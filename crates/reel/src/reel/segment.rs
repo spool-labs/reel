@@ -599,7 +599,7 @@ impl IoDriver {
         while !ops.is_empty() {
             let run = ops.len().min(self.batch_slots());
             let batch: Vec<Op> = ops.drain(..run).collect();
-            collect_split_reads(self.wait_batch(batch).await?.into_iter(), filled)?;
+            collect_split_reads(self.wait_batch(batch).await?, filled)?;
         }
         Ok(())
     }

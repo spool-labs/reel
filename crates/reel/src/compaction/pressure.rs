@@ -779,18 +779,24 @@ mod tests {
         let gate = RateGate::new(RateLimiter::for_compaction(CompactRate::Mbps(10)));
 
         let started = Instant::now();
+        let mut slept = Duration::ZERO;
         for _ in 0..PASSES {
             gate.wait_until_open();
             let since = Instant::now();
             std::thread::sleep(PASS_WORK);
+            slept += since.elapsed();
             gate.charge_from(since, PASS_BYTES);
         }
         let elapsed = started.elapsed();
 
         assert!(elapsed >= Duration::from_millis(90), "the passes ran free");
+        // Judge the gate on what it added, not on how far a loaded machine
+        // oversleeps: the old law charged the pass its own runtime again and
+        // would add about a hundred milliseconds here.
+        let gate_wait = elapsed.saturating_sub(slept);
         assert!(
-            elapsed < Duration::from_millis(150),
-            "the old law would take 200 ms"
+            gate_wait < Duration::from_millis(60),
+            "the gate added {gate_wait:?}, the old law would add 100 ms"
         );
     }
 

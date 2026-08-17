@@ -1,0 +1,15 @@
+[package]
+name = "reel-core"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["key-value", "storage", "store", "abstraction"]
+edition.workspace = true
+rust-version.workspace = true
+description = "A thin typed key-value store abstraction: the Store trait, write batches, and ordered iteration"
+categories = ["database", "rust-patterns"]
+
+[dependencies]
+thiserror.workspace = true
+wincode.workspace = true

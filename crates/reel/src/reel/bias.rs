@@ -362,6 +362,8 @@ fn occupied_bytes(root: &Path) -> Option<u64> {
 }
 
 /// Capacity of the filesystem this path sits on
+// The cast widens on macOS and is identity on Linux, since libc's statvfs widths differ
+#[allow(clippy::unnecessary_cast)]
 pub fn capacity_bytes(root: &Path) -> Option<u64> {
     stat_volume(root).map(|stats| stats.f_blocks as u64 * stats.f_frsize)
 }
@@ -371,6 +373,7 @@ pub fn capacity_bytes(root: &Path) -> Option<u64> {
 /// Not the capacity less what the reel accounts for: preallocation, footers,
 /// filesystem metadata and another tenant are all invisible to a sum over record
 /// bytes and all visible here.
+#[allow(clippy::unnecessary_cast)]
 pub fn available_bytes(root: &Path) -> Option<u64> {
     stat_volume(root).map(|stats| stats.f_bavail as u64 * stats.f_frsize)
 }

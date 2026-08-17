@@ -904,7 +904,7 @@ fn sorted_run(keys: &[Pubkey]) -> Vec<(Pubkey, Entry)> {
     for (at, key) in keys.iter().enumerate() {
         run.push((*key, entry_at(at as u64)));
     }
-    run.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    run.sort_unstable_by_key(|entry| entry.0);
     run
 }
 

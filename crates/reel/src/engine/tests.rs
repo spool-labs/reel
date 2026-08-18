@@ -2635,23 +2635,22 @@ fn a_carried_range() {
     assert_eq!(sim.read_count(), before, "the tier answered it");
 }
 
-// a column holding what a codec produced refuses a window of it
+// a column holding what a codec produced answers a window of the decoded payload
 #[test]
-fn a_coded_column_refuses() {
+fn a_coded_column_answers_a_window() {
     let (store, _sim) = coded_store(config(1, SyncPolicy::Never));
-    store.put(&coded(1), &stripes(4096)).expect("put");
+    let payload = stripes(4096);
+    store.put(&coded(1), &payload).expect("put");
 
-    let blocked = store.get_range(&coded(1), 0, 16);
-    let awaited = block_on(store.get_range_wait(&coded(1), 0, 16));
+    for (at, len) in [(0u64, 16usize), (1_000, 512), (4_090, 64), (4_096, 8)] {
+        let window = payload[at as usize..(at as usize + len).min(payload.len())].to_vec();
+        let blocked = store.get_range(&coded(1), at, len).expect("range");
+        let awaited = block_on(store.get_range_wait(&coded(1), at, len)).expect("awaited range");
 
-    assert!(
-        matches!(blocked, Err(ReelError::CodedRange(_))),
-        "{blocked:?}"
-    );
-    assert!(
-        matches!(awaited, Err(ReelError::CodedRange(_))),
-        "{awaited:?}"
-    );
+        assert_eq!(blocked.map(|value| value.into_vec()), Some(window.clone()), "at {at}");
+        assert_eq!(awaited.map(|value| value.into_vec()), Some(window), "awaited at {at}");
+    }
+
     assert!(
         store.get(&coded(1)).expect("get").is_some(),
         "the whole read still serves it"

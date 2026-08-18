@@ -18,7 +18,7 @@ use super::{read_only, FoundPlan, ReelStore, GRAVE_WINDOW, SWEEP_RUN};
 use crate::index::entry::Entry;
 use crate::index::recovery::rebuild_reel;
 use crate::index::tailer::{catch_up, CaughtUp, LogCursor};
-use crate::reel::{coded_range, Ask, RecordRead};
+use crate::reel::{Ask, RecordRead};
 use crate::sync::lock;
 use reel_core::{range_of, Value};
 
@@ -112,14 +112,15 @@ impl ReelStore {
         }
     }
 
-    /// Read part of one payload, without reading the rest of the record
+    /// Read part of one payload, clamped to it, at the caller's logical offsets
     ///
-    /// The range is clamped to the payload, and a value the index already holds is
-    /// cut in memory. Never verified, since the checksum covers a whole payload and
-    /// this holds a piece of one. What it keeps instead is identity, so a range
-    /// never answers with another record's bytes.
+    /// A raw record's window skips the whole-payload checksum but keeps identity.
+    /// A coded record decodes whole, checksum verified, and the window is cut
+    /// from the decoded payload.
     pub fn get_range(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Option<Value>> {
-        self.check_ranged(key)?;
+        if self.is_coded(key.column) {
+            return Ok(self.get(key)?.map(|payload| range_of(payload, offset, len)));
+        }
         self.settle_sealed()?;
         match self.resolve_range(key, offset, len)? {
             Resolved::Payload(payload) => return Ok(Some(payload)),
@@ -142,7 +143,9 @@ impl ReelStore {
         offset: u64,
         len: usize,
     ) -> Result<Option<Value>> {
-        self.check_ranged(key)?;
+        if self.is_coded(key.column) {
+            return Ok(self.get_wait(key).await?.map(|payload| range_of(payload, offset, len)));
+        }
         self.settle_sealed()?;
         match self.resolve_range_wait(key, offset, len).await? {
             Resolved::Payload(payload) => return Ok(Some(payload)),
@@ -475,17 +478,16 @@ impl ReelStore {
         self.index.page_from(playback, limit, out)
     }
 
-    /// Refuse a ranged read of a column whose payloads a codec produced
+    /// Whether a column's records are stored as a codec produced them
     ///
     /// A coded record is stored at a length of its own, so an offset the caller has
-    /// in mind addresses nothing on the volume and a codec frame decodes whole or
-    /// not at all. A column the volume does not serve is left to the read.
-    fn check_ranged(&self, key: &RecordKey) -> Result<()> {
-        match self.index.spec(key.column) {
-            Some(spec) if !matches!(spec.codec, Codec::None) => Err(coded_range(key.column)),
-            Some(_) => Ok(()),
-            None => Ok(()),
-        }
+    /// in mind addresses nothing on the volume: the range is cut from the decoded
+    /// payload instead of read off it. A column the volume does not serve is left
+    /// to the read.
+    fn is_coded(&self, column: ColumnId) -> bool {
+        self.index
+            .spec(column)
+            .is_some_and(|spec| !matches!(spec.codec, Codec::None))
     }
 
     /// Resolve one key, re-resolving a moved pointer and evicting a rotted record

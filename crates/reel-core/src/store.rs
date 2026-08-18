@@ -204,13 +204,13 @@ pub trait Store: Send + Sync {
     /// out, which is what an ordered backend wants; a backend whose keys have no
     /// order overrides it and marks in its own terms.
     fn sweep(&self, cf: &str, from: Option<&[u8]>, limit: usize) -> Result<SweptPage> {
+        // The mark is where to resume, inclusive, so it is the first key this
+        // page did not return and the next page starts on it. Skipping it here
+        // would drop one key per page boundary.
         let start = from.unwrap_or(&[]);
         let mut rows = Vec::with_capacity(limit);
         let mut next = None;
         for (key, value) in self.iter_from(cf, start, Direction::Asc)? {
-            if from.is_some_and(|mark| key.as_slice() == mark) {
-                continue;
-            }
             if rows.len() == limit {
                 next = Some(key);
                 break;
@@ -234,15 +234,13 @@ pub trait Store: Send + Sync {
         from: Option<&[u8]>,
         limit: usize,
     ) -> Result<SweptPage> {
+        // Inclusive, as in `sweep`: the mark is the first key not returned.
         let start = from.unwrap_or(prefix);
         let mut rows = Vec::with_capacity(limit);
         let mut next = None;
         for (key, value) in self.iter_from(cf, start, Direction::Asc)? {
             if !key.starts_with(prefix) {
                 break;
-            }
-            if from.is_some_and(|mark| key.as_slice() == mark) {
-                continue;
             }
             if rows.len() == limit {
                 next = Some(key);

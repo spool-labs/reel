@@ -414,6 +414,79 @@ fn flip(path: &Path, at: u64) {
 }
 
 // json output parses, for the commands a script would read
+// spans stand only over a paged open, and say so on a resident one
+#[test]
+fn paged_spans() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let volume = volume(&dir);
+
+    let resident = run(volume, &["--column", "records:1:32", "spans"]);
+    assert!(resident.ok, "spans failed: {}", resident.err);
+    assert!(
+        resident.out.contains("records") && resident.out.contains("pass --paged"),
+        "a resident open should name the open that answers: {}",
+        resident.out
+    );
+
+    let paged = run(volume, &["--column", "records:1:32", "--paged", "spans"]);
+    assert!(paged.ok, "paged spans failed: {}", paged.err);
+    assert!(
+        counted(&paged.out, "records") > 0,
+        "a paged open should count the sealed segments: {}",
+        paged.out
+    );
+}
+
+// a checkpoint publishes a directory that opens as a volume of its own
+#[test]
+fn checkpoint_copy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let volume = volume(&dir);
+    let target = dir.path().parent().expect("parent").join("copy");
+
+    let taken = run(volume, &["--column", "records:1:32", "checkpoint"]);
+    assert!(!taken.ok, "a checkpoint with no target should be refused");
+
+    let target_arg = target.to_string_lossy().to_string();
+    let taken = run(
+        volume,
+        &["--column", "records:1:32", "checkpoint", &target_arg],
+    );
+    assert!(taken.ok, "checkpoint failed: {}", taken.err);
+    assert!(
+        taken.out.contains("segments linked"),
+        "the report should say what it linked: {}",
+        taken.out
+    );
+
+    let copied = run(&target, &["--column", "records:1:32", "stat"]);
+    assert!(
+        copied.ok,
+        "the copy should open as a volume: {}",
+        copied.err
+    );
+
+    // Publishing over one is refused, so the second run leaves the first alone.
+    let again = run(
+        volume,
+        &["--column", "records:1:32", "checkpoint", &target_arg],
+    );
+    assert!(
+        !again.ok,
+        "a second checkpoint should not publish over the first"
+    );
+    std::fs::remove_dir_all(&target).expect("remove the copy");
+}
+
+/// The first figure on the row a table labels with this name
+fn counted(out: &str, label: &str) -> u64 {
+    out.lines()
+        .find(|line| line.starts_with(label))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|figure| figure.parse().ok())
+        .unwrap_or_else(|| panic!("no row for {label} in:\n{out}"))
+}
+
 #[test]
 fn json_parses() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -423,6 +496,7 @@ fn json_parses() {
         vec!["-o", "json", "cue"],
         vec!["-o", "json", "--column", "records:1:32", "cue"],
         vec!["-o", "json", "--column", "records:1:32", "stat"],
+        vec!["-o", "json", "--column", "records:1:32", "spans"],
         vec!["-o", "json", "verify"],
         vec!["-o", "json", "doctor"],
     ] {

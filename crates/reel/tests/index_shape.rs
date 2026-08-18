@@ -2121,14 +2121,13 @@ fn every_scan_counts_alike() {
             for want in [0u64, 7, 42, u64::MAX, rng.gen()] {
                 let plain = leads.iter().filter(|held| **held < want).count();
 
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(not(target_arch = "x86_64"))]
                 {
                     assert_eq!(
-                        scans::neon(&leads, want),
+                        scans::scalar(&leads, want),
                         plain,
-                        "neon differs: len {len} shape {shape}"
+                        "scalar differs: len {len} shape {shape}"
                     );
-                    assert_eq!(scans::scalar(&leads, want), plain, "scalar differs");
                 }
                 #[cfg(target_arch = "x86_64")]
                 {

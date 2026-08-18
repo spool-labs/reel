@@ -9,6 +9,7 @@ use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 
+use reel_core::store::SweptPage;
 use reel_core::{
     directory_size_bytes, BatchOp, CfDiskUsage, Direction, DiskVolume, Error as StoreError,
     Result as StoreResult, Store, StoreIter, StoreVolume, Value, WriteBatch,
@@ -234,7 +235,60 @@ impl Store for ReelStore {
     ///
     /// An empty prefix is the column's live count and a prefix naming one shard is a
     /// count that shard already keeps. Only a prefix cutting across shards steps
-    /// keys, and never payloads.
+    /// keys, and never payloads
+    /// 
+    /// One page of a column, in no promised order, resumable by an opaque mark.
+    fn sweep(&self, cf: &str, from: Option<&[u8]>, limit: usize) -> StoreResult<SweptPage> {
+        let column = self.classify(cf)?;
+        let mut page = KeyPage::default();
+        let next = self.sweep_column(column, from, limit, &mut page);
+
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(page.len());
+        for at in 0..page.len() {
+            keys.push(page.key_at(at));
+        }
+        let borrowed: Vec<&[u8]> = keys.iter().map(|key| key.as_slice()).collect();
+        let values = Store::get_many(self, cf, &borrowed)?;
+
+        let mut rows = Vec::with_capacity(keys.len());
+        for (key, value) in keys.into_iter().zip(values) {
+            // A key the page named and the read no longer finds was retired
+            // between the two, which a sweep simply does not hand out.
+            if let Some(value) = value {
+                rows.push((key, value));
+            }
+        }
+        Ok((rows, next))
+    }
+
+    /// One page under a shard-aligned prefix, in no promised order
+    fn sweep_prefix(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+        from: Option<&[u8]>,
+        limit: usize,
+    ) -> StoreResult<SweptPage> {
+        let column = self.classify(cf)?;
+        let mut page = KeyPage::default();
+        let next = self.sweep_column_prefix(column, prefix, from, limit, &mut page);
+
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(page.len());
+        for at in 0..page.len() {
+            keys.push(page.key_at(at));
+        }
+        let borrowed: Vec<&[u8]> = keys.iter().map(|key| key.as_slice()).collect();
+        let values = Store::get_many(self, cf, &borrowed)?;
+
+        let mut rows = Vec::with_capacity(keys.len());
+        for (key, value) in keys.into_iter().zip(values) {
+            if let Some(value) = value {
+                rows.push((key, value));
+            }
+        }
+        Ok((rows, next))
+    }
+
     fn count_prefix(&self, cf: &str, prefix: &[u8]) -> StoreResult<u64> {
         let column = self.classify(cf)?;
         // The counters miss the sealed keys of a paged column, and hold the wrong

@@ -63,6 +63,9 @@ impl CfDiskUsage {
     }
 }
 
+/// One page of a sweep and where the next one starts
+pub type SweptPage = (Vec<(Vec<u8>, Value)>, Option<Vec<u8>>);
+
 /// Trait for key-value storage with column family support
 ///
 /// Each column family is its own key space within one store.
@@ -191,6 +194,63 @@ pub trait Store: Send + Sync {
     /// override to skip value (e.g. blob-file) reads when only keys are needed.
     fn iter_keys_prefix(&self, cf: &str, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
         Ok(self.iter_prefix(cf, prefix)?.map(|(k, _)| k).collect())
+    }
+
+    /// One page of a column family, resumable by an opaque mark.
+    ///
+    /// Promises only that a full sweep hands out every live key at least once,
+    /// in whatever order the backend keeps. `None` back means the family is
+    /// done. The default walks in key order and marks with the last key handed
+    /// out, which is what an ordered backend wants; a backend whose keys have no
+    /// order overrides it and marks in its own terms.
+    fn sweep(&self, cf: &str, from: Option<&[u8]>, limit: usize) -> Result<SweptPage> {
+        let start = from.unwrap_or(&[]);
+        let mut rows = Vec::with_capacity(limit);
+        let mut next = None;
+        for (key, value) in self.iter_from(cf, start, Direction::Asc)? {
+            if from.is_some_and(|mark| key.as_slice() == mark) {
+                continue;
+            }
+            if rows.len() == limit {
+                next = Some(key);
+                break;
+            }
+            rows.push((key, value));
+        }
+        Ok((rows, next))
+    }
+
+    /// One page of the keys under a prefix, resumable by an opaque mark.
+    ///
+    /// Same promise as `sweep`, narrowed to a prefix. A backend whose keys have
+    /// no order can serve this only where the prefix selects a whole shard of
+    /// its own, and answers nothing where it does not, so a caller cannot turn a
+    /// prefix walk into a scan of the family by accident. The default walks the
+    /// prefix in key order, which an ordered backend can always do.
+    fn sweep_prefix(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+        from: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<SweptPage> {
+        let start = from.unwrap_or(prefix);
+        let mut rows = Vec::with_capacity(limit);
+        let mut next = None;
+        for (key, value) in self.iter_from(cf, start, Direction::Asc)? {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if from.is_some_and(|mark| key.as_slice() == mark) {
+                continue;
+            }
+            if rows.len() == limit {
+                next = Some(key);
+                break;
+            }
+            rows.push((key, value));
+        }
+        Ok((rows, next))
     }
 
     /// Exact count of the keys under `prefix`, WITHOUT materializing them.

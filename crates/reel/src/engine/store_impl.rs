@@ -321,6 +321,25 @@ impl Store for ReelStore {
         Ok(total)
     }
 
+    /// One page of keys under a shard-aligned prefix, in no promised order
+    fn sweep_keys_prefix(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+        from: Option<&[u8]>,
+        limit: usize,
+    ) -> StoreResult<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
+        let column = self.classify(cf)?;
+        let mut page = KeyPage::default();
+        let next = self.sweep_column_prefix(column, prefix, from, limit, &mut page);
+
+        let mut keys = Vec::with_capacity(page.len());
+        for at in 0..page.len() {
+            keys.push(page.key_at(at));
+        }
+        Ok((keys, next))
+    }
+
     fn bytes_prefix(&self, cf: &str, prefix: &[u8]) -> StoreResult<Option<u64>> {
         let column = self.classify(cf)?;
         let counted = self.counters_agree(column);
@@ -1169,6 +1188,7 @@ mod tests {
     const RECORD_CF: &str = "record";
     const BLOB_CF: &str = "blob";
     const ARTIFACT_CF: &str = "artifact";
+    const CODED_CF: &str = "coded";
 
     const GROUP_PREFIX_LEN: usize = 2;
     const RECORD_KEY_LEN: usize = GROUP_PREFIX_LEN + 32;
@@ -1208,6 +1228,17 @@ mod tests {
             row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
+            map_shape: MapShape::Tree,
+        },
+        ColumnSpec {
+            id: ColumnId(4),
+            name: CODED_CF,
+            key_width: KeyWidth::Fixed(BLOB_KEY_LEN as u16),
+            shard_bytes: 1,
+            inline_max: 0,
+            row_carry: 0,
+            purge_mark: None,
+            codec: Codec::Lz4,
             map_shape: MapShape::Tree,
         },
     ];
@@ -1282,6 +1313,62 @@ mod tests {
 
     fn keys(store: &dyn Store, cf: &str, prefix: &[u8]) -> Vec<Vec<u8>> {
         store.iter_keys_prefix(cf, prefix).expect("keys")
+    }
+
+    /// Bytes a codec shrinks, so a coded column really stores something coded
+    fn compressible(len: usize) -> Vec<u8> {
+        let words = ["slice", "spool", "track", "epoch", "record", "payload", "the", "and"];
+        let mut bytes = Vec::with_capacity(len + 8);
+        let mut at = 0usize;
+        while bytes.len() < len {
+            bytes.extend_from_slice(words[at % words.len()].as_bytes());
+            bytes.push(b' ');
+            at += 1;
+        }
+        bytes.truncate(len);
+        bytes
+    }
+
+    // a coded record answers a range with the bytes the same record stored raw does
+    #[test]
+    fn coded_ranges_match_raw() {
+        let engine = store();
+        let store = trait_store(&engine);
+        let payload = compressible(8_192);
+        store.put(RECORD_CF, &record(7, 1), &payload).expect("put raw");
+        store.put(CODED_CF, &[9u8; BLOB_KEY_LEN], &payload).expect("put coded");
+
+        // The guard the case rests on: an uncoded record here would make every
+        // assertion below pass without saying anything.
+        let stored = engine.column_totals(ColumnId(4)).expect("totals").bytes.to_bytes();
+        assert!(stored < payload.len() as u64, "the codec stored {stored} of {}", payload.len());
+
+        for (offset, len) in [(0u64, payload.len()), (0, 16), (1_000, 512), (4_096, 8_192), (8_192, 4)]
+        {
+            let raw = store
+                .get_range(RECORD_CF, &record(7, 1), offset, len)
+                .expect("raw range")
+                .map(Value::into_vec);
+            let coded = store
+                .get_range(CODED_CF, &[9u8; BLOB_KEY_LEN], offset, len)
+                .expect("coded range")
+                .map(Value::into_vec);
+            assert_eq!(coded, raw, "range at {offset} for {len}");
+
+            // Asked of the engine itself, since the awaited reads are not
+            // dispatchable through a trait object.
+            let awaited =
+                block_on(Store::get_range_wait(&engine, CODED_CF, &[9u8; BLOB_KEY_LEN], offset, len))
+                    .expect("awaited coded range")
+                    .map(Value::into_vec);
+            assert_eq!(awaited, raw, "awaited range at {offset} for {len}");
+        }
+
+        // A key nothing wrote answers nothing rather than no bytes, coded or not.
+        assert!(store
+            .get_range(CODED_CF, &[1u8; BLOB_KEY_LEN], 0, 4)
+            .expect("missing coded range")
+            .is_none());
     }
 
     // a playback asks the device for a run of payloads rather than one at a time

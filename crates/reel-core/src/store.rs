@@ -251,6 +251,22 @@ pub trait Store: Send + Sync {
         Ok((rows, next))
     }
 
+    /// One page of the keys under a prefix, resumable by an opaque mark.
+    ///
+    /// Same promise as `sweep_prefix` for a caller that wants the keys and none of
+    /// the values. The default takes the values and drops them; a backend that can
+    /// page keys on their own overrides it.
+    fn sweep_keys_prefix(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+        from: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
+        let (rows, next) = self.sweep_prefix(cf, prefix, from, limit)?;
+        Ok((rows.into_iter().map(|(key, _)| key).collect(), next))
+    }
+
     /// Exact count of the keys under `prefix`, WITHOUT materializing them.
     ///
     /// The default collects the keys and takes the length; backends override to

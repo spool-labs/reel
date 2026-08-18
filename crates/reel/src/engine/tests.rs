@@ -3971,7 +3971,7 @@ fn async_put_matches_the_block() {
         store.get(&record(7, 2)).expect("get").map(Value::into_vec),
         Some(vec![0x22; 512]),
     );
-    assert_eq!(store.column_totals(RECORD).count, 2);
+    assert_eq!(store.column_totals(RECORD).expect("totals").count, 2);
 }
 
 // an awaited put is as durable as the blocking put beside it
@@ -4102,8 +4102,8 @@ fn columns_are_independent() {
         store.get(&blob(9)).expect("get"),
         Some(Value::new(vec![0x22; 300]))
     );
-    assert_eq!(store.column_totals(RECORD).count, 1);
-    assert_eq!(store.column_totals(BLOB).count, 1);
+    assert_eq!(store.column_totals(RECORD).expect("totals").count, 1);
+    assert_eq!(store.column_totals(BLOB).expect("totals").count, 1);
     assert_eq!(store.totals().bytes, ByteCount::from_bytes(400));
 }
 

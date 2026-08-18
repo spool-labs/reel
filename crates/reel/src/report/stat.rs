@@ -79,13 +79,13 @@ pub fn stat(engine: &ReelStore) -> StatReport {
 
     let mut columns = Vec::new();
     for spec in engine.columns() {
-        let totals = index.column(spec.id).map(|column| column.totals());
+        let totals = index.column_totals(spec.id);
         columns.push(StatColumn {
             column: spec.name.to_string(),
             id: spec.id.as_u8(),
             runs: is_paged.then(|| index.sealed_spans(spec.id)),
-            records: (!is_paged).then(|| totals.as_ref().map_or(0, |totals| totals.count)),
-            bytes: (!is_paged).then(|| totals.as_ref().map_or(0, |totals| totals.bytes.to_bytes())),
+            records: totals.map(|totals| totals.count),
+            bytes: totals.map(|totals| totals.bytes.to_bytes()),
         });
     }
 

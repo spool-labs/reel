@@ -291,16 +291,11 @@ impl Store for ReelStore {
 
     fn count_prefix(&self, cf: &str, prefix: &[u8]) -> StoreResult<u64> {
         let column = self.classify(cf)?;
-        // The counters miss the sealed keys of a paged column, and hold the wrong
-        // number while a cover is owed its sweep. The walk is the answer that agrees
-        // with what a read of the same column would find.
-        let counted = !self.index().answers_from_footers(column)
-            && !self
-                .index()
-                .column(column)
-                .is_some_and(|index| index.has_pending_covers());
+        let counted = self.counters_agree(column);
         if prefix.is_empty() && counted {
-            return Ok(self.column_totals(column).count);
+            if let Some(totals) = self.column_totals(column) {
+                return Ok(totals.count);
+            }
         }
         if counted {
             if let Some(totals) = self.prefix_totals(column, prefix) {
@@ -324,6 +319,40 @@ impl Store for ReelStore {
             }
         }
         Ok(total)
+    }
+
+    fn bytes_prefix(&self, cf: &str, prefix: &[u8]) -> StoreResult<Option<u64>> {
+        let column = self.classify(cf)?;
+        let counted = self.counters_agree(column);
+        if prefix.is_empty() && counted {
+            if let Some(totals) = self.column_totals(column) {
+                return Ok(Some(totals.bytes.to_bytes()));
+            }
+        }
+        if counted {
+            if let Some(totals) = self.prefix_totals(column, prefix) {
+                return Ok(Some(totals.bytes.to_bytes()));
+            }
+        }
+
+        // The walk reads each key and where its record sits, and no payload at all.
+        let mut scope = Scope {
+            prefix: Some(prefix.to_vec()),
+            ..Scope::empty(Direction::Asc)
+        };
+        let mut page = Page::entries_only(&scope, column, self.serves(column));
+        let mut total = 0u64;
+        let mut key = Vec::new();
+        while let Some((found, _)) = page.next_into(self, &mut key) {
+            match scope.locate(&key) {
+                Position::Past => break,
+                Position::Before => continue,
+                Position::Inside => {
+                    total += found.map_or(0, |entry| u64::from(entry.loc.len));
+                }
+            }
+        }
+        Ok(Some(total))
     }
 
     fn walk_from(
@@ -387,7 +416,7 @@ impl Store for ReelStore {
 
     fn key_count_estimate(&self, cf: &str) -> StoreResult<Option<u64>> {
         match self.classify(cf) {
-            Ok(column) => Ok(Some(self.column_totals(column).count)),
+            Ok(column) => Ok(self.column_totals(column).map(|totals| totals.count)),
             Err(_) => Ok(None),
         }
     }
@@ -400,8 +429,8 @@ impl Store for ReelStore {
                 cf: spec.name.to_string(),
                 volume: StoreVolume::Bulk,
                 sst_bytes: 0,
-                blob_bytes: totals.bytes.to_bytes(),
-                num_keys: totals.count,
+                blob_bytes: totals.map_or(0, |totals| totals.bytes.to_bytes()),
+                num_keys: totals.map_or(0, |totals| totals.count),
             });
         }
         Ok(usage)
@@ -738,6 +767,12 @@ impl Page {
     /// A cursor carrying each key's payload length, for a playback that stages reads
     fn with_lens(scope: &Scope, column: ColumnId, serves: bool) -> Page {
         Page::open(scope, column, serves, KeyPage::with_lens())
+    }
+
+    /// The same cursor without the values a carrying column keeps, for a walk that
+    /// weighs records rather than reading them
+    fn entries_only(scope: &Scope, column: ColumnId, serves: bool) -> Page {
+        Page::open(scope, column, serves, KeyPage::entries_only())
     }
 
     fn open(scope: &Scope, column: ColumnId, serves: bool, buffered: KeyPage) -> Page {
@@ -1589,6 +1624,47 @@ mod tests {
             1
         );
         assert_eq!(store.count_prefix(RECORD_CF, &[]).expect("count"), 3);
+    }
+
+    // stored bytes under a prefix, from the counters and from the walk alike
+    #[test]
+    fn bytes_under_a_prefix() {
+        let store = store();
+        let store = trait_store(&store);
+        for group in [6u16, 7, 8] {
+            store
+                .put(RECORD_CF, &record(group, 1), &[0x11; 64])
+                .expect("put");
+        }
+        store
+            .put(RECORD_CF, &record(7, 2), &[0x22; 16])
+            .expect("put");
+
+        // The shard prefix is answered from the counters, the deeper one by a walk,
+        // and the two have to agree about the same records.
+        assert_eq!(
+            store.bytes_prefix(RECORD_CF, &7u16.to_be_bytes()).expect("bytes"),
+            Some(80)
+        );
+        assert_eq!(store.bytes_prefix(RECORD_CF, &[]).expect("bytes"), Some(208));
+
+        let mut prefix = 7u16.to_be_bytes().to_vec();
+        prefix.push(2);
+        assert_eq!(store.bytes_prefix(RECORD_CF, &prefix).expect("bytes"), Some(16));
+    }
+
+    // an overwritten record is weighed once, at the length it now holds
+    #[test]
+    fn bytes_follow_the_live_version() {
+        let store = store();
+        let store = trait_store(&store);
+        store.put(RECORD_CF, &record(7, 1), &[0x11; 64]).expect("put");
+        store.put(RECORD_CF, &record(7, 1), &[0x11; 8]).expect("overwrite");
+
+        assert_eq!(store.bytes_prefix(RECORD_CF, &[]).expect("bytes"), Some(8));
+
+        store.delete(RECORD_CF, &record(7, 1)).expect("delete");
+        assert_eq!(store.bytes_prefix(RECORD_CF, &[]).expect("bytes"), Some(0));
     }
 
     // a count that cuts across shards steps the keys rather than the counters

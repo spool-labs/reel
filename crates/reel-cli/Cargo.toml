@@ -1,0 +1,25 @@
+[package]
+name = "reel-cli"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["cli", "key-value", "storage", "inspection"]
+edition.workspace = true
+rust-version.workspace = true
+description = "Cue up a reel volume and look inside it"
+categories = ["command-line-utilities", "database"]
+publish = false
+
+[[bin]]
+name = "reel"
+path = "src/main.rs"
+
+[dependencies]
+reel.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,65 @@
+name: models
+
+# Loom and miri are too slow for a pull request and answer a different question from
+# the suite: not whether the engine works, but whether the orderings and the unsafe
+# under it hold. Weekly, and on demand.
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  loom:
+    name: loom
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # --cfg loom swaps crate::sync::checked over to loom's primitives and pulls the
+      # loom dependency in, so the whole lib compiles against the model checker. Six
+      # models, over Tension, the segment table's retire ordering, and the slot table.
+      # Release because a model explores more interleavings than a debug build can walk.
+      - name: the modelled orderings
+        env:
+          RUSTFLAGS: "--cfg loom"
+          LOOM_MAX_PREEMPTIONS: "3"
+        run: cargo test -p reel --lib --release -- loom_tests
+
+  miri:
+    name: miri
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly
+          components: miri
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Miri interprets, so anything that opens a file or submits to a ring is out of
+      # reach: posix_backend's tests are already cfg'd off under it, as is every
+      # differential cell. Named modules rather than the whole lib because two more
+      # things are out of reach than the cfgs say. `format::footer`, `format::record`
+      # and `format::block` checksum, and crc-fast dispatches to a SIMD intrinsic the
+      # interpreter has no shim for; `index::map` interprets too slowly to bound.
+      - name: the byte-level modules
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+        run: |
+          cargo miri test -p reel --lib -- \
+            format::column format::fence format::filter format::prefix \
+            index::tbtreemap index::opentable

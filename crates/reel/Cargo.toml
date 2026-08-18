@@ -1,0 +1,71 @@
+[package]
+name = "reel"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["key-value", "storage", "log-structured", "database", "embedded"]
+exclude = ["tests/", "benches/", "docs/"]
+edition.workspace = true
+rust-version.workspace = true
+description = "A log-structured key-value store: sequential writes, immutable segments, whole-segment reclaim"
+categories = ["database", "database-implementations", "data-structures", "filesystem"]
+
+[dependencies]
+reel-core.workspace = true
+thiserror.workspace = true
+crc-fast.workspace = true
+lz4_flex.workspace = true
+libc.workspace = true
+tracing.workspace = true
+serde = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+mimalloc = { version = "0.1", optional = true }
+snmalloc-rs = { version = "0.3", optional = true }
+
+[features]
+default = []
+
+# tests
+sim = ["dep:rand"]
+rendezvous = []
+
+# deserialization for `ReelConfig` and the enums it holds, for an operator who
+# keeps the volume's settings in a file rather than in code.
+serde = ["dep:serde"]
+
+# allocator swaps for this crate's own probe binaries, which is all a library can
+# offer: global allocator belongs to whoever builds the final binary.
+alloc-mimalloc = ["dep:mimalloc"]
+alloc-snmalloc = ["dep:snmalloc-rs"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+
+[dev-dependencies]
+reel = { path = ".", features = ["rendezvous", "serde", "sim"] }
+rand.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+reel-mock.workspace = true
+criterion = "0.5"
+indexset = "0.16"
+crossbeam-skiplist = "0.1"
+scc = "3"
+foldhash = "0.2"
+rustc-hash = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[[bench]]
+name = "reel"
+harness = false
+
+[[test]]
+name = "probes"
+harness = false
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(loom)"] }

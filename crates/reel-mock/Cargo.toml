@@ -1,0 +1,15 @@
+[package]
+name = "reel-mock"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["testing", "mock", "key-value"]
+edition.workspace = true
+rust-version.workspace = true
+description = "Test-double implementation of the reel store trait, for oracles and as a template; not a production backend"
+categories = ["development-tools::testing", "database"]
+publish = false
+
+[dependencies]
+reel-core.workspace = true

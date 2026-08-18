@@ -842,11 +842,22 @@ fn a_direct_read_takes_the_async_door() {
 fn direct_ring_serves_here() -> bool {
     let dir = tempdir().expect("tempdir");
     let (store, ring) = open_direct_on_ring(dir.path());
-    store
-        .put(&record_key(GROUP, id(1)), &vec![1u8; 4096])
-        .expect("put");
+    // The volume test at two records: unaligned payloads, both read paths, so
+    // the probe refuses whatever the test would refuse.
+    for byte in 1..=2u8 {
+        store
+            .put(
+                &record_key(GROUP, id(byte)),
+                &vec![byte; 4096 + byte as usize],
+            )
+            .expect("put");
+    }
     store.flush().expect("flush");
-    let _ = store.get(&record_key(GROUP, id(1))).expect("get");
+    for byte in 1..=2u8 {
+        let _ = store.get(&record_key(GROUP, id(byte))).expect("get");
+    }
+    let wanted: Vec<_> = (1..=2u8).map(|byte| record_key(GROUP, id(byte))).collect();
+    let _ = store.get_many(&wanted).expect("get_many");
     ReelIo::door_counts(&*ring).reached_ring
 }
 

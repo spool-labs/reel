@@ -66,6 +66,9 @@ impl CfDiskUsage {
 /// One page of a sweep and where the next one starts
 pub type SweptPage = (Vec<(Vec<u8>, Value)>, Option<Vec<u8>>);
 
+/// One page of swept keys and where the next one starts
+pub type SweptKeys = (Vec<Vec<u8>>, Option<Vec<u8>>);
+
 /// Trait for key-value storage with column family support
 ///
 /// Each column family is its own key space within one store.
@@ -262,7 +265,7 @@ pub trait Store: Send + Sync {
         prefix: &[u8],
         from: Option<&[u8]>,
         limit: usize,
-    ) -> Result<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
+    ) -> Result<SweptKeys> {
         let (rows, next) = self.sweep_prefix(cf, prefix, from, limit)?;
         Ok((rows.into_iter().map(|(key, _)| key).collect(), next))
     }

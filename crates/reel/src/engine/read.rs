@@ -144,7 +144,10 @@ impl ReelStore {
         len: usize,
     ) -> Result<Option<Value>> {
         if self.is_coded(key.column) {
-            return Ok(self.get_wait(key).await?.map(|payload| range_of(payload, offset, len)));
+            return Ok(self
+                .get_wait(key)
+                .await?
+                .map(|payload| range_of(payload, offset, len)));
         }
         self.settle_sealed()?;
         match self.resolve_range_wait(key, offset, len).await? {

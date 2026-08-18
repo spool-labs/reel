@@ -581,7 +581,7 @@ fn hash_of<const N: usize>(key: &[u8; N]) -> u64 {
     for word in &mut words {
         hash = mixed(hash, u64::from_le_bytes(word.try_into().unwrap()));
     }
-    if N % 8 != 0 {
+    if !N.is_multiple_of(8) {
         let mut word = [0u8; 8];
         word[..N % 8].copy_from_slice(words.remainder());
         hash = mixed(hash, u64::from_le_bytes(word));

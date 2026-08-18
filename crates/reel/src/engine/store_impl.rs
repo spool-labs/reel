@@ -9,7 +9,7 @@ use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 
-use reel_core::store::SweptPage;
+use reel_core::store::{SweptKeys, SweptPage};
 use reel_core::{
     directory_size_bytes, BatchOp, CfDiskUsage, Direction, DiskVolume, Error as StoreError,
     Result as StoreResult, Store, StoreIter, StoreVolume, Value, WriteBatch,
@@ -236,7 +236,7 @@ impl Store for ReelStore {
     /// An empty prefix is the column's live count and a prefix naming one shard is a
     /// count that shard already keeps. Only a prefix cutting across shards steps
     /// keys, and never payloads
-    /// 
+    ///
     /// One page of a column, in no promised order, resumable by an opaque mark.
     fn sweep(&self, cf: &str, from: Option<&[u8]>, limit: usize) -> StoreResult<SweptPage> {
         let column = self.classify(cf)?;
@@ -328,7 +328,7 @@ impl Store for ReelStore {
         prefix: &[u8],
         from: Option<&[u8]>,
         limit: usize,
-    ) -> StoreResult<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
+    ) -> StoreResult<SweptKeys> {
         let column = self.classify(cf)?;
         let mut page = KeyPage::default();
         let next = self.sweep_column_prefix(column, prefix, from, limit, &mut page);
@@ -1317,7 +1317,9 @@ mod tests {
 
     /// Bytes a codec shrinks, so a coded column really stores something coded
     fn compressible(len: usize) -> Vec<u8> {
-        let words = ["slice", "spool", "track", "epoch", "record", "payload", "the", "and"];
+        let words = [
+            "slice", "spool", "track", "epoch", "record", "payload", "the", "and",
+        ];
         let mut bytes = Vec::with_capacity(len + 8);
         let mut at = 0usize;
         while bytes.len() < len {
@@ -1335,16 +1337,33 @@ mod tests {
         let engine = store();
         let store = trait_store(&engine);
         let payload = compressible(8_192);
-        store.put(RECORD_CF, &record(7, 1), &payload).expect("put raw");
-        store.put(CODED_CF, &[9u8; BLOB_KEY_LEN], &payload).expect("put coded");
+        store
+            .put(RECORD_CF, &record(7, 1), &payload)
+            .expect("put raw");
+        store
+            .put(CODED_CF, &[9u8; BLOB_KEY_LEN], &payload)
+            .expect("put coded");
 
         // The guard the case rests on: an uncoded record here would make every
         // assertion below pass without saying anything.
-        let stored = engine.column_totals(ColumnId(4)).expect("totals").bytes.to_bytes();
-        assert!(stored < payload.len() as u64, "the codec stored {stored} of {}", payload.len());
+        let stored = engine
+            .column_totals(ColumnId(4))
+            .expect("totals")
+            .bytes
+            .to_bytes();
+        assert!(
+            stored < payload.len() as u64,
+            "the codec stored {stored} of {}",
+            payload.len()
+        );
 
-        for (offset, len) in [(0u64, payload.len()), (0, 16), (1_000, 512), (4_096, 8_192), (8_192, 4)]
-        {
+        for (offset, len) in [
+            (0u64, payload.len()),
+            (0, 16),
+            (1_000, 512),
+            (4_096, 8_192),
+            (8_192, 4),
+        ] {
             let raw = store
                 .get_range(RECORD_CF, &record(7, 1), offset, len)
                 .expect("raw range")
@@ -1357,10 +1376,15 @@ mod tests {
 
             // Asked of the engine itself, since the awaited reads are not
             // dispatchable through a trait object.
-            let awaited =
-                block_on(Store::get_range_wait(&engine, CODED_CF, &[9u8; BLOB_KEY_LEN], offset, len))
-                    .expect("awaited coded range")
-                    .map(Value::into_vec);
+            let awaited = block_on(Store::get_range_wait(
+                &engine,
+                CODED_CF,
+                &[9u8; BLOB_KEY_LEN],
+                offset,
+                len,
+            ))
+            .expect("awaited coded range")
+            .map(Value::into_vec);
             assert_eq!(awaited, raw, "awaited range at {offset} for {len}");
         }
 
@@ -1730,14 +1754,22 @@ mod tests {
         // The shard prefix is answered from the counters, the deeper one by a walk,
         // and the two have to agree about the same records.
         assert_eq!(
-            store.bytes_prefix(RECORD_CF, &7u16.to_be_bytes()).expect("bytes"),
+            store
+                .bytes_prefix(RECORD_CF, &7u16.to_be_bytes())
+                .expect("bytes"),
             Some(80)
         );
-        assert_eq!(store.bytes_prefix(RECORD_CF, &[]).expect("bytes"), Some(208));
+        assert_eq!(
+            store.bytes_prefix(RECORD_CF, &[]).expect("bytes"),
+            Some(208)
+        );
 
         let mut prefix = 7u16.to_be_bytes().to_vec();
         prefix.push(2);
-        assert_eq!(store.bytes_prefix(RECORD_CF, &prefix).expect("bytes"), Some(16));
+        assert_eq!(
+            store.bytes_prefix(RECORD_CF, &prefix).expect("bytes"),
+            Some(16)
+        );
     }
 
     // an overwritten record is weighed once, at the length it now holds
@@ -1745,8 +1777,12 @@ mod tests {
     fn bytes_follow_the_live_version() {
         let store = store();
         let store = trait_store(&store);
-        store.put(RECORD_CF, &record(7, 1), &[0x11; 64]).expect("put");
-        store.put(RECORD_CF, &record(7, 1), &[0x11; 8]).expect("overwrite");
+        store
+            .put(RECORD_CF, &record(7, 1), &[0x11; 64])
+            .expect("put");
+        store
+            .put(RECORD_CF, &record(7, 1), &[0x11; 8])
+            .expect("overwrite");
 
         assert_eq!(store.bytes_prefix(RECORD_CF, &[]).expect("bytes"), Some(8));
 

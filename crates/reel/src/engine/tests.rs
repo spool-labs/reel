@@ -2647,8 +2647,16 @@ fn a_coded_column_answers_a_window() {
         let blocked = store.get_range(&coded(1), at, len).expect("range");
         let awaited = block_on(store.get_range_wait(&coded(1), at, len)).expect("awaited range");
 
-        assert_eq!(blocked.map(|value| value.into_vec()), Some(window.clone()), "at {at}");
-        assert_eq!(awaited.map(|value| value.into_vec()), Some(window), "awaited at {at}");
+        assert_eq!(
+            blocked.map(|value| value.into_vec()),
+            Some(window.clone()),
+            "at {at}"
+        );
+        assert_eq!(
+            awaited.map(|value| value.into_vec()),
+            Some(window),
+            "awaited at {at}"
+        );
     }
 
     assert!(

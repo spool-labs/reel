@@ -87,6 +87,9 @@ pub struct OpenTable<const N: usize, Value> {
 
     /// Keys the table holds, which is what the load factor is measured against
     held: usize,
+
+    /// Resizes this table has been through, since each one moves every slot
+    generation: u64,
 }
 
 impl<const N: usize, Value> Default for OpenTable<N, Value> {
@@ -97,6 +100,7 @@ impl<const N: usize, Value> Default for OpenTable<N, Value> {
             keys: Vec::new(),
             values: Vec::new(),
             held: 0,
+            generation: 0,
         }
     }
 }
@@ -241,6 +245,31 @@ impl<const N: usize, Value: Default> OpenTable<N, Value> {
         }
         held.sort_unstable_by(|left, right| left.0.cmp(right.0));
         held
+    }
+
+    /// One page of the table in slot order, and where the next page starts
+    ///
+    /// Slot order is not key order and is not stable across a resize, which is
+    /// why the caller carries a generation beside the mark. What it buys is a
+    /// page that costs the page: no gather of the whole shard and no sort.
+    pub fn slot_page(&self, from: usize, limit: usize) -> (Vec<(&[u8; N], &Value)>, Option<usize>) {
+        let mut held = Vec::with_capacity(limit.min(self.held));
+        let mut at = from;
+        while at < self.slots() {
+            if self.control[at] != EMPTY {
+                if held.len() == limit {
+                    return (held, Some(at));
+                }
+                held.push((&self.keys[at], &self.values[at]));
+            }
+            at += 1;
+        }
+        (held, None)
+    }
+
+    /// How many times the table has been resized, which moves every slot
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Every pair inside a span, in key order
@@ -418,6 +447,9 @@ impl<const N: usize, Value: Default> OpenTable<N, Value> {
 
     /// Build a table of this many slots and put every held key back in it
     fn resize(&mut self, slots: usize) {
+        // Every slot moves, so a mark taken before this one means nothing after
+        // it. A sweep holding one restarts its shard rather than skipping keys.
+        self.generation += 1;
         let mut control = match slots {
             0 => Vec::new(),
             _ => vec![EMPTY; slots + MIRROR],
@@ -565,6 +597,99 @@ fn hash_of<const N: usize>(key: &[u8; N]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::column::{Mark, ShardMap};
+    use std::collections::BTreeSet;
+
+    /// Keys a sweep test puts in, enough to cross several pages
+    const SWEPT: usize = 5_000;
+
+    fn key_of(at: usize) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&(at as u64).to_le_bytes());
+        key
+    }
+
+    /// Every key a sweep hands out, paging until the mark comes back empty
+    fn swept(table: &OpenTable<32, u64>, page: usize) -> Vec<[u8; 32]> {
+        let mut seen = Vec::new();
+        let mut mark = Mark::Start;
+        loop {
+            let (rows, next) = ShardMap::sweep(table, &mark, page);
+            for (key, _) in rows {
+                seen.push(*key);
+            }
+            match next {
+                Some(next) => mark = next,
+                None => return seen,
+            }
+        }
+    }
+
+    // a sweep hands out every live key exactly once
+    #[test]
+    fn sweep_covers() {
+        let mut table = OpenTable::<32, u64>::new();
+        for at in 0..SWEPT {
+            table.insert(key_of(at), at as u64);
+        }
+
+        for page in [1usize, 7, 512, SWEPT * 2] {
+            let seen = swept(&table, page);
+            assert_eq!(seen.len(), SWEPT, "page {page} lost or repeated keys");
+            assert_eq!(
+                seen.iter().copied().collect::<BTreeSet<_>>().len(),
+                SWEPT,
+                "page {page} handed a key out twice"
+            );
+        }
+    }
+
+    // a resize mid sweep restarts the shard rather than skipping what moved
+    #[test]
+    fn sweep_survives_resize() {
+        let mut table = OpenTable::<32, u64>::new();
+        for at in 0..SWEPT {
+            table.insert(key_of(at), at as u64);
+        }
+
+        let (first, mark) = ShardMap::sweep(&table, &Mark::Start, 100);
+        assert_eq!(first.len(), 100);
+        let mark = mark.expect("more to sweep");
+        let before = table.generation();
+
+        // Grow past the load factor, which moves every slot the mark named.
+        for at in SWEPT..(SWEPT * 4) {
+            table.insert(key_of(at), at as u64);
+        }
+        assert!(table.generation() > before, "the table never resized");
+
+        // The stale mark is refused, so the sweep starts over and loses nothing.
+        let mut seen = BTreeSet::new();
+        let mut mark = mark;
+        loop {
+            let (rows, next) = ShardMap::sweep(&table, &mark, 512);
+            for (key, _) in rows {
+                seen.insert(*key);
+            }
+            match next {
+                Some(next) => mark = next,
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), SWEPT * 4, "a resized sweep lost keys");
+    }
+
+    // a mark another shape minted is refused rather than misread
+    #[test]
+    fn sweep_refuses_foreign() {
+        let mut table = OpenTable::<32, u64>::new();
+        for at in 0..64 {
+            table.insert(key_of(at), at as u64);
+        }
+
+        let (rows, _) = ShardMap::sweep(&table, &Mark::Key(Box::from(&key_of(10)[..])), 1024);
+        assert_eq!(rows.len(), 64, "a foreign mark should start the shard over");
+    }
 
     use crate::format::loc::{Loc, SegmentId};
     use crate::format::lsn::Lsn;

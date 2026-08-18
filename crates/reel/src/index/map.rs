@@ -15,7 +15,8 @@ use crate::config::{IndexResidency, ShardShapes};
 use crate::engine::Totals;
 use crate::error::{ReelError, Result};
 use crate::format::column::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyRef, RecordKey, INLINE_MAX, ROW_CARRY_MAX,
+    Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyRef, MapShape, RecordKey, INLINE_MAX,
+    ROW_CARRY_MAX,
 };
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::{Loc, SegmentId};
@@ -252,6 +253,15 @@ impl ReelIndex {
                         spec.name,
                     )));
                 }
+            }
+            if spec.map_shape == MapShape::Open
+                && shapes == ShardShapes::Declared
+                && residency != IndexResidency::Resident
+            {
+                return Err(ReelError::Config(format!(
+                    "column {} asks for an open shard, which a paged walk cannot merge",
+                    spec.name,
+                )));
             }
             if spec.row_carry as usize > ROW_CARRY_MAX {
                 // A row's carry is paid in the stride every block search walks and in
@@ -1602,7 +1612,7 @@ impl ReelIndex {
 mod tests {
     use super::*;
 
-    use crate::format::column::{KeyWidth, MapShape};
+    use crate::format::column::KeyWidth;
     use crate::index::entry::span_of;
 
     const RECORD: ColumnId = ColumnId(1);
@@ -1669,6 +1679,17 @@ mod tests {
             MapShape::Open
         );
         index
+    }
+
+    // an open shard is refused on a paged index, which has no order to merge it
+    #[test]
+    fn open_refuses_paged() {
+        let refused = ReelIndex::new(OPEN_COLUMNS, IndexResidency::Paged, ShardShapes::Declared);
+        assert!(refused.is_err());
+
+        // A volume that does not honour declarations never gets the open shard,
+        // so there is nothing to refuse.
+        assert!(ReelIndex::new(OPEN_COLUMNS, IndexResidency::Paged, ShardShapes::Tree).is_ok());
     }
 
     fn record_key(group: u16, byte: u8) -> RecordKey {

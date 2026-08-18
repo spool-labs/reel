@@ -489,6 +489,10 @@ impl IoDriver {
     ///
     /// The header buffer is the caller's spare and comes back either way, including
     /// alongside the error when the read fails. Only a failed submission loses it.
+    /// Read one split range, parking the caller for the completion
+    ///
+    /// `WarmFirst::Ask` puts one non-blocking read ahead of the op, the same way
+    /// the awaited twin does.
     pub fn pread_split_reusing(
         &self,
         file: FileId,
@@ -496,13 +500,19 @@ impl IoDriver {
         head_len: usize,
         body_len: usize,
         spare: Vec<u8>,
+        warm: WarmFirst,
     ) -> SplitAnswer {
+        let mut head = ReadBuf::reusing(spare, head_len);
+        let mut body = ReadBuf::new(body_len);
+        if warm == WarmFirst::Ask && self.backend.warm_split(file, offset, &mut head, &mut body) {
+            return Ok((head.into_vec(), body.into_vec()));
+        }
         let op = Op::PreadSplit {
             tag: self.next_tag(),
             file,
             offset,
-            head: ReadBuf::reusing(spare, head_len),
-            body: ReadBuf::new(body_len),
+            head,
+            body,
         };
         let completion = match self.run_op(op) {
             Ok(completion) => completion,

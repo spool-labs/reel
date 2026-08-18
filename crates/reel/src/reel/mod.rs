@@ -1292,6 +1292,7 @@ impl Reel {
                 prefix,
                 span,
                 take_header(),
+                self.shared.warm_first(),
             );
             return near_range(read, prefix, at, len, expected, lsn, loc);
         }
@@ -1664,10 +1665,14 @@ impl Reel {
         }
 
         let spare = take_header();
-        let read =
-            self.shared
-                .driver
-                .pread_split_reusing(handle.file(), offset, prefix, len, spare);
+        let read = self.shared.driver.pread_split_reusing(
+            handle.file(),
+            offset,
+            prefix,
+            len,
+            spare,
+            self.shared.warm_first(),
+        );
         framed_or_nothing(read, prefix, len)
     }
 

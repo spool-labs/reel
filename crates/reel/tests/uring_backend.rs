@@ -736,7 +736,14 @@ fn the_backend_says_which_door_its_ops_took() {
     };
     ReelIo::submit_inline(&backend, read).expect("the ring answered");
     let after_read = ReelIo::door_counts(&backend);
-    assert!(after_read.reached_ring, "a read never reached the ring");
+    if !after_read.reached_ring && (after_read.pool_refused || after_read.files_refused) {
+        eprintln!("skipping: a kernel registration was refused, doors: {after_read:?}");
+        return;
+    }
+    assert!(
+        after_read.reached_ring,
+        "a read never reached the ring, doors: {after_read:?}"
+    );
     assert_eq!(after_read.off_ring, opened, "a read fell off the ring");
 
     // A sync is not a ring op on this backend, so it takes the posix door.
@@ -793,9 +800,13 @@ fn a_direct_read_reaches_the_ring() {
     }
 
     let doors = ReelIo::door_counts(&backend);
+    if !doors.reached_ring && (doors.pool_refused || doors.files_refused) {
+        eprintln!("skipping: a kernel registration was refused, doors: {doors:?}");
+        return;
+    }
     assert!(
         doors.reached_ring,
-        "a direct volume's reads never reached the ring"
+        "a direct volume's reads never reached the ring, doors: {doors:?}"
     );
     assert_eq!(doors.off_ring, opened, "a direct read fell off the ring");
 }
@@ -833,40 +844,8 @@ fn a_direct_read_takes_the_async_door() {
 }
 
 // a whole direct volume writes and reads back through its rings' buffers
-/// Whether this kernel puts a direct op through the ring at all
-///
-/// A runner can set the ring up and still refuse its direct ops, downgrading
-/// every one to posix. That is an environment verdict, not a routing bug, so
-/// the direct test skips on it; where the probe passes, the assert below still
-/// holds the code to the ring.
-fn direct_ring_serves_here() -> bool {
-    let dir = tempdir().expect("tempdir");
-    let (store, ring) = open_direct_on_ring(dir.path());
-    // The volume test at two records: unaligned payloads, both read paths, so
-    // the probe refuses whatever the test would refuse.
-    for byte in 1..=2u8 {
-        store
-            .put(
-                &record_key(GROUP, id(byte)),
-                &vec![byte; 4096 + byte as usize],
-            )
-            .expect("put");
-    }
-    store.flush().expect("flush");
-    for byte in 1..=2u8 {
-        let _ = store.get(&record_key(GROUP, id(byte))).expect("get");
-    }
-    let wanted: Vec<_> = (1..=2u8).map(|byte| record_key(GROUP, id(byte))).collect();
-    let _ = store.get_many(&wanted).expect("get_many");
-    ReelIo::door_counts(&*ring).reached_ring
-}
-
 #[test]
 fn a_direct_volume_serves_a_volume() {
-    if !direct_ring_serves_here() {
-        eprintln!("skipping: this kernel refuses direct ops on the ring");
-        return;
-    }
     let dir = tempdir().expect("tempdir");
     let (store, ring) = open_direct_on_ring(dir.path());
 
@@ -902,9 +881,14 @@ fn a_direct_volume_serves_a_volume() {
         );
     }
 
+    let doors = ReelIo::door_counts(&*ring);
+    if !doors.reached_ring && (doors.pool_refused || doors.files_refused) {
+        eprintln!("skipping: a kernel registration was refused, doors: {doors:?}");
+        return;
+    }
     assert!(
-        ReelIo::door_counts(&*ring).reached_ring,
-        "the whole run was served on posix, so nothing above measured the ring",
+        doors.reached_ring,
+        "the whole run was served on posix, so nothing above measured the ring, doors: {doors:?}",
     );
 }
 

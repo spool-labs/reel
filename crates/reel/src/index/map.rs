@@ -1334,13 +1334,22 @@ impl ReelIndex {
     }
 
     /// Live key count and payload byte total for one column
-    pub fn column_totals(&self, column: ColumnId) -> Totals {
-        self.publish.reading_all(|| match self.column(column) {
-            Some(index) => index.totals(),
-            None => Totals {
-                count: 0,
-                bytes: ByteCount::from_bytes(0),
-            },
+    ///
+    /// A column answering keys out of footers holds keys no shard counted, so it
+    /// declines rather than reporting the resident half as the whole. A column the
+    /// map does not hold at all answers zero, which is what it holds.
+    pub fn column_totals(&self, column: ColumnId) -> Option<Totals> {
+        self.publish.reading_all(|| {
+            if self.answers_from_footers(column) {
+                return None;
+            }
+            Some(match self.column(column) {
+                Some(index) => index.totals(),
+                None => Totals {
+                    count: 0,
+                    bytes: ByteCount::from_bytes(0),
+                },
+            })
         })
     }
 
@@ -1725,8 +1734,8 @@ mod tests {
             400
         );
         assert_eq!(index.get(&blob).expect("read").expect("blob").loc.len, 900);
-        assert_eq!(index.column_totals(RECORD).count, 1);
-        assert_eq!(index.column_totals(BLOB).count, 1);
+        assert_eq!(index.column_totals(RECORD).expect("totals").count, 1);
+        assert_eq!(index.column_totals(BLOB).expect("totals").count, 1);
         assert_eq!(index.totals().count, 2);
         assert_eq!(index.totals().bytes, ByteCount::from_bytes(1300));
     }
@@ -1811,8 +1820,8 @@ mod tests {
             .expect("range delete");
         while index.sweep_covers(usize::MAX).expect("sweep") {}
 
-        assert_eq!(index.column_totals(RECORD).count, 0);
-        assert_eq!(index.column_totals(BLOB).count, 1);
+        assert_eq!(index.column_totals(RECORD).expect("totals").count, 0);
+        assert_eq!(index.column_totals(BLOB).expect("totals").count, 1);
     }
 
     // a playback pages one column's keys and never crosses into another

@@ -291,16 +291,11 @@ impl Store for ReelStore {
 
     fn count_prefix(&self, cf: &str, prefix: &[u8]) -> StoreResult<u64> {
         let column = self.classify(cf)?;
-        // The counters miss the sealed keys of a paged column, and hold the wrong
-        // number while a cover is owed its sweep. The walk is the answer that agrees
-        // with what a read of the same column would find.
-        let counted = !self.index().answers_from_footers(column)
-            && !self
-                .index()
-                .column(column)
-                .is_some_and(|index| index.has_pending_covers());
+        let counted = self.counters_agree(column);
         if prefix.is_empty() && counted {
-            return Ok(self.column_totals(column).count);
+            if let Some(totals) = self.column_totals(column) {
+                return Ok(totals.count);
+            }
         }
         if counted {
             if let Some(totals) = self.prefix_totals(column, prefix) {
@@ -324,6 +319,59 @@ impl Store for ReelStore {
             }
         }
         Ok(total)
+    }
+
+    /// One page of keys under a shard-aligned prefix, in no promised order
+    fn sweep_keys_prefix(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+        from: Option<&[u8]>,
+        limit: usize,
+    ) -> StoreResult<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
+        let column = self.classify(cf)?;
+        let mut page = KeyPage::default();
+        let next = self.sweep_column_prefix(column, prefix, from, limit, &mut page);
+
+        let mut keys = Vec::with_capacity(page.len());
+        for at in 0..page.len() {
+            keys.push(page.key_at(at));
+        }
+        Ok((keys, next))
+    }
+
+    fn bytes_prefix(&self, cf: &str, prefix: &[u8]) -> StoreResult<Option<u64>> {
+        let column = self.classify(cf)?;
+        let counted = self.counters_agree(column);
+        if prefix.is_empty() && counted {
+            if let Some(totals) = self.column_totals(column) {
+                return Ok(Some(totals.bytes.to_bytes()));
+            }
+        }
+        if counted {
+            if let Some(totals) = self.prefix_totals(column, prefix) {
+                return Ok(Some(totals.bytes.to_bytes()));
+            }
+        }
+
+        // The walk reads each key and where its record sits, and no payload at all.
+        let mut scope = Scope {
+            prefix: Some(prefix.to_vec()),
+            ..Scope::empty(Direction::Asc)
+        };
+        let mut page = Page::entries_only(&scope, column, self.serves(column));
+        let mut total = 0u64;
+        let mut key = Vec::new();
+        while let Some((found, _)) = page.next_into(self, &mut key) {
+            match scope.locate(&key) {
+                Position::Past => break,
+                Position::Before => continue,
+                Position::Inside => {
+                    total += found.map_or(0, |entry| u64::from(entry.loc.len));
+                }
+            }
+        }
+        Ok(Some(total))
     }
 
     fn walk_from(
@@ -387,7 +435,7 @@ impl Store for ReelStore {
 
     fn key_count_estimate(&self, cf: &str) -> StoreResult<Option<u64>> {
         match self.classify(cf) {
-            Ok(column) => Ok(Some(self.column_totals(column).count)),
+            Ok(column) => Ok(self.column_totals(column).map(|totals| totals.count)),
             Err(_) => Ok(None),
         }
     }
@@ -400,8 +448,8 @@ impl Store for ReelStore {
                 cf: spec.name.to_string(),
                 volume: StoreVolume::Bulk,
                 sst_bytes: 0,
-                blob_bytes: totals.bytes.to_bytes(),
-                num_keys: totals.count,
+                blob_bytes: totals.map_or(0, |totals| totals.bytes.to_bytes()),
+                num_keys: totals.map_or(0, |totals| totals.count),
             });
         }
         Ok(usage)
@@ -738,6 +786,12 @@ impl Page {
     /// A cursor carrying each key's payload length, for a playback that stages reads
     fn with_lens(scope: &Scope, column: ColumnId, serves: bool) -> Page {
         Page::open(scope, column, serves, KeyPage::with_lens())
+    }
+
+    /// The same cursor without the values a carrying column keeps, for a walk that
+    /// weighs records rather than reading them
+    fn entries_only(scope: &Scope, column: ColumnId, serves: bool) -> Page {
+        Page::open(scope, column, serves, KeyPage::entries_only())
     }
 
     fn open(scope: &Scope, column: ColumnId, serves: bool, buffered: KeyPage) -> Page {
@@ -1134,6 +1188,7 @@ mod tests {
     const RECORD_CF: &str = "record";
     const BLOB_CF: &str = "blob";
     const ARTIFACT_CF: &str = "artifact";
+    const CODED_CF: &str = "coded";
 
     const GROUP_PREFIX_LEN: usize = 2;
     const RECORD_KEY_LEN: usize = GROUP_PREFIX_LEN + 32;
@@ -1173,6 +1228,17 @@ mod tests {
             row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
+            map_shape: MapShape::Tree,
+        },
+        ColumnSpec {
+            id: ColumnId(4),
+            name: CODED_CF,
+            key_width: KeyWidth::Fixed(BLOB_KEY_LEN as u16),
+            shard_bytes: 1,
+            inline_max: 0,
+            row_carry: 0,
+            purge_mark: None,
+            codec: Codec::Lz4,
             map_shape: MapShape::Tree,
         },
     ];
@@ -1247,6 +1313,62 @@ mod tests {
 
     fn keys(store: &dyn Store, cf: &str, prefix: &[u8]) -> Vec<Vec<u8>> {
         store.iter_keys_prefix(cf, prefix).expect("keys")
+    }
+
+    /// Bytes a codec shrinks, so a coded column really stores something coded
+    fn compressible(len: usize) -> Vec<u8> {
+        let words = ["slice", "spool", "track", "epoch", "record", "payload", "the", "and"];
+        let mut bytes = Vec::with_capacity(len + 8);
+        let mut at = 0usize;
+        while bytes.len() < len {
+            bytes.extend_from_slice(words[at % words.len()].as_bytes());
+            bytes.push(b' ');
+            at += 1;
+        }
+        bytes.truncate(len);
+        bytes
+    }
+
+    // a coded record answers a range with the bytes the same record stored raw does
+    #[test]
+    fn coded_ranges_match_raw() {
+        let engine = store();
+        let store = trait_store(&engine);
+        let payload = compressible(8_192);
+        store.put(RECORD_CF, &record(7, 1), &payload).expect("put raw");
+        store.put(CODED_CF, &[9u8; BLOB_KEY_LEN], &payload).expect("put coded");
+
+        // The guard the case rests on: an uncoded record here would make every
+        // assertion below pass without saying anything.
+        let stored = engine.column_totals(ColumnId(4)).expect("totals").bytes.to_bytes();
+        assert!(stored < payload.len() as u64, "the codec stored {stored} of {}", payload.len());
+
+        for (offset, len) in [(0u64, payload.len()), (0, 16), (1_000, 512), (4_096, 8_192), (8_192, 4)]
+        {
+            let raw = store
+                .get_range(RECORD_CF, &record(7, 1), offset, len)
+                .expect("raw range")
+                .map(Value::into_vec);
+            let coded = store
+                .get_range(CODED_CF, &[9u8; BLOB_KEY_LEN], offset, len)
+                .expect("coded range")
+                .map(Value::into_vec);
+            assert_eq!(coded, raw, "range at {offset} for {len}");
+
+            // Asked of the engine itself, since the awaited reads are not
+            // dispatchable through a trait object.
+            let awaited =
+                block_on(Store::get_range_wait(&engine, CODED_CF, &[9u8; BLOB_KEY_LEN], offset, len))
+                    .expect("awaited coded range")
+                    .map(Value::into_vec);
+            assert_eq!(awaited, raw, "awaited range at {offset} for {len}");
+        }
+
+        // A key nothing wrote answers nothing rather than no bytes, coded or not.
+        assert!(store
+            .get_range(CODED_CF, &[1u8; BLOB_KEY_LEN], 0, 4)
+            .expect("missing coded range")
+            .is_none());
     }
 
     // a playback asks the device for a run of payloads rather than one at a time
@@ -1589,6 +1711,47 @@ mod tests {
             1
         );
         assert_eq!(store.count_prefix(RECORD_CF, &[]).expect("count"), 3);
+    }
+
+    // stored bytes under a prefix, from the counters and from the walk alike
+    #[test]
+    fn bytes_under_a_prefix() {
+        let store = store();
+        let store = trait_store(&store);
+        for group in [6u16, 7, 8] {
+            store
+                .put(RECORD_CF, &record(group, 1), &[0x11; 64])
+                .expect("put");
+        }
+        store
+            .put(RECORD_CF, &record(7, 2), &[0x22; 16])
+            .expect("put");
+
+        // The shard prefix is answered from the counters, the deeper one by a walk,
+        // and the two have to agree about the same records.
+        assert_eq!(
+            store.bytes_prefix(RECORD_CF, &7u16.to_be_bytes()).expect("bytes"),
+            Some(80)
+        );
+        assert_eq!(store.bytes_prefix(RECORD_CF, &[]).expect("bytes"), Some(208));
+
+        let mut prefix = 7u16.to_be_bytes().to_vec();
+        prefix.push(2);
+        assert_eq!(store.bytes_prefix(RECORD_CF, &prefix).expect("bytes"), Some(16));
+    }
+
+    // an overwritten record is weighed once, at the length it now holds
+    #[test]
+    fn bytes_follow_the_live_version() {
+        let store = store();
+        let store = trait_store(&store);
+        store.put(RECORD_CF, &record(7, 1), &[0x11; 64]).expect("put");
+        store.put(RECORD_CF, &record(7, 1), &[0x11; 8]).expect("overwrite");
+
+        assert_eq!(store.bytes_prefix(RECORD_CF, &[]).expect("bytes"), Some(8));
+
+        store.delete(RECORD_CF, &record(7, 1)).expect("delete");
+        assert_eq!(store.bytes_prefix(RECORD_CF, &[]).expect("bytes"), Some(0));
     }
 
     // a count that cuts across shards steps the keys rather than the counters

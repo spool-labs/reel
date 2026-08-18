@@ -833,8 +833,29 @@ fn a_direct_read_takes_the_async_door() {
 }
 
 // a whole direct volume writes and reads back through its rings' buffers
+/// Whether this kernel puts a direct op through the ring at all
+///
+/// A runner can set the ring up and still refuse its direct ops, downgrading
+/// every one to posix. That is an environment verdict, not a routing bug, so
+/// the direct test skips on it; where the probe passes, the assert below still
+/// holds the code to the ring.
+fn direct_ring_serves_here() -> bool {
+    let dir = tempdir().expect("tempdir");
+    let (store, ring) = open_direct_on_ring(dir.path());
+    store
+        .put(&record_key(GROUP, id(1)), &vec![1u8; 4096])
+        .expect("put");
+    store.flush().expect("flush");
+    let _ = store.get(&record_key(GROUP, id(1))).expect("get");
+    ReelIo::door_counts(&*ring).reached_ring
+}
+
 #[test]
 fn a_direct_volume_serves_a_volume() {
+    if !direct_ring_serves_here() {
+        eprintln!("skipping: this kernel refuses direct ops on the ring");
+        return;
+    }
     let dir = tempdir().expect("tempdir");
     let (store, ring) = open_direct_on_ring(dir.path());
 

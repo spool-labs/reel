@@ -266,9 +266,17 @@ So a warm win of six to sixteen times is available **only** to a caller on the
 blocking door, and a caller that needs queue depth gives it up by construction. Those
 are opposite doors for opposite workloads: a warm plane of small records wants the
 mapping and no depth, and a cold burst of scattered keys wants depth and cannot have
-the mapping. The escape the code already names and does not build is a warm probe,
-where the first poll answers from the page cache without blocking and a cold one takes
-EAGAIN and rides the driver.
+the mapping.
+
+The escape is a warm probe: one non-blocking read ahead of the op, so a record the
+page cache holds is answered with no tag, slot or completion spent, and a cold one
+takes EAGAIN and rides the driver. `PointReads::Probed` turns it on. Both doors have
+it now, `wait_split_reusing` and `pread_split_reusing` alike.
+
+Prefer the probe to the mapping on media that fails by sector. A bad sector under a
+mapped read is SIGBUS and a dead process; the same read through the door comes back
+an error the caller can act on. The probe keeps the warm win and leaves every cold
+read on the reporting path.
 
 ## Why the tail count is the write-path knob
 

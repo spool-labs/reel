@@ -845,6 +845,13 @@ drawn_shape!(drawn_shape_seed_5, 5);
 drawn_shape!(drawn_shape_seed_8, 8);
 drawn_shape!(drawn_shape_seed_13, 13);
 
+// a reopen must not resurrect a deleted key: the seed a campaign caught compaction on,
+// dropping a tombstone while a number drawn before it had still to land
+drawn_shape!(
+    a_reopen_must_not_resurrect_a_deleted_key,
+    11630724910943363631
+);
+
 // replay one drawn seed by number, the knob a campaign failure names
 #[test]
 fn replay() {

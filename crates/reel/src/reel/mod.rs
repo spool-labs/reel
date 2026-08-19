@@ -729,6 +729,19 @@ impl ReelShared {
         quiet
     }
 
+    /// The number below which no record can still land, the floor a delete is done at
+    ///
+    /// The frontier is read first, so a draw between the two reads is one the check
+    /// sees rather than one the floor lets past. A volume with something in flight
+    /// falls back to the same window a grave holds a key against.
+    pub fn settled_below(&self) -> Lsn {
+        let peek = self.lsn.peek().as_u64();
+        match self.nothing_unpublished() {
+            true => Lsn(peek),
+            false => Lsn(peek.saturating_sub(crate::engine::GRAVE_WINDOW)),
+        }
+    }
+
     /// Cold window reads in flight, not counting the one about to be routed
     fn cold_depth(&self) -> u64 {
         self.cold_depth.load(Ordering::Relaxed)

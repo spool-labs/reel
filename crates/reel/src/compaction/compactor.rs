@@ -708,7 +708,13 @@ impl Compactor {
         if reel.tails().is_empty() {
             return Ok(());
         }
-        let min_other = index.min_lsn_excluding(segment);
+        // What the other segments hold is only half the floor: a number drawn before
+        // this pass can still be published into a segment after it, under an lsn no
+        // floor has seen, so a tombstone above what is settled has to come across.
+        let settled = shared.settled_below();
+        let drop_floor = index
+            .min_lsn_excluding(segment)
+            .map_or(settled, |floor| floor.min(settled));
         let source = match source_handle(shared, segment) {
             Ok(source) => source,
             Err(error) if is_missing(&error) => {
@@ -763,7 +769,7 @@ impl Compactor {
                 order,
                 *prefix_bound,
                 segment,
-                min_other,
+                drop_floor,
                 &mut tally,
                 &mut pace,
             ),
@@ -773,7 +779,7 @@ impl Compactor {
                 index,
                 &mut reader,
                 segment,
-                min_other,
+                drop_floor,
                 &mut tally,
                 &mut pace,
             ),
@@ -883,7 +889,7 @@ impl Compactor {
         order: &[(u32, u32)],
         prefix_bound: u64,
         segment: SegmentId,
-        min_other: Option<Lsn>,
+        drop_floor: Lsn,
         tally: &mut PassTally,
         pace: &mut PassPace<'_>,
     ) -> Result<()> {
@@ -926,7 +932,7 @@ impl Compactor {
 
             for (_, record, payload) in staged {
                 self.apply_one(
-                    reel, dest_index, index, reader, &record, payload, segment, min_other, tally,
+                    reel, dest_index, index, reader, &record, payload, segment, drop_floor, tally,
                 )?;
                 pace.reached(reader.read_bytes() + tally.copied_bytes);
             }
@@ -947,7 +953,7 @@ impl Compactor {
         index: &ReelIndex,
         reader: &mut SegmentReader<'_>,
         segment: SegmentId,
-        min_other: Option<Lsn>,
+        drop_floor: Lsn,
         tally: &mut PassTally,
         pace: &mut PassPace<'_>,
     ) -> Result<()> {
@@ -968,7 +974,7 @@ impl Compactor {
                 &record,
                 Staged::Unread,
                 segment,
-                min_other,
+                drop_floor,
                 tally,
             )?;
             pace.reached(reader.read_bytes() + tally.copied_bytes);
@@ -1016,11 +1022,11 @@ impl Compactor {
         record: &SourceRecord,
         staged: Staged,
         segment: SegmentId,
-        min_other: Option<Lsn>,
+        drop_floor: Lsn,
         tally: &mut PassTally,
     ) -> Result<()> {
         match self.rewrite_one(
-            reel, dest_index, index, reader, record, staged, segment, min_other,
+            reel, dest_index, index, reader, record, staged, segment, drop_floor,
         )? {
             Rewrote::Copied(span) => {
                 tally.copied_bytes += span;
@@ -1052,12 +1058,12 @@ impl Compactor {
         record: &SourceRecord,
         staged: Staged,
         segment: SegmentId,
-        min_other: Option<Lsn>,
+        drop_floor: Lsn,
     ) -> Result<Rewrote> {
         if record.header.flags.is_tombstone() || record.header.flags.is_range_tombstone() {
             return Ok(
                 match self
-                    .carry_or_drop(reel, dest_index, index, reader, record, staged, min_other)?
+                    .carry_or_drop(reel, dest_index, index, reader, record, staged, drop_floor)?
                 {
                     TombstoneStep::Carried => Rewrote::Carried,
                     TombstoneStep::Dropped => Rewrote::Dropped,
@@ -1411,9 +1417,9 @@ impl Compactor {
         reader: &mut SegmentReader<'_>,
         record: &SourceRecord,
         staged: Staged,
-        min_other: Option<Lsn>,
+        drop_floor: Lsn,
     ) -> Result<TombstoneStep> {
-        if !should_carry(index, &record.header, min_other)? {
+        if !should_carry(index, &record.header, drop_floor)? {
             return Ok(TombstoneStep::Dropped);
         }
         let tail = &reel.tails()[dest_index];
@@ -1663,11 +1669,12 @@ fn footer_facts(footer: &SegmentFooter) -> FooterFacts {
     }
 }
 
-fn should_carry(
-    index: &ReelIndex,
-    tombstone: &RecordHeader,
-    min_other: Option<Lsn>,
-) -> Result<bool> {
+/// Whether a tombstone has to come across, or nothing it shadows can still turn up
+///
+/// A newer entry in the index says the key is live again, so the delete is finished.
+/// Otherwise the floor decides: a tombstone at or above it is still holding its key's
+/// place against a record that has not landed yet.
+fn should_carry(index: &ReelIndex, tombstone: &RecordHeader, drop_floor: Lsn) -> Result<bool> {
     if tombstone.flags.is_tombstone() {
         if let Some(entry) = index.get(&tombstone.key)? {
             if entry.lsn > tombstone.lsn {
@@ -1675,11 +1682,7 @@ fn should_carry(
             }
         }
     }
-    Ok(match min_other {
-        Some(floor) if tombstone.lsn < floor => false,
-        Some(_) => true,
-        None => false,
-    })
+    Ok(tombstone.lsn >= drop_floor)
 }
 
 impl Compactor {
@@ -2605,6 +2608,31 @@ mod tests {
 
         let rebuilt = rebuilt_from(&fixture);
         assert_eq!(rebuilt_keys(&rebuilt), vec![key_bytes(2), key_bytes(3)]);
+    }
+
+    // a number drawn before a delete can still land under it, so the tombstone stands
+    #[test]
+    fn carries_tombstone_over_a_drawn_number() {
+        let fixture = fixture(settings());
+        put(&fixture, 1, vec![0x11; 200]);
+        delete(&fixture, 1);
+        seal(&fixture);
+        put(&fixture, 2, vec![0x22; 200]);
+        seal(&fixture);
+        put(&fixture, 3, vec![0x33; 200]);
+
+        // one writer past its draw and short of its segment, which is what the floor
+        // the standing segments show cannot see
+        let drawn = fixture.reel.shared().draw_gauge(1);
+        fixture
+            .compactor
+            .compact_segment(&fixture.reel, &fixture.index, SegmentId(1))
+            .expect("compact");
+        drop(drawn);
+        fixture.reel.flush().expect("flush");
+
+        assert_eq!(fixture.compactor.counters().tombstones_carried, 1);
+        assert_eq!(fixture.compactor.counters().tombstones_dropped, 0);
     }
 
     // a dropped tombstone never resurrects its key on a rebuild

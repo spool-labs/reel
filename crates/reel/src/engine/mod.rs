@@ -57,7 +57,7 @@ pub(crate) const LOCK_FILE: &str = "reel.lock";
 ///
 /// A grave refuses a record drawn before it and published after it, so it is done
 /// once no such record can still arrive.
-const GRAVE_WINDOW: u64 = 1 << 20;
+pub(crate) const GRAVE_WINDOW: u64 = 1 << 20;
 
 /// Bytes admitted between maintenance asks that make ingest hot
 ///

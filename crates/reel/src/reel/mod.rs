@@ -475,6 +475,17 @@ impl ReelShared {
         let _ = self.segments.set(segments);
     }
 
+    /// Note the oldest number a segment can surface, as soon as its bytes are down
+    ///
+    /// Booked at landing rather than at the publish, since a caller that goes away
+    /// between the two leaves a record a rebuild still finds and no entry names. The
+    /// publish books the same number again, which a minimum takes twice for free.
+    pub fn note_landed(&self, segment: SegmentId, lsn: Lsn) {
+        if let Some(segments) = self.segments.get() {
+            segments.note_min(segment, lsn);
+        }
+    }
+
     /// A sealed segment's directory, read once and held for the life of the segment
     pub fn footer_map_of(&self, segment: SegmentId) -> Result<Option<Arc<FooterMap>>> {
         if let Some(map) = self.footers.map_of(segment) {

@@ -788,6 +788,9 @@ impl Appender {
                     }
                 }
                 let loc = outcome?;
+                // The bytes are down, so the segment can surface this number whether or
+                // not the caller stays to publish it.
+                self.shared.note_landed(loc.segment, lsn);
                 self.tail.publish_committed(base + span);
                 self.step_reservation(&active, base + span);
                 self.paced_writeback(&active);
@@ -909,6 +912,11 @@ impl Appender {
                     }
                 }
                 let locs = outcome?;
+                // The run took one reservation in one segment and its numbers were
+                // issued in order, so the frame's own is the oldest of them.
+                if let Some(first) = headers.first() {
+                    self.shared.note_landed(active.handle.id(), first.lsn);
+                }
                 self.tail.publish_committed(base + span);
                 self.step_reservation(&active, base + span);
                 self.paced_writeback(&active);

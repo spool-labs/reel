@@ -2122,6 +2122,9 @@ mod tests {
             crate::config::ShardShapes::Tree,
         )
         .expect("index");
+        // What the engine wires at open: the seal reads a segment's tally from these
+        // and a landing books its floor into them.
+        shared.set_segments(index.segments_handle());
         let compactor = Compactor::new(&config, 0, 0);
         Fixture {
             sim,
@@ -2633,6 +2636,37 @@ mod tests {
 
         assert_eq!(fixture.compactor.counters().tombstones_carried, 1);
         assert_eq!(fixture.compactor.counters().tombstones_dropped, 0);
+    }
+
+    // a record that landed and never published still holds its segment's floor down
+    #[test]
+    fn a_landed_orphan_keeps_its_tombstone() {
+        let fixture = fixture(settings());
+        // What a dropped future leaves: the bytes are on the device under the oldest
+        // number on the volume, and no index entry ever names them.
+        drop(
+            fixture
+                .reel
+                .put(key(1), vec![0x11; 200], 0, Commit::PerRecord)
+                .expect("orphan"),
+        );
+        seal(&fixture);
+        put(&fixture, 1, vec![0x22; 200]);
+        delete(&fixture, 1);
+        seal(&fixture);
+        put(&fixture, 2, vec![0x33; 200]);
+
+        fixture
+            .compactor
+            .compact_segment(&fixture.reel, &fixture.index, SegmentId(2))
+            .expect("compact");
+        fixture.reel.flush().expect("flush");
+
+        assert_eq!(fixture.compactor.counters().tombstones_carried, 1);
+        assert_eq!(fixture.compactor.counters().tombstones_dropped, 0);
+
+        let rebuilt = rebuilt_from(&fixture);
+        assert!(!rebuilt_keys(&rebuilt).contains(&key_bytes(1)));
     }
 
     // a dropped tombstone never resurrects its key on a rebuild

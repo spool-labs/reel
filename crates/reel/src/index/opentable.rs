@@ -36,6 +36,12 @@ const LOAD_SLOTS: usize = 8;
 /// Bytes of control a slot carries beside its key and its value
 pub const CONTROL_BYTES: u64 = 1;
 
+/// Control bytes one probe reads at a time
+const GROUP: usize = 16;
+
+/// Control bytes kept past the end of the array, mirroring its head
+const MIRROR: usize = GROUP - 1;
+
 /// Slots that hold this many keys at the load factor, rounded up
 ///
 /// Exact rather than rounded to a power of two, which is what the multiply-shift
@@ -81,6 +87,9 @@ pub struct OpenTable<const N: usize, Value> {
 
     /// Keys the table holds, which is what the load factor is measured against
     held: usize,
+
+    /// Resizes this table has been through, since each one moves every slot
+    generation: u64,
 }
 
 impl<const N: usize, Value> Default for OpenTable<N, Value> {
@@ -91,6 +100,7 @@ impl<const N: usize, Value> Default for OpenTable<N, Value> {
             keys: Vec::new(),
             values: Vec::new(),
             held: 0,
+            generation: 0,
         }
     }
 }
@@ -115,7 +125,7 @@ impl<const N: usize, Value: Default> OpenTable<N, Value> {
 
     /// Slots the table holds, filled and empty
     pub fn slots(&self) -> usize {
-        self.control.len()
+        self.keys.len()
     }
 
     /// Keys the table holds
@@ -126,6 +136,16 @@ impl<const N: usize, Value: Default> OpenTable<N, Value> {
     /// Whether the table holds no keys at all
     pub fn is_empty(&self) -> bool {
         self.held == 0
+    }
+
+    /// Write one control byte, and every mirror of it past the end of the array
+    fn put_control(&mut self, at: usize, byte: u8) {
+        self.control[at] = byte;
+        let mut mirror = at + self.slots();
+        while mirror < self.control.len() {
+            self.control[mirror] = byte;
+            mirror += self.slots();
+        }
     }
 
     /// What is held for a key
@@ -157,7 +177,7 @@ impl<const N: usize, Value: Default> OpenTable<N, Value> {
                 }
             }
         };
-        self.control[free] = fragment(hash_of(&key));
+        self.put_control(free, fragment(hash_of(&key)));
         self.keys[free] = key;
         self.values[free] = value;
         self.held += 1;
@@ -174,12 +194,12 @@ impl<const N: usize, Value: Default> OpenTable<N, Value> {
 
     /// Drop every key, keeping the room already taken
     pub fn clear(&mut self) {
-        for at in 0..self.control.len() {
+        for at in 0..self.slots() {
             if self.control[at] != EMPTY {
-                self.control[at] = EMPTY;
                 self.values[at] = Value::default();
             }
         }
+        self.control.fill(EMPTY);
         self.held = 0;
     }
 
@@ -218,13 +238,38 @@ impl<const N: usize, Value: Default> OpenTable<N, Value> {
     /// A column taking this shape pays for its footprint here.
     pub fn sorted(&self) -> Vec<(&[u8; N], &Value)> {
         let mut held: Vec<(&[u8; N], &Value)> = Vec::with_capacity(self.held);
-        for at in 0..self.control.len() {
+        for at in 0..self.slots() {
             if self.control[at] != EMPTY {
                 held.push((&self.keys[at], &self.values[at]));
             }
         }
         held.sort_unstable_by(|left, right| left.0.cmp(right.0));
         held
+    }
+
+    /// One page of the table in slot order, and where the next page starts
+    ///
+    /// Slot order is not key order and is not stable across a resize, which is
+    /// why the caller carries a generation beside the mark. What it buys is a
+    /// page that costs the page: no gather of the whole shard and no sort.
+    pub fn slot_page(&self, from: usize, limit: usize) -> (Vec<(&[u8; N], &Value)>, Option<usize>) {
+        let mut held = Vec::with_capacity(limit.min(self.held));
+        let mut at = from;
+        while at < self.slots() {
+            if self.control[at] != EMPTY {
+                if held.len() == limit {
+                    return (held, Some(at));
+                }
+                held.push((&self.keys[at], &self.values[at]));
+            }
+            at += 1;
+        }
+        (held, None)
+    }
+
+    /// How many times the table has been resized, which moves every slot
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Every pair inside a span, in key order
@@ -234,7 +279,7 @@ impl<const N: usize, Value: Default> OpenTable<N, Value> {
         high: Bound<&[u8; N]>,
     ) -> Vec<(&[u8; N], &Value)> {
         let mut held: Vec<(&[u8; N], &Value)> = Vec::new();
-        for at in 0..self.control.len() {
+        for at in 0..self.slots() {
             if self.control[at] == EMPTY {
                 continue;
             }
@@ -266,10 +311,93 @@ impl<const N: usize, Value: Default> OpenTable<N, Value> {
     ///
     /// The walk stops at the first empty slot because a chain is contiguous from its
     /// home, so an empty slot on it means the key is not in the table.
+    #[cfg(target_arch = "aarch64")]
     fn site(&self, key: &[u8; N]) -> Site {
+        use std::arch::aarch64::*;
+
         let slots = self.slots();
         // A table nothing has been put in has no slot to name, and the caller that
         // sees this makes room and asks again.
+        if slots == 0 {
+            return Site::Free(0);
+        }
+        let hash = hash_of(key);
+        let want = fragment(hash);
+        let mut group = home(hash, slots);
+        // SAFETY: NEON is baseline on aarch64, and the mirror keeps a sixteen byte
+        // load inside the allocation from any slot the table names.
+        unsafe {
+            let wanted = vdupq_n_u8(want);
+            loop {
+                let held = vld1q_u8(self.control.as_ptr().add(group));
+                let hit = nibble_mask(vceqq_u8(held, wanted));
+                let empty = nibble_mask(vcltq_s8(vreinterpretq_s8_u8(held), vdupq_n_s8(0)));
+                let mut live = match empty {
+                    0 => hit,
+                    _ => hit & !(u64::MAX << empty.trailing_zeros()),
+                };
+                while live != 0 {
+                    let lane = live.trailing_zeros() as usize / NIBBLE_BITS;
+                    let at = wrap(group + lane, slots);
+                    // Nothing is ever resolved on the fragment alone.
+                    if self.keys[at] == *key {
+                        return Site::Held(at);
+                    }
+                    // The mask carries four bits a lane, so the whole nibble goes.
+                    live &= !(0xF << (lane * NIBBLE_BITS));
+                }
+                if empty != 0 {
+                    let lane = empty.trailing_zeros() as usize / NIBBLE_BITS;
+                    return Site::Free(wrap(group + lane, slots));
+                }
+                group = wrap(group + GROUP, slots);
+            }
+        }
+    }
+
+    /// The same walk on x86, where the group mask is one instruction
+    #[cfg(target_arch = "x86_64")]
+    fn site(&self, key: &[u8; N]) -> Site {
+        use std::arch::x86_64::*;
+
+        let slots = self.slots();
+        if slots == 0 {
+            return Site::Free(0);
+        }
+        let hash = hash_of(key);
+        let want = fragment(hash);
+        let mut group = home(hash, slots);
+        // SAFETY: SSE2 is baseline on x86-64, and the mirror keeps a sixteen byte load
+        // inside the allocation from any slot the table names.
+        unsafe {
+            let wanted = _mm_set1_epi8(want as i8);
+            loop {
+                let held = _mm_loadu_si128(self.control.as_ptr().add(group) as *const __m128i);
+                let hit = _mm_movemask_epi8(_mm_cmpeq_epi8(held, wanted)) as u32;
+                let empty = _mm_movemask_epi8(held) as u32;
+                let mut live = match empty {
+                    0 => hit,
+                    _ => hit & !(u32::MAX << empty.trailing_zeros()),
+                };
+                while live != 0 {
+                    let at = wrap(group + live.trailing_zeros() as usize, slots);
+                    if self.keys[at] == *key {
+                        return Site::Held(at);
+                    }
+                    live &= live - 1;
+                }
+                if empty != 0 {
+                    return Site::Free(wrap(group + empty.trailing_zeros() as usize, slots));
+                }
+                group = wrap(group + GROUP, slots);
+            }
+        }
+    }
+
+    /// The same walk a slot at a time, where a machine has no group load
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    fn site(&self, key: &[u8; N]) -> Site {
+        let slots = self.slots();
         if slots == 0 {
             return Site::Free(0);
         }
@@ -304,26 +432,33 @@ impl<const N: usize, Value: Default> OpenTable<N, Value> {
         while self.control[probe] != EMPTY {
             let from = home(hash_of(&self.keys[probe]), slots);
             if reach(from, hole, slots) < reach(from, probe, slots) {
-                self.control[hole] = self.control[probe];
+                let moved = self.control[probe];
+                self.put_control(hole, moved);
                 self.keys[hole] = self.keys[probe];
                 self.values[hole] = std::mem::take(&mut self.values[probe]);
                 hole = probe;
             }
             probe = step(probe, slots);
         }
-        self.control[hole] = EMPTY;
+        self.put_control(hole, EMPTY);
         self.held -= 1;
         taken
     }
 
     /// Build a table of this many slots and put every held key back in it
     fn resize(&mut self, slots: usize) {
-        let mut control = vec![EMPTY; slots];
+        // Every slot moves, so a mark taken before this one means nothing after
+        // it. A sweep holding one restarts its shard rather than skipping keys.
+        self.generation += 1;
+        let mut control = match slots {
+            0 => Vec::new(),
+            _ => vec![EMPTY; slots + MIRROR],
+        };
         let mut keys = vec![[0u8; N]; slots];
         let mut values: Vec<Value> = Vec::with_capacity(slots);
         values.resize_with(slots, Value::default);
 
-        for at in 0..self.control.len() {
+        for at in 0..self.slots() {
             if self.control[at] == EMPTY {
                 continue;
             }
@@ -336,6 +471,10 @@ impl<const N: usize, Value: Default> OpenTable<N, Value> {
             control[to] = fragment(hash);
             keys[to] = key;
             values[to] = std::mem::take(&mut self.values[at]);
+        }
+
+        for at in slots..control.len() {
+            control[at] = control[at % slots];
         }
 
         self.control = control;
@@ -368,6 +507,38 @@ fn home(hash: u64, slots: usize) -> usize {
     ((hash as u128 * slots as u128) >> 64) as usize
 }
 
+/// A slot a group scan named past the end of the table, brought back inside it
+///
+/// A table narrower than a group can be passed more than once, so the path off the end
+/// is a modulo rather than one subtraction.
+#[inline(always)]
+fn wrap(at: usize, slots: usize) -> usize {
+    match at >= slots {
+        true => at % slots,
+        false => at,
+    }
+}
+
+/// Bits one lane of an aarch64 group mask carries
+#[cfg(target_arch = "aarch64")]
+const NIBBLE_BITS: usize = 4;
+
+/// A NEON compare as four bits a lane, folded into one word
+///
+/// # Safety
+/// NEON, which is baseline on aarch64.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn nibble_mask(cmp: std::arch::aarch64::uint8x16_t) -> u64 {
+    use std::arch::aarch64::*;
+
+    // SAFETY: the caller is inside the group walk, which runs on NEON.
+    unsafe {
+        let nibbles = vshrn_n_u16(vreinterpretq_u16_u8(cmp), 4);
+        vget_lane_u64(vreinterpret_u64_u8(nibbles), 0)
+    }
+}
+
 /// The next slot on a chain, wrapping at the end of the table
 fn step(at: usize, slots: usize) -> usize {
     match at + 1 == slots {
@@ -392,18 +563,28 @@ fn fragment(hash: u64) -> u8 {
     (hash & 0x7F) as u8
 }
 
+/// One round of the key mix: a word in, a multiply and a shift out
+#[inline(always)]
+fn mixed(hash: u64, word: u64) -> u64 {
+    let mixed = (hash ^ word).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    mixed ^ (mixed >> 31)
+}
+
 /// One 64 bit hash of a key
 ///
 /// Mixed rather than taken raw, since a column is free to declare an open shape over
 /// structured keys and passing those through would pile a shard onto one chain.
-fn hash_of(key: &[u8]) -> u64 {
+#[inline(always)]
+fn hash_of<const N: usize>(key: &[u8; N]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for chunk in key.chunks(8) {
+    let mut words = key.chunks_exact(8);
+    for word in &mut words {
+        hash = mixed(hash, u64::from_le_bytes(word.try_into().unwrap()));
+    }
+    if !N.is_multiple_of(8) {
         let mut word = [0u8; 8];
-        word[..chunk.len()].copy_from_slice(chunk);
-        hash ^= u64::from_le_bytes(word);
-        hash = hash.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        hash ^= hash >> 31;
+        word[..N % 8].copy_from_slice(words.remainder());
+        hash = mixed(hash, u64::from_le_bytes(word));
     }
     // A final avalanche, so the high bits the home slot reads and the low bits the
     // fragment reads both depend on every byte of the key.
@@ -416,6 +597,99 @@ fn hash_of(key: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::column::{Mark, ShardMap};
+    use std::collections::BTreeSet;
+
+    /// Keys a sweep test puts in, enough to cross several pages
+    const SWEPT: usize = 5_000;
+
+    fn key_of(at: usize) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&(at as u64).to_le_bytes());
+        key
+    }
+
+    /// Every key a sweep hands out, paging until the mark comes back empty
+    fn swept(table: &OpenTable<32, u64>, page: usize) -> Vec<[u8; 32]> {
+        let mut seen = Vec::new();
+        let mut mark = Mark::Start;
+        loop {
+            let (rows, next) = ShardMap::sweep(table, &mark, page);
+            for (key, _) in rows {
+                seen.push(*key);
+            }
+            match next {
+                Some(next) => mark = next,
+                None => return seen,
+            }
+        }
+    }
+
+    // a sweep hands out every live key exactly once
+    #[test]
+    fn sweep_covers() {
+        let mut table = OpenTable::<32, u64>::new();
+        for at in 0..SWEPT {
+            table.insert(key_of(at), at as u64);
+        }
+
+        for page in [1usize, 7, 512, SWEPT * 2] {
+            let seen = swept(&table, page);
+            assert_eq!(seen.len(), SWEPT, "page {page} lost or repeated keys");
+            assert_eq!(
+                seen.iter().copied().collect::<BTreeSet<_>>().len(),
+                SWEPT,
+                "page {page} handed a key out twice"
+            );
+        }
+    }
+
+    // a resize mid sweep restarts the shard rather than skipping what moved
+    #[test]
+    fn sweep_survives_resize() {
+        let mut table = OpenTable::<32, u64>::new();
+        for at in 0..SWEPT {
+            table.insert(key_of(at), at as u64);
+        }
+
+        let (first, mark) = ShardMap::sweep(&table, &Mark::Start, 100);
+        assert_eq!(first.len(), 100);
+        let mark = mark.expect("more to sweep");
+        let before = table.generation();
+
+        // Grow past the load factor, which moves every slot the mark named.
+        for at in SWEPT..(SWEPT * 4) {
+            table.insert(key_of(at), at as u64);
+        }
+        assert!(table.generation() > before, "the table never resized");
+
+        // The stale mark is refused, so the sweep starts over and loses nothing.
+        let mut seen = BTreeSet::new();
+        let mut mark = mark;
+        loop {
+            let (rows, next) = ShardMap::sweep(&table, &mark, 512);
+            for (key, _) in rows {
+                seen.insert(*key);
+            }
+            match next {
+                Some(next) => mark = next,
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), SWEPT * 4, "a resized sweep lost keys");
+    }
+
+    // a mark another shape minted is refused rather than misread
+    #[test]
+    fn sweep_refuses_foreign() {
+        let mut table = OpenTable::<32, u64>::new();
+        for at in 0..64 {
+            table.insert(key_of(at), at as u64);
+        }
+
+        let (rows, _) = ShardMap::sweep(&table, &Mark::Key(Box::from(&key_of(10)[..])), 1024);
+        assert_eq!(rows.len(), 64, "a foreign mark should start the shard over");
+    }
 
     use crate::format::loc::{Loc, SegmentId};
     use crate::format::lsn::Lsn;

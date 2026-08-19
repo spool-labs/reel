@@ -39,6 +39,12 @@ pub struct DoorCounts {
 
     /// Ops handed to another backend instead of going on a ring
     pub off_ring: u64,
+
+    /// Whether the kernel refused a thread's buffer pool
+    pub pool_refused: bool,
+
+    /// Whether the kernel refused a ring's sparse file table
+    pub files_refused: bool,
 }
 
 /// Ring-shaped file I/O every reel backend implements

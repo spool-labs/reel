@@ -475,6 +475,17 @@ impl ReelShared {
         let _ = self.segments.set(segments);
     }
 
+    /// Note the oldest number a segment can surface, as soon as its bytes are down
+    ///
+    /// Booked at landing rather than at the publish, since a caller that goes away
+    /// between the two leaves a record a rebuild still finds and no entry names. The
+    /// publish books the same number again, which a minimum takes twice for free.
+    pub fn note_landed(&self, segment: SegmentId, lsn: Lsn) {
+        if let Some(segments) = self.segments.get() {
+            segments.note_min(segment, lsn);
+        }
+    }
+
     /// A sealed segment's directory, read once and held for the life of the segment
     pub fn footer_map_of(&self, segment: SegmentId) -> Result<Option<Arc<FooterMap>>> {
         if let Some(map) = self.footers.map_of(segment) {
@@ -727,6 +738,19 @@ impl ReelShared {
             .filter_map(|(_, held)| held.as_ref())
             .all(|held| held.unpublished.load(Ordering::Acquire) == 0);
         quiet
+    }
+
+    /// The number below which no record can still land, the floor a delete is done at
+    ///
+    /// The frontier is read first, so a draw between the two reads is one the check
+    /// sees rather than one the floor lets past. A volume with something in flight
+    /// falls back to the same window a grave holds a key against.
+    pub fn settled_below(&self) -> Lsn {
+        let peek = self.lsn.peek().as_u64();
+        match self.nothing_unpublished() {
+            true => Lsn(peek),
+            false => Lsn(peek.saturating_sub(crate::engine::GRAVE_WINDOW)),
+        }
     }
 
     /// Cold window reads in flight, not counting the one about to be routed
@@ -1292,6 +1316,7 @@ impl Reel {
                 prefix,
                 span,
                 take_header(),
+                self.shared.warm_first(),
             );
             return near_range(read, prefix, at, len, expected, lsn, loc);
         }
@@ -1664,10 +1689,14 @@ impl Reel {
         }
 
         let spare = take_header();
-        let read =
-            self.shared
-                .driver
-                .pread_split_reusing(handle.file(), offset, prefix, len, spare);
+        let read = self.shared.driver.pread_split_reusing(
+            handle.file(),
+            offset,
+            prefix,
+            len,
+            spare,
+            self.shared.warm_first(),
+        );
         framed_or_nothing(read, prefix, len)
     }
 

@@ -481,6 +481,29 @@ impl ColumnIndex {
         on_index!(self, index => index.page(start, limit, out))
     }
 
+    /// One page of the keys under a shard-aligned prefix, in no promised order
+    pub fn sweep_prefix(
+        &self,
+        nonce: u64,
+        prefix: &[u8],
+        from: Option<&ColumnMark>,
+        limit: usize,
+        out: &mut KeyPage,
+    ) -> Option<ColumnMark> {
+        on_index!(self, index => index.sweep_prefix(nonce, prefix, from, limit, out))
+    }
+
+    /// One page of the column's live keys, in no promised order
+    pub fn sweep(
+        &self,
+        nonce: u64,
+        from: Option<&ColumnMark>,
+        limit: usize,
+        out: &mut KeyPage,
+    ) -> Option<ColumnMark> {
+        on_index!(self, index => index.sweep(nonce, from, limit, out))
+    }
+
     /// Fill a page with one bounded run of live keys, descending from a bound
     pub fn page_back(&self, end: Bound<&[u8]>, limit: usize, out: &mut KeyPage) {
         on_index!(self, index => index.page_back(end, limit, out))
@@ -2058,6 +2081,56 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         })
     }
 
+    /// One page of the keys under a shard-aligned prefix, in no promised order
+    ///
+    /// The prefix has to be exactly the shard key: a shorter one spans shards
+    /// and a longer one splits a shard, and neither can be served by walking one
+    /// shard's slots. Refused rather than served slowly, the same way
+    /// `prefix_totals` refuses, so a caller cannot ask for a full scan by
+    /// accident.
+    pub fn sweep_prefix(
+        &self,
+        nonce: u64,
+        prefix: &[u8],
+        from: Option<&ColumnMark>,
+        limit: usize,
+        out: &mut KeyPage,
+    ) -> Option<ColumnMark> {
+        out.clear();
+        if self.shard_bytes == 0 || prefix.len() != self.shard_bytes as usize || limit == 0 {
+            return None;
+        }
+        let at = self.shard_of_bytes(prefix);
+        if at >= self.shards.len() {
+            return None;
+        }
+
+        let resumed = from.filter(|mark| mark.nonce == nonce && mark.shard == at);
+        let mut within = resumed.map_or(Mark::Start, |mark| mark.within.clone());
+        loop {
+            let state = read(&self.shards[at]);
+            let room = limit - out.len();
+            let (rows, next) = state.map.sweep(&within, room);
+            for (key, entry) in &rows {
+                if entry.is_grave() || self.is_covered(key.as_slice(), entry.lsn) {
+                    continue;
+                }
+                out.push_carried(key.as_slice(), **entry, None);
+            }
+            match next {
+                Some(next) if out.len() >= limit => {
+                    return Some(ColumnMark {
+                        nonce,
+                        shard: at,
+                        within: next,
+                    })
+                }
+                Some(next) => within = next,
+                None => return None,
+            }
+        }
+    }
+
     /// Fill a page with one bounded run of live keys, ascending from a bound
     ///
     /// Each key's location goes into the page with it, so a playback stages its reads
@@ -2101,6 +2174,67 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 }
             }
         }
+    }
+
+    /// One page of the column's live keys, in no promised order, and where the
+    /// next page starts
+    ///
+    /// Every live key is handed out at least once across a full sweep. Not
+    /// exactly once: a shard that resizes mid sweep starts over, and the callers
+    /// of this are idempotent by construction. Graves and covered entries are
+    /// filtered here the same way a paged read filters them.
+    pub fn sweep(
+        &self,
+        nonce: u64,
+        from: Option<&ColumnMark>,
+        limit: usize,
+        out: &mut KeyPage,
+    ) -> Option<ColumnMark> {
+        out.clear();
+        if limit == 0 {
+            return from.cloned();
+        }
+        // A mark another opening minted names a shard layout this one never had.
+        let resumed = from.filter(|mark| mark.nonce == nonce);
+        let first = resumed.map_or(0, |mark| mark.shard);
+
+        for at in first..self.shards.len() {
+            let mut within = match at == first {
+                true => resumed.map_or(Mark::Start, |mark| mark.within.clone()),
+                false => Mark::Start,
+            };
+            loop {
+                let state = read(&self.shards[at]);
+                let room = limit - out.len();
+                let (rows, next) = state.map.sweep(&within, room);
+                for (key, entry) in &rows {
+                    if entry.is_grave() || self.is_covered(key.as_slice(), entry.lsn) {
+                        continue;
+                    }
+                    out.push_carried(key.as_slice(), **entry, None);
+                }
+                match next {
+                    // The shard has more, and the page is full if it took the room.
+                    Some(next) if out.len() >= limit => {
+                        return Some(ColumnMark {
+                            nonce,
+                            shard: at,
+                            within: next,
+                        })
+                    }
+                    Some(next) => within = next,
+                    None => break,
+                }
+            }
+            if out.len() >= limit && at + 1 < self.shards.len() {
+                return Some(ColumnMark {
+                    nonce,
+                    shard: at + 1,
+                    within: Mark::Start,
+                });
+            }
+        }
+        None
     }
 
     /// Fill a page with one bounded run of live keys, descending from a bound
@@ -2248,6 +2382,89 @@ fn settle<K: IndexKey, S: Shape<K>>(
 ///
 /// Generic in the value as well as the key, because a shard holds two of these:
 /// the entries, and the values a carrying column keeps beside them.
+/// Where a sweep of a whole column left off
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColumnMark {
+    /// The opening that minted this mark
+    pub nonce: u64,
+
+    /// The shard the sweep stopped in
+    pub shard: usize,
+
+    /// Where it stopped inside that shard
+    pub within: Mark,
+}
+
+impl ColumnMark {
+    /// The mark as bytes, for a caller that carries it over a wire or a restart
+    ///
+    /// Opaque on purpose: the shape of it is this engine's business, and a peer
+    /// or a cursor that stored one only ever hands it back.
+    pub fn pack(&self) -> Vec<u8> {
+        let mut packed = Vec::with_capacity(32);
+        packed.extend_from_slice(&self.nonce.to_le_bytes());
+        packed.extend_from_slice(&(self.shard as u64).to_le_bytes());
+        match &self.within {
+            Mark::Start => packed.push(0),
+            Mark::Slot { at, generation } => {
+                packed.push(1);
+                packed.extend_from_slice(&(*at as u64).to_le_bytes());
+                packed.extend_from_slice(&generation.to_le_bytes());
+            }
+            Mark::Key(key) => {
+                packed.push(2);
+                packed.extend_from_slice(key);
+            }
+        }
+        packed
+    }
+
+    /// A mark read back from bytes, or nothing where they are not one
+    ///
+    /// Nothing rather than an error: bytes that do not decode are bytes from
+    /// somewhere else, and the sweep that gets them starts over.
+    pub fn unpack(packed: &[u8]) -> Option<ColumnMark> {
+        if packed.len() < 17 {
+            return None;
+        }
+        let nonce = u64::from_le_bytes(packed[..8].try_into().ok()?);
+        let shard = u64::from_le_bytes(packed[8..16].try_into().ok()?) as usize;
+        let within = match packed[16] {
+            0 => Mark::Start,
+            1 if packed.len() == 33 => Mark::Slot {
+                at: u64::from_le_bytes(packed[17..25].try_into().ok()?) as usize,
+                generation: u64::from_le_bytes(packed[25..33].try_into().ok()?),
+            },
+            2 => Mark::Key(Box::from(&packed[17..])),
+            _ => return None,
+        };
+        Some(ColumnMark {
+            nonce,
+            shard,
+            within,
+        })
+    }
+}
+
+/// Where a sweep of one shard left off
+///
+/// Opaque to the caller: a shape mints marks only it can read, and one handed a
+/// mark it did not mint starts its shard again rather than guessing. The
+/// generation goes with it because a resize moves every slot, so a slot number
+/// from before one points at a different key after it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum Mark {
+    /// The beginning of the shard
+    #[default]
+    Start,
+
+    /// The slot to resume at, and the generation it was taken in
+    Slot { at: usize, generation: u64 },
+
+    /// The key to resume after, for a shape that keeps its keys in order
+    Key(Box<[u8]>),
+}
+
 pub trait ShardMap<K: IndexKey, V: 'static>: Default {
     /// Put a value in, handing back the one it displaced
     fn put(&mut self, key: K, val: V) -> Option<V>;
@@ -2309,6 +2526,26 @@ pub trait ShardMap<K: IndexKey, V: 'static>: Default {
         for (key, val) in run {
             self.put(key, val);
         }
+    }
+
+    /// One page of the shard and where the next one starts, in whatever order
+    /// the shape keeps.
+    fn sweep<'a>(&'a self, from: &Mark, limit: usize) -> (Vec<(&'a K, &'a V)>, Option<Mark>) {
+        let mut page = Vec::with_capacity(limit);
+        let mut last: Option<&K> = None;
+        for (key, val) in self.walk() {
+            if let Mark::Key(after) = from {
+                if key.borrow() <= after.as_ref() {
+                    continue;
+                }
+            }
+            if page.len() == limit {
+                return (page, last.map(|key| Mark::Key(key.borrow().into())));
+            }
+            page.push((key, val));
+            last = Some(key);
+        }
+        (page, None)
     }
 
     /// Pack the map back up where deletion has left room worth taking back
@@ -2566,6 +2803,22 @@ impl<const N: usize, V: Default + 'static> ShardMap<[u8; N], V> for OpenTable<N,
         self.sorted_span(low, high).into_iter().rev()
     }
 
+    /// A slot scan, which costs the page rather than the shard
+    ///
+    /// The mark carries the generation the slot was read in, and a resize since
+    /// then means the slot points at a different key. Such a mark starts the
+    /// shard over: every live key is seen at least once, which is what the
+    /// callers of this need and all an unordered shape can promise.
+    fn sweep<'a>(&'a self, from: &Mark, limit: usize) -> (Vec<(&'a [u8; N], &'a V)>, Option<Mark>) {
+        let at = match from {
+            Mark::Slot { at, generation } if *generation == self.generation() => *at,
+            _ => 0,
+        };
+        let (page, next) = self.slot_page(at, limit);
+        let generation = self.generation();
+        (page, next.map(|at| Mark::Slot { at, generation }))
+    }
+
     fn absorb_sorted(&mut self, run: Vec<([u8; N], V)>) {
         self.absorb(run);
     }
@@ -2805,6 +3058,146 @@ mod tests {
 
     use crate::format::column::{Codec, ColumnId, KeyWidth};
     use crate::format::loc::SegmentId;
+    use std::collections::BTreeSet;
+
+    /// Keys the ordered sweep test puts in, enough to cross several pages
+    const SWEPT: usize = 2_000;
+
+    // a column sweep hands out every live key at least once, across its shards
+    #[test]
+    fn column_sweep_covers() {
+        let index = sharded();
+        let segments = SegmentTable::new();
+        let mut wrote = BTreeSet::new();
+        for group in [7u16, 1, 40, 3, 91] {
+            for byte in 0..50u8 {
+                index.insert(
+                    &key(group, byte),
+                    Entry::new(loc(1, u32::from(byte), 10), Lsn(u64::from(byte) + 1)),
+                    &segments,
+                    None,
+                );
+                wrote.insert(key(group, byte));
+            }
+        }
+
+        let mut seen = BTreeSet::new();
+        let mut mark = None;
+        let mut page = KeyPage::default();
+        loop {
+            let next = index.sweep(7, mark.as_ref(), 32, &mut page);
+            seen.extend(keys_in(&page));
+            match next {
+                Some(next) => mark = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen, wrote, "a column sweep lost keys");
+    }
+
+    // a shard-aligned prefix sweeps its shard and refuses any other width
+    #[test]
+    fn prefix_sweep_takes_its_shard() {
+        let index = sharded();
+        let segments = SegmentTable::new();
+        let mut wrote = BTreeSet::new();
+        for group in [7u16, 1, 40] {
+            for byte in 0..40u8 {
+                index.insert(
+                    &key(group, byte),
+                    Entry::new(loc(1, u32::from(byte), 10), Lsn(u64::from(byte) + 1)),
+                    &segments,
+                    None,
+                );
+                if group == 7 {
+                    wrote.insert(key(group, byte));
+                }
+            }
+        }
+
+        let mut seen = BTreeSet::new();
+        let mut mark = None;
+        let mut page = KeyPage::default();
+        let prefix = 7u16.to_be_bytes();
+        loop {
+            let next = index.sweep_prefix(9, &prefix, mark.as_ref(), 16, &mut page);
+            seen.extend(keys_in(&page));
+            match next {
+                Some(next) => mark = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen, wrote, "a prefix sweep took the wrong shard's keys");
+
+        // Anything but the shard key is refused rather than served by scanning.
+        assert!(index.sweep_prefix(9, &[7u8], None, 16, &mut page).is_none());
+        assert_eq!(page.len(), 0);
+        assert!(index
+            .sweep_prefix(9, &[0, 7, 0], None, 16, &mut page)
+            .is_none());
+        assert_eq!(page.len(), 0);
+    }
+
+    // a mark another opening minted starts the column over
+    #[test]
+    fn column_sweep_refuses_foreign_nonce() {
+        let index = sharded();
+        let segments = SegmentTable::new();
+        for byte in 0..40u8 {
+            index.insert(
+                &key(7, byte),
+                Entry::new(loc(1, u32::from(byte), 10), Lsn(u64::from(byte) + 1)),
+                &segments,
+                None,
+            );
+        }
+
+        let mut page = KeyPage::default();
+        let foreign = ColumnMark {
+            nonce: 1,
+            shard: 900,
+            within: Mark::Start,
+        };
+        index.sweep(7, Some(&foreign), 1_000, &mut page);
+        assert_eq!(
+            page.len(),
+            40,
+            "a foreign nonce should start the column over"
+        );
+    }
+
+    // the ordered sweep hands out every key once, and in key order
+    #[test]
+    fn tree_sweep_covers() {
+        let mut tree: TBTreeMap<Box<[u8]>, NODE_WIDTH, u64> = TBTreeMap::new();
+        for at in 0..SWEPT {
+            tree.insert(Box::from(&(at as u64).to_be_bytes()[..]), at as u64);
+        }
+
+        for page in [1usize, 13, 512, SWEPT * 2] {
+            let mut seen = Vec::new();
+            let mut mark = Mark::Start;
+            loop {
+                let (rows, next) = ShardMap::sweep(&tree, &mark, page);
+                for (key, _) in rows {
+                    seen.push(key.clone());
+                }
+                match next {
+                    Some(next) => mark = next,
+                    None => break,
+                }
+            }
+            assert_eq!(seen.len(), SWEPT, "page {page} lost or repeated keys");
+            assert_eq!(
+                seen.iter().cloned().collect::<BTreeSet<_>>().len(),
+                SWEPT,
+                "page {page} handed a key out twice"
+            );
+            let mut ordered = seen.clone();
+            ordered.sort();
+            assert_eq!(seen, ordered, "an ordered shape swept out of order");
+        }
+    }
 
     const VARIABLE: ColumnSpec = ColumnSpec {
         id: ColumnId(3),

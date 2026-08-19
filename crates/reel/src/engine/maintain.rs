@@ -202,8 +202,24 @@ impl ReelStore {
     }
 
     /// Live record count and byte total for one column, from counters
-    pub fn column_totals(&self, column: ColumnId) -> Totals {
+    ///
+    /// Nothing comes back from a column resolving keys through sealed footers,
+    /// whose counters cover the resident half alone.
+    pub fn column_totals(&self, column: ColumnId) -> Option<Totals> {
         self.index.column_totals(column)
+    }
+
+    /// Whether a column's counters say what a walk of it would find
+    ///
+    /// They do not while a paged column holds sealed keys no shard counted, nor
+    /// while a range cover is owed its sweep and the counters still carry what it
+    /// deleted.
+    pub fn counters_agree(&self, column: ColumnId) -> bool {
+        !self.index.answers_from_footers(column)
+            && !self
+                .index
+                .column(column)
+                .is_some_and(|index| index.has_pending_covers())
     }
 
     /// Live count and byte total under a key prefix, when the counters answer it

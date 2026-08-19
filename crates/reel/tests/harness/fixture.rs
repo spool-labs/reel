@@ -8,7 +8,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
@@ -44,16 +43,13 @@ const fn carrying(spec: &ColumnSpec, row_carry: u16) -> ColumnSpec {
 /// Bytes the carrying variant asks its record rows to hold
 pub const STREAM_CARRY: u16 = 256;
 
-/// How long a guard gives the reel to reach a state the stream should have taken it to
+/// Rounds of driving a guard gives the reel to reach a state the stream should have
+/// taken it to
 ///
-/// A rolled segment seals on the sealer's thread and only a sealed one can hand its keys
-/// over, so a stream can finish ahead of the last seal it caused. Asking again is what
-/// the maintenance tick does anyway, and long enough that what runs the bound out is a
-/// handover that never comes rather than one that was slow.
-const LIVENESS_WAIT: Duration = Duration::from_secs(30);
-
-/// How long a guard leaves the machine alone between two attempts
-const LIVENESS_GAP: Duration = Duration::from_millis(2);
+/// Counted in passes rather than in seconds, since every round runs the work the state
+/// needs rather than waiting for somebody else to run it. The passes are idempotent, so
+/// a run that has not reached it by here will not reach it at all.
+const LIVENESS_ROUNDS: u32 = 64;
 
 /// The carrying variant of the harness column set
 pub const CARRYING_COLUMNS: ColumnSet = &[
@@ -340,19 +336,34 @@ impl Differential {
         self.page_out_reel();
     }
 
+    /// Segments standing on the device, which says whether anything sealed at all
+    fn segments_standing(&self) -> usize {
+        self.reel_sim
+            .durable_image()
+            .iter()
+            .filter(|(path, _)| path.to_string_lossy().ends_with(".reel"))
+            .count()
+    }
+
     /// Run the passes behind a condition until it holds, or fail on the bound
+    ///
+    /// The bound is rounds of the passes themselves, not seconds: every round flushes,
+    /// which waits the sealer out rather than sleeping past it, so a saturated machine
+    /// makes each round slower and never makes one fewer. What runs the bound out is a
+    /// condition the passes cannot reach, which is the defect the guard is here for.
     fn drive_until(&mut self, mut reached: impl FnMut(&mut Differential) -> bool, what: &str) {
-        let deadline = Instant::now() + LIVENESS_WAIT;
-        loop {
+        for _ in 0..LIVENESS_ROUNDS {
             if reached(self) {
                 return;
             }
-            assert!(
-                Instant::now() < deadline,
-                "{what}, in {LIVENESS_WAIT:?} of being asked"
-            );
-            std::thread::sleep(LIVENESS_GAP);
         }
+        panic!(
+            "{what}, in {LIVENESS_ROUNDS} rounds of driving it, \
+             {} segments standing, {} keys paged, faults {:?}",
+            self.segments_standing(),
+            self.paged_out,
+            self.fault_reach(),
+        );
     }
 
     /// Apply a whole stream, checking agreement before the first op and after each
@@ -360,7 +371,7 @@ impl Differential {
         self.assert_agrees();
         for (step, op) in ops.iter().enumerate() {
             self.apply(op);
-            self.page_out_reel();
+            self.hand_over_reel();
             if step % CHECKPOINT_EVERY == CHECKPOINT_EVERY - 1 {
                 self.checkpoint_reel_index();
             }
@@ -381,7 +392,7 @@ impl Differential {
         self.assert_agrees();
         for (step, op) in ops.iter().enumerate() {
             self.apply(op);
-            self.page_out_reel();
+            self.hand_over_reel();
             if step % every == 0 {
                 self.assert_agrees();
                 self.compact_reel();

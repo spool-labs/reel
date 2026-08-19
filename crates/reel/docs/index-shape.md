@@ -295,6 +295,28 @@ faster. What that mostly says is how little of a listed row is the map at all: t
 above move by factors and these move by percent, because a row is a seek, a walk step and a
 record played back and only the first two are the map's.
 
+## The sweep, and what an unordered shard can promise
+
+A maintenance pass wants complete, resumable coverage of a column. It does not want key
+order, and asking for order is what shuts an unordered shard out: `page` resumes from a
+key, which on the open table means gathering the shard and sorting it to return a page.
+
+`ShardMap::sweep` asks for coverage instead. The tree walks in key order and marks with
+the last key it handed out; the open table walks slots and marks with a slot, which costs
+the page rather than the shard. One method, both shapes, no new variant.
+
+A mark is opaque and each shape only reads its own. It carries the table generation,
+since a resize moves every slot, and `ColumnMark` carries the opening that minted it,
+since a mark outlives its process through a persisted cursor or a peer's request. A mark
+from elsewhere restarts rather than resuming into a layout that is not there.
+
+So the promise is at-least-once, not exactly-once: a shard that resizes mid sweep starts
+over. That is what the callers need, and it is all an unordered shape can give.
+
+`sweep_prefix` narrows it, and only where the prefix is exactly the shard key. Shorter
+spans shards, longer splits one, and neither can be served by walking one shard's slots,
+so both are refused rather than served by scanning the family.
+
 ## Resident bytes per key, which the tree does not win
 
 Weighed by the counting allocator over the same corpora, every arm cloning its keys in so each

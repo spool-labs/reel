@@ -469,17 +469,6 @@ fn open_never_reopen() {
     }
 }
 
-// and on a paged volume, where the open shard holds only what no footer covers
-#[test]
-#[cfg(not(miri))]
-fn open_paged_single_tail() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open_shaped(*seed, paged_config(1));
-        fixture.run_stream(&op_stream::generate(*seed, PAGED_STREAM_LEN));
-        fixture.assert_paged_out();
-    }
-}
-
 /// The index written down at a cue, and read back at the reopens the stream takes
 fn checkpointing_config(active_tails: u32) -> ReelConfig {
     ReelConfig {

@@ -18,6 +18,8 @@ use crate::error::{ReelError, Result};
 /// Eight leaves no tie run at all for a key whose first eight bytes are its own.
 pub const FENCE_LEAD: usize = 8;
 
+const _: () = assert!(FENCE_LEAD == 8);
+
 /// Leads one page of a fence holds, which is the stride the sampled level takes
 ///
 /// The leads are a fixed stride array, so a fence left on the volume is read a
@@ -25,11 +27,23 @@ pub const FENCE_LEAD: usize = 8;
 pub const FENCE_PAGE_LEADS: usize = 512;
 
 /// The lead a key sorts under: its front bytes, zero padded to the lead width
+///
+/// The whole-lead case is split out because it copies a width known here, where the
+/// shared path takes a runtime one and pays a call for it.
 pub fn lead_of(key: &[u8]) -> [u8; FENCE_LEAD] {
-    let mut lead = [0u8; FENCE_LEAD];
-    let width = key.len().min(FENCE_LEAD);
-    lead[..width].copy_from_slice(&key[..width]);
-    lead
+    match key.len() >= FENCE_LEAD {
+        true => key[..FENCE_LEAD].try_into().unwrap_or([0u8; FENCE_LEAD]),
+        false => {
+            let mut lead = [0u8; FENCE_LEAD];
+            lead[..key.len()].copy_from_slice(key);
+            lead
+        }
+    }
+}
+
+/// One lead as the big-endian word its bytes order by
+fn word_of(lead: &[u8]) -> u64 {
+    u64::from_be_bytes(lead.try_into().unwrap_or([0u8; FENCE_LEAD]))
 }
 
 /// Leads the sampled level over this many blocks holds, one per page of leads
@@ -72,12 +86,19 @@ impl FenceCut {
             ));
         }
         let cut = FenceCut { leads, first };
-        for at in 1..cut.len() {
-            if cut.lead_at(at - 1) > cut.lead_at(at) {
-                return Err(ReelError::Corruption(
-                    "a segment's fence leads do not ascend".to_string(),
-                ));
+        let mut fell = 0usize;
+        if cut.len() > 1 {
+            let mut held = word_of(&cut.leads[..FENCE_LEAD]);
+            for lead in cut.leads[FENCE_LEAD..].chunks_exact(FENCE_LEAD) {
+                let word = word_of(lead);
+                fell += usize::from(word < held);
+                held = word;
             }
+        }
+        if fell > 0 {
+            return Err(ReelError::Corruption(
+                "a segment's fence leads do not ascend".to_string(),
+            ));
         }
         Ok(cut)
     }
@@ -358,6 +379,41 @@ mod tests {
 
         assert!(FenceCut::try_new(leads(&firsts), 0).is_err());
         assert!(FenceCut::try_new(Arc::from(vec![0u8; FENCE_LEAD + 1]), 0).is_err());
+    }
+
+    // one fall anywhere in a long fence is found, wherever a widened loop cuts it
+    //
+    // The check counts the falls rather than stopping at the first, so a fence longer
+    // than one vector step with its only fall on the last pair is the case that goes
+    // missing if the remainder is left out. Equal leads are not a fall: a tie run is
+    // what a truncated lead is allowed to make.
+    #[test]
+    fn one_fall_anywhere_is_found() {
+        let ascending: Vec<[u8; FENCE_LEAD]> =
+            (1..=40u64).map(|at| (at * 3).to_be_bytes()).collect();
+        let held: Vec<&[u8]> = ascending.iter().map(|lead| &lead[..]).collect();
+        assert!(
+            FenceCut::try_new(leads(&held), 0).is_ok(),
+            "the fixture ascends"
+        );
+
+        for fall in 1..ascending.len() {
+            let mut broken = ascending.clone();
+            broken[fall] = 0u64.to_be_bytes();
+            let held: Vec<&[u8]> = broken.iter().map(|lead| &lead[..]).collect();
+            assert!(
+                FenceCut::try_new(leads(&held), 0).is_err(),
+                "a fall at lead {fall} was not found"
+            );
+        }
+
+        let mut tied = ascending.clone();
+        tied[17] = tied[16];
+        let held: Vec<&[u8]> = tied.iter().map(|lead| &lead[..]).collect();
+        assert!(
+            FenceCut::try_new(leads(&held), 0).is_ok(),
+            "a tie run is not a fall"
+        );
     }
 
     // a sampled fence names one page of leads for a key whose front is its own

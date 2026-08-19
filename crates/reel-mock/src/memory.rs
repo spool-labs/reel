@@ -124,6 +124,24 @@ impl Store for MemoryStore {
         Ok(count)
     }
 
+    fn bytes_prefix(&self, cf: &str, prefix: &[u8]) -> Result<Option<u64>> {
+        // Summed in place: the values are already in memory, so nothing is faulted
+        // in to weigh them.
+        let data = self.data.read().unwrap();
+        let bytes = data
+            .get(cf)
+            .map(|cf_data| {
+                cf_data
+                    .iter()
+                    .filter(|(key, _)| key.starts_with(prefix))
+                    .map(|(_, value)| value.len() as u64)
+                    .sum()
+            })
+            .unwrap_or(0);
+
+        Ok(Some(bytes))
+    }
+
     fn iter_prefix(&self, cf: &str, prefix: &[u8]) -> Result<StoreIter<'_>> {
         let data = self.data.read().unwrap();
         let prefix = prefix.to_vec();

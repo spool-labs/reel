@@ -15,7 +15,8 @@ use crate::config::{IndexResidency, ShardShapes};
 use crate::engine::Totals;
 use crate::error::{ReelError, Result};
 use crate::format::column::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyRef, RecordKey, INLINE_MAX, ROW_CARRY_MAX,
+    Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyRef, MapShape, RecordKey, INLINE_MAX,
+    ROW_CARRY_MAX,
 };
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::{Loc, SegmentId};
@@ -252,6 +253,15 @@ impl ReelIndex {
                         spec.name,
                     )));
                 }
+            }
+            if spec.map_shape == MapShape::Open
+                && shapes == ShardShapes::Declared
+                && residency != IndexResidency::Resident
+            {
+                return Err(ReelError::Config(format!(
+                    "column {} asks for an open shard, which a paged walk cannot merge",
+                    spec.name,
+                )));
             }
             if spec.row_carry as usize > ROW_CARRY_MAX {
                 // A row's carry is paid in the stride every block search walks and in
@@ -1324,13 +1334,22 @@ impl ReelIndex {
     }
 
     /// Live key count and payload byte total for one column
-    pub fn column_totals(&self, column: ColumnId) -> Totals {
-        self.publish.reading_all(|| match self.column(column) {
-            Some(index) => index.totals(),
-            None => Totals {
-                count: 0,
-                bytes: ByteCount::from_bytes(0),
-            },
+    ///
+    /// A column answering keys out of footers holds keys no shard counted, so it
+    /// declines rather than reporting the resident half as the whole. A column the
+    /// map does not hold at all answers zero, which is what it holds.
+    pub fn column_totals(&self, column: ColumnId) -> Option<Totals> {
+        self.publish.reading_all(|| {
+            if self.answers_from_footers(column) {
+                return None;
+            }
+            Some(match self.column(column) {
+                Some(index) => index.totals(),
+                None => Totals {
+                    count: 0,
+                    bytes: ByteCount::from_bytes(0),
+                },
+            })
         })
     }
 
@@ -1602,7 +1621,7 @@ impl ReelIndex {
 mod tests {
     use super::*;
 
-    use crate::format::column::{KeyWidth, MapShape};
+    use crate::format::column::KeyWidth;
     use crate::index::entry::span_of;
 
     const RECORD: ColumnId = ColumnId(1);
@@ -1671,6 +1690,17 @@ mod tests {
         index
     }
 
+    // an open shard is refused on a paged index, which has no order to merge it
+    #[test]
+    fn open_refuses_paged() {
+        let refused = ReelIndex::new(OPEN_COLUMNS, IndexResidency::Paged, ShardShapes::Declared);
+        assert!(refused.is_err());
+
+        // A volume that does not honour declarations never gets the open shard,
+        // so there is nothing to refuse.
+        assert!(ReelIndex::new(OPEN_COLUMNS, IndexResidency::Paged, ShardShapes::Tree).is_ok());
+    }
+
     fn record_key(group: u16, byte: u8) -> RecordKey {
         let mut bytes = group.to_be_bytes().to_vec();
         bytes.extend_from_slice(&[byte; 32]);
@@ -1704,8 +1734,8 @@ mod tests {
             400
         );
         assert_eq!(index.get(&blob).expect("read").expect("blob").loc.len, 900);
-        assert_eq!(index.column_totals(RECORD).count, 1);
-        assert_eq!(index.column_totals(BLOB).count, 1);
+        assert_eq!(index.column_totals(RECORD).expect("totals").count, 1);
+        assert_eq!(index.column_totals(BLOB).expect("totals").count, 1);
         assert_eq!(index.totals().count, 2);
         assert_eq!(index.totals().bytes, ByteCount::from_bytes(1300));
     }
@@ -1790,8 +1820,8 @@ mod tests {
             .expect("range delete");
         while index.sweep_covers(usize::MAX).expect("sweep") {}
 
-        assert_eq!(index.column_totals(RECORD).count, 0);
-        assert_eq!(index.column_totals(BLOB).count, 1);
+        assert_eq!(index.column_totals(RECORD).expect("totals").count, 0);
+        assert_eq!(index.column_totals(BLOB).expect("totals").count, 1);
     }
 
     // a playback pages one column's keys and never crosses into another

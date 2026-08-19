@@ -12,6 +12,7 @@ pub mod format;
 pub mod index;
 pub mod io;
 pub mod reel;
+pub mod report;
 pub mod sync;
 pub mod units;
 
@@ -45,6 +46,7 @@ pub use index::page::KeyPage;
 pub use index::persisted::PersistedIndex;
 pub use index::playback::{PlaybackCursor, Way};
 pub use index::recovery::{rebuild_reel, RebuiltReel};
+pub use reel::checkpoint::Checkpoint;
 pub use reel::cue::{CuePoint, CuePoints};
 pub use reel::tail::Tail;
 pub use reel::volumes::Volumes;

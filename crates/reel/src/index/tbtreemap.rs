@@ -425,39 +425,7 @@ impl Drop for HeldDescent {
     }
 }
 
-/// How many of a sorted lead array fall below the wanted one
-///
-/// Hand vector arms pay on baseline x86, where SSE2 has no unsigned 64-bit
-/// compare for the optimiser to widen into. On aarch64 the autovectorised
-/// scalar form matches or beats this arm, which makes it a deletion candidate.
-#[cfg(target_arch = "aarch64")]
-fn count_below(leads: &[u64], want: u64) -> usize {
-    use std::arch::aarch64::*;
-
-    // SAFETY: NEON is baseline on aarch64, and every load is bounded by the
-    // chunk iterator rather than by arithmetic on the length.
-    unsafe {
-        let wanted = vdupq_n_u64(want);
-        // Two accumulators: one vector compare has a latency the next cannot start
-        // under, so two independent chains fill that gap.
-        let (mut low, mut high) = (vdupq_n_u64(0), vdupq_n_u64(0));
-        let mut quads = leads.chunks_exact(4);
-        for quad in &mut quads {
-            let first = vld1q_u64(quad.as_ptr());
-            let second = vld1q_u64(quad.as_ptr().add(2));
-            low = vsubq_u64(low, vcltq_u64(first, wanted));
-            high = vsubq_u64(high, vcltq_u64(second, wanted));
-        }
-        let acc = vaddq_u64(low, high);
-        let mut below = (vgetq_lane_u64(acc, 0) + vgetq_lane_u64(acc, 1)) as usize;
-        for held in quads.remainder() {
-            below += usize::from(*held < want);
-        }
-        below
-    }
-}
-
-/// The same count on x86, chosen from what the processor reports
+/// How many of a sorted lead array fall below the wanted one, on x86
 ///
 /// The 512 bit form answers in the shape the question is asked, an unsigned compare
 /// to a mask register a population count turns into the tally, where AVX2 has no
@@ -542,14 +510,16 @@ unsafe fn count_avx2(leads: &[u64], want: u64) -> usize {
     below + count_scalar(lanes.remainder(), want)
 }
 
-/// The same count, for a machine without a vector form
-#[cfg(not(target_arch = "aarch64"))]
+/// The same count, written so the optimiser is free to widen it
+///
+/// The idiomatic form on purpose: on aarch64 this compiles to eight lanes a step
+/// against four accumulators, which is twice what a hand written NEON arm managed.
 fn count_scalar(leads: &[u64], want: u64) -> usize {
     leads.iter().filter(|held| **held < want).count()
 }
 
-/// The same count, for a machine without the vector form
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+/// The same count, everywhere the hand arms are not carried
+#[cfg(not(target_arch = "x86_64"))]
 fn count_below(leads: &[u64], want: u64) -> usize {
     count_scalar(leads, want)
 }
@@ -582,31 +552,24 @@ pub mod scans {
     }
 }
 
-/// The same, where the vector form is NEON rather than an x86 one
-#[cfg(target_arch = "aarch64")]
+/// The one scan every other machine counts with
+#[cfg(not(target_arch = "x86_64"))]
 pub mod scans {
-    /// The vector form this build uses
-    pub fn neon(leads: &[u64], want: u64) -> usize {
-        super::count_below(leads, want)
-    }
-
-    /// The form every machine has, for holding the vector one against
+    /// The form this build uses, which is the only one it carries
     pub fn scalar(leads: &[u64], want: u64) -> usize {
-        leads.iter().filter(|held| **held < want).count()
+        super::count_scalar(leads, want)
     }
 }
 
 /// Which scan this build counts leads with, for a box that fell back quietly
 pub fn scan_backend() -> &'static str {
-    #[cfg(target_arch = "aarch64")]
-    return "neon";
     #[cfg(target_arch = "x86_64")]
     return match backend() {
         Scan::Avx512 => "avx512f",
         Scan::Avx2 => "avx2",
         Scan::Scalar => "scalar",
     };
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(not(target_arch = "x86_64"))]
     return "scalar";
 }
 

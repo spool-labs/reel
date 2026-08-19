@@ -31,52 +31,73 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  # Split across runners so a hang costs one shard's timeout, not an hour, and the
+  # suite's wall time is its slowest shard.
   test:
-    name: test (linux)
+    name: test (linux, ${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [workspace, lib, integration-0, integration-1, differential]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: tests
       # A test that writes real files honours TMPDIR, and /tmp on a runner is not
       # promised to be a disk. RUNNER_TEMP is.
       - name: temp on the runner's own disk
         run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
 
-      - name: the other crates
-        run: cargo test --workspace --exclude reel --no-fail-fast
-
-      # crash_points and differential have their own job or step, so this run is every
-      # other target. The list comes from cargo rather than from here, so a test file
-      # added later is picked up without touching this file.
-      - name: reel, less the binaries run on their own
+      # crash_points and differential have their own job or shard, so the integration
+      # shards split every other target between them. The list comes from cargo rather
+      # than from here, so a test file added later is picked up without touching this
+      # file; sorted so the split is deterministic.
+      - name: run this shard
         run: |
           set -euo pipefail
-          mapfile -t names < <(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "reel") | .targets[]
-                     | select(any(.kind[]; . == "test")) | .name' \
-            | grep -vx -e crash_points -e differential)
-          selected=()
-          for name in "${names[@]}"; do selected+=(--test "$name"); done
-          echo "running ${#names[@]} test targets: ${names[*]}"
-          cargo test -p reel --lib "${selected[@]}" --no-fail-fast \
-            -- --skip callers_spread_across_the_shards
-
-      # The one lib test that is not parallel-safe: it reads a process-wide shard
-      # counter and assumes its increments are consecutive, so anything else touching
-      # the async door beside it can red it. Skipped above, run here on its own.
-      - name: the shard counter test, alone
-        run: cargo test -p reel --lib -- --exact --test-threads=1 io::uring_backend::tests::callers_spread_across_the_shards
-
-      # Serial because the paged handover guards are only mostly deterministic. The
-      # fixture flushes before it asks, so the sealer no longer decides the answer, but
-      # a machine with most of its cores taken can still run one of them out of its
-      # bound: 8 of 10 parallel runs green under that load against 10 of 10 serial.
-      - name: differential, one test at a time
-        run: cargo test -p reel --test differential -- --test-threads=1
+          case "${{ matrix.shard }}" in
+            workspace)
+              cargo test --workspace --exclude reel --no-fail-fast
+              ;;
+            lib)
+              cargo test -p reel --lib --no-fail-fast \
+                -- --skip callers_spread_across_the_shards
+              # The one lib test that is not parallel-safe: it reads a process-wide
+              # shard counter and assumes its increments are consecutive, so anything
+              # else touching the async door beside it can red it. Run on its own.
+              cargo test -p reel --lib -- --exact --test-threads=1 \
+                io::uring_backend::tests::callers_spread_across_the_shards
+              ;;
+            integration-*)
+              part="${{ matrix.shard }}"
+              part="${part#integration-}"
+              mapfile -t names < <(cargo metadata --no-deps --format-version 1 \
+                | jq -r '.packages[] | select(.name == "reel") | .targets[]
+                         | select(any(.kind[]; . == "test")) | .name' \
+                | grep -vx -e crash_points -e differential | sort)
+              selected=()
+              for i in "${!names[@]}"; do
+                if (( i % 2 == part )); then selected+=(--test "${names[$i]}"); fi
+              done
+              echo "running ${#selected[@]} of ${#names[@]} targets: ${selected[*]}"
+              test "${#selected[@]}" -gt 0
+              cargo test -p reel "${selected[@]}" --no-fail-fast
+              ;;
+            differential)
+              # Serial because the paged handover guards are only mostly
+              # deterministic. The fixture flushes before it asks, so the sealer no
+              # longer decides the answer, but a machine with most of its cores taken
+              # can still run one of them out of its bound: 8 of 10 parallel runs
+              # green under that load against 10 of 10 serial.
+              cargo test -p reel --test differential -- --test-threads=1
+              ;;
+          esac
 
   crash-points:
     name: crash points

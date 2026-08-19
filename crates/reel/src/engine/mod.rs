@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use crate::units::ByteCount;
 
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
 use crate::append::admission::InflightBudget;
 use crate::compaction::compactor::{CompactionCounters, Compactor};
@@ -31,9 +31,11 @@ use crate::format::column::{spec_by_name, ColumnId, ColumnSet, ColumnSpec, Recor
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::SegmentId;
 use crate::format::lsn::Lsn;
+use crate::index::column::ColumnMark;
 use crate::index::counters::ReadCounters;
 use crate::index::lockfile::OwnershipLock;
 use crate::index::map::ReelIndex;
+use crate::index::page::KeyPage;
 use crate::reel::bias::MachineFacts;
 use crate::reel::cue::CuePoints;
 
@@ -55,7 +57,7 @@ pub(crate) const LOCK_FILE: &str = "reel.lock";
 ///
 /// A grave refuses a record drawn before it and published after it, so it is done
 /// once no such record can still arrive.
-const GRAVE_WINDOW: u64 = 1 << 20;
+pub(crate) const GRAVE_WINDOW: u64 = 1 << 20;
 
 /// Bytes admitted between maintenance asks that make ingest hot
 ///
@@ -73,6 +75,12 @@ const SWEEP_RUN: usize = 1 << 16;
 /// One, because a second pass buys reclaim the device was already spending on the
 /// first and takes the foreground's tail with it.
 const COMPACT_PASSES: usize = 1;
+
+/// Openings this process has made, which is what tells their sweep marks apart
+///
+/// A counter rather than a clock or a random source: the only thing a mark has
+/// to distinguish is one opening from another.
+static OPENINGS: AtomicU32 = AtomicU32::new(0);
 
 /// A sealed segment whose keys are still resident, and when they stop being
 ///
@@ -197,6 +205,9 @@ pub enum CompactPass {
 pub struct ReelStore {
     /// Directory the volume's home piece lives in
     root: PathBuf,
+
+    /// What this opening stamps into the sweep marks it mints
+    sweep_nonce: u64,
 
     /// Configuration this volume was opened with
     config: ReelConfig,
@@ -474,6 +485,8 @@ impl ReelStore {
             bias,
             footprint: AtomicU64::new(0),
             ingest_marker: AtomicU64::new(0),
+            sweep_nonce: (std::process::id() as u64) << 32
+                | OPENINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64,
             root,
             driver,
             budget,
@@ -531,6 +544,46 @@ impl ReelStore {
     /// leaves a pending future waiting for somebody to reap it.
     pub fn driver(&self) -> &Arc<IoDriver> {
         &self.driver
+    }
+
+    /// One page of a column's live keys, in no promised order
+    ///
+    /// The mark is opaque bytes: hand back whatever the last page answered, and
+    /// nothing to start. `None` back means the column is done. Every live key is
+    /// handed out at least once; a shard that resizes mid sweep starts over, so
+    /// a caller has to be idempotent, which every caller of this is.
+    pub fn sweep_column(
+        &self,
+        column: ColumnId,
+        from: Option<&[u8]>,
+        limit: usize,
+        out: &mut KeyPage,
+    ) -> Option<Vec<u8>> {
+        let resumed = from.and_then(ColumnMark::unpack);
+        let index = self.index.column(column)?;
+        index
+            .sweep(self.sweep_nonce, resumed.as_ref(), limit, out)
+            .map(|mark| mark.pack())
+    }
+
+    /// One page of the keys under a shard-aligned prefix, in no promised order
+    ///
+    /// Nothing back where the prefix is not exactly the column's shard key, so a
+    /// caller cannot turn a prefix walk into a scan of the family by asking for
+    /// the wrong width.
+    pub fn sweep_column_prefix(
+        &self,
+        column: ColumnId,
+        prefix: &[u8],
+        from: Option<&[u8]>,
+        limit: usize,
+        out: &mut KeyPage,
+    ) -> Option<Vec<u8>> {
+        let resumed = from.and_then(ColumnMark::unpack);
+        let index = self.index.column(column)?;
+        index
+            .sweep_prefix(self.sweep_nonce, prefix, resumed.as_ref(), limit, out)
+            .map(|mark| mark.pack())
     }
 
     /// The sequence number the volume has reached

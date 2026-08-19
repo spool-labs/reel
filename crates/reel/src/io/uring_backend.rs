@@ -698,6 +698,9 @@ impl Ring {
             .submitter()
             .register_files_sparse(MAX_REGISTERED_FILES)
             .is_ok();
+        if !is_registered {
+            core.doors.note_files_refused();
+        }
         // The kernel clamps the completion queue, so the bound on ops in flight is
         // read back from the ring rather than assumed.
         let entries = ring.params().cq_entries() as usize;
@@ -707,6 +710,9 @@ impl Ring {
             true => Buffers::register(&ring),
             false => Buffers::none(),
         };
+        if core.is_direct && core.tuning.registered_buffers && !buffers.is_live() {
+            core.doors.note_pool_refused();
+        }
         Ok(Ring {
             ring,
             inflight: Inflight::with_capacity(entries),
@@ -1016,6 +1022,8 @@ struct Core {
 struct DoorTally {
     reached_ring: AtomicBool,
     off_ring: AtomicU64,
+    pool_refused: AtomicBool,
+    files_refused: AtomicBool,
 }
 
 impl DoorTally {
@@ -1034,10 +1042,26 @@ impl DoorTally {
         self.off_ring.fetch_add(ops as u64, Ordering::Relaxed);
     }
 
+    /// A thread's pool was refused by the kernel
+    fn note_pool_refused(&self) {
+        if !self.pool_refused.load(Ordering::Relaxed) {
+            self.pool_refused.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// A ring's sparse file table was refused by the kernel
+    fn note_files_refused(&self) {
+        if !self.files_refused.load(Ordering::Relaxed) {
+            self.files_refused.store(true, Ordering::Relaxed);
+        }
+    }
+
     fn counts(&self) -> DoorCounts {
         DoorCounts {
             reached_ring: self.reached_ring.load(Ordering::Relaxed),
             off_ring: self.off_ring.load(Ordering::Relaxed),
+            pool_refused: self.pool_refused.load(Ordering::Relaxed),
+            files_refused: self.files_refused.load(Ordering::Relaxed),
         }
     }
 }

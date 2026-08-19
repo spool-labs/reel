@@ -47,8 +47,71 @@ pub struct DoorCounts {
     pub files_refused: bool,
 }
 
+/// Which backend actually serves a volume, as opposed to the one it asked for
+///
+/// A configured ring downgrades to posix when the kernel will not set one up, so
+/// the request and the outcome are two different facts. Each backend answers
+/// from its own state rather than from the request that built it, which is what
+/// keeps the answer from drifting into a restatement of the config.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServingBackend {
+    /// Synchronous posix ops through the page cache
+    Posix,
+
+    /// Synchronous posix ops on descriptors that bypass the page cache
+    PosixDirect,
+
+    /// A ring submitting through the page cache
+    Ring,
+
+    /// A ring submitting on descriptors that bypass the page cache
+    RingDirect,
+
+    /// The in-memory backend a simulation runs on, never chosen from config
+    Sim,
+}
+
+impl ServingBackend {
+    /// Whether a ring serves this volume
+    pub fn is_ring(self) -> bool {
+        matches!(self, ServingBackend::Ring | ServingBackend::RingDirect)
+    }
+
+    /// Whether this volume's descriptors bypass the page cache
+    pub fn is_direct(self) -> bool {
+        matches!(
+            self,
+            ServingBackend::PosixDirect | ServingBackend::RingDirect
+        )
+    }
+
+    /// The name this backend reports itself under
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServingBackend::Posix => "posix",
+            ServingBackend::PosixDirect => "posix_direct",
+            ServingBackend::Ring => "ring",
+            ServingBackend::RingDirect => "ring_direct",
+            ServingBackend::Sim => "sim",
+        }
+    }
+}
+
+impl std::fmt::Display for ServingBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Ring-shaped file I/O every reel backend implements
 pub trait ReelIo: Send + Sync {
+    /// Which backend is serving, answered from what this one is rather than
+    /// from what was asked for
+    ///
+    /// Required rather than defaulted: a backend that forgot to answer would
+    /// report someone else's identity, which is the failure this exists to stop.
+    fn serving(&self) -> ServingBackend;
+
     /// Move owned ops into the ring, each yielding one tagged completion later
     ///
     /// Only a poll on the submitting thread can take those completions; pairing

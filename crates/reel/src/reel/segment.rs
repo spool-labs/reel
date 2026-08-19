@@ -63,6 +63,11 @@ impl IoDriver {
         }
     }
 
+    /// Which backend is serving under this driver
+    pub fn serving(&self) -> crate::io::ServingBackend {
+        self.backend.serving()
+    }
+
     /// Device flushes the backend under this driver has asked for
     pub fn sync_count(&self) -> u64 {
         self.backend.sync_count()

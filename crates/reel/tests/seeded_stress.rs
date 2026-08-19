@@ -126,6 +126,13 @@ fn campaign_skip() -> u64 {
         .unwrap_or(0)
 }
 
+/// One seed to walk over and over, named as `seed:rounds`
+fn hammered() -> Option<(u64, u64)> {
+    let raw = std::env::var("REEL_STRESS_HAMMER").ok()?;
+    let (seed, rounds) = raw.split_once(':')?;
+    Some((seed.parse().ok()?, rounds.parse().ok()?))
+}
+
 fn address(byte: u8) -> [u8; ID_LEN] {
     [byte; ID_LEN]
 }
@@ -857,6 +864,27 @@ drawn_shape!(
 fn replay() {
     if let Ok(raw) = std::env::var("REEL_STRESS_REPLAY") {
         walk(raw.parse().expect("a seed"));
+    }
+}
+
+// walk one drawn seed over and over, for a race a single pass almost never draws
+//
+// A walk is threaded, so one replay of a seed says nothing about an interleaving.
+// Seed 1696173307150234702 parts the live store from a reopen about once in a few
+// thousand rounds, and does so at the pre-performance tip as well.
+//
+// Opt in with REEL_STRESS_HAMMER=<seed>:<rounds>.
+#[test]
+fn hammer() {
+    let Some((seed, rounds)) = hammered() else {
+        return;
+    };
+    println!("hammering seed {seed} for {rounds} rounds");
+    for round in 0..rounds {
+        if round % 500 == 0 {
+            println!("round {round}");
+        }
+        walk(seed);
     }
 }
 

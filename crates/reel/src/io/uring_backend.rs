@@ -24,6 +24,7 @@ use crate::io::direct::{
 use crate::io::op::{Completion, FileId, Op, Outcome, ReadBuf, Tag, WriteBuf};
 use crate::io::posix_backend::{PosixBackend, MAX_IOVECS, STAGE_BYTES};
 use crate::io::slots::{SlotTable, SLOT_COUNT};
+use crate::io::ServingBackend;
 use crate::io::{DoorCounts, ReelIo};
 use crate::sync::lock;
 
@@ -1655,6 +1656,17 @@ impl UringBackend {
 }
 
 impl ReelIo for UringBackend {
+    /// A ring, told apart by the descriptors its core opened
+    ///
+    /// This backend only exists when `UringBackend::new` set a ring up, so
+    /// answering ring here cannot outlive the ring it names.
+    fn serving(&self) -> ServingBackend {
+        match self.core.is_direct {
+            true => ServingBackend::RingDirect,
+            false => ServingBackend::Ring,
+        }
+    }
+
     /// Which door this volume's ops took, which a ring leg has to be able to ask
     fn door_counts(&self) -> DoorCounts {
         self.core.doors.counts()

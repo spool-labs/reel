@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::config::{IoBackend, ReelConfig};
 use crate::io::posix_backend::PosixBackend;
-use crate::io::ReelIo;
+use crate::io::{ReelIo, ServingBackend};
 
 /// Outcome of resolving a configured backend against the runtime ring setup
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,16 +23,20 @@ enum BackendDecision {
 /// Choose a backend from config, downgrading to posix when the ring cannot serve
 /// the request
 pub fn select_backend(config: &ReelConfig) -> Arc<dyn ReelIo> {
+    // What is announced is asked of the backend that was built, not derived from
+    // the config beside it, so the line cannot say ring while posix serves.
     if wants_ring(config.io_backend) {
         if let Some(ring) = open_ring(config) {
-            announce(BackendDecision::Ring);
+            announce(BackendDecision::Ring, ring.serving());
             return ring;
         }
-        announce(BackendDecision::RingUnavailable);
-        return Arc::new(fallback_posix(config));
+        let posix = Arc::new(fallback_posix(config));
+        announce(BackendDecision::RingUnavailable, posix.serving());
+        return posix;
     }
-    announce(BackendDecision::Posix);
-    Arc::new(fallback_posix(config))
+    let posix = Arc::new(fallback_posix(config));
+    announce(BackendDecision::Posix, posix.serving());
+    posix
 }
 
 /// The posix backend a volume runs when the ring is not serving it
@@ -74,12 +78,21 @@ fn wants_ring(backend: IoBackend) -> bool {
     }
 }
 
-fn announce(decision: BackendDecision) {
+/// Say which backend took the volume, on every arm rather than only the bad one
+///
+/// A silent success and a silent downgrade look identical in a log, so an
+/// operator reading one could not tell a ring from the fallback under it. The
+/// downgrade stays a warning because it is the one arm that loses what was
+/// asked for.
+fn announce(decision: BackendDecision, serving: ServingBackend) {
     match decision {
-        BackendDecision::Posix | BackendDecision::Ring => {}
+        BackendDecision::Posix | BackendDecision::Ring => {
+            tracing::info!("reel volume served by the {serving} backend");
+        }
         BackendDecision::RingUnavailable => {
             tracing::warn!(
-                "io_uring backend requested but the ring is unavailable, using the posix backend"
+                "io_uring backend requested but the ring is unavailable, \
+                 so the {serving} backend serves this volume instead"
             );
         }
     }
@@ -118,6 +131,44 @@ mod tests {
         for backend in [IoBackend::Posix, IoBackend::Uring, IoBackend::UringDirect] {
             let selected: Arc<dyn ReelIo> = select_backend(&config_for(backend));
             assert_eq!(Arc::strong_count(&selected), 1);
+        }
+    }
+
+    // a posix request is served by posix everywhere, with nothing to downgrade
+    #[test]
+    fn posix_serves_what_it_asked_for() {
+        let selected = select_backend(&config_for(IoBackend::Posix));
+        assert_eq!(selected.serving(), ServingBackend::Posix);
+        assert!(!selected.serving().is_ring());
+    }
+
+    // off linux there is no ring to have, and the volume says so rather than
+    // repeating the request back
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_ring_request_is_posix_without_a_ring() {
+        for backend in [IoBackend::Uring, IoBackend::UringDirect] {
+            let selected = select_backend(&config_for(backend));
+            assert!(
+                !selected.serving().is_ring(),
+                "{backend:?} reported a ring on a platform without one",
+            );
+        }
+    }
+
+    // the answer is the backend's own, so it disagrees with the request whenever
+    // the ring could not be had
+    #[test]
+    fn serving_is_the_outcome_not_the_request() {
+        for backend in [IoBackend::Posix, IoBackend::Uring, IoBackend::UringDirect] {
+            let config = config_for(backend);
+            let serving = select_backend(&config).serving();
+            if serving.is_ring() {
+                assert!(
+                    wants_ring(config.io_backend),
+                    "a ring served a volume that never asked for one",
+                );
+            }
         }
     }
 }

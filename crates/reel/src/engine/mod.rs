@@ -546,6 +546,14 @@ impl ReelStore {
         &self.driver
     }
 
+    /// Which backend serves this volume, which is not always the one asked for
+    ///
+    /// `config().io_backend` is the request; this is the outcome. They differ
+    /// whenever a ring was configured and the kernel would not set one up.
+    pub fn serving_backend(&self) -> crate::io::ServingBackend {
+        self.driver.serving()
+    }
+
     /// One page of a column's live keys, in no promised order
     ///
     /// The mark is opaque bytes: hand back whatever the last page answered, and

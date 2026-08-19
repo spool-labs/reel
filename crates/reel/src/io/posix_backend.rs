@@ -24,7 +24,7 @@ use crate::io::direct::{
 use crate::io::op::{
     Advice, Completion, FileId, Op, Outcome, ReadBuf, SegmentEntry, SyncRangeMode, WriteBuf,
 };
-use crate::io::ReelIo;
+use crate::io::{ReelIo, ServingBackend};
 use crate::sync::{lock, read, write};
 
 /// Buffers one vectored call carries, the portable floor of the kernel's own cap
@@ -803,6 +803,14 @@ impl Default for PosixBackend {
 }
 
 impl ReelIo for PosixBackend {
+    /// Posix, told apart by the descriptors this backend opened for itself
+    fn serving(&self) -> ServingBackend {
+        match self.is_direct {
+            true => ServingBackend::PosixDirect,
+            false => ServingBackend::Posix,
+        }
+    }
+
     fn sync_count(&self) -> u64 {
         PosixBackend::sync_count(self)
     }

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use crate::error::{ReelError, Result};
 use crate::io::fault::{FaultKind, FaultPlan, ScheduledFault};
 use crate::io::op::{Advice, Completion, FileId, Op, Outcome, ReadBuf, SegmentEntry, WriteBuf};
-use crate::io::ReelIo;
+use crate::io::{ReelIo, ServingBackend};
 use crate::sync::lock;
 
 /// The durable bytes of every file, the image a crash leaves behind
@@ -325,6 +325,11 @@ impl SimIo {
 }
 
 impl ReelIo for SimIo {
+    /// The simulation's own backend, which no configuration selects
+    fn serving(&self) -> ServingBackend {
+        ServingBackend::Sim
+    }
+
     fn sync_count(&self) -> u64 {
         SimIo::sync_count(self)
     }

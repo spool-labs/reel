@@ -26,6 +26,7 @@ mod playback_speed;
 mod preallocate_cost;
 mod publish_cost;
 mod repoint_hold;
+mod segment_price;
 mod tick_facts;
 
 struct Probe {
@@ -176,6 +177,9 @@ const PROBES: &[Probe] = &[
         "repoint_hold::hold_by_batch_size",
         repoint_hold::hold_by_batch_size,
     ),
+    opt_in("segment_price::read_side", segment_price::read_side),
+    opt_in("segment_price::write_side", segment_price::write_side),
+    opt_in("segment_price::tick_side", segment_price::tick_side),
     opt_in(
         "tick_facts::pricing_the_stack_by_segment_count",
         tick_facts::pricing_the_stack_by_segment_count,

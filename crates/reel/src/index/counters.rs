@@ -123,13 +123,6 @@ impl Floors {
 /// Rows one chunk of the window holds, so retiring frees whole allocations
 const CHUNK: usize = 256;
 
-/// Stripes the live count is spread over, one cache line apiece
-///
-/// Live is written once per record and read once per maintenance tick, so the
-/// active segment's row is every writer's row and the stripes are what keeps that
-/// from being one contended line. Summing four on the read side costs nothing.
-const STRIPES: usize = 4;
-
 /// Ids the window stretches to before a booking is refused rather than allocated
 ///
 /// A volume allocates segment numbers in order, so the distance from the oldest
@@ -146,43 +139,17 @@ const BORN: u32 = 2;
 /// The segment retired, so every booking against it is dropped and counted
 const RETIRED: u32 = 4;
 
-/// One live counter on its own line, since every writer moves the active row's
-#[repr(align(64))]
-#[derive(Debug)]
-struct Stripe(AtomicU64);
-
-/// The stripe this thread books its live bytes into
-///
-/// Fixed per thread rather than drawn per booking, so a writer keeps to one line
-/// instead of walking all four.
-fn stripe_of() -> usize {
-    #[cfg(loom)]
-    {
-        0
-    }
-    #[cfg(not(loom))]
-    {
-        use std::cell::Cell;
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        thread_local! {
-            static MINE: Cell<usize> = const { Cell::new(usize::MAX) };
-        }
-        MINE.with(|mine| {
-            if mine.get() == usize::MAX {
-                mine.set(NEXT.fetch_add(1, Ordering::Relaxed) % STRIPES);
-            }
-            mine.get()
-        })
-    }
-}
-
 /// One segment's counters, moved by whichever writer's key points into it
 ///
 /// A blank row reads as a segment that has seen no record at all rather than one
 /// whose oldest record is sequence zero, which is what the reserved minimum is for.
+/// One line per row, so two segments booked at once never share one.
 #[repr(align(64))]
 #[derive(Debug)]
 struct SegmentRow {
+    /// Bytes the index still points at
+    live: AtomicU64,
+
     /// Bytes shadowed by an overwrite or a delete
     dead: AtomicU64,
 
@@ -203,15 +170,13 @@ struct SegmentRow {
 
     /// Present, born and retired together, so one load answers all three
     flags: AtomicU32,
-
-    /// Bytes the index still points at, spread so writers do not share a line
-    live: [Stripe; STRIPES],
 }
 
 impl SegmentRow {
     /// A row standing for a segment nothing has booked against yet
     fn new() -> SegmentRow {
         SegmentRow {
+            live: AtomicU64::new(0),
             dead: AtomicU64::new(0),
             held: AtomicU64::new(0),
             min_lsn: AtomicU64::new(u64::MAX),
@@ -219,27 +184,7 @@ impl SegmentRow {
             held_lsn: AtomicU64::new(Lsn::NONE.as_u64()),
             incarnation: AtomicU32::new(0),
             flags: AtomicU32::new(0),
-            live: [
-                Stripe(AtomicU64::new(0)),
-                Stripe(AtomicU64::new(0)),
-                Stripe(AtomicU64::new(0)),
-                Stripe(AtomicU64::new(0)),
-            ],
         }
-    }
-
-    /// Take the row back to never having been touched
-    fn blank(&self) {
-        for stripe in &self.live {
-            stripe.0.store(0, Ordering::Release);
-        }
-        self.dead.store(0, Ordering::Release);
-        self.held.store(0, Ordering::Release);
-        self.min_lsn.store(u64::MAX, Ordering::Release);
-        self.max_lsn.store(Lsn::NONE.as_u64(), Ordering::Release);
-        self.held_lsn.store(Lsn::NONE.as_u64(), Ordering::Release);
-        self.incarnation.store(0, Ordering::Release);
-        self.flags.store(0, Ordering::Release);
     }
 
     fn flags(&self) -> u32 {
@@ -263,41 +208,30 @@ impl SegmentRow {
         self.flags.fetch_or(bits, Ordering::AcqRel);
     }
 
-    fn live_bytes(&self) -> u64 {
-        self.live
-            .iter()
-            .map(|stripe| stripe.0.load(Ordering::Acquire))
-            .fold(0u64, |total, bytes| total.wrapping_add(bytes))
-    }
-
     fn add_live(&self, span: u64) {
-        self.live[stripe_of()].0.fetch_add(span, Ordering::AcqRel);
+        self.live.fetch_add(span, Ordering::AcqRel);
     }
 
-    /// Take a span off live, borrowing from the other stripes when one runs out
-    ///
-    /// Live is booked into whichever stripe the writer had and taken off by whoever
-    /// shadows it, so a stripe can go short of what the segment holds overall.
     fn drop_live(&self, span: u64) {
-        let mut owed = span;
-        for at in 0..STRIPES {
-            if owed == 0 {
-                return;
-            }
-            let stripe = &self.live[(stripe_of() + at) % STRIPES];
-            let taken = stripe
-                .0
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                    Some(held.saturating_sub(owed))
-                })
-                .unwrap_or(0);
-            owed -= taken.min(owed);
-        }
+        let _ = self
+            .live
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                Some(held.saturating_sub(span))
+            });
+    }
+
+    fn store_live(&self, span: u64) {
+        self.live.store(span, Ordering::Release);
+    }
+
+    fn shadow(&self, span: u64) {
+        self.drop_live(span);
+        self.dead.fetch_add(span, Ordering::AcqRel);
     }
 
     fn bytes(&self) -> SegmentBytes {
         SegmentBytes {
-            live: self.live_bytes(),
+            live: self.live.load(Ordering::Acquire),
             dead: self.dead.load(Ordering::Acquire),
             held: self.held.load(Ordering::Acquire),
             held_lsn: match self.held_lsn.load(Ordering::Acquire) {
@@ -305,6 +239,18 @@ impl SegmentRow {
                 newest => Some(Lsn(newest)),
             },
         }
+    }
+
+    /// Take the row back to never having been touched
+    fn blank(&self) {
+        self.live.store(0, Ordering::Release);
+        self.dead.store(0, Ordering::Release);
+        self.held.store(0, Ordering::Release);
+        self.min_lsn.store(u64::MAX, Ordering::Release);
+        self.max_lsn.store(Lsn::NONE.as_u64(), Ordering::Release);
+        self.held_lsn.store(Lsn::NONE.as_u64(), Ordering::Release);
+        self.incarnation.store(0, Ordering::Release);
+        self.flags.store(0, Ordering::Release);
     }
 
     fn min_lsn(&self) -> Option<Lsn> {
@@ -323,18 +269,26 @@ impl SegmentRow {
             self.min_lsn.fetch_min(lsn.0, Ordering::AcqRel);
         }
     }
-
-    fn shadow(&self, span: u64) {
-        self.drop_live(span);
-        self.dead.fetch_add(span, Ordering::AcqRel);
-    }
 }
 
-/// A chunk of rows, boxed so a retiring window frees whole allocations
-fn chunk() -> Box<[SegmentRow]> {
-    let mut rows = Vec::with_capacity(CHUNK);
-    rows.resize_with(CHUNK, SegmentRow::new);
-    rows.into_boxed_slice()
+/// A chunk of rows, freed whole when the window slides past it
+#[derive(Debug)]
+struct Chunk {
+    rows: Box<[SegmentRow]>,
+}
+
+impl Chunk {
+    fn new() -> Chunk {
+        let mut rows = Vec::with_capacity(CHUNK);
+        rows.resize_with(CHUNK, SegmentRow::new);
+        Chunk {
+            rows: rows.into_boxed_slice(),
+        }
+    }
+
+    fn at(&self, slot: usize) -> &SegmentRow {
+        &self.rows[slot]
+    }
 }
 
 /// The stretch of segment numbers the table holds rows for
@@ -349,8 +303,11 @@ struct Window {
     /// The oldest number no retire has passed, below which everything is gone
     floor: u64,
 
+    /// One past the highest number ever counted, which bounds every walk
+    reach: u64,
+
     /// Rows in number order, oldest chunk first
-    chunks: VecDeque<Box<[SegmentRow]>>,
+    chunks: VecDeque<Chunk>,
 
     /// Rows carrying the present bit, so a count is not a walk
     present: usize,
@@ -367,7 +324,9 @@ impl Window {
             return None;
         }
         let at = (id - self.base) as usize;
-        self.chunks.get(at / CHUNK).map(|rows| &rows[at % CHUNK])
+        self.chunks
+            .get(at / CHUNK)
+            .map(|chunk| chunk.at(at % CHUNK))
     }
 
     /// The row of a segment still being counted, or nothing for one that is not
@@ -381,7 +340,7 @@ impl Window {
         if id < self.floor {
             return true;
         }
-        self.row(segment).is_some_and(SegmentRow::is_retired)
+        self.row(segment).is_some_and(|row| row.is_retired())
     }
 
     /// The row a number stands on, growing the window to reach it
@@ -405,7 +364,7 @@ impl Window {
                 return None;
             }
             for _ in 0..(reach as usize / CHUNK) {
-                self.chunks.push_front(chunk());
+                self.chunks.push_front(Chunk::new());
             }
             self.base -= reach;
         }
@@ -414,9 +373,9 @@ impl Window {
             return None;
         }
         while at >= self.chunks.len() * CHUNK {
-            self.chunks.push_back(chunk());
+            self.chunks.push_back(Chunk::new());
         }
-        let row = &self.chunks[at / CHUNK][at % CHUNK];
+        let row = self.chunks[at / CHUNK].at(at % CHUNK);
         match row.is_retired() {
             true => None,
             false => Some(row),
@@ -432,6 +391,7 @@ impl Window {
         if fresh {
             self.present += 1;
         }
+        self.reach = self.reach.max(u64::from(segment.as_u32()) + 1);
         self.row(segment)
     }
 
@@ -466,6 +426,9 @@ impl Window {
             self.present -= usize::from(was_present);
             self.born -= usize::from(was_born);
         }
+        if self.present == 0 {
+            self.reach = self.floor;
+        }
         self.slide();
     }
 
@@ -482,6 +445,7 @@ impl Window {
                 Some(_) | None => break,
             }
         }
+        self.reach = self.reach.max(self.floor);
         while self.floor - self.base >= CHUNK as u64 && !self.chunks.is_empty() {
             self.chunks.pop_front();
             self.base += CHUNK as u64;
@@ -489,21 +453,31 @@ impl Window {
     }
 
     /// Every counted row with the number it stands for, in number order
+    ///
+    /// The walk is bounded by the numbers actually counted rather than by the rows
+    /// allocated, so a volume of one segment reads one row and not a whole chunk.
     fn counted_rows(&self) -> impl Iterator<Item = (SegmentId, &SegmentRow)> {
-        self.chunks
-            .iter()
-            .flat_map(|rows| rows.iter())
-            .enumerate()
-            .filter_map(move |(at, row)| match row.is_present() {
-                true => Some((SegmentId((self.base + at as u64) as u32), row)),
-                false => None,
+        let from = (self.floor - self.base) as usize;
+        let to = (self.reach.max(self.base) - self.base) as usize;
+        self.chunks.iter().enumerate().flat_map(move |(at, chunk)| {
+            let start = at * CHUNK;
+            let low = from.saturating_sub(start).min(CHUNK);
+            let high = to.saturating_sub(start).min(CHUNK);
+            (low..high).filter_map(move |slot| {
+                let row = chunk.at(slot);
+                match row.is_present() {
+                    true => Some((SegmentId((self.base + (start + slot) as u64) as u32), row)),
+                    false => None,
+                }
             })
+        })
     }
 
     fn clear(&mut self) {
         self.chunks.clear();
         self.base = 0;
         self.floor = 0;
+        self.reach = 0;
         self.present = 0;
         self.born = 0;
     }
@@ -629,7 +603,7 @@ impl SegmentTable {
     pub fn bytes_of(&self, segment: SegmentId) -> SegmentBytes {
         read(&self.window)
             .counted(segment)
-            .map(SegmentRow::bytes)
+            .map(|row| row.bytes())
             .unwrap_or_default()
     }
 
@@ -839,7 +813,7 @@ impl SegmentTable {
             let Some(row) = window.open_counted(segment) else {
                 continue;
             };
-            row.live[0].0.store(bytes.live, Ordering::Release);
+            row.store_live(bytes.live);
             row.dead.store(bytes.dead, Ordering::Release);
             row.held.store(bytes.held, Ordering::Release);
             let newest = bytes.held_lsn.unwrap_or(Lsn::NONE);

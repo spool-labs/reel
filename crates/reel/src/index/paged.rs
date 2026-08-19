@@ -7,15 +7,15 @@
 //! the record count. Ruling a segment out by its range only works on a column
 //! written in key order; uniform keys need the filter the footer reserves room for.
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::error::Result;
-use crate::format::block::{FooterMap, RowBlock};
+use crate::format::block::{FooterMap, RowBlock, BLOCK_BYTES};
 use crate::format::column::{ColumnId, KeyBytes};
 use crate::format::footer::{FooterFind, FooterRow, SegmentFooter};
 use crate::format::loc::SegmentId;
+use crate::hold::{hold_key, segment_key, Hold, MAX_BLOCK};
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
 use crate::sync::{read, write};
 
@@ -370,43 +370,17 @@ fn reaches(span: &Span, low: Option<&[u8]>, high: Option<&[u8]>) -> bool {
 ///
 /// A footer is the sorted index of its own segment, so the first search costs two
 /// reads and every search after it costs none. Bounded, since the point of a paged
-/// index is that resident memory stops following the volume.
+/// index is that resident memory stops following the volume. Three tenants over one
+/// slab, a third of the bound and a weight function apiece.
 pub struct FooterCache {
-    /// Bytes each of the three pools will hold at once, a third of the knob apiece
-    share: usize,
-
-    /// What the cache is holding, behind one lock
-    held: RwLock<FooterHeld>,
-}
-
-#[derive(Default)]
-struct FooterHeld {
     /// Parsed footers, by the segment they came from
-    footers: HashMap<SegmentId, Arc<SegmentFooter>>,
+    footers: Hold<Arc<SegmentFooter>>,
 
     /// Directories of segments read a block at a time, held to a share of their own
-    maps: HashMap<SegmentId, Arc<FooterMap>>,
-
-    /// Bytes the held directories weigh, which is almost all filter
-    map_bytes: usize,
-
-    /// The order they were taken in, which is the order they are given up
-    map_order: VecDeque<SegmentId>,
+    maps: Hold<Arc<FooterMap>>,
 
     /// Blocks of rows read on demand, by the segment and column they came from
-    blocks: HashMap<(SegmentId, ColumnId, usize), Arc<RowBlock>>,
-
-    /// Bytes the blocks weigh, held to their own share of the bound
-    block_bytes: usize,
-
-    /// The order blocks were taken in, which is the order they are given up
-    block_order: VecDeque<(SegmentId, ColumnId, usize)>,
-
-    /// Bytes the held footers add up to, so the bound is on what they weigh
-    bytes: usize,
-
-    /// The order they were taken in, which is the order they are given up
-    taken: VecDeque<SegmentId>,
+    blocks: Hold<Arc<RowBlock>>,
 }
 
 impl FooterCache {
@@ -418,9 +392,11 @@ impl FooterCache {
     /// A bound too small for a single entry holds nothing, which is what asking for
     /// no cache on a paged volume means.
     pub fn new(capacity: usize) -> FooterCache {
+        let share = capacity / POOLS;
         FooterCache {
-            share: capacity / POOLS,
-            held: RwLock::new(FooterHeld::default()),
+            footers: Hold::new(share, BLOCK_BYTES),
+            maps: Hold::new(share, BLOCK_BYTES),
+            blocks: Hold::new(share, BLOCK_BYTES),
         }
     }
 
@@ -432,44 +408,26 @@ impl FooterCache {
 
     /// Bytes held per pool: footers, directories, blocks
     pub fn held_split(&self) -> (usize, usize, usize) {
-        let held = read(&self.held);
-        (held.bytes, held.map_bytes, held.block_bytes)
+        (self.footers.bytes(), self.maps.bytes(), self.blocks.bytes())
     }
 
     /// The footer of a segment, if it is still held
     pub fn get(&self, segment: SegmentId) -> Option<Arc<SegmentFooter>> {
-        read(&self.held).footers.get(&segment).cloned()
+        self.footers.get(segment_key(segment))
     }
 
     /// The directory of a segment, if it is still held
     pub fn map_of(&self, segment: SegmentId) -> Option<Arc<FooterMap>> {
-        read(&self.held).maps.get(&segment).cloned()
+        self.maps.get(segment_key(segment))
     }
 
-    /// Hold a segment's directory, giving up the one taken longest ago when full
+    /// Hold a segment's directory, giving up a cold one when full
     ///
     /// Losing one costs the next reader a directory read and a segment it cannot
     /// rule out, never a wrong answer.
     pub fn insert_map(&self, segment: SegmentId, map: Arc<FooterMap>) {
         let weight = map.weight();
-        if weight > self.share {
-            return;
-        }
-        let mut held = write(&self.held);
-        if held.maps.contains_key(&segment) {
-            return;
-        }
-        while held.map_bytes + weight > self.share {
-            let Some(oldest) = held.map_order.pop_front() else {
-                break;
-            };
-            if let Some(given) = held.maps.remove(&oldest) {
-                held.map_bytes = held.map_bytes.saturating_sub(given.weight());
-            }
-        }
-        held.map_bytes += weight;
-        held.maps.insert(segment, map);
-        held.map_order.push_back(segment);
+        self.maps.insert(segment_key(segment), map, weight);
     }
 
     /// One block of a column's rows, if it is still held
@@ -479,10 +437,13 @@ impl FooterCache {
         column: ColumnId,
         at: usize,
     ) -> Option<Arc<RowBlock>> {
-        read(&self.held).blocks.get(&(segment, column, at)).cloned()
+        if at > MAX_BLOCK {
+            return None;
+        }
+        self.blocks.get(hold_key(segment, column, at))
     }
 
-    /// Hold one block, giving up the ones taken longest ago if the cache is full
+    /// Hold one block, giving up cold ones if the cache is full
     pub fn insert_block(
         &self,
         segment: SegmentId,
@@ -490,92 +451,42 @@ impl FooterCache {
         at: usize,
         block: Arc<RowBlock>,
     ) {
+        // A block index past what a packed key names is not held rather than held
+        // under a key another block would answer to.
+        if at > MAX_BLOCK {
+            return;
+        }
         let weight = block.weight();
-        if weight > self.share {
-            return;
-        }
-        let key = (segment, column, at);
-        let mut held = write(&self.held);
-        if held.blocks.contains_key(&key) {
-            return;
-        }
-        while held.block_bytes + weight > self.share {
-            let Some(oldest) = held.block_order.pop_front() else {
-                break;
-            };
-            if let Some(given) = held.blocks.remove(&oldest) {
-                held.block_bytes = held.block_bytes.saturating_sub(given.weight());
-            }
-        }
-        held.block_bytes += weight;
-        held.blocks.insert(key, block);
-        held.block_order.push_back(key);
+        self.blocks
+            .insert(hold_key(segment, column, at), block, weight);
     }
 
-    /// Hold a footer, giving up the one taken longest ago if the cache is full
+    /// Hold a footer, giving up a cold one if the cache is full
     ///
     /// One weighing more than the pool is turned away rather than taken in alone: the
     /// caller keeps the footer it just read either way, so admitting it would empty
     /// the pool for a tenant that fits nothing beside it.
     pub fn insert(&self, segment: SegmentId, footer: Arc<SegmentFooter>) {
         let weight = footer.encoded_len();
-        if weight > self.share {
-            return;
-        }
-        let mut held = write(&self.held);
-        if held.footers.contains_key(&segment) {
-            return;
-        }
-        while held.bytes + weight > self.share {
-            let Some(oldest) = held.taken.pop_front() else {
-                break;
-            };
-            if let Some(given) = held.footers.remove(&oldest) {
-                held.bytes = held.bytes.saturating_sub(given.encoded_len());
-            }
-        }
-        held.bytes += weight;
-        held.footers.insert(segment, footer);
-        held.taken.push_back(segment);
+        self.footers.insert(segment_key(segment), footer, weight);
     }
 
     /// Give up a segment's footer, for one the compactor has retired
+    ///
+    /// A retired segment's blocks name bytes in a file that is gone, so they go with
+    /// it rather than waiting to be evicted by pressure. Each pool walks that
+    /// segment's own chain rather than everything it holds.
     pub fn forget(&self, segment: SegmentId) {
-        let mut held = write(&self.held);
-        if let Some(given) = held.footers.remove(&segment) {
-            held.bytes = held.bytes.saturating_sub(given.encoded_len());
-        }
-        held.taken.retain(|taken| *taken != segment);
-        if let Some(given) = held.maps.remove(&segment) {
-            held.map_bytes = held.map_bytes.saturating_sub(given.weight());
-        }
-        held.map_order.retain(|taken| *taken != segment);
-        // A retired segment's blocks name bytes in a file that is gone, so they go
-        // with it rather than waiting to be evicted by pressure.
-        held.block_order.retain(|key| key.0 != segment);
-        let mut given = 0usize;
-        held.blocks.retain(|key, block| {
-            if key.0 == segment {
-                given += block.weight();
-                return false;
-            }
-            true
-        });
-        held.block_bytes = held.block_bytes.saturating_sub(given);
+        self.footers.forget(segment);
+        self.maps.forget(segment);
+        self.blocks.forget(segment);
     }
 
     /// Give up every footer, for a reader rebuilding its view of the volume
     pub fn clear(&self) {
-        let mut held = write(&self.held);
-        held.footers.clear();
-        held.taken.clear();
-        held.bytes = 0;
-        held.maps.clear();
-        held.map_order.clear();
-        held.map_bytes = 0;
-        held.blocks.clear();
-        held.block_order.clear();
-        held.block_bytes = 0;
+        self.footers.clear();
+        self.maps.clear();
+        self.blocks.clear();
     }
 }
 

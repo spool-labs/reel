@@ -482,3 +482,87 @@ pub fn paged_lookup_block_reads() {
         );
     }
 }
+
+/// Keys a bounded-cache row reads over and over, the working set inside the volume
+const HOT_KEYS: u64 = 200;
+
+/// Rounds the hot set is read for, so a policy has passes to get it wrong in
+const HOT_ROUNDS: u64 = 20;
+
+/// A paged volume whose footer cache holds a share of what it would like to
+///
+/// Big enough that the hot working set fits several times over, small enough that a
+/// scan of the whole volume cannot stay resident beside it. That gap is where an
+/// eviction policy is the only thing separating two caches.
+fn filled_bounded(cache_bytes: u64) -> ReelStore {
+    let store = ReelStore::open_with_io(
+        PathBuf::from("/bounded"),
+        ReelConfig {
+            footer_cache: ByteCount::from_bytes(cache_bytes),
+            ..config(10)
+        },
+        COLUMNS,
+        Arc::new(SimIo::new(FaultPlan::new(5))),
+    )
+    .expect("open");
+
+    let payload = vec![0x3Cu8; PAYLOAD];
+    for at in 0..KEYS {
+        store.put(&key(at), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
+    store
+}
+
+// what a hot working set costs once the cache cannot hold the whole volume
+//
+// Counts rather than time: how many reads a policy leaves is the engine's answer and
+// is the same on any machine. The scan between rounds is the term that decides it,
+// since strict insertion order gives up the hot entries on schedule however often
+// they were read, and a hand that clears a bit only on the way past does not.
+pub fn a_bounded_cache_keeps_its_working_set() {
+    println!();
+    println!("| cache bytes | reads/hot ask | reads/scan ask |");
+    println!("|---|---|---|");
+    for cache_bytes in [64u64 * 1024, 256 * 1024, 1024 * 1024] {
+        let store = filled_bounded(cache_bytes);
+        // One pass over everything first, so the rows below are steady state rather
+        // than the cost of filling an empty cache.
+        let _ = hit_counts(&store, KEYS);
+
+        let mut hot = ProbeCounts::default();
+        let mut scan = ProbeCounts::default();
+        for _ in 0..HOT_ROUNDS {
+            let before = store.filter_probes();
+            for at in 0..HOT_KEYS {
+                assert!(store.get(&key(at)).expect("get").is_some());
+            }
+            hot = add(hot, store.filter_probes().since(before));
+
+            // The scan is what evicts: it walks keys the hot set never asks for.
+            let before = store.filter_probes();
+            for at in HOT_KEYS..KEYS {
+                assert!(store.get(&key(at)).expect("get").is_some());
+            }
+            scan = add(scan, store.filter_probes().since(before));
+        }
+
+        println!(
+            "| {cache_bytes} | {:.3} | {:.3} |",
+            hot.block_reads as f64 / (HOT_KEYS * HOT_ROUNDS) as f64,
+            scan.block_reads as f64 / ((KEYS - HOT_KEYS) * HOT_ROUNDS) as f64,
+        );
+    }
+}
+
+/// Two readings of the counters, added rather than differenced
+fn add(left: ProbeCounts, right: ProbeCounts) -> ProbeCounts {
+    ProbeCounts {
+        asked: left.asked + right.asked,
+        skipped: left.skipped + right.skipped,
+        blocks: left.blocks + right.blocks,
+        block_reads: left.block_reads + right.block_reads,
+        map_reads: left.map_reads + right.map_reads,
+    }
+}

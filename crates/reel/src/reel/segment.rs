@@ -7,13 +7,13 @@
 //! a tag addresses.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 
 use crate::error::{ReelError, Result};
 use crate::format::loc::SegmentId;
+use crate::hold::{segment_key, Hold};
 use crate::io::mapping::Mapping;
 use crate::io::op::{
     Advice, ColdRoute, Completion, FileId, Op, Outcome, ReadBuf, SegmentEntry, Tag, WarmFirst,
@@ -21,7 +21,6 @@ use crate::io::op::{
 };
 use crate::io::slots::{runs_of, SlotTable};
 use crate::io::ReelIo;
-use crate::sync::{read, write};
 
 /// What one read of a batch filled, or why that read alone could not be served
 ///
@@ -1164,26 +1163,15 @@ impl SegmentHandle {
     }
 }
 
-/// What names one segment file across a whole volume
-///
-/// A volume holds one reel and a reel numbers its segments monotonically, so the
-/// number alone names the file.
-type CacheKey = SegmentId;
-
-struct CacheEntry {
-    handle: SegmentHandle,
-    is_hot: AtomicBool,
-}
-
 /// A bounded cache of open sealed segment handles, reclaimed by second chance
 ///
-/// Eviction drops the cache's reference only; a reader still holding the handle
-/// keeps the file open. A hit takes a shared guard and sets one recency bit, so
-/// only an insert that has to make room takes the map exclusively.
+/// A fourth tenant of the hold: the entry shape fits because a segment number is
+/// the whole key and a handle weighs one, so the byte budget the other three split
+/// is a handle count here and nothing else changes. Eviction drops the cache's
+/// reference only; a reader still holding the handle keeps the file open.
 pub struct FdCache {
-    capacity: usize,
     id: u64,
-    entries: RwLock<HashMap<CacheKey, CacheEntry, SegmentIdHash>>,
+    entries: Hold<SegmentHandle>,
 }
 
 /// Names the next cache, so two volumes never share a memo
@@ -1250,9 +1238,8 @@ impl FdCache {
     /// A cache holding at most this many sealed handles, floored at one
     pub fn new(capacity: usize) -> FdCache {
         FdCache {
-            capacity: capacity.max(1),
             id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
-            entries: RwLock::new(HashMap::default()),
+            entries: Hold::new(capacity.max(1), 1),
         }
     }
 
@@ -1272,14 +1259,7 @@ impl FdCache {
             return memoized;
         }
 
-        let handle = {
-            let entries = read(&self.entries);
-            let entry = entries.get(&id)?;
-            if !entry.is_hot.load(Ordering::Relaxed) {
-                entry.is_hot.store(true, Ordering::Relaxed);
-            }
-            entry.handle.clone()
-        };
+        let handle = self.entries.get(segment_key(id))?;
         LAST_HANDLE.with(|slot| {
             *slot.borrow_mut() = Some(HandleMemo {
                 cache: self.id,
@@ -1290,61 +1270,33 @@ impl FdCache {
         Some(handle)
     }
 
-    /// Insert a handle, sweeping for a cold entry when at capacity
+    /// Insert a handle, giving up a cold one when at capacity
+    ///
+    /// A handle already held is left as it stands, since the two name the same file
+    /// and the held one may be the warmer of the pair.
     pub fn insert(&self, handle: SegmentHandle) {
-        let key = handle.id();
-        let mut entries = write(&self.entries);
-        if !entries.contains_key(&key) && entries.len() >= self.capacity {
-            evict_cold(&mut entries);
-        }
-        entries.insert(
-            key,
-            CacheEntry {
-                handle,
-                is_hot: AtomicBool::new(false),
-            },
-        );
+        let key = segment_key(handle.id());
+        self.entries.insert(key, handle, 1);
     }
 
     /// Drop a doomed segment from the cache when it is doomed
     pub fn remove(&self, id: SegmentId) -> Option<SegmentHandle> {
-        write(&self.entries).remove(&id).map(|entry| entry.handle)
+        self.entries.take(segment_key(id))
     }
 
     /// Drop every cached handle, for a reader rebuilding its view of the volume
     pub fn clear(&self) {
-        write(&self.entries).clear();
+        self.entries.clear();
     }
 
     /// Number of handles currently cached
     pub fn len(&self) -> usize {
-        read(&self.entries).len()
+        self.entries.len()
     }
 
     /// Whether the cache holds no handles
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-/// Drop one entry that has not been read since the last sweep passed it
-///
-/// A pass where every entry is hot clears them all and takes the first one it
-/// reached, so making room always makes room.
-fn evict_cold(entries: &mut HashMap<CacheKey, CacheEntry, SegmentIdHash>) {
-    let mut fallback = None;
-    let mut cold = None;
-    for (key, entry) in entries.iter() {
-        if fallback.is_none() {
-            fallback = Some(*key);
-        }
-        if !entry.is_hot.swap(false, Ordering::Relaxed) {
-            cold = Some(*key);
-            break;
-        }
-    }
-    if let Some(key) = cold.or(fallback) {
-        entries.remove(&key);
+        self.entries.is_empty()
     }
 }
 

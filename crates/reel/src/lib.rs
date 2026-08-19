@@ -9,6 +9,7 @@ pub mod config;
 pub mod engine;
 pub mod error;
 pub mod format;
+pub mod hold;
 pub mod index;
 pub mod io;
 pub mod reel;

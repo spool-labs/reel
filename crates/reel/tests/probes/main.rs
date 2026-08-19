@@ -112,6 +112,10 @@ const PROBES: &[Probe] = &[
         filter_cost::a_blocked_hit_costs_a_run_of_block_loads,
     ),
     opt_in(
+        "filter_cost::a_bounded_cache_keeps_its_working_set",
+        filter_cost::a_bounded_cache_keeps_its_working_set,
+    ),
+    opt_in(
         "filter_cost::paged_lookup_block_reads",
         filter_cost::paged_lookup_block_reads,
     ),

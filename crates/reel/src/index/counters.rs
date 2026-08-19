@@ -300,8 +300,8 @@ struct Window {
     /// The number row zero of the first chunk stands for, chunk aligned
     base: u64,
 
-    /// The oldest number no retire has passed, below which everything is gone
-    floor: u64,
+    /// Numbers below this had their chunk freed, raised only by freeing one
+    gone: u64,
 
     /// One past the highest number ever counted, which bounds every walk
     reach: u64,
@@ -320,7 +320,7 @@ impl Window {
     /// The row a number stands on, retired numbers and untouched ones alike
     fn row(&self, segment: SegmentId) -> Option<&SegmentRow> {
         let id = u64::from(segment.as_u32());
-        if id < self.floor || id < self.base {
+        if id < self.gone || id < self.base {
             return None;
         }
         let at = (id - self.base) as usize;
@@ -337,7 +337,7 @@ impl Window {
     /// Whether a number is one the table has already let go of
     fn is_retired(&self, segment: SegmentId) -> bool {
         let id = u64::from(segment.as_u32());
-        if id < self.floor {
+        if id < self.gone {
             return true;
         }
         self.row(segment).is_some_and(|row| row.is_retired())
@@ -349,16 +349,14 @@ impl Window {
     /// that lost its race from bringing a segment back.
     fn open(&mut self, segment: SegmentId) -> Option<&SegmentRow> {
         let id = u64::from(segment.as_u32());
-        if id < self.floor {
+        if id < self.gone {
             return None;
         }
         if self.chunks.is_empty() {
             self.base = id - (id % CHUNK as u64);
-            self.floor = self.floor.max(self.base);
         }
         if id < self.base {
-            // A number below the window and above the floor was never retired, so
-            // the window reaches back for it rather than dropping the booking.
+            // Never retired, so the window reaches back rather than dropping it.
             let reach = self.base - (id - (id % CHUNK as u64));
             if reach > MAX_WINDOW {
                 return None;
@@ -410,11 +408,9 @@ impl Window {
         true
     }
 
-    /// Clear a retired segment's row and slide the floor past the run below it
+    /// Clear a retired segment's row and give back the chunks behind it
     ///
-    /// A number the table never knew is left alone rather than marked gone: nothing
-    /// stood there to bring back, and marking it would refuse a segment whose file
-    /// the caller has not actually seen off.
+    /// A number the table never knew is left alone, since nothing stood there.
     fn retire(&mut self, segment: SegmentId) {
         let cleared = self.row(segment).filter(|row| row.is_known()).map(|row| {
             let was = row.flags();
@@ -427,28 +423,29 @@ impl Window {
             self.born -= usize::from(was_born);
         }
         if self.present == 0 {
-            self.reach = self.floor;
+            self.reach = self.base;
         }
         self.slide();
     }
 
-    /// Move the floor past retired rows and give back the chunks behind it
+    /// Give back the chunks behind a run of retired rows
     ///
-    /// Only retired rows are passed. An untouched row at the floor is a number a
-    /// tail drew and has not written into yet, and passing it would drop that
-    /// segment's first booking along with the floor it carries.
+    /// Only retired rows are passed: an untouched one is a number a tail drew and
+    /// has not written into yet, whose first booking carries the segment's floor.
     fn slide(&mut self) {
-        loop {
-            let at = self.floor;
-            match self.row(SegmentId(at as u32)) {
-                Some(row) if row.is_retired() => self.floor = at + 1,
-                Some(_) | None => break,
+        // Local, since numbers below the window's start were never touched.
+        let mut at = self.base.max(self.gone);
+        while let Some(row) = self.row(SegmentId(at as u32)) {
+            if !row.is_retired() {
+                break;
             }
+            at += 1;
         }
-        self.reach = self.reach.max(self.floor);
-        while self.floor - self.base >= CHUNK as u64 && !self.chunks.is_empty() {
+        self.reach = self.reach.max(at);
+        while at >= self.base + CHUNK as u64 && !self.chunks.is_empty() {
             self.chunks.pop_front();
             self.base += CHUNK as u64;
+            self.gone = self.base;
         }
     }
 
@@ -457,7 +454,7 @@ impl Window {
     /// The walk is bounded by the numbers actually counted rather than by the rows
     /// allocated, so a volume of one segment reads one row and not a whole chunk.
     fn counted_rows(&self) -> impl Iterator<Item = (SegmentId, &SegmentRow)> {
-        let from = (self.floor - self.base) as usize;
+        let from = (self.gone.max(self.base) - self.base) as usize;
         let to = (self.reach.max(self.base) - self.base) as usize;
         self.chunks.iter().enumerate().flat_map(move |(at, chunk)| {
             let start = at * CHUNK;
@@ -476,7 +473,7 @@ impl Window {
     fn clear(&mut self) {
         self.chunks.clear();
         self.base = 0;
-        self.floor = 0;
+        self.gone = 0;
         self.reach = 0;
         self.present = 0;
         self.born = 0;

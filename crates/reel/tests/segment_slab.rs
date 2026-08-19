@@ -17,8 +17,11 @@ use reel::format::lsn::Lsn;
 use reel::index::counters::SegmentTable;
 use reel::SegmentBytes;
 
-/// Segment numbers the streams draw from, small so retires and late bookings collide
-const SEGMENTS: u32 = 24;
+/// Segment numbers the streams draw from, banded so the window spans chunks
+const NUMBERS: [u32; 36] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 300, 301, 302, 303, 304, 305, 306, 307, 308, 309, 310,
+    311, 900, 901, 902, 903, 904, 905, 906, 907, 908, 909, 910, 911,
+];
 
 /// Ops one stream applies
 const OPS: usize = 4_000;
@@ -239,7 +242,7 @@ fn agree(table: &SegmentTable, oracle: &Oracle, step: usize) {
         oracle.snapshot(),
         "ranking parted at {step}"
     );
-    for number in 0..=SEGMENTS {
+    for number in NUMBERS.iter().copied().chain([12, 512, 1_000]) {
         let segment = SegmentId(number);
         assert_eq!(
             table.bytes_of(segment),
@@ -290,7 +293,7 @@ fn stream(seed: u64) {
     let mut oracle = Oracle::default();
 
     for step in 0..OPS {
-        let segment = SegmentId(rng.gen_range(0..SEGMENTS));
+        let segment = SegmentId(NUMBERS[rng.gen_range(0..NUMBERS.len())]);
         let lsn = Lsn(rng.gen_range(1..500));
         let span = rng.gen_range(1..4_000);
         match rng.gen_range(0..14u32) {
@@ -465,6 +468,36 @@ fn an_unbooked_number_is_not_slid_past() {
     assert_eq!(table.min_lsn_of(SegmentId(10)), Some(Lsn(3)));
     assert_eq!(table.min_lsn_excluding(SegmentId(99)), Some(Lsn(3)));
     assert_eq!(table.dropped_bookings(), 0);
+}
+
+// a low number still books after a higher one seated the window
+#[test]
+fn a_number_below_the_first_one_still_books() {
+    let table = SegmentTable::new();
+    table.mark_live(SegmentId(300), Lsn(50), 100);
+    table.mark_live(SegmentId(12), Lsn(7), 100);
+
+    assert_eq!(table.len(), 2, "the low number lost its row");
+    assert_eq!(table.bytes_of(SegmentId(12)).live, 100);
+    assert_eq!(table.min_lsn_of(SegmentId(12)), Some(Lsn(7)));
+    assert_eq!(table.min_lsn_excluding(SegmentId(300)), Some(Lsn(7)));
+    assert_eq!(table.dropped_bookings(), 0);
+}
+
+// a rebuild's born marks land whatever order the segments arrive in
+#[test]
+fn born_marks_land_out_of_number_order() {
+    let table = SegmentTable::new();
+    table.mark_born([SegmentId(600), SegmentId(300), SegmentId(12)]);
+
+    for number in [600u32, 300, 12] {
+        assert!(
+            table.is_born(SegmentId(number)),
+            "segment {number} lost its born mark"
+        );
+        assert!(!table.incarnation_of(SegmentId(number)).is_none());
+    }
+    assert_eq!(table.born_count(), 3);
 }
 
 // the window gives its chunks back as the oldest segments retire

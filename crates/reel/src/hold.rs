@@ -405,9 +405,14 @@ impl<V> Inner<V> {
 
     /// Give a slot back, taking it out of the table and its chain
     fn drop_slot(&mut self, at: usize) -> usize {
+        self.chain_unlink(at as u32);
+        self.free_slot(at)
+    }
+
+    /// Give a slot back with its chain already rewired around it
+    fn free_slot(&mut self, at: usize) -> usize {
         let key = self.slots[at].key;
         self.table_remove(key);
-        self.chain_unlink(at as u32);
         let held = &mut self.slots[at];
         held.val = None;
         self.bytes -= held.weight;
@@ -448,21 +453,30 @@ impl<V> Inner<V> {
     }
 
     /// Unlink every entry of one segment, walking that segment's chain alone
+    ///
+    /// The chain is rebuilt in the one pass that finds them, so retiring a segment
+    /// costs its own entries rather than its entries times the chain they sit in.
     fn forget(&mut self, segment: u32) -> usize {
         let bucket = mix(segment_key(SegmentId(segment))) as usize & (self.chains.len() - 1);
         let mut at = self.chains[bucket];
+        let mut kept = NONE;
         let mut going = Vec::new();
         while at != NONE {
             let slot = &self.slots[at as usize];
             let next = slot.next;
-            if slot.val.is_some() && segment_of(slot.key) == segment {
-                going.push(at as usize);
+            match slot.val.is_some() && segment_of(slot.key) == segment {
+                true => going.push(at as usize),
+                false => {
+                    self.slots[at as usize].next = kept;
+                    kept = at;
+                }
             }
             at = next;
         }
+        self.chains[bucket] = kept;
         let mut freed = 0;
         for at in going {
-            freed += self.drop_slot(at);
+            freed += self.free_slot(at);
         }
         freed
     }

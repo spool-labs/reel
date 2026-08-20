@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 reel = { workspace = true, features = ["serde"] }
 clap.workspace = true
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

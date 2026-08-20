@@ -758,6 +758,7 @@ name = "reel-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "reel",
  "serde",
  "serde_json",

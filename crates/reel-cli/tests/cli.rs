@@ -44,6 +44,48 @@ struct Run {
     err: String,
 }
 
+/// One command run again as json, which is where the exact figures live
+///
+/// The text form is written for a reader and its wording is allowed to change;
+/// the json is the report's data and is what a test should be pinned to. Only
+/// the assertions that are actually about presentation read the text.
+fn json(volume: &Path, args: &[&str]) -> serde_json::Value {
+    let mut all = vec!["-o", "json"];
+    all.extend_from_slice(args);
+    let run = run(volume, &all);
+    // Not asserted on the exit code: a sweep that finds a fault reports it and
+    // exits nonzero, and its report is exactly the one a test wants to read.
+    assert!(!run.out.is_empty(), "{all:?} answered nothing: {}", run.err);
+    serde_json::from_str(&run.out)
+        .unwrap_or_else(|error| panic!("{all:?} produced invalid json ({error}): {}", run.out))
+}
+
+/// A figure a report answers under this name
+fn figure(report: &serde_json::Value, name: &str) -> u64 {
+    report[name]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no `{name}` figure in {report}"))
+}
+
+/// What a report says stands between its figures and what a reader would take
+/// them for
+fn caveats(report: &serde_json::Value) -> Vec<String> {
+    report["caveats"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no caveats in {report}"))
+        .iter()
+        .map(|caveat| caveat["what"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// A table row by the name in its first cell, which is indented under its heading
+fn row<'a>(out: &'a str, name: &str) -> &'a str {
+    out.lines()
+        .map(str::trim_start)
+        .find(|line| line.starts_with(name))
+        .unwrap_or_else(|| panic!("no row for {name} in:\n{out}"))
+}
+
 fn run(volume: &Path, args: &[&str]) -> Run {
     let output = Command::new(env!("CARGO_BIN_EXE_reel"))
         .arg(volume)
@@ -101,9 +143,17 @@ fn cues_a_volume() {
     let cue = run(volume, &["cue"]);
     assert!(cue.ok, "cue failed: {}", cue.err);
     assert!(
-        cue.out.contains("sequence"),
-        "no sequence line: {}",
         cue.out
+            .lines()
+            .next()
+            .is_some_and(|head| head.contains("seq ")),
+        "the head should say where the sequence stands: {}",
+        cue.out,
+    );
+    assert!(
+        cue.out.contains(" dead"),
+        "the verdict should lead with what compaction is owed: {}",
+        cue.out,
     );
     assert!(
         cue.out.contains("segment"),
@@ -111,7 +161,7 @@ fn cues_a_volume() {
         cue.out
     );
     assert!(
-        cue.out.contains("none in this process"),
+        cue.out.contains("none held in this process"),
         "cue points held by nothing should say so: {}",
         cue.out,
     );
@@ -146,11 +196,7 @@ fn declared_columns_are_counted() {
         "no cover line: {}",
         cue.out
     );
-    let row = cue
-        .out
-        .lines()
-        .find(|line| line.starts_with(RECORD_CF))
-        .unwrap_or_else(|| panic!("the declared column is missing: {}", cue.out));
+    let row = row(&cue.out, RECORD_CF);
     let sealed: usize = row
         .split_whitespace()
         .last()
@@ -168,33 +214,33 @@ fn limits_the_segment_listing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let volume = volume(&dir);
 
-    let all = run(volume, &["cue"]);
-    assert!(all.ok, "cue failed: {}", all.err);
-    let held = all
-        .out
-        .lines()
-        .find_map(|line| line.strip_prefix("segments          "))
-        .and_then(|count| count.trim().parse::<usize>().ok())
-        .unwrap_or_else(|| panic!("no segment count: {}", all.out));
+    let held = figure(&json(volume, &["cue"]), "total_segments") as usize;
     assert!(
         held > 1,
         "the writes should have filled more than one segment"
     );
+
+    let all = run(volume, &["cue"]);
+    assert!(all.ok, "cue failed: {}", all.err);
     assert!(
-        all.out
-            .contains(&format!("showing {held} of {held} segments")),
-        "an unlimited listing shows every segment: {}",
+        all.out.contains(&format!("all {held} segments")),
+        "a listing showing every segment should say so: {}",
         all.out,
     );
 
     let capped = run(volume, &["cue", "--limit", "1"]);
     assert!(capped.ok, "cue failed: {}", capped.err);
     assert!(
-        capped
-            .out
-            .contains(&format!("showing 1 of {held} segments")),
-        "the limit should cap the listing: {}",
+        capped.out.contains(&format!("1 of {held} segments")),
+        "the limit should cap the listing and say what it capped: {}",
         capped.out,
+    );
+    assert_eq!(
+        json(volume, &["cue", "--limit", "1"])["segments"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "the limit should reach the data as well as the text",
     );
 }
 
@@ -206,13 +252,18 @@ fn doctor_reads_the_machine() {
     let doctor = run(dir.path(), &["doctor"]);
     assert!(doctor.ok, "doctor failed: {}", doctor.err);
     assert!(
-        doctor.out.contains("because:"),
-        "no reason line: {}",
+        doctor.out.contains("this machine"),
+        "no column for what the machine argues: {}",
         doctor.out
     );
     assert!(
-        doctor.out.contains("verdict"),
-        "no verdict column: {}",
+        doctor.out.contains("plane:"),
+        "the reason should be named beside the knob it explains: {}",
+        doctor.out
+    );
+    assert!(
+        doctor.out.contains("knobs"),
+        "the verdict should weigh the knobs against each other: {}",
         doctor.out
     );
 }
@@ -240,11 +291,7 @@ fn stat_counts_the_live_records() {
 
     let stat = run(volume, &["--column", "records:1:32", "stat"]);
     assert!(stat.ok, "stat failed: {}", stat.err);
-    let row = stat
-        .out
-        .lines()
-        .find(|line| line.starts_with(RECORD_CF))
-        .unwrap_or_else(|| panic!("the declared column is missing: {}", stat.out));
+    let row = row(&stat.out, RECORD_CF);
     // column, id, runs, records, bytes
     let records: u64 = row
         .split_whitespace()
@@ -258,7 +305,10 @@ fn stat_counts_the_live_records() {
     );
     // The overwrites left the versions they replaced behind.
     assert!(
-        !stat.out.contains("dead bytes        0 B"),
+        figure(
+            &json(volume, &["--column", "records:1:32", "stat"]),
+            "dead_bytes"
+        ) > 0,
         "the overwrites should weigh something dead: {}",
         stat.out,
     );
@@ -272,18 +322,24 @@ fn stat_paged_admits_what_it_cannot_count() {
 
     let stat = run(volume, &["--column", "records:1:32", "--paged", "stat"]);
     assert!(stat.ok, "stat failed: {}", stat.err);
-    let row = stat
-        .out
-        .lines()
-        .find(|line| line.starts_with(RECORD_CF))
-        .unwrap_or_else(|| panic!("the declared column is missing: {}", stat.out));
+    let row = row(&stat.out, RECORD_CF);
     assert!(
         row.contains('-'),
         "an unanswerable count should be a dash: {row}"
     );
+    // The caveat has to reach the data too: a consumer reading only the figures
+    // would otherwise take a floor for the total.
+    let caveats = caveats(&json(
+        volume,
+        &["--column", "records:1:32", "--paged", "stat"],
+    ));
     assert!(
-        stat.out.contains("are floors"),
-        "a paged open owes the reader the floor caveat: {}",
+        caveats.iter().any(|caveat| caveat.contains("floors")),
+        "a paged open owes the reader the floor caveat: {caveats:?}",
+    );
+    assert!(
+        stat.out.contains("floors"),
+        "and owes it in the text as well: {}",
         stat.out,
     );
 }
@@ -297,29 +353,37 @@ fn verify_passes_a_sound_volume() {
     let verify = run(volume, &["verify"]);
     assert!(verify.ok, "verify failed: {}", verify.err);
     assert!(
-        verify.out.contains("clean, "),
+        verify.out.contains("CLEAN"),
         "no clean verdict: {}",
         verify.out
     );
     assert!(
-        verify.out.contains("files not indexed 0"),
-        "every file should be one the index names: {}",
-        verify.out,
+        verify.err.is_empty(),
+        "a redirected sweep should draw no progress: {:?}",
+        verify.err,
     );
-    let records = swept(&verify.out, "records checked   ");
+
+    let swept = json(volume, &["verify"]);
     assert!(
-        records > 0,
-        "a sweep of nothing is not a clean bill: {}",
-        verify.out
+        swept["not_indexed"]
+            .as_array()
+            .is_some_and(|files| files.is_empty()),
+        "every file should be one the index names: {swept}",
+    );
+    assert!(
+        caveats(&swept).is_empty(),
+        "a clean sweep of a whole volume owes the reader nothing: {swept}",
+    );
+    assert!(
+        figure(&swept, "records") > 0,
+        "a sweep of nothing is not a clean bill: {swept}",
     );
     // Every segment file on the root is swept, not just the ones still holding
     // a live key.
-    let files = segments(volume).len();
     assert_eq!(
-        swept(&verify.out, "segments swept    "),
-        files as u64,
-        "the sweep should cover every segment file: {}",
-        verify.out,
+        figure(&swept, "segments_swept"),
+        segments(volume).len() as u64,
+        "the sweep should cover every segment file: {swept}",
     );
 }
 
@@ -339,12 +403,17 @@ fn verify_catches_a_flipped_byte() {
         verify.out
     );
     assert!(
-        !verify.out.contains("clean, "),
+        !verify.out.contains("CLEAN"),
         "a faulted sweep is not clean: {}",
         verify.out
     );
     assert!(
-        swept(&verify.out, "faults            ") > 0,
+        verify.out.contains("FAULTS"),
+        "the fault should be named, not only counted: {}",
+        verify.out,
+    );
+    assert!(
+        figure(&json(volume, &["verify"]), "faults") > 0,
         "the fault should be counted: {}",
         verify.out,
     );
@@ -373,18 +442,10 @@ fn verify_catches_a_truncated_segment() {
         verify.out
     );
     assert!(
-        swept(&verify.out, "faults            ") > 0,
+        figure(&json(volume, &["verify"]), "faults") > 0,
         "the fault should be counted: {}",
         verify.out,
     );
-}
-
-/// A headline figure out of a report
-fn swept(out: &str, label: &str) -> u64 {
-    out.lines()
-        .find_map(|line| line.strip_prefix(label))
-        .and_then(|count| count.trim().parse().ok())
-        .unwrap_or_else(|| panic!("no `{label}` line: {out}"))
 }
 
 /// The volume's segment files, largest first
@@ -423,7 +484,7 @@ fn paged_spans() {
     let resident = run(volume, &["--column", "records:1:32", "spans"]);
     assert!(resident.ok, "spans failed: {}", resident.err);
     assert!(
-        resident.out.contains("records") && resident.out.contains("pass --paged"),
+        resident.out.contains("records") && resident.out.contains("--paged"),
         "a resident open should name the open that answers: {}",
         resident.out
     );
@@ -480,11 +541,11 @@ fn checkpoint_copy() {
 
 /// The first figure on the row a table labels with this name
 fn counted(out: &str, label: &str) -> u64 {
-    out.lines()
-        .find(|line| line.starts_with(label))
-        .and_then(|line| line.split_whitespace().nth(1))
+    row(out, label)
+        .split_whitespace()
+        .nth(1)
         .and_then(|figure| figure.parse().ok())
-        .unwrap_or_else(|| panic!("no row for {label} in:\n{out}"))
+        .unwrap_or_else(|| panic!("no figure on the {label} row in:\n{out}"))
 }
 
 #[test]
@@ -506,4 +567,105 @@ fn json_parses() {
             panic!("{args:?} produced invalid json ({error}): {}", run.out)
         });
     }
+}
+
+// markdown carries the tables, for a pull request or a CI summary
+#[test]
+fn markdown_carries_the_tables() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let volume = volume(&dir);
+
+    let stat = run(
+        volume,
+        &["-o", "markdown", "--column", "records:1:32", "stat"],
+    );
+    assert!(stat.ok, "markdown stat failed: {}", stat.err);
+    assert!(
+        stat.out.starts_with("## "),
+        "the head should be a heading: {}",
+        stat.out
+    );
+    assert!(
+        stat.out
+            .contains("| column | id | runs | records | bytes |"),
+        "the column table should survive as a table: {}",
+        stat.out,
+    );
+    assert!(
+        stat.out.contains("| --- | ---: |"),
+        "figures should be aligned right: {}",
+        stat.out
+    );
+    assert!(
+        stat.out.lines().any(|line| line.starts_with("**")),
+        "the verdict should carry: {}",
+        stat.out
+    );
+}
+
+// nothing is dressed unless somebody asked for it or is watching
+#[test]
+fn text_is_plain_off_a_terminal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let volume = volume(&dir);
+
+    // The test harness gives the child a pipe, which is the case that matters:
+    // escape sequences in a captured log are noise a reader cannot turn off.
+    for args in [vec!["cue"], vec!["--color", "never", "cue"]] {
+        let cue = run(volume, &args);
+        assert!(cue.ok, "{args:?} failed: {}", cue.err);
+        assert!(
+            !cue.out.contains('\x1b'),
+            "{args:?} dressed a pipe: {:?}",
+            cue.out,
+        );
+        assert!(
+            !cue.out.contains('╭'),
+            "{args:?} framed a pipe: {:?}",
+            cue.out
+        );
+    }
+
+    let asked = run(volume, &["--color", "always", "cue"]);
+    assert!(asked.ok, "cue failed: {}", asked.err);
+    assert!(
+        asked.out.contains('\x1b') && asked.out.contains('╭'),
+        "asking for colour should dress it anyway: {:?}",
+        asked.out,
+    );
+}
+
+// a caveat is a figure's own, and travels with it into the data
+#[test]
+fn caveats_travel_with_the_figures() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let volume = volume(&dir);
+
+    let undeclared = json(volume, &["cue"]);
+    let owed = caveats(&undeclared);
+    assert!(
+        owed.iter()
+            .any(|caveat| caveat.contains("no columns declared")),
+        "an undeclared open should say what it is not counting: {owed:?}",
+    );
+    assert!(
+        undeclared["caveats"][0]["fix"].is_string(),
+        "a caveat with an answer should name it: {undeclared}",
+    );
+    assert!(
+        run(volume, &["cue"]).out.contains("NOT COUNTED"),
+        "and should reach the text as its own block",
+    );
+
+    // Declaring the columns answers that one, so it stops being said.
+    let declared = caveats(&json(
+        volume,
+        &["--column", "records:1:32", "--paged", "cue"],
+    ));
+    assert!(
+        !declared
+            .iter()
+            .any(|caveat| caveat.contains("no columns declared")),
+        "a declared open should not still be owed the declaration: {declared:?}",
+    );
 }

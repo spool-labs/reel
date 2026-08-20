@@ -7,6 +7,9 @@ use std::path::Path;
 
 use crate::config::{IoBackend, ReelConfig, DEFAULT_FD_CACHE};
 use crate::reel::bias::{access_ranges, MachineFacts, Plane, RingAvailability};
+use crate::report::doc::{Column, Doc, Note, Row, Table, Tone};
+use crate::report::fmt;
+use crate::report::render::Report;
 use crate::units::ByteCount;
 
 /// The machine's facts beside the knobs a configuration asks for
@@ -112,6 +115,184 @@ pub fn doctor(root: &Path, config: &ReelConfig) -> DoctorReport {
         verdict_preallocate: format!("{:?}", verdict.preallocate),
         shipped_fd_cache: DEFAULT_FD_CACHE,
         verdict_fd_cache: verdict.fd_cache,
+    }
+}
+
+/// One knob, as the configuration asks for it beside what this machine argues
+struct Knob {
+    /// What the knob is called
+    name: &'static str,
+
+    /// What the configuration asks for
+    configured: String,
+
+    /// What this machine argues for
+    chosen: String,
+
+    /// Why the machine argues that, where the verdict gave a reason
+    because: Option<String>,
+}
+
+impl Knob {
+    /// Whether the configuration and the machine want different things
+    fn disagrees(&self) -> bool {
+        self.configured != self.chosen
+    }
+}
+
+impl Report for DoctorReport {
+    fn doc(&self) -> Doc {
+        let knobs = self.knobs();
+        let disagreeing = knobs.iter().filter(|knob| knob.disagrees()).count();
+
+        let mut table = Table::new([
+            Column::left("knob"),
+            Column::left("configured"),
+            Column::left("this machine"),
+        ]);
+        for knob in &knobs {
+            let cells = Row::new([
+                knob.name.to_string(),
+                knob.configured.clone(),
+                knob.chosen.clone(),
+            ]);
+            table = table.row(match knob.disagrees() {
+                true => cells.note("disagrees").toned(Tone::Warn),
+                false => cells,
+            });
+        }
+
+        // A reason belongs beside the knob it explains rather than adrift at the
+        // top of the report, where a reader has to carry it back down.
+        let notes: Vec<Note> = knobs
+            .iter()
+            .filter_map(|knob| {
+                knob.because
+                    .as_ref()
+                    .map(|because| Note::new(format!("{}: {because}", knob.name)))
+            })
+            .collect();
+
+        Doc::new()
+            .head(fmt::volume_name(&self.root))
+            .head("doctor")
+            .head(fmt::maybe_bytes(self.memory_bytes) + " memory")
+            .head(format!("io_uring {}", self.ring))
+            .verdict(
+                match disagreeing {
+                    0 => Tone::Good,
+                    _ => Tone::Warn,
+                },
+                match disagreeing {
+                    0 => format!("{} of {} knobs agree", knobs.len(), knobs.len()),
+                    _ => format!("{disagreeing} of {} knobs disagree", knobs.len()),
+                },
+                format!(
+                    "idle reservation {} under the shipped default",
+                    fmt::bytes(self.idle_reservation_bytes),
+                ),
+            )
+            .facts(self.facts())
+            .table(table)
+            .notes("why", Tone::Plain, notes)
+            .footer(["machine-readable: -o json"])
+    }
+}
+
+impl DoctorReport {
+    fn facts(&self) -> Vec<(String, String)> {
+        vec![
+            ("root".to_string(), self.root.clone()),
+            (
+                "filesystem".to_string(),
+                match (self.capacity_bytes, self.occupied_bytes) {
+                    (Some(capacity), Some(occupied)) => format!(
+                        "{}, {} occupied",
+                        fmt::bytes(capacity),
+                        fmt::bytes(occupied)
+                    ),
+                    _ => fmt::maybe_bytes(self.capacity_bytes),
+                },
+            ),
+            (
+                "logical block".to_string(),
+                fmt::maybe_bytes(self.logical_block_bytes),
+            ),
+            (
+                "rotational".to_string(),
+                match self.is_rotational {
+                    Some(true) => "yes".to_string(),
+                    Some(false) => "no".to_string(),
+                    None => "unknown".to_string(),
+                },
+            ),
+            (
+                "actuators".to_string(),
+                match self.actuator_ranges {
+                    0 => "one, or the drive does not say".to_string(),
+                    ranges => format!("{ranges} ranges"),
+                },
+            ),
+            (
+                "open file limit".to_string(),
+                match self.open_file_limit {
+                    Some(limit) => limit.to_string(),
+                    None => "unlimited".to_string(),
+                },
+            ),
+        ]
+    }
+
+    /// The knobs the configuration asks for beside the ones this machine argues for
+    fn knobs(&self) -> [Knob; 5] {
+        [
+            Knob {
+                name: "plane",
+                configured: self.configured_plane.clone(),
+                chosen: self.verdict_plane.clone(),
+                because: Some(self.because.clone()),
+            },
+            Knob {
+                name: "map above",
+                configured: floor_label(self.configured_map_above),
+                // A verdict names the floor a record has to clear, and a direct
+                // plane names none at all, so a volume asking for a mapping
+                // there disagrees.
+                chosen: match self.configured_map_above.is_some()
+                    && self.verdict_map_above.is_none()
+                {
+                    true => "refused".to_string(),
+                    false => floor_label(self.verdict_map_above),
+                },
+                because: Some(self.map_because.clone()),
+            },
+            Knob {
+                name: "ranged reads",
+                configured: self.configured_ranged_reads.clone(),
+                chosen: self.verdict_ranged_reads.clone(),
+                because: None,
+            },
+            Knob {
+                name: "preallocate",
+                configured: self.configured_preallocate.clone(),
+                chosen: self.verdict_preallocate.clone(),
+                because: None,
+            },
+            Knob {
+                name: "fd cache",
+                configured: self.shipped_fd_cache.to_string(),
+                chosen: self.verdict_fd_cache.to_string(),
+                because: None,
+            },
+        ]
+    }
+}
+
+/// How a floor reads in the report, where absent means the volume maps nothing
+fn floor_label(floor: Option<u64>) -> String {
+    match floor {
+        Some(bytes) => fmt::bytes(bytes),
+        None => "off".to_string(),
     }
 }
 

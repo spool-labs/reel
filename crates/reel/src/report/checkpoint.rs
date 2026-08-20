@@ -7,6 +7,9 @@
 use std::path::Path;
 
 use crate::reel::checkpoint::Checkpoint;
+use crate::report::doc::{Doc, Tone};
+use crate::report::fmt;
+use crate::report::render::Report;
 
 /// A checkpoint that was taken, and where it landed
 #[derive(Clone, Debug)]
@@ -28,5 +31,27 @@ pub fn checkpoint(taken: &Checkpoint, target: &Path) -> CheckpointReport {
         at: taken.at.as_u64(),
         segments: taken.segments,
         target: target.display().to_string(),
+    }
+}
+
+impl Report for CheckpointReport {
+    fn doc(&self) -> Doc {
+        Doc::new()
+            .head(fmt::volume_name(&self.target))
+            .head("checkpoint")
+            .head(format!("seq {}", self.at))
+            .verdict(
+                Tone::Good,
+                "TAKEN",
+                format!(
+                    "{} at sequence {}",
+                    fmt::plural(self.segments as u64, "segment linked", "segments linked"),
+                    self.at,
+                ),
+            )
+            .facts([("target".to_string(), self.target.clone())])
+            .line("The copy is hard links, so it costs metadata rather than bytes and shares")
+            .line("them with the volume until compaction moves on.")
+            .footer([format!("restoring is opening it: reel {} cue", self.target)])
     }
 }

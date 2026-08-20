@@ -9,38 +9,63 @@
 //! A volume's columns are the declaration of whatever wrote it and no part of a
 //! segment file names them, so the per column figures count only the columns
 //! declared with `--column`. The reports live in the engine, so this binary is
-//! argument parsing and a match arm per verb.
+//! argument parsing, a match arm per verb, and the two things the engine will
+//! not do for itself: decide whether there is a terminal out there, and draw a
+//! bar for the one verb slow enough to need one.
+
+mod progress;
+mod term;
 
 use std::error::Error;
+use std::io::{stderr, stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-use reel::report::render::{self, Render};
+use reel::report::render::{self, Report};
 use reel::report::{checkpoint, cue, doctor, spans, spec, stat, verify};
 use reel::{IndexResidency, ReelConfig, ReelStore};
 
+use term::ColorChoice;
+
 type Fallible<T> = Result<T, Box<dyn Error>>;
 
-/// Text (human-readable) or json output.
+/// How a report should be written out
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 #[clap(rename_all = "lowercase")]
 enum OutputFormat {
+    /// For a person at a terminal, framed and coloured where there is one
     #[default]
     Text,
+
+    /// Every figure and every caveat as data, for a script or an agent
     Json,
+
+    /// For a pull request, an issue, or a CI job summary
+    Markdown,
 }
 
-/// Print a report in the requested format.
-fn emit<Report>(report: &Report, format: OutputFormat) -> Fallible<ExitCode>
+/// Print a report in the requested format
+///
+/// Json is the complete record: it carries every row a listing truncates and
+/// every caveat the text form renders as a note, so a consumer never has to
+/// parse prose to learn that a figure is a floor.
+fn emit<Model>(cli: &Cli, report: &Model) -> Fallible<ExitCode>
 where
-    Report: Render + Serialize,
+    Model: Report + Serialize,
 {
-    match format {
+    let out = stdout();
+    match cli.output {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(report)?),
-        OutputFormat::Text => print!("{}", render::text(report)),
+        OutputFormat::Markdown => print!("{}", render::markdown(report)),
+        OutputFormat::Text => {
+            let style = term::style(cli.color, &out);
+            let mut lock = out.lock();
+            write!(lock, "{}", render::text(report, &style))?;
+            lock.flush()?;
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -49,6 +74,15 @@ where
 #[command(
     name = "reel",
     about = "Cue up a reel volume and look inside it",
+    long_about = "Cue up a reel volume and look inside it.\n\n\
+        Point at a volume root and ask the volume about itself: where its \
+        sequence stands, what its segments weigh, what a read can still reach \
+        back to. Every verb but `checkpoint` opens read-only and takes no \
+        ownership lock, so it reads a volume something else is writing.\n\n\
+        A volume's columns are the declaration of whatever wrote it, and no \
+        part of a segment file names them, so the per-column figures count only \
+        what `--column` declares. A figure an open could not count comes back as \
+        a dash and a note saying so, never as a zero.",
     version
 )]
 struct Cli {
@@ -81,6 +115,11 @@ struct Cli {
     #[arg(short, long, default_value = "text")]
     output: OutputFormat,
 
+    /// Whether text output may be coloured and framed. Auto dresses a terminal
+    /// and leaves a pipe, a file and a CI log plain. NO_COLOR is honoured.
+    #[arg(long, value_name = "WHEN", default_value = "auto")]
+    color: ColorChoice,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -95,8 +134,8 @@ enum Command {
     /// Where the volume's sequence stands, what its segments weigh, and what a
     /// read can still reach back to.
     Cue {
-        /// Maximum segments to list, fullest of dead first.
-        #[arg(long, default_value_t = 50)]
+        /// Maximum segments to list, fullest of dead first. Zero lists them all.
+        #[arg(long, default_value_t = 10)]
         limit: usize,
     },
     /// What each column holds and what the segments weigh, live against dead.
@@ -111,8 +150,8 @@ enum Command {
     /// Exits nonzero if anything is unreadable or fails its checksum. Reads only:
     /// nothing is repaired and nothing is written.
     Verify {
-        /// Maximum segments to list, the faulted ones first.
-        #[arg(long, default_value_t = 50)]
+        /// Maximum segments to list, the faulted ones first. Zero lists them all.
+        #[arg(long, default_value_t = 20)]
         limit: usize,
     },
     /// Take a durable copy of the volume as it stands, into a new directory.
@@ -142,24 +181,30 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> Fallible<ExitCode> {
     match &cli.command {
-        Command::Cue { limit } => emit(&cue::cue(&cli.open()?, *limit), cli.output),
-        Command::Stat => emit(&stat::stat(&cli.open()?), cli.output),
-        Command::Spans => emit(&spans::spans(&cli.open()?), cli.output),
+        Command::Cue { limit } => emit(cli, &cue::cue(&cli.open()?, *limit)),
+        Command::Stat => emit(cli, &stat::stat(&cli.open()?)),
+        Command::Spans => emit(cli, &spans::spans(&cli.open()?)),
         Command::Verify { limit } => sweep(cli, *limit),
         Command::Checkpoint { target } => copy(cli, target),
         // Reads the machine under the root rather than the volume on it, so it
         // answers where nothing has been written yet.
-        Command::Doctor => emit(
-            &doctor::doctor(&cli.path, &ReelConfig::default()),
-            cli.output,
-        ),
+        Command::Doctor => emit(cli, &doctor::doctor(&cli.path, &ReelConfig::default())),
     }
 }
 
 /// Sweep the volume and let the findings be the exit code as well as the report
+///
+/// The sweep is the one verb that can take minutes, so it draws its progress
+/// where somebody is watching. The bar is erased before the report is written,
+/// which is what keeps it out of a terminal's scrollback as well as out of a
+/// redirected stream.
 fn sweep(cli: &Cli, limit: usize) -> Fallible<ExitCode> {
-    let swept = verify::verify(&cli.open_named()?, limit);
-    let code = emit(&swept, cli.output)?;
+    let store = cli.open_named()?;
+    let mut bar = progress::Bar::new("SWEPT", term::watch(cli.color, &stderr()));
+    let swept = verify::verify_watched(&store, limit, &mut |swept| bar.show(swept.fraction()));
+    bar.done();
+
+    let code = emit(cli, &swept)?;
     Ok(match swept.is_sound() {
         true => code,
         false => ExitCode::FAILURE,
@@ -169,7 +214,7 @@ fn sweep(cli: &Cli, limit: usize) -> Fallible<ExitCode> {
 /// Take a durable copy, the one verb that writes and so the one that locks
 fn copy(cli: &Cli, target: &Path) -> Fallible<ExitCode> {
     let taken = cli.open_primary()?.checkpoint(target)?;
-    emit(&checkpoint::checkpoint(&taken, target), cli.output)
+    emit(cli, &checkpoint::checkpoint(&taken, target))
 }
 
 impl Cli {

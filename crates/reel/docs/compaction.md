@@ -206,6 +206,14 @@ leg copied 1042 MiB in 36 s, 30 MB/s of copies against the 40 MB/s cap that run
 named, and reclaimed nothing by unlink at all: an average at three quarters of the
 ceiling on a bursty workload means the gate was shutting.
 
+**Routing writes to their own tails by expected lifetime was measured and refused.**
+Separating a churning key set from a write-once one takes an interleaved workload
+from 0.93 bytes copied per byte reclaimed to 0.02, but the shape this engine is
+built for has nothing to give up: a cohort volume already retires 80 of 81 segments
+by unlink and copies 0.9 MB against 676 MB reclaimed, and banding it only splits the
+tails and the segments finer. The win is real and belongs to whoever has mixed
+lifetimes; it is not a reason to grow `ColumnSpec` a field for callers who do not.
+
 **So "low stakes" is a property of the shape, not of the engine.** Columns share
 segments, so one column that churns scatters dead bytes inside segments otherwise
 live, and a group drop is a cover push plus a range tombstone rather than a directory

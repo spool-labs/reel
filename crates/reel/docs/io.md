@@ -295,6 +295,24 @@ never-written extents, which is every write an append-only log issues.
 `tests/stress/inode_lock.rs` measures that below the engine, so an engine sweep can
 be read against a floor.
 
+**It survives.** On a ccx33 on ext4, 2026-08-19, a direct first pass into reserved
+but never-written extents scales 12 to 14 times over sixteen writers on one file,
+while the buffered rows stay flat at 1.00 and a file per writer beats one file by
+6.8x there. So the shared path is real and the tail count is the buffered answer to
+it, which is the one the default backend takes.
+
+**One file for the whole reel was refused on the same run.** It only works on the
+direct path, where reservation is what makes it work at all: bare, every append
+extending, it reads 222 MB/s against 3,170 reserved. A log grows without bound, so
+a single file has to extend for ever, and reserving a chunk at a time rather than
+the whole file costs 28% of that. What it buys back is nothing, since one file only
+ever matches a file per writer, which is where segments already sit.
+
+**Preallocation earns that keep only on a shared inode.** With a file per tail,
+reserved, chunked and bare land inside the run-to-run spread of each other, so
+`Preallocate` is a question about when ENOSPC arrives and how many blocks sit idle,
+not about throughput.
+
 ## Why dropping pages is not a knob
 
 Because it is not free and the volume that wants it is the exception. Dropping is

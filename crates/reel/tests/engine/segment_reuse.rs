@@ -6,11 +6,14 @@
 //! per day. A store holding megabytes could sit on tens of gigabytes of shells.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tempfile::TempDir;
 
 use reel::config::{ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, MapShape, RecordKey};
+use reel::io::fault::FaultPlan;
+use reel::io::sim_backend::SimIo;
 use reel::units::ByteCount;
 use reel::{KeyWidth, Preallocate, ReelStore};
 
@@ -113,6 +116,59 @@ fn a_sealed_segment_sheds_its_reservation() {
             "key {at} went missing after the cut"
         );
     }
+}
+
+// a crash's leftover reservation is cut at the next writable open
+#[test]
+fn reopen_cuts_a_crashed_tail() {
+    let config = ReelConfig {
+        sync: SyncPolicy::EveryPut,
+        ..config()
+    };
+    let sim = SimIo::new(FaultPlan::new(1));
+    let store = ReelStore::open_with_io(
+        PathBuf::from("/reel"),
+        config.clone(),
+        COLUMNS,
+        Arc::new(sim.clone()),
+    )
+    .expect("open");
+    store.put(&key(0), &vec![0x5Au8; 8 * 1024]).expect("put");
+    // What a power loss leaves: the tail unsealed at its full reservation.
+    let image = sim.durable_image();
+    drop(store);
+    assert!(
+        image
+            .iter()
+            .any(|(path, bytes)| is_segment(path) && bytes.len() as u64 >= SEGMENT),
+        "the crash image never held the reservation this test is about"
+    );
+
+    let survivor = SimIo::from_image(image);
+    let reopened = ReelStore::open_with_io(
+        PathBuf::from("/reel"),
+        config,
+        COLUMNS,
+        Arc::new(survivor.clone()),
+    )
+    .expect("reopen");
+    assert!(reopened.get(&key(0)).expect("get").is_some());
+
+    let widest = survivor
+        .durable_image()
+        .iter()
+        .filter(|(path, _)| is_segment(path))
+        .map(|(_, bytes)| bytes.len() as u64)
+        .max()
+        .expect("the walked tail survived the reopen");
+    assert!(
+        widest < SEGMENT / 4,
+        "a walked tail kept {widest} of its reservation"
+    );
+}
+
+fn is_segment(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "reel")
 }
 
 // restarts after the data landed cost nothing further

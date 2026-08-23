@@ -431,6 +431,28 @@ impl ReelStore {
         for path in &rebuilt.quarantined {
             tracing::warn!("quarantined a foreign reel segment at {}", path.display());
         }
+        // A tail a crash left open keeps its whole reservation, and nothing writes
+        // it again. Cutting it to the walked end here is what stops unclean stops
+        // from banking a segment of slack apiece. Best effort: a store that cannot
+        // trim still serves.
+        if !is_read_only {
+            for (path, end) in &rebuilt.oversized {
+                let cut = (|| -> Result<()> {
+                    let file = driver.open(path, false)?;
+                    let outcome = driver
+                        .truncate(file, *end)
+                        .and_then(|()| driver.sync_full(file));
+                    driver.close(file)?;
+                    outcome
+                })();
+                if let Err(error) = cut {
+                    tracing::warn!(
+                        segment = %path.display(),
+                        "failed to cut a walked tail to its records: {error}",
+                    );
+                }
+            }
+        }
         // Taken before the install, which takes the map with it.
         let mut on_disk: Vec<SegmentId> = rebuilt.segments.keys().copied().collect();
         on_disk.sort();

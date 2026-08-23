@@ -87,6 +87,10 @@ pub struct RebuiltReel {
     /// Bytes of each segment the rebuild consumed, carried only for the tails it
     /// walked
     pub consumed: HashMap<SegmentId, u64>,
+
+    /// Walked tails whose files run past their last record, with the walked end.
+    /// The slack is a crash's leftover reservation, and a writable open cuts it.
+    pub oversized: Vec<(PathBuf, u64)>,
 }
 
 /// One sealed segment's key span for one column, which rules it in or out of a search
@@ -188,6 +192,7 @@ pub fn rebuild_from_persisted(
     let mut resolver = Resolver::new(pages);
     let mut quarantined = Vec::new();
     let mut consumed = HashMap::new();
+    let mut oversized = Vec::new();
     let mut sealed_files = Vec::new();
     let mut placements = Vec::new();
     let mut highest_number = 0u32;
@@ -210,6 +215,9 @@ pub fn rebuild_from_persisted(
             }
             Loaded::Walked(offset) => {
                 consumed.insert(segment, offset);
+                if offset < len {
+                    oversized.push((path, offset));
+                }
             }
             Loaded::Foreign => quarantined.push(path),
         }
@@ -233,6 +241,7 @@ pub fn rebuild_from_persisted(
         placements,
         quarantined,
         consumed,
+        oversized,
     })
 }
 

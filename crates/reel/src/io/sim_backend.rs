@@ -464,6 +464,7 @@ fn route_completion(state: &mut SimState, position: u64, completion: Completion)
         | Some(FaultKind::ListError)
         | Some(FaultKind::ReadError)
         | Some(FaultKind::ReorderDir)
+        | Some(FaultKind::TruncateError)
         | Some(FaultKind::BitFlip { .. })
         | None => state.ready.push_back(completion),
     }
@@ -664,7 +665,7 @@ fn execute_op(state: &mut SimState, op: Op, position: u64) -> Completion {
         },
         Op::Truncate { tag, file, len } => Completion {
             tag,
-            outcome: Outcome::Done(truncate(state, file, len)),
+            outcome: Outcome::Done(truncate(state, file, len, fault)),
         },
         Op::Advise {
             tag,
@@ -756,6 +757,7 @@ fn write_effect(fault: Option<FaultKind>, full_len: u64) -> (u64, u64) {
         | Some(FaultKind::ListError)
         | Some(FaultKind::ReadError)
         | Some(FaultKind::ReorderDir)
+        | Some(FaultKind::TruncateError)
         | Some(FaultKind::BitFlip { .. })
         | Some(FaultKind::DropCompletion)
         | Some(FaultKind::DelayCompletion { .. })
@@ -899,7 +901,10 @@ fn allocate(
 }
 
 /// Cut the cached view to a length; the durable image follows at the next sync
-fn truncate(state: &mut SimState, file: FileId, len: u64) -> Result<()> {
+fn truncate(state: &mut SimState, file: FileId, len: u64, fault: Option<FaultKind>) -> Result<()> {
+    if matches!(fault, Some(FaultKind::TruncateError)) {
+        return Err(input_output());
+    }
     let file_ref = held_file_mut(state, file)?;
     file_ref.cached.resize(len as usize, 0);
     Ok(())

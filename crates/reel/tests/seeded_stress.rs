@@ -270,7 +270,8 @@ fn drawn_fault(rng: &mut SmallRng) -> (FaultKind, bool) {
         73..=78 => (FaultKind::SyncError, true),
         79..=84 => (FaultKind::ReadError, false),
         85..=89 => (FaultKind::EnospcAppend, false),
-        90..=93 => (FaultKind::EnospcAllocate, false),
+        90..=92 => (FaultKind::EnospcAllocate, false),
+        93 => (FaultKind::TruncateError, false),
         94..=96 => (FaultKind::ReorderDir, false),
         _ => (
             FaultKind::BitFlip {

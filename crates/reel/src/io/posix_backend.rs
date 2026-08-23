@@ -653,6 +653,10 @@ impl PosixBackend {
                 tag,
                 outcome: Outcome::Done(self.allocate(file, offset, len)),
             },
+            Op::Truncate { tag, file, len } => Completion {
+                tag,
+                outcome: Outcome::Done(self.truncate(file, len)),
+            },
             Op::Advise {
                 tag,
                 file,
@@ -727,6 +731,11 @@ impl PosixBackend {
     fn allocate(&self, file: FileId, offset: u64, len: u64) -> Result<()> {
         let fd = self.fd_of(file)?;
         raw_allocate(fd, offset, len)
+    }
+
+    fn truncate(&self, file: FileId, len: u64) -> Result<()> {
+        let fd = self.fd_of(file)?;
+        checked(unsafe { libc::ftruncate(fd, len as libc::off_t) })
     }
 
     fn length(&self, file: FileId) -> Result<u64> {

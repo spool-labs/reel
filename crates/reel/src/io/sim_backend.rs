@@ -434,6 +434,7 @@ fn is_dir_op(op: &Op) -> bool {
         | Op::Length { .. }
         | Op::Close { .. }
         | Op::Allocate { .. }
+        | Op::Truncate { .. }
         | Op::Advise { .. } => false,
     }
 }
@@ -660,6 +661,10 @@ fn execute_op(state: &mut SimState, op: Op, position: u64) -> Completion {
         } => Completion {
             tag,
             outcome: Outcome::Done(allocate(state, file, offset, len, fault)),
+        },
+        Op::Truncate { tag, file, len } => Completion {
+            tag,
+            outcome: Outcome::Done(truncate(state, file, len)),
         },
         Op::Advise {
             tag,
@@ -890,6 +895,13 @@ fn allocate(
     if file_ref.cached.len() < end {
         file_ref.cached.resize(end, 0);
     }
+    Ok(())
+}
+
+/// Cut the cached view to a length; the durable image follows at the next sync
+fn truncate(state: &mut SimState, file: FileId, len: u64) -> Result<()> {
+    let file_ref = held_file_mut(state, file)?;
+    file_ref.cached.resize(len as usize, 0);
     Ok(())
 }
 

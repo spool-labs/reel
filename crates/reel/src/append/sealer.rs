@@ -26,7 +26,12 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
     if active.terminal.load(Ordering::Acquire) {
         return Ok(());
     }
-    let bridged = bridge_reserved_slack(shared, active, end)?;
+    // The reservation past the last record goes back to the filesystem. The footer
+    // has to end the file either way, and cutting to the records rather than padding
+    // to the reservation is what keeps a restart from banking a segment of slack.
+    if active.alloc_high.load(Ordering::Acquire) > end {
+        shared.driver.truncate(active.handle.file(), end)?;
+    }
 
     // Writeback orders nothing, so under the one-sync seal a crash can leave a durable
     // footer naming bytes that never landed. With peers that resolves to a read-time
@@ -49,7 +54,7 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
         )?;
         shared
             .driver
-            .writev_all(active.handle.file(), bridged, vec![WriteBuf::owned(packed)])?;
+            .writev_all(active.handle.file(), end, vec![WriteBuf::owned(packed)])?;
         shared.driver.sync_full(active.handle.file())
     })();
     if let Err(error) = written {
@@ -186,27 +191,6 @@ pub(super) fn stamp_failed_range(
         Ok(wrote) => wrote == HEADER_LEN as u64,
         Err(_) => false,
     }
-}
-
-/// Fill the gap between the last record and the reserved space with one pad
-pub(super) fn bridge_reserved_slack(
-    shared: &Arc<ReelShared>,
-    active: &Active,
-    end: u64,
-) -> Result<u64> {
-    let alloc_high = active.alloc_high.load(Ordering::Acquire);
-    if alloc_high <= end {
-        return Ok(end);
-    }
-    let gap = alloc_high - end;
-    if gap < HEADER_LEN as u64 {
-        return Ok(end);
-    }
-    let pad = RecordHeader::fill((gap - HEADER_LEN as u64) as u32);
-    let mut bufs = Vec::with_capacity(1);
-    WriteBuf::push_prefix(&mut bufs, pad.pack());
-    shared.driver.writev_all(active.handle.file(), end, bufs)?;
-    Ok(alloc_high)
 }
 
 /// What the sealer's worker is asked to do

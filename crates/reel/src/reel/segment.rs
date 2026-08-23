@@ -783,6 +783,15 @@ impl IoDriver {
         })
     }
 
+    /// Cut a file to a length, handing reserved space past it back
+    pub fn truncate(&self, file: FileId, len: u64) -> Result<()> {
+        self.done(Op::Truncate {
+            tag: self.next_tag(),
+            file,
+            len,
+        })
+    }
+
     /// Run one op whose completion carries no payload
     fn done(&self, op: Op) -> Result<()> {
         match self.run_op(op)?.outcome {

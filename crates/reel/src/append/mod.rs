@@ -665,6 +665,17 @@ impl Appender {
         if active.terminal.load(Ordering::Acquire) {
             return Ok(());
         }
+        // A tail whose footer lists nothing holds a header and a reservation, and a
+        // seal would leave that shell on disk for every restart to stack another one.
+        // It goes the way the spare goes, and the next open draws fresh.
+        if lock(&active.entries).is_empty() {
+            let drawn = active.handle.id();
+            active.handle.mark_doomed();
+            active.terminal.store(true, Ordering::Release);
+            self.shared.release_segment(drawn);
+            self.shared.forget_merge_output(drawn);
+            return Ok(());
+        }
         let end = active.end();
         let sealed = self.seal_active(&active, end);
         active.terminal.store(true, Ordering::Release);

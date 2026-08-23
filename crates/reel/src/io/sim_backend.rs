@@ -890,11 +890,11 @@ fn allocate(
     if matches!(fault, Some(FaultKind::EnospcAllocate)) {
         return Err(out_of_space());
     }
-    let file_ref = held_file_mut(state, file)?;
-    let end = (offset + len) as usize;
-    if file_ref.cached.len() < end {
-        file_ref.cached.resize(end, 0);
-    }
+    // The reservation is invisible to the format: it claims blocks without
+    // touching the length, so the simulated file keeps ending at its last
+    // written byte the way a real one does under a keep-size fallocate.
+    held_file_mut(state, file)?;
+    let _ = (offset, len);
     Ok(())
 }
 

@@ -109,6 +109,11 @@ fn merging_config(active_tails: u32) -> ReelConfig {
     ReelConfig {
         merge_sorted_runs: true,
         compact_dead_ratio: 1.0,
+        // Half the paged segment, the smallest a batch and its block fit: the
+        // stream's tails resume across its reopens rather than leaving
+        // orphans, so rolls have to make the runs the merge collapses, and at
+        // the paged size the stream barely fills one segment.
+        segment_bytes: ByteCount::from_bytes(8 * 1024),
         ..rewriting_config(active_tails)
     }
 }

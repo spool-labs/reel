@@ -2115,7 +2115,7 @@ mod tests {
             columns,
             1,
         ));
-        let reel = Reel::open(Arc::clone(&shared)).expect("open reel");
+        let reel = Reel::open(Arc::clone(&shared), Vec::new()).expect("open reel");
         let index = ReelIndex::new(
             columns,
             crate::config::IndexResidency::Resident,
@@ -2216,7 +2216,7 @@ mod tests {
             rebuilt.sealed,
             rebuilt.sealed_keys,
         );
-        let reel = Reel::open(Arc::clone(&shared)).expect("reopen reel");
+        let reel = Reel::open(Arc::clone(&shared), Vec::new()).expect("reopen reel");
         let compactor = Compactor::new(&config, 0, 0);
         Fixture {
             sim,

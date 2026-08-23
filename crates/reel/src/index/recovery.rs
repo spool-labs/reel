@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 
 use crate::error::Result;
 use crate::format::column::{ColumnId, KeyBytes, RecordKey};
-use crate::format::footer::{FooterPartition, FooterTally, SegmentFooter, FIXED_TAIL_LEN};
+use crate::format::footer::{
+    FooterEntry, FooterPartition, FooterTally, SegmentFooter, FIXED_TAIL_LEN,
+};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{
@@ -31,6 +33,9 @@ use crate::reel::segment_number;
 
 /// Bytes at the very end of a sealed segment holding its footer length and magic
 const TRAILER_LEN: u64 = 8;
+
+/// Bytes of the file end searched for the trailer past any aligned-write zeros
+const TRAILER_PROBE_LEN: u64 = 4096;
 
 /// One record recovered from a segment, before newest-wins resolution
 struct SeenRecord {
@@ -88,9 +93,12 @@ pub struct RebuiltReel {
     /// walked
     pub consumed: HashMap<SegmentId, u64>,
 
-    /// Walked tails whose files run past their last record, with the walked end.
-    /// The slack is a crash's leftover reservation, and a writable open cuts it.
-    pub oversized: Vec<(PathBuf, u64)>,
+    /// Walked tails and their file lengths. A crash keeps their reservation's
+    /// blocks claimed past the end, and a writable open gives those back.
+    pub walked: Vec<(PathBuf, u64)>,
+
+    /// The same tails as appenders can pick them up, lowest number first
+    pub resumable: Vec<ResumableTail>,
 }
 
 /// One sealed segment's key span for one column, which rules it in or out of a search
@@ -192,7 +200,8 @@ pub fn rebuild_from_persisted(
     let mut resolver = Resolver::new(pages);
     let mut quarantined = Vec::new();
     let mut consumed = HashMap::new();
-    let mut oversized = Vec::new();
+    let mut walked = Vec::new();
+    let mut resumable: Vec<ResumableTail> = Vec::new();
     let mut sealed_files = Vec::new();
     let mut placements = Vec::new();
     let mut highest_number = 0u32;
@@ -213,10 +222,18 @@ pub fn rebuild_from_persisted(
                 consumed.insert(segment, len);
                 sealed_files.push((segment, path, len));
             }
-            Loaded::Walked(offset) => {
+            Loaded::Walked(offset, rows) => {
                 consumed.insert(segment, offset);
-                if offset < len {
-                    oversized.push((path, offset));
+                walked.push((path.clone(), len));
+                // Resumable means the file ends at its records. A file running
+                // past its walk holds bytes no appender may write behind.
+                if offset == len {
+                    resumable.push(ResumableTail {
+                        segment,
+                        path,
+                        end: offset,
+                        rows,
+                    });
                 }
             }
             Loaded::Foreign => quarantined.push(path),
@@ -241,7 +258,11 @@ pub fn rebuild_from_persisted(
         placements,
         quarantined,
         consumed,
-        oversized,
+        walked,
+        resumable: {
+            resumable.sort_by_key(|tail| tail.segment.as_u32());
+            resumable
+        },
     })
 }
 
@@ -342,11 +363,23 @@ enum Loaded {
     /// A sealed segment, read from its footer, with nothing left to follow
     Sealed,
 
-    /// An unsealed tail, walked to this offset
-    Walked(u64),
+    /// An unsealed tail, walked to an offset, its rows in walk order
+    Walked(u64, Vec<FooterEntry>),
 
     /// A file that is not a segment of this reel
     Foreign,
+}
+
+/// An unsealed tail an appender can pick up where it stopped
+///
+/// The end is the walked offset, and the rows are what the tail's in-memory
+/// footer held when the process went: rebuilt from the walk, carrying nothing
+/// inline, so a read through one goes to the record.
+pub struct ResumableTail {
+    pub segment: SegmentId,
+    pub path: PathBuf,
+    pub end: u64,
+    pub rows: Vec<FooterEntry>,
 }
 
 /// Read one segment into the resolver, releasing its descriptor either way
@@ -391,8 +424,21 @@ fn read_segment(
             let mut reader = SegmentReader::new(driver, file, file_len);
             let walked = walk_records(&mut reader, segment, 0, file_len)?;
             let reached = walked.next_offset;
+            let rows = walked
+                .records
+                .iter()
+                .map(|record| {
+                    FooterEntry::new(
+                        record.key.clone(),
+                        record.lsn,
+                        record.loc.offset,
+                        record.loc.len,
+                        record.flags,
+                    )
+                })
+                .collect();
             absorb_walked(resolver, walked.records);
-            Ok(Loaded::Walked(reached))
+            Ok(Loaded::Walked(reached, rows))
         }
     }
 }
@@ -1398,16 +1444,31 @@ pub(crate) fn read_footer(
     if file_len < min_footer {
         return Ok(None);
     }
-    let trailer = driver.pread(file, file_len - TRAILER_LEN, TRAILER_LEN)?;
+    // An aligned write can land the footer with a block's worth of zeros after
+    // it, so the trailer is read at the last byte that is not padding rather
+    // than at the file end.
+    let probe = file_len.min(TRAILER_PROBE_LEN);
+    let padded = driver.pread(file, file_len - probe, probe)?;
+    if (padded.len() as u64) < probe {
+        return Ok(None);
+    }
+    let Some(last) = padded.iter().rposition(|byte| *byte != 0) else {
+        return Ok(None);
+    };
+    let end = file_len - probe + last as u64 + 1;
+    if end < min_footer {
+        return Ok(None);
+    }
+    let trailer = driver.pread(file, end - TRAILER_LEN, TRAILER_LEN)?;
     if (trailer.len() as u64) < TRAILER_LEN {
         return Ok(None);
     }
     let footer_len = u64::from(read_u32_le(&trailer[0..4]));
-    if footer_len < min_footer || footer_len > file_len {
+    if footer_len < min_footer || footer_len > end {
         return Ok(None);
     }
 
-    let footer_bytes = driver.pread(file, file_len - footer_len, footer_len)?;
+    let footer_bytes = driver.pread(file, end - footer_len, footer_len)?;
     if (footer_bytes.len() as u64) < footer_len {
         return Ok(None);
     }
@@ -1531,7 +1592,7 @@ mod tests {
     fn rebuilds_from_footer() {
         let sim = SimIo::new(FaultPlan::new(1));
         let shared = shared(config(SyncPolicy::Never), &sim);
-        let appender = Appender::open(Arc::clone(&shared), 0).expect("open");
+        let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_data(key(1), vec![0x11; 400], 0, Commit::PerRecord)
             .expect("put");
@@ -1553,7 +1614,7 @@ mod tests {
     fn rebuilds_columns_apart() {
         let sim = SimIo::new(FaultPlan::new(1));
         let shared = shared(config(SyncPolicy::Never), &sim);
-        let appender = Appender::open(Arc::clone(&shared), 0).expect("open");
+        let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_data(key(1), vec![0x11; 400], 0, Commit::PerRecord)
             .expect("put");
@@ -1573,7 +1634,7 @@ mod tests {
     fn newest_lsn_wins() {
         let sim = SimIo::new(FaultPlan::new(1));
         let shared = shared(config(SyncPolicy::Never), &sim);
-        let appender = Appender::open(Arc::clone(&shared), 0).expect("open");
+        let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_data(key(1), vec![0x11; 400], 0, Commit::PerRecord)
             .expect("first");
@@ -1595,7 +1656,7 @@ mod tests {
     fn tombstone_wins_absent() {
         let sim = SimIo::new(FaultPlan::new(1));
         let shared = shared(config(SyncPolicy::Never), &sim);
-        let appender = Appender::open(Arc::clone(&shared), 0).expect("open");
+        let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_data(key(1), vec![0x11; 400], 0, Commit::PerRecord)
             .expect("put");
@@ -1615,7 +1676,7 @@ mod tests {
     fn range_tombstone_replays() {
         let sim = SimIo::new(FaultPlan::new(1));
         let shared = shared(config(SyncPolicy::Never), &sim);
-        let appender = Appender::open(Arc::clone(&shared), 0).expect("open");
+        let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_data(key(1), vec![0x11; 100], 0, Commit::PerRecord)
             .expect("put");
@@ -1641,7 +1702,7 @@ mod tests {
     fn range_tombstone_spares_newer() {
         let sim = SimIo::new(FaultPlan::new(1));
         let shared = shared(config(SyncPolicy::Never), &sim);
-        let appender = Appender::open(Arc::clone(&shared), 0).expect("open");
+        let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_range_tombstone(key(0), None, Commit::PerRecord)
             .expect("range delete");
@@ -1660,7 +1721,7 @@ mod tests {
     fn rebuilds_active_tail() {
         let sim = SimIo::new(FaultPlan::new(1));
         let shared = shared(config(SyncPolicy::EveryPut), &sim);
-        let appender = Appender::open(Arc::clone(&shared), 0).expect("open");
+        let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_data(key(1), vec![0x11; 400], 0, Commit::PerRecord)
             .expect("put");
@@ -1679,7 +1740,7 @@ mod tests {
     fn whole_batch_rebuilds() {
         let sim = SimIo::new(FaultPlan::new(1));
         let shared = shared(config(SyncPolicy::EveryPut), &sim);
-        let appender = Appender::open(Arc::clone(&shared), 0).expect("open");
+        let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_batch(vec![
                 BatchRecord {
@@ -1703,7 +1764,7 @@ mod tests {
     fn torn_batch_is_dropped() {
         let sim = SimIo::new(FaultPlan::new(1));
         let shared = shared(config(SyncPolicy::EveryPut), &sim);
-        let appender = Appender::open(Arc::clone(&shared), 0).expect("open");
+        let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_data(key(9), vec![0x99; 200], 0, Commit::PerRecord)
             .expect("put");
@@ -1731,7 +1792,7 @@ mod tests {
     fn batch_with_first_record_torn_is_dropped() {
         let sim = SimIo::new(FaultPlan::new(1));
         let shared = shared(config(SyncPolicy::EveryPut), &sim);
-        let appender = Appender::open(Arc::clone(&shared), 0).expect("open");
+        let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_data(key(9), vec![0x99; 200], 0, Commit::PerRecord)
             .expect("put");
@@ -1757,7 +1818,7 @@ mod tests {
     /// Write a batch of two behind one plain record, and say where its frame sits
     fn tail_with_a_batch(sim: &SimIo) -> u64 {
         let shared = shared(config(SyncPolicy::EveryPut), sim);
-        let appender = Appender::open(Arc::clone(&shared), 0).expect("open");
+        let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_data(key(9), vec![0x99; 200], 0, Commit::PerRecord)
             .expect("put");
@@ -1836,7 +1897,7 @@ mod tests {
     fn foreign_segment_quarantined() {
         let sim = SimIo::new(FaultPlan::new(1));
         let shared = shared(config(SyncPolicy::Never), &sim);
-        let appender = Appender::open(Arc::clone(&shared), 0).expect("open");
+        let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_data(key(1), vec![0x11; 400], 0, Commit::PerRecord)
             .expect("put");
@@ -1870,7 +1931,7 @@ mod tests {
     fn a_stale_footerless_segment_does_not_shadow_paged() {
         let sim = SimIo::new(FaultPlan::new(1));
         let shared = shared(config(SyncPolicy::Never), &sim);
-        let appender = Appender::open(Arc::clone(&shared), 0).expect("open");
+        let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_data(key(1), vec![0x11; 300], 0, Commit::PerRecord)
             .expect("old version");
@@ -1921,7 +1982,7 @@ mod tests {
             let plan = FaultPlan::new(1).with_fault(at, crate::io::fault::FaultKind::EnospcAppend);
             let sim = SimIo::new(plan);
             let shared = shared(config(SyncPolicy::Never), &sim);
-            let Ok(appender) = Appender::open(Arc::clone(&shared), 0) else {
+            let Ok(appender) = Appender::open(Arc::clone(&shared), 0, None) else {
                 continue;
             };
             let first = appender.append_data(key(1), vec![0x11; 300], 0, Commit::PerRecord);
@@ -1958,7 +2019,7 @@ mod tests {
     fn torn_tail_drops_one_record() {
         let sim = SimIo::new(FaultPlan::new(1));
         let shared = shared(config(SyncPolicy::Never), &sim);
-        let appender = Appender::open(Arc::clone(&shared), 0).expect("open");
+        let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_data(key(1), vec![0x11; 400], 0, Commit::PerRecord)
             .expect("kept");
@@ -2059,7 +2120,7 @@ mod tests {
 
     fn sealed_pair(sim: &SimIo) {
         let shared = shared(config(SyncPolicy::Never), sim);
-        let appender = Appender::open(Arc::clone(&shared), 0).expect("open");
+        let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_data(key(1), vec![0x11; 400], 0, Commit::PerRecord)
             .expect("put");

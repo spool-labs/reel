@@ -69,58 +69,99 @@ fn bytes_in(root: &Path) -> u64 {
         .sum()
 }
 
-// a store opened and closed without a write leaves nothing on disk
+// a store restarted idle keeps its one tail rather than drawing another
 #[test]
-fn an_idle_restart_leaves_no_segment() {
+fn an_idle_restart_keeps_one_segment() {
     let home = TempDir::new().expect("home");
 
+    let mut seen: Option<Vec<PathBuf>> = None;
     for round in 0..5 {
         let store =
             ReelStore::open(home.path().to_path_buf(), config(), COLUMNS).expect("open");
         store.close().expect("close");
         drop(store);
         let left = segments_in(home.path());
-        assert!(
-            left.is_empty(),
-            "restart {round} left {} segment files",
-            left.len()
-        );
+        assert_eq!(left.len(), 1, "restart {round} changed the segment count");
+        if let Some(before) = &seen {
+            assert_eq!(&left, before, "restart {round} drew a fresh segment");
+        }
+        seen = Some(left);
     }
 }
 
-// a seal cuts the file to its records, not its preallocation
+// a restart appends into the tail it left, and everything reads back
 #[test]
-fn a_sealed_segment_sheds_its_reservation() {
+fn a_restart_resumes_the_tail() {
+    let home = TempDir::new().expect("home");
+    let payload = vec![0x5Au8; 8 * 1024];
+
+    let store = ReelStore::open(home.path().to_path_buf(), config(), COLUMNS).expect("open");
+    store.put(&key(0), &payload).expect("put");
+    store.close().expect("close");
+    drop(store);
+
+    let store = ReelStore::open(home.path().to_path_buf(), config(), COLUMNS).expect("reopen");
+    assert_eq!(
+        segments_in(home.path()).len(),
+        1,
+        "the reopen drew a segment instead of resuming"
+    );
+    store.put(&key(1), &payload).expect("put after resume");
+    store.close().expect("close");
+    drop(store);
+
+    let store = ReelStore::open(home.path().to_path_buf(), config(), COLUMNS).expect("third open");
+    for at in 0..2u64 {
+        assert!(
+            store.get(&key(at)).expect("get").is_some(),
+            "key {at} went missing across the resumes"
+        );
+    }
+    assert_eq!(segments_in(home.path()).len(), 1);
+}
+
+// a segment seals when it fills, and the sealed file ends at its footer
+#[test]
+fn a_full_segment_seals_at_its_footer() {
     let home = TempDir::new().expect("home");
 
     let store = ReelStore::open(home.path().to_path_buf(), config(), COLUMNS).expect("open");
     let payload = vec![0x5Au8; 8 * 1024];
-    for at in 0..4u64 {
+    let puts = (SEGMENT / payload.len() as u64) + 8;
+    for at in 0..puts {
         store.put(&key(at), &payload).expect("put");
     }
     store.close().expect("close");
     drop(store);
 
-    let sealed = segments_in(home.path());
-    assert_eq!(sealed.len(), 1, "expected the one sealed tail");
-    let len = std::fs::metadata(&sealed[0]).expect("metadata").len();
-    assert!(
-        len < SEGMENT / 4,
-        "sealed file kept {len} of a {SEGMENT} byte reservation"
+    let segments = segments_in(home.path());
+    assert!(segments.len() >= 2, "the tail never rolled");
+    let sealed = segments
+        .iter()
+        .filter(|path| {
+            std::fs::read(path)
+                .expect("read segment")
+                .ends_with(b"REEL")
+        })
+        .count();
+    assert_eq!(
+        sealed,
+        segments.len() - 1,
+        "every rolled segment ends at its footer, the tail at its records"
     );
 
     let reopened = ReelStore::open(home.path().to_path_buf(), config(), COLUMNS).expect("reopen");
-    for at in 0..4u64 {
+    for at in 0..puts {
         assert!(
             reopened.get(&key(at)).expect("get").is_some(),
-            "key {at} went missing after the cut"
+            "key {at} went missing after the roll"
         );
     }
 }
 
-// a crash's leftover reservation is cut at the next writable open
+// a crash leaves only the records: the reservation never lives in the length
 #[test]
-fn reopen_cuts_a_crashed_tail() {
+fn a_crash_leaves_only_the_records() {
     let config = ReelConfig {
         sync: SyncPolicy::EveryPut,
         ..config()
@@ -134,14 +175,17 @@ fn reopen_cuts_a_crashed_tail() {
     )
     .expect("open");
     store.put(&key(0), &vec![0x5Au8; 8 * 1024]).expect("put");
-    // What a power loss leaves: the tail unsealed at its full reservation.
     let image = sim.durable_image();
     drop(store);
+    let widest = image
+        .iter()
+        .filter(|(path, _)| is_segment(path))
+        .map(|(_, bytes)| bytes.len() as u64)
+        .max()
+        .expect("the crash image holds the tail");
     assert!(
-        image
-            .iter()
-            .any(|(path, bytes)| is_segment(path) && bytes.len() as u64 >= SEGMENT),
-        "the crash image never held the reservation this test is about"
+        widest < SEGMENT / 4,
+        "a crash image carried {widest} of a {SEGMENT} byte reservation"
     );
 
     let survivor = SimIo::from_image(image);
@@ -153,18 +197,16 @@ fn reopen_cuts_a_crashed_tail() {
     )
     .expect("reopen");
     assert!(reopened.get(&key(0)).expect("get").is_some());
+}
 
-    let widest = survivor
-        .durable_image()
-        .iter()
-        .filter(|(path, _)| is_segment(path))
-        .map(|(_, bytes)| bytes.len() as u64)
-        .max()
-        .expect("the walked tail survived the reopen");
-    assert!(
-        widest < SEGMENT / 4,
-        "a walked tail kept {widest} of its reservation"
-    );
+// a flush after a close settles instead of parking on the doomed tail
+#[test]
+fn a_flush_after_close_settles() {
+    let home = TempDir::new().expect("home");
+    let store = ReelStore::open(home.path().to_path_buf(), config(), COLUMNS).expect("open");
+    store.close().expect("close");
+    store.flush().expect("a flush after close");
+    drop(store);
 }
 
 fn is_segment(path: &Path) -> bool {

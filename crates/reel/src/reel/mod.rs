@@ -37,7 +37,7 @@ use crate::format::lsn::{Lsn, LsnCounter};
 use crate::format::record::HEADER_LEN;
 use crate::index::counters::{FilterProbes, SegmentTable};
 use crate::index::paged::{FooterCache, FooterSource};
-use crate::index::recovery::read_footer;
+use crate::index::recovery::{read_footer, ResumableTail};
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
 use crate::io::op::{Advice, ColdRoute, Completion, FileId, Op, WarmFirst};
 use crate::reel::segment::{DirectOpen, FdCache, IoDriver, SegmentHandle, SplitRead};
@@ -577,6 +577,25 @@ impl ReelShared {
             .collect()
     }
 
+    /// Register the hold for a segment an appender resumes, marking it a tail
+    ///
+    /// The number was drawn by a previous process, so nothing advances here;
+    /// the segment only comes back under a tail's hold.
+    pub fn adopt_segment(&self, id: SegmentId) -> Arc<SegmentHolds> {
+        let mut map = write(&self.holds);
+        let held = match map.get(&id) {
+            Some(Some(held)) => Arc::clone(held),
+            _ => {
+                let held: Arc<SegmentHolds> = Arc::default();
+                map.insert(id, Some(Arc::clone(&held)));
+                held
+            }
+        };
+        self.refresh_held_floor(&map);
+        held.is_tail.store(true, Ordering::Release);
+        held
+    }
+
     /// Draw the next monotonic segment number, holding it for the tail that drew it
     ///
     /// Numbers are never given back, and a wrap would name a fresh file after a
@@ -949,13 +968,24 @@ impl Reel {
     /// A volume that rewrites at seal, or that owns a capacity tier, keeps one extra
     /// tail back for compaction: a sorted run is only sorted if nothing else is
     /// writing into it. The reserved tail is the last one and route never offers it.
-    pub fn open(shared: Arc<ReelShared>) -> Result<Reel> {
+    ///
+    /// Tails a previous process left unsealed are picked up in number order, one
+    /// per foreground tail, so a restart continues its segments rather than
+    /// drawing new ones. The reserved tail never resumes: a merge's output has
+    /// to be nothing but its own runs.
+    pub fn open(shared: Arc<ReelShared>, resumable: Vec<ResumableTail>) -> Result<Reel> {
         let count = shared.config.tail_count();
         let reserved = shared.config.rewrite_on_seal || shared.volumes.has_capacity();
         let total = count + usize::from(reserved);
+        let mut candidates = resumable.into_iter();
         let mut tails = Vec::with_capacity(total);
         for index in 0..total {
-            tails.push(Appender::open(Arc::clone(&shared), index as u64)?);
+            let is_reserved = reserved && index == total - 1;
+            let adopted = match is_reserved {
+                true => None,
+                false => candidates.next(),
+            };
+            tails.push(Appender::open(Arc::clone(&shared), index as u64, adopted)?);
         }
         Ok(Reel { shared, tails })
     }

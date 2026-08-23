@@ -2661,6 +2661,11 @@ mod tests {
                 offset: 0,
                 len: 1,
             },
+            Op::Truncate {
+                tag: tag(),
+                file: file(),
+                len: 1,
+            },
             Op::Advise {
                 tag: tag(),
                 file: file(),

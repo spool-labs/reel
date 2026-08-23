@@ -504,7 +504,7 @@ fn open_reel(base: &std::path::Path, backend: IoBackend, sync: SyncPolicy) -> Re
         TEST_COLUMNS,
         1,
     ));
-    Reel::open(shared).expect("open reel")
+    Reel::open(shared, Vec::new()).expect("open reel")
 }
 
 /// One measured run of a cell: tail count, put seconds, durable seconds, cpu seconds

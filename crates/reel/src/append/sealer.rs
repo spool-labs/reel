@@ -26,9 +26,9 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
     if active.terminal.load(Ordering::Acquire) {
         return Ok(());
     }
-    // The reservation past the last record goes back to the filesystem. The footer
-    // has to end the file either way, and cutting to the records rather than padding
-    // to the reservation is what keeps a restart from banking a segment of slack.
+    // The reservation's blocks past the last record go back to the filesystem.
+    // The length already ends at the records; the cut is what releases what the
+    // preallocation claimed beyond them, before the footer takes the end.
     if active.alloc_high.load(Ordering::Acquire) > end {
         shared.driver.truncate(active.handle.file(), end)?;
     }
@@ -52,10 +52,14 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
             shared.filter_bits_for(active.handle.id()),
             shared.config.seal_fences(),
         )?;
+        let sealed_end = end + packed.len() as u64;
         shared
             .driver
             .writev_all(active.handle.file(), end, vec![WriteBuf::owned(packed)])?;
-        shared.driver.sync_full(active.handle.file())
+        shared.driver.sync_full(active.handle.file())?;
+        // An aligned write can leave zeros after the footer. The file ends at
+        // the footer, so every trailer reader finds it at the end.
+        shared.driver.truncate(active.handle.file(), sealed_end)
     })();
     if let Err(error) = written {
         // The footer is the one copy of what this segment holds, so a failed seal puts

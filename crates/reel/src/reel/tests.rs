@@ -120,7 +120,7 @@ fn refuses_to_wrap_segment_numbers() {
 #[test]
 fn opens_configured_tails() {
     let (shared, _sim) = harness(4);
-    let reel = Reel::open(shared).expect("open");
+    let reel = Reel::open(shared, Vec::new()).expect("open");
 
     assert_eq!(reel.tails().len(), 4);
     let segments: BTreeSet<u32> = reel
@@ -135,7 +135,7 @@ fn opens_configured_tails() {
 #[test]
 fn each_tail_writes_its_own_segment() {
     let (shared, _sim) = harness(3);
-    let reel = Reel::open(shared).expect("open");
+    let reel = Reel::open(shared, Vec::new()).expect("open");
 
     for index in 0..3usize {
         let committed = reel.tails()[index]
@@ -152,7 +152,7 @@ fn each_tail_writes_its_own_segment() {
 #[test]
 fn put_and_delete_commit() {
     let (shared, _sim) = harness(1);
-    let reel = Reel::open(shared).expect("open");
+    let reel = Reel::open(shared, Vec::new()).expect("open");
 
     let put = reel
         .put(key(1), vec![0x11; 400], 0, Commit::PerRecord)
@@ -168,7 +168,7 @@ fn put_and_delete_commit() {
 #[test]
 fn range_delete_commits() {
     let (shared, _sim) = harness(1);
-    let reel = Reel::open(shared).expect("open");
+    let reel = Reel::open(shared, Vec::new()).expect("open");
 
     let end = [0x05u8; 34];
     let dropped = reel
@@ -183,7 +183,7 @@ fn range_delete_commits() {
 #[test]
 fn reads_back_by_key() {
     let (shared, _sim) = harness(1);
-    let reel = Reel::open(shared).expect("open");
+    let reel = Reel::open(shared, Vec::new()).expect("open");
     let committed = reel
         .put(key(9), vec![0x99; 300], 0, Commit::PerRecord)
         .expect("put");
@@ -204,7 +204,7 @@ fn reads_back_by_key() {
 #[test]
 fn reads_reject_a_superseded_version() {
     let (shared, _sim) = harness(1);
-    let reel = Reel::open(shared).expect("open");
+    let reel = Reel::open(shared, Vec::new()).expect("open");
     let first = reel
         .put(key(7), vec![0x11; 300], 0, Commit::PerRecord)
         .expect("put");
@@ -231,7 +231,7 @@ fn reads_reject_a_superseded_version() {
 #[test]
 fn concurrent_appends_across_tails() {
     let (shared, _sim) = harness(4);
-    let reel = Arc::new(Reel::open(shared).expect("open"));
+    let reel = Arc::new(Reel::open(shared, Vec::new()).expect("open"));
 
     let writers = 16u8;
     let barrier = Arc::new(Barrier::new(writers as usize));

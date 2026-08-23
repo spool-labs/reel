@@ -1,8 +1,9 @@
 name: models
 
-# Loom and miri are too slow for a pull request and answer a different question from
-# the suite: not whether the engine works, but whether the orderings and the unsafe
-# under it hold. Weekly, and on demand.
+# Loom, miri and the fuzzers are too slow for a pull request and answer a different
+# question from the suite: not whether the engine works, but whether the orderings and
+# the unsafe under it hold, and whether an input nobody thought of breaks it. Weekly,
+# and on demand.
 on:
   schedule:
     - cron: "17 4 * * 1"
@@ -63,3 +64,47 @@ jobs:
           cargo miri test -p reel --lib -- \
             format::column format::fence format::filter format::prefix \
             index::tbtreemap index::opentable
+
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - format_parsers
+          - codec_roundtrip
+          - persisted_index
+          - store_ops
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            .
+            fuzz
+      # Cached with the rest of ~/.cargo/bin, so only the first run of a week pays it.
+      - name: cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      # The committed corpus is the starting point rather than an empty directory, so
+      # a slot is spent past the gates a cold run would spend it finding. Each target
+      # runs alone: fail-fast off, because one crashing target says nothing about the
+      # other three and stopping them would throw away the run.
+      - name: ${{ matrix.target }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=1200 -rss_limit_mb=4096
+        working-directory: fuzz
+      # libFuzzer prints the failing unit as base64 before it dies, so the log already
+      # carries the reproducer. This puts the bytes beside it in a form that can be
+      # pasted straight back into a test.
+      - name: the units that failed
+        if: failure()
+        run: |
+          for unit in fuzz/artifacts/${{ matrix.target }}/*; do
+            [ -e "$unit" ] || continue
+            echo "== $unit"
+            xxd "$unit"
+          done

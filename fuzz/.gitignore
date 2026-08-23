@@ -1,0 +1,6 @@
+# Build output and crash reproducers are per-run. The corpus is not: it is the
+# coverage a hundred previous runs paid for, and a weekly job that starts without it
+# spends its whole slot rediscovering the front door of every parser.
+target
+artifacts
+coverage

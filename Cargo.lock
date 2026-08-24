@@ -726,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "reel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc-fast",
  "criterion",
@@ -755,7 +755,7 @@ dependencies = [
 
 [[package]]
 name = "reel-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "libc",
@@ -767,7 +767,7 @@ dependencies = [
 
 [[package]]
 name = "reel-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror",
  "wincode",
@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "reel-mock"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "reel-core",
 ]

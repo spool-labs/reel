@@ -1476,7 +1476,7 @@ mod tests {
     fn an_entry_stays_in_its_size_class() {
         assert_eq!(
             std::mem::size_of::<FooterEntry>(),
-            160,
+            96,
             "a footer entry changed size; a resumed tail holds one per row",
         );
     }

@@ -2,8 +2,8 @@
 //!
 //! A reel holds every column on one log, so a record says which column it belongs
 //! to and how wide its key is. Keys are stored at their own column's width rather
-//! than padded to the widest, and carried inline rather than on the heap, since
-//! one is built per record read and written.
+//! than padded to the widest, and the common widths are carried in place rather
+//! than on the heap, since one is built per record read and written.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -17,11 +17,17 @@ use crate::error::{ReelError, Result};
 /// it is what a width field has to be able to say, not a size anything occupies.
 pub const MAX_KEY_LEN: usize = 1056;
 
-/// Widest key carried inline, past which a key goes to the heap
+/// Widest key a record's prefix stages, past which a key rides as a shared tail
 ///
-/// Every fixed-width column the reel serves sits at or under this, so none of
-/// them allocates; a variable column pays a pointer per key.
+/// Every fixed-width column the reel serves sits at or under this, so none of them
+/// splits its record into a second buffer; a wider variable key does.
 pub const INLINE_KEY_LEN: usize = 108;
+
+/// Widest key held in the key's own bytes, past which it holds a pointer
+///
+/// Sized so the common fixed widths, a 32 byte id and the 34 byte record key, sit
+/// in place: a walk builds one key per row it steps, and this is what each weighs.
+pub const SHORT_KEY_LEN: usize = 40;
 
 /// Widest value a column may ask the index to carry for it
 ///
@@ -103,17 +109,22 @@ impl ColumnId {
     }
 }
 
-/// A key's bytes, carried inline where they fit and on the heap where they do not
+/// A key's bytes, carried in place where they fit and on the heap where they do not
 ///
-/// A key past the inline width holds an `Arc`, so cloning stays a refcount rather
-/// than a copy of the name, and the type cannot be `Copy`.
+/// Three widths rather than two, because a rebuild holds one of these per record
+/// version and every one of them would otherwise be as wide as the widest key a
+/// prefix stages. A key past the staging width holds an `Arc`, so cloning stays a
+/// refcount rather than a copy of the name, and the type cannot be `Copy`.
 #[derive(Clone)]
 pub enum KeyBytes {
-    /// Bytes in place, which is what every fixed-width column carries
+    /// Bytes in place, which is what the common fixed widths carry
     Inline {
         width: u8,
-        bytes: [u8; INLINE_KEY_LEN],
+        bytes: [u8; SHORT_KEY_LEN],
     },
+
+    /// Bytes on the heap, owned by the one key, still staged in a record's prefix
+    Boxed(Box<[u8]>),
 
     /// Bytes on the heap, shared by refcount rather than copied
     Spilled(Arc<[u8]>),
@@ -131,7 +142,10 @@ impl KeyBytes {
         if bytes.len() > INLINE_KEY_LEN {
             return Ok(KeyBytes::Spilled(Arc::from(bytes)));
         }
-        let mut inline = [0u8; INLINE_KEY_LEN];
+        if bytes.len() > SHORT_KEY_LEN {
+            return Ok(KeyBytes::Boxed(Box::from(bytes)));
+        }
+        let mut inline = [0u8; SHORT_KEY_LEN];
         inline[..bytes.len()].copy_from_slice(bytes);
         Ok(KeyBytes::Inline {
             width: bytes.len() as u8,
@@ -143,7 +157,7 @@ impl KeyBytes {
     pub fn empty() -> KeyBytes {
         KeyBytes::Inline {
             width: 0,
-            bytes: [0u8; INLINE_KEY_LEN],
+            bytes: [0u8; SHORT_KEY_LEN],
         }
     }
 
@@ -151,6 +165,7 @@ impl KeyBytes {
     pub fn as_slice(&self) -> &[u8] {
         match self {
             KeyBytes::Inline { width, bytes } => &bytes[..*width as usize],
+            KeyBytes::Boxed(bytes) => bytes,
             KeyBytes::Spilled(bytes) => bytes,
         }
     }
@@ -159,21 +174,22 @@ impl KeyBytes {
     pub fn width(&self) -> u16 {
         match self {
             KeyBytes::Inline { width, .. } => u16::from(*width),
+            KeyBytes::Boxed(bytes) => bytes.len() as u16,
             KeyBytes::Spilled(bytes) => bytes.len() as u16,
         }
     }
 
-    /// Whether this key had to go to the heap, which is what a spill counter reads
+    /// Whether this key rides outside the record prefix rather than within it
     pub fn is_spilled(&self) -> bool {
         matches!(self, KeyBytes::Spilled(_))
     }
 
     /// The heap bytes themselves, for a writer that would rather point than copy
     ///
-    /// Nothing for an inline key, which is already staged in the prefix.
+    /// Nothing for a key the prefix stages, which is already copied into it.
     pub fn spilled_bytes(&self) -> Option<Arc<[u8]>> {
         match self {
-            KeyBytes::Inline { .. } => None,
+            KeyBytes::Inline { .. } | KeyBytes::Boxed(_) => None,
             KeyBytes::Spilled(bytes) => Some(Arc::clone(bytes)),
         }
     }
@@ -472,7 +488,7 @@ mod tests {
     fn a_record_key_stays_in_its_size_class() {
         assert_eq!(
             std::mem::size_of::<RecordKey>(),
-            120,
+            56,
             "a record key changed size; the walk pays this per key stepped",
         );
     }

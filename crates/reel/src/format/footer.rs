@@ -142,8 +142,8 @@ pub struct FooterEntry {
     /// Bytes the column reserves per row for a value it carries here
     pub inline_width: u16,
 
-    /// The value itself, meaningful up to the length above
-    pub inline: CarryBytes,
+    /// The value itself up to the length above, absent where the row carries none
+    pub inline: Option<CarryBytes>,
 }
 
 /// What one sealed segment says about a key, the filter consulted first
@@ -276,7 +276,7 @@ impl FooterEntry {
             len,
             flags,
             inline_width: 0,
-            inline: [0u8; ROW_CARRY_MAX],
+            inline: None,
         }
     }
 
@@ -303,7 +303,7 @@ impl FooterEntry {
         );
         entry.inline_width = inline_width.min(ROW_CARRY_MAX as u16);
         if header.flags.is_data() && header.length <= u32::from(entry.inline_width) {
-            entry.inline = carry_bytes(payload);
+            entry.inline = Some(carry_bytes(payload, entry.inline_width));
         }
         Some(entry)
     }
@@ -314,7 +314,7 @@ impl FooterEntry {
         if !self.flags.is_data() || self.inline_width == 0 || len > self.inline_width as usize {
             return None;
         }
-        Some(&self.inline[..len])
+        self.inline.as_deref().and_then(|carry| carry.get(..len))
     }
 
     /// An entry for a value the caller is keeping in the row and nowhere else
@@ -333,7 +333,7 @@ impl FooterEntry {
         }
         let mut entry = FooterEntry::new(key, lsn, NO_RECORD, value.len() as u32, flags);
         entry.inline_width = carry;
-        entry.inline = carry_bytes(value);
+        entry.inline = Some(carry_bytes(value, carry));
         Some(entry)
     }
 
@@ -582,8 +582,13 @@ impl FooterPartition {
             // record header follows, so a reader of either can zero the field and redo it.
             let crc_at = self.packed.len();
             self.packed.extend_from_slice(&0u32.to_le_bytes());
-            self.packed
-                .extend_from_slice(&entry.inline[..self.inline_width as usize]);
+            // The region is the column's declared width whatever the entry carries, so a
+            // row carrying nothing or less than the width is padded out to it.
+            let held = entry.inline.as_deref().unwrap_or(&[]);
+            let width = self.inline_width as usize;
+            let taken = held.len().min(width);
+            self.packed.extend_from_slice(&held[..taken]);
+            self.packed.resize(self.packed.len() + width - taken, 0);
             let crc = checksum(&self.packed[began..]);
             self.packed[crc_at..crc_at + ROW_CRC_LEN].copy_from_slice(&crc.to_le_bytes());
         }
@@ -628,8 +633,11 @@ impl FooterPartition {
             .map_err(|error| ReelError::Corruption(error.to_string()))?;
         let mut entry = FooterRow::read(row, width)?.into_entry(key);
         entry.inline_width = self.inline_width;
-        if let Some(held) = verify_row(row, width, self.inline_width)? {
-            entry.inline = carry_bytes(held);
+        // Checked whatever the row is, but kept only where the row really carries a
+        // value, so an entry read back matches the one that was pushed.
+        let held = verify_row(row, width, self.inline_width)?;
+        if entry.flags.is_data() && entry.len <= u32::from(self.inline_width) {
+            entry.inline = held.map(CarryBytes::from);
         }
         Ok(entry)
     }
@@ -1463,6 +1471,16 @@ mod tests {
             .collect()
     }
 
+    // an entry stays in its size class, since a merge holds one per row it walks
+    #[test]
+    fn an_entry_stays_in_its_size_class() {
+        assert_eq!(
+            std::mem::size_of::<FooterEntry>(),
+            160,
+            "a footer entry changed size; a resumed tail holds one per row",
+        );
+    }
+
     // shaped names spend most of their bytes on shared fronts, which packing drops
     #[test]
     fn packed_object_names_shrink_the_partition() {
@@ -1522,7 +1540,7 @@ mod tests {
         let mut entry =
             FooterEntry::new(key.clone(), Lsn(9), 4096, value.len() as u32, Flags::DATA);
         entry.inline_width = CARRY;
-        entry.inline = carry_bytes(&value);
+        entry.inline = Some(carry_bytes(&value, CARRY));
         partition.push(&entry);
 
         // The stride is the key, the fixed tail, and a carry region that is the
@@ -1612,7 +1630,7 @@ mod tests {
         let mut partition = FooterPartition::new(RECORD, 34, CARRY);
         let mut entry = FooterEntry::new(key, Lsn(9), 4096, value.len() as u32, Flags::DATA);
         entry.inline_width = CARRY;
-        entry.inline = carry_bytes(&value);
+        entry.inline = Some(carry_bytes(&value, CARRY));
         partition.push(&entry);
 
         assert!(

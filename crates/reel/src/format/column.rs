@@ -37,14 +37,18 @@ pub const INLINE_MAX: usize = 4;
 pub const ROW_CARRY_MAX: usize = 256;
 
 /// What a sealed row carries of a value, for a column that asked to carry one
-pub type CarryBytes = [u8; ROW_CARRY_MAX];
+///
+/// On the heap and only where a row really carries something: most columns carry
+/// nothing, and an inline array would cost its full width on every entry built.
+pub type CarryBytes = Box<[u8]>;
 
-/// The leading bytes of a payload, for a row that carries its value
-pub fn carry_bytes(payload: &[u8]) -> CarryBytes {
-    let mut carry = [0u8; ROW_CARRY_MAX];
-    let taken = payload.len().min(ROW_CARRY_MAX);
+/// The leading bytes of a payload, padded out to the width the row reserves
+pub fn carry_bytes(payload: &[u8], width: u16) -> CarryBytes {
+    let width = (width as usize).min(ROW_CARRY_MAX);
+    let mut carry = vec![0u8; width];
+    let taken = payload.len().min(width);
     carry[..taken].copy_from_slice(&payload[..taken]);
-    carry
+    carry.into_boxed_slice()
 }
 
 /// The bytes an index entry or a footer row carries of a value itself

@@ -513,22 +513,50 @@ impl ColumnIndex {
 /// One key's carried state: a first touch remembered, or the value resident
 ///
 /// The ghost costs a map entry and no bytes, and is what makes a second touch mean
-/// something. `Held` carries the value and a clock the shed pass steps down, bumped
-/// by hits, so a key keeps its place by being read.
+/// something. It is also the filler of every unfilled place in a tree's value array,
+/// so it is a null pointer rather than room for the value it might become.
 #[derive(Default)]
-pub enum Carried {
-    /// Touched once; the next warm admits it
-    ///
-    /// Also what an unfilled place in a tree's value array holds, since it owns nothing.
-    #[default]
-    Seen,
+pub struct Carried(Option<Box<Held>>);
+
+/// The value a resident key serves, and the clock deciding how long it keeps its place
+///
+/// The clock is stepped down by the shed pass and bumped by hits, so a key stays by
+/// being read.
+pub struct Held {
+    /// Version the bytes were captured against, so a stale capture never serves
+    pub lsn: Lsn,
+
+    /// The value itself, handed out by refcount rather than copied
+    pub bytes: Arc<[u8]>,
+
+    /// Countdown the shed pass steps down and a read bumps back up
+    pub heat: AtomicU8,
+}
+
+impl Carried {
+    /// Touched once, holding nothing; the next warm admits it
+    pub fn seen() -> Carried {
+        Carried(None)
+    }
 
     /// Resident, serving reads without io
-    Held {
-        lsn: Lsn,
-        bytes: Arc<[u8]>,
-        heat: AtomicU8,
-    },
+    pub fn held(lsn: Lsn, bytes: Arc<[u8]>, heat: u8) -> Carried {
+        Carried(Some(Box::new(Held {
+            lsn,
+            bytes,
+            heat: AtomicU8::new(heat),
+        })))
+    }
+
+    /// What this key holds, or nothing for a ghost
+    pub fn resident(&self) -> Option<&Held> {
+        self.0.as_deref()
+    }
+
+    /// The same, owned, for a caller giving the bytes back
+    pub fn into_resident(self) -> Option<Box<Held>> {
+        self.0
+    }
 }
 
 /// Keys in one shard's run before a batch is worth its bookkeeping
@@ -575,8 +603,12 @@ const CARRIED_HEAT_MAX: u8 = 3;
 
 /// Drop what a key carried, keeping the byte total exact
 fn evict_carried<K: IndexKey, S: Shape<K>>(state: &mut ShardState<K, S>, key: &K) {
-    if let Some(Carried::Held { bytes, .. }) = state.carried.take(key.as_slice()) {
-        state.carried_bytes -= bytes.len() as u64;
+    if let Some(held) = state
+        .carried
+        .take(key.as_slice())
+        .and_then(Carried::into_resident)
+    {
+        state.carried_bytes -= held.bytes.len() as u64;
     }
 }
 
@@ -1002,13 +1034,10 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                     // A write capture enters at the bottom of the clock, so a
                     // value earns its place by being read rather than written.
                     state.carried_bytes += bytes.len() as u64;
-                    let held = Carried::Held {
-                        lsn,
-                        bytes,
-                        heat: AtomicU8::new(0),
-                    };
-                    if let Some(Carried::Held { bytes: old, .. }) = state.carried.put(key, held) {
-                        state.carried_bytes -= old.len() as u64;
+                    let held = Carried::held(lsn, bytes, 0);
+                    if let Some(old) = state.carried.put(key, held).and_then(Carried::into_resident)
+                    {
+                        state.carried_bytes -= old.bytes.len() as u64;
                     }
                 }
                 None => evict_carried(state, &key),
@@ -1029,22 +1058,17 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             return None;
         }
         let state = read(&self.shards[self.shard_of_bytes(key)]);
-        match state.carried.at(key)? {
-            Carried::Held {
-                lsn: held,
-                bytes,
-                heat,
-            } if *held == lsn => {
-                // The bump is relaxed and lossy on purpose: racing bumps can
-                // only under-count heat.
-                let hot = heat.load(Ordering::Relaxed);
-                if hot < CARRIED_HEAT_MAX {
-                    heat.store(hot + 1, Ordering::Relaxed);
-                }
-                Some(Arc::clone(bytes))
-            }
-            _ => None,
+        let held = state.carried.at(key)?.resident()?;
+        if held.lsn != lsn {
+            return None;
         }
+        // The bump is relaxed and lossy on purpose: racing bumps can only
+        // under-count heat.
+        let hot = held.heat.load(Ordering::Relaxed);
+        if hot < CARRIED_HEAT_MAX {
+            held.heat.store(hot + 1, Ordering::Relaxed);
+        }
+        Some(Arc::clone(&held.bytes))
     }
 
     /// Remember a value a read just paid the device for
@@ -1067,17 +1091,13 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         // Armed, a first touch leaves only the ghost, so one pass over cold
         // keys buys no residency it never earned.
         if two_touch && !state.carried.holds(key.as_slice()) {
-            state.carried.put(key, Carried::Seen);
+            state.carried.put(key, Carried::seen());
             return;
         }
         state.carried_bytes += bytes.len() as u64;
-        let held = Carried::Held {
-            lsn,
-            bytes: Arc::from(bytes),
-            heat: AtomicU8::new(CARRIED_ADMIT),
-        };
-        if let Some(Carried::Held { bytes: old, .. }) = state.carried.put(key, held) {
-            state.carried_bytes -= old.len() as u64;
+        let held = Carried::held(lsn, Arc::from(bytes), CARRIED_ADMIT);
+        if let Some(old) = state.carried.put(key, held).and_then(Carried::into_resident) {
+            state.carried_bytes -= old.bytes.len() as u64;
         }
     }
 
@@ -1112,21 +1132,21 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             }
             let mut state = write(shard);
             let mut dropped: Vec<K> = Vec::new();
-            for (key, held) in state.carried.walk() {
+            for (key, carried) in state.carried.walk() {
                 if freed >= want || visited >= visit_cap {
                     break;
                 }
                 visited += 1;
-                match held {
-                    Carried::Seen => dropped.push(key.clone()),
-                    Carried::Held { bytes, heat, .. } => {
-                        let hot = heat.load(Ordering::Relaxed);
+                match carried.resident() {
+                    None => dropped.push(key.clone()),
+                    Some(held) => {
+                        let hot = held.heat.load(Ordering::Relaxed);
                         match hot {
                             0 => {
-                                freed += bytes.len() as u64;
+                                freed += held.bytes.len() as u64;
                                 dropped.push(key.clone());
                             }
-                            _ => heat.store(hot - 1, Ordering::Relaxed),
+                            _ => held.heat.store(hot - 1, Ordering::Relaxed),
                         }
                     }
                 }
@@ -2296,13 +2316,12 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         if self.carry_max == 0 {
             return None;
         }
-        match state.carried.at(key.as_slice())? {
-            // A page serve takes the value without bumping its heat: a scan must
-            // not renew a place it did not earn.
-            Carried::Held {
-                lsn: held, bytes, ..
-            } if *held == entry.lsn => Some(Arc::clone(bytes)),
-            _ => None,
+        // A page serve takes the value without bumping its heat: a scan must not
+        // renew a place it did not earn.
+        let held = state.carried.at(key.as_slice())?.resident()?;
+        match held.lsn == entry.lsn {
+            true => Some(Arc::clone(&held.bytes)),
+            false => None,
         }
     }
 
@@ -3062,6 +3081,16 @@ mod tests {
 
     /// Keys the ordered sweep test puts in, enough to cross several pages
     const SWEPT: usize = 2_000;
+
+    // a carried slot stays pointer wide, since every ghost and empty place pays it
+    #[test]
+    fn a_carried_slot_stays_pointer_wide() {
+        assert_eq!(
+            std::mem::size_of::<Carried>(),
+            std::mem::size_of::<usize>(),
+            "a carried slot changed size; every unfilled leaf place holds one",
+        );
+    }
 
     // a column sweep hands out every live key at least once, across its shards
     #[test]

@@ -76,8 +76,7 @@ fn an_idle_restart_keeps_one_segment() {
 
     let mut seen: Option<Vec<PathBuf>> = None;
     for round in 0..5 {
-        let store =
-            ReelStore::open(home.path().to_path_buf(), config(), COLUMNS).expect("open");
+        let store = ReelStore::open(home.path().to_path_buf(), config(), COLUMNS).expect("open");
         store.close().expect("close");
         drop(store);
         let left = segments_in(home.path());
@@ -210,7 +209,8 @@ fn a_flush_after_close_settles() {
 }
 
 fn is_segment(path: &Path) -> bool {
-    path.extension().is_some_and(|extension| extension == "reel")
+    path.extension()
+        .is_some_and(|extension| extension == "reel")
 }
 
 // restarts after the data landed cost nothing further
@@ -225,8 +225,7 @@ fn idle_restarts_do_not_grow_the_store() {
     let settled = bytes_in(home.path());
 
     for _ in 0..5 {
-        let store =
-            ReelStore::open(home.path().to_path_buf(), config(), COLUMNS).expect("reopen");
+        let store = ReelStore::open(home.path().to_path_buf(), config(), COLUMNS).expect("reopen");
         store.close().expect("close");
         drop(store);
     }

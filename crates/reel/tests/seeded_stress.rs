@@ -500,9 +500,13 @@ const SECOND_LIFE: u64 = 1 << 48;
 /// waived, whatever shape the first life took.
 fn resumed_life(seed: u64, shape: &Shape, root: PathBuf, image: DurableImage) {
     let sim = SimIo::from_image(image);
-    let store =
-        ReelStore::open_with_io(root.clone(), config(shape), TEST_COLUMNS, Arc::new(sim.clone()))
-            .expect("a resumed open");
+    let store = ReelStore::open_with_io(
+        root.clone(),
+        config(shape),
+        TEST_COLUMNS,
+        Arc::new(sim.clone()),
+    )
+    .expect("a resumed open");
     let mut rng = SmallRng::seed_from_u64(seed ^ 0x5EC0_11FE);
     let mut expected: BTreeMap<Key, u64> = BTreeMap::new();
     for step in 0..(ops_per_caller() / 4 + 16) {
@@ -762,9 +766,13 @@ fn walk(seed: u64) {
 
     let image = sim.durable_image();
     let restored = SimIo::from_image(image.clone());
-    let reopened =
-        ReelStore::open_with_io(root.clone(), config(&shape), TEST_COLUMNS, Arc::new(restored))
-            .expect("reopen");
+    let reopened = ReelStore::open_with_io(
+        root.clone(),
+        config(&shape),
+        TEST_COLUMNS,
+        Arc::new(restored),
+    )
+    .expect("reopen");
     let (after, after_failed) = view(&reopened);
     assert!(
         shape.lies || after_failed.is_empty(),

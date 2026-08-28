@@ -1644,7 +1644,10 @@ mod tests {
 
         let held: usize = resolver.runs.iter().map(Vec::len).sum();
         assert_eq!(held, KEYS as usize, "the run holds one version a key");
-        assert!(held < versions, "which is under what the source handed over");
+        assert!(
+            held < versions,
+            "which is under what the source handed over"
+        );
 
         let resolved = resolver.finish();
         let entries = resolved.entries.get(&RECORDS).expect("records");

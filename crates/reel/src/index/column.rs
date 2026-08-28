@@ -1035,7 +1035,10 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                     // value earns its place by being read rather than written.
                     state.carried_bytes += bytes.len() as u64;
                     let held = Carried::held(lsn, bytes, 0);
-                    if let Some(old) = state.carried.put(key, held).and_then(Carried::into_resident)
+                    if let Some(old) = state
+                        .carried
+                        .put(key, held)
+                        .and_then(Carried::into_resident)
                     {
                         state.carried_bytes -= old.bytes.len() as u64;
                     }
@@ -1096,7 +1099,11 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         }
         state.carried_bytes += bytes.len() as u64;
         let held = Carried::held(lsn, Arc::from(bytes), CARRIED_ADMIT);
-        if let Some(old) = state.carried.put(key, held).and_then(Carried::into_resident) {
+        if let Some(old) = state
+            .carried
+            .put(key, held)
+            .and_then(Carried::into_resident)
+        {
             state.carried_bytes -= old.bytes.len() as u64;
         }
     }

@@ -1057,10 +1057,9 @@ struct ResolvedRecords {
 /// Newest-wins resolution over sorted runs, joined once at the finish
 ///
 /// The sources are already sorted, so resolving them through a map would pay a
-/// descent per record to rediscover an order the inputs had. The runs are held as
-/// they arrive and merged once through a loser tree, which leaves the per-column
-/// output sorted for the bulk install. Every version is held rather than only the
-/// survivor, so an overwrite-heavy volume pays memory here.
+/// descent per record to rediscover an order the inputs had. Each run is folded to
+/// one version a key as it arrives, and the runs are merged once through a loser
+/// tree, which leaves the per-column output sorted for the bulk install.
 struct Resolver {
     runs: Vec<Vec<(RecordKey, SeenRecord)>>,
     ranges: Vec<RangeCover>,
@@ -1093,7 +1092,7 @@ impl Resolver {
     /// The bookkeeping that does not depend on the join happens here. Booking a
     /// tombstone's hold now is what keeps a segment of nothing but tombstones from
     /// having no row at all, which neither compaction nor the scrub could see.
-    fn absorb_sorted_run(&mut self, run: Vec<(RecordKey, SeenRecord)>) {
+    fn absorb_sorted_run(&mut self, mut run: Vec<(RecordKey, SeenRecord)>) {
         if run.is_empty() {
             return;
         }
@@ -1106,7 +1105,38 @@ impl Resolver {
                 false => note_segment_min(&mut self.segment_min_lsn, record.segment, record.lsn),
             }
         }
+        self.fold_newest(&mut run);
         self.runs.push(run);
+    }
+
+    /// Cut a run down to one version a key, booking every version it drops dead
+    ///
+    /// The run is in key then sequence order, so a key's versions are adjacent and the
+    /// last of them is the newest. The join would resolve them the same way and book the
+    /// same losers dead, so doing it here holds a source at the size of the keys it still
+    /// resolves rather than of every version it ever wrote.
+    fn fold_newest(&mut self, run: &mut Vec<(RecordKey, SeenRecord)>) {
+        let mut kept = 0usize;
+        for at in 1..run.len() {
+            if run[kept].0 != run[at].0 {
+                kept += 1;
+                run.swap(kept, at);
+                continue;
+            }
+            // An exact tie falls to the version already held, which is what the join
+            // does with a tie between two runs.
+            match run[at].1.lsn > run[kept].1.lsn {
+                true => {
+                    self.book_dead(&run[kept].1);
+                    run.swap(kept, at);
+                }
+                false => self.book_dead(&run[at].1),
+            }
+        }
+        if kept + 1 < run.len() {
+            run.truncate(kept + 1);
+            run.shrink_to_fit();
+        }
     }
 
     /// Take a walked tail's records, which arrive in file order rather than key
@@ -1585,6 +1615,50 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    // an overwrite-heavy source is held at its survivors, not at every version
+    #[test]
+    fn a_run_is_folded_to_its_survivors() {
+        const KEYS: u8 = 8;
+        const VERSIONS: u64 = 64;
+        let mut resolver = Resolver::new(false);
+        let mut run = Vec::new();
+        for version in 0..VERSIONS {
+            for byte in 0..KEYS {
+                run.push((
+                    key(byte),
+                    SeenRecord {
+                        lsn: Lsn(version * u64::from(KEYS) + u64::from(byte) + 1),
+                        segment: SegmentId(1),
+                        offset: 0,
+                        len: 400,
+                        key_width: 34,
+                        is_tombstone: false,
+                    },
+                ));
+            }
+        }
+        let versions = run.len();
+        resolver.absorb_unsorted_run(run);
+
+        let held: usize = resolver.runs.iter().map(Vec::len).sum();
+        assert_eq!(held, KEYS as usize, "the run holds one version a key");
+        assert!(held < versions, "which is under what the source handed over");
+
+        let resolved = resolver.finish();
+        let entries = resolved.entries.get(&RECORDS).expect("records");
+        assert_eq!(entries.len(), KEYS as usize);
+        let newest = (VERSIONS - 1) * u64::from(KEYS);
+        for (_, entry) in entries {
+            assert!(entry.lsn > Lsn(newest), "each key kept its newest version");
+        }
+
+        // Every version that lost is booked dead where it lay, folded or joined.
+        let span = span_of(34, 400);
+        let bytes = resolved.segments.get(&SegmentId(1)).expect("segment");
+        assert_eq!(bytes.dead, (versions - KEYS as usize) as u64 * span);
+        assert_eq!(bytes.live, KEYS as u64 * span);
     }
 
     // a sealed segment rebuilds its live records from the footer alone

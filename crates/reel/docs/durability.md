@@ -210,10 +210,11 @@ carries on at the boundary the frame named. The cost is one checksum pass over t
 bytes the tail holds, which is bounded by the segment size rather than by the
 record count.
 
-**Newest-wins is folded in as records arrive, on the resident path.** Only the
-surviving version of each key is held, and a record that loses is booked dead
-where it lies and dropped, so a rebuild costs memory for what the volume still
-resolves rather than for every version it ever wrote. This is also what makes
+**Newest-wins is folded in as records arrive, on the resident path.** Each
+source's run is cut to one version of each key as it lands, and a record that
+loses is booked dead where it lies and dropped, so a rebuild costs memory for the
+keys a source still resolves rather than for every version it ever wrote. The
+winner across sources is settled by the join that follows. This is also what makes
 runtime visibility and the rebuilt index agree when a later put landed in a
 lower-numbered segment. Range tombstones are held for the length of the pass and
 applied at the end, since their effect is on keys rather than on one key and no

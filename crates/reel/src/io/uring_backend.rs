@@ -20,6 +20,7 @@ use crate::config::{RingTuning, RingWait};
 use crate::error::{ReelError, Result};
 use crate::io::direct::{
     align_up, covering_span, cut_into, cut_split_into, wanted_window, AlignedBuf, DIRECT_ALIGN,
+    DIRECT_REQUEST_BYTES,
 };
 use crate::io::op::{Completion, FileId, Op, Outcome, ReadBuf, Tag, WriteBuf};
 use crate::io::posix_backend::{PosixBackend, MAX_IOVECS, STAGE_BYTES};
@@ -39,11 +40,12 @@ const IOVEC_ROOM: usize = 2;
 /// Registered descriptor slots one ring keeps, the ceiling on files it can hold
 const MAX_REGISTERED_FILES: u32 = 4096;
 
-/// Bytes one registered buffer holds, the widest direct op the pool can serve
+/// Bytes one registered buffer holds, the room a staged op lands in
 ///
 /// The posix staging width plus the block a covering read is widened by, since a
-/// read aligned to nothing rounds down at the front and up at the back. A span
-/// past this takes the op off the ring entirely.
+/// read aligned to nothing rounds down at the front and up at the back. What the
+/// pool serves stops a block short of this, at the width one request reaches the
+/// device as; a span past that takes the op off the ring entirely.
 const REGISTERED_BUFFER_BYTES: usize = STAGE_BYTES + DIRECT_ALIGN;
 
 /// Registered buffers one ring keeps, the ceiling on direct ops it can have out
@@ -183,8 +185,11 @@ impl Buffers {
     }
 
     /// Take a buffer for an op of this span, or nothing when none can serve it
+    ///
+    /// The ceiling is the request width rather than the buffer's, so an op the pool
+    /// has room for but the device would answer in two goes off the ring instead.
     fn claim(&mut self, span: usize) -> Option<u16> {
-        if span > REGISTERED_BUFFER_BYTES {
+        if span > DIRECT_REQUEST_BYTES {
             return None;
         }
         self.free.pop()

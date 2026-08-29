@@ -41,6 +41,9 @@ struct Stage {
     /// The threads the script owns, empty while it speaks for everyone
     cast: HashSet<ThreadId>,
 
+    /// The thread that armed the script, which its refusals are scoped to
+    owner: Option<ThreadId>,
+
     /// Which script the stage belongs to, so a late arrival cannot join the next
     run: u64,
 }
@@ -59,6 +62,15 @@ impl Stage {
     /// Whether a cast script has narrowed past the arriving thread
     fn bystander(&self, who: ThreadId) -> bool {
         !self.cast.is_empty() && !self.cast.contains(&who)
+    }
+
+    /// Whether the thread is one the script itself runs on
+    ///
+    /// A gate holds whoever reaches it, but a refusal takes work away from the
+    /// thread that meets it, and a thread of some other test cannot be asked to
+    /// go without work it is waiting on.
+    fn owns(&self, who: ThreadId) -> bool {
+        self.owner == Some(who) || self.cast.contains(&who)
     }
 
     /// Arrivals the script speaks for: its cast's, or everyone's when it has none
@@ -82,6 +94,7 @@ fn stage() -> &'static (Mutex<Stage>, Condvar) {
                 gates: HashMap::new(),
                 reached: HashMap::new(),
                 cast: HashSet::new(),
+                owner: None,
                 run: 0,
             }),
             Condvar::new(),
@@ -91,6 +104,8 @@ fn stage() -> &'static (Mutex<Stage>, Condvar) {
 
 /// Whether a script has refused the point, for a site guarding optional work
 ///
+/// Only for the script's own threads: the refused work is what a caller elsewhere
+/// in the suite is waiting on, and taking it away wedges that caller for good.
 /// One load while nothing is armed.
 #[inline]
 pub fn refused(name: &'static str) -> bool {
@@ -99,7 +114,7 @@ pub fn refused(name: &'static str) -> bool {
     }
     let (mutex, _) = stage();
     let stage = lock(mutex);
-    !stage.bystander(thread::current().id()) && stage.refused.contains(name)
+    stage.owns(thread::current().id()) && stage.refused.contains(name)
 }
 
 /// Mark a named moment, parking here while a script gates it
@@ -177,6 +192,7 @@ pub fn script() -> Script {
         stage.gates.clear();
         stage.reached.clear();
         stage.cast.clear();
+        stage.owner = Some(thread::current().id());
         stage.run += 1;
     }
     ARMED.store(true, Ordering::Release);
@@ -213,7 +229,7 @@ impl Script {
         })
     }
 
-    /// Refuse the point outright: arrivals return without acting
+    /// Refuse the point outright on this script's threads: they return without acting
     pub fn refuse(&self, name: &'static str) {
         let (mutex, _) = stage();
         lock(mutex).refused.insert(name);
@@ -278,6 +294,36 @@ impl Drop for Script {
         stage.gates.clear();
         stage.reached.clear();
         stage.cast.clear();
+        stage.owner = None;
         condvar.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // a refusal reaches the script's own threads and nobody else's
+    #[test]
+    fn a_refusal_spares_a_bystander() {
+        let script = script();
+        script.refuse("test/refusal");
+
+        // Asked before the script casts anything, which is the window a refusal
+        // used to speak for every thread in the process through.
+        let bystander = thread::spawn(|| refused("test/refusal"))
+            .join()
+            .expect("the bystander joins");
+        let cast = script
+            .cast(|| refused("test/refusal"))
+            .join()
+            .expect("the cast thread joins");
+
+        assert!(
+            refused("test/refusal"),
+            "the script's own thread was spared"
+        );
+        assert!(cast, "a thread the script cast was spared");
+        assert!(!bystander, "the refusal reached a thread of another test");
     }
 }

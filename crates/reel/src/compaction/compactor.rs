@@ -11,24 +11,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::{ReelConfig, RepairPath, VolumeClass};
 use crate::error::Result;
+use crate::format::band::Band;
 use crate::format::column::RecordKey;
 use crate::format::footer::FooterEntry;
 use crate::format::footer::{FooterPartition, SegmentFooter, FIXED_TAIL_LEN, NO_RECORD};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{peek_key_width, read_u32_le, RecordHeader, HEADER_LEN};
+use crate::format::segment_header::SegmentHeader;
 use crate::index::map::ReelIndex;
 use crate::reel::segment::{SegmentHandle, SegmentReader, READ_CHUNK};
-use crate::reel::{Reel, ReelShared};
+use crate::reel::{Reel, ReelShared, NOTHING_PURGED};
 use crate::sync::{lock, try_lock};
 
 use crate::compaction::pressure::{GcPressure, PassPace, RateGate, RateLimiter};
 
 /// Bytes at the end of a sealed segment holding its footer length and magic
 const TRAILER_LEN: u64 = 8;
-
-/// The floor of a volume that has purged nothing, which no key sits below
-const NOTHING_PURGED: u64 = 0;
 
 /// Earnings one scrub pass will carry over from a stretch with no ticks in it
 ///
@@ -341,9 +340,6 @@ pub struct Compactor {
     /// Counters the maintenance plane publishes
     metrics: Metrics,
 
-    /// Purge floor every column with a mark is measured against
-    purge_floor: AtomicU64,
-
     /// Segments a pass is rewriting right now, so a second pass picks another
     in_flight: Mutex<std::collections::HashSet<SegmentId>>,
 
@@ -481,7 +477,6 @@ impl Compactor {
                 .unwrap_or(0),
             demote_after_bytes,
             metrics: Metrics::new(),
-            purge_floor: AtomicU64::new(NOTHING_PURGED),
         }
     }
 
@@ -740,15 +735,21 @@ impl Compactor {
         // key order where the segment can say what that is, offset order otherwise
         let order = self.rewrite_order(shared, segment);
         let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
-        let dest_index = least_loaded_tail(reel);
+        // The band the source was drawn under is where its survivors belong. Placement
+        // the writer paid for is undone otherwise: every rewrite would put a window's
+        // records back into the mixture they were kept out of.
+        let band = band_of(shared, &source)?;
+        let dest_index = destination(reel, band)?;
 
-        // Only the reserved tail answers to a named tier, since a foreground destination
-        // mixes fresh puts in and fresh puts stay fast. A leftover active segment from
-        // the other tier is sealed away so the swap draws under the tier just set.
+        // Only the reserved tail answers to a named tier and to the source's band, since
+        // a foreground destination mixes fresh puts in and fresh puts stay fast. A
+        // leftover active segment from another tier or another band is sealed away so
+        // the swap draws under what this pass just set.
         if reel.reserved_tail() == Some(dest_index) {
             let class = self.output_class(shared, segment);
             let dest = &reel.tails()[dest_index];
             dest.set_draw_class(class);
+            dest.set_band(band)?;
             let active = dest.tail().active_segment();
             if shared.volumes.class_of(shared.volumes.root_of(active)) != class {
                 dest.seal()?;
@@ -922,7 +923,7 @@ impl Compactor {
                                 // the record, not the pass
                                 None => continue,
                             };
-                        let payload = self.stage_payload(index, reader, &record, segment)?;
+                        let payload = self.stage_payload(reel, index, reader, &record, segment)?;
                         staged.push((position, record, payload));
                     }
                 }
@@ -987,6 +988,7 @@ impl Compactor {
     /// fill the cap with dead weight.
     fn stage_payload(
         &self,
+        reel: &Reel,
         index: &ReelIndex,
         reader: &mut SegmentReader<'_>,
         record: &SourceRecord,
@@ -1005,7 +1007,7 @@ impl Compactor {
         if !live {
             return Ok(Staged::Dead);
         }
-        if self.is_purged(index, &header.key) {
+        if is_purged(reel.shared().purge_floor(), index, &header.key) {
             return Ok(Staged::Live(None));
         }
         read_payload(reader, record).map(|payload| Staged::Live(Some(payload)))
@@ -1095,19 +1097,6 @@ impl Compactor {
         footer_order(&footer)
     }
 
-    /// Move the floor everything below which is finished
-    ///
-    /// A record whose column marks its keys and whose mark falls below this is dropped
-    /// by the next pass over its segment rather than copied forward.
-    pub fn purge_below(&self, floor: u64) {
-        self.purge_floor.fetch_max(floor, Ordering::AcqRel);
-    }
-
-    /// The floor a pass drops records below
-    pub fn purge_floor(&self) -> u64 {
-        self.purge_floor.load(Ordering::Acquire)
-    }
-
     /// Punch the dead runs out of sealed segments, and say what came back
     ///
     /// Sealed, footer-bearing segments only: a rebuild reads those from their footers
@@ -1187,23 +1176,6 @@ impl Compactor {
             }
         }
         Ok(report)
-    }
-
-    /// Whether the purge floor has passed this key, so its record is finished
-    ///
-    /// A column that does not mark its keys never answers yes, whatever the floor is.
-    fn is_purged(&self, index: &ReelIndex, key: &RecordKey) -> bool {
-        let floor = self.purge_floor.load(Ordering::Acquire);
-        if floor == NOTHING_PURGED {
-            return false;
-        }
-        match index
-            .spec(key.column)
-            .and_then(|spec| spec.mark_of(key.as_slice()))
-        {
-            Some(mark) => mark < floor,
-            None => false,
-        }
     }
 
     /// A row that can be this value's only home, when everything about it allows one
@@ -1352,7 +1324,7 @@ impl Compactor {
         // A record the floor has passed is dropped and its key goes with it. No
         // tombstone is written: the key is below a floor the whole volume agrees on, so
         // absence tells a later reader everything one would.
-        if self.is_purged(index, &record.header.key) {
+        if is_purged(reel.shared().purge_floor(), index, &record.header.key) {
             index.evict_at(&record.header.key, loc)?;
             self.metrics.record_purged(1);
             return Ok(CopyStep::Skipped);
@@ -1710,22 +1682,60 @@ impl Compactor {
     }
 }
 
-fn least_loaded_tail(reel: &Reel) -> usize {
+/// Whether the purge floor has passed this key, so its record is finished
+fn is_purged(floor: u64, index: &ReelIndex, key: &RecordKey) -> bool {
+    if floor == NOTHING_PURGED {
+        return false;
+    }
+    match index
+        .spec(key.column)
+        .and_then(|spec| spec.mark_of(key.as_slice()))
+    {
+        Some(mark) => mark < floor,
+        None => false,
+    }
+}
+
+/// The tail this pass copies its survivors into
+fn destination(reel: &Reel, band: Option<Band>) -> Result<usize> {
     // A volume that rewrites at seal keeps a tail back for exactly this, since a run
     // copied in key order stops being one the moment a foreground put lands inside it.
     if let Some(reserved) = reel.reserved_tail() {
-        return reserved;
+        return Ok(reserved);
     }
-    let mut chosen = 0usize;
-    let mut lowest = u64::MAX;
-    for (index, tail) in reel.tails().iter().enumerate() {
-        let load = tail.load();
-        if load < lowest {
-            lowest = load;
-            chosen = index;
-        }
+    // Otherwise the survivors route the way a fresh write of the same band would: into
+    // the tail that band is on, and into the least loaded unbanded tail where the
+    // source carried no band at all.
+    reel.place(band)
+}
+
+/// The band a sealed segment was drawn under, read off its own header record
+///
+/// One small read at the head of a pass that is about to read the whole file, so a
+/// band comes from the segment rather than from a table a restart would lose. A file
+/// whose head does not read as a segment header answers nothing: the pass that follows
+/// is the one that decides what to do about it.
+fn band_of(shared: &Arc<ReelShared>, source: &SegmentHandle) -> Result<Option<Band>> {
+    let head = shared.driver.pread(source.file(), 0, HEADER_LEN as u64)?;
+    if head.len() < HEADER_LEN {
+        return Ok(None);
     }
-    chosen
+    let Ok(header) = RecordHeader::unpack(&head) else {
+        return Ok(None);
+    };
+    if !header.flags.is_segment_header() {
+        return Ok(None);
+    }
+    let payload =
+        shared
+            .driver
+            .pread(source.file(), HEADER_LEN as u64, u64::from(header.length))?;
+    if payload.len() < header.length as usize || !header.verify(&payload) {
+        return Ok(None);
+    }
+    Ok(SegmentHeader::unpack(&payload)
+        .map(|parsed| parsed.band)
+        .unwrap_or_default())
 }
 
 /// A handle on one sealed segment, from the descriptor cache or a fresh open
@@ -2028,9 +2038,9 @@ mod tests {
         CompactRate, Preallocate, ReelConfig, SyncPolicy, ThreadBudget, DEFAULT_FD_CACHE,
     };
     use crate::format::column::{
-        Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, RecordKey,
+        Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, PurgeMark, RecordKey,
     };
-    use crate::format::segment_header::SEGMENT_HEADER_LEN;
+    use crate::format::segment_header::SEGMENT_HEADER_SPAN;
     use crate::index::entry::span_of;
     use crate::index::recovery::{rebuild_reel, RebuiltReel};
     use crate::io::fault::{FaultKind, FaultPlan};
@@ -2042,7 +2052,7 @@ mod tests {
     const REEL_DIR: &str = "/bulk";
     const RECORDS: ColumnId = ColumnId(1);
     const KEY_WIDTH: usize = 34;
-    const SEG_HEADER_SPAN: usize = HEADER_LEN + SEGMENT_HEADER_LEN;
+    const SEG_HEADER_SPAN: usize = HEADER_LEN + SEGMENT_HEADER_SPAN;
 
     const COLUMNS: ColumnSet = &[ColumnSpec {
         id: RECORDS,
@@ -2066,7 +2076,7 @@ mod tests {
         shard_bytes: 0,
         inline_max: 0,
         row_carry: 0,
-        purge_mark: Some(0),
+        purge_mark: Some(PurgeMark::at(0)),
         codec: Codec::None,
         map_shape: MapShape::Tree,
     }];
@@ -2309,7 +2319,7 @@ mod tests {
         }
         seal(&fixture);
 
-        fixture.compactor.purge_below(4);
+        fixture.reel.shared().purge_below(4);
         fixture
             .compactor
             .compact_segment(&fixture.reel, &fixture.index, SegmentId(1))
@@ -2345,7 +2355,7 @@ mod tests {
         put(&fixture, 2, vec![0x22; 200]);
         seal(&fixture);
 
-        fixture.compactor.purge_below(u64::MAX);
+        fixture.reel.shared().purge_below(u64::MAX);
         fixture
             .compactor
             .compact_segment(&fixture.reel, &fixture.index, SegmentId(1))
@@ -2362,10 +2372,10 @@ mod tests {
     fn the_floor_only_rises() {
         let fixture = fixture_over(settings(), MARKED);
 
-        fixture.compactor.purge_below(10);
-        fixture.compactor.purge_below(4);
+        fixture.reel.shared().purge_below(10);
+        fixture.reel.shared().purge_below(4);
 
-        assert_eq!(fixture.compactor.purge_floor(), 10);
+        assert_eq!(fixture.reel.shared().purge_floor(), 10);
     }
 
     // a fully dead segment is unlinked whole with no rewrite

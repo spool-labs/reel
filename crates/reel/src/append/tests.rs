@@ -16,7 +16,7 @@ use crate::config::{IoBackend, Preallocate, ReelConfig, DEFAULT_FD_CACHE};
 use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape};
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::SegmentId;
-use crate::format::segment_header::SEGMENT_HEADER_LEN;
+use crate::format::segment_header::SEGMENT_HEADER_SPAN;
 use crate::io::fault::{FaultKind, FaultPlan};
 use crate::io::op::{Advice, SegmentEntry};
 use crate::io::sim_backend::SimIo;
@@ -26,7 +26,7 @@ use crate::sync::tension::block_on;
 const REEL_DIR: &str = "/bulk";
 const RECORDS: ColumnId = ColumnId(1);
 const KEY_WIDTH: usize = 34;
-const SEG_HEADER_SPAN: u64 = HEADER_LEN as u64 + SEGMENT_HEADER_LEN as u64;
+const SEG_HEADER_SPAN: u64 = HEADER_LEN as u64 + SEGMENT_HEADER_SPAN as u64;
 
 /// One fixed-key column, the shape the append path is exercised over
 const COLUMNS: ColumnSet = &[ColumnSpec {

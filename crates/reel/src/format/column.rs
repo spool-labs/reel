@@ -388,8 +388,8 @@ pub struct ColumnSpec {
     /// Bytes a sealed row carries of this column's values, zero to carry none
     pub row_carry: u16,
 
-    /// Bytes into a key where a big endian u64 says where it sits on the purge timeline
-    pub purge_mark: Option<u8>,
+    /// Where a key says the record dies, and whether the write is placed by it too
+    pub purge_mark: Option<PurgeMark>,
 
     /// Codec attempted on this column's payloads at admission, not promised
     pub codec: Codec,
@@ -401,19 +401,52 @@ pub struct ColumnSpec {
 /// Bytes a purge mark takes within a key
 pub const MARK_LEN: usize = 8;
 
-impl ColumnSpec {
-    /// Where this key sits on the purge timeline, for a column that marks its keys
-    ///
-    /// A key too short to carry a mark reads as the bottom of the timeline, below
-    /// every floor, so a malformed key is purged rather than kept forever.
-    pub fn mark_of(&self, key: &[u8]) -> Option<u64> {
-        let at = self.purge_mark? as usize;
+/// Where a column's keys say the record dies, and what the volume does with that
+///
+/// Placement is opt-in on the same offset because it costs open segments, which a
+/// column purging by the mark and nothing else has no reason to pay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PurgeMark {
+    /// Bytes into a key where the big endian u64 sits
+    pub at: u8,
+
+    /// Whether writes are placed by that mark as well as purged by it
+    pub places: bool,
+}
+
+impl PurgeMark {
+    /// A mark the volume purges by, placing nothing
+    pub const fn at(at: u8) -> PurgeMark {
+        PurgeMark { at, places: false }
+    }
+
+    /// The same mark, with writes banded by it as well
+    pub const fn placing(at: u8) -> PurgeMark {
+        PurgeMark { at, places: true }
+    }
+
+    /// Where this key sits on the purge timeline
+    pub fn read(&self, key: &[u8]) -> u64 {
+        let at = self.at as usize;
+        // A key too short to carry the mark reads as the bottom, so it is purged.
         let Some(bytes) = key.get(at..at + MARK_LEN) else {
-            return Some(0);
+            return 0;
         };
         let mut mark = [0u8; MARK_LEN];
         mark.copy_from_slice(bytes);
-        Some(u64::from_be_bytes(mark))
+        u64::from_be_bytes(mark)
+    }
+}
+
+impl ColumnSpec {
+    /// Where this key sits on the purge timeline, for a column that marks its keys
+    pub fn mark_of(&self, key: &[u8]) -> Option<u64> {
+        Some(self.purge_mark?.read(key))
+    }
+
+    /// The mark this column's writes are placed by, for a column that asked for that
+    pub fn placement_mark(&self) -> Option<PurgeMark> {
+        self.purge_mark.filter(|mark| mark.places)
     }
 
     /// Number of index shards the column splits into
@@ -548,6 +581,50 @@ mod tests {
 
         assert_eq!(record.shard_of(&[0x03]), 768);
         assert_eq!(record.shard_of(&[]), 0);
+    }
+
+    // a mark reads the key's big endian u64, and a short key reads as the bottom
+    #[test]
+    fn reads_a_mark() {
+        let mark = PurgeMark::at(2);
+
+        assert_eq!(mark.read(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 7]), 7);
+        assert_eq!(mark.read(&[0, 0, 0]), 0);
+    }
+
+    // placement answers only for a column that asked for it, off the same offset
+    #[test]
+    fn placement_is_the_same_fact() {
+        let key = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 9];
+        let purged = ColumnSpec {
+            purge_mark: Some(PurgeMark::at(2)),
+            ..spec()
+        };
+        let placed = ColumnSpec {
+            purge_mark: Some(PurgeMark::placing(2)),
+            ..spec()
+        };
+
+        assert_eq!(purged.mark_of(&key), Some(9));
+        assert_eq!(purged.placement_mark(), None);
+        assert_eq!(placed.mark_of(&key), Some(9));
+        assert_eq!(placed.placement_mark().expect("mark").read(&key), 9);
+        assert_eq!(spec().placement_mark(), None);
+    }
+
+    /// An unmarked declaration the mark tests vary one field of
+    fn spec() -> ColumnSpec {
+        ColumnSpec {
+            id: ColumnId(1),
+            name: "record",
+            key_width: KeyWidth::Fixed(10),
+            shard_bytes: 0,
+            inline_max: 0,
+            row_carry: 0,
+            purge_mark: None,
+            codec: Codec::None,
+            map_shape: MapShape::Tree,
+        }
     }
 
     // columns resolve by name and by identifier

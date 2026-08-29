@@ -17,6 +17,9 @@ impl ReelStore {
     }
 
     /// Owned-payload put that hands the buffer to the tail without a copy
+    ///
+    /// A column placed by its purge mark is banded off the key; every other routes to
+    /// the least loaded tail.
     pub fn put_owned(&self, key: &RecordKey, payload: Vec<u8>) -> Result<()> {
         let planned = self.plan_put(key, payload)?;
         // The tail owns the key it queues, and the index insert below needs it too.
@@ -90,7 +93,8 @@ impl ReelStore {
     /// Apply a batch of writes as one reservation, one write, and one sync
     ///
     /// A batch is one durability point: the sync is taken once the last record has
-    /// landed, and the index moves only after it comes back clean.
+    /// landed, and the index moves only after it comes back clean. One tail takes all
+    /// of it, so a placed batch takes the band covering the last of it to die.
     pub fn apply_batch(&self, writes: Vec<RecordWrite>) -> Result<()> {
         let Some((records, keys)) = self.plan_batch(writes)? else {
             return Ok(());

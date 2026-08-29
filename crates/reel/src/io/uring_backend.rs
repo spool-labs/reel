@@ -832,16 +832,29 @@ impl Ring {
     ///
     /// An interrupted wait means look again, and a busy ring means a full queue
     /// with something in it. The wait hands the kernel what is queued on its way
-    /// in, since keeping the list would let a later refusal take back records the
-    /// kernel is already writing into.
+    /// in, so it is the submission as much as the sleep and a flush in front of one
+    /// is the same entries going over a syscall early. An enter that fails outright
+    /// took nothing, so what is still queued is answered here exactly as a flush
+    /// answers it.
     fn park(&mut self) -> Result<()> {
         let waited = self.ring.submit_and_wait(1);
-        self.queued.clear();
         match waited {
-            Ok(_) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(()),
-            Err(error) if error.raw_os_error() == Some(libc::EBUSY) => Ok(()),
-            Err(error) => Err(ReelError::Io(error)),
+            Ok(_) => {
+                self.queued.clear();
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                self.queued.clear();
+                Ok(())
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EBUSY) => {
+                self.queued.clear();
+                Ok(())
+            }
+            Err(error) => {
+                self.refuse(error.raw_os_error().unwrap_or(libc::EIO));
+                Err(ReelError::Io(error))
+            }
         }
     }
 
@@ -854,6 +867,11 @@ impl Ring {
             self.sleep_once();
             return;
         }
+        // The spin is the one wait that never enters the kernel, so it is the one
+        // that has to hand the entries over itself: nothing the kernel has not been
+        // told about can finish, and the loop below would ask a queue that stays
+        // empty for as long as it is willing to ask.
+        self.flush();
         let mut rounds = 0u32;
         loop {
             if self.drain() > 0 {
@@ -1393,7 +1411,6 @@ fn deliver(
 ) {
     for op in ops.drain(..) {
         while ring.is_full() {
-            ring.flush();
             ring.drain();
             ring.inflight.take_free(drained);
             if ring.is_full() {
@@ -1410,12 +1427,12 @@ fn deliver(
 }
 
 /// Wait until the slab has a free slot, taking what lands for the batch on the way
+///
+/// What is queued goes over inside the wait rather than in front of it, since both
+/// the sleep and the spin hand the entries to the kernel on their own.
 fn make_room(ring: &mut Ring, filled: &mut [Option<Completion>]) -> usize {
     let mut taken = 0;
     while ring.is_full() {
-        // What is queued goes over first, since nothing the kernel has not been told
-        // about can finish.
-        ring.flush();
         taken += ring.harvest(filled);
         if ring.is_full() {
             ring.wait_more();
@@ -1443,7 +1460,6 @@ fn run_batch(ring: &mut Ring, ops: &mut Vec<Op>, posix: &PosixBackend, out: &mut
             None => outstanding += 1,
         }
     }
-    ring.flush();
 
     while outstanding > 0 {
         let taken = ring.harvest(&mut filled);
@@ -1467,7 +1483,6 @@ fn run_one(ring: &mut Ring, op: Op, posix: &PosixBackend) -> Completion {
     if let Some(completion) = ring.stage(op, posix, 0) {
         return completion;
     }
-    ring.flush();
     loop {
         if let Some(completion) = filled[0].take() {
             return completion;
@@ -1482,7 +1497,6 @@ fn run_one(ring: &mut Ring, op: Op, posix: &PosixBackend) -> Completion {
 fn queue_batch(ring: &mut Ring, ops: Vec<Op>, posix: &PosixBackend) {
     for op in ops {
         while ring.is_full() {
-            ring.flush();
             if ring.drain() == 0 && ring.is_full() {
                 ring.wait_more();
             }

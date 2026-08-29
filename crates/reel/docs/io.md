@@ -22,6 +22,19 @@ rather than around it, and it is a production path.
 through a block-aligned buffer. Linux only, and it resolves to a buffered
 volume anywhere else.
 
+**On ext4 a buffered ring is a queue in front of a worker pool.** A buffered op
+there punts to `io_wq`, and one probe on one kernel says so plainly: two
+`iou-wrk` threads through every buffered phase on an ext4 loop device, zero
+through all of them on btrfs, and zero through the direct phases on ext4. So on
+ext4 a `uring` volume hands its work to a kernel worker pool that does the
+blocking call on the engine's behalf, which is a thread handoff bought with a
+submission and not an asynchronous op, and the compaction wave further down
+prices it at 41 percent of a drain's cycles. The fleet runs ext4, where the ring is
+decorative on a buffered volume and `uring_direct` is the answer: the descriptor
+bypasses the page cache, the request reaches the device from the submitting
+thread, and no worker stands in between. An operator who wants the page cache on
+ext4 should read the posix rows rather than the ring's.
+
 ## How one is chosen
 
 `select_backend` runs at open and never fails the open over a backend choice.

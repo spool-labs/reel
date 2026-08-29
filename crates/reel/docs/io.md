@@ -126,6 +126,31 @@ only the fall-through pays an atomic add, and a fall-through hot enough for that
 to show is the answer rather than the cost. A backend with no ring answers that
 nothing reached one and nothing fell off one, so a posix leg prints no line.
 
+## The one write wide enough to leave the ring
+
+Every write reel issues waits for its own completion: `writev` goes down
+`submit_inline`, which stages one op and waits for that op. A ring write has no
+batch to travel with, so what the ring is worth on the write path is not the
+submission itself but whatever else rides in the same `io_uring_enter`.
+
+A seal traced on ext4 in a container, 400k records into 24 MiB segments, put one
+9,628,877 byte `Writev` on the ring against 1,563 record writes that were all
+128 KiB or under. The wide one is a segment's whole sorted footer, and the
+kernel answers it on an `iou-wrk` worker while the sealer waits on the
+completion: the same wait, one thread further away. Writes leave the ring above
+`DIRECT_REQUEST_BYTES` now, which is where the direct door already stopped
+serving them, so both doors agree on what a ring write is and the footer blocks
+on the thread that issued it. That thread is the sealer, which owns a footer
+sort and an `fsync` already.
+
+Chunking the footer into 512 KiB ring submissions was the alternative, so that
+several requests reach the device from one enter. The same trace rules against
+it: with every write forced off the ring the process's peak `iou-wrk` count went
+2 to 0, so on ext4 a chunk buys another worker punt rather than another queued
+request, and twenty of them would need short-write and ordering bookkeeping for
+a write whose caller wants one count. The sealer's next act is `sync_full`,
+which serialises whatever the chunks won.
+
 ## Direct io and its alignment tax
 
 Bypassing the page cache moves three constraints onto the caller: the file

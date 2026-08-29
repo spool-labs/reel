@@ -1850,6 +1850,16 @@ impl ReelIo for UringBackend {
 /// taken for a whole one. Those go to the posix backend, which loops.
 const RING_SPAN_CAP: u64 = 0x7fff_f000;
 
+/// Bytes a write hands the ring before it is worth more as a blocking call
+///
+/// Every write reel issues waits for its own completion, so the ring's part is the
+/// batching, and a write this wide has nothing to batch with. A footer is the one
+/// that reaches it: a segment's whole sorted index in a single call, megabytes the
+/// kernel hands to a worker thread while the submitter waits anyway. The sealer
+/// that issues it is a thread that owns blocking work already, and the direct door
+/// stops at this width regardless, so the two doors agree on what a ring write is.
+const RING_WRITE_CAP: u64 = DIRECT_REQUEST_BYTES as u64;
+
 /// Bytes a vectored write hands over across all its buffers
 fn write_span(bufs: &[WriteBuf]) -> u64 {
     let mut span = 0u64;
@@ -1869,7 +1879,7 @@ fn ring_file(op: &Op) -> Option<FileId> {
         // has nowhere to split it, so it goes to posix, which walks it in capped
         // calls.
         Op::Writev { bufs, .. } if bufs.len() > MAX_IOVECS => None,
-        Op::Writev { bufs, .. } if write_span(bufs) > RING_SPAN_CAP => None,
+        Op::Writev { bufs, .. } if write_span(bufs) > RING_WRITE_CAP => None,
         Op::Pread { buf, .. } | Op::PreadCold { buf, .. }
             if buf.wanted() as u64 > RING_SPAN_CAP =>
         {
@@ -2436,6 +2446,27 @@ mod tests {
         );
     }
 
+    // a write wide enough to travel alone takes the posix path, footers included
+    #[test]
+    fn a_lone_wide_write_stays_off_the_ring() {
+        let write = |bytes: usize| Op::Writev {
+            tag: tag(),
+            file: file(),
+            offset: 0,
+            bufs: vec![WriteBuf::owned(vec![0u8; bytes])],
+        };
+        assert_eq!(
+            ring_file(&write(RING_WRITE_CAP as usize)),
+            Some(file()),
+            "a write filling the cap exactly still belongs on the ring",
+        );
+        assert_eq!(
+            ring_file(&write(RING_WRITE_CAP as usize + 1)),
+            None,
+            "a footer is megabytes with nothing beside it, so it blocks where it is issued",
+        );
+    }
+
     // the pool lends one buffer per op, takes it back, and refuses a wider span
     #[test]
     fn the_pool_lends_and_takes_back() {
@@ -2446,30 +2477,40 @@ mod tests {
         for _ in 0..REGISTERED_BUFFERS {
             taken.push(
                 buffers
-                    .claim(REGISTERED_BUFFER_BYTES)
+                    .claim(DIRECT_REQUEST_BYTES)
                     .expect("a buffer is free"),
             );
         }
 
         assert!(buffers.is_starved(), "every buffer is carrying an op");
         assert!(buffers.claim(1).is_none(), "a starved pool lent one anyway");
-        assert!(
-            buffers.claim(REGISTERED_BUFFER_BYTES + 1).is_none(),
-            "a span wider than a buffer was staged into one",
-        );
 
         buffers.release(taken.pop().expect("a claim"));
+        assert!(
+            buffers.claim(DIRECT_REQUEST_BYTES + 1).is_none(),
+            "a span past one device request was staged into a buffer that had room",
+        );
         // The worst offset a record of the staging width can sit at: one byte past
-        // a boundary, so the covering read pays a block at each end.
+        // a boundary, so the covering read pays a block at each end. The buffer has
+        // the room and the device would answer it in two, so it goes off the ring.
         let (_, span) = covering_span(DIRECT_ALIGN as u64 - 1, STAGE_BYTES as u64);
         assert_eq!(
             span as usize,
-            STAGE_BYTES + DIRECT_ALIGN,
+            REGISTERED_BUFFER_BYTES,
             "the widening moved"
         );
         assert!(
-            buffers.claim(span as usize).is_some(),
-            "the widest staged record does not fit the buffer sized for it",
+            buffers.claim(span as usize).is_none(),
+            "a read widened past one request took the ring anyway",
+        );
+        // A run the planner capped, which is the widest read that does reach it.
+        let (_, capped) = covering_span(
+            DIRECT_ALIGN as u64 - 1,
+            (DIRECT_REQUEST_BYTES - DIRECT_ALIGN) as u64,
+        );
+        assert!(
+            buffers.claim(capped as usize).is_some(),
+            "the widest run the planner merges does not fit one request",
         );
         buffers.release(taken.pop().expect("a claim"));
         assert!(!buffers.is_starved(), "the buffer came back");

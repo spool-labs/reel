@@ -48,7 +48,7 @@ use reel_core::Value;
 pub use read::coded_range;
 use read::{
     check_in_block, deep_range, frame_to_range, frame_to_read, framed_or_nothing, merge_runs_into,
-    near_range, window_or_nothing, window_start, Planned, Run, MERGE_GAP,
+    merge_span, near_range, window_or_nothing, window_start, Planned, Run, MERGE_GAP,
 };
 
 /// The first segment number a fresh reel numbers from
@@ -1463,7 +1463,11 @@ impl Reel {
             return Ok(());
         }
 
-        merge_runs_into(&scratch.plan, &mut scratch.runs);
+        merge_runs_into(
+            &scratch.plan,
+            merge_span(self.shared.driver.serving()),
+            &mut scratch.runs,
+        );
         self.read_ops(scratch);
         self.shared.driver.run_split_reads_into(
             &mut scratch.ops,
@@ -1489,7 +1493,11 @@ impl Reel {
             return Ok(());
         }
 
-        merge_runs_into(&scratch.plan, &mut scratch.runs);
+        merge_runs_into(
+            &scratch.plan,
+            merge_span(self.shared.driver.serving()),
+            &mut scratch.runs,
+        );
         self.read_ops(scratch);
         self.shared
             .driver

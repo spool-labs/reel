@@ -11,12 +11,25 @@ use std::ptr::NonNull;
 use crate::error::{ReelError, Result};
 use crate::format::record::BLOCK;
 use crate::io::op::ReadBuf;
+use crate::io::posix_backend::STAGE_BYTES;
 
 /// Boundary every direct op's offset, length, and buffer address sits on
 ///
 /// A superset rather than a discovered value: devices report 512 more often, and
 /// a buffer aligned to the larger is aligned to the smaller.
 pub const DIRECT_ALIGN: usize = BLOCK as usize;
+
+/// Bytes one direct op asks the device for, at most
+///
+/// A request wider than the queue's max_hw_sectors is cut up by the block layer
+/// and arrives as two, and behind an IOMMU that ceiling is 128 KiB. A staging
+/// buffer is a block wider than this so a covering read has room to round out at
+/// both ends, which would put a request one block over the line: the room stays,
+/// and what is asked for stops short.
+pub const DIRECT_REQUEST_BYTES: usize = STAGE_BYTES;
+
+// A request that does not divide into blocks is one the kernel refuses whole.
+const _: () = assert!(DIRECT_REQUEST_BYTES.is_multiple_of(DIRECT_ALIGN));
 
 /// The unit a buffered read faults, which is what a covering span is priced against
 ///

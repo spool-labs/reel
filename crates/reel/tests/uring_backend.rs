@@ -5,7 +5,8 @@
 //! absent everywhere else.
 //!
 //! Knobs, all optional, so one binary sweeps the ring instead of one build each:
-//! REEL_RING_NO_REGISTERED_BUFFERS, REEL_RING_WAIT (kernel|spin|auto).
+//! REEL_RING_NO_REGISTERED_BUFFERS, REEL_RING_WAIT (kernel|spin|auto),
+//! REEL_RING_TASKRUN (deferred|cooperative|interrupt).
 
 #![cfg(target_os = "linux")]
 
@@ -16,8 +17,8 @@ use std::thread::{self, Thread};
 
 use tempfile::tempdir;
 
-use reel::config::{IoBackend, RingTuning, RingWait, SyncPolicy};
-use reel::io::op::{Completion, FileId, Op, Outcome, ReadBuf, Tag};
+use reel::config::{IoBackend, RingTuning, RingWait, SyncPolicy, TaskRun};
+use reel::io::op::{Completion, FileId, Op, Outcome, ReadBuf, Tag, WriteBuf};
 use reel::io::uring_backend::UringBackend;
 use reel::io::ReelIo;
 use reel::reel::segment::IoDriver;
@@ -132,6 +133,11 @@ fn tuning() -> RingTuning {
             Ok("kernel") => RingWait::Kernel,
             Ok("spin") => RingWait::Spin,
             _ => RingWait::Auto,
+        },
+        taskrun: match std::env::var("REEL_RING_TASKRUN").as_deref() {
+            Ok("cooperative") => TaskRun::Cooperative,
+            Ok("interrupt") => TaskRun::Interrupt,
+            _ => TaskRun::Deferred,
         },
     }
 }
@@ -995,4 +1001,56 @@ fn ring_takes_concurrent_writers() {
             .expect("present");
         assert_eq!(read, vec![byte; 2048]);
     }
+}
+
+// a write only batch under the automatic wait comes back without giving up on its spin
+//
+// The automatic wait spins while the ring holds only writes, and a ring holding its
+// completion work posts nothing into a queue that a spin reads without asking. The
+// batch coming back proves nothing on its own, since a spin that gave up sleeps and
+// gets the same answer: the proof is that it never gave up.
+#[test]
+fn a_write_batch_spins_without_giving_up() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("writes");
+    std::fs::write(&path, []).expect("the file exists to be opened");
+
+    let backend = UringBackend::new(
+        false,
+        RingTuning {
+            wait: RingWait::Auto,
+            ..tuning()
+        },
+    )
+    .expect("ring");
+    let file = open_through(&backend, &path);
+
+    let mut ops: Vec<Op> = (0..64u64)
+        .map(|at| Op::Writev {
+            tag: Tag(at),
+            file,
+            offset: at * 4096,
+            bufs: vec![WriteBuf::owned(vec![at as u8; 4096])],
+        })
+        .collect();
+    let mut out = Vec::new();
+    assert!(
+        backend.submit_batch(&mut ops, &mut out),
+        "the ring took a batch of writes",
+    );
+
+    assert_eq!(out.len(), 64, "every write came back");
+    for completion in &out {
+        match &completion.outcome {
+            Outcome::Wrote { result, .. } => {
+                assert_eq!(*result.as_ref().expect("the write landed"), 4096)
+            }
+            other => panic!("a write came back as {other:?}"),
+        }
+    }
+    assert_eq!(
+        backend.spin_outs(),
+        0,
+        "a spinning wait gave up, so it was asking a queue nothing could reach",
+    );
 }

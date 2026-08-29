@@ -403,6 +403,55 @@ the question reopens: fio hipri against non-hipri, sizes 4/16/64/256 KiB, depths
 IOPS. A direct-volume read row has to leave `map_above` unset either way, because a
 mapped read never reaches the ring.
 
+## Deferred completion work, and the ask the spin had to learn
+
+A ring interrupts its owning thread for every completion unless told otherwise.
+`IORING_SETUP_DEFER_TASKRUN` holds the work instead and runs it when the thread
+enters asking for completions, which drops the inter-processor interrupt, stops
+completions running on a transition the thread made for something else, and lands
+them in a batch at the one place that wants them. It requires
+`IORING_SETUP_SINGLE_ISSUER` and that the enter come from the submitting thread.
+Ring-per-thread already promises both, so this is the flag the design was already
+paying for and not asking for.
+
+`RingTuning::taskrun` picks it, `Deferred` by default. A refusal comes back as one
+errno with nothing in it naming the flag, so `build_ring` steps down by trial:
+`Deferred`, then `Cooperative` (`COOP_TASKRUN`, 5.19, no interrupt but the work
+runs at any kernel exit), then `Interrupt`, which is a ring built the old way.
+Both held modes also ask for `TASKRUN_FLAG`, so `IORING_SQ_TASKRUN` says when work
+is waiting and a peek stays a flag read.
+
+**The contract that comes with it.** Nothing appears in the completion queue until
+this thread enters with `GETEVENTS`, and `io-uring`'s `submit()` is
+`submit_and_wait(0)`, which sets `GETEVENTS` only when it is also waiting. So
+`flush()` does not run completion work, and every path that reads the queue without
+sleeping would read a queue that stays empty. All of them go through `Ring::drain`,
+which asks first when the flag is up: the batch harvest, the spin, the engine loop,
+and `ReelIo::poll`. The ask is an enter offering nothing and waiting for nothing.
+
+**What the mode costs the spin, counted before any box sees it.** A spin exists to
+read the completion queue without a syscall, and under `Deferred` there is no such
+read: the ask is the only thing that fills the queue. On the container's ext4, a
+buffered seal went from 1,591 enters against 1,591 submissions to 3,179 against
+1,591, one submit and one ask per op. The direct arm did not move, 1,594 against
+1,597, because its completions are already there when the submit enters. Folding
+`GETEVENTS` into the submission was tried and is not kept: it moved the threaded
+direct phase 2,116 enters to 2,103 and nothing else, because the completion is not
+ready at submit time, and it bought that with a hand-rolled `enter`. A wait that
+parks pays none of this, since `submit_and_wait` was already asking, and the same
+seal under `Interrupt` measures 1,591 against 1,591, so the knob is the way back
+rather than an argument. The sweep that prices this mode therefore has to move the
+wait beside it rather than hold it at `Auto`, and `REEL_RING_TASKRUN` crosses with
+`REEL_RING_WAIT` in the ring suite for exactly that.
+
+**The wedge this exists to stop.** `RingWait::Auto` spins while the ring holds only
+writes, and a spin never enters the kernel. Without the ask it burns its million
+rounds and then sleeps, which is not a hang and does not fail a correctness test:
+in the container a 64-write batch took 9.85 s against 0.37 s and gave up on four
+spins. `spin_outs` counts a wait that gave up, `a_write_batch_spins_without_giving_up`
+asserts it stays zero, and zero is the only working answer: a count climbing there
+says the ring's completion mode and its wait no longer agree.
+
 ## What the ring backend's thread_local design constrains
 
 The per-thread ring is what makes `SINGLE_ISSUER` legal, and it is the right
@@ -454,10 +503,12 @@ rather than against docs or memory. The backend already uses most of the crate,
 so the holes are narrow, but two of them point at something already measured.
 
 Already in use, so nobody re-derives it: `setup_clamp`, `setup_single_issuer`,
+`setup_defer_taskrun`, `setup_coop_taskrun`, `setup_taskrun_flag`, `Submitter::enter`,
 `register_buffers`, `register_files_sparse`, `register_files_update`, and opcodes
 `Read`, `ReadFixed`, `Readv`, `Writev`, `WriteFixed`, plus `PollAdd.multi` for the
-inbox kick. The kernel's completion-work and submission-poll setup flags were
-measured, found to buy nothing on this engine's shapes, and are not asked for.
+inbox kick. The completion-work flags are the section above; the submission-poll
+flag is not asked for, since `SQPOLL` buys a kernel thread per ring and a 30 µs
+wake against seals that arrive in bursts.
 
 **Worth doing, in order.**
 

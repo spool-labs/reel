@@ -14,9 +14,9 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 
-use io_uring::{cqueue, opcode, types, IoUring};
+use io_uring::{cqueue, opcode, types, EnterFlags, IoUring};
 
-use crate::config::{RingTuning, RingWait};
+use crate::config::{RingTuning, RingWait, TaskRun};
 use crate::error::{ReelError, Result};
 use crate::io::direct::{
     align_up, covering_span, cut_into, cut_split_into, wanted_window, AlignedBuf, DIRECT_ALIGN,
@@ -690,6 +690,12 @@ struct Ring {
     /// How this thread waits for a completion that has not landed yet
     wait: RingWait,
 
+    /// Whether the kernel holds this ring's completion work until it is asked for
+    ///
+    /// Read before every look at the queue, so it is the ring's own answer rather
+    /// than the tuning's: a mode the kernel refused is not a mode to ask under.
+    asks_for_completions: bool,
+
     /// The volume's door tally, which this ring's per-op decisions feed
     doors: Arc<DoorTally>,
 }
@@ -697,7 +703,7 @@ struct Ring {
 impl Ring {
     /// Build this thread's ring under the volume's tuning
     fn new(core: &Core) -> Result<Ring> {
-        let ring = build_ring()?;
+        let ring = ring_under(core.taskrun)?;
         // A kernel that will not take the table leaves the ring on plain
         // descriptors, so a refusal is a lost optimization not a lost volume.
         let is_registered = ring
@@ -728,6 +734,7 @@ impl Ring {
             queued: Vec::with_capacity(entries),
             kick: None,
             wait: core.tuning.wait,
+            asks_for_completions: core.taskrun.is_asked_for(),
             doors: Arc::clone(&core.doors),
         })
     }
@@ -804,10 +811,43 @@ impl Ring {
         }
     }
 
+    /// Run the completion work the kernel is holding for this thread, if any
+    ///
+    /// Under a mode that holds it, the queue fills only when the thread asks, and
+    /// the crate's submit asks only when it is also waiting for a completion, so a
+    /// thread that means to peek has to ask by hand. Nothing is offered and nothing
+    /// is waited for: this is the ask and not the wait.
+    ///
+    /// The mode is read before the flag because reading the flag borrows the
+    /// submission queue, whose drop stores the tail back, and a spinning wait comes
+    /// through here every round. A ring the kernel posts into as it goes never pays
+    /// that store; one holding its work pays it beside a syscall anyway.
+    fn run_owed_work(&mut self) {
+        if !self.asks_for_completions || !self.ring.submission().taskrun() {
+            return;
+        }
+        // SAFETY: an enter submitting nothing and waiting for nothing, made on the
+        // thread that owns this ring, which is what the mode requires.
+        let entered = unsafe {
+            self.ring
+                .submitter()
+                .enter::<libc::sigset_t>(0, 0, EnterFlags::GETEVENTS.bits(), None)
+        };
+        if let Err(error) = entered {
+            // The work stays queued and the flag stays up, so the next look asks
+            // again; nothing is lost but this round.
+            tracing::debug!("the ring refused to run its own completion work: {error}");
+        }
+    }
+
     /// Move whatever the ring has finished into the reaped list
     ///
-    /// A completion queue is shared memory, so this costs no syscall.
+    /// A completion queue is shared memory, so this costs no syscall on a ring the
+    /// kernel posts into as it goes. One holding its work is asked first, which is
+    /// what makes every reader of the queue below taskrun aware by going through
+    /// here: the harvest, the spin, the engine loop, and the driver's own poll.
     fn drain(&mut self) -> usize {
+        self.run_owed_work();
         let mut drained = 0;
         let mut has_kicked = false;
         let mut is_still_armed = false;
@@ -886,6 +926,7 @@ impl Ring {
             if rounds > MAX_SPIN_ROUNDS {
                 // A spin this long is not a completion about to land, so the thread
                 // sleeps for one rather than holding a core to find out.
+                self.doors.note_spun_out();
                 self.sleep_once();
                 return;
             }
@@ -1034,6 +1075,10 @@ impl Ring {
 struct Core {
     posix: Arc<PosixBackend>,
     tuning: RingTuning,
+
+    /// The completion mode this kernel took, settled once for every thread's ring
+    taskrun: TaskRun,
+
     is_direct: bool,
     doors: Arc<DoorTally>,
 }
@@ -1048,6 +1093,7 @@ struct DoorTally {
     off_ring: AtomicU64,
     pool_refused: AtomicBool,
     files_refused: AtomicBool,
+    spun_out: AtomicU64,
 }
 
 impl DoorTally {
@@ -1071,6 +1117,15 @@ impl DoorTally {
         if !self.pool_refused.load(Ordering::Relaxed) {
             self.pool_refused.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// A spinning wait gave up and slept instead
+    ///
+    /// The one wait that never enters the kernel is the one that cannot be told a
+    /// completion is being held for it, so a count climbing here is the reading
+    /// that says the ring's completion mode and the wait no longer agree.
+    fn note_spun_out(&self) {
+        self.spun_out.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A ring's sparse file table was refused by the kernel
@@ -1552,19 +1607,59 @@ fn shard_of(count: usize) -> usize {
     })
 }
 
-/// Build one ring
+/// Build one ring under one completion mode
 ///
 /// A setup the kernel refuses is reported rather than retried, so an operator
 /// finds out that the volume is not on a ring.
-fn build_ring() -> Result<IoUring> {
+fn ring_under(taskrun: TaskRun) -> Result<IoUring> {
     let mut builder = IoUring::builder();
     // The kernel clamps an oversized request rather than refusing it, so asking past
     // the limit is how a ring ends up as deep as the machine allows.
     builder.setup_clamp();
     // A ring belongs to the thread that built it, so the promise the kernel
-    // enforces is one this backend keeps by construction.
+    // enforces is one this backend keeps by construction, and it is what the
+    // deferred mode below is allowed to rest on.
     builder.setup_single_issuer();
+    match taskrun {
+        TaskRun::Deferred => {
+            builder.setup_defer_taskrun();
+        }
+        TaskRun::Cooperative => {
+            builder.setup_coop_taskrun();
+        }
+        TaskRun::Interrupt => {}
+    }
+    // Both modes leave the work queued rather than run, so the ring has to say when
+    // it is holding some or a thread reading its own queue would read an old one.
+    if taskrun.is_asked_for() {
+        builder.setup_taskrun_flag();
+    }
     builder.build(RING_ENTRIES).map_err(ReelError::Io)
+}
+
+/// Build one ring under the best completion mode this kernel will take
+///
+/// A refusal is one errno with nothing in it naming the flag, so the step down is
+/// by trial: a kernel too old for deferred work gets cooperative, and one too old
+/// for that runs the ring the way it has always run.
+fn build_ring(wanted: TaskRun) -> Result<(IoUring, TaskRun)> {
+    let mut refused = None;
+    for &taskrun in wanted.and_below() {
+        match ring_under(taskrun) {
+            Ok(ring) => {
+                if taskrun != wanted {
+                    tracing::debug!(
+                        "this kernel refused {wanted:?} completion work, \
+                         so the ring runs {taskrun:?}"
+                    );
+                }
+                return Ok((ring, taskrun));
+            }
+            Err(error) => refused = Some(error),
+        }
+    }
+    Err(refused
+        .unwrap_or_else(|| ReelError::Io(std::io::Error::other("no completion mode was tried"))))
 }
 
 impl std::fmt::Debug for UringBackend {
@@ -1581,7 +1676,10 @@ impl UringBackend {
     /// Rings are built by the threads that own them, so this one setup proves the
     /// kernel takes the tuning at all rather than failing on the first put.
     pub fn new(is_direct: bool, tuning: RingTuning) -> Result<UringBackend> {
-        drop(build_ring()?);
+        // The mode settles here rather than per ring, so a kernel that refuses the
+        // one asked for is found out once instead of by every thread in turn.
+        let (probe, taskrun) = build_ring(tuning.taskrun)?;
+        drop(probe);
         // One engine per thread the machine can run, which is where an async caller
         // lands: a machine that will not say its width gets one.
         let shards = std::thread::available_parallelism()
@@ -1593,6 +1691,7 @@ impl UringBackend {
                 // opens carry the flag from here.
                 posix: Arc::new(PosixBackend::with_direct(is_direct)),
                 tuning,
+                taskrun,
                 is_direct,
                 doors: Arc::new(DoorTally::default()),
             }),
@@ -1603,6 +1702,15 @@ impl UringBackend {
     /// Ops the posix path under this ring has answered
     pub fn ops(&self) -> u64 {
         self.core.posix.ops()
+    }
+
+    /// Spinning waits on this volume that gave up and slept instead
+    ///
+    /// Zero is the working answer. Anything else is a spin that asked a queue no
+    /// completion could reach, which is what a ring holding its completion work
+    /// looks like to a thread that never asks for it.
+    pub fn spin_outs(&self) -> u64 {
+        self.core.doors.spun_out.load(Ordering::Relaxed)
     }
 
     /// Run something against this thread's ring, building it the first time

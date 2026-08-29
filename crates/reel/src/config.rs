@@ -230,6 +230,25 @@ pub enum RingWait {
     Kernel,
 }
 
+/// When the kernel runs the completion work a ring owes its owning thread
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum TaskRun {
+    /// Hold it until the thread enters asking for completions, on a kernel from 6.1
+    ///
+    /// A ring is one thread's here, which is the promise this mode is built on: no
+    /// interrupt, no work run on a transition the thread made for something else,
+    /// and the completions land in a batch at the one place that wants them.
+    Deferred,
+
+    /// Run it at the next kernel exit rather than interrupting for it, from 5.19
+    Cooperative,
+
+    /// Interrupt the thread for every completion, which is what a ring does unasked
+    Interrupt,
+}
+
 /// Ring tunables
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Deserialize))]
@@ -240,6 +259,9 @@ pub struct RingTuning {
 
     /// How a thread waits on a completion that has not landed yet
     pub wait: RingWait,
+
+    /// When the kernel runs this ring's completion work, stepped down where refused
+    pub taskrun: TaskRun,
 }
 
 impl Default for RingTuning {
@@ -247,7 +269,32 @@ impl Default for RingTuning {
         Self {
             registered_buffers: true,
             wait: RingWait::Auto,
+            taskrun: TaskRun::Deferred,
         }
+    }
+}
+
+impl TaskRun {
+    /// This mode and the ones below it, for a kernel that refuses the one asked for
+    ///
+    /// Deferred wants 6.1 and cooperative 5.19, and a refusal comes back from the
+    /// setup as one errno with nothing in it to say which flag was the problem, so
+    /// the answer is to try the next one down rather than to read the version.
+    pub fn and_below(self) -> &'static [TaskRun] {
+        match self {
+            TaskRun::Deferred => &[TaskRun::Deferred, TaskRun::Cooperative, TaskRun::Interrupt],
+            TaskRun::Cooperative => &[TaskRun::Cooperative, TaskRun::Interrupt],
+            TaskRun::Interrupt => &[TaskRun::Interrupt],
+        }
+    }
+
+    /// Whether a thread has to ask the kernel before it reads its own queue
+    ///
+    /// Both modes that are not the default set `IORING_SQ_TASKRUN` when work is
+    /// waiting, so a peek is a flag read; only under deferred is the ask the one
+    /// thing that makes a completion appear.
+    pub fn is_asked_for(self) -> bool {
+        !matches!(self, TaskRun::Interrupt)
     }
 }
 
@@ -789,6 +836,42 @@ fn byte_multiplier(unit: &str) -> std::result::Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // a mode the kernel refuses has somewhere to step down to, and the floor has not
+    #[test]
+    fn a_completion_mode_steps_down_to_one_every_kernel_takes() {
+        assert_eq!(
+            TaskRun::Deferred.and_below(),
+            [TaskRun::Deferred, TaskRun::Cooperative, TaskRun::Interrupt],
+        );
+        assert_eq!(
+            TaskRun::Cooperative.and_below(),
+            [TaskRun::Cooperative, TaskRun::Interrupt],
+        );
+        assert_eq!(
+            TaskRun::Interrupt.and_below(),
+            [TaskRun::Interrupt],
+            "the floor asks for nothing, so it has nowhere to fall to",
+        );
+        for mode in TaskRun::Deferred.and_below() {
+            assert_eq!(
+                mode.and_below().last(),
+                Some(&TaskRun::Interrupt),
+                "a mode stepped down without reaching the one a ring runs unasked",
+            );
+        }
+    }
+
+    // the two modes that hold their work are the two a thread has to ask
+    #[test]
+    fn a_held_completion_is_one_the_thread_asks_for() {
+        assert!(TaskRun::Deferred.is_asked_for());
+        assert!(TaskRun::Cooperative.is_asked_for());
+        assert!(
+            !TaskRun::Interrupt.is_asked_for(),
+            "a ring that interrupts for a completion has posted it already",
+        );
+    }
 
     // the floor is asked about the record, so one volume answers both ways
     #[test]

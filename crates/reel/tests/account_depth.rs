@@ -14,7 +14,7 @@
 //!   cargo test -p reel --test account_depth --release -- --ignored --nocapture
 //!
 //! Knobs, all optional: REEL_DEPTH_DIR, REEL_DEPTH_ACCOUNTS, REEL_DEPTH_SET,
-//! REEL_DEPTH_DEPTHS, REEL_DEPTH_THREADS, REEL_DEPTH_BACKENDS, REEL_DEPTH_RING_WAIT.
+//! REEL_DEPTH_DEPTHS, REEL_DEPTH_THREADS, REEL_DEPTH_BACKENDS.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IoBackend, KeyWidth, MapShape, RecordKey,
-    ReelConfig, ReelStore, RingTuning, RingWait, SyncPolicy, ThreadBudget, MAP_EVERYTHING,
+    ReelConfig, ReelStore, SyncPolicy, ThreadBudget, MAP_EVERYTHING,
 };
 
 const ACCOUNTS_CF: ColumnId = ColumnId(1);
@@ -259,13 +259,6 @@ fn process_cpu_secs() -> f64 {
     0.0
 }
 
-fn ring_wait() -> RingWait {
-    match std::env::var("REEL_DEPTH_RING_WAIT").as_deref() {
-        Ok("spin") => RingWait::Spin,
-        _ => RingWait::Kernel,
-    }
-}
-
 fn config(backend: IoBackend) -> ReelConfig {
     ReelConfig {
         io_backend: backend,
@@ -276,10 +269,6 @@ fn config(backend: IoBackend) -> ReelConfig {
         // against a driver read, so both doors read unmapped here.
         map_above: None,
         segment_bytes: ByteCount::from_bytes(64 * 1024 * 1024),
-        uring: RingTuning {
-            wait: ring_wait(),
-            ..RingTuning::default()
-        },
         ..ReelConfig::default()
     }
 }

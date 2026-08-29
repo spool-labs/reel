@@ -5,8 +5,7 @@
 //! absent everywhere else.
 //!
 //! Knobs, all optional, so one binary sweeps the ring instead of one build each:
-//! REEL_RING_NO_REGISTERED_BUFFERS, REEL_RING_WAIT (kernel|spin|auto),
-//! REEL_RING_TASKRUN (deferred|cooperative|interrupt).
+//! REEL_RING_NO_REGISTERED_BUFFERS, REEL_RING_TASKRUN (deferred|cooperative|interrupt).
 
 #![cfg(target_os = "linux")]
 
@@ -17,7 +16,7 @@ use std::thread::{self, Thread};
 
 use tempfile::tempdir;
 
-use reel::config::{IoBackend, RingTuning, RingWait, SyncPolicy, TaskRun};
+use reel::config::{IoBackend, RingTuning, SyncPolicy, TaskRun};
 use reel::io::op::{Completion, FileId, Op, Outcome, ReadBuf, Tag, WriteBuf};
 use reel::io::uring_backend::UringBackend;
 use reel::io::ReelIo;
@@ -118,9 +117,9 @@ fn open_direct_on_ring(root: &std::path::Path) -> (ReelStore, Arc<UringBackend>)
     (store, ring)
 }
 
-/// Ring tunables for this run, so one binary sweeps the wait instead of one build each
+/// Ring tunables for this run, so one binary sweeps the ring instead of one build each
 ///
-///   REEL_RING_WAIT=kernel cargo test --test uring_backend
+///   REEL_RING_TASKRUN=interrupt cargo test --test uring_backend
 fn tuning() -> RingTuning {
     let flag = |name: &str, unset: bool| {
         std::env::var(name)
@@ -129,11 +128,6 @@ fn tuning() -> RingTuning {
     };
     RingTuning {
         registered_buffers: !flag("REEL_RING_NO_REGISTERED_BUFFERS", false),
-        wait: match std::env::var("REEL_RING_WAIT").as_deref() {
-            Ok("kernel") => RingWait::Kernel,
-            Ok("spin") => RingWait::Spin,
-            _ => RingWait::Auto,
-        },
         taskrun: match std::env::var("REEL_RING_TASKRUN").as_deref() {
             Ok("cooperative") => TaskRun::Cooperative,
             Ok("interrupt") => TaskRun::Interrupt,
@@ -1003,26 +997,19 @@ fn ring_takes_concurrent_writers() {
     }
 }
 
-// a write only batch under the automatic wait comes back without giving up on its spin
+// a write only batch comes back without giving up on its spin
 //
-// The automatic wait spins while the ring holds only writes, and a ring holding its
-// completion work posts nothing into a queue that a spin reads without asking. The
-// batch coming back proves nothing on its own, since a spin that gave up sleeps and
-// gets the same answer: the proof is that it never gave up.
+// The wait spins while the ring holds only writes, and a ring holding its completion
+// work posts nothing into a queue that a spin reads without asking. The batch coming
+// back proves nothing on its own, since a spin that gave up sleeps and gets the same
+// answer: the proof is that it never gave up.
 #[test]
 fn a_write_batch_spins_without_giving_up() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("writes");
     std::fs::write(&path, []).expect("the file exists to be opened");
 
-    let backend = UringBackend::new(
-        false,
-        RingTuning {
-            wait: RingWait::Auto,
-            ..tuning()
-        },
-    )
-    .expect("ring");
+    let backend = UringBackend::new(false, tuning()).expect("ring");
     let file = open_through(&backend, &path);
 
     let mut ops: Vec<Op> = (0..64u64)

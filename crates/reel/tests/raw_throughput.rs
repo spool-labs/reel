@@ -18,8 +18,7 @@
 //! `REEL_RAW_SIZES`, `REEL_RAW_KEYS`, `REEL_RAW_KEY_SHAPES`, `REEL_RAW_THREADS`,
 //! `REEL_RAW_WRITE`, `REEL_RAW_BYTES`, `REEL_RAW_SHARDS`, `REEL_RAW_MAX_OPS`,
 //! `REEL_RAW_TAILS`, `REEL_RAW_SEGMENT`, `REEL_RAW_VOLUMES`, `REEL_RAW_DROP_CACHES`,
-//! `REEL_RAW_RANDOM_READS`, `REEL_RAW_SKIP_READS`, `REEL_RAW_WEIGH`, `REEL_RAW_CSV`,
-//! `REEL_RING_WAIT`.
+//! `REEL_RAW_RANDOM_READS`, `REEL_RAW_SKIP_READS`, `REEL_RAW_WEIGH`, `REEL_RAW_CSV`.
 //!
 //! Ignored by default. Run with:
 //!   cargo test -p reel --test raw_throughput --release -- --ignored --nocapture --test-threads=1
@@ -39,8 +38,8 @@ use reel::format::lsn::Lsn;
 use reel::format::record::checksum;
 use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, IoBackend, KeyWidth,
-    MapShape, RecordKey, RecordWrite, ReelConfig, ReelIndex, ReelStore, RingTuning, RingWait,
-    ShardShapes, SyncPolicy, ThreadBudget, INLINE_KEY_LEN, MAP_EVERYTHING, MAX_KEY_LEN,
+    MapShape, RecordKey, RecordWrite, ReelConfig, ReelIndex, ReelStore, ShardShapes, SyncPolicy,
+    ThreadBudget, INLINE_KEY_LEN, MAP_EVERYTHING, MAX_KEY_LEN,
 };
 
 /// The column this bench writes into
@@ -503,28 +502,7 @@ fn config(backend: IoBackend, sync: SyncPolicy) -> ReelConfig {
             true => None,
             false => MAP_EVERYTHING,
         },
-        uring: ring_tuning(),
         ..ReelConfig::default()
-    }
-}
-
-/// Ring wait policy for the sweep, which is the one ring knob the rows separate
-///
-/// Unset here rather than named, since a harness that hardcodes its own default stops
-/// measuring what ships the moment the default moves.
-fn ring_tuning() -> RingTuning {
-    let shipped = RingTuning::default();
-    RingTuning {
-        wait: match std::env::var("REEL_RING_WAIT").ok().as_deref() {
-            Some("auto") => RingWait::Auto,
-            Some("kernel") => RingWait::Kernel,
-            Some("spin") => RingWait::Spin,
-            Some(other) => {
-                panic!("REEL_RING_WAIT holds `{other}`, which is not auto, spin or kernel")
-            }
-            None => shipped.wait,
-        },
-        ..shipped
     }
 }
 

@@ -16,7 +16,7 @@ use std::thread::JoinHandle;
 
 use io_uring::{cqueue, opcode, types, EnterFlags, IoUring};
 
-use crate::config::{RingTuning, RingWait, TaskRun};
+use crate::config::{RingTuning, TaskRun};
 use crate::error::{ReelError, Result};
 use crate::io::direct::{
     align_up, covering_span, cut_into, cut_split_into, wanted_window, AlignedBuf, DIRECT_ALIGN,
@@ -685,9 +685,6 @@ struct Ring {
     /// The inbox this ring watches, on an engine thread and nowhere else
     kick: Option<Kick>,
 
-    /// How this thread waits for a completion that has not landed yet
-    wait: RingWait,
-
     /// Whether the kernel holds this ring's completion work, as the kernel answered
     /// and not as the tuning asked
     asks_for_completions: bool,
@@ -729,32 +726,21 @@ impl Ring {
             is_direct: core.is_direct,
             queued: Vec::with_capacity(entries),
             kick: None,
-            wait: core.tuning.wait,
             asks_for_completions: core.taskrun.is_asked_for(),
             doors: Arc::clone(&core.doors),
         })
     }
 
-    /// How a thread waits for a ring in this state, apart from the ring itself
+    /// Whether a thread spins for what the ring is holding rather than sleeping for it
     ///
-    /// The two facts that decide it, so the choice can be asserted without a
+    /// A write lands in page cache, and spinning for one is 8.1 us against 13.0 us at
+    /// the commit p50. One read out is a device round trip, where the same spin burns
+    /// 10.8x the cycles for nothing.
+    ///
+    /// Reads the ops out rather than `&self`, so the rule can be asserted without a
     /// kernel to build a ring on.
-    fn wait_for(wait: RingWait, holds_only_writes: bool) -> RingWait {
-        match wait {
-            RingWait::Auto => match holds_only_writes {
-                true => RingWait::Spin,
-                false => RingWait::Kernel,
-            },
-            chosen => chosen,
-        }
-    }
-
-    /// How this thread waits for what the ring is holding right now
-    ///
-    /// An automatic wait reads the answer off the ops out: a write lands in page
-    /// cache and is worth spinning for, and one read out is a device round trip.
-    fn wait_now(&self) -> RingWait {
-        Ring::wait_for(self.wait, self.inflight.holds_only_writes())
+    fn spins_for(inflight: &Inflight) -> bool {
+        inflight.holds_only_writes()
     }
 
     /// Whether the ring has room to take another op
@@ -894,7 +880,7 @@ impl Ring {
     /// The ops out own buffers the kernel may still be writing into, so a wait that
     /// fails keeps asking rather than taking that memory back.
     fn wait_more(&mut self) {
-        if matches!(self.wait_now(), RingWait::Kernel) {
+        if !Ring::spins_for(&self.inflight) {
             self.sleep_once();
             return;
         }
@@ -1905,10 +1891,9 @@ impl ReelIo for UringBackend {
 
     /// Whether a wait on this volume's rings ever sleeps rather than spinning
     ///
-    /// An automatic wait sleeps for a read and spins for a write, so it counts as a
-    /// door that parks.
+    /// A wait sleeps for a read and spins for a write, so it counts as a door that parks.
     fn parks_on_wait(&self) -> bool {
-        !matches!(self.core.tuning.wait, RingWait::Spin)
+        true
     }
 
     /// Sleep on this thread's own completion queue rather than asking it in a loop
@@ -1917,7 +1902,7 @@ impl ReelIo for UringBackend {
     /// owes it nothing would hold the wait forever.
     fn poll_blocking(&self, out: &mut Vec<Completion>) -> Result<usize> {
         let drained = self.poll(out)?;
-        if drained > 0 || !self.parks_on_wait() {
+        if drained > 0 {
             return Ok(drained);
         }
         self.on_open_ring(|ring| {
@@ -2273,28 +2258,25 @@ mod tests {
         }
     }
 
-    // an automatic wait spins only while the ring holds nothing but writes
+    // the wait spins only while the ring holds nothing but writes
     #[test]
     fn the_wait_follows_what_the_ring_holds() {
         let mut inflight = Inflight::with_capacity(4);
-        assert!(inflight.holds_only_writes(), "an empty ring holds no read");
+        assert!(Ring::spins_for(&inflight), "an empty ring holds no read");
 
         let write = inflight.insert(wrote(), UNORDERED);
-        assert!(
-            inflight.holds_only_writes(),
-            "a write is worth spinning for"
-        );
+        assert!(Ring::spins_for(&inflight), "a write is worth spinning for");
 
         let read = inflight.insert(pending(), UNORDERED);
-        assert!(!inflight.holds_only_writes(), "one read out ends the spin");
+        assert!(!Ring::spins_for(&inflight), "one read out ends the spin");
 
         assert!(inflight.take(write).is_some());
         assert!(
-            !inflight.holds_only_writes(),
+            !Ring::spins_for(&inflight),
             "the read is still out after the write came back"
         );
         assert!(inflight.take(read).is_some());
-        assert!(inflight.holds_only_writes(), "the read came back");
+        assert!(Ring::spins_for(&inflight), "the read came back");
     }
 
     // a refused entry takes the read count it carried back with it
@@ -2762,17 +2744,6 @@ mod tests {
             file: file(),
         };
         assert_eq!(staged_span(&sync), None, "an op with no buffers took one");
-    }
-
-    // an automatic wait reads its answer off the ops the ring is holding
-    #[test]
-    fn an_automatic_wait_follows_the_ops_out() {
-        assert_eq!(Ring::wait_for(RingWait::Auto, true), RingWait::Spin);
-        assert_eq!(Ring::wait_for(RingWait::Auto, false), RingWait::Kernel);
-
-        // A named preference is taken whatever the ring is holding.
-        assert_eq!(Ring::wait_for(RingWait::Spin, false), RingWait::Spin);
-        assert_eq!(Ring::wait_for(RingWait::Kernel, true), RingWait::Kernel);
     }
 
     // an op the kernel serves by blocking stays off the ring

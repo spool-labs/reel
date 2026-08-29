@@ -28,8 +28,8 @@ pub use compaction::merge::MergeReport;
 pub use compaction::pressure::{GcPressure, GcTier, RateLimiter};
 pub use config::{
     CompactRate, FenceResidency, HotIndex, IndexResidency, IoBackend, PointReads, Preallocate,
-    RangedReads, ReelConfig, RepairPath, RingTuning, RingWait, ShardShapes, SyncPolicy,
-    ThreadBudget, VolumeClass, VolumeSpec, DEFAULT_FD_CACHE, MAP_EVERYTHING,
+    RangedReads, ReelConfig, RepairPath, RingTuning, ShardShapes, SyncPolicy, ThreadBudget,
+    VolumeClass, VolumeSpec, DEFAULT_FD_CACHE, MAP_EVERYTHING,
 };
 pub use engine::index_checkpoint::IndexCheckpoint;
 pub use engine::{CompactPass, RecordWrite, ReelStore, Totals};

@@ -69,16 +69,17 @@ single poller inbox that costs a lock and a wakeup each, which shows up as
 context switches per op climbing with writer count where posix stays flat.
 No registered buffers, no single-issuer rings.
 
-**How a waiter waits, and a caveat on early ring rows.** The ring can spin on the
-completion queue or sleep in the kernel, and until a sweep could select between
-them, every ring number ever recorded priced `RingWait::Spin` whether or not it
-said so. Measured on a 9975WX across 1 to 64 threads at 4 KiB, spin is the faster
-of the two at every thread count, by 3 to 9 percent low and 0.6 percent at 64.
-What it costs is CPU: 543 percent against 405, and 263,263 involuntary context
-switches against 106,523. `Kernel` ships for that reason, and the trade is stated
-correctly as a quarter of the CPU and 2.5x fewer preemptions for a fraction of a
-percent of throughput, not as faster and cheaper at once. Reads are flat across
-both at 5,344 to 6,706 MB/s, which is the device rather than the backend.
+**How a waiter waits, and a caveat on early ring rows.** The wait follows what the
+ring is holding and nothing selects it: it spins while the ring holds only writes
+and sleeps in the kernel once a read is out. Spinning a write-only ring is worth
+8.1 us against 13.0 us at the commit p50 on the beast box, and the same spin with
+reads in the mix burns 10.8x the cycles for nothing. Until a sweep could separate
+the two, every ring number ever recorded priced a spin whether or not it said so.
+Measured on a 9975WX across 1 to 64 threads at 4 KiB, spin is the faster of the
+two at every thread count, by 3 to 9 percent low and 0.6 percent at 64, and what
+it costs is CPU: 543 percent against 405, and 263,263 involuntary context switches
+against 106,523. Reads are flat across both at 5,344 to 6,706 MB/s, which is the
+device rather than the backend, so the sleeping half gives up no throughput at all.
 
 **The ring is not a write lever on that box at all.** The 129-row backend sweep
 of the same day put posix and uring within 1 percent of each other from 64 KiB
@@ -453,11 +454,10 @@ direct phase 2,116 enters to 2,103 and nothing else, because the completion is n
 ready at submit time, and it bought that with a hand-rolled `enter`. A wait that
 parks pays none of this, since `submit_and_wait` was already asking, and the same
 seal under `Interrupt` measures 1,591 against 1,591, so the knob is the way back
-rather than an argument. The sweep that prices this mode therefore has to move the
-wait beside it rather than hold it at `Auto`, and `REEL_RING_TASKRUN` crosses with
-`REEL_RING_WAIT` in the ring suite for exactly that.
+rather than an argument. Only the spinning half of the wait pays this, and nothing
+selects the wait any more, so `REEL_RING_TASKRUN` sweeps the mode on its own.
 
-**The wedge this exists to stop.** `RingWait::Auto` spins while the ring holds only
+**The wedge this exists to stop.** The wait spins while the ring holds only
 writes, and a spin never enters the kernel. Without the ask it burns its million
 rounds and then sleeps, which is not a hang and does not fail a correctness test:
 in the container a 64-write batch took 9.85 s against 0.37 s and gave up on four

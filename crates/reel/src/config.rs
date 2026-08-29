@@ -217,19 +217,6 @@ impl VolumeSpec {
     }
 }
 
-/// How a thread waits for a ring completion that has not arrived
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-pub enum RingWait {
-    /// Spin while the ring holds only writes and sleep once it holds a read
-    Auto,
-    /// Spin, then yield, and keep asking, holding a core for the whole wait
-    Spin,
-    /// Sleep in the kernel until a completion is ready, at a syscall in and a wakeup out
-    Kernel,
-}
-
 /// When the kernel runs the completion work a ring owes its owning thread
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Deserialize))]
@@ -255,9 +242,6 @@ pub struct RingTuning {
     /// Hand the kernel a pool of aligned buffers, which is what puts direct data ops on the ring
     pub registered_buffers: bool,
 
-    /// How a thread waits on a completion that has not landed yet
-    pub wait: RingWait,
-
     /// When the kernel runs this ring's completion work, stepped down where refused
     pub taskrun: TaskRun,
 }
@@ -266,7 +250,6 @@ impl Default for RingTuning {
     fn default() -> Self {
         Self {
             registered_buffers: true,
-            wait: RingWait::Auto,
             taskrun: TaskRun::Deferred,
         }
     }

@@ -266,17 +266,18 @@ pub struct ReelStore {
 
 /// The index a previous cue wrote down, where this open may believe any of it
 ///
-/// Unarmed, nothing is read at all, and a paging volume never wrote one. A file
-/// describing columns the store no longer serves is refused whole rather than in
-/// part, since dropping a block's rows while still skipping its segments is the one
-/// way this file loses a live record.
+/// Read whenever one is there, since a paging volume never wrote one and every other
+/// file is CRC verified per block and joined newest-wins, so believing it can only
+/// save reads. A file describing columns the store no longer serves is refused whole
+/// rather than in part, since dropping a block's rows while still skipping its
+/// segments is the one way this file loses a live record.
 fn offered_index(
     driver: &IoDriver,
     root: &Path,
     config: &ReelConfig,
     columns: ColumnSet,
 ) -> Result<Option<PersistedReader>> {
-    if !config.index_checkpoint || config.index.pages() {
+    if config.index.pages() {
         return Ok(None);
     }
     let Some(reader) = PersistedReader::open(driver, root)? else {

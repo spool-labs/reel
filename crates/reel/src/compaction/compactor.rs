@@ -2750,7 +2750,7 @@ mod tests {
     }
 
     /// The op an out of space fault is injected at, past the open's own ops
-    const ENOSPC_AT: u64 = 11;
+    const ENOSPC_AT: u64 = 12;
 
     fn engine_config() -> ReelConfig {
         ReelConfig {

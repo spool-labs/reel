@@ -474,20 +474,12 @@ fn open_never_reopen() {
     }
 }
 
-/// The index written down at a cue, and read back at the reopens the stream takes
-fn checkpointing_config(active_tails: u32) -> ReelConfig {
-    ReelConfig {
-        index_checkpoint: true,
-        ..reel_config(active_tails)
-    }
-}
-
 // a volume reopening from its written-down index serves what the oracle serves
 #[test]
 #[cfg(not(miri))]
 fn checkpointed_single_tail() {
     for seed in SEEDS {
-        let mut fixture = Differential::open(*seed, checkpointing_config(1));
+        let mut fixture = Differential::open(*seed, reel_config(1)).checkpointing();
         fixture.run_stream(&op_stream::generate(*seed, STREAM_LEN));
         assert!(
             fixture.checkpointed_keys() > 0,
@@ -501,7 +493,7 @@ fn checkpointed_single_tail() {
 #[cfg(not(miri))]
 fn checkpointed_multi_tail() {
     for seed in SEEDS {
-        let mut fixture = Differential::open(*seed, checkpointing_config(4));
+        let mut fixture = Differential::open(*seed, reel_config(4)).checkpointing();
         fixture.run_stream(&op_stream::generate(*seed, STREAM_LEN));
         assert!(
             fixture.checkpointed_keys() > 0,
@@ -515,13 +507,7 @@ fn checkpointed_multi_tail() {
 #[cfg(not(miri))]
 fn checkpointed_never_reopen() {
     for seed in SEEDS {
-        let mut fixture = Differential::open(
-            *seed,
-            ReelConfig {
-                index_checkpoint: true,
-                ..never_config(1)
-            },
-        );
+        let mut fixture = Differential::open(*seed, never_config(1)).checkpointing();
         fixture.run_stream(&op_stream::generate(*seed, STREAM_LEN));
         assert!(
             fixture.checkpointed_keys() > 0,
@@ -535,7 +521,7 @@ fn checkpointed_never_reopen() {
 #[cfg(not(miri))]
 fn checkpointed_open_shards() {
     for seed in SEEDS {
-        let mut fixture = Differential::open_shaped(*seed, checkpointing_config(1));
+        let mut fixture = Differential::open_shaped(*seed, reel_config(1)).checkpointing();
         fixture.run_stream(&op_stream::generate(*seed, STREAM_LEN));
         assert!(
             fixture.checkpointed_keys() > 0,

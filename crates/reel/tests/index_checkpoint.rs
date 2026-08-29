@@ -17,8 +17,8 @@ use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::sync::rendezvous;
 use reel::{
-    segment_file_name, ByteCount, ColumnSet, CompactRate, Preallocate, ReelConfig, ReelStore,
-    SyncPolicy, ThreadBudget,
+    segment_file_name, ByteCount, ColumnSet, CompactRate, IndexResidency, Preallocate, ReelConfig,
+    ReelStore, SyncPolicy, ThreadBudget,
 };
 use reel_mock::MemoryStore;
 
@@ -41,14 +41,13 @@ const STREAM_LEN: usize = 160;
 /// Compaction passes a test drives when it wants the volume drained
 const DRAIN_PASSES: usize = 64;
 
-fn config(index_checkpoint: bool) -> ReelConfig {
+fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT_BYTES),
         alloc_chunk: ByteCount::from_bytes(ALLOC_CHUNK),
         preallocate: Preallocate::Chunk,
         sync: SyncPolicy::EveryPut,
         active_tails: ThreadBudget::threads(1),
-        index_checkpoint,
         ..ReelConfig::default()
     }
 }
@@ -60,7 +59,7 @@ fn config(index_checkpoint: bool) -> ReelConfig {
 fn draining_config() -> ReelConfig {
     ReelConfig {
         compact_mbps: CompactRate::Mbps(100_000),
-        ..config(true)
+        ..config()
     }
 }
 
@@ -86,6 +85,15 @@ fn replace_file(image: &mut DurableImage, path: &Path, bytes: Vec<u8>) {
         }
     }
     image.push((path.to_path_buf(), bytes));
+}
+
+/// The same image with one file taken out of it, as a volume that never wrote it
+fn without_file(image: &DurableImage, path: &Path) -> DurableImage {
+    image
+        .iter()
+        .filter(|(name, _)| name != path)
+        .cloned()
+        .collect()
 }
 
 /// The bytes one file holds in a durable image
@@ -120,17 +128,17 @@ fn assert_agrees(reopened: &ReelStore, memory: &MemoryStore, context: &str) {
     );
 }
 
-// a volume armed for one writes its index down and reads it back at the next open
+// a volume writes its index down and reads it back at the next open
 //
-// Measured rather than asserted: the armed open reads far less than the same image
-// opened by a volume that ignores the file, and both serve the same records.
+// Measured rather than asserted: the open that finds a file reads far less than the
+// same image with the file taken out of it, and both serve the same records.
 #[test]
 fn the_open_reads_the_index() {
     let sim = SimIo::new(FaultPlan::new(1));
     let memory = MemoryStore::new();
     let ops = op_stream::generate_durable(1, STREAM_LEN);
     let image = {
-        let store = open(&sim, config(true), TEST_COLUMNS);
+        let store = open(&sim, config(), TEST_COLUMNS);
         run(&store, &memory, &ops);
         let taken = store.checkpoint_index().expect("index checkpoint");
         assert!(taken.keys > 0, "the file stood for no key");
@@ -143,12 +151,12 @@ fn the_open_reads_the_index() {
         "no index reached the medium"
     );
 
-    let armed = SimIo::from_image(image.clone());
-    let reading = open(&armed, config(true), TEST_COLUMNS);
-    let with_index = armed.read_count();
+    let holding = SimIo::from_image(image.clone());
+    let reading = open(&holding, config(), TEST_COLUMNS);
+    let with_index = holding.read_count();
 
-    let bare = SimIo::from_image(image);
-    let sweeping = open(&bare, config(false), TEST_COLUMNS);
+    let bare = SimIo::from_image(without_file(&image, &index_path()));
+    let sweeping = open(&bare, config(), TEST_COLUMNS);
     let sweeping_reads = bare.read_count();
 
     assert_eq!(
@@ -158,7 +166,7 @@ fn the_open_reads_the_index() {
     );
     assert!(
         with_index < sweeping_reads,
-        "the armed open read {with_index} times against the sweep's {sweeping_reads}, so it swept too",
+        "the open with a file read {with_index} times against the sweep's {sweeping_reads}, so it swept too",
     );
     assert_agrees(&reading, &memory, "after an open from its own index");
 }
@@ -210,7 +218,7 @@ fn a_stale_index_over_a_moved_volume() {
     replace_file(&mut image, &index_path(), stale);
 
     let restored = SimIo::from_image(image);
-    let reopened = open(&restored, config(true), TEST_COLUMNS);
+    let reopened = open(&restored, config(), TEST_COLUMNS);
 
     assert_agrees(&reopened, &memory, "with a stale index on the volume");
 }
@@ -233,7 +241,7 @@ fn vouched_for(image: &DurableImage, persisted: &[u8]) -> (usize, usize) {
 fn a_rotted_index_is_ignored() {
     let sim = SimIo::new(FaultPlan::new(3));
     let memory = MemoryStore::new();
-    let store = open(&sim, config(true), TEST_COLUMNS);
+    let store = open(&sim, config(), TEST_COLUMNS);
     run(&store, &memory, &op_stream::generate_durable(3, STREAM_LEN));
     store.checkpoint_index().expect("index checkpoint");
     store.close().expect("close");
@@ -245,7 +253,7 @@ fn a_rotted_index_is_ignored() {
     replace_file(&mut image, &index_path(), rotted);
 
     let restored = SimIo::from_image(image);
-    let reopened = open(&restored, config(true), TEST_COLUMNS);
+    let reopened = open(&restored, config(), TEST_COLUMNS);
 
     assert_agrees(&reopened, &memory, "with a rotted index on the volume");
 }
@@ -255,7 +263,7 @@ fn a_rotted_index_is_ignored() {
 fn a_truncated_index_is_ignored() {
     let sim = SimIo::new(FaultPlan::new(4));
     let memory = MemoryStore::new();
-    let store = open(&sim, config(true), TEST_COLUMNS);
+    let store = open(&sim, config(), TEST_COLUMNS);
     run(&store, &memory, &op_stream::generate_durable(4, STREAM_LEN));
     store.checkpoint_index().expect("index checkpoint");
     store.close().expect("close");
@@ -265,29 +273,33 @@ fn a_truncated_index_is_ignored() {
     replace_file(&mut image, &index_path(), whole[..whole.len() / 2].to_vec());
 
     let restored = SimIo::from_image(image);
-    let reopened = open(&restored, config(true), TEST_COLUMNS);
+    let reopened = open(&restored, config(), TEST_COLUMNS);
 
     assert_agrees(&reopened, &memory, "with a half index on the volume");
 }
 
-// a volume the operator never armed writes none and believes none it finds
+// a paging volume leaves its sealed keys in the footers and has none to write down
 #[test]
-fn an_unarmed_volume_keeps_none() {
+fn a_paging_volume_refuses() {
     let sim = SimIo::new(FaultPlan::new(5));
     let memory = MemoryStore::new();
-    let store = open(&sim, config(false), TEST_COLUMNS);
+    let paging = ReelConfig {
+        index: IndexResidency::Paged,
+        ..config()
+    };
+    let store = open(&sim, paging, TEST_COLUMNS);
     run(&store, &memory, &op_stream::generate_durable(5, STREAM_LEN));
 
     assert!(
         store.checkpoint_index().is_err(),
-        "an unarmed volume wrote one anyway"
+        "a paging volume wrote one anyway"
     );
 
     store.close().expect("close");
     let image = sim.durable_image();
     assert!(
         held(&image, &index_path()).is_none(),
-        "an unarmed volume left a file"
+        "a paging volume left a file"
     );
 }
 
@@ -297,18 +309,14 @@ fn a_read_only_volume_refuses() {
     let sim = SimIo::new(FaultPlan::new(6));
     let memory = MemoryStore::new();
     {
-        let store = open(&sim, config(true), TEST_COLUMNS);
+        let store = open(&sim, config(), TEST_COLUMNS);
         run(&store, &memory, &op_stream::generate_durable(6, STREAM_LEN));
         store.close().expect("close");
     }
 
-    let follower = ReelStore::open_read_only_with_io(
-        root(),
-        config(true),
-        TEST_COLUMNS,
-        Arc::new(sim.clone()),
-    )
-    .expect("open read only");
+    let follower =
+        ReelStore::open_read_only_with_io(root(), config(), TEST_COLUMNS, Arc::new(sim.clone()))
+            .expect("open read only");
 
     assert!(follower.checkpoint_index().is_err(), "a follower wrote one");
 }
@@ -321,7 +329,7 @@ fn a_read_only_volume_refuses() {
 fn a_crash_before_the_rename_keeps_the_old_file() {
     let sim = SimIo::new(FaultPlan::new(8));
     let memory = MemoryStore::new();
-    let store = Arc::new(open(&sim, config(true), TEST_COLUMNS));
+    let store = Arc::new(open(&sim, config(), TEST_COLUMNS));
     run(&store, &memory, &op_stream::generate_durable(8, STREAM_LEN));
     store.checkpoint_index().expect("first index checkpoint");
     let first = sim.durable_bytes(&index_path()).expect("an index");
@@ -352,7 +360,7 @@ fn a_crash_before_the_rename_keeps_the_old_file() {
     store.close().expect("close");
 
     let restored = SimIo::from_image(sim.durable_image());
-    let reopened = open(&restored, config(true), TEST_COLUMNS);
+    let reopened = open(&restored, config(), TEST_COLUMNS);
 
     assert_agrees(
         &reopened,
@@ -369,7 +377,7 @@ fn a_crash_before_the_rename_keeps_the_old_file() {
 fn segments_the_file_never_saw() {
     let sim = SimIo::new(FaultPlan::new(11));
     let memory = MemoryStore::new();
-    let store = open(&sim, config(true), TEST_COLUMNS);
+    let store = open(&sim, config(), TEST_COLUMNS);
 
     run(
         &store,
@@ -387,7 +395,7 @@ fn segments_the_file_never_saw() {
     store.close().expect("close");
 
     let restored = SimIo::from_image(sim.durable_image());
-    let reopened = open(&restored, config(true), TEST_COLUMNS);
+    let reopened = open(&restored, config(), TEST_COLUMNS);
 
     assert!(
         taken.segments > 0,

@@ -21,7 +21,7 @@ The engine writes five kinds of file and nothing else.
 | `reel.volumes` | the first root | the manifest naming every root this reel spans |
 | `reel.volume` | every root past the first | the marker saying this root was mounted where the manifest says |
 | `reel.lock` | the first root | the advisory lock one writing process holds for its lifetime |
-| `reel.index` | the first root | the resident index written down at a cue, when `index_checkpoint` is on |
+| `reel.index` | the first root | the resident index a `checkpoint_index()` wrote down at a cue |
 
 A segment opens with a header record carrying the format version and its own
 segment number, so a file that is not this reel's is quarantined rather than

@@ -490,9 +490,6 @@ pub struct ReelConfig {
     /// Bytes of sealed-footer state a paged volume keeps at once
     #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_bytes"))]
     pub footer_cache: ByteCount,
-
-    /// Write the resident index down at a cue, and read it back at the next open
-    pub index_checkpoint: bool,
 }
 
 /// A floor every record clears, for a volume that wants the mapping outright
@@ -536,7 +533,6 @@ impl Default for ReelConfig {
             uring: RingTuning::default(),
             filter_bits: DEFAULT_FILTER_BITS,
             fence: FenceResidency::Off,
-            index_checkpoint: false,
         }
     }
 }

@@ -52,14 +52,6 @@ fn config() -> ReelConfig {
     }
 }
 
-/// The same volume, armed to keep an index of its own beside the segments
-fn checkpointing_config() -> ReelConfig {
-    ReelConfig {
-        index_checkpoint: true,
-        ..config()
-    }
-}
-
 fn open(dir: &Path) -> ReelStore {
     open_with(dir, config())
 }
@@ -209,7 +201,7 @@ fn the_copy_carries_its_own_index() {
     let live = home.path().join("live");
     let copy = home.path().join("copy");
 
-    let store = open_with(&live, checkpointing_config());
+    let store = open(&live);
     fill(&store, 0..400, 0x28);
     store.checkpoint(&copy).expect("checkpoint");
 
@@ -218,7 +210,7 @@ fn the_copy_carries_its_own_index() {
         "the copy took the segments and left the index behind",
     );
 
-    let restored = open_with(&copy, checkpointing_config());
+    let restored = open(&copy);
     for at in 0..400u32 {
         assert_eq!(
             restored.get(&key(at)).expect("read").map(Value::into_vec),

@@ -1,10 +1,8 @@
-//! Placement bands: what a segment holds once a caller names death windows
+//! Placement bands: what a segment holds once a column declares its keys marked
 //!
-//! The claim the mechanism makes is narrow and checkable on one volume: a segment a
-//! band drew holds that band's records and nothing else, the file says which band that
-//! was across a restart, and a rewrite puts the survivors back under the same one.
-//! Everything the win is made of rests on those, so they are asserted rather than
-//! measured here.
+//! A segment a band drew holds that band's records and nothing else, the file says
+//! which band that was across a restart, and a rewrite puts the survivors back under
+//! the same one. Everything the win is made of rests on those.
 
 use std::collections::HashMap;
 
@@ -16,30 +14,58 @@ use reel::format::record::{RecordHeader, HEADER_LEN};
 use reel::format::segment_header::SegmentHeader;
 use reel::{
     Band, ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, KeyWidth,
-    MapShape, Preallocate, RecordKey, RecordWrite, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    MapShape, Preallocate, PurgeMark, RecordKey, RecordWrite, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget,
 };
 
-const RECORDS: ColumnId = ColumnId(1);
+const MARKED: ColumnId = ColumnId(1);
+const PLAIN: ColumnId = ColumnId(2);
 
-const COLUMNS: ColumnSet = &[ColumnSpec {
-    id: RECORDS,
-    name: "records",
-    key_width: KeyWidth::Fixed(8),
-    shard_bytes: 0,
-    inline_max: 0,
-    row_carry: 0,
-    purge_mark: None,
-    codec: Codec::None,
-    map_shape: MapShape::Tree,
-}];
+/// A marked key is an identifier and then the position it dies at
+const DEATH_AT: u8 = 8;
+
+const COLUMNS: ColumnSet = &[
+    ColumnSpec {
+        id: MARKED,
+        name: "marked",
+        key_width: KeyWidth::Fixed(16),
+        shard_bytes: 0,
+        inline_max: 0,
+        row_carry: 0,
+        purge_mark: Some(PurgeMark::placing(DEATH_AT)),
+        codec: Codec::None,
+        map_shape: MapShape::Tree,
+    },
+    ColumnSpec {
+        id: PLAIN,
+        name: "plain",
+        key_width: KeyWidth::Fixed(8),
+        shard_bytes: 0,
+        inline_max: 0,
+        row_carry: 0,
+        purge_mark: None,
+        codec: Codec::None,
+        map_shape: MapShape::Tree,
+    },
+];
 
 /// Small enough that a few hundred records fill several of them
 const SEGMENT_BYTES: u64 = 256 * 1024;
 
 const PAYLOAD: usize = 1024;
 
-fn key(at: u64) -> RecordKey {
-    RecordKey::from_bytes(RECORDS, &at.to_be_bytes()).expect("key")
+/// Far enough out that the floors these tests set stay under every death
+const FLOOR: u64 = 1_000;
+
+fn key(at: u64, death: u64) -> RecordKey {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&at.to_be_bytes());
+    bytes[8..].copy_from_slice(&death.to_be_bytes());
+    RecordKey::from_bytes(MARKED, &bytes).expect("key")
+}
+
+fn plain_key(at: u64) -> RecordKey {
+    RecordKey::from_bytes(PLAIN, &at.to_be_bytes()).expect("key")
 }
 
 fn config(tails: u32) -> ReelConfig {
@@ -91,35 +117,34 @@ fn keys_of(footer: &SegmentFooter) -> Vec<RecordKey> {
     keys
 }
 
-fn put(store: &ReelStore, at: u64, band: Option<Band>) {
-    store
-        .apply_batch_banded(
-            vec![RecordWrite::Put {
-                key: key(at),
-                payload: vec![0x5a; PAYLOAD],
-            }],
-            band,
-        )
-        .expect("put");
+fn put(store: &ReelStore, key: RecordKey) {
+    store.put_owned(&key, vec![0x5a; PAYLOAD]).expect("put");
 }
 
 // a segment a band drew holds that band's records and nothing else
 //
-// The bands are written interleaved, one record at a time, so nothing but the routing
-// could be keeping them apart.
+// Written interleaved, one record at a time, so only the routing keeps them apart.
 #[test]
 fn a_segment_holds_one_band() {
     let dir = TempDir::new().expect("tempdir");
     let store = ReelStore::open(dir.path().to_path_buf(), config(4), COLUMNS).expect("open");
+    store.purge_below(FLOOR);
 
     let mut bands: HashMap<Vec<u8>, Option<Band>> = HashMap::new();
     for at in 0..900u64 {
-        let band = match at % 3 {
-            0 => None,
-            held => Some(Band(held)),
+        if at % 3 == 0 {
+            let key = plain_key(at);
+            bands.insert(key.as_slice().to_vec(), None);
+            store.put_owned(&key, vec![0x5a; PAYLOAD]).expect("put");
+            continue;
+        }
+        let death = match at % 3 {
+            1 => FLOOR + 4,
+            _ => FLOOR + 4096,
         };
-        bands.insert(key(at).as_slice().to_vec(), band);
-        put(&store, at, band);
+        let key = key(at, death);
+        bands.insert(key.as_slice().to_vec(), Some(Band::of(death, FLOOR)));
+        put(&store, key);
     }
     store.flush().expect("flush");
     store.cue().expect("cue");
@@ -143,7 +168,7 @@ fn a_segment_holds_one_band() {
             );
         }
     }
-    assert!(banded >= 2, "neither band ever drew a segment of its own");
+    assert!(banded >= 2, "neither window ever drew a segment of its own");
     store.close().expect("close");
 }
 
@@ -155,20 +180,22 @@ fn a_segment_holds_one_band() {
 fn a_rewrite_keeps_the_band() {
     let dir = TempDir::new().expect("tempdir");
     let store = ReelStore::open(dir.path().to_path_buf(), config(4), COLUMNS).expect("open");
+    store.purge_below(FLOOR);
 
-    let band = Band(7);
+    let death = FLOOR + 64;
+    let band = Band::of(death, FLOOR);
     for at in 0..600u64 {
-        put(&store, at, Some(band));
+        put(&store, key(at, death));
     }
     store.flush().expect("flush");
     store.cue().expect("cue");
     while store.sweep_covers().expect("sweep") {}
 
-    // Most of the band dies, which is what puts its segments over the rewrite bar with
-    // survivors still in them.
+    // Most of the window dies, which is what puts its segments over the rewrite bar
+    // with survivors still in them.
     for at in 0..600u64 {
         if at % 5 != 0 {
-            store.delete(&key(at)).expect("delete");
+            store.delete(&key(at, death)).expect("delete");
         }
     }
     store.flush().expect("flush");
@@ -187,14 +214,12 @@ fn a_rewrite_keeps_the_band() {
     store.flush().expect("flush");
     store.cue().expect("cue");
 
-    // Every survivor now reads out of a segment stamped with the band it was written
-    // under, whichever pass moved it.
     let sealed = sealed_bands(dir.path());
     let mut survivors = 0;
     for at in (0..600u64).step_by(5) {
         let entry = store
             .index()
-            .get(&key(at))
+            .get(&key(at, death))
             .expect("index get")
             .expect("a survivor still resolves");
         let (_, stamp, _) = sealed
@@ -215,11 +240,13 @@ fn a_rewrite_keeps_the_band() {
 #[test]
 fn a_band_survives_a_reopen() {
     let dir = TempDir::new().expect("tempdir");
-    let band = Band(11);
+    let death = FLOOR + 64;
+    let band = Band::of(death, FLOOR);
     {
         let store = ReelStore::open(dir.path().to_path_buf(), config(4), COLUMNS).expect("open");
+        store.purge_below(FLOOR);
         for at in 0..600u64 {
-            put(&store, at, Some(band));
+            put(&store, key(at, death));
         }
         store.flush().expect("flush");
         store.cue().expect("cue");
@@ -227,13 +254,14 @@ fn a_band_survives_a_reopen() {
     }
 
     let store = ReelStore::open(dir.path().to_path_buf(), config(4), COLUMNS).expect("reopen");
+    store.purge_below(FLOOR);
     assert!(
         store.tail_bands().iter().all(Option::is_none),
         "a reopened pool remembers nothing"
     );
     for at in 0..600u64 {
         if at % 5 != 0 {
-            store.delete(&key(at)).expect("delete");
+            store.delete(&key(at, death)).expect("delete");
         }
     }
     store.flush().expect("flush");
@@ -256,7 +284,7 @@ fn a_band_survives_a_reopen() {
     for at in (0..600u64).step_by(5) {
         let entry = store
             .index()
-            .get(&key(at))
+            .get(&key(at, death))
             .expect("index get")
             .expect("a survivor still resolves");
         let (_, stamp, _) = sealed
@@ -274,35 +302,41 @@ fn a_band_survives_a_reopen() {
     store.close().expect("close");
 }
 
-// a released band gives its tail back, and nothing follows the band into its segments
+// a floor moved past a window gives its tail back, with nobody asking
 #[test]
-fn a_released_band_gives_its_tail_back() {
+fn a_finished_window_gives_its_tail_back() {
     let dir = TempDir::new().expect("tempdir");
     let store = ReelStore::open(dir.path().to_path_buf(), config(4), COLUMNS).expect("open");
+    store.purge_below(FLOOR);
 
-    put(&store, 1, Some(Band(1)));
+    let death = FLOOR + 4;
+    let band = Band::of(death, FLOOR);
+    put(&store, key(1, death));
     assert_eq!(
         store.tail_bands().iter().flatten().count(),
         1,
-        "the band took no tail"
+        "the window took no tail"
     );
 
-    assert!(store.release_band(Band(1)).expect("release"));
-    assert_eq!(store.tail_bands().iter().flatten().count(), 0);
+    // Past the end of the window, so everything it holds is dead.
+    store.purge_below(band.as_u64());
+    put(&store, key(2, band.as_u64() + 4096));
     assert!(
-        !store.release_band(Band(1)).expect("release"),
-        "a band holding no tail cannot give one back"
+        !store
+            .tail_bands()
+            .iter()
+            .flatten()
+            .any(|held| *held == band),
+        "a finished window kept its tail"
     );
 
-    // The window is closed, so what follows must not land where its records did.
-    put(&store, 2, None);
     store.flush().expect("flush");
     store.cue().expect("cue");
-    for (segment, band, footer) in sealed_bands(dir.path()) {
-        if band == Some(Band(1)) {
+    for (segment, held, footer) in sealed_bands(dir.path()) {
+        if held == Some(band) {
             assert!(
-                !keys_of(&footer).contains(&key(2)),
-                "segment {} took a record after its band was given back",
+                !keys_of(&footer).contains(&key(2, band.as_u64() + 4096)),
+                "segment {} took a record after its window was finished",
                 segment.as_u32(),
             );
         }
@@ -310,26 +344,95 @@ fn a_released_band_gives_its_tail_back() {
     store.close().expect("close");
 }
 
-// more live bands than tails falls back to unbanded rather than stalling or thrashing
+// more live windows than tails falls back to unbanded rather than stalling or thrashing
 #[test]
 fn a_band_with_no_tail_falls_back() {
     let dir = TempDir::new().expect("tempdir");
     // Two tails, so one band can be held and the other tail stays unbanded.
     let store = ReelStore::open(dir.path().to_path_buf(), config(2), COLUMNS).expect("open");
+    store.purge_below(FLOOR);
 
     for at in 0..300u64 {
-        put(&store, at, Some(Band(at % 8)));
+        put(&store, key(at, FLOOR + 4 + (at % 8) * 32));
     }
     store.flush().expect("flush");
 
     assert!(
         store.band_fallbacks() > 0,
-        "eight bands over one banded tail should have fallen back"
+        "eight windows over one banded tail should have fallen back"
     );
     // Placement is the only thing that gives: every record is still where the index
     // says it is.
     for at in 0..300u64 {
-        assert!(store.get(&key(at)).expect("get").is_some(), "lost {at}");
+        let key = key(at, FLOOR + 4 + (at % 8) * 32);
+        assert!(store.get(&key).expect("get").is_some(), "lost {at}");
     }
+    store.close().expect("close");
+}
+
+// a column declaring no mark is routed exactly as it was before bands existed
+#[test]
+fn an_unmarked_column_claims_nothing() {
+    let dir = TempDir::new().expect("tempdir");
+    let store = ReelStore::open(dir.path().to_path_buf(), config(4), COLUMNS).expect("open");
+    store.purge_below(FLOOR);
+
+    for at in 0..300u64 {
+        store
+            .put_owned(&plain_key(at), vec![0x5a; PAYLOAD])
+            .expect("put");
+    }
+    store.flush().expect("flush");
+
+    assert!(store.tail_bands().iter().all(Option::is_none));
+    assert_eq!(store.band_fallbacks(), 0);
+    store.close().expect("close");
+}
+
+// a batch mixing windows takes the one covering the last of them to die
+#[test]
+fn a_batch_takes_the_band_that_covers_it() {
+    let dir = TempDir::new().expect("tempdir");
+    let store = ReelStore::open(dir.path().to_path_buf(), config(4), COLUMNS).expect("open");
+    store.purge_below(FLOOR);
+
+    let deaths = [FLOOR + 4, FLOOR + 40, FLOOR + 400];
+    let covering = deaths
+        .iter()
+        .map(|death| Band::of(*death, FLOOR))
+        .max()
+        .expect("bands");
+    store
+        .apply_batch(
+            deaths
+                .iter()
+                .enumerate()
+                .map(|(at, death)| RecordWrite::Put {
+                    key: key(at as u64, *death),
+                    payload: vec![0x5a; PAYLOAD],
+                })
+                .collect(),
+        )
+        .expect("batch");
+
+    assert!(
+        store.tail_bands().contains(&Some(covering)),
+        "the batch took a window it does not outlive"
+    );
+
+    // A batch carrying anything unplaced takes no window at all.
+    store
+        .apply_batch(vec![
+            RecordWrite::Put {
+                key: key(9, FLOOR + 4),
+                payload: vec![0x5a; PAYLOAD],
+            },
+            RecordWrite::Put {
+                key: plain_key(9),
+                payload: vec![0x5a; PAYLOAD],
+            },
+        ])
+        .expect("batch");
+    assert_eq!(store.tail_bands().iter().flatten().count(), 1);
     store.close().expect("close");
 }

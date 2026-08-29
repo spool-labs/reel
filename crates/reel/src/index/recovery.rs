@@ -11,7 +11,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex};
 
+use crate::config::ThreadBudget;
 use crate::error::Result;
 use crate::format::column::{ColumnId, KeyBytes, RecordKey};
 use crate::format::footer::{
@@ -28,14 +30,22 @@ use crate::index::entry::{span_of, Entry, RangeCover};
 use crate::index::persisted::{trusted, PersistedReader, PersistedSegment};
 use crate::index::sealed_keys::SealedKeys;
 use crate::io::op::FileId;
+use crate::io::ServingBackend;
 use crate::reel::segment::{IoDriver, SegmentReader};
 use crate::reel::segment_number;
+use crate::sync::lock;
 
 /// Bytes at the very end of a sealed segment holding its footer length and magic
 const TRAILER_LEN: u64 = 8;
 
 /// Bytes of the file end searched for the trailer past any aligned-write zeros
 const TRAILER_PROBE_LEN: u64 = 4096;
+
+/// Threads a rebuild opens segment files on, however wide the machine is
+const MAX_READERS: usize = 8;
+
+/// Segment files each reader may read ahead of the join
+const READ_AHEAD: usize = 4;
 
 /// One record recovered from a segment, before newest-wins resolution
 struct SeenRecord {
@@ -205,6 +215,7 @@ pub fn rebuild_from_persisted(
     let mut sealed_files = Vec::new();
     let mut placements = Vec::new();
     let mut highest_number = 0u32;
+    let mut jobs: Vec<(SegmentId, PathBuf, u64)> = Vec::new();
     for (number, path, len, root) in files {
         highest_number = highest_number.max(number);
         let segment = SegmentId(number);
@@ -217,28 +228,33 @@ pub fn rebuild_from_persisted(
             consumed.insert(segment, len);
             continue;
         }
-        match load_segment(driver, &path, segment, len, pages, &mut resolver)? {
+        jobs.push((segment, path, len));
+    }
+    read_segments(driver, &jobs, |at, parts| {
+        let (segment, path, len) = &jobs[at];
+        match absorb_segment(*segment, parts, pages, &mut resolver)? {
             Loaded::Sealed => {
-                consumed.insert(segment, len);
-                sealed_files.push((segment, path, len));
+                consumed.insert(*segment, *len);
+                sealed_files.push((*segment, path.clone(), *len));
             }
             Loaded::Walked(offset, rows) => {
-                consumed.insert(segment, offset);
-                walked.push((path.clone(), len));
+                consumed.insert(*segment, offset);
+                walked.push((path.clone(), *len));
                 // Resumable means the file ends at its records. A file running
                 // past its walk holds bytes no appender may write behind.
-                if offset == len {
+                if offset == *len {
                     resumable.push(ResumableTail {
-                        segment,
-                        path,
+                        segment: *segment,
+                        path: path.clone(),
                         end: offset,
                         rows,
                     });
                 }
             }
-            Loaded::Foreign => quarantined.push(path),
+            Loaded::Foreign => quarantined.push(path.clone()),
         }
-    }
+        Ok(())
+    })?;
     adopted.join(&mut resolver);
 
     let mut resolved = resolver.finish();
@@ -382,47 +398,208 @@ pub struct ResumableTail {
     pub rows: Vec<FooterEntry>,
 }
 
-/// Read one segment into the resolver, releasing its descriptor either way
+/// One segment file read off the medium, before any of it is joined
+///
+/// Everything the join needs is in here, so absorbing a segment touches no
+/// descriptor and the reads can run wherever there is a thread for them.
+enum SegmentParts {
+    /// A sealed segment's footer, and the range ends its rows do not carry
+    Sealed(SegmentFooter, Vec<Option<KeyBytes>>),
+
+    /// An unsealed tail's walk, in the order the records sit in the file
+    Walked(Walked),
+
+    /// A file that is not a segment of this reel
+    Foreign,
+}
+
+/// Read every job's segment file, handing each to the join in job order
+///
+/// The reads are independent of one another and the join is not: an exact tie
+/// between two runs falls to the earliest source, and the segment sweep decides
+/// which that is. So the files are opened across whatever readers the backend is
+/// worth having, while the join takes them one at a time in the order one thread
+/// would have read them. A reader runs no further ahead of the join than the
+/// window, which holds the peak at a few segments' parts rather than the volume's.
+fn read_segments(
+    driver: &IoDriver,
+    jobs: &[(SegmentId, PathBuf, u64)],
+    mut join: impl FnMut(usize, SegmentParts) -> Result<()>,
+) -> Result<()> {
+    let readers = match reads_on_its_caller(driver) {
+        true => ThreadBudget::Auto
+            .resolve()
+            .clamp(1, MAX_READERS)
+            .min(jobs.len()),
+        false => 1,
+    };
+    if readers <= 1 {
+        for (at, (segment, path, len)) in jobs.iter().enumerate() {
+            join(at, read_segment(driver, path, *segment, *len)?)?;
+        }
+        return Ok(());
+    }
+
+    let queue = Mutex::new(ReadQueue {
+        next: 0,
+        done: HashMap::new(),
+        taken: 0,
+        stop: false,
+    });
+    let moved = Condvar::new();
+    let window = readers * READ_AHEAD;
+    let mut outcome = Ok(());
+    std::thread::scope(|scope| {
+        for _ in 0..readers {
+            scope.spawn(|| read_claimed(driver, jobs, &queue, &moved, window));
+        }
+        for at in 0..jobs.len() {
+            let parts = {
+                let mut held = lock(&queue);
+                let parts = loop {
+                    match held.done.remove(&at) {
+                        Some(parts) => break parts,
+                        None => {
+                            held = moved.wait(held).unwrap_or_else(|bad| bad.into_inner());
+                        }
+                    }
+                };
+                held.taken = at + 1;
+                moved.notify_all();
+                parts
+            };
+            outcome = parts.and_then(|parts| join(at, parts));
+            if outcome.is_err() {
+                lock(&queue).stop = true;
+                moved.notify_all();
+                break;
+            }
+        }
+    });
+    outcome
+}
+
+/// Whether a reader thread on this backend is another read in flight
+///
+/// A synchronous backend runs its syscall on whichever thread submitted it, so a
+/// second thread is a second seek the drive can be working on. A ring has one queue
+/// and one drain turn whoever submits, and the simulator answers out of memory under
+/// one lock and counts its ops in submit order, so on both a fan-out buys contention
+/// rather than depth.
+fn reads_on_its_caller(driver: &IoDriver) -> bool {
+    matches!(
+        driver.serving(),
+        ServingBackend::Posix | ServingBackend::PosixDirect
+    )
+}
+
+/// What the readers have read and how far the join has got through it
+struct ReadQueue {
+    /// The next job a reader claims, since the files are read in order
+    next: usize,
+
+    /// Parts read and not yet joined, by job
+    done: HashMap<usize, Result<SegmentParts>>,
+
+    /// Jobs the join has taken, which is what the read-ahead window is measured from
+    taken: usize,
+
+    /// Set where the join gave up, so the readers stop with it
+    stop: bool,
+}
+
+/// Claim jobs and read them until the list runs out or the join stops
+fn read_claimed(
+    driver: &IoDriver,
+    jobs: &[(SegmentId, PathBuf, u64)],
+    queue: &Mutex<ReadQueue>,
+    moved: &Condvar,
+    window: usize,
+) {
+    loop {
+        let at = {
+            let mut held = lock(queue);
+            loop {
+                if held.stop || held.next >= jobs.len() {
+                    return;
+                }
+                if held.next < held.taken + window {
+                    break;
+                }
+                held = moved.wait(held).unwrap_or_else(|bad| bad.into_inner());
+            }
+            let at = held.next;
+            held.next += 1;
+            at
+        };
+        let (segment, path, len) = &jobs[at];
+        let parts = read_segment(driver, path, *segment, *len);
+        lock(queue).done.insert(at, parts);
+        moved.notify_all();
+    }
+}
+
+/// Read one segment file, releasing its descriptor either way
 ///
 /// A rebuild opens every segment file, so a descriptor left behind here is one per
 /// segment on every open of the volume.
-fn load_segment(
+fn read_segment(
     driver: &IoDriver,
     path: &Path,
     segment: SegmentId,
     file_len: u64,
-    pages: bool,
-    resolver: &mut Resolver,
-) -> Result<Loaded> {
+) -> Result<SegmentParts> {
     let file = driver.open(path, false)?;
-    let loaded = read_segment(driver, file, segment, file_len, pages, resolver);
+    let read = read_parts(driver, file, segment, file_len);
     driver.close(file)?;
-    loaded
+    read
 }
 
-fn read_segment(
+fn read_parts(
     driver: &IoDriver,
     file: FileId,
     segment: SegmentId,
     file_len: u64,
-    pages: bool,
-    resolver: &mut Resolver,
-) -> Result<Loaded> {
+) -> Result<SegmentParts> {
     if !belongs_here(driver, file, segment)? {
-        return Ok(Loaded::Foreign);
+        return Ok(SegmentParts::Foreign);
     }
 
     match read_footer(driver, file, file_len)? {
         Some(footer) => {
-            match pages {
-                true => sweep_footer(driver, file, segment, &footer, resolver)?,
-                false => collect_from_footer(driver, file, segment, &footer, resolver)?,
-            }
-            Ok(Loaded::Sealed)
+            let ends = read_range_ends(driver, file, &footer)?;
+            Ok(SegmentParts::Sealed(footer, ends))
         }
         None => {
             let mut reader = SegmentReader::new(driver, file, file_len);
-            let walked = walk_records(&mut reader, segment, 0, file_len)?;
+            Ok(SegmentParts::Walked(walk_records(
+                &mut reader,
+                segment,
+                0,
+                file_len,
+            )?))
+        }
+    }
+}
+
+/// Fold one segment's parts into the resolver
+fn absorb_segment(
+    segment: SegmentId,
+    parts: SegmentParts,
+    pages: bool,
+    resolver: &mut Resolver,
+) -> Result<Loaded> {
+    match parts {
+        SegmentParts::Foreign => Ok(Loaded::Foreign),
+        SegmentParts::Sealed(footer, ends) => {
+            let mut ends = ends.into_iter();
+            match pages {
+                true => sweep_footer(segment, &footer, &mut ends, resolver)?,
+                false => collect_from_footer(segment, &footer, &mut ends, resolver)?,
+            }
+            Ok(Loaded::Sealed)
+        }
+        SegmentParts::Walked(walked) => {
             let reached = walked.next_offset;
             let rows = walked
                 .records
@@ -622,27 +799,25 @@ fn belongs_here(driver: &IoDriver, file: FileId, segment: SegmentId) -> Result<b
     }
 }
 
-/// Take a sealed segment's records from its footer, reading only its ranges back
+/// Take a sealed segment's records from its footer, ranges from the ends beside it
 ///
 /// Sealing waits for every reservation and syncs, so what a footer lists is what
 /// landed and a batch frame has nothing left to decide. The one thing a footer
-/// cannot answer is a range tombstone's end, so those are read back one at a time.
+/// cannot answer is a range tombstone's end, and those arrive in footer order.
 fn collect_from_footer(
-    driver: &IoDriver,
-    file: FileId,
     segment: SegmentId,
     footer: &SegmentFooter,
+    ends: &mut impl Iterator<Item = Option<KeyBytes>>,
     resolver: &mut Resolver,
 ) -> Result<()> {
-    collect_partitions(driver, file, segment, &footer.partitions, resolver)
+    collect_partitions(segment, &footer.partitions, ends, resolver)
 }
 
 /// Absorb every row of these partitions into the join
 fn collect_partitions(
-    driver: &IoDriver,
-    file: FileId,
     segment: SegmentId,
     partitions: &[FooterPartition],
+    ends: &mut impl Iterator<Item = Option<KeyBytes>>,
     resolver: &mut Resolver,
 ) -> Result<()> {
     // One run per source. The partitions come sorted by column and their rows by key,
@@ -651,7 +826,7 @@ fn collect_partitions(
     for entry in partitions.iter().flat_map(|partition| partition.entries()) {
         let entry = entry?;
         if entry.is_range_tombstone() {
-            let end = read_range_end(driver, file, &entry.key, entry.offset, entry.len)?;
+            let end = ends.next().flatten();
             let span = span_of(entry.key.width(), entry.len);
             resolver.absorb_range(
                 RangeCover {
@@ -690,10 +865,9 @@ fn collect_partitions(
 /// the scrub settles shadowing after it. Live key counts are left alone, since a key
 /// rewritten into several segments appears in several footers.
 fn sweep_footer(
-    driver: &IoDriver,
-    file: FileId,
     segment: SegmentId,
     footer: &SegmentFooter,
+    ends: &mut impl Iterator<Item = Option<KeyBytes>>,
     resolver: &mut Resolver,
 ) -> Result<()> {
     resolver.book_tally(segment, footer.tally);
@@ -719,7 +893,7 @@ fn sweep_footer(
                 .insert(entry.key.as_slice());
             let span = span_of(entry.key.width(), entry.len);
             if entry.is_range_tombstone() {
-                let end = read_range_end(driver, file, &entry.key, entry.offset, entry.len)?;
+                let end = ends.next().flatten();
                 resolver.absorb_range(
                     RangeCover {
                         start: entry.key,
@@ -740,18 +914,43 @@ fn sweep_footer(
     Ok(())
 }
 
+/// Read back the end of every range tombstone the footer lists, in its own order
+///
+/// A footer row says where its record sits and not where its range stops, so the
+/// ends are the one thing a sealed segment still owes the medium. Taken here so the
+/// join that follows reads nothing at all, and read off the rows rather than the
+/// entries since finding a range needs no key.
+fn read_range_ends(
+    driver: &IoDriver,
+    file: FileId,
+    footer: &SegmentFooter,
+) -> Result<Vec<Option<KeyBytes>>> {
+    let mut ends = Vec::new();
+    for partition in &footer.partitions {
+        for at in 0..partition.len() {
+            let row = partition.row_at(at)?;
+            if !row.flags.is_range_tombstone() {
+                continue;
+            }
+            let width = partition.key_at(at).map_or(0, |key| key.len() as u16);
+            ends.push(read_range_end(driver, file, width, row.offset, row.len)?);
+        }
+    }
+    Ok(ends)
+}
+
 /// Read the exclusive end a range tombstone carries as its payload
 fn read_range_end(
     driver: &IoDriver,
     file: FileId,
-    key: &RecordKey,
+    key_width: u16,
     offset: u32,
     len: u32,
 ) -> Result<Option<KeyBytes>> {
     if len == 0 {
         return Ok(None);
     }
-    let at = u64::from(offset) + HEADER_LEN as u64 + u64::from(key.width());
+    let at = u64::from(offset) + HEADER_LEN as u64 + u64::from(key_width);
     let bytes = driver.pread(file, at, u64::from(len))?;
     if bytes.len() < len as usize {
         return Ok(None);

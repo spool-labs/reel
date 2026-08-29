@@ -11,18 +11,27 @@
 //! speaks for instead of sweeping their footers. Same volume and same segment counts as
 //! the swept arm, since all three reopen one image and only an armed open reads the file.
 //!
+//! The simulator serves every read out of memory, so what it times is the join rather than
+//! the medium. Point `REEL_OPEN_TIME_DIR` at a directory to run the same three arms on the
+//! real backend under a temporary volume there, which is where a per-segment read costs a
+//! seek. The volume is built once and each arm opens its own copy, so an arm never reads
+//! what the one before it left behind; the copy warms the page cache, so these are warm
+//! opens rather than cold ones.
+//!
 //! Opt-in. Run with:
 //!   cargo test -p reel --release --test probes -- open_time
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use tempfile::TempDir;
 
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, MapShape,
-    Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, IoBackend, KeyWidth,
+    MapShape, Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 /// Virtual root the simulator's files live under
@@ -122,10 +131,40 @@ fn fill_to_segments(store: &ReelStore, wanted: usize) -> u64 {
     written
 }
 
+/// The three configs the arms open under, in the order the table reports them
+fn arms() -> [ReelConfig; 3] {
+    [
+        config(IndexResidency::Resident),
+        config(IndexResidency::Paged),
+        checkpointing(),
+    ]
+}
+
+/// What one case measured: segments and keys on the volume, then an arm each
+struct Case {
+    segments: usize,
+    keys: u64,
+    arms: Vec<(Duration, u64)>,
+}
+
+/// Directory the operator asked for a real volume under, if they asked for one
+fn named_root() -> Option<PathBuf> {
+    std::env::var_os("REEL_OPEN_TIME_DIR").map(PathBuf::from)
+}
+
 // how long an open takes, and what it holds afterwards, as segments multiply
 pub fn open_time_by_segment_count() {
     // libtest leaves the test name line open, so a header needs a newline ahead of it.
     println!();
+    let root = named_root();
+    match &root {
+        Some(root) => println!(
+            "backend {:?} under {}",
+            IoBackend::default(),
+            root.display()
+        ),
+        None => println!("backend simulator"),
+    }
     println!(
         "{:>9}  {:>9}  {:>12}  {:>12}  {:>12}  {:>12}  {:>12}  {:>12}",
         "segments",
@@ -139,44 +178,104 @@ pub fn open_time_by_segment_count() {
     );
 
     for &wanted in CASES {
-        let sim = SimIo::new(FaultPlan::new(1));
-        let store = ReelStore::open_with_io(
-            PathBuf::from(ROOT),
-            checkpointing(),
-            COLUMNS,
-            Arc::new(sim.clone()),
-        )
-        .expect("open");
-        let keys = fill_to_segments(&store, wanted);
-        store.flush().expect("flush");
-        // The file goes into the image every arm reopens: an unarmed open never reads it,
-        // so the swept arms measure the same volume rather than a smaller one.
-        store.checkpoint_index().expect("checkpoint");
-        let segments = store.index().segments_snapshot().len();
-        let image = sim.durable_image();
-        drop(store);
-
-        let mut row = Vec::new();
-        for config in [
-            config(IndexResidency::Resident),
-            config(IndexResidency::Paged),
-            checkpointing(),
-        ] {
-            let restored = SimIo::from_image(image.clone());
-            let start = Instant::now();
-            let store =
-                ReelStore::open_with_io(PathBuf::from(ROOT), config, COLUMNS, Arc::new(restored))
-                    .expect("reopen");
-            let elapsed = start.elapsed();
-            // What the open left behind, before any maintenance tick has run.
-            let held = store.resident_bytes().to_bytes() / 1024;
-            row.push((elapsed, held));
-            drop(store);
-        }
-
+        let case = match &root {
+            Some(root) => on_disk(root, wanted),
+            None => simulated(wanted),
+        };
+        let arms = &case.arms;
         println!(
             "{:>9}  {:>9}  {:>12.2?}  {:>9} KiB  {:>12.2?}  {:>9} KiB  {:>12.2?}  {:>9} KiB",
-            segments, keys, row[0].0, row[0].1, row[1].0, row[1].1, row[2].0, row[2].1,
+            case.segments,
+            case.keys,
+            arms[0].0,
+            arms[0].1,
+            arms[1].0,
+            arms[1].1,
+            arms[2].0,
+            arms[2].1,
         );
+    }
+}
+
+/// One case against the simulator, every arm reopening the same durable image
+fn simulated(wanted: usize) -> Case {
+    let sim = SimIo::new(FaultPlan::new(1));
+    let store = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        checkpointing(),
+        COLUMNS,
+        Arc::new(sim.clone()),
+    )
+    .expect("open");
+    let keys = fill_to_segments(&store, wanted);
+    store.flush().expect("flush");
+    // The file goes into the image every arm reopens: an unarmed open never reads it,
+    // so the swept arms measure the same volume rather than a smaller one.
+    store.checkpoint_index().expect("checkpoint");
+    let segments = store.index().segments_snapshot().len();
+    let image = sim.durable_image();
+    drop(store);
+
+    let mut arms_taken = Vec::new();
+    for config in arms() {
+        let restored = SimIo::from_image(image.clone());
+        let start = Instant::now();
+        let store =
+            ReelStore::open_with_io(PathBuf::from(ROOT), config, COLUMNS, Arc::new(restored))
+                .expect("reopen");
+        let elapsed = start.elapsed();
+        // What the open left behind, before any maintenance tick has run.
+        let held = store.resident_bytes().to_bytes() / 1024;
+        arms_taken.push((elapsed, held));
+        drop(store);
+    }
+    Case {
+        segments,
+        keys,
+        arms: arms_taken,
+    }
+}
+
+/// The same case on the real backend, under a temporary volume the run removes
+fn on_disk(root: &Path, wanted: usize) -> Case {
+    let home = TempDir::new_in(root).expect("tempdir");
+    let built = home.path().join("built");
+    let store = ReelStore::open(built.clone(), checkpointing(), COLUMNS).expect("open");
+    let keys = fill_to_segments(&store, wanted);
+    store.flush().expect("flush");
+    store.checkpoint_index().expect("checkpoint");
+    let segments = store.index().segments_snapshot().len();
+    drop(store);
+
+    let mut arms_taken = Vec::new();
+    for (at, config) in arms().into_iter().enumerate() {
+        let arm = home.path().join(format!("arm{at}"));
+        copy_tree(&built, &arm);
+        let start = Instant::now();
+        let store = ReelStore::open(arm, config, COLUMNS).expect("reopen");
+        let elapsed = start.elapsed();
+        let held = store.resident_bytes().to_bytes() / 1024;
+        arms_taken.push((elapsed, held));
+        drop(store);
+    }
+    Case {
+        segments,
+        keys,
+        arms: arms_taken,
+    }
+}
+
+/// Copy a built volume so an arm opens files nothing else has opened
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("arm directory");
+    for entry in std::fs::read_dir(from).expect("built volume") {
+        let entry = entry.expect("directory entry");
+        let target = to.join(entry.file_name());
+        match entry.file_type().expect("file type").is_dir() {
+            true => copy_tree(&entry.path(), &target),
+            false => {
+                std::fs::copy(entry.path(), target).expect("copy");
+            }
+        }
     }
 }

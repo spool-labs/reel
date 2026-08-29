@@ -25,6 +25,7 @@ impl ReelStore {
             planned.payload,
             planned.codec,
             Commit::PerRecord,
+            None,
         )?;
         self.index
             .insert(key, committed.loc, committed.lsn, planned.carried)?;
@@ -44,6 +45,7 @@ impl ReelStore {
                 planned.payload,
                 planned.codec,
                 Commit::PerRecord,
+                None,
             )
             .await?;
         self.index
@@ -96,7 +98,7 @@ impl ReelStore {
             return Ok(());
         };
 
-        let committed = self.reel.write_batch(records)?;
+        let committed = self.reel.write_batch(records, None)?;
         self.reel.sync_if_owed()?;
         self.publish_batch(&keys, &committed)
     }
@@ -110,7 +112,7 @@ impl ReelStore {
             return Ok(());
         };
 
-        let committed = self.reel.write_batch_wait(records).await?;
+        let committed = self.reel.write_batch_wait(records, None).await?;
         self.reel.sync_if_owed_wait().await?;
         self.publish_batch(&keys, &committed)
     }

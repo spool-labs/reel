@@ -5,6 +5,7 @@
 //! Writes route to the least-loaded tail. Every column shares the one log, so a
 //! batch spanning columns is one durability point and one recovery domain.
 
+pub mod bands;
 pub mod bias;
 pub mod checkpoint;
 pub mod cue;
@@ -28,6 +29,7 @@ use crate::config::{PointReads, RangedReads, ReelConfig};
 use crate::error::{ReelError, Result};
 use std::sync::OnceLock;
 
+use crate::format::band::Band;
 use crate::format::block::{lookup_in_span, FooterMap, RowBlock};
 use crate::format::column::{ColumnId, ColumnSet, KeyRef, RecordKey};
 use crate::format::fence::{FenceCut, FenceReach};
@@ -40,6 +42,7 @@ use crate::index::paged::{FooterCache, FooterSource};
 use crate::index::recovery::read_footer;
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
 use crate::io::op::{Advice, ColdRoute, Completion, FileId, Op, WarmFirst};
+use crate::reel::bands::BandPool;
 use crate::reel::segment::{DirectOpen, FdCache, IoDriver, SegmentHandle, SplitRead};
 use crate::sync::{lock, read, write};
 
@@ -941,6 +944,7 @@ impl Drop for HeldScratch {
 pub struct Reel {
     shared: Arc<ReelShared>,
     tails: Vec<Appender>,
+    bands: BandPool,
 }
 
 impl Reel {
@@ -957,7 +961,11 @@ impl Reel {
         for index in 0..total {
             tails.push(Appender::open(Arc::clone(&shared), index as u64)?);
         }
-        Ok(Reel { shared, tails })
+        Ok(Reel {
+            shared,
+            tails,
+            bands: BandPool::new(count),
+        })
     }
 
     /// The tail compaction owns, which no foreground write is offered
@@ -979,6 +987,7 @@ impl Reel {
         Reel {
             shared,
             tails: Vec::new(),
+            bands: BandPool::new(0),
         }
     }
 
@@ -1001,15 +1010,16 @@ impl Reel {
         self.shared.cold_depth.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Append or overwrite a payload, routed to the least-loaded tail
+    /// Append or overwrite a payload, routed to the tail the band names
     pub fn put(
         &self,
         key: RecordKey,
         payload: Vec<u8>,
         codec: u8,
         commit: Commit,
+        band: Option<Band>,
     ) -> Result<Committed> {
-        self.route().append_data(key, payload, codec, commit)
+        self.route(band)?.append_data(key, payload, codec, commit)
     }
 
     /// The same append awaited, taking its durability point on the async door
@@ -1022,15 +1032,19 @@ impl Reel {
         payload: Vec<u8>,
         codec: u8,
         commit: Commit,
+        band: Option<Band>,
     ) -> Result<Committed> {
-        self.route()
+        self.route(band)?
             .append_data_wait(key, payload, codec, commit)
             .await
     }
 
     /// Append a tombstone for one key, routed to the least-loaded tail
+    ///
+    /// A tombstone names no band: it dies when compaction can drop it rather than when
+    /// the record it hides was going to die.
     pub fn delete(&self, key: RecordKey, commit: Commit) -> Result<Committed> {
-        self.route().append_tombstone(key, commit)
+        self.route(None)?.append_tombstone(key, commit)
     }
 
     /// Append a tombstone covering a half-open key range within one column
@@ -1040,21 +1054,53 @@ impl Reel {
         end: Option<&[u8]>,
         commit: Commit,
     ) -> Result<Committed> {
-        self.route().append_range_tombstone(start, end, commit)
+        self.route(None)?.append_range_tombstone(start, end, commit)
     }
 
     /// Append a whole batch to one tail as one reservation and one write
     ///
     /// Everything the batch carries lands together or not at all: the records go down
     /// back to back behind a frame declaring their count and their span, and a rebuild
-    /// keeps the run only when it reads exactly what the frame declared.
-    pub fn write_batch(&self, records: Vec<BatchRecord>) -> Result<Vec<Committed>> {
-        self.route().append_batch(records)
+    /// keeps the run only when it reads exactly what the frame declared. One band
+    /// covers the batch, since one tail takes all of it.
+    pub fn write_batch(
+        &self,
+        records: Vec<BatchRecord>,
+        band: Option<Band>,
+    ) -> Result<Vec<Committed>> {
+        self.route(band)?.append_batch(records)
     }
 
     /// The same batch awaited, admitted without holding a thread for the budget
-    pub async fn write_batch_wait(&self, records: Vec<BatchRecord>) -> Result<Vec<Committed>> {
-        self.route().append_batch_wait(records).await
+    pub async fn write_batch_wait(
+        &self,
+        records: Vec<BatchRecord>,
+        band: Option<Band>,
+    ) -> Result<Vec<Committed>> {
+        self.route(band)?.append_batch_wait(records).await
+    }
+
+    /// The band each foreground tail is drawing under, for a caller reporting placement
+    pub fn tail_bands(&self) -> Vec<Option<Band>> {
+        self.bands.owners()
+    }
+
+    /// Banded writes that found no tail free and went to the unbanded ones instead
+    pub fn band_fallbacks(&self) -> u64 {
+        self.bands.fallbacks()
+    }
+
+    /// Give a closed window's tail back to the pool
+    pub fn release_band(&self, band: Band) -> Result<bool> {
+        self.bands.release(self.foreground(), band)
+    }
+
+    /// The tail a write of this band belongs in, claiming one where the band has none
+    ///
+    /// Compaction places its survivors through here too, so a rewritten record ends up
+    /// beside the fresh records of its own window rather than back in the mixture.
+    pub fn place(&self, band: Option<Band>) -> Result<usize> {
+        self.bands.place(self.foreground(), band)
     }
 
     /// Sync every active tail
@@ -1700,19 +1746,32 @@ impl Reel {
         framed_or_nothing(read, prefix, len)
     }
 
-    /// The tail a foreground write goes to, which is the least loaded of them
-    fn route(&self) -> &Appender {
+    /// The tail a foreground write goes to
+    ///
+    /// A write naming no band goes to the least loaded tail, and on a volume nothing
+    /// has ever banded that is the whole of it: the pool is asked one relaxed load
+    /// first and stays out of the way. A banded write goes to the tail that band is on,
+    /// which may cost a claim.
+    ///
+    /// The band is settled here and the record is written after, so a claim landing in
+    /// between leaves that one record in the segment the tail has just drawn. The
+    /// window is one claim wide and it costs placement, not correctness: the record is
+    /// still where the index says and still dies whenever it dies.
+    fn route(&self, band: Option<Band>) -> Result<&Appender> {
         let foreground = self.foreground();
-        let mut chosen = &foreground[0];
-        let mut lowest = chosen.load();
-        for tail in &foreground[1..] {
-            let load = tail.load();
-            if load < lowest {
-                lowest = load;
-                chosen = tail;
+        if band.is_none() && self.bands.is_idle() {
+            let mut chosen = &foreground[0];
+            let mut lowest = chosen.load();
+            for tail in &foreground[1..] {
+                let load = tail.load();
+                if load < lowest {
+                    lowest = load;
+                    chosen = tail;
+                }
             }
+            return Ok(chosen);
         }
-        chosen
+        Ok(&foreground[self.bands.place(foreground, band)?])
     }
 }
 

@@ -2030,7 +2030,7 @@ mod tests {
     use crate::format::column::{
         Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, RecordKey,
     };
-    use crate::format::segment_header::SEGMENT_HEADER_LEN;
+    use crate::format::segment_header::SEGMENT_HEADER_SPAN;
     use crate::index::entry::span_of;
     use crate::index::recovery::{rebuild_reel, RebuiltReel};
     use crate::io::fault::{FaultKind, FaultPlan};
@@ -2042,7 +2042,7 @@ mod tests {
     const REEL_DIR: &str = "/bulk";
     const RECORDS: ColumnId = ColumnId(1);
     const KEY_WIDTH: usize = 34;
-    const SEG_HEADER_SPAN: usize = HEADER_LEN + SEGMENT_HEADER_LEN;
+    const SEG_HEADER_SPAN: usize = HEADER_LEN + SEGMENT_HEADER_SPAN;
 
     const COLUMNS: ColumnSet = &[ColumnSpec {
         id: RECORDS,
@@ -2141,7 +2141,7 @@ mod tests {
     fn put(fixture: &Fixture, byte: u8, payload: Vec<u8>) {
         let committed = fixture
             .reel
-            .put(key(byte), payload, 0, Commit::PerRecord)
+            .put(key(byte), payload, 0, Commit::PerRecord, None)
             .expect("put");
         fixture
             .index
@@ -2300,7 +2300,13 @@ mod tests {
             let key = marked_key(mark, 0);
             let committed = fixture
                 .reel
-                .put(key.clone(), vec![mark as u8; 200], 0, Commit::PerRecord)
+                .put(
+                    key.clone(),
+                    vec![mark as u8; 200],
+                    0,
+                    Commit::PerRecord,
+                    None,
+                )
                 .expect("put");
             fixture
                 .index
@@ -2647,7 +2653,7 @@ mod tests {
         drop(
             fixture
                 .reel
-                .put(key(1), vec![0x11; 200], 0, Commit::PerRecord)
+                .put(key(1), vec![0x11; 200], 0, Commit::PerRecord, None)
                 .expect("orphan"),
         );
         seal(&fixture);
@@ -3265,7 +3271,7 @@ mod tests {
                 let key = RecordKey::from_bytes(RECORDS, &bytes).expect("key");
                 let committed = fixture
                     .reel
-                    .put(key.clone(), payload.clone(), 0, Commit::PerRecord)
+                    .put(key.clone(), payload.clone(), 0, Commit::PerRecord, None)
                     .expect("put");
                 fixture
                     .index

@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::config::{Preallocate, SyncPolicy, VolumeClass};
 use crate::error::{ReelError, Result};
+use crate::format::band::Band;
 use crate::format::column::RecordKey;
 use crate::format::footer::{FooterEntry, SegmentFooter};
 use crate::format::loc::{Loc, SegmentId};
@@ -259,6 +260,10 @@ pub struct Appender {
     /// The tier this tail's draws go to, fast except when compaction demotes
     draw_class: AtomicU8,
 
+    /// The death window this tail's draws are stamped with, nothing where it takes
+    /// whatever names no band
+    band: Mutex<Option<Band>>,
+
     /// Whether a merge owns this tail, so every segment it draws is merge output
     writes_merge_output: bool,
 
@@ -343,6 +348,7 @@ impl Appender {
             inflight: AtomicU64::new(0),
             depth: DrainDepth::default(),
             draw_class: AtomicU8::new(0),
+            band: Mutex::new(None),
             writes_merge_output,
         };
         let fresh = appender.prepare_segment()?;
@@ -635,6 +641,79 @@ impl Appender {
         Ok(id)
     }
 
+    /// The death window this tail's segments are drawn under
+    pub fn band(&self) -> Option<Band> {
+        *lock(&self.band)
+    }
+
+    /// Point the tail's draws at a band, ending the segment it holds now
+    ///
+    /// A segment says which band it was drawn under in the header record written at the
+    /// draw, so a change only ever reaches the next segment: the one open here is sealed
+    /// behind it and the spare drawn ahead under the old band is given back. A segment
+    /// holding nothing but its header goes the way that spare goes rather than sealing a
+    /// shell, since a claim finding an idle tail is the common case.
+    pub fn set_band(&self, band: Option<Band>) -> Result<()> {
+        let previous = {
+            // The spare is held across the change, so a writer drawing one ahead either
+            // draws it before this or under the band this leaves behind.
+            let mut spare = lock(&self.spare);
+            let mut held = lock(&self.band);
+            if *held == band {
+                return Ok(());
+            }
+            if let Some(stale) = spare.take() {
+                self.scrap(stale);
+            }
+            std::mem::replace(&mut *held, band)
+        };
+
+        let rolled = {
+            let mut active = write(&self.active);
+            let empty = lock(&active.entries).is_empty();
+            self.swap_in_fresh(&mut active).map(|held| (held, empty))
+        };
+        let (retired, was_empty) = match rolled {
+            Ok(rolled) => rolled,
+            // The draw failed, so the tail is still on a segment stamped with the band it
+            // had, and that is what it must go on saying.
+            Err(error) => {
+                *lock(&self.band) = previous;
+                return Err(error);
+            }
+        };
+        if was_empty {
+            self.scrap(retired);
+            return Ok(());
+        }
+        let end = retired.end();
+        let sealed = retire_segment(&self.shared, &retired, end);
+        if sealed.is_err() {
+            park_broken_seal(&self.shared, retired, end);
+        }
+        sealed
+    }
+
+    /// Give a drawn segment back unwritten, since nothing points into it
+    fn scrap(&self, held: Active) {
+        let drawn = held.handle.id();
+        held.handle.mark_doomed();
+        // Durable because nothing is owed: the file is going away, and a flush that
+        // arrives later must settle rather than park forever.
+        held.sync.mark_durable();
+        // A hold or a mark left behind would stop the held floor ever advancing past a
+        // segment that is not there.
+        self.shared.release_segment(drawn);
+        self.shared.forget_merge_output(drawn);
+    }
+
+    /// Give the spare drawn ahead back, for a tail that is stopping
+    fn doom_spare(&self) {
+        if let Some(held) = lock(&self.spare).take() {
+            self.scrap(held);
+        }
+    }
+
     /// Flush, seal the last segment, and give its hold up, for a tail that ends
     ///
     /// The hold is what keeps the maintenance plane off a segment, so a tail that lives
@@ -653,14 +732,7 @@ impl Appender {
     /// Sealing on the way out is what tells a shutdown from a crash on disk. The tail is
     /// left with nothing to append to, so a write that still arrives rolls first.
     pub fn close(&self) -> Result<()> {
-        if let Some(spare) = lock(&self.spare).take() {
-            let drawn = spare.handle.id();
-            spare.handle.mark_doomed();
-            // The file goes, so a hold or a mark left behind would stop the held floor
-            // ever advancing past a segment that is not there.
-            self.shared.release_segment(drawn);
-            self.shared.forget_merge_output(drawn);
-        }
+        self.doom_spare();
         let active = write(&self.active);
         if active.terminal.load(Ordering::Acquire) {
             return Ok(());
@@ -1458,7 +1530,9 @@ impl Appender {
             .alloc_high
             .store(self.preallocate(&active)?, Ordering::Release);
 
-        let payload = SegmentHeader::new(id).pack().to_vec();
+        // Stamped at the draw, since a band is what the segment is for and compaction
+        // reads it off the file to place the survivors it copies out.
+        let payload = SegmentHeader::banded(id, self.band()).pack().to_vec();
         let header = RecordHeader::segment_header(&payload);
         let span = self.reserved_span(&header);
         active.reserved.store(span, Ordering::Release);

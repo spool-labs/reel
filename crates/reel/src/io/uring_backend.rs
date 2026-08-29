@@ -2602,11 +2602,7 @@ mod tests {
         // a boundary, so the covering read pays a block at each end. The buffer has
         // the room and the device would answer it in two, so it goes off the ring.
         let (_, span) = covering_span(DIRECT_ALIGN as u64 - 1, STAGE_BYTES as u64);
-        assert_eq!(
-            span as usize,
-            REGISTERED_BUFFER_BYTES,
-            "the widening moved"
-        );
+        assert_eq!(span as usize, REGISTERED_BUFFER_BYTES, "the widening moved");
         assert!(
             buffers.claim(span as usize).is_none(),
             "a read widened past one request took the ring anyway",

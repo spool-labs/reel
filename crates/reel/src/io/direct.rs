@@ -21,11 +21,9 @@ pub const DIRECT_ALIGN: usize = BLOCK as usize;
 
 /// Bytes one direct op asks the device for, at most
 ///
-/// A request wider than the queue's max_hw_sectors is cut up by the block layer
-/// and arrives as two, and behind an IOMMU that ceiling is 128 KiB. A staging
-/// buffer is a block wider than this so a covering read has room to round out at
-/// both ends, which would put a request one block over the line: the room stays,
-/// and what is asked for stops short.
+/// A request wider than the queue's max_hw_sectors is cut up by the block layer and
+/// arrives as two, and behind an IOMMU that ceiling is 128 KiB. The staging buffer is a
+/// block wider so a covering read can round out at both ends; what is asked for stops short.
 pub const DIRECT_REQUEST_BYTES: usize = STAGE_BYTES;
 
 // A request that does not divide into blocks is one the kernel refuses whole.

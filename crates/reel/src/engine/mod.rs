@@ -267,11 +267,10 @@ pub struct ReelStore {
 
 /// The index a previous cue wrote down, where this open may believe any of it
 ///
-/// Read whenever one is there, since a paging volume never wrote one and every other
-/// file is CRC verified per block and joined newest-wins, so believing it can only
-/// save reads. A file describing columns the store no longer serves is refused whole
-/// rather than in part, since dropping a block's rows while still skipping its
-/// segments is the one way this file loses a live record.
+/// Read whenever one is there: a paging volume never wrote one, and every other file is
+/// CRC verified per block and joined newest-wins, so believing it can only save reads. A
+/// file describing columns the store no longer serves is refused whole rather than in
+/// part, since dropping a block's rows while skipping its segments loses a live record.
 fn offered_index(
     driver: &IoDriver,
     root: &Path,
@@ -651,9 +650,8 @@ impl ReelStore {
 
     /// Flush and stop every active tail, leaving each where the next open resumes it
     ///
-    /// Nothing seals on a close: a tail's segment persists across processes and
-    /// only takes a footer when it fills. The open that follows walks each tail
-    /// once and appends where this process stopped.
+    /// Nothing seals on a close: a tail's segment persists across processes and only
+    /// takes a footer when it fills. The open that follows appends where this one stopped.
     pub fn close(&self) -> Result<()> {
         if self.is_read_only {
             return Ok(());

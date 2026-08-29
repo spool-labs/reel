@@ -1002,10 +1002,9 @@ impl Reel {
     /// tail back for compaction: a sorted run is only sorted if nothing else is
     /// writing into it. The reserved tail is the last one and route never offers it.
     ///
-    /// Tails a previous process left unsealed are picked up in number order, one
-    /// per foreground tail, so a restart continues its segments rather than
-    /// drawing new ones. The reserved tail never resumes: a merge's output has
-    /// to be nothing but its own runs.
+    /// Tails a previous process left unsealed are picked up in number order, so a restart
+    /// continues its segments rather than drawing new ones. The reserved tail never
+    /// resumes: a merge's output has to be nothing but its own runs.
     pub fn open(shared: Arc<ReelShared>, resumable: Vec<ResumableTail>) -> Result<Reel> {
         let count = shared.config.tail_count();
         let reserved = shared.config.rewrite_on_seal || shared.volumes.has_capacity();
@@ -1820,15 +1819,9 @@ impl Reel {
 
     /// The tail a foreground write goes to
     ///
-    /// A write in no band goes to the least loaded tail, and on a volume whose columns
-    /// declare no placement that is the whole of it: the pool is asked one relaxed load
-    /// first and stays out of the way. A banded write goes to the tail that band is on,
-    /// which may cost a claim.
-    ///
     /// The band is settled here and the record is written after, so a claim landing in
-    /// between leaves that one record in the segment the tail has just drawn. The
-    /// window is one claim wide and it costs placement, not correctness: the record is
-    /// still where the index says and still dies whenever it dies.
+    /// between leaves that one record in the segment the tail has just drawn. The window
+    /// is one claim wide and it costs placement, not correctness.
     fn route(&self, band: Option<Band>) -> Result<&Appender> {
         let foreground = self.foreground();
         if band.is_none() && self.bands.is_idle() {

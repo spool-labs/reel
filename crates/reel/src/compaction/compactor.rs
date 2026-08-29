@@ -1703,18 +1703,14 @@ fn destination(reel: &Reel, band: Option<Band>) -> Result<usize> {
     if let Some(reserved) = reel.reserved_tail() {
         return Ok(reserved);
     }
-    // Otherwise the survivors route the way a fresh write of the same band would: into
-    // the tail that band is on, and into the least loaded unbanded tail where the
-    // source carried no band at all.
+    // Otherwise the survivors route the way a fresh write of the same band would.
     reel.place(band)
 }
 
 /// The band a sealed segment was drawn under, read off its own header record
 ///
-/// One small read at the head of a pass that is about to read the whole file, so a
-/// band comes from the segment rather than from a table a restart would lose. A file
-/// whose head does not read as a segment header answers nothing: the pass that follows
-/// is the one that decides what to do about it.
+/// One small read at the head of a pass that is about to read the whole file, so a band
+/// comes from the segment rather than from a table a restart would lose.
 fn band_of(shared: &Arc<ReelShared>, source: &SegmentHandle) -> Result<Option<Band>> {
     let head = shared.driver.pread(source.file(), 0, HEADER_LEN as u64)?;
     if head.len() < HEADER_LEN {

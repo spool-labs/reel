@@ -42,10 +42,8 @@ const MAX_REGISTERED_FILES: u32 = 4096;
 
 /// Bytes one registered buffer holds, the room a staged op lands in
 ///
-/// The posix staging width plus the block a covering read is widened by, since a
-/// read aligned to nothing rounds down at the front and up at the back. What the
-/// pool serves stops a block short of this, at the width one request reaches the
-/// device as; a span past that takes the op off the ring entirely.
+/// A block over the staging width, since a read aligned to nothing rounds down at
+/// the front and up at the back. A span past what the pool serves goes off the ring.
 const REGISTERED_BUFFER_BYTES: usize = STAGE_BYTES + DIRECT_ALIGN;
 
 /// Registered buffers one ring keeps, the ceiling on direct ops it can have out
@@ -690,10 +688,8 @@ struct Ring {
     /// How this thread waits for a completion that has not landed yet
     wait: RingWait,
 
-    /// Whether the kernel holds this ring's completion work until it is asked for
-    ///
-    /// Read before every look at the queue, so it is the ring's own answer rather
-    /// than the tuning's: a mode the kernel refused is not a mode to ask under.
+    /// Whether the kernel holds this ring's completion work, as the kernel answered
+    /// and not as the tuning asked
     asks_for_completions: bool,
 
     /// The volume's door tally, which this ring's per-op decisions feed
@@ -813,29 +809,23 @@ impl Ring {
 
     /// Run the completion work the kernel is holding for this thread, if any
     ///
-    /// Under a mode that holds it, the queue fills only when the thread asks, and
-    /// the crate's submit asks only when it is also waiting for a completion, so a
-    /// thread that means to peek has to ask by hand. Nothing is offered and nothing
-    /// is waited for: this is the ask and not the wait.
-    ///
-    /// The mode is read before the flag because reading the flag borrows the
-    /// submission queue, whose drop stores the tail back, and a spinning wait comes
-    /// through here every round. A ring the kernel posts into as it goes never pays
-    /// that store; one holding its work pays it beside a syscall anyway.
+    /// The crate's submit asks only when it is also waiting for a completion, so a
+    /// thread that means to peek has to ask by hand: this is the ask and not the wait.
+    /// The mode is read before the flag because reading the flag borrows the submission
+    /// queue, whose drop stores the tail back, and a spin comes through here every round.
     fn run_owed_work(&mut self) {
         if !self.asks_for_completions || !self.ring.submission().taskrun() {
             return;
         }
-        // SAFETY: an enter submitting nothing and waiting for nothing, made on the
-        // thread that owns this ring, which is what the mode requires.
+        // SAFETY: an enter submitting nothing and waiting for nothing, on the thread
+        // that owns this ring, which is what the mode requires.
         let entered = unsafe {
             self.ring
                 .submitter()
                 .enter::<libc::sigset_t>(0, 0, EnterFlags::GETEVENTS.bits(), None)
         };
         if let Err(error) = entered {
-            // The work stays queued and the flag stays up, so the next look asks
-            // again; nothing is lost but this round.
+            // The work stays queued and the flag stays up, so the next look asks again.
             tracing::debug!("the ring refused to run its own completion work: {error}");
         }
     }
@@ -843,9 +833,8 @@ impl Ring {
     /// Move whatever the ring has finished into the reaped list
     ///
     /// A completion queue is shared memory, so this costs no syscall on a ring the
-    /// kernel posts into as it goes. One holding its work is asked first, which is
-    /// what makes every reader of the queue below taskrun aware by going through
-    /// here: the harvest, the spin, the engine loop, and the driver's own poll.
+    /// kernel posts into as it goes. One holding its work is asked first, so every
+    /// reader of the queue goes through here.
     fn drain(&mut self) -> usize {
         self.run_owed_work();
         let mut drained = 0;
@@ -875,12 +864,9 @@ impl Ring {
 
     /// Sleep until the ring has finished at least one of the ops it holds
     ///
-    /// An interrupted wait means look again, and a busy ring means a full queue
-    /// with something in it. The wait hands the kernel what is queued on its way
-    /// in, so it is the submission as much as the sleep and a flush in front of one
-    /// is the same entries going over a syscall early. An enter that fails outright
-    /// took nothing, so what is still queued is answered here exactly as a flush
-    /// answers it.
+    /// The wait hands the kernel what is queued on its way in, so it is the submission
+    /// as much as the sleep. An interrupted or busy wait means look again; an enter
+    /// that failed outright took nothing.
     fn park(&mut self) -> Result<()> {
         let waited = self.ring.submit_and_wait(1);
         match waited {
@@ -912,10 +898,8 @@ impl Ring {
             self.sleep_once();
             return;
         }
-        // The spin is the one wait that never enters the kernel, so it is the one
-        // that has to hand the entries over itself: nothing the kernel has not been
-        // told about can finish, and the loop below would ask a queue that stays
-        // empty for as long as it is willing to ask.
+        // The spin never enters the kernel, so it has to hand the entries over itself
+        // or the loop below would ask a queue that stays empty.
         self.flush();
         let mut rounds = 0u32;
         loop {
@@ -1119,11 +1103,8 @@ impl DoorTally {
         }
     }
 
-    /// A spinning wait gave up and slept instead
-    ///
-    /// The one wait that never enters the kernel is the one that cannot be told a
-    /// completion is being held for it, so a count climbing here is the reading
-    /// that says the ring's completion mode and the wait no longer agree.
+    /// A spinning wait gave up and slept instead, which reads as the ring's completion
+    /// mode and its wait no longer agreeing
     fn note_spun_out(&self) {
         self.spun_out.fetch_add(1, Ordering::Relaxed);
     }
@@ -1616,9 +1597,8 @@ fn ring_under(taskrun: TaskRun) -> Result<IoUring> {
     // The kernel clamps an oversized request rather than refusing it, so asking past
     // the limit is how a ring ends up as deep as the machine allows.
     builder.setup_clamp();
-    // A ring belongs to the thread that built it, so the promise the kernel
-    // enforces is one this backend keeps by construction, and it is what the
-    // deferred mode below is allowed to rest on.
+    // A ring belongs to the thread that built it, so the deferred mode below can rest
+    // on the promise this flag makes.
     builder.setup_single_issuer();
     match taskrun {
         TaskRun::Deferred => {
@@ -1639,9 +1619,8 @@ fn ring_under(taskrun: TaskRun) -> Result<IoUring> {
 
 /// Build one ring under the best completion mode this kernel will take
 ///
-/// A refusal is one errno with nothing in it naming the flag, so the step down is
-/// by trial: a kernel too old for deferred work gets cooperative, and one too old
-/// for that runs the ring the way it has always run.
+/// A refusal is one errno with nothing in it naming the flag, so the step down is by
+/// trial: a kernel too old for deferred work gets cooperative, then plain.
 fn build_ring(wanted: TaskRun) -> Result<(IoUring, TaskRun)> {
     let mut refused = None;
     for &taskrun in wanted.and_below() {
@@ -1706,9 +1685,8 @@ impl UringBackend {
 
     /// Spinning waits on this volume that gave up and slept instead
     ///
-    /// Zero is the working answer. Anything else is a spin that asked a queue no
-    /// completion could reach, which is what a ring holding its completion work
-    /// looks like to a thread that never asks for it.
+    /// Zero is the working answer; anything else is a spin that asked a queue no
+    /// completion could reach.
     pub fn spin_outs(&self) -> u64 {
         self.core.doors.spun_out.load(Ordering::Relaxed)
     }
@@ -1961,11 +1939,8 @@ const RING_SPAN_CAP: u64 = 0x7fff_f000;
 /// Bytes a write hands the ring before it is worth more as a blocking call
 ///
 /// Every write reel issues waits for its own completion, so the ring's part is the
-/// batching, and a write this wide has nothing to batch with. A footer is the one
-/// that reaches it: a segment's whole sorted index in a single call, megabytes the
-/// kernel hands to a worker thread while the submitter waits anyway. The sealer
-/// that issues it is a thread that owns blocking work already, and the direct door
-/// stops at this width regardless, so the two doors agree on what a ring write is.
+/// batching, and a write this wide has nothing to batch with. Set to the direct
+/// door's own ceiling, so the two doors agree on what a ring write is.
 const RING_WRITE_CAP: u64 = DIRECT_REQUEST_BYTES as u64;
 
 /// Bytes a vectored write hands over across all its buffers

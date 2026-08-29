@@ -93,10 +93,9 @@ const MERGE_SPAN: u64 = 1024 * 1024;
 
 /// The same bound on a volume whose reads bypass the page cache
 ///
-/// A direct read flies through a registered buffer, and one the buffer cannot serve
-/// leaves the ring for the posix path a record at a time. The cap is the request
-/// width less the block a covering read rounds out by, so every run that merges is
-/// one the ring can still carry whole.
+/// A read the registered buffer cannot serve leaves the ring for the posix path a record
+/// at a time. The cap is the request width less the block a covering read rounds out by,
+/// so every run that merges is one the ring can still carry whole.
 const DIRECT_MERGE_SPAN: u64 = (DIRECT_REQUEST_BYTES - DIRECT_ALIGN) as u64;
 
 /// Bytes a merged read on this backend reaches before the run is broken

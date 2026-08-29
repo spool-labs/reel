@@ -237,9 +237,7 @@ pub enum RingWait {
 pub enum TaskRun {
     /// Hold it until the thread enters asking for completions, on a kernel from 6.1
     ///
-    /// A ring is one thread's here, which is the promise this mode is built on: no
-    /// interrupt, no work run on a transition the thread made for something else,
-    /// and the completions land in a batch at the one place that wants them.
+    /// Rests on a ring belonging to one thread, which is the promise this backend keeps.
     Deferred,
 
     /// Run it at the next kernel exit rather than interrupting for it, from 5.19
@@ -277,9 +275,8 @@ impl Default for RingTuning {
 impl TaskRun {
     /// This mode and the ones below it, for a kernel that refuses the one asked for
     ///
-    /// Deferred wants 6.1 and cooperative 5.19, and a refusal comes back from the
-    /// setup as one errno with nothing in it to say which flag was the problem, so
-    /// the answer is to try the next one down rather than to read the version.
+    /// Deferred wants 6.1 and cooperative 5.19, and a refusal comes back as one errno with
+    /// nothing naming the flag, so the answer is to try the next one down.
     pub fn and_below(self) -> &'static [TaskRun] {
         match self {
             TaskRun::Deferred => &[TaskRun::Deferred, TaskRun::Cooperative, TaskRun::Interrupt],
@@ -290,9 +287,8 @@ impl TaskRun {
 
     /// Whether a thread has to ask the kernel before it reads its own queue
     ///
-    /// Both modes that are not the default set `IORING_SQ_TASKRUN` when work is
-    /// waiting, so a peek is a flag read; only under deferred is the ask the one
-    /// thing that makes a completion appear.
+    /// Both non-default modes set `IORING_SQ_TASKRUN` when work is waiting, so a peek is a
+    /// flag read; only under deferred is the ask what makes a completion appear.
     pub fn is_asked_for(self) -> bool {
         !matches!(self, TaskRun::Interrupt)
     }

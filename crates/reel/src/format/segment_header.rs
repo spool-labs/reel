@@ -34,10 +34,9 @@ pub const SEGMENT_HEADER_SPAN: usize = BAND_END;
 
 /// The fixed payload carried by the first record of every segment
 ///
-/// The prefix's layout never changes, so any build can read the version and segment
-/// number of any file ever written and identify it. What follows the prefix is read
-/// where the payload reaches it and defaulted where it does not, which is how the
-/// band a segment was drawn under joined a format already in the field.
+/// The prefix's layout never changes, so any build can identify any file ever written.
+/// What follows is read where the payload reaches it and defaulted where it does not,
+/// which is how the band joined a format already in the field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SegmentHeader {
     /// Format version the segment was written under

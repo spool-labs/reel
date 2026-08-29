@@ -7,16 +7,13 @@
 //! segment rather than all of them and its index column should be flat.
 //!
 //! The third arm is the same resident map read back rather than rebuilt: the volume wrote
-//! its index down before closing, so the open takes the rows for every segment the file
-//! speaks for instead of sweeping their footers. Same volume and same segment counts as
-//! the swept arm, since all three reopen one image and only the third keeps its file.
+//! its index down before closing, so the open takes the rows instead of sweeping footers.
+//! All three reopen one image and only the third keeps its file.
 //!
 //! The simulator serves every read out of memory, so what it times is the join rather than
 //! the medium. Point `REEL_OPEN_TIME_DIR` at a directory to run the same three arms on the
-//! real backend under a temporary volume there, which is where a per-segment read costs a
-//! seek. The volume is built once and each arm opens its own copy, so an arm never reads
-//! what the one before it left behind; the copy warms the page cache, so these are warm
-//! opens rather than cold ones.
+//! real backend, which is where a per-segment read costs a seek. Each arm opens its own
+//! copy of a volume built once, so these are warm opens rather than cold ones.
 //!
 //! Opt-in. Run with:
 //!   cargo test -p reel --release --test probes -- open_time

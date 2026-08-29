@@ -261,8 +261,7 @@ pub struct Appender {
     /// The tier this tail's draws go to, fast except when compaction demotes
     draw_class: AtomicU8,
 
-    /// The death window this tail's draws are stamped with, nothing where it takes
-    /// whatever names no band
+    /// The death window this tail's draws are stamped with, nothing for unbanded traffic
     band: Mutex<Option<Band>>,
 
     /// Whether a merge owns this tail, so every segment it draws is merge output
@@ -323,10 +322,6 @@ impl DrainDepth {
 
 impl Appender {
     /// Open a tail on the segment a previous process left, or a fresh draw
-    ///
-    /// A tail either has a past or it does not: handed one, it picks the
-    /// segment up at its walked end; otherwise it draws fresh and writes the
-    /// header as record zero.
     pub fn open(
         shared: Arc<ReelShared>,
         index: u64,
@@ -665,11 +660,9 @@ impl Appender {
 
     /// Point the tail's draws at a band, ending the segment it holds now
     ///
-    /// A segment says which band it was drawn under in the header record written at the
-    /// draw, so a change only ever reaches the next segment: the one open here is sealed
-    /// behind it and the spare drawn ahead under the old band is given back. A segment
-    /// holding nothing but its header goes the way that spare goes rather than sealing a
-    /// shell, since a claim finding an idle tail is the common case.
+    /// A segment says which band it was drawn under in its header, so a change only ever
+    /// reaches the next segment: the one open here is sealed behind it, and one holding
+    /// nothing but its header is scrapped rather than sealed as a shell.
     pub fn set_band(&self, band: Option<Band>) -> Result<()> {
         let previous = {
             // The spare is held across the change, so a writer drawing one ahead either
@@ -1466,10 +1459,7 @@ impl Appender {
 
     /// Take up the segment a previous process left unsealed, at its walked end
     ///
-    /// The rows the walk rebuilt become the in-memory footer, carrying nothing
-    /// inline, the reservation is re-established ahead of the head, and one
-    /// sync makes the resumed bytes durable before anything new rides behind
-    /// them.
+    /// One sync makes the resumed bytes durable before anything new rides behind them.
     fn resume_segment(&self, resumed: ResumableTail) -> Result<Active> {
         let holds = self.shared.adopt_segment(resumed.segment);
         let file = self.shared.driver.open(&resumed.path, false)?;

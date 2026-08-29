@@ -388,9 +388,8 @@ enum Loaded {
 
 /// An unsealed tail an appender can pick up where it stopped
 ///
-/// The end is the walked offset, and the rows are what the tail's in-memory
-/// footer held when the process went: rebuilt from the walk, carrying nothing
-/// inline, so a read through one goes to the record.
+/// The end is the walked offset; the rows are rebuilt from the walk and carry
+/// nothing inline, so a read through one goes to the record.
 pub struct ResumableTail {
     pub segment: SegmentId,
     pub path: PathBuf,
@@ -415,12 +414,10 @@ enum SegmentParts {
 
 /// Read every job's segment file, handing each to the join in job order
 ///
-/// The reads are independent of one another and the join is not: an exact tie
-/// between two runs falls to the earliest source, and the segment sweep decides
-/// which that is. So the files are opened across whatever readers the backend is
-/// worth having, while the join takes them one at a time in the order one thread
-/// would have read them. A reader runs no further ahead of the join than the
-/// window, which holds the peak at a few segments' parts rather than the volume's.
+/// The reads are independent and the join is not: an exact tie between two runs falls
+/// to the earliest source. So the files are read across threads while the join takes
+/// them in order, and a reader runs no further ahead than the window, which holds the
+/// peak at a few segments' parts rather than the volume's.
 fn read_segments(
     driver: &IoDriver,
     jobs: &[(SegmentId, PathBuf, u64)],
@@ -481,11 +478,10 @@ fn read_segments(
 
 /// Whether a reader thread on this backend is another read in flight
 ///
-/// A synchronous backend runs its syscall on whichever thread submitted it, so a
-/// second thread is a second seek the drive can be working on. A ring has one queue
-/// and one drain turn whoever submits, and the simulator answers out of memory under
-/// one lock and counts its ops in submit order, so on both a fan-out buys contention
-/// rather than depth.
+/// A synchronous backend runs its syscall on whichever thread submitted it, so a second
+/// thread is a second seek the drive can be working on. A ring has one queue and one
+/// drain, and the simulator answers under one lock in submit order, so on both a
+/// fan-out buys contention rather than depth.
 fn reads_on_its_caller(driver: &IoDriver) -> bool {
     matches!(
         driver.serving(),
@@ -916,10 +912,9 @@ fn sweep_footer(
 
 /// Read back the end of every range tombstone the footer lists, in its own order
 ///
-/// A footer row says where its record sits and not where its range stops, so the
-/// ends are the one thing a sealed segment still owes the medium. Taken here so the
-/// join that follows reads nothing at all, and read off the rows rather than the
-/// entries since finding a range needs no key.
+/// A footer row says where its record sits and not where its range stops, so the ends
+/// are the one thing a sealed segment still owes the medium. Taken here so the join
+/// that follows reads nothing at all.
 fn read_range_ends(
     driver: &IoDriver,
     file: FileId,
@@ -1311,9 +1306,8 @@ impl Resolver {
     /// Cut a run down to one version a key, booking every version it drops dead
     ///
     /// The run is in key then sequence order, so a key's versions are adjacent and the
-    /// last of them is the newest. The join would resolve them the same way and book the
-    /// same losers dead, so doing it here holds a source at the size of the keys it still
-    /// resolves rather than of every version it ever wrote.
+    /// last is the newest. The join would resolve them the same way, so folding here
+    /// holds a source at the size of the keys it still resolves.
     fn fold_newest(&mut self, run: &mut Vec<(RecordKey, SeenRecord)>) {
         let mut kept = 0usize;
         for at in 1..run.len() {
@@ -1673,9 +1667,8 @@ pub(crate) fn read_footer(
     if file_len < min_footer {
         return Ok(None);
     }
-    // An aligned write can land the footer with a block's worth of zeros after
-    // it, so the trailer is read at the last byte that is not padding rather
-    // than at the file end.
+    // An aligned write can land the footer with a block's worth of zeros after it, so
+    // the trailer is read at the last byte that is not padding.
     let probe = file_len.min(TRAILER_PROBE_LEN);
     let padded = driver.pread(file, file_len - probe, probe)?;
     if (padded.len() as u64) < probe {

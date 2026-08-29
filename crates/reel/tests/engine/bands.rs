@@ -2,7 +2,7 @@
 //!
 //! A segment a band drew holds that band's records and nothing else, the file says
 //! which band that was across a restart, and a rewrite puts the survivors back under
-//! the same one. Everything the win is made of rests on those.
+//! the same one.
 
 use std::collections::HashMap;
 

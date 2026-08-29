@@ -2,8 +2,9 @@
 //!
 //! Bands do not add tails. The pool is the one the configuration already sized, and a
 //! band claims one of its tails for as long as it is being written to. One tail is
-//! always left unclaimed, so traffic that names no band never lands in a banded
-//! segment; a band that finds nothing free writes there too rather than stalling.
+//! always left unclaimed, so traffic in no band never lands in a banded segment; a band
+//! that finds nothing free writes there too rather than stalling. A floor that has
+//! passed a band takes its tail back, so nobody has to hand one in.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::RwLock;
@@ -32,6 +33,10 @@ pub struct BandPool {
     /// have gone quiet since to lose its own
     handed_over: AtomicU64,
 
+    /// Highest floor the finished bands have been retired against, so a floor that has
+    /// not moved costs one relaxed load rather than the table
+    swept: AtomicU64,
+
     /// Banded writes that found no tail and went where unbanded traffic goes
     fell_back: AtomicU64,
 }
@@ -54,6 +59,7 @@ impl BandPool {
             used: (0..tails).map(|_| AtomicU64::new(0)).collect(),
             claimed: AtomicUsize::new(0),
             handed_over: AtomicU64::new(0),
+            swept: AtomicU64::new(0),
             fell_back: AtomicU64::new(0),
         }
     }
@@ -78,8 +84,10 @@ impl BandPool {
     /// A band already on a tail is a read of the table and nothing else. Everything
     /// costly is on the claim: it seals the tail it takes, so the band that follows
     /// starts on a segment of its own.
-    pub fn place(&self, foreground: &[Appender], band: Option<Band>) -> Result<usize> {
-        let Some(band) = band else {
+    pub fn place(&self, foreground: &[Appender], band: Option<Band>, floor: u64) -> Result<usize> {
+        self.retire_finished(foreground, floor)?;
+        // A band the floor has passed holds nothing alive, so it is not worth a tail.
+        let Some(band) = band.filter(|band| !band.is_finished(floor)) else {
             return Ok(self.unbanded(foreground));
         };
         if let Some(at) = self.holder(band) {
@@ -94,20 +102,23 @@ impl BandPool {
         }
     }
 
-    /// Give a band's tail back, for a caller whose window has closed
-    ///
-    /// The tail is sealed behind the band, so what it takes next lands in a segment of
-    /// its own and the window's segments are all done. A band nothing holds a tail for
-    /// answers false and costs nothing.
-    pub fn release(&self, foreground: &[Appender], band: Band) -> Result<bool> {
+    /// Give back every tail holding a window the floor has passed, once per floor move
+    fn retire_finished(&self, foreground: &[Appender], floor: u64) -> Result<()> {
+        if self.is_idle() || self.swept.load(Ordering::Relaxed) >= floor {
+            return Ok(());
+        }
         let mut owner = write(&self.owner);
-        let Some(at) = owner.iter().position(|held| *held == Some(band)) else {
-            return Ok(false);
-        };
-        foreground[at].set_band(None)?;
-        owner[at] = None;
-        self.claimed.fetch_sub(1, Ordering::Relaxed);
-        Ok(true)
+        for at in 0..owner.len() {
+            match owner[at] {
+                Some(band) if band.is_finished(floor) => {}
+                Some(_) | None => continue,
+            }
+            foreground[at].set_band(None)?;
+            owner[at] = None;
+            self.claimed.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.swept.fetch_max(floor, Ordering::Relaxed);
+        Ok(())
     }
 
     /// The tail a band is already drawing under, counted as a use of it
@@ -165,10 +176,7 @@ impl BandPool {
 
     /// The banded tail that has written nothing since a tail last changed hands
     ///
-    /// Death windows advance, so a band that has stopped writing is one whose window
-    /// has passed and its tail is free to take. A band still writing keeps its tail:
-    /// that is what stops a caller holding more live bands than there are tails from
-    /// paying a seal per record, since those bands write unbanded instead.
+    /// The whole of the pool's rotation on a volume that never moves its floor.
     fn stalest(&self, owner: &[Option<Band>]) -> Option<usize> {
         let bar = self.handed_over.load(Ordering::Relaxed);
         let mut chosen = None;

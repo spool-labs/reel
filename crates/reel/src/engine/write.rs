@@ -4,7 +4,6 @@ use std::sync::atomic::Ordering;
 
 use crate::append::{BatchRecord, BatchWrite, Commit, Committed};
 use crate::error::{ReelError, Result};
-use crate::format::band::Band;
 use crate::format::column::RecordKey;
 
 use super::{read_only, BatchKey, KeyOp, Planned, RecordWrite, ReelStore};
@@ -18,27 +17,10 @@ impl ReelStore {
     }
 
     /// Owned-payload put that hands the buffer to the tail without a copy
-    pub fn put_owned(&self, key: &RecordKey, payload: Vec<u8>) -> Result<()> {
-        self.put_owned_banded(key, payload, None)
-    }
-
-    /// The same put in a band, which places it beside what dies when it does
     ///
-    /// The band is the caller's own window number: records carrying the same one go to
-    /// the same tail, so the segment they fill can be reclaimed by unlinking it rather
-    /// than by copying whatever outlived it. Nothing checks the number and nothing
-    /// requires it to be right; a wrong band costs placement and nothing else.
-    pub fn put_banded(&self, key: &RecordKey, payload: &[u8], band: Band) -> Result<()> {
-        self.put_owned_banded(key, payload.to_vec(), Some(band))
-    }
-
-    /// Owned-payload put into a band, or into the unbanded tails where there is none
-    pub fn put_owned_banded(
-        &self,
-        key: &RecordKey,
-        payload: Vec<u8>,
-        band: Option<Band>,
-    ) -> Result<()> {
+    /// A column placed by its purge mark is banded off the key; every other routes to
+    /// the least loaded tail.
+    pub fn put_owned(&self, key: &RecordKey, payload: Vec<u8>) -> Result<()> {
         let planned = self.plan_put(key, payload)?;
         // The tail owns the key it queues, and the index insert below needs it too.
         let committed = self.reel.put(
@@ -46,7 +28,6 @@ impl ReelStore {
             planned.payload,
             planned.codec,
             Commit::PerRecord,
-            band,
         )?;
         self.index
             .insert(key, committed.loc, committed.lsn, planned.carried)?;
@@ -58,16 +39,6 @@ impl ReelStore {
     /// The record reaches the device on this thread either way; what is awaited is
     /// admission and the sync.
     pub async fn put_owned_wait(&self, key: &RecordKey, payload: Vec<u8>) -> Result<()> {
-        self.put_owned_banded_wait(key, payload, None).await
-    }
-
-    /// The awaited put in a band
-    pub async fn put_owned_banded_wait(
-        &self,
-        key: &RecordKey,
-        payload: Vec<u8>,
-        band: Option<Band>,
-    ) -> Result<()> {
         let planned = self.plan_put(key, payload)?;
         let committed = self
             .reel
@@ -76,7 +47,6 @@ impl ReelStore {
                 planned.payload,
                 planned.codec,
                 Commit::PerRecord,
-                band,
             )
             .await?;
         self.index
@@ -123,18 +93,14 @@ impl ReelStore {
     /// Apply a batch of writes as one reservation, one write, and one sync
     ///
     /// A batch is one durability point: the sync is taken once the last record has
-    /// landed, and the index moves only after it comes back clean.
+    /// landed, and the index moves only after it comes back clean. One tail takes all
+    /// of it, so a placed batch takes the band covering the last of it to die.
     pub fn apply_batch(&self, writes: Vec<RecordWrite>) -> Result<()> {
-        self.apply_batch_banded(writes, None)
-    }
-
-    /// The same batch placed in a band, since one tail takes all of it
-    pub fn apply_batch_banded(&self, writes: Vec<RecordWrite>, band: Option<Band>) -> Result<()> {
         let Some((records, keys)) = self.plan_batch(writes)? else {
             return Ok(());
         };
 
-        let committed = self.reel.write_batch(records, band)?;
+        let committed = self.reel.write_batch(records)?;
         self.reel.sync_if_owed()?;
         self.publish_batch(&keys, &committed)
     }
@@ -144,20 +110,11 @@ impl ReelStore {
     /// The plan and the publish are the blocking batch's own, so the only thing a
     /// row racing the doors sees is where the two waits went.
     pub async fn apply_batch_wait(&self, writes: Vec<RecordWrite>) -> Result<()> {
-        self.apply_batch_banded_wait(writes, None).await
-    }
-
-    /// The awaited batch placed in a band
-    pub async fn apply_batch_banded_wait(
-        &self,
-        writes: Vec<RecordWrite>,
-        band: Option<Band>,
-    ) -> Result<()> {
         let Some((records, keys)) = self.plan_batch(writes)? else {
             return Ok(());
         };
 
-        let committed = self.reel.write_batch_wait(records, band).await?;
+        let committed = self.reel.write_batch_wait(records).await?;
         self.reel.sync_if_owed_wait().await?;
         self.publish_batch(&keys, &committed)
     }

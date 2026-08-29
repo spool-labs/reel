@@ -732,20 +732,10 @@ impl ReelStore {
 
     /// Banded writes that found no tail free and went to the unbanded ones instead
     ///
-    /// A number that keeps climbing says the volume holds more live bands than it has
-    /// tails, so the placement the caller asked for is not the one it is getting.
+    /// A number that keeps climbing says the volume holds more live death windows than
+    /// it has tails, so the placement its keys ask for is not the one they are getting.
     pub fn band_fallbacks(&self) -> u64 {
         self.reel.band_fallbacks()
-    }
-
-    /// Give a closed window's tail back, sealing it behind the band
-    ///
-    /// A caller that knows when a window stops taking writes hands its tail back here
-    /// rather than leaving the pool to work it out, which is the difference between a
-    /// pool sized for the windows that are live and one sized for every window ever
-    /// opened. False where no tail was on the band.
-    pub fn release_band(&self, band: Band) -> Result<bool> {
-        self.reel.release_band(band)
     }
 
     /// Whether windows may still be read around the page cache on this volume

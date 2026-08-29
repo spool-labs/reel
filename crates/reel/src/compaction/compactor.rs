@@ -21,16 +21,13 @@ use crate::format::record::{peek_key_width, read_u32_le, RecordHeader, HEADER_LE
 use crate::format::segment_header::SegmentHeader;
 use crate::index::map::ReelIndex;
 use crate::reel::segment::{SegmentHandle, SegmentReader, READ_CHUNK};
-use crate::reel::{Reel, ReelShared};
+use crate::reel::{Reel, ReelShared, NOTHING_PURGED};
 use crate::sync::{lock, try_lock};
 
 use crate::compaction::pressure::{GcPressure, PassPace, RateGate, RateLimiter};
 
 /// Bytes at the end of a sealed segment holding its footer length and magic
 const TRAILER_LEN: u64 = 8;
-
-/// The floor of a volume that has purged nothing, which no key sits below
-const NOTHING_PURGED: u64 = 0;
 
 /// Earnings one scrub pass will carry over from a stretch with no ticks in it
 ///
@@ -343,9 +340,6 @@ pub struct Compactor {
     /// Counters the maintenance plane publishes
     metrics: Metrics,
 
-    /// Purge floor every column with a mark is measured against
-    purge_floor: AtomicU64,
-
     /// Segments a pass is rewriting right now, so a second pass picks another
     in_flight: Mutex<std::collections::HashSet<SegmentId>>,
 
@@ -483,7 +477,6 @@ impl Compactor {
                 .unwrap_or(0),
             demote_after_bytes,
             metrics: Metrics::new(),
-            purge_floor: AtomicU64::new(NOTHING_PURGED),
         }
     }
 
@@ -930,7 +923,7 @@ impl Compactor {
                                 // the record, not the pass
                                 None => continue,
                             };
-                        let payload = self.stage_payload(index, reader, &record, segment)?;
+                        let payload = self.stage_payload(reel, index, reader, &record, segment)?;
                         staged.push((position, record, payload));
                     }
                 }
@@ -995,6 +988,7 @@ impl Compactor {
     /// fill the cap with dead weight.
     fn stage_payload(
         &self,
+        reel: &Reel,
         index: &ReelIndex,
         reader: &mut SegmentReader<'_>,
         record: &SourceRecord,
@@ -1013,7 +1007,7 @@ impl Compactor {
         if !live {
             return Ok(Staged::Dead);
         }
-        if self.is_purged(index, &header.key) {
+        if is_purged(reel.shared().purge_floor(), index, &header.key) {
             return Ok(Staged::Live(None));
         }
         read_payload(reader, record).map(|payload| Staged::Live(Some(payload)))
@@ -1103,19 +1097,6 @@ impl Compactor {
         footer_order(&footer)
     }
 
-    /// Move the floor everything below which is finished
-    ///
-    /// A record whose column marks its keys and whose mark falls below this is dropped
-    /// by the next pass over its segment rather than copied forward.
-    pub fn purge_below(&self, floor: u64) {
-        self.purge_floor.fetch_max(floor, Ordering::AcqRel);
-    }
-
-    /// The floor a pass drops records below
-    pub fn purge_floor(&self) -> u64 {
-        self.purge_floor.load(Ordering::Acquire)
-    }
-
     /// Punch the dead runs out of sealed segments, and say what came back
     ///
     /// Sealed, footer-bearing segments only: a rebuild reads those from their footers
@@ -1195,23 +1176,6 @@ impl Compactor {
             }
         }
         Ok(report)
-    }
-
-    /// Whether the purge floor has passed this key, so its record is finished
-    ///
-    /// A column that does not mark its keys never answers yes, whatever the floor is.
-    fn is_purged(&self, index: &ReelIndex, key: &RecordKey) -> bool {
-        let floor = self.purge_floor.load(Ordering::Acquire);
-        if floor == NOTHING_PURGED {
-            return false;
-        }
-        match index
-            .spec(key.column)
-            .and_then(|spec| spec.mark_of(key.as_slice()))
-        {
-            Some(mark) => mark < floor,
-            None => false,
-        }
     }
 
     /// A row that can be this value's only home, when everything about it allows one
@@ -1360,7 +1324,7 @@ impl Compactor {
         // A record the floor has passed is dropped and its key goes with it. No
         // tombstone is written: the key is below a floor the whole volume agrees on, so
         // absence tells a later reader everything one would.
-        if self.is_purged(index, &record.header.key) {
+        if is_purged(reel.shared().purge_floor(), index, &record.header.key) {
             index.evict_at(&record.header.key, loc)?;
             self.metrics.record_purged(1);
             return Ok(CopyStep::Skipped);
@@ -1718,6 +1682,20 @@ impl Compactor {
     }
 }
 
+/// Whether the purge floor has passed this key, so its record is finished
+fn is_purged(floor: u64, index: &ReelIndex, key: &RecordKey) -> bool {
+    if floor == NOTHING_PURGED {
+        return false;
+    }
+    match index
+        .spec(key.column)
+        .and_then(|spec| spec.mark_of(key.as_slice()))
+    {
+        Some(mark) => mark < floor,
+        None => false,
+    }
+}
+
 /// The tail this pass copies its survivors into
 fn destination(reel: &Reel, band: Option<Band>) -> Result<usize> {
     // A volume that rewrites at seal keeps a tail back for exactly this, since a run
@@ -2060,7 +2038,7 @@ mod tests {
         CompactRate, Preallocate, ReelConfig, SyncPolicy, ThreadBudget, DEFAULT_FD_CACHE,
     };
     use crate::format::column::{
-        Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, RecordKey,
+        Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, PurgeMark, RecordKey,
     };
     use crate::format::segment_header::SEGMENT_HEADER_SPAN;
     use crate::index::entry::span_of;
@@ -2098,7 +2076,7 @@ mod tests {
         shard_bytes: 0,
         inline_max: 0,
         row_carry: 0,
-        purge_mark: Some(0),
+        purge_mark: Some(PurgeMark::at(0)),
         codec: Codec::None,
         map_shape: MapShape::Tree,
     }];
@@ -2173,7 +2151,7 @@ mod tests {
     fn put(fixture: &Fixture, byte: u8, payload: Vec<u8>) {
         let committed = fixture
             .reel
-            .put(key(byte), payload, 0, Commit::PerRecord, None)
+            .put(key(byte), payload, 0, Commit::PerRecord)
             .expect("put");
         fixture
             .index
@@ -2332,13 +2310,7 @@ mod tests {
             let key = marked_key(mark, 0);
             let committed = fixture
                 .reel
-                .put(
-                    key.clone(),
-                    vec![mark as u8; 200],
-                    0,
-                    Commit::PerRecord,
-                    None,
-                )
+                .put(key.clone(), vec![mark as u8; 200], 0, Commit::PerRecord)
                 .expect("put");
             fixture
                 .index
@@ -2347,7 +2319,7 @@ mod tests {
         }
         seal(&fixture);
 
-        fixture.compactor.purge_below(4);
+        fixture.reel.shared().purge_below(4);
         fixture
             .compactor
             .compact_segment(&fixture.reel, &fixture.index, SegmentId(1))
@@ -2383,7 +2355,7 @@ mod tests {
         put(&fixture, 2, vec![0x22; 200]);
         seal(&fixture);
 
-        fixture.compactor.purge_below(u64::MAX);
+        fixture.reel.shared().purge_below(u64::MAX);
         fixture
             .compactor
             .compact_segment(&fixture.reel, &fixture.index, SegmentId(1))
@@ -2400,10 +2372,10 @@ mod tests {
     fn the_floor_only_rises() {
         let fixture = fixture_over(settings(), MARKED);
 
-        fixture.compactor.purge_below(10);
-        fixture.compactor.purge_below(4);
+        fixture.reel.shared().purge_below(10);
+        fixture.reel.shared().purge_below(4);
 
-        assert_eq!(fixture.compactor.purge_floor(), 10);
+        assert_eq!(fixture.reel.shared().purge_floor(), 10);
     }
 
     // a fully dead segment is unlinked whole with no rewrite
@@ -2685,7 +2657,7 @@ mod tests {
         drop(
             fixture
                 .reel
-                .put(key(1), vec![0x11; 200], 0, Commit::PerRecord, None)
+                .put(key(1), vec![0x11; 200], 0, Commit::PerRecord)
                 .expect("orphan"),
         );
         seal(&fixture);
@@ -3303,7 +3275,7 @@ mod tests {
                 let key = RecordKey::from_bytes(RECORDS, &bytes).expect("key");
                 let committed = fixture
                     .reel
-                    .put(key.clone(), payload.clone(), 0, Commit::PerRecord, None)
+                    .put(key.clone(), payload.clone(), 0, Commit::PerRecord)
                     .expect("put");
                 fixture
                     .index

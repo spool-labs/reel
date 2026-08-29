@@ -155,7 +155,7 @@ fn put_and_delete_commit() {
     let reel = Reel::open(shared).expect("open");
 
     let put = reel
-        .put(key(1), vec![0x11; 400], 0, Commit::PerRecord, None)
+        .put(key(1), vec![0x11; 400], 0, Commit::PerRecord)
         .expect("put");
     assert_eq!(put.lsn, Lsn(1));
     let delete = reel.delete(key(2), Commit::PerRecord).expect("delete");
@@ -185,7 +185,7 @@ fn reads_back_by_key() {
     let (shared, _sim) = harness(1);
     let reel = Reel::open(shared).expect("open");
     let committed = reel
-        .put(key(9), vec![0x99; 300], 0, Commit::PerRecord, None)
+        .put(key(9), vec![0x99; 300], 0, Commit::PerRecord)
         .expect("put");
     reel.flush().expect("flush");
 
@@ -206,10 +206,10 @@ fn reads_reject_a_superseded_version() {
     let (shared, _sim) = harness(1);
     let reel = Reel::open(shared).expect("open");
     let first = reel
-        .put(key(7), vec![0x11; 300], 0, Commit::PerRecord, None)
+        .put(key(7), vec![0x11; 300], 0, Commit::PerRecord)
         .expect("put");
     let second = reel
-        .put(key(7), vec![0x22; 300], 0, Commit::PerRecord, None)
+        .put(key(7), vec![0x22; 300], 0, Commit::PerRecord)
         .expect("put");
     reel.flush().expect("flush");
 
@@ -241,14 +241,8 @@ fn concurrent_appends_across_tails() {
         let barrier = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
             barrier.wait();
-            reel.put(
-                key(byte + 1),
-                vec![byte + 1; 300],
-                0,
-                Commit::PerRecord,
-                None,
-            )
-            .expect("put")
+            reel.put(key(byte + 1), vec![byte + 1; 300], 0, Commit::PerRecord)
+                .expect("put")
         }));
     }
     let mut located = BTreeSet::new();

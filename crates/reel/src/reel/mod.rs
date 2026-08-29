@@ -24,14 +24,14 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use crate::append::admission::InflightBudget;
-use crate::append::{Appender, BatchRecord, Commit, Committed};
+use crate::append::{Appender, BatchRecord, BatchWrite, Commit, Committed};
 use crate::config::{PointReads, RangedReads, ReelConfig};
 use crate::error::{ReelError, Result};
 use std::sync::OnceLock;
 
 use crate::format::band::Band;
 use crate::format::block::{lookup_in_span, FooterMap, RowBlock};
-use crate::format::column::{ColumnId, ColumnSet, KeyRef, RecordKey};
+use crate::format::column::{ColumnId, ColumnSet, KeyRef, PurgeMark, RecordKey};
 use crate::format::fence::{FenceCut, FenceReach};
 use crate::format::footer::{FooterFind, FooterRow, FooterTally, SegmentFooter};
 use crate::format::loc::{Loc, SegmentId};
@@ -56,6 +56,9 @@ use read::{
 
 /// The first segment number a fresh reel numbers from
 const FIRST_SEGMENT: u32 = 1;
+
+/// The floor of a volume that has purged nothing, which no key sits below
+pub const NOTHING_PURGED: u64 = 0;
 
 /// Slots in the lookup from a column identifier to what it declared
 const COLUMN_SLOTS: usize = 256;
@@ -179,6 +182,12 @@ pub struct ReelShared {
 
     /// Inline width per column identifier, so a record's is one index rather than a scan
     row_carries: Vec<u16>,
+
+    /// The mark of each column placed by it, so a write's band is one index
+    placement_marks: Vec<Option<PurgeMark>>,
+
+    /// Timeline position everything below which the volume is finished with
+    purge_floor: AtomicU64,
 
     /// Monotonic segment number every tail draws from
     next_segment: AtomicU32,
@@ -343,8 +352,10 @@ impl ReelShared {
         next_segment: u32,
     ) -> ReelShared {
         let mut row_carries = vec![0u16; COLUMN_SLOTS];
+        let mut placement_marks = vec![None; COLUMN_SLOTS];
         for spec in columns {
             row_carries[spec.id.as_index()] = spec.row_carry_width();
+            placement_marks[spec.id.as_index()] = spec.placement_mark();
         }
         // The primary root stays first: the lock and the manifest live on it, and
         // it is always the fast tier.
@@ -369,6 +380,8 @@ impl ReelShared {
             config,
             columns,
             row_carries,
+            placement_marks,
+            purge_floor: AtomicU64::new(NOTHING_PURGED),
             next_segment: AtomicU32::new(next_segment.max(FIRST_SEGMENT)),
             sealed_pending: Mutex::new(Vec::new()),
             sealed_waiting: AtomicBool::new(false),
@@ -413,6 +426,22 @@ impl ReelShared {
     /// Bytes a column asks a footer row to carry of the value itself
     pub fn row_carry(&self, column: ColumnId) -> u16 {
         self.row_carries[column.as_index()]
+    }
+
+    /// The band a write of this key belongs in, for a column placed by its mark
+    pub fn band_of(&self, key: &RecordKey) -> Option<Band> {
+        let mark = self.placement_marks[key.column.as_index()]?;
+        Some(Band::of(mark.read(key.as_slice()), self.purge_floor()))
+    }
+
+    /// Move the floor everything below which the volume is finished with, upwards only
+    pub fn purge_below(&self, floor: u64) {
+        self.purge_floor.fetch_max(floor, Ordering::AcqRel);
+    }
+
+    /// The floor compaction drops records below, and bands are measured from
+    pub fn purge_floor(&self) -> u64 {
+        self.purge_floor.load(Ordering::Acquire)
     }
 
     /// A handle on a segment file, from the descriptor cache or from a fresh open
@@ -1010,16 +1039,16 @@ impl Reel {
         self.shared.cold_depth.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Append or overwrite a payload, routed to the tail the band names
+    /// Append or overwrite a payload, routed to the tail its key's band is on
     pub fn put(
         &self,
         key: RecordKey,
         payload: Vec<u8>,
         codec: u8,
         commit: Commit,
-        band: Option<Band>,
     ) -> Result<Committed> {
-        self.route(band)?.append_data(key, payload, codec, commit)
+        self.route(self.shared.band_of(&key))?
+            .append_data(key, payload, codec, commit)
     }
 
     /// The same append awaited, taking its durability point on the async door
@@ -1032,17 +1061,16 @@ impl Reel {
         payload: Vec<u8>,
         codec: u8,
         commit: Commit,
-        band: Option<Band>,
     ) -> Result<Committed> {
-        self.route(band)?
+        self.route(self.shared.band_of(&key))?
             .append_data_wait(key, payload, codec, commit)
             .await
     }
 
     /// Append a tombstone for one key, routed to the least-loaded tail
     ///
-    /// A tombstone names no band: it dies when compaction can drop it rather than when
-    /// the record it hides was going to die.
+    /// A tombstone takes no band, whatever its key says: it dies when compaction can
+    /// drop it rather than when the record it hides was going to die.
     pub fn delete(&self, key: RecordKey, commit: Commit) -> Result<Committed> {
         self.route(None)?.append_tombstone(key, commit)
     }
@@ -1061,23 +1089,17 @@ impl Reel {
     ///
     /// Everything the batch carries lands together or not at all: the records go down
     /// back to back behind a frame declaring their count and their span, and a rebuild
-    /// keeps the run only when it reads exactly what the frame declared. One band
-    /// covers the batch, since one tail takes all of it.
-    pub fn write_batch(
-        &self,
-        records: Vec<BatchRecord>,
-        band: Option<Band>,
-    ) -> Result<Vec<Committed>> {
-        self.route(band)?.append_batch(records)
+    /// keeps the run only when it reads exactly what the frame declared. One tail takes
+    /// all of it, so one band covers it.
+    pub fn write_batch(&self, records: Vec<BatchRecord>) -> Result<Vec<Committed>> {
+        self.route(self.batch_band(&records))?.append_batch(records)
     }
 
     /// The same batch awaited, admitted without holding a thread for the budget
-    pub async fn write_batch_wait(
-        &self,
-        records: Vec<BatchRecord>,
-        band: Option<Band>,
-    ) -> Result<Vec<Committed>> {
-        self.route(band)?.append_batch_wait(records).await
+    pub async fn write_batch_wait(&self, records: Vec<BatchRecord>) -> Result<Vec<Committed>> {
+        self.route(self.batch_band(&records))?
+            .append_batch_wait(records)
+            .await
     }
 
     /// The band each foreground tail is drawing under, for a caller reporting placement
@@ -1090,17 +1112,29 @@ impl Reel {
         self.bands.fallbacks()
     }
 
-    /// Give a closed window's tail back to the pool
-    pub fn release_band(&self, band: Band) -> Result<bool> {
-        self.bands.release(self.foreground(), band)
-    }
-
     /// The tail a write of this band belongs in, claiming one where the band has none
     ///
     /// Compaction places its survivors through here too, so a rewritten record ends up
     /// beside the fresh records of its own window rather than back in the mixture.
     pub fn place(&self, band: Option<Band>) -> Result<usize> {
-        self.bands.place(self.foreground(), band)
+        self.bands
+            .place(self.foreground(), band, self.shared.purge_floor())
+    }
+
+    /// The band covering a whole batch, which is the last of its records to die
+    fn batch_band(&self, records: &[BatchRecord]) -> Option<Band> {
+        let mut widest = None;
+        for record in records {
+            // Anything unplaced takes the batch out of every band, since a window is
+            // only worth unlinking whole if everything in it is dead by the number.
+            match record.write {
+                BatchWrite::Put(_, _) => {}
+                BatchWrite::Delete | BatchWrite::DeleteRange(_) => return None,
+            }
+            let band = self.shared.band_of(&record.key)?;
+            widest = Some(widest.map_or(band, |held: Band| held.max(band)));
+        }
+        widest
     }
 
     /// Sync every active tail
@@ -1748,8 +1782,8 @@ impl Reel {
 
     /// The tail a foreground write goes to
     ///
-    /// A write naming no band goes to the least loaded tail, and on a volume nothing
-    /// has ever banded that is the whole of it: the pool is asked one relaxed load
+    /// A write in no band goes to the least loaded tail, and on a volume whose columns
+    /// declare no placement that is the whole of it: the pool is asked one relaxed load
     /// first and stays out of the way. A banded write goes to the tail that band is on,
     /// which may cost a claim.
     ///
@@ -1771,7 +1805,10 @@ impl Reel {
             }
             return Ok(chosen);
         }
-        Ok(&foreground[self.bands.place(foreground, band)?])
+        let at = self
+            .bands
+            .place(foreground, band, self.shared.purge_floor())?;
+        Ok(&foreground[at])
     }
 }
 

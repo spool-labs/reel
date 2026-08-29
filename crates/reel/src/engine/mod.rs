@@ -27,6 +27,7 @@ use crate::append::admission::InflightBudget;
 use crate::compaction::compactor::{CompactionCounters, Compactor};
 use crate::config::{ReelConfig, DEFAULT_FD_CACHE};
 use crate::error::{ReelError, Result};
+use crate::format::band::Band;
 use crate::format::column::{spec_by_name, ColumnId, ColumnSet, ColumnSpec, RecordKey};
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::SegmentId;
@@ -722,6 +723,29 @@ impl ReelStore {
     /// A read of the maintenance counters
     pub fn compaction_counters(&self) -> CompactionCounters {
         self.compactor.counters()
+    }
+
+    /// The band each foreground tail is drawing under right now
+    pub fn tail_bands(&self) -> Vec<Option<Band>> {
+        self.reel.tail_bands()
+    }
+
+    /// Banded writes that found no tail free and went to the unbanded ones instead
+    ///
+    /// A number that keeps climbing says the volume holds more live bands than it has
+    /// tails, so the placement the caller asked for is not the one it is getting.
+    pub fn band_fallbacks(&self) -> u64 {
+        self.reel.band_fallbacks()
+    }
+
+    /// Give a closed window's tail back, sealing it behind the band
+    ///
+    /// A caller that knows when a window stops taking writes hands its tail back here
+    /// rather than leaving the pool to work it out, which is the difference between a
+    /// pool sized for the windows that are live and one sized for every window ever
+    /// opened. False where no tail was on the band.
+    pub fn release_band(&self, band: Band) -> Result<bool> {
+        self.reel.release_band(band)
     }
 
     /// Whether windows may still be read around the page cache on this volume

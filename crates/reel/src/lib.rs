@@ -34,6 +34,7 @@ pub use config::{
 pub use engine::index_checkpoint::IndexCheckpoint;
 pub use engine::{CompactPass, RecordWrite, ReelStore, Totals};
 pub use error::{ReelError, Result};
+pub use format::band::Band;
 pub use format::column::{
     inline_bytes, Codec, ColumnId, ColumnSet, ColumnSpec, InlineBytes, KeyBytes, KeyRef, KeyWidth,
     MapShape, RecordKey, INLINE_KEY_LEN, INLINE_MAX, MARK_LEN, MAX_KEY_LEN,

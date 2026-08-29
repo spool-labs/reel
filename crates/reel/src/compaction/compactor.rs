@@ -11,12 +11,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::{ReelConfig, RepairPath, VolumeClass};
 use crate::error::Result;
+use crate::format::band::Band;
 use crate::format::column::RecordKey;
 use crate::format::footer::FooterEntry;
 use crate::format::footer::{FooterPartition, SegmentFooter, FIXED_TAIL_LEN, NO_RECORD};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{peek_key_width, read_u32_le, RecordHeader, HEADER_LEN};
+use crate::format::segment_header::SegmentHeader;
 use crate::index::map::ReelIndex;
 use crate::reel::segment::{SegmentHandle, SegmentReader, READ_CHUNK};
 use crate::reel::{Reel, ReelShared};
@@ -740,15 +742,21 @@ impl Compactor {
         // key order where the segment can say what that is, offset order otherwise
         let order = self.rewrite_order(shared, segment);
         let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
-        let dest_index = least_loaded_tail(reel);
+        // The band the source was drawn under is where its survivors belong. Placement
+        // the writer paid for is undone otherwise: every rewrite would put a window's
+        // records back into the mixture they were kept out of.
+        let band = band_of(shared, &source)?;
+        let dest_index = destination(reel, band)?;
 
-        // Only the reserved tail answers to a named tier, since a foreground destination
-        // mixes fresh puts in and fresh puts stay fast. A leftover active segment from
-        // the other tier is sealed away so the swap draws under the tier just set.
+        // Only the reserved tail answers to a named tier and to the source's band, since
+        // a foreground destination mixes fresh puts in and fresh puts stay fast. A
+        // leftover active segment from another tier or another band is sealed away so
+        // the swap draws under what this pass just set.
         if reel.reserved_tail() == Some(dest_index) {
             let class = self.output_class(shared, segment);
             let dest = &reel.tails()[dest_index];
             dest.set_draw_class(class);
+            dest.set_band(band)?;
             let active = dest.tail().active_segment();
             if shared.volumes.class_of(shared.volumes.root_of(active)) != class {
                 dest.seal()?;
@@ -1710,22 +1718,46 @@ impl Compactor {
     }
 }
 
-fn least_loaded_tail(reel: &Reel) -> usize {
+/// The tail this pass copies its survivors into
+fn destination(reel: &Reel, band: Option<Band>) -> Result<usize> {
     // A volume that rewrites at seal keeps a tail back for exactly this, since a run
     // copied in key order stops being one the moment a foreground put lands inside it.
     if let Some(reserved) = reel.reserved_tail() {
-        return reserved;
+        return Ok(reserved);
     }
-    let mut chosen = 0usize;
-    let mut lowest = u64::MAX;
-    for (index, tail) in reel.tails().iter().enumerate() {
-        let load = tail.load();
-        if load < lowest {
-            lowest = load;
-            chosen = index;
-        }
+    // Otherwise the survivors route the way a fresh write of the same band would: into
+    // the tail that band is on, and into the least loaded unbanded tail where the
+    // source carried no band at all.
+    reel.place(band)
+}
+
+/// The band a sealed segment was drawn under, read off its own header record
+///
+/// One small read at the head of a pass that is about to read the whole file, so a
+/// band comes from the segment rather than from a table a restart would lose. A file
+/// whose head does not read as a segment header answers nothing: the pass that follows
+/// is the one that decides what to do about it.
+fn band_of(shared: &Arc<ReelShared>, source: &SegmentHandle) -> Result<Option<Band>> {
+    let head = shared.driver.pread(source.file(), 0, HEADER_LEN as u64)?;
+    if head.len() < HEADER_LEN {
+        return Ok(None);
     }
-    chosen
+    let Ok(header) = RecordHeader::unpack(&head) else {
+        return Ok(None);
+    };
+    if !header.flags.is_segment_header() {
+        return Ok(None);
+    }
+    let payload =
+        shared
+            .driver
+            .pread(source.file(), HEADER_LEN as u64, u64::from(header.length))?;
+    if payload.len() < header.length as usize || !header.verify(&payload) {
+        return Ok(None);
+    }
+    Ok(SegmentHeader::unpack(&payload)
+        .map(|parsed| parsed.band)
+        .unwrap_or_default())
 }
 
 /// A handle on one sealed segment, from the descriptor cache or a fresh open

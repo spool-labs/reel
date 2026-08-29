@@ -49,8 +49,8 @@ const REFUSED_RECORD: u32 = 7;
 ///
 /// A plan pins faults to op positions rather than calls, so these are read off a run:
 /// at one tail syncing every put, they are the last two records' writes.
-const TORN_AT: u64 = 18;
-const ENOSPC_AT: u64 = 20;
+const TORN_AT: u64 = 19;
+const ENOSPC_AT: u64 = 21;
 
 /// Payload bytes that survive the tear, behind the header that describes them
 const TORN_PAYLOAD_BYTES: u64 = 8;

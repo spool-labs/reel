@@ -204,8 +204,8 @@ pub struct ReelShared {
     /// Lowest segment number anything still holds, or all ones when nothing does
     held_floor: AtomicU32,
 
-    /// Highest segment number given up on without a footer, or zero when none was
-    unsealed_high: AtomicU32,
+    /// Segments released without a footer, until one lands or their file goes
+    unsealed: Mutex<std::collections::HashSet<SegmentId>>,
 
     /// Segments retired holding acknowledged bytes no sync ever covered
     past_saving: AtomicU64,
@@ -387,7 +387,7 @@ impl ReelShared {
             sealed_waiting: AtomicBool::new(false),
             holds: RwLock::new(TBTreeMap::new()),
             held_floor: AtomicU32::new(u32::MAX),
-            unsealed_high: AtomicU32::new(0),
+            unsealed: Mutex::new(std::collections::HashSet::new()),
             past_saving: AtomicU64::new(0),
             broken_seals: Mutex::new(Vec::new()),
             cold_direct: AtomicBool::new(true),
@@ -713,18 +713,23 @@ impl ReelShared {
     /// The window that matters is between a tail rolling off a segment and the
     /// sealer's fsync returning: no tail owns it and its pages are still dirty. A
     /// segment given up on without a footer never gets that far, so the unsealed
-    /// mark answers before the holds do.
+    /// mark answers before the holds do. The mark names that segment and no other:
+    /// one dooming says nothing about the segments already sealed under it.
     pub fn is_settled(&self, id: SegmentId) -> bool {
-        let number = id.as_u32();
-        if number <= self.unsealed_high.load(Ordering::Relaxed) {
+        if lock(&self.unsealed).contains(&id) {
             return false;
         }
-        number < self.held_floor.load(Ordering::Relaxed) || !self.is_held(id)
+        id.as_u32() < self.held_floor.load(Ordering::Relaxed) || !self.is_held(id)
     }
 
     /// Note a segment released without its footer, which never reads as settled
     pub fn note_unsealed(&self, id: SegmentId) {
-        self.unsealed_high.fetch_max(id.as_u32(), Ordering::Relaxed);
+        lock(&self.unsealed).insert(id);
+    }
+
+    /// Take the mark off a segment that has landed a footer, or whose file has gone
+    pub fn forget_unsealed(&self, id: SegmentId) {
+        lock(&self.unsealed).remove(&id);
     }
 
     /// Count a segment retired holding acknowledged bytes no sync covered

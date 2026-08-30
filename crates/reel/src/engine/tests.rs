@@ -590,6 +590,7 @@ fn a_failed_seal_is_retried_on_the_tick() {
     // what makes a failed seal cost a past-saving count.
 
     // Every sync the seal takes fails, so the footer cannot be answered for.
+    let sealing = store.reel.tails()[0].tail().active_segment();
     sim.arm_next_ops(8, FaultKind::SyncError);
     store.reel.tails()[0]
         .seal()
@@ -599,10 +600,18 @@ fn a_failed_seal_is_retried_on_the_tick() {
         store.reel.shared().past_saving_count() > 0,
         "the failed seal counted nothing past saving"
     );
+    assert!(
+        !store.reel.shared().is_settled(sealing),
+        "a segment with no footer read as settled"
+    );
 
     let sealed = store.retry_broken_seals();
     assert_eq!(sealed, 1, "the parked seal did not land");
     assert_eq!(store.reel.shared().past_saving_count(), 0);
+    assert!(
+        store.reel.shared().is_settled(sealing),
+        "the retry's footer landed and the segment still read unsealed"
+    );
     store
         .flush()
         .expect("a volume with every seal down flushes clean");

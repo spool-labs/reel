@@ -863,6 +863,7 @@ impl Compactor {
         shared.fd_cache.remove(segment);
         // the footer goes with the file, or it answers for a segment that is not there
         shared.footers.forget(segment);
+        shared.forget_unsealed(segment);
         source.mark_doomed();
         drop(source);
 

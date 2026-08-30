@@ -792,6 +792,7 @@ fn retire_sources(
         compactor.forget_facts(source.segment);
         shared.fd_cache.remove(source.segment);
         shared.footers.forget(source.segment);
+        shared.forget_unsealed(source.segment);
         source.handle.mark_doomed();
         state.report.sources_retired += 1;
     }

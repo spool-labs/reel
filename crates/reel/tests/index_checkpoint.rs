@@ -12,8 +12,9 @@ mod harness;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use reel::format::loc::SegmentId;
 use reel::index::persisted::{PersistedIndex, PERSISTED_INDEX};
-use reel::io::fault::FaultPlan;
+use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::sync::rendezvous;
 use reel::{
@@ -221,6 +222,87 @@ fn a_stale_index_over_a_moved_volume() {
     let reopened = open(&restored, config(), TEST_COLUMNS);
 
     assert_agrees(&reopened, &memory, "with a stale index on the volume");
+}
+
+// a segment given up on unsealed costs the file that one segment and no other
+//
+// The mark a doom leaves is its own. Read as a floor instead, one lost sync near the
+// head takes every segment sealed under it out of the file, and a volume that ever
+// dooms anything writes an empty index from then on.
+#[test]
+fn a_doomed_segment_keeps_the_rest_closed() {
+    let sim = SimIo::new(FaultPlan::new(13));
+    let memory = MemoryStore::new();
+    let store = open(&sim, config(), TEST_COLUMNS);
+    run(
+        &store,
+        &memory,
+        &op_stream::generate_durable(13, STREAM_LEN),
+    );
+
+    // The put's sync fails, so the tail gives up on the segment it holds and rolls past
+    // it, leaving one file below the head with no footer behind it. The window is the
+    // put's own ops: a wider one would fail the fresh segment the roll draws.
+    let doomed = StreamOp::Put {
+        group: 7,
+        address: 0,
+        len: 300,
+        fill: 0xd0,
+    };
+    sim.arm_next_ops(2, FaultKind::SyncError);
+    let refused = apply_mutation(&store, &doomed);
+    sim.disarm();
+    assert!(refused.is_err(), "the armed sync error reached no put");
+    // The same record again, so the two stores hold what the failed one did not.
+    run(&store, &memory, &[doomed]);
+
+    let taken = store.checkpoint_index().expect("index checkpoint");
+    assert!(taken.keys > 0, "the file stood for no key");
+    store.close().expect("close");
+
+    let image = sim.durable_image();
+    let persisted =
+        PersistedIndex::unpack(&held(&image, &index_path()).expect("an index")).expect("unpack");
+    let named: Vec<SegmentId> = persisted
+        .segments
+        .iter()
+        .map(|stamp| stamp.segment)
+        .collect();
+    let highest = named
+        .iter()
+        .map(|segment| segment.as_u32())
+        .max()
+        .expect("the file names a segment");
+    let skipped: Vec<u32> = (1..highest)
+        .filter(|number| {
+            held(&image, &root().join(segment_file_name(SegmentId(*number)))).is_some()
+        })
+        .filter(|number| !named.contains(&SegmentId(*number)))
+        .collect();
+    assert_eq!(
+        skipped.len(),
+        1,
+        "the file skipped segments {skipped:?}, and only the doomed one is outstanding",
+    );
+
+    let holding = SimIo::from_image(image.clone());
+    let reading = open(&holding, config(), TEST_COLUMNS);
+    let with_index = holding.read_count();
+
+    let bare = SimIo::from_image(without_file(&image, &index_path()));
+    let sweeping = open(&bare, config(), TEST_COLUMNS);
+    let sweeping_reads = bare.read_count();
+
+    assert_eq!(
+        observe(&reading).records,
+        observe(&sweeping).records,
+        "the two opens disagree about what the volume holds",
+    );
+    assert!(
+        with_index < sweeping_reads,
+        "the open with a file read {with_index} times against the sweep's {sweeping_reads}, so it swept too",
+    );
+    assert_agrees(&reading, &memory, "with a doomed segment under the file");
 }
 
 /// Segments a file names that still stand at the length it recorded, and how many it names

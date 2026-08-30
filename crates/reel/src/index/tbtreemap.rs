@@ -1,11 +1,11 @@
 //! `TBTreeMap`: a B+ tree shaped for what a shard actually holds
 //!
 //! Nodes live in two arenas, leaves in one `Vec` and inner nodes in another, with a
-//! child an index and a tag bit rather than a pointer. A node is searched on the
-//! leading eight bytes of every key, kept as a `u64` beside them, with full keys
-//! consulted only where those tie. The leaves are chained both ways, so an ordered
-//! walk runs backwards at the speed it runs forwards, and a tree holds nothing until
-//! something is put in it.
+//! child an index and a tag bit rather than a pointer. A node is searched on eight
+//! bytes of every key, kept as a `u64` beside them and read from past whatever that
+//! node's own keys share, with full keys consulted only where those tie. The leaves
+//! are chained both ways, so an ordered walk runs backwards at the speed it runs
+//! forwards, and a tree holds nothing until something is put in it.
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
@@ -27,9 +27,9 @@ pub trait TreeKey: Ord + Clone + Borrow<Self::Probe> + Sized {
 
     /// Which word a node searches its lead array with
     ///
-    /// `Whole` for a key whose leading bytes already discriminate, which is every
-    /// fixed column. `Shared` for one carrying a bucket or a namespace in front,
-    /// where the lead has to be read from past the bytes the node's keys share.
+    /// `Whole` for a key whose leading bytes always discriminate, which is a number.
+    /// `Shared` for bytes, where a scan prefix or a bucket in front leaves the lead
+    /// reading what every key in the node holds identically.
     type Window: LeadWindow<Self>;
 
     /// A key for a place a node has made but not filled
@@ -77,14 +77,14 @@ pub trait TreeKey: Ord + Clone + Borrow<Self::Probe> + Sized {
     fn separator(left: &Self, right: &Self) -> (Self, bool);
 }
 
-/// Where a probe sits against the bytes a node's entries have in common
+/// Which edge a probe takes that a node's window puts outside the node
+///
+/// A probe carrying the bytes the node's entries have in common has no edge: it is
+/// ordered against them by the lead, which is what the window hands back instead.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Place {
     /// Under everything the node holds, so the answer is its left edge
     Below,
-
-    /// Carrying the shared bytes, so the lead array decides
-    Inside,
 
     /// Over everything the node holds, so the answer is its right edge
     Above,
@@ -96,11 +96,17 @@ pub enum Place {
 /// key order across the entries of that one node. Nothing is asked to be monotone
 /// across nodes: a descent asks each node it lands on.
 pub trait LeadWindow<K: TreeKey>: Clone + Default {
-    /// The word this node's lead array is searched with, for a probe inside it
+    /// The word this node's lead array is searched with, for an entry it holds
+    ///
+    /// Only a node rebuilding its own leads asks this, since what it holds carries the
+    /// bytes it agreed on by construction. A search asks `word`.
     fn lead(&self, probe: &K::Probe) -> u64;
 
-    /// Whether the probe carries the bytes this node's entries share
-    fn place(&self, probe: &K::Probe) -> Place;
+    /// The word to search the leads with, or the edge a probe outside the node takes
+    ///
+    /// A placement and a lead read the same bytes of the same probe, and a search asks
+    /// for both at every node it lands on, so a window answers them together.
+    fn word(&self, probe: &K::Probe) -> Result<u64, Place>;
 
     /// Bytes of key this window is reading its lead from past, which nothing needs
     fn skipped(&self) -> usize;
@@ -116,7 +122,7 @@ pub trait LeadWindow<K: TreeKey>: Clone + Default {
         K::Probe: 'a;
 }
 
-/// The lead a key's own leading bytes make, which is what a fixed column takes
+/// The lead a key's own leading bytes make, which is what a number takes
 ///
 /// Zero sized, and every branch it decides folds away: a probe is always inside a
 /// window that shares nothing, and a node that never retunes never rebuilds a lead.
@@ -128,8 +134,8 @@ impl<K: TreeKey> LeadWindow<K> for Whole {
         K::head(probe)
     }
 
-    fn place(&self, _probe: &K::Probe) -> Place {
-        Place::Inside
+    fn word(&self, probe: &K::Probe) -> Result<u64, Place> {
+        Ok(K::head(probe))
     }
 
     fn skipped(&self) -> usize {
@@ -148,7 +154,7 @@ impl<K: TreeKey> LeadWindow<K> for Whole {
 ///
 /// An object key is a thirty-two byte bucket address and then a name, so anything
 /// under thirty-three leaves the lead reading bucket bytes and discriminating
-/// nothing.
+/// nothing. A fixed key caps at its own width instead, which is all it can share.
 pub const SHARED_CAP: usize = 128;
 
 /// The lead taken from past the bytes a node's own entries share
@@ -159,7 +165,7 @@ pub const SHARED_CAP: usize = 128;
 /// out, so nothing is left for the lead array to get wrong.
 #[derive(Clone)]
 pub struct Shared<const CAP: usize = SHARED_CAP> {
-    /// Bytes of `pre` the node's entries are known to agree on
+    /// Bytes of `pre` the node's entries are known to agree on, a word of them or none
     off: u16,
 
     /// The agreed bytes themselves, held inline so a placement chases no pointer
@@ -179,52 +185,118 @@ impl<const CAP: usize> Default for Shared<CAP> {
     }
 }
 
-impl<K: TreeKey<Probe = [u8]>, const CAP: usize> LeadWindow<K> for Shared<CAP> {
-    fn lead(&self, probe: &[u8]) -> u64 {
+impl<const CAP: usize> Shared<CAP> {
+    /// The eight bytes at the window, zero padded where the key runs out under it
+    fn at_window(&self, probe: &[u8]) -> u64 {
         let at = self.off as usize;
         let mut wide = [0u8; 8];
-        if at < probe.len() {
-            let take = (probe.len() - at).min(8);
-            wide[..take].copy_from_slice(&probe[at..at + take]);
+        // The whole word in one load where the key has eight bytes past the window,
+        // which is every fixed key wider than its shared run and most names.
+        if at + 8 <= probe.len() {
+            wide.copy_from_slice(&probe[at..at + 8]);
+        } else if at < probe.len() {
+            let take = probe.len() - at;
+            wide[..take].copy_from_slice(&probe[at..]);
         }
         u64::from_be_bytes(wide)
     }
 
-    fn place(&self, probe: &[u8]) -> Place {
+    /// Whether a probe carries the bytes the node agreed on, and its edge if it does not
+    ///
+    /// A window agreeing on nothing holds every probe inside itself, which is what a
+    /// node whose keys share less than a lead is left at.
+    fn inside(&self, probe: &[u8]) -> Result<(), Place> {
         let at = self.off as usize;
+        if at == 0 {
+            return Ok(());
+        }
         let cut = at.min(probe.len());
-        match probe[..cut].cmp(&self.pre[..cut]) {
-            Ordering::Less => Place::Below,
-            Ordering::Greater => Place::Above,
+        match against(&probe[..cut], &self.pre[..cut]) {
+            Ordering::Less => Err(Place::Below),
+            Ordering::Greater => Err(Place::Above),
             // A probe that runs out inside the shared bytes is a prefix of every
             // key the node holds, and a prefix sorts below what extends it.
-            Ordering::Equal if probe.len() < at => Place::Below,
-            Ordering::Equal => Place::Inside,
+            Ordering::Equal if probe.len() < at => Err(Place::Below),
+            Ordering::Equal => Ok(()),
         }
+    }
+}
+
+impl<K: TreeKey, const CAP: usize> LeadWindow<K> for Shared<CAP>
+where
+    K::Probe: AsRef<[u8]>,
+{
+    fn lead(&self, probe: &K::Probe) -> u64 {
+        self.at_window(probe.as_ref())
+    }
+
+    fn word(&self, probe: &K::Probe) -> Result<u64, Place> {
+        let probe = probe.as_ref();
+        self.inside(probe)?;
+        Ok(self.at_window(probe))
     }
 
     fn skipped(&self) -> usize {
         self.off as usize
     }
 
-    fn tune<'a>(&mut self, mut held: impl Iterator<Item = &'a [u8]>) -> bool {
+    fn tune<'a>(&mut self, held: impl Iterator<Item = &'a K::Probe>) -> bool
+    where
+        K::Probe: 'a,
+    {
+        let mut held = held.map(AsRef::as_ref);
         let Some(first) = held.next() else {
             return false;
         };
         let mut shared = first.len().min(CAP);
         for next in held {
             shared = shared.min(agreed::<CAP>(first, next));
-            if shared == 0 {
+            if shared < 8 {
                 break;
             }
         }
-        if shared == self.off as usize {
+        // A window narrower than the lead is dropped rather than kept. The lead is eight
+        // bytes wide, so a run shorter than that is one the lead already reads past, and
+        // moving the window there buys no discrimination and costs every probe the node
+        // sees a placement against bytes that were going to order it anyway.
+        let shared = match shared < 8 {
+            true => 0,
+            false => shared,
+        };
+        // The bytes settle it rather than the count of them: a node emptied and filled
+        // again agrees on as many bytes as it did and on other ones, and a window
+        // calling that unchanged would go on placing probes against what it used to
+        // hold. A count alone never moves at all where every key is one width.
+        if shared == self.off as usize && self.pre[..shared] == first[..shared] {
             return false;
         }
         self.off = shared as u16;
         self.pre[..shared].copy_from_slice(&first[..shared]);
         true
     }
+}
+
+/// How a probe's leading bytes sit against the ones a node's window holds
+///
+/// A word at a time, because `[u8]::cmp` over a run whose length is not a constant is
+/// a `memcmp` call and a descent pays one at every level it lands on. The tail is the
+/// bytes past the last whole word, at most seven of them.
+fn against(probe: &[u8], pre: &[u8]) -> Ordering {
+    let mut done = 0;
+    while done + 8 <= probe.len() {
+        let held = u64::from_be_bytes(probe[done..done + 8].try_into().expect("eight bytes"));
+        let want = u64::from_be_bytes(pre[done..done + 8].try_into().expect("eight bytes"));
+        if held != want {
+            return held.cmp(&want);
+        }
+        done += 8;
+    }
+    for (held, want) in probe[done..].iter().zip(&pre[done..]) {
+        if held != want {
+            return held.cmp(want);
+        }
+    }
+    Ordering::Equal
 }
 
 /// Leading bytes two probes agree on, up to what a window will hold
@@ -240,10 +312,11 @@ fn agreed<const CAP: usize>(left: &[u8], right: &[u8]) -> usize {
 /// A key of the width its column declared, held inline
 ///
 /// Short keys pad with zero, which keeps the order: the pad is the lowest byte, so a
-/// key that is a prefix of another still sorts below it.
+/// key that is a prefix of another still sorts below it. The window is capped at the
+/// width, since a node's entries cannot agree on more bytes than a key has.
 impl<const N: usize> TreeKey for [u8; N] {
     type Probe = [u8; N];
-    type Window = Whole;
+    type Window = Shared<N>;
 
     fn filler() -> [u8; N] {
         [0u8; N]
@@ -280,7 +353,10 @@ impl<const N: usize> TreeKey for [u8; N] {
         let mut cut = [0u8; N];
         let take = differs.map_or(N, |at| at + 1);
         cut[..take].copy_from_slice(&right[..take]);
-        (cut, take > 8)
+        // Held whole whatever the cut reaches: a node that retunes reads its
+        // separators again at the new offset, so one kept as a lead alone would
+        // leave a slot with nothing to rebuild from.
+        (cut, true)
     }
 }
 
@@ -640,12 +716,11 @@ fn seek<K: TreeKey>(
     len: usize,
     probe: &K::Probe,
 ) -> Result<usize, usize> {
-    match win.place(probe) {
-        Place::Below => return Err(0),
-        Place::Above => return Err(len),
-        Place::Inside => {}
-    }
-    let want = win.lead(probe);
+    let want = match win.word(probe) {
+        Ok(want) => want,
+        Err(Place::Below) => return Err(0),
+        Err(Place::Above) => return Err(len),
+    };
     let mut at = count_below(&leads[..len], want);
     while at < len && leads[at] == want {
         match keys[at].borrow().cmp(probe) {
@@ -657,6 +732,11 @@ fn seek<K: TreeKey>(
     Err(at)
 }
 
+/// The order is the layout, so the window sits on the line the length is read from
+///
+/// Left to the compiler the window lands past the values, a kilobyte from the length,
+/// and a search waits on a second line of the node to learn where to read its lead.
+#[repr(C)]
 struct Leaf<K: TreeKey, const B: usize, V: Default> {
     len: usize,
     win: K::Window,
@@ -667,6 +747,8 @@ struct Leaf<K: TreeKey, const B: usize, V: Default> {
     prev: u32,
 }
 
+/// Laid out like the leaf, and for the same reason
+#[repr(C)]
 struct Inner<K: TreeKey, const B: usize> {
     /// Separators the node routes by
     len: usize,
@@ -762,12 +844,11 @@ fn inner_seek<K: TreeKey, const B: usize>(inner: &Inner<K, B>, probe: &K::Probe)
     if inner.len == 0 {
         return 0;
     }
-    match inner.win.place(probe) {
-        Place::Below => return 0,
-        Place::Above => return inner.len,
-        Place::Inside => {}
-    }
-    let want = inner.win.lead(probe);
+    let want = match inner.win.word(probe) {
+        Ok(want) => want,
+        Err(Place::Below) => return 0,
+        Err(Place::Above) => return inner.len,
+    };
     let mut at = count_below(&inner.lead[..inner.len], want);
     // The cursor starts at the front and steps, so a whole tied walk costs one pass
     // over the spill rather than a search per slot.
@@ -786,10 +867,10 @@ fn inner_seek<K: TreeKey, const B: usize>(inner: &Inner<K, B>, probe: &K::Probe)
 /// The lead alone cannot order a probe the node's window puts outside itself, since
 /// its bytes at the window are not comparable with the ones held.
 fn rank<K: TreeKey>(win: &K::Window, probe: &K::Probe) -> (u8, u64) {
-    match win.place(probe) {
-        Place::Below => (0, 0),
-        Place::Inside => (1, win.lead(probe)),
-        Place::Above => (2, u64::MAX),
+    match win.word(probe) {
+        Ok(lead) => (1, lead),
+        Err(Place::Below) => (0, 0),
+        Err(Place::Above) => (2, u64::MAX),
     }
 }
 
@@ -1048,14 +1129,16 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         shift_spill(&mut inner.spill, slot);
         // A lifted separator's lead was taken under whatever window cut it, and the
         // node taking it in reads its leads under its own, so where the two differ
-        // the separator itself is what they are recomputed from.
-        inner.lead[slot] = match &lift_spill {
-            Some(full) => inner.win.lead(full.borrow()),
+        // the separator itself is what they are recomputed from. One the window puts
+        // outside itself has no lead to route by until the retune below rebuilds them.
+        let lifted = lift_spill
+            .as_ref()
+            .map(|full| inner.win.word(full.borrow()));
+        inner.lead[slot] = match lifted {
+            Some(word) => word.unwrap_or(0),
             None => lift_lead,
         };
-        let broke = lift_spill
-            .as_ref()
-            .is_some_and(|full| inner.win.place(full.borrow()) != Place::Inside);
+        let broke = matches!(lifted, Some(Err(_)));
         if let Some(full) = lift_spill {
             put_spill(&mut inner.spill, slot, full);
         }
@@ -1113,19 +1196,20 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             Ok(found) => Some(std::mem::replace(&mut leaf.vals[found], val)),
             Err(slot) => {
                 // A key the window puts outside itself is one the rest of the leaf
-                // no longer agrees with, so the leads are owed a rebuild.
-                let broke = leaf.win.place(key.borrow()) != Place::Inside;
+                // no longer agrees with, so the leads are owed a rebuild and it has
+                // none of its own until that runs.
+                let word = leaf.win.word(key.borrow());
                 leaf.lead.copy_within(slot..leaf.len, slot + 1);
                 // The tail slot holds a filler the shift carries down to `slot`,
                 // where the arriving key replaces it, so nothing is cloned.
                 K::open(&mut leaf.keys, slot, leaf.len);
                 leaf.vals[slot..=leaf.len].rotate_right(1);
-                leaf.lead[slot] = leaf.win.lead(key.borrow());
+                leaf.lead[slot] = word.unwrap_or(0);
                 leaf.keys[slot] = key;
                 leaf.vals[slot] = val;
                 leaf.len += 1;
                 self.len += 1;
-                if broke {
+                if word.is_err() {
                     leaf.retune();
                 }
                 None
@@ -1535,7 +1619,8 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
     /// Bytes of shared prefix the leaves are reading their leads from past
     ///
     /// The mean over the leaves, unweighted, since what is wanted is whether the
-    /// windows moved. Zero on every fixed column, where there is nothing to move past.
+    /// windows moved. Zero where a node's keys agree on nothing, which is what a
+    /// column with no scan prefix and no bucket in front holds.
     pub fn lead_skip(&self) -> f64 {
         let mut total = 0usize;
         let mut seen = 0usize;

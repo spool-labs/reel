@@ -204,29 +204,68 @@ a tied inner walk steps a cursor from the front rather than placing it by binary
 adds four unpredictable branches over a stride as wide as the key and costs 1.20x to 1.27x of
 a tied get at the widths a 72 or 108 byte key ships at.
 
-## The lead does not discriminate where the scan prefix is wide
+## The scan prefix that defeats the lead
 
 The tree searches a node on eight byte leads and reads whole keys only across a tie. Measured
 2026-08-11 through a real volume, one key set per column family written the way that family's
-own prefix helper reads it, **seven of the eighteen fixed columns tie at 1.0000** and they are
-exactly the seven whose scan shares eight bytes or more. The other eleven tie at 0.0000, and so
-do the five variable columns, whose window retunes past what their keys share.
+own prefix helper reads it, **seven of the eighteen fixed columns tied at 1.0000** and they are
+exactly the seven whose scan shares eight bytes or more. The other eleven tied at 0.0000, and so
+did the five variable columns, whose window retunes past what their keys share.
 
-None of the seven ties by accident. Each writes its scan's prefix first, an owner address or an
+None of the seven tied by accident. Each writes its scan's prefix first, an owner address or an
 epoch or a timestamp, because that is what makes the scan a range: the prefix that makes the
-scan possible is the prefix that defeats the lead. What it costs is the trick itself, since
-`seek` counts the leads below the wanted one, finds the whole node equal, and walks it
-comparing full keys, so a tied column pays the node width in whole-key comparisons. Those seven
+scan possible is the prefix that defeats the lead. What it cost was the trick itself, since
+`seek` counts the leads below the wanted one, found the whole node equal, and walked it
+comparing full keys, so a tied column paid the node width in whole-key comparisons. Those seven
 declare keys from 24 bytes to 96, so the budget puts them between 42 slots a node and 16,
 against the 64 they all held before.
 
-**Correctness is untouched**, which is why it went unnoticed:
-`a_tied_lead_still_answers_and_says_that_it_tied` holds that every key answers, that the ordered
-walk stays in order across a fully tied run, and that `tie_rate` reports it. The obvious fix
-does not work, since a per-column lead offset only preserves order if every key in the shard
-shares the bytes before it and an epoch-keyed column is a single shard holding every epoch.
-`ReelStore::lead_tie_rates` is the surface, walked off the leaves, so a new column with no scan
-prefix fails the caller's guard rather than joining the table quietly.
+**A fixed key takes the window the names take**, `Shared<N>` at the key's own width, since a
+node's entries cannot agree on more bytes than a key has. What does not work is a per-column
+lead offset, which only preserves order where every key in the shard shares the bytes before
+it, and an epoch-keyed column is a single shard holding every epoch; the window's invariant is
+one node's, and a node inside that shard holds one epoch. A million keys a shape against the
+same tree with its window switched off, both arms in one process, the mean of two runs, ns a
+get and ns an entry walked:
+
+| shape, 1M keys | flat get | window get | flat miss | window miss | flat walk | window walk | skip | tie |
+|---|---|---|---|---|---|---|---|---|
+| snapshot epoch/group/chunk, 24B | 235.1 | **167.4** | 140.1 | **78.2** | 2.95 | **2.74** | 22.8 | 0.011 |
+| tuple group/tape/track, 34B | 239.2 | **151.9** | 239.2 | **138.0** | 4.24 | **3.00** | 17.4 | 0.001 |
+| wal generation/offset, 16B | 252.2 | **133.7** | 229.3 | **78.9** | 2.82 | **1.92** | 13.0 | 0.000 |
+| spool then address, 34B | 109.1 | **101.7** | 121.2 | **113.7** | 2.74 | 2.85 | 0.0 | 0.000 |
+| address, 32B | 103.1 | 105.9 | 123.3 | **117.2** | 2.36 | 2.76 | 0.0 | 0.000 |
+
+**A shape whose lead already discriminated keeps its reads**, which is the gate the fix had to
+clear, and it takes three things to hold that. A window narrower than the lead is dropped: a
+run under eight bytes is one the lead reads past already, so moving the window there buys no
+discrimination and costs every probe a placement, and a column whose keys share nothing carries
+`off` at zero and reads its lead from the front the way `Whole` does. The placement and the lead
+are one call, `LeadWindow::word`, since a node asked for them separately read the same probe
+twice and cost 11 percent on the address shapes. And a node is `repr(C)` with the window behind
+the length, since the compiler otherwise lays it past the values, a kilobyte from the length,
+and a search waits on a second line of the node to learn where its lead starts. What it costs
+is bytes, 2 to 5 a key: the window inline in every node, and every separator now held whole,
+which is what lets a node that retunes rebuild its leads at the offset it moved to.
+
+**The bytes are what a shape with nothing to skip pays**, and it pays them on the walk rather
+than on the search. Their gets land inside 7 percent either way across repeated runs and their
+misses come back 5 and 6 percent quicker, but a node carrying a window it never moves is a
+wider node to step through: the 32 byte address shape walks 0.4ns an entry slower, and one
+spool's shard of the 34 byte column, small enough to sit in cache throughout, gets 5 percent
+slower. **Writes go the way the gets do**, a million inserts running 13, 13 and 55 percent
+faster on the three shapes, 5 percent faster on the spool column and 7 percent slower on the
+address one, with steady state churn no slower on any of them.
+
+**Correctness is held by the oracle**: `a_shared_lead_moves_the_window_and_still_answers` holds
+that every key of a fully shared shape answers, that a probe carrying none of the shared bytes
+is placed at the edge rather than by a lead read past bytes it does not have, and that the
+ordered walk stays in order. `a_refilled_node_places_probes_against_what_it_holds_now` holds the
+one a fixed width finds and a name shape mostly hid: **a window retunes on the bytes a node
+agreed on, not on how many there were**, or a node emptied and filled again goes on placing
+probes against the keys that left. `ReelStore::lead_tie_rates` is the surface, walked off the
+leaves, so a column the window cannot reach fails the caller's guard rather than joining the
+table quietly.
 
 ## The name columns, and the lead a bucket defeats
 

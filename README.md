@@ -14,7 +14,7 @@ tail, so the kernel never serializes them on a shared inode. Readers run beside
 them without locks. One process owns a store for writing at a time; other
 processes can open it read-only and follow.
 
-- **Segments, not pages.** Values are stored whole and read back verbatim. A
+- **Segments.** Values are stored whole and read back verbatim. A
   record is one append, and a read is one device op placed by the index.
 - **One reel, many volumes.** Extra roots are declared as fast or capacity;
   compaction demotes aged survivors onto the capacity tier without changing

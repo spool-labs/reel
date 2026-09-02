@@ -16,7 +16,7 @@ use std::thread::JoinHandle;
 
 use io_uring::{cqueue, opcode, types, EnterFlags, IoUring};
 
-use crate::config::{RingTuning, TaskRun};
+use crate::config::{IowqWorkers, RingTuning, TaskRun};
 use crate::error::{ReelError, Result};
 use crate::io::direct::{
     align_up, covering_span, cut_into, cut_split_into, wanted_window, AlignedBuf, DIRECT_ALIGN,
@@ -706,6 +706,13 @@ impl Ring {
         if !is_registered {
             core.doors.note_files_refused();
         }
+        let workers = core.tuning.iowq_workers;
+        if workers.is_asked() && !cap_workers(&ring, workers) {
+            core.doors.note_workers_refused();
+        }
+        if core.tuning.pinned_iowq && !pin_workers(&ring) {
+            core.doors.note_workers_refused();
+        }
         // The kernel clamps the completion queue, so the bound on ops in flight is
         // read back from the ring rather than assumed.
         let entries = ring.params().cq_entries() as usize;
@@ -1063,6 +1070,7 @@ struct DoorTally {
     off_ring: AtomicU64,
     pool_refused: AtomicBool,
     files_refused: AtomicBool,
+    workers_refused: AtomicBool,
     spun_out: AtomicU64,
 }
 
@@ -1102,12 +1110,20 @@ impl DoorTally {
         }
     }
 
+    /// A ring's worker cap or pin was refused by the kernel
+    fn note_workers_refused(&self) {
+        if !self.workers_refused.load(Ordering::Relaxed) {
+            self.workers_refused.store(true, Ordering::Relaxed);
+        }
+    }
+
     fn counts(&self) -> DoorCounts {
         DoorCounts {
             reached_ring: self.reached_ring.load(Ordering::Relaxed),
             off_ring: self.off_ring.load(Ordering::Relaxed),
             pool_refused: self.pool_refused.load(Ordering::Relaxed),
             files_refused: self.files_refused.load(Ordering::Relaxed),
+            workers_refused: self.workers_refused.load(Ordering::Relaxed),
         }
     }
 }
@@ -1625,6 +1641,26 @@ fn build_ring(wanted: TaskRun) -> Result<(IoUring, TaskRun)> {
     }
     Err(refused
         .unwrap_or_else(|| ReelError::Io(std::io::Error::other("no completion mode was tried"))))
+}
+
+/// Cap the kernel workers behind a ring, refused on a kernel before 5.15
+fn cap_workers(ring: &IoUring, workers: IowqWorkers) -> bool {
+    let mut caps = [workers.bounded, workers.unbounded];
+    ring.submitter()
+        .register_iowq_max_workers(&mut caps)
+        .is_ok()
+}
+
+/// Keep a ring's kernel workers on the cores its thread may run on
+fn pin_workers(ring: &IoUring) -> bool {
+    // SAFETY: a zeroed set is an empty cpu set, which the kernel fills in place
+    let mut cpus: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::cpu_set_t>();
+    // SAFETY: the set is sized by its own type and outlives the call
+    if unsafe { libc::sched_getaffinity(0, size, &mut cpus) } != 0 {
+        return false;
+    }
+    ring.submitter().register_iowq_aff(&cpus).is_ok()
 }
 
 impl std::fmt::Debug for UringBackend {

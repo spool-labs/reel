@@ -45,6 +45,9 @@ pub struct DoorCounts {
 
     /// Whether the kernel refused a ring's sparse file table
     pub files_refused: bool,
+
+    /// Whether the kernel refused a ring's worker cap or pin
+    pub workers_refused: bool,
 }
 
 /// Which backend actually serves a volume, as opposed to the one it asked for

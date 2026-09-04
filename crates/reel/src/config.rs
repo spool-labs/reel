@@ -234,6 +234,25 @@ pub enum TaskRun {
     Interrupt,
 }
 
+/// Caps on the kernel workers that run what a ring punts, zero keeping the kernel's
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct IowqWorkers {
+    /// Workers for file io, which the kernel bounds by cpu count
+    pub bounded: u32,
+
+    /// Workers for the rest, which it bounds by the process limit
+    pub unbounded: u32,
+}
+
+impl IowqWorkers {
+    /// Whether either cap was asked for
+    pub fn is_asked(self) -> bool {
+        self.bounded != 0 || self.unbounded != 0
+    }
+}
+
 /// Ring tunables
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Deserialize))]
@@ -244,6 +263,12 @@ pub struct RingTuning {
 
     /// When the kernel runs this ring's completion work, stepped down where refused
     pub taskrun: TaskRun,
+
+    /// Caps on the kernel workers behind this ring
+    pub iowq_workers: IowqWorkers,
+
+    /// Keep those workers on the cores the ring's own thread may run on
+    pub pinned_iowq: bool,
 }
 
 impl Default for RingTuning {
@@ -251,6 +276,8 @@ impl Default for RingTuning {
         Self {
             registered_buffers: true,
             taskrun: TaskRun::Deferred,
+            iowq_workers: IowqWorkers::default(),
+            pinned_iowq: false,
         }
     }
 }

@@ -16,7 +16,7 @@ use std::thread::{self, Thread};
 
 use tempfile::tempdir;
 
-use reel::config::{IoBackend, RingTuning, SyncPolicy, TaskRun};
+use reel::config::{IoBackend, IowqWorkers, RingTuning, SyncPolicy, TaskRun};
 use reel::io::op::{Completion, FileId, Op, Outcome, ReadBuf, Tag, WriteBuf};
 use reel::io::uring_backend::UringBackend;
 use reel::io::ReelIo;
@@ -133,6 +133,17 @@ fn tuning() -> RingTuning {
             Ok("interrupt") => TaskRun::Interrupt,
             _ => TaskRun::Deferred,
         },
+        iowq_workers: match std::env::var("REEL_RING_IOWQ_WORKERS") {
+            Ok(pair) => {
+                let (bounded, unbounded) = pair.split_once(',').expect("bounded,unbounded");
+                IowqWorkers {
+                    bounded: bounded.parse().expect("bounded"),
+                    unbounded: unbounded.parse().expect("unbounded"),
+                }
+            }
+            Err(_) => IowqWorkers::default(),
+        },
+        pinned_iowq: flag("REEL_RING_PIN_IOWQ", false),
     }
 }
 
@@ -995,6 +1006,50 @@ fn ring_takes_concurrent_writers() {
             .expect("present");
         assert_eq!(read, vec![byte; 2048]);
     }
+}
+
+// a capped and pinned worker pool is taken by the kernel
+#[test]
+fn a_capped_and_pinned_pool_is_taken() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("writes");
+    std::fs::write(&path, []).expect("the file exists to be opened");
+
+    let tuning = RingTuning {
+        iowq_workers: IowqWorkers {
+            bounded: 2,
+            unbounded: 2,
+        },
+        pinned_iowq: true,
+        ..tuning()
+    };
+    let backend = UringBackend::new(false, tuning).expect("ring");
+    let file = open_through(&backend, &path);
+
+    let mut ops: Vec<Op> = (0..16u64)
+        .map(|at| Op::Writev {
+            tag: Tag(at),
+            file,
+            offset: at * 4096,
+            bufs: vec![WriteBuf::owned(vec![at as u8; 4096])],
+        })
+        .collect();
+    let mut out = Vec::new();
+    assert!(
+        backend.submit_batch(&mut ops, &mut out),
+        "the ring took a batch of writes",
+    );
+    assert_eq!(out.len(), 16, "every write came back");
+
+    let doors = backend.door_counts();
+    assert!(
+        doors.reached_ring,
+        "the batch went on the ring, doors: {doors:?}"
+    );
+    assert!(
+        !doors.workers_refused,
+        "the kernel refused the worker cap or pin, doors: {doors:?}",
+    );
 }
 
 // a write only batch comes back without giving up on its spin

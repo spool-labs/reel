@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use rand::Rng;
 use tempfile::TempDir;
 
+use reel::config::{IowqWorkers, RingTuning};
 use reel::{
     Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, IoBackend, KeyWidth,
     MapShape, RecordKey, ReelConfig, ReelStore, SyncPolicy,
@@ -253,6 +254,25 @@ fn driver_count() -> u32 {
         .unwrap_or(1)
 }
 
+/// Ring knobs from `REEL_RING_IOWQ_WORKERS=bounded,unbounded` and `REEL_RING_PIN_IOWQ=1`
+fn ring_tuning() -> RingTuning {
+    let iowq_workers = match std::env::var("REEL_RING_IOWQ_WORKERS") {
+        Ok(pair) => {
+            let (bounded, unbounded) = pair.split_once(',').expect("bounded,unbounded");
+            IowqWorkers {
+                bounded: bounded.parse().expect("bounded"),
+                unbounded: unbounded.parse().expect("unbounded"),
+            }
+        }
+        Err(_) => IowqWorkers::default(),
+    };
+    RingTuning {
+        iowq_workers,
+        pinned_iowq: std::env::var("REEL_RING_PIN_IOWQ").is_ok_and(|value| value == "1"),
+        ..RingTuning::default()
+    }
+}
+
 fn config(compact_mbps: u64) -> ReelConfig {
     ReelConfig {
         // Compaction is the thing under test, so nothing else may pace the
@@ -261,6 +281,7 @@ fn config(compact_mbps: u64) -> ReelConfig {
         scrub_mbps: 0,
         compact_mbps: CompactRate::Mbps(compact_mbps),
         io_backend: backend(),
+        uring: ring_tuning(),
         ..ReelConfig::default()
     }
 }

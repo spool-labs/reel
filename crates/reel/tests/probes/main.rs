@@ -19,6 +19,8 @@ mod interference;
 mod layout;
 mod mapped_reads;
 mod merge_rate;
+#[cfg(target_os = "linux")]
+mod merged_reads;
 mod negative_price;
 mod open_time;
 mod past_ram;
@@ -204,6 +206,8 @@ const LINUX_PROBES: &[Probe] = &[
         "past_ram::cold_reads_past_ram",
         past_ram::cold_reads_past_ram,
     ),
+    opt_in("merged_reads::fill", merged_reads::fill),
+    opt_in("merged_reads::read", merged_reads::read),
 ];
 
 #[cfg(not(target_os = "linux"))]

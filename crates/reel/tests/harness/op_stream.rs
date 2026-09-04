@@ -13,16 +13,16 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
 /// Groups the generator draws from
-const GROUPS: &[u16] = &[7, 8, 9];
+pub const GROUPS: &[u16] = &[7, 8, 9];
 
 /// Distinct addresses per group the generator draws from
-const ADDRESS_SPACE: u8 = 12;
+pub const ADDRESS_SPACE: u8 = 12;
 
 /// Smallest payload the generator emits
-const MIN_LEN: usize = 1;
+pub const MIN_LEN: usize = 1;
 
 /// Largest payload the generator emits
-const MAX_LEN: usize = 300;
+pub const MAX_LEN: usize = 300;
 
 /// Upper bound of the weighted op roll
 const ROLL_SPACE: u32 = 100;

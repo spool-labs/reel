@@ -1,0 +1,50 @@
+[package]
+name = "reel-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+rand = { version = "0.8", features = ["small_rng"] }
+# The simulator is what makes a differential case deterministic and free of io.
+reel = { path = "../crates/reel", features = ["sim"] }
+reel-core = { path = "../crates/reel-core" }
+reel-mock = { path = "../crates/reel-mock" }
+
+# Coverage guidance needs the optimised build to be walkable, so the frames stay.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "format_parsers"
+path = "fuzz_targets/format_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_roundtrip"
+path = "fuzz_targets/codec_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "persisted_index"
+path = "fuzz_targets/persisted_index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "store_ops"
+path = "fuzz_targets/store_ops.rs"
+test = false
+doc = false
+bench = false

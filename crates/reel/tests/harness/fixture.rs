@@ -119,6 +119,9 @@ pub struct Differential {
     /// Whether the stream drives the maintenance tick rather than the passes under it
     is_maintained: bool,
 
+    /// Whether the stream writes the reel's index down as it goes
+    is_checkpointing: bool,
+
     /// The seed this run was drawn from, so a failure names the stream to replay
     seed: u64,
 
@@ -164,6 +167,17 @@ impl Differential {
         Differential {
             is_maintained: true,
             ..Differential::open(seed, reel_config)
+        }
+    }
+
+    /// The same run, writing the reel's index down at a cadence of the stream's
+    ///
+    /// Nothing on the volume schedules this, so a run that wants the reopens to read
+    /// a file back says so here.
+    pub fn checkpointing(self) -> Differential {
+        Differential {
+            is_checkpointing: true,
+            ..self
         }
     }
 
@@ -238,6 +252,7 @@ impl Differential {
             listed_before: 0,
             merged_before: 0,
             is_maintained: false,
+            is_checkpointing: false,
             seed,
             memory: MemoryStore::new(),
             reel,
@@ -485,14 +500,14 @@ impl Differential {
         self.reel_sim = restored;
     }
 
-    /// Write the reel's index down, on a volume that was armed to keep one
+    /// Write the reel's index down, on a run that asked for it
     ///
     /// The keys are counted across the run so a checkpointing test can tell a run that
     /// exercised the path from one whose every file stood for nothing.
     fn checkpoint_reel_index(&mut self) {
-        // Both halves of what the store refuses on: a paging volume leaves its sealed
-        // keys in the footers and has no resident index to write down.
-        if !self.reel_config.index_checkpoint || self.reel_config.index.pages() {
+        // A paging volume leaves its sealed keys in the footers and has no resident
+        // index to write down, which the store refuses on.
+        if !self.is_checkpointing || self.reel_config.index.pages() {
             return;
         }
         let taken = self.reel.checkpoint_index().expect("index checkpoint");

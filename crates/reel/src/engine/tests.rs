@@ -590,6 +590,7 @@ fn a_failed_seal_is_retried_on_the_tick() {
     // what makes a failed seal cost a past-saving count.
 
     // Every sync the seal takes fails, so the footer cannot be answered for.
+    let sealing = store.reel.tails()[0].tail().active_segment();
     sim.arm_next_ops(8, FaultKind::SyncError);
     store.reel.tails()[0]
         .seal()
@@ -599,10 +600,18 @@ fn a_failed_seal_is_retried_on_the_tick() {
         store.reel.shared().past_saving_count() > 0,
         "the failed seal counted nothing past saving"
     );
+    assert!(
+        !store.reel.shared().is_settled(sealing),
+        "a segment with no footer read as settled"
+    );
 
     let sealed = store.retry_broken_seals();
     assert_eq!(sealed, 1, "the parked seal did not land");
     assert_eq!(store.reel.shared().past_saving_count(), 0);
+    assert!(
+        store.reel.shared().is_settled(sealing),
+        "the retry's footer landed and the segment still read unsealed"
+    );
     store
         .flush()
         .expect("a volume with every seal down flushes clean");
@@ -4478,9 +4487,9 @@ fn reopen_reproduces_index() {
     );
 }
 
-// closing seals the tails, so a reopen resolves the volume from footers
+// closing flushes and stops, leaving the tail for the next open to resume
 #[test]
-fn close_seals_every_tail() {
+fn close_leaves_the_tail_resumable() {
     let (store, sim) = sim_store(config(1, SyncPolicy::Never));
     store.put(&record(7, 1), &[0x11; 512]).expect("put");
 
@@ -4490,9 +4499,22 @@ fn close_seals_every_tail() {
         .durable_bytes(&Path::new(ROOT).join(segment_file_name(SegmentId(1))))
         .expect("segment durable");
     assert!(
-        SegmentFooter::parse(&bytes).is_ok(),
-        "a sealed segment ends in a footer"
+        SegmentFooter::parse(&bytes).is_err(),
+        "a close sealed the tail it should leave open"
     );
+
+    let reopened = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        config(1, SyncPolicy::Never),
+        COLUMNS,
+        Arc::new(SimIo::from_image(sim.durable_image())),
+    )
+    .expect("reopen");
+    reopened
+        .put(&record(7, 2), &[0x22; 512])
+        .expect("a resumed put");
+    assert!(reopened.get(&record(7, 1)).expect("get").is_some());
+    assert!(reopened.get(&record(7, 2)).expect("get").is_some());
 }
 
 // a read-only open serves reads but rejects every write

@@ -217,17 +217,21 @@ impl VolumeSpec {
     }
 }
 
-/// How a thread waits for a ring completion that has not arrived
+/// When the kernel runs the completion work a ring owes its owning thread
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-pub enum RingWait {
-    /// Spin while the ring holds only writes and sleep once it holds a read
-    Auto,
-    /// Spin, then yield, and keep asking, holding a core for the whole wait
-    Spin,
-    /// Sleep in the kernel until a completion is ready, at a syscall in and a wakeup out
-    Kernel,
+pub enum TaskRun {
+    /// Hold it until the thread enters asking for completions, on a kernel from 6.1
+    ///
+    /// Rests on a ring belonging to one thread, which is the promise this backend keeps.
+    Deferred,
+
+    /// Run it at the next kernel exit rather than interrupting for it, from 5.19
+    Cooperative,
+
+    /// Interrupt the thread for every completion, which is what a ring does unasked
+    Interrupt,
 }
 
 /// Ring tunables
@@ -238,16 +242,38 @@ pub struct RingTuning {
     /// Hand the kernel a pool of aligned buffers, which is what puts direct data ops on the ring
     pub registered_buffers: bool,
 
-    /// How a thread waits on a completion that has not landed yet
-    pub wait: RingWait,
+    /// When the kernel runs this ring's completion work, stepped down where refused
+    pub taskrun: TaskRun,
 }
 
 impl Default for RingTuning {
     fn default() -> Self {
         Self {
             registered_buffers: true,
-            wait: RingWait::Auto,
+            taskrun: TaskRun::Deferred,
         }
+    }
+}
+
+impl TaskRun {
+    /// This mode and the ones below it, for a kernel that refuses the one asked for
+    ///
+    /// Deferred wants 6.1 and cooperative 5.19, and a refusal comes back as one errno with
+    /// nothing naming the flag, so the answer is to try the next one down.
+    pub fn and_below(self) -> &'static [TaskRun] {
+        match self {
+            TaskRun::Deferred => &[TaskRun::Deferred, TaskRun::Cooperative, TaskRun::Interrupt],
+            TaskRun::Cooperative => &[TaskRun::Cooperative, TaskRun::Interrupt],
+            TaskRun::Interrupt => &[TaskRun::Interrupt],
+        }
+    }
+
+    /// Whether a thread has to ask the kernel before it reads its own queue
+    ///
+    /// Both non-default modes set `IORING_SQ_TASKRUN` when work is waiting, so a peek is a
+    /// flag read; only under deferred is the ask what makes a completion appear.
+    pub fn is_asked_for(self) -> bool {
+        !matches!(self, TaskRun::Interrupt)
     }
 }
 
@@ -443,9 +469,6 @@ pub struct ReelConfig {
     /// Bytes of sealed-footer state a paged volume keeps at once
     #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_bytes"))]
     pub footer_cache: ByteCount,
-
-    /// Write the resident index down at a cue, and read it back at the next open
-    pub index_checkpoint: bool,
 }
 
 /// A floor every record clears, for a volume that wants the mapping outright
@@ -489,7 +512,6 @@ impl Default for ReelConfig {
             uring: RingTuning::default(),
             filter_bits: DEFAULT_FILTER_BITS,
             fence: FenceResidency::Off,
-            index_checkpoint: false,
         }
     }
 }
@@ -789,6 +811,42 @@ fn byte_multiplier(unit: &str) -> std::result::Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // a mode the kernel refuses has somewhere to step down to, and the floor has not
+    #[test]
+    fn a_completion_mode_steps_down_to_one_every_kernel_takes() {
+        assert_eq!(
+            TaskRun::Deferred.and_below(),
+            [TaskRun::Deferred, TaskRun::Cooperative, TaskRun::Interrupt],
+        );
+        assert_eq!(
+            TaskRun::Cooperative.and_below(),
+            [TaskRun::Cooperative, TaskRun::Interrupt],
+        );
+        assert_eq!(
+            TaskRun::Interrupt.and_below(),
+            [TaskRun::Interrupt],
+            "the floor asks for nothing, so it has nowhere to fall to",
+        );
+        for mode in TaskRun::Deferred.and_below() {
+            assert_eq!(
+                mode.and_below().last(),
+                Some(&TaskRun::Interrupt),
+                "a mode stepped down without reaching the one a ring runs unasked",
+            );
+        }
+    }
+
+    // the two modes that hold their work are the two a thread has to ask
+    #[test]
+    fn a_held_completion_is_one_the_thread_asks_for() {
+        assert!(TaskRun::Deferred.is_asked_for());
+        assert!(TaskRun::Cooperative.is_asked_for());
+        assert!(
+            !TaskRun::Interrupt.is_asked_for(),
+            "a ring that interrupts for a completion has posted it already",
+        );
+    }
 
     // the floor is asked about the record, so one volume answers both ways
     #[test]

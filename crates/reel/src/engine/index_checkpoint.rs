@@ -53,17 +53,16 @@ impl ReelStore {
     ///
     /// The next open reads it back instead of sweeping every footer, taking its rows
     /// for each segment still standing at the length recorded here. Nothing schedules
-    /// this; a caller that wants the fast open runs it. Refused on a read-only
-    /// volume, on a paging one, and on a volume the operator did not arm.
+    /// this; a caller that wants the fast open runs it. Refused on a read-only volume
+    /// and on a paging one.
     pub fn checkpoint_index(&self) -> Result<IndexCheckpoint> {
         if self.is_read_only {
             return Err(read_only());
         }
         if !self.keeps_index() {
             return Err(ReelError::Rejected(
-                "this volume was not opened to keep an index checkpoint, or pages its \
-                 sealed keys out to their footers, so there is no resident index to \
-                 write down"
+                "this volume pages its sealed keys out to their footers, so there is \
+                 no resident index to write down"
                     .to_string(),
             ));
         }
@@ -82,7 +81,7 @@ impl ReelStore {
 
     /// Whether this volume keeps an index a later open can read back
     pub(super) fn keeps_index(&self) -> bool {
-        self.config.index_checkpoint && !self.config.index.pages()
+        !self.config.index.pages()
     }
 
     /// Walk the index over the segments a cue closed into a file under a root

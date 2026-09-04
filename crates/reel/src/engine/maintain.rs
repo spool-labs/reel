@@ -393,15 +393,15 @@ impl ReelStore {
     /// Move the floor everything below which the volume is finished with
     ///
     /// A column that marks its keys has its records dropped by compaction once their
-    /// mark falls below this, so the purge costs no tombstone per key. Columns that
-    /// mark nothing are untouched, and a floor only ever moves up.
+    /// mark falls below this, and its writes banded against it where it asked for that.
+    /// A floor only ever moves up.
     pub fn purge_below(&self, floor: u64) {
-        self.compactor.purge_below(floor);
+        self.reel.shared().purge_below(floor);
     }
 
-    /// The floor compaction drops records below
+    /// The floor compaction drops records below, and bands are measured from
     pub fn purge_floor(&self) -> u64 {
-        self.compactor.purge_floor()
+        self.reel.shared().purge_floor()
     }
 
     /// Erase the dead runs out of sealed segments, and report what came back

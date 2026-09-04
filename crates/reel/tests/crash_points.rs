@@ -235,10 +235,7 @@ fn every_boundary_open_shards() {
 fn every_boundary_across_an_index_checkpoint() {
     for seed in CHECKPOINT_SEEDS {
         let ops = op_stream::generate_durable(*seed, CRASH_LEN);
-        let config = ReelConfig {
-            index_checkpoint: true,
-            ..crash_config(1, SyncPolicy::EveryPut, SEGMENT_SMALL)
-        };
+        let config = crash_config(1, SyncPolicy::EveryPut, SEGMENT_SMALL);
         let harness = ReelHarness::new(config);
         let after = ops.len() / 2;
         let total = harness.boundary_count_across_index_checkpoint(&ops, after);

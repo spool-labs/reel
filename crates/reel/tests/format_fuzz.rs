@@ -18,6 +18,7 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
 use reel::append::codec::{admit, decode};
+use reel::format::band::Band;
 use reel::format::column::{Codec, ColumnId};
 use reel::format::filter::Filter;
 use reel::format::footer::{FooterEntry, SegmentFooter};
@@ -25,7 +26,7 @@ use reel::format::loc::SegmentId;
 use reel::format::lsn::Lsn;
 use reel::format::prefix::PrefixRows;
 use reel::format::record::{BatchFrame, Flags, RecordHeader, HEADER_LEN};
-use reel::format::segment_header::{SegmentHeader, SEGMENT_HEADER_LEN};
+use reel::format::segment_header::{SegmentHeader, SEGMENT_HEADER_LEN, SEGMENT_HEADER_SPAN};
 use reel::index::column::ColumnMark;
 use reel::index::persisted::{PersistedColumn, PersistedIndex, PersistedSegment};
 use reel::io::fault::FaultPlan;
@@ -344,6 +345,7 @@ fn segment_header_roundtrips() {
             let header = SegmentHeader {
                 version: rng.gen(),
                 segment: SegmentId(rng.gen()),
+                band: rng.gen::<bool>().then(|| Band(rng.gen())),
             };
 
             let parsed = SegmentHeader::unpack(&header.pack()).expect("a packed header parses");
@@ -456,11 +458,16 @@ fn a_damaged_image_reopens_consistent() {
     }
 }
 
-// the frozen segment header payload keeps its width, since every file starts with it
+// the segment header's frozen prefix keeps its width, since every file starts with it
 #[test]
 fn segment_header_width_is_frozen() {
+    let packed = SegmentHeader::new(SegmentId(1)).pack();
+
+    assert_eq!(packed.len(), SEGMENT_HEADER_SPAN);
     assert_eq!(
-        SegmentHeader::new(SegmentId(1)).pack().len(),
-        SEGMENT_HEADER_LEN
+        SegmentHeader::unpack(&packed[..SEGMENT_HEADER_LEN])
+            .expect("the prefix alone parses")
+            .segment,
+        SegmentId(1)
     );
 }

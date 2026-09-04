@@ -26,7 +26,12 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
     if active.terminal.load(Ordering::Acquire) {
         return Ok(());
     }
-    let bridged = bridge_reserved_slack(shared, active, end)?;
+    // The reservation's blocks past the last record go back to the filesystem.
+    // The length already ends at the records; the cut is what releases what the
+    // preallocation claimed beyond them, before the footer takes the end.
+    if active.alloc_high.load(Ordering::Acquire) > end {
+        shared.driver.truncate(active.handle.file(), end)?;
+    }
 
     // Writeback orders nothing, so under the one-sync seal a crash can leave a durable
     // footer naming bytes that never landed. With peers that resolves to a read-time
@@ -47,10 +52,14 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
             shared.filter_bits_for(active.handle.id()),
             shared.config.seal_fences(),
         )?;
+        let sealed_end = end + packed.len() as u64;
         shared
             .driver
-            .writev_all(active.handle.file(), bridged, vec![WriteBuf::owned(packed)])?;
-        shared.driver.sync_full(active.handle.file())
+            .writev_all(active.handle.file(), end, vec![WriteBuf::owned(packed)])?;
+        shared.driver.sync_full(active.handle.file())?;
+        // An aligned write can leave zeros after the footer. The file ends at
+        // the footer, so every trailer reader finds it at the end.
+        shared.driver.truncate(active.handle.file(), sealed_end)
     })();
     if let Err(error) = written {
         // The footer is the one copy of what this segment holds, so a failed seal puts
@@ -64,6 +73,9 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
         .driver
         .advise(active.handle.file(), 0, 0, Advice::Random);
     shared.fd_cache.insert(active.handle.clone());
+    // The footer is down, synced, and the file cut to it, so a segment an earlier
+    // attempt marked unsealed is settled again and the mark comes off with it.
+    shared.forget_unsealed(active.handle.id());
     // The footer is on disk now, so a paged index can take this segment's keys over from
     // the map. The tail does not hold the index, so it leaves the number instead.
     shared.note_sealed(active.handle.id());
@@ -186,27 +198,6 @@ pub(super) fn stamp_failed_range(
         Ok(wrote) => wrote == HEADER_LEN as u64,
         Err(_) => false,
     }
-}
-
-/// Fill the gap between the last record and the reserved space with one pad
-pub(super) fn bridge_reserved_slack(
-    shared: &Arc<ReelShared>,
-    active: &Active,
-    end: u64,
-) -> Result<u64> {
-    let alloc_high = active.alloc_high.load(Ordering::Acquire);
-    if alloc_high <= end {
-        return Ok(end);
-    }
-    let gap = alloc_high - end;
-    if gap < HEADER_LEN as u64 {
-        return Ok(end);
-    }
-    let pad = RecordHeader::fill((gap - HEADER_LEN as u64) as u32);
-    let mut bufs = Vec::with_capacity(1);
-    WriteBuf::push_prefix(&mut bufs, pad.pack());
-    shared.driver.writev_all(active.handle.file(), end, bufs)?;
-    Ok(alloc_high)
 }
 
 /// What the sealer's worker is asked to do

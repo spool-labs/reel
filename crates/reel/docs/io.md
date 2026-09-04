@@ -22,6 +22,19 @@ rather than around it, and it is a production path.
 through a block-aligned buffer. Linux only, and it resolves to a buffered
 volume anywhere else.
 
+**On ext4 a buffered ring is a queue in front of a worker pool.** A buffered op
+there punts to `io_wq`, and one probe on one kernel says so plainly: two
+`iou-wrk` threads through every buffered phase on an ext4 loop device, zero
+through all of them on btrfs, and zero through the direct phases on ext4. So on
+ext4 a `uring` volume hands its work to a kernel worker pool that does the
+blocking call on the engine's behalf, which is a thread handoff bought with a
+submission and not an asynchronous op, and the compaction wave further down
+prices it at 41 percent of a drain's cycles. The fleet runs ext4, where the ring is
+decorative on a buffered volume and `uring_direct` is the answer: the descriptor
+bypasses the page cache, the request reaches the device from the submitting
+thread, and no worker stands in between. An operator who wants the page cache on
+ext4 should read the posix rows rather than the ring's.
+
 ## How one is chosen
 
 `select_backend` runs at open and never fails the open over a backend choice.
@@ -56,16 +69,17 @@ single poller inbox that costs a lock and a wakeup each, which shows up as
 context switches per op climbing with writer count where posix stays flat.
 No registered buffers, no single-issuer rings.
 
-**How a waiter waits, and a caveat on early ring rows.** The ring can spin on the
-completion queue or sleep in the kernel, and until a sweep could select between
-them, every ring number ever recorded priced `RingWait::Spin` whether or not it
-said so. Measured on a 9975WX across 1 to 64 threads at 4 KiB, spin is the faster
-of the two at every thread count, by 3 to 9 percent low and 0.6 percent at 64.
-What it costs is CPU: 543 percent against 405, and 263,263 involuntary context
-switches against 106,523. `Kernel` ships for that reason, and the trade is stated
-correctly as a quarter of the CPU and 2.5x fewer preemptions for a fraction of a
-percent of throughput, not as faster and cheaper at once. Reads are flat across
-both at 5,344 to 6,706 MB/s, which is the device rather than the backend.
+**How a waiter waits, and a caveat on early ring rows.** The wait follows what the
+ring is holding and nothing selects it: it spins while the ring holds only writes
+and sleeps in the kernel once a read is out. Spinning a write-only ring is worth
+8.1 us against 13.0 us at the commit p50 on the beast box, and the same spin with
+reads in the mix burns 10.8x the cycles for nothing. Until a sweep could separate
+the two, every ring number ever recorded priced a spin whether or not it said so.
+Measured on a 9975WX across 1 to 64 threads at 4 KiB, spin is the faster of the
+two at every thread count, by 3 to 9 percent low and 0.6 percent at 64, and what
+it costs is CPU: 543 percent against 405, and 263,263 involuntary context switches
+against 106,523. Reads are flat across both at 5,344 to 6,706 MB/s, which is the
+device rather than the backend, so the sleeping half gives up no throughput at all.
 
 **The ring is not a write lever on that box at all.** The 129-row backend sweep
 of the same day put posix and uring within 1 percent of each other from 64 KiB
@@ -125,6 +139,31 @@ shared and the hot path pays a predictable branch rather than a store per op;
 only the fall-through pays an atomic add, and a fall-through hot enough for that
 to show is the answer rather than the cost. A backend with no ring answers that
 nothing reached one and nothing fell off one, so a posix leg prints no line.
+
+## The one write wide enough to leave the ring
+
+Every write reel issues waits for its own completion: `writev` goes down
+`submit_inline`, which stages one op and waits for that op. A ring write has no
+batch to travel with, so what the ring is worth on the write path is not the
+submission itself but whatever else rides in the same `io_uring_enter`.
+
+A seal traced on ext4 in a container, 400k records into 24 MiB segments, put one
+9,628,877 byte `Writev` on the ring against 1,563 record writes that were all
+128 KiB or under. The wide one is a segment's whole sorted footer, and the
+kernel answers it on an `iou-wrk` worker while the sealer waits on the
+completion: the same wait, one thread further away. Writes leave the ring above
+`DIRECT_REQUEST_BYTES` now, which is where the direct door already stopped
+serving them, so both doors agree on what a ring write is and the footer blocks
+on the thread that issued it. That thread is the sealer, which owns a footer
+sort and an `fsync` already.
+
+Chunking the footer into 512 KiB ring submissions was the alternative, so that
+several requests reach the device from one enter. The same trace rules against
+it: with every write forced off the ring the process's peak `iou-wrk` count went
+2 to 0, so on ext4 a chunk buys another worker punt rather than another queued
+request, and twenty of them would need short-write and ordering bookkeeping for
+a write whose caller wants one count. The sealer's next act is `sync_full`,
+which serialises whatever the chunks won.
 
 ## Direct io and its alignment tax
 
@@ -378,6 +417,54 @@ the question reopens: fio hipri against non-hipri, sizes 4/16/64/256 KiB, depths
 IOPS. A direct-volume read row has to leave `map_above` unset either way, because a
 mapped read never reaches the ring.
 
+## Deferred completion work, and the ask the spin had to learn
+
+A ring interrupts its owning thread for every completion unless told otherwise.
+`IORING_SETUP_DEFER_TASKRUN` holds the work instead and runs it when the thread
+enters asking for completions, which drops the inter-processor interrupt, stops
+completions running on a transition the thread made for something else, and lands
+them in a batch at the one place that wants them. It requires
+`IORING_SETUP_SINGLE_ISSUER` and that the enter come from the submitting thread.
+Ring-per-thread already promises both, so this is the flag the design was already
+paying for and not asking for.
+
+`RingTuning::taskrun` picks it, `Deferred` by default. A refusal comes back as one
+errno with nothing in it naming the flag, so `build_ring` steps down by trial:
+`Deferred`, then `Cooperative` (`COOP_TASKRUN`, 5.19, no interrupt but the work
+runs at any kernel exit), then `Interrupt`, which is a ring built the old way.
+Both held modes also ask for `TASKRUN_FLAG`, so `IORING_SQ_TASKRUN` says when work
+is waiting and a peek stays a flag read.
+
+**The contract that comes with it.** Nothing appears in the completion queue until
+this thread enters with `GETEVENTS`, and `io-uring`'s `submit()` is
+`submit_and_wait(0)`, which sets `GETEVENTS` only when it is also waiting. So
+`flush()` does not run completion work, and every path that reads the queue without
+sleeping would read a queue that stays empty. All of them go through `Ring::drain`,
+which asks first when the flag is up: the batch harvest, the spin, the engine loop,
+and `ReelIo::poll`. The ask is an enter offering nothing and waiting for nothing.
+
+**What the mode costs the spin, counted before any box sees it.** A spin exists to
+read the completion queue without a syscall, and under `Deferred` there is no such
+read: the ask is the only thing that fills the queue. On the container's ext4, a
+buffered seal went from 1,591 enters against 1,591 submissions to 3,179 against
+1,591, one submit and one ask per op. The direct arm did not move, 1,594 against
+1,597, because its completions are already there when the submit enters. Folding
+`GETEVENTS` into the submission was tried and is not kept: it moved the threaded
+direct phase 2,116 enters to 2,103 and nothing else, because the completion is not
+ready at submit time, and it bought that with a hand-rolled `enter`. A wait that
+parks pays none of this, since `submit_and_wait` was already asking, and the same
+seal under `Interrupt` measures 1,591 against 1,591, so the knob is the way back
+rather than an argument. Only the spinning half of the wait pays this, and nothing
+selects the wait any more, so `REEL_RING_TASKRUN` sweeps the mode on its own.
+
+**The wedge this exists to stop.** The wait spins while the ring holds only
+writes, and a spin never enters the kernel. Without the ask it burns its million
+rounds and then sleeps, which is not a hang and does not fail a correctness test:
+in the container a 64-write batch took 9.85 s against 0.37 s and gave up on four
+spins. `spin_outs` counts a wait that gave up, `a_write_batch_spins_without_giving_up`
+asserts it stays zero, and zero is the only working answer: a count climbing there
+says the ring's completion mode and its wait no longer agree.
+
 ## What the ring backend's thread_local design constrains
 
 The per-thread ring is what makes `SINGLE_ISSUER` legal, and it is the right
@@ -429,10 +516,12 @@ rather than against docs or memory. The backend already uses most of the crate,
 so the holes are narrow, but two of them point at something already measured.
 
 Already in use, so nobody re-derives it: `setup_clamp`, `setup_single_issuer`,
+`setup_defer_taskrun`, `setup_coop_taskrun`, `setup_taskrun_flag`, `Submitter::enter`,
 `register_buffers`, `register_files_sparse`, `register_files_update`, and opcodes
 `Read`, `ReadFixed`, `Readv`, `Writev`, `WriteFixed`, plus `PollAdd.multi` for the
-inbox kick. The kernel's completion-work and submission-poll setup flags were
-measured, found to buy nothing on this engine's shapes, and are not asked for.
+inbox kick. The completion-work flags are the section above; the submission-poll
+flag is not asked for, since `SQPOLL` buys a kernel thread per ring and a 30 µs
+wake against seals that arrive in bursts.
 
 **Worth doing, in order.**
 

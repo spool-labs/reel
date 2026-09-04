@@ -458,9 +458,56 @@ fn a_bulk_load_lands_what_the_key_at_a_time_load_lands() {
     }
 }
 
-// keys that share their whole lead answer correctly and report that they tied
+// a node that empties and fills again answers for the keys it holds now
+//
+// A leaf holding one key agrees with itself on the whole width, so its window moves to
+// the end of it. What replaces that key agrees on as many bytes and on different ones,
+// which is a window unchanged by every measure except the one that matters.
 #[test]
-fn a_tied_lead_still_answers_and_says_that_it_tied() {
+fn a_refilled_node_places_probes_against_what_it_holds_now() {
+    const LEAVES: u64 = 8;
+
+    let held = |at: u64, tail: u8| {
+        let mut key: Key = [0x5a; 34];
+        key[0] = at as u8;
+        key[33] = tail;
+        key
+    };
+
+    // A fill of one is the shape that puts a single key in every node, leaf and
+    // separator alike, which is where a width-wide window comes from.
+    let first: Vec<(Key, u64)> = (0..LEAVES).map(|at| (held(at, 0), at)).collect();
+    let mut tree: Tree = TBTreeMap::from_sorted(first.clone(), 1);
+    for (key, at) in &first {
+        assert_eq!(tree.remove(key), Some(*at), "a key would not leave");
+    }
+    assert!(tree.is_empty(), "the tree still holds {}", tree.len());
+
+    for at in 0..LEAVES {
+        let fresh = held(at, 0x11);
+        tree.insert(fresh, at + 100);
+    }
+    for at in 0..LEAVES {
+        assert_eq!(
+            tree.get(&held(at, 0x11)),
+            Some(&(at + 100)),
+            "a refilled node lost the key it took",
+        );
+        assert_eq!(
+            tree.get(&held(at, 0)),
+            None,
+            "a refilled node answered for the key that left",
+        );
+    }
+    let walked: Vec<Key> = tree.iter().map(|(key, _)| *key).collect();
+    let mut wanted: Vec<Key> = (0..LEAVES).map(|at| held(at, 0x11)).collect();
+    wanted.sort();
+    assert_eq!(walked, wanted, "a refilled tree walked out of order");
+}
+
+// keys that share their whole lead have a node read its lead from past them
+#[test]
+fn a_shared_lead_moves_the_window_and_still_answers() {
     const COUNT: usize = 4_000;
 
     let mut tied: Tree = TBTreeMap::new();
@@ -487,7 +534,12 @@ fn a_tied_lead_still_answers_and_says_that_it_tied() {
     assert_eq!(spread.len(), COUNT, "the spread tree lost keys");
 
     assert!(
-        tied.tie_rate() > 0.99,
+        tied.lead_skip() >= 8.0,
+        "a node holding keys that agree on eight bytes moved its window {:.1} bytes",
+        tied.lead_skip(),
+    );
+    assert!(
+        tied.tie_rate() < 0.01,
         "keys sharing eight leading bytes reported a tie rate of {:.4}",
         tied.tie_rate(),
     );
@@ -497,7 +549,7 @@ fn a_tied_lead_still_answers_and_says_that_it_tied() {
         spread.tie_rate(),
     );
 
-    // The answers are the point: a tie costs comparisons and changes nothing else.
+    // The answers are the point: the window moves the lead and changes nothing else.
     for (at, key) in tied_keys.iter().enumerate() {
         assert_eq!(
             tied.get(key),
@@ -513,9 +565,21 @@ fn a_tied_lead_still_answers_and_says_that_it_tied() {
         );
     }
 
-    // The order across a tied run comes from the whole keys rather than the lead.
+    // A probe carrying none of the bytes the nodes share is placed by that
+    // comparison rather than by a lead read from past bytes it does not have.
+    for edge in [0x00u8, 0xff] {
+        let mut outside: Key = [0x5a; 34];
+        outside[0] = edge;
+        assert_eq!(
+            tied.get(&outside),
+            None,
+            "a probe outside the shared prefix was found",
+        );
+    }
+
+    // The order comes from the whole keys, whatever the window reads.
     let walked: Vec<Key> = tied.iter().map(|(key, _)| *key).collect();
     let mut wanted = tied_keys.clone();
     wanted.sort();
-    assert_eq!(walked, wanted, "a tied run walked out of order");
+    assert_eq!(walked, wanted, "a windowed run walked out of order");
 }

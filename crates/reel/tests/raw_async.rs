@@ -16,9 +16,9 @@
 //! Knobs, all optional, each refusing a value it cannot read rather than falling back:
 //! REEL_ASYNC_MODES, REEL_ASYNC_BACKEND, REEL_ASYNC_SYNC, REEL_ASYNC_SIZES,
 //! REEL_ASYNC_THREADS, REEL_ASYNC_TAILS, REEL_ASYNC_DEPTH, REEL_ASYNC_BYTES,
-//! REEL_ASYNC_MAX_BYTES, REEL_ASYNC_MAX_OPS, REEL_ASYNC_DIR, REEL_ASYNC_DROP_CACHES,
-//! REEL_ASYNC_RING_WAIT. DROP_CACHES needs root and is what makes a read row a device
-//! number rather than a memcpy.
+//! REEL_ASYNC_MAX_BYTES, REEL_ASYNC_MAX_OPS, REEL_ASYNC_DIR, REEL_ASYNC_DROP_CACHES.
+//! DROP_CACHES needs root and is what makes a read row a device number rather than a
+//! memcpy.
 
 use std::future::Future;
 use std::path::Path;
@@ -34,7 +34,6 @@ use tempfile::TempDir;
 
 use reel::append::admission::InflightBudget;
 use reel::append::Commit;
-use reel::config::{RingTuning, RingWait};
 use reel::io::select::select_backend;
 use reel::io::slots::SLOT_COUNT;
 use reel::reel::segment::{FdCache, IoDriver};
@@ -485,10 +484,6 @@ fn open_reel(base: &std::path::Path, backend: IoBackend, sync: SyncPolicy) -> Re
         sync,
         active_tails: ThreadBudget::threads(env_bytes("REEL_ASYNC_TAILS", 0) as u32),
         scrub_mbps: 0,
-        uring: RingTuning {
-            wait: ring_wait(),
-            ..RingTuning::default()
-        },
         ..ReelConfig::default()
     };
     std::fs::create_dir_all(base).expect("reel dir");
@@ -504,7 +499,7 @@ fn open_reel(base: &std::path::Path, backend: IoBackend, sync: SyncPolicy) -> Re
         TEST_COLUMNS,
         1,
     ));
-    Reel::open(shared).expect("open reel")
+    Reel::open(shared, Vec::new()).expect("open reel")
 }
 
 /// One measured run of a cell: tail count, put seconds, durable seconds, cpu seconds
@@ -764,19 +759,6 @@ fn drive_flights<Flight: Future>(
     }
 }
 
-/// How a thread waits on a completion the ring has not filed yet
-///
-/// The default reads the wait off what the ring is holding, spinning for a write about
-/// to land and sleeping for a read that is a device away.
-fn ring_wait() -> RingWait {
-    match std::env::var("REEL_ASYNC_RING_WAIT").as_deref() {
-        Ok("kernel") => RingWait::Kernel,
-        Ok("spin") => RingWait::Spin,
-        Ok("auto") | Err(_) => RingWait::Auto,
-        Ok(other) => panic!("REEL_ASYNC_RING_WAIT `{other}` is not a known wait"),
-    }
-}
-
 /// A store on a real backend in a fresh directory, never serving from a mapping
 ///
 /// The async door always reads through the driver, so a mapped blocking row would win
@@ -788,10 +770,6 @@ fn open_store(base: &Path, backend: IoBackend) -> ReelStore {
         active_tails: ThreadBudget::threads(env_bytes("REEL_ASYNC_TAILS", 0) as u32),
         scrub_mbps: 0,
         map_above: None,
-        uring: RingTuning {
-            wait: ring_wait(),
-            ..RingTuning::default()
-        },
         ..ReelConfig::default()
     };
     std::fs::create_dir_all(base).expect("reel dir");

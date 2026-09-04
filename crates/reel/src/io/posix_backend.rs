@@ -653,6 +653,10 @@ impl PosixBackend {
                 tag,
                 outcome: Outcome::Done(self.allocate(file, offset, len)),
             },
+            Op::Truncate { tag, file, len } => Completion {
+                tag,
+                outcome: Outcome::Done(self.truncate(file, len)),
+            },
             Op::Advise {
                 tag,
                 file,
@@ -727,6 +731,11 @@ impl PosixBackend {
     fn allocate(&self, file: FileId, offset: u64, len: u64) -> Result<()> {
         let fd = self.fd_of(file)?;
         raw_allocate(fd, offset, len)
+    }
+
+    fn truncate(&self, file: FileId, len: u64) -> Result<()> {
+        let fd = self.fd_of(file)?;
+        truncate_to(fd, len)
     }
 
     fn length(&self, file: FileId) -> Result<u64> {
@@ -1378,27 +1387,25 @@ fn raw_sync_range(_fd: RawFd, _offset: u64, _len: u64, _mode: SyncRangeMode) -> 
 
 #[cfg(target_os = "linux")]
 fn raw_allocate(fd: RawFd, offset: u64, len: u64) -> Result<()> {
-    let end = offset.saturating_add(len);
-    let ret = unsafe { libc::fallocate(fd, 0, offset as libc::off_t, len as libc::off_t) };
+    // The reservation claims blocks without touching the length, so the file
+    // always ends at its last written byte and a crash leaves no slack inside
+    // it. A filesystem that cannot reserve just lets the writes allocate.
+    let ret = unsafe {
+        libc::fallocate(
+            fd,
+            libc::FALLOC_FL_KEEP_SIZE,
+            offset as libc::off_t,
+            len as libc::off_t,
+        )
+    };
     if ret == 0 {
         return Ok(());
     }
     let error = io::Error::last_os_error();
     match error.raw_os_error() {
-        Some(code) if code == libc::ENOSYS || code == libc::EOPNOTSUPP => extend_to(fd, end),
+        Some(code) if code == libc::ENOSYS || code == libc::EOPNOTSUPP => Ok(()),
         _ => Err(ReelError::Io(error)),
     }
-}
-
-/// Set the logical size to an end the file has not reached, never shrinking
-///
-/// A reservation step can arrive after the write head has passed its end, and a
-/// truncate down would destroy records that already landed.
-fn extend_to(fd: RawFd, end: u64) -> Result<()> {
-    if raw_length(fd)? >= end {
-        return Ok(());
-    }
-    truncate_to(fd, end)
 }
 
 /// Reserve a byte range on macOS, which counts its length differently from Linux
@@ -1410,7 +1417,11 @@ fn extend_to(fd: RawFd, end: u64) -> Result<()> {
 #[cfg(target_os = "macos")]
 fn raw_allocate(fd: RawFd, offset: u64, len: u64) -> Result<()> {
     let end = offset.saturating_add(len);
-    let held = raw_length(fd)?;
+    // Measured in allocated blocks rather than length: the length stays at the
+    // last written byte, and blocks are what the reservation actually holds.
+    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+    checked(unsafe { libc::fstat(fd, &mut status) })?;
+    let held = status.st_blocks as u64 * 512;
     if let Some(shortfall) = end.checked_sub(held).filter(|wanted| *wanted > 0) {
         let mut store = libc::fstore_t {
             fst_flags: libc::F_ALLOCATECONTIG,
@@ -1426,7 +1437,9 @@ fn raw_allocate(fd: RawFd, offset: u64, len: u64) -> Result<()> {
         }
         let _ = reserved;
     }
-    extend_to(fd, end)
+    // The length is left alone on purpose: the file ends at its last written
+    // byte, and the reservation lives past it.
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1654,9 +1667,9 @@ mod tests {
         assert_eq!(&buf, b"hello reel");
     }
 
-    // allocate reserves and sets the logical file size
+    // allocate reserves without touching the logical file size
     #[test]
-    fn allocate_sets_size() {
+    fn allocate_leaves_the_length_alone() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("segment-1");
         let backend = PosixBackend::new();
@@ -1680,7 +1693,7 @@ mod tests {
             .expect("submit list");
         let entries = listed(drain_one(&backend).outcome).expect("list");
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].len, 4096);
+        assert_eq!(entries[0].len, 0, "a reservation extended the length");
     }
 
     // extending a segment chunk by chunk reserves the segment, not the sum of offsets
@@ -1712,10 +1725,7 @@ mod tests {
         let held = std::fs::File::open(&path).expect("open the segment");
         let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
         assert_eq!(unsafe { libc::fstat(held.as_raw_fd(), &mut status) }, 0);
-        assert_eq!(
-            status.st_size as u64, logical,
-            "the logical size is the segment"
-        );
+        assert_eq!(status.st_size, 0, "a reservation extended the length");
 
         // Blocks are reported in 512 byte units on both platforms this builds for.
         // A little slack, since a filesystem may round a reservation up.

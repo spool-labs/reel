@@ -270,7 +270,8 @@ fn drawn_fault(rng: &mut SmallRng) -> (FaultKind, bool) {
         73..=78 => (FaultKind::SyncError, true),
         79..=84 => (FaultKind::ReadError, false),
         85..=89 => (FaultKind::EnospcAppend, false),
-        90..=93 => (FaultKind::EnospcAllocate, false),
+        90..=92 => (FaultKind::EnospcAllocate, false),
+        93 => (FaultKind::TruncateError, false),
         94..=96 => (FaultKind::ReorderDir, false),
         _ => (
             FaultKind::BitFlip {
@@ -490,6 +491,75 @@ fn caller_walk(store: &Arc<ReelStore>, sim: &SimIo, seed: u64, caller: u64) -> (
 }
 
 /// Everything the store serves over the key space, errors tolerated per key
+/// Versions a second life stamps, past anything a caller walk can draw
+const SECOND_LIFE: u64 = 1 << 48;
+
+/// A second life on the walk's image: the open resumes the tails, a quarter of
+/// a walk lands behind the resumed rows, and a third open must hand back
+/// exactly what the second held. The device is fault free, so nothing is
+/// waived, whatever shape the first life took.
+fn resumed_life(seed: u64, shape: &Shape, root: PathBuf, image: DurableImage) {
+    let sim = SimIo::from_image(image);
+    let store = ReelStore::open_with_io(
+        root.clone(),
+        config(shape),
+        TEST_COLUMNS,
+        Arc::new(sim.clone()),
+    )
+    .expect("a resumed open");
+    let mut rng = SmallRng::seed_from_u64(seed ^ 0x5EC0_11FE);
+    let mut expected: BTreeMap<Key, u64> = BTreeMap::new();
+    for step in 0..(ops_per_caller() / 4 + 16) {
+        let group = GROUPS[rng.gen_range(0..GROUPS.len())];
+        let byte = rng.gen_range(0..ADDRESS_SPACE);
+        let key = (group, byte);
+        if rng.gen_bool(0.85) {
+            let version = SECOND_LIFE | step;
+            store
+                .put(&key_of(key), &stamped(byte, version))
+                .expect("a second life put");
+            expected.insert(key, version);
+        } else {
+            store.delete(&key_of(key)).expect("a second life delete");
+            expected.remove(&key);
+        }
+    }
+    store.flush().expect("a second life flush");
+    let (held, failed) = view(&store);
+    assert!(
+        failed.is_empty(),
+        "seed {seed}: a resumed store failed to read {failed:?}"
+    );
+    for (key, version) in &expected {
+        let payload = held
+            .get(key)
+            .unwrap_or_else(|| panic!("seed {seed}: a resumed store lost {key:?}"));
+        assert_eq!(
+            version_of(payload),
+            *version,
+            "seed {seed}: a resumed store serves a stale version for {key:?}"
+        );
+    }
+    drop(store);
+
+    let third = ReelStore::open_with_io(
+        root,
+        config(shape),
+        TEST_COLUMNS,
+        Arc::new(SimIo::from_image(sim.durable_image())),
+    )
+    .expect("a third open");
+    let (after, failed) = view(&third);
+    assert!(
+        failed.is_empty(),
+        "seed {seed}: a third open failed to read {failed:?}"
+    );
+    assert_eq!(
+        held, after,
+        "seed {seed}: a resume cycle changed what the store holds"
+    );
+}
+
 fn view(store: &ReelStore) -> (BTreeMap<Key, Vec<u8>>, BTreeSet<Key>) {
     let mut held = BTreeMap::new();
     let mut failed = BTreeSet::new();
@@ -696,14 +766,20 @@ fn walk(seed: u64) {
 
     let image = sim.durable_image();
     let restored = SimIo::from_image(image.clone());
-    let reopened = ReelStore::open_with_io(root, config(&shape), TEST_COLUMNS, Arc::new(restored))
-        .expect("reopen");
+    let reopened = ReelStore::open_with_io(
+        root.clone(),
+        config(&shape),
+        TEST_COLUMNS,
+        Arc::new(restored),
+    )
+    .expect("reopen");
     let (after, after_failed) = view(&reopened);
     assert!(
         shape.lies || after_failed.is_empty(),
         "seed {seed}: a reopen failed to read {after_failed:?} from a fault free device"
     );
     assert_attempted(seed, "a reopen", &after, &attempted);
+    resumed_life(seed, &shape, root.clone(), image.clone());
     if let Some((live, live_sites, live_lsns)) = live {
         if !shape.lies && flushed && live != after {
             // The index's own testimony for the keys the two sides disagree on, which is

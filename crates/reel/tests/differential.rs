@@ -109,6 +109,11 @@ fn merging_config(active_tails: u32) -> ReelConfig {
     ReelConfig {
         merge_sorted_runs: true,
         compact_dead_ratio: 1.0,
+        // Half the paged segment, the smallest a batch and its block fit: the
+        // stream's tails resume across its reopens rather than leaving
+        // orphans, so rolls have to make the runs the merge collapses, and at
+        // the paged size the stream barely fills one segment.
+        segment_bytes: ByteCount::from_bytes(8 * 1024),
         ..rewriting_config(active_tails)
     }
 }
@@ -469,20 +474,12 @@ fn open_never_reopen() {
     }
 }
 
-/// The index written down at a cue, and read back at the reopens the stream takes
-fn checkpointing_config(active_tails: u32) -> ReelConfig {
-    ReelConfig {
-        index_checkpoint: true,
-        ..reel_config(active_tails)
-    }
-}
-
 // a volume reopening from its written-down index serves what the oracle serves
 #[test]
 #[cfg(not(miri))]
 fn checkpointed_single_tail() {
     for seed in SEEDS {
-        let mut fixture = Differential::open(*seed, checkpointing_config(1));
+        let mut fixture = Differential::open(*seed, reel_config(1)).checkpointing();
         fixture.run_stream(&op_stream::generate(*seed, STREAM_LEN));
         assert!(
             fixture.checkpointed_keys() > 0,
@@ -496,7 +493,7 @@ fn checkpointed_single_tail() {
 #[cfg(not(miri))]
 fn checkpointed_multi_tail() {
     for seed in SEEDS {
-        let mut fixture = Differential::open(*seed, checkpointing_config(4));
+        let mut fixture = Differential::open(*seed, reel_config(4)).checkpointing();
         fixture.run_stream(&op_stream::generate(*seed, STREAM_LEN));
         assert!(
             fixture.checkpointed_keys() > 0,
@@ -510,13 +507,7 @@ fn checkpointed_multi_tail() {
 #[cfg(not(miri))]
 fn checkpointed_never_reopen() {
     for seed in SEEDS {
-        let mut fixture = Differential::open(
-            *seed,
-            ReelConfig {
-                index_checkpoint: true,
-                ..never_config(1)
-            },
-        );
+        let mut fixture = Differential::open(*seed, never_config(1)).checkpointing();
         fixture.run_stream(&op_stream::generate(*seed, STREAM_LEN));
         assert!(
             fixture.checkpointed_keys() > 0,
@@ -530,7 +521,7 @@ fn checkpointed_never_reopen() {
 #[cfg(not(miri))]
 fn checkpointed_open_shards() {
     for seed in SEEDS {
-        let mut fixture = Differential::open_shaped(*seed, checkpointing_config(1));
+        let mut fixture = Differential::open_shaped(*seed, reel_config(1)).checkpointing();
         fixture.run_stream(&op_stream::generate(*seed, STREAM_LEN));
         assert!(
             fixture.checkpointed_keys() > 0,

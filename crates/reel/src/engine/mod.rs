@@ -27,6 +27,7 @@ use crate::append::admission::InflightBudget;
 use crate::compaction::compactor::{CompactionCounters, Compactor};
 use crate::config::{ReelConfig, DEFAULT_FD_CACHE};
 use crate::error::{ReelError, Result};
+use crate::format::band::Band;
 use crate::format::column::{spec_by_name, ColumnId, ColumnSet, ColumnSpec, RecordKey};
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::SegmentId;
@@ -266,17 +267,17 @@ pub struct ReelStore {
 
 /// The index a previous cue wrote down, where this open may believe any of it
 ///
-/// Unarmed, nothing is read at all, and a paging volume never wrote one. A file
-/// describing columns the store no longer serves is refused whole rather than in
-/// part, since dropping a block's rows while still skipping its segments is the one
-/// way this file loses a live record.
+/// Read whenever one is there: a paging volume never wrote one, and every other file is
+/// CRC verified per block and joined newest-wins, so believing it can only save reads. A
+/// file describing columns the store no longer serves is refused whole rather than in
+/// part, since dropping a block's rows while skipping its segments loses a live record.
 fn offered_index(
     driver: &IoDriver,
     root: &Path,
     config: &ReelConfig,
     columns: ColumnSet,
 ) -> Result<Option<PersistedReader>> {
-    if !config.index_checkpoint || config.index.pages() {
+    if config.index.pages() {
         return Ok(None);
     }
     let Some(reader) = PersistedReader::open(driver, root)? else {
@@ -431,6 +432,26 @@ impl ReelStore {
         for path in &rebuilt.quarantined {
             tracing::warn!("quarantined a foreign reel segment at {}", path.display());
         }
+        // A crash keeps a tail's reservation claimed past its end, and nothing
+        // writes that file again. Cutting each walked tail at its own length
+        // gives the blocks back without touching a byte it holds. Best effort:
+        // a store that cannot release still serves.
+        if !is_read_only {
+            for (path, len) in &rebuilt.walked {
+                let released = (|| -> Result<()> {
+                    let file = driver.open(path, false)?;
+                    let outcome = driver.truncate(file, *len);
+                    driver.close(file)?;
+                    outcome
+                })();
+                if let Err(error) = released {
+                    tracing::warn!(
+                        segment = %path.display(),
+                        "failed to release a walked tail's reservation: {error}",
+                    );
+                }
+            }
+        }
         // Taken before the install, which takes the map with it.
         let mut on_disk: Vec<SegmentId> = rebuilt.segments.keys().copied().collect();
         on_disk.sort();
@@ -468,7 +489,7 @@ impl ReelStore {
 
         let reel = match is_read_only {
             true => Reel::open_read_only(Arc::clone(&shared)),
-            false => Reel::open(Arc::clone(&shared))?,
+            false => Reel::open(Arc::clone(&shared), rebuilt.resumable)?,
         };
         // The volume exists now, so the index can be told where to read the footers
         // a paged column resolves through. A resident one never asks.
@@ -627,10 +648,10 @@ impl ReelStore {
         self.reel.flush_wait().await
     }
 
-    /// Seal every active tail so the next open resolves the volume from footers
+    /// Flush and stop every active tail, leaving each where the next open resumes it
     ///
-    /// A store dropped without this leaves one unsealed segment per tail, and the
-    /// open that follows reads each of them back record by record.
+    /// Nothing seals on a close: a tail's segment persists across processes and only
+    /// takes a footer when it fills. The open that follows appends where this one stopped.
     pub fn close(&self) -> Result<()> {
         if self.is_read_only {
             return Ok(());
@@ -724,6 +745,19 @@ impl ReelStore {
         self.compactor.counters()
     }
 
+    /// The band each foreground tail is drawing under right now
+    pub fn tail_bands(&self) -> Vec<Option<Band>> {
+        self.reel.tail_bands()
+    }
+
+    /// Banded writes that found no tail free and went to the unbanded ones instead
+    ///
+    /// A number that keeps climbing says the volume holds more live death windows than
+    /// it has tails, so the placement its keys ask for is not the one they are getting.
+    pub fn band_fallbacks(&self) -> u64 {
+        self.reel.band_fallbacks()
+    }
+
     /// Whether windows may still be read around the page cache on this volume
     ///
     /// A filesystem that serves no direct open retires the route, so this tells a
@@ -783,7 +817,7 @@ impl ReelStore {
 }
 
 impl Drop for ReelStore {
-    /// Seal the tails on the way out, so a clean shutdown reopens from footers
+    /// Flush the tails on the way out, so what they hold is durable
     ///
     /// A caller that wants to hear about a failure calls close itself; here a failure
     /// is traced and the volume is left the way a crash would leave it.

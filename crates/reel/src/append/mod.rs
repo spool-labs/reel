@@ -19,12 +19,14 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::config::{Preallocate, SyncPolicy, VolumeClass};
 use crate::error::{ReelError, Result};
+use crate::format::band::Band;
 use crate::format::column::RecordKey;
 use crate::format::footer::{FooterEntry, SegmentFooter};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::{Lsn, LsnCounter};
 use crate::format::record::{align_up, BatchFrame, Flags, RecordHeader, BLOCK, HEADER_LEN};
 use crate::format::segment_header::SegmentHeader;
+use crate::index::recovery::ResumableTail;
 use crate::io::op::{Op, OwnedBuf, SyncRangeMode, WriteBuf};
 use crate::reel::segment::{IoDriver, SegmentHandle};
 use crate::reel::tail::Tail;
@@ -259,6 +261,9 @@ pub struct Appender {
     /// The tier this tail's draws go to, fast except when compaction demotes
     draw_class: AtomicU8,
 
+    /// The death window this tail's draws are stamped with, nothing for unbanded traffic
+    band: Mutex<Option<Band>>,
+
     /// Whether a merge owns this tail, so every segment it draws is merge output
     writes_merge_output: bool,
 
@@ -316,9 +321,13 @@ impl DrainDepth {
 }
 
 impl Appender {
-    /// Open a tail, drawing a fresh segment and writing its header as record zero
-    pub fn open(shared: Arc<ReelShared>, index: u64) -> Result<Appender> {
-        Appender::start(shared, index, false)
+    /// Open a tail on the segment a previous process left, or a fresh draw
+    pub fn open(
+        shared: Arc<ReelShared>,
+        index: u64,
+        resumed: Option<ResumableTail>,
+    ) -> Result<Appender> {
+        Appender::start(shared, index, false, resumed)
     }
 
     /// Open a tail of a merge's own, whose segments hold nothing but its output
@@ -327,10 +336,15 @@ impl Appender {
     /// records would leave a segment that is not a run. Every segment this draws is
     /// marked as the merge's.
     pub fn open_for_merge(shared: Arc<ReelShared>, index: u64) -> Result<Appender> {
-        Appender::start(shared, index, true)
+        Appender::start(shared, index, true, None)
     }
 
-    fn start(shared: Arc<ReelShared>, index: u64, writes_merge_output: bool) -> Result<Appender> {
+    fn start(
+        shared: Arc<ReelShared>,
+        index: u64,
+        writes_merge_output: bool,
+        resumed: Option<ResumableTail>,
+    ) -> Result<Appender> {
         let tail = Arc::new(Tail::new(index));
         let driver = Arc::clone(&shared.driver);
         let active = Arc::new(RwLock::new(placeholder_active(driver)));
@@ -343,9 +357,13 @@ impl Appender {
             inflight: AtomicU64::new(0),
             depth: DrainDepth::default(),
             draw_class: AtomicU8::new(0),
+            band: Mutex::new(None),
             writes_merge_output,
         };
-        let fresh = appender.prepare_segment()?;
+        let fresh = match resumed {
+            Some(tail) => appender.resume_segment(tail)?,
+            None => appender.prepare_segment()?,
+        };
         appender.adopt(&mut write(&appender.active), fresh);
         Ok(appender)
     }
@@ -635,6 +653,77 @@ impl Appender {
         Ok(id)
     }
 
+    /// The death window this tail's segments are drawn under
+    pub fn band(&self) -> Option<Band> {
+        *lock(&self.band)
+    }
+
+    /// Point the tail's draws at a band, ending the segment it holds now
+    ///
+    /// A segment says which band it was drawn under in its header, so a change only ever
+    /// reaches the next segment: the one open here is sealed behind it, and one holding
+    /// nothing but its header is scrapped rather than sealed as a shell.
+    pub fn set_band(&self, band: Option<Band>) -> Result<()> {
+        let previous = {
+            // The spare is held across the change, so a writer drawing one ahead either
+            // draws it before this or under the band this leaves behind.
+            let mut spare = lock(&self.spare);
+            let mut held = lock(&self.band);
+            if *held == band {
+                return Ok(());
+            }
+            if let Some(stale) = spare.take() {
+                self.scrap(stale);
+            }
+            std::mem::replace(&mut *held, band)
+        };
+
+        let rolled = {
+            let mut active = write(&self.active);
+            let empty = lock(&active.entries).is_empty();
+            self.swap_in_fresh(&mut active).map(|held| (held, empty))
+        };
+        let (retired, was_empty) = match rolled {
+            Ok(rolled) => rolled,
+            // The draw failed, so the tail is still on a segment stamped with the band it
+            // had, and that is what it must go on saying.
+            Err(error) => {
+                *lock(&self.band) = previous;
+                return Err(error);
+            }
+        };
+        if was_empty {
+            self.scrap(retired);
+            return Ok(());
+        }
+        let end = retired.end();
+        let sealed = retire_segment(&self.shared, &retired, end);
+        if sealed.is_err() {
+            park_broken_seal(&self.shared, retired, end);
+        }
+        sealed
+    }
+
+    /// Give a drawn segment back unwritten, since nothing points into it
+    fn scrap(&self, held: Active) {
+        let drawn = held.handle.id();
+        held.handle.mark_doomed();
+        // Durable because nothing is owed: the file is going away, and a flush that
+        // arrives later must settle rather than park forever.
+        held.sync.mark_durable();
+        // A hold or a mark left behind would stop the held floor ever advancing past a
+        // segment that is not there.
+        self.shared.release_segment(drawn);
+        self.shared.forget_merge_output(drawn);
+    }
+
+    /// Give the spare drawn ahead back, for a tail that is stopping
+    fn doom_spare(&self) {
+        if let Some(held) = lock(&self.spare).take() {
+            self.scrap(held);
+        }
+    }
+
     /// Flush, seal the last segment, and give its hold up, for a tail that ends
     ///
     /// The hold is what keeps the maintenance plane off a segment, so a tail that lives
@@ -642,27 +731,53 @@ impl Appender {
     /// or reclaim again. A failed seal keeps the hold.
     pub fn finish(&self) -> Result<()> {
         self.flush()?;
-        self.close()?;
-        // Read after the close, so the segment released is the one the close sealed.
+        self.seal_terminal()?;
+        // Read after the seal, so the segment released is the one it sealed.
         self.shared.release_segment(self.tail.active_segment());
         Ok(())
     }
 
-    /// Seal the active segment and stop the tail, for a clean shutdown
+    /// Flush the tail and stop it, leaving its segment open for the next process
     ///
-    /// Sealing on the way out is what tells a shutdown from a crash on disk. The tail is
-    /// left with nothing to append to, so a write that still arrives rolls first.
+    /// Nothing seals here on purpose: the tail stays where it is and the next
+    /// open resumes it, so a restart costs no segment. Only a full segment ever
+    /// takes a footer. The sync is what makes the stop clean.
     pub fn close(&self) -> Result<()> {
-        if let Some(spare) = lock(&self.spare).take() {
-            let drawn = spare.handle.id();
-            spare.handle.mark_doomed();
-            // The file goes, so a hold or a mark left behind would stop the held floor
-            // ever advancing past a segment that is not there.
-            self.shared.release_segment(drawn);
-            self.shared.forget_merge_output(drawn);
-        }
+        self.doom_spare();
         let active = write(&self.active);
         if active.terminal.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let flushed = self.shared.driver.sync_full(active.handle.file());
+        active.terminal.store(true, Ordering::Release);
+        match &flushed {
+            Ok(()) => active.sync.mark_durable(),
+            Err(_) => active.sync.mark_broken(),
+        }
+        flushed
+    }
+
+    /// Seal the active segment and stop the tail, for a tail that ends for good
+    ///
+    /// The tail is left with nothing to append to, so a write that still arrives
+    /// rolls first.
+    fn seal_terminal(&self) -> Result<()> {
+        self.doom_spare();
+        let active = write(&self.active);
+        if active.terminal.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // A tail whose footer lists nothing holds a header and a reservation. It
+        // goes the way the spare goes rather than sealing a shell.
+        if lock(&active.entries).is_empty() {
+            let drawn = active.handle.id();
+            active.handle.mark_doomed();
+            active.terminal.store(true, Ordering::Release);
+            // Durable because nothing is owed: the file is going away, and a
+            // flush that arrives later must settle rather than park forever.
+            active.sync.mark_durable();
+            self.shared.release_segment(drawn);
+            self.shared.forget_merge_output(drawn);
             return Ok(());
         }
         let end = active.end();
@@ -1342,6 +1457,42 @@ impl Appender {
         }
     }
 
+    /// Take up the segment a previous process left unsealed, at its walked end
+    ///
+    /// One sync makes the resumed bytes durable before anything new rides behind them.
+    fn resume_segment(&self, resumed: ResumableTail) -> Result<Active> {
+        let holds = self.shared.adopt_segment(resumed.segment);
+        let file = self.shared.driver.open(&resumed.path, false)?;
+        let handle = SegmentHandle::new(
+            resumed.segment,
+            resumed.path,
+            file,
+            Arc::clone(&self.shared.driver),
+        );
+        let mut entries = SegmentFooter::empty();
+        for row in &resumed.rows {
+            entries.push(row);
+        }
+        let active = Active {
+            handle,
+            reserved: AtomicU64::new(resumed.end),
+            settled: AtomicU64::new(resumed.end),
+            cut_at: AtomicU64::new(NO_CUT),
+            alloc_high: AtomicU64::new(resumed.end),
+            entries: Mutex::new(entries),
+            sync: Arc::new(SyncState::new()),
+            terminal: AtomicBool::new(false),
+            holds,
+        };
+        let reserve = self.preallocate(&active)?;
+        active
+            .alloc_high
+            .store(reserve.max(resumed.end), Ordering::Release);
+        self.shared.driver.sync_full(active.handle.file())?;
+        active.sync.synced_at.store(resumed.end, Ordering::Release);
+        Ok(active)
+    }
+
     /// Draw a fresh segment, reserve its space, and write its header as record zero
     ///
     /// Drawing the number claims it, so a segment that never came together gives it
@@ -1458,7 +1609,9 @@ impl Appender {
             .alloc_high
             .store(self.preallocate(&active)?, Ordering::Release);
 
-        let payload = SegmentHeader::new(id).pack().to_vec();
+        // Stamped at the draw, since a band is what the segment is for and compaction
+        // reads it off the file to place the survivors it copies out.
+        let payload = SegmentHeader::banded(id, self.band()).pack().to_vec();
         let header = RecordHeader::segment_header(&payload);
         let span = self.reserved_span(&header);
         active.reserved.store(span, Ordering::Release);

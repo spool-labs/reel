@@ -206,13 +206,15 @@ leg copied 1042 MiB in 36 s, 30 MB/s of copies against the 40 MB/s cap that run
 named, and reclaimed nothing by unlink at all: an average at three quarters of the
 ceiling on a bursty workload means the gate was shutting.
 
-**Routing writes to their own tails by expected lifetime was measured and refused.**
-Separating a churning key set from a write-once one takes an interleaved workload
-from 0.93 bytes copied per byte reclaimed to 0.02, but the shape this engine is
-built for has nothing to give up: a cohort volume already retires 80 of 81 segments
-by unlink and copies 0.9 MB against 676 MB reclaimed, and banding it only splits the
-tails and the segments finer. The win is real and belongs to whoever has mixed
-lifetimes; it is not a reason to grow `ColumnSpec` a field for callers who do not.
+**Routing writes to their own tails by expected lifetime shipped as a key-derived
+column declaration.** Separating a churning key set from a write-once one takes an
+interleaved workload from 0.93 bytes copied per byte reclaimed to 0.02, but the shape
+this engine is built for has nothing to give up: a cohort volume already retires 80 of
+81 segments by unlink and copies 0.9 MB against 676 MB reclaimed, and banding it only
+splits the tails and the segments finer. So nothing is placed unless a column asks. A
+column that already tells the engine when its records die, through
+`ColumnSpec::purge_mark`, can be placed by that same fact; every other column routes
+exactly as before. What declaring it is worth is measured below.
 
 **So "low stakes" is a property of the shape, not of the engine.** Columns share
 segments, so one column that churns scatters dead bytes inside segments otherwise
@@ -220,6 +222,78 @@ live, and a group drop is a cover push plus a range tombstone rather than a dire
 unlink, which is that same scattered shape. `CompactionCounters::move_ratio` says
 which path a volume is on: the closer to zero, the more of its reclamation was an
 unlink.
+
+## Placement bands
+
+**A band is a death window the engine reads out of the key, and the whole mechanism is
+that it keeps one window to its own tail.** A column declares `purge_mark` with
+`places` set, which is the offset it already names for the purge timeline; `route`
+derives a band from every put on that column and sends it to the tail that band is on,
+claiming a tail from the pool on the first write. The pool is the tail count already
+configured, never more: bands do not add tails. One tail is always left unclaimed, so
+traffic in no band is never mixed into a banded segment, and a band that finds no tail
+free writes there too rather than stalling, which `band_fallbacks` counts. A batch
+takes one tail, so a batch of placed puts takes the band covering the last of them to
+die and any other batch takes none. The band goes into the segment header at the draw,
+so a segment says what it was drawn for; `compact_segment` reads it off the file and
+routes that segment's survivors to the same band's tail. Both halves are required: the
+paper (Lee, Ziegler, Leis, VLDB'26, section 4) is explicit that placement whose GC is
+not band-aware intermixes back to the baseline. `tests/engine/bands.rs` holds what the
+win rests on: a segment carries one band's records and no others, and a rewrite puts
+the survivors back under the same one.
+
+**The band is the position by which everything in it is dead.** A key's mark is an
+absolute death, and grouping on it raw would open a band per timeline unit and exhaust
+the pool, so `Band::of` takes the distance from the volume's purge floor to that death,
+rounds it down to a power of two, and rounds the death up to a multiple of that width:
+precision scaled to lifetime, which is the paper's zone-by-expected-death-time rule in
+the units the caller already declared. The width is added to the number, so two windows
+cut at different precisions that end on the same multiple stay apart. Because the
+number is a timeline position, a floor that reaches it says the window is finished and
+the pool takes its tail back with nobody asking. A volume that never moves its floor
+reads every distance as the whole timeline, bands coarsely, and rotates its pool only
+on quiet: 193 MiB rewritten on R2 below rather than 109.
+
+The workload is the deathtime campaign's, replayed against the mechanism instead of a
+model of it: one volume, 9,448 B coded slices under a 34 B key carrying its tape's
+expiry, lifetimes log-uniform over 2..256 epochs weighted young, per-key tombstones at
+expiry, compaction driven to a fixpoint and every tail cued at every epoch boundary in
+every arm. **A** is arrival order on one tail, what the engine did before. **T** is
+arrival order on the band run's tail count, so a win reads as placement rather than as
+having drawn more tails. **P** is E's marked column and E's purge floor on A's one
+tail, so a win reads as placement rather than as the purge dropping records for free.
+**E** is plain puts on a column declaring the mark. macOS, 2026-08-29.
+
+| run | shape | A rewritten / waf | T | P | E | E vs A |
+|---|---|---|---|---|---|---|
+| R2 | 8 MiB seg, 20 ep, 800 MiB | 427 MiB / 1.532 | 427 / 1.532 | 427 / 1.532 | **109 / 1.136** | 3.9x |
+| R5 | 32 MiB seg, 20 ep | 478 MiB / 1.596 | 478 / 1.596 | 478 / 1.596 | **105 / 1.131** | 4.5x |
+| R7 | 8 MiB seg, 40 ep, 1600 MiB | 1348 MiB / 1.840 | 1348 / 1.840 | 1348 / 1.840 | **311 / 1.194** | 4.3x |
+| R8 | 37,648 B slice, 8 MiB seg | 411 MiB / 1.513 | 411 / 1.513 | 411 / 1.513 | **103 / 1.129** | 4.0x |
+
+T and P are A to the byte in all four. Tails alone move nothing and the mark alone
+moves nothing: the tail a record goes to is what moves it. E also beats the caller-side
+buffering the mechanism replaces, which reached 119 / 1.148 on R2 and 332 / 1.207 on R7
+by holding 32 MiB of writes back; E holds none. Move ratio falls from 1.000 to 0.53, so
+half of what A could only rewrite is now an unlink.
+
+**What it costs is open segments.** The pool wants a tail per window live at once, 16
+in this workload, and below that bands fall back. R2, sweeping the pool:
+
+| banded tails | rewritten / waf | writes that fell back |
+|---|---|---|
+| 7 | 164 MiB / 1.205 | 30,883 |
+| 16 | **109 MiB / 1.136** | 1,462 |
+| 24 | 107 MiB / 1.133 | 0 |
+| 32 | 107 MiB / 1.133 | 0 |
+
+Seventeen tails cued every epoch also leave seventeen partial segments an epoch, which
+is why E's files run 254 against A's 66 and its peak footprint 922 MiB against 521;
+T's 386 files and 1193 MiB say that is the tail count and the cue, not the placement. A
+write-only probe over 400 MiB says banded tails still fill their segments: median
+sealed size 8.0 MiB of an 8 MiB segment at 8 and at 16 tails, the same as unbanded, and
+the interleave index sits at the tail count exactly (14.98 mean, 15.09 worst at 16
+tails) where least-loaded routing spreads it (6.61 mean, 32.39 worst at 8).
 
 ## What 28 TiB costs
 

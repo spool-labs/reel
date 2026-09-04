@@ -116,7 +116,11 @@ pub struct VerifyReport {
     /// Reads the engine itself failed, counted before this sweep read a byte
     pub unreadable_records: u64,
 
-    /// Segment files the index does not name, so nothing reads them
+    /// Segment files holding records the index does not name, so nothing reads them
+    ///
+    /// A segment holding nothing but its own header is left out: an idle tail
+    /// keeps one across a close for the next open to resume, and the index names
+    /// a segment only once a record has landed in it.
     pub not_indexed: Vec<String>,
 
     /// Segments swept that hold no record at all, which is a listing's noise
@@ -197,9 +201,12 @@ pub fn verify_watched(
     rows.sort_by_key(|row| row.segment);
 
     let empty_segments = rows.iter().filter(|row| row.is_empty()).count();
+    // A file holding nothing is nothing to lose: an idle tail keeps its
+    // header-only segment across a close so the next open resumes it, and no
+    // index names a segment before a record lands in it.
     let not_indexed: Vec<String> = rows
         .iter()
-        .filter(|row| !row.indexed)
+        .filter(|row| !row.indexed && !row.is_empty())
         .map(|row| segment_file_name(SegmentId(row.segment)))
         .collect();
 
@@ -453,7 +460,9 @@ fn sweep_footer(file: &mut File, footer: &SegmentFooter, row: &mut VerifyRow, wa
     for (offset, width, len) in at {
         let span = HEADER_LEN as u64 + u64::from(width) + u64::from(len);
         match check(file, u64::from(offset), span) {
-            Checked::Sound(bytes) => {
+            // A footer names records rather than the header, but one that points
+            // there is answered rather than skipped.
+            Checked::Sound(bytes) | Checked::Header(bytes) => {
                 row.sound(bytes);
                 watch.record(bytes);
             }
@@ -475,6 +484,12 @@ fn walk(file: &mut File, len: u64, row: &mut VerifyRow, watch: &mut Watch) {
                 watch.record(bytes);
                 at += bytes;
             }
+            // Read and checked like anything else, then stepped over: it is what
+            // the segment is, not something written into it.
+            Checked::Header(bytes) => {
+                watch.record(bytes);
+                at += bytes;
+            }
             Checked::Fault(why) => {
                 row.fault(why);
                 return;
@@ -488,6 +503,9 @@ fn walk(file: &mut File, len: u64, row: &mut VerifyRow, watch: &mut Watch) {
 enum Checked {
     /// The record checks out, and this is what it spans on disk
     Sound(u64),
+
+    /// The header a segment opens with, which spans bytes but is no record of its own
+    Header(u64),
 
     /// The record is not sound, and this says why
     Fault(String),
@@ -526,7 +544,10 @@ fn check(file: &mut File, at: u64, hint: u64) -> Checked {
         },
     };
     match header.verify(&payload) {
-        true => Checked::Sound(header.span()),
+        true => match header.flags.is_segment_header() {
+            true => Checked::Header(header.span()),
+            false => Checked::Sound(header.span()),
+        },
         false => Checked::Fault(format!("record at {at} fails its checksum")),
     }
 }
@@ -580,7 +601,7 @@ impl Report for VerifyReport {
                     "every sealed segment's footer decodes",
                     "every record a footer indexes matches its checksum",
                     "a segment with no footer is walked to its write frontier",
-                    "every segment file on the roots is one the index names",
+                    "every segment file on the roots holding a record is one the index names",
                 ],
             )
             .term(

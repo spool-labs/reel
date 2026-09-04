@@ -517,9 +517,6 @@ struct Arm {
 
     /// Where the fence over a sealed segment's blocks lives
     fence: FenceResidency,
-
-    /// Whether the volume writes its index down for the next open
-    is_checkpointing: bool,
 }
 
 const ARMS: [Arm; 2] = [
@@ -527,13 +524,11 @@ const ARMS: [Arm; 2] = [
         name: "paged-carrying",
         index: IndexResidency::Paged,
         fence: FenceResidency::Resident,
-        is_checkpointing: false,
     },
     Arm {
         name: "resident",
         index: IndexResidency::Resident,
         fence: FenceResidency::Off,
-        is_checkpointing: true,
     },
 ];
 
@@ -567,7 +562,6 @@ fn config(arm: &Arm, is_merge_driven: bool, knobs: &Knobs) -> ReelConfig {
         scrub_mbps: 0,
         index: arm.index,
         fence: arm.fence,
-        index_checkpoint: arm.is_checkpointing,
         shard_shapes: ShardShapes::Declared,
         rewrite_on_seal: true,
         merge_sorted_runs: is_merge_driven,

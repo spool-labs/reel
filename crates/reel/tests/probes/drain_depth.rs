@@ -105,7 +105,7 @@ fn measure(writers: usize, record: usize, per_writer: u64) -> (Vec<(u64, u64)>, 
         COLUMNS,
         1,
     ));
-    let appender = Arc::new(Appender::open(Arc::clone(&shared), 0).expect("appender"));
+    let appender = Arc::new(Appender::open(Arc::clone(&shared), 0, None).expect("appender"));
 
     let gate = Arc::new(Barrier::new(writers));
     let mut threads = Vec::with_capacity(writers);

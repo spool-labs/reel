@@ -2,8 +2,8 @@
 //!
 //! A reel holds every column on one log, so a record says which column it belongs
 //! to and how wide its key is. Keys are stored at their own column's width rather
-//! than padded to the widest, and carried inline rather than on the heap, since
-//! one is built per record read and written.
+//! than padded to the widest, and the common widths are carried in place rather
+//! than on the heap, since one is built per record read and written.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -17,11 +17,17 @@ use crate::error::{ReelError, Result};
 /// it is what a width field has to be able to say, not a size anything occupies.
 pub const MAX_KEY_LEN: usize = 1056;
 
-/// Widest key carried inline, past which a key goes to the heap
+/// Widest key a record's prefix stages, past which a key rides as a shared tail
 ///
-/// Every fixed-width column the reel serves sits at or under this, so none of
-/// them allocates; a variable column pays a pointer per key.
+/// Every fixed-width column the reel serves sits at or under this, so none of them
+/// splits its record into a second buffer; a wider variable key does.
 pub const INLINE_KEY_LEN: usize = 108;
+
+/// Widest key held in the key's own bytes, past which it holds a pointer
+///
+/// Sized so the common fixed widths, a 32 byte id and the 34 byte record key, sit
+/// in place: a walk builds one key per row it steps, and this is what each weighs.
+pub const SHORT_KEY_LEN: usize = 40;
 
 /// Widest value a column may ask the index to carry for it
 ///
@@ -37,14 +43,18 @@ pub const INLINE_MAX: usize = 4;
 pub const ROW_CARRY_MAX: usize = 256;
 
 /// What a sealed row carries of a value, for a column that asked to carry one
-pub type CarryBytes = [u8; ROW_CARRY_MAX];
+///
+/// On the heap and only where a row really carries something: most columns carry
+/// nothing, and an inline array would cost its full width on every entry built.
+pub type CarryBytes = Box<[u8]>;
 
-/// The leading bytes of a payload, for a row that carries its value
-pub fn carry_bytes(payload: &[u8]) -> CarryBytes {
-    let mut carry = [0u8; ROW_CARRY_MAX];
-    let taken = payload.len().min(ROW_CARRY_MAX);
+/// The leading bytes of a payload, padded out to the width the row reserves
+pub fn carry_bytes(payload: &[u8], width: u16) -> CarryBytes {
+    let width = (width as usize).min(ROW_CARRY_MAX);
+    let mut carry = vec![0u8; width];
+    let taken = payload.len().min(width);
     carry[..taken].copy_from_slice(&payload[..taken]);
-    carry
+    carry.into_boxed_slice()
 }
 
 /// The bytes an index entry or a footer row carries of a value itself
@@ -99,17 +109,22 @@ impl ColumnId {
     }
 }
 
-/// A key's bytes, carried inline where they fit and on the heap where they do not
+/// A key's bytes, carried in place where they fit and on the heap where they do not
 ///
-/// A key past the inline width holds an `Arc`, so cloning stays a refcount rather
-/// than a copy of the name, and the type cannot be `Copy`.
+/// Three widths rather than two, because a rebuild holds one of these per record
+/// version and every one of them would otherwise be as wide as the widest key a
+/// prefix stages. A key past the staging width holds an `Arc`, so cloning stays a
+/// refcount rather than a copy of the name, and the type cannot be `Copy`.
 #[derive(Clone)]
 pub enum KeyBytes {
-    /// Bytes in place, which is what every fixed-width column carries
+    /// Bytes in place, which is what the common fixed widths carry
     Inline {
         width: u8,
-        bytes: [u8; INLINE_KEY_LEN],
+        bytes: [u8; SHORT_KEY_LEN],
     },
+
+    /// Bytes on the heap, owned by the one key, still staged in a record's prefix
+    Boxed(Box<[u8]>),
 
     /// Bytes on the heap, shared by refcount rather than copied
     Spilled(Arc<[u8]>),
@@ -127,7 +142,10 @@ impl KeyBytes {
         if bytes.len() > INLINE_KEY_LEN {
             return Ok(KeyBytes::Spilled(Arc::from(bytes)));
         }
-        let mut inline = [0u8; INLINE_KEY_LEN];
+        if bytes.len() > SHORT_KEY_LEN {
+            return Ok(KeyBytes::Boxed(Box::from(bytes)));
+        }
+        let mut inline = [0u8; SHORT_KEY_LEN];
         inline[..bytes.len()].copy_from_slice(bytes);
         Ok(KeyBytes::Inline {
             width: bytes.len() as u8,
@@ -139,7 +157,7 @@ impl KeyBytes {
     pub fn empty() -> KeyBytes {
         KeyBytes::Inline {
             width: 0,
-            bytes: [0u8; INLINE_KEY_LEN],
+            bytes: [0u8; SHORT_KEY_LEN],
         }
     }
 
@@ -147,6 +165,7 @@ impl KeyBytes {
     pub fn as_slice(&self) -> &[u8] {
         match self {
             KeyBytes::Inline { width, bytes } => &bytes[..*width as usize],
+            KeyBytes::Boxed(bytes) => bytes,
             KeyBytes::Spilled(bytes) => bytes,
         }
     }
@@ -155,21 +174,22 @@ impl KeyBytes {
     pub fn width(&self) -> u16 {
         match self {
             KeyBytes::Inline { width, .. } => u16::from(*width),
+            KeyBytes::Boxed(bytes) => bytes.len() as u16,
             KeyBytes::Spilled(bytes) => bytes.len() as u16,
         }
     }
 
-    /// Whether this key had to go to the heap, which is what a spill counter reads
+    /// Whether this key rides outside the record prefix rather than within it
     pub fn is_spilled(&self) -> bool {
         matches!(self, KeyBytes::Spilled(_))
     }
 
     /// The heap bytes themselves, for a writer that would rather point than copy
     ///
-    /// Nothing for an inline key, which is already staged in the prefix.
+    /// Nothing for a key the prefix stages, which is already copied into it.
     pub fn spilled_bytes(&self) -> Option<Arc<[u8]>> {
         match self {
-            KeyBytes::Inline { .. } => None,
+            KeyBytes::Inline { .. } | KeyBytes::Boxed(_) => None,
             KeyBytes::Spilled(bytes) => Some(Arc::clone(bytes)),
         }
     }
@@ -368,8 +388,8 @@ pub struct ColumnSpec {
     /// Bytes a sealed row carries of this column's values, zero to carry none
     pub row_carry: u16,
 
-    /// Bytes into a key where a big endian u64 says where it sits on the purge timeline
-    pub purge_mark: Option<u8>,
+    /// Where a key says the record dies, and whether the write is placed by it too
+    pub purge_mark: Option<PurgeMark>,
 
     /// Codec attempted on this column's payloads at admission, not promised
     pub codec: Codec,
@@ -381,19 +401,52 @@ pub struct ColumnSpec {
 /// Bytes a purge mark takes within a key
 pub const MARK_LEN: usize = 8;
 
-impl ColumnSpec {
-    /// Where this key sits on the purge timeline, for a column that marks its keys
-    ///
-    /// A key too short to carry a mark reads as the bottom of the timeline, below
-    /// every floor, so a malformed key is purged rather than kept forever.
-    pub fn mark_of(&self, key: &[u8]) -> Option<u64> {
-        let at = self.purge_mark? as usize;
+/// Where a column's keys say the record dies, and what the volume does with that
+///
+/// Placement is opt-in on the same offset because it costs open segments, which a
+/// column purging by the mark and nothing else has no reason to pay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PurgeMark {
+    /// Bytes into a key where the big endian u64 sits
+    pub at: u8,
+
+    /// Whether writes are placed by that mark as well as purged by it
+    pub places: bool,
+}
+
+impl PurgeMark {
+    /// A mark the volume purges by, placing nothing
+    pub const fn at(at: u8) -> PurgeMark {
+        PurgeMark { at, places: false }
+    }
+
+    /// The same mark, with writes banded by it as well
+    pub const fn placing(at: u8) -> PurgeMark {
+        PurgeMark { at, places: true }
+    }
+
+    /// Where this key sits on the purge timeline
+    pub fn read(&self, key: &[u8]) -> u64 {
+        let at = self.at as usize;
+        // A key too short to carry the mark reads as the bottom, so it is purged.
         let Some(bytes) = key.get(at..at + MARK_LEN) else {
-            return Some(0);
+            return 0;
         };
         let mut mark = [0u8; MARK_LEN];
         mark.copy_from_slice(bytes);
-        Some(u64::from_be_bytes(mark))
+        u64::from_be_bytes(mark)
+    }
+}
+
+impl ColumnSpec {
+    /// Where this key sits on the purge timeline, for a column that marks its keys
+    pub fn mark_of(&self, key: &[u8]) -> Option<u64> {
+        Some(self.purge_mark?.read(key))
+    }
+
+    /// The mark this column's writes are placed by, for a column that asked for that
+    pub fn placement_mark(&self) -> Option<PurgeMark> {
+        self.purge_mark.filter(|mark| mark.places)
     }
 
     /// Number of index shards the column splits into
@@ -468,7 +521,7 @@ mod tests {
     fn a_record_key_stays_in_its_size_class() {
         assert_eq!(
             std::mem::size_of::<RecordKey>(),
-            120,
+            56,
             "a record key changed size; the walk pays this per key stepped",
         );
     }
@@ -528,6 +581,50 @@ mod tests {
 
         assert_eq!(record.shard_of(&[0x03]), 768);
         assert_eq!(record.shard_of(&[]), 0);
+    }
+
+    // a mark reads the key's big endian u64, and a short key reads as the bottom
+    #[test]
+    fn reads_a_mark() {
+        let mark = PurgeMark::at(2);
+
+        assert_eq!(mark.read(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 7]), 7);
+        assert_eq!(mark.read(&[0, 0, 0]), 0);
+    }
+
+    // placement answers only for a column that asked for it, off the same offset
+    #[test]
+    fn placement_is_the_same_fact() {
+        let key = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 9];
+        let purged = ColumnSpec {
+            purge_mark: Some(PurgeMark::at(2)),
+            ..spec()
+        };
+        let placed = ColumnSpec {
+            purge_mark: Some(PurgeMark::placing(2)),
+            ..spec()
+        };
+
+        assert_eq!(purged.mark_of(&key), Some(9));
+        assert_eq!(purged.placement_mark(), None);
+        assert_eq!(placed.mark_of(&key), Some(9));
+        assert_eq!(placed.placement_mark().expect("mark").read(&key), 9);
+        assert_eq!(spec().placement_mark(), None);
+    }
+
+    /// An unmarked declaration the mark tests vary one field of
+    fn spec() -> ColumnSpec {
+        ColumnSpec {
+            id: ColumnId(1),
+            name: "record",
+            key_width: KeyWidth::Fixed(10),
+            shard_bytes: 0,
+            inline_max: 0,
+            row_carry: 0,
+            purge_mark: None,
+            codec: Codec::None,
+            map_shape: MapShape::Tree,
+        }
     }
 
     // columns resolve by name and by identifier

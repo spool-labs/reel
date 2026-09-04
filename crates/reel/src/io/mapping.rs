@@ -15,7 +15,9 @@ pub struct Mapping {
     len: usize,
 }
 
-// Immutable shared memory over a file the format never truncates, so crossing
+// Immutable shared memory over a file the format never cuts below its records:
+// the only truncates release reservation blocks past the length or trim an
+// aligned write's padding, both beyond what any record read touches. Crossing
 // threads is sound.
 unsafe impl Send for Mapping {}
 unsafe impl Sync for Mapping {}

@@ -134,23 +134,32 @@ impl RestartTable {
     }
 }
 
+/// One column's place in a sealed segment and everything read about it with the directory
+#[derive(Clone, Debug)]
+struct Partition {
+    /// Where the column's rows sit
+    span: PartitionSpan,
+
+    /// What the segment says about keys it does not hold, when it says anything
+    filter: Option<Filter>,
+
+    /// Where the restart blocks begin, present only where the rows are packed
+    restarts: Option<RestartTable>,
+
+    /// The leads a search steps by, present only where the seal wrote them
+    fence: Option<Fence>,
+}
+
 /// A sealed segment's directory, which is all that has to be resident to read it
 ///
 /// Bytes rather than rows: a volume holding a thousand sealed segments holds a thousand
-/// of these, and each is a handful of spans whatever the segment holds.
+/// of these, and each is a handful of spans whatever the segment holds. One vector rather
+/// than four parallel ones, since every lookup here finds a position and then reads what
+/// that one partition says.
 #[derive(Clone, Debug, Default)]
 pub struct FooterMap {
-    /// Where each column's rows sit
-    spans: Vec<PartitionSpan>,
-
-    /// Each span's filter, parallel to the spans and read with the directory
-    filters: Vec<Option<Filter>>,
-
-    /// Each span's restart table, parallel again, present only where rows are packed
-    restarts: Vec<Option<RestartTable>>,
-
-    /// Each span's fence, parallel again, present only where the seal wrote one
-    fences: Vec<Option<Fence>>,
+    /// Each column's rows and what was read about them, in directory order
+    partitions: Vec<Partition>,
 }
 
 impl FooterMap {
@@ -202,12 +211,28 @@ impl FooterMap {
             .map(|span| read_restarts(driver, file, span, probes))
             .collect::<Result<Vec<_>>>()?;
         let fences = read_fences(driver, file, file_len, &span, &spans, fence, probes)?;
+        let filters = Filter::parse_region(region, spans.len());
         Ok(Some(FooterMap {
-            filters: Filter::parse_region(region, spans.len()),
-            restarts,
-            fences,
-            spans,
+            partitions: spans
+                .into_iter()
+                .zip(filters)
+                .zip(restarts)
+                .zip(fences)
+                .map(|(((span, filter), restarts), fence)| Partition {
+                    span,
+                    filter,
+                    restarts,
+                    fence,
+                })
+                .collect(),
         }))
+    }
+
+    /// Where one column sits in the directory, which every lookup here starts from
+    fn at(&self, column: ColumnId) -> Option<&Partition> {
+        self.partitions
+            .iter()
+            .find(|held| held.span.column == column)
     }
 
     /// Where one column's rows sit and what its filter says, in one lookup
@@ -216,51 +241,51 @@ impl FooterMap {
     /// filter, or one this reader could not follow, comes back with none, which means
     /// search: only a filter that parsed ever stops one.
     pub fn locate(&self, column: ColumnId) -> Option<(PartitionSpan, Option<&Filter>)> {
-        let at = self.spans.iter().position(|span| span.column == column)?;
-        Some((
-            self.spans[at],
-            self.filters.get(at).and_then(Option::as_ref),
-        ))
+        let held = self.at(column)?;
+        Some((held.span, held.filter.as_ref()))
     }
 
     /// Where one column's rows sit, if this segment holds any of them
     pub fn span_of(&self, column: ColumnId) -> Option<PartitionSpan> {
-        self.locate(column).map(|(span, _)| span)
+        Some(self.at(column)?.span)
     }
 
     /// One column's restart table, which only a packed partition has
     pub fn restarts_of(&self, column: ColumnId) -> Option<&RestartTable> {
-        let at = self.spans.iter().position(|span| span.column == column)?;
-        self.restarts.get(at).and_then(Option::as_ref)
+        self.at(column)?.restarts.as_ref()
     }
 
     /// One column's fence, which only a segment sealed on a fenced volume has
     pub fn fence_of(&self, column: ColumnId) -> Option<&Fence> {
-        let at = self.spans.iter().position(|span| span.column == column)?;
-        self.fences.get(at).and_then(Option::as_ref)
+        self.at(column)?.fence.as_ref()
     }
 
     /// The columns this segment holds rows for
     pub fn columns(&self) -> impl Iterator<Item = ColumnId> + '_ {
-        self.spans.iter().map(|span| span.column)
+        self.partitions.iter().map(|held| held.span.column)
     }
 
     /// Bytes this map weighs, for a cache that bounds what it holds
     pub fn weight(&self) -> usize {
         let filters: usize = self
-            .filters
+            .partitions
             .iter()
-            .flatten()
+            .filter_map(|held| held.filter.as_ref())
             .map(|filter| filter.encoded_len())
             .sum();
         let restarts: usize = self
-            .restarts
+            .partitions
             .iter()
-            .flatten()
+            .filter_map(|held| held.restarts.as_ref())
             .map(|table| table.offsets.len() * std::mem::size_of::<u32>())
             .sum();
-        let fences: usize = self.fences.iter().flatten().map(Fence::weight).sum();
-        self.spans.len() * std::mem::size_of::<PartitionSpan>() + filters + restarts + fences
+        let fences: usize = self
+            .partitions
+            .iter()
+            .filter_map(|held| held.fence.as_ref())
+            .map(Fence::weight)
+            .sum();
+        self.partitions.len() * std::mem::size_of::<Partition>() + filters + restarts + fences
     }
 }
 

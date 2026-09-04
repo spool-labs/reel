@@ -434,6 +434,7 @@ fn is_dir_op(op: &Op) -> bool {
         | Op::Length { .. }
         | Op::Close { .. }
         | Op::Allocate { .. }
+        | Op::Truncate { .. }
         | Op::Advise { .. } => false,
     }
 }
@@ -463,6 +464,7 @@ fn route_completion(state: &mut SimState, position: u64, completion: Completion)
         | Some(FaultKind::ListError)
         | Some(FaultKind::ReadError)
         | Some(FaultKind::ReorderDir)
+        | Some(FaultKind::TruncateError)
         | Some(FaultKind::BitFlip { .. })
         | None => state.ready.push_back(completion),
     }
@@ -661,6 +663,10 @@ fn execute_op(state: &mut SimState, op: Op, position: u64) -> Completion {
             tag,
             outcome: Outcome::Done(allocate(state, file, offset, len, fault)),
         },
+        Op::Truncate { tag, file, len } => Completion {
+            tag,
+            outcome: Outcome::Done(truncate(state, file, len, fault)),
+        },
         Op::Advise {
             tag,
             file,
@@ -751,6 +757,7 @@ fn write_effect(fault: Option<FaultKind>, full_len: u64) -> (u64, u64) {
         | Some(FaultKind::ListError)
         | Some(FaultKind::ReadError)
         | Some(FaultKind::ReorderDir)
+        | Some(FaultKind::TruncateError)
         | Some(FaultKind::BitFlip { .. })
         | Some(FaultKind::DropCompletion)
         | Some(FaultKind::DelayCompletion { .. })
@@ -885,11 +892,21 @@ fn allocate(
     if matches!(fault, Some(FaultKind::EnospcAllocate)) {
         return Err(out_of_space());
     }
-    let file_ref = held_file_mut(state, file)?;
-    let end = (offset + len) as usize;
-    if file_ref.cached.len() < end {
-        file_ref.cached.resize(end, 0);
+    // The reservation is invisible to the format: it claims blocks without
+    // touching the length, so the simulated file keeps ending at its last
+    // written byte the way a real one does under a keep-size fallocate.
+    held_file_mut(state, file)?;
+    let _ = (offset, len);
+    Ok(())
+}
+
+/// Cut the cached view to a length; the durable image follows at the next sync
+fn truncate(state: &mut SimState, file: FileId, len: u64, fault: Option<FaultKind>) -> Result<()> {
+    if matches!(fault, Some(FaultKind::TruncateError)) {
+        return Err(input_output());
     }
+    let file_ref = held_file_mut(state, file)?;
+    file_ref.cached.resize(len as usize, 0);
     Ok(())
 }
 

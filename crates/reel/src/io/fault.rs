@@ -34,6 +34,8 @@ pub enum FaultKind {
     ListError,
     /// A read fails with an input output error
     ReadError,
+    /// A truncate fails with an input output error
+    TruncateError,
     /// Directory renames and unlinks in the batch apply in reverse order
     ReorderDir,
     /// A stored byte has one bit flipped after it is written

@@ -14,12 +14,13 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 
-use io_uring::{cqueue, opcode, types, IoUring};
+use io_uring::{cqueue, opcode, types, EnterFlags, IoUring};
 
-use crate::config::{RingTuning, RingWait};
+use crate::config::{RingTuning, TaskRun};
 use crate::error::{ReelError, Result};
 use crate::io::direct::{
     align_up, covering_span, cut_into, cut_split_into, wanted_window, AlignedBuf, DIRECT_ALIGN,
+    DIRECT_REQUEST_BYTES,
 };
 use crate::io::op::{Completion, FileId, Op, Outcome, ReadBuf, Tag, WriteBuf};
 use crate::io::posix_backend::{PosixBackend, MAX_IOVECS, STAGE_BYTES};
@@ -39,11 +40,10 @@ const IOVEC_ROOM: usize = 2;
 /// Registered descriptor slots one ring keeps, the ceiling on files it can hold
 const MAX_REGISTERED_FILES: u32 = 4096;
 
-/// Bytes one registered buffer holds, the widest direct op the pool can serve
+/// Bytes one registered buffer holds, the room a staged op lands in
 ///
-/// The posix staging width plus the block a covering read is widened by, since a
-/// read aligned to nothing rounds down at the front and up at the back. A span
-/// past this takes the op off the ring entirely.
+/// A block over the staging width, since a read aligned to nothing rounds down at
+/// the front and up at the back. A span past what the pool serves goes off the ring.
 const REGISTERED_BUFFER_BYTES: usize = STAGE_BYTES + DIRECT_ALIGN;
 
 /// Registered buffers one ring keeps, the ceiling on direct ops it can have out
@@ -183,8 +183,11 @@ impl Buffers {
     }
 
     /// Take a buffer for an op of this span, or nothing when none can serve it
+    ///
+    /// The ceiling is the request width rather than the buffer's, so an op the pool
+    /// has room for but the device would answer in two goes off the ring instead.
     fn claim(&mut self, span: usize) -> Option<u16> {
-        if span > REGISTERED_BUFFER_BYTES {
+        if span > DIRECT_REQUEST_BYTES {
             return None;
         }
         self.free.pop()
@@ -682,8 +685,9 @@ struct Ring {
     /// The inbox this ring watches, on an engine thread and nowhere else
     kick: Option<Kick>,
 
-    /// How this thread waits for a completion that has not landed yet
-    wait: RingWait,
+    /// Whether the kernel holds this ring's completion work, as the kernel answered
+    /// and not as the tuning asked
+    asks_for_completions: bool,
 
     /// The volume's door tally, which this ring's per-op decisions feed
     doors: Arc<DoorTally>,
@@ -692,7 +696,7 @@ struct Ring {
 impl Ring {
     /// Build this thread's ring under the volume's tuning
     fn new(core: &Core) -> Result<Ring> {
-        let ring = build_ring()?;
+        let ring = ring_under(core.taskrun)?;
         // A kernel that will not take the table leaves the ring on plain
         // descriptors, so a refusal is a lost optimization not a lost volume.
         let is_registered = ring
@@ -722,31 +726,21 @@ impl Ring {
             is_direct: core.is_direct,
             queued: Vec::with_capacity(entries),
             kick: None,
-            wait: core.tuning.wait,
+            asks_for_completions: core.taskrun.is_asked_for(),
             doors: Arc::clone(&core.doors),
         })
     }
 
-    /// How a thread waits for a ring in this state, apart from the ring itself
+    /// Whether a thread spins for what the ring is holding rather than sleeping for it
     ///
-    /// The two facts that decide it, so the choice can be asserted without a
+    /// A write lands in page cache, and spinning for one is 8.1 us against 13.0 us at
+    /// the commit p50. One read out is a device round trip, where the same spin burns
+    /// 10.8x the cycles for nothing.
+    ///
+    /// Reads the ops out rather than `&self`, so the rule can be asserted without a
     /// kernel to build a ring on.
-    fn wait_for(wait: RingWait, holds_only_writes: bool) -> RingWait {
-        match wait {
-            RingWait::Auto => match holds_only_writes {
-                true => RingWait::Spin,
-                false => RingWait::Kernel,
-            },
-            chosen => chosen,
-        }
-    }
-
-    /// How this thread waits for what the ring is holding right now
-    ///
-    /// An automatic wait reads the answer off the ops out: a write lands in page
-    /// cache and is worth spinning for, and one read out is a device round trip.
-    fn wait_now(&self) -> RingWait {
-        Ring::wait_for(self.wait, self.inflight.holds_only_writes())
+    fn spins_for(inflight: &Inflight) -> bool {
+        inflight.holds_only_writes()
     }
 
     /// Whether the ring has room to take another op
@@ -799,10 +793,36 @@ impl Ring {
         }
     }
 
+    /// Run the completion work the kernel is holding for this thread, if any
+    ///
+    /// The crate's submit asks only when it is also waiting for a completion, so a
+    /// thread that means to peek has to ask by hand: this is the ask and not the wait.
+    /// The mode is read before the flag because reading the flag borrows the submission
+    /// queue, whose drop stores the tail back, and a spin comes through here every round.
+    fn run_owed_work(&mut self) {
+        if !self.asks_for_completions || !self.ring.submission().taskrun() {
+            return;
+        }
+        // SAFETY: an enter submitting nothing and waiting for nothing, on the thread
+        // that owns this ring, which is what the mode requires.
+        let entered = unsafe {
+            self.ring
+                .submitter()
+                .enter::<libc::sigset_t>(0, 0, EnterFlags::GETEVENTS.bits(), None)
+        };
+        if let Err(error) = entered {
+            // The work stays queued and the flag stays up, so the next look asks again.
+            tracing::debug!("the ring refused to run its own completion work: {error}");
+        }
+    }
+
     /// Move whatever the ring has finished into the reaped list
     ///
-    /// A completion queue is shared memory, so this costs no syscall.
+    /// A completion queue is shared memory, so this costs no syscall on a ring the
+    /// kernel posts into as it goes. One holding its work is asked first, so every
+    /// reader of the queue goes through here.
     fn drain(&mut self) -> usize {
+        self.run_owed_work();
         let mut drained = 0;
         let mut has_kicked = false;
         let mut is_still_armed = false;
@@ -830,18 +850,28 @@ impl Ring {
 
     /// Sleep until the ring has finished at least one of the ops it holds
     ///
-    /// An interrupted wait means look again, and a busy ring means a full queue
-    /// with something in it. The wait hands the kernel what is queued on its way
-    /// in, since keeping the list would let a later refusal take back records the
-    /// kernel is already writing into.
+    /// The wait hands the kernel what is queued on its way in, so it is the submission
+    /// as much as the sleep. An interrupted or busy wait means look again; an enter
+    /// that failed outright took nothing.
     fn park(&mut self) -> Result<()> {
         let waited = self.ring.submit_and_wait(1);
-        self.queued.clear();
         match waited {
-            Ok(_) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(()),
-            Err(error) if error.raw_os_error() == Some(libc::EBUSY) => Ok(()),
-            Err(error) => Err(ReelError::Io(error)),
+            Ok(_) => {
+                self.queued.clear();
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                self.queued.clear();
+                Ok(())
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EBUSY) => {
+                self.queued.clear();
+                Ok(())
+            }
+            Err(error) => {
+                self.refuse(error.raw_os_error().unwrap_or(libc::EIO));
+                Err(ReelError::Io(error))
+            }
         }
     }
 
@@ -850,10 +880,13 @@ impl Ring {
     /// The ops out own buffers the kernel may still be writing into, so a wait that
     /// fails keeps asking rather than taking that memory back.
     fn wait_more(&mut self) {
-        if matches!(self.wait_now(), RingWait::Kernel) {
+        if !Ring::spins_for(&self.inflight) {
             self.sleep_once();
             return;
         }
+        // The spin never enters the kernel, so it has to hand the entries over itself
+        // or the loop below would ask a queue that stays empty.
+        self.flush();
         let mut rounds = 0u32;
         loop {
             if self.drain() > 0 {
@@ -863,6 +896,7 @@ impl Ring {
             if rounds > MAX_SPIN_ROUNDS {
                 // A spin this long is not a completion about to land, so the thread
                 // sleeps for one rather than holding a core to find out.
+                self.doors.note_spun_out();
                 self.sleep_once();
                 return;
             }
@@ -1011,6 +1045,10 @@ impl Ring {
 struct Core {
     posix: Arc<PosixBackend>,
     tuning: RingTuning,
+
+    /// The completion mode this kernel took, settled once for every thread's ring
+    taskrun: TaskRun,
+
     is_direct: bool,
     doors: Arc<DoorTally>,
 }
@@ -1025,6 +1063,7 @@ struct DoorTally {
     off_ring: AtomicU64,
     pool_refused: AtomicBool,
     files_refused: AtomicBool,
+    spun_out: AtomicU64,
 }
 
 impl DoorTally {
@@ -1048,6 +1087,12 @@ impl DoorTally {
         if !self.pool_refused.load(Ordering::Relaxed) {
             self.pool_refused.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// A spinning wait gave up and slept instead, which reads as the ring's completion
+    /// mode and its wait no longer agreeing
+    fn note_spun_out(&self) {
+        self.spun_out.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A ring's sparse file table was refused by the kernel
@@ -1393,7 +1438,6 @@ fn deliver(
 ) {
     for op in ops.drain(..) {
         while ring.is_full() {
-            ring.flush();
             ring.drain();
             ring.inflight.take_free(drained);
             if ring.is_full() {
@@ -1410,12 +1454,12 @@ fn deliver(
 }
 
 /// Wait until the slab has a free slot, taking what lands for the batch on the way
+///
+/// What is queued goes over inside the wait rather than in front of it, since both
+/// the sleep and the spin hand the entries to the kernel on their own.
 fn make_room(ring: &mut Ring, filled: &mut [Option<Completion>]) -> usize {
     let mut taken = 0;
     while ring.is_full() {
-        // What is queued goes over first, since nothing the kernel has not been told
-        // about can finish.
-        ring.flush();
         taken += ring.harvest(filled);
         if ring.is_full() {
             ring.wait_more();
@@ -1443,7 +1487,6 @@ fn run_batch(ring: &mut Ring, ops: &mut Vec<Op>, posix: &PosixBackend, out: &mut
             None => outstanding += 1,
         }
     }
-    ring.flush();
 
     while outstanding > 0 {
         let taken = ring.harvest(&mut filled);
@@ -1467,7 +1510,6 @@ fn run_one(ring: &mut Ring, op: Op, posix: &PosixBackend) -> Completion {
     if let Some(completion) = ring.stage(op, posix, 0) {
         return completion;
     }
-    ring.flush();
     loop {
         if let Some(completion) = filled[0].take() {
             return completion;
@@ -1482,7 +1524,6 @@ fn run_one(ring: &mut Ring, op: Op, posix: &PosixBackend) -> Completion {
 fn queue_batch(ring: &mut Ring, ops: Vec<Op>, posix: &PosixBackend) {
     for op in ops {
         while ring.is_full() {
-            ring.flush();
             if ring.drain() == 0 && ring.is_full() {
                 ring.wait_more();
             }
@@ -1533,19 +1574,57 @@ fn shard_of(count: usize) -> usize {
     })
 }
 
-/// Build one ring
+/// Build one ring under one completion mode
 ///
 /// A setup the kernel refuses is reported rather than retried, so an operator
 /// finds out that the volume is not on a ring.
-fn build_ring() -> Result<IoUring> {
+fn ring_under(taskrun: TaskRun) -> Result<IoUring> {
     let mut builder = IoUring::builder();
     // The kernel clamps an oversized request rather than refusing it, so asking past
     // the limit is how a ring ends up as deep as the machine allows.
     builder.setup_clamp();
-    // A ring belongs to the thread that built it, so the promise the kernel
-    // enforces is one this backend keeps by construction.
+    // A ring belongs to the thread that built it, so the deferred mode below can rest
+    // on the promise this flag makes.
     builder.setup_single_issuer();
+    match taskrun {
+        TaskRun::Deferred => {
+            builder.setup_defer_taskrun();
+        }
+        TaskRun::Cooperative => {
+            builder.setup_coop_taskrun();
+        }
+        TaskRun::Interrupt => {}
+    }
+    // Both modes leave the work queued rather than run, so the ring has to say when
+    // it is holding some or a thread reading its own queue would read an old one.
+    if taskrun.is_asked_for() {
+        builder.setup_taskrun_flag();
+    }
     builder.build(RING_ENTRIES).map_err(ReelError::Io)
+}
+
+/// Build one ring under the best completion mode this kernel will take
+///
+/// A refusal is one errno with nothing in it naming the flag, so the step down is by
+/// trial: a kernel too old for deferred work gets cooperative, then plain.
+fn build_ring(wanted: TaskRun) -> Result<(IoUring, TaskRun)> {
+    let mut refused = None;
+    for &taskrun in wanted.and_below() {
+        match ring_under(taskrun) {
+            Ok(ring) => {
+                if taskrun != wanted {
+                    tracing::debug!(
+                        "this kernel refused {wanted:?} completion work, \
+                         so the ring runs {taskrun:?}"
+                    );
+                }
+                return Ok((ring, taskrun));
+            }
+            Err(error) => refused = Some(error),
+        }
+    }
+    Err(refused
+        .unwrap_or_else(|| ReelError::Io(std::io::Error::other("no completion mode was tried"))))
 }
 
 impl std::fmt::Debug for UringBackend {
@@ -1562,7 +1641,10 @@ impl UringBackend {
     /// Rings are built by the threads that own them, so this one setup proves the
     /// kernel takes the tuning at all rather than failing on the first put.
     pub fn new(is_direct: bool, tuning: RingTuning) -> Result<UringBackend> {
-        drop(build_ring()?);
+        // The mode settles here rather than per ring, so a kernel that refuses the
+        // one asked for is found out once instead of by every thread in turn.
+        let (probe, taskrun) = build_ring(tuning.taskrun)?;
+        drop(probe);
         // One engine per thread the machine can run, which is where an async caller
         // lands: a machine that will not say its width gets one.
         let shards = std::thread::available_parallelism()
@@ -1574,6 +1656,7 @@ impl UringBackend {
                 // opens carry the flag from here.
                 posix: Arc::new(PosixBackend::with_direct(is_direct)),
                 tuning,
+                taskrun,
                 is_direct,
                 doors: Arc::new(DoorTally::default()),
             }),
@@ -1584,6 +1667,14 @@ impl UringBackend {
     /// Ops the posix path under this ring has answered
     pub fn ops(&self) -> u64 {
         self.core.posix.ops()
+    }
+
+    /// Spinning waits on this volume that gave up and slept instead
+    ///
+    /// Zero is the working answer; anything else is a spin that asked a queue no
+    /// completion could reach.
+    pub fn spin_outs(&self) -> u64 {
+        self.core.doors.spun_out.load(Ordering::Relaxed)
     }
 
     /// Run something against this thread's ring, building it the first time
@@ -1800,10 +1891,9 @@ impl ReelIo for UringBackend {
 
     /// Whether a wait on this volume's rings ever sleeps rather than spinning
     ///
-    /// An automatic wait sleeps for a read and spins for a write, so it counts as a
-    /// door that parks.
+    /// A wait sleeps for a read and spins for a write, so it counts as a door that parks.
     fn parks_on_wait(&self) -> bool {
-        !matches!(self.core.tuning.wait, RingWait::Spin)
+        true
     }
 
     /// Sleep on this thread's own completion queue rather than asking it in a loop
@@ -1812,7 +1902,7 @@ impl ReelIo for UringBackend {
     /// owes it nothing would hold the wait forever.
     fn poll_blocking(&self, out: &mut Vec<Completion>) -> Result<usize> {
         let drained = self.poll(out)?;
-        if drained > 0 || !self.parks_on_wait() {
+        if drained > 0 {
             return Ok(drained);
         }
         self.on_open_ring(|ring| {
@@ -1830,6 +1920,13 @@ impl ReelIo for UringBackend {
 /// nothing behind it to issue the rest, so a wider op would come back short and be
 /// taken for a whole one. Those go to the posix backend, which loops.
 const RING_SPAN_CAP: u64 = 0x7fff_f000;
+
+/// Bytes a write hands the ring before it is worth more as a blocking call
+///
+/// Every write reel issues waits for its own completion, so the ring's part is the
+/// batching, and a write this wide has nothing to batch with. Set to the direct
+/// door's own ceiling, so the two doors agree on what a ring write is.
+const RING_WRITE_CAP: u64 = DIRECT_REQUEST_BYTES as u64;
 
 /// Bytes a vectored write hands over across all its buffers
 fn write_span(bufs: &[WriteBuf]) -> u64 {
@@ -1850,7 +1947,7 @@ fn ring_file(op: &Op) -> Option<FileId> {
         // has nowhere to split it, so it goes to posix, which walks it in capped
         // calls.
         Op::Writev { bufs, .. } if bufs.len() > MAX_IOVECS => None,
-        Op::Writev { bufs, .. } if write_span(bufs) > RING_SPAN_CAP => None,
+        Op::Writev { bufs, .. } if write_span(bufs) > RING_WRITE_CAP => None,
         Op::Pread { buf, .. } | Op::PreadCold { buf, .. }
             if buf.wanted() as u64 > RING_SPAN_CAP =>
         {
@@ -2161,28 +2258,25 @@ mod tests {
         }
     }
 
-    // an automatic wait spins only while the ring holds nothing but writes
+    // the wait spins only while the ring holds nothing but writes
     #[test]
     fn the_wait_follows_what_the_ring_holds() {
         let mut inflight = Inflight::with_capacity(4);
-        assert!(inflight.holds_only_writes(), "an empty ring holds no read");
+        assert!(Ring::spins_for(&inflight), "an empty ring holds no read");
 
         let write = inflight.insert(wrote(), UNORDERED);
-        assert!(
-            inflight.holds_only_writes(),
-            "a write is worth spinning for"
-        );
+        assert!(Ring::spins_for(&inflight), "a write is worth spinning for");
 
         let read = inflight.insert(pending(), UNORDERED);
-        assert!(!inflight.holds_only_writes(), "one read out ends the spin");
+        assert!(!Ring::spins_for(&inflight), "one read out ends the spin");
 
         assert!(inflight.take(write).is_some());
         assert!(
-            !inflight.holds_only_writes(),
+            !Ring::spins_for(&inflight),
             "the read is still out after the write came back"
         );
         assert!(inflight.take(read).is_some());
-        assert!(inflight.holds_only_writes(), "the read came back");
+        assert!(Ring::spins_for(&inflight), "the read came back");
     }
 
     // a refused entry takes the read count it carried back with it
@@ -2417,6 +2511,27 @@ mod tests {
         );
     }
 
+    // a write wide enough to travel alone takes the posix path, footers included
+    #[test]
+    fn a_lone_wide_write_stays_off_the_ring() {
+        let write = |bytes: usize| Op::Writev {
+            tag: tag(),
+            file: file(),
+            offset: 0,
+            bufs: vec![WriteBuf::owned(vec![0u8; bytes])],
+        };
+        assert_eq!(
+            ring_file(&write(RING_WRITE_CAP as usize)),
+            Some(file()),
+            "a write filling the cap exactly still belongs on the ring",
+        );
+        assert_eq!(
+            ring_file(&write(RING_WRITE_CAP as usize + 1)),
+            None,
+            "a footer is megabytes with nothing beside it, so it blocks where it is issued",
+        );
+    }
+
     // the pool lends one buffer per op, takes it back, and refuses a wider span
     #[test]
     fn the_pool_lends_and_takes_back() {
@@ -2427,30 +2542,36 @@ mod tests {
         for _ in 0..REGISTERED_BUFFERS {
             taken.push(
                 buffers
-                    .claim(REGISTERED_BUFFER_BYTES)
+                    .claim(DIRECT_REQUEST_BYTES)
                     .expect("a buffer is free"),
             );
         }
 
         assert!(buffers.is_starved(), "every buffer is carrying an op");
         assert!(buffers.claim(1).is_none(), "a starved pool lent one anyway");
-        assert!(
-            buffers.claim(REGISTERED_BUFFER_BYTES + 1).is_none(),
-            "a span wider than a buffer was staged into one",
-        );
 
         buffers.release(taken.pop().expect("a claim"));
+        assert!(
+            buffers.claim(DIRECT_REQUEST_BYTES + 1).is_none(),
+            "a span past one device request was staged into a buffer that had room",
+        );
         // The worst offset a record of the staging width can sit at: one byte past
-        // a boundary, so the covering read pays a block at each end.
+        // a boundary, so the covering read pays a block at each end. The buffer has
+        // the room and the device would answer it in two, so it goes off the ring.
         let (_, span) = covering_span(DIRECT_ALIGN as u64 - 1, STAGE_BYTES as u64);
-        assert_eq!(
-            span as usize,
-            STAGE_BYTES + DIRECT_ALIGN,
-            "the widening moved"
+        assert_eq!(span as usize, REGISTERED_BUFFER_BYTES, "the widening moved");
+        assert!(
+            buffers.claim(span as usize).is_none(),
+            "a read widened past one request took the ring anyway",
+        );
+        // A run the planner capped, which is the widest read that does reach it.
+        let (_, capped) = covering_span(
+            DIRECT_ALIGN as u64 - 1,
+            (DIRECT_REQUEST_BYTES - DIRECT_ALIGN) as u64,
         );
         assert!(
-            buffers.claim(span as usize).is_some(),
-            "the widest staged record does not fit the buffer sized for it",
+            buffers.claim(capped as usize).is_some(),
+            "the widest run the planner merges does not fit one request",
         );
         buffers.release(taken.pop().expect("a claim"));
         assert!(!buffers.is_starved(), "the buffer came back");
@@ -2625,17 +2746,6 @@ mod tests {
         assert_eq!(staged_span(&sync), None, "an op with no buffers took one");
     }
 
-    // an automatic wait reads its answer off the ops the ring is holding
-    #[test]
-    fn an_automatic_wait_follows_the_ops_out() {
-        assert_eq!(Ring::wait_for(RingWait::Auto, true), RingWait::Spin);
-        assert_eq!(Ring::wait_for(RingWait::Auto, false), RingWait::Kernel);
-
-        // A named preference is taken whatever the ring is holding.
-        assert_eq!(Ring::wait_for(RingWait::Spin, false), RingWait::Spin);
-        assert_eq!(Ring::wait_for(RingWait::Kernel, true), RingWait::Kernel);
-    }
-
     // an op the kernel serves by blocking stays off the ring
     #[test]
     fn blocking_ops_stay_off_the_ring() {
@@ -2659,6 +2769,11 @@ mod tests {
                 tag: tag(),
                 file: file(),
                 offset: 0,
+                len: 1,
+            },
+            Op::Truncate {
+                tag: tag(),
+                file: file(),
                 len: 1,
             },
             Op::Advise {

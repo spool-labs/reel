@@ -6,6 +6,8 @@ use crate::format::column::{ColumnId, KeyRef};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{RecordHeader, HEADER_LEN};
+use crate::io::direct::{DIRECT_ALIGN, DIRECT_REQUEST_BYTES};
+use crate::io::ServingBackend;
 use crate::reel::segment::{SegmentHandle, SplitAnswer, SplitRead};
 
 use super::{is_missing, recycle_header, RecordRead};
@@ -89,6 +91,21 @@ pub(super) const MERGE_GAP: u64 = 4 * 1024;
 /// keeps the whole block alive until it drops.
 const MERGE_SPAN: u64 = 1024 * 1024;
 
+/// The same bound on a volume whose reads bypass the page cache
+///
+/// A read the registered buffer cannot serve leaves the ring for the posix path a record
+/// at a time. The cap is the request width less the block a covering read rounds out by,
+/// so every run that merges is one the ring can still carry whole.
+const DIRECT_MERGE_SPAN: u64 = (DIRECT_REQUEST_BYTES - DIRECT_ALIGN) as u64;
+
+/// Bytes a merged read on this backend reaches before the run is broken
+pub(super) fn merge_span(serving: ServingBackend) -> u64 {
+    match serving.is_direct() {
+        true => DIRECT_MERGE_SPAN,
+        false => MERGE_SPAN,
+    }
+}
+
 /// One record's place in a batch, resolved before anything is submitted
 pub(super) struct Planned {
     pub(super) at: usize,
@@ -125,12 +142,12 @@ impl Run {
 ///
 /// Only forward, only within one segment, and only across a small gap: a run that
 /// went backwards or jumped would read the bytes between for nothing.
-pub(super) fn merge_runs_into(plan: &[Planned], runs: &mut Vec<Run>) {
+pub(super) fn merge_runs_into(plan: &[Planned], span: u64, runs: &mut Vec<Run>) {
     runs.clear();
     let mut start = 0usize;
     while start < plan.len() {
         let mut end = start + 1;
-        while end < plan.len() && joins(&plan[end - 1], &plan[end], plan[start].offset) {
+        while end < plan.len() && joins(&plan[end - 1], &plan[end], plan[start].offset, span) {
             end += 1;
         }
         runs.push(Run {
@@ -143,11 +160,11 @@ pub(super) fn merge_runs_into(plan: &[Planned], runs: &mut Vec<Run>) {
 }
 
 /// Whether the next record can ride the same read as the one before it
-pub(super) fn joins(last: &Planned, next: &Planned, from: u64) -> bool {
+pub(super) fn joins(last: &Planned, next: &Planned, from: u64, span: u64) -> bool {
     last.segment == next.segment
         && next.offset >= last.end()
         && next.offset - last.end() <= MERGE_GAP
-        && next.end() - from <= MERGE_SPAN
+        && next.end() - from <= span
 }
 
 /// Check one record framed inside a merged read, yielding why it was rejected

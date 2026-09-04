@@ -770,15 +770,25 @@ impl IoDriver {
         }
     }
 
-    /// Reserve space ahead of the write head, extending the file to cover it
+    /// Reserve space ahead of the write head without extending the length
     ///
-    /// The reservation is part of the file's length, so a walk to the end of a
-    /// preallocated segment runs into zeros rather than the last record written.
+    /// The file always ends at its last written byte, so a walk ends at the
+    /// records and a crash leaves no reservation inside the length. The blocks
+    /// claimed past the end are given back by the seal's cut.
     pub fn allocate(&self, file: FileId, offset: u64, len: u64) -> Result<()> {
         self.done(Op::Allocate {
             tag: self.next_tag(),
             file,
             offset,
+            len,
+        })
+    }
+
+    /// Cut a file to a length, handing reserved space past it back
+    pub fn truncate(&self, file: FileId, len: u64) -> Result<()> {
+        self.done(Op::Truncate {
+            tag: self.next_tag(),
+            file,
             len,
         })
     }

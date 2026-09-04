@@ -34,7 +34,10 @@ const FIXTURE_LEN: usize = 300;
 const ROOT_LIST_AT: u64 = 0;
 
 /// Op position the first segment read executes at, once the listing has resolved
-const FIRST_READ_AT: u64 = 3;
+///
+/// Past the open every reopen spends looking for an index file to read back, which
+/// on a volume that wrote none is one op that answers missing.
+const FIRST_READ_AT: u64 = 4;
 
 fn config() -> ReelConfig {
     ReelConfig {

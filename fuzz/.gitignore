@@ -1,0 +1,6 @@
+# Build output, crash reproducers and the unpacked corpus are per-run. A run starts
+# from the seeds beside them, one archive per target.
+target
+artifacts
+coverage
+corpus

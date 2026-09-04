@@ -2,6 +2,10 @@
 resolver = "2"
 members = ["crates/*"]
 
+# The fuzz targets build against libfuzzer on nightly and are not part of a stable
+# build of the store, so they stay out of the workspace and off the pull request path.
+exclude = ["fuzz"]
+
 [workspace.package]
 version = "0.2.0"
 license = "Apache-2.0"

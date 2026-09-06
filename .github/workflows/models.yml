@@ -94,7 +94,7 @@ jobs:
       # spent past the gates a cold run would spend it finding. They travel as one
       # archive per target and are unpacked into the directory libFuzzer reads.
       - name: seeds
-        run: mkdir -p corpus/${{ matrix.target }} && tar -xzf seeds/${{ matrix.target }}.tar.gz -C corpus/${{ matrix.target }}
+        run: python3 seeds.py unpack ${{ matrix.target }}
         working-directory: fuzz
       # Each target runs alone: fail-fast off, because one crashing target says nothing
       # about the other three and stopping them would throw away the run.

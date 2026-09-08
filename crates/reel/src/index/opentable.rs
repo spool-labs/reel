@@ -1123,11 +1123,14 @@ mod tests {
         assert_eq!(overhead_per_key(108, 24), 20);
     }
 
+    // miri interprets, so a sixteenth of the keys, where the ratio holds too
+    const SLOT_KEYS: usize = if cfg!(miri) { 16_384 } else { 262_144 };
+
     // a sized table holds a state-shaped key for what the arithmetic says it does,
     // asked of the structure rather than weighed off the allocator
     #[test]
     fn slot_bytes_a_key() {
-        let count = 262_144usize;
+        let count = SLOT_KEYS;
         let mut table: OpenTable<32, Entry> = OpenTable::with_keys(count);
         for at in 0..count as u64 {
             table.insert(
@@ -1145,7 +1148,7 @@ mod tests {
     // and a signature-wide key for what its own slot says, which is the wider one
     #[test]
     fn wide_slot_bytes_a_key() {
-        let count = 262_144usize;
+        let count = SLOT_KEYS;
         let mut table: OpenTable<72, Entry> = OpenTable::with_keys(count);
         for at in 0..count as u64 {
             table.insert(

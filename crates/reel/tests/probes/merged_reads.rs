@@ -1,8 +1,10 @@
 //! What the device sees of one batched read: requests, merges, bytes per request
 //!
 //! Fill and read are two arms so the read alone can run under perf. Linux only, root
-//! for `drop_caches`. `REEL_MERGE_DIR` names the volume, `REEL_MERGE_BACKEND` the plane,
-//! `REEL_MERGE_DEVICE` the diskstats row where the volume's own device has none.
+//! for `drop_caches`. `REEL_MERGE_DIR` names the volume. The probe works in a
+//! `reel-merged-reads` directory under it and refuses to fill one that has content.
+//! `REEL_MERGE_BACKEND` names the plane, `REEL_MERGE_DEVICE` the diskstats row where the
+//! volume's own device has none.
 //! Opt-in, run with:
 //!   cargo test -p reel --release --test probes -- merged_reads::fill
 //!   cargo test -p reel --release --test probes -- merged_reads::read
@@ -37,11 +39,13 @@ const RECORDS: u64 = 4096;
 /// Bytes a diskstats sector counts, whatever the device's own block size
 const SECTOR_BYTES: u64 = 512;
 
+/// The probe's own directory under the volume the operator named, or under the temp dir
 fn dir() -> PathBuf {
-    match std::env::var_os("REEL_MERGE_DIR") {
+    let volume = match std::env::var_os("REEL_MERGE_DIR") {
         Some(path) => PathBuf::from(path),
-        None => std::env::temp_dir().join("reel-merged-reads"),
-    }
+        None => std::env::temp_dir(),
+    };
+    volume.join("reel-merged-reads")
 }
 
 fn backend() -> IoBackend {
@@ -103,8 +107,16 @@ fn device_reads(path: &Path) -> Option<(String, u64, u64, u64)> {
 /// Write the records in key order, which is disk order, and leave the volume for the read
 pub fn fill() {
     let dir = dir();
-    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("volume dir");
+    let is_used = std::fs::read_dir(&dir)
+        .expect("volume dir")
+        .next()
+        .is_some();
+    assert!(
+        !is_used,
+        "{} holds a previous fill, remove it first",
+        dir.display()
+    );
     let store = ReelStore::open(dir.clone(), config(), COLUMNS).expect("open");
     let payload = vec![0x3Cu8; RECORD_BYTES];
     for at in 0..RECORDS {

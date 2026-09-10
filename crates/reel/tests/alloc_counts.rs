@@ -8,7 +8,7 @@
 //!
 //! Run with:
 //!
-//!   cargo test -p reel --test alloc_counts -- --nocapture
+//!   cargo test -p tape-reel --test alloc_counts -- --nocapture
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

@@ -10,7 +10,7 @@
 //! either, the test says what it skipped rather than passing quietly.
 //!
 //! Ignored by default. Run with:
-//!   cargo test -p reel --test capacity_reserve --release -- --ignored --nocapture
+//!   cargo test -p tape-reel --test capacity_reserve --release -- --ignored --nocapture
 
 #![cfg(target_os = "linux")]
 

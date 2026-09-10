@@ -38,7 +38,7 @@ jobs:
         env:
           RUSTFLAGS: "--cfg loom"
           LOOM_MAX_PREEMPTIONS: "3"
-        run: cargo test -p reel --lib --release -- loom_tests
+        run: cargo test -p tape-reel --lib --release -- loom_tests
 
   miri:
     name: miri
@@ -61,7 +61,7 @@ jobs:
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation"
         run: |
-          cargo miri test -p reel --lib -- \
+          cargo miri test -p tape-reel --lib -- \
             format::column format::fence format::filter format::prefix \
             index::tbtreemap index::opentable
 

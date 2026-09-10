@@ -1,7 +1,8 @@
 [package]
-name = "reel"
+name = "tape-reel"
 version.workspace = true
 license.workspace = true
+homepage.workspace = true
 repository.workspace = true
 readme = "../../README.md"
 keywords = ["key-value", "storage", "log-structured", "database", "embedded"]
@@ -10,6 +11,10 @@ edition.workspace = true
 rust-version.workspace = true
 description = "A log-structured key-value store: sequential writes, immutable segments, whole-segment reclaim"
 categories = ["database", "database-implementations", "data-structures", "filesystem"]
+
+[lib]
+name = "reel"
+path = "src/lib.rs"
 
 [dependencies]
 reel-core.workspace = true
@@ -43,7 +48,7 @@ alloc-snmalloc = ["dep:snmalloc-rs"]
 io-uring = "0.7"
 
 [dev-dependencies]
-reel = { path = ".", features = ["rendezvous", "serde", "sim"] }
+reel = { package = "tape-reel", path = ".", features = ["rendezvous", "serde", "sim"] }
 rand.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

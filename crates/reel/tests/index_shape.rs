@@ -8,7 +8,7 @@
 //! the record shape, 34 bytes fixed, held inline as the real index holds them.
 //!
 //! Ignored by default. Run with:
-//!   cargo test -p reel --test index_shape --release -- --ignored --nocapture
+//!   cargo test -p tape-reel --test index_shape --release -- --ignored --nocapture
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::{BTreeMap, HashMap};

@@ -6,7 +6,7 @@
 //! after the fact.
 //!
 //! Opt-in. Run with:
-//!   cargo test -p reel --test probes -- layout
+//!   cargo test -p tape-reel --test probes -- layout
 
 use std::path::{Path, PathBuf};
 

@@ -21,7 +21,7 @@
 //! `REEL_RAW_RANDOM_READS`, `REEL_RAW_SKIP_READS`, `REEL_RAW_WEIGH`, `REEL_RAW_CSV`.
 //!
 //! Ignored by default. Run with:
-//!   cargo test -p reel --test raw_throughput --release -- --ignored --nocapture --test-threads=1
+//!   cargo test -p tape-reel --test raw_throughput --release -- --ignored --nocapture --test-threads=1
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::RefCell;

@@ -6,7 +6,7 @@ The tree beats the map on every axis that reaches the store, and the largest win
 structure at all but in asking it for many keys at once.
 
 ```
-cargo test -p reel --test index_shape --release -- --ignored --nocapture
+cargo test -p tape-reel --test index_shape --release -- --ignored --nocapture
 ```
 
 Every number is one serial run on an idle machine, and arms are comparable to each other rather

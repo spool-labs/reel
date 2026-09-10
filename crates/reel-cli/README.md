@@ -1,4 +1,4 @@
-# reel-cli
+# tape-reel-cli
 
 The operator toolbox for reel volumes. One binary, `reel`, six verbs:
 

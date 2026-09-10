@@ -6,7 +6,7 @@
 //! the one path where a footer's whole key set is read at once.
 //!
 //! Opt-in. Run with:
-//!   cargo test -p reel --release --test probes -- handover_cost
+//!   cargo test -p tape-reel --release --test probes -- handover_cost
 
 use std::path::PathBuf;
 use std::sync::Arc;

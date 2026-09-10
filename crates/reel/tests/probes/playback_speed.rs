@@ -6,7 +6,7 @@
 //! up, and one that flattens is the ordering no longer being what is paid for.
 //!
 //! Opt-in. Run with:
-//!   cargo test -p reel --release --test probes -- playback_speed
+//!   cargo test -p tape-reel --release --test probes -- playback_speed
 
 use std::ops::Bound;
 use std::path::PathBuf;

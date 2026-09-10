@@ -305,48 +305,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reel"
-version = "0.2.0"
-dependencies = [
- "crc-fast",
- "io-uring",
- "libc",
- "loom",
- "lz4_flex",
- "rand",
- "reel-core",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "reel-core"
-version = "0.2.0"
-dependencies = [
- "thiserror",
- "wincode",
-]
-
-[[package]]
-name = "reel-fuzz"
-version = "0.0.0"
-dependencies = [
- "arbitrary",
- "libfuzzer-sys",
- "rand",
- "reel",
- "reel-core",
- "reel-mock",
-]
-
-[[package]]
-name = "reel-mock"
-version = "0.2.0"
-dependencies = [
- "reel-core",
-]
-
-[[package]]
 name = "regex-automata"
 version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -422,6 +380,48 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tape-reel"
+version = "0.2.0"
+dependencies = [
+ "crc-fast",
+ "io-uring",
+ "libc",
+ "loom",
+ "lz4_flex",
+ "rand",
+ "tape-reel-core",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "tape-reel-core"
+version = "0.2.0"
+dependencies = [
+ "thiserror",
+ "wincode",
+]
+
+[[package]]
+name = "tape-reel-fuzz"
+version = "0.0.0"
+dependencies = [
+ "arbitrary",
+ "libfuzzer-sys",
+ "rand",
+ "tape-reel",
+ "tape-reel-core",
+ "tape-reel-mock",
+]
+
+[[package]]
+name = "tape-reel-mock"
+version = "0.2.0"
+dependencies = [
+ "tape-reel-core",
 ]
 
 [[package]]

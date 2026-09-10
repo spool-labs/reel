@@ -9,7 +9,7 @@
 //! paid the row walk, and one past them paid the read as well.
 //!
 //! Opt-in. Run with:
-//!   cargo test -p reel --release --test probes -- tick_facts
+//!   cargo test -p tape-reel --release --test probes -- tick_facts
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -8,7 +8,7 @@
 //! stack and nothing allocated per op, so the gaps are floors.
 //!
 //! Opt-in. Run with:
-//!   cargo test -p reel --release --test probes -- door_price
+//!   cargo test -p tape-reel --release --test probes -- door_price
 
 use std::future::Future;
 use std::pin::{pin, Pin};

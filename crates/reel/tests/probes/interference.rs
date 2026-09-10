@@ -8,7 +8,7 @@
 //! arm is a quiet arm wearing another arm's label.
 //!
 //! Opt-in, since it writes over a hundred gigabytes and runs for twenty minutes:
-//!   TMPDIR=/some/device cargo test -p reel --release --test probes -- interference
+//!   TMPDIR=/some/device cargo test -p tape-reel --release --test probes -- interference
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;

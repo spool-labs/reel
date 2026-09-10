@@ -8,7 +8,7 @@
 //! threads at once is a shared line they bounce however short the hold.
 //!
 //! Opt-in. Run with:
-//!   cargo test -p reel --release --test probes -- negative_price
+//!   cargo test -p tape-reel --release --test probes -- negative_price
 
 use std::sync::Arc;
 use std::time::Instant;

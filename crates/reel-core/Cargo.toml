@@ -1,7 +1,8 @@
 [package]
-name = "reel-core"
+name = "tape-reel-core"
 version.workspace = true
 license.workspace = true
+homepage.workspace = true
 repository.workspace = true
 readme = "README.md"
 keywords = ["key-value", "storage", "store", "abstraction"]
@@ -9,6 +10,10 @@ edition.workspace = true
 rust-version.workspace = true
 description = "A thin typed key-value store abstraction: the Store trait, write batches, and ordered iteration"
 categories = ["database", "rust-patterns"]
+
+[lib]
+name = "reel_core"
+path = "src/lib.rs"
 
 [dependencies]
 thiserror.workspace = true

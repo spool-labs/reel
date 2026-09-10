@@ -8,7 +8,7 @@
 //! index entry and a memcpy, one that lost its value goes back to the device.
 //!
 //! Opt-in. Run with:
-//!   cargo test -p reel --release --test probes -- carried_price
+//!   cargo test -p tape-reel --release --test probes -- carried_price
 //! Knobs: CARRIED_HOT_KEYS, CARRIED_LOAD_MB, CARRIED_BUDGET_MB, CARRIED_VALUE.
 
 use std::path::Path;

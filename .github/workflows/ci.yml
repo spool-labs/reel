@@ -63,22 +63,22 @@ jobs:
           set -euo pipefail
           case "${{ matrix.shard }}" in
             workspace)
-              cargo test --workspace --exclude reel --no-fail-fast
+              cargo test --workspace --exclude tape-reel --no-fail-fast
               ;;
             lib)
-              cargo test -p reel --lib --no-fail-fast \
+              cargo test -p tape-reel --lib --no-fail-fast \
                 -- --skip callers_spread_across_the_shards
               # The one lib test that is not parallel-safe: it reads a process-wide
               # shard counter and assumes its increments are consecutive, so anything
               # else touching the async door beside it can red it. Run on its own.
-              cargo test -p reel --lib -- --exact --test-threads=1 \
+              cargo test -p tape-reel --lib -- --exact --test-threads=1 \
                 io::uring_backend::tests::callers_spread_across_the_shards
               ;;
             integration-*)
               part="${{ matrix.shard }}"
               part="${part#integration-}"
               mapfile -t names < <(cargo metadata --no-deps --format-version 1 \
-                | jq -r '.packages[] | select(.name == "reel") | .targets[]
+                | jq -r '.packages[] | select(.name == "tape-reel") | .targets[]
                          | select(any(.kind[]; . == "test")) | .name' \
                 | grep -vx -e crash_points -e differential | sort)
               selected=()
@@ -87,7 +87,7 @@ jobs:
               done
               echo "running ${#selected[@]} of ${#names[@]} targets: ${selected[*]}"
               test "${#selected[@]}" -gt 0
-              cargo test -p reel "${selected[@]}" --no-fail-fast
+              cargo test -p tape-reel "${selected[@]}" --no-fail-fast
               ;;
             differential)
               # Serial because the paged handover guards are only mostly
@@ -95,7 +95,7 @@ jobs:
               # longer decides the answer, but a machine with most of its cores taken
               # can still run one of them out of its bound: 8 of 10 parallel runs
               # green under that load against 10 of 10 serial.
-              cargo test -p reel --test differential -- --test-threads=1
+              cargo test -p tape-reel --test differential -- --test-threads=1
               ;;
           esac
 
@@ -114,7 +114,7 @@ jobs:
       # Its own job because it is three quarters of the suite's runtime on its own, and
       # in debug like the rest because optimizing it measured no faster: what it spends
       # its time on is the crash enumeration, not the code under it.
-      - run: cargo test -p reel --test crash_points
+      - run: cargo test -p tape-reel --test crash_points
 
   macos:
     name: test (macos)
@@ -193,4 +193,4 @@ jobs:
       # The library alone. reel depends on itself as a dev-dependency with sim,
       # rendezvous and serde on, so anything that builds a test target sees every
       # feature and never sees the set a consumer links.
-      - run: cargo clippy -p reel --lib ${{ matrix.features }} -- -D warnings
+      - run: cargo clippy -p tape-reel --lib ${{ matrix.features }} -- -D warnings

@@ -11,7 +11,7 @@
 //! fails, says so, and every number after it is warm and worthless.
 //!
 //! Run on a real Linux box as root:
-//!   cargo test -p reel --test account_depth --release -- --ignored --nocapture
+//!   cargo test -p tape-reel --test account_depth --release -- --ignored --nocapture
 //!
 //! Knobs, all optional: REEL_DEPTH_DIR, REEL_DEPTH_ACCOUNTS, REEL_DEPTH_SET,
 //! REEL_DEPTH_DEPTHS, REEL_DEPTH_THREADS, REEL_DEPTH_BACKENDS.

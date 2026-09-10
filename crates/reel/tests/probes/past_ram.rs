@@ -10,7 +10,7 @@
 //! Knobs: REEL_PAST_RAM_SIZES, REEL_PAST_RAM_BACKEND, REEL_PAST_RAM_VOLUME_BYTES.
 //!
 //! Linux only, and root for `drop_caches`. Opt-in. Run with:
-//!   sudo -E cargo test -p reel --release --test probes -- past_ram
+//!   sudo -E cargo test -p tape-reel --release --test probes -- past_ram
 
 #![cfg(target_os = "linux")]
 

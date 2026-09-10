@@ -9,7 +9,7 @@
 //!
 //! Run the measurements with:
 //!
-//!   cargo test -p reel --test row_carry --release -- --ignored --nocapture
+//!   cargo test -p tape-reel --test row_carry --release -- --ignored --nocapture
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

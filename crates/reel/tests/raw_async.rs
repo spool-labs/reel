@@ -11,7 +11,7 @@
 //! raced against a mapped blocking row would compare a driver read to a memcpy.
 //!
 //! Ignored by default. Run with:
-//!   cargo test -p reel --test raw_async --release -- --ignored --nocapture --test-threads=1
+//!   cargo test -p tape-reel --test raw_async --release -- --ignored --nocapture --test-threads=1
 //!
 //! Knobs, all optional, each refusing a value it cannot read rather than falling back:
 //! REEL_ASYNC_MODES, REEL_ASYNC_BACKEND, REEL_ASYNC_SYNC, REEL_ASYNC_SIZES,

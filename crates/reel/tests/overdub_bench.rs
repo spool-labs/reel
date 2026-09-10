@@ -39,7 +39,7 @@
 //! measures no device at all.
 //!
 //! Ignored by default. Run with:
-//!   cargo test -p reel --test overdub_bench --release -- --ignored --nocapture --test-threads=1
+//!   cargo test -p tape-reel --test overdub_bench --release -- --ignored --nocapture --test-threads=1
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};

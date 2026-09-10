@@ -7,7 +7,7 @@
 //! a laptop is an optimistic bound on a server.
 //!
 //! Opt-in, since it spawns threads and writes real files. Run with:
-//!   cargo test -p reel --test probes -- drain_depth
+//!   cargo test -p tape-reel --test probes -- drain_depth
 
 use std::sync::{Arc, Barrier};
 use std::thread;

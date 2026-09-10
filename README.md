@@ -1,4 +1,4 @@
-# reel
+# tape-reel
 
 A log-structured key-value store: sequential writes, immutable segments, whole-segment reclaim.
 

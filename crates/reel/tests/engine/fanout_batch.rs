@@ -10,7 +10,7 @@
 //! split or the fan-out.
 //!
 //! Ignored by default. Run with:
-//!   cargo test -p reel --test fanout_batch --release -- --ignored --nocapture
+//!   cargo test -p tape-reel --test fanout_batch --release -- --ignored --nocapture
 //! Knobs: FANOUT_ITEMS, FANOUT_WIDTH, FANOUT_BATCHES, FANOUT_VALUE, FANOUT_INDEX_VALUE
 
 use std::time::{Duration, Instant};

@@ -725,62 +725,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reel"
-version = "0.2.0"
-dependencies = [
- "crc-fast",
- "criterion",
- "crossbeam-skiplist",
- "foldhash",
- "indexset",
- "io-uring",
- "libc",
- "loom",
- "lz4_flex",
- "mimalloc",
- "rand",
- "reel",
- "reel-core",
- "reel-mock",
- "rustc-hash",
- "scc",
- "serde",
- "serde_json",
- "snmalloc-rs",
- "tempfile",
- "thiserror",
- "tracing",
- "xxhash-rust",
-]
-
-[[package]]
-name = "reel-cli"
-version = "0.2.0"
-dependencies = [
- "clap",
- "libc",
- "reel",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "reel-core"
-version = "0.2.0"
-dependencies = [
- "thiserror",
- "wincode",
-]
-
-[[package]]
-name = "reel-mock"
-version = "0.2.0"
-dependencies = [
- "reel-core",
-]
-
-[[package]]
 name = "regex"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -994,6 +938,62 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tape-reel"
+version = "0.2.0"
+dependencies = [
+ "crc-fast",
+ "criterion",
+ "crossbeam-skiplist",
+ "foldhash",
+ "indexset",
+ "io-uring",
+ "libc",
+ "loom",
+ "lz4_flex",
+ "mimalloc",
+ "rand",
+ "rustc-hash",
+ "scc",
+ "serde",
+ "serde_json",
+ "snmalloc-rs",
+ "tape-reel",
+ "tape-reel-core",
+ "tape-reel-mock",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "tape-reel-cli"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "tape-reel",
+ "tempfile",
+]
+
+[[package]]
+name = "tape-reel-core"
+version = "0.2.0"
+dependencies = [
+ "thiserror",
+ "wincode",
+]
+
+[[package]]
+name = "tape-reel-mock"
+version = "0.2.0"
+dependencies = [
+ "tape-reel-core",
 ]
 
 [[package]]

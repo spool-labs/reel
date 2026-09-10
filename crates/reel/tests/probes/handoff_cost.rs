@@ -6,7 +6,7 @@
 //! of the machine, so run this on the hardware the answer is for.
 //!
 //! Opt-in. Run with:
-//!   cargo test -p reel --release --test probes -- handoff_cost
+//!   cargo test -p tape-reel --release --test probes -- handoff_cost
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};

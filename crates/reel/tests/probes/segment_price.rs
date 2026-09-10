@@ -8,7 +8,7 @@
 //! this replaces was hashed and the one that replaces it is indexed.
 //!
 //! Opt-in. Run with:
-//!   cargo test -p reel --release --test probes -- segment_price
+//!   cargo test -p tape-reel --release --test probes -- segment_price
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};

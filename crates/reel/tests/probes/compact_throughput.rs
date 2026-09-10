@@ -10,7 +10,7 @@
 //! `ending` column says whether a row drained or ran out of deadline.
 //!
 //! Opt-in, since it writes tens of gigabytes. Run with:
-//!   cargo test -p reel --release --test probes -- compact_throughput
+//!   cargo test -p tape-reel --release --test probes -- compact_throughput
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

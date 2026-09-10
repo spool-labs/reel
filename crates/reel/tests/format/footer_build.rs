@@ -8,7 +8,7 @@
 //! memory and allocates far more, flat is the reverse.
 //!
 //! Ignored by default. Run with:
-//!   cargo test -p reel --test footer_build --release -- --ignored --nocapture
+//!   cargo test -p tape-reel --test footer_build --release -- --ignored --nocapture
 
 use std::time::{Duration, Instant};
 

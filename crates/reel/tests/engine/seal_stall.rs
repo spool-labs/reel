@@ -7,7 +7,7 @@
 //! that never rolled is a bench of nothing.
 //!
 //! Ignored by default. Run with:
-//!   cargo test -p reel --test seal_stall --release -- --ignored --nocapture
+//!   cargo test -p tape-reel --test seal_stall --release -- --ignored --nocapture
 
 use std::time::Instant;
 

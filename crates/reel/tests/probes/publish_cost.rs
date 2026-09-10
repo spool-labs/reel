@@ -9,7 +9,7 @@
 //! harness allocation alone and the two curves can be read apart.
 //!
 //! Opt-in, run with:
-//!   cargo test -p reel --release --test probes -- publish_cost
+//!   cargo test -p tape-reel --release --test probes -- publish_cost
 
 #[cfg(feature = "alloc-mimalloc")]
 #[global_allocator]

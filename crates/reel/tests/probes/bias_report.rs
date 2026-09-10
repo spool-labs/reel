@@ -7,7 +7,7 @@
 //! disk the engine will run on.
 //!
 //! Opt-in. Run with:
-//!   cargo test -p reel --test probes -- bias_report
+//!   cargo test -p tape-reel --test probes -- bias_report
 
 use std::path::PathBuf;
 

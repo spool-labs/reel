@@ -1,4 +1,4 @@
-# reel-mock
+# tape-reel-mock
 
 A test double for the `Store` trait, not a backend choice. Column families
 are hash maps under one lock over the whole store, and every read copies its

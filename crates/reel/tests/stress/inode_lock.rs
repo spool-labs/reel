@@ -10,7 +10,7 @@
 //!
 //! Point REEL_LOCK_DIR at the filesystem under test. REEL_LOCK_THREADS and
 //! REEL_LOCK_BYTES size the sweep. Run with:
-//!   cargo test -p reel --test inode_lock --release -- --ignored --nocapture --test-threads=1
+//!   cargo test -p tape-reel --test inode_lock --release -- --ignored --nocapture --test-threads=1
 
 use std::os::unix::io::RawFd;
 use std::time::Instant;

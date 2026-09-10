@@ -10,7 +10,7 @@
 //! memory before the clock starts and nothing in the MB/s column has met a device.
 //!
 //! Opt-in, run with:
-//!   cargo test -p reel --release --test probes -- merge_rate
+//!   cargo test -p tape-reel --release --test probes -- merge_rate
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;

@@ -1,4 +1,4 @@
-# reel-core
+# tape-reel-core
 
 A thin typed key-value store abstraction: byte-oriented access through the
 `Store` trait, typed access through `TypedStore` and `Column`, write batches,

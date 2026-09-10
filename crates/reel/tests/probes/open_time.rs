@@ -16,7 +16,7 @@
 //! copy of a volume built once, so these are warm opens rather than cold ones.
 //!
 //! Opt-in. Run with:
-//!   cargo test -p reel --release --test probes -- open_time
+//!   cargo test -p tape-reel --release --test probes -- open_time
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

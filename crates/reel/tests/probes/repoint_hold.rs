@@ -11,7 +11,7 @@
 //! without the barrier because it cannot be half a batch.
 //!
 //! Opt-in, run with:
-//!   cargo test -p reel --release --test probes -- repoint_hold
+//!   cargo test -p tape-reel --release --test probes -- repoint_hold
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;

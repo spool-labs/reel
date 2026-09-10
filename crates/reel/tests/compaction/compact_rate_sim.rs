@@ -8,7 +8,7 @@
 //! device is a number rather than a drive, so nothing here says anything about io.
 //!
 //! Run with:
-//!   cargo test -p reel --test compact_rate_sim -- --nocapture
+//!   cargo test -p tape-reel --test compact_rate_sim -- --nocapture
 
 use reel::{CompactRate, GcPressure, GcTier, RateLimiter};
 

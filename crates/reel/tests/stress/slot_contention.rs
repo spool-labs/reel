@@ -8,7 +8,7 @@
 //! measures the table's bookkeeping and the locks around it.
 //!
 //! Ignored by default, since it spawns threads and holds cores. Run with:
-//!   cargo test -p reel --test slot_contention --release -- --ignored --nocapture --test-threads=1
+//!   cargo test -p tape-reel --test slot_contention --release -- --ignored --nocapture --test-threads=1
 //!
 //! Knobs, all optional: REEL_SLOT_MODES, REEL_SLOT_THREADS, REEL_SLOT_DEPTHS,
 //! REEL_SLOT_OPS.

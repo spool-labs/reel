@@ -327,7 +327,7 @@ one, and that costs real time to diagnose.
 
 `tests/probes/bias_report.rs` prints the facts, the verdict and the disagreements:
 
-    REEL_BIAS_DIR=/var/lib/reel cargo test -p reel \
+    REEL_BIAS_DIR=/var/lib/reel cargo test -p tape-reel \
       --test probes -- bias_report
 
 That is the recording step's comparison, runnable on a real box rather than

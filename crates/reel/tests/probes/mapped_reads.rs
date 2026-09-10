@@ -11,7 +11,7 @@
 //! `REEL_MAP_FILL` sizes the fill, `REEL_MAP_SIZES` picks the record sizes.
 //!
 //! Opt-in, run with:
-//!   cargo test -p reel --release --test probes -- mapped_reads
+//!   cargo test -p tape-reel --release --test probes -- mapped_reads
 
 use std::time::Instant;
 

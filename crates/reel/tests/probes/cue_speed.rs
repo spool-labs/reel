@@ -3,7 +3,7 @@
 //! Two questions a caller needs answered before building on this: whether
 //! cueing stalls the writer, and how much slower a historical read is than a
 //! live one. Opt-in, run with:
-//!   cargo test -p reel --release --test probes -- cue_speed
+//!   cargo test -p tape-reel --release --test probes -- cue_speed
 
 use std::time::Instant;
 

@@ -12,7 +12,7 @@
 //! different call with a shortfall of its own.
 //!
 //! Opt-in. Run with:
-//!   cargo test -p reel --release --test probes -- preallocate_cost
+//!   cargo test -p tape-reel --release --test probes -- preallocate_cost
 
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;

@@ -9,7 +9,7 @@
 //! REEL_ERASE_RECORD_BYTES (default 4096), REEL_ERASE_MODE (stride or random).
 //!
 //! Run with:
-//!   cargo test -p reel --release --test probes -- erase_probe
+//!   cargo test -p tape-reel --release --test probes -- erase_probe
 
 #[cfg(target_os = "linux")]
 use std::path::Path;

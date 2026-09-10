@@ -1,7 +1,7 @@
 # Unsafe: every site, and what makes it sound
 
 **75 `unsafe` occurrences across 61 items, in 9 files, all of them in `reel`.**
-`reel-core` and `reel-mock` have none. Test modules are excluded from those
+`tape-reel-core` and `tape-reel-mock` have none. Test modules are excluded from those
 counts; what follows is what a release build compiles.
 
 Nearly all of it is one shape. The engine talks to the kernel directly, so a

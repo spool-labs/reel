@@ -11,7 +11,7 @@
 //!
 //! Run it with:
 //!
-//!   cargo test -p reel --test fence_walk --release -- --ignored --nocapture
+//!   cargo test -p tape-reel --test fence_walk --release -- --ignored --nocapture
 
 use std::path::PathBuf;
 use std::sync::Arc;

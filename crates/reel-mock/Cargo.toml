@@ -1,7 +1,8 @@
 [package]
-name = "reel-mock"
+name = "tape-reel-mock"
 version.workspace = true
 license.workspace = true
+homepage.workspace = true
 repository.workspace = true
 readme = "README.md"
 keywords = ["testing", "mock", "key-value"]
@@ -10,6 +11,10 @@ rust-version.workspace = true
 description = "Test-double implementation of the reel store trait, for oracles and as a template; not a production backend"
 categories = ["development-tools::testing", "database"]
 publish = false
+
+[lib]
+name = "reel_mock"
+path = "src/lib.rs"
 
 [dependencies]
 reel-core.workspace = true

@@ -64,6 +64,10 @@ const COLUMNS: ColumnSet = &[
 
 /// The group every record here is written under
 const GROUP: u16 = 7;
+
+/// Commits one latency run makes, and the payload each one holds
+const COMMITS: u64 = 2000;
+const COMMIT_BYTES: usize = 4096;
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
 
@@ -149,6 +153,66 @@ fn ingest(c: &mut Criterion) {
         });
     }
     group.finish();
+}
+
+/// One record appended and made durable, which is what a commit costs
+///
+/// The store flushes before every put returns, so the number is the device round trip
+/// plus whatever the filesystem does to the segment file underneath it. The volume is
+/// fresh for every run and its setup is outside the timed section.
+fn commit_latency(c: &mut Criterion) {
+    let config = ReelConfig {
+        sync: SyncPolicy::EveryPut,
+        ..base_config()
+    };
+    let mut taken: Vec<Duration> = Vec::new();
+    let mut group = c.benchmark_group("commit_latency");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(COMMITS));
+    group.bench_function(
+        BenchmarkId::from_parameter(format!("{COMMIT_BYTES}B")),
+        |b| {
+            b.iter_batched(
+                || Volume::open(config.clone()),
+                |volume| {
+                    let body = payload(COMMIT_BYTES, 0x23);
+                    for index in 0..COMMITS {
+                        let at = Instant::now();
+                        volume
+                            .store
+                            .put_owned(&record_key(GROUP, id(index)), body.clone())
+                            .expect("put");
+                        // Percentiles come off the first run, so they are the volume's
+                        // first commits and not a mean over every run criterion took.
+                        let took = at.elapsed();
+                        if taken.len() < COMMITS as usize {
+                            taken.push(took);
+                        }
+                    }
+                    volume
+                },
+                BatchSize::PerIteration,
+            )
+        },
+    );
+    group.finish();
+
+    taken.sort_unstable();
+    println!(
+        "commit_latency over {} commits: p50 {:?}, p99 {:?}",
+        taken.len(),
+        at_percentile(&taken, 50),
+        at_percentile(&taken, 99),
+    );
+}
+
+/// The latency at one percentile of a sorted run
+fn at_percentile(sorted: &[Duration], percent: usize) -> Duration {
+    if sorted.is_empty() {
+        return Duration::ZERO;
+    }
+    let at = sorted.len() * percent / 100;
+    sorted[at.min(sorted.len() - 1)]
 }
 
 /// Rewriting keys that already exist, against inserting fresh ones
@@ -495,6 +559,7 @@ fn reel_dir_of(root: &Path) -> PathBuf {
 criterion_group!(
     benches,
     ingest,
+    commit_latency,
     update,
     ingest_concurrent,
     read,

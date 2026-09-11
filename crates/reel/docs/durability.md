@@ -67,10 +67,12 @@ than "this is corrupt".
 | a byte count | flush once that many bytes have settled since the last flush | the record is durable if the put crossed the threshold, otherwise it is durable once a later one does |
 | `0` | flush before every put returns | the record reached the device |
 
-Two things flush regardless of the policy. A segment seal takes a full sync after
+Three things flush regardless of the policy. A segment seal takes a full sync after
 writing its footer. Creating a segment syncs the volume directory, because a file's
 own sync says nothing about the entry naming it, and a crash that takes the
-directory block takes the whole segment with it.
+directory block takes the whole segment with it. A tail also keeps a window of
+zeros written and synced ahead of its write head, so every append lands on a block
+the filesystem has already given out.
 
 The seal itself runs off the append path. A roll hands the retiring segment to
 a per-tail sealer thread, `flush()` drains that thread before syncing so a

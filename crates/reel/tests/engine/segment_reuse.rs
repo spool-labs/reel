@@ -33,6 +33,9 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
 
 const SEGMENT: u64 = 1024 * 1024;
 
+/// Zeros a tail lays down ahead of its head: four of this segment's draw margins
+const WINDOW: u64 = (SEGMENT / 16) * 4;
+
 fn key(at: u64) -> RecordKey {
     let mut bytes = [0u8; 16];
     bytes[8..].copy_from_slice(&at.to_be_bytes());
@@ -67,6 +70,58 @@ fn bytes_in(root: &Path) -> u64 {
         .iter()
         .map(|path| std::fs::metadata(path).expect("metadata").len())
         .sum()
+}
+
+/// Copy every file in a root, the image a process that died would leave behind
+fn copy_root(from: &Path, to: &Path) {
+    for entry in std::fs::read_dir(from).expect("read root") {
+        let entry = entry.expect("entry");
+        if entry.path().is_file() {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).expect("copy");
+        }
+    }
+}
+
+// a new segment is zeroed to its window edge, and a walk over one stops at the records
+#[test]
+fn a_new_segment_is_written_through() {
+    let home = TempDir::new().expect("home");
+    let payload = vec![0x5Au8; 8 * 1024];
+
+    let store = ReelStore::open(home.path().to_path_buf(), config(), COLUMNS).expect("open");
+    store.put(&key(0), &payload).expect("put");
+
+    let segments = segments_in(home.path());
+    assert_eq!(segments.len(), 1, "the tail drew more than one segment");
+    let bytes = std::fs::read(&segments[0]).expect("read segment");
+    assert_eq!(
+        bytes.len() as u64,
+        WINDOW,
+        "the window was not written through at creation"
+    );
+    assert!(
+        bytes[WINDOW as usize / 2..].iter().all(|byte| *byte == 0),
+        "the fill past the records is not zeros"
+    );
+
+    // The fill reads back as a data record with no sequence number, which is where the
+    // walk stops, and a written record always draws a sequence number above zero.
+    let crashed = TempDir::new().expect("crashed");
+    copy_root(home.path(), crashed.path());
+    store.close().expect("close");
+    drop(store);
+
+    let store = ReelStore::open(crashed.path().to_path_buf(), config(), COLUMNS).expect("reopen");
+    assert!(
+        store.get(&key(0)).expect("get").is_some(),
+        "the record before the fill went missing"
+    );
+    store.put(&key(1), &payload).expect("put after the crash");
+    assert_eq!(
+        segments_in(crashed.path()).len(),
+        1,
+        "the reopen drew a segment instead of resuming the one it found"
+    );
 }
 
 // a store restarted idle keeps its one tail rather than drawing another

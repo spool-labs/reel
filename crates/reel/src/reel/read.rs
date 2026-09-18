@@ -2,7 +2,7 @@
 
 use crate::error::{ReelError, Result};
 
-use crate::format::column::{ColumnId, KeyRef};
+use crate::format::column::KeyRef;
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{RecordHeader, HEADER_LEN};
@@ -347,19 +347,11 @@ pub(super) fn frame_to_range(
     if !header_matches(&header, expected, lsn, loc) {
         return Ok(RecordRead::Stale);
     }
-    // A record carrying the byte here was written when the column declared a codec
-    // and read back after it stopped. Its stored bytes are not the ones the caller
-    // is addressing and are not corrupt either, so it is reported rather than cut.
+    // The offsets the caller asked at address the payload this record decodes to,
+    // and none of that payload is on the volume, so the window is left to a whole
+    // read that decodes and cuts.
     if header.codec != 0 {
-        return Err(coded_range(expected.column));
+        return Ok(RecordRead::Coded);
     }
     Ok(RecordRead::Found(body))
-}
-
-/// A range asked of bytes a codec produced
-pub fn coded_range(column: ColumnId) -> ReelError {
-    ReelError::CodedRange(format!(
-        "column {} stores what a codec produced, and a codec frame decodes whole",
-        column.as_u8()
-    ))
 }

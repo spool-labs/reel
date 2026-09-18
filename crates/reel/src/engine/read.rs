@@ -114,13 +114,11 @@ impl ReelStore {
 
     /// Read part of one payload, clamped to it, at the caller's logical offsets
     ///
-    /// A raw record's window skips the whole-payload checksum but keeps identity.
-    /// A coded record decodes whole, checksum verified, and the window is cut
-    /// from the decoded payload.
+    /// The record's own header decides which way it is served. A raw record's
+    /// window skips the whole-payload checksum but keeps identity. A coded record
+    /// decodes whole, checksum verified, and the window is cut from the payload it
+    /// decodes to.
     pub fn get_range(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Option<Value>> {
-        if self.is_coded(key.column) {
-            return Ok(self.get(key)?.map(|payload| range_of(payload, offset, len)));
-        }
         self.settle_sealed()?;
         match self.resolve_range(key, offset, len)? {
             Resolved::Payload(payload) => return Ok(Some(payload)),
@@ -143,12 +141,6 @@ impl ReelStore {
         offset: u64,
         len: usize,
     ) -> Result<Option<Value>> {
-        if self.is_coded(key.column) {
-            return Ok(self
-                .get_wait(key)
-                .await?
-                .map(|payload| range_of(payload, offset, len)));
-        }
         self.settle_sealed()?;
         match self.resolve_range_wait(key, offset, len).await? {
             Resolved::Payload(payload) => return Ok(Some(payload)),
@@ -305,7 +297,7 @@ impl ReelStore {
                 }
                 Some(payload)
             }
-            RecordRead::Stale | RecordRead::Gone | RecordRead::Corrupt => None,
+            RecordRead::Stale | RecordRead::Gone | RecordRead::Corrupt | RecordRead::Coded => None,
         }
     }
 
@@ -437,7 +429,9 @@ impl ReelStore {
                 )))
             }
             // Never retried: a newer version is not this reader's to see.
-            RecordRead::Stale | RecordRead::Gone | RecordRead::Corrupt => Ok(None),
+            RecordRead::Stale | RecordRead::Gone | RecordRead::Corrupt | RecordRead::Coded => {
+                Ok(None)
+            }
         }
     }
 
@@ -481,12 +475,11 @@ impl ReelStore {
         self.index.page_from(playback, limit, out)
     }
 
-    /// Whether a column's records are stored as a codec produced them
+    /// Whether a column's records can hold what a codec produced
     ///
-    /// A coded record is stored at a length of its own, so an offset the caller has
-    /// in mind addresses nothing on the volume: the range is cut from the decoded
-    /// payload instead of read off it. A column the volume does not serve is left
-    /// to the read.
+    /// The declaration says what may have happened and the record header says what
+    /// did, so this only decides whether the header has to be read. A column the
+    /// volume does not serve is left to the read.
     fn is_coded(&self, column: ColumnId) -> bool {
         self.index
             .spec(column)
@@ -505,7 +498,7 @@ impl ReelStore {
         for _ in 0..RESOLVE_RETRIES {
             let entry = match resolving.step(self, key)? {
                 Step::Done(resolved) => return Ok(resolved),
-                Step::Read(entry, _) => entry,
+                Step::Read(entry) => entry,
             };
             let read = self.reel.read_record(
                 entry.loc,
@@ -529,7 +522,7 @@ impl ReelStore {
         for _ in 0..RESOLVE_RETRIES {
             let entry = match resolving.step(self, key)? {
                 Step::Done(resolved) => return Ok(resolved),
-                Step::Read(entry, _) => entry,
+                Step::Read(entry) => entry,
             };
             let read = self
                 .reel
@@ -547,15 +540,17 @@ impl ReelStore {
     /// The carried tier is read from and never written to here, since a range holds
     /// a piece of a record and the tier holds records. An entry whose incarnation
     /// stamp is still current takes one device read and no header echo; everything
-    /// else takes the header-checked read.
+    /// else takes the header-checked read, and a header saying a codec produced the
+    /// record sends the window to the whole read.
     fn resolve_range(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Resolved> {
         let mut resolving = Resolving::new(self, key);
         for _ in 0..RESOLVE_RETRIES {
             let (entry, wanted) = match resolving.step_range(self, key, offset, len)? {
-                Step::Done(resolved) => return Ok(resolved),
-                Step::Read(entry, wanted) => (entry, wanted),
+                RangeStep::Done(resolved) => return Ok(resolved),
+                RangeStep::Whole => return self.whole_range(key, offset, len),
+                RangeStep::Read(entry, wanted) => (entry, wanted),
             };
-            if self.window_certain(&entry) {
+            if resolving.window_bare(self, &entry) {
                 if let Some(found) =
                     self.reel
                         .read_window(entry.loc, key.width(), offset, wanted)?
@@ -566,6 +561,9 @@ impl ReelStore {
             let read = self
                 .reel
                 .read_range(entry.loc, key.as_ref(), entry.lsn, offset, wanted)?;
+            if matches!(read, RecordRead::Coded) {
+                return self.whole_range(key, offset, len);
+            }
             if let Some(resolved) = resolving.fold_range(self, key, entry, read)? {
                 return Ok(resolved);
             }
@@ -583,10 +581,11 @@ impl ReelStore {
         let mut resolving = Resolving::new(self, key);
         for _ in 0..RESOLVE_RETRIES {
             let (entry, wanted) = match resolving.step_range(self, key, offset, len)? {
-                Step::Done(resolved) => return Ok(resolved),
-                Step::Read(entry, wanted) => (entry, wanted),
+                RangeStep::Done(resolved) => return Ok(resolved),
+                RangeStep::Whole => return self.whole_range_wait(key, offset, len).await,
+                RangeStep::Read(entry, wanted) => (entry, wanted),
             };
-            if self.window_certain(&entry) {
+            if resolving.window_bare(self, &entry) {
                 let found = self
                     .reel
                     .read_window_wait(entry.loc, key.width(), offset, wanted)
@@ -599,11 +598,34 @@ impl ReelStore {
                 .reel
                 .read_range_wait(entry.loc, key.as_ref(), entry.lsn, offset, wanted)
                 .await?;
+            if matches!(read, RecordRead::Coded) {
+                return self.whole_range_wait(key, offset, len).await;
+            }
             if let Some(resolved) = resolving.fold_range(self, key, entry, read)? {
                 return Ok(resolved);
             }
         }
         resolving.give_up(self, key)
+    }
+
+    /// Read the record whole and cut the window out of what it decodes to
+    ///
+    /// Where a record whose header says a codec produced its bytes is served: the
+    /// offsets the caller asked at address the decoded payload, which no read off
+    /// the volume reaches.
+    fn whole_range(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Resolved> {
+        Ok(match self.get(key)? {
+            Some(payload) => Resolved::Payload(range_of(payload, offset, len)),
+            None => Resolved::Missing,
+        })
+    }
+
+    /// The same as a future, for a caller with no thread to park
+    async fn whole_range_wait(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Resolved> {
+        Ok(match self.get_wait(key).await? {
+            Some(payload) => Resolved::Payload(range_of(payload, offset, len)),
+            None => Resolved::Missing,
+        })
     }
 
     /// Whether the index can vouch for this entry without the on-disk echo
@@ -689,6 +711,9 @@ impl ReelStore {
                 *framed_nothing = Some(entry.loc);
                 Ok(None)
             }
+            // A whole read decodes what a codec produced, and a window is answered
+            // by the range door before it folds, so nothing arrives here coded.
+            RecordRead::Coded => Ok(None),
         }
     }
 
@@ -725,8 +750,20 @@ enum Step {
     /// The attempt answered without asking the volume
     Done(Resolved),
 
-    /// The record to read, and for a ranged read how much of it is wanted
+    /// The record to read off the volume
+    Read(Entry),
+}
+
+/// The same for a window, which the record itself can send to the whole read
+enum RangeStep {
+    /// The attempt answered without asking the volume
+    Done(Resolved),
+
+    /// The record to read, and how much of it is wanted
     Read(Entry, usize),
+
+    /// The record has to be read whole, whatever window the caller asked for
+    Whole,
 }
 
 /// What a resolve carries across its retries
@@ -737,6 +774,9 @@ struct Resolving {
     /// Whether the key's column carries values in the index
     carries: bool,
 
+    /// Whether the column's records can hold what a codec produced
+    coded: bool,
+
     /// A location that framed nothing, kept so giving up can evict it
     framed_nothing: Option<Loc>,
 }
@@ -745,8 +785,17 @@ impl Resolving {
     fn new(store: &ReelStore, key: &RecordKey) -> Resolving {
         Resolving {
             carries: store.index.carry_max(key.column) != 0,
+            coded: store.is_coded(key.column),
             framed_nothing: None,
         }
+    }
+
+    /// Whether this record's window can be read off the volume with no header
+    ///
+    /// A column that declares a codec holds raw and coded records side by side and
+    /// only the header tells them apart, so a window of one is never read bare.
+    fn window_bare(&self, store: &ReelStore, entry: &Entry) -> bool {
+        !self.coded && store.window_certain(entry)
     }
 
     /// What the index says about a whole-record read
@@ -754,34 +803,39 @@ impl Resolving {
         Ok(match store.resolve_index(key, self.carries)? {
             Ready::Payload(payload) => Step::Done(Resolved::Payload(payload)),
             Ready::Missing => Step::Done(Resolved::Missing),
-            Ready::Read(entry) => Step::Read(entry, 0),
+            Ready::Read(entry) => Step::Read(entry),
         })
     }
 
     /// The same for a window of one record, which also clamps what is wanted
     ///
     /// A window past the end of the payload wants nothing, and a caller asking for
-    /// nothing is answered rather than sent to the volume for zero bytes.
+    /// nothing is answered without a trip to the volume. The
+    /// clamp is against the stored length, which is the payload's only on a record
+    /// no codec produced.
     fn step_range(
         &self,
         store: &ReelStore,
         key: &RecordKey,
         offset: u64,
         len: usize,
-    ) -> Result<Step> {
+    ) -> Result<RangeStep> {
         let entry = match store.resolve_index(key, self.carries)? {
             Ready::Payload(payload) => {
-                return Ok(Step::Done(Resolved::Payload(range_of(
+                return Ok(RangeStep::Done(Resolved::Payload(range_of(
                     payload, offset, len,
                 ))))
             }
-            Ready::Missing => return Ok(Step::Done(Resolved::Missing)),
+            Ready::Missing => return Ok(RangeStep::Done(Resolved::Missing)),
             Ready::Read(entry) => entry,
         };
         let wanted = clamped(entry.loc.len, offset, len);
         match wanted {
-            0 => Ok(Step::Done(Resolved::Payload(Value::default()))),
-            wanted => Ok(Step::Read(entry, wanted)),
+            // A coded record is stored at a length of its own, so nothing left to
+            // clamp against it says nothing about where the payload ends.
+            0 if self.coded => Ok(RangeStep::Whole),
+            0 => Ok(RangeStep::Done(Resolved::Payload(Value::default()))),
+            wanted => Ok(RangeStep::Read(entry, wanted)),
         }
     }
 

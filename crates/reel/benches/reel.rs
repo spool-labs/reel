@@ -29,6 +29,7 @@ use reel::{
 
 const RECORDS: ColumnId = ColumnId(1);
 const BLOB: ColumnId = ColumnId(2);
+const CODED: ColumnId = ColumnId(3);
 
 /// Name the store trait addresses the record column by
 const RECORDS_CF: &str = "records";
@@ -58,6 +59,17 @@ const COLUMNS: ColumnSet = &[
         row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
+        map_shape: MapShape::Tree,
+    },
+    ColumnSpec {
+        id: CODED,
+        name: "coded_data",
+        key_width: KeyWidth::Fixed(32),
+        shard_bytes: 0,
+        inline_max: 0,
+        row_carry: 0,
+        purge_mark: None,
+        codec: Codec::Lz4,
         map_shape: MapShape::Tree,
     },
 ];
@@ -114,6 +126,19 @@ fn id(index: u64) -> [u8; 32] {
 fn payload(len: usize, seed: u8) -> Vec<u8> {
     (0..len)
         .map(|index| (index as u8).wrapping_add(seed))
+        .collect()
+}
+
+/// A payload no codec shrinks, so a column that declares one still stores it raw
+fn noise(len: usize) -> Vec<u8> {
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
         .collect()
 }
 
@@ -242,6 +267,57 @@ fn read(c: &mut Criterion) {
                         .get(&record_key(GROUP, id(cursor)))
                         .expect("get"),
                 )
+            })
+        });
+    }
+    group.finish();
+}
+
+/// Windows of one large record off a column that declares a codec
+///
+/// The record decides which way it is served: one the codec left raw is read at
+/// the offset asked for, one it kept decodes whole and is cut.
+fn ranged(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ranged");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    let len = 50 * MIB as usize;
+
+    for (shape, body) in [("raw", noise(len)), ("coded", payload(len, 0x5a))] {
+        let volume = Volume::open(base_config());
+        let key = RecordKey::from_bytes(CODED, &[1u8; 32]).expect("key");
+        volume.store.put_owned(&key, body).expect("put");
+
+        group.throughput(Throughput::Elements(50));
+        group.bench_function(BenchmarkId::new(shape, "1MiB_x50"), |b| {
+            b.iter(|| {
+                for window in 0..50u64 {
+                    black_box(
+                        volume
+                            .store
+                            .get_range(&key, window * MIB, MIB as usize)
+                            .expect("range"),
+                    );
+                }
+            })
+        });
+
+        group.throughput(Throughput::Elements(1_000));
+        group.bench_function(BenchmarkId::new(shape, "1KiB_x1000"), |b| {
+            let mut state = 0x9E37_79B9_7F4A_7C15u64;
+            b.iter(|| {
+                for _ in 0..1_000u32 {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let at = state % (len as u64 - KIB);
+                    black_box(
+                        volume
+                            .store
+                            .get_range(&key, at, KIB as usize)
+                            .expect("range"),
+                    );
+                }
             })
         });
     }
@@ -498,6 +574,7 @@ criterion_group!(
     update,
     ingest_concurrent,
     read,
+    ranged,
     read_concurrent,
     recovery,
     scrub_scan,

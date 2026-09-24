@@ -897,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "tape-reel"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crc-fast",
  "criterion",
@@ -924,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "tape-reel-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "libc",
@@ -936,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "tape-reel-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "thiserror",
  "wincode",
@@ -944,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "tape-reel-mock"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "tape-reel-core",
 ]

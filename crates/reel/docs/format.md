@@ -207,8 +207,9 @@ sit together, sorted by key, fixed-stride at that column's own key width.
 ```
 
 One row is the key, then the sequence number, the offset, the payload length,
-the record's own flags, which is 17 bytes past the key, and up to four inlined
-value bytes where the column declares an inline width. A partition whose keys
+the record's own flags, which is 17 bytes past the key, then, where the column
+declares a `row_carry` width, a row checksum and that many of the value's
+leading bytes, padded, at most 256. A partition whose keys
 are all one width strides at it. One whose keys vary is prefix compressed
 instead, `format/prefix.rs`'s restart-block encoding, because its keys are
 names and sorted names share their fronts; the parse rebuilds whole rows, so

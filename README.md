@@ -134,14 +134,9 @@ Nothing is on by default: what a caller links is the engine and no test rig.
   one and hands it to the engine.
 - `rendezvous`: named points a test can park a thread at, mid-write. Off, every
   site on a production path is a call to an empty function.
-- `alloc-mimalloc`, `alloc-snmalloc`: the allocator this crate's own probe
-  binaries link.
 
-The allocator pair is not a knob for a consumer. A global allocator belongs to
-whoever builds the final binary, so a library can only set one for binaries it
-owns, which here are its probes: linking `reel` with `alloc-mimalloc` changes
-nothing about how your process allocates. Set `#[global_allocator]` in your own
-binary instead.
+The engine allocates through whatever global allocator your binary sets, so
+pick one with `#[global_allocator]` in your own binary.
 
 ## Tests
 

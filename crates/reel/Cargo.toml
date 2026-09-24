@@ -25,8 +25,6 @@ libc.workspace = true
 tracing.workspace = true
 serde = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
-mimalloc = { version = "0.1", optional = true }
-snmalloc-rs = { version = "0.3", optional = true }
 
 [features]
 default = []
@@ -38,11 +36,6 @@ rendezvous = []
 # deserialization for `ReelConfig` and the enums it holds, for an operator who
 # keeps the volume's settings in a file rather than in code.
 serde = ["dep:serde"]
-
-# allocator swaps for this crate's own probe binaries, which is all a library can
-# offer: global allocator belongs to whoever builds the final binary.
-alloc-mimalloc = ["dep:mimalloc"]
-alloc-snmalloc = ["dep:snmalloc-rs"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"

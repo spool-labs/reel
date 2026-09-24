@@ -11,16 +11,6 @@
 //! Opt-in, run with:
 //!   cargo test -p tape-reel --release --test probes -- publish_cost
 
-#[cfg(feature = "alloc-mimalloc")]
-#[global_allocator]
-static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-// Only one process can name a global allocator, so asking for both picks mimalloc
-// rather than failing to build, which is what `--all-features` asks for.
-#[cfg(all(feature = "alloc-snmalloc", not(feature = "alloc-mimalloc")))]
-#[global_allocator]
-static ALLOCATOR: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
-
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
@@ -66,17 +56,6 @@ fn writer_counts() -> Vec<u16> {
         .into_iter()
         .take_while(|writers| usize::from(*writers) <= cores.max(8))
         .collect()
-}
-
-/// Which allocator this binary was linked against, so a log says what it measured
-fn allocator() -> &'static str {
-    if cfg!(feature = "alloc-mimalloc") {
-        "mimalloc"
-    } else if cfg!(feature = "alloc-snmalloc") {
-        "snmalloc"
-    } else {
-        "system"
-    }
 }
 
 fn key(group: u16, index: u32) -> RecordKey {
@@ -141,7 +120,6 @@ fn batch(group: u16, round: u32, payload: &[u8]) -> Vec<RecordWrite> {
 pub fn batch_publish() {
     // libtest leaves the test name line open, so a header needs a newline ahead of it.
     println!();
-    println!("allocator: {}", allocator());
     println!("{:>8} {:>14} {:>14}", "writers", "per batch", "batches/s");
     for writers in writer_counts() {
         let dir = TempDir::new().expect("tempdir");
@@ -186,7 +164,6 @@ pub fn batch_publish() {
 // the store taken out, so only what `batch_publish` does beyond this is the engine's.
 pub fn batch_alloc_only() {
     println!();
-    println!("allocator: {}", allocator());
     println!("{:>8} {:>14} {:>14}", "writers", "per batch", "batches/s");
     for writers in writer_counts() {
         let start = Arc::new(Barrier::new(usize::from(writers) + 1));

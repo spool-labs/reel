@@ -7,7 +7,7 @@ members = ["crates/*"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 license = "Apache-2.0"
 homepage = "https://tape.network"
 repository = "https://github.com/spool-labs/reel"
@@ -18,7 +18,7 @@ rust-version = "1.89"
 reel = { package = "tape-reel", path = "crates/reel" }
 # Versioned because the published engine depends on it: a bare path dependency
 # is a publish error. The mock is private and needs only its workspace path.
-reel-core = { package = "tape-reel-core", path = "crates/reel-core", version = "0.2.0" }
+reel-core = { package = "tape-reel-core", path = "crates/reel-core", version = "0.3.0" }
 reel-mock = { package = "tape-reel-mock", path = "crates/reel-mock" }
 clap = { version = "4.6", features = ["derive"] }
 thiserror = "2.0.12"

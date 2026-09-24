@@ -370,7 +370,13 @@ pub(super) fn publish_flush(owed: &Owed, flushed: &Result<Option<u64>>) {
         Ok(Some(covered)) => owed.sync.flush.slack_with(|flush| {
             // Two flushes of one segment can finish out of order, and the one answering
             // for less must not walk the watermark back.
-            owed.sync.synced_at.fetch_max(*covered, Ordering::AcqRel);
+            let before = owed.sync.synced_at.fetch_max(*covered, Ordering::AcqRel);
+            // What the volume wrote between these two flushes. A flush that finished out
+            // of order answers for less than one already counted and says nothing.
+            let span = covered.saturating_sub(before);
+            if span > 0 {
+                owed.sync.last_span.store(span, Ordering::Release);
+            }
             flush.is_running = false;
         }),
         Ok(None) => owed.sync.flush.slack_with(|flush| {

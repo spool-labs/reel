@@ -29,17 +29,18 @@ pub const INLINE_KEY_LEN: usize = 108;
 /// in place: a walk builds one key per row it steps, and this is what each weighs.
 pub const SHORT_KEY_LEN: usize = 40;
 
-/// Widest value a column may ask the index to carry for it
+/// Bytes of a value a decoded footer row keeps, and the floor of the resident side map
 ///
-/// An index entry has this many bytes of padding to spend, so a ceiling up to it
-/// is free and one past it costs eight bytes on every key of every column.
+/// The index entry holds no value bytes. A column's `inline_max` has to pass this
+/// before the resident index keeps any value beside its entries, and it keeps only
+/// values longer than this.
 pub const INLINE_MAX: usize = 4;
 
 /// Widest value a sealed row carries beside its key
 ///
-/// Unlike the index entry's inline bytes, which every resident key of every
-/// column pays for, a row is read a block at a time and only the reader who
-/// wanted that block pays for what it carries.
+/// Unlike the resident side map, which the resident index pays for per key it
+/// keeps, a row is read a block at a time and only the reader who wanted that
+/// block pays for what it holds.
 pub const ROW_CARRY_MAX: usize = 256;
 
 /// What a sealed row carries of a value, for a column that asked to carry one
@@ -57,7 +58,7 @@ pub fn carry_bytes(payload: &[u8], width: u16) -> CarryBytes {
     carry.into_boxed_slice()
 }
 
-/// The bytes an index entry or a footer row carries of a value itself
+/// The leading bytes of a value, as many as a decoded footer row keeps
 pub type InlineBytes = [u8; INLINE_MAX];
 
 /// The leading bytes of a payload, as far as one of those will hold
@@ -382,7 +383,7 @@ pub struct ColumnSpec {
     /// Leading key bytes that select the index shard a key lives in
     pub shard_bytes: u8,
 
-    /// Payload bytes at or below which a value is served from the index, zero to opt out
+    /// Longest value the resident index keeps beside its entry, which takes only values past INLINE_MAX
     pub inline_max: u16,
 
     /// Bytes a sealed row carries of this column's values, zero to carry none

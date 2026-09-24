@@ -24,13 +24,12 @@ lz4_flex.workspace = true
 libc.workspace = true
 tracing.workspace = true
 serde = { workspace = true, optional = true }
-rand = { workspace = true, optional = true }
 
 [features]
 default = []
 
 # tests
-sim = ["dep:rand"]
+sim = []
 rendezvous = []
 
 # deserialization for `ReelConfig` and the enums it holds, for an operator who

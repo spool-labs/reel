@@ -1501,9 +1501,9 @@ mod tests {
         assert_eq!(traces[0].advice, Advice::DontNeed);
     }
 
-    // the same seed and op stream yield the same durable image
+    // the same plan and op stream yield the same durable image
     #[test]
-    fn same_seed_same_image() {
+    fn same_plan_same_image() {
         let stream = |io: &SimIo| {
             let path = path_in(Path::new("/reel"), "segment-0");
             let file = open(io, &path, true);
@@ -1514,8 +1514,9 @@ mod tests {
             let _ = poll_all(io);
         };
 
-        let left = SimIo::new(FaultPlan::from_seed(4242));
-        let right = SimIo::new(FaultPlan::from_seed(4242));
+        let plan = || FaultPlan::new(4242).with_fault(1, FaultKind::TornWrite { durable_bytes: 3 });
+        let left = SimIo::new(plan());
+        let right = SimIo::new(plan());
         stream(&left);
         stream(&right);
         assert_eq!(left.durable_image(), right.durable_image());

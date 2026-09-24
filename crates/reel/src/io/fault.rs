@@ -2,16 +2,7 @@
 //!
 //! A plan pins a seed, an optional crash boundary, and a list of faults keyed to
 //! global op positions. The simulator is a pure function of an op stream and a
-//! plan, so the same seed reproduces the same on-disk image.
-
-use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
-
-const GENERATED_OP_RANGE: u64 = 8;
-const GENERATED_SHORT_BYTES: u64 = 64;
-const GENERATED_DELAY_POLLS: u32 = 4;
-const GENERATED_FAULT_KINDS: u32 = 13;
-const CRASH_PROBABILITY: f64 = 0.5;
+//! plan, so the same plan reproduces the same on-disk image.
 
 /// One fault the simulator injects when a scheduled op executes or completes
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,27 +73,6 @@ impl FaultPlan {
         }
     }
 
-    /// Build a deterministic plan of one fault and maybe a crash from a seed
-    pub fn from_seed(seed: u64) -> Self {
-        let mut rng = SmallRng::seed_from_u64(seed);
-
-        let at_op = rng.gen_range(0..GENERATED_OP_RANGE);
-        let kind = generate_kind(&mut rng);
-        let crash_at = if rng.gen_bool(CRASH_PROBABILITY) {
-            Some(rng.gen_range(0..GENERATED_OP_RANGE))
-        } else {
-            None
-        };
-
-        Self {
-            seed,
-            crash_at,
-            faults: vec![ScheduledFault { at_op, kind }],
-            reorder_completions: false,
-            scatter_bytes: None,
-        }
-    }
-
     /// Schedule a fault at a global op position
     pub fn with_fault(mut self, at_op: u64, kind: FaultKind) -> Self {
         self.faults.push(ScheduledFault { at_op, kind });
@@ -136,33 +106,6 @@ impl FaultPlan {
     }
 }
 
-fn generate_kind(rng: &mut SmallRng) -> FaultKind {
-    match rng.gen_range(0..GENERATED_FAULT_KINDS) {
-        0 => FaultKind::ShortWrite {
-            written_bytes: rng.gen_range(0..GENERATED_SHORT_BYTES),
-        },
-        1 => FaultKind::TornWrite {
-            durable_bytes: rng.gen_range(0..GENERATED_SHORT_BYTES),
-        },
-        2 => FaultKind::LyingSync,
-        3 => FaultKind::LyingSyncRange,
-        4 => FaultKind::EnospcAppend,
-        5 => FaultKind::EnospcAllocate,
-        6 => FaultKind::SyncError,
-        7 => FaultKind::ReorderDir,
-        8 => FaultKind::BitFlip {
-            at_byte: rng.gen_range(0..GENERATED_SHORT_BYTES),
-            bit: rng.gen_range(0..8),
-        },
-        9 => FaultKind::ListError,
-        10 => FaultKind::ReadError,
-        11 => FaultKind::DropCompletion,
-        _ => FaultKind::DelayCompletion {
-            polls: rng.gen_range(1..GENERATED_DELAY_POLLS),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,20 +119,6 @@ mod tests {
         assert_eq!(plan.crash_at, None);
         assert!(plan.faults.is_empty());
         assert!(!plan.reorder_completions);
-    }
-
-    // the same seed generates the same plan
-    #[test]
-    fn seed_stable() {
-        assert_eq!(FaultPlan::from_seed(1234), FaultPlan::from_seed(1234));
-    }
-
-    // a generated plan schedules exactly one fault
-    #[test]
-    fn single_fault() {
-        let plan = FaultPlan::from_seed(77);
-
-        assert_eq!(plan.faults.len(), 1);
     }
 
     // the builders assemble crash, fault, and reorder settings

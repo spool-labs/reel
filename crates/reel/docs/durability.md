@@ -169,9 +169,10 @@ segment held and syncs, so a batch in a footer is a batch that completed.
 
 ## Recovery: the files are the truth
 
-The index is rebuilt on open, by reading the volume's segment files in number
-order on the thread that opened it. There is no fan-out: with one log there is
-nothing to rebuild in parallel with anything else.
+The index is rebuilt on open from the volume's segment files. On a posix backend
+up to eight threads (`MAX_READERS`) read the files at once, and the opening thread
+applies them in segment number order, so an exact tie still goes to the earlier
+segment. The ring backend reads them one at a time on the opening thread.
 
 **A file is only a segment if it says so.** Its first record has to be a segment
 header record whose payload verifies and whose segment number and format version

@@ -1,6 +1,6 @@
 //! Typed wrapper around the Store trait for type-safe operations
 
-use crate::{Column, Error, Result, Store, Value};
+use crate::{Column, Error, Result, Store};
 
 /// A typed wrapper around a Store implementation
 ///
@@ -35,28 +35,6 @@ impl<S: Store> TypedStore<S> {
             }
             None => Ok(None),
         }
-    }
-
-    /// Read a column's stored bytes without decoding them
-    ///
-    /// Only for a column whose encoding is its raw bytes, since the store's own
-    /// buffer is handed back as it came.
-    pub fn get_raw<C: Column>(&self, key: &C::Key) -> Result<Option<Value>> {
-        let key_bytes = wincode::serialize(key)
-            .map_err(|e| Error::Serialization(format!("failed to serialize key: {}", e)))?;
-
-        self.inner.get(C::CF_NAME, &key_bytes)
-    }
-
-    /// Read a column's stored bytes without decoding them, awaited
-    ///
-    /// The key is serialized before the wait, so only the store's own future is
-    /// held across it.
-    pub async fn get_raw_wait<C: Column>(&self, key: &C::Key) -> Result<Option<Value>> {
-        let key_bytes = wincode::serialize(key)
-            .map_err(|e| Error::Serialization(format!("failed to serialize key: {}", e)))?;
-
-        self.inner.get_wait(C::CF_NAME, &key_bytes).await
     }
 
     /// Put a key-value pair into the column.

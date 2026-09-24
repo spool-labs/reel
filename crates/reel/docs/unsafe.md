@@ -1,8 +1,13 @@
 # Unsafe: every site, and what makes it sound
 
-**75 `unsafe` occurrences across 61 items, in 9 files, all of them in `reel`.**
+**83 `unsafe` occurrences across 62 items, in 11 files.** 81 of them, in 61 items
+across 10 files, are in `tape-reel`. The other 2 are one item in `tape-reel-cli`.
 `tape-reel-core` and `tape-reel-mock` have none. Test modules are excluded from those
 counts; what follows is what a release build compiles.
+
+Counted as the keyword in code outside test modules, with comments stripped. An
+item is the function or impl a site sits in, and each `cfg` alternative counts on
+its own.
 
 Nearly all of it is one shape. The engine talks to the kernel directly, so a
 syscall taking a descriptor or a pointer is an `unsafe` call with no safe
@@ -11,10 +16,10 @@ completion has just reported, which is the one place the type system cannot see
 what the kernel did.
 
 Many of the sites below are `cfg` alternatives of each other, so no build
-compiles all 61. A Linux x86_64 build compiles 55; a macOS aarch64 build
-compiles 36, having no ring backend and no Linux-only syscalls.
+compiles all 61 in `tape-reel`. A Linux x86_64 build compiles 54 of them. A macOS
+aarch64 build compiles 37, having no ring backend and no Linux-only syscalls.
 
-## `io/posix_backend.rs`: 26 occurrences, 22 items
+## `io/posix_backend.rs`: 28 occurrences, 22 items
 
 The syscall surface. Six shapes, then the wrappers.
 
@@ -35,9 +40,13 @@ The syscall surface. Six shapes, then the wrappers.
 | `raw_allocate` | `fallocate` on Linux, `F_PREALLOCATE` then extend on macOS | **invariant undocumented.** Descriptor plus an `fstore_t` this frame owns |
 | `raw_advise` | `posix_fadvise` on Linux, `F_RDAHEAD` on macOS | **invariant undocumented.** Descriptor and integers only |
 
-## `io/uring_backend.rs`: 14 occurrences, 12 items
+## `io/uring_backend.rs`: 15 occurrences, 10 items
 
-Every site here carries a `SAFETY` comment in the code.
+Every site has a comment saying why it is sound. Eight are `SAFETY` notes: the
+buffer registration, `run_owed_work`, the submission push, the kick arm, `kicked`,
+both calls in `Inbox::new`, and `kick`. The two completion commits and the two
+staged cuts have plain comments. `IoVecs` and `Buffers::filled` state theirs in the
+doc comment on the type and on the function.
 
 | site | what it does | what makes it sound |
 |---|---|---|
@@ -47,6 +56,7 @@ Every site here carries a `SAFETY` comment in the code.
 | read completion commit | commits a whole-record read | the kernel wrote exactly that many bytes into the buffer's room |
 | split read completion commit | commits a header and payload pair | a vectored read fills the first buffer before the second |
 | staged read, staged split | cuts the wanted window out of a registered staging buffer | the count came off the completion, so the range named is what the kernel wrote |
+| `run_owed_work` | an enter that submits nothing and waits for nothing, so the kernel runs completion work it holds for this thread | the call passes no buffer, and it runs on the thread that owns the ring, which is what deferred completion work requires |
 | submission push, kick arm | pushes an entry onto the submission queue | the entry names buffers held for the whole flight, or a descriptor that outlives the engine thread and no buffer at all |
 | `kicked` | reads the counter a wake left | an ffi read of the eight bytes an eventfd counter holds |
 | `Inbox::new` | creates the eventfd and takes ownership of it | the descriptor is fresh from the kernel and owned by nothing else |
@@ -76,17 +86,29 @@ Aligned staging for direct io. Every site carries a comment.
 | `Mapping::slice` | hands out a span of the mapping | in bounds of a live mapping over a file that is never truncated, checked against the mapped length first |
 | `Drop` | `munmap` | the base and length are the ones `mmap` returned |
 
-## `index/tbtreemap.rs`: 11 occurrences, 7 items
+## `index/tbtreemap.rs`: 10 occurrences, 6 items
 
-Vector scans over a node's leads, and a prefetch hint.
+Vector scans over a node's leads, and a prefetch hint. The scans are x86_64 only.
+Every other machine counts with the scalar loop, which needs no `unsafe`.
 
 | site | what it does | what makes it sound |
 |---|---|---|
-| `count_below`, aarch64 | NEON compares counting the leads below a wanted key | NEON is baseline on aarch64, and every load is bounded by the chunk iterator rather than by arithmetic on the length |
 | `count_below`, x86_64 | dispatches to the widest scan the processor reports | each arm runs only where detection found its feature, and every load is bounded by the chunk iterator |
 | `count_avx512`, `count_avx2` | the 512-bit and 256-bit forms | **invariant undocumented at the declaration.** Both are `#[target_feature]` `unsafe fn` with no `# Safety` section; the feature requirement is stated at the dispatch above and in the `scans` wrappers below |
 | `scans::avx512`, `scans::avx2` | the same two, callable directly so a test can hold them against each other | `# Safety`: the caller must have detected the feature first |
 | `prefetch` | inline asm on aarch64, the intrinsic on x86_64 | a prefetch of any address is architecturally a hint and cannot fault, and the pointer comes from a live arena slot regardless |
+
+## `index/opentable.rs`: 4 occurrences, 3 items
+
+The open table's probe, which reads sixteen control bytes at a time. Every site has
+a `SAFETY` note or a `# Safety` section. Other machines walk a slot at a time and
+need no `unsafe`.
+
+| site | what it does | what makes it sound |
+|---|---|---|
+| `site`, aarch64 | a NEON load of sixteen control bytes, compared against the key's hash fragment | NEON is baseline on aarch64, and the control array keeps fifteen mirror bytes past its last slot, so a sixteen byte load from any slot stays inside the allocation |
+| `site`, x86_64 | the same probe with SSE2 | SSE2 is baseline on x86_64, and the same mirror bounds the load |
+| `nibble_mask` | folds a NEON compare into four bits a lane in one word | `# Safety`: NEON, which is baseline on aarch64. It works on registers and reads no memory |
 
 ## `io/op.rs`: 2 occurrences, 1 item
 
@@ -116,6 +138,12 @@ The startup pass reading what the machine already knows. All commented.
 | site | what it does | what makes it sound |
 |---|---|---|
 | `erase_range` | `fallocate` with hole-punch and keep-size, giving a dead run's blocks back | an ffi call against a descriptor the caller holds open across it |
+
+## `tape-reel-cli`, `term.rs`: 2 occurrences, 1 item
+
+| site | what it does | what makes it sound |
+|---|---|---|
+| `winsize` | zeroes a `libc::winsize` and asks `ioctl(TIOCGWINSZ)` for the terminal's width | **invariant undocumented.** The struct is plain integers, so all zeros is a valid value, and the kernel writes at most one `winsize` into a struct this frame owns |
 
 ## What this list is not
 

@@ -481,7 +481,7 @@ impl ColumnIndex {
         on_index!(self, index => index.page(start, limit, out))
     }
 
-    /// One page of the keys under a shard-aligned prefix, in no promised order
+    /// One page of the keys under a prefix, in no promised order
     pub fn sweep_prefix(
         &self,
         nonce: u64,
@@ -2108,13 +2108,9 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         })
     }
 
-    /// One page of the keys under a shard-aligned prefix, in no promised order
+    /// One page of the keys under a prefix, and where the next page starts
     ///
-    /// The prefix has to be exactly the shard key: a shorter one spans shards
-    /// and a longer one splits a shard, and neither can be served by walking one
-    /// shard's slots. Refused rather than served slowly, the same way
-    /// `prefix_totals` refuses, so a caller cannot ask for a full scan by
-    /// accident.
+    /// An open table serves only its exact shard key, so a caller cannot ask for a full scan by accident.
     pub fn sweep_prefix(
         &self,
         nonce: u64,
@@ -2124,7 +2120,13 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         out: &mut KeyPage,
     ) -> Option<ColumnMark> {
         out.clear();
-        if self.shard_bytes == 0 || prefix.len() != self.shard_bytes as usize || limit == 0 {
+        if limit == 0 {
+            return None;
+        }
+        if S::SHAPE == MapShape::Tree {
+            return self.sweep_ordered_prefix(nonce, prefix, from, limit, out);
+        }
+        if self.shard_bytes == 0 || prefix.len() != self.shard_bytes as usize {
             return None;
         }
         let at = self.shard_of_bytes(prefix);
@@ -2156,6 +2158,62 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 None => return None,
             }
         }
+    }
+
+    /// One page of a prefix walked in key order, marked with the last key handed out
+    fn sweep_ordered_prefix(
+        &self,
+        nonce: u64,
+        prefix: &[u8],
+        from: Option<&ColumnMark>,
+        limit: usize,
+        out: &mut KeyPage,
+    ) -> Option<ColumnMark> {
+        let first = self.shard_of_bytes(prefix);
+        let mut high = prefix.to_vec();
+        high.resize(high.len().max(self.shard_bytes as usize), 0xff);
+        let last = self.shard_of_bytes(&high).min(self.shards.len() - 1);
+
+        // A mark from another opening or another prefix starts the walk over.
+        let resumed = from
+            .filter(|mark| mark.nonce == nonce && (first..=last).contains(&mark.shard))
+            .and_then(|mark| match &mark.within {
+                Mark::Key(key) if key.starts_with(prefix) => {
+                    K::from_slice(key).map(|key| (mark.shard, key))
+                }
+                _ => None,
+            });
+        let start = resumed.as_ref().map_or(first, |(shard, _)| *shard);
+
+        // A mark comes back only once another live key follows, so a finished prefix never ends on an empty page.
+        let mut stopped: Option<(usize, Box<[u8]>)> = None;
+        for at in self.occupied_range(start, last) {
+            let bound = match &resumed {
+                Some((shard, key)) if *shard == at => Bound::Excluded(key.clone()),
+                _ => Bound::Included(K::low_bound(prefix)),
+            };
+            let state = read(&self.shards[at]);
+            for (key, entry) in state.map.span(borrowed(&bound), Bound::Unbounded) {
+                if !key.as_slice().starts_with(prefix) {
+                    break;
+                }
+                if entry.is_grave() || self.is_covered(key.as_slice(), entry.lsn) {
+                    continue;
+                }
+                if let Some((shard, key)) = stopped {
+                    return Some(ColumnMark {
+                        nonce,
+                        shard,
+                        within: Mark::Key(key),
+                    });
+                }
+                out.push_carried(key.as_slice(), *entry, None);
+                if out.len() >= limit {
+                    stopped = Some((at, Box::from(key.as_slice())));
+                }
+            }
+        }
+        None
     }
 
     /// Fill a page with one bounded run of live keys, ascending from a bound
@@ -3131,7 +3189,7 @@ mod tests {
         assert_eq!(seen, wrote, "a column sweep lost keys");
     }
 
-    // a shard-aligned prefix sweeps its shard and refuses any other width
+    // a tree sweeps its shard key and any prefix narrower or wider than it
     #[test]
     fn prefix_sweep_takes_its_shard() {
         let index = sharded();
@@ -3165,13 +3223,55 @@ mod tests {
         }
         assert_eq!(seen, wrote, "a prefix sweep took the wrong shard's keys");
 
-        // Anything but the shard key is refused rather than served by scanning.
+        // The tree keeps its keys in order, so a prefix of any width is one run.
         assert!(index.sweep_prefix(9, &[7u8], None, 16, &mut page).is_none());
         assert_eq!(page.len(), 0);
         assert!(index
-            .sweep_prefix(9, &[0, 7, 0], None, 16, &mut page)
+            .sweep_prefix(9, &[0, 7, 3], None, 16, &mut page)
             .is_none());
-        assert_eq!(page.len(), 0);
+        assert_eq!(keys_in(&page), vec![key(7, 3)]);
+        assert!(index.sweep_prefix(9, &[0], None, 128, &mut page).is_none());
+        assert_eq!(page.len(), 120);
+    }
+
+    // an open table sweeps its shard key and refuses any other width
+    #[test]
+    fn open_prefix_sweep_takes_only_its_shard() {
+        let index: WidthIndex<[u8; 34], OpenTables<34>> = WidthIndex::new(&SHARDED);
+        let segments = SegmentTable::new();
+        let mut wrote = BTreeSet::new();
+        for group in [7u16, 1, 40] {
+            for byte in 0..40u8 {
+                index.insert(
+                    &key(group, byte),
+                    Entry::new(loc(1, u32::from(byte), 10), Lsn(u64::from(byte) + 1)),
+                    &segments,
+                    None,
+                );
+                if group == 7 {
+                    wrote.insert(key(group, byte));
+                }
+            }
+        }
+
+        let mut seen = BTreeSet::new();
+        let mut mark = None;
+        let mut page = KeyPage::default();
+        loop {
+            let next = index.sweep_prefix(9, &7u16.to_be_bytes(), mark.as_ref(), 16, &mut page);
+            seen.extend(keys_in(&page));
+            match next {
+                Some(next) => mark = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen, wrote, "a prefix sweep took the wrong shard's keys");
+
+        // Any other width is refused, so a prefix walk never scans the table.
+        for prefix in [&[0u8][..], &[0, 7, 3], &[]] {
+            assert!(index.sweep_prefix(9, prefix, None, 16, &mut page).is_none());
+            assert_eq!(page.len(), 0);
+        }
     }
 
     // a mark another opening minted starts the column over

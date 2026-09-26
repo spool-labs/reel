@@ -261,7 +261,7 @@ impl Store for ReelStore {
         Ok((rows, next))
     }
 
-    /// One page under a shard-aligned prefix, in no promised order
+    /// One page under a prefix, in key order on a tree and slot order on an open table
     fn sweep_prefix(
         &self,
         cf: &str,
@@ -321,7 +321,7 @@ impl Store for ReelStore {
         Ok(total)
     }
 
-    /// One page of keys under a shard-aligned prefix, in no promised order
+    /// One page of keys under a prefix, the same promise as `sweep_prefix`
     fn sweep_keys_prefix(
         &self,
         cf: &str,
@@ -1176,7 +1176,7 @@ mod tests {
 
     use crate::units::ByteCount;
 
-    use crate::config::{Preallocate, ReelConfig, SyncPolicy, ThreadBudget};
+    use crate::config::{Preallocate, ReelConfig, ShardShapes, SyncPolicy, ThreadBudget};
     use crate::format::column::{Codec, ColumnSet, ColumnSpec, MapShape};
     use crate::io::fault::FaultPlan;
     use crate::io::sim_backend::SimIo;
@@ -1842,6 +1842,296 @@ mod tests {
             keys(store, RECORD_CF, &[]),
             vec![record(6, 1), record(8, 1)]
         );
+    }
+
+    const PLAIN_CF: &str = "plain";
+    const WIDE_CF: &str = "wide";
+    const OPEN_CF: &str = "open";
+
+    const WIDE_KEY_LEN: usize = 34;
+
+    /// A variable tree, a fixed tree and an open table, the shapes a prefix sweep meets
+    const SWEEP_COLUMNS: ColumnSet = &[
+        ColumnSpec {
+            id: ColumnId(1),
+            name: PLAIN_CF,
+            key_width: KeyWidth::Variable,
+            shard_bytes: 0,
+            inline_max: 0,
+            row_carry: 0,
+            purge_mark: None,
+            codec: Codec::None,
+            map_shape: MapShape::Tree,
+        },
+        ColumnSpec {
+            id: ColumnId(2),
+            name: WIDE_CF,
+            key_width: KeyWidth::Fixed(WIDE_KEY_LEN as u16),
+            shard_bytes: GROUP_PREFIX_LEN as u8,
+            inline_max: 0,
+            row_carry: 0,
+            purge_mark: None,
+            codec: Codec::None,
+            map_shape: MapShape::Tree,
+        },
+        ColumnSpec {
+            id: ColumnId(3),
+            name: OPEN_CF,
+            key_width: KeyWidth::Fixed(WIDE_KEY_LEN as u16),
+            shard_bytes: GROUP_PREFIX_LEN as u8,
+            inline_max: 0,
+            row_carry: 0,
+            purge_mark: None,
+            codec: Codec::None,
+            map_shape: MapShape::Open,
+        },
+    ];
+
+    fn sweep_store() -> ReelStore {
+        let sim = SimIo::new(FaultPlan::new(1));
+        let config = ReelConfig {
+            shard_shapes: ShardShapes::Declared,
+            ..config()
+        };
+        ReelStore::open_with_io(PathBuf::from(ROOT), config, SWEEP_COLUMNS, Arc::new(sim))
+            .expect("open")
+    }
+
+    /// Two big-endian words, the shape the store's plain columns key on
+    fn pair(high: u64, low: u64) -> Vec<u8> {
+        let mut bytes = high.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&low.to_be_bytes());
+        bytes
+    }
+
+    /// Every page of a prefix sweep, and how many pages it took
+    fn swept(store: &dyn Store, cf: &str, prefix: &[u8], limit: usize) -> (Vec<Vec<u8>>, usize) {
+        let mut found = Vec::new();
+        let mut mark: Option<Vec<u8>> = None;
+        let mut pages = 0;
+        loop {
+            let (rows, next) = store
+                .sweep_prefix(cf, prefix, mark.as_deref(), limit)
+                .expect("sweep");
+            assert!(rows.len() <= limit, "a page ran past its limit");
+            for (key, value) in rows {
+                assert_eq!(
+                    store.get(cf, &key).expect("get"),
+                    Some(value),
+                    "a swept row came back with another value"
+                );
+                found.push(key);
+            }
+            pages += 1;
+            match next {
+                Some(next) => mark = Some(next),
+                None => break,
+            }
+            assert!(pages <= 1_000, "a prefix sweep never finished");
+        }
+        found.sort();
+        (found, pages)
+    }
+
+    // a prefix sweep on a variable tree finds the rows the prefix walk finds
+    #[test]
+    fn prefix_sweep_on_a_variable_tree() {
+        let store = sweep_store();
+        let store = trait_store(&store);
+        for high in [1u64, 2, 3] {
+            for low in [10u64, 20] {
+                store
+                    .put(PLAIN_CF, &pair(high, low), &low.to_be_bytes())
+                    .expect("put");
+            }
+        }
+
+        let prefix = 2u64.to_be_bytes();
+        let (found, _) = swept(store, PLAIN_CF, &prefix, 16);
+
+        assert_eq!(found, vec![pair(2, 10), pair(2, 20)]);
+        assert_eq!(found, keys(store, PLAIN_CF, &prefix));
+    }
+
+    // a small limit pages a variable tree's prefix and the marks resume it
+    #[test]
+    fn prefix_sweep_resumes_across_pages() {
+        let store = sweep_store();
+        let store = trait_store(&store);
+        let mut wrote = Vec::new();
+        for high in [4u64, 5, 6] {
+            for low in 0..9u64 {
+                store
+                    .put(PLAIN_CF, &pair(high, low), &[low as u8; 24])
+                    .expect("put");
+                if high == 5 {
+                    wrote.push(pair(high, low));
+                }
+            }
+        }
+
+        let (found, pages) = swept(store, PLAIN_CF, &5u64.to_be_bytes(), 2);
+
+        assert_eq!(found, wrote);
+        assert!(pages >= 5, "nine keys two to a page took {pages} pages");
+    }
+
+    // a prefix with no rows answers an empty page and no mark
+    #[test]
+    fn prefix_sweep_of_an_empty_prefix() {
+        let store = sweep_store();
+        let store = trait_store(&store);
+        for high in [1u64, 3] {
+            store
+                .put(PLAIN_CF, &pair(high, 1), &[0x11; 8])
+                .expect("put");
+        }
+
+        let (rows, next) = store
+            .sweep_prefix(PLAIN_CF, &2u64.to_be_bytes(), None, 16)
+            .expect("sweep");
+
+        assert!(rows.is_empty());
+        assert!(next.is_none());
+    }
+
+    // a prefix at the top of the key space sweeps to the end and stops
+    #[test]
+    fn prefix_sweep_at_the_end_of_the_key_space() {
+        let store = sweep_store();
+        let store = trait_store(&store);
+        let top = u64::MAX.to_be_bytes();
+        for low in [0u64, 7, u64::MAX] {
+            store
+                .put(PLAIN_CF, &pair(u64::MAX, low), &[0x22; 8])
+                .expect("put");
+        }
+        store
+            .put(PLAIN_CF, &pair(u64::MAX - 1, 1), &[0x22; 8])
+            .expect("put");
+
+        let (found, _) = swept(store, PLAIN_CF, &top, 2);
+
+        assert_eq!(
+            found,
+            vec![
+                pair(u64::MAX, 0),
+                pair(u64::MAX, 7),
+                pair(u64::MAX, u64::MAX)
+            ]
+        );
+        assert_eq!(found, keys(store, PLAIN_CF, &top));
+    }
+
+    // keys of different lengths under one prefix all come back
+    #[test]
+    fn prefix_sweep_over_mixed_lengths() {
+        let store = sweep_store();
+        let store = trait_store(&store);
+        let prefix = 9u64.to_be_bytes();
+        let mut wrote = vec![prefix.to_vec()];
+        for tail in [&[0u8][..], &[0, 0], &[1, 2, 3], &[0xff; 40]] {
+            let mut key = prefix.to_vec();
+            key.extend_from_slice(tail);
+            wrote.push(key);
+        }
+        for key in &wrote {
+            store.put(PLAIN_CF, key, &[0x33; 16]).expect("put");
+        }
+        store.put(PLAIN_CF, &[9u8; 4], &[0x33; 16]).expect("put");
+        store.put(PLAIN_CF, &pair(10, 0), &[0x33; 16]).expect("put");
+        wrote.sort();
+
+        for limit in [1usize, 2, 16] {
+            let (found, _) = swept(store, PLAIN_CF, &prefix, limit);
+            assert_eq!(found, wrote, "limit {limit} lost a key");
+        }
+        assert_eq!(keys(store, PLAIN_CF, &prefix), wrote);
+    }
+
+    // the sweep and the prefix walk agree on every prefix of the same data
+    #[test]
+    fn prefix_sweep_matches_the_prefix_walk() {
+        let store = sweep_store();
+        let store = trait_store(&store);
+        for high in 0..6u64 {
+            for low in 0..high * 3 {
+                store
+                    .put(PLAIN_CF, &pair(high, low), &[high as u8; 32])
+                    .expect("put");
+            }
+        }
+        store.delete(PLAIN_CF, &pair(4, 2)).expect("delete");
+
+        for high in 0..7u64 {
+            let prefix = high.to_be_bytes();
+            let (found, _) = swept(store, PLAIN_CF, &prefix, 4);
+            assert_eq!(found, keys(store, PLAIN_CF, &prefix), "prefix {high}");
+        }
+        let mut short = 0u64.to_be_bytes().to_vec();
+        short.truncate(7);
+        let (found, _) = swept(store, PLAIN_CF, &short, 5);
+        assert_eq!(found, keys(store, PLAIN_CF, &short));
+        let (found, _) = swept(store, PLAIN_CF, &[], 5);
+        assert_eq!(found, keys(store, PLAIN_CF, &[]));
+    }
+
+    // a fixed tree sweeps its shard key and any prefix inside or across shards
+    #[test]
+    fn prefix_sweep_on_a_fixed_tree() {
+        let store = sweep_store();
+        let store = trait_store(&store);
+        for group in [6u16, 7, 8] {
+            for byte in 0..5u8 {
+                store
+                    .put(WIDE_CF, &record(group, byte), &[byte; 16])
+                    .expect("put");
+            }
+        }
+
+        let (found, _) = swept(store, WIDE_CF, &7u16.to_be_bytes(), 2);
+        assert_eq!(
+            found,
+            (0..5u8).map(|byte| record(7, byte)).collect::<Vec<_>>()
+        );
+
+        let mut deeper = 7u16.to_be_bytes().to_vec();
+        deeper.push(3);
+        let (found, _) = swept(store, WIDE_CF, &deeper, 1);
+        assert_eq!(found, vec![record(7, 3)]);
+
+        let (found, _) = swept(store, WIDE_CF, &[0], 4);
+        assert_eq!(found, keys(store, WIDE_CF, &[0]));
+        assert_eq!(found.len(), 15);
+    }
+
+    // an open table sweeps its shard key and answers nothing for any other width
+    #[test]
+    fn prefix_sweep_on_an_open_table() {
+        let store = sweep_store();
+        let store = trait_store(&store);
+        for group in [6u16, 7, 8] {
+            for byte in 0..5u8 {
+                store
+                    .put(OPEN_CF, &record(group, byte), &[byte; 16])
+                    .expect("put");
+            }
+        }
+
+        let (found, _) = swept(store, OPEN_CF, &7u16.to_be_bytes(), 2);
+        assert_eq!(
+            found,
+            (0..5u8).map(|byte| record(7, byte)).collect::<Vec<_>>()
+        );
+
+        let mut deeper = 7u16.to_be_bytes().to_vec();
+        deeper.push(3);
+        for prefix in [&deeper[..], &[0][..], &[][..]] {
+            let (rows, next) = store
+                .sweep_prefix(OPEN_CF, prefix, None, 16)
+                .expect("sweep");
+            assert!(rows.is_empty() && next.is_none(), "{prefix:?} was served");
+        }
     }
 
     // the usage report names every column the reel serves

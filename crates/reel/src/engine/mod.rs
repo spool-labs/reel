@@ -595,11 +595,7 @@ impl ReelStore {
             .map(|mark| mark.pack())
     }
 
-    /// One page of the keys under a shard-aligned prefix, in no promised order
-    ///
-    /// Nothing back where the prefix is not exactly the column's shard key, so a
-    /// caller cannot turn a prefix walk into a scan of the family by asking for
-    /// the wrong width.
+    /// One page of the keys under a prefix, where an open column serves only its exact shard key
     pub fn sweep_column_prefix(
         &self,
         column: ColumnId,

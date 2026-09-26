@@ -352,9 +352,10 @@ from elsewhere restarts rather than resuming into a layout that is not there.
 So the promise is at-least-once, not exactly-once: a shard that resizes mid sweep starts
 over. That is what the callers need, and it is all an unordered shape can give.
 
-`sweep_prefix` narrows it, and only where the prefix is exactly the shard key. Shorter
+`sweep_prefix` narrows it. The tree serves any prefix in key order, since its keys under a
+prefix are one run. The open table serves only a prefix that is exactly the shard key. Shorter
 spans shards, longer splits one, and neither can be served by walking one shard's slots,
-so both are refused rather than served by scanning the family.
+so the open table refuses both and never scans the family.
 
 ## Resident bytes per key, which the tree does not win
 

@@ -14,6 +14,9 @@ pub(super) struct SyncState {
     /// Bytes settled the last time a flush finished, read without taking a lock
     pub(super) synced_at: AtomicU64,
 
+    /// Bytes the last two flushes had between them, which says how this volume writes
+    pub(super) last_span: AtomicU64,
+
     /// Who is at the device, whether the segment is past saving, and who is waiting
     pub(super) flush: Tension<Flush>,
 
@@ -25,6 +28,7 @@ impl SyncState {
     pub(super) fn new() -> SyncState {
         SyncState {
             synced_at: AtomicU64::new(0),
+            last_span: AtomicU64::new(0),
             flush: Tension::new(Flush {
                 is_running: false,
                 is_broken: false,

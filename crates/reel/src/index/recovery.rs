@@ -237,12 +237,13 @@ pub fn rebuild_from_persisted(
                 consumed.insert(*segment, *len);
                 sealed_files.push((*segment, path.clone(), *len));
             }
-            Loaded::Walked(offset, rows) => {
+            Loaded::Walked(offset, is_at_fill, rows) => {
                 consumed.insert(*segment, offset);
                 walked.push((path.clone(), *len));
-                // Resumable means the file ends at its records. A file running
-                // past its walk holds bytes no appender may write behind.
-                if offset == *len {
+                // Resumable means the walk ran out of written bytes. A walk that
+                // stopped on something else has bytes ahead of it that an appender
+                // must not write behind.
+                if is_at_fill {
                     resumable.push(ResumableTail {
                         segment: *segment,
                         path: path.clone(),
@@ -379,8 +380,9 @@ enum Loaded {
     /// A sealed segment, read from its footer, with nothing left to follow
     Sealed,
 
-    /// An unsealed tail, walked to an offset, its rows in walk order
-    Walked(u64, Vec<FooterEntry>),
+    /// An unsealed tail, walked to an offset, whether it may be taken up again, and
+    /// its rows in walk order
+    Walked(u64, bool, Vec<FooterEntry>),
 
     /// A file that is not a segment of this reel
     Foreign,
@@ -610,8 +612,9 @@ fn absorb_segment(
                     )
                 })
                 .collect();
+            let is_at_fill = walked.is_at_fill;
             absorb_walked(resolver, walked.records);
-            Ok(Loaded::Walked(reached, rows))
+            Ok(Loaded::Walked(reached, is_at_fill, rows))
         }
     }
 }
@@ -978,6 +981,9 @@ pub struct Walked {
 
     /// Offset the walk stopped at, which is where the next one resumes
     pub next_offset: u64,
+
+    /// Whether the walk stopped on bytes nothing has written
+    pub is_at_fill: bool,
 }
 
 /// Walk a segment from an offset, vetting every record and framing every batch
@@ -1058,9 +1064,16 @@ pub fn walk_records(
         next_offset = at + span;
     }
 
+    // A segment is written through with zeros when it is made, and the fill reads back
+    // as a data record with no sequence number. So a walk that stops on unwritten bytes
+    // stops at the end of what was written, and one that stops on anything else has
+    // written bytes ahead of it that an appender must not land behind.
+    let is_at_fill = matches!(read_head(reader, next_offset, limit)?, Head::Missing);
+
     Ok(Walked {
         records,
         next_offset,
+        is_at_fill,
     })
 }
 

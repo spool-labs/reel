@@ -133,14 +133,15 @@ still has to be fetched, and for a small value that fetch is the entire cost.
 
 Three answers, all bounded, all per column rather than per volume.
 
-- **Up to four bytes ride in the index entry.** A column declaring `inline_max`
-  spends padding the entry already had, so the ceiling is free up to it and costs
-  eight bytes on every key of every column past it.
+- **Values past four bytes can sit beside the resident entry.** The entry itself
+  is the location and the sequence number and holds no value. A column declaring
+  `inline_max` above four keeps values from five bytes up to that ceiling in a
+  side map next to its entries, which the resident index pays for per key kept.
 - **Up to 256 bytes ride in the sealed footer row.** A column declaring
   `row_carry` puts a value's leading bytes in the row, so a warm point read is
-  answered by the block the search was already going to fetch. Unlike the entry's
-  inline bytes, which every resident key pays for, a row is read a block at a
-  time and only the reader who wanted that block pays for what it carries.
+  answered by the block the search was already going to fetch. Unlike the side
+  map, which the resident index pays for, a row is read a block at a time and
+  only the reader who wanted that block pays for what it holds.
 - **Between the two, `carried_budget` bounds** what the resident index holds
   beside its entries, shed coldest first on the maintenance tick. Unset, nothing
   is shed and everything carried stays resident.

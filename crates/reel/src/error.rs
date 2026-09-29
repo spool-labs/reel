@@ -30,10 +30,6 @@ pub enum ReelError {
     #[error("reel rejected the operation: {0}")]
     Rejected(String),
 
-    /// A ranged read of a payload a codec produced, whose bytes have no offsets
-    #[error("reel cannot serve a range of a coded payload: {0}")]
-    CodedRange(String),
-
     /// Another writer already holds the reel ownership lock
     #[error("reel ownership lock held: {0}")]
     LockHeld(String),
@@ -86,7 +82,6 @@ impl From<ReelError> for StoreError {
             ReelError::Corruption(message) => StoreError::Database(message),
             ReelError::Backend(message) => StoreError::Database(message),
             ReelError::Rejected(message) => StoreError::Database(message),
-            ReelError::CodedRange(message) => StoreError::Database(message),
             ReelError::LockHeld(message) => StoreError::Database(message),
         }
     }

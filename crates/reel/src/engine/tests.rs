@@ -154,6 +154,28 @@ fn stripes(len: usize) -> Vec<u8> {
     (0..len).map(|at| (at % 251) as u8).collect()
 }
 
+/// A payload no codec shrinks, so a column that declares one still stores it raw
+fn noise(len: usize) -> Vec<u8> {
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect()
+}
+
+/// Bytes a column's live records take on the volume
+fn stored_bytes(store: &ReelStore, column: ColumnId) -> u64 {
+    store
+        .column_totals(column)
+        .expect("totals")
+        .bytes
+        .to_bytes()
+}
+
 fn coded_store(config: ReelConfig) -> (ReelStore, SimIo) {
     let sim = SimIo::new(FaultPlan::new(1));
     let store = ReelStore::open_with_io(
@@ -2644,12 +2666,61 @@ fn a_carried_range() {
     assert_eq!(sim.read_count(), before, "the tier answered it");
 }
 
+// a record a coded column stored raw reads its window off the volume
+#[test]
+fn a_raw_record_in_a_coded_column_ranges() {
+    let (store, _sim) = coded_store(config(1, SyncPolicy::Never));
+    let payload = noise(64 * 1024);
+    store.put(&coded(2), &payload).expect("put");
+
+    // The guard the case rests on: a record the codec kept would be served by the
+    // whole read and say nothing about the ranged path.
+    assert_eq!(
+        stored_bytes(&store, CODED),
+        payload.len() as u64,
+        "the codec kept the record"
+    );
+
+    let windows = [(0u64, 16usize), (1_000, 512), (60_000, 8_192), (65_536, 8)];
+    let awaited = reaping(&store, || {
+        windows
+            .iter()
+            .map(|(at, len)| {
+                block_on(store.get_range_wait(&coded(2), *at, *len))
+                    .expect("awaited range")
+                    .map(|value| value.into_vec())
+            })
+            .collect::<Vec<_>>()
+    });
+
+    for ((at, len), awaited) in windows.iter().zip(awaited) {
+        let start = (*at as usize).min(payload.len());
+        let end = start.saturating_add(*len).min(payload.len());
+        let window = payload[start..end].to_vec();
+        let blocked = store.get_range(&coded(2), *at, *len).expect("range");
+
+        assert_eq!(
+            blocked.map(|value| value.into_vec()),
+            Some(window.clone()),
+            "at {at}"
+        );
+        assert_eq!(awaited, Some(window), "awaited at {at}");
+    }
+}
+
 // a column holding what a codec produced answers a window of the decoded payload
 #[test]
 fn a_coded_column_answers_a_window() {
     let (store, _sim) = coded_store(config(1, SyncPolicy::Never));
     let payload = stripes(4096);
     store.put(&coded(1), &payload).expect("put");
+
+    // The same guard the other way: this record has to have shrunk, or the window
+    // never reaches the decode.
+    assert!(
+        stored_bytes(&store, CODED) < payload.len() as u64,
+        "the codec kept nothing"
+    );
 
     for (at, len) in [(0u64, 16usize), (1_000, 512), (4_090, 64), (4_096, 8)] {
         let window = payload[at as usize..(at as usize + len).min(payload.len())].to_vec();

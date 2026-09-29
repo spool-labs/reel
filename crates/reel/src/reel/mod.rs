@@ -48,7 +48,6 @@ use crate::sync::{lock, read, write};
 
 use reel_core::Value;
 
-pub use read::coded_range;
 use read::{
     check_in_block, deep_range, frame_to_range, frame_to_read, framed_or_nothing, merge_runs_into,
     merge_span, near_range, window_or_nothing, window_start, Planned, Run, MERGE_GAP,
@@ -884,6 +883,9 @@ pub enum RecordRead {
 
     /// The record is where the pointer said, but its bytes failed the checksum
     Corrupt,
+
+    /// A codec produced the record's stored bytes, so no window of it is on disk
+    Coded,
 }
 
 /// One record a resolved batch asks the device for

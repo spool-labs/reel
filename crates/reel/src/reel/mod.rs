@@ -896,6 +896,9 @@ struct ReadScratch {
     /// Every ask resolved to a place on the volume
     plan: Vec<Planned>,
 
+    /// One handle per segment the plan reads, so none is unlinked under a read in flight
+    handles: Vec<SegmentHandle>,
+
     /// The reads the plan was grouped into
     runs: Vec<Run>,
 
@@ -923,6 +926,7 @@ impl ReadScratch {
         ReadScratch {
             order: Vec::new(),
             plan: Vec::new(),
+            handles: Vec::new(),
             runs: Vec::new(),
             ops: Vec::new(),
             completions: Vec::new(),
@@ -937,6 +941,7 @@ impl ReadScratch {
     fn release(&mut self) {
         self.order.clear();
         self.plan.clear();
+        self.handles.clear();
         self.runs.clear();
         self.ops.clear();
         self.completions.clear();
@@ -1589,23 +1594,30 @@ impl Reel {
             .sort_unstable_by_key(|&at| (asks[at].loc.segment, asks[at].loc.offset));
 
         scratch.plan.clear();
+        scratch.handles.clear();
         scratch.plan.reserve(asks.len());
         for slot in 0..scratch.order.len() {
             let at = scratch.order[slot];
             let ask = &asks[at];
-            let handle = match self.handle_for(ask.loc.segment)? {
-                Some(handle) => handle,
-                None => {
-                    answers[at] = RecordRead::Gone;
-                    continue;
-                }
+            // Sorted by segment, so a segment's handle is taken once, at its first record.
+            let file = match scratch.plan.last() {
+                Some(last) if last.segment == ask.loc.segment => last.file,
+                _ => match self.handle_for(ask.loc.segment)? {
+                    Some(handle) => {
+                        let file = handle.file();
+                        scratch.handles.push(handle);
+                        file
+                    }
+                    None => {
+                        answers[at] = RecordRead::Gone;
+                        continue;
+                    }
+                },
             };
             scratch.plan.push(Planned {
                 at,
                 segment: ask.loc.segment,
-                // Kept until the batch has been collected, so a segment cannot be
-                // unlinked out from under a read in flight.
-                handle,
+                file,
                 offset: u64::from(ask.loc.offset),
                 prefix: HEADER_LEN + keys[ask.at as usize].width(),
                 len: ask.loc.len as usize,
@@ -1622,20 +1634,18 @@ impl Reel {
             let run = scratch.runs[at];
             let held = &scratch.plan[run.start];
             let op = match run.is_single() {
-                true => self.shared.driver.split_read(
-                    held.handle.file(),
-                    held.offset,
-                    held.prefix,
-                    held.len,
-                ),
+                true => {
+                    self.shared
+                        .driver
+                        .split_read(held.file, held.offset, held.prefix, held.len)
+                }
                 // A merged read has no header of its own: every record's header sits
                 // inside the block, so the whole span is the body.
-                false => self.shared.driver.split_read(
-                    held.handle.file(),
-                    held.offset,
-                    0,
-                    run.span as usize,
-                ),
+                false => {
+                    self.shared
+                        .driver
+                        .split_read(held.file, held.offset, 0, run.span as usize)
+                }
             };
             scratch.ops.push(op);
         }

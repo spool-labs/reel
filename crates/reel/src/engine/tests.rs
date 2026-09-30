@@ -1809,6 +1809,36 @@ fn a_hot_budget_keeps_recent_keys_above_the_floor() {
     assert_eq!(store.totals().count, u64::from(KEYS));
 }
 
+// a hot two-byte column touching thousands of shards holds its filters inside the budget
+#[test]
+fn a_hot_budget_counts_the_filters_of_many_shards() {
+    const BUDGET: u64 = 16 << 20;
+    let hot = ReelConfig {
+        index: IndexResidency::Hot(HotIndex {
+            after_secs: 3600,
+            budget: ByteCount::from_bytes(BUDGET),
+        }),
+        ..config(1, SyncPolicy::Never)
+    };
+    let (store, _sim) = sim_store(hot);
+    let floor = store.index.floor_bytes().to_bytes();
+
+    let payload = [0x5au8; 16];
+    for at in 0..8_000u32 {
+        store.put(&spread(at), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
+
+    let held = store.resident_bytes().to_bytes().saturating_sub(floor);
+    assert!(
+        held <= BUDGET,
+        "a {BUDGET} byte budget over a {floor} byte floor holds {held} bytes, filters {}",
+        store.index.column(RECORD).expect("column").filter_bytes()
+    );
+    assert_eq!(store.totals().count, 8_000);
+}
+
 /// A record key spread across the two-byte shards, one per number
 fn spread(at: u32) -> RecordKey {
     let mut bytes = ((at.wrapping_mul(0x9e37_79b1) >> 16) as u16)

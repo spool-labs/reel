@@ -761,29 +761,28 @@ impl<K: IndexKey> Covered<K> {
     }
 }
 
-/// Words one shard's filter takes on a resident or hot column, sixteen kibibytes
+/// Words one shard's filter takes at most, sixteen kibibytes
 const FILTER_WORDS: usize = 2048;
 
-/// Words a paged column's filters take between all of its shards, a mebibyte
+/// Words a paged or hot column's filters take between all of its shards, a mebibyte
 ///
-/// A paged column of few shards gives each the full filter. A two-byte paged column
-/// cuts it to two words a shard, which its shards can afford since each one clears
-/// when it pages out empty.
+/// A column of few shards gives each the full filter. A two-byte column cuts it to
+/// two words a shard, allocated at open so a hot budget's floor holds all of them.
 const COLUMN_FILTER_WORDS: usize = 1 << 17;
 
 /// Filters in front of every shard's lock, answering only definite absence
 ///
-/// A resident or hot column gives each shard the full filter, allocated on the
-/// shard's first key, since its shards keep their keys and a small filter would
-/// fill. A paged column cuts one run of words evenly between its shards. A key's
+/// A resident column gives each shard the full filter, allocated on the shard's
+/// first key, since its shards keep their keys and a small filter would fill. A
+/// paged or hot column cuts one mebibyte evenly between its shards at open. A key's
 /// bits are set before the map takes it and a shard's bits are cleared when its map
 /// empties, both under the shard's write lock, so a reader that sees a bit clear is
 /// reading a state the lock it skipped would also have allowed.
 struct ShardFilters {
-    /// A paged column's words, every shard's run of them in shard order
+    /// A paged or hot column's words, every shard's run of them in shard order
     shared: Box<[AtomicU64]>,
 
-    /// A resident or hot column's filters, one per shard, each built on first use
+    /// A resident column's filters, one per shard, each built on first use
     own: Box<[OnceLock<Box<[AtomicU64]>>]>,
 
     /// Filters `own` has built so far
@@ -796,7 +795,7 @@ struct ShardFilters {
 impl ShardFilters {
     fn new(shards: usize, residency: IndexResidency) -> ShardFilters {
         let shards = shards.max(1);
-        if residency != IndexResidency::Paged {
+        if residency == IndexResidency::Resident {
             return ShardFilters {
                 shared: Box::new([]),
                 own: (0..shards).map(|_| OnceLock::new()).collect(),

@@ -214,9 +214,6 @@ pub struct ReelIndex {
 
     /// Bytes the empty index held at open, which no handover can give back
     floor: u64,
-
-    /// Bytes the empty index held at open outside its filters
-    map_floor: u64,
 }
 
 impl ReelIndex {
@@ -289,7 +286,6 @@ impl ReelIndex {
         }
         let sealed_keys = (0..columns.len()).map(|_| SealedKeys::new()).collect();
         let floor: u64 = indexes.iter().map(ColumnIndex::heap_bytes).sum();
-        let map_floor = floor - indexes.iter().map(ColumnIndex::filter_bytes).sum::<u64>();
         if let IndexResidency::Hot(hot) = residency {
             // The shards and their filters cost this before a key arrives, and a
             // budget under it would hand over every sealed key it was meant to hold.
@@ -312,7 +308,6 @@ impl ReelIndex {
             unclaimed: std::sync::atomic::AtomicU64::new(0),
             publish: PublishBarrier::new(),
             floor,
-            map_floor,
         })
     }
 
@@ -1305,16 +1300,10 @@ impl ReelIndex {
 
     /// Memory the keys hold above what the empty index held at open
     ///
-    /// A hot budget is weighed against this, so it prices the keys alone. The filters
-    /// stay out of it: a shard builds its filter on its first key and keeps it once
-    /// its keys are handed over, so no handover gives those bytes back.
+    /// A hot budget is weighed against this, so it prices the keys alone. A hot
+    /// column's filters are all allocated at open, so the floor holds them.
     pub fn key_bytes(&self) -> ByteCount {
-        let maps: u64 = self
-            .indexes
-            .iter()
-            .map(|index| index.heap_bytes() - index.filter_bytes())
-            .sum();
-        ByteCount::from_bytes(maps.saturating_sub(self.map_floor))
+        ByteCount::from_bytes(self.resident_bytes().to_bytes().saturating_sub(self.floor))
     }
 
     /// Bytes the empty index held at open

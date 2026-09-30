@@ -30,7 +30,7 @@
 //! Knobs, all optional: `REEL_OVERDUB_DIR`, `REEL_OVERDUB_ROUNDS`, `REEL_OVERDUB_SCALE`,
 //! `REEL_OVERDUB_HOT`, `REEL_OVERDUB_MID`, `REEL_OVERDUB_FRESH`, `REEL_OVERDUB_READS`,
 //! `REEL_OVERDUB_BATCH`, `REEL_OVERDUB_VALUE`, `REEL_OVERDUB_SEGMENT`,
-//! `REEL_OVERDUB_PASSES`, `REEL_OVERDUB_CARRIED`, `REEL_OVERDUB_FOOTER_CACHE`,
+//! `REEL_OVERDUB_PASSES`, `REEL_OVERDUB_FOOTER_CACHE`,
 //! `REEL_OVERDUB_COMPACT_MBPS`, `REEL_OVERDUB_DEAD_RATIO`, `REEL_OVERDUB_MERGE_RATIO`,
 //! `REEL_OVERDUB_READERS`, `REEL_OVERDUB_TAILS`.
 //!
@@ -49,7 +49,6 @@ use std::time::Instant;
 
 use tempfile::TempDir;
 
-use reel::format::column::ROW_CARRY_MAX;
 use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, FenceResidency,
     IndexResidency, KeyWidth, MapShape, MergeReport, Preallocate, ProbeCounts, RecordKey,
@@ -122,9 +121,6 @@ const COMPACT_PASSES: u64 = 8;
 /// speed and the merge column is the only thing that differs between them. A box run
 /// should set this to what its device actually gives back.
 const COMPACT_MBPS: u64 = 100_000;
-
-/// Byte budget for the values the index carries, zero for the shipped unshed tier
-const CARRIED_BYTES: u64 = 0;
 
 /// Bytes of sealed-footer state a paged volume keeps at once
 ///
@@ -217,9 +213,6 @@ struct Knobs {
     /// Rewrite passes one tick drives
     passes: u64,
 
-    /// Byte budget for the carried values
-    carried_bytes: u64,
-
     /// Bytes of sealed-footer state a paged volume keeps at once
     footer_cache_bytes: u64,
 
@@ -301,7 +294,6 @@ fn knobs() -> Knobs {
         value_mean: env_num("REEL_OVERDUB_VALUE", VALUE_MEAN).max(2),
         segment_bytes: env_bytes("REEL_OVERDUB_SEGMENT", SEGMENT_BYTES),
         passes: env_num("REEL_OVERDUB_PASSES", COMPACT_PASSES),
-        carried_bytes: env_bytes("REEL_OVERDUB_CARRIED", CARRIED_BYTES),
         footer_cache_bytes: env_bytes("REEL_OVERDUB_FOOTER_CACHE", FOOTER_CACHE_BYTES),
         compact_mbps: env_num("REEL_OVERDUB_COMPACT_MBPS", COMPACT_MBPS).max(1),
         compact_dead_ratio: env_share("REEL_OVERDUB_DEAD_RATIO", COMPACT_DEAD_RATIO),
@@ -332,14 +324,6 @@ fn key_at(number: u64) -> RecordKey {
 /// Bytes this key's value occupies, spread either side of the mean
 fn value_len(number: u64, mean: u64) -> usize {
     (mean / 2 + mix(number, VALUE_SALT) % mean) as usize
-}
-
-/// Bytes a sealed row reserves for the value itself
-///
-/// The widest the spread produces, or the widest a row will hold, whichever is smaller:
-/// past the ceiling the top of the spread rides as a record and the rest still carries.
-fn carry_width(mean: u64) -> u16 {
-    (mean / 2 + mean - 1).min(ROW_CARRY_MAX as u64) as u16
 }
 
 /// The gap at one point of the measured distribution, in rounds
@@ -532,23 +516,16 @@ const ARMS: [Arm; 2] = [
     },
 ];
 
-/// The column both flavours declare, its sealed rows sized to hold the values themselves
-///
-/// Leaked once a cell, since a column set is static and the carry width comes from a knob.
-fn columns(row_carry: u16) -> ColumnSet {
-    let specs: Box<[ColumnSpec]> = Box::new([ColumnSpec {
-        id: STATE,
-        name: "state",
-        key_width: KeyWidth::Fixed(KEY_WIDTH as u16),
-        shard_bytes: SHARD_BYTES,
-        inline_max: 0,
-        row_carry,
-        purge_mark: None,
-        codec: Codec::None,
-        map_shape: MapShape::Open,
-    }]);
-    Box::leak(specs)
-}
+/// The column both flavours declare
+const COLUMNS: ColumnSet = &[ColumnSpec {
+    id: STATE,
+    name: "state",
+    key_width: KeyWidth::Fixed(KEY_WIDTH as u16),
+    shard_bytes: SHARD_BYTES,
+    purge_mark: None,
+    codec: Codec::None,
+    map_shape: MapShape::Open,
+}];
 
 /// What one cell opens its volume with, the flavour and the merge being all that differ
 fn config(arm: &Arm, is_merge_driven: bool, knobs: &Knobs) -> ReelConfig {
@@ -566,7 +543,6 @@ fn config(arm: &Arm, is_merge_driven: bool, knobs: &Knobs) -> ReelConfig {
         rewrite_on_seal: true,
         merge_sorted_runs: is_merge_driven,
         filter_bits: FILTER_BITS,
-        carried_budget: ByteCount::from_bytes(knobs.carried_bytes),
         footer_cache: ByteCount::from_bytes(knobs.footer_cache_bytes),
         compact_mbps: CompactRate::Mbps(knobs.compact_mbps),
         compact_dead_ratio: knobs.compact_dead_ratio,
@@ -587,7 +563,6 @@ fn tick(store: &ReelStore, knobs: &Knobs) -> MergeReport {
             CompactPass::Idle | CompactPass::Held => break,
         }
     }
-    store.shed_carried();
     store.merge_when_due().expect("merge").unwrap_or_default()
 }
 
@@ -788,7 +763,7 @@ fn run_cell(arm: &Arm, is_merge_driven: bool, knobs: &Knobs, root: &Path) -> Cel
     let store = ReelStore::open(
         root.to_path_buf(),
         config(arm, is_merge_driven, knobs),
-        columns(carry_width(knobs.value_mean)),
+        COLUMNS,
     )
     .expect("open");
 

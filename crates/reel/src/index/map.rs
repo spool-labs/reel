@@ -15,8 +15,7 @@ use crate::config::{IndexResidency, ShardShapes};
 use crate::engine::Totals;
 use crate::error::{ReelError, Result};
 use crate::format::column::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyRef, MapShape, RecordKey, INLINE_MAX,
-    ROW_CARRY_MAX,
+    Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, MapShape, RecordKey,
 };
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::{Loc, SegmentId};
@@ -142,17 +141,11 @@ pub struct KeyRepoint {
 /// exists to not have.
 const RELEASE_RUN: usize = 1024;
 
-/// Carried entries one shed pass may visit, the sweep's effort cap
-const SHED_VISITS: usize = 4096;
-
 /// The ceiling of a sealed segment nothing recorded one for, which rules nothing out
 ///
 /// Above every sequence number a reel can issue, so a segment wearing it sorts to the
 /// front of a fan-out and no hit can stop the walk short of it.
 const NO_CEILING: Lsn = Lsn(u64::MAX);
-
-/// Rotates the shard a shed pass starts at, so passes spread over a column
-static SHED_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// One range delete's cover as a batch hands it to the index
 ///
@@ -237,46 +230,12 @@ impl ReelIndex {
                     spec.name,
                 )));
             }
-            if spec.inline_max as usize > INLINE_MAX {
-                // A ceiling past INLINE_MAX turns on the side map of kept values,
-                // which lives beside the resident entries and nowhere else, and a
-                // codec would make it disagree with the stored bytes.
-                if residency != IndexResidency::Resident {
-                    return Err(ReelError::Config(format!(
-                        "column {} carries values resident, which a paged index cannot hold",
-                        spec.name,
-                    )));
-                }
-                if spec.codec != Codec::None {
-                    return Err(ReelError::Config(format!(
-                        "column {} cannot both carry values resident and compress them",
-                        spec.name,
-                    )));
-                }
-            }
             if spec.map_shape == MapShape::Open
                 && shapes == ShardShapes::Declared
                 && residency != IndexResidency::Resident
             {
                 return Err(ReelError::Config(format!(
                     "column {} asks for an open shard, which a paged walk cannot merge",
-                    spec.name,
-                )));
-            }
-            if spec.row_carry as usize > ROW_CARRY_MAX {
-                // A row's carry is paid in the stride every block search walks and in
-                // the footer bytes of every sealed segment, so the ceiling is refused
-                // at open rather than discovered as a wide block later.
-                return Err(ReelError::Config(format!(
-                    "column {} asks its rows to carry {} bytes, past the {} a row holds",
-                    spec.name, spec.row_carry, ROW_CARRY_MAX,
-                )));
-            }
-            if spec.row_carry > 0 && spec.codec != Codec::None {
-                // What lands in a row is the payload the reader wanted, and a codec
-                // stores something else.
-                return Err(ReelError::Config(format!(
-                    "column {} cannot both carry values in its rows and compress them",
                     spec.name,
                 )));
             }
@@ -332,18 +291,6 @@ impl ReelIndex {
     /// range delete are all applied here, because a footer cannot know about any of
     /// them.
     pub fn get(&self, key: &RecordKey) -> Result<Option<Entry>> {
-        self.get_carried(key, None)
-    }
-
-    /// The same answer, with the value a sealed row carries copied into a buffer
-    ///
-    /// Filled only where a key resolved through a footer whose row carries its value,
-    /// which is what turns a paged read from two ios into one.
-    pub fn get_carried(
-        &self,
-        key: &RecordKey,
-        carry: Option<&mut Vec<u8>>,
-    ) -> Result<Option<Entry>> {
         let Some(at) = self.slot(key.column) else {
             return Ok(None);
         };
@@ -360,20 +307,15 @@ impl ReelIndex {
         if !self.residency.pages() {
             return Ok(None);
         }
-        self.sealed_entry(at, key, carry)
+        self.sealed_entry(at, key)
     }
 
     /// The newest thing every sealed footer says about a key
     ///
     /// The fan-out below finds it; what is left here is the two things a footer
     /// cannot know about itself, a tombstone row and a range delete.
-    fn sealed_entry(
-        &self,
-        at: usize,
-        key: &RecordKey,
-        carry: Option<&mut Vec<u8>>,
-    ) -> Result<Option<Entry>> {
-        match self.newest_sealed(at, key, None, carry)? {
+    fn sealed_entry(&self, at: usize, key: &RecordKey) -> Result<Option<Entry>> {
+        match self.newest_sealed(at, key, None)? {
             Some(entry) if entry.is_grave() => Ok(None),
             Some(entry) if self.indexes[at].is_covered_key(key.as_slice(), entry.lsn) => Ok(None),
             found => Ok(found),
@@ -419,7 +361,6 @@ impl ReelIndex {
         at: usize,
         key: &RecordKey,
         snapshot: Option<Lsn>,
-        carry: Option<&mut Vec<u8>>,
     ) -> Result<Option<Entry>> {
         let Some(footers) = self.footers.get() else {
             return Ok(None);
@@ -438,11 +379,6 @@ impl ReelIndex {
         };
 
         let mut newest: Option<(Entry, SegmentId)> = None;
-        // Every candidate fills the scratch and only the winner keeps what it filled,
-        // so the accepted row's bytes are taken out of the scratch where it is
-        // accepted rather than read back after the loop.
-        let mut scratch = Vec::new();
-        let mut held: Option<Vec<u8>> = None;
         for (visited, unordered) in candidates.iter().enumerate() {
             let segment = match ordered.is_empty() {
                 true => unordered,
@@ -456,8 +392,7 @@ impl ReelIndex {
                 }
             }
 
-            let asking = carry.is_some().then_some(&mut scratch);
-            let Some(found) = footers.find(segment, key.column, key.as_slice(), asking)? else {
+            let Some(found) = footers.find(segment, key.column, key.as_slice())? else {
                 continue;
             };
             if snapshot.is_some_and(|snapshot| found.lsn > snapshot) {
@@ -469,10 +404,6 @@ impl ReelIndex {
             if newest.is_some_and(|(best, from)| (best.lsn, from) >= (found.lsn, segment)) {
                 continue;
             }
-            held = match carry.is_some() && found.carries() {
-                true => Some(std::mem::take(&mut scratch)),
-                false => None,
-            };
             let entry = match found.is_tombstone() || found.is_range_tombstone() {
                 true => Entry::grave(found.lsn),
                 false => {
@@ -486,10 +417,6 @@ impl ReelIndex {
             newest = Some((entry, segment));
         }
 
-        if let (Some(into), Some(bytes)) = (carry, held) {
-            into.clear();
-            into.extend_from_slice(&bytes);
-        }
         Ok(newest.map(|(entry, _)| entry))
     }
 
@@ -527,7 +454,7 @@ impl ReelIndex {
                     .iter()
                     .filter(|part| part.column == key.column)
                 {
-                    let Some(row) = partition.find_row(key.as_slice(), None).transpose()? else {
+                    let Some(row) = partition.find_row(key.as_slice()).transpose()? else {
                         continue;
                     };
                     sealed.push(SealedSite {
@@ -563,7 +490,7 @@ impl ReelIndex {
         }
         // The write path takes the read path's own fan-out, so an overwrite probe
         // stops on the same terms a get does.
-        Ok(match self.newest_sealed(at, key, None, None)? {
+        Ok(match self.newest_sealed(at, key, None)? {
             None => Sealed::Absent,
             Some(entry) if entry.is_grave() => Sealed::Gone,
             Some(entry) if self.indexes[at].is_covered_key(key.as_slice(), entry.lsn) => {
@@ -606,7 +533,7 @@ impl ReelIndex {
     /// Rows above the snapshot record writes that had not happened yet and are
     /// ignored outright; the same tombstone and cover rules apply to what is left.
     fn sealed_entry_at(&self, at: usize, key: &RecordKey, snapshot: Lsn) -> Result<Option<Entry>> {
-        match self.newest_sealed(at, key, Some(snapshot), None)? {
+        match self.newest_sealed(at, key, Some(snapshot))? {
             Some(entry) if entry.is_grave() => Ok(None),
             Some(entry)
                 if self.indexes[at].is_covered_key_at(key.as_slice(), entry.lsn, snapshot) =>
@@ -662,21 +589,6 @@ impl ReelIndex {
         }
     }
 
-    /// Take a listed row's key into the count, when its source never had it counted
-    ///
-    /// Nothing points at a listed row, so no repoint runs for it. A source sealed at
-    /// runtime already has this key in its paged count and keeps it; a born source
-    /// never counted it, so this is where it joins.
-    pub fn note_listed(&self, key: &RecordKey, from: SegmentId, len: u32) -> bool {
-        let Some(at) = self.slot(key.column) else {
-            return false;
-        };
-        if self.counted(from) {
-            return false;
-        }
-        self.indexes[at].count_listed(key.as_slice(), u64::from(len))
-    }
-
     /// Record the keys one newly sealed segment covers for one column
     pub fn note_sealed(
         &self,
@@ -693,8 +605,8 @@ impl ReelIndex {
     /// Note every column's span in one sealed segment, from the footer it sealed with
     ///
     /// Worth doing on every volume, since it names the segments a search must consider
-    /// and rules out the rest. Here rather than in the engine because compaction needs
-    /// it too: a pass that lists rows notes its destination before retiring the source.
+    /// and rules out the rest. Here rather than in the engine because a merge notes
+    /// its output too.
     pub fn note_spans(&self, segment: SegmentId, footer: &SegmentFooter) -> Result<()> {
         // The ceiling goes down before any span does: a search the span admits must
         // never meet a segment the fan-out believes can hold nothing.
@@ -749,14 +661,8 @@ impl ReelIndex {
     /// A put that lands on an empty place may be an overwrite the map cannot see,
     /// since a paged column gives its keys up. So the map goes first and only a put
     /// that found nothing asks the footers.
-    pub fn insert(
-        &self,
-        key: &RecordKey,
-        loc: Loc,
-        lsn: Lsn,
-        carried: Option<Arc<[u8]>>,
-    ) -> Result<bool> {
-        let landed = self.insert_mapped(key, loc, lsn, carried);
+    pub fn insert(&self, key: &RecordKey, loc: Loc, lsn: Lsn) -> Result<bool> {
+        let landed = self.insert_mapped(key, loc, lsn);
         if landed.may_be_paged() {
             self.settle_displaced(key)?;
         }
@@ -768,22 +674,11 @@ impl ReelIndex {
     /// This half is memory work under a shard lock, which is what a batch does while
     /// it holds the publish barrier. The other reads a footer, and a reader waiting on
     /// the barrier should not be waiting on the volume.
-    pub fn insert_mapped(
-        &self,
-        key: &RecordKey,
-        loc: Loc,
-        lsn: Lsn,
-        carried: Option<Arc<[u8]>>,
-    ) -> Landed {
+    pub fn insert_mapped(&self, key: &RecordKey, loc: Loc, lsn: Lsn) -> Landed {
         let Some(at) = self.slot(key.column) else {
             return Landed::Newer;
         };
-        self.indexes[at].insert(
-            key.as_slice(),
-            Entry::new(loc, lsn),
-            &self.segments,
-            carried,
-        )
+        self.indexes[at].insert(key.as_slice(), Entry::new(loc, lsn), &self.segments)
     }
 
     /// Book the footer-held record a mapped mutation displaced, if there was one
@@ -818,74 +713,14 @@ impl ReelIndex {
     /// What a footer holds for a key the map does not, if the column pages at all
     fn paged_entry(&self, at: usize, key: &RecordKey) -> Result<Option<Entry>> {
         match self.residency.pages() {
-            true => self.sealed_entry(at, key, None),
+            true => self.sealed_entry(at, key),
             false => Ok(None),
         }
-    }
-
-    /// Bytes this column asks the index to carry of a value itself
-    pub fn inline_max(&self, column: ColumnId) -> u16 {
-        self.spec(column).map_or(0, |spec| spec.inline_max)
     }
 
     /// Codec this column asks admission to attempt on its payloads
     pub fn codec_of(&self, column: ColumnId) -> Codec {
         self.spec(column).map_or(Codec::None, |spec| spec.codec)
-    }
-
-    /// Ceiling up to which this column carries values beside its entries
-    pub fn carry_max(&self, column: ColumnId) -> u16 {
-        self.slot(column)
-            .map_or(0, |at| self.indexes[at].carry_max())
-    }
-
-    /// The payload a write asks the index to keep, when the column keeps values at all
-    ///
-    /// Only values longer than INLINE_MAX and no longer than the ceiling are taken,
-    /// and every other value reads from the volume.
-    pub fn carry_capture(&self, column: ColumnId, payload: &[u8]) -> Option<Arc<[u8]>> {
-        let ceiling = self.carry_max(column) as usize;
-        (payload.len() > INLINE_MAX && payload.len() <= ceiling).then(|| payload.into())
-    }
-
-    /// The carried value for a key, exactly as new as the entry the caller holds
-    pub fn carried_value(&self, key: &RecordKey, lsn: Lsn) -> Option<Arc<[u8]>> {
-        self.slot(key.column)
-            .and_then(|at| self.indexes[at].carried_value(key.as_slice(), lsn))
-    }
-
-    /// Remember a value a read just paid the device for
-    pub fn warm_carried(&self, key: KeyRef<'_>, lsn: Lsn, bytes: &[u8], two_touch: bool) {
-        if let Some(at) = self.slot(key.column) {
-            self.indexes[at].warm_carried(key.as_slice(), lsn, bytes, two_touch);
-        }
-    }
-
-    /// Bytes of carried values resident across every column
-    pub fn carried_total(&self) -> u64 {
-        self.indexes.iter().map(ColumnIndex::carried_bytes).sum()
-    }
-
-    /// Shed carried values down to a byte budget, coldest first
-    ///
-    /// One bounded pass over the columns that carry, rotating its starting shard so
-    /// repeated passes spread over a column rather than draining the front of it.
-    pub fn shed_carried(&self, budget: u64) -> u64 {
-        let total = self.carried_total();
-        let Some(mut want) = total.checked_sub(budget).filter(|over| *over > 0) else {
-            return 0;
-        };
-        let start = SHED_CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut freed = 0u64;
-        for index in &self.indexes {
-            if want == 0 {
-                break;
-            }
-            let shed = index.shed_carried(want, start, SHED_VISITS);
-            freed += shed;
-            want = want.saturating_sub(shed);
-        }
-        freed
     }
 
     /// Drop a key on a tombstone, guarded by its sequence number
@@ -1245,7 +1080,7 @@ impl ReelIndex {
             }
             return Ok(index.evict_at(key.as_slice(), at, &self.segments));
         }
-        match self.sealed_entry(column_at, key, None)? {
+        match self.sealed_entry(column_at, key)? {
             Some(entry) if entry.loc == at => Ok(index.evict_paged(
                 key.as_slice(),
                 at,
@@ -1647,8 +1482,6 @@ mod tests {
             name: "record",
             key_width: KeyWidth::Fixed(34),
             shard_bytes: 2,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
             map_shape: MapShape::Tree,
@@ -1658,8 +1491,6 @@ mod tests {
             name: "blob_data",
             key_width: KeyWidth::Fixed(32),
             shard_bytes: 0,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
             map_shape: MapShape::Tree,
@@ -1669,8 +1500,6 @@ mod tests {
             name: "short",
             key_width: KeyWidth::Fixed(16),
             shard_bytes: 1,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
             map_shape: MapShape::Tree,
@@ -1687,8 +1516,6 @@ mod tests {
             name: spec.name,
             key_width: spec.key_width,
             shard_bytes: spec.shard_bytes,
-            inline_max: spec.inline_max,
-            row_carry: spec.row_carry,
             purge_mark: spec.purge_mark,
             codec: spec.codec,
             map_shape: MapShape::Open,
@@ -1760,10 +1587,10 @@ mod tests {
         let blob = blob_key(0x11);
 
         index
-            .insert(&record, loc(1, 0, 400), Lsn(1), None)
+            .insert(&record, loc(1, 0, 400), Lsn(1))
             .expect("insert");
         index
-            .insert(&blob, loc(1, 500, 900), Lsn(2), None)
+            .insert(&blob, loc(1, 500, 900), Lsn(2))
             .expect("insert");
 
         assert_eq!(
@@ -1784,7 +1611,7 @@ mod tests {
         let stray = RecordKey::from_bytes(ColumnId(9), &[0u8; 32]).expect("key");
 
         assert!(!index
-            .insert(&stray, loc(1, 0, 400), Lsn(1), None)
+            .insert(&stray, loc(1, 0, 400), Lsn(1))
             .expect("insert"));
         assert!(index.get(&stray).expect("read").is_none());
         assert!(index.column(ColumnId(9)).is_none());
@@ -1800,8 +1627,6 @@ mod tests {
                 name: "one",
                 key_width: KeyWidth::Fixed(32),
                 shard_bytes: 0,
-                inline_max: 0,
-                row_carry: 0,
                 purge_mark: None,
                 codec: Codec::None,
                 map_shape: MapShape::Tree,
@@ -1811,8 +1636,6 @@ mod tests {
                 name: "two",
                 key_width: KeyWidth::Fixed(32),
                 shard_bytes: 0,
-                inline_max: 0,
-                row_carry: 0,
                 purge_mark: None,
                 codec: Codec::None,
                 map_shape: MapShape::Tree,
@@ -1827,10 +1650,10 @@ mod tests {
     fn columns_share_segments() {
         let index = index();
         index
-            .insert(&record_key(1, 0x11), loc(1, 0, 400), Lsn(1), None)
+            .insert(&record_key(1, 0x11), loc(1, 0, 400), Lsn(1))
             .expect("insert");
         index
-            .insert(&blob_key(0x22), loc(1, 500, 900), Lsn(2), None)
+            .insert(&blob_key(0x22), loc(1, 500, 900), Lsn(2))
             .expect("insert");
 
         let bytes = index.segment_bytes(SegmentId(1));
@@ -1845,10 +1668,10 @@ mod tests {
     fn range_delete_stays_in_its_column() {
         let index = index();
         index
-            .insert(&record_key(42, 0x01), loc(1, 0, 100), Lsn(1), None)
+            .insert(&record_key(42, 0x01), loc(1, 0, 100), Lsn(1))
             .expect("insert");
         index
-            .insert(&blob_key(0x00), loc(1, 200, 100), Lsn(2), None)
+            .insert(&blob_key(0x00), loc(1, 200, 100), Lsn(2))
             .expect("insert");
 
         let start = RecordKey::from_bytes(RECORD, &[0u8; 34]).expect("key");
@@ -1866,13 +1689,13 @@ mod tests {
     fn pages_one_column() {
         let index = index();
         index
-            .insert(&record_key(1, 0x01), loc(1, 0, 100), Lsn(1), None)
+            .insert(&record_key(1, 0x01), loc(1, 0, 100), Lsn(1))
             .expect("insert");
         index
-            .insert(&record_key(2, 0x02), loc(1, 0, 100), Lsn(2), None)
+            .insert(&record_key(2, 0x02), loc(1, 0, 100), Lsn(2))
             .expect("insert");
         index
-            .insert(&blob_key(0x03), loc(1, 0, 100), Lsn(3), None)
+            .insert(&blob_key(0x03), loc(1, 0, 100), Lsn(3))
             .expect("insert");
 
         let mut out = KeyPage::default();
@@ -1892,7 +1715,7 @@ mod tests {
     fn install_replaces() {
         let index = index();
         index
-            .insert(&record_key(5, 0x05), loc(9, 0, 50), Lsn(1), None)
+            .insert(&record_key(5, 0x05), loc(9, 0, 50), Lsn(1))
             .expect("insert");
 
         let mut entries = HashMap::new();
@@ -1943,7 +1766,6 @@ mod tests {
                         &record_key(1, byte),
                         loc(1, byte as u32 * 100, 100),
                         Lsn(byte as u64 + 1),
-                        None,
                     )
                     .expect("insert");
             }
@@ -1994,7 +1816,6 @@ mod tests {
                             &short_key(group, byte),
                             loc(1, byte as u32 * 100, 100),
                             Lsn(u64::from(group) * 256 + u64::from(byte) + 1),
-                            None,
                         )
                         .expect("insert");
                 }
@@ -2041,7 +1862,7 @@ mod tests {
             .expect("index");
 
         index
-            .insert(&record_key(1, 0x11), loc(1, 0, 400), Lsn(1), None)
+            .insert(&record_key(1, 0x11), loc(1, 0, 400), Lsn(1))
             .expect("insert");
 
         assert!(index.get(&record_key(1, 0x11)).expect("read").is_some());
@@ -2059,8 +1880,6 @@ mod tests {
             name: "odd",
             key_width: KeyWidth::Fixed(20),
             shard_bytes: 0,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
             map_shape: MapShape::Open,
@@ -2086,7 +1905,7 @@ mod tests {
                     let key = RecordKey::from_bytes(RECORD, &key).expect("key");
                     for index in [&tree, &open] {
                         index
-                            .insert(&key, loc(1, byte as u32 * 100, 100), Lsn(1), None)
+                            .insert(&key, loc(1, byte as u32 * 100, 100), Lsn(1))
                             .expect("insert");
                     }
                 }
@@ -2108,7 +1927,7 @@ mod tests {
     fn forget_clears_segment() {
         let index = index();
         index
-            .insert(&record_key(1, 0x01), loc(1, 0, 400), Lsn(1), None)
+            .insert(&record_key(1, 0x01), loc(1, 0, 400), Lsn(1))
             .expect("insert");
         index
             .remove(&record_key(1, 0x01), Lsn(2), loc(1, 0, 0))

@@ -125,35 +125,6 @@ arrive in whole segments. A workload that rewrites the same keys forever leaves
 its dead bytes scattered inside segments that are otherwise live, and that is the
 copy path every time.
 
-## Carry: the small-value case the separation makes worse
-
-Separating keys from values costs a read. Where values sit inline in a file
-block, a key found is a value found. Here a resolved key names a record that
-still has to be fetched, and for a small value that fetch is the entire cost.
-
-Three answers, all bounded, all per column rather than per volume.
-
-- **Values past four bytes can sit beside the resident entry.** The entry itself
-  is the location and the sequence number and holds no value. A column declaring
-  `inline_max` above four keeps values from five bytes up to that ceiling in a
-  side map next to its entries, which the resident index pays for per key kept.
-- **Up to 256 bytes ride in the sealed footer row.** A column declaring
-  `row_carry` puts a value's leading bytes in the row, so a warm point read is
-  answered by the block the search was already going to fetch. Unlike the side
-  map, which the resident index pays for, a row is read a block at a time and
-  only the reader who wanted that block pays for what it holds.
-- **Between the two, `carried_budget` bounds** what the resident index holds
-  beside its entries, shed coldest first on the maintenance tick. Unset, nothing
-  is shed and everything carried stays resident.
-
-A carrying row carries its own checksum, because a row that answers from itself
-is not covered by the record's checksum the way a row that names a record is.
-
-The structural point is that this is a value-side answer to a value-side problem,
-paid by the columns that have it. There is no store-wide setting that trades the
-large-record path for the small-record one, because the two never share a
-mechanism.
-
 ## Standing sorted runs and the collapse
 
 This is where the level structure comes back, as an option.
@@ -190,10 +161,7 @@ pay neither.
 reclaim keeps the standing stack's dead share under the collapse trigger, so the
 collapse never fires. A control run left 427 standing runs and zero merges, and
 the paged arm paid for it at 15.9 asks per get and a 10.8 ms p99, measured on a
-64-thread EPYC 9375F, 2026-08. Separately, a merge pass whose rows carry lists
-them into one output segment that never rolls, so the pass mints a segment
-bounded only by the live set. Until the merge bounds its output, 0.50 is the
-shipped default and the collapse is a knob to leave alone.
+64-thread EPYC 9375F, 2026-08.
 
 ## What the shape gives up
 

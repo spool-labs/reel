@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+use reel_core::Value;
 use tempfile::{tempdir, TempDir};
 
 use crate::units::ByteCount;
@@ -36,7 +37,6 @@ const ROOT: &str = "/bulk";
 const RECORD: ColumnId = ColumnId(1);
 const BLOB: ColumnId = ColumnId(2);
 const FLAG: ColumnId = ColumnId(3);
-const CARRY: ColumnId = ColumnId(4);
 const CODED: ColumnId = ColumnId(5);
 
 const COLUMNS: ColumnSet = &[
@@ -45,8 +45,6 @@ const COLUMNS: ColumnSet = &[
         name: "record",
         key_width: KeyWidth::Fixed(34),
         shard_bytes: 2,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -56,8 +54,6 @@ const COLUMNS: ColumnSet = &[
         name: "blob_data",
         key_width: KeyWidth::Fixed(32),
         shard_bytes: 0,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -67,8 +63,6 @@ const COLUMNS: ColumnSet = &[
         name: "flag",
         key_width: KeyWidth::Fixed(8),
         shard_bytes: 0,
-        inline_max: 4,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -81,23 +75,8 @@ const CODED_COLUMNS: ColumnSet = &[ColumnSpec {
     name: "coded",
     key_width: KeyWidth::Fixed(8),
     shard_bytes: 0,
-    inline_max: 0,
-    row_carry: 0,
     purge_mark: None,
     codec: Codec::Lz4,
-    map_shape: MapShape::Tree,
-}];
-
-/// A carrying column set of its own, since a paged volume refuses one
-const CARRY_COLUMNS: ColumnSet = &[ColumnSpec {
-    id: CARRY,
-    name: "carry",
-    key_width: KeyWidth::Fixed(8),
-    shard_bytes: 0,
-    inline_max: 512,
-    row_carry: 0,
-    purge_mark: None,
-    codec: Codec::None,
     map_shape: MapShape::Tree,
 }];
 
@@ -109,8 +88,6 @@ const NAME_COLUMNS: ColumnSet = &[ColumnSpec {
     name: "names",
     key_width: KeyWidth::Variable,
     shard_bytes: 0,
-    inline_max: 0,
-    row_carry: 0,
     purge_mark: None,
     codec: Codec::None,
     map_shape: MapShape::Tree,
@@ -139,10 +116,6 @@ fn blob(byte: u8) -> RecordKey {
 
 fn flag(byte: u8) -> RecordKey {
     RecordKey::from_bytes(FLAG, &[byte; 8]).expect("key")
-}
-
-fn carry(byte: u8) -> RecordKey {
-    RecordKey::from_bytes(CARRY, &[byte; 8]).expect("key")
 }
 
 fn coded(byte: u8) -> RecordKey {
@@ -182,22 +155,6 @@ fn coded_store(config: ReelConfig) -> (ReelStore, SimIo) {
         PathBuf::from(ROOT),
         config,
         CODED_COLUMNS,
-        Arc::new(sim.clone()),
-    )
-    .expect("open");
-    (store, sim)
-}
-
-fn carried_held(store: &ReelStore) -> u64 {
-    store.index.column(CARRY).expect("column").carried_bytes()
-}
-
-fn carried_store(config: ReelConfig) -> (ReelStore, SimIo) {
-    let sim = SimIo::new(FaultPlan::new(1));
-    let store = ReelStore::open_with_io(
-        PathBuf::from(ROOT),
-        config,
-        CARRY_COLUMNS,
         Arc::new(sim.clone()),
     )
     .expect("open");
@@ -2006,8 +1963,6 @@ const WIDE_COLUMNS: ColumnSet = &[ColumnSpec {
     name: "wide",
     key_width: KeyWidth::Fixed(16),
     shard_bytes: 1,
-    inline_max: 0,
-    row_carry: 0,
     purge_mark: None,
     codec: Codec::None,
     map_shape: MapShape::Tree,
@@ -2339,152 +2294,6 @@ fn get_many_submits_once() {
         batched < asked.len() as u64,
         "the batch read {batched} times for {} records, against {looped} one at a time",
         asked.len()
-    );
-}
-
-// with no budget the carried tier keeps every write
-#[test]
-fn carried_values_stay_resident_unarmed() {
-    let (store, sim) = carried_store(config(1, SyncPolicy::Never));
-    for byte in 1..=4u8 {
-        store.put(&carry(byte), &[byte; 200]).expect("put");
-    }
-    assert_eq!(carried_held(&store), 800, "every capture is resident");
-
-    let before = sim.read_count();
-    for byte in 1..=4u8 {
-        assert_eq!(
-            store.get(&carry(byte)).expect("read").map(Value::into_vec),
-            Some(vec![byte; 200])
-        );
-    }
-    assert_eq!(
-        sim.read_count(),
-        before,
-        "every value answered from the index"
-    );
-}
-
-// an armed budget sheds a write burst back down on the tick
-#[test]
-fn an_armed_budget_sheds_a_write_burst() {
-    let armed = ReelConfig {
-        carried_budget: ByteCount::from_bytes(1024),
-        ..config(1, SyncPolicy::Never)
-    };
-    let (store, _sim) = carried_store(armed);
-    for byte in 1..=10u8 {
-        store.put(&carry(byte), &[byte; 256]).expect("put");
-    }
-    assert_eq!(
-        carried_held(&store),
-        2560,
-        "captures land ahead of the tick"
-    );
-
-    store.maintain_once().expect("tick");
-
-    assert!(
-        carried_held(&store) <= 1024,
-        "the shed honours the budget, held {}",
-        carried_held(&store)
-    );
-}
-
-// an armed read admits on the second touch, not the first
-#[test]
-fn an_armed_read_admits_on_the_second_touch() {
-    let armed = || ReelConfig {
-        carried_budget: ByteCount::from_bytes(64 * 1024),
-        ..config(1, SyncPolicy::Never)
-    };
-    let (store, sim) = carried_store(armed());
-    store.put(&carry(7), &[7u8; 200]).expect("put");
-    store.flush().expect("flush");
-    drop(store);
-
-    // Recovery rebuilds entries and not carried values, so reads warm them.
-    let store = ReelStore::open_with_io(
-        PathBuf::from(ROOT),
-        armed(),
-        CARRY_COLUMNS,
-        Arc::new(sim.clone()),
-    )
-    .expect("reopen");
-    store.get(&carry(7)).expect("read").expect("found");
-    assert_eq!(carried_held(&store), 0, "one touch is a ghost, not a value");
-
-    store.get(&carry(7)).expect("read").expect("found");
-    assert_eq!(carried_held(&store), 200, "the second touch admits");
-
-    let before = sim.read_count();
-    store.get(&carry(7)).expect("read").expect("found");
-    assert_eq!(sim.read_count(), before, "the third answers from the index");
-}
-
-// a key that keeps answering outlives a bulk load the budget evicts
-#[test]
-fn a_hot_carried_key_outlives_a_burst() {
-    let armed = || ReelConfig {
-        carried_budget: ByteCount::from_bytes(600),
-        ..config(1, SyncPolicy::Never)
-    };
-    let (store, sim) = carried_store(armed());
-    store.put(&carry(1), &[1u8; 256]).expect("put");
-    store.flush().expect("flush");
-    drop(store);
-
-    let store = ReelStore::open_with_io(
-        PathBuf::from(ROOT),
-        armed(),
-        CARRY_COLUMNS,
-        Arc::new(sim.clone()),
-    )
-    .expect("reopen");
-    // Two touches admit, two more bump the countdown to its ceiling.
-    for _ in 0..4 {
-        store.get(&carry(1)).expect("read").expect("found");
-    }
-    for byte in 10..=18u8 {
-        store.put(&carry(byte), &[byte; 256]).expect("put");
-    }
-
-    store.maintain_once().expect("tick");
-
-    assert!(carried_held(&store) <= 600, "the budget holds");
-    let before = sim.read_count();
-    store.get(&carry(1)).expect("read").expect("found");
-    assert_eq!(sim.read_count(), before, "the hot key kept its place");
-}
-
-// an armed batch read admits nothing, so a scan cannot displace the tier
-#[test]
-fn an_armed_batch_read_warms_nothing() {
-    let armed = || ReelConfig {
-        carried_budget: ByteCount::from_bytes(64 * 1024),
-        ..config(1, SyncPolicy::Never)
-    };
-    let (store, sim) = carried_store(armed());
-    store.put(&carry(3), &[3u8; 200]).expect("put");
-    store.flush().expect("flush");
-    drop(store);
-
-    let store = ReelStore::open_with_io(
-        PathBuf::from(ROOT),
-        armed(),
-        CARRY_COLUMNS,
-        Arc::new(sim.clone()),
-    )
-    .expect("reopen");
-    let answers = store.get_many(&[carry(3)]).expect("batch");
-    assert_eq!(
-        answers.into_iter().next().flatten().map(Value::into_vec),
-        Some(vec![3u8; 200])
-    );
-    assert_eq!(
-        carried_held(&store),
-        0,
-        "a bulk read leaves no ghost and no value"
     );
 }
 
@@ -2982,23 +2791,6 @@ fn a_short_range_reads_its_record() {
         .expect("found");
 
     assert_eq!(&*found, &[2, 3]);
-}
-
-// a carried value is cut from the bytes the index is holding
-#[test]
-fn a_carried_range() {
-    let (store, sim) = carried_store(config(1, SyncPolicy::Never));
-    let payload = stripes(200);
-    store.put(&carry(3), &payload).expect("put");
-    let before = sim.read_count();
-
-    let found = store
-        .get_range(&carry(3), 8, 16)
-        .expect("range")
-        .expect("found");
-
-    assert_eq!(&*found, &payload[8..24]);
-    assert_eq!(sim.read_count(), before, "the tier answered it");
 }
 
 // a record a coded column stored raw reads its window off the volume

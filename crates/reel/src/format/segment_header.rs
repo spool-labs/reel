@@ -9,7 +9,7 @@ use crate::format::record::{read_u32_le, read_u64_le};
 ///
 /// A build meeting a version it cannot read refuses the whole file here, rather
 /// than truncating its walk at an unknown record kind and losing the tail silently.
-pub const FORMAT_VERSION: u16 = 4;
+pub const FORMAT_VERSION: u16 = 5;
 
 const VERSION_LEN: usize = std::mem::size_of::<u16>();
 const SEGMENT_LEN: usize = std::mem::size_of::<u32>();

@@ -7,7 +7,6 @@
 use std::collections::VecDeque;
 use std::ops::Bound;
 use std::path::Path;
-use std::sync::Arc;
 
 use reel_core::store::{SweptKeys, SweptPage};
 use reel_core::{
@@ -359,10 +358,10 @@ impl Store for ReelStore {
             prefix: Some(prefix.to_vec()),
             ..Scope::empty(Direction::Asc)
         };
-        let mut page = Page::entries_only(&scope, column, self.serves(column));
+        let mut page = Page::with_lens(&scope, column, self.serves(column));
         let mut total = 0u64;
         let mut key = Vec::new();
-        while let Some((found, _)) = page.next_into(self, &mut key) {
+        while let Some(found) = page.next_into(self, &mut key) {
             match scope.locate(&key) {
                 Position::Past => break,
                 Position::Before => continue,
@@ -702,7 +701,6 @@ impl ReelStore {
             spare: Vec::new(),
             staged: Vec::new(),
             placed: Vec::new(),
-            held: Vec::new(),
             run: PLAYBACK_RUN_MIN,
             is_done: false,
         }
@@ -758,7 +756,7 @@ impl ReelStore {
 /// up strictly past the last key the previous one carried. The index lock is taken
 /// once per page and never held across a payload read.
 struct Page {
-    /// Keys the last page pulled, with whatever the column carries beside them
+    /// Keys the last page pulled, with where each record sits
     buffered: KeyPage,
 
     /// Whether the reel holds the column at all, since one it does not has no keys
@@ -774,9 +772,6 @@ struct Page {
     size: usize,
 }
 
-/// Where a key's record sits, beside the value the page already carries for it
-type Placed = (Option<Entry>, Option<Arc<[u8]>>);
-
 impl Page {
     /// A cursor over keys alone, for a playback that reads no payloads
     fn keys_only(scope: &Scope, column: ColumnId, serves: bool) -> Page {
@@ -786,12 +781,6 @@ impl Page {
     /// A cursor carrying each key's payload length, for a playback that stages reads
     fn with_lens(scope: &Scope, column: ColumnId, serves: bool) -> Page {
         Page::open(scope, column, serves, KeyPage::with_lens())
-    }
-
-    /// The same cursor without the values a carrying column keeps, for a walk that
-    /// weighs records rather than reading them
-    fn entries_only(scope: &Scope, column: ColumnId, serves: bool) -> Page {
-        Page::open(scope, column, serves, KeyPage::entries_only())
     }
 
     fn open(scope: &Scope, column: ColumnId, serves: bool, buffered: KeyPage) -> Page {
@@ -826,7 +815,7 @@ impl Page {
     ///
     /// A walk that steps a million rows hands the same buffer back every time, where
     /// an owned key allocates and frees per row to move as little as eight bytes.
-    fn next_into(&mut self, store: &ReelStore, key: &mut Vec<u8>) -> Option<Placed> {
+    fn next_into(&mut self, store: &ReelStore, key: &mut Vec<u8>) -> Option<Option<Entry>> {
         if !self.serves {
             return None;
         }
@@ -834,10 +823,7 @@ impl Page {
             let taken = self.taken;
             self.taken += 1;
             self.key_into(taken, key);
-            return Some((
-                self.buffered.found_at(taken),
-                self.buffered.take_carried(taken),
-            ));
+            return Some(self.buffered.found_at(taken));
         }
 
         let playback = self.playback.as_mut()?;
@@ -862,7 +848,7 @@ impl Page {
         }
         self.taken = 1;
         self.key_into(0, key);
-        Some((self.buffered.found_at(0), self.buffered.take_carried(0)))
+        Some(self.buffered.found_at(0))
     }
 }
 
@@ -905,9 +891,6 @@ struct Playback<'store> {
 
     /// Where the index placed each of those keys
     placed: Vec<Option<Entry>>,
-
-    /// The payload the index already carries for each of them, where it does
-    held: Vec<Option<Arc<[u8]>>>,
 
     /// Records the next run reads, doubling while the caller keeps draining them
     run: usize,
@@ -994,8 +977,8 @@ impl Iterator for Playback<'_> {
     }
 }
 
-/// A key the playback reached, with what the index held for it and any carried bytes
-type ScopedKey = (Vec<u8>, Option<Entry>, Option<Arc<[u8]>>);
+/// A key the playback reached, with what the index held for it
+type ScopedKey = (Vec<u8>, Option<Entry>);
 
 impl Playback<'_> {
     /// The next key inside the playback's scope, or nothing once the playback is over
@@ -1003,7 +986,7 @@ impl Playback<'_> {
         // One buffer for the whole search, so a skipped key costs no allocation.
         let mut key = self.spare.pop().unwrap_or_default();
         loop {
-            let (found, carried) = match self.page.next_into(self.store, &mut key) {
+            let found = match self.page.next_into(self.store, &mut key) {
                 Some(found) => found,
                 None => {
                     self.is_done = true;
@@ -1023,7 +1006,7 @@ impl Playback<'_> {
             // The width is the one thing a key can fail on, and nothing owned is
             // built here: the run lends these to the read path borrowed.
             if key.len() <= MAX_KEY_LEN {
-                return Some((key, found, carried));
+                return Some((key, found));
             }
         }
     }
@@ -1068,38 +1051,29 @@ impl Playback<'_> {
         // out of the walk's own lists so a run past the first buys none of them.
         let mut keys = std::mem::take(&mut self.staged);
         let mut found = std::mem::take(&mut self.placed);
-        let mut carried = std::mem::take(&mut self.held);
         keys.clear();
         found.clear();
-        carried.clear();
         keys.reserve(wanted);
         found.reserve(wanted);
-        carried.reserve(wanted);
         let mut bytes = 0u64;
         self.run = (self.run * 2).min(PLAYBACK_RUN_MAX);
 
         while keys.len() < wanted && bytes < PLAYBACK_READ_BYTES {
-            let Some((key, entry, value)) = self.next_in_scope() else {
+            let Some((key, entry)) = self.next_in_scope() else {
                 break;
             };
-            // A value the page already carries costs the run nothing to stage.
-            bytes += match value {
-                Some(_) => 0,
-                None => entry.map(|entry| u64::from(entry.loc.len)).unwrap_or(0),
-            };
+            bytes += entry.map(|entry| u64::from(entry.loc.len)).unwrap_or(0);
             keys.push(key);
             found.push(entry);
-            carried.push(value);
         }
 
         // The entries came off the page the index already built, so the read goes
         // straight to the device rather than resolving these keys a second time.
         let column = self.column;
         let asked: Vec<KeyRef<'_>> = keys.iter().map(|key| KeyRef::new(column, key)).collect();
-        let read = self.store.read_found(&asked, &found, &mut carried);
+        let read = self.store.read_found(&asked, &found);
         drop(asked);
         self.placed = found;
-        self.held = carried;
         match read {
             Ok(values) => {
                 for (key, value) in keys.drain(..).zip(values) {
@@ -1202,8 +1176,6 @@ mod tests {
             name: RECORD_CF,
             key_width: KeyWidth::Fixed(RECORD_KEY_LEN as u16),
             shard_bytes: GROUP_PREFIX_LEN as u8,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
             map_shape: MapShape::Tree,
@@ -1213,8 +1185,6 @@ mod tests {
             name: BLOB_CF,
             key_width: KeyWidth::Fixed(BLOB_KEY_LEN as u16),
             shard_bytes: 1,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
             map_shape: MapShape::Tree,
@@ -1224,8 +1194,6 @@ mod tests {
             name: ARTIFACT_CF,
             key_width: KeyWidth::Fixed(ARTIFACT_KEY_LEN as u16),
             shard_bytes: 0,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
             map_shape: MapShape::Tree,
@@ -1235,8 +1203,6 @@ mod tests {
             name: CODED_CF,
             key_width: KeyWidth::Fixed(BLOB_KEY_LEN as u16),
             shard_bytes: 1,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::Lz4,
             map_shape: MapShape::Tree,
@@ -1857,8 +1823,6 @@ mod tests {
             name: PLAIN_CF,
             key_width: KeyWidth::Variable,
             shard_bytes: 0,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
             map_shape: MapShape::Tree,
@@ -1868,8 +1832,6 @@ mod tests {
             name: WIDE_CF,
             key_width: KeyWidth::Fixed(WIDE_KEY_LEN as u16),
             shard_bytes: GROUP_PREFIX_LEN as u8,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
             map_shape: MapShape::Tree,
@@ -1879,8 +1841,6 @@ mod tests {
             name: OPEN_CF,
             key_width: KeyWidth::Fixed(WIDE_KEY_LEN as u16),
             shard_bytes: GROUP_PREFIX_LEN as u8,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
             map_shape: MapShape::Open,

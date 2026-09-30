@@ -6,5 +6,4 @@ value: the shape an oracle wants and the wrong one for production. Its
 copying is deliberate, so a differential test against the real engine reads
 obviously.
 
-Not published. If you want a store that serves hot values from memory, that
-is the reel engine itself with a carried budget armed.
+Not published.

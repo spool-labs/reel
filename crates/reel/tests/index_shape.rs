@@ -2250,8 +2250,6 @@ fn batched_index_reads() {
         name: "records",
         key_width: KeyWidth::Fixed(34),
         shard_bytes: 2,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -2286,7 +2284,6 @@ fn batched_index_reads() {
                 key,
                 Entry::new(Loc::new(SegmentId(1), at as u32, 4096), Lsn(at as u64 + 1)),
                 &segments,
-                None,
             );
         }
 

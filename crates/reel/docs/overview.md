@@ -33,7 +33,7 @@ never a numbering of its own, and the index never encodes a path.
 ```
 put / write_batch
       |
-      v  plan: column check, capacity check, codec, carry
+      v  plan: column check, capacity check, codec
    route to the least loaded tail
       |
       v  reserve a byte range at the write head   (one atomic step, the only
@@ -58,17 +58,14 @@ seal runs off the append path on a per-tail sealer thread.
 ## The read path
 
 The index is asked first. A resident column answers from its map: an entry
-holds the location and the sequence number. A column that declared an
-`inline_max` above four bytes also keeps values from five bytes up to that
-ceiling in a side map beside its entries, and those never reach the device.
-Everything else is one device op placed by the entry.
+holds the location and the sequence number, and the read is one device op
+placed by the entry.
 
 A paged or hot column answers its unsealed keys the same way and sends the rest
 to the footers. That search is a funnel: a whole-column filter over every
 sealed key, then the per-segment key spans, then each surviving segment's own
-filter, then its directory, then one block of rows, then the row. A row may
-carry the value's leading bytes itself, which ends the read there. Otherwise
-the row names a record and the driver fetches it.
+filter, then its directory, then one block of rows, then the row. The row points at a
+record and the driver fetches it.
 
 The search reads every candidate rather than stopping at the first, because a
 segment number is not a version: several tails write at once, so a newer record
@@ -91,7 +88,6 @@ maintain_once            one tick, every step bounded and paced
   page out sealed        paged and hot volumes only
   sweep covers
   prune graves
-  shed carried
   compact once  ->  drain wholly dead segments        unlink, nothing copied
                 ->  select the highest dead fraction past the threshold
                     gates: claim, pending cover, cue floor, rot pin
@@ -131,10 +127,8 @@ Terms this codebase uses with meanings a newcomer cannot guess.
 - **repoint**: moving one index entry onto a copy of its record, guarded on the
   version the copy was made from, which is how compaction relocates a record
   without losing a write that raced it.
-- **carry**: holding leading value bytes beside the key so a read answers
-  without reaching the record: in the index entry, in the sealed row, or both,
-  bounded by `carried_budget`. Separately, a tombstone is *carried* into a
-  compaction's destination while anything old enough for it to hide survives.
+- **carry**: a tombstone is *carried* into a compaction's destination while
+  anything old enough for it to hide survives.
 - **footer**: the packed sorted index a seal writes at the end of a segment.
   Partitioned by column, each partition sorted by key and strided at that
   column's own key width, behind a directory and a fixed tail.

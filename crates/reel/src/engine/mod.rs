@@ -49,7 +49,6 @@ use crate::io::select::select_backend;
 use crate::io::ReelIo;
 use crate::reel::segment::{FdCache, IoDriver};
 use crate::reel::{Reel, ReelShared};
-use reel_core::Value;
 
 /// Name of the file a writable open takes the volume's ownership lock on
 pub(crate) const LOCK_FILE: &str = "reel.lock";
@@ -135,21 +134,6 @@ struct Planned {
 
     /// The codec byte that produced those bytes
     codec: u8,
-
-    /// The whole payload where the column carries it in the index
-    carried: Option<Arc<[u8]>>,
-}
-
-/// A resolved batch split into what the index answered and what the device owes
-///
-/// Both doors plan through this, so a batch reaches the device having done the same
-/// work whichever one it came in through.
-struct FoundPlan {
-    /// One place per key asked for, filled where the index answered
-    ///
-    /// The one list a batch buys, since it is the one the caller takes away. What
-    /// the device is asked for goes in the reading thread's own list beside it.
-    answers: Vec<Option<Value>>,
 }
 
 /// One key of a planned batch and what the index needs to land it
@@ -159,9 +143,6 @@ struct BatchKey {
 
     /// What the index does for this key once the record has landed
     op: KeyOp,
-
-    /// The whole payload where the column carries it in the index
-    carried: Option<Arc<[u8]>>,
 }
 
 /// What one record of a batch asks of the index
@@ -702,11 +683,6 @@ impl ReelStore {
     /// answer and a warm heap hides what a map just took off the free list.
     pub fn resident_bytes(&self) -> ByteCount {
         self.index.resident_bytes()
-    }
-
-    /// Bytes of carried values resident across every column
-    pub fn carried_bytes(&self) -> ByteCount {
-        ByteCount::from_bytes(self.index.carried_total())
     }
 
     /// The volumes the operator declared dead, empty on a whole store

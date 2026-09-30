@@ -28,13 +28,10 @@ const ROWS: ColumnId = ColumnId(1);
 /// Keys the volume holds, spread so every run's range covers every key
 const KEYS: u64 = 900;
 
-/// Payload short enough for the carrying column to hold in its row
+/// Payload of the even keys
 const NARROW: usize = 200;
 
-/// Payload too wide for that row, so a carrying volume still writes records
-///
-/// A volume whose every value rode in a row would never roll its output segment, since a
-/// listed row reserves no space, and the whole file would be one run with nothing to merge.
+/// Payload of the odd keys
 const WIDE: usize = 900;
 
 /// Rounds of rewrites, each one leaving a run behind
@@ -48,21 +45,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     name: "rows",
     key_width: KeyWidth::Fixed(32),
     shard_bytes: 0,
-    inline_max: 0,
-    row_carry: 0,
-    purge_mark: None,
-    codec: Codec::None,
-    map_shape: MapShape::Tree,
-}];
-
-/// The same column with its sealed rows holding the value itself where it fits
-const CARRIED: ColumnSet = &[ColumnSpec {
-    id: ROWS,
-    name: "rows",
-    key_width: KeyWidth::Fixed(32),
-    shard_bytes: 0,
-    inline_max: 0,
-    row_carry: NARROW as u16,
     purge_mark: None,
     codec: Codec::None,
     map_shape: MapShape::Tree,
@@ -399,18 +381,6 @@ fn merge_output_is_not_promotable() {
         store.page_out_sealed().expect("page out") > 0,
         "merge output took the residency the recent segments had earned",
     );
-}
-
-// a merge carries a row holding its own value forward rather than losing it
-#[test]
-fn carried_rows_survive() {
-    let (store, _io) = open_over(merging_config(), CARRIED);
-    fill_runs(&store);
-
-    let report = store.merge_once().expect("merge");
-
-    assert!(report.rows_listed > 0, "a carrying column listed nothing");
-    assert_every_key_reads(&store, &[]);
 }
 
 // every key answers while the output and the runs it replaces are both standing

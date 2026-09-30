@@ -51,8 +51,6 @@ const BENCH_COLUMNS: ColumnSet = &[ColumnSpec {
     name: "raw",
     key_width: KeyWidth::Fixed(KEY_WIDTH as u16),
     shard_bytes: 2,
-    inline_max: 0,
-    row_carry: 0,
     purge_mark: None,
     codec: Codec::None,
     map_shape: MapShape::Tree,
@@ -83,8 +81,6 @@ const TEST_COLUMNS: ColumnSet = &[
         name: "records",
         key_width: KeyWidth::Fixed(RECORD_KEY_LEN as u16),
         shard_bytes: 2,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -94,8 +90,6 @@ const TEST_COLUMNS: ColumnSet = &[
         name: "blob_data",
         key_width: KeyWidth::Fixed(ID_LEN as u16),
         shard_bytes: 0,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -454,8 +448,6 @@ fn bench_columns(key_width: usize, variable: bool) -> ColumnSet {
             KeyWidth::Fixed(key_width as u16)
         },
         shard_bytes: 2,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -702,7 +694,7 @@ fn narrow_bytes_per_key(ascending: bool) -> f64 {
         } else {
             key_at(at, KEY_WIDTH)
         };
-        index.insert(&key, loc, Lsn(at + 1), None).expect("insert");
+        index.insert(&key, loc, Lsn(at + 1)).expect("insert");
     }
     let held = weigh_read().held;
 
@@ -724,7 +716,7 @@ fn index_bytes_per_key(groups: u64) -> f64 {
     for at in 0..INDEX_KEYS as u64 {
         let loc = Loc::new(SegmentId((at >> 20) as u32 + 1), at as u32, 65_536);
         index
-            .insert(&index_key(groups, at), loc, Lsn(at + 1), None)
+            .insert(&index_key(groups, at), loc, Lsn(at + 1))
             .expect("insert");
     }
     let held = weigh_read().held;
@@ -749,7 +741,7 @@ fn index_pass(groups: u64, writers: usize, keys: usize) -> (f64, f64) {
                 for at in first..first + per_writer as u64 {
                     let loc = Loc::new(SegmentId((at >> 20) as u32 + 1), at as u32, 65_536);
                     index
-                        .insert(&index_key(groups, at), loc, Lsn(at + 1), None)
+                        .insert(&index_key(groups, at), loc, Lsn(at + 1))
                         .expect("insert");
                 }
             });

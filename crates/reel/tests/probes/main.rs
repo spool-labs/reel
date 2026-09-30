@@ -6,7 +6,6 @@
 //! asks for one.
 
 mod bias_report;
-mod carried_price;
 mod compact_throughput;
 mod cue_speed;
 mod door_price;
@@ -59,10 +58,6 @@ const PROBES: &[Probe] = &[
     default(
         "bias_report::the_rule_is_a_function_of_its_facts",
         bias_report::the_rule_is_a_function_of_its_facts,
-    ),
-    opt_in(
-        "carried_price::a_bulk_load_meets_a_hot_working_set",
-        carried_price::a_bulk_load_meets_a_hot_working_set,
     ),
     opt_in(
         "compact_throughput::reclaim_throughput_by_rate",

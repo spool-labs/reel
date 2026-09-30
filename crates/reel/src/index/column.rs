@@ -8,17 +8,15 @@
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::ops::Bound;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock};
 
 use crate::units::ByteCount;
 
 use crate::config::{IndexResidency, ShardShapes};
 use crate::engine::Totals;
 use crate::error::{ReelError, Result};
-use crate::format::column::{
-    ColumnId, ColumnSpec, KeyBytes, MapShape, RecordKey, INLINE_MAX, MAX_KEY_LEN,
-};
+use crate::format::column::{ColumnId, ColumnSpec, KeyBytes, MapShape, RecordKey, MAX_KEY_LEN};
 use crate::format::loc::{Loc, SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
 use crate::index::counters::SegmentTable;
@@ -144,9 +142,6 @@ pub struct KeyMove<'batch> {
     /// The sequence number it was written under
     pub lsn: Lsn,
 
-    /// The value kept resident beside the entry, on a column that carries
-    pub carried: Option<Arc<[u8]>>,
-
     /// Whether this is a tombstone rather than a put
     pub is_delete: bool,
 }
@@ -249,39 +244,8 @@ impl ColumnIndex {
     }
 
     /// Apply a committed data record, guarded by its sequence number
-    pub fn insert(
-        &self,
-        key: &[u8],
-        entry: Entry,
-        segments: &SegmentTable,
-        carried: Option<Arc<[u8]>>,
-    ) -> Landed {
-        on_index!(self, index => index.insert(key, entry, segments, carried))
-    }
-
-    /// Ceiling up to which this column carries values beside its entries
-    pub fn carry_max(&self) -> u16 {
-        on_index!(self, index => index.carry_max())
-    }
-
-    /// The carried value for a key, exactly as new as the entry the caller holds
-    pub fn carried_value(&self, key: &[u8], lsn: Lsn) -> Option<Arc<[u8]>> {
-        on_index!(self, index => index.carried_value(key, lsn))
-    }
-
-    /// Remember a value a read just paid the device for
-    pub fn warm_carried(&self, key: &[u8], lsn: Lsn, bytes: &[u8], two_touch: bool) {
-        on_index!(self, index => index.warm_carried(key, lsn, bytes, two_touch))
-    }
-
-    /// Bytes of carried values the column holds resident
-    pub fn carried_bytes(&self) -> u64 {
-        on_index!(self, index => index.carried_bytes())
-    }
-
-    /// Shed carried bytes toward a budget, coldest first
-    pub fn shed_carried(&self, want: u64, start_shard: usize, visit_cap: usize) -> u64 {
-        on_index!(self, index => index.shed_carried(want, start_shard, visit_cap))
+    pub fn insert(&self, key: &[u8], entry: Entry, segments: &SegmentTable) -> Landed {
+        on_index!(self, index => index.insert(key, entry, segments))
     }
 
     /// Drop a key on a tombstone, guarded by its sequence number
@@ -453,11 +417,6 @@ impl ColumnIndex {
         on_index!(self, index => index.page_out(key, loc))
     }
 
-    /// Count a key a rewrite listed in a row, for a shard that never counted it
-    pub fn count_listed(&self, key: &[u8], bytes: u64) -> bool {
-        on_index!(self, index => index.count_listed(key, bytes))
-    }
-
     /// Install rebuilt entries in one pass, replacing whatever the column held
     pub fn install(&self, entries: Vec<(KeyBytes, Entry)>, segments: &SegmentTable) {
         on_index!(self, index => index.install(entries, segments))
@@ -527,55 +486,6 @@ impl ColumnIndex {
     }
 }
 
-/// One key's carried state: a first touch remembered, or the value resident
-///
-/// The ghost costs a map entry and no bytes, and is what makes a second touch mean
-/// something. It is also the filler of every unfilled place in a tree's value array,
-/// so it is a null pointer rather than room for the value it might become.
-#[derive(Default)]
-pub struct Carried(Option<Box<Held>>);
-
-/// The value a resident key serves, and the clock deciding how long it keeps its place
-///
-/// The clock is stepped down by the shed pass and bumped by hits, so a key stays by
-/// being read.
-pub struct Held {
-    /// Version the bytes were captured against, so a stale capture never serves
-    pub lsn: Lsn,
-
-    /// The value itself, handed out by refcount rather than copied
-    pub bytes: Arc<[u8]>,
-
-    /// Countdown the shed pass steps down and a read bumps back up
-    pub heat: AtomicU8,
-}
-
-impl Carried {
-    /// Touched once, holding nothing; the next warm admits it
-    pub fn seen() -> Carried {
-        Carried(None)
-    }
-
-    /// Resident, serving reads without io
-    pub fn held(lsn: Lsn, bytes: Arc<[u8]>, heat: u8) -> Carried {
-        Carried(Some(Box::new(Held {
-            lsn,
-            bytes,
-            heat: AtomicU8::new(heat),
-        })))
-    }
-
-    /// What this key holds, or nothing for a ghost
-    pub fn resident(&self) -> Option<&Held> {
-        self.0.as_deref()
-    }
-
-    /// The same, owned, for a caller giving the bytes back
-    pub fn into_resident(self) -> Option<Box<Held>> {
-        self.0
-    }
-}
-
 /// Keys in one shard's run before a batch is worth its bookkeeping
 const BATCH_RUN: usize = 4;
 
@@ -612,23 +522,6 @@ impl Drop for HeldGroups {
     }
 }
 
-/// Countdown a read admission starts at
-const CARRIED_ADMIT: u8 = 2;
-
-/// Ceiling a hit bumps the countdown toward
-const CARRIED_HEAT_MAX: u8 = 3;
-
-/// Drop what a key carried, keeping the byte total exact
-fn evict_carried<K: IndexKey, S: Shape<K>>(state: &mut ShardState<K, S>, key: &K) {
-    if let Some(held) = state
-        .carried
-        .take(key.as_slice())
-        .and_then(Carried::into_resident)
-    {
-        state.carried_bytes -= held.bytes.len() as u64;
-    }
-}
-
 /// One shard's keys and the payload bytes they resolve to
 struct ShardState<K: IndexKey, S: Shape<K>> {
     /// Every key the shard holds, live records and graves alike
@@ -645,12 +538,6 @@ struct ShardState<K: IndexKey, S: Shape<K>> {
 
     /// Live records of this shard that a sealed footer answers for instead
     paged: usize,
-
-    /// Values the column carries beside its entries, under the entries' own lock
-    carried: S::Carried,
-
-    /// Bytes the carried values add up to
-    carried_bytes: u64,
 }
 
 impl<K: IndexKey, S: Shape<K>> ShardState<K, S> {
@@ -660,8 +547,6 @@ impl<K: IndexKey, S: Shape<K>> ShardState<K, S> {
             bytes: 0,
             graves: 0,
             oldest_grave: Lsn(u64::MAX),
-            carried: S::Carried::default(),
-            carried_bytes: 0,
             paged: 0,
         }
     }
@@ -900,9 +785,6 @@ pub struct WidthIndex<K: IndexKey, S: Shape<K>> {
 
     /// Leading key bytes that pick a shard
     shard_bytes: u8,
-
-    /// Ceiling past which the column stops carrying a value, zero for none
-    carry_max: u16,
 }
 
 impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
@@ -920,16 +802,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             occupied: RwLock::new(TBTreeMap::new()),
             declared_width: spec.key_width.fixed().unwrap_or(0),
             shard_bytes: spec.shard_bytes,
-            carry_max: match spec.inline_max as usize > INLINE_MAX {
-                true => spec.inline_max,
-                false => 0,
-            },
         }
-    }
-
-    /// Ceiling up to which this column carries values beside its entries
-    pub fn carry_max(&self) -> u16 {
-        self.carry_max
     }
 
     /// Bytes every key occupies, the declared width rather than any one key's
@@ -955,7 +828,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         let fixed = (self.shards.capacity() * std::mem::size_of::<RwLock<ShardState<K, S>>>())
             as u64
             + self.filters.heap_bytes();
-        fixed + self.sum_shards(|state| state.map.heap_bytes() + state.carried.heap_bytes())
+        fixed + self.sum_shards(|state| state.map.heap_bytes())
     }
 
     /// Which structure this column's shards took
@@ -970,20 +843,14 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// exact. What comes back is what the map held: on a paged column a put that
     /// landed on an empty place may have replaced a record only a footer knows about,
     /// and exactly one put can see the place empty, so exactly one goes looking.
-    pub fn insert(
-        &self,
-        key: &[u8],
-        entry: Entry,
-        segments: &SegmentTable,
-        carried: Option<Arc<[u8]>>,
-    ) -> Landed {
+    pub fn insert(&self, key: &[u8], entry: Entry, segments: &SegmentTable) -> Landed {
         let key = match K::from_slice(key) {
             Some(key) => key,
             None => return Landed::Newer,
         };
         let at = self.shard_of(&key);
         let mut state = write(&self.shards[at]);
-        self.insert_held(&mut state, at, key, entry, segments, carried)
+        self.insert_held(&mut state, at, key, entry, segments)
     }
 
     /// Apply a batch's moves, holding a shard once for the run of keys in it
@@ -1048,7 +915,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 key,
                 Entry::new(moving.loc, moving.lsn),
                 segments,
-                moving.carried.clone(),
             ),
         }
     }
@@ -1065,7 +931,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         key: K,
         entry: Entry,
         segments: &SegmentTable,
-        carried: Option<Arc<[u8]>>,
     ) -> Landed {
         // The record's own hold keeps its segment from retiring until this publish
         // lands, so the stamp can be issued live here.
@@ -1115,141 +980,9 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             }
         };
 
-        if self.carry_max != 0 {
-            match carried {
-                Some(bytes) => {
-                    // A write capture enters at the bottom of the clock, so a
-                    // value earns its place by being read rather than written.
-                    state.carried_bytes += bytes.len() as u64;
-                    let held = Carried::held(lsn, bytes, 0);
-                    if let Some(old) = state
-                        .carried
-                        .put(key, held)
-                        .and_then(Carried::into_resident)
-                    {
-                        state.carried_bytes -= old.bytes.len() as u64;
-                    }
-                }
-                None => evict_carried(state, &key),
-            }
-        }
-
         segments.mark_live(loc.segment, lsn, span_of(width, loc.len));
         self.note_filled(at, was_empty);
         landed
-    }
-
-    /// The carried value for a key, exactly as new as the entry the caller holds
-    pub fn carried_value(&self, key: &[u8], lsn: Lsn) -> Option<Arc<[u8]>> {
-        if self.carry_max == 0 {
-            return None;
-        }
-        if !K::accepts(key) {
-            return None;
-        }
-        let state = read(&self.shards[self.shard_of_bytes(key)]);
-        let held = state.carried.at(key)?.resident()?;
-        if held.lsn != lsn {
-            return None;
-        }
-        // The bump is relaxed and lossy on purpose: racing bumps can only
-        // under-count heat.
-        let hot = held.heat.load(Ordering::Relaxed);
-        if hot < CARRIED_HEAT_MAX {
-            held.heat.store(hot + 1, Ordering::Relaxed);
-        }
-        Some(Arc::clone(&held.bytes))
-    }
-
-    /// Remember a value a read just paid the device for
-    ///
-    /// The entry is checked again under the write lock, so a value captured against
-    /// one version never serves for another.
-    pub fn warm_carried(&self, key: &[u8], lsn: Lsn, bytes: &[u8], two_touch: bool) {
-        if self.carry_max == 0 || bytes.len() > self.carry_max as usize {
-            return;
-        }
-        let Some(key) = K::from_slice(key) else {
-            return;
-        };
-        let at = self.shard_of(&key);
-        let mut state = write(&self.shards[at]);
-        match state.map.at(key.as_slice()) {
-            Some(existing) if !existing.is_grave() && existing.lsn == lsn => {}
-            Some(_) | None => return,
-        }
-        // Armed, a first touch leaves only the ghost, so one pass over cold
-        // keys buys no residency it never earned.
-        if two_touch && !state.carried.holds(key.as_slice()) {
-            state.carried.put(key, Carried::seen());
-            return;
-        }
-        state.carried_bytes += bytes.len() as u64;
-        let held = Carried::held(lsn, Arc::from(bytes), CARRIED_ADMIT);
-        if let Some(old) = state
-            .carried
-            .put(key, held)
-            .and_then(Carried::into_resident)
-        {
-            state.carried_bytes -= old.bytes.len() as u64;
-        }
-    }
-
-    /// Bytes of carried values the column holds resident
-    pub fn carried_bytes(&self) -> u64 {
-        self.shards
-            .iter()
-            .map(|shard| read(shard).carried_bytes)
-            .sum()
-    }
-
-    /// Shed carried values, ghosts decaying and countdowns stepping down
-    ///
-    /// Bounded by the bytes wanted and the entries visited, whichever ends first. A
-    /// countdown at zero gives its value back and anything warmer steps one down.
-    /// The caller hands in the shard to start at, so repeated passes spread over the
-    /// column instead of always draining the first shard.
-    pub fn shed_carried(&self, want: u64, start_shard: usize, visit_cap: usize) -> u64 {
-        if self.carry_max == 0 || want == 0 {
-            return 0;
-        }
-        let mut freed = 0u64;
-        let mut visited = 0usize;
-        let count = self.shards.len();
-        for step in 0..count {
-            if freed >= want || visited >= visit_cap {
-                break;
-            }
-            let shard = &self.shards[(start_shard + step) % count];
-            if read(shard).carried.vacant() {
-                continue;
-            }
-            let mut state = write(shard);
-            let mut dropped: Vec<K> = Vec::new();
-            for (key, carried) in state.carried.walk() {
-                if freed >= want || visited >= visit_cap {
-                    break;
-                }
-                visited += 1;
-                match carried.resident() {
-                    None => dropped.push(key.clone()),
-                    Some(held) => {
-                        let hot = held.heat.load(Ordering::Relaxed);
-                        match hot {
-                            0 => {
-                                freed += held.bytes.len() as u64;
-                                dropped.push(key.clone());
-                            }
-                            _ => held.heat.store(hot - 1, Ordering::Relaxed),
-                        }
-                    }
-                }
-            }
-            for key in &dropped {
-                evict_carried(&mut state, key);
-            }
-        }
-        freed
     }
 
     /// Drop a key on a tombstone, guarded by its sequence number
@@ -1311,7 +1044,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             .map
             .put(key.clone(), Entry::grave_from(lsn, tombstone.segment));
         state.note_grave(lsn);
-        evict_carried(state, &key);
         self.note_filled(at, was_empty);
         landed
     }
@@ -1761,7 +1493,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                     *per_segment.get_or_insert(entry.loc.segment, 0) += entry.span(key.width());
                     freed += u64::from(entry.loc.len);
                     state.map.take(key.as_slice());
-                    evict_carried(state, key);
                 }
                 for (segment, span) in per_segment.iter() {
                     segments.shadow(*segment, *span);
@@ -1968,26 +1699,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         true
     }
 
-    /// Count a key a rewrite moved into a footer row rather than into a record
-    ///
-    /// A key handed over at runtime was counted on its way out and stays counted; one
-    /// a rebuild left sealed never was, so listing it in a row is where it joins the
-    /// count.
-    pub fn count_listed(&self, key: &[u8], bytes: u64) -> bool {
-        let Some(key) = K::from_slice(key) else {
-            return false;
-        };
-        let at = self.shard_of(&key);
-        let mut state = write(&self.shards[at]);
-        let was_empty = state.map.vacant() && state.paged == 0;
-        state.paged += 1;
-        state.bytes += bytes;
-        // The shard has to be on the walk now: only occupied shards are summed, and
-        // a paged count outside that set reads as the key having been deleted.
-        self.note_filled(at, was_empty);
-        true
-    }
-
     /// Give a key up to the footer of the segment it landed in
     ///
     /// The record stays live and its bytes stay booked live: what changes is only
@@ -2101,8 +1812,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             self.filters.clear(at);
             state.bytes = 0;
             state.graves = 0;
-            state.carried.empty();
-            state.carried_bytes = 0;
             // What a rebuild installs is resident by definition, so a shard that had
             // handed keys over starts from nothing like any other.
             state.paged = 0;
@@ -2232,7 +1941,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 if entry.is_grave() || self.is_covered(key.as_slice(), entry.lsn) {
                     continue;
                 }
-                out.push_carried(key.as_slice(), **entry, None);
+                out.push(key.as_slice(), **entry);
             }
             match next {
                 Some(next) if out.len() >= limit => {
@@ -2295,7 +2004,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                         within: Mark::Key(key),
                     });
                 }
-                out.push_carried(key.as_slice(), *entry, None);
+                out.push(key.as_slice(), *entry);
                 if out.len() >= limit {
                     stopped = Some((at, Box::from(key.as_slice())));
                 }
@@ -2337,11 +2046,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                     !entry.is_grave() && !self.is_covered(key.as_slice(), entry.lsn)
                 })
             {
-                let carried = match out.keeps_carried() {
-                    true => self.page_carry(&state, key, entry),
-                    false => None,
-                };
-                out.push_carried(key.as_slice(), *entry, carried);
+                out.push(key.as_slice(), *entry);
                 if out.len() >= limit {
                     return;
                 }
@@ -2384,7 +2089,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                     if entry.is_grave() || self.is_covered(key.as_slice(), entry.lsn) {
                         continue;
                     }
-                    out.push_carried(key.as_slice(), **entry, None);
+                    out.push(key.as_slice(), **entry);
                 }
                 match next {
                     // The shard has more, and the page is full if it took the room.
@@ -2437,11 +2142,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                         !entry.is_grave() && !self.is_covered(key.as_slice(), entry.lsn)
                     })
             {
-                let carried = match out.keeps_carried() {
-                    true => self.page_carry(&state, key, entry),
-                    false => None,
-                };
-                out.push_carried(key.as_slice(), *entry, carried);
+                out.push(key.as_slice(), *entry);
                 if out.len() >= limit {
                     return;
                 }
@@ -2461,21 +2162,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         let len = u64::from(existing.loc.len);
         state.bytes = state.bytes.saturating_sub(len);
         state.map.take(key.as_slice());
-        evict_carried(state, key);
-    }
-
-    /// The value a page serves for a key, cloned under the shard lock it holds
-    fn page_carry(&self, state: &ShardState<K, S>, key: &K, entry: &Entry) -> Option<Arc<[u8]>> {
-        if self.carry_max == 0 {
-            return None;
-        }
-        // A page serve takes the value without bumping its heat: a scan must not
-        // renew a place it did not earn.
-        let held = state.carried.at(key.as_slice())?.resident()?;
-        match held.lsn == entry.lsn {
-            true => Some(Arc::clone(&held.bytes)),
-            false => None,
-        }
     }
 
     /// Record a shard that has just taken its first key
@@ -3026,9 +2712,6 @@ pub trait Shape<K: IndexKey> {
     /// Where the shard's entries live
     type Entries: ShardMap<K, Entry>;
 
-    /// Where the values a carrying column keeps beside them live
-    type Carried: ShardMap<K, Carried>;
-
     /// What a column's shards actually took, not always what the column asked for
     const SHAPE: MapShape;
 
@@ -3058,7 +2741,6 @@ macro_rules! tree_shapes {
         $(
             impl Shape<[u8; $width]> for Trees<$width> {
                 type Entries = TBTreeMap<[u8; $width], { node_width($width) }, Entry>;
-                type Carried = TBTreeMap<[u8; $width], { node_width($width) }, Carried>;
                 const SHAPE: MapShape = MapShape::Tree;
                 const OVERHEAD_PER_KEY: u64 = NODE_BYTES_PER_KEY;
             }
@@ -3081,7 +2763,6 @@ pub struct VarTrees;
 
 impl Shape<Box<[u8]>> for VarTrees {
     type Entries = TBTreeMap<Box<[u8]>, VAR_NODE_WIDTH, Entry>;
-    type Carried = TBTreeMap<Box<[u8]>, VAR_NODE_WIDTH, Carried>;
     const SHAPE: MapShape = MapShape::Tree;
     const OVERHEAD_PER_KEY: u64 = NODE_BYTES_PER_KEY;
 }
@@ -3095,7 +2776,6 @@ pub struct OpenTables<const N: usize>;
 
 impl<const N: usize> Shape<[u8; N]> for OpenTables<N> {
     type Entries = OpenTable<N, Entry>;
-    type Carried = OpenTable<N, Carried>;
     const SHAPE: MapShape = MapShape::Open;
     const OVERHEAD_PER_KEY: u64 = overhead_per_key(N as u64, std::mem::size_of::<Entry>() as u64);
 }
@@ -3253,16 +2933,6 @@ mod tests {
     /// Keys the ordered sweep test puts in, enough to cross several pages
     const SWEPT: usize = 2_000;
 
-    // a carried slot stays pointer wide, since every ghost and empty place pays it
-    #[test]
-    fn a_carried_slot_stays_pointer_wide() {
-        assert_eq!(
-            std::mem::size_of::<Carried>(),
-            std::mem::size_of::<usize>(),
-            "a carried slot changed size; every unfilled leaf place holds one",
-        );
-    }
-
     // a column sweep hands out every live key at least once, across its shards
     #[test]
     fn column_sweep_covers() {
@@ -3275,7 +2945,6 @@ mod tests {
                     &key(group, byte),
                     Entry::new(loc(1, u32::from(byte), 10), Lsn(u64::from(byte) + 1)),
                     &segments,
-                    None,
                 );
                 wrote.insert(key(group, byte));
             }
@@ -3307,7 +2976,6 @@ mod tests {
                     &key(group, byte),
                     Entry::new(loc(1, u32::from(byte), 10), Lsn(u64::from(byte) + 1)),
                     &segments,
-                    None,
                 );
                 if group == 7 {
                     wrote.insert(key(group, byte));
@@ -3353,7 +3021,6 @@ mod tests {
                     &key(group, byte),
                     Entry::new(loc(1, u32::from(byte), 10), Lsn(u64::from(byte) + 1)),
                     &segments,
-                    None,
                 );
                 if group == 7 {
                     wrote.insert(key(group, byte));
@@ -3391,7 +3058,6 @@ mod tests {
                 &key(7, byte),
                 Entry::new(loc(1, u32::from(byte), 10), Lsn(u64::from(byte) + 1)),
                 &segments,
-                None,
             );
         }
 
@@ -3447,8 +3113,6 @@ mod tests {
         name: "object_list",
         key_width: KeyWidth::Variable,
         shard_bytes: 1,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -3486,7 +3150,6 @@ mod tests {
                 name,
                 Entry::new(loc(1, at as u32 * 100, 50), Lsn(at as u64 + 1)),
                 &segments,
-                None,
             );
             assert!(landed.took_place(), "insert {at}");
         }
@@ -3520,12 +3183,7 @@ mod tests {
             b"photosx".to_vec(),
         ];
         for (at, name) in names.iter().enumerate() {
-            index.insert(
-                name,
-                Entry::new(loc(1, at as u32, 10), Lsn(1)),
-                &segments,
-                None,
-            );
+            index.insert(name, Entry::new(loc(1, at as u32, 10), Lsn(1)), &segments);
         }
         names.sort();
 
@@ -3542,8 +3200,8 @@ mod tests {
         let segments = SegmentTable::new();
         let name = b"photos/2026/cat.jpg".as_slice();
 
-        index.insert(name, Entry::new(loc(1, 0, 10), Lsn(1)), &segments, None);
-        index.insert(name, Entry::new(loc(1, 40, 10), Lsn(2)), &segments, None);
+        index.insert(name, Entry::new(loc(1, 0, 10), Lsn(1)), &segments);
+        index.insert(name, Entry::new(loc(1, 40, 10), Lsn(2)), &segments);
 
         assert_eq!(index.totals().count, 1);
         assert_eq!(index.get(name).expect("present").lsn, Lsn(2));
@@ -3554,8 +3212,6 @@ mod tests {
         name: "record",
         key_width: KeyWidth::Fixed(34),
         shard_bytes: 2,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -3566,8 +3222,6 @@ mod tests {
         name: "blob_data",
         key_width: KeyWidth::Fixed(32),
         shard_bytes: 0,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -3607,7 +3261,7 @@ mod tests {
         let segments = SegmentTable::new();
         for byte in 0..50u8 {
             let entry = Entry::new(loc(1, u32::from(byte), 10), Lsn(u64::from(byte) + 1));
-            index.insert(&key(7, byte), entry, &segments, None);
+            index.insert(&key(7, byte), entry, &segments);
         }
         for byte in 0..50u8 {
             assert!(index.page_out(&key(7, byte), loc(1, u32::from(byte), 10)));
@@ -3617,12 +3271,7 @@ mod tests {
             "the emptied shard's filter still holds its keys"
         );
 
-        index.insert(
-            &key(7, 3),
-            Entry::new(loc(2, 0, 10), Lsn(100)),
-            &segments,
-            None,
-        );
+        index.insert(&key(7, 3), Entry::new(loc(2, 0, 10), Lsn(100)), &segments);
         assert_eq!(
             index.get(&key(7, 3)).map(|entry| entry.loc),
             Some(loc(2, 0, 10))
@@ -3641,7 +3290,7 @@ mod tests {
         let segments = SegmentTable::new();
         for at in 0..1_000u32 {
             let entry = Entry::new(loc(1, at, 10), Lsn(u64::from(at) + 1));
-            index.insert(&crowded(at), entry, &segments, None);
+            index.insert(&crowded(at), entry, &segments);
         }
 
         let held = write(&index.shards[7]);
@@ -3684,7 +3333,6 @@ mod tests {
                     &key(group, byte),
                     Entry::new(loc(1, u32::from(byte), 10), Lsn(u64::from(byte))),
                     &segments,
-                    None,
                 );
             }
         }
@@ -3732,8 +3380,6 @@ mod tests {
             name: "odd",
             key_width: KeyWidth::Fixed(33),
             shard_bytes: 0,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
             map_shape: MapShape::Tree,
@@ -3805,8 +3451,6 @@ mod tests {
                 name: "small",
                 key_width: KeyWidth::Fixed(width as u16),
                 shard_bytes: 0,
-                inline_max: 0,
-                row_carry: 0,
                 purge_mark: None,
                 codec: Codec::None,
                 map_shape: MapShape::Tree,
@@ -3824,12 +3468,7 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
 
-        index.insert(
-            &key(1, 1),
-            Entry::new(loc(1, 0, 400), Lsn(1)),
-            &segments,
-            None,
-        );
+        index.insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(1)), &segments);
         assert!(
             index.get(&key(1, 1)).is_some(),
             "a present key survives the filter"
@@ -3859,12 +3498,7 @@ mod tests {
         let segments = SegmentTable::new();
 
         assert!(index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 400), Lsn(1)),
-                &segments,
-                None
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(1)), &segments,)
             .took_place());
 
         let entry = index.get(&key(1, 1)).expect("present");
@@ -3881,12 +3515,7 @@ mod tests {
         let segments = SegmentTable::new();
 
         assert_eq!(
-            index.insert(
-                &[0u8; 20],
-                Entry::new(loc(1, 0, 400), Lsn(1)),
-                &segments,
-                None
-            ),
+            index.insert(&[0u8; 20], Entry::new(loc(1, 0, 400), Lsn(1)), &segments,),
             Landed::Newer
         );
         assert!(index.get(&[0u8; 20]).is_none());
@@ -3899,21 +3528,11 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
         index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 400), Lsn(1)),
-                &segments,
-                None,
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(1)), &segments)
             .took_place();
 
         index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(2, 0, 900), Lsn(2)),
-                &segments,
-                None,
-            )
+            .insert(&key(1, 1), Entry::new(loc(2, 0, 900), Lsn(2)), &segments)
             .took_place();
 
         assert_eq!(segments.bytes_of(SegmentId(1)).live, 0);
@@ -3929,21 +3548,11 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
         index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(2, 0, 900), Lsn(5)),
-                &segments,
-                None,
-            )
+            .insert(&key(1, 1), Entry::new(loc(2, 0, 900), Lsn(5)), &segments)
             .took_place();
 
         let applied = index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 400), Lsn(3)),
-                &segments,
-                None,
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(3)), &segments)
             .took_place();
 
         assert!(!applied);
@@ -3958,12 +3567,7 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
         index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 400), Lsn(1)),
-                &segments,
-                None,
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(1)), &segments)
             .took_place();
 
         assert_eq!(
@@ -3982,12 +3586,7 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
         index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 400), Lsn(5)),
-                &segments,
-                None,
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(5)), &segments)
             .took_place();
 
         assert_eq!(
@@ -4005,28 +3604,13 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
         index
-            .insert(
-                &key(7, 1),
-                Entry::new(loc(1, 0, 400), Lsn(1)),
-                &segments,
-                None,
-            )
+            .insert(&key(7, 1), Entry::new(loc(1, 0, 400), Lsn(1)), &segments)
             .took_place();
         index
-            .insert(
-                &key(7, 2),
-                Entry::new(loc(1, 0, 600), Lsn(2)),
-                &segments,
-                None,
-            )
+            .insert(&key(7, 2), Entry::new(loc(1, 0, 600), Lsn(2)), &segments)
             .took_place();
         index
-            .insert(
-                &key(8, 1),
-                Entry::new(loc(1, 0, 100), Lsn(3)),
-                &segments,
-                None,
-            )
+            .insert(&key(8, 1), Entry::new(loc(1, 0, 100), Lsn(3)), &segments)
             .took_place();
 
         let seven = index.prefix_totals(&7u16.to_be_bytes()).expect("prefix");
@@ -4044,12 +3628,7 @@ mod tests {
             WidthIndex::new(&FLAT, IndexResidency::Resident);
         let segments = SegmentTable::new();
         index
-            .insert(
-                &[0x11; 32],
-                Entry::new(loc(1, 0, 400), Lsn(1)),
-                &segments,
-                None,
-            )
+            .insert(&[0x11; 32], Entry::new(loc(1, 0, 400), Lsn(1)), &segments)
             .took_place();
 
         assert_eq!(index.totals().count, 1);
@@ -4067,7 +3646,6 @@ mod tests {
                     &key(group, byte),
                     Entry::new(loc(1, 0, 100), Lsn(1)),
                     &segments,
-                    None,
                 )
                 .took_place();
         }
@@ -4095,7 +3673,6 @@ mod tests {
                     &key(group, 1),
                     Entry::new(loc(1, 0, 100), Lsn(1)),
                     &segments,
-                    None,
                 )
                 .took_place();
         }
@@ -4117,7 +3694,6 @@ mod tests {
                     &key(group, group as u8),
                     Entry::new(loc(1, 0, 100), Lsn(1)),
                     &segments,
-                    None,
                 )
                 .took_place();
         }
@@ -4126,7 +3702,6 @@ mod tests {
                 &key(42, 0xaa),
                 Entry::new(loc(1, 0, 100), Lsn(2)),
                 &segments,
-                None,
             )
             .took_place();
 
@@ -4157,20 +3732,10 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
         index
-            .insert(
-                &key(42, 1),
-                Entry::new(loc(1, 0, 100), Lsn(1)),
-                &segments,
-                None,
-            )
+            .insert(&key(42, 1), Entry::new(loc(1, 0, 100), Lsn(1)), &segments)
             .took_place();
         index
-            .insert(
-                &key(42, 2),
-                Entry::new(loc(1, 0, 100), Lsn(20)),
-                &segments,
-                None,
-            )
+            .insert(&key(42, 2), Entry::new(loc(1, 0, 100), Lsn(20)), &segments)
             .took_place();
 
         index.remove_range(&42u16.to_be_bytes(), Some(&43u16.to_be_bytes()), Lsn(9));
@@ -4193,7 +3758,6 @@ mod tests {
                     &key(group, 1),
                     Entry::new(loc(1, 0, 100), Lsn(1)),
                     &segments,
-                    None,
                 )
                 .took_place();
         }
@@ -4213,12 +3777,7 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
         index
-            .insert(
-                &key(5, 5),
-                Entry::new(loc(1, 0, 50), Lsn(1)),
-                &segments,
-                None,
-            )
+            .insert(&key(5, 5), Entry::new(loc(1, 0, 50), Lsn(1)), &segments)
             .took_place();
 
         index.install(
@@ -4247,12 +3806,7 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
         index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 400), Lsn(1)),
-                &segments,
-                None,
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(1)), &segments)
             .took_place();
 
         let moved = index.repoint(&key(1, 1), loc(2, 0, 400), Lsn(1), &segments);
@@ -4271,20 +3825,10 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
         index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 400), Lsn(1)),
-                &segments,
-                None,
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(1)), &segments)
             .took_place();
         index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(3, 0, 900), Lsn(2)),
-                &segments,
-                None,
-            )
+            .insert(&key(1, 1), Entry::new(loc(3, 0, 900), Lsn(2)), &segments)
             .took_place();
 
         let moved = index.repoint(&key(1, 1), loc(2, 0, 400), Lsn(1), &segments);
@@ -4300,12 +3844,7 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
         index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 400), Lsn(1)),
-                &segments,
-                None,
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(1)), &segments)
             .took_place();
 
         let evicted = index.evict_at(&key(1, 1), loc(1, 0, 400), &segments);
@@ -4322,20 +3861,10 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
         index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 400), Lsn(1)),
-                &segments,
-                None,
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(1)), &segments)
             .took_place();
         index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(2, 0, 500), Lsn(2)),
-                &segments,
-                None,
-            )
+            .insert(&key(1, 1), Entry::new(loc(2, 0, 500), Lsn(2)), &segments)
             .took_place();
 
         assert!(!index.evict_at(&key(1, 1), loc(1, 0, 400), &segments));
@@ -4348,20 +3877,10 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
         index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 400), Lsn(1)),
-                &segments,
-                None,
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(1)), &segments)
             .took_place();
         index
-            .insert(
-                &key(2, 1),
-                Entry::new(loc(1, 0, 400), Lsn(2)),
-                &segments,
-                None,
-            )
+            .insert(&key(2, 1), Entry::new(loc(1, 0, 400), Lsn(2)), &segments)
             .took_place();
 
         index.remove(&key(1, 1), Lsn(3), loc(1, 0, 0), &segments);
@@ -4394,12 +3913,7 @@ mod tests {
         // has never seen.
         index.remove(&key(1, 1), Lsn(6), loc(1, 0, 0), &segments);
         assert!(!index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 400), Lsn(5)),
-                &segments,
-                None
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(5)), &segments,)
             .took_place());
 
         assert!(index.get(&key(1, 1)).is_none(), "the deleted key came back");
@@ -4412,22 +3926,12 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
         index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 100), Lsn(2)),
-                &segments,
-                None,
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 100), Lsn(2)), &segments)
             .took_place();
 
         index.remove(&key(1, 1), Lsn(6), loc(1, 0, 0), &segments);
         assert!(!index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 400), Lsn(5)),
-                &segments,
-                None
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(5)), &segments,)
             .took_place());
 
         assert!(index.get(&key(1, 1)).is_none());
@@ -4442,12 +3946,7 @@ mod tests {
 
         index.remove(&key(1, 1), Lsn(6), loc(1, 0, 0), &segments);
         assert!(index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 400), Lsn(7)),
-                &segments,
-                None
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(7)), &segments,)
             .took_place());
 
         assert!(index.get(&key(1, 1)).is_some());
@@ -4465,20 +3964,10 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
         index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 100), Lsn(2)),
-                &segments,
-                None,
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 100), Lsn(2)), &segments)
             .took_place();
         index
-            .insert(
-                &key(1, 2),
-                Entry::new(loc(1, 0, 100), Lsn(3)),
-                &segments,
-                None,
-            )
+            .insert(&key(1, 2), Entry::new(loc(1, 0, 100), Lsn(3)), &segments)
             .took_place();
 
         index.remove_range(&key(1, 0), None, Lsn(6));
@@ -4490,12 +3979,7 @@ mod tests {
             "the cover is the guard, not a grave per key"
         );
         assert!(!index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 400), Lsn(5)),
-                &segments,
-                None
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(5)), &segments,)
             .took_place());
         assert!(
             index.get(&key(1, 1)).is_none(),
@@ -4542,7 +4026,6 @@ mod tests {
                 key,
                 Entry::new(loc(1, at as u32, 10), Lsn(at as u64 + 1)),
                 &segments,
-                None,
             );
         }
 
@@ -4594,7 +4077,7 @@ mod tests {
         let swept = keys(3);
         let kept = keys(4);
         for key in swept.iter().chain(kept.iter()) {
-            index.insert(key, Entry::new(loc(1, 0, 10), Lsn(1)), &segments, None);
+            index.insert(key, Entry::new(loc(1, 0, 10), Lsn(1)), &segments);
         }
         let filled = read(&index.shards[3]).map.leaf_count();
         assert!(filled > 1, "2000 keys landed in {filled} leaves");
@@ -4621,12 +4104,7 @@ mod tests {
         }
 
         // The shard takes keys again after the release, and the walk finds it.
-        index.insert(
-            &swept[0],
-            Entry::new(loc(1, 0, 10), Lsn(20)),
-            &segments,
-            None,
-        );
+        index.insert(&swept[0], Entry::new(loc(1, 0, 10), Lsn(20)), &segments);
         assert_eq!(
             read(&index.occupied).len(),
             2,
@@ -4650,7 +4128,7 @@ mod tests {
             })
             .collect();
         for key in &held {
-            index.insert(key, Entry::new(loc(1, 0, 10), Lsn(1)), &segments, None);
+            index.insert(key, Entry::new(loc(1, 0, 10), Lsn(1)), &segments);
         }
         let filled = read(&index.shards[3]).map.leaf_count();
 
@@ -4689,12 +4167,7 @@ mod tests {
         );
 
         assert!(!index
-            .insert(
-                &key(1, 5),
-                Entry::new(loc(1, 0, 400), Lsn(5)),
-                &segments,
-                None
-            )
+            .insert(&key(1, 5), Entry::new(loc(1, 0, 400), Lsn(5)), &segments,)
             .took_place());
         assert!(index.get(&key(1, 5)).is_none(), "the purged key came back");
         assert_eq!(index.totals().count, 0);
@@ -4709,12 +4182,7 @@ mod tests {
         index.remove_range(&key(1, 0), None, Lsn(6));
 
         assert!(index
-            .insert(
-                &key(1, 5),
-                Entry::new(loc(1, 0, 400), Lsn(7)),
-                &segments,
-                None
-            )
+            .insert(&key(1, 5), Entry::new(loc(1, 0, 400), Lsn(7)), &segments,)
             .took_place());
         assert!(index.get(&key(1, 5)).is_some());
     }
@@ -4729,23 +4197,13 @@ mod tests {
 
         assert!(
             !index
-                .insert(
-                    &key(1, 5),
-                    Entry::new(loc(1, 0, 400), Lsn(5)),
-                    &segments,
-                    None
-                )
+                .insert(&key(1, 5), Entry::new(loc(1, 0, 400), Lsn(5)), &segments,)
                 .took_place(),
             "a key inside the range is refused"
         );
         assert!(
             index
-                .insert(
-                    &key(2, 5),
-                    Entry::new(loc(1, 0, 400), Lsn(5)),
-                    &segments,
-                    None
-                )
+                .insert(&key(2, 5), Entry::new(loc(1, 0, 400), Lsn(5)), &segments,)
                 .took_place(),
             "a key past the end of the range is not this delete's business"
         );
@@ -4758,12 +4216,7 @@ mod tests {
         let segments = SegmentTable::new();
 
         index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 100), Lsn(1)),
-                &segments,
-                None,
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 100), Lsn(1)), &segments)
             .took_place();
         index.remove(&key(1, 1), Lsn(2), loc(1, 0, 0), &segments);
 
@@ -4797,12 +4250,7 @@ mod tests {
         // Nothing is held any more, so a record older than the retired delete is
         // taken on its own merits.
         assert!(index
-            .insert(
-                &key(1, 5),
-                Entry::new(loc(1, 0, 400), Lsn(5)),
-                &segments,
-                None
-            )
+            .insert(&key(1, 5), Entry::new(loc(1, 0, 400), Lsn(5)), &segments,)
             .took_place());
     }
 
@@ -4819,12 +4267,7 @@ mod tests {
         assert_eq!(index.cover_count(), 0);
         assert_eq!(index.grave_count(), 0);
         assert!(index
-            .insert(
-                &key(1, 5),
-                Entry::new(loc(1, 0, 400), Lsn(5)),
-                &segments,
-                None
-            )
+            .insert(&key(1, 5), Entry::new(loc(1, 0, 400), Lsn(5)), &segments,)
             .took_place());
     }
 
@@ -4839,7 +4282,6 @@ mod tests {
                     &key(7, byte),
                     Entry::new(loc(1, 0, 100), Lsn(1 + byte as u64)),
                     &segments,
-                    None,
                 )
                 .took_place();
         }
@@ -4869,12 +4311,7 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
         index
-            .insert(
-                &key(7, 1),
-                Entry::new(loc(1, 0, 100), Lsn(1)),
-                &segments,
-                None,
-            )
+            .insert(&key(7, 1), Entry::new(loc(1, 0, 100), Lsn(1)), &segments)
             .took_place();
 
         index.remove_range(&7u16.to_be_bytes(), None, Lsn(9));
@@ -4894,20 +4331,10 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
         index
-            .insert(
-                &key(7, 1),
-                Entry::new(loc(1, 0, 400), Lsn(1)),
-                &segments,
-                None,
-            )
+            .insert(&key(7, 1), Entry::new(loc(1, 0, 400), Lsn(1)), &segments)
             .took_place();
         index
-            .insert(
-                &key(8, 1),
-                Entry::new(loc(1, 0, 100), Lsn(2)),
-                &segments,
-                None,
-            )
+            .insert(&key(8, 1), Entry::new(loc(1, 0, 100), Lsn(2)), &segments)
             .took_place();
 
         index.remove_range(&7u16.to_be_bytes(), Some(&8u16.to_be_bytes()), Lsn(9));
@@ -4946,12 +4373,7 @@ mod tests {
 
         assert_eq!(index.grave_count(), 1);
         assert!(!index
-            .insert(
-                &key(1, 1),
-                Entry::new(loc(1, 0, 400), Lsn(4)),
-                &segments,
-                None
-            )
+            .insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(4)), &segments,)
             .took_place());
     }
 }

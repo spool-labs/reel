@@ -19,8 +19,6 @@ const WIDE_COLUMNS: ColumnSet = &[ColumnSpec {
     name: "wide",
     key_width: KeyWidth::Variable,
     shard_bytes: 2,
-    inline_max: 0,
-    row_carry: 0,
     purge_mark: None,
     codec: Codec::None,
     map_shape: MapShape::Tree,

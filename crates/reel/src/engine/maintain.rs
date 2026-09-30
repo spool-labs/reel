@@ -481,7 +481,6 @@ impl ReelStore {
         self.page_out_sealed()?;
         self.sweep_covers()?;
         self.prune_tombstones();
-        self.shed_carried();
         self.compact_once()?;
         // After the rewrite, so a run the pass above unlinked whole is never bytes a
         // merge reads. A pass that refuses or fails is one tier of one tick, and the
@@ -573,18 +572,6 @@ impl ReelStore {
             return 0;
         }
         self.index.prune_tombstones(Lsn(floor))
-    }
-
-    /// Shed carried values down to the configured budget, coldest first
-    ///
-    /// Two loads and nothing else while the budget is unset, and one sum while
-    /// it is unmet, so an unarmed volume never pays for the tier's policy.
-    pub fn shed_carried(&self) -> u64 {
-        let budget = self.config.carried_budget.to_bytes();
-        if budget == 0 {
-            return 0;
-        }
-        self.index.shed_carried(budget)
     }
 
     /// Run one bounded compaction pass over the fullest sealed segment

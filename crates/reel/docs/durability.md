@@ -46,7 +46,7 @@ drive and not about surviving the loss of power.
 ## Format stability
 
 Two version numbers are stamped on disk. `FORMAT_VERSION` in
-`format/segment_header.rs` is **4**, written into the header record of every
+`format/segment_header.rs` is **5**, written into the header record of every
 segment. `FORMAT_VERSION` in `index/persisted.rs` is **2**, written into the
 index checkpoint file. A segment whose header names another version is
 quarantined whole rather than walked, and an index checkpoint whose version does

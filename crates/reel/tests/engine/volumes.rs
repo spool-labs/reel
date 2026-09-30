@@ -25,8 +25,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     name: "rows",
     key_width: KeyWidth::Fixed(16),
     shard_bytes: 0,
-    inline_max: 0,
-    row_carry: 0,
     purge_mark: None,
     codec: Codec::None,
     map_shape: MapShape::Tree,

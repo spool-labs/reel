@@ -51,6 +51,7 @@ pub enum ColumnIndex {
     W108(WidthIndex<[u8; 108], Trees<108>>),
 
     /// The widths a column may ask for an open-addressed shard at
+    Open16(WidthIndex<[u8; 16], OpenTables<16>>),
     Open32(WidthIndex<[u8; 32], OpenTables<32>>),
     Open34(WidthIndex<[u8; 34], OpenTables<34>>),
     Open72(WidthIndex<[u8; 72], OpenTables<72>>),
@@ -117,6 +118,7 @@ macro_rules! on_index {
             ColumnIndex::W72($bound) => $body,
             ColumnIndex::W96($bound) => $body,
             ColumnIndex::W108($bound) => $body,
+            ColumnIndex::Open16($bound) => $body,
             ColumnIndex::Open32($bound) => $body,
             ColumnIndex::Open34($bound) => $body,
             ColumnIndex::Open72($bound) => $body,
@@ -178,6 +180,7 @@ impl ColumnIndex {
         };
         if is_open {
             return match width {
+                16 => Ok(ColumnIndex::Open16(WidthIndex::new(spec))),
                 32 => Ok(ColumnIndex::Open32(WidthIndex::new(spec))),
                 34 => Ok(ColumnIndex::Open34(WidthIndex::new(spec))),
                 72 => Ok(ColumnIndex::Open72(WidthIndex::new(spec))),
@@ -3651,13 +3654,13 @@ mod tests {
         };
 
         // The slack a slot holds open grows with the slot, so each width owes its own.
-        for (width, overhead) in [(32u16, 9u64), (34, 9), (72, 14), (108, 20)] {
+        for (width, overhead) in [(16u16, 6u64), (32, 9), (34, 9), (72, 14), (108, 20)] {
             let index = ColumnIndex::new(&open(width), ShardShapes::Declared).expect("an open arm");
             assert_eq!(index.key_width(), width);
             assert_eq!(index.map_shape(), MapShape::Open, "{width} byte keys");
             assert_eq!(index.overhead_per_key(), overhead, "{width} byte keys");
         }
-        for width in [8u16, 16, 48] {
+        for width in [8u16, 20, 48] {
             assert!(
                 ColumnIndex::new(&open(width), ShardShapes::Declared).is_err(),
                 "{width}"

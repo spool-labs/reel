@@ -395,7 +395,9 @@ impl Compactor {
     /// The claim is what stops two passes reading and retiring the same file. A merge
     /// takes one per source and holds them all for the length of its pass.
     pub fn claim(&self, segment: SegmentId) -> Option<PassClaim<'_>> {
-        lock(&self.in_flight).insert(segment).then_some(PassClaim {
+        // a dropped claim relocks in_flight, so the guard ends here and only a won insert builds one
+        let won = lock(&self.in_flight).insert(segment);
+        won.then(|| PassClaim {
             compactor: self,
             segment,
         })
@@ -2793,6 +2795,30 @@ mod tests {
         assert_eq!(running.scrub_rate_mbps(), Some(4));
         assert!(!disabled.is_scrub_enabled());
         assert_eq!(disabled.scrub_rate_mbps(), None);
+    }
+
+    // a second claim on a held segment comes back empty and leaves the lock free
+    #[test]
+    fn second_claim_on_a_held_segment_is_refused() {
+        let compactor = Arc::new(Compactor::new(&settings(), 0, 0));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let claiming = Arc::clone(&compactor);
+        thread::spawn(move || {
+            let first = claiming.claim(SegmentId(7));
+            let second = claiming.claim(SegmentId(7));
+            let taken = (first.is_some(), second.is_some());
+            drop((first, second));
+            let _ = sender.send(taken);
+        });
+        let (first, second) = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the second claim deadlocked on in_flight");
+        assert!(first, "the first claim takes the segment");
+        assert!(!second, "the second claim is refused");
+        assert!(
+            compactor.claim(SegmentId(7)).is_some(),
+            "the first claim released it"
+        );
     }
 
     /// The op an out of space fault is injected at, past the open's own ops

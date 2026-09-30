@@ -9,9 +9,7 @@ use std::borrow::Cow;
 
 use crate::error::{ReelError, Result};
 use crate::format::block::block_rows_of;
-use crate::format::column::{
-    carry_bytes, inline_bytes, CarryBytes, ColumnId, RecordKey, INLINE_MAX, ROW_CARRY_MAX,
-};
+use crate::format::column::{ColumnId, RecordKey};
 use crate::format::fence::{fence_bytes, lead_of, top_leads, FENCE_LEAD, FENCE_PAGE_LEADS};
 use crate::format::filter::{Filter, HEADER_LEN as FILTER_HEADER_LEN};
 use crate::format::lsn::Lsn;
@@ -30,29 +28,14 @@ const U64_BYTES: usize = std::mem::size_of::<u64>();
 /// Bytes one packed entry takes past its key
 pub const ENTRY_TAIL_LEN: usize = U64_BYTES + U32_BYTES + U32_BYTES + 1;
 
-/// Bytes a carrying row spends on its own checksum, ahead of the value
-///
-/// A row that names a record is checked by that record, and the block path does not
-/// verify the whole-footer checksum, so a row that answers with its own bytes carries a
-/// checksum of its own and nothing else does.
-pub const ROW_CRC_LEN: usize = U32_BYTES;
-
-/// Bytes a row spends on a carry of this width, checksum included
-pub const fn carry_region(carry: u16) -> usize {
-    match carry {
-        0 => 0,
-        carry => ROW_CRC_LEN + carry as usize,
-    }
-}
-
 /// Bytes one directory row takes: the column, its widths, its rows, and its span
 ///
 /// The span is there because a varying partition's length is not its row count times
 /// anything, and a reader holding only the directory has to step from one to the next.
-pub const DIRECTORY_ROW_LEN: usize = 1 + 2 + 2 + U32_BYTES + U32_BYTES;
+pub const DIRECTORY_ROW_LEN: usize = 1 + 2 + U32_BYTES + U32_BYTES;
 
 /// Where a directory row's span field begins
-const DIRECTORY_SPAN_AT: usize = 1 + 2 + 2 + U32_BYTES;
+const DIRECTORY_SPAN_AT: usize = 1 + 2 + U32_BYTES;
 
 /// The width a partition declares when its rows are not all one width
 ///
@@ -85,38 +68,6 @@ pub struct FooterTally {
     pub dead: u64,
 }
 
-/// The offset a row carrying its own value records, since it names no record
-///
-/// A carried row answers from itself, so it points at nothing, and a zero would read as
-/// the segment header record.
-pub const NO_RECORD: u32 = u32::MAX;
-
-/// The carried bytes of a packed row, once its checksum has answered for them
-///
-/// The row's own four checksum bytes are zeroed and the rest recomputed, so a flipped
-/// bit anywhere in the key, the tail or the value is caught here rather than served.
-pub fn verify_row(row: &[u8], key_width: usize, carry: u16) -> Result<Option<&[u8]>> {
-    if carry == 0 {
-        return Ok(None);
-    }
-    let crc_at = key_width + ENTRY_TAIL_LEN;
-    let held_at = crc_at + ROW_CRC_LEN;
-    let held = row
-        .get(held_at..held_at + carry as usize)
-        .ok_or_else(|| ReelError::Corruption("footer row is short of its value".to_string()))?;
-    let stored = read_u32_le(&row[crc_at..held_at]);
-    let mut scratch = Vec::with_capacity(row.len());
-    scratch.extend_from_slice(&row[..crc_at]);
-    scratch.extend_from_slice(&0u32.to_le_bytes());
-    scratch.extend_from_slice(held);
-    if checksum(&scratch) != stored {
-        return Err(ReelError::Corruption(
-            "a footer row carrying its value fails its own checksum".to_string(),
-        ));
-    }
-    Ok(Some(held))
-}
-
 /// One sealed record's index entry, as packed in a segment footer
 ///
 /// A point tombstone carries a zero length, a data entry its payload length, and a range
@@ -138,12 +89,6 @@ pub struct FooterEntry {
 
     /// The record's own flags, which say which kind of record it is
     pub flags: Flags,
-
-    /// Bytes the column reserves per row for a value it carries here
-    pub inline_width: u16,
-
-    /// The value itself up to the length above, absent where the row carries none
-    pub inline: Option<CarryBytes>,
 }
 
 /// What one sealed segment says about a key, the filter consulted first
@@ -176,26 +121,11 @@ pub struct FooterRow {
 
     /// The record's own flags, which say which kind of record it is
     pub flags: Flags,
-
-    /// Bytes the column reserves per row for a value it carries here
-    inline_width: u16,
-
-    /// The value itself, meaningful up to the length above
-    inline: [u8; INLINE_MAX],
 }
 
 impl FooterRow {
-    /// Decode one packed row, value and all, for a reader holding only that row
-    pub fn from_packed(row: &[u8], width: usize, inline_width: u16) -> Result<FooterRow> {
-        let found = FooterRow::read(row, width)?;
-        let inline_at = width + ENTRY_TAIL_LEN;
-        let inline = row
-            .get(inline_at..inline_at + inline_width as usize)
-            .ok_or_else(|| ReelError::Corruption("footer row is short of its value".to_string()))?;
-        Ok(found.with_inline(inline_width, inline))
-    }
-
-    fn read(row: &[u8], width: usize) -> Result<FooterRow> {
+    /// Decode one packed row, for a reader holding only that row
+    pub fn read(row: &[u8], width: usize) -> Result<FooterRow> {
         let offset_at = width + U64_BYTES;
         let len_at = offset_at + U32_BYTES;
         let flags_at = len_at + U32_BYTES;
@@ -204,50 +134,7 @@ impl FooterRow {
             offset: read_u32_le(&row[offset_at..len_at]),
             len: read_u32_le(&row[len_at..flags_at]),
             flags: Flags::from_bits(row[flags_at])?,
-            inline_width: 0,
-            inline: [0u8; INLINE_MAX],
         })
-    }
-
-    /// The same row carrying the value its column keeps beside it
-    fn with_inline(self, inline_width: u16, inline: &[u8]) -> FooterRow {
-        FooterRow {
-            inline_width,
-            inline: inline_bytes(inline),
-            ..self
-        }
-    }
-
-    /// Whether this row is the only place its value lives
-    ///
-    /// There is no record to fall back to, so the read path answers such a row from its
-    /// carry or reports corruption.
-    pub fn stands_alone(&self) -> bool {
-        self.offset == NO_RECORD
-    }
-
-    /// The value this row carries, when the column asked for one and it fits
-    ///
-    /// A row may carry more than this struct holds, so a wider value reads as none and
-    /// the caller goes to the record.
-    pub fn inlined(&self) -> Option<&[u8]> {
-        let len = self.len as usize;
-        if !self.flags.is_data()
-            || self.inline_width == 0
-            || len > self.inline_width as usize
-            || len > INLINE_MAX
-        {
-            return None;
-        }
-        Some(&self.inline[..len])
-    }
-
-    /// Whether this row holds the value itself, whatever its length
-    ///
-    /// A carried value can be zero bytes long, so an empty answer cannot be the way a
-    /// caller learns there was none.
-    pub fn carries(&self) -> bool {
-        self.flags.is_data() && self.inline_width > 0 && self.len <= u32::from(self.inline_width)
     }
 
     /// The same row filed under its key, for a caller that wants one
@@ -275,66 +162,24 @@ impl FooterEntry {
             offset,
             len,
             flags,
-            inline_width: 0,
-            inline: None,
         }
     }
 
     /// An entry for a record if the footer lists its kind, else nothing
     ///
-    /// Data records and both kinds of tombstone are listed; pads and segment headers are
-    /// not. A payload short enough for the column's ceiling is copied into the row, and
-    /// everything else is only pointed at.
-    pub fn from_record(
-        header: &RecordHeader,
-        offset: u32,
-        payload: &[u8],
-        inline_width: u16,
-    ) -> Option<FooterEntry> {
+    /// Data records and both kinds of tombstone are listed, pads and segment headers
+    /// are not.
+    pub fn from_record(header: &RecordHeader, offset: u32) -> Option<FooterEntry> {
         if !is_listed(header.flags) {
             return None;
         }
-        let mut entry = FooterEntry::new(
+        Some(FooterEntry::new(
             header.key.clone(),
             header.lsn,
             offset,
             header.length,
             header.flags,
-        );
-        entry.inline_width = inline_width.min(ROW_CARRY_MAX as u16);
-        if header.flags.is_data() && header.length <= u32::from(entry.inline_width) {
-            entry.inline = Some(carry_bytes(payload, entry.inline_width));
-        }
-        Some(entry)
-    }
-
-    /// The value this row carries, when the column asked for one and it fits
-    pub fn inlined(&self) -> Option<&[u8]> {
-        let len = self.len as usize;
-        if !self.flags.is_data() || self.inline_width == 0 || len > self.inline_width as usize {
-            return None;
-        }
-        self.inline.as_deref().and_then(|carry| carry.get(..len))
-    }
-
-    /// An entry for a value the caller is keeping in the row and nowhere else
-    ///
-    /// No record is written for it, so the offset is the sentinel and the carry holds the
-    /// value. Refused for a value the row cannot hold, which would lose it.
-    pub fn standing_alone(
-        key: RecordKey,
-        lsn: Lsn,
-        flags: Flags,
-        carry: u16,
-        value: &[u8],
-    ) -> Option<FooterEntry> {
-        if !flags.is_data() || carry == 0 || value.len() > carry as usize {
-            return None;
-        }
-        let mut entry = FooterEntry::new(key, lsn, NO_RECORD, value.len() as u32, flags);
-        entry.inline_width = carry;
-        entry.inline = Some(carry_bytes(value, carry));
-        Some(entry)
+        ))
     }
 
     /// Whether this entry marks a delete of one key rather than a payload
@@ -366,9 +211,6 @@ pub struct FooterPartition {
     /// Key width every row in the partition strides by, or the varying sentinel
     pub key_width: u16,
 
-    /// Bytes each row reserves for the value the column carries here, zero for none
-    pub inline_width: u16,
-
     /// The rows themselves, in the shape they are written in
     packed: Vec<u8>,
 
@@ -381,11 +223,10 @@ pub struct FooterPartition {
 
 impl FooterPartition {
     /// An empty partition for one column at its key width
-    pub fn new(column: ColumnId, key_width: u16, inline_width: u16) -> FooterPartition {
+    pub fn new(column: ColumnId, key_width: u16) -> FooterPartition {
         FooterPartition {
             column,
             key_width,
-            inline_width,
             packed: Vec::new(),
             starts: Vec::new(),
             filter: None,
@@ -431,15 +272,11 @@ impl FooterPartition {
     }
 
     /// One key against this partition, the filter asked before any search
-    ///
-    /// A caller wanting the value the row carries passes a buffer for it, which is filled
-    /// from the packed rows while they are in hand; nothing is copied for a caller that
-    /// passes none.
-    pub fn lookup(&self, key: &[u8], carry: Option<&mut Vec<u8>>) -> Result<FooterFind> {
+    pub fn lookup(&self, key: &[u8]) -> Result<FooterFind> {
         if !self.may_hold(key) {
             return Ok(FooterFind::RuledOut);
         }
-        match self.find_row(key, carry) {
+        match self.find_row(key) {
             None => Ok(FooterFind::Missing),
             Some(row) => Ok(FooterFind::Found(row?)),
         }
@@ -466,7 +303,7 @@ impl FooterPartition {
     /// which is the door every reader goes through whatever the shape.
     pub fn stride(&self) -> usize {
         debug_assert!(!self.is_varying(), "a varying partition has no stride");
-        self.key_width as usize + ENTRY_TAIL_LEN + carry_region(self.inline_width)
+        self.key_width as usize + ENTRY_TAIL_LEN
     }
 
     /// The widest key any row in this partition opens with
@@ -488,7 +325,7 @@ impl FooterPartition {
     /// The read side cuts its blocks by the same arithmetic off the directory row, both
     /// through one function: a fence built at a different cut names the wrong block.
     pub fn block_rows(&self) -> usize {
-        block_rows_of(self.key_width, self.inline_width)
+        block_rows_of(self.key_width)
     }
 
     /// Blocks this partition's rows divide into on disk
@@ -506,26 +343,17 @@ impl FooterPartition {
 
     /// Whether the records these rows name sit in the order the rows are in
     ///
-    /// Which is what makes a segment a sorted run. Rows that stand alone name no record
-    /// and are passed over, since the sentinel among real offsets reads as unsorted.
+    /// Which is what makes a segment a sorted run.
     pub fn is_sorted_run(&self) -> bool {
         let mut behind = 0u32;
         for at in 0..self.len() {
             let offset = self.offset_at(at);
-            if offset == NO_RECORD {
-                continue;
-            }
             if offset < behind {
                 return false;
             }
             behind = offset;
         }
         true
-    }
-
-    /// Bytes past the key that every row carries, whatever its key width
-    fn row_tail(&self) -> usize {
-        ENTRY_TAIL_LEN + carry_region(self.inline_width)
     }
 
     /// Where one row begins and ends within the packed rows
@@ -543,14 +371,14 @@ impl FooterPartition {
 
     /// The key width one row was written at
     ///
-    /// Derived from the row's own length rather than stored: the tail and the inline
-    /// value are one size on every row, so whatever the row holds past them is its key.
+    /// Derived from the row's own length rather than stored: the tail is one size on
+    /// every row, so whatever the row holds past it is its key.
     fn key_len(&self, index: usize) -> Option<usize> {
         if !self.is_varying() {
             return Some(self.key_width as usize);
         }
         let (start, end) = self.row_span(index)?;
-        (end - start).checked_sub(self.row_tail())
+        (end - start).checked_sub(ENTRY_TAIL_LEN)
     }
 
     /// Rows the partition holds
@@ -571,55 +399,13 @@ impl FooterPartition {
     /// A strided partition takes rows keyed at its width. A varying one records where the
     /// row started, and that start is the only thing separating this row from the next.
     pub fn push(&mut self, entry: &FooterEntry) {
-        let began = self.packed.len();
         self.packed.extend_from_slice(entry.key.as_slice());
         self.packed.extend_from_slice(&entry.lsn.pack());
         self.packed.extend_from_slice(&entry.offset.to_le_bytes());
         self.packed.extend_from_slice(&entry.len.to_le_bytes());
         self.packed.push(entry.flags.bits());
-        if self.inline_width > 0 {
-            // Over the whole row with its own four bytes left zero, the same rule the
-            // record header follows, so a reader of either can zero the field and redo it.
-            let crc_at = self.packed.len();
-            self.packed.extend_from_slice(&0u32.to_le_bytes());
-            // The region is the column's declared width whatever the entry carries, so a
-            // row carrying nothing or less than the width is padded out to it.
-            let held = entry.inline.as_deref().unwrap_or(&[]);
-            let width = self.inline_width as usize;
-            let taken = held.len().min(width);
-            self.packed.extend_from_slice(&held[..taken]);
-            self.packed.resize(self.packed.len() + width - taken, 0);
-            let crc = checksum(&self.packed[began..]);
-            self.packed[crc_at..crc_at + ROW_CRC_LEN].copy_from_slice(&crc.to_le_bytes());
-        }
         if self.is_varying() {
             self.starts.push(self.packed.len() as u32);
-        }
-    }
-
-    /// The value a row carries, checked against the checksum the row carries with it
-    ///
-    /// The one door to a carried value, so no reader can take the bytes without the
-    /// check. A failed checksum is reported rather than served, since a carried value
-    /// has no record to fall back to.
-    pub fn carried_at(&self, index: usize) -> Result<Option<&[u8]>> {
-        if self.inline_width == 0 {
-            return Ok(None);
-        }
-        let (start, end) = self
-            .row_span(index)
-            .ok_or_else(|| ReelError::Corruption("footer row is out of range".to_string()))?;
-        let row = &self.packed[start..end];
-        let width = self.key_len(index).unwrap_or(0);
-        let Some(held) = verify_row(row, width, self.inline_width)? else {
-            return Ok(None);
-        };
-        // The region is the column's declared width and the value is the record's own
-        // length, so the cut happens after the checksum, which covers the whole region.
-        let found = FooterRow::read(row, width)?;
-        match found.flags.is_data() && found.len <= u32::from(self.inline_width) {
-            true => Ok(held.get(..found.len as usize)),
-            false => Ok(None),
         }
     }
 
@@ -631,15 +417,7 @@ impl FooterPartition {
         let row = self.row_bytes(index)?;
         let key = RecordKey::from_bytes(self.column, &row[..width])
             .map_err(|error| ReelError::Corruption(error.to_string()))?;
-        let mut entry = FooterRow::read(row, width)?.into_entry(key);
-        entry.inline_width = self.inline_width;
-        // Checked whatever the row is, but kept only where the row really carries a
-        // value, so an entry read back matches the one that was pushed.
-        let held = verify_row(row, width, self.inline_width)?;
-        if entry.flags.is_data() && entry.len <= u32::from(self.inline_width) {
-            entry.inline = held.map(CarryBytes::from);
-        }
-        Ok(entry)
+        Ok(FooterRow::read(row, width)?.into_entry(key))
     }
 
     /// Every row in the order the partition holds them
@@ -715,26 +493,9 @@ impl FooterPartition {
     }
 
     /// What the newest row for a key says, without rebuilding the key to say it
-    pub fn find_row(&self, key: &[u8], carry: Option<&mut Vec<u8>>) -> Option<Result<FooterRow>> {
+    pub fn find_row(&self, key: &[u8]) -> Option<Result<FooterRow>> {
         let at = self.locate(key)?;
-        Some(self.row_at(at).and_then(|row| {
-            let width = self
-                .key_len(at)
-                .ok_or_else(|| ReelError::Corruption("footer row is out of range".to_string()))?;
-            let bytes = self.row_bytes(at)?;
-            let held = match verify_row(bytes, width, self.inline_width)? {
-                Some(held) => held,
-                None => &[][..],
-            };
-            let row = row.with_inline(self.inline_width, held);
-            if let Some(into) = carry {
-                into.clear();
-                if row.carries() {
-                    into.extend_from_slice(&held[..row.len as usize]);
-                }
-            }
-            Ok(row)
-        }))
+        Some(self.row_at(at))
     }
 
     /// The first and last row sharing the key at a position
@@ -949,7 +710,7 @@ impl SegmentFooter {
             Ok(at) => at,
             Err(at) => {
                 self.partitions
-                    .insert(at, FooterPartition::new(column, width, entry.inline_width));
+                    .insert(at, FooterPartition::new(column, width));
                 at
             }
         };
@@ -1275,7 +1036,6 @@ fn encoded_partition_rows(partition: &FooterPartition) -> Result<Cow<'_, [u8]>> 
 fn write_directory_row(buf: &mut Vec<u8>, partition: &FooterPartition, span: usize) {
     buf.push(partition.column.as_u8());
     buf.extend_from_slice(&partition.key_width.to_le_bytes());
-    buf.extend_from_slice(&partition.inline_width.to_le_bytes());
     buf.extend_from_slice(&(partition.len() as u32).to_le_bytes());
     buf.extend_from_slice(&(span as u32).to_le_bytes());
 }
@@ -1305,16 +1065,10 @@ fn read_partitions(
             ));
         }
         let key_width = u16::from_le_bytes([row[1], row[2]]);
-        let inline_width = u16::from_le_bytes([row[3], row[4]]);
-        if inline_width as usize > ROW_CARRY_MAX {
-            return Err(ReelError::Corruption(
-                "footer partition claims more carried bytes than a row holds".to_string(),
-            ));
-        }
-        let count = read_u32_le(&row[5..DIRECTORY_SPAN_AT]) as usize;
+        let count = read_u32_le(&row[3..DIRECTORY_SPAN_AT]) as usize;
         let listed_span = read_u32_le(&row[DIRECTORY_SPAN_AT..DIRECTORY_ROW_LEN]) as usize;
 
-        let mut partition = FooterPartition::new(column, key_width, inline_width);
+        let mut partition = FooterPartition::new(column, key_width);
         if partition.is_varying() {
             // The varying rows land prefix compressed, so the parse rebuilds the
             // whole-row form every in-memory reader searches.
@@ -1327,7 +1081,7 @@ fn read_partitions(
                     "footer partition holds a row count its directory row denies".to_string(),
                 ));
             }
-            let (packed, starts) = rows.unpacked(partition.row_tail())?;
+            let (packed, starts) = rows.unpacked(ENTRY_TAIL_LEN)?;
             partition.packed = packed;
             partition.starts = starts;
             rows_at += listed_span;
@@ -1426,19 +1180,12 @@ pub fn partition_spans(
         let row = directory
             .get(start..start + DIRECTORY_ROW_LEN)
             .ok_or_else(|| ReelError::Corruption("footer directory is truncated".to_string()))?;
-        let inline_width = u16::from_le_bytes([row[3], row[4]]);
-        if inline_width as usize > ROW_CARRY_MAX {
-            return Err(ReelError::Corruption(
-                "footer partition claims more carried bytes than a row holds".to_string(),
-            ));
-        }
         let key_width = u16::from_le_bytes([row[1], row[2]]);
-        let rows = read_u32_le(&row[5..DIRECTORY_SPAN_AT]) as usize;
+        let rows = read_u32_le(&row[3..DIRECTORY_SPAN_AT]) as usize;
         let encoded = read_u32_le(&row[DIRECTORY_SPAN_AT..DIRECTORY_ROW_LEN]) as u64;
         let span = crate::format::block::PartitionSpan {
             column: ColumnId(row[0]),
             key_width,
-            inline_width,
             rows,
             at,
             encoded,
@@ -1508,7 +1255,7 @@ mod tests {
     fn an_entry_stays_in_its_size_class() {
         assert_eq!(
             std::mem::size_of::<FooterEntry>(),
-            96,
+            80,
             "a footer entry changed size; a resumed tail holds one per row",
         );
     }
@@ -1559,129 +1306,6 @@ mod tests {
         let mut footer = SegmentFooter::build(rows);
         let _ = footer.pack(0);
         footer.partitions.remove(0)
-    }
-
-    // a row carries a value past what an index entry holds, and reads it back
-    #[test]
-    fn a_row_carries_more_than_an_entry() {
-        const CARRY: u16 = 200;
-        let value = vec![0x5Au8; 165];
-        let key = RecordKey::from_bytes(RECORD, &[7u8; 34]).expect("key");
-        let mut partition = FooterPartition::new(RECORD, 34, CARRY);
-
-        let mut entry =
-            FooterEntry::new(key.clone(), Lsn(9), 4096, value.len() as u32, Flags::DATA);
-        entry.inline_width = CARRY;
-        entry.inline = Some(carry_bytes(&value, CARRY));
-        partition.push(&entry);
-
-        // The stride is the key, the fixed tail, and a carry region that is the
-        // row's own checksum ahead of the value.
-        assert_eq!(
-            partition.stride(),
-            34 + ENTRY_TAIL_LEN + ROW_CRC_LEN + CARRY as usize
-        );
-
-        let read = partition.entry_at(0).expect("row");
-        assert_eq!(read.key, key);
-        assert_eq!(read.lsn, Lsn(9));
-        assert_eq!(
-            read.inlined(),
-            Some(value.as_slice()),
-            "the row holds the whole value"
-        );
-
-        let row = partition.row_at(0).expect("row");
-        assert_eq!(
-            row.inlined(),
-            None,
-            "a value wider than an entry reads as none"
-        );
-    }
-
-    // a row can be the only place a value lives, and says so
-    #[test]
-    fn a_row_can_stand_alone() {
-        const CARRY: u16 = 200;
-        let value = vec![0x5Au8; 165];
-        let key = RecordKey::from_bytes(RECORD, &[7u8; 34]).expect("key");
-        let entry = FooterEntry::standing_alone(key.clone(), Lsn(9), Flags::DATA, CARRY, &value)
-            .expect("a value the row can hold");
-
-        let mut partition = FooterPartition::new(RECORD, 34, CARRY);
-        partition.push(&entry);
-
-        let row = partition
-            .find_row(&[7u8; 34], None)
-            .expect("found")
-            .expect("row");
-        assert!(row.stands_alone(), "the row says it is the only copy");
-        assert!(row.carries(), "and it carries the value");
-        assert_eq!(
-            partition.carried_at(0).expect("checked"),
-            Some(value.as_slice())
-        );
-
-        // The whole footer round trips, so a sealed segment can hold rows like this.
-        let mut footer = SegmentFooter::empty();
-        footer.push(&entry);
-        let packed = footer.pack(0).expect("pack");
-        let parsed = SegmentFooter::parse(&packed).expect("parse");
-        let back = parsed.partitions[0]
-            .find_row(&[7u8; 34], None)
-            .expect("found")
-            .expect("row");
-        assert!(back.stands_alone());
-        assert_eq!(
-            parsed.partitions[0].carried_at(0).expect("checked"),
-            Some(value.as_slice())
-        );
-    }
-
-    // a value the row cannot hold is refused rather than losing its record
-    #[test]
-    fn a_value_past_the_carry_cannot_stand_alone() {
-        let key = RecordKey::from_bytes(RECORD, &[7u8; 34]).expect("key");
-        assert!(
-            FooterEntry::standing_alone(key.clone(), Lsn(1), Flags::DATA, 200, &[0u8; 201])
-                .is_none(),
-            "dropping the record for a value the row cannot hold would lose it"
-        );
-        assert!(
-            FooterEntry::standing_alone(key, Lsn(1), Flags::DATA, 0, &[0u8; 4]).is_none(),
-            "a column that carries nothing has no row to stand on"
-        );
-    }
-
-    // a carried value whose bytes rotted is refused, since no record stands behind it
-    #[test]
-    fn a_rotted_carry_is_refused() {
-        const CARRY: u16 = 200;
-        let value = vec![0x5Au8; 165];
-        let key = RecordKey::from_bytes(RECORD, &[7u8; 34]).expect("key");
-        let mut partition = FooterPartition::new(RECORD, 34, CARRY);
-        let mut entry = FooterEntry::new(key, Lsn(9), 4096, value.len() as u32, Flags::DATA);
-        entry.inline_width = CARRY;
-        entry.inline = Some(carry_bytes(&value, CARRY));
-        partition.push(&entry);
-
-        assert!(
-            partition.carried_at(0).expect("checked").is_some(),
-            "whole to begin with"
-        );
-
-        let at = 34 + ENTRY_TAIL_LEN + ROW_CRC_LEN + 3;
-        partition.packed[at] ^= 0xff;
-
-        assert!(
-            partition.carried_at(0).is_err(),
-            "a rotted carry is corruption"
-        );
-        assert!(partition
-            .find_row(&[7u8; 34], None)
-            .expect("found")
-            .is_err());
-        assert!(partition.entry_at(0).is_err());
     }
 
     /// Rows enough to fill several blocks, in the order a fresh segment writes them
@@ -2208,7 +1832,7 @@ mod tests {
 
         let mut footer = SegmentFooter::empty();
         for (header, offset) in records {
-            if let Some(entry) = FooterEntry::from_record(&header, offset, &[], 0) {
+            if let Some(entry) = FooterEntry::from_record(&header, offset) {
                 footer.push(&entry);
             }
         }

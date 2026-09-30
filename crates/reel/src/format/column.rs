@@ -29,49 +29,6 @@ pub const INLINE_KEY_LEN: usize = 108;
 /// in place: a walk builds one key per row it steps, and this is what each weighs.
 pub const SHORT_KEY_LEN: usize = 40;
 
-/// Bytes of a value a decoded footer row keeps, and the floor of the resident side map
-///
-/// The index entry holds no value bytes. A column's `inline_max` has to pass this
-/// before the resident index keeps any value beside its entries, and it keeps only
-/// values longer than this.
-pub const INLINE_MAX: usize = 4;
-
-/// Widest value a sealed row carries beside its key
-///
-/// Unlike the resident side map, which the resident index pays for per key it
-/// keeps, a row is read a block at a time and only the reader who wanted that
-/// block pays for what it holds.
-pub const ROW_CARRY_MAX: usize = 256;
-
-/// What a sealed row carries of a value, for a column that asked to carry one
-///
-/// On the heap and only where a row really carries something: most columns carry
-/// nothing, and an inline array would cost its full width on every entry built.
-pub type CarryBytes = Box<[u8]>;
-
-/// The leading bytes of a payload, padded out to the width the row reserves
-pub fn carry_bytes(payload: &[u8], width: u16) -> CarryBytes {
-    let width = (width as usize).min(ROW_CARRY_MAX);
-    let mut carry = vec![0u8; width];
-    let taken = payload.len().min(width);
-    carry[..taken].copy_from_slice(&payload[..taken]);
-    carry.into_boxed_slice()
-}
-
-/// The leading bytes of a value, as many as a decoded footer row keeps
-pub type InlineBytes = [u8; INLINE_MAX];
-
-/// The leading bytes of a payload, as far as one of those will hold
-///
-/// Bytes past a record's own length are never read back, so a caller hands over
-/// whatever it has without measuring it first.
-pub fn inline_bytes(payload: &[u8]) -> InlineBytes {
-    let mut inline = [0u8; INLINE_MAX];
-    let taken = payload.len().min(INLINE_MAX);
-    inline[..taken].copy_from_slice(&payload[..taken]);
-    inline
-}
-
 /// How a stored payload was encoded, stamped into the record header
 ///
 /// Zero is raw bytes and a nonzero byte names the codec that produced the stored
@@ -383,12 +340,6 @@ pub struct ColumnSpec {
     /// Leading key bytes that select the index shard a key lives in
     pub shard_bytes: u8,
 
-    /// Longest value the resident index keeps beside its entry, which takes only values past INLINE_MAX
-    pub inline_max: u16,
-
-    /// Bytes a sealed row carries of this column's values, zero to carry none
-    pub row_carry: u16,
-
     /// Where a key says the record dies, and whether the write is placed by it too
     pub purge_mark: Option<PurgeMark>,
 
@@ -469,13 +420,6 @@ impl ColumnSpec {
     }
 }
 
-impl ColumnSpec {
-    /// Bytes this column's sealed rows carry of a value
-    pub const fn row_carry_width(&self) -> u16 {
-        self.row_carry
-    }
-}
-
 pub type ColumnSet = &'static [ColumnSpec];
 
 /// Resolve a column family name to its declaration
@@ -498,8 +442,6 @@ mod tests {
             name: "record",
             key_width: KeyWidth::Fixed(34),
             shard_bytes: 2,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
             map_shape: MapShape::Tree,
@@ -509,8 +451,6 @@ mod tests {
             name: "blob",
             key_width: KeyWidth::Fixed(32),
             shard_bytes: 0,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
             map_shape: MapShape::Tree,
@@ -620,8 +560,6 @@ mod tests {
             name: "record",
             key_width: KeyWidth::Fixed(10),
             shard_bytes: 0,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
             map_shape: MapShape::Tree,

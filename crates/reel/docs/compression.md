@@ -48,15 +48,11 @@ Compression happens at admission, before the record is framed, on the
 caller's thread, through the payload pool in both directions. The tails
 append opaque bytes exactly as before.
 
-The column declares its codec in the column spec, beside the key width and
-the inline ceiling. A declared codec is an attempt, not a promise: a payload
+The column declares its codec in the column spec, beside the key width. A declared codec is an attempt, not a promise: a payload
 the codec cannot shrink by at least an eighth is stored raw with the byte at
 zero, so the read side has one rule per record rather than a column rule with
 exceptions. Payloads under `MIN_ATTEMPT`, 256 bytes, skip the attempt
-entirely. And a payload that would land at or under the column's inline
-ceiling is stored raw whatever the codec says, because the inlined bytes in
-an index entry and a footer row are payload bytes, and a codec would change
-what they mean. That rule is load-bearing and the module doc says so.
+entirely.
 
 One honest limit. The reel compresses a record at a time, so it can never
 find redundancy between records the way a block-compressed store does when

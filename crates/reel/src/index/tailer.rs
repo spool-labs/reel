@@ -238,9 +238,7 @@ fn apply_one(index: &ReelIndex, cursor: &mut LogCursor, record: &WalkedRecord) -
         return Ok(true);
     }
 
-    // The replay holds headers rather than payloads, so a carrying column starts
-    // cold here and warms on its first read.
-    index.insert(&record.key, record.loc, record.lsn, None)
+    index.insert(&record.key, record.loc, record.lsn)
 }
 
 #[cfg(test)]
@@ -260,8 +258,6 @@ mod tests {
         name: "records",
         key_width: KeyWidth::Fixed(8),
         shard_bytes: 1,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,

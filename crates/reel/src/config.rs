@@ -442,10 +442,6 @@ pub struct ReelConfig {
     /// Whether an awaited whole-record read asks the page cache before it queues
     pub point_reads: PointReads,
 
-    /// Byte budget for the values the index carries beside its entries, zero for all-resident
-    #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_bytes"))]
-    pub carried_budget: ByteCount,
-
     /// Append tails the volume runs, which is how many files it appends into
     #[cfg_attr(
         feature = "serde",
@@ -507,7 +503,6 @@ impl Default for ReelConfig {
             merge_sorted_runs: false,
             merge_dead_ratio: DEFAULT_MERGE_DEAD_RATIO,
             point_reads: PointReads::Queued,
-            carried_budget: ByteCount::from_bytes(0),
             footer_cache: ByteCount::mb(DEFAULT_FOOTER_CACHE_MIB),
             active_tails: ThreadBudget::Auto,
             volumes: Vec::new(),

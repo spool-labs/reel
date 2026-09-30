@@ -38,8 +38,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     name: "records",
     key_width: KeyWidth::Fixed(RECORD_KEY_LEN as u16),
     shard_bytes: GROUP_PREFIX_LEN as u8,
-    inline_max: 0,
-    row_carry: 0,
     purge_mark: None,
     codec: Codec::None,
     map_shape: MapShape::Tree,

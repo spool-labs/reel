@@ -33,8 +33,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     name: "accounts",
     key_width: KeyWidth::Fixed(32),
     shard_bytes: 0,
-    inline_max: 0,
-    row_carry: 0,
     purge_mark: None,
     codec: Codec::None,
     map_shape: MapShape::Tree,
@@ -99,7 +97,7 @@ fn filled() -> ReelIndex {
         ReelIndex::new(COLUMNS, IndexResidency::Resident, ShardShapes::Tree).expect("index");
     for at in 0..KEYS {
         index
-            .insert(&key(at), source(at), Lsn(at + 1), None)
+            .insert(&key(at), source(at), Lsn(at + 1))
             .expect("insert");
     }
     index
@@ -286,7 +284,6 @@ pub fn hold_by_batch_size() {
                     key: key.as_slice(),
                     loc: *loc,
                     lsn: Lsn(issued + slot as u64 + 1),
-                    carried: None,
                     is_delete: false,
                 })
                 .collect();

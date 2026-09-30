@@ -18,7 +18,7 @@ rather than a measured cell.
   gates for compaction and the scrub.
 - `engine/maintain.rs::maintain_once`, one tick: retry failed seals, publish the
   footprint, page sealed keys into their footers, sweep covers, prune the graves
-  nothing older can reach, shed carried rows, one compaction pass, one merge when due,
+  nothing older can reach, one compaction pass, one merge when due,
   one scrub pass. Each is bounded and paced, so the caller drives this on a timer.
 
 Dead bytes are tracked per segment as `SegmentBytes`, moved live to dead when a
@@ -157,7 +157,7 @@ from config at provisioning.
 |---|---|---|
 | `compact_mbps` | `auto`, unpaced | background MB/s and read p99, both on the curve above (ccx33, 2026-08-16). Charged reads plus copies |
 | `compact_dead_ratio` | `0.50` | eligibility, not choice: selection rewrites 0.84 to 0.91 dead segments whatever the bar (sim). Escalation lowers it to 0.20 under debt |
-| `merge_dead_ratio` | `0.50` | leave it alone. A merge pass whose rows carry mints one output segment that never rolls (64-thread EPYC, 2026-08); `config.md` carries the run |
+| `merge_dead_ratio` | `0.50` | leave it alone. The two dead ratios compose badly at their defaults, `config.md` has the run |
 | `scrub_mbps` | `64`, clamped to `compact_mbps` unless that is unpaced | the lap length, nothing else. An integrity sweep cannot outbid space reclamation |
 
 ## Reclaiming without copying

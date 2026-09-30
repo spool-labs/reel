@@ -318,52 +318,6 @@ fn fenced_paged_leads() {
     }
 }
 
-// a volume whose sealed rows carry their values serves what a resident one serves
-#[test]
-#[cfg(not(miri))]
-fn carrying_paged_single_tail() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open_carrying(*seed, paged_config(1));
-        fixture.run_stream(&op_stream::generate(*seed, PAGED_STREAM_LEN));
-        fixture.assert_paged_out();
-    }
-}
-
-// the same at four tails, where a key can seal in one and be rewritten in another
-#[test]
-#[cfg(not(miri))]
-fn carrying_paged_multi_tail() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open_carrying(*seed, paged_config(4));
-        fixture.run_stream(&op_stream::generate(*seed, PAGED_STREAM_LEN));
-        fixture.assert_paged_out();
-    }
-}
-
-// a volume that lists its rows and deletes the records serves what a resident one does
-#[test]
-#[cfg(not(miri))]
-fn carrying_rewritten_single_tail() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open_carrying(*seed, rewriting_config(1));
-        fixture.run_stream(&op_stream::generate(*seed, PAGED_STREAM_LEN));
-        fixture.assert_paged_out();
-        fixture.assert_rows_listed();
-    }
-}
-
-// the same at four tails, where the rewriter's tail is not the one the puts are on
-#[test]
-#[cfg(not(miri))]
-fn carrying_rewritten_multi_tail() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open_carrying(*seed, rewriting_config(4));
-        fixture.run_stream(&op_stream::generate(*seed, PAGED_STREAM_LEN));
-        fixture.assert_paged_out();
-        fixture.assert_rows_listed();
-    }
-}
-
 // a volume whose runs a merge collapses serves what one that never merged serves
 #[test]
 #[cfg(not(miri))]
@@ -407,29 +361,6 @@ fn maintained_merge_multi_tail() {
         let mut fixture = Differential::open_maintained(*seed, maintained_config(4));
         fixture.run_stream(&op_stream::generate(*seed, PAGED_STREAM_LEN));
         fixture.assert_merged_runs();
-    }
-}
-
-// and on a carrying column, where a merged row is the only copy of its value
-#[test]
-#[cfg(not(miri))]
-fn merged_carrying_single_tail() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open_carrying(*seed, merging_config(1));
-        fixture.run_stream(&op_stream::generate(*seed, PAGED_STREAM_LEN));
-        fixture.assert_rows_listed();
-        fixture.assert_merged_runs();
-    }
-}
-
-// and on a hot volume, where a carried row is reached only once its keys age out
-#[test]
-#[cfg(not(miri))]
-fn carrying_hot_single_tail() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open_carrying(*seed, hot_config(1));
-        fixture.run_stream(&op_stream::generate(*seed, PAGED_STREAM_LEN));
-        fixture.assert_paged_out();
     }
 }
 

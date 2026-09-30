@@ -13,8 +13,7 @@ use crate::config::{ReelConfig, RepairPath, VolumeClass};
 use crate::error::Result;
 use crate::format::band::Band;
 use crate::format::column::RecordKey;
-use crate::format::footer::FooterEntry;
-use crate::format::footer::{FooterPartition, SegmentFooter, FIXED_TAIL_LEN, NO_RECORD};
+use crate::format::footer::{FooterPartition, SegmentFooter, FIXED_TAIL_LEN};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{peek_key_width, read_u32_le, RecordHeader, HEADER_LEN};
@@ -48,9 +47,6 @@ enum Rewrote {
     /// A live record was copied, carrying this many footprint bytes
     Copied(u64),
 
-    /// A live value went into a row, and no record was written for it
-    Listed,
-
     /// The record was dead, corrupt, or below the purge floor
     Skipped,
 
@@ -68,9 +64,6 @@ enum Rewrote {
 enum CopyStep {
     /// The record was copied, carrying this many footprint bytes
     Copied(u64),
-
-    /// The value went into a row and no record was written for it
-    Listed,
 
     /// The record was dead or corrupt, so nothing was copied
     Skipped,
@@ -141,9 +134,6 @@ pub struct CompactionCounters {
     /// Records dropped for sitting below the purge floor rather than copied
     pub records_purged: u64,
 
-    /// Values a rewrite put in a row and wrote no record for, costing no copied bytes
-    pub rows_listed: u64,
-
     /// Sorted runs merge passes read together, the only trace a tick-driven merge leaves
     pub runs_merged: u64,
 
@@ -177,7 +167,6 @@ struct Metrics {
     scrub_hits: AtomicU64,
     scrub_bytes: AtomicU64,
     records_purged: AtomicU64,
-    rows_listed: AtomicU64,
     runs_merged: AtomicU64,
     read_bytes: AtomicU64,
 }
@@ -193,7 +182,6 @@ impl Metrics {
             scrub_hits: AtomicU64::new(0),
             scrub_bytes: AtomicU64::new(0),
             records_purged: AtomicU64::new(0),
-            rows_listed: AtomicU64::new(0),
             runs_merged: AtomicU64::new(0),
             read_bytes: AtomicU64::new(0),
         }
@@ -211,7 +199,6 @@ impl Metrics {
             .fetch_add(tally.carried, Ordering::AcqRel);
         self.tombstones_dropped
             .fetch_add(tally.dropped, Ordering::AcqRel);
-        self.rows_listed.fetch_add(tally.listed, Ordering::AcqRel);
         self.read_bytes.fetch_add(read_bytes, Ordering::AcqRel);
     }
 
@@ -241,7 +228,6 @@ impl Metrics {
             scrub_hits: self.scrub_hits.load(Ordering::Acquire),
             scrub_bytes: self.scrub_bytes.load(Ordering::Acquire),
             records_purged: self.records_purged.load(Ordering::Acquire),
-            rows_listed: self.rows_listed.load(Ordering::Acquire),
             runs_merged: self.runs_merged.load(Ordering::Acquire),
             read_bytes: self.read_bytes.load(Ordering::Acquire),
             // the compactor holds the pins, so the gauge is filled by its reader
@@ -269,7 +255,6 @@ enum Staged {
 #[derive(Default)]
 struct PassTally {
     copied_bytes: u64,
-    listed: u64,
     carried: u64,
     dropped: u64,
     had_live: bool,
@@ -807,20 +792,6 @@ impl Compactor {
             ),
         };
 
-        // the source's standing rows come across before the flush, since the scan above
-        // only ever saw records and these have none
-        match self.relist_standing(reel, index, dest_index, segment) {
-            Ok((moved, rot)) => {
-                tally.listed += moved;
-                tally.had_live |= moved > 0;
-                tally.rotted |= rot;
-            }
-            Err(error) => {
-                drop(source);
-                return Err(error);
-            }
-        }
-
         if let Err(error) = reel.tails()[dest_index].flush() {
             drop(source);
             return Err(error);
@@ -856,21 +827,11 @@ impl Compactor {
             return Ok(());
         }
 
-        // The destination is closed before the source is retired, since a listed row is
-        // not on disk until the seal writes it, and the error is propagated because a
-        // seal that fails must leave the source standing. Closing per pass also keeps
-        // one source's records to one destination, so key and offset order agree in it.
+        // Closing per pass keeps one source's records to one destination, so key and
+        // offset order agree in it.
         if tally.had_live {
             if let Some(reserved) = reel.reserved_tail() {
-                let closed = reel.tails()[reserved].seal()?;
-                // A listed row has no index entry, so noting the destination's spans
-                // ahead of the retire closes a window where an acknowledged key exists
-                // nowhere a read looks.
-                if tally.listed > 0 {
-                    if let Some(footer) = shared.footer_of(closed)? {
-                        index.note_spans(closed, &footer)?;
-                    }
-                }
+                reel.tails()[reserved].seal()?;
             }
         }
 
@@ -1056,13 +1017,6 @@ impl Compactor {
                 tally.copied_bytes += span;
                 tally.had_live = true;
             }
-            // A listed row is live work like a copy, so the segment has something to
-            // seal. Its span stays out of the copied bytes, which gauge write
-            // amplification, since a listed value writes no record at all.
-            Rewrote::Listed => {
-                tally.had_live = true;
-                tally.listed += 1;
-            }
             Rewrote::Skipped => {}
             Rewrote::Carried => tally.carried += 1,
             Rewrote::Dropped => tally.dropped += 1,
@@ -1097,7 +1051,6 @@ impl Compactor {
         Ok(
             match self.copy_live(reel, dest_index, index, reader, record, staged, segment)? {
                 CopyStep::Copied(span) => Rewrote::Copied(span),
-                CopyStep::Listed => Rewrote::Listed,
                 CopyStep::Skipped => Rewrote::Skipped,
                 CopyStep::Rotted => Rewrote::Rotted,
             },
@@ -1140,7 +1093,7 @@ impl Compactor {
             for partition in &footer.partitions {
                 for at in 0..partition.len() {
                     let row = partition.row_at(at)?;
-                    if row.stands_alone() || !row.flags.is_data() {
+                    if !row.flags.is_data() {
                         continue;
                     }
                     offsets.push(row.offset);
@@ -1200,122 +1153,6 @@ impl Compactor {
         Ok(report)
     }
 
-    /// A row that can be this value's only home, when everything about it allows one
-    ///
-    /// Every condition here is a way to lose the value rather than a preference: the
-    /// volume and the destination have to allow listing, the record has to be
-    /// uncompressed, the key must be gone from the resident map, and the row itself has
-    /// to be able to hold the value.
-    fn carried_row(
-        &self,
-        reel: &Reel,
-        index: &ReelIndex,
-        dest_index: usize,
-        record: &SourceRecord,
-        payload: &[u8],
-    ) -> Option<FooterEntry> {
-        if !self.may_list(reel, dest_index) {
-            return None;
-        }
-        if record.header.codec != 0 {
-            return None;
-        }
-        // A key still in the resident map names this record from RAM and nothing
-        // repoints it when the row is listed, so the record is copied instead and a
-        // later pass lists it once the key has paged out.
-        if index
-            .column(record.header.key.column)
-            .and_then(|column| column.entry_or_grave(record.header.key.as_slice()))
-            .is_some()
-        {
-            return None;
-        }
-        let carry = index.spec(record.header.key.column)?.row_carry_width();
-        FooterEntry::standing_alone(
-            record.header.key.clone(),
-            record.header.lsn,
-            record.header.flags,
-            carry,
-            payload,
-        )
-    }
-
-    /// Whether this pass may put a value in a row and write no record for it
-    ///
-    /// Both conditions are about who holds the only copy: the volume has to page, since
-    /// a resident entry would keep naming a record about to be unlinked, and the
-    /// destination has to be the tail this pass seals itself.
-    fn may_list(&self, reel: &Reel, dest_index: usize) -> bool {
-        reel.shared().config.index.pages() && reel.reserved_tail() == Some(dest_index)
-    }
-
-    /// Carry a source's standing rows into the destination, since no record holds them
-    ///
-    /// The scan walks records and a listed row has none, so without this a pass over a
-    /// segment holding one would retire it and take the only copy of its value. A row
-    /// the index no longer resolves to is dropped, which is how one is reclaimed.
-    fn relist_standing(
-        &self,
-        reel: &Reel,
-        index: &ReelIndex,
-        dest_index: usize,
-        segment: SegmentId,
-    ) -> Result<(u64, bool)> {
-        if !self.may_list(reel, dest_index) {
-            return Ok((0, false));
-        }
-        let Some(footer) = reel.shared().footer_of(segment)? else {
-            return Ok((0, false));
-        };
-        let mut listed = 0u64;
-        let mut rotted = false;
-        for partition in &footer.partitions {
-            let Some(carry) = index
-                .spec(partition.column)
-                .map(|spec| spec.row_carry_width())
-            else {
-                continue;
-            };
-            for at in 0..partition.len() {
-                let row = partition.row_at(at)?;
-                if !row.stands_alone() {
-                    continue;
-                }
-                let Some(bytes) = partition.key_at(at) else {
-                    continue;
-                };
-                let key = RecordKey::from_bytes(partition.column, bytes)?;
-                let key_of = key.clone();
-                // the row has to still be the version the volume answers with
-                let loc = Loc::new(segment, NO_RECORD, row.len);
-                match index.get(&key)? {
-                    Some(entry) if entry.loc == loc => {}
-                    Some(_) | None => continue,
-                }
-                // a row that will not verify is the sole copy of its value, so its
-                // segment is kept the way a rotted record's is
-                let value = match partition.carried_at(at) {
-                    Ok(Some(value)) => value,
-                    Ok(None) | Err(_) => {
-                        self.metrics.record_hits(1);
-                        rotted = true;
-                        continue;
-                    }
-                };
-                let Some(entry) =
-                    FooterEntry::standing_alone(key, row.lsn, row.flags, carry, value)
-                else {
-                    rotted = true;
-                    continue;
-                };
-                reel.tails()[dest_index].list_carried_row(&entry)?;
-                index.note_listed(&key_of, segment, row.len);
-                listed += 1;
-            }
-        }
-        Ok((listed, rotted))
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn copy_live(
         &self,
@@ -1372,15 +1209,6 @@ impl Compactor {
                 segment.as_u32()
             );
             return Ok(CopyStep::Rotted);
-        }
-
-        // A value the destination's rows can hold goes into a row and nowhere else.
-        // The index is not repointed: the source keeps answering until a paged search
-        // finds the new row, once the destination's spans are noted at its seal.
-        if let Some(entry) = self.carried_row(reel, index, dest_index, record, &payload) {
-            reel.tails()[dest_index].list_carried_row(&entry)?;
-            index.note_listed(&record.header.key, segment, record.header.length);
-            return Ok(CopyStep::Listed);
         }
 
         // the queue owns what it writes and the repoint below needs the key again, so
@@ -1658,10 +1486,6 @@ fn footer_order(footer: &SegmentFooter) -> Option<(Vec<(u32, u32)>, u64)> {
         widest = widest.max(partition.widest_key());
         for row in 0..partition.len() {
             match partition.row_at(row) {
-                // A row that stands alone names no record, and its sentinel offset
-                // sitting in key order among real ones would read as unsorted for
-                // ever, so every destination would re-select itself.
-                Ok(row) if row.stands_alone() => {}
                 Ok(row) => order.push((row.offset, row.len)),
                 Err(_) => return None,
             }
@@ -2097,8 +1921,6 @@ mod tests {
         name: "records",
         key_width: KeyWidth::Fixed(KEY_WIDTH as u16),
         shard_bytes: 2,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -2112,8 +1934,6 @@ mod tests {
         name: "marked",
         key_width: KeyWidth::Fixed(MARKED_WIDTH as u16),
         shard_bytes: 0,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: Some(PurgeMark::at(0)),
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -2193,7 +2013,7 @@ mod tests {
             .expect("put");
         fixture
             .index
-            .insert(&key(byte), committed.loc, committed.lsn, None)
+            .insert(&key(byte), committed.loc, committed.lsn)
             .expect("insert");
     }
 
@@ -2352,7 +2172,7 @@ mod tests {
                 .expect("put");
             fixture
                 .index
-                .insert(&key, committed.loc, committed.lsn, None)
+                .insert(&key, committed.loc, committed.lsn)
                 .expect("insert");
         }
         seal(&fixture);
@@ -3341,7 +3161,7 @@ mod tests {
                     .expect("put");
                 fixture
                     .index
-                    .insert(&key, committed.loc, committed.lsn, None)
+                    .insert(&key, committed.loc, committed.lsn)
                     .expect("insert");
             }
             seal(&fixture);

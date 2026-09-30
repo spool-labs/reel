@@ -9,7 +9,7 @@ An index maps each live key to its segment and offset. It stays in memory or pag
 footers the seals wrote. One process owns a volume for writing. Others can open it read-only and follow.
 
 - Columns are declared by the caller: key width (fixed or variable), sharding, index shape
-  (ordered tree or open table), inline and carried values, lz4, and purge marks.
+  (ordered tree or open table), lz4, and purge marks.
 - Point reads, batched reads, ranged reads, ordered walks, and prefix sweeps. A tree column
   sweeps any prefix in key order. An open column sweeps only its exact shard key.
 - A write batch is one durability point. Every call has a blocking and an awaited form.
@@ -29,8 +29,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     name: BLOCKS,
     key_width: KeyWidth::Fixed(16),
     shard_bytes: 2,
-    inline_max: 0,
-    row_carry: 0,
     purge_mark: None,
     codec: Codec::None,
     map_shape: MapShape::Tree,

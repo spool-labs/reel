@@ -1292,7 +1292,7 @@ impl ReelIndex {
                 let per_key = u64::from(spec.key_width.fixed().unwrap_or(0))
                     + ENTRY_BYTES
                     + index.overhead_per_key();
-                index.resident_keys() * per_key
+                index.resident_keys() * per_key + index.filter_bytes()
             })
             .sum();
         ByteCount::from_bytes(bytes)

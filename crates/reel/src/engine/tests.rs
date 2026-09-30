@@ -1834,6 +1834,46 @@ fn a_slow_scrub_does_not_starve_the_handover() {
     );
 }
 
+// a paged column's filters stay small across scattered keys and count as resident
+#[test]
+fn scattered_keys_leave_the_filters_small_and_counted() {
+    let paged = ReelConfig {
+        index: IndexResidency::Paged,
+        segment_bytes: ByteCount::from_bytes(64 * 1024),
+        ..config(1, SyncPolicy::Never)
+    };
+    let (store, _sim) = sim_store(paged);
+    let payload = vec![0x3cu8; 200];
+    // Four thousand keys land in about as many of the column's 65,536 shards.
+    for at in 0..4_000u32 {
+        store.put(&spread(at), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    store.reel.tails()[0].seal().expect("seal");
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
+    let column = store.index.column(RECORD).expect("column");
+    assert_eq!(column.resident_keys(), 0, "every key went to its footer");
+
+    let filters = column.filter_bytes();
+    assert!(
+        filters <= 1 << 20,
+        "the filters of a column holding nothing take {filters} bytes"
+    );
+    assert!(
+        store.resident_bytes().to_bytes() >= filters,
+        "the index counts {} bytes and its filters hold {filters}",
+        store.resident_bytes().to_bytes()
+    );
+    // A shard that paged out empty forgets its keys, and still reads them from the footer.
+    for at in (0..4_000u32).step_by(97) {
+        assert!(
+            store.contains(&spread(at)).expect("contains"),
+            "key {at} went missing"
+        );
+    }
+}
+
 // a segment holding only tombstones is still accounted for, so it can be seen
 #[test]
 fn a_segment_of_only_tombstones_is_accounted_for() {

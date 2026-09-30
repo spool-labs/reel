@@ -9,7 +9,7 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 
 use crate::units::ByteCount;
 
@@ -224,6 +224,11 @@ impl ColumnIndex {
     /// for both would report a tree's cost for an open shard's keys.
     pub fn overhead_per_key(&self) -> u64 {
         on_index!(self, index => index.overhead_per_key())
+    }
+
+    /// Bytes the filters in front of the shards hold
+    pub fn filter_bytes(&self) -> u64 {
+        on_index!(self, index => index.filter_bytes())
     }
 
     /// Which structure this column's shards opened in, not always what was declared
@@ -744,53 +749,80 @@ impl<K: IndexKey> Covered<K> {
     }
 }
 
-/// Bits one shard's filter holds, sixteen kibibytes allocated on first use
+/// Most words one shard's filter takes, sixteen kibibytes
 const FILTER_WORDS: usize = 2048;
 
-/// A filter in front of one shard's lock, answering only definite absence
+/// Words one column's filters take between all of its shards, a mebibyte
 ///
-/// Allocated the first time its shard takes a key, so the sixty-five thousand
-/// shards a two-byte column declares cost nothing until they hold something. A
-/// key's bits are set before the map takes it, so a reader that sees a bit clear is
-/// reading a state the lock it skipped would also have allowed. Nothing is ever
-/// cleared, so a filter that saturates answers maybe for everything.
-struct ShardFilter {
-    words: OnceLock<Box<[AtomicU64]>>,
+/// A column of few shards gives each the most a filter takes, and a two-byte
+/// column's sixty-five thousand shards get two words apiece rather than a gibibyte.
+const COLUMN_FILTER_WORDS: usize = 1 << 17;
+
+/// Filters in front of every shard's lock, answering only definite absence
+///
+/// One run of words cut evenly between the shards. A key's bits are set before the
+/// map takes it and a shard's bits are cleared when its map empties, both under the
+/// shard's write lock, so a reader that sees a bit clear is reading a state the lock
+/// it skipped would also have allowed. A shard that pages out empty starts clean, so
+/// a paged column's filters never fill with keys a footer now answers for.
+struct ShardFilters {
+    words: Box<[AtomicU64]>,
+
+    /// Words each shard owns, a power of two
+    per_shard: usize,
 }
 
-impl ShardFilter {
-    fn empty() -> ShardFilter {
-        ShardFilter {
-            words: OnceLock::new(),
+impl ShardFilters {
+    fn new(shards: usize) -> ShardFilters {
+        let even = (COLUMN_FILTER_WORDS / shards.max(1)).clamp(1, FILTER_WORDS);
+        let per_shard = 1usize << even.ilog2();
+        ShardFilters {
+            words: (0..per_shard * shards.max(1))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            per_shard,
         }
     }
 
+    /// One shard's words
+    fn of(&self, shard: usize) -> &[AtomicU64] {
+        &self.words[shard * self.per_shard..(shard + 1) * self.per_shard]
+    }
+
     /// Record a key on its way into the shard's map
-    fn note(&self, hash: u64) {
-        let words = self
-            .words
-            .get_or_init(|| (0..FILTER_WORDS).map(|_| AtomicU64::new(0)).collect());
-        let (first, second) = probe_pair(hash);
+    fn note(&self, shard: usize, hash: u64) {
+        let words = self.of(shard);
+        let (first, second) = probe_pair(hash, self.per_shard);
         words[(first / 64) as usize].fetch_or(1 << (first % 64), Ordering::Relaxed);
         words[(second / 64) as usize].fetch_or(1 << (second % 64), Ordering::Relaxed);
     }
 
     /// Whether the shard may hold the key, where a no is certain
-    fn may_hold(&self, hash: u64) -> bool {
-        let Some(words) = self.words.get() else {
-            return false;
-        };
-        let (first, second) = probe_pair(hash);
+    fn may_hold(&self, shard: usize, hash: u64) -> bool {
+        let words = self.of(shard);
+        let (first, second) = probe_pair(hash, self.per_shard);
         words[(first / 64) as usize].load(Ordering::Relaxed) & (1 << (first % 64)) != 0
             && words[(second / 64) as usize].load(Ordering::Relaxed) & (1 << (second % 64)) != 0
+    }
+
+    /// Forget every key of a shard whose map holds nothing, under its write lock
+    fn clear(&self, shard: usize) {
+        for word in self.of(shard) {
+            word.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Bytes the filters hold, all of them allocated when the column opens
+    fn heap_bytes(&self) -> u64 {
+        std::mem::size_of_val(&*self.words) as u64
     }
 }
 
 /// Two bit positions from one key hash, mixed apart so the pair is not one sequence
-fn probe_pair(hash: u64) -> (u64, u64) {
-    const BITS: u64 = (FILTER_WORDS * 64) as u64;
+fn probe_pair(hash: u64, words: usize) -> (u64, u64) {
+    let mask = (words as u64 * 64) - 1;
     let other = hash.wrapping_mul(0xD6E8_FEB8_6659_FD93) ^ (hash >> 32);
-    (hash % BITS, other % BITS)
+    (hash & mask, other & mask)
 }
 
 /// One hash of a key's bytes, taken borrowed so a probe builds no key
@@ -811,7 +843,7 @@ pub struct WidthIndex<K: IndexKey, S: Shape<K>> {
     shards: Vec<RwLock<ShardState<K, S>>>,
 
     /// A filter beside each shard's lock, so a definite miss never takes it
-    filters: Vec<ShardFilter>,
+    filters: ShardFilters,
 
     /// Ranges a tombstone swept, tested against records that arrive after it
     covers: RwLock<Vec<Covered<K>>>,
@@ -836,14 +868,12 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// An empty index for a column, split into the shards the column declares
     pub fn new(spec: &ColumnSpec) -> WidthIndex<K, S> {
         let mut shards = Vec::with_capacity(spec.shard_count());
-        let mut filters = Vec::with_capacity(spec.shard_count());
         for _ in 0..spec.shard_count() {
             shards.push(RwLock::new(ShardState::empty()));
-            filters.push(ShardFilter::empty());
         }
         WidthIndex {
             shards,
-            filters,
+            filters: ShardFilters::new(spec.shard_count()),
             covers: RwLock::new(Vec::new()),
             has_covers: AtomicBool::new(false),
             occupied: RwLock::new(TBTreeMap::new()),
@@ -869,6 +899,11 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// Bytes a resident key costs beyond itself and its entry, from the shape
     pub fn overhead_per_key(&self) -> u64 {
         S::OVERHEAD_PER_KEY
+    }
+
+    /// Bytes the filters in front of the shards hold
+    pub fn filter_bytes(&self) -> u64 {
+        self.filters.heap_bytes()
     }
 
     /// Which structure this column's shards took
@@ -997,7 +1032,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         // The entry goes in on the way past and a refusal puts back what it
         // displaced, so an accepted put is one descent rather than a lookup and an
         // insert.
-        self.filters[at].note(filter_hash(key.as_slice()));
+        self.filters.note(at, filter_hash(key.as_slice()));
         // Taken before the key moves into the map, since a variable column's key
         // owns the bytes the span is measured from.
         let width = key.width();
@@ -1219,7 +1254,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             None => Landed::Nothing,
         };
 
-        self.filters[at].note(filter_hash(key.as_slice()));
+        self.filters.note(at, filter_hash(key.as_slice()));
         state
             .map
             .put(key.clone(), Entry::grave_from(lsn, tombstone.segment));
@@ -1273,7 +1308,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             return false;
         }
 
-        self.filters[at].note(filter_hash(key.as_slice()));
+        self.filters.note(at, filter_hash(key.as_slice()));
         state.map.put(key, Entry::grave(lsn));
         state.note_grave(lsn);
         self.note_filled(at, was_empty);
@@ -1307,7 +1342,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         }
         segments.release_live(from.segment, span_of(key.width(), from.len));
         segments.mark_live(to.segment, lsn, span_of(key.width(), to.len));
-        self.filters[at].note(filter_hash(key.as_slice()));
+        self.filters.note(at, filter_hash(key.as_slice()));
         state.map.put(
             key,
             Entry::new(to, lsn).stamped(segments.live_incarnation(to.segment)),
@@ -1358,7 +1393,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             return None;
         }
         let at = self.shard_of_bytes(key);
-        if !self.filters[at].may_hold(filter_hash(key)) {
+        if !self.filters.may_hold(at, filter_hash(key)) {
             return None;
         }
         read(&self.shards[at]).map.at(key).copied()
@@ -1383,7 +1418,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         for (at, index) in run.iter().enumerate() {
             let key = keys[*index].as_slice();
             let shard = self.shard_of_bytes(key);
-            if !self.filters[shard].may_hold(filter_hash(key)) {
+            if !self.filters.may_hold(shard, filter_hash(key)) {
                 continue;
             }
             if !K::accepts(key) {
@@ -1788,7 +1823,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             return None;
         }
         let at = self.shard_of_bytes(key);
-        if !self.filters[at].may_hold(filter_hash(key)) {
+        if !self.filters.may_hold(at, filter_hash(key)) {
             return None;
         }
         let entry = read(&self.shards[at]).map.at(key).copied()?;
@@ -1836,7 +1871,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                     expected_lsn,
                     span_of(key.width(), new_loc.len),
                 );
-                self.filters[at].note(filter_hash(key.as_slice()));
+                self.filters.note(at, filter_hash(key.as_slice()));
                 // The copy sits in an open tail, held live until the repoint is
                 // published, so its stamp is issued here.
                 state.map.put(
@@ -1974,7 +2009,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             if entry.is_grave() {
                 state.note_grave(entry.lsn);
             }
-            self.filters[at].note(filter_hash(key.as_slice()));
+            self.filters.note(at, filter_hash(key.as_slice()));
         }
         state.map.absorb_sorted(run);
         self.note_filled(at, was_empty);
@@ -2011,6 +2046,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         for at in occupied {
             let mut state = write(&self.shards[at]);
             state.map.empty();
+            self.filters.clear(at);
             state.bytes = 0;
             state.graves = 0;
             state.carried.empty();
@@ -2406,6 +2442,9 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// map: dropping it there would take its paged count out of every total, which
     /// reads as the keys having been deleted rather than handed over.
     fn note_emptied(&self, at: usize, state: &mut ShardState<K, S>) {
+        if state.map.vacant() {
+            self.filters.clear(at);
+        }
         if state.map.vacant() && state.paged == 0 {
             // The room goes with the walk: nothing visits a shard outside the
             // occupied set, so a shard left here is one nothing will pack.

@@ -122,6 +122,43 @@ fn a_new_segment_is_written_through() {
     );
 }
 
+// a tail zeros its next window only when its last one took enough syncs to pay for it
+#[test]
+fn only_a_tail_that_syncs_often_fills_its_next_window() {
+    const BIG_SEGMENT: u64 = 64 * 1024 * 1024;
+    const BIG_WINDOW: u64 = 4 * 1024 * 1024;
+    let payload = vec![0x5Au8; 64 * 1024];
+    let length_after = |sync: SyncPolicy| {
+        let home = TempDir::new().expect("home");
+        let config = ReelConfig {
+            segment_bytes: ByteCount::from_bytes(BIG_SEGMENT),
+            alloc_chunk: ByteCount::from_bytes(BIG_SEGMENT / 4),
+            sync,
+            ..config()
+        };
+        let store = ReelStore::open(home.path().to_path_buf(), config, COLUMNS).expect("open");
+        for at in 0..80 {
+            store.put(&key(at), &payload).expect("put");
+        }
+        let segments = segments_in(home.path());
+        assert_eq!(segments.len(), 1, "the tail drew more than one segment");
+        std::fs::metadata(&segments[0]).expect("metadata").len()
+    };
+
+    for sync in [SyncPolicy::Never, SyncPolicy::Bytes(ByteCount::mb(1))] {
+        let length = length_after(sync);
+        assert!(
+            length > BIG_WINDOW && length < 2 * BIG_WINDOW,
+            "a tail with {sync:?} wrote zeros past its records, length {length}"
+        );
+    }
+    assert_eq!(
+        length_after(SyncPolicy::EveryPut),
+        2 * BIG_WINDOW,
+        "a tail that syncs every put did not zero its next window"
+    );
+}
+
 // a store restarted idle keeps its one tail rather than drawing another
 #[test]
 fn an_idle_restart_keeps_one_segment() {

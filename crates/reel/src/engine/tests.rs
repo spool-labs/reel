@@ -1793,7 +1793,7 @@ fn a_hot_budget_keeps_recent_keys_above_the_floor() {
     store.flush().expect("flush");
     store.page_out_sealed().expect("page out");
 
-    let held = store.resident_bytes().to_bytes() - floor;
+    let held = store.index.key_bytes().to_bytes();
     assert!(
         held >= BUDGET / 2,
         "a {BUDGET} byte budget over a {floor} byte floor holds {held} bytes of keys"
@@ -2015,7 +2015,7 @@ fn a_hot_budget_bounds_what_the_maps_allocate() {
     store.page_out_sealed().expect("page out");
 
     let column = store.index.column(WIDE).expect("column");
-    let allocated = column.heap_bytes() - store.index.floor_bytes().to_bytes();
+    let allocated = store.index.key_bytes().to_bytes();
     assert!(
         column.resident_keys() > 0,
         "the budget holds some keys resident"

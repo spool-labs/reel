@@ -93,11 +93,7 @@ impl FooterSource for ReelShared {
     ) -> Result<Option<FooterRow>> {
         self.probes.note_probe();
         if let Some(footer) = self.footers.get(segment) {
-            let Some(partition) = footer
-                .partitions
-                .iter()
-                .find(|partition| partition.column == column)
-            else {
+            let Some(partition) = footer.partition(column) else {
                 return Ok(None);
             };
             return Ok(self.answer_of(partition.lookup(key, carry)?));

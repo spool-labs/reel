@@ -1209,6 +1209,9 @@ impl SegmentFooter {
             ));
         }
 
+        // Packed in column order, and held that way whatever a file says, since every
+        // lookup by column is a binary search.
+        partitions.sort_by_key(|partition| partition.column);
         Ok(SegmentFooter {
             partitions,
             min_lsn,
@@ -1217,6 +1220,27 @@ impl SegmentFooter {
             tally,
         })
     }
+
+    /// One column's partition, found by a binary search over the column order
+    pub fn partition(&self, column: ColumnId) -> Option<&FooterPartition> {
+        partition_in(&self.partitions, column, |partition| partition.column)
+    }
+}
+
+/// One column's entry in a run held in column order
+///
+/// A handful is scanned outright, since a scan of a few beats the branches of a search.
+pub(crate) fn partition_in<Held>(
+    held: &[Held],
+    column: ColumnId,
+    column_of: impl Fn(&Held) -> ColumnId,
+) -> Option<&Held> {
+    if held.len() <= 8 {
+        return held.iter().find(|one| column_of(one) == column);
+    }
+    held.binary_search_by_key(&column, &column_of)
+        .ok()
+        .map(|at| &held[at])
 }
 
 /// One partition's rows in their on-disk form
@@ -1761,6 +1785,27 @@ mod tests {
         assert_eq!(two.len(), 2);
         assert_eq!(two.key_at(0).map(<[u8]>::len), Some(34));
         assert_eq!(two.key_at(1).map(<[u8]>::len), Some(200));
+    }
+
+    // a footer of many columns finds each one's partition, and none for a column it lacks
+    #[test]
+    fn many_columns_find_their_partitions() {
+        // Pushed high to low, so the pack has an order to put right.
+        let rows: Vec<FooterEntry> = (0..40u8)
+            .rev()
+            .map(|column| entry(ColumnId(column * 2 + 1), column, 16, 1, 0, 100))
+            .collect();
+        let bytes = SegmentFooter::build(rows).pack(0).expect("pack");
+        let parsed = SegmentFooter::parse(&bytes).expect("parse");
+        for column in 0..40u8 {
+            let id = ColumnId(column * 2 + 1);
+            assert_eq!(parsed.partition(id).map(|found| found.column), Some(id));
+            assert!(
+                parsed.partition(ColumnId(column * 2)).is_none(),
+                "column {}",
+                column * 2
+            );
+        }
     }
 
     // rows of differing widths survive a pack and a parse with their keys intact

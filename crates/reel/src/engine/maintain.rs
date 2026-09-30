@@ -487,6 +487,9 @@ impl ReelStore {
         if let Err(error) = self.merge_when_due() {
             tracing::warn!("a maintenance tick left the sorted runs standing: {error}");
         }
+        // The handover goes again ahead of the scrub, since a rewrite or a merge above
+        // can hold the tick long enough for a backlog of sealed keys to build.
+        self.page_out_sealed()?;
         self.scrub_once()?;
         Ok(())
     }

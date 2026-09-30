@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{ReelConfig, RepairPath, VolumeClass};
 use crate::error::Result;
@@ -135,6 +135,9 @@ pub struct CompactionCounters {
     /// Records the scrub or compaction found failing their checksum
     pub scrub_hits: u64,
 
+    /// Record bytes the scrub has read back and checked
+    pub scrub_bytes: u64,
+
     /// Records dropped for sitting below the purge floor rather than copied
     pub records_purged: u64,
 
@@ -172,6 +175,7 @@ struct Metrics {
     tombstones_carried: AtomicU64,
     tombstones_dropped: AtomicU64,
     scrub_hits: AtomicU64,
+    scrub_bytes: AtomicU64,
     records_purged: AtomicU64,
     rows_listed: AtomicU64,
     runs_merged: AtomicU64,
@@ -187,6 +191,7 @@ impl Metrics {
             tombstones_carried: AtomicU64::new(0),
             tombstones_dropped: AtomicU64::new(0),
             scrub_hits: AtomicU64::new(0),
+            scrub_bytes: AtomicU64::new(0),
             records_purged: AtomicU64::new(0),
             rows_listed: AtomicU64::new(0),
             runs_merged: AtomicU64::new(0),
@@ -214,6 +219,10 @@ impl Metrics {
         self.scrub_hits.fetch_add(hits, Ordering::AcqRel);
     }
 
+    fn record_scrubbed(&self, bytes: u64) {
+        self.scrub_bytes.fetch_add(bytes, Ordering::AcqRel);
+    }
+
     fn record_purged(&self, purged: u64) {
         self.records_purged.fetch_add(purged, Ordering::AcqRel);
     }
@@ -230,6 +239,7 @@ impl Metrics {
             tombstones_carried: self.tombstones_carried.load(Ordering::Acquire),
             tombstones_dropped: self.tombstones_dropped.load(Ordering::Acquire),
             scrub_hits: self.scrub_hits.load(Ordering::Acquire),
+            scrub_bytes: self.scrub_bytes.load(Ordering::Acquire),
             records_purged: self.records_purged.load(Ordering::Acquire),
             rows_listed: self.rows_listed.load(Ordering::Acquire),
             runs_merged: self.runs_merged.load(Ordering::Acquire),
@@ -286,6 +296,15 @@ struct ScrubCursor {
 
     /// Dead bytes counted in this segment so far, across however many passes
     dead: u64,
+}
+
+/// Restarts a scrub gate's earnings however its pass leaves
+struct Rest<'gate>(&'gate RateGate);
+
+impl Drop for Rest<'_> {
+    fn drop(&mut self) {
+        self.0.rest();
+    }
 }
 
 /// What one segment's share of a scrub pass produced
@@ -1427,10 +1446,14 @@ impl Compactor {
         };
         // the rate decides how much this pass may read, so the sweep runs at its
         // configured rate whether the plane is ticked once a minute or in a tight loop
-        let mut budget = gate.allowance(SCRUB_PASS_MAX);
+        let (mut budget, stretch) = gate.allowance(SCRUB_PASS_MAX);
+        let _rest = Rest(gate);
         if budget == 0 {
             return Ok(0);
         }
+        // A pass stops at its bytes or at the stretch it earned, whichever comes first,
+        // so a scrub slower than its rate holds the tick no longer than it waited.
+        let deadline = Instant::now() + stretch;
 
         let shared = reel.shared();
         let mut plan = Vec::new();
@@ -1483,7 +1506,15 @@ impl Compactor {
             };
             // the moment a pass is mid-sweep, for a test probing what a second caller sees
             crate::sync::rendezvous::at("scrub/segment");
-            let step = self.scrub_segment(shared, index, *segment, resume, carried, &mut budget)?;
+            let step = self.scrub_segment(
+                shared,
+                index,
+                *segment,
+                resume,
+                carried,
+                &mut budget,
+                deadline,
+            )?;
             hits += step.hits;
             if let Some((offset, region_end)) = step.resume_at {
                 *lock(&self.scrub_cursor) = Some(ScrubCursor {
@@ -1504,6 +1535,7 @@ impl Compactor {
         Ok(hits)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scrub_segment(
         &self,
         shared: &Arc<ReelShared>,
@@ -1512,6 +1544,7 @@ impl Compactor {
         resume: Option<(u64, u64)>,
         carried: u64,
         budget: &mut u64,
+        deadline: Instant,
     ) -> Result<ScrubStep> {
         // a sweep runs behind whatever the plane is retiring, so a segment can go
         // between the plan and the pass
@@ -1545,9 +1578,13 @@ impl Compactor {
 
         let mut hits = 0usize;
         let mut dead = carried;
+        let mut scanned = 0u64;
         loop {
-            if *budget == 0 {
+            // a record is read before the clock is asked, so every pass moves the sweep
+            let is_late = scanned > 0 && Instant::now() >= deadline;
+            if *budget == 0 || is_late {
                 self.metrics.record_hits(hits as u64);
+                self.metrics.record_scrubbed(scanned);
                 return Ok(ScrubStep {
                     hits,
                     dead,
@@ -1559,6 +1596,7 @@ impl Compactor {
                 None => break,
             };
             *budget = budget.saturating_sub(record.span());
+            scanned += record.span();
             if !record.header.flags.is_data() {
                 continue;
             }
@@ -1597,6 +1635,7 @@ impl Compactor {
             }
         }
         self.metrics.record_hits(hits as u64);
+        self.metrics.record_scrubbed(scanned);
         Ok(ScrubStep {
             hits,
             dead,

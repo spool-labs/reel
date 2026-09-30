@@ -8,7 +8,7 @@ use std::ops::Bound;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tempfile::{tempdir, TempDir};
 
@@ -1721,6 +1721,116 @@ fn a_hot_index_pages_when_it_runs_out_of_room() {
         played(&store, RECORD).len(),
         200,
         "and the playback still sees them"
+    );
+}
+
+/// A record key spread across the two-byte shards, one per number
+fn spread(at: u32) -> RecordKey {
+    let mut bytes = ((at.wrapping_mul(0x9e37_79b1) >> 16) as u16)
+        .to_be_bytes()
+        .to_vec();
+    bytes.extend_from_slice(&at.to_be_bytes());
+    bytes.resize(34, 0);
+    RecordKey::from_bytes(RECORD, &bytes).expect("key")
+}
+
+// a scrub slower than its rate leaves every tick's handover its turn
+#[test]
+fn a_slow_scrub_does_not_starve_the_handover() {
+    const SEGMENT: u64 = 64 * 1024;
+    const LOADED: u32 = 30_000;
+    const TICKS: usize = 6;
+    const LONG_TICK: Duration = Duration::from_secs(1);
+    let paged = ReelConfig {
+        index: IndexResidency::Paged,
+        segment_bytes: ByteCount::from_bytes(SEGMENT),
+        ..config(1, SyncPolicy::Never)
+    };
+    assert!(paged.scrub_mbps > 0, "the scrub runs at its default rate");
+    let (store, _sim) = sim_store(paged);
+    let store = Arc::new(store);
+
+    // Enough sealed segments that a whole lap of the slowed scrub takes seconds.
+    let payload = vec![0x5au8; 200];
+    for at in 0..LOADED {
+        store.put(&spread(at), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    // One tick at full speed spends what the load earned.
+    store.maintain_once().expect("warm tick");
+    let lap: u64 = store
+        .index
+        .segments_snapshot()
+        .iter()
+        .map(|(_, bytes)| bytes.live + bytes.dead)
+        .sum();
+
+    let script = crate::sync::rendezvous::script();
+    script.hold("scrub/segment");
+
+    // A writer keeps sealing segments the whole time the ticks run.
+    let writing = Arc::new(AtomicBool::new(true));
+    let peak = Arc::new(AtomicU64::new(0));
+    let writer = {
+        let (store, writing, peak) = (Arc::clone(&store), Arc::clone(&writing), Arc::clone(&peak));
+        let payload = payload.clone();
+        std::thread::spawn(move || {
+            let mut at = LOADED;
+            while writing.load(Ordering::Relaxed) {
+                for _ in 0..100 {
+                    store.put(&spread(at), &payload).expect("put");
+                    at += 1;
+                }
+                let resident = store.index.column(RECORD).expect("column").resident_keys();
+                peak.fetch_max(resident, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    let ticker = {
+        let store = Arc::clone(&store);
+        script.cast(move || {
+            let mut ticks = Vec::with_capacity(TICKS);
+            for _ in 0..TICKS {
+                let started = Instant::now();
+                let before = store.compaction_counters().scrub_bytes;
+                store.maintain_once().expect("tick");
+                let scrubbed = store.compaction_counters().scrub_bytes - before;
+                let took = started.elapsed();
+                ticks.push((took, scrubbed));
+                // one long tick is the failure, and the ones after it only grow
+                if took > LONG_TICK {
+                    break;
+                }
+            }
+            ticks
+        })
+    };
+    // Every segment the scrub opens costs it this long, well under its rate.
+    while !ticker.is_finished() {
+        std::thread::sleep(Duration::from_millis(20));
+        script.pass_one("scrub/segment");
+    }
+    let ticks = ticker.join().expect("ticker");
+    writing.store(false, Ordering::Relaxed);
+    writer.join().expect("writer");
+    drop(script);
+
+    // Each pass earns only the stretch since the one before it ended.
+    for (at, (took, scrubbed)) in ticks.iter().enumerate() {
+        assert!(
+            *took <= LONG_TICK,
+            "tick {at} took {took:?} and scrubbed {scrubbed} bytes of a {lap} byte lap"
+        );
+        assert!(
+            *scrubbed < lap / 4,
+            "tick {at} scrubbed {scrubbed} bytes of a {lap} byte lap in {took:?}"
+        );
+    }
+    let peak = peak.load(Ordering::Relaxed);
+    assert!(
+        peak < 10_000,
+        "{peak} keys stood resident while the ticks ran: {ticks:?}"
     );
 }
 

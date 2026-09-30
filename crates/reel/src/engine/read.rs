@@ -337,16 +337,13 @@ impl ReelStore {
         let dead: Vec<bool> = std::iter::once(false)
             .chain(self.config.volumes.iter().map(|volume| volume.dead))
             .collect();
-        let rebuilt = rebuild_reel(&self.driver, &roots, &dead, self.config.index.pages())?;
-        self.index.install(
-            rebuilt.entries,
-            rebuilt.covers,
-            rebuilt.segments,
-            rebuilt.segment_min_lsn,
-            rebuilt.segment_max_lsn,
-            rebuilt.sealed,
-            rebuilt.sealed_keys,
-        );
+        let rebuilt = rebuild_reel(
+            &self.driver,
+            &roots,
+            &dead,
+            self.config.index.pages(),
+            &self.index,
+        )?;
         let mut cursor = lock(&self.cursor);
         *cursor = LogCursor::new();
         cursor.start_from(&rebuilt.consumed);

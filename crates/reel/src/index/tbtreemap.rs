@@ -1597,6 +1597,11 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             + spills) as u64
     }
 
+    /// Whether every leaf is as full as a sorted build would leave it
+    pub fn is_packed(&self) -> bool {
+        self.leaves.len() <= self.len.div_ceil(B).max(1)
+    }
+
     /// Whether packing would give back room worth the pass
     ///
     /// Fill alone cannot say: a shard holding three keys reads as badly under-filled,

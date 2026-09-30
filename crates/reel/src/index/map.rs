@@ -22,7 +22,7 @@ use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::index::column::{ColumnIndex, KeyMove, Landed, PendingCover};
 use crate::index::counters::{Floors, SegmentBytes, SegmentStamp, SegmentTable};
-use crate::index::entry::{Entry, RangeCover};
+use crate::index::entry::Entry;
 use crate::index::page::KeyPage;
 use crate::index::paged::{Candidates, FooterSource, SealedRanges};
 use crate::index::playback::{self, merged_page, Paged, PlaybackCursor, Way};
@@ -1342,46 +1342,22 @@ impl ReelIndex {
         }
     }
 
-    /// Install a rebuilt index in one pass, replacing whatever it held
+    /// Close a rebuild that filled the maps: size them, then stand the sealed spans
     ///
-    /// The caller has already resolved newest-wins across every segment, so the
-    /// entries are the live winners. The per-segment minimums are the oldest record
-    /// each segment can still surface, which the compactor consults before trimming a
-    /// tombstone; the maximums, read off each sealed footer, are where a fan-out
-    /// stops. A segment brought back without one is one no fan-out will stop short of.
-    #[allow(clippy::too_many_arguments)]
-    pub fn install(
+    /// The spans come off each sealed footer a paged rebuild swept, and a resident one
+    /// brings none.
+    pub fn finish_rebuild(
         &self,
-        entries: HashMap<ColumnId, Vec<(KeyBytes, Entry)>>,
-        covers: Vec<RangeCover>,
-        segments: HashMap<SegmentId, SegmentBytes>,
-        seg_min_lsn: HashMap<SegmentId, Lsn>,
-        seg_max_lsn: HashMap<SegmentId, Lsn>,
         sealed: Vec<SealedSpan>,
         sealed_keys: HashMap<ColumnId, SealedKeys>,
     ) {
         for index in &self.indexes {
-            index.clear();
+            index.fit();
         }
-        let born: Vec<SegmentId> = sealed.iter().map(|span| span.segment).collect();
-        // The table goes first, since every entry installed below takes its
-        // incarnation stamp from what this resolves.
-        self.segments.install(segments, seg_min_lsn, seg_max_lsn);
         // The keys of these segments are in no shard counter, and the settle and
-        // repoint paths ask the table before they count. Marked after the install,
-        // which starts the set over.
-        self.segments.mark_born(born);
-        for (column, rows) in entries {
-            if let Some(index) = self.column(column) {
-                index.install(rows, &self.segments);
-            }
-        }
-        // After the keys, since installing a column's keys clears what it holds.
-        for cover in covers {
-            if let Some(index) = self.column(cover.start.column) {
-                index.install_cover(cover.start.key.as_slice(), cover.end.as_ref(), cover.lsn);
-            }
-        }
+        // repoint paths ask the table before they count.
+        self.segments
+            .mark_born(sealed.iter().map(|span| span.segment));
         // The key filters go in ahead of the spans they stand in front of, as they
         // do at a seal.
         for (column, keys) in sealed_keys {
@@ -1708,49 +1684,6 @@ mod tests {
             .page(BLOB, Bound::Unbounded, 8, &mut out)
             .expect("page");
         assert_eq!(out.len(), 1);
-    }
-
-    // installing a rebuilt index replaces the keys and the segment counters
-    #[test]
-    fn install_replaces() {
-        let index = index();
-        index
-            .insert(&record_key(5, 0x05), loc(9, 0, 50), Lsn(1))
-            .expect("insert");
-
-        let mut entries = HashMap::new();
-        entries.insert(
-            RECORD,
-            vec![(
-                KeyBytes::new(record_key(1, 0x11).as_slice()).expect("key"),
-                Entry::new(loc(1, 0, 400), Lsn(4)),
-            )],
-        );
-        let mut segments = HashMap::new();
-        segments.insert(
-            SegmentId(1),
-            SegmentBytes {
-                live: span_of(34, 400),
-                dead: 77,
-                ..SegmentBytes::default()
-            },
-        );
-        let mut min_lsn = HashMap::new();
-        min_lsn.insert(SegmentId(1), Lsn(4));
-        index.install(
-            entries,
-            Vec::new(),
-            segments,
-            min_lsn,
-            HashMap::new(),
-            Vec::new(),
-            HashMap::new(),
-        );
-
-        assert_eq!(index.totals().count, 1);
-        assert!(!index.contains(&record_key(5, 0x05)).expect("read"));
-        assert_eq!(index.dead_bytes(), 77);
-        assert_eq!(index.min_lsn_excluding(SegmentId(2)), Some(Lsn(4)));
     }
 
     // an open-addressed column serves what a tree one serves, walk included

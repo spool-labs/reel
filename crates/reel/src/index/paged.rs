@@ -49,11 +49,7 @@ pub trait FooterSource: Send + Sync {
         let Some(footer) = self.footer(segment)? else {
             return Ok(None);
         };
-        let Some(partition) = footer
-            .partitions
-            .iter()
-            .find(|partition| partition.column == column)
-        else {
+        let Some(partition) = footer.partition(column) else {
             return Ok(None);
         };
         match partition.lookup(key, carry)? {

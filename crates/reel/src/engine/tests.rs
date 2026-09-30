@@ -8,7 +8,7 @@ use std::ops::Bound;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tempfile::{tempdir, TempDir};
 
@@ -16,7 +16,7 @@ use crate::units::ByteCount;
 
 use crate::config::{
     CompactRate, HotIndex, IndexResidency, PointReads, Preallocate, RangedReads, RepairPath,
-    SyncPolicy, ThreadBudget,
+    ShardShapes, SyncPolicy, ThreadBudget,
 };
 use crate::format::column::{Codec, ColumnId, ColumnSpec, MapShape};
 use crate::format::footer::SegmentFooter;
@@ -1694,19 +1694,32 @@ fn a_hot_index_holds_recent_keys() {
 // a hot index over its budget hands the oldest segments over early
 #[test]
 fn a_hot_index_pages_when_it_runs_out_of_room() {
-    let hot = ReelConfig {
+    const KEYS: u64 = 40_000;
+    let hot = |budget| ReelConfig {
         index: IndexResidency::Hot(HotIndex {
             after_secs: 3600,
-            budget: ByteCount::from_bytes(1),
+            budget,
         }),
+        segment_bytes: ByteCount::from_bytes(64 * 1024),
         ..config(1, SyncPolicy::Never)
     };
-    let (store, _sim) = sim_store(hot);
+    // The least budget a volume takes is what its columns hold empty.
+    let floor = ReelIndex::new(WIDE_COLUMNS, hot(ByteCount::gb(1)).index, ShardShapes::Tree)
+        .expect("index")
+        .floor_bytes();
+    let store = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        hot(floor),
+        WIDE_COLUMNS,
+        Arc::new(SimIo::new(FaultPlan::new(1))),
+    )
+    .expect("open");
 
-    let payload = vec![0xa5u8; 8 * 1024];
-    for byte in 0..200u8 {
-        store.put(&record(7, byte), &payload).expect("put");
+    let payload = [0xa5u8; 16];
+    for at in 0..KEYS {
+        store.put(&wide(at), &payload).expect("put");
     }
+    store.flush().expect("flush");
 
     assert!(
         store.page_out_sealed().expect("page out") > 0,
@@ -1714,13 +1727,335 @@ fn a_hot_index_pages_when_it_runs_out_of_room() {
     );
     assert_eq!(
         store.totals().count,
-        200,
+        KEYS,
         "handing keys over is not deleting them"
     );
     assert_eq!(
-        played(&store, RECORD).len(),
-        200,
+        played(&store, WIDE).len() as u64,
+        KEYS,
         "and the playback still sees them"
+    );
+}
+
+// a hot budget under what the columns hold empty is refused at open
+#[test]
+fn a_hot_budget_under_the_floor_is_refused() {
+    let hot = ReelConfig {
+        index: IndexResidency::Hot(HotIndex {
+            after_secs: 3600,
+            budget: ByteCount::from_bytes(1),
+        }),
+        ..config(1, SyncPolicy::Never)
+    };
+    let opened = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        hot,
+        COLUMNS,
+        Arc::new(SimIo::new(FaultPlan::new(1))),
+    );
+    match opened {
+        Err(ReelError::Config(reason)) => assert!(reason.contains("hot index budget"), "{reason}"),
+        Err(other) => panic!("refused for another reason: {other}"),
+        Ok(_) => panic!("a one byte budget opened"),
+    }
+}
+
+/// A record key in one of sixty-four shards, in the order of its number within it
+fn grouped(at: u32) -> RecordKey {
+    let mut bytes = ((at % 64) as u16).to_be_bytes().to_vec();
+    bytes.extend_from_slice(&at.to_be_bytes());
+    bytes.resize(34, 0);
+    RecordKey::from_bytes(RECORD, &bytes).expect("key")
+}
+
+// a hot budget prices the keys above the shards' floor, so it keeps a budget of recent keys
+#[test]
+fn a_hot_budget_keeps_recent_keys_above_the_floor() {
+    const BUDGET: u64 = 16 << 20;
+    const KEYS: u32 = 400_000;
+    let hot = ReelConfig {
+        index: IndexResidency::Hot(HotIndex {
+            after_secs: 3600,
+            budget: ByteCount::from_bytes(BUDGET),
+        }),
+        ..config(1, SyncPolicy::Never)
+    };
+    let (store, _sim) = sim_store(hot);
+    let floor = store.index.floor_bytes().to_bytes();
+
+    let payload = [0x17u8; 16];
+    for at in 0..KEYS {
+        store.put(&grouped(at), &payload).expect("put");
+        if at % 20_000 == 0 {
+            store.page_out_sealed().expect("page out");
+        }
+    }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
+
+    let held = store.index.key_bytes().to_bytes();
+    assert!(
+        held >= BUDGET / 2,
+        "a {BUDGET} byte budget over a {floor} byte floor holds {held} bytes of keys"
+    );
+    assert!(
+        (0..1_000).all(|at| is_paged(&store, &grouped(at))),
+        "the oldest keys went to their footers"
+    );
+    assert!(
+        (KEYS - 1_000..KEYS).all(|at| !is_paged(&store, &grouped(at))),
+        "the newest keys stayed resident"
+    );
+    assert_eq!(store.totals().count, u64::from(KEYS));
+}
+
+// a hot two-byte column touching thousands of shards holds its filters inside the budget
+#[test]
+fn a_hot_budget_counts_the_filters_of_many_shards() {
+    const BUDGET: u64 = 16 << 20;
+    let hot = ReelConfig {
+        index: IndexResidency::Hot(HotIndex {
+            after_secs: 3600,
+            budget: ByteCount::from_bytes(BUDGET),
+        }),
+        ..config(1, SyncPolicy::Never)
+    };
+    let (store, _sim) = sim_store(hot);
+    let floor = store.index.floor_bytes().to_bytes();
+
+    let payload = [0x5au8; 16];
+    for at in 0..8_000u32 {
+        store.put(&spread(at), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
+
+    let held = store.resident_bytes().to_bytes().saturating_sub(floor);
+    assert!(
+        held <= BUDGET,
+        "a {BUDGET} byte budget over a {floor} byte floor holds {held} bytes, filters {}",
+        store.index.column(RECORD).expect("column").filter_bytes()
+    );
+    assert_eq!(store.totals().count, 8_000);
+}
+
+/// A record key spread across the two-byte shards, one per number
+fn spread(at: u32) -> RecordKey {
+    let mut bytes = ((at.wrapping_mul(0x9e37_79b1) >> 16) as u16)
+        .to_be_bytes()
+        .to_vec();
+    bytes.extend_from_slice(&at.to_be_bytes());
+    bytes.resize(34, 0);
+    RecordKey::from_bytes(RECORD, &bytes).expect("key")
+}
+
+// a scrub slower than its rate leaves every tick's handover its turn
+#[test]
+fn a_slow_scrub_does_not_starve_the_handover() {
+    const SEGMENT: u64 = 64 * 1024;
+    const LOADED: u32 = 30_000;
+    const TICKS: usize = 6;
+    const LONG_TICK: Duration = Duration::from_secs(1);
+    let paged = ReelConfig {
+        index: IndexResidency::Paged,
+        segment_bytes: ByteCount::from_bytes(SEGMENT),
+        ..config(1, SyncPolicy::Never)
+    };
+    assert!(paged.scrub_mbps > 0, "the scrub runs at its default rate");
+    let (store, _sim) = sim_store(paged);
+    let store = Arc::new(store);
+
+    // Enough sealed segments that a whole lap of the slowed scrub takes seconds.
+    let payload = vec![0x5au8; 200];
+    for at in 0..LOADED {
+        store.put(&spread(at), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    // One tick at full speed spends what the load earned.
+    store.maintain_once().expect("warm tick");
+    let lap: u64 = store
+        .index
+        .segments_snapshot()
+        .iter()
+        .map(|(_, bytes)| bytes.live + bytes.dead)
+        .sum();
+
+    let script = crate::sync::rendezvous::script();
+    script.hold("scrub/segment");
+
+    // A writer keeps sealing segments the whole time the ticks run.
+    let writing = Arc::new(AtomicBool::new(true));
+    let peak = Arc::new(AtomicU64::new(0));
+    let writer = {
+        let (store, writing, peak) = (Arc::clone(&store), Arc::clone(&writing), Arc::clone(&peak));
+        let payload = payload.clone();
+        std::thread::spawn(move || {
+            let mut at = LOADED;
+            while writing.load(Ordering::Relaxed) {
+                for _ in 0..100 {
+                    store.put(&spread(at), &payload).expect("put");
+                    at += 1;
+                }
+                let resident = store.index.column(RECORD).expect("column").resident_keys();
+                peak.fetch_max(resident, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    let ticker = {
+        let store = Arc::clone(&store);
+        script.cast(move || {
+            let mut ticks = Vec::with_capacity(TICKS);
+            for _ in 0..TICKS {
+                let started = Instant::now();
+                let before = store.compaction_counters().scrub_bytes;
+                store.maintain_once().expect("tick");
+                let scrubbed = store.compaction_counters().scrub_bytes - before;
+                let took = started.elapsed();
+                ticks.push((took, scrubbed));
+                // one long tick is the failure, and the ones after it only grow
+                if took > LONG_TICK {
+                    break;
+                }
+            }
+            ticks
+        })
+    };
+    // Every segment the scrub opens costs it this long, well under its rate.
+    while !ticker.is_finished() {
+        std::thread::sleep(Duration::from_millis(20));
+        script.pass_one("scrub/segment");
+    }
+    let ticks = ticker.join().expect("ticker");
+    writing.store(false, Ordering::Relaxed);
+    writer.join().expect("writer");
+    drop(script);
+
+    // Each pass earns only the stretch since the one before it ended.
+    for (at, (took, scrubbed)) in ticks.iter().enumerate() {
+        assert!(
+            *took <= LONG_TICK,
+            "tick {at} took {took:?} and scrubbed {scrubbed} bytes of a {lap} byte lap"
+        );
+        assert!(
+            *scrubbed < lap / 4,
+            "tick {at} scrubbed {scrubbed} bytes of a {lap} byte lap in {took:?}"
+        );
+    }
+    let peak = peak.load(Ordering::Relaxed);
+    assert!(
+        peak < 10_000,
+        "{peak} keys stood resident while the ticks ran: {ticks:?}"
+    );
+}
+
+// a paged column's filters stay small across scattered keys and count as resident
+#[test]
+fn scattered_keys_leave_the_filters_small_and_counted() {
+    let paged = ReelConfig {
+        index: IndexResidency::Paged,
+        segment_bytes: ByteCount::from_bytes(64 * 1024),
+        ..config(1, SyncPolicy::Never)
+    };
+    let (store, _sim) = sim_store(paged);
+    let payload = vec![0x3cu8; 200];
+    // Four thousand keys land in about as many of the column's 65,536 shards.
+    for at in 0..4_000u32 {
+        store.put(&spread(at), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    store.reel.tails()[0].seal().expect("seal");
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
+    let column = store.index.column(RECORD).expect("column");
+    assert_eq!(column.resident_keys(), 0, "every key went to its footer");
+
+    let filters = column.filter_bytes();
+    assert!(
+        filters <= 1 << 20,
+        "the filters of a column holding nothing take {filters} bytes"
+    );
+    assert!(
+        store.resident_bytes().to_bytes() >= filters,
+        "the index counts {} bytes and its filters hold {filters}",
+        store.resident_bytes().to_bytes()
+    );
+    // A shard that paged out empty forgets its keys, and still reads them from the footer.
+    for at in (0..4_000u32).step_by(97) {
+        assert!(
+            store.contains(&spread(at)).expect("contains"),
+            "key {at} went missing"
+        );
+    }
+}
+
+const WIDE: ColumnId = ColumnId(7);
+
+/// A sixteen-byte key scattered across the wide column's shards, one per number
+fn wide(at: u64) -> RecordKey {
+    let mut key = (at.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .to_be_bytes()
+        .to_vec();
+    key.extend_from_slice(&at.to_be_bytes());
+    RecordKey::from_bytes(WIDE, &key).expect("key")
+}
+
+/// A sixteen-byte column over a byte of shards, the shape a hot budget is priced on
+const WIDE_COLUMNS: ColumnSet = &[ColumnSpec {
+    id: WIDE,
+    name: "wide",
+    key_width: KeyWidth::Fixed(16),
+    shard_bytes: 1,
+    inline_max: 0,
+    row_carry: 0,
+    purge_mark: None,
+    codec: Codec::None,
+    map_shape: MapShape::Tree,
+}];
+
+// a hot index given a budget holds about that much memory, counted by what it allocated
+#[test]
+fn a_hot_budget_bounds_what_the_maps_allocate() {
+    const BUDGET: u64 = 4 << 20;
+    let hot = ReelConfig {
+        index: IndexResidency::Hot(HotIndex {
+            after_secs: 3600,
+            budget: ByteCount::from_bytes(BUDGET),
+        }),
+        segment_bytes: ByteCount::from_bytes(64 * 1024),
+        ..config(1, SyncPolicy::Never)
+    };
+    let sim = SimIo::new(FaultPlan::new(1));
+    let store = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        hot,
+        WIDE_COLUMNS,
+        Arc::new(sim.clone()),
+    )
+    .expect("open");
+
+    let payload = vec![0x42u8; 200];
+    for at in 0..120_000u64 {
+        store.put(&wide(at), &payload).expect("put");
+        if at % 10_000 == 0 {
+            store.page_out_sealed().expect("page out");
+        }
+    }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
+
+    let column = store.index.column(WIDE).expect("column");
+    let allocated = store.index.key_bytes().to_bytes();
+    assert!(
+        column.resident_keys() > 0,
+        "the budget holds some keys resident"
+    );
+    // A tenth over for the open tail, whose keys no budget can hand over.
+    assert!(
+        allocated <= BUDGET + BUDGET / 10,
+        "a {BUDGET} byte budget holds {allocated} bytes for {} keys, and the index counts {}",
+        column.resident_keys(),
+        store.resident_bytes().to_bytes()
     );
 }
 

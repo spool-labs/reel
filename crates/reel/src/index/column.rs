@@ -13,7 +13,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::units::ByteCount;
 
-use crate::config::ShardShapes;
+use crate::config::{IndexResidency, ShardShapes};
 use crate::engine::Totals;
 use crate::error::{ReelError, Result};
 use crate::format::column::{
@@ -51,6 +51,7 @@ pub enum ColumnIndex {
     W108(WidthIndex<[u8; 108], Trees<108>>),
 
     /// The widths a column may ask for an open-addressed shard at
+    Open16(WidthIndex<[u8; 16], OpenTables<16>>),
     Open32(WidthIndex<[u8; 32], OpenTables<32>>),
     Open34(WidthIndex<[u8; 34], OpenTables<34>>),
     Open72(WidthIndex<[u8; 72], OpenTables<72>>),
@@ -117,6 +118,7 @@ macro_rules! on_index {
             ColumnIndex::W72($bound) => $body,
             ColumnIndex::W96($bound) => $body,
             ColumnIndex::W108($bound) => $body,
+            ColumnIndex::Open16($bound) => $body,
             ColumnIndex::Open32($bound) => $body,
             ColumnIndex::Open34($bound) => $body,
             ColumnIndex::Open72($bound) => $body,
@@ -164,8 +166,12 @@ impl ColumnIndex {
     ///
     /// A volume that does not honour declarations drops the open-shard request
     /// rather than refusing it: nothing on disk turns on which structure the keys
-    /// sat in.
-    pub fn new(spec: &ColumnSpec, shapes: ShardShapes) -> Result<ColumnIndex> {
+    /// sat in. The residency sizes the filters in front of the shards.
+    pub fn new(
+        spec: &ColumnSpec,
+        shapes: ShardShapes,
+        residency: IndexResidency,
+    ) -> Result<ColumnIndex> {
         let is_open = spec.map_shape == MapShape::Open && shapes == ShardShapes::Declared;
         let Some(width) = spec.key_width.fixed() else {
             if is_open {
@@ -174,14 +180,15 @@ impl ColumnIndex {
                     spec.name,
                 )));
             }
-            return Ok(ColumnIndex::Var(WidthIndex::new(spec)));
+            return Ok(ColumnIndex::Var(WidthIndex::new(spec, residency)));
         };
         if is_open {
             return match width {
-                32 => Ok(ColumnIndex::Open32(WidthIndex::new(spec))),
-                34 => Ok(ColumnIndex::Open34(WidthIndex::new(spec))),
-                72 => Ok(ColumnIndex::Open72(WidthIndex::new(spec))),
-                108 => Ok(ColumnIndex::Open108(WidthIndex::new(spec))),
+                16 => Ok(ColumnIndex::Open16(WidthIndex::new(spec, residency))),
+                32 => Ok(ColumnIndex::Open32(WidthIndex::new(spec, residency))),
+                34 => Ok(ColumnIndex::Open34(WidthIndex::new(spec, residency))),
+                72 => Ok(ColumnIndex::Open72(WidthIndex::new(spec, residency))),
+                108 => Ok(ColumnIndex::Open108(WidthIndex::new(spec, residency))),
                 other => Err(ReelError::Config(format!(
                     "column {} asks for an open shard at {other} bytes, which the index \
                      holds no arm for",
@@ -190,22 +197,22 @@ impl ColumnIndex {
             };
         }
         match width {
-            0 => Ok(ColumnIndex::W0(WidthIndex::new(spec))),
-            2 => Ok(ColumnIndex::W2(WidthIndex::new(spec))),
-            8 => Ok(ColumnIndex::W8(WidthIndex::new(spec))),
-            12 => Ok(ColumnIndex::W12(WidthIndex::new(spec))),
-            16 => Ok(ColumnIndex::W16(WidthIndex::new(spec))),
-            20 => Ok(ColumnIndex::W20(WidthIndex::new(spec))),
-            24 => Ok(ColumnIndex::W24(WidthIndex::new(spec))),
-            32 => Ok(ColumnIndex::W32(WidthIndex::new(spec))),
-            34 => Ok(ColumnIndex::W34(WidthIndex::new(spec))),
-            36 => Ok(ColumnIndex::W36(WidthIndex::new(spec))),
-            40 => Ok(ColumnIndex::W40(WidthIndex::new(spec))),
-            44 => Ok(ColumnIndex::W44(WidthIndex::new(spec))),
-            48 => Ok(ColumnIndex::W48(WidthIndex::new(spec))),
-            72 => Ok(ColumnIndex::W72(WidthIndex::new(spec))),
-            96 => Ok(ColumnIndex::W96(WidthIndex::new(spec))),
-            108 => Ok(ColumnIndex::W108(WidthIndex::new(spec))),
+            0 => Ok(ColumnIndex::W0(WidthIndex::new(spec, residency))),
+            2 => Ok(ColumnIndex::W2(WidthIndex::new(spec, residency))),
+            8 => Ok(ColumnIndex::W8(WidthIndex::new(spec, residency))),
+            12 => Ok(ColumnIndex::W12(WidthIndex::new(spec, residency))),
+            16 => Ok(ColumnIndex::W16(WidthIndex::new(spec, residency))),
+            20 => Ok(ColumnIndex::W20(WidthIndex::new(spec, residency))),
+            24 => Ok(ColumnIndex::W24(WidthIndex::new(spec, residency))),
+            32 => Ok(ColumnIndex::W32(WidthIndex::new(spec, residency))),
+            34 => Ok(ColumnIndex::W34(WidthIndex::new(spec, residency))),
+            36 => Ok(ColumnIndex::W36(WidthIndex::new(spec, residency))),
+            40 => Ok(ColumnIndex::W40(WidthIndex::new(spec, residency))),
+            44 => Ok(ColumnIndex::W44(WidthIndex::new(spec, residency))),
+            48 => Ok(ColumnIndex::W48(WidthIndex::new(spec, residency))),
+            72 => Ok(ColumnIndex::W72(WidthIndex::new(spec, residency))),
+            96 => Ok(ColumnIndex::W96(WidthIndex::new(spec, residency))),
+            108 => Ok(ColumnIndex::W108(WidthIndex::new(spec, residency))),
             other => Err(ReelError::Config(format!(
                 "column {} declares a key width of {other} bytes, which no index holds",
                 spec.name,
@@ -224,6 +231,16 @@ impl ColumnIndex {
     /// for both would report a tree's cost for an open shard's keys.
     pub fn overhead_per_key(&self) -> u64 {
         on_index!(self, index => index.overhead_per_key())
+    }
+
+    /// Bytes the filters in front of the shards hold
+    pub fn filter_bytes(&self) -> u64 {
+        on_index!(self, index => index.filter_bytes())
+    }
+
+    /// Bytes the column's index holds, counted from what its maps allocated
+    pub fn heap_bytes(&self) -> u64 {
+        on_index!(self, index => index.heap_bytes())
     }
 
     /// Which structure this column's shards opened in, not always what was declared
@@ -744,53 +761,109 @@ impl<K: IndexKey> Covered<K> {
     }
 }
 
-/// Bits one shard's filter holds, sixteen kibibytes allocated on first use
+/// Words one shard's filter takes at most, sixteen kibibytes
 const FILTER_WORDS: usize = 2048;
 
-/// A filter in front of one shard's lock, answering only definite absence
+/// Words a paged or hot column's filters take between all of its shards, a mebibyte
 ///
-/// Allocated the first time its shard takes a key, so the sixty-five thousand
-/// shards a two-byte column declares cost nothing until they hold something. A
-/// key's bits are set before the map takes it, so a reader that sees a bit clear is
-/// reading a state the lock it skipped would also have allowed. Nothing is ever
-/// cleared, so a filter that saturates answers maybe for everything.
-struct ShardFilter {
-    words: OnceLock<Box<[AtomicU64]>>,
+/// A column of few shards gives each the full filter. A two-byte column cuts it to
+/// two words a shard, allocated at open so a hot budget's floor holds all of them.
+const COLUMN_FILTER_WORDS: usize = 1 << 17;
+
+/// Filters in front of every shard's lock, answering only definite absence
+///
+/// A resident column gives each shard the full filter, allocated on the shard's
+/// first key, since its shards keep their keys and a small filter would fill. A
+/// paged or hot column cuts one mebibyte evenly between its shards at open. A key's
+/// bits are set before the map takes it and a shard's bits are cleared when its map
+/// empties, both under the shard's write lock, so a reader that sees a bit clear is
+/// reading a state the lock it skipped would also have allowed.
+struct ShardFilters {
+    /// A paged or hot column's words, every shard's run of them in shard order
+    shared: Box<[AtomicU64]>,
+
+    /// A resident column's filters, one per shard, each built on first use
+    own: Box<[OnceLock<Box<[AtomicU64]>>]>,
+
+    /// Filters `own` has built so far
+    built: AtomicU64,
+
+    /// Words each shard owns, a power of two
+    per_shard: usize,
 }
 
-impl ShardFilter {
-    fn empty() -> ShardFilter {
-        ShardFilter {
-            words: OnceLock::new(),
+impl ShardFilters {
+    fn new(shards: usize, residency: IndexResidency) -> ShardFilters {
+        let shards = shards.max(1);
+        if residency == IndexResidency::Resident {
+            return ShardFilters {
+                shared: Box::new([]),
+                own: (0..shards).map(|_| OnceLock::new()).collect(),
+                built: AtomicU64::new(0),
+                per_shard: FILTER_WORDS,
+            };
+        }
+        let even = (COLUMN_FILTER_WORDS / shards).clamp(1, FILTER_WORDS);
+        let per_shard = 1usize << even.ilog2();
+        ShardFilters {
+            shared: (0..per_shard * shards).map(|_| AtomicU64::new(0)).collect(),
+            own: Box::new([]),
+            built: AtomicU64::new(0),
+            per_shard,
+        }
+    }
+
+    /// One shard's words, where a shard that never took a key has none
+    fn of(&self, shard: usize) -> Option<&[AtomicU64]> {
+        match self.own.get(shard) {
+            Some(own) => own.get().map(|words| &**words),
+            None => Some(&self.shared[shard * self.per_shard..(shard + 1) * self.per_shard]),
         }
     }
 
     /// Record a key on its way into the shard's map
-    fn note(&self, hash: u64) {
-        let words = self
-            .words
-            .get_or_init(|| (0..FILTER_WORDS).map(|_| AtomicU64::new(0)).collect());
-        let (first, second) = probe_pair(hash);
+    fn note(&self, shard: usize, hash: u64) {
+        let words = match self.own.get(shard) {
+            Some(own) => &**own.get_or_init(|| {
+                self.built.fetch_add(1, Ordering::Relaxed);
+                (0..self.per_shard).map(|_| AtomicU64::new(0)).collect()
+            }),
+            None => &self.shared[shard * self.per_shard..(shard + 1) * self.per_shard],
+        };
+        let (first, second) = probe_pair(hash, self.per_shard);
         words[(first / 64) as usize].fetch_or(1 << (first % 64), Ordering::Relaxed);
         words[(second / 64) as usize].fetch_or(1 << (second % 64), Ordering::Relaxed);
     }
 
     /// Whether the shard may hold the key, where a no is certain
-    fn may_hold(&self, hash: u64) -> bool {
-        let Some(words) = self.words.get() else {
+    fn may_hold(&self, shard: usize, hash: u64) -> bool {
+        let Some(words) = self.of(shard) else {
             return false;
         };
-        let (first, second) = probe_pair(hash);
+        let (first, second) = probe_pair(hash, self.per_shard);
         words[(first / 64) as usize].load(Ordering::Relaxed) & (1 << (first % 64)) != 0
             && words[(second / 64) as usize].load(Ordering::Relaxed) & (1 << (second % 64)) != 0
+    }
+
+    /// Forget every key of a shard whose map holds nothing, under its write lock
+    fn clear(&self, shard: usize) {
+        for word in self.of(shard).unwrap_or_default() {
+            word.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Bytes the filters hold, the ones built on first use included
+    fn heap_bytes(&self) -> u64 {
+        let built = self.built.load(Ordering::Relaxed) * (self.per_shard * 8) as u64;
+        (std::mem::size_of_val(&*self.shared) + std::mem::size_of_val(&*self.own)) as u64 + built
     }
 }
 
 /// Two bit positions from one key hash, mixed apart so the pair is not one sequence
-fn probe_pair(hash: u64) -> (u64, u64) {
-    const BITS: u64 = (FILTER_WORDS * 64) as u64;
+fn probe_pair(hash: u64, words: usize) -> (u64, u64) {
+    let mask = (words as u64 * 64) - 1;
     let other = hash.wrapping_mul(0xD6E8_FEB8_6659_FD93) ^ (hash >> 32);
-    (hash % BITS, other % BITS)
+    (hash & mask, other & mask)
 }
 
 /// One hash of a key's bytes, taken borrowed so a probe builds no key
@@ -811,7 +884,7 @@ pub struct WidthIndex<K: IndexKey, S: Shape<K>> {
     shards: Vec<RwLock<ShardState<K, S>>>,
 
     /// A filter beside each shard's lock, so a definite miss never takes it
-    filters: Vec<ShardFilter>,
+    filters: ShardFilters,
 
     /// Ranges a tombstone swept, tested against records that arrive after it
     covers: RwLock<Vec<Covered<K>>>,
@@ -834,16 +907,14 @@ pub struct WidthIndex<K: IndexKey, S: Shape<K>> {
 
 impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// An empty index for a column, split into the shards the column declares
-    pub fn new(spec: &ColumnSpec) -> WidthIndex<K, S> {
+    pub fn new(spec: &ColumnSpec, residency: IndexResidency) -> WidthIndex<K, S> {
         let mut shards = Vec::with_capacity(spec.shard_count());
-        let mut filters = Vec::with_capacity(spec.shard_count());
         for _ in 0..spec.shard_count() {
             shards.push(RwLock::new(ShardState::empty()));
-            filters.push(ShardFilter::empty());
         }
         WidthIndex {
             shards,
-            filters,
+            filters: ShardFilters::new(spec.shard_count(), residency),
             covers: RwLock::new(Vec::new()),
             has_covers: AtomicBool::new(false),
             occupied: RwLock::new(TBTreeMap::new()),
@@ -869,6 +940,22 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// Bytes a resident key costs beyond itself and its entry, from the shape
     pub fn overhead_per_key(&self) -> u64 {
         S::OVERHEAD_PER_KEY
+    }
+
+    /// Bytes the filters in front of the shards hold
+    pub fn filter_bytes(&self) -> u64 {
+        self.filters.heap_bytes()
+    }
+
+    /// Bytes the column's index holds: its shards, their maps' allocations and the filters
+    ///
+    /// Counts capacity, since a shard's arenas grow by doubling and hold what they
+    /// allocated until a pack gives it back.
+    pub fn heap_bytes(&self) -> u64 {
+        let fixed = (self.shards.capacity() * std::mem::size_of::<RwLock<ShardState<K, S>>>())
+            as u64
+            + self.filters.heap_bytes();
+        fixed + self.sum_shards(|state| state.map.heap_bytes() + state.carried.heap_bytes())
     }
 
     /// Which structure this column's shards took
@@ -997,7 +1084,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         // The entry goes in on the way past and a refusal puts back what it
         // displaced, so an accepted put is one descent rather than a lookup and an
         // insert.
-        self.filters[at].note(filter_hash(key.as_slice()));
+        self.filters.note(at, filter_hash(key.as_slice()));
         // Taken before the key moves into the map, since a variable column's key
         // owns the bytes the span is measured from.
         let width = key.width();
@@ -1219,7 +1306,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             None => Landed::Nothing,
         };
 
-        self.filters[at].note(filter_hash(key.as_slice()));
+        self.filters.note(at, filter_hash(key.as_slice()));
         state
             .map
             .put(key.clone(), Entry::grave_from(lsn, tombstone.segment));
@@ -1273,7 +1360,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             return false;
         }
 
-        self.filters[at].note(filter_hash(key.as_slice()));
+        self.filters.note(at, filter_hash(key.as_slice()));
         state.map.put(key, Entry::grave(lsn));
         state.note_grave(lsn);
         self.note_filled(at, was_empty);
@@ -1307,7 +1394,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         }
         segments.release_live(from.segment, span_of(key.width(), from.len));
         segments.mark_live(to.segment, lsn, span_of(key.width(), to.len));
-        self.filters[at].note(filter_hash(key.as_slice()));
+        self.filters.note(at, filter_hash(key.as_slice()));
         state.map.put(
             key,
             Entry::new(to, lsn).stamped(segments.live_incarnation(to.segment)),
@@ -1358,7 +1445,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             return None;
         }
         let at = self.shard_of_bytes(key);
-        if !self.filters[at].may_hold(filter_hash(key)) {
+        if !self.filters.may_hold(at, filter_hash(key)) {
             return None;
         }
         read(&self.shards[at]).map.at(key).copied()
@@ -1383,7 +1470,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         for (at, index) in run.iter().enumerate() {
             let key = keys[*index].as_slice();
             let shard = self.shard_of_bytes(key);
-            if !self.filters[shard].may_hold(filter_hash(key)) {
+            if !self.filters.may_hold(shard, filter_hash(key)) {
                 continue;
             }
             if !K::accepts(key) {
@@ -1788,7 +1875,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             return None;
         }
         let at = self.shard_of_bytes(key);
-        if !self.filters[at].may_hold(filter_hash(key)) {
+        if !self.filters.may_hold(at, filter_hash(key)) {
             return None;
         }
         let entry = read(&self.shards[at]).map.at(key).copied()?;
@@ -1836,7 +1923,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                     expected_lsn,
                     span_of(key.width(), new_loc.len),
                 );
-                self.filters[at].note(filter_hash(key.as_slice()));
+                self.filters.note(at, filter_hash(key.as_slice()));
                 // The copy sits in an open tail, held live until the repoint is
                 // published, so its stamp is issued here.
                 state.map.put(
@@ -1974,7 +2061,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             if entry.is_grave() {
                 state.note_grave(entry.lsn);
             }
-            self.filters[at].note(filter_hash(key.as_slice()));
+            self.filters.note(at, filter_hash(key.as_slice()));
         }
         state.map.absorb_sorted(run);
         self.note_filled(at, was_empty);
@@ -2011,6 +2098,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         for at in occupied {
             let mut state = write(&self.shards[at]);
             state.map.empty();
+            self.filters.clear(at);
             state.bytes = 0;
             state.graves = 0;
             state.carried.empty();
@@ -2406,6 +2494,9 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// map: dropping it there would take its paged count out of every total, which
     /// reads as the keys having been deleted rather than handed over.
     fn note_emptied(&self, at: usize, state: &mut ShardState<K, S>) {
+        if state.map.vacant() {
+            self.filters.clear(at);
+        }
         if state.map.vacant() && state.paged == 0 {
             // The room goes with the walk: nothing visits a shard outside the
             // occupied set, so a shard left here is one nothing will pack.
@@ -2568,6 +2659,9 @@ pub trait ShardMap<K: IndexKey, V: 'static>: Default {
     /// Whether the shard holds nothing
     fn vacant(&self) -> bool;
 
+    /// Bytes the map has allocated, spare room included
+    fn heap_bytes(&self) -> u64;
+
     /// Drop every key, keeping whatever room was already taken
     fn empty(&mut self);
 
@@ -2688,6 +2782,10 @@ impl<const B: usize, V: Default + 'static> ShardMap<Box<[u8]>, V> for TBTreeMap<
         self.is_empty()
     }
 
+    fn heap_bytes(&self) -> u64 {
+        TBTreeMap::heap_bytes(self)
+    }
+
     fn empty(&mut self) {
         self.clear();
     }
@@ -2772,6 +2870,10 @@ impl<const N: usize, const B: usize, V: Default + 'static> ShardMap<[u8; N], V>
 
     fn vacant(&self) -> bool {
         self.is_empty()
+    }
+
+    fn heap_bytes(&self) -> u64 {
+        TBTreeMap::heap_bytes(self)
     }
 
     fn empty(&mut self) {
@@ -2861,6 +2963,10 @@ impl<const N: usize, V: Default + 'static> ShardMap<[u8; N], V> for OpenTable<N,
 
     fn vacant(&self) -> bool {
         self.is_empty()
+    }
+
+    fn heap_bytes(&self) -> u64 {
+        OpenTable::heap_bytes(self)
     }
 
     fn empty(&mut self) {
@@ -3237,7 +3343,8 @@ mod tests {
     // an open table sweeps its shard key and refuses any other width
     #[test]
     fn open_prefix_sweep_takes_only_its_shard() {
-        let index: WidthIndex<[u8; 34], OpenTables<34>> = WidthIndex::new(&SHARDED);
+        let index: WidthIndex<[u8; 34], OpenTables<34>> =
+            WidthIndex::new(&SHARDED, IndexResidency::Resident);
         let segments = SegmentTable::new();
         let mut wrote = BTreeSet::new();
         for group in [7u16, 1, 40] {
@@ -3350,7 +3457,7 @@ mod tests {
     // a variable column opens, where before it was refused outright
     #[test]
     fn a_variable_column_opens() {
-        let index = ColumnIndex::new(&VARIABLE, ShardShapes::Tree)
+        let index = ColumnIndex::new(&VARIABLE, ShardShapes::Tree, IndexResidency::Resident)
             .expect("a variable column has an index now");
         assert!(matches!(index, ColumnIndex::Var(_)));
         assert_eq!(index.key_width(), 0, "a variable column declares no width");
@@ -3359,7 +3466,8 @@ mod tests {
     // keys of different lengths live in one column and answer for themselves
     #[test]
     fn a_variable_column_holds_every_length() {
-        let index = ColumnIndex::new(&VARIABLE, ShardShapes::Tree).expect("index");
+        let index = ColumnIndex::new(&VARIABLE, ShardShapes::Tree, IndexResidency::Resident)
+            .expect("index");
         let segments = SegmentTable::new();
 
         let names: Vec<Vec<u8>> = [
@@ -3400,7 +3508,8 @@ mod tests {
     // a shorter key sorts before what extends it, which listing depends on
     #[test]
     fn a_variable_column_orders_by_bytes() {
-        let index = ColumnIndex::new(&VARIABLE, ShardShapes::Tree).expect("index");
+        let index = ColumnIndex::new(&VARIABLE, ShardShapes::Tree, IndexResidency::Resident)
+            .expect("index");
         let segments = SegmentTable::new();
 
         let mut names: Vec<Vec<u8>> = vec![
@@ -3428,7 +3537,8 @@ mod tests {
     // an overwrite replaces the key rather than adding a second one
     #[test]
     fn a_variable_key_overwrites_in_place() {
-        let index = ColumnIndex::new(&VARIABLE, ShardShapes::Tree).expect("index");
+        let index = ColumnIndex::new(&VARIABLE, ShardShapes::Tree, IndexResidency::Resident)
+            .expect("index");
         let segments = SegmentTable::new();
         let name = b"photos/2026/cat.jpg".as_slice();
 
@@ -3464,7 +3574,7 @@ mod tests {
     };
 
     fn sharded() -> WidthIndex<[u8; 34], Trees<34>> {
-        WidthIndex::new(&SHARDED)
+        WidthIndex::new(&SHARDED, IndexResidency::Resident)
     }
 
     fn key(group: u16, byte: u8) -> Vec<u8> {
@@ -3479,6 +3589,74 @@ mod tests {
 
     fn keys_in(out: &KeyPage) -> Vec<Vec<u8>> {
         (0..out.len()).map(|at| out.key_at(at)).collect()
+    }
+
+    /// One of many keys in the same shard, told apart by its number
+    fn crowded(at: u32) -> Vec<u8> {
+        let mut out = 7u16.to_be_bytes().to_vec();
+        out.extend_from_slice(&at.to_be_bytes());
+        out.resize(34, 0);
+        out
+    }
+
+    // a paged shard that empties forgets its keys and still finds one put back
+    #[test]
+    fn a_paged_shard_clears_and_finds_a_reinsert() {
+        let index: WidthIndex<[u8; 34], Trees<34>> =
+            WidthIndex::new(&SHARDED, IndexResidency::Paged);
+        let segments = SegmentTable::new();
+        for byte in 0..50u8 {
+            let entry = Entry::new(loc(1, u32::from(byte), 10), Lsn(u64::from(byte) + 1));
+            index.insert(&key(7, byte), entry, &segments, None);
+        }
+        for byte in 0..50u8 {
+            assert!(index.page_out(&key(7, byte), loc(1, u32::from(byte), 10)));
+        }
+        assert!(
+            !index.filters.may_hold(7, filter_hash(&key(7, 3))),
+            "the emptied shard's filter still holds its keys"
+        );
+
+        index.insert(
+            &key(7, 3),
+            Entry::new(loc(2, 0, 10), Lsn(100)),
+            &segments,
+            None,
+        );
+        assert_eq!(
+            index.get(&key(7, 3)).map(|entry| entry.loc),
+            Some(loc(2, 0, 10))
+        );
+        assert!(
+            index.get(&key(7, 4)).is_none(),
+            "a paged key reads from its footer"
+        );
+    }
+
+    // a resident shard of many keys answers a clear miss without taking its lock
+    #[test]
+    fn a_resident_miss_skips_a_crowded_shard_lock() {
+        let index: WidthIndex<[u8; 34], Trees<34>> =
+            WidthIndex::new(&SHARDED, IndexResidency::Resident);
+        let segments = SegmentTable::new();
+        for at in 0..1_000u32 {
+            let entry = Entry::new(loc(1, at, 10), Lsn(u64::from(at) + 1));
+            index.insert(&crowded(at), entry, &segments, None);
+        }
+
+        let held = write(&index.shards[7]);
+        let (answer, answered) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let found = (1_000..1_100u32)
+                    .filter(|at| index.get(&crowded(*at)).is_some())
+                    .count();
+                answer.send(found).expect("send");
+            });
+            let missed = answered.recv_timeout(std::time::Duration::from_secs(5));
+            drop(held);
+            assert_eq!(missed, Ok(0), "a miss waited on the shard's lock");
+        });
     }
 
     /// Run the lazy sweep to completion, the way the maintenance tick would
@@ -3561,10 +3739,10 @@ mod tests {
             map_shape: MapShape::Tree,
         };
 
-        assert!(ColumnIndex::new(&odd, ShardShapes::Tree).is_err());
-        assert!(ColumnIndex::new(&SHARDED, ShardShapes::Tree).is_ok());
+        assert!(ColumnIndex::new(&odd, ShardShapes::Tree, IndexResidency::Resident).is_err());
+        assert!(ColumnIndex::new(&SHARDED, ShardShapes::Tree, IndexResidency::Resident).is_ok());
         assert_eq!(
-            ColumnIndex::new(&FLAT, ShardShapes::Tree)
+            ColumnIndex::new(&FLAT, ShardShapes::Tree, IndexResidency::Resident)
                 .expect("flat")
                 .key_width(),
             32
@@ -3581,19 +3759,29 @@ mod tests {
         };
 
         // The slack a slot holds open grows with the slot, so each width owes its own.
-        for (width, overhead) in [(32u16, 9u64), (34, 9), (72, 14), (108, 20)] {
-            let index = ColumnIndex::new(&open(width), ShardShapes::Declared).expect("an open arm");
+        for (width, overhead) in [(16u16, 6u64), (32, 9), (34, 9), (72, 14), (108, 20)] {
+            let index = ColumnIndex::new(
+                &open(width),
+                ShardShapes::Declared,
+                IndexResidency::Resident,
+            )
+            .expect("an open arm");
             assert_eq!(index.key_width(), width);
             assert_eq!(index.map_shape(), MapShape::Open, "{width} byte keys");
             assert_eq!(index.overhead_per_key(), overhead, "{width} byte keys");
         }
-        for width in [8u16, 16, 48] {
+        for width in [8u16, 20, 48] {
             assert!(
-                ColumnIndex::new(&open(width), ShardShapes::Declared).is_err(),
+                ColumnIndex::new(
+                    &open(width),
+                    ShardShapes::Declared,
+                    IndexResidency::Resident
+                )
+                .is_err(),
                 "{width}"
             );
         }
-        assert!(ColumnIndex::new(&VARIABLE, ShardShapes::Tree).is_ok());
+        assert!(ColumnIndex::new(&VARIABLE, ShardShapes::Tree, IndexResidency::Resident).is_ok());
         assert!(
             ColumnIndex::new(
                 &ColumnSpec {
@@ -3601,6 +3789,7 @@ mod tests {
                     ..VARIABLE
                 },
                 ShardShapes::Declared,
+                IndexResidency::Resident,
             )
             .is_err(),
             "a column with no declared width has no slot to size",
@@ -3623,7 +3812,8 @@ mod tests {
                 map_shape: MapShape::Tree,
             };
 
-            let index = ColumnIndex::new(&spec, ShardShapes::Tree).expect("a small width declared");
+            let index = ColumnIndex::new(&spec, ShardShapes::Tree, IndexResidency::Resident)
+                .expect("a small width declared");
             assert_eq!(index.key_width(), u16::from(width));
         }
     }
@@ -3850,7 +4040,8 @@ mod tests {
     // a flat column keeps one shard and answers no prefix totals at all
     #[test]
     fn flat_column_has_one_shard() {
-        let index: WidthIndex<[u8; 32], Trees<32>> = WidthIndex::new(&FLAT);
+        let index: WidthIndex<[u8; 32], Trees<32>> =
+            WidthIndex::new(&FLAT, IndexResidency::Resident);
         let segments = SegmentTable::new();
         index
             .insert(

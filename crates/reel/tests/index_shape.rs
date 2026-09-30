@@ -33,6 +33,7 @@ use reel::index::tbtreemap::{
     node_width, scan_backend, scans, Shared, TBTreeMap, TreeKey, Whole, MAX_NODE_WIDTH,
     MIN_NODE_WIDTH, NODE_BUDGET, SHARED_CAP,
 };
+use reel::IndexResidency;
 
 /// Nodes a tree of record keys holds, which is what the records column takes
 const RECORD_NODES: usize = node_width(34);
@@ -2267,7 +2268,8 @@ fn batched_index_reads() {
     );
 
     for &per_group in &[65_536usize, 1_048_576] {
-        let index: WidthIndex<[u8; 34], Trees<34>> = WidthIndex::new(&RECORDS);
+        let index: WidthIndex<[u8; 34], Trees<34>> =
+            WidthIndex::new(&RECORDS, IndexResidency::Resident);
         let segments = SegmentTable::new();
         let mut rng = SmallRng::seed_from_u64(0x51ce);
         let mut held: Vec<[u8; 34]> = Vec::with_capacity(per_group * GROUPS as usize);

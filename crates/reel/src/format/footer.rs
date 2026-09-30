@@ -936,20 +936,21 @@ impl SegmentFooter {
     /// Add one row, opening the partition for its column if this is the first
     ///
     /// A partition opens at the width of the first key its column offers and strides by
-    /// it. A key of a second width stops the striding rather than being padded into it.
+    /// it. A key of a second width stops the striding and is never padded into it. A new
+    /// partition goes in at its column's place, so a lookup by column can search the
+    /// footer at every stage.
     pub fn push(&mut self, entry: &FooterEntry) {
         let column = entry.key.column;
         let width = entry.key.width();
         let at = match self
             .partitions
-            .iter()
-            .position(|found| found.column == column)
+            .binary_search_by_key(&column, |found| found.column)
         {
-            Some(at) => at,
-            None => {
+            Ok(at) => at,
+            Err(at) => {
                 self.partitions
-                    .push(FooterPartition::new(column, width, entry.inline_width));
-                self.partitions.len() - 1
+                    .insert(at, FooterPartition::new(column, width, entry.inline_width));
+                at
             }
         };
         if self.partitions[at].key_width != width {
@@ -1209,6 +1210,9 @@ impl SegmentFooter {
             ));
         }
 
+        // Packed in column order, and held that way whatever a file says, since every
+        // lookup by column is a binary search.
+        partitions.sort_by_key(|partition| partition.column);
         Ok(SegmentFooter {
             partitions,
             min_lsn,
@@ -1217,6 +1221,27 @@ impl SegmentFooter {
             tally,
         })
     }
+
+    /// One column's partition, found by a binary search over the column order
+    pub fn partition(&self, column: ColumnId) -> Option<&FooterPartition> {
+        partition_in(&self.partitions, column, |partition| partition.column)
+    }
+}
+
+/// One column's entry in a run held in column order
+///
+/// A handful is scanned outright, since a scan of a few beats the branches of a search.
+pub(crate) fn partition_in<Held>(
+    held: &[Held],
+    column: ColumnId,
+    column_of: impl Fn(&Held) -> ColumnId,
+) -> Option<&Held> {
+    if held.len() <= 8 {
+        return held.iter().find(|one| column_of(one) == column);
+    }
+    held.binary_search_by_key(&column, &column_of)
+        .ok()
+        .map(|at| &held[at])
 }
 
 /// One partition's rows in their on-disk form
@@ -1266,12 +1291,19 @@ fn read_partitions(
 ) -> Result<(Vec<FooterPartition>, usize)> {
     let mut partitions = Vec::with_capacity(partition_count);
     let mut rows_at = 0usize;
+    let mut listed = [false; u8::MAX as usize + 1];
     for index in 0..partition_count {
         let at = directory_at + index * DIRECTORY_ROW_LEN;
         let row = footer
             .get(at..at + DIRECTORY_ROW_LEN)
             .ok_or_else(|| ReelError::Corruption("footer directory is truncated".to_string()))?;
         let column = ColumnId(row[0]);
+        // A lookup by column finds one partition, so a second would be rows no read sees.
+        if std::mem::replace(&mut listed[row[0] as usize], true) {
+            return Err(ReelError::Corruption(
+                "footer directory lists a column twice".to_string(),
+            ));
+        }
         let key_width = u16::from_le_bytes([row[1], row[2]]);
         let inline_width = u16::from_le_bytes([row[3], row[4]]);
         if inline_width as usize > ROW_CARRY_MAX {
@@ -1761,6 +1793,66 @@ mod tests {
         assert_eq!(two.len(), 2);
         assert_eq!(two.key_at(0).map(<[u8]>::len), Some(34));
         assert_eq!(two.key_at(1).map(<[u8]>::len), Some(200));
+    }
+
+    // a footer of many columns finds each one's partition, and none for a column it lacks
+    #[test]
+    fn many_columns_find_their_partitions() {
+        // Pushed high to low, so the pack has an order to put right.
+        let rows: Vec<FooterEntry> = (0..40u8)
+            .rev()
+            .map(|column| entry(ColumnId(column * 2 + 1), column, 16, 1, 0, 100))
+            .collect();
+        let bytes = SegmentFooter::build(rows).pack(0).expect("pack");
+        let parsed = SegmentFooter::parse(&bytes).expect("parse");
+        for column in 0..40u8 {
+            let id = ColumnId(column * 2 + 1);
+            assert_eq!(parsed.partition(id).map(|found| found.column), Some(id));
+            assert!(
+                parsed.partition(ColumnId(column * 2)).is_none(),
+                "column {}",
+                column * 2
+            );
+        }
+    }
+
+    // a built footer of many columns finds each one's partition before any pack
+    #[test]
+    fn built_columns_find_their_partitions() {
+        // Arriving out of order, and more of them than the scan takes.
+        let arrivals = [9u8, 3, 17, 1, 12, 5, 20, 7, 2, 15, 11];
+        let rows: Vec<FooterEntry> = arrivals
+            .iter()
+            .map(|column| entry(ColumnId(*column), *column, 16, 1, 0, 100))
+            .collect();
+        let mut footer = SegmentFooter::build(rows);
+        for column in arrivals {
+            let row =
+                FooterEntry::new(key(ColumnId(column), 0xee, 16), Lsn(2), 0, 100, Flags::DATA);
+            footer.push(&row);
+        }
+        for column in arrivals {
+            let found = footer.partition(ColumnId(column));
+            assert_eq!(found.map(|found| found.column), Some(ColumnId(column)));
+            assert_eq!(found.map(FooterPartition::len), Some(2), "column {column}");
+        }
+        assert!(footer.partition(ColumnId(4)).is_none());
+    }
+
+    // a directory that lists one column twice is refused as corrupt
+    #[test]
+    fn a_column_listed_twice_is_refused() {
+        let mut footer = SegmentFooter::build(vec![
+            entry(ColumnId(1), 0x01, 16, 1, 0, 10),
+            entry(ColumnId(2), 0x01, 16, 2, 10, 10),
+        ]);
+        let mut packed = footer.pack(0).expect("pack");
+        assert!(SegmentFooter::parse(&packed).is_ok());
+
+        let second = packed.len() - FIXED_TAIL_LEN - DIRECTORY_ROW_LEN;
+        packed[second] = 1;
+        reseal(&mut packed);
+        assert!(SegmentFooter::parse(&packed).is_err());
     }
 
     // rows of differing widths survive a pack and a parse with their keys intact

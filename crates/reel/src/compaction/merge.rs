@@ -108,10 +108,7 @@ struct MergeSource {
 impl MergeSource {
     /// The partition holding one column's rows, or nothing where it holds none
     fn partition_of(&self, column: ColumnId) -> Option<&FooterPartition> {
-        self.footer
-            .partitions
-            .iter()
-            .find(|partition| partition.column == column)
+        self.footer.partition(column)
     }
 }
 

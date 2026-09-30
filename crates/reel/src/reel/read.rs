@@ -11,8 +11,8 @@ use crate::io::op::FileId;
 use crate::io::ServingBackend;
 use crate::reel::segment::{SplitAnswer, SplitRead};
 
-use super::{is_missing, recycle_header, RecordRead};
-use reel_core::Value;
+use super::{is_missing, recycle_header, Ask, ReadScratch, RecordRead, Spot};
+use reel_core::{ReadBlock, Value};
 
 /// A whole framed record, or nothing when the segment no longer holds one there
 ///
@@ -119,13 +119,6 @@ pub(super) struct Run {
     pub(super) span: u64,
 }
 
-impl Run {
-    /// Whether this run is one record, which is read framed rather than cut
-    pub(super) fn is_single(&self) -> bool {
-        self.end - self.start == 1
-    }
-}
-
 /// Group records that sit next to each other into the reads that will serve them
 ///
 /// Only forward, only within one segment, and only across a small gap: a run that
@@ -184,6 +177,47 @@ pub(super) fn check_in_block(
         return Err(RecordRead::Corrupt);
     }
     Ok(codec)
+}
+
+/// Frame every record each run read, leaving its spot in the run's block
+///
+/// A run that came back short, or a segment gone under it, leaves its records as
+/// misses for the caller to resolve again.
+pub(super) fn place_runs(
+    scratch: &mut ReadScratch,
+    asks: &[Ask],
+    keys: &[KeyRef<'_>],
+    is_verified: bool,
+    blocks: &mut Vec<ReadBlock>,
+    spots: &mut [Spot],
+) -> Result<()> {
+    for (run, filled) in scratch.runs.iter().zip(scratch.filled.drain(..)) {
+        let block = match filled {
+            Ok((head, body)) => {
+                recycle_header(head);
+                body
+            }
+            Err(error) if is_missing(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        let base = scratch.plan[run.start].offset;
+        let index = blocks.len() as u32;
+        for held in &scratch.plan[run.start..run.end] {
+            let at = (held.offset - base) as usize;
+            let ask = &asks[held.at];
+            let key = keys[ask.at as usize];
+            if let Ok(codec) = check_in_block(&block, at, held, key, ask.lsn, ask.loc, is_verified) {
+                spots[ask.at as usize] = Spot {
+                    block: index,
+                    at: (at + held.prefix) as u32,
+                    len: held.len as u32,
+                    codec,
+                };
+            }
+        }
+        blocks.push(ReadBlock::new(block, crate::reel::payload::give));
+    }
+    Ok(())
 }
 
 /// Decide what a framed record read means, once the bytes are in hand

@@ -4,7 +4,6 @@
 //! A value is stored exactly as it arrives and read back verbatim, and a playback
 //! steps the column's index in key order and reads payloads lazily.
 
-use std::collections::VecDeque;
 use std::ops::Bound;
 use std::path::Path;
 
@@ -19,6 +18,7 @@ use crate::format::column::{ColumnId, KeyRef, KeyWidth, RecordKey, MAX_KEY_LEN};
 use crate::index::entry::Entry;
 use crate::index::page::KeyPage;
 use crate::index::playback::{PlaybackCursor, Way};
+use crate::engine::read::Placed;
 
 /// Keys a playback's first trip to the index pulls
 ///
@@ -697,9 +697,10 @@ impl ReelStore {
             scope,
             column,
             page,
-            ready: VecDeque::new(),
             staged: Vec::new(),
-            placed: Vec::new(),
+            found: Vec::new(),
+            placed: Placed::default(),
+            cursor: 0,
             run: PLAYBACK_RUN_MIN,
             is_done: false,
         }
@@ -879,17 +880,17 @@ struct Playback<'store> {
     /// Keys pulled from the index, a page at a time
     page: Page,
 
-    /// What the last run read, in key order, each beside its key's slot in the page
-    ///
-    /// Values rather than their bytes, since a merged read hands every record in a
-    /// run a window onto one block and owned vectors would copy them apart again.
-    ready: VecDeque<(usize, Value)>,
-
-    /// The page slots one run stages, kept across the runs of a walk
+    /// The page slots the last run staged, kept across the runs of a walk
     staged: Vec<usize>,
 
     /// Where the index placed each of those keys
-    placed: Vec<Option<Entry>>,
+    found: Vec<Option<Entry>>,
+
+    /// What the last run read, in place, by staged position
+    placed: Placed,
+
+    /// The staged position the walk reaches next
+    cursor: usize,
 
     /// Records the next run reads, doubling while the caller keeps draining them
     run: usize,
@@ -910,8 +911,7 @@ impl LentIter<'_> {
     /// The next entry, valid until the next step
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<(&[u8], &[u8])> {
-        let (key, value) = self.playback.next_lent()?;
-        Some((key, &**value))
+        self.playback.next_lent()
     }
 }
 
@@ -964,15 +964,9 @@ impl Iterator for Playback<'_> {
     type Item = (Vec<u8>, Value);
 
     fn next(&mut self) -> Option<(Vec<u8>, Value)> {
-        loop {
-            if let Some((slot, value)) = self.ready.pop_front() {
-                return Some((self.page.key(slot).to_vec(), value));
-            }
-            if self.is_done {
-                return None;
-            }
-            self.read_run();
-        }
+        let at = self.step()?;
+        let value = self.placed.take(at)?;
+        Some((self.page.key(self.staged[at]).to_vec(), value))
     }
 }
 
@@ -1006,16 +1000,26 @@ impl Playback<'_> {
     }
 
     /// The next entry with both halves lent until the caller's next step
-    fn next_lent(&mut self) -> Option<(&[u8], &Value)> {
-        self.ready.pop_front();
-        while self.ready.is_empty() {
+    fn next_lent(&mut self) -> Option<(&[u8], &[u8])> {
+        let at = self.step()?;
+        Some((self.page.key(self.staged[at]), self.placed.lend(at)?))
+    }
+
+    /// The staged position of the next record read, reading a run when these ran out
+    fn step(&mut self) -> Option<usize> {
+        loop {
+            while self.cursor < self.staged.len() {
+                let at = self.cursor;
+                self.cursor += 1;
+                if self.placed.holds(at) {
+                    return Some(at);
+                }
+            }
             if self.is_done {
                 return None;
             }
             self.read_run();
         }
-        let (slot, value) = self.ready.front()?;
-        Some((self.page.key(*slot), value))
     }
 
     /// Take the next run of keys off the page and read all of their payloads at once
@@ -1026,67 +1030,39 @@ impl Playback<'_> {
     /// per run, so a caller that stops early pays for what it nearly wanted.
     fn read_run(&mut self) {
         let wanted = self.run;
-        // Sized to the run, since these grow to exactly it on a draining walk. Taken
-        // out of the walk's own lists so a run past the first buys none of them.
-        let mut keys = std::mem::take(&mut self.staged);
-        let mut found = std::mem::take(&mut self.placed);
-        keys.clear();
-        found.clear();
-        keys.reserve(wanted);
-        found.reserve(wanted);
-        let mut bytes = 0u64;
         self.run = (self.run * 2).min(PLAYBACK_RUN_MAX);
-
-        while keys.len() < wanted && bytes < PLAYBACK_READ_BYTES {
-            let Some((slot, entry)) = self.next_in_scope(!keys.is_empty()) else {
+        self.staged.clear();
+        self.found.clear();
+        self.cursor = 0;
+        let mut bytes = 0u64;
+        while self.staged.len() < wanted && bytes < PLAYBACK_READ_BYTES {
+            let Some((slot, entry)) = self.next_in_scope(!self.staged.is_empty()) else {
                 break;
             };
             bytes += entry.map(|entry| u64::from(entry.loc.len)).unwrap_or(0);
-            keys.push(slot);
-            found.push(entry);
+            self.staged.push(slot);
+            self.found.push(entry);
         }
 
         // The entries came off the page the index already built, so the read goes
         // straight to the device rather than resolving these keys a second time.
         let column = self.column;
-        let asked: Vec<KeyRef<'_>> = keys
+        let keys: Vec<KeyRef<'_>> = self
+            .staged
             .iter()
             .map(|&slot| KeyRef::new(column, self.page.key(slot)))
             .collect();
-        let read = self.store.read_found(&asked, &found);
-        drop(asked);
-        self.placed = found;
-        match read {
-            Ok(values) => {
-                for (slot, value) in keys.drain(..).zip(values) {
-                    if let Some(value) = value {
-                        self.ready.push_back((slot, value));
-                    }
-                }
-                self.staged = keys;
-            }
-            // A failed run says nothing about which record failed it, so it is read
-            // again one at a time and the unreadable record drops out on its own.
-            Err(_) => {
-                self.read_singly(&mut keys, column);
-                self.staged = keys;
-            }
+        // A failed read says nothing about which record failed it, so every key it
+        // left missing is looked up on its own and an unreadable one drops out.
+        if let Err(error) = self.store.read_placed(&keys, &self.found, &mut self.placed) {
+            tracing::warn!("a playback read a run one record at a time: {error}");
         }
-    }
-
-    /// Read a run one record at a time, dropping the ones that cannot be read
-    ///
-    /// The store iterator has no way to carry an error, so a key the playback cannot
-    /// read drops out of the results and is counted as unreadable.
-    fn read_singly(&mut self, keys: &mut Vec<usize>, column: ColumnId) {
-        for slot in keys.drain(..) {
-            // The one place a run builds an owned key, on the path a device error
-            // already sent one record at a time.
-            let Ok(record) = RecordKey::from_bytes(column, self.page.key(slot)) else {
-                continue;
-            };
-            match self.store.get(&record) {
-                Ok(Some(value)) => self.ready.push_back((slot, value)),
+        let missed: Vec<usize> = self.placed.missed().collect();
+        for at in missed {
+            // The record moved or went bad since the page resolved it, which is what
+            // compaction does under a playback.
+            match keys[at].to_owned_key().and_then(|key| self.store.get(&key)) {
+                Ok(Some(value)) => self.placed.hold(at, value),
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!("a playback skipped a record it could not read: {error}");

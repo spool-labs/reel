@@ -289,3 +289,48 @@ fn idle_restarts_do_not_grow_the_store() {
         "idle restarts changed what the store weighs"
     );
 }
+
+// a clean stop leaves no segment holding blocks past its end
+#[cfg(target_os = "linux")]
+#[test]
+fn a_close_gives_back_every_reservation() {
+    use std::os::unix::fs::MetadataExt;
+
+    let home = TempDir::new().expect("home");
+    let config = ReelConfig {
+        active_tails: ThreadBudget::threads(4),
+        ..config()
+    };
+    let payload = vec![0x5Au8; 8 * 1024];
+    for round in 0..2u64 {
+        let store =
+            ReelStore::open(home.path().to_path_buf(), config.clone(), COLUMNS).expect("open");
+        std::thread::scope(|scope| {
+            for writer in 0..4u64 {
+                let (store, payload) = (&store, &payload);
+                scope.spawn(move || {
+                    for at in 0..300u64 {
+                        let at = round << 32 | writer << 16 | at;
+                        store.put(&key(at), payload).expect("put");
+                    }
+                });
+            }
+        });
+        store.close().expect("close");
+        drop(store);
+    }
+
+    let segments = segments_in(home.path());
+    assert!(segments.len() > 4, "the tails never rolled");
+    for path in segments {
+        let meta = std::fs::metadata(&path).expect("metadata");
+        let held = meta.blocks() * 512;
+        let written = meta.len().next_multiple_of(4096);
+        assert!(
+            held <= written + 4096,
+            "{} holds {held} bytes on disk for {} written",
+            path.display(),
+            meta.len()
+        );
+    }
+}

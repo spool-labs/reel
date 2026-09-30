@@ -738,14 +738,20 @@ impl Appender {
     ///
     /// Nothing seals here on purpose: the tail stays where it is and the next
     /// open resumes it, so a restart costs no segment. Only a full segment ever
-    /// takes a footer. The sync is what makes the stop clean.
+    /// takes a footer. The cut gives the window ahead back, and the sync is what
+    /// makes the stop clean.
     pub fn close(&self) -> Result<()> {
         self.doom_spare();
         let active = write(&self.active);
         if active.terminal.load(Ordering::Acquire) {
             return Ok(());
         }
-        let flushed = self.shared.driver.sync_full(active.handle.file());
+        let file = active.handle.file();
+        let flushed = self
+            .shared
+            .driver
+            .truncate(file, active.end())
+            .and_then(|()| self.shared.driver.sync_full(file));
         active.terminal.store(true, Ordering::Release);
         match &flushed {
             Ok(()) => active.sync.mark_durable(),

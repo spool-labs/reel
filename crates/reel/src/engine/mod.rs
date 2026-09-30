@@ -408,8 +408,14 @@ impl ReelStore {
         }
         crate::reel::volumes::ensure_manifest(&driver, &roots, &dead, is_read_only)?;
         let persisted = offered_index(&driver, &root, &config, columns)?;
-        let rebuilt =
-            rebuild_from_persisted(&driver, &roots, &dead, config.index.pages(), persisted)?;
+        let rebuilt = rebuild_from_persisted(
+            &driver,
+            &roots,
+            &dead,
+            config.index.pages(),
+            persisted,
+            &index,
+        )?;
         for path in &rebuilt.quarantined {
             tracing::warn!("quarantined a foreign reel segment at {}", path.display());
         }
@@ -433,21 +439,6 @@ impl ReelStore {
                 }
             }
         }
-        // Taken before the install, which takes the map with it.
-        let mut on_disk: Vec<SegmentId> = rebuilt.segments.keys().copied().collect();
-        on_disk.sort();
-        // A paged rebuild left its sealed keys in the footers, so what it installs for
-        // them is the span each segment covers, with nothing queued to hand over.
-        index.install(
-            rebuilt.entries,
-            rebuilt.covers,
-            rebuilt.segments,
-            rebuilt.segment_min_lsn,
-            rebuilt.segment_max_lsn,
-            rebuilt.sealed,
-            rebuilt.sealed_keys,
-        );
-
         // A reader starts its cursor where the rebuild left the volume, so its
         // first catch-up reads only what has been written since the open.
         let mut cursor = LogCursor::new();

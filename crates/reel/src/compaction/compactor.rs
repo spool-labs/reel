@@ -1900,11 +1900,11 @@ mod tests {
         CompactRate, Preallocate, ReelConfig, SyncPolicy, ThreadBudget, DEFAULT_FD_CACHE,
     };
     use crate::format::column::{
-        Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, PurgeMark, RecordKey,
+        Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyWidth, MapShape, PurgeMark, RecordKey,
     };
     use crate::format::segment_header::SEGMENT_HEADER_SPAN;
-    use crate::index::entry::span_of;
-    use crate::index::recovery::{rebuild_reel, RebuiltReel};
+    use crate::index::entry::{span_of, Entry};
+    use crate::index::recovery::rebuild_reel;
     use crate::io::fault::{FaultKind, FaultPlan};
     use crate::io::sim_backend::{DurableImage, SimIo};
     use crate::reel::segment::{FdCache, IoDriver};
@@ -2043,11 +2043,23 @@ mod tests {
         Path::new(REEL_DIR).join(segment_file_name(SegmentId(number)))
     }
 
-    fn rebuilt_from(fixture: &Fixture) -> RebuiltReel {
+    fn rebuilt_from(fixture: &Fixture) -> ReelIndex {
         let image = fixture.sim.durable_image();
         let restored = SimIo::from_image(image);
         let driver = IoDriver::new(Arc::new(restored));
-        rebuild_reel(&driver, &[PathBuf::from(REEL_DIR)], &[false], false).expect("rebuild")
+        let index = resident_index();
+        rebuild_reel(&driver, &[PathBuf::from(REEL_DIR)], &[false], false, &index)
+            .expect("rebuild");
+        index
+    }
+
+    fn resident_index() -> ReelIndex {
+        ReelIndex::new(
+            COLUMNS,
+            crate::config::IndexResidency::Resident,
+            crate::config::ShardShapes::Tree,
+        )
+        .expect("index")
     }
 
     fn reopen(image: DurableImage, config: ReelConfig) -> Fixture {
@@ -2065,25 +2077,17 @@ mod tests {
             COLUMNS,
             1,
         ));
-        let rebuilt = rebuild_reel(driver.as_ref(), &[PathBuf::from(REEL_DIR)], &[false], false)
-            .expect("rebuild");
+        let index = resident_index();
+        let rebuilt = rebuild_reel(
+            driver.as_ref(),
+            &[PathBuf::from(REEL_DIR)],
+            &[false],
+            false,
+            &index,
+        )
+        .expect("rebuild");
         shared.lsn.recover_to(rebuilt.highest_lsn);
         shared.recover_next_segment(rebuilt.highest_segment);
-        let index = ReelIndex::new(
-            COLUMNS,
-            crate::config::IndexResidency::Resident,
-            crate::config::ShardShapes::Tree,
-        )
-        .expect("index");
-        index.install(
-            rebuilt.entries,
-            rebuilt.covers,
-            rebuilt.segments,
-            rebuilt.segment_min_lsn,
-            rebuilt.segment_max_lsn,
-            rebuilt.sealed,
-            rebuilt.sealed_keys,
-        );
         let reel = Reel::open(Arc::clone(&shared), Vec::new()).expect("reopen reel");
         let compactor = Compactor::new(&config, 0, 0);
         Fixture {
@@ -2095,18 +2099,15 @@ mod tests {
     }
 
     /// Keys the rebuild resolved in the record column, in key order
-    fn rebuilt_keys(rebuilt: &RebuiltReel) -> Vec<Vec<u8>> {
-        let mut out: Vec<Vec<u8>> = rebuilt
-            .entries
-            .get(&RECORDS)
-            .map(|rows| {
-                rows.iter()
-                    .map(|(key, _)| key.as_slice().to_vec())
-                    .collect()
-            })
-            .unwrap_or_default();
-        out.sort();
-        out
+    fn rebuilt_keys(rebuilt: &ReelIndex) -> Vec<Vec<u8>> {
+        rebuilt_rows(rebuilt)
+            .iter()
+            .map(|(key, _)| key.as_slice().to_vec())
+            .collect()
+    }
+
+    fn rebuilt_rows(rebuilt: &ReelIndex) -> Vec<(KeyBytes, Entry)> {
+        rebuilt.column(RECORDS).expect("records").held()
     }
 
     /// The bytes of one key, for comparing against a rebuild
@@ -2575,7 +2576,7 @@ mod tests {
 
         let rebuilt = rebuilt_from(&fixture);
         assert_eq!(rebuilt_keys(&rebuilt), vec![key_bytes(1)]);
-        let (_, entry) = rebuilt.entries[&RECORDS][0];
+        let (_, entry) = rebuilt_rows(&rebuilt)[0];
         assert_eq!(entry.lsn, Lsn(1));
     }
 

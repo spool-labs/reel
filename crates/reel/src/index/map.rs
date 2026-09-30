@@ -136,9 +136,6 @@ pub struct KeyRepoint {
     pub lsn: Lsn,
 }
 
-/// Bytes one index entry occupies, which is what the map holds beside every key
-const ENTRY_BYTES: u64 = std::mem::size_of::<Entry>() as u64;
-
 /// Paged keys a range delete settles at a time
 ///
 /// Holding every key a range reaches would be the resident footprint a paged column
@@ -1277,24 +1274,12 @@ impl ReelIndex {
         self.indexes.iter().map(|index| index.cover_count()).sum()
     }
 
-    /// Memory the maps are holding, near enough for a budget to act on
+    /// Memory the maps are holding, which is what a budget acts on
     ///
-    /// Every key costs its own bytes, the entry it resolves to, and its share of
-    /// whatever holds them. That third term comes from the column's shape, since the
-    /// two shapes differ by an order of magnitude and one number for both would
-    /// misprice whichever column it was not taken from.
+    /// Counted from what every shard's maps allocated plus the shards and their filters,
+    /// since arenas that grow by doubling hold up to twice what their keys fill.
     pub fn resident_bytes(&self) -> ByteCount {
-        let bytes: u64 = self
-            .columns
-            .iter()
-            .zip(&self.indexes)
-            .map(|(spec, index)| {
-                let per_key = u64::from(spec.key_width.fixed().unwrap_or(0))
-                    + ENTRY_BYTES
-                    + index.overhead_per_key();
-                index.resident_keys() * per_key + index.filter_bytes()
-            })
-            .sum();
+        let bytes: u64 = self.indexes.iter().map(ColumnIndex::heap_bytes).sum();
         ByteCount::from_bytes(bytes)
     }
 
@@ -1984,25 +1969,31 @@ mod tests {
     fn open_costs_less() {
         let tree = index();
         let open = open_index();
+        let empty = [tree.resident_bytes(), open.resident_bytes()];
 
-        for byte in 0..64u8 {
-            for index in [&tree, &open] {
-                index
-                    .insert(
-                        &blob_key(byte),
-                        loc(1, byte as u32 * 100, 100),
-                        Lsn(byte as u64 + 1),
-                        None,
-                    )
-                    .expect("insert");
+        // Four shards of a thousand keys, so what the keys add outweighs the rounding.
+        for group in 0..4u16 {
+            for byte in 0..=255u8 {
+                for spread in 0..4u8 {
+                    let mut key = record_key(group, byte).as_slice().to_vec();
+                    key[3] = spread;
+                    let key = RecordKey::from_bytes(RECORD, &key).expect("key");
+                    for index in [&tree, &open] {
+                        index
+                            .insert(&key, loc(1, byte as u32 * 100, 100), Lsn(1), None)
+                            .expect("insert");
+                    }
+                }
             }
         }
 
+        let added = |index: &ReelIndex, empty: ByteCount| {
+            index.resident_bytes().to_bytes() - empty.to_bytes()
+        };
+        let (tree_added, open_added) = (added(&tree, empty[0]), added(&open, empty[1]));
         assert!(
-            open.resident_bytes() < tree.resident_bytes(),
-            "open {:?} against tree {:?}",
-            open.resident_bytes(),
-            tree.resident_bytes(),
+            open_added < tree_added,
+            "the keys added {open_added} bytes open against {tree_added} in a tree"
         );
     }
 

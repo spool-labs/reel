@@ -1874,6 +1874,72 @@ fn scattered_keys_leave_the_filters_small_and_counted() {
     }
 }
 
+const WIDE: ColumnId = ColumnId(7);
+
+/// A sixteen-byte column over a byte of shards, the shape a hot budget is priced on
+const WIDE_COLUMNS: ColumnSet = &[ColumnSpec {
+    id: WIDE,
+    name: "wide",
+    key_width: KeyWidth::Fixed(16),
+    shard_bytes: 1,
+    inline_max: 0,
+    row_carry: 0,
+    purge_mark: None,
+    codec: Codec::None,
+    map_shape: MapShape::Tree,
+}];
+
+// a hot index given a budget holds about that much memory, counted by what it allocated
+#[test]
+fn a_hot_budget_bounds_what_the_maps_allocate() {
+    const BUDGET: u64 = 4 << 20;
+    let hot = ReelConfig {
+        index: IndexResidency::Hot(HotIndex {
+            after_secs: 3600,
+            budget: ByteCount::from_bytes(BUDGET),
+        }),
+        segment_bytes: ByteCount::from_bytes(64 * 1024),
+        ..config(1, SyncPolicy::Never)
+    };
+    let sim = SimIo::new(FaultPlan::new(1));
+    let store = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        hot,
+        WIDE_COLUMNS,
+        Arc::new(sim.clone()),
+    )
+    .expect("open");
+
+    let payload = vec![0x42u8; 200];
+    for at in 0..120_000u64 {
+        let mut key = (at.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            .to_be_bytes()
+            .to_vec();
+        key.extend_from_slice(&at.to_be_bytes());
+        let key = RecordKey::from_bytes(WIDE, &key).expect("key");
+        store.put(&key, &payload).expect("put");
+        if at % 10_000 == 0 {
+            store.page_out_sealed().expect("page out");
+        }
+    }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
+
+    let column = store.index.column(WIDE).expect("column");
+    let allocated = column.heap_bytes();
+    assert!(
+        column.resident_keys() > 0,
+        "the budget holds some keys resident"
+    );
+    // A tenth over for the open tail, whose keys no budget can hand over.
+    assert!(
+        allocated <= BUDGET + BUDGET / 10,
+        "a {BUDGET} byte budget holds {allocated} bytes for {} keys, and the index counts {}",
+        column.resident_keys(),
+        store.resident_bytes().to_bytes()
+    );
+}
+
 // a segment holding only tombstones is still accounted for, so it can be seen
 #[test]
 fn a_segment_of_only_tombstones_is_accounted_for() {

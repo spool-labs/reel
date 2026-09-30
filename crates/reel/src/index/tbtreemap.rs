@@ -1582,6 +1582,21 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         self.leaves.len()
     }
 
+    /// Bytes the node arenas have allocated, spare capacity included
+    ///
+    /// The arenas grow by doubling, so what a tree holds is its capacity and not its
+    /// length. A key held behind a pointer is not counted.
+    pub fn heap_bytes(&self) -> u64 {
+        let spills: usize = self
+            .inners
+            .iter()
+            .map(|inner| inner.spill.capacity() * std::mem::size_of::<(u8, K)>())
+            .sum();
+        (self.leaves.capacity() * std::mem::size_of::<Leaf<K, B, V>>()
+            + self.inners.capacity() * std::mem::size_of::<Inner<K, B>>()
+            + spills) as u64
+    }
+
     /// Whether packing would give back room worth the pass
     ///
     /// Fill alone cannot say: a shard holding three keys reads as badly under-filled,

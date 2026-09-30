@@ -231,6 +231,11 @@ impl ColumnIndex {
         on_index!(self, index => index.filter_bytes())
     }
 
+    /// Bytes the column's index holds, counted from what its maps allocated
+    pub fn heap_bytes(&self) -> u64 {
+        on_index!(self, index => index.heap_bytes())
+    }
+
     /// Which structure this column's shards opened in, not always what was declared
     pub fn map_shape(&self) -> MapShape {
         on_index!(self, index => index.map_shape())
@@ -904,6 +909,17 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// Bytes the filters in front of the shards hold
     pub fn filter_bytes(&self) -> u64 {
         self.filters.heap_bytes()
+    }
+
+    /// Bytes the column's index holds: its shards, their maps' allocations and the filters
+    ///
+    /// Capacity rather than length, since a shard's arenas grow by doubling and hold
+    /// what they allocated until a pack gives it back.
+    pub fn heap_bytes(&self) -> u64 {
+        let fixed = (self.shards.capacity() * std::mem::size_of::<RwLock<ShardState<K, S>>>())
+            as u64
+            + self.filters.heap_bytes();
+        fixed + self.sum_shards(|state| state.map.heap_bytes() + state.carried.heap_bytes())
     }
 
     /// Which structure this column's shards took
@@ -2607,6 +2623,9 @@ pub trait ShardMap<K: IndexKey, V: 'static>: Default {
     /// Whether the shard holds nothing
     fn vacant(&self) -> bool;
 
+    /// Bytes the map has allocated, spare room included
+    fn heap_bytes(&self) -> u64;
+
     /// Drop every key, keeping whatever room was already taken
     fn empty(&mut self);
 
@@ -2727,6 +2746,10 @@ impl<const B: usize, V: Default + 'static> ShardMap<Box<[u8]>, V> for TBTreeMap<
         self.is_empty()
     }
 
+    fn heap_bytes(&self) -> u64 {
+        TBTreeMap::heap_bytes(self)
+    }
+
     fn empty(&mut self) {
         self.clear();
     }
@@ -2811,6 +2834,10 @@ impl<const N: usize, const B: usize, V: Default + 'static> ShardMap<[u8; N], V>
 
     fn vacant(&self) -> bool {
         self.is_empty()
+    }
+
+    fn heap_bytes(&self) -> u64 {
+        TBTreeMap::heap_bytes(self)
     }
 
     fn empty(&mut self) {
@@ -2900,6 +2927,10 @@ impl<const N: usize, V: Default + 'static> ShardMap<[u8; N], V> for OpenTable<N,
 
     fn vacant(&self) -> bool {
         self.is_empty()
+    }
+
+    fn heap_bytes(&self) -> u64 {
+        OpenTable::heap_bytes(self)
     }
 
     fn empty(&mut self) {

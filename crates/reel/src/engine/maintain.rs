@@ -273,7 +273,7 @@ impl ReelStore {
     fn next_to_hand_over(&self) -> Option<SegmentId> {
         let now = Instant::now();
         let over_budget = match self.config.index {
-            IndexResidency::Hot(hot) => self.index.resident_bytes() > hot.budget,
+            IndexResidency::Hot(hot) => self.index.key_bytes() > hot.budget,
             _ => false,
         };
         let mut held = lock(&self.held);

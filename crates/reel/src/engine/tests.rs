@@ -16,7 +16,7 @@ use crate::units::ByteCount;
 
 use crate::config::{
     CompactRate, HotIndex, IndexResidency, PointReads, Preallocate, RangedReads, RepairPath,
-    SyncPolicy, ThreadBudget,
+    ShardShapes, SyncPolicy, ThreadBudget,
 };
 use crate::format::column::{Codec, ColumnId, ColumnSpec, MapShape};
 use crate::format::footer::SegmentFooter;
@@ -1694,19 +1694,32 @@ fn a_hot_index_holds_recent_keys() {
 // a hot index over its budget hands the oldest segments over early
 #[test]
 fn a_hot_index_pages_when_it_runs_out_of_room() {
-    let hot = ReelConfig {
+    const KEYS: u64 = 40_000;
+    let hot = |budget| ReelConfig {
         index: IndexResidency::Hot(HotIndex {
             after_secs: 3600,
-            budget: ByteCount::from_bytes(1),
+            budget,
         }),
+        segment_bytes: ByteCount::from_bytes(64 * 1024),
         ..config(1, SyncPolicy::Never)
     };
-    let (store, _sim) = sim_store(hot);
+    // The least budget a volume takes is what its columns hold empty.
+    let floor = ReelIndex::new(WIDE_COLUMNS, hot(ByteCount::gb(1)).index, ShardShapes::Tree)
+        .expect("index")
+        .floor_bytes();
+    let store = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        hot(floor),
+        WIDE_COLUMNS,
+        Arc::new(SimIo::new(FaultPlan::new(1))),
+    )
+    .expect("open");
 
-    let payload = vec![0xa5u8; 8 * 1024];
-    for byte in 0..200u8 {
-        store.put(&record(7, byte), &payload).expect("put");
+    let payload = [0xa5u8; 16];
+    for at in 0..KEYS {
+        store.put(&wide(at), &payload).expect("put");
     }
+    store.flush().expect("flush");
 
     assert!(
         store.page_out_sealed().expect("page out") > 0,
@@ -1714,14 +1727,86 @@ fn a_hot_index_pages_when_it_runs_out_of_room() {
     );
     assert_eq!(
         store.totals().count,
-        200,
+        KEYS,
         "handing keys over is not deleting them"
     );
     assert_eq!(
-        played(&store, RECORD).len(),
-        200,
+        played(&store, WIDE).len() as u64,
+        KEYS,
         "and the playback still sees them"
     );
+}
+
+// a hot budget under what the columns hold empty is refused at open
+#[test]
+fn a_hot_budget_under_the_floor_is_refused() {
+    let hot = ReelConfig {
+        index: IndexResidency::Hot(HotIndex {
+            after_secs: 3600,
+            budget: ByteCount::from_bytes(1),
+        }),
+        ..config(1, SyncPolicy::Never)
+    };
+    let opened = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        hot,
+        COLUMNS,
+        Arc::new(SimIo::new(FaultPlan::new(1))),
+    );
+    match opened {
+        Err(ReelError::Config(reason)) => assert!(reason.contains("hot index budget"), "{reason}"),
+        Err(other) => panic!("refused for another reason: {other}"),
+        Ok(_) => panic!("a one byte budget opened"),
+    }
+}
+
+/// A record key in one of sixty-four shards, in the order of its number within it
+fn grouped(at: u32) -> RecordKey {
+    let mut bytes = ((at % 64) as u16).to_be_bytes().to_vec();
+    bytes.extend_from_slice(&at.to_be_bytes());
+    bytes.resize(34, 0);
+    RecordKey::from_bytes(RECORD, &bytes).expect("key")
+}
+
+// a hot budget prices the keys above the shards' floor, so it keeps a budget of recent keys
+#[test]
+fn a_hot_budget_keeps_recent_keys_above_the_floor() {
+    const BUDGET: u64 = 16 << 20;
+    const KEYS: u32 = 400_000;
+    let hot = ReelConfig {
+        index: IndexResidency::Hot(HotIndex {
+            after_secs: 3600,
+            budget: ByteCount::from_bytes(BUDGET),
+        }),
+        ..config(1, SyncPolicy::Never)
+    };
+    let (store, _sim) = sim_store(hot);
+    let floor = store.index.floor_bytes().to_bytes();
+
+    let payload = [0x17u8; 16];
+    for at in 0..KEYS {
+        store.put(&grouped(at), &payload).expect("put");
+        if at % 20_000 == 0 {
+            store.page_out_sealed().expect("page out");
+        }
+    }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
+
+    let held = store.resident_bytes().to_bytes() - floor;
+    assert!(
+        held >= BUDGET / 2,
+        "a {BUDGET} byte budget over a {floor} byte floor holds {held} bytes of keys"
+    );
+    assert!(
+        (0..1_000).all(|at| is_paged(&store, &grouped(at))),
+        "the oldest keys went to their footers"
+    );
+    assert!(
+        (KEYS - 1_000..KEYS).all(|at| !is_paged(&store, &grouped(at))),
+        "the newest keys stayed resident"
+    );
+    assert_eq!(store.totals().count, u64::from(KEYS));
 }
 
 /// A record key spread across the two-byte shards, one per number
@@ -1876,6 +1961,15 @@ fn scattered_keys_leave_the_filters_small_and_counted() {
 
 const WIDE: ColumnId = ColumnId(7);
 
+/// A sixteen-byte key scattered across the wide column's shards, one per number
+fn wide(at: u64) -> RecordKey {
+    let mut key = (at.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .to_be_bytes()
+        .to_vec();
+    key.extend_from_slice(&at.to_be_bytes());
+    RecordKey::from_bytes(WIDE, &key).expect("key")
+}
+
 /// A sixteen-byte column over a byte of shards, the shape a hot budget is priced on
 const WIDE_COLUMNS: ColumnSet = &[ColumnSpec {
     id: WIDE,
@@ -1912,12 +2006,7 @@ fn a_hot_budget_bounds_what_the_maps_allocate() {
 
     let payload = vec![0x42u8; 200];
     for at in 0..120_000u64 {
-        let mut key = (at.wrapping_mul(0x9e37_79b9_7f4a_7c15))
-            .to_be_bytes()
-            .to_vec();
-        key.extend_from_slice(&at.to_be_bytes());
-        let key = RecordKey::from_bytes(WIDE, &key).expect("key");
-        store.put(&key, &payload).expect("put");
+        store.put(&wide(at), &payload).expect("put");
         if at % 10_000 == 0 {
             store.page_out_sealed().expect("page out");
         }
@@ -1926,7 +2015,7 @@ fn a_hot_budget_bounds_what_the_maps_allocate() {
     store.page_out_sealed().expect("page out");
 
     let column = store.index.column(WIDE).expect("column");
-    let allocated = column.heap_bytes();
+    let allocated = column.heap_bytes() - store.index.floor_bytes().to_bytes();
     assert!(
         column.resident_keys() > 0,
         "the budget holds some keys resident"

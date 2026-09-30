@@ -211,6 +211,9 @@ pub struct ReelIndex {
 
     /// Held while a batch moves the maps, so no spanning read sees part of one
     publish: PublishBarrier,
+
+    /// Bytes the empty index held at open, which no handover can give back
+    floor: u64,
 }
 
 impl ReelIndex {
@@ -282,6 +285,17 @@ impl ReelIndex {
             sealed.push(SealedRanges::new());
         }
         let sealed_keys = (0..columns.len()).map(|_| SealedKeys::new()).collect();
+        let floor: u64 = indexes.iter().map(ColumnIndex::heap_bytes).sum();
+        if let IndexResidency::Hot(hot) = residency {
+            // The shards and their filters cost this before a key arrives, and a
+            // budget under it would hand over every sealed key it was meant to hold.
+            if hot.budget.to_bytes() < floor {
+                return Err(ReelError::Config(format!(
+                    "a hot index budget of {} bytes is under the {floor} bytes these columns hold empty",
+                    hot.budget.to_bytes(),
+                )));
+            }
+        }
         Ok(ReelIndex {
             columns,
             indexes,
@@ -293,6 +307,7 @@ impl ReelIndex {
             residency,
             unclaimed: std::sync::atomic::AtomicU64::new(0),
             publish: PublishBarrier::new(),
+            floor,
         })
     }
 
@@ -1281,6 +1296,18 @@ impl ReelIndex {
     pub fn resident_bytes(&self) -> ByteCount {
         let bytes: u64 = self.indexes.iter().map(ColumnIndex::heap_bytes).sum();
         ByteCount::from_bytes(bytes)
+    }
+
+    /// Memory the keys hold above what the empty index held at open
+    ///
+    /// A hot budget is weighed against this, so it prices the keys alone.
+    pub fn key_bytes(&self) -> ByteCount {
+        ByteCount::from_bytes(self.resident_bytes().to_bytes().saturating_sub(self.floor))
+    }
+
+    /// Bytes the empty index held at open
+    pub fn floor_bytes(&self) -> ByteCount {
+        ByteCount::from_bytes(self.floor)
     }
 
     /// Live key count and payload byte total across every column

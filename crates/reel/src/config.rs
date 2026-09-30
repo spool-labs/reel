@@ -82,7 +82,10 @@ pub struct HotIndex {
     /// Seconds a sealed segment's keys stay resident before they are handed over
     pub after_secs: u64,
 
-    /// Resident index bytes past which the oldest segments are handed over early
+    /// Bytes the keys hold above the empty index, past which the oldest segments go early
+    ///
+    /// The shards and their filters cost a floor before any key arrives, and a volume
+    /// refuses a budget under that floor at open.
     #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_bytes"))]
     pub budget: ByteCount,
 }

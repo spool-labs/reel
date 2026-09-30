@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::units::ByteCount;
 
-use crate::append::publish::{stripe_of_parts, stripes_of, PublishBarrier, ALL_STRIPES};
+use crate::append::publish::PublishBarrier;
 use crate::config::{IndexResidency, ShardShapes};
 use crate::engine::Totals;
 use crate::error::{ReelError, Result};
@@ -738,38 +738,30 @@ impl ReelIndex {
 
     /// Publish a batch's moves under the barrier, so a spanning read sees all or none
     ///
-    /// Only the stripes the batch's own keys fall in are taken, so a batch writing one
-    /// group does not order itself against every other batch. A range is the exception
-    /// and takes every stripe: its cover answers for a whole column rather than for the
-    /// shard one key falls in. The hold covers the map moves alone; whatever settling
-    /// they call for runs with the barrier given up.
+    /// Batches publishing at the same time share one hold and move side by side under
+    /// shard locks. The hold covers the map moves alone; whatever settling they call
+    /// for runs with the barrier given up.
     ///
     /// The key moves go in the order the batch built them, with each range standing its
     /// cover at the point of the run it was given at. What comes back is one answer per
     /// key move; a cover displaces nothing and has no answer to give.
     pub fn publish_batch(&self, moves: &[KeyMove<'_>], ranges: &[RangeMove<'_>]) -> Vec<Landed> {
-        let stripes = match ranges.is_empty() {
-            true => moves.iter().fold(0u64, |mask, planned| {
-                mask | 1u64 << stripe_of_parts(planned.column, planned.key)
-            }),
-            false => ALL_STRIPES,
-        };
-        let _publishing = self.publish.publishing(stripes);
-
-        let mut landed = Vec::with_capacity(moves.len());
-        let mut at = 0;
-        for range in ranges {
-            let upto = range.after.min(moves.len());
-            if upto > at {
-                self.apply_moves(&moves[at..upto], &mut landed);
-                at = upto;
+        self.publish.publish_grouped(|| {
+            let mut landed = Vec::with_capacity(moves.len());
+            let mut at = 0;
+            for range in ranges {
+                let upto = range.after.min(moves.len());
+                if upto > at {
+                    self.apply_moves(&moves[at..upto], &mut landed);
+                    at = upto;
+                }
+                self.cover_range(range.start, range.end, range.lsn, range.tombstone);
             }
-            self.cover_range(range.start, range.end, range.lsn, range.tombstone);
-        }
-        if at < moves.len() {
-            self.apply_moves(&moves[at..], &mut landed);
-        }
-        landed
+            if at < moves.len() {
+                self.apply_moves(&moves[at..], &mut landed);
+            }
+            landed
+        })
     }
 
     /// Resolve every key against one state of the maps
@@ -786,7 +778,7 @@ impl ReelIndex {
                 None => Ok(Vec::new()),
             };
         }
-        let _reading = self.publish.reading(stripes_of(keys.iter()));
+        let _reading = self.publish.reading();
         let mut found: Vec<Option<Entry>> = vec![None; keys.len()];
 
         // Grouped by column and handed over together, so the shards a batch touches
@@ -836,10 +828,9 @@ impl ReelIndex {
     /// Run a follower's apply pass under the exclusive barrier
     ///
     /// A pass moves the index the same key at a time a batch does while a follower
-    /// serves reads throughout, and it cannot name its keys up front, so it takes
-    /// every stripe. Every device read the pass needs is done before it enters.
+    /// serves reads throughout. Every device read the pass needs is done before it enters.
     pub fn publish_pass<Applied>(&self, apply: impl FnOnce() -> Applied) -> Applied {
-        let _publishing = self.publish.publishing(ALL_STRIPES);
+        let _publishing = self.publish.publishing();
         apply()
     }
 

@@ -950,8 +950,8 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
 
     /// Bytes the column's index holds: its shards, their maps' allocations and the filters
     ///
-    /// Capacity rather than length, since a shard's arenas grow by doubling and hold
-    /// what they allocated until a pack gives it back.
+    /// Counts capacity, since a shard's arenas grow by doubling and hold what they
+    /// allocated until a pack gives it back.
     pub fn heap_bytes(&self) -> u64 {
         let fixed = (self.shards.capacity() * std::mem::size_of::<RwLock<ShardState<K, S>>>())
             as u64

@@ -1584,8 +1584,8 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
 
     /// Bytes the node arenas have allocated, spare capacity included
     ///
-    /// The arenas grow by doubling, so what a tree holds is its capacity and not its
-    /// length. A key held behind a pointer is not counted.
+    /// The arenas grow by doubling, so a tree holds its whole capacity. A key held
+    /// behind a pointer is left out.
     pub fn heap_bytes(&self) -> u64 {
         let spills: usize = self
             .inners

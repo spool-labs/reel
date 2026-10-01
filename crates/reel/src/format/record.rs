@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crc_fast::{CrcAlgorithm, Digest};
 
 use crate::error::{ReelError, Result};
-use crate::format::column::{ColumnId, RecordKey, INLINE_KEY_LEN, MAX_KEY_LEN};
+use crate::format::column::{ColumnId, KeyRef, RecordKey, INLINE_KEY_LEN, MAX_KEY_LEN};
 use crate::format::lsn::Lsn;
 
 /// Fixed size of a record header in bytes
@@ -567,6 +567,20 @@ impl RecordHeader {
         digest.update(payload);
         digest.finalize() as u32
     }
+}
+
+/// The codec of the data record a prefix starts, when it is this key's at this sequence number and length
+///
+/// Read in place, so checking a record builds no key.
+pub fn data_codec(prefix: &[u8], key: KeyRef<'_>, lsn: Lsn, length: u32) -> Option<u8> {
+    let fixed = prefix.get(..HEADER_LEN)?;
+    let is_match = Flags::from_bits(fixed[OFFSET_FLAGS]).is_ok_and(Flags::is_data)
+        && fixed[OFFSET_COLUMN] == key.column.as_u8()
+        && usize::from(read_u16_le(&fixed[OFFSET_KEY_WIDTH..OFFSET_CODEC])) == key.bytes.len()
+        && prefix.get(HEADER_LEN..HEADER_LEN + key.bytes.len()) == Some(key.bytes)
+        && read_u64_le(&fixed[OFFSET_LSN..OFFSET_FLAGS]) == lsn.as_u64()
+        && read_u32_le(&fixed[OFFSET_LENGTH..OFFSET_CRC]) == length;
+    is_match.then_some(fixed[OFFSET_CODEC])
 }
 
 /// The key width a record claims, read from the fixed part of its header

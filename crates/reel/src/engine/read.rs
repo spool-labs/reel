@@ -18,58 +18,131 @@ use super::{read_only, ReelStore, GRAVE_WINDOW, SWEEP_RUN};
 use crate::index::entry::Entry;
 use crate::index::recovery::rebuild_reel;
 use crate::index::tailer::{catch_up, CaughtUp, LogCursor};
-use crate::reel::{Ask, RecordRead};
+use crate::reel::{Ask, RecordRead, Spot};
 use crate::sync::lock;
-use reel_core::{range_of, Value};
+use reel_core::{range_of, ReadBlock, Value};
 
 /// How many times a read re-resolves a stale index pointer before giving up
 const RESOLVE_RETRIES: u32 = 4;
 
-/// The lists one thread's resolved batches work through, kept between reads
+/// One batch read in place: the blocks it filled, a spot per key, and the records
+/// it had to own
 ///
-/// Both are as wide as the batch and neither leaves, so they stay with the thread:
-/// only the answers a batch hands back are bought per read.
+/// A walk lends from it until its next batch, and a caller keeping records takes
+/// them out as values.
 #[derive(Default)]
-struct FoundAsks {
+pub(crate) struct Placed {
     /// What the device is asked for, one per key the index placed
     asks: Vec<Ask>,
 
-    /// What it answered, in the order asked
-    read: Vec<RecordRead>,
+    /// One block per merged read
+    blocks: Vec<ReadBlock>,
+
+    /// Where each key's record sits, by the caller's position
+    spots: Vec<Spot>,
+
+    /// Records a lookup or a decode answered, which no block holds
+    owned: Vec<Value>,
 }
 
-impl FoundAsks {
-    const fn empty() -> FoundAsks {
-        FoundAsks {
-            asks: Vec::new(),
-            read: Vec::new(),
+/// A spot's block when the record is held owned, its index into `owned`
+const OWNED: u32 = u32::MAX - 1;
+
+impl Placed {
+    /// The record at a key's position, lent until the next batch
+    pub(crate) fn lend(&self, at: usize) -> Option<&[u8]> {
+        let spot = self.spots.get(at)?;
+        match spot.block {
+            OWNED => Some(&self.owned[spot.at as usize]),
+            block => {
+                let start = spot.at as usize;
+                let block = self.blocks.get(block as usize)?;
+                block.get(start..start + spot.len as usize)
+            }
+        }
+    }
+
+    /// The record at a key's position, as a value of its own
+    pub(crate) fn take(&mut self, at: usize) -> Option<Value> {
+        let spot = *self.spots.get(at)?;
+        match spot.block {
+            OWNED => Some(std::mem::take(&mut self.owned[spot.at as usize])),
+            block => self.blocks.get(block as usize)?.window(spot.at as usize, spot.len as usize),
+        }
+    }
+
+    /// Whether the batch holds a record for the key at this position
+    pub(crate) fn holds(&self, at: usize) -> bool {
+        self.spots.get(at).is_some_and(|spot| *spot != Spot::MISS)
+    }
+
+    /// Hold a record the blocks cannot answer, at a key's position
+    pub(crate) fn hold(&mut self, at: usize, value: Value) {
+        self.spots[at] = Spot {
+            block: OWNED,
+            at: self.owned.len() as u32,
+            len: 0,
+            codec: 0,
+        };
+        self.owned.push(value);
+    }
+
+    /// Start over on a batch of this many keys, with every one missing
+    fn reset(&mut self, keys: usize) {
+        self.asks.clear();
+        self.blocks.clear();
+        self.owned.clear();
+        self.spots.clear();
+        self.spots.resize(keys, Spot::MISS);
+    }
+
+    /// Keys the index placed that the read did not find, which have to be resolved again
+    pub(crate) fn missed(&self) -> impl Iterator<Item = usize> + '_ {
+        self.asks
+            .iter()
+            .map(|ask| ask.at as usize)
+            .filter(|&at| self.spots[at] == Spot::MISS)
+    }
+
+    /// Decode every record the read left as stored bytes
+    fn decode_coded(&mut self) {
+        for at in 0..self.spots.len() {
+            let spot = self.spots[at];
+            if spot.codec == 0 || spot.block == OWNED {
+                continue;
+            }
+            let stored = &self.blocks[spot.block as usize][spot.at as usize..][..spot.len as usize];
+            match crate::append::codec::decode(spot.codec, stored) {
+                Some(decoded) => self.hold(at, Value::pooled(decoded, crate::reel::payload::give)),
+                // A decode that fails is corruption wearing a valid checksum, left for
+                // the single-key path to answer.
+                None => self.spots[at] = Spot::MISS,
+            }
         }
     }
 }
 
 thread_local! {
-    /// One set of batch lists per reading thread, handed back after every read
-    static FOUND_ASKS: std::cell::Cell<FoundAsks> =
-        const { std::cell::Cell::new(FoundAsks::empty()) };
+    /// One placed batch per reading thread, handed back after every read
+    static PLACED: std::cell::Cell<Placed> = std::cell::Cell::new(Placed::default());
 }
 
-/// This thread's batch lists, given back however the read that borrowed them ends
-struct HeldAsks(FoundAsks);
+/// This thread's placed batch, given back however the read that borrowed it ends
+struct HeldPlaced(Placed);
 
-impl HeldAsks {
-    fn take() -> HeldAsks {
-        HeldAsks(FOUND_ASKS.with(std::cell::Cell::take))
+impl HeldPlaced {
+    fn take() -> HeldPlaced {
+        HeldPlaced(PLACED.with(std::cell::Cell::take))
     }
 }
 
-impl Drop for HeldAsks {
+impl Drop for HeldPlaced {
     fn drop(&mut self) {
         let mut held = std::mem::take(&mut self.0);
-        held.asks.clear();
-        // Cleared rather than dropped, so a value a failed batch left goes back to
+        // Cleared rather than dropped, so a block a failed batch left goes back to
         // the payload pool here rather than being held until this thread reads again.
-        held.read.clear();
-        FOUND_ASKS.with(|spare| spare.set(held));
+        held.reset(0);
+        PLACED.with(|spare| spare.set(held));
     }
 }
 
@@ -198,29 +271,18 @@ impl ReelStore {
         keys: &[KeyRef<'_>],
         found: &[Option<Entry>],
     ) -> Result<Vec<Option<Value>>> {
-        let mut held = HeldAsks::take();
-        let asked = &mut held.0;
-        let mut answers = self.plan_found(keys, found, &mut asked.asks);
-        if asked.asks.is_empty() {
-            return Ok(answers);
-        }
-
-        self.reel
-            .read_records(&asked.asks, keys, self.config.verify_reads, &mut asked.read)?;
-        // Stepped by position rather than by a draining iterator, since the retry
-        // below re-enters the engine and must not be holding these lists when it does.
-        for slot in 0..asked.asks.len().min(asked.read.len()) {
-            let ask = asked.asks[slot];
-            let outcome = std::mem::replace(&mut asked.read[slot], RecordRead::Stale);
-            let at = ask.at as usize;
-            match Self::keep_found(outcome) {
-                Some(payload) => answers[at] = Some(payload),
-                // The record moved or went bad since the caller resolved it, which is
-                // what compaction does under a playback.
-                None => answers[at] = self.get(&keys[at].to_owned_key()?)?,
+        let mut held = HeldPlaced::take();
+        let placed = &mut held.0;
+        self.read_placed(keys, found, placed)?;
+        // The record moved or went bad since the caller resolved it, which is what
+        // compaction does under a playback.
+        let missed: Vec<usize> = placed.missed().collect();
+        for at in missed {
+            if let Some(value) = self.get(&keys[at].to_owned_key()?)? {
+                placed.hold(at, value);
             }
         }
-        Ok(answers)
+        Ok((0..keys.len()).map(|at| placed.take(at)).collect())
     }
 
     /// Read a resolved batch as a future, answered in the order asked
@@ -231,56 +293,63 @@ impl ReelStore {
         keys: &[KeyRef<'_>],
         found: &[Option<Entry>],
     ) -> Result<Vec<Option<Value>>> {
-        let mut held = HeldAsks::take();
-        let asked = &mut held.0;
-        let mut answers = self.plan_found(keys, found, &mut asked.asks);
-        if asked.asks.is_empty() {
-            return Ok(answers);
+        let mut held = HeldPlaced::take();
+        let placed = &mut held.0;
+        self.plan_placed(keys.len(), found, placed);
+        if !placed.asks.is_empty() {
+            self.reel
+                .read_placed_wait(
+                    &placed.asks,
+                    keys,
+                    self.config.verify_reads,
+                    &mut placed.blocks,
+                    &mut placed.spots,
+                )
+                .await?;
+            placed.decode_coded();
         }
-
-        self.reel
-            .read_records_wait(&asked.asks, keys, self.config.verify_reads, &mut asked.read)
-            .await?;
-        for slot in 0..asked.asks.len().min(asked.read.len()) {
-            let ask = asked.asks[slot];
-            let outcome = std::mem::replace(&mut asked.read[slot], RecordRead::Stale);
-            let at = ask.at as usize;
-            match Self::keep_found(outcome) {
-                Some(payload) => answers[at] = Some(payload),
-                None => answers[at] = self.get_wait(&keys[at].to_owned_key()?).await?,
+        let missed: Vec<usize> = placed.missed().collect();
+        for at in missed {
+            if let Some(value) = self.get_wait(&keys[at].to_owned_key()?).await? {
+                placed.hold(at, value);
             }
         }
-        Ok(answers)
+        Ok((0..keys.len()).map(|at| placed.take(at)).collect())
     }
 
-    /// One empty answer per key, and an ask for every key the index placed
-    fn plan_found(
+    /// Read a resolved batch into place, leaving every record it could not find a miss
+    pub(crate) fn read_placed(
         &self,
         keys: &[KeyRef<'_>],
         found: &[Option<Entry>],
-        asks: &mut Vec<Ask>,
-    ) -> Vec<Option<Value>> {
-        let answers: Vec<Option<Value>> = (0..keys.len()).map(|_| None).collect();
-        asks.clear();
-        asks.reserve(keys.len());
+        placed: &mut Placed,
+    ) -> Result<()> {
+        self.plan_placed(keys.len(), found, placed);
+        if placed.asks.is_empty() {
+            return Ok(());
+        }
+        self.reel.read_placed(
+            &placed.asks,
+            keys,
+            self.config.verify_reads,
+            &mut placed.blocks,
+            &mut placed.spots,
+        )?;
+        placed.decode_coded();
+        Ok(())
+    }
 
-        for (at, entry) in found.iter().enumerate().take(keys.len()) {
+    /// An ask for every key the index placed, with every key missing until read
+    fn plan_placed(&self, keys: usize, found: &[Option<Entry>], placed: &mut Placed) {
+        placed.reset(keys);
+        for (at, entry) in found.iter().enumerate().take(keys) {
             if let Some(entry) = entry {
-                asks.push(Ask {
+                placed.asks.push(Ask {
                     loc: entry.loc,
                     lsn: entry.lsn,
                     at: at as u32,
                 });
             }
-        }
-        answers
-    }
-
-    /// What one batched read answered, or nothing when the key has to be re-resolved
-    fn keep_found(outcome: RecordRead) -> Option<Value> {
-        match outcome {
-            RecordRead::Found(payload) => Some(payload),
-            RecordRead::Stale | RecordRead::Gone | RecordRead::Corrupt | RecordRead::Coded => None,
         }
     }
 

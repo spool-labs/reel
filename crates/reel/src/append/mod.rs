@@ -51,6 +51,9 @@ const WRITEBACK_CHUNK: u64 = 1024 * 1024;
 /// Bytes one write of the zero fill covers
 const FILL_SPAN: u64 = 1024 * 1024;
 
+/// Zeros one sync pays for: it saves 0.5 ms and a 4 MiB fill costs 3.6 ms
+const SYNC_WORTH: u64 = 512 * 1024;
+
 /// Draw margins of zeros a tail keeps ahead of its write head
 ///
 /// The margin is where the tail draws the segment it rolls to, so four of them puts
@@ -1641,18 +1644,11 @@ impl Appender {
         Ok(active)
     }
 
-    /// Lay the next window down the way this volume's own writing says to
-    ///
-    /// Zeroing pays when a flush lands more often than once a window, since the commit
-    /// it saves the allocation on is the one about to flush. A volume that writes a
-    /// whole window between flushes is bandwidth bound instead: doubling the bytes it
-    /// puts down costs it more than the allocation ever did, so that window is only
-    /// reserved. The volume moves between the two as its own pattern moves, with no
-    /// setting to get wrong.
+    /// Zero the next window only when syncs land close enough together to pay for it
     fn settle_ahead(&self, active: &Active, from: u64, to: u64) -> Result<()> {
         let since = from.saturating_sub(active.sync.synced_at.load(Ordering::Acquire));
         let between = since.max(active.sync.last_span.load(Ordering::Acquire));
-        if between >= to - from {
+        if between >= SYNC_WORTH.min(to - from) {
             return self
                 .shared
                 .driver

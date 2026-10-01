@@ -35,12 +35,6 @@ const PLAYBACK_PAGE_MAX: usize = 8192;
 /// read ahead of it, so the first run is small and each one after it doubles.
 const PLAYBACK_RUN_MIN: usize = 8;
 
-/// Ceiling the run stops doubling at
-///
-/// A page of keys costs one trip to the index, but each payload behind them is a
-/// round trip the thread spends waiting, so a run of them is what fills the queue.
-const PLAYBACK_RUN_MAX: usize = 128;
-
 /// Payload bytes a playback lets a run reach before it stops adding to it
 ///
 /// Depth is worth having on small records, which are almost all wait, and worth
@@ -714,7 +708,7 @@ impl ReelStore {
     fn playback_sized(&self, scope: Scope, column: ColumnId, hint: usize) -> Playback<'_> {
         let mut playback = self.playback(scope, column);
         if hint != 0 {
-            playback.run = hint.clamp(1, PLAYBACK_RUN_MAX);
+            playback.run = hint;
             playback.page.size = hint.clamp(1, PLAYBACK_PAGE_MAX);
         }
         playback
@@ -1030,7 +1024,7 @@ impl Playback<'_> {
     /// per run, so a caller that stops early pays for what it nearly wanted.
     fn read_run(&mut self) {
         let wanted = self.run;
-        self.run = (self.run * 2).min(PLAYBACK_RUN_MAX);
+        self.run = self.run.saturating_mul(2);
         self.staged.clear();
         self.found.clear();
         self.cursor = 0;
@@ -1346,34 +1340,34 @@ mod tests {
         );
     }
 
-    // the run starts small and reaches its ceiling only for a playback that keeps going
+    // the run starts small and grows only for a playback that keeps going
     #[test]
-    fn a_run_ramps_to_its_ceiling() {
+    fn a_run_ramps_from_the_floor() {
         let (store, sim) = store_with_io();
         let store = trait_store(&store);
-        let count = PLAYBACK_RUN_MAX * 3;
+        let count = PLAYBACK_RUN_MIN * 48;
         for key in 0..count {
             let mut bytes = record(1, 0);
             bytes[2..6].copy_from_slice(&(key as u32).to_be_bytes());
             store.put(RECORD_CF, &bytes, &[7u8; 64]).expect("put");
         }
 
-        // One key wanted, so one run at the floor rather than one at the ceiling.
+        // One key wanted, so one run at the floor rather than one sized to the column.
         let before = sim.read_bytes();
         let first = store.iter(RECORD_CF).expect("iter").next();
         assert!(first.is_some(), "the playback found its first key");
         let taking_one = sim.read_bytes() - before;
 
-        // The whole column wanted, so the run doubles until it reaches the ceiling.
+        // The whole column wanted, so the run doubles as the walk goes.
         let before = sim.read_bytes();
         let played = store.iter(RECORD_CF).expect("iter").count();
         let taking_all = sim.read_bytes() - before;
         assert_eq!(played, count);
 
         // Far more bytes than one run's, so the first caller was never charged for
-        // the ceiling.
+        // the whole column.
         assert!(
-            taking_all > taking_one * (count / PLAYBACK_RUN_MAX) as u64,
+            taking_all > taking_one * 3,
             "taking one key read {taking_one} bytes against {taking_all} for all {count}"
         );
     }

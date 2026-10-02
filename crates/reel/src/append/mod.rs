@@ -31,7 +31,7 @@ use crate::io::op::{Op, OwnedBuf, SyncRangeMode, WriteBuf};
 use crate::io::ServingBackend;
 use crate::reel::segment::{IoDriver, SegmentHandle};
 use crate::reel::tail::Tail;
-use crate::reel::{ReelShared, SegmentHolds};
+use crate::reel::{DrawnRecords, ReelShared, SegmentHolds};
 use crate::sync::{lock, read, try_lock, write};
 
 use flush::{turn_at, Owed, SyncState, Turn};
@@ -197,6 +197,25 @@ pub struct BatchRecord {
 
     /// What the record does to that key
     pub write: BatchWrite,
+}
+
+/// Bytes one run of copies holds at most, short enough that a foreground write to the
+/// same segment never waits long behind it
+const COPY_RUN_BYTES: u64 = 64 * 1024;
+
+/// One live record compaction carries across, under the number it was written with
+pub struct CopyRecord {
+    /// Column and key the record is addressed by
+    pub key: RecordKey,
+
+    /// The source record's own sequence number
+    pub lsn: Lsn,
+
+    /// The payload as it is stored
+    pub payload: OwnedBuf,
+
+    /// The codec byte that produced the payload
+    pub codec: u8,
 }
 
 /// One segment a tail is appending to, shared by every writer on that tail
@@ -463,25 +482,45 @@ impl Appender {
         )
     }
 
-    /// Append a compaction copy under the source record's own sequence number
+    /// Append a run of compaction copies as one reservation and one write
     ///
-    /// Keeping the original number means a crash that leaves both copies sees one
-    /// version.
-    pub fn append_copy(
-        &self,
-        key: RecordKey,
-        lsn: Lsn,
-        payload: OwnedBuf,
-        codec: u8,
-    ) -> Result<Committed> {
-        let bytes = framed_bytes(&key, payload.len());
-        self.admit(
-            bytes,
-            key,
-            Intent::Data(payload, codec),
-            Origin::Relocated(lsn),
-            Commit::Batched,
-        )
+    /// Every record keeps the sequence number of the one it copies, so a crash that
+    /// leaves both copies sees one version. Each stands alone, with no frame and no
+    /// batch mark, so a crash part way through the run leaves whole records. A run
+    /// wider than a segment is refused, and `copy_run_cap` keeps a caller under that.
+    pub fn append_copies(&self, copies: Vec<CopyRecord>) -> Result<Vec<Committed>> {
+        if copies.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bytes = copies
+            .iter()
+            .map(|copy| framed_bytes(&copy.key, copy.payload.len()))
+            .sum();
+        self.shared.budget.acquire(bytes);
+        let _admitted = self.admitted(bytes);
+        let mut headers = Vec::with_capacity(copies.len());
+        let mut payloads = Vec::with_capacity(copies.len());
+        for copy in copies {
+            let (header, payload) = build_record(
+                copy.key,
+                copy.lsn,
+                Intent::Data(copy.payload, copy.codec),
+                BatchMark::Alone,
+                Origin::Relocated(copy.lsn),
+            );
+            headers.push(header);
+            payloads.push(payload);
+        }
+        self.place_run(headers, payloads, false, None)
+    }
+
+    /// Bytes one run of copies may hold, a small share of a segment at most
+    ///
+    /// A run that does not fit what is left of a segment rolls it, so the cap is also
+    /// the most a roll leaves unused.
+    pub fn copy_run_cap(&self) -> u64 {
+        let target = self.shared.config.segment_bytes.to_bytes();
+        COPY_RUN_BYTES.min(target / 16)
     }
 
     /// Carry a tombstone into a rewritten segment under its own sequence number
@@ -955,7 +994,7 @@ impl Appender {
         let count = records.len();
         // Gauged before the first draw, given back once every record of the run holds
         // its segment.
-        let mut drawn = Some(self.shared.draw_gauge(count as u64));
+        let drawn = self.shared.draw_gauge(count as u64);
         let mut headers = Vec::with_capacity(count);
         let mut payloads = Vec::with_capacity(count);
         // A batch of one is a plain record: there is no middle for a crash to land in,
@@ -977,8 +1016,22 @@ impl Appender {
             payloads.push(payload);
         }
 
+        self.place_run(headers, payloads, mark == BatchMark::Member, Some(drawn))
+    }
+
+    /// Reserve one range for a run of built records, write it, and say where each landed
+    ///
+    /// A framed run is a batch a crash has to drop whole. A run of copies has no frame.
+    fn place_run(
+        &self,
+        headers: Vec<RecordHeader>,
+        mut payloads: Vec<OwnedBuf>,
+        is_framed: bool,
+        mut drawn: Option<DrawnRecords<'_>>,
+    ) -> Result<Vec<Committed>> {
+        let count = headers.len();
         let run: u64 = headers.iter().map(|header| header.span()).sum();
-        let frame = (mark == BatchMark::Member).then_some(BatchFrame {
+        let frame = is_framed.then_some(BatchFrame {
             count: count as u32,
             span: run,
         });
@@ -1033,10 +1086,10 @@ impl Appender {
                     }
                 }
                 let locs = outcome?;
-                // The run took one reservation in one segment and its numbers were
-                // issued in order, so the frame's own is the oldest of them.
-                if let Some(first) = headers.first() {
-                    self.shared.note_landed(active.handle.id(), first.lsn);
+                // A batch's numbers were issued in order and a run of copies brings its
+                // own, so the oldest is looked for.
+                if let Some(oldest) = headers.iter().map(|header| header.lsn).min() {
+                    self.shared.note_landed(active.handle.id(), oldest);
                 }
                 self.tail.publish_committed(base + span);
                 self.paced_writeback(&active);

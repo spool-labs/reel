@@ -16,7 +16,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::append::Appender;
+use crate::append::{Appender, CopyRecord};
 use crate::config::RepairPath;
 use crate::error::{ReelError, Result};
 use crate::format::column::{ColumnId, RecordKey};
@@ -125,6 +125,15 @@ struct MergeState {
     /// What the pass will report when it is done
     report: MergeReport,
 
+    /// Winning records waiting to go down as one write, in key order
+    copies: Vec<CopyRecord>,
+
+    /// Each queued record's key, sequence number and span, for its repoint and the report
+    queued: Vec<(RecordKey, Lsn, u64)>,
+
+    /// Bytes the queued records frame
+    queued_bytes: u64,
+
     /// Moved records waiting for a hold of the publish barrier
     pending: Vec<KeyRepoint>,
 
@@ -168,6 +177,9 @@ pub fn merge_once(
             runs_merged: sources.len() as u64,
             ..MergeReport::default()
         },
+        copies: Vec::new(),
+        queued: Vec::new(),
+        queued_bytes: 0,
         pending: Vec::with_capacity(REPOINT_BATCH),
         written: BTreeSet::new(),
     };
@@ -438,7 +450,7 @@ fn merge_column(
     let mut cursors: Vec<usize> = vec![0; sources.len()];
     loop {
         let Some(key) = least_key(sources, &cursors, column) else {
-            return Ok(());
+            return land_copies(writer, state);
         };
         let winner = take_key(sources, &mut cursors, column, &key, &mut state.report);
         let Some(winner) = winner else {
@@ -531,6 +543,8 @@ fn emit_row(
     // there to survive: a pruned grave reads as nothing here, and dropping the record
     // on that is how a merge resurrects the version underneath it.
     if row.is_tombstone() || row.is_range_tombstone() {
+        // a tombstone goes down where its key sorts, after the copies queued ahead of it
+        land_copies(writer, state)?;
         return carry_tombstone(index, writer, sources, readers, state, key, winner);
     }
 
@@ -633,16 +647,38 @@ fn copy_record(
         return Ok(());
     }
 
-    let committed =
-        writer.append_copy(key.clone(), record.header.lsn, payload, record.header.codec)?;
-    state.written.insert(committed.loc.segment);
-    state.report.rows_written += 1;
-    state.report.bytes_written += record.span();
-    state.pending.push(KeyRepoint {
+    let span = record.span();
+    if state.queued_bytes + span > writer.copy_run_cap() {
+        land_copies(writer, state)?;
+    }
+    state.queued_bytes += span;
+    state.copies.push(CopyRecord {
         key: key.clone(),
-        to: committed.loc,
         lsn: record.header.lsn,
+        payload,
+        codec: record.header.codec,
     });
+    state.queued.push((key.clone(), record.header.lsn, span));
+    Ok(())
+}
+
+/// Write the queued copies as one run and line their repoints up for the barrier
+fn land_copies(writer: &Appender, state: &mut MergeState) -> Result<()> {
+    if state.copies.is_empty() {
+        return Ok(());
+    }
+    state.queued_bytes = 0;
+    let landed = writer.append_copies(std::mem::take(&mut state.copies))?;
+    for ((key, lsn, span), committed) in state.queued.drain(..).zip(landed) {
+        state.written.insert(committed.loc.segment);
+        state.report.rows_written += 1;
+        state.report.bytes_written += span;
+        state.pending.push(KeyRepoint {
+            key,
+            to: committed.loc,
+            lsn,
+        });
+    }
     Ok(())
 }
 

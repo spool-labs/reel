@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::append::CopyRecord;
 use crate::config::{ReelConfig, RepairPath, VolumeClass};
 use crate::error::Result;
 use crate::format::band::Band;
@@ -44,8 +45,8 @@ const FETCH_DEPTH: usize = 8;
 
 /// What rewriting one of a segment's records produced, whichever order reached it
 enum Rewrote {
-    /// A live record was copied, carrying this many footprint bytes
-    Copied(u64),
+    /// A live record joined the run waiting to land
+    Queued,
 
     /// The record was dead, corrupt, or below the purge floor
     Skipped,
@@ -62,8 +63,8 @@ enum Rewrote {
 
 /// What handling one live-record copy produced
 enum CopyStep {
-    /// The record was copied, carrying this many footprint bytes
-    Copied(u64),
+    /// The record joined the run waiting to land
+    Queued,
 
     /// The record was dead or corrupt, so nothing was copied
     Skipped,
@@ -259,6 +260,19 @@ struct PassTally {
     dropped: u64,
     had_live: bool,
     rotted: bool,
+}
+
+/// Live records waiting to land in the destination as one write, in the order queued
+#[derive(Default)]
+struct CopyRun {
+    /// The records the appender is handed
+    copies: Vec<CopyRecord>,
+
+    /// Each queued record's key, sequence number and span, for its repoint and the tally
+    moved: Vec<(RecordKey, Lsn, u64)>,
+
+    /// Bytes the queued records frame
+    bytes: u64,
 }
 
 /// Where the last scrub pass stopped, so the next one carries on from there
@@ -878,6 +892,7 @@ impl Compactor {
         pace: &mut PassPace<'_>,
     ) -> Result<()> {
         let mut pool: Vec<Vec<u8>> = Vec::new();
+        let mut run = CopyRun::default();
         let mut start = 0usize;
         while start < order.len() {
             let end = stripe_end(order, start);
@@ -916,13 +931,14 @@ impl Compactor {
 
             for (_, record, payload) in staged {
                 self.apply_one(
-                    reel, dest_index, index, reader, &record, payload, segment, drop_floor, tally,
+                    reel, dest_index, index, reader, record, payload, segment, drop_floor,
+                    &mut run, tally,
                 )?;
                 pace.reached(reader.read_bytes() + tally.copied_bytes);
             }
             start = end;
         }
-        Ok(())
+        self.land_run(reel, dest_index, index, &mut run, tally)
     }
 
     /// Rewrite a segment with no footer by walking its records where they lie
@@ -941,28 +957,25 @@ impl Compactor {
         tally: &mut PassTally,
         pace: &mut PassPace<'_>,
     ) -> Result<()> {
+        let mut run = CopyRun::default();
         let mut at = 0u64;
-        loop {
-            let record = match RecordScan::resuming(reader, at).next_record()? {
-                Some(record) => {
-                    at = u64::from(record.offset) + record.header.span();
-                    record
-                }
-                None => return Ok(()),
-            };
+        while let Some(record) = RecordScan::resuming(reader, at).next_record()? {
+            at = u64::from(record.offset) + record.header.span();
             self.apply_one(
                 reel,
                 dest_index,
                 index,
                 reader,
-                &record,
+                record,
                 Staged::Unread,
                 segment,
                 drop_floor,
+                &mut run,
                 tally,
             )?;
             pace.reached(reader.read_bytes() + tally.copied_bytes);
         }
+        self.land_run(reel, dest_index, index, &mut run, tally)
     }
 
     /// The payload a stripe fetch holds for the apply, where one will be wanted
@@ -997,6 +1010,10 @@ impl Compactor {
     }
 
     /// Rewrite one record and fold what happened into the pass's tally
+    ///
+    /// A live record only joins the run. The run lands first when the record is a
+    /// tombstone, which has to go down where its key sorts, or when the record would
+    /// take the run past what one write may hold.
     #[allow(clippy::too_many_arguments)]
     fn apply_one(
         &self,
@@ -1004,24 +1021,52 @@ impl Compactor {
         dest_index: usize,
         index: &ReelIndex,
         reader: &mut SegmentReader<'_>,
-        record: &SourceRecord,
+        record: SourceRecord,
         staged: Staged,
         segment: SegmentId,
         drop_floor: Lsn,
+        run: &mut CopyRun,
         tally: &mut PassTally,
     ) -> Result<()> {
+        let cap = reel.tails()[dest_index].copy_run_cap();
+        if !record.header.flags.is_data() || run.bytes + record.span() > cap {
+            self.land_run(reel, dest_index, index, run, tally)?;
+        }
         match self.rewrite_one(
-            reel, dest_index, index, reader, record, staged, segment, drop_floor,
+            reel, dest_index, index, reader, record, staged, segment, drop_floor, run,
         )? {
-            Rewrote::Copied(span) => {
-                tally.copied_bytes += span;
-                tally.had_live = true;
-            }
-            Rewrote::Skipped => {}
+            Rewrote::Queued | Rewrote::Skipped => {}
             Rewrote::Carried => tally.carried += 1,
             Rewrote::Dropped => tally.dropped += 1,
             Rewrote::Rotted => tally.rotted = true,
         }
+        Ok(())
+    }
+
+    /// Write the queued copies as one run and point the index at where they landed
+    ///
+    /// The copies are down while the index still points at the source, which is the
+    /// window a concurrent delete or overwrite has to win in, so every repoint is
+    /// guarded by the sequence number its copy was made under.
+    fn land_run(
+        &self,
+        reel: &Reel,
+        dest_index: usize,
+        index: &ReelIndex,
+        run: &mut CopyRun,
+        tally: &mut PassTally,
+    ) -> Result<()> {
+        if run.copies.is_empty() {
+            return Ok(());
+        }
+        run.bytes = 0;
+        let landed = reel.tails()[dest_index].append_copies(std::mem::take(&mut run.copies))?;
+        crate::sync::rendezvous::at("compaction/repoint");
+        for ((key, lsn, span), committed) in run.moved.drain(..).zip(landed) {
+            index.repoint(&key, committed.loc, lsn)?;
+            tally.copied_bytes += span;
+        }
+        tally.had_live = true;
         Ok(())
     }
 
@@ -1033,15 +1078,16 @@ impl Compactor {
         dest_index: usize,
         index: &ReelIndex,
         reader: &mut SegmentReader<'_>,
-        record: &SourceRecord,
+        record: SourceRecord,
         staged: Staged,
         segment: SegmentId,
         drop_floor: Lsn,
+        run: &mut CopyRun,
     ) -> Result<Rewrote> {
         if record.header.flags.is_tombstone() || record.header.flags.is_range_tombstone() {
             return Ok(
                 match self
-                    .carry_or_drop(reel, dest_index, index, reader, record, staged, drop_floor)?
+                    .carry_or_drop(reel, dest_index, index, reader, &record, staged, drop_floor)?
                 {
                     TombstoneStep::Carried => Rewrote::Carried,
                     TombstoneStep::Dropped => Rewrote::Dropped,
@@ -1049,8 +1095,8 @@ impl Compactor {
             );
         }
         Ok(
-            match self.copy_live(reel, dest_index, index, reader, record, staged, segment)? {
-                CopyStep::Copied(span) => Rewrote::Copied(span),
+            match self.copy_live(reel, index, reader, record, staged, segment, run)? {
+                CopyStep::Queued => Rewrote::Queued,
                 CopyStep::Skipped => Rewrote::Skipped,
                 CopyStep::Rotted => Rewrote::Rotted,
             },
@@ -1157,12 +1203,12 @@ impl Compactor {
     fn copy_live(
         &self,
         reel: &Reel,
-        dest_index: usize,
         index: &ReelIndex,
         reader: &mut SegmentReader<'_>,
-        record: &SourceRecord,
+        record: SourceRecord,
         staged: Staged,
         segment: SegmentId,
+        run: &mut CopyRun,
     ) -> Result<CopyStep> {
         let loc = record.loc(segment);
         // The fetch phase already asked whether the index points here, so the apply asks
@@ -1191,7 +1237,7 @@ impl Compactor {
 
         let payload = match staged {
             Some(payload) => payload,
-            None => read_payload(reader, record)?,
+            None => read_payload(reader, &record)?,
         };
         if !record.header.verify(&payload) {
             // With peers the eviction turns the miss into a repair enqueue. A sole copy
@@ -1211,19 +1257,19 @@ impl Compactor {
             return Ok(CopyStep::Rotted);
         }
 
-        // the queue owns what it writes and the repoint below needs the key again, so
-        // the clone is required rather than incidental
-        let committed = reel.tails()[dest_index].append_copy(
-            record.header.key.clone(),
-            record.header.lsn,
+        // The appender owns what it writes and the repoint needs the key again, so
+        // the key is cloned once.
+        let span = record.span();
+        let header = record.header;
+        run.bytes += span;
+        run.copies.push(CopyRecord {
+            key: header.key.clone(),
+            lsn: header.lsn,
             payload,
-            record.header.codec,
-        )?;
-        // the copy is down and the index still points at the source, which is the
-        // window a concurrent delete or overwrite has to win in
-        crate::sync::rendezvous::at("compaction/repoint");
-        index.repoint(&record.header.key, committed.loc, record.header.lsn)?;
-        Ok(CopyStep::Copied(record.span()))
+            codec: header.codec,
+        });
+        run.moved.push((header.key, header.lsn, span));
+        Ok(CopyStep::Queued)
     }
 
     /// Carry a tombstone into the destination, or drop one nothing can undo
@@ -1499,12 +1545,30 @@ fn footer_order(footer: &SegmentFooter) -> Option<(Vec<(u32, u32)>, u64)> {
 /// A footer whose rows will not decode names no order at all, and a rewrite for order
 /// has nothing to put such a segment into, so it is left where a scan can still read it.
 fn footer_facts(footer: &SegmentFooter) -> FooterFacts {
-    let is_out_of_order = footer_order(footer)
-        .is_some_and(|(order, _)| !order.windows(2).all(|pair| pair[0].0 <= pair[1].0));
     FooterFacts {
         is_sorted_run: footer.partitions.iter().all(FooterPartition::is_sorted_run),
-        is_out_of_order,
+        is_out_of_order: is_out_of_order(footer),
     }
+}
+
+/// Whether a footer's rows, taken in key order, ever step back in offset
+///
+/// Read off the rows where they lie, so a question with a yes or no answer builds no
+/// list of them. False where a row will not decode, as a footer with no order has none
+/// to be out of.
+fn is_out_of_order(footer: &SegmentFooter) -> bool {
+    let mut last = 0u32;
+    let mut steps_back = false;
+    for partition in &footer.partitions {
+        for row in 0..partition.len() {
+            let Ok(row) = partition.row_at(row) else {
+                return false;
+            };
+            steps_back |= row.offset < last;
+            last = row.offset;
+        }
+    }
+    steps_back
 }
 
 /// Whether a tombstone has to come across, or nothing it shadows can still turn up
@@ -1661,12 +1725,11 @@ pub fn footer_bound(
     if footer_len < min_footer || footer_len > file_len {
         return Ok(file_len);
     }
-    let footer_bytes = shared
-        .driver
-        .pread(handle.file(), file_len - footer_len, footer_len)?;
-    match SegmentFooter::parse(&footer_bytes) {
-        Ok(_) => Ok(file_len - footer_len),
-        Err(_) => Ok(file_len),
+    // Whether those bytes are a footer is the cache's to answer: it usually holds the
+    // parsed one already, and reading it here again would parse it only to drop it.
+    match shared.footer_of(handle.id())? {
+        Some(_) => Ok(file_len - footer_len),
+        None => Ok(file_len),
     }
 }
 
@@ -2404,13 +2467,15 @@ mod tests {
 
         put(&fixture, 1, vec![0x44; 500]);
         let committed = fixture.reel.tails()[0]
-            .append_copy(
-                record.header.key,
-                record.header.lsn,
+            .append_copies(vec![CopyRecord {
+                key: record.header.key,
+                lsn: record.header.lsn,
                 payload,
-                record.header.codec,
-            )
-            .expect("copy");
+                codec: record.header.codec,
+            }])
+            .expect("copy")
+            .pop()
+            .expect("one copy landed");
         let moved = fixture
             .index
             .repoint(&key(1), committed.loc, record.header.lsn)
@@ -2568,7 +2633,12 @@ mod tests {
         seal(&fixture);
 
         fixture.reel.tails()[0]
-            .append_copy(key(1), Lsn(1), vec![0x55; 300], 0)
+            .append_copies(vec![CopyRecord {
+                key: key(1),
+                lsn: Lsn(1),
+                payload: vec![0x55; 300],
+                codec: 0,
+            }])
             .expect("copy");
         fixture.reel.flush().expect("flush");
 

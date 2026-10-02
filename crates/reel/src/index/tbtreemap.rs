@@ -1470,6 +1470,39 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         })
     }
 
+    /// Every pair from a low bound on, a leaf's run at a time
+    ///
+    /// One descent places the bound, then each leaf hands over its keys and values as
+    /// two slices, so a caller copying a page copies runs instead of pairs.
+    pub fn range_runs<'a>(&'a self, low: Bound<&K>) -> impl Iterator<Item = (&'a [K], &'a [V])> {
+        let (mut at, mut slot) = match low {
+            Bound::Unbounded => (self.first, 0usize),
+            Bound::Included(key) => self.seat(key.borrow()).unwrap_or((NONE, 0)),
+            Bound::Excluded(key) => match self.seat(key.borrow()) {
+                Some((at, slot)) => {
+                    let leaf = &self.leaves[slot_of(at)];
+                    match slot < leaf.len && leaf.keys[slot] == *key {
+                        true => (at, slot + 1),
+                        false => (at, slot),
+                    }
+                }
+                None => (NONE, 0),
+            },
+        };
+        std::iter::from_fn(move || loop {
+            if at == NONE {
+                return None;
+            }
+            let leaf = &self.leaves[slot_of(at)];
+            let from = slot;
+            at = leaf.next;
+            slot = 0;
+            if from < leaf.len {
+                return Some((&leaf.keys[from..leaf.len], &leaf.vals[from..leaf.len]));
+            }
+        })
+    }
+
     /// The same span walked from its high end down
     ///
     /// The leaves are chained both ways, so this is the forward walk with the links

@@ -1649,7 +1649,9 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         };
         let at = self.shard_of(&key);
         let mut state = write(&self.shards[at]);
-        match state.map.at(key.as_slice()).copied() {
+        // Changed where it sits: the entry was just found, and putting it back would
+        // walk the map to it a second time.
+        match state.map.at_mut(key.as_slice()) {
             Some(existing) if existing.lsn == expected_lsn && !existing.is_grave() => {
                 let span = existing.span(key.width());
                 segments.release_live(existing.loc.segment, span);
@@ -1661,10 +1663,8 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 self.filters.note(at, filter_hash(key.as_slice()));
                 // The copy sits in an open tail, held live until the repoint is
                 // published, so its stamp is issued here.
-                state.map.put(
-                    key,
-                    existing.moved_to(new_loc, segments.live_incarnation(new_loc.segment)),
-                );
+                let stamp = segments.live_incarnation(new_loc.segment);
+                *existing = existing.moved_to(new_loc, stamp);
                 true
             }
             Some(_) | None => {
@@ -2344,6 +2344,9 @@ pub trait ShardMap<K: IndexKey, V: 'static>: Default {
     /// What is held for a key, borrowed rather than built
     fn at(&self, key: &[u8]) -> Option<&V>;
 
+    /// What is held for a key, to be changed where it sits
+    fn at_mut(&mut self, key: &[u8]) -> Option<&mut V>;
+
     /// Whether a key is held at all
     fn holds(&self, key: &[u8]) -> bool;
 
@@ -2462,6 +2465,10 @@ impl<const B: usize, V: Default + 'static> ShardMap<Box<[u8]>, V> for TBTreeMap<
         self.get(key)
     }
 
+    fn at_mut(&mut self, key: &[u8]) -> Option<&mut V> {
+        self.get_mut(key)
+    }
+
     fn holds(&self, key: &[u8]) -> bool {
         self.contains_key(key)
     }
@@ -2544,6 +2551,11 @@ impl<const N: usize, const B: usize, V: Default + 'static> ShardMap<[u8; N], V>
         // an absence rather than a fault.
         let key: &[u8; N] = key.try_into().ok()?;
         self.get(key)
+    }
+
+    fn at_mut(&mut self, key: &[u8]) -> Option<&mut V> {
+        let key: &[u8; N] = key.try_into().ok()?;
+        self.get_mut(key)
     }
 
     fn holds(&self, key: &[u8]) -> bool {
@@ -2636,6 +2648,11 @@ impl<const N: usize, V: Default + 'static> ShardMap<[u8; N], V> for OpenTable<N,
         // an absence rather than a fault.
         let key: &[u8; N] = key.try_into().ok()?;
         self.get(key)
+    }
+
+    fn at_mut(&mut self, key: &[u8]) -> Option<&mut V> {
+        let key: &[u8; N] = key.try_into().ok()?;
+        self.get_mut(key)
     }
 
     fn holds(&self, key: &[u8]) -> bool {

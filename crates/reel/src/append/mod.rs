@@ -1541,10 +1541,6 @@ impl Appender {
             file,
             Arc::clone(&self.shared.driver),
         );
-        let mut entries = SegmentFooter::empty();
-        for row in &resumed.rows {
-            entries.push(row);
-        }
         let active = Active {
             handle,
             reserved: AtomicU64::new(resumed.end),
@@ -1552,7 +1548,7 @@ impl Appender {
             cut_at: AtomicU64::new(NO_CUT),
             alloc_high: AtomicU64::new(resumed.end),
             fill: Mutex::new(()),
-            entries: Mutex::new(entries),
+            entries: Mutex::new(resumed.entries),
             sync: Arc::new(SyncState::new()),
             terminal: AtomicBool::new(false),
             holds,

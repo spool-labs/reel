@@ -193,7 +193,7 @@ pub fn rebuild_from_persisted(
                 consumed.insert(*segment, *len);
                 sealed_files.push((*segment, path.clone(), *len));
             }
-            Loaded::Walked(offset, is_at_fill, rows) => {
+            Loaded::Walked(offset, is_at_fill, entries) => {
                 consumed.insert(*segment, offset);
                 walked.push((path.clone(), *len));
                 // Resumable means the walk ran out of written bytes. A walk that
@@ -204,7 +204,7 @@ pub fn rebuild_from_persisted(
                         segment: *segment,
                         path: path.clone(),
                         end: offset,
-                        rows,
+                        entries,
                     });
                 }
             }
@@ -274,8 +274,8 @@ enum Loaded {
     Sealed,
 
     /// An unsealed tail, walked to an offset, whether it may be taken up again, and
-    /// its rows in walk order
-    Walked(u64, bool, Vec<FooterEntry>),
+    /// its rows packed as its footer holds them
+    Walked(u64, bool, SegmentFooter),
 
     /// A file that is not a segment of this reel
     Foreign,
@@ -283,13 +283,13 @@ enum Loaded {
 
 /// An unsealed tail an appender can pick up where it stopped
 ///
-/// The end is the walked offset; the rows are rebuilt from the walk and carry
-/// nothing inline, so a read through one goes to the record.
+/// The end is the walked offset; the footer is rebuilt from the walk and carries
+/// nothing inline, so a read through one of its rows goes to the record.
 pub struct ResumableTail {
     pub segment: SegmentId,
     pub path: PathBuf,
     pub end: u64,
-    pub rows: Vec<FooterEntry>,
+    pub entries: SegmentFooter,
 }
 
 /// One segment file read off the medium, before any of it is joined
@@ -300,8 +300,8 @@ enum SegmentParts {
     /// A sealed segment's footer, and the range ends its rows do not carry
     Sealed(SegmentFooter, Vec<Option<KeyBytes>>),
 
-    /// An unsealed tail's walk, in the order the records sit in the file
-    Walked(Walked),
+    /// An unsealed tail's walk
+    Walked(WalkedTail),
 
     /// A file that is not a segment of this reel
     Foreign,
@@ -463,12 +463,7 @@ fn read_parts(
         }
         None => {
             let mut reader = SegmentReader::new(driver, file, file_len);
-            Ok(SegmentParts::Walked(walk_records(
-                &mut reader,
-                segment,
-                0,
-                file_len,
-            )?))
+            Ok(SegmentParts::Walked(walk_tail(&mut reader, segment, file_len)?))
         }
     }
 }
@@ -490,24 +485,10 @@ fn absorb_segment(
             }
             Ok(Loaded::Sealed)
         }
-        SegmentParts::Walked(walked) => {
-            let reached = walked.next_offset;
-            let rows = walked
-                .records
-                .iter()
-                .map(|record| {
-                    FooterEntry::new(
-                        record.key.clone(),
-                        record.lsn,
-                        record.loc.offset,
-                        record.loc.len,
-                        record.flags,
-                    )
-                })
-                .collect();
-            let is_at_fill = walked.is_at_fill;
-            absorb_walked(resolver, walked.records);
-            Ok(Loaded::Walked(reached, is_at_fill, rows))
+        SegmentParts::Walked(tail) => {
+            let mut ends = tail.ends.into_iter();
+            collect_partitions(segment, &tail.footer.partitions, &mut ends, resolver)?;
+            Ok(Loaded::Walked(tail.next_offset, tail.is_at_fill, tail.footer))
         }
     }
 }
@@ -852,8 +833,68 @@ pub fn walk_records(
     from: u64,
     to: u64,
 ) -> Result<Walked> {
-    let limit = reader.limit().min(to);
     let mut records = Vec::new();
+    let (next_offset, is_at_fill) =
+        walk_each(reader, segment, from, to, |record| records.push(record))?;
+    Ok(Walked {
+        records,
+        next_offset,
+        is_at_fill,
+    })
+}
+
+/// An unsealed tail's walk, its rows packed the way the tail's own footer packs them
+struct WalkedTail {
+    /// Rows column by column, each column in the order the records sit in the file
+    footer: SegmentFooter,
+
+    /// Each range tombstone's end, in the footer's order
+    ends: Vec<Option<KeyBytes>>,
+
+    /// Offset the walk stopped at, which is where the tail resumes
+    next_offset: u64,
+
+    /// Whether the walk stopped on bytes nothing has written
+    is_at_fill: bool,
+}
+
+/// Walk a whole tail into the footer an appender takes it up with
+///
+/// A record held whole costs four times its packed row, and the tails of a volume of
+/// small records hold millions of them.
+fn walk_tail(reader: &mut SegmentReader<'_>, segment: SegmentId, to: u64) -> Result<WalkedTail> {
+    let mut footer = SegmentFooter::empty();
+    let mut ends = Vec::new();
+    let (next_offset, is_at_fill) = walk_each(reader, segment, 0, to, |record| {
+        if record.flags.is_range_tombstone() {
+            ends.push((record.key.column, record.range_end));
+        }
+        let (offset, len) = (record.loc.offset, record.loc.len);
+        footer.push(&FooterEntry::new(record.key, record.lsn, offset, len, record.flags));
+    })?;
+    // The footer holds a column's rows together, and a stable sort keeps each column's
+    // ends in file order.
+    ends.sort_by_key(|(column, _)| *column);
+    Ok(WalkedTail {
+        footer,
+        ends: ends.into_iter().map(|(_, end)| end).collect(),
+        next_offset,
+        is_at_fill,
+    })
+}
+
+/// The walk itself, handing each record on once it is vetted and its batch is whole
+///
+/// Answers the offset the walk stopped at and whether it stopped on unwritten bytes.
+fn walk_each(
+    reader: &mut SegmentReader<'_>,
+    segment: SegmentId,
+    from: u64,
+    to: u64,
+    mut take: impl FnMut(WalkedRecord),
+) -> Result<(u64, bool)> {
+    let limit = reader.limit().min(to);
+    let mut run = Vec::new();
     // Where a walk may resume from. It trails the write head by whatever an unlanded
     // run holds, so a tail that grows into its own batch is re-read from the frame
     // rather than resumed inside it.
@@ -884,8 +925,8 @@ pub fn walk_records(
             if ends_at > limit {
                 break;
             }
-            match walk_batch(reader, segment, &frame, offset, ends_at)? {
-                Batch::Whole(run) => records.extend(run),
+            match walk_batch(reader, segment, &frame, offset, ends_at, &mut run)? {
+                Batch::Whole => run.drain(..).for_each(&mut take),
                 // The run is on disk and not intact, so it is dropped whole and the
                 // walk carries on at the boundary the frame named.
                 Batch::Torn => {}
@@ -912,7 +953,7 @@ pub fn walk_records(
             continue;
         }
         let span = header.span();
-        records.push(resolve_walked(reader, segment, header, at)?);
+        take(resolve_walked(reader, segment, header, at)?);
         next_offset = at + span;
     }
 
@@ -921,12 +962,7 @@ pub fn walk_records(
     // stops at the end of what was written, and one that stops on anything else has
     // written bytes ahead of it that an appender must not land behind.
     let is_at_fill = matches!(read_head(reader, next_offset, limit)?, Head::Missing);
-
-    Ok(Walked {
-        records,
-        next_offset,
-        is_at_fill,
-    })
+    Ok((next_offset, is_at_fill))
 }
 
 /// What the bytes at an offset turned out to be
@@ -971,8 +1007,8 @@ fn read_head(reader: &mut SegmentReader<'_>, offset: u64, limit: u64) -> Result<
 
 /// What one batch's declared region turned out to hold
 enum Batch {
-    /// Every record the frame declared is there and verifies
-    Whole(Vec<WalkedRecord>),
+    /// Every record the frame declared is there and verifies, held in the run
+    Whole,
 
     /// The region is written and is not the run the frame declared
     Torn,
@@ -993,8 +1029,9 @@ fn walk_batch(
     frame: &BatchFrame,
     from: u64,
     ends_at: u64,
+    run: &mut Vec<WalkedRecord>,
 ) -> Result<Batch> {
-    let mut run = Vec::new();
+    run.clear();
     let mut offset = from;
     for _ in 0..frame.count {
         let header = match read_head(reader, offset, ends_at)? {
@@ -1018,7 +1055,7 @@ fn walk_batch(
         run.push(resolve_walked(reader, segment, header, at)?);
     }
     match offset == ends_at {
-        true => Ok(Batch::Whole(run)),
+        true => Ok(Batch::Whole),
         false => Ok(Batch::Torn),
     }
 }
@@ -1048,22 +1085,6 @@ fn resolve_walked(
         flags: header.flags,
         range_end,
     })
-}
-
-/// Fold a walk's records into the index, ranges apart from keys
-fn absorb_walked(resolver: &mut Resolver<'_>, records: Vec<WalkedRecord>) {
-    for record in records {
-        match record.flags.is_range_tombstone() {
-            true => resolver.range(&record.key, record.range_end, record.lsn, record.loc),
-            false => resolver.put(
-                record.key.column,
-                record.key.as_slice(),
-                record.loc,
-                record.lsn,
-                record.flags.is_tombstone(),
-            ),
-        }
-    }
 }
 
 fn verify_record(

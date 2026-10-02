@@ -14,7 +14,7 @@ use crate::format::fence::{fence_bytes, lead_of, top_leads, FENCE_LEAD, FENCE_PA
 use crate::format::filter::{Filter, HEADER_LEN as FILTER_HEADER_LEN};
 use crate::format::lsn::Lsn;
 use crate::format::prefix::PrefixRows;
-use crate::format::record::{checksum, read_u32_le, read_u64_le, Flags, RecordHeader};
+use crate::format::record::{checksum, digest, read_u32_le, read_u64_le, Flags, RecordHeader};
 
 /// Marker in the final bytes of a sealed segment
 const FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"REEL");
@@ -867,6 +867,22 @@ impl SegmentFooter {
     /// between the rows and the filters, which follows from the row counts and widths the
     /// directory already carries.
     pub fn pack_fenced(&mut self, filter_bits: u8, is_fenced: bool) -> Result<Vec<u8>> {
+        let (rows, tail) = self.pack_apart(filter_bits, is_fenced)?;
+        let mut buf = Vec::with_capacity(rows.iter().map(Vec::len).sum::<usize>() + tail.len());
+        for piece in &rows {
+            buf.extend_from_slice(piece);
+        }
+        buf.extend_from_slice(&tail);
+        self.put_rows(rows);
+        Ok(buf)
+    }
+
+    /// The same footer as each partition's rows, lent out where they sit, and the bytes
+    /// after them
+    ///
+    /// A seal lands the pieces in one vectored write, so no page of the rows is copied,
+    /// and gives the rows back with `put_rows`.
+    pub fn pack_apart(&mut self, filter_bits: u8, is_fenced: bool) -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
         self.partitions.sort_by_key(|partition| partition.column);
         for partition in self.partitions.iter_mut() {
             partition.sort();
@@ -889,10 +905,7 @@ impl SegmentFooter {
             + region_len
             + self.partitions.len() * DIRECTORY_ROW_LEN
             + FIXED_TAIL_LEN;
-        let mut buf = Vec::with_capacity(footer_len);
-        for rows in &encoded {
-            buf.extend_from_slice(rows);
-        }
+        let mut buf = Vec::with_capacity(footer_len - rows_len);
         buf.extend_from_slice(&fences);
         if region_len > 0 {
             for partition in &self.partitions {
@@ -920,9 +933,40 @@ impl SegmentFooter {
         buf.extend_from_slice(&(footer_len as u32).to_le_bytes());
         buf.extend_from_slice(&FOOTER_MAGIC.to_le_bytes());
 
-        let crc = checksum(&buf);
+        let mut crc = digest();
+        for rows in &encoded {
+            crc.update(rows);
+        }
+        crc.update(&buf);
+        let crc = crc.finalize() as u32;
         buf[crc_at..crc_at + U32_BYTES].copy_from_slice(&crc.to_le_bytes());
-        Ok(buf)
+
+        // A varying partition writes an encoded copy and keeps its rows, and a strided
+        // one lends the rows it holds.
+        let encoded: Vec<Option<Vec<u8>>> = encoded
+            .into_iter()
+            .map(|rows| match rows {
+                Cow::Owned(rows) => Some(rows),
+                Cow::Borrowed(_) => None,
+            })
+            .collect();
+        let rows = encoded
+            .into_iter()
+            .zip(self.partitions.iter_mut())
+            .map(|(encoded, partition)| {
+                encoded.unwrap_or_else(|| std::mem::take(&mut partition.packed))
+            })
+            .collect();
+        Ok((rows, buf))
+    }
+
+    /// Take back the rows `pack_apart` lent
+    pub fn put_rows(&mut self, rows: Vec<Vec<u8>>) {
+        for (partition, rows) in self.partitions.iter_mut().zip(rows) {
+            if !partition.is_varying() {
+                partition.packed = rows;
+            }
+        }
     }
 
     /// Parse a footer from the trailing bytes of a segment

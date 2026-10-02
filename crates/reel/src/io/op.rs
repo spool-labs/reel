@@ -166,6 +166,16 @@ impl Part {
         }
     }
 
+    /// A shorter stretch inside this one, for the payload behind a record's prefix
+    pub fn narrowed(self, skip: usize, len: usize) -> Part {
+        debug_assert!(skip + len <= self.len as usize);
+        Part {
+            bytes: self.bytes,
+            start: self.start + skip as u32,
+            len: len as u32,
+        }
+    }
+
     /// The bytes the stretch covers
     pub fn as_slice(&self) -> &[u8] {
         &self.bytes[self.start as usize..(self.start + self.len) as usize]

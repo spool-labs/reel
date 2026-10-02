@@ -891,6 +891,7 @@ impl Compactor {
         pace: &mut PassPace<'_>,
     ) -> Result<()> {
         let mut run = CopyRun::default();
+        let mut staged: Vec<Option<Part>> = Vec::new();
         let mut start = 0usize;
         while start < order.len() {
             let end = stripe_end(order, start);
@@ -900,8 +901,10 @@ impl Compactor {
             plan.sort_unstable_by_key(|&(_, offset)| offset);
             let ranges = chunk_ranges(&plan, order, prefix_bound, reader.limit());
 
-            let mut staged: Vec<(usize, SourceRecord, Option<Part>)> =
-                Vec::with_capacity(plan.len());
+            // One held stretch per record, in the slot its key order gives it, so the
+            // apply walks them in order with nothing to sort.
+            staged.clear();
+            staged.resize(end - start, None);
             let mut wave_at = 0usize;
             while wave_at < ranges.len() {
                 let wave =
@@ -913,27 +916,36 @@ impl Compactor {
                 for (range, buffer) in wave.iter().zip(buffers) {
                     reader.preload(range.start, buffer);
                     for &(position, offset) in &plan[range.members.clone()] {
-                        let record =
-                            match RecordScan::resuming(reader, u64::from(offset)).next_record()? {
-                                Some(record) => record,
-                                // a footer offset the records disagree with gives up
-                                // the record, not the pass
-                                None => continue,
-                            };
-                        // Held where the read left it, so a record the apply skips costs
-                        // the fetch nothing and the index is asked once, in key order.
-                        let payload = match record.header.flags.is_tombstone() {
-                            true => None,
-                            false => Some(held_payload(reader, &record)?),
-                        };
-                        staged.push((position, record, payload));
+                        // Held where the read left it and parsed at the apply, so a
+                        // record costs the fetch sixteen bytes whatever its key weighs.
+                        let span = prefix_bound as usize + order[position].1 as usize;
+                        staged[position - start] = Some(reader.held(u64::from(offset), span)?);
                     }
                 }
                 pace.reached(reader.read_bytes() + tally.copied_bytes);
             }
-            staged.sort_unstable_by_key(|entry| entry.0);
 
-            for (_, record, payload) in staged {
+            for (slot, held) in staged.drain(..).enumerate() {
+                let Some(held) = held else {
+                    continue;
+                };
+                let offset = order[start + slot].0;
+                let (record, payload) = match held_record(offset, held) {
+                    Some(found) => found,
+                    // a record its footer row undersold is read where it lies
+                    None => match RecordScan::resuming(reader, u64::from(offset)).next_record()? {
+                        Some(record) => {
+                            let payload = match record.header.flags.is_tombstone() {
+                                true => None,
+                                false => Some(held_payload(reader, &record)?),
+                            };
+                            (record, payload)
+                        }
+                        // a footer offset the records disagree with gives up the
+                        // record, not the pass
+                        None => continue,
+                    },
+                };
                 self.apply_one(
                     reel, dest_index, index, reader, record, payload, segment, drop_floor,
                     &mut run, tally,
@@ -1757,6 +1769,27 @@ impl<'reader, 'driver> RecordScan<'reader, 'driver> {
         }
         Ok(None)
     }
+}
+
+/// The record a held stretch of a segment opens with, and its payload inside the stretch
+///
+/// Nothing where the bytes are not a whole record a rewrite carries.
+fn held_record(offset: u32, held: Part) -> Option<(SourceRecord, Option<Part>)> {
+    let bytes = held.as_slice();
+    let width = peek_key_width(bytes.get(..HEADER_LEN)?)?;
+    let header = RecordHeader::unpack(bytes.get(..HEADER_LEN + width)?).ok()?;
+    if header.is_unwritten() || !header.fits_within(bytes.len() as u64) {
+        return None;
+    }
+    let flags = header.flags;
+    if !(flags.is_data() || flags.is_tombstone() || flags.is_range_tombstone()) {
+        return None;
+    }
+    let payload = match flags.is_tombstone() {
+        true => None,
+        false => Some(held.narrowed(HEADER_LEN + width, header.length as usize)),
+    };
+    Some((SourceRecord { header, offset }, payload))
 }
 
 /// The payload behind one record header, held where the reader's window has it

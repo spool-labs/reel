@@ -761,9 +761,11 @@ impl Compactor {
                 return Ok(());
             }
         };
-        let region_end = footer_bound(shared, &source, file_len)?;
-        // key order where the segment can say what that is, offset order otherwise
-        let order = self.rewrite_order(shared, segment);
+        // read once for the pass: where the records end, and their key order where the
+        // segment can say what that is, offset order otherwise
+        let footer = shared.footer_of(segment)?;
+        let region_end = footer_bound(shared, &source, file_len, footer.as_deref())?;
+        let order = footer.as_deref().and_then(footer_order);
         let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
         reader.stock(std::mem::take(&mut *lock(&self.spare)));
         // The band the source was drawn under is where its survivors belong. Placement
@@ -1117,21 +1119,6 @@ impl Compactor {
         )
     }
 
-    /// A segment's records in key order, per column, as offset and length pairs
-    ///
-    /// A sealed segment's footer is already a sorted index of what it holds, so applying
-    /// records in that order is what makes the destination sorted on disk. The offsets
-    /// are trusted only as an order: every record is still read, framed and checksum
-    /// verified where it lands.
-    fn rewrite_order(
-        &self,
-        shared: &Arc<ReelShared>,
-        segment: SegmentId,
-    ) -> Option<(Vec<(u32, u32)>, u64)> {
-        let footer = shared.footer_of(segment).ok().flatten()?;
-        footer_order(&footer)
-    }
-
     /// Punch the dead runs out of sealed segments, and say what came back
     ///
     /// Sealed, footer-bearing segments only: a rebuild reads those from their footers
@@ -1169,7 +1156,7 @@ impl Compactor {
                 Some(len) => len,
                 None => continue,
             };
-            let region_end = footer_bound(shared, &source, file_len)?;
+            let region_end = footer_bound(shared, &source, file_len, Some(&footer))?;
             let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
             let mut runs: Vec<(u64, u64)> = Vec::new();
             for offset in offsets {
@@ -1461,7 +1448,10 @@ impl Compactor {
         };
         let (from, region_end) = match resume {
             Some(carried) => carried,
-            None => (0, footer_bound(shared, &handle, file_len)?),
+            None => {
+                let footer = shared.footer_of(handle.id())?;
+                (0, footer_bound(shared, &handle, file_len, footer.as_deref())?)
+            }
         };
         let mut reader = SegmentReader::new(&shared.driver, handle.file(), region_end);
         let mut scan = RecordScan::resuming(&mut reader, from);
@@ -1720,13 +1710,17 @@ pub fn is_missing(error: &crate::error::ReelError) -> bool {
 }
 
 /// Where a sealed segment's record region ends, which is where its footer begins
+///
+/// The caller brings the footer it read, or nothing for a segment that has none, so a
+/// pass that needs the rows as well reads the footer once.
 pub fn footer_bound(
     shared: &Arc<ReelShared>,
     handle: &SegmentHandle,
     file_len: u64,
+    footer: Option<&SegmentFooter>,
 ) -> Result<u64> {
     let min_footer = FIXED_TAIL_LEN as u64;
-    if file_len < min_footer {
+    if footer.is_none() || file_len < min_footer {
         return Ok(file_len);
     }
     let trailer = shared
@@ -1739,12 +1733,7 @@ pub fn footer_bound(
     if footer_len < min_footer || footer_len > file_len {
         return Ok(file_len);
     }
-    // Whether those bytes are a footer is the cache's to answer: it usually holds the
-    // parsed one already, and reading it here again would parse it only to drop it.
-    match shared.footer_of(handle.id())? {
-        Some(_) => Ok(file_len - footer_len),
-        None => Ok(file_len),
-    }
+    Ok(file_len - footer_len)
 }
 
 /// A forward walk over one segment's records, buying its bytes in chunks
@@ -2473,7 +2462,9 @@ mod tests {
         let shared = fixture.reel.shared();
         let source = source_handle(shared, SegmentId(1)).expect("handle");
         let file_len = segment_len(shared, &source).expect("len").expect("present");
-        let region_end = footer_bound(shared, &source, file_len).expect("bound");
+        let footer = shared.footer_of(SegmentId(1)).expect("footer");
+        let region_end =
+            footer_bound(shared, &source, file_len, footer.as_deref()).expect("bound");
         let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
         let mut scan = RecordScan::resuming(&mut reader, 0);
         let record = loop {

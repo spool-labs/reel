@@ -362,7 +362,7 @@ fn select_runs<'compactor>(
             continue;
         };
         claims.push(claim);
-        let region_end = footer_bound(shared, &handle, file_len)?;
+        let region_end = footer_bound(shared, &handle, file_len, Some(&footer))?;
         sources.push(MergeSource {
             segment,
             handle,

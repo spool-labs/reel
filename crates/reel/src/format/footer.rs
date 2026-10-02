@@ -616,6 +616,37 @@ impl FooterPartition {
         true
     }
 
+    /// Bytes every key in the partition opens with, which tell no two rows apart
+    fn shared_prefix(&self) -> usize {
+        let Some(first) = self.key_at(0) else {
+            return 0;
+        };
+        let mut shared = first.len();
+        for at in 1..self.len() {
+            if shared == 0 {
+                break;
+            }
+            let key = self.key_at(at).unwrap_or_default();
+            let agreed = first.iter().zip(key).take_while(|(one, two)| one == two);
+            shared = shared.min(agreed.count());
+        }
+        shared
+    }
+
+    /// Eight bytes of one row's key past the shared prefix, as a number that orders as
+    /// the key does
+    ///
+    /// A key that runs out is padded with zeros, which can only tie it with a longer
+    /// one, and a tie is settled on the whole key.
+    fn key_head(&self, index: usize, shared: usize) -> u64 {
+        let key = self.key_at(index).unwrap_or_default();
+        let rest = key.get(shared..).unwrap_or_default();
+        let mut head = [0u8; U64_BYTES];
+        let held = rest.len().min(U64_BYTES);
+        head[..held].copy_from_slice(&rest[..held]);
+        u64::from_be_bytes(head)
+    }
+
     /// Put the rows in key order, ordering a key's versions by sequence number
     ///
     /// Two rows can share a key when a segment holds an overwrite of its own record, and
@@ -628,19 +659,26 @@ impl FooterPartition {
         }
 
         let count = self.len();
-        let mut order: Vec<u32> = (0..count as u32).collect();
+        // Each row brings the head of its key along, so a comparison is settled by two
+        // words already in hand and only a tie goes back to the rows.
+        let shared = self.shared_prefix();
+        let mut order: Vec<(u64, u32)> = (0..count as u32)
+            .map(|at| (self.key_head(at as usize, shared), at))
+            .collect();
         // Unstable, with the sequence number as the tie break. Writers finish in whatever
         // order they finish, so a key rewritten within one segment can arrive newest
         // first, and ordering that run by arrival leaves the older row where a lookup
         // takes it.
         order.sort_unstable_by(|left, right| {
-            let left = *left as usize;
-            let right = *right as usize;
-            // In range by construction, since the order came from the row count.
-            let one = self.key_at(left).unwrap_or_default();
-            let two = self.key_at(right).unwrap_or_default();
-            one.cmp(two)
-                .then_with(|| self.lsn_at(left).cmp(&self.lsn_at(right)))
+            left.0.cmp(&right.0).then_with(|| {
+                let left = left.1 as usize;
+                let right = right.1 as usize;
+                // In range by construction, since the order came from the row count.
+                let one = self.key_at(left).unwrap_or_default();
+                let two = self.key_at(right).unwrap_or_default();
+                one.cmp(two)
+                    .then_with(|| self.lsn_at(left).cmp(&self.lsn_at(right)))
+            })
         });
 
         let mut sorted = Vec::with_capacity(self.packed.len());
@@ -648,7 +686,7 @@ impl FooterPartition {
         if self.is_varying() {
             starts.push(0u32);
         }
-        for index in order {
+        for (_, index) in order {
             // In range by construction, as above.
             let (start, end) = self.row_span(index as usize).unwrap_or((0, 0));
             sorted.extend_from_slice(&self.packed[start..end]);

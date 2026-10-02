@@ -463,6 +463,10 @@ fn an_unreadable_footer_does_not_lose_the_batch() {
     let second = store.reel.tails()[0].seal().expect("seal");
     store.flush().expect("flush");
 
+    // The seal left both footers held, and this is about one that has to be read back.
+    store.reel.shared().footers.forget(first);
+    store.reel.shared().footers.forget(second);
+
     // Wide enough for the length and the two reads one footer costs, narrow
     // enough that the segment behind it is read from a working device.
     sim.arm_next_ops(3, FaultKind::ReadError);

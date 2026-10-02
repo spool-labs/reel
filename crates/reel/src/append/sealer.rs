@@ -67,6 +67,11 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
         *lock(&active.entries) = footer;
         return Err(error);
     }
+    // Packing left the footer as a read of the file would parse it, so the first search
+    // of this segment finds it held and reads nothing back.
+    shared
+        .footers
+        .insert(active.handle.id(), Arc::new(footer));
     // The handle stops being a write head here and becomes the one readers find in the
     // cache, so it takes the hint a read-path open would have given it.
     let _ = shared

@@ -238,21 +238,6 @@ impl Metrics {
     }
 }
 
-/// What the fetch phase learned about a record, carried to the apply phase
-///
-/// Everything the fetch already asked the index is an answer the apply would ask for a
-/// second time, which on a paged column is a footer search.
-enum Staged {
-    /// Nothing was staged, so the apply reads the payload and asks for itself
-    Unread,
-
-    /// The index no longer pointed at this record when the fetch looked
-    Dead,
-
-    /// Live when the fetch looked, with the bytes if the fetch read them
-    Live(Option<Part>),
-}
-
 /// What one pass accumulated while it rewrote
 #[derive(Default)]
 struct PassTally {
@@ -915,7 +900,8 @@ impl Compactor {
             plan.sort_unstable_by_key(|&(_, offset)| offset);
             let ranges = chunk_ranges(&plan, order, prefix_bound, reader.limit());
 
-            let mut staged: Vec<(usize, SourceRecord, Staged)> = Vec::with_capacity(plan.len());
+            let mut staged: Vec<(usize, SourceRecord, Option<Part>)> =
+                Vec::with_capacity(plan.len());
             let mut wave_at = 0usize;
             while wave_at < ranges.len() {
                 let wave =
@@ -934,7 +920,12 @@ impl Compactor {
                                 // the record, not the pass
                                 None => continue,
                             };
-                        let payload = self.stage_payload(reel, index, reader, &record, segment)?;
+                        // Held where the read left it, so a record the apply skips costs
+                        // the fetch nothing and the index is asked once, in key order.
+                        let payload = match record.header.flags.is_tombstone() {
+                            true => None,
+                            false => Some(held_payload(reader, &record)?),
+                        };
                         staged.push((position, record, payload));
                     }
                 }
@@ -983,7 +974,7 @@ impl Compactor {
                 index,
                 reader,
                 record,
-                Staged::Unread,
+                None,
                 segment,
                 drop_floor,
                 &mut run,
@@ -992,37 +983,6 @@ impl Compactor {
             pace.reached(reader.read_bytes() + tally.copied_bytes);
         }
         self.land_run(reel, dest_index, index, &mut run, tally)
-    }
-
-    /// The payload a stripe fetch holds for the apply, where one will be wanted
-    ///
-    /// Nothing is staged for a record the apply is going to skip, since its bytes would
-    /// fill the cap with dead weight.
-    fn stage_payload(
-        &self,
-        reel: &Reel,
-        index: &ReelIndex,
-        reader: &mut SegmentReader<'_>,
-        record: &SourceRecord,
-        segment: SegmentId,
-    ) -> Result<Staged> {
-        let header = &record.header;
-        if header.flags.is_range_tombstone() {
-            return held_payload(reader, record).map(|end| Staged::Live(Some(end)));
-        }
-        if header.flags.is_tombstone() {
-            // a point tombstone has no payload to stage and asks nothing of the index
-            return Ok(Staged::Unread);
-        }
-        let live =
-            matches!(index.get(&header.key)?, Some(entry) if entry.loc == record.loc(segment));
-        if !live {
-            return Ok(Staged::Dead);
-        }
-        if is_purged(reel.shared().purge_floor(), index, &header.key) {
-            return Ok(Staged::Live(None));
-        }
-        held_payload(reader, record).map(|payload| Staged::Live(Some(payload)))
     }
 
     /// Rewrite one record and fold what happened into the pass's tally
@@ -1038,7 +998,7 @@ impl Compactor {
         index: &ReelIndex,
         reader: &mut SegmentReader<'_>,
         record: SourceRecord,
-        staged: Staged,
+        staged: Option<Part>,
         segment: SegmentId,
         drop_floor: Lsn,
         run: &mut CopyRun,
@@ -1095,7 +1055,7 @@ impl Compactor {
         index: &ReelIndex,
         reader: &mut SegmentReader<'_>,
         record: SourceRecord,
-        staged: Staged,
+        staged: Option<Part>,
         segment: SegmentId,
         drop_floor: Lsn,
         run: &mut CopyRun,
@@ -1207,25 +1167,18 @@ impl Compactor {
         index: &ReelIndex,
         reader: &mut SegmentReader<'_>,
         record: SourceRecord,
-        staged: Staged,
+        staged: Option<Part>,
         segment: SegmentId,
         run: &mut CopyRun,
     ) -> Result<CopyStep> {
         let loc = record.loc(segment);
-        // The fetch phase already asked whether the index points here, so the apply asks
-        // only when nothing did. The repoint below is guarded on the version the fetch
-        // saw, so a record that dies between the two phases loses there.
-        let staged = match staged {
-            Staged::Dead => return Ok(CopyStep::Skipped),
-            Staged::Live(payload) => payload,
-            Staged::Unread => {
-                match index.get(&record.header.key)? {
-                    Some(entry) if entry.loc == loc => {}
-                    Some(_) | None => return Ok(CopyStep::Skipped),
-                }
-                None
-            }
-        };
+        // Asked here, where a stripe arrives in key order and one key's walk of the map
+        // leaves the next one's path warm. The repoint is guarded on the version this
+        // saw, so a record that dies before its run lands loses there.
+        match index.get(&record.header.key)? {
+            Some(entry) if entry.loc == loc => {}
+            Some(_) | None => return Ok(CopyStep::Skipped),
+        }
 
         // A record the floor has passed is dropped and its key goes with it. No
         // tombstone is written: the key is below a floor the whole volume agrees on, so
@@ -1285,7 +1238,7 @@ impl Compactor {
         index: &ReelIndex,
         reader: &mut SegmentReader<'_>,
         record: &SourceRecord,
-        staged: Staged,
+        staged: Option<Part>,
         drop_floor: Lsn,
     ) -> Result<TombstoneStep> {
         if !should_carry(index, &record.header, drop_floor)? {
@@ -1294,8 +1247,8 @@ impl Compactor {
         let tail = &reel.tails()[dest_index];
         let carried = if record.header.flags.is_range_tombstone() {
             let end = match staged {
-                Staged::Live(Some(end)) => end.as_slice().to_vec(),
-                Staged::Live(None) | Staged::Unread | Staged::Dead => read_payload(reader, record)?,
+                Some(end) => end.as_slice().to_vec(),
+                None => read_payload(reader, record)?,
             };
             tail.append_carried_range(record.header.key.clone(), record.header.lsn, end)?
         } else {

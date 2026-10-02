@@ -111,19 +111,26 @@ impl Filter {
         })
     }
 
-    /// Set one key's bits, counting it toward the keys this filter holds
-    pub fn insert(&mut self, key: &[u8]) {
+    /// Set one key's bits, and say whether the filter did not already hold it
+    ///
+    /// A key whose bits were all set counts for nothing, so one that comes back
+    /// through a rewrite spends none of the filter's budget.
+    pub fn insert(&mut self, key: &[u8]) -> bool {
         let blocks = self.body.len() / BLOCK_BYTES;
         if self.kind != KIND_BLOOM || blocks == 0 || self.probes == 0 {
-            return;
+            return false;
         }
         let hash = hash_key(key, self.seed);
         let block = block_of(hash, blocks) * BLOCK_BYTES;
+        let mut is_new = false;
         for bit in bits_of(hash, u32::from(self.probes)) {
             let at = bit as usize / 8;
-            self.body[block + at] |= 1u8 << (bit % 8);
+            let mask = 1u8 << (bit % 8);
+            is_new |= self.body[block + at] & mask == 0;
+            self.body[block + at] |= mask;
         }
-        self.keys += 1;
+        self.keys += u32::from(is_new);
+        is_new
     }
 
     /// Whether the segment may hold this key, which is only ever a maybe or a no

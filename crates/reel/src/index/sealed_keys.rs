@@ -110,10 +110,13 @@ impl Levels {
             self.stack.push(filter);
             self.room = budget;
         }
-        // The level was just topped up if it was out of room.
+        // The level was just topped up if it was out of room. A key the level
+        // already holds takes none of it, or every rewrite of a segment would
+        // spend its keys again and the stack would grow with the copying.
         if let Some(top) = self.stack.last_mut() {
-            top.insert(key);
-            self.room -= 1;
+            if top.insert(key) {
+                self.room -= 1;
+            }
         }
     }
 }
@@ -133,6 +136,18 @@ mod tests {
             assert!(keys.may_hold(&at.to_le_bytes()));
         }
         assert_eq!(keys.skips(), 0);
+    }
+
+    // keys that come back through a rewrite take no room, so the stack stays as it was
+    #[test]
+    fn repeated_keys_grow_nothing() {
+        let keys = SealedKeys::new();
+        for _ in 0..3 {
+            for at in 0..FIRST_LEVEL_KEYS as u64 {
+                keys.insert(&at.to_le_bytes());
+            }
+        }
+        assert_eq!(read(&keys.levels).stack.len(), 1);
     }
 
     // a key never inserted is almost always ruled out, and the skip is counted

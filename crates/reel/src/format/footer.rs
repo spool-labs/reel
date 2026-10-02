@@ -930,6 +930,12 @@ impl SegmentFooter {
     /// The slice must end at the segment end. An absent magic, a length out of range, or
     /// a checksum mismatch is reported so the caller falls back to a record scan.
     pub fn parse(segment_tail: &[u8]) -> Result<SegmentFooter> {
+        SegmentFooter::parse_owned(segment_tail.to_vec())
+    }
+
+    /// The same parse, keeping the buffer as the first partition's rows so no page of
+    /// them is copied
+    pub fn parse_owned(mut segment_tail: Vec<u8>) -> Result<SegmentFooter> {
         let total = segment_tail.len();
         if total < FIXED_TAIL_LEN {
             return Err(ReelError::Corruption(
@@ -953,7 +959,8 @@ impl SegmentFooter {
             ));
         }
 
-        let footer = &segment_tail[total - footer_len..total];
+        let opens = total - footer_len;
+        let footer = &segment_tail[opens..total];
         verify_footer_crc(footer, footer_len)?;
 
         let entry_count = read_at_u32(footer, footer_len, ENTRY_COUNT_FROM_END) as usize;
@@ -986,13 +993,19 @@ impl SegmentFooter {
         }
 
         let directory_at = body - directory_len;
-        let (mut partitions, consumed) = read_partitions(footer, directory_at, partition_count)?;
+        let (mut partitions, consumed, lead) =
+            read_partitions(footer, directory_at, partition_count)?;
         let region = &footer[directory_at - bloom_len..directory_at];
         for (partition, filter) in partitions
             .iter_mut()
             .zip(Filter::parse_region(region, partition_count))
         {
             partition.filter = filter;
+        }
+        if let Some(span) = lead {
+            segment_tail.truncate(opens + span);
+            segment_tail.drain(..opens);
+            partitions[0].packed = segment_tail;
         }
 
         // What is left between the rows and the filters is the fence, and nothing here
@@ -1081,14 +1094,16 @@ fn write_directory_row(buf: &mut Vec<u8>, partition: &FooterPartition, span: usi
 /// Decode the directory and take each partition's packed rows behind it
 ///
 /// Also answers how many bytes of the rows region the partitions consumed, since the
-/// in-memory form's length is not the on-disk one for prefix packed rows.
+/// in-memory form's length is not the on-disk one for prefix packed rows. A strided
+/// first partition comes back empty with its span, for the caller's buffer to fill.
 fn read_partitions(
     footer: &[u8],
     directory_at: usize,
     partition_count: usize,
-) -> Result<(Vec<FooterPartition>, usize)> {
+) -> Result<(Vec<FooterPartition>, usize, Option<usize>)> {
     let mut partitions = Vec::with_capacity(partition_count);
     let mut rows_at = 0usize;
+    let mut lead = None;
     let mut listed = [false; u8::MAX as usize + 1];
     for index in 0..partition_count {
         let at = directory_at + index * DIRECTORY_ROW_LEN;
@@ -1130,16 +1145,19 @@ fn read_partitions(
         let packed = footer
             .get(rows_at..rows_at + span)
             .ok_or_else(|| ReelError::Corruption("footer partition is truncated".to_string()))?;
-        partition.packed = packed.to_vec();
-        if partition.encoded_len() != listed_span {
+        if span != listed_span {
             return Err(ReelError::Corruption(
                 "footer partition is not the length its directory row claims".to_string(),
             ));
         }
+        match index {
+            0 => lead = Some(span),
+            _ => partition.packed = packed.to_vec(),
+        }
         rows_at += span;
         partitions.push(partition);
     }
-    Ok((partitions, rows_at))
+    Ok((partitions, rows_at, lead))
 }
 
 /// Read a sealed segment's trailer without reading the footer it describes

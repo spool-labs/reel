@@ -1252,7 +1252,7 @@ pub(crate) fn read_footer(
     if (footer_bytes.len() as u64) < footer_len {
         return Ok(None);
     }
-    match SegmentFooter::parse(&footer_bytes) {
+    match SegmentFooter::parse_owned(footer_bytes) {
         Ok(footer) => Ok(Some(footer)),
         Err(_) => Ok(None),
     }

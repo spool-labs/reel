@@ -20,6 +20,7 @@ use crate::format::lsn::Lsn;
 use crate::format::record::{peek_key_width, read_u32_le, RecordHeader, HEADER_LEN};
 use crate::format::segment_header::SegmentHeader;
 use crate::index::map::ReelIndex;
+use crate::io::op::Part;
 use crate::reel::segment::{SegmentHandle, SegmentReader, READ_CHUNK};
 use crate::reel::{Reel, ReelShared, NOTHING_PURGED};
 use crate::sync::{lock, try_lock};
@@ -249,7 +250,7 @@ enum Staged {
     Dead,
 
     /// Live when the fetch looked, with the bytes if the fetch read them
-    Live(Option<Vec<u8>>),
+    Live(Option<Part>),
 }
 
 /// What one pass accumulated while it rewrote
@@ -367,6 +368,9 @@ pub struct Compactor {
     /// What each sealed segment's footer said, so a walk over the standing ones reads
     /// none of them again
     sealed_facts: Mutex<std::collections::HashMap<SegmentId, FooterFacts>>,
+
+    /// Read buffers the last pass finished with, which the next pass reads into
+    spare: Mutex<Vec<Vec<u8>>>,
 }
 
 /// Takes a segment out of the in-flight set however its pass leaves
@@ -489,6 +493,7 @@ impl Compactor {
             in_flight: Mutex::new(std::collections::HashSet::new()),
             rotted: Mutex::new(std::collections::HashMap::new()),
             sealed_facts: Mutex::new(std::collections::HashMap::new()),
+            spare: Mutex::new(Vec::new()),
             // nothing about the sweep survives the process, so the rotation comes from
             // something that differs between runs of it
             scrub_seed: SystemTime::now()
@@ -498,6 +503,11 @@ impl Compactor {
             demote_after_bytes,
             metrics: Metrics::new(),
         }
+    }
+
+    /// Give back the read buffers kept between passes, once there is no next pass
+    pub fn release_spare(&self) {
+        *lock(&self.spare) = Vec::new();
     }
 
     /// Free-space pressure and tiering for the volume
@@ -755,6 +765,7 @@ impl Compactor {
         // key order where the segment can say what that is, offset order otherwise
         let order = self.rewrite_order(shared, segment);
         let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
+        reader.stock(std::mem::take(&mut *lock(&self.spare)));
         // The band the source was drawn under is where its survivors belong. Placement
         // the writer paid for is undone otherwise: every rewrite would put a window's
         // records back into the mixture they were kept out of.
@@ -819,6 +830,7 @@ impl Compactor {
         // refills at dead records included, plus the copies it wrote.
         let read_bytes = reader.read_bytes();
         let charged = read_bytes.saturating_add(tally.copied_bytes);
+        *lock(&self.spare) = reader.into_spare();
 
         // A rotted record on a sole copy keeps its segment: the key still resolves into
         // this file, and retiring it would unlink the last copy of those bytes.
@@ -891,7 +903,6 @@ impl Compactor {
         tally: &mut PassTally,
         pace: &mut PassPace<'_>,
     ) -> Result<()> {
-        let mut pool: Vec<Vec<u8>> = Vec::new();
         let mut run = CopyRun::default();
         let mut start = 0usize;
         while start < order.len() {
@@ -910,9 +921,9 @@ impl Compactor {
                 wave_at += wave.len();
                 let asks: Vec<(u64, usize)> =
                     wave.iter().map(|range| (range.start, range.len)).collect();
-                let buffers = reader.read_ranges(&asks, &mut pool)?;
+                let buffers = reader.read_ranges(&asks)?;
                 for (range, buffer) in wave.iter().zip(buffers) {
-                    pool.push(reader.preload(range.start, buffer));
+                    reader.preload(range.start, buffer);
                     for &(position, offset) in &plan[range.members.clone()] {
                         let record =
                             match RecordScan::resuming(reader, u64::from(offset)).next_record()? {
@@ -936,9 +947,12 @@ impl Compactor {
                 )?;
                 pace.reached(reader.read_bytes() + tally.copied_bytes);
             }
+            // The copies are written out of the stripe's read buffers, so landing them
+            // is what frees those buffers for the next stripe.
+            self.land_run(reel, dest_index, index, &mut run, tally)?;
             start = end;
         }
-        self.land_run(reel, dest_index, index, &mut run, tally)
+        Ok(())
     }
 
     /// Rewrite a segment with no footer by walking its records where they lie
@@ -992,7 +1006,7 @@ impl Compactor {
     ) -> Result<Staged> {
         let header = &record.header;
         if header.flags.is_range_tombstone() {
-            return read_payload(reader, record).map(|end| Staged::Live(Some(end)));
+            return held_payload(reader, record).map(|end| Staged::Live(Some(end)));
         }
         if header.flags.is_tombstone() {
             // a point tombstone has no payload to stage and asks nothing of the index
@@ -1006,7 +1020,7 @@ impl Compactor {
         if is_purged(reel.shared().purge_floor(), index, &header.key) {
             return Ok(Staged::Live(None));
         }
-        read_payload(reader, record).map(|payload| Staged::Live(Some(payload)))
+        held_payload(reader, record).map(|payload| Staged::Live(Some(payload)))
     }
 
     /// Rewrite one record and fold what happened into the pass's tally
@@ -1237,9 +1251,9 @@ impl Compactor {
 
         let payload = match staged {
             Some(payload) => payload,
-            None => read_payload(reader, &record)?,
+            None => held_payload(reader, &record)?,
         };
-        if !record.header.verify(&payload) {
+        if !record.header.verify(payload.as_slice()) {
             // With peers the eviction turns the miss into a repair enqueue. A sole copy
             // keeps its bytes where they are: rewriting them would stamp a fresh
             // checksum over rot and serve it as good.
@@ -1293,7 +1307,7 @@ impl Compactor {
         let tail = &reel.tails()[dest_index];
         let carried = if record.header.flags.is_range_tombstone() {
             let end = match staged {
-                Staged::Live(Some(end)) => end,
+                Staged::Live(Some(end)) => end.as_slice().to_vec(),
                 Staged::Live(None) | Staged::Unread | Staged::Dead => read_payload(reader, record)?,
             };
             tail.append_carried_range(record.header.key.clone(), record.header.lsn, end)?
@@ -1801,6 +1815,11 @@ impl<'reader, 'driver> RecordScan<'reader, 'driver> {
         }
         Ok(None)
     }
+}
+
+/// The payload behind one record header, held where the reader's window has it
+pub fn held_payload(reader: &mut SegmentReader<'_>, record: &SourceRecord) -> Result<Part> {
+    reader.held(record.payload_at(), record.header.length as usize)
 }
 
 /// The payload behind one record header, copied out of the reader's window
@@ -2463,7 +2482,7 @@ mod tests {
                 break record;
             }
         };
-        let payload = read_payload(scan.reader(), &record).expect("payload");
+        let payload = held_payload(scan.reader(), &record).expect("payload");
 
         put(&fixture, 1, vec![0x44; 500]);
         let committed = fixture.reel.tails()[0]
@@ -2636,7 +2655,7 @@ mod tests {
             .append_copies(vec![CopyRecord {
                 key: key(1),
                 lsn: Lsn(1),
-                payload: vec![0x55; 300],
+                payload: Part::whole(vec![0x55; 300]),
                 codec: 0,
             }])
             .expect("copy");

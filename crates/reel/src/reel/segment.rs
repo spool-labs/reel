@@ -16,8 +16,8 @@ use crate::format::loc::SegmentId;
 use crate::hold::{segment_key, Hold};
 use crate::io::mapping::Mapping;
 use crate::io::op::{
-    Advice, ColdRoute, Completion, FileId, Op, Outcome, ReadBuf, SegmentEntry, Tag, WarmFirst,
-    WriteBuf,
+    Advice, ColdRoute, Completion, FileId, Op, Outcome, Part, ReadBuf, SegmentEntry, Tag,
+    WarmFirst, WriteBuf,
 };
 use crate::io::slots::{runs_of, SlotTable};
 use crate::io::ReelIo;
@@ -914,9 +914,15 @@ pub struct SegmentReader<'driver> {
     driver: &'driver IoDriver,
     file: FileId,
     limit: u64,
-    window: Vec<u8>,
+    window: Arc<Vec<u8>>,
     window_at: u64,
     read_bytes: u64,
+
+    /// Buffers no window or write holds, kept for the next read
+    spare: Vec<Vec<u8>>,
+
+    /// Windows the reader moved off while a write still held part of them
+    lent: Vec<Arc<Vec<u8>>>,
 }
 
 impl<'driver> SegmentReader<'driver> {
@@ -926,10 +932,68 @@ impl<'driver> SegmentReader<'driver> {
             driver,
             file,
             limit,
-            window: Vec::new(),
+            window: Arc::default(),
             window_at: 0,
             read_bytes: 0,
+            spare: Vec::new(),
+            lent: Vec::new(),
         }
+    }
+
+    /// Hand the reader buffers an earlier reader finished with
+    pub fn stock(&mut self, spare: Vec<Vec<u8>>) {
+        self.spare = spare;
+    }
+
+    /// Every buffer the reader holds alone, for the next reader to start with
+    pub fn into_spare(mut self) -> Vec<Vec<u8>> {
+        self.retire(Arc::default());
+        self.reclaim();
+        self.spare
+    }
+
+    /// The payload at this offset as a stretch of the window, for a write to hold
+    ///
+    /// The window stays alive for as long as the write holds it, and the reader's
+    /// next read goes into another buffer.
+    pub fn held(&mut self, offset: u64, len: usize) -> Result<Part> {
+        let len = self.range(offset, len)?.len();
+        let start = match len {
+            0 => 0,
+            _ => (offset - self.window_at) as usize,
+        };
+        Ok(Part::new(&self.window, start, len))
+    }
+
+    /// Swap the window out, keeping its buffer where nothing else holds it
+    fn retire(&mut self, window: Arc<Vec<u8>>) {
+        match Arc::try_unwrap(std::mem::replace(&mut self.window, window)) {
+            Ok(bytes) if bytes.capacity() > 0 => self.spare.push(bytes),
+            Ok(_) => {}
+            Err(held) => self.lent.push(held),
+        }
+    }
+
+    /// Take back every lent window the writes have let go of
+    fn reclaim(&mut self) {
+        let mut at = 0;
+        while at < self.lent.len() {
+            if Arc::strong_count(&self.lent[at]) > 1 {
+                at += 1;
+                continue;
+            }
+            if let Ok(bytes) = Arc::try_unwrap(self.lent.swap_remove(at)) {
+                self.spare.push(bytes);
+            }
+        }
+    }
+
+    /// A buffer for the next read, one already paid for where there is one
+    fn buffer(&mut self) -> Vec<u8> {
+        if self.spare.is_empty() {
+            self.reclaim();
+        }
+        self.spare.pop().unwrap_or_default()
     }
 
     /// Byte the reader stops at
@@ -969,8 +1033,9 @@ impl<'driver> SegmentReader<'driver> {
 
     fn refill(&mut self, offset: u64, wanted: usize) -> Result<()> {
         let span = (wanted.max(READ_CHUNK) as u64).min(self.limit - offset);
-        let reuse = std::mem::take(&mut self.window);
-        self.window = self.driver.pread_reusing(self.file, offset, span, reuse)?;
+        self.retire(Arc::default());
+        let reuse = self.buffer();
+        self.window = Arc::new(self.driver.pread_reusing(self.file, offset, span, reuse)?);
         self.window_at = offset;
         self.read_bytes += self.window.len() as u64;
         Ok(())
@@ -980,11 +1045,7 @@ impl<'driver> SegmentReader<'driver> {
     ///
     /// Buffers come back in ask order, short only where the segment runs out, and a
     /// range past the limit comes back empty without an op.
-    pub fn read_ranges(
-        &mut self,
-        ranges: &[(u64, usize)],
-        pool: &mut Vec<Vec<u8>>,
-    ) -> Result<Vec<Vec<u8>>> {
+    pub fn read_ranges(&mut self, ranges: &[(u64, usize)]) -> Result<Vec<Vec<u8>>> {
         let mut asked = Vec::with_capacity(ranges.len());
         let mut ops = Vec::with_capacity(ranges.len());
         for (at, &(offset, len)) in ranges.iter().enumerate() {
@@ -997,7 +1058,7 @@ impl<'driver> SegmentReader<'driver> {
                 tag: self.driver.next_tag(),
                 file: self.file,
                 offset,
-                buf: ReadBuf::reusing(pool.pop().unwrap_or_default(), wanted),
+                buf: ReadBuf::reusing(self.buffer(), wanted),
             });
         }
         let completions = self.driver.run(ops)?;
@@ -1017,9 +1078,9 @@ impl<'driver> SegmentReader<'driver> {
     }
 
     /// Adopt a fetched range as the window, handing back the one it replaces
-    pub fn preload(&mut self, offset: u64, window: Vec<u8>) -> Vec<u8> {
+    pub fn preload(&mut self, offset: u64, window: Vec<u8>) {
         self.window_at = offset;
-        std::mem::replace(&mut self.window, window)
+        self.retire(Arc::new(window));
     }
 }
 

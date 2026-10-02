@@ -27,7 +27,7 @@ use crate::format::lsn::{Lsn, LsnCounter};
 use crate::format::record::{align_up, BatchFrame, Flags, RecordHeader, BLOCK, HEADER_LEN};
 use crate::format::segment_header::SegmentHeader;
 use crate::index::recovery::ResumableTail;
-use crate::io::op::{Op, OwnedBuf, SyncRangeMode, WriteBuf};
+use crate::io::op::{Op, OwnedBuf, Part, SyncRangeMode, WriteBuf};
 use crate::io::ServingBackend;
 use crate::reel::segment::{IoDriver, SegmentHandle};
 use crate::reel::tail::Tail;
@@ -211,8 +211,8 @@ pub struct CopyRecord {
     /// The source record's own sequence number
     pub lsn: Lsn,
 
-    /// The payload as it is stored
-    pub payload: OwnedBuf,
+    /// The payload as it is stored, in the buffer the caller read it into
+    pub payload: Part,
 
     /// The codec byte that produced the payload
     pub codec: u8,
@@ -501,15 +501,15 @@ impl Appender {
         let mut headers = Vec::with_capacity(copies.len());
         let mut payloads = Vec::with_capacity(copies.len());
         for copy in copies {
-            let (header, payload) = build_record(
-                copy.key,
+            headers.push(RecordHeader::new_coded(
+                copy.payload.len() as u32,
                 copy.lsn,
-                Intent::Data(copy.payload, copy.codec),
-                BatchMark::Alone,
-                Origin::Relocated(copy.lsn),
-            );
-            headers.push(header);
-            payloads.push(payload);
+                Origin::Relocated(copy.lsn).applied(Flags::DATA),
+                copy.key,
+                copy.codec,
+                copy.payload.as_slice(),
+            ));
+            payloads.push(copy.payload);
         }
         self.place_run(headers, payloads, false, None)
     }
@@ -1022,10 +1022,10 @@ impl Appender {
     /// Reserve one range for a run of built records, write it, and say where each landed
     ///
     /// A framed run is a batch a crash has to drop whole. A run of copies has no frame.
-    fn place_run(
+    fn place_run<Payload: Into<WriteBuf>>(
         &self,
         headers: Vec<RecordHeader>,
-        mut payloads: Vec<OwnedBuf>,
+        mut payloads: Vec<Payload>,
         is_framed: bool,
         mut drawn: Option<DrawnRecords<'_>>,
     ) -> Result<Vec<Committed>> {
@@ -1121,13 +1121,13 @@ impl Appender {
     ///
     /// The frame goes down in the same write as the records it declares, ahead of them,
     /// so nothing can leave a frame standing over a run that was never written.
-    fn write_run(
+    fn write_run<Payload: Into<WriteBuf>>(
         &self,
         active: &Active,
         base: u64,
         frame: Option<BatchFrame>,
         headers: &[RecordHeader],
-        payloads: Vec<OwnedBuf>,
+        payloads: Vec<Payload>,
         framed: u64,
     ) -> Result<Vec<Loc>> {
         // Three buffers a record rather than two, since a spilled key rides in one of its
@@ -1147,7 +1147,7 @@ impl Appender {
             }
             WriteBuf::push_prefix(&mut bufs, header.pack());
             if header.has_payload() {
-                bufs.push(WriteBuf::owned(payload));
+                bufs.push(payload.into());
             }
             locs.push(Loc::new(active.handle.id(), at as u32, header.length));
             at += header.span();

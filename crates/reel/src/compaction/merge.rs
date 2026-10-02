@@ -29,8 +29,8 @@ use crate::reel::{Reel, ReelShared};
 use crate::sync::rendezvous;
 
 use crate::compaction::compactor::{
-    footer_bound, is_missing, read_payload, segment_len, source_handle, Compactor, PassClaim,
-    RecordScan, SourceRecord,
+    footer_bound, held_payload, is_missing, read_payload, segment_len, source_handle, Compactor,
+    PassClaim, RecordScan, SourceRecord,
 };
 use crate::compaction::pressure::PassPace;
 
@@ -628,10 +628,10 @@ fn copy_record(
         sources[winner.at].is_rotted = true;
         return Ok(());
     };
-    let payload = read_payload(&mut readers[winner.at], &record)?;
+    let payload = held_payload(&mut readers[winner.at], &record)?;
     let segment = sources[winner.at].segment;
 
-    if !record.header.verify(&payload) {
+    if !record.header.verify(payload.as_slice()) {
         // With peers the eviction turns the miss into a repair enqueue and the source
         // may still retire. A sole copy keeps its bytes where they are: rewriting them
         // would stamp a fresh checksum over rot and serve it as good.

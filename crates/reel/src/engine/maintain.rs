@@ -636,7 +636,10 @@ impl ReelStore {
                 Ok(CompactPass::Copied)
             }
             None if did_work => Ok(CompactPass::Copied),
-            None => Ok(CompactPass::Idle),
+            None => {
+                self.compactor.release_spare();
+                Ok(CompactPass::Idle)
+            }
         }
     }
 

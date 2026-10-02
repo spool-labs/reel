@@ -5,8 +5,10 @@
 //! bound, each value whole and a version somebody wrote for that key. Once writers stop,
 //! a walk up, a walk down and a point read of every key must agree.
 //!
-//! Knobs: REEL_MW_SEEDS (how many seeds, default 6), REEL_MW_OPS (ops per writer, default
-//! 2500), REEL_MW_SEED (one seed to replay).
+//! Knobs: REEL_MW_SEEDS (how many seeds, default 6), REEL_MW_FIRST (the first seed, default 1,
+//! so parallel processes split a campaign), REEL_MW_OPS (ops per writer, default 2500),
+//! REEL_MW_SEED (one seed to replay), REEL_MW_UNMAPPED (reads through the driver) and
+//! REEL_MW_URING (the buffered ring backend, Linux only).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,6 +79,10 @@ fn config(rng: &mut SmallRng) -> ReelConfig {
         active_tails: ThreadBudget::threads(rng.gen_range(1..=4)),
         compact_dead_ratio: 0.1,
         scrub_mbps: 0,
+        io_backend: match std::env::var("REEL_MW_URING").is_ok() {
+            true => reel::IoBackend::Uring,
+            false => reel::IoBackend::Posix,
+        },
         map_above: match std::env::var("REEL_MW_UNMAPPED").is_ok() {
             true => None,
             false => MAP_EVERYTHING,
@@ -234,7 +240,8 @@ fn mapped_walks_hold_under_writes_and_compaction() {
         run(seed);
         return;
     }
-    for seed in 1..=knob("REEL_MW_SEEDS", 6) {
+    let first = knob("REEL_MW_FIRST", 1);
+    for seed in first..first + knob("REEL_MW_SEEDS", 6) {
         run(seed);
     }
 }

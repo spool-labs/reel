@@ -2025,19 +2025,22 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             let state = read(&self.shards[at]);
             let covers = self.has_covers.load(Ordering::Relaxed);
             for (keys, entries) in state.map.span_runs(low) {
+                // A run with nothing dead in it goes over in one copy of keys and one of entries,
+                // cut at the room the page has left.
                 let take = keys.len().min(limit - out.len());
-                let (keys, entries) = (&keys[..take], &entries[..take]);
-                // A run with nothing dead in it goes over in one copy of keys and one of entries.
-                let clean = !covers && !entries.iter().any(Entry::is_grave);
+                let clean = !covers && !entries[..take].iter().any(Entry::is_grave);
                 let width = keys.first().map_or(0, |key| key.as_slice().len());
-                let packed = match clean {
-                    true => K::packed(keys).is_some_and(|bytes| out.push_packed(bytes, width, entries)),
-                    false => false,
-                };
+                let packed = clean
+                    && K::packed(&keys[..take])
+                        .is_some_and(|bytes| out.push_packed(bytes, width, &entries[..take]));
                 if !packed {
+                    // Dead entries are skipped, so the whole run is walked until the page fills.
                     for (key, entry) in keys.iter().zip(entries) {
                         if !entry.is_grave() && !self.is_covered(key.as_slice(), entry.lsn) {
                             out.push(key.as_slice(), *entry);
+                            if out.len() >= limit {
+                                return;
+                            }
                         }
                     }
                 }

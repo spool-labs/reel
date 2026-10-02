@@ -1298,7 +1298,7 @@ impl Reel {
         let start = window_start(loc, key_width, at);
 
         if self.shared.config.maps(len) {
-            if let Some(map) = handle.mapping() {
+            if let Some(map) = handle.mapping(self.shared.config.segment_bytes.to_bytes()) {
                 if let Some(bytes) = map.slice(start, len) {
                     let mut body = crate::reel::payload::take(len);
                     body.extend_from_slice(bytes);
@@ -1500,7 +1500,7 @@ impl Reel {
         if !self.shared.config.maps(len) {
             return None;
         }
-        let map = handle.mapping()?;
+        let map = handle.mapping(self.shared.config.segment_bytes.to_bytes())?;
         let head_bytes = map.slice(offset, prefix)?;
         let body_bytes = map.slice(offset + prefix as u64 + at, len)?;
 
@@ -1592,7 +1592,7 @@ impl Reel {
             let record = match self.shared.config.maps(len) {
                 true => match self.hold_segment(ask.loc.segment, &mut scratch.handles)? {
                     Some(handle) => handle
-                        .mapping()
+                        .mapping(self.shared.config.segment_bytes.to_bytes())
                         .and_then(|map| map.slice(offset, prefix + len)),
                     None => continue,
                 },
@@ -1708,7 +1708,7 @@ impl Reel {
         // A mapped volume serves a record the mapping covers straight out of the
         // page cache; anything it does not cover takes the driver below.
         if self.shared.config.maps(len) {
-            if let Some(map) = handle.mapping() {
+            if let Some(map) = handle.mapping(self.shared.config.segment_bytes.to_bytes()) {
                 let head_at = map.slice(offset, prefix);
                 let body_at = map.slice(offset + prefix as u64, len);
                 if let (Some(head_bytes), Some(body_bytes)) = (head_at, body_at) {

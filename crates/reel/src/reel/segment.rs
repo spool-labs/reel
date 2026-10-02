@@ -1199,12 +1199,13 @@ impl SegmentHandle {
     /// The segment's read-only mapping, taken on the first ask and kept for the
     /// life of the handle family
     ///
-    /// A file that cannot be mapped stays unmapped for that life rather than buying
-    /// a failed map per read.
-    pub fn mapping(&self) -> Option<&Mapping> {
+    /// The mapping reserves `span` bytes, the size a segment may grow to, so a tail
+    /// read early still serves what it writes after. A file that cannot be mapped
+    /// stays unmapped for that life rather than buying a failed map per read.
+    pub fn mapping(&self, span: u64) -> Option<&Mapping> {
         self.inner
             .mapping
-            .get_or_init(|| Mapping::open(&self.inner.path))
+            .get_or_init(|| Mapping::open(&self.inner.path, span))
             .as_ref()
     }
 

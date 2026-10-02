@@ -4033,6 +4033,30 @@ fn flip_on_disk(store: &ReelStore, dir: &TempDir, key: &RecordKey) {
     file.write_at(&byte, at).expect("write the payload byte");
 }
 
+// a tail mapped on an early read still serves the records written after it
+#[test]
+fn a_tail_read_early_keeps_serving_from_its_mapping() {
+    let (store, backend, _dir) = posix_store(ReelConfig {
+        map_above: crate::config::MAP_EVERYTHING,
+        ..config(1, SyncPolicy::Never)
+    });
+    let first = record(7, 1);
+    let payload = stripes(8 * 1024);
+    store.put(&first, &payload).expect("put");
+    store.get(&first).expect("map the tail").expect("found");
+
+    // Past the reservation the tail had when it was mapped.
+    let last = record(7, 60);
+    for byte in 2..=60 {
+        store.put(&record(7, byte), &payload).expect("put");
+    }
+
+    let ops = backend.ops();
+    let found = store.get(&last).expect("get").expect("found");
+    assert_eq!(&*found, &payload[..]);
+    assert_eq!(backend.ops() - ops, 0, "a record the tail grew into went to the driver");
+}
+
 // a warm awaited read is answered from the page cache with the engine untouched
 #[test]
 fn a_warm_awaited_read_skips_the_engine() {

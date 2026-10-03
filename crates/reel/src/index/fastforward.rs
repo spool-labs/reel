@@ -49,6 +49,9 @@ const BUCKET_BYTES: u64 = 64;
 /// Pairs waiting for the cleaner before new ones are left to compaction
 const MAX_PENDING: usize = 1 << 20;
 
+/// Threads the cleaner reads headers on
+const CLEANER_THREADS: usize = 8;
+
 /// Payload bytes one small length class covers
 const SMALL_STEP: u32 = 64;
 
@@ -565,37 +568,49 @@ impl FastColumn {
         let (Some(records), Some(segments)) = (self.records.get(), self.segments.get()) else {
             return 0;
         };
-        let mut settled = 0;
-        while settled < budget {
-            let Some(pending) = lock(&self.pending).pop_front() else {
-                break;
-            };
-            self.beside.fetch_sub(1, Ordering::Relaxed);
-            settled += 1;
-            let older = match records.head(segment_of(pending.older), offset_of(pending.older)) {
-                Ok(Some(older)) => older,
-                // The segment is gone or holds no record there, so the entry points at nothing.
-                Ok(None) => {
-                    write(&self.shards[pending.shard]).take(pending.hash, pending.older);
-                    continue;
-                }
-                Err(error) => {
-                    tracing::warn!("the FastForward cleaner could not read a record header: {error}");
-                    continue;
-                }
-            };
-            if older.key != pending.head.key {
-                continue;
+        let batch: Vec<Pending> = {
+            let mut pending = lock(&self.pending);
+            let count = budget.min(pending.len());
+            pending.drain(..count).collect()
+        };
+        self.beside.fetch_sub(batch.len() as u64, Ordering::Relaxed);
+        // Each read waits on the device, so the batch is spread across threads.
+        let share = batch.len().div_ceil(CLEANER_THREADS).max(1);
+        std::thread::scope(|scope| {
+            for part in batch.chunks(share) {
+                scope.spawn(move || {
+                    for pending in part {
+                        self.settle_pending(records.as_ref(), segments.as_ref(), pending);
+                    }
+                });
             }
-            let (stale, head) = match older.lsn < pending.head.lsn {
-                true => (pending.older, older),
-                false => (pending.newer, pending.head),
-            };
-            if write(&self.shards[pending.shard]).take(pending.hash, stale) {
-                self.book_gone(stale, &head, segments.as_ref());
+        });
+        batch.len()
+    }
+
+    fn settle_pending(&self, records: &dyn RecordSource, segments: &SegmentTable, pending: &Pending) {
+        let older = match records.head(segment_of(pending.older), offset_of(pending.older)) {
+            Ok(Some(older)) => older,
+            // The segment is gone or holds no record there, so the entry points at nothing.
+            Ok(None) => {
+                write(&self.shards[pending.shard]).take(pending.hash, pending.older);
+                return;
             }
+            Err(error) => {
+                tracing::warn!("the FastForward cleaner could not read a record header: {error}");
+                return;
+            }
+        };
+        if older.key != pending.head.key {
+            return;
         }
-        settled
+        let (stale, head) = match older.lsn < pending.head.lsn {
+            true => (pending.older, older),
+            false => (pending.newer, pending.head),
+        };
+        if write(&self.shards[pending.shard]).take(pending.hash, stale) {
+            self.book_gone(stale, &head, segments);
+        }
     }
 
     /// A key's newest payload in one read of each candidate a ceiling cannot rule out

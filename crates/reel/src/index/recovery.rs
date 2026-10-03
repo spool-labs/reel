@@ -822,9 +822,7 @@ impl<'a> Cursor<'a> {
 
     fn feed(&self, resolver: &mut Resolver<'_>) -> Result<()> {
         let column = self.partition.column;
-        self.put_with(|key, loc, lsn, is_delete| {
-            resolver.put(column, key, loc, lsn, is_delete)
-        })
+        self.put_with(|key, loc, lsn, is_delete| resolver.put(column, key, loc, lsn, is_delete))
     }
 }
 
@@ -1535,7 +1533,8 @@ impl<'a> Resolver<'a> {
             self.flush();
             self.queue.column = column;
         }
-        self.queue.push(self.index, self.index.segments(), key, loc, lsn, is_delete);
+        self.queue
+            .push(self.index, self.index.segments(), key, loc, lsn, is_delete);
     }
 
     /// Stand one range as a cover, after everything queued ahead of it
@@ -1904,11 +1903,18 @@ mod tests {
             let roots = [PathBuf::from(REEL_DIR)];
             let rebuilt = rebuild_reel(&driver, &roots, &[false], false, &index).expect("rebuild");
 
-            let rows = index.column(RECORDS).map(|column| column.held()).unwrap_or_default();
+            let rows = index
+                .column(RECORDS)
+                .map(|column| column.held())
+                .unwrap_or_default();
             assert_eq!(rows.len(), newest.len());
             for (key, entry) in &rows {
                 let at = u32::from_be_bytes(key.as_slice()[4..8].try_into().expect("number"));
-                assert_eq!(Some(&entry.lsn), newest.get(&at), "key {at} kept its newest");
+                assert_eq!(
+                    Some(&entry.lsn),
+                    newest.get(&at),
+                    "key {at} kept its newest"
+                );
             }
             let (mut live, mut dead) = (0, 0);
             for number in 1..=rebuilt.highest_segment.as_u32() {

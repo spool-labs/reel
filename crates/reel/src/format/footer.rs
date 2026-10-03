@@ -732,6 +732,32 @@ impl SegmentFooter {
         }
     }
 
+    /// An empty footer with room for as many rows as this one holds, column by column
+    ///
+    /// A tail's next segment takes about the rows its last one did, and rows that fit the
+    /// room never move. Growing into them a doubling at a time copied the rows again
+    /// into fresh pages at every step.
+    pub fn empty_like(&self) -> SegmentFooter {
+        let mut footer = SegmentFooter::empty();
+        for held in &self.partitions {
+            let mut partition = FooterPartition::new(held.column, held.key_width);
+            partition.packed = Vec::with_capacity(held.packed.len());
+            partition.starts = Vec::with_capacity(held.starts.len());
+            footer.partitions.push(partition);
+        }
+        footer
+    }
+
+    /// Make room for this many more rows in every strided partition
+    pub fn reserve_rows(&mut self, rows: usize) {
+        for partition in &mut self.partitions {
+            if !partition.is_varying() {
+                let room = rows * partition.stride();
+                partition.packed.reserve(room);
+            }
+        }
+    }
+
     /// Add one row, opening the partition for its column if this is the first
     ///
     /// A partition opens at the width of the first key its column offers and strides by
@@ -883,6 +909,8 @@ impl SegmentFooter {
     /// A seal lands the pieces in one vectored write, so no page of the rows is copied,
     /// and gives the rows back with `put_rows`.
     pub fn pack_apart(&mut self, filter_bits: u8, is_fenced: bool) -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
+        // A partition opened with room and never written to says nothing on disk.
+        self.partitions.retain(|partition| !partition.is_empty());
         self.partitions.sort_by_key(|partition| partition.column);
         for partition in self.partitions.iter_mut() {
             partition.sort();

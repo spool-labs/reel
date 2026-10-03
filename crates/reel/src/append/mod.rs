@@ -1402,6 +1402,11 @@ impl Appender {
             None => self.prepare_segment()?,
         };
         let retiring = std::mem::replace(active, fresh);
+        let mut entries = lock(&active.entries);
+        if entries.is_empty() {
+            *entries = lock(&retiring.entries).empty_like();
+        }
+        drop(entries);
         self.adopt_locked(active);
         Ok(retiring)
     }

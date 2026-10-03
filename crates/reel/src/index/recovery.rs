@@ -870,7 +870,14 @@ fn walk_tail(reader: &mut SegmentReader<'_>, segment: SegmentId, to: u64) -> Res
             ends.push((record.key.column, record.range_end));
         }
         let (offset, len) = (record.loc.offset, record.loc.len);
+        // The first record says what the rest of the tail likely holds, so the rows get
+        // their room in one go.
+        let span = HEADER_LEN as u64 + record.key.width() as u64 + u64::from(len);
+        let is_first = footer.is_empty();
         footer.push(&FooterEntry::new(record.key, record.lsn, offset, len, record.flags));
+        if is_first {
+            footer.reserve_rows((to.saturating_sub(u64::from(offset)) / span) as usize);
+        }
     })?;
     // The footer holds a column's rows together, and a stable sort keeps each column's
     // ends in file order.

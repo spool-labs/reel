@@ -981,16 +981,7 @@ impl Compactor {
         while let Some(record) = RecordScan::resuming(reader, at).next_record()? {
             at = u64::from(record.offset) + record.header.span();
             self.apply_one(
-                reel,
-                dest_index,
-                index,
-                reader,
-                record,
-                None,
-                segment,
-                drop_floor,
-                &mut run,
-                tally,
+                reel, dest_index, index, reader, record, None, segment, drop_floor, &mut run, tally,
             )?;
             pace.reached(reader.read_bytes() + tally.copied_bytes);
         }
@@ -1415,7 +1406,10 @@ impl Compactor {
             Some(carried) => carried,
             None => {
                 let footer = shared.footer_of(handle.id())?;
-                (0, footer_bound(shared, &handle, file_len, footer.as_deref())?)
+                (
+                    0,
+                    footer_bound(shared, &handle, file_len, footer.as_deref())?,
+                )
             }
         };
         let mut reader = SegmentReader::new(&shared.driver, handle.file(), region_end);
@@ -2449,8 +2443,7 @@ mod tests {
         let source = source_handle(shared, SegmentId(1)).expect("handle");
         let file_len = segment_len(shared, &source).expect("len").expect("present");
         let footer = shared.footer_of(SegmentId(1)).expect("footer");
-        let region_end =
-            footer_bound(shared, &source, file_len, footer.as_deref()).expect("bound");
+        let region_end = footer_bound(shared, &source, file_len, footer.as_deref()).expect("bound");
         let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
         let mut scan = RecordScan::resuming(&mut reader, 0);
         let record = loop {

@@ -165,7 +165,13 @@ mod tests {
         file.write_all(&[9u8; 512]).expect("write");
         assert_eq!(map.slice(4096, 512).expect("grown"), &[9u8; 512]);
         assert_eq!(map.len(), 4608);
-        assert!(map.slice(4608, 1).is_none(), "past the file is still the driver's");
-        assert!(map.slice((1 << 20) - 1, 2).is_none(), "past the span is the driver's");
+        assert!(
+            map.slice(4608, 1).is_none(),
+            "past the file is still the driver's"
+        );
+        assert!(
+            map.slice((1 << 20) - 1, 2).is_none(),
+            "past the span is the driver's"
+        );
     }
 }

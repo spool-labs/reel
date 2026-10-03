@@ -38,7 +38,10 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
 const KEYS: u64 = 1500;
 
 fn knob(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// A value that names its key and version and fills the rest from both, so a torn or
@@ -59,10 +62,17 @@ fn value_of(key: u64, version: u64, len: usize) -> Vec<u8> {
 
 /// The key and version a value claims, once its filler checks out
 fn check_value(seed: u64, key: u64, value: &[u8]) -> u64 {
-    assert!(value.len() >= 16, "seed {seed}: key {key} value of {} bytes", value.len());
+    assert!(
+        value.len() >= 16,
+        "seed {seed}: key {key} value of {} bytes",
+        value.len()
+    );
     let named = u64::from_be_bytes(value[..8].try_into().unwrap());
     let version = u64::from_be_bytes(value[8..16].try_into().unwrap());
-    assert_eq!(named, key, "seed {seed}: key {key} served the value of key {named}");
+    assert_eq!(
+        named, key,
+        "seed {seed}: key {key} served the value of key {named}"
+    );
     assert_eq!(
         value,
         value_of(key, version, value.len() - 16).as_slice(),
@@ -102,7 +112,13 @@ fn writer(store: &ReelStore, attempted: &Attempted, seed: u64, id: u64, ops: u64
             0..=69 => {
                 let len = rng.gen_range(0..600);
                 attempted[key as usize].lock().unwrap().insert(version);
-                Store::put(store, "rows", &key.to_be_bytes(), &value_of(key, version, len)).expect("put");
+                Store::put(
+                    store,
+                    "rows",
+                    &key.to_be_bytes(),
+                    &value_of(key, version, len),
+                )
+                .expect("put");
             }
             70..=84 => {
                 Store::delete(store, "rows", &key.to_be_bytes()).expect("delete");
@@ -113,7 +129,8 @@ fn writer(store: &ReelStore, attempted: &Attempted, seed: u64, id: u64, ops: u64
                 for k in key..(key + width).min(KEYS) {
                     let len = rng.gen_range(0..300);
                     attempted[k as usize].lock().unwrap().insert(version);
-                    Store::put(store, "rows", &k.to_be_bytes(), &value_of(k, version, len)).expect("put run");
+                    Store::put(store, "rows", &k.to_be_bytes(), &value_of(k, version, len))
+                        .expect("put run");
                 }
             }
         }
@@ -133,27 +150,44 @@ fn walker(store: &ReelStore, attempted: &Attempted, seed: u64, id: u64, done: &A
         let hint = rng.gen_range(1..=400usize);
         let mut last: Option<u64> = None;
         let mut taken = 0usize;
-        Store::walk_from(store, "rows", &start.to_be_bytes(), way, hint, &mut |k, v| {
-            let key = u64::from_be_bytes(k.try_into().expect("8 byte key"));
-            match way {
-                Direction::Asc => assert!(key >= start, "seed {seed}: asc walk from {start} gave {key}"),
-                Direction::Desc => assert!(key <= start, "seed {seed}: desc walk from {start} gave {key}"),
-            }
-            if let Some(prev) = last {
+        Store::walk_from(
+            store,
+            "rows",
+            &start.to_be_bytes(),
+            way,
+            hint,
+            &mut |k, v| {
+                let key = u64::from_be_bytes(k.try_into().expect("8 byte key"));
                 match way {
-                    Direction::Asc => assert!(key > prev, "seed {seed}: asc walk went {prev} then {key}"),
-                    Direction::Desc => assert!(key < prev, "seed {seed}: desc walk went {prev} then {key}"),
+                    Direction::Asc => assert!(
+                        key >= start,
+                        "seed {seed}: asc walk from {start} gave {key}"
+                    ),
+                    Direction::Desc => assert!(
+                        key <= start,
+                        "seed {seed}: desc walk from {start} gave {key}"
+                    ),
                 }
-            }
-            last = Some(key);
-            let version = check_value(seed, key, v);
-            assert!(
-                attempted[key as usize].lock().unwrap().contains(&version),
-                "seed {seed}: key {key} served version {version} nobody wrote"
-            );
-            taken += 1;
-            taken < want
-        })
+                if let Some(prev) = last {
+                    match way {
+                        Direction::Asc => {
+                            assert!(key > prev, "seed {seed}: asc walk went {prev} then {key}")
+                        }
+                        Direction::Desc => {
+                            assert!(key < prev, "seed {seed}: desc walk went {prev} then {key}")
+                        }
+                    }
+                }
+                last = Some(key);
+                let version = check_value(seed, key, v);
+                assert!(
+                    attempted[key as usize].lock().unwrap().contains(&version),
+                    "seed {seed}: key {key} served version {version} nobody wrote"
+                );
+                taken += 1;
+                taken < want
+            },
+        )
         .expect("walk");
         walked += taken as u64;
     }
@@ -163,7 +197,9 @@ fn walker(store: &ReelStore, attempted: &Attempted, seed: u64, id: u64, done: &A
 fn run(seed: u64) {
     let mut rng = SmallRng::seed_from_u64(seed);
     let dir = TempDir::new().expect("tempdir");
-    let store = Arc::new(ReelStore::open(dir.path().to_path_buf(), config(&mut rng), COLUMNS).expect("open"));
+    let store = Arc::new(
+        ReelStore::open(dir.path().to_path_buf(), config(&mut rng), COLUMNS).expect("open"),
+    );
     let attempted: Attempted = Arc::new((0..KEYS).map(|_| Mutex::new(BTreeSet::new())).collect());
     let ops = knob("REEL_MW_OPS", 2500);
     let writers = rng.gen_range(1..=3u64);
@@ -198,24 +234,41 @@ fn run(seed: u64) {
         }
         done.store(true, Ordering::Relaxed);
         maintainer.join().expect("maintainer");
-        walking.into_iter().map(|w| w.join().expect("walker")).sum::<u64>()
+        walking
+            .into_iter()
+            .map(|w| w.join().expect("walker"))
+            .sum::<u64>()
     });
     assert!(walked > 0, "seed {seed}: walkers took nothing");
 
     // Quiet now: a full walk up, a full walk down and a point read of every key agree.
     let mut up = BTreeMap::new();
-    Store::walk_from(&*store, "rows", &0u64.to_be_bytes(), Direction::Asc, 128, &mut |k, v| {
-        let key = u64::from_be_bytes(k.try_into().unwrap());
-        up.insert(key, check_value(seed, key, v));
-        true
-    })
+    Store::walk_from(
+        &*store,
+        "rows",
+        &0u64.to_be_bytes(),
+        Direction::Asc,
+        128,
+        &mut |k, v| {
+            let key = u64::from_be_bytes(k.try_into().unwrap());
+            up.insert(key, check_value(seed, key, v));
+            true
+        },
+    )
     .expect("walk up");
     let mut down = BTreeMap::new();
-    Store::walk_from(&*store, "rows", &(KEYS - 1).to_be_bytes(), Direction::Desc, 128, &mut |k, v| {
-        let key = u64::from_be_bytes(k.try_into().unwrap());
-        down.insert(key, check_value(seed, key, v));
-        true
-    })
+    Store::walk_from(
+        &*store,
+        "rows",
+        &(KEYS - 1).to_be_bytes(),
+        Direction::Desc,
+        128,
+        &mut |k, v| {
+            let key = u64::from_be_bytes(k.try_into().unwrap());
+            down.insert(key, check_value(seed, key, v));
+            true
+        },
+    )
     .expect("walk down");
     if up != down {
         let keys: BTreeSet<u64> = up.keys().chain(down.keys()).copied().collect();
@@ -230,13 +283,20 @@ fn run(seed: u64) {
     for key in 0..KEYS {
         let got = Store::get(&*store, "rows", &key.to_be_bytes()).expect("get");
         let point = got.map(|v| check_value(seed, key, &v));
-        assert_eq!(point, up.get(&key).copied(), "seed {seed}: key {key} walk and point read disagree");
+        assert_eq!(
+            point,
+            up.get(&key).copied(),
+            "seed {seed}: key {key} walk and point read disagree"
+        );
     }
 }
 
 #[test]
 fn mapped_walks_hold_under_writes_and_compaction() {
-    if let Some(seed) = std::env::var("REEL_MW_SEED").ok().and_then(|v| v.parse().ok()) {
+    if let Some(seed) = std::env::var("REEL_MW_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         run(seed);
         return;
     }

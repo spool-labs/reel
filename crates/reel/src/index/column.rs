@@ -2383,7 +2383,10 @@ pub trait ShardMap<K: IndexKey, V: 'static>: Default {
     ) -> impl Iterator<Item = (&'a K, &'a V)>;
 
     /// Pairs from a low bound on, in runs. One pair per run unless the map keeps leaves.
-    fn span_runs<'a>(&'a self, low: Bound<&'a K>) -> Box<dyn Iterator<Item = (&'a [K], &'a [V])> + 'a> {
+    fn span_runs<'a>(
+        &'a self,
+        low: Bound<&'a K>,
+    ) -> Box<dyn Iterator<Item = (&'a [K], &'a [V])> + 'a> {
         Box::new(
             self.span(low, Bound::Unbounded)
                 .map(|(key, val)| (std::slice::from_ref(key), std::slice::from_ref(val))),

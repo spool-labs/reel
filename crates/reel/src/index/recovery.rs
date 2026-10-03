@@ -471,7 +471,11 @@ fn read_parts(
         }
         None => {
             let mut reader = SegmentReader::new(driver, file, file_len);
-            Ok(SegmentParts::Walked(walk_tail(&mut reader, segment, file_len)?))
+            Ok(SegmentParts::Walked(walk_tail(
+                &mut reader,
+                segment,
+                file_len,
+            )?))
         }
     }
 }
@@ -495,15 +499,27 @@ fn absorb_segment(
                 true => sweep_footer(segment, &footer, &mut ends.into_iter(), resolver)?,
                 false => {
                     stand_ranges(segment, &footer, ends, resolver)?;
-                    held.push(Held { segment, footer, is_sorted: true });
+                    held.push(Held {
+                        segment,
+                        footer,
+                        is_sorted: true,
+                    });
                 }
             }
             Ok(Loaded::Sealed)
         }
         SegmentParts::Walked(tail) => {
             stand_ranges(segment, &tail.footer, tail.ends, resolver)?;
-            held.push(Held { segment, footer: tail.footer, is_sorted: false });
-            Ok(Loaded::Walked(tail.next_offset, tail.is_at_fill, SegmentFooter::empty()))
+            held.push(Held {
+                segment,
+                footer: tail.footer,
+                is_sorted: false,
+            });
+            Ok(Loaded::Walked(
+                tail.next_offset,
+                tail.is_at_fill,
+                SegmentFooter::empty(),
+            ))
         }
     }
 }
@@ -525,7 +541,8 @@ fn stand_ranges(
             if !found.flags.is_range_tombstone() {
                 continue;
             }
-            let start = RecordKey::from_bytes(partition.column, partition.key_at(row).unwrap_or_default())?;
+            let start =
+                RecordKey::from_bytes(partition.column, partition.key_at(row).unwrap_or_default())?;
             let loc = Loc::new(segment, found.offset, found.len);
             resolver.range(&start, ends.next().flatten(), found.lsn, loc);
         }
@@ -554,7 +571,12 @@ fn feed_held(
 ) -> Result<()> {
     let mut columns: Vec<ColumnId> = held
         .iter()
-        .flat_map(|rows| rows.footer.partitions.iter().map(|partition| partition.column))
+        .flat_map(|rows| {
+            rows.footer
+                .partitions
+                .iter()
+                .map(|partition| partition.column)
+        })
         .collect();
     columns.sort_unstable();
     columns.dedup();
@@ -567,7 +589,10 @@ fn feed_held(
         merge_cursors(&mut cursors, |cursor| cursor.feed(resolver))?;
     }
     for rows in held.drain(..) {
-        if let Some(tail) = resumable.iter_mut().find(|tail| tail.segment == rows.segment) {
+        if let Some(tail) = resumable
+            .iter_mut()
+            .find(|tail| tail.segment == rows.segment)
+        {
             tail.entries = rows.footer;
         }
     }
@@ -629,7 +654,13 @@ impl<'a> Cursor<'a> {
         if !found.flags.is_range_tombstone() {
             let key = self.key().unwrap_or_default();
             let loc = Loc::new(self.segment, found.offset, found.len);
-            resolver.put(self.partition.column, key, loc, found.lsn, found.flags.is_tombstone());
+            resolver.put(
+                self.partition.column,
+                key,
+                loc,
+                found.lsn,
+                found.flags.is_tombstone(),
+            );
         }
         Ok(())
     }
@@ -1042,7 +1073,13 @@ fn walk_tail(reader: &mut SegmentReader<'_>, segment: SegmentId, to: u64) -> Res
         // their room in one go.
         let span = HEADER_LEN as u64 + record.key.width() as u64 + u64::from(len);
         let is_first = footer.is_empty();
-        footer.push(&FooterEntry::new(record.key, record.lsn, offset, len, record.flags));
+        footer.push(&FooterEntry::new(
+            record.key,
+            record.lsn,
+            offset,
+            len,
+            record.flags,
+        ));
         if is_first {
             footer.reserve_rows((to.saturating_sub(u64::from(offset)) / span) as usize);
         }

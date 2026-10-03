@@ -908,7 +908,11 @@ impl SegmentFooter {
     ///
     /// A seal lands the pieces in one vectored write, so no page of the rows is copied,
     /// and gives the rows back with `put_rows`.
-    pub fn pack_apart(&mut self, filter_bits: u8, is_fenced: bool) -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
+    pub fn pack_apart(
+        &mut self,
+        filter_bits: u8,
+        is_fenced: bool,
+    ) -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
         // A partition opened with room and never written to says nothing on disk.
         self.partitions.retain(|partition| !partition.is_empty());
         self.partitions.sort_by_key(|partition| partition.column);

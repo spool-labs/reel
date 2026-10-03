@@ -4054,7 +4054,11 @@ fn a_tail_read_early_keeps_serving_from_its_mapping() {
     let ops = backend.ops();
     let found = store.get(&last).expect("get").expect("found");
     assert_eq!(&*found, &payload[..]);
-    assert_eq!(backend.ops() - ops, 0, "a record the tail grew into went to the driver");
+    assert_eq!(
+        backend.ops() - ops,
+        0,
+        "a record the tail grew into went to the driver"
+    );
 }
 
 // a warm awaited read is answered from the page cache with the engine untouched

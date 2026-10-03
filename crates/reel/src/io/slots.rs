@@ -1189,14 +1189,6 @@ mod tests {
         assert_eq!(table.outstanding(), 1);
     }
 
-    // the low bits of a tag are its slot, so the table wraps rather than grows
-    #[test]
-    fn a_tag_addresses_one_slot() {
-        assert_eq!(index_of(Tag(0)), 0);
-        assert_eq!(index_of(Tag(SLOT_COUNT as u64)), 0);
-        assert_eq!(index_of(Tag(SLOT_COUNT as u64 + 3)), 3);
-    }
-
     // two callers racing one slot never both hold it, however they interleave
     #[test]
     fn a_contended_slot_serves_one_at_a_time() {

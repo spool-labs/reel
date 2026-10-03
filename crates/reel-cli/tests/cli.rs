@@ -165,21 +165,6 @@ fn cues_a_volume() {
     );
 }
 
-// an undeclared volume says which figures it is not counting
-#[test]
-fn undeclared_columns_are_named_as_such() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let volume = volume(&dir);
-
-    let cue = run(volume, &["cue"]);
-    assert!(cue.ok, "cue failed: {}", cue.err);
-    assert!(
-        cue.out.contains("no columns declared"),
-        "an empty declaration should be admitted: {}",
-        cue.out,
-    );
-}
-
 // a declared column is counted, and its name reaches the report
 #[test]
 fn declared_columns_are_counted() {

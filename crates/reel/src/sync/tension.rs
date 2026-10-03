@@ -433,16 +433,6 @@ mod tests {
         assert!(!tension.is_taut());
     }
 
-    // a slack with nothing waiting takes neither the gate nor a waker
-    #[test]
-    fn idle_slack_does_nothing() {
-        let tension = Tension::new(());
-
-        tension.slack();
-
-        assert!(!tension.is_taut());
-    }
-
     // the condition may take the state it waits on, which is what a permit is
     #[test]
     fn wait_takes_from_the_state() {

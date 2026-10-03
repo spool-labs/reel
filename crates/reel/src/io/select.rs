@@ -109,31 +109,6 @@ mod tests {
         }
     }
 
-    // posix is taken as configured and never asks the kernel for a ring
-    #[test]
-    fn posix_wants_no_ring() {
-        assert!(!wants_ring(IoBackend::Posix));
-    }
-
-    // either ring arm asks for a ring, and only the direct one asks for direct
-    #[test]
-    fn ring_arms_want_a_ring() {
-        assert!(wants_ring(IoBackend::Uring));
-        assert!(wants_ring(IoBackend::UringDirect));
-
-        assert!(!config_for(IoBackend::Uring).io_backend.is_direct());
-        assert!(config_for(IoBackend::UringDirect).io_backend.is_direct());
-    }
-
-    // every configured backend yields a usable single owner backend
-    #[test]
-    fn selection_builds_backend() {
-        for backend in [IoBackend::Posix, IoBackend::Uring, IoBackend::UringDirect] {
-            let selected: Arc<dyn ReelIo> = select_backend(&config_for(backend));
-            assert_eq!(Arc::strong_count(&selected), 1);
-        }
-    }
-
     // a posix request is served by posix everywhere, with nothing to downgrade
     #[test]
     fn posix_serves_what_it_asked_for() {

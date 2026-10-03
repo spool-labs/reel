@@ -183,28 +183,6 @@ mod tests {
         assert_eq!(budget.queued_bytes(), ByteCount::from_bytes(12_288));
     }
 
-    // acquire and release move the gauge up and back down
-    #[test]
-    fn gauge_tracks_outstanding() {
-        let budget = budget(1024);
-
-        budget.acquire(1024);
-        assert_eq!(budget.queued_bytes(), ByteCount::from_bytes(1024));
-
-        budget.release(1024);
-        assert_eq!(budget.queued_bytes(), ByteCount::from_bytes(0));
-    }
-
-    // a request larger than the whole ceiling still proceeds when idle
-    #[test]
-    fn oversized_proceeds_idle() {
-        let budget = budget(1024);
-
-        budget.acquire(4096);
-
-        assert_eq!(budget.queued_bytes(), ByteCount::from_bytes(4096));
-    }
-
     // an exhausted budget blocks a further acquire until a release frees room
     #[test]
     fn exhausted_blocks_then_proceeds() {

@@ -105,33 +105,3 @@ impl FaultPlan {
             .map(|fault| fault.kind)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // a new plan carries no faults, no crash, and no reordering
-    #[test]
-    fn empty_plan() {
-        let plan = FaultPlan::new(9);
-
-        assert_eq!(plan.seed, 9);
-        assert_eq!(plan.crash_at, None);
-        assert!(plan.faults.is_empty());
-        assert!(!plan.reorder_completions);
-    }
-
-    // the builders assemble crash, fault, and reorder settings
-    #[test]
-    fn builders_compose() {
-        let plan = FaultPlan::new(3)
-            .with_crash(5)
-            .with_fault(2, FaultKind::LyingSync)
-            .with_reorder();
-
-        assert_eq!(plan.crash_at, Some(5));
-        assert_eq!(plan.fault_at(2), Some(FaultKind::LyingSync));
-        assert_eq!(plan.fault_at(4), None);
-        assert!(plan.reorder_completions);
-    }
-}

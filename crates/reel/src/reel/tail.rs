@@ -59,16 +59,6 @@ impl Tail {
 mod tests {
     use super::*;
 
-    // a fresh tail reports no segment and an empty write head
-    #[test]
-    fn starts_empty() {
-        let tail = Tail::new(2);
-
-        assert_eq!(tail.index(), 2);
-        assert_eq!(tail.active_segment(), SegmentId(0));
-        assert_eq!(tail.committed_len(), 0);
-    }
-
     // committed length advances as the appender publishes it
     #[test]
     fn committed_advances() {

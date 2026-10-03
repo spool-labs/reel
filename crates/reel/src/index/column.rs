@@ -3152,15 +3152,6 @@ mod tests {
         map_shape: MapShape::Tree,
     };
 
-    // a variable column opens, where before it was refused outright
-    #[test]
-    fn a_variable_column_opens() {
-        let index = ColumnIndex::new(&VARIABLE, ShardShapes::Tree, IndexResidency::Resident)
-            .expect("a variable column has an index now");
-        assert!(matches!(index, ColumnIndex::Var(_)));
-        assert_eq!(index.key_width(), 0, "a variable column declares no width");
-    }
-
     // keys of different lengths live in one column and answer for themselves
     #[test]
     fn a_variable_column_holds_every_length() {

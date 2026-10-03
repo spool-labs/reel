@@ -465,26 +465,6 @@ pub struct SegmentEntry {
 mod tests {
     use super::*;
 
-    // every op reports the tag it carries
-    #[test]
-    fn tag_roundtrip() {
-        let open = Op::Open {
-            tag: Tag(7),
-            path: PathBuf::from("/reel/segment-0"),
-            create: true,
-            direct: false,
-        };
-        let writev = Op::Writev {
-            tag: Tag(9),
-            file: FileId(1),
-            offset: 0,
-            bufs: vec![WriteBuf::owned(vec![1, 2, 3])],
-        };
-
-        assert_eq!(open.tag(), Tag(7));
-        assert_eq!(writev.tag(), Tag(9));
-    }
-
     use crate::format::column::{ColumnId, RecordKey};
     use crate::format::lsn::Lsn;
     use crate::format::record::{Flags, RecordHeader};

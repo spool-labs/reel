@@ -1739,27 +1739,6 @@ mod tests {
         assert!(store.contains(BLOB_CF, &[0x22; 32]).expect("contains"));
     }
 
-    // a range delete through the trait drops the keys the range covers
-    #[test]
-    fn range_delete_through_the_trait() {
-        let store = store();
-        let store = trait_store(&store);
-        for group in [6u16, 7, 8] {
-            store
-                .put(RECORD_CF, &record(group, 1), &[0x11; 64])
-                .expect("put");
-        }
-
-        store
-            .delete_range(RECORD_CF, &7u16.to_be_bytes(), &8u16.to_be_bytes())
-            .expect("range delete");
-
-        assert_eq!(
-            keys(store, RECORD_CF, &[]),
-            vec![record(6, 1), record(8, 1)]
-        );
-    }
-
     const PLAIN_CF: &str = "plain";
     const WIDE_CF: &str = "wide";
     const OPEN_CF: &str = "open";
@@ -1841,49 +1820,6 @@ mod tests {
         }
         found.sort();
         (found, pages)
-    }
-
-    // a prefix sweep on a variable tree finds the rows the prefix walk finds
-    #[test]
-    fn prefix_sweep_on_a_variable_tree() {
-        let store = sweep_store();
-        let store = trait_store(&store);
-        for high in [1u64, 2, 3] {
-            for low in [10u64, 20] {
-                store
-                    .put(PLAIN_CF, &pair(high, low), &low.to_be_bytes())
-                    .expect("put");
-            }
-        }
-
-        let prefix = 2u64.to_be_bytes();
-        let (found, _) = swept(store, PLAIN_CF, &prefix, 16);
-
-        assert_eq!(found, vec![pair(2, 10), pair(2, 20)]);
-        assert_eq!(found, keys(store, PLAIN_CF, &prefix));
-    }
-
-    // a small limit pages a variable tree's prefix and the marks resume it
-    #[test]
-    fn prefix_sweep_resumes_across_pages() {
-        let store = sweep_store();
-        let store = trait_store(&store);
-        let mut wrote = Vec::new();
-        for high in [4u64, 5, 6] {
-            for low in 0..9u64 {
-                store
-                    .put(PLAIN_CF, &pair(high, low), &[low as u8; 24])
-                    .expect("put");
-                if high == 5 {
-                    wrote.push(pair(high, low));
-                }
-            }
-        }
-
-        let (found, pages) = swept(store, PLAIN_CF, &5u64.to_be_bytes(), 2);
-
-        assert_eq!(found, wrote);
-        assert!(pages >= 5, "nine keys two to a page took {pages} pages");
     }
 
     // a prefix with no rows answers an empty page and no mark

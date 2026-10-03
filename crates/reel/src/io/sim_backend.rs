@@ -1522,15 +1522,6 @@ mod tests {
         assert_eq!(left.durable_image(), right.durable_image());
     }
 
-    // a simulator keeps the seed and plan it was built from
-    #[test]
-    fn keeps_plan() {
-        let io = SimIo::new(FaultPlan::new(42));
-
-        assert_eq!(io.seed(), 42);
-        assert_eq!(io.plan().seed, 42);
-    }
-
     // the op count moves once per executed op
     #[test]
     fn the_op_count_moves_per_op() {

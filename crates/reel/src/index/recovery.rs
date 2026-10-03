@@ -874,29 +874,40 @@ fn sweep_footer(
             });
         }
 
-        for entry in partition.entries() {
-            let entry = entry?;
-            // Fed before the span is installed, so a search the span admits is never
-            // ruled out by a filter that has not heard of the segment.
-            resolver
-                .sealed_keys
-                .entry(partition.column)
-                .or_default()
-                .insert(entry.key.as_slice());
-            let loc = Loc::new(segment, entry.offset, entry.len);
-            if entry.is_range_tombstone() {
-                resolver.range(&entry.key, ends.next().flatten(), entry.lsn, loc);
+        // Fed before the span is installed, so a search the span admits is never ruled
+        // out by a filter that has not heard of the segment.
+        resolver
+            .sealed_keys
+            .entry(partition.column)
+            .or_default()
+            .insert_partition(partition);
+        // The table hears the partition once, with its oldest record and its
+        // tombstones' spans summed, since a call a row took its lock a row.
+        let mut oldest = Lsn(u64::MAX);
+        let (mut held, mut held_lsn) = (0u64, Lsn::NONE);
+        for at in 0..partition.len() {
+            let row = partition.row_at(at)?;
+            let key = partition.key_at(at).unwrap_or_default();
+            if row.flags.is_range_tombstone() {
+                let start = RecordKey::from_bytes(partition.column, key)?;
+                let loc = Loc::new(segment, row.offset, row.len);
+                resolver.range(&start, ends.next().flatten(), row.lsn, loc);
                 continue;
             }
-            resolver.see(entry.lsn);
-            match entry.is_tombstone() {
-                true => resolver.index.segments().mark_held(
-                    segment,
-                    entry.lsn,
-                    span_of(entry.key.width(), entry.len),
-                ),
-                false => resolver.index.segments().note_min(segment, entry.lsn),
+            resolver.see(row.lsn);
+            match row.flags.is_tombstone() {
+                true => {
+                    held += span_of(key.len() as u16, row.len);
+                    held_lsn = held_lsn.max(row.lsn);
+                }
+                false => oldest = oldest.min(row.lsn),
             }
+        }
+        if held > 0 {
+            resolver.index.segments().mark_held(segment, held_lsn, held);
+        }
+        if oldest != Lsn(u64::MAX) {
+            resolver.index.segments().note_min(segment, oldest);
         }
     }
     Ok(())

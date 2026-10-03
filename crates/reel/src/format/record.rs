@@ -583,16 +583,20 @@ pub fn data_codec(prefix: &[u8], key: KeyRef<'_>, lsn: Lsn, length: u32) -> Opti
     is_match.then_some(fixed[OFFSET_CODEC])
 }
 
-/// A record's key, version, length and kind, when its header claims a key this wide
-pub fn head_fields(prefix: &[u8], width: usize) -> Option<(&[u8], Lsn, u32, Flags)> {
+/// A record's version, length and kind, when the prefix it starts holds this key
+///
+/// Read in place, so checking a candidate builds no key.
+pub fn head_for(prefix: &[u8], key: KeyRef<'_>) -> Option<(Lsn, u32, Flags)> {
     let fixed = prefix.get(..HEADER_LEN)?;
-    if usize::from(read_u16_le(&fixed[OFFSET_KEY_WIDTH..OFFSET_CODEC])) != width {
+    let is_match = fixed[OFFSET_COLUMN] == key.column.as_u8()
+        && usize::from(read_u16_le(&fixed[OFFSET_KEY_WIDTH..OFFSET_CODEC])) == key.bytes.len()
+        && prefix.get(HEADER_LEN..HEADER_LEN + key.bytes.len()) == Some(key.bytes);
+    if !is_match {
         return None;
     }
-    let key = prefix.get(HEADER_LEN..HEADER_LEN + width)?;
     let flags = Flags::from_bits(fixed[OFFSET_FLAGS]).ok()?;
     let lsn = Lsn(read_u64_le(&fixed[OFFSET_LSN..OFFSET_FLAGS]));
-    Some((key, lsn, read_u32_le(&fixed[OFFSET_LENGTH..OFFSET_CRC]), flags))
+    Some((lsn, read_u32_le(&fixed[OFFSET_LENGTH..OFFSET_CRC]), flags))
 }
 
 /// The key width a record claims, read from the fixed part of its header

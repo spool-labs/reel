@@ -247,6 +247,53 @@ fn a_paged_column_reads_from_its_footer() {
     assert!(store.contains(&handed).expect("read"));
 }
 
+// FastForward answers a paged column's sealed keys through overwrites, deletes and compaction
+#[test]
+fn fastforward_answers_sealed_keys() {
+    let (store, _sim) = sim_store(ReelConfig {
+        index: IndexResidency::Paged,
+        compact_mbps: CompactRate::Mbps(64),
+        ..config(1, SyncPolicy::Never)
+    });
+    let value = |byte: u8, version: u8| vec![byte.wrapping_add(version); 8 * 1024];
+    let mut expected: Vec<Option<Vec<u8>>> = (0..200u8).map(|byte| Some(value(byte, 0))).collect();
+    for byte in 0..200u8 {
+        store.put(&record(7, byte), &value(byte, 0)).expect("put");
+    }
+    store.flush().expect("flush");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+    assert!(store.index.fast_held() > 0, "the handover filled FastForward");
+
+    let check = |expected: &[Option<Vec<u8>>], stage: &str| {
+        for (byte, value) in expected.iter().enumerate() {
+            let found = store.get(&record(7, byte as u8)).expect("read");
+            let found = found.map(|found| found.to_vec());
+            assert_eq!(&found, value, "key {byte} after {stage}");
+        }
+    };
+    check(&expected, "the handover");
+
+    for byte in (0..200u8).step_by(3) {
+        store.put(&record(7, byte), &value(byte, 1)).expect("overwrite");
+        expected[byte as usize] = Some(value(byte, 1));
+    }
+    for byte in (1..200u8).step_by(5) {
+        store.delete(&record(7, byte)).expect("delete");
+        expected[byte as usize] = None;
+    }
+    check(&expected, "overwrites and deletes");
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("hand over");
+    while store.index.scrub_fast(1024) > 0 {}
+    check(&expected, "the cleaner");
+
+    store.compact_once().expect("compact");
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("hand over");
+    while store.index.scrub_fast(1024) > 0 {}
+    check(&expected, "compaction");
+}
+
 // a sealed segment's ceiling covers its tombstone rows and not only its records
 #[test]
 fn a_ceiling_covers_a_tombstone() {
@@ -845,9 +892,11 @@ fn footer_pools_share_one_bound() {
 
     // Cleared first, since a resolve that finds a footer the handover parsed never
     // reaches for a block. The resolves fill two pools and the pass after them the third.
+    // They resolve as of a snapshot, since FastForward answers a live read without a footer.
     store.reel.shared().footers.clear();
     for key in &handed {
-        assert!(store.contains(key).expect("resolve"), "a key went missing");
+        let found = store.index.get_at(key, Lsn(u64::MAX)).expect("resolve");
+        assert!(found.is_some(), "a key went missing");
     }
     for (segment, _) in store.index.segments_snapshot() {
         let _ = store.reel.shared().footer_of(segment).expect("footer");
@@ -895,14 +944,11 @@ fn a_fresh_key_skips_the_sealed_search() {
         .find(|key| is_paged(&store, key));
     let sealed = sealed.expect("a key went to its footer");
 
-    // A key never written: ruled out by the filter, no candidate asked.
-    let before = store.index.sealed_skips();
+    // A key never written: FastForward holds nothing for it, so no footer is asked.
+    let before = store.filter_probes();
     assert!(store.get(&record(9, 250)).expect("get").is_none());
-    assert!(
-        store.index.sealed_skips() > before,
-        "the fresh key searched segments"
-    );
-    // A sealed key still resolves through the fan-out the filter guards.
+    assert_eq!(store.filter_probes(), before, "the fresh key searched segments");
+    // A sealed key resolves through FastForward.
     assert!(store.get(&sealed).expect("get").is_some());
 
     store.close().expect("close");

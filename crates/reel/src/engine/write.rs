@@ -193,7 +193,7 @@ impl ReelStore {
         // One answer per key move, so the ranges are stepped over rather than paired.
         let mut answers = landed.iter();
         let mut displaced = Vec::new();
-        for planned in keys {
+        for (planned, record) in keys.iter().zip(committed) {
             if matches!(planned.op, KeyOp::Range(_)) {
                 continue;
             }
@@ -201,12 +201,12 @@ impl ReelStore {
                 break;
             };
             if pages && mapped.may_be_paged() {
-                displaced.push(planned.key.clone());
+                displaced.push((planned.key.clone(), record.lsn));
             }
         }
 
-        for key in displaced {
-            self.index.settle_displaced(&key)?;
+        for (key, lsn) in displaced {
+            self.index.settle_displaced(&key, lsn)?;
         }
         Ok(())
     }

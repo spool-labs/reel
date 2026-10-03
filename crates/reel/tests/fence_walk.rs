@@ -132,11 +132,13 @@ fn filled_under(config: ReelConfig) -> (ReelStore, SimIo) {
 /// Probe a sample of the keys, and say what finding them cost
 fn hit_counts(store: &ReelStore) -> ProbeCounts {
     let stride = keys() / PROBES;
+    // As of a cue point, since FastForward answers a live get without asking a footer.
+    let cue = store.cue().expect("cue");
     let before = store.filter_probes();
     for at in 0..PROBES {
         let at = at * stride;
         assert!(
-            store.get(&key(at)).expect("get").is_some(),
+            store.get_at(&key(at), &cue).expect("get").is_some(),
             "key {at} went missing",
         );
     }
@@ -272,10 +274,12 @@ fn what_a_miss_costs_without_a_filter() {
 
 /// Probe keys nothing wrote, which the column's sealed-key set answers on its own
 fn miss_counts(store: &ReelStore) -> ProbeCounts {
+    // As of a cue point, since FastForward answers a live get without asking a footer.
+    let cue = store.cue().expect("cue");
     let before = store.filter_probes();
     for at in keys()..keys() + PROBES {
         assert!(
-            store.get(&key(at)).expect("get").is_none(),
+            store.get_at(&key(at), &cue).expect("get").is_none(),
             "key {at} is not there"
         );
     }

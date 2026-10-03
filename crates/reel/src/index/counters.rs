@@ -165,9 +165,6 @@ struct SegmentRow {
     /// Newest tombstone version here, or the reserved zero for none
     held_lsn: AtomicU64,
 
-    /// Newest version booked here, sealed or not, or the reserved zero for none
-    booked_lsn: AtomicU64,
-
     /// The life this segment is on, or the reserved zero for none issued
     incarnation: AtomicU32,
 
@@ -185,7 +182,6 @@ impl SegmentRow {
             min_lsn: AtomicU64::new(u64::MAX),
             max_lsn: AtomicU64::new(Lsn::NONE.as_u64()),
             held_lsn: AtomicU64::new(Lsn::NONE.as_u64()),
-            booked_lsn: AtomicU64::new(Lsn::NONE.as_u64()),
             incarnation: AtomicU32::new(0),
             flags: AtomicU32::new(0),
         }
@@ -507,7 +503,6 @@ impl SegmentTable {
         self.opened(segment, |row| {
             row.note_min(lsn);
             row.add_live(span);
-            row.booked_lsn.fetch_max(lsn.as_u64(), Ordering::Relaxed);
         });
     }
 
@@ -519,28 +514,6 @@ impl SegmentTable {
         self.opened(segment, |row| {
             row.note_min(lsn);
             row.dead.fetch_add(span, Ordering::AcqRel);
-            row.booked_lsn.fetch_max(lsn.as_u64(), Ordering::Relaxed);
-        });
-    }
-
-    /// The newest version a segment can hold, from its footer or its bookings
-    pub fn ceiling_of(&self, segment: SegmentId) -> Option<Lsn> {
-        let window = read(&self.window);
-        let row = window.counted(segment)?;
-        let newest = row
-            .max_lsn
-            .load(Ordering::Acquire)
-            .max(row.booked_lsn.load(Ordering::Acquire));
-        match newest == Lsn::NONE.as_u64() {
-            true => None,
-            false => Some(Lsn(newest)),
-        }
-    }
-
-    /// Raise the newest version booked against a segment, for a rebuild handing over its sums
-    pub fn note_booked(&self, segment: SegmentId, lsn: Lsn) {
-        self.opened(segment, |row| {
-            row.booked_lsn.fetch_max(lsn.as_u64(), Ordering::Relaxed);
         });
     }
 
@@ -891,11 +864,6 @@ pub trait Bookings {
 
     /// Book a tombstone's own footprint against the segment holding it
     fn mark_held(&self, segment: SegmentId, lsn: Lsn, span: u64);
-
-    /// Whether a put may read records to order two versions of one key
-    fn can_read_records(&self) -> bool {
-        true
-    }
 }
 
 impl Bookings for SegmentTable {
@@ -934,7 +902,6 @@ struct TallyRow {
     bytes: SegmentBytes,
     shadowed: u64,
     oldest: Option<Lsn>,
-    newest: Option<Lsn>,
 }
 
 impl<'table> Tally<'table> {
@@ -963,7 +930,6 @@ impl<'table> Tally<'table> {
                     bytes: SegmentBytes::default(),
                     shadowed: 0,
                     oldest: None,
-                    newest: None,
                 });
                 rows.len() - 1
             }
@@ -982,9 +948,6 @@ impl<'table> Tally<'table> {
             if let Some(oldest) = row.oldest {
                 self.table.note_min(row.segment, oldest);
             }
-            if let Some(newest) = row.newest {
-                self.table.note_booked(row.segment, newest);
-            }
         }
         for row in rows.iter().filter(|row| row.shadowed > 0) {
             self.table.shadow(row.segment, row.shadowed);
@@ -995,7 +958,6 @@ impl<'table> Tally<'table> {
 impl TallyRow {
     fn note_min(&mut self, lsn: Lsn) {
         self.oldest = Some(self.oldest.map_or(lsn, |oldest| oldest.min(lsn)));
-        self.newest = Some(self.newest.map_or(lsn, |newest| newest.max(lsn)));
     }
 }
 
@@ -1025,10 +987,6 @@ impl Bookings for Tally<'_> {
 
     fn shadow(&self, segment: SegmentId, span: u64) {
         self.with(segment, |row| row.shadowed += span);
-    }
-
-    fn can_read_records(&self) -> bool {
-        false
     }
 
     fn mark_held(&self, segment: SegmentId, lsn: Lsn, span: u64) {

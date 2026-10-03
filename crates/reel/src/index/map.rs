@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::ops::Bound;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::units::ByteCount;
@@ -18,13 +19,13 @@ use crate::format::column::{
     Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, MapShape, RecordKey,
 };
 use crate::format::footer::SegmentFooter;
-use crate::format::loc::{Loc, SegmentId};
+use crate::format::loc::{Loc, SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
 use crate::index::column::{ColumnIndex, KeyMove, Landed, PendingCover};
 use crate::index::counters::{Floors, SegmentBytes, SegmentStamp, SegmentTable};
 use crate::index::entry::Entry;
+use crate::index::fastforward::{FastColumn, Lookup, RecordSource};
 use crate::index::page::KeyPage;
-use crate::index::fastforward::{Lookup, RecordSource};
 use crate::index::paged::{Candidates, FooterSource, SealedRanges};
 use crate::index::playback::{self, merged_page, Paged, PlaybackCursor, Way};
 use crate::index::recovery::SealedSpan;
@@ -188,6 +189,15 @@ pub struct ReelIndex {
     /// Every sealed key each column holds, as one filter ahead of the fan-out
     sealed_keys: Vec<SealedKeys>,
 
+    /// Each column's sealed keys as record locations, answering a get in one read
+    fast: Vec<FastColumn>,
+
+    /// Whether every sealed key is in `fast`, after an open that loaded them or found none
+    fast_ready: AtomicBool,
+
+    /// Segments retired since FastForward last dropped the entries pointing into them
+    retired: AtomicU64,
+
     /// Column identifier to its position, so routing a record is one load
     by_id: Vec<Option<usize>>,
 
@@ -261,6 +271,9 @@ impl ReelIndex {
             indexes,
             sealed,
             sealed_keys,
+            fast: (0..columns.len()).map(|_| FastColumn::new()).collect(),
+            fast_ready: AtomicBool::new(false),
+            retired: AtomicU64::new(0),
             by_id,
             segments: Arc::new(SegmentTable::new()),
             footers: OnceLock::new(),
@@ -283,33 +296,69 @@ impl ReelIndex {
         let _ = self.footers.set(footers);
     }
 
-    /// Where FastForward columns read the records their entries point at
+    /// Where FastForward reads the records its entries point at
     pub fn set_records(&self, records: Arc<dyn RecordSource>) {
-        for index in &self.indexes {
-            index.attach_records(&records, &self.segments);
+        for fast in &self.fast {
+            fast.attach(Arc::clone(&records), Arc::clone(&self.segments));
         }
     }
 
-    /// A key's newest payload in one read, when its column is FastForward and resident
+    /// Whether FastForward answers for a column's sealed keys
+    fn fast_serves(&self) -> bool {
+        self.residency.pages() && self.fast_ready.load(Ordering::Acquire)
+    }
+
+    /// A key's newest payload in one read, when FastForward holds the column's sealed keys
+    ///
+    /// A key the map holds reads through the checked path, which is one read too.
     pub fn fast_read(&self, key: &RecordKey) -> Result<Lookup> {
-        match (self.slot(key.column), self.residency.pages()) {
-            (Some(at), false) => self.indexes[at].fast_read(key),
-            (Some(_), true) | (None, true) | (None, false) => Ok(Lookup::Unsettled),
+        let (Some(at), true) = (self.slot(key.column), self.fast_serves()) else {
+            return Ok(Lookup::Unsettled);
+        };
+        let index = &self.indexes[at];
+        match index.entry_or_grave(key.as_slice()) {
+            Some(entry) if entry.is_grave() || index.is_covered_key(key.as_slice(), entry.lsn) => {
+                return Ok(Lookup::Missing)
+            }
+            Some(_) => return Ok(Lookup::Unsettled),
+            None => {}
         }
+        Ok(match self.fast[at].read(key)? {
+            Lookup::Found(lsn, _) if index.is_covered_key(key.as_slice(), lsn) => Lookup::Missing,
+            found => found,
+        })
     }
 
-    /// Settle up to `budget` versions FastForward columns put beside an older one
+    /// Take out up to `budget` older versions FastForward lookups read past, and book them
     pub fn scrub_fast(&self, budget: usize) -> usize {
+        if self.retired.swap(0, Ordering::AcqRel) > 0 {
+            for fast in &self.fast {
+                fast.forget_retired(|segment| self.segments.incarnation_of(segment) != SegmentIncarnation::NONE);
+            }
+        }
         let mut settled = 0;
-        for index in &self.indexes {
-            settled += index.scrub_fast(budget - settled);
+        for (at, fast) in self.fast.iter().enumerate() {
+            for (key, loc) in fast.scrub(budget.saturating_sub(settled)) {
+                self.indexes[at].settle_paged(key.as_slice(), loc, self.counted(loc.segment), &self.segments);
+                settled += 1;
+            }
         }
         settled
     }
 
-    /// Versions FastForward columns hold beside an older one for their cleaners
+    /// Older versions FastForward holds for its cleaner
     pub fn fast_beside(&self) -> u64 {
-        self.indexes.iter().map(ColumnIndex::fast_beside).sum()
+        self.fast.iter().map(FastColumn::beside).sum()
+    }
+
+    /// Entries FastForward holds in all
+    pub fn fast_held(&self) -> u64 {
+        self.fast.iter().map(FastColumn::held).sum()
+    }
+
+    /// Say every sealed key is in FastForward, so it may answer for them
+    pub fn mark_fast_ready(&self) {
+        self.fast_ready.store(true, Ordering::Release);
     }
 
     /// Where a key's live record is, reading a footer if the column pages
@@ -345,10 +394,18 @@ impl ReelIndex {
     /// The fan-out below finds it; what is left here is the two things a footer
     /// cannot know about itself, a tombstone row and a range delete.
     fn sealed_entry(&self, at: usize, key: &RecordKey) -> Result<Option<Entry>> {
-        match self.newest_sealed(at, key, None)? {
+        match self.newest_live(at, key)? {
             Some(entry) if entry.is_grave() => Ok(None),
             Some(entry) if self.indexes[at].is_covered_key(key.as_slice(), entry.lsn) => Ok(None),
             found => Ok(found),
+        }
+    }
+
+    /// The newest sealed version of a key, from FastForward once it holds every sealed key
+    fn newest_live(&self, at: usize, key: &RecordKey) -> Result<Option<Entry>> {
+        match self.fast_serves() {
+            true => self.fast[at].entry(key),
+            false => self.newest_sealed(at, key, None),
         }
     }
 
@@ -520,7 +577,7 @@ impl ReelIndex {
         }
         // The write path takes the read path's own fan-out, so an overwrite probe
         // stops on the same terms a get does.
-        Ok(match self.newest_sealed(at, key, None)? {
+        Ok(match self.newest_live(at, key)? {
             None => Sealed::Absent,
             Some(entry) if entry.is_grave() => Sealed::Gone,
             Some(entry) if self.indexes[at].is_covered_key(key.as_slice(), entry.lsn) => {
@@ -612,11 +669,18 @@ impl ReelIndex {
     }
 
     /// Give a key up to the footer of the segment it landed in
+    ///
+    /// FastForward takes the key before the map lets it go, so a get never sees neither.
     pub fn page_out(&self, column: ColumnId, key: &[u8], loc: Loc) -> bool {
-        match self.column(column) {
-            Some(index) => index.page_out(key, loc),
-            None => false,
+        let Some(at) = self.slot(column) else {
+            return false;
+        };
+        self.fast[at].insert(key, loc);
+        let handed = self.indexes[at].page_out(key, loc);
+        if !handed {
+            self.fast[at].remove_at(key, loc);
         }
+        handed
     }
 
     /// Record the keys one newly sealed segment covers for one column
@@ -694,7 +758,7 @@ impl ReelIndex {
     pub fn insert(&self, key: &RecordKey, loc: Loc, lsn: Lsn) -> Result<bool> {
         let landed = self.insert_mapped(key, loc, lsn);
         if landed.may_be_paged() {
-            self.settle_displaced(key)?;
+            self.settle_displaced(key, lsn)?;
         }
         Ok(landed != Landed::Newer)
     }
@@ -717,10 +781,20 @@ impl ReelIndex {
     /// can still be answering for. Deferring it past the map move costs nothing a
     /// reader can see: what it settles is the dead-byte accounting the compactor
     /// reads, which is a tick behind by design anyway.
-    pub fn settle_displaced(&self, key: &RecordKey) -> Result<bool> {
+    ///
+    /// FastForward reads the displaced record's header, from memory when it can.
+    pub fn settle_displaced(&self, key: &RecordKey, lsn: Lsn) -> Result<bool> {
         let Some(at) = self.slot(key.column) else {
             return Ok(false);
         };
+        if self.fast_serves() {
+            let mut settled = false;
+            for loc in self.fast[at].displace(key, lsn)? {
+                let counted = self.counted(loc.segment);
+                settled |= self.indexes[at].settle_paged(key.as_slice(), loc, counted, &self.segments);
+            }
+            return Ok(settled);
+        }
         let Some(displaced) = self.paged_entry(at, key)? else {
             return Ok(false);
         };
@@ -760,7 +834,7 @@ impl ReelIndex {
     /// whether a live record went, wherever it was being answered from.
     pub fn remove(&self, key: &RecordKey, lsn: Lsn, tombstone: Loc) -> Result<bool> {
         let landed = self.remove_mapped(key, lsn, tombstone);
-        match landed.may_be_paged() && self.settle_displaced(key)? {
+        match landed.may_be_paged() && self.settle_displaced(key, lsn)? {
             true => Ok(true),
             false => Ok(landed.dropped_record()),
         }
@@ -1008,6 +1082,7 @@ impl ReelIndex {
                 self.counted(loc.segment),
                 &self.segments,
             );
+            self.fast[at].remove_at(key.as_slice(), *loc);
         }
         index.advance_release(pending.lsn, run.resume.as_deref());
         Ok(run.examined)
@@ -1028,14 +1103,20 @@ impl ReelIndex {
             return Ok(index.repoint(key.as_slice(), to, expected_lsn, &self.segments));
         }
         match self.sealed_state(at, key)? {
-            Sealed::Live(entry) if entry.lsn == expected_lsn => Ok(index.repoint_paged(
-                key.as_slice(),
-                entry.loc,
-                to,
-                expected_lsn,
-                self.counted(entry.loc.segment),
-                &self.segments,
-            )),
+            Sealed::Live(entry) if entry.lsn == expected_lsn => {
+                let moved = index.repoint_paged(
+                    key.as_slice(),
+                    entry.loc,
+                    to,
+                    expected_lsn,
+                    self.counted(entry.loc.segment),
+                    &self.segments,
+                );
+                if moved {
+                    self.fast[at].remove_at(key.as_slice(), entry.loc);
+                }
+                Ok(moved)
+            }
             // A newer version won the race, so the copy is dead on arrival and
             // the compactor books it as such.
             Sealed::Live(_) | Sealed::Gone => Ok(false),
@@ -1102,14 +1183,20 @@ impl ReelIndex {
             return Ok(index.evict_at(key.as_slice(), at, &self.segments));
         }
         match self.sealed_entry(column_at, key)? {
-            Some(entry) if entry.loc == at => Ok(index.evict_paged(
-                key.as_slice(),
-                at,
-                entry.lsn,
-                self.counted(entry.loc.segment),
-                &self.segments,
-            )),
-            _ => Ok(false),
+            Some(entry) if entry.loc == at => {
+                let evicted = index.evict_paged(
+                    key.as_slice(),
+                    at,
+                    entry.lsn,
+                    self.counted(entry.loc.segment),
+                    &self.segments,
+                );
+                if evicted {
+                    self.fast[column_at].remove_at(key.as_slice(), at);
+                }
+                Ok(evicted)
+            }
+            Some(_) | None => Ok(false),
         }
     }
 
@@ -1401,6 +1488,10 @@ impl ReelIndex {
             let spans = by_column.remove(&column.id).unwrap_or_default();
             self.sealed[at].replace(spans);
         }
+        // A volume with nothing sealed has no keys FastForward could be missing.
+        if self.sealed.iter().all(SealedRanges::is_empty) {
+            self.mark_fast_ready();
+        }
     }
 
     /// Drop every key and every segment counter the index holds
@@ -1408,12 +1499,17 @@ impl ReelIndex {
         for index in &self.indexes {
             index.clear();
         }
+        for fast in &self.fast {
+            fast.clear();
+        }
+        self.fast_ready.store(false, Ordering::Release);
         self.segments.clear();
     }
 
     /// Forget a segment's counters once its file has been unlinked
     pub fn forget_segment(&self, segment: SegmentId) {
         self.segments.forget(segment);
+        self.retired.fetch_add(1, Ordering::AcqRel);
         // A retired segment's footer goes with its file, so a paged index that
         // kept searching it would read a file that is no longer there.
         for sealed in &self.sealed {

@@ -544,7 +544,7 @@ impl ReelStore {
     /// reader does not own.
     fn resolve_read(&self, key: &RecordKey) -> Result<Resolved> {
         match self.index.fast_read(key)? {
-            Lookup::Found(payload) => return Ok(Resolved::Payload(payload)),
+            Lookup::Found(_, payload) => return Ok(Resolved::Payload(payload)),
             Lookup::Missing => return Ok(Resolved::Missing),
             Lookup::Unsettled => {}
         }

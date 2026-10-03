@@ -38,7 +38,7 @@ use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::{Lsn, LsnCounter};
 use crate::format::record::HEADER_LEN;
 use crate::index::counters::{FilterProbes, SegmentTable};
-use crate::index::fastforward::{FastRead, Head, HeadRead, RecordSource, WIDTH};
+use crate::index::fastforward::{FastRead, Head, HeadRead, RecordSource};
 use crate::index::paged::{FooterCache, FooterSource};
 use crate::index::recovery::{read_footer, ResumableTail};
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
@@ -78,43 +78,33 @@ const DIRECT_RECORD_FLOOR: u32 = 1024 * 1024;
 /// is the case it loses.
 const DIRECT_DEPTH_FLOOR: u64 = 2;
 
-/// Where a FastForward column reads the records its entries point at
+/// Where FastForward reads the records its entries point at
 impl RecordSource for ReelShared {
-    fn head(&self, segment: SegmentId, offset: u32) -> Result<Option<Head>> {
-        let Some(handle) = self.handle_for(segment)? else {
-            return Ok(None);
-        };
-        let prefix = self.driver.pread(handle.file(), u64::from(offset), (HEADER_LEN + WIDTH) as u64)?;
-        Ok(head_of(&prefix))
-    }
-
-    fn cached_head(&self, segment: SegmentId, offset: u32) -> Result<HeadRead> {
+    fn head(&self, key: KeyRef<'_>, segment: SegmentId, offset: u32) -> Result<HeadRead> {
         let Some(handle) = self.handle_for(segment)? else {
             return Ok(HeadRead::Missing);
         };
-        Ok(match self.driver.warm_only(handle.file(), u64::from(offset), HEADER_LEN + WIDTH) {
-            Some(prefix) => match head_of(&prefix) {
-                Some(head) => HeadRead::Found(head),
-                None => HeadRead::Missing,
-            },
+        let prefix = (HEADER_LEN + key.bytes.len()) as u64;
+        let bytes = self.driver.pread(handle.file(), u64::from(offset), prefix)?;
+        Ok(head_read(&bytes, key))
+    }
+
+    fn cached_head(&self, key: KeyRef<'_>, segment: SegmentId, offset: u32) -> Result<HeadRead> {
+        let Some(handle) = self.handle_for(segment)? else {
+            return Ok(HeadRead::Missing);
+        };
+        let prefix = HEADER_LEN + key.bytes.len();
+        Ok(match self.driver.warm_only(handle.file(), u64::from(offset), prefix) {
+            Some(bytes) => head_read(&bytes, key),
             None => HeadRead::Cold,
         })
     }
 
-    fn record(&self, key: &RecordKey, segment: SegmentId, offset: u32, bound: Option<u32>) -> Result<FastRead> {
+    fn record(&self, key: &RecordKey, segment: SegmentId, offset: u32, bound: u32) -> Result<FastRead> {
         let Some(handle) = self.handle_for(segment)? else {
             return Ok(FastRead::Other);
         };
-        let prefix = HEADER_LEN + WIDTH;
-        // A record too long for any length class reads its header first.
-        let Some(bound) = bound else {
-            return match self.head(segment, offset)? {
-                Some(head) if head.key.as_slice() != key.as_slice() => Ok(FastRead::Other),
-                Some(head) if head.is_tombstone => Ok(FastRead::Tombstone(head)),
-                Some(head) => self.whole_record(handle.file(), key, head, Loc::new(segment, offset, head.len)),
-                None => Ok(FastRead::Other),
-            };
-        };
+        let prefix = HEADER_LEN + key.as_slice().len();
         let answer = self.driver.pread_split_reusing(
             handle.file(),
             u64::from(offset),
@@ -133,25 +123,21 @@ impl RecordSource for ReelShared {
                 };
             }
         };
-        let head = head_of(&bytes);
-        let verdict = match head {
-            Some(head) if head.key.as_slice() != key.as_slice() => FastRead::Other,
-            Some(head) if head.is_tombstone => FastRead::Tombstone(head),
-            Some(head) if body.len() >= head.len as usize => {
+        let verdict = match head_read(&bytes, key.as_ref()) {
+            HeadRead::Same(head) if head.is_tombstone => FastRead::Tombstone(head),
+            HeadRead::Same(head) if body.len() >= head.len as usize => {
                 body.truncate(head.len as usize);
                 let loc = Loc::new(segment, offset, head.len);
-                return Ok(fast_read_of(
-                    frame_to_read(bytes, body, key.as_ref(), head.lsn, loc, self.config.verify_reads),
-                    head,
-                ));
+                let read = frame_to_read(bytes, body, key.as_ref(), head.lsn, loc, self.config.verify_reads);
+                return Ok(fast_read_of(read, head));
             }
             // The file ends inside the bound, so the record reads again at its own length.
-            Some(head) => {
+            HeadRead::Same(head) => {
                 recycle_header(bytes);
                 crate::reel::payload::give(body);
                 return self.whole_record(handle.file(), key, head, Loc::new(segment, offset, head.len));
             }
-            None => FastRead::Other,
+            HeadRead::Other | HeadRead::Missing | HeadRead::Cold => FastRead::Other,
         };
         recycle_header(bytes);
         crate::reel::payload::give(body);
@@ -162,7 +148,7 @@ impl RecordSource for ReelShared {
 impl ReelShared {
     /// One record read at the length its header gave
     fn whole_record(&self, file: FileId, key: &RecordKey, head: Head, loc: Loc) -> Result<FastRead> {
-        let prefix = HEADER_LEN + WIDTH;
+        let prefix = HEADER_LEN + key.as_slice().len();
         let len = loc.len as usize;
         let read = self.driver.pread_split_reusing(
             file,
@@ -182,18 +168,16 @@ impl ReelShared {
     }
 }
 
-/// A record's header and key, when they make a data record or tombstone of the FastForward width
-fn head_of(prefix: &[u8]) -> Option<Head> {
-    let (found, lsn, len, flags) = crate::format::record::head_fields(prefix, WIDTH)?;
-    if !flags.is_data() && !flags.is_tombstone() {
-        return None;
+/// What a record's header says about one key, a pad or another key reading as other
+fn head_read(prefix: &[u8], key: KeyRef<'_>) -> HeadRead {
+    match crate::format::record::head_for(prefix, key) {
+        Some((lsn, len, flags)) if flags.is_data() || flags.is_tombstone() => HeadRead::Same(Head {
+            lsn,
+            len,
+            is_tombstone: flags.is_tombstone(),
+        }),
+        Some(_) | None => HeadRead::Other,
     }
-    Some(Head {
-        key: found.try_into().ok()?,
-        lsn,
-        len,
-        is_tombstone: flags.is_tombstone(),
-    })
 }
 
 /// What a checked read of one FastForward candidate settles

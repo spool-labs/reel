@@ -8,7 +8,7 @@
 use std::borrow::Borrow;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{OnceLock, RwLock};
 
 use crate::units::ByteCount;
 
@@ -20,7 +20,6 @@ use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::index::counters::{Bookings, SegmentTable};
 use crate::index::entry::{span_of, Entry};
-use crate::index::fastforward::{FastColumn, Lookup, RecordSource};
 use crate::index::opentable::{overhead_per_key, OpenTable};
 use crate::index::page::KeyPage;
 use crate::index::paged::SealedRanges;
@@ -57,9 +56,6 @@ pub enum ColumnIndex {
 
     /// A column whose keys are whatever length they are, held on the heap
     Var(WidthIndex<Box<[u8]>, VarTrees>),
-
-    /// Sixteen byte keys held as record locations alone
-    Fast16(FastColumn),
 }
 
 /// What a mutation found in the map where the key was
@@ -125,7 +121,6 @@ macro_rules! on_index {
             ColumnIndex::Open72($bound) => $body,
             ColumnIndex::Open108($bound) => $body,
             ColumnIndex::Var($bound) => $body,
-            ColumnIndex::Fast16($bound) => $body,
         }
     };
 }
@@ -183,7 +178,7 @@ impl ColumnIndex {
         };
         if is_open {
             return match width {
-                16 => Ok(ColumnIndex::Fast16(FastColumn::new(spec))),
+                16 => Ok(ColumnIndex::Open16(WidthIndex::new(spec, residency))),
                 32 => Ok(ColumnIndex::Open32(WidthIndex::new(spec, residency))),
                 34 => Ok(ColumnIndex::Open34(WidthIndex::new(spec, residency))),
                 72 => Ok(ColumnIndex::Open72(WidthIndex::new(spec, residency))),
@@ -222,37 +217,6 @@ impl ColumnIndex {
     /// Bytes every key in this column occupies
     pub fn key_width(&self) -> u16 {
         on_index!(self, index => index.key_width())
-    }
-
-    /// Where a FastForward column reads records and books what its cleaner frees
-    pub fn attach_records(&self, records: &Arc<dyn RecordSource>, segments: &Arc<SegmentTable>) {
-        if let ColumnIndex::Fast16(fast) = self {
-            fast.attach(Arc::clone(records), Arc::clone(segments));
-        }
-    }
-
-    /// A key's newest payload in one read, on a FastForward column
-    pub fn fast_read(&self, key: &RecordKey) -> Result<Lookup> {
-        if let ColumnIndex::Fast16(fast) = self {
-            return fast.read(key);
-        }
-        Ok(Lookup::Unsettled)
-    }
-
-    /// Settle up to `budget` versions a FastForward column put beside an older one
-    pub fn scrub_fast(&self, budget: usize) -> usize {
-        if let ColumnIndex::Fast16(fast) = self {
-            return fast.scrub(budget);
-        }
-        0
-    }
-
-    /// Versions a FastForward column holds beside an older one for its cleaner
-    pub fn fast_beside(&self) -> u64 {
-        if let ColumnIndex::Fast16(fast) = self {
-            return fast.beside();
-        }
-        0
     }
 
     /// Leading key bytes that pick a shard, so keys apart in them share no lock

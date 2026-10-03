@@ -102,10 +102,12 @@ fn filled(filter_bits: u8) -> ReelStore {
 
 /// Probe for keys that were never written, and say what the segments were asked
 fn miss_counts(store: &ReelStore) -> ProbeCounts {
+    // As of a cue point, since FastForward answers a live get without asking a footer.
+    let cue = store.cue().expect("cue");
     let before = store.filter_probes();
     for at in KEYS..KEYS + MISSES {
         assert!(
-            store.get(&key(at)).expect("get").is_none(),
+            store.get_at(&key(at), &cue).expect("get").is_none(),
             "a key nothing wrote"
         );
     }
@@ -114,10 +116,12 @@ fn miss_counts(store: &ReelStore) -> ProbeCounts {
 
 /// Probe for keys that were written, and say what finding them cost
 fn hit_counts(store: &ReelStore, keys: u64) -> ProbeCounts {
+    // As of a cue point, since FastForward answers a live get without asking a footer.
+    let cue = store.cue().expect("cue");
     let before = store.filter_probes();
     for at in 0..keys {
         assert!(
-            store.get(&key(at)).expect("get").is_some(),
+            store.get_at(&key(at), &cue).expect("get").is_some(),
             "key {at} went missing"
         );
     }

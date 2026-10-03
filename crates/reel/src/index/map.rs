@@ -849,7 +849,7 @@ impl ReelIndex {
             }
             match self.slot(column) {
                 Some(slot) => {
-                    self.indexes[slot].apply_moves(&moves[at..end], &self.segments, landed)
+                    self.indexes[slot].apply_moves(&moves[at..end], &*self.segments, landed)
                 }
                 // A column nothing indexes takes the same answer one key at a
                 // time would have given, once for each key it would have gone to.

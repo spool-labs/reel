@@ -26,7 +26,7 @@ use crate::format::record::{
 };
 use crate::format::segment_header::{SegmentHeader, FORMAT_VERSION};
 use crate::index::column::{KeyMove, Landed};
-use crate::index::counters::SegmentBytes;
+use crate::index::counters::{Bookings, SegmentBytes, Tally};
 use crate::index::entry::{span_of, Entry};
 use crate::index::map::ReelIndex;
 use crate::index::persisted::{trusted, PersistedReader, PersistedSegment};
@@ -687,14 +687,17 @@ fn feed_part(
         column,
         ..KeyQueue::default()
     };
+    // Booked here and handed over once, so the parts never meet on a segment's row.
+    let tally = Tally::new(index.segments());
     let mut highest = Lsn::NONE;
     merge_cursors(&mut mine, |cursor| {
         cursor.put_with(|key, loc, lsn, is_delete| {
             highest = highest.max(lsn);
-            queue.push(index, key, loc, lsn, is_delete);
+            queue.push(index, &tally, key, loc, lsn, is_delete);
         })
     })?;
-    queue.flush(index);
+    queue.flush_into(index, &tally);
+    tally.settle();
     Ok(highest)
 }
 
@@ -1538,7 +1541,7 @@ impl<'a> Resolver<'a> {
             self.flush();
             self.queue.column = column;
         }
-        self.queue.push(self.index, key, loc, lsn, is_delete);
+        self.queue.push(self.index, self.index.segments(), key, loc, lsn, is_delete);
     }
 
     /// Stand one range as a cover, after everything queued ahead of it
@@ -1605,17 +1608,30 @@ struct KeyQueue {
 
 impl KeyQueue {
     /// Queue one record or point tombstone, applying the batch ahead of it once full
-    fn push(&mut self, index: &ReelIndex, key: &[u8], loc: Loc, lsn: Lsn, is_delete: bool) {
+    fn push<B: Bookings>(
+        &mut self,
+        index: &ReelIndex,
+        segments: &B,
+        key: &[u8],
+        loc: Loc,
+        lsn: Lsn,
+        is_delete: bool,
+    ) {
         if self.rows.len() == BATCH {
-            self.flush(index);
+            self.flush_into(index, segments);
         }
         self.keys.extend_from_slice(key);
         let end = self.keys.len();
         self.rows.push((end, loc, lsn, is_delete));
     }
 
-    /// Apply what is queued in order, a shard lock a run of keys
+    /// Apply what is queued in order, booked straight into the segment table
     fn flush(&mut self, index: &ReelIndex) {
+        self.flush_into(index, index.segments());
+    }
+
+    /// Apply what is queued in order, a shard lock a run of keys
+    fn flush_into<B: Bookings>(&mut self, index: &ReelIndex, segments: &B) {
         if self.rows.is_empty() {
             return;
         }
@@ -1637,7 +1653,7 @@ impl KeyQueue {
                 })
                 .collect();
             self.landed.clear();
-            column.apply_moves(&moves, index.segments(), &mut self.landed);
+            column.apply_moves(&moves, segments, &mut self.landed);
         }
         self.keys.clear();
         self.rows.clear();

@@ -848,6 +848,155 @@ impl SegmentTable {
     }
 }
 
+/// Where an index write books what it did to its segments' bytes
+///
+/// The table itself on a live write. A rebuild thread sums into a tally instead, since
+/// threads applying rows at once would all meet on the table's lock and on the few
+/// rows the window's segments stand on.
+pub trait Bookings {
+    /// The incarnation an entry pointing into a segment is stamped with
+    fn live_incarnation(&self, segment: SegmentId) -> SegmentIncarnation;
+
+    /// Book a record live in its segment, and note the version it carries
+    fn mark_live(&self, segment: SegmentId, lsn: Lsn, span: u64);
+
+    /// Book a record dead where it lies, and note the version it carries
+    fn mark_dead(&self, segment: SegmentId, lsn: Lsn, span: u64);
+
+    /// Move a record's footprint from live to dead within its segment
+    fn shadow(&self, segment: SegmentId, span: u64);
+
+    /// Book a tombstone's own footprint against the segment holding it
+    fn mark_held(&self, segment: SegmentId, lsn: Lsn, span: u64);
+}
+
+impl Bookings for SegmentTable {
+    fn live_incarnation(&self, segment: SegmentId) -> SegmentIncarnation {
+        self.live_incarnation(segment)
+    }
+
+    fn mark_live(&self, segment: SegmentId, lsn: Lsn, span: u64) {
+        self.mark_live(segment, lsn, span)
+    }
+
+    fn mark_dead(&self, segment: SegmentId, lsn: Lsn, span: u64) {
+        self.mark_dead(segment, lsn, span)
+    }
+
+    fn shadow(&self, segment: SegmentId, span: u64) {
+        self.shadow(segment, span)
+    }
+
+    fn mark_held(&self, segment: SegmentId, lsn: Lsn, span: u64) {
+        self.mark_held(segment, lsn, span)
+    }
+}
+
+/// One rebuild thread's bookings, summed per segment until it hands them over
+pub struct Tally<'table> {
+    table: &'table SegmentTable,
+    rows: std::cell::RefCell<Vec<TallyRow>>,
+}
+
+/// What a tally has summed for one segment
+struct TallyRow {
+    segment: SegmentId,
+    incarnation: Option<SegmentIncarnation>,
+    bytes: SegmentBytes,
+    shadowed: u64,
+    oldest: Option<Lsn>,
+}
+
+impl<'table> Tally<'table> {
+    pub fn new(table: &'table SegmentTable) -> Tally<'table> {
+        Tally {
+            table,
+            rows: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Change one segment's sums, the newest row first since runs of rows share one
+    fn with<T>(&self, segment: SegmentId, change: impl FnOnce(&mut TallyRow) -> T) -> T {
+        let mut rows = self.rows.borrow_mut();
+        let at = match rows.iter().rposition(|row| row.segment == segment) {
+            Some(at) => at,
+            None => {
+                rows.push(TallyRow {
+                    segment,
+                    incarnation: None,
+                    bytes: SegmentBytes::default(),
+                    shadowed: 0,
+                    oldest: None,
+                });
+                rows.len() - 1
+            }
+        };
+        change(&mut rows[at])
+    }
+
+    /// Hand every sum to the table, the live bytes ahead of the shadowed ones
+    ///
+    /// Each shadowed record was booked live first, by this tally or an earlier one,
+    /// so with every live sum in place no count dips below what it would have.
+    pub fn settle(self) {
+        let rows = self.rows.into_inner();
+        for row in &rows {
+            if row.bytes != SegmentBytes::default() {
+                self.table.adopt(row.segment, row.bytes);
+            }
+            if let Some(oldest) = row.oldest {
+                self.table.note_min(row.segment, oldest);
+            }
+        }
+        for row in rows.iter().filter(|row| row.shadowed > 0) {
+            self.table.shadow(row.segment, row.shadowed);
+        }
+    }
+}
+
+impl TallyRow {
+    fn note_min(&mut self, lsn: Lsn) {
+        self.oldest = Some(self.oldest.map_or(lsn, |oldest| oldest.min(lsn)));
+    }
+}
+
+impl Bookings for Tally<'_> {
+    fn live_incarnation(&self, segment: SegmentId) -> SegmentIncarnation {
+        if let Some(known) = self.with(segment, |row| row.incarnation) {
+            return known;
+        }
+        let issued = self.table.live_incarnation(segment);
+        self.with(segment, |row| row.incarnation = Some(issued));
+        issued
+    }
+
+    fn mark_live(&self, segment: SegmentId, lsn: Lsn, span: u64) {
+        self.with(segment, |row| {
+            row.note_min(lsn);
+            row.bytes.live += span;
+        });
+    }
+
+    fn mark_dead(&self, segment: SegmentId, lsn: Lsn, span: u64) {
+        self.with(segment, |row| {
+            row.note_min(lsn);
+            row.bytes.dead += span;
+        });
+    }
+
+    fn shadow(&self, segment: SegmentId, span: u64) {
+        self.with(segment, |row| row.shadowed += span);
+    }
+
+    fn mark_held(&self, segment: SegmentId, lsn: Lsn, span: u64) {
+        self.with(segment, |row| {
+            row.bytes.live += span;
+            row.bytes.held += span;
+            row.bytes.held_lsn = Some(row.bytes.held_lsn.map_or(lsn, |held| held.max(lsn)));
+        });
+    }
+}
+
 /// Store-wide counters that no single column owns
 ///
 /// Live counts and byte totals belong to the columns holding the keys, so what is

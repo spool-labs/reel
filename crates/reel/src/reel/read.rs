@@ -154,16 +154,16 @@ pub(super) fn joins(last: &Planned, next: &Planned, from: u64, span: u64) -> boo
 pub(super) fn check_in_block(
     block: &[u8],
     at: usize,
-    held: &Planned,
+    prefix: usize,
     expected: KeyRef<'_>,
     lsn: Lsn,
     loc: Loc,
     is_verified: bool,
 ) -> std::result::Result<u8, RecordRead> {
-    let Some(body_at) = at.checked_add(held.prefix) else {
+    let Some(body_at) = at.checked_add(prefix) else {
         return Err(RecordRead::Stale);
     };
-    let Some(body_end) = body_at.checked_add(held.len) else {
+    let Some(body_end) = body_at.checked_add(loc.len as usize) else {
         return Err(RecordRead::Stale);
     };
     if body_end > block.len() {
@@ -206,7 +206,9 @@ pub(super) fn place_runs(
             let at = (held.offset - base) as usize;
             let ask = &asks[held.at];
             let key = keys[ask.at as usize];
-            if let Ok(codec) = check_in_block(&block, at, held, key, ask.lsn, ask.loc, is_verified) {
+            if let Ok(codec) =
+                check_in_block(&block, at, held.prefix, key, ask.lsn, ask.loc, is_verified)
+            {
                 spots[ask.at as usize] = Spot {
                     block: index,
                     at: (at + held.prefix) as u32,

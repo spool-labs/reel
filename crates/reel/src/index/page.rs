@@ -78,6 +78,27 @@ impl KeyPage {
         self.count += 1;
     }
 
+    /// Add a run of keys packed at one width, with each key's entry, in one copy each
+    ///
+    /// False, with nothing added, when the run's width differs from the page's.
+    pub fn push_packed(&mut self, keys: &[u8], width: usize, found: &[Entry]) -> bool {
+        if found.is_empty() {
+            return true;
+        }
+        if !self.ends.is_empty() || (self.count > 0 && width != self.width) || width == 0 {
+            return false;
+        }
+        if self.count == 0 {
+            self.width = width;
+        }
+        self.keys.extend_from_slice(keys);
+        if self.keeps_found {
+            self.found.extend_from_slice(found);
+        }
+        self.count += found.len();
+        true
+    }
+
     /// How many keys the page holds
     pub fn len(&self) -> usize {
         self.count

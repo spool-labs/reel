@@ -18,8 +18,11 @@ const DEFAULT_COMPACT_DEAD_RATIO: f64 = 0.50;
 const DEFAULT_MERGE_DEAD_RATIO: f64 = 0.50;
 const DEFAULT_SCRUB_MBPS: u64 = 64;
 
-/// Sealed descriptors the reader cache holds, the one number every volume runs
-pub const DEFAULT_FD_CACHE: u64 = 256;
+/// Sealed descriptors the reader cache holds, unless the open-file limit says fewer
+///
+/// A store with more sealed segments than this drops a handle on every miss and remaps
+/// the segment on the next read, so the default sits well above a volume's segment count.
+pub const DEFAULT_FD_CACHE: u64 = 4096;
 
 const DEFAULT_FOOTER_CACHE_MIB: u64 = 64;
 const DEFAULT_FILTER_BITS: u8 = 10;

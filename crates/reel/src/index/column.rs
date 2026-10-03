@@ -1649,7 +1649,9 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         };
         let at = self.shard_of(&key);
         let mut state = write(&self.shards[at]);
-        match state.map.at(key.as_slice()).copied() {
+        // Changed where it sits: the entry was just found, and putting it back would
+        // walk the map to it a second time.
+        match state.map.at_mut(key.as_slice()) {
             Some(existing) if existing.lsn == expected_lsn && !existing.is_grave() => {
                 let span = existing.span(key.width());
                 segments.release_live(existing.loc.segment, span);
@@ -1661,10 +1663,8 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 self.filters.note(at, filter_hash(key.as_slice()));
                 // The copy sits in an open tail, held live until the repoint is
                 // published, so its stamp is issued here.
-                state.map.put(
-                    key,
-                    existing.moved_to(new_loc, segments.live_incarnation(new_loc.segment)),
-                );
+                let stamp = segments.live_incarnation(new_loc.segment);
+                *existing = existing.moved_to(new_loc, stamp);
                 true
             }
             Some(_) | None => {
@@ -2023,14 +2023,27 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             // for as long as the walk it opens.
             let low = borrowed(&bound);
             let state = read(&self.shards[at]);
-            for (key, entry) in state
-                .map
-                .span(low, Bound::Unbounded)
-                .filter(|(key, entry)| {
-                    !entry.is_grave() && !self.is_covered(key.as_slice(), entry.lsn)
-                })
-            {
-                out.push(key.as_slice(), *entry);
+            let covers = self.has_covers.load(Ordering::Relaxed);
+            for (keys, entries) in state.map.span_runs(low) {
+                // A run with nothing dead in it goes over in one copy of keys and one of entries,
+                // cut at the room the page has left.
+                let take = keys.len().min(limit - out.len());
+                let clean = !covers && !entries[..take].iter().any(Entry::is_grave);
+                let width = keys.first().map_or(0, |key| key.as_slice().len());
+                let packed = clean
+                    && K::packed(&keys[..take])
+                        .is_some_and(|bytes| out.push_packed(bytes, width, &entries[..take]));
+                if !packed {
+                    // Dead entries are skipped, so the whole run is walked until the page fills.
+                    for (key, entry) in keys.iter().zip(entries) {
+                        if !entry.is_grave() && !self.is_covered(key.as_slice(), entry.lsn) {
+                            out.push(key.as_slice(), *entry);
+                            if out.len() >= limit {
+                                return;
+                            }
+                        }
+                    }
+                }
                 if out.len() >= limit {
                     return;
                 }
@@ -2331,6 +2344,9 @@ pub trait ShardMap<K: IndexKey, V: 'static>: Default {
     /// What is held for a key, borrowed rather than built
     fn at(&self, key: &[u8]) -> Option<&V>;
 
+    /// What is held for a key, to be changed where it sits
+    fn at_mut(&mut self, key: &[u8]) -> Option<&mut V>;
+
     /// Whether a key is held at all
     fn holds(&self, key: &[u8]) -> bool;
 
@@ -2365,6 +2381,17 @@ pub trait ShardMap<K: IndexKey, V: 'static>: Default {
         low: Bound<&'a K>,
         high: Bound<&K>,
     ) -> impl Iterator<Item = (&'a K, &'a V)>;
+
+    /// Pairs from a low bound on, in runs. One pair per run unless the map keeps leaves.
+    fn span_runs<'a>(
+        &'a self,
+        low: Bound<&'a K>,
+    ) -> Box<dyn Iterator<Item = (&'a [K], &'a [V])> + 'a> {
+        Box::new(
+            self.span(low, Bound::Unbounded)
+                .map(|(key, val)| (std::slice::from_ref(key), std::slice::from_ref(val))),
+        )
+    }
 
     /// Many keys at once, answered in the order asked
     ///
@@ -2439,6 +2466,10 @@ impl<const B: usize, V: Default + 'static> ShardMap<Box<[u8]>, V> for TBTreeMap<
 
     fn at(&self, key: &[u8]) -> Option<&V> {
         self.get(key)
+    }
+
+    fn at_mut(&mut self, key: &[u8]) -> Option<&mut V> {
+        self.get_mut(key)
     }
 
     fn holds(&self, key: &[u8]) -> bool {
@@ -2525,6 +2556,11 @@ impl<const N: usize, const B: usize, V: Default + 'static> ShardMap<[u8; N], V>
         self.get(key)
     }
 
+    fn at_mut(&mut self, key: &[u8]) -> Option<&mut V> {
+        let key: &[u8; N] = key.try_into().ok()?;
+        self.get_mut(key)
+    }
+
     fn holds(&self, key: &[u8]) -> bool {
         self.at(key).is_some()
     }
@@ -2570,6 +2606,13 @@ impl<const N: usize, const B: usize, V: Default + 'static> ShardMap<[u8; N], V>
         self.range_back(low, high)
     }
 
+    fn span_runs<'a>(
+        &'a self,
+        low: Bound<&'a [u8; N]>,
+    ) -> Box<dyn Iterator<Item = (&'a [[u8; N]], &'a [V])> + 'a> {
+        Box::new(self.range_runs(low))
+    }
+
     fn at_many<'a>(&'a self, keys: &[[u8; N]], out: &mut Vec<Option<&'a V>>) {
         self.get_many_sorted(keys, out);
     }
@@ -2608,6 +2651,11 @@ impl<const N: usize, V: Default + 'static> ShardMap<[u8; N], V> for OpenTable<N,
         // an absence rather than a fault.
         let key: &[u8; N] = key.try_into().ok()?;
         self.get(key)
+    }
+
+    fn at_mut(&mut self, key: &[u8]) -> Option<&mut V> {
+        let key: &[u8; N] = key.try_into().ok()?;
+        self.get_mut(key)
     }
 
     fn holds(&self, key: &[u8]) -> bool {
@@ -2787,6 +2835,12 @@ pub trait IndexKey: Ord + Clone + Send + Sync + Borrow<[u8]> + 'static {
     /// The bytes themselves
     fn as_slice(&self) -> &[u8];
 
+    /// Keys packed end to end, where the key type is laid out that way already
+    fn packed(keys: &[Self]) -> Option<&[u8]> {
+        let _ = keys;
+        None
+    }
+
     /// Bytes this key occupies, which a record's span is measured with
     fn width(&self) -> u16 {
         self.as_slice().len() as u16
@@ -2794,6 +2848,10 @@ pub trait IndexKey: Ord + Clone + Send + Sync + Borrow<[u8]> + 'static {
 }
 
 impl<const N: usize> IndexKey for [u8; N] {
+    fn packed(keys: &[Self]) -> Option<&[u8]> {
+        Some(keys.as_flattened())
+    }
+
     fn from_slice(bytes: &[u8]) -> Option<[u8; N]> {
         match bytes.len() == N {
             true => {

@@ -10,7 +10,7 @@ use crate::error::Result;
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::SegmentId;
 use crate::format::record::{RecordHeader, HEADER_LEN};
-use crate::io::op::{Advice, WriteBuf};
+use crate::io::op::{Advice, Part, WriteBuf};
 use crate::reel::ReelShared;
 use crate::sync::tension::Tension;
 use crate::sync::{lock, read, write};
@@ -48,14 +48,27 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
     // are the reopen join's to settle, not the tally's.
     footer.sealed_at = shared.lsn.peek();
     let written = (|| -> Result<()> {
-        let packed = footer.pack_fenced(
+        let (rows, tail) = footer.pack_apart(
             shared.filter_bits_for(active.handle.id()),
             shared.config.seal_fences(),
         )?;
-        let sealed_end = end + packed.len() as u64;
-        shared
-            .driver
-            .writev_all(active.handle.file(), end, vec![WriteBuf::owned(packed)])?;
+        // The rows go down from the partitions that hold them and come back after.
+        let rows: Vec<Arc<Vec<u8>>> = rows.into_iter().map(Arc::new).collect();
+        let footer_len = rows.iter().map(|piece| piece.len()).sum::<usize>() + tail.len();
+        let sealed_end = end + footer_len as u64;
+        let mut pieces: Vec<WriteBuf> = rows
+            .iter()
+            .filter(|piece| !piece.is_empty())
+            .map(|piece| WriteBuf::Part(Part::new(piece, 0, piece.len())))
+            .collect();
+        pieces.push(WriteBuf::owned(tail));
+        let wrote = shared.driver.writev_all(active.handle.file(), end, pieces);
+        footer.put_rows(
+            rows.into_iter()
+                .map(|piece| Arc::try_unwrap(piece).unwrap_or_else(|piece| Vec::clone(&piece)))
+                .collect(),
+        );
+        wrote?;
         shared.driver.sync_full(active.handle.file())?;
         // An aligned write can leave zeros after the footer. The file ends at
         // the footer, so every trailer reader finds it at the end.
@@ -67,6 +80,9 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
         *lock(&active.entries) = footer;
         return Err(error);
     }
+    // Packing left the footer as a read of the file would parse it, so the first search
+    // of this segment finds it held and reads nothing back.
+    shared.footers.insert(active.handle.id(), Arc::new(footer));
     // The handle stops being a write head here and becomes the one readers find in the
     // cache, so it takes the hint a read-path open would have given it.
     let _ = shared

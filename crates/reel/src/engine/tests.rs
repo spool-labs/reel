@@ -463,6 +463,10 @@ fn an_unreadable_footer_does_not_lose_the_batch() {
     let second = store.reel.tails()[0].seal().expect("seal");
     store.flush().expect("flush");
 
+    // The seal left both footers held, and this is about one that has to be read back.
+    store.reel.shared().footers.forget(first);
+    store.reel.shared().footers.forget(second);
+
     // Wide enough for the length and the two reads one footer costs, narrow
     // enough that the segment behind it is read from a working device.
     sim.arm_next_ops(3, FaultKind::ReadError);
@@ -4027,6 +4031,34 @@ fn flip_on_disk(store: &ReelStore, dir: &TempDir, key: &RecordKey) {
     file.read_at(&mut byte, at).expect("read the payload byte");
     byte[0] ^= 0xff;
     file.write_at(&byte, at).expect("write the payload byte");
+}
+
+// a tail mapped on an early read still serves the records written after it
+#[test]
+fn a_tail_read_early_keeps_serving_from_its_mapping() {
+    let (store, backend, _dir) = posix_store(ReelConfig {
+        map_above: crate::config::MAP_EVERYTHING,
+        ..config(1, SyncPolicy::Never)
+    });
+    let first = record(7, 1);
+    let payload = stripes(8 * 1024);
+    store.put(&first, &payload).expect("put");
+    store.get(&first).expect("map the tail").expect("found");
+
+    // Past the reservation the tail had when it was mapped.
+    let last = record(7, 60);
+    for byte in 2..=60 {
+        store.put(&record(7, byte), &payload).expect("put");
+    }
+
+    let ops = backend.ops();
+    let found = store.get(&last).expect("get").expect("found");
+    assert_eq!(&*found, &payload[..]);
+    assert_eq!(
+        backend.ops() - ops,
+        0,
+        "a record the tail grew into went to the driver"
+    );
 }
 
 // a warm awaited read is answered from the page cache with the engine untouched

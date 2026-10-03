@@ -640,7 +640,7 @@ fn feed_column(
     let ordered = target.is_none_or(|index| index.map_shape() != MapShape::Open);
     let parts = match target {
         Some(index) if rows >= SPLIT_FEED_ROWS => {
-            split_by_shard(&cursors, index.shard_bytes(), ThreadBudget::Auto.resolve())
+            split_by_shard(index.shard_bytes(), ThreadBudget::Auto.resolve())
         }
         _ => Vec::new(),
     };
@@ -704,59 +704,28 @@ fn feed_part(
     Ok(highest)
 }
 
-/// Sample keys each cursor offers a part, for placing the cuts between parts
-const SAMPLES_PER_PART: usize = 8;
-
 /// A part's key bounds, the low one inside it and the high one past it, open where absent
 type Part = (Option<Vec<u8>>, Option<Vec<u8>>);
 
-/// Cut a window's keys into parts of about equal rows, each holding whole shards
+/// Cut a column's keys into a part per thread at even steps of their leading byte
 ///
-/// Every cursor offers evenly spaced keys, each standing for the rows up to the next
-/// one, and a cut falls where the running count crosses a part's share. A cut is
-/// trimmed to its shard's leading bytes, so no shard's keys straddle two parts.
-fn split_by_shard(
-    cursors: &[Cursor<'_>],
-    shard_bytes: u8,
-    threads: usize,
-) -> Vec<Part> {
-    let width = shard_bytes as usize;
-    if width == 0 || threads < 2 {
+/// Shards follow the leading bytes, so a cut there never splits a shard's keys across
+/// two parts. Keys bunched in a few shards leave some parts light, which costs time
+/// and nothing else, since one shard is one lock either way.
+fn split_by_shard(shard_bytes: u8, threads: usize) -> Vec<Part> {
+    let parts = threads.min(256);
+    if shard_bytes == 0 || parts < 2 {
         return Vec::new();
     }
-    let mut samples: Vec<(&[u8], usize)> = Vec::new();
-    let mut total = 0;
-    for cursor in cursors {
-        let step = cursor.left().div_ceil(threads * SAMPLES_PER_PART).max(1);
-        let mut at = cursor.at;
-        while at < cursor.end {
-            samples.push((cursor.key_of(at), step.min(cursor.end - at)));
-            at += step;
-        }
-        total += cursor.left();
-    }
-    samples.sort_unstable_by(|one, two| one.0.cmp(two.0));
-    let share = total.div_ceil(threads);
-    let mut cuts: Vec<Vec<u8>> = Vec::new();
-    let mut running = 0;
-    for (key, weight) in samples {
-        if running >= share * (cuts.len() + 1) {
-            let mut cut = key[..key.len().min(width)].to_vec();
-            cut.resize(width, 0);
-            if cut.iter().any(|byte| *byte != 0) && cuts.last().is_none_or(|last| *last < cut) {
-                cuts.push(cut);
-            }
-        }
-        running += weight;
-    }
-    let mut parts = Vec::with_capacity(cuts.len() + 1);
+    let mut split = Vec::with_capacity(parts);
     let mut low = None;
-    for cut in cuts {
-        parts.push((low, Some(cut.clone())));
+    for at in 1..parts {
+        let cut = vec![(256 * at / parts) as u8];
+        split.push((low, Some(cut.clone())));
         low = Some(cut);
     }
-    parts.push((low, None));
-    parts
+    split.push((low, None));
+    split
 }
 
 /// One held partition walked in key order, over a span of its places

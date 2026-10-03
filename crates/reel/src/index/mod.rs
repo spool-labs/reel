@@ -8,6 +8,7 @@
 pub mod column;
 pub mod counters;
 pub mod entry;
+pub mod fastforward;
 pub mod lockfile;
 pub mod map;
 pub mod opentable;

@@ -41,6 +41,7 @@ use crate::reel::bias::MachineFacts;
 use crate::reel::cue::CuePoints;
 
 use crate::compaction::pressure::PassPlane;
+use crate::index::fastforward::RecordSource;
 use crate::index::paged::FooterSource;
 use crate::index::persisted::{admits, PersistedReader};
 use crate::index::recovery::rebuild_from_persisted;
@@ -466,6 +467,7 @@ impl ReelStore {
         // The volume exists now, so the index can be told where to read the footers
         // a paged column resolves through. A resident one never asks.
         index.set_footers(Arc::clone(&shared) as Arc<dyn FooterSource>);
+        index.set_records(Arc::clone(&shared) as Arc<dyn RecordSource>);
         // And the other direction: a seal writes down what its segment weighs, and
         // these are the counters that know.
         shared.set_segments(index.segments_handle());

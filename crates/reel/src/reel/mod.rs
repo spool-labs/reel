@@ -38,6 +38,7 @@ use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::{Lsn, LsnCounter};
 use crate::format::record::HEADER_LEN;
 use crate::index::counters::{FilterProbes, SegmentTable};
+use crate::index::fastforward::{Head, RecordSource, WIDTH};
 use crate::index::paged::{FooterCache, FooterSource};
 use crate::index::recovery::{read_footer, ResumableTail};
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
@@ -78,6 +79,29 @@ const DIRECT_RECORD_FLOOR: u32 = 1024 * 1024;
 const DIRECT_DEPTH_FLOOR: u64 = 2;
 
 /// The footers a paged index resolves its sealed keys through
+impl RecordSource for ReelShared {
+    fn head(&self, segment: SegmentId, offset: u32) -> Result<Option<Head>> {
+        let Some(handle) = self.handle_for(segment)? else {
+            return Ok(None);
+        };
+        let prefix = self.driver.pread(handle.file(), u64::from(offset), (HEADER_LEN + WIDTH) as u64)?;
+        let Some((found, lsn, len, flags)) = crate::format::record::head_fields(&prefix, WIDTH) else {
+            return Ok(None);
+        };
+        if !flags.is_data() && !flags.is_tombstone() {
+            return Ok(None);
+        }
+        let mut key = [0u8; WIDTH];
+        key.copy_from_slice(found);
+        Ok(Some(Head {
+            key,
+            lsn,
+            len,
+            is_tombstone: flags.is_tombstone(),
+        }))
+    }
+}
+
 impl FooterSource for ReelShared {
     fn footer(&self, segment: SegmentId) -> Result<Option<Arc<SegmentFooter>>> {
         self.footer_of(segment)

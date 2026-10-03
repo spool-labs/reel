@@ -864,6 +864,11 @@ pub trait Bookings {
 
     /// Book a tombstone's own footprint against the segment holding it
     fn mark_held(&self, segment: SegmentId, lsn: Lsn, span: u64);
+
+    /// Whether a put may read records to order two versions of one key
+    fn can_read_records(&self) -> bool {
+        true
+    }
 }
 
 impl Bookings for SegmentTable {
@@ -987,6 +992,10 @@ impl Bookings for Tally<'_> {
 
     fn shadow(&self, segment: SegmentId, span: u64) {
         self.with(segment, |row| row.shadowed += span);
+    }
+
+    fn can_read_records(&self) -> bool {
+        false
     }
 
     fn mark_held(&self, segment: SegmentId, lsn: Lsn, span: u64) {

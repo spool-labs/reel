@@ -24,6 +24,7 @@ use crate::index::column::{ColumnIndex, KeyMove, Landed, PendingCover};
 use crate::index::counters::{Floors, SegmentBytes, SegmentStamp, SegmentTable};
 use crate::index::entry::Entry;
 use crate::index::page::KeyPage;
+use crate::index::fastforward::RecordSource;
 use crate::index::paged::{Candidates, FooterSource, SealedRanges};
 use crate::index::playback::{self, merged_page, Paged, PlaybackCursor, Way};
 use crate::index::recovery::SealedSpan;
@@ -280,6 +281,13 @@ impl ReelIndex {
     /// Set once at open, after the volume the footers live on exists.
     pub fn set_footers(&self, footers: Arc<dyn FooterSource>) {
         let _ = self.footers.set(footers);
+    }
+
+    /// Where FastForward columns read the record headers they confirm keys against
+    pub fn set_records(&self, records: Arc<dyn RecordSource>) {
+        for index in &self.indexes {
+            index.attach_records(&records);
+        }
     }
 
     /// Where a key's live record is, reading a footer if the column pages

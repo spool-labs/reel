@@ -754,11 +754,11 @@ fn prune_walked_shadowed(
                 let rows = &suspects[&partition.column];
                 let marks = shadowed.entry(partition.column).or_default();
                 // The footer rows and the suspects are both in key order, so
-                // one forward pass joins them.
+                // one forward pass joins them, and only a row whose key matches is
+                // read past its key.
                 let mut at = 0usize;
-                for row in partition.entries() {
-                    let row = row?;
-                    let key = row.key.as_slice();
+                for found in 0..partition.len() {
+                    let key = partition.key_at(found).unwrap_or_default();
                     while at < rows.len() && rows[at].0.as_slice() < key {
                         at += 1;
                     }
@@ -769,17 +769,18 @@ fn prune_walked_shadowed(
                     if suspect.as_slice() != key {
                         continue;
                     }
+                    let row = partition.row_at(found)?;
                     if row.lsn > entry.lsn {
                         marks.push(at);
                     } else if row.lsn < entry.lsn
                         && entry.lsn >= footer.sealed_at
-                        && !row.is_tombstone()
-                        && !row.is_range_tombstone()
+                        && !row.flags.is_tombstone()
+                        && !row.flags.is_range_tombstone()
                     {
                         // At or past the frontier, so the tally froze without this
                         // shadowing. Below it the tally already counted the death and
                         // a debit here would count it twice.
-                        let span = span_of(row.key.width(), row.len);
+                        let span = span_of(key.len() as u16, row.len);
                         let held = debits
                             .entry(partition.column)
                             .or_default()

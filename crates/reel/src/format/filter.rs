@@ -133,6 +133,27 @@ impl Filter {
         is_new
     }
 
+    /// Start fetching the block a key would set, ahead of the insert that sets it
+    pub fn prefetch(&self, key: &[u8]) {
+        let blocks = self.body.len() / BLOCK_BYTES;
+        if self.kind != KIND_BLOOM || blocks == 0 {
+            return;
+        }
+        let at = block_of(hash_key(key, self.seed), blocks) * BLOCK_BYTES;
+        let block = self.body[at..].as_ptr();
+        // A hint the cpu may drop, which never faults and changes no state.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(block.cast())
+        };
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!("prfm pstl1keep, [{0}]", in(reg) block, options(nostack, readonly, preserves_flags))
+        };
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let _ = block;
+    }
+
     /// Whether the segment may hold this key, which is only ever a maybe or a no
     pub fn may_hold(&self, key: &[u8]) -> bool {
         match self.kind {

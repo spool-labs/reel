@@ -31,6 +31,9 @@ pub struct SealedKeys {
     skips: AtomicU64,
 }
 
+/// Keys the filter fetches a block ahead of the one going in
+const PREFETCH_AHEAD: usize = 16;
+
 struct Levels {
     /// The filters, oldest level first
     stack: Vec<Filter>,
@@ -63,9 +66,17 @@ impl SealedKeys {
     }
 
     /// Take every key a sealed partition holds, under one lock
+    ///
+    /// A level past the caches costs a memory miss a key, so the block of the key a
+    /// few places on is fetched while this one goes in and the misses overlap.
     pub fn insert_partition(&self, partition: &FooterPartition) {
         let mut levels = write(&self.levels);
         for at in 0..partition.len() {
+            if let Some(ahead) = partition.key_at(at + PREFETCH_AHEAD) {
+                if let Some(top) = levels.stack.last() {
+                    top.prefetch(ahead);
+                }
+            }
             if let Some(key) = partition.key_at(at) {
                 levels.take(key);
             }

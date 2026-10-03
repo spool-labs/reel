@@ -192,13 +192,7 @@ pub fn rebuild_from_persisted(
     let mut held: Vec<Held> = Vec::new();
     read_segments(driver, &jobs, |at, parts| {
         let (segment, path, len) = &jobs[at];
-        // A resident volume feeds a window of segments in key order, so each shard's
-        // tree fills a leaf at a time.
-        let loaded = match pages {
-            true => absorb_segment(*segment, parts, pages, &mut resolver)?,
-            false => hold_segment(*segment, parts, &mut held),
-        };
-        match loaded {
+        match absorb_segment(*segment, parts, pages, &mut resolver, &mut held)? {
             Loaded::Sealed => {
                 consumed.insert(*segment, *len);
                 sealed_files.push((*segment, path.clone(), *len));
@@ -482,59 +476,70 @@ fn read_parts(
     }
 }
 
-/// Fold one segment's parts into the index
+/// Fold one segment's parts into the index, holding the rows it installs for the feed
+///
+/// A paging volume sweeps a sealed footer and installs none of its keys. Ranges stand at
+/// once, since a cover settles by sequence number whichever rows it meets first. A
+/// walked tail's footer goes to the tail resuming it once its window is fed.
 fn absorb_segment(
     segment: SegmentId,
     parts: SegmentParts,
     pages: bool,
     resolver: &mut Resolver<'_>,
+    held: &mut Vec<Held>,
 ) -> Result<Loaded> {
     match parts {
         SegmentParts::Foreign => Ok(Loaded::Foreign),
         SegmentParts::Sealed(footer, ends) => {
-            let mut ends = ends.into_iter();
             match pages {
-                true => sweep_footer(segment, &footer, &mut ends, resolver)?,
-                false => collect_partitions(segment, &footer.partitions, &mut ends, resolver)?,
+                true => sweep_footer(segment, &footer, &mut ends.into_iter(), resolver)?,
+                false => {
+                    stand_ranges(segment, &footer, ends, resolver)?;
+                    held.push(Held { segment, footer, is_sorted: true });
+                }
             }
             Ok(Loaded::Sealed)
         }
         SegmentParts::Walked(tail) => {
-            let mut ends = tail.ends.into_iter();
-            collect_partitions(segment, &tail.footer.partitions, &mut ends, resolver)?;
-            Ok(Loaded::Walked(tail.next_offset, tail.is_at_fill, tail.footer))
+            stand_ranges(segment, &tail.footer, tail.ends, resolver)?;
+            held.push(Held { segment, footer: tail.footer, is_sorted: false });
+            Ok(Loaded::Walked(tail.next_offset, tail.is_at_fill, SegmentFooter::empty()))
         }
     }
 }
 
-/// One segment's rows a resident rebuild holds until its window is fed
+/// Stand a segment's range tombstones, each with its end in footer order
+fn stand_ranges(
+    segment: SegmentId,
+    footer: &SegmentFooter,
+    ends: Vec<Option<KeyBytes>>,
+    resolver: &mut Resolver<'_>,
+) -> Result<()> {
+    if ends.is_empty() {
+        return Ok(());
+    }
+    let mut ends = ends.into_iter();
+    for partition in &footer.partitions {
+        for row in 0..partition.len() {
+            let found = partition.row_at(row)?;
+            if !found.flags.is_range_tombstone() {
+                continue;
+            }
+            let start = RecordKey::from_bytes(partition.column, partition.key_at(row).unwrap_or_default())?;
+            let loc = Loc::new(segment, found.offset, found.len);
+            resolver.range(&start, ends.next().flatten(), found.lsn, loc);
+        }
+    }
+    Ok(())
+}
+
+/// One segment's rows held until its window is fed in key order
 struct Held {
     segment: SegmentId,
     footer: SegmentFooter,
 
-    /// Each range tombstone's end, partition by partition in row order
-    ends: Vec<Option<KeyBytes>>,
-
     /// Whether the rows sit in key order, which a sealed footer's do and a walk's do not
     is_sorted: bool,
-}
-
-/// Keep a resident segment's rows for the key-ordered feed
-///
-/// A walked tail's footer stays here until the feed and then goes to the tail resuming
-/// it, so what the walk hands back for now is an empty one.
-fn hold_segment(segment: SegmentId, parts: SegmentParts, held: &mut Vec<Held>) -> Loaded {
-    match parts {
-        SegmentParts::Foreign => Loaded::Foreign,
-        SegmentParts::Sealed(footer, ends) => {
-            held.push(Held { segment, footer, ends, is_sorted: true });
-            Loaded::Sealed
-        }
-        SegmentParts::Walked(tail) => {
-            held.push(Held { segment, footer: tail.footer, ends: tail.ends, is_sorted: false });
-            Loaded::Walked(tail.next_offset, tail.is_at_fill, SegmentFooter::empty())
-        }
-    }
 }
 
 /// Feed every held row to the resolver in key order, then hand each walked footer on
@@ -558,7 +563,7 @@ fn feed_held(
             .iter()
             .enumerate()
             .filter_map(|(source, rows)| Cursor::open(source, rows, column))
-            .collect::<Result<_>>()?;
+            .collect();
         merge_cursors(&mut cursors, |cursor| cursor.feed(resolver))?;
     }
     for rows in held.drain(..) {
@@ -579,20 +584,12 @@ struct Cursor<'a> {
     /// Row numbers in key order, for rows that sit in arrival order
     order: Option<Vec<u32>>,
     at: usize,
-
-    /// Range tombstone ends by row number
-    ends: Vec<(u32, Option<KeyBytes>)>,
 }
 
 impl<'a> Cursor<'a> {
-    fn open(source: usize, rows: &'a Held, column: ColumnId) -> Option<Result<Cursor<'a>>> {
-        let at = rows
-            .footer
-            .partitions
-            .iter()
-            .position(|partition| partition.column == column)?;
-        let partition = &rows.footer.partitions[at];
-        Some(ends_of(rows, at).map(|ends| Cursor {
+    fn open(source: usize, rows: &'a Held, column: ColumnId) -> Option<Cursor<'a>> {
+        let partition = rows.footer.partition(column)?;
+        Some(Cursor {
             source,
             segment: rows.segment,
             partition,
@@ -608,8 +605,7 @@ impl<'a> Cursor<'a> {
                 order
             }),
             at: 0,
-            ends,
-        }))
+        })
     }
 
     fn is_done(&self) -> bool {
@@ -627,52 +623,16 @@ impl<'a> Cursor<'a> {
         self.partition.key_at(self.row())
     }
 
+    /// Put one row, a range having stood when its segment was held
     fn feed(&self, resolver: &mut Resolver<'_>) -> Result<()> {
-        let row = self.row();
-        let found = self.partition.row_at(row)?;
-        let key = self.key().unwrap_or_default();
-        let loc = Loc::new(self.segment, found.offset, found.len);
-        match found.flags.is_range_tombstone() {
-            true => {
-                let end = self
-                    .ends
-                    .binary_search_by_key(&(row as u32), |(at, _)| *at)
-                    .ok()
-                    .and_then(|at| self.ends[at].1.clone());
-                let start = RecordKey::from_bytes(self.partition.column, key)?;
-                resolver.range(&start, end, found.lsn, loc);
-            }
-            false => resolver.put(
-                self.partition.column,
-                key,
-                loc,
-                found.lsn,
-                found.flags.is_tombstone(),
-            ),
+        let found = self.partition.row_at(self.row())?;
+        if !found.flags.is_range_tombstone() {
+            let key = self.key().unwrap_or_default();
+            let loc = Loc::new(self.segment, found.offset, found.len);
+            resolver.put(self.partition.column, key, loc, found.lsn, found.flags.is_tombstone());
         }
         Ok(())
     }
-}
-
-/// The ends of one partition's range tombstones, matched to their rows
-fn ends_of(rows: &Held, partition: usize) -> Result<Vec<(u32, Option<KeyBytes>)>> {
-    if rows.ends.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut ends = rows.ends.iter();
-    let mut matched = Vec::new();
-    for (at, held) in rows.footer.partitions.iter().enumerate().take(partition + 1) {
-        for row in 0..held.len() {
-            if !held.row_at(row)?.flags.is_range_tombstone() {
-                continue;
-            }
-            let end = ends.next().cloned().flatten();
-            if at == partition {
-                matched.push((row as u32, end));
-            }
-        }
-    }
-    Ok(matched)
 }
 
 /// Hand rows on across cursors in key order, a tie going to the earlier segment
@@ -887,34 +847,6 @@ fn belongs_here(driver: &IoDriver, file: FileId, segment: SegmentId) -> Result<b
         Ok(parsed) => Ok(parsed.segment == segment && parsed.version == FORMAT_VERSION),
         Err(_) => Ok(false),
     }
-}
-
-/// Take a sealed segment's records from its footer, ranges from the ends beside it
-///
-/// Sealing waits for every reservation and syncs, so what a footer lists is what
-/// landed and a batch frame has nothing left to decide. The one thing a footer
-/// cannot answer is a range tombstone's end, and those arrive in footer order.
-fn collect_partitions(
-    segment: SegmentId,
-    partitions: &[FooterPartition],
-    ends: &mut impl Iterator<Item = Option<KeyBytes>>,
-    resolver: &mut Resolver<'_>,
-) -> Result<()> {
-    for entry in partitions.iter().flat_map(|partition| partition.entries()) {
-        let entry = entry?;
-        let loc = Loc::new(segment, entry.offset, entry.len);
-        match entry.is_range_tombstone() {
-            true => resolver.range(&entry.key, ends.next().flatten(), entry.lsn, loc),
-            false => resolver.put(
-                entry.key.column,
-                entry.key.as_slice(),
-                loc,
-                entry.lsn,
-                entry.is_tombstone(),
-            ),
-        }
-    }
-    Ok(())
 }
 
 /// Tally one sealed segment's footer without installing any of its keys

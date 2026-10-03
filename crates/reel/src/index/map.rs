@@ -24,7 +24,7 @@ use crate::index::column::{ColumnIndex, KeyMove, Landed, PendingCover};
 use crate::index::counters::{Floors, SegmentBytes, SegmentStamp, SegmentTable};
 use crate::index::entry::Entry;
 use crate::index::page::KeyPage;
-use crate::index::fastforward::RecordSource;
+use crate::index::fastforward::{Lookup, RecordSource};
 use crate::index::paged::{Candidates, FooterSource, SealedRanges};
 use crate::index::playback::{self, merged_page, Paged, PlaybackCursor, Way};
 use crate::index::recovery::SealedSpan;
@@ -283,11 +283,33 @@ impl ReelIndex {
         let _ = self.footers.set(footers);
     }
 
-    /// Where FastForward columns read the record headers they confirm keys against
+    /// Where FastForward columns read the records their entries point at
     pub fn set_records(&self, records: Arc<dyn RecordSource>) {
         for index in &self.indexes {
-            index.attach_records(&records);
+            index.attach_records(&records, &self.segments);
         }
+    }
+
+    /// A key's newest payload in one read, when its column is FastForward and resident
+    pub fn fast_read(&self, key: &RecordKey) -> Result<Lookup> {
+        match (self.slot(key.column), self.residency.pages()) {
+            (Some(at), false) => self.indexes[at].fast_read(key),
+            (Some(_), true) | (None, true) | (None, false) => Ok(Lookup::Unsettled),
+        }
+    }
+
+    /// Settle up to `budget` versions FastForward columns put beside an older one
+    pub fn scrub_fast(&self, budget: usize) -> usize {
+        let mut settled = 0;
+        for index in &self.indexes {
+            settled += index.scrub_fast(budget - settled);
+        }
+        settled
+    }
+
+    /// Versions FastForward columns hold beside an older one for their cleaners
+    pub fn fast_beside(&self) -> u64 {
+        self.indexes.iter().map(ColumnIndex::fast_beside).sum()
     }
 
     /// Where a key's live record is, reading a footer if the column pages

@@ -10,6 +10,7 @@ use crate::error::{ReelError, Result};
 use crate::format::column::{Codec, ColumnId, KeyRef, RecordKey};
 use crate::format::loc::Loc;
 use crate::format::lsn::Lsn;
+use crate::index::fastforward::Lookup;
 use crate::index::page::KeyPage;
 use crate::index::playback::PlaybackCursor;
 use crate::reel::cue::CuePoint;
@@ -542,6 +543,11 @@ impl ReelStore {
     /// pointer unresolved, since evicting would delete a key from a volume the
     /// reader does not own.
     fn resolve_read(&self, key: &RecordKey) -> Result<Resolved> {
+        match self.index.fast_read(key)? {
+            Lookup::Found(payload) => return Ok(Resolved::Payload(payload)),
+            Lookup::Missing => return Ok(Resolved::Missing),
+            Lookup::Unsettled => {}
+        }
         let mut resolving = Resolving::new(self, key);
         for _ in 0..RESOLVE_RETRIES {
             let entry = match resolving.step(self, key)? {

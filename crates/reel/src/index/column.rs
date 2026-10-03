@@ -20,7 +20,7 @@ use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::index::counters::{Bookings, SegmentTable};
 use crate::index::entry::{span_of, Entry};
-use crate::index::fastforward::{FastColumn, RecordSource};
+use crate::index::fastforward::{FastColumn, Lookup, RecordSource};
 use crate::index::opentable::{overhead_per_key, OpenTable};
 use crate::index::page::KeyPage;
 use crate::index::paged::SealedRanges;
@@ -224,11 +224,35 @@ impl ColumnIndex {
         on_index!(self, index => index.key_width())
     }
 
-    /// Where a FastForward column reads the record headers its lookups confirm against
-    pub fn attach_records(&self, records: &Arc<dyn RecordSource>) {
+    /// Where a FastForward column reads records and books what its cleaner frees
+    pub fn attach_records(&self, records: &Arc<dyn RecordSource>, segments: &Arc<SegmentTable>) {
         if let ColumnIndex::Fast16(fast) = self {
-            fast.attach(Arc::clone(records));
+            fast.attach(Arc::clone(records), Arc::clone(segments));
         }
+    }
+
+    /// A key's newest payload in one read, on a FastForward column
+    pub fn fast_read(&self, key: &RecordKey) -> Result<Lookup> {
+        if let ColumnIndex::Fast16(fast) = self {
+            return fast.read(key);
+        }
+        Ok(Lookup::Unsettled)
+    }
+
+    /// Settle up to `budget` versions a FastForward column put beside an older one
+    pub fn scrub_fast(&self, budget: usize) -> usize {
+        if let ColumnIndex::Fast16(fast) = self {
+            return fast.scrub(budget);
+        }
+        0
+    }
+
+    /// Versions a FastForward column holds beside an older one for its cleaner
+    pub fn fast_beside(&self) -> u64 {
+        if let ColumnIndex::Fast16(fast) = self {
+            return fast.beside();
+        }
+        0
     }
 
     /// Leading key bytes that pick a shard, so keys apart in them share no lock

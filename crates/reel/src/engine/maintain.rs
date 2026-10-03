@@ -23,6 +23,9 @@ use super::{
 };
 use crate::sync::lock;
 
+/// Versions the FastForward cleaner settles on one maintenance tick, each one header read
+const FAST_SCRUB_BUDGET: usize = 1024;
+
 impl ReelStore {
     /// Tell the index about every segment that has sealed since it was last told
     ///
@@ -492,6 +495,7 @@ impl ReelStore {
         // can hold the tick long enough for a backlog of sealed keys to build.
         self.page_out_sealed()?;
         self.scrub_once()?;
+        self.index.scrub_fast(FAST_SCRUB_BUDGET);
         Ok(())
     }
 

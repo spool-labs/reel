@@ -38,7 +38,7 @@ use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::{Lsn, LsnCounter};
 use crate::format::record::HEADER_LEN;
 use crate::index::counters::{FilterProbes, SegmentTable};
-use crate::index::fastforward::{Head, RecordSource, WIDTH};
+use crate::index::fastforward::{FastRead, Head, HeadRead, RecordSource, WIDTH};
 use crate::index::paged::{FooterCache, FooterSource};
 use crate::index::recovery::{read_footer, ResumableTail};
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
@@ -78,30 +78,134 @@ const DIRECT_RECORD_FLOOR: u32 = 1024 * 1024;
 /// is the case it loses.
 const DIRECT_DEPTH_FLOOR: u64 = 2;
 
-/// The footers a paged index resolves its sealed keys through
+/// Where a FastForward column reads the records its entries point at
 impl RecordSource for ReelShared {
     fn head(&self, segment: SegmentId, offset: u32) -> Result<Option<Head>> {
         let Some(handle) = self.handle_for(segment)? else {
             return Ok(None);
         };
         let prefix = self.driver.pread(handle.file(), u64::from(offset), (HEADER_LEN + WIDTH) as u64)?;
-        let Some((found, lsn, len, flags)) = crate::format::record::head_fields(&prefix, WIDTH) else {
-            return Ok(None);
+        Ok(head_of(&prefix))
+    }
+
+    fn cached_head(&self, segment: SegmentId, offset: u32) -> Result<HeadRead> {
+        let Some(handle) = self.handle_for(segment)? else {
+            return Ok(HeadRead::Missing);
         };
-        if !flags.is_data() && !flags.is_tombstone() {
-            return Ok(None);
-        }
-        let mut key = [0u8; WIDTH];
-        key.copy_from_slice(found);
-        Ok(Some(Head {
-            key,
-            lsn,
-            len,
-            is_tombstone: flags.is_tombstone(),
-        }))
+        Ok(match self.driver.warm_only(handle.file(), u64::from(offset), HEADER_LEN + WIDTH) {
+            Some(prefix) => match head_of(&prefix) {
+                Some(head) => HeadRead::Found(head),
+                None => HeadRead::Missing,
+            },
+            None => HeadRead::Cold,
+        })
+    }
+
+    fn record(&self, key: &RecordKey, segment: SegmentId, offset: u32, bound: Option<u32>) -> Result<FastRead> {
+        let Some(handle) = self.handle_for(segment)? else {
+            return Ok(FastRead::Other);
+        };
+        let prefix = HEADER_LEN + WIDTH;
+        // A record too long for any length class reads its header first.
+        let Some(bound) = bound else {
+            return match self.head(segment, offset)? {
+                Some(head) if head.key.as_slice() != key.as_slice() => Ok(FastRead::Other),
+                Some(head) if head.is_tombstone => Ok(FastRead::Tombstone(head)),
+                Some(head) => self.whole_record(handle.file(), key, head, Loc::new(segment, offset, head.len)),
+                None => Ok(FastRead::Other),
+            };
+        };
+        let answer = self.driver.pread_split_reusing(
+            handle.file(),
+            u64::from(offset),
+            prefix,
+            bound as usize,
+            take_header(),
+            self.warm_first(),
+        );
+        let (bytes, mut body) = match answer {
+            Ok(read) => read,
+            Err((error, spare)) => {
+                recycle_header(spare);
+                return match is_missing(&error) {
+                    true => Ok(FastRead::Other),
+                    false => Err(error),
+                };
+            }
+        };
+        let head = head_of(&bytes);
+        let verdict = match head {
+            Some(head) if head.key.as_slice() != key.as_slice() => FastRead::Other,
+            Some(head) if head.is_tombstone => FastRead::Tombstone(head),
+            Some(head) if body.len() >= head.len as usize => {
+                body.truncate(head.len as usize);
+                let loc = Loc::new(segment, offset, head.len);
+                return Ok(fast_read_of(
+                    frame_to_read(bytes, body, key.as_ref(), head.lsn, loc, self.config.verify_reads),
+                    head,
+                ));
+            }
+            // The file ends inside the bound, so the record reads again at its own length.
+            Some(head) => {
+                recycle_header(bytes);
+                crate::reel::payload::give(body);
+                return self.whole_record(handle.file(), key, head, Loc::new(segment, offset, head.len));
+            }
+            None => FastRead::Other,
+        };
+        recycle_header(bytes);
+        crate::reel::payload::give(body);
+        Ok(verdict)
     }
 }
 
+impl ReelShared {
+    /// One record read at the length its header gave
+    fn whole_record(&self, file: FileId, key: &RecordKey, head: Head, loc: Loc) -> Result<FastRead> {
+        let prefix = HEADER_LEN + WIDTH;
+        let len = loc.len as usize;
+        let read = self.driver.pread_split_reusing(
+            file,
+            u64::from(loc.offset),
+            prefix,
+            len,
+            take_header(),
+            self.warm_first(),
+        );
+        Ok(match framed_or_nothing(read, prefix, len)? {
+            Some((bytes, body)) => fast_read_of(
+                frame_to_read(bytes, body, key.as_ref(), head.lsn, loc, self.config.verify_reads),
+                head,
+            ),
+            None => FastRead::Other,
+        })
+    }
+}
+
+/// A record's header and key, when they make a data record or tombstone of the FastForward width
+fn head_of(prefix: &[u8]) -> Option<Head> {
+    let (found, lsn, len, flags) = crate::format::record::head_fields(prefix, WIDTH)?;
+    if !flags.is_data() && !flags.is_tombstone() {
+        return None;
+    }
+    Some(Head {
+        key: found.try_into().ok()?,
+        lsn,
+        len,
+        is_tombstone: flags.is_tombstone(),
+    })
+}
+
+/// What a checked read of one FastForward candidate settles
+fn fast_read_of(read: RecordRead, head: Head) -> FastRead {
+    match read {
+        RecordRead::Found(value) => FastRead::Found(head, value),
+        RecordRead::Stale => FastRead::Other,
+        RecordRead::Gone | RecordRead::Corrupt | RecordRead::Coded => FastRead::Unsure,
+    }
+}
+
+/// The footers a paged index resolves its sealed keys through
 impl FooterSource for ReelShared {
     fn footer(&self, segment: SegmentId) -> Result<Option<Arc<SegmentFooter>>> {
         self.footer_of(segment)

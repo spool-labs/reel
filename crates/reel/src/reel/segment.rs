@@ -525,6 +525,16 @@ impl IoDriver {
         split_answer(completion)
     }
 
+    /// Read one range from resident pages only, or nothing when any of it is cold
+    pub fn warm_only(&self, file: FileId, offset: u64, len: usize) -> Option<Vec<u8>> {
+        let mut bytes = ReadBuf::new(len);
+        let mut nothing = ReadBuf::new(0);
+        match self.backend.warm_split(file, offset, &mut bytes, &mut nothing) {
+            true => Some(bytes.into_vec()),
+            false => None,
+        }
+    }
+
     /// Read one split range as a future rather than by parking the caller
     ///
     /// WarmFirst::Ask puts one non-blocking read ahead of the op, so a record the

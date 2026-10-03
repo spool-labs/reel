@@ -468,6 +468,7 @@ impl ReelStore {
         // a paged column resolves through. A resident one never asks.
         index.set_footers(Arc::clone(&shared) as Arc<dyn FooterSource>);
         index.set_records(Arc::clone(&shared) as Arc<dyn RecordSource>);
+        index.load_fast()?;
         // And the other direction: a seal writes down what its segment weighs, and
         // these are the counters that know.
         shared.set_segments(index.segments_handle());

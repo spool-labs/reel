@@ -250,11 +250,12 @@ fn a_paged_column_reads_from_its_footer() {
 // FastForward answers a paged column's sealed keys through overwrites, deletes and compaction
 #[test]
 fn fastforward_answers_sealed_keys() {
-    let (store, _sim) = sim_store(ReelConfig {
+    let paged = ReelConfig {
         index: IndexResidency::Paged,
         compact_mbps: CompactRate::Mbps(64),
         ..config(1, SyncPolicy::Never)
-    });
+    };
+    let (store, sim) = sim_store(paged.clone());
     let value = |byte: u8, version: u8| vec![byte.wrapping_add(version); 8 * 1024];
     let mut expected: Vec<Option<Vec<u8>>> = (0..200u8).map(|byte| Some(value(byte, 0))).collect();
     for byte in 0..200u8 {
@@ -264,14 +265,14 @@ fn fastforward_answers_sealed_keys() {
     assert!(store.page_out_sealed().expect("hand over") > 0);
     assert!(store.index.fast_held() > 0, "the handover filled FastForward");
 
-    let check = |expected: &[Option<Vec<u8>>], stage: &str| {
+    let check = |store: &ReelStore, expected: &[Option<Vec<u8>>], stage: &str| {
         for (byte, value) in expected.iter().enumerate() {
             let found = store.get(&record(7, byte as u8)).expect("read");
             let found = found.map(|found| found.to_vec());
             assert_eq!(&found, value, "key {byte} after {stage}");
         }
     };
-    check(&expected, "the handover");
+    check(&store, &expected, "the handover");
 
     for byte in (0..200u8).step_by(3) {
         store.put(&record(7, byte), &value(byte, 1)).expect("overwrite");
@@ -281,17 +282,26 @@ fn fastforward_answers_sealed_keys() {
         store.delete(&record(7, byte)).expect("delete");
         expected[byte as usize] = None;
     }
-    check(&expected, "overwrites and deletes");
+    check(&store, &expected, "overwrites and deletes");
     store.flush().expect("flush");
     store.page_out_sealed().expect("hand over");
     while store.index.scrub_fast(1024) > 0 {}
-    check(&expected, "the cleaner");
+    check(&store, &expected, "the cleaner");
 
     store.compact_once().expect("compact");
     store.flush().expect("flush");
     store.page_out_sealed().expect("hand over");
     while store.index.scrub_fast(1024) > 0 {}
-    check(&expected, "compaction");
+    check(&store, &expected, "compaction");
+
+    // The open loads FastForward from the footers, and every key answers as it did.
+    store.close().expect("close");
+    drop(store);
+    let restored = SimIo::from_image(sim.durable_image());
+    let reopened = ReelStore::open_with_io(PathBuf::from(ROOT), paged, COLUMNS, Arc::new(restored))
+        .expect("reopen");
+    assert!(reopened.index.fast_held() > 0, "the open loaded FastForward");
+    check(&reopened, &expected, "a reopen");
 }
 
 // a sealed segment's ceiling covers its tombstone rows and not only its records
@@ -954,17 +964,14 @@ fn a_fresh_key_skips_the_sealed_search() {
     store.close().expect("close");
     drop(store);
 
-    // The paged rebuild feeds the filter from the footer sweep, so the same
-    // pair of answers holds on the reopened volume.
+    // The paged open loads FastForward from the footers, so the same pair of
+    // answers holds on the reopened volume.
     let restored = SimIo::from_image(sim.durable_image());
     let reopened = ReelStore::open_with_io(PathBuf::from(ROOT), paged, COLUMNS, Arc::new(restored))
         .expect("reopen");
-    let before = reopened.index.sealed_skips();
+    let before = reopened.filter_probes();
     assert!(reopened.get(&record(9, 250)).expect("get").is_none());
-    assert!(
-        reopened.index.sealed_skips() > before,
-        "the rebuild fed no filter"
-    );
+    assert_eq!(reopened.filter_probes(), before, "the reopened fresh key searched segments");
     assert!(reopened.get(&sealed).expect("get").is_some());
 }
 

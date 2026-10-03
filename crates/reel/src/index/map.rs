@@ -149,6 +149,12 @@ const RELEASE_RUN: usize = 1024;
 /// front of a fan-out and no hit can stop the walk short of it.
 const NO_CEILING: Lsn = Lsn(u64::MAX);
 
+/// Parts a FastForward load cuts a column's key space into, by leading byte, one thread each
+const LOAD_PARTS: usize = 16;
+
+/// Keys one load cursor examines before it reopens where it stopped
+const LOAD_RUN: usize = 1 << 20;
+
 /// One range delete's cover as a batch hands it to the index
 ///
 /// The position is what keeps a batch's order: the key moves given before it go in
@@ -359,6 +365,66 @@ impl ReelIndex {
     /// Say every sealed key is in FastForward, so it may answer for them
     pub fn mark_fast_ready(&self) {
         self.fast_ready.store(true, Ordering::Release);
+    }
+
+    /// Fill FastForward with every sealed key's newest live version, then let it answer
+    ///
+    /// The paged walk's own merge picks each key's newest footer row, and a key the map
+    /// holds stays with the map. Each column's key space is cut by leading byte, one
+    /// thread a part.
+    pub fn load_fast(&self) -> Result<()> {
+        if !self.residency.pages() || self.fast_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let Some(footers) = self.footers.get() else {
+            return Ok(());
+        };
+        for (at, column) in self.columns.iter().enumerate() {
+            if self.sealed[at].is_empty() {
+                continue;
+            }
+            let paged = self.paged_at(at, column.id, footers);
+            let paged = &paged;
+            std::thread::scope(|scope| -> Result<()> {
+                let workers: Vec<_> = (0..LOAD_PARTS)
+                    .map(|part| scope.spawn(move || self.load_part(at, paged, part)))
+                    .collect();
+                for worker in workers {
+                    worker
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+                }
+                Ok(())
+            })?;
+        }
+        self.mark_fast_ready();
+        Ok(())
+    }
+
+    /// Load one leading-byte part of a column's sealed keys into FastForward
+    fn load_part(&self, at: usize, paged: &Paged<'_>, part: usize) -> Result<()> {
+        let width = 256 / LOAD_PARTS;
+        let mut from = vec![(part * width) as u8];
+        let until = (part + 1 < LOAD_PARTS).then(|| vec![((part + 1) * width) as u8]);
+        let mut found = Vec::new();
+        loop {
+            let mut playback = PlaybackCursor::new(paged.column, Way::Up, Bound::Included(&from))?;
+            let run = playback::release_rows(
+                paged,
+                &mut playback,
+                until.as_deref(),
+                NO_CEILING,
+                LOAD_RUN,
+                &mut found,
+            )?;
+            for (key, loc) in found.drain(..) {
+                self.fast[at].insert(key.as_slice(), loc);
+            }
+            match run.resume {
+                Some(resume) => from = resume,
+                None => return Ok(()),
+            }
+        }
     }
 
     /// Where a key's live record is, reading a footer if the column pages

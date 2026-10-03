@@ -584,8 +584,7 @@ fn feed_held(
     columns.sort_unstable();
     columns.dedup();
     for column in columns {
-        // A walk's rows sit in arrival order, so a walked partition is put in key
-        // order once and every part of the feed reads that.
+        // A walked partition is put in key order once, and every part reads that.
         let orders: Vec<Option<Vec<u32>>> =
             held.iter().map(|rows| key_order(rows, column)).collect();
         let cursors: Vec<Cursor<'_>> = held
@@ -610,8 +609,6 @@ fn feed_held(
 }
 
 /// A walked partition's rows in key order, equal keys keeping arrival order
-///
-/// Arrival order is the order the resolver would meet them in walking the tail.
 fn key_order(rows: &Held, column: ColumnId) -> Option<Vec<u32>> {
     if rows.is_sorted {
         return None;
@@ -626,10 +623,7 @@ fn key_order(rows: &Held, column: ColumnId) -> Option<Vec<u32>> {
     Some(order)
 }
 
-/// Feed one column's held rows, split across threads once the window is big enough
-///
-/// Each part holds whole shards, so the parts apply without meeting on a shard
-/// lock, and every version of a key lands in one part, where the tie rule holds.
+/// Feed one column's held rows, split across threads by whole shards once the window is big enough
 fn feed_column(
     column: ColumnId,
     mut cursors: Vec<Cursor<'_>>,
@@ -707,20 +701,19 @@ fn feed_part(
 /// A part's key bounds, the low one inside it and the high one past it, open where absent
 type Part = (Option<Vec<u8>>, Option<Vec<u8>>);
 
-/// Cut a column's keys into a part per thread at even steps of their leading byte
-///
-/// Shards follow the leading bytes, so a cut there never splits a shard's keys across
-/// two parts. Keys bunched in a few shards leave some parts light, which costs time
-/// and nothing else, since one shard is one lock either way.
+/// Values a leading key byte can take
+const LEADING_BYTES: usize = 1 << 8;
+
+/// Cut a column's keys into a part per thread at even steps of the leading byte, which keeps shards whole
 fn split_by_shard(shard_bytes: u8, threads: usize) -> Vec<Part> {
-    let parts = threads.min(256);
+    let parts = threads.min(LEADING_BYTES);
     if shard_bytes == 0 || parts < 2 {
         return Vec::new();
     }
     let mut split = Vec::with_capacity(parts);
     let mut low = None;
     for at in 1..parts {
-        let cut = vec![(256 * at / parts) as u8];
+        let cut = vec![(LEADING_BYTES * at / parts) as u8];
         split.push((low, Some(cut.clone())));
         low = Some(cut);
     }
@@ -826,11 +819,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Hand rows on in key order across cursors, or a cursor at a time where the map holds
-/// no order, a tie going to the earlier segment either way
-///
-/// Only a tree fills faster in key order. An open table settles each key on its own,
-/// and a cursor at a time still meets a key's versions in segment order.
+/// Hand rows on in key order for a tree, or a cursor at a time for an open table, a tie going to the earlier segment
 fn take_rows(
     cursors: &mut Vec<Cursor<'_>>,
     ordered: bool,
@@ -1601,10 +1590,10 @@ struct KeyQueue {
 
 impl KeyQueue {
     /// Queue one record or point tombstone, applying the batch ahead of it once full
-    fn push<B: Bookings>(
+    fn push<Book: Bookings>(
         &mut self,
         index: &ReelIndex,
-        segments: &B,
+        segments: &Book,
         key: &[u8],
         loc: Loc,
         lsn: Lsn,
@@ -1624,7 +1613,7 @@ impl KeyQueue {
     }
 
     /// Apply what is queued in order, a shard lock a run of keys
-    fn flush_into<B: Bookings>(&mut self, index: &ReelIndex, segments: &B) {
+    fn flush_into<Book: Bookings>(&mut self, index: &ReelIndex, segments: &Book) {
         if self.rows.is_empty() {
             return;
         }
@@ -1858,8 +1847,7 @@ mod tests {
         assert_eq!(bytes.live, KEYS as u64 * span);
     }
 
-    // a window big enough to split across threads keeps every key's newest version and
-    // books every shadowed record, as one thread would
+    // a window split across threads keeps every key's newest version and books what one thread would
     #[test]
     fn a_split_feed_keeps_newest_versions() {
         const KEYS: u32 = 12_000;

@@ -147,10 +147,10 @@ pub struct KeyMove<'batch> {
 
 impl ColumnIndex {
     /// Apply a batch's moves to this column, sharing a shard's lock across keys
-    pub fn apply_moves<B: Bookings>(
+    pub fn apply_moves<Book: Bookings>(
         &self,
         moves: &[KeyMove<'_>],
-        segments: &B,
+        segments: &Book,
         landed: &mut Vec<Landed>,
     ) {
         on_index!(self, index => index.apply_moves(moves, segments, landed))
@@ -867,10 +867,10 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// Applied strictly in the order given, so what a reader can see is what it saw
     /// before. Consecutive keys landing in the same shard hold it together; keys
     /// that scatter across shards cost one lock each.
-    pub fn apply_moves<B: Bookings>(
+    pub fn apply_moves<Book: Bookings>(
         &self,
         moves: &[KeyMove<'_>],
-        segments: &B,
+        segments: &Book,
         landed: &mut Vec<Landed>,
     ) {
         let mut at = 0;
@@ -901,13 +901,13 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     ///
     /// The tombstone's own span is booked from in here rather than before the lock,
     /// which adds no lock order the crate did not already have.
-    fn apply_held<B: Bookings>(
+    fn apply_held<Book: Bookings>(
         &self,
         state: &mut ShardState<K, S>,
         shard: usize,
         key: K,
         moving: &KeyMove<'_>,
-        segments: &B,
+        segments: &Book,
     ) -> Landed {
         match moving.is_delete {
             true => {
@@ -933,13 +933,13 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// Split out so a batch takes a shard once for the keys landing in it rather
     /// than once per key. The publish barrier serialises this work, so an extra
     /// lock take is time every other writer spends queued behind it.
-    fn insert_held<B: Bookings>(
+    fn insert_held<Book: Bookings>(
         &self,
         state: &mut ShardState<K, S>,
         at: usize,
         key: K,
         entry: Entry,
-        segments: &B,
+        segments: &Book,
     ) -> Landed {
         // The record's own hold keeps its segment from retiring until this publish
         // lands, so the stamp can be issued live here.
@@ -1018,14 +1018,14 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// The tombstone itself, with the key parsed and its shard already held
     ///
     /// The caller has already booked the tombstone record's own span.
-    fn remove_held<B: Bookings>(
+    fn remove_held<Book: Bookings>(
         &self,
         state: &mut ShardState<K, S>,
         at: usize,
         key: K,
         lsn: Lsn,
         tombstone: Loc,
-        segments: &B,
+        segments: &Book,
     ) -> Landed {
         let was_empty = state.map.vacant();
         let existing = state.map.at(key.as_slice()).copied();
@@ -2151,12 +2151,12 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     }
 
     /// Take one entry out of a shard, moving its bytes to dead and its totals down
-    fn drop_entry<B: Bookings>(
+    fn drop_entry<Book: Bookings>(
         &self,
         state: &mut ShardState<K, S>,
         key: &K,
         existing: Entry,
-        segments: &B,
+        segments: &Book,
     ) {
         segments.shadow(existing.loc.segment, existing.span(key.width()));
         let len = u64::from(existing.loc.len);

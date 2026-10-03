@@ -848,11 +848,7 @@ impl SegmentTable {
     }
 }
 
-/// Where an index write books what it did to its segments' bytes
-///
-/// The table itself on a live write. A rebuild thread sums into a tally instead, since
-/// threads applying rows at once would all meet on the table's lock and on the few
-/// rows the window's segments stand on.
+/// Where an index write books its segments' bytes, the table itself or one rebuild thread's tally
 pub trait Bookings {
     /// The incarnation an entry pointing into a segment is stamped with
     fn live_incarnation(&self, segment: SegmentId) -> SegmentIncarnation;
@@ -896,8 +892,6 @@ impl Bookings for SegmentTable {
 pub struct Tally<'table> {
     table: &'table SegmentTable,
     rows: std::cell::RefCell<Vec<TallyRow>>,
-
-    /// The row asked about last, since a run of rows shares one segment
     last: std::cell::Cell<usize>,
 }
 
@@ -944,10 +938,7 @@ impl<'table> Tally<'table> {
         change(&mut rows[at])
     }
 
-    /// Hand every sum to the table, the live bytes ahead of the shadowed ones
-    ///
-    /// Each shadowed record was booked live first, by this tally or an earlier one,
-    /// so with every live sum in place no count dips below what it would have.
+    /// Hand every sum to the table, live bytes first so no count dips below zero
     pub fn settle(self) {
         let rows = self.rows.into_inner();
         for row in &rows {

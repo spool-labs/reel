@@ -52,6 +52,9 @@ const READ_AHEAD: usize = 4;
 /// Records one column batch takes into the index at a time
 const BATCH: usize = 4096;
 
+/// Segments a resident rebuild holds before it feeds their rows in key order
+const FEED_WINDOW: usize = MAX_READERS * READ_AHEAD;
+
 /// What a reel rebuild hands back beside the index it filled
 pub struct RebuiltReel {
     /// Highest sequence number seen, for reinitializing the counter
@@ -186,9 +189,16 @@ pub fn rebuild_from_persisted(
         }
         jobs.push((segment, path, len));
     }
+    let mut held: Vec<Held> = Vec::new();
     read_segments(driver, &jobs, |at, parts| {
         let (segment, path, len) = &jobs[at];
-        match absorb_segment(*segment, parts, pages, &mut resolver)? {
+        // A resident volume feeds a window of segments in key order, so each shard's
+        // tree fills a leaf at a time.
+        let loaded = match pages {
+            true => absorb_segment(*segment, parts, pages, &mut resolver)?,
+            false => hold_segment(*segment, parts, &mut held),
+        };
+        match loaded {
             Loaded::Sealed => {
                 consumed.insert(*segment, *len);
                 sealed_files.push((*segment, path.clone(), *len));
@@ -210,8 +220,12 @@ pub fn rebuild_from_persisted(
             }
             Loaded::Foreign => quarantined.push(path.clone()),
         }
+        if held.len() >= FEED_WINDOW {
+            feed_held(&mut held, &mut resolver, &mut resumable)?;
+        }
         Ok(())
     })?;
+    feed_held(&mut held, &mut resolver, &mut resumable)?;
     // A file that goes bad partway through its rows starts the rebuild over without it.
     if let Some(reader) = persisted {
         if let Err(error) = adopt(driver, reader, &standing, &mut resolver) {
@@ -490,6 +504,216 @@ fn absorb_segment(
             collect_partitions(segment, &tail.footer.partitions, &mut ends, resolver)?;
             Ok(Loaded::Walked(tail.next_offset, tail.is_at_fill, tail.footer))
         }
+    }
+}
+
+/// One segment's rows a resident rebuild holds until its window is fed
+struct Held {
+    segment: SegmentId,
+    footer: SegmentFooter,
+
+    /// Each range tombstone's end, partition by partition in row order
+    ends: Vec<Option<KeyBytes>>,
+
+    /// Whether the rows sit in key order, which a sealed footer's do and a walk's do not
+    is_sorted: bool,
+}
+
+/// Keep a resident segment's rows for the key-ordered feed
+///
+/// A walked tail's footer stays here until the feed and then goes to the tail resuming
+/// it, so what the walk hands back for now is an empty one.
+fn hold_segment(segment: SegmentId, parts: SegmentParts, held: &mut Vec<Held>) -> Loaded {
+    match parts {
+        SegmentParts::Foreign => Loaded::Foreign,
+        SegmentParts::Sealed(footer, ends) => {
+            held.push(Held { segment, footer, ends, is_sorted: true });
+            Loaded::Sealed
+        }
+        SegmentParts::Walked(tail) => {
+            held.push(Held { segment, footer: tail.footer, ends: tail.ends, is_sorted: false });
+            Loaded::Walked(tail.next_offset, tail.is_at_fill, SegmentFooter::empty())
+        }
+    }
+}
+
+/// Feed every held row to the resolver in key order, then hand each walked footer on
+///
+/// A key's versions keep segment order, so a tie still falls to the earlier source and
+/// every key settles to the version it did. Ascending keys append, so each shard's tree
+/// fills one leaf at a time and the open owes it no repack.
+fn feed_held(
+    held: &mut Vec<Held>,
+    resolver: &mut Resolver<'_>,
+    resumable: &mut [ResumableTail],
+) -> Result<()> {
+    let mut columns: Vec<ColumnId> = held
+        .iter()
+        .flat_map(|rows| rows.footer.partitions.iter().map(|partition| partition.column))
+        .collect();
+    columns.sort_unstable();
+    columns.dedup();
+    for column in columns {
+        let mut cursors: Vec<Cursor<'_>> = held
+            .iter()
+            .enumerate()
+            .filter_map(|(source, rows)| Cursor::open(source, rows, column))
+            .collect::<Result<_>>()?;
+        merge_cursors(&mut cursors, |cursor| cursor.feed(resolver))?;
+    }
+    for rows in held.drain(..) {
+        if let Some(tail) = resumable.iter_mut().find(|tail| tail.segment == rows.segment) {
+            tail.entries = rows.footer;
+        }
+    }
+    Ok(())
+}
+
+/// One held partition walked in key order
+struct Cursor<'a> {
+    /// Position among the held segments, which breaks a tie between equal keys
+    source: usize,
+    segment: SegmentId,
+    partition: &'a FooterPartition,
+
+    /// Row numbers in key order, for rows that sit in arrival order
+    order: Option<Vec<u32>>,
+    at: usize,
+
+    /// Range tombstone ends by row number
+    ends: Vec<(u32, Option<KeyBytes>)>,
+}
+
+impl<'a> Cursor<'a> {
+    fn open(source: usize, rows: &'a Held, column: ColumnId) -> Option<Result<Cursor<'a>>> {
+        let at = rows
+            .footer
+            .partitions
+            .iter()
+            .position(|partition| partition.column == column)?;
+        let partition = &rows.footer.partitions[at];
+        Some(ends_of(rows, at).map(|ends| Cursor {
+            source,
+            segment: rows.segment,
+            partition,
+            order: (!rows.is_sorted).then(|| {
+                // Equal keys keep arrival order, so the resolver meets them as it would
+                // walking the tail.
+                let mut order: Vec<u32> = (0..partition.len() as u32).collect();
+                order.sort_unstable_by(|one, two| {
+                    let ones = partition.key_at(*one as usize);
+                    let twos = partition.key_at(*two as usize);
+                    ones.cmp(&twos).then(one.cmp(two))
+                });
+                order
+            }),
+            at: 0,
+            ends,
+        }))
+    }
+
+    fn is_done(&self) -> bool {
+        self.at >= self.partition.len()
+    }
+
+    fn row(&self) -> usize {
+        match &self.order {
+            Some(order) => order[self.at] as usize,
+            None => self.at,
+        }
+    }
+
+    fn key(&self) -> Option<&'a [u8]> {
+        self.partition.key_at(self.row())
+    }
+
+    fn feed(&self, resolver: &mut Resolver<'_>) -> Result<()> {
+        let row = self.row();
+        let found = self.partition.row_at(row)?;
+        let key = self.key().unwrap_or_default();
+        let loc = Loc::new(self.segment, found.offset, found.len);
+        match found.flags.is_range_tombstone() {
+            true => {
+                let end = self
+                    .ends
+                    .binary_search_by_key(&(row as u32), |(at, _)| *at)
+                    .ok()
+                    .and_then(|at| self.ends[at].1.clone());
+                let start = RecordKey::from_bytes(self.partition.column, key)?;
+                resolver.range(&start, end, found.lsn, loc);
+            }
+            false => resolver.put(
+                self.partition.column,
+                key,
+                loc,
+                found.lsn,
+                found.flags.is_tombstone(),
+            ),
+        }
+        Ok(())
+    }
+}
+
+/// The ends of one partition's range tombstones, matched to their rows
+fn ends_of(rows: &Held, partition: usize) -> Result<Vec<(u32, Option<KeyBytes>)>> {
+    if rows.ends.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ends = rows.ends.iter();
+    let mut matched = Vec::new();
+    for (at, held) in rows.footer.partitions.iter().enumerate().take(partition + 1) {
+        for row in 0..held.len() {
+            if !held.row_at(row)?.flags.is_range_tombstone() {
+                continue;
+            }
+            let end = ends.next().cloned().flatten();
+            if at == partition {
+                matched.push((row as u32, end));
+            }
+        }
+    }
+    Ok(matched)
+}
+
+/// Hand rows on across cursors in key order, a tie going to the earlier segment
+fn merge_cursors(
+    cursors: &mut Vec<Cursor<'_>>,
+    mut take: impl FnMut(&Cursor<'_>) -> Result<()>,
+) -> Result<()> {
+    cursors.retain(|cursor| !cursor.is_done());
+    // A binary heap of cursor positions with the least key on top.
+    let mut heap: Vec<usize> = (0..cursors.len()).collect();
+    for at in (0..heap.len() / 2).rev() {
+        sift_down(&mut heap, at, cursors);
+    }
+    while let Some(&top) = heap.first() {
+        take(&cursors[top])?;
+        cursors[top].at += 1;
+        if cursors[top].is_done() {
+            heap.swap_remove(0);
+        }
+        sift_down(&mut heap, 0, cursors);
+    }
+    Ok(())
+}
+
+fn sift_down(heap: &mut [usize], mut at: usize, cursors: &[Cursor<'_>]) {
+    let before = |one: usize, two: usize| match cursors[one].key().cmp(&cursors[two].key()) {
+        std::cmp::Ordering::Equal => cursors[one].source < cursors[two].source,
+        order => order == std::cmp::Ordering::Less,
+    };
+    loop {
+        let mut least = at;
+        for child in [2 * at + 1, 2 * at + 2] {
+            if child < heap.len() && before(heap[child], heap[least]) {
+                least = child;
+            }
+        }
+        if least == at {
+            return;
+        }
+        heap.swap(at, least);
+        at = least;
     }
 }
 

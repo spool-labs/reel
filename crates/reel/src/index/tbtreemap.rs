@@ -1631,8 +1631,11 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
     }
 
     /// Whether every leaf is as full as a sorted build would leave it
+    ///
+    /// Ascending inserts leave each leaf one short, since an append splits off the
+    /// last key, and that counts: a repack would win back one slot in a node.
     pub fn is_packed(&self) -> bool {
-        self.leaves.len() <= self.len.div_ceil(B).max(1)
+        self.leaves.len() <= self.len.div_ceil(B - 1).max(1)
     }
 
     /// Whether packing would give back room worth the pass

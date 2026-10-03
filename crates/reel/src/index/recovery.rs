@@ -15,7 +15,7 @@ use std::sync::{Condvar, Mutex};
 
 use crate::config::ThreadBudget;
 use crate::error::Result;
-use crate::format::column::{ColumnId, KeyBytes, RecordKey};
+use crate::format::column::{ColumnId, KeyBytes, MapShape, RecordKey};
 use crate::format::footer::{
     FooterEntry, FooterPartition, FooterTally, SegmentFooter, FIXED_TAIL_LEN,
 };
@@ -636,14 +636,16 @@ fn feed_column(
     resolver: &mut Resolver<'_>,
 ) -> Result<()> {
     let rows: usize = cursors.iter().map(Cursor::left).sum();
-    let parts = match resolver.index.column(column) {
+    let target = resolver.index.column(column);
+    let ordered = target.is_none_or(|index| index.map_shape() != MapShape::Open);
+    let parts = match target {
         Some(index) if rows >= SPLIT_FEED_ROWS => {
             split_by_shard(&cursors, index.shard_bytes(), ThreadBudget::Auto.resolve())
         }
         _ => Vec::new(),
     };
     if parts.len() < 2 {
-        return merge_cursors(&mut cursors, |cursor| cursor.feed(resolver));
+        return take_rows(&mut cursors, ordered, |cursor| cursor.feed(resolver));
     }
     // Rows queued ahead of this window land before it, as they would on one thread.
     resolver.flush();
@@ -654,7 +656,8 @@ fn feed_column(
             .iter()
             .map(|(low, high)| {
                 scope.spawn(move || {
-                    feed_part(index, column, cursors, low.as_deref(), high.as_deref())
+                    let bounds = (low.as_deref(), high.as_deref());
+                    feed_part(index, column, ordered, cursors, bounds)
                 })
             })
             .collect();
@@ -671,13 +674,13 @@ fn feed_column(
     Ok(())
 }
 
-/// Merge and apply the rows of one part, handing back the newest sequence number put
+/// Apply the rows of one part, handing back the newest sequence number put
 fn feed_part(
     index: &ReelIndex,
     column: ColumnId,
+    ordered: bool,
     cursors: &[Cursor<'_>],
-    low: Option<&[u8]>,
-    high: Option<&[u8]>,
+    (low, high): (Option<&[u8]>, Option<&[u8]>),
 ) -> Result<Lsn> {
     let mut mine: Vec<Cursor<'_>> = cursors
         .iter()
@@ -690,7 +693,7 @@ fn feed_part(
     // Booked here and handed over once, so the parts never meet on a segment's row.
     let tally = Tally::new(index.segments());
     let mut highest = Lsn::NONE;
-    merge_cursors(&mut mine, |cursor| {
+    take_rows(&mut mine, ordered, |cursor| {
         cursor.put_with(|key, loc, lsn, is_delete| {
             highest = highest.max(lsn);
             queue.push(index, &tally, key, loc, lsn, is_delete);
@@ -854,6 +857,28 @@ impl<'a> Cursor<'a> {
             resolver.put(column, key, loc, lsn, is_delete)
         })
     }
+}
+
+/// Hand rows on in key order across cursors, or a cursor at a time where the map holds
+/// no order, a tie going to the earlier segment either way
+///
+/// Only a tree fills faster in key order. An open table settles each key on its own,
+/// and a cursor at a time still meets a key's versions in segment order.
+fn take_rows(
+    cursors: &mut Vec<Cursor<'_>>,
+    ordered: bool,
+    mut take: impl FnMut(&Cursor<'_>) -> Result<()>,
+) -> Result<()> {
+    if ordered {
+        return merge_cursors(cursors, take);
+    }
+    for cursor in cursors.iter_mut() {
+        while !cursor.is_done() {
+            take(cursor)?;
+            cursor.at += 1;
+        }
+    }
+    Ok(())
 }
 
 /// Hand rows on across cursors in key order, a tie going to the earlier segment
@@ -1899,24 +1924,34 @@ mod tests {
         }
         appender.seal().expect("seal");
 
-        let rebuilt = rebuild(&sim);
+        // A tree takes the rows merged in key order, an open table a segment at a time.
+        const OPEN: ColumnSet = &[ColumnSpec {
+            map_shape: MapShape::Open,
+            ..COLUMNS[0]
+        }];
+        for (columns, shapes) in [(COLUMNS, ShardShapes::Tree), (OPEN, ShardShapes::Declared)] {
+            let driver = IoDriver::new(Arc::new(sim.clone()));
+            let index = ReelIndex::new(columns, IndexResidency::Resident, shapes).expect("index");
+            let roots = [PathBuf::from(REEL_DIR)];
+            let rebuilt = rebuild_reel(&driver, &roots, &[false], false, &index).expect("rebuild");
 
-        let rows = rebuilt.rows(RECORDS);
-        assert_eq!(rows.len(), newest.len());
-        for (key, entry) in &rows {
-            let at = u32::from_be_bytes(key.as_slice()[4..8].try_into().expect("number"));
-            assert_eq!(Some(&entry.lsn), newest.get(&at), "key {at} kept its newest");
+            let rows = index.column(RECORDS).map(|column| column.held()).unwrap_or_default();
+            assert_eq!(rows.len(), newest.len());
+            for (key, entry) in &rows {
+                let at = u32::from_be_bytes(key.as_slice()[4..8].try_into().expect("number"));
+                assert_eq!(Some(&entry.lsn), newest.get(&at), "key {at} kept its newest");
+            }
+            let (mut live, mut dead) = (0, 0);
+            for number in 1..=rebuilt.highest_segment.as_u32() {
+                let bytes = index.segment_bytes(SegmentId(number));
+                live += bytes.live;
+                dead += bytes.dead;
+            }
+            let (record, tombstone) = (span_of(34, 16), span_of(34, 0));
+            let deletes = deleted.len() as u64;
+            assert_eq!(dead, (u64::from(KEYS) + deletes) * record);
+            assert_eq!(live, newest.len() as u64 * record + deletes * tombstone);
         }
-        let (mut live, mut dead) = (0, 0);
-        for number in 1..=rebuilt.highest_segment.as_u32() {
-            let bytes = rebuilt.index.segment_bytes(SegmentId(number));
-            live += bytes.live;
-            dead += bytes.dead;
-        }
-        let (record, tombstone) = (span_of(34, 16), span_of(34, 0));
-        let deletes = deleted.len() as u64;
-        assert_eq!(dead, (u64::from(KEYS) + deletes) * record);
-        assert_eq!(live, newest.len() as u64 * record + deletes * tombstone);
     }
 
     // a sealed segment rebuilds its live records from the footer alone

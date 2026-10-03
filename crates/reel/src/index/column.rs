@@ -219,6 +219,11 @@ impl ColumnIndex {
         on_index!(self, index => index.key_width())
     }
 
+    /// Leading key bytes that pick a shard, so keys apart in them share no lock
+    pub fn shard_bytes(&self) -> u8 {
+        on_index!(self, index => index.shard_bytes)
+    }
+
     /// Bytes a resident key costs this column beyond itself and its entry
     ///
     /// The shape decides it, and the two shapes are four times apart, so one number

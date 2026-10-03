@@ -55,6 +55,9 @@ const BATCH: usize = 4096;
 /// Segments a resident rebuild holds before it feeds their rows in key order
 const FEED_WINDOW: usize = MAX_READERS * READ_AHEAD;
 
+/// Rows a column's window must hold before its feed splits across threads
+const SPLIT_FEED_ROWS: usize = 4 * BATCH;
+
 /// What a reel rebuild hands back beside the index it filled
 pub struct RebuiltReel {
     /// Highest sequence number seen, for reinitializing the counter
@@ -581,12 +584,19 @@ fn feed_held(
     columns.sort_unstable();
     columns.dedup();
     for column in columns {
-        let mut cursors: Vec<Cursor<'_>> = held
+        // A walk's rows sit in arrival order, so a walked partition is put in key
+        // order once and every part of the feed reads that.
+        let orders: Vec<Option<Vec<u32>>> =
+            held.iter().map(|rows| key_order(rows, column)).collect();
+        let cursors: Vec<Cursor<'_>> = held
             .iter()
+            .zip(&orders)
             .enumerate()
-            .filter_map(|(source, rows)| Cursor::open(source, rows, column))
+            .filter_map(|(source, (rows, order))| {
+                Cursor::open(source, rows, column, order.as_deref())
+            })
             .collect();
-        merge_cursors(&mut cursors, |cursor| cursor.feed(resolver))?;
+        feed_column(column, cursors, resolver)?;
     }
     for rows in held.drain(..) {
         if let Some(tail) = resumable
@@ -599,7 +609,152 @@ fn feed_held(
     Ok(())
 }
 
-/// One held partition walked in key order
+/// A walked partition's rows in key order, equal keys keeping arrival order
+///
+/// Arrival order is the order the resolver would meet them in walking the tail.
+fn key_order(rows: &Held, column: ColumnId) -> Option<Vec<u32>> {
+    if rows.is_sorted {
+        return None;
+    }
+    let partition = rows.footer.partition(column)?;
+    let mut order: Vec<u32> = (0..partition.len() as u32).collect();
+    order.sort_unstable_by(|one, two| {
+        let ones = partition.key_at(*one as usize);
+        let twos = partition.key_at(*two as usize);
+        ones.cmp(&twos).then(one.cmp(two))
+    });
+    Some(order)
+}
+
+/// Feed one column's held rows, split across threads once the window is big enough
+///
+/// Each part holds whole shards, so the parts apply without meeting on a shard
+/// lock, and every version of a key lands in one part, where the tie rule holds.
+fn feed_column(
+    column: ColumnId,
+    mut cursors: Vec<Cursor<'_>>,
+    resolver: &mut Resolver<'_>,
+) -> Result<()> {
+    let rows: usize = cursors.iter().map(Cursor::left).sum();
+    let parts = match resolver.index.column(column) {
+        Some(index) if rows >= SPLIT_FEED_ROWS => {
+            split_by_shard(&cursors, index.shard_bytes(), ThreadBudget::Auto.resolve())
+        }
+        _ => Vec::new(),
+    };
+    if parts.len() < 2 {
+        return merge_cursors(&mut cursors, |cursor| cursor.feed(resolver));
+    }
+    // Rows queued ahead of this window land before it, as they would on one thread.
+    resolver.flush();
+    let index = resolver.index;
+    let cursors = &cursors;
+    let highest = std::thread::scope(|scope| -> Result<Lsn> {
+        let workers: Vec<_> = parts
+            .iter()
+            .map(|(low, high)| {
+                scope.spawn(move || {
+                    feed_part(index, column, cursors, low.as_deref(), high.as_deref())
+                })
+            })
+            .collect();
+        let mut highest = Lsn::NONE;
+        for worker in workers {
+            let found = worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+            highest = highest.max(found);
+        }
+        Ok(highest)
+    })?;
+    resolver.see(highest);
+    Ok(())
+}
+
+/// Merge and apply the rows of one part, handing back the newest sequence number put
+fn feed_part(
+    index: &ReelIndex,
+    column: ColumnId,
+    cursors: &[Cursor<'_>],
+    low: Option<&[u8]>,
+    high: Option<&[u8]>,
+) -> Result<Lsn> {
+    let mut mine: Vec<Cursor<'_>> = cursors
+        .iter()
+        .map(|cursor| cursor.within(low, high))
+        .collect();
+    let mut queue = KeyQueue {
+        column,
+        ..KeyQueue::default()
+    };
+    let mut highest = Lsn::NONE;
+    merge_cursors(&mut mine, |cursor| {
+        cursor.put_with(|key, loc, lsn, is_delete| {
+            highest = highest.max(lsn);
+            queue.push(index, key, loc, lsn, is_delete);
+        })
+    })?;
+    queue.flush(index);
+    Ok(highest)
+}
+
+/// Sample keys each cursor offers a part, for placing the cuts between parts
+const SAMPLES_PER_PART: usize = 8;
+
+/// A part's key bounds, the low one inside it and the high one past it, open where absent
+type Part = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// Cut a window's keys into parts of about equal rows, each holding whole shards
+///
+/// Every cursor offers evenly spaced keys, each standing for the rows up to the next
+/// one, and a cut falls where the running count crosses a part's share. A cut is
+/// trimmed to its shard's leading bytes, so no shard's keys straddle two parts.
+fn split_by_shard(
+    cursors: &[Cursor<'_>],
+    shard_bytes: u8,
+    threads: usize,
+) -> Vec<Part> {
+    let width = shard_bytes as usize;
+    if width == 0 || threads < 2 {
+        return Vec::new();
+    }
+    let mut samples: Vec<(&[u8], usize)> = Vec::new();
+    let mut total = 0;
+    for cursor in cursors {
+        let step = cursor.left().div_ceil(threads * SAMPLES_PER_PART).max(1);
+        let mut at = cursor.at;
+        while at < cursor.end {
+            samples.push((cursor.key_of(at), step.min(cursor.end - at)));
+            at += step;
+        }
+        total += cursor.left();
+    }
+    samples.sort_unstable_by(|one, two| one.0.cmp(two.0));
+    let share = total.div_ceil(threads);
+    let mut cuts: Vec<Vec<u8>> = Vec::new();
+    let mut running = 0;
+    for (key, weight) in samples {
+        if running >= share * (cuts.len() + 1) {
+            let mut cut = key[..key.len().min(width)].to_vec();
+            cut.resize(width, 0);
+            if cut.iter().any(|byte| *byte != 0) && cuts.last().is_none_or(|last| *last < cut) {
+                cuts.push(cut);
+            }
+        }
+        running += weight;
+    }
+    let mut parts = Vec::with_capacity(cuts.len() + 1);
+    let mut low = None;
+    for cut in cuts {
+        parts.push((low, Some(cut.clone())));
+        low = Some(cut);
+    }
+    parts.push((low, None));
+    parts
+}
+
+/// One held partition walked in key order, over a span of its places
+#[derive(Clone, Copy)]
 struct Cursor<'a> {
     /// Position among the held segments, which breaks a tie between equal keys
     source: usize,
@@ -607,62 +762,94 @@ struct Cursor<'a> {
     partition: &'a FooterPartition,
 
     /// Row numbers in key order, for rows that sit in arrival order
-    order: Option<Vec<u32>>,
+    order: Option<&'a [u32]>,
     at: usize,
+
+    /// One past the last place this cursor walks
+    end: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn open(source: usize, rows: &'a Held, column: ColumnId) -> Option<Cursor<'a>> {
+    fn open(
+        source: usize,
+        rows: &'a Held,
+        column: ColumnId,
+        order: Option<&'a [u32]>,
+    ) -> Option<Cursor<'a>> {
         let partition = rows.footer.partition(column)?;
         Some(Cursor {
             source,
             segment: rows.segment,
             partition,
-            order: (!rows.is_sorted).then(|| {
-                // Equal keys keep arrival order, so the resolver meets them as it would
-                // walking the tail.
-                let mut order: Vec<u32> = (0..partition.len() as u32).collect();
-                order.sort_unstable_by(|one, two| {
-                    let ones = partition.key_at(*one as usize);
-                    let twos = partition.key_at(*two as usize);
-                    ones.cmp(&twos).then(one.cmp(two))
-                });
-                order
-            }),
+            order,
             at: 0,
+            end: partition.len(),
         })
     }
 
+    /// The same places, from the first key at or past `low` to the last one below `high`
+    fn within(&self, low: Option<&[u8]>, high: Option<&[u8]>) -> Cursor<'a> {
+        let at = low.map_or(self.at, |low| self.seek(low));
+        let end = high.map_or(self.end, |high| self.seek(high)).max(at);
+        Cursor { at, end, ..*self }
+    }
+
+    /// The first place whose key is not below a bound
+    fn seek(&self, bound: &[u8]) -> usize {
+        let (mut low, mut high) = (self.at, self.end);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            match self.key_of(middle) < bound {
+                true => low = middle + 1,
+                false => high = middle,
+            }
+        }
+        low
+    }
+
     fn is_done(&self) -> bool {
-        self.at >= self.partition.len()
+        self.at >= self.end
+    }
+
+    fn left(&self) -> usize {
+        self.end.saturating_sub(self.at)
+    }
+
+    fn row_of(&self, at: usize) -> usize {
+        match self.order {
+            Some(order) => order[at] as usize,
+            None => at,
+        }
     }
 
     fn row(&self) -> usize {
-        match &self.order {
-            Some(order) => order[self.at] as usize,
-            None => self.at,
-        }
+        self.row_of(self.at)
     }
 
     fn key(&self) -> Option<&'a [u8]> {
         self.partition.key_at(self.row())
     }
 
-    /// Put one row, a range having stood when its segment was held
-    fn feed(&self, resolver: &mut Resolver<'_>) -> Result<()> {
+    fn key_of(&self, at: usize) -> &'a [u8] {
+        self.partition.key_at(self.row_of(at)).unwrap_or_default()
+    }
+
+    /// Hand the row at this place to `put`, a range having stood when its segment was held
+    fn put_with(&self, put: impl FnOnce(&'a [u8], Loc, Lsn, bool)) -> Result<()> {
         let found = self.partition.row_at(self.row())?;
         if !found.flags.is_range_tombstone() {
             let key = self.key().unwrap_or_default();
             let loc = Loc::new(self.segment, found.offset, found.len);
-            resolver.put(
-                self.partition.column,
-                key,
-                loc,
-                found.lsn,
-                found.flags.is_tombstone(),
-            );
+            put(key, loc, found.lsn, found.flags.is_tombstone());
         }
         Ok(())
+    }
+
+    fn feed(&self, resolver: &mut Resolver<'_>) -> Result<()> {
+        let column = self.partition.column;
+        self.put_with(|key, loc, lsn, is_delete| {
+            resolver.put(column, key, loc, lsn, is_delete)
+        })
     }
 }
 
@@ -1347,13 +1534,11 @@ impl<'a> Resolver<'a> {
     /// Queue one record or point tombstone for its column's map
     fn put(&mut self, column: ColumnId, key: &[u8], loc: Loc, lsn: Lsn, is_delete: bool) {
         self.see(lsn);
-        if column != self.queue.column || self.queue.rows.len() == BATCH {
+        if column != self.queue.column {
             self.flush();
             self.queue.column = column;
         }
-        self.queue.keys.extend_from_slice(key);
-        let end = self.queue.keys.len();
-        self.queue.rows.push((end, loc, lsn, is_delete));
+        self.queue.push(self.index, key, loc, lsn, is_delete);
     }
 
     /// Stand one range as a cover, after everything queued ahead of it
@@ -1419,6 +1604,16 @@ struct KeyQueue {
 }
 
 impl KeyQueue {
+    /// Queue one record or point tombstone, applying the batch ahead of it once full
+    fn push(&mut self, index: &ReelIndex, key: &[u8], loc: Loc, lsn: Lsn, is_delete: bool) {
+        if self.rows.len() == BATCH {
+            self.flush(index);
+        }
+        self.keys.extend_from_slice(key);
+        let end = self.keys.len();
+        self.rows.push((end, loc, lsn, is_delete));
+    }
+
     /// Apply what is queued in order, a shard lock a run of keys
     fn flush(&mut self, index: &ReelIndex) {
         if self.rows.is_empty() {
@@ -1652,6 +1847,60 @@ mod tests {
         let bytes = rebuilt.index.segment_bytes(SegmentId(1));
         assert_eq!(bytes.dead, ((VERSIONS - 1) * KEYS as usize) as u64 * span);
         assert_eq!(bytes.live, KEYS as u64 * span);
+    }
+
+    // a window big enough to split across threads keeps every key's newest version and
+    // books every shadowed record, as one thread would
+    #[test]
+    fn a_split_feed_keeps_newest_versions() {
+        const KEYS: u32 = 12_000;
+        const DELETE_EVERY: usize = 7;
+        let sim = SimIo::new(FaultPlan::new(1));
+        let shared = shared(config(SyncPolicy::Never), &sim);
+        let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
+        // The leading bytes are a hash of the number, so the keys cover every shard.
+        let spread = |at: u32| {
+            let mut bytes = [0u8; 34];
+            bytes[..4].copy_from_slice(&at.wrapping_mul(0x9E37_79B9).to_be_bytes());
+            bytes[4..8].copy_from_slice(&at.to_be_bytes());
+            RecordKey::from_bytes(RECORDS, &bytes).expect("key")
+        };
+        let mut newest = HashMap::new();
+        for version in 0..2u8 {
+            for at in 0..KEYS {
+                let put = appender
+                    .append_data(spread(at), vec![version; 16], 0, Commit::PerRecord)
+                    .expect("put");
+                newest.insert(at, put.lsn);
+            }
+        }
+        let deleted: Vec<u32> = (0..KEYS).step_by(DELETE_EVERY).collect();
+        for at in &deleted {
+            appender
+                .append_tombstone(spread(*at), Commit::PerRecord)
+                .expect("delete");
+            newest.remove(at);
+        }
+        appender.seal().expect("seal");
+
+        let rebuilt = rebuild(&sim);
+
+        let rows = rebuilt.rows(RECORDS);
+        assert_eq!(rows.len(), newest.len());
+        for (key, entry) in &rows {
+            let at = u32::from_be_bytes(key.as_slice()[4..8].try_into().expect("number"));
+            assert_eq!(Some(&entry.lsn), newest.get(&at), "key {at} kept its newest");
+        }
+        let (mut live, mut dead) = (0, 0);
+        for number in 1..=rebuilt.highest_segment.as_u32() {
+            let bytes = rebuilt.index.segment_bytes(SegmentId(number));
+            live += bytes.live;
+            dead += bytes.dead;
+        }
+        let (record, tombstone) = (span_of(34, 16), span_of(34, 0));
+        let deletes = deleted.len() as u64;
+        assert_eq!(dead, (u64::from(KEYS) + deletes) * record);
+        assert_eq!(live, newest.len() as u64 * record + deletes * tombstone);
     }
 
     // a sealed segment rebuilds its live records from the footer alone

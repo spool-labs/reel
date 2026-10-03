@@ -896,6 +896,9 @@ impl Bookings for SegmentTable {
 pub struct Tally<'table> {
     table: &'table SegmentTable,
     rows: std::cell::RefCell<Vec<TallyRow>>,
+
+    /// The row asked about last, since a run of rows shares one segment
+    last: std::cell::Cell<usize>,
 }
 
 /// What a tally has summed for one segment
@@ -912,13 +915,19 @@ impl<'table> Tally<'table> {
         Tally {
             table,
             rows: std::cell::RefCell::new(Vec::new()),
+            last: std::cell::Cell::new(0),
         }
     }
 
-    /// Change one segment's sums, the newest row first since runs of rows share one
+    /// Change one segment's sums, trying the row asked about last before any search
     fn with<T>(&self, segment: SegmentId, change: impl FnOnce(&mut TallyRow) -> T) -> T {
         let mut rows = self.rows.borrow_mut();
-        let at = match rows.iter().rposition(|row| row.segment == segment) {
+        let last = self.last.get();
+        let found = match rows.get(last) {
+            Some(row) if row.segment == segment => Some(last),
+            _ => rows.iter().rposition(|row| row.segment == segment),
+        };
+        let at = match found {
             Some(at) => at,
             None => {
                 rows.push(TallyRow {
@@ -931,6 +940,7 @@ impl<'table> Tally<'table> {
                 rows.len() - 1
             }
         };
+        self.last.set(at);
         change(&mut rows[at])
     }
 

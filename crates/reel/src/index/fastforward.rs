@@ -504,13 +504,14 @@ impl FastColumn {
                 table.set(*place, 0);
             }
             // Booked before the entry shows, so no lookup sees it under a stale ceiling.
-            let landed = match Self::newest(&same) {
+            return match Self::newest(&same) {
                 Some(newest) if newest.head.lsn >= lsn => {
                     if !is_delete {
                         books.mark_dead(loc.segment, lsn, span_of(WIDTH as u16, loc.len));
                     }
-                    return Landed::Newer;
+                    Landed::Newer
                 }
+                // A cold candidate here went to the cleaner when the entry beside it went in.
                 Some(newest) => {
                     for older in &same {
                         self.book_gone(older.place.entry, &older.head, books);
@@ -528,12 +529,11 @@ impl FastColumn {
                     if !table.place(hash, entry) {
                         unimplemented!("growing a full FastForward table")
                     }
+                    drop(table);
+                    self.queue_beside(shard, hash, &unsure, entry, head);
                     Landed::Nothing
                 }
             };
-            drop(table);
-            self.queue_beside(shard, hash, &unsure, entry, head);
-            return landed;
         }
     }
 

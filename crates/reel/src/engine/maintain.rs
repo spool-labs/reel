@@ -24,7 +24,7 @@ use super::{
 use crate::sync::lock;
 
 /// Versions the FastForward cleaner settles on one maintenance tick, each one header read
-const FAST_SCRUB_BUDGET: usize = 1024;
+const FAST_SCRUB_BUDGET: usize = 4096;
 
 impl ReelStore {
     /// Tell the index about every segment that has sealed since it was last told

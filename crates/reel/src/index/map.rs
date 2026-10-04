@@ -916,9 +916,19 @@ impl ReelIndex {
         };
         if self.fast_serves() {
             let mut settled = false;
-            for loc in self.fast[at].displace(key, lsn)? {
+            let displaced = self.fast[at].displace(key, lsn)?;
+            for loc in displaced.booked {
                 let counted = self.counted(loc.segment);
                 settled |= self.indexes[at].settle_paged(key.as_slice(), loc, counted, &self.segments);
+            }
+            for (loc, least) in displaced.classed {
+                let counted = self.counted(loc.segment);
+                settled |= self.indexes[at].settle_paged_least(key.as_slice(), loc, least, counted, &self.segments);
+            }
+            for (loc, least) in displaced.rebooked {
+                if self.counted(loc.segment) {
+                    self.indexes[at].rebook_paged(key.as_slice(), least, loc.len);
+                }
             }
             return Ok(settled);
         }
@@ -1682,12 +1692,40 @@ impl ReelIndex {
 
     /// Forget a segment's counters once its file has been unlinked
     pub fn forget_segment(&self, segment: SegmentId) {
+        self.rebook_retiring(segment);
         self.segments.forget(segment);
         self.retired.fetch_add(1, Ordering::AcqRel);
         // A retired segment's footer goes with its file, so a paged index that
         // kept searching it would read a file that is no longer there.
         for sealed in &self.sealed {
             sealed.forget(segment);
+        }
+    }
+
+    /// Book the true length of every overwrite a retiring segment holds that was booked from its class
+    ///
+    /// Done before the segment's own locks are taken, from the footer the pass already has. A footer
+    /// that is gone, as on a follower whose writer unlinked the file, leaves those bookings in the slack.
+    fn rebook_retiring(&self, segment: SegmentId) {
+        if !self.counted(segment) || self.fast_displaced() == 0 {
+            return;
+        }
+        let Some(footers) = self.footers.get() else {
+            return;
+        };
+        let Ok(Some(footer)) = footers.footer(segment) else {
+            return;
+        };
+        for (at, fast) in self.fast.iter().enumerate() {
+            let Some(partition) = footer.partition(self.columns[at].id) else {
+                continue;
+            };
+            let Ok(rebooked) = fast.settle_displaced_in(segment, partition) else {
+                continue;
+            };
+            for row in rebooked {
+                self.indexes[at].rebook_paged(row.key.as_slice(), row.booked, row.actual);
+            }
         }
     }
 

@@ -273,6 +273,23 @@ impl ColumnIndex {
         on_index!(self, index => index.settle_paged(key, loc, counted, segments))
     }
 
+    /// Book a footer-held record gone with no read, its segment at `loc` and its live bytes at `least`
+    pub fn settle_paged_least(
+        &self,
+        key: &[u8],
+        loc: Loc,
+        least: u32,
+        counted: bool,
+        segments: &SegmentTable,
+    ) -> bool {
+        on_index!(self, index => index.settle_paged_least(key, loc, least, counted, segments))
+    }
+
+    /// Swap the length a class booked for a record's true length, once it is known
+    pub fn rebook_paged(&self, key: &[u8], booked: u32, actual: u32) {
+        on_index!(self, index => index.rebook_paged(key, booked, actual))
+    }
+
     /// Take a paged key out with a grave of its own, for a record that will not read
     pub fn evict_paged(
         &self,
@@ -1074,6 +1091,49 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         let at = self.shard_of(&key);
         let mut state = write(&self.shards[at]);
         settle(&mut state, loc, segments, key.width(), counted)
+    }
+
+    /// Book a footer-held record gone with no read, its segment at `loc` and its live bytes at `least`
+    ///
+    /// The least length of the class never exceeds the record's own, so the live bytes never
+    /// floor at zero and a later rebook lands exactly.
+    pub fn settle_paged_least(
+        &self,
+        key: &[u8],
+        loc: Loc,
+        least: u32,
+        counted: bool,
+        segments: &SegmentTable,
+    ) -> bool {
+        let Some(key) = K::from_slice(key) else {
+            return false;
+        };
+        let at = self.shard_of(&key);
+        let mut state = write(&self.shards[at]);
+        if counted {
+            if state.paged == 0 {
+                return false;
+            }
+            state.paged -= 1;
+            state.bytes = state.bytes.saturating_sub(u64::from(least));
+        }
+        segments.shadow(loc.segment, span_of(key.width(), loc.len));
+        true
+    }
+
+    /// Swap the length a class booked for a record's true length, once it is known
+    ///
+    /// The booking took `booked` off the live bytes where the record held `actual`.
+    pub fn rebook_paged(&self, key: &[u8], booked: u32, actual: u32) {
+        let Some(key) = K::from_slice(key) else {
+            return;
+        };
+        let at = self.shard_of(&key);
+        let mut state = write(&self.shards[at]);
+        state.bytes = state
+            .bytes
+            .saturating_add(u64::from(booked))
+            .saturating_sub(u64::from(actual));
     }
 
     /// Take a paged key out with a grave of its own, for a record that will not read

@@ -358,6 +358,37 @@ fn fastforward_reads_take_one_read_a_key() {
     assert_eq!(reads(&|| drop(block_on(store.get_many_wait(&handed)).expect("many"))), 10, "an awaited batch");
 }
 
+// compaction gives each overwrite booked from its length class its true length back as the segment retires
+#[test]
+fn compaction_rebooks_class_bookings_at_their_true_length() {
+    let (store, _sim) = sim_store(ReelConfig {
+        index: IndexResidency::Paged,
+        compact_mbps: CompactRate::Mbps(64),
+        ..config(1, SyncPolicy::Never)
+    });
+    let payload = vec![0xa5u8; 8_000];
+    for byte in 0..200u8 {
+        store.put(&record(7, byte), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+    let exact = store.totals().bytes;
+
+    for byte in 0..200u8 {
+        store.put(&record(7, byte), &payload).expect("overwrite");
+    }
+    store.flush().expect("flush");
+    assert!(store.fast_slack() > 0, "no overwrite was booked from its class");
+    assert_ne!(store.totals().bytes, exact, "the class middle happened to equal the payload");
+
+    for _ in 0..8 {
+        store.compact_once().expect("compact");
+        store.maintain_once().expect("maintain");
+    }
+    assert_eq!(store.fast_slack(), 0, "a class booking outlived its segment");
+    assert_eq!(store.totals().bytes, exact, "the live bytes kept a class booking's error");
+}
+
 // a retire leaves FastForward's entries in segments an open rebuilt, which wear no incarnation yet
 #[test]
 fn fastforward_keeps_rebuilt_segments_through_a_retire() {

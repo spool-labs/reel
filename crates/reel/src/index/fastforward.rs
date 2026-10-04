@@ -119,6 +119,31 @@ pub enum FastRead {
     Unsure,
 }
 
+/// What an overwrite settled: records it booked dead, and class bookings it corrected
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Displaced {
+    /// Records taken out, each at its true length
+    pub booked: Vec<Loc>,
+
+    /// Records marked displaced, each at the middle of its class beside the least length its class covers
+    pub classed: Vec<(Loc, u32)>,
+
+    /// Records an earlier overwrite booked from their class, each at its true length beside the least length booked
+    pub rebooked: Vec<(Loc, u32)>,
+}
+
+/// A class booking a retiring segment's footer corrects
+#[derive(Debug, PartialEq, Eq)]
+pub struct Rebooked {
+    pub key: RecordKey,
+
+    /// The least length the class booked
+    pub booked: u32,
+
+    /// The length the record held
+    pub actual: u32,
+}
+
 /// One record a lookup reads: where it sits, and how much of its payload to ask for
 #[derive(Clone, Copy, Debug)]
 pub struct Candidate {
@@ -296,24 +321,22 @@ impl Slot {
         self.meta & DISPLACED != 0
     }
 
-    /// The most a length in the slot's class can sit from its middle
-    fn half_width(&self) -> u32 {
-        let class = (self.meta >> CLASS_SHIFT) & CLASS_MASK;
-        let below = match class {
+    /// The least length the slot's class covers, which live bytes book with no read so they never go below the truth
+    fn least(&self) -> u32 {
+        match (self.meta >> CLASS_SHIFT) & CLASS_MASK {
             0 => 0,
-            class => bound_of(class - 1),
-        };
-        (bound_of(class) - below).div_ceil(2)
+            class => bound_of(class - 1) + 1,
+        }
     }
 
-    /// The middle of the slot's length class, which a version booked with no read counts as
+    /// How far the slot's true length can sit above the least of its class
+    fn width(&self) -> u32 {
+        bound_of((self.meta >> CLASS_SHIFT) & CLASS_MASK) - self.least()
+    }
+
+    /// The middle of the slot's length class, which a segment's dead bytes book with no read
     fn middle(&self) -> u32 {
-        let class = (self.meta >> CLASS_SHIFT) & CLASS_MASK;
-        let below = match class {
-            0 => 0,
-            class => bound_of(class - 1),
-        };
-        below + (bound_of(class) - below) / 2
+        self.least() + self.width() / 2
     }
 
     fn in_second(self, is_second: bool) -> Slot {
@@ -654,7 +677,7 @@ pub struct FastColumn {
     stale: Mutex<VecDeque<Stale>>,
     beside: AtomicU64,
 
-    /// Bytes the class bookings may sit from the truth, half a class each at most
+    /// Bytes the class bookings may sit below the truth, a class width each at most
     slack: AtomicU64,
 
     /// Rows an open took before it could read a header, settled once it can
@@ -1003,15 +1026,15 @@ impl FastColumn {
     /// segment may hold a newer version reads its header and goes, booked exactly, and so
     /// does every entry of a key holding `SETTLE_AT` versions or more. What comes back is
     /// every record booked, for the caller to settle.
-    pub fn displace(&self, key: &RecordKey, newer: Lsn) -> Result<Vec<Loc>> {
+    pub fn displace(&self, key: &RecordKey, newer: Lsn) -> Result<Displaced> {
         let (Some(records), Some(segments)) = (self.records.get(), self.segments.get()) else {
-            return Ok(Vec::new());
+            return Ok(Displaced::default());
         };
         let hash = hash_of(key.as_slice());
         let shard = shard_of(hash);
         let seen = self.shards[shard].read().matches(hash);
         if seen.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Displaced::default());
         }
         let must_read = seen.len() >= SETTLE_AT;
         let (mut unread, mut older, mut gone) = (Vec::new(), Vec::new(), Vec::new());
@@ -1036,24 +1059,71 @@ impl FastColumn {
                 HeadRead::Missing => gone.push(slot),
             }
         }
-        let mut booked = Vec::with_capacity(unread.len() + older.len());
+        let mut settled = Displaced::default();
         let mut table = self.shards[shard].write();
         for slot in &gone {
             table.take(hash, slot);
         }
-        // A displaced entry was booked when it was marked, so taking it books nothing more.
         for (slot, len) in &older {
-            if table.take_slot(hash, slot).is_some_and(|took| !took.is_displaced()) {
-                booked.push(Loc::new(slot.segment(), slot.offset, *len));
+            let loc = Loc::new(slot.segment(), slot.offset, *len);
+            match table.take_slot(hash, slot) {
+                // Marked earlier and booked from its class, so the header just read corrects that booking.
+                Some(took) if took.is_displaced() => {
+                    settled.rebooked.push((loc, took.least()));
+                    self.unslack(&took);
+                }
+                Some(_) => settled.booked.push(loc),
+                None => {}
             }
         }
         for slot in &unread {
             if table.mark_displaced(hash, slot) {
-                booked.push(Loc::new(slot.segment(), slot.offset, slot.middle()));
-                self.slack.fetch_add(u64::from(slot.half_width()), Ordering::Relaxed);
+                settled.classed.push((Loc::new(slot.segment(), slot.offset, slot.middle()), slot.least()));
+                self.slack.fetch_add(u64::from(slot.width()), Ordering::Relaxed);
             }
         }
-        Ok(booked)
+        Ok(settled)
+    }
+
+    /// Drop the slack one class booking stood for, once its true length is known
+    fn unslack(&self, slot: &Slot) {
+        let width = u64::from(slot.width());
+        let _ = self.slack.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |slack| Some(slack.saturating_sub(width)));
+    }
+
+    /// Take out every displaced entry pointing into a retiring segment, with the true length its footer row gives
+    ///
+    /// A row reads its shard under the read lock first, so a segment with nothing displaced in it costs no write lock.
+    pub fn settle_displaced_in(&self, segment: SegmentId, partition: &FooterPartition) -> Result<Vec<Rebooked>> {
+        let mut rebooked = Vec::new();
+        if self.displaced() == 0 {
+            return Ok(rebooked);
+        }
+        for at in 0..partition.len() {
+            let entry = partition.entry_at(at)?;
+            if entry.is_tombstone() || entry.is_range_tombstone() {
+                continue;
+            }
+            let hash = hash_of(entry.key.as_slice());
+            let shard = &self.shards[shard_of(hash)];
+            if shard.displaced.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            let loc = Loc::new(segment, entry.offset, entry.len);
+            let held = shard.read().matches(hash).iter().find(|place| place.slot.at(loc) && place.slot.is_displaced()).map(|place| place.slot);
+            let Some(slot) = held else {
+                continue;
+            };
+            if shard.write().take_slot(hash, &slot).is_some() {
+                self.unslack(&slot);
+                rebooked.push(Rebooked {
+                    key: entry.key,
+                    booked: slot.least(),
+                    actual: entry.len,
+                });
+            }
+        }
+        Ok(rebooked)
     }
 
     fn queue(&self, stale: Stale) {
@@ -1460,10 +1530,11 @@ mod tests {
         segments.note_max(SegmentId(1), Lsn(5));
         column.insert(key(1).as_slice(), old);
         // 200 bytes sit in the class from 193 to 256
-        assert_eq!(column.displace(&key(1), Lsn(10)).expect("displace"), vec![Loc::new(SegmentId(1), 0, 224)]);
+        // segments book the class middle and live bytes the least it covers
+        assert_eq!(column.displace(&key(1), Lsn(10)).expect("displace").classed, vec![(Loc::new(SegmentId(1), 0, 224), 193)]);
         assert_eq!(records.heads.load(Ordering::Relaxed), 0);
         assert_eq!((column.held(), column.displaced()), (1, 1));
-        assert!(column.displace(&key(1), Lsn(11)).expect("displace").is_empty());
+        assert_eq!(column.displace(&key(1), Lsn(11)).expect("displace"), Displaced::default());
         assert_eq!(version(&column, 1), Some(1));
         column.forget_retired(|segment| segment != SegmentId(1));
         assert_eq!((column.held(), column.displaced()), (0, 0));
@@ -1473,7 +1544,7 @@ mod tests {
         records.write(newer, key(3).as_slice(), Lsn(30));
         segments.note_max(SegmentId(2), Lsn(30));
         column.insert(key(3).as_slice(), newer);
-        assert!(column.displace(&key(3), Lsn(12)).expect("displace").is_empty());
+        assert!(column.displace(&key(3), Lsn(12)).expect("displace").booked.is_empty());
         assert_eq!(version(&column, 3), Some(30));
 
         // a key holding several versions reads them all and each goes, booked exactly
@@ -1483,10 +1554,29 @@ mod tests {
             column.insert(key(4).as_slice(), *loc);
         }
         segments.note_max(SegmentId(3), Lsn(45));
-        let mut booked = column.displace(&key(4), Lsn(50)).expect("displace");
+        let mut booked = column.displace(&key(4), Lsn(50)).expect("displace").booked;
         booked.sort_by_key(|loc| loc.offset);
         assert_eq!(booked, held);
         assert_eq!(version(&column, 4), None);
+
+        // a header read takes back a class booking, at the record's own length
+        let first = Loc::new(SegmentId(4), 0, 200);
+        records.write(first, key(5).as_slice(), Lsn(60));
+        segments.note_max(SegmentId(4), Lsn(61));
+        column.insert(key(5).as_slice(), first);
+        assert_eq!(column.displace(&key(5), Lsn(70)).expect("displace").classed, vec![(Loc::new(SegmentId(4), 0, 224), 193)]);
+        let slack = column.slack();
+        for (at, lsn) in [(64, 71), (128, 72)] {
+            let loc = Loc::new(SegmentId(5), at, 40);
+            records.write(loc, key(5).as_slice(), Lsn(lsn));
+            column.insert(key(5).as_slice(), loc);
+        }
+        segments.note_max(SegmentId(5), Lsn(72));
+        let settled = column.displace(&key(5), Lsn(80)).expect("displace");
+        assert_eq!(settled.rebooked, vec![(first, 193)]);
+        assert_eq!(settled.booked.len(), 2);
+        assert!(column.slack() < slack, "the corrected booking still counted in the slack");
+        assert_eq!(column.displaced(), 0);
     }
 
     #[test]

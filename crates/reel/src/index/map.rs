@@ -382,9 +382,6 @@ impl ReelIndex {
         let mut sealed: Vec<SegmentId> = self.sealed.iter().flat_map(SealedRanges::segments).collect();
         sealed.sort_unstable();
         sealed.dedup();
-        for fast in &self.fast {
-            fast.begin_load();
-        }
         let next = AtomicUsize::new(0);
         std::thread::scope(|scope| -> Result<()> {
             let workers: Vec<_> = (0..LOAD_THREADS)
@@ -428,7 +425,7 @@ impl ReelIndex {
                     || index.covered_by_swept(key, entry.lsn);
                 if !is_answered {
                     let loc = Loc::new(segment, entry.offset, entry.len);
-                    self.fast[at].load(key, loc, entry.lsn, entry.is_tombstone());
+                    self.fast[at].load(&entry.key, loc, entry.lsn, entry.is_tombstone())?;
                 }
             }
         }

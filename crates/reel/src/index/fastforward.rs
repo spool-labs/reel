@@ -160,17 +160,8 @@ fn bound_of(class: u32) -> u32 {
 
 /// A key's 64 bit hash, mixed so structured keys spread like random ones
 fn hash_of(key: &[u8]) -> u64 {
-    hash_seeded(key, 0)
-}
-
-/// A second hash of a key, which a load keeps beside a slot so two keys sharing its bits stay apart
-fn check_of(key: &[u8]) -> u32 {
-    (hash_seeded(key, 1) >> 32) as u32
-}
-
-fn hash_seeded(key: &[u8], seed: u64) -> u64 {
     const ODD: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut state = 0xCBF2_9CE4_8422_2325 ^ key.len() as u64 ^ seed.wrapping_mul(ODD);
+    let mut state = 0xCBF2_9CE4_8422_2325 ^ key.len() as u64;
     let mut chunks = key.chunks_exact(8);
     for chunk in &mut chunks {
         let mut word = [0u8; 8];
@@ -316,20 +307,10 @@ impl std::ops::Deref for Places {
     }
 }
 
-/// What a load keeps beside one slot: the version it holds and the key's second hash
-#[derive(Clone, Copy, Default)]
-struct Carry {
-    lsn: u64,
-    check: u32,
-}
-
 struct Table {
     buckets: Vec<Bucket>,
     held: usize,
     seed: u64,
-
-    /// One carry per slot while a load runs, and nothing otherwise
-    carries: Vec<Carry>,
 }
 
 impl Table {
@@ -338,26 +319,6 @@ impl Table {
             buckets: vec![Bucket::default(); count.max(2)],
             held: 0,
             seed: count as u64,
-            carries: Vec::new(),
-        }
-    }
-
-    fn is_loading(&self) -> bool {
-        !self.carries.is_empty()
-    }
-
-    fn carry_at(&self, bucket: usize, way: usize) -> Carry {
-        match self.is_loading() {
-            true => self.carries[bucket * WAYS + way],
-            false => Carry::default(),
-        }
-    }
-
-    /// Write a slot and, while loading, what it carries
-    fn put(&mut self, bucket: usize, way: usize, slot: Slot, carry: Carry) {
-        self.buckets[bucket].slots[way] = slot;
-        if self.is_loading() {
-            self.carries[bucket * WAYS + way] = carry;
         }
     }
 
@@ -411,56 +372,43 @@ impl Table {
     /// Put a slot in either of its key's buckets, moving others along when both are full
     ///
     /// A failed placement hands back the slot left homeless, which may be another key's.
-    fn place(&mut self, slot: Slot, carry: Carry) -> std::result::Result<(), (Slot, Carry)> {
+    fn place(&mut self, slot: Slot) -> std::result::Result<(), Slot> {
         let home = self.home(slot.mid);
         let second = (home + self.step(slot.tag())) % self.buckets.len();
         for (bucket, is_second) in [(home, false), (second, true)] {
             if let Some(way) = self.free_way(bucket) {
-                self.put(bucket, way, slot.in_second(is_second), carry);
+                self.buckets[bucket].slots[way] = slot.in_second(is_second);
                 self.held += 1;
                 return Ok(());
             }
         }
-        let (mut bucket, mut moving, mut carried) = (home, slot.in_second(false), carry);
+        let (mut bucket, mut moving) = (home, slot.in_second(false));
         for _ in 0..MAX_KICKS {
             self.seed = mix(self.seed);
             let way = (self.seed % WAYS as u64) as usize;
-            let (evicted, evicted_carry) = (self.buckets[bucket].slots[way], self.carry_at(bucket, way));
-            self.put(bucket, way, moving, carried);
+            let evicted = std::mem::replace(&mut self.buckets[bucket].slots[way], moving);
             bucket = self.other(bucket, &evicted);
             moving = evicted.in_second(!evicted.is_second());
-            carried = evicted_carry;
             if let Some(free) = self.free_way(bucket) {
-                self.put(bucket, free, moving, carried);
+                self.buckets[bucket].slots[free] = moving;
                 self.held += 1;
                 return Ok(());
             }
         }
-        Err((moving, carried))
+        Err(moving)
     }
 
     fn is_full(&self) -> bool {
         self.held as f64 >= (self.buckets.len() * WAYS) as f64 * LOAD
     }
 
-    /// A table this one's slots fit into at the next size, carries and all
+    /// A table this one's slots fit into at the next size
     fn grown(&self) -> Table {
         let mut count = ((self.buckets.len() as f64) * GROWTH).ceil() as usize;
         loop {
             let mut table = Table::with_buckets(count);
-            if self.is_loading() {
-                table.carries = vec![Carry::default(); count.max(2) * WAYS];
-            }
-            let mut fits = true;
-            'slots: for (bucket, held) in self.buckets.iter().enumerate() {
-                for (way, slot) in held.slots.iter().enumerate() {
-                    if !slot.is_empty() && table.place(*slot, self.carry_at(bucket, way)).is_err() {
-                        fits = false;
-                        break 'slots;
-                    }
-                }
-            }
-            if fits {
+            let slots = self.buckets.iter().flat_map(|bucket| bucket.slots.iter());
+            if slots.filter(|slot| !slot.is_empty()).all(|slot| table.place(*slot).is_ok()) {
                 return table;
             }
             count = ((count as f64) * GROWTH).ceil() as usize;
@@ -468,12 +416,12 @@ impl Table {
     }
 
     /// Put a slot in, growing the table first when it is full or the pair has no room
-    fn insert(&mut self, slot: Slot, carry: Carry) {
+    fn insert(&mut self, slot: Slot) {
         if self.is_full() {
             *self = self.grown();
         }
-        let mut homeless = (slot, carry);
-        while let Err(left) = self.place(homeless.0, homeless.1) {
+        let mut homeless = slot;
+        while let Err(left) = self.place(homeless) {
             *self = self.grown();
             homeless = left;
         }
@@ -484,7 +432,7 @@ impl Table {
         let found = self.matches(hash);
         match found.iter().find(|place| place.slot.same_place(slot)) {
             Some(place) => {
-                self.put(place.bucket, place.way, Slot::default(), Carry::default());
+                self.buckets[place.bucket].slots[place.way] = Slot::default();
                 self.held -= 1;
                 true
             }
@@ -565,50 +513,50 @@ impl FastColumn {
         if table.matches(hash).iter().any(|place| place.slot.same_place(&slot)) {
             return;
         }
-        table.insert(slot, Carry::default());
-    }
-
-    /// Get ready to load sealed rows, keeping a version and a check beside each slot
-    pub fn begin_load(&self) {
-        for shard in &self.shards {
-            let mut table = write(shard);
-            table.carries = vec![Carry::default(); table.buckets.len() * WAYS];
-        }
+        table.insert(slot);
     }
 
     /// Load one sealed row, keeping each key's newest version and a tombstone as a grave
     ///
-    /// A tie goes to the newer segment, which is a compaction copy of the other.
-    pub fn load(&self, key: &[u8], loc: Loc, lsn: Lsn, is_tombstone: bool) {
-        let hash = hash_of(key);
-        let check = check_of(key);
+    /// A slot sharing the key's bits is a version of the key, or rarely another key, so
+    /// its header is read to tell which and how new it is. A tie goes to the newer
+    /// segment, which is a compaction copy of the other.
+    pub fn load(&self, key: &RecordKey, loc: Loc, lsn: Lsn, is_tombstone: bool) -> Result<()> {
+        let Some(records) = self.records.get() else {
+            return Ok(());
+        };
+        let hash = hash_of(key.as_slice());
         let slot = match is_tombstone {
             true => Slot::new(hash, loc).as_grave(),
             false => Slot::new(hash, loc),
         };
-        let carry = Carry {
-            lsn: lsn.as_u64(),
-            check,
-        };
-        let mut table = write(&self.shards[shard_of(hash)]);
-        let held = table
-            .matches(hash)
-            .iter()
-            .copied()
-            .find(|place| table.carry_at(place.bucket, place.way).check == check);
-        match held {
-            Some(place) => {
-                let standing = table.carry_at(place.bucket, place.way).lsn;
-                if (carry.lsn, slot.segment) > (standing, place.slot.segment) {
-                    let moved = slot.in_second(place.slot.is_second());
-                    table.put(place.bucket, place.way, moved, carry);
+        let shard = shard_of(hash);
+        loop {
+            let seen = read(&self.shards[shard]).matches(hash);
+            let mut standing = None;
+            for place in seen.iter() {
+                if let HeadRead::Same(head) = records.head(key.as_ref(), place.slot.segment(), place.slot.offset)? {
+                    standing = Some((place.slot, head.lsn));
                 }
             }
-            None => table.insert(slot, carry),
+            let mut table = write(&self.shards[shard]);
+            // Another thread loaded a row of this key while the headers were read.
+            if *table.matches(hash) != *seen {
+                continue;
+            }
+            match standing {
+                Some((held, held_lsn)) if (lsn, slot.segment) > (held_lsn, held.segment) => {
+                    table.take(hash, &held);
+                    table.insert(slot);
+                }
+                Some(_) => {}
+                None => table.insert(slot),
+            }
+            return Ok(());
         }
     }
 
-    /// Close a load: drop the graves that only kept older rows out, and the carries
+    /// Close a load by dropping the graves that only kept older rows out
     pub fn finish_load(&self) {
         for shard in &self.shards {
             let mut table = write(shard);
@@ -622,7 +570,6 @@ impl FastColumn {
                 }
             }
             table.held -= dropped;
-            table.carries = Vec::new();
         }
     }
 
@@ -864,6 +811,7 @@ mod tests {
         key: Vec<u8>,
         lsn: Lsn,
         len: u32,
+        is_tombstone: bool,
     }
 
     /// Records kept in memory, the way a segment would answer
@@ -875,10 +823,15 @@ mod tests {
 
     impl Records {
         fn write(&self, loc: Loc, key: &[u8], lsn: Lsn) {
+            self.put(loc, key, lsn, false);
+        }
+
+        fn put(&self, loc: Loc, key: &[u8], lsn: Lsn, is_tombstone: bool) {
             let written = Written {
                 key: key.to_vec(),
                 lsn,
                 len: loc.len,
+                is_tombstone,
             };
             lock(&self.written).insert((loc.segment.as_u32(), loc.offset), written);
         }
@@ -888,7 +841,7 @@ mod tests {
                 Some(written) if written.key == key.bytes => HeadRead::Same(Head {
                     lsn: written.lsn,
                     len: written.len,
-                    is_tombstone: false,
+                    is_tombstone: written.is_tombstone,
                 }),
                 Some(_) => HeadRead::Other,
                 None => HeadRead::Missing,
@@ -1022,12 +975,9 @@ mod tests {
             (4, Loc::new(SegmentId(2), 192, 0), 1, true),
             (4, Loc::new(SegmentId(3), 192, 40), 7, false),
         ];
-        column.begin_load();
         for (at, loc, lsn, is_tombstone) in rows {
-            if !is_tombstone {
-                records.write(loc, key(at).as_slice(), Lsn(lsn));
-            }
-            column.load(key(at).as_slice(), loc, Lsn(lsn), is_tombstone);
+            records.put(loc, key(at).as_slice(), Lsn(lsn), is_tombstone);
+            column.load(&key(at), loc, Lsn(lsn), is_tombstone).expect("load");
         }
         column.finish_load();
         assert_eq!(version(&column, 1), Some(5), "the newer row stands");

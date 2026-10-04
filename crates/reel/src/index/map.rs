@@ -402,6 +402,16 @@ impl ReelIndex {
         settled
     }
 
+    /// Bytes the byte counters may sit from the truth, from FastForward's class bookings
+    pub fn fast_slack(&self) -> u64 {
+        self.fast.iter().map(FastColumn::slack).sum()
+    }
+
+    /// Overwritten sealed versions booked from their length class, held until compaction retires them
+    pub fn fast_displaced(&self) -> u64 {
+        self.fast.iter().map(FastColumn::displaced).sum()
+    }
+
     /// Older versions FastForward holds for its cleaner
     pub fn fast_beside(&self) -> u64 {
         self.fast.iter().map(FastColumn::beside).sum()

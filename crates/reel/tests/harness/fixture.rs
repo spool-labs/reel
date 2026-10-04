@@ -530,10 +530,12 @@ impl Differential {
                 self.seed,
                 self.at_step,
             );
-            assert_eq!(
-                self.reel.totals().bytes.to_bytes(),
-                reel.global.bytes,
-                "reel byte counter disagreed with a scan"
+            // An overwrite booked by length class sits up to half a class off.
+            let (counted, slack) = (self.reel.totals().bytes.to_bytes(), self.reel.fast_slack());
+            assert!(
+                counted.abs_diff(reel.global.bytes) <= slack,
+                "reel byte counter disagreed with a scan: {counted} against {}, slack {slack}",
+                reel.global.bytes
             );
         } else {
             assert!(
@@ -541,7 +543,7 @@ impl Differential {
                 "reel count counter overcounted under born segments"
             );
             assert!(
-                self.reel.totals().bytes.to_bytes() <= reel.global.bytes,
+                self.reel.totals().bytes.to_bytes() <= reel.global.bytes + self.reel.fast_slack(),
                 "reel byte counter overcounted under born segments"
             );
         }

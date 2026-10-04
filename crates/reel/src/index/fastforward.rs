@@ -55,6 +55,9 @@ const BUCKET_BYTES: u64 = 64;
 /// Candidates one key can have, both of its buckets full
 const MAX_CANDIDATES: usize = 2 * WAYS;
 
+/// Versions one key may hold before an overwrite reads them all, so its two buckets never fill
+const SETTLE_AT: usize = 3;
+
 /// Payload bytes one small length class covers
 const SMALL_STEP: u64 = 64;
 
@@ -75,6 +78,9 @@ const CLASS_SHIFT: u32 = 8;
 const CLASS_MASK: u32 = 0xFF;
 const SECOND: u32 = 1;
 const GRAVE: u32 = 2;
+
+/// An overwritten version already booked dead from its length class, left for compaction
+const DISPLACED: u32 = 4;
 
 /// What a record's header says, once its key matched the one asked about
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -286,6 +292,30 @@ impl Slot {
         }
     }
 
+    fn is_displaced(&self) -> bool {
+        self.meta & DISPLACED != 0
+    }
+
+    /// The most a length in the slot's class can sit from its middle
+    fn half_width(&self) -> u32 {
+        let class = (self.meta >> CLASS_SHIFT) & CLASS_MASK;
+        let below = match class {
+            0 => 0,
+            class => bound_of(class - 1),
+        };
+        (bound_of(class) - below).div_ceil(2)
+    }
+
+    /// The middle of the slot's length class, which a version booked with no read counts as
+    fn middle(&self) -> u32 {
+        let class = (self.meta >> CLASS_SHIFT) & CLASS_MASK;
+        let below = match class {
+            0 => 0,
+            class => bound_of(class - 1),
+        };
+        below + (bound_of(class) - below) / 2
+    }
+
     fn in_second(self, is_second: bool) -> Slot {
         let meta = match is_second {
             true => self.meta | SECOND,
@@ -464,13 +494,21 @@ impl Table {
         }
     }
 
-    /// Take out the slot pointing at one record, wherever displacement has moved it
-    fn take(&mut self, hash: u64, slot: &Slot) -> bool {
+    /// Take out the slot pointing at one record, wherever displacement has moved it, handing it back
+    fn take(&mut self, hash: u64, slot: &Slot) -> Option<Slot> {
         let found = self.matches(hash);
-        match found.iter().find(|place| place.slot.same_place(slot)) {
+        let place = found.iter().find(|place| place.slot.same_place(slot))?;
+        self.buckets[place.bucket].slots[place.way] = Slot::default();
+        self.held -= 1;
+        Some(place.slot)
+    }
+
+    /// Mark the slot pointing at one record displaced, unless it already is
+    fn mark_displaced(&mut self, hash: u64, slot: &Slot) -> bool {
+        let found = self.matches(hash);
+        match found.iter().find(|place| place.slot.same_place(slot) && !place.slot.is_displaced()) {
             Some(place) => {
-                self.buckets[place.bucket].slots[place.way] = Slot::default();
-                self.held -= 1;
+                self.buckets[place.bucket].slots[place.way].meta |= DISPLACED;
                 true
             }
             None => false,
@@ -510,6 +548,9 @@ struct Shard {
 
     /// Slots taken out so far, which a lookup that found nothing checks for a race
     taken: AtomicU64,
+
+    /// Slots marked displaced and still held
+    displaced: AtomicU64,
 }
 
 impl Shard {
@@ -517,6 +558,7 @@ impl Shard {
         Shard {
             table: RwLock::new(Table::with_buckets(FIRST_BUCKETS)),
             taken: AtomicU64::new(0),
+            displaced: AtomicU64::new(0),
         }
     }
 
@@ -528,6 +570,7 @@ impl Shard {
         Writing {
             table: write(&self.table),
             taken: &self.taken,
+            displaced: &self.displaced,
         }
     }
 }
@@ -536,22 +579,48 @@ impl Shard {
 struct Writing<'a> {
     table: RwLockWriteGuard<'a, Table>,
     taken: &'a AtomicU64,
+    displaced: &'a AtomicU64,
 }
 
 impl Writing<'_> {
     /// Take out the slot pointing at one record, wherever displacement has moved it
     fn take(&mut self, hash: u64, slot: &Slot) -> bool {
-        let took = self.table.take(hash, slot);
-        if took {
-            self.taken.fetch_add(1, Ordering::Release);
-        }
-        took
+        self.take_slot(hash, slot).is_some()
     }
 
-    /// Count slots a sweep emptied by hand
-    fn count_taken(&self, slots: u64) {
+    /// Take out the slot pointing at one record, handing back what it held
+    fn take_slot(&mut self, hash: u64, slot: &Slot) -> Option<Slot> {
+        let took = self.table.take(hash, slot)?;
+        self.taken.fetch_add(1, Ordering::Release);
+        if took.is_displaced() {
+            self.displaced.fetch_sub(1, Ordering::Relaxed);
+        }
+        Some(took)
+    }
+
+    /// Take out the slot pointing at one record unless an overwrite already booked it
+    fn take_unbooked(&mut self, hash: u64, slot: &Slot) -> bool {
+        let found = self.table.matches(hash);
+        let is_booked = found.iter().any(|place| place.slot.same_place(slot) && place.slot.is_displaced());
+        !is_booked && self.take(hash, slot)
+    }
+
+    /// Mark the slot pointing at one record displaced, unless it already is
+    fn mark_displaced(&mut self, hash: u64, slot: &Slot) -> bool {
+        let marked = self.table.mark_displaced(hash, slot);
+        if marked {
+            self.displaced.fetch_add(1, Ordering::Relaxed);
+        }
+        marked
+    }
+
+    /// Count slots a sweep emptied by hand, and how many of them were displaced
+    fn count_taken(&self, slots: u64, displaced: u64) {
         if slots > 0 {
             self.taken.fetch_add(slots, Ordering::Release);
+        }
+        if displaced > 0 {
+            self.displaced.fetch_sub(displaced, Ordering::Relaxed);
         }
     }
 }
@@ -585,6 +654,9 @@ pub struct FastColumn {
     stale: Mutex<VecDeque<Stale>>,
     beside: AtomicU64,
 
+    /// Bytes the class bookings may sit from the truth, half a class each at most
+    slack: AtomicU64,
+
     /// Rows an open took before it could read a header, settled once it can
     set_aside: Mutex<Vec<SetAside>>,
 }
@@ -603,6 +675,7 @@ impl FastColumn {
             segments: OnceLock::new(),
             stale: Mutex::new(VecDeque::new()),
             beside: AtomicU64::new(0),
+            slack: AtomicU64::new(0),
             set_aside: Mutex::new(Vec::new()),
         }
     }
@@ -616,6 +689,16 @@ impl FastColumn {
     /// Older versions waiting for the cleaner
     pub fn beside(&self) -> u64 {
         self.beside.load(Ordering::Relaxed)
+    }
+
+    /// Bytes the byte counters may sit from the truth, from every class booking so far
+    pub fn slack(&self) -> u64 {
+        self.slack.load(Ordering::Relaxed)
+    }
+
+    /// Overwritten versions booked from their length class and held until compaction
+    pub fn displaced(&self) -> u64 {
+        self.shards.iter().map(|shard| shard.displaced.load(Ordering::Relaxed)).sum()
     }
 
     /// Entries held
@@ -886,15 +969,19 @@ impl FastColumn {
                 }
             }
             table.held -= dropped;
-            table.count_taken(dropped as u64);
+            table.count_taken(dropped as u64, 0);
         }
     }
 
-    /// Whether a key's one slot points at this record, which a caller that read it can trust with no read
+    /// Whether a key's one live slot points at this record, which a caller that read it can trust with no read
     pub fn only_at(&self, key: &[u8], loc: Loc) -> bool {
         let hash = hash_of(key);
         let seen = self.shards[shard_of(hash)].read().matches(hash);
-        seen.len() == 1 && seen[0].slot.at(loc)
+        let mut live = seen.iter().filter(|place| !place.slot.is_displaced());
+        match (live.next(), live.next()) {
+            (Some(place), None) => place.slot.at(loc),
+            (Some(_), Some(_)) | (None, _) => false,
+        }
     }
 
     /// Take out the entry pointing at one record, for a compaction move, an eviction or a release
@@ -908,12 +995,16 @@ impl FastColumn {
         }
     }
 
-    /// Take a key's entries older than `newer` out, now that the map holds that version
+    /// Book a key's entries older than `newer` dead, now that the map holds that version
     ///
-    /// A header memory does not hold is read from the device, so the counters move with
-    /// the write. What comes back is every record taken out, for the caller to book.
+    /// An entry in a segment holding nothing at or past `newer` is older with no read. It
+    /// is marked displaced in place and booked at the middle of its length class, then
+    /// stays for lookups in flight until compaction retires its segment. An entry whose
+    /// segment may hold a newer version reads its header and goes, booked exactly, and so
+    /// does every entry of a key holding `SETTLE_AT` versions or more. What comes back is
+    /// every record booked, for the caller to settle.
     pub fn displace(&self, key: &RecordKey, newer: Lsn) -> Result<Vec<Loc>> {
-        let Some(records) = self.records.get() else {
+        let (Some(records), Some(segments)) = (self.records.get(), self.segments.get()) else {
             return Ok(Vec::new());
         };
         let hash = hash_of(key.as_slice());
@@ -922,30 +1013,47 @@ impl FastColumn {
         if seen.is_empty() {
             return Ok(Vec::new());
         }
-        let (mut older, mut gone) = (Vec::new(), Vec::new());
+        let must_read = seen.len() >= SETTLE_AT;
+        let (mut unread, mut older, mut gone) = (Vec::new(), Vec::new(), Vec::new());
         for place in seen.iter() {
-            let (segment, offset) = (place.slot.segment(), place.slot.offset);
-            let answer = match records.cached_head(key.as_ref(), segment, offset)? {
-                HeadRead::Cold => records.head(key.as_ref(), segment, offset)?,
+            let slot = place.slot;
+            let is_older = segments.max_lsn_of(slot.segment()).is_some_and(|ceiling| ceiling < newer);
+            match (must_read, slot.is_displaced(), is_older) {
+                (false, true, _) => continue,
+                (false, false, true) => {
+                    unread.push(slot);
+                    continue;
+                }
+                (false, false, false) | (true, _, _) => {}
+            }
+            let answer = match records.cached_head(key.as_ref(), slot.segment(), slot.offset)? {
+                HeadRead::Cold => records.head(key.as_ref(), slot.segment(), slot.offset)?,
                 answer => answer,
             };
             match answer {
-                HeadRead::Same(head) if head.lsn < newer => older.push((place.slot, head.len)),
+                HeadRead::Same(head) if head.lsn < newer => older.push((slot, head.len)),
                 HeadRead::Same(_) | HeadRead::Other | HeadRead::Cold => {}
-                HeadRead::Missing => gone.push(place.slot),
+                HeadRead::Missing => gone.push(slot),
             }
         }
-        let mut taken = Vec::with_capacity(older.len());
+        let mut booked = Vec::with_capacity(unread.len() + older.len());
         let mut table = self.shards[shard].write();
         for slot in &gone {
             table.take(hash, slot);
         }
+        // A displaced entry was booked when it was marked, so taking it books nothing more.
         for (slot, len) in &older {
-            if table.take(hash, slot) {
-                taken.push(Loc::new(slot.segment(), slot.offset, *len));
+            if table.take_slot(hash, slot).is_some_and(|took| !took.is_displaced()) {
+                booked.push(Loc::new(slot.segment(), slot.offset, *len));
             }
         }
-        Ok(taken)
+        for slot in &unread {
+            if table.mark_displaced(hash, slot) {
+                booked.push(Loc::new(slot.segment(), slot.offset, slot.middle()));
+                self.slack.fetch_add(u64::from(slot.half_width()), Ordering::Relaxed);
+            }
+        }
+        Ok(booked)
     }
 
     fn queue(&self, stale: Stale) {
@@ -964,7 +1072,7 @@ impl FastColumn {
                 break;
             };
             self.beside.fetch_sub(1, Ordering::Relaxed);
-            let took = self.shards[shard_of(stale.hash)].write().take(stale.hash, &stale.slot);
+            let took = self.shards[shard_of(stale.hash)].write().take_unbooked(stale.hash, &stale.slot);
             if took {
                 let loc = Loc::new(stale.slot.segment(), stale.slot.offset, stale.len);
                 taken.push((stale.key, loc));
@@ -1028,11 +1136,19 @@ impl FastColumn {
     }
 
     /// The key's one candidate, when it has exactly one, which a single read can answer for
+    ///
+    /// A displaced entry was booked as an overwritten version, so it is left to the full lookup.
     pub fn sole(&self, key: &RecordKey) -> Option<Candidate> {
-        let mut pick = self.pick(key)?;
-        match pick.ordered.len() {
-            1 => self.next(&mut pick),
-            _ => None,
+        let pick = self.pick(key)?;
+        let mut live = pick.ordered.iter().filter(|(_, slot)| !slot.is_displaced());
+        match (live.next(), live.next()) {
+            (Some((_, slot)), None) => Some(Candidate {
+                segment: slot.segment(),
+                offset: slot.offset,
+                bound: slot.bound(),
+                slot: *slot,
+            }),
+            (Some(_), Some(_)) | (None, _) => None,
         }
     }
 
@@ -1112,7 +1228,7 @@ impl FastColumn {
 
     /// Close a lookup with its newest version, handing the older ones it read to the cleaner
     pub fn settle(&self, key: &RecordKey, pick: Pick) -> Lookup {
-        for (slot, len) in pick.stale {
+        for (slot, len) in pick.stale.into_iter().filter(|(slot, _)| !slot.is_displaced()) {
             self.queue(Stale {
                 key: key.clone(),
                 hash: pick.hash,
@@ -1180,17 +1296,18 @@ impl FastColumn {
         let mut forgotten = 0;
         for shard in &self.shards {
             let mut table = shard.write();
-            let mut dropped = 0;
+            let (mut dropped, mut displaced) = (0, 0);
             for bucket in table.buckets.iter_mut() {
                 for slot in bucket.slots.iter_mut() {
                     if !slot.is_empty() && !is_standing(slot.segment()) {
+                        displaced += u64::from(slot.is_displaced());
                         *slot = Slot::default();
                         dropped += 1;
                     }
                 }
             }
             table.held -= dropped;
-            table.count_taken(dropped as u64);
+            table.count_taken(dropped as u64, displaced);
             forgotten += dropped as u64;
         }
         forgotten
@@ -1201,12 +1318,14 @@ impl FastColumn {
         for shard in &self.shards {
             let mut table = shard.write();
             let held = table.held as u64;
+            let displaced = table.displaced.load(Ordering::Relaxed);
             *table = Table::with_buckets(FIRST_BUCKETS);
-            table.count_taken(held);
+            table.count_taken(held, displaced);
         }
         lock(&self.stale).clear();
         lock(&self.set_aside).clear();
         self.beside.store(0, Ordering::Relaxed);
+        self.slack.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1233,6 +1352,7 @@ mod tests {
     struct Records {
         written: Mutex<HashMap<(u32, u32), Written>>,
         is_cold: AtomicBool,
+        heads: AtomicU64,
     }
 
     impl Records {
@@ -1265,6 +1385,7 @@ mod tests {
 
     impl RecordSource for Records {
         fn head(&self, key: KeyRef<'_>, segment: SegmentId, offset: u32) -> Result<HeadRead> {
+            self.heads.fetch_add(1, Ordering::Relaxed);
             Ok(self.answer(key, segment, offset))
         }
 
@@ -1325,34 +1446,49 @@ mod tests {
         assert_eq!(version(&column, keys + 1), None);
     }
 
-    // a displaced version is taken out at once, from memory or from the device
+    // an overwritten version is booked from its length class with no read, and stays until its segment retires
     #[test]
-    fn displaced_versions_go_at_once() {
+    fn overwritten_versions_are_booked_from_their_class() {
         let records = Arc::new(Records::default());
-        let column = column(&records);
-        let warm = Loc::new(SegmentId(1), 0, 40);
-        let cold = Loc::new(SegmentId(1), 64, 40);
-        records.write(warm, key(1).as_slice(), Lsn(1));
-        records.write(cold, key(2).as_slice(), Lsn(2));
-        column.insert(key(1).as_slice(), warm);
-        column.insert(key(2).as_slice(), cold);
-
-        assert_eq!(column.displace(&key(1), Lsn(10)).expect("displace"), vec![warm]);
-        assert_eq!(version(&column, 1), None);
-
+        let segments = Arc::new(SegmentTable::new());
+        let column = FastColumn::new();
+        column.attach(Arc::clone(&records) as Arc<dyn RecordSource>, Arc::clone(&segments));
         records.is_cold.store(true, Ordering::Relaxed);
-        assert_eq!(column.displace(&key(2), Lsn(11)).expect("displace"), vec![cold]);
-        assert_eq!(column.held(), 0);
 
-        // a version at or past the map's stays
+        let old = Loc::new(SegmentId(1), 0, 200);
+        records.write(old, key(1).as_slice(), Lsn(1));
+        segments.note_max(SegmentId(1), Lsn(5));
+        column.insert(key(1).as_slice(), old);
+        // 200 bytes sit in the class from 193 to 256
+        assert_eq!(column.displace(&key(1), Lsn(10)).expect("displace"), vec![Loc::new(SegmentId(1), 0, 224)]);
+        assert_eq!(records.heads.load(Ordering::Relaxed), 0);
+        assert_eq!((column.held(), column.displaced()), (1, 1));
+        assert!(column.displace(&key(1), Lsn(11)).expect("displace").is_empty());
+        assert_eq!(version(&column, 1), Some(1));
+        column.forget_retired(|segment| segment != SegmentId(1));
+        assert_eq!((column.held(), column.displaced()), (0, 0));
+
+        // a segment that may hold a newer version is read, and the newer version stays
         let newer = Loc::new(SegmentId(2), 0, 40);
         records.write(newer, key(3).as_slice(), Lsn(30));
+        segments.note_max(SegmentId(2), Lsn(30));
         column.insert(key(3).as_slice(), newer);
         assert!(column.displace(&key(3), Lsn(12)).expect("displace").is_empty());
         assert_eq!(version(&column, 3), Some(30));
+
+        // a key holding several versions reads them all and each goes, booked exactly
+        let held: Vec<Loc> = (0..SETTLE_AT as u32).map(|at| Loc::new(SegmentId(3), at * 64, 40)).collect();
+        for (at, loc) in held.iter().enumerate() {
+            records.write(*loc, key(4).as_slice(), Lsn(40 + at as u64));
+            column.insert(key(4).as_slice(), *loc);
+        }
+        segments.note_max(SegmentId(3), Lsn(45));
+        let mut booked = column.displace(&key(4), Lsn(50)).expect("displace");
+        booked.sort_by_key(|loc| loc.offset);
+        assert_eq!(booked, held);
+        assert_eq!(version(&column, 4), None);
     }
 
-    // the newest of several versions answers, a copy beside its source stays, older ones go to the cleaner
     #[test]
     fn the_newest_version_answers_and_copies_stand() {
         let records = Arc::new(Records::default());

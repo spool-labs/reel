@@ -601,6 +601,11 @@ impl ReelStore {
         &self.cues
     }
 
+    /// Bytes the byte counters may sit from the truth, from overwrites booked by length class
+    pub fn fast_slack(&self) -> u64 {
+        self.index.fast_slack()
+    }
+
     /// Sealed segments a rebuild left uncounted, standing until they retire
     ///
     /// While any stand, the totals promise only a floor: their keys were never

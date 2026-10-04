@@ -562,9 +562,9 @@ impl ReelStore {
         self.check_column(key)?;
         // FastForward holds a key's newest sealed version, which answers in one read
         // when the cue can see it.
-        if let Some((column, since, newer)) = self.index.fast_route_at(key, at) {
+        if let Some((column, since)) = self.index.fast_route_at(key) {
             let lookup = self.index.fast_column(column).read(key)?;
-            match self.index.fast_finish_at(column, key, since, newer, at, lookup) {
+            match self.index.fast_finish_at(column, key, since, at, lookup) {
                 Lookup::Found(_, value) => return Ok(Some(value)),
                 Lookup::Missing => return Ok(None),
                 Lookup::Unsettled => {}

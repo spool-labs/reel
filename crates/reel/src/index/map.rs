@@ -218,8 +218,6 @@ pub struct ReelIndex {
     /// What each column's sealed segments cover, empty unless the column pages
     sealed: Vec<SealedRanges>,
 
-    /// Every sealed key each column holds, as one filter ahead of the fan-out
-
     /// Each column's sealed keys as record locations, answering a get in one read
     fast: Vec<FastColumn>,
 
@@ -331,32 +329,28 @@ impl ReelIndex {
         }
     }
 
-    /// Where a cue read can ask FastForward, and whether the map holds a version past the cue
+    /// Where a cue read can ask FastForward
     ///
-    /// A map entry the cue can see answers through the checked path, as does a column
-    /// FastForward does not serve.
-    pub fn fast_route_at(&self, key: &RecordKey, snapshot: Lsn) -> Option<(usize, Since, bool)> {
+    /// Only for a key the map has let go. A key the map still holds answers through the
+    /// checked path, since a hand-over in flight puts an older version in FastForward
+    /// before the map refuses it. A column FastForward does not serve goes there too.
+    pub fn fast_route_at(&self, key: &RecordKey) -> Option<(usize, Since)> {
         let (Some(at), true) = (self.slot(key.column), self.fast_serves()) else {
             return None;
         };
         let since = self.fast[at].since(key);
-        match self.indexes[at].entry_or_grave(key.as_slice()) {
-            Some(entry) if entry.lsn <= snapshot => None,
-            Some(_) => Some((at, since, true)),
-            None => Some((at, since, false)),
-        }
+        self.indexes[at].entry_or_grave(key.as_slice()).is_none().then_some((at, since))
     }
 
     /// Apply a cue to a FastForward answer: the newest sealed version stands when the cue sees it
     ///
-    /// A newer one, or a miss beside a map version past the cue, goes to the footers, which
-    /// keep every version an overwrite took out of FastForward.
+    /// A newer one goes to the footers, which keep every version an overwrite took out of
+    /// FastForward.
     pub fn fast_finish_at(
         &self,
         at: usize,
         key: &RecordKey,
         since: Since,
-        newer: bool,
         snapshot: Lsn,
         lookup: Lookup,
     ) -> Lookup {
@@ -365,7 +359,7 @@ impl ReelIndex {
             Lookup::Found(lsn, _) if self.indexes[at].is_covered_key_at(key.as_slice(), lsn, snapshot) => {
                 Lookup::Missing
             }
-            Lookup::Missing if newer || self.fast[at].moved(since) => Lookup::Unsettled,
+            Lookup::Missing if self.fast[at].moved(since) => Lookup::Unsettled,
             found => found,
         }
     }
@@ -807,6 +801,8 @@ impl ReelIndex {
             return false;
         };
         self.fast[at].insert(key, loc);
+        // FastForward holds the key and the map has yet to let it go.
+        crate::sync::rendezvous::at("paged/handover-fast");
         let handed = self.indexes[at].page_out(key, loc);
         if !handed {
             self.fast[at].remove_at(key, loc);

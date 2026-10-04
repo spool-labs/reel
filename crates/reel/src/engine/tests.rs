@@ -4969,3 +4969,45 @@ fn flip_payload(image: &mut DurableImage, loc: Loc) {
         }
     }
 }
+
+// a cue read never takes the version hand-over has put in FastForward while the map still holds a newer one
+#[test]
+fn a_cue_read_waits_out_a_hand_over_in_flight() {
+    let (store, _) = sim_store(ReelConfig {
+        index: IndexResidency::Paged,
+        ..config(1, SyncPolicy::Never)
+    });
+    let store = Arc::new(store);
+    let (first, second, third) = (vec![0xa5u8; 8 * 1024], vec![0x5au8; 8 * 1024], vec![0x3cu8; 8 * 1024]);
+    let keys: Vec<RecordKey> = (0..200u8).map(|byte| record(7, byte)).collect();
+    for key in &keys {
+        store.put(key, &first).expect("put");
+    }
+    drop(store.cue().expect("seal"));
+    for key in &keys {
+        store.put(key, &second).expect("rewrite");
+    }
+    let cue = store.cue().expect("cue");
+    for key in &keys {
+        store.put(key, &third).expect("rewrite past the cue");
+    }
+
+    let script = crate::sync::rendezvous::script();
+    script.hold("paged/handover-fast");
+    let handing = {
+        let store = Arc::clone(&store);
+        script.cast(move || store.page_out_sealed().expect("hand over"))
+    };
+    script.await_reached("paged/handover-fast", 1);
+    let stale = keys
+        .iter()
+        .filter(|key| {
+            let read = store.get_at(key, &cue).expect("cue read");
+            read.as_deref().map(|value| value[0]) != Some(0x5a)
+        })
+        .count();
+    script.release("paged/handover-fast");
+    handing.join().expect("hand over");
+    drop(script);
+    assert_eq!(stale, 0, "a cue read answered with a version older than the cue");
+}

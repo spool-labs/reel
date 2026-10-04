@@ -106,6 +106,13 @@ impl<const N: usize, Value> Default for OpenTable<N, Value> {
 }
 
 impl<const N: usize, Value: Default> OpenTable<N, Value> {
+    /// Bytes the table's arrays have allocated, empty slots and spare capacity included
+    pub fn heap_bytes(&self) -> u64 {
+        (self.control.capacity()
+            + self.keys.capacity() * N
+            + self.values.capacity() * std::mem::size_of::<Value>()) as u64
+    }
+
     /// An empty table, which allocates when something is first put in it
     pub fn new() -> OpenTable<N, Value> {
         OpenTable::default()

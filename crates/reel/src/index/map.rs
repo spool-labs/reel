@@ -136,9 +136,6 @@ pub struct KeyRepoint {
     pub lsn: Lsn,
 }
 
-/// Bytes one index entry occupies, which is what the map holds beside every key
-const ENTRY_BYTES: u64 = std::mem::size_of::<Entry>() as u64;
-
 /// Paged keys a range delete settles at a time
 ///
 /// Holding every key a range reaches would be the resident footprint a paged column
@@ -214,6 +211,9 @@ pub struct ReelIndex {
 
     /// Held while a batch moves the maps, so no spanning read sees part of one
     publish: PublishBarrier,
+
+    /// Bytes the empty index held at open, which no handover can give back
+    floor: u64,
 }
 
 impl ReelIndex {
@@ -281,10 +281,21 @@ impl ReelIndex {
                 )));
             }
             by_id[spec.id.as_index()] = Some(at);
-            indexes.push(ColumnIndex::new(spec, shapes)?);
+            indexes.push(ColumnIndex::new(spec, shapes, residency)?);
             sealed.push(SealedRanges::new());
         }
         let sealed_keys = (0..columns.len()).map(|_| SealedKeys::new()).collect();
+        let floor: u64 = indexes.iter().map(ColumnIndex::heap_bytes).sum();
+        if let IndexResidency::Hot(hot) = residency {
+            // The shards and their filters cost this before a key arrives, and a
+            // budget under it would hand over every sealed key it was meant to hold.
+            if hot.budget.to_bytes() < floor {
+                return Err(ReelError::Config(format!(
+                    "a hot index budget of {} bytes is under the {floor} bytes these columns hold empty",
+                    hot.budget.to_bytes(),
+                )));
+            }
+        }
         Ok(ReelIndex {
             columns,
             indexes,
@@ -296,6 +307,7 @@ impl ReelIndex {
             residency,
             unclaimed: std::sync::atomic::AtomicU64::new(0),
             publish: PublishBarrier::new(),
+            floor,
         })
     }
 
@@ -1277,25 +1289,26 @@ impl ReelIndex {
         self.indexes.iter().map(|index| index.cover_count()).sum()
     }
 
-    /// Memory the maps are holding, near enough for a budget to act on
+    /// Memory the maps are holding, which is what a budget acts on
     ///
-    /// Every key costs its own bytes, the entry it resolves to, and its share of
-    /// whatever holds them. That third term comes from the column's shape, since the
-    /// two shapes differ by an order of magnitude and one number for both would
-    /// misprice whichever column it was not taken from.
+    /// Counted from what every shard's maps allocated plus the shards and their filters,
+    /// since arenas that grow by doubling hold up to twice what their keys fill.
     pub fn resident_bytes(&self) -> ByteCount {
-        let bytes: u64 = self
-            .columns
-            .iter()
-            .zip(&self.indexes)
-            .map(|(spec, index)| {
-                let per_key = u64::from(spec.key_width.fixed().unwrap_or(0))
-                    + ENTRY_BYTES
-                    + index.overhead_per_key();
-                index.resident_keys() * per_key
-            })
-            .sum();
+        let bytes: u64 = self.indexes.iter().map(ColumnIndex::heap_bytes).sum();
         ByteCount::from_bytes(bytes)
+    }
+
+    /// Memory the keys hold above what the empty index held at open
+    ///
+    /// A hot budget is weighed against this, so it prices the keys alone. A hot
+    /// column's filters are all allocated at open, so the floor holds them.
+    pub fn key_bytes(&self) -> ByteCount {
+        ByteCount::from_bytes(self.resident_bytes().to_bytes().saturating_sub(self.floor))
+    }
+
+    /// Bytes the empty index held at open
+    pub fn floor_bytes(&self) -> ByteCount {
+        ByteCount::from_bytes(self.floor)
     }
 
     /// Live key count and payload byte total across every column
@@ -1626,6 +1639,7 @@ mod tests {
 
     const RECORD: ColumnId = ColumnId(1);
     const BLOB: ColumnId = ColumnId(2);
+    const SHORT: ColumnId = ColumnId(3);
 
     const COLUMNS: ColumnSet = &[
         ColumnSpec {
@@ -1644,6 +1658,17 @@ mod tests {
             name: "blob_data",
             key_width: KeyWidth::Fixed(32),
             shard_bytes: 0,
+            inline_max: 0,
+            row_carry: 0,
+            purge_mark: None,
+            codec: Codec::None,
+            map_shape: MapShape::Tree,
+        },
+        ColumnSpec {
+            id: SHORT,
+            name: "short",
+            key_width: KeyWidth::Fixed(16),
+            shard_bytes: 1,
             inline_max: 0,
             row_carry: 0,
             purge_mark: None,
@@ -1670,7 +1695,11 @@ mod tests {
         }
     }
 
-    const OPEN_COLUMNS: ColumnSet = &[opened(&COLUMNS[0]), opened(&COLUMNS[1])];
+    const OPEN_COLUMNS: ColumnSet = &[
+        opened(&COLUMNS[0]),
+        opened(&COLUMNS[1]),
+        opened(&COLUMNS[2]),
+    ];
 
     fn index() -> ReelIndex {
         ReelIndex::new(COLUMNS, IndexResidency::Resident, ShardShapes::Tree).expect("index")
@@ -1683,10 +1712,12 @@ mod tests {
             ShardShapes::Declared,
         )
         .expect("index");
-        assert_eq!(
-            index.column(RECORD).expect("column").map_shape(),
-            MapShape::Open
-        );
+        for column in [RECORD, BLOB, SHORT] {
+            assert_eq!(
+                index.column(column).expect("column").map_shape(),
+                MapShape::Open
+            );
+        }
         index
     }
 
@@ -1705,6 +1736,12 @@ mod tests {
         let mut bytes = group.to_be_bytes().to_vec();
         bytes.extend_from_slice(&[byte; 32]);
         RecordKey::from_bytes(RECORD, &bytes).expect("key")
+    }
+
+    fn short_key(group: u8, byte: u8) -> RecordKey {
+        let mut bytes = vec![group, byte];
+        bytes.resize(16, byte ^ 0x5a);
+        RecordKey::from_bytes(SHORT, &bytes).expect("key")
     }
 
     fn blob_key(byte: u8) -> RecordKey {
@@ -1943,6 +1980,60 @@ mod tests {
         assert_eq!(tree.totals().count, open.totals().count);
     }
 
+    // a sixteen-byte open column serves what the tree serves, walk included
+    #[test]
+    fn open_serves_short_keys_the_same() {
+        let tree = index();
+        let open = open_index();
+
+        for group in 0..4u8 {
+            for byte in 0..=255u8 {
+                for index in [&tree, &open] {
+                    index
+                        .insert(
+                            &short_key(group, byte),
+                            loc(1, byte as u32 * 100, 100),
+                            Lsn(u64::from(group) * 256 + u64::from(byte) + 1),
+                            None,
+                        )
+                        .expect("insert");
+                }
+            }
+        }
+        for byte in (0..=255u8).step_by(5) {
+            for index in [&tree, &open] {
+                index
+                    .remove(&short_key(2, byte), Lsn(5000 + byte as u64), loc(1, 0, 0))
+                    .expect("remove");
+            }
+        }
+
+        for group in 0..5u8 {
+            for byte in 0..=255u8 {
+                assert_eq!(
+                    tree.get(&short_key(group, byte)).expect("read"),
+                    open.get(&short_key(group, byte)).expect("read"),
+                    "group {group} byte {byte}",
+                );
+            }
+        }
+        let mut from_tree = KeyPage::default();
+        let mut from_open = KeyPage::default();
+        tree.page(SHORT, Bound::Unbounded, 2048, &mut from_tree)
+            .expect("page");
+        open.page(SHORT, Bound::Unbounded, 2048, &mut from_open)
+            .expect("page");
+        assert_eq!(from_tree.len(), from_open.len());
+        for at in 0..from_tree.len() {
+            assert_eq!(
+                from_tree.key_at(at),
+                from_open.key_at(at),
+                "key {at} of the walk"
+            );
+        }
+        assert_eq!(tree.totals().count, open.totals().count);
+    }
+
     // a volume that does not honour declarations gives an open column the tree
     #[test]
     fn shape_gate_falls_back() {
@@ -1966,7 +2057,7 @@ mod tests {
         const ODD: ColumnSet = &[ColumnSpec {
             id: ColumnId(1),
             name: "odd",
-            key_width: KeyWidth::Fixed(16),
+            key_width: KeyWidth::Fixed(20),
             shard_bytes: 0,
             inline_max: 0,
             row_carry: 0,
@@ -1984,25 +2075,31 @@ mod tests {
     fn open_costs_less() {
         let tree = index();
         let open = open_index();
+        let empty = [tree.resident_bytes(), open.resident_bytes()];
 
-        for byte in 0..64u8 {
-            for index in [&tree, &open] {
-                index
-                    .insert(
-                        &blob_key(byte),
-                        loc(1, byte as u32 * 100, 100),
-                        Lsn(byte as u64 + 1),
-                        None,
-                    )
-                    .expect("insert");
+        // Four shards of a thousand keys, so what the keys add outweighs the rounding.
+        for group in 0..4u16 {
+            for byte in 0..=255u8 {
+                for spread in 0..4u8 {
+                    let mut key = record_key(group, byte).as_slice().to_vec();
+                    key[3] = spread;
+                    let key = RecordKey::from_bytes(RECORD, &key).expect("key");
+                    for index in [&tree, &open] {
+                        index
+                            .insert(&key, loc(1, byte as u32 * 100, 100), Lsn(1), None)
+                            .expect("insert");
+                    }
+                }
             }
         }
 
+        let added = |index: &ReelIndex, empty: ByteCount| {
+            index.resident_bytes().to_bytes() - empty.to_bytes()
+        };
+        let (tree_added, open_added) = (added(&tree, empty[0]), added(&open, empty[1]));
         assert!(
-            open.resident_bytes() < tree.resident_bytes(),
-            "open {:?} against tree {:?}",
-            open.resident_bytes(),
-            tree.resident_bytes(),
+            open_added < tree_added,
+            "the keys added {open_added} bytes open against {tree_added} in a tree"
         );
     }
 

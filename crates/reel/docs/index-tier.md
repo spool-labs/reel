@@ -284,9 +284,13 @@ does coming out. `a_fresh_key_skips_the_sealed_search` pins both feeds and
 
 ## The footprint formula reads low, and one shard shape is ruinous
 
-`resident_bytes` is a formula, the key width plus `size_of::<Entry>()` plus the
+`resident_bytes` was a formula, the key width plus `size_of::<Entry>()` plus the
 shape's own per-key overhead, 37 bytes on a tree and arithmetic on the slot for an
-open table, so it cannot see the tree at all. The weighing route is `Scale` in
+open table, so it could not see the tree at all. It now adds up what every shard's
+map allocated, spare capacity included, plus the shard array and the filters in front
+of it, through `ShardMap::heap_bytes`. A hot column cuts one mebibyte of filters
+between its shards at open, so the empty index's floor holds them. A hot budget weighs
+the maps above that floor, and a budget under it is refused. The weighing route is `Scale` in
 `tests/raw_throughput.rs`, a per-thread counting `GlobalAlloc` behind a `WEIGHING`
 flag, reported by `cpu_terms`. A million keys, node width 64 against 16, counted
 layout bytes rather than timings, so the machine matters little:
@@ -299,8 +303,8 @@ layout bytes rather than timings, so the machine matters little:
 | 16 B key, ascending | 73 | 137 | 69 |
 | 16 B key, scattered | 1,325 | 1,329 | 69 |
 
-**The formula reads 1.33x to 1.65x low**, so every index footprint figure in these
-docs is understated and the 95 and 103 bytes a key that so much rests on are gauges.
+**The formula read 1.33x to 1.65x low**, so every index footprint figure in these
+docs taken from it is understated and the 95 and 103 bytes a key that so much rests on are gauges.
 The node width change is not a footprint regression either way, neutral on the bulk
 record column and a large win on a 16 byte ascending key.
 

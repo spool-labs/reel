@@ -212,27 +212,26 @@ impl FooterMap {
             .collect::<Result<Vec<_>>>()?;
         let fences = read_fences(driver, file, file_len, &span, &spans, fence, probes)?;
         let filters = Filter::parse_region(region, spans.len());
-        Ok(Some(FooterMap {
-            partitions: spans
-                .into_iter()
-                .zip(filters)
-                .zip(restarts)
-                .zip(fences)
-                .map(|(((span, filter), restarts), fence)| Partition {
-                    span,
-                    filter,
-                    restarts,
-                    fence,
-                })
-                .collect(),
-        }))
+        let mut partitions: Vec<Partition> = spans
+            .into_iter()
+            .zip(filters)
+            .zip(restarts)
+            .zip(fences)
+            .map(|(((span, filter), restarts), fence)| Partition {
+                span,
+                filter,
+                restarts,
+                fence,
+            })
+            .collect();
+        // held in column order, which a lookup by column searches
+        partitions.sort_by_key(|held| held.span.column);
+        Ok(Some(FooterMap { partitions }))
     }
 
     /// Where one column sits in the directory, which every lookup here starts from
     fn at(&self, column: ColumnId) -> Option<&Partition> {
-        self.partitions
-            .iter()
-            .find(|held| held.span.column == column)
+        crate::format::footer::partition_in(&self.partitions, column, |held| held.span.column)
     }
 
     /// Where one column's rows sit and what its filter says, in one lookup

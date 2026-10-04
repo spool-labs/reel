@@ -273,7 +273,7 @@ impl ReelStore {
     fn next_to_hand_over(&self) -> Option<SegmentId> {
         let now = Instant::now();
         let over_budget = match self.config.index {
-            IndexResidency::Hot(hot) => self.index.resident_bytes() > hot.budget,
+            IndexResidency::Hot(hot) => self.index.key_bytes() > hot.budget,
             _ => false,
         };
         let mut held = lock(&self.held);
@@ -467,9 +467,11 @@ impl ReelStore {
     /// Run one bounded pass of the whole maintenance plane
     ///
     /// Every pass is paced by the rates the volume was configured with, so the caller
-    /// drives this on a timer and never has to bound it. Bounded in bytes, not in
-    /// wall clock: a volume that named a compaction cap takes as long as the bytes it
-    /// moves owe at that cap, and an unpaced one returns at device speed.
+    /// drives this on a timer and never has to bound it. A compaction pass moves the
+    /// bytes its cap allows and takes as long as those bytes owe at that cap, and an
+    /// unpaced one returns at device speed. The scrub also stops at the stretch it
+    /// earned since its last pass, so a slow scrub holds the tick no longer than it
+    /// waited.
     pub fn maintain_once(&self) -> Result<()> {
         if self.is_read_only {
             return Ok(());
@@ -487,6 +489,9 @@ impl ReelStore {
         if let Err(error) = self.merge_when_due() {
             tracing::warn!("a maintenance tick left the sorted runs standing: {error}");
         }
+        // The handover goes again ahead of the scrub, since a rewrite or a merge above
+        // can hold the tick long enough for a backlog of sealed keys to build.
+        self.page_out_sealed()?;
         self.scrub_once()?;
         Ok(())
     }

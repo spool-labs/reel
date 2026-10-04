@@ -30,8 +30,11 @@ const GROWTH: f64 = 1.5;
 /// Shards, picked by the top byte of a key's hash
 const SHARDS: usize = 256;
 
-/// Buckets a shard starts with
+/// Buckets the lowest rung of a shard's ladder holds
 const FIRST_BUCKETS: usize = 8;
+
+/// Least a growth multiplies a shard by, so a table sized between rungs never grows by a sliver
+const LEAST_GROWTH: f64 = 1.2;
 
 /// Slots a full pair of buckets moves along before the shard grows instead
 const MAX_KICKS: usize = 256;
@@ -418,14 +421,40 @@ struct Table {
     buckets: Vec<Bucket>,
     held: usize,
     seed: u64,
+
+    /// Share of a growth step this shard's ladder is offset by
+    phase: f64,
+}
+
+/// Where shard `at`'s ladder sits within one growth step
+fn phase_of(at: usize) -> f64 {
+    at as f64 / SHARDS as f64
+}
+
+/// The rung a table of `len` buckets grows to, on the ladder offset by `phase`
+///
+/// Shards fill at one rate, so shards on one ladder cross their limit together and each
+/// holds its old table beside its new one: at 100M keys that was 1.45 GiB beside 2.16 GiB.
+/// Offset ladders put each shard's growth at its own key count.
+fn next_rung(len: usize, phase: f64) -> usize {
+    let least = len as f64 * LEAST_GROWTH / FIRST_BUCKETS as f64;
+    let rung = (least.ln() / GROWTH.ln() - phase).ceil();
+    let buckets = (FIRST_BUCKETS as f64 * GROWTH.powf(rung + phase)).round() as usize;
+    buckets.max(len + 1)
+}
+
+/// The lowest rung of the ladder offset by `phase`
+fn first_rung(phase: f64) -> usize {
+    (FIRST_BUCKETS as f64 * GROWTH.powf(phase)).round() as usize
 }
 
 impl Table {
-    fn with_buckets(count: usize) -> Table {
+    fn with_buckets(count: usize, phase: f64) -> Table {
         Table {
             buckets: vec![Bucket::default(); count.max(2)],
             held: 0,
             seed: count as u64,
+            phase,
         }
     }
 
@@ -511,14 +540,14 @@ impl Table {
 
     /// A table this one's slots fit into at the next size
     fn grown(&self) -> Table {
-        let mut count = ((self.buckets.len() as f64) * GROWTH).ceil() as usize;
+        let mut count = next_rung(self.buckets.len(), self.phase);
         loop {
-            let mut table = Table::with_buckets(count);
+            let mut table = Table::with_buckets(count, self.phase);
             let slots = self.buckets.iter().flat_map(|bucket| bucket.slots.iter());
             if slots.filter(|slot| !slot.is_empty()).all(|slot| table.place(*slot).is_ok()) {
                 return table;
             }
-            count = ((count as f64) * GROWTH).ceil() as usize;
+            count = next_rung(count, self.phase);
         }
     }
 
@@ -594,9 +623,9 @@ struct Shard {
 }
 
 impl Shard {
-    fn new() -> Shard {
+    fn new(at: usize) -> Shard {
         Shard {
-            table: RwLock::new(Table::with_buckets(FIRST_BUCKETS)),
+            table: RwLock::new(Table::with_buckets(first_rung(phase_of(at)), phase_of(at))),
             taken: AtomicU64::new(0),
             displaced: AtomicU64::new(0),
         }
@@ -710,7 +739,7 @@ impl Default for FastColumn {
 impl FastColumn {
     pub fn new() -> FastColumn {
         FastColumn {
-            shards: (0..SHARDS).map(|_| Shard::new()).collect(),
+            shards: (0..SHARDS).map(Shard::new).collect(),
             records: OnceLock::new(),
             segments: OnceLock::new(),
             stale: Mutex::new(VecDeque::new()),
@@ -753,6 +782,11 @@ impl FastColumn {
             .sum()
     }
 
+    /// Which of `lanes` runs of shards holds a key, so threads split a hand-over without sharing one
+    pub fn lane_of(key: &[u8], lanes: usize) -> usize {
+        shard_of(hash_of(key)) * lanes / SHARDS
+    }
+
     /// Hold a sealed record's location
     ///
     /// The caller hands over the newest version, so an older entry of the same key is
@@ -771,10 +805,10 @@ impl FastColumn {
     pub fn reserve(&self, keys: u64) {
         let per_shard = keys.div_ceil(SHARDS as u64) as f64;
         let buckets = (per_shard / (WAYS as f64 * LOAD)).ceil() as usize;
-        for shard in &self.shards {
+        for (at, shard) in self.shards.iter().enumerate() {
             let mut table = shard.write();
             if table.held == 0 && table.buckets.len() < buckets {
-                *table = Table::with_buckets(buckets);
+                *table = Table::with_buckets(buckets, phase_of(at));
             }
         }
     }
@@ -1412,11 +1446,11 @@ impl FastColumn {
 
     /// Drop every entry, for a rebuild starting over
     pub fn clear(&self) {
-        for shard in &self.shards {
+        for (at, shard) in self.shards.iter().enumerate() {
             let mut table = shard.write();
             let held = table.held as u64;
             let displaced = table.displaced.load(Ordering::Relaxed);
-            *table = Table::with_buckets(FIRST_BUCKETS);
+            *table = Table::with_buckets(first_rung(phase_of(at)), phase_of(at));
             table.count_taken(held, displaced);
         }
         lock(&self.stale).clear();

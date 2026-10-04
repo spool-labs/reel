@@ -70,9 +70,9 @@ than "this is corrupt".
 Three things flush regardless of the policy. A segment seal takes a full sync after
 writing its footer. Creating a segment syncs the volume directory, because a file's
 own sync says nothing about the entry naming it, and a crash that takes the
-directory block takes the whole segment with it. A tail also keeps a window of
-zeros written and synced ahead of its write head, so every append lands on a block
-the filesystem has already given out.
+directory block takes the whole segment with it. A tail that syncs often also
+keeps a window of zeros written and synced ahead of its write head, so its appends
+land on blocks the filesystem has already given out.
 
 The seal itself runs off the append path. A roll hands the retiring segment to
 a per-tail sealer thread, `flush()` drains that thread before syncing so a

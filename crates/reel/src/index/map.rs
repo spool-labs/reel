@@ -422,6 +422,16 @@ impl ReelIndex {
         self.fast.iter().map(FastColumn::held).sum()
     }
 
+    /// Bytes FastForward's tables hold, every bucket counted whether filled or not
+    pub fn fast_heap_bytes(&self) -> u64 {
+        self.fast.iter().map(FastColumn::heap_bytes).sum()
+    }
+
+    /// Bytes the sealed-key filters hold
+    pub fn sealed_keys_bytes(&self) -> u64 {
+        self.sealed_keys.iter().map(SealedKeys::heap_bytes).sum()
+    }
+
     /// Say every sealed key is in FastForward, so it may answer for them
     pub fn mark_fast_ready(&self) {
         self.fast_ready.store(true, Ordering::Release);

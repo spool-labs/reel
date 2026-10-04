@@ -684,6 +684,11 @@ impl ReelStore {
         self.index.resident_bytes()
     }
 
+    /// Bytes the footer cache holds across its footers, directories and blocks
+    pub fn footer_cache_bytes(&self) -> ByteCount {
+        ByteCount::from_bytes(self.reel.shared().footers.held_bytes() as u64)
+    }
+
     /// The volumes the operator declared dead, empty on a whole store
     ///
     /// The records those drives held answer as missing, and the reel has nothing

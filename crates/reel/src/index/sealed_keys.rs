@@ -98,6 +98,10 @@ impl SealedKeys {
     }
 
     /// Searches answered without asking any segment
+    pub fn heap_bytes(&self) -> u64 {
+        read(&self.levels).stack.iter().map(|filter| filter.encoded_len() as u64).sum()
+    }
+
     pub fn skips(&self) -> u64 {
         self.skips.load(Ordering::Relaxed)
     }

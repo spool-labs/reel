@@ -166,6 +166,9 @@ pub struct WalkRow {
     pub offset: u32,
     pub bound: u32,
     pub is_grave: bool,
+
+    /// Whether an overwrite or a delete booked this version as older, so it never answers alone
+    pub is_displaced: bool,
 }
 
 impl WalkRow {
@@ -176,6 +179,7 @@ impl WalkRow {
             offset: slot.offset,
             bound: slot.bound(),
             is_grave: slot.is_grave(),
+            is_displaced: slot.is_displaced(),
         }
     }
 }
@@ -1729,7 +1733,8 @@ impl FastColumn {
             .read()
             .matches(hash)
             .iter()
-            .any(|place| segments.max_lsn_of(place.slot.segment()).is_none_or(|max| max > lsn))
+            // A displaced slot was booked as older than a version written since, so it is never the newer one.
+            .any(|place| !place.slot.is_displaced() && segments.max_lsn_of(place.slot.segment()).is_none_or(|max| max > lsn))
     }
 
     /// How many slots have left each shard so far, read before a walk asks the map

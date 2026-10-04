@@ -519,6 +519,9 @@ struct SealedRow {
     lsn: Lsn,
     len: u32,
     is_tombstone: bool,
+
+    /// Whether this version came from a slot an overwrite or a delete booked as older
+    is_displaced: bool,
     segment: SegmentId,
     offset: u32,
 
@@ -581,6 +584,7 @@ pub fn ordered_page(
     paged: &Paged<'_>,
     fast: &FastColumn,
     width: usize,
+    settle: &dyn Fn(&[u8]) -> Result<Option<Entry>>,
     playback: &mut PlaybackCursor,
     limit: usize,
     out: &mut KeyPage,
@@ -601,7 +605,7 @@ pub fn ordered_page(
         keys: Vec::new(),
     };
     while out.len() < limit {
-        match ordered_round(paged, fast, width, playback, &mut walk, limit, out)? {
+        match ordered_round(paged, fast, width, settle, playback, &mut walk, limit, out)? {
             Round::More => {}
             Round::End => break,
             Round::Footers => return Ok(Ordered::Footers),
@@ -615,10 +619,12 @@ pub fn ordered_page(
 }
 
 /// One round of an ordered page: one look at the map and the index, then the records it points at
+#[allow(clippy::too_many_arguments)]
 fn ordered_round(
     paged: &Paged<'_>,
     fast: &FastColumn,
     width: usize,
+    settle: &dyn Fn(&[u8]) -> Result<Option<Entry>>,
     playback: &mut PlaybackCursor,
     walk: &mut Walk,
     limit: usize,
@@ -667,7 +673,7 @@ fn ordered_round(
         .flatten();
     let walked = walk.rows.last().map(|row| row.lead);
 
-    let Some(mut sealed) = read_sealed(fast, paged.column, width, way, with_payloads, walk)? else {
+    let Some(mut sealed) = read_sealed(fast, paged.column, width, way, with_payloads, settle, walk)? else {
         return Ok(Round::Footers);
     };
     let keys = walk.keys.as_slice();
@@ -771,13 +777,15 @@ fn ordered_round(
 /// compaction copy of the other. A row whose segment is gone is taken out of the index,
 /// since its record moved on or died. One only the checked path can read sends the page
 /// to the footers. A page for a caller reading every payload reads each record whole,
-/// so the payload comes in the same read.
+/// so the payload comes in the same read. A newest version an overwrite or a delete
+/// booked as older is settled by the checked path, since its delete may have no grave left.
 fn read_sealed(
     fast: &FastColumn,
     column: ColumnId,
     width: usize,
     way: Way,
     with_payloads: bool,
+    settle: &dyn Fn(&[u8]) -> Result<Option<Entry>>,
     walk: &mut Walk,
 ) -> Result<Option<Vec<SealedRow>>> {
     let Walk { from, rows, keys, .. } = walk;
@@ -804,6 +812,7 @@ fn read_sealed(
                 lsn: head.lsn,
                 len: head.len,
                 is_tombstone: head.is_tombstone,
+                is_displaced: row.is_displaced,
                 segment: row.segment,
                 offset: row.offset,
                 payload: value,
@@ -832,7 +841,21 @@ fn read_sealed(
         by_key.then((right.lsn, right.segment).cmp(&(left.lsn, left.segment)))
     });
     read.dedup_by(|later, kept| key_of(later) == key_of(kept));
-    Ok(Some(read))
+    let mut settled = Vec::with_capacity(read.len());
+    for row in read {
+        if !row.is_displaced {
+            settled.push(row);
+            continue;
+        }
+        match settle(key_of(&row))? {
+            Some(entry) if (entry.loc.segment, entry.loc.offset) == (row.segment, row.offset) => settled.push(row),
+            // A newer version FastForward holds no slot for, which the footers serve.
+            Some(_) => return Ok(None),
+            // Deleted, with its grave gone from the map.
+            None => {}
+        }
+    }
+    Ok(Some(settled))
 }
 
 /// One page of a column's own map, in the playback's direction

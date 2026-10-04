@@ -1698,7 +1698,8 @@ impl ReelIndex {
             Some(footers) => {
                 let paged = self.paged_at(slot, column, footers);
                 if let Some(width) = self.ordered_width(slot) {
-                    if ordered_page(&paged, &self.fast[slot], width, playback, limit, out)? == Ordered::Filled {
+                    let settle = |key: &[u8]| -> Result<Option<Entry>> { self.get(&RecordKey::from_bytes(column, key)?) };
+                    if ordered_page(&paged, &self.fast[slot], width, &settle, playback, limit, out)? == Ordered::Filled {
                         self.ordered_pages.fetch_add(1, Ordering::Relaxed);
                         return Ok(());
                     }

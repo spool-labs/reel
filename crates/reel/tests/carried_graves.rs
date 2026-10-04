@@ -10,6 +10,7 @@ use tempfile::TempDir;
 
 use reel::format::column::RecordKey;
 use reel::format::loc::SegmentId;
+use reel::format::lsn::Lsn;
 use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, MapShape,
     ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
@@ -24,6 +25,17 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     purge_mark: None,
     codec: Codec::None,
     map_shape: MapShape::Tree,
+}];
+
+/// The same column with its sealed keys walked in key order out of FastForward
+const ORDERED: ColumnSet = &[ColumnSpec {
+    id: ColumnId(1),
+    name: "rows",
+    key_width: KeyWidth::Fixed(16),
+    shard_bytes: 0,
+    purge_mark: None,
+    codec: Codec::None,
+    map_shape: MapShape::Ordered,
 }];
 
 /// A segment no tail will reach, standing in for a carried copy's segment
@@ -197,4 +209,24 @@ fn a_put_after_a_delete_survives_compacting_its_tombstone() {
     assert!(compaction.tombstones_dropped > 0, "the tombstone was carried over a newer put");
     assert_eq!(value(&store), Some(b"second".to_vec()));
     assert!(walked(&store), "a walk lost the second put");
+}
+
+// an ordered walk keeps a deleted key out once its grave is pruned, though its old version stands displaced
+#[test]
+fn an_ordered_walk_keeps_a_deleted_key_out_once_its_grave_is_pruned() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = ReelStore::open(dir.path().to_path_buf(), config(), ORDERED).expect("open");
+    Store::put(&store, "rows", &the_key(), b"first").expect("put");
+    fill(&store, 1);
+    Store::delete(&store, "rows", &the_key()).expect("delete");
+    fill(&store, 2);
+    store.index().prune_tombstones(Lsn(u64::MAX));
+    assert_eq!(store.index().grave_count(), 0, "the grave stood, so this tested nothing");
+
+    assert!(!walked(&store), "a key walk brought the deleted key back");
+    let values = Store::iter_from(&store, "rows", &[], Direction::Asc)
+        .expect("values")
+        .any(|(key, _)| key == the_key());
+    assert!(!values, "a value walk brought the deleted key back");
+    assert_eq!(value(&store), None, "a get brought the deleted key back");
 }

@@ -26,8 +26,6 @@ const COLUMNS: &[ColumnSpec] = &[ColumnSpec {
     name: "records",
     key_width: KeyWidth::Fixed(34),
     shard_bytes: 2,
-    inline_max: 0,
-    row_carry: 0,
     purge_mark: None,
     codec: Codec::None,
     map_shape: MapShape::Tree,

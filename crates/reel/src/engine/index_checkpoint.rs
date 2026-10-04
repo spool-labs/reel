@@ -180,7 +180,7 @@ impl ReelStore {
         column: ColumnId,
         closed: &BTreeMap<SegmentId, u64>,
     ) -> Result<()> {
-        let mut page = KeyPage::entries_only();
+        let mut page = KeyPage::with_lens();
         // One buffer for the resume bound rather than one per page.
         let mut from: Vec<u8> = Vec::new();
         let mut is_first = true;

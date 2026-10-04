@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::engine::ReelStore;
 use crate::format::column::MAX_KEY_LEN;
-use crate::format::footer::{SegmentFooter, NO_RECORD};
+use crate::format::footer::SegmentFooter;
 use crate::format::loc::SegmentId;
 use crate::format::record::{RecordHeader, HEADER_LEN};
 use crate::reel::{segment_file_name, SEGMENT_SUFFIX};
@@ -39,9 +39,6 @@ pub struct VerifyRow {
     /// Bytes those records span on disk
     pub bytes: u64,
 
-    /// Rows whose value lives in the footer alone, with no record to read
-    pub carried: u64,
-
     /// Records that would not read or would not match
     pub faults: u64,
 
@@ -57,7 +54,6 @@ impl VerifyRow {
             indexed: false,
             records: 0,
             bytes: 0,
-            carried: 0,
             faults: 0,
             fault: None,
         }
@@ -87,7 +83,7 @@ impl VerifyRow {
     /// they sweep clean with nothing in them. They are swept and counted either
     /// way; this is only whether a row of zeroes is worth a reader's line.
     pub fn is_empty(&self) -> bool {
-        self.records == 0 && self.faults == 0 && self.carried == 0
+        self.records == 0 && self.faults == 0
     }
 }
 
@@ -106,9 +102,6 @@ pub struct VerifyReport {
 
     /// Bytes those records span on disk
     pub bytes: u64,
-
-    /// Rows carried in a footer, with no record to read
-    pub carried_rows: u64,
 
     /// Records that would not read or would not match
     pub faults: u64,
@@ -215,7 +208,6 @@ pub fn verify_watched(
         segments_swept: rows.len(),
         records: rows.iter().map(|row| row.records).sum(),
         bytes: rows.iter().map(|row| row.bytes).sum(),
-        carried_rows: rows.iter().map(|row| row.carried).sum(),
         faults: rows.iter().map(|row| row.faults).sum(),
         unreadable_records: engine.unreadable_records(),
         caveats: caveats(&not_indexed, engine.unreadable_records()),
@@ -449,8 +441,6 @@ fn sweep_footer(file: &mut File, footer: &SegmentFooter, row: &mut VerifyRow, wa
     let mut at: Vec<(u32, u16, u32)> = Vec::new();
     for entry in footer.entries() {
         match entry {
-            // A row whose value lives in the footer alone has no record to read.
-            Ok(entry) if entry.offset == NO_RECORD => row.carried += 1,
             Ok(entry) => at.push((entry.offset, entry.key.width(), entry.len)),
             Err(error) => row.fault(format!("footer row does not decode: {error}")),
         }
@@ -586,7 +576,6 @@ impl Report for VerifyReport {
                 ("volume".to_string(), self.volume.clone()),
                 ("records checked".to_string(), self.records.to_string()),
                 ("bytes checked".to_string(), fmt::bytes(self.bytes)),
-                ("carried rows".to_string(), self.carried_rows.to_string()),
             ])
             .notes("faults", Tone::Bad, self.faults())
             .table(self.segment_table())
@@ -745,7 +734,6 @@ mod tests {
             indexed: true,
             records,
             bytes: records * 1024,
-            carried: 0,
             faults,
             fault: (faults > 0).then(|| format!("record at {segment} fails its checksum")),
         }
@@ -762,7 +750,6 @@ mod tests {
             segments_swept: rows.len(),
             records: rows.iter().map(|row| row.records).sum(),
             bytes: rows.iter().map(|row| row.bytes).sum(),
-            carried_rows: 0,
             faults: rows.iter().map(|row| row.faults).sum(),
             unreadable_records: 0,
             not_indexed: Vec::new(),

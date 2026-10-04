@@ -46,9 +46,6 @@ pub enum Way {
     Down,
 }
 
-/// The value a row hands the walk when the row is the only place it lives
-type Carried = Option<Arc<[u8]>>;
-
 /// One sealed segment's rows for one column, stepped in the playback's own order
 struct SegmentRows {
     /// Segment the rows came from, which is where their records are
@@ -130,20 +127,14 @@ impl SegmentRows {
     /// A segment that overwrote its own record holds both versions under one key in
     /// write order, so the newest is the last of the run and stepping past the rest
     /// keeps a repeated key from being merged twice.
-    fn take(&mut self) -> Result<Option<(FooterRow, Carried)>> {
+    fn take(&mut self) -> Result<Option<FooterRow>> {
         let Some((first, last)) = self.run() else {
             return Ok(None);
         };
         // The last of a run is the live one, whichever end the playback came at it from.
         let found = self.rows().row_at(last)?;
-        // A row that stands alone is the only copy of its value, with no record for
-        // the read to follow, so the walk takes the bytes here.
-        let carried = match found.stands_alone() {
-            true => self.rows().carried_at(last)?.map(Arc::from),
-            false => None,
-        };
         self.step_past(first, last);
-        Ok(Some((found, carried)))
+        Ok(Some(found))
     }
 
     /// Step past every row sharing the key the cursor sits on, reading none of them
@@ -486,7 +477,7 @@ pub fn merged_page(
         if index.entry_or_grave(key).is_some() {
             continue;
         }
-        let Some((segment, found, carried)) = newest else {
+        let Some((segment, found)) = newest else {
             continue;
         };
         if found.is_tombstone() || found.is_range_tombstone() {
@@ -495,12 +486,9 @@ pub fn merged_page(
         if index.is_covered_key(key, found.lsn) {
             continue;
         }
-        // The carry rides with the key, because a row that stands alone has no record
-        // for the read to follow and the key would point at the no-record sentinel.
-        out.push_carried(
+        out.push(
             key,
             Entry::new(Loc::new(segment, found.offset, found.len), found.lsn),
-            carried,
         );
     }
 
@@ -576,9 +564,7 @@ pub fn release_rows(
         examined += 1;
         last_len = key.len();
 
-        // The sweep wants where the row is, not what it holds, so a carry it took is
-        // dropped here rather than copied on to a caller that would ignore it.
-        let Some((segment, found, _)) = newest_row_below(rows, front, way, key, below)? else {
+        let Some((segment, found)) = newest_row_below(rows, front, way, key, below)? else {
             continue;
         };
         if found.is_tombstone() || found.is_range_tombstone() {
@@ -631,16 +617,16 @@ fn newest_row_below(
     way: Way,
     key: &[u8],
     below: Lsn,
-) -> Result<Option<(SegmentId, FooterRow, Carried)>> {
-    let mut newest: Option<(SegmentId, FooterRow, Carried)> = None;
+) -> Result<Option<(SegmentId, FooterRow)>> {
+    let mut newest: Option<(SegmentId, FooterRow)> = None;
     take_front(rows, front, way, key, |segment, row| {
-        if let Some((found, carried)) = row.take()? {
+        if let Some(found) = row.take()? {
             if found.lsn < below
                 && newest
                     .as_ref()
-                    .is_none_or(|(_, newest, _)| newest.lsn < found.lsn)
+                    .is_none_or(|(_, newest)| newest.lsn < found.lsn)
             {
-                newest = Some((segment, found, carried));
+                newest = Some((segment, found));
             }
         }
         Ok(())
@@ -702,15 +688,15 @@ fn newest_row(
     front: &mut Front,
     way: Way,
     key: &[u8],
-) -> Result<Option<(SegmentId, FooterRow, Carried)>> {
-    let mut newest: Option<(SegmentId, FooterRow, Carried)> = None;
+) -> Result<Option<(SegmentId, FooterRow)>> {
+    let mut newest: Option<(SegmentId, FooterRow)> = None;
     take_front(rows, front, way, key, |segment, row| {
-        if let Some((found, carried)) = row.take()? {
+        if let Some(found) = row.take()? {
             if newest
                 .as_ref()
-                .is_none_or(|(_, newest, _)| newest.lsn < found.lsn)
+                .is_none_or(|(_, newest)| newest.lsn < found.lsn)
             {
-                newest = Some((segment, found, carried));
+                newest = Some((segment, found));
             }
         }
         Ok(())
@@ -793,8 +779,6 @@ mod tests {
         name: "flat",
         key_width: KeyWidth::Fixed(8),
         shard_bytes: 0,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,

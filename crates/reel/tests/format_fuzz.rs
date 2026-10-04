@@ -215,9 +215,9 @@ fn payload_bytes(rng: &mut SmallRng, len: usize) -> Vec<u8> {
 
 // what admission stored, decode gives back exactly
 //
-// Lengths straddle the floor admission never tries under and the inline ceiling it
-// refuses at, so a run covers both refusals beside the keeps rather than assuming
-// them. A refusal must hand back the payload it was given, untouched.
+// Lengths straddle the floor admission never tries under, so a run covers the refusal
+// beside the keeps rather than assuming it. A refusal must hand back the payload it
+// was given, untouched.
 #[test]
 fn codec_payloads_roundtrip() {
     for seed in SEEDS {
@@ -225,9 +225,8 @@ fn codec_payloads_roundtrip() {
         for _ in 0..CASES {
             let len = rng.gen_range(0..=MAX_PAYLOAD_LEN);
             let logical = payload_bytes(&mut rng, len);
-            let inline_max = rng.gen_range(0..=128u16);
             for codec in CODECS {
-                let (stored, byte) = admit(*codec, inline_max, logical.clone());
+                let (stored, byte) = admit(*codec, logical.clone());
                 match byte {
                     0 => assert_eq!(stored, logical, "a refused payload was not handed back"),
                     _ => assert_eq!(
@@ -258,7 +257,7 @@ fn wounded_codec_payloads_never_panic() {
             let len = rng.gen_range(MAX_CASE_LEN..=MAX_PAYLOAD_LEN);
             let logical = payload_bytes(&mut rng, len);
             for codec in CODECS {
-                let (stored, byte) = admit(*codec, 0, logical.clone());
+                let (stored, byte) = admit(*codec, logical.clone());
                 if byte == 0 {
                     continue;
                 }

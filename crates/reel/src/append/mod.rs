@@ -481,17 +481,6 @@ impl Appender {
         )
     }
 
-    /// List a row whose value it holds, writing no record for it
-    ///
-    /// The value is not durable until the footer is, so the caller must seal the
-    /// destination before retiring the source and must not repoint the index at the row
-    /// before then.
-    pub fn list_carried_row(&self, entry: &FooterEntry) -> Result<SegmentId> {
-        let active = read(&self.active);
-        lock(&active.entries).push(entry);
-        Ok(active.handle.id())
-    }
-
     /// Carry a tombstone into a rewritten segment under its own sequence number
     pub fn append_carried_tombstone(&self, key: RecordKey, lsn: Lsn) -> Result<Committed> {
         self.admit(
@@ -1091,10 +1080,7 @@ impl Appender {
             at += BatchFrame::SPAN;
         }
         for (header, payload) in headers.iter().zip(payloads) {
-            let row_carry = self.shared.row_carry(header.key.column);
-            if let Some(entry) =
-                FooterEntry::from_record(header, at as u32, payload.as_slice(), row_carry)
-            {
+            if let Some(entry) = FooterEntry::from_record(header, at as u32) {
                 entries.push(entry);
             }
             WriteBuf::push_prefix(&mut bufs, header.pack());
@@ -1167,8 +1153,7 @@ impl Appender {
         header: &RecordHeader,
         payload: OwnedBuf,
     ) -> Result<Loc> {
-        let row_carry = self.shared.row_carry(header.key.column);
-        let listed = FooterEntry::from_record(header, base as u32, payload.as_slice(), row_carry);
+        let listed = FooterEntry::from_record(header, base as u32);
 
         // Five rather than four, since a spilled key rides in a buffer of its own.
         let mut bufs = take_bufs(5);

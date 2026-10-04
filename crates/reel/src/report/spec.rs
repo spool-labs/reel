@@ -122,8 +122,6 @@ pub fn column(spec: &str) -> SpecResult<ColumnSpec> {
         name: String::leak(name.to_string()),
         key_width,
         shard_bytes: 0,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,

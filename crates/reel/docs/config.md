@@ -132,14 +132,6 @@ against paging.
 That p99 is not all paging, which is the next section: this arm was carrying a
 stack of 427 standing runs that never collapsed, at 15.9 asks per get.
 
-Carrying and codecs are per column rather than per volume. `row_carry` puts a
-value's leading bytes in the sealed row so a warm point read never reaches the
-record; `codec` compresses the payload. With 128 bytes carried, an Lz4 column
-held 0.72 GiB against 0.87 GiB raw, 21 percent less disk, and the raw column
-answered warm points about 15 percent faster, 1.52 to 1.92 us against 1.79 to
-2.26. Disk is the only clean verdict in that pair; the write difference sat
-inside the harness drift. `carried_budget` bounds what the whole index carries.
-
 ## The write path
 
 **Batch, whatever else you do.** A 1.2 KB-record ingest, warm, single-stream,
@@ -225,16 +217,6 @@ segment number is not a version and every candidate has to be asked. So the
 symptom is reader-visible before it is fatal: `ReelStore::filter_probes` reports
 asks per get, and `sorted_run_dead_ratio` reports the share the trigger is being
 compared against.
-
-Do not lower `merge_dead_ratio` on a carrying paged volume yet. Measured on a
-64-thread EPYC, 2026-08: a merge pass whose rows carry lists them into one
-output segment that never rolls, so the pass mints a segment bounded only by
-the live set, and the maintenance tick then re-parses that footer forever. At
-six million live keys the cell crawled at under a megabyte a second and never
-finished. A ratio that fires the collapse currently buys fewer runs and a
-better median at the price of worse asks per get and an unbounded segment.
-Until the merge bounds its output, `0.50` (which in practice never fires) is
-the shipped default, and the collapse is a knob to leave alone.
 
 `merge_sorted_runs` requires `rewrite_on_seal` and is refused without it. A
 volume that does not seal by rewriting produces nothing sorted to merge.

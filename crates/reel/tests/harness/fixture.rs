@@ -21,28 +21,6 @@ use crate::harness::wire::{
     apply_mutation, group_prefix, wire_key, BLOB, RECORDS, RECORDS_CF, TEST_COLUMNS,
 };
 
-/// The harness columns with one of them carrying its values in its sealed rows
-///
-/// Derived from the harness columns field by field, so a change to the declaration
-/// cannot leave this holding a different key width or codec. Only the carry differs, and
-/// only on the record column, whose payloads straddle the carry so both populations run.
-const fn carrying(spec: &ColumnSpec, row_carry: u16) -> ColumnSpec {
-    ColumnSpec {
-        id: spec.id,
-        name: spec.name,
-        key_width: spec.key_width,
-        shard_bytes: spec.shard_bytes,
-        inline_max: spec.inline_max,
-        row_carry,
-        purge_mark: spec.purge_mark,
-        codec: spec.codec,
-        map_shape: spec.map_shape,
-    }
-}
-
-/// Bytes the carrying variant asks its record rows to hold
-pub const STREAM_CARRY: u16 = 256;
-
 /// Rounds of driving a guard gives the reel to reach a state the stream should have
 /// taken it to
 ///
@@ -50,12 +28,6 @@ pub const STREAM_CARRY: u16 = 256;
 /// needs rather than waiting for somebody else to run it. The passes are idempotent, so
 /// a run that has not reached it by here will not reach it at all.
 const LIVENESS_ROUNDS: u32 = 64;
-
-/// The carrying variant of the harness column set
-pub const CARRYING_COLUMNS: ColumnSet = &[
-    carrying(&TEST_COLUMNS[0], STREAM_CARRY),
-    carrying(&TEST_COLUMNS[1], 0),
-];
 
 /// The harness columns asking for open-addressed shards
 ///
@@ -67,8 +39,6 @@ const fn opened(spec: &ColumnSpec) -> ColumnSpec {
         name: spec.name,
         key_width: spec.key_width,
         shard_bytes: spec.shard_bytes,
-        inline_max: spec.inline_max,
-        row_carry: spec.row_carry,
         purge_mark: spec.purge_mark,
         codec: spec.codec,
         map_shape: MapShape::Open,
@@ -109,9 +79,6 @@ pub struct Differential {
 
     /// The step and op a divergence is reported against
     at_step: Option<(usize, String)>,
-
-    /// Rows listed by passes before the reopens that reset the reel's own counter
-    listed_before: u64,
 
     /// Sorted runs merged before those reopens, counted the same way
     merged_before: u64,
@@ -181,11 +148,6 @@ impl Differential {
         }
     }
 
-    /// The same, on a column set whose sealed rows carry their values
-    pub fn open_carrying(seed: u64, reel_config: ReelConfig) -> Differential {
-        Differential::open_with_columns(seed, reel_config, CARRYING_COLUMNS)
-    }
-
     /// The same, on a column set whose resident shards are open addressed
     pub fn open_shaped(seed: u64, reel_config: ReelConfig) -> Differential {
         let reel_config = ReelConfig {
@@ -235,7 +197,7 @@ impl Differential {
         self.reel_plan = plan_for_reopen;
     }
 
-    /// Open on a named column set, which is the only thing a carrying run needs
+    /// Open on a named column set, which is the only thing a shaped run needs
     fn open_with_columns(seed: u64, reel_config: ReelConfig, columns: ColumnSet) -> Differential {
         let sim = SimIo::new(FaultPlan::new(seed));
         let reel = ReelStore::open_with_io(
@@ -249,7 +211,6 @@ impl Differential {
         Differential {
             columns,
             at_step: None,
-            listed_before: 0,
             merged_before: 0,
             is_maintained: false,
             is_checkpointing: false,
@@ -282,14 +243,6 @@ impl Differential {
         self.merged_before + self.reel.compaction_counters().runs_merged
     }
 
-    /// Values a rewrite put in a row and wrote no record for
-    ///
-    /// Carried across the stream's reopens, since each one is a fresh store with fresh
-    /// counters and the question is what the whole run did.
-    pub fn rows_listed(&self) -> u64 {
-        self.listed_before + self.reel.compaction_counters().rows_listed
-    }
-
     /// Faults the reel's device reached, against the count its plan scheduled
     pub fn fault_reach(&self) -> (u64, usize) {
         self.reel_sim.fault_reach()
@@ -308,19 +261,6 @@ impl Differential {
                 fixture.paged_out > 0
             },
             &format!("seed {seed} paged nothing out"),
-        );
-    }
-
-    /// The stream's rewrites listed rows and deleted the records behind them
-    pub fn assert_rows_listed(&mut self) {
-        let seed = self.seed;
-        self.drive_until(
-            |fixture| {
-                fixture.hand_over_reel();
-                fixture.compact_reel();
-                fixture.rows_listed() > 0
-            },
-            &format!("seed {seed} listed no row, so it deleted no record"),
         );
     }
 
@@ -485,7 +425,6 @@ impl Differential {
     }
 
     fn reopen(&mut self) {
-        self.listed_before += self.reel.compaction_counters().rows_listed;
         self.merged_before += self.reel.compaction_counters().runs_merged;
         self.reel.flush().expect("flush reel");
         let image = self.reel_sim.durable_image();

@@ -29,8 +29,7 @@ impl ReelStore {
             planned.codec,
             Commit::PerRecord,
         )?;
-        self.index
-            .insert(key, committed.loc, committed.lsn, planned.carried)?;
+        self.index.insert(key, committed.loc, committed.lsn)?;
         Ok(())
     }
 
@@ -49,8 +48,7 @@ impl ReelStore {
                 Commit::PerRecord,
             )
             .await?;
-        self.index
-            .insert(key, committed.loc, committed.lsn, planned.carried)?;
+        self.index.insert(key, committed.loc, committed.lsn)?;
         Ok(())
     }
 
@@ -75,19 +73,9 @@ impl ReelStore {
         }
         self.check_column(key)?;
         self.check_capacity(payload.len() as u64)?;
-        let (payload, codec) = crate::append::codec::admit(
-            self.index.codec_of(key.column),
-            self.index.inline_max(key.column),
-            payload,
-        );
-        // Taken before the tail takes the buffer, and taken on stored bytes, so a
-        // compressed record carries what it stored.
-        let carried = self.index.carry_capture(key.column, &payload);
-        Ok(Planned {
-            payload,
-            codec,
-            carried,
-        })
+        let (payload, codec) =
+            crate::append::codec::admit(self.index.codec_of(key.column), payload);
+        Ok(Planned { payload, codec })
     }
 
     /// Apply a batch of writes as one reservation, one write, and one sync
@@ -136,11 +124,8 @@ impl ReelStore {
             let (key, write, op) = match write {
                 RecordWrite::Put { key, payload } => {
                     self.check_column(&key)?;
-                    let (payload, codec) = crate::append::codec::admit(
-                        self.index.codec_of(key.column),
-                        self.index.inline_max(key.column),
-                        payload,
-                    );
+                    let (payload, codec) =
+                        crate::append::codec::admit(self.index.codec_of(key.column), payload);
                     (key, BatchWrite::Put(payload, codec), KeyOp::Put)
                 }
                 RecordWrite::Delete { key } => {
@@ -159,15 +144,11 @@ impl ReelStore {
                     (start, BatchWrite::DeleteRange(carried), KeyOp::Range(end))
                 }
             };
-            let carried = match &write {
-                BatchWrite::Put(payload, _) => self.index.carry_capture(key.column, payload),
-                BatchWrite::Delete | BatchWrite::DeleteRange(_) => None,
-            };
             records.push(BatchRecord {
                 key: key.clone(),
                 write,
             });
-            keys.push(BatchKey { key, op, carried });
+            keys.push(BatchKey { key, op });
         }
         if records.is_empty() {
             return Ok(None);
@@ -202,7 +183,6 @@ impl ReelStore {
                     key: planned.key.as_slice(),
                     loc: landed.loc,
                     lsn: landed.lsn,
-                    carried: planned.carried.clone(),
                     is_delete: matches!(op, KeyOp::Delete),
                 }),
             }

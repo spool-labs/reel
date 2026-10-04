@@ -84,19 +84,13 @@ impl FooterSource for ReelShared {
     }
 
     /// One key, answered by reading the blocks the search touches and no more
-    fn find(
-        &self,
-        segment: SegmentId,
-        column: ColumnId,
-        key: &[u8],
-        carry: Option<&mut Vec<u8>>,
-    ) -> Result<Option<FooterRow>> {
+    fn find(&self, segment: SegmentId, column: ColumnId, key: &[u8]) -> Result<Option<FooterRow>> {
         self.probes.note_probe();
         if let Some(footer) = self.footers.get(segment) {
             let Some(partition) = footer.partition(column) else {
                 return Ok(None);
             };
-            return Ok(self.answer_of(partition.lookup(key, carry)?));
+            return Ok(self.answer_of(partition.lookup(key)?));
         }
 
         let Some(map) = self.footer_map_of(segment)? else {
@@ -137,7 +131,6 @@ impl FooterSource for ReelShared {
                     .insert_block(segment, column, at, Arc::clone(&block));
                 Ok(Some(block))
             },
-            carry,
         )?;
         Ok(self.answer_of(outcome))
     }
@@ -174,9 +167,6 @@ pub struct ReelShared {
 
     /// The columns this reel serves, for the widths a record's column declares
     pub columns: ColumnSet,
-
-    /// Inline width per column identifier, so a record's is one index rather than a scan
-    row_carries: Vec<u16>,
 
     /// The mark of each column placed by it, so a write's band is one index
     placement_marks: Vec<Option<PurgeMark>>,
@@ -346,10 +336,8 @@ impl ReelShared {
         columns: ColumnSet,
         next_segment: u32,
     ) -> ReelShared {
-        let mut row_carries = vec![0u16; COLUMN_SLOTS];
         let mut placement_marks = vec![None; COLUMN_SLOTS];
         for spec in columns {
-            row_carries[spec.id.as_index()] = spec.row_carry_width();
             placement_marks[spec.id.as_index()] = spec.placement_mark();
         }
         // The primary root stays first: the lock and the manifest live on it, and
@@ -374,7 +362,6 @@ impl ReelShared {
             footers: FooterCache::new(config.footer_cache.to_bytes() as usize),
             config,
             columns,
-            row_carries,
             placement_marks,
             purge_floor: AtomicU64::new(NOTHING_PURGED),
             next_segment: AtomicU32::new(next_segment.max(FIRST_SEGMENT)),
@@ -416,11 +403,6 @@ impl ReelShared {
             true => 0,
             false => self.config.seal_filter_bits(),
         }
-    }
-
-    /// Bytes a column asks a footer row to carry of the value itself
-    pub fn row_carry(&self, column: ColumnId) -> u16 {
-        self.row_carries[column.as_index()]
     }
 
     /// The band a write of this key belongs in, for a column placed by its mark

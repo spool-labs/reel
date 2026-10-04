@@ -36,8 +36,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     name: "accounts",
     key_width: KeyWidth::Fixed(32),
     shard_bytes: 2,
-    inline_max: 0,
-    row_carry: 0,
     purge_mark: None,
     codec: Codec::None,
     map_shape: MapShape::Tree,

@@ -5,8 +5,6 @@
 //! per record. Keys are packed end to end at the column's width, so a page is one
 //! allocation rather than one per key.
 
-use std::sync::Arc;
-
 use crate::index::entry::Entry;
 
 /// A run of keys in index order and, when asked for, where each one's record sits
@@ -17,9 +15,6 @@ pub struct KeyPage {
 
     /// Where each key's record sits, empty on a keys-only page
     found: Vec<Entry>,
-
-    /// The value for a key whose column carries it resident, empty otherwise
-    carried: Vec<Option<Arc<[u8]>>>,
 
     /// Stride the keys were packed at, meaningful only while the ends are empty
     width: usize,
@@ -32,9 +27,6 @@ pub struct KeyPage {
 
     /// Whether a caller will read the entries, so a keys-only walk skips them
     keeps_found: bool,
-
-    /// Whether a caller will read the carried values, so a fill can skip them
-    keeps_carried: bool,
 }
 
 impl KeyPage {
@@ -42,26 +34,8 @@ impl KeyPage {
     pub fn with_lens() -> KeyPage {
         KeyPage {
             keeps_found: true,
-            keeps_carried: true,
             ..KeyPage::default()
         }
-    }
-
-    /// The same page without the values a carrying column keeps beside its entries
-    ///
-    /// Saves a carrying column a map lookup and a refcount per key when the walk
-    /// reads where a record sits and never its bytes.
-    pub fn entries_only() -> KeyPage {
-        KeyPage {
-            keeps_found: true,
-            keeps_carried: false,
-            ..KeyPage::default()
-        }
-    }
-
-    /// Whether a fill should look up the value a carrying column holds for a key
-    pub fn keeps_carried(&self) -> bool {
-        self.keeps_carried
     }
 
     /// Drop the page's contents, keeping its allocations for the next fill
@@ -69,7 +43,6 @@ impl KeyPage {
         self.keys.clear();
         self.ends.clear();
         self.found.clear();
-        self.carried.clear();
         self.width = 0;
         self.count = 0;
     }
@@ -78,11 +51,6 @@ impl KeyPage {
     ///
     /// The page takes its stride from whichever key is added first.
     pub fn push(&mut self, key: &[u8], found: Entry) {
-        self.push_carried(key, found, None);
-    }
-
-    /// Add one key with the value its column carries beside the index
-    pub fn push_carried(&mut self, key: &[u8], found: Entry, carried: Option<Arc<[u8]>>) {
         // A page of one width is cut by arithmetic. A second width ends that, so
         // the ends are filled in for the keys already packed and kept from then on.
         if self.ends.is_empty() && self.count > 0 && key.len() != self.width {
@@ -99,15 +67,7 @@ impl KeyPage {
         if self.keeps_found {
             self.found.push(found);
         }
-        if self.keeps_carried {
-            self.carried.push(carried);
-        }
         self.count += 1;
-    }
-
-    /// Take the carried value at a position, leaving nothing behind
-    pub fn take_carried(&mut self, at: usize) -> Option<Arc<[u8]>> {
-        self.carried.get_mut(at).and_then(Option::take)
     }
 
     /// How many keys the page holds

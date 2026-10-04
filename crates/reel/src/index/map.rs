@@ -24,7 +24,7 @@ use crate::format::lsn::Lsn;
 use crate::index::column::{ColumnIndex, KeyMove, Landed, PendingCover};
 use crate::index::counters::{Floors, SegmentBytes, SegmentStamp, SegmentTable};
 use crate::index::entry::Entry;
-use crate::index::fastforward::{FastColumn, Lookup, Pick, RecordSource, Since, LOOKUP_TRIES};
+use crate::index::fastforward::{FastColumn, Lookup, Pick, RecordSource, Settled, Since, LOOKUP_TRIES};
 use crate::index::page::KeyPage;
 use crate::index::paged::{Candidates, FooterSource, SealedRanges};
 use crate::index::playback::{self, merged_page, Paged, PlaybackCursor, Way};
@@ -541,7 +541,10 @@ impl ReelIndex {
     /// The newest sealed version of a key, from FastForward once it holds every sealed key
     fn newest_live(&self, at: usize, key: &RecordKey) -> Result<Option<Entry>> {
         match self.fast_serves() {
-            true => self.fast[at].entry(key),
+            true => match self.fast[at].entry(key)? {
+                Settled::Entry(found) => Ok(found),
+                Settled::Footers => self.newest_sealed(at, key, None),
+            },
             false => self.newest_sealed(at, key, None),
         }
     }

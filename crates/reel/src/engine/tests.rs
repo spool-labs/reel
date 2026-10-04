@@ -1443,6 +1443,28 @@ fn a_paged_grave_outlives_the_window() {
     assert_eq!(store.totals().count, 199);
 }
 
+// a deleted key stays gone once its grave is pruned, though its old version still stands displaced
+#[test]
+fn a_deleted_key_stays_gone_once_its_grave_is_pruned() {
+    let payload = vec![0xa5u8; 8 * 1024];
+    let (store, handed) = paged_fixture(&payload);
+    store.delete(&handed).expect("delete");
+    // Enough to roll the tail, so the tombstone's segment seals and its grave may go.
+    for byte in 0..200u8 {
+        store.put(&record(8, byte), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
+    store.index.prune_tombstones(Lsn(u64::MAX));
+    assert_eq!(store.index.grave_count(), 0, "the grave stood, so this tested nothing");
+
+    assert!(store.get(&handed).expect("read").is_none(), "a get brought the key back");
+    assert!(block_on(store.get_wait(&handed)).expect("read").is_none(), "an awaited get brought the key back");
+    let many = store.get_many(&[handed.clone(), record(8, 1)]).expect("many");
+    assert!(many[0].is_none(), "a batch brought the key back");
+    assert!(store.get_range(&handed, 0, 64).expect("range").is_none(), "a range brought the key back");
+}
+
 // an idle tick prunes a grave to the counter, not to the window
 #[test]
 fn an_idle_tick_prunes_graves_to_the_counter() {

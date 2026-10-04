@@ -159,7 +159,20 @@ pub struct Pick {
     ordered: Vec<(Option<Lsn>, Slot)>,
     next: usize,
     best: Option<(Head, Option<Value>)>,
+
+    /// Whether the best version so far came from a displaced slot
+    best_displaced: bool,
     stale: Vec<(Slot, u32)>,
+}
+
+/// What the header path makes of a key's slots
+#[derive(Debug, PartialEq, Eq)]
+pub enum Settled {
+    /// The newest version a live slot holds, a grave for a tombstone, or nothing
+    Entry(Option<Entry>),
+
+    /// The newest version sits in a displaced slot, which only the footers can settle
+    Footers,
 }
 
 /// What folding one read into a lookup leaves it to do
@@ -1252,6 +1265,7 @@ impl FastColumn {
             ordered,
             next: 0,
             best: None,
+            best_displaced: false,
             stale: Vec::new(),
         })
     }
@@ -1295,7 +1309,10 @@ impl FastColumn {
                     pick.stale.push((candidate.slot, head.len));
                 }
             }
-            Some(_) | None => pick.best = Some((head, value)),
+            Some(_) | None => {
+                pick.best = Some((head, value));
+                pick.best_displaced = candidate.slot.is_displaced();
+            }
         }
         Offered::Next
     }
@@ -1311,22 +1328,25 @@ impl FastColumn {
             });
         }
         match pick.best {
+            // A displaced version was overwritten or deleted once, so what came after it is the footers' to say.
+            Some(_) if pick.best_displaced => Lookup::Unsettled,
             Some((head, Some(value))) => Lookup::Found(head.lsn, value),
             Some((_, None)) | None => Lookup::Missing,
         }
     }
 
     /// A key's newest sealed entry, reading every candidate's header, for a caller that reads the record itself
-    pub fn entry(&self, key: &RecordKey) -> Result<Option<Entry>> {
+    pub fn entry(&self, key: &RecordKey) -> Result<Settled> {
         let (Some(records), Some(segments)) = (self.records.get(), self.segments.get()) else {
-            return Ok(None);
+            return Ok(Settled::Entry(None));
         };
         for _ in 0..LOOKUP_TRIES {
-            if let Some(entry) = self.entry_once(key, records.as_ref(), segments)? {
-                return Ok(entry);
+            if let Some(settled) = self.entry_once(key, records.as_ref(), segments)? {
+                return Ok(settled);
             }
         }
-        Ok(None)
+        // Segments kept going under the look, and the footers hold still.
+        Ok(Settled::Footers)
     }
 
     /// One look at the table and a header read of each candidate, or nothing when a segment went under it
@@ -1335,7 +1355,7 @@ impl FastColumn {
         key: &RecordKey,
         records: &dyn RecordSource,
         segments: &SegmentTable,
-    ) -> Result<Option<Option<Entry>>> {
+    ) -> Result<Option<Settled>> {
         let (hash, ordered) = self.ordered(key, segments);
         let mut best: Option<(Head, Slot)> = None;
         for (ceiling, slot) in &ordered {
@@ -1356,13 +1376,16 @@ impl FastColumn {
                 HeadRead::Same(_) | HeadRead::Other | HeadRead::Cold => {}
             }
         }
-        Ok(Some(best.map(|(head, slot)| match head.is_tombstone {
+        if best.is_some_and(|(_, slot)| slot.is_displaced()) {
+            return Ok(Some(Settled::Footers));
+        }
+        Ok(Some(Settled::Entry(best.map(|(head, slot)| match head.is_tombstone {
             true => Entry::grave(head.lsn),
             false => {
                 let stamp = segments.incarnation_of(slot.segment());
                 Entry::new(Loc::new(slot.segment(), slot.offset, head.len), head.lsn).stamped(stamp)
             }
-        })))
+        }))))
     }
 
     /// Drop every entry pointing into a segment no longer standing, with no reads
@@ -1527,12 +1550,9 @@ mod tests {
         assert_eq!(displaced.classed.len(), 2);
         assert_eq!(column.displaced(), 2);
 
-        // the bystander still answers, from a lookup and from the header path
-        match column.read(&bystander).expect("read") {
-            Lookup::Found(lsn, _) => assert_eq!(lsn, Lsn(2)),
-            Lookup::Missing | Lookup::Unsettled => panic!("the bystander lost its record"),
-        }
-        assert_eq!(column.entry(&bystander).expect("entry").map(|entry| entry.lsn), Some(Lsn(2)));
+        // the bystander's newest version sits in a displaced slot, so both paths leave it to the footers
+        assert!(matches!(column.read(&bystander).expect("read"), Lookup::Unsettled));
+        assert_eq!(column.entry(&bystander).expect("entry"), Settled::Footers);
         // a single-candidate read and a move's shortcut leave a displaced slot to the full lookup
         assert!(column.sole(&bystander).is_none());
         assert!(!column.only_at(bystander.as_slice(), other));
@@ -1589,7 +1609,8 @@ mod tests {
         assert_eq!(records.heads.load(Ordering::Relaxed), 0);
         assert_eq!((column.held(), column.displaced()), (1, 1));
         assert_eq!(column.displace(&key(1), Lsn(11)).expect("displace"), Displaced::default());
-        assert_eq!(version(&column, 1), Some(1));
+        // a displaced version alone never answers, since it was overwritten or deleted once
+        assert!(matches!(column.read(&key(1)).expect("read"), Lookup::Unsettled));
         column.forget_retired(|segment| segment != SegmentId(1));
         assert_eq!((column.held(), column.displaced()), (0, 0));
 
@@ -1695,7 +1716,7 @@ mod tests {
         assert_eq!(version(&column, 9), Some(1));
         assert_eq!(column.held(), 1, "the slot into the gone segment went");
         column.insert(key(9).as_slice(), retired);
-        assert_eq!(column.entry(&key(9)).expect("entry").map(|entry| entry.lsn), Some(Lsn(1)));
+        assert!(matches!(column.entry(&key(9)).expect("entry"), Settled::Entry(Some(entry)) if entry.lsn == Lsn(1)));
         assert_eq!(column.held(), 1);
     }
 

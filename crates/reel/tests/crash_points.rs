@@ -16,7 +16,7 @@ use reel::format::record::{BatchFrame, RecordHeader, HEADER_LEN};
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::{
-    ByteCount, CompactPass, CompactRate, Preallocate, RecordWrite, ReelConfig, ReelStore,
+    ByteCount, IndexResidency, CompactPass, CompactRate, Preallocate, RecordWrite, ReelConfig, ReelStore,
     RepairPath, ShardShapes, SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
 };
 use reel_core::{Store, Value};
@@ -25,7 +25,9 @@ use reel_mock::MemoryStore;
 use harness::fixture::OPEN_COLUMNS;
 use harness::observe::observe;
 use harness::op_stream::{self, StreamOp};
-use harness::reel_harness::{assert_recount, flip_largest_segment, ReelHarness};
+use harness::reel_harness::{
+    assert_recount, counter_totals, flip_largest_segment, scan_totals, ReelHarness,
+};
 use harness::wire::{apply_mutation, framed_value, group_prefix, wire_key, RECORDS, RECORDS_CF};
 
 /// Group most targeted tests write into
@@ -74,6 +76,9 @@ const LARGE_PAYLOAD: usize = 20_000;
 
 /// Segment size that rolls right after one large record
 const SEGMENT_TIGHT: u64 = 24 * 1024;
+
+/// Payload bytes that fill a small segment in three records, so a short stream seals often
+const SEAL_PAYLOAD: usize = 5_000;
 
 /// First op position the sync error search schedules at
 const SYNC_ERROR_FROM: u64 = 4;
@@ -359,6 +364,69 @@ fn a_sole_copy_footer_never_outlives_its_records() {
             assert_only_written_values(&reopened, &ops, crash_at);
         }
     }
+}
+
+// every crash boundary of a paged stream reopens with FastForward answering as the footers do
+//
+// Records roll the tight segment, so the stream seals several times, and the overwrites
+// and deletes leave keys with versions in more than one segment for the open to settle.
+#[test]
+fn every_boundary_fastforward_answers_as_the_footers() {
+    let mut ops: Vec<StreamOp> = (1..=5u8)
+        .map(|address| put(GROUP, address, SEAL_PAYLOAD, address))
+        .collect();
+    ops.push(StreamOp::Overwrite {
+        group: GROUP,
+        address: 2,
+        len: SEAL_PAYLOAD,
+        fill: 20,
+    });
+    ops.push(StreamOp::Delete {
+        group: GROUP,
+        address: 3,
+    });
+    ops.push(put(GROUP, 6, SEAL_PAYLOAD, 6));
+    ops.push(StreamOp::Overwrite {
+        group: GROUP,
+        address: 4,
+        len: SEAL_PAYLOAD,
+        fill: 40,
+    });
+    let keys: Vec<RecordKey> = (1..=6u8)
+        .map(|address| RecordKey::from_bytes(RECORDS, &wire_key(GROUP, address)).expect("key"))
+        .collect();
+    // Unsynced, since what is compared is the two paths over whatever landed.
+    let paged = ReelConfig {
+        index: IndexResidency::Paged,
+        ..crash_config(1, SyncPolicy::Never, SEGMENT_SMALL)
+    };
+    let harness = ReelHarness::new(paged);
+    let total = harness.boundary_count(&ops);
+    assert!(total > 0, "the stream crosses no io boundary");
+
+    let mut loaded = 0u64;
+    for crash_at in 0..total {
+        let (sim, _) = harness.run(FaultPlan::new(1).with_crash(crash_at), &ops);
+        let reopened = harness.reopen(sim.durable_image());
+        // A paged open counts nothing in a sealed segment, so while one stands the
+        // counters are a floor, as the fixture holds them.
+        match reopened.born_segments() {
+            0 => assert_recount(&reopened, crash_at),
+            _ => assert!(
+                counter_totals(&reopened).count <= scan_totals(&reopened).count,
+                "the counters overcounted under born segments at {crash_at}"
+            ),
+        }
+        loaded = loaded.max(reopened.index().fast_held());
+        // As of a cue, a read takes the footer search, which is the answer to match.
+        let cue = reopened.cue().expect("cue");
+        for key in &keys {
+            let live = reopened.get(key).expect("get").map(|value| value.to_vec());
+            let footers = reopened.get_at(key, &cue).expect("cue read").map(|value| value.to_vec());
+            assert_eq!(live, footers, "key {key:?} after a crash at {crash_at}");
+        }
+    }
+    assert!(loaded > 0, "no reopen loaded FastForward, so the comparison proved nothing");
 }
 
 // a scattered crash across four tails keeps the acknowledged prefix too

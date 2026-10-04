@@ -2,18 +2,20 @@
 //!
 //! A lookup confirms each candidate against the key in the record's own header.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use reel_core::Value;
 
 use crate::error::Result;
-use crate::format::column::{KeyRef, RecordKey};
+use crate::format::column::{ColumnId, KeyRef, RecordKey};
+use crate::format::footer::{FooterFind, FooterPartition};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::index::counters::SegmentTable;
 use crate::index::entry::Entry;
+use crate::index::paged::FooterSource;
 use crate::sync::{lock, read, write};
 
 /// Slots in one bucket, which fills one cache line
@@ -33,6 +35,9 @@ const FIRST_BUCKETS: usize = 8;
 
 /// Slots a full pair of buckets moves along before the shard grows instead
 const MAX_KICKS: usize = 256;
+
+/// Threads an open settles its set-aside rows on, each read waiting on the device
+const SETTLE_THREADS: usize = 8;
 
 /// Times a lookup starts over when a candidate's segment went while it read
 ///
@@ -451,6 +456,22 @@ struct Stale {
     len: u32,
 }
 
+/// The slot a set-aside row stands as, a grave for a tombstone
+fn slot_of(hash: u64, row: &SetAside) -> Slot {
+    match row.is_tombstone {
+        true => Slot::new(hash, row.loc).as_grave(),
+        false => Slot::new(hash, row.loc),
+    }
+}
+
+/// A sealed row an open set aside, because a slot already shared its key's bits
+struct SetAside {
+    key: RecordKey,
+    loc: Loc,
+    lsn: Lsn,
+    is_tombstone: bool,
+}
+
 /// A column's sealed keys as record locations, in shards picked by hash
 pub struct FastColumn {
     shards: Vec<RwLock<Table>>,
@@ -458,6 +479,9 @@ pub struct FastColumn {
     segments: OnceLock<Arc<SegmentTable>>,
     stale: Mutex<VecDeque<Stale>>,
     beside: AtomicU64,
+
+    /// Rows an open took before it could read a header, settled once it can
+    set_aside: Mutex<Vec<SetAside>>,
 }
 
 impl Default for FastColumn {
@@ -476,6 +500,7 @@ impl FastColumn {
             segments: OnceLock::new(),
             stale: Mutex::new(VecDeque::new()),
             beside: AtomicU64::new(0),
+            set_aside: Mutex::new(Vec::new()),
         }
     }
 
@@ -516,6 +541,187 @@ impl FastColumn {
         table.insert(slot);
     }
 
+    /// Size every shard for about this many keys, so a load does not grow them a step at a time
+    pub fn reserve(&self, keys: u64) {
+        let per_shard = keys.div_ceil(SHARDS as u64) as f64;
+        let buckets = (per_shard / (WAYS as f64 * LOAD)).ceil() as usize;
+        for shard in &self.shards {
+            let mut table = write(shard);
+            if table.held == 0 && table.buckets.len() < buckets {
+                *table = Table::with_buckets(buckets);
+            }
+        }
+    }
+
+    /// Take one sealed footer partition's rows during an open, before any header can be read
+    ///
+    /// The rows go in a shard at a time, one lock and one warm table each. A row whose
+    /// key's bits no slot shares goes straight in. One that meets a slot is a second
+    /// version of a key, or rarely another key, and waits for `settle_rows`.
+    pub fn take_partition(&self, segment: SegmentId, partition: &FooterPartition) -> Result<()> {
+        let mut by_shard: Vec<Vec<(u64, Slot, u32)>> = vec![Vec::new(); SHARDS];
+        for at in 0..partition.len() {
+            let entry = partition.entry_at(at)?;
+            if entry.is_range_tombstone() {
+                continue;
+            }
+            let hash = hash_of(entry.key.as_slice());
+            let slot = Slot::new(hash, Loc::new(segment, entry.offset, entry.len));
+            let slot = match entry.is_tombstone() {
+                true => slot.as_grave(),
+                false => slot,
+            };
+            by_shard[shard_of(hash)].push((hash, slot, at as u32));
+        }
+        // Loaders start at different shards, so two of them rarely want the same lock.
+        let first = segment.as_u32() as usize % SHARDS;
+        let mut aside = Vec::new();
+        for shard in (first..SHARDS).chain(0..first) {
+            let rows = &by_shard[shard];
+            if rows.is_empty() {
+                continue;
+            }
+            let mut table = write(&self.shards[shard]);
+            for (hash, slot, at) in rows {
+                match table.matches(*hash).is_empty() {
+                    true => table.insert(*slot),
+                    false => aside.push(*at),
+                }
+            }
+        }
+        if aside.is_empty() {
+            return Ok(());
+        }
+        let mut set_aside = Vec::with_capacity(aside.len());
+        for at in aside {
+            let entry = partition.entry_at(at as usize)?;
+            set_aside.push(SetAside {
+                loc: Loc::new(segment, entry.offset, entry.len),
+                lsn: entry.lsn,
+                is_tombstone: entry.is_tombstone(),
+                key: entry.key,
+            });
+        }
+        lock(&self.set_aside).extend(set_aside);
+        Ok(())
+    }
+
+    /// Settle the rows an open set aside, against the footers of the slots they met
+    ///
+    /// A set-aside row nearly always meets one slot, another version of its key. That
+    /// slot's footer says by key which record it is and how new, so rows are grouped by
+    /// the slot's segment and each footer is read once, with no record read. A row that
+    /// meets no slot or several, or one its footer cannot settle, reads headers.
+    pub fn settle_rows(&self, column: ColumnId, footers: &dyn FooterSource) -> Result<()> {
+        let rows = std::mem::take(&mut *lock(&self.set_aside));
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut by_segment: HashMap<SegmentId, Vec<usize>> = HashMap::new();
+        let mut by_header = Vec::new();
+        for (at, row) in rows.iter().enumerate() {
+            let hash = hash_of(row.key.as_slice());
+            let seen = read(&self.shards[shard_of(hash)]).matches(hash);
+            match seen.len() {
+                1 => by_segment.entry(seen[0].slot.segment()).or_default().push(at),
+                _ => by_header.push(at),
+            }
+        }
+        let groups: Vec<(SegmentId, Vec<usize>)> = by_segment.into_iter().collect();
+        let next = AtomicUsize::new(0);
+        let unsettled = Mutex::new(by_header);
+        std::thread::scope(|scope| -> Result<()> {
+            let workers: Vec<_> = (0..SETTLE_THREADS)
+                .map(|_| {
+                    scope.spawn(|| -> Result<()> {
+                        while let Some((segment, group)) = groups.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let left = self.settle_against(column, *segment, group, &rows, footers)?;
+                            lock(&unsettled).extend(left);
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+            }
+            Ok(())
+        })?;
+        for at in std::mem::take(&mut *lock(&unsettled)) {
+            let row = &rows[at];
+            self.load(&row.key, row.loc, row.lsn, row.is_tombstone)?;
+        }
+        Ok(())
+    }
+
+    /// Settle the rows whose slot sits in one segment, handing back those its footer cannot
+    fn settle_against(
+        &self,
+        column: ColumnId,
+        segment: SegmentId,
+        group: &[usize],
+        rows: &[SetAside],
+        footers: &dyn FooterSource,
+    ) -> Result<Vec<usize>> {
+        let Some(footer) = footers.footer_once(segment)? else {
+            return Ok(group.to_vec());
+        };
+        let Some(partition) = footer.partition(column) else {
+            return Ok(group.to_vec());
+        };
+        let mut group = group.to_vec();
+        group.sort_unstable_by(|left, right| rows[*left].key.cmp(&rows[*right].key));
+        let mut unsettled = Vec::new();
+        for same_key in group.chunk_by(|left, right| rows[*left].key == rows[*right].key) {
+            // The newest set-aside version of the key, a tie to the newer segment.
+            let Some(newest) = same_key
+                .iter()
+                .copied()
+                .max_by_key(|at| (rows[*at].lsn, rows[*at].loc.segment))
+            else {
+                continue;
+            };
+            let row = &rows[newest];
+            let standing = match partition.lookup(row.key.as_slice())? {
+                FooterFind::Found(found) => found,
+                // The slot this row met holds another key.
+                FooterFind::Missing | FooterFind::RuledOut => {
+                    unsettled.extend_from_slice(same_key);
+                    continue;
+                }
+            };
+            let hash = hash_of(row.key.as_slice());
+            let mut table = write(&self.shards[shard_of(hash)]);
+            let held = table.matches(hash);
+            let place = held.iter().find(|place| place.slot.segment() == segment).copied();
+            let is_newer = (row.lsn, row.loc.segment) > (standing.lsn, segment);
+            let settled = match place {
+                // The slot is the version this footer holds, so the newer of the two stands.
+                Some(place) if place.slot.offset == standing.offset => {
+                    if is_newer {
+                        table.take(hash, &place.slot);
+                        table.insert(slot_of(hash, row));
+                    }
+                    true
+                }
+                // The slot is an older version in a segment that rewrote the key, and the
+                // footer's newest is this row.
+                Some(place) if segment == row.loc.segment && standing.offset == row.loc.offset => {
+                    table.take(hash, &place.slot);
+                    table.insert(slot_of(hash, row));
+                    true
+                }
+                Some(_) | None => false,
+            };
+            if !settled {
+                unsettled.extend_from_slice(same_key);
+            }
+        }
+        Ok(unsettled)
+    }
+
     /// Load one sealed row, keeping each key's newest version and a tombstone as a grave
     ///
     /// A slot sharing the key's bits is a version of the key, or rarely another key, so
@@ -531,6 +737,13 @@ impl FastColumn {
             false => Slot::new(hash, loc),
         };
         let shard = shard_of(hash);
+        {
+            let mut table = write(&self.shards[shard]);
+            if table.matches(hash).is_empty() {
+                table.insert(slot);
+                return Ok(());
+            }
+        }
         loop {
             let seen = read(&self.shards[shard]).matches(hash);
             let mut standing = None;
@@ -792,6 +1005,7 @@ impl FastColumn {
             *write(shard) = Table::with_buckets(FIRST_BUCKETS);
         }
         lock(&self.stale).clear();
+        lock(&self.set_aside).clear();
         self.beside.store(0, Ordering::Relaxed);
     }
 }

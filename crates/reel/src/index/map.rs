@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::ops::Bound;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::units::ByteCount;
@@ -149,8 +149,6 @@ const RELEASE_RUN: usize = 1024;
 /// front of a fan-out and no hit can stop the walk short of it.
 const NO_CEILING: Lsn = Lsn(u64::MAX);
 
-/// Threads a FastForward load reads sealed footers on, one footer each at a time
-const LOAD_THREADS: usize = 8;
 
 /// One range delete's cover as a batch hands it to the index
 ///
@@ -367,68 +365,47 @@ impl ReelIndex {
         self.fast_ready.store(true, Ordering::Release);
     }
 
-    /// Fill FastForward with every sealed key's newest live version, then let it answer
+    /// Take a sealed footer's rows during a paged open, a range row aside
+    pub fn take_sealed_footer(&self, segment: SegmentId, footer: &SegmentFooter) -> Result<()> {
+        for partition in &footer.partitions {
+            if let Some(at) = self.slot(partition.column) {
+                self.fast[at].take_partition(segment, partition)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Size FastForward from the first sealed footer of an open, since segments run to one size
+    pub fn reserve_fast(&self, footer: &SegmentFooter, segments: usize) {
+        for partition in &footer.partitions {
+            if let Some(at) = self.slot(partition.column) {
+                self.fast[at].reserve((partition.len() * segments) as u64);
+            }
+        }
+    }
+
+    /// Finish what a paged open loaded into FastForward, then let it answer
     ///
-    /// Each sealed footer is read once, a footer a thread at a time, so what a load holds
-    /// is a few footers and not the volume's. A key the map holds stays with the map,
-    /// and a row a finished range delete took stays out.
-    pub fn load_fast(&self) -> Result<()> {
+    /// The rows set aside read their headers now that records can be read. A key the
+    /// map holds has a newer version than any footer, so FastForward's older one goes.
+    pub fn finish_fast_load(&self) -> Result<()> {
         if !self.residency.pages() || self.fast_ready.load(Ordering::Acquire) {
             return Ok(());
         }
         let Some(footers) = self.footers.get() else {
             return Ok(());
         };
-        let mut sealed: Vec<SegmentId> = self.sealed.iter().flat_map(SealedRanges::segments).collect();
-        sealed.sort_unstable();
-        sealed.dedup();
-        let next = AtomicUsize::new(0);
-        std::thread::scope(|scope| -> Result<()> {
-            let workers: Vec<_> = (0..LOAD_THREADS)
-                .map(|_| {
-                    scope.spawn(|| -> Result<()> {
-                        while let Some(segment) = sealed.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            if let Some(footer) = footers.footer_once(*segment)? {
-                                self.load_footer(*segment, &footer)?;
-                            }
-                        }
-                        Ok(())
-                    })
-                })
-                .collect();
-            for worker in workers {
-                worker
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
-            }
-            Ok(())
-        })?;
-        for fast in &self.fast {
+        for (at, fast) in self.fast.iter().enumerate() {
+            fast.settle_rows(self.columns[at].id, footers.as_ref())?;
             fast.finish_load();
         }
-        self.mark_fast_ready();
-        Ok(())
-    }
-
-    /// Load one sealed footer's rows, leaving out what the map or a finished cover answers for
-    fn load_footer(&self, segment: SegmentId, footer: &SegmentFooter) -> Result<()> {
-        for partition in &footer.partitions {
-            let Some(at) = self.slot(partition.column) else {
-                continue;
-            };
-            let index = &self.indexes[at];
-            for entry in partition.entries() {
-                let entry = entry?;
-                let key = entry.key.as_slice();
-                let is_answered = entry.is_range_tombstone()
-                    || index.entry_or_grave(key).is_some()
-                    || index.covered_by_swept(key, entry.lsn);
-                if !is_answered {
-                    let loc = Loc::new(segment, entry.offset, entry.len);
-                    self.fast[at].load(&entry.key, loc, entry.lsn, entry.is_tombstone())?;
-                }
+        for (at, index) in self.indexes.iter().enumerate() {
+            for (key, entry) in index.held() {
+                let key = RecordKey::new(self.columns[at].id, key);
+                self.fast[at].displace(&key, entry.lsn)?;
             }
         }
+        self.mark_fast_ready();
         Ok(())
     }
 

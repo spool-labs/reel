@@ -304,6 +304,52 @@ fn fastforward_answers_sealed_keys() {
     check(&reopened, &expected, "a reopen");
 }
 
+// a FastForward column takes a range delete and a prefix count, and refuses an index checkpoint cleanly
+#[test]
+fn fastforward_takes_ranges_and_prefix_counts() {
+    let paged = ReelConfig {
+        index: IndexResidency::Paged,
+        ..config(1, SyncPolicy::Never)
+    };
+    let (store, sim) = sim_store(paged.clone());
+    let payload = vec![0x5au8; 8 * 1024];
+    for byte in 0..200u8 {
+        store.put(&record(7, byte), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+    assert!(store.index.fast_held() > 0, "the handover filled FastForward");
+
+    let dropped = 50..150u8;
+    store
+        .delete_range(&record(7, dropped.start), Some(record(7, dropped.end).as_slice()))
+        .expect("delete range");
+    let check = |store: &ReelStore, stage: &str| {
+        for byte in 0..200u8 {
+            let found = store.get(&record(7, byte)).expect("get");
+            assert_eq!(found.is_some(), !dropped.contains(&byte), "key {byte} after {stage}");
+        }
+        let counted = reel_core::Store::count_prefix(store, "record", &7u16.to_be_bytes()).expect("count");
+        assert_eq!(counted, 100, "the prefix count after {stage}");
+    };
+    check(&store, "the range delete");
+    for _ in 0..4 {
+        store.maintain_once().expect("maintain");
+    }
+    check(&store, "the cover sweep");
+    assert!(
+        matches!(store.checkpoint_index(), Err(ReelError::Rejected(_))),
+        "a paging volume refuses an index checkpoint"
+    );
+
+    store.close().expect("close");
+    drop(store);
+    let restored = SimIo::from_image(sim.durable_image());
+    let reopened = ReelStore::open_with_io(PathBuf::from(ROOT), paged, COLUMNS, Arc::new(restored))
+        .expect("reopen");
+    check(&reopened, "a reopen");
+}
+
 // a sealed segment's ceiling covers its tombstone rows and not only its records
 #[test]
 fn a_ceiling_covers_a_tombstone() {

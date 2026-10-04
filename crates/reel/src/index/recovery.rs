@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::sync::{Condvar, Mutex};
 
 use crate::config::ThreadBudget;
@@ -54,6 +55,9 @@ const BATCH: usize = 4096;
 
 /// Segments a resident rebuild holds before it feeds their rows in key order
 const FEED_WINDOW: usize = MAX_READERS * READ_AHEAD;
+
+/// Threads a paged open loads sealed footers into FastForward on, and footers queued for them
+const LOADERS: usize = 8;
 
 /// Rows a column's window must hold before its feed splits across threads
 const SPLIT_FEED_ROWS: usize = 4 * BATCH;
@@ -193,12 +197,34 @@ pub fn rebuild_from_persisted(
         jobs.push((segment, path, len));
     }
     let mut held: Vec<Held> = Vec::new();
-    read_segments(driver, &jobs, |at, parts| {
+    // A paged open hands each sealed footer to FastForward's loaders as it is swept, so
+    // the loads run beside the reads instead of after them.
+    let (queue, feed) = std::sync::mpsc::sync_channel::<(SegmentId, SegmentFooter)>(LOADERS);
+    let feed = Mutex::new(feed);
+    let loaders = match pages {
+        true => LOADERS,
+        false => 0,
+    };
+    std::thread::scope(|scope| -> Result<()> {
+        let loading: Vec<_> = (0..loaders)
+            .map(|_| scope.spawn(|| load_footers(index, &feed)))
+            .collect();
+        let queue = pages.then_some(queue);
+        let mut is_sized = false;
+        let read = read_segments(driver, &jobs, |at, parts| {
         let (segment, path, len) = &jobs[at];
         match absorb_segment(*segment, parts, pages, &mut resolver, &mut held)? {
-            Loaded::Sealed => {
+            Loaded::Sealed(footer) => {
                 consumed.insert(*segment, *len);
                 sealed_files.push((*segment, path.clone(), *len));
+                if let (Some(queue), Some(footer)) = (&queue, footer) {
+                    if !is_sized {
+                        index.reserve_fast(&footer, jobs.len());
+                        is_sized = true;
+                    }
+                    // The loaders keep receiving until the queue closes, so a send never waits on nothing.
+                    let _ = queue.send((*segment, footer));
+                }
             }
             Loaded::Walked(offset, is_at_fill, entries) => {
                 consumed.insert(*segment, offset);
@@ -221,6 +247,14 @@ pub fn rebuild_from_persisted(
             feed_held(&mut held, &mut resolver, &mut resumable)?;
         }
         Ok(())
+    });
+        drop(queue);
+        for loader in loading {
+            loader
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+        }
+        read
     })?;
     feed_held(&mut held, &mut resolver, &mut resumable)?;
     // A file that goes bad partway through its rows starts the rebuild over without it.
@@ -279,10 +313,31 @@ fn adopt(
     read
 }
 
+/// Take sealed footers off the queue into FastForward until it closes
+///
+/// A failed load keeps receiving, so the sweep feeding the queue never waits on a loader
+/// that stopped, and the first error comes back once the queue is done.
+fn load_footers(index: &ReelIndex, feed: &Mutex<Receiver<(SegmentId, SegmentFooter)>>) -> Result<()> {
+    let mut failed = None;
+    loop {
+        let next = lock(feed).recv();
+        let Ok((segment, footer)) = next else {
+            break;
+        };
+        if failed.is_none() {
+            failed = index.take_sealed_footer(segment, &footer).err();
+        }
+    }
+    match failed {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 /// What reading one segment during a rebuild turned out to be
 enum Loaded {
-    /// A sealed segment, read from its footer, with nothing left to follow
-    Sealed,
+    /// A sealed segment, read from its footer, which a paged open still has to load
+    Sealed(Option<SegmentFooter>),
 
     /// An unsealed tail, walked to an offset, whether it may be taken up again, and
     /// its rows packed as its footer holds them
@@ -497,20 +552,21 @@ fn absorb_segment(
 ) -> Result<Loaded> {
     match parts {
         SegmentParts::Foreign => Ok(Loaded::Foreign),
-        SegmentParts::Sealed(footer, ends) => {
-            match pages {
-                true => sweep_footer(segment, &footer, &mut ends.into_iter(), resolver)?,
-                false => {
-                    stand_ranges(segment, &footer, ends, resolver)?;
-                    held.push(Held {
-                        segment,
-                        footer,
-                        is_sorted: true,
-                    });
-                }
+        SegmentParts::Sealed(footer, ends) => match pages {
+            true => {
+                sweep_footer(segment, &footer, &mut ends.into_iter(), resolver)?;
+                Ok(Loaded::Sealed(Some(footer)))
             }
-            Ok(Loaded::Sealed)
-        }
+            false => {
+                stand_ranges(segment, &footer, ends, resolver)?;
+                held.push(Held {
+                    segment,
+                    footer,
+                    is_sorted: true,
+                });
+                Ok(Loaded::Sealed(None))
+            }
+        },
         SegmentParts::Walked(tail) => {
             stand_ranges(segment, &tail.footer, tail.ends, resolver)?;
             held.push(Held {

@@ -99,6 +99,9 @@ impl KeyPage {
         if self.keeps_found {
             self.found.reserve(count);
         }
+        if self.reads_payloads {
+            self.payloads.reserve(count);
+        }
     }
 
     /// Add one key and the payload length its record holds

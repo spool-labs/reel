@@ -743,6 +743,10 @@ impl ReelStore {
         if hint != 0 {
             playback.run = hint;
             playback.page.size = hint.clamp(1, PLAYBACK_PAGE_MAX);
+            // Sized once to the caller's count, so the first page fills without regrowing.
+            let size = playback.page.size;
+            playback.staged.reserve(size);
+            playback.found.reserve(size);
         }
         playback
     }

@@ -1992,6 +1992,8 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         if limit == 0 {
             return;
         }
+        // Sized once, so a walk's first page does not regrow its buffers a key at a time.
+        out.reserve(limit, usize::from(self.declared_width));
         let first = match start {
             Bound::Unbounded => 0,
             Bound::Included(key) | Bound::Excluded(key) => self.shard_of_bytes(key),
@@ -2100,6 +2102,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// Fill a page with one bounded run of live keys, descending from a bound
     pub fn page_back(&self, end: Bound<&[u8]>, limit: usize, out: &mut KeyPage) {
         out.clear();
+        out.reserve(limit, usize::from(self.declared_width));
         if limit == 0 {
             return;
         }

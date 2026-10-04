@@ -597,12 +597,14 @@ pub fn ordered_page(
         Bound::Included(key) | Bound::Excluded(key) => Some(FastColumn::lead(key.as_slice())),
         Bound::Unbounded => None,
     };
+    // Sized to the page and its slack once, rather than regrown a row at a time.
+    let room = limit + ORDERED_SLACK;
     let mut walk = Walk {
         from,
         lead,
         is_sealed_done: false,
-        rows: Vec::new(),
-        keys: Vec::new(),
+        rows: Vec::with_capacity(room),
+        keys: Vec::with_capacity(room * width),
     };
     while out.len() < limit {
         match ordered_round(paged, fast, width, settle, playback, &mut walk, limit, out)? {

@@ -228,6 +228,10 @@ fn bound_of(class: u32) -> u32 {
 
 /// A key's 64 bit hash, mixed so structured keys spread like random ones
 fn hash_of(key: &[u8]) -> u64 {
+    #[cfg(test)]
+    if let Some(shared) = tests::shared_hash(key) {
+        return shared;
+    }
     const ODD: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut state = 0xCBF2_9CE4_8422_2325 ^ key.len() as u64;
     let mut chunks = key.chunks_exact(8);
@@ -1482,6 +1486,56 @@ mod tests {
         let mut bytes = [0u8; 16];
         bytes[..8].copy_from_slice(&at.to_be_bytes());
         RecordKey::from_bytes(COLUMN, &bytes).expect("key")
+    }
+
+    /// Keys under this prefix all hash alike, so a test can stand two keys on one fingerprint
+    const SHARED: &[u8] = b"shared!!";
+
+    /// The hash every key under the shared prefix takes
+    const SHARED_HASH: u64 = 0x5EED_0000_5EED_0000;
+
+    pub(super) fn shared_hash(key: &[u8]) -> Option<u64> {
+        key.starts_with(SHARED).then_some(SHARED_HASH)
+    }
+
+    fn shared_key(at: u64) -> RecordKey {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(SHARED);
+        bytes[8..].copy_from_slice(&at.to_be_bytes());
+        RecordKey::from_bytes(COLUMN, &bytes).expect("key")
+    }
+
+    // an overwrite that meets another key's slot on a shared fingerprint costs a booking, never that key
+    #[test]
+    fn a_shared_fingerprint_never_loses_the_other_key() {
+        let records = Arc::new(Records::default());
+        let segments = Arc::new(SegmentTable::new());
+        let column = FastColumn::new();
+        column.attach(Arc::clone(&records) as Arc<dyn RecordSource>, Arc::clone(&segments));
+        records.is_cold.store(true, Ordering::Relaxed);
+        let (overwritten, bystander) = (shared_key(1), shared_key(2));
+        let (old, other) = (Loc::new(SegmentId(1), 0, 200), Loc::new(SegmentId(2), 0, 300));
+        records.write(old, overwritten.as_slice(), Lsn(1));
+        records.write(other, bystander.as_slice(), Lsn(2));
+        segments.note_max(SegmentId(1), Lsn(5));
+        segments.note_max(SegmentId(2), Lsn(5));
+        column.insert(overwritten.as_slice(), old);
+        column.insert(bystander.as_slice(), other);
+
+        // with no read the overwrite cannot tell the two slots apart, so it books both
+        let displaced = column.displace(&overwritten, Lsn(10)).expect("displace");
+        assert_eq!(displaced.classed.len(), 2);
+        assert_eq!(column.displaced(), 2);
+
+        // the bystander still answers, from a lookup and from the header path
+        match column.read(&bystander).expect("read") {
+            Lookup::Found(lsn, _) => assert_eq!(lsn, Lsn(2)),
+            Lookup::Missing | Lookup::Unsettled => panic!("the bystander lost its record"),
+        }
+        assert_eq!(column.entry(&bystander).expect("entry").map(|entry| entry.lsn), Some(Lsn(2)));
+        // a single-candidate read and a move's shortcut leave a displaced slot to the full lookup
+        assert!(column.sole(&bystander).is_none());
+        assert!(!column.only_at(bystander.as_slice(), other));
     }
 
     fn column(records: &Arc<Records>) -> FastColumn {

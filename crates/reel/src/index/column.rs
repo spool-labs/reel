@@ -6,7 +6,6 @@
 //! a no-op and runtime visibility matches what a crash rebuild would resolve.
 
 use std::borrow::Borrow;
-use std::collections::HashMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
@@ -17,7 +16,7 @@ use crate::config::{IndexResidency, ShardShapes};
 use crate::engine::Totals;
 use crate::error::{ReelError, Result};
 use crate::format::column::{ColumnId, ColumnSpec, KeyBytes, MapShape, RecordKey, MAX_KEY_LEN};
-use crate::format::loc::{Loc, SegmentId, SegmentIncarnation};
+use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::index::counters::SegmentTable;
 use crate::index::entry::{span_of, Entry};
@@ -417,14 +416,19 @@ impl ColumnIndex {
         on_index!(self, index => index.page_out(key, loc))
     }
 
-    /// Install rebuilt entries in one pass, replacing whatever the column held
-    pub fn install(&self, entries: Vec<(KeyBytes, Entry)>, segments: &SegmentTable) {
-        on_index!(self, index => index.install(entries, segments))
+    /// Every entry the column holds, graves included, in key order
+    pub fn held(&self) -> Vec<(KeyBytes, Entry)> {
+        on_index!(self, index => index.held())
     }
 
-    /// Put back a range a rebuild resolved, without sweeping for what it covers
-    pub fn install_cover(&self, start: &[u8], end: Option<&KeyBytes>, lsn: Lsn) {
-        on_index!(self, index => index.install_cover(start, end, lsn))
+    /// Take out an entry a rebuild found outversioned, booking a record dead
+    pub fn drop_shadowed(&self, key: &[u8], segments: &SegmentTable) {
+        on_index!(self, index => index.drop_shadowed(key, segments))
+    }
+
+    /// Size every shard's map to what it holds, once a rebuild has filled it
+    pub fn fit(&self) {
+        on_index!(self, index => index.fit())
     }
 
     /// Drop every key, for a reader rebuilding the whole volume
@@ -1728,63 +1732,43 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         true
     }
 
-    /// Install rebuilt entries in one pass, replacing whatever the column held
-    ///
-    /// A paged rebuild brings graves as well as records, and they are counted as
-    /// graves here rather than left to look like keys. The segment table must already
-    /// hold what the same rebuild resolved, since every entry takes its stamp from it
-    /// on the way in.
-    pub fn install(&self, entries: Vec<(KeyBytes, Entry)>, segments: &SegmentTable) {
-        self.clear();
-        let mut stamps: HashMap<SegmentId, SegmentIncarnation> = HashMap::new();
-        // The entries arrive in key order and the shards cut the key space by
-        // prefix, so each shard's keys are one contiguous run, gathered outside any
-        // lock and taken as one sorted bulk load under one lock take.
-        let mut run: Vec<(K, Entry)> = Vec::new();
-        let mut run_shard = 0usize;
-        for (key, entry) in entries {
-            let key = match K::from_slice(key.as_slice()) {
-                Some(key) => key,
-                None => continue,
-            };
-            let stamp = *stamps
-                .entry(entry.loc.segment)
-                .or_insert_with(|| segments.incarnation_of(entry.loc.segment));
-            let entry = entry.stamped(stamp);
-            let at = self.shard_of(&key);
-            if at != run_shard && !run.is_empty() {
-                self.install_run(run_shard, std::mem::take(&mut run));
+    /// Every entry the column holds, graves included, in key order
+    pub fn held(&self) -> Vec<(KeyBytes, Entry)> {
+        let mut out = Vec::new();
+        for at in self.occupied_range(0, self.shards.len() - 1) {
+            let state = read(&self.shards[at]);
+            for (key, entry) in state.map.walk() {
+                if let Ok(key) = KeyBytes::new(key.as_slice()) {
+                    out.push((key, *entry));
+                }
             }
-            run_shard = at;
-            run.push((key, entry));
         }
-        if !run.is_empty() {
-            self.install_run(run_shard, run);
-        }
+        out
     }
 
-    /// Land one shard's sorted run: counters, filter, and the map in one take
-    fn install_run(&self, at: usize, run: Vec<(K, Entry)>) {
+    /// Take out an entry a rebuild found outversioned, booking a record dead
+    pub fn drop_shadowed(&self, key: &[u8], segments: &SegmentTable) {
+        let Some(key) = K::from_slice(key) else {
+            return;
+        };
+        let at = self.shard_of(&key);
         let mut state = write(&self.shards[at]);
-        let was_empty = state.map.vacant();
-        for (key, entry) in &run {
-            state.bytes += u64::from(entry.loc.len);
-            if entry.is_grave() {
-                state.note_grave(entry.lsn);
+        match state.map.at(key.as_slice()).copied() {
+            Some(existing) if existing.is_grave() => {
+                state.map.take(key.as_slice());
+                state.graves -= 1;
             }
-            self.filters.note(at, filter_hash(key.as_slice()));
+            Some(existing) => self.drop_entry(&mut state, &key, existing, segments),
+            None => return,
         }
-        state.map.absorb_sorted(run);
-        self.note_filled(at, was_empty);
+        self.note_emptied(at, &mut state);
     }
 
-    /// Put back a range a rebuild resolved, without sweeping for what it covers
-    ///
-    /// The cover comes back unswept: a rebuild resolved every record it read against
-    /// the range already. On a paged column the refusal is still the only thing
-    /// between a covered key and a footer search that would find it.
-    pub fn install_cover(&self, start: &[u8], end: Option<&KeyBytes>, lsn: Lsn) {
-        self.push_cover(start, end.map(|end| K::low_bound(end.as_slice())), lsn);
+    /// Size every shard's map to what it holds, once a rebuild has filled it
+    pub fn fit(&self) {
+        for at in self.occupied_range(0, self.shards.len() - 1) {
+            write(&self.shards[at]).map.fit();
+        }
     }
 
     /// Raise one cover, the shape a range delete and a rebuild share
@@ -2380,17 +2364,8 @@ pub trait ShardMap<K: IndexKey, V: 'static>: Default {
         }
     }
 
-    /// Take a sorted run in one pass, the shape a rebuild hands over
-    ///
-    /// The default puts the pairs in one at a time; a map with a bulk path takes the
-    /// run whole and builds at full fill. The run must be in key order, and repeats
-    /// are allowed with the last one winning: the same run cannot land differently
-    /// for having found the shard empty.
-    fn absorb_sorted(&mut self, run: Vec<(K, V)>) {
-        for (key, val) in run {
-            self.put(key, val);
-        }
-    }
+    /// Give back the room a map grown a key at a time holds past its fill
+    fn fit(&mut self) {}
 
     /// One page of the shard and where the next one starts, in whatever order
     /// the shape keeps.
@@ -2500,14 +2475,9 @@ impl<const B: usize, V: Default + 'static> ShardMap<Box<[u8]>, V> for TBTreeMap<
         self.get_many_sorted(keys, out);
     }
 
-    fn absorb_sorted(&mut self, run: Vec<(Box<[u8]>, V)>) {
-        match self.is_empty() {
-            true => *self = TBTreeMap::from_sorted(run, B),
-            false => {
-                for (key, val) in run {
-                    self.insert(key, val);
-                }
-            }
+    fn fit(&mut self) {
+        if !self.is_packed() {
+            self.repack(B);
         }
     }
 
@@ -2590,14 +2560,9 @@ impl<const N: usize, const B: usize, V: Default + 'static> ShardMap<[u8; N], V>
         self.get_many_sorted(keys, out);
     }
 
-    fn absorb_sorted(&mut self, run: Vec<([u8; N], V)>) {
-        match self.is_empty() {
-            true => *self = TBTreeMap::from_sorted(run, B),
-            false => {
-                for (key, val) in run {
-                    self.insert(key, val);
-                }
-            }
+    fn fit(&mut self) {
+        if !self.is_packed() {
+            self.repack(B);
         }
     }
 
@@ -2695,8 +2660,8 @@ impl<const N: usize, V: Default + 'static> ShardMap<[u8; N], V> for OpenTable<N,
         (page, next.map(|at| Mark::Slot { at, generation }))
     }
 
-    fn absorb_sorted(&mut self, run: Vec<([u8; N], V)>) {
-        self.absorb(run);
+    fn fit(&mut self) {
+        OpenTable::fit(self);
     }
 
     fn pack_owed(&mut self) {
@@ -3769,35 +3734,6 @@ mod tests {
         assert!(!index.contains(&key(65535, 1)));
         sweep_all(&index, &segments);
         assert_eq!(index.totals().count, 1);
-    }
-
-    // installing rebuilt entries sets keys and totals at once
-    #[test]
-    fn install_replaces() {
-        let index = sharded();
-        let segments = SegmentTable::new();
-        index
-            .insert(&key(5, 5), Entry::new(loc(1, 0, 50), Lsn(1)), &segments)
-            .took_place();
-
-        index.install(
-            vec![
-                (
-                    KeyBytes::new(&key(1, 1)).expect("key"),
-                    Entry::new(loc(1, 0, 400), Lsn(1)),
-                ),
-                (
-                    KeyBytes::new(&key(2, 2)).expect("key"),
-                    Entry::new(loc(2, 0, 900), Lsn(2)),
-                ),
-            ],
-            &segments,
-        );
-
-        assert_eq!(index.totals().count, 2);
-        assert_eq!(index.totals().bytes, ByteCount::from_bytes(1300));
-        assert!(!index.contains(&key(5, 5)));
-        assert_eq!(index.get(&key(2, 2)).expect("present").lsn, Lsn(2));
     }
 
     // a repoint moves a key to its copy only while the version is unchanged

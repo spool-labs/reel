@@ -239,6 +239,13 @@ impl<const N: usize, Value: Default> OpenTable<N, Value> {
         self.resize(slots_for(self.held));
     }
 
+    /// Size the table to its load factor, for one grown a key at a time
+    pub fn fit(&mut self) {
+        if self.slots() > slots_for(self.held) {
+            self.resize(slots_for(self.held));
+        }
+    }
+
     /// Every pair the table holds, in key order
     ///
     /// Gathered and sorted, since an open-addressed table has no order to read off.

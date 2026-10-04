@@ -24,7 +24,7 @@ use crate::format::lsn::Lsn;
 use crate::index::column::{ColumnIndex, KeyMove, Landed, PendingCover};
 use crate::index::counters::{Floors, SegmentBytes, SegmentStamp, SegmentTable};
 use crate::index::entry::Entry;
-use crate::index::fastforward::{FastColumn, Lookup, RecordSource};
+use crate::index::fastforward::{FastColumn, Lookup, Pick, RecordSource, Since, LOOKUP_TRIES};
 use crate::index::page::KeyPage;
 use crate::index::paged::{Candidates, FooterSource, SealedRanges};
 use crate::index::playback::{self, merged_page, Paged, PlaybackCursor, Way};
@@ -130,11 +130,45 @@ pub struct KeyRepoint {
     /// Column and key the record is addressed by
     pub key: RecordKey,
 
+    /// Where the pass read the record it copied, when it knows
+    pub from: Option<Loc>,
+
     /// Where the copy landed
     pub to: Loc,
 
     /// The sequence number the move is guarded by, which is the source's own
     pub lsn: Lsn,
+}
+
+/// Where a batch's keys sit: an entry the map or a footer gave, or a FastForward lookup to read
+pub struct Located {
+    /// An entry per key, nothing for a key with none or one a pick answers
+    pub found: Vec<Option<Entry>>,
+
+    /// The keys FastForward answers, each with its lookup started
+    pub picks: Vec<FastPick>,
+}
+
+/// One key of a batch that FastForward answers
+pub struct FastPick {
+    /// The key's position in the batch
+    pub at: usize,
+
+    /// The column its table sits at
+    pub column: usize,
+    pub pick: Pick,
+
+    /// Where the key's shard stood before the map was asked
+    pub since: Since,
+}
+
+/// Where a FastForward lookup goes before any read
+pub enum FastRoute {
+    /// The map answered, or the column is not FastForward's to answer
+    Settled(Lookup),
+
+    /// The column at this position holds the key's sealed versions, and its shard stood here before the map was asked
+    Column(usize, Since),
 }
 
 /// Paged keys a range delete settles at a time
@@ -313,24 +347,40 @@ impl ReelIndex {
     ///
     /// A key the map holds reads through the checked path, which is one read too.
     pub fn fast_read(&self, key: &RecordKey) -> Result<Lookup> {
+        match self.fast_route(key) {
+            FastRoute::Settled(lookup) => Ok(lookup),
+            FastRoute::Column(at, since) => Ok(self.fast_finish(at, key, since, self.fast[at].read(key)?)),
+        }
+    }
+
+    /// Where a FastForward lookup goes: settled by the map already, or to one column's table
+    pub fn fast_route(&self, key: &RecordKey) -> FastRoute {
         let (Some(at), true) = (self.slot(key.column), self.fast_serves()) else {
-            return Ok(Lookup::Unsettled);
+            return FastRoute::Settled(Lookup::Unsettled);
         };
+        let since = self.fast[at].since(key);
         let index = &self.indexes[at];
         match index.entry_or_grave(key.as_slice()) {
             Some(entry) if entry.is_grave() || index.is_covered_key(key.as_slice(), entry.lsn) => {
-                return Ok(Lookup::Missing)
+                FastRoute::Settled(Lookup::Missing)
             }
-            Some(_) => return Ok(Lookup::Unsettled),
-            None => {}
+            Some(_) => FastRoute::Settled(Lookup::Unsettled),
+            None => FastRoute::Column(at, since),
         }
-        Ok(match self.fast[at].read(key)? {
-            Lookup::Found(lsn, _) if index.is_covered_key(key.as_slice(), lsn) => Lookup::Missing,
-            // A write or a compaction move put the key in the map after it was asked, and
-            // took the sealed entry out after this went looking.
-            Lookup::Missing if index.entry_or_grave(key.as_slice()).is_some() => Lookup::Unsettled,
+    }
+
+    /// One column's FastForward table, for a lookup the caller drives itself
+    pub fn fast_column(&self, at: usize) -> &FastColumn {
+        &self.fast[at]
+    }
+
+    /// Apply what a footer cannot know to a FastForward answer: covers, and a slot that left under it
+    pub fn fast_finish(&self, at: usize, key: &RecordKey, since: Since, lookup: Lookup) -> Lookup {
+        match lookup {
+            Lookup::Found(lsn, _) if self.indexes[at].is_covered_key(key.as_slice(), lsn) => Lookup::Missing,
+            Lookup::Missing if self.fast[at].moved(since) => Lookup::Unsettled,
             found => found,
-        })
+        }
     }
 
     /// Take out up to `budget` older versions FastForward lookups read past, and book them
@@ -423,20 +473,36 @@ impl ReelIndex {
         let Some(at) = self.slot(key.column) else {
             return Ok(None);
         };
+        if !self.residency.pages() {
+            return Ok(self.mapped(at, key).flatten());
+        }
+        for _ in 0..LOOKUP_TRIES {
+            let since = self.fast[at].since(key);
+            if let Some(answer) = self.mapped(at, key) {
+                return Ok(answer);
+            }
+            let found = self.sealed_entry(at, key)?;
+            if found.is_some() || !self.fast_serves() || !self.fast[at].moved(since) {
+                return Ok(found);
+            }
+        }
+        // Slots kept leaving the key's shard under every look, and the footers hold still.
+        match self.mapped(at, key) {
+            Some(answer) => Ok(answer),
+            None => Ok(self.live_only(at, key, self.newest_sealed(at, key, None)?)),
+        }
+    }
+
+    /// What the map says about a key, a grave or a cover over it as nothing, or no word
+    fn mapped(&self, at: usize, key: &RecordKey) -> Option<Option<Entry>> {
         match self.indexes[at].entry_or_grave(key.as_slice()) {
-            Some(entry) if entry.is_grave() => return Ok(None),
+            Some(entry) if entry.is_grave() => Some(None),
             // An entry a cover spans is a key the drop took, and the map held the
             // newest version, so there is no footer left to ask.
-            Some(entry) if self.indexes[at].is_covered_key(key.as_slice(), entry.lsn) => {
-                return Ok(None)
-            }
-            Some(entry) => return Ok(Some(entry)),
-            None => {}
+            Some(entry) if self.indexes[at].is_covered_key(key.as_slice(), entry.lsn) => Some(None),
+            Some(entry) => Some(Some(entry)),
+            None => None,
         }
-        if !self.residency.pages() {
-            return Ok(None);
-        }
-        self.sealed_entry(at, key)
     }
 
     /// The newest thing every sealed footer says about a key
@@ -444,10 +510,15 @@ impl ReelIndex {
     /// The fan-out below finds it; what is left here is the two things a footer
     /// cannot know about itself, a tombstone row and a range delete.
     fn sealed_entry(&self, at: usize, key: &RecordKey) -> Result<Option<Entry>> {
-        match self.newest_live(at, key)? {
-            Some(entry) if entry.is_grave() => Ok(None),
-            Some(entry) if self.indexes[at].is_covered_key(key.as_slice(), entry.lsn) => Ok(None),
-            found => Ok(found),
+        Ok(self.live_only(at, key, self.newest_live(at, key)?))
+    }
+
+    /// A sealed find with a tombstone row or a range delete over it read as nothing
+    fn live_only(&self, at: usize, key: &RecordKey, found: Option<Entry>) -> Option<Entry> {
+        match found {
+            Some(entry) if entry.is_grave() => None,
+            Some(entry) if self.indexes[at].is_covered_key(key.as_slice(), entry.lsn) => None,
+            found => found,
         }
     }
 
@@ -923,14 +994,28 @@ impl ReelIndex {
     /// Under the barrier so a batch publishing beside this cannot answer some of
     /// the keys from before it and the rest from after. One key takes nothing,
     /// since one key cannot be half a batch.
-    pub fn get_many(&self, keys: &[RecordKey]) -> Result<Vec<Option<Entry>>> {
+    pub fn get_many(&self, keys: &[RecordKey]) -> Result<Located> {
+        let mut picks = Vec::new();
         // One key cannot be half a batch, and grouping it would put the barrier, the
         // sort and the shard run in front of a single descent for nothing.
         if keys.len() < 2 {
-            return match keys.first() {
-                Some(key) => Ok(vec![self.get(key)?]),
-                None => Ok(Vec::new()),
+            let Some(key) = keys.first() else {
+                return Ok(Located {
+                    found: Vec::new(),
+                    picks,
+                });
             };
+            let found = match self.fast_pick(0, key) {
+                Some(pick) => {
+                    picks.push(pick);
+                    None
+                }
+                None => self.get(key)?,
+            };
+            return Ok(Located {
+                found: vec![found],
+                picks,
+            });
         }
         let _reading = self.publish.reading();
         let mut found: Vec<Option<Entry>> = vec![None; keys.len()];
@@ -969,14 +1054,37 @@ impl ReelIndex {
                         None
                     }
                     Some(entry) => Some(*entry),
-                    // A key the map has nothing for may still be in a sealed footer,
-                    // which is a device read rather than a lookup.
-                    None => self.paged_entry(slot, key)?,
+                    // A key the map has nothing for may still be in a sealed segment. A pick
+                    // taken here reads its candidates later as one batch.
+                    None => match (self.fast_pick(*index, key), self.residency.pages()) {
+                        (Some(pick), _) => {
+                            picks.push(pick);
+                            None
+                        }
+                        // The map took the key since the look above, or FastForward is not
+                        // serving yet, so the whole lookup answers.
+                        (None, true) => self.get(key)?,
+                        (None, false) => None,
+                    },
                 };
             }
             at = end;
         }
-        Ok(found)
+        Ok(Located { found, picks })
+    }
+
+    /// A FastForward lookup for a key the map holds nothing for, started under the caller's barrier
+    fn fast_pick(&self, at: usize, key: &RecordKey) -> Option<FastPick> {
+        let FastRoute::Column(column, since) = self.fast_route(key) else {
+            return None;
+        };
+        let pick = self.fast[column].pick(key)?;
+        Some(FastPick {
+            at,
+            column,
+            pick,
+            since,
+        })
     }
 
     /// Run a follower's apply pass under the exclusive barrier
@@ -1141,16 +1249,26 @@ impl ReelIndex {
     /// Repoint a key from a compacted record to its rewritten copy under a guard
     ///
     /// A paged key has no entry to repoint, so it comes back into the map until the
-    /// destination seals and hands it over again. Where it came from is read back out
-    /// of the footer rather than taken from the caller, since that is also what says
-    /// the row is still the version being moved.
-    pub fn repoint(&self, key: &RecordKey, to: Loc, expected_lsn: Lsn) -> Result<bool> {
+    /// destination seals and hands it over again. The caller's source stands when it is
+    /// the key's one FastForward slot. Otherwise the footers give the source, and they
+    /// also say whether the row is still the version being moved.
+    pub fn repoint(&self, key: &RecordKey, from: Option<Loc>, to: Loc, expected_lsn: Lsn) -> Result<bool> {
         let Some(at) = self.slot(key.column) else {
             return Ok(false);
         };
         let index = &self.indexes[at];
         if !self.is_paged_key(at, key) {
             return Ok(index.repoint(key.as_slice(), to, expected_lsn, &self.segments));
+        }
+        // The pass read the record at its source, so when that is the key's one FastForward
+        // slot it is this key at this version, and no slot holds a newer one: no read needed.
+        if let Some(from) = from.filter(|from| self.fast_serves() && self.fast[at].only_at(key.as_slice(), *from)) {
+            let counted = self.counted(from.segment);
+            let moved = index.repoint_paged(key.as_slice(), from, to, expected_lsn, counted, &self.segments);
+            if moved {
+                self.fast[at].remove_at(key.as_slice(), from);
+            }
+            return Ok(moved);
         }
         match self.sealed_state(at, key)? {
             Sealed::Live(entry) if entry.lsn == expected_lsn => {
@@ -1194,7 +1312,7 @@ impl ReelIndex {
         self.publish_pass(|| {
             let mut moved = 0u64;
             for repoint in moves {
-                if self.repoint(&repoint.key, repoint.to, repoint.lsn)? {
+                if self.repoint(&repoint.key, repoint.from, repoint.to, repoint.lsn)? {
                     moved += 1;
                 }
             }

@@ -21,7 +21,7 @@ use crate::config::RepairPath;
 use crate::error::{ReelError, Result};
 use crate::format::column::{ColumnId, RecordKey};
 use crate::format::footer::{FooterPartition, FooterRow, SegmentFooter};
-use crate::format::loc::SegmentId;
+use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::index::map::{KeyRepoint, ReelIndex};
 use crate::reel::segment::{SegmentHandle, SegmentReader};
@@ -129,7 +129,7 @@ struct MergeState {
     copies: Vec<CopyRecord>,
 
     /// Each queued record's key, sequence number and span, for its repoint and the report
-    queued: Vec<(RecordKey, Lsn, u64)>,
+    queued: Vec<(RecordKey, Loc, Lsn, u64)>,
 
     /// Bytes the queued records frame
     queued_bytes: u64,
@@ -658,7 +658,7 @@ fn copy_record(
         payload,
         codec: record.header.codec,
     });
-    state.queued.push((key.clone(), record.header.lsn, span));
+    state.queued.push((key.clone(), record.loc(segment), record.header.lsn, span));
     Ok(())
 }
 
@@ -669,12 +669,13 @@ fn land_copies(writer: &Appender, state: &mut MergeState) -> Result<()> {
     }
     state.queued_bytes = 0;
     let landed = writer.append_copies(std::mem::take(&mut state.copies))?;
-    for ((key, lsn, span), committed) in state.queued.drain(..).zip(landed) {
+    for ((key, from, lsn, span), committed) in state.queued.drain(..).zip(landed) {
         state.written.insert(committed.loc.segment);
         state.report.rows_written += 1;
         state.report.bytes_written += span;
         state.pending.push(KeyRepoint {
             key,
+            from: Some(from),
             to: committed.loc,
             lsn,
         });

@@ -234,7 +234,7 @@ fn apply_one(index: &ReelIndex, cursor: &mut LogCursor, record: &WalkedRecord) -
 
     // A relocation is the same version in a new place, so taking it for a stale
     // write would leave the reader on the segment compaction is about to unlink.
-    if record.flags.is_relocated() && index.repoint(&record.key, record.loc, record.lsn)? {
+    if record.flags.is_relocated() && index.repoint(&record.key, None, record.loc, record.lsn)? {
         return Ok(true);
     }
 

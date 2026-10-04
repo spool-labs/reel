@@ -255,7 +255,7 @@ struct CopyRun {
     copies: Vec<CopyRecord>,
 
     /// Each queued record's key, sequence number and span, for its repoint and the tally
-    moved: Vec<(RecordKey, Lsn, u64)>,
+    moved: Vec<(RecordKey, Loc, Lsn, u64)>,
 
     /// Bytes the queued records frame
     bytes: u64,
@@ -1041,8 +1041,8 @@ impl Compactor {
         run.bytes = 0;
         let landed = reel.tails()[dest_index].append_copies(std::mem::take(&mut run.copies))?;
         crate::sync::rendezvous::at("compaction/repoint");
-        for ((key, lsn, span), committed) in run.moved.drain(..).zip(landed) {
-            index.repoint(&key, committed.loc, lsn)?;
+        for ((key, from, lsn, span), committed) in run.moved.drain(..).zip(landed) {
+            index.repoint(&key, Some(from), committed.loc, lsn)?;
             tally.copied_bytes += span;
         }
         tally.had_live = true;
@@ -1225,7 +1225,7 @@ impl Compactor {
             payload,
             codec: header.codec,
         });
-        run.moved.push((header.key, header.lsn, span));
+        run.moved.push((header.key, loc, header.lsn, span));
         Ok(CopyStep::Queued)
     }
 
@@ -2467,7 +2467,7 @@ mod tests {
             .expect("one copy landed");
         let moved = fixture
             .index
-            .repoint(&key(1), committed.loc, record.header.lsn)
+            .repoint(&key(1), None, committed.loc, record.header.lsn)
             .expect("repoint");
 
         assert!(!moved);

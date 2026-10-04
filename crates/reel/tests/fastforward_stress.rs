@@ -26,6 +26,8 @@ use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, MapShape,
     ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
+use reel::format::column::RecordKey;
+use reel::sync::tension::block_on;
 use reel_core::Store;
 
 const COLUMNS: ColumnSet = &[ColumnSpec {
@@ -148,19 +150,57 @@ fn writer(store: &ReelStore, ledger: &Ledger, seed: u64, id: u64, writers: u64, 
     }
 }
 
+fn record_key(key: u64) -> RecordKey {
+    RecordKey::from_bytes(COLUMNS[0].id, &key.to_be_bytes()).expect("key")
+}
+
+/// Whether a window could have come from a put that falls between `floor` and `ceiling`
+///
+/// A value's filler depends on its key and op alone, so the window's bytes are the same
+/// whatever length that put was written at.
+fn admits_window(ledger: &Ledger, key: u64, floor: u64, ceiling: u64, at: u64, window: &[u8]) -> bool {
+    let end = at as usize + window.len();
+    (floor..=ceiling).filter(|op| *op > 0 && !ledger.is_delete(key, *op)).any(|op| {
+        let full = value_of(key, op, end.saturating_sub(16));
+        full.len() >= end && full[at as usize..end] == *window
+    })
+}
+
+/// Reads one key, or a few, through each of the store's read paths in turn
 fn reader(store: &ReelStore, ledger: &Ledger, seed: u64, id: u64, done: &AtomicBool) -> u64 {
     let mut rng = SmallRng::seed_from_u64(seed ^ (id << 48) ^ 0x5A5A);
     let mut read = 0u64;
     while !done.load(Ordering::Relaxed) {
-        let key = rng.gen_range(0..KEYS);
-        let floor = ledger.completed[key as usize].load(Ordering::Acquire);
-        let got = Store::get(store, "rows", &key.to_be_bytes()).expect("get");
-        let ceiling = ledger.started[key as usize].load(Ordering::Acquire);
-        let answer = got.map(|value| op_of(seed, key, &value));
-        assert!(
-            ledger.admits(key, floor, ceiling, answer),
-            "seed {seed}: key {key} answered {answer:?} with op {floor} done before the read and {ceiling} begun after"
-        );
+        let keys: Vec<u64> = (0..rng.gen_range(1..=4)).map(|_| rng.gen_range(0..KEYS)).collect();
+        let floors: Vec<u64> = keys.iter().map(|key| ledger.completed[*key as usize].load(Ordering::Acquire)).collect();
+        let path = rng.gen_range(0..4u32);
+        let (at, len) = (rng.gen_range(0..24u64), rng.gen_range(1..64usize));
+        let answers: Vec<Option<Vec<u8>>> = match path {
+            0 => vec![Store::get(store, "rows", &keys[0].to_be_bytes()).expect("get").map(|value| value.to_vec())],
+            1 => vec![block_on(store.get_wait(&record_key(keys[0]))).expect("get").map(|value| value.to_vec())],
+            2 => {
+                let asked: Vec<RecordKey> = keys.iter().map(|key| record_key(*key)).collect();
+                let got = store.get_many(&asked).expect("get many");
+                got.into_iter().map(|value| value.map(|value| value.to_vec())).collect()
+            }
+            _ => vec![store.get_range(&record_key(keys[0]), at, len).expect("range").map(|value| value.to_vec())],
+        };
+        for (position, answer) in answers.iter().enumerate() {
+            let key = keys[position];
+            let floor = floors[position];
+            let ceiling = ledger.started[key as usize].load(Ordering::Acquire);
+            let admitted = match (path, answer) {
+                (3, Some(window)) => admits_window(ledger, key, floor, ceiling, at, window),
+                (_, answer) => {
+                    let op = answer.as_ref().map(|value| op_of(seed, key, value));
+                    ledger.admits(key, floor, ceiling, op)
+                }
+            };
+            assert!(
+                admitted,
+                "seed {seed}: path {path} key {key} answered {answer:?} with op {floor} done before the read and {ceiling} begun after"
+            );
+        }
         read += 1;
     }
     read

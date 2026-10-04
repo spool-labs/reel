@@ -10,7 +10,9 @@ use crate::error::{ReelError, Result};
 use crate::format::column::{Codec, ColumnId, KeyRef, RecordKey};
 use crate::format::loc::Loc;
 use crate::format::lsn::Lsn;
-use crate::index::fastforward::Lookup;
+use crate::index::fastforward::{Candidate, FastRead, Lookup, Offered, Since, LOOKUP_TRIES};
+use crate::index::map::{FastPick, FastRoute, Located};
+use crate::reel::{FastAsk, FastRange};
 use crate::index::page::KeyPage;
 use crate::index::playback::PlaybackCursor;
 use crate::reel::cue::CuePoint;
@@ -238,11 +240,70 @@ impl ReelStore {
     /// that retries, rebuilds and evicts.
     pub fn get_many(&self, keys: &[RecordKey]) -> Result<Vec<Option<Value>>> {
         self.settle_sealed()?;
-        let found = self.locate_many(keys)?;
+        let located = self.locate_many(keys)?;
         // Borrowed for the read: the batch holds the caller's keys the whole way
         // through and the read path only ever reads them.
         let borrowed: Vec<KeyRef<'_>> = keys.iter().map(RecordKey::as_ref).collect();
-        self.read_found(&borrowed, &found)
+        let mut values = self.read_found(&borrowed, &located.found)?;
+        if located.picks.is_empty() {
+            return Ok(values);
+        }
+        let mut picks = located.picks;
+        let asks = self.first_asks(keys, &mut picks);
+        let reads = self.reel.shared().fast_records(&asks.asks)?;
+        let offered = self.offer_firsts(&mut picks, asks.taken, reads);
+        for (fast, offered) in picks.into_iter().zip(offered) {
+            let key = &keys[fast.at];
+            let column = self.index.fast_column(fast.column);
+            let lookup = match offered {
+                Offered::Next => column.read_on(key, fast.pick)?,
+                Offered::Again | Offered::Unsettled => Lookup::Unsettled,
+            };
+            values[fast.at] = match self.index.fast_finish(fast.column, key, fast.since, lookup) {
+                Lookup::Found(_, value) => Some(value),
+                Lookup::Missing => None,
+                Lookup::Unsettled => self.get(key)?,
+            };
+        }
+        Ok(values)
+    }
+
+    /// Each pick's first candidate, as one batch of asks, and which picks have one
+    fn first_asks<'a>(&self, keys: &'a [RecordKey], picks: &mut [FastPick]) -> FirstAsks<'a> {
+        let mut asks = Vec::with_capacity(picks.len());
+        let mut taken = Vec::with_capacity(picks.len());
+        for fast in picks.iter_mut() {
+            let candidate = self.index.fast_column(fast.column).next(&mut fast.pick);
+            if let Some(candidate) = candidate {
+                asks.push(FastAsk {
+                    key: &keys[fast.at],
+                    segment: candidate.segment,
+                    offset: candidate.offset,
+                    bound: candidate.bound,
+                });
+            }
+            taken.push(candidate);
+        }
+        FirstAsks { asks, taken }
+    }
+
+    /// Fold each first candidate's read into its pick
+    fn offer_firsts(
+        &self,
+        picks: &mut [FastPick],
+        taken: Vec<Option<Candidate>>,
+        reads: Vec<FastRead>,
+    ) -> Vec<Offered> {
+        let mut reads = reads.into_iter();
+        let mut offered = Vec::with_capacity(picks.len());
+        for (fast, candidate) in picks.iter_mut().zip(taken) {
+            let column = self.index.fast_column(fast.column);
+            offered.push(match (candidate, candidate.and_then(|_| reads.next())) {
+                (Some(candidate), Some(read)) => column.offer(&mut fast.pick, candidate, read),
+                (Some(_), None) | (None, Some(_)) | (None, None) => Offered::Next,
+            });
+        }
+        offered
     }
 
     /// Read several keys as one future, answered in the order asked
@@ -250,16 +311,48 @@ impl ReelStore {
     /// One submission and one wait, with no thread held per read.
     pub async fn get_many_wait(&self, keys: &[RecordKey]) -> Result<Vec<Option<Value>>> {
         self.settle_sealed()?;
-        let found = self.locate_many(keys)?;
+        let located = self.locate_many(keys)?;
         let borrowed: Vec<KeyRef<'_>> = keys.iter().map(RecordKey::as_ref).collect();
-        self.read_found_wait(&borrowed, &found).await
+        let mut values = self.read_found_wait(&borrowed, &located.found).await?;
+        if located.picks.is_empty() {
+            return Ok(values);
+        }
+        let mut picks = located.picks;
+        let asks = self.first_asks(keys, &mut picks);
+        let reads = self.reel.shared().fast_records_wait(&asks.asks).await?;
+        let offered = self.offer_firsts(&mut picks, asks.taken, reads);
+        let shared = self.reel.shared();
+        for (mut fast, offered) in picks.into_iter().zip(offered) {
+            let key = &keys[fast.at];
+            let column = self.index.fast_column(fast.column);
+            let mut flow = offered;
+            while flow == Offered::Next {
+                let Some(candidate) = column.next(&mut fast.pick) else {
+                    break;
+                };
+                let read = shared
+                    .fast_record_wait(key, candidate.segment, candidate.offset, candidate.bound)
+                    .await?;
+                flow = column.offer(&mut fast.pick, candidate, read);
+            }
+            let lookup = match flow {
+                Offered::Next => column.settle(key, fast.pick),
+                Offered::Again | Offered::Unsettled => Lookup::Unsettled,
+            };
+            values[fast.at] = match self.index.fast_finish(fast.column, key, fast.since, lookup) {
+                Lookup::Found(_, value) => Some(value),
+                Lookup::Missing => None,
+                Lookup::Unsettled => self.get_wait(key).await?,
+            };
+        }
+        Ok(values)
     }
 
     /// Ask the index where every key sits, all of them against one state of it
     ///
     /// The index takes its own barrier, so a batch publishing beside this cannot
     /// answer some keys from before it and the rest from after.
-    fn locate_many(&self, keys: &[RecordKey]) -> Result<Vec<Option<Entry>>> {
+    fn locate_many(&self, keys: &[RecordKey]) -> Result<Located> {
         self.index.get_many(keys)
     }
 
@@ -572,6 +665,11 @@ impl ReelStore {
     /// Nothing here maps, since an async caller has a runtime worker to protect and
     /// a fault cannot be woken.
     async fn resolve_read_wait(&self, key: &RecordKey) -> Result<Resolved> {
+        match self.fast_read_wait(key).await? {
+            Lookup::Found(_, payload) => return Ok(Resolved::Payload(payload)),
+            Lookup::Missing => return Ok(Resolved::Missing),
+            Lookup::Unsettled => {}
+        }
         let mut resolving = Resolving::new(self, key);
         for _ in 0..RESOLVE_RETRIES {
             let entry = match resolving.step(self, key)? {
@@ -589,12 +687,70 @@ impl ReelStore {
         resolving.give_up(self, key)
     }
 
+    /// A key's newest payload as a future, one read of each FastForward candidate it needs
+    async fn fast_read_wait(&self, key: &RecordKey) -> Result<Lookup> {
+        let (at, since) = match self.index.fast_route(key) {
+            FastRoute::Settled(lookup) => return Ok(lookup),
+            FastRoute::Column(at, since) => (at, since),
+        };
+        let column = self.index.fast_column(at);
+        let shared = self.reel.shared();
+        'tries: for _ in 0..LOOKUP_TRIES {
+            let Some(mut pick) = column.pick(key) else {
+                return Ok(Lookup::Unsettled);
+            };
+            while let Some(candidate) = column.next(&mut pick) {
+                let read = shared
+                    .fast_record_wait(key, candidate.segment, candidate.offset, candidate.bound)
+                    .await?;
+                match column.offer(&mut pick, candidate, read) {
+                    Offered::Next => {}
+                    Offered::Again => continue 'tries,
+                    Offered::Unsettled => return Ok(Lookup::Unsettled),
+                }
+            }
+            return Ok(self.index.fast_finish(at, key, since, column.settle(key, pick)));
+        }
+        Ok(Lookup::Unsettled)
+    }
+
+    /// The one FastForward candidate a range read can go straight to, when the key has one
+    fn fast_range_candidate(&self, key: &RecordKey) -> Option<(usize, Since, Candidate)> {
+        let FastRoute::Column(at, since) = self.index.fast_route(key) else {
+            return None;
+        };
+        Some((at, since, self.index.fast_column(at).sole(key)?))
+    }
+
+    /// What a FastForward range read answers, or nothing for the checked path to settle
+    fn fast_range_answer(&self, at: usize, key: &RecordKey, since: Since, read: FastRange) -> Option<Resolved> {
+        let lookup = match read {
+            FastRange::Found(head, window) => Lookup::Found(head.lsn, window),
+            FastRange::Tombstone(_) => Lookup::Missing,
+            FastRange::Other | FastRange::Gone | FastRange::Unsure => return None,
+        };
+        match self.index.fast_finish(at, key, since, lookup) {
+            Lookup::Found(_, window) => Some(Resolved::Payload(window)),
+            Lookup::Missing => Some(Resolved::Missing),
+            Lookup::Unsettled => None,
+        }
+    }
+
     /// Resolve one key and read the range its entry places, retrying as a read does
     ///
     /// An entry whose incarnation stamp is still current takes one device read and no
     /// header echo. Everything else takes the header-checked read, and a header saying a
     /// codec produced the record sends the window to the whole read.
     fn resolve_range(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Resolved> {
+        if let Some((at, since, candidate)) = self.fast_range_candidate(key) {
+            let read = self
+                .reel
+                .shared()
+                .fast_range(key, candidate.segment, candidate.offset, offset, len)?;
+            if let Some(resolved) = self.fast_range_answer(at, key, since, read) {
+                return Ok(resolved);
+            }
+        }
         let mut resolving = Resolving::new(self, key);
         for _ in 0..RESOLVE_RETRIES {
             let (entry, wanted) = match resolving.step_range(self, key, offset, len)? {
@@ -630,6 +786,16 @@ impl ReelStore {
         offset: u64,
         len: usize,
     ) -> Result<Resolved> {
+        if let Some((at, since, candidate)) = self.fast_range_candidate(key) {
+            let read = self
+                .reel
+                .shared()
+                .fast_range_wait(key, candidate.segment, candidate.offset, offset, len)
+                .await?;
+            if let Some(resolved) = self.fast_range_answer(at, key, since, read) {
+                return Ok(resolved);
+            }
+        }
         let mut resolving = Resolving::new(self, key);
         for _ in 0..RESOLVE_RETRIES {
             let (entry, wanted) = match resolving.step_range(self, key, offset, len)? {
@@ -852,6 +1018,12 @@ impl Resolving {
     fn give_up(self, store: &ReelStore, key: &RecordKey) -> Result<Resolved> {
         store.give_up(key, self.framed_nothing)
     }
+}
+
+/// The first candidate of each pick in a batch, and which picks had one
+struct FirstAsks<'a> {
+    asks: Vec<FastAsk<'a>>,
+    taken: Vec<Option<Candidate>>,
 }
 
 /// What resolving one key against the reel produced

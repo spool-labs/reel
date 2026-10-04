@@ -258,7 +258,7 @@ pub fn hold_by_batch_size() {
                 let mut landed = 0u64;
                 for (slot, key) in keys.iter().enumerate() {
                     let lsn = Lsn(first + slot as u64 + 1);
-                    if index.repoint(key, locs[slot], lsn).expect("repoint") {
+                    if index.repoint(key, None, locs[slot], lsn).expect("repoint") {
                         landed += 1;
                     }
                 }

@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use reel_core::Value;
 
@@ -44,7 +44,7 @@ const SETTLE_THREADS: usize = 8;
 /// A compaction can move a record, seal its copy and retire the source inside one
 /// slow read, and only a fresh look at the table finds the copy. Each try takes one
 /// such candidate out, so this many tries outlast every candidate a key can have.
-const LOOKUP_TRIES: usize = MAX_CANDIDATES + 1;
+pub const LOOKUP_TRIES: usize = MAX_CANDIDATES + 1;
 
 /// Older versions waiting for the cleaner before new ones are left to the retired-segment sweep
 const MAX_STALE: usize = 1 << 20;
@@ -111,6 +111,37 @@ pub enum FastRead {
 
     /// A record the checked read has to settle, such as one failing its checksum
     Unsure,
+}
+
+/// One record a lookup reads: where it sits, and how much of its payload to ask for
+#[derive(Clone, Copy, Debug)]
+pub struct Candidate {
+    pub segment: SegmentId,
+    pub offset: u32,
+    pub bound: u32,
+    slot: Slot,
+}
+
+/// A lookup in progress: the candidates in order, and the newest version read so far
+pub struct Pick {
+    hash: u64,
+    ordered: Vec<(Option<Lsn>, Slot)>,
+    next: usize,
+    best: Option<(Head, Option<Value>)>,
+    stale: Vec<(Slot, u32)>,
+}
+
+/// What folding one read into a lookup leaves it to do
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Offered {
+    /// Read the next candidate, if one is left
+    Next,
+
+    /// A candidate's segment went, so the lookup starts over from a fresh look
+    Again,
+
+    /// Something only the checked read can settle
+    Unsettled,
 }
 
 /// What one lookup settled about a key
@@ -473,9 +504,82 @@ struct SetAside {
     is_tombstone: bool,
 }
 
+/// One shard of a column's table, and how many slots have left it
+struct Shard {
+    table: RwLock<Table>,
+
+    /// Slots taken out so far, which a lookup that found nothing checks for a race
+    taken: AtomicU64,
+}
+
+impl Shard {
+    fn new() -> Shard {
+        Shard {
+            table: RwLock::new(Table::with_buckets(FIRST_BUCKETS)),
+            taken: AtomicU64::new(0),
+        }
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, Table> {
+        read(&self.table)
+    }
+
+    fn write(&self) -> Writing<'_> {
+        Writing {
+            table: write(&self.table),
+            taken: &self.taken,
+        }
+    }
+}
+
+/// A shard held for writing, which counts every slot it takes out before it lets go
+struct Writing<'a> {
+    table: RwLockWriteGuard<'a, Table>,
+    taken: &'a AtomicU64,
+}
+
+impl Writing<'_> {
+    /// Take out the slot pointing at one record, wherever displacement has moved it
+    fn take(&mut self, hash: u64, slot: &Slot) -> bool {
+        let took = self.table.take(hash, slot);
+        if took {
+            self.taken.fetch_add(1, Ordering::Release);
+        }
+        took
+    }
+
+    /// Count slots a sweep emptied by hand
+    fn count_taken(&self, slots: u64) {
+        if slots > 0 {
+            self.taken.fetch_add(slots, Ordering::Release);
+        }
+    }
+}
+
+impl std::ops::Deref for Writing<'_> {
+    type Target = Table;
+
+    fn deref(&self) -> &Table {
+        &self.table
+    }
+}
+
+impl std::ops::DerefMut for Writing<'_> {
+    fn deref_mut(&mut self) -> &mut Table {
+        &mut self.table
+    }
+}
+
+/// Where a key's shard stood before a lookup asked the map, to check a miss against
+#[derive(Clone, Copy, Debug)]
+pub struct Since {
+    shard: usize,
+    taken: u64,
+}
+
 /// A column's sealed keys as record locations, in shards picked by hash
 pub struct FastColumn {
-    shards: Vec<RwLock<Table>>,
+    shards: Vec<Shard>,
     records: OnceLock<Arc<dyn RecordSource>>,
     segments: OnceLock<Arc<SegmentTable>>,
     stale: Mutex<VecDeque<Stale>>,
@@ -494,9 +598,7 @@ impl Default for FastColumn {
 impl FastColumn {
     pub fn new() -> FastColumn {
         FastColumn {
-            shards: (0..SHARDS)
-                .map(|_| RwLock::new(Table::with_buckets(FIRST_BUCKETS)))
-                .collect(),
+            shards: (0..SHARDS).map(|_| Shard::new()).collect(),
             records: OnceLock::new(),
             segments: OnceLock::new(),
             stale: Mutex::new(VecDeque::new()),
@@ -518,13 +620,13 @@ impl FastColumn {
 
     /// Entries held
     pub fn held(&self) -> u64 {
-        self.shards.iter().map(|shard| read(shard).held as u64).sum()
+        self.shards.iter().map(|shard| shard.read().held as u64).sum()
     }
 
     pub fn heap_bytes(&self) -> u64 {
         self.shards
             .iter()
-            .map(|shard| read(shard).buckets.len() as u64 * BUCKET_BYTES)
+            .map(|shard| shard.read().buckets.len() as u64 * BUCKET_BYTES)
             .sum()
     }
 
@@ -535,7 +637,7 @@ impl FastColumn {
     pub fn insert(&self, key: &[u8], loc: Loc) {
         let hash = hash_of(key);
         let slot = Slot::new(hash, loc);
-        let mut table = write(&self.shards[shard_of(hash)]);
+        let mut table = self.shards[shard_of(hash)].write();
         if table.matches(hash).iter().any(|place| place.slot.same_place(&slot)) {
             return;
         }
@@ -547,7 +649,7 @@ impl FastColumn {
         let per_shard = keys.div_ceil(SHARDS as u64) as f64;
         let buckets = (per_shard / (WAYS as f64 * LOAD)).ceil() as usize;
         for shard in &self.shards {
-            let mut table = write(shard);
+            let mut table = shard.write();
             if table.held == 0 && table.buckets.len() < buckets {
                 *table = Table::with_buckets(buckets);
             }
@@ -582,7 +684,7 @@ impl FastColumn {
             if rows.is_empty() {
                 continue;
             }
-            let mut table = write(&self.shards[shard]);
+            let mut table = self.shards[shard].write();
             for (hash, slot, at) in rows {
                 match table.matches(*hash).is_empty() {
                     true => table.insert(*slot),
@@ -622,7 +724,7 @@ impl FastColumn {
         let mut by_header = Vec::new();
         for (at, row) in rows.iter().enumerate() {
             let hash = hash_of(row.key.as_slice());
-            let seen = read(&self.shards[shard_of(hash)]).matches(hash);
+            let seen = self.shards[shard_of(hash)].read().matches(hash);
             match seen.len() {
                 1 => by_segment.entry(seen[0].slot.segment()).or_default().push(at),
                 _ => by_header.push(at),
@@ -694,7 +796,7 @@ impl FastColumn {
                 }
             };
             let hash = hash_of(row.key.as_slice());
-            let mut table = write(&self.shards[shard_of(hash)]);
+            let mut table = self.shards[shard_of(hash)].write();
             let held = table.matches(hash);
             let place = held.iter().find(|place| place.slot.segment() == segment).copied();
             let is_newer = (row.lsn, row.loc.segment) > (standing.lsn, segment);
@@ -739,21 +841,21 @@ impl FastColumn {
         };
         let shard = shard_of(hash);
         {
-            let mut table = write(&self.shards[shard]);
+            let mut table = self.shards[shard].write();
             if table.matches(hash).is_empty() {
                 table.insert(slot);
                 return Ok(());
             }
         }
         loop {
-            let seen = read(&self.shards[shard]).matches(hash);
+            let seen = self.shards[shard].read().matches(hash);
             let mut standing = None;
             for place in seen.iter() {
                 if let HeadRead::Same(head) = records.head(key.as_ref(), place.slot.segment(), place.slot.offset)? {
                     standing = Some((place.slot, head.lsn));
                 }
             }
-            let mut table = write(&self.shards[shard]);
+            let mut table = self.shards[shard].write();
             // Another thread loaded a row of this key while the headers were read.
             if *table.matches(hash) != *seen {
                 continue;
@@ -773,7 +875,7 @@ impl FastColumn {
     /// Close a load by dropping the graves that only kept older rows out
     pub fn finish_load(&self) {
         for shard in &self.shards {
-            let mut table = write(shard);
+            let mut table = shard.write();
             let mut dropped = 0;
             for bucket in table.buckets.iter_mut() {
                 for slot in bucket.slots.iter_mut() {
@@ -784,13 +886,21 @@ impl FastColumn {
                 }
             }
             table.held -= dropped;
+            table.count_taken(dropped as u64);
         }
+    }
+
+    /// Whether a key's one slot points at this record, which a caller that read it can trust with no read
+    pub fn only_at(&self, key: &[u8], loc: Loc) -> bool {
+        let hash = hash_of(key);
+        let seen = self.shards[shard_of(hash)].read().matches(hash);
+        seen.len() == 1 && seen[0].slot.at(loc)
     }
 
     /// Take out the entry pointing at one record, for a compaction move, an eviction or a release
     pub fn remove_at(&self, key: &[u8], loc: Loc) -> bool {
         let hash = hash_of(key);
-        let mut table = write(&self.shards[shard_of(hash)]);
+        let mut table = self.shards[shard_of(hash)].write();
         let held = table.matches(hash).iter().find(|place| place.slot.at(loc)).copied();
         match held {
             Some(place) => table.take(hash, &place.slot),
@@ -808,7 +918,7 @@ impl FastColumn {
         };
         let hash = hash_of(key.as_slice());
         let shard = shard_of(hash);
-        let seen = read(&self.shards[shard]).matches(hash);
+        let seen = self.shards[shard].read().matches(hash);
         if seen.is_empty() {
             return Ok(Vec::new());
         }
@@ -826,7 +936,7 @@ impl FastColumn {
             }
         }
         let mut taken = Vec::with_capacity(older.len());
-        let mut table = write(&self.shards[shard]);
+        let mut table = self.shards[shard].write();
         for slot in &gone {
             table.take(hash, slot);
         }
@@ -854,7 +964,7 @@ impl FastColumn {
                 break;
             };
             self.beside.fetch_sub(1, Ordering::Relaxed);
-            let took = write(&self.shards[shard_of(stale.hash)]).take(stale.hash, &stale.slot);
+            let took = self.shards[shard_of(stale.hash)].write().take(stale.hash, &stale.slot);
             if took {
                 let loc = Loc::new(stale.slot.segment(), stale.slot.offset, stale.len);
                 taken.push((stale.key, loc));
@@ -866,7 +976,7 @@ impl FastColumn {
     /// The candidates for a key, newest segment ceiling first, ties to the newer segment
     fn ordered(&self, key: &RecordKey, segments: &SegmentTable) -> (u64, Vec<(Option<Lsn>, Slot)>) {
         let hash = hash_of(key.as_slice());
-        let seen = read(&self.shards[shard_of(hash)]).matches(hash);
+        let seen = self.shards[shard_of(hash)].read().matches(hash);
         let mut ordered: Vec<(Option<Lsn>, Slot)> = seen.iter().map(|place| (None, place.slot)).collect();
         if ordered.len() > 1 {
             for (ceiling, slot) in ordered.iter_mut() {
@@ -882,61 +992,138 @@ impl FastColumn {
     /// A version an older candidate held goes to the cleaner already confirmed. Equal
     /// versions are a compaction copy beside its source, and both stay.
     pub fn read(&self, key: &RecordKey) -> Result<Lookup> {
-        let (Some(records), Some(segments)) = (self.records.get(), self.segments.get()) else {
+        let Some(records) = self.records.get() else {
             return Ok(Lookup::Unsettled);
         };
-        for _ in 0..LOOKUP_TRIES {
-            if let Some(lookup) = self.read_once(key, records.as_ref(), segments)? {
-                return Ok(lookup);
+        'tries: for _ in 0..LOOKUP_TRIES {
+            let Some(mut pick) = self.pick(key) else {
+                return Ok(Lookup::Unsettled);
+            };
+            while let Some(candidate) = self.next(&mut pick) {
+                let read = records.record(key, candidate.segment, candidate.offset, candidate.bound)?;
+                match self.offer(&mut pick, candidate, read) {
+                    Offered::Next => {}
+                    Offered::Again => continue 'tries,
+                    Offered::Unsettled => return Ok(Lookup::Unsettled),
+                }
             }
+            return Ok(self.settle(key, pick));
         }
         Ok(Lookup::Unsettled)
     }
 
-    /// One look at the table and a read of each candidate, or nothing when a segment went under it
-    fn read_once(&self, key: &RecordKey, records: &dyn RecordSource, segments: &SegmentTable) -> Result<Option<Lookup>> {
+    /// Carry a started lookup on, one read of each candidate left, and settle it
+    pub fn read_on(&self, key: &RecordKey, mut pick: Pick) -> Result<Lookup> {
+        let Some(records) = self.records.get() else {
+            return Ok(Lookup::Unsettled);
+        };
+        while let Some(candidate) = self.next(&mut pick) {
+            let read = records.record(key, candidate.segment, candidate.offset, candidate.bound)?;
+            match self.offer(&mut pick, candidate, read) {
+                Offered::Next => {}
+                Offered::Again | Offered::Unsettled => return Ok(Lookup::Unsettled),
+            }
+        }
+        Ok(self.settle(key, pick))
+    }
+
+    /// The key's one candidate, when it has exactly one, which a single read can answer for
+    pub fn sole(&self, key: &RecordKey) -> Option<Candidate> {
+        let mut pick = self.pick(key)?;
+        match pick.ordered.len() {
+            1 => self.next(&mut pick),
+            _ => None,
+        }
+    }
+
+    /// Where the key's shard stands, read before the map is asked
+    pub fn since(&self, key: &RecordKey) -> Since {
+        let shard = shard_of(hash_of(key.as_slice()));
+        Since {
+            shard,
+            taken: self.shards[shard].taken.load(Ordering::Acquire),
+        }
+    }
+
+    /// Whether a slot left the key's shard since then, which may have been the key's newest version
+    ///
+    /// A write or a compaction move puts the key in the map before its slot goes, so
+    /// a lookup that missed in both stands only when nothing left in between.
+    pub fn moved(&self, since: Since) -> bool {
+        self.shards[since.shard].taken.load(Ordering::Acquire) != since.taken
+    }
+
+    /// Start a lookup, ordering the key's candidates, or nothing before records can be read
+    pub fn pick(&self, key: &RecordKey) -> Option<Pick> {
+        let segments = self.segments.get()?;
         let (hash, ordered) = self.ordered(key, segments);
-        let mut best: Option<(Head, Option<Value>)> = None;
-        let mut stale = Vec::new();
-        for (ceiling, slot) in &ordered {
+        Some(Pick {
+            hash,
+            ordered,
+            next: 0,
+            best: None,
+            stale: Vec::new(),
+        })
+    }
+
+    /// The next candidate a lookup reads, past any whose segment's ceiling rules it out
+    pub fn next(&self, pick: &mut Pick) -> Option<Candidate> {
+        while let Some((ceiling, slot)) = pick.ordered.get(pick.next).copied() {
+            pick.next += 1;
             // A segment holding nothing newer than the version in hand needs no read.
-            if let (Some((head, _)), Some(ceiling)) = (&best, ceiling) {
-                if *ceiling < head.lsn {
+            if let (Some((head, _)), Some(ceiling)) = (&pick.best, ceiling) {
+                if ceiling < head.lsn {
                     continue;
                 }
             }
-            let (head, value) = match records.record(key, slot.segment(), slot.offset, slot.bound())? {
-                FastRead::Found(head, value) => (head, Some(value)),
-                FastRead::Tombstone(head) => (head, None),
-                FastRead::Other => continue,
-                // The segment is gone, so the slot points at nothing and goes before the next look.
-                FastRead::Gone => {
-                    write(&self.shards[shard_of(hash)]).take(hash, slot);
-                    return Ok(None);
-                }
-                FastRead::Unsure => return Ok(Some(Lookup::Unsettled)),
-            };
-            match &best {
-                Some((current, _)) if current.lsn >= head.lsn => {
-                    if current.lsn > head.lsn {
-                        stale.push((*slot, head.len));
-                    }
-                }
-                Some(_) | None => best = Some((head, value)),
-            }
+            return Some(Candidate {
+                segment: slot.segment(),
+                offset: slot.offset,
+                bound: slot.bound(),
+                slot,
+            });
         }
-        for (slot, len) in stale {
+        None
+    }
+
+    /// Fold one candidate's read into a lookup
+    pub fn offer(&self, pick: &mut Pick, candidate: Candidate, read: FastRead) -> Offered {
+        let (head, value) = match read {
+            FastRead::Found(head, value) => (head, Some(value)),
+            FastRead::Tombstone(head) => (head, None),
+            FastRead::Other => return Offered::Next,
+            // The segment is gone, so the slot points at nothing and goes before the next look.
+            FastRead::Gone => {
+                self.shards[shard_of(pick.hash)].write().take(pick.hash, &candidate.slot);
+                return Offered::Again;
+            }
+            FastRead::Unsure => return Offered::Unsettled,
+        };
+        match &pick.best {
+            Some((current, _)) if current.lsn >= head.lsn => {
+                if current.lsn > head.lsn {
+                    pick.stale.push((candidate.slot, head.len));
+                }
+            }
+            Some(_) | None => pick.best = Some((head, value)),
+        }
+        Offered::Next
+    }
+
+    /// Close a lookup with its newest version, handing the older ones it read to the cleaner
+    pub fn settle(&self, key: &RecordKey, pick: Pick) -> Lookup {
+        for (slot, len) in pick.stale {
             self.queue(Stale {
                 key: key.clone(),
-                hash,
+                hash: pick.hash,
                 slot,
                 len,
             });
         }
-        Ok(Some(match best {
+        match pick.best {
             Some((head, Some(value))) => Lookup::Found(head.lsn, value),
             Some((_, None)) | None => Lookup::Missing,
-        }))
+        }
     }
 
     /// A key's newest sealed entry, reading every candidate's header, for a caller that reads the record itself
@@ -973,7 +1160,7 @@ impl FastColumn {
                 }
                 // The segment is gone, so the slot points at nothing and goes before the next look.
                 HeadRead::Missing => {
-                    write(&self.shards[shard_of(hash)]).take(hash, slot);
+                    self.shards[shard_of(hash)].write().take(hash, slot);
                     return Ok(None);
                 }
                 HeadRead::Same(_) | HeadRead::Other | HeadRead::Cold => {}
@@ -992,7 +1179,7 @@ impl FastColumn {
     pub fn forget_retired(&self, is_standing: impl Fn(SegmentId) -> bool) -> u64 {
         let mut forgotten = 0;
         for shard in &self.shards {
-            let mut table = write(shard);
+            let mut table = shard.write();
             let mut dropped = 0;
             for bucket in table.buckets.iter_mut() {
                 for slot in bucket.slots.iter_mut() {
@@ -1003,6 +1190,7 @@ impl FastColumn {
                 }
             }
             table.held -= dropped;
+            table.count_taken(dropped as u64);
             forgotten += dropped as u64;
         }
         forgotten
@@ -1011,7 +1199,10 @@ impl FastColumn {
     /// Drop every entry, for a rebuild starting over
     pub fn clear(&self) {
         for shard in &self.shards {
-            *write(shard) = Table::with_buckets(FIRST_BUCKETS);
+            let mut table = shard.write();
+            let held = table.held as u64;
+            *table = Table::with_buckets(FIRST_BUCKETS);
+            table.count_taken(held);
         }
         lock(&self.stale).clear();
         lock(&self.set_aside).clear();

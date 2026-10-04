@@ -44,13 +44,13 @@ use crate::index::recovery::{read_footer, ResumableTail};
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
 use crate::io::op::{Advice, ColdRoute, Completion, FileId, Op, WarmFirst};
 use crate::reel::bands::BandPool;
-use crate::reel::segment::{DirectOpen, FdCache, IoDriver, SegmentHandle, SplitRead};
+use crate::reel::segment::{DirectOpen, FdCache, IoDriver, SegmentHandle, SplitAnswer, SplitRead};
 use crate::sync::{lock, read, write};
 
 use reel_core::{ReadBlock, Value};
 
 use read::{
-    check_in_block, deep_range, frame_to_range, frame_to_read, framed_or_nothing, merge_runs_into,
+    check_in_block, cut_range, deep_range, frame_to_range, frame_to_read, framed_or_nothing, merge_runs_into,
     merge_span, near_range, place_runs, window_or_nothing, window_start, Planned, Run, MERGE_GAP,
 };
 
@@ -113,39 +113,233 @@ impl RecordSource for ReelShared {
             take_header(),
             self.warm_first(),
         );
+        match self.fast_verdict(answer, key, segment, offset)? {
+            Verdict::Read(read) => Ok(read),
+            Verdict::Whole(head) => {
+                self.whole_record(handle.file(), key, head, Loc::new(segment, offset, head.len))
+            }
+        }
+    }
+}
+
+/// What one FastForward range read settled
+pub enum FastRange {
+    /// The key's record at this candidate, and the window of its payload asked for
+    Found(Head, Value),
+    Tombstone(Head),
+    Other,
+    Gone,
+
+    /// A coded record, or one the read came up short on, which the checked path reads
+    Unsure,
+}
+
+/// One FastForward candidate a batch reads
+pub struct FastAsk<'a> {
+    pub key: &'a RecordKey,
+    pub segment: SegmentId,
+    pub offset: u32,
+    pub bound: u32,
+}
+
+/// What one bounded read of a FastForward candidate settled
+enum Verdict {
+    Read(FastRead),
+
+    /// The file ends inside the bound, so the record reads again at its own length
+    Whole(Head),
+}
+
+impl ReelShared {
+    /// The record at a place, read as a future in one read of its header and up to `bound` payload bytes
+    pub async fn fast_record_wait(
+        &self,
+        key: &RecordKey,
+        segment: SegmentId,
+        offset: u32,
+        bound: u32,
+    ) -> Result<FastRead> {
+        let Some(handle) = self.handle_for(segment)? else {
+            return Ok(FastRead::Gone);
+        };
+        let prefix = HEADER_LEN + key.as_slice().len();
+        let answer = self
+            .driver
+            .wait_split_reusing(
+                handle.file(),
+                u64::from(offset),
+                prefix,
+                bound as usize,
+                take_header(),
+                self.warm_first(),
+            )
+            .await;
+        match self.fast_verdict(answer, key, segment, offset)? {
+            Verdict::Read(read) => Ok(read),
+            Verdict::Whole(head) => {
+                let loc = Loc::new(segment, offset, head.len);
+                self.whole_record_wait(handle.file(), key, head, loc).await
+            }
+        }
+    }
+
+    /// One record read as a future at the length its header gave
+    async fn whole_record_wait(&self, file: FileId, key: &RecordKey, head: Head, loc: Loc) -> Result<FastRead> {
+        let prefix = HEADER_LEN + key.as_slice().len();
+        let len = loc.len as usize;
+        let read = self
+            .driver
+            .wait_split_reusing(file, u64::from(loc.offset), prefix, len, take_header(), self.warm_first())
+            .await;
+        Ok(match framed_or_nothing(read, prefix, len)? {
+            Some((bytes, body)) => fast_read_of(
+                frame_to_read(bytes, body, key.as_ref(), head.lsn, loc, self.config.verify_reads),
+                head,
+            ),
+            None => FastRead::Other,
+        })
+    }
+
+    /// A window of the record at a place, its header and the window in one round trip
+    ///
+    /// A window near the payload's front comes in one span with the header, and a deeper
+    /// one is a second read submitted with the first. The key is confirmed from the
+    /// header and the window cut to the payload the header gives.
+    pub fn fast_range(&self, key: &RecordKey, segment: SegmentId, offset: u32, at: u64, len: usize) -> Result<FastRange> {
+        let Some(handle) = self.handle_for(segment)? else {
+            return Ok(FastRange::Gone);
+        };
+        let prefix = HEADER_LEN + key.as_slice().len();
+        let base = u64::from(offset);
+        if at <= MERGE_GAP {
+            let span = at as usize + len;
+            let answer = self.driver.pread_split_reusing(handle.file(), base, prefix, span, take_header(), self.warm_first());
+            return near_fast_range(answer, key, at, len);
+        }
+        let ops = vec![
+            self.driver.split_read(handle.file(), base, 0, prefix),
+            self.driver.split_read(handle.file(), base + prefix as u64 + at, 0, len),
+        ];
+        deep_fast_range(self.driver.run_split_reads(ops)?, key, at, len)
+    }
+
+    /// The same window as a future, through the driver
+    pub async fn fast_range_wait(
+        &self,
+        key: &RecordKey,
+        segment: SegmentId,
+        offset: u32,
+        at: u64,
+        len: usize,
+    ) -> Result<FastRange> {
+        let Some(handle) = self.handle_for(segment)? else {
+            return Ok(FastRange::Gone);
+        };
+        let prefix = HEADER_LEN + key.as_slice().len();
+        let base = u64::from(offset);
+        if at <= MERGE_GAP {
+            let span = at as usize + len;
+            let answer = self
+                .driver
+                .wait_split_reusing(handle.file(), base, prefix, span, take_header(), WarmFirst::Skip)
+                .await;
+            return near_fast_range(answer, key, at, len);
+        }
+        let ops = vec![
+            self.driver.split_read(handle.file(), base, 0, prefix),
+            self.driver.split_read(handle.file(), base + prefix as u64 + at, 0, len),
+        ];
+        deep_fast_range(self.driver.wait_split_reads(ops).await?, key, at, len)
+    }
+
+    /// One bounded read of each FastForward candidate, submitted together
+    pub fn fast_records(&self, asks: &[FastAsk<'_>]) -> Result<Vec<FastRead>> {
+        let (ops, handles) = self.fast_ops(asks)?;
+        let filled = self.driver.run_split_reads(ops)?;
+        let mut filled = filled.into_iter();
+        let mut reads = Vec::with_capacity(asks.len());
+        for (ask, handle) in asks.iter().zip(&handles) {
+            let Some(handle) = handle else {
+                reads.push(FastRead::Gone);
+                continue;
+            };
+            let answer = next_split(&mut filled)?;
+            reads.push(match self.fast_verdict(answer, ask.key, ask.segment, ask.offset)? {
+                Verdict::Read(read) => read,
+                Verdict::Whole(head) => {
+                    self.whole_record(handle.file(), ask.key, head, Loc::new(ask.segment, ask.offset, head.len))?
+                }
+            });
+        }
+        Ok(reads)
+    }
+
+    /// The same batch as a future, one submission and one wait
+    pub async fn fast_records_wait(&self, asks: &[FastAsk<'_>]) -> Result<Vec<FastRead>> {
+        let (ops, handles) = self.fast_ops(asks)?;
+        let filled = self.driver.wait_split_reads(ops).await?;
+        let mut filled = filled.into_iter();
+        let mut reads = Vec::with_capacity(asks.len());
+        for (ask, handle) in asks.iter().zip(&handles) {
+            let Some(handle) = handle else {
+                reads.push(FastRead::Gone);
+                continue;
+            };
+            let answer = next_split(&mut filled)?;
+            reads.push(match self.fast_verdict(answer, ask.key, ask.segment, ask.offset)? {
+                Verdict::Read(read) => read,
+                Verdict::Whole(head) => {
+                    let loc = Loc::new(ask.segment, ask.offset, head.len);
+                    self.whole_record_wait(handle.file(), ask.key, head, loc).await?
+                }
+            });
+        }
+        Ok(reads)
+    }
+
+    /// The bounded split read of each candidate, and the handle holding its segment open
+    fn fast_ops(&self, asks: &[FastAsk<'_>]) -> Result<(Vec<Op>, Vec<Option<SegmentHandle>>)> {
+        let mut ops = Vec::with_capacity(asks.len());
+        let mut handles = Vec::with_capacity(asks.len());
+        for ask in asks {
+            let handle = self.handle_for(ask.segment)?;
+            if let Some(handle) = &handle {
+                let prefix = HEADER_LEN + ask.key.as_slice().len();
+                ops.push(self.driver.split_read(handle.file(), u64::from(ask.offset), prefix, ask.bound as usize));
+            }
+            handles.push(handle);
+        }
+        Ok((ops, handles))
+    }
+
+    /// Settle one bounded read of a candidate, or say it needs a read at the record's own length
+    fn fast_verdict(&self, answer: SplitAnswer, key: &RecordKey, segment: SegmentId, offset: u32) -> Result<Verdict> {
         let (bytes, mut body) = match answer {
             Ok(read) => read,
             Err((error, spare)) => {
                 recycle_header(spare);
                 return match is_missing(&error) {
-                    true => Ok(FastRead::Gone),
+                    true => Ok(Verdict::Read(FastRead::Gone)),
                     false => Err(error),
                 };
             }
         };
         let verdict = match head_read(&bytes, key.as_ref()) {
-            HeadRead::Same(head) if head.is_tombstone => FastRead::Tombstone(head),
+            HeadRead::Same(head) if head.is_tombstone => Verdict::Read(FastRead::Tombstone(head)),
             HeadRead::Same(head) if body.len() >= head.len as usize => {
                 body.truncate(head.len as usize);
                 let loc = Loc::new(segment, offset, head.len);
                 let read = frame_to_read(bytes, body, key.as_ref(), head.lsn, loc, self.config.verify_reads);
-                return Ok(fast_read_of(read, head));
+                return Ok(Verdict::Read(fast_read_of(read, head)));
             }
-            // The file ends inside the bound, so the record reads again at its own length.
-            HeadRead::Same(head) => {
-                recycle_header(bytes);
-                crate::reel::payload::give(body);
-                return self.whole_record(handle.file(), key, head, Loc::new(segment, offset, head.len));
-            }
-            HeadRead::Other | HeadRead::Missing | HeadRead::Cold => FastRead::Other,
+            HeadRead::Same(head) => Verdict::Whole(head),
+            HeadRead::Other | HeadRead::Missing | HeadRead::Cold => Verdict::Read(FastRead::Other),
         };
         recycle_header(bytes);
         crate::reel::payload::give(body);
         Ok(verdict)
     }
-}
 
-impl ReelShared {
     /// One record read at the length its header gave
     fn whole_record(&self, file: FileId, key: &RecordKey, head: Head, loc: Loc) -> Result<FastRead> {
         let prefix = HEADER_LEN + key.as_slice().len();
@@ -165,6 +359,110 @@ impl ReelShared {
             ),
             None => FastRead::Other,
         })
+    }
+}
+
+/// The payload bytes of a window that a record of this length holds
+fn window_of(head: &Head, at: u64, len: usize) -> usize {
+    (u64::from(head.len).saturating_sub(at)).min(len as u64) as usize
+}
+
+/// What a header says about a ranged read: the record, or why the window cannot come from it
+fn range_head(prefix: &[u8], key: &RecordKey) -> std::result::Result<Head, FastRange> {
+    match head_read(prefix, key.as_ref()) {
+        HeadRead::Same(head) if head.is_tombstone => Err(FastRange::Tombstone(head)),
+        // A coded record's window is of the payload it decodes to, so only a whole read cuts it.
+        HeadRead::Same(head) => match crate::format::record::data_codec(prefix, key.as_ref(), head.lsn, head.len) {
+            Some(0) => Ok(head),
+            Some(_) | None => Err(FastRange::Unsure),
+        },
+        HeadRead::Other | HeadRead::Missing | HeadRead::Cold => Err(FastRange::Other),
+    }
+}
+
+/// A window that came in one span with its record's header
+fn near_fast_range(answer: SplitAnswer, key: &RecordKey, at: u64, len: usize) -> Result<FastRange> {
+    let (bytes, body) = match answer {
+        Ok(read) => read,
+        Err((error, spare)) => {
+            recycle_header(spare);
+            return match is_missing(&error) {
+                true => Ok(FastRange::Gone),
+                false => Err(error),
+            };
+        }
+    };
+    let verdict = match range_head(&bytes, key) {
+        Ok(head) => {
+            let wanted = window_of(&head, at, len);
+            match body.len() >= at as usize + wanted {
+                true => match cut_range(body, at as usize, wanted) {
+                    Some(window) => FastRange::Found(head, window),
+                    None => FastRange::Unsure,
+                },
+                false => {
+                    crate::reel::payload::give(body);
+                    FastRange::Unsure
+                }
+            }
+        }
+        Err(verdict) => {
+            crate::reel::payload::give(body);
+            verdict
+        }
+    };
+    recycle_header(bytes);
+    Ok(verdict)
+}
+
+/// A window that came as its own read beside its record's header
+fn deep_fast_range(filled: Vec<SplitRead>, key: &RecordKey, at: u64, len: usize) -> Result<FastRange> {
+    let mut filled = filled.into_iter();
+    let header = next_split(&mut filled)?;
+    let window = next_split(&mut filled)?;
+    let (head_bytes, window_bytes) = match (header, window) {
+        (Ok((empty, head)), Ok((spare, window))) => {
+            crate::reel::payload::give(empty);
+            crate::reel::payload::give(spare);
+            (head, window)
+        }
+        (Err((error, _)), _) | (_, Err((error, _))) => {
+            return match is_missing(&error) {
+                true => Ok(FastRange::Gone),
+                false => Err(error),
+            };
+        }
+    };
+    let verdict = match range_head(&head_bytes, key) {
+        Ok(head) => {
+            let wanted = window_of(&head, at, len);
+            match window_bytes.len() >= wanted {
+                true => match cut_range(window_bytes, 0, wanted) {
+                    Some(window) => FastRange::Found(head, window),
+                    None => FastRange::Unsure,
+                },
+                false => {
+                    crate::reel::payload::give(window_bytes);
+                    FastRange::Unsure
+                }
+            }
+        }
+        Err(verdict) => {
+            crate::reel::payload::give(window_bytes);
+            verdict
+        }
+    };
+    crate::reel::payload::give(head_bytes);
+    Ok(verdict)
+}
+
+/// The next answer of a batch, as a single read would have it
+fn next_split(filled: &mut impl Iterator<Item = SplitRead>) -> Result<SplitAnswer> {
+    match filled.next() {
+        Some(read) => Ok(read.map_err(|error| (error, Vec::new()))),
+        None => Err(ReelError::Backend(
+            "a FastForward batch came back with fewer answers than it asked".to_string(),
+        )),
     }
 }
 

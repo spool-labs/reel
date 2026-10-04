@@ -265,11 +265,30 @@ fn fastforward_answers_sealed_keys() {
     assert!(store.page_out_sealed().expect("hand over") > 0);
     assert!(store.index.fast_held() > 0, "the handover filled FastForward");
 
+    // Every get path agrees: one at a time, in a batch, and as a future of each.
     let check = |store: &ReelStore, expected: &[Option<Vec<u8>>], stage: &str| {
+        let keys: Vec<RecordKey> = (0..expected.len()).map(|byte| record(7, byte as u8)).collect();
+        let many = store.get_many(&keys).expect("get many");
+        let waited_many = block_on(store.get_many_wait(&keys)).expect("awaited get many");
         for (byte, value) in expected.iter().enumerate() {
-            let found = store.get(&record(7, byte as u8)).expect("read");
-            let found = found.map(|found| found.to_vec());
+            let found = store.get(&keys[byte]).expect("read").map(|found| found.to_vec());
             assert_eq!(&found, value, "key {byte} after {stage}");
+            let waited = block_on(store.get_wait(&keys[byte])).expect("awaited get");
+            assert_eq!(&waited.map(|found| found.to_vec()), value, "awaited key {byte} after {stage}");
+            assert_eq!(&many[byte].as_ref().map(|found| found.to_vec()), value, "batched key {byte} after {stage}");
+            let waited = waited_many[byte].as_ref().map(|found| found.to_vec());
+            assert_eq!(&waited, value, "awaited batched key {byte} after {stage}");
+            // A window near the front, one deep in the payload, and one cut short at its end.
+            for (at, len) in [(10u64, 100usize), (6_000, 1_000), (8_000, 1_000)] {
+                let want = value.as_ref().map(|value| {
+                    let from = (at as usize).min(value.len());
+                    value[from..(from + len).min(value.len())].to_vec()
+                });
+                let window = store.get_range(&keys[byte], at, len).expect("range").map(|found| found.to_vec());
+                assert_eq!(window, want, "key {byte} window {at}+{len} after {stage}");
+                let waited = block_on(store.get_range_wait(&keys[byte], at, len)).expect("awaited range");
+                assert_eq!(waited.map(|found| found.to_vec()), want, "awaited key {byte} window {at}+{len} after {stage}");
+            }
         }
     };
     check(&store, &expected, "the handover");
@@ -302,6 +321,41 @@ fn fastforward_answers_sealed_keys() {
         .expect("reopen");
     assert!(reopened.index.fast_held() > 0, "the open loaded FastForward");
     check(&reopened, &expected, "a reopen");
+}
+
+// every read FastForward answers costs one device read a key, a deep window two in one submission
+#[test]
+fn fastforward_reads_take_one_read_a_key() {
+    let (store, sim) = sim_store(ReelConfig {
+        index: IndexResidency::Paged,
+        ..config(1, SyncPolicy::Never)
+    });
+    let payload = vec![0xa5u8; 8 * 1024];
+    for byte in 0..200u8 {
+        store.put(&record(7, byte), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+    let handed: Vec<RecordKey> = (0..200u8)
+        .map(|byte| record(7, byte))
+        .filter(|key| is_paged(&store, key))
+        .take(10)
+        .collect();
+    assert_eq!(handed.len(), 10, "ten keys went to FastForward");
+    // One read first, so the segment's handle is open and no count below includes it.
+    store.get(&handed[0]).expect("warm");
+
+    let reads = |read: &dyn Fn()| {
+        let before = sim.ops();
+        read();
+        sim.ops() - before
+    };
+    assert_eq!(reads(&|| drop(store.get(&handed[1]).expect("get"))), 1, "a get");
+    assert_eq!(reads(&|| drop(block_on(store.get_wait(&handed[2])).expect("get"))), 1, "an awaited get");
+    assert_eq!(reads(&|| drop(store.get_range(&handed[3], 10, 100).expect("range"))), 1, "a near window");
+    assert_eq!(reads(&|| drop(store.get_range(&handed[4], 6_000, 1_000).expect("range"))), 2, "a deep window");
+    assert_eq!(reads(&|| drop(store.get_many(&handed).expect("many"))), 10, "a batch");
+    assert_eq!(reads(&|| drop(block_on(store.get_many_wait(&handed)).expect("many"))), 10, "an awaited batch");
 }
 
 // a retire leaves FastForward's entries in segments an open rebuilt, which wear no incarnation yet

@@ -61,6 +61,11 @@ impl LsnCounter {
         Lsn(self.0.fetch_add(1, Ordering::Relaxed))
     }
 
+    /// Issue a batch's numbers as one unbroken run, returning the first
+    pub fn issue_run(&self, count: u64) -> Lsn {
+        Lsn(self.0.fetch_add(count, Ordering::Relaxed))
+    }
+
     /// The sequence number the next issue would return, without advancing
     pub fn peek(&self) -> Lsn {
         Lsn(self.0.load(Ordering::Relaxed))

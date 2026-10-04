@@ -198,3 +198,139 @@ fn batch_or_nothing() {
 
     assert!(reads > 0, "the readers never got a read in");
 }
+
+/// The same column sharded on its first byte, so one batch's keys land in many shards
+const SPREAD: ColumnSet = &[ColumnSpec {
+    shard_bytes: 1,
+    ..COLUMNS[0]
+}];
+
+/// Key groups the many-writer test spreads its batches over
+const GROUPS: u64 = 8;
+
+/// Keys in one group, every one of them written by each batch on the group
+const GROUP_KEYS: u64 = 64;
+
+/// Batches each writer lands in the many-writer test
+const WRITER_BATCHES: u64 = 1500;
+
+/// A group's key, led by its place in the group so a batch crosses every shard
+fn group_key(group: u64, at: u64) -> [u8; 8] {
+    (at << 56 | group).to_be_bytes()
+}
+
+fn next_random(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// Write or delete a whole group with one tag, so a group only ever holds one tag
+fn group_batch(group: u64, tag: Option<u64>) -> WriteBatch {
+    let mut batch = WriteBatch::new();
+    for at in 0..GROUP_KEYS {
+        let key = group_key(group, at);
+        match tag {
+            Some(tag) => batch.put("rows", &key, &[tag.to_le_bytes(), [0x5a; 8]].concat()),
+            None => batch.delete("rows", &key),
+        }
+    }
+    batch
+}
+
+// many writers at once, and every read of one group sees one batch's tag or none of it
+#[test]
+fn many_writers_or_nothing() {
+    let store = Arc::new(
+        ReelStore::open_with_io(
+            PathBuf::from("/visibility"),
+            ReelConfig {
+                active_tails: ThreadBudget::threads(4),
+                ..config()
+            },
+            SPREAD,
+            Arc::new(SimIo::new(FaultPlan::new(12))),
+        )
+        .expect("open"),
+    );
+    for group in 0..GROUPS {
+        Store::write_batch(&*store, group_batch(group, Some(group))).expect("seed");
+    }
+
+    let is_writing = Arc::new(AtomicBool::new(true));
+    let writers: Vec<_> = (0..4u64)
+        .map(|writer| {
+            let store = Arc::clone(&store);
+            thread::spawn(move || {
+                let mut state = 0x9e37_79b9_7f4a_7c15 ^ (writer + 1);
+                for round in 0..WRITER_BATCHES {
+                    let group = next_random(&mut state) % GROUPS;
+                    let tag = (writer + 1) << 32 | round;
+                    let tag = (!next_random(&mut state).is_multiple_of(5)).then_some(tag);
+                    Store::write_batch(&*store, group_batch(group, tag)).expect("batch");
+                }
+            })
+        })
+        .collect();
+
+    let readers: Vec<_> = (0..3u64)
+        .map(|reader| {
+            let store = Arc::clone(&store);
+            let is_writing = Arc::clone(&is_writing);
+            thread::spawn(move || {
+                let mut state = 0x2545_f491_4f6c_dd1d ^ (reader + 1);
+                let mut page = reel::KeyPage::with_lens();
+                let (mut reads, mut torn) = (0u64, 0u64);
+                while is_writing.load(Ordering::Acquire) {
+                    let group = next_random(&mut state) % GROUPS;
+                    let picked: Vec<[u8; 8]> = (0..2 + next_random(&mut state) % 15)
+                        .map(|_| group_key(group, next_random(&mut state) % GROUP_KEYS))
+                        .collect();
+                    let asked: Vec<&[u8]> = picked.iter().map(|key| key.as_slice()).collect();
+                    let answers = Store::get_many(&*store, "rows", &asked).expect("get many");
+                    let tags: Vec<Option<[u8; 8]>> = answers
+                        .iter()
+                        .map(|answer| {
+                            answer
+                                .as_ref()
+                                .map(|value| value[..8].try_into().expect("tag"))
+                        })
+                        .collect();
+                    if tags.iter().any(|tag| *tag != tags[0]) {
+                        torn += 1;
+                    }
+
+                    // One page of the whole column, where every group is all there or gone.
+                    let whole = (GROUPS * GROUP_KEYS) as usize;
+                    store
+                        .page(ColumnId(1), std::ops::Bound::Unbounded, whole, &mut page)
+                        .expect("page");
+                    let mut held = [0u64; GROUPS as usize];
+                    for at in 0..page.len() {
+                        if let Some(key) = page.key_ref(at) {
+                            held[key[7] as usize] += 1;
+                        }
+                    }
+                    if held.iter().any(|count| *count != 0 && *count != GROUP_KEYS) {
+                        torn += 1;
+                    }
+                    reads += 1;
+                }
+                (reads, torn)
+            })
+        })
+        .collect();
+
+    for writer in writers {
+        writer.join().expect("writer");
+    }
+    is_writing.store(false, Ordering::Release);
+    let mut reads = 0u64;
+    for reader in readers {
+        let (seen, torn) = reader.join().expect("reader");
+        assert_eq!(torn, 0, "{torn} of {seen} reads saw part of a batch");
+        reads += seen;
+    }
+    assert!(reads > 0, "the readers never got a read in");
+}

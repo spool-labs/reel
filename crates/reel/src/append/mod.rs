@@ -966,8 +966,9 @@ impl Appender {
             true => BatchMark::Member,
             false => BatchMark::Alone,
         };
-        for record in records {
-            let lsn = self.shared.lsn.issue();
+        let first = self.shared.lsn.issue_run(count as u64);
+        for (at, record) in records.into_iter().enumerate() {
+            let lsn = Lsn(first.0 + at as u64);
             let intent = match record.write {
                 BatchWrite::Put(payload, codec) => Intent::Data(payload, codec),
                 BatchWrite::Delete => Intent::Tombstone,

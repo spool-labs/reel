@@ -1260,6 +1260,11 @@ impl Compactor {
         // the destination has to know it holds these, or it seals with no row and the
         // delete is lost
         index.hold(&record.header.key, record.header.lsn, carried.loc);
+        // A paged column gave the delete's grave up once its segment sealed, and this pass
+        // retires that segment, so the copy stands a grave until its own segment is noted.
+        if record.header.flags.is_tombstone() {
+            index.hold_grave(&record.header.key, record.header.lsn, carried.loc.segment);
+        }
         Ok(TombstoneStep::Carried)
     }
 

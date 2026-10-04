@@ -1273,6 +1273,22 @@ impl FastColumn {
         }
     }
 
+    /// Whether a slot for the key's bits sits in a segment holding anything newer than `lsn`
+    ///
+    /// No header is read, so a caller holding the map's lock can ask. A slot whose
+    /// segment's ceiling is unknown counts as newer.
+    pub fn may_hold_newer(&self, key: &[u8], lsn: Lsn) -> bool {
+        let Some(segments) = self.segments.get() else {
+            return true;
+        };
+        let hash = hash_of(key);
+        self.shards[shard_of(hash)]
+            .read()
+            .matches(hash)
+            .iter()
+            .any(|place| segments.max_lsn_of(place.slot.segment()).is_none_or(|max| max > lsn))
+    }
+
     /// Where the key's shard stands, read before the map is asked
     pub fn since(&self, key: &RecordKey) -> Since {
         let shard = shard_of(hash_of(key.as_slice()));

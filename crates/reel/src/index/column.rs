@@ -204,6 +204,11 @@ impl ColumnIndex {
         on_index!(self, index => index.remove(key, lsn, tombstone, segments))
     }
 
+    /// Stand a grave for a tombstone compaction carried into a segment, unless a newer version stands
+    pub fn hold_grave(&self, key: &[u8], lsn: Lsn, segment: SegmentId, is_shadowed: impl FnOnce() -> bool) {
+        on_index!(self, index => index.hold_grave(key, lsn, segment, is_shadowed))
+    }
+
     /// What a record of this column's width and a payload of this length occupies
     pub fn span_of(&self, len: u32) -> u64 {
         span_of(self.key_width(), len)
@@ -967,6 +972,32 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         let at = self.shard_of(&key);
         let mut state = write(&self.shards[at]);
         self.remove_held(&mut state, at, key, lsn, tombstone, segments)
+    }
+
+    /// Stand a grave for a tombstone compaction carried into a segment, unless a newer version stands
+    ///
+    /// The map's own entry is checked first, then `is_shadowed` with the shard still
+    /// held, for a newer version the map cannot see. The tombstone's span is already
+    /// booked, so nothing moves in the counters.
+    pub fn hold_grave(&self, key: &[u8], lsn: Lsn, segment: SegmentId, is_shadowed: impl FnOnce() -> bool) {
+        let Some(key) = K::from_slice(key) else {
+            return;
+        };
+        let at = self.shard_of(&key);
+        let mut state = write(&self.shards[at]);
+        let was_empty = state.map.vacant();
+        let existing = state.map.at(key.as_slice()).copied();
+        if existing.is_some_and(|existing| !existing.is_grave() || existing.lsn > lsn) || is_shadowed() {
+            return;
+        }
+        // An older grave is replaced by this one rather than counted again.
+        if existing.is_some() {
+            state.graves -= 1;
+        }
+        self.filters.note(at, filter_hash(key.as_slice()));
+        state.map.put(key, Entry::grave_from(lsn, segment));
+        state.note_grave(lsn);
+        self.note_filled(at, was_empty);
     }
 
     /// The tombstone itself, with the key parsed and its shard already held

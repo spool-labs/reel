@@ -1428,6 +1428,32 @@ impl ReelIndex {
         }
     }
 
+    /// Stand a grave for a point tombstone compaction carried, on a paging volume
+    ///
+    /// A delete's grave goes once its tombstone's segment is noted, and the pass that
+    /// carries the tombstone on retires that segment. The copy is in no footer a walk
+    /// opens until its own segment is noted, so an older record of the key would answer
+    /// in the meantime. The grave stands for the copy, and the prune takes it the same
+    /// way once the copy's segment is noted.
+    ///
+    /// A newer version anywhere refuses it: the map's own entry, or a FastForward slot
+    /// in a segment holding anything newer, both read under the map's lock. A handover
+    /// puts the key in FastForward before the map lets it go, so one of the two shows
+    /// it. No grave stands while FastForward is still loading, since nothing there can
+    /// be ruled out yet.
+    pub fn hold_grave(&self, key: &RecordKey, lsn: Lsn, segment: SegmentId) {
+        if !self.residency.pages() || !self.fast_serves() {
+            return;
+        }
+        let Some(at) = self.slot(key.column) else {
+            return;
+        };
+        let fast = &self.fast[at];
+        self.indexes[at].hold_grave(key.as_slice(), lsn, segment, || {
+            fast.may_hold_newer(key.as_slice(), lsn)
+        });
+    }
+
     /// Book a carried tombstone's footprint in the segment it was copied into
     ///
     /// The key only says which column's width the record was framed at.

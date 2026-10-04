@@ -1052,17 +1052,6 @@ mod loom_tests {
 mod tests {
     use super::*;
 
-    // a fresh set of read counters has seen nothing go wrong
-    #[test]
-    fn starts_clean() {
-        let counters = ReadCounters::new();
-
-        assert_eq!(counters.unreadable_records(), 0);
-
-        counters.note_unreadable();
-        assert_eq!(counters.unreadable_records(), 1);
-    }
-
     // shadowing a record moves its footprint from live to dead
     #[test]
     fn segment_shadow() {

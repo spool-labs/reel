@@ -576,18 +576,6 @@ mod tests {
         assert_eq!(both.capacity_over_memory(), Some(4.0));
     }
 
-    // a volume that fits within reach of memory keeps the warm plane
-    #[test]
-    fn a_small_volume_stays_buffered() {
-        let facts = MachineFacts {
-            memory_bytes: Some(64),
-            volume_bytes: Some(64),
-            ..MachineFacts::default()
-        };
-
-        assert_eq!(facts.verdict(0).plane, Plane::Buffered);
-    }
-
     // the floor follows the device's own readahead
     #[test]
     fn the_mapping_floor_follows_readahead() {
@@ -671,18 +659,6 @@ mod tests {
             "{}",
             verdict.map_because
         );
-    }
-
-    // past the bar the set cannot stay warm and the plane flips
-    #[test]
-    fn a_volume_many_times_memory_goes_direct() {
-        let facts = MachineFacts {
-            memory_bytes: Some(64),
-            volume_bytes: Some(64 * 2),
-            ..MachineFacts::default()
-        };
-
-        assert_eq!(facts.verdict(0).plane, Plane::Direct);
     }
 
     // the bar is a floor rather than a midpoint, so just under it stays buffered

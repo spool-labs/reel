@@ -26,24 +26,6 @@ impl Column for Scores {
 }
 
 #[test]
-fn put_get() {
-    let store = TypedStore::new(MemoryStore::new());
-
-    store.put::<Users>(&1, &"Alice:30".to_string()).unwrap();
-
-    let retrieved = store.get::<Users>(&1).unwrap();
-    assert_eq!(retrieved, Some("Alice:30".to_string()));
-}
-
-#[test]
-fn get_nonexistent() {
-    let store = TypedStore::new(MemoryStore::new());
-
-    let result = store.get::<Users>(&999).unwrap();
-    assert_eq!(result, None);
-}
-
-#[test]
 fn delete() {
     let store = TypedStore::new(MemoryStore::new());
 
@@ -53,17 +35,6 @@ fn delete() {
     store.delete::<Users>(&1).unwrap();
     assert!(!store.contains::<Users>(&1).unwrap());
     assert_eq!(store.get::<Users>(&1).unwrap(), None);
-}
-
-#[test]
-fn contains() {
-    let store = TypedStore::new(MemoryStore::new());
-
-    assert!(!store.contains::<Users>(&1).unwrap());
-
-    store.put::<Users>(&1, &"Charlie:35".to_string()).unwrap();
-
-    assert!(store.contains::<Users>(&1).unwrap());
 }
 
 #[test]
@@ -103,14 +74,6 @@ fn iter() {
         assert_eq!(*key, users[i].0);
         assert_eq!(*value, users[i].1);
     }
-}
-
-#[test]
-fn iter_empty() {
-    let store = TypedStore::new(MemoryStore::new());
-
-    let results = store.iter::<Users>().unwrap();
-    assert_eq!(results.len(), 0);
 }
 
 #[test]

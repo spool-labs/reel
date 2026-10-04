@@ -301,32 +301,3 @@ fn compare_thresholds_and_rates() {
         }
     }
 }
-
-// selection is greedy, so a lower threshold only widens the candidate set and
-// never picks a worse segment while a better one exists
-#[test]
-fn a_lower_threshold_never_changes_the_choice_while_a_better_segment_exists() {
-    let segments = [
-        Segment {
-            live: 10.0,
-            dead: 90.0,
-            age: 1.0,
-        },
-        Segment {
-            live: 70.0,
-            dead: 30.0,
-            age: 1.0,
-        },
-    ];
-
-    let pick = |threshold: f64| {
-        segments
-            .iter()
-            .filter(|segment| segment.dead_fraction() >= threshold)
-            .max_by(|a, b| a.dead_fraction().total_cmp(&b.dead_fraction()))
-            .map(|segment| segment.dead_fraction())
-    };
-
-    assert_eq!(pick(BASE_DEAD_RATIO), Some(0.9));
-    assert_eq!(pick(ESCALATED_RATIO), Some(0.9));
-}

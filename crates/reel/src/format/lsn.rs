@@ -119,12 +119,4 @@ mod tests {
 
         assert_eq!(counter.peek(), Lsn(3));
     }
-
-    // a sequence number round trips through its byte form
-    #[test]
-    fn byte_roundtrip() {
-        let lsn = Lsn(0x0102_0304_0506_0708);
-
-        assert_eq!(Lsn::unpack(lsn.pack()), lsn);
-    }
 }

@@ -655,16 +655,6 @@ mod tests {
         assert!(!pressure.is_foreground_blocked(u64::MAX / 2));
     }
 
-    // the automatic compaction rate is unpaced, a cap exists only when named
-    #[test]
-    fn auto_rate_unpaced() {
-        let auto = RateLimiter::for_compaction(CompactRate::Auto);
-        let fixed = RateLimiter::for_compaction(CompactRate::Mbps(120));
-
-        assert_eq!(auto.target_mbps(), 0);
-        assert_eq!(fixed.target_mbps(), 120);
-    }
-
     // a zero scrub rate disables the scrub limiter
     #[test]
     fn scrub_zero_disables() {

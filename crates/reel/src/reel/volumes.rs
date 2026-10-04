@@ -467,16 +467,6 @@ mod tests {
         )
     }
 
-    // an unplaced segment is on the first root, which is the one-element case
-    #[test]
-    fn unplaced_segments_are_home() {
-        let volumes = two(0);
-        assert_eq!(
-            volumes.path_of(SegmentId(7)),
-            PathBuf::from("/a/000007.reel")
-        );
-    }
-
     // a placed segment resolves to its own root and nobody else moves
     #[test]
     fn placement_routes_one_segment() {

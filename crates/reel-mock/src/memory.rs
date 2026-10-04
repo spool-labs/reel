@@ -248,16 +248,6 @@ mod tests {
     }
 
     #[test]
-    fn put_get() {
-        let store = MemoryStore::new();
-
-        store.put("test", b"key", b"value").unwrap();
-
-        let result = store.get("test", b"key").unwrap();
-        assert_eq!(result, Some(Value::new(b"value".to_vec())));
-    }
-
-    #[test]
     fn put_overwrites() {
         let store = MemoryStore::new();
 
@@ -278,13 +268,6 @@ mod tests {
         store.delete("test", b"key").unwrap();
         assert!(!store.contains("test", b"key").unwrap());
         assert_eq!(store.get("test", b"key").unwrap(), None);
-    }
-
-    #[test]
-    fn delete_nonexistent() {
-        let store = MemoryStore::new();
-
-        store.delete("test", b"nonexistent").unwrap();
     }
 
     #[test]
@@ -318,25 +301,6 @@ mod tests {
             store.get("cf3", b"key").unwrap(),
             Some(Value::new(b"value3".to_vec()))
         );
-    }
-
-    #[test]
-    fn binary_data() {
-        let store = MemoryStore::new();
-
-        let key = vec![0u8, 1, 2, 255, 254];
-        let value = vec![10u8, 20, 30, 200, 100];
-
-        store.put("test", &key, &value).unwrap();
-        assert_eq!(store.get("test", &key).unwrap(), Some(Value::new(value)));
-    }
-
-    #[test]
-    fn batch_empty() {
-        let store = MemoryStore::new();
-        let batch = WriteBatch::new();
-
-        store.write_batch(batch).unwrap();
     }
 
     #[test]

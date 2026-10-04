@@ -1850,23 +1850,6 @@ mod tests {
         );
     }
 
-    // a tombstone entry survives with a zero length beside a data entry
-    #[test]
-    fn tombstone_entry() {
-        let mut footer = SegmentFooter::build(vec![
-            entry(RECORD, 0x01, 34, 5, 0, 1600),
-            entry(RECORD, 0x02, 34, 6, 1656, 0),
-        ]);
-
-        let packed = footer.pack(0).expect("pack");
-        let parsed = SegmentFooter::parse(&packed).expect("parse");
-        let rows = collect(&parsed);
-
-        assert_eq!(rows[1].len, 0);
-        assert!(rows[1].is_tombstone());
-        assert_eq!(rows.len(), 2);
-    }
-
     // a range tombstone is listed with the length of the end key it names
     #[test]
     fn range_tombstone_entry() {

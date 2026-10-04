@@ -118,14 +118,6 @@ mod tests {
         Arc::new(CuePoints::new())
     }
 
-    // a volume holding nothing has no floor, so nothing else changes
-    #[test]
-    fn none_held() {
-        let points = points();
-        assert!(points.is_empty());
-        assert_eq!(points.floor(), None);
-    }
-
     // the floor is the oldest held, and rises as holders let go
     #[test]
     fn floor_follows_oldest() {

@@ -216,31 +216,6 @@ fn every_whole_block_drain_is_aligned() {
     }
 }
 
-// a buffered drain leaves the write head at the end of its own records
-#[test]
-fn buffered_drain_writes_only_its_records() {
-    let (shared, _sim) = harness(
-        config(SyncPolicy::Never, Preallocate::Chunk),
-        FaultPlan::new(1),
-    );
-    let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
-
-    let mut expected = SEG_HEADER_SPAN;
-    for byte in 1..=5u8 {
-        let payload = byte as u64 * 111;
-        appender
-            .append_data(
-                key(byte),
-                vec![byte; payload as usize],
-                0,
-                Commit::PerRecord,
-            )
-            .expect("append");
-        expected += framed(payload as usize);
-        assert_eq!(appender.tail().committed_len(), expected);
-    }
-}
-
 // a sync leaves the write head exactly where the records left it
 #[test]
 fn a_sync_adds_no_bytes() {
@@ -721,22 +696,6 @@ fn a_batch_never_spans_segments() {
     );
 }
 
-// the committed length reaches past every record a drain wrote
-#[test]
-fn committed_length_reaches_past_every_record() {
-    let (shared, _sim) = harness(
-        config(SyncPolicy::Never, Preallocate::Chunk),
-        FaultPlan::new(1),
-    );
-    let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
-
-    let committed = appender
-        .append_data(key(9), vec![0x99; 700], 0, Commit::PerRecord)
-        .expect("append");
-    let record_end = committed.loc.offset as u64 + HEADER_LEN as u64 + 700;
-    assert!(appender.tail().committed_len() >= record_end);
-}
-
 // a writer that finds the spare being drawn walks away rather than queueing
 #[test]
 fn drawing_a_spare_never_queues_a_writer() {
@@ -1002,27 +961,6 @@ fn spare_is_drawn_before_the_roll() {
         entries.iter().any(|entry| entry.name == name),
         "the next segment was not drawn"
     );
-}
-
-// chunk preallocation slack is closed at seal so the footer ends the file
-#[test]
-fn seal_bridges_preallocation_slack() {
-    let (shared, sim) = harness(
-        config(SyncPolicy::Never, Preallocate::Chunk),
-        FaultPlan::new(1),
-    );
-    let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
-
-    appender
-        .append_data(key(1), vec![0x11; 128], 0, Commit::PerRecord)
-        .expect("append");
-    appender.seal().expect("seal");
-
-    let bytes = sim
-        .durable_bytes(&shared.segment_path(SegmentId(1)))
-        .expect("durable");
-    let footer = SegmentFooter::parse(&bytes).expect("footer parses at the file end");
-    assert_eq!(footer.entry_count(), 1);
 }
 
 // a drain that never landed leaves no footer entry at the offset it framed

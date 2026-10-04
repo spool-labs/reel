@@ -494,9 +494,6 @@ pub fn merged_page(
     Ok(())
 }
 
-/// Sealed rows an ordered page reads past what it still needs, for those it will drop
-const ORDERED_SLACK: usize = 16;
-
 /// Times one round of an ordered page looks again when a sealed slot left under its look,
 /// before the footers answer
 const ORDERED_TRIES: usize = 8;
@@ -525,7 +522,7 @@ struct SealedRow {
     segment: SegmentId,
     offset: u32,
 
-    /// The payload, when the page is for a caller that reads every one
+    /// The payload, none for a tombstone
     payload: Option<Value>,
 }
 
@@ -597,14 +594,13 @@ pub fn ordered_page(
         Bound::Included(key) | Bound::Excluded(key) => Some(FastColumn::lead(key.as_slice())),
         Bound::Unbounded => None,
     };
-    // Sized to the page and its slack once, rather than regrown a row at a time.
-    let room = limit + ORDERED_SLACK;
+    // Sized to the page once, rather than regrown a row at a time.
     let mut walk = Walk {
         from,
         lead,
         is_sealed_done: false,
-        rows: Vec::with_capacity(room),
-        keys: Vec::with_capacity(room * width),
+        rows: Vec::with_capacity(limit),
+        keys: Vec::with_capacity(limit * width),
     };
     while out.len() < limit {
         match ordered_round(paged, fast, width, settle, playback, &mut walk, limit, out)? {
@@ -635,12 +631,6 @@ fn ordered_round(
     let index = paged.index;
     let PlaybackCursor { way, resident, .. } = playback;
     let way = *way;
-    let with_payloads = out.reads_payloads();
-    // A payload read past the page's end is wasted, so a payload page takes no slack.
-    let slack = match with_payloads {
-        true => 0,
-        false => ORDERED_SLACK,
-    };
     let from = borrowed_bound(&walk.from);
     let (near, far) = match way {
         Way::Up => (0, u64::MAX),
@@ -659,9 +649,9 @@ fn ordered_round(
         resident_page(index, way, from, span, resident);
         walk.rows.clear();
         if !walk.is_sealed_done {
-            fast.walk_lead(walk.lead, way, span + slack, &mut walk.rows);
+            fast.walk_lead(walk.lead, way, span, &mut walk.rows);
         }
-        let cut = (walk.rows.len() >= span + slack)
+        let cut = (walk.rows.len() >= span)
             .then(|| walk.rows.last().map(|row| row.lead))
             .flatten();
         if !fast.moved_between(&before, walk.lead.unwrap_or(near), cut.unwrap_or(far)) {
@@ -675,7 +665,7 @@ fn ordered_round(
         .flatten();
     let walked = walk.rows.last().map(|row| row.lead);
 
-    let Some(mut sealed) = read_sealed(fast, paged.column, width, way, with_payloads, settle, walk)? else {
+    let Some(mut sealed) = read_sealed(fast, paged.column, width, way, settle, walk)? else {
         return Ok(Round::Footers);
     };
     let keys = walk.keys.as_slice();
@@ -778,15 +768,14 @@ fn ordered_round(
 /// The newest version of a key stands, a tie going to the newer segment, which is a
 /// compaction copy of the other. A row whose segment is gone is taken out of the index,
 /// since its record moved on or died. One only the checked path can read sends the page
-/// to the footers. A page for a caller reading every payload reads each record whole,
-/// so the payload comes in the same read. A newest version an overwrite or a delete
-/// booked as older is settled by the checked path, since its delete may have no grave left.
+/// to the footers. Each record is read whole, so its payload comes in the same read. A
+/// newest version an overwrite or a delete booked as older is settled by the checked path,
+/// since its delete may have no grave left.
 fn read_sealed(
     fast: &FastColumn,
     column: ColumnId,
     width: usize,
     way: Way,
-    with_payloads: bool,
     settle: &dyn Fn(&[u8]) -> Result<Option<Entry>>,
     walk: &mut Walk,
 ) -> Result<Option<Vec<SealedRow>>> {
@@ -797,10 +786,7 @@ fn read_sealed(
         .map(|row| RowAsk {
             segment: row.segment,
             offset: row.offset,
-            bound: match with_payloads {
-                true => row.bound,
-                false => 0,
-            },
+            bound: row.bound,
         })
         .collect();
     let Some(reads) = fast.read_rows(column, width, &asks, keys)? else {

@@ -1697,7 +1697,7 @@ impl ReelIndex {
         match self.paged_footers(slot) {
             Some(footers) => {
                 let paged = self.paged_at(slot, column, footers);
-                if let Some(width) = self.ordered_width(slot) {
+                if let Some(width) = self.ordered_width(slot, out) {
                     let settle = |key: &[u8]| -> Result<Option<Entry>> { self.get(&RecordKey::from_bytes(column, key)?) };
                     if ordered_page(&paged, &self.fast[slot], width, &settle, playback, limit, out)? == Ordered::Filled {
                         self.ordered_pages.fetch_add(1, Ordering::Relaxed);
@@ -1713,10 +1713,10 @@ impl ReelIndex {
 
     /// The key width an ordered column's walks read records at, once its index holds every sealed key
     ///
-    /// None sends a walk to the footers: a hashed column, a column of variable width, or
-    /// an index still loading.
-    fn ordered_width(&self, at: usize) -> Option<usize> {
-        if !self.fast_serves() || self.fast[at].layout() != Layout::Ordered {
+    /// None sends a walk to the footers: a hashed column, a column of variable width, an
+    /// index still loading, or a walk of keys alone, which the footers hold already.
+    fn ordered_width(&self, at: usize, out: &KeyPage) -> Option<usize> {
+        if !out.reads_payloads() || !self.fast_serves() || self.fast[at].layout() != Layout::Ordered {
             return None;
         }
         match self.columns[at].key_width {

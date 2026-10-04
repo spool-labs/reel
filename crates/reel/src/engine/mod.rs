@@ -213,7 +213,7 @@ pub struct ReelStore {
     cursor: Mutex<LogCursor>,
 
     /// Sealed segments whose keys have not been handed to their footers yet, in seal order
-    held: Mutex<VecDeque<SegmentId>>,
+    held: Mutex<VecDeque<(SegmentId, Arc<SegmentFooter>)>>,
 
     /// Whether this open refuses every write
     is_read_only: bool,
@@ -462,7 +462,7 @@ impl ReelStore {
 
         // Nothing is waiting to be handed over: the only keys a rebuild leaves
         // resident are the tails', and a tail is handed over when it seals.
-        let held: VecDeque<SegmentId> = VecDeque::new();
+        let held: VecDeque<(SegmentId, Arc<SegmentFooter>)> = VecDeque::new();
 
         Ok(ReelStore {
             bias,

@@ -689,8 +689,11 @@ struct Pending {
     /// The segment sealed
     segment: SegmentId,
 
-    /// Whether a caller is already reading this one's footer
+    /// Whether a caller is already noting this one's spans
     is_taken: bool,
+
+    /// The footer the seal wrote, so naming and handing over never read it back
+    footer: Arc<SegmentFooter>,
 }
 
 impl ReelShared {
@@ -941,12 +944,13 @@ impl ReelShared {
     }
 
     /// Note a segment whose footer is now on disk, for the index to page out
-    pub fn note_sealed(&self, segment: SegmentId) {
+    pub fn note_sealed(&self, segment: SegmentId, footer: Arc<SegmentFooter>) {
         // The window where a seal is durable but the index has not been told.
         crate::sync::rendezvous::at("seal/queued");
         lock(&self.sealed_pending).push(Pending {
             segment,
             is_taken: false,
+            footer,
         });
         self.sealed_waiting.store(true, Ordering::Release);
     }
@@ -956,17 +960,17 @@ impl ReelShared {
         self.sealed_waiting.load(Ordering::Acquire)
     }
 
-    /// The segments sealed since this was last asked
+    /// The segments sealed since this was last asked, each with the footer its seal wrote
     ///
     /// They stay on the queue, where a compaction pass can still see their spans
     /// are owed; clearing the flag only sends other callers past this batch.
-    pub fn peek_sealed(&self) -> Vec<SegmentId> {
+    pub fn peek_sealed(&self) -> Vec<(SegmentId, Arc<SegmentFooter>)> {
         let mut pending = lock(&self.sealed_pending);
         self.sealed_waiting.store(false, Ordering::Release);
         let mut taken = Vec::with_capacity(pending.len());
         for entry in pending.iter_mut().filter(|entry| !entry.is_taken) {
             entry.is_taken = true;
-            taken.push(entry.segment);
+            taken.push((entry.segment, Arc::clone(&entry.footer)));
         }
         taken
     }
@@ -978,20 +982,6 @@ impl ReelShared {
     /// the maintenance tick, which asks whether or not the flag is up.
     pub fn settle_sealed(&self, named: &[SegmentId]) {
         lock(&self.sealed_pending).retain(|entry| !named.contains(&entry.segment));
-    }
-
-    /// Put back segments a pass took and could not name, for the next one to take
-    ///
-    /// The claim has to come off whichever way the caller leaves, or the entry holds
-    /// compaction off the segment for ever and no later pass will take it.
-    pub fn release_sealed(&self, named: &[SegmentId]) {
-        let mut pending = lock(&self.sealed_pending);
-        for entry in pending
-            .iter_mut()
-            .filter(|entry| named.contains(&entry.segment))
-        {
-            entry.is_taken = false;
-        }
     }
 
     /// Segments whose spans the index has not been told about yet

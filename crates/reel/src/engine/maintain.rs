@@ -3,12 +3,14 @@
 use std::path::{Path, PathBuf};
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use crate::compaction::compactor::EraseReport;
 use crate::compaction::merge::{merge_once, sorted_run_dead_ratio, MergeReport};
 use crate::error::{ReelError, Result};
 use crate::format::column::ColumnId;
-use crate::format::loc::{Loc, SegmentId};
+use crate::format::footer::SegmentFooter;
+use crate::format::loc::SegmentId;
 use crate::format::lsn::Lsn;
 use crate::index::counters::ProbeCounts;
 use crate::reel::checkpoint::{
@@ -242,8 +244,8 @@ impl ReelStore {
         }
 
         let mut paged = 0usize;
-        while let Some(segment) = self.next_to_hand_over() {
-            paged += self.hand_over(segment)?;
+        while let Some((segment, footer)) = self.next_to_hand_over() {
+            paged += self.hand_over(segment, &footer)?;
         }
         Ok(paged)
     }
@@ -252,20 +254,15 @@ impl ReelStore {
     ///
     /// The half of the handover worth doing on every volume: it names the segments a
     /// search must consider and rules out the rest, without handing a key over.
-    /// False where there is no footer to read at all, which no retry changes.
-    fn note_spans(&self, segment: SegmentId) -> Result<bool> {
-        let Some(footer) = self.reel.shared().footer_of(segment)? else {
-            return Ok(false);
-        };
+    fn note_spans(&self, segment: SegmentId, footer: &SegmentFooter) -> Result<()> {
         // The footer is in hand and the spans are not down yet. A retire that lands
         // here takes the file and clears the registry this is about to write into.
         crate::sync::rendezvous::at("seal/spans");
-        self.index.note_spans(segment, &footer)?;
-        Ok(true)
+        self.index.note_spans(segment, footer)
     }
 
-    /// The next sealed segment owed a handover, oldest first
-    fn next_to_hand_over(&self) -> Option<SegmentId> {
+    /// The next sealed segment owed a handover, oldest first, with the footer its seal wrote
+    fn next_to_hand_over(&self) -> Option<(SegmentId, Arc<SegmentFooter>)> {
         lock(&self.held).pop_front()
     }
 
@@ -274,29 +271,12 @@ impl ReelStore {
     /// The spans are not recorded here: recording them off this queue would put a
     /// segment compaction has since retired back into the search. Paging a key out
     /// cannot, since it moves only an entry that still points into this segment.
-    fn hand_over(&self, segment: SegmentId) -> Result<usize> {
+    fn hand_over(&self, segment: SegmentId, footer: &SegmentFooter) -> Result<usize> {
         // The keys are given up one at a time, with reads served throughout.
         crate::sync::rendezvous::at("paged/handover");
-        let Some(footer) = self.reel.shared().footer_of(segment)? else {
-            return Ok(0);
-        };
         let mut paged = 0usize;
         for partition in &footer.partitions {
-            // The key is borrowed out of the packed bytes: decoding whole entries
-            // would build a `KeyBytes` per row, including the rows this skips.
-            for at in 0..partition.len() {
-                let row = partition.row_at(at)?;
-                if !row.flags.is_data() {
-                    continue;
-                }
-                let Some(key) = partition.key_at(at) else {
-                    continue;
-                };
-                let loc = Loc::new(segment, row.offset, row.len);
-                if self.index.page_out(partition.column, key, loc) {
-                    paged += 1;
-                }
-            }
+            paged += self.index.page_out_partition(segment, partition)?;
         }
         Ok(paged)
     }
@@ -311,44 +291,27 @@ impl ReelStore {
         if sealed.is_empty() {
             return Ok(());
         }
-        let mut named = Vec::with_capacity(sealed.len());
-        // Taken by the peek above and not named here, so the claim has to come off
-        // or nothing will ever take them again.
-        let mut kept = Vec::new();
-        for segment in sealed {
-            match self.note_spans(segment) {
-                Ok(_) => named.push(segment),
-                // A device that would not answer this time may answer next time.
-                Err(ReelError::Io(error)) => {
-                    kept.push(segment);
-                    tracing::warn!(
-                        "could not read reel segment {}'s footer to name what it holds, trying again: {error}",
-                        segment.as_u32()
-                    );
-                }
-                // Anything else is about the bytes rather than about the device,
-                // so the segment is given up to compaction.
-                Err(error) => {
-                    tracing::warn!(
-                        "reel segment {} sealed with a footer that names no key range: {error}",
-                        segment.as_u32()
-                    );
-                    named.push(segment);
-                }
+        for (segment, footer) in &sealed {
+            // A footer that names no key range is given up to compaction.
+            if let Err(error) = self.note_spans(*segment, footer) {
+                tracing::warn!(
+                    "reel segment {} sealed with a footer that names no key range: {error}",
+                    segment.as_u32()
+                );
             }
         }
+        let named: Vec<SegmentId> = sealed.iter().map(|(segment, _)| *segment).collect();
         // The mark comes off here rather than beside the paged queue below, or a
         // resident volume would hold every merge's note for the life of the volume.
         for segment in &named {
             self.reel.shared().forget_merge_output(*segment);
         }
         self.reel.shared().settle_sealed(&named);
-        self.reel.shared().release_sealed(&kept);
 
         if !self.config.index.pages() {
             return Ok(());
         }
-        lock(&self.held).extend(named);
+        lock(&self.held).extend(sealed);
         Ok(())
     }
 

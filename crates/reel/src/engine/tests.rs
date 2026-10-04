@@ -669,7 +669,7 @@ fn a_second_caller_cannot_take_a_held_segment() {
         let store = Arc::clone(&store);
         std::thread::spawn(move || store.hold_sealed())
     };
-    // The footer is read and the spans are not down.
+    // The footer is in hand and the spans are not down.
     script.await_reached("seal/spans", 1);
 
     // The second caller, which is what a read behind a fresh seal is. It must
@@ -709,9 +709,9 @@ fn a_second_caller_cannot_take_a_held_segment() {
     }
 }
 
-// one unreadable footer costs its own segment and none of the batch behind it
+// naming and handing over a sealed segment reads nothing back from the device
 #[test]
-fn an_unreadable_footer_does_not_lose_the_batch() {
+fn naming_a_seal_reads_no_footer() {
     let (store, sim) = sim_store(ReelConfig {
         index: IndexResidency::Paged,
         ..config(1, SyncPolicy::Never)
@@ -726,59 +726,30 @@ fn an_unreadable_footer_does_not_lose_the_batch() {
     }
     let second = store.reel.tails()[0].seal().expect("seal");
     store.flush().expect("flush");
-
-    // The seal left both footers held, and this is about one that has to be read back.
+    // A footer cache too small to keep them, which is when a footer used to be read back.
     store.reel.shared().footers.forget(first);
     store.reel.shared().footers.forget(second);
 
-    // Wide enough for the length and the two reads one footer costs, narrow
-    // enough that the segment behind it is read from a working device.
-    sim.arm_next_ops(3, FaultKind::ReadError);
-    let outcome = store.hold_sealed();
+    // Every read fails, so a footer read back would fail the pass or leave a segment unnamed.
+    sim.arm_next_ops(64, FaultKind::ReadError);
+    let outcome = store.page_out_sealed();
     sim.disarm();
-    assert!(
-        outcome.is_ok(),
-        "one unreadable footer failed the whole pass: {outcome:?}"
-    );
+    assert!(outcome.is_ok(), "naming the seals failed: {outcome:?}");
     let (fired, _) = sim.fault_reach();
-    assert!(
-        fired > 0,
-        "the armed read error never landed, so nothing was tested"
-    );
+    assert_eq!(fired, 0, "naming the seals read the device");
 
-    assert!(
-        store
-            .index
-            .sites(&record(7, 8))
-            .expect("sites")
-            .candidates
-            .contains(&second),
-        "the segment behind the failure went unnamed: {second:?}"
-    );
-    assert!(
-        !store
-            .index
-            .sites(&record(7, 0))
-            .expect("sites")
-            .candidates
-            .contains(&first),
-        "the failed read named {first:?} anyway, so nothing was tested"
-    );
-    assert!(
-        store.reel.shared().pending_seals().contains(&first),
-        "the segment whose footer would not read was dropped rather than kept"
-    );
-
-    store.hold_sealed().expect("name what the fault held back");
-    assert!(
-        store
-            .index
-            .sites(&record(7, 0))
-            .expect("sites")
-            .candidates
-            .contains(&first),
-        "the retry never named {first:?}"
-    );
+    for (byte, segment) in [(0u8, first), (8u8, second)] {
+        assert!(
+            store
+                .index
+                .sites(&record(7, byte))
+                .expect("sites")
+                .candidates
+                .contains(&segment),
+            "{segment:?} went unnamed"
+        );
+    }
+    assert!(store.reel.shared().pending_seals().is_empty(), "a seal stayed owed");
 }
 
 // a paged reopen leaves its sealed keys in the footers instead of installing them

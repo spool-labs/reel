@@ -16,7 +16,7 @@ use crate::config::IndexResidency;
 use crate::engine::Totals;
 use crate::error::{ReelError, Result};
 use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, RecordKey};
-use crate::format::footer::SegmentFooter;
+use crate::format::footer::{FooterPartition, SegmentFooter};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::index::column::{ColumnIndex, KeyMove, Landed, PendingCover};
@@ -245,6 +245,15 @@ pub struct ReelIndex {
     /// Held while a batch moves the maps, so no spanning read sees part of one
     publish: PublishBarrier,
 }
+
+/// Threads one segment's hand-over splits across, each owning a lane of FastForward shards
+///
+/// One thread handed over 1.17M keys a second on the box while the load wrote 1.68M, so
+/// 30M keys still waited in the map when a 100M load ended.
+const HANDOVER_LANES: usize = 4;
+
+/// Rows below which a partition hands over on the calling thread, sooner than lanes start
+const SPLIT_AT: usize = 4096;
 
 impl ReelIndex {
     /// An empty index over the columns a reel serves
@@ -808,6 +817,51 @@ impl ReelIndex {
             self.fast[at].remove_at(key, loc);
         }
         handed
+    }
+
+    /// Give one sealed partition's keys up, a lane of FastForward shards to a thread
+    ///
+    /// Every key still goes through `page_out` alone. Each lane starts at its own share of
+    /// key order, so the threads meet different map shards too.
+    pub fn page_out_partition(&self, segment: SegmentId, partition: &FooterPartition) -> Result<usize> {
+        let lanes = match partition.len() >= SPLIT_AT {
+            true => HANDOVER_LANES,
+            false => 1,
+        };
+        let mut rows: Vec<Vec<(u32, Loc)>> = vec![Vec::new(); lanes];
+        for at in 0..partition.len() {
+            let row = partition.row_at(at)?;
+            if !row.flags.is_data() {
+                continue;
+            }
+            // The key is borrowed out of the packed bytes, never decoded into an entry.
+            let Some(key) = partition.key_at(at) else {
+                continue;
+            };
+            rows[FastColumn::lane_of(key, lanes)].push((at as u32, Loc::new(segment, row.offset, row.len)));
+        }
+        let hand = |lane: usize, rows: &[(u32, Loc)]| -> usize {
+            let (head, tail) = rows.split_at(rows.len() * lane / lanes);
+            tail.iter()
+                .chain(head)
+                .filter(|(at, loc)| {
+                    partition
+                        .key_at(*at as usize)
+                        .is_some_and(|key| self.page_out(partition.column, key, *loc))
+                })
+                .count()
+        };
+        if lanes == 1 {
+            return Ok(hand(0, &rows[0]));
+        }
+        Ok(std::thread::scope(|scope| {
+            let handing: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .map(|(lane, rows)| scope.spawn(move || hand(lane, rows)))
+                .collect();
+            handing.into_iter().map(|lane| lane.join().expect("a hand-over lane panicked")).sum()
+        }))
     }
 
     /// Record the keys one newly sealed segment covers for one column

@@ -14,6 +14,7 @@ use tempfile::TempDir;
 
 use reel::config::{IndexResidency, ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, MapShape, RecordKey};
+use reel::format::loc::SegmentId;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::units::ByteCount;
@@ -379,9 +380,15 @@ fn filled_blocked(filter_bits: u8) -> ReelStore {
 // a hit against a held footer reads no blocks at all
 //
 // A footer in hand is searched in memory, so the block counter means nothing without
-// knowing which of the two search paths a volume is on.
+// knowing which of the two search paths a volume is on. A seal hands its footer to the
+// index and the cache keeps none, so each one is taken in hand first, after a cue has
+// sealed the tail.
 pub fn a_held_footer_costs_no_blocks() {
     let store = filled(0);
+    store.cue().expect("cue");
+    for segment in 0..256 {
+        store.segment_footer(SegmentId(segment)).expect("footer");
+    }
     let counts = hit_counts(&store, KEYS);
 
     assert!(counts.searched() > 0, "no search reached a sealed segment");

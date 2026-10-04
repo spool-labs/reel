@@ -80,9 +80,9 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
         *lock(&active.entries) = footer;
         return Err(error);
     }
-    // Packing left the footer as a read of the file would parse it, so the first search
-    // of this segment finds it held and reads nothing back.
-    shared.footers.insert(active.handle.id(), Arc::new(footer));
+    // Packing left the footer as a read of the file would parse it, so it rides the
+    // sealed queue to the index, which never reads it back.
+    let footer = Arc::new(footer);
     // The handle stops being a write head here and becomes the one readers find in the
     // cache, so it takes the hint a read-path open would have given it.
     let _ = shared
@@ -94,7 +94,7 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
     shared.forget_unsealed(active.handle.id());
     // The footer is on disk now, so a paged index can take this segment's keys over from
     // the map. The tail does not hold the index, so it leaves the number instead.
-    shared.note_sealed(active.handle.id());
+    shared.note_sealed(active.handle.id(), footer);
     Ok(())
 }
 

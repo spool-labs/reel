@@ -35,6 +35,11 @@ pub trait FooterSource: Send + Sync {
     /// The whole footer rather than one row, because a playback cannot ask by key.
     fn footer(&self, segment: SegmentId) -> Result<Option<Arc<SegmentFooter>>>;
 
+    /// One sealed segment's footer for a single pass, leaving no copy in any cache
+    fn footer_once(&self, segment: SegmentId) -> Result<Option<Arc<SegmentFooter>>> {
+        self.footer(segment)
+    }
+
     /// What a sealed segment's footer says about a key, if it says anything
     fn find(&self, segment: SegmentId, column: ColumnId, key: &[u8]) -> Result<Option<FooterRow>> {
         let Some(footer) = self.footer(segment)? else {

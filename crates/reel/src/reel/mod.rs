@@ -102,7 +102,7 @@ impl RecordSource for ReelShared {
 
     fn record(&self, key: &RecordKey, segment: SegmentId, offset: u32, bound: u32) -> Result<FastRead> {
         let Some(handle) = self.handle_for(segment)? else {
-            return Ok(FastRead::Other);
+            return Ok(FastRead::Gone);
         };
         let prefix = HEADER_LEN + key.as_slice().len();
         let answer = self.driver.pread_split_reusing(
@@ -118,7 +118,7 @@ impl RecordSource for ReelShared {
             Err((error, spare)) => {
                 recycle_header(spare);
                 return match is_missing(&error) {
-                    true => Ok(FastRead::Other),
+                    true => Ok(FastRead::Gone),
                     false => Err(error),
                 };
             }
@@ -193,6 +193,13 @@ fn fast_read_of(read: RecordRead, head: Head) -> FastRead {
 impl FooterSource for ReelShared {
     fn footer(&self, segment: SegmentId) -> Result<Option<Arc<SegmentFooter>>> {
         self.footer_of(segment)
+    }
+
+    fn footer_once(&self, segment: SegmentId) -> Result<Option<Arc<SegmentFooter>>> {
+        if let Some(footer) = self.footers.get(segment) {
+            return Ok(Some(footer));
+        }
+        Ok(self.footer_from_disk(segment)?.map(Arc::new))
     }
 
     /// One key, answered by reading the blocks the search touches and no more
@@ -560,21 +567,25 @@ impl ReelShared {
         if let Some(footer) = self.footers.get(segment) {
             return Ok(Some(footer));
         }
-        let handle = match self.handle_for(segment)? {
-            Some(handle) => handle,
-            None => return Ok(None),
+        let Some(footer) = self.footer_from_disk(segment)? else {
+            return Ok(None);
+        };
+        let footer = Arc::new(footer);
+        self.footers.insert(segment, Arc::clone(&footer));
+        Ok(Some(footer))
+    }
+
+    /// One sealed segment's footer read from its file, with no cache asked or filled
+    fn footer_from_disk(&self, segment: SegmentId) -> Result<Option<SegmentFooter>> {
+        let Some(handle) = self.handle_for(segment)? else {
+            return Ok(None);
         };
         let file_len = match self.driver.length(handle.file()) {
             Ok(len) => len,
             Err(error) if error.is_missing() => return Ok(None),
             Err(error) => return Err(error),
         };
-        let footer = match read_footer(&self.driver, handle.file(), file_len)? {
-            Some(footer) => Arc::new(footer),
-            None => return Ok(None),
-        };
-        self.footers.insert(segment, Arc::clone(&footer));
-        Ok(Some(footer))
+        read_footer(&self.driver, handle.file(), file_len)
     }
 
     /// What a segment weighs, live against dead, for the seal that writes it down

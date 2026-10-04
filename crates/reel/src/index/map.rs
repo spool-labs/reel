@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::ops::Bound;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::units::ByteCount;
@@ -149,11 +149,8 @@ const RELEASE_RUN: usize = 1024;
 /// front of a fan-out and no hit can stop the walk short of it.
 const NO_CEILING: Lsn = Lsn(u64::MAX);
 
-/// Parts a FastForward load cuts a column's key space into, by leading byte, one thread each
-const LOAD_PARTS: usize = 16;
-
-/// Keys one load cursor examines before it reopens where it stopped
-const LOAD_RUN: usize = 1 << 20;
+/// Threads a FastForward load reads sealed footers on, one footer each at a time
+const LOAD_THREADS: usize = 8;
 
 /// One range delete's cover as a batch hands it to the index
 ///
@@ -331,6 +328,9 @@ impl ReelIndex {
         }
         Ok(match self.fast[at].read(key)? {
             Lookup::Found(lsn, _) if index.is_covered_key(key.as_slice(), lsn) => Lookup::Missing,
+            // A write or a compaction move put the key in the map after it was asked, and
+            // took the sealed entry out after this went looking.
+            Lookup::Missing if index.entry_or_grave(key.as_slice()).is_some() => Lookup::Unsettled,
             found => found,
         })
     }
@@ -369,9 +369,9 @@ impl ReelIndex {
 
     /// Fill FastForward with every sealed key's newest live version, then let it answer
     ///
-    /// The paged walk's own merge picks each key's newest footer row, and a key the map
-    /// holds stays with the map. Each column's key space is cut by leading byte, one
-    /// thread a part.
+    /// Each sealed footer is read once, a footer a thread at a time, so what a load holds
+    /// is a few footers and not the volume's. A key the map holds stays with the map,
+    /// and a row a finished range delete took stays out.
     pub fn load_fast(&self) -> Result<()> {
         if !self.residency.pages() || self.fast_ready.load(Ordering::Acquire) {
             return Ok(());
@@ -379,52 +379,60 @@ impl ReelIndex {
         let Some(footers) = self.footers.get() else {
             return Ok(());
         };
-        for (at, column) in self.columns.iter().enumerate() {
-            if self.sealed[at].is_empty() {
-                continue;
+        let mut sealed: Vec<SegmentId> = self.sealed.iter().flat_map(SealedRanges::segments).collect();
+        sealed.sort_unstable();
+        sealed.dedup();
+        for fast in &self.fast {
+            fast.begin_load();
+        }
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| -> Result<()> {
+            let workers: Vec<_> = (0..LOAD_THREADS)
+                .map(|_| {
+                    scope.spawn(|| -> Result<()> {
+                        while let Some(segment) = sealed.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            if let Some(footer) = footers.footer_once(*segment)? {
+                                self.load_footer(*segment, &footer)?;
+                            }
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
             }
-            let paged = self.paged_at(at, column.id, footers);
-            let paged = &paged;
-            std::thread::scope(|scope| -> Result<()> {
-                let workers: Vec<_> = (0..LOAD_PARTS)
-                    .map(|part| scope.spawn(move || self.load_part(at, paged, part)))
-                    .collect();
-                for worker in workers {
-                    worker
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
-                }
-                Ok(())
-            })?;
+            Ok(())
+        })?;
+        for fast in &self.fast {
+            fast.finish_load();
         }
         self.mark_fast_ready();
         Ok(())
     }
 
-    /// Load one leading-byte part of a column's sealed keys into FastForward
-    fn load_part(&self, at: usize, paged: &Paged<'_>, part: usize) -> Result<()> {
-        let width = 256 / LOAD_PARTS;
-        let mut from = vec![(part * width) as u8];
-        let until = (part + 1 < LOAD_PARTS).then(|| vec![((part + 1) * width) as u8]);
-        let mut found = Vec::new();
-        loop {
-            let mut playback = PlaybackCursor::new(paged.column, Way::Up, Bound::Included(&from))?;
-            let run = playback::release_rows(
-                paged,
-                &mut playback,
-                until.as_deref(),
-                NO_CEILING,
-                LOAD_RUN,
-                &mut found,
-            )?;
-            for (key, loc) in found.drain(..) {
-                self.fast[at].insert(key.as_slice(), loc);
-            }
-            match run.resume {
-                Some(resume) => from = resume,
-                None => return Ok(()),
+    /// Load one sealed footer's rows, leaving out what the map or a finished cover answers for
+    fn load_footer(&self, segment: SegmentId, footer: &SegmentFooter) -> Result<()> {
+        for partition in &footer.partitions {
+            let Some(at) = self.slot(partition.column) else {
+                continue;
+            };
+            let index = &self.indexes[at];
+            for entry in partition.entries() {
+                let entry = entry?;
+                let key = entry.key.as_slice();
+                let is_answered = entry.is_range_tombstone()
+                    || index.entry_or_grave(key).is_some()
+                    || index.covered_by_swept(key, entry.lsn);
+                if !is_answered {
+                    let loc = Loc::new(segment, entry.offset, entry.len);
+                    self.fast[at].load(key, loc, entry.lsn, entry.is_tombstone());
+                }
             }
         }
+        Ok(())
     }
 
     /// Where a key's live record is, reading a footer if the column pages

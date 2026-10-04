@@ -34,6 +34,12 @@ const FIRST_BUCKETS: usize = 8;
 /// Slots a full pair of buckets moves along before the shard grows instead
 const MAX_KICKS: usize = 256;
 
+/// Times a lookup starts over when a candidate's segment went while it read
+///
+/// A compaction can move a record, seal its copy and retire the source inside one
+/// slow read, and only a fresh look at the table finds the copy.
+const LOOKUP_TRIES: usize = 4;
+
 /// Older versions waiting for the cleaner before new ones are left to the retired-segment sweep
 const MAX_STALE: usize = 1 << 20;
 
@@ -62,6 +68,7 @@ const TAG_SHIFT: u32 = 16;
 const CLASS_SHIFT: u32 = 8;
 const CLASS_MASK: u32 = 0xFF;
 const SECOND: u32 = 1;
+const GRAVE: u32 = 2;
 
 /// What a record's header says, once its key matched the one asked about
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,6 +99,9 @@ pub enum FastRead {
     Found(Head, Value),
     Tombstone(Head),
     Other,
+
+    /// The segment is gone, so whatever the entry pointed at has moved on or died
+    Gone,
 
     /// A record the checked read has to settle, such as one failing its checksum
     Unsure,
@@ -150,8 +160,17 @@ fn bound_of(class: u32) -> u32 {
 
 /// A key's 64 bit hash, mixed so structured keys spread like random ones
 fn hash_of(key: &[u8]) -> u64 {
+    hash_seeded(key, 0)
+}
+
+/// A second hash of a key, which a load keeps beside a slot so two keys sharing its bits stay apart
+fn check_of(key: &[u8]) -> u32 {
+    (hash_seeded(key, 1) >> 32) as u32
+}
+
+fn hash_seeded(key: &[u8], seed: u64) -> u64 {
     const ODD: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut state = 0xCBF2_9CE4_8422_2325 ^ key.len() as u64;
+    let mut state = 0xCBF2_9CE4_8422_2325 ^ key.len() as u64 ^ seed.wrapping_mul(ODD);
     let mut chunks = key.chunks_exact(8);
     for chunk in &mut chunks {
         let mut word = [0u8; 8];
@@ -228,6 +247,17 @@ impl Slot {
         self.meta & SECOND != 0
     }
 
+    fn is_grave(&self) -> bool {
+        self.meta & GRAVE != 0
+    }
+
+    fn as_grave(self) -> Slot {
+        Slot {
+            meta: self.meta | GRAVE,
+            ..self
+        }
+    }
+
     fn in_second(self, is_second: bool) -> Slot {
         let meta = match is_second {
             true => self.meta | SECOND,
@@ -286,10 +316,20 @@ impl std::ops::Deref for Places {
     }
 }
 
+/// What a load keeps beside one slot: the version it holds and the key's second hash
+#[derive(Clone, Copy, Default)]
+struct Carry {
+    lsn: u64,
+    check: u32,
+}
+
 struct Table {
     buckets: Vec<Bucket>,
     held: usize,
     seed: u64,
+
+    /// One carry per slot while a load runs, and nothing otherwise
+    carries: Vec<Carry>,
 }
 
 impl Table {
@@ -298,6 +338,26 @@ impl Table {
             buckets: vec![Bucket::default(); count.max(2)],
             held: 0,
             seed: count as u64,
+            carries: Vec::new(),
+        }
+    }
+
+    fn is_loading(&self) -> bool {
+        !self.carries.is_empty()
+    }
+
+    fn carry_at(&self, bucket: usize, way: usize) -> Carry {
+        match self.is_loading() {
+            true => self.carries[bucket * WAYS + way],
+            false => Carry::default(),
+        }
+    }
+
+    /// Write a slot and, while loading, what it carries
+    fn put(&mut self, bucket: usize, way: usize, slot: Slot, carry: Carry) {
+        self.buckets[bucket].slots[way] = slot;
+        if self.is_loading() {
+            self.carries[bucket * WAYS + way] = carry;
         }
     }
 
@@ -351,43 +411,56 @@ impl Table {
     /// Put a slot in either of its key's buckets, moving others along when both are full
     ///
     /// A failed placement hands back the slot left homeless, which may be another key's.
-    fn place(&mut self, slot: Slot) -> std::result::Result<(), Slot> {
+    fn place(&mut self, slot: Slot, carry: Carry) -> std::result::Result<(), (Slot, Carry)> {
         let home = self.home(slot.mid);
         let second = (home + self.step(slot.tag())) % self.buckets.len();
         for (bucket, is_second) in [(home, false), (second, true)] {
             if let Some(way) = self.free_way(bucket) {
-                self.buckets[bucket].slots[way] = slot.in_second(is_second);
+                self.put(bucket, way, slot.in_second(is_second), carry);
                 self.held += 1;
                 return Ok(());
             }
         }
-        let (mut bucket, mut moving) = (home, slot.in_second(false));
+        let (mut bucket, mut moving, mut carried) = (home, slot.in_second(false), carry);
         for _ in 0..MAX_KICKS {
             self.seed = mix(self.seed);
             let way = (self.seed % WAYS as u64) as usize;
-            let evicted = std::mem::replace(&mut self.buckets[bucket].slots[way], moving);
+            let (evicted, evicted_carry) = (self.buckets[bucket].slots[way], self.carry_at(bucket, way));
+            self.put(bucket, way, moving, carried);
             bucket = self.other(bucket, &evicted);
             moving = evicted.in_second(!evicted.is_second());
+            carried = evicted_carry;
             if let Some(free) = self.free_way(bucket) {
-                self.buckets[bucket].slots[free] = moving;
+                self.put(bucket, free, moving, carried);
                 self.held += 1;
                 return Ok(());
             }
         }
-        Err(moving)
+        Err((moving, carried))
     }
 
     fn is_full(&self) -> bool {
         self.held as f64 >= (self.buckets.len() * WAYS) as f64 * LOAD
     }
 
-    /// A table this one's slots fit into at the next size
+    /// A table this one's slots fit into at the next size, carries and all
     fn grown(&self) -> Table {
         let mut count = ((self.buckets.len() as f64) * GROWTH).ceil() as usize;
         loop {
             let mut table = Table::with_buckets(count);
-            let slots = self.buckets.iter().flat_map(|bucket| bucket.slots.iter());
-            if slots.filter(|slot| !slot.is_empty()).all(|slot| table.place(*slot).is_ok()) {
+            if self.is_loading() {
+                table.carries = vec![Carry::default(); count.max(2) * WAYS];
+            }
+            let mut fits = true;
+            'slots: for (bucket, held) in self.buckets.iter().enumerate() {
+                for (way, slot) in held.slots.iter().enumerate() {
+                    if !slot.is_empty() && table.place(*slot, self.carry_at(bucket, way)).is_err() {
+                        fits = false;
+                        break 'slots;
+                    }
+                }
+            }
+            if fits {
                 return table;
             }
             count = ((count as f64) * GROWTH).ceil() as usize;
@@ -395,12 +468,12 @@ impl Table {
     }
 
     /// Put a slot in, growing the table first when it is full or the pair has no room
-    fn insert(&mut self, slot: Slot) {
+    fn insert(&mut self, slot: Slot, carry: Carry) {
         if self.is_full() {
             *self = self.grown();
         }
-        let mut homeless = slot;
-        while let Err(left) = self.place(homeless) {
+        let mut homeless = (slot, carry);
+        while let Err(left) = self.place(homeless.0, homeless.1) {
             *self = self.grown();
             homeless = left;
         }
@@ -411,7 +484,7 @@ impl Table {
         let found = self.matches(hash);
         match found.iter().find(|place| place.slot.same_place(slot)) {
             Some(place) => {
-                self.buckets[place.bucket].slots[place.way] = Slot::default();
+                self.put(place.bucket, place.way, Slot::default(), Carry::default());
                 self.held -= 1;
                 true
             }
@@ -492,7 +565,65 @@ impl FastColumn {
         if table.matches(hash).iter().any(|place| place.slot.same_place(&slot)) {
             return;
         }
-        table.insert(slot);
+        table.insert(slot, Carry::default());
+    }
+
+    /// Get ready to load sealed rows, keeping a version and a check beside each slot
+    pub fn begin_load(&self) {
+        for shard in &self.shards {
+            let mut table = write(shard);
+            table.carries = vec![Carry::default(); table.buckets.len() * WAYS];
+        }
+    }
+
+    /// Load one sealed row, keeping each key's newest version and a tombstone as a grave
+    ///
+    /// A tie goes to the newer segment, which is a compaction copy of the other.
+    pub fn load(&self, key: &[u8], loc: Loc, lsn: Lsn, is_tombstone: bool) {
+        let hash = hash_of(key);
+        let check = check_of(key);
+        let slot = match is_tombstone {
+            true => Slot::new(hash, loc).as_grave(),
+            false => Slot::new(hash, loc),
+        };
+        let carry = Carry {
+            lsn: lsn.as_u64(),
+            check,
+        };
+        let mut table = write(&self.shards[shard_of(hash)]);
+        let held = table
+            .matches(hash)
+            .iter()
+            .copied()
+            .find(|place| table.carry_at(place.bucket, place.way).check == check);
+        match held {
+            Some(place) => {
+                let standing = table.carry_at(place.bucket, place.way).lsn;
+                if (carry.lsn, slot.segment) > (standing, place.slot.segment) {
+                    let moved = slot.in_second(place.slot.is_second());
+                    table.put(place.bucket, place.way, moved, carry);
+                }
+            }
+            None => table.insert(slot, carry),
+        }
+    }
+
+    /// Close a load: drop the graves that only kept older rows out, and the carries
+    pub fn finish_load(&self) {
+        for shard in &self.shards {
+            let mut table = write(shard);
+            let mut dropped = 0;
+            for bucket in table.buckets.iter_mut() {
+                for slot in bucket.slots.iter_mut() {
+                    if slot.is_grave() {
+                        *slot = Slot::default();
+                        dropped += 1;
+                    }
+                }
+            }
+            table.held -= dropped;
+            table.carries = Vec::new();
+        }
     }
 
     /// Take out the entry pointing at one record, for a compaction move, an eviction or a release
@@ -593,6 +724,16 @@ impl FastColumn {
         let (Some(records), Some(segments)) = (self.records.get(), self.segments.get()) else {
             return Ok(Lookup::Unsettled);
         };
+        for _ in 0..LOOKUP_TRIES {
+            if let Some(lookup) = self.read_once(key, records.as_ref(), segments)? {
+                return Ok(lookup);
+            }
+        }
+        Ok(Lookup::Unsettled)
+    }
+
+    /// One look at the table and a read of each candidate, or nothing when a segment went under it
+    fn read_once(&self, key: &RecordKey, records: &dyn RecordSource, segments: &SegmentTable) -> Result<Option<Lookup>> {
         let (hash, ordered) = self.ordered(key, segments);
         let mut best: Option<(Head, Option<Value>)> = None;
         let mut stale = Vec::new();
@@ -607,7 +748,8 @@ impl FastColumn {
                 FastRead::Found(head, value) => (head, Some(value)),
                 FastRead::Tombstone(head) => (head, None),
                 FastRead::Other => continue,
-                FastRead::Unsure => return Ok(Lookup::Unsettled),
+                FastRead::Gone => return Ok(None),
+                FastRead::Unsure => return Ok(Some(Lookup::Unsettled)),
             };
             match &best {
                 Some((current, _)) if current.lsn >= head.lsn => {
@@ -626,10 +768,10 @@ impl FastColumn {
                 len,
             });
         }
-        Ok(match best {
+        Ok(Some(match best {
             Some((head, Some(value))) => Lookup::Found(head.lsn, value),
             Some((_, None)) | None => Lookup::Missing,
-        })
+        }))
     }
 
     /// A key's newest sealed entry, reading every candidate's header, for a caller that reads the record itself
@@ -637,6 +779,21 @@ impl FastColumn {
         let (Some(records), Some(segments)) = (self.records.get(), self.segments.get()) else {
             return Ok(None);
         };
+        for _ in 0..LOOKUP_TRIES {
+            if let Some(entry) = self.entry_once(key, records.as_ref(), segments)? {
+                return Ok(entry);
+            }
+        }
+        Ok(None)
+    }
+
+    /// One look at the table and a header read of each candidate, or nothing when a segment went under it
+    fn entry_once(
+        &self,
+        key: &RecordKey,
+        records: &dyn RecordSource,
+        segments: &SegmentTable,
+    ) -> Result<Option<Option<Entry>>> {
         let (_, ordered) = self.ordered(key, segments);
         let mut best: Option<(Head, Slot)> = None;
         for (ceiling, slot) in &ordered {
@@ -649,16 +806,17 @@ impl FastColumn {
                 HeadRead::Same(head) if best.is_none_or(|(current, _)| head.lsn > current.lsn) => {
                     best = Some((head, *slot));
                 }
-                HeadRead::Same(_) | HeadRead::Other | HeadRead::Missing | HeadRead::Cold => {}
+                HeadRead::Missing => return Ok(None),
+                HeadRead::Same(_) | HeadRead::Other | HeadRead::Cold => {}
             }
         }
-        Ok(best.map(|(head, slot)| match head.is_tombstone {
+        Ok(Some(best.map(|(head, slot)| match head.is_tombstone {
             true => Entry::grave(head.lsn),
             false => {
                 let stamp = segments.incarnation_of(slot.segment());
                 Entry::new(Loc::new(slot.segment(), slot.offset, head.len), head.lsn).stamped(stamp)
             }
-        }))
+        })))
     }
 
     /// Drop every entry pointing into a segment no longer standing, with no reads
@@ -756,7 +914,8 @@ mod tests {
                     FastRead::Found(head, Value::from(head.lsn.as_u64().to_le_bytes().to_vec()))
                 }
                 HeadRead::Same(_) => FastRead::Unsure,
-                HeadRead::Other | HeadRead::Missing | HeadRead::Cold => FastRead::Other,
+                HeadRead::Missing => FastRead::Gone,
+                HeadRead::Other | HeadRead::Cold => FastRead::Other,
             })
         }
     }
@@ -846,6 +1005,51 @@ mod tests {
         assert_eq!(taken, vec![(key(7), old)]);
         assert!(column.remove_at(key(7).as_slice(), new));
         assert_eq!(version(&column, 7), Some(9), "the copy still answers");
+    }
+
+    // a load keeps each key's newest row, gives a tie to the newer segment, and drops deleted keys
+    #[test]
+    fn a_load_keeps_the_newest_row_of_each_key() {
+        let records = Arc::new(Records::default());
+        let column = column(&records);
+        let rows = [
+            (1u64, Loc::new(SegmentId(2), 0, 40), 5u64, false),
+            (1, Loc::new(SegmentId(1), 0, 40), 3, false),
+            (2, Loc::new(SegmentId(1), 64, 40), 4, false),
+            (2, Loc::new(SegmentId(3), 64, 40), 4, false),
+            (3, Loc::new(SegmentId(1), 128, 40), 2, false),
+            (3, Loc::new(SegmentId(2), 128, 0), 6, true),
+            (4, Loc::new(SegmentId(2), 192, 0), 1, true),
+            (4, Loc::new(SegmentId(3), 192, 40), 7, false),
+        ];
+        column.begin_load();
+        for (at, loc, lsn, is_tombstone) in rows {
+            if !is_tombstone {
+                records.write(loc, key(at).as_slice(), Lsn(lsn));
+            }
+            column.load(key(at).as_slice(), loc, Lsn(lsn), is_tombstone);
+        }
+        column.finish_load();
+        assert_eq!(version(&column, 1), Some(5), "the newer row stands");
+        assert_eq!(version(&column, 3), None, "a newer tombstone drops the key");
+        assert_eq!(version(&column, 4), Some(7), "a newer row stands over an older tombstone");
+        assert_eq!(column.held(), 3);
+        assert!(column.remove_at(key(2).as_slice(), Loc::new(SegmentId(3), 64, 40)), "a tie went to the copy");
+        assert_eq!(column.held(), 2);
+    }
+
+    // a candidate whose segment went sends the lookup to the checked path, never to an older version
+    #[test]
+    fn a_gone_candidate_never_lets_an_older_version_answer() {
+        let records = Arc::new(Records::default());
+        let column = column(&records);
+        let older = Loc::new(SegmentId(1), 0, 40);
+        let moved = Loc::new(SegmentId(2), 0, 40);
+        records.write(older, key(9).as_slice(), Lsn(1));
+        column.insert(key(9).as_slice(), older);
+        column.insert(key(9).as_slice(), moved);
+        assert!(matches!(column.read(&key(9)).expect("read"), Lookup::Unsettled));
+        assert_eq!(column.entry(&key(9)).expect("entry"), None);
     }
 
     // entries into a retired segment go without a read

@@ -622,22 +622,22 @@ impl<K: IndexKey> Covered<K> {
 /// Words one shard's filter takes at most, sixteen kibibytes
 const FILTER_WORDS: usize = 2048;
 
-/// Words a paged or hot column's filters take between all of its shards, a mebibyte
+/// Words a paged column's filters take between all of its shards, a mebibyte
 ///
 /// A column of few shards gives each the full filter. A two-byte column cuts it to
-/// two words a shard, allocated at open so a hot budget's floor holds all of them.
+/// two words a shard, allocated at open.
 const COLUMN_FILTER_WORDS: usize = 1 << 17;
 
 /// Filters in front of every shard's lock, answering only definite absence
 ///
 /// A resident column gives each shard the full filter, allocated on the shard's
 /// first key, since its shards keep their keys and a small filter would fill. A
-/// paged or hot column cuts one mebibyte evenly between its shards at open. A key's
+/// paged column cuts one mebibyte evenly between its shards at open. A key's
 /// bits are set before the map takes it and a shard's bits are cleared when its map
 /// empties, both under the shard's write lock, so a reader that sees a bit clear is
 /// reading a state the lock it skipped would also have allowed.
 struct ShardFilters {
-    /// A paged or hot column's words, every shard's run of them in shard order
+    /// A paged column's words, every shard's run of them in shard order
     shared: Box<[AtomicU64]>,
 
     /// A resident column's filters, one per shard, each built on first use

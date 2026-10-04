@@ -324,7 +324,7 @@ ran within 18% of the 1 MiB shape, 806 against 985 MB/s of reads (ccx33, 2026-08
    integrity coverage is a sampling rate.
 2. **The resident index does not fit.** 95 bytes a key is 2.8 GB at 1 MiB records,
    11.2 GB at 256 KiB, 44.6 GB at 64 KiB, and `IndexResidency::Resident` is still
-   the default. `Paged` holds about a byte a key, `Hot` a budget; `index-tier.md`.
+   the default. `Paged` holds about a byte a key, as `index-tier.md` records.
 3. **The tick sweeps every segment.** `index.ranking()` allocates a vector of every
    segment under a read lock and folds two atomics per entry, to choose one target.
    `select_unsorted` calls it again and asks the memoized footer facts per

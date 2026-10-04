@@ -1,9 +1,8 @@
 //! What handing a sealed segment's keys to its footer costs
 //!
-//! A hot index keeps a sealed segment's keys resident for a while and then gives them
-//! to the footer, which is `page_out_sealed`. That sweep visits every row of every
-//! segment it hands over, so its cost is per row rather than per segment, and it is
-//! the one path where a footer's whole key set is read at once.
+//! A paged index gives a sealed segment's keys to the footer on the next tick, which is
+//! `page_out_sealed`. That sweep visits every row of every segment it hands over, so it
+//! costs per row, and it is the one path where a footer's whole key set is read at once.
 //!
 //! Opt-in. Run with:
 //!   cargo test -p tape-reel --release --test probes -- handover_cost
@@ -15,8 +14,8 @@ use std::time::Instant;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, HotIndex, IndexResidency, KeyWidth,
-    MapShape, Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, MapShape,
+    Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 /// Virtual root the simulator's files live under
@@ -65,11 +64,7 @@ const SEGMENT: u64 = 64 * 1024;
 /// Segment counts the sweep reports
 const CASES: &[usize] = &[64, 256, 1024];
 
-/// A hot index that hands a segment over the moment it is asked
-///
-/// `after_secs` zero puts every sealed segment's ready time in the past, so one
-/// `page_out_sealed` drains the whole queue and the timer covers the sweep rather than
-/// the wait in front of it. The budget is large so nothing is handed over early.
+/// A paged index, so one `page_out_sealed` drains the whole queue and the timer covers the sweep
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT),
@@ -77,10 +72,7 @@ fn config() -> ReelConfig {
         preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
-        index: IndexResidency::Hot(HotIndex {
-            after_secs: 0,
-            budget: ByteCount::gb(1),
-        }),
+        index: IndexResidency::Paged,
         ..ReelConfig::default()
     }
 }

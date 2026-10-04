@@ -17,7 +17,6 @@ mod tests;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use crate::units::ByteCount;
 
@@ -82,18 +81,6 @@ const COMPACT_PASSES: usize = 1;
 /// A counter rather than a clock or a random source: the only thing a mark has
 /// to distinguish is one opening from another.
 static OPENINGS: AtomicU32 = AtomicU32::new(0);
-
-/// A sealed segment whose keys are still resident, and when they stop being
-///
-/// A paged volume drains this queue every tick. A hot one keeps a segment here until
-/// its wait is over or the budget reaches it, which makes the recent past cost one io.
-struct Held {
-    /// The sealed segment, kept in seal order so the oldest leaves first
-    segment: SegmentId,
-
-    /// When its keys may be handed over, at once for one an earlier process sealed
-    ready_at: Instant,
-}
 
 /// One write in a batch
 pub enum RecordWrite {
@@ -225,8 +212,8 @@ pub struct ReelStore {
     /// How far a read-only follower has read the log
     cursor: Mutex<LogCursor>,
 
-    /// Sealed segments whose keys have not been handed to their footers yet
-    held: Mutex<VecDeque<Held>>,
+    /// Sealed segments whose keys have not been handed to their footers yet, in seal order
+    held: Mutex<VecDeque<SegmentId>>,
 
     /// Whether this open refuses every write
     is_read_only: bool,
@@ -475,7 +462,7 @@ impl ReelStore {
 
         // Nothing is waiting to be handed over: the only keys a rebuild leaves
         // resident are the tails', and a tail is handed over when it seals.
-        let held: VecDeque<Held> = VecDeque::new();
+        let held: VecDeque<SegmentId> = VecDeque::new();
 
         Ok(ReelStore {
             bias,

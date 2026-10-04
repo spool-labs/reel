@@ -160,8 +160,6 @@ serial run, which is why the binary declines the libtest harness.
   or they assert nothing.
 - **Read-only volumes under faults.** The follower's refresh under a drawn fault
   plan, and sole-copy corruption answers on a read-only open.
-- **Hot residency in the stresser.** The walk draws resident and paged; `Hot` is
-  untouched.
 - **Multi-tail sole-copy crash sweep.** The sweep runs one tail, the ordering
   argument is per tail, and a multi-tail leg would say so.
 - **The ring leg of the stresser on Linux.** The tag-wrap pin only means what it

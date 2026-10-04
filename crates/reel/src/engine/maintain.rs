@@ -1,13 +1,11 @@
 //! The maintenance tick: seal handover, footprint, compaction, the merge and the scrub
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use std::sync::atomic::Ordering;
 
 use crate::compaction::compactor::EraseReport;
 use crate::compaction::merge::{merge_once, sorted_run_dead_ratio, MergeReport};
-use crate::config::IndexResidency;
 use crate::error::{ReelError, Result};
 use crate::format::column::ColumnId;
 use crate::format::loc::{Loc, SegmentId};
@@ -18,9 +16,7 @@ use crate::reel::checkpoint::{
     Checkpoint,
 };
 
-use super::{
-    read_only, CompactPass, Held, ReelStore, Totals, GRAVE_WINDOW, INGEST_HOT_BYTES, SWEEP_RUN,
-};
+use super::{read_only, CompactPass, ReelStore, Totals, GRAVE_WINDOW, INGEST_HOT_BYTES, SWEEP_RUN};
 use crate::sync::lock;
 
 /// Older versions the FastForward cleaner takes out on one maintenance tick, with no reads
@@ -268,21 +264,9 @@ impl ReelStore {
         Ok(true)
     }
 
-    /// The next segment whose keys are neither recent enough nor cheap enough to keep
-    ///
-    /// A paged volume keeps nothing, so this is the queue in order. A hot one hands
-    /// over what has waited out its age, then keeps going while the maps are over
-    /// budget.
+    /// The next sealed segment owed a handover, oldest first
     fn next_to_hand_over(&self) -> Option<SegmentId> {
-        let now = Instant::now();
-        let over_budget = match self.config.index {
-            IndexResidency::Hot(hot) => self.index.key_bytes() > hot.budget,
-            _ => false,
-        };
-        let mut held = lock(&self.held);
-        let front = held.front()?;
-        (over_budget || front.ready_at <= now)
-            .then(|| held.pop_front().expect("a front that answered").segment)
+        lock(&self.held).pop_front()
     }
 
     /// Give one sealed segment's keys to its footer
@@ -317,12 +301,11 @@ impl ReelStore {
         Ok(paged)
     }
 
-    /// Take the segments sealed since the last tick, name them, and start their wait
+    /// Take the segments sealed since the last tick, record their spans, and queue the handover
     ///
-    /// The wait runs from the seal rather than from this tick, so two segments
-    /// sealed either side of a tick are the same age at the next one. Spans go down
-    /// first and for every residency, and a segment stays on the sealed queue until
-    /// it has been named, so nothing retires a segment the index cannot search yet.
+    /// Spans go down first and for every residency, and only a paged volume queues the
+    /// handover. A segment stays on the sealed queue until it has been named, so nothing
+    /// retires a segment the index cannot search yet.
     pub(super) fn hold_sealed(&self) -> Result<()> {
         let sealed = self.reel.shared().peek_sealed();
         if sealed.is_empty() {
@@ -332,9 +315,9 @@ impl ReelStore {
         // Taken by the peek above and not named here, so the claim has to come off
         // or nothing will ever take them again.
         let mut kept = Vec::new();
-        for (segment, sealed_at) in sealed {
+        for segment in sealed {
             match self.note_spans(segment) {
-                Ok(_) => named.push((segment, sealed_at)),
+                Ok(_) => named.push(segment),
                 // A device that would not answer this time may answer next time.
                 Err(ReelError::Io(error)) => {
                     kept.push(segment);
@@ -350,46 +333,22 @@ impl ReelStore {
                         "reel segment {} sealed with a footer that names no key range: {error}",
                         segment.as_u32()
                     );
-                    named.push((segment, sealed_at));
+                    named.push(segment);
                 }
             }
         }
-        let settled: Vec<SegmentId> = named.iter().map(|(segment, _)| *segment).collect();
         // The mark comes off here rather than beside the paged queue below, or a
         // resident volume would hold every merge's note for the life of the volume.
-        let mut merged = Vec::new();
-        for segment in &settled {
-            if self.reel.shared().forget_merge_output(*segment) {
-                merged.push(*segment);
-            }
+        for segment in &named {
+            self.reel.shared().forget_merge_output(*segment);
         }
-        self.reel.shared().settle_sealed(&settled);
+        self.reel.shared().settle_sealed(&named);
         self.reel.shared().release_sealed(&kept);
 
         if !self.config.index.pages() {
             return Ok(());
         }
-        let wait = match self.config.index {
-            IndexResidency::Hot(hot) => hot.after(),
-            _ => Duration::ZERO,
-        };
-        let mut held = lock(&self.held);
-        for (segment, sealed_at) in named {
-            // Merge output is never recent: a row written recently lives in a newer
-            // run and shadows the merged copy. Left in seal order a base merge would
-            // seal last and take the residency budget from the segments that earned it.
-            let is_promotable = !merged.contains(&segment);
-            match is_promotable {
-                true => held.push_back(Held {
-                    segment,
-                    ready_at: sealed_at + wait,
-                }),
-                false => held.push_front(Held {
-                    segment,
-                    ready_at: sealed_at,
-                }),
-            }
-        }
+        lock(&self.held).extend(named);
         Ok(())
     }
 

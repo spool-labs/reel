@@ -1,7 +1,6 @@
 //! Reel store configuration and load-time validation
 
 use std::num::NonZeroU32;
-use std::time::Duration;
 
 #[cfg(feature = "serde")]
 use serde::de::Error as SerdeError;
@@ -61,42 +60,12 @@ pub enum IndexResidency {
 
     /// Sealed keys stay in their footers, memory holds what it takes to find them
     Paged,
-
-    /// Recent sealed keys stay in memory, older ones go to their footers
-    Hot(HotIndex),
 }
 
 impl IndexResidency {
     /// Whether sealed keys ever leave the map on this volume
     pub fn pages(&self) -> bool {
-        !matches!(self, IndexResidency::Resident)
-    }
-}
-
-/// When a hot index gives a sealed segment's keys up
-///
-/// Both limits are ceilings rather than targets: a segment goes over once it has
-/// been sealed longer than the age, and the oldest go early while the maps weigh
-/// more than the budget.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Deserialize))]
-#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
-pub struct HotIndex {
-    /// Seconds a sealed segment's keys stay resident before they are handed over
-    pub after_secs: u64,
-
-    /// Bytes the keys hold above the empty index, past which the oldest segments go early
-    ///
-    /// The shards and their filters cost a floor before any key arrives, and a volume
-    /// refuses a budget under that floor at open.
-    #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_bytes"))]
-    pub budget: ByteCount,
-}
-
-impl HotIndex {
-    /// How long a sealed segment's keys stay resident
-    pub fn after(&self) -> Duration {
-        Duration::from_secs(self.after_secs)
+        matches!(self, IndexResidency::Paged)
     }
 }
 

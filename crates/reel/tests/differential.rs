@@ -10,8 +10,8 @@ mod harness;
 
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::{
-    ByteCount, CompactRate, FenceResidency, HotIndex, IndexResidency, Preallocate, ReelConfig,
-    SyncPolicy, ThreadBudget,
+    ByteCount, CompactRate, FenceResidency, IndexResidency, Preallocate, ReelConfig, SyncPolicy,
+    ThreadBudget,
 };
 
 use harness::fixture::Differential;
@@ -136,17 +136,6 @@ fn fenced_config(active_tails: u32, fence: FenceResidency) -> ReelConfig {
     ReelConfig {
         footer_cache: ByteCount::from_bytes(64 * 1024),
         fence,
-        ..paged_config(active_tails)
-    }
-}
-
-/// A hot index whose age has already run out, so it pages on the first tick
-fn hot_config(active_tails: u32) -> ReelConfig {
-    ReelConfig {
-        index: IndexResidency::Hot(HotIndex {
-            after_secs: 0,
-            budget: ByteCount::gb(1),
-        }),
         ..paged_config(active_tails)
     }
 }
@@ -361,17 +350,6 @@ fn maintained_merge_multi_tail() {
         let mut fixture = Differential::open_maintained(*seed, maintained_config(4));
         fixture.run_stream(&op_stream::generate(*seed, PAGED_STREAM_LEN));
         fixture.assert_merged_runs();
-    }
-}
-
-// a hot volume whose keys have aged out serves what a resident one serves
-#[test]
-#[cfg(not(miri))]
-fn hot_single_tail() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open(*seed, hot_config(1));
-        fixture.run_stream(&op_stream::generate(*seed, PAGED_STREAM_LEN));
-        fixture.assert_paged_out();
     }
 }
 

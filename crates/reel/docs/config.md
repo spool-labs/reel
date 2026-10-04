@@ -12,7 +12,7 @@ and your own flow through them before trusting a line of it.
 | knob | start at | move it when |
 |---|---|---|
 | `io_backend` | `posix`, which is the default | readers await concurrently, then name `uring` |
-| `index` | `resident` | the live key count outgrows the memory you will give it, then `paged` or `hot` |
+| `index` | `resident` | the live key count outgrows the memory you will give it, then `paged` |
 | `filter_bits` | `10` | never on a resident volume: the seal already spends nothing there |
 | `footer_cache` | `64 MiB`, raised until searches stop reading directories | a paged volume holds more sealed footers than the cache does |
 | `map_above` | unset | the working set stays resident and the median matters more than the tail |

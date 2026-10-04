@@ -61,7 +61,7 @@ The index is asked first. A resident column answers from its map: an entry
 holds the location and the sequence number, and the read is one device op
 placed by the entry.
 
-A paged or hot column answers its unsealed keys the same way and sends the rest
+A paged column answers its unsealed keys the same way and sends the rest
 to the footers. That search is a funnel: a whole-column filter over every
 sealed key, then the per-segment key spans, then each surviving segment's own
 filter, then its directory, then one block of rows, then the row. The row points at a
@@ -85,7 +85,7 @@ it needs a buffer it owns.
 maintain_once            one tick, every step bounded and paced
   retry broken seals
   publish footprint
-  page out sealed        paged and hot volumes only
+  page out sealed        paged volumes only
   sweep covers
   prune graves
   compact once  ->  drain wholly dead segments        unlink, nothing copied

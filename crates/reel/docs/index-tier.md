@@ -1,24 +1,19 @@
 # The index tier
 
-The design record for `Paged` and `Hot`, the on-disk index tier. It is the gate on
+The design record for `Paged`, the on-disk index tier. It is the gate on
 the full-history deployment class, where 95 bytes of resident RAM per key is 19 GB
 at 200 million keys and the open cannot happen at all at a billion.
 
 `Resident` is the default and what every measurement before the tier used: every live
 key in a sharded map, each shard tracking its bytes, its graves and its paged count,
 so `live_count` is `map.len() - graves + paged`. `Paged` hands a sealed segment's keys
-to its footer and resolves them from there. `Hot { after_secs, budget }` is the same
-machinery with a policy in front of it: a sealed segment's keys stay resident until
-they have been sealed longer than the age or the maps weigh more than the budget,
-whichever comes first, and then the oldest go. What that buys is the shape a caller
-actually reads in, one io for the recent past and two for the history behind it. None
-of the three is a migration of another; the default is unchanged.
+to its footer and resolves them from there. Neither is a migration of the other, and
+the default is unchanged.
 
 ```
 where a key's location lives                              ops per read
 
   Resident   every live key in the sharded map                     1
-  Hot        recent seals in the map, older ones in footers      1..2
   Paged      only unsealed keys, graves and covers in the map       2
 
 what a paged lookup walks, and what each step takes out
@@ -41,8 +36,8 @@ over leads, so a search reads one block rather than one per halving.
 
 ## What a paged index has to get right
 
-Every rule below was a shipped defect first. `paged_single_tail`, `paged_multi_tail`
-and `hot_single_tail` in `differential.rs` run seeded streams against a memory oracle
+Every rule below was a shipped defect first. `paged_single_tail` and `paged_multi_tail`
+in `differential.rs` run seeded streams against a memory oracle
 with `page_out_sealed` driven inside the stream, so every op after a seal runs
 against a half-paged index, and they assert the run paged something out, because a
 paged run that pages nothing is a resident run wearing a config. Five named cases in
@@ -116,22 +111,6 @@ A point read pays much less: at twenty-five sealed segments it is within a few
 percent of resident at every size, peaking at fourteen percent on the middle rows.
 The footer search is fine; it was the merge that was not.
 
-The hot tier lands between the two, over the same twenty-five sealed segments with a
-one mebibyte budget and the age set past the run, so the budget alone decides. Only
-that arm has been measured; `after_secs` never has.
-
-| payload | keys | resident | hot | paged |
-|---|---|---|---|---|
-| 1 KiB | 25,600 | 1.36 ms | 2.89 ms | 3.14 ms |
-| 4 KiB | 25,600 | 1.38 ms | 3.78 ms | 5.62 ms |
-| 16 KiB | 6,400 | 401 us | 413 us | 1.38 ms |
-| 64 KiB | 1,600 | 111 us | 121 us | 364 us |
-| 1 MiB | 100 | 20.9 us | 19.9 us | 44.4 us |
-
-The cases the budget fits stay resident and play at resident speed; the ones that
-overflow it track the paged tier. It handed 233,115 keys to footers where the paged
-run handed 404,355, which is the tier working rather than the tier being skipped.
-
 ## What the tier saves, measured
 
 Over fifty thousand record keys on the same box, 2026-07-29:
@@ -139,11 +118,9 @@ Over fifty thousand record keys on the same box, 2026-07-29:
 | residency | index held |
 |---|---|
 | resident | 4,638 KiB |
-| hot, one mebibyte budget | 987 KiB |
 | paged | 51 KiB |
 
-**Paged holds ninety-one times less than resident.** The hot run settled at 987 KiB
-against the 1,024 KiB it was given, so the budget is honoured to within four percent.
+**Paged holds ninety-one times less than resident.**
 The resident row is 95.0 bytes a key, the same figure a counting allocator produced
 on another day by another method. Accounted rather than observed, and it had to be:
 the sweep's resident-footprint columns read a process RSS delta, and on a warmed heap
@@ -285,12 +262,10 @@ does coming out. `a_fresh_key_skips_the_sealed_search` pins both feeds and
 ## The footprint formula reads low, and one shard shape is ruinous
 
 `resident_bytes` was a formula, the key width plus `size_of::<Entry>()` plus the
-shape's own per-key overhead, 37 bytes on a tree and arithmetic on the slot for an
-open table, so it could not see the tree at all. It now adds up what every shard's
+shape's own per-key overhead, 37 bytes on a tree, so it could not see the tree at all.
+It now adds up what every shard's
 map allocated, spare capacity included, plus the shard array and the filters in front
-of it, through `ShardMap::heap_bytes`. A hot column cuts one mebibyte of filters
-between its shards at open, so the empty index's floor holds them. A hot budget weighs
-the maps above that floor, and a budget under it is refused. The weighing route is `Scale` in
+of it, through `ShardMap::heap_bytes`. The weighing route is `Scale` in
 `tests/raw_throughput.rs`, a per-thread counting `GlobalAlloc` behind a `WEIGHING`
 flag, reported by `cpu_terms`. A million keys, node width 64 against 16, counted
 layout bytes rather than timings, so the machine matters little:
@@ -316,39 +291,12 @@ its caller's allocation rule holds one deployment to about fifty occupied groups
 shard width is a decision to take against the expected occupancy rather than a
 default to copy.
 
-## Merge output is handed over first, plain compaction output is not
-
-A hot volume builds its handover queue in seal order and evicts from the front, so
-the most recently sealed segment is handed over last. Rewritten rows sealing now
-would take the longest residency while genuinely recent segments are evicted ahead of
-them, which after one base merge on an accounts volume is the whole eviction order
-upside down.
-
-**The merge half is closed.** A merge writes through its own appender at
-`tail_count + 1`, past every tail `Reel::route` hands foreground writes to, so its
-output is pure rather than interleaved with fresh records. Each output segment is
-marked merge output as it is drawn, and `hold_sealed` reads that mark: a promotable
-segment goes to the back of the queue with the residency wait on it, merge output to
-the front with no wait at all. Merge output is never recent, since a row written
-recently lives in a newer run and shadows the merged copy. A hot volume with
-everything else inside its window hands over nothing until a merge runs and hands its
-output over the moment one does, which is what `merge_output_is_not_promotable`
-asserts either side of the pass.
-
-**Plain compaction is not closed, and that is accepted for now, ruled 2026-08-17.** A
-rewrite draws its destination from `least_loaded_tail`, which returns the reserved
-tail only where `rewrite_on_seal` is set or the volume has capacity tiers. An
-ordinary volume has neither, so compaction output shares a foreground tail with fresh
-records and seals promotable, and a rewritten segment's keys are handed back to the
-resident tier as though they were fresh. A flag on that shared file would demote the
-fresh writes riding in it.
-
 ## A resident loc is a pointer, so a merge has to repoint it
 
 Not a defect, a cost that was never written down. Paged mode finds a row by fence and
 holds no pointer, so a merge repoints nothing. Resident mode holds an exact `Loc` for
-every key, so a merge repoints every entry it moves, and hot mode repoints whatever
-fraction it still holds. The per-entry cost is a map write, small against the io the
+every key, so a merge repoints every entry it moves.
+The per-entry cost is a map write, small against the io the
 merge is already paying; what it costs is granularity, since each batch of repoints
 takes the publish barrier, so a jitter bound on a merge applies to its index side and
 not only to its io. The machinery exists, compaction repointing as it copies. What

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use reel::config::{CompactRate, HotIndex, IndexResidency, ReelConfig, SyncPolicy, ThreadBudget};
+use reel::config::{CompactRate, IndexResidency, ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, MapShape, RecordKey};
 use reel::format::loc::SegmentId;
 use reel::io::fault::FaultPlan;
@@ -355,38 +355,6 @@ fn only_merge_output_drops_its_filter() {
             );
         }
     }
-}
-
-// a hot index hands merge output over ahead of everything, rather than behind it
-#[test]
-fn merge_output_is_not_promotable() {
-    let config = ReelConfig {
-        index: IndexResidency::Hot(HotIndex {
-            after_secs: 3600,
-            budget: ByteCount::gb(1),
-        }),
-        ..merging_config()
-    };
-    let (store, _io) = open_over(config, COLUMNS);
-    fill_runs(&store);
-
-    // Everything standing sealed within the hour, so nothing is owed a handover yet.
-    assert_eq!(
-        store.page_out_sealed().expect("page out"),
-        0,
-        "a hot volume gave its keys up inside the residency window",
-    );
-
-    let report = store.merge_once().expect("merge");
-    assert!(
-        report.rows_written > 0,
-        "the merge wrote nothing to hand over"
-    );
-
-    assert!(
-        store.page_out_sealed().expect("page out") > 0,
-        "merge output took the residency the recent segments had earned",
-    );
 }
 
 // every key answers while the output and the runs it replaces are both standing

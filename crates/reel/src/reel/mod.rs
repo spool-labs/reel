@@ -21,7 +21,6 @@ mod tests;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
 
 use crate::append::admission::InflightBudget;
 use crate::append::{Appender, BatchRecord, BatchWrite, Commit, Committed};
@@ -690,9 +689,6 @@ struct Pending {
     /// The segment sealed
     segment: SegmentId,
 
-    /// When it sealed, so a residency tier ages it from the seal and not the tick
-    sealed_at: Instant,
-
     /// Whether a caller is already reading this one's footer
     is_taken: bool,
 }
@@ -950,7 +946,6 @@ impl ReelShared {
         crate::sync::rendezvous::at("seal/queued");
         lock(&self.sealed_pending).push(Pending {
             segment,
-            sealed_at: Instant::now(),
             is_taken: false,
         });
         self.sealed_waiting.store(true, Ordering::Release);
@@ -961,17 +956,17 @@ impl ReelShared {
         self.sealed_waiting.load(Ordering::Acquire)
     }
 
-    /// The segments sealed since this was last asked, with when each sealed
+    /// The segments sealed since this was last asked
     ///
     /// They stay on the queue, where a compaction pass can still see their spans
     /// are owed; clearing the flag only sends other callers past this batch.
-    pub fn peek_sealed(&self) -> Vec<(SegmentId, Instant)> {
+    pub fn peek_sealed(&self) -> Vec<SegmentId> {
         let mut pending = lock(&self.sealed_pending);
         self.sealed_waiting.store(false, Ordering::Release);
         let mut taken = Vec::with_capacity(pending.len());
         for entry in pending.iter_mut().filter(|entry| !entry.is_taken) {
             entry.is_taken = true;
-            taken.push((entry.segment, entry.sealed_at));
+            taken.push(entry.segment);
         }
         taken
     }

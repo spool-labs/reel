@@ -42,8 +42,9 @@ const SETTLE_THREADS: usize = 8;
 /// Times a lookup starts over when a candidate's segment went while it read
 ///
 /// A compaction can move a record, seal its copy and retire the source inside one
-/// slow read, and only a fresh look at the table finds the copy.
-const LOOKUP_TRIES: usize = 4;
+/// slow read, and only a fresh look at the table finds the copy. Each try takes one
+/// such candidate out, so this many tries outlast every candidate a key can have.
+const LOOKUP_TRIES: usize = MAX_CANDIDATES + 1;
 
 /// Older versions waiting for the cleaner before new ones are left to the retired-segment sweep
 const MAX_STALE: usize = 1 << 20;
@@ -908,7 +909,11 @@ impl FastColumn {
                 FastRead::Found(head, value) => (head, Some(value)),
                 FastRead::Tombstone(head) => (head, None),
                 FastRead::Other => continue,
-                FastRead::Gone => return Ok(None),
+                // The segment is gone, so the slot points at nothing and goes before the next look.
+                FastRead::Gone => {
+                    write(&self.shards[shard_of(hash)]).take(hash, slot);
+                    return Ok(None);
+                }
                 FastRead::Unsure => return Ok(Some(Lookup::Unsettled)),
             };
             match &best {
@@ -954,7 +959,7 @@ impl FastColumn {
         records: &dyn RecordSource,
         segments: &SegmentTable,
     ) -> Result<Option<Option<Entry>>> {
-        let (_, ordered) = self.ordered(key, segments);
+        let (hash, ordered) = self.ordered(key, segments);
         let mut best: Option<(Head, Slot)> = None;
         for (ceiling, slot) in &ordered {
             if let (Some((head, _)), Some(ceiling)) = (&best, ceiling) {
@@ -966,7 +971,11 @@ impl FastColumn {
                 HeadRead::Same(head) if best.is_none_or(|(current, _)| head.lsn > current.lsn) => {
                     best = Some((head, *slot));
                 }
-                HeadRead::Missing => return Ok(None),
+                // The segment is gone, so the slot points at nothing and goes before the next look.
+                HeadRead::Missing => {
+                    write(&self.shards[shard_of(hash)]).take(hash, slot);
+                    return Ok(None);
+                }
                 HeadRead::Same(_) | HeadRead::Other | HeadRead::Cold => {}
             }
         }
@@ -1202,18 +1211,21 @@ mod tests {
         assert_eq!(column.held(), 2);
     }
 
-    // a candidate whose segment went sends the lookup to the checked path, never to an older version
+    // a candidate whose segment went is taken out, and the lookup answers from a fresh look
     #[test]
-    fn a_gone_candidate_never_lets_an_older_version_answer() {
+    fn a_gone_candidate_is_taken_out_before_the_next_look() {
         let records = Arc::new(Records::default());
         let column = column(&records);
-        let older = Loc::new(SegmentId(1), 0, 40);
-        let moved = Loc::new(SegmentId(2), 0, 40);
-        records.write(older, key(9).as_slice(), Lsn(1));
-        column.insert(key(9).as_slice(), older);
-        column.insert(key(9).as_slice(), moved);
-        assert!(matches!(column.read(&key(9)).expect("read"), Lookup::Unsettled));
-        assert_eq!(column.entry(&key(9)).expect("entry"), None);
+        let standing = Loc::new(SegmentId(1), 0, 40);
+        let retired = Loc::new(SegmentId(2), 0, 40);
+        records.write(standing, key(9).as_slice(), Lsn(1));
+        column.insert(key(9).as_slice(), standing);
+        column.insert(key(9).as_slice(), retired);
+        assert_eq!(version(&column, 9), Some(1));
+        assert_eq!(column.held(), 1, "the slot into the gone segment went");
+        column.insert(key(9).as_slice(), retired);
+        assert_eq!(column.entry(&key(9)).expect("entry").map(|entry| entry.lsn), Some(Lsn(1)));
+        assert_eq!(column.held(), 1);
     }
 
     // entries into a retired segment go without a read

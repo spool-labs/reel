@@ -8,10 +8,10 @@ Nothing is updated in place. A delete writes a tombstone and compaction gives th
 An index maps each live key to its segment and offset. It stays in memory or pages out to the
 footers the seals wrote. One process owns a volume for writing. Others can open it read-only and follow.
 
-- Columns are declared by the caller: key width (fixed or variable), sharding, index shape
-  (ordered tree or open table), lz4, and purge marks.
-- Point reads, batched reads, ranged reads, ordered walks, and prefix sweeps. A tree column
-  sweeps any prefix in key order. An open column sweeps only its exact shard key.
+- Columns are declared by the caller: key width (fixed or variable), sharding, lz4, and purge
+  marks.
+- Point reads, batched reads, ranged reads, ordered walks, and prefix sweeps. A prefix sweep
+  takes any prefix, in key order.
 - A write batch is one durability point. Every call has a blocking and an awaited form.
 - Extra roots join as fast or capacity volumes, and compaction demotes aged data to capacity.
 - Cue points read the volume as it stood. A checkpoint copies it at a cue into a store of its own.

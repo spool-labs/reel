@@ -278,12 +278,7 @@ mod tests {
     }
 
     fn index() -> ReelIndex {
-        ReelIndex::new(
-            COLUMNS,
-            crate::config::IndexResidency::Resident,
-            crate::config::ShardShapes::Tree,
-        )
-        .expect("index")
+        ReelIndex::new(COLUMNS, crate::config::IndexResidency::Resident).expect("index")
     }
 
     // an older version arriving after a newer one is refused by the index guard

@@ -52,7 +52,7 @@ use tempfile::TempDir;
 use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, FenceResidency,
     IndexResidency, KeyWidth, MapShape, MergeReport, Preallocate, ProbeCounts, RecordKey,
-    ReelConfig, ReelStore, ShardShapes, SyncPolicy, ThreadBudget,
+    ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 /// The one column the workload writes
@@ -524,7 +524,7 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: SHARD_BYTES,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Open,
+    map_shape: MapShape::Tree,
 }];
 
 /// What one cell opens its volume with, the flavour and the merge being all that differ
@@ -539,7 +539,6 @@ fn config(arm: &Arm, is_merge_driven: bool, knobs: &Knobs) -> ReelConfig {
         scrub_mbps: 0,
         index: arm.index,
         fence: arm.fence,
-        shard_shapes: ShardShapes::Declared,
         rewrite_on_seal: true,
         merge_sorted_runs: is_merge_driven,
         filter_bits: FILTER_BITS,

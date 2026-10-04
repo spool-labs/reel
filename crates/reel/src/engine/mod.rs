@@ -391,7 +391,7 @@ impl ReelStore {
         };
         let compactor = Compactor::new(&config, capacity_bytes, fast_capacity);
 
-        let index = ReelIndex::new(columns, config.index, config.shard_shapes)?;
+        let index = ReelIndex::new(columns, config.index)?;
         // The manifest names every root before anything reads one, so a missing
         // mount refuses here rather than reading as loss below.
         let dead: Vec<bool> = std::iter::once(false)
@@ -554,8 +554,8 @@ impl ReelStore {
     ///
     /// The mark is opaque bytes: hand back whatever the last page answered, and
     /// nothing to start. `None` back means the column is done. Every live key is
-    /// handed out at least once; a shard that resizes mid sweep starts over, so
-    /// a caller has to be idempotent, which every caller of this is.
+    /// handed out at least once. A mark another opening minted starts the column
+    /// over, so a caller has to be idempotent, which every caller of this is.
     pub fn sweep_column(
         &self,
         column: ColumnId,
@@ -570,7 +570,7 @@ impl ReelStore {
             .map(|mark| mark.pack())
     }
 
-    /// One page of the keys under a prefix, where an open column serves only its exact shard key
+    /// One page of the keys under a prefix, in key order
     pub fn sweep_column_prefix(
         &self,
         column: ColumnId,

@@ -763,7 +763,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::config::{IndexResidency, ShardShapes};
+    use crate::config::IndexResidency;
     use crate::format::column::{Codec, ColumnSpec, MapShape, RecordKey};
     use crate::format::footer::FooterEntry;
     use crate::format::lsn::Lsn;
@@ -811,8 +811,7 @@ mod tests {
     impl Fixture {
         fn new(footers: &[(SegmentId, &[u8])]) -> Fixture {
             Fixture {
-                index: ColumnIndex::new(&SPEC, ShardShapes::Tree, IndexResidency::Resident)
-                    .expect("column"),
+                index: ColumnIndex::new(&SPEC, IndexResidency::Resident).expect("column"),
                 sealed: SealedRanges::new(),
                 footers: CountingFooters {
                     footers: footers

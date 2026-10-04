@@ -375,36 +375,6 @@ fn hot_single_tail() {
     }
 }
 
-// an open-addressed index serves what the oracle serves
-#[test]
-#[cfg(not(miri))]
-fn open_single_tail() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open_shaped(*seed, reel_config(1));
-        fixture.run_stream(&op_stream::generate(*seed, STREAM_LEN));
-    }
-}
-
-// the same at four tails, where the version guard runs on every insert
-#[test]
-#[cfg(not(miri))]
-fn open_multi_tail() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open_shaped(*seed, reel_config(4));
-        fixture.run_stream(&op_stream::generate(*seed, STREAM_LEN));
-    }
-}
-
-// a reopen rebuilds the open shards without resurrecting anything
-#[test]
-#[cfg(not(miri))]
-fn open_never_reopen() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open_shaped(*seed, never_config(1));
-        fixture.run_stream(&op_stream::generate(*seed, STREAM_LEN));
-    }
-}
-
 // a volume reopening from its written-down index serves what the oracle serves
 #[test]
 #[cfg(not(miri))]
@@ -439,20 +409,6 @@ fn checkpointed_multi_tail() {
 fn checkpointed_never_reopen() {
     for seed in SEEDS {
         let mut fixture = Differential::open(*seed, never_config(1)).checkpointing();
-        fixture.run_stream(&op_stream::generate(*seed, STREAM_LEN));
-        assert!(
-            fixture.checkpointed_keys() > 0,
-            "seed {seed} wrote no key into any index checkpoint",
-        );
-    }
-}
-
-// an open-addressed column writes its index down and reads it back unchanged
-#[test]
-#[cfg(not(miri))]
-fn checkpointed_open_shards() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open_shaped(*seed, reel_config(1)).checkpointing();
         fixture.run_stream(&op_stream::generate(*seed, STREAM_LEN));
         assert!(
             fixture.checkpointed_keys() > 0,

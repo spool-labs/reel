@@ -12,12 +12,10 @@ use std::sync::{Arc, OnceLock};
 use crate::units::ByteCount;
 
 use crate::append::publish::PublishBarrier;
-use crate::config::{IndexResidency, ShardShapes};
+use crate::config::IndexResidency;
 use crate::engine::Totals;
 use crate::error::{ReelError, Result};
-use crate::format::column::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, MapShape, RecordKey,
-};
+use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, RecordKey};
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
@@ -257,15 +255,7 @@ pub struct ReelIndex {
 
 impl ReelIndex {
     /// An empty index over the columns a reel serves
-    ///
-    /// The shapes say whether a column's own map declaration is honoured, per volume
-    /// rather than per column because it is the way back off a shape: a volume that
-    /// stops honouring them rebuilds every column into the tree.
-    pub fn new(
-        columns: ColumnSet,
-        residency: IndexResidency,
-        shapes: ShardShapes,
-    ) -> Result<ReelIndex> {
+    pub fn new(columns: ColumnSet, residency: IndexResidency) -> Result<ReelIndex> {
         let mut indexes = Vec::with_capacity(columns.len());
         let mut sealed = Vec::with_capacity(columns.len());
         let mut by_id = vec![None; COLUMN_SLOTS];
@@ -276,17 +266,8 @@ impl ReelIndex {
                     spec.name,
                 )));
             }
-            if spec.map_shape == MapShape::Open
-                && shapes == ShardShapes::Declared
-                && residency != IndexResidency::Resident
-            {
-                return Err(ReelError::Config(format!(
-                    "column {} asks for an open shard, which a paged walk cannot merge",
-                    spec.name,
-                )));
-            }
             by_id[spec.id.as_index()] = Some(at);
-            indexes.push(ColumnIndex::new(spec, shapes, residency)?);
+            indexes.push(ColumnIndex::new(spec, residency)?);
             sealed.push(SealedRanges::new());
         }
         let sealed_keys = (0..columns.len()).map(|_| SealedKeys::new()).collect();
@@ -1787,12 +1768,11 @@ impl ReelIndex {
 mod tests {
     use super::*;
 
-    use crate::format::column::KeyWidth;
+    use crate::format::column::{KeyWidth, MapShape};
     use crate::index::entry::span_of;
 
     const RECORD: ColumnId = ColumnId(1);
     const BLOB: ColumnId = ColumnId(2);
-    const SHORT: ColumnId = ColumnId(3);
 
     const COLUMNS: ColumnSet = &[
         ColumnSpec {
@@ -1813,80 +1793,16 @@ mod tests {
             codec: Codec::None,
             map_shape: MapShape::Tree,
         },
-        ColumnSpec {
-            id: SHORT,
-            name: "short",
-            key_width: KeyWidth::Fixed(16),
-            shard_bytes: 1,
-            purge_mark: None,
-            codec: Codec::None,
-            map_shape: MapShape::Tree,
-        },
-    ];
-
-    /// The same declaration asking for an open-addressed shard
-    ///
-    /// Derived field by field, so a change above cannot leave this one holding a
-    /// different key width.
-    const fn opened(spec: &ColumnSpec) -> ColumnSpec {
-        ColumnSpec {
-            id: spec.id,
-            name: spec.name,
-            key_width: spec.key_width,
-            shard_bytes: spec.shard_bytes,
-            purge_mark: spec.purge_mark,
-            codec: spec.codec,
-            map_shape: MapShape::Open,
-        }
-    }
-
-    const OPEN_COLUMNS: ColumnSet = &[
-        opened(&COLUMNS[0]),
-        opened(&COLUMNS[1]),
-        opened(&COLUMNS[2]),
     ];
 
     fn index() -> ReelIndex {
-        ReelIndex::new(COLUMNS, IndexResidency::Resident, ShardShapes::Tree).expect("index")
-    }
-
-    fn open_index() -> ReelIndex {
-        let index = ReelIndex::new(
-            OPEN_COLUMNS,
-            IndexResidency::Resident,
-            ShardShapes::Declared,
-        )
-        .expect("index");
-        for column in [RECORD, BLOB, SHORT] {
-            assert_eq!(
-                index.column(column).expect("column").map_shape(),
-                MapShape::Open
-            );
-        }
-        index
-    }
-
-    // an open shard is refused on a paged index, which has no order to merge it
-    #[test]
-    fn open_refuses_paged() {
-        let refused = ReelIndex::new(OPEN_COLUMNS, IndexResidency::Paged, ShardShapes::Declared);
-        assert!(refused.is_err());
-
-        // A volume that does not honour declarations never gets the open shard,
-        // so there is nothing to refuse.
-        assert!(ReelIndex::new(OPEN_COLUMNS, IndexResidency::Paged, ShardShapes::Tree).is_ok());
+        ReelIndex::new(COLUMNS, IndexResidency::Resident).expect("index")
     }
 
     fn record_key(group: u16, byte: u8) -> RecordKey {
         let mut bytes = group.to_be_bytes().to_vec();
         bytes.extend_from_slice(&[byte; 32]);
         RecordKey::from_bytes(RECORD, &bytes).expect("key")
-    }
-
-    fn short_key(group: u8, byte: u8) -> RecordKey {
-        let mut bytes = vec![group, byte];
-        bytes.resize(16, byte ^ 0x5a);
-        RecordKey::from_bytes(SHORT, &bytes).expect("key")
     }
 
     fn blob_key(byte: u8) -> RecordKey {
@@ -1960,7 +1876,7 @@ mod tests {
             },
         ];
 
-        assert!(ReelIndex::new(CLASHING, IndexResidency::Resident, ShardShapes::Tree).is_err());
+        assert!(ReelIndex::new(CLASHING, IndexResidency::Resident).is_err());
     }
 
     // both columns book their bytes into the segments they share
@@ -2026,175 +1942,6 @@ mod tests {
             .page(BLOB, Bound::Unbounded, 8, &mut out)
             .expect("page");
         assert_eq!(out.len(), 1);
-    }
-
-    // an open-addressed column serves what a tree one serves, walk included
-    #[test]
-    fn open_serves_the_same() {
-        let tree = index();
-        let open = open_index();
-
-        for byte in 0..40u8 {
-            for index in [&tree, &open] {
-                index
-                    .insert(
-                        &record_key(1, byte),
-                        loc(1, byte as u32 * 100, 100),
-                        Lsn(byte as u64 + 1),
-                    )
-                    .expect("insert");
-            }
-        }
-        for byte in (0..40u8).step_by(3) {
-            for index in [&tree, &open] {
-                index
-                    .remove(&record_key(1, byte), Lsn(100 + byte as u64), loc(1, 0, 0))
-                    .expect("remove");
-            }
-        }
-
-        for byte in 0..40u8 {
-            assert_eq!(
-                tree.get(&record_key(1, byte)).expect("read"),
-                open.get(&record_key(1, byte)).expect("read"),
-                "byte {byte}",
-            );
-        }
-        let mut from_tree = KeyPage::default();
-        let mut from_open = KeyPage::default();
-        tree.page(RECORD, Bound::Unbounded, 64, &mut from_tree)
-            .expect("page");
-        open.page(RECORD, Bound::Unbounded, 64, &mut from_open)
-            .expect("page");
-        assert_eq!(from_tree.len(), from_open.len());
-        for at in 0..from_tree.len() {
-            assert_eq!(
-                from_tree.key_at(at),
-                from_open.key_at(at),
-                "key {at} of the walk"
-            );
-        }
-        assert_eq!(tree.totals().count, open.totals().count);
-    }
-
-    // a sixteen-byte open column serves what the tree serves, walk included
-    #[test]
-    fn open_serves_short_keys_the_same() {
-        let tree = index();
-        let open = open_index();
-
-        for group in 0..4u8 {
-            for byte in 0..=255u8 {
-                for index in [&tree, &open] {
-                    index
-                        .insert(
-                            &short_key(group, byte),
-                            loc(1, byte as u32 * 100, 100),
-                            Lsn(u64::from(group) * 256 + u64::from(byte) + 1),
-                        )
-                        .expect("insert");
-                }
-            }
-        }
-        for byte in (0..=255u8).step_by(5) {
-            for index in [&tree, &open] {
-                index
-                    .remove(&short_key(2, byte), Lsn(5000 + byte as u64), loc(1, 0, 0))
-                    .expect("remove");
-            }
-        }
-
-        for group in 0..5u8 {
-            for byte in 0..=255u8 {
-                assert_eq!(
-                    tree.get(&short_key(group, byte)).expect("read"),
-                    open.get(&short_key(group, byte)).expect("read"),
-                    "group {group} byte {byte}",
-                );
-            }
-        }
-        let mut from_tree = KeyPage::default();
-        let mut from_open = KeyPage::default();
-        tree.page(SHORT, Bound::Unbounded, 2048, &mut from_tree)
-            .expect("page");
-        open.page(SHORT, Bound::Unbounded, 2048, &mut from_open)
-            .expect("page");
-        assert_eq!(from_tree.len(), from_open.len());
-        for at in 0..from_tree.len() {
-            assert_eq!(
-                from_tree.key_at(at),
-                from_open.key_at(at),
-                "key {at} of the walk"
-            );
-        }
-        assert_eq!(tree.totals().count, open.totals().count);
-    }
-
-    // a volume that does not honour declarations gives an open column the tree
-    #[test]
-    fn shape_gate_falls_back() {
-        let index = ReelIndex::new(OPEN_COLUMNS, IndexResidency::Resident, ShardShapes::Tree)
-            .expect("index");
-
-        index
-            .insert(&record_key(1, 0x11), loc(1, 0, 400), Lsn(1))
-            .expect("insert");
-
-        assert!(index.get(&record_key(1, 0x11)).expect("read").is_some());
-        assert_eq!(
-            index.column(RECORD).expect("column").map_shape(),
-            MapShape::Tree
-        );
-    }
-
-    // a width the index holds no open arm for is refused rather than quietly treed
-    #[test]
-    fn open_refuses_odd_widths() {
-        const ODD: ColumnSet = &[ColumnSpec {
-            id: ColumnId(1),
-            name: "odd",
-            key_width: KeyWidth::Fixed(20),
-            shard_bytes: 0,
-            purge_mark: None,
-            codec: Codec::None,
-            map_shape: MapShape::Open,
-        }];
-
-        assert!(ReelIndex::new(ODD, IndexResidency::Resident, ShardShapes::Declared).is_err());
-        assert!(ReelIndex::new(ODD, IndexResidency::Resident, ShardShapes::Tree).is_ok());
-    }
-
-    // the same keys cost less resident in an open shard than in a tree
-    #[test]
-    fn open_costs_less() {
-        let tree = index();
-        let open = open_index();
-        let empty = [tree.resident_bytes(), open.resident_bytes()];
-
-        // Four shards of a thousand keys, so what the keys add outweighs the rounding.
-        for group in 0..4u16 {
-            for byte in 0..=255u8 {
-                for spread in 0..4u8 {
-                    let mut key = record_key(group, byte).as_slice().to_vec();
-                    key[3] = spread;
-                    let key = RecordKey::from_bytes(RECORD, &key).expect("key");
-                    for index in [&tree, &open] {
-                        index
-                            .insert(&key, loc(1, byte as u32 * 100, 100), Lsn(1))
-                            .expect("insert");
-                    }
-                }
-            }
-        }
-
-        let added = |index: &ReelIndex, empty: ByteCount| {
-            index.resident_bytes().to_bytes() - empty.to_bytes()
-        };
-        let (tree_added, open_added) = (added(&tree, empty[0]), added(&open, empty[1]));
-        assert!(
-            open_added < tree_added,
-            "the keys added {open_added} bytes open against {tree_added} in a tree"
-        );
     }
 
     // forgetting a retired segment clears its counters and its sequence bound

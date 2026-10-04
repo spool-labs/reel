@@ -11,15 +11,13 @@ use std::sync::Arc;
 
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
-use reel::{ColumnSet, ColumnSpec, MapShape, ReelConfig, ReelStore, ShardShapes};
+use reel::{ReelConfig, ReelStore};
 use reel_core::{Direction, Store};
 use reel_mock::MemoryStore;
 
 use crate::harness::observe::observe;
 use crate::harness::op_stream::StreamOp;
-use crate::harness::wire::{
-    apply_mutation, group_prefix, wire_key, BLOB, RECORDS, RECORDS_CF, TEST_COLUMNS,
-};
+use crate::harness::wire::{apply_mutation, group_prefix, wire_key, RECORDS_CF, TEST_COLUMNS};
 
 /// Rounds of driving a guard gives the reel to reach a state the stream should have
 /// taken it to
@@ -28,25 +26,6 @@ use crate::harness::wire::{
 /// needs rather than waiting for somebody else to run it. The passes are idempotent, so
 /// a run that has not reached it by here will not reach it at all.
 const LIVENESS_ROUNDS: u32 = 64;
-
-/// The harness columns asking for open-addressed shards
-///
-/// Both widths are ones the index holds an open arm for, which is why the whole set can
-/// flip rather than half of it.
-const fn opened(spec: &ColumnSpec) -> ColumnSpec {
-    ColumnSpec {
-        id: spec.id,
-        name: spec.name,
-        key_width: spec.key_width,
-        shard_bytes: spec.shard_bytes,
-        purge_mark: spec.purge_mark,
-        codec: spec.codec,
-        map_shape: MapShape::Open,
-    }
-}
-
-/// The open-addressed variant of the harness column set
-pub const OPEN_COLUMNS: ColumnSet = &[opened(&TEST_COLUMNS[0]), opened(&TEST_COLUMNS[1])];
 
 /// Virtual bulk root the reel simulator files live under
 const REEL_ROOT: &str = "/bulk";
@@ -74,9 +53,6 @@ const MERGE_EVERY: usize = 3;
 const CHECKPOINT_EVERY: usize = 7;
 
 pub struct Differential {
-    /// Columns the reel under test was opened with
-    columns: ColumnSet,
-
     /// The step and op a divergence is reported against
     at_step: Option<(usize, String)>,
 
@@ -117,7 +93,29 @@ pub struct Differential {
 impl Differential {
     /// Open the memory oracle and the reel for a seed and a reel configuration
     pub fn open(seed: u64, reel_config: ReelConfig) -> Differential {
-        Differential::open_with_columns(seed, reel_config, TEST_COLUMNS)
+        let sim = SimIo::new(FaultPlan::new(seed));
+        let reel = ReelStore::open_with_io(
+            PathBuf::from(REEL_ROOT),
+            reel_config.clone(),
+            TEST_COLUMNS,
+            Arc::new(sim.clone()),
+        )
+        .expect("open reel");
+
+        Differential {
+            at_step: None,
+            merged_before: 0,
+            is_maintained: false,
+            is_checkpointing: false,
+            seed,
+            memory: MemoryStore::new(),
+            reel,
+            reel_sim: sim,
+            reel_config,
+            reel_plan: FaultPlan::new(seed),
+            paged_out: 0,
+            checkpointed_keys: 0,
+        }
     }
 
     /// The same pair, under the name a long soak calls for
@@ -148,29 +146,6 @@ impl Differential {
         }
     }
 
-    /// The same, on a column set whose resident shards are open addressed
-    pub fn open_shaped(seed: u64, reel_config: ReelConfig) -> Differential {
-        let reel_config = ReelConfig {
-            shard_shapes: ShardShapes::Declared,
-            ..reel_config
-        };
-        let fixture = Differential::open_with_columns(seed, reel_config, OPEN_COLUMNS);
-        // A declaration the volume did not honour is a tree run wearing another name.
-        for column in [RECORDS, BLOB] {
-            let index = fixture
-                .reel
-                .index()
-                .column(column)
-                .expect("a declared column");
-            assert_eq!(
-                index.map_shape(),
-                MapShape::Open,
-                "column {column:?} opened in the tree"
-            );
-        }
-        fixture
-    }
-
     /// Open both stores with a plan the reel's device replays
     ///
     /// Only a plan that never fails an op belongs here, since the oracle is exact and
@@ -189,40 +164,12 @@ impl Differential {
         self.reel = ReelStore::open_with_io(
             PathBuf::from(REEL_ROOT),
             self.reel_config.clone(),
-            self.columns,
+            TEST_COLUMNS,
             Arc::new(sim.clone()),
         )
         .expect("open reel");
         self.reel_sim = sim;
         self.reel_plan = plan_for_reopen;
-    }
-
-    /// Open on a named column set, which is the only thing a shaped run needs
-    fn open_with_columns(seed: u64, reel_config: ReelConfig, columns: ColumnSet) -> Differential {
-        let sim = SimIo::new(FaultPlan::new(seed));
-        let reel = ReelStore::open_with_io(
-            PathBuf::from(REEL_ROOT),
-            reel_config.clone(),
-            columns,
-            Arc::new(sim.clone()),
-        )
-        .expect("open reel");
-
-        Differential {
-            columns,
-            at_step: None,
-            merged_before: 0,
-            is_maintained: false,
-            is_checkpointing: false,
-            seed,
-            memory: MemoryStore::new(),
-            reel,
-            reel_sim: sim,
-            reel_config,
-            reel_plan: FaultPlan::new(seed),
-            paged_out: 0,
-            checkpointed_keys: 0,
-        }
     }
 
     /// Keys the reel has given up to a footer over the whole run
@@ -432,7 +379,7 @@ impl Differential {
         self.reel = ReelStore::open_with_io(
             PathBuf::from(REEL_ROOT),
             self.reel_config.clone(),
-            self.columns,
+            TEST_COLUMNS,
             Arc::new(restored.clone()),
         )
         .expect("reopen reel");

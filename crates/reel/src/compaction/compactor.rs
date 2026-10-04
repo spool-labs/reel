@@ -2035,12 +2035,8 @@ mod tests {
             1,
         ));
         let reel = Reel::open(Arc::clone(&shared), Vec::new()).expect("open reel");
-        let index = ReelIndex::new(
-            columns,
-            crate::config::IndexResidency::Resident,
-            crate::config::ShardShapes::Tree,
-        )
-        .expect("index");
+        let index =
+            ReelIndex::new(columns, crate::config::IndexResidency::Resident).expect("index");
         // What the engine wires at open: the seal reads a segment's tally from these
         // and a landing books its floor into them.
         shared.set_segments(index.segments_handle());
@@ -2105,12 +2101,7 @@ mod tests {
     }
 
     fn resident_index() -> ReelIndex {
-        ReelIndex::new(
-            COLUMNS,
-            crate::config::IndexResidency::Resident,
-            crate::config::ShardShapes::Tree,
-        )
-        .expect("index")
+        ReelIndex::new(COLUMNS, crate::config::IndexResidency::Resident).expect("index")
     }
 
     fn reopen(image: DurableImage, config: ReelConfig) -> Fixture {

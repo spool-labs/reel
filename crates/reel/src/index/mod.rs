@@ -11,7 +11,6 @@ pub mod entry;
 pub mod fastforward;
 pub mod lockfile;
 pub mod map;
-pub mod opentable;
 pub mod page;
 pub mod paged;
 pub mod persisted;

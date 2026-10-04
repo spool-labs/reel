@@ -331,20 +331,6 @@ pub enum PointReads {
     Probed,
 }
 
-/// Whether a column may hold its resident keys in anything but the tree
-///
-/// Nothing on disk depends on the choice and a reopen rebuilds the maps either
-/// way, so the tree is also the way back off the other shape.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-pub enum ShardShapes {
-    /// Every column's keys in the ordered tree
-    Tree,
-    /// Each column takes the shape its own declaration asks for
-    Declared,
-}
-
 /// Where a sealed segment's fence over its blocks lives, off unless asked for
 ///
 /// A fence is one lead per block of a partition's rows. Without it a blocked search
@@ -393,9 +379,6 @@ pub struct ReelConfig {
 
     /// Where the index of a sealed segment lives, in memory or in its footer
     pub index: IndexResidency,
-
-    /// Whether a column's declared map shape is honoured, or the tree serves them all
-    pub shard_shapes: ShardShapes,
 
     /// Durability sync cadence parsed from the sync bytes scalar
     #[cfg_attr(
@@ -493,7 +476,6 @@ impl Default for ReelConfig {
             alloc_chunk: ByteCount::mb(DEFAULT_ALLOC_CHUNK_MIB),
             preallocate: Preallocate::Full,
             index: IndexResidency::Resident,
-            shard_shapes: ShardShapes::Tree,
             sync: SyncPolicy::Never,
             compact_dead_ratio: DEFAULT_COMPACT_DEAD_RATIO,
             compact_mbps: CompactRate::Auto,

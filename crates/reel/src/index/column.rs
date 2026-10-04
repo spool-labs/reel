@@ -12,15 +12,14 @@ use std::sync::{OnceLock, RwLock};
 
 use crate::units::ByteCount;
 
-use crate::config::{IndexResidency, ShardShapes};
+use crate::config::IndexResidency;
 use crate::engine::Totals;
 use crate::error::{ReelError, Result};
-use crate::format::column::{ColumnId, ColumnSpec, KeyBytes, MapShape, RecordKey, MAX_KEY_LEN};
+use crate::format::column::{ColumnId, ColumnSpec, KeyBytes, RecordKey, MAX_KEY_LEN};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::index::counters::{Bookings, SegmentTable};
 use crate::index::entry::{span_of, Entry};
-use crate::index::opentable::{overhead_per_key, OpenTable};
 use crate::index::page::KeyPage;
 use crate::index::paged::SealedRanges;
 use crate::index::tbtreemap::{node_width, TBTreeMap, NODE_WIDTH};
@@ -46,13 +45,6 @@ pub enum ColumnIndex {
     W72(WidthIndex<[u8; 72], Trees<72>>),
     W96(WidthIndex<[u8; 96], Trees<96>>),
     W108(WidthIndex<[u8; 108], Trees<108>>),
-
-    /// The widths a column may ask for an open-addressed shard at
-    Open16(WidthIndex<[u8; 16], OpenTables<16>>),
-    Open32(WidthIndex<[u8; 32], OpenTables<32>>),
-    Open34(WidthIndex<[u8; 34], OpenTables<34>>),
-    Open72(WidthIndex<[u8; 72], OpenTables<72>>),
-    Open108(WidthIndex<[u8; 108], OpenTables<108>>),
 
     /// A column whose keys are whatever length they are, held on the heap
     Var(WidthIndex<Box<[u8]>, VarTrees>),
@@ -115,11 +107,6 @@ macro_rules! on_index {
             ColumnIndex::W72($bound) => $body,
             ColumnIndex::W96($bound) => $body,
             ColumnIndex::W108($bound) => $body,
-            ColumnIndex::Open16($bound) => $body,
-            ColumnIndex::Open32($bound) => $body,
-            ColumnIndex::Open34($bound) => $body,
-            ColumnIndex::Open72($bound) => $body,
-            ColumnIndex::Open108($bound) => $body,
             ColumnIndex::Var($bound) => $body,
         }
     };
@@ -158,38 +145,11 @@ impl ColumnIndex {
 
     /// An empty index for one column, refusing a width nothing indexes
     ///
-    /// A volume that does not honour declarations drops the open-shard request
-    /// rather than refusing it: nothing on disk turns on which structure the keys
-    /// sat in. The residency sizes the filters in front of the shards.
-    pub fn new(
-        spec: &ColumnSpec,
-        shapes: ShardShapes,
-        residency: IndexResidency,
-    ) -> Result<ColumnIndex> {
-        let is_open = spec.map_shape == MapShape::Open && shapes == ShardShapes::Declared;
+    /// The residency sizes the filters in front of the shards.
+    pub fn new(spec: &ColumnSpec, residency: IndexResidency) -> Result<ColumnIndex> {
         let Some(width) = spec.key_width.fixed() else {
-            if is_open {
-                return Err(ReelError::Config(format!(
-                    "column {} asks for an open shard, which needs a declared key width",
-                    spec.name,
-                )));
-            }
             return Ok(ColumnIndex::Var(WidthIndex::new(spec, residency)));
         };
-        if is_open {
-            return match width {
-                16 => Ok(ColumnIndex::Open16(WidthIndex::new(spec, residency))),
-                32 => Ok(ColumnIndex::Open32(WidthIndex::new(spec, residency))),
-                34 => Ok(ColumnIndex::Open34(WidthIndex::new(spec, residency))),
-                72 => Ok(ColumnIndex::Open72(WidthIndex::new(spec, residency))),
-                108 => Ok(ColumnIndex::Open108(WidthIndex::new(spec, residency))),
-                other => Err(ReelError::Config(format!(
-                    "column {} asks for an open shard at {other} bytes, which the index \
-                     holds no arm for",
-                    spec.name,
-                ))),
-            };
-        }
         match width {
             0 => Ok(ColumnIndex::W0(WidthIndex::new(spec, residency))),
             2 => Ok(ColumnIndex::W2(WidthIndex::new(spec, residency))),
@@ -224,14 +184,6 @@ impl ColumnIndex {
         on_index!(self, index => index.shard_bytes)
     }
 
-    /// Bytes a resident key costs this column beyond itself and its entry
-    ///
-    /// The shape decides it, and the two shapes are four times apart, so one number
-    /// for both would report a tree's cost for an open shard's keys.
-    pub fn overhead_per_key(&self) -> u64 {
-        on_index!(self, index => index.overhead_per_key())
-    }
-
     /// Bytes the filters in front of the shards hold
     pub fn filter_bytes(&self) -> u64 {
         on_index!(self, index => index.filter_bytes())
@@ -240,11 +192,6 @@ impl ColumnIndex {
     /// Bytes the column's index holds, counted from what its maps allocated
     pub fn heap_bytes(&self) -> u64 {
         on_index!(self, index => index.heap_bytes())
-    }
-
-    /// Which structure this column's shards opened in, not always what was declared
-    pub fn map_shape(&self) -> MapShape {
-        on_index!(self, index => index.map_shape())
     }
 
     /// Apply a committed data record, guarded by its sequence number
@@ -836,11 +783,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         self.declared_width
     }
 
-    /// Bytes a resident key costs beyond itself and its entry, from the shape
-    pub fn overhead_per_key(&self) -> u64 {
-        S::OVERHEAD_PER_KEY
-    }
-
     /// Bytes the filters in front of the shards hold
     pub fn filter_bytes(&self) -> u64 {
         self.filters.heap_bytes()
@@ -855,11 +797,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             as u64
             + self.filters.heap_bytes();
         fixed + self.sum_shards(|state| state.map.heap_bytes())
-    }
-
-    /// Which structure this column's shards took
-    pub fn map_shape(&self) -> MapShape {
-        S::SHAPE
     }
 
     /// Apply a committed data record, guarded by its sequence number
@@ -1954,9 +1891,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         })
     }
 
-    /// One page of the keys under a prefix, and where the next page starts
-    ///
-    /// An open table serves only its exact shard key, so a caller cannot ask for a full scan by accident.
+    /// One page of the keys under a prefix in key order, marked with the last key handed out
     pub fn sweep_prefix(
         &self,
         nonce: u64,
@@ -1969,52 +1904,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         if limit == 0 {
             return None;
         }
-        if S::SHAPE == MapShape::Tree {
-            return self.sweep_ordered_prefix(nonce, prefix, from, limit, out);
-        }
-        if self.shard_bytes == 0 || prefix.len() != self.shard_bytes as usize {
-            return None;
-        }
-        let at = self.shard_of_bytes(prefix);
-        if at >= self.shards.len() {
-            return None;
-        }
-
-        let resumed = from.filter(|mark| mark.nonce == nonce && mark.shard == at);
-        let mut within = resumed.map_or(Mark::Start, |mark| mark.within.clone());
-        loop {
-            let state = read(&self.shards[at]);
-            let room = limit - out.len();
-            let (rows, next) = state.map.sweep(&within, room);
-            for (key, entry) in &rows {
-                if entry.is_grave() || self.is_covered(key.as_slice(), entry.lsn) {
-                    continue;
-                }
-                out.push(key.as_slice(), **entry);
-            }
-            match next {
-                Some(next) if out.len() >= limit => {
-                    return Some(ColumnMark {
-                        nonce,
-                        shard: at,
-                        within: next,
-                    })
-                }
-                Some(next) => within = next,
-                None => return None,
-            }
-        }
-    }
-
-    /// One page of a prefix walked in key order, marked with the last key handed out
-    fn sweep_ordered_prefix(
-        &self,
-        nonce: u64,
-        prefix: &[u8],
-        from: Option<&ColumnMark>,
-        limit: usize,
-        out: &mut KeyPage,
-    ) -> Option<ColumnMark> {
         let first = self.shard_of_bytes(prefix);
         let mut high = prefix.to_vec();
         high.resize(high.len().max(self.shard_bytes as usize), 0xff);
@@ -2120,9 +2009,9 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// next page starts
     ///
     /// Every live key is handed out at least once across a full sweep. Not
-    /// exactly once: a shard that resizes mid sweep starts over, and the callers
-    /// of this are idempotent by construction. Graves and covered entries are
-    /// filtered here the same way a paged read filters them.
+    /// exactly once: a mark another opening minted starts the column over, and the
+    /// callers of this are idempotent by construction. Graves and covered entries
+    /// are filtered here the same way a paged read filters them.
     pub fn sweep(
         &self,
         nonce: u64,
@@ -2343,13 +2232,8 @@ impl ColumnMark {
         packed.extend_from_slice(&(self.shard as u64).to_le_bytes());
         match &self.within {
             Mark::Start => packed.push(0),
-            Mark::Slot { at, generation } => {
-                packed.push(1);
-                packed.extend_from_slice(&(*at as u64).to_le_bytes());
-                packed.extend_from_slice(&generation.to_le_bytes());
-            }
             Mark::Key(key) => {
-                packed.push(2);
+                packed.push(1);
                 packed.extend_from_slice(key);
             }
         }
@@ -2368,11 +2252,7 @@ impl ColumnMark {
         let shard = u64::from_le_bytes(packed[8..16].try_into().ok()?) as usize;
         let within = match packed[16] {
             0 => Mark::Start,
-            1 if packed.len() == 33 => Mark::Slot {
-                at: u64::from_le_bytes(packed[17..25].try_into().ok()?) as usize,
-                generation: u64::from_le_bytes(packed[25..33].try_into().ok()?),
-            },
-            2 => Mark::Key(Box::from(&packed[17..])),
+            1 => Mark::Key(Box::from(&packed[17..])),
             _ => return None,
         };
         Some(ColumnMark {
@@ -2385,20 +2265,14 @@ impl ColumnMark {
 
 /// Where a sweep of one shard left off
 ///
-/// Opaque to the caller: a shape mints marks only it can read, and one handed a
-/// mark it did not mint starts its shard again rather than guessing. The
-/// generation goes with it because a resize moves every slot, so a slot number
-/// from before one points at a different key after it.
+/// Opaque to the caller, which only ever hands one back.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum Mark {
     /// The beginning of the shard
     #[default]
     Start,
 
-    /// The slot to resume at, and the generation it was taken in
-    Slot { at: usize, generation: u64 },
-
-    /// The key to resume after, for a shape that keeps its keys in order
+    /// The key to resume after
     Key(Box<[u8]>),
 }
 
@@ -2495,8 +2369,7 @@ pub trait ShardMap<K: IndexKey, V: 'static>: Default {
 
     /// Pack the map back up where deletion has left room worth taking back
     ///
-    /// Cheap to ask: the shape that reclaims what a delete leaves does nothing here,
-    /// and the shape that does not guards the pass on the room having doubled.
+    /// Cheap to ask: the pass is guarded on the room having doubled.
     fn pack_owed(&mut self) {}
 
     /// Give the map's room back, for a shard that is holding nothing at all
@@ -2699,103 +2572,6 @@ impl<const N: usize, const B: usize, V: Default + 'static> ShardMap<[u8; N], V>
     }
 }
 
-/// The same shard held open-addressed instead of in a tree
-///
-/// Everything a point read does is here and everything an ordered read does is a
-/// gather and a sort, which is the trade the column made when it declared the shape.
-/// The cost is the shard rather than the run asked for: a page of ten keys off a
-/// shard of a million gathers and sorts the million. Deletion shifts a chain back
-/// over its hole rather than leaving a tombstone, so a search never steps over one.
-impl<const N: usize, V: Default + 'static> ShardMap<[u8; N], V> for OpenTable<N, V> {
-    fn put(&mut self, key: [u8; N], val: V) -> Option<V> {
-        self.insert(key, val)
-    }
-
-    fn at(&self, key: &[u8]) -> Option<&V> {
-        // A probe of the wrong width is a key this column cannot hold, which is
-        // an absence rather than a fault.
-        let key: &[u8; N] = key.try_into().ok()?;
-        self.get(key)
-    }
-
-    fn at_mut(&mut self, key: &[u8]) -> Option<&mut V> {
-        let key: &[u8; N] = key.try_into().ok()?;
-        self.get_mut(key)
-    }
-
-    fn holds(&self, key: &[u8]) -> bool {
-        match key.try_into() {
-            Ok(key) => self.contains_key(key),
-            Err(_) => false,
-        }
-    }
-
-    fn take(&mut self, key: &[u8]) -> Option<V> {
-        let key: &[u8; N] = key.try_into().ok()?;
-        self.remove(key)
-    }
-
-    fn count(&self) -> usize {
-        self.len()
-    }
-
-    fn vacant(&self) -> bool {
-        self.is_empty()
-    }
-
-    fn heap_bytes(&self) -> u64 {
-        OpenTable::heap_bytes(self)
-    }
-
-    fn empty(&mut self) {
-        self.clear();
-    }
-
-    fn walk(&self) -> impl Iterator<Item = (&[u8; N], &V)> {
-        self.sorted().into_iter()
-    }
-
-    fn span<'a>(
-        &'a self,
-        low: Bound<&[u8; N]>,
-        high: Bound<&'a [u8; N]>,
-    ) -> impl Iterator<Item = (&'a [u8; N], &'a V)> {
-        self.sorted_span(low, high).into_iter()
-    }
-
-    fn span_back<'a>(
-        &'a self,
-        low: Bound<&'a [u8; N]>,
-        high: Bound<&[u8; N]>,
-    ) -> impl Iterator<Item = (&'a [u8; N], &'a V)> {
-        self.sorted_span(low, high).into_iter().rev()
-    }
-
-    /// A slot scan, which costs the page rather than the shard
-    ///
-    /// The mark carries the generation the slot was read in, and a resize since
-    /// then means the slot points at a different key. Such a mark starts the
-    /// shard over: every live key is seen at least once, which is what the
-    /// callers of this need and all an unordered shape can promise.
-    fn sweep<'a>(&'a self, from: &Mark, limit: usize) -> (Vec<(&'a [u8; N], &'a V)>, Option<Mark>) {
-        let at = match from {
-            Mark::Slot { at, generation } if *generation == self.generation() => *at,
-            _ => 0,
-        };
-        let (page, next) = self.slot_page(at, limit);
-        let generation = self.generation();
-        (page, next.map(|at| Mark::Slot { at, generation }))
-    }
-
-    fn fit(&mut self) {
-        OpenTable::fit(self);
-    }
-
-    fn pack_owed(&mut self) {
-        self.pack();
-    }
-}
-
 /// Which pair of maps a column's shards are built from
 ///
 /// Per column rather than once for the whole index, because a column's key decides
@@ -2803,22 +2579,7 @@ impl<const N: usize, V: Default + 'static> ShardMap<[u8; N], V> for OpenTable<N,
 pub trait Shape<K: IndexKey> {
     /// Where the shard's entries live
     type Entries: ShardMap<K, Entry>;
-
-    /// What a column's shards actually took, not always what the column asked for
-    const SHAPE: MapShape;
-
-    /// Bytes a resident key costs beyond its own bytes and its entry
-    ///
-    /// A gauge for a budget to act on rather than a measurement: the tree's number
-    /// was weighed and the open shard's is arithmetic on its slot.
-    const OVERHEAD_PER_KEY: u64;
 }
-
-/// Bytes a resident key costs the tree beyond itself and its entry
-///
-/// A b-tree holds its keys in nodes with a header and slots it has not filled, so
-/// a key costs more than the key. A gauge rather than a measurement.
-const NODE_BYTES_PER_KEY: u64 = 37;
 
 /// The shape a declared width allows, and what every fixed column takes
 pub struct Trees<const N: usize>;
@@ -2833,8 +2594,6 @@ macro_rules! tree_shapes {
         $(
             impl Shape<[u8; $width]> for Trees<$width> {
                 type Entries = TBTreeMap<[u8; $width], { node_width($width) }, Entry>;
-                const SHAPE: MapShape = MapShape::Tree;
-                const OVERHEAD_PER_KEY: u64 = NODE_BYTES_PER_KEY;
             }
         )*
     };
@@ -2855,21 +2614,6 @@ pub struct VarTrees;
 
 impl Shape<Box<[u8]>> for VarTrees {
     type Entries = TBTreeMap<Box<[u8]>, VAR_NODE_WIDTH, Entry>;
-    const SHAPE: MapShape = MapShape::Tree;
-    const OVERHEAD_PER_KEY: u64 = NODE_BYTES_PER_KEY;
-}
-
-/// The shape a column takes when it asks for an open-addressed shard
-///
-/// One impl over every width, since nothing here is arithmetic on the width: a slot
-/// is the key and the value laid down next to each other. Which widths a column may
-/// declare it at is `ColumnIndex`'s to say.
-pub struct OpenTables<const N: usize>;
-
-impl<const N: usize> Shape<[u8; N]> for OpenTables<N> {
-    type Entries = OpenTable<N, Entry>;
-    const SHAPE: MapShape = MapShape::Open;
-    const OVERHEAD_PER_KEY: u64 = overhead_per_key(N as u64, std::mem::size_of::<Entry>() as u64);
 }
 
 /// A key as the resident map holds it
@@ -3028,7 +2772,7 @@ fn resize(current: u64, old_len: u64, new_len: u64) -> u64 {
 mod tests {
     use super::*;
 
-    use crate::format::column::{Codec, ColumnId, KeyWidth};
+    use crate::format::column::{Codec, ColumnId, KeyWidth, MapShape};
     use crate::format::loc::SegmentId;
     use std::collections::BTreeSet;
 
@@ -3110,46 +2854,6 @@ mod tests {
         assert_eq!(page.len(), 120);
     }
 
-    // an open table sweeps its shard key and refuses any other width
-    #[test]
-    fn open_prefix_sweep_takes_only_its_shard() {
-        let index: WidthIndex<[u8; 34], OpenTables<34>> =
-            WidthIndex::new(&SHARDED, IndexResidency::Resident);
-        let segments = SegmentTable::new();
-        let mut wrote = BTreeSet::new();
-        for group in [7u16, 1, 40] {
-            for byte in 0..40u8 {
-                index.insert(
-                    &key(group, byte),
-                    Entry::new(loc(1, u32::from(byte), 10), Lsn(u64::from(byte) + 1)),
-                    &segments,
-                );
-                if group == 7 {
-                    wrote.insert(key(group, byte));
-                }
-            }
-        }
-
-        let mut seen = BTreeSet::new();
-        let mut mark = None;
-        let mut page = KeyPage::default();
-        loop {
-            let next = index.sweep_prefix(9, &7u16.to_be_bytes(), mark.as_ref(), 16, &mut page);
-            seen.extend(keys_in(&page));
-            match next {
-                Some(next) => mark = Some(next),
-                None => break,
-            }
-        }
-        assert_eq!(seen, wrote, "a prefix sweep took the wrong shard's keys");
-
-        // Any other width is refused, so a prefix walk never scans the table.
-        for prefix in [&[0u8][..], &[0, 7, 3], &[]] {
-            assert!(index.sweep_prefix(9, prefix, None, 16, &mut page).is_none());
-            assert_eq!(page.len(), 0);
-        }
-    }
-
     // a mark another opening minted starts the column over
     #[test]
     fn column_sweep_refuses_foreign_nonce() {
@@ -3223,7 +2927,7 @@ mod tests {
     // a variable column opens, where before it was refused outright
     #[test]
     fn a_variable_column_opens() {
-        let index = ColumnIndex::new(&VARIABLE, ShardShapes::Tree, IndexResidency::Resident)
+        let index = ColumnIndex::new(&VARIABLE, IndexResidency::Resident)
             .expect("a variable column has an index now");
         assert!(matches!(index, ColumnIndex::Var(_)));
         assert_eq!(index.key_width(), 0, "a variable column declares no width");
@@ -3232,8 +2936,7 @@ mod tests {
     // keys of different lengths live in one column and answer for themselves
     #[test]
     fn a_variable_column_holds_every_length() {
-        let index = ColumnIndex::new(&VARIABLE, ShardShapes::Tree, IndexResidency::Resident)
-            .expect("index");
+        let index = ColumnIndex::new(&VARIABLE, IndexResidency::Resident).expect("index");
         let segments = SegmentTable::new();
 
         let names: Vec<Vec<u8>> = [
@@ -3273,8 +2976,7 @@ mod tests {
     // a shorter key sorts before what extends it, which listing depends on
     #[test]
     fn a_variable_column_orders_by_bytes() {
-        let index = ColumnIndex::new(&VARIABLE, ShardShapes::Tree, IndexResidency::Resident)
-            .expect("index");
+        let index = ColumnIndex::new(&VARIABLE, IndexResidency::Resident).expect("index");
         let segments = SegmentTable::new();
 
         let mut names: Vec<Vec<u8>> = vec![
@@ -3297,8 +2999,7 @@ mod tests {
     // an overwrite replaces the key rather than adding a second one
     #[test]
     fn a_variable_key_overwrites_in_place() {
-        let index = ColumnIndex::new(&VARIABLE, ShardShapes::Tree, IndexResidency::Resident)
-            .expect("index");
+        let index = ColumnIndex::new(&VARIABLE, IndexResidency::Resident).expect("index");
         let segments = SegmentTable::new();
         let name = b"photos/2026/cat.jpg".as_slice();
 
@@ -3487,60 +3188,13 @@ mod tests {
             map_shape: MapShape::Tree,
         };
 
-        assert!(ColumnIndex::new(&odd, ShardShapes::Tree, IndexResidency::Resident).is_err());
-        assert!(ColumnIndex::new(&SHARDED, ShardShapes::Tree, IndexResidency::Resident).is_ok());
+        assert!(ColumnIndex::new(&odd, IndexResidency::Resident).is_err());
+        assert!(ColumnIndex::new(&SHARDED, IndexResidency::Resident).is_ok());
         assert_eq!(
-            ColumnIndex::new(&FLAT, ShardShapes::Tree, IndexResidency::Resident)
+            ColumnIndex::new(&FLAT, IndexResidency::Resident)
                 .expect("flat")
                 .key_width(),
             32
-        );
-    }
-
-    // an open shard is taken only at the widths there is an arm for
-    #[test]
-    fn open_arms_are_declared() {
-        let open = |width: u16| ColumnSpec {
-            key_width: KeyWidth::Fixed(width),
-            map_shape: MapShape::Open,
-            ..FLAT
-        };
-
-        // The slack a slot holds open grows with the slot, so each width owes its own.
-        for (width, overhead) in [(16u16, 6u64), (32, 9), (34, 9), (72, 14), (108, 20)] {
-            let index = ColumnIndex::new(
-                &open(width),
-                ShardShapes::Declared,
-                IndexResidency::Resident,
-            )
-            .expect("an open arm");
-            assert_eq!(index.key_width(), width);
-            assert_eq!(index.map_shape(), MapShape::Open, "{width} byte keys");
-            assert_eq!(index.overhead_per_key(), overhead, "{width} byte keys");
-        }
-        for width in [8u16, 20, 48] {
-            assert!(
-                ColumnIndex::new(
-                    &open(width),
-                    ShardShapes::Declared,
-                    IndexResidency::Resident
-                )
-                .is_err(),
-                "{width}"
-            );
-        }
-        assert!(ColumnIndex::new(&VARIABLE, ShardShapes::Tree, IndexResidency::Resident).is_ok());
-        assert!(
-            ColumnIndex::new(
-                &ColumnSpec {
-                    map_shape: MapShape::Open,
-                    ..VARIABLE
-                },
-                ShardShapes::Declared,
-                IndexResidency::Resident,
-            )
-            .is_err(),
-            "a column with no declared width has no slot to size",
         );
     }
 
@@ -3558,8 +3212,8 @@ mod tests {
                 map_shape: MapShape::Tree,
             };
 
-            let index = ColumnIndex::new(&spec, ShardShapes::Tree, IndexResidency::Resident)
-                .expect("a small width declared");
+            let index =
+                ColumnIndex::new(&spec, IndexResidency::Resident).expect("a small width declared");
             assert_eq!(index.key_width(), u16::from(width));
         }
     }

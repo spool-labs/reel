@@ -17,7 +17,7 @@ use crate::units::ByteCount;
 
 use crate::config::{
     CompactRate, HotIndex, IndexResidency, PointReads, Preallocate, RangedReads, RepairPath,
-    ShardShapes, SyncPolicy, ThreadBudget,
+    SyncPolicy, ThreadBudget,
 };
 use crate::format::column::{Codec, ColumnId, ColumnSpec, MapShape};
 use crate::format::footer::SegmentFooter;
@@ -1909,7 +1909,7 @@ fn a_hot_index_pages_when_it_runs_out_of_room() {
         ..config(1, SyncPolicy::Never)
     };
     // The least budget a volume takes is what its columns hold empty.
-    let floor = ReelIndex::new(WIDE_COLUMNS, hot(ByteCount::gb(1)).index, ShardShapes::Tree)
+    let floor = ReelIndex::new(WIDE_COLUMNS, hot(ByteCount::gb(1)).index)
         .expect("index")
         .floor_bytes();
     let store = ReelStore::open_with_io(

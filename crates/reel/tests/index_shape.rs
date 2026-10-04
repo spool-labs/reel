@@ -28,7 +28,6 @@ use reel::format::lsn::Lsn;
 use reel::index::column::{Shape, ShardMap, Trees, VarTrees, WidthIndex, VAR_NODE_WIDTH};
 use reel::index::counters::SegmentTable;
 use reel::index::entry::Entry;
-use reel::index::opentable::OpenTable;
 use reel::index::tbtreemap::{
     node_width, scan_backend, scans, Shared, TBTreeMap, TreeKey, Whole, MAX_NODE_WIDTH,
     MIN_NODE_WIDTH, NODE_BUDGET, SHARED_CAP,
@@ -945,18 +944,6 @@ fn hash_at(keys: &[Pubkey], is_installed: bool) -> HashMap<Pubkey, Entry, FxBuil
     map
 }
 
-/// The open-addressed table, grown from empty or sized once for its keys
-fn open_at(keys: &[Pubkey], is_installed: bool) -> OpenTable<32, Entry> {
-    let mut map = match is_installed {
-        true => OpenTable::with_keys(keys.len()),
-        false => OpenTable::new(),
-    };
-    for (at, key) in keys.iter().enumerate() {
-        map.insert(*key, entry_at(at as u64));
-    }
-    map
-}
-
 /// Weigh one container over the keys and time a probe of every one of them
 ///
 /// Every probe is a key the container holds, so a count short of the whole set is
@@ -979,17 +966,16 @@ fn weigh_arm<Map>(
     (bytes as f64 / probes.len() as f64, per_probe)
 }
 
-/// What a resident 32 byte key costs, tree against open addressing
+/// What a resident 32 byte key costs, tree against the standard maps
 ///
 /// The full 32 byte key in every arm: a prefix as the map key loses a key outright when
 /// two collide, and the keys are chosen by whoever writes them. `HashMap` is the ceiling
-/// the shape is measured against; `OpenTable` is what would actually go in, and it
-/// answers an ordered walk by gathering and sorting.
+/// the shape is measured against.
 ///
 /// Every arm is weighed at both loads, since a container's footprint is as much the load
 /// as the structure. `grown` puts the keys in one at a time, which is what a running
 /// volume does; `installed` is the bulk path a rebuild takes, the tree from its sorted
-/// run and the table sized once for a key count known at open.
+/// run and the hash map reserved once for a key count known at open.
 #[test]
 #[ignore = "measurement; run with --ignored --nocapture"]
 fn key_footprint() {
@@ -1000,17 +986,8 @@ fn key_footprint() {
         std::mem::size_of::<Entry>()
     );
     println!(
-        "{:>9} {:>10} {:>10} {:>9} {:>10} {:>9} {:>10} {:>9} {:>10} {:>9}",
-        "keys",
-        "load",
-        "tbtree B",
-        "get ns",
-        "btree B",
-        "get ns",
-        "hash B",
-        "get ns",
-        "open B",
-        "get ns",
+        "{:>9} {:>10} {:>10} {:>9} {:>10} {:>9} {:>10} {:>9}",
+        "keys", "load", "tbtree B", "get ns", "btree B", "get ns", "hash B", "get ns",
     );
 
     for count in [262_144usize, 1_048_576] {
@@ -1032,11 +1009,6 @@ fn key_footprint() {
                 &probes,
                 |map, key| map.get(key).is_some(),
             );
-            let (open_bytes, open_ns) = weigh_arm(
-                || open_at(&keys, is_installed),
-                &probes,
-                |map, key| map.get(key).is_some(),
-            );
 
             let load = match is_installed {
                 true => "installed",
@@ -1044,7 +1016,7 @@ fn key_footprint() {
             };
             println!(
                 "{count:>9} {load:>10} {tb_bytes:>10.1} {tb_ns:>9.1} {bt_bytes:>10.1} \
-                 {bt_ns:>9.1} {hash_bytes:>10.1} {hash_ns:>9.1} {open_bytes:>10.1} {open_ns:>9.1}",
+                 {bt_ns:>9.1} {hash_bytes:>10.1} {hash_ns:>9.1}",
             );
         }
     }

@@ -274,18 +274,11 @@ impl RecordKey {
 
 /// What structure a column's resident shards hold their keys in
 ///
-/// The tree serves every column. The open-addressed table is for a clustered
-/// column that is huge, small-valued and overwrite-heavy, and only the fixed
-/// widths the index declares an open arm for may take it. The choice is
-/// resident-side only, so no on-disk byte depends on it, a reopen may flip it,
-/// and a volume that ignores the declaration gives every column the tree.
+/// The choice is resident-side only, so no on-disk byte depends on it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MapShape {
-    /// Ordered tree shards, what a column takes unless it opts out
+    /// Ordered tree shards, which serve every column
     Tree,
-
-    /// Open-addressed shards: point reads first, ordered walks collect and sort
-    Open,
 }
 
 /// What a column's keys measure, which is a width or the absence of one

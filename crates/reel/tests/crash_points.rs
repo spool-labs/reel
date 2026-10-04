@@ -16,13 +16,12 @@ use reel::format::record::{BatchFrame, RecordHeader, HEADER_LEN};
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::{
-    ByteCount, IndexResidency, CompactPass, CompactRate, Preallocate, RecordWrite, ReelConfig, ReelStore,
-    RepairPath, ShardShapes, SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
+    ByteCount, CompactPass, CompactRate, IndexResidency, Preallocate, RecordWrite, ReelConfig,
+    ReelStore, RepairPath, SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
 };
 use reel_core::{Store, Value};
 use reel_mock::MemoryStore;
 
-use harness::fixture::OPEN_COLUMNS;
 use harness::observe::observe;
 use harness::op_stream::{self, StreamOp};
 use harness::reel_harness::{
@@ -165,10 +164,7 @@ fn put(group: u16, address: u8, len: usize, fill: u8) -> StreamOp {
 }
 
 fn enumerate(config: ReelConfig, ops: &[StreamOp], seed: u64, durable: bool) {
-    enumerate_over(ReelHarness::new(config), ops, seed, durable);
-}
-
-fn enumerate_over(harness: ReelHarness, ops: &[StreamOp], seed: u64, durable: bool) {
+    let harness = ReelHarness::new(config);
     let total = harness.boundary_count(ops);
     assert!(total > 0, "the stream crosses no io boundary");
 
@@ -203,27 +199,6 @@ fn every_boundary_multi_tail() {
         let ops = op_stream::generate_durable(*seed, CRASH_LEN);
         enumerate(
             crash_config(4, SyncPolicy::EveryPut, SEGMENT_SMALL),
-            &ops,
-            *seed,
-            true,
-        );
-    }
-}
-
-// every crash boundary reproduces the durable prefix into open-addressed shards
-//
-// The other side of the reopen: a rebuild lands each shard's keys in one bulk pass, and
-// crashing mid-write makes that pass absorb a different run at every boundary.
-#[test]
-fn every_boundary_open_shards() {
-    for seed in MULTI_TAIL_SEEDS {
-        let ops = op_stream::generate_durable(*seed, CRASH_LEN);
-        let config = ReelConfig {
-            shard_shapes: ShardShapes::Declared,
-            ..crash_config(1, SyncPolicy::EveryPut, SEGMENT_SMALL)
-        };
-        enumerate_over(
-            ReelHarness::with_columns(config, OPEN_COLUMNS),
             &ops,
             *seed,
             true,

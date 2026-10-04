@@ -19,10 +19,14 @@ use std::time::Instant;
 
 use reel::format::loc::{Loc, SegmentId};
 use reel::format::lsn::Lsn;
-use reel::{Entry, OpenTable};
+use reel::index::tbtreemap::{node_width, TBTreeMap};
+use reel::Entry;
 
-/// Keys the bare table holds
-const TABLE_KEYS: usize = 1_000_000;
+/// Keys the bare tree holds
+const TREE_KEYS: usize = 1_000_000;
+
+/// Keys a node holds at the thirty-two byte width the probe asks at
+const NODE: usize = node_width(32);
 
 /// Asks each thread makes per timed arm
 const ASKS: u64 = 1_000_000;
@@ -111,23 +115,23 @@ where
 
 /// The bare structure: a probe against a state machine around the same probe
 pub fn a_probe_never_waits() {
-    let mut table: OpenTable<32, Entry> = OpenTable::with_keys(TABLE_KEYS);
-    for at in 0..TABLE_KEYS as u64 {
-        table.insert(
+    let mut tree: TBTreeMap<[u8; 32], NODE, Entry> = TBTreeMap::new();
+    for at in 0..TREE_KEYS as u64 {
+        tree.insert(
             key_of(at),
             Entry::new(Loc::new(SegmentId(1), at as u32, 200), Lsn(at)),
         );
     }
-    let table = &table;
+    let tree = &tree;
 
-    println!("one probe of {TABLE_KEYS} resident keys, ns an ask, {ASKS} asks a thread");
+    println!("one probe of {TREE_KEYS} resident keys, ns an ask, {ASKS} asks a thread");
     println!("  threads      direct   future-ready   one-suspension");
     for threads in [1u64, 8] {
         let direct = timed(threads, |thread| {
             let mut found = 0u64;
             for at in 0..ASKS {
-                let key = key_of(mixed(thread * ASKS + at) % TABLE_KEYS as u64);
-                found += u64::from(table.get(std::hint::black_box(&key)).is_some());
+                let key = key_of(mixed(thread * ASKS + at) % TREE_KEYS as u64);
+                found += u64::from(tree.get(std::hint::black_box(&key)).is_some());
             }
             assert_eq!(found, ASKS, "every drawn key is present");
             found
@@ -136,9 +140,9 @@ pub fn a_probe_never_waits() {
             let waker = Waker::from(Arc::new(Unparker(thread::current())));
             let mut found = 0u64;
             for at in 0..ASKS {
-                let key = key_of(mixed(thread * ASKS + at) % TABLE_KEYS as u64);
+                let key = key_of(mixed(thread * ASKS + at) % TREE_KEYS as u64);
                 found += u64::from(drive(&waker, async {
-                    table.get(std::hint::black_box(&key)).is_some()
+                    tree.get(std::hint::black_box(&key)).is_some()
                 }));
             }
             assert_eq!(found, ASKS, "the state machine loses nothing");
@@ -148,10 +152,10 @@ pub fn a_probe_never_waits() {
             let waker = Waker::from(Arc::new(Unparker(thread::current())));
             let mut found = 0u64;
             for at in 0..ASKS {
-                let key = key_of(mixed(thread * ASKS + at) % TABLE_KEYS as u64);
+                let key = key_of(mixed(thread * ASKS + at) % TREE_KEYS as u64);
                 found += u64::from(drive(&waker, async {
                     YieldOnce(false).await;
-                    table.get(std::hint::black_box(&key)).is_some()
+                    tree.get(std::hint::black_box(&key)).is_some()
                 }));
             }
             assert_eq!(found, ASKS, "a suspension loses nothing");

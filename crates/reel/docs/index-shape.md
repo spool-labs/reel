@@ -1,8 +1,7 @@
 # What the resident index is held in
 
 The index started as a `BTreeMap<K, Entry>` per shard. It is a purpose-built B+ tree now at
-both key types, with an open-addressed arm a column may declare instead at four of the widths.
-The tree beats the map on every axis that reaches the store, and the largest win is not in the
+both key types. The tree beats the map on every axis that reaches the store, and the largest win is not in the
 structure at all but in asking it for many keys at once.
 
 ```
@@ -31,9 +30,7 @@ lock-free arms lose to. At 16,384 keys a shard `skipmap` inserts at 204ns and ge
 `indexset` holds only its walk, 0.3ns a key throughout.
 
 **Ordering is a gate, not a score.** A listing seeks by prefix, rolls a folder up past a
-delimiter and resumes from a name, so a hash cannot hold that column whatever it costs. The
-open-addressed arm is that trade taken deliberately, by a column answering point reads that
-gathers and sorts for the rare walk.
+delimiter and resumes from a name, so a hash cannot hold that column whatever it costs.
 
 ## The tree
 
@@ -172,19 +169,9 @@ it, having just dropped the graves with the shard held.
 
 ## What shipped
 
-**Every column is on a tree unless it asks for the other shape.** `ShardMap` is generic in its
-value as well as its key and `Shape` names the pair of maps a column's shards are built from.
-Sixteen fixed arms of `ColumnIndex` take `Trees<N>`, five take `OpenTables<N>` at 16, 32, 34,
-72 and 108 bytes, and the variable arm takes `VarTrees`, each at the node width its key asks for.
-
-**The open shard is a declaration, not a format.** `map_shape` asks for it, it is resident-side
-only so no on-disk byte turns on it and a reopen may flip it, and a volume opened under
-`ShardShapes::Tree` drops the request rather than refusing it. A variable column, or a width
-with no open arm, asking for one is refused at open. Three parallel arrays and no nodes: a slot
-costs its control byte, its key and its value, probing is linear from a home slot with a delete
-shifting the run back over the hole, and the capacity is any size, from a multiply into it
-rather than a mask, so a table built from a run of known length is sized once at its 7/8 load
-factor.
+**Every column is on a tree.** `ShardMap` is generic in its value as well as its key and `Shape`
+picks the map a column's shards are built from. Sixteen fixed arms of `ColumnIndex` take
+`Trees<N>` and the variable arm takes `VarTrees`, each at the node width its key asks for.
 
 **The walk runs both ways**, leaves chained in both directions so `page_back` is served by the
 chain rather than by a reversed `BTreeMap` range, which is the only thing that could hold the
@@ -334,28 +321,15 @@ faster. What that mostly says is how little of a listed row is the map at all: t
 above move by factors and these move by percent, because a row is a seek, a walk step and a
 record played back and only the first two are the map's.
 
-## The sweep, and what an unordered shard can promise
+## The sweep
 
-A maintenance pass wants complete, resumable coverage of a column. It does not want key
-order, and asking for order is what shuts an unordered shard out: `page` resumes from a
-key, which on the open table means gathering the shard and sorting it to return a page.
+A maintenance pass wants complete, resumable coverage of a column. `ShardMap::sweep` walks a
+shard in key order and marks with the last key it handed out. A mark is opaque, and
+`ColumnMark` carries the opening that minted it, since a mark outlives its process through a
+persisted cursor or a peer's request. A mark from another opening starts the sweep over, so
+the promise is at-least-once, which is what the callers need.
 
-`ShardMap::sweep` asks for coverage instead. The tree walks in key order and marks with
-the last key it handed out; the open table walks slots and marks with a slot, which costs
-the page rather than the shard. One method, both shapes, no new variant.
-
-A mark is opaque and each shape only reads its own. It carries the table generation,
-since a resize moves every slot, and `ColumnMark` carries the opening that minted it,
-since a mark outlives its process through a persisted cursor or a peer's request. A mark
-from elsewhere restarts rather than resuming into a layout that is not there.
-
-So the promise is at-least-once, not exactly-once: a shard that resizes mid sweep starts
-over. That is what the callers need, and it is all an unordered shape can give.
-
-`sweep_prefix` narrows it. The tree serves any prefix in key order, since its keys under a
-prefix are one run. The open table serves only a prefix that is exactly the shard key. Shorter
-spans shards, longer splits one, and neither can be served by walking one shard's slots,
-so the open table refuses both and never scans the family.
+`sweep_prefix` narrows it to one prefix, in key order, since the keys under a prefix are one run.
 
 ## Resident bytes per key, which the tree does not win
 
@@ -381,9 +355,7 @@ hours on one core. Manufacture one and the store answers for a record it cannot 
 honestly and wrongly.
 
 So the rule is not about length. **A lossy key must never be the map key in a structure that
-cannot hold two entries under one prefix.** The open-addressed arm obeys it by construction:
-the whole key is the map key and every hit compares it, and the control byte's seven bits of
-hash are a probe hint and nothing a slot is claimed by. With duplicate support the prefix
+cannot hold two entries under one prefix.** With duplicate support the prefix
 length is a performance knob; without it nothing under 16 bytes is defensible, and 16 only
 because 2^68 is unreachable.
 
@@ -393,7 +365,7 @@ because 2^68 is unreachable.
 pages rather than pack them. A configuration change rather than a rewrite.
 
 **Resident bytes per key on the fixed columns.** The harness is `key_footprint`, weighing tree,
-map, hash and open table over 32 byte keys at both loads, and the numbers are still owed.
+map and hash over 32 byte keys at both loads, and the numbers are still owed.
 
 **Contention, and the window under churn.** Every arm is single threaded, so the claim that
 65,536 shards leave nothing for a lock-free map to win is an argument from shard count, and

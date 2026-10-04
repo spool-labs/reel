@@ -254,7 +254,7 @@ impl Store for ReelStore {
         Ok((rows, next))
     }
 
-    /// One page under a prefix, in key order on a tree and slot order on an open table
+    /// One page under a prefix, in key order
     fn sweep_prefix(
         &self,
         cf: &str,
@@ -1100,7 +1100,7 @@ mod tests {
 
     use crate::units::ByteCount;
 
-    use crate::config::{Preallocate, ReelConfig, ShardShapes, SyncPolicy, ThreadBudget};
+    use crate::config::{Preallocate, ReelConfig, SyncPolicy, ThreadBudget};
     use crate::format::column::{Codec, ColumnSet, ColumnSpec, MapShape};
     use crate::io::fault::FaultPlan;
     use crate::io::sim_backend::SimIo;
@@ -1762,11 +1762,10 @@ mod tests {
 
     const PLAIN_CF: &str = "plain";
     const WIDE_CF: &str = "wide";
-    const OPEN_CF: &str = "open";
 
     const WIDE_KEY_LEN: usize = 34;
 
-    /// A variable tree, a fixed tree and an open table, the shapes a prefix sweep meets
+    /// A variable tree and a fixed tree, the shapes a prefix sweep meets
     const SWEEP_COLUMNS: ColumnSet = &[
         ColumnSpec {
             id: ColumnId(1),
@@ -1786,24 +1785,11 @@ mod tests {
             codec: Codec::None,
             map_shape: MapShape::Tree,
         },
-        ColumnSpec {
-            id: ColumnId(3),
-            name: OPEN_CF,
-            key_width: KeyWidth::Fixed(WIDE_KEY_LEN as u16),
-            shard_bytes: GROUP_PREFIX_LEN as u8,
-            purge_mark: None,
-            codec: Codec::None,
-            map_shape: MapShape::Open,
-        },
     ];
 
     fn sweep_store() -> ReelStore {
         let sim = SimIo::new(FaultPlan::new(1));
-        let config = ReelConfig {
-            shard_shapes: ShardShapes::Declared,
-            ..config()
-        };
-        ReelStore::open_with_io(PathBuf::from(ROOT), config, SWEEP_COLUMNS, Arc::new(sim))
+        ReelStore::open_with_io(PathBuf::from(ROOT), config(), SWEEP_COLUMNS, Arc::new(sim))
             .expect("open")
     }
 
@@ -2013,35 +1999,6 @@ mod tests {
         let (found, _) = swept(store, WIDE_CF, &[0], 4);
         assert_eq!(found, keys(store, WIDE_CF, &[0]));
         assert_eq!(found.len(), 15);
-    }
-
-    // an open table sweeps its shard key and answers nothing for any other width
-    #[test]
-    fn prefix_sweep_on_an_open_table() {
-        let store = sweep_store();
-        let store = trait_store(&store);
-        for group in [6u16, 7, 8] {
-            for byte in 0..5u8 {
-                store
-                    .put(OPEN_CF, &record(group, byte), &[byte; 16])
-                    .expect("put");
-            }
-        }
-
-        let (found, _) = swept(store, OPEN_CF, &7u16.to_be_bytes(), 2);
-        assert_eq!(
-            found,
-            (0..5u8).map(|byte| record(7, byte)).collect::<Vec<_>>()
-        );
-
-        let mut deeper = 7u16.to_be_bytes().to_vec();
-        deeper.push(3);
-        for prefix in [&deeper[..], &[0][..], &[][..]] {
-            let (rows, next) = store
-                .sweep_prefix(OPEN_CF, prefix, None, 16)
-                .expect("sweep");
-            assert!(rows.is_empty() && next.is_none(), "{prefix:?} was served");
-        }
     }
 
     // the usage report names every column the reel serves

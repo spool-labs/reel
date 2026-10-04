@@ -415,21 +415,14 @@ pub fn merged_page(
     if limit == 0 {
         return Ok(());
     }
-
-    // Opened before the bound is borrowed, because opening takes the playback
-    // mutably and the bound points into it.
-    playback.open(paged)?;
     let Some(at) = playback.at.as_ref() else {
         return Ok(());
     };
-    let from = borrowed_bound(at);
-    // Nothing sealed reaches this run, so the map's page is the whole answer and
-    // the merge is not worth setting up.
-    if playback.rows.is_empty() {
-        resident_page(index, way, from, limit, out);
-        playback.advance(out, limit)?;
-        return Ok(());
-    }
+    // The map's page is read before the footers open. A key the map hands to a footer
+    // after this read is in the page, and one it handed over before sits in a segment
+    // noted before that, which the opening counts.
+    resident_page(index, way, borrowed_bound(at), limit, &mut playback.resident);
+    playback.open(paged)?;
 
     let PlaybackCursor {
         rows,
@@ -437,7 +430,6 @@ pub fn merged_page(
         resident,
         ..
     } = playback;
-    resident_page(index, way, from, limit, resident);
     // A page that came back full says nothing about the keys past its last, so the
     // merge stops there rather than emitting a footer key over an unread one.
     let edge = (resident.len() == limit)
@@ -471,10 +463,13 @@ pub fn merged_page(
             taken += 1;
             continue;
         }
-        // A key the page did not carry can still be one the map holds: a grave over
-        // a paged record, or an entry past the reach of a page that stopped short.
+        // A key missing from the page can still be one the map took since the page was
+        // read. A grave drops it, and a put answers with its own entry.
         let newest = newest_row(rows, front, way, key)?;
-        if index.entry_or_grave(key).is_some() {
+        if let Some(entry) = index.entry_or_grave(key) {
+            if !entry.is_grave() && !index.is_covered_key(key, entry.lsn) {
+                out.push(key, entry);
+            }
             continue;
         }
         let Some((segment, found)) = newest else {

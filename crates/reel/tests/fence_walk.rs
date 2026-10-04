@@ -132,13 +132,13 @@ fn filled_under(config: ReelConfig) -> (ReelStore, SimIo) {
 /// Probe a sample of the keys, and say what finding them cost
 fn hit_counts(store: &ReelStore) -> ProbeCounts {
     let stride = keys() / PROBES;
-    // As of a cue point, since FastForward answers a live get without asking a footer.
+    // The index's own search as of a cue point, since FastForward answers a store read first.
     let cue = store.cue().expect("cue");
     let before = store.filter_probes();
     for at in 0..PROBES {
         let at = at * stride;
         assert!(
-            store.get_at(&key(at), &cue).expect("get").is_some(),
+            store.index().get_at(&key(at), cue.at()).expect("get").is_some(),
             "key {at} went missing",
         );
     }
@@ -218,8 +218,8 @@ fn a_fence_lands_a_search_on_one_block() {
 
 // what an in-range miss costs a fenced sorted run, with a filter and without
 //
-// A key no sealed segment holds is ruled out ahead of the fan-out by the column's
-// sealed-key set. The miss that survives is the fan-out's own, and a fence cannot
+// A key no sealed segment holds is ruled out ahead of the fan-out by FastForward,
+// which holds no slot for it. The miss that survives is the fan-out's own, and a fence cannot
 // stand in for a filter there: the leads say where a key would sit, never whether
 // it is there.
 #[test]
@@ -272,9 +272,8 @@ fn what_a_miss_costs_without_a_filter() {
     );
 }
 
-/// Probe keys nothing wrote, which the column's sealed-key set answers on its own
+/// Probe keys nothing wrote, which FastForward answers on its own
 fn miss_counts(store: &ReelStore) -> ProbeCounts {
-    // As of a cue point, since FastForward answers a live get without asking a footer.
     let cue = store.cue().expect("cue");
     let before = store.filter_probes();
     for at in keys()..keys() + PROBES {

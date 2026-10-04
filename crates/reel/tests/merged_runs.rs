@@ -243,13 +243,13 @@ fn fewer_asks_a_get() {
     let (store, _io) = open_over(merging_config(), COLUMNS);
     fill_runs(&store);
 
-    // As of a cue point, since FastForward answers a live get without asking a footer.
+    // The index's own search as of a cue point, since FastForward answers a store read first.
     // Dropped before the merge, since a standing cue point pins the runs it would retire.
     let asked_before = {
         let cue = store.cue().expect("cue");
         let before = store.filter_probes();
         for at in 0..KEYS {
-            store.get_at(&key_at(at), &cue).expect("get").expect("present");
+            store.index().get_at(&key_at(at), cue.at()).expect("get").expect("present");
         }
         store.filter_probes().since(before).asked
     };
@@ -260,7 +260,7 @@ fn fewer_asks_a_get() {
     let cue = store.cue().expect("cue");
     let after = store.filter_probes();
     for at in 0..KEYS {
-        store.get_at(&key_at(at), &cue).expect("get").expect("present");
+        store.index().get_at(&key_at(at), cue.at()).expect("get").expect("present");
     }
     let asked_after = store.filter_probes().since(after).asked;
 

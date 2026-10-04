@@ -389,6 +389,44 @@ fn compaction_rebooks_class_bookings_at_their_true_length() {
     assert_eq!(store.totals().bytes, exact, "the live bytes kept a class booking's error");
 }
 
+// a cue read of a key unchanged since the cue takes one read, and one rewritten since reads the footers
+#[test]
+fn a_cue_read_takes_one_read_while_the_key_stands() {
+    let (store, sim) = sim_store(ReelConfig {
+        index: IndexResidency::Paged,
+        ..config(1, SyncPolicy::Never)
+    });
+    let (first, second) = (vec![0xa5u8; 8 * 1024], vec![0x5au8; 8 * 1024]);
+    for byte in 0..200u8 {
+        store.put(&record(7, byte), &first).expect("put");
+    }
+    let cue = store.cue().expect("cue");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+    for byte in 0..10u8 {
+        store.put(&record(7, byte), &second).expect("rewrite");
+    }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("hand over");
+    let standing: Vec<RecordKey> = (10..200u8)
+        .map(|byte| record(7, byte))
+        .filter(|key| is_paged(&store, key))
+        .take(2)
+        .collect();
+    assert_eq!(standing.len(), 2, "two unchanged keys went to FastForward");
+    store.get_at(&standing[0], &cue).expect("warm");
+
+    let before = sim.ops();
+    let read = store.get_at(&standing[1], &cue).expect("cue read");
+    assert_eq!(sim.ops() - before, 1, "an unchanged key read more than once");
+    assert_eq!(read.as_deref(), Some(&first[..]));
+    for byte in 0..10u8 {
+        let read = store.get_at(&record(7, byte), &cue).expect("cue read");
+        assert_eq!(read.as_deref(), Some(&first[..]), "key {byte} answered past the cue");
+        let live = store.get(&record(7, byte)).expect("get");
+        assert_eq!(live.as_deref(), Some(&second[..]), "key {byte} lost its rewrite");
+    }
+}
+
 // a retire leaves FastForward's entries in segments an open rebuilt, which wear no incarnation yet
 #[test]
 fn fastforward_keeps_rebuilt_segments_through_a_retire() {

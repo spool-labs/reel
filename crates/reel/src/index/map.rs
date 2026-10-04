@@ -27,7 +27,6 @@ use crate::index::page::KeyPage;
 use crate::index::paged::{Candidates, FooterSource, SealedRanges};
 use crate::index::playback::{self, merged_page, Paged, PlaybackCursor, Way};
 use crate::index::recovery::SealedSpan;
-use crate::index::sealed_keys::SealedKeys;
 
 /// Slots in the lookup from a column identifier to its index
 const COLUMN_SLOTS: usize = 256;
@@ -220,7 +219,6 @@ pub struct ReelIndex {
     sealed: Vec<SealedRanges>,
 
     /// Every sealed key each column holds, as one filter ahead of the fan-out
-    sealed_keys: Vec<SealedKeys>,
 
     /// Each column's sealed keys as record locations, answering a get in one read
     fast: Vec<FastColumn>,
@@ -267,12 +265,10 @@ impl ReelIndex {
             indexes.push(ColumnIndex::new(spec, residency)?);
             sealed.push(SealedRanges::new());
         }
-        let sealed_keys = (0..columns.len()).map(|_| SealedKeys::new()).collect();
         Ok(ReelIndex {
             columns,
             indexes,
             sealed,
-            sealed_keys,
             fast: (0..columns.len()).map(|_| FastColumn::new()).collect(),
             fast_ready: AtomicBool::new(false),
             retired: AtomicU64::new(0),
@@ -335,6 +331,45 @@ impl ReelIndex {
         }
     }
 
+    /// Where a cue read can ask FastForward, and whether the map holds a version past the cue
+    ///
+    /// A map entry the cue can see answers through the checked path, as does a column
+    /// FastForward does not serve.
+    pub fn fast_route_at(&self, key: &RecordKey, snapshot: Lsn) -> Option<(usize, Since, bool)> {
+        let (Some(at), true) = (self.slot(key.column), self.fast_serves()) else {
+            return None;
+        };
+        let since = self.fast[at].since(key);
+        match self.indexes[at].entry_or_grave(key.as_slice()) {
+            Some(entry) if entry.lsn <= snapshot => None,
+            Some(_) => Some((at, since, true)),
+            None => Some((at, since, false)),
+        }
+    }
+
+    /// Apply a cue to a FastForward answer: the newest sealed version stands when the cue sees it
+    ///
+    /// A newer one, or a miss beside a map version past the cue, goes to the footers, which
+    /// keep every version an overwrite took out of FastForward.
+    pub fn fast_finish_at(
+        &self,
+        at: usize,
+        key: &RecordKey,
+        since: Since,
+        newer: bool,
+        snapshot: Lsn,
+        lookup: Lookup,
+    ) -> Lookup {
+        match lookup {
+            Lookup::Found(lsn, _) if lsn > snapshot => Lookup::Unsettled,
+            Lookup::Found(lsn, _) if self.indexes[at].is_covered_key_at(key.as_slice(), lsn, snapshot) => {
+                Lookup::Missing
+            }
+            Lookup::Missing if newer || self.fast[at].moved(since) => Lookup::Unsettled,
+            found => found,
+        }
+    }
+
     /// One column's FastForward table, for a lookup the caller drives itself
     pub fn fast_column(&self, at: usize) -> &FastColumn {
         &self.fast[at]
@@ -391,11 +426,6 @@ impl ReelIndex {
     /// Bytes FastForward's tables hold, every bucket counted whether filled or not
     pub fn fast_heap_bytes(&self) -> u64 {
         self.fast.iter().map(FastColumn::heap_bytes).sum()
-    }
-
-    /// Bytes the sealed-key filters hold
-    pub fn sealed_keys_bytes(&self) -> u64 {
-        self.sealed_keys.iter().map(SealedKeys::heap_bytes).sum()
     }
 
     /// Say every sealed key is in FastForward, so it may answer for them
@@ -558,11 +588,6 @@ impl ReelIndex {
         let Some(footers) = self.footers.get() else {
             return Ok(None);
         };
-        // Asked once ahead of the fan-out: a key no sealed segment holds skips
-        // the candidate walk and every per-segment filter behind it.
-        if !self.sealed_keys[at].may_hold(key.as_slice()) {
-            return Ok(None);
-        }
         let candidates = self.sealed[at].candidates(key.as_slice());
         // Ordered only where there is something to stop short of, so a column
         // written in key order pays nothing for a walk of one candidate.
@@ -815,20 +840,10 @@ impl ReelIndex {
             let Some((lowest, highest)) = partition.key_range() else {
                 continue;
             };
-            // Keys go in before the span is visible, so a search the span admits can
-            // never be ruled out by a filter that has not heard of this segment.
-            if let Some(at) = self.slot(partition.column) {
-                self.sealed_keys[at].insert_partition(partition);
-            }
             let (lowest, highest) = (KeyBytes::new(lowest)?, KeyBytes::new(highest)?);
             self.note_sealed(partition.column, segment, lowest, highest);
         }
         Ok(())
-    }
-
-    /// Sealed searches the key filters answered without asking any segment
-    pub fn sealed_skips(&self) -> u64 {
-        self.sealed_keys.iter().map(|keys| keys.skips()).sum()
     }
 
     /// The columns this index was built over
@@ -1604,11 +1619,7 @@ impl ReelIndex {
     ///
     /// The spans come off each sealed footer a paged rebuild swept, and a resident one
     /// brings none.
-    pub fn finish_rebuild(
-        &self,
-        sealed: Vec<SealedSpan>,
-        sealed_keys: HashMap<ColumnId, SealedKeys>,
-    ) {
+    pub fn finish_rebuild(&self, sealed: Vec<SealedSpan>) {
         for index in &self.indexes {
             index.fit();
         }
@@ -1616,13 +1627,6 @@ impl ReelIndex {
         // repoint paths ask the table before they count.
         self.segments
             .mark_born(sealed.iter().map(|span| span.segment));
-        // The key filters go in ahead of the spans they stand in front of, as they
-        // do at a seal.
-        for (column, keys) in sealed_keys {
-            if let Some(at) = self.slot(column) {
-                self.sealed_keys[at].adopt(&keys);
-            }
-        }
         // Spans are grouped per column and installed in one pass each, since a
         // paging volume brings one per sealed segment and reindexing per segment
         // would make the open quadratic in them.

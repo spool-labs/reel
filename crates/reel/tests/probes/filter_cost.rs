@@ -102,7 +102,6 @@ fn filled(filter_bits: u8) -> ReelStore {
 
 /// Probe for keys that were never written, and say what the segments were asked
 fn miss_counts(store: &ReelStore) -> ProbeCounts {
-    // As of a cue point, since FastForward answers a live get without asking a footer.
     let cue = store.cue().expect("cue");
     let before = store.filter_probes();
     for at in KEYS..KEYS + MISSES {
@@ -116,12 +115,12 @@ fn miss_counts(store: &ReelStore) -> ProbeCounts {
 
 /// Probe for keys that were written, and say what finding them cost
 fn hit_counts(store: &ReelStore, keys: u64) -> ProbeCounts {
-    // As of a cue point, since FastForward answers a live get without asking a footer.
+    // The index's own search as of a cue point, since FastForward answers a store read first.
     let cue = store.cue().expect("cue");
     let before = store.filter_probes();
     for at in 0..keys {
         assert!(
-            store.get_at(&key(at), &cue).expect("get").is_some(),
+            store.index().get_at(&key(at), cue.at()).expect("get").is_some(),
             "key {at} went missing"
         );
     }
@@ -130,18 +129,17 @@ fn hit_counts(store: &ReelStore, keys: u64) -> ProbeCounts {
 
 // a probe costs what its class deserves: a miss no segment, a hit one search
 //
-// The sealed-keys filter stands ahead of the fan-out, so a key nothing wrote is
-// answered before any segment is asked. What the per-segment bits still remove is the
+// FastForward stands ahead of the fan-out, so a key nothing wrote is answered before
+// any segment is asked. What the per-segment bits still remove is the
 // searches of keys that exist somewhere.
 pub fn filters_remove_the_searches() {
     let unfiltered = filled(0);
 
-    // Misses die at the sealed-keys filter, bits or none. The few that leak through are
-    // its false positives rather than a fan-out.
+    // Misses die at FastForward, bits or none.
     let bare_misses = miss_counts(&unfiltered);
     assert!(
         bare_misses.asked < MISSES,
-        "{} segment asks for {MISSES} misses reached past the sealed-keys filter",
+        "{} segment asks for {MISSES} misses reached past FastForward",
         bare_misses.asked,
     );
 

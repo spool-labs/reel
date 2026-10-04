@@ -560,6 +560,16 @@ impl ReelStore {
     /// at that number.
     pub fn read_as_of(&self, key: &RecordKey, at: Lsn) -> Result<Option<Value>> {
         self.check_column(key)?;
+        // FastForward holds a key's newest sealed version, which answers in one read
+        // when the cue can see it.
+        if let Some((column, since, newer)) = self.index.fast_route_at(key, at) {
+            let lookup = self.index.fast_column(column).read(key)?;
+            match self.index.fast_finish_at(column, key, since, newer, at, lookup) {
+                Lookup::Found(_, value) => return Ok(Some(value)),
+                Lookup::Missing => return Ok(None),
+                Lookup::Unsettled => {}
+            }
+        }
         let Some(entry) = self.index.get_at(key, at)? else {
             return Ok(None);
         };

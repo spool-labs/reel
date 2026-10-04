@@ -16,6 +16,5 @@ pub mod paged;
 pub mod persisted;
 pub mod playback;
 pub mod recovery;
-pub mod sealed_keys;
 pub mod tailer;
 pub mod tbtreemap;

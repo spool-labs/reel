@@ -31,7 +31,6 @@ use crate::index::counters::{Bookings, SegmentBytes, Tally};
 use crate::index::entry::{span_of, Entry};
 use crate::index::map::ReelIndex;
 use crate::index::persisted::{trusted, PersistedReader, PersistedSegment};
-use crate::index::sealed_keys::SealedKeys;
 use crate::io::op::FileId;
 use crate::io::ServingBackend;
 use crate::reel::segment::{IoDriver, SegmentReader};
@@ -1113,13 +1112,6 @@ fn sweep_footer(
             });
         }
 
-        // Fed before the span is installed, so a search the span admits is never ruled
-        // out by a filter that has not heard of the segment.
-        resolver
-            .sealed_keys
-            .entry(partition.column)
-            .or_default()
-            .insert_partition(partition);
         // The table hears the partition once, with its oldest record and its
         // tombstones' spans summed, since a call a row took its lock a row.
         let mut oldest = Lsn(u64::MAX);
@@ -1527,7 +1519,6 @@ struct Resolver<'a> {
     index: &'a ReelIndex,
     queue: KeyQueue,
     sealed: Vec<SealedSpan>,
-    sealed_keys: HashMap<ColumnId, SealedKeys>,
     highest: Lsn,
     pages: bool,
 }
@@ -1539,7 +1530,6 @@ impl<'a> Resolver<'a> {
             index,
             queue: KeyQueue::default(),
             sealed: Vec::new(),
-            sealed_keys: HashMap::new(),
             highest: Lsn::NONE,
             pages,
         }
@@ -1610,7 +1600,7 @@ impl<'a> Resolver<'a> {
             while self.index.sweep_covers(usize::MAX)? {}
             self.index.prune_tombstones(Lsn(u64::MAX));
         }
-        self.index.finish_rebuild(self.sealed, self.sealed_keys);
+        self.index.finish_rebuild(self.sealed);
         Ok(self.highest)
     }
 }

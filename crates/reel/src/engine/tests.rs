@@ -304,6 +304,44 @@ fn fastforward_answers_sealed_keys() {
     check(&reopened, &expected, "a reopen");
 }
 
+// a retire leaves FastForward's entries in segments an open rebuilt, which wear no incarnation yet
+#[test]
+fn fastforward_keeps_rebuilt_segments_through_a_retire() {
+    let paged = ReelConfig {
+        index: IndexResidency::Paged,
+        compact_mbps: CompactRate::Mbps(64),
+        ..config(1, SyncPolicy::Never)
+    };
+    let (store, sim) = sim_store(paged.clone());
+    let payload = vec![0xa5u8; 8 * 1024];
+    for byte in 0..200u8 {
+        store.put(&record(7, byte), &payload).expect("put");
+    }
+    // The first segment's keys are written again, so a pass can retire it whole.
+    for byte in 0..120u8 {
+        store.put(&record(7, byte), &payload).expect("overwrite");
+    }
+    store.close().expect("close");
+    drop(store);
+
+    let restored = SimIo::from_image(sim.durable_image());
+    let reopened = ReelStore::open_with_io(PathBuf::from(ROOT), paged, COLUMNS, Arc::new(restored))
+        .expect("reopen");
+    assert!(reopened.index.fast_held() > 0, "the open loaded FastForward");
+    for _ in 0..4 {
+        reopened.compact_once().expect("compact");
+        reopened.maintain_once().expect("maintain");
+    }
+    let compaction = reopened.compaction_counters();
+    assert!(
+        compaction.segments_rewritten + compaction.segments_unlinked_whole > 0,
+        "nothing retired, so the sweep never ran"
+    );
+    for byte in 0..200u8 {
+        assert!(reopened.get(&record(7, byte)).expect("get").is_some(), "key {byte} went missing");
+    }
+}
+
 // a FastForward column takes a range delete and a prefix count, and refuses an index checkpoint cleanly
 #[test]
 fn fastforward_takes_ranges_and_prefix_counts() {

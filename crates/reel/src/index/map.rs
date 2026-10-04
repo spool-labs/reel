@@ -4,7 +4,7 @@
 //! width and shard as far as its own write plane needs. The segments are shared,
 //! since one holds records from every column and the compactor asks about it whole.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -19,7 +19,7 @@ use crate::format::column::{
     Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, MapShape, RecordKey,
 };
 use crate::format::footer::SegmentFooter;
-use crate::format::loc::{Loc, SegmentId, SegmentIncarnation};
+use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::index::column::{ColumnIndex, KeyMove, Landed, PendingCover};
 use crate::index::counters::{Floors, SegmentBytes, SegmentStamp, SegmentTable};
@@ -336,8 +336,10 @@ impl ReelIndex {
     /// Take out up to `budget` older versions FastForward lookups read past, and book them
     pub fn scrub_fast(&self, budget: usize) -> usize {
         if self.retired.swap(0, Ordering::AcqRel) > 0 {
-            for fast in &self.fast {
-                fast.forget_retired(|segment| self.segments.incarnation_of(segment) != SegmentIncarnation::NONE);
+            // FastForward only points into sealed segments, and a retire forgets the span.
+            for (at, fast) in self.fast.iter().enumerate() {
+                let standing: HashSet<SegmentId> = self.sealed[at].segments().into_iter().collect();
+                fast.forget_retired(|segment| standing.contains(&segment));
             }
         }
         let mut settled = 0;

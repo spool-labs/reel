@@ -46,7 +46,7 @@ const TRAILER_PROBE_LEN: u64 = 4096;
 /// Threads a rebuild opens segment files on, however wide the machine is
 const MAX_READERS: usize = 8;
 
-/// Segment files each reader may read ahead of the join
+/// Segment files each reader may read ahead of the join on a resident rebuild
 const READ_AHEAD: usize = 4;
 
 /// Records one column batch takes into the index at a time
@@ -55,7 +55,7 @@ const BATCH: usize = 4096;
 /// Segments a resident rebuild holds before it feeds their rows in key order
 const FEED_WINDOW: usize = MAX_READERS * READ_AHEAD;
 
-/// Threads a paged open loads sealed footers into FastForward on, and footers queued for them
+/// Threads a paged open loads sealed footers into FastForward on
 const LOADERS: usize = 8;
 
 /// Rows a column's window must hold before its feed splits across threads
@@ -198,7 +198,9 @@ pub fn rebuild_from_persisted(
     let mut held: Vec<Held> = Vec::new();
     // A paged open hands each sealed footer to FastForward's loaders as it is swept, so
     // the loads run beside the reads.
-    let (queue, feed) = std::sync::mpsc::sync_channel::<(SegmentId, SegmentFooter)>(LOADERS);
+    // One footer waits for the loaders and each reader reads one ahead: the loaders are
+    // the slower side, so anything deeper only holds footers, 0.6 GiB of a 100M reopen.
+    let (queue, feed) = std::sync::mpsc::sync_channel::<(SegmentId, SegmentFooter)>(1);
     let feed = Mutex::new(feed);
     let loaders = match pages {
         true => LOADERS,
@@ -210,7 +212,11 @@ pub fn rebuild_from_persisted(
             .collect();
         let queue = pages.then_some(queue);
         let mut is_sized = false;
-        let read = read_segments(driver, &jobs, |at, parts| {
+        let ahead = match pages {
+            true => 1,
+            false => READ_AHEAD,
+        };
+        let read = read_segments(driver, &jobs, ahead, |at, parts| {
         let (segment, path, len) = &jobs[at];
         match absorb_segment(*segment, parts, pages, &mut resolver, &mut held)? {
             Loaded::Sealed(footer) => {
@@ -381,6 +387,7 @@ enum SegmentParts {
 fn read_segments(
     driver: &IoDriver,
     jobs: &[(SegmentId, PathBuf, u64)],
+    ahead: usize,
     mut join: impl FnMut(usize, SegmentParts) -> Result<()>,
 ) -> Result<()> {
     let readers = match reads_on_its_caller(driver) {
@@ -404,7 +411,7 @@ fn read_segments(
         stop: false,
     });
     let moved = Condvar::new();
-    let window = readers * READ_AHEAD;
+    let window = readers * ahead;
     let mut outcome = Ok(());
     std::thread::scope(|scope| {
         for _ in 0..readers {

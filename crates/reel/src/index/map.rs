@@ -447,15 +447,11 @@ impl ReelIndex {
         let Some(footers) = self.footers.get() else {
             return Ok(());
         };
+        // A key the map holds keeps any older sealed slot until an overwrite or a retire takes
+        // it, since reads ask the map first and order a later pair by ceiling.
         for (at, fast) in self.fast.iter().enumerate() {
             fast.settle_rows(self.columns[at].id, footers.as_ref())?;
             fast.finish_load();
-        }
-        for (at, index) in self.indexes.iter().enumerate() {
-            for (key, entry) in index.held() {
-                let key = RecordKey::new(self.columns[at].id, key);
-                self.fast[at].displace(&key, entry.lsn)?;
-            }
         }
         self.mark_fast_ready();
         Ok(())

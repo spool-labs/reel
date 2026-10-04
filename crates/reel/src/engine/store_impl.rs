@@ -15,6 +15,7 @@ use reel_core::{
 
 use crate::engine::{RecordWrite, ReelStore};
 use crate::format::column::{ColumnId, KeyRef, KeyWidth, RecordKey, MAX_KEY_LEN};
+use crate::index::column::{ColumnMark, Mark};
 use crate::index::entry::Entry;
 use crate::index::page::KeyPage;
 use crate::index::playback::{PlaybackCursor, Way};
@@ -233,25 +234,8 @@ impl Store for ReelStore {
     /// One page of a column, in no promised order, resumable by an opaque mark.
     fn sweep(&self, cf: &str, from: Option<&[u8]>, limit: usize) -> StoreResult<SweptPage> {
         let column = self.classify(cf)?;
-        let mut page = KeyPage::default();
-        let next = self.sweep_column(column, from, limit, &mut page);
-
-        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(page.len());
-        for at in 0..page.len() {
-            keys.push(page.key_at(at));
-        }
-        let borrowed: Vec<&[u8]> = keys.iter().map(|key| key.as_slice()).collect();
-        let values = Store::get_many(self, cf, &borrowed)?;
-
-        let mut rows = Vec::with_capacity(keys.len());
-        for (key, value) in keys.into_iter().zip(values) {
-            // A key the page named and the read no longer finds was retired
-            // between the two, which a sweep simply does not hand out.
-            if let Some(value) = value {
-                rows.push((key, value));
-            }
-        }
-        Ok((rows, next))
+        let (keys, next) = self.swept_keys(column, None, from, limit)?;
+        Ok((self.swept_rows(cf, keys)?, next))
     }
 
     /// One page under a prefix, in key order
@@ -263,23 +247,8 @@ impl Store for ReelStore {
         limit: usize,
     ) -> StoreResult<SweptPage> {
         let column = self.classify(cf)?;
-        let mut page = KeyPage::default();
-        let next = self.sweep_column_prefix(column, prefix, from, limit, &mut page);
-
-        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(page.len());
-        for at in 0..page.len() {
-            keys.push(page.key_at(at));
-        }
-        let borrowed: Vec<&[u8]> = keys.iter().map(|key| key.as_slice()).collect();
-        let values = Store::get_many(self, cf, &borrowed)?;
-
-        let mut rows = Vec::with_capacity(keys.len());
-        for (key, value) in keys.into_iter().zip(values) {
-            if let Some(value) = value {
-                rows.push((key, value));
-            }
-        }
-        Ok((rows, next))
+        let (keys, next) = self.swept_keys(column, Some(prefix), from, limit)?;
+        Ok((self.swept_rows(cf, keys)?, next))
     }
 
     fn count_prefix(&self, cf: &str, prefix: &[u8]) -> StoreResult<u64> {
@@ -323,14 +292,7 @@ impl Store for ReelStore {
         limit: usize,
     ) -> StoreResult<SweptKeys> {
         let column = self.classify(cf)?;
-        let mut page = KeyPage::default();
-        let next = self.sweep_column_prefix(column, prefix, from, limit, &mut page);
-
-        let mut keys = Vec::with_capacity(page.len());
-        for at in 0..page.len() {
-            keys.push(page.key_at(at));
-        }
-        Ok((keys, next))
+        self.swept_keys(column, Some(prefix), from, limit)
     }
 
     fn bytes_prefix(&self, cf: &str, prefix: &[u8]) -> StoreResult<Option<u64>> {
@@ -631,6 +593,77 @@ impl ReelStore {
         let take = bound.len().min(width);
         bytes[..take].copy_from_slice(&bound[..take]);
         bytes
+    }
+
+    /// One page of keys for a sweep, and the mark the next page resumes from
+    ///
+    /// A resident map holds every key and sweeps in its own order. A paged volume's map
+    /// holds only what no footer covers yet, so its sweep pages the column in key order,
+    /// which reads the sealed keys too, and marks with the last key it handed out.
+    fn swept_keys(
+        &self,
+        column: ColumnId,
+        prefix: Option<&[u8]>,
+        from: Option<&[u8]>,
+        limit: usize,
+    ) -> StoreResult<SweptKeys> {
+        let mut page = KeyPage::default();
+        if !self.config.index.pages() {
+            let next = match prefix {
+                Some(prefix) => self.sweep_column_prefix(column, prefix, from, limit, &mut page),
+                None => self.sweep_column(column, from, limit, &mut page),
+            };
+            return Ok(((0..page.len()).map(|at| page.key_at(at)).collect(), next));
+        }
+        if limit == 0 {
+            return Ok((Vec::new(), from.map(<[u8]>::to_vec)));
+        }
+        // A mark another opening minted starts the sweep over, which a promise of every key
+        // at least once allows.
+        let after = from
+            .and_then(ColumnMark::unpack)
+            .filter(|mark| mark.nonce == self.sweep_nonce)
+            .and_then(|mark| match mark.within {
+                Mark::Key(key) => Some(key),
+                Mark::Start => None,
+            });
+        let start = match (&after, prefix) {
+            (Some(after), _) => Bound::Excluded(after.as_ref()),
+            (None, Some(prefix)) => Bound::Included(prefix),
+            (None, None) => Bound::Unbounded,
+        };
+        self.index.page(column, start, limit, &mut page).map_err(StoreError::from)?;
+        let mut keys = Vec::with_capacity(page.len());
+        for at in 0..page.len() {
+            let key = page.key_at(at);
+            if prefix.is_some_and(|prefix| !key.starts_with(prefix)) {
+                return Ok((keys, None));
+            }
+            keys.push(key);
+        }
+        let next = match (keys.len() == limit, keys.last()) {
+            (true, Some(last)) => Some(
+                ColumnMark {
+                    nonce: self.sweep_nonce,
+                    shard: 0,
+                    within: Mark::Key(Box::from(last.as_slice())),
+                }
+                .pack(),
+            ),
+            _ => None,
+        };
+        Ok((keys, next))
+    }
+
+    /// A sweep's keys with their values, less any key retired since the page held it
+    fn swept_rows(&self, cf: &str, keys: Vec<Vec<u8>>) -> StoreResult<Vec<(Vec<u8>, Value)>> {
+        let borrowed: Vec<&[u8]> = keys.iter().map(|key| key.as_slice()).collect();
+        let values = Store::get_many(self, cf, &borrowed)?;
+        Ok(keys
+            .into_iter()
+            .zip(values)
+            .filter_map(|(key, value)| value.map(|value| (key, value)))
+            .collect())
     }
 
     /// Walk keys alone from a bound, values never read

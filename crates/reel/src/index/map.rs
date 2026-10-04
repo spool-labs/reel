@@ -238,9 +238,9 @@ impl ReelIndex {
                 )));
             }
             if spec.inline_max as usize > INLINE_MAX {
-                // A ceiling past the entry's array means the value rides in the
-                // carried map, which lives beside the resident entries and nowhere
-                // else, and a codec would make it disagree with the stored bytes.
+                // A ceiling past INLINE_MAX turns on the side map of kept values,
+                // which lives beside the resident entries and nowhere else, and a
+                // codec would make it disagree with the stored bytes.
                 if residency != IndexResidency::Resident {
                     return Err(ReelError::Config(format!(
                         "column {} carries values resident, which a paged index cannot hold",
@@ -827,10 +827,10 @@ impl ReelIndex {
             .map_or(0, |at| self.indexes[at].carry_max())
     }
 
-    /// The payload a write asks the index to carry, when the column carries at all
+    /// The payload a write asks the index to keep, when the column keeps values at all
     ///
-    /// Values that fit the entry's own array are served from there and values past
-    /// the ceiling read from the volume, so only the span between the two is taken.
+    /// Only values longer than INLINE_MAX and no longer than the ceiling are taken,
+    /// and every other value reads from the volume.
     pub fn carry_capture(&self, column: ColumnId, payload: &[u8]) -> Option<Arc<[u8]>> {
         let ceiling = self.carry_max(column) as usize;
         (payload.len() > INLINE_MAX && payload.len() <= ceiling).then(|| payload.into())

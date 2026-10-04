@@ -7,9 +7,6 @@ pub enum Error {
     #[error("Database error: {0}")]
     Database(String),
 
-    #[error("Key not found")]
-    NotFound,
-
     #[error("Column family not found: {0}")]
     ColumnFamilyNotFound(String),
 

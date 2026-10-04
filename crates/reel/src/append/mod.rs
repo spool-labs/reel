@@ -17,7 +17,7 @@ mod tests;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::config::{Preallocate, SyncPolicy, VolumeClass};
+use crate::config::{SyncPolicy, VolumeClass};
 use crate::error::{ReelError, Result};
 use crate::format::band::Band;
 use crate::format::column::RecordKey;
@@ -28,6 +28,7 @@ use crate::format::record::{align_up, BatchFrame, Flags, RecordHeader, BLOCK, HE
 use crate::format::segment_header::SegmentHeader;
 use crate::index::recovery::ResumableTail;
 use crate::io::op::{Op, OwnedBuf, SyncRangeMode, WriteBuf};
+use crate::io::ServingBackend;
 use crate::reel::segment::{IoDriver, SegmentHandle};
 use crate::reel::tail::Tail;
 use crate::reel::{ReelShared, SegmentHolds};
@@ -46,6 +47,15 @@ const ALIGN: u64 = BLOCK;
 
 /// Bytes a tail lets build behind the write head before it starts the device on them
 const WRITEBACK_CHUNK: u64 = 1024 * 1024;
+
+/// Bytes one write of the zero fill covers
+const FILL_SPAN: u64 = 1024 * 1024;
+
+/// Draw margins of zeros a tail keeps ahead of its write head
+///
+/// The margin is where the tail draws the segment it rolls to, so four of them puts
+/// the last fill well before the draw instead of beside it.
+const FILL_WINDOWS: u64 = 4;
 
 /// Highest byte offset a resident pointer can name within a segment
 const MAX_SEGMENT_OFFSET: u64 = u32::MAX as u64;
@@ -200,8 +210,11 @@ struct Active {
     /// Lowest reservation that ran past the segment, the offset a seal cuts at
     cut_at: AtomicU64,
 
-    /// End of the space reserved from the filesystem ahead of the write head
+    /// End of the zeros laid down ahead of the write head, which no claim passes
     alloc_high: AtomicU64,
+
+    /// Held by the claimer laying the next window down, so only one lays it
+    fill: Mutex<()>,
 
     /// Rows for the records written so far, which the seal packs into the footer
     entries: Mutex<SegmentFooter>,
@@ -222,11 +235,6 @@ impl Active {
         self.cut_at
             .load(Ordering::Acquire)
             .min(self.reserved.load(Ordering::Acquire))
-    }
-
-    /// Reserve the next span, handing back the base it starts at
-    fn claim(&self, span: u64) -> u64 {
-        self.reserved.fetch_add(span, Ordering::AcqRel)
     }
 
     /// Land one claim, however its write went
@@ -871,7 +879,7 @@ impl Appender {
                 self.roll_terminal()?;
                 continue;
             }
-            let base = active.claim(span);
+            let base = self.claim_filled(&active, span);
             if base + span + ALIGN <= target && base + span <= MAX_SEGMENT_OFFSET {
                 // The hold is taken with the tail still held shared, so the roll that
                 // seals this segment cannot come between the record landing and the
@@ -907,7 +915,6 @@ impl Appender {
                 // not the caller stays to publish it.
                 self.shared.note_landed(loc.segment, lsn);
                 self.tail.publish_committed(base + span);
-                self.step_reservation(&active, base + span);
                 self.paced_writeback(&active);
                 let is_owed = commit == Commit::PerRecord && self.owes_sync(&active);
                 let owed = is_owed.then(|| Owed {
@@ -992,7 +999,7 @@ impl Appender {
                 self.roll_terminal()?;
                 continue;
             }
-            let base = active.claim(span);
+            let base = self.claim_filled(&active, span);
             if base + span + ALIGN <= target && base + span <= MAX_SEGMENT_OFFSET {
                 let mut committed = Vec::with_capacity(count);
                 for header in &headers {
@@ -1033,7 +1040,6 @@ impl Appender {
                     self.shared.note_landed(active.handle.id(), first.lsn);
                 }
                 self.tail.publish_committed(base + span);
-                self.step_reservation(&active, base + span);
                 self.paced_writeback(&active);
                 let wants_spare = base + span + self.spare_margin() >= target;
                 drop(active);
@@ -1391,41 +1397,59 @@ impl Appender {
         seal_segment(&self.shared, active, end)
     }
 
-    /// Reserve the next chunk of space once the write head is closing on the last
+    /// Claim a range, laying the next window of zeros down first if the claim needs it
     ///
-    /// The step has to stay ahead of the writers, or records land in a hole and the
-    /// filesystem picks extents one write at a time. One writer takes the step, the rest
-    /// keep writing.
-    fn step_reservation(&self, active: &Active, head: u64) {
-        if !matches!(self.shared.config.preallocate, Preallocate::Chunk) {
-            return;
-        }
-        let chunk = self.shared.config.alloc_chunk.to_bytes();
+    /// The rule the fill rests on: no claim passes the filled edge. A fill therefore
+    /// starts above every offset any writer holds and cannot land on a record being
+    /// written. A claimer that would pass the edge lays the next window down itself and
+    /// publishes the edge only once the zeros are on the medium; the claimers behind it
+    /// wait for that edge rather than claiming past it. Past the end of the segment
+    /// there is nothing left to fill, so the claim goes through and its caller rolls.
+    fn claim_filled(&self, active: &Active, span: u64) -> u64 {
         let target = self.shared.config.segment_bytes.to_bytes();
-        let reserved = active.alloc_high.load(Ordering::Acquire);
-        if reserved >= target || head + chunk / 2 < reserved {
-            return;
-        }
-
-        let next = align_up((reserved + chunk).min(target), ALIGN);
-        // Only the writer that moves the mark reserves, so a burst of writers past it
-        // does not become a burst of identical reservation calls.
-        if active
-            .alloc_high
-            .compare_exchange(reserved, next, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        if let Err(error) =
-            self.shared
-                .driver
-                .allocate(active.handle.file(), reserved, next - reserved)
-        {
-            // The space is not reserved after all, so the mark goes back and the next
-            // writer tries again rather than writing into a hole it believes is claimed.
-            active.alloc_high.store(reserved, Ordering::Release);
-            tracing::warn!("failed to reserve the next chunk of a reel segment: {error}");
+        loop {
+            let reserved = active.reserved.load(Ordering::Acquire);
+            let filled = active.alloc_high.load(Ordering::Acquire);
+            if reserved + span > filled && filled < target {
+                let guard = lock(&active.fill);
+                // Whoever held the lock first may have laid down what this claim wants.
+                let filled = active.alloc_high.load(Ordering::Acquire);
+                if reserved + span > filled && filled < target {
+                    let want = self.fill_window().max(span);
+                    let next = align_up((filled + want).min(target), ALIGN);
+                    match self.settle_ahead(active, filled, next) {
+                        Ok(()) => active.alloc_high.fetch_max(next, Ordering::AcqRel),
+                        // A volume with no room for a window still has room for this
+                        // record. The edge moves to the end of this claim and no
+                        // further, so the claim covers every byte the window did not
+                        // reach and a later fill still starts above every claim. What
+                        // it costs is the allocation the window would have taken off
+                        // the commit.
+                        Err(error) => {
+                            tracing::warn!(
+                                "failed to zero the window ahead of a reel segment: {error}"
+                            );
+                            active
+                                .alloc_high
+                                .fetch_max(reserved + span, Ordering::AcqRel)
+                        }
+                    };
+                }
+                drop(guard);
+                continue;
+            }
+            if active
+                .reserved
+                .compare_exchange(
+                    reserved,
+                    reserved + span,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return reserved;
+            }
         }
     }
 
@@ -1479,15 +1503,18 @@ impl Appender {
             settled: AtomicU64::new(resumed.end),
             cut_at: AtomicU64::new(NO_CUT),
             alloc_high: AtomicU64::new(resumed.end),
+            fill: Mutex::new(()),
             entries: Mutex::new(entries),
             sync: Arc::new(SyncState::new()),
             terminal: AtomicBool::new(false),
             holds,
         };
-        let reserve = self.preallocate(&active)?;
+        // What the file already holds is already zeroed behind and ahead of the walked
+        // end, so the window is where it ends and the next write extends it.
+        let filled = self.shared.driver.length(active.handle.file())?;
         active
             .alloc_high
-            .store(reserve.max(resumed.end), Ordering::Release);
+            .store(filled.max(resumed.end), Ordering::Release);
         self.shared.driver.sync_full(active.handle.file())?;
         active.sync.synced_at.store(resumed.end, Ordering::Release);
         Ok(active)
@@ -1600,6 +1627,7 @@ impl Appender {
             settled: AtomicU64::new(0),
             cut_at: AtomicU64::new(NO_CUT),
             alloc_high: AtomicU64::new(0),
+            fill: Mutex::new(()),
             entries: Mutex::new(SegmentFooter::empty()),
             sync: Arc::new(SyncState::new()),
             terminal: AtomicBool::new(false),
@@ -1607,7 +1635,7 @@ impl Appender {
         };
         active
             .alloc_high
-            .store(self.preallocate(&active)?, Ordering::Release);
+            .store(self.open_window(&active, 0)?, Ordering::Release);
 
         // Stamped at the draw, since a band is what the segment is for and compaction
         // reads it off the file to place the survivors it copies out.
@@ -1621,17 +1649,66 @@ impl Appender {
         Ok(active)
     }
 
-    fn preallocate(&self, active: &Active) -> Result<u64> {
+    /// Lay the next window down the way this volume's own writing says to
+    ///
+    /// Zeroing pays when a flush lands more often than once a window, since the commit
+    /// it saves the allocation on is the one about to flush. A volume that writes a
+    /// whole window between flushes is bandwidth bound instead: doubling the bytes it
+    /// puts down costs it more than the allocation ever did, so that window is only
+    /// reserved. The volume moves between the two as its own pattern moves, with no
+    /// setting to get wrong.
+    fn settle_ahead(&self, active: &Active, from: u64, to: u64) -> Result<()> {
+        let since = from.saturating_sub(active.sync.synced_at.load(Ordering::Acquire));
+        let between = since.max(active.sync.last_span.load(Ordering::Acquire));
+        if between >= to - from {
+            return self
+                .shared
+                .driver
+                .allocate(active.handle.file(), from, to - from);
+        }
+        self.fill_ahead(active, from, to)
+    }
+
+    /// Zero the window a tail writes into next, so its records overwrite blocks
+    ///
+    /// A file that grows write by write makes every durable commit pay for block
+    /// allocation. Measured on ext4 over NVMe, a durable commit takes 47 us while the
+    /// file is growing and 16 us once the blocks under it have been written; fallocate
+    /// on its own does not close that, because the first write still has to convert
+    /// the unwritten extent. The sync is what settles those extents, so it belongs
+    /// here rather than on the commit that would otherwise pay for them. The sim
+    /// backend keeps its files in memory and has no extents to settle, so there this
+    /// just reserves.
+    fn fill_ahead(&self, active: &Active, from: u64, to: u64) -> Result<()> {
+        let file = active.handle.file();
+        if matches!(self.shared.driver.serving(), ServingBackend::Sim) {
+            return self.shared.driver.allocate(file, from, to - from);
+        }
+        let zeros: Arc<[u8]> = vec![0u8; FILL_SPAN.min(to - from) as usize].into();
+        let mut at = from;
+        while at < to {
+            let span = (zeros.len() as u64).min(to - at);
+            let buf = match span == zeros.len() as u64 {
+                true => WriteBuf::Shared(Arc::clone(&zeros)),
+                false => WriteBuf::zeros(span as usize),
+            };
+            self.shared.driver.writev_all(file, at, vec![buf])?;
+            at += span;
+        }
+        self.shared.driver.sync_full(file)
+    }
+
+    /// How far ahead of the write head the zeroed window reaches
+    fn fill_window(&self) -> u64 {
+        self.spare_margin() * FILL_WINDOWS
+    }
+
+    /// Lay down the window a fresh tail writes into, and say where it ends
+    fn open_window(&self, active: &Active, from: u64) -> Result<u64> {
         let target = self.shared.config.segment_bytes.to_bytes();
-        let reserve = match self.shared.config.preallocate {
-            Preallocate::Full => target,
-            Preallocate::Chunk => self.shared.config.alloc_chunk.to_bytes().min(target),
-        };
-        let reserve = align_up(reserve, ALIGN).min(align_up(target, ALIGN));
-        self.shared
-            .driver
-            .allocate(active.handle.file(), 0, reserve)?;
-        Ok(reserve)
+        let to = align_up((from + self.fill_window()).min(target), ALIGN);
+        self.fill_ahead(active, from, to)?;
+        Ok(to)
     }
 }
 
@@ -1752,6 +1829,7 @@ fn placeholder_active(driver: Arc<IoDriver>) -> Active {
         settled: AtomicU64::new(0),
         cut_at: AtomicU64::new(NO_CUT),
         alloc_high: AtomicU64::new(0),
+        fill: Mutex::new(()),
         entries: Mutex::new(SegmentFooter::empty()),
         sync: Arc::new(SyncState::new()),
         terminal: AtomicBool::new(false),

@@ -58,8 +58,9 @@ seal runs off the append path on a per-tail sealer thread.
 ## The read path
 
 The index is asked first. A resident column answers from its map: an entry
-holds the location, the sequence number, and up to four inline value bytes for
-a column that declared them, so a small value never reaches the device at all.
+holds the location and the sequence number. A column that declared an
+`inline_max` above four bytes also keeps values from five bytes up to that
+ceiling in a side map beside its entries, and those never reach the device.
 Everything else is one device op placed by the entry.
 
 A paged or hot column answers its unsealed keys the same way and sends the rest

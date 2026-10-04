@@ -47,6 +47,14 @@ impl KeyPage {
         self.count = 0;
     }
 
+    /// Room for this many more keys at a width, so a fill never regrows its buffers
+    pub fn reserve(&mut self, count: usize, width: usize) {
+        self.keys.reserve(count * width);
+        if self.keeps_found {
+            self.found.reserve(count);
+        }
+    }
+
     /// Add one key and the payload length its record holds
     ///
     /// The page takes its stride from whichever key is added first.

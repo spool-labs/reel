@@ -46,11 +46,11 @@ use crate::reel::bands::BandPool;
 use crate::reel::segment::{DirectOpen, FdCache, IoDriver, SegmentHandle, SplitRead};
 use crate::sync::{lock, read, write};
 
-use reel_core::Value;
+use reel_core::{ReadBlock, Value};
 
 use read::{
-    check_in_block, deep_range, frame_to_range, frame_to_read, framed_or_nothing, merge_runs_into,
-    merge_span, near_range, window_or_nothing, window_start, Planned, Run, MERGE_GAP,
+    deep_range, frame_to_range, frame_to_read, framed_or_nothing, merge_runs_into,
+    merge_span, near_range, place_runs, window_or_nothing, window_start, Planned, Run, MERGE_GAP,
 };
 
 /// The first segment number a fresh reel numbers from
@@ -870,6 +870,23 @@ pub enum RecordRead {
 ///
 /// The key is named by position rather than carried, so the list of asks holds no
 /// borrow and a thread can keep it between submissions.
+/// Where a placed read left one record: a window of one of its blocks
+///
+/// A codec other than zero says the window holds the record's stored bytes, which
+/// decode to the payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spot {
+    pub block: u32,
+    pub at: u32,
+    pub len: u32,
+    pub codec: u8,
+}
+
+impl Spot {
+    /// A record the read did not find where its ask said
+    pub const MISS: Spot = Spot { block: u32::MAX, at: 0, len: 0, codec: 0 };
+}
+
 #[derive(Clone, Copy)]
 pub struct Ask {
     /// Where the index says the record sits
@@ -890,11 +907,14 @@ pub struct Ask {
 /// handles open and a filled read holds pooled payload buffers.
 #[derive(Default)]
 struct ReadScratch {
-    /// Asks sorted into volume order, so neighbours are neighbours before merging
-    order: Vec<usize>,
+    /// Each ask's place on the volume beside its position, sorted into volume order
+    order: Vec<(u64, u32)>,
 
     /// Every ask resolved to a place on the volume
     plan: Vec<Planned>,
+
+    /// One handle per segment the plan reads, so none is unlinked under a read in flight
+    handles: Vec<SegmentHandle>,
 
     /// The reads the plan was grouped into
     runs: Vec<Run>,
@@ -907,15 +927,6 @@ struct ReadScratch {
 
     /// What each run's read filled
     filled: Vec<SplitRead>,
-
-    /// Windows a merged read is cut into, one per record in the run
-    cuts: Vec<(usize, usize)>,
-
-    /// Why each record of a merged read was rejected, or the codec it carries
-    verdicts: Vec<std::result::Result<u8, RecordRead>>,
-
-    /// The windows themselves, handed out to the answers
-    windows: Vec<Option<Value>>,
 }
 
 impl ReadScratch {
@@ -923,13 +934,11 @@ impl ReadScratch {
         ReadScratch {
             order: Vec::new(),
             plan: Vec::new(),
+            handles: Vec::new(),
             runs: Vec::new(),
             ops: Vec::new(),
             completions: Vec::new(),
             filled: Vec::new(),
-            cuts: Vec::new(),
-            verdicts: Vec::new(),
-            windows: Vec::new(),
         }
     }
 
@@ -937,13 +946,11 @@ impl ReadScratch {
     fn release(&mut self) {
         self.order.clear();
         self.plan.clear();
+        self.handles.clear();
         self.runs.clear();
         self.ops.clear();
         self.completions.clear();
         self.filled.clear();
-        self.cuts.clear();
-        self.verdicts.clear();
-        self.windows.clear();
     }
 }
 
@@ -1505,258 +1512,128 @@ impl Reel {
         Some((head, Value::pooled(body, crate::reel::payload::give)))
     }
 
-    /// Read several records with one submission, answered in the order asked
+    /// Read several records with one submission, each left in place in its run's block
     ///
-    /// One answer per ask, in the order asked, into a vector the caller keeps. A
-    /// record whose segment is gone is reported in its own slot. Records written in
-    /// one batch are one contiguous byte range, so they are read together and cut
-    /// back out of the block. Every list the submission works through between here
-    /// and the device belongs to this thread, so its price does not follow the width.
-    pub fn read_records(
+    /// One spot per key, in the caller's order, into vectors the caller keeps. Records
+    /// written in one batch are one contiguous byte range, so neighbours are read
+    /// together and every record is framed inside its run's block. A walk lends
+    /// straight from the blocks, and a caller keeping a record takes a window of one.
+    /// A spot of `Spot::MISS` is a record the caller resolves again: its segment is
+    /// gone, the pointer is stale, or the bytes failed their checks.
+    pub fn read_placed(
         &self,
         asks: &[Ask],
         keys: &[KeyRef<'_>],
         is_verified: bool,
-        answers: &mut Vec<RecordRead>,
+        blocks: &mut Vec<ReadBlock>,
+        spots: &mut Vec<Spot>,
     ) -> Result<()> {
-        stale_slots(asks.len(), answers);
         let mut held = HeldScratch::take();
         let scratch = &mut held.0;
-        self.plan_reads(asks, keys, scratch, answers)?;
-        if scratch.plan.is_empty() {
-            return Ok(());
+        if self.plan_reads(asks, keys, scratch, blocks, spots)? {
+            self.shared.driver.run_split_reads_into(
+                &mut scratch.ops,
+                &mut scratch.completions,
+                &mut scratch.filled,
+            )?;
+            place_runs(scratch, asks, keys, is_verified, blocks, spots)?;
         }
-
-        merge_runs_into(
-            &scratch.plan,
-            merge_span(self.shared.driver.serving()),
-            &mut scratch.runs,
-        );
-        self.read_ops(scratch);
-        self.shared.driver.run_split_reads_into(
-            &mut scratch.ops,
-            &mut scratch.completions,
-            &mut scratch.filled,
-        )?;
-        self.frame_runs(scratch, asks, keys, is_verified, answers)
+        Ok(())
     }
 
-    /// Read several records as one future, answered in the order asked
-    pub async fn read_records_wait(
+    /// Read several records as one future, each left in place in its run's block
+    pub async fn read_placed_wait(
         &self,
         asks: &[Ask],
         keys: &[KeyRef<'_>],
         is_verified: bool,
-        answers: &mut Vec<RecordRead>,
+        blocks: &mut Vec<ReadBlock>,
+        spots: &mut Vec<Spot>,
     ) -> Result<()> {
-        stale_slots(asks.len(), answers);
         let mut held = HeldScratch::take();
         let scratch = &mut held.0;
-        self.plan_reads(asks, keys, scratch, answers)?;
-        if scratch.plan.is_empty() {
-            return Ok(());
+        if self.plan_reads(asks, keys, scratch, blocks, spots)? {
+            self.shared
+                .driver
+                .wait_split_reads_into(&mut scratch.ops, &mut scratch.filled)
+                .await?;
+            place_runs(scratch, asks, keys, is_verified, blocks, spots)?;
         }
-
-        merge_runs_into(
-            &scratch.plan,
-            merge_span(self.shared.driver.serving()),
-            &mut scratch.runs,
-        );
-        self.read_ops(scratch);
-        self.shared
-            .driver
-            .wait_split_reads_into(&mut scratch.ops, &mut scratch.filled)
-            .await?;
-        self.frame_runs(scratch, asks, keys, is_verified, answers)
+        Ok(())
     }
 
-    /// Resolve every ask to a place on the volume, before anything is submitted
+    /// Resolve every ask to a place on the volume and build one read per run
     ///
     /// Key order is not offset order, so the asks are sorted by place first: runs
-    /// only form once neighbours are neighbours. Every answer lands by its own slot,
-    /// so the caller's order is untouched.
+    /// only form once neighbours are neighbours. An ask whose segment is gone stays
+    /// a miss. False when nothing is left to read.
     fn plan_reads(
         &self,
         asks: &[Ask],
         keys: &[KeyRef<'_>],
         scratch: &mut ReadScratch,
-        answers: &mut [RecordRead],
-    ) -> Result<()> {
+        blocks: &mut Vec<ReadBlock>,
+        spots: &mut Vec<Spot>,
+    ) -> Result<bool> {
+        blocks.clear();
+        spots.clear();
+        spots.resize(keys.len(), Spot::MISS);
         scratch.order.clear();
-        scratch.order.extend(0..asks.len());
-        scratch
-            .order
-            .sort_unstable_by_key(|&at| (asks[at].loc.segment, asks[at].loc.offset));
+        scratch.order.extend(asks.iter().enumerate().map(|(at, ask)| {
+            let place = (u64::from(ask.loc.segment.0) << 32) | u64::from(ask.loc.offset);
+            (place, at as u32)
+        }));
+        scratch.order.sort_unstable_by_key(|&(place, _)| place);
 
         scratch.plan.clear();
+        scratch.handles.clear();
         scratch.plan.reserve(asks.len());
         for slot in 0..scratch.order.len() {
-            let at = scratch.order[slot];
+            let at = scratch.order[slot].1 as usize;
             let ask = &asks[at];
-            let handle = match self.handle_for(ask.loc.segment)? {
-                Some(handle) => handle,
-                None => {
-                    answers[at] = RecordRead::Gone;
-                    continue;
-                }
+            // Sorted by segment, so a segment's handle is taken once, at its first record.
+            let file = match scratch.plan.last() {
+                Some(last) if last.segment == ask.loc.segment => last.file,
+                _ => match self.handle_for(ask.loc.segment)? {
+                    Some(handle) => {
+                        let file = handle.file();
+                        scratch.handles.push(handle);
+                        file
+                    }
+                    None => continue,
+                },
             };
             scratch.plan.push(Planned {
                 at,
                 segment: ask.loc.segment,
-                // Kept until the batch has been collected, so a segment cannot be
-                // unlinked out from under a read in flight.
-                handle,
+                file,
                 offset: u64::from(ask.loc.offset),
                 prefix: HEADER_LEN + keys[ask.at as usize].width(),
                 len: ask.loc.len as usize,
             });
         }
-        Ok(())
-    }
+        if scratch.plan.is_empty() {
+            return Ok(false);
+        }
 
-    /// One split read per run, each taking its buffers uninitialised from the pool
-    fn read_ops(&self, scratch: &mut ReadScratch) {
+        merge_runs_into(
+            &scratch.plan,
+            merge_span(self.shared.driver.serving()),
+            &mut scratch.runs,
+        );
+        // Every record's header sits inside its run's span, so each run is one read
+        // of the whole span, with no header of its own.
         scratch.ops.clear();
         scratch.ops.reserve(scratch.runs.len());
-        for at in 0..scratch.runs.len() {
-            let run = scratch.runs[at];
-            let held = &scratch.plan[run.start];
-            let op = match run.is_single() {
-                true => self.shared.driver.split_read(
-                    held.handle.file(),
-                    held.offset,
-                    held.prefix,
-                    held.len,
-                ),
-                // A merged read has no header of its own: every record's header sits
-                // inside the block, so the whole span is the body.
-                false => self.shared.driver.split_read(
-                    held.handle.file(),
-                    held.offset,
-                    0,
-                    run.span as usize,
-                ),
-            };
+        for run in &scratch.runs {
+            let first = &scratch.plan[run.start];
+            let op = self
+                .shared
+                .driver
+                .split_read(first.file, first.offset, 0, run.span as usize);
             scratch.ops.push(op);
         }
-    }
-
-    /// Turn what the runs filled into one answer per record asked for
-    fn frame_runs(
-        &self,
-        scratch: &mut ReadScratch,
-        asks: &[Ask],
-        keys: &[KeyRef<'_>],
-        is_verified: bool,
-        answers: &mut [RecordRead],
-    ) -> Result<()> {
-        for at in 0..scratch.runs.len().min(scratch.filled.len()) {
-            let run = scratch.runs[at];
-            // Moved out of the list rather than borrowed, so the cut below is free
-            // to take the rest of the lists with it. An empty pair costs nothing to
-            // leave in its place.
-            let framed = std::mem::replace(&mut scratch.filled[at], Ok((Vec::new(), Vec::new())));
-            let block = match framed {
-                Ok(block) => block,
-                Err(error) if is_missing(&error) => continue,
-                Err(error) => return Err(error),
-            };
-            match run.is_single() {
-                true => {
-                    let held = &scratch.plan[run.start];
-                    let (head, body) = block;
-                    let ask = &asks[held.at];
-                    let key = keys[ask.at as usize];
-                    answers[held.at] = match head.len() == held.prefix && body.len() == held.len {
-                        true => frame_to_read(head, body, key, ask.lsn, ask.loc, is_verified),
-                        false => {
-                            recycle_header(head);
-                            RecordRead::Stale
-                        }
-                    };
-                }
-                false => {
-                    let (head, body) = block;
-                    recycle_header(head);
-                    self.cut_run(
-                        run.start,
-                        run.end,
-                        body,
-                        scratch,
-                        asks,
-                        keys,
-                        is_verified,
-                        answers,
-                    );
-                }
-            }
-        }
-        scratch.filled.clear();
-        Ok(())
-    }
-
-    /// Frame every record inside one merged read and hand each its own window
-    ///
-    /// The block goes back to the pool once the last window taken from it drops, so
-    /// a caller keeping one record of a run keeps the run's buffer with it.
-    #[allow(clippy::too_many_arguments)]
-    fn cut_run(
-        &self,
-        start: usize,
-        end: usize,
-        block: Vec<u8>,
-        scratch: &mut ReadScratch,
-        asks: &[Ask],
-        keys: &[KeyRef<'_>],
-        is_verified: bool,
-        answers: &mut [RecordRead],
-    ) {
-        let base = scratch.plan[start].offset;
-        scratch.cuts.clear();
-        scratch.verdicts.clear();
-
-        for slot in start..end {
-            let held = &scratch.plan[slot];
-            let at = (held.offset - base) as usize;
-            let ask = &asks[held.at];
-            let cut = (at + held.prefix, held.len);
-            let verdict = check_in_block(
-                &block,
-                at,
-                held,
-                keys[ask.at as usize],
-                ask.lsn,
-                ask.loc,
-                is_verified,
-            );
-            scratch.cuts.push(cut);
-            scratch.verdicts.push(verdict);
-        }
-
-        Value::windows_into(
-            block,
-            crate::reel::payload::give,
-            &scratch.cuts,
-            &mut scratch.windows,
-        );
-        for slot in 0..end - start {
-            let placed = scratch.plan[start + slot].at;
-            let verdict = std::mem::replace(&mut scratch.verdicts[slot], Ok(0));
-            answers[placed] = match (verdict, scratch.windows[slot].take()) {
-                (Err(rejected), _) => rejected,
-                (Ok(0), Some(window)) => RecordRead::Found(window),
-                // A coded record decodes straight out of the shared block into its
-                // own pooled buffer, so the batch's single read is still the only
-                // pass over the stored bytes.
-                (Ok(codec), Some(window)) => match crate::append::codec::decode(codec, &window) {
-                    Some(decoded) => {
-                        RecordRead::Found(Value::pooled(decoded, crate::reel::payload::give))
-                    }
-                    None => RecordRead::Corrupt,
-                },
-                (Ok(_), None) => RecordRead::Stale,
-            };
-        }
+        Ok(true)
     }
 
     /// Resolve a segment number to a handle, opening and caching it on a miss
@@ -1831,18 +1708,6 @@ impl Reel {
 thread_local! {
     /// One header buffer per reading thread, handed back after every framed read
     static HEADER_SPARE: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
-}
-
-/// Leave one answer slot per ask, each reading as a record that has moved
-///
-/// Every slot the reads land in is written over, so what stays is what nothing
-/// answered, which is a pointer the caller has to resolve again.
-fn stale_slots(wanted: usize, answers: &mut Vec<RecordRead>) {
-    answers.clear();
-    answers.reserve(wanted);
-    for _ in 0..wanted {
-        answers.push(RecordRead::Stale);
-    }
 }
 
 /// This thread's header buffer, or a fresh one when it has none to lend

@@ -5,13 +5,14 @@ use crate::error::{ReelError, Result};
 use crate::format::column::KeyRef;
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
-use crate::format::record::{RecordHeader, HEADER_LEN};
+use crate::format::record::{data_codec, RecordHeader, HEADER_LEN};
 use crate::io::direct::{DIRECT_ALIGN, DIRECT_REQUEST_BYTES};
+use crate::io::op::FileId;
 use crate::io::ServingBackend;
-use crate::reel::segment::{SegmentHandle, SplitAnswer, SplitRead};
+use crate::reel::segment::{SplitAnswer, SplitRead};
 
-use super::{is_missing, recycle_header, RecordRead};
-use reel_core::Value;
+use super::{is_missing, recycle_header, Ask, ReadScratch, RecordRead, Spot};
+use reel_core::{ReadBlock, Value};
 
 /// A whole framed record, or nothing when the segment no longer holds one there
 ///
@@ -62,22 +63,9 @@ pub(super) fn window_or_nothing(read: Result<Vec<u8>>, len: usize) -> Result<Opt
     }
 }
 
-/// Whether an on-disk record is the one an index pointer claimed to name
-///
-/// The sequence number is part of the comparison because the other fields are equal
-/// across two versions of the same key at the same length. Compaction copies a
-/// record under the sequence number it copied, so this holds across a relocation.
-pub(super) fn header_matches(
-    header: &RecordHeader,
-    expected: KeyRef<'_>,
-    lsn: Lsn,
-    loc: Loc,
-) -> bool {
-    header.flags.is_data()
-        && header.key.column == expected.column
-        && header.key.as_slice() == expected.bytes
-        && header.lsn == lsn
-        && header.length == loc.len
+/// Whether a record's header and key hash to the checksum it was written with
+fn is_intact(prefix: &[u8], payload: &[u8]) -> bool {
+    RecordHeader::unpack(prefix).is_ok_and(|header| header.verify(payload))
 }
 
 /// Bytes of gap a merged read spans rather than breaking the run
@@ -110,7 +98,7 @@ pub(super) fn merge_span(serving: ServingBackend) -> u64 {
 pub(super) struct Planned {
     pub(super) at: usize,
     pub(super) segment: SegmentId,
-    pub(super) handle: SegmentHandle,
+    pub(super) file: FileId,
     pub(super) offset: u64,
     pub(super) prefix: usize,
     pub(super) len: usize,
@@ -129,13 +117,6 @@ pub(super) struct Run {
     pub(super) start: usize,
     pub(super) end: usize,
     pub(super) span: u64,
-}
-
-impl Run {
-    /// Whether this run is one record, which is read framed rather than cut
-    pub(super) fn is_single(&self) -> bool {
-        self.end - self.start == 1
-    }
 }
 
 /// Group records that sit next to each other into the reads that will serve them
@@ -188,17 +169,55 @@ pub(super) fn check_in_block(
     if body_end > block.len() {
         return Err(RecordRead::Stale);
     }
-    let header = match RecordHeader::unpack(&block[at..body_at]) {
-        Ok(header) => header,
-        Err(_) => return Err(RecordRead::Stale),
-    };
-    if !header_matches(&header, expected, lsn, loc) {
+    let prefix = &block[at..body_at];
+    let Some(codec) = data_codec(prefix, expected, lsn, loc.len) else {
         return Err(RecordRead::Stale);
-    }
-    if is_verified && !header.verify(&block[body_at..body_end]) {
+    };
+    if is_verified && !is_intact(prefix, &block[body_at..body_end]) {
         return Err(RecordRead::Corrupt);
     }
-    Ok(header.codec)
+    Ok(codec)
+}
+
+/// Frame every record each run read, leaving its spot in the run's block
+///
+/// A run that came back short, or a segment gone under it, leaves its records as
+/// misses for the caller to resolve again.
+pub(super) fn place_runs(
+    scratch: &mut ReadScratch,
+    asks: &[Ask],
+    keys: &[KeyRef<'_>],
+    is_verified: bool,
+    blocks: &mut Vec<ReadBlock>,
+    spots: &mut [Spot],
+) -> Result<()> {
+    for (run, filled) in scratch.runs.iter().zip(scratch.filled.drain(..)) {
+        let block = match filled {
+            Ok((head, body)) => {
+                recycle_header(head);
+                body
+            }
+            Err(error) if is_missing(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        let base = scratch.plan[run.start].offset;
+        let index = blocks.len() as u32;
+        for held in &scratch.plan[run.start..run.end] {
+            let at = (held.offset - base) as usize;
+            let ask = &asks[held.at];
+            let key = keys[ask.at as usize];
+            if let Ok(codec) = check_in_block(&block, at, held, key, ask.lsn, ask.loc, is_verified) {
+                spots[ask.at as usize] = Spot {
+                    block: index,
+                    at: (at + held.prefix) as u32,
+                    len: held.len as u32,
+                    codec,
+                };
+            }
+        }
+        blocks.push(ReadBlock::new(block, crate::reel::payload::give));
+    }
+    Ok(())
 }
 
 /// Decide what a framed record read means, once the bytes are in hand
@@ -213,22 +232,19 @@ pub(super) fn frame_to_read(
     // Wrapped before anything can return, so a record the checks reject still
     // hands its buffer back to the pool rather than to the allocator.
     let body = Value::pooled(body, crate::reel::payload::give);
-    let unpacked = RecordHeader::unpack(&head);
+    let codec = data_codec(&head, expected, lsn, loc.len);
+    let is_corrupt = codec.is_some() && is_verified && !is_intact(&head, &body);
     recycle_header(head);
-    let header = match unpacked {
-        Ok(header) => header,
-        Err(_) => return RecordRead::Stale,
-    };
-    if !header_matches(&header, expected, lsn, loc) {
+    let Some(codec) = codec else {
         return RecordRead::Stale;
-    }
-    if is_verified && !header.verify(&body) {
+    };
+    if is_corrupt {
         return RecordRead::Corrupt;
     }
-    if header.codec != 0 {
+    if codec != 0 {
         // A decode that fails is corruption wearing a valid checksum, answered
         // exactly as a failed checksum is.
-        return match crate::append::codec::decode(header.codec, &body) {
+        return match crate::append::codec::decode(codec, &body) {
             Some(decoded) => RecordRead::Found(Value::pooled(decoded, crate::reel::payload::give)),
             None => RecordRead::Corrupt,
         };
@@ -340,17 +356,13 @@ pub(super) fn frame_to_range(
     lsn: Lsn,
     loc: Loc,
 ) -> Result<RecordRead> {
-    let header = match RecordHeader::unpack(head) {
-        Ok(header) => header,
-        Err(_) => return Ok(RecordRead::Stale),
-    };
-    if !header_matches(&header, expected, lsn, loc) {
+    let Some(codec) = data_codec(head, expected, lsn, loc.len) else {
         return Ok(RecordRead::Stale);
-    }
+    };
     // The offsets the caller asked at address the payload this record decodes to,
     // and none of that payload is on the volume, so the window is left to a whole
     // read that decodes and cuts.
-    if header.codec != 0 {
+    if codec != 0 {
         return Ok(RecordRead::Coded);
     }
     Ok(RecordRead::Found(body))

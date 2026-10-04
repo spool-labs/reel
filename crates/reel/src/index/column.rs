@@ -2109,9 +2109,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             Bound::Unbounded => self.shards.len() - 1,
             Bound::Included(key) | Bound::Excluded(key) => self.shard_of_bytes(key),
         };
-        let mut shards = self.occupied_range(0, last);
-        shards.reverse();
-        for at in shards {
+        for at in self.occupied_back(last) {
             let bound = match at == last {
                 true => high_bound::<K>(end),
                 false => Bound::Unbounded,
@@ -2175,15 +2173,31 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         }
     }
 
-    /// Occupied shards within an inclusive shard range, in key order
-    fn occupied_range(&self, first: usize, last: usize) -> Vec<usize> {
-        read(&self.occupied)
-            .range(
-                Bound::Included(&(first as u64)),
-                Bound::Included(&(last as u64)),
-            )
-            .map(|(at, _)| *at as usize)
-            .collect()
+    /// Occupied shards within an inclusive shard range, in key order, found as the walk reaches each
+    fn occupied_range(&self, first: usize, last: usize) -> impl Iterator<Item = usize> + '_ {
+        let (mut low, high) = (first as u64, last as u64);
+        std::iter::from_fn(move || {
+            let at = *read(&self.occupied)
+                .range(Bound::Included(&low), Bound::Included(&high))
+                .next()?
+                .0;
+            low = at + 1;
+            Some(at as usize)
+        })
+    }
+
+    /// Occupied shards at or below a shard, in descending key order
+    fn occupied_back(&self, last: usize) -> impl Iterator<Item = usize> + '_ {
+        let mut high = Some(last as u64);
+        std::iter::from_fn(move || {
+            let from = high?;
+            let at = *read(&self.occupied)
+                .range_back(Bound::Unbounded, Bound::Included(&from))
+                .next()?
+                .0;
+            high = at.checked_sub(1);
+            Some(at as usize)
+        })
     }
 
     fn shard_of(&self, key: &K) -> usize {

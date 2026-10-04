@@ -18,6 +18,6 @@ pub use store::{
     StoreVolume,
 };
 pub use typed::TypedStore;
-pub use value::Value;
+pub use value::{ReadBlock, Value};
 
 pub type Result<T> = std::result::Result<T, Error>;

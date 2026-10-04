@@ -52,6 +52,9 @@ const READ_AHEAD: usize = 4;
 /// Records one column batch takes into the index at a time
 const BATCH: usize = 4096;
 
+/// Segments a resident rebuild holds before it feeds their rows in key order
+const FEED_WINDOW: usize = MAX_READERS * READ_AHEAD;
+
 /// What a reel rebuild hands back beside the index it filled
 pub struct RebuiltReel {
     /// Highest sequence number seen, for reinitializing the counter
@@ -186,14 +189,15 @@ pub fn rebuild_from_persisted(
         }
         jobs.push((segment, path, len));
     }
+    let mut held: Vec<Held> = Vec::new();
     read_segments(driver, &jobs, |at, parts| {
         let (segment, path, len) = &jobs[at];
-        match absorb_segment(*segment, parts, pages, &mut resolver)? {
+        match absorb_segment(*segment, parts, pages, &mut resolver, &mut held)? {
             Loaded::Sealed => {
                 consumed.insert(*segment, *len);
                 sealed_files.push((*segment, path.clone(), *len));
             }
-            Loaded::Walked(offset, is_at_fill, rows) => {
+            Loaded::Walked(offset, is_at_fill, entries) => {
                 consumed.insert(*segment, offset);
                 walked.push((path.clone(), *len));
                 // Resumable means the walk ran out of written bytes. A walk that
@@ -204,14 +208,18 @@ pub fn rebuild_from_persisted(
                         segment: *segment,
                         path: path.clone(),
                         end: offset,
-                        rows,
+                        entries,
                     });
                 }
             }
             Loaded::Foreign => quarantined.push(path.clone()),
         }
+        if held.len() >= FEED_WINDOW {
+            feed_held(&mut held, &mut resolver, &mut resumable)?;
+        }
         Ok(())
     })?;
+    feed_held(&mut held, &mut resolver, &mut resumable)?;
     // A file that goes bad partway through its rows starts the rebuild over without it.
     if let Some(reader) = persisted {
         if let Err(error) = adopt(driver, reader, &standing, &mut resolver) {
@@ -274,8 +282,8 @@ enum Loaded {
     Sealed,
 
     /// An unsealed tail, walked to an offset, whether it may be taken up again, and
-    /// its rows in walk order
-    Walked(u64, bool, Vec<FooterEntry>),
+    /// its rows packed as its footer holds them
+    Walked(u64, bool, SegmentFooter),
 
     /// A file that is not a segment of this reel
     Foreign,
@@ -283,13 +291,13 @@ enum Loaded {
 
 /// An unsealed tail an appender can pick up where it stopped
 ///
-/// The end is the walked offset; the rows are rebuilt from the walk and carry
-/// nothing inline, so a read through one goes to the record.
+/// The end is the walked offset; the footer is rebuilt from the walk and carries
+/// nothing inline, so a read through one of its rows goes to the record.
 pub struct ResumableTail {
     pub segment: SegmentId,
     pub path: PathBuf,
     pub end: u64,
-    pub rows: Vec<FooterEntry>,
+    pub entries: SegmentFooter,
 }
 
 /// One segment file read off the medium, before any of it is joined
@@ -300,8 +308,8 @@ enum SegmentParts {
     /// A sealed segment's footer, and the range ends its rows do not carry
     Sealed(SegmentFooter, Vec<Option<KeyBytes>>),
 
-    /// An unsealed tail's walk, in the order the records sit in the file
-    Walked(Walked),
+    /// An unsealed tail's walk
+    Walked(WalkedTail),
 
     /// A file that is not a segment of this reel
     Foreign,
@@ -463,52 +471,240 @@ fn read_parts(
         }
         None => {
             let mut reader = SegmentReader::new(driver, file, file_len);
-            Ok(SegmentParts::Walked(walk_records(
+            Ok(SegmentParts::Walked(walk_tail(
                 &mut reader,
                 segment,
-                0,
                 file_len,
             )?))
         }
     }
 }
 
-/// Fold one segment's parts into the index
+/// Fold one segment's parts into the index, holding the rows it installs for the feed
+///
+/// A paging volume sweeps a sealed footer and installs none of its keys. Ranges stand at
+/// once, since a cover settles by sequence number whichever rows it meets first. A
+/// walked tail's footer goes to the tail resuming it once its window is fed.
 fn absorb_segment(
     segment: SegmentId,
     parts: SegmentParts,
     pages: bool,
     resolver: &mut Resolver<'_>,
+    held: &mut Vec<Held>,
 ) -> Result<Loaded> {
     match parts {
         SegmentParts::Foreign => Ok(Loaded::Foreign),
         SegmentParts::Sealed(footer, ends) => {
-            let mut ends = ends.into_iter();
             match pages {
-                true => sweep_footer(segment, &footer, &mut ends, resolver)?,
-                false => collect_partitions(segment, &footer.partitions, &mut ends, resolver)?,
+                true => sweep_footer(segment, &footer, &mut ends.into_iter(), resolver)?,
+                false => {
+                    stand_ranges(segment, &footer, ends, resolver)?;
+                    held.push(Held {
+                        segment,
+                        footer,
+                        is_sorted: true,
+                    });
+                }
             }
             Ok(Loaded::Sealed)
         }
-        SegmentParts::Walked(walked) => {
-            let reached = walked.next_offset;
-            let rows = walked
-                .records
-                .iter()
-                .map(|record| {
-                    FooterEntry::new(
-                        record.key.clone(),
-                        record.lsn,
-                        record.loc.offset,
-                        record.loc.len,
-                        record.flags,
-                    )
-                })
-                .collect();
-            let is_at_fill = walked.is_at_fill;
-            absorb_walked(resolver, walked.records);
-            Ok(Loaded::Walked(reached, is_at_fill, rows))
+        SegmentParts::Walked(tail) => {
+            stand_ranges(segment, &tail.footer, tail.ends, resolver)?;
+            held.push(Held {
+                segment,
+                footer: tail.footer,
+                is_sorted: false,
+            });
+            Ok(Loaded::Walked(
+                tail.next_offset,
+                tail.is_at_fill,
+                SegmentFooter::empty(),
+            ))
         }
+    }
+}
+
+/// Stand a segment's range tombstones, each with its end in footer order
+fn stand_ranges(
+    segment: SegmentId,
+    footer: &SegmentFooter,
+    ends: Vec<Option<KeyBytes>>,
+    resolver: &mut Resolver<'_>,
+) -> Result<()> {
+    if ends.is_empty() {
+        return Ok(());
+    }
+    let mut ends = ends.into_iter();
+    for partition in &footer.partitions {
+        for row in 0..partition.len() {
+            let found = partition.row_at(row)?;
+            if !found.flags.is_range_tombstone() {
+                continue;
+            }
+            let start =
+                RecordKey::from_bytes(partition.column, partition.key_at(row).unwrap_or_default())?;
+            let loc = Loc::new(segment, found.offset, found.len);
+            resolver.range(&start, ends.next().flatten(), found.lsn, loc);
+        }
+    }
+    Ok(())
+}
+
+/// One segment's rows held until its window is fed in key order
+struct Held {
+    segment: SegmentId,
+    footer: SegmentFooter,
+
+    /// Whether the rows sit in key order, which a sealed footer's do and a walk's do not
+    is_sorted: bool,
+}
+
+/// Feed every held row to the resolver in key order, then hand each walked footer on
+///
+/// A key's versions keep segment order, so a tie still falls to the earlier source and
+/// every key settles to the version it did. Ascending keys append, so each shard's tree
+/// fills one leaf at a time and the open owes it no repack.
+fn feed_held(
+    held: &mut Vec<Held>,
+    resolver: &mut Resolver<'_>,
+    resumable: &mut [ResumableTail],
+) -> Result<()> {
+    let mut columns: Vec<ColumnId> = held
+        .iter()
+        .flat_map(|rows| {
+            rows.footer
+                .partitions
+                .iter()
+                .map(|partition| partition.column)
+        })
+        .collect();
+    columns.sort_unstable();
+    columns.dedup();
+    for column in columns {
+        let mut cursors: Vec<Cursor<'_>> = held
+            .iter()
+            .enumerate()
+            .filter_map(|(source, rows)| Cursor::open(source, rows, column))
+            .collect();
+        merge_cursors(&mut cursors, |cursor| cursor.feed(resolver))?;
+    }
+    for rows in held.drain(..) {
+        if let Some(tail) = resumable
+            .iter_mut()
+            .find(|tail| tail.segment == rows.segment)
+        {
+            tail.entries = rows.footer;
+        }
+    }
+    Ok(())
+}
+
+/// One held partition walked in key order
+struct Cursor<'a> {
+    /// Position among the held segments, which breaks a tie between equal keys
+    source: usize,
+    segment: SegmentId,
+    partition: &'a FooterPartition,
+
+    /// Row numbers in key order, for rows that sit in arrival order
+    order: Option<Vec<u32>>,
+    at: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn open(source: usize, rows: &'a Held, column: ColumnId) -> Option<Cursor<'a>> {
+        let partition = rows.footer.partition(column)?;
+        Some(Cursor {
+            source,
+            segment: rows.segment,
+            partition,
+            order: (!rows.is_sorted).then(|| {
+                // Equal keys keep arrival order, so the resolver meets them as it would
+                // walking the tail.
+                let mut order: Vec<u32> = (0..partition.len() as u32).collect();
+                order.sort_unstable_by(|one, two| {
+                    let ones = partition.key_at(*one as usize);
+                    let twos = partition.key_at(*two as usize);
+                    ones.cmp(&twos).then(one.cmp(two))
+                });
+                order
+            }),
+            at: 0,
+        })
+    }
+
+    fn is_done(&self) -> bool {
+        self.at >= self.partition.len()
+    }
+
+    fn row(&self) -> usize {
+        match &self.order {
+            Some(order) => order[self.at] as usize,
+            None => self.at,
+        }
+    }
+
+    fn key(&self) -> Option<&'a [u8]> {
+        self.partition.key_at(self.row())
+    }
+
+    /// Put one row, a range having stood when its segment was held
+    fn feed(&self, resolver: &mut Resolver<'_>) -> Result<()> {
+        let found = self.partition.row_at(self.row())?;
+        if !found.flags.is_range_tombstone() {
+            let key = self.key().unwrap_or_default();
+            let loc = Loc::new(self.segment, found.offset, found.len);
+            resolver.put(
+                self.partition.column,
+                key,
+                loc,
+                found.lsn,
+                found.flags.is_tombstone(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Hand rows on across cursors in key order, a tie going to the earlier segment
+fn merge_cursors(
+    cursors: &mut Vec<Cursor<'_>>,
+    mut take: impl FnMut(&Cursor<'_>) -> Result<()>,
+) -> Result<()> {
+    cursors.retain(|cursor| !cursor.is_done());
+    // A binary heap of cursor positions with the least key on top.
+    let mut heap: Vec<usize> = (0..cursors.len()).collect();
+    for at in (0..heap.len() / 2).rev() {
+        sift_down(&mut heap, at, cursors);
+    }
+    while let Some(&top) = heap.first() {
+        take(&cursors[top])?;
+        cursors[top].at += 1;
+        if cursors[top].is_done() {
+            heap.swap_remove(0);
+        }
+        sift_down(&mut heap, 0, cursors);
+    }
+    Ok(())
+}
+
+fn sift_down(heap: &mut [usize], mut at: usize, cursors: &[Cursor<'_>]) {
+    let before = |one: usize, two: usize| match cursors[one].key().cmp(&cursors[two].key()) {
+        std::cmp::Ordering::Equal => cursors[one].source < cursors[two].source,
+        order => order == std::cmp::Ordering::Less,
+    };
+    loop {
+        let mut least = at;
+        for child in [2 * at + 1, 2 * at + 2] {
+            if child < heap.len() && before(heap[child], heap[least]) {
+                least = child;
+            }
+        }
+        if least == at {
+            return;
+        }
+        heap.swap(at, least);
+        at = least;
     }
 }
 
@@ -589,11 +785,11 @@ fn prune_walked_shadowed(
                 let rows = &suspects[&partition.column];
                 let marks = shadowed.entry(partition.column).or_default();
                 // The footer rows and the suspects are both in key order, so
-                // one forward pass joins them.
+                // one forward pass joins them, and only a row whose key matches is
+                // read past its key.
                 let mut at = 0usize;
-                for row in partition.entries() {
-                    let row = row?;
-                    let key = row.key.as_slice();
+                for found in 0..partition.len() {
+                    let key = partition.key_at(found).unwrap_or_default();
                     while at < rows.len() && rows[at].0.as_slice() < key {
                         at += 1;
                     }
@@ -604,17 +800,18 @@ fn prune_walked_shadowed(
                     if suspect.as_slice() != key {
                         continue;
                     }
+                    let row = partition.row_at(found)?;
                     if row.lsn > entry.lsn {
                         marks.push(at);
                     } else if row.lsn < entry.lsn
                         && entry.lsn >= footer.sealed_at
-                        && !row.is_tombstone()
-                        && !row.is_range_tombstone()
+                        && !row.flags.is_tombstone()
+                        && !row.flags.is_range_tombstone()
                     {
                         // At or past the frontier, so the tally froze without this
                         // shadowing. Below it the tally already counted the death and
                         // a debit here would count it twice.
-                        let span = span_of(row.key.width(), row.len);
+                        let span = span_of(key.len() as u16, row.len);
                         let held = debits
                             .entry(partition.column)
                             .or_default()
@@ -684,34 +881,6 @@ fn belongs_here(driver: &IoDriver, file: FileId, segment: SegmentId) -> Result<b
     }
 }
 
-/// Take a sealed segment's records from its footer, ranges from the ends beside it
-///
-/// Sealing waits for every reservation and syncs, so what a footer lists is what
-/// landed and a batch frame has nothing left to decide. The one thing a footer
-/// cannot answer is a range tombstone's end, and those arrive in footer order.
-fn collect_partitions(
-    segment: SegmentId,
-    partitions: &[FooterPartition],
-    ends: &mut impl Iterator<Item = Option<KeyBytes>>,
-    resolver: &mut Resolver<'_>,
-) -> Result<()> {
-    for entry in partitions.iter().flat_map(|partition| partition.entries()) {
-        let entry = entry?;
-        let loc = Loc::new(segment, entry.offset, entry.len);
-        match entry.is_range_tombstone() {
-            true => resolver.range(&entry.key, ends.next().flatten(), entry.lsn, loc),
-            false => resolver.put(
-                entry.key.column,
-                entry.key.as_slice(),
-                loc,
-                entry.lsn,
-                entry.is_tombstone(),
-            ),
-        }
-    }
-    Ok(())
-}
-
 /// Tally one sealed segment's footer without installing any of its keys
 ///
 /// The keys stay in the footer, so what a rebuild installs is the span, the oldest
@@ -737,29 +906,40 @@ fn sweep_footer(
             });
         }
 
-        for entry in partition.entries() {
-            let entry = entry?;
-            // Fed before the span is installed, so a search the span admits is never
-            // ruled out by a filter that has not heard of the segment.
-            resolver
-                .sealed_keys
-                .entry(partition.column)
-                .or_default()
-                .insert(entry.key.as_slice());
-            let loc = Loc::new(segment, entry.offset, entry.len);
-            if entry.is_range_tombstone() {
-                resolver.range(&entry.key, ends.next().flatten(), entry.lsn, loc);
+        // Fed before the span is installed, so a search the span admits is never ruled
+        // out by a filter that has not heard of the segment.
+        resolver
+            .sealed_keys
+            .entry(partition.column)
+            .or_default()
+            .insert_partition(partition);
+        // The table hears the partition once, with its oldest record and its
+        // tombstones' spans summed, since a call a row took its lock a row.
+        let mut oldest = Lsn(u64::MAX);
+        let (mut held, mut held_lsn) = (0u64, Lsn::NONE);
+        for at in 0..partition.len() {
+            let row = partition.row_at(at)?;
+            let key = partition.key_at(at).unwrap_or_default();
+            if row.flags.is_range_tombstone() {
+                let start = RecordKey::from_bytes(partition.column, key)?;
+                let loc = Loc::new(segment, row.offset, row.len);
+                resolver.range(&start, ends.next().flatten(), row.lsn, loc);
                 continue;
             }
-            resolver.see(entry.lsn);
-            match entry.is_tombstone() {
-                true => resolver.index.segments().mark_held(
-                    segment,
-                    entry.lsn,
-                    span_of(entry.key.width(), entry.len),
-                ),
-                false => resolver.index.segments().note_min(segment, entry.lsn),
+            resolver.see(row.lsn);
+            match row.flags.is_tombstone() {
+                true => {
+                    held += span_of(key.len() as u16, row.len);
+                    held_lsn = held_lsn.max(row.lsn);
+                }
+                false => oldest = oldest.min(row.lsn),
             }
+        }
+        if held > 0 {
+            resolver.index.segments().mark_held(segment, held_lsn, held);
+        }
+        if oldest != Lsn(u64::MAX) {
+            resolver.index.segments().note_min(segment, oldest);
         }
     }
     Ok(())
@@ -852,8 +1032,81 @@ pub fn walk_records(
     from: u64,
     to: u64,
 ) -> Result<Walked> {
-    let limit = reader.limit().min(to);
     let mut records = Vec::new();
+    let (next_offset, is_at_fill) =
+        walk_each(reader, segment, from, to, |record| records.push(record))?;
+    Ok(Walked {
+        records,
+        next_offset,
+        is_at_fill,
+    })
+}
+
+/// An unsealed tail's walk, its rows packed the way the tail's own footer packs them
+struct WalkedTail {
+    /// Rows column by column, each column in the order the records sit in the file
+    footer: SegmentFooter,
+
+    /// Each range tombstone's end, in the footer's order
+    ends: Vec<Option<KeyBytes>>,
+
+    /// Offset the walk stopped at, which is where the tail resumes
+    next_offset: u64,
+
+    /// Whether the walk stopped on bytes nothing has written
+    is_at_fill: bool,
+}
+
+/// Walk a whole tail into the footer an appender takes it up with
+///
+/// A record held whole costs four times its packed row, and the tails of a volume of
+/// small records hold millions of them.
+fn walk_tail(reader: &mut SegmentReader<'_>, segment: SegmentId, to: u64) -> Result<WalkedTail> {
+    let mut footer = SegmentFooter::empty();
+    let mut ends = Vec::new();
+    let (next_offset, is_at_fill) = walk_each(reader, segment, 0, to, |record| {
+        if record.flags.is_range_tombstone() {
+            ends.push((record.key.column, record.range_end));
+        }
+        let (offset, len) = (record.loc.offset, record.loc.len);
+        // The first record says what the rest of the tail likely holds, so the rows get
+        // their room in one go.
+        let span = HEADER_LEN as u64 + record.key.width() as u64 + u64::from(len);
+        let is_first = footer.is_empty();
+        footer.push(&FooterEntry::new(
+            record.key,
+            record.lsn,
+            offset,
+            len,
+            record.flags,
+        ));
+        if is_first {
+            footer.reserve_rows((to.saturating_sub(u64::from(offset)) / span) as usize);
+        }
+    })?;
+    // The footer holds a column's rows together, and a stable sort keeps each column's
+    // ends in file order.
+    ends.sort_by_key(|(column, _)| *column);
+    Ok(WalkedTail {
+        footer,
+        ends: ends.into_iter().map(|(_, end)| end).collect(),
+        next_offset,
+        is_at_fill,
+    })
+}
+
+/// The walk itself, handing each record on once it is vetted and its batch is whole
+///
+/// Answers the offset the walk stopped at and whether it stopped on unwritten bytes.
+fn walk_each(
+    reader: &mut SegmentReader<'_>,
+    segment: SegmentId,
+    from: u64,
+    to: u64,
+    mut take: impl FnMut(WalkedRecord),
+) -> Result<(u64, bool)> {
+    let limit = reader.limit().min(to);
+    let mut run = Vec::new();
     // Where a walk may resume from. It trails the write head by whatever an unlanded
     // run holds, so a tail that grows into its own batch is re-read from the frame
     // rather than resumed inside it.
@@ -884,8 +1137,8 @@ pub fn walk_records(
             if ends_at > limit {
                 break;
             }
-            match walk_batch(reader, segment, &frame, offset, ends_at)? {
-                Batch::Whole(run) => records.extend(run),
+            match walk_batch(reader, segment, &frame, offset, ends_at, &mut run)? {
+                Batch::Whole => run.drain(..).for_each(&mut take),
                 // The run is on disk and not intact, so it is dropped whole and the
                 // walk carries on at the boundary the frame named.
                 Batch::Torn => {}
@@ -912,7 +1165,7 @@ pub fn walk_records(
             continue;
         }
         let span = header.span();
-        records.push(resolve_walked(reader, segment, header, at)?);
+        take(resolve_walked(reader, segment, header, at)?);
         next_offset = at + span;
     }
 
@@ -921,12 +1174,7 @@ pub fn walk_records(
     // stops at the end of what was written, and one that stops on anything else has
     // written bytes ahead of it that an appender must not land behind.
     let is_at_fill = matches!(read_head(reader, next_offset, limit)?, Head::Missing);
-
-    Ok(Walked {
-        records,
-        next_offset,
-        is_at_fill,
-    })
+    Ok((next_offset, is_at_fill))
 }
 
 /// What the bytes at an offset turned out to be
@@ -971,8 +1219,8 @@ fn read_head(reader: &mut SegmentReader<'_>, offset: u64, limit: u64) -> Result<
 
 /// What one batch's declared region turned out to hold
 enum Batch {
-    /// Every record the frame declared is there and verifies
-    Whole(Vec<WalkedRecord>),
+    /// Every record the frame declared is there and verifies, held in the run
+    Whole,
 
     /// The region is written and is not the run the frame declared
     Torn,
@@ -993,8 +1241,9 @@ fn walk_batch(
     frame: &BatchFrame,
     from: u64,
     ends_at: u64,
+    run: &mut Vec<WalkedRecord>,
 ) -> Result<Batch> {
-    let mut run = Vec::new();
+    run.clear();
     let mut offset = from;
     for _ in 0..frame.count {
         let header = match read_head(reader, offset, ends_at)? {
@@ -1018,7 +1267,7 @@ fn walk_batch(
         run.push(resolve_walked(reader, segment, header, at)?);
     }
     match offset == ends_at {
-        true => Ok(Batch::Whole(run)),
+        true => Ok(Batch::Whole),
         false => Ok(Batch::Torn),
     }
 }
@@ -1048,22 +1297,6 @@ fn resolve_walked(
         flags: header.flags,
         range_end,
     })
-}
-
-/// Fold a walk's records into the index, ranges apart from keys
-fn absorb_walked(resolver: &mut Resolver<'_>, records: Vec<WalkedRecord>) {
-    for record in records {
-        match record.flags.is_range_tombstone() {
-            true => resolver.range(&record.key, record.range_end, record.lsn, record.loc),
-            false => resolver.put(
-                record.key.column,
-                record.key.as_slice(),
-                record.loc,
-                record.lsn,
-                record.flags.is_tombstone(),
-            ),
-        }
-    }
 }
 
 fn verify_record(
@@ -1252,7 +1485,7 @@ pub(crate) fn read_footer(
     if (footer_bytes.len() as u64) < footer_len {
         return Ok(None);
     }
-    match SegmentFooter::parse(&footer_bytes) {
+    match SegmentFooter::parse_owned(footer_bytes) {
         Ok(footer) => Ok(Some(footer)),
         Err(_) => Ok(None),
     }

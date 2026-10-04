@@ -13,6 +13,7 @@ use reel_core::{Direction, Store};
 
 use reel::{
     Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, ReelConfig, ReelStore, SyncPolicy,
+    MAP_EVERYTHING,
 };
 
 /// Rows every walk steps
@@ -66,8 +67,12 @@ fn wide_key(row: u64) -> Vec<u8> {
 }
 
 fn filled() -> (TempDir, ReelStore) {
+    filled_with(config())
+}
+
+fn filled_with(config: ReelConfig) -> (TempDir, ReelStore) {
     let dir = TempDir::new().expect("tempdir");
-    let store = ReelStore::open(dir.path().to_path_buf(), config(), COLUMNS).expect("open");
+    let store = ReelStore::open(dir.path().to_path_buf(), config, COLUMNS).expect("open");
     for row in 0..ROWS {
         Store::put(&store, "fixed", &row.to_be_bytes(), &payload(row)).expect("fixed put");
         Store::put(&store, "wide", &wide_key(row), &payload(row)).expect("wide put");
@@ -111,6 +116,27 @@ fn a_lent_walk_matches_the_owned_one() {
     let lent = lent(&store, "fixed", None, Direction::Asc);
     assert_eq!(lent.len(), ROWS as usize, "the lending walk lost rows");
     assert_eq!(lent, owned(&store, "fixed", None, Direction::Asc));
+}
+
+// a mapped volume lends the same rows, each placed from its segment's mapping
+#[test]
+fn a_mapped_walk_matches_the_owned_one() {
+    let (_dir, store) = filled_with(ReelConfig {
+        map_above: MAP_EVERYTHING,
+        ..config()
+    });
+    let from = (ROWS / 2).to_be_bytes();
+
+    for cf in ["fixed", "wide"] {
+        let lent = lent(&store, cf, None, Direction::Asc);
+        assert_eq!(lent.len(), ROWS as usize, "{cf} lost rows");
+        assert_eq!(lent, owned(&store, cf, None, Direction::Asc), "{cf}");
+    }
+    for way in [Direction::Asc, Direction::Desc] {
+        let lent = lent(&store, "fixed", Some(&from), way);
+        assert_eq!(lent, owned(&store, "fixed", Some(&from), way), "{way:?}");
+        assert!(!lent.is_empty(), "{way:?} lent nothing");
+    }
 }
 
 // a narrow key after a wide one is the whole key, not the tail of the last one

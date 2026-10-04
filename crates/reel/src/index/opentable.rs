@@ -163,6 +163,14 @@ impl<const N: usize, Value: Default> OpenTable<N, Value> {
         }
     }
 
+    /// What a key holds, to be changed in place
+    pub fn get_mut(&mut self, key: &[u8; N]) -> Option<&mut Value> {
+        match self.site(key) {
+            Site::Held(at) => Some(&mut self.values[at]),
+            Site::Free(_) => None,
+        }
+    }
+
     /// Whether a key is held at all
     pub fn contains_key(&self, key: &[u8; N]) -> bool {
         matches!(self.site(key), Site::Held(_))

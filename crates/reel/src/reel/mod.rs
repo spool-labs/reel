@@ -49,7 +49,7 @@ use crate::sync::{lock, read, write};
 use reel_core::{ReadBlock, Value};
 
 use read::{
-    deep_range, frame_to_range, frame_to_read, framed_or_nothing, merge_runs_into,
+    check_in_block, deep_range, frame_to_range, frame_to_read, framed_or_nothing, merge_runs_into,
     merge_span, near_range, place_runs, window_or_nothing, window_start, Planned, Run, MERGE_GAP,
 };
 
@@ -1298,7 +1298,7 @@ impl Reel {
         let start = window_start(loc, key_width, at);
 
         if self.shared.config.maps(len) {
-            if let Some(map) = handle.mapping() {
+            if let Some(map) = handle.mapping(self.shared.config.segment_bytes.to_bytes()) {
                 if let Some(bytes) = map.slice(start, len) {
                     let mut body = crate::reel::payload::take(len);
                     body.extend_from_slice(bytes);
@@ -1500,7 +1500,7 @@ impl Reel {
         if !self.shared.config.maps(len) {
             return None;
         }
-        let map = handle.mapping()?;
+        let map = handle.mapping(self.shared.config.segment_bytes.to_bytes())?;
         let head_bytes = map.slice(offset, prefix)?;
         let body_bytes = map.slice(offset + prefix as u64 + at, len)?;
 
@@ -1530,7 +1530,7 @@ impl Reel {
     ) -> Result<()> {
         let mut held = HeldScratch::take();
         let scratch = &mut held.0;
-        if self.plan_reads(asks, keys, scratch, blocks, spots)? {
+        if self.plan_reads(asks, keys, is_verified, scratch, blocks, spots)? {
             self.shared.driver.run_split_reads_into(
                 &mut scratch.ops,
                 &mut scratch.completions,
@@ -1552,7 +1552,7 @@ impl Reel {
     ) -> Result<()> {
         let mut held = HeldScratch::take();
         let scratch = &mut held.0;
-        if self.plan_reads(asks, keys, scratch, blocks, spots)? {
+        if self.plan_reads(asks, keys, is_verified, scratch, blocks, spots)? {
             self.shared
                 .driver
                 .wait_split_reads_into(&mut scratch.ops, &mut scratch.filled)
@@ -1562,15 +1562,17 @@ impl Reel {
         Ok(())
     }
 
-    /// Resolve every ask to a place on the volume and build one read per run
+    /// Place every record a mapping covers and build one read per run of the rest
     ///
-    /// Key order is not offset order, so the asks are sorted by place first: runs
-    /// only form once neighbours are neighbours. An ask whose segment is gone stays
-    /// a miss. False when nothing is left to read.
+    /// A mapped record is checked where it lies and copied out once, into one block
+    /// for the batch. Key order is not offset order, so the asks left for the driver
+    /// are sorted by place first: runs only form once neighbours are neighbours. An
+    /// ask whose segment is gone stays a miss. False when nothing is left to read.
     fn plan_reads(
         &self,
         asks: &[Ask],
         keys: &[KeyRef<'_>],
+        is_verified: bool,
         scratch: &mut ReadScratch,
         blocks: &mut Vec<ReadBlock>,
         spots: &mut Vec<Spot>,
@@ -1579,27 +1581,57 @@ impl Reel {
         spots.clear();
         spots.resize(keys.len(), Spot::MISS);
         scratch.order.clear();
-        scratch.order.extend(asks.iter().enumerate().map(|(at, ask)| {
-            let place = (u64::from(ask.loc.segment.0) << 32) | u64::from(ask.loc.offset);
-            (place, at as u32)
-        }));
-        scratch.order.sort_unstable_by_key(|&(place, _)| place);
-
         scratch.plan.clear();
         scratch.handles.clear();
-        scratch.plan.reserve(asks.len());
+        let mut mapped = Vec::new();
+        for (at, ask) in asks.iter().enumerate() {
+            let key = keys[ask.at as usize];
+            let prefix = HEADER_LEN + key.width();
+            let len = ask.loc.len as usize;
+            let offset = u64::from(ask.loc.offset);
+            let record = match self.shared.config.maps(len) {
+                true => match self.hold_segment(ask.loc.segment, &mut scratch.handles)? {
+                    Some(handle) => handle
+                        .mapping(self.shared.config.segment_bytes.to_bytes())
+                        .and_then(|map| map.slice(offset, prefix + len)),
+                    None => continue,
+                },
+                false => None,
+            };
+            let Some(record) = record else {
+                let place = (u64::from(ask.loc.segment.0) << 32) | offset;
+                scratch.order.push((place, at as u32));
+                continue;
+            };
+            if let Ok(codec) = check_in_block(record, 0, prefix, key, ask.lsn, ask.loc, is_verified)
+            {
+                if mapped.capacity() == 0 {
+                    let wanted = asks.iter().map(|ask| ask.loc.len as usize).sum();
+                    mapped = crate::reel::payload::take(wanted);
+                }
+                spots[ask.at as usize] = Spot {
+                    block: 0,
+                    at: mapped.len() as u32,
+                    len: len as u32,
+                    codec,
+                };
+                mapped.extend_from_slice(&record[prefix..]);
+            }
+        }
+        if mapped.capacity() != 0 {
+            blocks.push(ReadBlock::new(mapped, crate::reel::payload::give));
+        }
+        scratch.order.sort_unstable_by_key(|&(place, _)| place);
+
+        scratch.plan.reserve(scratch.order.len());
         for slot in 0..scratch.order.len() {
             let at = scratch.order[slot].1 as usize;
             let ask = &asks[at];
-            // Sorted by segment, so a segment's handle is taken once, at its first record.
+            // Sorted by segment, so a segment's handle is asked for once, at its first record.
             let file = match scratch.plan.last() {
                 Some(last) if last.segment == ask.loc.segment => last.file,
-                _ => match self.handle_for(ask.loc.segment)? {
-                    Some(handle) => {
-                        let file = handle.file();
-                        scratch.handles.push(handle);
-                        file
-                    }
+                _ => match self.hold_segment(ask.loc.segment, &mut scratch.handles)? {
+                    Some(handle) => handle.file(),
                     None => continue,
                 },
             };
@@ -1636,6 +1668,29 @@ impl Reel {
         Ok(true)
     }
 
+    /// Take a segment's handle once per batch and lend it for every record after
+    ///
+    /// Held until the batch is done, so no segment is unlinked under a read in flight.
+    /// The handles stay in segment order, so finding one is a search. Nothing when the
+    /// segment is gone.
+    fn hold_segment<'held>(
+        &self,
+        segment: SegmentId,
+        handles: &'held mut Vec<SegmentHandle>,
+    ) -> Result<Option<&'held SegmentHandle>> {
+        let at = match handles.binary_search_by_key(&segment, SegmentHandle::id) {
+            Ok(at) => at,
+            Err(at) => match self.handle_for(segment)? {
+                Some(handle) => {
+                    handles.insert(at, handle);
+                    at
+                }
+                None => return Ok(None),
+            },
+        };
+        Ok(Some(&handles[at]))
+    }
+
     /// Resolve a segment number to a handle, opening and caching it on a miss
     pub fn handle_for(&self, segment: SegmentId) -> Result<Option<SegmentHandle>> {
         self.shared.handle_for(segment)
@@ -1653,7 +1708,7 @@ impl Reel {
         // A mapped volume serves a record the mapping covers straight out of the
         // page cache; anything it does not cover takes the driver below.
         if self.shared.config.maps(len) {
-            if let Some(map) = handle.mapping() {
+            if let Some(map) = handle.mapping(self.shared.config.segment_bytes.to_bytes()) {
                 let head_at = map.slice(offset, prefix);
                 let body_at = map.slice(offset + prefix as u64, len);
                 if let (Some(head_bytes), Some(body_bytes)) = (head_at, body_at) {

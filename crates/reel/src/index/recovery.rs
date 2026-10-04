@@ -198,7 +198,7 @@ pub fn rebuild_from_persisted(
     }
     let mut held: Vec<Held> = Vec::new();
     // A paged open hands each sealed footer to FastForward's loaders as it is swept, so
-    // the loads run beside the reads instead of after them.
+    // the loads run beside the reads.
     let (queue, feed) = std::sync::mpsc::sync_channel::<(SegmentId, SegmentFooter)>(LOADERS);
     let feed = Mutex::new(feed);
     let loaders = match pages {

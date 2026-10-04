@@ -50,7 +50,7 @@ fn knob(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// A value that names its key and op and fills the rest from both, so a torn or misplaced read cannot pass
+/// A value that carries its key and op and fills the rest from both, so a torn or misplaced read cannot pass
 fn value_of(key: u64, op: u64, len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + len);
     out.extend_from_slice(&key.to_be_bytes());

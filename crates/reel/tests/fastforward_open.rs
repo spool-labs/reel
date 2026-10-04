@@ -30,7 +30,7 @@ const COLUMNS: &[ColumnSpec] = &[ColumnSpec {
 /// Payload bytes per record, W4's size
 const VALUE_BYTES: usize = 200;
 
-/// Records written when the environment names no count
+/// Records written when the environment gives no count
 const DEFAULT_KEYS: u64 = 2_000_000;
 
 /// One record in this many is written twice, so versions of one key sit in two segments

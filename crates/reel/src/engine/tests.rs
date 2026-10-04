@@ -2964,13 +2964,33 @@ fn a_dropped_range_leaks_nothing() {
     );
 }
 
-// a vouched window takes one device read wherever it sits in the record
+// a window of a record in an open tail is copied out of the tail's mapping, with no device read
+#[test]
+fn an_open_tail_answers_a_window_from_its_mapping() {
+    let (store, backend, _dir) = posix_store(config(1, SyncPolicy::Never));
+    let key = record(7, 1);
+    let payload = stripes(64 * 1024);
+    store.put(&key, &payload).expect("put");
+    store.get(&key).expect("warm the descriptor");
+
+    let before = backend.ops();
+    let window = store
+        .get_range(&key, 40_000, 4_000)
+        .expect("range")
+        .expect("found");
+    assert_eq!(&*window, &payload[40_000..44_000]);
+    assert_eq!(backend.ops() - before, 0, "a window of an open tail went to the device");
+}
+
+// a vouched window of a sealed record takes one device read wherever it sits in the record
 #[test]
 fn a_posix_range_reads_a_window() {
     let (store, backend, _dir) = posix_store(config(1, SyncPolicy::Never));
     let key = record(7, 1);
     let payload = stripes(64 * 1024);
     store.put(&key, &payload).expect("put");
+    // An open tail answers from its mapping, so the record is sealed first.
+    store.reel.tails()[0].seal().expect("seal");
     store.get(&key).expect("warm the descriptor");
 
     let before = backend.ops();

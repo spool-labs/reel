@@ -1703,7 +1703,7 @@ impl Reel {
         };
         let start = window_start(loc, key_width, at);
 
-        if self.shared.config.maps(len) {
+        if self.maps(loc.segment, len) {
             if let Some(map) = handle.mapping(self.shared.config.segment_bytes.to_bytes()) {
                 if let Some(bytes) = map.slice(start, len) {
                     let mut body = crate::reel::payload::take(len);
@@ -1903,7 +1903,7 @@ impl Reel {
         at: u64,
         len: usize,
     ) -> Option<(Vec<u8>, Value)> {
-        if !self.shared.config.maps(len) {
+        if !self.maps(handle.id(), len) {
             return None;
         }
         let map = handle.mapping(self.shared.config.segment_bytes.to_bytes())?;
@@ -1995,7 +1995,7 @@ impl Reel {
             let prefix = HEADER_LEN + key.width();
             let len = ask.loc.len as usize;
             let offset = u64::from(ask.loc.offset);
-            let record = match self.shared.config.maps(len) {
+            let record = match self.maps(ask.loc.segment, len) {
                 true => match self.hold_segment(ask.loc.segment, &mut scratch.handles)? {
                     Some(handle) => handle
                         .mapping(self.shared.config.segment_bytes.to_bytes())
@@ -2097,6 +2097,17 @@ impl Reel {
         Ok(Some(&handles[at]))
     }
 
+    /// Whether a read of `len` bytes in `segment` goes through the segment's mapping
+    ///
+    /// A tail's pages were just written, so they are in the page cache and a mapping
+    /// copies them with no syscall. A scan of 1,000 keys reads its tail keys one at a
+    /// time, which made preads 84% of its time.
+    fn maps(&self, segment: SegmentId, len: usize) -> bool {
+        let config = &self.shared.config;
+        config.maps(len)
+            || (config.maps_tails() && self.tails().iter().any(|tail| tail.tail().active_segment() == segment))
+    }
+
     /// Resolve a segment number to a handle, opening and caching it on a miss
     pub fn handle_for(&self, segment: SegmentId) -> Result<Option<SegmentHandle>> {
         self.shared.handle_for(segment)
@@ -2113,7 +2124,7 @@ impl Reel {
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         // A mapped volume serves a record the mapping covers straight out of the
         // page cache; anything it does not cover takes the driver below.
-        if self.shared.config.maps(len) {
+        if self.maps(handle.id(), len) {
             if let Some(map) = handle.mapping(self.shared.config.segment_bytes.to_bytes()) {
                 let head_at = map.slice(offset, prefix);
                 let body_at = map.slice(offset + prefix as u64, len);

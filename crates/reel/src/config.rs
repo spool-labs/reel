@@ -436,6 +436,14 @@ impl ReelConfig {
             None => false,
         }
     }
+
+    /// Whether reads into an open tail go through its mapping, whatever `map_above` says
+    ///
+    /// Never on a direct volume, whose page cache holds nothing, nor where ranged reads
+    /// route windows a mapping would answer first.
+    pub fn maps_tails(&self) -> bool {
+        self.io_backend != IoBackend::UringDirect && self.ranged_reads == RangedReads::Cached
+    }
 }
 
 impl Default for ReelConfig {

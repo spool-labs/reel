@@ -11,6 +11,8 @@ use std::sync::Arc;
 
 use std::ops::Bound;
 
+use reel_core::Value;
+
 use crate::error::Result;
 use crate::format::column::{ColumnId, KeyBytes, MAX_KEY_LEN};
 use crate::format::footer::{FooterPartition, FooterRow, SegmentFooter};
@@ -18,6 +20,7 @@ use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::index::column::ColumnIndex;
 use crate::index::entry::Entry;
+use crate::index::fastforward::{FastColumn, RowAsk, RowRead, WalkRow};
 use crate::index::page::KeyPage;
 use crate::index::paged::{FooterSource, SealedRanges};
 
@@ -489,6 +492,347 @@ pub fn merged_page(
 
     playback.advance(out, limit)?;
     Ok(())
+}
+
+/// Sealed rows an ordered page reads past what it still needs, for those it will drop
+const ORDERED_SLACK: usize = 16;
+
+/// Times one round of an ordered page looks again when a sealed slot left under its look,
+/// before the footers answer
+const ORDERED_TRIES: usize = 8;
+
+/// How an ordered page fill came out
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ordered {
+    /// The page is filled and the playback moved past it
+    Filled,
+
+    /// The sealed index moved under every look of a round, or met a record only the
+    /// checked path reads, so the footers fill this page
+    Footers,
+}
+
+/// One sealed row an ordered page has read
+struct SealedRow {
+    /// Where the key its record holds sits in the round's packed keys, counted in keys
+    at: usize,
+    lsn: Lsn,
+    len: u32,
+    is_tombstone: bool,
+    segment: SegmentId,
+    offset: u32,
+
+    /// The payload, when the page is for a caller that reads every one
+    payload: Option<Value>,
+}
+
+/// One ordered page's walk: where its next round starts, and the buffers each round refills
+struct Walk {
+    /// The map is read past this bound, and a sealed row on the near side of it is dropped
+    from: Bound<KeyBytes>,
+
+    /// The lead the sealed walk resumes at, inclusive, or nothing to start at the near end
+    ///
+    /// Every sealed row on the near side of it has been merged by an earlier round.
+    lead: Option<u64>,
+
+    /// Whether a round has merged the last lead there is in the page's direction
+    is_sealed_done: bool,
+
+    /// The sealed rows a round's look found
+    rows: Vec<WalkRow>,
+
+    /// The keys their records hold, packed at the column's width
+    keys: Vec<u8>,
+}
+
+/// What one round left the page to do
+enum Round {
+    /// The page has room and more of the column may be left
+    More,
+
+    /// The map and the sealed index both ran out
+    End,
+
+    /// The footers fill the page
+    Footers,
+}
+
+/// The last key a round merged, from the map's page or from the sealed rows
+#[derive(Clone, Copy)]
+enum Merged {
+    Map(usize),
+    Sealed(usize),
+}
+
+/// Fill a page from the map and an ordered sealed index, leaving the footers closed
+///
+/// A page fills in rounds. Each round takes the map's page and a run of sealed rows back
+/// to back, reads each row's record for its key, and merges the two. A record's key
+/// settles a tie on the leading bytes, an older version beside a newer one, and a row of
+/// the bound's own lead on the wrong side of it.
+///
+/// The map is read first, so a key handed from the map to the index is seen at least
+/// once. A put moves a key the other way, and the index counts the slot it lets go, so a
+/// round whose look saw a slot leave the shards it crossed looks again over half the
+/// span. The look is memory alone, which keeps that window short, and the records are
+/// read after it.
+pub fn ordered_page(
+    paged: &Paged<'_>,
+    fast: &FastColumn,
+    width: usize,
+    playback: &mut PlaybackCursor,
+    limit: usize,
+    out: &mut KeyPage,
+) -> Result<Ordered> {
+    out.clear();
+    let Some(from) = playback.at.clone() else {
+        return Ok(Ordered::Filled);
+    };
+    let lead = match &from {
+        Bound::Included(key) | Bound::Excluded(key) => Some(FastColumn::lead(key.as_slice())),
+        Bound::Unbounded => None,
+    };
+    let mut walk = Walk {
+        from,
+        lead,
+        is_sealed_done: false,
+        rows: Vec::new(),
+        keys: Vec::new(),
+    };
+    while out.len() < limit {
+        match ordered_round(paged, fast, width, playback, &mut walk, limit, out)? {
+            Round::More => {}
+            Round::End => break,
+            Round::Footers => return Ok(Ordered::Footers),
+        }
+    }
+    playback.advance(out, limit)?;
+    // The footers' cursors stand where the last footer page left them, so the next one
+    // opens them again here.
+    playback.generation = None;
+    Ok(Ordered::Filled)
+}
+
+/// One round of an ordered page: one look at the map and the index, then the records it points at
+fn ordered_round(
+    paged: &Paged<'_>,
+    fast: &FastColumn,
+    width: usize,
+    playback: &mut PlaybackCursor,
+    walk: &mut Walk,
+    limit: usize,
+    out: &mut KeyPage,
+) -> Result<Round> {
+    let index = paged.index;
+    let PlaybackCursor { way, resident, .. } = playback;
+    let way = *way;
+    let with_payloads = out.reads_payloads();
+    // A payload read past the page's end is wasted, so a payload page takes no slack.
+    let slack = match with_payloads {
+        true => 0,
+        false => ORDERED_SLACK,
+    };
+    let from = borrowed_bound(&walk.from);
+    let (near, far) = match way {
+        Way::Up => (0, u64::MAX),
+        Way::Down => (u64::MAX, 0),
+    };
+
+    let mut span = limit - out.len();
+    let mut looks = 0;
+    // The last lead a walk cut short read, or nothing when the walk ran off the end
+    let cut = loop {
+        if looks == ORDERED_TRIES {
+            return Ok(Round::Footers);
+        }
+        looks += 1;
+        let before = fast.taken_all();
+        resident_page(index, way, from, span, resident);
+        walk.rows.clear();
+        if !walk.is_sealed_done {
+            fast.walk_lead(walk.lead, way, span + slack, &mut walk.rows);
+        }
+        let cut = (walk.rows.len() >= span + slack)
+            .then(|| walk.rows.last().map(|row| row.lead))
+            .flatten();
+        if !fast.moved_between(&before, walk.lead.unwrap_or(near), cut.unwrap_or(far)) {
+            break cut;
+        }
+        span = (span / 2).max(1);
+    };
+    // A full map page says nothing past its last key.
+    let edge = (resident.len() == span)
+        .then(|| resident.key_ref(span - 1))
+        .flatten();
+    let walked = walk.rows.last().map(|row| row.lead);
+
+    let Some(mut sealed) = read_sealed(fast, paged.column, width, way, with_payloads, walk)? else {
+        return Ok(Round::Footers);
+    };
+    let keys = walk.keys.as_slice();
+    let key_of = |row: &SealedRow| &keys[row.at * width..(row.at + 1) * width];
+    let mut next = 0usize;
+    let mut taken = 0usize;
+    let mut merged = None;
+    let mut is_at_cut = false;
+    while out.len() < limit {
+        let mapped = resident.key_ref(taken);
+        let from_map = match (mapped, sealed.get(next)) {
+            (None, None) => break,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (Some(mapped), Some(row)) => mapped == key_of(row) || is_ahead(way, mapped, key_of(row)),
+        };
+        if from_map {
+            let key = mapped.expect("a map key was chosen");
+            // A map key past the last lead a cut walk read may have sealed rows before it
+            // that no round has read yet.
+            let lead = FastColumn::lead(key);
+            let is_past = |last: u64| match way {
+                Way::Up => lead > last,
+                Way::Down => lead < last,
+            };
+            if cut.is_some_and(is_past) {
+                is_at_cut = true;
+                break;
+            }
+            if sealed.get(next).is_some_and(|row| key_of(row) == key) {
+                next += 1;
+            }
+            let found = resident
+                .found_at(taken)
+                .expect("the map's page holds its entries");
+            out.push(key, found);
+            merged = Some(Merged::Map(taken));
+            taken += 1;
+            continue;
+        }
+
+        let row = &mut sealed[next];
+        let key = key_of(row);
+        if edge.is_some_and(|edge| is_ahead(way, edge, key)) {
+            break;
+        }
+        merged = Some(Merged::Sealed(next));
+        next += 1;
+        // A key the map took since its page was read: a grave drops it, and a put
+        // answers with its own entry.
+        if let Some(entry) = index.entry_or_grave(key) {
+            if !entry.is_grave() && !index.is_covered_key(key, entry.lsn) {
+                out.push(key, entry);
+            }
+            continue;
+        }
+        if row.is_tombstone || index.is_covered_key(key, row.lsn) {
+            continue;
+        }
+        let entry = Entry::new(Loc::new(row.segment, row.offset, row.len), row.lsn);
+        out.push_read(key, entry, row.payload.take());
+    }
+
+    if out.len() >= limit {
+        return Ok(Round::More);
+    }
+    // Short of a full page, a map page that was not full and a walk that ran off the end
+    // read both to their ends in one look.
+    if edge.is_none() && cut.is_none() {
+        return Ok(Round::End);
+    }
+    let merged = merged.map(|merged| match merged {
+        Merged::Map(at) => resident.key_ref(at).expect("a merged map key"),
+        Merged::Sealed(at) => key_of(&sealed[at]),
+    });
+    let step = |last: u64| match way {
+        Way::Up => last.checked_add(1),
+        Way::Down => last.checked_sub(1),
+    };
+    let (lead, is_last) = match (is_at_cut, edge, walked) {
+        // The map's page reached past the cut and every row walked was merged.
+        (true, _, _) => (cut.and_then(step), true),
+        // A full map page may end short of what the walk read, and a key handed over
+        // between rounds could sit in that gap, so the next walk starts back at the last
+        // key merged.
+        (false, Some(_), _) => (merged.map(FastColumn::lead).or(walk.lead), false),
+        (false, None, Some(last)) => (step(last), true),
+        (false, None, None) => (walk.lead, false),
+    };
+    if let Some(merged) = merged {
+        walk.from = Bound::Excluded(KeyBytes::new(merged)?);
+    }
+    walk.is_sealed_done |= is_last && lead.is_none();
+    walk.lead = lead;
+    Ok(Round::More)
+}
+
+/// Read the records a look's rows point at and order them by key, one row a key
+///
+/// The newest version of a key stands, a tie going to the newer segment, which is a
+/// compaction copy of the other. A row whose segment is gone is taken out of the index,
+/// since its record moved on or died. One only the checked path can read sends the page
+/// to the footers. A page for a caller reading every payload reads each record whole,
+/// so the payload comes in the same read.
+fn read_sealed(
+    fast: &FastColumn,
+    column: ColumnId,
+    width: usize,
+    way: Way,
+    with_payloads: bool,
+    walk: &mut Walk,
+) -> Result<Option<Vec<SealedRow>>> {
+    let Walk { from, rows, keys, .. } = walk;
+    let from = borrowed_bound(from);
+    let asks: Vec<RowAsk> = rows
+        .iter()
+        .map(|row| RowAsk {
+            segment: row.segment,
+            offset: row.offset,
+            bound: match with_payloads {
+                true => row.bound,
+                false => 0,
+            },
+        })
+        .collect();
+    let Some(reads) = fast.read_rows(column, width, &asks, keys)? else {
+        return Ok(None);
+    };
+    let mut read = Vec::with_capacity(rows.len());
+    for (at, (row, answer)) in rows.iter().zip(reads).enumerate() {
+        match answer {
+            RowRead::Found { head, value } => read.push(SealedRow {
+                at,
+                lsn: head.lsn,
+                len: head.len,
+                is_tombstone: head.is_tombstone,
+                segment: row.segment,
+                offset: row.offset,
+                payload: value,
+            }),
+            // The record moved on and its source retired, so the slot points at nothing.
+            RowRead::Gone => fast.forget_row(row),
+            RowRead::Other => {}
+            RowRead::Unsure => return Ok(None),
+        }
+    }
+    let keys = keys.as_slice();
+    let key_of = |row: &SealedRow| &keys[row.at * width..(row.at + 1) * width];
+    read.retain(|row| match (way, from) {
+        (_, Bound::Unbounded) => true,
+        (Way::Up, Bound::Included(bound)) => key_of(row) >= bound,
+        (Way::Up, Bound::Excluded(bound)) => key_of(row) > bound,
+        (Way::Down, Bound::Included(bound)) => key_of(row) <= bound,
+        (Way::Down, Bound::Excluded(bound)) => key_of(row) < bound,
+    });
+    // Newest version first within a key, so the dedup below keeps it.
+    read.sort_unstable_by(|left, right| {
+        let by_key = match way {
+            Way::Up => key_of(left).cmp(key_of(right)),
+            Way::Down => key_of(right).cmp(key_of(left)),
+        };
+        by_key.then((right.lsn, right.segment).cmp(&(left.lsn, left.segment)))
+    });
+    read.dedup_by(|later, kept| key_of(later) == key_of(kept));
+    Ok(Some(read))
 }
 
 /// One page of a column's own map, in the playback's direction

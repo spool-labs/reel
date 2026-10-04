@@ -16,10 +16,10 @@ use reel::format::record::{BatchFrame, RecordHeader, HEADER_LEN};
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::{
-    ByteCount, CompactPass, CompactRate, IndexResidency, Preallocate, RecordWrite, ReelConfig,
-    ReelStore, RepairPath, SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
+    ByteCount, ColumnSet, ColumnSpec, CompactPass, CompactRate, IndexResidency, MapShape, Preallocate,
+    RecordWrite, ReelConfig, ReelStore, RepairPath, SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
 };
-use reel_core::{Store, Value};
+use reel_core::{Direction, Store, Value};
 use reel_mock::MemoryStore;
 
 use harness::observe::observe;
@@ -27,7 +27,9 @@ use harness::op_stream::{self, StreamOp};
 use harness::reel_harness::{
     assert_recount, counter_totals, flip_largest_segment, scan_totals, ReelHarness,
 };
-use harness::wire::{apply_mutation, framed_value, group_prefix, wire_key, RECORDS, RECORDS_CF};
+use harness::wire::{
+    apply_mutation, framed_value, group_prefix, wire_key, RECORDS, RECORDS_CF, RECORD_KEY_LEN, TEST_COLUMNS,
+};
 
 /// Group most targeted tests write into
 const GROUP: u16 = 7;
@@ -341,12 +343,9 @@ fn a_sole_copy_footer_never_outlives_its_records() {
     }
 }
 
-// every crash boundary of a paged stream reopens with FastForward answering as the footers do
-//
-// Records roll the tight segment, so the stream seals several times, and the overwrites
-// and deletes leave keys with versions in more than one segment for the open to settle.
-#[test]
-fn every_boundary_fastforward_answers_as_the_footers() {
+/// A paged stream that seals several times, its overwrites and deletes leaving keys with
+/// versions in more than one segment for the open to settle
+fn sealing_stream() -> Vec<StreamOp> {
     let mut ops: Vec<StreamOp> = (1..=5u8)
         .map(|address| put(GROUP, address, SEAL_PAYLOAD, address))
         .collect();
@@ -367,6 +366,31 @@ fn every_boundary_fastforward_answers_as_the_footers() {
         len: SEAL_PAYLOAD,
         fill: 40,
     });
+    ops
+}
+
+/// The harness columns with their sealed keys held in key order
+const ORDERED_COLUMNS: ColumnSet = &[ordered(&TEST_COLUMNS[0]), ordered(&TEST_COLUMNS[1])];
+
+const fn ordered(spec: &ColumnSpec) -> ColumnSpec {
+    ColumnSpec {
+        id: spec.id,
+        name: spec.name,
+        key_width: spec.key_width,
+        shard_bytes: spec.shard_bytes,
+        purge_mark: spec.purge_mark,
+        codec: spec.codec,
+        map_shape: MapShape::Ordered,
+    }
+}
+
+// every crash boundary of a paged stream reopens with FastForward answering as the footers do
+//
+// Records roll the tight segment, so the stream seals several times, and the overwrites
+// and deletes leave keys with versions in more than one segment for the open to settle.
+#[test]
+fn every_boundary_fastforward_answers_as_the_footers() {
+    let ops = sealing_stream();
     let keys: Vec<RecordKey> = (1..=6u8)
         .map(|address| RecordKey::from_bytes(RECORDS, &wire_key(GROUP, address)).expect("key"))
         .collect();
@@ -402,6 +426,55 @@ fn every_boundary_fastforward_answers_as_the_footers() {
         }
     }
     assert!(loaded > 0, "no reopen loaded FastForward, so the comparison proved nothing");
+}
+
+// every crash boundary of a paged stream reopens with its ordered walks answering as the gets do
+//
+// The same stream on columns holding their sealed keys in key order, so a walk reads
+// FastForward in order. Walks up, down and of keys alone each have to match the gets.
+#[test]
+fn every_boundary_ordered_walks_answer_as_the_gets() {
+    let ops = sealing_stream();
+    let keys: Vec<Vec<u8>> = (1..=6u8).map(|address| wire_key(GROUP, address)).collect();
+    let paged = ReelConfig {
+        index: IndexResidency::Paged,
+        ..crash_config(1, SyncPolicy::Never, SEGMENT_SMALL)
+    };
+    let harness = ReelHarness::with_columns(paged, ORDERED_COLUMNS);
+    let total = harness.boundary_count(&ops);
+    assert!(total > 0, "the stream crosses no io boundary");
+
+    let mut walked = 0u64;
+    for crash_at in 0..total {
+        let (sim, _) = harness.run(FaultPlan::new(1).with_crash(crash_at), &ops);
+        let reopened = harness.reopen(sim.durable_image());
+        let mut want: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for key in &keys {
+            if let Some(value) = Store::get(&reopened, RECORDS_CF, key).expect("get") {
+                want.push((key.clone(), value.to_vec()));
+            }
+        }
+        let up: Vec<(Vec<u8>, Vec<u8>)> = Store::iter(&reopened, RECORDS_CF)
+            .expect("iter")
+            .map(|(key, value)| (key, value.to_vec()))
+            .collect();
+        assert_eq!(up, want, "a walk up after a crash at {crash_at}");
+        let mut down: Vec<(Vec<u8>, Vec<u8>)> =
+            Store::iter_from(&reopened, RECORDS_CF, &[0xFF; RECORD_KEY_LEN], Direction::Desc)
+                .expect("iter from")
+                .map(|(key, value)| (key, value.to_vec()))
+                .collect();
+        down.reverse();
+        assert_eq!(down, want, "a walk down after a crash at {crash_at}");
+        let alone: Vec<Vec<u8>> = reopened
+            .iter_keys_from(RECORDS_CF, None, Direction::Asc)
+            .expect("keys")
+            .collect();
+        let want_keys: Vec<Vec<u8>> = want.iter().map(|(key, _)| key.clone()).collect();
+        assert_eq!(alone, want_keys, "a key walk after a crash at {crash_at}");
+        walked = walked.max(reopened.index().ordered_walks().0);
+    }
+    assert!(walked > 0, "no reopen walked the ordered index, so the comparison proved nothing");
 }
 
 // a scattered crash across four tails keeps the acknowledged prefix too

@@ -718,7 +718,7 @@ impl ReelStore {
     }
 
     fn playback(&self, scope: Scope, column: ColumnId) -> Playback<'_> {
-        let page = Page::with_lens(&scope, column, self.serves(column));
+        let page = Page::reading(&scope, column, self.serves(column));
         Playback {
             store: self,
             scope,
@@ -808,6 +808,11 @@ impl Page {
     /// A cursor carrying each key's payload length, for a playback that stages reads
     fn with_lens(scope: &Scope, column: ColumnId, serves: bool) -> Page {
         Page::open(scope, column, serves, KeyPage::with_lens())
+    }
+
+    /// A cursor for a playback that reads every payload, which a walk may read for it
+    fn reading(scope: &Scope, column: ColumnId, serves: bool) -> Page {
+        Page::open(scope, column, serves, KeyPage::reading())
     }
 
     fn open(scope: &Scope, column: ColumnId, serves: bool, buffered: KeyPage) -> Page {
@@ -1071,6 +1076,16 @@ impl Playback<'_> {
             self.found.push(entry);
         }
 
+        // A walk that read a record whole already holds its payload, so only the rest
+        // go to the device.
+        let mut carried = Vec::new();
+        for (at, slot) in self.staged.iter().enumerate() {
+            if let Some(payload) = self.page.buffered.take_payload(*slot) {
+                self.found[at] = None;
+                carried.push((at, payload));
+            }
+        }
+
         // The entries came off the page the index already built, so the read goes
         // straight to the device rather than resolving these keys a second time.
         let column = self.column;
@@ -1083,6 +1098,9 @@ impl Playback<'_> {
         // left missing is looked up on its own and an unreadable one drops out.
         if let Err(error) = self.store.read_placed(&keys, &self.found, &mut self.placed) {
             tracing::warn!("a playback read a run one record at a time: {error}");
+        }
+        for (at, payload) in carried {
+            self.placed.hold(at, payload);
         }
         let missed: Vec<usize> = self.placed.missed().collect();
         for at in missed {

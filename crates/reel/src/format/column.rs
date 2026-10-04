@@ -279,6 +279,14 @@ impl RecordKey {
 pub enum MapShape {
     /// Ordered tree shards, which serve every column
     Tree,
+
+    /// Tree shards for what is unsealed, and sealed keys held in key order
+    ///
+    /// For a column whose keys are already uniform, such as content hashes or public
+    /// keys. A paged volume places its sealed keys by their own leading bytes, so a walk
+    /// reads them in order from one table, with no footer merge. Keys that
+    /// share a prefix pile into one place and should keep the tree.
+    Ordered,
 }
 
 /// What a column's keys measure, which is a width or the absence of one

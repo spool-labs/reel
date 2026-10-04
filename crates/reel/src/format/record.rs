@@ -599,6 +599,21 @@ pub fn head_for(prefix: &[u8], key: KeyRef<'_>) -> Option<(Lsn, u32, Flags)> {
     Some((lsn, read_u32_le(&fixed[OFFSET_LENGTH..OFFSET_CRC]), flags))
 }
 
+/// A record's key, version, length and kind, when the prefix it starts is one of this column's
+///
+/// The walk of an ordered index knows where a record is and not which key it holds,
+/// so the key comes off the header.
+pub fn head_any(prefix: &[u8], column: ColumnId, width: usize) -> Option<(&[u8], Lsn, u32, Flags)> {
+    let fixed = prefix.get(..HEADER_LEN)?;
+    if fixed[OFFSET_COLUMN] != column.as_u8() || usize::from(read_u16_le(&fixed[OFFSET_KEY_WIDTH..OFFSET_CODEC])) != width {
+        return None;
+    }
+    let key = prefix.get(HEADER_LEN..HEADER_LEN + width)?;
+    let flags = Flags::from_bits(fixed[OFFSET_FLAGS]).ok()?;
+    let lsn = Lsn(read_u64_le(&fixed[OFFSET_LSN..OFFSET_FLAGS]));
+    Some((key, lsn, read_u32_le(&fixed[OFFSET_LENGTH..OFFSET_CRC]), flags))
+}
+
 /// The key width a record claims, read from the fixed part of its header
 ///
 /// A walk needs this before it can parse the record, since the key sits between

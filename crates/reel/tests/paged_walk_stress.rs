@@ -1,6 +1,8 @@
 //! Walks of a paged column under writers, deletes, seals, handovers and compaction, drawn from one seed
 //!
-//! The column's walks merge the map with the footers. It holds three kinds of keys. Stable keys are written once before any
+//! Each seed runs a tree column, whose walks merge the map with the footers, and an
+//! ordered column, whose walks merge the map with FastForward. The column holds three
+//! kinds of keys. Stable keys are written once before any
 //! thread starts and never touched again. Live keys are written before the threads start
 //! too, and the writers overwrite them but never delete them. Churned keys belong to one
 //! writer each, which overwrites and deletes them while walks run. A key that is live for
@@ -43,6 +45,7 @@ const fn rows(map_shape: MapShape) -> ColumnSpec {
 }
 
 const TREE: ColumnSet = &[rows(MapShape::Tree)];
+const ORDERED: ColumnSet = &[rows(MapShape::Ordered)];
 
 /// Keys written once and never touched again
 const STABLE: u64 = 400;
@@ -341,8 +344,15 @@ fn run(seed: u64, columns: ColumnSet) {
         maintainer.join().expect("maintainer");
     });
 
+    let (pages, fallbacks) = store.index().ordered_walks();
     let last = last.lock().expect("last").clone();
-    println!("{case}: {} walks", walks.load(Ordering::Relaxed));
+    println!(
+        "{case}: {} walks, {pages} ordered pages, {fallbacks} sent to the footers",
+        walks.load(Ordering::Relaxed)
+    );
+    if columns[0].map_shape == MapShape::Ordered {
+        assert!(pages > 0, "{case}: no walk read the ordered index");
+    }
     Store::maintain(&*store).expect("maintain");
     settled(&store, &stable, &last, case, "after the writers");
 
@@ -367,4 +377,9 @@ fn seeds(columns: ColumnSet) {
 #[test]
 fn tree_walks_hold_under_writes_and_compaction() {
     seeds(TREE);
+}
+
+#[test]
+fn ordered_walks_hold_under_writes_and_compaction() {
+    seeds(ORDERED);
 }

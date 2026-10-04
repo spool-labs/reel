@@ -1,10 +1,12 @@
 //! Walks of a paged column answer as a model does, through writes, deletes, seals, compaction and reopens
 //!
-//! One column holds 16 byte keys spread like hashes, on a paged volume, so its sealed
-//! keys are answered by the footers. Every walk shape is checked against a model of
-//! what the column holds: whole walks both ways, walks from a bound, ranges, prefixes,
-//! keys alone, and walks the caller stops early. Checks follow maintenance, so a walk
-//! meets a compaction pass that has just retired a segment.
+//! One column holds 16 byte keys spread like hashes, on a paged volume. A tree column
+//! walks its sealed keys out of the footers, and an ordered one out of FastForward in
+//! key order. Every walk shape is checked against a model of what the column holds:
+//! whole walks both ways, walks from a bound, ranges, prefixes, keys alone, and walks
+//! the caller stops early. Checks follow maintenance, so a walk meets a compaction pass
+//! that has just retired a segment. The index counts the pages ordered walks filled, so
+//! an ordered run that quietly fell back to the footers fails.
 //!
 //! Knobs: REEL_PWM_SEEDS (how many seeds, default 6), REEL_PWM_FIRST (the first seed,
 //! default 1), REEL_PWM_OPS (ops a seed runs, default 3000) and REEL_PWM_SEED (one seed
@@ -36,6 +38,7 @@ const fn rows(map_shape: MapShape) -> ColumnSpec {
 }
 
 const TREE: ColumnSet = &[rows(MapShape::Tree)];
+const ORDERED: ColumnSet = &[rows(MapShape::Ordered)];
 
 /// Distinct keys a run writes, deletes and walks
 const KEYS: u64 = 2000;
@@ -231,7 +234,11 @@ fn run(seed: u64, columns: ColumnSet) {
         Store::maintain(&store).expect("maintain");
     }
     check(&store, &model, &mut rng, seed, "settled");
-    println!("seed {seed}: {} keys held", model.len());
+    let (pages, fallbacks) = store.index().ordered_walks();
+    println!("seed {seed} {:?}: {pages} ordered pages, {fallbacks} sent to the footers, {} keys held", columns[0].map_shape, model.len());
+    if columns[0].map_shape == MapShape::Ordered {
+        assert!(pages > 0, "seed {seed}: no walk read the ordered index");
+    }
 
 
     store.close().expect("close");
@@ -254,4 +261,9 @@ fn seeds(columns: ColumnSet) {
 #[test]
 fn tree_walks_answer_as_the_model() {
     seeds(TREE);
+}
+
+#[test]
+fn ordered_walks_answer_as_the_model() {
+    seeds(ORDERED);
 }

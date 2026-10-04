@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::{DurableImage, SimIo};
-use reel::{ReelConfig, ReelStore, SEGMENT_SUFFIX};
+use reel::{ColumnSet, ReelConfig, ReelStore, SEGMENT_SUFFIX};
 
 use crate::harness::observe::{observe, Totals};
 use crate::harness::op_stream::StreamOp;
@@ -21,12 +21,18 @@ const REEL_ROOT: &str = "/bulk";
 
 pub struct ReelHarness {
     config: ReelConfig,
+    columns: ColumnSet,
 }
 
 impl ReelHarness {
     /// A crash driver for one reel configuration
     pub fn new(config: ReelConfig) -> ReelHarness {
-        ReelHarness { config }
+        ReelHarness::with_columns(config, TEST_COLUMNS)
+    }
+
+    /// The same driver over a named column set
+    pub fn with_columns(config: ReelConfig, columns: ColumnSet) -> ReelHarness {
+        ReelHarness { config, columns }
     }
 
     /// Count the io boundaries a clean run of the stream crosses
@@ -48,7 +54,7 @@ impl ReelHarness {
         if let Ok(store) = ReelStore::open_with_io(
             root(),
             self.config.clone(),
-            TEST_COLUMNS,
+            self.columns,
             Arc::new(sim.clone()),
         ) {
             acknowledged = replay(&store, &sim, ops);
@@ -83,7 +89,7 @@ impl ReelHarness {
         if let Ok(store) = ReelStore::open_with_io(
             root(),
             self.config.clone(),
-            TEST_COLUMNS,
+            self.columns,
             Arc::new(sim.clone()),
         ) {
             acknowledged = replay_across(&store, &sim, ops, after);
@@ -102,7 +108,7 @@ impl ReelHarness {
 
     /// Open a store over a supplied simulator, expecting the open to succeed
     pub fn open_or_panic(&self, sim: SimIo) -> ReelStore {
-        ReelStore::open_with_io(root(), self.config.clone(), TEST_COLUMNS, Arc::new(sim))
+        ReelStore::open_with_io(root(), self.config.clone(), self.columns, Arc::new(sim))
             .expect("open reel over sim")
     }
 }

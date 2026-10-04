@@ -10,6 +10,10 @@
 //! Off Linux the page-cache probe always answers cold, so an overwrite always reads the
 //! displaced header from the device. On Linux the same run takes the cached path too.
 //!
+//! Each seed runs a tree column, whose FastForward places keys by a hash, and an ordered
+//! column, whose FastForward places them by their own leading bytes. Keys are scattered,
+//! the way content addresses spread, which the ordered layout needs.
+//!
 //! Knobs: REEL_FF_SEEDS (how many seeds, default 4), REEL_FF_FIRST (the first seed, default
 //! 1), REEL_FF_OPS (ops per writer, default 2000) and REEL_FF_SEED (one seed to replay).
 
@@ -30,15 +34,20 @@ use reel::format::column::RecordKey;
 use reel::sync::tension::block_on;
 use reel_core::Store;
 
-const COLUMNS: ColumnSet = &[ColumnSpec {
-    id: ColumnId(1),
-    name: "rows",
-    key_width: KeyWidth::Fixed(8),
-    shard_bytes: 0,
-    purge_mark: None,
-    codec: Codec::None,
-    map_shape: MapShape::Tree,
-}];
+const fn rows(map_shape: MapShape) -> ColumnSpec {
+    ColumnSpec {
+        id: ColumnId(1),
+        name: "rows",
+        key_width: KeyWidth::Fixed(8),
+        shard_bytes: 0,
+        purge_mark: None,
+        codec: Codec::None,
+        map_shape,
+    }
+}
+
+const TREE: ColumnSet = &[rows(MapShape::Tree)];
+const ORDERED: ColumnSet = &[rows(MapShape::Ordered)];
 
 const KEYS: u64 = 1200;
 
@@ -50,6 +59,14 @@ fn knob(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+/// The bytes of key number `key`, scattered so their leading bits are uniform
+fn key_bytes(key: u64) -> [u8; 8] {
+    let mut mixed = key.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (mixed ^ (mixed >> 31)).to_be_bytes()
 }
 
 /// A value that carries its key and op and fills the rest from both, so a torn or misplaced read cannot pass
@@ -140,10 +157,10 @@ fn writer(store: &ReelStore, ledger: &Ledger, seed: u64, id: u64, writers: u64, 
         }
         ledger.started[key as usize].store(op, Ordering::Release);
         match is_delete {
-            true => Store::delete(store, "rows", &key.to_be_bytes()).expect("delete"),
+            true => Store::delete(store, "rows", &key_bytes(key)).expect("delete"),
             false => {
                 let len = rng.gen_range(0..400);
-                Store::put(store, "rows", &key.to_be_bytes(), &value_of(key, op, len)).expect("put");
+                Store::put(store, "rows", &key_bytes(key), &value_of(key, op, len)).expect("put");
             }
         }
         ledger.completed[key as usize].store(op, Ordering::Release);
@@ -151,7 +168,7 @@ fn writer(store: &ReelStore, ledger: &Ledger, seed: u64, id: u64, writers: u64, 
 }
 
 fn record_key(key: u64) -> RecordKey {
-    RecordKey::from_bytes(COLUMNS[0].id, &key.to_be_bytes()).expect("key")
+    RecordKey::from_bytes(ColumnId(1), &key_bytes(key)).expect("key")
 }
 
 /// Whether a window could have come from a put that falls between `floor` and `ceiling`
@@ -176,7 +193,7 @@ fn reader(store: &ReelStore, ledger: &Ledger, seed: u64, id: u64, done: &AtomicB
         let path = rng.gen_range(0..4u32);
         let (at, len) = (rng.gen_range(0..24u64), rng.gen_range(1..64usize));
         let answers: Vec<Option<Vec<u8>>> = match path {
-            0 => vec![Store::get(store, "rows", &keys[0].to_be_bytes()).expect("get").map(|value| value.to_vec())],
+            0 => vec![Store::get(store, "rows", &key_bytes(keys[0])).expect("get").map(|value| value.to_vec())],
             1 => vec![block_on(store.get_wait(&record_key(keys[0]))).expect("get").map(|value| value.to_vec())],
             2 => {
                 let asked: Vec<RecordKey> = keys.iter().map(|key| record_key(*key)).collect();
@@ -211,17 +228,17 @@ fn settled(store: &ReelStore, ledger: &Ledger, seed: u64, stage: &str) {
     for key in 0..KEYS {
         let last = ledger.completed[key as usize].load(Ordering::Acquire);
         let want = (last != 0 && !ledger.is_delete(key, last)).then_some(last);
-        let got = Store::get(store, "rows", &key.to_be_bytes()).expect("get");
+        let got = Store::get(store, "rows", &key_bytes(key)).expect("get");
         let answer = got.map(|value| op_of(seed, key, &value));
         assert_eq!(answer, want, "seed {seed}: key {key} after {stage}");
     }
 }
 
-fn run(seed: u64) {
+fn run(seed: u64, columns: ColumnSet) {
     let mut rng = SmallRng::seed_from_u64(seed);
     let dir = TempDir::new().expect("tempdir");
     let config = config(&mut rng);
-    let store = Arc::new(ReelStore::open(dir.path().to_path_buf(), config.clone(), COLUMNS).expect("open"));
+    let store = Arc::new(ReelStore::open(dir.path().to_path_buf(), config.clone(), columns).expect("open"));
     let ledger = Arc::new(Ledger::new());
     let ops = knob("REEL_FF_OPS", 2000);
     let writers = rng.gen_range(1..=3u64);
@@ -261,7 +278,8 @@ fn run(seed: u64) {
     assert!(store.index().fast_held() > 0, "seed {seed}: nothing reached FastForward");
     let compaction = store.compaction_counters();
     println!(
-        "seed {seed}: {writers} writers, {readers} readers, {read} reads, FastForward holds {}, {} segments rewritten, {} unlinked whole",
+        "seed {seed} {:?}: {writers} writers, {readers} readers, {read} reads, FastForward holds {}, {} segments rewritten, {} unlinked whole",
+        columns[0].map_shape,
         store.index().fast_held(),
         compaction.segments_rewritten,
         compaction.segments_unlinked_whole,
@@ -273,18 +291,27 @@ fn run(seed: u64) {
     let store = Arc::into_inner(store).expect("one owner");
     store.close().expect("close");
     drop(store);
-    let reopened = ReelStore::open(dir.path().to_path_buf(), config, COLUMNS).expect("reopen");
+    let reopened = ReelStore::open(dir.path().to_path_buf(), config, columns).expect("reopen");
     settled(&reopened, &ledger, seed, "a reopen");
 }
 
-#[test]
-fn fastforward_reads_hold_under_writes_and_compaction() {
+fn seeds(columns: ColumnSet) {
     if let Some(seed) = std::env::var("REEL_FF_SEED").ok().and_then(|seed| seed.parse().ok()) {
-        run(seed);
+        run(seed, columns);
         return;
     }
     let first = knob("REEL_FF_FIRST", 1);
     for seed in first..first + knob("REEL_FF_SEEDS", 4) {
-        run(seed);
+        run(seed, columns);
     }
+}
+
+#[test]
+fn fastforward_reads_hold_under_writes_and_compaction() {
+    seeds(TREE);
+}
+
+#[test]
+fn ordered_fastforward_reads_hold_under_writes_and_compaction() {
+    seeds(ORDERED);
 }

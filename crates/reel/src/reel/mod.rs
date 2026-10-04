@@ -37,7 +37,7 @@ use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::{Lsn, LsnCounter};
 use crate::format::record::HEADER_LEN;
 use crate::index::counters::{FilterProbes, SegmentTable};
-use crate::index::fastforward::{FastRead, Head, HeadRead, RecordSource};
+use crate::index::fastforward::{FastRead, Head, HeadRead, RecordSource, RowAsk, RowRead};
 use crate::index::paged::{FooterCache, FooterSource};
 use crate::index::recovery::{read_footer, ResumableTail};
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
@@ -79,6 +79,33 @@ const DIRECT_DEPTH_FLOOR: u64 = 2;
 
 /// Where FastForward reads the records its entries point at
 impl RecordSource for ReelShared {
+    fn rows(&self, column: ColumnId, width: usize, asks: &[RowAsk], keys: &mut Vec<u8>) -> Result<Vec<RowRead>> {
+        let prefix = HEADER_LEN + width;
+        keys.clear();
+        keys.resize(asks.len() * width, 0);
+        let mut ops = Vec::with_capacity(asks.len());
+        let mut handles = Vec::with_capacity(asks.len());
+        for ask in asks {
+            let handle = self.handle_for(ask.segment)?;
+            if let Some(handle) = &handle {
+                ops.push(self.driver.split_read(handle.file(), u64::from(ask.offset), prefix, ask.bound as usize));
+            }
+            handles.push(handle);
+        }
+        let filled = self.driver.run_split_reads(ops)?;
+        let mut filled = filled.into_iter();
+        let mut rows = Vec::with_capacity(asks.len());
+        for ((ask, handle), key) in asks.iter().zip(&handles).zip(keys.chunks_exact_mut(width)) {
+            let Some(handle) = handle else {
+                rows.push(RowRead::Gone);
+                continue;
+            };
+            let answer = next_split(&mut filled)?;
+            rows.push(self.row_verdict(answer, column, ask, handle.file(), key)?);
+        }
+        Ok(rows)
+    }
+
     fn head(&self, key: KeyRef<'_>, segment: SegmentId, offset: u32) -> Result<HeadRead> {
         let Some(handle) = self.handle_for(segment)? else {
             return Ok(HeadRead::Missing);
@@ -339,6 +366,60 @@ impl ReelShared {
         Ok(verdict)
     }
 
+    /// Settle one walked row's read: its key into `key`, its header, and its payload when the read was for it
+    fn row_verdict(&self, answer: SplitAnswer, column: ColumnId, ask: &RowAsk, file: FileId, key: &mut [u8]) -> Result<RowRead> {
+        let (bytes, mut body) = match answer {
+            Ok(read) => read,
+            Err((error, spare)) => {
+                recycle_header(spare);
+                return match is_missing(&error) {
+                    true => Ok(RowRead::Gone),
+                    false => Err(error),
+                };
+            }
+        };
+        let found = crate::format::record::head_any(&bytes, column, key.len())
+            .filter(|(_, _, _, flags)| flags.is_data() || flags.is_tombstone())
+            .map(|(read, lsn, len, flags)| {
+                key.copy_from_slice(read);
+                Head {
+                    lsn,
+                    len,
+                    is_tombstone: flags.is_tombstone(),
+                }
+            });
+        let Some(head) = found else {
+            recycle_header(bytes);
+            crate::reel::payload::give(body);
+            return Ok(RowRead::Other);
+        };
+        if head.is_tombstone || ask.bound == 0 {
+            recycle_header(bytes);
+            crate::reel::payload::give(body);
+            return Ok(RowRead::Found { head, value: None });
+        }
+        let loc = Loc::new(ask.segment, ask.offset, head.len);
+        if body.len() >= head.len as usize {
+            body.truncate(head.len as usize);
+            let read = frame_to_read(bytes, body, KeyRef::new(column, key), head.lsn, loc, self.config.verify_reads);
+            return Ok(row_read_of(read, head));
+        }
+        // The payload outruns the bound, so the record reads again at its own length.
+        recycle_header(bytes);
+        crate::reel::payload::give(body);
+        let record_key = RecordKey::from_bytes(column, key)?;
+        Ok(match self.whole_record(file, &record_key, head, loc)? {
+            FastRead::Found(head, value) => RowRead::Found {
+                head,
+                value: Some(value),
+            },
+            FastRead::Tombstone(head) => RowRead::Found { head, value: None },
+            FastRead::Gone => RowRead::Gone,
+            FastRead::Other => RowRead::Other,
+            FastRead::Unsure => RowRead::Unsure,
+        })
+    }
+
     /// One record read at the length its header gave
     fn whole_record(&self, file: FileId, key: &RecordKey, head: Head, loc: Loc) -> Result<FastRead> {
         let prefix = HEADER_LEN + key.as_slice().len();
@@ -474,6 +555,18 @@ fn head_read(prefix: &[u8], key: KeyRef<'_>) -> HeadRead {
             is_tombstone: flags.is_tombstone(),
         }),
         Some(_) | None => HeadRead::Other,
+    }
+}
+
+/// What a checked read of one walked row settles
+fn row_read_of(read: RecordRead, head: Head) -> RowRead {
+    match read {
+        RecordRead::Found(value) => RowRead::Found {
+            head,
+            value: Some(value),
+        },
+        RecordRead::Stale => RowRead::Other,
+        RecordRead::Gone | RecordRead::Corrupt | RecordRead::Coded => RowRead::Unsure,
     }
 }
 

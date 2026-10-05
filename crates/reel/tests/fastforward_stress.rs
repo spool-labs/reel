@@ -10,9 +10,7 @@
 //! Off Linux the page-cache probe always answers cold, so an overwrite always reads the
 //! displaced header from the device. On Linux the same run takes the cached path too.
 //!
-//! Each seed runs a tree column, whose FastForward places keys by a hash, and an ordered
-//! column, whose FastForward places them by their own leading bytes. Keys are scattered,
-//! the way content addresses spread, which the ordered layout needs.
+//! Keys are scattered, the way content addresses spread.
 //!
 //! Knobs: REEL_FF_SEEDS (how many seeds, default 4), REEL_FF_FIRST (the first seed, default
 //! 1), REEL_FF_OPS (ops per writer, default 2000) and REEL_FF_SEED (one seed to replay).
@@ -47,7 +45,6 @@ const fn rows(map_shape: MapShape) -> ColumnSpec {
 }
 
 const TREE: ColumnSet = &[rows(MapShape::Tree)];
-const ORDERED: ColumnSet = &[rows(MapShape::Ordered)];
 
 const KEYS: u64 = 1200;
 
@@ -309,9 +306,4 @@ fn seeds(columns: ColumnSet) {
 #[test]
 fn fastforward_reads_hold_under_writes_and_compaction() {
     seeds(TREE);
-}
-
-#[test]
-fn ordered_fastforward_reads_hold_under_writes_and_compaction() {
-    seeds(ORDERED);
 }

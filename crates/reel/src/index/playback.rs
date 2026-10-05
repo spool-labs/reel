@@ -11,8 +11,6 @@ use std::sync::Arc;
 
 use std::ops::Bound;
 
-use reel_core::Value;
-
 use crate::error::Result;
 use crate::format::column::{ColumnId, KeyBytes, MAX_KEY_LEN};
 use crate::format::footer::{FooterPartition, FooterRow, SegmentFooter};
@@ -20,7 +18,6 @@ use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::index::column::ColumnIndex;
 use crate::index::entry::Entry;
-use crate::index::fastforward::{FastColumn, RowAsk, RowRead, WalkRow};
 use crate::index::page::KeyPage;
 use crate::index::paged::{FooterSource, SealedRanges};
 
@@ -49,216 +46,255 @@ pub enum Way {
     Down,
 }
 
-/// One sealed segment's rows for one column, stepped in the playback's own order
-struct SegmentRows {
+/// One sealed segment's rows for one column, held for the length of a playback
+struct Run {
     /// Segment the rows came from, which is where their records are
     segment: SegmentId,
 
-    /// The whole footer, held for the run so stepping a row costs no read
+    /// The whole footer, held so stepping a row costs no read
     footer: Arc<SegmentFooter>,
 
     /// Which of the footer's partitions holds this column
     partition: usize,
-
-    /// Row the cursor sits on
-    at: usize,
-
-    /// Whether the cursor has passed the last row in its direction
-    spent: bool,
-
-    /// Direction the cursor steps in
-    way: Way,
 }
 
-impl SegmentRows {
-    /// Open a cursor on one segment's rows for a column, placed at a bound
-    ///
-    /// Nothing comes back when the segment holds no rows for the column, or when
-    /// the bound is already past every row it does hold.
-    fn open(
-        segment: SegmentId,
-        footer: Arc<SegmentFooter>,
-        column: ColumnId,
-        way: Way,
-        from: Bound<&[u8]>,
-    ) -> Option<SegmentRows> {
-        let partition = footer
-            .partitions
-            .iter()
-            .position(|partition| partition.column == column)?;
-        let rows = &footer.partitions[partition];
-        if rows.is_empty() {
-            return None;
-        }
-
-        let at = match (way, from) {
-            (Way::Up, Bound::Unbounded) => 0,
-            (Way::Up, Bound::Included(key)) => rows.lower_bound(key),
-            (Way::Up, Bound::Excluded(key)) => rows.upper_bound(key),
-            (Way::Down, Bound::Unbounded) => rows.len() - 1,
-            (Way::Down, Bound::Included(key)) => rows.upper_bound(key).checked_sub(1)?,
-            (Way::Down, Bound::Excluded(key)) => rows.lower_bound(key).checked_sub(1)?,
-        };
-        if at >= rows.len() {
-            return None;
-        }
-
-        Some(SegmentRows {
-            segment,
-            footer,
-            partition,
-            at,
-            spent: false,
-            way,
-        })
-    }
-
+impl Run {
     fn rows(&self) -> &FooterPartition {
         &self.footer.partitions[self.partition]
     }
-
-    /// The key the cursor sits on, or nothing once it has run out
-    fn key(&self) -> Option<&[u8]> {
-        match self.spent {
-            true => None,
-            false => self.rows().key_at(self.at),
-        }
-    }
-
-    /// Take the newest row for the key the cursor sits on and step past its run
-    ///
-    /// A segment that overwrote its own record holds both versions under one key in
-    /// write order, so the newest is the last of the run and stepping past the rest
-    /// keeps a repeated key from being merged twice.
-    fn take(&mut self) -> Result<Option<FooterRow>> {
-        let Some((first, last)) = self.run() else {
-            return Ok(None);
-        };
-        // The last of a run is the live one, whichever end the playback came at it from.
-        let found = self.rows().row_at(last)?;
-        self.step_past(first, last);
-        Ok(Some(found))
-    }
-
-    /// Step past every row sharing the key the cursor sits on, reading none of them
-    fn skip(&mut self) {
-        match self.run() {
-            Some((first, last)) => self.step_past(first, last),
-            None => self.spent = true,
-        }
-    }
-
-    /// The rows sharing the key the cursor sits on, or nothing once it has run out
-    fn run(&self) -> Option<(usize, usize)> {
-        match self.spent {
-            true => None,
-            false => self.rows().run(self.at),
-        }
-    }
-
-    /// Move the cursor off a run, which is the one part of this the direction owns
-    fn step_past(&mut self, first: usize, last: usize) {
-        let next = match self.way {
-            // Asking the row itself rather than the count, since the count is a
-            // division by a stride the partition works out every time it is asked.
-            Way::Up => self.rows().key_at(last + 1).map(|_| last + 1),
-            Way::Down => first.checked_sub(1),
-        };
-        match next {
-            Some(at) => self.at = at,
-            None => self.spent = true,
-        }
-    }
 }
 
-/// The open cursors, ordered so the one holding the next key is to hand
+/// The key one cursor stands on: the rows sharing it, and its leading bytes
 ///
-/// Ordering costs the depth of a heap per key where a scan over every cursor costs
-/// its width. The heap holds positions rather than keys, since the cursor a position
-/// names already holds its key.
-#[derive(Default)]
-struct Front {
-    /// Cursor positions, heap ordered by the key each one sits on
-    order: Vec<usize>,
+/// A segment that overwrote its own record holds both versions under one key in write
+/// order, so the last row sharing a key is the live one, whichever end a playback
+/// reaches it from.
+#[derive(Clone, Copy)]
+struct Head {
+    /// The key's leading eight bytes, big-endian, which settle nearly every compare
+    lead: u64,
+
+    /// First and last row sharing the key
+    first: usize,
+    last: usize,
+
+    /// Whether the cursor has passed the last row in its direction
+    is_spent: bool,
 }
 
-impl Front {
-    /// Order every cursor that still holds a key
-    fn new(rows: &[SegmentRows], way: Way) -> Front {
-        let mut front = Front {
-            order: (0..rows.len())
-                .filter(|at| rows[*at].key().is_some())
-                .collect(),
+impl Head {
+    const SPENT: Head = Head {
+        lead: 0,
+        first: 0,
+        last: 0,
+        is_spent: true,
+    };
+
+    /// The head a cursor stepping one way has when it arrives at a row
+    ///
+    /// Stepping up arrives at the first row of a key and stepping down at the last, so
+    /// only the far end of the run is looked for.
+    fn at(rows: &FooterPartition, way: Way, row: usize) -> Head {
+        let Some(key) = rows.key_at(row) else {
+            return Head::SPENT;
         };
-        for at in (0..front.order.len() / 2).rev() {
-            front.sift_down(rows, way, at);
-        }
-        front
-    }
-
-    /// The cursor holding the next key in playback order
-    fn peek(&self) -> Option<usize> {
-        self.order.first().copied()
-    }
-
-    /// Take the front cursor off, leaving the next one in its place
-    fn pop(&mut self, rows: &[SegmentRows], way: Way) -> Option<usize> {
-        let front = self.order.first().copied()?;
-        let last = self.order.pop().expect("a heap that answered");
-        if !self.order.is_empty() {
-            self.order[0] = last;
-            self.sift_down(rows, way, 0);
-        }
-        Some(front)
-    }
-
-    /// Put a cursor back once it has moved, unless it has run out
-    fn push(&mut self, rows: &[SegmentRows], way: Way, at: usize) {
-        if rows[at].key().is_none() {
-            return;
-        }
-        self.order.push(at);
-        self.sift_up(rows, way, self.order.len() - 1);
-    }
-
-    fn sift_up(&mut self, rows: &[SegmentRows], way: Way, mut at: usize) {
-        while at > 0 {
-            let parent = (at - 1) / 2;
-            if !ahead_of(rows, way, self.order[at], self.order[parent]) {
-                return;
-            }
-            self.order.swap(at, parent);
-            at = parent;
-        }
-    }
-
-    fn sift_down(&mut self, rows: &[SegmentRows], way: Way, mut at: usize) {
-        loop {
-            let mut first = at;
-            for child in [at * 2 + 1, at * 2 + 2] {
-                if child < self.order.len()
-                    && ahead_of(rows, way, self.order[child], self.order[first])
-                {
-                    first = child;
+        let (mut first, mut last) = (row, row);
+        match way {
+            Way::Up => {
+                while rows.key_at(last + 1) == Some(key) {
+                    last += 1;
                 }
             }
-            if first == at {
-                return;
+            Way::Down => {
+                while first > 0 && rows.key_at(first - 1) == Some(key) {
+                    first -= 1;
+                }
             }
-            self.order.swap(at, first);
-            at = first;
+        }
+        Head {
+            lead: lead_of(key),
+            first,
+            last,
+            is_spent: false,
+        }
+    }
+
+    /// Where a cursor opened at a bound first stands
+    ///
+    /// A bound outside the rows' own range places the cursor at their near end with no
+    /// search, which is every segment of a merged run but the one holding the bound.
+    fn placed(rows: &FooterPartition, way: Way, from: Bound<&[u8]>) -> Head {
+        let count = rows.len();
+        let (Some(low), Some(high)) = (rows.key_at(0), count.checked_sub(1).and_then(|last| rows.key_at(last))) else {
+            return Head::SPENT;
+        };
+        let row = match (way, from) {
+            (Way::Up, Bound::Unbounded) => Some(0),
+            (Way::Up, Bound::Included(key)) if key <= low => Some(0),
+            (Way::Up, Bound::Included(key)) => Some(rows.lower_bound(key)),
+            (Way::Up, Bound::Excluded(key)) if key < low => Some(0),
+            (Way::Up, Bound::Excluded(key)) => Some(rows.upper_bound(key)),
+            (Way::Down, Bound::Unbounded) => Some(count - 1),
+            (Way::Down, Bound::Included(key)) if key >= high => Some(count - 1),
+            (Way::Down, Bound::Included(key)) => rows.upper_bound(key).checked_sub(1),
+            (Way::Down, Bound::Excluded(key)) if key > high => Some(count - 1),
+            (Way::Down, Bound::Excluded(key)) => rows.lower_bound(key).checked_sub(1),
+        };
+        match row {
+            Some(row) => Head::at(rows, way, row),
+            None => Head::SPENT,
         }
     }
 }
 
-/// Whether one cursor's key comes before another's in the playback's own order
-fn ahead_of(rows: &[SegmentRows], way: Way, left: usize, right: usize) -> bool {
-    match (rows[left].key(), rows[right].key()) {
-        (Some(left), Some(right)) => is_ahead(way, left, right),
-        // A cursor that has run out sorts behind one that has not, so the heap
-        // empties from the front rather than carrying spent cursors at its root.
-        (Some(_), None) => true,
-        (None, _) => false,
+/// A key's leading eight bytes as one integer, zero filled past a short key
+///
+/// Two leads that differ order their keys as the bytes do, and equal ones leave the
+/// rest of the keys to decide.
+fn lead_of(key: &[u8]) -> u64 {
+    let mut lead = [0u8; 8];
+    let led = key.len().min(8);
+    lead[..led].copy_from_slice(&key[..led]);
+    u64::from_be_bytes(lead)
+}
+
+/// A cursor on every sealed run a playback reaches, played against each other in a loser tree
+///
+/// A step plays the cursor that moved up its own path, one compare a level, and the leads
+/// settle nearly every compare without a key being read.
+#[derive(Default)]
+struct Sealed {
+    runs: Vec<Run>,
+    heads: Vec<Head>,
+
+    /// The loser each node holds, and at 0 the cursor holding the next key
+    tree: Vec<usize>,
+}
+
+impl Sealed {
+    /// Play cursors already placed against each other
+    fn new(runs: Vec<Run>, heads: Vec<Head>, way: Way) -> Sealed {
+        let count = heads.len();
+        let mut sealed = Sealed {
+            runs,
+            heads,
+            tree: vec![0; count],
+        };
+        // Leaves stand past the nodes, and a node's children are the winners below it.
+        let mut winners = vec![0usize; 2 * count];
+        for leaf in 0..count {
+            winners[count + leaf] = leaf;
+        }
+        for node in (1..count).rev() {
+            let (left, right) = (winners[2 * node], winners[2 * node + 1]);
+            let (won, lost) = match sealed.ahead(way, right, left) {
+                true => (right, left),
+                false => (left, right),
+            };
+            winners[node] = won;
+            sealed.tree[node] = lost;
+        }
+        if count > 0 {
+            sealed.tree[0] = winners[1];
+        }
+        sealed
+    }
+
+    /// The key the front cursor stands on, or nothing once every run is spent
+    fn key(&self) -> Option<&[u8]> {
+        self.key_of(*self.tree.first()?)
+    }
+
+    fn key_of(&self, at: usize) -> Option<&[u8]> {
+        let head = &self.heads[at];
+        match head.is_spent {
+            true => None,
+            false => self.runs[at].rows().key_at(head.first),
+        }
+    }
+
+    /// The front cursor, when it stands on this key
+    fn front_on(&self, key: &[u8]) -> Option<usize> {
+        let at = *self.tree.first()?;
+        (self.key_of(at) == Some(key)).then_some(at)
+    }
+
+    /// Step every cursor standing on a key past it, reading none of their rows
+    fn skip(&mut self, way: Way, key: &[u8]) {
+        while let Some(at) = self.front_on(key) {
+            self.step(way, at);
+        }
+    }
+
+    /// The newest row any cursor holds for a key, under a ceiling when one is given
+    ///
+    /// Every cursor standing on the key is stepped past it either way. The sequence
+    /// number decides rather than the segment number, since a volume writing through
+    /// several tails can land a rewrite in a lower-numbered segment.
+    fn newest(&mut self, way: Way, key: &[u8], below: Option<Lsn>) -> Result<Option<(SegmentId, FooterRow)>> {
+        let mut newest: Option<(SegmentId, FooterRow)> = None;
+        while let Some(at) = self.front_on(key) {
+            let found = self.runs[at].rows().row_at(self.heads[at].last)?;
+            let segment = self.runs[at].segment;
+            self.step(way, at);
+            let is_under = below.is_none_or(|below| found.lsn < below);
+            if is_under && newest.as_ref().is_none_or(|(_, newest)| newest.lsn < found.lsn) {
+                newest = Some((segment, found));
+            }
+        }
+        Ok(newest)
+    }
+
+    /// Move the front cursor off its key and play it up the tree
+    fn step(&mut self, way: Way, at: usize) {
+        let head = self.heads[at];
+        let next = match way {
+            Way::Up => Some(head.last + 1),
+            Way::Down => head.first.checked_sub(1),
+        };
+        self.heads[at] = match next {
+            Some(row) => Head::at(self.runs[at].rows(), way, row),
+            None => Head::SPENT,
+        };
+        self.replay(way, at);
+    }
+
+    /// Play one leaf up to the root, leaving the new front at 0
+    ///
+    /// Only the front cursor may move, since every loser on its path was played
+    /// against it and no other leaf's path says the same.
+    fn replay(&mut self, way: Way, leaf: usize) {
+        let mut winner = leaf;
+        let mut node = (self.heads.len() + leaf) / 2;
+        while node > 0 {
+            let held = self.tree[node];
+            if self.ahead(way, held, winner) {
+                self.tree[node] = winner;
+                winner = held;
+            }
+            node /= 2;
+        }
+        self.tree[0] = winner;
+    }
+
+    /// Whether one cursor's key comes before another's in the playback's order
+    ///
+    /// A spent cursor sorts behind every live one, so the tree empties from the front.
+    fn ahead(&self, way: Way, left: usize, right: usize) -> bool {
+        let (one, other) = (&self.heads[left], &self.heads[right]);
+        if one.is_spent || other.is_spent {
+            return !one.is_spent;
+        }
+        if one.lead != other.lead {
+            return match way {
+                Way::Up => one.lead < other.lead,
+                Way::Down => one.lead > other.lead,
+            };
+        }
+        match (self.key_of(left), self.key_of(right)) {
+            (Some(one), Some(other)) => is_ahead(way, one, other),
+            _ => false,
+        }
     }
 }
 
@@ -275,11 +311,8 @@ pub struct PlaybackCursor {
     /// Where the next page starts, or nothing once the playback has run out
     at: Option<Bound<KeyBytes>>,
 
-    /// One open cursor per sealed segment the playback reaches into
-    rows: Vec<SegmentRows>,
-
-    /// Those same cursors, ordered by the key each one sits on
-    front: Front,
+    /// A cursor on every sealed segment the playback reaches into
+    sealed: Sealed,
 
     /// The sealed set the cursors were opened against, so a change reopens them
     generation: Option<u64>,
@@ -295,8 +328,7 @@ impl PlaybackCursor {
             column,
             way,
             at: Some(owned_bound(from)?),
-            rows: Vec::new(),
-            front: Front::default(),
+            sealed: Sealed::default(),
             generation: None,
             resident: KeyPage::with_lens(),
         })
@@ -395,8 +427,7 @@ impl PlaybackCursor {
         let Some(at) = self.at.as_ref() else {
             return Ok(());
         };
-        self.rows = paged.open_rows(self.way, borrowed_bound(at))?;
-        self.front = Front::new(&self.rows, self.way);
+        self.sealed = paged.open_sealed(self.way, borrowed_bound(at))?;
         self.generation = Some(generation);
         Ok(())
     }
@@ -428,10 +459,7 @@ pub fn merged_page(
     playback.open(paged)?;
 
     let PlaybackCursor {
-        rows,
-        front,
-        resident,
-        ..
+        sealed, resident, ..
     } = playback;
     // A page that came back full says nothing about the keys past its last, so the
     // merge stops there rather than emitting a footer key over an unread one.
@@ -443,7 +471,7 @@ pub fn merged_page(
     let mut want = [0u8; MAX_KEY_LEN];
 
     while out.len() < limit {
-        let Some(key) = next_key(resident.key_ref(taken), rows, front, way, &mut want) else {
+        let Some(key) = next_key(resident.key_ref(taken), sealed, way, &mut want) else {
             break;
         };
         if edge.is_some_and(|edge| is_ahead(way, edge, key)) {
@@ -453,10 +481,7 @@ pub fn merged_page(
         // The map's answer stands on its own, so the footers are stepped past this
         // key without their rows being decoded.
         if resident.key_ref(taken) == Some(key) {
-            take_front(rows, front, way, key, |_, row| {
-                row.skip();
-                Ok(())
-            })?;
+            sealed.skip(way, key);
             // Dropping the key here would lose it for good, since the next page
             // starts after the last key this one emitted.
             let found = resident
@@ -468,7 +493,7 @@ pub fn merged_page(
         }
         // A key missing from the page can still be one the map took since the page was
         // read. A grave drops it, and a put answers with its own entry.
-        let newest = newest_row(rows, front, way, key)?;
+        let newest = sealed.newest(way, key, None)?;
         if let Some(entry) = index.entry_or_grave(key) {
             if !entry.is_grave() && !index.is_covered_key(key, entry.lsn) {
                 out.push(key, entry);
@@ -492,352 +517,6 @@ pub fn merged_page(
 
     playback.advance(out, limit)?;
     Ok(())
-}
-
-/// Times one round of an ordered page looks again when a sealed slot left under its look,
-/// before the footers answer
-const ORDERED_TRIES: usize = 8;
-
-/// How an ordered page fill came out
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Ordered {
-    /// The page is filled and the playback moved past it
-    Filled,
-
-    /// The sealed index moved under every look of a round, or met a record only the
-    /// checked path reads, so the footers fill this page
-    Footers,
-}
-
-/// One sealed row an ordered page has read
-struct SealedRow {
-    /// Where the key its record holds sits in the round's packed keys, counted in keys
-    at: usize,
-    lsn: Lsn,
-    len: u32,
-    is_tombstone: bool,
-
-    /// Whether this version came from a slot an overwrite or a delete booked as older
-    is_displaced: bool,
-    segment: SegmentId,
-    offset: u32,
-
-    /// The payload, none for a tombstone
-    payload: Option<Value>,
-}
-
-/// One ordered page's walk: where its next round starts, and the buffers each round refills
-struct Walk {
-    /// The map is read past this bound, and a sealed row on the near side of it is dropped
-    from: Bound<KeyBytes>,
-
-    /// The lead the sealed walk resumes at, inclusive, or nothing to start at the near end
-    ///
-    /// Every sealed row on the near side of it has been merged by an earlier round.
-    lead: Option<u64>,
-
-    /// Whether a round has merged the last lead there is in the page's direction
-    is_sealed_done: bool,
-
-    /// The sealed rows a round's look found
-    rows: Vec<WalkRow>,
-
-    /// The keys their records hold, packed at the column's width
-    keys: Vec<u8>,
-}
-
-/// What one round left the page to do
-enum Round {
-    /// The page has room and more of the column may be left
-    More,
-
-    /// The map and the sealed index both ran out
-    End,
-
-    /// The footers fill the page
-    Footers,
-}
-
-/// The last key a round merged, from the map's page or from the sealed rows
-#[derive(Clone, Copy)]
-enum Merged {
-    Map(usize),
-    Sealed(usize),
-}
-
-/// Fill a page from the map and an ordered sealed index, leaving the footers closed
-///
-/// A page fills in rounds. Each round takes the map's page and a run of sealed rows back
-/// to back, reads each row's record for its key, and merges the two. A record's key
-/// settles a tie on the leading bytes, an older version beside a newer one, and a row of
-/// the bound's own lead on the wrong side of it.
-///
-/// The map is read first, so a key handed from the map to the index is seen at least
-/// once. A put moves a key the other way, and the index counts the slot it lets go, so a
-/// round whose look saw a slot leave the shards it crossed looks again over half the
-/// span. The look is memory alone, which keeps that window short, and the records are
-/// read after it.
-pub fn ordered_page(
-    paged: &Paged<'_>,
-    fast: &FastColumn,
-    width: usize,
-    settle: &dyn Fn(&[u8]) -> Result<Option<Entry>>,
-    playback: &mut PlaybackCursor,
-    limit: usize,
-    out: &mut KeyPage,
-) -> Result<Ordered> {
-    out.clear();
-    let Some(from) = playback.at.clone() else {
-        return Ok(Ordered::Filled);
-    };
-    let lead = match &from {
-        Bound::Included(key) | Bound::Excluded(key) => Some(FastColumn::lead(key.as_slice())),
-        Bound::Unbounded => None,
-    };
-    // Sized to the page once, rather than regrown a row at a time.
-    let mut walk = Walk {
-        from,
-        lead,
-        is_sealed_done: false,
-        rows: Vec::with_capacity(limit),
-        keys: Vec::with_capacity(limit * width),
-    };
-    while out.len() < limit {
-        match ordered_round(paged, fast, width, settle, playback, &mut walk, limit, out)? {
-            Round::More => {}
-            Round::End => break,
-            Round::Footers => return Ok(Ordered::Footers),
-        }
-    }
-    playback.advance(out, limit)?;
-    // The footers' cursors stand where the last footer page left them, so the next one
-    // opens them again here.
-    playback.generation = None;
-    Ok(Ordered::Filled)
-}
-
-/// One round of an ordered page: one look at the map and the index, then the records it points at
-#[allow(clippy::too_many_arguments)]
-fn ordered_round(
-    paged: &Paged<'_>,
-    fast: &FastColumn,
-    width: usize,
-    settle: &dyn Fn(&[u8]) -> Result<Option<Entry>>,
-    playback: &mut PlaybackCursor,
-    walk: &mut Walk,
-    limit: usize,
-    out: &mut KeyPage,
-) -> Result<Round> {
-    let index = paged.index;
-    let PlaybackCursor { way, resident, .. } = playback;
-    let way = *way;
-    let from = borrowed_bound(&walk.from);
-    let (near, far) = match way {
-        Way::Up => (0, u64::MAX),
-        Way::Down => (u64::MAX, 0),
-    };
-
-    let mut span = limit - out.len();
-    let mut looks = 0;
-    // The last lead a walk cut short read, or nothing when the walk ran off the end
-    let cut = loop {
-        if looks == ORDERED_TRIES {
-            return Ok(Round::Footers);
-        }
-        looks += 1;
-        let before = fast.taken_all();
-        resident_page(index, way, from, span, resident);
-        walk.rows.clear();
-        if !walk.is_sealed_done {
-            fast.walk_lead(walk.lead, way, span, &mut walk.rows);
-        }
-        let cut = (walk.rows.len() >= span)
-            .then(|| walk.rows.last().map(|row| row.lead))
-            .flatten();
-        if !fast.moved_between(&before, walk.lead.unwrap_or(near), cut.unwrap_or(far)) {
-            break cut;
-        }
-        span = (span / 2).max(1);
-    };
-    // A full map page says nothing past its last key.
-    let edge = (resident.len() == span)
-        .then(|| resident.key_ref(span - 1))
-        .flatten();
-    let walked = walk.rows.last().map(|row| row.lead);
-
-    let Some(mut sealed) = read_sealed(fast, paged.column, width, way, walk)? else {
-        return Ok(Round::Footers);
-    };
-    let keys = walk.keys.as_slice();
-    let key_of = |row: &SealedRow| &keys[row.at * width..(row.at + 1) * width];
-    let mut next = 0usize;
-    let mut taken = 0usize;
-    let mut merged = None;
-    let mut is_at_cut = false;
-    while out.len() < limit {
-        let mapped = resident.key_ref(taken);
-        let from_map = match (mapped, sealed.get(next)) {
-            (None, None) => break,
-            (Some(_), None) => true,
-            (None, Some(_)) => false,
-            (Some(mapped), Some(row)) => mapped == key_of(row) || is_ahead(way, mapped, key_of(row)),
-        };
-        if from_map {
-            let key = mapped.expect("a map key was chosen");
-            // A map key past the last lead a cut walk read may have sealed rows before it
-            // that no round has read yet.
-            let lead = FastColumn::lead(key);
-            let is_past = |last: u64| match way {
-                Way::Up => lead > last,
-                Way::Down => lead < last,
-            };
-            if cut.is_some_and(is_past) {
-                is_at_cut = true;
-                break;
-            }
-            if sealed.get(next).is_some_and(|row| key_of(row) == key) {
-                next += 1;
-            }
-            let found = resident
-                .found_at(taken)
-                .expect("the map's page holds its entries");
-            out.push(key, found);
-            merged = Some(Merged::Map(taken));
-            taken += 1;
-            continue;
-        }
-
-        let row = &mut sealed[next];
-        let key = key_of(row);
-        if edge.is_some_and(|edge| is_ahead(way, edge, key)) {
-            break;
-        }
-        merged = Some(Merged::Sealed(next));
-        next += 1;
-        // A key the map took since its page was read: a grave drops it, and a put
-        // answers with its own entry.
-        if let Some(entry) = index.entry_or_grave(key) {
-            if !entry.is_grave() && !index.is_covered_key(key, entry.lsn) {
-                out.push(key, entry);
-            }
-            continue;
-        }
-        if row.is_tombstone || index.is_covered_key(key, row.lsn) {
-            continue;
-        }
-        // A version an overwrite or a delete booked as older stands only once the get path
-        // agrees, since its delete may have no grave left in the map.
-        if row.is_displaced {
-            match settle(key)? {
-                Some(entry) if (entry.loc.segment, entry.loc.offset) == (row.segment, row.offset) => {}
-                // A newer version FastForward holds no slot for, which the footers serve.
-                Some(_) => return Ok(Round::Footers),
-                // Deleted, with its grave gone from the map.
-                None => continue,
-            }
-        }
-        let entry = Entry::new(Loc::new(row.segment, row.offset, row.len), row.lsn);
-        out.push_read(key, entry, row.payload.take());
-    }
-
-    if out.len() >= limit {
-        return Ok(Round::More);
-    }
-    // Short of a full page, a map page that was not full and a walk that ran off the end
-    // read both to their ends in one look.
-    if edge.is_none() && cut.is_none() {
-        return Ok(Round::End);
-    }
-    let merged = merged.map(|merged| match merged {
-        Merged::Map(at) => resident.key_ref(at).expect("a merged map key"),
-        Merged::Sealed(at) => key_of(&sealed[at]),
-    });
-    let step = |last: u64| match way {
-        Way::Up => last.checked_add(1),
-        Way::Down => last.checked_sub(1),
-    };
-    let (lead, is_last) = match (is_at_cut, edge, walked) {
-        // The map's page reached past the cut and every row walked was merged.
-        (true, _, _) => (cut.and_then(step), true),
-        // A full map page may end short of what the walk read, and a key handed over
-        // between rounds could sit in that gap, so the next walk starts back at the last
-        // key merged.
-        (false, Some(_), _) => (merged.map(FastColumn::lead).or(walk.lead), false),
-        (false, None, Some(last)) => (step(last), true),
-        (false, None, None) => (walk.lead, false),
-    };
-    if let Some(merged) = merged {
-        walk.from = Bound::Excluded(KeyBytes::new(merged)?);
-    }
-    walk.is_sealed_done |= is_last && lead.is_none();
-    walk.lead = lead;
-    Ok(Round::More)
-}
-
-/// Read the records a look's rows point at and order them by key, one row a key
-///
-/// The newest version of a key stands, a tie going to the newer segment, which is a
-/// compaction copy of the other. A row whose segment is gone is taken out of the index,
-/// since its record moved on or died. One only the checked path can read sends the page
-/// to the footers. Each record is read whole, so its payload comes in the same read.
-fn read_sealed(
-    fast: &FastColumn,
-    column: ColumnId,
-    width: usize,
-    way: Way,
-    walk: &mut Walk,
-) -> Result<Option<Vec<SealedRow>>> {
-    let Walk { from, rows, keys, .. } = walk;
-    let from = borrowed_bound(from);
-    let asks: Vec<RowAsk> = rows
-        .iter()
-        .map(|row| RowAsk {
-            segment: row.segment,
-            offset: row.offset,
-            bound: row.bound,
-        })
-        .collect();
-    let Some(reads) = fast.read_rows(column, width, &asks, keys)? else {
-        return Ok(None);
-    };
-    let mut read = Vec::with_capacity(rows.len());
-    for (at, (row, answer)) in rows.iter().zip(reads).enumerate() {
-        match answer {
-            RowRead::Found { head, value } => read.push(SealedRow {
-                at,
-                lsn: head.lsn,
-                len: head.len,
-                is_tombstone: head.is_tombstone,
-                is_displaced: row.is_displaced,
-                segment: row.segment,
-                offset: row.offset,
-                payload: value,
-            }),
-            // The record moved on and its source retired, so the slot points at nothing.
-            RowRead::Gone => fast.forget_row(row),
-            RowRead::Other => {}
-            RowRead::Unsure => return Ok(None),
-        }
-    }
-    let keys = keys.as_slice();
-    let key_of = |row: &SealedRow| &keys[row.at * width..(row.at + 1) * width];
-    read.retain(|row| match (way, from) {
-        (_, Bound::Unbounded) => true,
-        (Way::Up, Bound::Included(bound)) => key_of(row) >= bound,
-        (Way::Up, Bound::Excluded(bound)) => key_of(row) > bound,
-        (Way::Down, Bound::Included(bound)) => key_of(row) <= bound,
-        (Way::Down, Bound::Excluded(bound)) => key_of(row) < bound,
-    });
-    // Newest version first within a key, so the dedup below keeps it.
-    read.sort_unstable_by(|left, right| {
-        let by_key = match way {
-            Way::Up => key_of(left).cmp(key_of(right)),
-            Way::Down => key_of(right).cmp(key_of(left)),
-        };
-        by_key.then((right.lsn, right.segment).cmp(&(left.lsn, left.segment)))
-    });
-    read.dedup_by(|later, kept| key_of(later) == key_of(kept));
-    Ok(Some(read))
 }
 
 /// One page of a column's own map, in the playback's direction
@@ -887,13 +566,13 @@ pub fn release_rows(
     }
     playback.open(paged)?;
     let way = playback.way;
-    let PlaybackCursor { rows, front, .. } = playback;
+    let PlaybackCursor { sealed, .. } = playback;
     let mut want = [0u8; MAX_KEY_LEN];
     let mut examined = 0usize;
     let mut last_len = 0usize;
 
     while examined < limit {
-        let Some(key) = next_key(None, rows, front, way, &mut want) else {
+        let Some(key) = next_key(None, sealed, way, &mut want) else {
             return Ok(ReleaseRun {
                 resume: None,
                 examined,
@@ -908,7 +587,7 @@ pub fn release_rows(
         examined += 1;
         last_len = key.len();
 
-        let Some((segment, found)) = newest_row_below(rows, front, way, key, below)? else {
+        let Some((segment, found)) = sealed.newest(way, key, Some(below))? else {
             continue;
         };
         if found.is_tombstone() || found.is_range_tombstone() {
@@ -951,33 +630,6 @@ fn successor(key: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// The newest row below a floor any open cursor holds for a key
-///
-/// Every cursor sitting on the key is stepped past it either way, so a key is
-/// visited once whatever the rows said.
-fn newest_row_below(
-    rows: &mut [SegmentRows],
-    front: &mut Front,
-    way: Way,
-    key: &[u8],
-    below: Lsn,
-) -> Result<Option<(SegmentId, FooterRow)>> {
-    let mut newest: Option<(SegmentId, FooterRow)> = None;
-    take_front(rows, front, way, key, |segment, row| {
-        if let Some(found) = row.take()? {
-            if found.lsn < below
-                && newest
-                    .as_ref()
-                    .is_none_or(|(_, newest)| newest.lsn < found.lsn)
-            {
-                newest = Some((segment, found));
-            }
-        }
-        Ok(())
-    })?;
-    Ok(newest)
-}
-
 /// Copy a borrowed bound, for a playback that carries its place between pages
 fn owned_bound(bound: Bound<&[u8]>) -> Result<Bound<KeyBytes>> {
     Ok(match bound {
@@ -998,7 +650,7 @@ fn borrowed_bound(bound: &Bound<KeyBytes>) -> Bound<&[u8]> {
 
 impl Paged<'_> {
     /// Open a cursor on every sealed segment whose keys reach into the playback
-    fn open_rows(&self, way: Way, from: Bound<&[u8]>) -> Result<Vec<SegmentRows>> {
+    fn open_sealed(&self, way: Way, from: Bound<&[u8]>) -> Result<Sealed> {
         let bound = match from {
             Bound::Unbounded => None,
             Bound::Included(key) | Bound::Excluded(key) => Some(key),
@@ -1008,63 +660,26 @@ impl Paged<'_> {
             Way::Down => self.sealed.spanning(None, bound),
         };
 
-        let mut rows = Vec::with_capacity(reachable.len());
+        let mut runs = Vec::with_capacity(reachable.len());
+        let mut heads = Vec::with_capacity(reachable.len());
         for segment in reachable {
             // A segment retired between the range read and this one is simply gone,
             // and what it held has been copied on or was dead.
             let Some(footer) = self.footers.footer(segment)? else {
                 continue;
             };
-            if let Some(cursor) = SegmentRows::open(segment, footer, self.column, way, from) {
-                rows.push(cursor);
+            let Some(partition) = footer.partitions.iter().position(|rows| rows.column == self.column) else {
+                continue;
+            };
+            let head = Head::placed(&footer.partitions[partition], way, from);
+            if head.is_spent {
+                continue;
             }
+            runs.push(Run { segment, footer, partition });
+            heads.push(head);
         }
-        Ok(rows)
+        Ok(Sealed::new(runs, heads, way))
     }
-}
-
-/// The newest row any open cursor holds for a key, stepping every one of them past it
-///
-/// The sequence number decides it rather than the segment number, since a volume
-/// writing through several tails can land a rewrite in a lower-numbered segment.
-fn newest_row(
-    rows: &mut [SegmentRows],
-    front: &mut Front,
-    way: Way,
-    key: &[u8],
-) -> Result<Option<(SegmentId, FooterRow)>> {
-    let mut newest: Option<(SegmentId, FooterRow)> = None;
-    take_front(rows, front, way, key, |segment, row| {
-        if let Some(found) = row.take()? {
-            if newest
-                .as_ref()
-                .is_none_or(|(_, newest)| newest.lsn < found.lsn)
-            {
-                newest = Some((segment, found));
-            }
-        }
-        Ok(())
-    })?;
-    Ok(newest)
-}
-
-/// Visit every cursor sitting on a key, and put each back where it now belongs
-///
-/// Only the cursors holding the key are touched, which is what the ordering buys.
-fn take_front(
-    rows: &mut [SegmentRows],
-    front: &mut Front,
-    way: Way,
-    key: &[u8],
-    mut visit: impl FnMut(SegmentId, &mut SegmentRows) -> Result<()>,
-) -> Result<()> {
-    while front.peek().is_some_and(|at| rows[at].key() == Some(key)) {
-        let at = front.pop(rows, way).expect("a front that answered");
-        let segment = rows[at].segment;
-        visit(segment, &mut rows[at])?;
-        front.push(rows, way, at);
-    }
-    Ok(())
 }
 
 /// The next key in playback order across the map's page and every open cursor
@@ -1073,12 +688,11 @@ fn take_front(
 /// since the merge steps those sources while it still has the key in hand.
 fn next_key<'a>(
     resident: Option<&[u8]>,
-    rows: &[SegmentRows],
-    front: &Front,
+    sealed: &Sealed,
     way: Way,
     want: &'a mut [u8; MAX_KEY_LEN],
 ) -> Option<&'a [u8]> {
-    let sealed = front.peek().and_then(|at| rows[at].key());
+    let sealed = sealed.key();
     let best = match (resident, sealed) {
         (Some(resident), Some(sealed)) => match is_ahead(way, sealed, resident) {
             true => sealed,

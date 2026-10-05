@@ -37,7 +37,7 @@ use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::{Lsn, LsnCounter};
 use crate::format::record::HEADER_LEN;
 use crate::index::counters::{FilterProbes, SegmentTable};
-use crate::index::fastforward::{FastRead, Head, HeadRead, RecordSource, RowAsk, RowRead};
+use crate::index::fastforward::{FastRead, Head, HeadRead, RecordSource};
 use crate::index::paged::{FooterCache, FooterSource};
 use crate::index::recovery::{read_footer, ResumableTail};
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
@@ -77,99 +77,8 @@ const DIRECT_RECORD_FLOOR: u32 = 1024 * 1024;
 /// is the case it loses.
 const DIRECT_DEPTH_FLOOR: u64 = 2;
 
-/// Walked rows one read covers: a span of one segment, and the rows' places in the batch's order
-struct RowRun {
-    segment: SegmentId,
-    file: FileId,
-
-    /// Where the read starts, the first row's offset
-    base: u64,
-
-    /// Where the read ends, past the furthest byte any of its rows needs
-    end: u64,
-
-    /// The rows it covers, as a range of the batch's place order
-    first: usize,
-    last: usize,
-}
-
 /// Where FastForward reads the records its entries point at
 impl RecordSource for ReelShared {
-    fn rows(&self, column: ColumnId, width: usize, asks: &[RowAsk], keys: &mut Vec<u8>) -> Result<Vec<RowRead>> {
-        let prefix = (HEADER_LEN + width) as u64;
-        keys.clear();
-        keys.resize(asks.len() * width, 0);
-        let mut rows: Vec<RowRead> = asks.iter().map(|_| RowRead::Gone).collect();
-        // In place order neighbours share one read, and a walk in key order over a sorted
-        // run asks for neighbours already. A row's end is its length class, which reaches
-        // past the record's own end, so runs join on what they already read.
-        let mut order: Vec<usize> = (0..asks.len()).collect();
-        order.sort_unstable_by_key(|&at| (asks[at].segment, asks[at].offset));
-        let reach = merge_span(self.driver.serving());
-        let mut runs: Vec<RowRun> = Vec::new();
-        // Held until the reads are done, so no segment is unlinked under one in flight.
-        let mut held = Vec::new();
-        for (slot, &at) in order.iter().enumerate() {
-            let ask = &asks[at];
-            let start = u64::from(ask.offset);
-            let end = start + prefix + u64::from(ask.bound);
-            if let Some(run) = runs.last_mut() {
-                if run.segment == ask.segment && start <= run.end + MERGE_GAP && end.max(run.end) - run.base <= reach {
-                    run.end = run.end.max(end);
-                    run.last = slot + 1;
-                    continue;
-                }
-            }
-            let file = match runs.last() {
-                Some(run) if run.segment == ask.segment => run.file,
-                _ => match self.handle_for(ask.segment)? {
-                    Some(handle) => {
-                        let file = handle.file();
-                        held.push(handle);
-                        file
-                    }
-                    None => continue,
-                },
-            };
-            runs.push(RowRun {
-                segment: ask.segment,
-                file,
-                base: start,
-                end,
-                first: slot,
-                last: slot + 1,
-            });
-        }
-        let ops = runs
-            .iter()
-            .map(|run| self.driver.split_read(run.file, run.base, 0, (run.end - run.base) as usize))
-            .collect();
-        let mut filled = self.driver.run_split_reads(ops)?.into_iter();
-        for run in &runs {
-            let block = match next_split(&mut filled)? {
-                Ok((head, body)) => {
-                    recycle_header(head);
-                    ReadBlock::new(body, crate::reel::payload::give)
-                }
-                Err((error, spare)) => {
-                    recycle_header(spare);
-                    match is_missing(&error) {
-                        true => continue,
-                        false => return Err(error),
-                    }
-                }
-            };
-            for &at in &order[run.first..run.last] {
-                let ask = &asks[at];
-                let key = &mut keys[at * width..(at + 1) * width];
-                let offset = (u64::from(ask.offset) - run.base) as usize;
-                rows[at] = self.row_in_block(&block, offset, column, ask, run.file, key)?;
-            }
-        }
-        drop(held);
-        Ok(rows)
-    }
-
     fn head(&self, key: KeyRef<'_>, segment: SegmentId, offset: u32) -> Result<HeadRead> {
         let Some(handle) = self.handle_for(segment)? else {
             return Ok(HeadRead::Missing);
@@ -428,52 +337,6 @@ impl ReelShared {
         recycle_header(bytes);
         crate::reel::payload::give(body);
         Ok(verdict)
-    }
-
-    /// Settle one walked row out of its run's block: its key into `key`, its header, and its payload when asked
-    fn row_in_block(&self, block: &ReadBlock, at: usize, column: ColumnId, ask: &RowAsk, file: FileId, key: &mut [u8]) -> Result<RowRead> {
-        let prefix = HEADER_LEN + key.len();
-        let found = block
-            .get(at..)
-            .and_then(|bytes| crate::format::record::head_any(bytes, column, key.len()))
-            .filter(|(_, _, _, flags)| flags.is_data() || flags.is_tombstone())
-            .map(|(read, lsn, len, flags)| {
-                key.copy_from_slice(read);
-                Head {
-                    lsn,
-                    len,
-                    is_tombstone: flags.is_tombstone(),
-                }
-            });
-        let Some(head) = found else {
-            return Ok(RowRead::Other);
-        };
-        if head.is_tombstone || ask.bound == 0 {
-            return Ok(RowRead::Found { head, value: None });
-        }
-        let loc = Loc::new(ask.segment, ask.offset, head.len);
-        match check_in_block(block, at, prefix, KeyRef::new(column, key), head.lsn, loc, self.config.verify_reads) {
-            Ok(0) => Ok(RowRead::Found {
-                head,
-                value: block.window(at + prefix, head.len as usize),
-            }),
-            // A coded record, or one failing its checksum, is the checked path's to read.
-            Ok(_) | Err(RecordRead::Corrupt) => Ok(RowRead::Unsure),
-            // The payload outruns what the run read, so the record reads again at its own length.
-            Err(_) => {
-                let record_key = RecordKey::from_bytes(column, key)?;
-                Ok(match self.whole_record(file, &record_key, head, loc)? {
-                    FastRead::Found(head, value) => RowRead::Found {
-                        head,
-                        value: Some(value),
-                    },
-                    FastRead::Tombstone(head) => RowRead::Found { head, value: None },
-                    FastRead::Gone => RowRead::Gone,
-                    FastRead::Other => RowRead::Other,
-                    FastRead::Unsure => RowRead::Unsure,
-                })
-            }
-        }
     }
 
     /// One record read at the length its header gave

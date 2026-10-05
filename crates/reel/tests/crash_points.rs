@@ -16,7 +16,7 @@ use reel::format::record::{BatchFrame, RecordHeader, HEADER_LEN};
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::{
-    ByteCount, ColumnSet, ColumnSpec, CompactPass, CompactRate, IndexResidency, MapShape, Preallocate,
+    ByteCount, CompactPass, CompactRate, IndexResidency, Preallocate,
     RecordWrite, ReelConfig, ReelStore, RepairPath, SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
 };
 use reel_core::{Direction, Store, Value};
@@ -369,21 +369,6 @@ fn sealing_stream() -> Vec<StreamOp> {
     ops
 }
 
-/// The harness columns with their sealed keys held in key order
-const ORDERED_COLUMNS: ColumnSet = &[ordered(&TEST_COLUMNS[0]), ordered(&TEST_COLUMNS[1])];
-
-const fn ordered(spec: &ColumnSpec) -> ColumnSpec {
-    ColumnSpec {
-        id: spec.id,
-        name: spec.name,
-        key_width: spec.key_width,
-        shard_bytes: spec.shard_bytes,
-        purge_mark: spec.purge_mark,
-        codec: spec.codec,
-        map_shape: MapShape::Ordered,
-    }
-}
-
 // every crash boundary of a paged stream reopens with FastForward answering as the footers do
 //
 // Records roll the tight segment, so the stream seals several times, and the overwrites
@@ -428,23 +413,22 @@ fn every_boundary_fastforward_answers_as_the_footers() {
     assert!(loaded > 0, "no reopen loaded FastForward, so the comparison proved nothing");
 }
 
-// every crash boundary of a paged stream reopens with its ordered walks answering as the gets do
+// every crash boundary of a paged stream reopens with its walks answering as the gets do
 //
-// The same stream on columns holding their sealed keys in key order, so a walk reads
-// FastForward in order. Walks up, down and of keys alone each have to match the gets.
+// Walks up, down and of keys alone merge the map with the footers, and each has to
+// match the gets.
 #[test]
-fn every_boundary_ordered_walks_answer_as_the_gets() {
+fn every_boundary_walks_answer_as_the_gets() {
     let ops = sealing_stream();
     let keys: Vec<Vec<u8>> = (1..=6u8).map(|address| wire_key(GROUP, address)).collect();
     let paged = ReelConfig {
         index: IndexResidency::Paged,
         ..crash_config(1, SyncPolicy::Never, SEGMENT_SMALL)
     };
-    let harness = ReelHarness::with_columns(paged, ORDERED_COLUMNS);
+    let harness = ReelHarness::with_columns(paged, TEST_COLUMNS);
     let total = harness.boundary_count(&ops);
     assert!(total > 0, "the stream crosses no io boundary");
 
-    let mut walked = 0u64;
     for crash_at in 0..total {
         let (sim, _) = harness.run(FaultPlan::new(1).with_crash(crash_at), &ops);
         let reopened = harness.reopen(sim.durable_image());
@@ -472,9 +456,7 @@ fn every_boundary_ordered_walks_answer_as_the_gets() {
             .collect();
         let want_keys: Vec<Vec<u8>> = want.iter().map(|(key, _)| key.clone()).collect();
         assert_eq!(alone, want_keys, "a key walk after a crash at {crash_at}");
-        walked = walked.max(reopened.index().ordered_walks().0);
     }
-    assert!(walked > 0, "no reopen walked the ordered index, so the comparison proved nothing");
 }
 
 // a scattered crash across four tails keeps the acknowledged prefix too

@@ -27,17 +27,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     map_shape: MapShape::Tree,
 }];
 
-/// The same column with its sealed keys walked in key order out of FastForward
-const ORDERED: ColumnSet = &[ColumnSpec {
-    id: ColumnId(1),
-    name: "rows",
-    key_width: KeyWidth::Fixed(16),
-    shard_bytes: 0,
-    purge_mark: None,
-    codec: Codec::None,
-    map_shape: MapShape::Ordered,
-}];
-
 /// A segment no tail will reach, standing in for a carried copy's segment
 const COPY: SegmentId = SegmentId(u32::MAX - 1);
 
@@ -211,11 +200,11 @@ fn a_put_after_a_delete_survives_compacting_its_tombstone() {
     assert!(walked(&store), "a walk lost the second put");
 }
 
-// an ordered walk keeps a deleted key out once its grave is pruned, though its old version stands displaced
+// a walk keeps a deleted key out once its grave is pruned, with its old version still sealed
 #[test]
-fn an_ordered_walk_keeps_a_deleted_key_out_once_its_grave_is_pruned() {
+fn a_walk_keeps_a_deleted_key_out_once_its_grave_is_pruned() {
     let dir = TempDir::new().expect("temp dir");
-    let store = ReelStore::open(dir.path().to_path_buf(), config(), ORDERED).expect("open");
+    let store = ReelStore::open(dir.path().to_path_buf(), config(), COLUMNS).expect("open");
     Store::put(&store, "rows", &the_key(), b"first").expect("put");
     fill(&store, 1);
     Store::delete(&store, "rows", &the_key()).expect("delete");

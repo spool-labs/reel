@@ -16,7 +16,7 @@ use crate::config::IndexResidency;
 use crate::engine::Totals;
 use crate::error::{ReelError, Result};
 use crate::format::column::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyWidth, MapShape, RecordKey,
+    Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, RecordKey,
 };
 use crate::format::footer::{FooterPartition, SegmentFooter};
 use crate::format::loc::{Loc, SegmentId};
@@ -24,10 +24,10 @@ use crate::format::lsn::Lsn;
 use crate::index::column::{ColumnIndex, KeyMove, Landed, PendingCover};
 use crate::index::counters::{Floors, SegmentBytes, SegmentStamp, SegmentTable};
 use crate::index::entry::Entry;
-use crate::index::fastforward::{FastColumn, Layout, Lookup, Pick, RecordSource, Settled, Since, LOOKUP_TRIES};
+use crate::index::fastforward::{FastColumn, Lookup, Pick, RecordSource, Settled, Since, LOOKUP_TRIES};
 use crate::index::page::KeyPage;
 use crate::index::paged::{Candidates, FooterSource, SealedRanges};
-use crate::index::playback::{self, merged_page, ordered_page, Ordered, Paged, PlaybackCursor, Way};
+use crate::index::playback::{self, merged_page, Paged, PlaybackCursor, Way};
 use crate::index::recovery::SealedSpan;
 
 /// Slots in the lookup from a column identifier to its index
@@ -229,12 +229,6 @@ pub struct ReelIndex {
     /// Segments retired since FastForward last dropped the entries pointing into them
     retired: AtomicU64,
 
-    /// Pages an ordered column's walk filled from its ordered index
-    ordered_pages: AtomicU64,
-
-    /// Pages it sent to the footers, because every look of a round moved or a record needed the checked path
-    ordered_fallbacks: AtomicU64,
-
     /// Column identifier to its position, so routing a record is one load
     by_id: Vec<Option<usize>>,
 
@@ -286,17 +280,10 @@ impl ReelIndex {
             sealed,
             fast: columns
                 .iter()
-                // FastForward is rebuilt from the footers at every open, so a column can
-                // take or leave the ordered layout across opens.
-                .map(|spec| match spec.map_shape {
-                    MapShape::Ordered => FastColumn::with_layout(Layout::Ordered),
-                    MapShape::Tree => FastColumn::new(),
-                })
+                .map(|_| FastColumn::new())
                 .collect(),
             fast_ready: AtomicBool::new(false),
             retired: AtomicU64::new(0),
-            ordered_pages: AtomicU64::new(0),
-            ordered_fallbacks: AtomicU64::new(0),
             by_id,
             segments: Arc::new(SegmentTable::new()),
             footers: OnceLock::new(),
@@ -437,14 +424,6 @@ impl ReelIndex {
     /// Older versions FastForward holds for its cleaner
     pub fn fast_beside(&self) -> u64 {
         self.fast.iter().map(FastColumn::beside).sum()
-    }
-
-    /// Pages ordered walks filled from their ordered index, and pages they sent to the footers
-    pub fn ordered_walks(&self) -> (u64, u64) {
-        (
-            self.ordered_pages.load(Ordering::Relaxed),
-            self.ordered_fallbacks.load(Ordering::Relaxed),
-        )
     }
 
     /// Entries FastForward holds in all
@@ -1695,33 +1674,8 @@ impl ReelIndex {
             return Ok(());
         };
         match self.paged_footers(slot) {
-            Some(footers) => {
-                let paged = self.paged_at(slot, column, footers);
-                if let Some(width) = self.ordered_width(slot, out) {
-                    let settle = |key: &[u8]| -> Result<Option<Entry>> { self.get(&RecordKey::from_bytes(column, key)?) };
-                    if ordered_page(&paged, &self.fast[slot], width, &settle, playback, limit, out)? == Ordered::Filled {
-                        self.ordered_pages.fetch_add(1, Ordering::Relaxed);
-                        return Ok(());
-                    }
-                    self.ordered_fallbacks.fetch_add(1, Ordering::Relaxed);
-                }
-                merged_page(&paged, playback, limit, out)
-            }
+            Some(footers) => merged_page(&self.paged_at(slot, column, footers), playback, limit, out),
             None => playback.page_resident(&self.indexes[slot], limit, out),
-        }
-    }
-
-    /// The key width an ordered column's walks read records at, once its index holds every sealed key
-    ///
-    /// None sends a walk to the footers: a hashed column, a column of variable width, an
-    /// index still loading, or a walk of keys alone, which the footers hold already.
-    fn ordered_width(&self, at: usize, out: &KeyPage) -> Option<usize> {
-        if !out.reads_payloads() || !self.fast_serves() || self.fast[at].layout() != Layout::Ordered {
-            return None;
-        }
-        match self.columns[at].key_width {
-            KeyWidth::Fixed(width) if width > 0 => Some(usize::from(width)),
-            KeyWidth::Fixed(_) | KeyWidth::Variable => None,
         }
     }
 

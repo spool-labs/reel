@@ -16,7 +16,6 @@ use crate::format::lsn::Lsn;
 use crate::index::counters::SegmentTable;
 use crate::index::entry::Entry;
 use crate::index::paged::FooterSource;
-use crate::index::playback::Way;
 use crate::sync::{lock, read, write};
 
 /// Slots in one bucket, which fills one cache line
@@ -157,33 +156,6 @@ pub struct Candidate {
     slot: Slot,
 }
 
-/// One sealed row of an ordered walk, in the order its table holds it
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WalkRow {
-    /// The key's leading seven bytes as placed, which order rows up to a tie
-    pub lead: u64,
-    pub segment: SegmentId,
-    pub offset: u32,
-    pub bound: u32,
-    pub is_grave: bool,
-
-    /// Whether an overwrite or a delete booked this version as older, so it never answers alone
-    pub is_displaced: bool,
-}
-
-impl WalkRow {
-    fn of(shard: usize, slot: Slot) -> WalkRow {
-        WalkRow {
-            lead: ((shard as u64) << 56) | (u64::from(slot.mid) << 24) | u64::from(slot.tag()),
-            segment: slot.segment(),
-            offset: slot.offset,
-            bound: slot.bound(),
-            is_grave: slot.is_grave(),
-            is_displaced: slot.is_displaced(),
-        }
-    }
-}
-
 /// A lookup in progress: the candidates in order, and the newest version read so far
 pub struct Pick {
     hash: u64,
@@ -228,42 +200,8 @@ pub enum Lookup {
     Unsettled,
 }
 
-/// One walked row to read, whatever key it holds
-#[derive(Clone, Copy, Debug)]
-pub struct RowAsk {
-    pub segment: SegmentId,
-    pub offset: u32,
-
-    /// Payload bytes to read beside the header, zero for the key alone
-    pub bound: u32,
-}
-
-/// What reading one walked row settled
-pub enum RowRead {
-    /// A record of the column: its header, and its payload when the read was for it
-    ///
-    /// The key goes in the caller's packed buffer. A read for the key alone stops short
-    /// of the payload, so nothing checks those bytes against the record's checksum.
-    Found { head: Head, value: Option<Value> },
-
-    /// The segment is gone, so the row moved or died under the walk
-    Gone,
-
-    /// No record of the column starts there, or one did and failed its check
-    Other,
-
-    /// A coded record, or one a read came up short on, which the checked path reads
-    Unsure,
-}
-
 /// Where the index reads the records it points at
 pub trait RecordSource: Send + Sync {
-    /// The records at several places, whatever keys they hold, in one submission
-    ///
-    /// Each found record's key goes into `keys` at its ask's place, packed at the
-    /// column's width.
-    fn rows(&self, column: ColumnId, width: usize, asks: &[RowAsk], keys: &mut Vec<u8>) -> Result<Vec<RowRead>>;
-
     /// The header at a place, read from the device if it must be
     fn head(&self, key: KeyRef<'_>, segment: SegmentId, offset: u32) -> Result<HeadRead>;
 
@@ -329,42 +267,6 @@ fn mix(mut value: u64) -> u64 {
     value ^= value >> 33;
     value = value.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
     value ^ (value >> 33)
-}
-
-/// How a column places its sealed keys, which decides whether its table can be walked
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum Layout {
-    /// Spread by a hash, so keys of any shape share the load
-    #[default]
-    Hashed,
-
-    /// Kept in key order by the key's own leading bytes, so a walk reads the table
-    ///
-    /// For keys that are already uniform, such as content hashes and public keys. A
-    /// column whose keys share a prefix piles them into one cluster.
-    Ordered,
-}
-
-/// The bits a key is placed by under a layout
-fn bits_of(layout: Layout, key: &[u8]) -> u64 {
-    match layout {
-        Layout::Hashed => hash_of(key),
-        Layout::Ordered => lead_of(key),
-    }
-}
-
-/// A key's first seven bytes, laid out so the shard, mid and tag read them in order
-///
-/// The shard takes byte 0, the mid bytes 1 to 4 and the tag bytes 5 and 6, so two
-/// keys compare by these bits as they compare by those bytes. A short key reads as
-/// zeros past its end.
-fn lead_of(key: &[u8]) -> u64 {
-    let mut lead = [0u8; 7];
-    let len = key.len().min(lead.len());
-    lead[..len].copy_from_slice(&key[..len]);
-    let mid = u32::from_be_bytes([lead[1], lead[2], lead[3], lead[4]]);
-    let tag = u16::from_be_bytes([lead[5], lead[6]]);
-    (u64::from(lead[0]) << 56) | (u64::from(mid) << 24) | u64::from(tag)
 }
 
 fn shard_of(hash: u64) -> usize {
@@ -474,11 +376,6 @@ impl Slot {
         !self.is_empty() && self.mid == mid_of(hash) && self.tag() == tag_of(hash)
     }
 
-    /// Where the slot sorts in an ordered table, its key's leading bits below the shard
-    fn order(&self) -> (u32, u32) {
-        (self.mid, self.tag())
-    }
-
     fn at(&self, loc: Loc) -> bool {
         self.segment == loc.segment.as_u32() && self.offset == loc.offset
     }
@@ -498,16 +395,11 @@ struct Place {
     slot: Slot,
 }
 
-/// The slots holding one key's bits
-///
-/// A hashed key has at most both of its buckets full. An ordered table can hold any
-/// number of keys sharing seven leading bytes, so past that count the places spill to
-/// the heap.
+/// The slots holding one key's bits, at most both of its buckets full
 #[derive(Clone, Debug)]
 struct Places {
     held: [Place; MAX_CANDIDATES],
     count: usize,
-    spilled: Vec<Place>,
 }
 
 impl Places {
@@ -515,20 +407,12 @@ impl Places {
         Places {
             held: [Place::default(); MAX_CANDIDATES],
             count: 0,
-            spilled: Vec::new(),
         }
     }
 
     fn push(&mut self, place: Place) {
-        if self.count < MAX_CANDIDATES && self.spilled.is_empty() {
-            self.held[self.count] = place;
-            self.count += 1;
-            return;
-        }
-        if self.spilled.is_empty() {
-            self.spilled.extend_from_slice(&self.held[..self.count]);
-        }
-        self.spilled.push(place);
+        self.held[self.count] = place;
+        self.count += 1;
     }
 }
 
@@ -536,10 +420,7 @@ impl std::ops::Deref for Places {
     type Target = [Place];
 
     fn deref(&self) -> &[Place] {
-        match self.spilled.is_empty() {
-            true => &self.held[..self.count],
-            false => &self.spilled,
-        }
+        &self.held[..self.count]
     }
 }
 
@@ -551,17 +432,13 @@ impl PartialEq for Places {
 
 impl Eq for Places {}
 
-/// Buckets past the last home an ordered table keeps, for a cluster that runs off the end
-const TAIL_BUCKETS: usize = 64;
-
 struct Table {
     buckets: Vec<Bucket>,
 
-    /// How many buckets a key's mid can land on as its home, every bucket for a hashed table
+    /// How many buckets a key's mid can land on as its home, which is every bucket
     homes: usize,
     held: usize,
     seed: u64,
-    layout: Layout,
 
     /// Share of a growth step this shard's ladder is offset by
     phase: f64,
@@ -590,18 +467,13 @@ fn first_rung(phase: f64) -> usize {
 }
 
 impl Table {
-    fn with_buckets(count: usize, layout: Layout, phase: f64) -> Table {
+    fn with_buckets(count: usize, phase: f64) -> Table {
         let homes = count.max(2);
-        let total = match layout {
-            Layout::Hashed => homes,
-            Layout::Ordered => homes + TAIL_BUCKETS,
-        };
         Table {
-            buckets: vec![Bucket::default(); total],
+            buckets: vec![Bucket::default(); homes],
             homes,
             held: 0,
             seed: count as u64,
-            layout,
             phase,
         }
     }
@@ -610,25 +482,8 @@ impl Table {
         ((u64::from(mid) * self.homes as u64) >> 32) as usize
     }
 
-    /// Slots the table has room for, past the last home included
-    fn width(&self) -> usize {
-        self.buckets.len() * WAYS
-    }
-
-    fn slot_at(&self, at: usize) -> Slot {
-        self.buckets[at / WAYS].slots[at % WAYS]
-    }
-
     fn set_at(&mut self, at: usize, slot: Slot) {
         self.buckets[at / WAYS].slots[at % WAYS] = slot;
-    }
-
-    fn place_at(&self, at: usize) -> Place {
-        Place {
-            bucket: at / WAYS,
-            way: at % WAYS,
-            slot: self.slot_at(at),
-        }
     }
 
     fn step(&self, tag: u32) -> usize {
@@ -651,9 +506,6 @@ impl Table {
     }
 
     fn matches(&self, hash: u64) -> Places {
-        if self.layout == Layout::Ordered {
-            return self.matches_in_order(hash);
-        }
         let mut found = Places::new();
         let [home, second] = self.pair(hash);
         for (bucket, is_second) in [(home, false), (second, true)] {
@@ -711,13 +563,9 @@ impl Table {
     fn grown(&self) -> Table {
         let mut count = next_rung(self.homes, self.phase);
         loop {
-            let mut table = Table::with_buckets(count, self.layout, self.phase);
-            let mut slots = self.buckets.iter().flat_map(|bucket| bucket.slots.iter()).copied();
-            let fits = match self.layout {
-                Layout::Hashed => slots.filter(|slot| !slot.is_empty()).all(|slot| table.place(slot).is_ok()),
-                Layout::Ordered => table.lay(&mut slots),
-            };
-            if fits {
+            let mut table = Table::with_buckets(count, self.phase);
+            let slots = self.buckets.iter().flat_map(|bucket| bucket.slots.iter()).copied();
+            if slots.filter(|slot| !slot.is_empty()).all(|slot| table.place(slot).is_ok()) {
                 return table;
             }
             count = next_rung(count, self.phase);
@@ -728,12 +576,6 @@ impl Table {
     fn insert(&mut self, slot: Slot) {
         if self.is_full() {
             *self = self.grown();
-        }
-        if self.layout == Layout::Ordered {
-            while !self.insert_in_order(slot) {
-                *self = self.grown();
-            }
-            return;
         }
         let mut homeless = slot;
         while let Err(left) = self.place(homeless) {
@@ -746,18 +588,12 @@ impl Table {
     fn take(&mut self, hash: u64, slot: &Slot) -> Option<Slot> {
         let found = self.matches(hash);
         let place = *found.iter().find(|place| place.slot.same_place(slot))?;
-        let at = place.bucket * WAYS + place.way;
-        match self.layout {
-            Layout::Hashed => self.set_at(at, Slot::default()),
-            Layout::Ordered => self.close_gap(at),
-        }
+        self.set_at(place.bucket * WAYS + place.way, Slot::default());
         self.held -= 1;
         Some(place.slot)
     }
 
     /// Mark the slot pointing at one record displaced, unless it already is
-    ///
-    /// The mark sits outside a slot's order, so an ordered table stays sorted.
     fn mark_displaced(&mut self, hash: u64, slot: &Slot) -> bool {
         let found = self.matches(hash);
         match found.iter().find(|place| place.slot.same_place(slot) && !place.slot.is_displaced()) {
@@ -778,173 +614,17 @@ impl Table {
             .flat_map(|bucket| bucket.slots.iter())
             .filter(|slot| !slot.is_empty() && !keep(slot) && slot.is_displaced())
             .count() as u64;
-        match self.layout {
-            Layout::Hashed => {
-                for bucket in self.buckets.iter_mut() {
-                    for slot in bucket.slots.iter_mut() {
-                        if !slot.is_empty() && !keep(slot) {
-                            *slot = Slot::default();
-                            self.held -= 1;
-                        }
-                    }
+        for bucket in self.buckets.iter_mut() {
+            for slot in bucket.slots.iter_mut() {
+                if !slot.is_empty() && !keep(slot) {
+                    *slot = Slot::default();
+                    self.held -= 1;
                 }
-            }
-            // Taking slots out only frees room, so the kept ones lay back down in the
-            // same table, each at or before where it stood.
-            Layout::Ordered => {
-                let kept: Vec<Slot> = self
-                    .buckets
-                    .iter()
-                    .flat_map(|bucket| bucket.slots.iter())
-                    .copied()
-                    .filter(|slot| !slot.is_empty() && keep(slot))
-                    .collect();
-                self.buckets.iter_mut().for_each(|bucket| *bucket = Bucket::default());
-                self.held = 0;
-                let laid = self.lay(&mut kept.into_iter());
-                debug_assert!(laid, "kept slots always fit where they stood");
             }
         }
         (before - self.held, displaced)
     }
 
-    /// The slots holding a key's bits in an ordered table, from its home to past its order
-    ///
-    /// Every slot sits at or after its home and nothing is empty between them, so the
-    /// key's slots are the run with its order before the first empty or later one.
-    fn matches_in_order(&self, hash: u64) -> Places {
-        let order = (mid_of(hash), tag_of(hash));
-        let mut found = Places::new();
-        for at in self.home(order.0) * WAYS..self.width() {
-            let slot = self.slot_at(at);
-            if slot.is_empty() {
-                break;
-            }
-            match slot.order().cmp(&order) {
-                std::cmp::Ordering::Less => {}
-                std::cmp::Ordering::Equal => found.push(self.place_at(at)),
-                std::cmp::Ordering::Greater => break,
-            }
-        }
-        found
-    }
-
-    /// Put a slot in its order, moving the rest of its cluster up one, or false at the end
-    ///
-    /// A slot whose order equals one held goes after it, so slots of one bit pattern keep
-    /// the order they arrived in.
-    fn insert_in_order(&mut self, slot: Slot) -> bool {
-        let width = self.width();
-        let mut at = self.home(slot.mid) * WAYS;
-        while at < width {
-            let held = self.slot_at(at);
-            if held.is_empty() || held.order() > slot.order() {
-                break;
-            }
-            at += 1;
-        }
-        let mut end = at;
-        while end < width && !self.slot_at(end).is_empty() {
-            end += 1;
-        }
-        if end == width {
-            return false;
-        }
-        for from in (at..end).rev() {
-            let moving = self.slot_at(from);
-            self.set_at(from + 1, moving);
-        }
-        self.set_at(at, slot);
-        self.held += 1;
-        true
-    }
-
-    /// Empty one slot of an ordered table and pull its cluster's tail down over the gap
-    ///
-    /// A slot moves down only while that keeps it at or after its home, so the table
-    /// stays sorted with nothing empty between a slot and its home.
-    fn close_gap(&mut self, at: usize) {
-        let width = self.width();
-        let mut gap = at;
-        loop {
-            let next = gap + 1;
-            if next >= width {
-                break;
-            }
-            let moving = self.slot_at(next);
-            if moving.is_empty() || self.home(moving.mid) * WAYS > gap {
-                break;
-            }
-            self.set_at(gap, moving);
-            gap = next;
-        }
-        self.set_at(gap, Slot::default());
-    }
-
-    /// Where an ordered walk from a key's bits starts in this table, in its direction
-    ///
-    /// Up starts at the first slot ordered at or past the bits, down at the last slot
-    /// ordered at or before them. Nothing ordered past the bits can sit before their
-    /// home, so both scans start there.
-    fn walk_start(&self, hash: u64, way: Way) -> Option<usize> {
-        let order = (mid_of(hash), tag_of(hash));
-        let mut at = self.home(order.0) * WAYS;
-        while at < self.width() {
-            let slot = self.slot_at(at);
-            if slot.is_empty() || slot.order() > order || (way == Way::Up && slot.order() == order) {
-                break;
-            }
-            at += 1;
-        }
-        match way {
-            Way::Up => Some(at),
-            Way::Down => at.checked_sub(1),
-        }
-    }
-
-    /// Slots in order from a position, up or down, until `limit` or the table's end
-    ///
-    /// A run of slots sharing their order is never split, so the last row handed back
-    /// is never a tie with the next one left behind.
-    fn walk_from(&self, mut at: usize, way: Way, limit: usize, shard: usize, out: &mut Vec<WalkRow>) {
-        loop {
-            if at >= self.width() {
-                return;
-            }
-            let slot = self.slot_at(at);
-            if !slot.is_empty() {
-                let row = WalkRow::of(shard, slot);
-                let is_tied = out.last().is_some_and(|last| last.lead == row.lead);
-                if out.len() >= limit && !is_tied {
-                    return;
-                }
-                out.push(row);
-            }
-            match way {
-                Way::Up => at += 1,
-                Way::Down => match at.checked_sub(1) {
-                    Some(below) => at = below,
-                    None => return,
-                },
-            }
-        }
-    }
-
-    /// Lay sorted slots into an empty ordered table, or false when they run off its end
-    fn lay(&mut self, slots: &mut dyn Iterator<Item = Slot>) -> bool {
-        let width = self.width();
-        let mut next = 0;
-        for slot in slots.filter(|slot| !slot.is_empty()) {
-            let at = next.max(self.home(slot.mid) * WAYS);
-            if at >= width {
-                return false;
-            }
-            self.set_at(at, slot);
-            self.held += 1;
-            next = at + 1;
-        }
-        true
-    }
 }
 
 /// An older version a lookup read past, for the cleaner to take out
@@ -985,9 +665,9 @@ struct Shard {
 }
 
 impl Shard {
-    fn new(at: usize, layout: Layout) -> Shard {
+    fn new(at: usize) -> Shard {
         Shard {
-            table: RwLock::new(Table::with_buckets(first_rung(phase_of(at)), layout, phase_of(at))),
+            table: RwLock::new(Table::with_buckets(first_rung(phase_of(at)), phase_of(at))),
             taken: AtomicU64::new(0),
             displaced: AtomicU64::new(0),
         }
@@ -1090,9 +770,6 @@ pub struct FastColumn {
 
     /// Rows an open took before it could read a header, settled once it can
     set_aside: Mutex<Vec<SetAside>>,
-
-    /// Whether keys are placed by a hash or held in key order
-    layout: Layout,
 }
 
 impl Default for FastColumn {
@@ -1103,106 +780,15 @@ impl Default for FastColumn {
 
 impl FastColumn {
     pub fn new() -> FastColumn {
-        FastColumn::with_layout(Layout::Hashed)
-    }
-
-    /// An empty column placing its keys by a layout
-    pub fn with_layout(layout: Layout) -> FastColumn {
         FastColumn {
-            shards: (0..SHARDS).map(|at| Shard::new(at, layout)).collect(),
+            shards: (0..SHARDS).map(Shard::new).collect(),
             records: OnceLock::new(),
             segments: OnceLock::new(),
             stale: Mutex::new(VecDeque::new()),
             beside: AtomicU64::new(0),
             slack: AtomicU64::new(0),
             set_aside: Mutex::new(Vec::new()),
-            layout,
         }
-    }
-
-    /// How this column places its keys
-    pub fn layout(&self) -> Layout {
-        self.layout
-    }
-
-    /// Read the records walked rows point at, keys packed into `keys`, or nothing before records can be read
-    pub fn read_rows(&self, column: ColumnId, width: usize, asks: &[RowAsk], keys: &mut Vec<u8>) -> Result<Option<Vec<RowRead>>> {
-        match self.records.get() {
-            Some(records) => records.rows(column, width, asks, keys).map(Some),
-            None => Ok(None),
-        }
-    }
-
-    /// Take out the slot a walk found pointing into a gone segment, so the next walk skips it
-    ///
-    /// An ordered column places a key by its lead, so the row's lead finds its slot
-    /// with no key to read.
-    pub fn forget_row(&self, row: &WalkRow) {
-        let hash = row.lead;
-        let slot = self.shards[shard_of(hash)]
-            .read()
-            .matches(hash)
-            .iter()
-            .find(|place| place.slot.segment() == row.segment && place.slot.offset == row.offset)
-            .map(|place| place.slot);
-        if let Some(slot) = slot {
-            self.shards[shard_of(hash)].write().take(hash, &slot);
-        }
-    }
-
-    /// Up to `limit` sealed rows in key order from a key, on an ordered column
-    ///
-    /// Rows come in the order of their keys' leading seven bytes: going up, from those
-    /// at or past the key's, going down, from those at or before. A caller reads each
-    /// row's record for its key, which settles a tie on those bytes and a row of the
-    /// bound's own lead on the wrong side of it. A hashed column has no order and hands
-    /// back nothing.
-    pub fn walk(&self, from: Option<&[u8]>, way: Way, limit: usize, out: &mut Vec<WalkRow>) {
-        self.walk_lead(from.map(lead_of), way, limit, out);
-    }
-
-    /// The leading bits a key is placed by in an ordered column, which a walk resumes from
-    pub fn lead(key: &[u8]) -> u64 {
-        lead_of(key)
-    }
-
-    /// The same walk from a lead, inclusive, for a page resuming past the rows it read
-    pub fn walk_lead(&self, bits: Option<u64>, way: Way, limit: usize, out: &mut Vec<WalkRow>) {
-        out.clear();
-        if self.layout != Layout::Ordered || limit == 0 {
-            return;
-        }
-        let first = match (bits, way) {
-            (Some(bits), _) => shard_of(bits),
-            (None, Way::Up) => 0,
-            (None, Way::Down) => SHARDS - 1,
-        };
-        let shards: Box<dyn Iterator<Item = usize>> = match way {
-            Way::Up => Box::new(first..SHARDS),
-            Way::Down => Box::new((0..=first).rev()),
-        };
-        // A lead's top byte is its shard, so no tie spans two shards.
-        for shard in shards {
-            let table = self.shards[shard].read();
-            let start = match bits.filter(|_| shard == first) {
-                Some(bits) => table.walk_start(bits, way),
-                None => match way {
-                    Way::Up => Some(0),
-                    Way::Down => table.width().checked_sub(1),
-                },
-            };
-            if let Some(at) = start {
-                table.walk_from(at, way, limit, shard, out);
-            }
-            if out.len() >= limit {
-                return;
-            }
-        }
-    }
-
-    /// The bits a key is placed by in this column
-    fn bits(&self, key: &[u8]) -> u64 {
-        bits_of(self.layout, key)
     }
 
     /// Where lookups read records, and the counters that order segments
@@ -1248,7 +834,7 @@ impl FastColumn {
     /// The caller hands over the newest version, so an older entry of the same key is
     /// one the map displaced and the cleaner will settle.
     pub fn insert(&self, key: &[u8], loc: Loc) {
-        let hash = self.bits(key);
+        let hash = hash_of(key);
         let slot = Slot::new(hash, loc);
         let mut table = self.shards[shard_of(hash)].write();
         if table.matches(hash).iter().any(|place| place.slot.same_place(&slot)) {
@@ -1264,7 +850,7 @@ impl FastColumn {
         for (at, shard) in self.shards.iter().enumerate() {
             let mut table = shard.write();
             if table.held == 0 && table.homes < buckets {
-                *table = Table::with_buckets(buckets, self.layout, phase_of(at));
+                *table = Table::with_buckets(buckets, phase_of(at));
             }
         }
     }
@@ -1281,7 +867,7 @@ impl FastColumn {
             if entry.is_range_tombstone() {
                 continue;
             }
-            let hash = self.bits(entry.key.as_slice());
+            let hash = hash_of(entry.key.as_slice());
             let slot = Slot::new(hash, Loc::new(segment, entry.offset, entry.len));
             let slot = match entry.is_tombstone() {
                 true => slot.as_grave(),
@@ -1336,7 +922,7 @@ impl FastColumn {
         let mut by_segment: HashMap<SegmentId, Vec<usize>> = HashMap::new();
         let mut by_header = Vec::new();
         for (at, row) in rows.iter().enumerate() {
-            let hash = self.bits(row.key.as_slice());
+            let hash = hash_of(row.key.as_slice());
             let seen = self.shards[shard_of(hash)].read().matches(hash);
             match seen.len() {
                 1 => by_segment.entry(seen[0].slot.segment()).or_default().push(at),
@@ -1389,8 +975,8 @@ impl FastColumn {
         };
         let mut group = group.to_vec();
         group.sort_unstable_by(|left, right| rows[*left].key.cmp(&rows[*right].key));
-        // Keys sharing their bits, as keys sharing a lead do in an ordered table, meet each
-        // other's slots, so a slot counts as this key's only when its footer row says so.
+        // Keys sharing their bits meet each other's slots, so a slot counts as this key's
+        // only when its footer row says so.
         let mut keys_at: Option<HashMap<u32, usize>> = None;
         let mut key_at = |offset: u32| -> Result<Option<&[u8]>> {
             if keys_at.is_none() {
@@ -1421,7 +1007,7 @@ impl FastColumn {
                     continue;
                 }
             };
-            let hash = self.bits(row.key.as_slice());
+            let hash = hash_of(row.key.as_slice());
             let mut table = self.shards[shard_of(hash)].write();
             let held = table.matches(hash);
             let place = held.iter().find(|place| place.slot.segment() == segment).copied();
@@ -1464,7 +1050,7 @@ impl FastColumn {
         let Some(records) = self.records.get() else {
             return Ok(());
         };
-        let hash = self.bits(key.as_slice());
+        let hash = hash_of(key.as_slice());
         let slot = match is_tombstone {
             true => Slot::new(hash, loc).as_grave(),
             false => Slot::new(hash, loc),
@@ -1513,7 +1099,7 @@ impl FastColumn {
 
     /// Whether a key's one live slot points at this record, which a caller that read it can trust with no read
     pub fn only_at(&self, key: &[u8], loc: Loc) -> bool {
-        let hash = self.bits(key);
+        let hash = hash_of(key);
         let seen = self.shards[shard_of(hash)].read().matches(hash);
         let mut live = seen.iter().filter(|place| !place.slot.is_displaced());
         match (live.next(), live.next()) {
@@ -1524,7 +1110,7 @@ impl FastColumn {
 
     /// Take out the entry pointing at one record, for a compaction move, an eviction or a release
     pub fn remove_at(&self, key: &[u8], loc: Loc) -> bool {
-        let hash = self.bits(key);
+        let hash = hash_of(key);
         let mut table = self.shards[shard_of(hash)].write();
         let held = table.matches(hash).iter().find(|place| place.slot.at(loc)).copied();
         match held {
@@ -1545,7 +1131,7 @@ impl FastColumn {
         let (Some(records), Some(segments)) = (self.records.get(), self.segments.get()) else {
             return Ok(Displaced::default());
         };
-        let hash = self.bits(key.as_slice());
+        let hash = hash_of(key.as_slice());
         let shard = shard_of(hash);
         let seen = self.shards[shard].read().matches(hash);
         if seen.is_empty() {
@@ -1668,7 +1254,7 @@ impl FastColumn {
 
     /// The candidates for a key, newest segment ceiling first, ties to the newer segment
     fn ordered(&self, key: &RecordKey, segments: &SegmentTable) -> (u64, Vec<(Option<Lsn>, Slot)>) {
-        let hash = self.bits(key.as_slice());
+        let hash = hash_of(key.as_slice());
         let seen = self.shards[shard_of(hash)].read().matches(hash);
         let mut ordered: Vec<(Option<Lsn>, Slot)> = seen.iter().map(|place| (None, place.slot)).collect();
         if ordered.len() > 1 {
@@ -1745,7 +1331,7 @@ impl FastColumn {
         let Some(segments) = self.segments.get() else {
             return true;
         };
-        let hash = self.bits(key);
+        let hash = hash_of(key);
         self.shards[shard_of(hash)]
             .read()
             .matches(hash)
@@ -1754,23 +1340,9 @@ impl FastColumn {
             .any(|place| !place.slot.is_displaced() && segments.max_lsn_of(place.slot.segment()).is_none_or(|max| max > lsn))
     }
 
-    /// How many slots have left each shard so far, read before a walk asks the map
-    pub fn taken_all(&self) -> [u64; SHARDS] {
-        std::array::from_fn(|at| self.shards[at].taken.load(Ordering::Acquire))
-    }
-
-    /// Whether a slot left any shard between two leads since a walk took its counts
-    ///
-    /// A key that moved from this index to the map between the walk's two looks is in
-    /// neither, so a walk that saw nothing leave the shards it crossed stands.
-    pub fn moved_between(&self, before: &[u64], from: u64, to: u64) -> bool {
-        let (low, high) = (shard_of(from.min(to)), shard_of(from.max(to)));
-        (low..=high).any(|shard| self.shards[shard].taken.load(Ordering::Acquire) != before[shard])
-    }
-
     /// Where the key's shard stands, read before the map is asked
     pub fn since(&self, key: &RecordKey) -> Since {
-        let shard = shard_of(self.bits(key.as_slice()));
+        let shard = shard_of(hash_of(key.as_slice()));
         Since {
             shard,
             taken: self.shards[shard].taken.load(Ordering::Acquire),
@@ -1935,7 +1507,7 @@ impl FastColumn {
             let mut table = shard.write();
             let held = table.held as u64;
             let displaced = table.displaced.load(Ordering::Relaxed);
-            *table = Table::with_buckets(first_rung(phase_of(at)), self.layout, phase_of(at));
+            *table = Table::with_buckets(first_rung(phase_of(at)), phase_of(at));
             table.count_taken(held, displaced);
         }
         lock(&self.stale).clear();
@@ -2000,32 +1572,6 @@ mod tests {
     }
 
     impl RecordSource for Records {
-        fn rows(&self, _column: ColumnId, width: usize, asks: &[RowAsk], keys: &mut Vec<u8>) -> Result<Vec<RowRead>> {
-            let written = lock(&self.written);
-            keys.clear();
-            keys.resize(asks.len() * width, 0);
-            let mut rows = Vec::with_capacity(asks.len());
-            for (at, ask) in asks.iter().enumerate() {
-                rows.push(match written.get(&(ask.segment.as_u32(), ask.offset)) {
-                    Some(row) if row.key.len() == width => {
-                        keys[at * width..(at + 1) * width].copy_from_slice(&row.key);
-                        RowRead::Found {
-                            head: Head {
-                                lsn: row.lsn,
-                                len: row.len,
-                                is_tombstone: row.is_tombstone,
-                            },
-                            value: (ask.bound > 0 && !row.is_tombstone)
-                                .then(|| Value::from(row.lsn.as_u64().to_le_bytes().to_vec())),
-                        }
-                    }
-                    Some(_) => RowRead::Other,
-                    None => RowRead::Gone,
-                });
-            }
-            Ok(rows)
-        }
-
         fn head(&self, key: KeyRef<'_>, segment: SegmentId, offset: u32) -> Result<HeadRead> {
             self.heads.fetch_add(1, Ordering::Relaxed);
             Ok(self.answer(key, segment, offset))
@@ -2279,143 +1825,6 @@ mod tests {
         assert_eq!(column.held(), 50);
         assert_eq!(version(&column, 0), Some(1));
         assert_eq!(version(&column, 1), None);
-    }
-
-    /// A key whose leading bytes are spread like a hash, as an ordered column's keys are
-    fn scattered(at: u64) -> RecordKey {
-        let mut bytes = [0u8; 16];
-        bytes[..8].copy_from_slice(&mix(at ^ 0x5DEE_CE66).to_be_bytes());
-        bytes[8..].copy_from_slice(&at.to_be_bytes());
-        RecordKey::from_bytes(COLUMN, &bytes).expect("key")
-    }
-
-    fn ordered_column(records: &Arc<Records>) -> FastColumn {
-        let column = FastColumn::with_layout(Layout::Ordered);
-        column.attach(Arc::clone(records) as Arc<dyn RecordSource>, Arc::new(SegmentTable::new()));
-        column
-    }
-
-    fn version_of(column: &FastColumn, key: &RecordKey) -> Option<u64> {
-        match column.read(key).expect("read") {
-            Lookup::Found(lsn, _) => Some(lsn.as_u64()),
-            Lookup::Missing => None,
-            Lookup::Unsettled => panic!("a key needed the checked read"),
-        }
-    }
-
-    /// Check every shard of an ordered column and hand back the slots it holds
-    ///
-    /// Each shard is sorted, each slot sits at or past its home with nothing empty in
-    /// between, and its count matches what it holds.
-    fn assert_ordered(column: &FastColumn) -> u64 {
-        let mut held = 0;
-        for shard in &column.shards {
-            let table = shard.read();
-            let mut last = None;
-            let mut count = 0;
-            for at in 0..table.width() {
-                let slot = table.slot_at(at);
-                if slot.is_empty() {
-                    continue;
-                }
-                count += 1;
-                let home = table.home(slot.mid) * WAYS;
-                assert!(at >= home, "a slot sits before its home");
-                assert!((home..at).all(|between| !table.slot_at(between).is_empty()), "a gap between a slot and its home");
-                assert!(last.is_none_or(|last| last <= slot.order()), "a shard is out of order");
-                last = Some(slot.order());
-            }
-            assert_eq!(count, table.held, "a shard miscounts what it holds");
-            held += count as u64;
-        }
-        held
-    }
-
-    // an ordered column keeps its order and its keys through inserts, takes, growth and a sweep
-    #[test]
-    fn an_ordered_column_keeps_order_through_change() {
-        let records = Arc::new(Records::default());
-        let column = ordered_column(&records);
-        let keys = 30_000u64;
-        let loc_of = |at: u64| Loc::new(SegmentId(1 + (at % 7) as u32), at as u32 * 64, 40);
-        for at in 0..keys {
-            records.write(loc_of(at), scattered(at).as_slice(), Lsn(at + 1));
-            column.insert(scattered(at).as_slice(), loc_of(at));
-        }
-        assert_eq!(assert_ordered(&column), keys);
-
-        for at in (0..keys).step_by(3) {
-            assert!(column.remove_at(scattered(at).as_slice(), loc_of(at)), "key {at} was not taken");
-        }
-        assert_eq!(assert_ordered(&column), keys - keys.div_ceil(3));
-        assert!(column.forget_retired(|segment| segment != SegmentId(2)) > 0);
-        assert_ordered(&column);
-
-        for at in 0..keys {
-            let expected = (at % 3 != 0 && at % 7 != 1).then_some(at + 1);
-            assert_eq!(version_of(&column, &scattered(at)), expected, "key {at}");
-        }
-    }
-
-    // an ordered walk hands rows back in key order, up or down, from a key held or not
-    #[test]
-    fn an_ordered_walk_reads_rows_in_key_order() {
-        let records = Arc::new(Records::default());
-        let column = ordered_column(&records);
-        let keys = 20_000u64;
-        let mut leads = Vec::new();
-        for at in 0..keys {
-            let key = scattered(at);
-            column.insert(key.as_slice(), Loc::new(SegmentId(1), at as u32 * 64, 40));
-            leads.push(lead_of(key.as_slice()));
-        }
-        leads.sort_unstable();
-
-        let mut out = Vec::new();
-        for probe in 0..400u64 {
-            // Half the walks start at a key held, half at one that is not.
-            let from = scattered(probe * 37 % (2 * keys));
-            let start = lead_of(from.as_slice());
-            column.walk(Some(from.as_slice()), Way::Up, 50, &mut out);
-            let up: Vec<u64> = leads.iter().copied().filter(|lead| *lead >= start).take(50).collect();
-            assert_eq!(out.iter().map(|row| row.lead).collect::<Vec<_>>(), up, "up from probe {probe}");
-
-            column.walk(Some(from.as_slice()), Way::Down, 50, &mut out);
-            let down: Vec<u64> = leads.iter().rev().copied().filter(|lead| *lead <= start).take(50).collect();
-            assert_eq!(out.iter().map(|row| row.lead).collect::<Vec<_>>(), down, "down from probe {probe}");
-        }
-
-        column.walk(None, Way::Up, usize::MAX, &mut out);
-        assert_eq!(out.iter().map(|row| row.lead).collect::<Vec<_>>(), leads);
-        column.walk(None, Way::Down, usize::MAX, &mut out);
-        assert_eq!(out.len() as u64, keys);
-        assert!(out.windows(2).all(|pair| pair[0].lead >= pair[1].lead));
-    }
-
-    // keys sharing seven leading bytes spill past a bucket pair, each answers, and a walk keeps them together
-    #[test]
-    fn keys_sharing_a_lead_spill_and_stay_together() {
-        let records = Arc::new(Records::default());
-        let column = ordered_column(&records);
-        let shared = |at: u64| {
-            let mut bytes = [0u8; 16];
-            bytes[..7].copy_from_slice(&[9, 8, 7, 6, 5, 4, 3]);
-            bytes[8..].copy_from_slice(&at.to_be_bytes());
-            RecordKey::from_bytes(COLUMN, &bytes).expect("key")
-        };
-        let ties = 3 * MAX_CANDIDATES as u64;
-        for at in 0..ties {
-            let loc = Loc::new(SegmentId(1), at as u32 * 64, 40);
-            records.write(loc, shared(at).as_slice(), Lsn(at + 1));
-            column.insert(shared(at).as_slice(), loc);
-        }
-        assert_ordered(&column);
-        for at in 0..ties {
-            assert_eq!(version_of(&column, &shared(at)), Some(at + 1), "tied key {at}");
-        }
-        let mut out = Vec::new();
-        column.walk(Some(shared(0).as_slice()), Way::Up, 5, &mut out);
-        assert_eq!(out.len() as u64, ties, "a walk split a tie");
     }
 
     // every length class covers the lengths it is chosen for, up to the largest record

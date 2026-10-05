@@ -1645,9 +1645,11 @@ impl Appender {
     /// Such a tail skips the spare drawn ahead, since a spare built under one tier would
     /// be the wrong file the moment a pass names the other.
     fn is_class_managed(&self) -> bool {
-        let config = &self.shared.config;
-        let reserved = config.tail_count()..config.tail_count() + config.compact_passes();
-        self.shared.volumes.has_capacity() && reserved.contains(&(self.tail.index() as usize))
+        if !self.shared.volumes.has_capacity() {
+            return false;
+        }
+        let first = self.shared.config.tail_count();
+        (first..first + self.shared.config.compact_passes()).contains(&(self.tail.index() as usize))
     }
 
     /// Remove what a failed creation left behind, before its id moves volumes

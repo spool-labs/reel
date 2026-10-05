@@ -1,6 +1,7 @@
 //! Reel store configuration and load-time validation
 
 use std::num::NonZeroU32;
+use std::sync::OnceLock;
 
 #[cfg(feature = "serde")]
 use serde::de::Error as SerdeError;
@@ -112,11 +113,17 @@ impl ThreadBudget {
     }
 
     /// The cap in threads, resolved against the machine for an automatic budget
+    ///
+    /// The machine is asked once per process: on Linux each ask reads cgroup files, and
+    /// the tail count resolved from it lays out the tails for the volume's whole life.
     pub fn resolve(self) -> usize {
+        static WIDTH: OnceLock<usize> = OnceLock::new();
         match self {
-            ThreadBudget::Auto => std::thread::available_parallelism()
-                .map(|width| width.get())
-                .unwrap_or(1),
+            ThreadBudget::Auto => *WIDTH.get_or_init(|| {
+                std::thread::available_parallelism()
+                    .map(|width| width.get())
+                    .unwrap_or(1)
+            }),
             ThreadBudget::Fixed(count) => count.get() as usize,
         }
     }

@@ -1699,6 +1699,34 @@ impl ReelIndex {
         }
     }
 
+    /// The most sealed segments any key of any column falls inside
+    pub fn overlap_depth(&self) -> usize {
+        self.sealed.iter().map(SealedRanges::depth).max().unwrap_or(0)
+    }
+
+    /// The segments of the smallest layers, once some column's layers pass a depth
+    ///
+    /// The deepest column decides. Its smallest layers are its youngest, sealed one at a
+    /// time, so merging them among themselves leaves the large merged layers alone.
+    pub fn youngest_tier(&self, depth: usize, take: usize) -> Option<std::collections::BTreeSet<SegmentId>> {
+        let mut layers = self
+            .sealed
+            .iter()
+            .map(SealedRanges::layers)
+            .max_by_key(Vec::len)?;
+        if layers.len() <= depth {
+            return None;
+        }
+        let bytes: HashMap<SegmentId, u64> = self
+            .segments_snapshot()
+            .into_iter()
+            .map(|(segment, bytes)| (segment, bytes.total()))
+            .collect();
+        let weight = |layer: &Vec<SegmentId>| layer.iter().map(|segment| bytes.get(segment).copied().unwrap_or(0)).sum::<u64>();
+        layers.sort_by_cached_key(weight);
+        Some(layers.into_iter().take(take).flatten().collect())
+    }
+
     /// Let go of the footers walks opened under a sealed set that has since moved
     ///
     /// A slot no walk came back to would otherwise hold a retired segment's footer.

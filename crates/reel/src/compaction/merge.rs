@@ -151,6 +151,31 @@ pub fn merge_once(
     index: &ReelIndex,
     cue_floor: Option<Lsn>,
 ) -> Result<MergeReport> {
+    merge_selected(compactor, reel, index, cue_floor, None)
+}
+
+/// Merge only these sorted runs into one, leaving every other run standing
+///
+/// What a volume does when too many runs reach over the same keys: the youngest are
+/// collapsed among themselves, so a byte is rewritten once a tier rather than once a
+/// pass. Tombstones carry and liveness comes from the index, as in a whole merge.
+pub fn merge_runs(
+    compactor: &Compactor,
+    reel: &Reel,
+    index: &ReelIndex,
+    cue_floor: Option<Lsn>,
+    only: &BTreeSet<SegmentId>,
+) -> Result<MergeReport> {
+    merge_selected(compactor, reel, index, cue_floor, Some(only))
+}
+
+fn merge_selected(
+    compactor: &Compactor,
+    reel: &Reel,
+    index: &ReelIndex,
+    cue_floor: Option<Lsn>,
+    only: Option<&BTreeSet<SegmentId>>,
+) -> Result<MergeReport> {
     let shared = reel.shared();
     if !shared.config.merge_sorted_runs {
         return Err(ReelError::Rejected(
@@ -167,7 +192,7 @@ pub fn merge_once(
     // The claim stops a compaction pass retiring a run out from under the merge reading
     // it, and dropping it stops a failed pass hiding those runs for ever.
     let mut claims = Vec::new();
-    let mut sources = select_runs(compactor, reel, index, cue_floor, &mut claims)?;
+    let mut sources = select_runs(compactor, reel, index, cue_floor, only, &mut claims)?;
     if sources.len() < RUNS_WORTH_MERGING {
         return Ok(MergeReport::default());
     }
@@ -318,12 +343,16 @@ fn select_runs<'compactor>(
     reel: &Reel,
     index: &ReelIndex,
     cue_floor: Option<Lsn>,
+    only: Option<&BTreeSet<SegmentId>>,
     claims: &mut Vec<PassClaim<'compactor>>,
 ) -> Result<Vec<MergeSource>> {
     let shared = reel.shared();
     let owed = shared.pending_seals();
     let mut sources = Vec::new();
     for (segment, bytes) in index.segments_snapshot() {
+        if only.is_some_and(|only| !only.contains(&segment)) {
+            continue;
+        }
         if shared.is_held(segment) || owed.contains(&segment) || bytes.total() == 0 {
             continue;
         }

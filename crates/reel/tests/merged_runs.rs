@@ -431,7 +431,7 @@ fn a_capped_merge_is_paced() {
     assert_every_key_reads(&store, &[]);
 }
 
-// the stack's dead share is what the tick decides on, either side of the threshold
+// the stack's dead share decides whether a tick collapses the whole stack, either side of the threshold
 #[test]
 fn the_stack_debt_triggers_the_tick() {
     // The threshold is read at open, so each half is filled under its own, and what the
@@ -459,21 +459,15 @@ fn the_stack_debt_triggers_the_tick() {
             < debt + MARGIN,
         "this half's stack reached a threshold it is meant to sit under",
     );
-    assert!(
-        under.merge_when_due().expect("merge").is_none(),
-        "a stack under the threshold was collapsed anyway",
-    );
+    // Under the threshold the stack stands. Runs piled past the merge depth may still
+    // lose a tier of the youngest, which leaves most of the stack where it was.
     under.maintain_once().expect("tick");
-    assert_eq!(
-        under.compaction_counters().runs_merged,
-        0,
-        "a tick collapsed a stack the volume did not ask it to",
+    let merged = under.compaction_counters().runs_merged;
+    assert!(
+        merged < standing as u64,
+        "a tick under the threshold collapsed all {standing} runs of the stack",
     );
-    assert_eq!(
-        standing_runs(&under),
-        standing,
-        "the stack collapsed without a merge"
-    );
+    assert_every_key_reads(&under, &[]);
     drop(under);
 
     let (over, _over_io) = open_over(triggered_config(debt - MARGIN), COLUMNS);

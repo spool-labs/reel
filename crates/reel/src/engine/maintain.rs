@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::compaction::compactor::EraseReport;
-use crate::compaction::merge::{merge_once, sorted_run_dead_ratio, MergeReport};
+use crate::compaction::merge::{merge_once, merge_runs, sorted_run_dead_ratio, MergeReport};
 use crate::error::{ReelError, Result};
 use crate::format::column::ColumnId;
 use crate::format::footer::SegmentFooter;
@@ -23,6 +23,14 @@ use crate::sync::lock;
 
 /// Older versions the FastForward cleaner takes out on one maintenance tick, with no reads
 const FAST_SCRUB_BUDGET: usize = 65_536;
+
+/// Sorted runs one key may fall inside before the youngest are merged among themselves
+///
+/// A walk seeks once in every run over its start, so this bounds what a short scan pays.
+const MERGE_DEPTH: usize = 8;
+
+/// Layers one tiered merge collapses, the smallest the volume holds
+const MERGE_TIER: usize = 4;
 
 impl ReelStore {
     /// Tell the index about every segment that has sealed since it was last told
@@ -383,10 +391,15 @@ impl ReelStore {
         // nothing, so the stack is priced from a settled view and merged from one.
         self.settle_sealed()?;
         let debt = self.sorted_run_dead_ratio()?;
-        if !debt.is_some_and(|ratio| ratio >= self.config.merge_dead_ratio) {
-            return Ok(None);
+        if debt.is_some_and(|ratio| ratio >= self.config.merge_dead_ratio) {
+            return merge_once(&self.compactor, &self.reel, &self.index, self.cues.floor()).map(Some);
         }
-        merge_once(&self.compactor, &self.reel, &self.index, self.cues.floor()).map(Some)
+        // Too many runs reaching over the same keys: the youngest collapse among
+        // themselves, which keeps a walk's merge narrow without rewriting the volume.
+        let Some(tier) = self.index.youngest_tier(MERGE_DEPTH, MERGE_TIER) else {
+            return Ok(None);
+        };
+        merge_runs(&self.compactor, &self.reel, &self.index, self.cues.floor(), &tier).map(Some)
     }
 
     /// Run one bounded pass of the whole maintenance plane

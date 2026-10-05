@@ -228,7 +228,12 @@ impl FooterPartition {
             column,
             key_width,
             packed: Vec::new(),
-            starts: Vec::new(),
+            // A varying partition's first row starts at zero, and each push records where
+            // its row ends. A strided one works its rows out from the stride.
+            starts: match key_width == VARYING_WIDTH {
+                true => vec![0],
+                false => Vec::new(),
+            },
             filter: None,
         }
     }
@@ -741,8 +746,8 @@ impl SegmentFooter {
         let mut footer = SegmentFooter::empty();
         for held in &self.partitions {
             let mut partition = FooterPartition::new(held.column, held.key_width);
-            partition.packed = Vec::with_capacity(held.packed.len());
-            partition.starts = Vec::with_capacity(held.starts.len());
+            partition.packed.reserve(held.packed.len());
+            partition.starts.reserve(held.starts.len());
             footer.partitions.push(partition);
         }
         footer
@@ -1380,6 +1385,22 @@ mod tests {
             .entries()
             .map(|entry| entry.expect("entry"))
             .collect()
+    }
+
+    // a tail's next segment keeps its first row when its last one's partition varied
+    #[test]
+    fn the_next_footer_of_a_varying_partition_keeps_its_first_row() {
+        let mut last = SegmentFooter::empty();
+        last.push(&entry(RECORD, 1, 8, 1, 36, 64));
+        last.push(&entry(RECORD, 2, 12, 2, 136, 64));
+        assert!(last.partition(RECORD).expect("partition").is_varying());
+
+        let mut next = last.empty_like();
+        let first = entry(RECORD, 3, 22, 3, 36, 64);
+        next.push(&first);
+        next.push(&entry(RECORD, 4, 9, 4, 136, 64));
+        assert_eq!(collect(&next).first(), Some(&first), "the first row of the next segment went missing");
+        assert_eq!(next.entry_count(), 2);
     }
 
     // an entry stays in its size class, since a merge holds one per row it walks

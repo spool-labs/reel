@@ -30,7 +30,7 @@ const FAST_SCRUB_BUDGET: usize = 65_536;
 const MERGE_DEPTH: usize = 8;
 
 /// Layers one tiered merge collapses, the smallest the volume holds
-const MERGE_TIER: usize = 4;
+const MERGE_TIER: usize = 8;
 
 impl ReelStore {
     /// Tell the index about every segment that has sealed since it was last told

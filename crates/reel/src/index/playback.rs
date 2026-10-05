@@ -665,7 +665,7 @@ fn ordered_round(
         .flatten();
     let walked = walk.rows.last().map(|row| row.lead);
 
-    let Some(mut sealed) = read_sealed(fast, paged.column, width, way, settle, walk)? else {
+    let Some(mut sealed) = read_sealed(fast, paged.column, width, way, walk)? else {
         return Ok(Round::Footers);
     };
     let keys = walk.keys.as_slice();
@@ -725,6 +725,17 @@ fn ordered_round(
         if row.is_tombstone || index.is_covered_key(key, row.lsn) {
             continue;
         }
+        // A version an overwrite or a delete booked as older stands only once the get path
+        // agrees, since its delete may have no grave left in the map.
+        if row.is_displaced {
+            match settle(key)? {
+                Some(entry) if (entry.loc.segment, entry.loc.offset) == (row.segment, row.offset) => {}
+                // A newer version FastForward holds no slot for, which the footers serve.
+                Some(_) => return Ok(Round::Footers),
+                // Deleted, with its grave gone from the map.
+                None => continue,
+            }
+        }
         let entry = Entry::new(Loc::new(row.segment, row.offset, row.len), row.lsn);
         out.push_read(key, entry, row.payload.take());
     }
@@ -768,15 +779,12 @@ fn ordered_round(
 /// The newest version of a key stands, a tie going to the newer segment, which is a
 /// compaction copy of the other. A row whose segment is gone is taken out of the index,
 /// since its record moved on or died. One only the checked path can read sends the page
-/// to the footers. Each record is read whole, so its payload comes in the same read. A
-/// newest version an overwrite or a delete booked as older is settled by the checked path,
-/// since its delete may have no grave left.
+/// to the footers. Each record is read whole, so its payload comes in the same read.
 fn read_sealed(
     fast: &FastColumn,
     column: ColumnId,
     width: usize,
     way: Way,
-    settle: &dyn Fn(&[u8]) -> Result<Option<Entry>>,
     walk: &mut Walk,
 ) -> Result<Option<Vec<SealedRow>>> {
     let Walk { from, rows, keys, .. } = walk;
@@ -829,21 +837,7 @@ fn read_sealed(
         by_key.then((right.lsn, right.segment).cmp(&(left.lsn, left.segment)))
     });
     read.dedup_by(|later, kept| key_of(later) == key_of(kept));
-    let mut settled = Vec::with_capacity(read.len());
-    for row in read {
-        if !row.is_displaced {
-            settled.push(row);
-            continue;
-        }
-        match settle(key_of(&row))? {
-            Some(entry) if (entry.loc.segment, entry.loc.offset) == (row.segment, row.offset) => settled.push(row),
-            // A newer version FastForward holds no slot for, which the footers serve.
-            Some(_) => return Ok(None),
-            // Deleted, with its grave gone from the map.
-            None => {}
-        }
-    }
-    Ok(Some(settled))
+    Ok(Some(read))
 }
 
 /// One page of a column's own map, in the playback's direction

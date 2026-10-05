@@ -439,7 +439,6 @@ impl ReelIndex {
         self.fast.iter().map(FastColumn::beside).sum()
     }
 
-    /// Entries FastForward holds in all
     /// Pages ordered walks filled from their ordered index, and pages they sent to the footers
     pub fn ordered_walks(&self) -> (u64, u64) {
         (
@@ -448,6 +447,7 @@ impl ReelIndex {
         )
     }
 
+    /// Entries FastForward holds in all
     pub fn fast_held(&self) -> u64 {
         self.fast.iter().map(FastColumn::held).sum()
     }

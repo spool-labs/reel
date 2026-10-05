@@ -224,11 +224,16 @@ pub struct FooterPartition {
 impl FooterPartition {
     /// An empty partition for one column at its key width
     pub fn new(column: ColumnId, key_width: u16) -> FooterPartition {
+        // a varying partition's starts open with the first row's, which is 0
+        let starts = match key_width == VARYING_WIDTH {
+            true => vec![0],
+            false => Vec::new(),
+        };
         FooterPartition {
             column,
             key_width,
             packed: Vec::new(),
-            starts: Vec::new(),
+            starts,
             filter: None,
         }
     }
@@ -741,8 +746,8 @@ impl SegmentFooter {
         let mut footer = SegmentFooter::empty();
         for held in &self.partitions {
             let mut partition = FooterPartition::new(held.column, held.key_width);
-            partition.packed = Vec::with_capacity(held.packed.len());
-            partition.starts = Vec::with_capacity(held.starts.len());
+            partition.packed.reserve(held.packed.len());
+            partition.starts.reserve(held.starts.len());
             footer.partitions.push(partition);
         }
         footer
@@ -1549,6 +1554,26 @@ mod tests {
         assert_eq!(two.len(), 2);
         assert_eq!(two.key_at(0).map(<[u8]>::len), Some(34));
         assert_eq!(two.key_at(1).map(<[u8]>::len), Some(200));
+    }
+
+    // a footer started from a varying one keeps every row, the first included
+    #[test]
+    fn a_footer_like_a_varying_one_keeps_its_first_row() {
+        let last = SegmentFooter::build(vec![
+            entry(RECORD, 1, 8, 1, 0, 100),
+            entry(RECORD, 2, 12, 2, 100, 100),
+        ]);
+        let mut next = last.empty_like();
+        next.push(&entry(RECORD, 3, 22, 3, 0, 100));
+        next.push(&entry(RECORD, 4, 9, 4, 100, 100));
+
+        assert_eq!(next.entry_count(), 2);
+        let rows = collect(&next);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().any(|row| row.lsn == Lsn(3)),
+            "the first row is kept"
+        );
     }
 
     // a footer of many columns finds each one's partition, and none for a column it lacks

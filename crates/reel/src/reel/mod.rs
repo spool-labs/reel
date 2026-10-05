@@ -1391,29 +1391,61 @@ pub struct Reel {
     shared: Arc<ReelShared>,
     tails: Vec<Appender>,
     bands: BandPool,
+
+    /// Tails kept back for compaction at the end of `tails`, one per pass at once
+    reserved: usize,
+
+    /// The reserved tails a pass holds, one bit each
+    leased: AtomicU64,
+}
+
+/// One reserved tail, held by one compaction pass and given back however it leaves
+pub struct ReservedLease<'reel> {
+    reel: &'reel Reel,
+    index: usize,
+}
+
+impl ReservedLease<'_> {
+    /// Position of the leased tail among the reel's tails
+    pub fn index(&self) -> usize {
+        self.index
+    }
+}
+
+impl Drop for ReservedLease<'_> {
+    fn drop(&mut self) {
+        let bit = 1u64 << (self.index - self.reel.foreground().len());
+        self.reel.leased.fetch_and(!bit, Ordering::AcqRel);
+    }
+}
+
+/// Tails a volume keeps back for compaction: one per pass it runs at once, or none
+fn reserved_count(shared: &ReelShared) -> usize {
+    match shared.config.rewrite_on_seal || shared.volumes.has_capacity() {
+        true => shared.config.compact_passes(),
+        false => 0,
+    }
 }
 
 impl Reel {
     /// Open a reel with the configured number of active tails
     ///
-    /// A volume that rewrites at seal, or that owns a capacity tier, keeps one extra
-    /// tail back for compaction: a sorted run is only sorted if nothing else is
-    /// writing into it. The reserved tail is the last one and route never offers it.
+    /// A volume that rewrites at seal, or that owns a capacity tier, keeps a tail back
+    /// for each compaction pass it runs at once: a sorted run is only sorted if nothing
+    /// else is writing into it. The reserved tails come last and route never offers them.
     ///
     /// Tails a previous process left unsealed are picked up in number order, so a restart
-    /// continues its segments rather than drawing new ones. The reserved tail never
+    /// continues its segments rather than drawing new ones. A reserved tail never
     /// resumes: a merge's output has to be nothing but its own runs.
     pub fn open(shared: Arc<ReelShared>, resumable: Vec<ResumableTail>) -> Result<Reel> {
         let count = shared.config.tail_count();
-        let reserved = shared.config.rewrite_on_seal || shared.volumes.has_capacity();
-        let total = count + usize::from(reserved);
+        let reserved = reserved_count(&shared);
         let mut candidates = resumable.into_iter();
-        let mut tails = Vec::with_capacity(total);
-        for index in 0..total {
-            let is_reserved = reserved && index == total - 1;
-            let adopted = match is_reserved {
-                true => None,
-                false => candidates.next(),
+        let mut tails = Vec::with_capacity(count + reserved);
+        for index in 0..count + reserved {
+            let adopted = match index < count {
+                true => candidates.next(),
+                false => None,
             };
             tails.push(Appender::open(Arc::clone(&shared), index as u64, adopted)?);
         }
@@ -1421,21 +1453,42 @@ impl Reel {
             shared,
             tails,
             bands: BandPool::new(count),
+            reserved,
+            leased: AtomicU64::new(0),
         })
     }
 
-    /// The tail compaction owns, which no foreground write is offered
-    pub fn reserved_tail(&self) -> Option<usize> {
-        let held = self.shared.config.rewrite_on_seal || self.shared.volumes.has_capacity();
-        (held && !self.tails.is_empty()).then(|| self.tails.len() - 1)
+    /// Hold a reserved tail for one pass, or nothing when the volume keeps none free
+    pub fn lease_reserved(&self) -> Option<ReservedLease<'_>> {
+        let first = self.foreground().len();
+        let mut leased = self.leased.load(Ordering::Acquire);
+        loop {
+            let free = (0..self.reserved).find(|at| leased & (1u64 << at) == 0)?;
+            match self.leased.compare_exchange_weak(
+                leased,
+                leased | (1u64 << free),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(ReservedLease {
+                        reel: self,
+                        index: first + free,
+                    })
+                }
+                Err(found) => leased = found,
+            }
+        }
+    }
+
+    /// Whether this volume keeps tails back for compaction
+    pub fn keeps_reserved(&self) -> bool {
+        self.reserved > 0
     }
 
     /// The tails a foreground write may be routed to
     fn foreground(&self) -> &[Appender] {
-        match self.reserved_tail() {
-            Some(reserved) => &self.tails[..reserved],
-            None => &self.tails,
-        }
+        &self.tails[..self.tails.len() - self.reserved]
     }
 
     /// Open a reel with no append tails, for a read-only open that never writes
@@ -1444,6 +1497,8 @@ impl Reel {
             shared,
             tails: Vec::new(),
             bands: BandPool::new(0),
+            reserved: 0,
+            leased: AtomicU64::new(0),
         }
     }
 

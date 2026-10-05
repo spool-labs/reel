@@ -426,6 +426,16 @@ impl Compactor {
         Ok(Some(facts))
     }
 
+    /// Whether a merge can take this segment now: a sorted run no pass is holding
+    pub fn is_mergeable(&self, shared: &Arc<ReelShared>, segment: SegmentId) -> bool {
+        !lock(&self.in_flight).contains(&segment)
+            && self
+                .facts_of(shared, segment)
+                .ok()
+                .flatten()
+                .is_some_and(|facts| facts.is_sorted_run)
+    }
+
     /// Drop what a retired segment's footer settled, since the file is going with it
     pub fn forget_facts(&self, segment: SegmentId) {
         lock(&self.sealed_facts).remove(&segment);
@@ -461,9 +471,10 @@ impl Compactor {
     /// deadlock guard is off: a full disk cannot be compacted out of, because compaction
     /// needs somewhere to write the survivors.
     pub fn new(config: &ReelConfig, capacity_bytes: u64, fast_capacity_bytes: u64) -> Compactor {
-        // One segment for compaction to write survivors into, plus one per tail, since
+        // One segment for each pass to write survivors into, plus one per tail, since
         // between two maintenance ticks every tail can roll and claim a fresh segment.
-        let reserve = config.segment_bytes.to_bytes() * (config.tail_count() as u64 + 1);
+        let reserve =
+            config.segment_bytes.to_bytes() * (config.tail_count() + config.compact_passes()) as u64;
         // Half the fast tier of later ingest: late enough that the hot set stays hot,
         // early enough that the tier never fills before demotion starts.
         let demote_after_bytes = (fast_capacity_bytes > 1).then_some(fast_capacity_bytes / 2);
@@ -552,11 +563,7 @@ impl Compactor {
         if let Some(ranked) = self.select_ranked(reel, index, effective_dead_ratio, cue_floor) {
             return Some(ranked);
         }
-        let fallback = self.select_unsorted(reel, index, cue_floor);
-        if let Some((segment, _)) = fallback {
-            lock(&self.in_flight).insert(segment);
-        }
-        fallback
+        self.select_unsorted(reel, index, cue_floor)
     }
 
     /// A sealed segment with nothing live left in it, which retires by unlink
@@ -667,8 +674,15 @@ impl Compactor {
         let (segments, _) = index.ranking();
         let pinned = lock(&self.rotted).clone();
         let owed = shared.pending_seals();
+        // claimed under the lock the choice is made under, as the ranked walk does, or
+        // passes running side by side leave with the same segment
+        let mut claimed = lock(&self.in_flight);
         for (segment, bytes) in segments {
-            if shared.is_held(segment) || bytes.total() == 0 || owed.contains(&segment) {
+            if shared.is_held(segment)
+                || claimed.contains(&segment)
+                || bytes.total() == 0
+                || owed.contains(&segment)
+            {
                 continue;
             }
             // rewriting for order meets the same rot as rewriting for space
@@ -693,6 +707,7 @@ impl Compactor {
             if shared.pending_seals().contains(&segment) {
                 continue;
             }
+            claimed.insert(segment);
             return Some((segment, 0.0));
         }
         None
@@ -757,13 +772,23 @@ impl Compactor {
         // the writer paid for is undone otherwise: every rewrite would put a window's
         // records back into the mixture they were kept out of.
         let band = band_of(shared, &source)?;
-        let dest_index = destination(reel, band)?;
+        // A volume that keeps tails back writes each pass into one of its own, since a
+        // run copied in key order stops being one the moment anything else lands inside
+        // it. Otherwise the survivors route the way a fresh write of the same band would.
+        let lease = reel.lease_reserved();
+        if reel.keeps_reserved() && lease.is_none() {
+            return Ok(());
+        }
+        let dest_index = match &lease {
+            Some(lease) => lease.index(),
+            None => reel.place(band)?,
+        };
 
-        // Only the reserved tail answers to a named tier and to the source's band, since
+        // Only a reserved tail answers to a named tier and to the source's band, since
         // a foreground destination mixes fresh puts in and fresh puts stay fast. A
         // leftover active segment from another tier or another band is sealed away so
         // the swap draws under what this pass just set.
-        if reel.reserved_tail() == Some(dest_index) {
+        if lease.is_some() {
             let class = self.output_class(shared, segment);
             let dest = &reel.tails()[dest_index];
             dest.set_draw_class(class);
@@ -843,8 +868,8 @@ impl Compactor {
         // Closing per pass keeps one source's records to one destination, so key and
         // offset order agree in it.
         if tally.had_live {
-            if let Some(reserved) = reel.reserved_tail() {
-                reel.tails()[reserved].seal()?;
+            if let Some(lease) = &lease {
+                reel.tails()[lease.index()].seal()?;
             }
         }
 
@@ -1583,17 +1608,6 @@ fn is_purged(floor: u64, index: &ReelIndex, key: &RecordKey) -> bool {
         Some(mark) => mark < floor,
         None => false,
     }
-}
-
-/// The tail this pass copies its survivors into
-fn destination(reel: &Reel, band: Option<Band>) -> Result<usize> {
-    // A volume that rewrites at seal keeps a tail back for exactly this, since a run
-    // copied in key order stops being one the moment a foreground put lands inside it.
-    if let Some(reserved) = reel.reserved_tail() {
-        return Ok(reserved);
-    }
-    // Otherwise the survivors route the way a fresh write of the same band would.
-    reel.place(band)
 }
 
 /// The band a sealed segment was drawn under, read off its own header record

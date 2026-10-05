@@ -36,13 +36,13 @@ const SETTLED_DEPTH: usize = 8;
 /// Ticks a round drives maintenance for, past what its merges take
 const TICKS: usize = 12;
 
-fn config() -> ReelConfig {
+fn config(tails: u32) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(128 * 1024),
         alloc_chunk: ByteCount::from_bytes(32 * 1024),
         preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
-        active_tails: ThreadBudget::threads(1),
+        active_tails: ThreadBudget::threads(tails),
         index: IndexResidency::Paged,
         rewrite_on_seal: true,
         merge_sorted_runs: true,
@@ -91,8 +91,18 @@ fn check(store: &ReelStore, model: &BTreeMap<Vec<u8>, Vec<u8>>, stage: &str) {
 // fresh keys alone keep the runs over one key within the merge depth, and every key answers
 #[test]
 fn fresh_keys_keep_the_runs_over_a_key_within_the_depth() {
+    keeps_the_depth(1);
+}
+
+// eight tails run four passes a tick, three rewriting beside a merge, over the same keys
+#[test]
+fn passes_side_by_side_keep_the_depth_and_every_key() {
+    keeps_the_depth(8);
+}
+
+fn keeps_the_depth(tails: u32) {
     let dir = TempDir::new().expect("temp dir");
-    let store = ReelStore::open(dir.path().to_path_buf(), config(), COLUMNS).expect("open");
+    let store = ReelStore::open(dir.path().to_path_buf(), config(tails), COLUMNS).expect("open");
     let mut model = BTreeMap::new();
     let mut deepest = 0;
     for round in 0..ROUNDS {
@@ -118,6 +128,6 @@ fn fresh_keys_keep_the_runs_over_a_key_within_the_depth() {
 
     store.close().expect("close");
     drop(store);
-    let reopened = ReelStore::open(dir.path().to_path_buf(), config(), COLUMNS).expect("reopen");
+    let reopened = ReelStore::open(dir.path().to_path_buf(), config(tails), COLUMNS).expect("reopen");
     check(&reopened, &model, "after a reopen");
 }

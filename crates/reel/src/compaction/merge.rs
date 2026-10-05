@@ -276,7 +276,7 @@ fn note_output_spans(
 /// Past the reserved tails, so draws are unpinned and the output lands on whichever
 /// volume has room.
 fn merge_tail_index(shared: &ReelShared) -> u64 {
-    shared.config.tail_count() as u64 + 1
+    (shared.config.tail_count() + shared.config.compact_passes()) as u64
 }
 
 /// The dead share of the standing sorted runs, or nothing where there is no stack

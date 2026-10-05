@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::compaction::compactor::EraseReport;
@@ -396,7 +396,9 @@ impl ReelStore {
         }
         // Too many runs reaching over the same keys: the youngest collapse among
         // themselves, which keeps a walk's merge narrow without rewriting the volume.
-        let Some(tier) = self.index.youngest_tier(MERGE_DEPTH, MERGE_TIER) else {
+        let shared = self.reel.shared();
+        let mergeable = |segment| self.compactor.is_mergeable(shared, segment);
+        let Some(tier) = self.index.youngest_tier(MERGE_DEPTH, MERGE_TIER, mergeable) else {
             return Ok(None);
         };
         merge_runs(&self.compactor, &self.reel, &self.index, self.cues.floor(), &tier).map(Some)
@@ -419,13 +421,7 @@ impl ReelStore {
         self.page_out_sealed()?;
         self.sweep_covers()?;
         self.prune_tombstones();
-        self.compact_once()?;
-        // After the rewrite, so a run the pass above unlinked whole is never bytes a
-        // merge reads. A pass that refuses or fails is one tier of one tick, and the
-        // scrub below is still owed.
-        if let Err(error) = self.merge_when_due() {
-            tracing::warn!("a maintenance tick left the sorted runs standing: {error}");
-        }
+        self.compact_and_merge()?;
         // The handover goes again ahead of the scrub, since a rewrite or a merge above
         // can hold the tick long enough for a backlog of sealed keys to build.
         self.page_out_sealed()?;
@@ -433,6 +429,46 @@ impl ReelStore {
         self.index.scrub_fast(FAST_SCRUB_BUDGET);
         self.index.sweep_walk_runs();
         Ok(())
+    }
+
+    /// Rewrite and merge with every compaction pass the volume runs at once
+    ///
+    /// A one-pass volume rewrites and then merges, so a run the rewrite unlinked whole
+    /// is never bytes the merge reads. A wider one merges on one worker while the rest
+    /// rewrite, and they keep rewriting for as long as the merge holds the tick, since
+    /// the tick waits for it anyway.
+    fn compact_and_merge(&self) -> Result<()> {
+        let passes = self.config.compact_passes();
+        if passes == 1 {
+            self.compact_once()?;
+            self.merge_owed();
+            return Ok(());
+        }
+        let merging = AtomicBool::new(true);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                self.merge_owed();
+                merging.store(false, Ordering::Release);
+            });
+            let workers: Vec<_> = (1..passes)
+                .map(|_| {
+                    scope.spawn(|| -> Result<()> {
+                        while self.compact_once()? == CompactPass::Copied && merging.load(Ordering::Acquire) {}
+                        Ok(())
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .try_for_each(|worker| worker.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+        })
+    }
+
+    /// Merge what is due, where a pass that refuses or fails is one tier of one tick
+    fn merge_owed(&self) {
+        if let Err(error) = self.merge_when_due() {
+            tracing::warn!("a maintenance tick left the sorted runs standing: {error}");
+        }
     }
 
     /// Retry the seals of segments a device failure left footerless

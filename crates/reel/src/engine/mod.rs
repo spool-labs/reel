@@ -70,12 +70,6 @@ const INGEST_HOT_BYTES: u64 = 8 * 1024 * 1024;
 /// Bounded so a tick stays a bounded pass whatever was dropped.
 const SWEEP_RUN: usize = 1 << 16;
 
-/// Segment rewrites the volume admits at once
-///
-/// One, because a second pass buys reclaim the device was already spending on the
-/// first and takes the foreground's tail with it.
-const COMPACT_PASSES: usize = 1;
-
 /// Openings this process has made, which is what tells their sweep marks apart
 ///
 /// A counter rather than a clock or a random source: the only thing a mark has
@@ -476,7 +470,7 @@ impl ReelStore {
             reads,
             fd_cache,
             compactor,
-            compaction_plane: PassPlane::new(COMPACT_PASSES),
+            compaction_plane: PassPlane::new(config.compact_passes()),
             config,
             reel,
             index,

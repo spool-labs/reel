@@ -490,6 +490,15 @@ impl ReelConfig {
         self.active_tails.resolve_tails().max(fast)
     }
 
+    /// Compaction passes this volume runs at once, one for every two tails
+    ///
+    /// Ingest spreads over the tails, so the passes that sort and merge what they land
+    /// scale with them, and a one-tail volume keeps its single pass. A reserved tail is
+    /// leased by a bit in a word, which caps the passes at 64.
+    pub fn compact_passes(&self) -> usize {
+        self.tail_count().div_ceil(2).min(64)
+    }
+
     /// Bits per key this volume's seals actually spend on filters
     ///
     /// Nothing on a resident index, whatever the knob says: such a column answers

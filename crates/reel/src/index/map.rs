@@ -1731,17 +1731,27 @@ impl ReelIndex {
         self.sealed.iter().map(SealedRanges::depth).max().unwrap_or(0)
     }
 
-    /// The segments of the smallest layers, once some column's layers pass a depth
+    /// The segments of the smallest layers a merge can take, once some column's layers pass a depth
     ///
     /// The deepest column decides. Its smallest layers are its youngest, sealed one at a
-    /// time, so merging them among themselves leaves the large merged layers alone.
-    pub fn youngest_tier(&self, depth: usize, take: usize) -> Option<std::collections::BTreeSet<SegmentId>> {
+    /// time, so merging them among themselves leaves the large merged layers alone. A
+    /// layer holding a segment no merge can take yet sits this one out.
+    pub fn youngest_tier(
+        &self,
+        depth: usize,
+        take: usize,
+        mergeable: impl Fn(SegmentId) -> bool,
+    ) -> Option<std::collections::BTreeSet<SegmentId>> {
         let mut layers = self
             .sealed
             .iter()
             .map(SealedRanges::layers)
             .max_by_key(Vec::len)?;
         if layers.len() <= depth {
+            return None;
+        }
+        layers.retain(|layer| layer.iter().all(|segment| mergeable(*segment)));
+        if layers.len() < 2 {
             return None;
         }
         let bytes: HashMap<SegmentId, u64> = self

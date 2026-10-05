@@ -90,6 +90,11 @@ impl Placed {
         self.owned.push(value);
     }
 
+    /// Empty the batch, keeping its vectors for the next one
+    pub(crate) fn clear(&mut self) {
+        self.reset(0);
+    }
+
     /// Start over on a batch of this many keys, with every one missing
     fn reset(&mut self, keys: usize) {
         self.asks.clear();

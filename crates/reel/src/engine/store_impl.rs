@@ -18,7 +18,7 @@ use crate::format::column::{ColumnId, KeyRef, KeyWidth, RecordKey, MAX_KEY_LEN};
 use crate::index::column::{ColumnMark, Mark};
 use crate::index::entry::Entry;
 use crate::index::page::KeyPage;
-use crate::index::playback::{PlaybackCursor, Way};
+use crate::index::playback::{CursorBuffers, PlaybackCursor, Way};
 use crate::engine::read::Placed;
 
 /// Keys a playback's first trip to the index pulls
@@ -718,18 +718,22 @@ impl ReelStore {
     }
 
     fn playback(&self, scope: Scope, column: ColumnId) -> Playback<'_> {
-        let page = Page::reading(&scope, column, self.serves(column));
+        // The last playback on this thread left its vectors behind, emptied.
+        let mut spare = SPARE_WALK.with(std::cell::Cell::take).unwrap_or_default();
+        let buffered = spare.buffered.take().unwrap_or_else(KeyPage::reading);
+        let page = Page::open(&scope, column, self.serves(column), buffered, spare.cursor.take().unwrap_or_default());
         Playback {
             store: self,
             scope,
             column,
             page,
-            staged: Vec::new(),
-            found: Vec::new(),
-            placed: Placed::default(),
+            staged: std::mem::take(&mut spare.staged),
+            found: std::mem::take(&mut spare.found),
+            placed: std::mem::take(&mut spare.placed),
             cursor: 0,
             run: PLAYBACK_RUN_MIN,
             is_done: false,
+            spare: Some(spare),
         }
     }
 
@@ -806,20 +810,15 @@ struct Page {
 impl Page {
     /// A cursor over keys alone, for a playback that reads no payloads
     fn keys_only(scope: &Scope, column: ColumnId, serves: bool) -> Page {
-        Page::open(scope, column, serves, KeyPage::default())
+        Page::open(scope, column, serves, KeyPage::default(), CursorBuffers::default())
     }
 
     /// A cursor carrying each key's payload length, for a playback that stages reads
     fn with_lens(scope: &Scope, column: ColumnId, serves: bool) -> Page {
-        Page::open(scope, column, serves, KeyPage::with_lens())
+        Page::open(scope, column, serves, KeyPage::with_lens(), CursorBuffers::default())
     }
 
-    /// A cursor for a playback that reads every payload, which a walk may read for it
-    fn reading(scope: &Scope, column: ColumnId, serves: bool) -> Page {
-        Page::open(scope, column, serves, KeyPage::reading())
-    }
-
-    fn open(scope: &Scope, column: ColumnId, serves: bool, buffered: KeyPage) -> Page {
+    fn open(scope: &Scope, column: ColumnId, serves: bool, buffered: KeyPage, cursor: CursorBuffers) -> Page {
         let way = match scope.direction {
             Direction::Asc => Way::Up,
             Direction::Desc => Way::Down,
@@ -831,7 +830,7 @@ impl Page {
             buffered,
             serves,
             taken: 0,
-            playback: PlaybackCursor::new(column, way, as_slice_bound(&bound)).ok(),
+            playback: PlaybackCursor::with_buffers(column, way, as_slice_bound(&bound), cursor).ok(),
             size: PLAYBACK_PAGE_MIN,
         }
     }
@@ -933,6 +932,46 @@ struct Playback<'store> {
 
     /// Whether the playback has run out of keys
     is_done: bool,
+
+    /// Where this playback's vectors go back to when it ends, for the thread's next one
+    spare: Option<Box<WalkBuffers>>,
+}
+
+/// The vectors one playback fills, handed to the thread's next playback when it ends
+///
+/// A short walk spent most of its allocations building these afresh and dropping them,
+/// 22 of them a scan of ten keys.
+#[derive(Default)]
+struct WalkBuffers {
+    staged: Vec<usize>,
+    found: Vec<Option<Entry>>,
+    placed: Placed,
+    buffered: Option<KeyPage>,
+    cursor: Option<CursorBuffers>,
+}
+
+thread_local! {
+    /// The last finished playback's vectors on this thread
+    static SPARE_WALK: std::cell::Cell<Option<Box<WalkBuffers>>> = const { std::cell::Cell::new(None) };
+}
+
+impl Drop for Playback<'_> {
+    fn drop(&mut self) {
+        let Some(mut spare) = self.spare.take() else {
+            return;
+        };
+        self.staged.clear();
+        self.found.clear();
+        self.placed.clear();
+        spare.staged = std::mem::take(&mut self.staged);
+        spare.found = std::mem::take(&mut self.found);
+        spare.placed = std::mem::take(&mut self.placed);
+        let mut buffered = std::mem::take(&mut self.page.buffered);
+        buffered.clear();
+        spare.buffered = Some(buffered);
+        spare.cursor = self.page.playback.take().map(PlaybackCursor::into_buffers);
+        SPARE_WALK.with(|cell| cell.set(Some(spare)));
+    }
 }
 
 /// A walk that lends each entry rather than handing it over

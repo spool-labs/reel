@@ -238,36 +238,45 @@ struct Sealed {
 
     /// The loser each node holds, and at 0 the cursor holding the next key
     tree: Vec<usize>,
+
+    /// The winner below each node while the tree is played, kept for the next build
+    winners: Vec<usize>,
 }
 
 impl Sealed {
-    /// Play cursors already placed against each other
-    fn new(set: Arc<RunSet>, at: Vec<u32>, heads: Vec<Head>, way: Way) -> Sealed {
-        let count = heads.len();
-        let mut sealed = Sealed {
-            set: Some(set),
-            at,
-            heads,
-            tree: vec![0; count],
-        };
+    /// Play the cursors placed in `at` and `heads` against each other
+    fn build(&mut self, way: Way) {
+        let count = self.heads.len();
+        self.tree.clear();
+        self.tree.resize(count, 0);
         // Leaves stand past the nodes, and a node's children are the winners below it.
-        let mut winners = vec![0usize; 2 * count];
+        let mut winners = std::mem::take(&mut self.winners);
+        winners.clear();
+        winners.resize(2 * count, 0);
         for leaf in 0..count {
             winners[count + leaf] = leaf;
         }
         for node in (1..count).rev() {
             let (left, right) = (winners[2 * node], winners[2 * node + 1]);
-            let (won, lost) = match sealed.ahead(way, right, left) {
+            let (won, lost) = match self.ahead(way, right, left) {
                 true => (right, left),
                 false => (left, right),
             };
             winners[node] = won;
-            sealed.tree[node] = lost;
+            self.tree[node] = lost;
         }
         if count > 0 {
-            sealed.tree[0] = winners[1];
+            self.tree[0] = winners[1];
         }
-        sealed
+        self.winners = winners;
+    }
+
+    /// Let go of the runs and forget every cursor, keeping the vectors for the next open
+    fn clear(&mut self) {
+        self.set = None;
+        self.at.clear();
+        self.heads.clear();
+        self.tree.clear();
     }
 
     /// The key the front cursor stands on, or nothing once every run is spent
@@ -396,17 +405,57 @@ pub struct PlaybackCursor {
     resident: KeyPage,
 }
 
+/// The vectors a playback's cursors fill, handed to the next playback on the thread
+pub struct CursorBuffers {
+    sealed: Sealed,
+    resident: KeyPage,
+}
+
+impl Default for CursorBuffers {
+    fn default() -> CursorBuffers {
+        CursorBuffers {
+            sealed: Sealed::default(),
+            resident: KeyPage::with_lens(),
+        }
+    }
+}
+
 impl PlaybackCursor {
     /// A playback of one column from a bound, with nothing open yet
     pub fn new(column: ColumnId, way: Way, from: Bound<&[u8]>) -> Result<PlaybackCursor> {
+        PlaybackCursor::with_buffers(column, way, from, CursorBuffers::default())
+    }
+
+    /// The same playback, filling vectors a finished one left behind
+    pub fn with_buffers(
+        column: ColumnId,
+        way: Way,
+        from: Bound<&[u8]>,
+        buffers: CursorBuffers,
+    ) -> Result<PlaybackCursor> {
+        let CursorBuffers { mut sealed, mut resident } = buffers;
+        sealed.clear();
+        resident.clear();
         Ok(PlaybackCursor {
             column,
             way,
             at: Some(owned_bound(from)?),
-            sealed: Sealed::default(),
+            sealed,
             generation: None,
-            resident: KeyPage::with_lens(),
+            resident,
         })
+    }
+
+    /// The vectors this playback filled, emptied for the next one
+    pub fn into_buffers(self) -> CursorBuffers {
+        let PlaybackCursor {
+            mut sealed,
+            mut resident,
+            ..
+        } = self;
+        sealed.clear();
+        resident.clear();
+        CursorBuffers { sealed, resident }
     }
 
     /// The column this playback crosses
@@ -502,7 +551,7 @@ impl PlaybackCursor {
         let Some(at) = self.at.as_ref() else {
             return Ok(());
         };
-        self.sealed = paged.open_sealed(self.way, borrowed_bound(at))?;
+        paged.open_sealed(self.way, borrowed_bound(at), &mut self.sealed)?;
         self.generation = Some(generation);
         Ok(())
     }
@@ -725,7 +774,7 @@ fn borrowed_bound(bound: &Bound<KeyBytes>) -> Bound<&[u8]> {
 
 impl Paged<'_> {
     /// Open a cursor on every sealed segment whose keys reach into the playback
-    fn open_sealed(&self, way: Way, from: Bound<&[u8]>) -> Result<Sealed> {
+    fn open_sealed(&self, way: Way, from: Bound<&[u8]>, sealed: &mut Sealed) -> Result<()> {
         let generation = self.sealed.generation();
         let set = self.runs.current(generation, || {
             let mut runs = Vec::new();
@@ -744,16 +793,17 @@ impl Paged<'_> {
         })?;
 
         // A run whose keys all lie behind the bound is passed over without a search.
-        let mut at = Vec::with_capacity(set.runs.len());
-        let mut heads = Vec::with_capacity(set.runs.len());
+        sealed.clear();
         for (index, run) in set.runs.iter().enumerate() {
             let head = Head::placed(run.rows(), way, from);
             if !head.is_spent {
-                at.push(index as u32);
-                heads.push(head);
+                sealed.at.push(index as u32);
+                sealed.heads.push(head);
             }
         }
-        Ok(Sealed::new(set, at, heads, way))
+        sealed.set = Some(set);
+        sealed.build(way);
+        Ok(())
     }
 }
 

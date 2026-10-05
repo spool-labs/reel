@@ -13,12 +13,12 @@ use reel_core::{
     Result as StoreResult, Store, StoreIter, StoreVolume, Value, WriteBatch,
 };
 
+use crate::engine::read::Placed;
 use crate::engine::{RecordWrite, ReelStore};
 use crate::format::column::{ColumnId, KeyRef, KeyWidth, RecordKey, MAX_KEY_LEN};
 use crate::index::entry::Entry;
 use crate::index::page::KeyPage;
 use crate::index::playback::{PlaybackCursor, Way};
-use crate::engine::read::Placed;
 
 /// Keys a playback's first trip to the index pulls
 ///

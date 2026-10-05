@@ -418,6 +418,7 @@ impl ReelStore {
         self.page_out_sealed()?;
         self.scrub_once()?;
         self.index.scrub_fast(FAST_SCRUB_BUDGET);
+        self.index.sweep_walk_runs();
         Ok(())
     }
 

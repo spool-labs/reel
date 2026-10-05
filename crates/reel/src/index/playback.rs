@@ -34,6 +34,69 @@ pub struct Paged<'a> {
 
     /// Where the footers themselves are read from
     pub footers: &'a dyn FooterSource,
+
+    /// The footers a walk opens, kept while the sealed set stands
+    pub runs: &'a WalkRuns,
+}
+
+/// Slots a column keeps its opened runs in, so walks on different threads share none
+const RUN_SLOTS: usize = 16;
+
+/// Hands out each thread's run slot, once
+static NEXT_RUN_SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    /// The run slot this thread takes in every column
+    static RUN_SLOT: usize = NEXT_RUN_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % RUN_SLOTS;
+}
+
+/// One column's sealed runs as a walk opens them, as of one generation of its sealed set
+pub struct RunSet {
+    generation: u64,
+    runs: Vec<Run>,
+}
+
+/// A slot of opened runs, on a cache line of its own
+#[repr(align(64))]
+#[derive(Default)]
+struct RunSlot(std::sync::Mutex<Option<Arc<RunSet>>>);
+
+/// The runs one column's walks open, kept a slot a thread while its sealed set stands
+///
+/// Opening every footer a walk reaches costs a cache lookup and a count each, which a
+/// short walk felt. A walk takes its thread's slot, and a slot whose sealed set has
+/// moved is opened again. The maintenance tick sweeps the slots no walk came back
+/// to, so a retired segment's footer is let go.
+#[derive(Default)]
+pub struct WalkRuns {
+    slots: [RunSlot; RUN_SLOTS],
+}
+
+impl WalkRuns {
+    /// The runs as of a generation, from this thread's slot or opened afresh
+    fn current(&self, generation: u64, open: impl FnOnce() -> Result<Vec<Run>>) -> Result<Arc<RunSet>> {
+        let slot = &self.slots[RUN_SLOT.with(|slot| *slot)];
+        let mut held = crate::sync::lock(&slot.0);
+        if let Some(set) = held.as_ref().filter(|set| set.generation == generation) {
+            return Ok(Arc::clone(set));
+        }
+        let set = Arc::new(RunSet {
+            generation,
+            runs: open()?,
+        });
+        *held = Some(Arc::clone(&set));
+        Ok(set)
+    }
+
+    /// Let go of every slot opened before a generation
+    pub fn sweep(&self, generation: u64) {
+        for slot in &self.slots {
+            let mut held = crate::sync::lock(&slot.0);
+            if held.as_ref().is_some_and(|set| set.generation != generation) {
+                *held = None;
+            }
+        }
+    }
 }
 
 /// Which way a playback crosses its column
@@ -46,7 +109,7 @@ pub enum Way {
     Down,
 }
 
-/// One sealed segment's rows for one column, held for the length of a playback
+/// One sealed segment's rows for one column, held while its sealed set stands
 struct Run {
     /// Segment the rows came from, which is where their records are
     segment: SegmentId,
@@ -129,6 +192,10 @@ impl Head {
             return Head::SPENT;
         };
         let row = match (way, from) {
+            (Way::Up, Bound::Included(key)) if key > high => None,
+            (Way::Up, Bound::Excluded(key)) if key >= high => None,
+            (Way::Down, Bound::Included(key)) if key < low => None,
+            (Way::Down, Bound::Excluded(key)) if key <= low => None,
             (Way::Up, Bound::Unbounded) => Some(0),
             (Way::Up, Bound::Included(key)) if key <= low => Some(0),
             (Way::Up, Bound::Included(key)) => Some(rows.lower_bound(key)),
@@ -164,7 +231,9 @@ fn lead_of(key: &[u8]) -> u64 {
 /// settle nearly every compare without a key being read.
 #[derive(Default)]
 struct Sealed {
-    runs: Vec<Run>,
+    /// The runs the cursors stand in, and which run each cursor reads
+    set: Option<Arc<RunSet>>,
+    at: Vec<u32>,
     heads: Vec<Head>,
 
     /// The loser each node holds, and at 0 the cursor holding the next key
@@ -173,10 +242,11 @@ struct Sealed {
 
 impl Sealed {
     /// Play cursors already placed against each other
-    fn new(runs: Vec<Run>, heads: Vec<Head>, way: Way) -> Sealed {
+    fn new(set: Arc<RunSet>, at: Vec<u32>, heads: Vec<Head>, way: Way) -> Sealed {
         let count = heads.len();
         let mut sealed = Sealed {
-            runs,
+            set: Some(set),
+            at,
             heads,
             tree: vec![0; count],
         };
@@ -205,11 +275,16 @@ impl Sealed {
         self.key_of(*self.tree.first()?)
     }
 
+    /// The run a cursor reads
+    fn run(&self, at: usize) -> &Run {
+        &self.set.as_ref().expect("cursors stand in a set").runs[self.at[at] as usize]
+    }
+
     fn key_of(&self, at: usize) -> Option<&[u8]> {
         let head = &self.heads[at];
         match head.is_spent {
             true => None,
-            false => self.runs[at].rows().key_at(head.first),
+            false => self.run(at).rows().key_at(head.first),
         }
     }
 
@@ -234,8 +309,8 @@ impl Sealed {
     fn newest(&mut self, way: Way, key: &[u8], below: Option<Lsn>) -> Result<Option<(SegmentId, FooterRow)>> {
         let mut newest: Option<(SegmentId, FooterRow)> = None;
         while let Some(at) = self.front_on(key) {
-            let found = self.runs[at].rows().row_at(self.heads[at].last)?;
-            let segment = self.runs[at].segment;
+            let found = self.run(at).rows().row_at(self.heads[at].last)?;
+            let segment = self.run(at).segment;
             self.step(way, at);
             let is_under = below.is_none_or(|below| found.lsn < below);
             if is_under && newest.as_ref().is_none_or(|(_, newest)| newest.lsn < found.lsn) {
@@ -253,7 +328,7 @@ impl Sealed {
             Way::Down => head.first.checked_sub(1),
         };
         self.heads[at] = match next {
-            Some(row) => Head::at(self.runs[at].rows(), way, row),
+            Some(row) => Head::at(self.run(at).rows(), way, row),
             None => Head::SPENT,
         };
         self.replay(way, at);
@@ -651,34 +726,34 @@ fn borrowed_bound(bound: &Bound<KeyBytes>) -> Bound<&[u8]> {
 impl Paged<'_> {
     /// Open a cursor on every sealed segment whose keys reach into the playback
     fn open_sealed(&self, way: Way, from: Bound<&[u8]>) -> Result<Sealed> {
-        let bound = match from {
-            Bound::Unbounded => None,
-            Bound::Included(key) | Bound::Excluded(key) => Some(key),
-        };
-        let reachable = match way {
-            Way::Up => self.sealed.spanning(bound, None),
-            Way::Down => self.sealed.spanning(None, bound),
-        };
-
-        let mut runs = Vec::with_capacity(reachable.len());
-        let mut heads = Vec::with_capacity(reachable.len());
-        for segment in reachable {
-            // A segment retired between the range read and this one is simply gone,
-            // and what it held has been copied on or was dead.
-            let Some(footer) = self.footers.footer(segment)? else {
-                continue;
-            };
-            let Some(partition) = footer.partitions.iter().position(|rows| rows.column == self.column) else {
-                continue;
-            };
-            let head = Head::placed(&footer.partitions[partition], way, from);
-            if head.is_spent {
-                continue;
+        let generation = self.sealed.generation();
+        let set = self.runs.current(generation, || {
+            let mut runs = Vec::new();
+            for segment in self.sealed.spanning(None, None) {
+                // A segment retired between the range read and this one is simply gone,
+                // and what it held has been copied on or was dead.
+                let Some(footer) = self.footers.footer(segment)? else {
+                    continue;
+                };
+                let Some(partition) = footer.partitions.iter().position(|rows| rows.column == self.column) else {
+                    continue;
+                };
+                runs.push(Run { segment, footer, partition });
             }
-            runs.push(Run { segment, footer, partition });
-            heads.push(head);
+            Ok(runs)
+        })?;
+
+        // A run whose keys all lie behind the bound is passed over without a search.
+        let mut at = Vec::with_capacity(set.runs.len());
+        let mut heads = Vec::with_capacity(set.runs.len());
+        for (index, run) in set.runs.iter().enumerate() {
+            let head = Head::placed(run.rows(), way, from);
+            if !head.is_spent {
+                at.push(index as u32);
+                heads.push(head);
+            }
         }
-        Ok(Sealed::new(runs, heads, way))
+        Ok(Sealed::new(set, at, heads, way))
     }
 }
 
@@ -763,6 +838,7 @@ mod tests {
         index: ColumnIndex,
         sealed: SealedRanges,
         footers: CountingFooters,
+        runs: WalkRuns,
     }
 
     impl Fixture {
@@ -777,6 +853,7 @@ mod tests {
                         .collect(),
                     opened: AtomicUsize::new(0),
                 },
+                runs: WalkRuns::default(),
             }
         }
 
@@ -786,6 +863,7 @@ mod tests {
                 index: &self.index,
                 sealed: &self.sealed,
                 footers: &self.footers,
+                runs: &self.runs,
             }
         }
 

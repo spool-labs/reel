@@ -27,7 +27,7 @@ use crate::index::entry::Entry;
 use crate::index::fastforward::{FastColumn, Lookup, Pick, RecordSource, Settled, Since, LOOKUP_TRIES};
 use crate::index::page::KeyPage;
 use crate::index::paged::{Candidates, FooterSource, SealedRanges};
-use crate::index::playback::{self, merged_page, Paged, PlaybackCursor, Way};
+use crate::index::playback::{self, merged_page, Paged, PlaybackCursor, WalkRuns, Way};
 use crate::index::recovery::SealedSpan;
 
 /// Slots in the lookup from a column identifier to its index
@@ -220,6 +220,9 @@ pub struct ReelIndex {
     /// What each column's sealed segments cover, empty unless the column pages
     sealed: Vec<SealedRanges>,
 
+    /// The footers each column's walks opened, kept while its sealed set stands
+    walk_runs: Vec<WalkRuns>,
+
     /// Each column's sealed keys as record locations, answering a get in one read
     fast: Vec<FastColumn>,
 
@@ -277,6 +280,7 @@ impl ReelIndex {
         Ok(ReelIndex {
             columns,
             indexes,
+            walk_runs: sealed.iter().map(|_| WalkRuns::default()).collect(),
             sealed,
             fast: columns
                 .iter()
@@ -1691,6 +1695,16 @@ impl ReelIndex {
             index: &self.indexes[at],
             sealed: &self.sealed[at],
             footers: footers.as_ref(),
+            runs: &self.walk_runs[at],
+        }
+    }
+
+    /// Let go of the footers walks opened under a sealed set that has since moved
+    ///
+    /// A slot no walk came back to would otherwise hold a retired segment's footer.
+    pub fn sweep_walk_runs(&self) {
+        for (sealed, runs) in self.sealed.iter().zip(&self.walk_runs) {
+            runs.sweep(sealed.generation());
         }
     }
 

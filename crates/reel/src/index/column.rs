@@ -16,7 +16,7 @@ use crate::config::IndexResidency;
 use crate::engine::Totals;
 use crate::error::{ReelError, Result};
 use crate::format::column::{ColumnId, ColumnSpec, KeyBytes, RecordKey, MAX_KEY_LEN};
-use crate::format::loc::{Loc, SegmentId};
+use crate::format::loc::{Loc, SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
 use crate::index::counters::{Bookings, SegmentTable};
 use crate::index::entry::{span_of, Entry};
@@ -258,13 +258,12 @@ impl ColumnIndex {
     pub fn repoint_paged(
         &self,
         key: &[u8],
-        from: Loc,
         to: Loc,
         lsn: Lsn,
         counted: bool,
-        segments: &SegmentTable,
+        stamp: SegmentIncarnation,
     ) -> bool {
-        on_index!(self, index => index.repoint_paged(key, from, to, lsn, counted, segments))
+        on_index!(self, index => index.repoint_paged(key, to, lsn, counted, stamp))
     }
 
     /// Take a half-open range with one standing cover, sweeping nothing
@@ -375,9 +374,9 @@ impl ColumnIndex {
         key: &[u8],
         new_loc: Loc,
         expected_lsn: Lsn,
-        segments: &SegmentTable,
-    ) -> bool {
-        on_index!(self, index => index.repoint(key, new_loc, expected_lsn, segments))
+        stamp: SegmentIncarnation,
+    ) -> Option<Loc> {
+        on_index!(self, index => index.repoint(key, new_loc, expected_lsn, stamp))
     }
 
     /// Drop a key while it still resolves one exact location, writing no tombstone
@@ -1141,15 +1140,14 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// Guarded by where the caller found it, so a key rewritten or deleted since it
     /// was resolved keeps whatever took its place. A key handed over at runtime moves
     /// back from the paged count; one a rebuild left sealed was never counted, so it
-    /// is counted fresh on the way in.
+    /// is counted fresh on the way in. The caller books the bytes either way.
     pub fn repoint_paged(
         &self,
         key: &[u8],
-        from: Loc,
         to: Loc,
         lsn: Lsn,
         counted: bool,
-        segments: &SegmentTable,
+        stamp: SegmentIncarnation,
     ) -> bool {
         let Some(key) = K::from_slice(key) else {
             return false;
@@ -1158,16 +1156,10 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         let mut state = write(&self.shards[at]);
         let was_empty = state.map.vacant();
         if state.map.holds(key.as_slice()) {
-            segments.mark_dead(to.segment, lsn, span_of(key.width(), to.len));
             return false;
         }
-        segments.release_live(from.segment, span_of(key.width(), from.len));
-        segments.mark_live(to.segment, lsn, span_of(key.width(), to.len));
         self.filters.note(at, filter_hash(key.as_slice()));
-        state.map.put(
-            key,
-            Entry::new(to, lsn).stamped(segments.live_incarnation(to.segment)),
-        );
+        state.map.put(key, Entry::new(to, lsn).stamped(stamp));
         match counted {
             // Saturating on purpose: a count that reaches zero early is a count
             // to fix, not a reason to drop a live record.
@@ -1667,47 +1659,28 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// Repoint a key from a compacted record to its rewritten copy under a guard
     ///
     /// The copy carries the source record's sequence number, so the entry moves only
-    /// while it still resolves that exact version. A raced repoint is declined and the
-    /// copy is booked dead in its destination.
+    /// while it still resolves that exact version. What comes back is where the entry
+    /// moved from, for the caller to book, and nothing for a raced repoint.
     pub fn repoint(
         &self,
         key: &[u8],
         new_loc: Loc,
         expected_lsn: Lsn,
-        segments: &SegmentTable,
-    ) -> bool {
-        let key = match K::from_slice(key) {
-            Some(key) => key,
-            None => return false,
-        };
+        stamp: SegmentIncarnation,
+    ) -> Option<Loc> {
+        let key = K::from_slice(key)?;
         let at = self.shard_of(&key);
         let mut state = write(&self.shards[at]);
         // Changed where it sits: the entry was just found, and putting it back would
         // walk the map to it a second time.
         match state.map.at_mut(key.as_slice()) {
             Some(existing) if existing.lsn == expected_lsn && !existing.is_grave() => {
-                let span = existing.span(key.width());
-                segments.release_live(existing.loc.segment, span);
-                segments.mark_live(
-                    new_loc.segment,
-                    expected_lsn,
-                    span_of(key.width(), new_loc.len),
-                );
+                let from = existing.loc;
                 self.filters.note(at, filter_hash(key.as_slice()));
-                // The copy sits in an open tail, held live until the repoint is
-                // published, so its stamp is issued here.
-                let stamp = segments.live_incarnation(new_loc.segment);
                 *existing = existing.moved_to(new_loc, stamp);
-                true
+                Some(from)
             }
-            Some(_) | None => {
-                segments.mark_dead(
-                    new_loc.segment,
-                    expected_lsn,
-                    span_of(key.width(), new_loc.len),
-                );
-                false
-            }
+            Some(_) | None => None,
         }
     }
 
@@ -3565,17 +3538,14 @@ mod tests {
             .insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(1)), &segments)
             .took_place();
 
-        let moved = index.repoint(&key(1, 1), loc(2, 0, 400), Lsn(1), &segments);
+        let moved = index.repoint(&key(1, 1), loc(2, 0, 400), Lsn(1), SegmentIncarnation(1));
 
-        assert!(moved);
+        assert_eq!(moved, Some(loc(1, 0, 400)));
         assert_eq!(index.get(&key(1, 1)).expect("present").loc, loc(2, 0, 400));
-        assert_eq!(segments.bytes_of(SegmentId(1)).live, 0);
-        assert_eq!(segments.bytes_of(SegmentId(1)).dead, 0);
-        assert_eq!(segments.bytes_of(SegmentId(2)).live, span_of(34, 400));
         assert_eq!(index.totals().count, 1);
     }
 
-    // a repoint loses to a concurrent overwrite and the copy is booked dead
+    // a repoint loses to a concurrent overwrite and leaves the newer entry standing
     #[test]
     fn repoint_loses_to_overwrite() {
         let index = sharded();
@@ -3587,11 +3557,10 @@ mod tests {
             .insert(&key(1, 1), Entry::new(loc(3, 0, 900), Lsn(2)), &segments)
             .took_place();
 
-        let moved = index.repoint(&key(1, 1), loc(2, 0, 400), Lsn(1), &segments);
+        let moved = index.repoint(&key(1, 1), loc(2, 0, 400), Lsn(1), SegmentIncarnation(1));
 
-        assert!(!moved);
+        assert_eq!(moved, None);
         assert_eq!(index.get(&key(1, 1)).expect("present").loc, loc(3, 0, 900));
-        assert_eq!(segments.bytes_of(SegmentId(2)).dead, span_of(34, 400));
     }
 
     // evicting a corrupt record removes the key and books its bytes dead

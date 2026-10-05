@@ -34,10 +34,7 @@ use crate::compaction::compactor::{
 };
 use crate::compaction::pressure::PassPace;
 
-/// Repoints one hold of the publish barrier takes
-///
-/// A reader waiting on the barrier pays the whole hold, so the cap is on the hold
-/// rather than on the pass.
+/// Repoints one booking of the moved bytes covers
 const REPOINT_BATCH: usize = 4096;
 
 /// Sorted runs below which there is nothing for a merge to collapse
@@ -724,13 +721,17 @@ fn read_source_record(
     Ok(found.filter(|record| record.offset == offset))
 }
 
-/// Publish the repoints a run of copies is owed, under one hold of the barrier
+/// Publish the repoints a run of copies is owed
+///
+/// Outside the publish barrier, as a rewrite's are: a repoint keeps the version, so a
+/// walk finds the same record at either place until the source retires, and a hold
+/// over every stripe would stall every walk for the length of the run.
 fn flush_repoints(index: &ReelIndex, state: &mut MergeState) -> Result<()> {
     if state.pending.is_empty() {
         return Ok(());
     }
     rendezvous::at("merge/repoint");
-    let moved = index.repoint_batch(&state.pending)?;
+    let moved = index.repoint_run(&state.pending)?;
     state.pending.clear();
     state.report.entries_repointed += moved;
     state.report.repoint_batches += 1;

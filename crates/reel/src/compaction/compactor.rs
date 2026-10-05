@@ -19,7 +19,7 @@ use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{peek_key_width, read_u32_le, RecordHeader, HEADER_LEN};
 use crate::format::segment_header::SegmentHeader;
-use crate::index::map::ReelIndex;
+use crate::index::map::{KeyRepoint, ReelIndex};
 use crate::io::op::Part;
 use crate::reel::segment::{SegmentHandle, SegmentReader, READ_CHUNK};
 use crate::reel::{Reel, ReelShared, NOTHING_PURGED};
@@ -256,6 +256,9 @@ struct CopyRun {
 
     /// Each queued record's key, sequence number and span, for its repoint and the tally
     moved: Vec<(RecordKey, Loc, Lsn, u64)>,
+
+    /// The landed run's repoints, kept for the next run once published
+    repoints: Vec<KeyRepoint>,
 
     /// Bytes the queued records frame
     bytes: u64,
@@ -1067,9 +1070,17 @@ impl Compactor {
         let landed = reel.tails()[dest_index].append_copies(std::mem::take(&mut run.copies))?;
         crate::sync::rendezvous::at("compaction/repoint");
         for ((key, from, lsn, span), committed) in run.moved.drain(..).zip(landed) {
-            index.repoint(&key, Some(from), committed.loc, lsn)?;
+            run.repoints.push(KeyRepoint {
+                key,
+                from: Some(from),
+                to: committed.loc,
+                lsn,
+            });
             tally.copied_bytes += span;
         }
+        let published = index.repoint_run(&run.repoints);
+        run.repoints.clear();
+        published?;
         tally.had_live = true;
         Ok(())
     }

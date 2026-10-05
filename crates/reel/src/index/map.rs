@@ -19,11 +19,11 @@ use crate::format::column::{
     Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, RecordKey,
 };
 use crate::format::footer::{FooterPartition, SegmentFooter};
-use crate::format::loc::{Loc, SegmentId};
+use crate::format::loc::{Loc, SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
 use crate::index::column::{ColumnIndex, KeyMove, Landed, PendingCover};
 use crate::index::counters::{Floors, SegmentBytes, SegmentStamp, SegmentTable};
-use crate::index::entry::Entry;
+use crate::index::entry::{span_of, Entry};
 use crate::index::fastforward::{FastColumn, Lookup, Pick, RecordSource, Settled, Since, LOOKUP_TRIES};
 use crate::index::page::KeyPage;
 use crate::index::paged::{Candidates, FooterSource, SealedRanges};
@@ -1349,41 +1349,119 @@ impl ReelIndex {
     /// the key's one FastForward slot. Otherwise the footers give the source, and they
     /// also say whether the row is still the version being moved.
     pub fn repoint(&self, key: &RecordKey, from: Option<Loc>, to: Loc, expected_lsn: Lsn) -> Result<bool> {
+        let moves = [KeyRepoint {
+            key: key.clone(),
+            from,
+            to,
+            lsn: expected_lsn,
+        }];
+        Ok(self.repoint_run(&moves)? == 1)
+    }
+
+    /// Repoint a run of moved records at their copies, booking the run's bytes in bulk
+    ///
+    /// The copies are booked live before any repoint is published, so a write taking a
+    /// moved key down books its copy out of a count that already holds it. A repoint
+    /// that loses its race moves its copy from live to dead, and each source gives up
+    /// what moved out of it in one booking once the run is done. The table is shared
+    /// with every writer, so a booking per record is what a pass would contend on.
+    pub fn repoint_run(&self, moves: &[KeyRepoint]) -> Result<u64> {
+        let mut copies: Vec<(SegmentId, u64, Lsn, SegmentIncarnation)> = Vec::new();
+        for repoint in moves {
+            let span = span_of(repoint.key.as_slice().len() as u16, repoint.to.len);
+            match copies.iter_mut().find(|copy| copy.0 == repoint.to.segment) {
+                Some(copy) => {
+                    copy.1 += span;
+                    copy.2 = copy.2.min(repoint.lsn);
+                }
+                None => copies.push((repoint.to.segment, span, repoint.lsn, SegmentIncarnation::NONE)),
+            }
+        }
+        for copy in &mut copies {
+            self.segments.mark_live(copy.0, copy.2, copy.1);
+            copy.3 = self.segments.live_incarnation(copy.0);
+        }
+        let mut released: Vec<(SegmentId, u64)> = Vec::new();
+        let mut lost: Vec<(SegmentId, u64)> = Vec::new();
+        let mut moved = 0u64;
+        let mut failed = None;
+        for repoint in moves {
+            let width = repoint.key.as_slice().len() as u16;
+            let stamp = copies
+                .iter()
+                .find(|copy| copy.0 == repoint.to.segment)
+                .map_or(SegmentIncarnation::NONE, |copy| copy.3);
+            let outcome = match failed {
+                Some(_) => Ok(None),
+                None => self.repoint_moved(&repoint.key, repoint.from, repoint.to, repoint.lsn, stamp),
+            };
+            let (segment, span, into) = match outcome {
+                Ok(Some(from)) => {
+                    moved += 1;
+                    (from.segment, span_of(width, from.len), &mut released)
+                }
+                Ok(None) => (repoint.to.segment, span_of(width, repoint.to.len), &mut lost),
+                Err(error) => {
+                    failed = Some(error);
+                    (repoint.to.segment, span_of(width, repoint.to.len), &mut lost)
+                }
+            };
+            match into.iter_mut().find(|held| held.0 == segment) {
+                Some(held) => held.1 += span,
+                None => into.push((segment, span)),
+            }
+        }
+        for (segment, span) in lost {
+            self.segments.shadow(segment, span);
+        }
+        for (segment, span) in released {
+            self.segments.release_live(segment, span);
+        }
+        match failed {
+            Some(error) => Err(error),
+            None => Ok(moved),
+        }
+    }
+
+    /// Move one key's entry from a compacted record to its copy, booking nothing
+    ///
+    /// What comes back is where the entry moved from, or nothing where the key moved on.
+    fn repoint_moved(
+        &self,
+        key: &RecordKey,
+        from: Option<Loc>,
+        to: Loc,
+        expected_lsn: Lsn,
+        stamp: SegmentIncarnation,
+    ) -> Result<Option<Loc>> {
         let Some(at) = self.slot(key.column) else {
-            return Ok(false);
+            return Ok(None);
         };
         let index = &self.indexes[at];
         if !self.is_paged_key(at, key) {
-            return Ok(index.repoint(key.as_slice(), to, expected_lsn, &self.segments));
+            return Ok(index.repoint(key.as_slice(), to, expected_lsn, stamp));
         }
         // The pass read the record at its source, so when that is the key's one FastForward
         // slot it is this key at this version, and no slot holds a newer one: no read needed.
         if let Some(from) = from.filter(|from| self.fast_serves() && self.fast[at].only_at(key.as_slice(), *from)) {
             let counted = self.counted(from.segment);
-            let moved = index.repoint_paged(key.as_slice(), from, to, expected_lsn, counted, &self.segments);
-            if moved {
-                self.fast[at].remove_at(key.as_slice(), from);
+            if !index.repoint_paged(key.as_slice(), to, expected_lsn, counted, stamp) {
+                return Ok(None);
             }
-            return Ok(moved);
+            self.fast[at].remove_at(key.as_slice(), from);
+            return Ok(Some(from));
         }
         match self.sealed_state(at, key)? {
             Sealed::Live(entry) if entry.lsn == expected_lsn => {
-                let moved = index.repoint_paged(
-                    key.as_slice(),
-                    entry.loc,
-                    to,
-                    expected_lsn,
-                    self.counted(entry.loc.segment),
-                    &self.segments,
-                );
-                if moved {
-                    self.fast[at].remove_at(key.as_slice(), entry.loc);
+                let counted = self.counted(entry.loc.segment);
+                if !index.repoint_paged(key.as_slice(), to, expected_lsn, counted, stamp) {
+                    return Ok(None);
                 }
-                Ok(moved)
+                self.fast[at].remove_at(key.as_slice(), entry.loc);
+                Ok(Some(entry.loc))
             }
-            // A newer version won the race, so the copy is dead on arrival and
-            // the compactor books it as such.
-            Sealed::Live(_) | Sealed::Gone => Ok(false),
+            // A newer version won the race, so the copy is dead on arrival.
+            Sealed::Live(_) | Sealed::Gone => Ok(None),
             // Nothing anywhere answers for this key, which does not mean nothing
             // does: a segment that sealed since the pass began is invisible here,
             // and adopting the copy would write the source's sequence number into
@@ -1392,29 +1470,11 @@ impl ReelIndex {
             Sealed::Absent => {
                 self.unclaimed
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(false)
+                Ok(None)
             }
         }
     }
 
-    /// Repoint a run of moved records at their copies, under one hold of the barrier
-    ///
-    /// Per key it is the guarded move `repoint` makes, taken together so the hold is
-    /// paid once for the run. The run length bounds a hold rather than a rate: a
-    /// reader waiting on the barrier pays the whole of it, so a pass moving millions
-    /// of entries cuts them into runs. A paged key resolves its source row inside the
-    /// hold, from a footer the caller has usually just read.
-    pub fn repoint_batch(&self, moves: &[KeyRepoint]) -> Result<u64> {
-        self.publish_pass(|| {
-            let mut moved = 0u64;
-            for repoint in moves {
-                if self.repoint(&repoint.key, repoint.from, repoint.to, repoint.lsn)? {
-                    moved += 1;
-                }
-            }
-            Ok(moved)
-        })
-    }
 
     /// Copies compaction made that nothing else was pointing at
     ///

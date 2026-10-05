@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use reel::format::footer::{FooterEntry, FooterPartition, SegmentFooter};
 use reel::format::lsn::Lsn;
-use reel::format::prefix::PrefixRows;
+use reel::format::prefix::{PrefixRows, Tail};
 use reel::format::record::Flags;
 use reel::{ColumnId, RecordKey};
 
@@ -82,9 +82,11 @@ fn paired(keys: &[Vec<u8>]) -> (Duration, PrefixRows) {
         tail[..8].copy_from_slice(&(at as u64).to_le_bytes());
         staged.push((key.clone(), tail));
     }
-    staged.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    // Equal keys go in sequence order, as a footer sorts them, since a tail is written as
+    // its difference from the row before.
+    staged.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
 
-    let mut rows = PrefixRows::new();
+    let mut rows = PrefixRows::new(Tail::Entry);
     for (key, tail) in &staged {
         rows.push(key, tail).expect("push");
     }
@@ -115,9 +117,9 @@ fn flat(keys: &[Vec<u8>]) -> (Duration, PrefixRows) {
         let len = u16::from_le_bytes([packed[row], packed[row + 1]]) as usize;
         &packed[row + 2..row + 2 + len]
     };
-    order.sort_unstable_by(|left, right| key_of(*left).cmp(key_of(*right)));
+    order.sort_unstable_by(|left, right| key_of(*left).cmp(key_of(*right)).then(left.cmp(right)));
 
-    let mut rows = PrefixRows::new();
+    let mut rows = PrefixRows::new(Tail::Entry);
     for at in &order {
         let row = *at as usize * stride;
         let len = u16::from_le_bytes([packed[row], packed[row + 1]]) as usize;
@@ -143,7 +145,9 @@ fn sort_only(keys: &[Vec<u8>]) -> Duration {
         tail[..8].copy_from_slice(&(at as u64).to_le_bytes());
         staged.push((key.clone(), tail));
     }
-    staged.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    // Equal keys go in sequence order, as a footer sorts them, since a tail is written as
+    // its difference from the row before.
+    staged.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
     std::hint::black_box(&staged);
     began.elapsed()
 }
@@ -233,8 +237,8 @@ fn both_accumulators_pack_the_same_block() {
     assert_eq!(one.len(), two.len());
     assert_eq!(one.packed_len(), two.packed_len());
     assert_eq!(
-        one.keys(TAIL).expect("keys"),
-        two.keys(TAIL).expect("keys"),
+        one.keys().expect("keys"),
+        two.keys().expect("keys"),
         "the two accumulators disagree about the order",
     );
 }
@@ -285,7 +289,7 @@ fn what_packing_is_worth_by_column_shape() {
     ] {
         let mut sorted = corpus.clone();
         sorted.sort();
-        let mut rows = PrefixRows::new();
+        let mut rows = PrefixRows::new(Tail::Raw(TAIL.min(8)));
         for (at, key) in sorted.iter().enumerate() {
             rows.push(key, &(at as u64).to_le_bytes()[..TAIL.min(8)])
                 .ok();

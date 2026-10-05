@@ -24,7 +24,7 @@ use reel::format::filter::Filter;
 use reel::format::footer::{FooterEntry, SegmentFooter};
 use reel::format::loc::SegmentId;
 use reel::format::lsn::Lsn;
-use reel::format::prefix::PrefixRows;
+use reel::format::prefix::{unpack, PrefixRows, Tail};
 use reel::format::record::{BatchFrame, Flags, RecordHeader, HEADER_LEN};
 use reel::format::segment_header::{SegmentHeader, SEGMENT_HEADER_LEN, SEGMENT_HEADER_SPAN};
 use reel::index::column::ColumnMark;
@@ -106,7 +106,9 @@ fn parsers_never_panic_on_arbitrary_bytes() {
             let _ = SegmentFooter::parse(&bytes);
             let _ = SegmentHeader::unpack(&bytes);
             let _ = PersistedIndex::unpack(&bytes);
-            let _ = PrefixRows::decode(&bytes);
+            let _ = PrefixRows::decode(&bytes, Tail::Entry);
+            let _ = unpack(&bytes, Tail::Entry, None);
+            let _ = unpack(&bytes, Tail::Entry, Some(33));
             let _ = ColumnMark::unpack(&bytes);
             let _ = Filter::parse_region(&bytes, rng.gen_range(0..8));
             for codec in CODECS {

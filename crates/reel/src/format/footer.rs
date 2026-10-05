@@ -13,7 +13,7 @@ use crate::format::column::{ColumnId, RecordKey};
 use crate::format::fence::{fence_bytes, lead_of, top_leads, FENCE_LEAD, FENCE_PAGE_LEADS};
 use crate::format::filter::{Filter, HEADER_LEN as FILTER_HEADER_LEN};
 use crate::format::lsn::Lsn;
-use crate::format::prefix::{packed_len, PrefixRows};
+use crate::format::prefix::{unpack, PrefixRows, Tail};
 use crate::format::record::{checksum, digest, read_u32_le, read_u64_le, Flags, RecordHeader};
 
 /// Marker in the final bytes of a sealed segment
@@ -264,15 +264,6 @@ impl FooterPartition {
     /// Whether the rows lie prefix packed on disk, so a block of them opens on a restart
     pub fn is_packed(&self) -> bool {
         self.is_packed
-    }
-
-    /// Pack a strided partition's rows when its sorted keys share enough of their fronts to pay
-    fn choose_packing(&mut self) {
-        if self.is_varying() {
-            return;
-        }
-        let keys = (0..self.len()).filter_map(|at| self.key_at(at));
-        self.is_packed = packed_len(keys, ENTRY_TAIL_LEN) < self.packed.len();
     }
 
     /// Stop striding, keeping the rows already packed
@@ -949,7 +940,9 @@ impl SegmentFooter {
         for partition in self.partitions.iter_mut() {
             partition.sort();
             partition.build_filter(filter_bits);
-            partition.choose_packing();
+            // Every partition lies packed: a tail's differences save bytes even where
+            // keys share nothing.
+            partition.is_packed = true;
         }
 
         let encoded = self
@@ -1174,7 +1167,7 @@ fn encoded_partition_rows(partition: &FooterPartition) -> Result<Cow<'_, [u8]>> 
     if !partition.is_packed() {
         return Ok(Cow::Borrowed(partition.packed.as_slice()));
     }
-    let mut rows = PrefixRows::new();
+    let mut rows = PrefixRows::with_capacity(Tail::Entry, partition.packed.len());
     for index in 0..partition.len() {
         let width = partition.key_len(index).ok_or_else(|| {
             ReelError::Corruption(
@@ -1184,9 +1177,7 @@ fn encoded_partition_rows(partition: &FooterPartition) -> Result<Cow<'_, [u8]>> 
         let row = partition.row_bytes(index)?;
         rows.push(&row[..width], &row[width..])?;
     }
-    let mut out = Vec::with_capacity(rows.encoded_len());
-    rows.encode(&mut out);
-    Ok(Cow::Owned(out))
+    Ok(Cow::Owned(rows.into_encoded()))
 }
 
 /// Write one partition's directory row
@@ -1242,16 +1233,11 @@ fn read_partitions(
             let blob = footer.get(rows_at..rows_at + listed_span).ok_or_else(|| {
                 ReelError::Corruption("footer partition is truncated".to_string())
             })?;
-            let rows = PrefixRows::decode(blob)?;
-            if rows.len() != count {
+            let row_len = (!partition.is_varying()).then(|| partition.stride());
+            let (packed, starts, rows) = unpack(blob, Tail::Entry, row_len)?;
+            if rows != count {
                 return Err(ReelError::Corruption(
                     "footer partition holds a row count its directory row denies".to_string(),
-                ));
-            }
-            let (packed, starts) = rows.unpacked(ENTRY_TAIL_LEN)?;
-            if !partition.is_varying() && packed.len() != count * partition.stride() {
-                return Err(ReelError::Corruption(
-                    "a packed partition holds rows of another width than its directory row".to_string(),
                 ));
             }
             partition.packed = packed;
@@ -1545,14 +1531,16 @@ mod tests {
         assert_eq!(collect(&parsed), collect(&footer));
     }
 
-    // keys spread like hashes share too little to pay for packing, so their column stays strided
+    // keys spread like hashes still pack smaller than strided, since each tail is written as a difference
     #[test]
-    fn spread_keys_stay_strided() {
-        let mut footer = SegmentFooter::build(many_rows(200));
+    fn spread_keys_pack_smaller_than_strided() {
+        let rows = many_rows(200);
+        let strided = rows.len() * (34 + ENTRY_TAIL_LEN);
+        let mut footer = SegmentFooter::build(rows);
         let packed = footer.pack(0).expect("pack");
-        assert!(!footer.partition(RECORD).expect("partition").is_packed());
+        assert!(footer.partition(RECORD).expect("partition").is_packed());
+        assert!(packed.len() < strided, "{} bytes against {strided} strided", packed.len());
         let parsed = SegmentFooter::parse(&packed).expect("parse");
-        assert!(!parsed.partition(RECORD).expect("partition").is_packed());
         assert_eq!(parsed, footer);
     }
 

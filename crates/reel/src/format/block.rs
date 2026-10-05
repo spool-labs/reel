@@ -18,7 +18,7 @@ use crate::format::footer::{
     directory_span, partition_spans, DirectorySpan, FooterFind, FooterRow, DIRECTORY_ROW_LEN,
     ENTRY_TAIL_LEN, FIXED_TAIL_LEN, VARYING_WIDTH,
 };
-use crate::format::prefix::{unpack_block, RESTART_INTERVAL, TRAILER_LEN};
+use crate::format::prefix::{unpack_block, Tail, RESTART_INTERVAL, TRAILER_LEN};
 use crate::format::record::read_u32_le;
 use crate::index::counters::FilterProbes;
 use crate::io::op::FileId;
@@ -478,7 +478,7 @@ impl RowBlock {
                 "footer partition is truncated".to_string(),
             ));
         }
-        let (packed, starts) = unpack_block(&bytes, ENTRY_TAIL_LEN)?;
+        let (packed, starts) = unpack_block(&bytes, Tail::Entry)?;
         if starts.len() - 1 != rows {
             return Err(ReelError::Corruption(
                 "a restart block holds a row count its table denies".to_string(),

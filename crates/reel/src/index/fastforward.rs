@@ -1389,6 +1389,19 @@ impl FastColumn {
         };
         let mut group = group.to_vec();
         group.sort_unstable_by(|left, right| rows[*left].key.cmp(&rows[*right].key));
+        // Keys sharing their bits, as keys sharing a lead do in an ordered table, meet each
+        // other's slots, so a slot counts as this key's only when its footer row says so.
+        let mut keys_at: Option<HashMap<u32, usize>> = None;
+        let mut key_at = |offset: u32| -> Result<Option<&[u8]>> {
+            if keys_at.is_none() {
+                let mut at_offset = HashMap::with_capacity(partition.len());
+                for at in 0..partition.len() {
+                    at_offset.insert(partition.row_at(at)?.offset, at);
+                }
+                keys_at = Some(at_offset);
+            }
+            Ok(keys_at.as_ref().and_then(|keys| keys.get(&offset)).and_then(|at| partition.key_at(*at)))
+        };
         let mut unsettled = Vec::new();
         for same_key in group.chunk_by(|left, right| rows[*left].key == rows[*right].key) {
             // The newest set-aside version of the key, a tie to the newer segment.
@@ -1424,7 +1437,11 @@ impl FastColumn {
                 }
                 // The slot is an older version in a segment that rewrote the key, and the
                 // footer's newest is this row.
-                Some(place) if segment == row.loc.segment && standing.offset == row.loc.offset => {
+                Some(place)
+                    if segment == row.loc.segment
+                        && standing.offset == row.loc.offset
+                        && key_at(place.slot.offset)? == Some(row.key.as_slice()) =>
+                {
                     table.take(hash, &place.slot);
                     table.insert(slot_of(hash, row));
                     true

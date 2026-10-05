@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::compaction::compactor::EraseReport;
 use crate::compaction::merge::{merge_once, merge_runs, sorted_run_dead_ratio, MergeReport};
@@ -31,6 +32,9 @@ const MERGE_DEPTH: usize = 8;
 
 /// Layers one tiered merge collapses, the smallest the volume holds
 const MERGE_TIER: usize = 8;
+
+/// How often the hand-over runs while compaction passes hold the tick, the tick's own second
+const HANDOVER_TICK: Duration = Duration::from_secs(1);
 
 impl ReelStore {
     /// Tell the index about every segment that has sealed since it was last told
@@ -431,13 +435,37 @@ impl ReelStore {
         Ok(())
     }
 
+    /// Run the tick's compaction passes, with the hand-over going on beside them
+    fn compact_and_merge(&self) -> Result<()> {
+        let running = AtomicBool::new(true);
+        std::thread::scope(|scope| {
+            // The hand-over keeps its own second while the passes run. A merge holds the
+            // tick for as long as it takes, and the keys sealed meanwhile would wait in the
+            // map for all of it, holding memory the page cache then goes without.
+            let keeper = scope.spawn(|| -> Result<()> {
+                loop {
+                    std::thread::park_timeout(HANDOVER_TICK);
+                    if !running.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    self.page_out_sealed()?;
+                }
+            });
+            let passed = self.run_passes();
+            running.store(false, Ordering::Release);
+            keeper.thread().unpark();
+            let kept = keeper.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            passed.and(kept)
+        })
+    }
+
     /// Rewrite and merge with every compaction pass the volume runs at once
     ///
     /// A one-pass volume rewrites and then merges, so a run the rewrite unlinked whole
     /// is never bytes the merge reads. A wider one merges on one worker while the rest
     /// rewrite, and they keep rewriting for as long as the merge holds the tick, since
     /// the tick waits for it anyway.
-    fn compact_and_merge(&self) -> Result<()> {
+    fn run_passes(&self) -> Result<()> {
         let passes = self.config.compact_passes();
         if passes == 1 {
             self.compact_once()?;

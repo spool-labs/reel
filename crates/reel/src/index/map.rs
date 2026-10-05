@@ -1439,7 +1439,14 @@ impl ReelIndex {
         };
         let index = &self.indexes[at];
         if !self.is_paged_key(at, key) {
-            return Ok(index.repoint(key.as_slice(), to, expected_lsn, stamp));
+            match index.repoint(key.as_slice(), to, expected_lsn, stamp) {
+                Some(from) => return Ok(Some(from)),
+                // A hand-over can page the key out between the two looks, and then the
+                // move is the paged one below. Declining it would book the copy dead and
+                // let the pass retire the only record the key has.
+                None if !self.is_paged_key(at, key) => return Ok(None),
+                None => {}
+            }
         }
         // The pass read the record at its source, so when that is the key's one FastForward
         // slot it is this key at this version, and no slot holds a newer one: no read needed.

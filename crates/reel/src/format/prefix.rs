@@ -261,6 +261,27 @@ fn shared_prefix(left: &[u8], right: &[u8]) -> usize {
     left.iter().zip(right).take_while(|(a, b)| a == b).count()
 }
 
+/// Bytes sorted rows would take prefix packed, priced without packing them
+///
+/// Walks the same restarts and shares `push` does, so a footer can weigh the packed form
+/// against the strided one before it builds either.
+pub fn packed_len<'a>(keys: impl Iterator<Item = &'a [u8]>, tail_len: usize) -> usize {
+    let mut len = TRAILER_LEN;
+    let mut last: &[u8] = &[];
+    for (at, key) in keys.enumerate() {
+        let shared = match at.is_multiple_of(RESTART_INTERVAL) {
+            true => {
+                len += std::mem::size_of::<u32>();
+                0
+            }
+            false => shared_prefix(last, key),
+        };
+        len += ROW_HEADER_LEN + key.len() - shared + tail_len;
+        last = key;
+    }
+    len
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

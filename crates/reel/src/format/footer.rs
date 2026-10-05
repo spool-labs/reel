@@ -13,7 +13,7 @@ use crate::format::column::{ColumnId, RecordKey};
 use crate::format::fence::{fence_bytes, lead_of, top_leads, FENCE_LEAD, FENCE_PAGE_LEADS};
 use crate::format::filter::{Filter, HEADER_LEN as FILTER_HEADER_LEN};
 use crate::format::lsn::Lsn;
-use crate::format::prefix::PrefixRows;
+use crate::format::prefix::{packed_len, PrefixRows};
 use crate::format::record::{checksum, digest, read_u32_le, read_u64_le, Flags, RecordHeader};
 
 /// Marker in the final bytes of a sealed segment
@@ -42,6 +42,11 @@ const DIRECTORY_SPAN_AT: usize = 1 + 2 + U32_BYTES;
 /// Past the longest key by a wide margin, so it can never collide with a width a column
 /// really keyed its rows at. Such a partition carries a start per row ahead of the rows.
 pub const VARYING_WIDTH: u16 = u16::MAX;
+
+/// The bit a fixed width carries in a directory row when its rows lie prefix packed
+///
+/// Clear in every width a key really has, since no key is wider than `MAX_KEY_LEN`.
+pub const PACKED_WIDTH: u16 = 0x8000;
 
 /// Bytes one row start takes in a varying partition's table
 pub const START_BYTES: usize = U32_BYTES;
@@ -219,6 +224,10 @@ pub struct FooterPartition {
 
     /// What the segment says about keys it does not hold, when it says anything
     filter: Option<Filter>,
+
+    /// Whether the rows lie prefix packed on disk: always for varying keys, and for one
+    /// width when packing saves bytes
+    is_packed: bool,
 }
 
 impl FooterPartition {
@@ -235,6 +244,7 @@ impl FooterPartition {
                 false => Vec::new(),
             },
             filter: None,
+            is_packed: key_width == VARYING_WIDTH,
         }
     }
 
@@ -251,6 +261,20 @@ impl FooterPartition {
         self.key_width == VARYING_WIDTH
     }
 
+    /// Whether the rows lie prefix packed on disk, so a block of them opens on a restart
+    pub fn is_packed(&self) -> bool {
+        self.is_packed
+    }
+
+    /// Pack a strided partition's rows when its sorted keys share enough of their fronts to pay
+    fn choose_packing(&mut self) {
+        if self.is_varying() {
+            return;
+        }
+        let keys = (0..self.len()).filter_map(|at| self.key_at(at));
+        self.is_packed = packed_len(keys, ENTRY_TAIL_LEN) < self.packed.len();
+    }
+
     /// Stop striding, keeping the rows already packed
     ///
     /// The rows in hand were all written at the old width, so their starts are the
@@ -263,6 +287,7 @@ impl FooterPartition {
         let rows = self.len();
         self.starts = (0..=rows).map(|row| (row * stride) as u32).collect();
         self.key_width = VARYING_WIDTH;
+        self.is_packed = true;
     }
 
     /// Whether this partition may hold the key, which only its filter can deny
@@ -330,7 +355,7 @@ impl FooterPartition {
     /// The read side cuts its blocks by the same arithmetic off the directory row, both
     /// through one function: a fence built at a different cut names the wrong block.
     pub fn block_rows(&self) -> usize {
-        block_rows_of(self.key_width)
+        block_rows_of(self.key_width, self.is_packed)
     }
 
     /// Blocks this partition's rows divide into on disk
@@ -924,6 +949,7 @@ impl SegmentFooter {
         for partition in self.partitions.iter_mut() {
             partition.sort();
             partition.build_filter(filter_bits);
+            partition.choose_packing();
         }
 
         let encoded = self
@@ -978,8 +1004,8 @@ impl SegmentFooter {
         let crc = crc.finalize() as u32;
         buf[crc_at..crc_at + U32_BYTES].copy_from_slice(&crc.to_le_bytes());
 
-        // A varying partition writes an encoded copy and keeps its rows, and a strided
-        // one lends the rows it holds.
+        // A packed partition writes an encoded copy and keeps its rows, and a strided one
+        // lends the rows it holds.
         let encoded: Vec<Option<Vec<u8>>> = encoded
             .into_iter()
             .map(|rows| match rows {
@@ -998,9 +1024,11 @@ impl SegmentFooter {
     }
 
     /// Take back the rows `pack_apart` lent
+    ///
+    /// A packed partition lent an encoded copy and kept its own rows, so it takes nothing back.
     pub fn put_rows(&mut self, rows: Vec<Vec<u8>>) {
         for (partition, rows) in self.partitions.iter_mut().zip(rows) {
-            if !partition.is_varying() {
+            if !partition.is_packed() {
                 partition.packed = rows;
             }
         }
@@ -1139,11 +1167,11 @@ pub(crate) fn partition_in<Held>(
 
 /// One partition's rows in their on-disk form
 ///
-/// A strided partition writes its rows as they stand. A varying one writes the
+/// A strided partition writes its rows as they stand. A packed one writes the
 /// prefix-compressed block, which shares each key's front with the row before it and so
 /// needs the rows already sorted.
 fn encoded_partition_rows(partition: &FooterPartition) -> Result<Cow<'_, [u8]>> {
-    if !partition.is_varying() {
+    if !partition.is_packed() {
         return Ok(Cow::Borrowed(partition.packed.as_slice()));
     }
     let mut rows = PrefixRows::new();
@@ -1167,7 +1195,11 @@ fn encoded_partition_rows(partition: &FooterPartition) -> Result<Cow<'_, [u8]>> 
 /// partition's on-disk form is built at write time.
 fn write_directory_row(buf: &mut Vec<u8>, partition: &FooterPartition, span: usize) {
     buf.push(partition.column.as_u8());
-    buf.extend_from_slice(&partition.key_width.to_le_bytes());
+    let width = match partition.is_packed() && !partition.is_varying() {
+        true => partition.key_width | PACKED_WIDTH,
+        false => partition.key_width,
+    };
+    buf.extend_from_slice(&width.to_le_bytes());
     buf.extend_from_slice(&(partition.len() as u32).to_le_bytes());
     buf.extend_from_slice(&(span as u32).to_le_bytes());
 }
@@ -1198,14 +1230,15 @@ fn read_partitions(
                 "footer directory lists a column twice".to_string(),
             ));
         }
-        let key_width = u16::from_le_bytes([row[1], row[2]]);
+        let (key_width, is_packed) = width_field(u16::from_le_bytes([row[1], row[2]]));
         let count = read_u32_le(&row[3..DIRECTORY_SPAN_AT]) as usize;
         let listed_span = read_u32_le(&row[DIRECTORY_SPAN_AT..DIRECTORY_ROW_LEN]) as usize;
 
         let mut partition = FooterPartition::new(column, key_width);
-        if partition.is_varying() {
-            // The varying rows land prefix compressed, so the parse rebuilds the
-            // whole-row form every in-memory reader searches.
+        partition.is_packed = is_packed;
+        if is_packed {
+            // Packed rows land prefix compressed, so the parse rebuilds the whole-row
+            // form every in-memory reader searches.
             let blob = footer.get(rows_at..rows_at + listed_span).ok_or_else(|| {
                 ReelError::Corruption("footer partition is truncated".to_string())
             })?;
@@ -1216,8 +1249,16 @@ fn read_partitions(
                 ));
             }
             let (packed, starts) = rows.unpacked(ENTRY_TAIL_LEN)?;
+            if !partition.is_varying() && packed.len() != count * partition.stride() {
+                return Err(ReelError::Corruption(
+                    "a packed partition holds rows of another width than its directory row".to_string(),
+                ));
+            }
             partition.packed = packed;
-            partition.starts = starts;
+            // One width strides in memory, however it lay on disk.
+            if partition.is_varying() {
+                partition.starts = starts;
+            }
             rows_at += listed_span;
             partitions.push(partition);
             continue;
@@ -1317,12 +1358,13 @@ pub fn partition_spans(
         let row = directory
             .get(start..start + DIRECTORY_ROW_LEN)
             .ok_or_else(|| ReelError::Corruption("footer directory is truncated".to_string()))?;
-        let key_width = u16::from_le_bytes([row[1], row[2]]);
+        let (key_width, is_packed) = width_field(u16::from_le_bytes([row[1], row[2]]));
         let rows = read_u32_le(&row[3..DIRECTORY_SPAN_AT]) as usize;
         let encoded = read_u32_le(&row[DIRECTORY_SPAN_AT..DIRECTORY_ROW_LEN]) as u64;
         let span = crate::format::block::PartitionSpan {
             column: ColumnId(row[0]),
             key_width,
+            is_packed,
             rows,
             at,
             encoded,
@@ -1331,6 +1373,15 @@ pub fn partition_spans(
         spans.push(span);
     }
     Ok(spans)
+}
+
+/// A directory row's width field, read as its rows' key width and whether they lie packed
+fn width_field(field: u16) -> (u16, bool) {
+    match field {
+        VARYING_WIDTH => (VARYING_WIDTH, true),
+        field if field & PACKED_WIDTH != 0 => (field & !PACKED_WIDTH, true),
+        field => (field, false),
+    }
 }
 
 fn read_at_u32(footer: &[u8], footer_len: usize, from_end: usize) -> u32 {
@@ -1459,6 +1510,50 @@ mod tests {
         let mut footer = SegmentFooter::build(rows);
         let _ = footer.pack(0);
         footer.partitions.remove(0)
+    }
+
+    /// Rows of a few owners, each owner's keys sharing their first 32 bytes as an address's signatures do
+    fn owned_rows(owners: u8, rows: u16) -> Vec<FooterEntry> {
+        let mut entries = Vec::new();
+        for owner in 0..owners {
+            for row in 0..rows {
+                let mut bytes = [owner; 48];
+                bytes[32..34].copy_from_slice(&row.to_be_bytes());
+                bytes[34..].copy_from_slice(&[(row as u8) ^ 0x5a; 14]);
+                let key = RecordKey::from_bytes(RECORD, &bytes).expect("key");
+                let at = u32::from(owner) * 1000 + u32::from(row);
+                entries.push(FooterEntry::new(key, Lsn(u64::from(at) + 1), at * 100, 64, Flags::DATA));
+            }
+        }
+        entries
+    }
+
+    // a one-width column whose keys share their fronts lies packed on disk and parses back whole
+    #[test]
+    fn a_one_width_column_with_shared_fronts_lies_packed() {
+        let rows = owned_rows(4, 200);
+        let strided = rows.len() * (48 + ENTRY_TAIL_LEN);
+        let mut footer = SegmentFooter::build(rows);
+        let packed = footer.pack(0).expect("pack");
+        assert!(packed.len() < strided * 3 / 4, "{} bytes against {strided} strided", packed.len());
+
+        let parsed = SegmentFooter::parse(&packed).expect("parse");
+        let partition = parsed.partition(RECORD).expect("partition");
+        assert!(partition.is_packed(), "shared fronts pay for packing");
+        assert!(!partition.is_varying(), "one width still strides in memory");
+        assert_eq!(parsed, footer);
+        assert_eq!(collect(&parsed), collect(&footer));
+    }
+
+    // keys spread like hashes share too little to pay for packing, so their column stays strided
+    #[test]
+    fn spread_keys_stay_strided() {
+        let mut footer = SegmentFooter::build(many_rows(200));
+        let packed = footer.pack(0).expect("pack");
+        assert!(!footer.partition(RECORD).expect("partition").is_packed());
+        let parsed = SegmentFooter::parse(&packed).expect("parse");
+        assert!(!parsed.partition(RECORD).expect("partition").is_packed());
+        assert_eq!(parsed, footer);
     }
 
     /// Rows enough to fill several blocks, in the order a fresh segment writes them

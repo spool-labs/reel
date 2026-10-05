@@ -4997,3 +4997,51 @@ fn a_cue_read_waits_out_a_hand_over_in_flight() {
     drop(script);
     assert_eq!(stale, 0, "a cue read answered with a version older than the cue");
 }
+// keys sharing their fronts lie packed in their footers, and a footer search with no cached footer reads their blocks back
+#[test]
+fn a_cue_read_searches_packed_footer_blocks() {
+    let (store, _) = sim_store(ReelConfig {
+        index: IndexResidency::Paged,
+        footer_cache: ByteCount::from_bytes(0),
+        ..config(1, SyncPolicy::Never)
+    });
+    let owned = |owner: u8, row: u32| {
+        let mut bytes = vec![owner; 30];
+        bytes.extend_from_slice(&row.to_be_bytes());
+        RecordKey::from_bytes(RECORD, &bytes).expect("key")
+    };
+    let (first, second) = (vec![0x11u8; 64], vec![0x22u8; 64]);
+    for owner in 0..4u8 {
+        for row in 0..300u32 {
+            store.put(&owned(owner, row), &first).expect("put");
+        }
+    }
+    let cue = store.cue().expect("cue");
+    for owner in 0..4u8 {
+        for row in 0..300u32 {
+            store.put(&owned(owner, row), &second).expect("rewrite");
+        }
+    }
+    drop(store.cue().expect("seal"));
+    store.page_out_sealed().expect("hand over");
+    let packed = store
+        .index
+        .segments_snapshot()
+        .iter()
+        .filter_map(|(segment, _)| store.reel.shared().footer_of(*segment).expect("footer"))
+        .filter(|footer| footer.partition(RECORD).is_some_and(|partition| partition.is_packed()))
+        .count();
+    assert!(packed > 0, "no footer packed the shared fronts");
+
+    let before = store.filter_probes().block_reads;
+    for owner in 0..4u8 {
+        for row in (0..300u32).step_by(7) {
+            let read = store.get_at(&owned(owner, row), &cue).expect("cue read");
+            assert_eq!(read.as_deref(), Some(&first[..]), "owner {owner} row {row} answered past the cue");
+            let live = store.get(&owned(owner, row)).expect("get");
+            assert_eq!(live.as_deref(), Some(&second[..]), "owner {owner} row {row} lost its rewrite");
+        }
+    }
+    assert!(store.get_at(&owned(9, 1), &cue).expect("cue read").is_none());
+    assert!(store.filter_probes().block_reads > before, "no search read a packed block");
+}

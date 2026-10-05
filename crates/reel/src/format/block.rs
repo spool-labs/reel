@@ -44,12 +44,12 @@ pub const BLOCK_BYTES: usize = 8 * 1024;
 
 /// Rows one block of a partition holds, the row count under the byte cap
 ///
-/// A varying partition's rows are prefix compressed, so no row's place is arithmetic and
+/// A packed partition's rows are prefix compressed, so no row's place is arithmetic and
 /// its unit of read is the restart block, whose first row carries its key whole. Free of
 /// the span because the seal cuts its fence at the same boundaries, and two copies of
 /// this arithmetic would be a fence naming the wrong block past the first cut.
-pub fn block_rows_of(key_width: u16) -> usize {
-    if key_width == VARYING_WIDTH {
+pub fn block_rows_of(key_width: u16, is_packed: bool) -> usize {
+    if is_packed {
         return RESTART_INTERVAL;
     }
     let stride = key_width as usize + ENTRY_TAIL_LEN;
@@ -64,6 +64,9 @@ pub struct PartitionSpan {
 
     /// Width every row strides by, or the varying sentinel
     pub key_width: u16,
+
+    /// Whether the rows lie prefix packed, so a read opens on a restart block
+    pub is_packed: bool,
 
     /// Rows this column contributed to the footer
     pub rows: usize,
@@ -89,7 +92,7 @@ impl PartitionSpan {
 
     /// Rows one of this partition's blocks holds, the row count under the byte cap
     pub fn block_rows(&self) -> usize {
-        block_rows_of(self.key_width)
+        block_rows_of(self.key_width, self.is_packed)
     }
 
     /// Blocks the rows divide into
@@ -367,7 +370,7 @@ fn read_restarts(
     span: &PartitionSpan,
     probes: &FilterProbes,
 ) -> Result<Option<RestartTable>> {
-    if !span.is_varying() || span.rows == 0 {
+    if !span.is_packed || span.rows == 0 {
         return Ok(None);
     }
     let count = span.rows.div_ceil(RESTART_INTERVAL);
@@ -444,7 +447,7 @@ impl RowBlock {
         restarts: Option<&RestartTable>,
     ) -> Result<RowBlock> {
         let (first, rows) = span.block(at);
-        if !span.is_varying() {
+        if !span.is_packed {
             let stride = span.stride();
             let offset = span.at + (first * stride) as u64;
             let packed = driver.pread(file, offset, (rows * stride) as u64)?;
@@ -457,7 +460,7 @@ impl RowBlock {
             });
         }
 
-        // A varying partition's rows are prefix compressed, so the unit of read is the
+        // A packed partition's rows are prefix compressed, so the unit of read is the
         // cut between two restart offsets, rebuilt into the row form searches speak.
         let Some(table) = restarts else {
             return Err(ReelError::Corruption(

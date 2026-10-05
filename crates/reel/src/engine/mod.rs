@@ -416,6 +416,14 @@ impl ReelStore {
             persisted,
             &index,
         )?;
+        // Compaction only copies what the index can find, so a writable open over a
+        // column it doesn't declare would drop that column's records.
+        if let Some(column) = rebuilt.undeclared.filter(|_| !is_read_only) {
+            return Err(ReelError::Config(format!(
+                "the volume holds column {} and this open doesn't declare it",
+                column.0,
+            )));
+        }
         for path in &rebuilt.quarantined {
             tracing::warn!("quarantined a foreign reel segment at {}", path.display());
         }

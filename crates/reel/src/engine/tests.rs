@@ -4589,6 +4589,43 @@ fn reopen_reproduces_index() {
     );
 }
 
+// an open that leaves out a written column still counts its bytes, and only a read-only one goes on
+#[test]
+fn an_undeclared_column_is_counted_and_refused_writable() {
+    let (store, sim) = sim_store(config(2, SyncPolicy::EveryPut));
+    store.put(&record(7, 1), &[0x11; 400]).expect("put");
+    store.put(&blob(1), &[0x33; 900]).expect("blob");
+    store.close().expect("close");
+    let records_only: ColumnSet = &COLUMNS[..1];
+
+    let restored = Arc::new(SimIo::from_image(sim.durable_image()));
+    let writable = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        config(2, SyncPolicy::EveryPut),
+        records_only,
+        restored.clone(),
+    );
+    assert!(
+        matches!(writable, Err(ReelError::Config(_))),
+        "a writable open over an undeclared column is refused",
+    );
+
+    let read_only = ReelStore::open_read_only_with_io(
+        PathBuf::from(ROOT),
+        config(2, SyncPolicy::EveryPut),
+        records_only,
+        restored,
+    )
+    .expect("read-only open");
+    let live: u64 = read_only
+        .index
+        .segments_snapshot()
+        .iter()
+        .map(|(_, bytes)| bytes.live)
+        .sum();
+    assert!(live >= 900, "the blob's bytes stay booked live: {live}");
+}
+
 // closing flushes and stops, leaving the tail for the next open to resume
 #[test]
 fn close_leaves_the_tail_resumable() {

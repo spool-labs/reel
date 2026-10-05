@@ -540,10 +540,14 @@ impl ReelStore {
         let live = self.totals().bytes.to_bytes();
         let dead_fraction = dead_fraction(dead, live);
         let is_hot = self.is_ingest_hot();
-        if !self
-            .compactor
-            .pressure()
-            .should_compact(dead_fraction, is_hot)
+        // Runs piled past the merge depth are sorted even under a hot ingest: a tier
+        // merge reads sorted runs alone, and the pile is what every walk pays for.
+        let is_deep = self.config.merge_sorted_runs && self.index.overlap_depth() > MERGE_DEPTH;
+        if !is_deep
+            && !self
+                .compactor
+                .pressure()
+                .should_compact(dead_fraction, is_hot)
         {
             return Ok(CompactPass::Held);
         }

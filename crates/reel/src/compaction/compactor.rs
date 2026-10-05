@@ -1130,11 +1130,7 @@ impl Compactor {
                         Some(record) if record.offset != offset => continue,
                         Some(record) => record,
                     };
-                let live = matches!(
-                    index.get(&record.header.key)?,
-                    Some(entry) if entry.loc == record.loc(segment)
-                );
-                if live {
+                if index.is_live_at(&record.header.key, record.loc(segment), record.header.lsn)? {
                     continue;
                 }
                 let start = u64::from(record.offset);
@@ -1178,9 +1174,8 @@ impl Compactor {
         // Asked here, where a stripe arrives in key order and one key's walk of the map
         // leaves the next one's path warm. The repoint is guarded on the version this
         // saw, so a record that dies before its run lands loses there.
-        match index.get(&record.header.key)? {
-            Some(entry) if entry.loc == loc => {}
-            Some(_) | None => return Ok(CopyStep::Skipped),
+        if !index.is_live_at(&record.header.key, loc, record.header.lsn)? {
+            return Ok(CopyStep::Skipped);
         }
 
         // A record the floor has passed is dropped and its key goes with it. No
@@ -1445,14 +1440,10 @@ impl Compactor {
                 continue;
             }
             let loc = record.loc(segment);
-            match index.get(&record.header.key)? {
-                Some(entry) if entry.loc == loc => {}
-                // the index resolves this key elsewhere or nowhere, so what sits here
-                // is shadowed
-                Some(_) | None => {
-                    dead += record.span();
-                    continue;
-                }
+            // the index resolves this key elsewhere or nowhere, so what sits here is shadowed
+            if !index.is_live_at(&record.header.key, loc, record.header.lsn)? {
+                dead += record.span();
+                continue;
             }
             let payload = scan
                 .reader()

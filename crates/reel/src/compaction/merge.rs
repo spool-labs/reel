@@ -580,8 +580,10 @@ fn emit_row(
     // A data row is written only while the volume still answers with it: a row written
     // past a version an open tail, an unselected run or a standing cover holds plants a
     // version nothing points at and books a key the volume has already counted.
-    let live = index.get(key)?;
-    if live.is_none_or(|entry| entry.lsn != row.lsn) {
+    let loc = Loc::new(sources[winner.at].segment, row.offset, row.len);
+    let is_live = index.surely_at(key, loc, row.lsn)
+        || index.get(key)?.is_some_and(|entry| entry.lsn == row.lsn);
+    if !is_live {
         state.report.rows_shadowed += 1;
         return Ok(());
     }

@@ -517,6 +517,33 @@ impl ReelIndex {
         }
     }
 
+    /// Whether a key's live version is the record at `loc`
+    pub fn is_live_at(&self, key: &RecordKey, loc: Loc, lsn: Lsn) -> Result<bool> {
+        if self.surely_at(key, loc, lsn) {
+            return Ok(true);
+        }
+        Ok(self.get(key)?.is_some_and(|entry| entry.loc == loc))
+    }
+
+    /// Whether the index points a key at the record at `loc`, known with no read
+    ///
+    /// The caller holds that record, so FastForward's one live slot under the key's hash
+    /// pointing there settles it with no header read. False is only unsure.
+    pub fn surely_at(&self, key: &RecordKey, loc: Loc, lsn: Lsn) -> bool {
+        let Some(at) = self.slot(key.column) else {
+            return false;
+        };
+        match self.mapped(at, key) {
+            Some(answer) => answer.is_some_and(|entry| entry.loc == loc),
+            None => {
+                self.residency.pages()
+                    && self.fast_serves()
+                    && self.fast[at].only_at(key.as_slice(), loc)
+                    && !self.indexes[at].is_covered_key(key.as_slice(), lsn)
+            }
+        }
+    }
+
     /// What the map says about a key, a grave or a cover over it as nothing, or no word
     fn mapped(&self, at: usize, key: &RecordKey) -> Option<Option<Entry>> {
         match self.indexes[at].entry_or_grave(key.as_slice()) {

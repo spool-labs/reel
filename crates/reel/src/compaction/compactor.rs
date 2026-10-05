@@ -1956,7 +1956,7 @@ mod tests {
         CompactRate, Preallocate, ReelConfig, SyncPolicy, ThreadBudget, DEFAULT_FD_CACHE,
     };
     use crate::format::column::{
-        Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyWidth, MapShape, PurgeMark, RecordKey,
+        Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyWidth, PurgeMark, RecordKey,
     };
     use crate::format::segment_header::SEGMENT_HEADER_SPAN;
     use crate::index::entry::{span_of, Entry};
@@ -1979,7 +1979,6 @@ mod tests {
         shard_bytes: 2,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     }];
 
     /// Bytes a marked key takes: the mark, then an index within it
@@ -1992,7 +1991,6 @@ mod tests {
         shard_bytes: 0,
         purge_mark: Some(PurgeMark::at(0)),
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     }];
 
     fn marked_key(mark: u64, index: u64) -> RecordKey {

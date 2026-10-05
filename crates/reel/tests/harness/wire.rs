@@ -4,7 +4,7 @@
 //! verbatim. Building the same bytes for every backend and applying each mutation
 //! through the trait is what makes the reel and the memory oracle comparable.
 
-use reel::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, RecordKey};
+use reel::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey};
 use reel_core::{Result as StoreResult, Store, WriteBatch};
 
 use crate::harness::op_stream::StreamOp;
@@ -46,7 +46,6 @@ pub const TEST_COLUMNS: ColumnSet = &[
         shard_bytes: GROUP_PREFIX_LEN as u8,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -55,7 +54,6 @@ pub const TEST_COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 

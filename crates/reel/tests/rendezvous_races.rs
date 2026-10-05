@@ -17,7 +17,7 @@ use reel::io::sim_backend::SimIo;
 use reel::sync::rendezvous;
 use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, IndexResidency, KeyPage,
-    KeyWidth, MapShape, PlaybackCursor, Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy,
+    KeyWidth, PlaybackCursor, Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy,
     ThreadBudget, Way,
 };
 
@@ -28,7 +28,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 fn config(index: IndexResidency) -> ReelConfig {
@@ -54,7 +53,6 @@ const SHARDED: ColumnSet = &[ColumnSpec {
     shard_bytes: 1,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 fn open(root: &str, seed: u64, index: IndexResidency) -> Arc<ReelStore> {

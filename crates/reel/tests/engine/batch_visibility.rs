@@ -19,7 +19,7 @@ use reel_core::{Store, WriteBatch};
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, Preallocate, ReelConfig,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, ReelConfig,
     ReelStore, SyncPolicy, ThreadBudget,
 };
 
@@ -30,7 +30,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// Keys one batch carries, enough that publishing them takes a visible while

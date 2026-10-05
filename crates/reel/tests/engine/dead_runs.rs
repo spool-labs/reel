@@ -17,7 +17,7 @@ use reel::format::footer::SegmentFooter;
 use reel::format::loc::SegmentId;
 use reel::format::record::{BLOCK, HEADER_LEN};
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactRate, KeyWidth, MapShape, RecordKey,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactRate, KeyWidth, RecordKey,
     ReelConfig, ReelStore, SyncPolicy,
 };
 
@@ -32,7 +32,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 2,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -41,7 +40,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 

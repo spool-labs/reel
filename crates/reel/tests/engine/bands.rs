@@ -14,7 +14,7 @@ use reel::format::record::{RecordHeader, HEADER_LEN};
 use reel::format::segment_header::SegmentHeader;
 use reel::{
     Band, ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, KeyWidth,
-    MapShape, Preallocate, PurgeMark, RecordKey, RecordWrite, ReelConfig, ReelStore, SyncPolicy,
+    Preallocate, PurgeMark, RecordKey, RecordWrite, ReelConfig, ReelStore, SyncPolicy,
     ThreadBudget,
 };
 
@@ -32,7 +32,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: Some(PurgeMark::placing(DEATH_AT)),
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: PLAIN,
@@ -41,7 +40,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 

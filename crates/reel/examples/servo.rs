@@ -10,7 +10,7 @@ use std::path::Path;
 
 use reel::reel::bias::{access_ranges, available_bytes, MachineFacts, Plane, RingAvailability};
 use reel::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, RangedReads, ReelConfig, ReelStore,
+    Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RangedReads, ReelConfig, ReelStore,
 };
 
 const RECORDS: &str = "records";
@@ -23,7 +23,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 1,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// A byte count as a person reads it, or the absence the platform reported

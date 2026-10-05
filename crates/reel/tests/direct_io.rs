@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use reel::config::{IoBackend, Preallocate, ReelConfig, SyncPolicy};
 use reel::sync::tension::block_on;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, RecordKey, ReelStore,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelStore,
 };
 use reel_core::{Direction, Store};
 
@@ -36,7 +36,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: GROUP_PREFIX_LEN as u8,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -45,7 +44,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 

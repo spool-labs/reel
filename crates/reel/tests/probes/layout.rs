@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use reel::config::{ReelConfig, SyncPolicy, ThreadBudget, VolumeSpec};
-use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, MapShape, RecordKey};
+use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, RecordKey};
 use reel::units::ByteCount;
 use reel::{KeyWidth, Preallocate, ReelStore};
 
@@ -24,7 +24,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// A fresh directory under the build's target dir, emptied if a run left one

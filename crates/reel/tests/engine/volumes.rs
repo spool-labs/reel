@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use reel::config::{ReelConfig, SyncPolicy, ThreadBudget, VolumeSpec};
-use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, MapShape, RecordKey};
+use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, RecordKey};
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::SimIo;
 use reel::units::ByteCount;
@@ -27,7 +27,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 fn key(at: u64) -> RecordKey {

@@ -10,7 +10,7 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSpec, IndexResidency, KeyWidth, MapShape, RecordKey,
+    ByteCount, Codec, ColumnId, ColumnSpec, IndexResidency, KeyWidth, RecordKey,
     ReelConfig, ReelStore, SyncPolicy, ThreadBudget, MAP_EVERYTHING,
 };
 
@@ -23,7 +23,6 @@ const COLUMNS: &[ColumnSpec] = &[ColumnSpec {
     shard_bytes: 2,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// The group every record here is written under

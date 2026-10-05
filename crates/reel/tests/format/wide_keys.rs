@@ -9,7 +9,7 @@
 use tempfile::TempDir;
 
 use reel::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, MapShape, RecordKey,
+    Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, RecordKey,
     RecordWrite, ReelConfig, ReelStore, SyncPolicy, INLINE_KEY_LEN, MAX_KEY_LEN,
 };
 
@@ -21,7 +21,6 @@ const WIDE_COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 2,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// Widths every case runs, straddling the bound a key spills at

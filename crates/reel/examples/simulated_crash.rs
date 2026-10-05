@@ -15,7 +15,7 @@ use reel::format::record::HEADER_LEN;
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, MapShape,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth,
     Preallocate, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 use reel_core::Value;
@@ -29,7 +29,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 2,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// Virtual root the simulated files live under, since no directory is touched

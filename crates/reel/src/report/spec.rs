@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::config::{VolumeClass, VolumeSpec};
-use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape};
+use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth};
 
 /// Result of reading one spec string
 pub type SpecResult<T> = std::result::Result<T, SpecError>;
@@ -124,7 +124,6 @@ pub fn column(spec: &str) -> SpecResult<ColumnSpec> {
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     })
 }
 

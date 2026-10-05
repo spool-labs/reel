@@ -25,14 +25,14 @@ use rand::{Rng, SeedableRng};
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, MapShape,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth,
     ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 use reel::format::column::RecordKey;
 use reel::sync::tension::block_on;
 use reel_core::Store;
 
-const fn rows(map_shape: MapShape) -> ColumnSpec {
+const fn rows() -> ColumnSpec {
     ColumnSpec {
         id: ColumnId(1),
         name: "rows",
@@ -40,11 +40,10 @@ const fn rows(map_shape: MapShape) -> ColumnSpec {
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape,
     }
 }
 
-const TREE: ColumnSet = &[rows(MapShape::Tree)];
+const TREE: ColumnSet = &[rows()];
 
 const KEYS: u64 = 1200;
 
@@ -275,8 +274,7 @@ fn run(seed: u64, columns: ColumnSet) {
     assert!(store.index().fast_held() > 0, "seed {seed}: nothing reached FastForward");
     let compaction = store.compaction_counters();
     println!(
-        "seed {seed} {:?}: {writers} writers, {readers} readers, {read} reads, FastForward holds {}, {} segments rewritten, {} unlinked whole",
-        columns[0].map_shape,
+        "seed {seed}: {writers} writers, {readers} readers, {read} reads, FastForward holds {}, {} segments rewritten, {} unlinked whole",
         store.index().fast_held(),
         compaction.segments_rewritten,
         compaction.segments_unlinked_whole,

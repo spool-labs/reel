@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reel::config::{CompactRate, IndexResidency, ReelConfig, SyncPolicy, ThreadBudget};
-use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, MapShape, RecordKey};
+use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, RecordKey};
 use reel::format::loc::SegmentId;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
@@ -47,7 +47,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// A paged volume that seals by rewriting and will take a merge when asked

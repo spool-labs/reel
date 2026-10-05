@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactRate, IoBackend, KeyWidth, MapShape,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactRate, IoBackend, KeyWidth,
     RecordKey, ReelConfig, ReelStore, SyncPolicy,
 };
 
@@ -40,7 +40,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: GROUP_PREFIX_LEN as u8,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// One in five records the kill leaves alive, at this position and the next

@@ -38,7 +38,7 @@ pub use engine::{CompactPass, RecordWrite, ReelStore, Totals};
 pub use error::{ReelError, Result};
 pub use format::band::Band;
 pub use format::column::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyRef, KeyWidth, MapShape, PurgeMark,
+    Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyRef, KeyWidth, PurgeMark,
     RecordKey, INLINE_KEY_LEN, MARK_LEN, MAX_KEY_LEN, SHORT_KEY_LEN,
 };
 pub use index::counters::{ProbeCounts, ReadCounters, SegmentBytes, SegmentTable};

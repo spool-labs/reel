@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::Command;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, Preallocate, RecordKey,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, RecordKey,
     ReelConfig, ReelStore, SyncPolicy,
 };
 use tempfile::TempDir;
@@ -32,7 +32,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// What one command run produced

@@ -13,7 +13,7 @@ use crate::units::ByteCount;
 
 use crate::append::admission::InflightBudget;
 use crate::config::{IoBackend, Preallocate, ReelConfig, DEFAULT_FD_CACHE};
-use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape};
+use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth};
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::SegmentId;
 use crate::format::segment_header::SEGMENT_HEADER_SPAN;
@@ -36,7 +36,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 2,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 fn config(sync: SyncPolicy, preallocate: Preallocate) -> ReelConfig {

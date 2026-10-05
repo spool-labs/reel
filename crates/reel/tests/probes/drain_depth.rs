@@ -21,7 +21,7 @@ use reel::format::column::RecordKey;
 use reel::io::posix_backend::PosixBackend;
 use reel::reel::segment::{FdCache, IoDriver};
 use reel::{
-    Appender, ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, ReelShared,
+    Appender, ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelShared,
 };
 
 /// Bytes the group takes at the front of a record key
@@ -44,7 +44,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: GROUP_PREFIX_LEN as u8,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -53,7 +52,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 

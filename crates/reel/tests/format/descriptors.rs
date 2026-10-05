@@ -16,7 +16,7 @@ use tempfile::TempDir;
 
 use reel::io::posix_backend::PosixBackend;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, Preallocate,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate,
     RangedReads, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
@@ -40,7 +40,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: GROUP_PREFIX_LEN as u8,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -49,7 +48,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 

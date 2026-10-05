@@ -2806,7 +2806,7 @@ fn resize(current: u64, old_len: u64, new_len: u64) -> u64 {
 mod tests {
     use super::*;
 
-    use crate::format::column::{Codec, ColumnId, KeyWidth, MapShape};
+    use crate::format::column::{Codec, ColumnId, KeyWidth};
     use crate::format::loc::SegmentId;
     use std::collections::BTreeSet;
 
@@ -2955,7 +2955,6 @@ mod tests {
         shard_bytes: 1,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     };
 
     // a variable column opens, where before it was refused outright
@@ -3051,7 +3050,6 @@ mod tests {
         shard_bytes: 2,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     };
 
     const FLAT: ColumnSpec = ColumnSpec {
@@ -3061,7 +3059,6 @@ mod tests {
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     };
 
     fn sharded() -> WidthIndex<[u8; 34], Trees<34>> {
@@ -3219,7 +3216,6 @@ mod tests {
             shard_bytes: 0,
             purge_mark: None,
             codec: Codec::None,
-            map_shape: MapShape::Tree,
         };
 
         assert!(ColumnIndex::new(&odd, IndexResidency::Resident).is_err());
@@ -3243,7 +3239,6 @@ mod tests {
                 shard_bytes: 0,
                 purge_mark: None,
                 codec: Codec::None,
-                map_shape: MapShape::Tree,
             };
 
             let index =

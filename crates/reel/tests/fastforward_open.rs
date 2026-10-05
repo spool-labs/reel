@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 use reel::config::{IndexResidency, ReelConfig, SyncPolicy};
-use reel::format::column::{Codec, ColumnId, ColumnSpec, MapShape, RecordKey};
+use reel::format::column::{Codec, ColumnId, ColumnSpec, RecordKey};
 use reel::units::ByteCount;
 use reel::{KeyWidth, ReelStore};
 
@@ -24,7 +24,6 @@ const COLUMNS: &[ColumnSpec] = &[ColumnSpec {
     shard_bytes: 1,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// Payload bytes per record, W4's size

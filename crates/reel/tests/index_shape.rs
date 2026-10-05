@@ -22,7 +22,7 @@ use rand::{Rng, SeedableRng};
 use rustc_hash::FxBuildHasher;
 use scc::{Guard, TreeIndex};
 
-use reel::format::column::{Codec, ColumnId, ColumnSpec, KeyWidth, MapShape, RecordKey};
+use reel::format::column::{Codec, ColumnId, ColumnSpec, KeyWidth, RecordKey};
 use reel::format::loc::{Loc, SegmentId};
 use reel::format::lsn::Lsn;
 use reel::index::column::{Shape, ShardMap, Trees, VarTrees, WidthIndex, VAR_NODE_WIDTH};
@@ -2224,7 +2224,6 @@ fn batched_index_reads() {
         shard_bytes: 2,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     };
 
     // Held per group rather than per volume, since a read locks and descends one shard

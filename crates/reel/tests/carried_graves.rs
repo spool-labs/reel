@@ -12,7 +12,7 @@ use reel::format::column::RecordKey;
 use reel::format::loc::SegmentId;
 use reel::format::lsn::Lsn;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, MapShape,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth,
     ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 use reel_core::{Direction, Store};
@@ -24,7 +24,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// A segment no tail will reach, standing in for a carried copy's segment

@@ -14,7 +14,7 @@ use std::time::Instant;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, MapShape,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth,
     Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
@@ -36,7 +36,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 2,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -45,7 +44,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 

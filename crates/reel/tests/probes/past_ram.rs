@@ -20,7 +20,7 @@ use rand::{thread_rng, Rng};
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactRate, IoBackend, KeyWidth, MapShape,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactRate, IoBackend, KeyWidth,
     RecordKey, ReelConfig, ReelStore, SyncPolicy,
 };
 
@@ -44,7 +44,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: GROUP_PREFIX_LEN as u8,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -53,7 +52,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 

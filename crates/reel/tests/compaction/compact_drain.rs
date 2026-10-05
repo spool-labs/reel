@@ -10,7 +10,7 @@ use std::sync::Arc;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, Preallocate, ReelConfig,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, ReelConfig,
     ReelStore, SyncPolicy, ThreadBudget,
 };
 use reel_core::Store;
@@ -22,7 +22,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 // kill five segments, compact once, and all five are gone

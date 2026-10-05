@@ -19,7 +19,7 @@ use rand::{Rng, SeedableRng};
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, MapShape,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth,
     ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 use reel_core::{Direction, Store};
@@ -32,7 +32,6 @@ const fn rows(key_width: KeyWidth) -> ColumnSpec {
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     }
 }
 

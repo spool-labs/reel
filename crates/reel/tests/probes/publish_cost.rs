@@ -20,7 +20,7 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSpec, IndexResidency, KeyPage, KeyWidth, MapShape, RecordKey,
+    ByteCount, Codec, ColumnId, ColumnSpec, IndexResidency, KeyPage, KeyWidth, RecordKey,
     RecordWrite, ReelConfig, ReelStore, SyncPolicy, ThreadBudget, MAP_EVERYTHING,
 };
 
@@ -33,7 +33,6 @@ const COLUMNS: &[ColumnSpec] = &[ColumnSpec {
     shard_bytes: 2,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// Keys one batch carries

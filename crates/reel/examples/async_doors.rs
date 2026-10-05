@@ -13,7 +13,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, ReelConfig, ReelStore,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore,
     Store, StoreResult, Value, WriteBatch,
 };
 
@@ -27,7 +27,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 1,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// The whole runtime: a wake unparks the thread that is polling

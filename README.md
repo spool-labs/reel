@@ -20,7 +20,7 @@ footers the seals wrote. One process owns a volume for writing. Others can open 
 
 ```rust
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, ReelConfig, ReelStore, Store,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, Store,
 };
 
 const BLOCKS: &str = "blocks";
@@ -31,7 +31,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 2,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

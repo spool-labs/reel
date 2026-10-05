@@ -18,7 +18,7 @@ use std::time::Instant;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, Preallocate, RecordKey,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, RecordKey,
     ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
@@ -37,7 +37,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// Payload every record carries, small because the question is per segment

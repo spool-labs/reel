@@ -1734,7 +1734,7 @@ mod tests {
     use crate::append::admission::InflightBudget;
     use crate::append::{Appender, BatchRecord, BatchWrite, Commit};
     use crate::config::{IndexResidency, Preallocate, ReelConfig, SyncPolicy, DEFAULT_FD_CACHE};
-    use crate::format::column::{Codec, ColumnSet, ColumnSpec, KeyWidth, MapShape};
+    use crate::format::column::{Codec, ColumnSet, ColumnSpec, KeyWidth};
     use crate::io::fault::FaultPlan;
     use crate::io::op::WriteBuf;
     use crate::io::sim_backend::{DurableImage, SimIo};
@@ -1753,7 +1753,6 @@ mod tests {
             shard_bytes: 2,
             purge_mark: None,
             codec: Codec::None,
-            map_shape: MapShape::Tree,
         },
         ColumnSpec {
             id: META,
@@ -1762,7 +1761,6 @@ mod tests {
             shard_bytes: 1,
             purge_mark: None,
             codec: Codec::None,
-            map_shape: MapShape::Tree,
         },
     ];
 

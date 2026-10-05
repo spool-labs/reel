@@ -1156,7 +1156,7 @@ mod tests {
     use crate::units::ByteCount;
 
     use crate::config::{Preallocate, ReelConfig, SyncPolicy, ThreadBudget};
-    use crate::format::column::{Codec, ColumnSet, ColumnSpec, MapShape};
+    use crate::format::column::{Codec, ColumnSet, ColumnSpec};
     use crate::io::fault::FaultPlan;
     use crate::io::sim_backend::SimIo;
     use crate::sync::tension::block_on;
@@ -1183,7 +1183,6 @@ mod tests {
             shard_bytes: GROUP_PREFIX_LEN as u8,
             purge_mark: None,
             codec: Codec::None,
-            map_shape: MapShape::Tree,
         },
         ColumnSpec {
             id: ColumnId(2),
@@ -1192,7 +1191,6 @@ mod tests {
             shard_bytes: 1,
             purge_mark: None,
             codec: Codec::None,
-            map_shape: MapShape::Tree,
         },
         ColumnSpec {
             id: ColumnId(3),
@@ -1201,7 +1199,6 @@ mod tests {
             shard_bytes: 0,
             purge_mark: None,
             codec: Codec::None,
-            map_shape: MapShape::Tree,
         },
         ColumnSpec {
             id: ColumnId(4),
@@ -1210,7 +1207,6 @@ mod tests {
             shard_bytes: 1,
             purge_mark: None,
             codec: Codec::Lz4,
-            map_shape: MapShape::Tree,
         },
     ];
 
@@ -1829,7 +1825,6 @@ mod tests {
             shard_bytes: 0,
             purge_mark: None,
             codec: Codec::None,
-            map_shape: MapShape::Tree,
         },
         ColumnSpec {
             id: ColumnId(2),
@@ -1838,7 +1833,6 @@ mod tests {
             shard_bytes: GROUP_PREFIX_LEN as u8,
             purge_mark: None,
             codec: Codec::None,
-            map_shape: MapShape::Tree,
         },
     ];
 

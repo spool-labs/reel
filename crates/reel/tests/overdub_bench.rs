@@ -51,7 +51,7 @@ use tempfile::TempDir;
 
 use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, FenceResidency,
-    IndexResidency, KeyWidth, MapShape, MergeReport, Preallocate, ProbeCounts, RecordKey,
+    IndexResidency, KeyWidth, MergeReport, Preallocate, ProbeCounts, RecordKey,
     ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
@@ -524,7 +524,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: SHARD_BYTES,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// What one cell opens its volume with, the flavour and the merge being all that differ

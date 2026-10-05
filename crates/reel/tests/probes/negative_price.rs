@@ -16,7 +16,7 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use reel::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, RecordKey, ReelConfig, ReelStore,
+    Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelConfig, ReelStore,
     SyncPolicy,
 };
 
@@ -30,7 +30,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 2,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// Keys the store holds, all under one two-byte prefix so one shard is occupied

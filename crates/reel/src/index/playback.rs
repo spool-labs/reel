@@ -722,7 +722,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::config::IndexResidency;
-    use crate::format::column::{Codec, ColumnSpec, MapShape, RecordKey};
+    use crate::format::column::{Codec, ColumnSpec, RecordKey};
     use crate::format::footer::FooterEntry;
     use crate::format::lsn::Lsn;
     use crate::format::record::Flags;
@@ -739,7 +739,6 @@ mod tests {
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     };
 
     /// A footer source over hand-built footers that counts what it is asked for

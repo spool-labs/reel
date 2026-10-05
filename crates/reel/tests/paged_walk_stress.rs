@@ -26,12 +26,12 @@ use rand::{Rng, SeedableRng};
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, MapShape,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth,
     ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 use reel_core::{Direction, Store};
 
-const fn rows(map_shape: MapShape) -> ColumnSpec {
+const fn rows() -> ColumnSpec {
     ColumnSpec {
         id: ColumnId(1),
         name: "rows",
@@ -39,11 +39,10 @@ const fn rows(map_shape: MapShape) -> ColumnSpec {
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape,
     }
 }
 
-const TREE: ColumnSet = &[rows(MapShape::Tree)];
+const TREE: ColumnSet = &[rows()];
 
 /// Keys written once and never touched again
 const STABLE: u64 = 400;
@@ -280,7 +279,7 @@ fn settled(store: &ReelStore, stable: &BTreeMap<Vec<u8>, Vec<u8>>, last: &BTreeM
 }
 
 fn run(seed: u64, columns: ColumnSet) {
-    let case = format!("seed {seed} {:?}", columns[0].map_shape);
+    let case = format!("seed {seed}");
     let case = case.as_str();
     let mut rng = SmallRng::seed_from_u64(seed);
     let dir = TempDir::new().expect("temp dir");

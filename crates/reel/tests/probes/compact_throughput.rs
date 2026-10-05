@@ -21,7 +21,7 @@ use tempfile::TempDir;
 
 use reel::{
     Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, IoBackend, KeyWidth,
-    MapShape, RecordKey, ReelConfig, ReelStore, SyncPolicy,
+    RecordKey, ReelConfig, ReelStore, SyncPolicy,
 };
 
 const RECORDS: ColumnId = ColumnId(1);
@@ -42,7 +42,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 2,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -51,7 +50,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 
@@ -66,7 +64,6 @@ const LZ4_COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 2,
     purge_mark: None,
     codec: Codec::Lz4,
-    map_shape: MapShape::Tree,
 }];
 
 /// The record column key for a group and an id

@@ -29,7 +29,7 @@ use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, IoBackend, KeyWidth,
-    MapShape, Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 /// Virtual root the simulator's files live under
@@ -50,7 +50,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 2,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -59,7 +58,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 

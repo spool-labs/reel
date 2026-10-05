@@ -272,15 +272,6 @@ impl RecordKey {
     }
 }
 
-/// What structure a column's resident shards hold their keys in
-///
-/// The choice is resident-side only, so no on-disk byte depends on it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MapShape {
-    /// Ordered tree shards, which serve every column
-    Tree,
-}
-
 /// What a column's keys measure, which is a width or the absence of one
 ///
 /// A fixed column's width is what a footer partition strides by and what the
@@ -338,9 +329,6 @@ pub struct ColumnSpec {
 
     /// Codec attempted on this column's payloads at admission, not promised
     pub codec: Codec,
-
-    /// Which structure the resident index holds this column's keys in
-    pub map_shape: MapShape,
 }
 
 /// Bytes a purge mark takes within a key
@@ -437,7 +425,6 @@ mod tests {
             shard_bytes: 2,
             purge_mark: None,
             codec: Codec::None,
-            map_shape: MapShape::Tree,
         },
         ColumnSpec {
             id: ColumnId(2),
@@ -446,7 +433,6 @@ mod tests {
             shard_bytes: 0,
             purge_mark: None,
             codec: Codec::None,
-            map_shape: MapShape::Tree,
         },
     ];
 
@@ -555,7 +541,6 @@ mod tests {
             shard_bytes: 0,
             purge_mark: None,
             codec: Codec::None,
-            map_shape: MapShape::Tree,
         }
     }
 

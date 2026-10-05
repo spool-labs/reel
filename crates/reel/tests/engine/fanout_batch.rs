@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, RecordKey, RecordWrite,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, RecordWrite,
     ReelConfig, ReelStore, SyncPolicy,
 };
 
@@ -86,7 +86,6 @@ fn column(id: ColumnId, name: &'static str, key_width: usize) -> ColumnSpec {
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     }
 }
 

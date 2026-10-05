@@ -38,7 +38,7 @@ use reel::format::lsn::Lsn;
 use reel::format::record::checksum;
 use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, IoBackend, KeyWidth,
-    MapShape, RecordKey, RecordWrite, ReelConfig, ReelIndex, ReelStore, SyncPolicy, ThreadBudget,
+    RecordKey, RecordWrite, ReelConfig, ReelIndex, ReelStore, SyncPolicy, ThreadBudget,
     INLINE_KEY_LEN, MAP_EVERYTHING, MAX_KEY_LEN,
 };
 
@@ -53,7 +53,6 @@ const BENCH_COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 2,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// The record column of the fixture set, keyed by a group and an id
@@ -83,7 +82,6 @@ const TEST_COLUMNS: ColumnSet = &[
         shard_bytes: 2,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -92,7 +90,6 @@ const TEST_COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 
@@ -450,7 +447,6 @@ fn bench_columns(key_width: usize, variable: bool) -> ColumnSet {
         shard_bytes: 2,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     };
     &Box::leak(Box::new([spec]))[..]
 }

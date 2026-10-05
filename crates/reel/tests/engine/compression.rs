@@ -13,7 +13,7 @@ use reel_core::Store;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, Preallocate, ReelConfig,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, ReelConfig,
     ReelStore, SyncPolicy, ThreadBudget,
 };
 
@@ -28,7 +28,6 @@ const fn status(codec: Codec) -> ColumnSpec {
         shard_bytes: 0,
         purge_mark: None,
         codec,
-        map_shape: MapShape::Tree,
     }
 }
 

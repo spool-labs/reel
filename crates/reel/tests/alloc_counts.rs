@@ -21,7 +21,7 @@ use std::thread;
 use tempfile::TempDir;
 
 use reel::config::{ReelConfig, SyncPolicy, ThreadBudget};
-use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, MapShape};
+use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec};
 use reel::units::ByteCount;
 use reel::{Direction, KeyWidth, Preallocate, ReelStore, Store, Value, WriteBatch};
 
@@ -121,7 +121,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 fn config() -> ReelConfig {

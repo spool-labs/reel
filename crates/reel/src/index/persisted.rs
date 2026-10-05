@@ -881,7 +881,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use crate::format::column::{Codec, ColumnSpec, MapShape};
+    use crate::format::column::{Codec, ColumnSpec};
     use crate::io::fault::FaultPlan;
     use crate::io::sim_backend::SimIo;
 
@@ -902,7 +902,6 @@ mod tests {
             shard_bytes: 2,
             purge_mark: None,
             codec: Codec::None,
-            map_shape: MapShape::Tree,
         },
         ColumnSpec {
             id: NOTES,
@@ -911,7 +910,6 @@ mod tests {
             shard_bytes: 1,
             purge_mark: None,
             codec: Codec::None,
-            map_shape: MapShape::Tree,
         },
     ];
 

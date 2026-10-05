@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use reel::config::{IndexResidency, ReelConfig, SyncPolicy, ThreadBudget};
-use reel::format::column::{Codec, ColumnId, ColumnSpec, MapShape, RecordKey};
+use reel::format::column::{Codec, ColumnId, ColumnSpec, RecordKey};
 use reel::index::persisted::PERSISTED_INDEX;
 use reel::reel::checkpoint::staging_of;
 use reel::sync::rendezvous;
@@ -28,7 +28,6 @@ const COLUMNS: &[ColumnSpec] = &[ColumnSpec {
     shard_bytes: 2,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 fn key(at: u32) -> RecordKey {

@@ -24,7 +24,7 @@ use reel::io::posix_backend::PosixBackend;
 use reel::reel::segment::IoDriver;
 use reel::{
     rebuild_reel, ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth,
-    MapShape, Preallocate, RecordKey, ReelConfig, ReelIndex, ReelStore, SyncPolicy, ThreadBudget,
+    Preallocate, RecordKey, ReelConfig, ReelIndex, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 const RECORDS: ColumnId = ColumnId(1);
@@ -46,7 +46,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 2,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -55,7 +54,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: CODED,
@@ -64,7 +62,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::Lz4,
-        map_shape: MapShape::Tree,
     },
 ];
 

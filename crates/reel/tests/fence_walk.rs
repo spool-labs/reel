@@ -21,7 +21,7 @@ use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::units::ByteCount;
 use reel::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, FenceResidency, IndexResidency, KeyWidth, MapShape,
+    Codec, ColumnId, ColumnSet, ColumnSpec, FenceResidency, IndexResidency, KeyWidth,
     Preallocate, ProbeCounts, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
     SEGMENT_SUFFIX,
 };
@@ -35,7 +35,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// Keys each segment takes, deep enough that a walk over its blocks costs halvings

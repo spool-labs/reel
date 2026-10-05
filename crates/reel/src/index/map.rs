@@ -1823,7 +1823,7 @@ impl ReelIndex {
 mod tests {
     use super::*;
 
-    use crate::format::column::{KeyWidth, MapShape};
+    use crate::format::column::{KeyWidth};
     use crate::index::entry::span_of;
 
     const RECORD: ColumnId = ColumnId(1);
@@ -1837,7 +1837,6 @@ mod tests {
             shard_bytes: 2,
             purge_mark: None,
             codec: Codec::None,
-            map_shape: MapShape::Tree,
         },
         ColumnSpec {
             id: BLOB,
@@ -1846,7 +1845,6 @@ mod tests {
             shard_bytes: 0,
             purge_mark: None,
             codec: Codec::None,
-            map_shape: MapShape::Tree,
         },
     ];
 
@@ -1918,7 +1916,6 @@ mod tests {
                 shard_bytes: 0,
                 purge_mark: None,
                 codec: Codec::None,
-                map_shape: MapShape::Tree,
             },
             ColumnSpec {
                 id: ColumnId(1),
@@ -1927,7 +1924,6 @@ mod tests {
                 shard_bytes: 0,
                 purge_mark: None,
                 codec: Codec::None,
-                map_shape: MapShape::Tree,
             },
         ];
 

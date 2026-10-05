@@ -21,7 +21,7 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSpec, IndexResidency, KeyWidth, MapShape, Preallocate,
+    ByteCount, Codec, ColumnId, ColumnSpec, IndexResidency, KeyWidth, Preallocate,
     RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
@@ -34,7 +34,6 @@ const COLUMNS: &[ColumnSpec] = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// Payload per record, large enough that a roll is reached in few enough puts

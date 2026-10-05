@@ -14,7 +14,7 @@ use tempfile::TempDir;
 
 use reel::format::column::RecordKey;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, MapShape,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth,
     ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 use reel_core::Value;
@@ -28,7 +28,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 2,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 const KEY_LEN: usize = 16;

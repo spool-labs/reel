@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use reel::config::{ReelConfig, SyncPolicy, ThreadBudget};
-use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, MapShape, RecordKey};
+use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, RecordKey};
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::units::ByteCount;
@@ -26,7 +26,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 const SEGMENT: u64 = 1024 * 1024;

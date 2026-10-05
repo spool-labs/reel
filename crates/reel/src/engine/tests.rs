@@ -19,7 +19,7 @@ use crate::config::{
     CompactRate, IndexResidency, PointReads, Preallocate, RangedReads, RepairPath, SyncPolicy,
     ThreadBudget,
 };
-use crate::format::column::{Codec, ColumnId, ColumnSpec, MapShape};
+use crate::format::column::{Codec, ColumnId, ColumnSpec};
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::record::HEADER_LEN;
@@ -47,7 +47,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 2,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -56,7 +55,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: FLAG,
@@ -65,7 +63,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 
@@ -77,7 +74,6 @@ const CODED_COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::Lz4,
-    map_shape: MapShape::Tree,
 }];
 
 const NAMES: ColumnId = ColumnId(6);
@@ -90,7 +86,6 @@ const NAME_COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 fn config(active_tails: u32, sync: SyncPolicy) -> ReelConfig {

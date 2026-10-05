@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, Preallocate, RecordKey,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, RecordKey,
     ReelConfig, ReelStore, SyncPolicy, ThreadBudget, VolumeSpec,
 };
 
@@ -32,7 +32,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 fn key(at: u64) -> RecordKey {

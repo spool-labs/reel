@@ -11,7 +11,7 @@
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IoBackend, KeyWidth, MapShape, RecordKey,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IoBackend, KeyWidth, RecordKey,
     RecordWrite, ReelConfig, ReelStore, SyncPolicy,
 };
 
@@ -30,7 +30,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 fn config(io_backend: IoBackend) -> ReelConfig {

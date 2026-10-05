@@ -18,7 +18,7 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use reel::config::{IndexResidency, ReelConfig, SyncPolicy, ThreadBudget};
-use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, MapShape, RecordKey};
+use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, RecordKey};
 use reel::units::ByteCount;
 use reel::{KeyWidth, Preallocate, ReelStore, MAP_EVERYTHING};
 
@@ -31,7 +31,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 1,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// Record sizes the sweep walks, which straddle the floor

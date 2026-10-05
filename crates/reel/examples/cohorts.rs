@@ -14,7 +14,7 @@ use tempfile::TempDir;
 
 use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, KeyWidth,
-    MapShape, Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 const EVENTS: ColumnId = ColumnId(1);
@@ -38,7 +38,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// Group in the leading four bytes, sequence in the rest, so a group is one range

@@ -24,7 +24,7 @@ use reel::format::footer::{FooterPartition, SegmentFooter};
 use reel::units::ByteCount;
 use reel::{
     Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, IndexResidency, KeyWidth,
-    MapShape, Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
     SEGMENT_SUFFIX,
 };
 
@@ -92,7 +92,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 fn config() -> ReelConfig {

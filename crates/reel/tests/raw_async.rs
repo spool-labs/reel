@@ -38,7 +38,7 @@ use reel::io::select::select_backend;
 use reel::io::slots::SLOT_COUNT;
 use reel::reel::segment::{FdCache, IoDriver};
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, Durability, IoBackend, KeyWidth, MapShape,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, Durability, IoBackend, KeyWidth,
     RecordKey, Reel, ReelConfig, ReelShared, ReelStore, SyncPolicy, ThreadBudget,
 };
 
@@ -56,7 +56,6 @@ const READ_COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 2,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// The record column of the fixture set, keyed by a group and an id
@@ -86,7 +85,6 @@ const TEST_COLUMNS: ColumnSet = &[
         shard_bytes: 2,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -95,7 +93,6 @@ const TEST_COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 

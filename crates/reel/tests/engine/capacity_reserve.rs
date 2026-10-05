@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, KeyWidth, MapShape, RecordKey,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, KeyWidth, RecordKey,
     ReelConfig, ReelError, ReelStore, SyncPolicy, ThreadBudget,
 };
 
@@ -33,7 +33,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 2,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -42,7 +41,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 

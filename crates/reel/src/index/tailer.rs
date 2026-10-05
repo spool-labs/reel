@@ -246,7 +246,7 @@ mod tests {
     use super::*;
 
     use crate::format::column::{
-        Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, RecordKey,
+        Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey,
     };
     use crate::format::loc::Loc;
     use crate::format::record::Flags;
@@ -260,7 +260,6 @@ mod tests {
         shard_bytes: 1,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     }];
 
     fn key(byte: u8) -> RecordKey {

@@ -24,7 +24,7 @@ use std::thread::Thread;
 use std::time::Instant;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IoBackend, KeyWidth, MapShape, RecordKey,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IoBackend, KeyWidth, RecordKey,
     ReelConfig, ReelStore, SyncPolicy, ThreadBudget, MAP_EVERYTHING,
 };
 
@@ -38,7 +38,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 2,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// Accounts the volume holds, enough that a 3,000 key sample shares few pages

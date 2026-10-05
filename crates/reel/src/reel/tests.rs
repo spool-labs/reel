@@ -9,7 +9,7 @@ use std::thread;
 use crate::units::ByteCount;
 
 use crate::config::{Preallocate, SyncPolicy, ThreadBudget, DEFAULT_FD_CACHE};
-use crate::format::column::{Codec, ColumnId, ColumnSpec, KeyWidth, MapShape};
+use crate::format::column::{Codec, ColumnId, ColumnSpec, KeyWidth};
 use crate::io::fault::FaultPlan;
 use crate::io::sim_backend::SimIo;
 
@@ -34,7 +34,6 @@ const TEST_COLUMNS: ColumnSet = &[
         shard_bytes: GROUP_PREFIX_LEN as u8,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: ColumnId(2),
@@ -43,7 +42,6 @@ const TEST_COLUMNS: ColumnSet = &[
         shard_bytes: 1,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: ColumnId(3),
@@ -52,7 +50,6 @@ const TEST_COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 

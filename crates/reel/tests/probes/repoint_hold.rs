@@ -21,7 +21,7 @@ use reel::format::loc::{Loc, SegmentId};
 use reel::format::lsn::Lsn;
 use reel::index::column::KeyMove;
 use reel::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, MapShape, RecordKey,
+    Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, RecordKey,
     ReelIndex,
 };
 
@@ -35,7 +35,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// Keys the index holds, which is what a repoint has to find its entry inside of

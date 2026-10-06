@@ -70,7 +70,10 @@ impl Placed {
         let spot = *self.spots.get(at)?;
         match spot.block {
             OWNED => Some(std::mem::take(&mut self.owned[spot.at as usize])),
-            block => self.blocks.get(block as usize)?.window(spot.at as usize, spot.len as usize),
+            block => self
+                .blocks
+                .get(block as usize)?
+                .window(spot.at as usize, spot.len as usize),
         }
     }
 

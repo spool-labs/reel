@@ -279,8 +279,10 @@ mod tests {
         block.extend_from_slice(b"onetwothree");
 
         let read = ReadBlock::new(block, count_it);
-        let cut: Vec<Option<Value>> =
-            [(0, 3), (3, 3), (6, 5), (9, 9)].iter().map(|&(at, len)| read.window(at, len)).collect();
+        let cut: Vec<Option<Value>> = [(0, 3), (3, 3), (6, 5), (9, 9)]
+            .iter()
+            .map(|&(at, len)| read.window(at, len))
+            .collect();
         drop(read);
 
         assert_eq!(&**cut[0].as_ref().expect("first"), b"one");

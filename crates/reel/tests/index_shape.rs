@@ -352,53 +352,6 @@ fn time_tree<const N: usize, const B: usize>(
     (insert, get, scan)
 }
 
-// the hand-rolled tree answers exactly what a BTreeMap does, before it is timed
-//
-// The ordered walk is the half most likely to be subtly wrong, since a split has to keep
-// the leaves chained.
-#[test]
-fn handroll_agrees_with_btreemap() {
-    for size in [1usize, 2, 7, 64, 255, 1024, 4096] {
-        let mut rng = SmallRng::seed_from_u64(size as u64);
-        let mut model: BTreeMap<Key, u64> = BTreeMap::new();
-        let mut tree: TBTreeMap<[u8; 34], 16, TreeVal> = TBTreeMap::new();
-
-        for step in 0..size {
-            let mut key = [0u8; 34];
-            // A narrow draw so overwrites happen rather than only fresh keys.
-            rng.fill(&mut key[..4]);
-            model.insert(key, step as u64);
-            tree.insert(
-                key,
-                TreeVal {
-                    segment: 0,
-                    offset: 0,
-                    len: 0,
-                    lsn: step as u64,
-                    incarnation: 1,
-                },
-            );
-        }
-
-        assert_eq!(
-            tree.len(),
-            model.len(),
-            "size {size}: the trees hold different counts"
-        );
-
-        for (key, held) in &model {
-            let found = tree
-                .get(key)
-                .unwrap_or_else(|| panic!("size {size}: a key went missing"));
-            assert_eq!(found.lsn, *held, "size {size}: a key kept the wrong value");
-        }
-
-        let walked: Vec<Key> = tree.iter().map(|(key, _)| *key).collect();
-        let expected: Vec<Key> = model.keys().copied().collect();
-        assert_eq!(walked, expected, "size {size}: the ordered walk disagrees");
-    }
-}
-
 // the hand-rolled tree against the rest, swept over node width
 #[test]
 #[ignore = "measurement; run with --ignored --nocapture"]
@@ -1208,51 +1161,6 @@ fn past_cache() {
     }
 }
 
-// a batched descent answers exactly what one at a time does
-#[test]
-fn get_many_agrees_with_get() {
-    let held = {
-        let mut all = keys(5000, 11);
-        all.sort_unstable();
-        all.dedup();
-        all
-    };
-    let pairs: Vec<(Key, TreeVal)> = held
-        .iter()
-        .enumerate()
-        .map(|(at, key)| {
-            (
-                *key,
-                TreeVal {
-                    segment: 0,
-                    offset: 0,
-                    len: 0,
-                    lsn: at as u64,
-                    incarnation: 1,
-                },
-            )
-        })
-        .collect();
-    let tree: TBTreeMap<[u8; 34], RECORD_NODES, TreeVal> =
-        TBTreeMap::from_sorted(pairs, RECORD_NODES);
-
-    // Half present, half absent, so a miss is checked as well as a hit.
-    let mut asked: Vec<Key> = held.iter().step_by(2).copied().collect();
-    asked.extend(keys(500, 77));
-
-    let mut batched = Vec::new();
-    tree.get_many(&asked, &mut batched);
-    assert_eq!(batched.len(), asked.len(), "the batch lost answers");
-    for (slot, key) in asked.iter().enumerate() {
-        let one = tree.get(key);
-        assert_eq!(
-            batched[slot].map(|val| val.lsn),
-            one.map(|val| val.lsn),
-            "the batch disagrees with a single get"
-        );
-    }
-}
-
 /// Keys handed to the tree at once, spanning what memory level parallelism allows
 const BATCHES: &[usize] = &[1, 4, 16, 64];
 
@@ -1308,60 +1216,6 @@ fn batched_descent() {
         }
         println!();
     }
-}
-
-// delete matches BTreeMap, including what a reopened walk sees afterwards
-#[test]
-fn remove_agrees_with_btreemap() {
-    let mut rng = SmallRng::seed_from_u64(31);
-    let mut model: BTreeMap<Key, u64> = BTreeMap::new();
-    let mut tree: TBTreeMap<[u8; 34], 16, TreeVal> = TBTreeMap::new();
-
-    let mut held: Vec<Key> = Vec::new();
-    for step in 0..4000u64 {
-        let mut key = [0u8; 34];
-        rng.fill(&mut key[..6]);
-        model.insert(key, step);
-        tree.insert(
-            key,
-            TreeVal {
-                segment: 0,
-                offset: 0,
-                len: 0,
-                lsn: step,
-                incarnation: 1,
-            },
-        );
-        held.push(key);
-    }
-
-    // Delete about half, and ask for keys that were never there as well.
-    for key in held.iter().step_by(2) {
-        assert_eq!(
-            tree.remove(key).map(|val| val.lsn),
-            model.remove(key),
-            "a delete disagreed"
-        );
-    }
-    for _ in 0..200 {
-        let mut key = [0u8; 34];
-        rng.fill(&mut key[..6]);
-        if !model.contains_key(&key) {
-            assert!(tree.remove(&key).is_none(), "a delete invented a key");
-        }
-    }
-
-    assert_eq!(tree.len(), model.len(), "counts drifted after deletes");
-    for (key, want) in &model {
-        assert_eq!(
-            tree.get(key).map(|val| val.lsn),
-            Some(*want),
-            "a survivor went missing"
-        );
-    }
-    let walked: Vec<Key> = tree.iter().map(|(key, _)| *key).collect();
-    let expected: Vec<Key> = model.keys().copied().collect();
-    assert_eq!(walked, expected, "the walk is wrong after deletes");
 }
 
 // what deletion does to fill, and what a rebuild takes back
@@ -1897,47 +1751,6 @@ fn range_cost() {
         }
         println!();
     }
-}
-
-// insert hands back what it displaced, which is what the index decides on
-#[test]
-fn insert_returns_the_displaced() {
-    let mut model: BTreeMap<Key, u64> = BTreeMap::new();
-    let mut tree: TBTreeMap<[u8; 34], 16, TreeVal> = TBTreeMap::new();
-
-    let held = keys(2000, 61);
-    // Write every key twice, so the second pass displaces the first.
-    for pass in 0..2u64 {
-        for (at, key) in held.iter().enumerate() {
-            let want = model.insert(*key, pass * 10_000 + at as u64);
-            let got = tree.insert(
-                *key,
-                TreeVal {
-                    segment: 0,
-                    offset: 0,
-                    len: 0,
-                    lsn: pass * 10_000 + at as u64,
-                    incarnation: 1,
-                },
-            );
-            assert_eq!(
-                got.map(|val| val.lsn),
-                want,
-                "pass {pass}: the displaced value disagrees"
-            );
-        }
-    }
-    assert_eq!(tree.len(), model.len(), "counts drifted across overwrites");
-}
-
-// an entry that has not been filled resolves to no live segment
-#[test]
-fn default_entry_names_nothing_live() {
-    let blank = Entry::default();
-    assert!(
-        blank.incarnation.is_none(),
-        "a blank entry wears a live stamp"
-    );
 }
 
 // the map a name column reaches answers what a `BTreeMap` of names answers

@@ -1630,7 +1630,12 @@ pub struct Spot {
 
 impl Spot {
     /// A record the read did not find where its ask said
-    pub const MISS: Spot = Spot { block: u32::MAX, at: 0, len: 0, codec: 0 };
+    pub const MISS: Spot = Spot {
+        block: u32::MAX,
+        at: 0,
+        len: 0,
+        codec: 0,
+    };
 }
 
 #[derive(Clone, Copy)]

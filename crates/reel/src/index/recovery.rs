@@ -85,6 +85,9 @@ pub struct RebuiltReel {
 
     /// The same tails as appenders can pick them up, lowest number first
     pub resumable: Vec<ResumableTail>,
+
+    /// A column the segments hold that this open doesn't declare
+    pub undeclared: Option<ColumnId>,
 }
 
 /// One sealed segment's key span for one column, which rules it in or out of a search
@@ -274,6 +277,7 @@ pub fn rebuild_from_persisted(
     }
 
     resolver.flush();
+    let undeclared = resolver.queue.undeclared;
     if pages {
         prune_walked_shadowed(driver, &sealed_files, &resolver.sealed, index)?;
     }
@@ -287,6 +291,7 @@ pub fn rebuild_from_persisted(
         consumed,
         walked,
         resumable,
+        undeclared,
     })
 }
 
@@ -1117,6 +1122,13 @@ fn sweep_footer(
     resolver: &mut Resolver<'_>,
 ) -> Result<()> {
     resolver.book_tally(segment, footer.tally);
+    if let Some(partition) = footer
+        .partitions
+        .iter()
+        .find(|held| resolver.index.column(held.column).is_none())
+    {
+        resolver.queue.undeclared.get_or_insert(partition.column);
+    }
     resolver.index.segments().note_max(segment, footer.max_lsn);
     for partition in &footer.partitions {
         if let Some((lowest, highest)) = partition.key_range() {
@@ -1528,6 +1540,7 @@ struct KeyQueue {
     keys: Vec<u8>,
     rows: Vec<(usize, Loc, Lsn, bool)>,
     landed: Vec<Landed>,
+    undeclared: Option<ColumnId>,
 }
 
 impl KeyQueue {
@@ -1559,25 +1572,41 @@ impl KeyQueue {
         if self.rows.is_empty() {
             return;
         }
-        if let Some(column) = index.column(self.column) {
-            let mut start = 0;
-            let moves: Vec<KeyMove<'_>> = self
-                .rows
-                .iter()
-                .map(|&(end, loc, lsn, is_delete)| {
-                    let key = &self.keys[start..end];
+        match index.column(self.column) {
+            Some(column) => {
+                let mut start = 0;
+                let moves: Vec<KeyMove<'_>> = self
+                    .rows
+                    .iter()
+                    .map(|&(end, loc, lsn, is_delete)| {
+                        let key = &self.keys[start..end];
+                        start = end;
+                        KeyMove {
+                            column: self.column,
+                            key,
+                            loc,
+                            lsn,
+                            is_delete,
+                        }
+                    })
+                    .collect();
+                self.landed.clear();
+                column.apply_moves(&moves, segments, &mut self.landed);
+            }
+            // A column this open doesn't declare still holds bytes in its segments,
+            // and nothing here can shadow them, so its rows are booked live.
+            None => {
+                self.undeclared.get_or_insert(self.column);
+                let mut start = 0;
+                for &(end, loc, lsn, is_delete) in &self.rows {
+                    let span = span_of((end - start) as u16, loc.len);
                     start = end;
-                    KeyMove {
-                        column: self.column,
-                        key,
-                        loc,
-                        lsn,
-                        is_delete,
+                    match is_delete {
+                        true => segments.mark_held(loc.segment, lsn, span),
+                        false => segments.mark_live(loc.segment, lsn, span),
                     }
-                })
-                .collect();
-            self.landed.clear();
-            column.apply_moves(&moves, segments, &mut self.landed);
+                }
+            }
         }
         self.keys.clear();
         self.rows.clear();

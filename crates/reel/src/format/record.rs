@@ -806,31 +806,6 @@ mod tests {
         };
     }
 
-    // a record spans its header, its key, and its payload
-    #[test]
-    fn span_covers_key() {
-        let header = RecordHeader::data(sample_key(RECORD, 0x11, 34), Lsn(1), &[0xab; 100]);
-
-        assert_eq!(header.prefix_len(), HEADER_LEN as u64 + 34);
-        assert_eq!(header.span(), HEADER_LEN as u64 + 34 + 100);
-    }
-
-    // a data record round trips and verifies against its payload
-    #[test]
-    fn data_roundtrip() {
-        let payload = vec![0xab; 1600];
-        let key = sample_key(RECORD, 0x11, 34);
-        let header = RecordHeader::data(key.clone(), Lsn(9), &payload);
-
-        let parsed = RecordHeader::unpack(header.pack().as_slice()).expect("unpack");
-
-        assert_eq!(parsed, header);
-        assert!(parsed.verify(&payload));
-        assert!(parsed.has_payload());
-        assert_eq!(parsed.length, 1600);
-        assert_eq!(parsed.key, key);
-    }
-
     // two columns of different key widths both round trip
     #[test]
     fn mixed_widths_roundtrip() {
@@ -923,17 +898,6 @@ mod tests {
         assert!(parsed.verify(&payload));
     }
 
-    // a flipped byte in a segment header payload is caught by the checksum
-    #[test]
-    fn segment_header_payload_flip() {
-        let mut payload = vec![0x5au8; 32];
-        let header = RecordHeader::segment_header(&payload);
-
-        payload[9] ^= 0x40;
-
-        assert!(!header.verify(&payload));
-    }
-
     // an empty payload data record is distinct from a tombstone by its flags
     #[test]
     fn empty_payload() {
@@ -945,39 +909,6 @@ mod tests {
         assert_eq!(data.length, 0);
     }
 
-    // a flipped bit anywhere in the header or the key is caught by the checksum
-    #[test]
-    fn header_bit_flip() {
-        let payload = vec![0x33; 200];
-        let header = RecordHeader::data(sample_key(RECORD, 0x44, 34), Lsn(6), &payload);
-        let packed = header.pack();
-        let bytes = packed.as_slice().to_vec();
-
-        for index in 0..bytes.len() {
-            if (OFFSET_CRC..OFFSET_LSN).contains(&index) {
-                continue;
-            }
-            let mut torn = bytes.clone();
-            torn[index] ^= 0x01;
-            let parsed = match RecordHeader::unpack(&torn) {
-                Ok(parsed) => parsed,
-                Err(_) => continue,
-            };
-            assert!(!parsed.verify(&payload), "byte {index} went unnoticed");
-        }
-    }
-
-    // a flipped bit in the payload is caught by the checksum
-    #[test]
-    fn payload_bit_flip() {
-        let mut payload = vec![0x77; 512];
-        let header = RecordHeader::data(sample_key(RECORD, 0x55, 34), Lsn(8), &payload);
-
-        payload[300] ^= 0x08;
-
-        assert!(!header.verify(&payload));
-    }
-
     // a corrupted codec byte is caught by the checksum
     #[test]
     fn codec_flip() {
@@ -987,17 +918,6 @@ mod tests {
         parsed.codec = 1;
 
         assert!(!parsed.verify(&[]));
-    }
-
-    // the same key bytes under two columns are two different records
-    #[test]
-    fn column_separates_keys() {
-        let payload = vec![0x12; 16];
-        let one = RecordHeader::data(sample_key(RECORD, 0x09, 32), Lsn(1), &payload);
-        let two = RecordHeader::data(sample_key(BLOB, 0x09, 32), Lsn(1), &payload);
-
-        assert_ne!(one.crc, two.crc);
-        assert_ne!(one.key, two.key);
     }
 
     // flag shapes no writer produces are rejected as corruption

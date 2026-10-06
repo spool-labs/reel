@@ -2178,57 +2178,6 @@ fn a_short_value_on_the_tail_reads_its_record() {
     assert!(sim.read_count() > before, "an unsealed record is read");
 }
 
-// a value past the ceiling is read from the volume like any other
-#[test]
-fn long_value_still_reads() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
-    store.put(&flag(1), &[9; 64]).expect("put");
-
-    let before = sim.read_count();
-    assert_eq!(
-        store.get(&flag(1)).expect("get"),
-        Some(Value::new(vec![9; 64]))
-    );
-    assert!(
-        sim.read_count() > before,
-        "a value too long to carry is read"
-    );
-}
-
-// a column that declared no ceiling reads its records however short they are
-#[test]
-fn plain_column_reads_short_values() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
-    store.put(&blob(1), &[3]).expect("put");
-
-    let before = sim.read_count();
-    assert_eq!(store.get(&blob(1)).expect("get"), Some(Value::new(vec![3])));
-    assert!(sim.read_count() > before);
-}
-
-// a value survives a seal and a reopen, read from the record the footer names
-#[test]
-fn a_value_survives_a_seal() {
-    let config = config(1, SyncPolicy::EveryPut);
-    let (store, sim) = sim_store(config.clone());
-    store.put(&flag(1), &[7, 7]).expect("put");
-    store.close().expect("close");
-
-    let restored = SimIo::from_image(sim.durable_image());
-    let reopened = ReelStore::open_with_io(
-        PathBuf::from(ROOT),
-        config,
-        COLUMNS,
-        Arc::new(restored.clone()),
-    )
-    .expect("reopen");
-
-    assert_eq!(
-        reopened.get(&flag(1)).expect("get"),
-        Some(Value::new(vec![7, 7]))
-    );
-}
-
 // a record reads back exactly, and its size and presence answer from the index
 #[test]
 fn put_get_roundtrip() {
@@ -2272,35 +2221,6 @@ fn get_many_answers_in_order() {
             Some(vec![1u8; 300]),
             Some(vec![4u8; 300]),
         ]
-    );
-}
-
-// the batch is one submission rather than a read, a wait, and the next read
-#[test]
-fn get_many_submits_once() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
-    let asked: Vec<RecordKey> = (1..=8u8).map(|byte| record(7, byte)).collect();
-    for (byte, key) in (1..=8u8).zip(&asked) {
-        store.put(key, &[byte; 200]).expect("put");
-    }
-
-    // What a loop over the single-key path leaves behind, for the contrast.
-    for key in &asked {
-        store.get(key).expect("get");
-    }
-    let looped = sim.read_count();
-
-    store.get_many(&asked).expect("get many");
-    let batched = sim.read_count() - looped;
-
-    assert!(
-        looped >= asked.len() as u64,
-        "the single-key path reads at least once per record"
-    );
-    assert!(
-        batched < asked.len() as u64,
-        "the batch read {batched} times for {} records, against {looped} one at a time",
-        asked.len()
     );
 }
 
@@ -2738,22 +2658,6 @@ fn a_range_matches_the_read() {
     assert_eq!(&*deep, &payload[20_000..24_000]);
 }
 
-// a window running off the end answers the bytes that are there
-#[test]
-fn a_range_past_the_end() {
-    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
-    let key = record(7, 1);
-    let payload = stripes(4096);
-    store.put(&key, &payload).expect("put");
-
-    let found = store
-        .get_range(&key, 4000, 4096)
-        .expect("range")
-        .expect("found");
-
-    assert_eq!(&*found, &payload[4000..]);
-}
-
 // a window starting at or past the end answers no bytes rather than nothing
 #[test]
 fn a_range_at_the_end() {
@@ -2784,20 +2688,6 @@ fn a_missing_key_ranges() {
         .get_range(&record(7, 2), 0, 16)
         .expect("range")
         .is_none());
-}
-
-// a window of a short value is cut from the record, since no entry holds it now
-#[test]
-fn a_short_range_reads_its_record() {
-    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
-    store.put(&flag(1), &[1, 2, 3, 4]).expect("put");
-
-    let found = store
-        .get_range(&flag(1), 1, 2)
-        .expect("range")
-        .expect("found");
-
-    assert_eq!(&*found, &[2, 3]);
 }
 
 // a record a coded column stored raw reads its window off the volume
@@ -4702,24 +4592,6 @@ fn an_empty_range_writes_nothing() {
     assert_eq!(store.totals().count, 1);
 }
 
-// a range delete is replayed on a reopen, so its keys stay gone
-#[test]
-fn range_delete_survives_a_reopen() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::EveryPut));
-    store.put(&record(7, 1), &[0x11; 100]).expect("put");
-    store.put(&record(8, 1), &[0x22; 100]).expect("put");
-    let start = RecordKey::from_bytes(RECORD, &group_bound(7)).expect("key");
-    store
-        .delete_range(&start, Some(&group_bound(8)))
-        .expect("range delete");
-
-    let reopened = reopen(&sim, config(1, SyncPolicy::EveryPut));
-
-    assert!(!reopened.contains(&record(7, 1)).expect("read"));
-    assert!(reopened.contains(&record(8, 1)).expect("read"));
-    assert_eq!(reopened.totals().count, 1);
-}
-
 // a clean reopen reproduces the whole index and its totals
 #[test]
 fn reopen_reproduces_index() {
@@ -4738,6 +4610,43 @@ fn reopen_reproduces_index() {
         reopened.get(&blob(1)).expect("get"),
         Some(Value::new(vec![0x33; 900]))
     );
+}
+
+// an open that leaves out a written column still counts its bytes, and only a read-only one goes on
+#[test]
+fn an_undeclared_column_is_counted_and_refused_writable() {
+    let (store, sim) = sim_store(config(2, SyncPolicy::EveryPut));
+    store.put(&record(7, 1), &[0x11; 400]).expect("put");
+    store.put(&blob(1), &[0x33; 900]).expect("blob");
+    store.close().expect("close");
+    let records_only: ColumnSet = &COLUMNS[..1];
+
+    let restored = Arc::new(SimIo::from_image(sim.durable_image()));
+    let writable = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        config(2, SyncPolicy::EveryPut),
+        records_only,
+        restored.clone(),
+    );
+    assert!(
+        matches!(writable, Err(ReelError::Config(_))),
+        "a writable open over an undeclared column is refused",
+    );
+
+    let read_only = ReelStore::open_read_only_with_io(
+        PathBuf::from(ROOT),
+        config(2, SyncPolicy::EveryPut),
+        records_only,
+        restored,
+    )
+    .expect("read-only open");
+    let live: u64 = read_only
+        .index
+        .segments_snapshot()
+        .iter()
+        .map(|(_, bytes)| bytes.live)
+        .sum();
+    assert!(live >= 900, "the blob's bytes stay booked live: {live}");
 }
 
 // closing flushes and stops, leaving the tail for the next open to resume

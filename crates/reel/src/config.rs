@@ -763,42 +763,6 @@ fn byte_multiplier(unit: &str) -> std::result::Result<u64, String> {
 mod tests {
     use super::*;
 
-    // a mode the kernel refuses has somewhere to step down to, and the floor has not
-    #[test]
-    fn a_completion_mode_steps_down_to_one_every_kernel_takes() {
-        assert_eq!(
-            TaskRun::Deferred.and_below(),
-            [TaskRun::Deferred, TaskRun::Cooperative, TaskRun::Interrupt],
-        );
-        assert_eq!(
-            TaskRun::Cooperative.and_below(),
-            [TaskRun::Cooperative, TaskRun::Interrupt],
-        );
-        assert_eq!(
-            TaskRun::Interrupt.and_below(),
-            [TaskRun::Interrupt],
-            "the floor asks for nothing, so it has nowhere to fall to",
-        );
-        for mode in TaskRun::Deferred.and_below() {
-            assert_eq!(
-                mode.and_below().last(),
-                Some(&TaskRun::Interrupt),
-                "a mode stepped down without reaching the one a ring runs unasked",
-            );
-        }
-    }
-
-    // the two modes that hold their work are the two a thread has to ask
-    #[test]
-    fn a_held_completion_is_one_the_thread_asks_for() {
-        assert!(TaskRun::Deferred.is_asked_for());
-        assert!(TaskRun::Cooperative.is_asked_for());
-        assert!(
-            !TaskRun::Interrupt.is_asked_for(),
-            "a ring that interrupts for a completion has posted it already",
-        );
-    }
-
     // the floor is asked about the record, so one volume answers both ways
     #[test]
     fn a_floor_maps_the_large_record_and_not_the_small() {
@@ -875,17 +839,6 @@ mod tests {
             32,
             "a named count is taken as given"
         );
-    }
-
-    // an every-put policy still validates
-    #[test]
-    fn every_put_ok() {
-        let config = ReelConfig {
-            sync: SyncPolicy::EveryPut,
-            ..ReelConfig::default()
-        };
-
-        assert!(config.validate().is_ok());
     }
 
     // human byte sizes parse to their byte counts

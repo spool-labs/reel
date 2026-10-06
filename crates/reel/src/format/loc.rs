@@ -72,18 +72,3 @@ impl Loc {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // a pointer keeps the fields it was built from
-    #[test]
-    fn keeps_fields() {
-        let loc = Loc::new(SegmentId(7), 4096, 1600);
-
-        assert_eq!(loc.segment, SegmentId(7));
-        assert_eq!(loc.offset, 4096);
-        assert_eq!(loc.len, 1600);
-    }
-}

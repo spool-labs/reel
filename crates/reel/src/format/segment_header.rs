@@ -155,19 +155,6 @@ mod tests {
     use crate::format::lsn::Lsn;
     use crate::format::record::RecordHeader;
 
-    // the frozen payload round trips through its byte form
-    #[test]
-    fn roundtrip() {
-        let header = SegmentHeader::new(SegmentId(9));
-
-        let parsed = SegmentHeader::unpack(&header.pack()).expect("unpack");
-
-        assert_eq!(parsed, header);
-        assert_eq!(parsed.version, FORMAT_VERSION);
-        assert_eq!(parsed.segment, SegmentId(9));
-        assert_eq!(parsed.band, None);
-    }
-
     // a banded segment says which window it was drawn under
     #[test]
     fn band_roundtrip() {

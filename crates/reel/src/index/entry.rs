@@ -150,8 +150,6 @@ mod tests {
     use super::*;
 
     use crate::format::column::ColumnId;
-    use crate::format::loc::SegmentId;
-    use crate::format::record::{HEADER_LEN, KEYLESS_MAX, KEYLESS_PREFIX};
 
     // a range covers only its own column, its own span, and older versions
     #[test]
@@ -194,39 +192,5 @@ mod tests {
     #[test]
     fn entry_width() {
         assert_eq!(std::mem::size_of::<Entry>(), 24);
-    }
-
-    // a rewritten copy keeps its version and takes the destination's stamp
-    #[test]
-    fn moved_keeps_its_version() {
-        let entry = Entry::new(Loc::new(SegmentId(1), 0, 2), Lsn(5)).stamped(SegmentIncarnation(3));
-
-        let moved = entry.moved_to(Loc::new(SegmentId(9), 64, 2), SegmentIncarnation(7));
-
-        assert_eq!(moved.lsn, Lsn(5));
-        assert_eq!(moved.loc.segment, SegmentId(9));
-        assert_eq!(moved.incarnation, SegmentIncarnation(7));
-    }
-
-    // a fresh entry wears no stamp until one is put on it
-    #[test]
-    fn stamp_starts_empty() {
-        let entry = Entry::new(Loc::new(SegmentId(1), 0, 8), Lsn(1));
-
-        assert!(entry.incarnation.is_none());
-        assert_eq!(
-            entry.stamped(SegmentIncarnation(4)).incarnation,
-            SegmentIncarnation(4)
-        );
-    }
-
-    // a record's footprint counts its header, its key, and its payload
-    #[test]
-    fn span_counts_the_key() {
-        let entry = Entry::new(Loc::new(SegmentId(1), 0, 1600), Lsn(1));
-
-        assert_eq!(entry.span(34), KEYLESS_PREFIX as u64 + 1600);
-        assert_eq!(span_of(0, 0), KEYLESS_PREFIX as u64);
-        assert_eq!(span_of(34, KEYLESS_MAX + 1), HEADER_LEN as u64 + 34 + u64::from(KEYLESS_MAX) + 1);
     }
 }

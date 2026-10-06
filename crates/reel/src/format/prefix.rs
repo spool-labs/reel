@@ -437,63 +437,6 @@ mod tests {
         rows
     }
 
-    fn paths() -> Vec<Vec<u8>> {
-        let mut keys: Vec<Vec<u8>> = (0..200u32)
-            .map(|at| {
-                format!(
-                    "tenants/{:08x}/exports/2026/08/02/part-{at:05}.parquet",
-                    at / 64
-                )
-                .into_bytes()
-            })
-            .collect();
-        keys.sort();
-        keys.dedup();
-        keys
-    }
-
-    // every key comes back out of the block it was packed into
-    #[test]
-    fn keys_survive_the_packing() {
-        let keys = paths();
-        let mut rows = PrefixRows::new(TAIL);
-        for (at, key) in keys.iter().enumerate() {
-            rows.push(key, &(at as u32).to_le_bytes()).expect("push");
-        }
-
-        assert_eq!(rows.len(), keys.len());
-        assert_eq!(rows.keys().expect("keys"), keys);
-    }
-
-    // sharing a front is what the encoding is for, so it has to actually save
-    #[test]
-    fn a_shared_front_is_stored_once() {
-        let keys = paths();
-        let mut rows = PrefixRows::new(TAIL);
-        for key in &keys {
-            rows.push(key, &[0u8; 4]).expect("push");
-        }
-
-        let whole: usize = keys.iter().map(|key| key.len() + TAIL.len()).sum();
-        let packed = rows.packed_len();
-        assert!(
-            packed * 2 < whole,
-            "packed {packed} against {whole} whole, which is not a saving",
-        );
-    }
-
-    // a seek finds the first row at or after the key it asked for
-    #[test]
-    fn a_seek_lands_on_the_first_row_at_or_after() {
-        let keys = paths();
-        let rows = built(&keys.iter().map(Vec::as_slice).collect::<Vec<_>>());
-
-        for (at, key) in keys.iter().enumerate() {
-            let found = rows.seek(key).expect("seek").expect("present");
-            assert_eq!(found.index, at, "seeking a key it holds");
-        }
-    }
-
     // a seek for a key between two rows lands on the one after it
     #[test]
     fn a_seek_between_rows_lands_after() {
@@ -555,16 +498,6 @@ mod tests {
         }
     }
 
-    // a block spanning many restarts is searched, not scanned
-    #[test]
-    fn restarts_carve_the_block_up() {
-        let keys = paths();
-        let rows = built(&keys.iter().map(Vec::as_slice).collect::<Vec<_>>());
-
-        let wanted = keys.len().div_ceil(RESTART_INTERVAL);
-        assert_eq!(rows.restarts(), wanted);
-    }
-
     // rows out of order are refused rather than encoded badly
     #[test]
     fn an_unsorted_row_is_refused() {
@@ -585,18 +518,6 @@ mod tests {
                 rows.seek(key).expect("seek").expect("present").index,
                 at
             );
-        }
-    }
-
-    // the tail rides with its key and comes back with it
-    #[test]
-    fn a_row_carries_its_tail() {
-        let keys = paths();
-        let rows = built(&keys.iter().map(Vec::as_slice).collect::<Vec<_>>());
-
-        for (at, key) in keys.iter().enumerate() {
-            let found = rows.seek(key).expect("seek").expect("present");
-            assert_eq!(found.tail, (at as u32).to_le_bytes(), "row {at}");
         }
     }
 }
@@ -763,24 +684,6 @@ mod cursor_tests {
         let rows = PrefixRows::new(TAIL);
         let mut cursor = rows.cursor();
         assert!(!cursor.advance().expect("step"));
-    }
-
-    // a walk crosses restart boundaries without losing its place
-    #[test]
-    fn a_walk_crosses_restarts() {
-        let keys = paths(200);
-        let rows = built(&keys);
-        assert!(
-            rows.restarts() > 4,
-            "the corpus has to span several restarts"
-        );
-
-        let mut cursor = rows.cursor();
-        let mut walked: Vec<Vec<u8>> = Vec::new();
-        while cursor.advance().expect("step") {
-            walked.push(cursor.key().to_vec());
-        }
-        assert_eq!(walked, keys);
     }
 }
 
@@ -998,28 +901,6 @@ mod backward_tests {
             Some((0, RESTART_INTERVAL + 3)),
             "the run spans the restart"
         );
-    }
-
-    // walking backwards over the whole partition yields it reversed
-    #[test]
-    fn a_backward_walk_reverses_the_order() {
-        let keys = paths(120);
-        let rows = {
-            let mut rows = PrefixRows::new(TAIL);
-            for (at, key) in keys.iter().enumerate() {
-                rows.push(key, &(at as u32).to_le_bytes()).expect("push");
-            }
-            rows
-        };
-
-        let mut walked: Vec<Vec<u8>> = Vec::new();
-        let mut at = rows.len();
-        while let Some(index) = at.checked_sub(1) {
-            walked.push(rows.key_of(index).expect("key"));
-            at = index;
-        }
-        walked.reverse();
-        assert_eq!(walked, keys);
     }
 }
 

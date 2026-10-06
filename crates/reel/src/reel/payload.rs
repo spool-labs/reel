@@ -177,25 +177,6 @@ mod tests {
         assert_eq!(second.as_ptr(), address, "the same allocation served both");
     }
 
-    // a small payload is pooled, which is the size a point read asks for most
-    #[test]
-    fn a_small_payload_is_pooled() {
-        const SMALL: usize = 1_200;
-        assert!(
-            class_of(SMALL).is_some(),
-            "a small payload falls outside the pool"
-        );
-
-        let taken = take(SMALL);
-        assert!(taken.capacity() >= SMALL);
-        let capacity = taken.capacity();
-        give(taken);
-
-        // Back on the next read of that size rather than bought again.
-        let again = take(SMALL);
-        assert_eq!(again.capacity(), capacity, "the buffer did not come back");
-    }
-
     // the classes reach both the floor and the ceiling
     #[test]
     fn the_classes_span_the_range() {

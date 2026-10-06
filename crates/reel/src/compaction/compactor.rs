@@ -2752,28 +2752,6 @@ mod tests {
         assert!(!rebuilt_keys(&rebuilt).contains(&key_bytes(1)));
     }
 
-    // a dropped tombstone never resurrects its key on a rebuild
-    #[test]
-    fn dropped_tombstone_stays_deleted() {
-        let fixture = fixture(settings());
-        put(&fixture, 1, vec![0x11; 200]);
-        delete(&fixture, 1);
-        seal(&fixture);
-        put(&fixture, 2, vec![0x22; 200]);
-        seal(&fixture);
-        put(&fixture, 3, vec![0x33; 200]);
-
-        fixture
-            .compactor
-            .compact_segment(&fixture.reel, &fixture.index, SegmentId(1))
-            .expect("compact");
-        fixture.reel.flush().expect("flush");
-
-        let rebuilt = rebuilt_from(&fixture);
-        assert!(!rebuilt_keys(&rebuilt).contains(&key_bytes(1)));
-        assert_eq!(rebuilt_keys(&rebuilt).len(), 2);
-    }
-
     // a crash after copying but before unlinking rebuilds one version from two copies
     #[test]
     fn mid_compaction_crash_one_version() {

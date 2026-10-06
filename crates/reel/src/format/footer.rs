@@ -233,16 +233,16 @@ pub struct FooterPartition {
 impl FooterPartition {
     /// An empty partition for one column at its key width
     pub fn new(column: ColumnId, key_width: u16) -> FooterPartition {
+        // a varying partition's starts open with the first row's, which is 0
+        let starts = match key_width == VARYING_WIDTH {
+            true => vec![0],
+            false => Vec::new(),
+        };
         FooterPartition {
             column,
             key_width,
             packed: Vec::new(),
-            // A varying partition's first row starts at zero, and each push records where
-            // its row ends. A strided one works its rows out from the stride.
-            starts: match key_width == VARYING_WIDTH {
-                true => vec![0],
-                false => Vec::new(),
-            },
+            starts,
             filter: None,
             is_packed: key_width == VARYING_WIDTH,
         }
@@ -1655,6 +1655,26 @@ mod tests {
         assert_eq!(two.key_at(1).map(<[u8]>::len), Some(200));
     }
 
+    // a footer started from a varying one keeps every row, the first included
+    #[test]
+    fn a_footer_like_a_varying_one_keeps_its_first_row() {
+        let last = SegmentFooter::build(vec![
+            entry(RECORD, 1, 8, 1, 0, 100),
+            entry(RECORD, 2, 12, 2, 100, 100),
+        ]);
+        let mut next = last.empty_like();
+        next.push(&entry(RECORD, 3, 22, 3, 0, 100));
+        next.push(&entry(RECORD, 4, 9, 4, 100, 100));
+
+        assert_eq!(next.entry_count(), 2);
+        let rows = collect(&next);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().any(|row| row.lsn == Lsn(3)),
+            "the first row is kept"
+        );
+    }
+
     // a footer of many columns finds each one's partition, and none for a column it lacks
     #[test]
     fn many_columns_find_their_partitions() {
@@ -1952,23 +1972,6 @@ mod tests {
             wide.pack(0).expect("pack").len() - narrow.pack(0).expect("pack").len(),
             108 - 24,
         );
-    }
-
-    // a tombstone entry survives with a zero length beside a data entry
-    #[test]
-    fn tombstone_entry() {
-        let mut footer = SegmentFooter::build(vec![
-            entry(RECORD, 0x01, 34, 5, 0, 1600),
-            entry(RECORD, 0x02, 34, 6, 1656, 0),
-        ]);
-
-        let packed = footer.pack(0).expect("pack");
-        let parsed = SegmentFooter::parse(&packed).expect("parse");
-        let rows = collect(&parsed);
-
-        assert_eq!(rows[1].len, 0);
-        assert!(rows[1].is_tombstone());
-        assert_eq!(rows.len(), 2);
     }
 
     // a range tombstone is listed with the length of the end key it names

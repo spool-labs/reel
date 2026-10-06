@@ -670,30 +670,6 @@ fn ordered<K: TreeKey>(keys: &[K]) -> bool {
     true
 }
 
-/// Ask the machine for a line without waiting on it
-#[inline(always)]
-fn prefetch(ptr: *const u8) {
-    // Inline asm because `core::arch::aarch64::_prefetch` is still unstable and
-    // this crate builds on stable; the x86 intrinsic below is not.
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: a prefetch of any address is architecturally a hint and cannot
-    // fault, and the pointer comes from a live arena slot regardless.
-    unsafe {
-        std::arch::asm!(
-            "prfm pldl1keep, [{0}]",
-            in(reg) ptr,
-            options(nostack, readonly, preserves_flags)
-        );
-    }
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: as above, `_mm_prefetch` is a hint and never faults.
-    unsafe {
-        std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let _ = ptr;
-}
-
 /// Set on a child index that names an inner node rather than a leaf
 const INNER: u32 = 1 << 31;
 
@@ -1900,7 +1876,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             true => self.inners[slot_of(at)].lead.as_ptr(),
             false => self.leaves[slot_of(at)].lead.as_ptr(),
         };
-        prefetch(ptr as *const u8);
+        crate::io::mapping::prefetch(ptr as *const u8);
     }
 
     /// Whole leaves in key order, for a caller that wants to run its own loop

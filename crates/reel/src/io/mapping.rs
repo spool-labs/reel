@@ -14,6 +14,30 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Ask the machine for a line without waiting on it
+#[inline(always)]
+pub(crate) fn prefetch(ptr: *const u8) {
+    // Inline asm because `core::arch::aarch64::_prefetch` is still unstable and
+    // this crate builds on stable; the x86 intrinsic below is not.
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: a prefetch of any address is architecturally a hint and cannot
+    // fault, and the pointer comes from a live mapping or arena slot regardless.
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{0}]",
+            in(reg) ptr,
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: as above, `_mm_prefetch` is a hint and never faults.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = ptr;
+}
+
 /// One read-only mapping over a whole segment file
 pub struct Mapping {
     base: *const u8,

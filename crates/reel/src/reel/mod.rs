@@ -1397,6 +1397,22 @@ fn reserved_count(shared: &ReelShared) -> usize {
     }
 }
 
+/// Records the mapped check looks ahead by, so that many memory stalls overlap
+const PREFETCH_AHEAD: usize = 16;
+
+/// Lines of one record asked for ahead: its header, its key and a small payload
+const PREFETCH_LINES: usize = 4;
+
+const CACHE_LINE: usize = 64;
+
+/// Ask the machine for a record's first lines without waiting on them
+fn prefetch_record(record: &[u8]) {
+    let lines = record.len().div_ceil(CACHE_LINE).min(PREFETCH_LINES);
+    for line in 0..lines {
+        crate::io::mapping::prefetch(record[line * CACHE_LINE..].as_ptr());
+    }
+}
+
 impl Reel {
     /// Open a reel with the configured number of active tails
     ///
@@ -2014,23 +2030,34 @@ impl Reel {
         scratch.order.clear();
         scratch.plan.clear();
         scratch.handles.clear();
+        // Every mapped record's segment is held before any is read, so the records
+        // below are cut from a handle list nothing moves.
+        for ask in asks {
+            if self.maps(ask.loc.segment, ask.loc.len as usize) {
+                self.hold_segment(ask.loc.segment, &mut scratch.handles)?;
+            }
+        }
+        // A scan's keys land on records spread over the volume, and the check below
+        // paid one memory stall a record, in turn. The records ahead are asked for
+        // first, so the stalls overlap.
+        let handles = &scratch.handles;
+        for ask in asks.iter().take(PREFETCH_AHEAD) {
+            if let Some(record) = self.in_place(handles, keys, ask) {
+                prefetch_record(record);
+            }
+        }
         let mut mapped = Vec::new();
         for (at, ask) in asks.iter().enumerate() {
+            if let Some(ahead) = asks.get(at + PREFETCH_AHEAD) {
+                if let Some(record) = self.in_place(handles, keys, ahead) {
+                    prefetch_record(record);
+                }
+            }
             let key = keys[ask.at as usize];
             let prefix = HEADER_LEN + key.width();
             let len = ask.loc.len as usize;
-            let offset = u64::from(ask.loc.offset);
-            let record = match self.maps(ask.loc.segment, len) {
-                true => match self.hold_segment(ask.loc.segment, &mut scratch.handles)? {
-                    Some(handle) => handle
-                        .mapping(self.shared.config.segment_bytes.to_bytes())
-                        .and_then(|map| map.slice(offset, prefix + len)),
-                    None => continue,
-                },
-                false => None,
-            };
-            let Some(record) = record else {
-                let place = (u64::from(ask.loc.segment.0) << 32) | offset;
+            let Some(record) = self.in_place(handles, keys, ask) else {
+                let place = (u64::from(ask.loc.segment.0) << 32) | u64::from(ask.loc.offset);
                 scratch.order.push((place, at as u32));
                 continue;
             };
@@ -2097,6 +2124,18 @@ impl Reel {
             scratch.ops.push(op);
         }
         Ok(true)
+    }
+
+    /// A record's bytes in its segment's mapping, when the read maps and the batch holds the segment
+    fn in_place<'held>(&self, handles: &'held [SegmentHandle], keys: &[KeyRef<'_>], ask: &Ask) -> Option<&'held [u8]> {
+        let len = ask.loc.len as usize;
+        if !self.maps(ask.loc.segment, len) {
+            return None;
+        }
+        let at = handles.binary_search_by_key(&ask.loc.segment, SegmentHandle::id).ok()?;
+        let map = handles[at].mapping(self.shared.config.segment_bytes.to_bytes())?;
+        let prefix = HEADER_LEN + keys[ask.at as usize].width();
+        map.slice(u64::from(ask.loc.offset), prefix + len)
     }
 
     /// Take a segment's handle once per batch and lend it for every record after

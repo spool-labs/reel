@@ -704,7 +704,7 @@ fn a_second_caller_cannot_take_a_held_segment() {
     }
 }
 
-// naming and handing over a sealed segment reads nothing back from the device
+// noting and handing over a sealed segment reads nothing back from the device
 #[test]
 fn naming_a_seal_reads_no_footer() {
     let (store, sim) = sim_store(ReelConfig {

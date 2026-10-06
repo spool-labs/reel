@@ -1059,7 +1059,7 @@ struct Pending {
     /// Whether a caller is already noting this one's spans
     is_taken: bool,
 
-    /// The footer the seal wrote, so naming and handing over never read it back
+    /// The footer the seal wrote, so noting and handing over never read it back
     footer: Arc<SegmentFooter>,
 }
 
@@ -1792,7 +1792,7 @@ impl Reel {
     /// Open a reel with the configured number of active tails
     ///
     /// A volume that owns a capacity tier keeps a tail back for each compaction pass it
-    /// runs at once, since only a reserved tail answers to a named tier. The reserved
+    /// runs at once, since only a reserved tail answers to a chosen tier. The reserved
     /// tails come last and route never offers them.
     ///
     /// Tails a previous process left unsealed are picked up in number order, so a restart

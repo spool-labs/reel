@@ -112,7 +112,7 @@ pub fn merge_into_key_run(
             continue;
         };
         // Chosen from a list taken before the claim, so a rewrite can have retired it
-        // in between, and a run covering a segment that is gone names records nowhere.
+        // in between, and a run covering a segment that is gone points at nothing.
         if !index.holds_sealed(*segment) {
             continue;
         }
@@ -143,8 +143,8 @@ pub fn merge_into_key_run(
     if sources.len() < 2 {
         return Ok(MergeReport::default());
     }
-    // Taken under the claims, so it holds for the whole merge: a row naming a segment
-    // outside it names a record a rewrite moved or dropped.
+    // Taken under the claims, so it holds for the whole merge: a row pointing into a
+    // segment outside it points at a record a rewrite moved or dropped.
     let standing: HashSet<SegmentId> = index.segments_snapshot().into_iter().map(|(segment, _)| segment).collect();
 
     let mut columns: BTreeSet<(ColumnId, u16)> = BTreeSet::new();

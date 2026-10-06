@@ -138,7 +138,7 @@ enum Run {
         leads: Vec<u64>,
     },
 
-    /// One column of a key run, its rows read in place, each naming its record's segment
+    /// One column of a key run, its rows read in place, each pointing into its record's segment
     Keys {
         run: Arc<KeyRun>,
         column: usize,
@@ -407,10 +407,10 @@ impl Sealed {
     /// The newest row any cursor holds for a key, under a ceiling when one is given
     ///
     /// Every cursor standing on the key is stepped past it either way. The sequence
-    /// number decides rather than the segment number, since a volume writing through
-    /// several tails can land a rewrite in a lower-numbered segment. A rewrite's copy
-    /// keeps its record's number, so on a tie the row whose segment still stands wins
-    /// over a key run's row naming the one the rewrite retired.
+    /// number decides, since a volume writing through several tails can land a rewrite
+    /// in a lower-numbered segment. A rewrite's copy keeps its record's number, so on a
+    /// tie the row whose segment still stands wins over a key run's row pointing into
+    /// the one the rewrite retired.
     fn newest(
         &mut self,
         way: Way,

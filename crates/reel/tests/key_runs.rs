@@ -216,7 +216,7 @@ fn key_runs_of_varying_keys_answer_as_the_model_on_four_tails() {
 /// Dead share a segment is rewritten at in the scenarios below, so half-dead ones go
 const HALF_DEAD: f64 = 0.3;
 
-/// Whether an older run names a retired segment for a key a newer run names a standing one for
+/// Whether an older run points into a retired segment for a key a newer run points into a standing one for
 fn is_stale_under_fresh(store: &ReelStore, key: &[u8]) -> bool {
     let index = store.index();
     let mut seen = Vec::new();
@@ -260,7 +260,7 @@ fn compact_all(store: &ReelStore) {
 // One tail writes keys in the order of their numbers, so a stretch of numbers is a
 // segment, while the keys themselves scatter and every segment reaches across the column.
 // A rewrite moves half a covered segment's records, and a later merge puts the copies in a
-// newer run while the old run, still naming the retired segment, is read first. The copy
+// newer run while the old run, still pointing into the retired segment, is read first. The copy
 // keeps its record's sequence number, so only the standing segment can break the tie.
 #[test]
 fn a_rewritten_record_answers_through_the_newer_run() {
@@ -302,7 +302,7 @@ fn a_rewritten_record_answers_through_the_newer_run() {
 }
 
 // Every key is deleted, its old segments retire whole, and the deletes' own segment is
-// rewritten while the run over the old segments still names each key. Dropping a delete
+// rewritten while the run over the old segments still holds each key. Dropping a delete
 // there would bring its key back from the run.
 #[test]
 fn a_delete_stands_while_a_run_still_holds_its_key() {

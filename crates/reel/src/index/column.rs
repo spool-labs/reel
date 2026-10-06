@@ -1002,7 +1002,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         if existing.is_some_and(|existing| !existing.is_grave() || existing.lsn > lsn) || is_shadowed() {
             return;
         }
-        // An older grave is replaced by this one rather than counted again.
+        // An older grave is replaced by this one and never counted again.
         if existing.is_some() {
             state.graves -= 1;
         }
@@ -1037,7 +1037,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 self.drop_entry(state, &key, existing, segments);
                 Landed::Record
             }
-            // An older grave is replaced by this one rather than counted again.
+            // An older grave is replaced by this one and never counted again.
             Some(_) => {
                 state.graves -= 1;
                 Landed::Grave
@@ -1741,7 +1741,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// Give up the keys of one lane of shards, each shard's lock taken once a chunk
     ///
     /// The same test `page_out` makes a key, made for every key of a shard while its lock
-    /// is held, so a sealed segment's keys cost a lock a chunk rather than one a key. A lane
+    /// is held, so a sealed segment's keys cost one lock a chunk of them. A lane
     /// is the shards whose number leaves `lane` over `lanes`. What comes back is which went.
     pub fn page_out_lane(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<bool> {
         let mut handed = vec![false; rows.len()];

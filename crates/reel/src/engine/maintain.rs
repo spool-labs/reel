@@ -293,7 +293,7 @@ impl ReelStore {
     /// Take the segments sealed since the last tick, record their spans, and queue the handover
     ///
     /// Spans go down first and for every residency, and only a paged volume queues the
-    /// handover. A segment stays on the sealed queue until it has been named, so nothing
+    /// handover. A segment stays on the sealed queue until it has been noted, so nothing
     /// retires a segment the index cannot search yet.
     pub(super) fn hold_sealed(&self) -> Result<()> {
         let sealed = self.reel.shared().peek_sealed();
@@ -301,7 +301,7 @@ impl ReelStore {
             return Ok(());
         }
         for (segment, footer) in &sealed {
-            // A footer that names no key range is given up to compaction.
+            // A footer with no key range is given up to compaction.
             if let Err(error) = self.note_spans(*segment, footer) {
                 tracing::warn!(
                     "reel segment {} sealed with a footer that names no key range: {error}",

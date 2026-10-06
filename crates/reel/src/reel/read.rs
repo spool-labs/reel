@@ -242,7 +242,7 @@ pub(super) fn place_runs(
 /// Decide what a framed record read means, once the bytes are in hand
 ///
 /// A keyless record is always verified, since its check is the only thing that says
-/// it is the record the entry or row named.
+/// it is the record the entry or row points at.
 pub(super) fn frame_to_read(
     head: Vec<u8>,
     body: Vec<u8>,

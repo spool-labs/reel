@@ -726,7 +726,7 @@ impl Compactor {
         // records back into the mixture they were kept out of.
         let band = band_of(shared, &source)?;
         // A volume that keeps tails back writes each pass into one of its own, the only
-        // tail that answers to a named tier. Otherwise the survivors route the way a
+        // tail that answers to a chosen tier. Otherwise the survivors route the way a
         // fresh write of the same band would.
         let lease = reel.lease_reserved();
         if reel.keeps_reserved() && lease.is_none() {
@@ -737,7 +737,7 @@ impl Compactor {
             None => reel.place(band)?,
         };
 
-        // Only a reserved tail answers to a named tier and to the source's band, since
+        // Only a reserved tail answers to a chosen tier and to the source's band, since
         // a foreground destination mixes fresh puts in and fresh puts stay fast. A
         // leftover active segment from another tier or another band is sealed away so
         // the swap draws under what this pass just set.

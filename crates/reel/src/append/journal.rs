@@ -35,7 +35,7 @@ impl Journal {
     /// Create the journal of a segment being drawn
     ///
     /// Made beside the segment and before the directory sync the segment takes, so
-    /// that one sync covers both names. A drawn number is new, and an open unlinks
+    /// that one sync covers both directory entries. A drawn number is new, and an open unlinks
     /// every journal whose segment is gone, so the file starts empty.
     pub(super) fn create(driver: &Arc<IoDriver>, segment_path: &Path) -> Result<Journal> {
         let path = journal_path(segment_path);
@@ -46,7 +46,7 @@ impl Journal {
     /// Take a journal up again with only the rows a reopen accepted
     ///
     /// The rows go down as one group in a fresh file renamed over the old one, so a
-    /// crash in between leaves one journal or the other and never a group that names a
+    /// crash in between leaves one journal or the other and never a group that lists a
     /// record the reopen dropped.
     pub(super) fn resume(driver: &Arc<IoDriver>, segment_path: &Path, rows: &[JournalRow]) -> Result<Journal> {
         let path = journal_path(segment_path);
@@ -94,7 +94,7 @@ impl Journal {
     /// Write every pending group to the file and sync it
     ///
     /// Both under the file's lock, so a seal that removes the journal waits for the sync
-    /// rather than closing the file under it.
+    /// and never closes the file under it.
     pub(super) fn sync_pending(&self) -> Result<()> {
         let mut file = lock(&self.file);
         self.write_locked(&mut file)?;

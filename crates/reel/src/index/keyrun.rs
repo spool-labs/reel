@@ -1,4 +1,4 @@
-//! Key runs: sorted rows naming where each record lies, merged without moving a record
+//! Key runs: sorted rows pointing at each record where it lies, merged without moving one
 //!
 //! A merge writes the rows of the runs it collapses into one key run and leaves every
 //! record where it was written, so neither the spot index nor the map hears of it. Data
@@ -344,7 +344,7 @@ impl KeyRun {
 
     /// The first row at a key or past it, or past it alone
     ///
-    /// The fence names the block, and one search inside it the row. A key past every
+    /// The fence picks the block, and one search inside it the row. A key past every
     /// row of its block lands on the next block's first row, since rows lie back to back.
     pub fn seek(&self, column: &RunColumn, key: &[u8], is_past: bool) -> u64 {
         let rows = self.rows(column);
@@ -468,7 +468,7 @@ impl KeyRunSet {
     ///
     /// A run that cannot be read is unlinked and its segments go back to the walk. So is
     /// a run a newer one covers whole, which a merge that stopped between writing its run
-    /// and unlinking its inputs leaves behind. A run naming a segment a rewrite retired
+    /// and unlinking its inputs leaves behind. A run pointing into a segment a rewrite retired
     /// stays: the rewrite's copies outrank its rows there.
     pub fn load(&self, driver: &Arc<IoDriver>, root: &Path) -> Result<()> {
         let mut runs = Vec::new();

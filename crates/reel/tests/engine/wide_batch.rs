@@ -11,8 +11,8 @@
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IoBackend, KeyWidth, RecordKey,
-    RecordWrite, ReelConfig, ReelStore, SyncPolicy,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IoBackend, KeyWidth, RecordKey, RecordWrite,
+    ReelConfig, ReelStore, SyncPolicy,
 };
 
 /// Spans one vectored call carries, which is the bound this file is about

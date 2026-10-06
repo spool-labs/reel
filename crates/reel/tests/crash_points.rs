@@ -17,8 +17,8 @@ use reel::format::record::KEYLESS_PREFIX;
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::{
-    ByteCount, IndexResidency, Preallocate,
-    RecordWrite, ReelConfig, ReelStore, RepairPath, SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
+    ByteCount, IndexResidency, Preallocate, RecordWrite, ReelConfig, ReelStore, RepairPath,
+    SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
 };
 use reel_core::{Direction, Store, Value};
 use reel_mock::MemoryStore;
@@ -29,7 +29,8 @@ use harness::reel_harness::{
     assert_recount, counter_totals, flip_largest_segment, scan_totals, ReelHarness,
 };
 use harness::wire::{
-    apply_mutation, framed_value, group_prefix, wire_key, RECORDS, RECORDS_CF, RECORD_KEY_LEN, TEST_COLUMNS,
+    apply_mutation, framed_value, group_prefix, wire_key, RECORDS, RECORDS_CF, RECORD_KEY_LEN,
+    TEST_COLUMNS,
 };
 
 /// Group most targeted tests write into
@@ -410,11 +411,17 @@ fn every_boundary_spot_index_answers_as_the_footers() {
         let cue = reopened.cue().expect("cue");
         for key in &keys {
             let live = reopened.get(key).expect("get").map(|value| value.to_vec());
-            let footers = reopened.get_at(key, &cue).expect("cue read").map(|value| value.to_vec());
+            let footers = reopened
+                .get_at(key, &cue)
+                .expect("cue read")
+                .map(|value| value.to_vec());
             assert_eq!(live, footers, "key {key:?} after a crash at {crash_at}");
         }
     }
-    assert!(loaded > 0, "no reopen loaded the spot index, so the comparison proved nothing");
+    assert!(
+        loaded > 0,
+        "no reopen loaded the spot index, so the comparison proved nothing"
+    );
 }
 
 // every crash boundary of a paged stream reopens with its walks answering as the gets do
@@ -447,11 +454,15 @@ fn every_boundary_walks_answer_as_the_gets() {
             .map(|(key, value)| (key, value.to_vec()))
             .collect();
         assert_eq!(up, want, "a walk up after a crash at {crash_at}");
-        let mut down: Vec<(Vec<u8>, Vec<u8>)> =
-            Store::iter_from(&reopened, RECORDS_CF, &[0xFF; RECORD_KEY_LEN], Direction::Desc)
-                .expect("iter from")
-                .map(|(key, value)| (key, value.to_vec()))
-                .collect();
+        let mut down: Vec<(Vec<u8>, Vec<u8>)> = Store::iter_from(
+            &reopened,
+            RECORDS_CF,
+            &[0xFF; RECORD_KEY_LEN],
+            Direction::Desc,
+        )
+        .expect("iter from")
+        .map(|(key, value)| (key, value.to_vec()))
+        .collect();
         down.reverse();
         assert_eq!(down, want, "a walk down after a crash at {crash_at}");
         let alone: Vec<Vec<u8>> = reopened
@@ -682,11 +693,7 @@ enum Tear {
 // it lists checks out, so a run that stops short is dropped whole.
 #[test]
 fn a_torn_batch_leaves_nothing_of_itself() {
-    for tear in [
-        Tear::FirstRecord,
-        Tear::MidBatch,
-        Tear::LastRecord,
-    ] {
+    for tear in [Tear::FirstRecord, Tear::MidBatch, Tear::LastRecord] {
         let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, SEGMENT_LARGE));
         let sim = SimIo::new(FaultPlan::new(1));
         let store = harness.open_or_panic(sim.clone());
@@ -799,7 +806,10 @@ fn cut_the_last_batch(image: &mut DurableImage, tear: Tear) {
         if !path.to_string_lossy().ends_with(SEGMENT_SUFFIX) {
             continue;
         }
-        let Some((_, journal)) = journals.iter().find(|(journal, _)| *journal == journal_path(path)) else {
+        let Some((_, journal)) = journals
+            .iter()
+            .find(|(journal, _)| *journal == journal_path(path))
+        else {
             continue;
         };
         let Some(at) = tear_offset(journal, tear) else {
@@ -1005,8 +1015,11 @@ fn merge_fill(round: u8, address: u8) -> u8 {
 fn write_merge_setup(store: &ReelStore) {
     for round in 1..=MERGE_ROUNDS {
         for address in 1..=MERGE_KEYS {
-            apply_mutation(store, &put(GROUP, address, MERGE_PAYLOAD, merge_fill(round, address)))
-                .expect("round");
+            apply_mutation(
+                store,
+                &put(GROUP, address, MERGE_PAYLOAD, merge_fill(round, address)),
+            )
+            .expect("round");
         }
     }
     apply_mutation(
@@ -1019,8 +1032,11 @@ fn write_merge_setup(store: &ReelStore) {
     .expect("delete");
     for round in MERGE_ROUNDS + 1..=MERGE_ROUNDS + MERGE_AFTER_ROUNDS {
         for address in MERGE_KEPT {
-            apply_mutation(store, &put(GROUP, *address, MERGE_PAYLOAD, merge_fill(round, *address)))
-                .expect("round after the delete");
+            apply_mutation(
+                store,
+                &put(GROUP, *address, MERGE_PAYLOAD, merge_fill(round, *address)),
+            )
+            .expect("round after the delete");
         }
     }
     store.flush().expect("flush");
@@ -1032,14 +1048,27 @@ fn assert_merged_answers(store: &ReelStore, crash_at: u64) {
     let last = MERGE_ROUNDS + MERGE_AFTER_ROUNDS;
     let want: Vec<(Vec<u8>, Vec<u8>)> = MERGE_KEPT
         .iter()
-        .map(|address| (wire_key(GROUP, *address), framed_value(MERGE_PAYLOAD, merge_fill(last, *address))))
+        .map(|address| {
+            (
+                wire_key(GROUP, *address),
+                framed_value(MERGE_PAYLOAD, merge_fill(last, *address)),
+            )
+        })
         .collect();
     for (key, value) in &want {
-        let found = Store::get(store, RECORDS_CF, key).expect("get").map(|value| value.to_vec());
-        assert_eq!(found.as_ref(), Some(value), "a merged key read back wrong at {crash_at}");
+        let found = Store::get(store, RECORDS_CF, key)
+            .expect("get")
+            .map(|value| value.to_vec());
+        assert_eq!(
+            found.as_ref(),
+            Some(value),
+            "a merged key read back wrong at {crash_at}"
+        );
     }
     assert!(
-        Store::get(store, RECORDS_CF, &wire_key(GROUP, MERGE_DELETED)).expect("get").is_none(),
+        Store::get(store, RECORDS_CF, &wire_key(GROUP, MERGE_DELETED))
+            .expect("get")
+            .is_none(),
         "a merge crash brought a deleted key back at {crash_at}",
     );
     let walked: Vec<(Vec<u8>, Vec<u8>)> = Store::iter(store, RECORDS_CF)

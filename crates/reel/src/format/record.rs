@@ -48,7 +48,8 @@ const KEYLESS_SHAPE_AT: usize = 8;
 const CODEC_BITS: u32 = 2;
 
 /// Every keyless length and codec fits the two bytes a shape takes
-const _: () = assert!(((KEYLESS_MAX as u64) << CODEC_BITS) | ((1 << CODEC_BITS) - 1) <= u16::MAX as u64);
+const _: () =
+    assert!(((KEYLESS_MAX as u64) << CODEC_BITS) | ((1 << CODEC_BITS) - 1) <= u16::MAX as u64);
 
 /// The check covers these bytes ahead of the key: column, key width, kind, shape and payload checksum
 const KEYLESS_FIXED: usize = 10;
@@ -142,11 +143,8 @@ impl Flags {
     /// A delete marker for a range of keys, its payload the exclusive end
     pub const RANGE_TOMBSTONE: Flags = Flags(FLAG_RANGE_TOMBSTONE);
 
-
     /// The first record of a segment, carrying its self describing payload
     pub const SEGMENT_HEADER: Flags = Flags(FLAG_SEGMENT_HEADER);
-
-
 
     /// The same record written again elsewhere by compaction
     ///
@@ -171,13 +169,10 @@ impl Flags {
         self.0 & FLAG_RANGE_TOMBSTONE != 0
     }
 
-
     /// Whether the segment header bit is set
     pub fn is_segment_header(self) -> bool {
         self.0 & FLAG_SEGMENT_HEADER != 0
     }
-
-
 
     /// Whether the record is compaction's copy of one written earlier
     pub fn is_relocated(self) -> bool {
@@ -219,7 +214,6 @@ impl Flags {
         Ok(Flags(byte))
     }
 }
-
 
 /// The bytes a record writes ahead of its payload: its header and then its key
 ///
@@ -522,7 +516,10 @@ impl RecordHeader {
     pub fn pack_in(&self, layout: RecordLayout, payload: &[u8]) -> RecordPrefix {
         match (layout, self.is_keyless_in(layout)) {
             (RecordLayout::Keyless(check), true) => {
-                debug_assert!(check != CheckKey::default(), "a keyless record packed under no segment's key");
+                debug_assert!(
+                    check != CheckKey::default(),
+                    "a keyless record packed under no segment's key"
+                );
                 let shape = keyless_shape(self.length, self.codec);
                 let covered = if self.has_payload() { payload } else { &[] };
                 let sum = keyless_check(&check, self.key.as_ref(), self.flags, shape, covered);
@@ -595,7 +592,6 @@ pub fn peek_key_width(bytes: &[u8]) -> Option<usize> {
     }
     Some(width)
 }
-
 
 /// Round a value up to the next multiple of an alignment
 pub(crate) fn align_up(value: u64, alignment: u64) -> u64 {
@@ -675,8 +671,11 @@ impl CheckKey {
     /// A fresh key from the system's randomness
     pub fn random() -> Result<CheckKey> {
         let mut bytes = [0u8; CHECK_KEY_LEN];
-        getrandom::getrandom(&mut bytes)
-            .map_err(|error| ReelError::Io(std::io::Error::other(format!("no randomness for a check key: {error}"))))?;
+        getrandom::getrandom(&mut bytes).map_err(|error| {
+            ReelError::Io(std::io::Error::other(format!(
+                "no randomness for a check key: {error}"
+            )))
+        })?;
         Ok(CheckKey(bytes))
     }
 
@@ -702,8 +701,14 @@ impl std::fmt::Debug for CheckKey {
 ///
 /// Only the low codec bits are kept, and `pack_in` checks the codec is under them.
 fn keyless_shape(len: u32, codec: u8) -> u16 {
-    debug_assert!(fits_keyless(len), "a keyless record is past the keyless ceiling");
-    debug_assert!(u32::from(codec) < 1 << CODEC_BITS, "a keyless record's codec is past its bits");
+    debug_assert!(
+        fits_keyless(len),
+        "a keyless record is past the keyless ceiling"
+    );
+    debug_assert!(
+        u32::from(codec) < 1 << CODEC_BITS,
+        "a keyless record's codec is past its bits"
+    );
     ((len << CODEC_BITS) | u32::from(codec)) as u16
 }
 
@@ -726,7 +731,13 @@ pub fn keyless_codec(prefix: &[u8; KEYLESS_PREFIX]) -> u8 {
 /// has no row to take from: the check alone says the record is the key's. The payload
 /// goes in as its checksum, so a long payload costs the hardware checksum and the keyed
 /// hash covers a few dozen bytes whatever the record's length.
-pub fn keyless_check(check: &CheckKey, key: KeyRef<'_>, flags: Flags, shape: u16, payload: &[u8]) -> u64 {
+pub fn keyless_check(
+    check: &CheckKey,
+    key: KeyRef<'_>,
+    flags: Flags,
+    shape: u16,
+    payload: &[u8],
+) -> u64 {
     let mut fixed = [0u8; KEYLESS_FIXED];
     fixed[0] = key.column.as_u8();
     fixed[1..3].copy_from_slice(&(key.bytes.len() as u16).to_le_bytes());
@@ -756,7 +767,13 @@ pub enum KeylessRead {
 ///
 /// The payload is the stored bytes at the length the reader expects, so a record of
 /// another length fails like any other mismatch.
-pub fn check_keyless(prefix: &[u8], payload: &[u8], key: KeyRef<'_>, flags: Flags, check: &CheckKey) -> KeylessRead {
+pub fn check_keyless(
+    prefix: &[u8],
+    payload: &[u8],
+    key: KeyRef<'_>,
+    flags: Flags,
+    check: &CheckKey,
+) -> KeylessRead {
     let Some(fixed) = prefix.get(..KEYLESS_PREFIX) else {
         return KeylessRead::Unwritten;
     };
@@ -1083,14 +1100,35 @@ mod tests {
         let other = sample_key(RECORD, 0x22, 108);
         let column = sample_key(BLOB, 0x21, 108);
         let wider = sample_key(RECORD, 0x21, 109);
-        assert_eq!(check(&other, Flags::DATA, body, &SEGMENT_KEY), KeylessRead::Corrupt);
-        assert_eq!(check(&column, Flags::DATA, body, &SEGMENT_KEY), KeylessRead::Corrupt);
-        assert_eq!(check(&wider, Flags::DATA, body, &SEGMENT_KEY), KeylessRead::Corrupt);
-        assert_eq!(check(&key, Flags::TOMBSTONE, body, &SEGMENT_KEY), KeylessRead::Corrupt);
-        assert_eq!(check(&key, Flags::DATA, &body[..7], &SEGMENT_KEY), KeylessRead::Corrupt);
+        assert_eq!(
+            check(&other, Flags::DATA, body, &SEGMENT_KEY),
+            KeylessRead::Corrupt
+        );
+        assert_eq!(
+            check(&column, Flags::DATA, body, &SEGMENT_KEY),
+            KeylessRead::Corrupt
+        );
+        assert_eq!(
+            check(&wider, Flags::DATA, body, &SEGMENT_KEY),
+            KeylessRead::Corrupt
+        );
+        assert_eq!(
+            check(&key, Flags::TOMBSTONE, body, &SEGMENT_KEY),
+            KeylessRead::Corrupt
+        );
+        assert_eq!(
+            check(&key, Flags::DATA, &body[..7], &SEGMENT_KEY),
+            KeylessRead::Corrupt
+        );
         let elsewhere = CheckKey([8; CHECK_KEY_LEN]);
-        assert_eq!(check(&key, Flags::DATA, body, &elsewhere), KeylessRead::Corrupt);
-        assert_eq!(check(&key, Flags::DATA, body, &SEGMENT_KEY), KeylessRead::Intact(0));
+        assert_eq!(
+            check(&key, Flags::DATA, body, &elsewhere),
+            KeylessRead::Corrupt
+        );
+        assert_eq!(
+            check(&key, Flags::DATA, body, &SEGMENT_KEY),
+            KeylessRead::Intact(0)
+        );
     }
 
     // the version is left out, so a spot read with no footer row confirms the record alone
@@ -1098,7 +1136,10 @@ mod tests {
     fn a_keyless_check_leaves_the_version_out() {
         let key = sample_key(RECORD, 0x21, 108);
 
-        assert_eq!(keyless(&key, Lsn(40), 0, &[7u8; 8]), keyless(&key, Lsn(41), 0, &[7u8; 8]));
+        assert_eq!(
+            keyless(&key, Lsn(40), 0, &[7u8; 8]),
+            keyless(&key, Lsn(41), 0, &[7u8; 8])
+        );
     }
 
     // zeros are space nothing wrote, which a reader tells apart from rot
@@ -1106,7 +1147,13 @@ mod tests {
     fn keyless_zeros_read_as_unwritten() {
         let key = sample_key(RECORD, 0x21, 108);
 
-        let read = check_keyless(&[0u8; KEYLESS_PREFIX], &[0u8; 8], key.as_ref(), Flags::DATA, &SEGMENT_KEY);
+        let read = check_keyless(
+            &[0u8; KEYLESS_PREFIX],
+            &[0u8; 8],
+            key.as_ref(),
+            Flags::DATA,
+            &SEGMENT_KEY,
+        );
 
         assert_eq!(read, KeylessRead::Unwritten);
     }
@@ -1160,7 +1207,10 @@ mod tests {
 
         assert!(!header.is_keyless_in(LAID));
         assert_eq!(header.span_in(LAID), header.span());
-        assert_eq!(header.pack_in(LAID, &payload).as_slice(), header.pack().as_slice());
+        assert_eq!(
+            header.pack_in(LAID, &payload).as_slice(),
+            header.pack().as_slice()
+        );
         assert!(header.verify(&payload));
     }
 
@@ -1192,11 +1242,23 @@ mod tests {
         assert_eq!(header.span_in(LAID), KEYLESS_PREFIX as u64);
         let prefix = header.pack_in(LAID, &[]);
         assert_eq!(
-            check_keyless(prefix.as_slice(), &[], key.as_ref(), Flags::TOMBSTONE, &SEGMENT_KEY),
+            check_keyless(
+                prefix.as_slice(),
+                &[],
+                key.as_ref(),
+                Flags::TOMBSTONE,
+                &SEGMENT_KEY
+            ),
             KeylessRead::Intact(0)
         );
         assert_eq!(
-            check_keyless(prefix.as_slice(), &[], key.as_ref(), Flags::DATA, &SEGMENT_KEY),
+            check_keyless(
+                prefix.as_slice(),
+                &[],
+                key.as_ref(),
+                Flags::DATA,
+                &SEGMENT_KEY
+            ),
             KeylessRead::Corrupt
         );
     }

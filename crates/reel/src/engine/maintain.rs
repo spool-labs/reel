@@ -369,7 +369,11 @@ impl ReelStore {
         let mut segments = Vec::new();
         let mut taken = 0u64;
         for (segment, bytes) in self.index.segments_snapshot() {
-            if covered.contains(&segment) || shared.is_held(segment) || owed.contains(&segment) || bytes.total() == 0 {
+            if covered.contains(&segment)
+                || shared.is_held(segment)
+                || owed.contains(&segment)
+                || bytes.total() == 0
+            {
                 continue;
             }
             let Some(footer) = shared.footer_of(segment)? else {
@@ -379,7 +383,12 @@ impl ReelStore {
             segments.push(segment);
         }
         let mut runs = self.index.key_runs().runs();
-        runs.sort_by_key(|run| run.columns().iter().map(|column| column.rows()).sum::<u64>());
+        runs.sort_by_key(|run| {
+            run.columns()
+                .iter()
+                .map(|column| column.rows())
+                .sum::<u64>()
+        });
         let mut joining = Vec::new();
         for run in runs {
             let rows: u64 = run.columns().iter().map(|column| column.rows()).sum();
@@ -389,7 +398,13 @@ impl ReelStore {
             taken += rows;
             joining.push(run);
         }
-        let merged = merge_into_key_run(&self.compactor, &self.reel, &self.index, &segments, &joining)?;
+        let merged = merge_into_key_run(
+            &self.compactor,
+            &self.reel,
+            &self.index,
+            &segments,
+            &joining,
+        )?;
         if merged.runs_merged == 0 {
             return Ok(None);
         }
@@ -443,7 +458,9 @@ impl ReelStore {
             let passed = self.run_passes();
             running.store(false, Ordering::Release);
             keeper.thread().unpark();
-            let kept = keeper.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let kept = keeper
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             passed.and(kept)
         })
     }
@@ -470,14 +487,18 @@ impl ReelStore {
             let workers: Vec<_> = (1..passes)
                 .map(|_| {
                     scope.spawn(|| -> Result<()> {
-                        while self.compact_once()? == CompactPass::Copied && merging.load(Ordering::Acquire) {}
+                        while self.compact_once()? == CompactPass::Copied
+                            && merging.load(Ordering::Acquire)
+                        {}
                         Ok(())
                     })
                 })
                 .collect();
-            workers
-                .into_iter()
-                .try_for_each(|worker| worker.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+            workers.into_iter().try_for_each(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
         })
     }
 

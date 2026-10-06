@@ -24,8 +24,8 @@ use std::thread::Thread;
 use std::time::Instant;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IoBackend, KeyWidth, RecordKey,
-    ReelConfig, ReelStore, SyncPolicy, ThreadBudget, MAP_EVERYTHING,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IoBackend, KeyWidth, RecordKey, ReelConfig,
+    ReelStore, SyncPolicy, ThreadBudget, MAP_EVERYTHING,
 };
 
 const ACCOUNTS_CF: ColumnId = ColumnId(1);

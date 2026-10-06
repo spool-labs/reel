@@ -19,8 +19,8 @@ use rand::{Rng, SeedableRng};
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth,
-    ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, ReelConfig,
+    ReelStore, SyncPolicy, ThreadBudget,
 };
 use reel_core::{Direction, Store};
 
@@ -65,7 +65,9 @@ impl Shape {
             Shape::Fixed => key_of(n),
             Shape::Variable => {
                 let stem = n / STEM as u64;
-                let mut key: Vec<u8> = (0..3).flat_map(|word| mix(stem * 3 + word).to_be_bytes()).collect();
+                let mut key: Vec<u8> = (0..3)
+                    .flat_map(|word| mix(stem * 3 + word).to_be_bytes())
+                    .collect();
                 // Zeros inside a key sort it past the shorter key a zero fill would make it equal.
                 key[3] = 0;
                 key[9] = 0;
@@ -164,14 +166,19 @@ fn config(rng: &mut SmallRng) -> ReelConfig {
 /// The first place two walks part, as the keys on each side, or nothing when they agree
 fn parting(got: &[(Vec<u8>, Vec<u8>)], want: &[(Vec<u8>, Vec<u8>)]) -> Option<String> {
     let at = (0..got.len().max(want.len())).find(|&at| got.get(at) != want.get(at))?;
-    let side = |rows: &[(Vec<u8>, Vec<u8>)]| rows.get(at).map(|(key, value)| (key.clone(), value.get(..16).map(<[u8]>::to_vec)));
+    let side = |rows: &[(Vec<u8>, Vec<u8>)]| {
+        rows.get(at)
+            .map(|(key, value)| (key.clone(), value.get(..16).map(<[u8]>::to_vec)))
+    };
     Some(format!(
         "row {at} of {} got and {} wanted: got {:02x?}, want {:02x?}, the row before {:02x?}",
         got.len(),
         want.len(),
         side(got),
         side(want),
-        at.checked_sub(1).and_then(|before| want.get(before)).map(|(key, _)| key),
+        at.checked_sub(1)
+            .and_then(|before| want.get(before))
+            .map(|(key, _)| key),
     ))
 }
 
@@ -187,7 +194,11 @@ fn pairs(walk: impl Iterator<Item = (Vec<u8>, reel_core::Value)>) -> Vec<(Vec<u8
     walk.map(|(key, value)| (key, value.to_vec())).collect()
 }
 
-fn expect(model: &Model, range: (Bound<&[u8]>, Bound<&[u8]>), down: bool) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn expect(
+    model: &Model,
+    range: (Bound<&[u8]>, Bound<&[u8]>),
+    down: bool,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     let run = model
         .range::<[u8], _>(range)
         .map(|(key, value)| (key.clone(), value.clone()));
@@ -198,13 +209,24 @@ fn expect(model: &Model, range: (Bound<&[u8]>, Bound<&[u8]>), down: bool) -> Vec
 }
 
 /// Every walk shape against the model
-fn check(store: &ReelStore, model: &Model, shape: Shape, rng: &mut SmallRng, seed: u64, stage: &str) {
+fn check(
+    store: &ReelStore,
+    model: &Model,
+    shape: Shape,
+    rng: &mut SmallRng,
+    seed: u64,
+    stage: &str,
+) {
     let whole = pairs(Store::iter(store, "rows").expect("iter"));
     let wanted = expect(model, (Bound::Unbounded, Bound::Unbounded), false);
     assert_walk!(whole, wanted, "seed {seed} {stage}: whole walk up");
     let top = shape.top();
     let down = pairs(Store::iter_from(store, "rows", &top, Direction::Desc).expect("iter from"));
-    assert_walk!(down, expect(model, (Bound::Unbounded, Bound::Unbounded), true), "seed {seed} {stage}: whole walk down");
+    assert_walk!(
+        down,
+        expect(model, (Bound::Unbounded, Bound::Unbounded), true),
+        "seed {seed} {stage}: whole walk down"
+    );
 
     for _ in 0..12 {
         let bound = shape.bound(rng);
@@ -212,7 +234,8 @@ fn check(store: &ReelStore, model: &Model, shape: Shape, rng: &mut SmallRng, see
         let want = expect(model, (Bound::Included(&bound), Bound::Unbounded), false);
         assert_walk!(up, want, "seed {seed} {stage}: up from {bound:02x?}");
 
-        let down = pairs(Store::iter_from(store, "rows", &bound, Direction::Desc).expect("iter from"));
+        let down =
+            pairs(Store::iter_from(store, "rows", &bound, Direction::Desc).expect("iter from"));
         let want = expect(model, (Bound::Unbounded, Bound::Included(&bound)), true);
         assert_walk!(down, want, "seed {seed} {stage}: down from {bound:02x?}");
 
@@ -224,8 +247,16 @@ fn check(store: &ReelStore, model: &Model, shape: Shape, rng: &mut SmallRng, see
             }
         };
         let range = pairs(Store::iter_range(store, "rows", &low, &high).expect("iter range"));
-        let want = expect(model, (Bound::Included(&low), Bound::Excluded(&high)), false);
-        assert_walk!(range, want, "seed {seed} {stage}: range {low:02x?}..{high:02x?}");
+        let want = expect(
+            model,
+            (Bound::Included(&low), Bound::Excluded(&high)),
+            false,
+        );
+        assert_walk!(
+            range,
+            want,
+            "seed {seed} {stage}: range {low:02x?}..{high:02x?}"
+        );
 
         let prefix = &bound[..rng.gen_range(1..=bound.len().min(2))];
         let prefixed = pairs(Store::iter_prefix(store, "rows", prefix).expect("iter prefix"));
@@ -258,11 +289,16 @@ fn check(store: &ReelStore, model: &Model, shape: Shape, rng: &mut SmallRng, see
             };
             short.push((key.to_vec(), value.to_vec()));
         }
-        let want: Vec<(Vec<u8>, Vec<u8>)> = expect(model, (Bound::Included(&bound), Bound::Unbounded), false)
-            .into_iter()
-            .take(hint)
-            .collect();
-        assert_walk!(short, want, "seed {seed} {stage}: {hint} rows up from {bound:02x?}");
+        let want: Vec<(Vec<u8>, Vec<u8>)> =
+            expect(model, (Bound::Included(&bound), Bound::Unbounded), false)
+                .into_iter()
+                .take(hint)
+                .collect();
+        assert_walk!(
+            short,
+            want,
+            "seed {seed} {stage}: {hint} rows up from {bound:02x?}"
+        );
     }
 }
 
@@ -271,7 +307,8 @@ fn run(seed: u64, shape: Shape) {
     let mut rng = SmallRng::seed_from_u64(seed);
     let dir = TempDir::new().expect("temp dir");
     let config = config(&mut rng);
-    let mut store = ReelStore::open(dir.path().to_path_buf(), config.clone(), columns).expect("open");
+    let mut store =
+        ReelStore::open(dir.path().to_path_buf(), config.clone(), columns).expect("open");
     let mut model = Model::new();
     let ops = knob("REEL_PWM_OPS", 3000);
 
@@ -296,7 +333,10 @@ fn run(seed: u64, shape: Shape) {
                 if high > low {
                     Store::delete_range(&store, "rows", &low, &high).expect("delete range");
                     let gone: Vec<Vec<u8>> = model
-                        .range::<[u8], _>((Bound::Included(low.as_slice()), Bound::Excluded(high.as_slice())))
+                        .range::<[u8], _>((
+                            Bound::Included(low.as_slice()),
+                            Bound::Excluded(high.as_slice()),
+                        ))
                         .map(|(key, _)| key.clone())
                         .collect();
                     for key in gone {
@@ -314,8 +354,16 @@ fn run(seed: u64, shape: Shape) {
         if op % 1400 == 0 {
             store.close().expect("close");
             drop(store);
-            store = ReelStore::open(dir.path().to_path_buf(), config.clone(), columns).expect("reopen");
-            check(&store, &model, shape, &mut rng, seed, &format!("reopen at op {op}"));
+            store =
+                ReelStore::open(dir.path().to_path_buf(), config.clone(), columns).expect("reopen");
+            check(
+                &store,
+                &model,
+                shape,
+                &mut rng,
+                seed,
+                &format!("reopen at op {op}"),
+            );
         }
     }
 
@@ -324,7 +372,6 @@ fn run(seed: u64, shape: Shape) {
     }
     check(&store, &model, shape, &mut rng, seed, "settled");
     println!("seed {seed} {shape:?}: {} keys held", model.len());
-
 
     store.close().expect("close");
     drop(store);

@@ -11,9 +11,7 @@ use tempfile::TempDir;
 
 use reel::config::{IoBackend, Preallocate, ReelConfig, SyncPolicy};
 use reel::sync::tension::block_on;
-use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelStore,
-};
+use reel::{ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelStore};
 use reel_core::{Direction, Store};
 
 /// Bytes the group takes at the front of a record key

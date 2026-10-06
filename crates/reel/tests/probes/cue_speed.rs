@@ -10,8 +10,8 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSpec, IndexResidency, KeyWidth, RecordKey,
-    ReelConfig, ReelStore, SyncPolicy, ThreadBudget, MAP_EVERYTHING,
+    ByteCount, Codec, ColumnId, ColumnSpec, IndexResidency, KeyWidth, RecordKey, ReelConfig,
+    ReelStore, SyncPolicy, ThreadBudget, MAP_EVERYTHING,
 };
 
 const RECORDS: ColumnId = ColumnId(1);

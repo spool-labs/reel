@@ -10,8 +10,7 @@ mod harness;
 
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::{
-    ByteCount, FenceResidency, IndexResidency, Preallocate, ReelConfig, SyncPolicy,
-    ThreadBudget,
+    ByteCount, FenceResidency, IndexResidency, Preallocate, ReelConfig, SyncPolicy, ThreadBudget,
 };
 
 use harness::fixture::Differential;

@@ -40,10 +40,10 @@ use crate::reel::bias::MachineFacts;
 use crate::reel::cue::CuePoints;
 
 use crate::compaction::pressure::PassPlane;
-use crate::index::spot::RecordSource;
 use crate::index::paged::FooterSource;
 use crate::index::persisted::{admits, PersistedReader};
 use crate::index::recovery::rebuild_from_persisted;
+use crate::index::spot::RecordSource;
 use crate::index::tailer::LogCursor;
 use crate::io::select::select_backend;
 use crate::io::ReelIo;
@@ -431,7 +431,9 @@ impl ReelStore {
             // A journal outlives its segment's seal only when a crash lands between the
             // two, and a resume a crash cut short leaves its part file.
             for root in &roots {
-                if let Err(error) = crate::index::recovery::remove_stale_journals(&driver, root, &rebuilt.consumed) {
+                if let Err(error) =
+                    crate::index::recovery::remove_stale_journals(&driver, root, &rebuilt.consumed)
+                {
                     tracing::warn!(root = %root.display(), "failed to remove stale journals: {error}");
                 }
             }
@@ -471,7 +473,9 @@ impl ReelStore {
         // A resident volume loads the runs a paged opening wrote too, since a delete
         // stands while a run holds an older row of its key.
         if !is_read_only {
-            index.key_runs().load(&shared.driver, &shared.volumes.roots()[0])?;
+            index
+                .key_runs()
+                .load(&shared.driver, &shared.volumes.roots()[0])?;
         }
 
         // Nothing is waiting to be handed over: the only keys a rebuild leaves

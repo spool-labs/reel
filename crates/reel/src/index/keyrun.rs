@@ -233,7 +233,9 @@ impl KeyRun {
             Some(map) => Backing::Mapped(map),
             None => {
                 let file = driver.open(path, false)?;
-                let read = driver.length(file).and_then(|len| driver.pread(file, 0, len));
+                let read = driver
+                    .length(file)
+                    .and_then(|len| driver.pread(file, 0, len));
                 let _ = driver.close(file);
                 Backing::Read(read?)
             }
@@ -280,23 +282,34 @@ impl KeyRun {
                 return Err(corrupt("a column's rows do not fill its stride"));
             }
             let table = match is_varying {
-                true => rows.checked_mul(8).ok_or_else(|| corrupt("a column too long to hold"))?,
+                true => rows
+                    .checked_mul(8)
+                    .ok_or_else(|| corrupt("a column too long to hold"))?,
                 false => 0,
             };
-            span(rows_at, rows_len.checked_add(table).ok_or_else(|| corrupt("a column too long to hold"))?)?;
+            span(
+                rows_at,
+                rows_len
+                    .checked_add(table)
+                    .ok_or_else(|| corrupt("a column too long to hold"))?,
+            )?;
             // Each block's lead and then the last key, each its length and its bytes.
             let blocks = rows.div_ceil(u64::from(block_rows));
             let mut fences = Vec::new();
             let mut fence_at = Vec::with_capacity(blocks as usize + 1);
             let mut at = fences_at;
             for _ in 0..blocks {
-                let len = u64::from(u16::from_le_bytes(span(at, 2)?.try_into().unwrap_or_default()));
+                let len = u64::from(u16::from_le_bytes(
+                    span(at, 2)?.try_into().unwrap_or_default(),
+                ));
                 fence_at.push(fences.len() as u32);
                 fences.extend_from_slice(span(at + 2, len)?);
                 at += 2 + len;
             }
             fence_at.push(fences.len() as u32);
-            let len = u64::from(u16::from_le_bytes(span(at, 2)?.try_into().unwrap_or_default()));
+            let len = u64::from(u16::from_le_bytes(
+                span(at, 2)?.try_into().unwrap_or_default(),
+            ));
             let last = span(at + 2, len)?.to_vec();
             columns.push(RunColumn {
                 column: ColumnId(row[0]),
@@ -312,7 +325,11 @@ impl KeyRun {
         }
         let covered_at = column_count * DIRECTORY_ROW;
         let covered = (0..covered_count)
-            .map(|at| SegmentId(read_u32_le(&directory[covered_at + at * 4..covered_at + at * 4 + 4])))
+            .map(|at| {
+                SegmentId(read_u32_le(
+                    &directory[covered_at + at * 4..covered_at + at * 4 + 4],
+                ))
+            })
             .collect();
         Ok(KeyRun {
             id,
@@ -436,7 +453,8 @@ impl KeyRunSet {
             }
             let at = run.seek(held, key, false);
             at < held.rows()
-                && row_in(run.rows(held), held, at as usize).is_ok_and(|(found, row)| found == key && row.lsn < lsn)
+                && row_in(run.rows(held), held, at as usize)
+                    .is_ok_and(|(found, row)| found == key && row.lsn < lsn)
         })
     }
 
@@ -459,7 +477,11 @@ impl KeyRunSet {
         });
         held.runs.push(run);
         held.runs.sort_by_key(|kept| kept.id);
-        held.covered = held.runs.iter().flat_map(|kept| kept.covered.iter().copied()).collect();
+        held.covered = held
+            .runs
+            .iter()
+            .flat_map(|kept| kept.covered.iter().copied())
+            .collect();
         self.generation.fetch_add(1, Ordering::AcqRel);
         retired
     }
@@ -491,7 +513,11 @@ impl KeyRunSet {
         runs.sort_by_key(|run| run.id);
         let mut kept: Vec<KeyRun> = Vec::new();
         while let Some(run) = runs.pop() {
-            let is_within = kept.iter().any(|newer| run.covered.iter().all(|segment| newer.covered.contains(segment)));
+            let is_within = kept.iter().any(|newer| {
+                run.covered
+                    .iter()
+                    .all(|segment| newer.covered.contains(segment))
+            });
             match is_within {
                 true => run.retire(),
                 false => kept.push(run),
@@ -502,7 +528,6 @@ impl KeyRunSet {
         }
         Ok(())
     }
-
 }
 
 /// Where one row's key starts in a column's rows, and how long it is
@@ -520,7 +545,9 @@ fn key_span(rows: &[u8], column: &RunColumn, at: usize) -> Option<(usize, usize)
 pub fn row_in<'a>(rows: &'a [u8], column: &RunColumn, at: usize) -> Result<(&'a [u8], RunRow)> {
     let corrupt = || ReelError::Corruption("key run row is past its column".to_string());
     let (start, width) = key_span(rows, column, at).ok_or_else(corrupt)?;
-    let row = rows.get(start..start + width + ROW_TAIL).ok_or_else(corrupt)?;
+    let row = rows
+        .get(start..start + width + ROW_TAIL)
+        .ok_or_else(corrupt)?;
     let tail = &row[width..];
     Ok((
         &row[..width],
@@ -606,8 +633,14 @@ impl<'d> RunWriter<'d> {
     ///
     /// A key width of VARYING_WIDTH takes keys of any width, each row saying its own.
     pub fn begin_column(&mut self, column: ColumnId, key_width: u16) -> Result<()> {
-        if self.columns.last().is_some_and(|held| held.column >= column) {
-            return Err(ReelError::Rejected("a key run's columns arrived out of order".to_string()));
+        if self
+            .columns
+            .last()
+            .is_some_and(|held| held.column >= column)
+        {
+            return Err(ReelError::Rejected(
+                "a key run's columns arrived out of order".to_string(),
+            ));
         }
         self.end_column()?;
         let block_rows = match key_width == VARYING_WIDTH {
@@ -644,19 +677,22 @@ impl<'d> RunWriter<'d> {
 
     /// Add one row to the open column, at a key above the last one it took
     pub fn push(&mut self, key: &[u8], row: RunRow) -> Result<()> {
-        let building = self
-            .columns
-            .last_mut()
-            .ok_or_else(|| ReelError::Rejected("a key run row came before any column".to_string()))?;
+        let building = self.columns.last_mut().ok_or_else(|| {
+            ReelError::Rejected("a key run row came before any column".to_string())
+        })?;
         let width = u16::try_from(key.len())
             .ok()
             .filter(|width| *width != VARYING_WIDTH)
             .ok_or_else(|| ReelError::Rejected("a key run row's key is too wide".to_string()))?;
         if !building.is_varying() && width != building.key_width {
-            return Err(ReelError::Rejected("a key run row is not its column's width".to_string()));
+            return Err(ReelError::Rejected(
+                "a key run row is not its column's width".to_string(),
+            ));
         }
         if building.rows > 0 && key <= building.last.as_slice() {
-            return Err(ReelError::Rejected("a key run's rows arrived out of order".to_string()));
+            return Err(ReelError::Rejected(
+                "a key run's rows arrived out of order".to_string(),
+            ));
         }
         if building.rows.is_multiple_of(u64::from(building.block_rows)) {
             building.fences.extend_from_slice(&width.to_le_bytes());
@@ -673,8 +709,10 @@ impl<'d> RunWriter<'d> {
         building.rows_len += (key.len() + ROW_TAIL) as u64;
         self.pending.extend_from_slice(key);
         self.pending.extend_from_slice(&row.lsn.pack());
-        self.pending.extend_from_slice(&row.loc.segment.as_u32().to_le_bytes());
-        self.pending.extend_from_slice(&row.loc.offset.to_le_bytes());
+        self.pending
+            .extend_from_slice(&row.loc.segment.as_u32().to_le_bytes());
+        self.pending
+            .extend_from_slice(&row.loc.offset.to_le_bytes());
         self.pending.extend_from_slice(&row.loc.len.to_le_bytes());
         self.pending.push(row.flags.bits());
         if self.pending.len() >= WRITE_BYTES {
@@ -694,7 +732,8 @@ impl<'d> RunWriter<'d> {
         }
         let bytes = std::mem::replace(&mut self.pending, Vec::with_capacity(WRITE_BYTES));
         let len = bytes.len() as u64;
-        self.driver.writev_all(self.file, self.at, vec![WriteBuf::owned(bytes)])?;
+        self.driver
+            .writev_all(self.file, self.at, vec![WriteBuf::owned(bytes)])?;
         self.at += len;
         Ok(())
     }
@@ -728,7 +767,8 @@ impl<'d> RunWriter<'d> {
         tail.extend_from_slice(&(self.columns.len() as u32).to_le_bytes());
         tail.extend_from_slice(&(covered.len() as u32).to_le_bytes());
         tail.extend_from_slice(&MAGIC.to_le_bytes());
-        self.driver.writev_all(self.file, self.at, vec![WriteBuf::owned(tail)])?;
+        self.driver
+            .writev_all(self.file, self.at, vec![WriteBuf::owned(tail)])?;
         self.driver.sync_full(self.file)?;
         self.driver.close(self.file)?;
         self.driver.rename(&self.temp, &self.path)?;
@@ -783,7 +823,9 @@ mod tests {
         }
         writer.begin_column(ColumnId(2), 8).expect("second column");
         writer.push(&key(1), row(1)).expect("push");
-        let path = writer.finish(&[SegmentId(4), SegmentId(9)]).expect("finish");
+        let path = writer
+            .finish(&[SegmentId(4), SegmentId(9)])
+            .expect("finish");
 
         let run = KeyRun::open(&driver, &path, 3).expect("open");
         assert_eq!(run.covered, vec![SegmentId(4), SegmentId(9)]);
@@ -795,7 +837,10 @@ mod tests {
             assert_eq!(got, want.as_slice());
             assert_eq!(got_row, row(*n));
         }
-        assert!(row_in(rows, column, keys.len()).is_err(), "a row past the column read back");
+        assert!(
+            row_in(rows, column, keys.len()).is_err(),
+            "a row past the column read back"
+        );
         assert_eq!(run.column(ColumnId(2)).expect("column two").rows(), 1);
     }
 
@@ -815,8 +860,14 @@ mod tests {
         let column = run.column(ColumnId(1)).expect("column");
         for probe in [0u64, 1, 2, 1_001, 4_000, 9_998, 9_999, 20_000] {
             let target = probe.to_be_bytes();
-            let at = keys.iter().position(|key| key >= &target).unwrap_or(keys.len()) as u64;
-            let past = keys.iter().position(|key| key > &target).unwrap_or(keys.len()) as u64;
+            let at = keys
+                .iter()
+                .position(|key| key >= &target)
+                .unwrap_or(keys.len()) as u64;
+            let past = keys
+                .iter()
+                .position(|key| key > &target)
+                .unwrap_or(keys.len()) as u64;
             assert_eq!(run.seek(column, &target, false), at, "probe {probe} at");
             assert_eq!(run.seek(column, &target, true), past, "probe {probe} past");
         }
@@ -827,13 +878,17 @@ mod tests {
     fn a_varying_column_reads_back_and_seeks() {
         let sim = SimIo::new(FaultPlan::new(1));
         let driver = driver(&sim);
-        let mut keys: Vec<Vec<u8>> = (0..3_000u32).map(|n| format!("k{}", n * 7).into_bytes()).collect();
+        let mut keys: Vec<Vec<u8>> = (0..3_000u32)
+            .map(|n| format!("k{}", n * 7).into_bytes())
+            .collect();
         keys.sort();
         keys.dedup();
         let mut writer = RunWriter::create(&driver, Path::new(ROOT), 5).expect("create");
         writer.begin_column(ColumnId(1), 8).expect("fixed column");
         writer.push(&key(1), row(1)).expect("push");
-        writer.begin_column(ColumnId(2), VARYING_WIDTH).expect("varying column");
+        writer
+            .begin_column(ColumnId(2), VARYING_WIDTH)
+            .expect("varying column");
         for (n, key) in keys.iter().enumerate() {
             writer.push(key, row(n as u32)).expect("push");
         }
@@ -849,10 +904,27 @@ mod tests {
             assert_eq!(key_in(rows, column, at), want.as_slice());
             assert_eq!(got_row, row(at as u32));
         }
-        assert_eq!(column.key_range().map(|(low, high)| (low.to_vec(), high.to_vec())), Some((keys[0].clone(), keys[keys.len() - 1].clone())));
-        for probe in [b"k".to_vec(), b"k0".to_vec(), b"k10".to_vec(), b"k5000".to_vec(), b"z".to_vec()] {
-            let at = keys.iter().position(|key| key >= &probe).unwrap_or(keys.len()) as u64;
-            let past = keys.iter().position(|key| key > &probe).unwrap_or(keys.len()) as u64;
+        assert_eq!(
+            column
+                .key_range()
+                .map(|(low, high)| (low.to_vec(), high.to_vec())),
+            Some((keys[0].clone(), keys[keys.len() - 1].clone()))
+        );
+        for probe in [
+            b"k".to_vec(),
+            b"k0".to_vec(),
+            b"k10".to_vec(),
+            b"k5000".to_vec(),
+            b"z".to_vec(),
+        ] {
+            let at = keys
+                .iter()
+                .position(|key| key >= &probe)
+                .unwrap_or(keys.len()) as u64;
+            let past = keys
+                .iter()
+                .position(|key| key > &probe)
+                .unwrap_or(keys.len()) as u64;
             assert_eq!(run.seek(column, &probe, false), at, "probe {probe:?} at");
             assert_eq!(run.seek(column, &probe, true), past, "probe {probe:?} past");
         }

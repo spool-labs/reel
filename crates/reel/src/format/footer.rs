@@ -1441,7 +1441,11 @@ mod tests {
         let first = entry(RECORD, 3, 22, 3, 36, 64);
         next.push(&first);
         next.push(&entry(RECORD, 4, 9, 4, 136, 64));
-        assert_eq!(collect(&next).first(), Some(&first), "the first row of the next segment went missing");
+        assert_eq!(
+            collect(&next).first(),
+            Some(&first),
+            "the first row of the next segment went missing"
+        );
         assert_eq!(next.entry_count(), 2);
     }
 
@@ -1513,7 +1517,13 @@ mod tests {
                 bytes[34..].copy_from_slice(&[(row as u8) ^ 0x5a; 14]);
                 let key = RecordKey::from_bytes(RECORD, &bytes).expect("key");
                 let at = u32::from(owner) * 1000 + u32::from(row);
-                entries.push(FooterEntry::new(key, Lsn(u64::from(at) + 1), at * 100, 64, Flags::DATA));
+                entries.push(FooterEntry::new(
+                    key,
+                    Lsn(u64::from(at) + 1),
+                    at * 100,
+                    64,
+                    Flags::DATA,
+                ));
             }
         }
         entries
@@ -1526,7 +1536,11 @@ mod tests {
         let strided = rows.len() * (48 + ENTRY_TAIL_LEN);
         let mut footer = SegmentFooter::build(rows);
         let packed = footer.pack(0).expect("pack");
-        assert!(packed.len() < strided * 3 / 4, "{} bytes against {strided} strided", packed.len());
+        assert!(
+            packed.len() < strided * 3 / 4,
+            "{} bytes against {strided} strided",
+            packed.len()
+        );
 
         let parsed = SegmentFooter::parse(&packed).expect("parse");
         let partition = parsed.partition(RECORD).expect("partition");
@@ -1544,7 +1558,11 @@ mod tests {
         let mut footer = SegmentFooter::build(rows);
         let packed = footer.pack(0).expect("pack");
         assert!(footer.partition(RECORD).expect("partition").is_packed());
-        assert!(packed.len() < strided, "{} bytes against {strided} strided", packed.len());
+        assert!(
+            packed.len() < strided,
+            "{} bytes against {strided} strided",
+            packed.len()
+        );
         let parsed = SegmentFooter::parse(&packed).expect("parse");
         assert_eq!(parsed, footer);
     }

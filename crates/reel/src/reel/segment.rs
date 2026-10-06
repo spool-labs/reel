@@ -531,7 +531,10 @@ impl IoDriver {
     pub fn warm_only(&self, file: FileId, offset: u64, len: usize) -> Option<Vec<u8>> {
         let mut bytes = ReadBuf::new(len);
         let mut nothing = ReadBuf::new(0);
-        match self.backend.warm_split(file, offset, &mut bytes, &mut nothing) {
+        match self
+            .backend
+            .warm_split(file, offset, &mut bytes, &mut nothing)
+        {
             true => Some(bytes.into_vec()),
             false => None,
         }
@@ -1178,7 +1181,13 @@ pub struct SegmentHandle {
 
 impl SegmentHandle {
     /// A handle to an open segment file whose records lie in this layout
-    pub fn new(id: SegmentId, path: PathBuf, file: FileId, driver: Arc<IoDriver>, layout: RecordLayout) -> SegmentHandle {
+    pub fn new(
+        id: SegmentId,
+        path: PathBuf,
+        file: FileId,
+        driver: Arc<IoDriver>,
+        layout: RecordLayout,
+    ) -> SegmentHandle {
         SegmentHandle {
             inner: Arc::new(SegmentInner {
                 id,
@@ -1197,8 +1206,14 @@ impl SegmentHandle {
     ///
     /// A file that opens with no readable segment header frames its records keyed, so its
     /// keyless records fail their reads as unreadable and are never served wrong.
-    pub fn opened(id: SegmentId, path: PathBuf, file: FileId, driver: Arc<IoDriver>) -> Result<SegmentHandle> {
-        let layout = read_segment_header(&driver, file)?.map_or(RecordLayout::Keyed, |header| header.layout);
+    pub fn opened(
+        id: SegmentId,
+        path: PathBuf,
+        file: FileId,
+        driver: Arc<IoDriver>,
+    ) -> Result<SegmentHandle> {
+        let layout =
+            read_segment_header(&driver, file)?.map_or(RecordLayout::Keyed, |header| header.layout);
         Ok(SegmentHandle::new(id, path, file, driver, layout))
     }
 
@@ -1209,7 +1224,13 @@ impl SegmentHandle {
 
     /// A never-doomed stand-in a tail holds until it opens its first real segment
     pub fn placeholder(driver: Arc<IoDriver>) -> SegmentHandle {
-        SegmentHandle::new(SegmentId(0), PathBuf::new(), NO_FILE, driver, RecordLayout::Keyed)
+        SegmentHandle::new(
+            SegmentId(0),
+            PathBuf::new(),
+            NO_FILE,
+            driver,
+            RecordLayout::Keyed,
+        )
     }
 
     /// Segment number this handle refers to
@@ -1544,7 +1565,13 @@ mod tests {
         let path = dir.join("000001.reel");
         let file = open(&driver, &path);
 
-        let handle = SegmentHandle::new(SegmentId(1), path.clone(), file, Arc::clone(&driver), RecordLayout::Keyed);
+        let handle = SegmentHandle::new(
+            SegmentId(1),
+            path.clone(),
+            file,
+            Arc::clone(&driver),
+            RecordLayout::Keyed,
+        );
         let reader = handle.clone();
         handle.mark_doomed();
 
@@ -1563,7 +1590,13 @@ mod tests {
         let dir = Path::new("/reel");
         let path = dir.join("000009.reel");
         let file = open(&driver, &path);
-        let handle = SegmentHandle::new(SegmentId(9), path, file, Arc::clone(&driver), RecordLayout::Keyed);
+        let handle = SegmentHandle::new(
+            SegmentId(9),
+            path,
+            file,
+            Arc::clone(&driver),
+            RecordLayout::Keyed,
+        );
 
         let cache = FdCache::new(4);
         cache.insert(handle.clone());
@@ -1597,7 +1630,13 @@ mod tests {
         let path = dir.join("000002.reel");
         let file = open(&driver, &path);
 
-        let handle = SegmentHandle::new(SegmentId(2), path, file, Arc::clone(&driver), RecordLayout::Keyed);
+        let handle = SegmentHandle::new(
+            SegmentId(2),
+            path,
+            file,
+            Arc::clone(&driver),
+            RecordLayout::Keyed,
+        );
         assert_eq!(handle.reference_count(), 1);
 
         drop(handle);

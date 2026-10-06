@@ -16,8 +16,7 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use reel::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelConfig, ReelStore,
-    SyncPolicy,
+    Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelConfig, ReelStore, SyncPolicy,
 };
 
 const RECORDS: ColumnId = ColumnId(1);

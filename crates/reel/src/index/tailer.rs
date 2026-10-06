@@ -10,12 +10,14 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::Result;
+use crate::format::journal::read_groups;
 use crate::format::loc::SegmentId;
 use crate::format::lsn::Lsn;
 use crate::index::entry::RangeCover;
 use crate::index::map::ReelIndex;
-use crate::format::journal::read_groups;
-use crate::index::recovery::{footer_records, journal_records, read_footer, read_journal, WalkedRecord, SEALED};
+use crate::index::recovery::{
+    footer_records, journal_records, read_footer, read_journal, WalkedRecord, SEALED,
+};
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
 use crate::io::op::FileId;
 use crate::reel::segment::IoDriver;
@@ -270,9 +272,7 @@ fn apply_one(index: &ReelIndex, cursor: &mut LogCursor, record: &WalkedRecord) -
 mod tests {
     use super::*;
 
-    use crate::format::column::{
-        Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey,
-    };
+    use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey};
     use crate::format::loc::Loc;
     use crate::format::record::Flags;
 

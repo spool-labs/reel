@@ -9,8 +9,8 @@
 use tempfile::TempDir;
 
 use reel::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, RecordKey,
-    RecordWrite, ReelConfig, ReelStore, SyncPolicy, INLINE_KEY_LEN, MAX_KEY_LEN,
+    Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, RecordKey, RecordWrite,
+    ReelConfig, ReelStore, SyncPolicy, INLINE_KEY_LEN, MAX_KEY_LEN,
 };
 
 /// The column these fixtures write into, taking a key of any width

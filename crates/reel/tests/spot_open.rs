@@ -61,7 +61,10 @@ fn resident_kib() -> u64 {
         .args(["-o", "rss=", "-p", &pid])
         .output()
         .expect("ps");
-    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
 }
 
 // a paged open loads the spot index a footer at a time, and every key reads back
@@ -113,6 +116,9 @@ fn a_paged_open_loads_the_spot_index_in_bounded_memory() {
         store.index().spot_held(),
     );
     for at in (0..keys).step_by((keys / 1000).max(1) as usize) {
-        assert!(store.get(&key(at)).expect("get").is_some(), "key {at} went missing");
+        assert!(
+            store.get(&key(at)).expect("get").is_some(),
+            "key {at} went missing"
+        );
     }
 }

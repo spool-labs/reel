@@ -46,8 +46,8 @@ use tempfile::TempDir;
 
 use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, FenceResidency,
-    IndexResidency, KeyWidth, MergeReport, Preallocate, ProbeCounts, RecordKey,
-    ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    IndexResidency, KeyWidth, MergeReport, Preallocate, ProbeCounts, RecordKey, ReelConfig,
+    ReelStore, SyncPolicy, ThreadBudget,
 };
 
 /// The one column the workload writes
@@ -208,7 +208,6 @@ struct Knobs {
 
     /// Dead fraction at which a sealed segment is rewritten
     compact_dead_ratio: f64,
-
 }
 
 /// A number from the environment, or the fallback
@@ -736,12 +735,7 @@ fn write_round(
 /// Drive the whole workload against one volume and say what it cost
 fn run_cell(arm: &Arm, knobs: &Knobs, root: &Path) -> Cell {
     std::fs::create_dir_all(root).expect("cell root");
-    let store = ReelStore::open(
-        root.to_path_buf(),
-        config(arm, knobs),
-        COLUMNS,
-    )
-    .expect("open");
+    let store = ReelStore::open(root.to_path_buf(), config(arm, knobs), COLUMNS).expect("open");
 
     let population = Population {
         hot: knobs.hot,
@@ -923,7 +917,11 @@ fn composed_posture() {
         let cell = run_cell(arm, &knobs, &root.join(arm.name));
 
         assert!(cell.written > 0, "{} wrote nothing", arm.name);
-        assert_eq!(cell.misses, 0, "{} lost keys the stream had written", arm.name);
+        assert_eq!(
+            cell.misses, 0,
+            "{} lost keys the stream had written",
+            arm.name
+        );
         assert!(cell.live > 0, "{} ended holding no live bytes", arm.name);
         assert!(cell.on_disk > 0, "{} left nothing on disk", arm.name);
 

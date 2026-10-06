@@ -8,7 +8,6 @@
 pub mod column;
 pub mod counters;
 pub mod entry;
-pub mod spot;
 pub mod keyrun;
 pub mod lockfile;
 pub mod map;
@@ -17,5 +16,6 @@ pub mod paged;
 pub mod persisted;
 pub mod playback;
 pub mod recovery;
+pub mod spot;
 pub mod tailer;
 pub mod tbtreemap;

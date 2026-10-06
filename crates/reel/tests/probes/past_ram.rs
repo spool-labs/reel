@@ -20,8 +20,8 @@ use rand::{thread_rng, Rng};
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactRate, IoBackend, KeyWidth,
-    RecordKey, ReelConfig, ReelStore, SyncPolicy,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactRate, IoBackend, KeyWidth, RecordKey,
+    ReelConfig, ReelStore, SyncPolicy,
 };
 
 /// Bytes the group takes at the front of a record key

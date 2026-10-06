@@ -26,8 +26,8 @@ use rand::{Rng, SeedableRng};
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth,
-    ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, ReelConfig,
+    ReelStore, SyncPolicy, ThreadBudget,
 };
 use reel_core::{Direction, Store};
 
@@ -120,21 +120,43 @@ struct Walk<'a> {
 }
 
 /// Check one walk's rows against the keys it crossed that were live throughout, and the values it returned
-fn check_walk(store: &ReelStore, case: &str, rows: &[(Vec<u8>, Vec<u8>)], stable: &BTreeMap<Vec<u8>, Vec<u8>>, live: &BTreeSet<Vec<u8>>, walk: &Walk<'_>) {
-    let Walk { from, down, reached_end, shape } = *walk;
+fn check_walk(
+    store: &ReelStore,
+    case: &str,
+    rows: &[(Vec<u8>, Vec<u8>)],
+    stable: &BTreeMap<Vec<u8>, Vec<u8>>,
+    live: &BTreeSet<Vec<u8>>,
+    walk: &Walk<'_>,
+) {
+    let Walk {
+        from,
+        down,
+        reached_end,
+        shape,
+    } = *walk;
     for pair in rows.windows(2) {
         let in_order = match down {
             true => pair[0].0 > pair[1].0,
             false => pair[0].0 < pair[1].0,
         };
-        assert!(in_order, "{case}: a walk came back out of order or with a key twice");
+        assert!(
+            in_order,
+            "{case}: a walk came back out of order or with a key twice"
+        );
     }
     for (key, value) in rows {
         let n = number_of(key);
         assert!(n < KEYS, "{case}: a walk returned a key nobody wrote");
-        assert_eq!(&value[..8], &n.to_be_bytes(), "{case}: key {n} came back with another key's value");
+        assert_eq!(
+            &value[..8],
+            &n.to_be_bytes(),
+            "{case}: key {n} came back with another key's value"
+        );
         if let Some(stable_value) = stable.get(key) {
-            assert_eq!(value, stable_value, "{case}: stable key {n} came back with the wrong value");
+            assert_eq!(
+                value, stable_value,
+                "{case}: stable key {n} came back with the wrong value"
+            );
         }
     }
     // Every stable and live key between the walk's start and the last key it returned is in it.
@@ -169,7 +191,15 @@ fn check_walk(store: &ReelStore, case: &str, rows: &[(Vec<u8>, Vec<u8>)], stable
     }
 }
 
-fn walker(store: &ReelStore, stable: &BTreeMap<Vec<u8>, Vec<u8>>, live: &BTreeSet<Vec<u8>>, case: &str, seed: u64, id: u64, done: &AtomicBool) -> u64 {
+fn walker(
+    store: &ReelStore,
+    stable: &BTreeMap<Vec<u8>, Vec<u8>>,
+    live: &BTreeSet<Vec<u8>>,
+    case: &str,
+    seed: u64,
+    id: u64,
+    done: &AtomicBool,
+) -> u64 {
     let mut rng = SmallRng::seed_from_u64(seed ^ (id << 40) ^ 0x57A1);
     let mut walks = 0;
     while !done.load(Ordering::Relaxed) {
@@ -184,7 +214,8 @@ fn walker(store: &ReelStore, stable: &BTreeMap<Vec<u8>, Vec<u8>>, live: &BTreeSe
         let mut reached_end = false;
         let shape = match rng.gen_range(0..3) {
             0 => {
-                let mut walk = Store::iter_from(store, "rows", &from, direction).expect("iter from");
+                let mut walk =
+                    Store::iter_from(store, "rows", &from, direction).expect("iter from");
                 while rows.len() < wanted {
                     match walk.next() {
                         Some((key, value)) => rows.push((key, value.to_vec())),
@@ -197,7 +228,9 @@ fn walker(store: &ReelStore, stable: &BTreeMap<Vec<u8>, Vec<u8>>, live: &BTreeSe
                 "iter"
             }
             1 => {
-                let mut walk = store.iter_lent("rows", Some(&from), direction, wanted).expect("lent");
+                let mut walk = store
+                    .iter_lent("rows", Some(&from), direction, wanted)
+                    .expect("lent");
                 while rows.len() < wanted {
                     match walk.next() {
                         Some((key, value)) => rows.push((key.to_vec(), value.to_vec())),
@@ -211,12 +244,17 @@ fn walker(store: &ReelStore, stable: &BTreeMap<Vec<u8>, Vec<u8>>, live: &BTreeSe
             }
             _ => {
                 // A key walk returns no values, so each key stands in with its own number.
-                let mut walk = store.iter_keys_from("rows", Some(&from), direction).expect("keys");
+                let mut walk = store
+                    .iter_keys_from("rows", Some(&from), direction)
+                    .expect("keys");
                 while rows.len() < wanted {
                     match walk.next() {
                         Some(key) => {
                             let n = number_of(&key);
-                            let value = stable.get(&key).cloned().unwrap_or_else(|| n.to_be_bytes().to_vec());
+                            let value = stable
+                                .get(&key)
+                                .cloned()
+                                .unwrap_or_else(|| n.to_be_bytes().to_vec());
                             rows.push((key, value));
                         }
                         None => {
@@ -240,7 +278,13 @@ fn walker(store: &ReelStore, stable: &BTreeMap<Vec<u8>, Vec<u8>>, live: &BTreeSe
     walks
 }
 
-fn writer(store: &ReelStore, seed: u64, id: u64, ops: u64, last: &Mutex<BTreeMap<Vec<u8>, Option<Vec<u8>>>>) {
+fn writer(
+    store: &ReelStore,
+    seed: u64,
+    id: u64,
+    ops: u64,
+    last: &Mutex<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
+) {
     let mut rng = SmallRng::seed_from_u64(seed ^ (id << 32) ^ 0xB0B);
     let owned: Vec<u64> = (STABLE..KEYS).filter(|n| n % WRITERS == id).collect();
     for op in 1..=ops {
@@ -262,7 +306,13 @@ fn writer(store: &ReelStore, seed: u64, id: u64, ops: u64, last: &Mutex<BTreeMap
 }
 
 /// A whole walk against the stable keys and what the writers left
-fn settled(store: &ReelStore, stable: &BTreeMap<Vec<u8>, Vec<u8>>, last: &BTreeMap<Vec<u8>, Option<Vec<u8>>>, case: &str, stage: &str) {
+fn settled(
+    store: &ReelStore,
+    stable: &BTreeMap<Vec<u8>, Vec<u8>>,
+    last: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    case: &str,
+    stage: &str,
+) {
     let mut want: BTreeMap<Vec<u8>, Vec<u8>> = stable.clone();
     for (key, value) in last {
         if let Some(value) = value {
@@ -274,8 +324,17 @@ fn settled(store: &ReelStore, stable: &BTreeMap<Vec<u8>, Vec<u8>>, last: &BTreeM
         .map(|(key, value)| (key, value.to_vec()))
         .collect();
     let want: Vec<(Vec<u8>, Vec<u8>)> = want.into_iter().collect();
-    assert_eq!(got.len(), want.len(), "{case} {stage}: a whole walk counts {} keys against {}", got.len(), want.len());
-    assert_eq!(got, want, "{case} {stage}: a whole walk differs from what the writers left");
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "{case} {stage}: a whole walk counts {} keys against {}",
+        got.len(),
+        want.len()
+    );
+    assert_eq!(
+        got, want,
+        "{case} {stage}: a whole walk differs from what the writers left"
+    );
 }
 
 fn run(seed: u64, columns: ColumnSet) {
@@ -284,7 +343,8 @@ fn run(seed: u64, columns: ColumnSet) {
     let mut rng = SmallRng::seed_from_u64(seed);
     let dir = TempDir::new().expect("temp dir");
     let config = config(&mut rng);
-    let store = Arc::new(ReelStore::open(dir.path().to_path_buf(), config.clone(), columns).expect("open"));
+    let store =
+        Arc::new(ReelStore::open(dir.path().to_path_buf(), config.clone(), columns).expect("open"));
     let ops = knob("REEL_PWS_OPS", 3000);
 
     let mut stable = BTreeMap::new();
@@ -319,9 +379,18 @@ fn run(seed: u64, columns: ColumnSet) {
         };
         let walkers: Vec<_> = (0..WALKERS)
             .map(|id| {
-                let (store, stable, live, done, walks) = (store.clone(), stable.clone(), live.clone(), done.clone(), walks.clone());
+                let (store, stable, live, done, walks) = (
+                    store.clone(),
+                    stable.clone(),
+                    live.clone(),
+                    done.clone(),
+                    walks.clone(),
+                );
                 scope.spawn(move || {
-                    walks.fetch_add(walker(&store, &stable, &live, case, seed, id, &done), Ordering::Relaxed);
+                    walks.fetch_add(
+                        walker(&store, &stable, &live, case, seed, id, &done),
+                        Ordering::Relaxed,
+                    );
                 })
             })
             .collect();

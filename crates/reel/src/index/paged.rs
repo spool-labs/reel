@@ -258,11 +258,19 @@ impl SealedRanges {
     /// walk's own, so the walk's depth leaves it out and counts the key run instead.
     pub fn depth_past(&self, covered: &std::collections::HashSet<SegmentId>) -> usize {
         let sealed = read(&self.ranges);
-        let mut open: std::collections::BinaryHeap<std::cmp::Reverse<&[u8]>> = std::collections::BinaryHeap::new();
+        let mut open: std::collections::BinaryHeap<std::cmp::Reverse<&[u8]>> =
+            std::collections::BinaryHeap::new();
         let mut deepest = 0;
-        for run in sealed.by_key.iter().filter(|run| !covered.contains(&run.segment)) {
+        for run in sealed
+            .by_key
+            .iter()
+            .filter(|run| !covered.contains(&run.segment))
+        {
             let lowest = run.span.lowest.as_slice();
-            while open.peek().is_some_and(|std::cmp::Reverse(highest)| *highest < lowest) {
+            while open
+                .peek()
+                .is_some_and(|std::cmp::Reverse(highest)| *highest < lowest)
+            {
                 open.pop();
             }
             open.push(std::cmp::Reverse(run.span.highest.as_slice()));
@@ -547,7 +555,11 @@ mod tests {
         ranges.note(SegmentId(5), key(0), key(30));
         assert_eq!(depth(&ranges), 3);
         ranges.note(SegmentId(6), key(30), key(40));
-        assert_eq!(depth(&ranges), 3, "a range meeting another at one key overlaps it there");
+        assert_eq!(
+            depth(&ranges),
+            3,
+            "a range meeting another at one key overlaps it there"
+        );
     }
 
     // a key is looked for only in the segments whose range could hold it

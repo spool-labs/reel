@@ -42,7 +42,11 @@ fn lane_groups(rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<(usize, 
             by_shard[shard].push(at);
         }
     }
-    by_shard.into_iter().enumerate().filter(|(_, ats)| !ats.is_empty()).collect()
+    by_shard
+        .into_iter()
+        .enumerate()
+        .filter(|(_, ats)| !ats.is_empty())
+        .collect()
 }
 
 /// Buckets the lowest rung of a shard's ladder holds
@@ -86,7 +90,9 @@ const SMALL_CLASSES: usize = 16;
 const CLASSES: usize = 192;
 
 /// One eighth of an octave as 16-bit fixed point, so each wide class is about 9% wider
-const EIGHTHS: [u64; 8] = [65_536, 71_468, 77_936, 84_990, 92_682, 101_070, 110_218, 120_194];
+const EIGHTHS: [u64; 8] = [
+    65_536, 71_468, 77_936, 84_990, 92_682, 101_070, 110_218, 120_194,
+];
 
 /// The payload bytes each length class covers
 static BOUNDS: [u32; CLASSES] = bounds();
@@ -245,7 +251,14 @@ pub trait RecordSource: Send + Sync {
     ///
     /// `alone` says the place is the key's only slot, so a record that confirms itself
     /// may answer with no version.
-    fn record(&self, key: &RecordKey, segment: SegmentId, offset: u32, bound: u32, alone: bool) -> Result<SpotRead>;
+    fn record(
+        &self,
+        key: &RecordKey,
+        segment: SegmentId,
+        offset: u32,
+        bound: u32,
+        alone: bool,
+    ) -> Result<SpotRead>;
 }
 
 /// The payload bytes of every length class, the small ones even and the wide ones geometric
@@ -257,7 +270,8 @@ const fn bounds() -> [u32; CLASSES] {
             true => (class as u64 + 1) * SMALL_STEP,
             false => {
                 let wide = class - SMALL_CLASSES + 1;
-                ((SMALL_CLASSES as u64 * SMALL_STEP) << (wide / 8)) * EIGHTHS[wide % 8] / EIGHTHS[0] + 1
+                ((SMALL_CLASSES as u64 * SMALL_STEP) << (wide / 8)) * EIGHTHS[wide % 8] / EIGHTHS[0]
+                    + 1
             }
         };
         bounds[class] = match bound > u32::MAX as u64 {
@@ -290,7 +304,9 @@ fn hash_of(key: &[u8]) -> u64 {
     for chunk in &mut chunks {
         let mut word = [0u8; 8];
         word.copy_from_slice(chunk);
-        state = (state ^ u64::from_le_bytes(word)).wrapping_mul(ODD).rotate_left(29);
+        state = (state ^ u64::from_le_bytes(word))
+            .wrapping_mul(ODD)
+            .rotate_left(29);
     }
     let mut tail = [0u8; 8];
     tail[..chunks.remainder().len()].copy_from_slice(chunks.remainder());
@@ -600,8 +616,15 @@ impl Table {
         let mut count = next_rung(self.homes, self.phase);
         loop {
             let mut table = Table::with_buckets(count, self.phase);
-            let slots = self.buckets.iter().flat_map(|bucket| bucket.slots.iter()).copied();
-            if slots.filter(|slot| !slot.is_empty()).all(|slot| table.place(slot).is_ok()) {
+            let slots = self
+                .buckets
+                .iter()
+                .flat_map(|bucket| bucket.slots.iter())
+                .copied();
+            if slots
+                .filter(|slot| !slot.is_empty())
+                .all(|slot| table.place(slot).is_ok())
+            {
                 return table;
             }
             count = next_rung(count, self.phase);
@@ -632,7 +655,10 @@ impl Table {
     /// Mark the slot pointing at one record displaced, unless it already is
     fn mark_displaced(&mut self, hash: u64, slot: &Slot) -> bool {
         let found = self.matches(hash);
-        match found.iter().find(|place| place.slot.same_place(slot) && !place.slot.is_displaced()) {
+        match found
+            .iter()
+            .find(|place| place.slot.same_place(slot) && !place.slot.is_displaced())
+        {
             Some(place) => {
                 self.buckets[place.bucket].slots[place.way].meta |= DISPLACED;
                 true
@@ -660,7 +686,6 @@ impl Table {
         }
         (before - self.held, displaced)
     }
-
 }
 
 /// An older version a lookup read past, for the cleaner to take out
@@ -748,7 +773,9 @@ impl Writing<'_> {
     /// Take out the slot pointing at one record unless an overwrite already booked it
     fn take_unbooked(&mut self, hash: u64, slot: &Slot) -> bool {
         let found = self.table.matches(hash);
-        let is_booked = found.iter().any(|place| place.slot.same_place(slot) && place.slot.is_displaced());
+        let is_booked = found
+            .iter()
+            .any(|place| place.slot.same_place(slot) && place.slot.is_displaced());
         !is_booked && self.take(hash, slot)
     }
 
@@ -845,12 +872,18 @@ impl SpotColumn {
 
     /// Overwritten versions booked from their length class and held until compaction
     pub fn displaced(&self) -> u64 {
-        self.shards.iter().map(|shard| shard.displaced.load(Ordering::Relaxed)).sum()
+        self.shards
+            .iter()
+            .map(|shard| shard.displaced.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Entries held
     pub fn held(&self) -> u64 {
-        self.shards.iter().map(|shard| shard.read().held as u64).sum()
+        self.shards
+            .iter()
+            .map(|shard| shard.read().held as u64)
+            .sum()
     }
 
     pub fn heap_bytes(&self) -> u64 {
@@ -881,7 +914,11 @@ impl SpotColumn {
                     let (key, loc) = rows[at];
                     let hash = hash_of(key);
                     let slot = Slot::new(hash, loc);
-                    if table.matches(hash).iter().any(|place| place.slot.same_place(&slot)) {
+                    if table
+                        .matches(hash)
+                        .iter()
+                        .any(|place| place.slot.same_place(&slot))
+                    {
                         continue;
                     }
                     table.insert(slot);
@@ -900,7 +937,11 @@ impl SpotColumn {
                 for &at in chunk {
                     let (key, loc) = rows[at];
                     let hash = hash_of(key);
-                    let held = table.matches(hash).iter().find(|place| place.slot.at(loc)).copied();
+                    let held = table
+                        .matches(hash)
+                        .iter()
+                        .find(|place| place.slot.at(loc))
+                        .copied();
                     if let Some(place) = held {
                         table.take(hash, &place.slot);
                     }
@@ -991,7 +1032,10 @@ impl SpotColumn {
             let hash = hash_of(row.key.as_slice());
             let seen = self.shards[shard_of(hash)].read().matches(hash);
             match seen.len() {
-                1 => by_segment.entry(seen[0].slot.segment()).or_default().push(at),
+                1 => by_segment
+                    .entry(seen[0].slot.segment())
+                    .or_default()
+                    .push(at),
                 _ => by_header.push(at),
             }
         }
@@ -1002,8 +1046,11 @@ impl SpotColumn {
             let workers: Vec<_> = (0..SETTLE_THREADS)
                 .map(|_| {
                     scope.spawn(|| -> Result<()> {
-                        while let Some((segment, group)) = groups.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            let left = self.settle_against(column, *segment, group, &rows, footers)?;
+                        while let Some((segment, group)) =
+                            groups.get(next.fetch_add(1, Ordering::Relaxed))
+                        {
+                            let left =
+                                self.settle_against(column, *segment, group, &rows, footers)?;
                             lock(&unsettled).extend(left);
                         }
                         Ok(())
@@ -1052,7 +1099,10 @@ impl SpotColumn {
                 }
                 keys_at = Some(at_offset);
             }
-            Ok(keys_at.as_ref().and_then(|keys| keys.get(&offset)).and_then(|at| partition.key_at(*at)))
+            Ok(keys_at
+                .as_ref()
+                .and_then(|keys| keys.get(&offset))
+                .and_then(|at| partition.key_at(*at)))
         };
         let mut unsettled = Vec::new();
         for same_key in group.chunk_by(|left, right| rows[*left].key == rows[*right].key) {
@@ -1076,7 +1126,10 @@ impl SpotColumn {
             let hash = hash_of(row.key.as_slice());
             let mut table = self.shards[shard_of(hash)].write();
             let held = table.matches(hash);
-            let place = held.iter().find(|place| place.slot.segment() == segment).copied();
+            let place = held
+                .iter()
+                .find(|place| place.slot.segment() == segment)
+                .copied();
             let is_newer = (row.lsn, row.loc.segment) > (standing.lsn, segment);
             let settled = match place {
                 // The slot is the version this footer holds, so the newer of the two stands.
@@ -1133,7 +1186,9 @@ impl SpotColumn {
             let seen = self.shards[shard].read().matches(hash);
             let mut standing = None;
             for place in seen.iter() {
-                if let HeadRead::Same(head) = records.head(key.as_ref(), place.slot.segment(), place.slot.offset)? {
+                if let HeadRead::Same(head) =
+                    records.head(key.as_ref(), place.slot.segment(), place.slot.offset)?
+                {
                     standing = Some((place.slot, head.lsn));
                 }
             }
@@ -1178,7 +1233,11 @@ impl SpotColumn {
     pub fn remove_at(&self, key: &[u8], loc: Loc) -> bool {
         let hash = hash_of(key);
         let mut table = self.shards[shard_of(hash)].write();
-        let held = table.matches(hash).iter().find(|place| place.slot.at(loc)).copied();
+        let held = table
+            .matches(hash)
+            .iter()
+            .find(|place| place.slot.at(loc))
+            .copied();
         match held {
             Some(place) => table.take(hash, &place.slot),
             None => false,
@@ -1207,7 +1266,9 @@ impl SpotColumn {
         let (mut unread, mut older, mut gone) = (Vec::new(), Vec::new(), Vec::new());
         for place in seen.iter() {
             let slot = place.slot;
-            let is_older = segments.max_lsn_of(slot.segment()).is_some_and(|ceiling| ceiling < newer);
+            let is_older = segments
+                .max_lsn_of(slot.segment())
+                .is_some_and(|ceiling| ceiling < newer);
             match (must_read, slot.is_displaced(), is_older) {
                 (false, true, _) => continue,
                 (false, false, true) => {
@@ -1245,8 +1306,12 @@ impl SpotColumn {
         }
         for slot in &unread {
             if table.mark_displaced(hash, slot) {
-                settled.classed.push((Loc::new(slot.segment(), slot.offset, slot.middle()), slot.least()));
-                self.slack.fetch_add(u64::from(slot.width()), Ordering::Relaxed);
+                settled.classed.push((
+                    Loc::new(slot.segment(), slot.offset, slot.middle()),
+                    slot.least(),
+                ));
+                self.slack
+                    .fetch_add(u64::from(slot.width()), Ordering::Relaxed);
             }
         }
         Ok(settled)
@@ -1255,13 +1320,21 @@ impl SpotColumn {
     /// Drop the slack one class booking stood for, once its true length is known
     fn unslack(&self, slot: &Slot) {
         let width = u64::from(slot.width());
-        let _ = self.slack.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |slack| Some(slack.saturating_sub(width)));
+        let _ = self
+            .slack
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |slack| {
+                Some(slack.saturating_sub(width))
+            });
     }
 
     /// Take out every displaced entry pointing into a retiring segment, with the true length its footer row gives
     ///
     /// A row reads its shard under the read lock first, so a segment with nothing displaced in it costs no write lock.
-    pub fn settle_displaced_in(&self, segment: SegmentId, partition: &FooterPartition) -> Result<Vec<Rebooked>> {
+    pub fn settle_displaced_in(
+        &self,
+        segment: SegmentId,
+        partition: &FooterPartition,
+    ) -> Result<Vec<Rebooked>> {
         let mut rebooked = Vec::new();
         if self.displaced() == 0 {
             return Ok(rebooked);
@@ -1277,7 +1350,12 @@ impl SpotColumn {
                 continue;
             }
             let loc = Loc::new(segment, entry.offset, entry.len);
-            let held = shard.read().matches(hash).iter().find(|place| place.slot.at(loc) && place.slot.is_displaced()).map(|place| place.slot);
+            let held = shard
+                .read()
+                .matches(hash)
+                .iter()
+                .find(|place| place.slot.at(loc) && place.slot.is_displaced())
+                .map(|place| place.slot);
             let Some(slot) = held else {
                 continue;
             };
@@ -1309,7 +1387,9 @@ impl SpotColumn {
                 break;
             };
             self.beside.fetch_sub(1, Ordering::Relaxed);
-            let took = self.shards[shard_of(stale.hash)].write().take_unbooked(stale.hash, &stale.slot);
+            let took = self.shards[shard_of(stale.hash)]
+                .write()
+                .take_unbooked(stale.hash, &stale.slot);
             if took {
                 let loc = Loc::new(stale.slot.segment(), stale.slot.offset, stale.len);
                 taken.push((stale.key, loc));
@@ -1322,12 +1402,15 @@ impl SpotColumn {
     fn ordered(&self, key: &RecordKey, segments: &SegmentTable) -> (u64, Vec<(Option<Lsn>, Slot)>) {
         let hash = hash_of(key.as_slice());
         let seen = self.shards[shard_of(hash)].read().matches(hash);
-        let mut ordered: Vec<(Option<Lsn>, Slot)> = seen.iter().map(|place| (None, place.slot)).collect();
+        let mut ordered: Vec<(Option<Lsn>, Slot)> =
+            seen.iter().map(|place| (None, place.slot)).collect();
         if ordered.len() > 1 {
             for (ceiling, slot) in ordered.iter_mut() {
                 *ceiling = segments.max_lsn_of(slot.segment());
             }
-            ordered.sort_unstable_by(|left, right| (right.0, right.1.segment).cmp(&(left.0, left.1.segment)));
+            ordered.sort_unstable_by(|left, right| {
+                (right.0, right.1.segment).cmp(&(left.0, left.1.segment))
+            });
         }
         (hash, ordered)
     }
@@ -1355,7 +1438,13 @@ impl SpotColumn {
             };
             pick.takes_newest = takes_newest;
             while let Some(candidate) = self.next(&mut pick) {
-                let read = records.record(key, candidate.segment, candidate.offset, candidate.bound, candidate.alone)?;
+                let read = records.record(
+                    key,
+                    candidate.segment,
+                    candidate.offset,
+                    candidate.bound,
+                    candidate.alone,
+                )?;
                 match self.offer(&mut pick, candidate, read) {
                     Offered::Next => {}
                     Offered::Again => continue 'tries,
@@ -1373,7 +1462,13 @@ impl SpotColumn {
             return Ok(Lookup::Unsettled);
         };
         while let Some(candidate) = self.next(&mut pick) {
-            let read = records.record(key, candidate.segment, candidate.offset, candidate.bound, candidate.alone)?;
+            let read = records.record(
+                key,
+                candidate.segment,
+                candidate.offset,
+                candidate.bound,
+                candidate.alone,
+            )?;
             match self.offer(&mut pick, candidate, read) {
                 Offered::Next => {}
                 Offered::Again | Offered::Unsettled => return Ok(Lookup::Unsettled),
@@ -1415,7 +1510,12 @@ impl SpotColumn {
             .matches(hash)
             .iter()
             // A displaced slot was booked as older than a version written since, so it is never the newer one.
-            .any(|place| !place.slot.is_displaced() && segments.max_lsn_of(place.slot.segment()).is_none_or(|max| max > lsn))
+            .any(|place| {
+                !place.slot.is_displaced()
+                    && segments
+                        .max_lsn_of(place.slot.segment())
+                        .is_none_or(|max| max > lsn)
+            })
     }
 
     /// Where the key's shard stands, read before the map is asked
@@ -1499,7 +1599,9 @@ impl SpotColumn {
             SpotRead::Other => return Offered::Next,
             // The segment is gone, so the slot points at nothing and goes before the next look.
             SpotRead::Gone => {
-                self.shards[shard_of(pick.hash)].write().take(pick.hash, &candidate.slot);
+                self.shards[shard_of(pick.hash)]
+                    .write()
+                    .take(pick.hash, &candidate.slot);
                 return Offered::Again;
             }
             SpotRead::Unsure => return Offered::Unsettled,
@@ -1520,7 +1622,11 @@ impl SpotColumn {
 
     /// Close a lookup with its newest version, handing the older ones it read to the cleaner
     pub fn settle(&self, key: &RecordKey, pick: Pick) -> Lookup {
-        for (slot, len) in pick.stale.into_iter().filter(|(slot, _)| !slot.is_displaced()) {
+        for (slot, len) in pick
+            .stale
+            .into_iter()
+            .filter(|(slot, _)| !slot.is_displaced())
+        {
             self.queue(Stale {
                 key: key.clone(),
                 hash: pick.hash,
@@ -1581,13 +1687,16 @@ impl SpotColumn {
         if best.is_some_and(|(_, slot)| slot.is_displaced()) {
             return Ok(Some(Settled::Footers));
         }
-        Ok(Some(Settled::Entry(best.map(|(head, slot)| match head.is_tombstone {
-            true => Entry::grave(head.lsn),
-            false => {
-                let stamp = segments.incarnation_of(slot.segment());
-                Entry::new(Loc::new(slot.segment(), slot.offset, head.len), head.lsn).stamped(stamp)
-            }
-        }))))
+        Ok(Some(Settled::Entry(best.map(
+            |(head, slot)| match head.is_tombstone {
+                true => Entry::grave(head.lsn),
+                false => {
+                    let stamp = segments.incarnation_of(slot.segment());
+                    Entry::new(Loc::new(slot.segment(), slot.offset, head.len), head.lsn)
+                        .stamped(stamp)
+                }
+            },
+        ))))
     }
 
     /// Drop every entry pointing into a segment no longer standing, with no reads
@@ -1678,14 +1787,26 @@ mod tests {
             Ok(self.answer(key, segment, offset))
         }
 
-        fn cached_head(&self, key: KeyRef<'_>, segment: SegmentId, offset: u32) -> Result<HeadRead> {
+        fn cached_head(
+            &self,
+            key: KeyRef<'_>,
+            segment: SegmentId,
+            offset: u32,
+        ) -> Result<HeadRead> {
             Ok(match self.is_cold.load(Ordering::Relaxed) {
                 true => HeadRead::Cold,
                 false => self.answer(key, segment, offset),
             })
         }
 
-        fn record(&self, key: &RecordKey, segment: SegmentId, offset: u32, bound: u32, _alone: bool) -> Result<SpotRead> {
+        fn record(
+            &self,
+            key: &RecordKey,
+            segment: SegmentId,
+            offset: u32,
+            bound: u32,
+            _alone: bool,
+        ) -> Result<SpotRead> {
             Ok(match self.answer(key.as_ref(), segment, offset) {
                 HeadRead::Same(head) if head.len <= bound => {
                     SpotRead::Found(head, Value::from(head.lsn.as_u64().to_le_bytes().to_vec()))
@@ -1726,10 +1847,16 @@ mod tests {
         let records = Arc::new(Records::default());
         let segments = Arc::new(SegmentTable::new());
         let column = SpotColumn::new();
-        column.attach(Arc::clone(&records) as Arc<dyn RecordSource>, Arc::clone(&segments));
+        column.attach(
+            Arc::clone(&records) as Arc<dyn RecordSource>,
+            Arc::clone(&segments),
+        );
         records.is_cold.store(true, Ordering::Relaxed);
         let (overwritten, bystander) = (shared_key(1), shared_key(2));
-        let (old, other) = (Loc::new(SegmentId(1), 0, 200), Loc::new(SegmentId(2), 0, 300));
+        let (old, other) = (
+            Loc::new(SegmentId(1), 0, 200),
+            Loc::new(SegmentId(2), 0, 300),
+        );
         records.write(old, overwritten.as_slice(), Lsn(1));
         records.write(other, bystander.as_slice(), Lsn(2));
         segments.note_max(SegmentId(1), Lsn(5));
@@ -1743,7 +1870,10 @@ mod tests {
         assert_eq!(column.displaced(), 2);
 
         // the bystander's newest version sits in a displaced slot, so both paths leave it to the footers
-        assert!(matches!(column.read(&bystander).expect("read"), Lookup::Unsettled));
+        assert!(matches!(
+            column.read(&bystander).expect("read"),
+            Lookup::Unsettled
+        ));
         assert_eq!(column.entry(&bystander).expect("entry"), Settled::Footers);
         // a single-candidate read and a move's shortcut leave a displaced slot to the full lookup
         assert!(column.sole(&bystander).is_none());
@@ -1752,7 +1882,10 @@ mod tests {
 
     fn column(records: &Arc<Records>) -> SpotColumn {
         let column = SpotColumn::new();
-        column.attach(Arc::clone(records) as Arc<dyn RecordSource>, Arc::new(SegmentTable::new()));
+        column.attach(
+            Arc::clone(records) as Arc<dyn RecordSource>,
+            Arc::new(SegmentTable::new()),
+        );
         column
     }
 
@@ -1760,7 +1893,9 @@ mod tests {
         match column.read(&key(at)).expect("read") {
             Lookup::Found(lsn, _) => Some(lsn.as_u64()),
             Lookup::Missing => None,
-            Lookup::Newest(_) => panic!("key {at} answered with no version from a source that reads them all"),
+            Lookup::Newest(_) => {
+                panic!("key {at} answered with no version from a source that reads them all")
+            }
             Lookup::Unsettled => panic!("key {at} needed the checked read"),
         }
     }
@@ -1772,7 +1907,11 @@ mod tests {
         let column = column(&records);
         let keys = 50_000u64;
         for at in 0..keys {
-            let loc = Loc::new(SegmentId(1 + (at / 10_000) as u32), (at % 10_000) as u32 * 64, 40);
+            let loc = Loc::new(
+                SegmentId(1 + (at / 10_000) as u32),
+                (at % 10_000) as u32 * 64,
+                40,
+            );
             records.write(loc, key(at).as_slice(), Lsn(at + 1));
             column.insert(key(at).as_slice(), loc);
         }
@@ -1789,7 +1928,10 @@ mod tests {
         let records = Arc::new(Records::default());
         let segments = Arc::new(SegmentTable::new());
         let column = SpotColumn::new();
-        column.attach(Arc::clone(&records) as Arc<dyn RecordSource>, Arc::clone(&segments));
+        column.attach(
+            Arc::clone(&records) as Arc<dyn RecordSource>,
+            Arc::clone(&segments),
+        );
         records.is_cold.store(true, Ordering::Relaxed);
 
         let old = Loc::new(SegmentId(1), 0, 200);
@@ -1798,12 +1940,21 @@ mod tests {
         column.insert(key(1).as_slice(), old);
         // 200 bytes sit in the class from 193 to 256
         // segments book the class middle and live bytes the least it covers
-        assert_eq!(column.displace(&key(1), Lsn(10)).expect("displace").classed, vec![(Loc::new(SegmentId(1), 0, 224), 193)]);
+        assert_eq!(
+            column.displace(&key(1), Lsn(10)).expect("displace").classed,
+            vec![(Loc::new(SegmentId(1), 0, 224), 193)]
+        );
         assert_eq!(records.heads.load(Ordering::Relaxed), 0);
         assert_eq!((column.held(), column.displaced()), (1, 1));
-        assert_eq!(column.displace(&key(1), Lsn(11)).expect("displace"), Displaced::default());
+        assert_eq!(
+            column.displace(&key(1), Lsn(11)).expect("displace"),
+            Displaced::default()
+        );
         // a displaced version alone never answers, since it was overwritten or deleted once
-        assert!(matches!(column.read(&key(1)).expect("read"), Lookup::Unsettled));
+        assert!(matches!(
+            column.read(&key(1)).expect("read"),
+            Lookup::Unsettled
+        ));
         column.forget_retired(|segment| segment != SegmentId(1));
         assert_eq!((column.held(), column.displaced()), (0, 0));
 
@@ -1812,11 +1963,17 @@ mod tests {
         records.write(newer, key(3).as_slice(), Lsn(30));
         segments.note_max(SegmentId(2), Lsn(30));
         column.insert(key(3).as_slice(), newer);
-        assert!(column.displace(&key(3), Lsn(12)).expect("displace").booked.is_empty());
+        assert!(column
+            .displace(&key(3), Lsn(12))
+            .expect("displace")
+            .booked
+            .is_empty());
         assert_eq!(version(&column, 3), Some(30));
 
         // a key holding several versions reads them all and each goes, booked exactly
-        let held: Vec<Loc> = (0..SETTLE_AT as u32).map(|at| Loc::new(SegmentId(3), at * 64, 40)).collect();
+        let held: Vec<Loc> = (0..SETTLE_AT as u32)
+            .map(|at| Loc::new(SegmentId(3), at * 64, 40))
+            .collect();
         for (at, loc) in held.iter().enumerate() {
             records.write(*loc, key(4).as_slice(), Lsn(40 + at as u64));
             column.insert(key(4).as_slice(), *loc);
@@ -1832,7 +1989,10 @@ mod tests {
         records.write(first, key(5).as_slice(), Lsn(60));
         segments.note_max(SegmentId(4), Lsn(61));
         column.insert(key(5).as_slice(), first);
-        assert_eq!(column.displace(&key(5), Lsn(70)).expect("displace").classed, vec![(Loc::new(SegmentId(4), 0, 224), 193)]);
+        assert_eq!(
+            column.displace(&key(5), Lsn(70)).expect("displace").classed,
+            vec![(Loc::new(SegmentId(4), 0, 224), 193)]
+        );
         let slack = column.slack();
         for (at, lsn) in [(64, 71), (128, 72)] {
             let loc = Loc::new(SegmentId(5), at, 40);
@@ -1843,7 +2003,10 @@ mod tests {
         let settled = column.displace(&key(5), Lsn(80)).expect("displace");
         assert_eq!(settled.rebooked, vec![(first, 193)]);
         assert_eq!(settled.booked.len(), 2);
-        assert!(column.slack() < slack, "the corrected booking still counted in the slack");
+        assert!(
+            column.slack() < slack,
+            "the corrected booking still counted in the slack"
+        );
         assert_eq!(column.displaced(), 0);
     }
 
@@ -1885,14 +2048,23 @@ mod tests {
         ];
         for (at, loc, lsn, is_tombstone) in rows {
             records.put(loc, key(at).as_slice(), Lsn(lsn), is_tombstone);
-            column.load(&key(at), loc, Lsn(lsn), is_tombstone).expect("load");
+            column
+                .load(&key(at), loc, Lsn(lsn), is_tombstone)
+                .expect("load");
         }
         column.finish_load();
         assert_eq!(version(&column, 1), Some(5), "the newer row stands");
         assert_eq!(version(&column, 3), None, "a newer tombstone drops the key");
-        assert_eq!(version(&column, 4), Some(7), "a newer row stands over an older tombstone");
+        assert_eq!(
+            version(&column, 4),
+            Some(7),
+            "a newer row stands over an older tombstone"
+        );
         assert_eq!(column.held(), 3);
-        assert!(column.remove_at(key(2).as_slice(), Loc::new(SegmentId(3), 64, 40)), "a tie went to the copy");
+        assert!(
+            column.remove_at(key(2).as_slice(), Loc::new(SegmentId(3), 64, 40)),
+            "a tie went to the copy"
+        );
         assert_eq!(column.held(), 2);
     }
 
@@ -1909,7 +2081,9 @@ mod tests {
         assert_eq!(version(&column, 9), Some(1));
         assert_eq!(column.held(), 1, "the slot into the gone segment went");
         column.insert(key(9).as_slice(), retired);
-        assert!(matches!(column.entry(&key(9)).expect("entry"), Settled::Entry(Some(entry)) if entry.lsn == Lsn(1)));
+        assert!(
+            matches!(column.entry(&key(9)).expect("entry"), Settled::Entry(Some(entry)) if entry.lsn == Lsn(1))
+        );
         assert_eq!(column.held(), 1);
     }
 
@@ -1932,10 +2106,27 @@ mod tests {
     // every length class covers the lengths it is chosen for, up to the largest record
     #[test]
     fn length_classes_cover_their_lengths() {
-        for len in [0u32, 1, 63, 64, 65, 200, 1024, 1025, 4096, 65_536, 1 << 20, 10_192_000, u32::MAX] {
+        for len in [
+            0u32,
+            1,
+            63,
+            64,
+            65,
+            200,
+            1024,
+            1025,
+            4096,
+            65_536,
+            1 << 20,
+            10_192_000,
+            u32::MAX,
+        ] {
             let bound = bound_of(class_of(len));
             assert!(bound >= len, "length {len}");
-            assert!(u64::from(bound) <= u64::from(len) * 110 / 100 + SMALL_STEP, "length {len} over-reads to {bound}");
+            assert!(
+                u64::from(bound) <= u64::from(len) * 110 / 100 + SMALL_STEP,
+                "length {len} over-reads to {bound}"
+            );
         }
     }
 }

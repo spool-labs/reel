@@ -120,7 +120,11 @@ fn hit_counts(store: &ReelStore, keys: u64) -> ProbeCounts {
     let before = store.filter_probes();
     for at in 0..keys {
         assert!(
-            store.index().get_at(&key(at), cue.at()).expect("get").is_some(),
+            store
+                .index()
+                .get_at(&key(at), cue.at())
+                .expect("get")
+                .is_some(),
             "key {at} went missing"
         );
     }

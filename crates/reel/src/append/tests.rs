@@ -15,8 +15,8 @@ use crate::append::admission::InflightBudget;
 use crate::config::{IoBackend, Preallocate, ReelConfig, DEFAULT_FD_CACHE};
 use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth};
 use crate::format::footer::SegmentFooter;
-use crate::format::loc::SegmentId;
 use crate::format::journal::{journal_path, read_groups, JournalRow};
+use crate::format::loc::SegmentId;
 use crate::format::record::{check_keyless, KeylessRead, KEYLESS_MAX, KEYLESS_PREFIX};
 use crate::format::segment_header::{SegmentHeader, SEGMENT_HEADER_SPAN};
 use crate::io::fault::{FaultKind, FaultPlan};
@@ -107,12 +107,20 @@ fn lands_intact(shared: &ReelShared, loc: Loc) -> bool {
     let bytes = read_segment(shared, &shared.segment_path(loc.segment));
     let header = RecordHeader::unpack(&bytes).expect("segment header");
     let payload = &bytes[HEADER_LEN..HEADER_LEN + header.length as usize];
-    let layout = SegmentHeader::unpack(payload).expect("segment header payload").layout;
-    let check = layout.keyless_key(loc.len).expect("a small record lies keyless");
+    let layout = SegmentHeader::unpack(payload)
+        .expect("segment header payload")
+        .layout;
+    let check = layout
+        .keyless_key(loc.len)
+        .expect("a small record lies keyless");
     let start = loc.offset as usize;
-    let (prefix, payload) = bytes[start..start + KEYLESS_PREFIX + loc.len as usize].split_at(KEYLESS_PREFIX);
+    let (prefix, payload) =
+        bytes[start..start + KEYLESS_PREFIX + loc.len as usize].split_at(KEYLESS_PREFIX);
     let key = key(payload[0]);
-    matches!(check_keyless(prefix, payload, key.as_ref(), Flags::DATA, &check), KeylessRead::Intact(_))
+    matches!(
+        check_keyless(prefix, payload, key.as_ref(), Flags::DATA, &check),
+        KeylessRead::Intact(_)
+    )
 }
 
 fn read_segment(shared: &ReelShared, path: &Path) -> Vec<u8> {
@@ -136,7 +144,6 @@ fn entry_len(entries: &[SegmentEntry], name: &str) -> u64 {
         .expect("segment listed")
 }
 
-
 // opening a tail writes the segment header as record zero and nothing else
 #[test]
 fn open_writes_segment_header() {
@@ -153,7 +160,10 @@ fn open_writes_segment_header() {
     let header = RecordHeader::unpack(&bytes).expect("header");
     assert!(header.flags.is_segment_header());
     assert_eq!(header.span(), SEG_HEADER_SPAN);
-    assert!(journaled(&shared, &appender, SegmentId(1)).is_empty(), "the header lists no row");
+    assert!(
+        journaled(&shared, &appender, SegmentId(1)).is_empty(),
+        "the header lists no row"
+    );
 }
 
 // a whole-block volume closes the header drain with zeros to the boundary
@@ -169,7 +179,9 @@ fn whole_block_open_fills_to_boundary() {
     let bytes = read_segment(&shared, &shared.segment_path(SegmentId(1)));
     let header = RecordHeader::unpack(&bytes).expect("header");
     assert!(header.flags.is_segment_header());
-    assert!(bytes[header.span() as usize..ALIGN as usize].iter().all(|byte| *byte == 0));
+    assert!(bytes[header.span() as usize..ALIGN as usize]
+        .iter()
+        .all(|byte| *byte == 0));
 }
 
 // records land back to back after the segment header, each where it reserved
@@ -193,11 +205,17 @@ fn records_land_contiguously() {
         SEG_HEADER_SPAN + framed(100) + framed(200) + framed(300)
     );
 
-    let data: Vec<JournalRow> = journaled(&shared, &appender, SegmentId(1)).into_iter().flatten().collect();
+    let data: Vec<JournalRow> = journaled(&shared, &appender, SegmentId(1))
+        .into_iter()
+        .flatten()
+        .collect();
     assert_eq!(data.len(), 3);
     assert_eq!(u64::from(data[0].offset), SEG_HEADER_SPAN);
     assert_eq!(u64::from(data[1].offset), SEG_HEADER_SPAN + framed(100));
-    assert_eq!(u64::from(data[2].offset), SEG_HEADER_SPAN + framed(100) + framed(200));
+    assert_eq!(
+        u64::from(data[2].offset),
+        SEG_HEADER_SPAN + framed(100) + framed(200)
+    );
 }
 
 // every drain of a whole-block volume leaves the write head on a boundary
@@ -364,7 +382,11 @@ fn a_second_writer_waits_on_the_first() {
     let Poll::Ready(Ok(Durability::Settled)) = poll_once(second.as_mut()) else {
         panic!("one flush answers for both writers");
     };
-    assert_eq!(sim.sync_count(), before + SYNCS_PER_FLUSH, "one flush's syncs");
+    assert_eq!(
+        sim.sync_count(),
+        before + SYNCS_PER_FLUSH,
+        "one flush's syncs"
+    );
 }
 
 // a turn nobody takes goes back, so the writer behind it is not left waiting
@@ -438,7 +460,11 @@ fn a_forwarded_flush_answers_both_writers() {
         Poll::Pending => block_on(first).expect("first writer"),
     }
 
-    assert_eq!(sim.sync_count(), before + SYNCS_PER_FLUSH, "one flush's syncs");
+    assert_eq!(
+        sim.sync_count(),
+        before + SYNCS_PER_FLUSH,
+        "one flush's syncs"
+    );
 }
 
 // a caller that walks away from a forwarded flush leaves the turn where it is
@@ -590,13 +616,20 @@ fn a_batch_journals_as_one_group() {
 
     appender.append_batch(batch_of(300)).expect("batch");
 
-    assert_eq!(appender.tail().committed_len(), SEG_HEADER_SPAN + framed(300) * 3);
+    assert_eq!(
+        appender.tail().committed_len(),
+        SEG_HEADER_SPAN + framed(300) * 3
+    );
     let groups = journaled(&shared, &appender, SegmentId(1));
     assert_eq!(groups.len(), 1, "the batch journaled as one group");
     let offsets: Vec<u64> = groups[0].iter().map(|row| u64::from(row.offset)).collect();
     assert_eq!(
         offsets,
-        vec![SEG_HEADER_SPAN, SEG_HEADER_SPAN + framed(300), SEG_HEADER_SPAN + framed(300) * 2]
+        vec![
+            SEG_HEADER_SPAN,
+            SEG_HEADER_SPAN + framed(300),
+            SEG_HEADER_SPAN + framed(300) * 2
+        ]
     );
 }
 
@@ -611,10 +644,16 @@ fn a_whole_block_batch_fills_behind_its_run() {
     appender.append_batch(batch_of(300)).expect("batch");
 
     let committed = appender.tail().committed_len();
-    assert_eq!(committed % ALIGN, 0, "the batch left the head off a boundary");
+    assert_eq!(
+        committed % ALIGN,
+        0,
+        "the batch left the head off a boundary"
+    );
     let run_end = ALIGN + framed(300) * 3;
     let bytes = read_segment(&shared, &shared.segment_path(SegmentId(1)));
-    assert!(bytes[run_end as usize..committed as usize].iter().all(|byte| *byte == 0));
+    assert!(bytes[run_end as usize..committed as usize]
+        .iter()
+        .all(|byte| *byte == 0));
 }
 
 // a batch too wide for the room left rolls whole rather than splitting in two
@@ -651,10 +690,17 @@ fn a_batch_never_spans_segments() {
         "a batch landed across {landed:?}",
     );
 
-    let offsets: Vec<u64> = committed.iter().map(|record| u64::from(record.loc.offset)).collect();
+    let offsets: Vec<u64> = committed
+        .iter()
+        .map(|record| u64::from(record.loc.offset))
+        .collect();
     assert_eq!(
         offsets,
-        vec![offsets[0], offsets[0] + framed(payload), offsets[0] + framed(payload) * 2],
+        vec![
+            offsets[0],
+            offsets[0] + framed(payload),
+            offsets[0] + framed(payload) * 2
+        ],
         "the run lands back to back",
     );
 }
@@ -1142,7 +1188,10 @@ fn flush_survives_a_roll_underneath_it() {
         "the tail rolled, so flushes and rolls really did interleave"
     );
     for record in &committed {
-        assert!(lands_intact(&shared, record.loc), "every record verifies where it landed");
+        assert!(
+            lands_intact(&shared, record.loc),
+            "every record verifies where it landed"
+        );
     }
 }
 

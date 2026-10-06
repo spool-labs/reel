@@ -64,7 +64,9 @@ impl Cursor<'_> {
     fn key(&self) -> Option<&[u8]> {
         match self {
             Cursor::Footer { rows, at, .. } => rows.key_at(*at),
-            Cursor::Keys { rows, column, at } => (*at < column.rows()).then(|| key_in(rows, column, *at as usize)),
+            Cursor::Keys { rows, column, at } => {
+                (*at < column.rows()).then(|| key_in(rows, column, *at as usize))
+            }
         }
     }
 
@@ -145,21 +147,38 @@ pub fn merge_into_key_run(
     }
     // Taken under the claims, so it holds for the whole merge: a row pointing into a
     // segment outside it points at a record a rewrite moved or dropped.
-    let standing: HashSet<SegmentId> = index.segments_snapshot().into_iter().map(|(segment, _)| segment).collect();
+    let standing: HashSet<SegmentId> = index
+        .segments_snapshot()
+        .into_iter()
+        .map(|(segment, _)| segment)
+        .collect();
 
     let mut columns: BTreeSet<(ColumnId, u16)> = BTreeSet::new();
     for source in &sources {
         match source {
-            Source::Footer { footer, .. } => {
-                columns.extend(footer.partitions.iter().filter(|rows| !rows.is_empty()).map(|rows| (rows.column, rows.key_width)))
-            }
-            Source::Keys(run) => columns.extend(run.columns().iter().map(|column| (column.column, column.key_width))),
+            Source::Footer { footer, .. } => columns.extend(
+                footer
+                    .partitions
+                    .iter()
+                    .filter(|rows| !rows.is_empty())
+                    .map(|rows| (rows.column, rows.key_width)),
+            ),
+            Source::Keys(run) => columns.extend(
+                run.columns()
+                    .iter()
+                    .map(|column| (column.column, column.key_width)),
+            ),
         }
     }
-    let mut widths = columns.iter().map(|(column, _)| *column).collect::<Vec<_>>();
+    let mut widths = columns
+        .iter()
+        .map(|(column, _)| *column)
+        .collect::<Vec<_>>();
     widths.dedup();
     if widths.len() != columns.len() {
-        return Err(ReelError::Rejected("a column comes in two key widths across the runs".to_string()));
+        return Err(ReelError::Rejected(
+            "a column comes in two key widths across the runs".to_string(),
+        ));
     }
 
     let root = shared.volumes.roots()[0].clone();
@@ -191,11 +210,19 @@ pub fn merge_into_key_run(
         })
         .collect();
     for run in runs {
-        covered.extend(run.covered.iter().copied().filter(|segment| standing.contains(segment)));
+        covered.extend(
+            run.covered
+                .iter()
+                .copied()
+                .filter(|segment| standing.contains(segment)),
+        );
     }
     let covered: Vec<SegmentId> = covered.into_iter().collect();
     let before = index.key_runs().covered();
-    report.segments_covered = covered.iter().filter(|segment| !before.contains(segment)).count() as u64;
+    report.segments_covered = covered
+        .iter()
+        .filter(|segment| !before.contains(segment))
+        .count() as u64;
     report.rows_written = writer.rows();
     let path = writer.finish(&covered)?;
     let run = Arc::new(KeyRun::open(&shared.driver, &path, id)?);
@@ -240,7 +267,9 @@ fn merge_column(
     }
     // A heap of the cursors still standing on rows, least key on top, so a row costs a
     // few comparisons however many runs the merge reads.
-    let mut heap: Vec<usize> = (0..cursors.len()).filter(|at| cursors[*at].key().is_some()).collect();
+    let mut heap: Vec<usize> = (0..cursors.len())
+        .filter(|at| cursors[*at].key().is_some())
+        .collect();
     for at in (0..heap.len() / 2).rev() {
         sift_down(&mut heap, &cursors, at);
     }

@@ -21,8 +21,7 @@ use reel::format::loc::{Loc, SegmentId};
 use reel::format::lsn::Lsn;
 use reel::index::column::KeyMove;
 use reel::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, RecordKey,
-    ReelIndex,
+    Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, RecordKey, ReelIndex,
 };
 
 const ACCOUNTS: ColumnId = ColumnId(1);

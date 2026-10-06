@@ -9,9 +9,7 @@
 use std::path::Path;
 
 use reel::reel::bias::{access_ranges, available_bytes, MachineFacts, Plane, RingAvailability};
-use reel::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RangedReads, ReelConfig, ReelStore,
-};
+use reel::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RangedReads, ReelConfig, ReelStore};
 
 const RECORDS: &str = "records";
 

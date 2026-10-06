@@ -20,8 +20,8 @@ use rand::{Rng, SeedableRng};
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore,
-    SyncPolicy, ThreadBudget, MAP_EVERYTHING,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget, MAP_EVERYTHING,
 };
 use reel_core::{Direction, Store};
 

@@ -26,7 +26,9 @@ use crate::format::footer::{FooterEntry, SegmentFooter};
 use crate::format::journal::JournalRow;
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::{Lsn, LsnCounter};
-use crate::format::record::{align_up, CheckKey, Flags, RecordHeader, RecordLayout, BLOCK, HEADER_LEN};
+use crate::format::record::{
+    align_up, CheckKey, Flags, RecordHeader, RecordLayout, BLOCK, HEADER_LEN,
+};
 use crate::format::segment_header::SegmentHeader;
 use crate::index::recovery::ResumableTail;
 use crate::io::mapping::WriteMapping;
@@ -38,8 +40,8 @@ use crate::reel::{DrawnRecords, ReelShared, SegmentHolds};
 use crate::sync::{lock, read, try_lock, write};
 
 use flush::{turn_at, Owed, SyncState, Turn};
-use journal::Journal;
 pub use flush::{Durability, FlushTurn};
+use journal::Journal;
 use sealer::{
     doom_active, flush_active, park_broken_seal, publish_flush, retire_segment, seal_segment,
     Sealer,
@@ -248,7 +250,9 @@ struct Active {
 impl Active {
     /// The mapping a write copies into, while every claim lands on reserved blocks
     fn mapping(&self) -> Option<&WriteMapping> {
-        self.map.as_ref().filter(|_| self.is_mapped.load(Ordering::Acquire))
+        self.map
+            .as_ref()
+            .filter(|_| self.is_mapped.load(Ordering::Acquire))
     }
 
     /// The offset a seal cuts this segment at
@@ -991,7 +995,10 @@ impl Appender {
         mut drawn: Option<DrawnRecords<'_>>,
     ) -> Result<Vec<Committed>> {
         let count = headers.len();
-        let framed: u64 = headers.iter().map(|header| header.span_in(RecordLayout::KEYLESS)).sum();
+        let framed: u64 = headers
+            .iter()
+            .map(|header| header.span_in(RecordLayout::KEYLESS))
+            .sum();
         let span = self.reserved_batch_span(framed);
         let target = self.shared.config.segment_bytes.to_bytes();
         if span + ALIGN > target {
@@ -1533,9 +1540,7 @@ impl Appender {
             length if length >= target => end,
             length => length,
         };
-        active
-            .alloc_high
-            .store(filled.max(end), Ordering::Release);
+        active.alloc_high.store(filled.max(end), Ordering::Release);
         self.shared.driver.sync_full(active.handle.file())?;
         active.sync.synced_at.store(end, Ordering::Release);
         Ok(active)
@@ -1671,7 +1676,10 @@ impl Appender {
 
         // Stamped at the draw, since a band is what the segment is for and compaction
         // reads it off the file to place the survivors it copies out.
-        let payload = SegmentHeader::banded(id, self.band()).laid_out(layout).pack().to_vec();
+        let payload = SegmentHeader::banded(id, self.band())
+            .laid_out(layout)
+            .pack()
+            .to_vec();
         let header = RecordHeader::segment_header(&payload);
         let span = self.reserved_span(&header);
         active.reserved.store(span, Ordering::Release);
@@ -1824,7 +1832,12 @@ fn framed_bytes(key: &RecordKey, payload_len: usize) -> u64 {
 /// Resolve an intent to the header and payload the record writes
 ///
 /// The batch mark goes on before the checksum, which covers the flags.
-fn build_record(key: RecordKey, lsn: Lsn, intent: Intent, origin: Origin) -> (RecordHeader, OwnedBuf) {
+fn build_record(
+    key: RecordKey,
+    lsn: Lsn,
+    intent: Intent,
+    origin: Origin,
+) -> (RecordHeader, OwnedBuf) {
     let flags = |kind: Flags| origin.applied(kind);
     match intent {
         Intent::Data(payload, codec) => (
@@ -1840,7 +1853,15 @@ fn build_record(key: RecordKey, lsn: Lsn, intent: Intent, origin: Origin) -> (Re
             payload,
         ),
         Intent::Tombstone => (
-            RecordHeader::framed(RecordLayout::KEYLESS, 0, lsn, flags(Flags::TOMBSTONE), key, 0, &[]),
+            RecordHeader::framed(
+                RecordLayout::KEYLESS,
+                0,
+                lsn,
+                flags(Flags::TOMBSTONE),
+                key,
+                0,
+                &[],
+            ),
             Vec::new(),
         ),
         Intent::RangeTombstone(end) => (

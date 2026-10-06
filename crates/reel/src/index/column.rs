@@ -205,7 +205,13 @@ impl ColumnIndex {
     }
 
     /// Stand a grave for a tombstone compaction copied into a segment, unless a newer version stands
-    pub fn hold_grave(&self, key: &[u8], lsn: Lsn, segment: SegmentId, is_shadowed: impl FnOnce() -> bool) {
+    pub fn hold_grave(
+        &self,
+        key: &[u8],
+        lsn: Lsn,
+        segment: SegmentId,
+        is_shadowed: impl FnOnce() -> bool,
+    ) {
         on_index!(self, index => index.hold_grave(key, lsn, segment, is_shadowed))
     }
 
@@ -991,7 +997,13 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// The map's own entry is checked first, then `is_shadowed` with the shard still
     /// held, for a newer version the map cannot see. The tombstone's span is already
     /// booked, so nothing moves in the counters.
-    pub fn hold_grave(&self, key: &[u8], lsn: Lsn, segment: SegmentId, is_shadowed: impl FnOnce() -> bool) {
+    pub fn hold_grave(
+        &self,
+        key: &[u8],
+        lsn: Lsn,
+        segment: SegmentId,
+        is_shadowed: impl FnOnce() -> bool,
+    ) {
         let Some(key) = K::from_slice(key) else {
             return;
         };
@@ -999,7 +1011,9 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         let mut state = write(&self.shards[at]);
         let was_empty = state.map.vacant();
         let existing = state.map.at(key.as_slice()).copied();
-        if existing.is_some_and(|existing| !existing.is_grave() || existing.lsn > lsn) || is_shadowed() {
+        if existing.is_some_and(|existing| !existing.is_grave() || existing.lsn > lsn)
+            || is_shadowed()
+        {
             return;
         }
         // An older grave is replaced by this one and never counted again.
@@ -2047,7 +2061,9 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 if !packed {
                     // Dead entries are skipped, so the whole run is walked until the page fills.
                     for (key, entry) in keys.iter().zip(entries) {
-                        if judged || (!entry.is_grave() && !self.is_covered(key.as_slice(), entry.lsn)) {
+                        if judged
+                            || (!entry.is_grave() && !self.is_covered(key.as_slice(), entry.lsn))
+                        {
                             out.push(key.as_slice(), *entry);
                             if out.len() >= limit {
                                 return;
@@ -3165,7 +3181,11 @@ mod tests {
         let mut steps = 0;
         while let Some(pending) = index.next_pending_cover() {
             steps += 1;
-            assert!(steps < 1000, "the sweep keeps coming back to cover {:?}", pending.lsn);
+            assert!(
+                steps < 1000,
+                "the sweep keeps coming back to cover {:?}",
+                pending.lsn
+            );
             if pending.release_from.is_some() {
                 index.advance_release(pending.lsn, None);
                 continue;

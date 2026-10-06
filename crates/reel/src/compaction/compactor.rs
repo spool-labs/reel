@@ -18,8 +18,8 @@ use crate::format::footer::{FooterRow, SegmentFooter, FIXED_TAIL_LEN};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{
-    check_keyless, fits_keyless, keyless_codec, peek_key_width, read_u32_le, CheckKey, KeylessRead, RecordHeader,
-    RecordLayout, HEADER_LEN, KEYLESS_PREFIX,
+    check_keyless, fits_keyless, keyless_codec, peek_key_width, read_u32_le, CheckKey, KeylessRead,
+    RecordHeader, RecordLayout, HEADER_LEN, KEYLESS_PREFIX,
 };
 use crate::format::segment_header::SegmentHeader;
 use crate::index::map::{KeyRepoint, ReelIndex};
@@ -116,7 +116,12 @@ impl SourceRecord {
     }
 
     /// A keyless record, its header taken from its footer row
-    fn keyless(header: RecordHeader, offset: u32, stored: [u8; KEYLESS_PREFIX], check: CheckKey) -> SourceRecord {
+    fn keyless(
+        header: RecordHeader,
+        offset: u32,
+        stored: [u8; KEYLESS_PREFIX],
+        check: CheckKey,
+    ) -> SourceRecord {
         SourceRecord {
             header,
             offset,
@@ -178,7 +183,9 @@ pub fn row_record(
             key: key.clone(),
             codec: keyless_codec(&stored),
         };
-        return Ok(Some(SourceRecord::keyless(header, row.offset, stored, check)));
+        return Ok(Some(SourceRecord::keyless(
+            header, row.offset, stored, check,
+        )));
     }
     let found = RecordScan::resuming(reader, u64::from(row.offset)).next_record()?;
     Ok(found.filter(|record| record.offset == row.offset && record.header.key == *key))
@@ -489,8 +496,8 @@ impl Compactor {
     pub fn new(config: &ReelConfig, capacity_bytes: u64, fast_capacity_bytes: u64) -> Compactor {
         // One segment for each pass to write survivors into, plus one per tail, since
         // between two maintenance ticks every tail can roll and claim a fresh segment.
-        let reserve =
-            config.segment_bytes.to_bytes() * (config.tail_count() + config.compact_passes()) as u64;
+        let reserve = config.segment_bytes.to_bytes()
+            * (config.tail_count() + config.compact_passes()) as u64;
         // Half the fast tier of later ingest: late enough that the hot set stays hot,
         // early enough that the tier never fills before demotion starts.
         let demote_after_bytes = (fast_capacity_bytes > 1).then_some(fast_capacity_bytes / 2);
@@ -873,7 +880,12 @@ impl Compactor {
         tally: &mut PassTally,
         pace: &mut PassPace<'_>,
     ) -> Result<()> {
-        let Ordered { order, prefix_bound, footer, layout } = ordered;
+        let Ordered {
+            order,
+            prefix_bound,
+            footer,
+            layout,
+        } = ordered;
         let rows = match (layout, footer) {
             (RecordLayout::Keyless(_), Some(footer)) => Some(footer_rows(footer)?),
             _ => None,
@@ -919,7 +931,9 @@ impl Compactor {
                 };
                 let (offset, len) = order[start + slot];
                 let found = match (&rows, layout.keyless_key(len)) {
-                    (Some(rows), Some(check)) => keyless_held(&rows[start + slot], offset, held, check),
+                    (Some(rows), Some(check)) => {
+                        keyless_held(&rows[start + slot], offset, held, check)
+                    }
                     _ => held_record(offset, held),
                 };
                 let (record, payload) = match found {
@@ -1580,7 +1594,6 @@ impl Compactor {
                     }
                 }
             }
-
         }
         self.metrics.record_hits(hits as u64);
         self.metrics.record_scrubbed(scanned);
@@ -1678,7 +1691,11 @@ fn should_carry(index: &ReelIndex, tombstone: &RecordHeader, drop_floor: Lsn) ->
     let key_runs = index.key_runs();
     let is_held_below = match tombstone.flags.is_range_tombstone() {
         true => !key_runs.runs().is_empty(),
-        false => key_runs.holds_older(tombstone.key.column, tombstone.key.as_slice(), tombstone.lsn),
+        false => key_runs.holds_older(
+            tombstone.key.column,
+            tombstone.key.as_slice(),
+            tombstone.lsn,
+        ),
     };
     Ok(is_held_below || tombstone.lsn >= drop_floor)
 }
@@ -1907,7 +1924,10 @@ fn footer_rows(footer: &SegmentFooter) -> Result<Vec<(RecordKey, FooterRow)>> {
     for partition in &footer.partitions {
         for at in 0..partition.len() {
             let key = partition.key_at(at).unwrap_or(&[]);
-            rows.push((RecordKey::from_bytes(partition.column, key)?, partition.row_at(at)?));
+            rows.push((
+                RecordKey::from_bytes(partition.column, key)?,
+                partition.row_at(at)?,
+            ));
         }
     }
     Ok(rows)
@@ -1936,7 +1956,10 @@ fn keyless_held(
         true => None,
         false => Some(held.narrowed(KEYLESS_PREFIX, row.len as usize)),
     };
-    Some((SourceRecord::keyless(header, offset, stored, check), payload))
+    Some((
+        SourceRecord::keyless(header, offset, stored, check),
+        payload,
+    ))
 }
 
 fn held_record(offset: u32, held: Part) -> Option<(SourceRecord, Option<Part>)> {
@@ -2608,7 +2631,8 @@ mod tests {
         let footer = footer.expect("sealed");
         let partition = &footer.partitions[0];
         let row = partition.row_at(0).expect("row");
-        let listed = RecordKey::from_bytes(partition.column, partition.key_at(0).expect("key")).expect("key");
+        let listed = RecordKey::from_bytes(partition.column, partition.key_at(0).expect("key"))
+            .expect("key");
         let record = row_record(&mut reader, source.layout(), &listed, &row)
             .expect("read")
             .expect("data record");

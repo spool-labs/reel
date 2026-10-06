@@ -38,8 +38,8 @@ use reel::io::select::select_backend;
 use reel::io::slots::SLOT_COUNT;
 use reel::reel::segment::{FdCache, IoDriver};
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, Durability, IoBackend, KeyWidth,
-    RecordKey, Reel, ReelConfig, ReelShared, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, Durability, IoBackend, KeyWidth, RecordKey,
+    Reel, ReelConfig, ReelShared, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 /// Bytes every bench key occupies

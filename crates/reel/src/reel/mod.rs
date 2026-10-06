@@ -35,11 +35,14 @@ use crate::format::fence::{FenceCut, FenceReach};
 use crate::format::footer::{FooterFind, FooterPartition, FooterRow, FooterTally, SegmentFooter};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::{Lsn, LsnCounter};
-use crate::format::record::{check_keyless, fits_keyless, keyless_len, CheckKey, Flags, KeylessRead, RecordLayout, HEADER_LEN, KEYLESS_PREFIX};
+use crate::format::record::{
+    check_keyless, fits_keyless, keyless_len, CheckKey, Flags, KeylessRead, RecordLayout,
+    HEADER_LEN, KEYLESS_PREFIX,
+};
 use crate::index::counters::{FilterProbes, SegmentTable};
-use crate::index::spot::{SpotRead, Head, HeadRead, RecordSource};
 use crate::index::paged::{FooterCache, FooterSource};
 use crate::index::recovery::{read_footer, ResumableTail};
+use crate::index::spot::{Head, HeadRead, RecordSource, SpotRead};
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
 use crate::io::op::{Advice, ColdRoute, Completion, FileId, Op, WarmFirst};
 use crate::reel::bands::BandPool;
@@ -49,8 +52,9 @@ use crate::sync::{lock, read, write};
 use reel_core::{ReadBlock, Value};
 
 use read::{
-    check_in_block, cut_range, decoded, deep_range, frame_to_range, frame_to_read, framed_or_nothing, keyless_range, merge_runs_into,
-    merge_span, near_range, place_runs, window_or_nothing, window_start, Planned, Run, MERGE_GAP,
+    check_in_block, cut_range, decoded, deep_range, frame_to_range, frame_to_read,
+    framed_or_nothing, keyless_range, merge_runs_into, merge_span, near_range, place_runs,
+    window_or_nothing, window_start, Planned, Run, MERGE_GAP,
 };
 
 /// The first segment number a fresh reel numbers from
@@ -92,7 +96,9 @@ impl RecordSource for ReelShared {
             return self.keyless_head(key, segment, offset);
         }
         let prefix = (HEADER_LEN + key.bytes.len()) as u64;
-        let bytes = self.driver.pread(handle.file(), u64::from(offset), prefix)?;
+        let bytes = self
+            .driver
+            .pread(handle.file(), u64::from(offset), prefix)?;
         Ok(head_read(&bytes, key))
     }
 
@@ -112,13 +118,25 @@ impl RecordSource for ReelShared {
             return Ok(keyless_head_of(found, offset));
         }
         let prefix = HEADER_LEN + key.bytes.len();
-        Ok(match self.driver.warm_only(handle.file(), u64::from(offset), prefix) {
-            Some(bytes) => head_read(&bytes, key),
-            None => HeadRead::Cold,
-        })
+        Ok(
+            match self
+                .driver
+                .warm_only(handle.file(), u64::from(offset), prefix)
+            {
+                Some(bytes) => head_read(&bytes, key),
+                None => HeadRead::Cold,
+            },
+        )
     }
 
-    fn record(&self, key: &RecordKey, segment: SegmentId, offset: u32, bound: u32, alone: bool) -> Result<SpotRead> {
+    fn record(
+        &self,
+        key: &RecordKey,
+        segment: SegmentId,
+        offset: u32,
+        bound: u32,
+        alone: bool,
+    ) -> Result<SpotRead> {
         let Some(handle) = self.handle_for(segment)? else {
             return Ok(SpotRead::Gone);
         };
@@ -162,7 +180,11 @@ impl RecordSource for ReelShared {
 /// class fits, and the record says where its payload ends inside it. A record that
 /// checks out under the key is the key's one sealed version. Anything else, another
 /// key's record or rot, only the row can tell apart, so nothing comes back for it.
-fn lone_keyless(answer: SplitAnswer, key: &RecordKey, check: &CheckKey) -> Result<Option<SpotRead>> {
+fn lone_keyless(
+    answer: SplitAnswer,
+    key: &RecordKey,
+    check: &CheckKey,
+) -> Result<Option<SpotRead>> {
     let (head, mut body) = match answer {
         Ok(read) => read,
         Err((error, spare)) => {
@@ -185,11 +207,15 @@ fn lone_keyless(answer: SplitAnswer, key: &RecordKey, check: &CheckKey) -> Resul
         crate::reel::payload::give(body);
         return Ok(None);
     };
-    Ok(Some(match decoded(codec, Value::pooled(body, crate::reel::payload::give)) {
-        RecordRead::Found(value) => SpotRead::Newest(len, value),
-        // checked out whole and still would not decode, which the checked path settles
-        RecordRead::Corrupt | RecordRead::Stale | RecordRead::Gone | RecordRead::Coded => SpotRead::Unsure,
-    }))
+    Ok(Some(
+        match decoded(codec, Value::pooled(body, crate::reel::payload::give)) {
+            RecordRead::Found(value) => SpotRead::Newest(len, value),
+            // checked out whole and still would not decode, which the checked path settles
+            RecordRead::Corrupt | RecordRead::Stale | RecordRead::Gone | RecordRead::Coded => {
+                SpotRead::Unsure
+            }
+        },
+    ))
 }
 
 /// A window of a payload a read already holds, in a buffer of its own
@@ -235,7 +261,11 @@ fn keyless_head_of(found: Option<FooterRow>, offset: u32) -> HeadRead {
 }
 
 /// The row of a key's run that sits at an offset, nothing where none of them does
-fn row_at_offset(partition: &FooterPartition, key: &[u8], offset: u32) -> Result<Option<FooterRow>> {
+fn row_at_offset(
+    partition: &FooterPartition,
+    key: &[u8],
+    offset: u32,
+) -> Result<Option<FooterRow>> {
     for at in partition.lower_bound(key)..partition.upper_bound(key) {
         let row = partition.row_at(at)?;
         if row.offset == offset {
@@ -362,7 +392,11 @@ impl ReelShared {
             return Ok(None);
         }
         let loc = Loc::new(segment, offset, head.len);
-        Ok(Some(range_of(self.whole_record(handle, key, head, loc)?, at, len)))
+        Ok(Some(range_of(
+            self.whole_record(handle, key, head, loc)?,
+            at,
+            len,
+        )))
     }
 
     /// The record at a place, read as a future in one read of its header and up to `bound` payload bytes
@@ -427,17 +461,38 @@ impl ReelShared {
     }
 
     /// One record read as a future at the length its header gave
-    async fn whole_record_wait(&self, handle: &SegmentHandle, key: &RecordKey, head: Head, loc: Loc) -> Result<SpotRead> {
+    async fn whole_record_wait(
+        &self,
+        handle: &SegmentHandle,
+        key: &RecordKey,
+        head: Head,
+        loc: Loc,
+    ) -> Result<SpotRead> {
         let layout = handle.layout();
         let prefix = layout.prefix_len(key.as_slice().len(), loc.len);
         let len = loc.len as usize;
         let read = self
             .driver
-            .wait_split_reusing(handle.file(), u64::from(loc.offset), prefix, len, take_header(), self.warm_first())
+            .wait_split_reusing(
+                handle.file(),
+                u64::from(loc.offset),
+                prefix,
+                len,
+                take_header(),
+                self.warm_first(),
+            )
             .await;
         Ok(match framed_or_nothing(read, prefix, len)? {
             Some((bytes, body)) => spot_read_of(
-                frame_to_read(bytes, body, key.as_ref(), head.lsn, loc, layout, self.config.verify_reads),
+                frame_to_read(
+                    bytes,
+                    body,
+                    key.as_ref(),
+                    head.lsn,
+                    loc,
+                    layout,
+                    self.config.verify_reads,
+                ),
                 head,
             ),
             None => SpotRead::Other,
@@ -486,12 +541,20 @@ impl ReelShared {
         let base = u64::from(offset);
         if at <= MERGE_GAP {
             let span = at as usize + len;
-            let answer = self.driver.pread_split_reusing(handle.file(), base, prefix, span, take_header(), self.warm_first());
+            let answer = self.driver.pread_split_reusing(
+                handle.file(),
+                base,
+                prefix,
+                span,
+                take_header(),
+                self.warm_first(),
+            );
             return near_spot_range(answer, key, at, len);
         }
         let ops = vec![
             self.driver.split_read(handle.file(), base, 0, prefix),
-            self.driver.split_read(handle.file(), base + prefix as u64 + at, 0, len),
+            self.driver
+                .split_read(handle.file(), base + prefix as u64 + at, 0, len),
         ];
         deep_spot_range(self.driver.run_split_reads(ops)?, key, at, len)
     }
@@ -538,13 +601,21 @@ impl ReelShared {
             let span = at as usize + len;
             let answer = self
                 .driver
-                .wait_split_reusing(handle.file(), base, prefix, span, take_header(), WarmFirst::Skip)
+                .wait_split_reusing(
+                    handle.file(),
+                    base,
+                    prefix,
+                    span,
+                    take_header(),
+                    WarmFirst::Skip,
+                )
                 .await;
             return near_spot_range(answer, key, at, len);
         }
         let ops = vec![
             self.driver.split_read(handle.file(), base, 0, prefix),
-            self.driver.split_read(handle.file(), base + prefix as u64 + at, 0, len),
+            self.driver
+                .split_read(handle.file(), base + prefix as u64 + at, 0, len),
         ];
         deep_spot_range(self.driver.wait_split_reads(ops).await?, key, at, len)
     }
@@ -562,10 +633,12 @@ impl ReelShared {
                     let loc = Loc::new(ask.segment, ask.offset, head.len);
                     self.exact_read(next_split(&mut filled)?, &handle, ask.key, head, loc)?
                 }
-                Asked::Lone(handle, check) => match lone_keyless(next_split(&mut filled)?, ask.key, &check)? {
-                    Some(read) => read,
-                    None => self.keyless_record(&handle, ask.key, ask.segment, ask.offset)?,
-                },
+                Asked::Lone(handle, check) => {
+                    match lone_keyless(next_split(&mut filled)?, ask.key, &check)? {
+                        Some(read) => read,
+                        None => self.keyless_record(&handle, ask.key, ask.segment, ask.offset)?,
+                    }
+                }
                 Asked::Bounded(handle) => {
                     let answer = next_split(&mut filled)?;
                     match self.spot_verdict(answer, ask.key, ask.segment, ask.offset)? {
@@ -594,10 +667,12 @@ impl ReelShared {
                     let loc = Loc::new(ask.segment, ask.offset, head.len);
                     self.exact_read(next_split(&mut filled)?, &handle, ask.key, head, loc)?
                 }
-                Asked::Lone(handle, check) => match lone_keyless(next_split(&mut filled)?, ask.key, &check)? {
-                    Some(read) => read,
-                    None => self.keyless_record(&handle, ask.key, ask.segment, ask.offset)?,
-                },
+                Asked::Lone(handle, check) => {
+                    match lone_keyless(next_split(&mut filled)?, ask.key, &check)? {
+                        Some(read) => read,
+                        None => self.keyless_record(&handle, ask.key, ask.segment, ask.offset)?,
+                    }
+                }
                 Asked::Bounded(handle) => {
                     let answer = next_split(&mut filled)?;
                     match self.spot_verdict(answer, ask.key, ask.segment, ask.offset)? {
@@ -628,7 +703,12 @@ impl ReelShared {
             let layout = handle.layout();
             if let RecordLayout::Keyless(check) = layout {
                 if ask.alone && fits_keyless(ask.bound) {
-                    ops.push(self.driver.split_read(handle.file(), u64::from(ask.offset), KEYLESS_PREFIX, ask.bound as usize));
+                    ops.push(self.driver.split_read(
+                        handle.file(),
+                        u64::from(ask.offset),
+                        KEYLESS_PREFIX,
+                        ask.bound as usize,
+                    ));
                     asked.push(Asked::Lone(handle, check));
                     continue;
                 }
@@ -648,24 +728,49 @@ impl ReelShared {
                     continue;
                 }
                 let prefix = layout.prefix_len(ask.key.as_slice().len(), head.len);
-                ops.push(self.driver.split_read(handle.file(), u64::from(ask.offset), prefix, head.len as usize));
+                ops.push(self.driver.split_read(
+                    handle.file(),
+                    u64::from(ask.offset),
+                    prefix,
+                    head.len as usize,
+                ));
                 asked.push(Asked::Exact(handle, head));
                 continue;
             }
             let prefix = HEADER_LEN + ask.key.as_slice().len();
-            ops.push(self.driver.split_read(handle.file(), u64::from(ask.offset), prefix, ask.bound as usize));
+            ops.push(self.driver.split_read(
+                handle.file(),
+                u64::from(ask.offset),
+                prefix,
+                ask.bound as usize,
+            ));
             asked.push(Asked::Bounded(handle));
         }
         Ok((ops, asked))
     }
 
     /// Settle a record read at the exact length its row gave
-    fn exact_read(&self, answer: SplitAnswer, handle: &SegmentHandle, key: &RecordKey, head: Head, loc: Loc) -> Result<SpotRead> {
+    fn exact_read(
+        &self,
+        answer: SplitAnswer,
+        handle: &SegmentHandle,
+        key: &RecordKey,
+        head: Head,
+        loc: Loc,
+    ) -> Result<SpotRead> {
         let layout = handle.layout();
         let prefix = layout.prefix_len(key.as_slice().len(), loc.len);
         Ok(match framed_or_nothing(answer, prefix, loc.len as usize)? {
             Some((bytes, body)) => spot_read_of(
-                frame_to_read(bytes, body, key.as_ref(), head.lsn, loc, layout, self.config.verify_reads),
+                frame_to_read(
+                    bytes,
+                    body,
+                    key.as_ref(),
+                    head.lsn,
+                    loc,
+                    layout,
+                    self.config.verify_reads,
+                ),
                 head,
             ),
             None => SpotRead::Other,
@@ -673,7 +778,13 @@ impl ReelShared {
     }
 
     /// Settle one bounded read of a candidate, or say it needs a read at the record's own length
-    fn spot_verdict(&self, answer: SplitAnswer, key: &RecordKey, segment: SegmentId, offset: u32) -> Result<Verdict> {
+    fn spot_verdict(
+        &self,
+        answer: SplitAnswer,
+        key: &RecordKey,
+        segment: SegmentId,
+        offset: u32,
+    ) -> Result<Verdict> {
         let (bytes, mut body) = match answer {
             Ok(read) => read,
             Err((error, spare)) => {
@@ -709,7 +820,13 @@ impl ReelShared {
     }
 
     /// One record read at the length its header or its row gave
-    fn whole_record(&self, handle: &SegmentHandle, key: &RecordKey, head: Head, loc: Loc) -> Result<SpotRead> {
+    fn whole_record(
+        &self,
+        handle: &SegmentHandle,
+        key: &RecordKey,
+        head: Head,
+        loc: Loc,
+    ) -> Result<SpotRead> {
         let layout = handle.layout();
         let prefix = layout.prefix_len(key.as_slice().len(), loc.len);
         let len = loc.len as usize;
@@ -723,7 +840,15 @@ impl ReelShared {
         );
         Ok(match framed_or_nothing(read, prefix, len)? {
             Some((bytes, body)) => spot_read_of(
-                frame_to_read(bytes, body, key.as_ref(), head.lsn, loc, layout, self.config.verify_reads),
+                frame_to_read(
+                    bytes,
+                    body,
+                    key.as_ref(),
+                    head.lsn,
+                    loc,
+                    layout,
+                    self.config.verify_reads,
+                ),
                 head,
             ),
             None => SpotRead::Other,
@@ -741,10 +866,12 @@ fn range_head(prefix: &[u8], key: &RecordKey) -> std::result::Result<Head, SpotR
     match head_read(prefix, key.as_ref()) {
         HeadRead::Same(head) if head.is_tombstone => Err(SpotRange::Tombstone(head)),
         // A coded record's window is of the payload it decodes to, so only a whole read cuts it.
-        HeadRead::Same(head) => match crate::format::record::data_codec(prefix, key.as_ref(), head.lsn, head.len) {
-            Some(0) => Ok(head),
-            Some(_) | None => Err(SpotRange::Unsure),
-        },
+        HeadRead::Same(head) => {
+            match crate::format::record::data_codec(prefix, key.as_ref(), head.lsn, head.len) {
+                Some(0) => Ok(head),
+                Some(_) | None => Err(SpotRange::Unsure),
+            }
+        }
         HeadRead::Other | HeadRead::Missing | HeadRead::Cold => Err(SpotRange::Other),
     }
 }
@@ -785,7 +912,12 @@ fn near_spot_range(answer: SplitAnswer, key: &RecordKey, at: u64, len: usize) ->
 }
 
 /// A window that came as its own read beside its record's header
-fn deep_spot_range(filled: Vec<SplitRead>, key: &RecordKey, at: u64, len: usize) -> Result<SpotRange> {
+fn deep_spot_range(
+    filled: Vec<SplitRead>,
+    key: &RecordKey,
+    at: u64,
+    len: usize,
+) -> Result<SpotRange> {
     let mut filled = filled.into_iter();
     let header = next_split(&mut filled)?;
     let window = next_split(&mut filled)?;
@@ -838,11 +970,13 @@ fn next_split(filled: &mut impl Iterator<Item = SplitRead>) -> Result<SplitAnswe
 /// What a record's header says about one key, a pad or another key reading as other
 fn head_read(prefix: &[u8], key: KeyRef<'_>) -> HeadRead {
     match crate::format::record::head_for(prefix, key) {
-        Some((lsn, len, flags)) if flags.is_data() || flags.is_tombstone() => HeadRead::Same(Head {
-            lsn,
-            len,
-            is_tombstone: flags.is_tombstone(),
-        }),
+        Some((lsn, len, flags)) if flags.is_data() || flags.is_tombstone() => {
+            HeadRead::Same(Head {
+                lsn,
+                len,
+                is_tombstone: flags.is_tombstone(),
+            })
+        }
         Some(_) | None => HeadRead::Other,
     }
 }
@@ -2063,7 +2197,15 @@ impl Reel {
             Some(framed) => framed,
             None => return Ok(RecordRead::Stale),
         };
-        Ok(frame_to_read(head, body, expected, lsn, loc, layout, is_verified))
+        Ok(frame_to_read(
+            head,
+            body,
+            expected,
+            lsn,
+            loc,
+            layout,
+            is_verified,
+        ))
     }
 
     /// Read one record as a future, always through the driver
@@ -2101,7 +2243,15 @@ impl Reel {
             Some(framed) => framed,
             None => return Ok(RecordRead::Stale),
         };
-        Ok(frame_to_read(head, body, expected, lsn, loc, layout, is_verified))
+        Ok(frame_to_read(
+            head,
+            body,
+            expected,
+            lsn,
+            loc,
+            layout,
+            is_verified,
+        ))
     }
 
     /// Read one window of a record's payload with no echo, one device read
@@ -2119,7 +2269,11 @@ impl Reel {
         let Some(handle) = self.handle_for(loc.segment)? else {
             return Ok(None);
         };
-        let start = window_start(loc, handle.layout().prefix_len(key_width as usize, loc.len), at);
+        let start = window_start(
+            loc,
+            handle.layout().prefix_len(key_width as usize, loc.len),
+            at,
+        );
 
         if self.maps(loc.segment, len) {
             if let Some(map) = handle.mapping(self.shared.config.segment_bytes.to_bytes()) {
@@ -2154,7 +2308,11 @@ impl Reel {
         let Some(handle) = self.handle_for(loc.segment)? else {
             return Ok(None);
         };
-        let start = window_start(loc, handle.layout().prefix_len(key_width as usize, loc.len), at);
+        let start = window_start(
+            loc,
+            handle.layout().prefix_len(key_width as usize, loc.len),
+            at,
+        );
         let route = self.window_route(&handle, loc);
         let _depth = self.shared.enter_cold();
         let read = self
@@ -2278,7 +2436,14 @@ impl Reel {
             let read = self
                 .shared
                 .driver
-                .wait_split_reusing(handle.file(), offset, KEYLESS_PREFIX, whole, take_header(), WarmFirst::Skip)
+                .wait_split_reusing(
+                    handle.file(),
+                    offset,
+                    KEYLESS_PREFIX,
+                    whole,
+                    take_header(),
+                    WarmFirst::Skip,
+                )
                 .await;
             return Ok(match framed_or_nothing(read, KEYLESS_PREFIX, whole)? {
                 Some((head, body)) => keyless_range(head, body, expected, &check, at, len),
@@ -2463,8 +2628,16 @@ impl Reel {
                 continue;
             };
             let prefix = layout.prefix_len(key.width(), ask.loc.len);
-            if let Ok(codec) = check_in_block(record, 0, prefix, key, ask.lsn, ask.loc, layout, is_verified)
-            {
+            if let Ok(codec) = check_in_block(
+                record,
+                0,
+                prefix,
+                key,
+                ask.lsn,
+                ask.loc,
+                layout,
+                is_verified,
+            ) {
                 if mapped.capacity() == 0 {
                     let wanted = asks.iter().map(|ask| ask.loc.len as usize).sum();
                     mapped = crate::reel::payload::take(wanted);
@@ -2540,11 +2713,14 @@ impl Reel {
         if !self.maps(ask.loc.segment, len) {
             return None;
         }
-        let at = handles.binary_search_by_key(&ask.loc.segment, SegmentHandle::id).ok()?;
+        let at = handles
+            .binary_search_by_key(&ask.loc.segment, SegmentHandle::id)
+            .ok()?;
         let layout = handles[at].layout();
         let map = handles[at].mapping(self.shared.config.segment_bytes.to_bytes())?;
         let prefix = layout.prefix_len(keys[ask.at as usize].width(), ask.loc.len);
-        map.slice(u64::from(ask.loc.offset), prefix + len).map(|record| (record, layout))
+        map.slice(u64::from(ask.loc.offset), prefix + len)
+            .map(|record| (record, layout))
     }
 
     /// Take a segment's handle once per batch and lend it for every record after
@@ -2578,7 +2754,11 @@ impl Reel {
     fn maps(&self, segment: SegmentId, len: usize) -> bool {
         let config = &self.shared.config;
         config.maps(len)
-            || (config.maps_tails() && self.tails().iter().any(|tail| tail.tail().active_segment() == segment))
+            || (config.maps_tails()
+                && self
+                    .tails()
+                    .iter()
+                    .any(|tail| tail.tail().active_segment() == segment))
     }
 
     /// Resolve a segment number to a handle, opening and caching it on a miss

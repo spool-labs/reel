@@ -20,9 +20,7 @@ use reel::config::{Preallocate, ReelConfig, SyncPolicy};
 use reel::format::column::RecordKey;
 use reel::io::posix_backend::PosixBackend;
 use reel::reel::segment::{FdCache, IoDriver};
-use reel::{
-    Appender, ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelShared,
-};
+use reel::{Appender, ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelShared};
 
 /// Bytes the group takes at the front of a record key
 const GROUP_PREFIX_LEN: usize = 2;

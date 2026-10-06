@@ -15,8 +15,8 @@ use reel::format::record::HEADER_LEN;
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth,
-    Preallocate, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, Preallocate,
+    ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 use reel_core::Value;
 

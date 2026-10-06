@@ -122,7 +122,9 @@ impl SegmentHeader {
                     .get(CHECK_AT..SEGMENT_HEADER_SPAN)
                     .and_then(|key| key.try_into().ok())
                     .ok_or_else(|| {
-                        ReelError::Corruption("a keyless segment header holds no check key".to_string())
+                        ReelError::Corruption(
+                            "a keyless segment header holds no check key".to_string(),
+                        )
                     })?;
                 RecordLayout::Keyless(CheckKey::from_bytes(check))
             }
@@ -177,11 +179,16 @@ mod tests {
             layout: RecordLayout::Keyless(CHECK),
         };
 
-        let mut wanted = vec![0x02, 0x00, 0x00, 0x01, 0x02, 0x03, 0x01, 0x07, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        let mut wanted = vec![
+            0x02, 0x00, 0x00, 0x01, 0x02, 0x03, 0x01, 0x07, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
         wanted.extend_from_slice(&[0xc0; CHECK_KEY_LEN]);
         assert_eq!(header.pack().to_vec(), wanted);
         assert_eq!(SEGMENT_HEADER_LEN, VERSION_LEN + SEGMENT_LEN);
-        assert_eq!(SEGMENT_HEADER_SPAN, SEGMENT_HEADER_LEN + BAND_LEN + 1 + CHECK_KEY_LEN);
+        assert_eq!(
+            SEGMENT_HEADER_SPAN,
+            SEGMENT_HEADER_LEN + BAND_LEN + 1 + CHECK_KEY_LEN
+        );
     }
 
     // a payload from a build that wrote no band reads as unbanded rather than failing
@@ -212,7 +219,9 @@ mod tests {
     // a keyless header cut before its check key refuses the file
     #[test]
     fn keyless_without_its_key_rejected() {
-        let packed = SegmentHeader::new(SegmentId(9)).laid_out(RecordLayout::Keyless(CHECK)).pack();
+        let packed = SegmentHeader::new(SegmentId(9))
+            .laid_out(RecordLayout::Keyless(CHECK))
+            .pack();
 
         assert!(SegmentHeader::unpack(&packed[..SEGMENT_HEADER_SPAN - 1]).is_err());
     }

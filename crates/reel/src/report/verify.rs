@@ -422,7 +422,9 @@ fn sweep(engine: &ReelStore, file: &SegmentFile, indexed: bool, watch: &mut Watc
     };
     let layout = layout_of(&mut file);
     if !layout.is_keyless_layout() {
-        return row.faulted(format!("{name} opens with no segment header this build reads"));
+        return row.faulted(format!(
+            "{name} opens with no segment header this build reads"
+        ));
     }
     match engine.segment_footer(segment) {
         Ok(Some(footer)) => {
@@ -438,7 +440,9 @@ fn sweep(engine: &ReelStore, file: &SegmentFile, indexed: bool, watch: &mut Watc
         }
         Ok(None) => {
             let Ok(journal) = std::fs::read(journal_path(path)) else {
-                return row.faulted(format!("{name} has no footer, and no journal lists its records"));
+                return row.faulted(format!(
+                    "{name} has no footer, and no journal lists its records"
+                ));
             };
             let (groups, _) = read_groups(&journal);
             let listed = groups
@@ -526,7 +530,8 @@ fn sweep_rows(
 fn keyed(file: &mut File, at: u64, width: u16, len: u32) -> std::result::Result<u64, String> {
     let span = HEADER_LEN as u64 + u64::from(width) + u64::from(len);
     let bytes = read_at(file, at, span).map_err(|error| format!("read at {at} failed: {error}"))?;
-    let header = RecordHeader::unpack(&bytes).map_err(|error| format!("header at {at} does not parse: {error}"))?;
+    let header = RecordHeader::unpack(&bytes)
+        .map_err(|error| format!("header at {at} does not parse: {error}"))?;
     let payload = bytes.get(header.prefix_len() as usize..).unwrap_or(&[]);
     match header.verify(payload) {
         true => Ok(header.span()),

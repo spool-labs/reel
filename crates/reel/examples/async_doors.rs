@@ -13,8 +13,8 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore,
-    Store, StoreResult, Value, WriteBatch,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, Store,
+    StoreResult, Value, WriteBatch,
 };
 
 const RECORDS: &str = "records";

@@ -258,19 +258,35 @@ fn spot_answers_sealed_keys() {
     }
     store.flush().expect("flush");
     assert!(store.page_out_sealed().expect("hand over") > 0);
-    assert!(store.index.spot_held() > 0, "the handover filled the spot index");
+    assert!(
+        store.index.spot_held() > 0,
+        "the handover filled the spot index"
+    );
 
     // Every get path agrees: one at a time, in a batch, and as a future of each.
     let check = |store: &ReelStore, expected: &[Option<Vec<u8>>], stage: &str| {
-        let keys: Vec<RecordKey> = (0..expected.len()).map(|byte| record(7, byte as u8)).collect();
+        let keys: Vec<RecordKey> = (0..expected.len())
+            .map(|byte| record(7, byte as u8))
+            .collect();
         let many = store.get_many(&keys).expect("get many");
         let waited_many = block_on(store.get_many_wait(&keys)).expect("awaited get many");
         for (byte, value) in expected.iter().enumerate() {
-            let found = store.get(&keys[byte]).expect("read").map(|found| found.to_vec());
+            let found = store
+                .get(&keys[byte])
+                .expect("read")
+                .map(|found| found.to_vec());
             assert_eq!(&found, value, "key {byte} after {stage}");
             let waited = block_on(store.get_wait(&keys[byte])).expect("awaited get");
-            assert_eq!(&waited.map(|found| found.to_vec()), value, "awaited key {byte} after {stage}");
-            assert_eq!(&many[byte].as_ref().map(|found| found.to_vec()), value, "batched key {byte} after {stage}");
+            assert_eq!(
+                &waited.map(|found| found.to_vec()),
+                value,
+                "awaited key {byte} after {stage}"
+            );
+            assert_eq!(
+                &many[byte].as_ref().map(|found| found.to_vec()),
+                value,
+                "batched key {byte} after {stage}"
+            );
             let waited = waited_many[byte].as_ref().map(|found| found.to_vec());
             assert_eq!(&waited, value, "awaited batched key {byte} after {stage}");
             // A window near the front, one deep in the payload, and one cut short at its end.
@@ -279,17 +295,27 @@ fn spot_answers_sealed_keys() {
                     let from = (at as usize).min(value.len());
                     value[from..(from + len).min(value.len())].to_vec()
                 });
-                let window = store.get_range(&keys[byte], at, len).expect("range").map(|found| found.to_vec());
+                let window = store
+                    .get_range(&keys[byte], at, len)
+                    .expect("range")
+                    .map(|found| found.to_vec());
                 assert_eq!(window, want, "key {byte} window {at}+{len} after {stage}");
-                let waited = block_on(store.get_range_wait(&keys[byte], at, len)).expect("awaited range");
-                assert_eq!(waited.map(|found| found.to_vec()), want, "awaited key {byte} window {at}+{len} after {stage}");
+                let waited =
+                    block_on(store.get_range_wait(&keys[byte], at, len)).expect("awaited range");
+                assert_eq!(
+                    waited.map(|found| found.to_vec()),
+                    want,
+                    "awaited key {byte} window {at}+{len} after {stage}"
+                );
             }
         }
     };
     check(&store, &expected, "the handover");
 
     for byte in (0..200u8).step_by(3) {
-        store.put(&record(7, byte), &value(byte, 1)).expect("overwrite");
+        store
+            .put(&record(7, byte), &value(byte, 1))
+            .expect("overwrite");
         expected[byte as usize] = Some(value(byte, 1));
     }
     for byte in (1..200u8).step_by(5) {
@@ -314,7 +340,10 @@ fn spot_answers_sealed_keys() {
     let restored = SimIo::from_image(sim.durable_image());
     let reopened = ReelStore::open_with_io(PathBuf::from(ROOT), paged, COLUMNS, Arc::new(restored))
         .expect("reopen");
-    assert!(reopened.index.spot_held() > 0, "the open loaded the spot index");
+    assert!(
+        reopened.index.spot_held() > 0,
+        "the open loaded the spot index"
+    );
     check(&reopened, &expected, "a reopen");
 }
 
@@ -345,12 +374,36 @@ fn spot_reads_take_one_read_a_key() {
         read();
         sim.ops() - before
     };
-    assert_eq!(reads(&|| drop(store.get(&handed[1]).expect("get"))), 1, "a get");
-    assert_eq!(reads(&|| drop(block_on(store.get_wait(&handed[2])).expect("get"))), 1, "an awaited get");
-    assert_eq!(reads(&|| drop(store.get_range(&handed[3], 10, 100).expect("range"))), 1, "a near window");
-    assert_eq!(reads(&|| drop(store.get_range(&handed[4], 6_000, 1_000).expect("range"))), 2, "a deep window");
-    assert_eq!(reads(&|| drop(store.get_many(&handed).expect("many"))), 10, "a batch");
-    assert_eq!(reads(&|| drop(block_on(store.get_many_wait(&handed)).expect("many"))), 10, "an awaited batch");
+    assert_eq!(
+        reads(&|| drop(store.get(&handed[1]).expect("get"))),
+        1,
+        "a get"
+    );
+    assert_eq!(
+        reads(&|| drop(block_on(store.get_wait(&handed[2])).expect("get"))),
+        1,
+        "an awaited get"
+    );
+    assert_eq!(
+        reads(&|| drop(store.get_range(&handed[3], 10, 100).expect("range"))),
+        1,
+        "a near window"
+    );
+    assert_eq!(
+        reads(&|| drop(store.get_range(&handed[4], 6_000, 1_000).expect("range"))),
+        2,
+        "a deep window"
+    );
+    assert_eq!(
+        reads(&|| drop(store.get_many(&handed).expect("many"))),
+        10,
+        "a batch"
+    );
+    assert_eq!(
+        reads(&|| drop(block_on(store.get_many_wait(&handed)).expect("many"))),
+        10,
+        "an awaited batch"
+    );
 }
 
 // compaction gives each overwrite booked from its length class its true length back as the segment retires
@@ -373,15 +426,30 @@ fn compaction_rebooks_class_bookings_at_their_true_length() {
         store.put(&record(7, byte), &payload).expect("overwrite");
     }
     store.flush().expect("flush");
-    assert!(store.spot_slack() > 0, "no overwrite was booked from its class");
-    assert_ne!(store.totals().bytes, exact, "the class middle happened to equal the payload");
+    assert!(
+        store.spot_slack() > 0,
+        "no overwrite was booked from its class"
+    );
+    assert_ne!(
+        store.totals().bytes,
+        exact,
+        "the class middle happened to equal the payload"
+    );
 
     for _ in 0..8 {
         store.compact_once().expect("compact");
         store.maintain_once().expect("maintain");
     }
-    assert_eq!(store.spot_slack(), 0, "a class booking outlived its segment");
-    assert_eq!(store.totals().bytes, exact, "the live bytes kept a class booking's error");
+    assert_eq!(
+        store.spot_slack(),
+        0,
+        "a class booking outlived its segment"
+    );
+    assert_eq!(
+        store.totals().bytes,
+        exact,
+        "the live bytes kept a class booking's error"
+    );
 }
 
 // a cue read of a key unchanged since the cue takes one read, and one rewritten since reads the footers
@@ -407,18 +475,34 @@ fn a_cue_read_takes_one_read_while_the_key_stands() {
         .filter(|key| is_paged(&store, key))
         .take(2)
         .collect();
-    assert_eq!(standing.len(), 2, "two unchanged keys went to the spot index");
+    assert_eq!(
+        standing.len(),
+        2,
+        "two unchanged keys went to the spot index"
+    );
     store.get_at(&standing[0], &cue).expect("warm");
 
     let before = sim.ops();
     let read = store.get_at(&standing[1], &cue).expect("cue read");
-    assert_eq!(sim.ops() - before, 1, "an unchanged key read more than once");
+    assert_eq!(
+        sim.ops() - before,
+        1,
+        "an unchanged key read more than once"
+    );
     assert_eq!(read.as_deref(), Some(&first[..]));
     for byte in 0..10u8 {
         let read = store.get_at(&record(7, byte), &cue).expect("cue read");
-        assert_eq!(read.as_deref(), Some(&first[..]), "key {byte} answered past the cue");
+        assert_eq!(
+            read.as_deref(),
+            Some(&first[..]),
+            "key {byte} answered past the cue"
+        );
         let live = store.get(&record(7, byte)).expect("get");
-        assert_eq!(live.as_deref(), Some(&second[..]), "key {byte} lost its rewrite");
+        assert_eq!(
+            live.as_deref(),
+            Some(&second[..]),
+            "key {byte} lost its rewrite"
+        );
     }
 }
 
@@ -445,7 +529,10 @@ fn spot_keeps_rebuilt_segments_through_a_retire() {
     let restored = SimIo::from_image(sim.durable_image());
     let reopened = ReelStore::open_with_io(PathBuf::from(ROOT), paged, COLUMNS, Arc::new(restored))
         .expect("reopen");
-    assert!(reopened.index.spot_held() > 0, "the open loaded the spot index");
+    assert!(
+        reopened.index.spot_held() > 0,
+        "the open loaded the spot index"
+    );
     for _ in 0..4 {
         reopened.compact_once().expect("compact");
         reopened.maintain_once().expect("maintain");
@@ -456,7 +543,10 @@ fn spot_keeps_rebuilt_segments_through_a_retire() {
         "nothing retired, so the sweep never ran"
     );
     for byte in 0..200u8 {
-        assert!(reopened.get(&record(7, byte)).expect("get").is_some(), "key {byte} went missing");
+        assert!(
+            reopened.get(&record(7, byte)).expect("get").is_some(),
+            "key {byte} went missing"
+        );
     }
 }
 
@@ -474,18 +564,29 @@ fn spot_takes_ranges_and_prefix_counts() {
     }
     store.flush().expect("flush");
     assert!(store.page_out_sealed().expect("hand over") > 0);
-    assert!(store.index.spot_held() > 0, "the handover filled the spot index");
+    assert!(
+        store.index.spot_held() > 0,
+        "the handover filled the spot index"
+    );
 
     let dropped = 50..150u8;
     store
-        .delete_range(&record(7, dropped.start), Some(record(7, dropped.end).as_slice()))
+        .delete_range(
+            &record(7, dropped.start),
+            Some(record(7, dropped.end).as_slice()),
+        )
         .expect("delete range");
     let check = |store: &ReelStore, stage: &str| {
         for byte in 0..200u8 {
             let found = store.get(&record(7, byte)).expect("get");
-            assert_eq!(found.is_some(), !dropped.contains(&byte), "key {byte} after {stage}");
+            assert_eq!(
+                found.is_some(),
+                !dropped.contains(&byte),
+                "key {byte} after {stage}"
+            );
         }
-        let counted = reel_core::Store::count_prefix(store, "record", &7u16.to_be_bytes()).expect("count");
+        let counted =
+            reel_core::Store::count_prefix(store, "record", &7u16.to_be_bytes()).expect("count");
         assert_eq!(counted, 100, "the prefix count after {stage}");
     };
     check(&store, "the range delete");
@@ -744,7 +845,10 @@ fn naming_a_seal_reads_no_footer() {
             "{segment:?} went unnamed"
         );
     }
-    assert!(store.reel.shared().pending_seals().is_empty(), "a seal stayed owed");
+    assert!(
+        store.reel.shared().pending_seals().is_empty(),
+        "a seal stayed owed"
+    );
 }
 
 // a paged reopen leaves its sealed keys in the footers instead of installing them
@@ -1130,7 +1234,11 @@ fn a_fresh_key_skips_the_sealed_search() {
     // A key never written: the spot index holds nothing for it, so no footer is asked.
     let before = store.filter_probes();
     assert!(store.get(&record(9, 250)).expect("get").is_none());
-    assert_eq!(store.filter_probes(), before, "the fresh key searched segments");
+    assert_eq!(
+        store.filter_probes(),
+        before,
+        "the fresh key searched segments"
+    );
     // A sealed key resolves through the spot index.
     assert!(store.get(&sealed).expect("get").is_some());
 
@@ -1144,7 +1252,11 @@ fn a_fresh_key_skips_the_sealed_search() {
         .expect("reopen");
     let before = reopened.filter_probes();
     assert!(reopened.get(&record(9, 250)).expect("get").is_none());
-    assert_eq!(reopened.filter_probes(), before, "the reopened fresh key searched segments");
+    assert_eq!(
+        reopened.filter_probes(),
+        before,
+        "the reopened fresh key searched segments"
+    );
     assert!(reopened.get(&sealed).expect("get").is_some());
 }
 
@@ -1460,13 +1572,28 @@ fn a_deleted_key_stays_gone_once_its_grave_is_pruned() {
     store.flush().expect("flush");
     store.page_out_sealed().expect("page out");
     store.index.prune_tombstones(Lsn(u64::MAX));
-    assert_eq!(store.index.grave_count(), 0, "the grave stood, so this tested nothing");
+    assert_eq!(
+        store.index.grave_count(),
+        0,
+        "the grave stood, so this tested nothing"
+    );
 
-    assert!(store.get(&handed).expect("read").is_none(), "a get brought the key back");
-    assert!(block_on(store.get_wait(&handed)).expect("read").is_none(), "an awaited get brought the key back");
-    let many = store.get_many(&[handed.clone(), record(8, 1)]).expect("many");
+    assert!(
+        store.get(&handed).expect("read").is_none(),
+        "a get brought the key back"
+    );
+    assert!(
+        block_on(store.get_wait(&handed)).expect("read").is_none(),
+        "an awaited get brought the key back"
+    );
+    let many = store
+        .get_many(&[handed.clone(), record(8, 1)])
+        .expect("many");
     assert!(many[0].is_none(), "a batch brought the key back");
-    assert!(store.get_range(&handed, 0, 64).expect("range").is_none(), "a range brought the key back");
+    assert!(
+        store.get_range(&handed, 0, 64).expect("range").is_none(),
+        "a range brought the key back"
+    );
 }
 
 // an idle tick prunes a grave to the counter, not to the window
@@ -2864,7 +2991,11 @@ fn an_open_tail_answers_a_window_from_its_mapping() {
         .expect("range")
         .expect("found");
     assert_eq!(&*window, &payload[40_000..44_000]);
-    assert_eq!(backend.ops() - before, 0, "a window of an open tail went to the device");
+    assert_eq!(
+        backend.ops() - before,
+        0,
+        "a window of an open tail went to the device"
+    );
 }
 
 // a vouched window of a sealed record takes one device read wherever it sits in the record
@@ -4873,7 +5004,11 @@ fn a_cue_read_waits_out_a_hand_over_in_flight() {
         ..config(1, SyncPolicy::Never)
     });
     let store = Arc::new(store);
-    let (first, second, third) = (vec![0xa5u8; 8 * 1024], vec![0x5au8; 8 * 1024], vec![0x3cu8; 8 * 1024]);
+    let (first, second, third) = (
+        vec![0xa5u8; 8 * 1024],
+        vec![0x5au8; 8 * 1024],
+        vec![0x3cu8; 8 * 1024],
+    );
     let keys: Vec<RecordKey> = (0..200u8).map(|byte| record(7, byte)).collect();
     for key in &keys {
         store.put(key, &first).expect("put");
@@ -4904,7 +5039,10 @@ fn a_cue_read_waits_out_a_hand_over_in_flight() {
     script.release("paged/handover-spot");
     handing.join().expect("hand over");
     drop(script);
-    assert_eq!(stale, 0, "a cue read answered with a version older than the cue");
+    assert_eq!(
+        stale, 0,
+        "a cue read answered with a version older than the cue"
+    );
 }
 // keys sharing their fronts lie packed in their footers, and a footer search with no cached footer reads their blocks back
 #[test]
@@ -4938,7 +5076,11 @@ fn a_cue_read_searches_packed_footer_blocks() {
         .segments_snapshot()
         .iter()
         .filter_map(|(segment, _)| store.reel.shared().footer_of(*segment).expect("footer"))
-        .filter(|footer| footer.partition(RECORD).is_some_and(|partition| partition.is_packed()))
+        .filter(|footer| {
+            footer
+                .partition(RECORD)
+                .is_some_and(|partition| partition.is_packed())
+        })
         .count();
     assert!(packed > 0, "no footer packed the shared fronts");
 
@@ -4946,11 +5088,25 @@ fn a_cue_read_searches_packed_footer_blocks() {
     for owner in 0..4u8 {
         for row in (0..300u32).step_by(7) {
             let read = store.get_at(&owned(owner, row), &cue).expect("cue read");
-            assert_eq!(read.as_deref(), Some(&first[..]), "owner {owner} row {row} answered past the cue");
+            assert_eq!(
+                read.as_deref(),
+                Some(&first[..]),
+                "owner {owner} row {row} answered past the cue"
+            );
             let live = store.get(&owned(owner, row)).expect("get");
-            assert_eq!(live.as_deref(), Some(&second[..]), "owner {owner} row {row} lost its rewrite");
+            assert_eq!(
+                live.as_deref(),
+                Some(&second[..]),
+                "owner {owner} row {row} lost its rewrite"
+            );
         }
     }
-    assert!(store.get_at(&owned(9, 1), &cue).expect("cue read").is_none());
-    assert!(store.filter_probes().block_reads > before, "no search read a packed block");
+    assert!(store
+        .get_at(&owned(9, 1), &cue)
+        .expect("cue read")
+        .is_none());
+    assert!(
+        store.filter_probes().block_reads > before,
+        "no search read a packed block"
+    );
 }

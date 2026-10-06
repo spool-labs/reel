@@ -5,7 +5,9 @@ use crate::error::{ReelError, Result};
 use crate::format::column::KeyRef;
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
-use crate::format::record::{check_keyless, data_codec, CheckKey, Flags, KeylessRead, RecordHeader, RecordLayout};
+use crate::format::record::{
+    check_keyless, data_codec, CheckKey, Flags, KeylessRead, RecordHeader, RecordLayout,
+};
 use crate::io::direct::{DIRECT_ALIGN, DIRECT_REQUEST_BYTES};
 use crate::io::op::FileId;
 use crate::io::ServingBackend;
@@ -173,7 +175,13 @@ pub(super) fn check_in_block(
         return Err(RecordRead::Stale);
     }
     if let Some(check) = layout.keyless_key(loc.len) {
-        return match check_keyless(&block[at..body_at], &block[body_at..body_end], expected, Flags::DATA, &check) {
+        return match check_keyless(
+            &block[at..body_at],
+            &block[body_at..body_end],
+            expected,
+            Flags::DATA,
+            &check,
+        ) {
             KeylessRead::Intact(codec) => Ok(codec),
             KeylessRead::Unwritten => Err(RecordRead::Stale),
             KeylessRead::Corrupt => Err(RecordRead::Corrupt),

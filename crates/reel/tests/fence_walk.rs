@@ -21,9 +21,8 @@ use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::units::ByteCount;
 use reel::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, FenceResidency, IndexResidency, KeyWidth,
-    Preallocate, ProbeCounts, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
-    SEGMENT_SUFFIX,
+    Codec, ColumnId, ColumnSet, ColumnSpec, FenceResidency, IndexResidency, KeyWidth, Preallocate,
+    ProbeCounts, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
 };
 
 const ROWS: ColumnId = ColumnId(1);
@@ -137,7 +136,11 @@ fn hit_counts(store: &ReelStore) -> ProbeCounts {
     for at in 0..PROBES {
         let at = at * stride;
         assert!(
-            store.index().get_at(&key(at), cue.at()).expect("get").is_some(),
+            store
+                .index()
+                .get_at(&key(at), cue.at())
+                .expect("get")
+                .is_some(),
             "key {at} went missing",
         );
     }
@@ -564,9 +567,17 @@ fn a_torn_fence_costs_the_footer() {
     )
     .expect("reopen");
 
-    let found = (0..keys()).filter(|at| store.get(&key(*at)).expect("get").is_some()).count();
-    assert!(found < keys() as usize, "a torn footer still answered for its records");
-    assert!(found > 0, "the torn footer took the other segments' keys with it");
+    let found = (0..keys())
+        .filter(|at| store.get(&key(*at)).expect("get").is_some())
+        .count();
+    assert!(
+        found < keys() as usize,
+        "a torn footer still answered for its records"
+    );
+    assert!(
+        found > 0,
+        "the torn footer took the other segments' keys with it"
+    );
 }
 
 /// Flip a byte inside the fence of the largest sealed segment in an image

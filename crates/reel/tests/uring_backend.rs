@@ -22,8 +22,7 @@ use reel::io::uring_backend::UringBackend;
 use reel::io::ReelIo;
 use reel::reel::segment::IoDriver;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelConfig,
-    ReelStore,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelConfig, ReelStore,
 };
 
 /// Bytes the group takes at the front of a record key

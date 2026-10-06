@@ -68,7 +68,10 @@ fn filled(dir: &TempDir) -> ReelStore {
 fn a_lone_spot_slot_reads_the_record_once() {
     let dir = TempDir::new().expect("tempdir");
     let store = filled(&dir);
-    assert!(store.index().spot_held() > 0, "nothing reached the spot index");
+    assert!(
+        store.index().spot_held() > 0,
+        "nothing reached the spot index"
+    );
 
     let before = store.filter_probes();
     let mut answered = 0u64;
@@ -104,11 +107,26 @@ fn a_seal_leaves_no_journal() {
     let store = filled(&dir);
     let names: Vec<String> = std::fs::read_dir(dir.path())
         .expect("list")
-        .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
-    let segments = names.iter().filter(|name| name.ends_with(SEGMENT_SUFFIX)).count();
-    let journals = names.iter().filter(|name| name.ends_with(JOURNAL_SUFFIX)).count();
+    let segments = names
+        .iter()
+        .filter(|name| name.ends_with(SEGMENT_SUFFIX))
+        .count();
+    let journals = names
+        .iter()
+        .filter(|name| name.ends_with(JOURNAL_SUFFIX))
+        .count();
     assert!(segments > 2, "the stream sealed too little to say anything");
-    assert!(journals <= 2, "{journals} journals stand beside {segments} segments");
+    assert!(
+        journals <= 2,
+        "{journals} journals stand beside {segments} segments"
+    );
     drop(store);
 }

@@ -24,12 +24,12 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use tempfile::TempDir;
 
-use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth,
-    ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
-};
 use reel::format::column::RecordKey;
 use reel::sync::tension::block_on;
+use reel::{
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, ReelConfig,
+    ReelStore, SyncPolicy, ThreadBudget,
+};
 use reel_core::Store;
 
 const fn rows() -> ColumnSpec {
@@ -82,10 +82,17 @@ fn value_of(key: u64, op: u64, len: usize) -> Vec<u8> {
 
 /// The op a value claims, once its key and filler check out
 fn op_of(seed: u64, key: u64, value: &[u8]) -> u64 {
-    assert!(value.len() >= 16, "seed {seed}: key {key} value of {} bytes", value.len());
+    assert!(
+        value.len() >= 16,
+        "seed {seed}: key {key} value of {} bytes",
+        value.len()
+    );
     let stored = u64::from_be_bytes(value[..8].try_into().expect("key bytes"));
     let op = u64::from_be_bytes(value[8..16].try_into().expect("op bytes"));
-    assert_eq!(stored, key, "seed {seed}: key {key} served the value of key {stored}");
+    assert_eq!(
+        stored, key,
+        "seed {seed}: key {key} served the value of key {stored}"
+    );
     assert_eq!(
         value,
         value_of(key, op, value.len() - 16).as_slice(),
@@ -129,14 +136,25 @@ impl Ledger {
     }
 
     fn is_delete(&self, key: u64, op: u64) -> bool {
-        self.deletes[key as usize].lock().expect("deletes").contains(&op)
+        self.deletes[key as usize]
+            .lock()
+            .expect("deletes")
+            .contains(&op)
     }
 
     /// Whether a read that began after `floor` completed and ended before `ceiling` started may answer this
     fn admits(&self, key: u64, floor: u64, ceiling: u64, answer: Option<u64>) -> bool {
         match answer {
             Some(op) => op >= floor && op <= ceiling && !self.is_delete(key, op),
-            None => floor == 0 || self.deletes[key as usize].lock().expect("deletes").range(floor..=ceiling).next().is_some(),
+            None => {
+                floor == 0
+                    || self.deletes[key as usize]
+                        .lock()
+                        .expect("deletes")
+                        .range(floor..=ceiling)
+                        .next()
+                        .is_some()
+            }
         }
     }
 }
@@ -149,7 +167,10 @@ fn writer(store: &ReelStore, ledger: &Ledger, seed: u64, id: u64, writers: u64, 
         let op = ledger.started[key as usize].load(Ordering::Acquire) + 1;
         let is_delete = rng.gen_range(0..100u32) < DELETE_SHARE;
         if is_delete {
-            ledger.deletes[key as usize].lock().expect("deletes").insert(op);
+            ledger.deletes[key as usize]
+                .lock()
+                .expect("deletes")
+                .insert(op);
         }
         ledger.started[key as usize].store(op, Ordering::Release);
         match is_delete {
@@ -171,12 +192,21 @@ fn record_key(key: u64) -> RecordKey {
 ///
 /// A value's filler depends on its key and op alone, so the window's bytes are the same
 /// whatever length that put was written at.
-fn admits_window(ledger: &Ledger, key: u64, floor: u64, ceiling: u64, at: u64, window: &[u8]) -> bool {
+fn admits_window(
+    ledger: &Ledger,
+    key: u64,
+    floor: u64,
+    ceiling: u64,
+    at: u64,
+    window: &[u8],
+) -> bool {
     let end = at as usize + window.len();
-    (floor..=ceiling).filter(|op| *op > 0 && !ledger.is_delete(key, *op)).any(|op| {
-        let full = value_of(key, op, end.saturating_sub(16));
-        full.len() >= end && full[at as usize..end] == *window
-    })
+    (floor..=ceiling)
+        .filter(|op| *op > 0 && !ledger.is_delete(key, *op))
+        .any(|op| {
+            let full = value_of(key, op, end.saturating_sub(16));
+            full.len() >= end && full[at as usize..end] == *window
+        })
 }
 
 /// Reads one key, or a few, through each of the store's read paths in turn
@@ -184,19 +214,33 @@ fn reader(store: &ReelStore, ledger: &Ledger, seed: u64, id: u64, done: &AtomicB
     let mut rng = SmallRng::seed_from_u64(seed ^ (id << 48) ^ 0x5A5A);
     let mut read = 0u64;
     while !done.load(Ordering::Relaxed) {
-        let keys: Vec<u64> = (0..rng.gen_range(1..=4)).map(|_| rng.gen_range(0..KEYS)).collect();
-        let floors: Vec<u64> = keys.iter().map(|key| ledger.completed[*key as usize].load(Ordering::Acquire)).collect();
+        let keys: Vec<u64> = (0..rng.gen_range(1..=4))
+            .map(|_| rng.gen_range(0..KEYS))
+            .collect();
+        let floors: Vec<u64> = keys
+            .iter()
+            .map(|key| ledger.completed[*key as usize].load(Ordering::Acquire))
+            .collect();
         let path = rng.gen_range(0..4u32);
         let (at, len) = (rng.gen_range(0..24u64), rng.gen_range(1..64usize));
         let answers: Vec<Option<Vec<u8>>> = match path {
-            0 => vec![Store::get(store, "rows", &key_bytes(keys[0])).expect("get").map(|value| value.to_vec())],
-            1 => vec![block_on(store.get_wait(&record_key(keys[0]))).expect("get").map(|value| value.to_vec())],
+            0 => vec![Store::get(store, "rows", &key_bytes(keys[0]))
+                .expect("get")
+                .map(|value| value.to_vec())],
+            1 => vec![block_on(store.get_wait(&record_key(keys[0])))
+                .expect("get")
+                .map(|value| value.to_vec())],
             2 => {
                 let asked: Vec<RecordKey> = keys.iter().map(|key| record_key(*key)).collect();
                 let got = store.get_many(&asked).expect("get many");
-                got.into_iter().map(|value| value.map(|value| value.to_vec())).collect()
+                got.into_iter()
+                    .map(|value| value.map(|value| value.to_vec()))
+                    .collect()
             }
-            _ => vec![store.get_range(&record_key(keys[0]), at, len).expect("range").map(|value| value.to_vec())],
+            _ => vec![store
+                .get_range(&record_key(keys[0]), at, len)
+                .expect("range")
+                .map(|value| value.to_vec())],
         };
         for (position, answer) in answers.iter().enumerate() {
             let key = keys[position];
@@ -234,7 +278,8 @@ fn run(seed: u64, columns: ColumnSet) {
     let mut rng = SmallRng::seed_from_u64(seed);
     let dir = TempDir::new().expect("tempdir");
     let config = config(&mut rng);
-    let store = Arc::new(ReelStore::open(dir.path().to_path_buf(), config.clone(), columns).expect("open"));
+    let store =
+        Arc::new(ReelStore::open(dir.path().to_path_buf(), config.clone(), columns).expect("open"));
     let ledger = Arc::new(Ledger::new());
     let ops = knob("REEL_FF_OPS", 2000);
     let writers = rng.gen_range(1..=3u64);
@@ -268,10 +313,16 @@ fn run(seed: u64, columns: ColumnSet) {
         }
         done.store(true, Ordering::Relaxed);
         maintainer.join().expect("maintainer");
-        reading.into_iter().map(|reading| reading.join().expect("reader")).sum::<u64>()
+        reading
+            .into_iter()
+            .map(|reading| reading.join().expect("reader"))
+            .sum::<u64>()
     });
     assert!(read > 0, "seed {seed}: readers took nothing");
-    assert!(store.index().spot_held() > 0, "seed {seed}: nothing reached the spot index");
+    assert!(
+        store.index().spot_held() > 0,
+        "seed {seed}: nothing reached the spot index"
+    );
     let compaction = store.compaction_counters();
     println!(
         "seed {seed}: {writers} writers, {readers} readers, {read} reads, the spot index holds {}, {} segments rewritten, {} unlinked whole",
@@ -291,7 +342,10 @@ fn run(seed: u64, columns: ColumnSet) {
 }
 
 fn seeds(columns: ColumnSet) {
-    if let Some(seed) = std::env::var("REEL_FF_SEED").ok().and_then(|seed| seed.parse().ok()) {
+    if let Some(seed) = std::env::var("REEL_FF_SEED")
+        .ok()
+        .and_then(|seed| seed.parse().ok())
+    {
         run(seed, columns);
         return;
     }

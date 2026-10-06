@@ -15,9 +15,7 @@ use crate::append::publish::PublishBarrier;
 use crate::config::IndexResidency;
 use crate::engine::Totals;
 use crate::error::{ReelError, Result};
-use crate::format::column::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, RecordKey,
-};
+use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, RecordKey};
 use crate::format::footer::{FooterPartition, SegmentFooter};
 use crate::format::loc::{Loc, SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
@@ -25,11 +23,11 @@ use crate::index::column::{ColumnIndex, KeyMove, Landed, PendingCover};
 use crate::index::counters::{Floors, SegmentBytes, SegmentStamp, SegmentTable};
 use crate::index::entry::{span_of, Entry};
 use crate::index::keyrun::KeyRunSet;
-use crate::index::spot::{SpotColumn, Lookup, Pick, RecordSource, Settled, Since, LOOKUP_TRIES};
 use crate::index::page::KeyPage;
 use crate::index::paged::{Candidates, FooterSource, SealedRanges};
 use crate::index::playback::{self, merged_page, Paged, PlaybackCursor, WalkRuns, Way};
 use crate::index::recovery::SealedSpan;
+use crate::index::spot::{Lookup, Pick, RecordSource, Settled, Since, SpotColumn, LOOKUP_TRIES};
 
 /// Slots in the lookup from a column identifier to its index
 const COLUMN_SLOTS: usize = 256;
@@ -183,7 +181,6 @@ const RELEASE_RUN: usize = 1024;
 /// front of a fan-out and no hit can stop the walk short of it.
 const NO_CEILING: Lsn = Lsn(u64::MAX);
 
-
 /// One range delete's cover as a batch hands it to the index
 ///
 /// The position is what keeps a batch's order: the key moves given before it go in
@@ -287,10 +284,7 @@ impl ReelIndex {
             walk_runs: sealed.iter().map(|_| WalkRuns::default()).collect(),
             key_runs: KeyRunSet::default(),
             sealed,
-            spot: columns
-                .iter()
-                .map(|_| SpotColumn::new())
-                .collect(),
+            spot: columns.iter().map(|_| SpotColumn::new()).collect(),
             spot_ready: AtomicBool::new(false),
             retired: AtomicU64::new(0),
             by_id,
@@ -332,7 +326,9 @@ impl ReelIndex {
     pub fn spot_read(&self, key: &RecordKey) -> Result<Lookup> {
         match self.spot_route(key) {
             SpotRoute::Settled(lookup) => Ok(lookup),
-            SpotRoute::Column(at, since) => Ok(self.spot_finish(at, key, since, self.spot[at].read(key)?)),
+            SpotRoute::Column(at, since) => {
+                Ok(self.spot_finish(at, key, since, self.spot[at].read(key)?))
+            }
         }
     }
 
@@ -362,7 +358,10 @@ impl ReelIndex {
             return None;
         };
         let since = self.spot[at].since(key);
-        self.indexes[at].entry_or_grave(key.as_slice()).is_none().then_some((at, since))
+        self.indexes[at]
+            .entry_or_grave(key.as_slice())
+            .is_none()
+            .then_some((at, since))
     }
 
     /// Apply a cue to a spot index answer: the newest sealed version stands when the cue sees it
@@ -379,7 +378,9 @@ impl ReelIndex {
     ) -> Lookup {
         match lookup {
             Lookup::Found(lsn, _) if lsn > snapshot => Lookup::Unsettled,
-            Lookup::Found(lsn, _) if self.indexes[at].is_covered_key_at(key.as_slice(), lsn, snapshot) => {
+            Lookup::Found(lsn, _)
+                if self.indexes[at].is_covered_key_at(key.as_slice(), lsn, snapshot) =>
+            {
                 Lookup::Missing
             }
             // a cue has to see the version, and this answer has none
@@ -397,7 +398,9 @@ impl ReelIndex {
     /// Apply what a footer cannot know to a spot index answer: covers, and a slot that left under it
     pub fn spot_finish(&self, at: usize, key: &RecordKey, since: Since, lookup: Lookup) -> Lookup {
         match lookup {
-            Lookup::Found(lsn, _) if self.indexes[at].is_covered_key(key.as_slice(), lsn) => Lookup::Missing,
+            Lookup::Found(lsn, _) if self.indexes[at].is_covered_key(key.as_slice(), lsn) => {
+                Lookup::Missing
+            }
             // read after the record, so a range delete that landed before it is seen here
             Lookup::Newest(_) if self.indexes[at].has_covers() => Lookup::Unsettled,
             Lookup::Missing if self.spot[at].moved(since) => Lookup::Unsettled,
@@ -417,7 +420,12 @@ impl ReelIndex {
         let mut settled = 0;
         for (at, spot) in self.spot.iter().enumerate() {
             for (key, loc) in spot.scrub(budget.saturating_sub(settled)) {
-                self.indexes[at].settle_paged(key.as_slice(), loc, self.counted(loc.segment), &self.segments);
+                self.indexes[at].settle_paged(
+                    key.as_slice(),
+                    loc,
+                    self.counted(loc.segment),
+                    &self.segments,
+                );
                 settled += 1;
             }
         }
@@ -853,7 +861,11 @@ impl ReelIndex {
     /// in neither, and a key the map would not give up comes back out of the spot index
     /// only where this hand-over put it there. Each step takes a shard's lock once a chunk
     /// of keys, and each lane owns its own shards, so lanes never wait on each other.
-    pub fn page_out_partition(&self, segment: SegmentId, partition: &FooterPartition) -> Result<usize> {
+    pub fn page_out_partition(
+        &self,
+        segment: SegmentId,
+        partition: &FooterPartition,
+    ) -> Result<usize> {
         let Some(at) = self.slot(partition.column) else {
             return Ok(0);
         };
@@ -886,8 +898,13 @@ impl ReelIndex {
             let lanes: Vec<Vec<bool>> = match lanes {
                 1 => vec![step(0)],
                 _ => std::thread::scope(|scope| {
-                    let running: Vec<_> = (0..lanes).map(|lane| scope.spawn(move || step(lane))).collect();
-                    running.into_iter().map(|lane| lane.join().expect("a hand-over lane panicked")).collect()
+                    let running: Vec<_> = (0..lanes)
+                        .map(|lane| scope.spawn(move || step(lane)))
+                        .collect();
+                    running
+                        .into_iter()
+                        .map(|lane| lane.join().expect("a hand-over lane panicked"))
+                        .collect()
                 }),
             };
             for lane in lanes {
@@ -1012,11 +1029,18 @@ impl ReelIndex {
             let displaced = self.spot[at].displace(key, lsn)?;
             for loc in displaced.booked {
                 let counted = self.counted(loc.segment);
-                settled |= self.indexes[at].settle_paged(key.as_slice(), loc, counted, &self.segments);
+                settled |=
+                    self.indexes[at].settle_paged(key.as_slice(), loc, counted, &self.segments);
             }
             for (loc, least) in displaced.classed {
                 let counted = self.counted(loc.segment);
-                settled |= self.indexes[at].settle_paged_least(key.as_slice(), loc, least, counted, &self.segments);
+                settled |= self.indexes[at].settle_paged_least(
+                    key.as_slice(),
+                    loc,
+                    least,
+                    counted,
+                    &self.segments,
+                );
             }
             for (loc, least) in displaced.rebooked {
                 if self.counted(loc.segment) {
@@ -1361,7 +1385,13 @@ impl ReelIndex {
     /// destination seals and hands it over again. The caller's source stands when it is
     /// the key's one spot index slot. Otherwise the footers give the source, and they
     /// also say whether the row is still the version being moved.
-    pub fn repoint(&self, key: &RecordKey, from: Option<Loc>, to: Loc, expected_lsn: Lsn) -> Result<bool> {
+    pub fn repoint(
+        &self,
+        key: &RecordKey,
+        from: Option<Loc>,
+        to: Loc,
+        expected_lsn: Lsn,
+    ) -> Result<bool> {
         let moves = [KeyRepoint {
             key: key.clone(),
             from,
@@ -1387,7 +1417,12 @@ impl ReelIndex {
                     copy.1 += span;
                     copy.2 = copy.2.min(repoint.lsn);
                 }
-                None => copies.push((repoint.to.segment, span, repoint.lsn, SegmentIncarnation::NONE)),
+                None => copies.push((
+                    repoint.to.segment,
+                    span,
+                    repoint.lsn,
+                    SegmentIncarnation::NONE,
+                )),
             }
         }
         for copy in &mut copies {
@@ -1406,17 +1441,27 @@ impl ReelIndex {
                 .map_or(SegmentIncarnation::NONE, |copy| copy.3);
             let outcome = match failed {
                 Some(_) => Ok(None),
-                None => self.repoint_moved(&repoint.key, repoint.from, repoint.to, repoint.lsn, stamp),
+                None => {
+                    self.repoint_moved(&repoint.key, repoint.from, repoint.to, repoint.lsn, stamp)
+                }
             };
             let (segment, span, into) = match outcome {
                 Ok(Some(from)) => {
                     moved += 1;
                     (from.segment, span_of(width, from.len), &mut released)
                 }
-                Ok(None) => (repoint.to.segment, span_of(width, repoint.to.len), &mut lost),
+                Ok(None) => (
+                    repoint.to.segment,
+                    span_of(width, repoint.to.len),
+                    &mut lost,
+                ),
                 Err(error) => {
                     failed = Some(error);
-                    (repoint.to.segment, span_of(width, repoint.to.len), &mut lost)
+                    (
+                        repoint.to.segment,
+                        span_of(width, repoint.to.len),
+                        &mut lost,
+                    )
                 }
             };
             match into.iter_mut().find(|held| held.0 == segment) {
@@ -1463,7 +1508,9 @@ impl ReelIndex {
         }
         // The pass read the record at its source, so when that is the key's one spot index
         // slot it is this key at this version, and no slot holds a newer one: no read needed.
-        if let Some(from) = from.filter(|from| self.spot_serves() && self.spot[at].only_at(key.as_slice(), *from)) {
+        if let Some(from) =
+            from.filter(|from| self.spot_serves() && self.spot[at].only_at(key.as_slice(), *from))
+        {
             let counted = self.counted(from.segment);
             if !index.repoint_paged(key.as_slice(), to, expected_lsn, counted, stamp) {
                 return Ok(None);
@@ -1494,7 +1541,6 @@ impl ReelIndex {
             }
         }
     }
-
 
     /// Copies compaction made that nothing else was pointing at
     ///
@@ -1785,7 +1831,9 @@ impl ReelIndex {
             return Ok(());
         };
         match self.paged_footers(slot) {
-            Some(footers) => merged_page(&self.paged_at(slot, column, footers), playback, limit, out),
+            Some(footers) => {
+                merged_page(&self.paged_at(slot, column, footers), playback, limit, out)
+            }
             None => playback.page_resident(&self.indexes[slot], limit, out),
         }
     }
@@ -1970,7 +2018,7 @@ impl ReelIndex {
 mod tests {
     use super::*;
 
-    use crate::format::column::{KeyWidth};
+    use crate::format::column::KeyWidth;
     use crate::index::entry::span_of;
 
     const RECORD: ColumnId = ColumnId(1);

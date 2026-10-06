@@ -23,7 +23,8 @@ use crate::format::journal::{journal_path, read_groups, JournalRow, JOURNAL_SUFF
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{
-    check_keyless, read_u32_le, Flags, KeylessRead, RecordHeader, RecordLayout, HEADER_LEN, KEYLESS_PREFIX,
+    check_keyless, read_u32_le, Flags, KeylessRead, RecordHeader, RecordLayout, HEADER_LEN,
+    KEYLESS_PREFIX,
 };
 use crate::format::segment_header::{SegmentHeader, FORMAT_VERSION};
 use crate::index::column::{KeyMove, Landed};
@@ -220,42 +221,42 @@ pub fn rebuild_from_persisted(
             false => READ_AHEAD,
         };
         let read = read_segments(driver, &jobs, ahead, |at, parts| {
-        let (segment, path, len) = &jobs[at];
-        match absorb_segment(*segment, parts, pages, &mut resolver, &mut held)? {
-            Loaded::Sealed(footer) => {
-                consumed.insert(*segment, SEALED);
-                sealed_files.push((*segment, path.clone(), *len));
-                if let (Some(queue), Some(footer)) = (&queue, footer) {
-                    if !is_sized {
-                        index.reserve_fast(&footer, jobs.len());
-                        is_sized = true;
+            let (segment, path, len) = &jobs[at];
+            match absorb_segment(*segment, parts, pages, &mut resolver, &mut held)? {
+                Loaded::Sealed(footer) => {
+                    consumed.insert(*segment, SEALED);
+                    sealed_files.push((*segment, path.clone(), *len));
+                    if let (Some(queue), Some(footer)) = (&queue, footer) {
+                        if !is_sized {
+                            index.reserve_fast(&footer, jobs.len());
+                            is_sized = true;
+                        }
+                        // The loaders keep receiving until the queue closes, so a send never waits on nothing.
+                        let _ = queue.send((*segment, footer));
                     }
-                    // The loaders keep receiving until the queue closes, so a send never waits on nothing.
-                    let _ = queue.send((*segment, footer));
                 }
-            }
-            Loaded::Journaled(end) => {
-                consumed.insert(*segment, end.journal_len);
-                walked.push((path.clone(), *len));
-                // A segment with no journal had its seal finish once, so an appender
-                // must not write into it again whatever its footer reads as now.
-                if let Some(rows) = end.rows {
-                    resumable.push(ResumableTail {
-                        segment: *segment,
-                        path: path.clone(),
-                        end: end.next_offset,
-                        entries: SegmentFooter::empty(),
-                        rows,
-                    });
+                Loaded::Journaled(end) => {
+                    consumed.insert(*segment, end.journal_len);
+                    walked.push((path.clone(), *len));
+                    // A segment with no journal had its seal finish once, so an appender
+                    // must not write into it again whatever its footer reads as now.
+                    if let Some(rows) = end.rows {
+                        resumable.push(ResumableTail {
+                            segment: *segment,
+                            path: path.clone(),
+                            end: end.next_offset,
+                            entries: SegmentFooter::empty(),
+                            rows,
+                        });
+                    }
                 }
+                Loaded::Foreign => quarantined.push(path.clone()),
             }
-            Loaded::Foreign => quarantined.push(path.clone()),
-        }
-        if held.len() >= FEED_WINDOW {
-            feed_held(&mut held, &mut resolver, &mut resumable)?;
-        }
-        Ok(())
-    });
+            if held.len() >= FEED_WINDOW {
+                feed_held(&mut held, &mut resolver, &mut resumable)?;
+            }
+            Ok(())
+        });
         drop(queue);
         for loader in loading {
             loader
@@ -327,7 +328,10 @@ fn adopt(
 ///
 /// A failed load keeps receiving, so the sweep feeding the queue never waits on a loader
 /// that stopped, and the first error comes back once the queue is done.
-fn load_footers(index: &ReelIndex, feed: &Mutex<Receiver<(SegmentId, SegmentFooter)>>) -> Result<()> {
+fn load_footers(
+    index: &ReelIndex,
+    feed: &Mutex<Receiver<(SegmentId, SegmentFooter)>>,
+) -> Result<()> {
     let mut failed = None;
     loop {
         let next = lock(feed).recv();
@@ -1194,10 +1198,17 @@ fn read_range_ends(
             let layout = match layout {
                 Some(layout) => layout,
                 None => *layout.insert(
-                    read_segment_header(driver, file)?.map_or(RecordLayout::Keyed, |header| header.layout),
+                    read_segment_header(driver, file)?
+                        .map_or(RecordLayout::Keyed, |header| header.layout),
                 ),
             };
-            ends.push(read_range_end(driver, file, layout.prefix_len(width, row.len), row.offset, row.len)?);
+            ends.push(read_range_end(
+                driver,
+                file,
+                layout.prefix_len(width, row.len),
+                row.offset,
+                row.len,
+            )?);
         }
     }
     Ok(ends)
@@ -1266,7 +1277,12 @@ struct JournaledTail {
 /// A group is one write, so a batch is kept whole or not at all, and a group listing a
 /// record that did not land as its row says is dropped. A segment with no journal had
 /// its seal finish once and its footer go bad since, and nothing lists its records.
-fn read_journaled(driver: &IoDriver, file: FileId, path: &Path, file_len: u64) -> Result<JournaledTail> {
+fn read_journaled(
+    driver: &IoDriver,
+    file: FileId,
+    path: &Path,
+    file_len: u64,
+) -> Result<JournaledTail> {
     let mut tail = JournaledTail {
         footer: SegmentFooter::empty(),
         ends: Vec::new(),
@@ -1279,7 +1295,8 @@ fn read_journaled(driver: &IoDriver, file: FileId, path: &Path, file_len: u64) -
     };
     let (groups, valid) = read_groups(&bytes);
     tail.journal_len = valid as u64;
-    let layout = read_segment_header(driver, file)?.map_or(RecordLayout::Keyed, |header| header.layout);
+    let layout =
+        read_segment_header(driver, file)?.map_or(RecordLayout::Keyed, |header| header.layout);
     let mut reader = SegmentReader::new(driver, file, file_len);
     let mut rows = Vec::new();
     let mut ends = Vec::new();
@@ -1293,7 +1310,13 @@ fn read_journaled(driver: &IoDriver, file: FileId, path: &Path, file_len: u64) -
             if row.flags.is_range_tombstone() {
                 ends.push((row.key.column, row.range_end.clone()));
             }
-            tail.footer.push(&FooterEntry::new(row.key.clone(), row.lsn, row.offset, row.len, row.flags));
+            tail.footer.push(&FooterEntry::new(
+                row.key.clone(),
+                row.lsn,
+                row.offset,
+                row.len,
+                row.flags,
+            ));
             rows.push(row);
         }
     }
@@ -1306,13 +1329,18 @@ fn read_journaled(driver: &IoDriver, file: FileId, path: &Path, file_len: u64) -
 }
 
 /// Unlink every journal a footer has taken over, and every journal part a resume left
-pub fn remove_stale_journals(driver: &IoDriver, root: &Path, consumed: &HashMap<SegmentId, u64>) -> Result<()> {
+pub fn remove_stale_journals(
+    driver: &IoDriver,
+    root: &Path,
+    consumed: &HashMap<SegmentId, u64>,
+) -> Result<()> {
     for entry in driver.list_or_empty(root)? {
         let is_stale = match entry.name.strip_suffix(JOURNAL_SUFFIX) {
-            Some(number) => number
-                .parse()
-                .ok()
-                .is_none_or(|number| consumed.get(&SegmentId(number)).is_none_or(|at| *at == SEALED)),
+            Some(number) => number.parse().ok().is_none_or(|number| {
+                consumed
+                    .get(&SegmentId(number))
+                    .is_none_or(|at| *at == SEALED)
+            }),
             None => entry.name.ends_with(".rows.part"),
         };
         if is_stale {
@@ -1323,7 +1351,11 @@ pub fn remove_stale_journals(driver: &IoDriver, root: &Path, consumed: &HashMap<
 }
 
 /// A segment's journal from an offset to its end, nothing where it has no journal
-pub(crate) fn read_journal(driver: &IoDriver, segment_path: &Path, from: u64) -> Result<Option<Vec<u8>>> {
+pub(crate) fn read_journal(
+    driver: &IoDriver,
+    segment_path: &Path,
+    from: u64,
+) -> Result<Option<Vec<u8>>> {
     let journal = match driver.open(&journal_path(segment_path), false) {
         Ok(journal) => journal,
         Err(error) if error.is_missing() => return Ok(None),
@@ -1345,7 +1377,11 @@ fn header_end(driver: &IoDriver, file: FileId) -> Result<u64> {
 }
 
 /// Whether every record a group lists sits where its row says and checks out
-fn all_landed(reader: &mut SegmentReader<'_>, layout: RecordLayout, group: &[JournalRow]) -> Result<bool> {
+fn all_landed(
+    reader: &mut SegmentReader<'_>,
+    layout: RecordLayout,
+    group: &[JournalRow],
+) -> Result<bool> {
     for row in group {
         if !is_indexable(row.flags) {
             return Ok(false);
@@ -1357,7 +1393,10 @@ fn all_landed(reader: &mut SegmentReader<'_>, layout: RecordLayout, group: &[Jou
                 return Ok(false);
             }
             let (prefix, payload) = record.split_at(KEYLESS_PREFIX);
-            if !matches!(check_keyless(prefix, payload, row.key.as_ref(), row.flags, &check), KeylessRead::Intact(_)) {
+            if !matches!(
+                check_keyless(prefix, payload, row.key.as_ref(), row.flags, &check),
+                KeylessRead::Intact(_)
+            ) {
                 return Ok(false);
             }
             continue;
@@ -1370,7 +1409,11 @@ fn all_landed(reader: &mut SegmentReader<'_>, layout: RecordLayout, group: &[Jou
         let Ok(header) = RecordHeader::unpack(head) else {
             return Ok(false);
         };
-        if header.key != row.key || header.lsn != row.lsn || header.length != row.len || header.flags != row.flags {
+        if header.key != row.key
+            || header.lsn != row.lsn
+            || header.length != row.len
+            || header.flags != row.flags
+        {
             return Ok(false);
         }
         if !verify_record(reader, u64::from(row.offset), &header)? {
@@ -1412,7 +1455,10 @@ pub(crate) fn footer_records(
 }
 
 /// The rows of a journal as a follower applies them
-pub(crate) fn journal_records(segment: SegmentId, groups: Vec<Vec<JournalRow>>) -> Vec<WalkedRecord> {
+pub(crate) fn journal_records(
+    segment: SegmentId,
+    groups: Vec<Vec<JournalRow>>,
+) -> Vec<WalkedRecord> {
     groups
         .into_iter()
         .flatten()
@@ -2129,7 +2175,10 @@ mod tests {
             ])
             .expect("batch");
         appender.flush().expect("flush");
-        (u64::from(committed[0].loc.offset), u64::from(committed[1].loc.offset))
+        (
+            u64::from(committed[0].loc.offset),
+            u64::from(committed[1].loc.offset),
+        )
     }
 
     // a batch whose records never landed is dropped, frame and all
@@ -2419,7 +2468,10 @@ mod tests {
 
         assert!(keys_of(&rebuilt, RECORDS).is_empty());
         assert!(
-            !rebuilt.resumable.iter().any(|tail| tail.segment == SegmentId(1)),
+            !rebuilt
+                .resumable
+                .iter()
+                .any(|tail| tail.segment == SegmentId(1)),
             "a tail would write into a sealed segment"
         );
     }
@@ -2445,7 +2497,10 @@ mod tests {
         let cut = footer_len_for(2);
 
         truncate_segment(&mut image, "000001.reel", cut);
-        image.push((journal_path(&Path::new(REEL_DIR).join("000001.reel")), journal));
+        image.push((
+            journal_path(&Path::new(REEL_DIR).join("000001.reel")),
+            journal,
+        ));
         let torn = SimIo::from_image(image);
         let rebuilt = rebuild(&torn);
 

@@ -361,7 +361,10 @@ impl<V> Inner<V> {
     }
 
     fn chain_unlink(&mut self, slot: u32) {
-        let (prev, next) = (self.slots[slot as usize].prev, self.slots[slot as usize].next);
+        let (prev, next) = (
+            self.slots[slot as usize].prev,
+            self.slots[slot as usize].next,
+        );
         match prev {
             NONE => {
                 let bucket = self.chain_at(self.slots[slot as usize].key);
@@ -600,9 +603,15 @@ mod tests {
 
         hold.forget(SegmentId(1));
         for block in 0..2_000 {
-            assert_eq!(hold.get(key_of(1, 0, block)), None, "block {block} outlived its segment");
+            assert_eq!(
+                hold.get(key_of(1, 0, block)),
+                None,
+                "block {block} outlived its segment"
+            );
         }
-        let left = (0..2_000).filter(|block| hold.get(key_of(2, 0, *block)).is_some()).count();
+        let left = (0..2_000)
+            .filter(|block| hold.get(key_of(2, 0, *block)).is_some())
+            .count();
         assert_eq!(hold.len(), left);
         assert_eq!(hold.bytes(), left * 16);
 

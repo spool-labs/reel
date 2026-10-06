@@ -181,7 +181,13 @@ impl WriteMapping {
             return false;
         }
         // In bounds of a live mapping, over a range only this writer's claim covers.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(offset as usize), bytes.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.base.add(offset as usize),
+                bytes.len(),
+            )
+        };
         true
     }
 }
@@ -225,15 +231,24 @@ mod tests {
     fn a_write_mapping_lands_in_the_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tail");
-        File::create(&path).expect("create").set_len(8192).expect("size");
+        File::create(&path)
+            .expect("create")
+            .set_len(8192)
+            .expect("size");
 
         let map = WriteMapping::open(&path, 8192).expect("map");
         assert!(map.write(4090, &[5u8; 12]), "a copy across a page edge");
-        assert!(!map.write(8190, &[5u8; 4]), "a copy past the span is refused");
+        assert!(
+            !map.write(8190, &[5u8; 4]),
+            "a copy past the span is refused"
+        );
         let bytes = std::fs::read(&path).expect("read");
         assert_eq!(&bytes[4090..4102], &[5u8; 12]);
         assert!(bytes[..4090].iter().all(|byte| *byte == 0));
-        assert!(WriteMapping::open(&path, 16384).is_none(), "a span past the file is refused");
+        assert!(
+            WriteMapping::open(&path, 16384).is_none(),
+            "a span past the file is refused"
+        );
     }
 
     // a path that does not open maps as nothing rather than an error

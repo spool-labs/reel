@@ -48,7 +48,11 @@ impl Journal {
     /// The rows go down as one group in a fresh file renamed over the old one, so a
     /// crash in between leaves one journal or the other and never a group that lists a
     /// record the reopen dropped.
-    pub(super) fn resume(driver: &Arc<IoDriver>, segment_path: &Path, rows: &[JournalRow]) -> Result<Journal> {
+    pub(super) fn resume(
+        driver: &Arc<IoDriver>,
+        segment_path: &Path,
+        rows: &[JournalRow],
+    ) -> Result<Journal> {
         let path = journal_path(segment_path);
         let fresh = path.with_extension("rows.part");
         let id = driver.open(&fresh, true)?;
@@ -120,7 +124,8 @@ impl Journal {
             return Ok(());
         }
         let len = bytes.len() as u64;
-        self.driver.writev_all(id, file.written, vec![WriteBuf::owned(bytes)])?;
+        self.driver
+            .writev_all(id, file.written, vec![WriteBuf::owned(bytes)])?;
         file.written += len;
         Ok(())
     }

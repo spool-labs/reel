@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth,
-    ReelConfig, ReelStore, SyncPolicy,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, ReelConfig,
+    ReelStore, SyncPolicy,
 };
 use reel_core::Store;
 
@@ -80,7 +80,8 @@ fn sweep_prefix_all(store: &ReelStore, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)>
     let mut rows = Vec::new();
     let mut from: Option<Vec<u8>> = None;
     loop {
-        let (page, next) = Store::sweep_prefix(store, "rows", prefix, from.as_deref(), PAGE).expect("sweep prefix");
+        let (page, next) = Store::sweep_prefix(store, "rows", prefix, from.as_deref(), PAGE)
+            .expect("sweep prefix");
         rows.extend(page.into_iter().map(|(key, value)| (key, value.to_vec())));
         match next {
             Some(next) => from = Some(next),
@@ -93,7 +94,8 @@ fn sweep_keys_prefix_all(store: &ReelStore, prefix: &[u8]) -> Vec<Vec<u8>> {
     let mut keys = Vec::new();
     let mut from: Option<Vec<u8>> = None;
     loop {
-        let (page, next) = Store::sweep_keys_prefix(store, "rows", prefix, from.as_deref(), PAGE).expect("sweep keys");
+        let (page, next) = Store::sweep_keys_prefix(store, "rows", prefix, from.as_deref(), PAGE)
+            .expect("sweep keys");
         keys.extend(page);
         match next {
             Some(next) => from = Some(next),
@@ -111,7 +113,11 @@ fn check(index: IndexResidency) {
     let dir = TempDir::new().expect("temp dir");
     let (store, model) = filled(&dir, index);
     let whole: Vec<(Vec<u8>, Vec<u8>)> = model.clone().into_iter().collect();
-    assert_eq!(sorted(sweep_all(&store)), whole, "a whole sweep differs from what was written");
+    assert_eq!(
+        sorted(sweep_all(&store)),
+        whole,
+        "a whole sweep differs from what was written"
+    );
 
     let prefix = [2u8];
     let under: Vec<(Vec<u8>, Vec<u8>)> = model
@@ -119,13 +125,26 @@ fn check(index: IndexResidency) {
         .filter(|(key, _)| key.starts_with(&prefix))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    assert_eq!(sorted(sweep_prefix_all(&store, &prefix)), under, "a prefix sweep differs");
+    assert_eq!(
+        sorted(sweep_prefix_all(&store, &prefix)),
+        under,
+        "a prefix sweep differs"
+    );
     let keys: Vec<Vec<u8>> = under.into_iter().map(|(key, _)| key).collect();
-    assert_eq!(sorted(sweep_keys_prefix_all(&store, &prefix)), keys, "a prefix key sweep differs");
+    assert_eq!(
+        sorted(sweep_keys_prefix_all(&store, &prefix)),
+        keys,
+        "a prefix key sweep differs"
+    );
 
     // A mark from nowhere starts the sweep over, and every key still comes back.
-    let (page, _) = Store::sweep(&store, "rows", Some(b"not a mark"), KEYS as usize).expect("sweep");
-    assert_eq!(page.len(), KEYS as usize, "a sweep from a foreign mark lost keys");
+    let (page, _) =
+        Store::sweep(&store, "rows", Some(b"not a mark"), KEYS as usize).expect("sweep");
+    assert_eq!(
+        page.len(),
+        KEYS as usize,
+        "a sweep from a foreign mark lost keys"
+    );
 }
 
 #[test]

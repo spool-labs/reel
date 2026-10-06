@@ -161,7 +161,9 @@ mod tests {
             offset: 100 * u32::from(byte),
             len: 40,
             flags,
-            range_end: flags.is_range_tombstone().then(|| KeyBytes::new(&[byte + 1; 12]).expect("end")),
+            range_end: flags
+                .is_range_tombstone()
+                .then(|| KeyBytes::new(&[byte + 1; 12]).expect("end")),
         }
     }
 
@@ -169,7 +171,10 @@ mod tests {
     #[test]
     fn groups_read_back() {
         let first = vec![row(1, 10, Flags::DATA)];
-        let second = vec![row(2, 11, Flags::TOMBSTONE), row(3, 12, Flags::RANGE_TOMBSTONE)];
+        let second = vec![
+            row(2, 11, Flags::TOMBSTONE),
+            row(3, 12, Flags::RANGE_TOMBSTONE),
+        ];
         let mut bytes = Vec::new();
         push_group(&first, &mut bytes);
         push_group(&second, &mut bytes);
@@ -185,7 +190,10 @@ mod tests {
         let mut bytes = Vec::new();
         push_group(&[row(1, 10, Flags::DATA)], &mut bytes);
         let whole = bytes.len();
-        push_group(&[row(2, 11, Flags::DATA), row(3, 12, Flags::DATA)], &mut bytes);
+        push_group(
+            &[row(2, 11, Flags::DATA), row(3, 12, Flags::DATA)],
+            &mut bytes,
+        );
 
         let (groups, len) = read_groups(&bytes[..bytes.len() - 1]);
         assert_eq!((groups.len(), len), (1, whole));

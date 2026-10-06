@@ -16,8 +16,8 @@ use tempfile::TempDir;
 
 use reel::io::posix_backend::PosixBackend;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate,
-    RangedReads, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, RangedReads,
+    RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 /// Bytes the group takes at the front of a record key

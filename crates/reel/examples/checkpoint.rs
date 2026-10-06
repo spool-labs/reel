@@ -14,8 +14,8 @@ use tempfile::TempDir;
 
 use reel::format::column::RecordKey;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth,
-    ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, ReelConfig,
+    ReelStore, SyncPolicy, ThreadBudget,
 };
 use reel_core::Value;
 

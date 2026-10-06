@@ -632,7 +632,9 @@ impl ReelStore {
             (None, Some(prefix)) => Bound::Included(prefix),
             (None, None) => Bound::Unbounded,
         };
-        self.index.page(column, start, limit, &mut page).map_err(StoreError::from)?;
+        self.index
+            .page(column, start, limit, &mut page)
+            .map_err(StoreError::from)?;
         let mut keys = Vec::with_capacity(page.len());
         for at in 0..page.len() {
             let key = page.key_at(at);
@@ -721,7 +723,13 @@ impl ReelStore {
         // The last playback on this thread left its vectors behind, emptied.
         let mut spare = SPARE_WALK.with(std::cell::Cell::take).unwrap_or_default();
         let buffered = spare.buffered.take().unwrap_or_else(KeyPage::reading);
-        let page = Page::open(&scope, column, self.serves(column), buffered, spare.cursor.take().unwrap_or_default());
+        let page = Page::open(
+            &scope,
+            column,
+            self.serves(column),
+            buffered,
+            spare.cursor.take().unwrap_or_default(),
+        );
         Playback {
             store: self,
             scope,
@@ -810,15 +818,33 @@ struct Page {
 impl Page {
     /// A cursor over keys alone, for a playback that reads no payloads
     fn keys_only(scope: &Scope, column: ColumnId, serves: bool) -> Page {
-        Page::open(scope, column, serves, KeyPage::default(), CursorBuffers::default())
+        Page::open(
+            scope,
+            column,
+            serves,
+            KeyPage::default(),
+            CursorBuffers::default(),
+        )
     }
 
     /// A cursor carrying each key's payload length, for a playback that stages reads
     fn with_lens(scope: &Scope, column: ColumnId, serves: bool) -> Page {
-        Page::open(scope, column, serves, KeyPage::with_lens(), CursorBuffers::default())
+        Page::open(
+            scope,
+            column,
+            serves,
+            KeyPage::with_lens(),
+            CursorBuffers::default(),
+        )
     }
 
-    fn open(scope: &Scope, column: ColumnId, serves: bool, buffered: KeyPage, cursor: CursorBuffers) -> Page {
+    fn open(
+        scope: &Scope,
+        column: ColumnId,
+        serves: bool,
+        buffered: KeyPage,
+        cursor: CursorBuffers,
+    ) -> Page {
         let way = match scope.direction {
             Direction::Asc => Way::Up,
             Direction::Desc => Way::Down,
@@ -830,7 +856,8 @@ impl Page {
             buffered,
             serves,
             taken: 0,
-            playback: PlaybackCursor::with_buffers(column, way, as_slice_bound(&bound), cursor).ok(),
+            playback: PlaybackCursor::with_buffers(column, way, as_slice_bound(&bound), cursor)
+                .ok(),
             size: PLAYBACK_PAGE_MIN,
         }
     }

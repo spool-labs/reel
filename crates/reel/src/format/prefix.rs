@@ -458,10 +458,7 @@ mod tests {
                 String::from_utf8_lossy(asked)
             );
         }
-        assert!(
-            rows.seek(b"zz").expect("seek").is_none(),
-            "past the end"
-        );
+        assert!(rows.seek(b"zz").expect("seek").is_none(), "past the end");
     }
 
     // the cases the incremental comparison is built out of, one at a time
@@ -514,14 +511,10 @@ mod tests {
 
         assert_eq!(rows.keys().expect("keys"), keys);
         for (at, key) in keys.iter().enumerate() {
-            assert_eq!(
-                rows.seek(key).expect("seek").expect("present").index,
-                at
-            );
+            assert_eq!(rows.seek(key).expect("seek").expect("present").index, at);
         }
     }
 }
-
 
 /// A walk over the rows, holding the key it sits on
 ///
@@ -687,7 +680,6 @@ mod cursor_tests {
     }
 }
 
-
 /// A block's rows decoded, which is what stepping backwards needs
 ///
 /// The row before is not reachable without adding up everything since the last
@@ -835,10 +827,7 @@ mod backward_tests {
 
         for (at, key) in keys.iter().enumerate() {
             assert_eq!(&rows.key_of(at).expect("key"), key, "row {at}");
-            assert_eq!(
-                rows.tail_of(at).expect("tail"),
-                (at as u32).to_le_bytes()
-            );
+            assert_eq!(rows.tail_of(at).expect("tail"), (at as u32).to_le_bytes());
         }
     }
 
@@ -878,11 +867,7 @@ mod backward_tests {
 
         assert_eq!(rows.run_at(0).expect("run"), Some((0, 0)));
         for at in 1..=3 {
-            assert_eq!(
-                rows.run_at(at).expect("run"),
-                Some((1, 3)),
-                "from {at}"
-            );
+            assert_eq!(rows.run_at(at).expect("run"), Some((1, 3)), "from {at}");
         }
         assert_eq!(rows.run_at(4).expect("run"), Some((4, 4)));
         assert_eq!(rows.run_at(5).expect("run"), None);
@@ -903,7 +888,6 @@ mod backward_tests {
         );
     }
 }
-
 
 /// Bytes the encoded form spends on its own shape past the rows
 pub const TRAILER_LEN: usize = 8;
@@ -990,7 +974,9 @@ impl PrefixRows {
     /// the trailer, the restart count, every offset, and the row count.
     pub fn decode(bytes: &[u8], tail: Tail) -> Result<PrefixRows> {
         let frame = Frame::read(bytes)?;
-        let restarts = (0..frame.restarts).map(|at| frame.restart(bytes, at)).collect();
+        let restarts = (0..frame.restarts)
+            .map(|at| frame.restart(bytes, at))
+            .collect();
         Ok(PrefixRows {
             packed: bytes[..frame.rows_end].to_vec(),
             restarts,
@@ -1065,7 +1051,11 @@ impl Frame {
 /// What `decode` and `unpacked` do together, with no copy of the rows first. Rows of
 /// one width (`row_len` bytes each, key and tail) come back strided with no starts, in a
 /// buffer sized exactly. Each restart offset has to land on the row it says it opens.
-pub fn unpack(bytes: &[u8], tail: Tail, row_len: Option<usize>) -> Result<(Vec<u8>, Vec<u32>, usize)> {
+pub fn unpack(
+    bytes: &[u8],
+    tail: Tail,
+    row_len: Option<usize>,
+) -> Result<(Vec<u8>, Vec<u32>, usize)> {
     let frame = Frame::read(bytes)?;
     let rows_bytes = &bytes[..frame.rows_end];
     let mut packed = Vec::with_capacity(match row_len {

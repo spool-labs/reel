@@ -12,8 +12,8 @@ use reel::format::column::RecordKey;
 use reel::format::loc::SegmentId;
 use reel::format::lsn::Lsn;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth,
-    ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, ReelConfig,
+    ReelStore, SyncPolicy, ThreadBudget,
 };
 use reel_core::{Direction, Store};
 
@@ -133,11 +133,17 @@ fn a_carried_tombstone_keeps_its_key_out_of_walks() {
         // The walk goes first: a get notes the segments that sealed, which would close the window.
         if store.compaction_counters().tombstones_carried > carried {
             is_copied = true;
-            assert!(!walked(&store), "a walk found the deleted key's first version");
+            assert!(
+                !walked(&store),
+                "a walk found the deleted key's first version"
+            );
             assert_eq!(value(&store), None, "a get found the deleted key");
         }
     }
-    assert!(is_copied, "no pass copied the tombstone, so this proves nothing");
+    assert!(
+        is_copied,
+        "no pass copied the tombstone, so this proves nothing"
+    );
 }
 
 #[test]
@@ -151,10 +157,16 @@ fn a_grave_refuses_a_put_already_handed_over() {
     Store::put(&store, "rows", &the_key(), b"second").expect("put again");
     fill(&store, 2);
     let column = store.index().column(ColumnId(1)).expect("column");
-    assert!(column.entry_or_grave(&the_key()).is_none(), "the second put was never handed over");
+    assert!(
+        column.entry_or_grave(&the_key()).is_none(),
+        "the second put was never handed over"
+    );
 
     store.index().hold_grave(&record_key(), deleted_at, COPY);
-    assert!(column.entry_or_grave(&the_key()).is_none(), "a grave stood over a newer put");
+    assert!(
+        column.entry_or_grave(&the_key()).is_none(),
+        "a grave stood over a newer put"
+    );
     assert_eq!(value(&store), Some(b"second".to_vec()));
     assert!(walked(&store), "a walk lost the second put");
 }
@@ -175,7 +187,10 @@ fn a_grave_stands_for_a_key_with_nothing_newer() {
         .column(ColumnId(1))
         .expect("column")
         .entry_or_grave(&the_key());
-    assert!(held.is_some_and(|entry| entry.is_grave()), "no grave stood for the deleted key");
+    assert!(
+        held.is_some_and(|entry| entry.is_grave()),
+        "no grave stood for the deleted key"
+    );
     assert_eq!(value(&store), None);
     assert!(!walked(&store), "a walk found the deleted key");
 }
@@ -196,8 +211,14 @@ fn a_put_after_a_delete_survives_compacting_its_tombstone() {
         store.compact_once().expect("compact");
     }
     let compaction = store.compaction_counters();
-    assert!(compaction.segments_rewritten > 0, "no pass ran, so this proves nothing");
-    assert!(compaction.tombstones_dropped > 0, "the tombstone was copied over a newer put");
+    assert!(
+        compaction.segments_rewritten > 0,
+        "no pass ran, so this proves nothing"
+    );
+    assert!(
+        compaction.tombstones_dropped > 0,
+        "the tombstone was copied over a newer put"
+    );
     assert_eq!(value(&store), Some(b"second".to_vec()));
     assert!(walked(&store), "a walk lost the second put");
 }
@@ -212,7 +233,11 @@ fn a_walk_keeps_a_deleted_key_out_once_its_grave_is_pruned() {
     Store::delete(&store, "rows", &the_key()).expect("delete");
     fill(&store, 2);
     store.index().prune_tombstones(Lsn(u64::MAX));
-    assert_eq!(store.index().grave_count(), 0, "the grave stood, so this tested nothing");
+    assert_eq!(
+        store.index().grave_count(),
+        0,
+        "the grave stood, so this tested nothing"
+    );
 
     assert!(!walked(&store), "a key walk brought the deleted key back");
     let values = Store::iter_from(&store, "rows", &[], Direction::Asc)

@@ -134,103 +134,36 @@ enum Run {
         partition: usize,
     },
 
-    /// One column of a key run, read a block at a time, each row naming its record's segment
+    /// One column of a key run, its rows read in place, each naming its record's segment
     Keys {
         run: Arc<KeyRun>,
         column: usize,
     },
 }
 
-/// The block of a key run one cursor stands in, read when the cursor reaches it
-#[derive(Default)]
-struct Window {
-    /// The block held, nothing before the cursor first reads
-    block: Option<u32>,
-
-    /// The column row the block starts at
-    first: u64,
-
-    /// The block's rows as they lie in the file
-    rows: Vec<u8>,
-}
-
-impl Window {
-    /// Hold the block a row lies in, reading it unless it is the one held
-    fn reach(&mut self, run: &KeyRun, column: &RunColumn, row: u64) -> Result<()> {
-        let block = (row / u64::from(column.block_rows())) as u32;
-        if self.block == Some(block) {
-            return Ok(());
-        }
-        self.rows = run.read_block(column, block, std::mem::take(&mut self.rows))?;
-        self.block = Some(block);
-        self.first = column.block_span(block).0;
-        Ok(())
-    }
-
-    /// The key of a row in the block held
-    fn key(&self, column: &RunColumn, row: u64) -> &[u8] {
-        key_in(&self.rows, column, (row - self.first) as usize)
-    }
-
-    /// The head a cursor has standing on a row of the block held
-    fn head(&self, column: &RunColumn, row: u64) -> Head {
-        Head {
-            lead: lead_of(self.key(column, row)),
-            first: row as usize,
-            last: row as usize,
-            is_spent: false,
-        }
-    }
-
-    /// The first row at a key or past it, or past it alone, as a column row
-    ///
-    /// The fence names the block, and one search inside it the row. A key past every
-    /// row of its block lands on the next block's first row, since rows lie back to back.
-    fn seek(&mut self, run: &KeyRun, column: &RunColumn, key: &[u8], is_past: bool) -> Result<u64> {
-        let block = column.block_for(key);
-        let (first, count) = column.block_span(block);
-        self.reach(run, column, first)?;
-        let (mut low, mut high) = (0usize, count as usize);
-        while low < high {
-            let mid = (low + high) / 2;
-            let held = key_in(&self.rows, column, mid);
-            let is_before = match is_past {
-                true => held <= key,
-                false => held < key,
-            };
-            match is_before {
-                true => low = mid + 1,
-                false => high = mid,
-            }
-        }
-        Ok(first + low as u64)
-    }
-
-    /// Where a cursor opened at a bound first stands in a key run's column
-    fn placed(&mut self, run: &KeyRun, column: &RunColumn, way: Way, from: Bound<&[u8]>) -> Result<Head> {
-        let rows = column.rows();
-        let Some((low, high)) = column.key_range() else {
-            return Ok(Head::SPENT);
-        };
-        let row = match (way, from) {
-            (Way::Up, Bound::Included(key)) if key > high => None,
-            (Way::Up, Bound::Excluded(key)) if key >= high => None,
-            (Way::Down, Bound::Included(key)) if key < low => None,
-            (Way::Down, Bound::Excluded(key)) if key <= low => None,
-            (Way::Up, Bound::Unbounded) => Some(0),
-            (Way::Down, Bound::Unbounded) => Some(rows - 1),
-            (Way::Up, Bound::Included(key)) => Some(self.seek(run, column, key, false)?),
-            (Way::Up, Bound::Excluded(key)) => Some(self.seek(run, column, key, true)?),
-            (Way::Down, Bound::Included(key)) => self.seek(run, column, key, true)?.checked_sub(1),
-            (Way::Down, Bound::Excluded(key)) => self.seek(run, column, key, false)?.checked_sub(1),
-        };
-        match row {
-            Some(row) if row < rows => {
-                self.reach(run, column, row)?;
-                Ok(self.head(column, row))
-            }
-            _ => Ok(Head::SPENT),
-        }
+/// Where a cursor opened at a bound first stands in a key run's column
+///
+/// A run holds one row a key, so a head's first and last row are the same.
+fn key_run_head(run: &KeyRun, column: &RunColumn, way: Way, from: Bound<&[u8]>) -> Head {
+    let rows = column.rows();
+    let Some((low, high)) = column.key_range() else {
+        return Head::SPENT;
+    };
+    let row = match (way, from) {
+        (Way::Up, Bound::Included(key)) if key > high => None,
+        (Way::Up, Bound::Excluded(key)) if key >= high => None,
+        (Way::Down, Bound::Included(key)) if key < low => None,
+        (Way::Down, Bound::Excluded(key)) if key <= low => None,
+        (Way::Up, Bound::Unbounded) => Some(0),
+        (Way::Down, Bound::Unbounded) => Some(rows - 1),
+        (Way::Up, Bound::Included(key)) => Some(run.seek(column, key, false)),
+        (Way::Up, Bound::Excluded(key)) => Some(run.seek(column, key, true)),
+        (Way::Down, Bound::Included(key)) => run.seek(column, key, true).checked_sub(1),
+        (Way::Down, Bound::Excluded(key)) => run.seek(column, key, false).checked_sub(1),
+    };
+    match row {
+        Some(row) if row < rows => Head::on(key_in(run.rows(column), column, row as usize), row as usize),
+        _ => Head::SPENT,
     }
 }
 
@@ -259,6 +192,16 @@ impl Head {
         last: 0,
         is_spent: true,
     };
+
+    /// The head of a cursor on a run's only row of a key
+    fn on(key: &[u8], row: usize) -> Head {
+        Head {
+            lead: lead_of(key),
+            first: row,
+            last: row,
+            is_spent: false,
+        }
+    }
 
     /// The head a cursor stepping one way has when it arrives at a row
     ///
@@ -343,9 +286,6 @@ struct Sealed {
     at: Vec<u32>,
     heads: Vec<Head>,
 
-    /// The block each cursor in a key run stands in, empty for a footer's cursor
-    windows: Vec<Window>,
-
     /// The loser each node holds, and at 0 the cursor holding the next key
     tree: Vec<usize>,
 
@@ -386,7 +326,6 @@ impl Sealed {
         self.set = None;
         self.at.clear();
         self.heads.clear();
-        self.windows.clear();
         self.tree.clear();
     }
 
@@ -407,7 +346,10 @@ impl Sealed {
         }
         match self.run(at) {
             Run::Footer { footer, partition, .. } => footer.partitions[*partition].key_at(head.first),
-            Run::Keys { run, column } => Some(self.windows[at].key(&run.columns()[*column], head.first as u64)),
+            Run::Keys { run, column } => {
+                let column = &run.columns()[*column];
+                Some(key_in(run.rows(column), column, head.first))
+            }
         }
     }
 
@@ -418,11 +360,10 @@ impl Sealed {
     }
 
     /// Step every cursor standing on a key past it, reading none of their rows
-    fn skip(&mut self, way: Way, key: &[u8]) -> Result<()> {
+    fn skip(&mut self, way: Way, key: &[u8]) {
         while let Some(at) = self.front_on(key) {
-            self.step(way, at)?;
+            self.step(way, at);
         }
-        Ok(())
     }
 
     /// The newest row any cursor holds for a key, under a ceiling when one is given
@@ -439,8 +380,7 @@ impl Sealed {
                 }
                 Run::Keys { run, column } => {
                     let column = &run.columns()[*column];
-                    let window = &self.windows[at];
-                    let (_, row) = row_in(&window.rows, column, (self.heads[at].last as u64 - window.first) as usize)?;
+                    let (_, row) = row_in(run.rows(column), column, self.heads[at].last)?;
                     (
                         row.loc.segment,
                         FooterRow {
@@ -452,7 +392,7 @@ impl Sealed {
                     )
                 }
             };
-            self.step(way, at)?;
+            self.step(way, at);
             let is_under = below.is_none_or(|below| found.lsn < below);
             if is_under && newest.as_ref().is_none_or(|(_, newest)| newest.lsn < found.lsn) {
                 newest = Some((segment, found));
@@ -462,7 +402,7 @@ impl Sealed {
     }
 
     /// Move the front cursor off its key and play it up the tree
-    fn step(&mut self, way: Way, at: usize) -> Result<()> {
+    fn step(&mut self, way: Way, at: usize) {
         let head = self.heads[at];
         let next = match way {
             Way::Up => Some(head.last + 1),
@@ -476,16 +416,12 @@ impl Sealed {
             (Some(row), Run::Keys { run, column }) => {
                 let column = &run.columns()[*column];
                 match (row as u64) < column.rows() {
-                    true => {
-                        self.windows[at].reach(run, column, row as u64)?;
-                        self.windows[at].head(column, row as u64)
-                    }
+                    true => Head::on(key_in(run.rows(column), column, row), row),
                     false => Head::SPENT,
                 }
             }
         };
         self.replay(way, at);
-        Ok(())
     }
 
     /// Play one leaf up to the root, leaving the new front at 0
@@ -750,7 +686,7 @@ pub fn merged_page(
         // The map's answer stands on its own, so the footers are stepped past this
         // key without their rows being decoded.
         if resident.key_ref(taken) == Some(key) {
-            sealed.skip(way, key)?;
+            sealed.skip(way, key);
             // Dropping the key here would lose it for good, since the next page
             // starts after the last key this one emitted.
             let found = resident
@@ -950,15 +886,13 @@ impl Paged<'_> {
         // A run whose keys all lie behind the bound is passed over without a search.
         sealed.clear();
         for (index, run) in set.runs.iter().enumerate() {
-            let mut window = Window::default();
             let head = match run {
                 Run::Footer { footer, partition, .. } => Head::placed(&footer.partitions[*partition], way, from),
-                Run::Keys { run, column } => window.placed(run, &run.columns()[*column], way, from)?,
+                Run::Keys { run, column } => key_run_head(run, &run.columns()[*column], way, from),
             };
             if !head.is_spent {
                 sealed.at.push(index as u32);
                 sealed.heads.push(head);
-                sealed.windows.push(window);
             }
         }
         sealed.set = Some(set);

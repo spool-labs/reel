@@ -9,7 +9,8 @@
 //! A file holds each column's rows back to back at a fixed stride, then each column's
 //! fence of block leads, the segments the run covers, a directory and a trailer. A row is
 //! the key at its column's width, then the sequence number, the segment, offset and
-//! length of the record, and its flags. A block is a read unit and nothing on disk.
+//! length of the record, and its flags. A block is a span of rows a search lands in and
+//! nothing on disk. A run is mapped whole for its life, so a walk reads its rows in place.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -21,10 +22,11 @@ use crate::format::column::ColumnId;
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{read_u32_le, read_u64_le, Flags};
+use crate::io::mapping::Mapping;
 use crate::io::op::{FileId, WriteBuf};
 use crate::reel::segment::IoDriver;
 
-/// Bytes a read of one block of rows aims for
+/// Bytes of rows one fence lead stands for, so a search touches a page or two of rows
 const BLOCK_BYTES: usize = 8 * 1024;
 
 /// Bytes a row carries past its key: sequence, segment, offset, length and flags
@@ -157,7 +159,26 @@ impl RunColumn {
     }
 }
 
-/// A key run open for reading, its fences and directory held and its rows read by block
+/// Where a key run's bytes are read from
+///
+/// A file on a real filesystem is mapped, and one the volume's driver alone can reach,
+/// as a simulated one, is read whole.
+enum Backing {
+    Mapped(Mapping),
+    Read(Vec<u8>),
+}
+
+impl Backing {
+    /// The whole file
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Backing::Mapped(map) => map.slice(0, map.len() as usize).unwrap_or_default(),
+            Backing::Read(bytes) => bytes,
+        }
+    }
+}
+
+/// A key run open for reading, its fences and directory held and its rows read in place
 pub struct KeyRun {
     /// The run's id, which its file name carries and which orders runs by age
     pub id: u64,
@@ -165,10 +186,10 @@ pub struct KeyRun {
     /// Where the file is
     pub path: PathBuf,
 
-    /// The file, held open for the run's life
-    file: FileId,
+    /// The file's bytes, for the run's life
+    backing: Backing,
 
-    /// What the run's blocks are read through
+    /// What unlinks the file once the run is retired
     driver: Arc<IoDriver>,
 
     /// Each column's rows, in column order
@@ -184,13 +205,28 @@ pub struct KeyRun {
 impl KeyRun {
     /// Open one key run, reading its directory, fences and covered segments
     pub fn open(driver: &Arc<IoDriver>, path: &Path, id: u64) -> Result<KeyRun> {
-        let file = driver.open(path, false)?;
-        let bytes = driver.length(file)?;
+        let backing = match Mapping::open(path, 0) {
+            Some(map) => Backing::Mapped(map),
+            None => {
+                let file = driver.open(path, false)?;
+                let read = driver.length(file).and_then(|len| driver.pread(file, 0, len));
+                let _ = driver.close(file);
+                Backing::Read(read?)
+            }
+        };
+        let file = backing.bytes();
+        let bytes = file.len() as u64;
         let corrupt = |what: &str| ReelError::Corruption(format!("key run {id}: {what}"));
+        let span = |at: u64, len: u64| {
+            at.checked_add(len)
+                .filter(|end| *end <= bytes)
+                .map(|end| &file[at as usize..end as usize])
+                .ok_or_else(|| corrupt("a region runs past the file"))
+        };
         if bytes < TRAILER as u64 {
             return Err(corrupt("shorter than its trailer"));
         }
-        let trailer = driver.pread(file, bytes - TRAILER as u64, TRAILER as u64)?;
+        let trailer = span(bytes - TRAILER as u64, TRAILER as u64)?;
         if read_u32_le(&trailer[16..20]) != MAGIC {
             return Err(corrupt("no magic"));
         }
@@ -201,7 +237,7 @@ impl KeyRun {
         if directory_at + directory_len + TRAILER as u64 != bytes {
             return Err(corrupt("directory does not fit the file"));
         }
-        let directory = driver.pread(file, directory_at, directory_len)?;
+        let directory = span(directory_at, directory_len)?;
         let mut columns = Vec::with_capacity(column_count);
         for at in 0..column_count {
             let row = &directory[at * DIRECTORY_ROW..(at + 1) * DIRECTORY_ROW];
@@ -213,9 +249,10 @@ impl KeyRun {
             if key_width == 0 || block_rows == 0 {
                 return Err(corrupt("a column with no width or no block size"));
             }
+            let stride = u64::from(key_width) + ROW_TAIL as u64;
+            span(rows_at, rows.checked_mul(stride).ok_or_else(|| corrupt("a column too long to hold"))?)?;
             let blocks = rows.div_ceil(u64::from(block_rows));
-            let fences_len = (blocks + 1) * u64::from(key_width);
-            let mut fences = driver.pread(file, fences_at, fences_len)?;
+            let mut fences = span(fences_at, (blocks + 1) * u64::from(key_width))?.to_vec();
             let last = fences.split_off((blocks * u64::from(key_width)) as usize);
             columns.push(RunColumn {
                 column: ColumnId(row[0]),
@@ -234,7 +271,7 @@ impl KeyRun {
         Ok(KeyRun {
             id,
             path: path.to_path_buf(),
-            file,
+            backing,
             driver: Arc::clone(driver),
             columns,
             covered,
@@ -252,17 +289,40 @@ impl KeyRun {
         &self.columns
     }
 
-    /// Read one block of a column's rows into a buffer the caller keeps
-    pub fn read_block(&self, column: &RunColumn, block: u32, into: Vec<u8>) -> Result<Vec<u8>> {
-        let (first, count) = column.block_span(block);
-        let stride = column.stride() as u64;
-        self.driver
-            .pread_reusing(self.file, column.rows_at + first * stride, u64::from(count) * stride, into)
+    /// A column's rows back to back, in place in the file
+    pub fn rows(&self, column: &RunColumn) -> &[u8] {
+        let at = column.rows_at as usize;
+        // Open checked every column's rows lie inside the file.
+        &self.backing.bytes()[at..at + column.rows as usize * column.stride()]
     }
 
-    /// Let go of the file and unlink it, for a run a merge or a rewrite retired
+    /// The first row at a key or past it, or past it alone
+    ///
+    /// The fence names the block, and one search inside it the row. A key past every
+    /// row of its block lands on the next block's first row, since rows lie back to back.
+    pub fn seek(&self, column: &RunColumn, key: &[u8], is_past: bool) -> u64 {
+        let rows = self.rows(column);
+        let (first, count) = column.block_span(column.block_for(key));
+        let (mut low, mut high) = (first, first + u64::from(count));
+        while low < high {
+            let mid = (low + high) / 2;
+            let held = key_in(rows, column, mid as usize);
+            let is_before = match is_past {
+                true => held <= key,
+                false => held < key,
+            };
+            match is_before {
+                true => low = mid + 1,
+                false => high = mid,
+            }
+        }
+        low
+    }
+
+    /// Unlink the file, for a run a merge or a rewrite retired
+    ///
+    /// Walks still holding the run keep reading it until they let it go.
     pub fn retire(&self) {
-        let _ = self.driver.close(self.file);
         let _ = self.driver.unlink(&self.path);
     }
 }
@@ -402,13 +462,13 @@ impl KeyRunSet {
     }
 }
 
-/// The key and the row at one place in a block a caller read
-pub fn row_in<'a>(block: &'a [u8], column: &RunColumn, at: usize) -> Result<(&'a [u8], RunRow)> {
+/// The key and the row at one row of a column's rows
+pub fn row_in<'a>(rows: &'a [u8], column: &RunColumn, at: usize) -> Result<(&'a [u8], RunRow)> {
     let stride = column.stride();
     let width = column.key_width as usize;
-    let row = block
+    let row = rows
         .get(at * stride..(at + 1) * stride)
-        .ok_or_else(|| ReelError::Corruption("key run row is past its block".to_string()))?;
+        .ok_or_else(|| ReelError::Corruption("key run row is past its column".to_string()))?;
     let tail = &row[width..];
     Ok((
         &row[..width],
@@ -424,10 +484,10 @@ pub fn row_in<'a>(block: &'a [u8], column: &RunColumn, at: usize) -> Result<(&'a
     ))
 }
 
-/// The key at one place in a block, without decoding its row
-pub fn key_in<'a>(block: &'a [u8], column: &RunColumn, at: usize) -> &'a [u8] {
+/// The key at one row of a column's rows, without decoding the row
+pub fn key_in<'a>(rows: &'a [u8], column: &RunColumn, at: usize) -> &'a [u8] {
     let stride = column.stride();
-    &block[at * stride..at * stride + column.key_width as usize]
+    &rows[at * stride..at * stride + column.key_width as usize]
 }
 
 /// A column being written, its rows already down and its fences gathered
@@ -609,7 +669,7 @@ mod tests {
         }
     }
 
-    // a run reads back every row it was written with, in order, through its blocks
+    // a run reads back every row it was written with, in order
     #[test]
     fn a_written_run_reads_back_its_rows() {
         let sim = SimIo::new(FaultPlan::new(1));
@@ -629,25 +689,19 @@ mod tests {
         assert_eq!(run.covered, vec![SegmentId(4), SegmentId(9)]);
         let column = run.column(ColumnId(1)).expect("column one");
         assert_eq!(column.rows(), 2_000);
-        let mut at = 0usize;
-        let mut buf = Vec::new();
-        for block in 0..column.blocks() {
-            buf = run.read_block(column, block, buf).expect("block");
-            let (_, count) = column.block_span(block);
-            for slot in 0..count as usize {
-                let (got, got_row) = row_in(&buf, column, slot).expect("row");
-                assert_eq!(got, keys[at].0.as_slice());
-                assert_eq!(got_row, row(keys[at].1));
-                at += 1;
-            }
+        let rows = run.rows(column);
+        for (at, (want, n)) in keys.iter().enumerate() {
+            let (got, got_row) = row_in(rows, column, at).expect("row");
+            assert_eq!(got, want.as_slice());
+            assert_eq!(got_row, row(*n));
         }
-        assert_eq!(at, keys.len());
+        assert!(row_in(rows, column, keys.len()).is_err(), "a row past the column read back");
         assert_eq!(run.column(ColumnId(2)).expect("column two").rows(), 1);
     }
 
-    // a key's block holds the first row at or past it
+    // a seek lands on the first row at or past a key, or past it alone
     #[test]
-    fn a_seek_lands_on_the_block_that_holds_the_key() {
+    fn a_seek_lands_on_the_first_row_at_or_past_the_key() {
         let sim = SimIo::new(FaultPlan::new(1));
         let driver = driver(&sim);
         let keys: Vec<[u8; 8]> = (0..5_000u64).map(|n| (n * 2).to_be_bytes()).collect();
@@ -661,16 +715,10 @@ mod tests {
         let column = run.column(ColumnId(1)).expect("column");
         for probe in [0u64, 1, 2, 1_001, 4_000, 9_998, 9_999, 20_000] {
             let target = probe.to_be_bytes();
-            let block = column.block_for(&target);
-            let (first, count) = column.block_span(block);
-            let buf = run.read_block(column, block, Vec::new()).expect("block");
-            let landed = (0..count as usize).find(|slot| key_in(&buf, column, *slot) >= &target[..]);
-            let want = keys.iter().position(|key| key >= &target);
-            match (landed, want) {
-                (Some(slot), Some(want)) => assert_eq!(first as usize + slot, want, "probe {probe}"),
-                (None, Some(want)) => assert_eq!(first as usize + count as usize, want, "probe {probe}"),
-                (_, None) => assert!(landed.is_none(), "probe {probe}"),
-            }
+            let at = keys.iter().position(|key| key >= &target).unwrap_or(keys.len()) as u64;
+            let past = keys.iter().position(|key| key > &target).unwrap_or(keys.len()) as u64;
+            assert_eq!(run.seek(column, &target, false), at, "probe {probe} at");
+            assert_eq!(run.seek(column, &target, true), past, "probe {probe} past");
         }
     }
 

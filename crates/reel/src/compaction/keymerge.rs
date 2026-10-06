@@ -13,7 +13,7 @@ use crate::error::{ReelError, Result};
 use crate::format::column::ColumnId;
 use crate::format::footer::{FooterPartition, SegmentFooter, VARYING_WIDTH};
 use crate::format::loc::{Loc, SegmentId};
-use crate::index::keyrun::{row_in, KeyRun, RunColumn, RunRow, RunWriter};
+use crate::index::keyrun::{key_in, row_in, KeyRun, RunColumn, RunRow, RunWriter};
 use crate::index::map::ReelIndex;
 use crate::reel::Reel;
 
@@ -53,12 +53,9 @@ enum Cursor<'a> {
         at: usize,
     },
     Keys {
-        run: &'a KeyRun,
+        rows: &'a [u8],
         column: &'a RunColumn,
         at: u64,
-        block: Option<u32>,
-        first: u64,
-        buf: Vec<u8>,
     },
 }
 
@@ -67,26 +64,8 @@ impl Cursor<'_> {
     fn key(&self) -> Option<&[u8]> {
         match self {
             Cursor::Footer { rows, at, .. } => rows.key_at(*at),
-            Cursor::Keys { column, at, first, buf, .. } => {
-                (*at < column.rows()).then(|| crate::index::keyrun::key_in(buf, column, (*at - *first) as usize))
-            }
+            Cursor::Keys { rows, column, at } => (*at < column.rows()).then(|| key_in(rows, column, *at as usize)),
         }
-    }
-
-    /// Read the block the cursor stands in, when it is not the one held
-    fn reach(&mut self) -> Result<()> {
-        if let Cursor::Keys { run, column, at, block, first, buf } = self {
-            if *at >= column.rows() {
-                return Ok(());
-            }
-            let wanted = (*at / u64::from(column.block_rows())) as u32;
-            if *block != Some(wanted) {
-                *buf = run.read_block(column, wanted, std::mem::take(buf))?;
-                *block = Some(wanted);
-                *first = column.block_span(wanted).0;
-            }
-        }
-        Ok(())
     }
 
     /// The row the cursor stands on, with the place its record lies
@@ -100,17 +79,16 @@ impl Cursor<'_> {
                     flags: row.flags,
                 })
             }
-            Cursor::Keys { column, at, first, buf, .. } => Ok(row_in(buf, column, (*at - *first) as usize)?.1),
+            Cursor::Keys { rows, column, at } => Ok(row_in(rows, column, *at as usize)?.1),
         }
     }
 
     /// Step to the next row
-    fn advance(&mut self) -> Result<()> {
+    fn advance(&mut self) {
         match self {
             Cursor::Footer { at, .. } => *at += 1,
             Cursor::Keys { at, .. } => *at += 1,
         }
-        self.reach()
     }
 }
 
@@ -237,16 +215,11 @@ fn merge_column(
             }
             Source::Keys(run) => {
                 if let Some(held) = run.column(column) {
-                    let mut cursor = Cursor::Keys {
-                        run,
+                    cursors.push(Cursor::Keys {
+                        rows: run.rows(held),
                         column: held,
                         at: 0,
-                        block: None,
-                        first: 0,
-                        buf: Vec::new(),
-                    };
-                    cursor.reach()?;
-                    cursors.push(cursor);
+                    });
                 }
             }
         }
@@ -273,7 +246,7 @@ fn merge_column(
             if newest.is_none_or(|held| held.lsn < row.lsn) {
                 newest = Some(row);
             }
-            cursors[top].advance()?;
+            cursors[top].advance();
             if cursors[top].key().is_none() {
                 heap.swap_remove(0);
             }

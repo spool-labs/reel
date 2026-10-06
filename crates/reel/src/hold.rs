@@ -76,6 +76,12 @@ struct Slot<V> {
 
     /// Next entry of the same segment, or the next vacancy while free
     next: u32,
+
+    /// The entry before this one in its segment's chain, so taking one out is a step
+    ///
+    /// A block pool holds thousands of one segment's blocks, and an eviction that
+    /// walked the chain for the link before it spent most of a scan.
+    prev: u32,
 }
 
 /// What one shard holds, behind its own mutex
@@ -345,24 +351,26 @@ impl<V> Inner<V> {
 
     fn chain_link(&mut self, slot: u32) {
         let bucket = self.chain_at(self.slots[slot as usize].key);
-        self.slots[slot as usize].next = self.chains[bucket];
+        let head = self.chains[bucket];
+        self.slots[slot as usize].next = head;
+        self.slots[slot as usize].prev = NONE;
+        if head != NONE {
+            self.slots[head as usize].prev = slot;
+        }
         self.chains[bucket] = slot;
     }
 
     fn chain_unlink(&mut self, slot: u32) {
-        let bucket = self.chain_at(self.slots[slot as usize].key);
-        let mut at = self.chains[bucket];
-        if at == slot {
-            self.chains[bucket] = self.slots[slot as usize].next;
-            return;
-        }
-        while at != NONE {
-            let next = self.slots[at as usize].next;
-            if next == slot {
-                self.slots[at as usize].next = self.slots[slot as usize].next;
-                return;
+        let (prev, next) = (self.slots[slot as usize].prev, self.slots[slot as usize].next);
+        match prev {
+            NONE => {
+                let bucket = self.chain_at(self.slots[slot as usize].key);
+                self.chains[bucket] = next;
             }
-            at = next;
+            prev => self.slots[prev as usize].next = next,
+        }
+        if next != NONE {
+            self.slots[next as usize].prev = prev;
         }
     }
 
@@ -379,6 +387,7 @@ impl<V> Inner<V> {
                     weight: 0,
                     hot: false,
                     next: NONE,
+                    prev: NONE,
                 });
                 (self.slots.len() - 1) as u32
             }
@@ -468,6 +477,10 @@ impl<V> Inner<V> {
                 true => going.push(at as usize),
                 false => {
                     self.slots[at as usize].next = kept;
+                    self.slots[at as usize].prev = NONE;
+                    if kept != NONE {
+                        self.slots[kept as usize].prev = at;
+                    }
                     kept = at;
                 }
             }
@@ -566,6 +579,36 @@ mod tests {
             assert_eq!(hold.get(key_of(1, 0, block)), Some(1));
             assert_eq!(hold.get(key_of(3, 0, block)), Some(3));
         }
+    }
+
+    // evictions out of the middle of long chains leave every chain whole for a retire
+    #[test]
+    fn evictions_keep_each_chain_whole() {
+        // Room for 64 entries, fed 4,000 blocks of two segments interleaved, so each
+        // segment's chain is long and loses entries from its middle.
+        let hold: Hold<u64> = Hold::new(64 * 16, 16);
+        for block in 0..2_000 {
+            for segment in [1u32, 2] {
+                hold.insert(key_of(segment, 0, block), u64::from(segment), 16);
+                // A read block is passed over by the hand, so evictions skip around.
+                if block % 3 == 0 {
+                    hold.get(key_of(segment, 0, block));
+                }
+            }
+        }
+        assert!(!hold.is_empty() && hold.len() <= 64);
+
+        hold.forget(SegmentId(1));
+        for block in 0..2_000 {
+            assert_eq!(hold.get(key_of(1, 0, block)), None, "block {block} outlived its segment");
+        }
+        let left = (0..2_000).filter(|block| hold.get(key_of(2, 0, *block)).is_some()).count();
+        assert_eq!(hold.len(), left);
+        assert_eq!(hold.bytes(), left * 16);
+
+        hold.forget(SegmentId(2));
+        assert!(hold.is_empty());
+        assert_eq!(hold.bytes(), 0);
     }
 
     // the table grows and everything held is still found afterwards

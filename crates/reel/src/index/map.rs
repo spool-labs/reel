@@ -24,6 +24,7 @@ use crate::format::lsn::Lsn;
 use crate::index::column::{ColumnIndex, KeyMove, Landed, PendingCover};
 use crate::index::counters::{Floors, SegmentBytes, SegmentStamp, SegmentTable};
 use crate::index::entry::{span_of, Entry};
+use crate::index::keyrun::KeyRunSet;
 use crate::index::fastforward::{FastColumn, Lookup, Pick, RecordSource, Settled, Since, LOOKUP_TRIES};
 use crate::index::page::KeyPage;
 use crate::index::paged::{Candidates, FooterSource, SealedRanges};
@@ -223,6 +224,9 @@ pub struct ReelIndex {
     /// The footers each column's walks opened, kept while its sealed set stands
     walk_runs: Vec<WalkRuns>,
 
+    /// The key runs merges wrote, which a walk reads in place of the footers they cover
+    key_runs: KeyRunSet,
+
     /// Each column's sealed keys as record locations, answering a get in one read
     fast: Vec<FastColumn>,
 
@@ -281,6 +285,7 @@ impl ReelIndex {
             columns,
             indexes,
             walk_runs: sealed.iter().map(|_| WalkRuns::default()).collect(),
+            key_runs: KeyRunSet::default(),
             sealed,
             fast: columns
                 .iter()
@@ -1790,12 +1795,33 @@ impl ReelIndex {
             sealed: &self.sealed[at],
             footers: footers.as_ref(),
             runs: &self.walk_runs[at],
+            key_runs: &self.key_runs,
         }
     }
 
-    /// The most sealed segments any key of any column falls inside
+    /// The key runs merges wrote, and the segments they answer for in a walk
+    pub fn key_runs(&self) -> &KeyRunSet {
+        &self.key_runs
+    }
+
+    /// Whether a segment is still a sealed run, which a retire stops it being
+    pub fn holds_sealed(&self, segment: SegmentId) -> bool {
+        self.sealed.iter().any(|sealed| sealed.holds(segment))
+    }
+
+    /// The most runs a walk from any one key merges: the segments no key run covers, and the key runs
+    ///
+    /// A key run of scattered keys reaches across its whole column, so each counts once.
+    /// With no key runs it is the most sealed segments any key falls inside.
     pub fn overlap_depth(&self) -> usize {
-        self.sealed.iter().map(SealedRanges::depth).max().unwrap_or(0)
+        let covered = self.key_runs.covered();
+        let runs = self.key_runs.runs().len();
+        self.sealed
+            .iter()
+            .map(|sealed| sealed.depth_past(&covered))
+            .max()
+            .unwrap_or(0)
+            + runs
     }
 
     /// The segments of the smallest layers a merge can take, once some column's layers pass a depth
@@ -1836,7 +1862,7 @@ impl ReelIndex {
     /// A slot no walk came back to would otherwise hold a retired segment's footer.
     pub fn sweep_walk_runs(&self) {
         for (sealed, runs) in self.sealed.iter().zip(&self.walk_runs) {
-            runs.sweep(sealed.generation());
+            runs.sweep(sealed.generation().wrapping_add(self.key_runs.generation()));
         }
     }
 

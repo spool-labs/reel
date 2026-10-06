@@ -380,7 +380,13 @@ impl ReelStore {
     /// as often as its traffic shadows rows and never on a quiet one. Nothing comes back
     /// where the stack is under the threshold or a seat or the rate held the pass off.
     pub fn merge_when_due(&self) -> Result<Option<MergeReport>> {
-        if self.is_read_only || !self.config.merge_sorted_runs {
+        if self.is_read_only {
+            return Ok(None);
+        }
+        if self.config.key_runs {
+            return self.key_merge_when_due();
+        }
+        if !self.config.merge_sorted_runs {
             return Ok(None);
         }
         // The seat is what keeps a merge and a rewrite off one another's segments, and
@@ -490,6 +496,62 @@ impl ReelStore {
                 .into_iter()
                 .try_for_each(|worker| worker.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
         })
+    }
+
+    /// Merge the walk's runs into one key run once too many stand over one key
+    ///
+    /// The young pile is every sealed segment no key run covers yet. Key runs join it
+    /// smallest first while each is no bigger than twice what is taken, so the young
+    /// runs merge often and cheaply and a large run is merged again only once the pile
+    /// has grown to its size.
+    fn key_merge_when_due(&self) -> Result<Option<MergeReport>> {
+        let Some(_pass) = self.compaction_plane.enter() else {
+            return Ok(None);
+        };
+        self.settle_sealed()?;
+        if self.index.overlap_depth() <= MERGE_DEPTH || self.index.has_pending_covers() {
+            return Ok(None);
+        }
+        let shared = self.reel.shared();
+        let covered = self.index.key_runs().covered();
+        let owed = shared.pending_seals();
+        let mut segments = Vec::new();
+        let mut taken = 0u64;
+        for (segment, bytes) in self.index.segments_snapshot() {
+            if covered.contains(&segment) || shared.is_held(segment) || owed.contains(&segment) || bytes.total() == 0 {
+                continue;
+            }
+            let Some(footer) = shared.footer_of(segment)? else {
+                continue;
+            };
+            taken += footer.entry_count() as u64;
+            segments.push(segment);
+        }
+        let mut runs = self.index.key_runs().runs();
+        runs.sort_by_key(|run| run.columns().iter().map(|column| column.rows()).sum::<u64>());
+        let mut joining = Vec::new();
+        for run in runs {
+            let rows: u64 = run.columns().iter().map(|column| column.rows()).sum();
+            if taken > 0 && rows > taken.saturating_mul(2) {
+                break;
+            }
+            taken += rows;
+            joining.push(run);
+        }
+        let merged = crate::compaction::keymerge::merge_into_key_run(
+            &self.compactor,
+            &self.reel,
+            &self.index,
+            &segments,
+            &joining,
+        )?;
+        self.compactor.note_merged_runs(merged.runs_merged);
+        Ok(Some(MergeReport {
+            runs_merged: merged.runs_merged,
+            rows_written: merged.rows_written,
+            rows_shadowed: merged.rows_shadowed,
+            ..MergeReport::default()
+        }))
     }
 
     /// Merge what is due, where a pass that refuses or fails is one tier of one tick
@@ -606,7 +668,7 @@ impl ReelStore {
         let is_hot = self.is_ingest_hot();
         // Runs piled past the merge depth are sorted even under a hot ingest: a tier
         // merge reads sorted runs alone, and the pile is what every walk pays for.
-        let is_deep = self.config.merge_sorted_runs && self.index.overlap_depth() > MERGE_DEPTH;
+        let is_deep = self.config.merge_sorted_runs && !self.config.key_runs && self.index.overlap_depth() > MERGE_DEPTH;
         if !is_deep
             && !self
                 .compactor

@@ -11,7 +11,10 @@
 //! the key at its column's width, then the sequence number, the segment, offset and
 //! length of the record, and its flags. A block is a read unit and nothing on disk.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use crate::error::{ReelError, Result};
 use crate::format::column::ColumnId;
@@ -155,7 +158,6 @@ impl RunColumn {
 }
 
 /// A key run open for reading, its fences and directory held and its rows read by block
-#[derive(Debug)]
 pub struct KeyRun {
     /// The run's id, which its file name carries and which orders runs by age
     pub id: u64,
@@ -165,6 +167,9 @@ pub struct KeyRun {
 
     /// The file, held open for the run's life
     file: FileId,
+
+    /// What the run's blocks are read through
+    driver: Arc<IoDriver>,
 
     /// Each column's rows, in column order
     columns: Vec<RunColumn>,
@@ -178,7 +183,7 @@ pub struct KeyRun {
 
 impl KeyRun {
     /// Open one key run, reading its directory, fences and covered segments
-    pub fn open(driver: &IoDriver, path: &Path, id: u64) -> Result<KeyRun> {
+    pub fn open(driver: &Arc<IoDriver>, path: &Path, id: u64) -> Result<KeyRun> {
         let file = driver.open(path, false)?;
         let bytes = driver.length(file)?;
         let corrupt = |what: &str| ReelError::Corruption(format!("key run {id}: {what}"));
@@ -230,6 +235,7 @@ impl KeyRun {
             id,
             path: path.to_path_buf(),
             file,
+            driver: Arc::clone(driver),
             columns,
             covered,
             bytes,
@@ -247,15 +253,143 @@ impl KeyRun {
     }
 
     /// Read one block of a column's rows into a buffer the caller keeps
-    pub fn read_block(&self, driver: &IoDriver, column: &RunColumn, block: u32, into: Vec<u8>) -> Result<Vec<u8>> {
+    pub fn read_block(&self, column: &RunColumn, block: u32, into: Vec<u8>) -> Result<Vec<u8>> {
         let (first, count) = column.block_span(block);
         let stride = column.stride() as u64;
-        driver.pread_reusing(self.file, column.rows_at + first * stride, u64::from(count) * stride, into)
+        self.driver
+            .pread_reusing(self.file, column.rows_at + first * stride, u64::from(count) * stride, into)
     }
 
-    /// Let go of the file, before the run is unlinked or dropped
-    pub fn close(&self, driver: &IoDriver) {
-        let _ = driver.close(self.file);
+    /// Let go of the file and unlink it, for a run a merge or a rewrite retired
+    pub fn retire(&self) {
+        let _ = self.driver.close(self.file);
+        let _ = self.driver.unlink(&self.path);
+    }
+}
+
+/// The key runs a volume holds, and the data segments they answer for in a walk
+///
+/// A covered segment keeps its records and its footer, which point reads and recovery
+/// still use, and only the walk passes it over for the run that holds its rows.
+#[derive(Default)]
+pub struct KeyRunSet {
+    held: RwLock<KeyRunsHeld>,
+    generation: AtomicU64,
+    next_id: AtomicU64,
+}
+
+#[derive(Default)]
+struct KeyRunsHeld {
+    runs: Vec<Arc<KeyRun>>,
+    covered: HashSet<SegmentId>,
+}
+
+impl KeyRunSet {
+    /// How many times the set has changed, which a walk's cached runs are keyed by
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// The runs held now, oldest first
+    pub fn runs(&self) -> Vec<Arc<KeyRun>> {
+        crate::sync::read(&self.held).runs.clone()
+    }
+
+    /// Whether a run answers for this segment in a walk
+    pub fn covers(&self, segment: SegmentId) -> bool {
+        crate::sync::read(&self.held).covered.contains(&segment)
+    }
+
+    /// Every segment a run answers for
+    pub fn covered(&self) -> HashSet<SegmentId> {
+        crate::sync::read(&self.held).covered.clone()
+    }
+
+    /// The id the next run is written under
+    pub fn draw_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Put a merged run in place of the runs it merged, handing those back to be unlinked
+    pub fn install(&self, run: Arc<KeyRun>, merged: &[u64]) -> Vec<Arc<KeyRun>> {
+        let mut held = crate::sync::write(&self.held);
+        self.next_id.fetch_max(run.id, Ordering::AcqRel);
+        let mut retired = Vec::new();
+        held.runs.retain(|kept| match merged.contains(&kept.id) {
+            true => {
+                retired.push(Arc::clone(kept));
+                false
+            }
+            false => true,
+        });
+        held.covered.extend(run.covered.iter().copied());
+        held.runs.push(run);
+        held.runs.sort_by_key(|kept| kept.id);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        retired
+    }
+
+    /// Read back the key runs a previous opening left
+    ///
+    /// A run is derived from the footers it covers, so one that cannot be read, or that
+    /// names a segment no longer standing, is unlinked and its segments go back to the
+    /// walk. So is a run a newer one covers whole, which a merge that stopped between
+    /// writing its run and unlinking its inputs leaves behind.
+    pub fn load(&self, driver: &Arc<IoDriver>, root: &Path, standing: impl Fn(SegmentId) -> bool) -> Result<()> {
+        let mut runs = Vec::new();
+        for entry in driver.list_or_empty(root)? {
+            let path = root.join(&entry.name);
+            if entry.name.ends_with(".part") && entry.name.contains(KEY_RUN_SUFFIX) {
+                let _ = driver.unlink(&path);
+                continue;
+            }
+            let Some(id) = key_run_id(&entry.name) else {
+                continue;
+            };
+            match KeyRun::open(driver, &path, id) {
+                Ok(run) if run.covered.iter().all(|segment| standing(*segment)) => runs.push(run),
+                Ok(run) => run.retire(),
+                Err(_) => {
+                    let _ = driver.unlink(&path);
+                }
+            }
+        }
+        runs.sort_by_key(|run| run.id);
+        let mut kept: Vec<KeyRun> = Vec::new();
+        while let Some(run) = runs.pop() {
+            let is_within = kept.iter().any(|newer| run.covered.iter().all(|segment| newer.covered.contains(segment)));
+            match is_within {
+                true => run.retire(),
+                false => kept.push(run),
+            }
+        }
+        for run in kept {
+            self.install(Arc::new(run), &[]);
+        }
+        Ok(())
+    }
+
+    /// Drop every run that answers for a segment about to move, giving the walk its footers back
+    ///
+    /// A run names its records where they lie, so a rewrite of one of its segments would
+    /// leave it pointing at the old places. What it covered goes back to the walk until a
+    /// later merge takes it again.
+    pub fn drop_covering(&self, segment: SegmentId) -> Vec<Arc<KeyRun>> {
+        let mut held = crate::sync::write(&self.held);
+        if !held.covered.contains(&segment) {
+            return Vec::new();
+        }
+        let mut dropped = Vec::new();
+        held.runs.retain(|kept| match kept.covered.contains(&segment) {
+            true => {
+                dropped.push(Arc::clone(kept));
+                false
+            }
+            false => true,
+        });
+        held.covered = held.runs.iter().flat_map(|kept| kept.covered.iter().copied()).collect();
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        dropped
     }
 }
 
@@ -450,8 +584,8 @@ mod tests {
 
     const ROOT: &str = "/runs";
 
-    fn driver(sim: &SimIo) -> IoDriver {
-        IoDriver::new(Arc::new(sim.clone()))
+    fn driver(sim: &SimIo) -> Arc<IoDriver> {
+        Arc::new(IoDriver::new(Arc::new(sim.clone())))
     }
 
     fn key(n: u32) -> [u8; 8] {
@@ -489,7 +623,7 @@ mod tests {
         let mut at = 0usize;
         let mut buf = Vec::new();
         for block in 0..column.blocks() {
-            buf = run.read_block(&driver, column, block, buf).expect("block");
+            buf = run.read_block(column, block, buf).expect("block");
             let (_, count) = column.block_span(block);
             for slot in 0..count as usize {
                 let (got, got_row) = row_in(&buf, column, slot).expect("row");
@@ -520,7 +654,7 @@ mod tests {
             let target = probe.to_be_bytes();
             let block = column.block_for(&target);
             let (first, count) = column.block_span(block);
-            let buf = run.read_block(&driver, column, block, Vec::new()).expect("block");
+            let buf = run.read_block(column, block, Vec::new()).expect("block");
             let landed = (0..count as usize).find(|slot| key_in(&buf, column, *slot) >= &target[..]);
             let want = keys.iter().position(|key| key >= &target);
             match (landed, want) {

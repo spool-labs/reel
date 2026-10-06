@@ -736,6 +736,11 @@ impl Compactor {
         if reel.tails().is_empty() {
             return Ok(());
         }
+        // A key run names this segment's records where they lie, and the rewrite moves
+        // them, so every run covering it goes and the walk reads its footer again.
+        for run in index.key_runs().drop_covering(segment) {
+            run.retire();
+        }
         // What the other segments hold is only half the floor: a number drawn before
         // this pass can still be published into a segment after it, under an lsn no
         // floor has seen, so a tombstone above what is settled has to come across.

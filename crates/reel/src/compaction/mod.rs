@@ -5,5 +5,6 @@
 //! under the pressure model that decides when a pass may run.
 
 pub mod compactor;
+pub mod keymerge;
 pub mod merge;
 pub mod pressure;

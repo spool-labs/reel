@@ -257,10 +257,18 @@ impl SealedRanges {
     /// What a walk from that key merges, before any segment is passed over. A merged
     /// run's segments cover their own stretches and add one between them.
     pub fn depth(&self) -> usize {
+        self.depth_past(&std::collections::HashSet::new())
+    }
+
+    /// The most sealed segments any one key falls inside, leaving out the ones named
+    ///
+    /// A segment a key run covers is no run of the walk's own, so the walk's depth leaves
+    /// it out and counts the key run instead.
+    pub fn depth_past(&self, covered: &std::collections::HashSet<SegmentId>) -> usize {
         let sealed = read(&self.ranges);
         let mut open: std::collections::BinaryHeap<std::cmp::Reverse<&[u8]>> = std::collections::BinaryHeap::new();
         let mut deepest = 0;
-        for run in &sealed.by_key {
+        for run in sealed.by_key.iter().filter(|run| !covered.contains(&run.segment)) {
             let lowest = run.span.lowest.as_slice();
             while open.peek().is_some_and(|std::cmp::Reverse(highest)| *highest < lowest) {
                 open.pop();

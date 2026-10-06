@@ -398,6 +398,12 @@ pub struct ReelConfig {
     /// Collapse the volume's sorted runs into one, on a caller's pass and on the tick
     pub merge_sorted_runs: bool,
 
+    /// Merge the walk's runs into key runs, leaving every record where it was written
+    ///
+    /// A key run holds the newest row of each key and the place its record lies, so a
+    /// merge moves keys and places alone and FastForward never hears of it.
+    pub key_runs: bool,
+
     /// Dead share of the standing sorted runs at which the tick collapses them
     pub merge_dead_ratio: f64,
 
@@ -470,6 +476,7 @@ impl Default for ReelConfig {
             ranged_reads: RangedReads::Cached,
             rewrite_on_seal: false,
             merge_sorted_runs: false,
+            key_runs: false,
             merge_dead_ratio: DEFAULT_MERGE_DEAD_RATIO,
             point_reads: PointReads::Queued,
             footer_cache: ByteCount::mb(DEFAULT_FOOTER_CACHE_MIB),

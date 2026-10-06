@@ -8,7 +8,7 @@
 pub mod column;
 pub mod counters;
 pub mod entry;
-pub mod fastforward;
+pub mod spot;
 pub mod keyrun;
 pub mod lockfile;
 pub mod map;

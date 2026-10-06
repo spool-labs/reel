@@ -1,7 +1,7 @@
 //! Key runs: sorted rows naming where each record lies, merged without moving a record
 //!
 //! A merge writes the rows of the runs it collapses into one key run and leaves every
-//! record where it was written, so neither FastForward nor the map hears of it. Data
+//! record where it was written, so neither the spot index nor the map hears of it. Data
 //! segments keep their own footers, which stay the authority for point reads and for
 //! recovery: a key run is derived from them, a walk reads it in place of the footers it
 //! covers, and a key run that is lost only gives those footers back to the walk.

@@ -10,9 +10,9 @@ use crate::error::{ReelError, Result};
 use crate::format::column::{Codec, ColumnId, KeyRef, RecordKey};
 use crate::format::loc::Loc;
 use crate::format::lsn::Lsn;
-use crate::index::fastforward::{Candidate, FastRead, Lookup, Offered, Since, LOOKUP_TRIES};
-use crate::index::map::{FastPick, FastRoute, Located};
-use crate::reel::{FastAsk, FastRange};
+use crate::index::spot::{Candidate, SpotRead, Lookup, Offered, Since, LOOKUP_TRIES};
+use crate::index::map::{SpotPick, SpotRoute, Located};
+use crate::reel::{SpotAsk, SpotRange};
 use crate::index::page::KeyPage;
 use crate::index::playback::PlaybackCursor;
 use crate::reel::cue::CuePoint;
@@ -255,16 +255,16 @@ impl ReelStore {
         }
         let mut picks = located.picks;
         let asks = self.first_asks(keys, &mut picks);
-        let reads = self.reel.shared().fast_records(&asks.asks)?;
+        let reads = self.reel.shared().spot_records(&asks.asks)?;
         let offered = self.offer_firsts(&mut picks, asks.taken, reads);
-        for (fast, offered) in picks.into_iter().zip(offered) {
-            let key = &keys[fast.at];
-            let column = self.index.fast_column(fast.column);
+        for (spot, offered) in picks.into_iter().zip(offered) {
+            let key = &keys[spot.at];
+            let column = self.index.spot_column(spot.column);
             let lookup = match offered {
-                Offered::Next => column.read_on(key, fast.pick)?,
+                Offered::Next => column.read_on(key, spot.pick)?,
                 Offered::Again | Offered::Unsettled => Lookup::Unsettled,
             };
-            values[fast.at] = match self.index.fast_finish(fast.column, key, fast.since, lookup) {
+            values[spot.at] = match self.index.spot_finish(spot.column, key, spot.since, lookup) {
                 Lookup::Found(_, value) => Some(value),
                 Lookup::Missing => None,
                 Lookup::Unsettled => self.get(key)?,
@@ -274,14 +274,14 @@ impl ReelStore {
     }
 
     /// Each pick's first candidate, as one batch of asks, and which picks have one
-    fn first_asks<'a>(&self, keys: &'a [RecordKey], picks: &mut [FastPick]) -> FirstAsks<'a> {
+    fn first_asks<'a>(&self, keys: &'a [RecordKey], picks: &mut [SpotPick]) -> FirstAsks<'a> {
         let mut asks = Vec::with_capacity(picks.len());
         let mut taken = Vec::with_capacity(picks.len());
-        for fast in picks.iter_mut() {
-            let candidate = self.index.fast_column(fast.column).next(&mut fast.pick);
+        for spot in picks.iter_mut() {
+            let candidate = self.index.spot_column(spot.column).next(&mut spot.pick);
             if let Some(candidate) = candidate {
-                asks.push(FastAsk {
-                    key: &keys[fast.at],
+                asks.push(SpotAsk {
+                    key: &keys[spot.at],
                     segment: candidate.segment,
                     offset: candidate.offset,
                     bound: candidate.bound,
@@ -295,16 +295,16 @@ impl ReelStore {
     /// Fold each first candidate's read into its pick
     fn offer_firsts(
         &self,
-        picks: &mut [FastPick],
+        picks: &mut [SpotPick],
         taken: Vec<Option<Candidate>>,
-        reads: Vec<FastRead>,
+        reads: Vec<SpotRead>,
     ) -> Vec<Offered> {
         let mut reads = reads.into_iter();
         let mut offered = Vec::with_capacity(picks.len());
-        for (fast, candidate) in picks.iter_mut().zip(taken) {
-            let column = self.index.fast_column(fast.column);
+        for (spot, candidate) in picks.iter_mut().zip(taken) {
+            let column = self.index.spot_column(spot.column);
             offered.push(match (candidate, candidate.and_then(|_| reads.next())) {
-                (Some(candidate), Some(read)) => column.offer(&mut fast.pick, candidate, read),
+                (Some(candidate), Some(read)) => column.offer(&mut spot.pick, candidate, read),
                 (Some(_), None) | (None, Some(_)) | (None, None) => Offered::Next,
             });
         }
@@ -324,27 +324,27 @@ impl ReelStore {
         }
         let mut picks = located.picks;
         let asks = self.first_asks(keys, &mut picks);
-        let reads = self.reel.shared().fast_records_wait(&asks.asks).await?;
+        let reads = self.reel.shared().spot_records_wait(&asks.asks).await?;
         let offered = self.offer_firsts(&mut picks, asks.taken, reads);
         let shared = self.reel.shared();
-        for (mut fast, offered) in picks.into_iter().zip(offered) {
-            let key = &keys[fast.at];
-            let column = self.index.fast_column(fast.column);
+        for (mut spot, offered) in picks.into_iter().zip(offered) {
+            let key = &keys[spot.at];
+            let column = self.index.spot_column(spot.column);
             let mut flow = offered;
             while flow == Offered::Next {
-                let Some(candidate) = column.next(&mut fast.pick) else {
+                let Some(candidate) = column.next(&mut spot.pick) else {
                     break;
                 };
                 let read = shared
-                    .fast_record_wait(key, candidate.segment, candidate.offset, candidate.bound)
+                    .spot_record_wait(key, candidate.segment, candidate.offset, candidate.bound)
                     .await?;
-                flow = column.offer(&mut fast.pick, candidate, read);
+                flow = column.offer(&mut spot.pick, candidate, read);
             }
             let lookup = match flow {
-                Offered::Next => column.settle(key, fast.pick),
+                Offered::Next => column.settle(key, spot.pick),
                 Offered::Again | Offered::Unsettled => Lookup::Unsettled,
             };
-            values[fast.at] = match self.index.fast_finish(fast.column, key, fast.since, lookup) {
+            values[spot.at] = match self.index.spot_finish(spot.column, key, spot.since, lookup) {
                 Lookup::Found(_, value) => Some(value),
                 Lookup::Missing => None,
                 Lookup::Unsettled => self.get_wait(key).await?,
@@ -565,11 +565,11 @@ impl ReelStore {
     /// at that number.
     pub fn read_as_of(&self, key: &RecordKey, at: Lsn) -> Result<Option<Value>> {
         self.check_column(key)?;
-        // FastForward holds a key's newest sealed version, which answers in one read
+        // The spot index holds a key's newest sealed version, which answers in one read
         // when the cue can see it.
-        if let Some((column, since)) = self.index.fast_route_at(key) {
-            let lookup = self.index.fast_column(column).read(key)?;
-            match self.index.fast_finish_at(column, key, since, at, lookup) {
+        if let Some((column, since)) = self.index.spot_route_at(key) {
+            let lookup = self.index.spot_column(column).read(key)?;
+            match self.index.spot_finish_at(column, key, since, at, lookup) {
                 Lookup::Found(_, value) => return Ok(Some(value)),
                 Lookup::Missing => return Ok(None),
                 Lookup::Unsettled => {}
@@ -651,7 +651,7 @@ impl ReelStore {
     /// pointer unresolved, since evicting would delete a key from a volume the
     /// reader does not own.
     fn resolve_read(&self, key: &RecordKey) -> Result<Resolved> {
-        match self.index.fast_read(key)? {
+        match self.index.spot_read(key)? {
             Lookup::Found(_, payload) => return Ok(Resolved::Payload(payload)),
             Lookup::Missing => return Ok(Resolved::Missing),
             Lookup::Unsettled => {}
@@ -680,7 +680,7 @@ impl ReelStore {
     /// Nothing here maps, since an async caller has a runtime worker to protect and
     /// a fault cannot be woken.
     async fn resolve_read_wait(&self, key: &RecordKey) -> Result<Resolved> {
-        match self.fast_read_wait(key).await? {
+        match self.spot_read_wait(key).await? {
             Lookup::Found(_, payload) => return Ok(Resolved::Payload(payload)),
             Lookup::Missing => return Ok(Resolved::Missing),
             Lookup::Unsettled => {}
@@ -702,13 +702,13 @@ impl ReelStore {
         resolving.give_up(self, key)
     }
 
-    /// A key's newest payload as a future, one read of each FastForward candidate it needs
-    async fn fast_read_wait(&self, key: &RecordKey) -> Result<Lookup> {
-        let (at, since) = match self.index.fast_route(key) {
-            FastRoute::Settled(lookup) => return Ok(lookup),
-            FastRoute::Column(at, since) => (at, since),
+    /// A key's newest payload as a future, one read of each the spot index candidate it needs
+    async fn spot_read_wait(&self, key: &RecordKey) -> Result<Lookup> {
+        let (at, since) = match self.index.spot_route(key) {
+            SpotRoute::Settled(lookup) => return Ok(lookup),
+            SpotRoute::Column(at, since) => (at, since),
         };
-        let column = self.index.fast_column(at);
+        let column = self.index.spot_column(at);
         let shared = self.reel.shared();
         'tries: for _ in 0..LOOKUP_TRIES {
             let Some(mut pick) = column.pick(key) else {
@@ -716,7 +716,7 @@ impl ReelStore {
             };
             while let Some(candidate) = column.next(&mut pick) {
                 let read = shared
-                    .fast_record_wait(key, candidate.segment, candidate.offset, candidate.bound)
+                    .spot_record_wait(key, candidate.segment, candidate.offset, candidate.bound)
                     .await?;
                 match column.offer(&mut pick, candidate, read) {
                     Offered::Next => {}
@@ -724,27 +724,27 @@ impl ReelStore {
                     Offered::Unsettled => return Ok(Lookup::Unsettled),
                 }
             }
-            return Ok(self.index.fast_finish(at, key, since, column.settle(key, pick)));
+            return Ok(self.index.spot_finish(at, key, since, column.settle(key, pick)));
         }
         Ok(Lookup::Unsettled)
     }
 
-    /// The one FastForward candidate a range read can go straight to, when the key has one
-    fn fast_range_candidate(&self, key: &RecordKey) -> Option<(usize, Since, Candidate)> {
-        let FastRoute::Column(at, since) = self.index.fast_route(key) else {
+    /// The one the spot index candidate a range read can go straight to, when the key has one
+    fn spot_range_candidate(&self, key: &RecordKey) -> Option<(usize, Since, Candidate)> {
+        let SpotRoute::Column(at, since) = self.index.spot_route(key) else {
             return None;
         };
-        Some((at, since, self.index.fast_column(at).sole(key)?))
+        Some((at, since, self.index.spot_column(at).sole(key)?))
     }
 
-    /// What a FastForward range read answers, or nothing for the checked path to settle
-    fn fast_range_answer(&self, at: usize, key: &RecordKey, since: Since, read: FastRange) -> Option<Resolved> {
+    /// What a spot index range read answers, or nothing for the checked path to settle
+    fn spot_range_answer(&self, at: usize, key: &RecordKey, since: Since, read: SpotRange) -> Option<Resolved> {
         let lookup = match read {
-            FastRange::Found(head, window) => Lookup::Found(head.lsn, window),
-            FastRange::Tombstone(_) => Lookup::Missing,
-            FastRange::Other | FastRange::Gone | FastRange::Unsure => return None,
+            SpotRange::Found(head, window) => Lookup::Found(head.lsn, window),
+            SpotRange::Tombstone(_) => Lookup::Missing,
+            SpotRange::Other | SpotRange::Gone | SpotRange::Unsure => return None,
         };
-        match self.index.fast_finish(at, key, since, lookup) {
+        match self.index.spot_finish(at, key, since, lookup) {
             Lookup::Found(_, window) => Some(Resolved::Payload(window)),
             Lookup::Missing => Some(Resolved::Missing),
             Lookup::Unsettled => None,
@@ -757,12 +757,12 @@ impl ReelStore {
     /// header echo. Everything else takes the header-checked read, and a header saying a
     /// codec produced the record sends the window to the whole read.
     fn resolve_range(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Resolved> {
-        if let Some((at, since, candidate)) = self.fast_range_candidate(key) {
+        if let Some((at, since, candidate)) = self.spot_range_candidate(key) {
             let read = self
                 .reel
                 .shared()
-                .fast_range(key, candidate.segment, candidate.offset, offset, len)?;
-            if let Some(resolved) = self.fast_range_answer(at, key, since, read) {
+                .spot_range(key, candidate.segment, candidate.offset, offset, len)?;
+            if let Some(resolved) = self.spot_range_answer(at, key, since, read) {
                 return Ok(resolved);
             }
         }
@@ -801,13 +801,13 @@ impl ReelStore {
         offset: u64,
         len: usize,
     ) -> Result<Resolved> {
-        if let Some((at, since, candidate)) = self.fast_range_candidate(key) {
+        if let Some((at, since, candidate)) = self.spot_range_candidate(key) {
             let read = self
                 .reel
                 .shared()
-                .fast_range_wait(key, candidate.segment, candidate.offset, offset, len)
+                .spot_range_wait(key, candidate.segment, candidate.offset, offset, len)
                 .await?;
-            if let Some(resolved) = self.fast_range_answer(at, key, since, read) {
+            if let Some(resolved) = self.spot_range_answer(at, key, since, read) {
                 return Ok(resolved);
             }
         }
@@ -1037,7 +1037,7 @@ impl Resolving {
 
 /// The first candidate of each pick in a batch, and which picks had one
 struct FirstAsks<'a> {
-    asks: Vec<FastAsk<'a>>,
+    asks: Vec<SpotAsk<'a>>,
     taken: Vec<Option<Candidate>>,
 }
 

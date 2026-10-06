@@ -55,7 +55,7 @@ const BATCH: usize = 4096;
 /// Segments a resident rebuild holds before it feeds their rows in key order
 const FEED_WINDOW: usize = MAX_READERS * READ_AHEAD;
 
-/// Threads a paged open loads sealed footers into FastForward on
+/// Threads a paged open loads sealed footers into the spot index on
 const LOADERS: usize = 8;
 
 /// Rows a column's window must hold before its feed splits across threads
@@ -196,7 +196,7 @@ pub fn rebuild_from_persisted(
         jobs.push((segment, path, len));
     }
     let mut held: Vec<Held> = Vec::new();
-    // A paged open hands each sealed footer to FastForward's loaders as it is swept, so
+    // A paged open hands each sealed footer to the spot index's loaders as it is swept, so
     // the loads run beside the reads.
     // One footer waits for the loaders and each reader reads one ahead: the loaders are
     // the slower side, so anything deeper only holds footers, 0.6 GiB of a 100M reopen.
@@ -318,7 +318,7 @@ fn adopt(
     read
 }
 
-/// Take sealed footers off the queue into FastForward until it closes
+/// Take sealed footers off the queue into the spot index until it closes
 ///
 /// A failed load keeps receiving, so the sweep feeding the queue never waits on a loader
 /// that stopped, and the first error comes back once the queue is done.

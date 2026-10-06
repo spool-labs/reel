@@ -115,7 +115,7 @@ fn miss_counts(store: &ReelStore) -> ProbeCounts {
 
 /// Probe for keys that were written, and say what finding them cost
 fn hit_counts(store: &ReelStore, keys: u64) -> ProbeCounts {
-    // The index's own search as of a cue point, since FastForward answers a store read first.
+    // The index's own search as of a cue point, since the spot index answers a store read first.
     let cue = store.cue().expect("cue");
     let before = store.filter_probes();
     for at in 0..keys {
@@ -129,17 +129,17 @@ fn hit_counts(store: &ReelStore, keys: u64) -> ProbeCounts {
 
 // a probe costs what its class deserves: a miss no segment, a hit one search
 //
-// FastForward stands ahead of the fan-out, so a key nothing wrote is answered before
+// The spot index stands ahead of the fan-out, so a key nothing wrote is answered before
 // any segment is asked. What the per-segment bits still remove is the
 // searches of keys that exist somewhere.
 pub fn filters_remove_the_searches() {
     let unfiltered = filled(0);
 
-    // Misses die at FastForward, bits or none.
+    // Misses die at the spot index, bits or none.
     let bare_misses = miss_counts(&unfiltered);
     assert!(
         bare_misses.asked < MISSES,
-        "{} segment asks for {MISSES} misses reached past FastForward",
+        "{} segment asks for {MISSES} misses reached past the spot index",
         bare_misses.asked,
     );
 

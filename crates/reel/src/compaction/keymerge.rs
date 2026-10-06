@@ -2,7 +2,7 @@
 //!
 //! A merge reads the rows of the runs it takes, a data segment's footer or an earlier
 //! key run, and writes the newest row of each key with the place its record lies. The
-//! records stay where they were written, so neither FastForward nor the map is touched,
+//! records stay where they were written, so neither the spot index nor the map is touched,
 //! and nothing goes down but keys and places.
 
 use std::collections::{BTreeSet, HashSet};

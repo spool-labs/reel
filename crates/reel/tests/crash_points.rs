@@ -369,7 +369,7 @@ fn sealing_stream() -> Vec<StreamOp> {
     ops
 }
 
-// every crash boundary of a paged stream reopens with FastForward answering as the footers do
+// every crash boundary of a paged stream reopens with the spot index answering as the footers do
 //
 // Records roll the tight segment, so the stream seals several times, and the overwrites
 // and deletes leave keys with versions in more than one segment for the open to settle.
@@ -401,7 +401,7 @@ fn every_boundary_fastforward_answers_as_the_footers() {
                 "the counters overcounted under born segments at {crash_at}"
             ),
         }
-        loaded = loaded.max(reopened.index().fast_held());
+        loaded = loaded.max(reopened.index().spot_held());
         // As of a cue, a read takes the footer search, which is the answer to match.
         let cue = reopened.cue().expect("cue");
         for key in &keys {
@@ -410,7 +410,7 @@ fn every_boundary_fastforward_answers_as_the_footers() {
             assert_eq!(live, footers, "key {key:?} after a crash at {crash_at}");
         }
     }
-    assert!(loaded > 0, "no reopen loaded FastForward, so the comparison proved nothing");
+    assert!(loaded > 0, "no reopen loaded the spot index, so the comparison proved nothing");
 }
 
 // every crash boundary of a paged stream reopens with its walks answering as the gets do

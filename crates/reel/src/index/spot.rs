@@ -1,4 +1,4 @@
-//! FastForward, the index of sealed keys, which keeps record locations and no keys
+//! The spot index, the index of sealed keys, which keeps record locations and no keys
 //!
 //! A lookup confirms each candidate against the key in the record's own header.
 
@@ -110,7 +110,7 @@ pub enum HeadRead {
 }
 
 /// One read of a record's header and payload
-pub enum FastRead {
+pub enum SpotRead {
     Found(Head, Value),
     Tombstone(Head),
     Other,
@@ -209,7 +209,7 @@ pub trait RecordSource: Send + Sync {
     fn cached_head(&self, key: KeyRef<'_>, segment: SegmentId, offset: u32) -> Result<HeadRead>;
 
     /// The record at a place, in one read of its header and up to `bound` payload bytes
-    fn record(&self, key: &RecordKey, segment: SegmentId, offset: u32, bound: u32) -> Result<FastRead>;
+    fn record(&self, key: &RecordKey, segment: SegmentId, offset: u32, bound: u32) -> Result<SpotRead>;
 }
 
 /// The payload bytes of every length class, the small ones even and the wide ones geometric
@@ -758,7 +758,7 @@ pub struct Since {
 }
 
 /// A column's sealed keys as record locations, in shards picked by their bits
-pub struct FastColumn {
+pub struct SpotColumn {
     shards: Vec<Shard>,
     records: OnceLock<Arc<dyn RecordSource>>,
     segments: OnceLock<Arc<SegmentTable>>,
@@ -772,15 +772,15 @@ pub struct FastColumn {
     set_aside: Mutex<Vec<SetAside>>,
 }
 
-impl Default for FastColumn {
-    fn default() -> FastColumn {
-        FastColumn::new()
+impl Default for SpotColumn {
+    fn default() -> SpotColumn {
+        SpotColumn::new()
     }
 }
 
-impl FastColumn {
-    pub fn new() -> FastColumn {
-        FastColumn {
+impl SpotColumn {
+    pub fn new() -> SpotColumn {
+        SpotColumn {
             shards: (0..SHARDS).map(Shard::new).collect(),
             records: OnceLock::new(),
             segments: OnceLock::new(),
@@ -1392,17 +1392,17 @@ impl FastColumn {
     }
 
     /// Fold one candidate's read into a lookup
-    pub fn offer(&self, pick: &mut Pick, candidate: Candidate, read: FastRead) -> Offered {
+    pub fn offer(&self, pick: &mut Pick, candidate: Candidate, read: SpotRead) -> Offered {
         let (head, value) = match read {
-            FastRead::Found(head, value) => (head, Some(value)),
-            FastRead::Tombstone(head) => (head, None),
-            FastRead::Other => return Offered::Next,
+            SpotRead::Found(head, value) => (head, Some(value)),
+            SpotRead::Tombstone(head) => (head, None),
+            SpotRead::Other => return Offered::Next,
             // The segment is gone, so the slot points at nothing and goes before the next look.
-            FastRead::Gone => {
+            SpotRead::Gone => {
                 self.shards[shard_of(pick.hash)].write().take(pick.hash, &candidate.slot);
                 return Offered::Again;
             }
-            FastRead::Unsure => return Offered::Unsettled,
+            SpotRead::Unsure => return Offered::Unsettled,
         };
         match &pick.best {
             Some((current, _)) if current.lsn >= head.lsn => {
@@ -1584,14 +1584,14 @@ mod tests {
             })
         }
 
-        fn record(&self, key: &RecordKey, segment: SegmentId, offset: u32, bound: u32) -> Result<FastRead> {
+        fn record(&self, key: &RecordKey, segment: SegmentId, offset: u32, bound: u32) -> Result<SpotRead> {
             Ok(match self.answer(key.as_ref(), segment, offset) {
                 HeadRead::Same(head) if head.len <= bound => {
-                    FastRead::Found(head, Value::from(head.lsn.as_u64().to_le_bytes().to_vec()))
+                    SpotRead::Found(head, Value::from(head.lsn.as_u64().to_le_bytes().to_vec()))
                 }
-                HeadRead::Same(_) => FastRead::Unsure,
-                HeadRead::Missing => FastRead::Gone,
-                HeadRead::Other | HeadRead::Cold => FastRead::Other,
+                HeadRead::Same(_) => SpotRead::Unsure,
+                HeadRead::Missing => SpotRead::Gone,
+                HeadRead::Other | HeadRead::Cold => SpotRead::Other,
             })
         }
     }
@@ -1624,7 +1624,7 @@ mod tests {
     fn a_shared_fingerprint_never_loses_the_other_key() {
         let records = Arc::new(Records::default());
         let segments = Arc::new(SegmentTable::new());
-        let column = FastColumn::new();
+        let column = SpotColumn::new();
         column.attach(Arc::clone(&records) as Arc<dyn RecordSource>, Arc::clone(&segments));
         records.is_cold.store(true, Ordering::Relaxed);
         let (overwritten, bystander) = (shared_key(1), shared_key(2));
@@ -1649,13 +1649,13 @@ mod tests {
         assert!(!column.only_at(bystander.as_slice(), other));
     }
 
-    fn column(records: &Arc<Records>) -> FastColumn {
-        let column = FastColumn::new();
+    fn column(records: &Arc<Records>) -> SpotColumn {
+        let column = SpotColumn::new();
         column.attach(Arc::clone(records) as Arc<dyn RecordSource>, Arc::new(SegmentTable::new()));
         column
     }
 
-    fn version(column: &FastColumn, at: u64) -> Option<u64> {
+    fn version(column: &SpotColumn, at: u64) -> Option<u64> {
         match column.read(&key(at)).expect("read") {
             Lookup::Found(lsn, _) => Some(lsn.as_u64()),
             Lookup::Missing => None,
@@ -1686,7 +1686,7 @@ mod tests {
     fn overwritten_versions_are_booked_from_their_class() {
         let records = Arc::new(Records::default());
         let segments = Arc::new(SegmentTable::new());
-        let column = FastColumn::new();
+        let column = SpotColumn::new();
         column.attach(Arc::clone(&records) as Arc<dyn RecordSource>, Arc::clone(&segments));
         records.is_cold.store(true, Ordering::Relaxed);
 

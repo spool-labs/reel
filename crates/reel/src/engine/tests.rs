@@ -242,9 +242,9 @@ fn a_paged_column_reads_from_its_footer() {
     assert!(store.contains(&handed).expect("read"));
 }
 
-// FastForward answers a paged column's sealed keys through overwrites, deletes and compaction
+// The spot index answers a paged column's sealed keys through overwrites, deletes and compaction
 #[test]
-fn fastforward_answers_sealed_keys() {
+fn spot_answers_sealed_keys() {
     let paged = ReelConfig {
         index: IndexResidency::Paged,
         compact_mbps: CompactRate::Mbps(64),
@@ -258,7 +258,7 @@ fn fastforward_answers_sealed_keys() {
     }
     store.flush().expect("flush");
     assert!(store.page_out_sealed().expect("hand over") > 0);
-    assert!(store.index.fast_held() > 0, "the handover filled FastForward");
+    assert!(store.index.spot_held() > 0, "the handover filled the spot index");
 
     // Every get path agrees: one at a time, in a batch, and as a future of each.
     let check = |store: &ReelStore, expected: &[Option<Vec<u8>>], stage: &str| {
@@ -299,28 +299,28 @@ fn fastforward_answers_sealed_keys() {
     check(&store, &expected, "overwrites and deletes");
     store.flush().expect("flush");
     store.page_out_sealed().expect("hand over");
-    while store.index.scrub_fast(1024) > 0 {}
+    while store.index.scrub_spot(1024) > 0 {}
     check(&store, &expected, "the cleaner");
 
     store.compact_once().expect("compact");
     store.flush().expect("flush");
     store.page_out_sealed().expect("hand over");
-    while store.index.scrub_fast(1024) > 0 {}
+    while store.index.scrub_spot(1024) > 0 {}
     check(&store, &expected, "compaction");
 
-    // The open loads FastForward from the footers, and every key answers as it did.
+    // The open loads the spot index from the footers, and every key answers as it did.
     store.close().expect("close");
     drop(store);
     let restored = SimIo::from_image(sim.durable_image());
     let reopened = ReelStore::open_with_io(PathBuf::from(ROOT), paged, COLUMNS, Arc::new(restored))
         .expect("reopen");
-    assert!(reopened.index.fast_held() > 0, "the open loaded FastForward");
+    assert!(reopened.index.spot_held() > 0, "the open loaded the spot index");
     check(&reopened, &expected, "a reopen");
 }
 
-// every read FastForward answers costs one device read a key, a deep window two in one submission
+// every read the spot index answers costs one device read a key, a deep window two in one submission
 #[test]
-fn fastforward_reads_take_one_read_a_key() {
+fn spot_reads_take_one_read_a_key() {
     let (store, sim) = sim_store(ReelConfig {
         index: IndexResidency::Paged,
         ..config(1, SyncPolicy::Never)
@@ -336,7 +336,7 @@ fn fastforward_reads_take_one_read_a_key() {
         .filter(|key| is_paged(&store, key))
         .take(10)
         .collect();
-    assert_eq!(handed.len(), 10, "ten keys went to FastForward");
+    assert_eq!(handed.len(), 10, "ten keys went to the spot index");
     // One read first, so the segment's handle is open and no count below includes it.
     store.get(&handed[0]).expect("warm");
 
@@ -373,14 +373,14 @@ fn compaction_rebooks_class_bookings_at_their_true_length() {
         store.put(&record(7, byte), &payload).expect("overwrite");
     }
     store.flush().expect("flush");
-    assert!(store.fast_slack() > 0, "no overwrite was booked from its class");
+    assert!(store.spot_slack() > 0, "no overwrite was booked from its class");
     assert_ne!(store.totals().bytes, exact, "the class middle happened to equal the payload");
 
     for _ in 0..8 {
         store.compact_once().expect("compact");
         store.maintain_once().expect("maintain");
     }
-    assert_eq!(store.fast_slack(), 0, "a class booking outlived its segment");
+    assert_eq!(store.spot_slack(), 0, "a class booking outlived its segment");
     assert_eq!(store.totals().bytes, exact, "the live bytes kept a class booking's error");
 }
 
@@ -407,7 +407,7 @@ fn a_cue_read_takes_one_read_while_the_key_stands() {
         .filter(|key| is_paged(&store, key))
         .take(2)
         .collect();
-    assert_eq!(standing.len(), 2, "two unchanged keys went to FastForward");
+    assert_eq!(standing.len(), 2, "two unchanged keys went to the spot index");
     store.get_at(&standing[0], &cue).expect("warm");
 
     let before = sim.ops();
@@ -422,9 +422,9 @@ fn a_cue_read_takes_one_read_while_the_key_stands() {
     }
 }
 
-// a retire leaves FastForward's entries in segments an open rebuilt, which wear no incarnation yet
+// a retire leaves the spot index's entries in segments an open rebuilt, which wear no incarnation yet
 #[test]
-fn fastforward_keeps_rebuilt_segments_through_a_retire() {
+fn spot_keeps_rebuilt_segments_through_a_retire() {
     let paged = ReelConfig {
         index: IndexResidency::Paged,
         compact_mbps: CompactRate::Mbps(64),
@@ -445,7 +445,7 @@ fn fastforward_keeps_rebuilt_segments_through_a_retire() {
     let restored = SimIo::from_image(sim.durable_image());
     let reopened = ReelStore::open_with_io(PathBuf::from(ROOT), paged, COLUMNS, Arc::new(restored))
         .expect("reopen");
-    assert!(reopened.index.fast_held() > 0, "the open loaded FastForward");
+    assert!(reopened.index.spot_held() > 0, "the open loaded the spot index");
     for _ in 0..4 {
         reopened.compact_once().expect("compact");
         reopened.maintain_once().expect("maintain");
@@ -460,9 +460,9 @@ fn fastforward_keeps_rebuilt_segments_through_a_retire() {
     }
 }
 
-// a FastForward column takes a range delete and a prefix count, and refuses an index checkpoint cleanly
+// a spot index column takes a range delete and a prefix count, and refuses an index checkpoint cleanly
 #[test]
-fn fastforward_takes_ranges_and_prefix_counts() {
+fn spot_takes_ranges_and_prefix_counts() {
     let paged = ReelConfig {
         index: IndexResidency::Paged,
         ..config(1, SyncPolicy::Never)
@@ -474,7 +474,7 @@ fn fastforward_takes_ranges_and_prefix_counts() {
     }
     store.flush().expect("flush");
     assert!(store.page_out_sealed().expect("hand over") > 0);
-    assert!(store.index.fast_held() > 0, "the handover filled FastForward");
+    assert!(store.index.spot_held() > 0, "the handover filled the spot index");
 
     let dropped = 50..150u8;
     store
@@ -1075,7 +1075,7 @@ fn footer_pools_share_one_bound() {
 
     // Cleared first, since a resolve that finds a footer the handover parsed never
     // reaches for a block. The resolves fill two pools and the pass after them the third.
-    // They resolve as of a snapshot, since FastForward answers a live read without a footer.
+    // They resolve as of a snapshot, since the spot index answers a live read without a footer.
     store.reel.shared().footers.clear();
     for key in &handed {
         let found = store.index.get_at(key, Lsn(u64::MAX)).expect("resolve");
@@ -1127,17 +1127,17 @@ fn a_fresh_key_skips_the_sealed_search() {
         .find(|key| is_paged(&store, key));
     let sealed = sealed.expect("a key went to its footer");
 
-    // A key never written: FastForward holds nothing for it, so no footer is asked.
+    // A key never written: the spot index holds nothing for it, so no footer is asked.
     let before = store.filter_probes();
     assert!(store.get(&record(9, 250)).expect("get").is_none());
     assert_eq!(store.filter_probes(), before, "the fresh key searched segments");
-    // A sealed key resolves through FastForward.
+    // A sealed key resolves through the spot index.
     assert!(store.get(&sealed).expect("get").is_some());
 
     store.close().expect("close");
     drop(store);
 
-    // The paged open loads FastForward from the footers, so the same pair of
+    // The paged open loads the spot index from the footers, so the same pair of
     // answers holds on the reopened volume.
     let restored = SimIo::from_image(sim.durable_image());
     let reopened = ReelStore::open_with_io(PathBuf::from(ROOT), paged, COLUMNS, Arc::new(restored))
@@ -4956,7 +4956,7 @@ fn flip_payload(image: &mut DurableImage, loc: Loc) {
     }
 }
 
-// a cue read never takes the version hand-over has put in FastForward while the map still holds a newer one
+// a cue read never takes the version hand-over has put in the spot index while the map still holds a newer one
 #[test]
 fn a_cue_read_waits_out_a_hand_over_in_flight() {
     let (store, _) = sim_store(ReelConfig {
@@ -4979,12 +4979,12 @@ fn a_cue_read_waits_out_a_hand_over_in_flight() {
     }
 
     let script = crate::sync::rendezvous::script();
-    script.hold("paged/handover-fast");
+    script.hold("paged/handover-spot");
     let handing = {
         let store = Arc::clone(&store);
         script.cast(move || store.page_out_sealed().expect("hand over"))
     };
-    script.await_reached("paged/handover-fast", 1);
+    script.await_reached("paged/handover-spot", 1);
     let stale = keys
         .iter()
         .filter(|key| {
@@ -4992,7 +4992,7 @@ fn a_cue_read_waits_out_a_hand_over_in_flight() {
             read.as_deref().map(|value| value[0]) != Some(0x5a)
         })
         .count();
-    script.release("paged/handover-fast");
+    script.release("paged/handover-spot");
     handing.join().expect("hand over");
     drop(script);
     assert_eq!(stale, 0, "a cue read answered with a version older than the cue");

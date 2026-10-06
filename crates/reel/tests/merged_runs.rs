@@ -242,7 +242,7 @@ fn fewer_asks_a_get() {
     let (store, _io) = open_over(merging_config(), COLUMNS);
     fill_runs(&store);
 
-    // The index's own search as of a cue point, since FastForward answers a store read first.
+    // The index's own search as of a cue point, since the spot index answers a store read first.
     // Dropped before the merge, since a standing cue point pins the runs it would retire.
     let asked_before = {
         let cue = store.cue().expect("cue");

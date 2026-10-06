@@ -1,6 +1,6 @@
-//! FastForward point reads under writers, deletes, seals, handovers and compaction, drawn from one seed
+//! The spot index point reads under writers, deletes, seals, handovers and compaction, drawn from one seed
 //!
-//! Segments are tiny and the volume pages, so seals hand keys to FastForward, compaction
+//! Segments are tiny and the volume pages, so seals hand keys to the spot index, compaction
 //! repoints and retires segments, and the cleaner runs, all while readers run. Each key
 //! has one writer, which marks an op started before it runs and completed after. A read
 //! must answer a put whose op falls between the op completed when it began and the op
@@ -271,11 +271,11 @@ fn run(seed: u64, columns: ColumnSet) {
         reading.into_iter().map(|reading| reading.join().expect("reader")).sum::<u64>()
     });
     assert!(read > 0, "seed {seed}: readers took nothing");
-    assert!(store.index().fast_held() > 0, "seed {seed}: nothing reached FastForward");
+    assert!(store.index().spot_held() > 0, "seed {seed}: nothing reached the spot index");
     let compaction = store.compaction_counters();
     println!(
-        "seed {seed}: {writers} writers, {readers} readers, {read} reads, FastForward holds {}, {} segments rewritten, {} unlinked whole",
-        store.index().fast_held(),
+        "seed {seed}: {writers} writers, {readers} readers, {read} reads, the spot index holds {}, {} segments rewritten, {} unlinked whole",
+        store.index().spot_held(),
         compaction.segments_rewritten,
         compaction.segments_unlinked_whole,
     );

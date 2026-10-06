@@ -1,4 +1,4 @@
-//! What a paged open holds while it loads FastForward, on a volume on disk
+//! What a paged open holds while it loads the spot index, on a volume on disk
 //!
 //! Ignored by default, since it writes REEL_FF_OPEN_KEYS records (two million when
 //! unset) and reports the open's time and the process's resident memory around it.
@@ -64,7 +64,7 @@ fn resident_kib() -> u64 {
     String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
 }
 
-// a paged open loads FastForward a footer at a time, and every key reads back
+// a paged open loads the spot index a footer at a time, and every key reads back
 #[test]
 #[ignore]
 fn a_paged_open_loads_fastforward_in_bounded_memory() {
@@ -105,12 +105,12 @@ fn a_paged_open_loads_fastforward_in_bounded_memory() {
     sampler.join().expect("sampler");
     let after = resident_kib();
     println!(
-        "{keys} keys: open {:.2} s, resident {} MiB before, {} MiB peak, {} MiB after, FastForward holds {}",
+        "{keys} keys: open {:.2} s, resident {} MiB before, {} MiB peak, {} MiB after, the spot index holds {}",
         opened.as_secs_f64(),
         before / 1024,
         peak.load(Ordering::Relaxed) / 1024,
         after / 1024,
-        store.index().fast_held(),
+        store.index().spot_held(),
     );
     for at in (0..keys).step_by((keys / 1000).max(1) as usize) {
         assert!(store.get(&key(at)).expect("get").is_some(), "key {at} went missing");

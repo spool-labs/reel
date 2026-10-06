@@ -40,7 +40,7 @@ use crate::reel::bias::MachineFacts;
 use crate::reel::cue::CuePoints;
 
 use crate::compaction::pressure::PassPlane;
-use crate::index::fastforward::RecordSource;
+use crate::index::spot::RecordSource;
 use crate::index::paged::FooterSource;
 use crate::index::persisted::{admits, PersistedReader};
 use crate::index::recovery::rebuild_from_persisted;
@@ -449,7 +449,7 @@ impl ReelStore {
         // a paged column resolves through. A resident one never asks.
         index.set_footers(Arc::clone(&shared) as Arc<dyn FooterSource>);
         index.set_records(Arc::clone(&shared) as Arc<dyn RecordSource>);
-        index.finish_fast_load()?;
+        index.finish_spot_load()?;
         // And the other direction: a seal writes down what its segment weighs, and
         // these are the counters that know.
         shared.set_segments(index.segments_handle());
@@ -586,8 +586,8 @@ impl ReelStore {
     }
 
     /// Bytes the byte counters may sit from the truth, from overwrites booked by length class
-    pub fn fast_slack(&self) -> u64 {
-        self.index.fast_slack()
+    pub fn spot_slack(&self) -> u64 {
+        self.index.spot_slack()
     }
 
     /// Sealed segments a rebuild left uncounted, standing until they retire

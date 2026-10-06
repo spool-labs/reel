@@ -401,7 +401,7 @@ pub struct ReelConfig {
     /// Merge the walk's runs into key runs, leaving every record where it was written
     ///
     /// A key run holds the newest row of each key and the place its record lies, so a
-    /// merge moves keys and places alone and FastForward never hears of it.
+    /// merge moves keys and places alone and the spot index never hears of it.
     pub key_runs: bool,
 
     /// Dead share of the standing sorted runs at which the tick collapses them

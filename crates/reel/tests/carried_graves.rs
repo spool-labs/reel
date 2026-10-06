@@ -185,7 +185,7 @@ fn a_put_after_a_delete_survives_compacting_its_tombstone() {
     fill(&store, 1);
     Store::delete(&store, "rows", &the_key()).expect("delete");
     fill(&store, 2);
-    // The second version seals and is handed over, so only FastForward holds it.
+    // The second version seals and is handed over, so only the spot index holds it.
     Store::put(&store, "rows", &the_key(), b"second").expect("put again");
     fill(&store, 3);
     overwrite(&store, 2, 4);

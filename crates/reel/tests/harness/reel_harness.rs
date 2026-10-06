@@ -167,7 +167,7 @@ pub fn assert_recount(store: &ReelStore, context: u64) {
     let scanned = scan_totals(store);
     let counted = counter_totals(store);
     // An overwrite booked by length class sits up to half a class off, and counts exactly.
-    let slack = store.fast_slack();
+    let slack = store.spot_slack();
     assert!(
         counted.count == scanned.count && counted.bytes.abs_diff(scanned.bytes) <= slack,
         "the reel counters disagree with a scan at {context}: {counted:?} against {scanned:?}, slack {slack}"

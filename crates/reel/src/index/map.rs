@@ -25,7 +25,7 @@ use crate::index::column::{ColumnIndex, KeyMove, Landed, PendingCover};
 use crate::index::counters::{Floors, SegmentBytes, SegmentStamp, SegmentTable};
 use crate::index::entry::{span_of, Entry};
 use crate::index::keyrun::KeyRunSet;
-use crate::index::fastforward::{FastColumn, Lookup, Pick, RecordSource, Settled, Since, LOOKUP_TRIES};
+use crate::index::spot::{SpotColumn, Lookup, Pick, RecordSource, Settled, Since, LOOKUP_TRIES};
 use crate::index::page::KeyPage;
 use crate::index::paged::{Candidates, FooterSource, SealedRanges};
 use crate::index::playback::{self, merged_page, Paged, PlaybackCursor, WalkRuns, Way};
@@ -140,17 +140,17 @@ pub struct KeyRepoint {
     pub lsn: Lsn,
 }
 
-/// Where a batch's keys sit: an entry the map or a footer gave, or a FastForward lookup to read
+/// Where a batch's keys sit: an entry the map or a footer gave, or a spot index lookup to read
 pub struct Located {
     /// An entry per key, nothing for a key with none or one a pick answers
     pub found: Vec<Option<Entry>>,
 
-    /// The keys FastForward answers, each with its lookup started
-    pub picks: Vec<FastPick>,
+    /// The keys the spot index answers, each with its lookup started
+    pub picks: Vec<SpotPick>,
 }
 
-/// One key of a batch that FastForward answers
-pub struct FastPick {
+/// One key of a batch that the spot index answers
+pub struct SpotPick {
     /// The key's position in the batch
     pub at: usize,
 
@@ -162,9 +162,9 @@ pub struct FastPick {
     pub since: Since,
 }
 
-/// Where a FastForward lookup goes before any read
-pub enum FastRoute {
-    /// The map answered, or the column is not FastForward's to answer
+/// Where a spot index lookup goes before any read
+pub enum SpotRoute {
+    /// The map answered, or the column is not the spot index's to answer
     Settled(Lookup),
 
     /// The column at this position holds the key's sealed versions, and its shard stood here before the map was asked
@@ -228,12 +228,12 @@ pub struct ReelIndex {
     key_runs: KeyRunSet,
 
     /// Each column's sealed keys as record locations, answering a get in one read
-    fast: Vec<FastColumn>,
+    spot: Vec<SpotColumn>,
 
-    /// Whether every sealed key is in `fast`, after an open that loaded them or found none
-    fast_ready: AtomicBool,
+    /// Whether every sealed key is in `spot`, after an open that loaded them or found none
+    spot_ready: AtomicBool,
 
-    /// Segments retired since FastForward last dropped the entries pointing into them
+    /// Segments retired since the spot index last dropped the entries pointing into them
     retired: AtomicU64,
 
     /// Column identifier to its position, so routing a record is one load
@@ -255,7 +255,7 @@ pub struct ReelIndex {
     publish: PublishBarrier,
 }
 
-/// Threads one segment's hand-over splits across, each owning a lane of FastForward shards
+/// Threads one segment's hand-over splits across, each owning a lane of the spot index shards
 ///
 /// One thread handed over 1.17M keys a second on the box while the load wrote 1.68M, so
 /// 30M keys still waited in the map when a 100M load ended.
@@ -287,11 +287,11 @@ impl ReelIndex {
             walk_runs: sealed.iter().map(|_| WalkRuns::default()).collect(),
             key_runs: KeyRunSet::default(),
             sealed,
-            fast: columns
+            spot: columns
                 .iter()
-                .map(|_| FastColumn::new())
+                .map(|_| SpotColumn::new())
                 .collect(),
-            fast_ready: AtomicBool::new(false),
+            spot_ready: AtomicBool::new(false),
             retired: AtomicU64::new(0),
             by_id,
             segments: Arc::new(SegmentTable::new()),
@@ -314,62 +314,62 @@ impl ReelIndex {
         let _ = self.footers.set(footers);
     }
 
-    /// Where FastForward reads the records its entries point at
+    /// Where the spot index reads the records its entries point at
     pub fn set_records(&self, records: Arc<dyn RecordSource>) {
-        for fast in &self.fast {
-            fast.attach(Arc::clone(&records), Arc::clone(&self.segments));
+        for spot in &self.spot {
+            spot.attach(Arc::clone(&records), Arc::clone(&self.segments));
         }
     }
 
-    /// Whether FastForward answers for a column's sealed keys
-    fn fast_serves(&self) -> bool {
-        self.residency.pages() && self.fast_ready.load(Ordering::Acquire)
+    /// Whether the spot index answers for a column's sealed keys
+    fn spot_serves(&self) -> bool {
+        self.residency.pages() && self.spot_ready.load(Ordering::Acquire)
     }
 
-    /// A key's newest payload in one read, when FastForward holds the column's sealed keys
+    /// A key's newest payload in one read, when the spot index holds the column's sealed keys
     ///
     /// A key the map holds reads through the checked path, which is one read too.
-    pub fn fast_read(&self, key: &RecordKey) -> Result<Lookup> {
-        match self.fast_route(key) {
-            FastRoute::Settled(lookup) => Ok(lookup),
-            FastRoute::Column(at, since) => Ok(self.fast_finish(at, key, since, self.fast[at].read(key)?)),
+    pub fn spot_read(&self, key: &RecordKey) -> Result<Lookup> {
+        match self.spot_route(key) {
+            SpotRoute::Settled(lookup) => Ok(lookup),
+            SpotRoute::Column(at, since) => Ok(self.spot_finish(at, key, since, self.spot[at].read(key)?)),
         }
     }
 
-    /// Where a FastForward lookup goes: settled by the map already, or to one column's table
-    pub fn fast_route(&self, key: &RecordKey) -> FastRoute {
-        let (Some(at), true) = (self.slot(key.column), self.fast_serves()) else {
-            return FastRoute::Settled(Lookup::Unsettled);
+    /// Where a spot index lookup goes: settled by the map already, or to one column's table
+    pub fn spot_route(&self, key: &RecordKey) -> SpotRoute {
+        let (Some(at), true) = (self.slot(key.column), self.spot_serves()) else {
+            return SpotRoute::Settled(Lookup::Unsettled);
         };
-        let since = self.fast[at].since(key);
+        let since = self.spot[at].since(key);
         let index = &self.indexes[at];
         match index.entry_or_grave(key.as_slice()) {
             Some(entry) if entry.is_grave() || index.is_covered_key(key.as_slice(), entry.lsn) => {
-                FastRoute::Settled(Lookup::Missing)
+                SpotRoute::Settled(Lookup::Missing)
             }
-            Some(_) => FastRoute::Settled(Lookup::Unsettled),
-            None => FastRoute::Column(at, since),
+            Some(_) => SpotRoute::Settled(Lookup::Unsettled),
+            None => SpotRoute::Column(at, since),
         }
     }
 
-    /// Where a cue read can ask FastForward
+    /// Where a cue read can ask the spot index
     ///
     /// Only for a key the map has let go. A key the map still holds answers through the
-    /// checked path, since a hand-over in flight puts an older version in FastForward
-    /// before the map refuses it. A column FastForward does not serve goes there too.
-    pub fn fast_route_at(&self, key: &RecordKey) -> Option<(usize, Since)> {
-        let (Some(at), true) = (self.slot(key.column), self.fast_serves()) else {
+    /// checked path, since a hand-over in flight puts an older version in the spot index
+    /// before the map refuses it. A column the spot index does not serve goes there too.
+    pub fn spot_route_at(&self, key: &RecordKey) -> Option<(usize, Since)> {
+        let (Some(at), true) = (self.slot(key.column), self.spot_serves()) else {
             return None;
         };
-        let since = self.fast[at].since(key);
+        let since = self.spot[at].since(key);
         self.indexes[at].entry_or_grave(key.as_slice()).is_none().then_some((at, since))
     }
 
-    /// Apply a cue to a FastForward answer: the newest sealed version stands when the cue sees it
+    /// Apply a cue to a spot index answer: the newest sealed version stands when the cue sees it
     ///
     /// A newer one goes to the footers, which keep every version an overwrite took out of
-    /// FastForward.
-    pub fn fast_finish_at(
+    /// The spot index.
+    pub fn spot_finish_at(
         &self,
         at: usize,
         key: &RecordKey,
@@ -382,37 +382,37 @@ impl ReelIndex {
             Lookup::Found(lsn, _) if self.indexes[at].is_covered_key_at(key.as_slice(), lsn, snapshot) => {
                 Lookup::Missing
             }
-            Lookup::Missing if self.fast[at].moved(since) => Lookup::Unsettled,
+            Lookup::Missing if self.spot[at].moved(since) => Lookup::Unsettled,
             found => found,
         }
     }
 
-    /// One column's FastForward table, for a lookup the caller drives itself
-    pub fn fast_column(&self, at: usize) -> &FastColumn {
-        &self.fast[at]
+    /// One column's the spot index table, for a lookup the caller drives itself
+    pub fn spot_column(&self, at: usize) -> &SpotColumn {
+        &self.spot[at]
     }
 
-    /// Apply what a footer cannot know to a FastForward answer: covers, and a slot that left under it
-    pub fn fast_finish(&self, at: usize, key: &RecordKey, since: Since, lookup: Lookup) -> Lookup {
+    /// Apply what a footer cannot know to a spot index answer: covers, and a slot that left under it
+    pub fn spot_finish(&self, at: usize, key: &RecordKey, since: Since, lookup: Lookup) -> Lookup {
         match lookup {
             Lookup::Found(lsn, _) if self.indexes[at].is_covered_key(key.as_slice(), lsn) => Lookup::Missing,
-            Lookup::Missing if self.fast[at].moved(since) => Lookup::Unsettled,
+            Lookup::Missing if self.spot[at].moved(since) => Lookup::Unsettled,
             found => found,
         }
     }
 
-    /// Take out up to `budget` older versions FastForward lookups read past, and book them
-    pub fn scrub_fast(&self, budget: usize) -> usize {
+    /// Take out up to `budget` older versions the spot index lookups read past, and book them
+    pub fn scrub_spot(&self, budget: usize) -> usize {
         if self.retired.swap(0, Ordering::AcqRel) > 0 {
-            // FastForward only points into sealed segments, and a retire forgets the span.
-            for (at, fast) in self.fast.iter().enumerate() {
+            // The spot index only points into sealed segments, and a retire forgets the span.
+            for (at, spot) in self.spot.iter().enumerate() {
                 let standing: HashSet<SegmentId> = self.sealed[at].segments().into_iter().collect();
-                fast.forget_retired(|segment| standing.contains(&segment));
+                spot.forget_retired(|segment| standing.contains(&segment));
             }
         }
         let mut settled = 0;
-        for (at, fast) in self.fast.iter().enumerate() {
-            for (key, loc) in fast.scrub(budget.saturating_sub(settled)) {
+        for (at, spot) in self.spot.iter().enumerate() {
+            for (key, loc) in spot.scrub(budget.saturating_sub(settled)) {
                 self.indexes[at].settle_paged(key.as_slice(), loc, self.counted(loc.segment), &self.segments);
                 settled += 1;
             }
@@ -420,61 +420,61 @@ impl ReelIndex {
         settled
     }
 
-    /// Bytes the byte counters may sit from the truth, from FastForward's class bookings
-    pub fn fast_slack(&self) -> u64 {
-        self.fast.iter().map(FastColumn::slack).sum()
+    /// Bytes the byte counters may sit from the truth, from the spot index's class bookings
+    pub fn spot_slack(&self) -> u64 {
+        self.spot.iter().map(SpotColumn::slack).sum()
     }
 
     /// Overwritten sealed versions booked from their length class, held until compaction retires them
-    pub fn fast_displaced(&self) -> u64 {
-        self.fast.iter().map(FastColumn::displaced).sum()
+    pub fn spot_displaced(&self) -> u64 {
+        self.spot.iter().map(SpotColumn::displaced).sum()
     }
 
-    /// Older versions FastForward holds for its cleaner
-    pub fn fast_beside(&self) -> u64 {
-        self.fast.iter().map(FastColumn::beside).sum()
+    /// Older versions the spot index holds for its cleaner
+    pub fn spot_beside(&self) -> u64 {
+        self.spot.iter().map(SpotColumn::beside).sum()
     }
 
-    /// Entries FastForward holds in all
-    pub fn fast_held(&self) -> u64 {
-        self.fast.iter().map(FastColumn::held).sum()
+    /// Entries the spot index holds in all
+    pub fn spot_held(&self) -> u64 {
+        self.spot.iter().map(SpotColumn::held).sum()
     }
 
-    /// Bytes FastForward's tables hold, every bucket counted whether filled or not
-    pub fn fast_heap_bytes(&self) -> u64 {
-        self.fast.iter().map(FastColumn::heap_bytes).sum()
+    /// Bytes the spot index's tables hold, every bucket counted whether filled or not
+    pub fn spot_heap_bytes(&self) -> u64 {
+        self.spot.iter().map(SpotColumn::heap_bytes).sum()
     }
 
-    /// Say every sealed key is in FastForward, so it may answer for them
-    pub fn mark_fast_ready(&self) {
-        self.fast_ready.store(true, Ordering::Release);
+    /// Say every sealed key is in the spot index, so it may answer for them
+    pub fn mark_spot_ready(&self) {
+        self.spot_ready.store(true, Ordering::Release);
     }
 
     /// Take a sealed footer's rows during a paged open, a range row aside
     pub fn take_sealed_footer(&self, segment: SegmentId, footer: &SegmentFooter) -> Result<()> {
         for partition in &footer.partitions {
             if let Some(at) = self.slot(partition.column) {
-                self.fast[at].take_partition(segment, partition)?;
+                self.spot[at].take_partition(segment, partition)?;
             }
         }
         Ok(())
     }
 
-    /// Size FastForward from the first sealed footer of an open, since segments run to one size
+    /// Size the spot index from the first sealed footer of an open, since segments run to one size
     pub fn reserve_fast(&self, footer: &SegmentFooter, segments: usize) {
         for partition in &footer.partitions {
             if let Some(at) = self.slot(partition.column) {
-                self.fast[at].reserve((partition.len() * segments) as u64);
+                self.spot[at].reserve((partition.len() * segments) as u64);
             }
         }
     }
 
-    /// Finish what a paged open loaded into FastForward, then let it answer
+    /// Finish what a paged open loaded into the spot index, then let it answer
     ///
     /// The rows set aside read their headers now that records can be read. A key the
-    /// map holds has a newer version than any footer, so FastForward's older one goes.
-    pub fn finish_fast_load(&self) -> Result<()> {
-        if !self.residency.pages() || self.fast_ready.load(Ordering::Acquire) {
+    /// map holds has a newer version than any footer, so the spot index's older one goes.
+    pub fn finish_spot_load(&self) -> Result<()> {
+        if !self.residency.pages() || self.spot_ready.load(Ordering::Acquire) {
             return Ok(());
         }
         let Some(footers) = self.footers.get() else {
@@ -482,11 +482,11 @@ impl ReelIndex {
         };
         // A key the map holds keeps any older sealed slot until an overwrite or a retire takes
         // it, since reads ask the map first and order a later pair by ceiling.
-        for (at, fast) in self.fast.iter().enumerate() {
-            fast.settle_rows(self.columns[at].id, footers.as_ref())?;
-            fast.finish_load();
+        for (at, spot) in self.spot.iter().enumerate() {
+            spot.settle_rows(self.columns[at].id, footers.as_ref())?;
+            spot.finish_load();
         }
-        self.mark_fast_ready();
+        self.mark_spot_ready();
         Ok(())
     }
 
@@ -506,12 +506,12 @@ impl ReelIndex {
             return Ok(self.mapped(at, key).flatten());
         }
         for _ in 0..LOOKUP_TRIES {
-            let since = self.fast[at].since(key);
+            let since = self.spot[at].since(key);
             if let Some(answer) = self.mapped(at, key) {
                 return Ok(answer);
             }
             let found = self.sealed_entry(at, key)?;
-            if found.is_some() || !self.fast_serves() || !self.fast[at].moved(since) {
+            if found.is_some() || !self.spot_serves() || !self.spot[at].moved(since) {
                 return Ok(found);
             }
         }
@@ -532,7 +532,7 @@ impl ReelIndex {
 
     /// Whether the index points a key at the record at `loc`, known with no read
     ///
-    /// The caller holds that record, so FastForward's one live slot under the key's hash
+    /// The caller holds that record, so the spot index's one live slot under the key's hash
     /// pointing there settles it with no header read. False is only unsure.
     pub fn surely_at(&self, key: &RecordKey, loc: Loc, lsn: Lsn) -> bool {
         let Some(at) = self.slot(key.column) else {
@@ -542,8 +542,8 @@ impl ReelIndex {
             Some(answer) => answer.is_some_and(|entry| entry.loc == loc),
             None => {
                 self.residency.pages()
-                    && self.fast_serves()
-                    && self.fast[at].only_at(key.as_slice(), loc)
+                    && self.spot_serves()
+                    && self.spot[at].only_at(key.as_slice(), loc)
                     && !self.indexes[at].is_covered_key(key.as_slice(), lsn)
             }
         }
@@ -578,10 +578,10 @@ impl ReelIndex {
         }
     }
 
-    /// The newest sealed version of a key, from FastForward once it holds every sealed key
+    /// The newest sealed version of a key, from the spot index once it holds every sealed key
     fn newest_live(&self, at: usize, key: &RecordKey) -> Result<Option<Entry>> {
-        match self.fast_serves() {
-            true => match self.fast[at].entry(key)? {
+        match self.spot_serves() {
+            true => match self.spot[at].entry(key)? {
                 Settled::Entry(found) => Ok(found),
                 Settled::Footers => self.newest_sealed(at, key, None),
             },
@@ -845,22 +845,22 @@ impl ReelIndex {
 
     /// Give a key up to the footer of the segment it landed in
     ///
-    /// FastForward takes the key before the map lets it go, so a get never sees neither.
+    /// The spot index takes the key before the map lets it go, so a get never sees neither.
     pub fn page_out(&self, column: ColumnId, key: &[u8], loc: Loc) -> bool {
         let Some(at) = self.slot(column) else {
             return false;
         };
-        self.fast[at].insert(key, loc);
-        // FastForward holds the key and the map has yet to let it go.
-        crate::sync::rendezvous::at("paged/handover-fast");
+        self.spot[at].insert(key, loc);
+        // The spot index holds the key and the map has yet to let it go.
+        crate::sync::rendezvous::at("paged/handover-spot");
         let handed = self.indexes[at].page_out(key, loc);
         if !handed {
-            self.fast[at].remove_at(key, loc);
+            self.spot[at].remove_at(key, loc);
         }
         handed
     }
 
-    /// Give one sealed partition's keys up, a lane of FastForward shards to a thread
+    /// Give one sealed partition's keys up, a lane of the spot index shards to a thread
     ///
     /// Every key still goes through `page_out` alone. Each lane starts at its own share of
     /// key order, so the threads meet different map shards too.
@@ -879,7 +879,7 @@ impl ReelIndex {
             let Some(key) = partition.key_at(at) else {
                 continue;
             };
-            rows[FastColumn::lane_of(key, lanes)].push((at as u32, Loc::new(segment, row.offset, row.len)));
+            rows[SpotColumn::lane_of(key, lanes)].push((at as u32, Loc::new(segment, row.offset, row.len)));
         }
         let hand = |lane: usize, rows: &[(u32, Loc)]| -> usize {
             let (head, tail) = rows.split_at(rows.len() * lane / lanes);
@@ -994,14 +994,14 @@ impl ReelIndex {
     /// reader can see: what it settles is the dead-byte accounting the compactor
     /// reads, which is a tick behind by design anyway.
     ///
-    /// FastForward reads the displaced record's header, from memory when it can.
+    /// The spot index reads the displaced record's header, from memory when it can.
     pub fn settle_displaced(&self, key: &RecordKey, lsn: Lsn) -> Result<bool> {
         let Some(at) = self.slot(key.column) else {
             return Ok(false);
         };
-        if self.fast_serves() {
+        if self.spot_serves() {
             let mut settled = false;
-            let displaced = self.fast[at].displace(key, lsn)?;
+            let displaced = self.spot[at].displace(key, lsn)?;
             for loc in displaced.booked {
                 let counted = self.counted(loc.segment);
                 settled |= self.indexes[at].settle_paged(key.as_slice(), loc, counted, &self.segments);
@@ -1106,7 +1106,7 @@ impl ReelIndex {
                     picks,
                 });
             };
-            let found = match self.fast_pick(0, key) {
+            let found = match self.spot_pick(0, key) {
                 Some(pick) => {
                     picks.push(pick);
                     None
@@ -1157,12 +1157,12 @@ impl ReelIndex {
                     Some(entry) => Some(*entry),
                     // A key the map has nothing for may still be in a sealed segment. A pick
                     // taken here reads its candidates later as one batch.
-                    None => match (self.fast_pick(*index, key), self.residency.pages()) {
+                    None => match (self.spot_pick(*index, key), self.residency.pages()) {
                         (Some(pick), _) => {
                             picks.push(pick);
                             None
                         }
-                        // The map took the key since the look above, or FastForward is not
+                        // The map took the key since the look above, or the spot index is not
                         // serving yet, so the whole lookup answers.
                         (None, true) => self.get(key)?,
                         (None, false) => None,
@@ -1174,13 +1174,13 @@ impl ReelIndex {
         Ok(Located { found, picks })
     }
 
-    /// A FastForward lookup for a key the map holds nothing for, started under the caller's barrier
-    fn fast_pick(&self, at: usize, key: &RecordKey) -> Option<FastPick> {
-        let FastRoute::Column(column, since) = self.fast_route(key) else {
+    /// A spot index lookup for a key the map holds nothing for, started under the caller's barrier
+    fn spot_pick(&self, at: usize, key: &RecordKey) -> Option<SpotPick> {
+        let SpotRoute::Column(column, since) = self.spot_route(key) else {
             return None;
         };
-        let pick = self.fast[column].pick(key)?;
-        Some(FastPick {
+        let pick = self.spot[column].pick(key)?;
+        Some(SpotPick {
             at,
             column,
             pick,
@@ -1341,7 +1341,7 @@ impl ReelIndex {
                 self.counted(loc.segment),
                 &self.segments,
             );
-            self.fast[at].remove_at(key.as_slice(), *loc);
+            self.spot[at].remove_at(key.as_slice(), *loc);
         }
         index.advance_release(pending.lsn, run.resume.as_deref());
         Ok(run.examined)
@@ -1351,7 +1351,7 @@ impl ReelIndex {
     ///
     /// A paged key has no entry to repoint, so it comes back into the map until the
     /// destination seals and hands it over again. The caller's source stands when it is
-    /// the key's one FastForward slot. Otherwise the footers give the source, and they
+    /// the key's one the spot index slot. Otherwise the footers give the source, and they
     /// also say whether the row is still the version being moved.
     pub fn repoint(&self, key: &RecordKey, from: Option<Loc>, to: Loc, expected_lsn: Lsn) -> Result<bool> {
         let moves = [KeyRepoint {
@@ -1453,14 +1453,14 @@ impl ReelIndex {
                 None => {}
             }
         }
-        // The pass read the record at its source, so when that is the key's one FastForward
+        // The pass read the record at its source, so when that is the key's one the spot index
         // slot it is this key at this version, and no slot holds a newer one: no read needed.
-        if let Some(from) = from.filter(|from| self.fast_serves() && self.fast[at].only_at(key.as_slice(), *from)) {
+        if let Some(from) = from.filter(|from| self.spot_serves() && self.spot[at].only_at(key.as_slice(), *from)) {
             let counted = self.counted(from.segment);
             if !index.repoint_paged(key.as_slice(), to, expected_lsn, counted, stamp) {
                 return Ok(None);
             }
-            self.fast[at].remove_at(key.as_slice(), from);
+            self.spot[at].remove_at(key.as_slice(), from);
             return Ok(Some(from));
         }
         match self.sealed_state(at, key)? {
@@ -1469,7 +1469,7 @@ impl ReelIndex {
                 if !index.repoint_paged(key.as_slice(), to, expected_lsn, counted, stamp) {
                     return Ok(None);
                 }
-                self.fast[at].remove_at(key.as_slice(), entry.loc);
+                self.spot[at].remove_at(key.as_slice(), entry.loc);
                 Ok(Some(entry.loc))
             }
             // A newer version won the race, so the copy is dead on arrival.
@@ -1528,7 +1528,7 @@ impl ReelIndex {
                     &self.segments,
                 );
                 if evicted {
-                    self.fast[column_at].remove_at(key.as_slice(), at);
+                    self.spot[column_at].remove_at(key.as_slice(), at);
                 }
                 Ok(evicted)
             }
@@ -1544,21 +1544,21 @@ impl ReelIndex {
     /// in the meantime. The grave stands for the copy, and the prune takes it the same
     /// way once the copy's segment is noted.
     ///
-    /// A newer version anywhere refuses it: the map's own entry, or a FastForward slot
+    /// A newer version anywhere refuses it: the map's own entry, or a spot index slot
     /// in a segment holding anything newer, both read under the map's lock. A handover
-    /// puts the key in FastForward before the map lets it go, so one of the two shows
-    /// it. No grave stands while FastForward is still loading, since nothing there can
+    /// puts the key in the spot index before the map lets it go, so one of the two shows
+    /// it. No grave stands while the spot index is still loading, since nothing there can
     /// be ruled out yet.
     pub fn hold_grave(&self, key: &RecordKey, lsn: Lsn, segment: SegmentId) {
-        if !self.residency.pages() || !self.fast_serves() {
+        if !self.residency.pages() || !self.spot_serves() {
             return;
         }
         let Some(at) = self.slot(key.column) else {
             return;
         };
-        let fast = &self.fast[at];
+        let spot = &self.spot[at];
         self.indexes[at].hold_grave(key.as_slice(), lsn, segment, || {
-            fast.may_hold_newer(key.as_slice(), lsn)
+            spot.may_hold_newer(key.as_slice(), lsn)
         });
     }
 
@@ -1893,9 +1893,9 @@ impl ReelIndex {
             let spans = by_column.remove(&column.id).unwrap_or_default();
             self.sealed[at].replace(spans);
         }
-        // A volume with nothing sealed has no keys FastForward could be missing.
+        // A volume with nothing sealed has no keys the spot index could be missing.
         if self.sealed.iter().all(SealedRanges::is_empty) {
-            self.mark_fast_ready();
+            self.mark_spot_ready();
         }
     }
 
@@ -1904,10 +1904,10 @@ impl ReelIndex {
         for index in &self.indexes {
             index.clear();
         }
-        for fast in &self.fast {
-            fast.clear();
+        for spot in &self.spot {
+            spot.clear();
         }
-        self.fast_ready.store(false, Ordering::Release);
+        self.spot_ready.store(false, Ordering::Release);
         self.segments.clear();
     }
 
@@ -1928,7 +1928,7 @@ impl ReelIndex {
     /// Done before the segment's own locks are taken, from the footer the pass already has. A footer
     /// that is gone, as on a follower whose writer unlinked the file, leaves those bookings in the slack.
     fn rebook_retiring(&self, segment: SegmentId) {
-        if !self.counted(segment) || self.fast_displaced() == 0 {
+        if !self.counted(segment) || self.spot_displaced() == 0 {
             return;
         }
         let Some(footers) = self.footers.get() else {
@@ -1937,11 +1937,11 @@ impl ReelIndex {
         let Ok(Some(footer)) = footers.footer(segment) else {
             return;
         };
-        for (at, fast) in self.fast.iter().enumerate() {
+        for (at, spot) in self.spot.iter().enumerate() {
             let Some(partition) = footer.partition(self.columns[at].id) else {
                 continue;
             };
-            let Ok(rebooked) = fast.settle_displaced_in(segment, partition) else {
+            let Ok(rebooked) = spot.settle_displaced_in(segment, partition) else {
                 continue;
             };
             for row in rebooked {

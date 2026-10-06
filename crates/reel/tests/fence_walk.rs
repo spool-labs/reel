@@ -131,7 +131,7 @@ fn filled_under(config: ReelConfig) -> (ReelStore, SimIo) {
 /// Probe a sample of the keys, and say what finding them cost
 fn hit_counts(store: &ReelStore) -> ProbeCounts {
     let stride = keys() / PROBES;
-    // The index's own search as of a cue point, since FastForward answers a store read first.
+    // The index's own search as of a cue point, since the spot index answers a store read first.
     let cue = store.cue().expect("cue");
     let before = store.filter_probes();
     for at in 0..PROBES {
@@ -217,7 +217,7 @@ fn a_fence_lands_a_search_on_one_block() {
 
 // what an in-range miss costs a fenced sorted run, with a filter and without
 //
-// A key no sealed segment holds is ruled out ahead of the fan-out by FastForward,
+// A key no sealed segment holds is ruled out ahead of the fan-out by the spot index,
 // which holds no slot for it. The miss that survives is the fan-out's own, and a fence cannot
 // stand in for a filter there: the leads say where a key would sit, never whether
 // it is there.
@@ -271,7 +271,7 @@ fn what_a_miss_costs_without_a_filter() {
     );
 }
 
-/// Probe keys nothing wrote, which FastForward answers on its own
+/// Probe keys nothing wrote, which the spot index answers on its own
 fn miss_counts(store: &ReelStore) -> ProbeCounts {
     let cue = store.cue().expect("cue");
     let before = store.filter_probes();

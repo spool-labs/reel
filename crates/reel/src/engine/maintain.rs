@@ -22,7 +22,7 @@ use crate::reel::checkpoint::{
 use super::{read_only, CompactPass, ReelStore, Totals, GRAVE_WINDOW, INGEST_HOT_BYTES, SWEEP_RUN};
 use crate::sync::lock;
 
-/// Older versions the FastForward cleaner takes out on one maintenance tick, with no reads
+/// Older versions the spot index cleaner takes out on one maintenance tick, with no reads
 const FAST_SCRUB_BUDGET: usize = 65_536;
 
 /// Sorted runs one key may fall inside before the youngest are merged among themselves
@@ -436,7 +436,7 @@ impl ReelStore {
         // can hold the tick long enough for a backlog of sealed keys to build.
         self.page_out_sealed()?;
         self.scrub_once()?;
-        self.index.scrub_fast(FAST_SCRUB_BUDGET);
+        self.index.scrub_spot(FAST_SCRUB_BUDGET);
         self.index.sweep_walk_runs();
         Ok(())
     }

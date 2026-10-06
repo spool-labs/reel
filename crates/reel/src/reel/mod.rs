@@ -622,9 +622,6 @@ pub struct ReelShared {
 
     /// Sequence numbers drawn for records that have not yet taken a segment hold
     drawn: AtomicU64,
-
-    /// Segments a merge writer drew, which nothing else ever writes into
-    merge_output: Mutex<std::collections::HashSet<SegmentId>>,
 }
 
 /// Drawn sequence numbers' place in the gauge, given back when their records land
@@ -791,33 +788,6 @@ impl ReelShared {
             cold_direct: AtomicBool::new(true),
             cold_depth: AtomicU64::new(0),
             drawn: AtomicU64::new(0),
-            merge_output: Mutex::new(std::collections::HashSet::new()),
-        }
-    }
-
-    /// Note that a merge writer drew this segment, so nothing else wrote into it
-    pub fn note_merge_output(&self, segment: SegmentId) {
-        lock(&self.merge_output).insert(segment);
-    }
-
-    /// Whether a merge writer drew this segment
-    pub fn is_merge_output(&self, segment: SegmentId) -> bool {
-        lock(&self.merge_output).contains(&segment)
-    }
-
-    /// Forget that a merge drew this segment, once the index has been told about it
-    pub fn forget_merge_output(&self, segment: SegmentId) -> bool {
-        lock(&self.merge_output).remove(&segment)
-    }
-
-    /// Bits this segment's seal spends per key on its filters
-    ///
-    /// Merge output gets none: its rows span the whole keyspace, so its fence
-    /// answers placement and a search reaching it is nearly always a hit.
-    pub fn filter_bits_for(&self, segment: SegmentId) -> u8 {
-        match self.is_merge_output(segment) {
-            true => 0,
-            false => self.config.seal_filter_bits(),
         }
     }
 
@@ -1421,7 +1391,7 @@ impl Drop for ReservedLease<'_> {
 
 /// Tails a volume keeps back for compaction: one per pass it runs at once, or none
 fn reserved_count(shared: &ReelShared) -> usize {
-    match shared.config.rewrite_on_seal || shared.volumes.has_capacity() {
+    match shared.volumes.has_capacity() {
         true => shared.config.compact_passes(),
         false => 0,
     }
@@ -1430,13 +1400,13 @@ fn reserved_count(shared: &ReelShared) -> usize {
 impl Reel {
     /// Open a reel with the configured number of active tails
     ///
-    /// A volume that rewrites at seal, or that owns a capacity tier, keeps a tail back
-    /// for each compaction pass it runs at once: a sorted run is only sorted if nothing
-    /// else is writing into it. The reserved tails come last and route never offers them.
+    /// A volume that owns a capacity tier keeps a tail back for each compaction pass it
+    /// runs at once, since only a reserved tail answers to a named tier. The reserved
+    /// tails come last and route never offers them.
     ///
     /// Tails a previous process left unsealed are picked up in number order, so a restart
-    /// continues its segments rather than drawing new ones. A reserved tail never
-    /// resumes: a merge's output has to be nothing but its own runs.
+    /// continues its segments. A reserved tail never resumes, so each pass starts on a
+    /// segment of its own.
     pub fn open(shared: Arc<ReelShared>, resumable: Vec<ResumableTail>) -> Result<Reel> {
         let count = shared.config.tail_count();
         let reserved = reserved_count(&shared);

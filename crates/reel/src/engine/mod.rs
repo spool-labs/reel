@@ -453,7 +453,9 @@ impl ReelStore {
         // And the other direction: a seal writes down what its segment weighs, and
         // these are the counters that know.
         shared.set_segments(index.segments_handle());
-        if config.key_runs && !is_read_only {
+        // A resident volume loads the runs a paged opening wrote too, since a delete
+        // stands while a run holds an older row of its key.
+        if !is_read_only {
             index.key_runs().load(&shared.driver, &shared.volumes.roots()[0])?;
         }
 

@@ -16,7 +16,7 @@ use reel::format::record::{BatchFrame, RecordHeader, HEADER_LEN};
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::{
-    ByteCount, CompactPass, CompactRate, IndexResidency, Preallocate,
+    ByteCount, IndexResidency, Preallocate,
     RecordWrite, ReelConfig, ReelStore, RepairPath, SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
 };
 use reel_core::{Direction, Store, Value};
@@ -111,23 +111,26 @@ const COMPACT_PAYLOAD: usize = 3000;
 /// Records written into the compaction source segment before overwrites
 const COMPACT_FILL: u8 = 4;
 
-/// Segment size the merge stream rolls a run out of
+/// Segment size the merge stream rolls, about one round of its keys
 const MERGE_SEG_BYTES: u64 = 20 * 1024;
 
 /// Keys the merge stream writes per round
 const MERGE_KEYS: u8 = 6;
 
 /// Payload each of those keys carries
-const MERGE_PAYLOAD: usize = 900;
+const MERGE_PAYLOAD: usize = 3000;
+
+/// Rounds over every key before the delete, a sealed segment each, past the merge depth
+const MERGE_ROUNDS: u8 = 12;
+
+/// Rounds over the kept keys after the delete, enough to seal the segment holding it
+const MERGE_AFTER_ROUNDS: u8 = 2;
 
 /// The key the merge stream deletes, which is the resurrection gate
 const MERGE_DELETED: u8 = 3;
 
 /// The keys that must still read back after a crash inside the merge
 const MERGE_KEPT: &[u8] = &[1, 2, 4, 5, 6];
-
-/// Rewrite passes the merge setup drives before it gives up on the volume settling
-const MERGE_SETTLE_PASSES: u32 = 64;
 
 /// Keys the sub group range delete stream writes before it deletes
 const RANGE_KEYS: u8 = 9;
@@ -961,27 +964,27 @@ fn mid_compaction() {
     }
 }
 
-// a crash in the middle of a merge keeps every live key and keeps the deleted one dead
+// a crash in the middle of a key merge keeps every live key and keeps the deleted one dead
 //
-// The sources stay the authority until the output is sealed and the repoints published,
-// so a reopen has to land on one side of that or the other. The delete is the gate: its
-// tombstone rides the merge like any other row, and losing it hands back the version
-// underneath.
+// A key merge writes its run whole under a part name and renames it in, and it moves no
+// record, so a reopen finds the run or finds none. Gets and walks have to answer as the
+// segments do either way. The delete is the gate: its row shadows the versions under it
+// in the run, and losing it hands one of them back to a walk.
 #[test]
-fn mid_merge() {
-    let harness = ReelHarness::new(merge_config());
+fn mid_key_merge() {
+    let harness = ReelHarness::new(key_merge_config());
 
     let probe_sim = SimIo::new(FaultPlan::new(0));
     let probe = harness.open_or_panic(probe_sim.clone());
     write_merge_setup(&probe);
     let setup_ops = probe_sim.ops();
-    let report = probe.merge_once().expect("probe merge");
+    let depth = probe.index().overlap_depth();
+    let report = probe.merge_when_due().expect("probe merge");
     let total_ops = probe_sim.ops();
     drop(probe);
     assert!(
-        report.runs_merged >= 2,
-        "the setup left {} runs, so the merge below collapses nothing",
-        report.runs_merged,
+        report.is_some_and(|report| report.runs_merged >= 2),
+        "the setup stacked the walk {depth} deep, so the merge below folds nothing",
     );
     assert!(total_ops > setup_ops, "the merge crossed no io boundary");
 
@@ -989,64 +992,42 @@ fn mid_merge() {
         let sim = SimIo::new(FaultPlan::new(1).with_crash(crash_at));
         let store = harness.open_or_panic(sim.clone());
         write_merge_setup(&store);
-        let _ = store.merge_once();
+        let _ = store.merge_when_due();
         drop(store);
 
         let reopened = harness.reopen(sim.durable_image());
-        assert_recount(&reopened, crash_at);
-        for address in MERGE_KEPT {
-            assert!(
-                merged_value(&reopened, *address).is_some(),
-                "a merged key went missing at {crash_at}",
-            );
-        }
-        assert!(
-            merged_value(&reopened, MERGE_DELETED).is_none(),
-            "a merge crash brought a deleted key back at {crash_at}",
-        );
+        assert_merged_answers(&reopened, crash_at);
 
-        // And the pass restarts, so the crash left a volume a merge can still work on.
-        let _ = reopened.merge_once();
-        assert_recount(&reopened, crash_at);
-        assert!(
-            merged_value(&reopened, MERGE_DELETED).is_none(),
-            "the restarted merge brought a deleted key back at {crash_at}",
-        );
+        // And the merge goes again, so the crash left a volume a merge can still work on.
+        let _ = reopened.merge_when_due();
+        assert_merged_answers(&reopened, crash_at);
     }
 }
 
-/// A volume that seals by rewriting and takes a merge when asked
-///
-/// The dead ratio is at one so compaction reclaims only wholly dead segments, which
-/// leaves the runs standing for the merge to collapse. The index stays resident, since a
-/// paged rebuild counts nothing it left in a footer and the recount would then be
-/// measuring the residency instead of the crash.
-fn merge_config() -> ReelConfig {
+/// A paged volume, whose walk a key merge folds once it stacks past the merge depth
+fn key_merge_config() -> ReelConfig {
     ReelConfig {
-        rewrite_on_seal: true,
-        merge_sorted_runs: true,
-        compact_dead_ratio: 1.0,
-        compact_mbps: CompactRate::Mbps(100_000),
+        index: IndexResidency::Paged,
         ..crash_config(1, SyncPolicy::EveryPut, MERGE_SEG_BYTES)
     }
 }
 
-/// Write two rounds of overlapping keys, settling each into a sorted run
+/// The fill a key carries in one round of the merge stream
+fn merge_fill(round: u8, address: u8) -> u8 {
+    round * 16 + address
+}
+
+/// Write rounds over the same keys, then the delete and enough after it to seal it
 ///
-/// The second round rewrites half of the first, so neither run goes wholly dead and both
-/// are standing when the merge arrives. The delete lands last, in its own run.
+/// Each round overwrites every key and rolls about one segment, so every sealed segment
+/// reaches across the keys and the walk's depth grows a segment a round.
 fn write_merge_setup(store: &ReelStore) {
-    for address in 1..=MERGE_KEYS {
-        apply_mutation(store, &put(GROUP, address, MERGE_PAYLOAD, address)).expect("first round");
-    }
-    settle_runs(store);
-    for address in 1..=MERGE_KEYS {
-        if address % 2 == 0 {
-            apply_mutation(store, &put(GROUP, address, MERGE_PAYLOAD, address + 100))
-                .expect("second round");
+    for round in 1..=MERGE_ROUNDS {
+        for address in 1..=MERGE_KEYS {
+            apply_mutation(store, &put(GROUP, address, MERGE_PAYLOAD, merge_fill(round, address)))
+                .expect("round");
         }
     }
-    settle_runs(store);
     apply_mutation(
         store,
         &StreamOp::Delete {
@@ -1055,31 +1036,36 @@ fn write_merge_setup(store: &ReelStore) {
         },
     )
     .expect("delete");
-    settle_runs(store);
-}
-
-/// Flush, seal and rewrite until the volume has nothing left to put in key order
-fn settle_runs(store: &ReelStore) {
-    store.flush().expect("flush");
-    drop(store.cue().expect("cue"));
-    store.page_out_sealed().expect("page out");
-    for _ in 0..MERGE_SETTLE_PASSES {
-        let pass = store.compact_once().expect("compact");
-        store.flush().expect("flush");
-        store.page_out_sealed().expect("page out");
-        if matches!(pass, CompactPass::Idle) {
-            return;
+    for round in MERGE_ROUNDS + 1..=MERGE_ROUNDS + MERGE_AFTER_ROUNDS {
+        for address in MERGE_KEPT {
+            apply_mutation(store, &put(GROUP, *address, MERGE_PAYLOAD, merge_fill(round, *address)))
+                .expect("round after the delete");
         }
     }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
 }
 
-/// What one key of the merge stream reads back as
-fn merged_value(store: &ReelStore, address: u8) -> Option<Vec<u8>> {
-    let key = RecordKey::from_bytes(RECORDS, &wire_key(GROUP, address)).expect("key");
-    store
-        .get(&key)
-        .expect("get")
-        .map(|value| value.as_ref().to_vec())
+/// Every key of the merge stream reads back as the last round left it, by get and by walk
+fn assert_merged_answers(store: &ReelStore, crash_at: u64) {
+    let last = MERGE_ROUNDS + MERGE_AFTER_ROUNDS;
+    let want: Vec<(Vec<u8>, Vec<u8>)> = MERGE_KEPT
+        .iter()
+        .map(|address| (wire_key(GROUP, *address), framed_value(MERGE_PAYLOAD, merge_fill(last, *address))))
+        .collect();
+    for (key, value) in &want {
+        let found = Store::get(store, RECORDS_CF, key).expect("get").map(|value| value.to_vec());
+        assert_eq!(found.as_ref(), Some(value), "a merged key read back wrong at {crash_at}");
+    }
+    assert!(
+        Store::get(store, RECORDS_CF, &wire_key(GROUP, MERGE_DELETED)).expect("get").is_none(),
+        "a merge crash brought a deleted key back at {crash_at}",
+    );
+    let walked: Vec<(Vec<u8>, Vec<u8>)> = Store::iter(store, RECORDS_CF)
+        .expect("iter")
+        .map(|(key, value)| (key, value.to_vec()))
+        .collect();
+    assert_eq!(walked, want, "a walk after a merge crash at {crash_at}");
 }
 
 // Assert every record the reopened reel serves is a version the stream actually wrote

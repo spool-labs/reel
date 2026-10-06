@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::compaction::compactor::EraseReport;
-use crate::compaction::merge::{merge_once, merge_runs, sorted_run_dead_ratio, MergeReport};
+use crate::compaction::keymerge::{merge_into_key_run, MergeReport};
 use crate::error::{ReelError, Result};
 use crate::format::column::ColumnId;
 use crate::format::footer::SegmentFooter;
@@ -25,13 +25,10 @@ use crate::sync::lock;
 /// Older versions the spot index cleaner takes out on one maintenance tick, with no reads
 const SPOT_SCRUB_BUDGET: usize = 65_536;
 
-/// Sorted runs one key may fall inside before the youngest are merged among themselves
+/// Runs one walk merges, the uncovered segments and the key runs, before a key merge
 ///
 /// A walk seeks once in every run over its start, so this bounds what a short scan pays.
 const MERGE_DEPTH: usize = 8;
-
-/// Layers one tiered merge collapses, the smallest the volume holds
-const MERGE_TIER: usize = 8;
 
 /// How often the hand-over runs while compaction passes hold the tick, the tick's own second
 const HANDOVER_TICK: Duration = Duration::from_secs(1);
@@ -313,11 +310,6 @@ impl ReelStore {
             }
         }
         let named: Vec<SegmentId> = sealed.iter().map(|(segment, _)| *segment).collect();
-        // The mark comes off here rather than beside the paged queue below, or a
-        // resident volume would hold every merge's note for the life of the volume.
-        for segment in &named {
-            self.reel.shared().forget_merge_output(*segment);
-        }
         self.reel.shared().settle_sealed(&named);
 
         if !self.config.index.pages() {
@@ -350,68 +342,59 @@ impl ReelStore {
         self.compactor.erase_dead_runs(&self.reel, &self.index)
     }
 
-    /// Collapse the volume's sorted runs into one, and report what the pass did
+    /// Merge the walk's runs into one key run once too many stand over one key
     ///
-    /// The pass a caller drives, which runs whatever the stack's debt is. The floor an
-    /// open cue point holds is read here, so a run holding a version an older reader can
-    /// still see is left alone.
-    pub fn merge_once(&self) -> Result<MergeReport> {
-        if self.is_read_only {
-            return Err(read_only());
-        }
-        // A pass asks the index which of a run's rows are still live, so it works
-        // from a settled view: a segment the index has not been told about answers
-        // that with nothing at all.
-        self.settle_sealed()?;
-        merge_once(&self.compactor, &self.reel, &self.index, self.cues.floor())
-    }
-
-    /// The dead share of the standing sorted runs, which is what a tick decides on
-    ///
-    /// Nothing where fewer runs stand than a merge could collapse.
-    pub fn sorted_run_dead_ratio(&self) -> Result<Option<f64>> {
-        sorted_run_dead_ratio(&self.compactor, &self.reel, &self.index, self.cues.floor())
-    }
-
-    /// Collapse the sorted runs where the stack has gone as dead as the volume allows
-    ///
-    /// What the tick drives, and nothing on a volume that did not arm the merge. The
-    /// trigger is the stack's own dead share rather than a cadence, so the volume merges
-    /// as often as its traffic shadows rows and never on a quiet one. Nothing comes back
-    /// where the stack is under the threshold or a seat or the rate held the pass off.
+    /// What the tick drives. The young pile is every sealed segment no key run covers
+    /// yet. Key runs join it smallest first while each is no bigger than twice what is
+    /// taken, so the young runs merge often and cheaply and a large run is merged again
+    /// only once the pile has grown to its size. Nothing comes back where the walk is
+    /// shallow enough, or another pass holds the seat.
     pub fn merge_when_due(&self) -> Result<Option<MergeReport>> {
         if self.is_read_only {
             return Ok(None);
         }
-        if self.config.key_runs {
-            return self.key_merge_when_due();
-        }
-        if !self.config.merge_sorted_runs {
-            return Ok(None);
-        }
-        // The seat is what keeps a merge and a rewrite off one another's segments, and
-        // it is taken before the rate is read for the reason a rewrite takes it first.
         let Some(_pass) = self.compaction_plane.enter() else {
             return Ok(None);
         };
-        if !self.compactor.is_compaction_due() {
-            return Ok(None);
-        }
-        // A run the index has not been told about answers every liveness question with
-        // nothing, so the stack is priced from a settled view and merged from one.
-        self.settle_sealed()?;
-        let debt = self.sorted_run_dead_ratio()?;
-        if debt.is_some_and(|ratio| ratio >= self.config.merge_dead_ratio) {
-            return merge_once(&self.compactor, &self.reel, &self.index, self.cues.floor()).map(Some);
-        }
-        // Too many runs reaching over the same keys: the youngest collapse among
-        // themselves, which keeps a walk's merge narrow without rewriting the volume.
-        let shared = self.reel.shared();
-        let mergeable = |segment| self.compactor.is_mergeable(shared, segment);
-        let Some(tier) = self.index.youngest_tier(MERGE_DEPTH, MERGE_TIER, mergeable) else {
+        let Some(_merging) = self.index.key_runs().try_merge() else {
             return Ok(None);
         };
-        merge_runs(&self.compactor, &self.reel, &self.index, self.cues.floor(), &tier).map(Some)
+        self.settle_sealed()?;
+        if self.index.overlap_depth() <= MERGE_DEPTH || self.index.has_pending_covers() {
+            return Ok(None);
+        }
+        let shared = self.reel.shared();
+        let covered = self.index.key_runs().covered();
+        let owed = shared.pending_seals();
+        let mut segments = Vec::new();
+        let mut taken = 0u64;
+        for (segment, bytes) in self.index.segments_snapshot() {
+            if covered.contains(&segment) || shared.is_held(segment) || owed.contains(&segment) || bytes.total() == 0 {
+                continue;
+            }
+            let Some(footer) = shared.footer_of(segment)? else {
+                continue;
+            };
+            taken += footer.entry_count() as u64;
+            segments.push(segment);
+        }
+        let mut runs = self.index.key_runs().runs();
+        runs.sort_by_key(|run| run.columns().iter().map(|column| column.rows()).sum::<u64>());
+        let mut joining = Vec::new();
+        for run in runs {
+            let rows: u64 = run.columns().iter().map(|column| column.rows()).sum();
+            if taken > 0 && rows > taken.saturating_mul(2) {
+                break;
+            }
+            taken += rows;
+            joining.push(run);
+        }
+        let merged = merge_into_key_run(&self.compactor, &self.reel, &self.index, &segments, &joining)?;
+        if merged.runs_merged == 0 {
+            return Ok(None);
+        }
+        self.compactor.note_merged_runs(merged.runs_merged);
+        Ok(Some(merged))
     }
 
     /// Run one bounded pass of the whole maintenance plane
@@ -498,72 +481,10 @@ impl ReelStore {
         })
     }
 
-    /// Merge the walk's runs into one key run once too many stand over one key
-    ///
-    /// The young pile is every sealed segment no key run covers yet. Key runs join it
-    /// smallest first while each is no bigger than twice what is taken, so the young
-    /// runs merge often and cheaply and a large run is merged again only once the pile
-    /// has grown to its size.
-    fn key_merge_when_due(&self) -> Result<Option<MergeReport>> {
-        let Some(_pass) = self.compaction_plane.enter() else {
-            return Ok(None);
-        };
-        let Some(_merging) = self.index.key_runs().try_merge() else {
-            return Ok(None);
-        };
-        self.settle_sealed()?;
-        if self.index.overlap_depth() <= MERGE_DEPTH || self.index.has_pending_covers() {
-            return Ok(None);
-        }
-        let shared = self.reel.shared();
-        let covered = self.index.key_runs().covered();
-        let owed = shared.pending_seals();
-        let mut segments = Vec::new();
-        let mut taken = 0u64;
-        for (segment, bytes) in self.index.segments_snapshot() {
-            if covered.contains(&segment) || shared.is_held(segment) || owed.contains(&segment) || bytes.total() == 0 {
-                continue;
-            }
-            let Some(footer) = shared.footer_of(segment)? else {
-                continue;
-            };
-            taken += footer.entry_count() as u64;
-            segments.push(segment);
-        }
-        let mut runs = self.index.key_runs().runs();
-        runs.sort_by_key(|run| run.columns().iter().map(|column| column.rows()).sum::<u64>());
-        let mut joining = Vec::new();
-        for run in runs {
-            let rows: u64 = run.columns().iter().map(|column| column.rows()).sum();
-            if taken > 0 && rows > taken.saturating_mul(2) {
-                break;
-            }
-            taken += rows;
-            joining.push(run);
-        }
-        let merged = crate::compaction::keymerge::merge_into_key_run(
-            &self.compactor,
-            &self.reel,
-            &self.index,
-            &segments,
-            &joining,
-        )?;
-        if merged.runs_merged == 0 {
-            return Ok(None);
-        }
-        self.compactor.note_merged_runs(merged.runs_merged);
-        Ok(Some(MergeReport {
-            runs_merged: merged.runs_merged,
-            rows_written: merged.rows_written,
-            rows_shadowed: merged.rows_shadowed,
-            ..MergeReport::default()
-        }))
-    }
-
     /// Merge what is due, where a pass that refuses or fails is one tier of one tick
     fn merge_owed(&self) {
         if let Err(error) = self.merge_when_due() {
-            tracing::warn!("a maintenance tick left the sorted runs standing: {error}");
+            tracing::warn!("a maintenance tick left the walk's runs unmerged: {error}");
         }
     }
 
@@ -672,14 +593,10 @@ impl ReelStore {
         let live = self.totals().bytes.to_bytes();
         let dead_fraction = dead_fraction(dead, live);
         let is_hot = self.is_ingest_hot();
-        // Runs piled past the merge depth are sorted even under a hot ingest: a tier
-        // merge reads sorted runs alone, and the pile is what every walk pays for.
-        let is_deep = self.config.merge_sorted_runs && !self.config.key_runs && self.index.overlap_depth() > MERGE_DEPTH;
-        if !is_deep
-            && !self
-                .compactor
-                .pressure()
-                .should_compact(dead_fraction, is_hot)
+        if !self
+            .compactor
+            .pressure()
+            .should_compact(dead_fraction, is_hot)
         {
             return Ok(CompactPass::Held);
         }

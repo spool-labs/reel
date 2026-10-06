@@ -56,11 +56,11 @@ pub struct Differential {
     /// The step and op a divergence is reported against
     at_step: Option<(usize, String)>,
 
-    /// Sorted runs merged before those reopens, counted the same way
+    /// Runs merged before those reopens, counted the same way
     merged_before: u64,
 
-    /// Whether the stream drives the maintenance tick rather than the passes under it
-    is_maintained: bool,
+    /// Whether the stream runs compaction passes, which a merging run leaves off
+    is_compacting: bool,
 
     /// Whether the stream writes the reel's index down as it goes
     is_checkpointing: bool,
@@ -105,7 +105,7 @@ impl Differential {
         Differential {
             at_step: None,
             merged_before: 0,
-            is_maintained: false,
+            is_compacting: true,
             is_checkpointing: false,
             seed,
             memory: MemoryStore::new(),
@@ -123,14 +123,13 @@ impl Differential {
         Differential::open(seed, reel_config)
     }
 
-    /// The same pair, with the maintenance tick driving the plane the stream would
+    /// The same pair with compaction left off, so the sealed segments stand for key merges
     ///
-    /// The tick decides the merge on the standing stack's own debt, so an armed volume
-    /// opened this way collapses its runs when its traffic has shadowed enough of them
-    /// rather than on a cadence of the stream's.
-    pub fn open_maintained(seed: u64, reel_config: ReelConfig) -> Differential {
+    /// A stream this small keeps its live keys in a few segments, and compaction retires
+    /// the rest long before the walk stacks deep enough for a merge.
+    pub fn open_merging(seed: u64, reel_config: ReelConfig) -> Differential {
         Differential {
-            is_maintained: true,
+            is_compacting: false,
             ..Differential::open(seed, reel_config)
         }
     }
@@ -182,7 +181,7 @@ impl Differential {
         self.checkpointed_keys
     }
 
-    /// Sorted runs merge passes read together over the whole run
+    /// Runs the key merges read together over the whole run
     ///
     /// Carried across the stream's reopens, since each one is a fresh store with fresh
     /// counters and the question is what the whole run did.
@@ -211,7 +210,7 @@ impl Differential {
         );
     }
 
-    /// The stream left two sorted runs standing and something collapsed them
+    /// The stream stacked its walk past the merge depth and a key merge folded it
     pub fn assert_merged_runs(&mut self) {
         let seed = self.seed;
         self.drive_until(
@@ -221,7 +220,7 @@ impl Differential {
                 fixture.merge_reel();
                 fixture.merged_runs() > 0
             },
-            &format!("seed {seed} never had two runs to merge"),
+            &format!("seed {seed} never stacked its walk deep enough to merge"),
         );
     }
 
@@ -400,12 +399,9 @@ impl Differential {
         self.checkpointed_keys += taken.keys;
     }
 
-    /// Bound the reel, either pass by pass or by handing the whole plane to the tick
+    /// Bound the reel pass by pass, on a run that compacts
     fn compact_reel(&self) {
-        if self.is_maintained {
-            for _ in 0..COMPACT_PASSES {
-                self.reel.maintain_once().expect("maintain reel");
-            }
+        if !self.is_compacting {
             return;
         }
         for _ in 0..COMPACT_PASSES {
@@ -413,15 +409,11 @@ impl Differential {
         }
     }
 
-    /// Collapse whatever sorted runs the stream has left standing
+    /// Fold the walk's runs into a key run, where the stream has stacked them deep enough
     ///
-    /// A volume that did not arm the merge refuses it outright, so this costs the other
-    /// streams a load. A maintained run decides its own merges and takes none here.
+    /// A resident volume never stacks any, so this costs the other streams a look.
     fn merge_reel(&self) {
-        if self.is_maintained || !self.reel_config.merge_sorted_runs {
-            return;
-        }
-        self.reel.merge_once().expect("merge reel");
+        self.reel.merge_when_due().expect("merge reel");
     }
 
     /// Hand the keys of any newly sealed segment over to their footers

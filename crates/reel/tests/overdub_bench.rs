@@ -6,13 +6,8 @@
 //! written exactly once. The reads are batched and skewed toward what was just written,
 //! which is what makes a paged get's search count the term that matters.
 //!
-//! Two flavours, each on its own volume, each run with the merge armed and with it left
-//! standing. The merge column is the one to read first: an armed volume collapses its
-//! sorted runs on its own tick, and the undriven cell is the same traffic with the runs
-//! left to pile up, so the pair prices what the collapse is worth. At the shipped
-//! triggers the pair comes out identical, because the reclaim rewrite takes a segment's
-//! dead bytes long before the stack as a whole reaches the collapse mark; putting
-//! `REEL_OVERDUB_MERGE_RATIO` under where the stack settles is what makes the merge fire.
+//! Two flavours, each on its own volume. A paged volume folds its walk into key runs on
+//! its own tick, and the merges column counts the rounds that took one.
 //!
 //! Two read columns rather than one: a search that finds its footer parsed and held costs
 //! no device read at all, so a volume small enough to fit its own footer cache prints
@@ -31,8 +26,8 @@
 //! `REEL_OVERDUB_HOT`, `REEL_OVERDUB_MID`, `REEL_OVERDUB_FRESH`, `REEL_OVERDUB_READS`,
 //! `REEL_OVERDUB_BATCH`, `REEL_OVERDUB_VALUE`, `REEL_OVERDUB_SEGMENT`,
 //! `REEL_OVERDUB_PASSES`, `REEL_OVERDUB_FOOTER_CACHE`,
-//! `REEL_OVERDUB_COMPACT_MBPS`, `REEL_OVERDUB_DEAD_RATIO`, `REEL_OVERDUB_MERGE_RATIO`,
-//! `REEL_OVERDUB_READERS`, `REEL_OVERDUB_TAILS`.
+//! `REEL_OVERDUB_COMPACT_MBPS`, `REEL_OVERDUB_DEAD_RATIO`, `REEL_OVERDUB_READERS`,
+//! `REEL_OVERDUB_TAILS`.
 //!
 //! Point `REEL_OVERDUB_DIR` at the filesystem under test. Without it the cells land
 //! wherever the temporary directory does, which on a machine with a memory backed one
@@ -117,9 +112,8 @@ const COMPACT_PASSES: u64 = 8;
 
 /// Compaction pace, in megabytes a second
 ///
-/// Effectively unpaced by default, so both cells of a pair drain their debt at the same
-/// speed and the merge column is the only thing that differs between them. A box run
-/// should set this to what its device actually gives back.
+/// Effectively unpaced by default, so every cell drains its debt at the same speed. A box
+/// run should set this to what its device actually gives back.
 const COMPACT_MBPS: u64 = 100_000;
 
 /// Bytes of sealed-footer state a paged volume keeps at once
@@ -131,13 +125,6 @@ const FOOTER_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Dead fraction at which a sealed segment is rewritten, the shipped one
 const COMPACT_DEAD_RATIO: f64 = 0.50;
-
-/// Dead share of the standing runs at which the tick collapses them, the shipped one
-///
-/// The rewrite above is what keeps this from ever being reached under steady traffic: it
-/// reclaims a segment's dead bytes long before the stack as a whole goes half dead. A run
-/// wanting to price the collapse has to put this under where the stack actually settles.
-const MERGE_DEAD_RATIO: f64 = 0.50;
 
 /// Rounds back a read still counts as recent
 const RECENT_ROUNDS: usize = 3;
@@ -222,8 +209,6 @@ struct Knobs {
     /// Dead fraction at which a sealed segment is rewritten
     compact_dead_ratio: f64,
 
-    /// Dead share of the standing runs at which the tick collapses them
-    merge_dead_ratio: f64,
 }
 
 /// A number from the environment, or the fallback
@@ -297,7 +282,6 @@ fn knobs() -> Knobs {
         footer_cache_bytes: env_bytes("REEL_OVERDUB_FOOTER_CACHE", FOOTER_CACHE_BYTES),
         compact_mbps: env_num("REEL_OVERDUB_COMPACT_MBPS", COMPACT_MBPS).max(1),
         compact_dead_ratio: env_share("REEL_OVERDUB_DEAD_RATIO", COMPACT_DEAD_RATIO),
-        merge_dead_ratio: env_share("REEL_OVERDUB_MERGE_RATIO", MERGE_DEAD_RATIO),
     }
 }
 
@@ -526,8 +510,8 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     codec: Codec::None,
 }];
 
-/// What one cell opens its volume with, the flavour and the merge being all that differ
-fn config(arm: &Arm, is_merge_driven: bool, knobs: &Knobs) -> ReelConfig {
+/// What one cell opens its volume with, the flavour being all that differs
+fn config(arm: &Arm, knobs: &Knobs) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(knobs.segment_bytes),
         alloc_chunk: ByteCount::from_bytes(ALLOC_CHUNK),
@@ -538,13 +522,10 @@ fn config(arm: &Arm, is_merge_driven: bool, knobs: &Knobs) -> ReelConfig {
         scrub_mbps: 0,
         index: arm.index,
         fence: arm.fence,
-        rewrite_on_seal: true,
-        merge_sorted_runs: is_merge_driven,
         filter_bits: FILTER_BITS,
         footer_cache: ByteCount::from_bytes(knobs.footer_cache_bytes),
         compact_mbps: CompactRate::Mbps(knobs.compact_mbps),
         compact_dead_ratio: knobs.compact_dead_ratio,
-        merge_dead_ratio: knobs.merge_dead_ratio,
         ..ReelConfig::default()
     }
 }
@@ -626,11 +607,8 @@ struct Cell {
     /// Segments standing after every round
     standing: Vec<usize>,
 
-    /// Passes that collapsed at least one run
+    /// Rounds whose tick took a key merge
     merges: u64,
-
-    /// Bytes those passes read and did not write out again
-    collapsed: u64,
 }
 
 impl Cell {
@@ -756,11 +734,11 @@ fn write_round(
 }
 
 /// Drive the whole workload against one volume and say what it cost
-fn run_cell(arm: &Arm, is_merge_driven: bool, knobs: &Knobs, root: &Path) -> Cell {
+fn run_cell(arm: &Arm, knobs: &Knobs, root: &Path) -> Cell {
     std::fs::create_dir_all(root).expect("cell root");
     let store = ReelStore::open(
         root.to_path_buf(),
-        config(arm, is_merge_driven, knobs),
+        config(arm, knobs),
         COLUMNS,
     )
     .expect("open");
@@ -791,7 +769,6 @@ fn run_cell(arm: &Arm, is_merge_driven: bool, knobs: &Knobs, root: &Path) -> Cel
         rewritten: 0,
         standing: Vec::with_capacity(knobs.rounds as usize),
         merges: 0,
-        collapsed: 0,
     };
     let mut batch_nanos: Vec<u64> =
         Vec::with_capacity((knobs.rounds * knobs.reads / BATCH_KEYS) as usize);
@@ -861,7 +838,6 @@ fn run_cell(arm: &Arm, is_merge_driven: bool, knobs: &Knobs, root: &Path) -> Cel
 
         if report.runs_merged > 0 {
             cell.merges += 1;
-            cell.collapsed += report.bytes_read.saturating_sub(report.bytes_written);
         }
         // Every reader is joined by here, so the run count is this round's and not a
         // reading taken while the volume was still being asked.
@@ -884,7 +860,7 @@ fn run_cell(arm: &Arm, is_merge_driven: bool, knobs: &Knobs, root: &Path) -> Cel
     cell
 }
 
-// what the composed posture does under a state-shaped stream, by flavour and by merge
+// what the composed posture does under a state-shaped stream, by flavour
 //
 // Measurement only, apart from the checks that the run was a run: every key the stream
 // asked for came back, and the volume ended holding something.
@@ -922,16 +898,14 @@ fn composed_posture() {
         },
     );
     println!(
-        "trigger: rewrite at {:.2} dead, collapse at {:.2}, footers held {} MiB, pace {} MB/s",
+        "trigger: rewrite at {:.2} dead, footers held {} MiB, pace {} MB/s",
         knobs.compact_dead_ratio,
-        knobs.merge_dead_ratio,
         knobs.footer_cache_bytes / (1 << 20),
         knobs.compact_mbps,
     );
     println!(
-        "{:>15} {:>9} {:>11} {:>8} {:>8} {:>11} {:>10} {:>13} {:>10} {:>12} {:>9} {:>9} {:>7} {:>10}",
+        "{:>15} {:>11} {:>8} {:>8} {:>11} {:>10} {:>13} {:>10} {:>12} {:>9} {:>9} {:>7}",
         "arm",
-        "merge",
         "writes/s",
         "p50 us",
         "p99 us",
@@ -943,53 +917,31 @@ fn composed_posture() {
         "runs avg",
         "runs max",
         "merges",
-        "freed MiB",
     );
 
     for arm in &ARMS {
-        for is_merge_driven in [true, false] {
-            let name = match is_merge_driven {
-                true => "driven",
-                false => "standing",
-            };
-            let cell = run_cell(
-                arm,
-                is_merge_driven,
-                &knobs,
-                &root.join(format!("{}-{name}", arm.name)),
-            );
+        let cell = run_cell(arm, &knobs, &root.join(arm.name));
 
-            assert!(cell.written > 0, "{} {name} wrote nothing", arm.name);
-            assert_eq!(
-                cell.misses, 0,
-                "{} {name} lost keys the stream had written",
-                arm.name
-            );
-            assert!(
-                cell.live > 0,
-                "{} {name} ended holding no live bytes",
-                arm.name
-            );
-            assert!(cell.on_disk > 0, "{} {name} left nothing on disk", arm.name);
+        assert!(cell.written > 0, "{} wrote nothing", arm.name);
+        assert_eq!(cell.misses, 0, "{} lost keys the stream had written", arm.name);
+        assert!(cell.live > 0, "{} ended holding no live bytes", arm.name);
+        assert!(cell.on_disk > 0, "{} left nothing on disk", arm.name);
 
-            println!(
-                "{:>15} {:>9} {:>11.0} {:>8.1} {:>8.1} {:>11.3} {:>10.3} {:>13.1} {:>9.2}x {:>12.1} {:>9.1} {:>9} {:>7} {:>10.1}",
-                arm.name,
-                name,
-                cell.writes_per_sec(),
-                cell.get_p50 as f64 / 1e3,
-                cell.get_p99 as f64 / 1e3,
-                cell.searches_per_get(),
-                cell.reads_per_get(),
-                cell.resident as f64 / (1 << 20) as f64,
-                cell.disk_over_live(),
-                cell.rewritten as f64 / (1 << 20) as f64,
-                cell.standing_mean(),
-                cell.standing_max(),
-                cell.merges,
-                cell.collapsed as f64 / (1 << 20) as f64,
-            );
-        }
+        println!(
+            "{:>15} {:>11.0} {:>8.1} {:>8.1} {:>11.3} {:>10.3} {:>13.1} {:>9.2}x {:>12.1} {:>9.1} {:>9} {:>7}",
+            arm.name,
+            cell.writes_per_sec(),
+            cell.get_p50 as f64 / 1e3,
+            cell.get_p99 as f64 / 1e3,
+            cell.searches_per_get(),
+            cell.reads_per_get(),
+            cell.resident as f64 / (1 << 20) as f64,
+            cell.disk_over_live(),
+            cell.rewritten as f64 / (1 << 20) as f64,
+            cell.standing_mean(),
+            cell.standing_max(),
+            cell.merges,
+        );
     }
     // Nothing is asserted about the timing columns: a microsecond figure held against
     // another would fail on a busy laptop and prove nothing about the posture.

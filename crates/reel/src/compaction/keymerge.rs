@@ -19,7 +19,7 @@ use crate::reel::Reel;
 
 /// What one key-run merge did
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct KeyMergeReport {
+pub struct MergeReport {
     /// Runs the merge read: data segments and key runs together
     pub runs_merged: u64,
 
@@ -103,7 +103,7 @@ pub fn merge_into_key_run(
     index: &ReelIndex,
     segments: &[SegmentId],
     runs: &[Arc<KeyRun>],
-) -> Result<KeyMergeReport> {
+) -> Result<MergeReport> {
     let shared = reel.shared();
     let mut claims: Vec<PassClaim<'_>> = Vec::new();
     let mut sources = Vec::new();
@@ -134,14 +134,14 @@ pub fn merge_into_key_run(
                 continue;
             }
             let Some(claim) = compactor.claim(*segment) else {
-                return Ok(KeyMergeReport::default());
+                return Ok(MergeReport::default());
             };
             claims.push(claim);
         }
     }
     sources.extend(runs.iter().map(|run| Source::Keys(Arc::clone(run))));
     if sources.len() < 2 {
-        return Ok(KeyMergeReport::default());
+        return Ok(MergeReport::default());
     }
     // Taken under the claims, so it holds for the whole merge: a row naming a segment
     // outside it names a record a rewrite moved or dropped.
@@ -165,9 +165,9 @@ pub fn merge_into_key_run(
     let root = shared.volumes.roots()[0].clone();
     let id = index.key_runs().draw_id();
     let mut writer = RunWriter::create(&shared.driver, &root, id)?;
-    let mut report = KeyMergeReport {
+    let mut report = MergeReport {
         runs_merged: sources.len() as u64,
-        ..KeyMergeReport::default()
+        ..MergeReport::default()
     };
     let written = (|| -> Result<()> {
         for (column, width) in &columns {
@@ -213,7 +213,7 @@ fn merge_column(
     column: ColumnId,
     standing: &HashSet<SegmentId>,
     writer: &mut RunWriter<'_>,
-    report: &mut KeyMergeReport,
+    report: &mut MergeReport,
 ) -> Result<()> {
     let mut cursors: Vec<Cursor<'_>> = Vec::with_capacity(sources.len());
     for source in sources {

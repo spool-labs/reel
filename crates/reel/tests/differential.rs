@@ -10,7 +10,7 @@ mod harness;
 
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::{
-    ByteCount, CompactRate, FenceResidency, IndexResidency, Preallocate, ReelConfig, SyncPolicy,
+    ByteCount, FenceResidency, IndexResidency, Preallocate, ReelConfig, SyncPolicy,
     ThreadBudget,
 };
 
@@ -47,14 +47,6 @@ const PAGED_SEGMENT_BYTES: u64 = 16 * 1024;
 /// Length of a paged stream, long enough to seal several segments at that size
 const PAGED_STREAM_LEN: usize = 640;
 
-/// Dead share of the standing runs a maintained stream's ticks merge at
-///
-/// At nothing, so every tick that finds a stack collapses it: a stream of a few hundred
-/// ops leaves a shallower stack than a running volume's, and only some seeds would reach
-/// a threshold worth the name. What this cell asks is whether a tick-driven merge still
-/// serves what the oracle serves, not where the threshold belongs.
-const MAINTAINED_MERGE_RATIO: f64 = 0.0;
-
 fn reel_config(active_tails: u32) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT_BYTES),
@@ -89,40 +81,14 @@ fn paged_config(active_tails: u32) -> ReelConfig {
     }
 }
 
-/// A paged volume that rewrites its sealed segments in key order
-///
-/// The rate gate is lifted because a stream this small would otherwise spend its passes
-/// held rather than rewriting.
-fn rewriting_config(active_tails: u32) -> ReelConfig {
-    ReelConfig {
-        rewrite_on_seal: true,
-        compact_mbps: CompactRate::Mbps(100_000),
-        ..paged_config(active_tails)
-    }
-}
-
-/// The same rewriting volume with the merge armed, so a caller may collapse its runs
-///
-/// The dead ratio is at one so compaction reclaims only wholly dead segments, which is
-/// what leaves the half-live runs standing for a merge to find.
+/// A paged volume that seals enough segments for its walk to pass the merge depth
 fn merging_config(active_tails: u32) -> ReelConfig {
     ReelConfig {
-        merge_sorted_runs: true,
-        compact_dead_ratio: 1.0,
         // Half the paged segment, the smallest a batch and its block fit: the
-        // stream's tails resume across its reopens rather than leaving
-        // orphans, so rolls have to make the runs the merge collapses, and at
-        // the paged size the stream barely fills one segment.
+        // stream's tails resume across its reopens, so rolls have to make the
+        // segments a merge folds, and at the paged size the stream seals too few.
         segment_bytes: ByteCount::from_bytes(8 * 1024),
-        ..rewriting_config(active_tails)
-    }
-}
-
-/// The same merging volume with the trigger a maintained stream's ticks decide on
-fn maintained_config(active_tails: u32) -> ReelConfig {
-    ReelConfig {
-        merge_dead_ratio: MAINTAINED_MERGE_RATIO,
-        ..merging_config(active_tails)
+        ..paged_config(active_tails)
     }
 }
 
@@ -307,12 +273,12 @@ fn fenced_paged_leads() {
     }
 }
 
-// a volume whose runs a merge collapses serves what one that never merged serves
+// a volume whose walk a key merge folds serves what one that never merged serves
 #[test]
 #[cfg(not(miri))]
 fn merged_single_tail() {
     for seed in SEEDS {
-        let mut fixture = Differential::open(*seed, merging_config(1));
+        let mut fixture = Differential::open_merging(*seed, merging_config(1));
         fixture.run_stream(&op_stream::generate(*seed, PAGED_STREAM_LEN));
         fixture.assert_paged_out();
         fixture.assert_merged_runs();
@@ -324,31 +290,9 @@ fn merged_single_tail() {
 #[cfg(not(miri))]
 fn merged_multi_tail() {
     for seed in SEEDS {
-        let mut fixture = Differential::open(*seed, merging_config(4));
+        let mut fixture = Differential::open_merging(*seed, merging_config(4));
         fixture.run_stream(&op_stream::generate(*seed, PAGED_STREAM_LEN));
         fixture.assert_paged_out();
-        fixture.assert_merged_runs();
-    }
-}
-
-// a volume whose own ticks collapse its runs serves what one that never merged serves
-#[test]
-#[cfg(not(miri))]
-fn maintained_merge_single_tail() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open_maintained(*seed, maintained_config(1));
-        fixture.run_stream(&op_stream::generate(*seed, PAGED_STREAM_LEN));
-        fixture.assert_merged_runs();
-    }
-}
-
-// the same at four tails, where a key can seal in one tail and be rewritten in another
-#[test]
-#[cfg(not(miri))]
-fn maintained_merge_multi_tail() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open_maintained(*seed, maintained_config(4));
-        fixture.run_stream(&op_stream::generate(*seed, PAGED_STREAM_LEN));
         fixture.assert_merged_runs();
     }
 }

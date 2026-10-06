@@ -50,7 +50,7 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
     footer.sealed_at = shared.lsn.peek();
     let written = (|| -> Result<()> {
         let (rows, tail) = footer.pack_apart(
-            shared.filter_bits_for(active.handle.id()),
+            shared.config.seal_filter_bits(),
             shared.config.seal_fences(),
         )?;
         // The rows go down from the partitions that hold them and come back after.

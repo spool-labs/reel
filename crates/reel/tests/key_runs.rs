@@ -62,7 +62,6 @@ fn config(tails: u32, dead_ratio: f64) -> ReelConfig {
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(tails),
         index: IndexResidency::Paged,
-        key_runs: true,
         compact_dead_ratio: dead_ratio,
         compact_mbps: CompactRate::Mbps(100_000),
         ..ReelConfig::default()

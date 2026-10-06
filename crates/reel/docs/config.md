@@ -20,8 +20,6 @@ and your own flow through them before trusting a line of it.
 | `active_tails` | `auto`, which is already one tail per fast volume | writers contend on one appender, and then upward only |
 | `compact_mbps` | `auto` | foreground p99 has a budget, then pick a cap off the curve below |
 | `compact_dead_ratio` | `0.50` | reclaim is not keeping up with the debt |
-| `rewrite_on_seal` + `merge_sorted_runs` | both on for a read-heavy volume | a write-only volume that is never searched |
-| `merge_dead_ratio` | `0.50` | leave it alone until the merge bounds its output; see the runs section |
 | `sync_bytes` (the `sync` field in code) | whatever the caller promises its own users | never for throughput |
 
 ## The read path
@@ -129,8 +127,9 @@ Warm point reads on the same box read 0.96 to 1.14 us resident against 1.5 to
 column as what a volume too large for memory pays rather than as an argument
 against paging.
 
-That p99 is not all paging, which is the next section: this arm was carrying a
-stack of 427 standing runs that never collapsed, at 15.9 asks per get.
+That p99 is not all paging: this arm searched a stack of 427 standing runs on
+every miss, at 15.9 asks per get. A paged get now asks the spot index first, which
+places a sealed key's record for one device read.
 
 ## The write path
 
@@ -204,22 +203,13 @@ what it reclaims: divide before sizing a cap against a deadline. And greedy
 selection multiplies the budget in the other direction, because segments are
 picked when they are mostly dead, so reclaimed bytes run ahead of copied bytes.
 
-### The defaults do not collapse the runs, and that is the one to watch
+### Walks merge eight runs at most
 
-`compact_dead_ratio` and `merge_dead_ratio` are separate triggers over the same
-bytes, and they compose. In the control run above, with both at their 0.50
-defaults: **427 standing runs and zero merges.** Reclaim at 0.50 keeps the
-standing stack's dead share under the collapse trigger, so the collapse never
-fires, and the paged arm paid for it at 15.9 reads per get and a 10.8 ms p99.
-
-Asks per get equal the standing run count for any key that misses, because a
-segment number is not a version and every candidate has to be asked. So the
-symptom is reader-visible before it is fatal: `ReelStore::filter_probes` reports
-asks per get, and `sorted_run_dead_ratio` reports the share the trigger is being
-compared against.
-
-`merge_sorted_runs` requires `rewrite_on_seal` and is refused without it. A
-volume that does not seal by rewriting produces nothing sorted to merge.
+A paged volume needs no merge knob. Once more than eight runs stand over one key,
+the maintenance tick merges the walk's runs into a key run, and a walk reads it in
+place of the footers it covers. `merge_when_due` runs the same merge for a caller.
+`why-not-an-lsm.md` has the design and its W9 numbers, and `format.md` has the
+file.
 
 ## What the config cannot choose for you
 

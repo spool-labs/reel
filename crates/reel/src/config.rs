@@ -15,7 +15,6 @@ use crate::error::{ReelError, Result};
 const DEFAULT_SEGMENT_GIB: u64 = 1;
 const DEFAULT_ALLOC_CHUNK_MIB: u64 = 64;
 const DEFAULT_COMPACT_DEAD_RATIO: f64 = 0.50;
-const DEFAULT_MERGE_DEAD_RATIO: f64 = 0.50;
 const DEFAULT_SCRUB_MBPS: u64 = 64;
 
 /// Sealed descriptors the reader cache holds, unless the open-file limit says fewer
@@ -392,21 +391,6 @@ pub struct ReelConfig {
     /// Which plane a window of a large record is read on
     pub ranged_reads: RangedReads,
 
-    /// Rewrite a segment into key order once it seals, then drop the log copy
-    pub rewrite_on_seal: bool,
-
-    /// Collapse the volume's sorted runs into one, on a caller's pass and on the tick
-    pub merge_sorted_runs: bool,
-
-    /// Merge the walk's runs into key runs, leaving every record where it was written
-    ///
-    /// A key run holds the newest row of each key and the place its record lies, so a
-    /// merge moves keys and places alone and the spot index never hears of it.
-    pub key_runs: bool,
-
-    /// Dead share of the standing sorted runs at which the tick collapses them
-    pub merge_dead_ratio: f64,
-
     /// Whether an awaited whole-record read asks the page cache before it queues
     pub point_reads: PointReads,
 
@@ -474,10 +458,6 @@ impl Default for ReelConfig {
             repair: RepairPath::Peers,
             map_above: None,
             ranged_reads: RangedReads::Cached,
-            rewrite_on_seal: false,
-            merge_sorted_runs: false,
-            key_runs: false,
-            merge_dead_ratio: DEFAULT_MERGE_DEAD_RATIO,
             point_reads: PointReads::Queued,
             footer_cache: ByteCount::mb(DEFAULT_FOOTER_CACHE_MIB),
             active_tails: ThreadBudget::Auto,
@@ -506,8 +486,8 @@ impl ReelConfig {
 
     /// Compaction passes this volume runs at once, one for every two tails
     ///
-    /// Ingest spreads over the tails, so the passes that sort and merge what they land
-    /// scale with them, and a one-tail volume keeps its single pass. A reserved tail is
+    /// Ingest spreads over the tails, so the passes that reclaim what they land scale
+    /// with them, and a one-tail volume keeps its single pass. A reserved tail is
     /// leased by a bit in a word, which caps the passes at 64.
     pub fn compact_passes(&self) -> usize {
         self.tail_count().div_ceil(2).min(64)
@@ -572,12 +552,6 @@ impl ReelConfig {
             ));
         }
 
-        if !(0.0..=1.0).contains(&self.merge_dead_ratio) {
-            return Err(ReelError::Config(
-                "merge_dead_ratio must be between zero and one".to_string(),
-            ));
-        }
-
         if self.map_above.is_some() && self.io_backend == IoBackend::UringDirect {
             return Err(ReelError::Config(
                 "map_above and a direct volume contradict each other: a mapping reads the page cache a direct volume bypasses".to_string(),
@@ -607,12 +581,6 @@ impl ReelConfig {
         if self.point_reads == PointReads::Probed && self.io_backend == IoBackend::UringDirect {
             return Err(ReelError::Config(
                 "point_reads and a direct volume contradict each other: a direct volume holds no page cache to ask".to_string(),
-            ));
-        }
-
-        if self.merge_sorted_runs && !self.rewrite_on_seal {
-            return Err(ReelError::Config(
-                "merge_sorted_runs needs rewrite_on_seal: a volume that does not seal by rewriting produces no sorted runs, and a merge over segments that only look sorted would rewrite the volume for nothing".to_string(),
             ));
         }
 
@@ -888,17 +856,6 @@ mod tests {
     fn ratio_out_of_range() {
         let config = ReelConfig {
             compact_dead_ratio: 1.5,
-            ..ReelConfig::default()
-        };
-
-        assert!(config.validate().is_err());
-    }
-
-    // a merge ratio outside the unit interval is rejected
-    #[test]
-    fn merge_ratio_out_of_range() {
-        let config = ReelConfig {
-            merge_dead_ratio: -0.5,
             ..ReelConfig::default()
         };
 

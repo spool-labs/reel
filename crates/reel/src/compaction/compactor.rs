@@ -14,7 +14,7 @@ use crate::config::{ReelConfig, RepairPath, VolumeClass};
 use crate::error::Result;
 use crate::format::band::Band;
 use crate::format::column::RecordKey;
-use crate::format::footer::{FooterPartition, SegmentFooter, FIXED_TAIL_LEN};
+use crate::format::footer::{SegmentFooter, FIXED_TAIL_LEN};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{peek_key_width, read_u32_le, RecordHeader, HEADER_LEN};
@@ -307,20 +307,6 @@ struct ScrubStep {
     resume_at: Option<(u64, u64)>,
 }
 
-/// What a sealed segment's footer settles for good
-///
-/// Neither answer can change: the footer is down before either is asked, and a segment
-/// is retired rather than rewritten in place. A tick asks both of every standing segment,
-/// so they are derived once per segment rather than read out of the file per walk.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FooterFacts {
-    /// Every partition's rows name ascending offsets, so the segment reads as one run
-    pub is_sorted_run: bool,
-
-    /// The rows in key order name offsets that do not ascend, so a rewrite has work
-    pub is_out_of_order: bool,
-}
-
 /// The maintenance plane for one volume, shared by every reel it holds
 pub struct Compactor {
     /// Free-space pressure and tiering for the volume
@@ -352,10 +338,6 @@ pub struct Compactor {
 
     /// Segments a pass left standing for rot, against the dead bytes it left them at
     rotted: Mutex<std::collections::HashMap<SegmentId, u64>>,
-
-    /// What each sealed segment's footer said, so a walk over the standing ones reads
-    /// none of them again
-    sealed_facts: Mutex<std::collections::HashMap<SegmentId, FooterFacts>>,
 
     /// Read buffers the last pass finished with, which the next pass reads into
     spare: Mutex<Vec<Vec<u8>>>,
@@ -408,56 +390,12 @@ impl Compactor {
         lock(&self.rotted).insert(segment, dead);
     }
 
-    /// What one sealed segment's footer says, read out of the file only on the first ask
-    ///
-    /// Nothing where the segment has no footer to read, and nothing held either: a seal
-    /// the device refused gets another, and an answer kept here would outlive the refusal.
-    pub fn facts_of(
-        &self,
-        shared: &Arc<ReelShared>,
-        segment: SegmentId,
-    ) -> Result<Option<FooterFacts>> {
-        if let Some(facts) = lock(&self.sealed_facts).get(&segment).copied() {
-            return Ok(Some(facts));
-        }
-        // read off the lock, or every miss holds the map across a device read
-        let Some(footer) = shared.footer_of(segment)? else {
-            return Ok(None);
-        };
-        let facts = footer_facts(&footer);
-        lock(&self.sealed_facts).insert(segment, facts);
-        Ok(Some(facts))
-    }
-
-    /// Whether a merge can take this segment now: a sorted run no pass is holding
-    pub fn is_mergeable(&self, shared: &Arc<ReelShared>, segment: SegmentId) -> bool {
-        !lock(&self.in_flight).contains(&segment)
-            && self
-                .facts_of(shared, segment)
-                .ok()
-                .flatten()
-                .is_some_and(|facts| facts.is_sorted_run)
-    }
-
-    /// Drop what a retired segment's footer settled, since the file is going with it
-    pub fn forget_facts(&self, segment: SegmentId) {
-        lock(&self.sealed_facts).remove(&segment);
-    }
-
     /// Book the runs one merge pass read together
     ///
     /// A pass the tick drove hands its report to nobody, so this is where a volume says
     /// whether its runs are being collapsed at all.
     pub fn note_merged_runs(&self, runs: u64) {
         self.metrics.record_merge(runs);
-    }
-
-    /// A meter for one pass of another kind, on the gate compaction is paced by
-    ///
-    /// The merge draws on the governor compaction draws on, since both are the same
-    /// device under the same foreground and an operator sets one budget.
-    pub fn pace(&self) -> PassPace<'_> {
-        self.compact_rate.pace()
     }
 
     /// Whether a foreground write of this size fits outside the reserve
@@ -491,7 +429,6 @@ impl Compactor {
             scrub_guard: Mutex::new(()),
             in_flight: Mutex::new(std::collections::HashSet::new()),
             rotted: Mutex::new(std::collections::HashMap::new()),
-            sealed_facts: Mutex::new(std::collections::HashMap::new()),
             spare: Mutex::new(Vec::new()),
             // nothing about the sweep survives the process, so the rotation comes from
             // something that differs between runs of it
@@ -551,8 +488,6 @@ impl Compactor {
     }
 
     /// The sealed segment with the highest dead fraction past the threshold
-    ///
-    /// A clustered volume with nothing to reclaim falls back to a rewrite for order.
     pub fn select_target(
         &self,
         reel: &Reel,
@@ -563,16 +498,10 @@ impl Compactor {
         if index.has_pending_covers() {
             return None;
         }
-        if let Some(ranked) = self.select_ranked(reel, index, effective_dead_ratio, cue_floor) {
-            return Some(ranked);
-        }
-        self.select_unsorted(reel, index, cue_floor)
+        self.select_ranked(reel, index, effective_dead_ratio, cue_floor)
     }
 
     /// A sealed segment with nothing live left in it, which retires by unlink
-    ///
-    /// The ranking alone: a clustering rewrite copies every live record forward, which
-    /// is the opposite of an unlink.
     pub fn select_whole_dead(
         &self,
         reel: &Reel,
@@ -659,63 +588,6 @@ impl Compactor {
         best
     }
 
-    /// A sealed segment whose records are not in key order, for a clustered volume
-    ///
-    /// The other reason to rewrite: not to reclaim space but to put records in the order
-    /// their keys are in, which is what makes a segment a sorted run. A segment is
-    /// already one exactly when the footer's rows in key order have ascending offsets.
-    fn select_unsorted(
-        &self,
-        reel: &Reel,
-        index: &ReelIndex,
-        cue_floor: Option<Lsn>,
-    ) -> Option<(SegmentId, f64)> {
-        if !reel.shared().config.rewrite_on_seal {
-            return None;
-        }
-        let shared = reel.shared();
-        let (segments, _) = index.ranking();
-        let pinned = lock(&self.rotted).clone();
-        let owed = shared.pending_seals();
-        // claimed under the lock the choice is made under, as the ranked walk does, or
-        // passes running side by side leave with the same segment
-        let mut claimed = lock(&self.in_flight);
-        for (segment, bytes) in segments {
-            if shared.is_held(segment)
-                || claimed.contains(&segment)
-                || bytes.total() == 0
-                || owed.contains(&segment)
-            {
-                continue;
-            }
-            // rewriting for order meets the same rot as rewriting for space
-            if pinned.get(&segment) == Some(&bytes.dead) {
-                continue;
-            }
-            if cue_floor.is_some_and(|floor| {
-                index
-                    .min_lsn_of(segment)
-                    .is_some_and(|oldest| oldest <= floor)
-            }) {
-                continue;
-            }
-            // which order a sealed footer's offsets are in was settled when it went down
-            let Some(facts) = self.facts_of(shared, segment).ok().flatten() else {
-                continue;
-            };
-            if !facts.is_out_of_order {
-                continue;
-            }
-            // the same stale copy the ranked walk guards against, for the same reason
-            if shared.pending_seals().contains(&segment) {
-                continue;
-            }
-            claimed.insert(segment);
-            return Some((segment, 0.0));
-        }
-        None
-    }
-
     /// Rewrite one sealed segment's live records and retire it
     ///
     /// A segment whose file is already gone leaves nothing to reclaim, so what it left
@@ -748,7 +620,6 @@ impl Compactor {
             Err(error) if is_missing(&error) => {
                 index.forget_segment(segment);
                 lock(&self.rotted).remove(&segment);
-                self.forget_facts(segment);
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -760,7 +631,6 @@ impl Compactor {
             None => {
                 index.forget_segment(segment);
                 lock(&self.rotted).remove(&segment);
-                self.forget_facts(segment);
                 return Ok(());
             }
         };
@@ -775,9 +645,9 @@ impl Compactor {
         // the writer paid for is undone otherwise: every rewrite would put a window's
         // records back into the mixture they were kept out of.
         let band = band_of(shared, &source)?;
-        // A volume that keeps tails back writes each pass into one of its own, since a
-        // run copied in key order stops being one the moment anything else lands inside
-        // it. Otherwise the survivors route the way a fresh write of the same band would.
+        // A volume that keeps tails back writes each pass into one of its own, the only
+        // tail that answers to a named tier. Otherwise the survivors route the way a
+        // fresh write of the same band would.
         let lease = reel.lease_reserved();
         if reel.keeps_reserved() && lease.is_none() {
             return Ok(());
@@ -882,7 +752,6 @@ impl Compactor {
         crate::sync::rendezvous::at("compaction/retire");
         index.forget_segment(segment);
         lock(&self.rotted).remove(&segment);
-        self.forget_facts(segment);
         shared.fd_cache.remove(segment);
         // the footer goes with the file, or it answers for a segment that is not there
         shared.footers.forget(segment);
@@ -1517,9 +1386,9 @@ impl Compactor {
 
 /// One footer's records in key order, per column, as offset and length pairs
 ///
-/// The order a rewrite applies its copies in, and the order the sortedness of a segment
-/// is read off. Nothing where a row will not decode: the records behind such a footer
-/// are still there to be scanned, so the order is given up rather than the pass.
+/// The order a rewrite applies its copies in. Nothing where a row will not decode: the
+/// records behind such a footer are still there to be scanned, so the pass reads them in
+/// offset order.
 fn footer_order(footer: &SegmentFooter) -> Option<(Vec<(u32, u32)>, u64)> {
     let mut order = Vec::with_capacity(footer.entry_count());
     let mut widest = 0usize;
@@ -1533,37 +1402,6 @@ fn footer_order(footer: &SegmentFooter) -> Option<(Vec<(u32, u32)>, u64)> {
         }
     }
     Some((order, HEADER_LEN as u64 + widest as u64))
-}
-
-/// Everything about a sealed segment that follows from its footer alone
-///
-/// A footer whose rows will not decode names no order at all, and a rewrite for order
-/// has nothing to put such a segment into, so it is left where a scan can still read it.
-fn footer_facts(footer: &SegmentFooter) -> FooterFacts {
-    FooterFacts {
-        is_sorted_run: footer.partitions.iter().all(FooterPartition::is_sorted_run),
-        is_out_of_order: is_out_of_order(footer),
-    }
-}
-
-/// Whether a footer's rows, taken in key order, ever step back in offset
-///
-/// Read off the rows where they lie, so a question with a yes or no answer builds no
-/// list of them. False where a row will not decode, as a footer with no order has none
-/// to be out of.
-fn is_out_of_order(footer: &SegmentFooter) -> bool {
-    let mut last = 0u32;
-    let mut steps_back = false;
-    for partition in &footer.partitions {
-        for row in 0..partition.len() {
-            let Ok(row) = partition.row_at(row) else {
-                return false;
-            };
-            steps_back |= row.offset < last;
-            last = row.offset;
-        }
-    }
-    steps_back
 }
 
 /// Whether a tombstone has to come across, or nothing it shadows can still turn up
@@ -3106,118 +2944,6 @@ mod tests {
             Some(SegmentId(1)),
             "a segment with nothing live left stays pinned",
         );
-    }
-
-    // the drain takes segments it can unlink, never a rewrite for order
-    #[test]
-    fn the_drain_never_takes_a_clustering_rewrite() {
-        let clustered = ReelConfig {
-            rewrite_on_seal: true,
-            ..settings()
-        };
-        let fixture = fixture(clustered);
-        // descending keys, so the segment's offsets and its key order disagree
-        for byte in (1..=4u8).rev() {
-            put(&fixture, byte, vec![byte; 4096]);
-        }
-        seal(&fixture);
-        fixture.reel.flush().expect("flush");
-
-        assert!(
-            fixture
-                .compactor
-                .select_target(&fixture.reel, &fixture.index, 1.0, None)
-                .is_some(),
-            "a clustered volume offers its unsorted segment to a ranked selection",
-        );
-        assert!(
-            fixture
-                .compactor
-                .select_whole_dead(&fixture.reel, &fixture.index, None)
-                .is_none(),
-            "the drain took a segment with live records in it",
-        );
-    }
-
-    // the memo answers a sealed segment's footer facts the way a fresh read does
-    #[test]
-    fn memoized_footer_facts_match_a_fresh_read() {
-        // one byte of footer cache, so a second segment's footer gives up the first and
-        // nothing but the memo can answer the whole set twice without a read
-        let clustered = ReelConfig {
-            rewrite_on_seal: true,
-            footer_cache: ByteCount::from_bytes(1),
-            ..settings()
-        };
-        let fixture = fixture(clustered);
-        // descending keys, so this segment's key order and its offsets disagree
-        for byte in (1..=4u8).rev() {
-            put(&fixture, byte, vec![byte; 4096]);
-        }
-        seal(&fixture);
-        // ascending keys, so this one is already a run
-        for byte in 5..=8u8 {
-            put(&fixture, byte, vec![byte; 4096]);
-        }
-        seal(&fixture);
-        fixture.reel.flush().expect("flush");
-
-        let shared = fixture.reel.shared();
-        let sealed: Vec<SegmentId> = fixture
-            .index
-            .segments_snapshot()
-            .into_iter()
-            .map(|(segment, _)| segment)
-            .filter(|segment| shared.footer_of(*segment).expect("footer").is_some())
-            .collect();
-        assert!(
-            sealed.len() >= 2,
-            "the volume sealed {} segments",
-            sealed.len()
-        );
-
-        let mut memoized = Vec::new();
-        for segment in &sealed {
-            let facts = fixture
-                .compactor
-                .facts_of(shared, *segment)
-                .expect("facts")
-                .expect("sealed");
-            let footer = shared.footer_of(*segment).expect("footer").expect("sealed");
-            assert_eq!(
-                facts,
-                footer_facts(&footer),
-                "segment {}'s memo disagrees with its own footer",
-                segment.as_u32(),
-            );
-            memoized.push(facts);
-        }
-        assert!(
-            memoized.iter().any(|facts| facts.is_out_of_order),
-            "no segment read as out of order, so the memo was never asked the question",
-        );
-        assert!(
-            memoized.iter().any(|facts| facts.is_sorted_run),
-            "no segment read as a run"
-        );
-
-        let before = fixture.sim.read_count();
-        for (segment, facts) in sealed.iter().zip(&memoized) {
-            let held = fixture.compactor.facts_of(shared, *segment).expect("facts");
-            assert_eq!(held.as_ref(), Some(facts));
-        }
-        assert_eq!(
-            fixture.sim.read_count(),
-            before,
-            "a held answer still went to the device"
-        );
-
-        // what a retire takes out, a fresh read puts back the same
-        for (segment, facts) in sealed.iter().zip(&memoized) {
-            fixture.compactor.forget_facts(*segment);
-            let derived = fixture.compactor.facts_of(shared, *segment).expect("facts");
-            assert_eq!(derived.as_ref(), Some(facts));
-        }
     }
 
     // the rate is what decides how much of the volume a sweep covers

@@ -17,7 +17,6 @@ mod handover_cost;
 mod interference;
 mod layout;
 mod mapped_reads;
-mod merge_rate;
 mod negative_price;
 mod open_time;
 mod past_ram;
@@ -26,7 +25,6 @@ mod preallocate_cost;
 mod publish_cost;
 mod repoint_hold;
 mod segment_price;
-mod tick_facts;
 
 struct Probe {
     name: &'static str,
@@ -140,10 +138,6 @@ const PROBES: &[Probe] = &[
         mapped_reads::mapped_over_unmapped_warm,
     ),
     opt_in(
-        "merge_rate::merge_by_run_count",
-        merge_rate::merge_by_run_count,
-    ),
-    opt_in(
         "negative_price::a_miss_is_answered_without_the_lock",
         negative_price::a_miss_is_answered_without_the_lock,
     ),
@@ -179,10 +173,6 @@ const PROBES: &[Probe] = &[
     opt_in("segment_price::read_side", segment_price::read_side),
     opt_in("segment_price::write_side", segment_price::write_side),
     opt_in("segment_price::tick_side", segment_price::tick_side),
-    opt_in(
-        "tick_facts::pricing_the_stack_by_segment_count",
-        tick_facts::pricing_the_stack_by_segment_count,
-    ),
 ];
 
 #[cfg(target_os = "linux")]

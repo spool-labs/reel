@@ -112,8 +112,10 @@ Terms this codebase uses with meanings a newcomer cannot guess.
 - **tail**: one open segment being appended to, with its own file and its own
   write head. A volume runs several, and writers spread across them so the
   kernel never serializes them on a shared inode.
-- **run**: two senses. A *sorted run* is a segment whose records sit in key
-  order, which is what sealing by rewrite produces. A *dead run* is a
+- **run**: three senses. A *sorted run* is a segment whose records sit in key
+  order, which is what a compaction rewrite produces. A *key run* is a file of
+  sorted key rows that a paged walk reads in place of the footers it covers. A
+  *dead run* is a
   contiguous stretch of dead bytes inside a segment, which is what a hole punch
   can give back.
 - **cover**: the in-memory footprint of a range delete. One record stands for

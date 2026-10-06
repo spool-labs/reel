@@ -252,18 +252,10 @@ impl SealedRanges {
             })
     }
 
-    /// The most sealed segments any one key falls inside
+    /// The most sealed segments any one key falls inside, leaving out the covered ones
     ///
-    /// What a walk from that key merges, before any segment is passed over. A merged
-    /// run's segments cover their own stretches and add one between them.
-    pub fn depth(&self) -> usize {
-        self.depth_past(&std::collections::HashSet::new())
-    }
-
-    /// The most sealed segments any one key falls inside, leaving out the ones named
-    ///
-    /// A segment a key run covers is no run of the walk's own, so the walk's depth leaves
-    /// it out and counts the key run instead.
+    /// What a walk from that key merges. A segment a key run covers is no run of the
+    /// walk's own, so the walk's depth leaves it out and counts the key run instead.
     pub fn depth_past(&self, covered: &std::collections::HashSet<SegmentId>) -> usize {
         let sealed = read(&self.ranges);
         let mut open: std::collections::BinaryHeap<std::cmp::Reverse<&[u8]>> = std::collections::BinaryHeap::new();
@@ -277,28 +269,6 @@ impl SealedRanges {
             deepest = deepest.max(open.len());
         }
         deepest
-    }
-
-    /// The sealed segments in layers, each a set whose key ranges never meet
-    ///
-    /// Taken in order of their low keys, each segment joins the first layer it does not
-    /// overlap, which gives as many layers as the depth. A merged run's segments share
-    /// a layer, and a segment holding keys from across the column stands alone in one.
-    pub fn layers(&self) -> Vec<Vec<SegmentId>> {
-        let sealed = read(&self.ranges);
-        let mut layers: Vec<(&[u8], Vec<SegmentId>)> = Vec::new();
-        for run in &sealed.by_key {
-            let lowest = run.span.lowest.as_slice();
-            let highest = run.span.highest.as_slice();
-            match layers.iter_mut().find(|(reach, _)| *reach < lowest) {
-                Some((reach, members)) => {
-                    *reach = highest;
-                    members.push(run.segment);
-                }
-                None => layers.push((highest, vec![run.segment])),
-            }
-        }
-        layers.into_iter().map(|(_, members)| members).collect()
     }
 
     /// The segments whose keys fall inside a range, oldest first
@@ -562,36 +532,22 @@ mod tests {
         KeyBytes::new(&[byte, 0, 0, 0, 0, 0, 0, 0]).expect("key")
     }
 
-    // the depth is the most ranges any one key falls inside, a merged run counting once
+    // the depth is the most ranges any one key falls inside, side by side ranges counting once
     #[test]
     fn depth_counts_the_ranges_over_one_key() {
         let ranges = SealedRanges::new();
-        assert_eq!(ranges.depth(), 0);
+        let depth = |ranges: &SealedRanges| ranges.depth_past(&std::collections::HashSet::new());
+        assert_eq!(depth(&ranges), 0);
         ranges.note(SegmentId(1), key(0), key(9));
         ranges.note(SegmentId(2), key(10), key(19));
         ranges.note(SegmentId(3), key(20), key(29));
-        assert_eq!(ranges.depth(), 1, "a merged run's segments sit side by side");
+        assert_eq!(depth(&ranges), 1, "side by side ranges count once");
         ranges.note(SegmentId(4), key(5), key(25));
-        assert_eq!(ranges.depth(), 2);
+        assert_eq!(depth(&ranges), 2);
         ranges.note(SegmentId(5), key(0), key(30));
-        assert_eq!(ranges.depth(), 3);
+        assert_eq!(depth(&ranges), 3);
         ranges.note(SegmentId(6), key(30), key(40));
-        assert_eq!(ranges.depth(), 3, "a range meeting another at one key overlaps it there");
-    }
-
-    // segments that never meet share a layer, and one reaching over others stands alone
-    #[test]
-    fn layers_split_the_segments_by_overlap() {
-        let ranges = SealedRanges::new();
-        ranges.note(SegmentId(1), key(0), key(9));
-        ranges.note(SegmentId(2), key(10), key(19));
-        ranges.note(SegmentId(3), key(0), key(30));
-        ranges.note(SegmentId(4), key(20), key(29));
-        let mut layers = ranges.layers();
-        layers.iter_mut().for_each(|layer| layer.sort());
-        layers.sort();
-        assert_eq!(layers, vec![vec![SegmentId(1), SegmentId(2), SegmentId(4)], vec![SegmentId(3)]]);
-        assert_eq!(layers.len(), ranges.depth());
+        assert_eq!(depth(&ranges), 3, "a range meeting another at one key overlaps it there");
     }
 
     // a key is looked for only in the segments whose range could hold it

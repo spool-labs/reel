@@ -306,9 +306,6 @@ pub struct Appender {
     /// The death window this tail's draws are stamped with, nothing for unbanded traffic
     band: Mutex<Option<Band>>,
 
-    /// Whether a merge owns this tail, so every segment it draws is merge output
-    writes_merge_output: bool,
-
     /// Seals segments this tail has rolled off, so a writer does not
     sealer: Sealer,
 }
@@ -369,24 +366,6 @@ impl Appender {
         index: u64,
         resumed: Option<ResumableTail>,
     ) -> Result<Appender> {
-        Appender::start(shared, index, false, resumed)
-    }
-
-    /// Open a tail of a merge's own, whose segments hold nothing but its output
-    ///
-    /// A merge writes its runs whole, so a foreground put landing between two of its
-    /// records would leave a segment that is not a run. Every segment this draws is
-    /// marked as the merge's.
-    pub fn open_for_merge(shared: Arc<ReelShared>, index: u64) -> Result<Appender> {
-        Appender::start(shared, index, true, None)
-    }
-
-    fn start(
-        shared: Arc<ReelShared>,
-        index: u64,
-        writes_merge_output: bool,
-        resumed: Option<ResumableTail>,
-    ) -> Result<Appender> {
         let tail = Arc::new(Tail::new(index));
         let driver = Arc::clone(&shared.driver);
         let active = Arc::new(RwLock::new(placeholder_active(driver)));
@@ -400,7 +379,6 @@ impl Appender {
             depth: DrainDepth::default(),
             draw_class: AtomicU8::new(0),
             band: Mutex::new(None),
-            writes_merge_output,
         };
         let fresh = match resumed {
             Some(tail) => appender.resume_segment(tail)?,
@@ -765,7 +743,6 @@ impl Appender {
         // A hold or a mark left behind would stop the held floor ever advancing past a
         // segment that is not there.
         self.shared.release_segment(drawn);
-        self.shared.forget_merge_output(drawn);
     }
 
     /// Give the spare drawn ahead back, for a tail that is stopping
@@ -834,7 +811,6 @@ impl Appender {
             // flush that arrives later must settle rather than park forever.
             active.sync.mark_durable();
             self.shared.release_segment(drawn);
-            self.shared.forget_merge_output(drawn);
             return Ok(());
         }
         let end = active.end();
@@ -1620,12 +1596,6 @@ impl Appender {
         let prepared = self.place_and_build(id, holds);
         if prepared.is_err() {
             self.shared.release_segment(id);
-            return prepared;
-        }
-        // Marked at the draw rather than at the first record, because the seal reads it
-        // and a segment can roll and seal while the pass that filled it writes on.
-        if self.writes_merge_output {
-            self.shared.note_merge_output(id);
         }
         prepared
     }

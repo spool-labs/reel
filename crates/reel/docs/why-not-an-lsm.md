@@ -125,54 +125,60 @@ arrive in whole segments. A workload that rewrites the same keys forever leaves
 its dead bytes scattered inside segments that are otherwise live, and that is the
 copy path every time.
 
-## Standing sorted runs and the collapse
+## Key runs
 
-This is where the level structure comes back, as an option.
+This is where the level structure comes back, for keys alone.
 
-A read that misses has to ask every candidate segment, because a segment number
-is not a version: several tails write at once, so a newer record can land in a
-lower-numbered segment than the one it replaces. With the index resident the map
-answers and the candidate count costs nothing. With the index paged, asks per get
-equal the standing run count for any key that misses.
+A paged get asks the spot index, an in-memory table of where each sealed key's
+record lies, and reads the record in one device read. A walk can't do that. The
+log keeps no key order, so a walk merges the footer of every sealed segment whose
+key range reaches into its span, and that fan-in grows with every seal.
 
-Two knobs turn that into a leveled shape, and neither is on by default.
+A key merge bounds it. Once more than eight runs stand over one key, the
+maintenance tick merges the walk's runs into a key run, a file of sorted rows that
+each hold a key, its sequence number and the place its record lies. The merge
+keeps the newest row of each key and moves no record. The spot index never hears
+of it, and a covered segment keeps its records and its footer for gets and for
+recovery. A walk reads the key run in place of the footers it covers, so it merges
+eight runs at most. Runs join a merge smallest first while each is no bigger than
+twice what the merge has taken, so young runs merge often and cheaply, and a large
+run is merged again only once the pile below it has grown to its size.
 
-**`rewrite_on_seal`** makes a segment sorted by key when it seals. It costs
-nothing extra: the seal is already reading and writing everything, and the
-footer's rows are already in key order, so applying them in that order lands a
-sorted run at no new io.
+That is a leveled merge of the keys alone. WiscKey splits keys from values the same
+way, and here the values already sit apart in the log. A row costs its key plus 21
+bytes, so a merge rewrites a small share of what was written.
 
-**`merge_sorted_runs`** collapses the standing runs into one. The pass reads the
-runs together in key order, keeps the newest version of every key, and retires
-the sources once its own output is sealed. Every tombstone is carried forward
-whatever it shadows, so no merge can resurrect a deleted key, and a run holding a
-version an open cue point can still read is not selected at all. It requires
-`rewrite_on_seal` and is refused without it, because a volume that does not seal
-by rewriting produces nothing sorted to merge.
+Compaction still reclaims dead space by rewriting segments, and a rewrite moves
+records out from under a key run. The run keeps standing. Each copy keeps its
+sequence number, and when a run's row and a rewritten copy tie, the copy wins, so a
+walk that meets a row pointing into a retired segment asks the index again. A
+delete stays on the volume while a key run still holds an older row of its key.
 
-That is a leveled merge in everything but the level count, and the position is
-that it should be a choice. What it buys is the read amplification a level
-structure buys by construction. What it costs is the write amplification a level
-structure pays by construction. A write-only volume that is never searched should
-pay neither.
+Measured on W9, a Hetzner ccx33 (8 vCPU, 32 GB), 2026-10-06: 10M keys loaded, then
+180 s of fresh inserts from seven writers beside one scan thread. Reel ran
+uncapped, then held at 330k puts/s. RocksDB ran at its own maximum, 285k puts/s.
 
-**What is not finished, stated plainly.** With `compact_dead_ratio` and
-`merge_dead_ratio` both at their 0.50 defaults the two triggers compose badly:
-reclaim keeps the standing stack's dead share under the collapse trigger, so the
-collapse never fires. A control run left 427 standing runs and zero merges, and
-the paged arm paid for it at 15.9 asks per get and a 10.8 ms p99, measured on a
-64-thread EPYC 9375F, 2026-08.
+| | reel, uncapped | reel at 330k puts/s | RocksDB at 285k puts/s |
+|---|---:|---:|---:|
+| puts/s | 994k | 330k | 285k |
+| write amp | 2.61 | 2.37 | 9.55 |
+| scan10/s | | 58.5k | 23.1k |
+| scan100/s | | 15.1k | 12.3k |
+| scan1000/s | | 2,086 | 2,264 |
+| cores | | 2.85 | 7.72 |
 
 ## What the shape gives up
 
 Named rather than argued, because each of these is real.
 
-- **No global key order across files.** A prefix scan is a merge over every
-  segment whose key range reaches into the span, heap ordered by the key each
-  cursor sits on. Leveled files bound that fan-in by construction; here it is
-  whatever the workload left standing.
-- **No bounded read amplification without arming the merge**, and the merge is
-  not finished.
+- **No global key order across files.** A walk merges the key runs and every
+  segment no run covers yet, heap ordered by the key each cursor sits on. Key
+  merges hold that at eight runs, where leveled files bound it by construction.
+- **Values stay in write order.** A key run orders the keys only, so a walk of a
+  thousand keys reads up to a thousand records from wherever they lie. While the
+  values sit in the page cache that costs little. Past RAM each one is a device
+  read, and on W9 long scans collapsed once the volume outgrew memory, at about
+  206 bytes a key against RocksDB's 126.
 - **A threshold that is an absolute bar.** A volume whose segments all sit just
   under it does nothing at all while its dead fraction climbs, until the tier
   escalates and lowers the bar in one step.

@@ -1,8 +1,9 @@
 # The on-disk format, and what each field is carrying
 
 Everything a volume holds is one shape repeated: a fixed header, a key, a payload.
-A sealed segment ends in a footer that indexes what it took. There is nothing else
-on disk. This document says what the fields are for, not what the byte offsets are,
+A sealed segment ends in a footer that indexes what it took. Beside the segments a
+paged volume keeps key runs, sorted rows its walks read in place of the footers
+they cover. This document says what the fields are for, not what the byte offsets are,
 which `format/` states once and does not need restating.
 
 The format version is 4, stamped into every segment header record. A build
@@ -246,6 +247,35 @@ the length and the magic. A footer whose magic is wrong, whose length is out of
 range, or whose checksum fails is not a footer, and the segment falls back to the
 record walk, which is also what a segment sealed only part way through gets.
 
+## Key runs
+
+A paged volume merges its walk's runs into a key run once more than eight stand
+over one key. Its file is `<id>.krun` with a twelve-digit id, written as
+`<id>.krun.part` until it is whole. The writer syncs it, renames it and syncs the
+directory, so a run under its own name is complete. An open unlinks any `.part` it
+finds, and any run a newer run covers whole.
+
+```
+| column rows, in column order | column fences | directory | covered segments | trailer |
+```
+
+A row is the key, then the sequence number, the segment, offset and length of the
+record, and its flags, which is 21 bytes past the key. A column of one key width
+strides at it. A column whose keys vary puts each key's two-byte length ahead of
+it, and a table of eight-byte row starts after its rows. A block is the span of
+rows a search lands in: 8 KiB of rows at a fixed width, 128 rows at a varying one.
+Each column's fences hold the first key of every block and the column's last key,
+each behind its length. The directory gives each column its id, key width, block
+rows, row count, where its rows start, their length and where its fences start,
+39 bytes a column. The covered segments are the ones whose footers the run answers
+for in a walk. The trailer is 20 bytes: where the directory starts, the column
+count, the covered count and the magic `KRUN`.
+
+A key run holds nothing the footers lack. The footers stay the authority for gets
+and for recovery, so a run that is lost only gives its segments back to the walk.
+An open unlinks a run it cannot parse, so this layout changes without a format
+version.
+
 ## What bounds a volume
 
 A resident pointer is a segment number, a byte offset within it, and a payload
@@ -263,8 +293,7 @@ The footer has to name every row because append order is not key order. **A
 compacted segment does not have to be like that.** Compaction already reads
 everything and writes everything, and the source footer is already sorted by key,
 so a rewrite applies its records in key order and its destination is a sorted run
-at no new io; `rewrite_on_seal` extends that to segments that were merely sealed,
-off by default.
+at no new io.
 
 What that unlocks and nothing yet spends: once offset order equals key order
 inside a segment, the footer can hold one entry per **page** of records instead

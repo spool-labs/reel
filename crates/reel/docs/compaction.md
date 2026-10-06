@@ -88,8 +88,6 @@ A segment with no live records retires by unlink instead. `select_whole_dead` is
 same ranking with no fallback, drained to exhaustion at the head of every pass and
 charging near nothing, since it copies nothing and reads little past the footer. It
 still runs inside a pass, so a shut gate holds it with everything else.
-`select_unsorted` is the other reason to rewrite, order rather than space, gated
-behind `rewrite_on_seal`.
 
 **The rewrite fetches in offset order and applies in key order**, since only the
 applies need the footer's order, the two meeting in a stripe bounded at
@@ -157,7 +155,6 @@ from config at provisioning.
 |---|---|---|
 | `compact_mbps` | `auto`, unpaced | background MB/s and read p99, both on the curve above (ccx33, 2026-08-16). Charged reads plus copies |
 | `compact_dead_ratio` | `0.50` | eligibility, not choice: selection rewrites 0.84 to 0.91 dead segments whatever the bar (sim). Escalation lowers it to 0.20 under debt |
-| `merge_dead_ratio` | `0.50` | leave it alone. The two dead ratios compose badly at their defaults, `config.md` has the run |
 | `scrub_mbps` | `64`, clamped to `compact_mbps` unless that is unpaced | the lap length, nothing else. An integrity sweep cannot outbid space reclamation |
 
 ## Reclaiming without copying
@@ -327,10 +324,7 @@ ran within 18% of the 1 MiB shape, 806 against 985 MB/s of reads (ccx33, 2026-08
    the default. `Paged` holds about a byte a key, as `index-tier.md` records.
 3. **The tick sweeps every segment.** `index.ranking()` allocates a vector of every
    segment under a read lock and folds two atomics per entry, to choose one target.
-   `select_unsorted` calls it again and asks the memoized footer facts per
-   segment until one is out of order; a fact is derived from the footer once at
-   first ask and never re-read for a sealed segment. Gated behind
-   `rewrite_on_seal`; neither sweep has been run at 28,672 segments.
+   The sweep has not been run at 28,672 segments.
 4. **The reserve is 0.031% of the volume.** `Compactor::new` sizes it as one segment
    per tail plus one, 9 GiB at the defaults, and the slowdown band is
    `SLOWDOWN_RESERVES` of them, 72 GiB, inside which `foreground_throttle` slows

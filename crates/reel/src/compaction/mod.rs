@@ -6,5 +6,4 @@
 
 pub mod compactor;
 pub mod keymerge;
-pub mod merge;
 pub mod pressure;

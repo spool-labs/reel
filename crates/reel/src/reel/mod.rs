@@ -2430,24 +2430,29 @@ impl Reel {
             }
         }
         // A scan's keys land on records spread over the volume, and the check below
-        // paid one memory stall a record, in turn. The records ahead are asked for
-        // first, so the stalls overlap.
+        // paid one memory stall a record, in turn. Each record is found once and its
+        // lines asked for then, and the check reaches it a window later, so the
+        // stalls overlap.
         let handles = &scratch.handles;
-        for ask in asks.iter().take(PREFETCH_AHEAD) {
-            if let Some((record, _)) = self.in_place(handles, keys, ask) {
-                prefetch_record(record);
-            }
-        }
+        let mut ahead: [Option<(&[u8], RecordLayout)>; PREFETCH_AHEAD] = [None; PREFETCH_AHEAD];
         let mut mapped = Vec::new();
-        for (at, ask) in asks.iter().enumerate() {
-            if let Some(ahead) = asks.get(at + PREFETCH_AHEAD) {
-                if let Some((record, _)) = self.in_place(handles, keys, ahead) {
+        for step in 0..asks.len() + PREFETCH_AHEAD {
+            let slot = step % PREFETCH_AHEAD;
+            let due = ahead[slot].take();
+            if let Some(ask) = asks.get(step) {
+                let record = self.in_place(handles, keys, ask);
+                if let Some((record, _)) = record {
                     prefetch_record(record);
                 }
+                ahead[slot] = record;
             }
+            let Some(at) = step.checked_sub(PREFETCH_AHEAD) else {
+                continue;
+            };
+            let ask = &asks[at];
             let key = keys[ask.at as usize];
             let len = ask.loc.len as usize;
-            let Some((record, layout)) = self.in_place(handles, keys, ask) else {
+            let Some((record, layout)) = due else {
                 let place = (u64::from(ask.loc.segment.0) << 32) | u64::from(ask.loc.offset);
                 scratch.order.push((place, at as u32));
                 continue;

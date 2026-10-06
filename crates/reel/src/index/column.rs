@@ -1810,9 +1810,16 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     }
 
     /// Raise one cover, the shape a range delete and a rebuild share
+    ///
+    /// A carried range delete stands in two segments until its source retires, and a
+    /// rebuild or a follower meets it in both. The sweep finds a cover by its sequence
+    /// number, so one already standing at this number is this cover.
     fn push_cover(&self, start: &[u8], high: Option<K>, lsn: Lsn) {
         let low = K::low_bound(start);
         let mut covers = write(&self.covers);
+        if covers.iter().any(|cover| cover.lsn == lsn) {
+            return;
+        }
         covers.push(Covered {
             low: low.clone(),
             high,
@@ -3151,7 +3158,10 @@ mod tests {
     ///
     /// Nothing here pages, so the release phase is stepped straight past.
     fn sweep_all<K: IndexKey, S: Shape<K>>(index: &WidthIndex<K, S>, segments: &SegmentTable) {
+        let mut steps = 0;
         while let Some(pending) = index.next_pending_cover() {
+            steps += 1;
+            assert!(steps < 1000, "the sweep keeps coming back to cover {:?}", pending.lsn);
             if pending.release_from.is_some() {
                 index.advance_release(pending.lsn, None);
                 continue;
@@ -4060,6 +4070,28 @@ mod tests {
         assert_eq!(index.totals().count, 0);
         assert_eq!(index.grave_count(), 0);
         assert!(!index.has_pending_covers());
+    }
+
+    // a range delete met in two segments stands once, and its sweep finishes
+    #[test]
+    fn a_cover_raised_twice_stands_once() {
+        let index = sharded();
+        let segments = SegmentTable::new();
+        for byte in 0..4u8 {
+            index
+                .insert(
+                    &key(7, byte),
+                    Entry::new(loc(1, 0, 100), Lsn(1 + byte as u64)),
+                    &segments,
+                )
+                .took_place();
+        }
+
+        index.remove_range(&7u16.to_be_bytes(), Some(&8u16.to_be_bytes()), Lsn(50));
+        index.remove_range(&7u16.to_be_bytes(), Some(&8u16.to_be_bytes()), Lsn(50));
+        sweep_all(&index, &segments);
+        assert!(!index.has_pending_covers());
+        assert_eq!(index.totals().count, 0);
     }
 
     // a covered entry refuses to page out and waits for the sweep

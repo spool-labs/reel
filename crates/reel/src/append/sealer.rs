@@ -353,13 +353,10 @@ pub(super) fn flush_active(
         )
     };
 
-    // The rows go down ahead of the syncs, so what this flush makes durable a reopen can
+    // The rows go down with the records, so what this flush makes durable a reopen can
     // find without the footer.
-    let rows = journal.write_pending()?;
+    journal.sync_pending()?;
     shared.driver.sync_data(handle.file())?;
-    if let Some(rows) = rows {
-        shared.driver.sync_data(rows)?;
-    }
     Ok(Some(covered))
 }
 

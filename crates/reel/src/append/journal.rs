@@ -91,11 +91,17 @@ impl Journal {
         push_group(rows, &mut lock(&self.pending));
     }
 
-    /// Write every pending group to the file, and hand back the file a sync covers
-    pub(super) fn write_pending(&self) -> Result<Option<FileId>> {
+    /// Write every pending group to the file and sync it
+    ///
+    /// Both under the file's lock, so a seal that removes the journal waits for the sync
+    /// rather than closing the file under it.
+    pub(super) fn sync_pending(&self) -> Result<()> {
         let mut file = lock(&self.file);
         self.write_locked(&mut file)?;
-        Ok(file.id)
+        match file.id {
+            Some(id) => self.driver.sync_data(id),
+            None => Ok(()),
+        }
     }
 
     /// The same write, skipped while another caller holds the file

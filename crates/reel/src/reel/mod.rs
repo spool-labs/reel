@@ -32,7 +32,7 @@ use crate::format::band::Band;
 use crate::format::block::{lookup_in_span, FooterMap, RowBlock};
 use crate::format::column::{ColumnId, ColumnSet, KeyRef, PurgeMark, RecordKey};
 use crate::format::fence::{FenceCut, FenceReach};
-use crate::format::footer::{FooterFind, FooterRow, FooterTally, SegmentFooter};
+use crate::format::footer::{FooterFind, FooterPartition, FooterRow, FooterTally, SegmentFooter};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::{Lsn, LsnCounter};
 use crate::format::record::{check_keyless, fits_keyless, keyless_len, CheckKey, Flags, KeylessRead, RecordLayout, HEADER_LEN, KEYLESS_PREFIX};
@@ -77,7 +77,7 @@ const DIRECT_RECORD_FLOOR: u32 = 1024 * 1024;
 /// is the case it loses.
 const DIRECT_DEPTH_FLOOR: u64 = 2;
 
-/// Where SpotForward reads the records its entries point at
+/// Where the spot index reads the records its entries point at
 ///
 /// A keyless segment's records carry no key. A key's lone candidate confirms itself
 /// by its record's keyed check, in one read. Every other one is confirmed by its footer
@@ -106,7 +106,7 @@ impl RecordSource for ReelShared {
                 return Ok(HeadRead::Cold);
             };
             let found = match footer.partition(key.column) {
-                Some(partition) => partition.find_row(key.bytes).transpose()?,
+                Some(partition) => row_at_offset(partition, key.bytes, offset)?,
                 None => None,
             };
             return Ok(keyless_head_of(found, offset));
@@ -234,7 +234,18 @@ fn keyless_head_of(found: Option<FooterRow>, offset: u32) -> HeadRead {
     }
 }
 
-/// What one SpotForward range read settled
+/// The row of a key's run that sits at an offset, nothing where none of them does
+fn row_at_offset(partition: &FooterPartition, key: &[u8], offset: u32) -> Result<Option<FooterRow>> {
+    for at in partition.lower_bound(key)..partition.upper_bound(key) {
+        let row = partition.row_at(at)?;
+        if row.offset == offset {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
+/// What one spot index range read settled
 pub enum SpotRange {
     /// The key's record at this candidate, and the window of its payload asked for
     Found(Head, Value),
@@ -249,7 +260,7 @@ pub enum SpotRange {
     Unsure,
 }
 
-/// One SpotForward candidate a batch reads
+/// One spot index candidate a batch reads
 pub struct SpotAsk<'a> {
     pub key: &'a RecordKey,
     pub segment: SegmentId,
@@ -260,7 +271,7 @@ pub struct SpotAsk<'a> {
     pub alone: bool,
 }
 
-/// What one bounded read of a SpotForward candidate settled
+/// What one bounded read of a spot index candidate settled
 enum Verdict {
     Read(SpotRead),
 
@@ -284,12 +295,24 @@ enum Asked {
 }
 
 impl ReelShared {
-    /// Confirm a candidate in a keyless segment against the footer row its key finds
+    /// Confirm a candidate in a keyless segment against the footer row filed under its key at its offset
     ///
-    /// A record whose row is not filed under the key at this offset belongs to another
-    /// key, or is an older version of this one the row search passes over.
+    /// The search finds a key's newest row, which nearly always is the candidate. An
+    /// older version the segment also holds sits elsewhere in the key's run of rows. A
+    /// record no row of the key sits at belongs to another key.
     fn keyless_head(&self, key: KeyRef<'_>, segment: SegmentId, offset: u32) -> Result<HeadRead> {
-        Ok(keyless_head_of(self.find(segment, key.column, key.bytes)?, offset))
+        let newest = self.find(segment, key.column, key.bytes)?;
+        if newest.as_ref().is_none_or(|row| row.offset == offset) {
+            return Ok(keyless_head_of(newest, offset));
+        }
+        let Some(footer) = self.footer_of(segment)? else {
+            return Ok(HeadRead::Missing);
+        };
+        let row = match footer.partition(key.column) {
+            Some(partition) => row_at_offset(partition, key.bytes, offset)?,
+            None => None,
+        };
+        Ok(keyless_head_of(row, offset))
     }
 
     /// One candidate in a keyless segment, settled off its row and one read of its record
@@ -526,7 +549,7 @@ impl ReelShared {
         deep_spot_range(self.driver.wait_split_reads(ops).await?, key, at, len)
     }
 
-    /// One bounded read of each SpotForward candidate, submitted together
+    /// One bounded read of each spot index candidate, submitted together
     pub fn spot_records(&self, asks: &[SpotAsk<'_>]) -> Result<Vec<SpotRead>> {
         let (ops, asked) = self.spot_ops(asks)?;
         let filled = self.driver.run_split_reads(ops)?;
@@ -824,7 +847,7 @@ fn head_read(prefix: &[u8], key: KeyRef<'_>) -> HeadRead {
     }
 }
 
-/// What a checked read of one the spot index candidate settles
+/// What a checked read of one spot index candidate settles
 fn spot_read_of(read: RecordRead, head: Head) -> SpotRead {
     match read {
         RecordRead::Found(value) => SpotRead::Found(head, value),

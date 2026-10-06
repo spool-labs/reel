@@ -318,6 +318,11 @@ impl ColumnIndex {
         on_index!(self, index => index.has_pending_covers())
     }
 
+    /// Whether any range delete stands over the column, which an answer with no version cannot be tested against
+    pub fn has_covers(&self) -> bool {
+        on_index!(self, index => index.has_covers())
+    }
+
     /// Drop what tombstones hold once nothing older than them can still be published
     pub fn prune_tombstones(&self, before: Lsn, sealed: Option<&SealedRanges>) -> u64 {
         on_index!(self, index => index.prune_tombstones(before, sealed))
@@ -1622,6 +1627,11 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                     .as_ref()
                     .is_none_or(|end| end.as_slice() > low.as_slice())
         })
+    }
+
+    /// Whether any range delete stands over the column
+    pub fn has_covers(&self) -> bool {
+        self.has_covers.load(Ordering::Relaxed)
     }
 
     /// Whether any cover is still owed its sweep

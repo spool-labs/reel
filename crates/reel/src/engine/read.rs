@@ -703,7 +703,7 @@ impl ReelStore {
         resolving.give_up(self, key)
     }
 
-    /// A key's newest payload as a future, one read of each the spot index candidate it needs
+    /// A key's newest payload as a future, one read of each spot index candidate it needs
     async fn spot_read_wait(&self, key: &RecordKey) -> Result<Lookup> {
         let (at, since) = match self.index.spot_route(key) {
             SpotRoute::Settled(lookup) => return Ok(lookup),
@@ -730,7 +730,7 @@ impl ReelStore {
         Ok(Lookup::Unsettled)
     }
 
-    /// The one the spot index candidate a range read can go straight to, when the key has one
+    /// The one spot index candidate a range read can go straight to, when the key has one
     fn spot_range_candidate(&self, key: &RecordKey) -> Option<(usize, Since, Candidate)> {
         let SpotRoute::Column(at, since) = self.index.spot_route(key) else {
             return None;

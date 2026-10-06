@@ -770,11 +770,8 @@ impl Appender {
         let driver = &self.shared.driver;
         let flushed = driver
             .truncate(file, active.end())
-            .and_then(|()| active.journal.write_pending())
-            .and_then(|rows| {
-                driver.sync_full(file)?;
-                rows.map_or(Ok(()), |rows| driver.sync_full(rows))
-            });
+            .and_then(|()| active.journal.sync_pending())
+            .and_then(|()| driver.sync_full(file));
         active.terminal.store(true, Ordering::Release);
         match &flushed {
             Ok(()) => active.sync.mark_durable(),

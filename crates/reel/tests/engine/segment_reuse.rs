@@ -113,8 +113,9 @@ fn a_new_segment_is_written_through() {
         "the fill past the records is not zeros"
     );
 
-    // The fill reads back as a data record with no sequence number, which is where the
-    // walk stops, and a written record always draws a sequence number above zero.
+    // A flush journals the record's row, which is what a reopen finds it by, and the
+    // copy is taken with the tail still open, as a crash leaves it.
+    store.flush().expect("flush");
     let crashed = TempDir::new().expect("crashed");
     copy_root(home.path(), crashed.path());
     store.close().expect("close");

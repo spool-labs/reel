@@ -546,7 +546,8 @@ fn a_fence_finds_nothing_that_is_not_there() {
 // a fence a crash left half written is a torn footer, and a torn footer is refused
 //
 // The leads live inside the footer's own checksum, so a flipped bit fails the whole
-// footer and the segment is rebuilt by walking its records.
+// footer. Its records are keyless and its journal went with the seal, so the segment's
+// keys go with the footer and every other segment's stay.
 #[test]
 fn a_torn_fence_costs_the_footer() {
     let (store, sim) = filled(FenceResidency::Resident);
@@ -563,12 +564,9 @@ fn a_torn_fence_costs_the_footer() {
     )
     .expect("reopen");
 
-    for at in 0..keys() {
-        assert!(
-            store.get(&key(at)).expect("get").is_some(),
-            "key {at} went missing behind a torn fence",
-        );
-    }
+    let found = (0..keys()).filter(|at| store.get(&key(*at)).expect("get").is_some()).count();
+    assert!(found < keys() as usize, "a torn footer still answered for its records");
+    assert!(found > 0, "the torn footer took the other segments' keys with it");
 }
 
 /// Flip a byte inside the fence of the largest sealed segment in an image

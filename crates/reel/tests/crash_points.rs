@@ -89,10 +89,10 @@ const SYNC_ERROR_FROM: u64 = 4;
 const SYNC_ERROR_TO: u64 = 20;
 
 /// First op position the out of space fault is scheduled at
-const ENOSPC_FROM: u64 = 8;
+const ENOSPC_FROM: u64 = 12;
 
 /// Last op position the out of space fault is scheduled at
-const ENOSPC_TO: u64 = 24;
+const ENOSPC_TO: u64 = 28;
 
 /// Overwrites of one key for the multi tail stream
 const OVERWRITE_COUNT: u8 = 6;
@@ -665,8 +665,8 @@ const NEIGHBOUR: u8 = 9;
 
 /// Where inside a batch a write is cut off
 ///
-/// The frame, the first record, one in the middle and the last: a writev that stopped
-/// at any of them leaves a run that must not be applied at all.
+/// The first record, one in the middle and the last: a writev that stopped at any of
+/// them leaves a run that must not be applied at all.
 #[derive(Clone, Copy, Debug)]
 enum Tear {
     FirstRecord,

@@ -382,6 +382,8 @@ impl ReelIndex {
             Lookup::Found(lsn, _) if self.indexes[at].is_covered_key_at(key.as_slice(), lsn, snapshot) => {
                 Lookup::Missing
             }
+            // a cue has to see the version, and this answer has none
+            Lookup::Newest(_) => Lookup::Unsettled,
             Lookup::Missing if self.spot[at].moved(since) => Lookup::Unsettled,
             found => found,
         }
@@ -396,6 +398,8 @@ impl ReelIndex {
     pub fn spot_finish(&self, at: usize, key: &RecordKey, since: Since, lookup: Lookup) -> Lookup {
         match lookup {
             Lookup::Found(lsn, _) if self.indexes[at].is_covered_key(key.as_slice(), lsn) => Lookup::Missing,
+            // read after the record, so a range delete that landed before it is seen here
+            Lookup::Newest(_) if self.indexes[at].has_covers() => Lookup::Unsettled,
             Lookup::Missing if self.spot[at].moved(since) => Lookup::Unsettled,
             found => found,
         }
@@ -1355,7 +1359,7 @@ impl ReelIndex {
     ///
     /// A paged key has no entry to repoint, so it comes back into the map until the
     /// destination seals and hands it over again. The caller's source stands when it is
-    /// the key's one the spot index slot. Otherwise the footers give the source, and they
+    /// the key's one spot index slot. Otherwise the footers give the source, and they
     /// also say whether the row is still the version being moved.
     pub fn repoint(&self, key: &RecordKey, from: Option<Loc>, to: Loc, expected_lsn: Lsn) -> Result<bool> {
         let moves = [KeyRepoint {
@@ -1457,7 +1461,7 @@ impl ReelIndex {
                 None => {}
             }
         }
-        // The pass read the record at its source, so when that is the key's one the spot index
+        // The pass read the record at its source, so when that is the key's one spot index
         // slot it is this key at this version, and no slot holds a newer one: no read needed.
         if let Some(from) = from.filter(|from| self.spot_serves() && self.spot[at].only_at(key.as_slice(), *from)) {
             let counted = self.counted(from.segment);

@@ -389,6 +389,11 @@ impl ColumnIndex {
         on_index!(self, index => index.page_out(key, loc))
     }
 
+    /// Give up the keys of one lane of shards, a shard's under one lock a chunk at a time
+    pub fn page_out_lane(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<bool> {
+        on_index!(self, index => index.page_out_lane(rows, lane, lanes))
+    }
+
     /// Every entry the column holds, graves included, in key order
     pub fn held(&self) -> Vec<(KeyBytes, Entry)> {
         on_index!(self, index => index.held())
@@ -465,6 +470,9 @@ impl ColumnIndex {
 
 /// Keys in one shard's run before a batch is worth its bookkeeping
 const BATCH_RUN: usize = 4;
+
+/// Keys a hand-over takes a shard's lock for at a time, so a put behind it waits a short while
+const LOCK_CHUNK: usize = 512;
 
 /// The shard grouping one thread's batched lookups work through
 ///
@@ -1717,25 +1725,49 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// it over would put it where the map sweep cannot reach and the release pass
     /// may already have been, so nothing would ever settle it.
     pub fn page_out(&self, key: &[u8], loc: Loc) -> bool {
-        let Some(key) = K::from_slice(key) else {
-            return false;
-        };
-        let at = self.shard_of(&key);
-        let mut state = write(&self.shards[at]);
-        match state.map.at(key.as_slice()) {
-            Some(existing)
-                if existing.loc == loc
-                    && !existing.is_grave()
-                    && !self.is_covered(key.as_slice(), existing.lsn) => {}
-            Some(_) | None => return false,
+        self.page_out_lane(&[(key, loc)], 0, 1)[0]
+    }
+
+    /// Give up the keys of one lane of shards, each shard's lock taken once a chunk
+    ///
+    /// The same test `page_out` makes a key, made for every key of a shard while its lock
+    /// is held, so a sealed segment's keys cost a lock a chunk rather than one a key. A lane
+    /// is the shards whose number leaves `lane` over `lanes`. What comes back is which went.
+    pub fn page_out_lane(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<bool> {
+        let mut handed = vec![false; rows.len()];
+        let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
+        for (at, (key, _)) in rows.iter().enumerate() {
+            if let Some(key) = K::from_slice(key) {
+                let shard = self.shard_of(&key);
+                if shard % lanes == lane {
+                    by_shard[shard].push(at);
+                }
+            }
         }
-        state.map.take(key.as_slice());
-        state.paged += 1;
-        // A column that pages hands its whole resident half over a key at a time,
-        // so this is the pass most able to leave a shard mostly room.
-        state.map.pack_owed();
-        self.note_emptied(at, &mut state);
-        true
+        for (shard, ats) in by_shard.iter().enumerate() {
+            for chunk in ats.chunks(LOCK_CHUNK) {
+                let mut state = write(&self.shards[shard]);
+                for &at in chunk {
+                    let (key, loc) = rows[at];
+                    let Some(key) = K::from_slice(key) else {
+                        continue;
+                    };
+                    match state.map.at(key.as_slice()) {
+                        Some(existing)
+                            if existing.loc == loc
+                                && !existing.is_grave()
+                                && !self.is_covered(key.as_slice(), existing.lsn) => {}
+                        Some(_) | None => continue,
+                    }
+                    state.map.take(key.as_slice());
+                    state.paged += 1;
+                    handed[at] = true;
+                }
+                state.map.pack_owed();
+                self.note_emptied(shard, &mut state);
+            }
+        }
+        handed
     }
 
     /// Every entry the column holds, graves included, in key order

@@ -843,66 +843,70 @@ impl ReelIndex {
             .map(|entry| ByteCount::from_bytes(u64::from(entry.loc.len))))
     }
 
-    /// Give a key up to the footer of the segment it landed in
+    /// Give one sealed partition's keys up, a lane of shards to a thread
     ///
-    /// The spot index takes the key before the map lets it go, so a get never sees neither.
-    pub fn page_out(&self, column: ColumnId, key: &[u8], loc: Loc) -> bool {
-        let Some(at) = self.slot(column) else {
-            return false;
-        };
-        self.spot[at].insert(key, loc);
-        // The spot index holds the key and the map has yet to let it go.
-        crate::sync::rendezvous::at("paged/handover-spot");
-        let handed = self.indexes[at].page_out(key, loc);
-        if !handed {
-            self.spot[at].remove_at(key, loc);
-        }
-        handed
-    }
-
-    /// Give one sealed partition's keys up, a lane of the spot index shards to a thread
-    ///
-    /// Every key still goes through `page_out` alone. Each lane starts at its own share of
-    /// key order, so the threads meet different map shards too.
+    /// The spot index takes every key before the map lets any go, so no read finds a key
+    /// in neither, and a key the map would not give up comes back out of the spot index
+    /// only where this hand-over put it there. Each step takes a shard's lock once a chunk
+    /// of keys, and each lane owns its own shards, so lanes never wait on each other.
     pub fn page_out_partition(&self, segment: SegmentId, partition: &FooterPartition) -> Result<usize> {
-        let lanes = match partition.len() >= SPLIT_AT {
-            true => HANDOVER_LANES,
-            false => 1,
+        let Some(at) = self.slot(partition.column) else {
+            return Ok(0);
         };
-        let mut rows: Vec<Vec<(u32, Loc)>> = vec![Vec::new(); lanes];
-        for at in 0..partition.len() {
-            let row = partition.row_at(at)?;
+        let mut rows: Vec<(&[u8], Loc)> = Vec::with_capacity(partition.len());
+        for row_at in 0..partition.len() {
+            // The key is borrowed out of the packed bytes, never decoded into an entry.
+            let Some(key) = partition.key_at(row_at) else {
+                continue;
+            };
+            // A segment that overwrote its own record holds every version in write order,
+            // and only the last can be the map's: an older one would only fill the key's
+            // spot index buckets for the map to refuse.
+            if partition.key_at(row_at + 1) == Some(key) {
+                continue;
+            }
+            let row = partition.row_at(row_at)?;
             if !row.flags.is_data() {
                 continue;
             }
-            // The key is borrowed out of the packed bytes, never decoded into an entry.
-            let Some(key) = partition.key_at(at) else {
-                continue;
-            };
-            rows[SpotColumn::lane_of(key, lanes)].push((at as u32, Loc::new(segment, row.offset, row.len)));
+            rows.push((key, Loc::new(segment, row.offset, row.len)));
         }
-        let hand = |lane: usize, rows: &[(u32, Loc)]| -> usize {
-            let (head, tail) = rows.split_at(rows.len() * lane / lanes);
-            tail.iter()
-                .chain(head)
-                .filter(|(at, loc)| {
-                    partition
-                        .key_at(*at as usize)
-                        .is_some_and(|key| self.page_out(partition.column, key, *loc))
-                })
-                .count()
+        let lanes = match rows.len() >= SPLIT_AT {
+            true => HANDOVER_LANES,
+            false => 1,
         };
-        if lanes == 1 {
-            return Ok(hand(0, &rows[0]));
+        let spot = &self.spot[at];
+        let index = &self.indexes[at];
+        let in_lanes = |step: &(dyn Fn(usize) -> Vec<bool> + Sync)| -> Vec<bool> {
+            let mut all = vec![false; rows.len()];
+            let lanes: Vec<Vec<bool>> = match lanes {
+                1 => vec![step(0)],
+                _ => std::thread::scope(|scope| {
+                    let running: Vec<_> = (0..lanes).map(|lane| scope.spawn(move || step(lane))).collect();
+                    running.into_iter().map(|lane| lane.join().expect("a hand-over lane panicked")).collect()
+                }),
+            };
+            for lane in lanes {
+                for (all, took) in all.iter_mut().zip(lane) {
+                    *all |= took;
+                }
+            }
+            all
+        };
+        let inserted = in_lanes(&|lane| spot.insert_lane(&rows, lane, lanes));
+        // The spot index holds every key and the map has yet to let any go.
+        crate::sync::rendezvous::at("paged/handover-spot");
+        let handed = in_lanes(&|lane| index.page_out_lane(&rows, lane, lanes));
+        let back: Vec<(&[u8], Loc)> = rows
+            .iter()
+            .zip(inserted.iter().zip(&handed))
+            .filter(|(_, (inserted, handed))| **inserted && !**handed)
+            .map(|(row, _)| *row)
+            .collect();
+        if !back.is_empty() {
+            spot.remove_lane(&back, 0, 1);
         }
-        Ok(std::thread::scope(|scope| {
-            let handing: Vec<_> = rows
-                .iter()
-                .enumerate()
-                .map(|(lane, rows)| scope.spawn(move || hand(lane, rows)))
-                .collect();
-            handing.into_iter().map(|lane| lane.join().expect("a hand-over lane panicked")).sum()
-        }))
+        Ok(handed.iter().filter(|handed| **handed).count())
     }
 
     /// Record the keys one newly sealed segment covers for one column

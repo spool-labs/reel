@@ -30,6 +30,21 @@ const GROWTH: f64 = 1.5;
 /// Shards, picked by the top byte of a key's hash
 const SHARDS: usize = 256;
 
+/// Keys a batch takes a shard's lock for at a time, so a write behind it waits a short while
+const LOCK_CHUNK: usize = 512;
+
+/// The rows of one lane of shards, gathered by shard
+fn lane_groups(rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<(usize, Vec<usize>)> {
+    let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); SHARDS];
+    for (at, (key, _)) in rows.iter().enumerate() {
+        let shard = shard_of(hash_of(key));
+        if shard % lanes == lane {
+            by_shard[shard].push(at);
+        }
+    }
+    by_shard.into_iter().enumerate().filter(|(_, ats)| !ats.is_empty()).collect()
+}
+
 /// Buckets the lowest rung of a shard's ladder holds
 const FIRST_BUCKETS: usize = 8;
 
@@ -824,23 +839,53 @@ impl SpotColumn {
             .sum()
     }
 
-    /// Which of `lanes` runs of shards holds a key, so threads split a hand-over without sharing one
-    pub fn lane_of(key: &[u8], lanes: usize) -> usize {
-        shard_of(hash_of(key)) * lanes / SHARDS
-    }
-
     /// Hold a sealed record's location
     ///
     /// The caller hands over the newest version, so an older entry of the same key is
     /// one the map displaced and the cleaner will settle.
     pub fn insert(&self, key: &[u8], loc: Loc) {
-        let hash = hash_of(key);
-        let slot = Slot::new(hash, loc);
-        let mut table = self.shards[shard_of(hash)].write();
-        if table.matches(hash).iter().any(|place| place.slot.same_place(&slot)) {
-            return;
+        self.insert_lane(&[(key, loc)], 0, 1);
+    }
+
+    /// Put the keys of one lane of shards in, a shard's under one lock a chunk at a time
+    ///
+    /// A lane is the shards whose number leaves `lane` over `lanes`, so lanes on other
+    /// threads never meet in one shard. What comes back is which keys took a new slot.
+    pub fn insert_lane(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<bool> {
+        let mut inserted = vec![false; rows.len()];
+        for (shard, ats) in lane_groups(rows, lane, lanes) {
+            for chunk in ats.chunks(LOCK_CHUNK) {
+                let mut table = self.shards[shard].write();
+                for &at in chunk {
+                    let (key, loc) = rows[at];
+                    let hash = hash_of(key);
+                    let slot = Slot::new(hash, loc);
+                    if table.matches(hash).iter().any(|place| place.slot.same_place(&slot)) {
+                        continue;
+                    }
+                    table.insert(slot);
+                    inserted[at] = true;
+                }
+            }
         }
-        table.insert(slot);
+        inserted
+    }
+
+    /// Take out the slots of one lane of shards that point at these records
+    pub fn remove_lane(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) {
+        for (shard, ats) in lane_groups(rows, lane, lanes) {
+            for chunk in ats.chunks(LOCK_CHUNK) {
+                let mut table = self.shards[shard].write();
+                for &at in chunk {
+                    let (key, loc) = rows[at];
+                    let hash = hash_of(key);
+                    let held = table.matches(hash).iter().find(|place| place.slot.at(loc)).copied();
+                    if let Some(place) = held {
+                        table.take(hash, &place.slot);
+                    }
+                }
+            }
+        }
     }
 
     /// Size every shard for about this many keys, so a load does not grow them a step at a time

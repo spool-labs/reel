@@ -17,7 +17,7 @@ use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth};
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::SegmentId;
 use crate::format::journal::{journal_path, read_groups, JournalRow};
-use crate::format::record::{check_keyless, KeylessRead, KEYLESS_PREFIX};
+use crate::format::record::{check_keyless, KeylessRead, KEYLESS_MAX, KEYLESS_PREFIX};
 use crate::format::segment_header::{SegmentHeader, SEGMENT_HEADER_SPAN};
 use crate::io::fault::{FaultKind, FaultPlan};
 use crate::io::op::{Advice, SegmentEntry};
@@ -571,6 +571,37 @@ fn batch_of(payload_len: usize) -> Vec<BatchRecord> {
             write: BatchWrite::Put(vec![byte; payload_len], 0),
         })
         .collect()
+}
+
+// a small record lies keyless, and a record past the ceiling keeps its header and key
+#[test]
+fn a_small_record_lies_keyless() {
+    let (shared, _sim) = harness(
+        config(SyncPolicy::Never, Preallocate::Chunk),
+        FaultPlan::new(1),
+    );
+    let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
+
+    let small = appender
+        .append_data(key(0x11), vec![0x11; 100], 0, Commit::PerRecord)
+        .expect("small");
+    let wide = KEYLESS_MAX as usize + 1;
+    let large = appender
+        .append_data(key(0x22), vec![0x22; wide], 0, Commit::PerRecord)
+        .expect("large");
+
+    assert!(lands_intact(&shared, small.loc));
+    assert_eq!(
+        u64::from(large.loc.offset),
+        u64::from(small.loc.offset) + KEYLESS_PREFIX as u64 + 100,
+        "the small record took its prefix and payload and nothing else"
+    );
+    let bytes = read_segment(&shared, &shared.segment_path(SegmentId(1)));
+    let at = large.loc.offset as usize;
+    let header = RecordHeader::unpack(&bytes[at..]).expect("a large record keeps its header");
+    assert_eq!(header.key, key(0x22));
+    let payload_at = at + header.prefix_len() as usize;
+    assert!(header.verify(&bytes[payload_at..payload_at + wide]));
 }
 
 // a batch lands back to back and journals its rows as one group

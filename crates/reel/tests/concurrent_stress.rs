@@ -302,17 +302,21 @@ fn storm(store: &Arc<ReelStore>) -> (Written, usize) {
         }));
     }
 
+    let paged = Arc::new(AtomicUsize::new(0));
+    // Maintenance hands sealed keys over before it compacts, so this does too
     let compactor = {
         let store = Arc::clone(store);
         let is_running = Arc::clone(&is_running);
+        let paged = Arc::clone(&paged);
         thread::spawn(move || {
             while is_running.load(Ordering::Relaxed) {
+                let handed = store.page_out_sealed().expect("page out");
+                paged.fetch_add(handed, Ordering::Relaxed);
                 store.compact_once().expect("compact");
             }
         })
     };
 
-    let paged = Arc::new(AtomicUsize::new(0));
     let pager = {
         let store = Arc::clone(store);
         let is_running = Arc::clone(&is_running);

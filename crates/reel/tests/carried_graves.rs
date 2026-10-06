@@ -81,6 +81,9 @@ fn overwrite(store: &ReelStore, round: u32, with: u8) {
 
 fn write_round(store: &ReelStore, round: u32, with: u8) {
     write_only(store, round, with);
+    // A flush waits out the seals the round started, so the maintenance after it finds
+    // every segment the round rolled off sealed.
+    store.flush().expect("flush");
     for _ in 0..3 {
         Store::maintain(store).expect("maintain");
     }

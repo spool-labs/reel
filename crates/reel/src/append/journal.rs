@@ -1,6 +1,7 @@
 //! An open segment's journal file, written at each flush and each writeback pace
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::error::Result;
@@ -22,6 +23,9 @@ pub(super) struct Journal {
 
     /// The file and how far it is written, held across a write so groups land in order
     file: Mutex<JournalFile>,
+
+    /// Bytes pushed so far, written or pending, which the segment's room shrinks by
+    pushed: AtomicU64,
 }
 
 struct JournalFile {
@@ -76,7 +80,13 @@ impl Journal {
             path,
             pending: Mutex::new(Vec::new()),
             file: Mutex::new(JournalFile { id, written }),
+            pushed: AtomicU64::new(written),
         }
+    }
+
+    /// Bytes the journal holds once everything pushed is written
+    pub(super) fn len(&self) -> u64 {
+        self.pushed.load(Ordering::Acquire)
     }
 
     /// Add the rows of one write that has landed, as one group
@@ -84,7 +94,11 @@ impl Journal {
         if rows.is_empty() {
             return;
         }
-        push_group(rows, &mut lock(&self.pending));
+        let mut pending = lock(&self.pending);
+        let before = pending.len();
+        push_group(rows, &mut pending);
+        self.pushed
+            .fetch_add((pending.len() - before) as u64, Ordering::AcqRel);
     }
 
     /// Write every pending group and sync, under the file's lock so a seal waits for it

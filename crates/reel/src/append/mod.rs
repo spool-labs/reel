@@ -269,6 +269,11 @@ impl Active {
     fn settle(&self, span: u64) {
         self.settled.fetch_add(span, Ordering::AcqRel);
     }
+
+    /// The bytes records may reach, so records and journal together stay within the segment
+    fn room(&self, target: u64) -> u64 {
+        target.saturating_sub(self.journal.len())
+    }
 }
 
 /// One append tail: a reservation head over one active segment
@@ -898,7 +903,8 @@ impl Appender {
                 continue;
             }
             let base = self.claim_filled(&active, span);
-            if base + span + ALIGN <= target && base + span <= MAX_SEGMENT_OFFSET {
+            let room = active.room(target);
+            if base + span + ALIGN <= room && base + span <= MAX_SEGMENT_OFFSET {
                 // The hold is taken with the tail still held shared, so the roll that
                 // seals this segment cannot come between the record landing and the
                 // maintenance plane being told to wait for it. The gauge is given back
@@ -929,7 +935,7 @@ impl Appender {
                     segment: active.handle.id(),
                     target: base + span,
                 });
-                let wants_spare = base + span + self.spare_margin() >= target;
+                let wants_spare = base + span + self.spare_margin() >= room;
                 drop(active);
                 if wants_spare {
                     self.prepare_spare();
@@ -1011,7 +1017,8 @@ impl Appender {
                 continue;
             }
             let base = self.claim_filled(&active, span);
-            if base + span + ALIGN <= target && base + span <= MAX_SEGMENT_OFFSET {
+            let room = active.room(target);
+            if base + span + ALIGN <= room && base + span <= MAX_SEGMENT_OFFSET {
                 let mut committed = Vec::with_capacity(count);
                 for header in &headers {
                     active.holds.hold_record();
@@ -1042,7 +1049,7 @@ impl Appender {
                 }
                 self.tail.publish_committed(base + span);
                 self.paced_writeback(&active);
-                let wants_spare = base + span + self.spare_margin() >= target;
+                let wants_spare = base + span + self.spare_margin() >= room;
                 drop(active);
                 if wants_spare {
                     self.prepare_spare();

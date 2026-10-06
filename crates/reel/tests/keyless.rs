@@ -10,14 +10,26 @@ use reel::{KeyWidth, Preallocate, ReelStore, SEGMENT_SUFFIX};
 
 const RECORDS: ColumnId = ColumnId(1);
 
-const COLUMNS: &[ColumnSpec] = &[ColumnSpec {
-    id: RECORDS,
-    name: "records",
-    key_width: KeyWidth::Fixed(16),
-    shard_bytes: 1,
-    purge_mark: None,
-    codec: Codec::None,
-}];
+const WIDE: ColumnId = ColumnId(2);
+
+const COLUMNS: &[ColumnSpec] = &[
+    ColumnSpec {
+        id: RECORDS,
+        name: "records",
+        key_width: KeyWidth::Fixed(16),
+        shard_bytes: 1,
+        purge_mark: None,
+        codec: Codec::None,
+    },
+    ColumnSpec {
+        id: WIDE,
+        name: "wide",
+        key_width: KeyWidth::Fixed(108),
+        shard_bytes: 1,
+        purge_mark: None,
+        codec: Codec::None,
+    },
+];
 
 /// Keys written, enough to roll the small segment several times
 const KEYS: u64 = 2_000;
@@ -124,5 +136,35 @@ fn a_seal_leaves_no_journal() {
         journals <= 2,
         "{journals} journals stand beside {segments} segments"
     );
+    drop(store);
+}
+
+// an open segment rolls once its records and journal fill it, however small the records
+#[test]
+fn a_journal_stays_within_its_segment() {
+    let dir = TempDir::new().expect("tempdir");
+    let store = ReelStore::open(dir.path().to_path_buf(), config(), COLUMNS).expect("open");
+    for at in 0..KEYS {
+        let mut bytes = [0u8; 108];
+        bytes[..8].copy_from_slice(&at.to_be_bytes());
+        let key = RecordKey::from_bytes(WIDE, &bytes).expect("key");
+        store.put(&key, &[1u8]).expect("put");
+    }
+    store.flush().expect("flush");
+    let limit = config().segment_bytes.to_bytes();
+    for entry in std::fs::read_dir(dir.path()).expect("list") {
+        let entry = entry.expect("entry");
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(JOURNAL_SUFFIX)
+        {
+            let len = entry.metadata().expect("stat").len();
+            assert!(
+                len <= limit,
+                "a journal of {len} bytes outgrew its {limit} byte segment"
+            );
+        }
+    }
     drop(store);
 }

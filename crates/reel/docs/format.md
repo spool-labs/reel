@@ -150,7 +150,9 @@ Every other backend has the kernel assemble the block and writes the records alo
 
 An open segment keeps its rows in a journal beside it, `<segment>.rows`, until its
 seal. Each write adds one group: the rows of the records it put down, a batch's rows
-together.
+together. The journal's bytes count against `segment_bytes`, so a segment rolls once
+its records and journal together fill it. Tiny records under wide keys seal sooner,
+and neither the open files nor the sealed one outgrow the segment size.
 
 ```
 | rows, 4 | bytes, 4 | row | row | ... | crc32c, 4 |

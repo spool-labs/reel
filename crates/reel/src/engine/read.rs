@@ -265,7 +265,7 @@ impl ReelStore {
                 Offered::Again | Offered::Unsettled => Lookup::Unsettled,
             };
             values[spot.at] = match self.index.spot_finish(spot.column, key, spot.since, lookup) {
-                Lookup::Found(_, value) => Some(value),
+                Lookup::Found(_, value) | Lookup::Newest(value) => Some(value),
                 Lookup::Missing => None,
                 Lookup::Unsettled => self.get(key)?,
             };
@@ -285,6 +285,7 @@ impl ReelStore {
                     segment: candidate.segment,
                     offset: candidate.offset,
                     bound: candidate.bound,
+                    alone: candidate.alone,
                 });
             }
             taken.push(candidate);
@@ -336,7 +337,7 @@ impl ReelStore {
                     break;
                 };
                 let read = shared
-                    .spot_record_wait(key, candidate.segment, candidate.offset, candidate.bound)
+                    .spot_record_wait(key, candidate.segment, candidate.offset, candidate.bound, candidate.alone)
                     .await?;
                 flow = column.offer(&mut spot.pick, candidate, read);
             }
@@ -345,7 +346,7 @@ impl ReelStore {
                 Offered::Again | Offered::Unsettled => Lookup::Unsettled,
             };
             values[spot.at] = match self.index.spot_finish(spot.column, key, spot.since, lookup) {
-                Lookup::Found(_, value) => Some(value),
+                Lookup::Found(_, value) | Lookup::Newest(value) => Some(value),
                 Lookup::Missing => None,
                 Lookup::Unsettled => self.get_wait(key).await?,
             };
@@ -568,11 +569,11 @@ impl ReelStore {
         // The spot index holds a key's newest sealed version, which answers in one read
         // when the cue can see it.
         if let Some((column, since)) = self.index.spot_route_at(key) {
-            let lookup = self.index.spot_column(column).read(key)?;
+            let lookup = self.index.spot_column(column).read_versioned(key)?;
             match self.index.spot_finish_at(column, key, since, at, lookup) {
                 Lookup::Found(_, value) => return Ok(Some(value)),
                 Lookup::Missing => return Ok(None),
-                Lookup::Unsettled => {}
+                Lookup::Newest(_) | Lookup::Unsettled => {}
             }
         }
         let Some(entry) = self.index.get_at(key, at)? else {
@@ -652,7 +653,7 @@ impl ReelStore {
     /// reader does not own.
     fn resolve_read(&self, key: &RecordKey) -> Result<Resolved> {
         match self.index.spot_read(key)? {
-            Lookup::Found(_, payload) => return Ok(Resolved::Payload(payload)),
+            Lookup::Found(_, payload) | Lookup::Newest(payload) => return Ok(Resolved::Payload(payload)),
             Lookup::Missing => return Ok(Resolved::Missing),
             Lookup::Unsettled => {}
         }
@@ -681,7 +682,7 @@ impl ReelStore {
     /// a fault cannot be woken.
     async fn resolve_read_wait(&self, key: &RecordKey) -> Result<Resolved> {
         match self.spot_read_wait(key).await? {
-            Lookup::Found(_, payload) => return Ok(Resolved::Payload(payload)),
+            Lookup::Found(_, payload) | Lookup::Newest(payload) => return Ok(Resolved::Payload(payload)),
             Lookup::Missing => return Ok(Resolved::Missing),
             Lookup::Unsettled => {}
         }
@@ -716,7 +717,7 @@ impl ReelStore {
             };
             while let Some(candidate) = column.next(&mut pick) {
                 let read = shared
-                    .spot_record_wait(key, candidate.segment, candidate.offset, candidate.bound)
+                    .spot_record_wait(key, candidate.segment, candidate.offset, candidate.bound, candidate.alone)
                     .await?;
                 match column.offer(&mut pick, candidate, read) {
                     Offered::Next => {}
@@ -741,11 +742,12 @@ impl ReelStore {
     fn spot_range_answer(&self, at: usize, key: &RecordKey, since: Since, read: SpotRange) -> Option<Resolved> {
         let lookup = match read {
             SpotRange::Found(head, window) => Lookup::Found(head.lsn, window),
+            SpotRange::Newest(window) => Lookup::Newest(window),
             SpotRange::Tombstone(_) => Lookup::Missing,
             SpotRange::Other | SpotRange::Gone | SpotRange::Unsure => return None,
         };
         match self.index.spot_finish(at, key, since, lookup) {
-            Lookup::Found(_, window) => Some(Resolved::Payload(window)),
+            Lookup::Found(_, window) | Lookup::Newest(window) => Some(Resolved::Payload(window)),
             Lookup::Missing => Some(Resolved::Missing),
             Lookup::Unsettled => None,
         }
@@ -761,7 +763,7 @@ impl ReelStore {
             let read = self
                 .reel
                 .shared()
-                .spot_range(key, candidate.segment, candidate.offset, offset, len)?;
+                .spot_range(key, candidate.segment, candidate.offset, candidate.bound, candidate.alone, offset, len)?;
             if let Some(resolved) = self.spot_range_answer(at, key, since, read) {
                 return Ok(resolved);
             }
@@ -805,7 +807,7 @@ impl ReelStore {
             let read = self
                 .reel
                 .shared()
-                .spot_range_wait(key, candidate.segment, candidate.offset, offset, len)
+                .spot_range_wait(key, candidate.segment, candidate.offset, candidate.bound, candidate.alone, offset, len)
                 .await?;
             if let Some(resolved) = self.spot_range_answer(at, key, since, read) {
                 return Ok(resolved);

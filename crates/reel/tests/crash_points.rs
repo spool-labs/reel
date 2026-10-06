@@ -12,7 +12,8 @@ mod harness;
 use std::collections::{BTreeMap, BTreeSet};
 
 use reel::format::column::RecordKey;
-use reel::format::record::{BatchFrame, RecordHeader, HEADER_LEN};
+use reel::format::journal::{journal_path, read_groups, JOURNAL_SUFFIX};
+use reel::format::record::KEYLESS_PREFIX;
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::{
@@ -668,7 +669,6 @@ const NEIGHBOUR: u8 = 9;
 /// at any of them leaves a run that must not be applied at all.
 #[derive(Clone, Copy, Debug)]
 enum Tear {
-    Frame,
     FirstRecord,
     MidBatch,
     LastRecord,
@@ -678,12 +678,11 @@ enum Tear {
 //
 // The reservation is one range and the write is one writev, so a crash inside it lands
 // at some byte of the run and the bytes past it stay the zeros the tail reserved. The
-// frame is what recovery reads that by: it declares how many records follow and how
-// many bytes they take, so a run that stops short is dropped whole.
+// batch's rows journal as one group, and recovery keeps a group only when every record
+// it lists checks out, so a run that stops short is dropped whole.
 #[test]
 fn a_torn_batch_leaves_nothing_of_itself() {
     for tear in [
-        Tear::Frame,
         Tear::FirstRecord,
         Tear::MidBatch,
         Tear::LastRecord,
@@ -732,7 +731,7 @@ fn a_torn_batch_leaves_nothing_of_itself() {
 // drops the delete with it and the keys it covered are still there.
 #[test]
 fn a_torn_range_batch_applies_neither_half() {
-    for tear in [Tear::Frame, Tear::MidBatch, Tear::LastRecord] {
+    for tear in [Tear::FirstRecord, Tear::MidBatch, Tear::LastRecord] {
         let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, SEGMENT_LARGE));
         let sim = SimIo::new(FaultPlan::new(1));
         let store = harness.open_or_panic(sim.clone());
@@ -788,61 +787,43 @@ fn address_key(address: u8) -> RecordKey {
 /// Cut the last batch of the image at a point inside it, as a stopped write would
 ///
 /// Everything from the cut to the end of the segment goes back to the zeros the tail
-/// had reserved there, which is what a writev that never got that far leaves.
+/// had reserved there, which is what a writev that never got that far leaves. The batch
+/// is found through the journal, whose group of more than one row is a batch's.
 fn cut_the_last_batch(image: &mut DurableImage, tear: Tear) {
+    let journals: Vec<(std::path::PathBuf, Vec<u8>)> = image
+        .iter()
+        .filter(|(path, _)| path.to_string_lossy().ends_with(JOURNAL_SUFFIX))
+        .cloned()
+        .collect();
     for (path, bytes) in image.iter_mut() {
         if !path.to_string_lossy().ends_with(SEGMENT_SUFFIX) {
             continue;
         }
-        let Some(at) = tear_offset(bytes, tear) else {
+        let Some((_, journal)) = journals.iter().find(|(journal, _)| *journal == journal_path(path)) else {
+            continue;
+        };
+        let Some(at) = tear_offset(journal, tear) else {
             continue;
         };
         bytes[at as usize..].fill(0);
         return;
     }
-    panic!("no segment of the image holds a framed batch");
+    panic!("no segment of the image holds a batch");
 }
 
-/// Where in the last batch of a segment a tear falls
-fn tear_offset(bytes: &[u8], tear: Tear) -> Option<u64> {
-    let (frame_at, frame) = last_frame(bytes)?;
-    let run_at = frame_at + BatchFrame::SPAN;
-    let mut starts = Vec::new();
-    let mut at = run_at;
-    while at < run_at + frame.span {
-        let header = RecordHeader::unpack(&bytes[at as usize..]).ok()?;
-        starts.push(at);
-        at += header.span();
-    }
-    let last = *starts.last()?;
+/// Where in the last batch a journal lists a tear falls
+fn tear_offset(journal: &[u8], tear: Tear) -> Option<u64> {
+    let (groups, _) = read_groups(journal);
+    let batch = groups.into_iter().rev().find(|group| group.len() > 1)?;
+    let mut starts: Vec<u64> = batch.iter().map(|row| u64::from(row.offset)).collect();
+    starts.sort_unstable();
+    // Past a record's own check, so the bytes that tear are its payload.
+    let inside = KEYLESS_PREFIX as u64;
     Some(match tear {
-        // Inside the declaration, which the frame's own checksum covers.
-        Tear::Frame => frame_at + HEADER_LEN as u64 + 2,
-        Tear::FirstRecord => run_at + HEADER_LEN as u64,
+        Tear::FirstRecord => starts[0] + inside,
         Tear::MidBatch => starts[starts.len() / 2],
-        Tear::LastRecord => last + HEADER_LEN as u64,
+        Tear::LastRecord => *starts.last()? + inside,
     })
-}
-
-/// The last batch frame a segment holds, and where it sits
-fn last_frame(bytes: &[u8]) -> Option<(u64, BatchFrame)> {
-    let mut found = None;
-    let mut at = 0u64;
-    while at + HEADER_LEN as u64 <= bytes.len() as u64 {
-        let Ok(header) = RecordHeader::unpack(&bytes[at as usize..]) else {
-            break;
-        };
-        if header.is_unwritten() || !header.fits_within(bytes.len() as u64 - at) {
-            break;
-        }
-        if header.flags.is_batch_frame() {
-            let from = (at + header.prefix_len()) as usize;
-            let declaration = &bytes[from..from + header.length as usize];
-            found = BatchFrame::unpack(&header, declaration).map(|frame| (at, frame));
-        }
-        at += header.span();
-    }
-    found
 }
 
 // a read time checksum failure treats a corrupted record as missing and stays consistent

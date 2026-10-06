@@ -25,7 +25,8 @@ use reel::format::footer::{FooterEntry, SegmentFooter};
 use reel::format::loc::SegmentId;
 use reel::format::lsn::Lsn;
 use reel::format::prefix::{unpack, PrefixRows, Tail};
-use reel::format::record::{BatchFrame, CheckKey, Flags, RecordHeader, RecordLayout, HEADER_LEN};
+use reel::format::journal::read_groups;
+use reel::format::record::{CheckKey, Flags, RecordHeader, RecordLayout, HEADER_LEN};
 use reel::format::segment_header::{SegmentHeader, SEGMENT_HEADER_LEN, SEGMENT_HEADER_SPAN};
 use reel::index::column::ColumnMark;
 use reel::index::persisted::{PersistedColumn, PersistedIndex, PersistedSegment};
@@ -114,19 +115,7 @@ fn parsers_never_panic_on_arbitrary_bytes() {
             for codec in CODECS {
                 let _ = decode(codec.as_byte(), &bytes);
             }
-
-            // a frame reads a header beside its payload, so it is offered both: a
-            // header these bytes really parse to where they do, and one packed to
-            // claim a frame where they do not, since a random string almost never
-            // carries the flag that gets past the first check.
-            if let Ok(header) = RecordHeader::unpack(&bytes) {
-                let _ = BatchFrame::unpack(&header, &bytes);
-            }
-            let declared = BatchFrame {
-                count: rng.gen(),
-                span: rng.gen(),
-            };
-            let _ = BatchFrame::unpack(&declared.header(), &bytes);
+            let _ = read_groups(&bytes);
         }
     }
 }

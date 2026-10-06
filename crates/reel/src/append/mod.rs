@@ -26,7 +26,7 @@ use crate::format::footer::{FooterEntry, SegmentFooter};
 use crate::format::journal::JournalRow;
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::{Lsn, LsnCounter};
-use crate::format::record::{align_up, BatchFrame, Flags, RecordHeader, BLOCK, HEADER_LEN};
+use crate::format::record::{align_up, CheckKey, Flags, RecordHeader, RecordLayout, BLOCK, HEADER_LEN};
 use crate::format::segment_header::SegmentHeader;
 use crate::index::recovery::ResumableTail;
 use crate::io::mapping::WriteMapping;
@@ -42,7 +42,7 @@ use journal::Journal;
 pub use flush::{Durability, FlushTurn};
 use sealer::{
     doom_active, flush_active, park_broken_seal, publish_flush, retire_segment, seal_segment,
-    stamp_failed_range, Sealer,
+    Sealer,
 };
 pub(crate) use sealer::{retry_broken_seals, BrokenSeal};
 
@@ -146,25 +146,6 @@ impl Origin {
         match self {
             Origin::Fresh => flags,
             Origin::Relocated(_) => flags.relocated(),
-        }
-    }
-}
-
-/// Whether a record belongs to a batch or stands on its own
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum BatchMark {
-    /// Not part of a batch at all, which a batch of one record also is
-    Alone,
-
-    /// One of a framed batch's records, which must never be applied alone
-    Member,
-}
-
-impl BatchMark {
-    fn applied(self, flags: Flags) -> Flags {
-        match self {
-            BatchMark::Alone => flags,
-            BatchMark::Member => flags.batched(),
         }
     }
 }
@@ -497,7 +478,8 @@ impl Appender {
         let mut headers = Vec::with_capacity(copies.len());
         let mut payloads = Vec::with_capacity(copies.len());
         for copy in copies {
-            headers.push(RecordHeader::new_coded(
+            headers.push(RecordHeader::framed(
+                RecordLayout::KEYLESS,
                 copy.payload.len() as u32,
                 copy.lsn,
                 Origin::Relocated(copy.lsn).applied(Flags::DATA),
@@ -507,7 +489,7 @@ impl Appender {
             ));
             payloads.push(copy.payload);
         }
-        self.place_run(headers, payloads, false, None)
+        self.place_run(headers, payloads, None)
     }
 
     /// Bytes one run of copies may hold, a small share of a segment at most
@@ -895,7 +877,7 @@ impl Appender {
         // segment hold accounts for.
         let mut drawn = (origin == Origin::Fresh).then(|| self.shared.draw_gauge(1));
         let lsn = origin.lsn(&self.shared.lsn);
-        let (header, mut payload) = build_record(key, lsn, intent, BatchMark::Alone, origin);
+        let (header, mut payload) = build_record(key, lsn, intent, origin);
         let span = self.reserved_span(&header);
         let target = self.shared.config.segment_bytes.to_bytes();
 
@@ -930,20 +912,10 @@ impl Appender {
                 let outcome =
                     self.write_record(&active, base, &header, std::mem::take(&mut payload));
                 active.settle(span);
-                // A write that failed leaves its range unwritten in the middle of the
-                // segment. Stamped as fill, the range is one record a recovery walk
-                // hops; only when the stamp will not land either does the seal cut
-                // below it and carry the loss.
+                // A write that failed lists no row, so its range is garbage nothing
+                // points into and the records above it stand.
                 if outcome.is_err() {
-                    match stamp_failed_range(&self.shared, &active, base, span) {
-                        true => self.tail.publish_committed(base + span),
-                        false => {
-                            active.cut_at.fetch_min(base, Ordering::AcqRel);
-                            // An unstamped hole strands whatever commits above it until
-                            // the seal.
-                            self.shared.note_past_saving();
-                        }
-                    }
+                    self.tail.publish_committed(base + span);
                 }
                 let loc = outcome?;
                 // The bytes are down, so the segment can surface this number whether or
@@ -995,12 +967,6 @@ impl Appender {
         let drawn = self.shared.draw_gauge(count as u64);
         let mut headers = Vec::with_capacity(count);
         let mut payloads = Vec::with_capacity(count);
-        // A batch of one is a plain record: there is no middle for a crash to land in,
-        // so it carries neither a frame nor a mark and pays for neither.
-        let mark = match count > 1 {
-            true => BatchMark::Member,
-            false => BatchMark::Alone,
-        };
         let first = self.shared.lsn.issue_run(count as u64);
         for (at, record) in records.into_iter().enumerate() {
             let lsn = Lsn(first.0 + at as u64);
@@ -1009,31 +975,26 @@ impl Appender {
                 BatchWrite::Delete => Intent::Tombstone,
                 BatchWrite::DeleteRange(end) => Intent::RangeTombstone(end),
             };
-            let (header, payload) = build_record(record.key, lsn, intent, mark, Origin::Fresh);
+            let (header, payload) = build_record(record.key, lsn, intent, Origin::Fresh);
             headers.push(header);
             payloads.push(payload);
         }
 
-        self.place_run(headers, payloads, mark == BatchMark::Member, Some(drawn))
+        self.place_run(headers, payloads, Some(drawn))
     }
 
     /// Reserve one range for a run of built records, write it, and say where each landed
     ///
-    /// A framed run is a batch a crash has to drop whole. A run of copies has no frame.
+    /// The run's rows journal as one group, which is what makes a batch come back from
+    /// a crash whole or not at all.
     fn place_run<Payload: Into<WriteBuf>>(
         &self,
         headers: Vec<RecordHeader>,
         mut payloads: Vec<Payload>,
-        is_framed: bool,
         mut drawn: Option<DrawnRecords<'_>>,
     ) -> Result<Vec<Committed>> {
         let count = headers.len();
-        let run: u64 = headers.iter().map(|header| header.span()).sum();
-        let frame = is_framed.then_some(BatchFrame {
-            count: count as u32,
-            span: run,
-        });
-        let framed = run + frame.map_or(0, |_| BatchFrame::SPAN);
+        let framed: u64 = headers.iter().map(|header| header.span_in(RecordLayout::KEYLESS)).sum();
         let span = self.reserved_batch_span(framed);
         let target = self.shared.config.segment_bytes.to_bytes();
         if span + ALIGN > target {
@@ -1065,23 +1026,13 @@ impl Appender {
                 let outcome = self.write_run(
                     &active,
                     base,
-                    frame,
                     &headers,
                     std::mem::take(&mut payloads),
                     framed,
                 );
                 active.settle(span);
-                // The same stamp a single record leaves, over the whole reservation.
                 if outcome.is_err() {
-                    match stamp_failed_range(&self.shared, &active, base, span) {
-                        true => self.tail.publish_committed(base + span),
-                        false => {
-                            active.cut_at.fetch_min(base, Ordering::AcqRel);
-                            // An unstamped hole strands whatever commits above it until
-                            // the seal.
-                            self.shared.note_past_saving();
-                        }
-                    }
+                    self.tail.publish_committed(base + span);
                 }
                 let locs = outcome?;
                 // A batch's numbers were issued in order and a run of copies brings its
@@ -1116,50 +1067,39 @@ impl Appender {
     }
 
     /// Write a run of records into one reservation with a single vectored write
-    ///
-    /// The frame goes down in the same write as the records it declares, ahead of them,
-    /// so nothing can leave a frame standing over a run that was never written.
     fn write_run<Payload: Into<WriteBuf>>(
         &self,
         active: &Active,
         base: u64,
-        frame: Option<BatchFrame>,
         headers: &[RecordHeader],
         payloads: Vec<Payload>,
         framed: u64,
     ) -> Result<Vec<Loc>> {
         // Three buffers a record rather than two, since a spilled key rides in one of its
-        // own between the header and the payload, and one more for the frame.
-        let mut bufs = take_bufs(headers.len() * 3 + 3);
+        // own between the header and the payload, and one more for the block's zeros.
+        let mut bufs = take_bufs(headers.len() * 3 + 1);
         let mut locs = Vec::with_capacity(headers.len());
         let mut entries = Vec::with_capacity(headers.len());
         let mut at = base;
-        if let Some(frame) = frame {
-            // Staged rather than owned, so a frame costs the batch no allocation.
-            WriteBuf::push_prefix(&mut bufs, frame.pack());
-            at += BatchFrame::SPAN;
-        }
         let mut rows = Vec::with_capacity(headers.len());
+        let layout = active.handle.layout();
         for (header, payload) in headers.iter().zip(payloads) {
             let payload = payload.into();
             if let Some(entry) = FooterEntry::from_record(header, at as u32) {
                 entries.push(entry);
                 rows.push(journal_row(header, at as u32, payload.as_slice()));
             }
-            WriteBuf::push_prefix(&mut bufs, header.pack());
+            WriteBuf::push_prefix(&mut bufs, header.pack_in(layout, payload.as_slice()));
             if header.has_payload() {
                 bufs.push(payload);
             }
             locs.push(Loc::new(active.handle.id(), at as u32, header.length));
-            at += header.span();
+            at += header.span_in(layout);
         }
 
-        let mut written = framed;
-        if self.shared.writes_whole_blocks() {
-            let pad = RecordHeader::fill(self.batch_fill(framed));
-            WriteBuf::push_prefix(&mut bufs, pad.pack());
-            bufs.push(WriteBuf::zeros(pad.length as usize));
-            written += pad.span();
+        let written = self.reserved_batch_span(framed);
+        if written > framed {
+            bufs.push(WriteBuf::zeros((written - framed) as usize));
         }
 
         self.depth.observe(self.inflight.load(Ordering::Relaxed));
@@ -1205,31 +1145,17 @@ impl Appender {
         Ok(wrote)
     }
 
-    /// Bytes a whole batch holds, including the pad a whole-block volume adds
+    /// Bytes a run of records holds, out to the next block on a whole-block volume
     fn reserved_batch_span(&self, framed: u64) -> u64 {
         if self.shared.writes_whole_blocks() {
-            return align_up(framed + HEADER_LEN as u64, ALIGN);
+            return align_up(framed, ALIGN);
         }
         framed
     }
 
-    /// Fill the closing pad a batch needs to reach the next block boundary
-    fn batch_fill(&self, framed: u64) -> u32 {
-        (self.reserved_batch_span(framed) - framed - HEADER_LEN as u64) as u32
-    }
-
-    /// Bytes one record holds, including the pad a whole-block volume adds
-    ///
-    /// A segment stops taking records a block short of its target, so the seal has room
-    /// for the closing pad and the footer behind it.
+    /// Bytes one record holds, out to the next block on a whole-block volume
     fn reserved_span(&self, header: &RecordHeader) -> u64 {
-        let span = header.span();
-        if self.shared.writes_whole_blocks() {
-            // The gap left over has to hold the pad header that names it, or it reads
-            // back as unwritten space and stops a scan at the record after it.
-            return align_up(span + HEADER_LEN as u64, ALIGN);
-        }
-        span
+        self.reserved_batch_span(header.span_in(RecordLayout::KEYLESS))
     }
 
     /// Write one record into the range a reservation named
@@ -1246,17 +1172,16 @@ impl Appender {
             .map(|_| journal_row(header, base as u32, payload.as_slice()));
 
         // Five rather than four, since a spilled key rides in a buffer of its own.
+        let layout = active.handle.layout();
         let mut bufs = take_bufs(5);
-        WriteBuf::push_prefix(&mut bufs, header.pack());
+        WriteBuf::push_prefix(&mut bufs, header.pack_in(layout, &payload));
         if header.has_payload() {
             bufs.push(WriteBuf::owned(payload));
         }
-        let mut framed = header.span();
-        if self.shared.writes_whole_blocks() {
-            let pad = RecordHeader::pad(base + framed);
-            WriteBuf::push_prefix(&mut bufs, pad.pack());
-            bufs.push(WriteBuf::zeros(pad.length as usize));
-            framed += pad.span();
+        let span = header.span_in(layout);
+        let framed = self.reserved_batch_span(span);
+        if framed > span {
+            bufs.push(WriteBuf::zeros((framed - span) as usize));
         }
 
         self.depth.observe(self.inflight.load(Ordering::Relaxed));
@@ -1581,12 +1506,12 @@ impl Appender {
             true => align_up(resumed.end + HEADER_LEN as u64, ALIGN),
             false => resumed.end,
         };
-        let handle = SegmentHandle::new(
+        let handle = SegmentHandle::opened(
             resumed.segment,
             resumed.path,
             file,
             Arc::clone(&self.shared.driver),
-        );
+        )?;
         let active = Active {
             handle,
             reserved: AtomicU64::new(end),
@@ -1723,7 +1648,10 @@ impl Appender {
         // directory sync per segment closes that, for the segment and its journal.
         self.shared.driver.sync_dir(self.shared.segment_dir(id))?;
         let map = self.write_mapping(&path, file)?;
-        let handle = SegmentHandle::new(id, path, file, Arc::clone(&self.shared.driver));
+        // Every segment drops the key and header of its small records, each checked under
+        // a key of the segment's own.
+        let layout = RecordLayout::Keyless(CheckKey::random()?);
+        let handle = SegmentHandle::new(id, path, file, Arc::clone(&self.shared.driver), layout);
 
         let active = Active {
             handle,
@@ -1746,7 +1674,7 @@ impl Appender {
 
         // Stamped at the draw, since a band is what the segment is for and compaction
         // reads it off the file to place the survivors it copies out.
-        let payload = SegmentHeader::banded(id, self.band()).pack().to_vec();
+        let payload = SegmentHeader::banded(id, self.band()).laid_out(layout).pack().to_vec();
         let header = RecordHeader::segment_header(&payload);
         let span = self.reserved_span(&header);
         active.reserved.store(span, Ordering::Release);
@@ -1865,7 +1793,7 @@ fn recycle_bufs(mut bufs: Vec<WriteBuf>) {
     bufs.clear();
     BUFS_SPARE.with(|held| {
         let spare = held.take();
-        // The roomier of the two is kept, since a batch frames far wider than a
+        // The roomier of the two is kept, since a batch takes far more buffers than a
         // single record and a thread that batches once will batch again.
         held.set(match spare.capacity() > bufs.capacity() {
             true => spare,
@@ -1874,16 +1802,12 @@ fn recycle_bufs(mut bufs: Vec<WriteBuf>) {
     });
 }
 
-/// Bytes a whole batch takes against admission, framing and all
+/// Bytes a whole batch takes against admission
 fn batch_bytes(records: &[BatchRecord]) -> u64 {
-    let mut bytes = match records.len() > 1 {
-        true => BatchFrame::SPAN,
-        false => 0,
-    };
-    for record in records {
-        bytes += framed_bytes(&record.key, record.write.len());
-    }
-    bytes
+    records
+        .iter()
+        .map(|record| framed_bytes(&record.key, record.write.len()))
+        .sum()
 }
 
 /// A segment that can no longer be made durable, for a writer waiting on one
@@ -1896,23 +1820,19 @@ fn not_durable(segment: SegmentId) -> ReelError {
 
 /// Bytes a record with this key and payload takes on disk
 fn framed_bytes(key: &RecordKey, payload_len: usize) -> u64 {
-    HEADER_LEN as u64 + u64::from(key.width()) + payload_len as u64
+    let prefix = RecordLayout::KEYLESS.prefix_len(key.width() as usize, payload_len as u32);
+    prefix as u64 + payload_len as u64
 }
 
 /// Resolve an intent to the header and payload the record writes
 ///
 /// The batch mark goes on before the checksum, which covers the flags.
-fn build_record(
-    key: RecordKey,
-    lsn: Lsn,
-    intent: Intent,
-    mark: BatchMark,
-    origin: Origin,
-) -> (RecordHeader, OwnedBuf) {
-    let flags = |kind: Flags| origin.applied(mark.applied(kind));
+fn build_record(key: RecordKey, lsn: Lsn, intent: Intent, origin: Origin) -> (RecordHeader, OwnedBuf) {
+    let flags = |kind: Flags| origin.applied(kind);
     match intent {
         Intent::Data(payload, codec) => (
-            RecordHeader::new_coded(
+            RecordHeader::framed(
+                RecordLayout::KEYLESS,
                 payload.len() as u32,
                 lsn,
                 flags(Flags::DATA),
@@ -1923,15 +1843,17 @@ fn build_record(
             payload,
         ),
         Intent::Tombstone => (
-            RecordHeader::new(0, lsn, flags(Flags::TOMBSTONE), key, &[]),
+            RecordHeader::framed(RecordLayout::KEYLESS, 0, lsn, flags(Flags::TOMBSTONE), key, 0, &[]),
             Vec::new(),
         ),
         Intent::RangeTombstone(end) => (
-            RecordHeader::new(
+            RecordHeader::framed(
+                RecordLayout::KEYLESS,
                 end.len() as u32,
                 lsn,
                 flags(Flags::RANGE_TOMBSTONE),
                 key,
+                0,
                 &end,
             ),
             end,

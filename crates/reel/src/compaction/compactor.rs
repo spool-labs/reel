@@ -14,10 +14,13 @@ use crate::config::{ReelConfig, RepairPath, VolumeClass};
 use crate::error::Result;
 use crate::format::band::Band;
 use crate::format::column::RecordKey;
-use crate::format::footer::{SegmentFooter, FIXED_TAIL_LEN};
+use crate::format::footer::{FooterRow, SegmentFooter, FIXED_TAIL_LEN};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
-use crate::format::record::{peek_key_width, read_u32_le, RecordHeader, HEADER_LEN};
+use crate::format::record::{
+    check_keyless, fits_keyless, keyless_codec, peek_key_width, read_u32_le, CheckKey, KeylessRead, RecordHeader,
+    RecordLayout, HEADER_LEN, KEYLESS_PREFIX,
+};
 use crate::format::segment_header::SegmentHeader;
 use crate::index::map::{KeyRepoint, ReelIndex};
 use crate::io::op::Part;
@@ -84,15 +87,44 @@ enum TombstoneStep {
 }
 
 /// One record read back from a segment during compaction, a merge or a scrub
+///
+/// A keyless record's header is put together from its footer row and its codec, and
+/// its check stays the one it was written with, which `verify` checks.
 pub struct SourceRecord {
     /// What the record says about itself, key and sequence number included
     pub header: RecordHeader,
 
     /// Where the record header begins within its segment
     pub offset: u32,
+
+    /// Bytes ahead of the payload: the header and key, or a keyless record's check and shape
+    prefix: u32,
+
+    /// A keyless record's own prefix and the key its segment checks under, nothing for a keyed one
+    keyless: Option<([u8; KEYLESS_PREFIX], CheckKey)>,
 }
 
 impl SourceRecord {
+    /// A record whose header and key were read where it lies
+    pub fn keyed(header: RecordHeader, offset: u32) -> SourceRecord {
+        SourceRecord {
+            prefix: header.prefix_len() as u32,
+            header,
+            offset,
+            keyless: None,
+        }
+    }
+
+    /// A keyless record, its header taken from its footer row
+    fn keyless(header: RecordHeader, offset: u32, stored: [u8; KEYLESS_PREFIX], check: CheckKey) -> SourceRecord {
+        SourceRecord {
+            header,
+            offset,
+            prefix: KEYLESS_PREFIX as u32,
+            keyless: Some((stored, check)),
+        }
+    }
+
     /// Where this record sits, for the liveness check against the index
     pub fn loc(&self, segment: SegmentId) -> Loc {
         Loc::new(segment, self.offset, self.header.length)
@@ -100,13 +132,56 @@ impl SourceRecord {
 
     /// Bytes the record occupies, framing included
     pub fn span(&self) -> u64 {
-        self.header.span()
+        u64::from(self.prefix) + u64::from(self.header.length)
     }
 
     /// Offset the record's payload begins at within its segment
     pub fn payload_at(&self) -> u64 {
-        u64::from(self.offset) + self.header.prefix_len()
+        u64::from(self.offset) + u64::from(self.prefix)
     }
+
+    /// Whether the payload checks out against what the record was written with
+    pub fn verify(&self, payload: &[u8]) -> bool {
+        match &self.keyless {
+            Some((stored, check)) => {
+                let header = &self.header;
+                let read = check_keyless(stored, payload, header.key.as_ref(), header.flags, check);
+                matches!(read, KeylessRead::Intact(_))
+            }
+            None => self.header.verify(payload),
+        }
+    }
+}
+
+/// The record one footer row stands for, read the way its segment frames it
+///
+/// A keyless record's key, version, length and kind come off the row and only its
+/// check and codec off the file, so nothing here has been verified yet. A record past
+/// the keyless ceiling keeps its header and is read as a keyed one is. Nothing where
+/// the bytes are not the record the row says sits there.
+pub fn row_record(
+    reader: &mut SegmentReader<'_>,
+    layout: RecordLayout,
+    key: &RecordKey,
+    row: &FooterRow,
+) -> Result<Option<SourceRecord>> {
+    if let Some(check) = layout.keyless_key(row.len) {
+        let prefix = reader.range(u64::from(row.offset), KEYLESS_PREFIX)?;
+        let Ok(stored) = <[u8; KEYLESS_PREFIX]>::try_from(prefix) else {
+            return Ok(None);
+        };
+        let header = RecordHeader {
+            length: row.len,
+            crc: 0,
+            lsn: row.lsn,
+            flags: row.flags,
+            key: key.clone(),
+            codec: keyless_codec(&stored),
+        };
+        return Ok(Some(SourceRecord::keyless(header, row.offset, stored, check)));
+    }
+    let found = RecordScan::resuming(reader, u64::from(row.offset)).next_record()?;
+    Ok(found.filter(|record| record.offset == row.offset && record.header.key == *key))
 }
 
 /// A point-in-time read of the maintenance counters
@@ -637,6 +712,11 @@ impl Compactor {
         // read once for the pass: where the records end, and their key order where the
         // segment can say what that is, offset order otherwise
         let footer = shared.footer_of(segment)?;
+        // A keyless segment with no footer is a merge's output that never sealed. Its
+        // keys are in no row a rewrite could read, so it stands until a reopen drops it.
+        if source.layout().is_keyless_layout() && footer.is_none() {
+            return Ok(());
+        }
         let region_end = footer_bound(shared, &source, file_len, footer.as_deref())?;
         let order = footer.as_deref().and_then(footer_order);
         let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
@@ -683,13 +763,20 @@ impl Compactor {
                 dest_index,
                 index,
                 &mut reader,
-                order,
-                *prefix_bound,
+                Ordered {
+                    order,
+                    prefix_bound: *prefix_bound,
+                    footer: footer.as_deref(),
+                    layout: source.layout(),
+                },
                 segment,
                 drop_floor,
                 &mut tally,
                 &mut pace,
             ),
+            // a keyless segment's records are listed by its rows alone, so one whose rows
+            // will not decode keeps its records until its footer reads
+            None if source.layout().is_keyless_layout() => Ok(()),
             None => self.rewrite_scanning(
                 reel,
                 dest_index,
@@ -780,13 +867,17 @@ impl Compactor {
         dest_index: usize,
         index: &ReelIndex,
         reader: &mut SegmentReader<'_>,
-        order: &[(u32, u32)],
-        prefix_bound: u64,
+        ordered: Ordered<'_>,
         segment: SegmentId,
         drop_floor: Lsn,
         tally: &mut PassTally,
         pace: &mut PassPace<'_>,
     ) -> Result<()> {
+        let Ordered { order, prefix_bound, footer, layout } = ordered;
+        let rows = match (layout, footer) {
+            (RecordLayout::Keyless(_), Some(footer)) => Some(footer_rows(footer)?),
+            _ => None,
+        };
         let mut run = CopyRun::default();
         let mut staged: Vec<Option<Part>> = Vec::new();
         let mut start = 0usize;
@@ -826,8 +917,12 @@ impl Compactor {
                 let Some(held) = held else {
                     continue;
                 };
-                let offset = order[start + slot].0;
-                let (record, payload) = match held_record(offset, held) {
+                let (offset, len) = order[start + slot];
+                let found = match (&rows, layout.keyless_key(len)) {
+                    (Some(rows), Some(check)) => keyless_held(&rows[start + slot], offset, held, check),
+                    _ => held_record(offset, held),
+                };
+                let (record, payload) = match found {
                     Some(found) => found,
                     // a record its footer row undersold is read where it lies
                     None => match RecordScan::resuming(reader, u64::from(offset)).next_record()? {
@@ -905,7 +1000,8 @@ impl Compactor {
         tally: &mut PassTally,
     ) -> Result<()> {
         let cap = reel.tails()[dest_index].copy_run_cap();
-        if !record.header.flags.is_data() || run.bytes + record.span() > cap {
+        // what the copy takes in the destination, a keyed tail whatever the source
+        if !record.header.flags.is_data() || run.bytes + record.header.span() > cap {
             self.land_run(reel, dest_index, index, run, tally)?;
         }
         match self.rewrite_one(
@@ -1002,19 +1098,6 @@ impl Compactor {
             let Some(footer) = shared.footer_of(segment).ok().flatten() else {
                 continue;
             };
-            // The footer's rows drive the walk, not a sequential scan: a hole an earlier
-            // pass left reads as zeroed headers, which a scan takes for the end of data.
-            let mut offsets: Vec<u32> = Vec::new();
-            for partition in &footer.partitions {
-                for at in 0..partition.len() {
-                    let row = partition.row_at(at)?;
-                    if !row.flags.is_data() {
-                        continue;
-                    }
-                    offsets.push(row.offset);
-                }
-            }
-            offsets.sort_unstable();
             let source = match source_handle(shared, segment) {
                 Ok(source) => source,
                 Err(error) if is_missing(&error) => continue,
@@ -1027,6 +1110,24 @@ impl Compactor {
             let region_end = footer_bound(shared, &source, file_len, Some(&footer))?;
             let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
             let mut runs: Vec<(u64, u64)> = Vec::new();
+            if source.layout().is_keyless_layout() {
+                keyless_dead_runs(index, &mut reader, &footer, segment, &mut runs)?;
+            }
+            // The footer's rows drive the walk: a hole an earlier pass left reads as
+            // zeroed headers, which a sequential scan takes for the end of data.
+            let mut offsets: Vec<u32> = Vec::new();
+            if source.layout() == RecordLayout::Keyed {
+                for partition in &footer.partitions {
+                    for at in 0..partition.len() {
+                        let row = partition.row_at(at)?;
+                        if !row.flags.is_data() {
+                            continue;
+                        }
+                        offsets.push(row.offset);
+                    }
+                }
+            }
+            offsets.sort_unstable();
             for offset in offsets {
                 let record =
                     match RecordScan::resuming(&mut reader, u64::from(offset)).next_record()? {
@@ -1096,7 +1197,7 @@ impl Compactor {
             Some(payload) => payload,
             None => held_payload(reader, &record)?,
         };
-        if !record.header.verify(payload.as_slice()) {
+        if !record.verify(payload.as_slice()) {
             // With peers the eviction turns the miss into a repair enqueue. A sole copy
             // keeps its bytes where they are: rewriting them would stamp a fresh
             // checksum over rot and serve it as good.
@@ -1115,8 +1216,8 @@ impl Compactor {
         }
 
         // The appender owns what it writes and the repoint needs the key again, so
-        // the key is cloned once.
-        let span = record.span();
+        // the key is cloned once. The span is the copy's, in a keyed destination.
+        let span = record.header.span();
         let header = record.header;
         run.bytes += span;
         run.copies.push(CopyRecord {
@@ -1318,6 +1419,25 @@ impl Compactor {
             }
         };
         let mut reader = SegmentReader::new(&shared.driver, handle.file(), region_end);
+        if handle.layout().is_keyless_layout() {
+            // a keyless segment with no footer is a merge's output that never sealed,
+            // which holds nothing the index can name
+            let Some(footer) = shared.footer_of(handle.id())? else {
+                return Ok(ScrubStep {
+                    hits: 0,
+                    dead: carried,
+                    resume_at: None,
+                });
+            };
+            let walk = KeylessScrub {
+                index,
+                segment,
+                layout: handle.layout(),
+                region_end,
+                deadline,
+            };
+            return self.scrub_keyless(shared, &walk, &mut reader, &footer, from, carried, budget);
+        }
         let mut scan = RecordScan::resuming(&mut reader, from);
 
         let mut hits = 0usize;
@@ -1354,7 +1474,7 @@ impl Compactor {
                 .reader()
                 .range(record.payload_at(), record.header.length as usize)?;
             let is_intact =
-                payload.len() == record.header.length as usize && record.header.verify(payload);
+                payload.len() == record.header.length as usize && record.verify(payload);
             if !is_intact {
                 // With peers the eviction is the repair enqueue. A sole copy keeps the
                 // key resolving so every read reports the loss.
@@ -1382,6 +1502,141 @@ impl Compactor {
             resume_at: None,
         })
     }
+}
+
+/// Where one keyless scrub pass reads and when it has to stop
+struct KeylessScrub<'a> {
+    index: &'a ReelIndex,
+    segment: SegmentId,
+
+    /// The segment's layout, which carries the key its records are checked under
+    layout: RecordLayout,
+    region_end: u64,
+    deadline: Instant,
+}
+
+impl Compactor {
+    /// Scrub a keyless segment from its rows, resuming at the first row at or past `from`
+    ///
+    /// The rows go in key order, so they are put in offset order first, and a pass
+    /// resumes at the first record at or past where the last one stopped.
+    #[allow(clippy::too_many_arguments)]
+    fn scrub_keyless(
+        &self,
+        shared: &Arc<ReelShared>,
+        walk: &KeylessScrub<'_>,
+        reader: &mut SegmentReader<'_>,
+        footer: &SegmentFooter,
+        from: u64,
+        carried: u64,
+        budget: &mut u64,
+    ) -> Result<ScrubStep> {
+        let mut hits = 0usize;
+        let mut dead = carried;
+        let mut scanned = 0u64;
+        let mut rows = footer_rows(footer)?;
+        rows.retain(|(_, row)| u64::from(row.offset) >= from);
+        rows.sort_unstable_by_key(|(_, row)| row.offset);
+        for (key, row) in rows {
+            let is_late = scanned > 0 && Instant::now() >= walk.deadline;
+            if *budget == 0 || is_late {
+                self.metrics.record_hits(hits as u64);
+                self.metrics.record_scrubbed(scanned);
+                return Ok(ScrubStep {
+                    hits,
+                    dead,
+                    resume_at: Some((u64::from(row.offset), walk.region_end)),
+                });
+            }
+            let Some(record) = row_record(reader, walk.layout, &key, &row)? else {
+                continue;
+            };
+            *budget = budget.saturating_sub(record.span());
+            scanned += record.span();
+            if !record.header.flags.is_data() {
+                continue;
+            }
+            let loc = record.loc(walk.segment);
+            if !walk.index.is_live_at(&key, loc, record.header.lsn)? {
+                dead += record.span();
+                continue;
+            }
+            let payload = reader.range(record.payload_at(), record.header.length as usize)?;
+            let is_intact =
+                payload.len() == record.header.length as usize && record.verify(payload);
+            if !is_intact {
+                match shared.config.repair {
+                    RepairPath::Peers => {
+                        if walk.index.evict_at(&key, loc)? {
+                            hits += 1;
+                        }
+                    }
+                    RepairPath::None => {
+                        hits += 1;
+                        tracing::warn!(
+                            "the scrub found a record in segment {} failing its checksum on a sole copy, keeping it",
+                            walk.segment.as_u32()
+                        );
+                    }
+                }
+            }
+
+        }
+        self.metrics.record_hits(hits as u64);
+        self.metrics.record_scrubbed(scanned);
+        Ok(ScrubStep {
+            hits,
+            dead,
+            resume_at: None,
+        })
+    }
+}
+
+/// The dead runs of a keyless segment, found from its rows and coalesced in offset order
+///
+/// A record past the keyless ceiling keeps its header and is read where it lies, as a
+/// keyed one is.
+fn keyless_dead_runs(
+    index: &ReelIndex,
+    reader: &mut SegmentReader<'_>,
+    footer: &SegmentFooter,
+    segment: SegmentId,
+    runs: &mut Vec<(u64, u64)>,
+) -> Result<()> {
+    let mut dead = Vec::new();
+    for partition in &footer.partitions {
+        for at in 0..partition.len() {
+            let row = partition.row_at(at)?;
+            if !row.flags.is_data() {
+                continue;
+            }
+            let Some(key) = partition.key_at(at) else {
+                continue;
+            };
+            let key = RecordKey::from_bytes(partition.column, key)?;
+            // a keyless record's span is its row's, so only a keyed one is read
+            let span = match fits_keyless(row.len) {
+                true => KEYLESS_PREFIX as u64 + u64::from(row.len),
+                false => match RecordScan::resuming(reader, u64::from(row.offset)).next_record()? {
+                    Some(record) if record.offset == row.offset => record.span(),
+                    Some(_) | None => continue,
+                },
+            };
+            if index.is_live_at(&key, Loc::new(segment, row.offset, row.len), row.lsn)? {
+                continue;
+            }
+            let start = u64::from(row.offset);
+            dead.push((start, start + span));
+        }
+    }
+    dead.sort_unstable();
+    for (start, end) in dead {
+        match runs.last_mut() {
+            Some(run) if run.1 == start => run.1 = end,
+            _ => runs.push((start, end)),
+        }
+    }
+    Ok(())
 }
 
 /// One footer's records in key order, per column, as offset and length pairs
@@ -1510,7 +1765,13 @@ pub fn source_handle(shared: &Arc<ReelShared>, segment: SegmentId) -> Result<Seg
     }
     let path = shared.segment_path(segment);
     let file = shared.driver.open(&path, false)?;
-    let handle = SegmentHandle::new(segment, path, file, Arc::clone(&shared.driver));
+    let handle = match SegmentHandle::opened(segment, path, file, Arc::clone(&shared.driver)) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = shared.driver.close(file);
+            return Err(error);
+        }
+    };
     shared.fd_cache.insert(handle.clone());
     Ok(handle)
 }
@@ -1622,10 +1883,7 @@ impl<'reader, 'driver> RecordScan<'reader, 'driver> {
                 || header.flags.is_tombstone()
                 || header.flags.is_range_tombstone()
             {
-                return Ok(Some(SourceRecord {
-                    header,
-                    offset: offset as u32,
-                }));
+                return Ok(Some(SourceRecord::keyed(header, offset as u32)));
             }
         }
         Ok(None)
@@ -1635,6 +1893,52 @@ impl<'reader, 'driver> RecordScan<'reader, 'driver> {
 /// The record a held stretch of a segment opens with, and its payload inside the stretch
 ///
 /// Nothing where the bytes are not a whole record a rewrite carries.
+/// What an ordered rewrite walks: the footer's order, and the rows a keyless record is keyed by
+struct Ordered<'a> {
+    order: &'a [(u32, u32)],
+    prefix_bound: u64,
+    footer: Option<&'a SegmentFooter>,
+    layout: RecordLayout,
+}
+
+/// Every row of a footer with its key, in the order `footer_order` lists their records
+fn footer_rows(footer: &SegmentFooter) -> Result<Vec<(RecordKey, FooterRow)>> {
+    let mut rows = Vec::with_capacity(footer.entry_count());
+    for partition in &footer.partitions {
+        for at in 0..partition.len() {
+            let key = partition.key_at(at).unwrap_or(&[]);
+            rows.push((RecordKey::from_bytes(partition.column, key)?, partition.row_at(at)?));
+        }
+    }
+    Ok(rows)
+}
+
+/// A keyless record held where the read left it, its header put together from its row
+fn keyless_held(
+    (key, row): &(RecordKey, FooterRow),
+    offset: u32,
+    held: Part,
+    check: CheckKey,
+) -> Option<(SourceRecord, Option<Part>)> {
+    let stored = <[u8; KEYLESS_PREFIX]>::try_from(held.as_slice().get(..KEYLESS_PREFIX)?).ok()?;
+    if held.as_slice().len() < KEYLESS_PREFIX + row.len as usize || row.offset != offset {
+        return None;
+    }
+    let header = RecordHeader {
+        length: row.len,
+        crc: 0,
+        lsn: row.lsn,
+        flags: row.flags,
+        key: key.clone(),
+        codec: keyless_codec(&stored),
+    };
+    let payload = match row.flags.is_tombstone() {
+        true => None,
+        false => Some(held.narrowed(KEYLESS_PREFIX, row.len as usize)),
+    };
+    Some((SourceRecord::keyless(header, offset, stored, check), payload))
+}
+
 fn held_record(offset: u32, held: Part) -> Option<(SourceRecord, Option<Part>)> {
     let bytes = held.as_slice();
     let width = peek_key_width(bytes.get(..HEADER_LEN)?)?;
@@ -1650,7 +1954,7 @@ fn held_record(offset: u32, held: Part) -> Option<(SourceRecord, Option<Part>)> 
         true => None,
         false => Some(held.narrowed(HEADER_LEN + width, header.length as usize)),
     };
-    Some((SourceRecord { header, offset }, payload))
+    Some((SourceRecord::keyed(header, offset), payload))
 }
 
 /// The payload behind one record header, held where the reader's window has it
@@ -2301,14 +2605,14 @@ mod tests {
         let footer = shared.footer_of(SegmentId(1)).expect("footer");
         let region_end = footer_bound(shared, &source, file_len, footer.as_deref()).expect("bound");
         let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
-        let mut scan = RecordScan::resuming(&mut reader, 0);
-        let record = loop {
-            let record = scan.next_record().expect("scan").expect("data record");
-            if record.header.flags.is_data() {
-                break record;
-            }
-        };
-        let payload = held_payload(scan.reader(), &record).expect("payload");
+        let footer = footer.expect("sealed");
+        let partition = &footer.partitions[0];
+        let row = partition.row_at(0).expect("row");
+        let listed = RecordKey::from_bytes(partition.column, partition.key_at(0).expect("key")).expect("key");
+        let record = row_record(&mut reader, source.layout(), &listed, &row)
+            .expect("read")
+            .expect("data record");
+        let payload = held_payload(&mut reader, &record).expect("payload");
 
         put(&fixture, 1, vec![0x44; 500]);
         let committed = fixture.reel.tails()[0]

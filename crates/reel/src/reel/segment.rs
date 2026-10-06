@@ -13,6 +13,8 @@ use std::sync::{Arc, OnceLock};
 
 use crate::error::{ReelError, Result};
 use crate::format::loc::SegmentId;
+use crate::format::record::{RecordHeader, RecordLayout, HEADER_LEN};
+use crate::format::segment_header::{SegmentHeader, SEGMENT_HEADER_SPAN};
 use crate::hold::{segment_key, Hold};
 use crate::io::mapping::Mapping;
 use crate::io::op::{
@@ -1112,6 +1114,7 @@ struct SegmentInner {
     path: PathBuf,
     file: FileId,
     driver: Arc<IoDriver>,
+    layout: RecordLayout,
     is_doomed: AtomicBool,
     mapping: OnceLock<Option<Mapping>>,
     direct: OnceLock<DirectOpen>,
@@ -1146,6 +1149,24 @@ impl Drop for SegmentInner {
     }
 }
 
+/// The header record a segment file opens with, nothing where it opens with none
+///
+/// One read covers the record and the payload this build writes.
+pub fn read_segment_header(driver: &IoDriver, file: FileId) -> Result<Option<SegmentHeader>> {
+    let head = driver.pread(file, 0, (HEADER_LEN + SEGMENT_HEADER_SPAN) as u64)?;
+    let Ok(header) = RecordHeader::unpack(head.get(..HEADER_LEN).unwrap_or(&[])) else {
+        return Ok(None);
+    };
+    let end = HEADER_LEN + header.length as usize;
+    let Some(payload) = head.get(HEADER_LEN..end) else {
+        return Ok(None);
+    };
+    if !header.flags.is_segment_header() || !header.verify(payload) {
+        return Ok(None);
+    }
+    Ok(SegmentHeader::unpack(payload).ok())
+}
+
 /// A refcounted reference to one open segment file
 ///
 /// Cloning shares the underlying file; the file is unlinked only when the last
@@ -1156,14 +1177,15 @@ pub struct SegmentHandle {
 }
 
 impl SegmentHandle {
-    /// A handle to an open segment file served by a driver
-    pub fn new(id: SegmentId, path: PathBuf, file: FileId, driver: Arc<IoDriver>) -> SegmentHandle {
+    /// A handle to an open segment file whose records lie in this layout
+    pub fn new(id: SegmentId, path: PathBuf, file: FileId, driver: Arc<IoDriver>, layout: RecordLayout) -> SegmentHandle {
         SegmentHandle {
             inner: Arc::new(SegmentInner {
                 id,
                 path,
                 file,
                 driver,
+                layout,
                 is_doomed: AtomicBool::new(false),
                 mapping: OnceLock::new(),
                 direct: OnceLock::new(),
@@ -1171,9 +1193,23 @@ impl SegmentHandle {
         }
     }
 
+    /// A handle on a segment file, its layout read off the header record it opens with
+    ///
+    /// A file that opens with no readable segment header frames its records keyed, so its
+    /// keyless records fail their reads as unreadable and are never served wrong.
+    pub fn opened(id: SegmentId, path: PathBuf, file: FileId, driver: Arc<IoDriver>) -> Result<SegmentHandle> {
+        let layout = read_segment_header(&driver, file)?.map_or(RecordLayout::Keyed, |header| header.layout);
+        Ok(SegmentHandle::new(id, path, file, driver, layout))
+    }
+
+    /// How this segment frames its records
+    pub fn layout(&self) -> RecordLayout {
+        self.inner.layout
+    }
+
     /// A never-doomed stand-in a tail holds until it opens its first real segment
     pub fn placeholder(driver: Arc<IoDriver>) -> SegmentHandle {
-        SegmentHandle::new(SegmentId(0), PathBuf::new(), NO_FILE, driver)
+        SegmentHandle::new(SegmentId(0), PathBuf::new(), NO_FILE, driver, RecordLayout::Keyed)
     }
 
     /// Segment number this handle refers to
@@ -1508,7 +1544,7 @@ mod tests {
         let path = dir.join("000001.reel");
         let file = open(&driver, &path);
 
-        let handle = SegmentHandle::new(SegmentId(1), path.clone(), file, Arc::clone(&driver));
+        let handle = SegmentHandle::new(SegmentId(1), path.clone(), file, Arc::clone(&driver), RecordLayout::Keyed);
         let reader = handle.clone();
         handle.mark_doomed();
 
@@ -1527,7 +1563,7 @@ mod tests {
         let dir = Path::new("/reel");
         let path = dir.join("000009.reel");
         let file = open(&driver, &path);
-        let handle = SegmentHandle::new(SegmentId(9), path, file, Arc::clone(&driver));
+        let handle = SegmentHandle::new(SegmentId(9), path, file, Arc::clone(&driver), RecordLayout::Keyed);
 
         let cache = FdCache::new(4);
         cache.insert(handle.clone());
@@ -1561,7 +1597,7 @@ mod tests {
         let path = dir.join("000002.reel");
         let file = open(&driver, &path);
 
-        let handle = SegmentHandle::new(SegmentId(2), path, file, Arc::clone(&driver));
+        let handle = SegmentHandle::new(SegmentId(2), path, file, Arc::clone(&driver), RecordLayout::Keyed);
         assert_eq!(handle.reference_count(), 1);
 
         drop(handle);
@@ -1583,6 +1619,7 @@ mod tests {
                 path,
                 file,
                 Arc::clone(&driver),
+                RecordLayout::Keyed,
             ));
         }
 
@@ -1595,6 +1632,7 @@ mod tests {
             path,
             file,
             Arc::clone(&driver),
+            RecordLayout::Keyed,
         ));
 
         assert_eq!(cache.len(), 2);
@@ -1616,6 +1654,7 @@ mod tests {
             path,
             file,
             Arc::clone(&driver),
+            RecordLayout::Keyed,
         ));
         assert!(cache.remove(SegmentId(9)).is_some());
 

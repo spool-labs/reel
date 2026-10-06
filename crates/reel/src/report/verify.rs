@@ -1,8 +1,7 @@
 //! Sweep a volume's records against their checksums
 //!
-//! A sealed segment is swept through its footer, which names where each record
-//! it indexes sits; a segment with no footer is walked record by record from the
-//! start until the write frontier. Nothing here writes, and nothing is repaired.
+//! A sealed segment is swept through its footer and an open one through its journal,
+//! each listing where its records sit. Nothing here writes, and nothing is repaired.
 //! A sweep only means what it says on a volume nothing is appending to.
 
 use std::fs::File;
@@ -10,10 +9,13 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::engine::ReelStore;
-use crate::format::column::MAX_KEY_LEN;
-use crate::format::footer::SegmentFooter;
+use crate::format::column::RecordKey;
+use crate::format::journal::{journal_path, read_groups};
 use crate::format::loc::SegmentId;
-use crate::format::record::{RecordHeader, HEADER_LEN};
+use crate::format::record::{
+    check_keyless, Flags, KeylessRead, RecordHeader, RecordLayout, HEADER_LEN, KEYLESS_PREFIX,
+};
+use crate::format::segment_header::{SegmentHeader, SEGMENT_HEADER_SPAN};
 use crate::reel::{segment_file_name, SEGMENT_SUFFIX};
 use crate::report::caveat::{self, Caveat};
 use crate::report::doc::{Column, Doc, Note, Row, Table, Tone};
@@ -418,127 +420,115 @@ fn sweep(engine: &ReelStore, file: &SegmentFile, indexed: bool, watch: &mut Watc
         Ok(file) => file,
         Err(error) => return row.faulted(format!("{name} will not open: {error}")),
     };
-    let len = match file.metadata() {
-        Ok(data) => data.len(),
-        Err(error) => return row.faulted(format!("{name} will not stat: {error}")),
-    };
-    // A footer says where every record it indexes sits, so a sealed segment is
-    // swept through it. Without one there is no boundary between the records and
-    // whatever follows them, so the segment is walked instead.
+    let layout = layout_of(&mut file);
+    if !layout.is_keyless_layout() {
+        return row.faulted(format!("{name} opens with no segment header this build reads"));
+    }
     match engine.segment_footer(segment) {
         Ok(Some(footer)) => {
             row.sealed = true;
-            sweep_footer(&mut file, &footer, &mut row, watch);
+            let mut listed = Vec::new();
+            for entry in footer.entries() {
+                match entry {
+                    Ok(entry) => listed.push((entry.key, entry.offset, entry.len, entry.flags)),
+                    Err(error) => row.fault(format!("footer row does not decode: {error}")),
+                }
+            }
+            sweep_rows(&mut file, listed, layout, &mut row, watch);
         }
-        Ok(None) => walk(&mut file, len, &mut row, watch),
+        Ok(None) => {
+            let journal = std::fs::read(journal_path(path)).unwrap_or_default();
+            let (groups, _) = read_groups(&journal);
+            let listed = groups
+                .into_iter()
+                .flatten()
+                .map(|entry| (entry.key, entry.offset, entry.len, entry.flags))
+                .collect();
+            sweep_rows(&mut file, listed, layout, &mut row, watch);
+        }
         Err(error) => row.fault(format!("footer does not parse: {error}")),
     }
     row
 }
 
-/// Check every record a footer indexes, in the order they sit on disk
-fn sweep_footer(file: &mut File, footer: &SegmentFooter, row: &mut VerifyRow, watch: &mut Watch) {
-    let mut at: Vec<(u32, u16, u32)> = Vec::new();
-    for entry in footer.entries() {
-        match entry {
-            Ok(entry) => at.push((entry.offset, entry.key.width(), entry.len)),
-            Err(error) => row.fault(format!("footer row does not decode: {error}")),
-        }
-    }
-    // Ascending, so a sweep of a spinning disk reads the file forwards.
-    at.sort_unstable();
-    for (offset, width, len) in at {
-        let span = HEADER_LEN as u64 + u64::from(width) + u64::from(len);
-        match check(file, u64::from(offset), span) {
-            // A footer names records rather than the header, but one that points
-            // there is answered rather than skipped.
-            Checked::Sound(bytes) | Checked::Header(bytes) => {
-                row.sound(bytes);
-                watch.record(bytes);
-            }
-            Checked::Fault(why) => row.fault(why),
-            // A footer named the record, so unwritten space where it pointed is
-            // the pointer being wrong rather than the end of anything.
-            Checked::Frontier => row.fault(format!("record at {offset} is unwritten space")),
-        }
-    }
-}
-
-/// Walk a segment with no footer, record by record, up to its write frontier
-fn walk(file: &mut File, len: u64, row: &mut VerifyRow, watch: &mut Watch) {
-    let mut at = 0u64;
-    while at + HEADER_LEN as u64 <= len {
-        match check(file, at, (HEADER_LEN + MAX_KEY_LEN) as u64) {
-            Checked::Sound(bytes) => {
-                row.sound(bytes);
-                watch.record(bytes);
-                at += bytes;
-            }
-            // Read and checked like anything else, then stepped over: it is what
-            // the segment is, not something written into it.
-            Checked::Header(bytes) => {
-                watch.record(bytes);
-                at += bytes;
-            }
-            Checked::Fault(why) => {
-                row.fault(why);
-                return;
-            }
-            Checked::Frontier => return,
-        }
-    }
-}
-
-/// What one record's bytes came back as
-enum Checked {
-    /// The record checks out, and this is what it spans on disk
-    Sound(u64),
-
-    /// The header a segment opens with, which spans bytes but is no record of its own
-    Header(u64),
-
-    /// The record is not sound, and this says why
-    Fault(String),
-
-    /// Unwritten space, so a walk has reached the frontier and stops
-    Frontier,
-}
-
-/// Read the record at this offset and check it against its own checksum
+/// How a segment file frames its records, read off its header record
 ///
-/// The hint is what to read before the header has said how long the record is:
-/// a footer knows exactly, and a walk asks for a header and the widest key the
-/// format admits.
-fn check(file: &mut File, at: u64, hint: u64) -> Checked {
-    let head = match read_at(file, at, hint) {
-        Ok(head) => head,
-        Err(error) => return Checked::Fault(format!("read at {at} failed: {error}")),
+/// A file whose header will not parse reads as keyed, which no segment this build
+/// writes is, and the sweep reports it.
+fn layout_of(file: &mut File) -> RecordLayout {
+    let Ok(head) = read_at(file, 0, (HEADER_LEN + SEGMENT_HEADER_SPAN) as u64) else {
+        return RecordLayout::Keyed;
     };
-    let header = match RecordHeader::unpack(&head) {
-        Ok(header) => header,
-        Err(error) => return Checked::Fault(format!("header at {at} does not parse: {error}")),
+    let Ok(header) = RecordHeader::unpack(&head) else {
+        return RecordLayout::Keyed;
     };
-    if header.is_unwritten() {
-        return Checked::Frontier;
+    let end = HEADER_LEN + header.length as usize;
+    match head.get(HEADER_LEN..end) {
+        Some(payload) if header.flags.is_segment_header() && header.verify(payload) => {
+            SegmentHeader::unpack(payload).map_or(RecordLayout::Keyed, |parsed| parsed.layout)
+        }
+        Some(_) | None => RecordLayout::Keyed,
     }
-    // A pad's fill is never written and never checksummed, so it is stepped over
-    // rather than read.
-    if header.flags.is_pad() {
-        return Checked::Sound(header.span());
+}
+
+/// Check every record a footer or a journal lists, against the row it came through
+///
+/// A keyless record's check covers the key and kind its row holds, under the key its
+/// segment header carries. A record past the keyless ceiling keeps its header and
+/// checks against its own checksum.
+fn sweep_rows(
+    file: &mut File,
+    mut listed: Vec<(RecordKey, u32, u32, Flags)>,
+    layout: RecordLayout,
+    row: &mut VerifyRow,
+    watch: &mut Watch,
+) {
+    // Ascending, so a sweep of a spinning disk reads the file forwards.
+    listed.sort_unstable_by_key(|(_, offset, _, _)| *offset);
+    for (key, offset, len, flags) in listed {
+        let Some(check) = layout.keyless_key(len) else {
+            match keyed(file, u64::from(offset), key.width(), len) {
+                Ok(span) => {
+                    row.sound(span);
+                    watch.record(span);
+                }
+                Err(why) => row.fault(why),
+            }
+            continue;
+        };
+        let span = KEYLESS_PREFIX as u64 + u64::from(len);
+        let bytes = match read_at(file, u64::from(offset), span) {
+            Ok(bytes) if bytes.len() as u64 == span => bytes,
+            Ok(_) => {
+                row.fault(format!("record at {offset} is short"));
+                continue;
+            }
+            Err(error) => {
+                row.fault(format!("read at {offset} failed: {error}"));
+                continue;
+            }
+        };
+        let (prefix, payload) = bytes.split_at(KEYLESS_PREFIX);
+        match check_keyless(prefix, payload, key.as_ref(), flags, &check) {
+            KeylessRead::Intact(_) => {
+                row.sound(span);
+                watch.record(span);
+            }
+            KeylessRead::Unwritten => row.fault(format!("record at {offset} is unwritten space")),
+            KeylessRead::Corrupt => row.fault(format!("record at {offset} fails its checksum")),
+        }
     }
-    let payload = match header.has_payload() {
-        false => Vec::new(),
-        true => match read_at(file, at + header.prefix_len(), u64::from(header.length)) {
-            Ok(payload) => payload,
-            Err(error) => return Checked::Fault(format!("payload at {at} is short: {error}")),
-        },
-    };
-    match header.verify(&payload) {
-        true => match header.flags.is_segment_header() {
-            true => Checked::Header(header.span()),
-            false => Checked::Sound(header.span()),
-        },
-        false => Checked::Fault(format!("record at {at} fails its checksum")),
+}
+
+/// Check a keyed record against its own checksum, and say what it spans on disk
+fn keyed(file: &mut File, at: u64, width: u16, len: u32) -> std::result::Result<u64, String> {
+    let span = HEADER_LEN as u64 + u64::from(width) + u64::from(len);
+    let bytes = read_at(file, at, span).map_err(|error| format!("read at {at} failed: {error}"))?;
+    let header = RecordHeader::unpack(&bytes).map_err(|error| format!("header at {at} does not parse: {error}"))?;
+    let payload = bytes.get(header.prefix_len() as usize..).unwrap_or(&[]);
+    match header.verify(payload) {
+        true => Ok(header.span()),
+        false => Err(format!("record at {at} fails its checksum")),
     }
 }
 

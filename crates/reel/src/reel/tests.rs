@@ -170,7 +170,7 @@ fn range_delete_commits() {
     assert_eq!(dropped.loc.len, end.len() as u32);
 }
 
-// a record read back resolves its own key and rejects another
+// a record read back resolves its own key, and another key fails its check
 #[test]
 fn reads_back_by_key() {
     let (shared, _sim) = harness(1);
@@ -188,12 +188,13 @@ fn reads_back_by_key() {
         .expect("read");
 
     assert_eq!(found, RecordRead::Found(Value::new(vec![0x99; 300])));
-    assert_eq!(stale, RecordRead::Stale);
+    assert_eq!(stale, RecordRead::Corrupt);
 }
 
-// an overwritten key's old pointer reads as stale rather than as the old value
+// an overwritten key's old place still reads its own record, since a keyless record
+// carries no version and the index alone judges which version is current
 #[test]
-fn reads_reject_a_superseded_version() {
+fn a_superseded_place_reads_its_own_record() {
     let (shared, _sim) = harness(1);
     let reel = Reel::open(shared, Vec::new()).expect("open");
     let first = reel
@@ -204,8 +205,8 @@ fn reads_reject_a_superseded_version() {
         .expect("put");
     reel.flush().expect("flush");
 
-    // The stale read names the old location under the new sequence number,
-    // which is what an index that moved on leaves behind.
+    // The old location under the new sequence number, which a keyed record turned down
+    // by its header.
     let superseded = reel
         .read_record(first.loc, key(7).as_ref(), second.lsn, true)
         .expect("read");
@@ -214,7 +215,7 @@ fn reads_reject_a_superseded_version() {
         .expect("read");
 
     assert_ne!(first.lsn, second.lsn);
-    assert_eq!(superseded, RecordRead::Stale);
+    assert_eq!(superseded, RecordRead::Found(Value::new(vec![0x11; 300])));
     assert_eq!(current, RecordRead::Found(Value::new(vec![0x22; 300])));
 }
 

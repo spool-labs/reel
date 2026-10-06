@@ -5,7 +5,7 @@ use crate::error::{ReelError, Result};
 use crate::format::column::KeyRef;
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
-use crate::format::record::{data_codec, RecordHeader, HEADER_LEN};
+use crate::format::record::{check_keyless, data_codec, CheckKey, Flags, KeylessRead, RecordHeader, RecordLayout};
 use crate::io::direct::{DIRECT_ALIGN, DIRECT_REQUEST_BYTES};
 use crate::io::op::FileId;
 use crate::io::ServingBackend;
@@ -40,9 +40,9 @@ pub(super) fn framed_or_nothing(
     }
 }
 
-/// Where a payload window begins on the volume
-pub(super) fn window_start(loc: Loc, key_width: u16, at: u64) -> u64 {
-    u64::from(loc.offset) + HEADER_LEN as u64 + u64::from(key_width) + at
+/// Where a payload window begins on the volume, behind a record prefix this long
+pub(super) fn window_start(loc: Loc, prefix: usize, at: u64) -> u64 {
+    u64::from(loc.offset) + prefix as u64 + at
 }
 
 /// A whole window, or nothing when the volume cannot answer it
@@ -99,6 +99,7 @@ pub(super) struct Planned {
     pub(super) at: usize,
     pub(super) segment: SegmentId,
     pub(super) file: FileId,
+    pub(super) layout: RecordLayout,
     pub(super) offset: u64,
     pub(super) prefix: usize,
     pub(super) len: usize,
@@ -151,6 +152,7 @@ pub(super) fn joins(last: &Planned, next: &Planned, from: u64, span: u64) -> boo
 /// Check one record framed inside a merged read, yielding why it was rejected
 ///
 /// Nothing rather than a verdict means the record is good and its window stands.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn check_in_block(
     block: &[u8],
     at: usize,
@@ -158,6 +160,7 @@ pub(super) fn check_in_block(
     expected: KeyRef<'_>,
     lsn: Lsn,
     loc: Loc,
+    layout: RecordLayout,
     is_verified: bool,
 ) -> std::result::Result<u8, RecordRead> {
     let Some(body_at) = at.checked_add(prefix) else {
@@ -168,6 +171,13 @@ pub(super) fn check_in_block(
     };
     if body_end > block.len() {
         return Err(RecordRead::Stale);
+    }
+    if let Some(check) = layout.keyless_key(loc.len) {
+        return match check_keyless(&block[at..body_at], &block[body_at..body_end], expected, Flags::DATA, &check) {
+            KeylessRead::Intact(codec) => Ok(codec),
+            KeylessRead::Unwritten => Err(RecordRead::Stale),
+            KeylessRead::Corrupt => Err(RecordRead::Corrupt),
+        };
     }
     let prefix = &block[at..body_at];
     let Some(codec) = data_codec(prefix, expected, lsn, loc.len) else {
@@ -206,9 +216,16 @@ pub(super) fn place_runs(
             let at = (held.offset - base) as usize;
             let ask = &asks[held.at];
             let key = keys[ask.at as usize];
-            if let Ok(codec) =
-                check_in_block(&block, at, held.prefix, key, ask.lsn, ask.loc, is_verified)
-            {
+            if let Ok(codec) = check_in_block(
+                &block,
+                at,
+                held.prefix,
+                key,
+                ask.lsn,
+                ask.loc,
+                held.layout,
+                is_verified,
+            ) {
                 spots[ask.at as usize] = Spot {
                     block: index,
                     at: (at + held.prefix) as u32,
@@ -223,17 +240,30 @@ pub(super) fn place_runs(
 }
 
 /// Decide what a framed record read means, once the bytes are in hand
+///
+/// A keyless record is always verified, since its check is the only thing that says
+/// it is the record the entry or row named.
 pub(super) fn frame_to_read(
     head: Vec<u8>,
     body: Vec<u8>,
     expected: KeyRef<'_>,
     lsn: Lsn,
     loc: Loc,
+    layout: RecordLayout,
     is_verified: bool,
 ) -> RecordRead {
     // Wrapped before anything can return, so a record the checks reject still
     // hands its buffer back to the pool rather than to the allocator.
     let body = Value::pooled(body, crate::reel::payload::give);
+    if let Some(check) = layout.keyless_key(loc.len) {
+        let read = check_keyless(&head, &body, expected, Flags::DATA, &check);
+        recycle_header(head);
+        return match read {
+            KeylessRead::Intact(codec) => decoded(codec, body),
+            KeylessRead::Unwritten => RecordRead::Stale,
+            KeylessRead::Corrupt => RecordRead::Corrupt,
+        };
+    }
     let codec = data_codec(&head, expected, lsn, loc.len);
     let is_corrupt = codec.is_some() && is_verified && !is_intact(&head, &body);
     recycle_header(head);
@@ -243,6 +273,11 @@ pub(super) fn frame_to_read(
     if is_corrupt {
         return RecordRead::Corrupt;
     }
+    decoded(codec, body)
+}
+
+/// A checked record's payload, decoded where a codec produced it
+pub(super) fn decoded(codec: u8, body: Value) -> RecordRead {
     if codec != 0 {
         // A decode that fails is corruption wearing a valid checksum, answered
         // exactly as a failed checksum is.
@@ -252,6 +287,33 @@ pub(super) fn frame_to_read(
         };
     }
     RecordRead::Found(body)
+}
+
+/// A window of a keyless record read whole, since only the whole record checks
+///
+/// A coded record says so, and the caller reads it again to decode and cut.
+pub(super) fn keyless_range(
+    head: Vec<u8>,
+    body: Vec<u8>,
+    expected: KeyRef<'_>,
+    check: &CheckKey,
+    at: u64,
+    len: usize,
+) -> RecordRead {
+    let read = check_keyless(&head, &body, expected, Flags::DATA, check);
+    recycle_header(head);
+    if read != KeylessRead::Intact(0) {
+        crate::reel::payload::give(body);
+        return match read {
+            KeylessRead::Intact(_) => RecordRead::Coded,
+            KeylessRead::Unwritten => RecordRead::Stale,
+            KeylessRead::Corrupt => RecordRead::Corrupt,
+        };
+    }
+    match cut_range(body, at as usize, len) {
+        Some(window) => RecordRead::Found(window),
+        None => RecordRead::Stale,
+    }
 }
 
 /// Frame a range that came back on the record header's own read

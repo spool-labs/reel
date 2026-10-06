@@ -9,7 +9,6 @@ use crate::config::RepairPath;
 use crate::error::Result;
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::SegmentId;
-use crate::format::record::{RecordHeader, HEADER_LEN};
 use crate::io::op::{Advice, Part, WriteBuf};
 use crate::reel::ReelShared;
 use crate::sync::tension::Tension;
@@ -191,31 +190,6 @@ pub(crate) fn retry_broken_seals(shared: &Arc<ReelShared>) -> usize {
         }
     }
     sealed
-}
-
-/// Stamp a failed reservation as fill, so recovery can walk past it
-///
-/// An unwritten span ends every recovery walk, and by the time a write reports its
-/// error a neighbour may already have committed above the range, so the stamp turns the
-/// span into one fill record a walk hops.
-pub(super) fn stamp_failed_range(
-    shared: &Arc<ReelShared>,
-    active: &Active,
-    base: u64,
-    span: u64,
-) -> bool {
-    if span < HEADER_LEN as u64 {
-        return false;
-    }
-    let pad = RecordHeader::fill((span - HEADER_LEN as u64) as u32);
-    let mut bufs = Vec::with_capacity(1);
-    WriteBuf::push_prefix(&mut bufs, pad.pack());
-    // The count is the answer, not the error: a short write reports success with only a
-    // prefix persisted, which is exactly the garbage the stamp exists to cover.
-    match shared.driver.writev(active.handle.file(), base, bufs) {
-        Ok(wrote) => wrote == HEADER_LEN as u64,
-        Err(_) => false,
-    }
 }
 
 /// What the sealer's worker is asked to do

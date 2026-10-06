@@ -127,6 +127,12 @@ pub enum HeadRead {
 /// One read of a record's header and payload
 pub enum SpotRead {
     Found(Head, Value),
+
+    /// The key's record at this length, confirmed by its own check with no version read
+    ///
+    /// Only a read told its candidate stands alone answers this way.
+    Newest(u32, Value),
+
     Tombstone(Head),
     Other,
 
@@ -168,6 +174,9 @@ pub struct Candidate {
     pub segment: SegmentId,
     pub offset: u32,
     pub bound: u32,
+
+    /// The key's only slot, so the read may answer with no version
+    pub alone: bool,
     slot: Slot,
 }
 
@@ -180,6 +189,12 @@ pub struct Pick {
 
     /// Whether the best version so far came from a displaced slot
     best_displaced: bool,
+
+    /// Whether a lone candidate may answer with no version, which a cue reader cannot use
+    takes_newest: bool,
+
+    /// Whether the best version came with no sequence number
+    is_versionless: bool,
     stale: Vec<(Slot, u32)>,
 }
 
@@ -209,6 +224,9 @@ pub enum Offered {
 /// What one lookup settled about a key
 pub enum Lookup {
     Found(Lsn, Value),
+
+    /// The key's one sealed version, confirmed by its record's own check, its sequence number unread
+    Newest(Value),
     Missing,
 
     /// Something only the checked read can settle
@@ -224,7 +242,10 @@ pub trait RecordSource: Send + Sync {
     fn cached_head(&self, key: KeyRef<'_>, segment: SegmentId, offset: u32) -> Result<HeadRead>;
 
     /// The record at a place, in one read of its header and up to `bound` payload bytes
-    fn record(&self, key: &RecordKey, segment: SegmentId, offset: u32, bound: u32) -> Result<SpotRead>;
+    ///
+    /// `alone` says the place is the key's only slot, so a record that confirms itself
+    /// may answer with no version.
+    fn record(&self, key: &RecordKey, segment: SegmentId, offset: u32, bound: u32, alone: bool) -> Result<SpotRead>;
 }
 
 /// The payload bytes of every length class, the small ones even and the wide ones geometric
@@ -1316,6 +1337,15 @@ impl SpotColumn {
     /// A version an older candidate held goes to the cleaner already confirmed. Equal
     /// versions are a compaction copy beside its source, and both stay.
     pub fn read(&self, key: &RecordKey) -> Result<Lookup> {
+        self.read_taking(key, true)
+    }
+
+    /// The same read for a cue reader, which needs every answer's sequence number
+    pub fn read_versioned(&self, key: &RecordKey) -> Result<Lookup> {
+        self.read_taking(key, false)
+    }
+
+    fn read_taking(&self, key: &RecordKey, takes_newest: bool) -> Result<Lookup> {
         let Some(records) = self.records.get() else {
             return Ok(Lookup::Unsettled);
         };
@@ -1323,8 +1353,9 @@ impl SpotColumn {
             let Some(mut pick) = self.pick(key) else {
                 return Ok(Lookup::Unsettled);
             };
+            pick.takes_newest = takes_newest;
             while let Some(candidate) = self.next(&mut pick) {
-                let read = records.record(key, candidate.segment, candidate.offset, candidate.bound)?;
+                let read = records.record(key, candidate.segment, candidate.offset, candidate.bound, candidate.alone)?;
                 match self.offer(&mut pick, candidate, read) {
                     Offered::Next => {}
                     Offered::Again => continue 'tries,
@@ -1342,7 +1373,7 @@ impl SpotColumn {
             return Ok(Lookup::Unsettled);
         };
         while let Some(candidate) = self.next(&mut pick) {
-            let read = records.record(key, candidate.segment, candidate.offset, candidate.bound)?;
+            let read = records.record(key, candidate.segment, candidate.offset, candidate.bound, candidate.alone)?;
             match self.offer(&mut pick, candidate, read) {
                 Offered::Next => {}
                 Offered::Again | Offered::Unsettled => return Ok(Lookup::Unsettled),
@@ -1356,12 +1387,14 @@ impl SpotColumn {
     /// A displaced entry was booked as an overwritten version, so it is left to the full lookup.
     pub fn sole(&self, key: &RecordKey) -> Option<Candidate> {
         let pick = self.pick(key)?;
+        let alone = pick.ordered.len() == 1;
         let mut live = pick.ordered.iter().filter(|(_, slot)| !slot.is_displaced());
         match (live.next(), live.next()) {
             (Some((_, slot)), None) => Some(Candidate {
                 segment: slot.segment(),
                 offset: slot.offset,
                 bound: slot.bound(),
+                alone: alone && !slot.is_grave(),
                 slot: *slot,
             }),
             (Some(_), Some(_)) | (None, _) => None,
@@ -1412,12 +1445,18 @@ impl SpotColumn {
             next: 0,
             best: None,
             best_displaced: false,
+            takes_newest: true,
+            is_versionless: false,
             stale: Vec::new(),
         })
     }
 
     /// The next candidate a lookup reads, past any whose segment's ceiling rules it out
+    ///
+    /// A key's only slot, live and holding data, is its newest sealed version whatever its
+    /// sequence number, so its read is told it stands alone.
     pub fn next(&self, pick: &mut Pick) -> Option<Candidate> {
+        let alone = pick.takes_newest && pick.ordered.len() == 1;
         while let Some((ceiling, slot)) = pick.ordered.get(pick.next).copied() {
             pick.next += 1;
             // A segment holding nothing newer than the version in hand needs no read.
@@ -1430,6 +1469,7 @@ impl SpotColumn {
                 segment: slot.segment(),
                 offset: slot.offset,
                 bound: slot.bound(),
+                alone: alone && !slot.is_displaced() && !slot.is_grave(),
                 slot,
             });
         }
@@ -1440,6 +1480,21 @@ impl SpotColumn {
     pub fn offer(&self, pick: &mut Pick, candidate: Candidate, read: SpotRead) -> Offered {
         let (head, value) = match read {
             SpotRead::Found(head, value) => (head, Some(value)),
+            // Only a lone candidate answers with no version, so nothing is held to order it against.
+            SpotRead::Newest(len, value) => {
+                if !candidate.alone || pick.best.is_some() {
+                    return Offered::Unsettled;
+                }
+                let head = Head {
+                    lsn: Lsn::NONE,
+                    len,
+                    is_tombstone: false,
+                };
+                pick.best = Some((head, Some(value)));
+                pick.best_displaced = false;
+                pick.is_versionless = true;
+                return Offered::Next;
+            }
             SpotRead::Tombstone(head) => (head, None),
             SpotRead::Other => return Offered::Next,
             // The segment is gone, so the slot points at nothing and goes before the next look.
@@ -1476,6 +1531,7 @@ impl SpotColumn {
         match pick.best {
             // A displaced version was overwritten or deleted once, so what came after it is the footers' to say.
             Some(_) if pick.best_displaced => Lookup::Unsettled,
+            Some((_, Some(value))) if pick.is_versionless => Lookup::Newest(value),
             Some((head, Some(value))) => Lookup::Found(head.lsn, value),
             Some((_, None)) | None => Lookup::Missing,
         }
@@ -1629,7 +1685,7 @@ mod tests {
             })
         }
 
-        fn record(&self, key: &RecordKey, segment: SegmentId, offset: u32, bound: u32) -> Result<SpotRead> {
+        fn record(&self, key: &RecordKey, segment: SegmentId, offset: u32, bound: u32, _alone: bool) -> Result<SpotRead> {
             Ok(match self.answer(key.as_ref(), segment, offset) {
                 HeadRead::Same(head) if head.len <= bound => {
                     SpotRead::Found(head, Value::from(head.lsn.as_u64().to_le_bytes().to_vec()))
@@ -1704,6 +1760,7 @@ mod tests {
         match column.read(&key(at)).expect("read") {
             Lookup::Found(lsn, _) => Some(lsn.as_u64()),
             Lookup::Missing => None,
+            Lookup::Newest(_) => panic!("key {at} answered with no version from a source that reads them all"),
             Lookup::Unsettled => panic!("key {at} needed the checked read"),
         }
     }

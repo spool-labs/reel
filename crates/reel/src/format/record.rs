@@ -69,17 +69,14 @@ const KIND_MASK: u8 = 0b0001_1111;
 
 const FLAG_TOMBSTONE: u8 = 0b0000_0001;
 const FLAG_RANGE_TOMBSTONE: u8 = 0b0000_0010;
-const FLAG_PAD: u8 = 0b0000_0100;
 const FLAG_SEGMENT_HEADER: u8 = 0b0000_1000;
-const FLAG_BATCH_FRAME: u8 = 0b0001_0000;
-const FLAG_BATCHED: u8 = 0b0010_0000;
 const FLAG_RELOCATED: u8 = 0b0100_0000;
 
 /// The kinds nothing resolves by key, which a mark never rides on
-const CONTROL_MASK: u8 = FLAG_PAD | FLAG_SEGMENT_HEADER | FLAG_BATCH_FRAME;
+const CONTROL_MASK: u8 = FLAG_SEGMENT_HEADER;
 
 /// The marks that ride along with a kind rather than being one
-const MARK_MASK: u8 = FLAG_BATCHED | FLAG_RELOCATED;
+const MARK_MASK: u8 = FLAG_RELOCATED;
 
 /// Every bit a writer sets, so anything else is a torn or foreign header
 const KNOWN_MASK: u8 = KIND_MASK | MARK_MASK;
@@ -92,9 +89,6 @@ const CRC: CrcAlgorithm = CrcAlgorithm::Crc32Iscsi;
 
 /// A prefix has to fit the inline write buffer, or every record would allocate
 const _: () = assert!(PREFIX_CAP <= crate::io::op::INLINE_CAP);
-
-/// A batch frame stages its declaration where a key would, so it has to fit there
-const _: () = assert!(HEADER_LEN + FRAME_PAYLOAD_LEN <= PREFIX_CAP);
 
 /// Read a little endian word from an exact four byte slice
 pub fn read_u32_le(bytes: &[u8]) -> u32 {
@@ -148,19 +142,11 @@ impl Flags {
     /// A delete marker for a range of keys, its payload the exclusive end
     pub const RANGE_TOMBSTONE: Flags = Flags(FLAG_RANGE_TOMBSTONE);
 
-    /// A drain aligning filler record with no payload
-    pub const PAD: Flags = Flags(FLAG_PAD);
 
     /// The first record of a segment, carrying its self describing payload
     pub const SEGMENT_HEADER: Flags = Flags(FLAG_SEGMENT_HEADER);
 
-    /// The record that opens a batch, its payload the run it declares
-    pub const BATCH_FRAME: Flags = Flags(FLAG_BATCH_FRAME);
 
-    /// The same record written as part of a batch
-    pub fn batched(self) -> Flags {
-        Flags(self.0 | FLAG_BATCHED)
-    }
 
     /// The same record written again elsewhere by compaction
     ///
@@ -185,25 +171,13 @@ impl Flags {
         self.0 & FLAG_RANGE_TOMBSTONE != 0
     }
 
-    /// Whether the pad bit is set
-    pub fn is_pad(self) -> bool {
-        self.0 & FLAG_PAD != 0
-    }
 
     /// Whether the segment header bit is set
     pub fn is_segment_header(self) -> bool {
         self.0 & FLAG_SEGMENT_HEADER != 0
     }
 
-    /// Whether this record is the frame a batch opens with
-    pub fn is_batch_frame(self) -> bool {
-        self.0 & FLAG_BATCH_FRAME != 0
-    }
 
-    /// Whether the record went down as part of a batch
-    pub fn is_batched(self) -> bool {
-        self.0 & FLAG_BATCHED != 0
-    }
 
     /// Whether the record is compaction's copy of one written earlier
     pub fn is_relocated(self) -> bool {
@@ -246,83 +220,6 @@ impl Flags {
     }
 }
 
-/// Bytes a batch frame declares its run in: the record count then their span
-pub const FRAME_PAYLOAD_LEN: usize = 12;
-
-/// What a batch frame says about the run of records behind it
-///
-/// Both numbers are here because either alone is weaker than the pair. The count says
-/// where the run ends in records and the span says where it ends in bytes, so a walk
-/// that reaches one without the other is looking at a run that did not land whole.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BatchFrame {
-    /// Records of the batch, which follow the frame with nothing between them
-    pub count: u32,
-
-    /// Bytes those records occupy, measured from the end of the frame
-    pub span: u64,
-}
-
-impl BatchFrame {
-    /// Bytes the frame itself occupies ahead of the run it opens
-    pub const SPAN: u64 = (HEADER_LEN + FRAME_PAYLOAD_LEN) as u64;
-
-    /// The header the frame writes, checksummed over what it declares
-    ///
-    /// No key and no sequence number: nothing resolves a frame, and what orders the
-    /// batch is the numbers its own records carry.
-    pub fn header(&self) -> RecordHeader {
-        RecordHeader::new(
-            FRAME_PAYLOAD_LEN as u32,
-            Lsn::NONE,
-            Flags::BATCH_FRAME,
-            RecordKey::none(),
-            &self.declaration(),
-        )
-    }
-
-    /// The frame's bytes, its header and its declaration staged together
-    ///
-    /// The declaration rides in the staging array where a key would, so a frame is one
-    /// inline buffer in the batch's write and costs the batch no allocation at all.
-    pub fn pack(&self) -> RecordPrefix {
-        let mut prefix = self.header().pack();
-        let end = prefix.len + FRAME_PAYLOAD_LEN;
-        prefix.bytes[prefix.len..end].copy_from_slice(&self.declaration());
-        prefix.len = end;
-        prefix
-    }
-
-    /// The run a frame record declares, or nothing where these bytes are not one
-    ///
-    /// Every shape no writer produces is refused here rather than trusted: a frame
-    /// with a key, one whose payload is the wrong width, one declaring a run of less
-    /// than two, and one whose span cannot hold the records it counts.
-    pub fn unpack(header: &RecordHeader, payload: &[u8]) -> Option<BatchFrame> {
-        if !header.flags.is_batch_frame()
-            || header.key.width() != 0
-            || header.length as usize != FRAME_PAYLOAD_LEN
-            || payload.len() < FRAME_PAYLOAD_LEN
-        {
-            return None;
-        }
-        let frame = BatchFrame {
-            count: read_u32_le(&payload[..4]),
-            span: read_u64_le(&payload[4..FRAME_PAYLOAD_LEN]),
-        };
-        if frame.count < 2 || frame.span < u64::from(frame.count) * HEADER_LEN as u64 {
-            return None;
-        }
-        Some(frame)
-    }
-
-    fn declaration(&self) -> [u8; FRAME_PAYLOAD_LEN] {
-        let mut out = [0u8; FRAME_PAYLOAD_LEN];
-        out[..4].copy_from_slice(&self.count.to_le_bytes());
-        out[4..].copy_from_slice(&self.span.to_le_bytes());
-        out
-    }
-}
 
 /// The bytes a record writes ahead of its payload: its header and then its key
 ///
@@ -420,19 +317,6 @@ impl RecordHeader {
     /// the exclusive end. An empty payload means the range has no upper bound.
     pub fn range_tombstone(key: RecordKey, lsn: Lsn, end: &[u8]) -> RecordHeader {
         RecordHeader::new(end.len() as u32, lsn, Flags::RANGE_TOMBSTONE, key, end)
-    }
-
-    /// A pad header realigning a tail at a position to the next block boundary
-    ///
-    /// The header carries the fill length so a scan hops over the gap to the next
-    /// aligned record; the fill bytes are not written and not checksummed.
-    pub fn pad(position: u64) -> RecordHeader {
-        RecordHeader::fill(pad_fill(position))
-    }
-
-    /// A pad header spanning an exact fill length
-    pub fn fill(length: u32) -> RecordHeader {
-        RecordHeader::new(length, Lsn::NONE, Flags::PAD, RecordKey::none(), &[])
     }
 
     /// A segment header record carrying the frozen self describing payload
@@ -586,13 +470,10 @@ impl RecordHeader {
 
     /// Whether this record carries a payload the length describes
     ///
-    /// Data records, range tombstones, segment headers and batch frames carry one;
-    /// point tombstones and pads do not.
+    /// Data records, range tombstones and segment headers carry one, and point
+    /// tombstones do not.
     pub fn has_payload(&self) -> bool {
-        self.flags.is_data()
-            || self.flags.is_segment_header()
-            || self.flags.is_range_tombstone()
-            || self.flags.is_batch_frame()
+        self.flags.is_data() || self.flags.is_segment_header() || self.flags.is_range_tombstone()
     }
 
     /// Whether these bytes are unwritten space rather than a record
@@ -715,14 +596,6 @@ pub fn peek_key_width(bytes: &[u8]) -> Option<usize> {
     Some(width)
 }
 
-/// The fill length a pad at this position needs to reach the next block boundary
-///
-/// The pad spans at least a header and lands on a boundary, bumped one extra
-/// block when the gap to the next boundary is smaller than a header.
-pub fn pad_fill(position: u64) -> u32 {
-    let boundary = align_up(position + HEADER_LEN as u64, BLOCK);
-    (boundary - position - HEADER_LEN as u64) as u32
-}
 
 /// Round a value up to the next multiple of an alignment
 pub(crate) fn align_up(value: u64, alignment: u64) -> u64 {
@@ -973,22 +846,16 @@ mod tests {
         }
     }
 
-    // tombstone and pad records carry no payload
+    // a tombstone carries no payload
     #[test]
-    fn control_records() {
+    fn tombstone_record() {
         let tombstone = RecordHeader::tombstone(sample_key(RECORD, 0x22, 34), Lsn(4));
-        let pad = RecordHeader::pad(100);
 
-        for header in [tombstone.clone(), pad.clone()] {
-            let parsed = RecordHeader::unpack(header.pack().as_slice()).expect("unpack");
-            assert_eq!(parsed, header);
-            assert!(parsed.verify(&[]));
-            assert!(!parsed.has_payload());
-        }
-
+        let parsed = RecordHeader::unpack(tombstone.pack().as_slice()).expect("unpack");
+        assert_eq!(parsed, tombstone);
+        assert!(parsed.verify(&[]));
+        assert!(!parsed.has_payload());
         assert!(tombstone.flags.is_tombstone());
-        assert!(pad.flags.is_pad());
-        assert_eq!(pad.key.width(), 0);
     }
 
     // a range tombstone carries its exclusive end as its payload
@@ -1037,111 +904,6 @@ mod tests {
         assert!(!plain.flags.is_relocated());
         assert!(moved.verify(&payload));
         assert_ne!(moved.crc, plain.crc, "the mark is covered by the checksum");
-    }
-
-    // the batch mark rides along with a record's kind without changing it
-    #[test]
-    fn batch_marks() {
-        let key = sample_key(RECORD, 0x33, 34);
-        let put = RecordHeader::new(4, Lsn(1), Flags::DATA.batched(), key.clone(), &[0x01; 4]);
-        let grave = RecordHeader::new(0, Lsn(2), Flags::TOMBSTONE.batched(), key, &[]);
-
-        assert!(put.flags.is_data());
-        assert!(put.flags.is_batched());
-        assert!(grave.flags.is_tombstone());
-        assert!(grave.flags.is_batched());
-        assert!(put.verify(&[0x01; 4]));
-        assert!(grave.verify(&[]));
-    }
-
-    // a batch mark is covered by the checksum, so it cannot be added afterwards
-    #[test]
-    fn batch_mark_is_checksummed() {
-        let payload = vec![0x44; 64];
-        let key = sample_key(RECORD, 0x44, 34);
-        let plain = RecordHeader::data(key.clone(), Lsn(5), &payload);
-        let marked = RecordHeader::new(
-            plain.length,
-            plain.lsn,
-            plain.flags.batched(),
-            key,
-            &payload,
-        );
-
-        assert!(marked.verify(&payload));
-        assert_ne!(marked.crc, plain.crc);
-    }
-
-    // a frame round trips through the bytes it stages, declaration and all
-    #[test]
-    fn batch_frame_roundtrips() {
-        let frame = BatchFrame {
-            count: 7,
-            span: 4_096,
-        };
-        let packed = frame.pack();
-
-        assert!(packed.tail().is_none(), "a frame is one buffer");
-        assert_eq!(packed.len(), BatchFrame::SPAN as usize);
-
-        let bytes = packed.as_slice();
-        let header = RecordHeader::unpack(bytes).expect("unpack");
-
-        assert_eq!(header, frame.header());
-        assert!(header.flags.is_batch_frame());
-        assert!(!header.flags.is_data());
-        assert!(header.has_payload());
-        assert_eq!(header.lsn, Lsn::NONE);
-        assert_eq!(header.span(), BatchFrame::SPAN);
-        assert!(header.verify(&bytes[HEADER_LEN..]));
-        assert_eq!(
-            BatchFrame::unpack(&header, &bytes[HEADER_LEN..]),
-            Some(frame)
-        );
-    }
-
-    // a declaration no writer produces is refused rather than walked
-    #[test]
-    fn batch_frame_refuses_what_no_writer_wrote() {
-        let frame = BatchFrame {
-            count: 3,
-            span: 300,
-        };
-        let packed = frame.pack();
-        let bytes = packed.as_slice().to_vec();
-        let header = RecordHeader::unpack(&bytes).expect("unpack");
-
-        assert!(BatchFrame::unpack(&header, &bytes[HEADER_LEN..HEADER_LEN + 4]).is_none());
-
-        let plain = RecordHeader::data(sample_key(RECORD, 0x01, 34), Lsn(1), &[0u8; 12]);
-        assert!(BatchFrame::unpack(&plain, &bytes[HEADER_LEN..]).is_none());
-
-        for (count, span) in [(0u32, 300u64), (1, 300), (3, 3 * HEADER_LEN as u64 - 1)] {
-            let lying = BatchFrame { count, span };
-            let packed = lying.pack();
-            let bytes = packed.as_slice().to_vec();
-            let header = RecordHeader::unpack(&bytes).expect("unpack");
-            assert!(
-                BatchFrame::unpack(&header, &bytes[HEADER_LEN..]).is_none(),
-                "a frame of {count} records in {span} bytes passed",
-            );
-        }
-    }
-
-    // a flipped bit in a frame's declaration is caught by the record's checksum
-    #[test]
-    fn batch_frame_declaration_is_checksummed() {
-        let frame = BatchFrame {
-            count: 4,
-            span: 1_000,
-        };
-        let header = frame.header();
-        let packed = frame.pack();
-        let mut declaration = packed.as_slice()[HEADER_LEN..].to_vec();
-
-        declaration[0] ^= 0x01;
-
-        assert!(!header.verify(&declaration));
     }
 
     // a segment header record round trips, carries its payload, and verifies
@@ -1245,10 +1007,9 @@ mod tests {
         let packed = header.pack().as_slice().to_vec();
 
         let two_kinds = 0b0000_0011;
-        let marked_pad = 0b0010_0100;
-        let marked_frame = 0b0011_0000;
+        let unused_mark = 0b0010_0000;
         let unknown_bit = 0b1000_0000;
-        for bits in [two_kinds, marked_pad, marked_frame, unknown_bit] {
+        for bits in [two_kinds, unused_mark, unknown_bit] {
             let mut torn = packed.clone();
             torn[OFFSET_FLAGS] = bits;
             assert!(RecordHeader::unpack(&torn).is_err(), "{bits:#010b} passed");
@@ -1327,41 +1088,6 @@ mod tests {
 
         assert!(!header.fits_within(prefix + 9_999));
         assert!(header.fits_within(prefix + 10_000));
-    }
-
-    // a pad always lands on a block boundary and spans at least a header
-    #[test]
-    fn pad_every_gap() {
-        for position in 0u64..(BLOCK * 2) {
-            let fill = pad_fill(position);
-            let span = HEADER_LEN as u64 + u64::from(fill);
-            let end = position + span;
-
-            assert_eq!(end % BLOCK, 0);
-            assert!(span >= HEADER_LEN as u64);
-            assert!(end > position);
-            assert_eq!(RecordHeader::pad(position).span(), span);
-        }
-    }
-
-    // the boundary gap cases produce the expected pad fill
-    #[test]
-    fn pad_boundaries() {
-        assert_eq!(pad_fill(0), BLOCK as u32 - HEADER_LEN as u32);
-
-        let gap_is_header = BLOCK - HEADER_LEN as u64;
-        assert_eq!(pad_fill(gap_is_header), 0);
-
-        let gap_below_header = gap_is_header + 1;
-        assert_eq!(
-            HEADER_LEN as u64 + u64::from(pad_fill(gap_below_header)),
-            BLOCK + HEADER_LEN as u64 - 1,
-        );
-
-        assert_eq!(
-            HEADER_LEN as u64 + u64::from(pad_fill(BLOCK - 1)),
-            BLOCK + 1
-        );
     }
 
     // a record header covers its payload at every length, including none at all
@@ -1518,17 +1244,14 @@ mod tests {
         assert!(header.verify(&payload));
     }
 
-    // a segment header and a pad keep their headers in a keyless segment
+    // a segment header keeps its header in a keyless segment
     #[test]
-    fn control_records_are_never_keyless() {
+    fn the_segment_header_is_never_keyless() {
         let payload = [0u8; 16];
         let header = RecordHeader::segment_header(&payload);
-        let pad = RecordHeader::fill(64);
 
-        for record in [header, pad] {
-            assert!(!record.is_keyless_in(LAID));
-            assert_eq!(record.span_in(LAID), record.span());
-        }
+        assert!(!header.is_keyless_in(LAID));
+        assert_eq!(header.span_in(LAID), header.span());
     }
 
     // a tombstone in a keyless segment is a keyless record with no payload

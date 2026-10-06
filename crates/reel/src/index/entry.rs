@@ -3,7 +3,7 @@
 use crate::format::column::{KeyBytes, RecordKey};
 use crate::format::loc::{Loc, SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
-use crate::format::record::HEADER_LEN;
+use crate::format::record::RecordLayout;
 
 /// Segment number no record can sit in, which is what tells a grave from an entry
 ///
@@ -106,8 +106,10 @@ impl Entry {
 }
 
 /// On-disk footprint of a record with this key width and payload length
+///
+/// A small record lies keyless, its prefix standing in for its header and key.
 pub fn span_of(key_width: u16, len: u32) -> u64 {
-    HEADER_LEN as u64 + u64::from(key_width) + u64::from(len)
+    RecordLayout::KEYLESS.prefix_len(key_width as usize, len) as u64 + u64::from(len)
 }
 
 /// A half-open key range one tombstone covers, and the version it covers it at
@@ -149,6 +151,7 @@ mod tests {
 
     use crate::format::column::ColumnId;
     use crate::format::loc::SegmentId;
+    use crate::format::record::{HEADER_LEN, KEYLESS_MAX, KEYLESS_PREFIX};
 
     // a range covers only its own column, its own span, and older versions
     #[test]
@@ -222,7 +225,8 @@ mod tests {
     fn span_counts_the_key() {
         let entry = Entry::new(Loc::new(SegmentId(1), 0, 1600), Lsn(1));
 
-        assert_eq!(entry.span(34), HEADER_LEN as u64 + 34 + 1600);
-        assert_eq!(span_of(0, 0), HEADER_LEN as u64);
+        assert_eq!(entry.span(34), KEYLESS_PREFIX as u64 + 1600);
+        assert_eq!(span_of(0, 0), KEYLESS_PREFIX as u64);
+        assert_eq!(span_of(34, KEYLESS_MAX + 1), HEADER_LEN as u64 + 34 + u64::from(KEYLESS_MAX) + 1);
     }
 }

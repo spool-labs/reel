@@ -16,7 +16,9 @@ use crate::config::{IoBackend, Preallocate, ReelConfig, DEFAULT_FD_CACHE};
 use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth};
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::SegmentId;
-use crate::format::segment_header::SEGMENT_HEADER_SPAN;
+use crate::format::journal::{journal_path, read_groups, JournalRow};
+use crate::format::record::{check_keyless, KeylessRead, KEYLESS_PREFIX};
+use crate::format::segment_header::{SegmentHeader, SEGMENT_HEADER_SPAN};
 use crate::io::fault::{FaultKind, FaultPlan};
 use crate::io::op::{Advice, SegmentEntry};
 use crate::io::sim_backend::SimIo;
@@ -88,7 +90,29 @@ fn poll_once<Awaited: Future>(future: Pin<&mut Awaited>) -> Poll<Awaited::Output
 
 /// Bytes a record with a key of this column's width and this payload takes
 fn framed(payload_len: usize) -> u64 {
-    HEADER_LEN as u64 + KEY_WIDTH as u64 + payload_len as u64
+    crate::index::entry::span_of(KEY_WIDTH as u16, payload_len as u32)
+}
+
+/// The groups of rows the open segment has journaled, which a flush writes down
+fn journaled(shared: &ReelShared, appender: &Appender, segment: SegmentId) -> Vec<Vec<JournalRow>> {
+    appender.flush().expect("flush");
+    let bytes = read_segment(shared, &journal_path(&shared.segment_path(segment)));
+    read_groups(&bytes).0
+}
+
+/// Whether the record at a place checks out as the key its payload's byte gives
+///
+/// Every record these cells write carries `key(byte)` with a payload of that byte.
+fn lands_intact(shared: &ReelShared, loc: Loc) -> bool {
+    let bytes = read_segment(shared, &shared.segment_path(loc.segment));
+    let header = RecordHeader::unpack(&bytes).expect("segment header");
+    let payload = &bytes[HEADER_LEN..HEADER_LEN + header.length as usize];
+    let layout = SegmentHeader::unpack(payload).expect("segment header payload").layout;
+    let check = layout.keyless_key(loc.len).expect("a small record lies keyless");
+    let start = loc.offset as usize;
+    let (prefix, payload) = bytes[start..start + KEYLESS_PREFIX + loc.len as usize].split_at(KEYLESS_PREFIX);
+    let key = key(payload[0]);
+    matches!(check_keyless(prefix, payload, key.as_ref(), Flags::DATA, &check), KeylessRead::Intact(_))
 }
 
 fn read_segment(shared: &ReelShared, path: &Path) -> Vec<u8> {
@@ -112,17 +136,6 @@ fn entry_len(entries: &[SegmentEntry], name: &str) -> u64 {
         .expect("segment listed")
 }
 
-fn walk(bytes: &[u8], limit: u64) -> Vec<(RecordHeader, u64)> {
-    let mut out = Vec::new();
-    let mut offset = 0u64;
-    while offset + HEADER_LEN as u64 <= limit {
-        let header = RecordHeader::unpack(&bytes[offset as usize..]).expect("header");
-        let next = offset + header.span();
-        out.push((header, offset));
-        offset = next;
-    }
-    out
-}
 
 // opening a tail writes the segment header as record zero and nothing else
 #[test]
@@ -137,15 +150,15 @@ fn open_writes_segment_header() {
     assert_eq!(appender.tail().committed_len(), SEG_HEADER_SPAN);
 
     let bytes = read_segment(&shared, &shared.segment_path(SegmentId(1)));
-    let records = walk(&bytes, SEG_HEADER_SPAN);
-    assert_eq!(records.len(), 1);
-    assert!(records[0].0.flags.is_segment_header());
-    assert_eq!(records[0].1, 0);
+    let header = RecordHeader::unpack(&bytes).expect("header");
+    assert!(header.flags.is_segment_header());
+    assert_eq!(header.span(), SEG_HEADER_SPAN);
+    assert!(journaled(&shared, &appender, SegmentId(1)).is_empty(), "the header lists no row");
 }
 
-// a whole-block volume closes the header drain with a pad to the boundary
+// a whole-block volume closes the header drain with zeros to the boundary
 #[test]
-fn whole_block_open_pads_to_boundary() {
+fn whole_block_open_fills_to_boundary() {
     let mut settings = config(SyncPolicy::EveryPut, Preallocate::Chunk);
     settings.io_backend = IoBackend::UringDirect;
     let (shared, _sim) = harness(settings, FaultPlan::new(1));
@@ -154,9 +167,9 @@ fn whole_block_open_pads_to_boundary() {
     assert_eq!(appender.tail().committed_len(), ALIGN);
 
     let bytes = read_segment(&shared, &shared.segment_path(SegmentId(1)));
-    let records = walk(&bytes, ALIGN);
-    assert!(records[0].0.flags.is_segment_header());
-    assert!(records[1].0.flags.is_pad());
+    let header = RecordHeader::unpack(&bytes).expect("header");
+    assert!(header.flags.is_segment_header());
+    assert!(bytes[header.span() as usize..ALIGN as usize].iter().all(|byte| *byte == 0));
 }
 
 // records land back to back after the segment header, each where it reserved
@@ -180,21 +193,11 @@ fn records_land_contiguously() {
         SEG_HEADER_SPAN + framed(100) + framed(200) + framed(300)
     );
 
-    let bytes = read_segment(&shared, &shared.segment_path(SegmentId(1)));
-    let records = walk(&bytes, committed);
-    let data: Vec<&(RecordHeader, u64)> = records
-        .iter()
-        .filter(|(header, _)| header.flags.is_data())
-        .collect();
+    let data: Vec<JournalRow> = journaled(&shared, &appender, SegmentId(1)).into_iter().flatten().collect();
     assert_eq!(data.len(), 3);
-    assert_eq!(data[0].1, SEG_HEADER_SPAN);
-    assert_eq!(data[1].1, SEG_HEADER_SPAN + framed(100));
-    assert_eq!(data[2].1, SEG_HEADER_SPAN + framed(100) + framed(200));
-    let pads = records
-        .iter()
-        .filter(|(header, _)| header.flags.is_pad())
-        .count();
-    assert_eq!(pads, 0);
+    assert_eq!(u64::from(data[0].offset), SEG_HEADER_SPAN);
+    assert_eq!(u64::from(data[1].offset), SEG_HEADER_SPAN + framed(100));
+    assert_eq!(u64::from(data[2].offset), SEG_HEADER_SPAN + framed(100) + framed(200));
 }
 
 // every drain of a whole-block volume leaves the write head on a boundary
@@ -261,12 +264,10 @@ fn a_sync_adds_no_bytes() {
     assert_eq!(appender.tail().committed_len(), record_end);
     assert!(sim.sync_count() > 0, "the put reached the device");
 
-    let bytes = read_segment(&shared, &shared.segment_path(SegmentId(1)));
-    let records = walk(&bytes, appender.tail().committed_len());
     assert_eq!(
-        records.len(),
-        2,
-        "a segment header and the record, nothing else"
+        journaled(&shared, &appender, SegmentId(1)).concat().len(),
+        1,
+        "the record and nothing else"
     );
 }
 
@@ -288,16 +289,11 @@ fn flush_syncs_what_settled() {
     appender.flush().expect("flush");
 
     assert!(sim.sync_count() > before, "the flush reached the device");
-    let bytes = read_segment(&shared, &shared.segment_path(SegmentId(1)));
-    let records = walk(&bytes, appender.tail().committed_len());
     assert_eq!(
         appender.tail().committed_len(),
         record_end,
         "the flush wrote no record of its own"
     );
-    assert!(records
-        .iter()
-        .all(|(header, _)| !header.flags.is_pad() || header.length > 0));
 }
 
 // a tail with no sync owed answers the awaitable wait without waiting
@@ -577,28 +573,9 @@ fn batch_of(payload_len: usize) -> Vec<BatchRecord> {
         .collect()
 }
 
-/// The frame a walk found, with the records it declares
-fn frame_of(records: &[(RecordHeader, u64)], bytes: &[u8]) -> (BatchFrame, usize) {
-    let at = records
-        .iter()
-        .position(|(header, _)| header.flags.is_batch_frame())
-        .expect("the batch wrote a frame");
-    let (header, offset) = &records[at];
-    let payload =
-        &bytes[(offset + header.prefix_len()) as usize..(offset + header.span()) as usize];
-    assert!(
-        header.verify(payload),
-        "the frame verifies against what it declares"
-    );
-    (
-        BatchFrame::unpack(header, payload).expect("a frame declaration"),
-        at,
-    )
-}
-
-// a batch opens with a frame declaring exactly the run written behind it
+// a batch lands back to back and journals its rows as one group
 #[test]
-fn a_batch_is_framed() {
+fn a_batch_journals_as_one_group() {
     let (shared, _sim) = harness(
         config(SyncPolicy::Never, Preallocate::Chunk),
         FaultPlan::new(1),
@@ -607,51 +584,19 @@ fn a_batch_is_framed() {
 
     appender.append_batch(batch_of(300)).expect("batch");
 
-    let committed = appender.tail().committed_len();
-    let bytes = read_segment(&shared, &shared.segment_path(SegmentId(1)));
-    let records = walk(&bytes, committed);
-    let (frame, at) = frame_of(&records, &bytes);
-
-    assert_eq!(frame.count, 3);
-    assert_eq!(frame.span, framed(300) * 3);
-    assert_eq!(records[at].1, SEG_HEADER_SPAN, "the frame opens the run");
-    let members = &records[at + 1..at + 1 + frame.count as usize];
-    assert!(members.iter().all(|(header, _)| header.flags.is_batched()));
-    let run: u64 = members.iter().map(|(header, _)| header.span()).sum();
-    assert_eq!(run, frame.span, "the frame declares the bytes the run took");
-    assert_eq!(committed, SEG_HEADER_SPAN + BatchFrame::SPAN + frame.span);
-}
-
-// a batch of one record is a plain record, framed and marked as nothing
-#[test]
-fn a_batch_of_one_pays_for_no_frame() {
-    let (shared, _sim) = harness(
-        config(SyncPolicy::Never, Preallocate::Chunk),
-        FaultPlan::new(1),
+    assert_eq!(appender.tail().committed_len(), SEG_HEADER_SPAN + framed(300) * 3);
+    let groups = journaled(&shared, &appender, SegmentId(1));
+    assert_eq!(groups.len(), 1, "the batch journaled as one group");
+    let offsets: Vec<u64> = groups[0].iter().map(|row| u64::from(row.offset)).collect();
+    assert_eq!(
+        offsets,
+        vec![SEG_HEADER_SPAN, SEG_HEADER_SPAN + framed(300), SEG_HEADER_SPAN + framed(300) * 2]
     );
-    let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
-
-    appender
-        .append_batch(vec![BatchRecord {
-            key: key(1),
-            write: BatchWrite::Put(vec![0x11; 300], 0),
-        }])
-        .expect("batch");
-
-    let committed = appender.tail().committed_len();
-    assert_eq!(committed, SEG_HEADER_SPAN + framed(300));
-
-    let bytes = read_segment(&shared, &shared.segment_path(SegmentId(1)));
-    let records = walk(&bytes, committed);
-    assert!(records
-        .iter()
-        .all(|(header, _)| !header.flags.is_batch_frame()));
-    assert!(records.iter().all(|(header, _)| !header.flags.is_batched()));
 }
 
-// a whole-block volume closes a batch with a pad behind the run, not inside it
+// a whole-block volume fills a batch out to the next boundary with zeros behind the run
 #[test]
-fn a_whole_block_batch_pads_behind_its_run() {
+fn a_whole_block_batch_fills_behind_its_run() {
     let mut settings = config(SyncPolicy::Never, Preallocate::Chunk);
     settings.io_backend = IoBackend::UringDirect;
     let (shared, _sim) = harness(settings, FaultPlan::new(1));
@@ -660,22 +605,10 @@ fn a_whole_block_batch_pads_behind_its_run() {
     appender.append_batch(batch_of(300)).expect("batch");
 
     let committed = appender.tail().committed_len();
-    assert_eq!(
-        committed % ALIGN,
-        0,
-        "the batch left the head off a boundary"
-    );
-
+    assert_eq!(committed % ALIGN, 0, "the batch left the head off a boundary");
+    let run_end = ALIGN + framed(300) * 3;
     let bytes = read_segment(&shared, &shared.segment_path(SegmentId(1)));
-    let records = walk(&bytes, committed);
-    let (frame, at) = frame_of(&records, &bytes);
-
-    assert_eq!(frame.count, 3);
-    let (closing, _) = &records[at + 1 + frame.count as usize];
-    assert!(
-        closing.flags.is_pad(),
-        "the pad is not what follows the run"
-    );
+    assert!(bytes[run_end as usize..committed as usize].iter().all(|byte| *byte == 0));
 }
 
 // a batch too wide for the room left rolls whole rather than splitting in two
@@ -691,7 +624,7 @@ fn a_batch_never_spans_segments() {
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
 
     let payload = 4_000;
-    let batch_span = BatchFrame::SPAN + framed(payload) * 3;
+    let batch_span = framed(payload) * 3;
     let target = shared.config.segment_bytes.to_bytes();
     while target - appender.tail().committed_len() >= batch_span + ALIGN {
         appender
@@ -712,14 +645,11 @@ fn a_batch_never_spans_segments() {
         "a batch landed across {landed:?}",
     );
 
-    let bytes = read_segment(&shared, &shared.segment_path(landed[0]));
-    let records = walk(&bytes, appender.tail().committed_len());
-    let (frame, at) = frame_of(&records, &bytes);
-    assert_eq!(frame.count, 3);
+    let offsets: Vec<u64> = committed.iter().map(|record| u64::from(record.loc.offset)).collect();
     assert_eq!(
-        records[at + 1].1,
-        records[at].1 + BatchFrame::SPAN,
-        "the run follows its frame with nothing between",
+        offsets,
+        vec![offsets[0], offsets[0] + framed(payload), offsets[0] + framed(payload) * 2],
+        "the run lands back to back",
     );
 }
 
@@ -735,7 +665,7 @@ fn committed_length_reaches_past_every_record() {
     let committed = appender
         .append_data(key(9), vec![0x99; 700], 0, Commit::PerRecord)
         .expect("append");
-    let record_end = committed.loc.offset as u64 + HEADER_LEN as u64 + 700;
+    let record_end = committed.loc.offset as u64 + framed(700);
     assert!(appender.tail().committed_len() >= record_end);
 }
 
@@ -1119,12 +1049,8 @@ fn concurrent_appends_all_commit() {
     }
     assert_eq!(committed.len(), writers as usize);
 
-    let bytes = read_segment(&shared, &shared.segment_path(SegmentId(1)));
     for record in &committed {
-        let start = record.loc.offset as usize;
-        let header = RecordHeader::unpack(&bytes[start..]).expect("header");
-        let payload = &bytes[start + HEADER_LEN..start + HEADER_LEN + header.length as usize];
-        assert!(header.verify(payload));
+        assert!(lands_intact(&shared, record.loc));
     }
 }
 
@@ -1155,18 +1081,9 @@ fn appends_land_during_a_sync() {
         committed.push(handle.join().expect("join"));
     }
 
-    let bytes = read_segment(&shared, &shared.segment_path(SegmentId(1)));
-    let records = walk(&bytes, appender.tail().committed_len());
     for record in &committed {
-        let start = record.loc.offset as usize;
-        let header = RecordHeader::unpack(&bytes[start..]).expect("header");
-        let payload = &bytes[start + HEADER_LEN..start + HEADER_LEN + header.length as usize];
-        assert!(header.verify(payload));
+        assert!(lands_intact(&shared, record.loc));
     }
-    assert!(
-        !records.is_empty(),
-        "the walk crossed every record the writers left"
-    );
 }
 
 // writers crossing one threshold together share a flush instead of each buying one
@@ -1256,14 +1173,7 @@ fn flush_survives_a_roll_underneath_it() {
         "the tail rolled, so flushes and rolls really did interleave"
     );
     for record in &committed {
-        let bytes = read_segment(&shared, &shared.segment_path(record.loc.segment));
-        let start = record.loc.offset as usize;
-        let header = RecordHeader::unpack(&bytes[start..]).expect("header");
-        let payload = &bytes[start + HEADER_LEN..start + HEADER_LEN + header.length as usize];
-        assert!(
-            header.verify(payload),
-            "every record verifies where it landed"
-        );
+        assert!(lands_intact(&shared, record.loc), "every record verifies where it landed");
     }
 }
 
@@ -1273,7 +1183,7 @@ fn budget_backpressure_serializes() {
     let (shared, _sim) = harness_capped(
         config(SyncPolicy::Never, Preallocate::Chunk),
         FaultPlan::new(1),
-        InflightBudget::new(ByteCount::from_bytes(HEADER_LEN as u64 + 250)),
+        InflightBudget::new(ByteCount::from_bytes(framed(250))),
     );
     let appender = Arc::new(Appender::open(Arc::clone(&shared), 0, None).expect("open"));
 

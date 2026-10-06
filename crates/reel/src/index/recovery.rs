@@ -23,7 +23,7 @@ use crate::format::journal::{journal_path, read_groups, JournalRow, JOURNAL_SUFF
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{
-    read_u32_le, Flags, RecordHeader, HEADER_LEN,
+    check_keyless, read_u32_le, Flags, KeylessRead, RecordHeader, RecordLayout, HEADER_LEN, KEYLESS_PREFIX,
 };
 use crate::format::segment_header::{SegmentHeader, FORMAT_VERSION};
 use crate::index::column::{KeyMove, Landed};
@@ -33,7 +33,7 @@ use crate::index::map::ReelIndex;
 use crate::index::persisted::{trusted, PersistedReader, PersistedSegment};
 use crate::io::op::FileId;
 use crate::io::ServingBackend;
-use crate::reel::segment::{IoDriver, SegmentReader};
+use crate::reel::segment::{read_segment_header, IoDriver, SegmentReader};
 use crate::reel::segment_number;
 use crate::sync::lock;
 
@@ -1171,14 +1171,21 @@ fn read_range_ends(
     footer: &SegmentFooter,
 ) -> Result<Vec<Option<KeyBytes>>> {
     let mut ends = Vec::new();
+    let mut layout = None;
     for partition in &footer.partitions {
         for at in 0..partition.len() {
             let row = partition.row_at(at)?;
             if !row.flags.is_range_tombstone() {
                 continue;
             }
-            let width = partition.key_at(at).map_or(0, |key| key.len() as u16);
-            ends.push(read_range_end(driver, file, width, row.offset, row.len)?);
+            let width = partition.key_at(at).map_or(0, |key| key.len());
+            let layout = match layout {
+                Some(layout) => layout,
+                None => *layout.insert(
+                    read_segment_header(driver, file)?.map_or(RecordLayout::Keyed, |header| header.layout),
+                ),
+            };
+            ends.push(read_range_end(driver, file, layout.prefix_len(width, row.len), row.offset, row.len)?);
         }
     }
     Ok(ends)
@@ -1188,14 +1195,14 @@ fn read_range_ends(
 fn read_range_end(
     driver: &IoDriver,
     file: FileId,
-    key_width: u16,
+    prefix: usize,
     offset: u32,
     len: u32,
 ) -> Result<Option<KeyBytes>> {
     if len == 0 {
         return Ok(None);
     }
-    let at = u64::from(offset) + HEADER_LEN as u64 + u64::from(key_width);
+    let at = u64::from(offset) + prefix as u64;
     let bytes = driver.pread(file, at, u64::from(len))?;
     if bytes.len() < len as usize {
         return Ok(None);
@@ -1260,11 +1267,12 @@ fn read_journaled(driver: &IoDriver, file: FileId, path: &Path, file_len: u64) -
     };
     let (groups, valid) = read_groups(&bytes);
     tail.journal_len = valid as u64;
+    let layout = read_segment_header(driver, file)?.map_or(RecordLayout::Keyed, |header| header.layout);
     let mut reader = SegmentReader::new(driver, file, file_len);
     let mut rows = Vec::new();
     let mut ends = Vec::new();
     for group in groups {
-        if !all_landed(&mut reader, &group)? {
+        if !all_landed(&mut reader, layout, &group)? {
             continue;
         }
         for row in group {
@@ -1325,10 +1333,22 @@ fn header_end(driver: &IoDriver, file: FileId) -> Result<u64> {
 }
 
 /// Whether every record a group lists sits where its row says and checks out
-fn all_landed(reader: &mut SegmentReader<'_>, group: &[JournalRow]) -> Result<bool> {
+fn all_landed(reader: &mut SegmentReader<'_>, layout: RecordLayout, group: &[JournalRow]) -> Result<bool> {
     for row in group {
         if !is_indexable(row.flags) {
             return Ok(false);
+        }
+        if let Some(check) = layout.keyless_key(row.len) {
+            let span = KEYLESS_PREFIX + row.len as usize;
+            let record = reader.range(u64::from(row.offset), span)?;
+            if record.len() < span {
+                return Ok(false);
+            }
+            let (prefix, payload) = record.split_at(KEYLESS_PREFIX);
+            if !matches!(check_keyless(prefix, payload, row.key.as_ref(), row.flags, &check), KeylessRead::Intact(_)) {
+                return Ok(false);
+            }
+            continue;
         }
         let prefix = HEADER_LEN + row.key.as_slice().len();
         let head = reader.range(u64::from(row.offset), prefix)?;
@@ -1614,8 +1634,6 @@ fn is_indexable(flags: Flags) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::format::record::BatchFrame;
 
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2062,8 +2080,8 @@ mod tests {
         assert_eq!(keys_of(&rebuilt, RECORDS), vec![vec![9u8; 34]]);
     }
 
-    /// Write a batch of two behind one plain record, journal it, and say where its frame sits
-    fn tail_with_a_batch(sim: &SimIo) -> u64 {
+    /// Write a batch of two behind one plain record, journal it, and say where its records sit
+    fn tail_with_a_batch(sim: &SimIo) -> (u64, u64) {
         let shared = shared(config(SyncPolicy::EveryPut), sim);
         let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
@@ -2082,17 +2100,17 @@ mod tests {
             ])
             .expect("batch");
         appender.flush().expect("flush");
-        u64::from(committed[0].loc.offset) - BatchFrame::SPAN
+        (u64::from(committed[0].loc.offset), u64::from(committed[1].loc.offset))
     }
 
     // a batch whose records never landed is dropped, frame and all
     #[test]
     fn a_batch_the_write_never_reached_is_dropped() {
         let sim = SimIo::new(FaultPlan::new(1));
-        let frame_at = tail_with_a_batch(&sim);
-        // The shape a writev that stopped inside the batch leaves: the frame is there
-        // and the run behind it is the reservation's own zeros.
-        zero_from(&sim, frame_at + BatchFrame::SPAN, 4096);
+        let (first, _) = tail_with_a_batch(&sim);
+        // The shape a writev that stopped before the batch leaves: the run is the
+        // reservation's own zeros.
+        zero_from(&sim, first, 4096);
 
         let rebuilt = rebuild(&sim);
 
@@ -2103,9 +2121,8 @@ mod tests {
     #[test]
     fn a_batch_cut_short_is_dropped() {
         let sim = SimIo::new(FaultPlan::new(1));
-        let frame_at = tail_with_a_batch(&sim);
-        let first = frame_at + BatchFrame::SPAN + HEADER_LEN as u64 + 34 + 300;
-        zero_from(&sim, first, 4096);
+        let (_, second) = tail_with_a_batch(&sim);
+        zero_from(&sim, second, 4096);
 
         let rebuilt = rebuild(&sim);
 

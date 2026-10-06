@@ -172,7 +172,7 @@ impl FooterEntry {
 
     /// An entry for a record if the footer lists its kind, else nothing
     ///
-    /// Data records and both kinds of tombstone are listed, pads and segment headers
+    /// Data records and both kinds of tombstone are listed, and segment headers
     /// are not.
     pub fn from_record(header: &RecordHeader, offset: u32) -> Option<FooterEntry> {
         if !is_listed(header.flags) {
@@ -2052,7 +2052,7 @@ mod tests {
 
     // a mixed record stream keeps only the listed kinds in the footer
     #[test]
-    fn excludes_pads_and_headers() {
+    fn excludes_segment_headers() {
         let key_a = key(RECORD, 0x11, 34);
         let key_b = key(RECORD, 0x22, 34);
 
@@ -2062,7 +2062,6 @@ mod tests {
                 RecordHeader::data(key_a.clone(), Lsn(5), &[0xab; 100]),
                 4096,
             ),
-            (RecordHeader::pad(4252), 4252),
             (RecordHeader::tombstone(key_b.clone(), Lsn(7)), 8248),
         ];
 

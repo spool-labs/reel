@@ -44,6 +44,9 @@ struct MappedRows {
     /// The writable mapping rows are copied into
     map: WriteMapping,
 
+    /// Bytes the mapping spans, past which a group goes down through the driver
+    span: u64,
+
     /// The file under the mapping, open until the seal
     id: FileId,
 
@@ -62,9 +65,10 @@ impl Journal {
         // A drawn number is new and an open unlinks stale journals, so the file starts empty
         let id = driver.open(&path, true)?;
         let mapped = span
-            .and_then(|span| WriteMapping::growing(&path, span))
-            .map(|map| MappedRows {
+            .and_then(|span| WriteMapping::growing(&path, span).map(|map| (map, span)))
+            .map(|(map, span)| MappedRows {
                 map,
+                span,
                 id,
                 grown: AtomicU64::new(0),
             });
@@ -144,7 +148,7 @@ impl Journal {
         let at = self.pushed.load(Ordering::Acquire);
         let end = at + pending.len() as u64;
         if end > mapped.grown.load(Ordering::Acquire) {
-            let grown = end.div_ceil(GROW) * GROW;
+            let grown = (end.div_ceil(GROW) * GROW).min(mapped.span.max(end));
             self.driver.truncate(mapped.id, grown)?;
             mapped.grown.store(grown, Ordering::Release);
         }

@@ -26,6 +26,16 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     codec: Codec::None,
 }];
 
+/// The same column with keys of any width
+const VARYING: ColumnSet = &[ColumnSpec {
+    id: ColumnId(1),
+    name: "rows",
+    key_width: KeyWidth::Variable,
+    shard_bytes: 0,
+    purge_mark: None,
+    codec: Codec::None,
+}];
+
 /// Fresh keys each round adds, a few segments' worth
 const PER_ROUND: u64 = 500;
 
@@ -72,6 +82,13 @@ fn key_of(n: u64) -> Vec<u8> {
     key
 }
 
+/// A key of eight to sixteen bytes, its width from its number
+fn varying_key(n: u64) -> Vec<u8> {
+    let mut key = key_of(n);
+    key.truncate(8 + (n % 9) as usize);
+    key
+}
+
 fn value_of(n: u64, round: u64) -> Vec<u8> {
     let mut value = (n ^ (round << 40)).to_be_bytes().to_vec();
     value.resize(100 + (n % 200) as usize, (n % 251) as u8);
@@ -112,8 +129,12 @@ fn check(store: &ReelStore, model: &BTreeMap<Vec<u8>, Vec<u8>>, stage: &str) {
 }
 
 fn rounds(tails: u32, dead_ratio: f64) {
+    rounds_of(tails, dead_ratio, COLUMNS, key_of);
+}
+
+fn rounds_of(tails: u32, dead_ratio: f64, columns: ColumnSet, key_of: fn(u64) -> Vec<u8>) {
     let dir = TempDir::new().expect("temp dir");
-    let store = ReelStore::open(dir.path().to_path_buf(), config(tails, dead_ratio), COLUMNS).expect("open");
+    let store = ReelStore::open(dir.path().to_path_buf(), config(tails, dead_ratio), columns).expect("open");
     let mut model = BTreeMap::new();
     for round in 0..ROUNDS {
         for n in round * PER_ROUND..(round + 1) * PER_ROUND {
@@ -152,7 +173,7 @@ fn rounds(tails: u32, dead_ratio: f64) {
     }
     store.close().expect("close");
     drop(store);
-    let reopened = ReelStore::open(dir.path().to_path_buf(), config(tails, dead_ratio), COLUMNS).expect("reopen");
+    let reopened = ReelStore::open(dir.path().to_path_buf(), config(tails, dead_ratio), columns).expect("reopen");
     assert!(!reopened.index().key_runs().runs().is_empty(), "the reopen read no key run back");
     check(&reopened, &model, "after a reopen");
 }
@@ -179,6 +200,18 @@ fn key_runs_answer_as_the_model_while_rewrites_reclaim_their_segments() {
 #[test]
 fn key_runs_answer_as_the_model_while_four_tails_reclaim() {
     rounds(4, RECLAIM);
+}
+
+// keys of eight to sixteen bytes merge into key runs whose rows each say their width
+#[test]
+fn key_runs_of_varying_keys_answer_as_the_model() {
+    rounds_of(1, RECLAIM, VARYING, varying_key);
+}
+
+// the same on four tails
+#[test]
+fn key_runs_of_varying_keys_answer_as_the_model_on_four_tails() {
+    rounds_of(4, RECLAIM, VARYING, varying_key);
 }
 
 /// Dead share a segment is rewritten at in the scenarios below, so half-dead ones go

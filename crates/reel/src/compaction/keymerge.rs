@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::compaction::compactor::{Compactor, PassClaim};
 use crate::error::{ReelError, Result};
 use crate::format::column::ColumnId;
-use crate::format::footer::{FooterPartition, SegmentFooter, VARYING_WIDTH};
+use crate::format::footer::{FooterPartition, SegmentFooter};
 use crate::format::loc::{Loc, SegmentId};
 use crate::index::keyrun::{key_in, row_in, KeyRun, RunColumn, RunRow, RunWriter};
 use crate::index::map::ReelIndex;
@@ -96,8 +96,7 @@ impl Cursor<'_> {
 ///
 /// Each segment is claimed for the length of the pass, so no rewrite moves its records
 /// while the merge is writing down where they lie. A column whose keys vary in width is
-/// one key runs do not take, and a merge meeting one gives up and leaves its runs as
-/// they were.
+/// written with each row saying its own width.
 pub fn merge_into_key_run(
     compactor: &Compactor,
     reel: &Reel,
@@ -156,9 +155,6 @@ pub fn merge_into_key_run(
             }
             Source::Keys(run) => columns.extend(run.columns().iter().map(|column| (column.column, column.key_width))),
         }
-    }
-    if columns.iter().any(|(_, width)| *width == VARYING_WIDTH) {
-        return Err(ReelError::Rejected("key runs take fixed-width columns alone".to_string()));
     }
     let mut widths = columns.iter().map(|(column, _)| *column).collect::<Vec<_>>();
     widths.dedup();

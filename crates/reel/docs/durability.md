@@ -12,27 +12,34 @@ takes the process and leaves the page cache standing; a power cut takes both.
 
 | `sync` | a process crash | a power cut |
 |---|---|---|
-| `never`, the default | nothing is lost | the active segment of each tail since its last seal is at risk; everything sealed is on the medium |
-| a byte count | nothing is lost | everything up to the last flush that returned, which trails the write head by at most that many bytes |
+| `never`, the default | what landed since the journal last went down, at most one 1 MiB writeback pace a tail | the active segment of each tail since its last seal is at risk; everything sealed is on the medium |
+| a byte count | everything after the last flush that returned, at most that many bytes | the same |
 | `0`, every put | nothing is lost | nothing is lost |
 | any of the above, for a multi-record batch | a batch is confirmed or it never happened | a batch is confirmed or it never happened |
 
+A small record is keyless, so an open segment's journal is what says which key each
+record holds. A record whose row never reached the journal is not found again, even
+when its bytes reached the page cache, which is why a process crash costs what it
+does above.
+
 Four things hold at every setting.
 
-- **A batch is confirmed or it never happened.** The frame that opens a batch
-  declares how many records follow and how many bytes they take, inside a
-  checksummed header, and a rebuild keeps the run only when exactly that is
-  there and verifies. Whatever a crash lands in the middle of, no reader ever
-  sees part of a batch.
+- **A batch is confirmed or it never happened.** A batch's rows go into its
+  segment's journal as one checksummed group, and a rebuild keeps the group only
+  when every record it lists checks out. Whatever a crash lands in the middle of,
+  no reader ever sees part of a batch.
 - **A sealed segment is on the medium.** The seal syncs after writing the
   footer, whatever the policy says.
 - **A segment's directory entry is on the medium.** Creating a segment syncs the
   volume directory, because a file's own sync says nothing about the entry
   naming it.
-- **A torn or rotted record costs one record**, not the segment behind it. The
-  exception is a batch, where one bad record takes the whole run.
+- **A torn record in an open segment costs its write's group**, one record or one
+  batch, and not the records behind it.
+- **A footer that rots after its seal costs its segment.** The records are keyless
+  and the journal went with the seal, so nothing lists them. A volume with peers
+  repairs them from a peer.
 
-What the batch row does not say is as fixed as what it does. The frame promises
+What the batch row does not say is as fixed as what it does. The group promises
 nothing about how one batch is ordered against another beyond what the log
 already promises, which is the sequence number every record carries. And it
 promises nothing new about syncs: a batch is durable exactly when the policy
@@ -46,10 +53,10 @@ drive and not about surviving the loss of power.
 ## Format stability
 
 Two version numbers are stamped on disk. `FORMAT_VERSION` in
-`format/segment_header.rs` is **5**, written into the header record of every
+`format/segment_header.rs` is **6**, written into the header record of every
 segment. `FORMAT_VERSION` in `index/persisted.rs` is **2**, written into the
 index checkpoint file. A segment whose header names another version is
-quarantined whole rather than walked, and an index checkpoint whose version does
+quarantined whole rather than read, and an index checkpoint whose version does
 not match is discarded and rebuilt from the segments.
 
 **Before 1.0 no cross-version promise is made.** Either number may move without
@@ -79,8 +86,8 @@ a per-tail sealer thread, `flush()` drains that thread before syncing so a
 durability ask still covers everything rolled before it, and an explicit
 `Appender::seal()` stays synchronous because a caller reaching for it is
 asking for a sealed segment. A crash can land while a footer is queued but
-unwritten; recovery walks a segment without one record by record, the same
-path a torn seal always took, and the crash suite covers it.
+unwritten. The segment's journal is unlinked only after its footer is down, so
+recovery reads it back through the journal, and the crash suite covers it.
 
 So under the default, what a power cut can take is the active segment of each tail,
 bounded by the last seal. Everything sealed is on the medium. That default is a
@@ -136,35 +143,14 @@ nobody made about the middle of a batch. Moving the index first would make a key
 readable on the strength of a write the caller is about to be told failed, so a
 batch that fails anywhere leaves nothing of itself visible.
 
-Across a crash the frame is what carries it. A batch of more than one record opens
-with a frame record declaring two things about the run behind it: how many records
-it holds and how many bytes they take. Both numbers are inside the frame's own
-checksummed header, and the frame goes down in the same vectored write as the
-records it declares, so nothing can leave a frame standing over a run that was
-never written.
+Across a crash the journal is what carries it. The records of a batch take one
+reservation and one write, and their rows go into the segment's journal as one group
+under one checksum. A rebuild keeps the group only when every record it lists sits
+where its row says and checks out, and drops it whole otherwise.
 
-A rebuild reads the frame first and applies nothing until it has read the whole
-run: exactly that many records, each carrying the batch mark in its own checksummed
-header, each verifying, and the last of them ending exactly where the span said.
-Anything else and the run is dropped whole. A record carrying the batch mark that
-the walk meets without a frame in front of it is dropped too, because nothing
-vouches for it as part of a run.
-
-Both numbers are there because either alone is weaker. The count without the span
-would take a run of the right length made of records that lie about their own; the
-span without the count would take a run that reached the right byte in the wrong
-number of steps. The frame also says where the batch ends before its records are
-read, which is what lets a rot inside a batch cost the batch rather than the walk.
-
-A batch of one record is exempt. There is no middle for a crash to land in, so it
-is written as a plain record with neither a frame nor a mark, and it pays for
-neither. That matters because a caller with one write path stages every mutation as
-a batch, and most of those carry a single key.
-
-A batch and its frame never span segments. The reservation covers the frame and
-every record at once, and a reservation that runs past the end of the segment is
-given up whole and retaken on the next one, so recovery never has to join a run
-across two files.
+A batch never spans segments. The reservation covers every record at once, and a
+reservation that runs past the end of the segment is given up whole and retaken on
+the next one, so its rows land in one journal.
 
 A sealed segment needs none of this. Sealing waits for every reservation the
 segment held and syncs, so a batch in a footer is a batch that completed.
@@ -185,8 +171,8 @@ footer length and the magic, the footer body is checksum verified, and its rows 
 decoded. The segment body is read only for the one thing a footer cannot carry,
 which is the exclusive end a range tombstone holds in its payload. A footer whose
 magic is wrong, whose length is out of range, or whose checksum fails is not a
-footer, and the segment falls back to the record walk, which is also what a segment
-sealed only part way through gets.
+footer. A segment sealed only part way through still has its journal and reads back
+through it.
 
 **A paging volume sweeps the footer instead of collecting it.** The rebuild takes
 whether the volume pages. Resident columns decode every row into entries as
@@ -196,22 +182,13 @@ booked against that segment, holding one parsed footer at a time, so the open's
 peak is one footer rather than the key set. Sealed keys are answered from their
 footers afterwards rather than installed.
 
-**The active tail is walked once, in chunks.** The walk ends at the first byte
-that cannot begin a record: a header that will not parse, unknown flag bits, a key
-width past the widest a column may declare, a record whose span runs past the end
-of the file, or a data header carrying no sequence number. That last one is the
-reservation a tail preallocated ahead of its write head. It reads back as zeros,
-and zeros parse as an empty data record, so a walk that did not recognise the shape
-would step through the whole reservation one header at a time.
-
-**Every walked record is checksum verified, and a failure drops one record.** A
-crash can tear a record anywhere in a segment nothing has sealed, and rot can spoil
-one anywhere at all. Cutting the walk at the first failure would throw away every
-good record behind it for one rotted byte, so what is kept is what verifies. The
-exception is a batch, where one bad record takes the whole run with it and the walk
-carries on at the boundary the frame named. The cost is one checksum pass over the
-bytes the tail holds, which is bounded by the segment size rather than by the
-record count.
+**The active tail is read through its journal.** The journal's whole groups are
+read in order, and a group is kept only when every record it lists sits at its
+row's offset and checks out: a keyless record by its keyed check, a larger one by
+its header and checksum. A torn group ends the journal, a group naming a record that
+did not land is dropped whole, and the tail resumes past the last record kept, its
+accepted rows written again as a fresh journal. A segment with no footer and no
+journal is one whose footer went bad after its seal, and no tail resumes into it.
 
 **Newest-wins is folded in as records arrive, on the resident path.** Each
 source's run is cut to one version of each key as it lands, and a record that
@@ -229,7 +206,7 @@ The rebuild hands back the live entries per column, the sealed key spans where
 the volume pages, per-segment byte counts, live and dead and the tombstone
 footprint held with its newest mark, the oldest data record each segment can
 still surface, the highest sequence number seen, the highest segment number
-present, how far it read into each segment so a reader can carry on from there,
+present, how far it read each tail's journal so a follower can carry on from there,
 and the paths it quarantined. The sequence counter and the segment
 numbering are both raised above what was found, so lost unsynced numbers are
 harmlessly reissued.
@@ -277,12 +254,10 @@ is holding for this reason and cannot reclaim until an operator acts.
 
 ## Clean shutdown against a crash
 
-`close` seals every tail, so the next open resolves the volume from footers alone.
-A store dropped without it leaves one unsealed segment per tail, and the open that
-follows reads each of them back record by record. That work is the price of a
-crash rather than of a shutdown, and the footer is what tells the two apart on
-disk. `Drop` seals as well and traces a failure, since there is nobody left to
-hand one to.
+`close` flushes every tail, journal included, and leaves each one for the next
+open to resume. `Drop` closes as well and traces a failure, since there is nobody
+left to hand one to. A crash leaves the rows written since the journal last went
+down unwritten, which is the difference between the two on disk.
 
 ## Corruption at read time
 
@@ -307,20 +282,21 @@ segment, and it is written there once, in its final position. A WAL in front of
 that would write every byte twice, and it would sync twice, to protect a window
 between the log and the store that does not exist.
 
-The one thing a WAL would add is a cheap way to make a multi-record batch atomic
-across a crash, since a log record can carry a commit marker. That is what the
-batch frame is, and it costs one header record per batch rather than a second
-file, because the segment is already the log the marker would go in.
+The journal is the one second file, and it holds rows, never values: what each
+record's key, version and place are, until the footer says the same at the seal.
+It is what lets a small record drop its key, and a batch's rows going into it as
+one group is what makes the batch atomic across a crash. It goes away at the seal.
 
 ## What is not promised
 
-- Anything the policy did not cover. Under `never` that is the active segment of
-  each tail since its last seal.
+- Anything the policy did not cover. Under `never` a power cut can take the active
+  segment of each tail since its last seal, and a process crash what landed since
+  the journal last went down.
 - A view of the volume held across several reads. A batch publishes under a
   barrier, so one read spanning many keys sees all of it or none of it, but the
   index keeps one version per key and two reads can still straddle a batch. The
   fixed view is a cue point.
-- Anything about the order of one batch against another. The frame makes a batch
+- Anything about the order of one batch against another. The journal makes a batch
   whole; what orders it against everything else is the sequence number each of
   its records carries, exactly as for a single put.
 - The window inside a seal, on a volume with peers. Between writeback of the

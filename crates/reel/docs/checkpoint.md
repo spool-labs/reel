@@ -44,8 +44,8 @@ hold is scoped where the LSM engine's is global: segments whose records all sit
 above the floor compact freely while the checkpoint links.
 
 **The files are the truth.** Recovery rebuilds the index from segment files
-alone, footers first, record walk where a footer is missing, every record
-checksummed. A directory of sealed segments is not an input to a restore
+alone, footers first, an open segment's journal where a footer is missing, every
+record checked. A directory of sealed segments is not an input to a restore
 procedure, it is an openable volume. There is no manifest to capture
 consistently because there is no manifest at all.
 

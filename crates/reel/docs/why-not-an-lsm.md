@@ -25,9 +25,9 @@ front of that would write every byte twice and sync twice, to protect a window
 between the log and the store that does not exist.
 
 The one thing a write-ahead log adds that is genuinely needed is a commit marker
-making a multi-record batch atomic across a crash, because a log record can
-carry one. That is what the batch frame is, and it costs one header record at
-the front of a batch rather than a second file.
+making a multi-record batch atomic across a crash. Here an open segment's journal
+carries it: a batch's rows go in as one checksummed group. The journal holds rows,
+never values, so a value is still written once, and it goes away at the seal.
 
 Three consequences follow from that absence, and they are larger than the saved
 write.

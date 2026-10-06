@@ -33,6 +33,9 @@ pub struct KeyPage {
     /// Whether the caller reads every payload, so a walk that met them may hand them over
     reads_payloads: bool,
 
+    /// Whether graves and covered entries come out too, for a merge that judges them itself
+    keeps_graves: bool,
+
     /// Payloads a walk read with their keys, one place a key once the first arrives
     payloads: Vec<Option<Value>>,
 }
@@ -63,6 +66,22 @@ impl KeyPage {
     /// Whether the caller reads every payload, so a payload read beside its key is worth keeping
     pub fn reads_payloads(&self) -> bool {
         self.reads_payloads
+    }
+
+    /// The map's half of a merge, graves and covered entries included
+    ///
+    /// The merge drops a sealed key the map has deleted, so it has to see the grave.
+    pub fn merging() -> KeyPage {
+        KeyPage {
+            keeps_found: true,
+            keeps_graves: true,
+            ..KeyPage::default()
+        }
+    }
+
+    /// Whether the page carries graves and covered entries for its reader to judge
+    pub fn keeps_graves(&self) -> bool {
+        self.keeps_graves
     }
 
     /// Drop the page's contents, keeping its allocations for the next fill

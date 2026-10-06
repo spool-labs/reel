@@ -507,7 +507,7 @@ impl Default for CursorBuffers {
     fn default() -> CursorBuffers {
         CursorBuffers {
             sealed: Sealed::default(),
-            resident: KeyPage::with_lens(),
+            resident: KeyPage::merging(),
         }
     }
 }
@@ -685,38 +685,43 @@ pub fn merged_page(
 
     let mut taken = 0usize;
     let mut want = [0u8; MAX_KEY_LEN];
+    // The next page resumes past the last key judged here, which the page's own last
+    // key cannot say once a judged key was a grave. Copied out, since the key past the
+    // edge is peeked into the same buffer. Nowhere, once every source ran dry.
+    let mut resume = [0u8; MAX_KEY_LEN];
+    let mut resume_len = 0usize;
+    let mut exhausted = false;
 
     while out.len() < limit {
         let Some(key) = next_key(resident.key_ref(taken), sealed, way, &mut want) else {
+            // A full map page may still have keys past its edge, so only a short one
+            // ends the playback.
+            exhausted = resident.len() < limit;
             break;
         };
         if edge.is_some_and(|edge| is_ahead(way, edge, key)) {
             break;
         }
+        resume[..key.len()].copy_from_slice(key);
+        resume_len = key.len();
 
         // The map's answer stands on its own, so the footers are stepped past this
-        // key without their rows being decoded.
+        // key without their rows being decoded. The page carries the map's graves, so
+        // a key the map deleted is dropped here, sealed rows and all.
         if resident.key_ref(taken) == Some(key) {
             sealed.skip(way, key);
-            // Dropping the key here would lose it for good, since the next page
-            // starts after the last key this one emitted.
             let found = resident
                 .found_at(taken)
                 .expect("the merge's own page carries its entries");
-            out.push(key, found);
             taken += 1;
-            continue;
-        }
-        // A key missing from the page can still be one the map took since the page was
-        // read. A grave drops it, and a put answers with its own entry.
-        let newest = sealed.newest(way, key, None, |segment| paged.sealed.holds(segment))?;
-        if let Some(entry) = index.entry_or_grave(key) {
-            if !entry.is_grave() && !index.is_covered_key(key, entry.lsn) {
-                out.push(key, entry);
+            if !found.is_grave() && !index.is_covered_key(key, found.lsn) {
+                out.push(key, found);
             }
             continue;
         }
-        let Some((segment, found)) = newest else {
+        // The page was read under the publish barrier, so a key it lacks is one the
+        // map does not hold, and the newest sealed row answers for it.
+        let Some((segment, found)) = sealed.newest(way, key, None, |segment| paged.sealed.holds(segment))? else {
             continue;
         };
         if found.is_tombstone() || found.is_range_tombstone() {
@@ -731,7 +736,10 @@ pub fn merged_page(
         );
     }
 
-    playback.advance(out, limit)?;
+    playback.at = match exhausted {
+        true => None,
+        false => Some(Bound::Excluded(KeyBytes::new(&resume[..resume_len])?)),
+    };
     Ok(())
 }
 
@@ -956,6 +964,7 @@ mod tests {
     use crate::format::footer::FooterEntry;
     use crate::format::lsn::Lsn;
     use crate::format::record::Flags;
+    use crate::index::counters::SegmentTable;
 
     const COLUMN: ColumnId = ColumnId(1);
 
@@ -1038,6 +1047,13 @@ mod tests {
             self.footers.opened.load(Ordering::Relaxed)
         }
 
+        /// Delete a key in the map, leaving a grave over whatever a sealed run holds for it
+        fn bury(&self, byte: u8) {
+            let segments = SegmentTable::new();
+            self.index
+                .remove(key(byte).as_slice(), Lsn(1000 + u64::from(byte)), Loc::new(SegmentId(9), 0, 0), &segments);
+        }
+
         /// Take one page, and say which keys it carried
         fn page(&self, playback: &mut PlaybackCursor, page: &mut KeyPage) -> Vec<u8> {
             merged_page(&self.paged(), playback, PAGE, page).expect("page");
@@ -1090,6 +1106,44 @@ mod tests {
             2,
             "one open per segment for the whole playback, not per page"
         );
+    }
+
+    // a key the map deleted stays out of the merge, whatever a sealed run holds for it
+    #[test]
+    fn a_grave_hides_a_sealed_row() {
+        let fixture = Fixture::new(&[(SegmentId(1), &[1, 2, 3, 4])]);
+        fixture.seal(SegmentId(1), 1, 4);
+        fixture.bury(2);
+
+        assert_eq!(fixture.drain(&mut playback()), vec![1, 3, 4]);
+    }
+
+    // a page of graves alone leaves the playback open for the keys past it
+    #[test]
+    fn a_page_of_graves_does_not_end_the_playback() {
+        let fixture = Fixture::new(&[(SegmentId(1), &[1, 2, 3, 4])]);
+        fixture.seal(SegmentId(1), 1, 4);
+        fixture.bury(1);
+        fixture.bury(2);
+
+        let mut playback = playback();
+        let mut page = KeyPage::with_lens();
+        assert_eq!(fixture.page(&mut playback, &mut page), Vec::<u8>::new(), "a page of graves is empty");
+        assert!(!playback.is_done(), "the playback stays open past a page of graves");
+        assert_eq!(fixture.drain(&mut playback), vec![3, 4]);
+    }
+
+    // a page that stops at its edge resumes behind the sealed key it peeked, whose grave
+    // is on the next page
+    #[test]
+    fn a_page_edge_resumes_before_the_key_it_peeked() {
+        let fixture = Fixture::new(&[(SegmentId(1), &[1, 2, 3, 4])]);
+        fixture.seal(SegmentId(1), 1, 4);
+        fixture.bury(1);
+        fixture.bury(2);
+        fixture.bury(3);
+
+        assert_eq!(fixture.drain(&mut playback()), vec![4]);
     }
 
     // a segment sealed mid-playback is picked up, since the cursors are opened again

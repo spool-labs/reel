@@ -869,28 +869,31 @@ impl Page {
             return Some((taken, self.buffered.found_at(taken)));
         }
 
-        let playback = self.playback.as_mut()?;
-        if playback.is_done() {
-            self.playback = None;
-            return None;
-        }
-        let wanted = self.size;
-        if let Some(KeyWidth::Fixed(width)) = store.key_shape(playback.column()) {
-            self.buffered.reserve(wanted, usize::from(width));
-        }
-        // A page a paged column could not read ends the playback short, since an
-        // iterator has nowhere to put an error. Counted, because that count is what
-        // separates a short playback from a complete one that found less.
-        if let Err(error) = store.page_from(playback, wanted, &mut self.buffered) {
-            tracing::warn!("a playback stopped at a page it could not read: {error}");
-            store.note_unreadable();
-            self.buffered.clear();
-            self.playback = None;
-        }
-        self.size = (self.size * 2).min(PLAYBACK_PAGE_MAX);
-
-        if self.buffered_count() == 0 {
-            return None;
+        // A page comes back empty with the playback still open when every key on it
+        // was a grave the merge dropped, so the next page is asked for.
+        loop {
+            let playback = self.playback.as_mut()?;
+            if playback.is_done() {
+                self.playback = None;
+                return None;
+            }
+            let wanted = self.size;
+            if let Some(KeyWidth::Fixed(width)) = store.key_shape(playback.column()) {
+                self.buffered.reserve(wanted, usize::from(width));
+            }
+            // A page a paged column could not read ends the playback short, since an
+            // iterator has nowhere to put an error. Counted, because that count is what
+            // separates a short playback from a complete one that found less.
+            if let Err(error) = store.page_from(playback, wanted, &mut self.buffered) {
+                tracing::warn!("a playback stopped at a page it could not read: {error}");
+                store.note_unreadable();
+                self.buffered.clear();
+                self.playback = None;
+            }
+            self.size = (self.size * 2).min(PLAYBACK_PAGE_MAX);
+            if self.buffered_count() > 0 {
+                break;
+            }
         }
         self.taken = 1;
         Some((0, self.buffered.found_at(0)))

@@ -2022,12 +2022,14 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             // for as long as the walk it opens.
             let low = borrowed(&bound);
             let state = read(&self.shards[at]);
+            // A merge judges graves and covers itself, so its page takes every entry.
+            let judged = out.keeps_graves();
             let covers = self.has_covers.load(Ordering::Relaxed);
             for (keys, entries) in state.map.span_runs(low) {
                 // A run with nothing dead in it goes over in one copy of keys and one of entries,
                 // cut at the room the page has left.
                 let take = keys.len().min(limit - out.len());
-                let clean = !covers && !entries[..take].iter().any(Entry::is_grave);
+                let clean = judged || (!covers && !entries[..take].iter().any(Entry::is_grave));
                 let width = keys.first().map_or(0, |key| key.as_slice().len());
                 let packed = clean
                     && K::packed(&keys[..take])
@@ -2035,7 +2037,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 if !packed {
                     // Dead entries are skipped, so the whole run is walked until the page fills.
                     for (key, entry) in keys.iter().zip(entries) {
-                        if !entry.is_grave() && !self.is_covered(key.as_slice(), entry.lsn) {
+                        if judged || (!entry.is_grave() && !self.is_covered(key.as_slice(), entry.lsn)) {
                             out.push(key.as_slice(), *entry);
                             if out.len() >= limit {
                                 return;
@@ -2129,12 +2131,13 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             };
             let high = borrowed(&bound);
             let state = read(&self.shards[at]);
+            let judged = out.keeps_graves();
             for (key, entry) in
                 state
                     .map
                     .span_back(Bound::Unbounded, high)
                     .filter(|(key, entry)| {
-                        !entry.is_grave() && !self.is_covered(key.as_slice(), entry.lsn)
+                        judged || (!entry.is_grave() && !self.is_covered(key.as_slice(), entry.lsn))
                     })
             {
                 out.push(key.as_slice(), *entry);

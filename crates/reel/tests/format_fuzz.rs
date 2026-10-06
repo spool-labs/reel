@@ -25,7 +25,7 @@ use reel::format::footer::{FooterEntry, SegmentFooter};
 use reel::format::loc::SegmentId;
 use reel::format::lsn::Lsn;
 use reel::format::prefix::{unpack, PrefixRows, Tail};
-use reel::format::record::{BatchFrame, Flags, RecordHeader, HEADER_LEN};
+use reel::format::record::{BatchFrame, CheckKey, Flags, RecordHeader, RecordLayout, HEADER_LEN};
 use reel::format::segment_header::{SegmentHeader, SEGMENT_HEADER_LEN, SEGMENT_HEADER_SPAN};
 use reel::index::column::ColumnMark;
 use reel::index::persisted::{PersistedColumn, PersistedIndex, PersistedSegment};
@@ -347,6 +347,10 @@ fn segment_header_roundtrips() {
                 version: rng.gen(),
                 segment: SegmentId(rng.gen()),
                 band: rng.gen::<bool>().then(|| Band(rng.gen())),
+                layout: match rng.gen::<bool>() {
+                    true => RecordLayout::Keyless(CheckKey::from_bytes(rng.gen())),
+                    false => RecordLayout::Keyed,
+                },
             };
 
             let parsed = SegmentHeader::unpack(&header.pack()).expect("a packed header parses");

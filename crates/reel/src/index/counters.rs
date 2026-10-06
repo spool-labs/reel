@@ -498,7 +498,7 @@ impl SegmentTable {
         SegmentTable::default()
     }
 
-    /// Book a record live in its segment, and note the version it carries
+    /// Book a record live in its segment, and note the version it holds
     pub fn mark_live(&self, segment: SegmentId, lsn: Lsn, span: u64) {
         self.opened(segment, |row| {
             row.note_min(lsn);
@@ -506,7 +506,7 @@ impl SegmentTable {
         });
     }
 
-    /// Book a record dead where it lies, and note the version it carries
+    /// Book a record dead where it lies, and note the version it holds
     ///
     /// A record whose index write lost its race is still on disk and a rebuild
     /// would still find it, so its version counts as a live one's does.
@@ -853,10 +853,10 @@ pub trait Bookings {
     /// The incarnation an entry pointing into a segment is stamped with
     fn live_incarnation(&self, segment: SegmentId) -> SegmentIncarnation;
 
-    /// Book a record live in its segment, and note the version it carries
+    /// Book a record live in its segment, and note the version it holds
     fn mark_live(&self, segment: SegmentId, lsn: Lsn, span: u64);
 
-    /// Book a record dead where it lies, and note the version it carries
+    /// Book a record dead where it lies, and note the version it holds
     fn mark_dead(&self, segment: SegmentId, lsn: Lsn, span: u64);
 
     /// Move a record's footprint from live to dead within its segment

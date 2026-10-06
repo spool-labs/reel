@@ -1,8 +1,8 @@
-//! A tombstone compaction carries keeps its key out of walks, and never hides a newer put
+//! A tombstone compaction copies keeps its key out of walks, and never hides a newer put
 //!
 //! On a paged volume a sealed tombstone has no grave in the map: a reopen rebuilds the
 //! map from what is unsealed, and the prune gives a grave up once its segment is noted.
-//! A pass that carries the tombstone retires that segment, so until the copy's own
+//! A pass that copies the tombstone retires that segment, so until the copy's own
 //! segment is noted the copy stands as a grave in the map. That grave must never stand
 //! over a version newer than the tombstone, wherever the newer version sits.
 
@@ -26,7 +26,7 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     codec: Codec::None,
 }];
 
-/// A segment no tail will reach, standing in for a carried copy's segment
+/// A segment no tail will reach, standing in for a copy's segment
 const COPY: SegmentId = SegmentId(u32::MAX - 1);
 
 /// Filler keys a round writes, enough to roll a segment more than once
@@ -125,19 +125,19 @@ fn a_carried_tombstone_keeps_its_key_out_of_walks() {
     fill(&store, 2);
     let store = reopen(store, &dir);
     write_only(&store, 2, 3);
-    // Walked right after the pass that carries it, before anything notes the copy's segment.
-    let mut is_carried = false;
+    // Walked right after the pass that copies it, before anything notes the copy's segment.
+    let mut is_copied = false;
     for _ in 0..8 {
         let carried = store.compaction_counters().tombstones_carried;
         store.compact_once().expect("compact");
         // The walk goes first: a get notes the segments that sealed, which would close the window.
         if store.compaction_counters().tombstones_carried > carried {
-            is_carried = true;
+            is_copied = true;
             assert!(!walked(&store), "a walk found the deleted key's first version");
             assert_eq!(value(&store), None, "a get found the deleted key");
         }
     }
-    assert!(is_carried, "no pass carried the tombstone, so this proves nothing");
+    assert!(is_copied, "no pass copied the tombstone, so this proves nothing");
 }
 
 #[test]
@@ -197,7 +197,7 @@ fn a_put_after_a_delete_survives_compacting_its_tombstone() {
     }
     let compaction = store.compaction_counters();
     assert!(compaction.segments_rewritten > 0, "no pass ran, so this proves nothing");
-    assert!(compaction.tombstones_dropped > 0, "the tombstone was carried over a newer put");
+    assert!(compaction.tombstones_dropped > 0, "the tombstone was copied over a newer put");
     assert_eq!(value(&store), Some(b"second".to_vec()));
     assert!(walked(&store), "a walk lost the second put");
 }

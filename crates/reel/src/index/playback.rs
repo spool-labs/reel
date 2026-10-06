@@ -723,8 +723,8 @@ pub fn merged_page(
 
     let mut taken = 0usize;
     let mut want = [0u8; MAX_KEY_LEN];
-    // The next page resumes past the last key judged here, which the page's own last
-    // key cannot say once a judged key was a grave. Copied out, since the key past the
+    // The next page resumes past the last key decided here, which the page's own last
+    // key cannot say once a decided key was a grave. Copied out, since the key past the
     // edge is peeked into the same buffer. Nowhere, once every source ran dry.
     let mut resume = [0u8; MAX_KEY_LEN];
     let mut resume_len = 0usize;
@@ -744,7 +744,7 @@ pub fn merged_page(
         resume_len = key.len();
 
         // The map's answer stands on its own, so the footers are stepped past this
-        // key without their rows being decoded. The page carries the map's graves, so
+        // key without their rows being decoded. The page holds the map's graves, so
         // a key the map deleted is dropped here, sealed rows and all.
         if resident.key_ref(taken) == Some(key) {
             sealed.skip(way, key);

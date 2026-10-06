@@ -470,7 +470,7 @@ impl RecordHeader {
 
     /// Whether this record carries a payload the length describes
     ///
-    /// Data records, range tombstones and segment headers carry one, and point
+    /// Data records, range tombstones and segment headers have one, and point
     /// tombstones do not.
     pub fn has_payload(&self) -> bool {
         self.flags.is_data() || self.flags.is_segment_header() || self.flags.is_range_tombstone()
@@ -515,7 +515,7 @@ impl RecordHeader {
         }
     }
 
-    /// The prefix of this record in a segment of this layout, over the payload it carries
+    /// The prefix of this record in a segment of this layout, over the payload it holds
     ///
     /// A keyless record's check is keyed by its segment, so it is taken here, once the
     /// segment the record lands in is known.
@@ -609,7 +609,7 @@ pub(crate) fn align_up(value: u64, alignment: u64) -> u64 {
 /// record's stored length, and every reader holds that length before it reads.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RecordLayout {
-    /// Every record carries its header and its key
+    /// Every record has its header and its key
     #[default]
     Keyed,
 
@@ -821,7 +821,7 @@ mod tests {
         }
     }
 
-    // a tombstone carries no payload
+    // a tombstone has no payload
     #[test]
     fn tombstone_record() {
         let tombstone = RecordHeader::tombstone(sample_key(RECORD, 0x22, 34), Lsn(4));

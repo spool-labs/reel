@@ -476,7 +476,7 @@ fn layout_of(file: &mut File) -> RecordLayout {
 /// Check every record a footer or a journal lists, against the row it came through
 ///
 /// A keyless record's check covers the key and kind its row holds, under the key its
-/// segment header carries. A record past the keyless ceiling keeps its header and
+/// segment header holds. A record past the keyless ceiling keeps its header and
 /// checks against its own checksum.
 fn sweep_rows(
     file: &mut File,

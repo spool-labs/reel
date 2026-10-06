@@ -32,7 +32,7 @@ use crate::reel::segment::IoDriver;
 /// Bytes of rows one fence lead stands for, so a search touches a page or two of rows
 const BLOCK_BYTES: usize = 8 * 1024;
 
-/// Bytes a row carries past its key: sequence, segment, offset, length and flags
+/// Bytes a row takes past its key: sequence, segment, offset, length and flags
 pub const ROW_TAIL: usize = 8 + 4 + 4 + 4 + 1;
 
 /// Bytes the writer gathers before it writes, so rows go down in large writes
@@ -57,7 +57,7 @@ pub fn key_run_name(id: u64) -> String {
     format!("{id:012}{KEY_RUN_SUFFIX}")
 }
 
-/// The id a key run's file name carries, or nothing for a file that is not one
+/// The id in a key run's file name, or nothing for a file that is not one
 pub fn key_run_id(name: &str) -> Option<u64> {
     name.strip_suffix(KEY_RUN_SUFFIX)?.parse().ok()
 }
@@ -117,7 +117,7 @@ impl RunColumn {
         self.key_width as usize + ROW_TAIL
     }
 
-    /// Whether each row carries its own key width
+    /// Whether each row holds its own key width
     pub fn is_varying(&self) -> bool {
         self.key_width == VARYING_WIDTH
     }
@@ -204,7 +204,7 @@ impl Backing {
 
 /// A key run open for reading, its fences and directory held and its rows read in place
 pub struct KeyRun {
-    /// The run's id, which its file name carries and which orders runs by age
+    /// The run's id, which its file name holds and which orders runs by age
     pub id: u64,
 
     /// Where the file is
@@ -416,7 +416,7 @@ impl KeyRunSet {
 
     /// Hold the set for one merge, nothing while another merge holds it
     ///
-    /// Key runs carry no claims, so two merges at once could both take one run and leave
+    /// Key runs have no claims, so two merges at once could both take one run and leave
     /// its rows in two.
     pub fn try_merge(&self) -> Option<MutexGuard<'_, ()>> {
         crate::sync::try_lock(&self.merging)

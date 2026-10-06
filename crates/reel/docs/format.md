@@ -44,7 +44,7 @@ A record whose payload is 4 KiB or less lies keyless:
 The check is a SipHash-1-3 over the record's column, key width, kind, shape, the
 payload's CRC32C and its key, keyed by a 16-byte secret drawn at random for each
 segment and kept in its header record. The shape is the payload length, shifted up
-two bits over the codec. The record carries no key, no sequence number and no flags:
+two bits over the codec. The record holds no key, no sequence number and no flags:
 its footer row holds them, or its journal row until the seal, and a reader that holds
 the key confirms the record by computing the check again. A writer choosing keys
 cannot make one key's record check as another's, since the secret is the segment's
@@ -158,7 +158,7 @@ together.
 row: | column, 1 | key width, 2 | key | lsn, 8 | offset, 4 | length, 4 | flags, 1 | range end |
 ```
 
-A range tombstone's row carries its exclusive end behind its length, `0xFFFF` for
+A range tombstone's row holds its exclusive end behind its length, `0xFFFF` for
 none. The CRC covers the group's head and rows, so a group a crash cut short fails it
 and the journal ends there.
 
@@ -204,7 +204,7 @@ One row is the key, then the sequence number, the offset, the payload length and
 record's flags. A partition packs its rows with `format/prefix.rs`'s restart-block
 encoding: keys prefix compressed where their sorted fronts share enough to pay for it,
 and each row's tail stored as varint differences from the row before. The parse
-rebuilds whole rows, so the encoding lives only on disk. The directory names each
+rebuilds whole rows, so the encoding lives only on disk. The directory lists each
 partition by column, key width, row count and encoded span, which is what lets
 the rows stride at the natural width instead of the widest one. The fixed tail is 64 bytes and
 holds, reading backwards from the end: the magic, the footer length, the footer's

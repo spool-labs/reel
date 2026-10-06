@@ -1367,7 +1367,7 @@ impl SpotColumn {
         Ok(Lookup::Unsettled)
     }
 
-    /// Carry a started lookup on, one read of each candidate left, and settle it
+    /// Continue a started lookup, one read of each candidate left, and settle it
     pub fn read_on(&self, key: &RecordKey, mut pick: Pick) -> Result<Lookup> {
         let Some(records) = self.records.get() else {
             return Ok(Lookup::Unsettled);

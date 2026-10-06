@@ -122,13 +122,13 @@ impl SegmentHeader {
                     .get(CHECK_AT..SEGMENT_HEADER_SPAN)
                     .and_then(|key| key.try_into().ok())
                     .ok_or_else(|| {
-                        ReelError::Corruption("a keyless segment header carries no check key".to_string())
+                        ReelError::Corruption("a keyless segment header holds no check key".to_string())
                     })?;
                 RecordLayout::Keyless(CheckKey::from_bytes(check))
             }
             Some(byte) => {
                 return Err(ReelError::Corruption(format!(
-                    "segment header carries record layout {byte}, which no writer stores"
+                    "segment header holds record layout {byte}, which no writer stores"
                 )))
             }
         };

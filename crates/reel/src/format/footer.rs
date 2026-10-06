@@ -43,7 +43,7 @@ const DIRECTORY_SPAN_AT: usize = 1 + 2 + U32_BYTES;
 /// really keyed its rows at. Such a partition carries a start per row ahead of the rows.
 pub const VARYING_WIDTH: u16 = u16::MAX;
 
-/// The bit a fixed width carries in a directory row when its rows lie prefix packed
+/// The bit a fixed width sets in a directory row when its rows lie prefix packed
 ///
 /// Clear in every width a key really has, since no key is wider than `MAX_KEY_LEN`.
 pub const PACKED_WIDTH: u16 = 0x8000;

@@ -192,7 +192,7 @@ fn reads_back_by_key() {
 }
 
 // an overwritten key's old place still reads its own record, since a keyless record
-// carries no version and the index alone judges which version is current
+// holds no version and the index alone decides which version is current
 #[test]
 fn a_superseded_place_reads_its_own_record() {
     let (shared, _sim) = harness(1);

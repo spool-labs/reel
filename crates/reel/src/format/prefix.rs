@@ -18,7 +18,7 @@ use crate::format::footer::ENTRY_TAIL_LEN;
 /// Fewer restarts saves bytes and makes the walk after a seek longer.
 pub const RESTART_INTERVAL: usize = 16;
 
-/// Widest tail a row carries once read back, which sizes the buffer a row decodes into
+/// Widest tail a row holds once read back, which sizes the buffer a row decodes into
 const TAIL_CAP: usize = 32;
 
 /// Where a footer entry tail keeps its offset, its length and its flags
@@ -581,7 +581,7 @@ impl<'a> PrefixCursor<'a> {
         if self.index >= self.rows.rows {
             return Ok(false);
         }
-        // A restart row carries its numbers whole, so it reads against nothing.
+        // A restart row holds its numbers whole, so it reads against nothing.
         if self.index.is_multiple_of(RESTART_INTERVAL) {
             self.tail = [0; TAIL_CAP];
         }
@@ -921,7 +921,7 @@ pub fn unpack_block(bytes: &[u8], shape: Tail) -> Result<(Vec<u8>, Vec<u32>)> {
     let mut at = 0usize;
     let mut index = 0usize;
     while at < bytes.len() {
-        // Every restart row carries its numbers whole, so it reads against nothing.
+        // Every restart row holds its numbers whole, so it reads against nothing.
         if index.is_multiple_of(RESTART_INTERVAL) {
             before = [0; TAIL_CAP];
         }

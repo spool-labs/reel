@@ -1544,10 +1544,10 @@ impl ReelIndex {
         }
     }
 
-    /// Stand a grave for a point tombstone compaction carried, on a paging volume
+    /// Stand a grave for a point tombstone compaction copied, on a paging volume
     ///
     /// A delete's grave goes once its tombstone's segment is noted, and the pass that
-    /// carries the tombstone on retires that segment. The copy is in no footer a walk
+    /// moves the tombstone on retires that segment. The copy is in no footer a walk
     /// opens until its own segment is noted, so an older record of the key would answer
     /// in the meantime. The grave stands for the copy, and the prune takes it the same
     /// way once the copy's segment is noted.

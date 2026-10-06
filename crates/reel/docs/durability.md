@@ -55,8 +55,8 @@ drive and not about surviving the loss of power.
 Two version numbers are stamped on disk. `FORMAT_VERSION` in
 `format/segment_header.rs` is **6**, written into the header record of every
 segment. `FORMAT_VERSION` in `index/persisted.rs` is **2**, written into the
-index checkpoint file. A segment whose header names another version is
-quarantined whole rather than read, and an index checkpoint whose version does
+index checkpoint file. A segment whose header holds another version is
+quarantined whole and never read, and an index checkpoint whose version does
 not match is discarded and rebuilt from the segments.
 
 **Before 1.0 no cross-version promise is made.** Either number may move without
@@ -143,7 +143,7 @@ nobody made about the middle of a batch. Moving the index first would make a key
 readable on the strength of a write the caller is about to be told failed, so a
 batch that fails anywhere leaves nothing of itself visible.
 
-Across a crash the journal is what carries it. The records of a batch take one
+Across a crash the journal keeps it. The records of a batch take one
 reservation and one write, and their rows go into the segment's journal as one group
 under one checksum. A rebuild keeps the group only when every record it lists sits
 where its row says and checks out, and drops it whole otherwise.
@@ -185,7 +185,7 @@ footers afterwards rather than installed.
 **The active tail is read through its journal.** The journal's whole groups are
 read in order, and a group is kept only when every record it lists sits at its
 row's offset and checks out: a keyless record by its keyed check, a larger one by
-its header and checksum. A torn group ends the journal, a group naming a record that
+its header and checksum. A torn group ends the journal, a group listing a record that
 did not land is dropped whole, and the tail resumes past the last record kept, its
 accepted rows written again as a fresh journal. A segment with no footer and no
 journal is one whose footer went bad after its seal, and no tail resumes into it.
@@ -206,7 +206,7 @@ The rebuild hands back the live entries per column, the sealed key spans where
 the volume pages, per-segment byte counts, live and dead and the tombstone
 footprint held with its newest mark, the oldest data record each segment can
 still surface, the highest sequence number seen, the highest segment number
-present, how far it read each tail's journal so a follower can carry on from there,
+present, how far it read each tail's journal so a follower can resume from there,
 and the paths it quarantined. The sequence counter and the segment
 numbering are both raised above what was found, so lost unsynced numbers are
 harmlessly reissued.

@@ -1683,7 +1683,7 @@ impl Appender {
 
     /// A fresh tail's writable mapping, its file sized to the whole segment, where the volume takes one
     ///
-    /// Linux alone, whose data sync is known to carry pages written through a mapping,
+    /// Linux alone, whose data sync is known to flush pages written through a mapping,
     /// and a buffered volume alone, since a direct one bypasses the page cache the copies
     /// land in. A simulated volume has no file to map.
     fn write_mapping(&self, path: &std::path::Path, file: FileId) -> Result<Option<WriteMapping>> {

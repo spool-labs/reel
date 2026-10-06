@@ -328,7 +328,7 @@ fn a_delete_stands_while_a_run_still_holds_its_key() {
         model.insert(filler(n), value_of(n, 2));
     }
     compact_all(&store);
-    // A pass that copies nothing live counts as an unlink whether or not it carried deletes.
+    // A pass that copies nothing live counts as an unlink whether or not it copied deletes.
     assert!(store.compaction_counters().segments_unlinked_whole > 0, "no old segment retired");
     check(&store, &model, "after the rewrite");
 

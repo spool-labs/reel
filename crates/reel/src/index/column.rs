@@ -204,7 +204,7 @@ impl ColumnIndex {
         on_index!(self, index => index.remove(key, lsn, tombstone, segments))
     }
 
-    /// Stand a grave for a tombstone compaction carried into a segment, unless a newer version stands
+    /// Stand a grave for a tombstone compaction copied into a segment, unless a newer version stands
     pub fn hold_grave(&self, key: &[u8], lsn: Lsn, segment: SegmentId, is_shadowed: impl FnOnce() -> bool) {
         on_index!(self, index => index.hold_grave(key, lsn, segment, is_shadowed))
     }
@@ -986,7 +986,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         self.remove_held(&mut state, at, key, lsn, tombstone, segments)
     }
 
-    /// Stand a grave for a tombstone compaction carried into a segment, unless a newer version stands
+    /// Stand a grave for a tombstone compaction copied into a segment, unless a newer version stands
     ///
     /// The map's own entry is checked first, then `is_shadowed` with the shard still
     /// held, for a newer version the map cannot see. The tombstone's span is already
@@ -1821,7 +1821,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
 
     /// Raise one cover, the shape a range delete and a rebuild share
     ///
-    /// A carried range delete stands in two segments until its source retires, and a
+    /// A copied range delete stands in two segments until its source retires, and a
     /// rebuild or a follower meets it in both. The sweep finds a cover by its sequence
     /// number, so one already standing at this number is this cover.
     fn push_cover(&self, start: &[u8], high: Option<K>, lsn: Lsn) {
@@ -2032,7 +2032,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             // for as long as the walk it opens.
             let low = borrowed(&bound);
             let state = read(&self.shards[at]);
-            // A merge judges graves and covers itself, so its page takes every entry.
+            // A merge checks graves and covers itself, so its page takes every entry.
             let judged = out.keeps_graves();
             let covers = self.has_covers.load(Ordering::Relaxed);
             for (keys, entries) in state.map.span_runs(low) {

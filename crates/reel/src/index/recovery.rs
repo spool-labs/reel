@@ -4,9 +4,9 @@
 //! back from disk. A sealed segment is read from the packed sorted footer at its end.
 //! An unsealed tail is read through the journal beside it, a group of rows a write:
 //! a group is kept only when every record it lists sits where its row says and checks
-//! out, so a batch comes back whole or not at all. A file whose segment header carries
+//! out, so a batch comes back whole or not at all. A file whose segment header holds
 //! an unknown format or another segment number is quarantined. Each key resolves to its
-//! highest sequence number, whichever segment carried it.
+//! highest sequence number, whichever segment holds it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1222,7 +1222,7 @@ fn read_range_end(
     Ok(KeyBytes::new(&bytes).ok())
 }
 
-/// One record a follower applies, carrying everything applying it needs
+/// One record a follower applies, with everything applying it needs
 pub struct WalkedRecord {
     /// Column and key the record is addressed by
     pub key: RecordKey,

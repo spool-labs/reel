@@ -65,7 +65,7 @@ fn key_bytes(key: u64) -> [u8; 8] {
     (mixed ^ (mixed >> 31)).to_be_bytes()
 }
 
-/// A value that carries its key and op and fills the rest from both, so a torn or misplaced read cannot pass
+/// A value that holds its key and op and fills the rest from both, so a torn or misplaced read cannot pass
 fn value_of(key: u64, op: u64, len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + len);
     out.extend_from_slice(&key.to_be_bytes());
@@ -83,9 +83,9 @@ fn value_of(key: u64, op: u64, len: usize) -> Vec<u8> {
 /// The op a value claims, once its key and filler check out
 fn op_of(seed: u64, key: u64, value: &[u8]) -> u64 {
     assert!(value.len() >= 16, "seed {seed}: key {key} value of {} bytes", value.len());
-    let named = u64::from_be_bytes(value[..8].try_into().expect("key bytes"));
+    let stored = u64::from_be_bytes(value[..8].try_into().expect("key bytes"));
     let op = u64::from_be_bytes(value[8..16].try_into().expect("op bytes"));
-    assert_eq!(named, key, "seed {seed}: key {key} served the value of key {named}");
+    assert_eq!(stored, key, "seed {seed}: key {key} served the value of key {stored}");
     assert_eq!(
         value,
         value_of(key, op, value.len() - 16).as_slice(),

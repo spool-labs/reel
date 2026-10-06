@@ -33,7 +33,7 @@ pub struct KeyPage {
     /// Whether the caller reads every payload, so a walk that met them may hand them over
     reads_payloads: bool,
 
-    /// Whether graves and covered entries come out too, for a merge that judges them itself
+    /// Whether graves and covered entries come out too, for a merge that checks them itself
     keeps_graves: bool,
 
     /// Payloads a walk read with their keys, one place a key once the first arrives
@@ -79,7 +79,7 @@ impl KeyPage {
         }
     }
 
-    /// Whether the page carries graves and covered entries for its reader to judge
+    /// Whether the page holds graves and covered entries for its reader to check
     pub fn keeps_graves(&self) -> bool {
         self.keeps_graves
     }

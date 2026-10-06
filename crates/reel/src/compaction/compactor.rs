@@ -1509,7 +1509,7 @@ struct KeylessScrub<'a> {
     index: &'a ReelIndex,
     segment: SegmentId,
 
-    /// The segment's layout, which carries the key its records are checked under
+    /// The segment's layout, which holds the key its records are checked under
     layout: RecordLayout,
     region_end: u64,
     deadline: Instant,
@@ -1674,7 +1674,7 @@ fn should_carry(index: &ReelIndex, tombstone: &RecordHeader, drop_floor: Lsn) ->
     }
     // A key run keeps the rows of segments a rewrite retired, and the floor knows nothing
     // of those, so a delete stands while a run still holds what it deleted. A range is
-    // carried whole while any run stands, since no one row says what it reaches.
+    // kept whole while any run stands, since no one row says what it reaches.
     let key_runs = index.key_runs();
     let is_held_below = match tombstone.flags.is_range_tombstone() {
         true => !key_runs.runs().is_empty(),

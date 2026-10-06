@@ -79,7 +79,7 @@ const DIRECT_DEPTH_FLOOR: u64 = 2;
 
 /// Where the spot index reads the records its entries point at
 ///
-/// A keyless segment's records carry no key. A key's lone candidate confirms itself
+/// A keyless segment's records hold no key. A key's lone candidate confirms itself
 /// by its record's keyed check, in one read. Every other one is confirmed by its footer
 /// row, which has to be filed under the key at the candidate's offset, and the row
 /// gives the version a lookup orders candidates by.

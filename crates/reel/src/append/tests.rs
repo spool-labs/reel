@@ -102,7 +102,7 @@ fn journaled(shared: &ReelShared, appender: &Appender, segment: SegmentId) -> Ve
 
 /// Whether the record at a place checks out as the key its payload's byte gives
 ///
-/// Every record these cells write carries `key(byte)` with a payload of that byte.
+/// Every record these cells write holds `key(byte)` with a payload of that byte.
 fn lands_intact(shared: &ReelShared, loc: Loc) -> bool {
     let bytes = read_segment(shared, &shared.segment_path(loc.segment));
     let header = RecordHeader::unpack(&bytes).expect("segment header");

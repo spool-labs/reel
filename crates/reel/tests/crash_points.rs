@@ -993,7 +993,7 @@ fn key_merge_config() -> ReelConfig {
     }
 }
 
-/// The fill a key carries in one round of the merge stream
+/// The fill a key holds in one round of the merge stream
 fn merge_fill(round: u8, address: u8) -> u8 {
     round * 16 + address
 }

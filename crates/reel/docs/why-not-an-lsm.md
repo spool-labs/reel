@@ -26,7 +26,7 @@ between the log and the store that does not exist.
 
 The one thing a write-ahead log adds that is genuinely needed is a commit marker
 making a multi-record batch atomic across a crash. Here an open segment's journal
-carries it: a batch's rows go in as one checksummed group. The journal holds rows,
+keeps it: a batch's rows go in as one checksummed group. The journal holds rows,
 never values, so a value is still written once, and it goes away at the seal.
 
 Three consequences follow from that absence, and they are larger than the saved

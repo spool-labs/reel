@@ -325,7 +325,7 @@ record played back and only the first two are the map's.
 
 A maintenance pass wants complete, resumable coverage of a column. `ShardMap::sweep` walks a
 shard in key order and marks with the last key it handed out. A mark is opaque, and
-`ColumnMark` carries the opening that minted it, since a mark outlives its process through a
+`ColumnMark` holds the opening that minted it, since a mark outlives its process through a
 persisted cursor or a peer's request. A mark from another opening starts the sweep over, so
 the promise is at-least-once, which is what the callers need.
 

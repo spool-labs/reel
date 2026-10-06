@@ -1,6 +1,6 @@
 //! The rows an open segment journals beside itself, so a reopen finds the records no footer lists yet
 //!
-//! A keyless record carries no key, so until its segment's footer is down this file is
+//! A keyless record holds no key, so until its segment's footer is down this file is
 //! the only place that says which key each record holds. Every write a tail makes adds
 //! one group: the rows of the records that write put down, a batch's rows together. A
 //! group is its row count, the byte length of its rows, the rows, then a crc32c over all

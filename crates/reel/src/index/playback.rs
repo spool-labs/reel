@@ -1049,6 +1049,7 @@ mod tests {
         sealed: SealedRanges,
         footers: CountingFooters,
         runs: WalkRuns,
+        key_runs: KeyRunSet,
     }
 
     impl Fixture {
@@ -1064,6 +1065,7 @@ mod tests {
                     opened: AtomicUsize::new(0),
                 },
                 runs: WalkRuns::default(),
+                key_runs: KeyRunSet::default(),
             }
         }
 
@@ -1074,6 +1076,7 @@ mod tests {
                 sealed: &self.sealed,
                 footers: &self.footers,
                 runs: &self.runs,
+                key_runs: &self.key_runs,
             }
         }
 

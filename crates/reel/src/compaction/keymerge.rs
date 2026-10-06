@@ -251,29 +251,67 @@ fn merge_column(
             }
         }
     }
+    // A heap of the cursors still standing on rows, least key on top, so a row costs a
+    // few comparisons however many runs the merge reads.
+    let mut heap: Vec<usize> = (0..cursors.len()).filter(|at| cursors[*at].key().is_some()).collect();
+    for at in (0..heap.len() / 2).rev() {
+        sift_down(&mut heap, &cursors, at);
+    }
     let mut key = Vec::new();
-    loop {
-        let Some(least) = cursors.iter().filter_map(Cursor::key).min() else {
-            return Ok(());
-        };
+    while let Some(&top) = heap.first() {
         key.clear();
-        key.extend_from_slice(least);
+        key.extend_from_slice(cursors[top].key().unwrap_or_default());
         // Every row of the key goes, and the one with the highest sequence number stays.
         let mut newest: Option<RunRow> = None;
         let mut seen = 0u64;
-        for cursor in &mut cursors {
-            while cursor.key() == Some(key.as_slice()) {
-                let row = cursor.row()?;
-                seen += 1;
-                if newest.is_none_or(|held| held.lsn < row.lsn) {
-                    newest = Some(row);
-                }
-                cursor.advance()?;
+        while let Some(&top) = heap.first() {
+            if cursors[top].key() != Some(key.as_slice()) {
+                break;
             }
+            let row = cursors[top].row()?;
+            seen += 1;
+            if newest.is_none_or(|held| held.lsn < row.lsn) {
+                newest = Some(row);
+            }
+            cursors[top].advance()?;
+            if cursors[top].key().is_none() {
+                heap.swap_remove(0);
+            }
+            sift_down(&mut heap, &cursors, 0);
         }
         report.rows_shadowed += seen.saturating_sub(1);
         if let Some(row) = newest {
             writer.push(&key, row)?;
         }
+    }
+    Ok(())
+}
+
+/// Whether cursor `a` stands on a lesser key than cursor `b`, ties to the earlier cursor
+fn is_before(cursors: &[Cursor<'_>], a: usize, b: usize) -> bool {
+    match (cursors[a].key(), cursors[b].key()) {
+        (Some(left), Some(right)) => (left, a) < (right, b),
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// Sink the cursor at `at` until both below it stand on greater keys
+fn sift_down(heap: &mut [usize], cursors: &[Cursor<'_>], mut at: usize) {
+    loop {
+        let left = 2 * at + 1;
+        if left >= heap.len() {
+            return;
+        }
+        let right = left + 1;
+        let child = match right < heap.len() && is_before(cursors, heap[right], heap[left]) {
+            true => right,
+            false => left,
+        };
+        if !is_before(cursors, heap[child], heap[at]) {
+            return;
+        }
+        heap.swap(at, child);
+        at = child;
     }
 }

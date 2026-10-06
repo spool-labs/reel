@@ -487,10 +487,12 @@ impl ReelStore {
             let workers: Vec<_> = (1..passes)
                 .map(|_| {
                     scope.spawn(|| -> Result<()> {
-                        while self.compact_once()? == CompactPass::Copied
-                            && merging.load(Ordering::Acquire)
-                        {}
-                        Ok(())
+                        loop {
+                            let copied = self.compact_once()? == CompactPass::Copied;
+                            if !copied || !merging.load(Ordering::Acquire) {
+                                return Ok(());
+                            }
+                        }
                     })
                 })
                 .collect();

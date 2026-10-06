@@ -586,8 +586,7 @@ fn count(c: &mut Criterion) {
 
 /// The checksum primitives every appended record pays for
 ///
-/// A put checksums its header and payload as one record and builds one pad header per
-/// drain, which are separate entry points and do not cost the same.
+/// A put past the keyless ceiling checksums its header and payload as one record.
 fn checksum_primitives(c: &mut Criterion) {
     let mut group = c.benchmark_group("checksum");
     let header = [0x5au8; 24];
@@ -611,9 +610,6 @@ fn checksum_primitives(c: &mut Criterion) {
                 black_box(&payload),
             ))
         })
-    });
-    group.bench_function("pad_header", |b| {
-        b.iter(|| black_box(RecordHeader::pad(black_box(4152))))
     });
     group.finish();
 }

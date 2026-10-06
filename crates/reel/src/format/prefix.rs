@@ -43,7 +43,7 @@ pub enum Tail {
 
 impl Tail {
     /// Bytes a tail takes once read back
-    pub fn len(self) -> usize {
+    pub(crate) fn len(self) -> usize {
         match self {
             Tail::Entry => ENTRY_TAIL_LEN,
             Tail::Raw(len) => len,

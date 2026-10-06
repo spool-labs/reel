@@ -69,6 +69,18 @@ fn bytes_in(root: &Path) -> u64 {
         .sum()
 }
 
+/// Where the bytes written to a file end: its first hole, or its length when it has none
+///
+/// A mapped tail stands at the whole segment while it is open, and the blocks past
+/// what it wrote are reserved and unwritten, which a seek for a hole finds.
+fn written_end(path: &Path) -> u64 {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::File::open(path).expect("open segment");
+    let end = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_HOLE) };
+    assert!(end >= 0, "a seek for the first hole failed");
+    end as u64
+}
+
 /// Copy every file in a root, the image a process that died would leave behind
 fn copy_root(from: &Path, to: &Path) {
     for entry in std::fs::read_dir(from).expect("read root") {
@@ -92,7 +104,7 @@ fn a_new_segment_is_written_through() {
     assert_eq!(segments.len(), 1, "the tail drew more than one segment");
     let bytes = std::fs::read(&segments[0]).expect("read segment");
     assert_eq!(
-        bytes.len() as u64,
+        written_end(&segments[0]),
         WINDOW,
         "the window was not written through at creation"
     );
@@ -141,7 +153,7 @@ fn only_a_tail_that_syncs_often_fills_its_next_window() {
         }
         let segments = segments_in(home.path());
         assert_eq!(segments.len(), 1, "the tail drew more than one segment");
-        std::fs::metadata(&segments[0]).expect("metadata").len()
+        written_end(&segments[0])
     };
 
     for sync in [SyncPolicy::Never, SyncPolicy::Bytes(ByteCount::mb(1))] {

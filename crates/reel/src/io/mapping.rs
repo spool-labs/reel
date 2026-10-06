@@ -1,4 +1,4 @@
-//! A read-only shared mapping of one segment file
+//! Shared mappings of one segment file, read-only for readers and writable for a tail
 //!
 //! Taken once per segment on the first mapped read and unmapped when the last
 //! handle drops, copying page-cache-warm bytes straight into the same pooled
@@ -9,7 +9,7 @@
 //! growing after its first read stays mapped. Reads stop at the length the file was
 //! last seen at, and a read past it looks at the file again before it gives up.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -107,6 +107,67 @@ impl Drop for Mapping {
     }
 }
 
+/// A writable shared mapping over a tail segment, which writers copy their records into
+///
+/// The file's length already covers the span, so every copy lands on bytes the file
+/// holds, and the claim window has reserved the blocks under them, so a write fault
+/// never has to allocate. A record copied in is in the page cache at once, where a
+/// pread and a read mapping both find it.
+pub struct WriteMapping {
+    base: *mut u8,
+    span: usize,
+}
+
+// Writers copy into ranges their claims keep apart, and nothing borrows the memory.
+unsafe impl Send for WriteMapping {}
+unsafe impl Sync for WriteMapping {}
+
+impl WriteMapping {
+    /// Map a file read-write over its first `span` bytes, or nothing when it cannot be
+    pub fn open(path: &Path, span: u64) -> Option<WriteMapping> {
+        let file = OpenOptions::new().read(true).write(true).open(path).ok()?;
+        if span == 0 || span > usize::MAX as u64 || file.metadata().ok()?.len() < span {
+            return None;
+        }
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                span as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return None;
+        }
+        Some(WriteMapping {
+            base: base as *mut u8,
+            span: span as usize,
+        })
+    }
+
+    /// Copy bytes in at an offset, refusing a span past the mapping
+    pub fn write(&self, offset: u64, bytes: &[u8]) -> bool {
+        let Some(end) = offset.checked_add(bytes.len() as u64) else {
+            return false;
+        };
+        if end > self.span as u64 {
+            return false;
+        }
+        // In bounds of a live mapping, over a range only this writer's claim covers.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(offset as usize), bytes.len()) };
+        true
+    }
+}
+
+impl Drop for WriteMapping {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.base as *mut libc::c_void, self.span) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -133,6 +194,22 @@ mod tests {
             "a span past the end is the driver's"
         );
         assert!(map.slice(u64::MAX, 1).is_none());
+    }
+
+    // bytes copied into a write mapping read back through the file at once
+    #[test]
+    fn a_write_mapping_lands_in_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tail");
+        File::create(&path).expect("create").set_len(8192).expect("size");
+
+        let map = WriteMapping::open(&path, 8192).expect("map");
+        assert!(map.write(4090, &[5u8; 12]), "a copy across a page edge");
+        assert!(!map.write(8190, &[5u8; 4]), "a copy past the span is refused");
+        let bytes = std::fs::read(&path).expect("read");
+        assert_eq!(&bytes[4090..4102], &[5u8; 12]);
+        assert!(bytes[..4090].iter().all(|byte| *byte == 0));
+        assert!(WriteMapping::open(&path, 16384).is_none(), "a span past the file is refused");
     }
 
     // a path that does not open maps as nothing rather than an error

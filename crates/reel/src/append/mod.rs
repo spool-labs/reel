@@ -27,7 +27,8 @@ use crate::format::lsn::{Lsn, LsnCounter};
 use crate::format::record::{align_up, BatchFrame, Flags, RecordHeader, BLOCK, HEADER_LEN};
 use crate::format::segment_header::SegmentHeader;
 use crate::index::recovery::ResumableTail;
-use crate::io::op::{Op, OwnedBuf, Part, SyncRangeMode, WriteBuf};
+use crate::io::mapping::WriteMapping;
+use crate::io::op::{FileId, Op, OwnedBuf, Part, SyncRangeMode, WriteBuf};
 use crate::io::ServingBackend;
 use crate::reel::segment::{IoDriver, SegmentHandle};
 use crate::reel::tail::Tail;
@@ -249,9 +250,20 @@ struct Active {
 
     /// What stands between this segment and its retirement, drawn with its number
     holds: Arc<SegmentHolds>,
+
+    /// The tail's writable mapping, which records are copied into in place of a write
+    map: Option<WriteMapping>,
+
+    /// Whether writes still go through the mapping, cleared once a window went unreserved
+    is_mapped: AtomicBool,
 }
 
 impl Active {
+    /// The mapping a write copies into, while every claim lands on reserved blocks
+    fn mapping(&self) -> Option<&WriteMapping> {
+        self.map.as_ref().filter(|_| self.is_mapped.load(Ordering::Acquire))
+    }
+
     /// The offset a seal cuts this segment at
     fn end(&self) -> u64 {
         self.cut_at
@@ -1162,11 +1174,7 @@ impl Appender {
         }
 
         self.depth.observe(self.inflight.load(Ordering::Relaxed));
-        let (wrote, bufs) = self
-            .shared
-            .driver
-            .writev_reusing(active.handle.file(), base, bufs)?;
-        recycle_bufs(bufs);
+        let wrote = self.write_framed(active, base, bufs)?;
         if wrote != written {
             return Err(ReelError::Io(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
@@ -1178,6 +1186,32 @@ impl Appender {
             pending.push(entry);
         }
         Ok(locs)
+    }
+
+    /// Put framed buffers down at their reservation, copied through the tail's mapping where it has one
+    ///
+    /// A copy makes no system call, which a write per record would. One the mapping
+    /// refuses goes through the driver whole, landing the same bytes over the same range.
+    fn write_framed(&self, active: &Active, base: u64, bufs: Vec<WriteBuf>) -> Result<u64> {
+        if let Some(map) = active.mapping() {
+            let mut at = base;
+            let is_copied = bufs.iter().all(|buf| {
+                let bytes = buf.as_slice();
+                let is_in = map.write(at, bytes);
+                at += bytes.len() as u64;
+                is_in
+            });
+            if is_copied {
+                recycle_bufs(bufs);
+                return Ok(at - base);
+            }
+        }
+        let (wrote, bufs) = self
+            .shared
+            .driver
+            .writev_reusing(active.handle.file(), base, bufs)?;
+        recycle_bufs(bufs);
+        Ok(wrote)
     }
 
     /// Bytes a whole batch holds, including the pad a whole-block volume adds
@@ -1232,11 +1266,7 @@ impl Appender {
         }
 
         self.depth.observe(self.inflight.load(Ordering::Relaxed));
-        let (wrote, bufs) = self
-            .shared
-            .driver
-            .writev_reusing(active.handle.file(), base, bufs)?;
-        recycle_bufs(bufs);
+        let wrote = self.write_framed(active, base, bufs)?;
         if wrote != framed {
             return Err(ReelError::Io(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
@@ -1482,6 +1512,10 @@ impl Appender {
                             tracing::warn!(
                                 "failed to zero the window ahead of a reel segment: {error}"
                             );
+                            // A write fault on a block nobody reserved can find the volume
+                            // full and has no way to say so, so the writes go through the
+                            // driver from here, cleared before the edge lets a claim past.
+                            active.is_mapped.store(false, Ordering::Release);
                             active
                                 .alloc_high
                                 .fetch_max(reserved + span, Ordering::AcqRel)
@@ -1557,10 +1591,18 @@ impl Appender {
             sync: Arc::new(SyncState::new()),
             terminal: AtomicBool::new(false),
             holds,
+            map: None,
+            is_mapped: AtomicBool::new(false),
         };
         // What the file already holds is already zeroed behind and ahead of the walked
-        // end, so the window is where it ends and the next write extends it.
-        let filled = self.shared.driver.length(active.handle.file())?;
+        // end, so the window is where it ends and the next write extends it. A tail that
+        // was mapped stands at the whole segment with nothing reserved past its last
+        // window, so its window starts again at the walked end.
+        let target = self.shared.config.segment_bytes.to_bytes();
+        let filled = match self.shared.driver.length(active.handle.file())? {
+            length if length >= target => resumed.end,
+            length => length,
+        };
         active
             .alloc_high
             .store(filled.max(resumed.end), Ordering::Release);
@@ -1671,6 +1713,7 @@ impl Appender {
         // A file's own sync says nothing about the directory entry naming it, so one
         // directory sync per segment closes that.
         self.shared.driver.sync_dir(self.shared.segment_dir(id))?;
+        let map = self.write_mapping(&path, file)?;
         let handle = SegmentHandle::new(id, path, file, Arc::clone(&self.shared.driver));
 
         let active = Active {
@@ -1684,6 +1727,8 @@ impl Appender {
             sync: Arc::new(SyncState::new()),
             terminal: AtomicBool::new(false),
             holds,
+            is_mapped: AtomicBool::new(map.is_some()),
+            map,
         };
         active
             .alloc_high
@@ -1699,6 +1744,23 @@ impl Appender {
         active.settled.store(span, Ordering::Release);
         written?;
         Ok(active)
+    }
+
+    /// A fresh tail's writable mapping, its file sized to the whole segment, where the volume takes one
+    ///
+    /// Linux alone, whose data sync is known to carry pages written through a mapping,
+    /// and a buffered volume alone, since a direct one bypasses the page cache the copies
+    /// land in. A simulated volume has no file to map.
+    fn write_mapping(&self, path: &std::path::Path, file: FileId) -> Result<Option<WriteMapping>> {
+        let is_eligible = cfg!(target_os = "linux")
+            && !self.shared.writes_whole_blocks()
+            && !matches!(self.shared.driver.serving(), ServingBackend::Sim);
+        if !is_eligible {
+            return Ok(None);
+        }
+        let target = self.shared.config.segment_bytes.to_bytes();
+        self.shared.driver.truncate(file, target)?;
+        Ok(WriteMapping::open(path, target))
     }
 
     /// Zero the next window only when syncs land close enough together to pay for it
@@ -1879,5 +1941,7 @@ fn placeholder_active(driver: Arc<IoDriver>) -> Active {
         sync: Arc::new(SyncState::new()),
         terminal: AtomicBool::new(false),
         holds: Arc::default(),
+        map: None,
+        is_mapped: AtomicBool::new(false),
     }
 }

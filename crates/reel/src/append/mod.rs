@@ -913,8 +913,7 @@ impl Appender {
                 let outcome =
                     self.write_record(&active, base, &header, std::mem::take(&mut payload));
                 active.settle(span);
-                // A write that failed lists no row, so its range is garbage nothing
-                // points into and the records above it stand.
+                // A failed write lists no row, so nothing points into its range
                 if outcome.is_err() {
                     self.tail.publish_committed(base + span);
                 }
@@ -985,9 +984,6 @@ impl Appender {
     }
 
     /// Reserve one range for a run of built records, write it, and say where each landed
-    ///
-    /// The run's rows journal as one group, which is what makes a batch come back from
-    /// a crash whole or not at all.
     fn place_run<Payload: Into<WriteBuf>>(
         &self,
         headers: Vec<RecordHeader>,
@@ -1079,8 +1075,7 @@ impl Appender {
         payloads: Vec<Payload>,
         framed: u64,
     ) -> Result<Vec<Loc>> {
-        // Three buffers a record rather than two, since a spilled key rides in one of its
-        // own between the header and the payload, and one more for the block's zeros.
+        // Up to three buffers a record (header, spilled key, payload) and one for the block's zeros
         let mut bufs = take_bufs(headers.len() * 3 + 1);
         let mut locs = Vec::with_capacity(headers.len());
         let mut entries = Vec::with_capacity(headers.len());
@@ -1119,14 +1114,12 @@ impl Appender {
             pending.push(entry);
         }
         drop(pending);
+        // One group for the whole run, so a batch comes back from a crash whole or not at all
         active.journal.push(&rows);
         Ok(locs)
     }
 
     /// Put framed buffers down at their reservation, copied through the tail's mapping where it has one
-    ///
-    /// A copy makes no system call, which a write per record would. One the mapping
-    /// refuses goes through the driver whole, landing the same bytes over the same range.
     fn write_framed(&self, active: &Active, base: u64, bufs: Vec<WriteBuf>) -> Result<u64> {
         if let Some(map) = active.mapping() {
             let mut at = base;
@@ -1308,8 +1301,7 @@ impl Appender {
         }];
         pacing.started_to = settled;
         drop(pacing);
-        // The rows go with the records, so a volume that never syncs loses no more to a
-        // crash than the stretch since this pace.
+        // Rows go down with the records, so a crash loses no more than the stretch since this pace
         active.journal.try_write_pending();
         let _ = self.shared.driver.run(ops);
     }
@@ -1441,9 +1433,7 @@ impl Appender {
                             tracing::warn!(
                                 "failed to zero the window ahead of a reel segment: {error}"
                             );
-                            // A write fault on a block nobody reserved can find the volume
-                            // full and has no way to say so, so the writes go through the
-                            // driver from here, cleared before the edge lets a claim past.
+                            // A fault on an unreserved block can't report a full volume, so writes take the driver
                             active.is_mapped.store(false, Ordering::Release);
                             active
                                 .alloc_high
@@ -1504,8 +1494,7 @@ impl Appender {
         let holds = self.shared.adopt_segment(resumed.segment);
         let file = self.shared.driver.open(&resumed.path, false)?;
         let journal = Journal::resume(&self.shared.driver, &resumed.path, &resumed.rows)?;
-        // A whole-block volume pads every record out to a block, and the journal lists
-        // the records alone, so the tail picks up at the block after the last one.
+        // A whole-block volume pads each record to a block, so the tail resumes at the next block
         let end = match self.shared.writes_whole_blocks() {
             true => align_up(resumed.end + HEADER_LEN as u64, ALIGN),
             false => resumed.end,
@@ -1531,10 +1520,7 @@ impl Appender {
             map: None,
             is_mapped: AtomicBool::new(false),
         };
-        // What the file already holds is already zeroed behind and ahead of the walked
-        // end, so the window is where it ends and the next write extends it. A tail that
-        // was mapped stands at the whole segment with nothing reserved past its last
-        // window, so its window starts again at the walked end.
+        // The window starts again at the walked end, where the next write extends it
         let target = self.shared.config.segment_bytes.to_bytes();
         let filled = match self.shared.driver.length(active.handle.file())? {
             length if length >= target => end,
@@ -1646,12 +1632,10 @@ impl Appender {
         let path = self.shared.segment_path(id);
         let file = self.shared.driver.open(&path, true)?;
         let journal = Journal::create(&self.shared.driver, &path)?;
-        // A file's own sync says nothing about the directory entry naming it, so one
-        // directory sync per segment closes that, for the segment and its journal.
+        // One directory sync makes both new entries durable, the segment's and its journal's
         self.shared.driver.sync_dir(self.shared.segment_dir(id))?;
         let map = self.write_mapping(&path, file)?;
-        // Every segment drops the key and header of its small records, each checked under
-        // a key of the segment's own.
+        // Small records go down keyless, checked under a key of the segment's own
         let layout = RecordLayout::Keyless(CheckKey::random()?);
         let handle = SegmentHandle::new(id, path, file, Arc::clone(&self.shared.driver), layout);
 
@@ -1689,11 +1673,7 @@ impl Appender {
         Ok(active)
     }
 
-    /// A fresh tail's writable mapping, its file sized to the whole segment, where the volume takes one
-    ///
-    /// Linux alone, whose data sync is known to flush pages written through a mapping,
-    /// and a buffered volume alone, since a direct one bypasses the page cache the copies
-    /// land in. A simulated volume has no file to map.
+    /// A fresh tail's writable mapping, on Linux buffered volumes, whose data sync flushes mapped writes
     fn write_mapping(&self, path: &std::path::Path, file: FileId) -> Result<Option<WriteMapping>> {
         let is_eligible = cfg!(target_os = "linux")
             && !self.shared.writes_whole_blocks()
@@ -1798,8 +1778,7 @@ fn recycle_bufs(mut bufs: Vec<WriteBuf>) {
     bufs.clear();
     BUFS_SPARE.with(|held| {
         let spare = held.take();
-        // The roomier of the two is kept, since a batch takes far more buffers than a
-        // single record and a thread that batches once will batch again.
+        // Keep the roomier one, since a thread that batches once will batch again
         held.set(match spare.capacity() > bufs.capacity() {
             true => spare,
             false => bufs,

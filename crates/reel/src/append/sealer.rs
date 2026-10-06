@@ -25,10 +25,7 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
     if active.terminal.load(Ordering::Acquire) {
         return Ok(());
     }
-    // The reservation's blocks past the last record go back to the filesystem.
-    // The length ends at the records, or at the whole segment for a mapped tail. The
-    // cut releases what the preallocation claimed beyond them, before the footer
-    // takes the end.
+    // Cut the file at the records, handing preallocated blocks back before the footer goes down
     if active.alloc_high.load(Ordering::Acquire) > end || active.map.is_some() {
         shared.driver.truncate(active.handle.file(), end)?;
     }
@@ -80,8 +77,7 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
         *lock(&active.entries) = footer;
         return Err(error);
     }
-    // Packing left the footer as a read of the file would parse it, so it rides the
-    // sealed queue to the index, which never reads it back.
+    // The packed footer goes to the index as is, so the index never reads it back
     let footer = Arc::new(footer);
     // The handle stops being a write head here and becomes the one readers find in the
     // cache, so it takes the hint a read-path open would have given it.
@@ -89,8 +85,7 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
         .driver
         .advise(active.handle.file(), 0, 0, Advice::Random);
     shared.fd_cache.insert(active.handle.clone());
-    // The footer is down, synced, and the file cut to it, so it lists every record the
-    // journal did, and a segment an earlier attempt marked unsealed is settled again.
+    // The synced footer lists every record the journal did, so the journal can go
     active.journal.remove();
     shared.forget_unsealed(active.handle.id());
     // The footer is on disk now, so a paged index can take this segment's keys over from
@@ -343,9 +338,7 @@ pub(super) fn flush_active(
         if active.handle.id() != segment || active.terminal.load(Ordering::Acquire) {
             return Ok(None);
         }
-        // Taking the segment exclusively is what makes the byte count mean something:
-        // every writer holds it shared across its whole reservation, so what has settled
-        // while it is held is what has landed, and has pushed its rows.
+        // Writers hold the segment shared, so under this hold everything settled has landed
         (
             active.handle.clone(),
             Arc::clone(&active.journal),
@@ -353,8 +346,7 @@ pub(super) fn flush_active(
         )
     };
 
-    // The rows go down with the records, so what this flush makes durable a reopen can
-    // find without the footer.
+    // Rows first, so whatever this flush makes durable a reopen finds without a footer
     journal.sync_pending()?;
     shared.driver.sync_data(handle.file())?;
     Ok(Some(covered))

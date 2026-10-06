@@ -101,8 +101,6 @@ fn journaled(shared: &ReelShared, appender: &Appender, segment: SegmentId) -> Ve
 }
 
 /// Whether the record at a place checks out as the key its payload's byte gives
-///
-/// Every record these cells write holds `key(byte)` with a payload of that byte.
 fn lands_intact(shared: &ReelShared, loc: Loc) -> bool {
     let bytes = read_segment(shared, &shared.segment_path(loc.segment));
     let header = RecordHeader::unpack(&bytes).expect("segment header");
@@ -975,8 +973,7 @@ fn spare_is_drawn_before_the_roll() {
 // a drain that never landed leaves no footer entry at the offset it framed
 #[test]
 fn failed_drain_leaves_no_footer_entry() {
-    // The segment's open, its journal's open, the directory sync, the space reservation
-    // and the header write come first, so the record's write is the sixth op.
+    // The record's write is the sixth op, after both opens, the directory sync, the reservation and the header
     let plan = FaultPlan::new(1).with_fault(5, FaultKind::EnospcAppend);
     let (shared, sim) = harness(config(SyncPolicy::Never, Preallocate::Chunk), plan);
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
@@ -1005,9 +1002,7 @@ fn failed_drain_leaves_no_footer_entry() {
 // a failed cadence sync gives up on the segment and rolls off it
 #[test]
 fn failed_sync_rolls_off_the_segment() {
-    // The segment's open, its journal's open, the directory sync, the space reservation,
-    // the header write, the record write and the journal's write all come first, so the
-    // tail's first sync is the eighth op.
+    // The tail's first sync is the eighth op, after both opens, the directory sync, the reservation and three writes
     let plan = FaultPlan::new(1).with_fault(7, FaultKind::SyncError);
     let (shared, _sim) = harness(config(SyncPolicy::EveryPut, Preallocate::Chunk), plan);
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");

@@ -1,9 +1,4 @@
-//! An open segment's journal file: the rows of what has landed, written at the tail's sync points
-//!
-//! A write adds its rows to the pending groups as it lands. A flush writes them to the
-//! file ahead of its syncs, so whatever a flush makes durable has its rows in the
-//! journal. Writeback pacing writes them too, which bounds what a volume that never
-//! syncs loses to the stretch since the last pace.
+//! An open segment's journal file, written at each flush and each writeback pace
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -16,7 +11,10 @@ use crate::sync::{lock, try_lock};
 
 /// One open segment's journal
 pub(super) struct Journal {
+    /// The driver the file is written through
     driver: Arc<IoDriver>,
+
+    /// Where the journal sits, beside its segment
     path: PathBuf,
 
     /// Groups for records that have landed and are not in the file yet
@@ -32,22 +30,15 @@ struct JournalFile {
 }
 
 impl Journal {
-    /// Create the journal of a segment being drawn
-    ///
-    /// Made beside the segment and before the directory sync the segment takes, so
-    /// that one sync covers both directory entries. A drawn number is new, and an open unlinks
-    /// every journal whose segment is gone, so the file starts empty.
+    /// Create the journal of a segment being drawn, before the directory sync that covers both
     pub(super) fn create(driver: &Arc<IoDriver>, segment_path: &Path) -> Result<Journal> {
         let path = journal_path(segment_path);
+        // A drawn number is new and an open unlinks stale journals, so the file starts empty
         let id = driver.open(&path, true)?;
         Ok(Journal::over(driver, path, Some(id), 0))
     }
 
     /// Take a journal up again with only the rows a reopen accepted
-    ///
-    /// The rows go down as one group in a fresh file renamed over the old one, so a
-    /// crash in between leaves one journal or the other and never a group that lists a
-    /// record the reopen dropped.
     pub(super) fn resume(
         driver: &Arc<IoDriver>,
         segment_path: &Path,
@@ -66,6 +57,7 @@ impl Journal {
             driver.writev_all(id, 0, vec![WriteBuf::owned(bytes)])?;
         }
         driver.sync_data(id)?;
+        // The rename swaps whole journals, so a crash leaves one or the other
         driver.rename(&fresh, &path)?;
         if let Some(dir) = path.parent() {
             driver.sync_dir(dir)?;
@@ -95,10 +87,7 @@ impl Journal {
         push_group(rows, &mut lock(&self.pending));
     }
 
-    /// Write every pending group to the file and sync it
-    ///
-    /// Both under the file's lock, so a seal that removes the journal waits for the sync
-    /// and never closes the file under it.
+    /// Write every pending group and sync, under the file's lock so a seal waits for it
     pub(super) fn sync_pending(&self) -> Result<()> {
         let mut file = lock(&self.file);
         self.write_locked(&mut file)?;

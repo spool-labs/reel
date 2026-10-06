@@ -17,11 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Ask the machine for a line without waiting on it
 #[inline(always)]
 pub(crate) fn prefetch(ptr: *const u8) {
-    // Inline asm because `core::arch::aarch64::_prefetch` is still unstable and
-    // this crate builds on stable. The x86 intrinsic below is stable.
+    // Inline asm, since the aarch64 prefetch intrinsic is unstable
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: a prefetch of any address is architecturally a hint and cannot
-    // fault, and the pointer comes from a live mapping or arena slot regardless.
+    // SAFETY: a prefetch is a hint and never faults
     unsafe {
         std::arch::asm!(
             "prfm pldl1keep, [{0}]",
@@ -132,17 +130,12 @@ impl Drop for Mapping {
 }
 
 /// A writable shared mapping over a tail segment, which writers copy their records into
-///
-/// The file's length already covers the span, so every copy lands on bytes the file
-/// holds, and the claim window has reserved the blocks under them, so a write fault
-/// never has to allocate. A record copied in is in the page cache at once, where a
-/// pread and a read mapping both find it.
 pub struct WriteMapping {
     base: *mut u8,
     span: usize,
 }
 
-// Writers copy into ranges their claims keep apart, and nothing borrows the memory.
+// Writers copy into ranges their claims keep apart, and nothing borrows the memory
 unsafe impl Send for WriteMapping {}
 unsafe impl Sync for WriteMapping {}
 
@@ -180,7 +173,7 @@ impl WriteMapping {
         if end > self.span as u64 {
             return false;
         }
-        // In bounds of a live mapping, over a range only this writer's claim covers.
+        // SAFETY: in bounds of a live mapping, over a range only this writer's claim covers
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),

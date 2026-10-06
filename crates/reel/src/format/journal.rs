@@ -1,11 +1,4 @@
-//! The rows an open segment journals beside itself, so a reopen finds the records no footer lists yet
-//!
-//! A keyless record holds no key, so until its segment's footer is down this file is
-//! the only place that says which key each record holds. Every write a tail makes adds
-//! one group: the rows of the records that write put down, a batch's rows together. A
-//! group is its row count, the byte length of its rows, the rows, then a crc32c over all
-//! of it, so a group a crash cut short fails its check and the journal ends there. The
-//! seal writes the footer and unlinks the journal.
+//! The journal format: one checksummed group of rows per write, read back until the first torn group
 
 use std::path::{Path, PathBuf};
 
@@ -21,13 +14,13 @@ pub fn journal_path(segment_path: &Path) -> PathBuf {
     segment_path.with_extension(&JOURNAL_SUFFIX[1..])
 }
 
-/// Bytes ahead of a group's rows: the row count and the rows' byte length
+/// A group opens with its row count and the byte length of its rows
 const GROUP_HEAD: usize = 4 + 4;
 
-/// Bytes behind a group's rows: the checksum over the head and the rows
+/// A group closes with a checksum over its head and rows
 const GROUP_TAIL: usize = 4;
 
-/// Bytes a row takes past its key: column, key length, sequence, offset, length and flags
+/// A row takes these bytes besides its key: column, key length, sequence, offset, length and flags
 const ROW_FIXED: usize = 1 + 2 + 8 + 4 + 4 + 1;
 
 /// The end length a range tombstone stores when its range runs to its column's end
@@ -41,8 +34,6 @@ pub struct JournalRow {
     pub offset: u32,
     pub len: u32,
     pub flags: Flags,
-
-    /// Exclusive end of a range tombstone's range, nothing where it runs to the column's end
     pub range_end: Option<KeyBytes>,
 }
 
@@ -83,12 +74,10 @@ fn push_row(row: &JournalRow, out: &mut Vec<u8>) {
 }
 
 /// Every whole group at the front of a journal, and the bytes they take
-///
-/// The read stops at the first group that is cut short or fails its check, since
-/// nothing past a torn group was written after it in one piece.
 pub fn read_groups(bytes: &[u8]) -> (Vec<Vec<JournalRow>>, usize) {
     let mut groups = Vec::new();
     let mut at = 0usize;
+    // Nothing past a torn group landed whole, so the read stops there
     while let Some((rows, next)) = read_group(bytes, at) {
         groups.push(rows);
         at = next;

@@ -86,6 +86,8 @@ fn sharded_key(shard: u8, at: u8) -> [u8; 8] {
 // a delete that lands while compaction stands between its copy and its repoint wins
 #[test]
 fn a_delete_in_the_repoint_window_wins() {
+    // The script's turn covers the setup too, so no other test holds a point its seals pass
+    let script = rendezvous::script();
     let store = open("/repoint-race", 41, IndexResidency::Resident);
     let payload = vec![0x2Du8; 4096];
     for at in 0..60u64 {
@@ -97,7 +99,6 @@ fn a_delete_in_the_repoint_window_wins() {
         Store::delete(&*store, "rows", &at.to_be_bytes()).expect("delete");
     }
 
-    let script = rendezvous::script();
     script.hold("compaction/repoint");
 
     let compactor = {

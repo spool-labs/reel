@@ -942,7 +942,7 @@ fn spare_is_drawn_before_the_roll() {
     let margin = (target / 16).min(WRITEBACK_CHUNK);
 
     let mut byte = 0u8;
-    while appender.tail().committed_len() + margin < target {
+    while appender.tail().committed_len() + margin < read(&appender.active).room(target) {
         byte = byte.wrapping_add(1);
         appender
             .append_data(key(byte), vec![byte; 500], 0, Commit::PerRecord)

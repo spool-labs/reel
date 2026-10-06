@@ -201,6 +201,8 @@ fn a_put_after_a_delete_survives_compacting_its_tombstone() {
     // The second version seals and is handed over, so only the spot index holds it
     Store::put(&store, "rows", &the_key(), b"second").expect("put again");
     fill(&store, 3);
+    // Both rounds around the tombstone go dead, so its segment is rewritten wherever it rolled
+    overwrite(&store, 1, 4);
     overwrite(&store, 2, 4);
     for _ in 0..8 {
         store.compact_once().expect("compact");

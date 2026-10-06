@@ -2244,7 +2244,7 @@ mod tests {
         );
     }
 
-    // a failed write lists no row, so records above it survive a reopen; the fault
+    // a failed write lists no row, so records above it survive a reopen. The fault
     // position is searched for since the op count moves with the write path
     #[test]
     fn a_failed_write_does_not_strand_later_records() {

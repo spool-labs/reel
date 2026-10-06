@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[inline(always)]
 pub(crate) fn prefetch(ptr: *const u8) {
     // Inline asm because `core::arch::aarch64::_prefetch` is still unstable and
-    // this crate builds on stable; the x86 intrinsic below is not.
+    // this crate builds on stable. The x86 intrinsic below is stable.
     #[cfg(target_arch = "aarch64")]
     // SAFETY: a prefetch of any address is architecturally a hint and cannot
     // fault, and the pointer comes from a live mapping or arena slot regardless.

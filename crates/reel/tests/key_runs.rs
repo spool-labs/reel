@@ -291,7 +291,7 @@ fn a_rewritten_record_answers_through_the_newer_run() {
     assert!(store.index().key_runs().runs().len() >= 2, "the copies never reached a run of their own");
     assert!(
         (1..900).step_by(2).any(|n| is_stale_under_fresh(&store, &key_of(n))),
-        "no key has a run naming its retired segment ahead of a run naming its copy"
+        "no key has a run pointing into its retired segment ahead of a run pointing at its copy"
     );
     check(&store, &model, "after the rewrite");
 

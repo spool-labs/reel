@@ -161,7 +161,7 @@ impl RunColumn {
 
     /// The block holding the first row at or past a key
     ///
-    /// The last block whose lead is at or below the key; a key below every lead lands
+    /// The last block whose lead is at or below the key. A key below every lead lands
     /// on the first block, and the row search inside it settles the rest.
     pub fn block_for(&self, key: &[u8]) -> u32 {
         let (mut low, mut high) = (0u32, self.blocks());

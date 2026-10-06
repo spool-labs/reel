@@ -364,7 +364,7 @@ fn a_second_writer_waits_on_the_first() {
     let Poll::Ready(Ok(Durability::Settled)) = poll_once(second.as_mut()) else {
         panic!("one flush answers for both writers");
     };
-    assert_eq!(sim.sync_count(), before + SYNCS_PER_FLUSH, "one flush, not two");
+    assert_eq!(sim.sync_count(), before + SYNCS_PER_FLUSH, "one flush's syncs");
 }
 
 // a turn nobody takes goes back, so the writer behind it is not left waiting
@@ -438,7 +438,7 @@ fn a_forwarded_flush_answers_both_writers() {
         Poll::Pending => block_on(first).expect("first writer"),
     }
 
-    assert_eq!(sim.sync_count(), before + SYNCS_PER_FLUSH, "one flush, not two");
+    assert_eq!(sim.sync_count(), before + SYNCS_PER_FLUSH, "one flush's syncs");
 }
 
 // a caller that walks away from a forwarded flush leaves the turn where it is

@@ -729,9 +729,9 @@ fn naming_a_seal_reads_no_footer() {
     sim.arm_next_ops(64, FaultKind::ReadError);
     let outcome = store.page_out_sealed();
     sim.disarm();
-    assert!(outcome.is_ok(), "naming the seals failed: {outcome:?}");
+    assert!(outcome.is_ok(), "noting the seals failed: {outcome:?}");
     let (fired, _) = sim.fault_reach();
-    assert_eq!(fired, 0, "naming the seals read the device");
+    assert_eq!(fired, 0, "noting the seals read the device");
 
     for (byte, segment) in [(0u8, first), (8u8, second)] {
         assert!(

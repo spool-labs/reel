@@ -26,9 +26,9 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
         return Ok(());
     }
     // The reservation's blocks past the last record go back to the filesystem.
-    // The length ends at the records, or at the whole segment for a mapped tail; the
-    // cut is what releases what the preallocation claimed beyond them, before the
-    // footer takes the end.
+    // The length ends at the records, or at the whole segment for a mapped tail. The
+    // cut releases what the preallocation claimed beyond them, before the footer
+    // takes the end.
     if active.alloc_high.load(Ordering::Acquire) > end || active.map.is_some() {
         shared.driver.truncate(active.handle.file(), end)?;
     }

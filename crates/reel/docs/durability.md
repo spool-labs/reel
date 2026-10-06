@@ -12,7 +12,7 @@ takes the process and leaves the page cache standing; a power cut takes both.
 
 | `sync` | a process crash | a power cut |
 |---|---|---|
-| `never`, the default | what landed since the journal last went down, at most one 1 MiB writeback pace a tail | the active segment of each tail since its last seal is at risk; everything sealed is on the medium |
+| `never`, the default | what landed since the journal last went down, at most one 1 MiB writeback pace a tail | the active segment of each tail since its last seal is at risk, and everything sealed is on the medium |
 | a byte count | everything after the last flush that returned, at most that many bytes | the same |
 | `0`, every put | nothing is lost | nothing is lost |
 | any of the above, for a multi-record batch | a batch is confirmed or it never happened | a batch is confirmed or it never happened |

@@ -304,7 +304,7 @@ impl ReelStore {
             // A footer with no key range is given up to compaction.
             if let Err(error) = self.note_spans(*segment, footer) {
                 tracing::warn!(
-                    "reel segment {} sealed with a footer that names no key range: {error}",
+                    "reel segment {} sealed with a footer that holds no key range: {error}",
                     segment.as_u32()
                 );
             }

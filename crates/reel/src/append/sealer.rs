@@ -90,8 +90,9 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
         .driver
         .advise(active.handle.file(), 0, 0, Advice::Random);
     shared.fd_cache.insert(active.handle.clone());
-    // The footer is down, synced, and the file cut to it, so a segment an earlier
-    // attempt marked unsealed is settled again and the mark comes off with it.
+    // The footer is down, synced, and the file cut to it, so it lists every record the
+    // journal did, and a segment an earlier attempt marked unsealed is settled again.
+    active.journal.remove();
     shared.forget_unsealed(active.handle.id());
     // The footer is on disk now, so a paged index can take this segment's keys over from
     // the map. The tail does not hold the index, so it leaves the number instead.
@@ -363,21 +364,28 @@ pub(super) fn flush_active(
     active: &RwLock<Active>,
     segment: SegmentId,
 ) -> Result<Option<u64>> {
-    let (handle, covered) = {
+    let (handle, journal, covered) = {
         let active = write(active);
         if active.handle.id() != segment || active.terminal.load(Ordering::Acquire) {
             return Ok(None);
         }
         // Taking the segment exclusively is what makes the byte count mean something:
         // every writer holds it shared across its whole reservation, so what has settled
-        // while it is held is what has landed.
+        // while it is held is what has landed, and has pushed its rows.
         (
             active.handle.clone(),
+            Arc::clone(&active.journal),
             active.settled.load(Ordering::Acquire),
         )
     };
 
+    // The rows go down ahead of the syncs, so what this flush makes durable a reopen can
+    // find without the footer.
+    let rows = journal.write_pending()?;
     shared.driver.sync_data(handle.file())?;
+    if let Some(rows) = rows {
+        shared.driver.sync_data(rows)?;
+    }
     Ok(Some(covered))
 }
 

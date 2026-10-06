@@ -14,9 +14,11 @@ use crate::format::loc::SegmentId;
 use crate::format::lsn::Lsn;
 use crate::index::entry::RangeCover;
 use crate::index::map::ReelIndex;
-use crate::index::recovery::{walk_records, WalkedRecord};
+use crate::format::journal::read_groups;
+use crate::index::recovery::{footer_records, journal_records, read_footer, read_journal, WalkedRecord, SEALED};
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
-use crate::reel::segment::{IoDriver, SegmentReader};
+use crate::io::op::FileId;
+use crate::reel::segment::IoDriver;
 use crate::reel::{segment_file_name, segment_number};
 
 /// Sequence numbers a range delete is kept for once the pass has moved past it
@@ -152,16 +154,16 @@ pub fn catch_up(
     let mut found: Vec<WalkedRecord> = Vec::new();
     for (segment, file_len) in present.iter() {
         let from = cursor.positions.get(segment).copied().unwrap_or(0);
-        if from >= *file_len {
+        if from == SEALED {
             continue;
         }
-        let file = driver.open(&reel_dir.join(segment_file_name(*segment)), false)?;
-        let mut reader = SegmentReader::new(driver, file, *file_len);
-        let walked = walk_records(&mut reader, *segment, from, *file_len);
+        let path = reel_dir.join(segment_file_name(*segment));
+        let file = driver.open(&path, false)?;
+        let followed = follow_segment(driver, file, &path, *segment, *file_len, from);
         driver.close(file)?;
-        let walked = walked?;
-        cursor.positions.insert(*segment, walked.next_offset);
-        found.extend(walked.records);
+        let (records, next) = followed?;
+        cursor.positions.insert(*segment, next);
+        found.extend(records);
     }
 
     // The index's guards assume sequence order; across passes the retained ranges
@@ -175,6 +177,29 @@ pub fn catch_up(
     cursor.prune_covers(result.highest_lsn);
     result.is_saturated = cursor.is_saturated();
     Ok(result)
+}
+
+/// What a follower has not yet read of one segment, and where it reads from next
+///
+/// A tail gives the journal's groups past the last pass. A segment that has sealed gives
+/// its whole footer once, since the index's sequence guard turns down the rows a pass
+/// through its journal already applied.
+fn follow_segment(
+    driver: &IoDriver,
+    file: FileId,
+    path: &Path,
+    segment: SegmentId,
+    file_len: u64,
+    from: u64,
+) -> Result<(Vec<WalkedRecord>, u64)> {
+    if let Some(footer) = read_footer(driver, file, file_len)? {
+        return Ok((footer_records(driver, file, segment, &footer)?, SEALED));
+    }
+    let Some(bytes) = read_journal(driver, path, from)? else {
+        return Ok((Vec::new(), from));
+    };
+    let (groups, valid) = read_groups(&bytes);
+    Ok((journal_records(segment, groups), from + valid as u64))
 }
 
 fn apply_all(

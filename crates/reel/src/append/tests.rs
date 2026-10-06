@@ -74,6 +74,9 @@ fn harness_capped(
     (shared, sim)
 }
 
+/// Syncs one flush takes: the segment's, then its journal's
+const SYNCS_PER_FLUSH: u64 = 2;
+
 fn key(byte: u8) -> RecordKey {
     RecordKey::from_bytes(RECORDS, &[byte; KEY_WIDTH]).expect("key")
 }
@@ -390,7 +393,7 @@ fn a_second_writer_waits_on_the_first() {
     let Poll::Ready(Ok(Durability::Settled)) = poll_once(second.as_mut()) else {
         panic!("one flush answers for both writers");
     };
-    assert_eq!(sim.sync_count(), before + 1, "one flush, not two");
+    assert_eq!(sim.sync_count(), before + SYNCS_PER_FLUSH, "one flush, not two");
 }
 
 // a turn nobody takes goes back, so the writer behind it is not left waiting
@@ -464,7 +467,7 @@ fn a_forwarded_flush_answers_both_writers() {
         Poll::Pending => block_on(first).expect("first writer"),
     }
 
-    assert_eq!(sim.sync_count(), before + 1, "one flush, not two");
+    assert_eq!(sim.sync_count(), before + SYNCS_PER_FLUSH, "one flush, not two");
 }
 
 // a caller that walks away from a forwarded flush leaves the turn where it is
@@ -490,7 +493,7 @@ fn a_dropped_wait_keeps_the_flush() {
     appender.sync_if_owed().expect("blocking sync");
     assert_eq!(
         sim.sync_count(),
-        before + 1,
+        before + SYNCS_PER_FLUSH,
         "the abandoned flush is the one that ran"
     );
 }
@@ -1027,7 +1030,9 @@ fn seal_bridges_preallocation_slack() {
 // a drain that never landed leaves no footer entry at the offset it framed
 #[test]
 fn failed_drain_leaves_no_footer_entry() {
-    let plan = FaultPlan::new(1).with_fault(4, FaultKind::EnospcAppend);
+    // The segment's open, its journal's open, the directory sync, the space reservation
+    // and the header write come first, so the record's write is the sixth op.
+    let plan = FaultPlan::new(1).with_fault(5, FaultKind::EnospcAppend);
     let (shared, sim) = harness(config(SyncPolicy::Never, Preallocate::Chunk), plan);
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
 
@@ -1055,9 +1060,10 @@ fn failed_drain_leaves_no_footer_entry() {
 // a failed cadence sync gives up on the segment and rolls off it
 #[test]
 fn failed_sync_rolls_off_the_segment() {
-    // The open, the directory sync, the space reservation, the segment header write and
-    // the record write all come first, so the tail's first sync is the sixth op.
-    let plan = FaultPlan::new(1).with_fault(5, FaultKind::SyncError);
+    // The segment's open, its journal's open, the directory sync, the space reservation,
+    // the header write, the record write and the journal's write all come first, so the
+    // tail's first sync is the eighth op.
+    let plan = FaultPlan::new(1).with_fault(7, FaultKind::SyncError);
     let (shared, _sim) = harness(config(SyncPolicy::EveryPut, Preallocate::Chunk), plan);
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
 
@@ -1069,7 +1075,7 @@ fn failed_sync_rolls_off_the_segment() {
 // a segment given up on unsealed never reads as settled
 #[test]
 fn a_doomed_segment_never_settles() {
-    let plan = FaultPlan::new(1).with_fault(5, FaultKind::SyncError);
+    let plan = FaultPlan::new(1).with_fault(7, FaultKind::SyncError);
     let (shared, _sim) = harness(config(SyncPolicy::EveryPut, Preallocate::Chunk), plan);
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
 
@@ -1199,8 +1205,8 @@ fn writers_share_one_flush() {
     let written = u64::from(writers) * rounds * 1000;
     let owed = written / 4096;
     assert!(
-        sim.sync_count() <= owed * 2,
-        "{} flushes for {owed} thresholds worth of writes",
+        sim.sync_count() <= owed * 2 * SYNCS_PER_FLUSH,
+        "{} syncs for {owed} thresholds worth of writes",
         sim.sync_count()
     );
 }

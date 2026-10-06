@@ -8,6 +8,7 @@
 pub mod admission;
 pub mod codec;
 mod flush;
+mod journal;
 pub(crate) mod publish;
 mod sealer;
 
@@ -22,6 +23,7 @@ use crate::error::{ReelError, Result};
 use crate::format::band::Band;
 use crate::format::column::RecordKey;
 use crate::format::footer::{FooterEntry, SegmentFooter};
+use crate::format::journal::JournalRow;
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::{Lsn, LsnCounter};
 use crate::format::record::{align_up, BatchFrame, Flags, RecordHeader, BLOCK, HEADER_LEN};
@@ -36,6 +38,7 @@ use crate::reel::{DrawnRecords, ReelShared, SegmentHolds};
 use crate::sync::{lock, read, try_lock, write};
 
 use flush::{turn_at, Owed, SyncState, Turn};
+use journal::Journal;
 pub use flush::{Durability, FlushTurn};
 use sealer::{
     doom_active, flush_active, park_broken_seal, publish_flush, retire_segment, seal_segment,
@@ -241,6 +244,9 @@ struct Active {
 
     /// Rows for the records written so far, which the seal packs into the footer
     entries: Mutex<SegmentFooter>,
+
+    /// The same rows as the journal beside the segment takes them, until the seal
+    journal: Arc<Journal>,
 
     /// Durability state, shared with whichever writers are flushing this segment
     sync: Arc<SyncState>,
@@ -737,6 +743,7 @@ impl Appender {
     fn scrap(&self, held: Active) {
         let drawn = held.handle.id();
         held.handle.mark_doomed();
+        held.journal.remove();
         // Durable because nothing is owed: the file is going away, and a flush that
         // arrives later must settle rather than park forever.
         held.sync.mark_durable();
@@ -778,11 +785,14 @@ impl Appender {
             return Ok(());
         }
         let file = active.handle.file();
-        let flushed = self
-            .shared
-            .driver
+        let driver = &self.shared.driver;
+        let flushed = driver
             .truncate(file, active.end())
-            .and_then(|()| self.shared.driver.sync_full(file));
+            .and_then(|()| active.journal.write_pending())
+            .and_then(|rows| {
+                driver.sync_full(file)?;
+                rows.map_or(Ok(()), |rows| driver.sync_full(rows))
+            });
         active.terminal.store(true, Ordering::Release);
         match &flushed {
             Ok(()) => active.sync.mark_durable(),
@@ -1129,13 +1139,16 @@ impl Appender {
             WriteBuf::push_prefix(&mut bufs, frame.pack());
             at += BatchFrame::SPAN;
         }
+        let mut rows = Vec::with_capacity(headers.len());
         for (header, payload) in headers.iter().zip(payloads) {
+            let payload = payload.into();
             if let Some(entry) = FooterEntry::from_record(header, at as u32) {
                 entries.push(entry);
+                rows.push(journal_row(header, at as u32, payload.as_slice()));
             }
             WriteBuf::push_prefix(&mut bufs, header.pack());
             if header.has_payload() {
-                bufs.push(payload.into());
+                bufs.push(payload);
             }
             locs.push(Loc::new(active.handle.id(), at as u32, header.length));
             at += header.span();
@@ -1161,6 +1174,8 @@ impl Appender {
         for entry in &entries {
             pending.push(entry);
         }
+        drop(pending);
+        active.journal.push(&rows);
         Ok(locs)
     }
 
@@ -1226,6 +1241,9 @@ impl Appender {
         payload: OwnedBuf,
     ) -> Result<Loc> {
         let listed = FooterEntry::from_record(header, base as u32);
+        let row = listed
+            .as_ref()
+            .map(|_| journal_row(header, base as u32, payload.as_slice()));
 
         // Five rather than four, since a spilled key rides in a buffer of its own.
         let mut bufs = take_bufs(5);
@@ -1251,6 +1269,9 @@ impl Appender {
         }
         if let Some(entry) = listed {
             lock(&active.entries).push(&entry);
+        }
+        if let Some(row) = row {
+            active.journal.push(&[row]);
         }
         Ok(Loc::new(active.handle.id(), base as u32, header.length))
     }
@@ -1358,6 +1379,9 @@ impl Appender {
         }];
         pacing.started_to = settled;
         drop(pacing);
+        // The rows go with the records, so a volume that never syncs loses no more to a
+        // crash than the stretch since this pace.
+        active.journal.try_write_pending();
         let _ = self.shared.driver.run(ops);
     }
 
@@ -1550,6 +1574,13 @@ impl Appender {
     fn resume_segment(&self, resumed: ResumableTail) -> Result<Active> {
         let holds = self.shared.adopt_segment(resumed.segment);
         let file = self.shared.driver.open(&resumed.path, false)?;
+        let journal = Journal::resume(&self.shared.driver, &resumed.path, &resumed.rows)?;
+        // A whole-block volume pads every record out to a block, and the journal lists
+        // the records alone, so the tail picks up at the block after the last one.
+        let end = match self.shared.writes_whole_blocks() {
+            true => align_up(resumed.end + HEADER_LEN as u64, ALIGN),
+            false => resumed.end,
+        };
         let handle = SegmentHandle::new(
             resumed.segment,
             resumed.path,
@@ -1558,12 +1589,13 @@ impl Appender {
         );
         let active = Active {
             handle,
-            reserved: AtomicU64::new(resumed.end),
-            settled: AtomicU64::new(resumed.end),
+            reserved: AtomicU64::new(end),
+            settled: AtomicU64::new(end),
             cut_at: AtomicU64::new(NO_CUT),
-            alloc_high: AtomicU64::new(resumed.end),
+            alloc_high: AtomicU64::new(end),
             fill: Mutex::new(()),
             entries: Mutex::new(resumed.entries),
+            journal: Arc::new(journal),
             sync: Arc::new(SyncState::new()),
             terminal: AtomicBool::new(false),
             holds,
@@ -1576,14 +1608,14 @@ impl Appender {
         // window, so its window starts again at the walked end.
         let target = self.shared.config.segment_bytes.to_bytes();
         let filled = match self.shared.driver.length(active.handle.file())? {
-            length if length >= target => resumed.end,
+            length if length >= target => end,
             length => length,
         };
         active
             .alloc_high
-            .store(filled.max(resumed.end), Ordering::Release);
+            .store(filled.max(end), Ordering::Release);
         self.shared.driver.sync_full(active.handle.file())?;
-        active.sync.synced_at.store(resumed.end, Ordering::Release);
+        active.sync.synced_at.store(end, Ordering::Release);
         Ok(active)
     }
 
@@ -1670,7 +1702,13 @@ impl Appender {
     /// once the scrap is gone and its directory has said so.
     fn scrap_attempt(&self, id: SegmentId) -> Result<()> {
         let driver = &self.shared.driver;
-        match driver.unlink(&self.shared.segment_path(id)) {
+        let path = self.shared.segment_path(id);
+        match driver.unlink(&crate::format::journal::journal_path(&path)) {
+            Ok(()) => {}
+            Err(error) if error.is_missing() => {}
+            Err(error) => return Err(error),
+        }
+        match driver.unlink(&path) {
             Ok(()) => driver.sync_dir(self.shared.segment_dir(id)),
             Err(error) if error.is_missing() => Ok(()),
             Err(error) => Err(error),
@@ -1680,8 +1718,9 @@ impl Appender {
     fn build_segment(&self, id: SegmentId, holds: Arc<SegmentHolds>) -> Result<Active> {
         let path = self.shared.segment_path(id);
         let file = self.shared.driver.open(&path, true)?;
+        let journal = Journal::create(&self.shared.driver, &path)?;
         // A file's own sync says nothing about the directory entry naming it, so one
-        // directory sync per segment closes that.
+        // directory sync per segment closes that, for the segment and its journal.
         self.shared.driver.sync_dir(self.shared.segment_dir(id))?;
         let map = self.write_mapping(&path, file)?;
         let handle = SegmentHandle::new(id, path, file, Arc::clone(&self.shared.driver));
@@ -1694,6 +1733,7 @@ impl Appender {
             alloc_high: AtomicU64::new(0),
             fill: Mutex::new(()),
             entries: Mutex::new(SegmentFooter::empty()),
+            journal: Arc::new(journal),
             sync: Arc::new(SyncState::new()),
             terminal: AtomicBool::new(false),
             holds,
@@ -1899,15 +1939,32 @@ fn build_record(
     }
 }
 
+/// The journal row of one record, a range tombstone's end read off its payload
+fn journal_row(header: &RecordHeader, offset: u32, payload: &[u8]) -> JournalRow {
+    let range_end = match header.flags.is_range_tombstone() && header.length > 0 {
+        true => crate::format::column::KeyBytes::new(payload).ok(),
+        false => None,
+    };
+    JournalRow {
+        key: header.key.clone(),
+        lsn: header.lsn,
+        offset,
+        len: header.length,
+        flags: header.flags,
+        range_end,
+    }
+}
+
 fn placeholder_active(driver: Arc<IoDriver>) -> Active {
     Active {
-        handle: SegmentHandle::placeholder(driver),
+        handle: SegmentHandle::placeholder(Arc::clone(&driver)),
         reserved: AtomicU64::new(0),
         settled: AtomicU64::new(0),
         cut_at: AtomicU64::new(NO_CUT),
         alloc_high: AtomicU64::new(0),
         fill: Mutex::new(()),
         entries: Mutex::new(SegmentFooter::empty()),
+        journal: Arc::new(Journal::none(&driver)),
         sync: Arc::new(SyncState::new()),
         terminal: AtomicBool::new(false),
         holds: Arc::default(),

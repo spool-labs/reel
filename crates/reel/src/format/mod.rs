@@ -11,6 +11,7 @@ pub mod column;
 pub mod fence;
 pub mod filter;
 pub mod footer;
+pub mod journal;
 pub mod loc;
 pub mod lsn;
 pub mod prefix;

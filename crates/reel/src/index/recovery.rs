@@ -1,13 +1,12 @@
 //! Rebuilding the reel's resident index from its segment files on open
 //!
 //! The files are the truth and the index is a cache, so on open the reel is read
-//! back from disk. A sealed segment is read from the packed sorted footer at its end;
-//! an unsealed tail is walked once, ending at the first byte that cannot begin a
-//! record. Every walked record is checksum verified and the ones that fail are left
-//! out. A batch is read through the frame that opens it and is kept only when the run
-//! the frame declared is there whole. A file whose segment header names an unknown
-//! format or another segment number is quarantined rather than truncated. Each key
-//! resolves to its highest sequence number, whichever segment carried it.
+//! back from disk. A sealed segment is read from the packed sorted footer at its end.
+//! An unsealed tail is read through the journal beside it, a group of rows a write:
+//! a group is kept only when every record it lists sits where its row says and checks
+//! out, so a batch comes back whole or not at all. A file whose segment header carries
+//! an unknown format or another segment number is quarantined. Each key resolves to its
+//! highest sequence number, whichever segment carried it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -20,10 +19,11 @@ use crate::format::column::{ColumnId, KeyBytes, RecordKey};
 use crate::format::footer::{
     FooterEntry, FooterPartition, FooterTally, SegmentFooter, FIXED_TAIL_LEN,
 };
+use crate::format::journal::{journal_path, read_groups, JournalRow, JOURNAL_SUFFIX};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{
-    peek_key_width, read_u32_le, BatchFrame, Flags, RecordHeader, HEADER_LEN,
+    read_u32_le, Flags, RecordHeader, HEADER_LEN,
 };
 use crate::format::segment_header::{SegmentHeader, FORMAT_VERSION};
 use crate::index::column::{KeyMove, Landed};
@@ -75,11 +75,11 @@ pub struct RebuiltReel {
     /// Files set aside as foreign or misplaced
     pub quarantined: Vec<PathBuf>,
 
-    /// Bytes of each segment the rebuild consumed, carried only for the tails it
-    /// walked
+    /// Bytes of each tail's journal the rebuild consumed, and SEALED for a segment
+    /// read from its footer
     pub consumed: HashMap<SegmentId, u64>,
 
-    /// Walked tails and their file lengths. A crash keeps their reservation's
+    /// Unsealed tails and their file lengths. A crash keeps their reservation's
     /// blocks claimed past the end, and a writable open gives those back.
     pub walked: Vec<(PathBuf, u64)>,
 
@@ -188,9 +188,9 @@ pub fn rebuild_from_persisted(
             placements.push((segment, root));
         }
         if standing.contains(&segment) {
-            // Sealed and vouched for, so the file is read to its end and the rows
-            // the persisted index holds stand in for walking it.
-            consumed.insert(segment, len);
+            // Sealed and vouched for, so the rows the persisted index holds stand in
+            // for reading it.
+            consumed.insert(segment, SEALED);
             continue;
         }
         jobs.push((segment, path, len));
@@ -220,7 +220,7 @@ pub fn rebuild_from_persisted(
         let (segment, path, len) = &jobs[at];
         match absorb_segment(*segment, parts, pages, &mut resolver, &mut held)? {
             Loaded::Sealed(footer) => {
-                consumed.insert(*segment, *len);
+                consumed.insert(*segment, SEALED);
                 sealed_files.push((*segment, path.clone(), *len));
                 if let (Some(queue), Some(footer)) = (&queue, footer) {
                     if !is_sized {
@@ -231,18 +231,18 @@ pub fn rebuild_from_persisted(
                     let _ = queue.send((*segment, footer));
                 }
             }
-            Loaded::Walked(offset, is_at_fill, entries) => {
-                consumed.insert(*segment, offset);
+            Loaded::Journaled(end) => {
+                consumed.insert(*segment, end.journal_len);
                 walked.push((path.clone(), *len));
-                // Resumable means the walk ran out of written bytes. A walk that
-                // stopped on something else has bytes ahead of it that an appender
-                // must not write behind.
-                if is_at_fill {
+                // A segment with no journal had its seal finish once, so an appender
+                // must not write into it again whatever its footer reads as now.
+                if let Some(rows) = end.rows {
                     resumable.push(ResumableTail {
                         segment: *segment,
                         path: path.clone(),
-                        end: offset,
-                        entries,
+                        end: end.next_offset,
+                        entries: SegmentFooter::empty(),
+                        rows,
                     });
                 }
             }
@@ -344,9 +344,8 @@ enum Loaded {
     /// A sealed segment, read from its footer, which a paged open still has to load
     Sealed(Option<SegmentFooter>),
 
-    /// An unsealed tail, walked to an offset, whether it may be taken up again, and
-    /// its rows packed as its footer holds them
-    Walked(u64, bool, SegmentFooter),
+    /// An unsealed tail read through its journal
+    Journaled(JournaledEnd),
 
     /// A file that is not a segment of this reel
     Foreign,
@@ -354,13 +353,27 @@ enum Loaded {
 
 /// An unsealed tail an appender can pick up where it stopped
 ///
-/// The end is the walked offset; the footer is rebuilt from the walk and carries
-/// nothing inline, so a read through one of its rows goes to the record.
+/// The end is where its last accepted record ends. The footer is rebuilt from the
+/// journal's rows, and the rows themselves go down again as the tail's fresh journal.
 pub struct ResumableTail {
     pub segment: SegmentId,
     pub path: PathBuf,
     pub end: u64,
     pub entries: SegmentFooter,
+    pub rows: Vec<JournalRow>,
+}
+
+/// What a journaled tail's read leaves for the rebuild beside its rows
+struct JournaledEnd {
+    /// Where the last accepted record ends
+    next_offset: u64,
+
+    /// Bytes of whole groups in the journal, where a follower picks up
+    journal_len: u64,
+
+    /// The accepted rows, for the tail that resumes them, nothing for a segment no
+    /// appender may write into again
+    rows: Option<Vec<JournalRow>>,
 }
 
 /// One segment file read off the medium, before any of it is joined
@@ -371,8 +384,8 @@ enum SegmentParts {
     /// A sealed segment's footer, and the range ends its rows do not carry
     Sealed(SegmentFooter, Vec<Option<KeyBytes>>),
 
-    /// An unsealed tail's walk
-    Walked(WalkedTail),
+    /// An unsealed tail read through its journal
+    Journaled(JournaledTail),
 
     /// A file that is not a segment of this reel
     Foreign,
@@ -513,7 +526,7 @@ fn read_segment(
     file_len: u64,
 ) -> Result<SegmentParts> {
     let file = driver.open(path, false)?;
-    let read = read_parts(driver, file, segment, file_len);
+    let read = read_parts(driver, file, path, segment, file_len);
     driver.close(file)?;
     read
 }
@@ -521,6 +534,7 @@ fn read_segment(
 fn read_parts(
     driver: &IoDriver,
     file: FileId,
+    path: &Path,
     segment: SegmentId,
     file_len: u64,
 ) -> Result<SegmentParts> {
@@ -533,14 +547,9 @@ fn read_parts(
             let ends = read_range_ends(driver, file, &footer)?;
             Ok(SegmentParts::Sealed(footer, ends))
         }
-        None => {
-            let mut reader = SegmentReader::new(driver, file, file_len);
-            Ok(SegmentParts::Walked(walk_tail(
-                &mut reader,
-                segment,
-                file_len,
-            )?))
-        }
+        None => Ok(SegmentParts::Journaled(read_journaled(
+            driver, file, path, file_len,
+        )?)),
     }
 }
 
@@ -548,7 +557,7 @@ fn read_parts(
 ///
 /// A paging volume sweeps a sealed footer and installs none of its keys. Ranges stand at
 /// once, since a cover settles by sequence number whichever rows it meets first. A
-/// walked tail's footer goes to the tail resuming it once its window is fed.
+/// journaled tail's footer goes to the tail resuming it once its window is fed.
 fn absorb_segment(
     segment: SegmentId,
     parts: SegmentParts,
@@ -573,18 +582,18 @@ fn absorb_segment(
                 Ok(Loaded::Sealed(None))
             }
         },
-        SegmentParts::Walked(tail) => {
+        SegmentParts::Journaled(tail) => {
             stand_ranges(segment, &tail.footer, tail.ends, resolver)?;
             held.push(Held {
                 segment,
                 footer: tail.footer,
                 is_sorted: false,
             });
-            Ok(Loaded::Walked(
-                tail.next_offset,
-                tail.is_at_fill,
-                SegmentFooter::empty(),
-            ))
+            Ok(Loaded::Journaled(JournaledEnd {
+                next_offset: tail.next_offset,
+                journal_len: tail.journal_len,
+                rows: tail.rows,
+            }))
         }
     }
 }
@@ -1194,7 +1203,7 @@ fn read_range_end(
     Ok(KeyBytes::new(&bytes).ok())
 }
 
-/// One record a walk resolved, carrying everything applying it needs
+/// One record a follower applies, carrying everything applying it needs
 pub struct WalkedRecord {
     /// Column and key the record is addressed by
     pub key: RecordKey,
@@ -1212,297 +1221,177 @@ pub struct WalkedRecord {
     pub range_end: Option<KeyBytes>,
 }
 
-/// What one walk of a segment produced
-pub struct Walked {
-    /// Records the walk resolved, in the order they sit in the segment
-    pub records: Vec<WalkedRecord>,
+/// The consumed position of a segment read from its footer, which a follower reads no more of
+pub const SEALED: u64 = u64::MAX;
 
-    /// Offset the walk stopped at, which is where the next one resumes
-    pub next_offset: u64,
-
-    /// Whether the walk stopped on bytes nothing has written
-    pub is_at_fill: bool,
-}
-
-/// Walk a segment from an offset, vetting every record and framing every batch
-///
-/// The walk stops at the first byte that cannot begin a record and hands back that
-/// offset, so a later walk of a tail that has grown picks up exactly there. A batch is
-/// read as one thing: its frame says how many records follow and how many bytes they
-/// take, and the run is kept only when exactly that is there and verifies. The offset
-/// reported is the one before a run whose bytes have not all landed rather than past
-/// it. Pass the file length to walk to the end.
-pub fn walk_records(
-    reader: &mut SegmentReader<'_>,
-    segment: SegmentId,
-    from: u64,
-    to: u64,
-) -> Result<Walked> {
-    let mut records = Vec::new();
-    let (next_offset, is_at_fill) =
-        walk_each(reader, segment, from, to, |record| records.push(record))?;
-    Ok(Walked {
-        records,
-        next_offset,
-        is_at_fill,
-    })
-}
-
-/// An unsealed tail's walk, its rows packed the way the tail's own footer packs them
-struct WalkedTail {
-    /// Rows column by column, each column in the order the records sit in the file
+/// An unsealed tail read through its journal, its rows packed the way its own footer packs them
+struct JournaledTail {
+    /// Rows column by column, each column in the order its journal took them
     footer: SegmentFooter,
 
     /// Each range tombstone's end, in the footer's order
     ends: Vec<Option<KeyBytes>>,
 
-    /// Offset the walk stopped at, which is where the tail resumes
+    /// The accepted rows as the journal holds them, nothing where there is no journal
+    rows: Option<Vec<JournalRow>>,
+
+    /// Where the last accepted record ends, which is where the tail resumes
     next_offset: u64,
 
-    /// Whether the walk stopped on bytes nothing has written
-    is_at_fill: bool,
+    /// Bytes of whole groups the journal holds
+    journal_len: u64,
 }
 
-/// Walk a whole tail into the footer an appender takes it up with
+/// Read an unsealed tail through its journal, keeping each group whose records all check out
 ///
-/// A record held whole costs four times its packed row, and the tails of a volume of
-/// small records hold millions of them.
-fn walk_tail(reader: &mut SegmentReader<'_>, segment: SegmentId, to: u64) -> Result<WalkedTail> {
-    let mut footer = SegmentFooter::empty();
+/// A group is one write, so a batch is kept whole or not at all, and a group listing a
+/// record that did not land as its row says is dropped. A segment with no journal had
+/// its seal finish once and its footer go bad since, and nothing lists its records.
+fn read_journaled(driver: &IoDriver, file: FileId, path: &Path, file_len: u64) -> Result<JournaledTail> {
+    let mut tail = JournaledTail {
+        footer: SegmentFooter::empty(),
+        ends: Vec::new(),
+        rows: None,
+        next_offset: header_end(driver, file)?,
+        journal_len: 0,
+    };
+    let Some(bytes) = read_journal(driver, path, 0)? else {
+        return Ok(tail);
+    };
+    let (groups, valid) = read_groups(&bytes);
+    tail.journal_len = valid as u64;
+    let mut reader = SegmentReader::new(driver, file, file_len);
+    let mut rows = Vec::new();
     let mut ends = Vec::new();
-    let (next_offset, is_at_fill) = walk_each(reader, segment, 0, to, |record| {
-        if record.flags.is_range_tombstone() {
-            ends.push((record.key.column, record.range_end));
+    for group in groups {
+        if !all_landed(&mut reader, &group)? {
+            continue;
         }
-        let (offset, len) = (record.loc.offset, record.loc.len);
-        // The first record says what the rest of the tail likely holds, so the rows get
-        // their room in one go.
-        let span = HEADER_LEN as u64 + record.key.width() as u64 + u64::from(len);
-        let is_first = footer.is_empty();
-        footer.push(&FooterEntry::new(
-            record.key,
-            record.lsn,
-            offset,
-            len,
-            record.flags,
-        ));
-        if is_first {
-            footer.reserve_rows((to.saturating_sub(u64::from(offset)) / span) as usize);
+        for row in group {
+            let span = span_of(row.key.width(), row.len);
+            tail.next_offset = tail.next_offset.max(u64::from(row.offset) + span);
+            if row.flags.is_range_tombstone() {
+                ends.push((row.key.column, row.range_end.clone()));
+            }
+            tail.footer.push(&FooterEntry::new(row.key.clone(), row.lsn, row.offset, row.len, row.flags));
+            rows.push(row);
         }
-    })?;
+    }
     // The footer holds a column's rows together, and a stable sort keeps each column's
-    // ends in file order.
+    // ends in journal order.
     ends.sort_by_key(|(column, _)| *column);
-    Ok(WalkedTail {
-        footer,
-        ends: ends.into_iter().map(|(_, end)| end).collect(),
-        next_offset,
-        is_at_fill,
-    })
+    tail.ends = ends.into_iter().map(|(_, end)| end).collect();
+    tail.rows = Some(rows);
+    Ok(tail)
 }
 
-/// The walk itself, handing each record on once it is vetted and its batch is whole
-///
-/// Answers the offset the walk stopped at and whether it stopped on unwritten bytes.
-fn walk_each(
-    reader: &mut SegmentReader<'_>,
-    segment: SegmentId,
-    from: u64,
-    to: u64,
-    mut take: impl FnMut(WalkedRecord),
-) -> Result<(u64, bool)> {
-    let limit = reader.limit().min(to);
-    let mut run = Vec::new();
-    // Where a walk may resume from. It trails the write head by whatever an unlanded
-    // run holds, so a tail that grows into its own batch is re-read from the frame
-    // rather than resumed inside it.
-    let mut next_offset = from;
-    let mut offset = from;
-    while offset + HEADER_LEN as u64 <= limit {
-        let header = match read_head(reader, offset, limit)? {
-            Head::Record(header) => header,
-            Head::Missing | Head::Broken => break,
+/// Unlink every journal a footer has taken over, and every journal part a resume left
+pub fn remove_stale_journals(driver: &IoDriver, root: &Path, consumed: &HashMap<SegmentId, u64>) -> Result<()> {
+    for entry in driver.list_or_empty(root)? {
+        let is_stale = match entry.name.strip_suffix(JOURNAL_SUFFIX) {
+            Some(number) => number
+                .parse()
+                .ok()
+                .is_none_or(|number| consumed.get(&SegmentId(number)).is_none_or(|at| *at == SEALED)),
+            None => entry.name.ends_with(".rows.part"),
         };
-        if !header.fits_within(limit - offset) {
-            break;
+        if is_stale {
+            driver.unlink(&root.join(&entry.name))?;
         }
-        let at = offset;
-        offset += header.span();
+    }
+    Ok(())
+}
 
-        if header.flags.is_batch_frame() {
-            // The frame's own checksum covers what it declares, so a frame that fails
-            // it leaves nothing saying where its batch ends and the walk stops here.
-            if !verify_record(reader, at, &header)? {
-                break;
-            }
-            let declaration = reader.range(at + header.prefix_len(), header.length as usize)?;
-            let Some(frame) = BatchFrame::unpack(&header, declaration) else {
-                break;
+/// A segment's journal from an offset to its end, nothing where it has no journal
+pub(crate) fn read_journal(driver: &IoDriver, segment_path: &Path, from: u64) -> Result<Option<Vec<u8>>> {
+    let journal = match driver.open(&journal_path(segment_path), false) {
+        Ok(journal) => journal,
+        Err(error) if error.is_missing() => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let read = driver.length(journal).and_then(|len| match len > from {
+        true => driver.pread(journal, from, len - from),
+        false => Ok(Vec::new()),
+    });
+    driver.close(journal)?;
+    read.map(Some)
+}
+
+/// Where the segment header record ends, which is where an empty tail resumes
+fn header_end(driver: &IoDriver, file: FileId) -> Result<u64> {
+    let head = driver.pread(file, 0, HEADER_LEN as u64)?;
+    let header = RecordHeader::unpack(head.get(..HEADER_LEN).unwrap_or(&[]))?;
+    Ok(header.span())
+}
+
+/// Whether every record a group lists sits where its row says and checks out
+fn all_landed(reader: &mut SegmentReader<'_>, group: &[JournalRow]) -> Result<bool> {
+    for row in group {
+        if !is_indexable(row.flags) {
+            return Ok(false);
+        }
+        let prefix = HEADER_LEN + row.key.as_slice().len();
+        let head = reader.range(u64::from(row.offset), prefix)?;
+        if head.len() < prefix {
+            return Ok(false);
+        }
+        let Ok(header) = RecordHeader::unpack(head) else {
+            return Ok(false);
+        };
+        if header.key != row.key || header.lsn != row.lsn || header.length != row.len || header.flags != row.flags {
+            return Ok(false);
+        }
+        if !verify_record(reader, u64::from(row.offset), &header)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Every record a sealed footer lists, as a follower applies it
+pub(crate) fn footer_records(
+    driver: &IoDriver,
+    file: FileId,
+    segment: SegmentId,
+    footer: &SegmentFooter,
+) -> Result<Vec<WalkedRecord>> {
+    let mut ends = read_range_ends(driver, file, footer)?.into_iter();
+    let mut records = Vec::with_capacity(footer.entry_count());
+    for partition in &footer.partitions {
+        for at in 0..partition.len() {
+            let row = partition.row_at(at)?;
+            let Some(key) = partition.key_at(at) else {
+                continue;
             };
-            let ends_at = offset + frame.span;
-            if ends_at > limit {
-                break;
-            }
-            match walk_batch(reader, segment, &frame, offset, ends_at, &mut run)? {
-                Batch::Whole => run.drain(..).for_each(&mut take),
-                // The run is on disk and not intact, so it is dropped whole and the
-                // walk carries on at the boundary the frame named.
-                Batch::Torn => {}
-                // The bytes are not all there, so the tail may yet grow into them and
-                // the walk leaves the frame for the pass that finds them.
-                Batch::Unlanded => break,
-            }
-            offset = ends_at;
-            next_offset = ends_at;
-            continue;
+            let range_end = match row.flags.is_range_tombstone() {
+                true => ends.next().flatten(),
+                false => None,
+            };
+            records.push(WalkedRecord {
+                key: RecordKey::from_bytes(partition.column, key)?,
+                lsn: row.lsn,
+                loc: Loc::new(segment, row.offset, row.len),
+                flags: row.flags,
+                range_end,
+            });
         }
-
-        // A member without its frame is a record of a run this walk cannot vouch for,
-        // so it is dropped rather than applied on its own.
-        if header.flags.is_batched() {
-            next_offset = at + header.span();
-            continue;
-        }
-
-        // A record that fails its checksum is dropped and the walk carries on, since
-        // cutting the walk there would throw away every good record behind it.
-        if !verify_record(reader, at, &header)? || !is_indexable(header.flags) {
-            next_offset = at + header.span();
-            continue;
-        }
-        let span = header.span();
-        take(resolve_walked(reader, segment, header, at)?);
-        next_offset = at + span;
     }
-
-    // A segment is written through with zeros when it is made, and the fill reads back
-    // as a data record with no sequence number. So a walk that stops on unwritten bytes
-    // stops at the end of what was written, and one that stops on anything else has
-    // written bytes ahead of it that an appender must not land behind.
-    let is_at_fill = matches!(read_head(reader, next_offset, limit)?, Head::Missing);
-    Ok((next_offset, is_at_fill))
+    Ok(records)
 }
 
-/// What the bytes at an offset turned out to be
-enum Head {
-    /// A record header, parsed and within the bytes the walk may read
-    Record(RecordHeader),
-
-    /// Bytes nothing has written yet, which is where a tail's reservation begins
-    Missing,
-
-    /// Bytes that are there and do not begin a record
-    Broken,
-}
-
-/// Parse the record beginning at an offset, telling absent bytes from bad ones
-///
-/// The two are not the same answer: bytes that are not there may arrive, and bytes
-/// that are there and will not parse never will.
-fn read_head(reader: &mut SegmentReader<'_>, offset: u64, limit: u64) -> Result<Head> {
-    if offset + HEADER_LEN as u64 > limit {
-        return Ok(Head::Missing);
-    }
-    let head_bytes = reader.range(offset, HEADER_LEN)?;
-    if head_bytes.len() < HEADER_LEN {
-        return Ok(Head::Missing);
-    }
-    let Some(width) = peek_key_width(head_bytes) else {
-        return Ok(Head::Broken);
-    };
-    let prefix = reader.range(offset, HEADER_LEN + width)?;
-    if prefix.len() < HEADER_LEN + width {
-        return Ok(Head::Missing);
-    }
-    let Ok(header) = RecordHeader::unpack(prefix) else {
-        return Ok(Head::Broken);
-    };
-    match header.is_unwritten() {
-        true => Ok(Head::Missing),
-        false => Ok(Head::Record(header)),
-    }
-}
-
-/// What one batch's declared region turned out to hold
-enum Batch {
-    /// Every record the frame declared is there and verifies, held in the run
-    Whole,
-
-    /// The region is written and is not the run the frame declared
-    Torn,
-
-    /// The region's bytes have not all landed, so the run may still be coming
-    Unlanded,
-}
-
-/// Read the run one frame declares, keeping it only if all of it is there
-///
-/// Nothing is applied until the whole run has been read, so a batch is never half
-/// installed and then retracted. Both of the frame's numbers have to come out: the
-/// records are counted and the bytes they take have to end exactly where the span
-/// said, so a run that stops early or runs long is torn either way.
-fn walk_batch(
-    reader: &mut SegmentReader<'_>,
-    segment: SegmentId,
-    frame: &BatchFrame,
-    from: u64,
-    ends_at: u64,
-    run: &mut Vec<WalkedRecord>,
-) -> Result<Batch> {
-    run.clear();
-    let mut offset = from;
-    for _ in 0..frame.count {
-        let header = match read_head(reader, offset, ends_at)? {
-            Head::Record(header) => header,
-            Head::Missing => return Ok(Batch::Unlanded),
-            Head::Broken => return Ok(Batch::Torn),
-        };
-        // A record of a run says so in its own checksummed header, so a run holding
-        // anything that does not is not the run the frame declared.
-        if !header.flags.is_batched()
-            || !is_indexable(header.flags)
-            || !header.fits_within(ends_at - offset)
-        {
-            return Ok(Batch::Torn);
-        }
-        if !verify_record(reader, offset, &header)? {
-            return Ok(Batch::Torn);
-        }
-        let at = offset;
-        offset += header.span();
-        run.push(resolve_walked(reader, segment, header, at)?);
-    }
-    match offset == ends_at {
-        true => Ok(Batch::Whole),
-        false => Ok(Batch::Torn),
-    }
-}
-
-/// Resolve one walked record, reading back the end a range tombstone carries
-fn resolve_walked(
-    reader: &mut SegmentReader<'_>,
-    segment: SegmentId,
-    header: RecordHeader,
-    offset: u64,
-) -> Result<WalkedRecord> {
-    let range_end = match header.flags.is_range_tombstone() {
-        false => None,
-        true => match header.length {
-            0 => None,
-            length => {
-                let bytes = reader.range(offset + header.prefix_len(), length as usize)?;
-                KeyBytes::new(bytes).ok()
-            }
-        },
-    };
-
-    Ok(WalkedRecord {
-        key: header.key,
-        lsn: header.lsn,
-        loc: Loc::new(segment, offset as u32, header.length),
-        flags: header.flags,
-        range_end,
-    })
+/// The rows of a journal as a follower applies them
+pub(crate) fn journal_records(segment: SegmentId, groups: Vec<Vec<JournalRow>>) -> Vec<WalkedRecord> {
+    groups
+        .into_iter()
+        .flatten()
+        .map(|row| WalkedRecord {
+            loc: Loc::new(segment, row.offset, row.len),
+            key: row.key,
+            lsn: row.lsn,
+            flags: row.flags,
+            range_end: row.range_end,
+        })
+        .collect()
 }
 
 fn verify_record(
@@ -1725,6 +1614,8 @@ fn is_indexable(flags: Flags) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::format::record::BatchFrame;
 
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2105,6 +1996,8 @@ mod tests {
                 },
             ])
             .expect("batch");
+        // A batch leaves its sync to the caller, and the sync is what journals its rows.
+        appender.flush().expect("flush");
 
         let rebuilt = rebuild(&sim);
 
@@ -2132,6 +2025,7 @@ mod tests {
                 },
             ])
             .expect("batch");
+        appender.flush().expect("flush");
         corrupt_payload(&sim, u64::from(committed[1].loc.offset));
 
         let rebuilt = rebuild(&sim);
@@ -2160,6 +2054,7 @@ mod tests {
                 },
             ])
             .expect("batch");
+        appender.flush().expect("flush");
         corrupt_payload(&sim, u64::from(committed[0].loc.offset));
 
         let rebuilt = rebuild(&sim);
@@ -2167,7 +2062,7 @@ mod tests {
         assert_eq!(keys_of(&rebuilt, RECORDS), vec![vec![9u8; 34]]);
     }
 
-    /// Write a batch of two behind one plain record, and say where its frame sits
+    /// Write a batch of two behind one plain record, journal it, and say where its frame sits
     fn tail_with_a_batch(sim: &SimIo) -> u64 {
         let shared = shared(config(SyncPolicy::EveryPut), sim);
         let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
@@ -2186,20 +2081,8 @@ mod tests {
                 },
             ])
             .expect("batch");
+        appender.flush().expect("flush");
         u64::from(committed[0].loc.offset) - BatchFrame::SPAN
-    }
-
-    // a batch whose frame rots is dropped whole, since nothing says where it ends
-    #[test]
-    fn a_torn_frame_drops_its_batch() {
-        let sim = SimIo::new(FaultPlan::new(1));
-        let frame_at = tail_with_a_batch(&sim);
-        // The declaration itself, which the frame's own checksum covers.
-        corrupt_at(&sim, frame_at + HEADER_LEN as u64, &[0xff; 4]);
-
-        let rebuilt = rebuild(&sim);
-
-        assert_eq!(keys_of(&rebuilt, RECORDS), vec![vec![9u8; 34]]);
     }
 
     // a batch whose records never landed is dropped, frame and all
@@ -2229,21 +2112,6 @@ mod tests {
         assert_eq!(keys_of(&rebuilt, RECORDS), vec![vec![9u8; 34]]);
     }
 
-    // a record of a run whose frame is gone is not applied on its own
-    #[test]
-    fn a_member_without_its_frame_is_dropped() {
-        let sim = SimIo::new(FaultPlan::new(1));
-        let frame_at = tail_with_a_batch(&sim);
-        // A pad in the frame's place, which is what a failed write leaves behind: the
-        // records are all there and nothing vouches for them as a run.
-        let pad = RecordHeader::fill(BatchFrame::SPAN as u32 - HEADER_LEN as u32);
-        corrupt_at(&sim, frame_at, pad.pack().as_slice());
-
-        let rebuilt = rebuild(&sim);
-
-        assert_eq!(keys_of(&rebuilt, RECORDS), vec![vec![9u8; 34]]);
-    }
-
     // a segment header naming another segment is quarantined, not indexed
     #[test]
     fn foreign_segment_quarantined() {
@@ -2265,8 +2133,11 @@ mod tests {
             .is_some());
     }
 
-    /// Cut a sealed segment back to its record region, the shape a failed seal leaves
-    fn strip_footer(image: &mut DurableImage, name: &str) {
+    /// Cut a sealed segment back to its record region and put back the journal it held,
+    /// the shape a seal that failed partway leaves
+    fn strip_footer(image: &mut DurableImage, name: &str, journal: Vec<u8>) {
+        let path = Path::new(REEL_DIR).join(name);
+        image.push((journal_path(&path), journal));
         for (path, bytes) in image.iter_mut() {
             if path.file_name().map(|found| found == name).unwrap_or(false) {
                 let len = bytes.len();
@@ -2293,6 +2164,10 @@ mod tests {
         appender
             .append_tombstone(key(3), Commit::PerRecord)
             .expect("old delete");
+        appender.flush().expect("flush");
+        let journal = sim
+            .durable_bytes(&journal_path(&Path::new(REEL_DIR).join("000001.reel")))
+            .expect("journal");
         appender.seal().expect("seal one");
         appender
             .append_data(key(1), vec![0x33; 300], 0, Commit::PerRecord)
@@ -2303,18 +2178,18 @@ mod tests {
         appender.seal().expect("seal two");
 
         let mut image = sim.durable_image();
-        strip_footer(&mut image, "000001.reel");
+        strip_footer(&mut image, "000001.reel", journal);
         let torn = SimIo::from_image(image);
         let rebuilt = rebuild_on(&torn, IndexResidency::Paged);
 
         let rows = rebuilt.rows(RECORDS);
         assert!(
             !rows.iter().any(|(key, _)| key.as_slice() == [1u8; 34]),
-            "the walked old version shadows the sealed rewrite"
+            "the journaled old version shadows the sealed rewrite"
         );
         assert!(
             !rows.iter().any(|(key, _)| key.as_slice() == [3u8; 34]),
-            "the walked tombstone left a grave over the sealed rewrite"
+            "the journaled tombstone left a grave over the sealed rewrite"
         );
         assert!(
             rows.iter()
@@ -2323,8 +2198,8 @@ mod tests {
         );
     }
 
-    // a failed write's range is stamped, so records above it survive a reopen; the
-    // fault position is searched for since the op count moves with the write path
+    // a failed write lists no row, so records above it survive a reopen; the fault
+    // position is searched for since the op count moves with the write path
     #[test]
     fn a_failed_write_does_not_strand_later_records() {
         let mut produced = 0;
@@ -2341,6 +2216,9 @@ mod tests {
             let (Ok(_), Err(_), Ok(newest)) = (first, middle, last) else {
                 continue;
             };
+            if appender.flush().is_err() {
+                continue;
+            }
             produced += 1;
 
             let rebuilt = rebuild(&sim);
@@ -2376,6 +2254,7 @@ mod tests {
         let committed = appender
             .append_data(key(2), vec![0x22; 400], 0, Commit::PerRecord)
             .expect("torn");
+        appender.flush().expect("flush");
         corrupt_payload(&sim, u64::from(committed.loc.offset));
 
         let rebuilt = rebuild(&sim);
@@ -2480,9 +2359,9 @@ mod tests {
         appender.seal().expect("seal");
     }
 
-    // a footer with a corrupt magic falls back to a record scan
+    // a footer that rots after its seal leaves its rows unlisted, and no tail resumes into it
     #[test]
-    fn torn_footer_scans() {
+    fn a_rotted_footer_loses_its_rows() {
         let sim = SimIo::new(FaultPlan::new(1));
         sealed_pair(&sim);
         let length = segment_len(&sim, "000001.reel");
@@ -2492,20 +2371,35 @@ mod tests {
         write_at(&driver, file, length - 1, &[0xff]);
         let rebuilt = rebuild(&sim);
 
-        let found = keys_of(&rebuilt, RECORDS);
-        assert!(found.contains(&vec![1u8; 34]));
-        assert!(found.contains(&vec![2u8; 34]));
+        assert!(keys_of(&rebuilt, RECORDS).is_empty());
+        assert!(
+            !rebuilt.resumable.iter().any(|tail| tail.segment == SegmentId(1)),
+            "a tail would write into a sealed segment"
+        );
     }
 
-    // a segment sealed only partially, its footer missing, is record scanned
+    // a seal that stopped before its footer was whole reads back through the journal
     #[test]
-    fn partial_footer_scans() {
+    fn a_seal_cut_short_reads_its_journal() {
         let sim = SimIo::new(FaultPlan::new(1));
-        sealed_pair(&sim);
+        let shared = shared(config(SyncPolicy::Never), &sim);
+        let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
+        appender
+            .append_data(key(1), vec![0x11; 400], 0, Commit::PerRecord)
+            .expect("put");
+        appender
+            .append_data(key(2), vec![0x22; 600], 0, Commit::PerRecord)
+            .expect("put");
+        appender.flush().expect("flush");
+        let journal = sim
+            .durable_bytes(&journal_path(&Path::new(REEL_DIR).join("000001.reel")))
+            .expect("journal");
+        appender.seal().expect("seal");
         let mut image = sim.durable_image();
         let cut = footer_len_for(2);
 
         truncate_segment(&mut image, "000001.reel", cut);
+        image.push((journal_path(&Path::new(REEL_DIR).join("000001.reel")), journal));
         let torn = SimIo::from_image(image);
         let rebuilt = rebuild(&torn);
 

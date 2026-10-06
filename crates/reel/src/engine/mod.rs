@@ -420,6 +420,13 @@ impl ReelStore {
                     );
                 }
             }
+            // A journal outlives its segment's seal only when a crash lands between the
+            // two, and a resume a crash cut short leaves its part file.
+            for root in &roots {
+                if let Err(error) = crate::index::recovery::remove_stale_journals(&driver, root, &rebuilt.consumed) {
+                    tracing::warn!(root = %root.display(), "failed to remove stale journals: {error}");
+                }
+            }
         }
         // A reader starts its cursor where the rebuild left the volume, so its
         // first catch-up reads only what has been written since the open.

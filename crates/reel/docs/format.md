@@ -246,8 +246,8 @@ went bad after its seal has nothing that lists its records.
 ## Key runs
 
 A paged volume merges its walk's runs into a key run once more than eight stand
-over one key. Its file is `<id>.krun` with a twelve-digit id, written as
-`<id>.krun.part` until it is whole. The writer syncs it, renames it and syncs the
+over one key. Its file is `<id>.keys` with a twelve-digit id, written as
+`<id>.keys.part` until it is whole. The writer syncs it, renames it and syncs the
 directory, so a run under its own name is complete. An open unlinks any `.part` it
 finds, and any run a newer run covers whole.
 

@@ -37,7 +37,7 @@ const TRAILER: usize = 8 + 4 + 4 + 4;
 const MAGIC: u32 = u32::from_le_bytes(*b"KRUN");
 
 /// Every key run's file name ends in this, so no segment scan mistakes one for a segment
-pub const KEY_RUN_SUFFIX: &str = ".krun";
+pub const KEY_RUN_SUFFIX: &str = ".keys";
 
 /// Format a key run's file name from its id
 pub fn key_run_name(id: u64) -> String {

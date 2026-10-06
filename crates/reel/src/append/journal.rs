@@ -11,7 +11,7 @@ use crate::io::op::{FileId, WriteBuf};
 use crate::reel::segment::IoDriver;
 use crate::sync::{lock, try_lock};
 
-/// A mapped journal's file grows by this much at a time, so a reopen reads little past its rows
+/// A mapped journal's file grows by at most this much at a time, and by a sixteenth of its span when less
 const GROW: u64 = 1024 * 1024;
 
 /// One open segment's journal
@@ -148,7 +148,8 @@ impl Journal {
         let at = self.pushed.load(Ordering::Acquire);
         let end = at + pending.len() as u64;
         if end > mapped.grown.load(Ordering::Acquire) {
-            let grown = (end.div_ceil(GROW) * GROW).min(mapped.span.max(end));
+            let step = (mapped.span / 16).clamp(4096, GROW);
+            let grown = (end.div_ceil(step) * step).min(mapped.span.max(end));
             self.driver.truncate(mapped.id, grown)?;
             mapped.grown.store(grown, Ordering::Release);
         }

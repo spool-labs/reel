@@ -132,6 +132,10 @@ enum Run {
 
         /// Which of the footer's partitions holds this column
         partition: usize,
+
+        /// The lead of every `LEAD_STRIDE`th row, so a search over the rows starts
+        /// inside one stride of its answer
+        leads: Vec<u64>,
     },
 
     /// One column of a key run, its rows read in place, each naming its record's segment
@@ -139,6 +143,32 @@ enum Run {
         run: Arc<KeyRun>,
         column: usize,
     },
+}
+
+/// Rows between the sampled leads a footer run keeps
+///
+/// A sealed segment's rows are many, and a cursor opening at a bound binary searched all
+/// of them, a cache miss a probe. The samples are a few probes in cache, and leave the
+/// rows a stride or two to search.
+const LEAD_STRIDE: usize = 64;
+
+/// The lead of every `LEAD_STRIDE`th row of a partition
+fn sampled_leads(rows: &FooterPartition) -> Vec<u64> {
+    (0..rows.len())
+        .step_by(LEAD_STRIDE)
+        .map(|row| rows.key_at(row).map_or(0, lead_of))
+        .collect()
+}
+
+/// The rows a key can stand among, from the sampled leads
+///
+/// Rows before the last sample leading the key are below it, and rows from the first
+/// sample past its lead are above it. Equal leads settle nothing, so they widen the window.
+fn lead_window(leads: &[u64], key: &[u8], count: usize) -> (usize, usize) {
+    let lead = lead_of(key);
+    let below = leads.partition_point(|&held| held < lead);
+    let past = leads.partition_point(|&held| held <= lead);
+    (below.saturating_sub(1) * LEAD_STRIDE, (past * LEAD_STRIDE).min(count))
 }
 
 /// Where a cursor opened at a bound first stands in a key run's column
@@ -236,10 +266,18 @@ impl Head {
     ///
     /// A bound outside the rows' own range places the cursor at their near end with no
     /// search, which is every segment of a merged run but the one holding the bound.
-    fn placed(rows: &FooterPartition, way: Way, from: Bound<&[u8]>) -> Head {
+    fn placed(rows: &FooterPartition, leads: &[u64], way: Way, from: Bound<&[u8]>) -> Head {
         let count = rows.len();
         let (Some(low), Some(high)) = (rows.key_at(0), count.checked_sub(1).and_then(|last| rows.key_at(last))) else {
             return Head::SPENT;
+        };
+        let lower_bound = |key: &[u8]| {
+            let (start, end) = lead_window(leads, key, count);
+            rows.bound_within(key, start, end, false)
+        };
+        let upper_bound = |key: &[u8]| {
+            let (start, end) = lead_window(leads, key, count);
+            rows.bound_within(key, start, end, true)
         };
         let row = match (way, from) {
             (Way::Up, Bound::Included(key)) if key > high => None,
@@ -248,14 +286,14 @@ impl Head {
             (Way::Down, Bound::Excluded(key)) if key <= low => None,
             (Way::Up, Bound::Unbounded) => Some(0),
             (Way::Up, Bound::Included(key)) if key <= low => Some(0),
-            (Way::Up, Bound::Included(key)) => Some(rows.lower_bound(key)),
+            (Way::Up, Bound::Included(key)) => Some(lower_bound(key)),
             (Way::Up, Bound::Excluded(key)) if key < low => Some(0),
-            (Way::Up, Bound::Excluded(key)) => Some(rows.upper_bound(key)),
+            (Way::Up, Bound::Excluded(key)) => Some(upper_bound(key)),
             (Way::Down, Bound::Unbounded) => Some(count - 1),
             (Way::Down, Bound::Included(key)) if key >= high => Some(count - 1),
-            (Way::Down, Bound::Included(key)) => rows.upper_bound(key).checked_sub(1),
+            (Way::Down, Bound::Included(key)) => upper_bound(key).checked_sub(1),
             (Way::Down, Bound::Excluded(key)) if key > high => Some(count - 1),
-            (Way::Down, Bound::Excluded(key)) => rows.lower_bound(key).checked_sub(1),
+            (Way::Down, Bound::Excluded(key)) => lower_bound(key).checked_sub(1),
         };
         match row {
             Some(row) => Head::at(rows, way, row),
@@ -383,7 +421,7 @@ impl Sealed {
         let mut newest: Option<(SegmentId, FooterRow)> = None;
         while let Some(at) = self.front_on(key) {
             let (segment, found) = match self.run(at) {
-                Run::Footer { segment, footer, partition } => {
+                Run::Footer { segment, footer, partition, .. } => {
                     (*segment, footer.partitions[*partition].row_at(self.heads[at].last)?)
                 }
                 Run::Keys { run, column } => {
@@ -892,7 +930,8 @@ impl Paged<'_> {
                 let Some(partition) = footer.partitions.iter().position(|rows| rows.column == self.column) else {
                     continue;
                 };
-                runs.push(Run::Footer { segment, footer, partition });
+                let leads = sampled_leads(&footer.partitions[partition]);
+                runs.push(Run::Footer { segment, footer, partition, leads });
             }
             for run in self.key_runs.runs() {
                 if let Some(column) = run.columns().iter().position(|held| held.column == self.column) {
@@ -906,7 +945,9 @@ impl Paged<'_> {
         sealed.clear();
         for (index, run) in set.runs.iter().enumerate() {
             let head = match run {
-                Run::Footer { footer, partition, .. } => Head::placed(&footer.partitions[*partition], way, from),
+                Run::Footer { footer, partition, leads, .. } => {
+                    Head::placed(&footer.partitions[*partition], leads, way, from)
+                }
                 Run::Keys { run, column } => key_run_head(run, &run.columns()[*column], way, from),
             };
             if !head.is_spent {
@@ -1106,6 +1147,26 @@ mod tests {
             2,
             "one open per segment for the whole playback, not per page"
         );
+    }
+
+    // a cursor opened at a bound lands on the same row whichever stride the bound falls in
+    #[test]
+    fn a_bound_lands_inside_its_stride() {
+        let keys: Vec<u8> = (1..=200).collect();
+        let fixture = Fixture::new(&[(SegmentId(1), &keys)]);
+        fixture.seal(SegmentId(1), 1, 200);
+        for from in [0u8, 1, 2, 63, 64, 65, 127, 128, 129, 199, 200] {
+            let bound = [from; 8];
+            let mut up = PlaybackCursor::new(COLUMN, Way::Up, Bound::Included(&bound)).expect("up");
+            let want: Vec<u8> = (from.max(1)..=200).collect();
+            assert_eq!(fixture.drain(&mut up), want, "up from {from}");
+            let mut past = PlaybackCursor::new(COLUMN, Way::Up, Bound::Excluded(&bound)).expect("past");
+            let want: Vec<u8> = (from + 1..=200).collect();
+            assert_eq!(fixture.drain(&mut past), want, "up past {from}");
+            let mut down = PlaybackCursor::new(COLUMN, Way::Down, Bound::Included(&bound)).expect("down");
+            let want: Vec<u8> = (1..=from.min(200)).rev().collect();
+            assert_eq!(fixture.drain(&mut down), want, "down from {from}");
+        }
     }
 
     // a key the map deleted stays out of the merge, whatever a sealed run holds for it

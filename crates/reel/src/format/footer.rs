@@ -558,7 +558,12 @@ impl FooterPartition {
 
     /// Binary search for the first row past a key, counting equal rows or not
     fn bound(&self, key: &[u8], past_equal: bool) -> usize {
-        let (mut low, mut high) = (0usize, self.len());
+        self.bound_within(key, 0, self.len(), past_equal)
+    }
+
+    /// The same search over a window of rows the caller already knows holds the answer
+    pub fn bound_within(&self, key: &[u8], low: usize, high: usize, past_equal: bool) -> usize {
+        let (mut low, mut high) = (low, high.min(self.len()));
         while low < high {
             let middle = low + (high - low) / 2;
             let Some(found) = self.key_at(middle) else {

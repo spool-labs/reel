@@ -1,45 +1,58 @@
 # The on-disk format, and what each field is carrying
 
-Everything a volume holds is one shape repeated: a fixed header, a key, a payload.
-A sealed segment ends in a footer that indexes what it took. Beside the segments a
-paged volume keeps key runs, sorted rows its walks read in place of the footers
-they cover. This document says what the fields are for, not what the byte offsets are,
-which `format/` states once and does not need restating.
+A volume holds segments of records. A sealed segment ends in a footer that indexes
+what it took, and an open one keeps the same rows in a journal beside it until its
+seal. A record of 4 KiB or less is its check, its shape and its payload, and its key
+lives only in its row. Beside the segments a paged volume keeps key runs, sorted rows
+its walks read in place of the footers they cover. This document says what the
+fields are for, not what the byte offsets are, which `format/` states once and does
+not need restating.
 
-The format version is 4, stamped into every segment header record. A build
-meeting a version it cannot read refuses the whole file there, rather than
-truncating its walk at an unknown record kind and losing the tail silently.
+The format version is 6, stamped into every segment header record. A build meeting a
+version it cannot read refuses the whole file there.
 
-It moved from 3 for the batch frame, which is a record kind a version 3 walk has
-never seen. That walk would refuse the frame's flags byte and stop at it, taking
-the rest of the tail with it, which is exactly the silent loss the version number
-exists to prevent. A new kind in the segment stream is a version, every time.
+It moved from 5 for keyless records, whose prefix a version 5 build would read as a
+header. A new shape in the segment stream is a version, every time.
 
 ## A segment
 
 ```
 offsets rising
 +--------------------------------------------------------------+
-| segment header record      no sequence number, no key         |
+| segment header record      no sequence number, no key        |
 +--------------------------------------------------------------+
-| record | record | record | ...                                |
+| record | record | record | ...                               |
 +--------------------------------------------------------------+
-| record | pad | record | ...      pad only on a direct volume  |
-+--------------------------------------------------------------+
-| pad record bridging the reserved slack, written at the seal   |
-+--------------------------------------------------------------+
-| footer                                                        |
-|   column partitions | filter region | directory | fixed tail  |
-|   in column order                                     64 B    |
+| footer                                                       |
+|   column partitions | filter region | directory | fixed tail |
+|   in column order                                     64 B   |
 +--------------------------------------------------------------+
 ```
 
-Until the seal, the space past the write head is the reservation the tail took
-from the filesystem: it reads back as zeros, and the walk recognises that shape.
-The seal does not give it back. It fills the gap with one pad record and writes
-the footer past it, so the file's length never moves backwards.
+Until the seal, the space past the write head is the reservation the tail took from
+the filesystem and reads back as zeros. The seal cuts the file at its last record and
+writes the footer there, then unlinks the journal.
 
 ## A record
+
+A record whose payload is 4 KiB or less lies keyless:
+
+```
+| check, 8 | shape, 2 | payload |
+```
+
+The check is a SipHash-1-3 over the record's column, key width, kind, shape, the
+payload's CRC32C and its key, keyed by a 16-byte secret drawn at random for each
+segment and kept in its header record. The shape is the payload length, shifted up
+two bits over the codec. The record carries no key, no sequence number and no flags:
+its footer row holds them, or its journal row until the seal, and a reader that holds
+the key confirms the record by computing the check again. A writer choosing keys
+cannot make one key's record check as another's, since the secret is the segment's
+own.
+
+A larger record, and the segment header record, keep a header and the key, since a
+key is a small share of a large record and a window into one reads without the rest
+of its payload:
 
 ```
 | header, 21 bytes | key, the column's own width | payload |
@@ -52,15 +65,12 @@ the footer past it, so the file's length never moves backwards.
 ```
 
 The header is fixed size on purpose. The key is variable, because a column stores
-its keys at the width it declares rather than padded to the widest width any
-column declares, and the width lives in the fixed part, so a walk finds the next
-record without parsing a variable-length header first. That is the whole reason
-the width is a header field rather than something the column table is consulted
-for: recovery walks a segment before it knows which columns the volume serves.
+its keys at the width it declares, padded to nothing, and the width lives in the
+fixed part, so a reader knows where the payload starts before it reads the key.
 
 | field | bytes | what it is |
 |---|---|---|
-| length | 4 | payload bytes, or pad fill, following the key |
+| length | 4 | payload bytes following the key |
 | crc | 4 | CRC32C over the header with this field zeroed, then the key, then the payload |
 | lsn | 8 | append sequence number ordering this record within the volume |
 | flags | 1 | what kind of record it is, and how it was committed |
@@ -92,36 +102,21 @@ pays a pointer per key instead, and 108 is the width past which it does.
 
 ## The flags, and why some of them ride along
 
-The low five bits say what kind of record it is and are exclusive. The two above
-them say how it was committed and travel with a kind.
+The low five bits say what kind of record it is and are exclusive. The relocated bit
+says a compaction wrote the record and travels with a kind. A keyless record keeps
+its flags in its row, and its check covers the kind.
 
 | bit | value | meaning |
 |---|---|---|
 | none set | `0000_0000` | a data record with a payload |
 | tombstone | `0000_0001` | a delete of one key, no payload |
 | range tombstone | `0000_0010` | a delete of a half-open range, payload is the exclusive end |
-| pad | `0000_0100` | alignment filler, no payload written |
-| segment header | `0000_1000` | the first record of a segment, payload is the frozen header |
-| batch frame | `0001_0000` | the record opening a batch, payload is the run it declares |
-| batched | `0010_0000` | one record of a framed batch |
+| segment header | `0000_1000` | the first record of a segment, payload is the header |
 | relocated | `0100_0000` | compaction's copy of a record written earlier |
 
-The high bit is unclaimed, so the tripwire is both: a bit outside the kinds and
-the marks is refused, and so are the shapes made of legal bits that no writer
-produces, since the kind bits are exclusive and marks ride only on records a
-batch or a compaction can contain, which no control record is. Every byte a
-writer ever produced passes, and a torn flags byte fails before anything is read
-behind it.
-
-The last three exist for a reader that is not the writer.
-
-**batch frame** is what makes a batch atomic across a crash. The records of a
-batch take one contiguous reservation, and a frame at the front of it declares
-how many of them there are and how many bytes they take, so a rebuild keeps the
-run only when exactly that is there and verifies. **batched** rides every record
-of the run, so a record that reaches a walk without its frame is dropped rather
-than applied on its own. Without the pair there is nothing on disk that says
-where a batch starts or stops, and a crash inside one would half-apply.
+Every other bit is unclaimed, so a bit outside the kinds and the mark is refused,
+and so are the shapes made of legal bits that no writer produces. A torn flags byte
+fails before anything is read behind it.
 
 **relocated** is what a compaction copy needs. The copy carries the sequence
 number of the record it copied, because newest-wins has to resolve one version and
@@ -131,64 +126,62 @@ resolved. A reader following the log from outside has only the record, and witho
 this bit it would read a relocation as a write that lost an ordering race, discard
 it, and go on pointing into a segment about to be unlinked.
 
-Both are covered by the checksum, so neither can be stamped onto a record after
-the fact: a remarked record would carry the checksum of the record it used to be.
+The bit is covered by a keyed record's checksum and lives in a keyless record's row,
+so it cannot be stamped onto a record after the fact.
 
 ## Zero is not a record
 
-The sequence counter issues from one, so zero is reserved. Control records carry
-it, and a header that parses as a data record with a zero sequence number is
-unwritten space rather than a record.
-
-That case is not theoretical. A tail reserves space from the filesystem ahead of
-its write head, and that space reads back as zeros, which parse as an empty data
-record. A walk that did not recognise the shape would step through the whole
-reservation one header at a time to the end of the file.
+The sequence counter issues from one, so zero is reserved for the segment header
+record. A tail reserves space from the filesystem ahead of its write head, and that
+space reads back as zeros: a keyless prefix of zeros checks as unwritten, and a
+header of zeros parses as a data record with sequence number zero, which no writer
+issues. Either way a read of a place nothing wrote answers as stale, never as a
+record.
 
 ## Alignment, and who pays for it
 
-The block boundary is 4096. A pad record's header carries the fill length so a
-scan hops the gap in one step.
+The block boundary is 4096. Only a volume whose writes go straight to the device
+covers whole blocks, which today is the direct ring. There each write's span is
+rounded up to the boundary with zeros behind its records, so the next reservation
+starts on one. Nothing reads the zeros, since the rows list where every record sits.
+Every other backend has the kernel assemble the block and writes the records alone.
 
-Only a volume whose writes go straight to the device covers whole blocks, which
-today is the direct ring. There a record reserves an aligned span and closes with
-a pad, so the next reservation starts on a boundary. Every other backend has the
-kernel assemble the block, so the fill would be bytes copied into a page and never
-read back: the pad header alone is written, the space it names is reserved and
-reads back as zeros either way.
+## The journal
 
-## The batch frame record
-
-A batch of more than one record opens with one. It carries no key and no sequence
-number, since nothing resolves it and what orders the batch is the numbers its own
-records carry, and its payload is twelve bytes: a four byte record count then an
-eight byte span, both little endian.
+An open segment keeps its rows in a journal beside it, `<segment>.rows`, until its
+seal. Each write adds one group: the rows of the records it put down, a batch's rows
+together.
 
 ```
-| header, 21 bytes | count, 4 | span, 8 | record | record | ... |
-                                        \_________________________/
-                                           count records, span bytes
+| rows, 4 | bytes, 4 | row | row | ... | crc32c, 4 |
+
+row: | column, 1 | key width, 2 | key | lsn, 8 | offset, 4 | length, 4 | flags, 1 | range end |
 ```
 
-The span is measured from the end of the frame, so a walk that trusts the frame
-knows where the batch ends before it has read any of it. Thirty-three bytes a
-batch, and a batch of one record is written without a frame at all.
+A range tombstone's row carries its exclusive end behind its length, `0xFFFF` for
+none. The CRC covers the group's head and rows, so a group a crash cut short fails it
+and the journal ends there.
 
-Both numbers are checksummed with the header, so neither can be edited after the
-fact, and both are checked: a run of the right byte count in the wrong number of
-records is refused, as is the reverse. The frame's own declaration is refused
-before it is walked if it counts fewer than two records or claims a span too small
-to hold the records it counts, since no writer produces either.
+A flush writes the pending groups and syncs the journal beside the segment, and
+writeback pacing writes them too. A reopen reads the journal's whole groups and keeps
+a group only when every record it lists sits where its row says and checks out, so a
+batch comes back whole or not at all. A resumed tail writes the accepted rows again
+as a fresh journal, renamed over the old one. The seal writes the footer and unlinks
+the journal, and an open unlinks any journal whose segment has a footer.
 
-The frame and its records go down in one vectored write inside one reservation,
-which is also what keeps them in one segment: a reservation that runs past the end
-of the segment is given up whole and retaken on the next one.
+Two things follow from the key living only in the rows. On a volume that syncs
+`Never` or by `Bytes`, a crash of the process loses what was written since the
+journal last went down, as a crash of the machine does: at most one pace or one sync
+threshold. And a footer that rots after its seal leaves its segment's records
+unlisted, since no walk can find a keyless record's key. A volume with peers repairs
+them from a peer.
 
 ## The segment header record
 
-Every segment opens with one, and its payload layout is frozen: a two byte format
-version and a four byte segment number. It takes no sequence number and no key,
-since nothing resolves it.
+Every segment opens with one. Its payload opens with a frozen prefix, a two byte
+format version and a four byte segment number, then the band the tail drew under, a
+layout byte, and the 16-byte secret its keyless records are checked under. It takes
+no sequence number and no key, since nothing resolves it.
 
 Frozen means an older build can read the version and segment number of a file a
 newer build wrote, so a longer payload from a future version parses rather than
@@ -207,12 +200,11 @@ sit together, sorted by key, fixed-stride at that column's own key width.
 | column partitions, in column order | reserved filter region | directory | fixed tail |
 ```
 
-One row is the key, then the sequence number, the offset, the payload length,
-the record's own flags, which is 17 bytes past the key. A partition whose keys
-are all one width strides at it. One whose keys vary is prefix compressed
-instead, `format/prefix.rs`'s restart-block encoding, because its keys are
-names and sorted names share their fronts; the parse rebuilds whole rows, so
-the encoding lives only on disk. The directory names each
+One row is the key, then the sequence number, the offset, the payload length and the
+record's flags. A partition packs its rows with `format/prefix.rs`'s restart-block
+encoding: keys prefix compressed where their sorted fronts share enough to pay for it,
+and each row's tail stored as varint differences from the row before. The parse
+rebuilds whole rows, so the encoding lives only on disk. The directory names each
 partition by column, key width, row count and encoded span, which is what lets
 the rows stride at the natural width instead of the widest one. The fixed tail is 64 bytes and
 holds, reading backwards from the end: the magic, the footer length, the footer's
@@ -228,8 +220,8 @@ the bytes it will occupy and nothing more.
 Three things about the footer are worth saying because they are decisions rather
 than layout:
 
-**Pads and segment headers are not listed.** A reader never resolves those by key,
-so a footer indexes only what a key can reach.
+**Segment headers are not listed.** A reader never resolves one by key, so a footer
+indexes only what a key can reach.
 
 **The flags byte is in the row.** A length of zero belongs to a point tombstone
 and to an empty data record alike, and a rebuild that could not tell them apart
@@ -244,8 +236,9 @@ Anything more is a format version.
 
 The footer's checksum covers the whole footer with its own field zeroed, including
 the length and the magic. A footer whose magic is wrong, whose length is out of
-range, or whose checksum fails is not a footer, and the segment falls back to the
-record walk, which is also what a segment sealed only part way through gets.
+range, or whose checksum fails is not a footer. A segment whose seal stopped part
+way through still has its journal and reads back through it, and one whose footer
+went bad after its seal has nothing that lists its records.
 
 ## Key runs
 
@@ -343,7 +336,8 @@ Named because each is cheap now and expensive later.
 - **The checksum algorithm.** A stored value is only reproducible under the
   algorithm that produced it. `checksum.md` is the record of the one change made
   here and why it will not be made again.
-- **The record header layout.** Fixed size and read by every walk.
+- **The record header layout and the keyless prefix.** Every read of a record parses
+  one or the other.
 - **The footer row shape.** Which is why the value inlining shared the deadline
   the checksum had, and it met it: values at or below a 4 byte ceiling ride in
   the row and the entry, landed while the format was open.

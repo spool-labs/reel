@@ -437,7 +437,9 @@ fn sweep(engine: &ReelStore, file: &SegmentFile, indexed: bool, watch: &mut Watc
             sweep_rows(&mut file, listed, layout, &mut row, watch);
         }
         Ok(None) => {
-            let journal = std::fs::read(journal_path(path)).unwrap_or_default();
+            let Ok(journal) = std::fs::read(journal_path(path)) else {
+                return row.faulted(format!("{name} has no footer, and no journal lists its records"));
+            };
             let (groups, _) = read_groups(&journal);
             let listed = groups
                 .into_iter()

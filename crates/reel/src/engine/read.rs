@@ -575,8 +575,7 @@ impl ReelStore {
     /// at that number.
     pub fn read_as_of(&self, key: &RecordKey, at: Lsn) -> Result<Option<Value>> {
         self.check_column(key)?;
-        // The spot index holds a key's newest sealed version, which answers in one read
-        // when the cue can see it.
+        // The spot index holds a key's newest sealed version, one read away when the cue can see it
         if let Some((column, since)) = self.index.spot_route_at(key) {
             let lookup = self.index.spot_column(column).read_versioned(key)?;
             match self.index.spot_finish_at(column, key, since, at, lookup) {
@@ -716,7 +715,7 @@ impl ReelStore {
         resolving.give_up(self, key)
     }
 
-    /// A key's newest payload as a future, one read of each spot index candidate it needs
+    /// A key's newest payload as a future, reading each needed spot index candidate once
     async fn spot_read_wait(&self, key: &RecordKey) -> Result<Lookup> {
         let (at, since) = match self.index.spot_route(key) {
             SpotRoute::Settled(lookup) => return Ok(lookup),
@@ -751,7 +750,7 @@ impl ReelStore {
         Ok(Lookup::Unsettled)
     }
 
-    /// The one spot index candidate a range read can go straight to, when the key has one
+    /// Look up the key's sole spot index candidate so a range read can go straight to it
     fn spot_range_candidate(&self, key: &RecordKey) -> Option<(usize, Since, Candidate)> {
         let SpotRoute::Column(at, since) = self.index.spot_route(key) else {
             return None;
@@ -759,7 +758,7 @@ impl ReelStore {
         Some((at, since, self.index.spot_column(at).sole(key)?))
     }
 
-    /// What a spot index range read answers, or nothing for the checked path to settle
+    /// Turn a spot index range read into an answer, or nothing when the checked path must settle it
     fn spot_range_answer(
         &self,
         at: usize,

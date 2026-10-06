@@ -113,7 +113,7 @@ const COMPACT_PAYLOAD: usize = 3000;
 /// Records written into the compaction source segment before overwrites
 const COMPACT_FILL: u8 = 4;
 
-/// Segment size the merge stream rolls, about one round of its keys
+/// The merge stream rolls a segment of this size, about one round of its keys
 const MERGE_SEG_BYTES: u64 = 20 * 1024;
 
 /// Keys the merge stream writes per round
@@ -348,8 +348,7 @@ fn a_sole_copy_footer_never_outlives_its_records() {
     }
 }
 
-/// A paged stream that seals several times, its overwrites and deletes leaving keys with
-/// versions in more than one segment for the open to settle
+/// A stream that seals several times, leaving keys with versions in more than one segment
 fn sealing_stream() -> Vec<StreamOp> {
     let mut ops: Vec<StreamOp> = (1..=5u8)
         .map(|address| put(GROUP, address, SEAL_PAYLOAD, address))
@@ -375,16 +374,13 @@ fn sealing_stream() -> Vec<StreamOp> {
 }
 
 // every crash boundary of a paged stream reopens with the spot index answering as the footers do
-//
-// Records roll the tight segment, so the stream seals several times, and the overwrites
-// and deletes leave keys with versions in more than one segment for the open to settle.
 #[test]
 fn every_boundary_spot_index_answers_as_the_footers() {
     let ops = sealing_stream();
     let keys: Vec<RecordKey> = (1..=6u8)
         .map(|address| RecordKey::from_bytes(RECORDS, &wire_key(GROUP, address)).expect("key"))
         .collect();
-    // Unsynced, since what is compared is the two paths over whatever landed.
+    // Unsynced, since the test compares the two read paths over whatever landed
     let paged = ReelConfig {
         index: IndexResidency::Paged,
         ..crash_config(1, SyncPolicy::Never, SEGMENT_SMALL)
@@ -397,8 +393,7 @@ fn every_boundary_spot_index_answers_as_the_footers() {
     for crash_at in 0..total {
         let (sim, _) = harness.run(FaultPlan::new(1).with_crash(crash_at), &ops);
         let reopened = harness.reopen(sim.durable_image());
-        // A paged open counts nothing in a sealed segment, so while one stands the
-        // counters are a floor, as the fixture holds them.
+        // A paged open counts no sealed segment, so while one stands the counters are a floor
         match reopened.born_segments() {
             0 => assert_recount(&reopened, crash_at),
             _ => assert!(
@@ -407,7 +402,7 @@ fn every_boundary_spot_index_answers_as_the_footers() {
             ),
         }
         loaded = loaded.max(reopened.index().spot_held());
-        // As of a cue, a read takes the footer search, which is the answer to match.
+        // A read as of a cue takes the footer search, the answer to match
         let cue = reopened.cue().expect("cue");
         for key in &keys {
             let live = reopened.get(key).expect("get").map(|value| value.to_vec());
@@ -425,9 +420,6 @@ fn every_boundary_spot_index_answers_as_the_footers() {
 }
 
 // every crash boundary of a paged stream reopens with its walks answering as the gets do
-//
-// Walks up, down and of keys alone merge the map with the footers, and each has to
-// match the gets.
 #[test]
 fn every_boundary_walks_answer_as_the_gets() {
     let ops = sealing_stream();
@@ -675,9 +667,6 @@ const TORN_BATCH: &[u8] = &[4, 5, 6];
 const NEIGHBOUR: u8 = 9;
 
 /// Where inside a batch a write is cut off
-///
-/// The first record, one in the middle and the last: a writev that stopped at any of
-/// them leaves a run that must not be applied at all.
 #[derive(Clone, Copy, Debug)]
 enum Tear {
     FirstRecord,
@@ -686,11 +675,6 @@ enum Tear {
 }
 
 // a batch cut off part way through leaves nothing of itself behind
-//
-// The reservation is one range and the write is one writev, so a crash inside it lands
-// at some byte of the run and the bytes past it stay the zeros the tail reserved. The
-// batch's rows journal as one group, and recovery keeps a group only when every record
-// it lists checks out, so a run that stops short is dropped whole.
 #[test]
 fn a_torn_batch_leaves_nothing_of_itself() {
     for tear in [Tear::FirstRecord, Tear::MidBatch, Tear::LastRecord] {
@@ -792,10 +776,6 @@ fn address_key(address: u8) -> RecordKey {
 }
 
 /// Cut the last batch of the image at a point inside it, as a stopped write would
-///
-/// Everything from the cut to the end of the segment goes back to the zeros the tail
-/// had reserved there, which is what a writev that never got that far leaves. The batch
-/// is found through the journal, whose group of more than one row is a batch's.
 fn cut_the_last_batch(image: &mut DurableImage, tear: Tear) {
     let journals: Vec<(std::path::PathBuf, Vec<u8>)> = image
         .iter()
@@ -821,13 +801,13 @@ fn cut_the_last_batch(image: &mut DurableImage, tear: Tear) {
     panic!("no segment of the image holds a batch");
 }
 
-/// Where in the last batch a journal lists a tear falls
+/// Find the tear's offset inside the journal's last batch
 fn tear_offset(journal: &[u8], tear: Tear) -> Option<u64> {
     let (groups, _) = read_groups(journal);
     let batch = groups.into_iter().rev().find(|group| group.len() > 1)?;
     let mut starts: Vec<u64> = batch.iter().map(|row| u64::from(row.offset)).collect();
     starts.sort_unstable();
-    // Past a record's own check, so the bytes that tear are its payload.
+    // Past a record's own check, so the bytes that tear are its payload
     let inside = KEYLESS_PREFIX as u64;
     Some(match tear {
         Tear::FirstRecord => starts[0] + inside,
@@ -956,11 +936,6 @@ fn mid_compaction() {
 }
 
 // a crash in the middle of a key merge keeps every live key and keeps the deleted one dead
-//
-// A key merge writes its run whole under a part name and renames it in, and it moves no
-// record, so a reopen finds the run or finds none. Gets and walks have to answer as the
-// segments do either way. The delete is the gate: its row shadows the versions under it
-// in the run, and losing it hands one of them back to a walk.
 #[test]
 fn mid_key_merge() {
     let harness = ReelHarness::new(key_merge_config());
@@ -989,13 +964,13 @@ fn mid_key_merge() {
         let reopened = harness.reopen(sim.durable_image());
         assert_merged_answers(&reopened, crash_at);
 
-        // And the merge goes again, so the crash left a volume a merge can still work on.
+        // A second merge proves the crash left a volume a merge can still work on
         let _ = reopened.merge_when_due();
         assert_merged_answers(&reopened, crash_at);
     }
 }
 
-/// A paged volume, whose walk a key merge folds once it stacks past the merge depth
+/// A paged volume, where a key merge folds the walk once it stacks past the merge depth
 fn key_merge_config() -> ReelConfig {
     ReelConfig {
         index: IndexResidency::Paged,
@@ -1003,15 +978,12 @@ fn key_merge_config() -> ReelConfig {
     }
 }
 
-/// The fill a key holds in one round of the merge stream
+/// A key's fill in one round of the merge stream
 fn merge_fill(round: u8, address: u8) -> u8 {
     round * 16 + address
 }
 
 /// Write rounds over the same keys, then the delete and enough after it to seal it
-///
-/// Each round overwrites every key and rolls about one segment, so every sealed segment
-/// reaches across the keys and the walk's depth grows a segment a round.
 fn write_merge_setup(store: &ReelStore) {
     for round in 1..=MERGE_ROUNDS {
         for address in 1..=MERGE_KEYS {

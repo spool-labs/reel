@@ -1,15 +1,5 @@
 //! Walks of a paged column answer as a model does, through writes, deletes, seals, compaction and reopens
-//!
-//! One column holds 16 byte keys spread like hashes, on a paged volume, and walks its
-//! sealed keys out of the footers. A second run holds keys of every width up to 24 bytes,
-//! each a prefix of the longer keys cut from the same stem, with zero bytes inside them. Every walk shape is checked against a model of what
-//! the column holds: whole walks both ways, walks from a bound, ranges, prefixes, keys
-//! alone, and walks the caller stops early. Checks follow maintenance, so a walk meets a
-//! compaction pass that has just retired a segment.
-//!
-//! Knobs: REEL_PWM_SEEDS (how many seeds, default 6), REEL_PWM_FIRST (the first seed,
-//! default 1), REEL_PWM_OPS (ops a seed runs, default 3000) and REEL_PWM_SEED (one seed
-//! to replay).
+//! Knobs: REEL_PWM_SEEDS (default 6), REEL_PWM_FIRST (default 1), REEL_PWM_OPS (ops per seed, default 3000), REEL_PWM_SEED (replays one seed)
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -38,7 +28,7 @@ const fn rows(key_width: KeyWidth) -> ColumnSpec {
 const FIXED: ColumnSet = &[rows(KeyWidth::Fixed(16))];
 const VARIABLE: ColumnSet = &[rows(KeyWidth::Variable)];
 
-/// Widest key the variable run writes, every width from one byte up cut from one stem
+/// The variable run cuts one key of every width up to this from each stem
 const STEM: usize = 24;
 
 /// What the run's keys look like
@@ -68,7 +58,7 @@ impl Shape {
                 let mut key: Vec<u8> = (0..3)
                     .flat_map(|word| mix(stem * 3 + word).to_be_bytes())
                     .collect();
-                // Zeros inside a key sort it past the shorter key a zero fill would make it equal.
+                // Zero bytes inside keys catch an order that pads the shorter key with zeros
                 key[3] = 0;
                 key[9] = 0;
                 key.truncate(n as usize % STEM + 1);
@@ -77,7 +67,7 @@ impl Shape {
         }
     }
 
-    /// A key past every key the run writes
+    /// A key that sorts past every key in the run
     fn top(self) -> Vec<u8> {
         match self {
             Shape::Fixed => vec![0xFF; 16],
@@ -113,7 +103,7 @@ impl Shape {
     }
 }
 
-/// Distinct keys a run writes, deletes and walks
+/// A run writes, deletes and walks this many distinct keys
 const KEYS: u64 = 2000;
 
 /// What the column should hold, key to value
@@ -163,7 +153,7 @@ fn config(rng: &mut SmallRng) -> ReelConfig {
     }
 }
 
-/// The first place two walks part, as the keys on each side, or nothing when they agree
+/// Describes where two walks first part, with the keys on each side, or returns nothing when they agree
 fn parting(got: &[(Vec<u8>, Vec<u8>)], want: &[(Vec<u8>, Vec<u8>)]) -> Option<String> {
     let at = (0..got.len().max(want.len())).find(|&at| got.get(at) != want.get(at))?;
     let side = |rows: &[(Vec<u8>, Vec<u8>)]| {
@@ -208,7 +198,7 @@ fn expect(
     }
 }
 
-/// Every walk shape against the model
+/// Checks every walk shape against the model
 fn check(
     store: &ReelStore,
     model: &Model,
@@ -277,7 +267,7 @@ fn check(
             .collect();
         assert_eq!(keys, want, "seed {seed} {stage}: keys up from {bound:02x?}");
 
-        // A walk the caller stops early, sized by a hint, still starts in the right place.
+        // A walk the caller stops early, sized by a hint, still starts in the right place
         let hint = [1usize, 3, 17][rng.gen_range(0..3)];
         let mut lent = store
             .iter_lent("rows", Some(&bound), Direction::Asc, hint)
@@ -325,11 +315,11 @@ fn run(seed: u64, shape: Shape) {
                 Store::delete(&store, "rows", &shape.key(n)).expect("delete");
                 model.remove(&shape.key(n));
             }
-            // A narrow range, about one 256th of the key space, so the column keeps keys to walk.
+            // Narrow ranges leave the column keys to walk
             _ => {
                 let low = shape.key(n);
                 let high = shape.range_end(&low);
-                // A saturated byte can leave the end at or before the key, an empty range.
+                // A saturated byte can leave the end at or before the key
                 if high > low {
                     Store::delete_range(&store, "rows", &low, &high).expect("delete range");
                     let gone: Vec<Vec<u8>> = model
@@ -390,11 +380,13 @@ fn seeds(shape: Shape) {
     }
 }
 
+// walks over sixteen byte keys spread like hashes answer as the model does
 #[test]
 fn walks_answer_as_the_model() {
     seeds(Shape::Fixed);
 }
 
+// walks over keys of every width, each a prefix of the longer ones, answer as the model does
 #[test]
 fn walks_of_every_key_width_answer_as_the_model() {
     seeds(Shape::Variable);

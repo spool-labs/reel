@@ -105,9 +105,7 @@ impl Entry {
     }
 }
 
-/// On-disk footprint of a record with this key width and payload length
-///
-/// A small record lies keyless, its prefix standing in for its header and key.
+/// On-disk footprint of a record with this key width and payload length, keyless when small
 pub fn span_of(key_width: u16, len: u32) -> u64 {
     RecordLayout::KEYLESS.prefix_len(key_width as usize, len) as u64 + u64::from(len)
 }

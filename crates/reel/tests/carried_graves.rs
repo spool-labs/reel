@@ -1,10 +1,4 @@
-//! A tombstone compaction copies keeps its key out of walks, and never hides a newer put
-//!
-//! On a paged volume a sealed tombstone has no grave in the map: a reopen rebuilds the
-//! map from what is unsealed, and the prune gives a grave up once its segment is noted.
-//! A pass that copies the tombstone retires that segment, so until the copy's own
-//! segment is noted the copy stands as a grave in the map. That grave must never stand
-//! over a version newer than the tombstone, wherever the newer version sits.
+//! A tombstone copied by compaction keeps its key out of walks and never hides a newer put
 
 use tempfile::TempDir;
 
@@ -29,7 +23,7 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
 /// A segment no tail will reach, standing in for a copy's segment
 const COPY: SegmentId = SegmentId(u32::MAX - 1);
 
-/// Filler keys a round writes, enough to roll a segment more than once
+/// Each round writes this many filler keys, enough to roll a segment more than once
 const FILL: u32 = 400;
 
 fn paged(dir: &TempDir) -> ReelStore {
@@ -68,8 +62,6 @@ fn filler(n: u32) -> Vec<u8> {
 }
 
 /// Write a round's own fillers, then let maintenance note and hand over what sealed
-///
-/// Each round has keys of its own, so a round kills nothing an earlier one wrote.
 fn fill(store: &ReelStore, round: u32) {
     write_round(store, round, round as u8);
 }
@@ -81,8 +73,7 @@ fn overwrite(store: &ReelStore, round: u32, with: u8) {
 
 fn write_round(store: &ReelStore, round: u32, with: u8) {
     write_only(store, round, with);
-    // A flush waits out the seals the round started, so the maintenance after it finds
-    // every segment the round rolled off sealed.
+    // The flush waits out the round's seals, so maintenance finds every rolled segment sealed
     store.flush().expect("flush");
     for _ in 0..3 {
         Store::maintain(store).expect("maintain");
@@ -113,24 +104,25 @@ fn record_key() -> RecordKey {
     RecordKey::from_bytes(ColumnId(1), &the_key()).expect("key")
 }
 
+// a tombstone copied by compaction keeps its key out of walks and gets
 #[test]
 fn a_carried_tombstone_keeps_its_key_out_of_walks() {
     let dir = TempDir::new().expect("temp dir");
     let store = paged(&dir);
-    // The first version seals with fillers that stay live, so its segment never compacts.
+    // The first version seals with fillers that stay live, so its segment never compacts
     Store::put(&store, "rows", &the_key(), b"first").expect("put");
     fill(&store, 1);
-    // The tombstone seals beside fillers that are written again, so its segment does.
+    // The tombstone seals beside fillers that are written again, so its segment does
     Store::delete(&store, "rows", &the_key()).expect("delete");
     fill(&store, 2);
     let store = reopen(store, &dir);
     write_only(&store, 2, 3);
-    // Walked right after the pass that copies it, before anything notes the copy's segment.
+    // Walked right after the pass that copies it, before anything notes the copy's segment
     let mut is_copied = false;
     for _ in 0..8 {
         let carried = store.compaction_counters().tombstones_carried;
         store.compact_once().expect("compact");
-        // The walk goes first: a get notes the segments that sealed, which would close the window.
+        // The walk goes first: a get notes the segments that sealed, which would close the window
         if store.compaction_counters().tombstones_carried > carried {
             is_copied = true;
             assert!(
@@ -146,6 +138,7 @@ fn a_carried_tombstone_keeps_its_key_out_of_walks() {
     );
 }
 
+// a grave for an older delete never stands over a newer put already handed over
 #[test]
 fn a_grave_refuses_a_put_already_handed_over() {
     let dir = TempDir::new().expect("temp dir");
@@ -171,6 +164,7 @@ fn a_grave_refuses_a_put_already_handed_over() {
     assert!(walked(&store), "a walk lost the second put");
 }
 
+// a grave for a delete with nothing newer hides the key from gets and walks
 #[test]
 fn a_grave_stands_for_a_key_with_nothing_newer() {
     let dir = TempDir::new().expect("temp dir");
@@ -195,6 +189,7 @@ fn a_grave_stands_for_a_key_with_nothing_newer() {
     assert!(!walked(&store), "a walk found the deleted key");
 }
 
+// compaction drops a tombstone under a newer put, so the put still reads back
 #[test]
 fn a_put_after_a_delete_survives_compacting_its_tombstone() {
     let dir = TempDir::new().expect("temp dir");
@@ -203,7 +198,7 @@ fn a_put_after_a_delete_survives_compacting_its_tombstone() {
     fill(&store, 1);
     Store::delete(&store, "rows", &the_key()).expect("delete");
     fill(&store, 2);
-    // The second version seals and is handed over, so only the spot index holds it.
+    // The second version seals and is handed over, so only the spot index holds it
     Store::put(&store, "rows", &the_key(), b"second").expect("put again");
     fill(&store, 3);
     overwrite(&store, 2, 4);

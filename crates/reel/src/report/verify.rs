@@ -1,8 +1,6 @@
 //! Sweep a volume's records against their checksums
 //!
-//! A sealed segment is swept through its footer and an open one through its journal,
-//! each listing where its records sit. Nothing here writes, and nothing is repaired.
-//! A sweep only means what it says on a volume nothing is appending to.
+//! Nothing here writes, and a sweep only holds while nothing appends to the volume
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -457,10 +455,7 @@ fn sweep(engine: &ReelStore, file: &SegmentFile, indexed: bool, watch: &mut Watc
     row
 }
 
-/// How a segment file frames its records, read off its header record
-///
-/// A file whose header will not parse reads as keyed, which no segment this build
-/// writes is, and the sweep reports it.
+/// How a segment file frames its records, falling back to keyed so a bad header gets reported
 fn layout_of(file: &mut File) -> RecordLayout {
     let Ok(head) = read_at(file, 0, (HEADER_LEN + SEGMENT_HEADER_SPAN) as u64) else {
         return RecordLayout::Keyed;
@@ -478,10 +473,6 @@ fn layout_of(file: &mut File) -> RecordLayout {
 }
 
 /// Check every record a footer or a journal lists, against the row it came through
-///
-/// A keyless record's check covers the key and kind its row holds, under the key its
-/// segment header holds. A record past the keyless ceiling keeps its header and
-/// checks against its own checksum.
 fn sweep_rows(
     file: &mut File,
     mut listed: Vec<(RecordKey, u32, u32, Flags)>,
@@ -489,7 +480,7 @@ fn sweep_rows(
     row: &mut VerifyRow,
     watch: &mut Watch,
 ) {
-    // Ascending, so a sweep of a spinning disk reads the file forwards.
+    // Ascending, so a sweep of a spinning disk reads the file forwards
     listed.sort_unstable_by_key(|(_, offset, _, _)| *offset);
     for (key, offset, len, flags) in listed {
         let Some(check) = layout.keyless_key(len) else {

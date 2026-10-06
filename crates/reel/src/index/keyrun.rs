@@ -1,18 +1,5 @@
 //! Key runs: sorted rows pointing at each record where it lies, merged without moving one
-//!
-//! A merge writes the rows of the runs it collapses into one key run and leaves every
-//! record where it was written, so neither the spot index nor the map hears of it. Data
-//! segments keep their own footers, which stay the authority for point reads and for
-//! recovery: a key run is derived from them, a walk reads it in place of the footers it
-//! covers, and a key run that is lost only gives those footers back to the walk.
-//!
-//! A file holds each column's rows back to back, then each column's fence of block leads,
-//! the segments the run covers, a directory and a trailer. A row is the key, then the
-//! sequence number, the segment, offset and length of the record, and its flags. A column
-//! of one key width lays its rows at a fixed stride. One whose keys vary in width puts
-//! each key's length ahead of it and a table of where each row starts after the rows. A
-//! block is a span of rows a search lands in and nothing on disk. A run is mapped whole
-//! for its life, so a walk reads its rows in place.
+//! Footers still serve point reads and recovery, so a lost run just returns its segments to the walk
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -29,30 +16,30 @@ use crate::io::mapping::Mapping;
 use crate::io::op::{FileId, WriteBuf};
 use crate::reel::segment::IoDriver;
 
-/// Bytes of rows one fence lead stands for, so a search touches a page or two of rows
+/// One fence lead covers this many bytes of rows, so a search touches a page or two
 const BLOCK_BYTES: usize = 8 * 1024;
 
-/// Bytes a row takes past its key: sequence, segment, offset, length and flags
+/// A row takes this many bytes past its key: sequence, segment, offset, length and flags
 pub const ROW_TAIL: usize = 8 + 4 + 4 + 4 + 1;
 
-/// Bytes the writer gathers before it writes, so rows go down in large writes
+/// The writer gathers this many bytes before each write, so rows go down in large writes
 const WRITE_BYTES: usize = 1 << 20;
 
-/// Rows one block of a column of varying key widths holds
+/// A block of a varying-width column holds this many rows
 const VARYING_BLOCK_ROWS: u32 = 128;
 
-/// Bytes one directory row takes: column, width, block rows, rows, rows at, row bytes, fences at
+/// A directory row takes this many bytes: column, width, block rows, rows, rows at, row bytes, fences at
 const DIRECTORY_ROW: usize = 1 + 2 + 4 + 8 + 8 + 8 + 8;
 
-/// Bytes the trailer takes: directory at, columns, covered count, magic
+/// The trailer takes this many bytes: directory at, columns, covered count, magic
 const TRAILER: usize = 8 + 4 + 4 + 4;
 
 const MAGIC: u32 = u32::from_le_bytes(*b"KRUN");
 
-/// What a key run's file name ends in, which no segment scan takes for a segment
+/// Every key run's file name ends in this, so no segment scan mistakes one for a segment
 pub const KEY_RUN_SUFFIX: &str = ".krun";
 
-/// The name a key run's file takes, and the name it is written under until it is whole
+/// Format a key run's file name from its id
 pub fn key_run_name(id: u64) -> String {
     format!("{id:012}{KEY_RUN_SUFFIX}")
 }
@@ -83,22 +70,22 @@ pub struct RunRow {
 /// One column's rows in a key run
 #[derive(Clone, Debug)]
 pub struct RunColumn {
-    /// Column every row belongs to
+    /// Every row belongs to this column
     pub column: ColumnId,
 
-    /// Width every key in the column has, or VARYING_WIDTH where each row says its own
+    /// Every key in the column has this width, or VARYING_WIDTH where each row says its own
     pub key_width: u16,
 
-    /// Rows one block holds, the last block holding the rest
+    /// Each block holds this many rows, the last one holding the rest
     block_rows: u32,
 
-    /// Rows the column holds
+    /// The column's row count
     rows: u64,
 
     /// Where the column's first row lies in the file
     rows_at: u64,
 
-    /// Bytes the rows take, ahead of a varying column's table of where each starts
+    /// The rows' length in bytes, ahead of a varying column's table of row starts
     rows_len: u64,
 
     /// Each block's first key, back to back
@@ -112,7 +99,7 @@ pub struct RunColumn {
 }
 
 impl RunColumn {
-    /// Bytes one row takes, in a column of one key width
+    /// Row size in bytes, in a column of one key width
     pub fn stride(&self) -> usize {
         self.key_width as usize + ROW_TAIL
     }
@@ -122,7 +109,7 @@ impl RunColumn {
         self.key_width == VARYING_WIDTH
     }
 
-    /// Bytes the column's region takes: its rows, and a varying column's table of starts
+    /// The region's length in bytes: its rows, and a varying column's table of starts
     fn region_len(&self) -> u64 {
         match self.is_varying() {
             true => self.rows_len + self.rows * 8,
@@ -130,17 +117,17 @@ impl RunColumn {
         }
     }
 
-    /// Rows the column holds
+    /// The column's row count
     pub fn rows(&self) -> u64 {
         self.rows
     }
 
-    /// Blocks the column's rows fill
+    /// The column's block count
     pub fn blocks(&self) -> u32 {
         self.rows.div_ceil(u64::from(self.block_rows)) as u32
     }
 
-    /// Rows one block holds, short only at the end
+    /// Rows per block, fewer only in the last one
     pub fn block_rows(&self) -> u32 {
         self.block_rows
     }
@@ -160,9 +147,6 @@ impl RunColumn {
     }
 
     /// The block holding the first row at or past a key
-    ///
-    /// The last block whose lead is at or below the key. A key below every lead lands
-    /// on the first block, and the row search inside it settles the rest.
     pub fn block_for(&self, key: &[u8]) -> u32 {
         let (mut low, mut high) = (0u32, self.blocks());
         while low < high {
@@ -175,7 +159,7 @@ impl RunColumn {
         low.saturating_sub(1)
     }
 
-    /// The span of rows one block holds, as a row index and a count
+    /// One block's first row index and row count
     pub fn block_span(&self, block: u32) -> (u64, u32) {
         let first = u64::from(block) * u64::from(self.block_rows);
         let count = (self.rows - first).min(u64::from(self.block_rows)) as u32;
@@ -183,10 +167,7 @@ impl RunColumn {
     }
 }
 
-/// Where a key run's bytes are read from
-///
-/// A file on a real filesystem is mapped, and one the volume's driver alone can reach,
-/// as a simulated one, is read whole.
+/// A key run's bytes, mapped from a real file or read whole through the driver
 enum Backing {
     Mapped(Mapping),
     Read(Vec<u8>),
@@ -219,10 +200,10 @@ pub struct KeyRun {
     /// Each column's rows, in column order
     columns: Vec<RunColumn>,
 
-    /// The data segments whose footers the run answers for in a walk
+    /// The run stands in for these data segments' footers in a walk
     pub covered: Vec<SegmentId>,
 
-    /// Bytes the file holds, what a merge reading it pays
+    /// The file's size in bytes, which a merge reading it pays
     pub bytes: u64,
 }
 
@@ -293,7 +274,6 @@ impl KeyRun {
                     .checked_add(table)
                     .ok_or_else(|| corrupt("a column too long to hold"))?,
             )?;
-            // Each block's lead and then the last key, each its length and its bytes.
             let blocks = rows.div_ceil(u64::from(block_rows));
             let mut fences = Vec::new();
             let mut fence_at = Vec::with_capacity(blocks as usize + 1);
@@ -347,7 +327,7 @@ impl KeyRun {
         self.columns.iter().find(|held| held.column == column)
     }
 
-    /// Every column the run holds rows for
+    /// The run's columns, in column order
     pub fn columns(&self) -> &[RunColumn] {
         &self.columns
     }
@@ -355,14 +335,11 @@ impl KeyRun {
     /// A column's rows back to back, and a varying column's table of starts, in place in the file
     pub fn rows(&self, column: &RunColumn) -> &[u8] {
         let at = column.rows_at as usize;
-        // Open checked every column's region lies inside the file.
+        // Open checked that every column's region lies inside the file
         &self.backing.bytes()[at..at + column.region_len() as usize]
     }
 
-    /// The first row at a key or past it, or past it alone
-    ///
-    /// The fence picks the block, and one search inside it the row. A key past every
-    /// row of its block lands on the next block's first row, since rows lie back to back.
+    /// The first row at or past a key, or strictly past it with `is_past`
     pub fn seek(&self, column: &RunColumn, key: &[u8], is_past: bool) -> u64 {
         let rows = self.rows(column);
         let (first, count) = column.block_span(column.block_for(key));
@@ -382,20 +359,13 @@ impl KeyRun {
         low
     }
 
-    /// Unlink the file, for a run a merge or a rewrite retired
-    ///
-    /// Walks still holding the run keep reading it until they let it go.
+    /// Unlink a retired run's file, which walks still holding the run can keep reading
     pub fn retire(&self) {
         let _ = self.driver.unlink(&self.path);
     }
 }
 
-/// The key runs a volume holds, and the data segments they answer for in a walk
-///
-/// A covered segment keeps its records and its footer, which point reads and recovery
-/// still use, and only the walk passes it over for the run that holds its rows. A
-/// rewrite of a covered segment leaves its runs standing: each copy keeps its sequence
-/// number, and on a tie the row whose segment still stands wins.
+/// A volume's key runs and the segments they stand in for during a walk
 #[derive(Default)]
 pub struct KeyRunSet {
     held: RwLock<KeyRunsHeld>,
@@ -411,7 +381,7 @@ struct KeyRunsHeld {
 }
 
 impl KeyRunSet {
-    /// How many times the set has changed, which a walk's cached runs are keyed by
+    /// The set's change count, so a walk can tell its cached runs are stale
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
@@ -426,23 +396,17 @@ impl KeyRunSet {
         crate::sync::read(&self.held).covered.contains(&segment)
     }
 
-    /// Every segment a run answers for
+    /// The covered segments over all runs
     pub fn covered(&self) -> HashSet<SegmentId> {
         crate::sync::read(&self.held).covered.clone()
     }
 
-    /// Hold the set for one merge, nothing while another merge holds it
-    ///
-    /// Key runs have no claims, so two merges at once could both take one run and leave
-    /// its rows in two.
+    /// Hold the set for one merge, so two merges never take the same run
     pub fn try_merge(&self) -> Option<MutexGuard<'_, ()>> {
         crate::sync::try_lock(&self.merging)
     }
 
     /// Whether a run holds a row for a key below a sequence number
-    ///
-    /// Such a row can name a record a rewrite has already dropped, so a tombstone above it
-    /// has to stand for as long as the row does.
     pub fn holds_older(&self, column: ColumnId, key: &[u8], lsn: Lsn) -> bool {
         self.runs().iter().any(|run| {
             let Some(held) = run.column(column) else {
@@ -458,7 +422,7 @@ impl KeyRunSet {
         })
     }
 
-    /// The id the next run is written under
+    /// Take the id for the next run
     pub fn draw_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::AcqRel) + 1
     }
@@ -486,12 +450,7 @@ impl KeyRunSet {
         retired
     }
 
-    /// Read back the key runs a previous opening left
-    ///
-    /// A run that cannot be read is unlinked and its segments go back to the walk. So is
-    /// a run a newer one covers whole, which a merge that stopped between writing its run
-    /// and unlinking its inputs leaves behind. A run pointing into a segment a rewrite retired
-    /// stays: the rewrite's copies outrank its rows there.
+    /// Read back the key runs on disk, unlinking unreadable ones and any covered whole by a newer run
     pub fn load(&self, driver: &Arc<IoDriver>, root: &Path) -> Result<()> {
         let mut runs = Vec::new();
         for entry in driver.list_or_empty(root)? {
@@ -585,8 +544,6 @@ struct Building {
     rows_len: u64,
     fences: Vec<u8>,
     last: Vec<u8>,
-
-    /// Where each row of a varying column starts, written after the rows
     starts: Vec<u64>,
 }
 
@@ -596,10 +553,7 @@ impl Building {
     }
 }
 
-/// Writes one key run, a column at a time in column order and each column's rows ascending
-///
-/// The file is written under a temporary name and renamed whole once synced, so a run
-/// under its own name is always complete.
+/// Writes one key run, which shows up under its own name only once whole and synced
 pub struct RunWriter<'d> {
     driver: &'d IoDriver,
     file: FileId,
@@ -630,8 +584,6 @@ impl<'d> RunWriter<'d> {
     }
 
     /// Open the next column, which has to come after the one before it
-    ///
-    /// A key width of VARYING_WIDTH takes keys of any width, each row saying its own.
     pub fn begin_column(&mut self, column: ColumnId, key_width: u16) -> Result<()> {
         if self
             .columns
@@ -721,7 +673,7 @@ impl<'d> RunWriter<'d> {
         Ok(())
     }
 
-    /// Rows the run holds so far, over every column
+    /// The run's row count so far, over every column
     pub fn rows(&self) -> u64 {
         self.columns.iter().map(|column| column.rows).sum()
     }

@@ -83,9 +83,7 @@ fn paged_config(active_tails: u32) -> ReelConfig {
 /// A paged volume that seals enough segments for its walk to pass the merge depth
 fn merging_config(active_tails: u32) -> ReelConfig {
     ReelConfig {
-        // Half the paged segment, the smallest a batch and its block fit: the
-        // stream's tails resume across its reopens, so rolls have to make the
-        // segments a merge folds, and at the paged size the stream seals too few.
+        // Half the paged segment is the smallest that fits a batch and its block, and the paged size seals too few to merge
         segment_bytes: ByteCount::from_bytes(8 * 1024),
         ..paged_config(active_tails)
     }
@@ -272,7 +270,7 @@ fn fenced_paged_leads() {
     }
 }
 
-// a volume whose walk a key merge folds serves what one that never merged serves
+// a volume whose key merges fold its walk serves what one that never merged serves
 #[test]
 #[cfg(not(miri))]
 fn merged_single_tail() {

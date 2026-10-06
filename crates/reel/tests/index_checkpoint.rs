@@ -240,10 +240,7 @@ fn a_doomed_segment_keeps_the_rest_closed() {
         &op_stream::generate_durable(13, STREAM_LEN),
     );
 
-    // The put's sync fails, so the tail gives up on the segment it holds and rolls past
-    // it, leaving one file below the head with no footer behind it. The window is the
-    // put's own ops, its record's write, its journal's write and the two syncs: a wider
-    // one would fail the fresh segment the roll draws.
+    // Arm only the put's two writes and two syncs, since a wider window fails the fresh segment the roll draws
     let doomed = StreamOp::Put {
         group: 7,
         address: 0,

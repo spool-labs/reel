@@ -1,6 +1,4 @@
-//! The spot index, the index of sealed keys, which keeps record locations and no keys
-//!
-//! A lookup confirms each candidate against the key in the record's own header.
+//! The spot index keeps record locations for sealed keys and checks each key in its record's header
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -21,7 +19,7 @@ use crate::sync::{lock, read, write};
 /// Slots in one bucket, which fills one cache line
 const WAYS: usize = 4;
 
-/// Share of a shard's slots it fills before it grows
+/// A shard grows once it fills this share of its slots
 const LOAD: f64 = 0.85;
 
 /// How much a shard grows by when it fills
@@ -30,7 +28,7 @@ const GROWTH: f64 = 1.5;
 /// Shards, picked by the top byte of a key's hash
 const SHARDS: usize = 256;
 
-/// Keys a batch takes a shard's lock for at a time, so a write behind it waits a short while
+/// A batch takes a shard's lock for this many keys at a time, so a write behind it waits a short while
 const LOCK_CHUNK: usize = 512;
 
 /// The rows of one lane of shards, gathered by shard
@@ -49,38 +47,34 @@ fn lane_groups(rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<(usize, 
         .collect()
 }
 
-/// Buckets the lowest rung of a shard's ladder holds
+/// The lowest rung of a shard's ladder holds this many buckets
 const FIRST_BUCKETS: usize = 8;
 
-/// Least a growth multiplies a shard by, so a table sized between rungs never grows by a sliver
+/// A growth multiplies a shard by at least this much, so a table sized between rungs never grows by a sliver
 const LEAST_GROWTH: f64 = 1.2;
 
-/// Slots a full pair of buckets moves along before the shard grows instead
+/// A full pair of buckets moves this many slots along before the shard grows instead
 const MAX_KICKS: usize = 256;
 
-/// Threads an open settles its set-aside rows on, each read waiting on the device
+/// An open settles its set-aside rows on this many threads, since each read waits on the device
 const SETTLE_THREADS: usize = 8;
 
-/// Times a lookup starts over when a candidate's segment went while it read
-///
-/// A compaction can move a record, seal its copy and retire the source inside one
-/// slow read, and only a fresh look at the table finds the copy. Each try takes one
-/// such candidate out, so this many tries outlast every candidate a key can have.
+/// A lookup tries this many times, since each try takes out one candidate whose segment went mid-read
 pub const LOOKUP_TRIES: usize = MAX_CANDIDATES + 1;
 
 /// Older versions waiting for the cleaner before new ones are left to the retired-segment sweep
 const MAX_STALE: usize = 1 << 20;
 
-/// Bytes one bucket takes
+/// One bucket takes this many bytes
 const BUCKET_BYTES: u64 = 64;
 
-/// Candidates one key can have, both of its buckets full
+/// One key can have this many candidates, with both of its buckets full
 const MAX_CANDIDATES: usize = 2 * WAYS;
 
-/// Versions one key may hold before an overwrite reads them all, so its two buckets never fill
+/// An overwrite reads every version of a key holding this many, so its two buckets never fill
 const SETTLE_AT: usize = 3;
 
-/// Payload bytes one small length class covers
+/// One small length class covers this many payload bytes
 const SMALL_STEP: u64 = 64;
 
 /// Small length classes, each one step wider than the last
@@ -94,7 +88,7 @@ const EIGHTHS: [u64; 8] = [
     65_536, 71_468, 77_936, 84_990, 92_682, 101_070, 110_218, 120_194,
 ];
 
-/// The payload bytes each length class covers
+/// The upper payload bound of each length class
 static BOUNDS: [u32; CLASSES] = bounds();
 
 const TAG_SHIFT: u32 = 16;
@@ -132,20 +126,22 @@ pub enum HeadRead {
 
 /// One read of a record's header and payload
 pub enum SpotRead {
+    /// The record holds the key asked about, read with its payload
     Found(Head, Value),
 
-    /// The key's record at this length, confirmed by its own check with no version read
-    ///
-    /// Only a read told its candidate stands alone answers this way.
+    /// A lone candidate's record at this length, confirmed by its own check with no version read
     Newest(u32, Value),
 
+    /// The record is a tombstone for the key asked about
     Tombstone(Head),
+
+    /// The record holds another key
     Other,
 
     /// The segment is gone, so whatever the entry pointed at has moved on or died
     Gone,
 
-    /// A record the checked read has to settle, such as one failing its checksum
+    /// The checked read has to settle the record, as when it fails its checksum
     Unsure,
 }
 
@@ -158,39 +154,54 @@ pub struct Displaced {
     /// Records marked displaced, each at the middle of its class beside the least length its class covers
     pub classed: Vec<(Loc, u32)>,
 
-    /// Records an earlier overwrite booked from their class, each at its true length beside the least length booked
+    /// Records booked from their class by an earlier overwrite, each at its true length beside the least length booked
     pub rebooked: Vec<(Loc, u32)>,
 }
 
-/// A class booking a retiring segment's footer corrects
+/// A class booking corrected by a retiring segment's footer
 #[derive(Debug, PartialEq, Eq)]
 pub struct Rebooked {
+    /// The record's key
     pub key: RecordKey,
 
-    /// The least length the class booked
+    /// The length booked, the least its class covers
     pub booked: u32,
 
-    /// The length the record held
+    /// The record's true length
     pub actual: u32,
 }
 
-/// One record a lookup reads: where it sits, and how much of its payload to ask for
+/// A record for a lookup to read: where it sits, and how much of its payload to ask for
 #[derive(Clone, Copy, Debug)]
 pub struct Candidate {
+    /// The record's segment
     pub segment: SegmentId,
+
+    /// The record's offset in its segment
     pub offset: u32,
+
+    /// How many payload bytes to ask for, the top of the slot's length class
     pub bound: u32,
 
-    /// The key's only slot, so the read may answer with no version
+    /// Whether the slot is the key's only one, so the read may answer with no version
     pub alone: bool,
+
+    /// The candidate's slot in the table
     slot: Slot,
 }
 
 /// A lookup in progress: the candidates in order, and the newest version read so far
 pub struct Pick {
+    /// The key's hash
     hash: u64,
+
+    /// The candidates in read order, each with its segment's ceiling when there are several
     ordered: Vec<(Option<Lsn>, Slot)>,
+
+    /// Where the next candidate sits in the order
     next: usize,
+
+    /// The newest version read so far, with no payload for a tombstone
     best: Option<(Head, Option<Value>)>,
 
     /// Whether the best version so far came from a displaced slot
@@ -201,13 +212,15 @@ pub struct Pick {
 
     /// Whether the best version came with no sequence number
     is_versionless: bool,
+
+    /// Each older version read past and its length, for the cleaner
     stale: Vec<(Slot, u32)>,
 }
 
 /// What the header path makes of a key's slots
 #[derive(Debug, PartialEq, Eq)]
 pub enum Settled {
-    /// The newest version a live slot holds, a grave for a tombstone, or nothing
+    /// The newest version in a live slot, a grave for a tombstone, or nothing
     Entry(Option<Entry>),
 
     /// The newest version sits in a displaced slot, which only the footers can settle
@@ -229,10 +242,13 @@ pub enum Offered {
 
 /// What one lookup settled about a key
 pub enum Lookup {
+    /// The key's newest sealed version and its payload
     Found(Lsn, Value),
 
     /// The key's one sealed version, confirmed by its record's own check, its sequence number unread
     Newest(Value),
+
+    /// The key has no sealed version, or its newest is a tombstone
     Missing,
 
     /// Something only the checked read can settle
@@ -248,9 +264,6 @@ pub trait RecordSource: Send + Sync {
     fn cached_head(&self, key: KeyRef<'_>, segment: SegmentId, offset: u32) -> Result<HeadRead>;
 
     /// The record at a place, in one read of its header and up to `bound` payload bytes
-    ///
-    /// `alone` says the place is the key's only slot, so a record that confirms itself
-    /// may answer with no version.
     fn record(
         &self,
         key: &RecordKey,
@@ -341,10 +354,14 @@ fn tag_of(hash: u64) -> u32 {
 struct Slot {
     /// The segment, where the reserved zero marks an empty slot
     segment: u32,
+
+    /// The record's offset in its segment
     offset: u32,
+
+    /// The key's mid hash bits, which pick its home bucket
     mid: u32,
 
-    /// Tag, length class and whether the slot sits in its key's second bucket
+    /// Tag, length class, and the bits for second bucket, grave and displaced
     meta: u32,
 }
 
@@ -393,7 +410,7 @@ impl Slot {
         self.meta & DISPLACED != 0
     }
 
-    /// The least length the slot's class covers, which live bytes book with no read so they never go below the truth
+    /// The least length in the slot's class, which live bytes book with no read so they never go below the truth
     fn least(&self) -> u32 {
         match (self.meta >> CLASS_SHIFT) & CLASS_MASK {
             0 => 0,
@@ -485,14 +502,19 @@ impl PartialEq for Places {
 impl Eq for Places {}
 
 struct Table {
+    /// The buckets, one cache line of slots each
     buckets: Vec<Bucket>,
 
     /// How many buckets a key's mid can land on as its home, which is every bucket
     homes: usize,
+
+    /// How many slots are in use
     held: usize,
+
+    /// Random state that picks which slot each kick moves
     seed: u64,
 
-    /// Share of a growth step this shard's ladder is offset by
+    /// How far into a growth step this shard's ladder sits
     phase: f64,
 }
 
@@ -501,11 +523,7 @@ fn phase_of(at: usize) -> f64 {
     at as f64 / SHARDS as f64
 }
 
-/// The rung a table of `len` homes grows to, on the ladder offset by `phase`
-///
-/// Shards fill at one rate, so shards on one ladder cross their limit together and each
-/// holds its old table beside its new one: at 100M keys that was 1.45 GiB beside 2.16 GiB.
-/// Offset ladders put each shard's growth at its own key count.
+/// The next rung for a table of `len` homes, on a ladder offset by `phase` so shards grow at different times
 fn next_rung(len: usize, phase: f64) -> usize {
     let least = len as f64 * LEAST_GROWTH / FIRST_BUCKETS as f64;
     let rung = (least.ln() / GROWTH.ln() - phase).ceil();
@@ -542,7 +560,7 @@ impl Table {
         1 + (mix(u64::from(tag)) % (self.buckets.len() as u64 - 1)) as usize
     }
 
-    /// The bucket a slot does not sit in, of the two its key may use
+    /// The other of the two buckets a slot's key may use
     fn other(&self, bucket: usize, slot: &Slot) -> usize {
         let count = self.buckets.len();
         let step = self.step(slot.tag());
@@ -578,9 +596,7 @@ impl Table {
         self.buckets[bucket].slots.iter().position(Slot::is_empty)
     }
 
-    /// Put a slot in either of its key's buckets, moving others along when both are full
-    ///
-    /// A failed placement hands back the slot left homeless, which may be another key's.
+    /// Put a slot in either of its key's buckets, moving others along, or hand back whichever slot ends up homeless
     fn place(&mut self, slot: Slot) -> std::result::Result<(), Slot> {
         let home = self.home(slot.mid);
         let second = (home + self.step(slot.tag())) % self.buckets.len();
@@ -611,7 +627,7 @@ impl Table {
         self.held as f64 >= (self.homes * WAYS) as f64 * LOAD
     }
 
-    /// A table this one's slots fit into at the next size
+    /// A copy of this table at the next rung that fits every slot
     fn grown(&self) -> Table {
         let mut count = next_rung(self.homes, self.phase);
         loop {
@@ -688,17 +704,15 @@ impl Table {
     }
 }
 
-/// An older version a lookup read past, for the cleaner to take out
+/// An older version passed over by a lookup, for the cleaner to take out
 struct Stale {
     key: RecordKey,
     hash: u64,
     slot: Slot,
-
-    /// The record's length, from the header the lookup read
     len: u32,
 }
 
-/// The slot a set-aside row stands as, a grave for a tombstone
+/// The slot for a set-aside row, a grave for a tombstone
 fn slot_of(hash: u64, row: &SetAside) -> Slot {
     match row.is_tombstone {
         true => Slot::new(hash, row.loc).as_grave(),
@@ -706,7 +720,7 @@ fn slot_of(hash: u64, row: &SetAside) -> Slot {
     }
 }
 
-/// A sealed row an open set aside, because a slot already shared its key's bits
+/// A sealed row set aside by an open, because a slot already shared its key's bits
 struct SetAside {
     key: RecordKey,
     loc: Loc,
@@ -716,6 +730,7 @@ struct SetAside {
 
 /// One shard of a column's table, and how many slots have left it
 struct Shard {
+    /// The shard's table of slots
     table: RwLock<Table>,
 
     /// Slots taken out so far, which a lookup that found nothing checks for a race
@@ -822,16 +837,25 @@ pub struct Since {
 
 /// A column's sealed keys as record locations, in shards picked by their bits
 pub struct SpotColumn {
+    /// The shards, picked by the top byte of a key's hash
     shards: Vec<Shard>,
+
+    /// Where lookups read records, set once by attach
     records: OnceLock<Arc<dyn RecordSource>>,
+
+    /// The counters that order segments, set once by attach
     segments: OnceLock<Arc<SegmentTable>>,
+
+    /// Older versions waiting for the cleaner
     stale: Mutex<VecDeque<Stale>>,
+
+    /// How many older versions wait for the cleaner
     beside: AtomicU64,
 
-    /// Bytes the class bookings may sit below the truth, a class width each at most
+    /// How far the class bookings may sit below the truth, at most a class width each
     slack: AtomicU64,
 
-    /// Rows an open took before it could read a header, settled once it can
+    /// Rows taken by an open before it could read a header, settled once it can
     set_aside: Mutex<Vec<SetAside>>,
 }
 
@@ -842,6 +866,7 @@ impl Default for SpotColumn {
 }
 
 impl SpotColumn {
+    /// An empty column, which reads no records until it is attached
     pub fn new() -> SpotColumn {
         SpotColumn {
             shards: (0..SHARDS).map(Shard::new).collect(),
@@ -865,7 +890,7 @@ impl SpotColumn {
         self.beside.load(Ordering::Relaxed)
     }
 
-    /// Bytes the byte counters may sit from the truth, from every class booking so far
+    /// How far the byte counters may sit from the truth, from every class booking so far
     pub fn slack(&self) -> u64 {
         self.slack.load(Ordering::Relaxed)
     }
@@ -886,6 +911,7 @@ impl SpotColumn {
             .sum()
     }
 
+    /// How many bytes the bucket tables take
     pub fn heap_bytes(&self) -> u64 {
         self.shards
             .iter()
@@ -893,18 +919,12 @@ impl SpotColumn {
             .sum()
     }
 
-    /// Hold a sealed record's location
-    ///
-    /// The caller hands over the newest version, so an older entry of the same key is
-    /// one the map displaced and the cleaner will settle.
+    /// Hold the location of a key's newest sealed record, leaving older entries to the cleaner
     pub fn insert(&self, key: &[u8], loc: Loc) {
         self.insert_lane(&[(key, loc)], 0, 1);
     }
 
-    /// Put the keys of one lane of shards in, a shard's under one lock a chunk at a time
-    ///
-    /// A lane is the shards whose number leaves `lane` over `lanes`, so lanes on other
-    /// threads never meet in one shard. What comes back is which keys took a new slot.
+    /// Put in the keys of the shards whose number leaves `lane` over `lanes`, and say which took a new slot
     pub fn insert_lane(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<bool> {
         let mut inserted = vec![false; rows.len()];
         for (shard, ats) in lane_groups(rows, lane, lanes) {
@@ -962,11 +982,7 @@ impl SpotColumn {
         }
     }
 
-    /// Take one sealed footer partition's rows during an open, before any header can be read
-    ///
-    /// The rows go in a shard at a time, one lock and one warm table each. A row whose
-    /// key's bits no slot shares goes straight in. One that meets a slot is a second
-    /// version of a key, or rarely another key, and waits for `settle_rows`.
+    /// Take a sealed footer partition's rows during an open, setting aside each row that meets a slot
     pub fn take_partition(&self, segment: SegmentId, partition: &FooterPartition) -> Result<()> {
         let mut by_shard: Vec<Vec<(u64, Slot, u32)>> = vec![Vec::new(); SHARDS];
         for at in 0..partition.len() {
@@ -982,7 +998,7 @@ impl SpotColumn {
             };
             by_shard[shard_of(hash)].push((hash, slot, at as u32));
         }
-        // Loaders start at different shards, so two of them rarely want the same lock.
+        // Loaders start at different shards, so two of them rarely want the same lock
         let first = segment.as_u32() as usize % SHARDS;
         let mut aside = Vec::new();
         for shard in (first..SHARDS).chain(0..first) {
@@ -1015,12 +1031,7 @@ impl SpotColumn {
         Ok(())
     }
 
-    /// Settle the rows an open set aside, against the footers of the slots they met
-    ///
-    /// A set-aside row nearly always meets one slot, another version of its key. That
-    /// slot's footer says by key which record it is and how new, so rows are grouped by
-    /// the slot's segment and each footer is read once, with no record read. A row that
-    /// meets no slot or several, or one its footer cannot settle, reads headers.
+    /// Settle the rows an open set aside against the footers of the slots they met, reading headers for the rest
     pub fn settle_rows(&self, column: ColumnId, footers: &dyn FooterSource) -> Result<()> {
         let rows = std::mem::take(&mut *lock(&self.set_aside));
         if rows.is_empty() {
@@ -1088,8 +1099,7 @@ impl SpotColumn {
         };
         let mut group = group.to_vec();
         group.sort_unstable_by(|left, right| rows[*left].key.cmp(&rows[*right].key));
-        // Keys sharing their bits meet each other's slots, so a slot counts as this key's
-        // only when its footer row says so.
+        // A slot counts as this key's only when its footer row says so, since keys can share bits
         let mut keys_at: Option<HashMap<u32, usize>> = None;
         let mut key_at = |offset: u32| -> Result<Option<&[u8]>> {
             if keys_at.is_none() {
@@ -1106,7 +1116,6 @@ impl SpotColumn {
         };
         let mut unsettled = Vec::new();
         for same_key in group.chunk_by(|left, right| rows[*left].key == rows[*right].key) {
-            // The newest set-aside version of the key, a tie to the newer segment.
             let Some(newest) = same_key
                 .iter()
                 .copied()
@@ -1117,7 +1126,7 @@ impl SpotColumn {
             let row = &rows[newest];
             let standing = match partition.lookup(row.key.as_slice())? {
                 FooterFind::Found(found) => found,
-                // The slot this row met holds another key.
+                // The slot this row met holds another key
                 FooterFind::Missing | FooterFind::RuledOut => {
                     unsettled.extend_from_slice(same_key);
                     continue;
@@ -1132,7 +1141,7 @@ impl SpotColumn {
                 .copied();
             let is_newer = (row.lsn, row.loc.segment) > (standing.lsn, segment);
             let settled = match place {
-                // The slot is the version this footer holds, so the newer of the two stands.
+                // The slot is the version this footer holds, so the newer of the two stands
                 Some(place) if place.slot.offset == standing.offset => {
                     if is_newer {
                         table.take(hash, &place.slot);
@@ -1140,8 +1149,7 @@ impl SpotColumn {
                     }
                     true
                 }
-                // The slot is an older version in a segment that rewrote the key, and the
-                // footer's newest is this row.
+                // The slot is an older version of the key in this row's segment, whose footer points at this row
                 Some(place)
                     if segment == row.loc.segment
                         && standing.offset == row.loc.offset
@@ -1160,11 +1168,7 @@ impl SpotColumn {
         Ok(unsettled)
     }
 
-    /// Load one sealed row, keeping each key's newest version and a tombstone as a grave
-    ///
-    /// A slot sharing the key's bits is a version of the key, or rarely another key, so
-    /// its header is read to tell which and how new it is. A tie goes to the newer
-    /// segment, which is a compaction copy of the other.
+    /// Load one sealed row, keeping each key's newest version, a tie to the newer segment, a tombstone as a grave
     pub fn load(&self, key: &RecordKey, loc: Loc, lsn: Lsn, is_tombstone: bool) -> Result<()> {
         let Some(records) = self.records.get() else {
             return Ok(());
@@ -1193,7 +1197,7 @@ impl SpotColumn {
                 }
             }
             let mut table = self.shards[shard].write();
-            // Another thread loaded a row of this key while the headers were read.
+            // Another thread loaded a row of this key while the headers were read
             if *table.matches(hash) != *seen {
                 continue;
             }
@@ -1244,14 +1248,7 @@ impl SpotColumn {
         }
     }
 
-    /// Book a key's entries older than `newer` dead, now that the map holds that version
-    ///
-    /// An entry in a segment holding nothing at or past `newer` is older with no read. It
-    /// is marked displaced in place and booked at the middle of its length class, then
-    /// stays for lookups in flight until compaction retires its segment. An entry whose
-    /// segment may hold a newer version reads its header and goes, booked exactly, and so
-    /// does every entry of a key holding `SETTLE_AT` versions or more. What comes back is
-    /// every record booked, for the caller to settle.
+    /// Book a key's entries older than `newer` dead, leaving unread ones in place for lookups in flight
     pub fn displace(&self, key: &RecordKey, newer: Lsn) -> Result<Displaced> {
         let (Some(records), Some(segments)) = (self.records.get(), self.segments.get()) else {
             return Ok(Displaced::default());
@@ -1295,7 +1292,7 @@ impl SpotColumn {
         for (slot, len) in &older {
             let loc = Loc::new(slot.segment(), slot.offset, *len);
             match table.take_slot(hash, slot) {
-                // Marked earlier and booked from its class, so the header just read corrects that booking.
+                // Booked from its class earlier, so the header just read corrects that booking
                 Some(took) if took.is_displaced() => {
                     settled.rebooked.push((loc, took.least()));
                     self.unslack(&took);
@@ -1327,9 +1324,7 @@ impl SpotColumn {
             });
     }
 
-    /// Take out every displaced entry pointing into a retiring segment, with the true length its footer row gives
-    ///
-    /// A row reads its shard under the read lock first, so a segment with nothing displaced in it costs no write lock.
+    /// Take out every displaced entry pointing into a retiring segment, with the true length from its footer row
     pub fn settle_displaced_in(
         &self,
         segment: SegmentId,
@@ -1416,9 +1411,6 @@ impl SpotColumn {
     }
 
     /// A key's newest payload in one read of each candidate a ceiling cannot rule out
-    ///
-    /// A version an older candidate held goes to the cleaner already confirmed. Equal
-    /// versions are a compaction copy beside its source, and both stay.
     pub fn read(&self, key: &RecordKey) -> Result<Lookup> {
         self.read_taking(key, true)
     }
@@ -1477,9 +1469,7 @@ impl SpotColumn {
         Ok(self.settle(key, pick))
     }
 
-    /// The key's one candidate, when it has exactly one, which a single read can answer for
-    ///
-    /// A displaced entry was booked as an overwritten version, so it is left to the full lookup.
+    /// The key's one live candidate, which a single read can answer for, leaving displaced ones to the full lookup
     pub fn sole(&self, key: &RecordKey) -> Option<Candidate> {
         let pick = self.pick(key)?;
         let alone = pick.ordered.len() == 1;
@@ -1496,10 +1486,7 @@ impl SpotColumn {
         }
     }
 
-    /// Whether a slot for the key's bits sits in a segment holding anything newer than `lsn`
-    ///
-    /// No header is read, so a caller holding the map's lock can ask. A slot whose
-    /// segment's ceiling is unknown counts as newer.
+    /// Whether a slot for the key's bits sits in a segment holding anything newer than `lsn`, with no header read
     pub fn may_hold_newer(&self, key: &[u8], lsn: Lsn) -> bool {
         let Some(segments) = self.segments.get() else {
             return true;
@@ -1509,7 +1496,7 @@ impl SpotColumn {
             .read()
             .matches(hash)
             .iter()
-            // A displaced slot was booked as older than a version written since, so it is never the newer one.
+            // A displaced slot was booked as older than a version written since, so it is never the newer one
             .any(|place| {
                 !place.slot.is_displaced()
                     && segments
@@ -1528,10 +1515,8 @@ impl SpotColumn {
     }
 
     /// Whether a slot left the key's shard since then, which may have been the key's newest version
-    ///
-    /// A write or a compaction move puts the key in the map before its slot goes, so
-    /// a lookup that missed in both stands only when nothing left in between.
     pub fn moved(&self, since: Since) -> bool {
+        // A key reaches the map before its slot goes, so a miss in both stands only if nothing left
         self.shards[since.shard].taken.load(Ordering::Acquire) != since.taken
     }
 
@@ -1551,15 +1536,12 @@ impl SpotColumn {
         })
     }
 
-    /// The next candidate a lookup reads, past any whose segment's ceiling rules it out
-    ///
-    /// A key's only slot, live and holding data, is its newest sealed version whatever its
-    /// sequence number, so its read is told it stands alone.
+    /// The next candidate to read, past any whose segment's ceiling rules it out
     pub fn next(&self, pick: &mut Pick) -> Option<Candidate> {
+        // A key's only live slot holding data is its newest sealed version, whatever its sequence number
         let alone = pick.takes_newest && pick.ordered.len() == 1;
         while let Some((ceiling, slot)) = pick.ordered.get(pick.next).copied() {
             pick.next += 1;
-            // A segment holding nothing newer than the version in hand needs no read.
             if let (Some((head, _)), Some(ceiling)) = (&pick.best, ceiling) {
                 if ceiling < head.lsn {
                     continue;
@@ -1580,7 +1562,7 @@ impl SpotColumn {
     pub fn offer(&self, pick: &mut Pick, candidate: Candidate, read: SpotRead) -> Offered {
         let (head, value) = match read {
             SpotRead::Found(head, value) => (head, Some(value)),
-            // Only a lone candidate answers with no version, so nothing is held to order it against.
+            // Only a lone candidate answers with no version, so nothing is held to order it against
             SpotRead::Newest(len, value) => {
                 if !candidate.alone || pick.best.is_some() {
                     return Offered::Unsettled;
@@ -1597,7 +1579,7 @@ impl SpotColumn {
             }
             SpotRead::Tombstone(head) => (head, None),
             SpotRead::Other => return Offered::Next,
-            // The segment is gone, so the slot points at nothing and goes before the next look.
+            // The segment is gone, so the slot points at nothing and goes before the next look
             SpotRead::Gone => {
                 self.shards[shard_of(pick.hash)]
                     .write()
@@ -1608,6 +1590,7 @@ impl SpotColumn {
         };
         match &pick.best {
             Some((current, _)) if current.lsn >= head.lsn => {
+                // An equal version is a compaction copy beside its source, and both stay
                 if current.lsn > head.lsn {
                     pick.stale.push((candidate.slot, head.len));
                 }
@@ -1635,7 +1618,7 @@ impl SpotColumn {
             });
         }
         match pick.best {
-            // A displaced version was overwritten or deleted once, so what came after it is the footers' to say.
+            // A displaced version was overwritten or deleted once, so what came after it is the footers' to say
             Some(_) if pick.best_displaced => Lookup::Unsettled,
             Some((_, Some(value))) if pick.is_versionless => Lookup::Newest(value),
             Some((head, Some(value))) => Lookup::Found(head.lsn, value),
@@ -1653,7 +1636,7 @@ impl SpotColumn {
                 return Ok(settled);
             }
         }
-        // Segments kept going under the look, and the footers hold still.
+        // Segments kept going under the look, and the footers hold still
         Ok(Settled::Footers)
     }
 
@@ -1676,7 +1659,7 @@ impl SpotColumn {
                 HeadRead::Same(head) if best.is_none_or(|(current, _)| head.lsn > current.lsn) => {
                     best = Some((head, *slot));
                 }
-                // The segment is gone, so the slot points at nothing and goes before the next look.
+                // The segment is gone, so the slot points at nothing and goes before the next look
                 HeadRead::Missing => {
                     self.shards[shard_of(hash)].write().take(hash, slot);
                     return Ok(None);
@@ -1827,7 +1810,7 @@ mod tests {
     /// Keys under this prefix all hash alike, so a test can stand two keys on one fingerprint
     const SHARED: &[u8] = b"shared!!";
 
-    /// The hash every key under the shared prefix takes
+    /// Every key under the shared prefix takes this hash
     const SHARED_HASH: u64 = 0x5EED_0000_5EED_0000;
 
     pub(super) fn shared_hash(key: &[u8]) -> Option<u64> {
@@ -1841,7 +1824,7 @@ mod tests {
         RecordKey::from_bytes(COLUMN, &bytes).expect("key")
     }
 
-    // an overwrite that meets another key's slot on a shared fingerprint costs a booking, never that key
+    // an overwrite that meets another key's slot on a shared fingerprint books it, and that key's lookups go to the footers
     #[test]
     fn a_shared_fingerprint_never_loses_the_other_key() {
         let records = Arc::new(Records::default());
@@ -1938,8 +1921,7 @@ mod tests {
         records.write(old, key(1).as_slice(), Lsn(1));
         segments.note_max(SegmentId(1), Lsn(5));
         column.insert(key(1).as_slice(), old);
-        // 200 bytes sit in the class from 193 to 256
-        // segments book the class middle and live bytes the least it covers
+        // 200 bytes sit in the class from 193 to 256, so segments book its middle and live bytes its least
         assert_eq!(
             column.displace(&key(1), Lsn(10)).expect("displace").classed,
             vec![(Loc::new(SegmentId(1), 0, 224), 193)]
@@ -2010,6 +1992,7 @@ mod tests {
         assert_eq!(column.displaced(), 0);
     }
 
+    // the newest version answers, only the older one goes to the cleaner, and a copy answers once its source goes
     #[test]
     fn the_newest_version_answers_and_copies_stand() {
         let records = Arc::new(Records::default());

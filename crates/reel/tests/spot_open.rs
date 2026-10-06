@@ -1,7 +1,5 @@
-//! What a paged open holds while it loads the spot index, on a volume on disk
-//!
-//! Ignored by default, since it writes REEL_FF_OPEN_KEYS records (two million when
-//! unset) and reports the open's time and the process's resident memory around it.
+//! Reports how long a paged open takes to load the spot index and how much memory it holds
+//! Ignored by default since it writes two million records unless REEL_FF_OPEN_KEYS sets the count
 
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -26,7 +24,7 @@ const COLUMNS: &[ColumnSpec] = &[ColumnSpec {
     codec: Codec::None,
 }];
 
-/// Payload bytes per record, W4's size
+/// Payload bytes per record
 const VALUE_BYTES: usize = 200;
 
 /// Records written when the environment gives no count

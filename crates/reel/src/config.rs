@@ -112,10 +112,8 @@ impl ThreadBudget {
     }
 
     /// The cap in threads, resolved against the machine for an automatic budget
-    ///
-    /// The machine is asked once per process: on Linux each ask reads cgroup files, and
-    /// the tail count resolved from it lays out the tails for the volume's whole life.
     pub fn resolve(self) -> usize {
+        // One ask per process skips repeat cgroup reads and keeps the tail layout fixed
         static WIDTH: OnceLock<usize> = OnceLock::new();
         match self {
             ThreadBudget::Auto => *WIDTH.get_or_init(|| {
@@ -435,9 +433,6 @@ impl ReelConfig {
     }
 
     /// Whether reads into an open tail go through its mapping, whatever `map_above` says
-    ///
-    /// Never on a direct volume, whose page cache holds nothing, nor where ranged reads
-    /// route windows a mapping would answer first.
     pub fn maps_tails(&self) -> bool {
         self.io_backend != IoBackend::UringDirect && self.ranged_reads == RangedReads::Cached
     }
@@ -484,12 +479,9 @@ impl ReelConfig {
         self.active_tails.resolve_tails().max(fast)
     }
 
-    /// Compaction passes this volume runs at once, one for every two tails
-    ///
-    /// Ingest spreads over the tails, so the passes that reclaim what they land scale
-    /// with them, and a one-tail volume keeps its single pass. A reserved tail is
-    /// leased by a bit in a word, which caps the passes at 64.
+    /// How many compaction passes run at once, one for every two tails
     pub fn compact_passes(&self) -> usize {
+        // One bit in a word leases each reserved tail, which caps the passes at the word's width
         self.tail_count().div_ceil(2).min(64)
     }
 

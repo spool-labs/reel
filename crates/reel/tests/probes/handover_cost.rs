@@ -1,11 +1,5 @@
-//! What handing a sealed segment's keys to its footer costs
-//!
-//! A paged index gives a sealed segment's keys to the footer on the next tick, which is
-//! `page_out_sealed`. That sweep visits every row of every segment it hands over, so it
-//! costs per row, and it is the one path where a footer's whole key set is read at once.
-//!
-//! Opt-in. Run with:
-//!   cargo test -p tape-reel --release --test probes -- handover_cost
+//! Measures what it costs to hand a sealed segment's keys to its footer
+//! Opt-in, run with `cargo test -p tape-reel --release --test probes -- handover_cost`
 
 use std::path::PathBuf;
 use std::sync::Arc;

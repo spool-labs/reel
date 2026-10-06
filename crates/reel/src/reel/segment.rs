@@ -1152,9 +1152,7 @@ impl Drop for SegmentInner {
     }
 }
 
-/// The header record a segment file opens with, nothing where it opens with none
-///
-/// One read covers the record and the payload this build writes.
+/// The header record a segment file opens with, or nothing when it has none
 pub fn read_segment_header(driver: &IoDriver, file: FileId) -> Result<Option<SegmentHeader>> {
     let head = driver.pread(file, 0, (HEADER_LEN + SEGMENT_HEADER_SPAN) as u64)?;
     let Ok(header) = RecordHeader::unpack(head.get(..HEADER_LEN).unwrap_or(&[])) else {
@@ -1203,15 +1201,13 @@ impl SegmentHandle {
     }
 
     /// A handle on a segment file, its layout read off the header record it opens with
-    ///
-    /// A file that opens with no readable segment header frames its records keyed, so its
-    /// keyless records fail their reads as unreadable and are never served wrong.
     pub fn opened(
         id: SegmentId,
         path: PathBuf,
         file: FileId,
         driver: Arc<IoDriver>,
     ) -> Result<SegmentHandle> {
+        // A file with no readable header reads as keyed, so its keyless records fail and are never served wrong
         let layout =
             read_segment_header(&driver, file)?.map_or(RecordLayout::Keyed, |header| header.layout);
         Ok(SegmentHandle::new(id, path, file, driver, layout))

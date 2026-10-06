@@ -182,10 +182,6 @@ pub fn catch_up(
 }
 
 /// What a follower has not yet read of one segment, and where it reads from next
-///
-/// A tail gives the journal's groups past the last pass. A segment that has sealed gives
-/// its whole footer once, since the index's sequence guard turns down the rows a pass
-/// through its journal already applied.
 fn follow_segment(
     driver: &IoDriver,
     file: FileId,
@@ -194,6 +190,7 @@ fn follow_segment(
     file_len: u64,
     from: u64,
 ) -> Result<(Vec<WalkedRecord>, u64)> {
+    // The sequence guard turns down the footer rows a pass through the journal already applied
     if let Some(footer) = read_footer(driver, file, file_len)? {
         return Ok((footer_records(driver, file, segment, &footer)?, SEALED));
     }

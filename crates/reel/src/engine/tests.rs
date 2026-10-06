@@ -242,7 +242,7 @@ fn a_paged_column_reads_from_its_footer() {
     assert!(store.contains(&handed).expect("read"));
 }
 
-// The spot index answers a paged column's sealed keys through overwrites, deletes and compaction
+// the spot index answers a paged column's sealed keys through overwrites, deletes and compaction
 #[test]
 fn spot_answers_sealed_keys() {
     let paged = ReelConfig {
@@ -263,7 +263,6 @@ fn spot_answers_sealed_keys() {
         "the handover filled the spot index"
     );
 
-    // Every get path agrees: one at a time, in a batch, and as a future of each.
     let check = |store: &ReelStore, expected: &[Option<Vec<u8>>], stage: &str| {
         let keys: Vec<RecordKey> = (0..expected.len())
             .map(|byte| record(7, byte as u8))
@@ -289,7 +288,7 @@ fn spot_answers_sealed_keys() {
             );
             let waited = waited_many[byte].as_ref().map(|found| found.to_vec());
             assert_eq!(&waited, value, "awaited batched key {byte} after {stage}");
-            // A window near the front, one deep in the payload, and one cut short at its end.
+            // A window near the front, one deep in the payload, and one cut short at its end
             for (at, len) in [(10u64, 100usize), (6_000, 1_000), (8_000, 1_000)] {
                 let want = value.as_ref().map(|value| {
                     let from = (at as usize).min(value.len());
@@ -334,7 +333,6 @@ fn spot_answers_sealed_keys() {
     while store.index.scrub_spot(1024) > 0 {}
     check(&store, &expected, "compaction");
 
-    // The open loads the spot index from the footers, and every key answers as it did.
     store.close().expect("close");
     drop(store);
     let restored = SimIo::from_image(sim.durable_image());
@@ -366,7 +364,7 @@ fn spot_reads_take_one_read_a_key() {
         .take(10)
         .collect();
     assert_eq!(handed.len(), 10, "ten keys went to the spot index");
-    // One read first, so the segment's handle is open and no count below includes it.
+    // One read first, so the segment's handle is open and no count below includes it
     store.get(&handed[0]).expect("warm");
 
     let reads = |read: &dyn Fn()| {
@@ -519,7 +517,7 @@ fn spot_keeps_rebuilt_segments_through_a_retire() {
     for byte in 0..200u8 {
         store.put(&record(7, byte), &payload).expect("put");
     }
-    // The first segment's keys are written again, so a pass can retire it whole.
+    // The first segment's keys are written again, so a pass can retire it whole
     for byte in 0..120u8 {
         store.put(&record(7, byte), &payload).expect("overwrite");
     }
@@ -765,7 +763,7 @@ fn a_second_caller_cannot_take_a_held_segment() {
         let store = Arc::clone(&store);
         std::thread::spawn(move || store.hold_sealed())
     };
-    // The footer is in hand and the spans are not down.
+    // The footer is in hand and the spans are not down
     script.await_reached("seal/spans", 1);
 
     // The second caller, which is what a read behind a fresh seal is. It must
@@ -822,11 +820,11 @@ fn naming_a_seal_reads_no_footer() {
     }
     let second = store.reel.tails()[0].seal().expect("seal");
     store.flush().expect("flush");
-    // A footer cache too small to keep them, which is when a footer used to be read back.
+    // Forget both footers, as a cache too small to keep them would
     store.reel.shared().footers.forget(first);
     store.reel.shared().footers.forget(second);
 
-    // Every read fails, so a footer read back would fail the pass or leave a segment unnamed.
+    // Every read fails, so reading a footer back would fail the pass or leave a segment out of the candidates
     sim.arm_next_ops(64, FaultKind::ReadError);
     let outcome = store.page_out_sealed();
     sim.disarm();
@@ -1177,9 +1175,7 @@ fn footer_pools_share_one_bound() {
         .collect();
     assert!(!handed.is_empty(), "some keys went to their footer");
 
-    // Cleared first, since a resolve that finds a footer the handover parsed never
-    // reaches for a block. The resolves fill two pools and the pass after them the third.
-    // They resolve as of a snapshot, since the spot index answers a live read without a footer.
+    // Clear the cache and resolve at a snapshot, since a parsed footer or the spot index would skip the blocks
     store.reel.shared().footers.clear();
     for key in &handed {
         let found = store.index.get_at(key, Lsn(u64::MAX)).expect("resolve");
@@ -1231,7 +1227,7 @@ fn a_fresh_key_skips_the_sealed_search() {
         .find(|key| is_paged(&store, key));
     let sealed = sealed.expect("a key went to its footer");
 
-    // A key never written: the spot index holds nothing for it, so no footer is asked.
+    // A key never written: the spot index holds nothing for it, so no footer is asked
     let before = store.filter_probes();
     assert!(store.get(&record(9, 250)).expect("get").is_none());
     assert_eq!(
@@ -1239,14 +1235,12 @@ fn a_fresh_key_skips_the_sealed_search() {
         before,
         "the fresh key searched segments"
     );
-    // A sealed key resolves through the spot index.
     assert!(store.get(&sealed).expect("get").is_some());
 
     store.close().expect("close");
     drop(store);
 
-    // The paged open loads the spot index from the footers, so the same pair of
-    // answers holds on the reopened volume.
+    // The paged open loads the spot index from the footers, so the reopened volume answers the same
     let restored = SimIo::from_image(sim.durable_image());
     let reopened = ReelStore::open_with_io(PathBuf::from(ROOT), paged, COLUMNS, Arc::new(restored))
         .expect("reopen");
@@ -1565,7 +1559,7 @@ fn a_deleted_key_stays_gone_once_its_grave_is_pruned() {
     let payload = vec![0xa5u8; 8 * 1024];
     let (store, handed) = paged_fixture(&payload);
     store.delete(&handed).expect("delete");
-    // Enough to roll the tail, so the tombstone's segment seals and its grave may go.
+    // Enough to roll the tail, so the tombstone's segment seals and its grave may go
     for byte in 0..200u8 {
         store.put(&record(8, byte), &payload).expect("put");
     }
@@ -3005,7 +2999,7 @@ fn a_posix_range_reads_a_window() {
     let key = record(7, 1);
     let payload = stripes(64 * 1024);
     store.put(&key, &payload).expect("put");
-    // An open tail answers from its mapping, so the record is sealed first.
+    // An open tail answers from its mapping, so the record is sealed first
     store.reel.tails()[0].seal().expect("seal");
     store.get(&key).expect("warm the descriptor");
 

@@ -98,9 +98,6 @@ impl SegmentHeader {
     }
 
     /// Parse the frozen prefix, tolerating a payload that stops before the band or the layout
-    ///
-    /// A layout byte no writer stores is refused, and so is a keyless one with no check
-    /// key: a reader that guessed would frame or check every record in the file wrong.
     pub fn unpack(bytes: &[u8]) -> Result<SegmentHeader> {
         if bytes.len() < SEGMENT_HEADER_LEN {
             return Err(ReelError::Corruption(
@@ -203,7 +200,7 @@ mod tests {
         assert_eq!(parsed.band, None);
     }
 
-    // a merge's segment says its records lie keyless under its key, and a payload without the byte reads keyed
+    // a keyless layout survives a round trip, and a payload without the layout byte reads keyed
     #[test]
     fn layout_roundtrip() {
         let header = SegmentHeader::new(SegmentId(9)).laid_out(RecordLayout::Keyless(CHECK));

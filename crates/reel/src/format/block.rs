@@ -42,12 +42,7 @@ pub const BLOCK_ROWS: usize = 64;
 /// move more bytes, and for a cold lookup that runs the wrong way.
 pub const BLOCK_BYTES: usize = 8 * 1024;
 
-/// Rows one block of a partition holds, the row count under the byte cap
-///
-/// A packed partition's rows are prefix compressed, so no row's place is arithmetic and
-/// its unit of read is the restart block, whose first row carries its key whole. Free of
-/// the span because the seal cuts its fence at the same boundaries, and two copies of
-/// this arithmetic would be a fence naming the wrong block past the first cut.
+/// Rows per block of a partition, shared with the seal so both cut the same blocks
 pub fn block_rows_of(key_width: u16, is_packed: bool) -> usize {
     if is_packed {
         return RESTART_INTERVAL;
@@ -460,8 +455,7 @@ impl RowBlock {
             });
         }
 
-        // A packed partition's rows are prefix compressed, so the unit of read is the
-        // cut between two restart offsets, rebuilt into the row form searches speak.
+        // Prefix compression makes the unit of read the cut between two restart offsets
         let Some(table) = restarts else {
             return Err(ReelError::Corruption(
                 "a packed partition was read without its restart table".to_string(),

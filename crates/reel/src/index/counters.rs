@@ -506,10 +506,7 @@ impl SegmentTable {
         });
     }
 
-    /// Book a record dead where it lies, and note the version it holds
-    ///
-    /// A record whose index write lost its race is still on disk and a rebuild
-    /// would still find it, so its version counts as a live one's does.
+    /// Book a record dead where it lies, and note its version because a rebuild would still find it
     pub fn mark_dead(&self, segment: SegmentId, lsn: Lsn, span: u64) {
         self.opened(segment, |row| {
             row.note_min(lsn);
@@ -850,7 +847,7 @@ impl SegmentTable {
 
 /// Where an index write books its segments' bytes, the table itself or one rebuild thread's tally
 pub trait Bookings {
-    /// The incarnation an entry pointing into a segment is stamped with
+    /// The incarnation stamped on an entry pointing into a segment
     fn live_incarnation(&self, segment: SegmentId) -> SegmentIncarnation;
 
     /// Book a record live in its segment, and note the version it holds
@@ -905,6 +902,7 @@ struct TallyRow {
 }
 
 impl<'table> Tally<'table> {
+    /// An empty tally that settles into this table
     pub fn new(table: &'table SegmentTable) -> Tally<'table> {
         Tally {
             table,

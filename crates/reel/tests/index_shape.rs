@@ -920,15 +920,6 @@ fn weigh_arm<Map>(
 }
 
 /// What a resident 32 byte key costs, tree against the standard maps
-///
-/// The full 32 byte key in every arm: a prefix as the map key loses a key outright when
-/// two collide, and the keys are chosen by whoever writes them. `HashMap` is the ceiling
-/// the shape is measured against.
-///
-/// Every arm is weighed at both loads, since a container's footprint is as much the load
-/// as the structure. `grown` puts the keys in one at a time, which is what a running
-/// volume does; `installed` is the bulk path a rebuild takes, the tree from its sorted
-/// run and the hash map reserved once for a key count known at open.
 #[test]
 #[ignore = "measurement; run with --ignored --nocapture"]
 fn key_footprint() {

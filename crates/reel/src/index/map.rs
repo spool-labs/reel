@@ -140,20 +140,22 @@ pub struct KeyRepoint {
 
 /// Where a batch's keys sit: an entry the map or a footer gave, or a spot index lookup to read
 pub struct Located {
-    /// An entry per key, nothing for a key with none or one a pick answers
+    /// An entry per key, or nothing where a key has none or a pick answers it
     pub found: Vec<Option<Entry>>,
 
-    /// The keys the spot index answers, each with its lookup started
+    /// Keys for the spot index to answer, each with its lookup started
     pub picks: Vec<SpotPick>,
 }
 
-/// One key of a batch that the spot index answers
+/// One batch key answered by the spot index
 pub struct SpotPick {
     /// The key's position in the batch
     pub at: usize,
 
-    /// The column its table sits at
+    /// The position of the column whose spot table holds the key
     pub column: usize,
+
+    /// The key's lookup, started under the caller's barrier
     pub pick: Pick,
 
     /// Where the key's shard stood before the map was asked
@@ -218,10 +220,10 @@ pub struct ReelIndex {
     /// What each column's sealed segments cover, empty unless the column pages
     sealed: Vec<SealedRanges>,
 
-    /// The footers each column's walks opened, kept while its sealed set stands
+    /// Footers opened by each column's walks, kept while its sealed set stands
     walk_runs: Vec<WalkRuns>,
 
-    /// The key runs merges wrote, which a walk reads in place of the footers they cover
+    /// Merges write these key runs, and a walk reads them in place of the footers they cover
     key_runs: KeyRunSet,
 
     /// Each column's sealed keys as record locations, answering a get in one read
@@ -252,13 +254,10 @@ pub struct ReelIndex {
     publish: PublishBarrier,
 }
 
-/// Threads one segment's hand-over splits across, each owning a lane of the spot index shards
-///
-/// One thread handed over 1.17M keys a second on the box while the load wrote 1.68M, so
-/// 30M keys still waited in the map when a 100M load ended.
+/// One segment's hand-over splits across this many threads, each owning a lane of the spot index shards
 const HANDOVER_LANES: usize = 4;
 
-/// Rows below which a partition hands over on the calling thread, sooner than lanes start
+/// A partition under this many rows hands over on the calling thread, since lanes cost more to start
 const SPLIT_AT: usize = 4096;
 
 impl ReelIndex {
@@ -308,7 +307,7 @@ impl ReelIndex {
         let _ = self.footers.set(footers);
     }
 
-    /// Where the spot index reads the records its entries point at
+    /// Tell the spot index where to read the records its entries point at
     pub fn set_records(&self, records: Arc<dyn RecordSource>) {
         for spot in &self.spot {
             spot.attach(Arc::clone(&records), Arc::clone(&self.segments));
@@ -321,8 +320,6 @@ impl ReelIndex {
     }
 
     /// A key's newest payload in one read, when the spot index holds the column's sealed keys
-    ///
-    /// A key the map holds reads through the checked path, which is one read too.
     pub fn spot_read(&self, key: &RecordKey) -> Result<Lookup> {
         match self.spot_route(key) {
             SpotRoute::Settled(lookup) => Ok(lookup),
@@ -348,26 +345,20 @@ impl ReelIndex {
         }
     }
 
-    /// Where a cue read can ask the spot index
-    ///
-    /// Only for a key the map has let go. A key the map still holds answers through the
-    /// checked path, since a hand-over in flight puts an older version in the spot index
-    /// before the map refuses it. A column the spot index does not serve goes there too.
+    /// Where a cue read can ask the spot index, only for a key the map has let go
     pub fn spot_route_at(&self, key: &RecordKey) -> Option<(usize, Since)> {
         let (Some(at), true) = (self.slot(key.column), self.spot_serves()) else {
             return None;
         };
         let since = self.spot[at].since(key);
+        // A hand-over in flight puts an older version in the spot index before the map lets go
         self.indexes[at]
             .entry_or_grave(key.as_slice())
             .is_none()
             .then_some((at, since))
     }
 
-    /// Apply a cue to a spot index answer: the newest sealed version stands when the cue sees it
-    ///
-    /// A newer one goes to the footers, which keep every version an overwrite took out of
-    /// The spot index.
+    /// Apply a cue to a spot index answer, leaving a version the cue cannot see to the footers
     pub fn spot_finish_at(
         &self,
         at: usize,
@@ -383,14 +374,14 @@ impl ReelIndex {
             {
                 Lookup::Missing
             }
-            // a cue has to see the version, and this answer has none
+            // A cue has to see the version, and this answer has none
             Lookup::Newest(_) => Lookup::Unsettled,
             Lookup::Missing if self.spot[at].moved(since) => Lookup::Unsettled,
             found => found,
         }
     }
 
-    /// One column's the spot index table, for a lookup the caller drives itself
+    /// One column's spot index table, so the caller can drive a lookup itself
     pub fn spot_column(&self, at: usize) -> &SpotColumn {
         &self.spot[at]
     }
@@ -401,7 +392,7 @@ impl ReelIndex {
             Lookup::Found(lsn, _) if self.indexes[at].is_covered_key(key.as_slice(), lsn) => {
                 Lookup::Missing
             }
-            // read after the record, so a range delete that landed before it is seen here
+            // Read after the record, so a range delete that landed before it is seen here
             Lookup::Newest(_) if self.indexes[at].has_covers() => Lookup::Unsettled,
             Lookup::Missing if self.spot[at].moved(since) => Lookup::Unsettled,
             found => found,
@@ -411,7 +402,7 @@ impl ReelIndex {
     /// Take out up to `budget` older versions the spot index lookups read past, and book them
     pub fn scrub_spot(&self, budget: usize) -> usize {
         if self.retired.swap(0, Ordering::AcqRel) > 0 {
-            // The spot index only points into sealed segments, and a retire forgets the span.
+            // The spot index only points into sealed segments, and a retire forgets the span
             for (at, spot) in self.spot.iter().enumerate() {
                 let standing: HashSet<SegmentId> = self.sealed[at].segments().into_iter().collect();
                 spot.forget_retired(|segment| standing.contains(&segment));
@@ -432,7 +423,7 @@ impl ReelIndex {
         settled
     }
 
-    /// Bytes the byte counters may sit from the truth, from the spot index's class bookings
+    /// Slack in the byte counters from the spot index's class bookings
     pub fn spot_slack(&self) -> u64 {
         self.spot.iter().map(SpotColumn::slack).sum()
     }
@@ -442,17 +433,17 @@ impl ReelIndex {
         self.spot.iter().map(SpotColumn::displaced).sum()
     }
 
-    /// Older versions the spot index holds for its cleaner
+    /// Older versions held in the spot index for its cleaner
     pub fn spot_beside(&self) -> u64 {
         self.spot.iter().map(SpotColumn::beside).sum()
     }
 
-    /// Entries the spot index holds in all
+    /// All entries in the spot index
     pub fn spot_held(&self) -> u64 {
         self.spot.iter().map(SpotColumn::held).sum()
     }
 
-    /// Bytes the spot index's tables hold, every bucket counted whether filled or not
+    /// Heap bytes of the spot index's tables, counting every bucket whether filled or not
     pub fn spot_heap_bytes(&self) -> u64 {
         self.spot.iter().map(SpotColumn::heap_bytes).sum()
     }
@@ -462,7 +453,7 @@ impl ReelIndex {
         self.spot_ready.store(true, Ordering::Release);
     }
 
-    /// Take a sealed footer's rows during a paged open, a range row aside
+    /// Take a sealed footer's rows during a paged open, skipping range tombstones
     pub fn take_sealed_footer(&self, segment: SegmentId, footer: &SegmentFooter) -> Result<()> {
         for partition in &footer.partitions {
             if let Some(at) = self.slot(partition.column) {
@@ -481,10 +472,7 @@ impl ReelIndex {
         }
     }
 
-    /// Finish what a paged open loaded into the spot index, then let it answer
-    ///
-    /// The rows set aside read their headers now that records can be read. A key the
-    /// map holds has a newer version than any footer, so the spot index's older one goes.
+    /// Finish the paged open's spot index load once records can be read, then let it answer
     pub fn finish_spot_load(&self) -> Result<()> {
         if !self.residency.pages() || self.spot_ready.load(Ordering::Acquire) {
             return Ok(());
@@ -492,8 +480,7 @@ impl ReelIndex {
         let Some(footers) = self.footers.get() else {
             return Ok(());
         };
-        // A key the map holds keeps any older sealed slot until an overwrite or a retire takes
-        // it, since reads ask the map first and order a later pair by ceiling.
+        // A key the map holds keeps any older sealed slot until an overwrite or retire, since reads ask the map first
         for (at, spot) in self.spot.iter().enumerate() {
             spot.settle_rows(self.columns[at].id, footers.as_ref())?;
             spot.finish_load();
@@ -527,7 +514,7 @@ impl ReelIndex {
                 return Ok(found);
             }
         }
-        // Slots kept leaving the key's shard under every look, and the footers hold still.
+        // Slots kept leaving the key's shard under every look, and the footers hold still
         match self.mapped(at, key) {
             Some(answer) => Ok(answer),
             None => Ok(self.live_only(at, key, self.newest_sealed(at, key, None)?)),
@@ -542,10 +529,7 @@ impl ReelIndex {
         Ok(self.get(key)?.is_some_and(|entry| entry.loc == loc))
     }
 
-    /// Whether the index points a key at the record at `loc`, known with no read
-    ///
-    /// The caller holds that record, so the spot index's one live slot under the key's hash
-    /// pointing there settles it with no header read. False is only unsure.
+    /// Whether the index surely points a key at the record at `loc` with no read, where false is only unsure
     pub fn surely_at(&self, key: &RecordKey, loc: Loc, lsn: Lsn) -> bool {
         let Some(at) = self.slot(key.column) else {
             return false;
@@ -856,11 +840,6 @@ impl ReelIndex {
     }
 
     /// Give one sealed partition's keys up, a lane of shards to a thread
-    ///
-    /// The spot index takes every key before the map lets any go, so no read finds a key
-    /// in neither, and a key the map would not give up comes back out of the spot index
-    /// only where this hand-over put it there. Each step takes a shard's lock once a chunk
-    /// of keys, and each lane owns its own shards, so lanes never wait on each other.
     pub fn page_out_partition(
         &self,
         segment: SegmentId,
@@ -871,13 +850,11 @@ impl ReelIndex {
         };
         let mut rows: Vec<(&[u8], Loc)> = Vec::with_capacity(partition.len());
         for row_at in 0..partition.len() {
-            // The key is borrowed out of the packed bytes, never decoded into an entry.
+            // The key is borrowed out of the packed bytes, never decoded into an entry
             let Some(key) = partition.key_at(row_at) else {
                 continue;
             };
-            // A segment that overwrote its own record holds every version in write order,
-            // and only the last can be the map's: an older one would only fill the key's
-            // spot index buckets for the map to refuse.
+            // Only a key's last version in the segment can be the map's, so older ones are skipped
             if partition.key_at(row_at + 1) == Some(key) {
                 continue;
             }
@@ -915,7 +892,7 @@ impl ReelIndex {
             all
         };
         let inserted = in_lanes(&|lane| spot.insert_lane(&rows, lane, lanes));
-        // The spot index holds every key and the map has yet to let any go.
+        // The spot index takes every key before the map lets any go, so no read misses both
         crate::sync::rendezvous::at("paged/handover-spot");
         let handed = in_lanes(&|lane| index.page_out_lane(&rows, lane, lanes));
         let back: Vec<(&[u8], Loc)> = rows
@@ -924,6 +901,7 @@ impl ReelIndex {
             .filter(|(_, (inserted, handed))| **inserted && !**handed)
             .map(|(row, _)| *row)
             .collect();
+        // Only keys this hand-over put in and the map kept come back out of the spot index
         if !back.is_empty() {
             spot.remove_lane(&back, 0, 1);
         }
@@ -1012,14 +990,7 @@ impl ReelIndex {
         self.indexes[at].insert(key.as_slice(), Entry::new(loc, lsn), &self.segments)
     }
 
-    /// Book the footer-held record a mapped mutation displaced, if there was one
-    ///
-    /// Asked only of a mutation that landed on an empty place, the only kind a footer
-    /// can still be answering for. Deferring it past the map move costs nothing a
-    /// reader can see: what it settles is the dead-byte accounting the compactor
-    /// reads, which is a tick behind by design anyway.
-    ///
-    /// The spot index reads the displaced record's header, from memory when it can.
+    /// Book the footer-held record a mapped mutation displaced, safe to defer since only compaction reads the booking
     pub fn settle_displaced(&self, key: &RecordKey, lsn: Lsn) -> Result<bool> {
         let Some(at) = self.slot(key.column) else {
             return Ok(false);
@@ -1187,15 +1158,13 @@ impl ReelIndex {
                         None
                     }
                     Some(entry) => Some(*entry),
-                    // A key the map has nothing for may still be in a sealed segment. A pick
-                    // taken here reads its candidates later as one batch.
+                    // A key the map lacks may sit in a sealed segment, so its pick reads later in one batch
                     None => match (self.spot_pick(*index, key), self.residency.pages()) {
                         (Some(pick), _) => {
                             picks.push(pick);
                             None
                         }
-                        // The map took the key since the look above, or the spot index is not
-                        // serving yet, so the whole lookup answers.
+                        // The map gained the key since the look above, or the spot index is not serving yet, so a full get answers
                         (None, true) => self.get(key)?,
                         (None, false) => None,
                     },
@@ -1206,7 +1175,7 @@ impl ReelIndex {
         Ok(Located { found, picks })
     }
 
-    /// A spot index lookup for a key the map holds nothing for, started under the caller's barrier
+    /// Start a spot index lookup under the caller's barrier, for a key missing from the map
     fn spot_pick(&self, at: usize, key: &RecordKey) -> Option<SpotPick> {
         let SpotRoute::Column(column, since) = self.spot_route(key) else {
             return None;
@@ -1380,11 +1349,6 @@ impl ReelIndex {
     }
 
     /// Repoint a key from a compacted record to its rewritten copy under a guard
-    ///
-    /// A paged key has no entry to repoint, so it comes back into the map until the
-    /// destination seals and hands it over again. The caller's source stands when it is
-    /// the key's one spot index slot. Otherwise the footers give the source, and they
-    /// also say whether the row is still the version being moved.
     pub fn repoint(
         &self,
         key: &RecordKey,
@@ -1401,13 +1365,7 @@ impl ReelIndex {
         Ok(self.repoint_run(&moves)? == 1)
     }
 
-    /// Repoint a run of moved records at their copies, booking the run's bytes in bulk
-    ///
-    /// The copies are booked live before any repoint is published, so a write taking a
-    /// moved key down books its copy out of a count that already holds it. A repoint
-    /// that loses its race moves its copy from live to dead, and each source gives up
-    /// what moved out of it in one booking once the run is done. The table is shared
-    /// with every writer, so a booking per record is what a pass would contend on.
+    /// Repoint a run of moved records at their copies, booking the run's bytes in bulk to spare the shared table
     pub fn repoint_run(&self, moves: &[KeyRepoint]) -> Result<u64> {
         let mut copies: Vec<(SegmentId, u64, Lsn, SegmentIncarnation)> = Vec::new();
         for repoint in moves {
@@ -1425,6 +1383,7 @@ impl ReelIndex {
                 )),
             }
         }
+        // Copies go live before any repoint publishes, so a write that drops a moved key finds its copy counted
         for copy in &mut copies {
             self.segments.mark_live(copy.0, copy.2, copy.1);
             copy.3 = self.segments.live_incarnation(copy.0);
@@ -1481,9 +1440,7 @@ impl ReelIndex {
         }
     }
 
-    /// Move one key's entry from a compacted record to its copy, booking nothing
-    ///
-    /// What comes back is where the entry moved from, or nothing where the key moved on.
+    /// Move one key's entry from a compacted record to its copy, returning the source and booking nothing
     fn repoint_moved(
         &self,
         key: &RecordKey,
@@ -1499,15 +1456,12 @@ impl ReelIndex {
         if !self.is_paged_key(at, key) {
             match index.repoint(key.as_slice(), to, expected_lsn, stamp) {
                 Some(from) => return Ok(Some(from)),
-                // A hand-over can page the key out between the two looks, and then the
-                // move is the paged one below. Declining it would book the copy dead and
-                // let the pass retire the only record the key has.
+                // A hand-over may page the key out between the looks, and declining then would retire its only record
                 None if !self.is_paged_key(at, key) => return Ok(None),
                 None => {}
             }
         }
-        // The pass read the record at its source, so when that is the key's one spot index
-        // slot it is this key at this version, and no slot holds a newer one: no read needed.
+        // The pass read the source, so the key's one spot index slot there is this version and needs no read
         if let Some(from) =
             from.filter(|from| self.spot_serves() && self.spot[at].only_at(key.as_slice(), *from))
         {
@@ -1527,7 +1481,7 @@ impl ReelIndex {
                 self.spot[at].remove_at(key.as_slice(), entry.loc);
                 Ok(Some(entry.loc))
             }
-            // A newer version won the race, so the copy is dead on arrival.
+            // A newer version won the race, so the copy is dead on arrival
             Sealed::Live(_) | Sealed::Gone => Ok(None),
             // Nothing anywhere answers for this key, which does not mean nothing
             // does: a segment that sealed since the pass began is invisible here,
@@ -1590,20 +1544,9 @@ impl ReelIndex {
         }
     }
 
-    /// Stand a grave for a point tombstone compaction copied, on a paging volume
-    ///
-    /// A delete's grave goes once its tombstone's segment is noted, and the pass that
-    /// moves the tombstone on retires that segment. The copy is in no footer a walk
-    /// opens until its own segment is noted, so an older record of the key would answer
-    /// in the meantime. The grave stands for the copy, and the prune takes it the same
-    /// way once the copy's segment is noted.
-    ///
-    /// A newer version anywhere refuses it: the map's own entry, or a spot index slot
-    /// in a segment holding anything newer, both read under the map's lock. A handover
-    /// puts the key in the spot index before the map lets it go, so one of the two shows
-    /// it. No grave stands while the spot index is still loading, since nothing there can
-    /// be ruled out yet.
+    /// Stand a grave for a point tombstone compaction copied, so no older record answers before its segment is noted
     pub fn hold_grave(&self, key: &RecordKey, lsn: Lsn, segment: SegmentId) {
+        // A loading spot index cannot rule out a newer version, so no grave stands yet
         if !self.residency.pages() || !self.spot_serves() {
             return;
         }
@@ -1611,6 +1554,7 @@ impl ReelIndex {
             return;
         };
         let spot = &self.spot[at];
+        // A hand-over fills the spot index before the map lets go, so one of the two shows a newer version
         self.indexes[at].hold_grave(key.as_slice(), lsn, segment, || {
             spot.may_hold_newer(key.as_slice(), lsn)
         });
@@ -1648,10 +1592,7 @@ impl ReelIndex {
         self.indexes.iter().map(|index| index.cover_count()).sum()
     }
 
-    /// Memory the maps are holding
-    ///
-    /// Counted from what every shard's maps allocated plus the shards and their filters,
-    /// since arenas that grow by doubling hold up to twice what their keys fill.
+    /// Heap bytes allocated by the maps, the shards and their filters
     pub fn resident_bytes(&self) -> ByteCount {
         let bytes: u64 = self.indexes.iter().map(ColumnIndex::heap_bytes).sum();
         ByteCount::from_bytes(bytes)
@@ -1855,20 +1796,17 @@ impl ReelIndex {
         }
     }
 
-    /// The key runs merges wrote, and the segments they answer for in a walk
+    /// The key runs from merges, and the segments they answer for in a walk
     pub fn key_runs(&self) -> &KeyRunSet {
         &self.key_runs
     }
 
-    /// Whether a segment is still a sealed run, which a retire stops it being
+    /// Whether a segment is a sealed run that has not retired
     pub fn holds_sealed(&self, segment: SegmentId) -> bool {
         self.sealed.iter().any(|sealed| sealed.holds(segment))
     }
 
-    /// The most runs a walk from any one key merges: the segments no key run covers, and the key runs
-    ///
-    /// A key run of scattered keys reaches across its whole column, so each counts once.
-    /// With no key runs it is the most sealed segments any key falls inside.
+    /// A walk from any one key merges at most this many runs, the uncovered segments plus every key run
     pub fn overlap_depth(&self) -> usize {
         let covered = self.key_runs.covered();
         let runs = self.key_runs.runs().len();
@@ -1880,9 +1818,7 @@ impl ReelIndex {
             + runs
     }
 
-    /// Let go of the footers walks opened under a sealed set that has since moved
-    ///
-    /// A slot no walk came back to would otherwise hold a retired segment's footer.
+    /// Drop footers walks opened under an older sealed set, so no slot holds a retired segment's footer
     pub fn sweep_walk_runs(&self) {
         for (sealed, runs) in self.sealed.iter().zip(&self.walk_runs) {
             runs.sweep(sealed.generation().wrapping_add(self.key_runs.generation()));
@@ -1916,7 +1852,7 @@ impl ReelIndex {
             let spans = by_column.remove(&column.id).unwrap_or_default();
             self.sealed[at].replace(spans);
         }
-        // A volume with nothing sealed has no keys the spot index could be missing.
+        // A volume with nothing sealed has no keys the spot index could be missing
         if self.sealed.iter().all(SealedRanges::is_empty) {
             self.mark_spot_ready();
         }
@@ -1946,10 +1882,7 @@ impl ReelIndex {
         }
     }
 
-    /// Book the true length of every overwrite a retiring segment holds that was booked from its class
-    ///
-    /// Done before the segment's own locks are taken, from the footer the pass already has. A footer
-    /// that is gone, as on a follower whose writer unlinked the file, leaves those bookings in the slack.
+    /// Book the true length of each class-booked overwrite in a retiring segment, before its locks are taken
     fn rebook_retiring(&self, segment: SegmentId) {
         if !self.counted(segment) || self.spot_displaced() == 0 {
             return;
@@ -1957,6 +1890,7 @@ impl ReelIndex {
         let Some(footers) = self.footers.get() else {
             return;
         };
+        // The pass already holds the footer, and a footer gone on a follower leaves these bookings in the slack
         let Ok(Some(footer)) = footers.footer(segment) else {
             return;
         };

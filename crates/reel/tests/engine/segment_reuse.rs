@@ -69,10 +69,7 @@ fn bytes_in(root: &Path) -> u64 {
         .sum()
 }
 
-/// Where the bytes written to a file end: its first hole, or its length when it has none
-///
-/// A mapped tail stands at the whole segment while it is open, and the blocks past
-/// what it wrote are reserved and unwritten, which a seek for a hole finds.
+/// Finds the end of a file's written bytes at its first hole, since a mapped tail spans the whole segment
 fn written_end(path: &Path) -> u64 {
     use std::os::unix::io::AsRawFd;
     let file = std::fs::File::open(path).expect("open segment");
@@ -113,8 +110,7 @@ fn a_new_segment_is_written_through() {
         "the fill past the records is not zeros"
     );
 
-    // A flush journals the record's row, which is what a reopen finds it by, and the
-    // copy is taken with the tail still open, as a crash leaves it.
+    // Flush so a reopen finds the record's journaled row, then copy with the tail open as a crash leaves it
     store.flush().expect("flush");
     let crashed = TempDir::new().expect("crashed");
     copy_root(home.path(), crashed.path());

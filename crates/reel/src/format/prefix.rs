@@ -1,12 +1,4 @@
-//! Footer rows that carry what a key does not share with the row before it
-//!
-//! A footer holds a column's keys sorted, and sorted keys share their fronts, so a
-//! row stores how much it shares with the row before it and only the rest. That
-//! costs the arithmetic a flat run of fixed-width rows is binary searched by, so
-//! every so many rows a restart carries its key whole; the restarts are a sorted
-//! array to bisect, and a search lands in one small block and walks it. A footer
-//! row's tail is its record's sequence, offset, length and flags, and inside a
-//! restart block each of the numbers is kept as its difference from the row before.
+//! Footer rows that keep only what a key does not share with the row before it
 
 use std::cmp::Ordering;
 
@@ -18,7 +10,7 @@ use crate::format::footer::ENTRY_TAIL_LEN;
 /// Fewer restarts saves bytes and makes the walk after a seek longer.
 pub const RESTART_INTERVAL: usize = 16;
 
-/// Widest tail a row holds once read back, which sizes the buffer a row decodes into
+/// Every tail fits in this many bytes once read back
 const TAIL_CAP: usize = 32;
 
 /// Where a footer entry tail keeps its offset, its length and its flags
@@ -32,8 +24,7 @@ const _: () = assert!(ENTRY_TAIL_LEN == FLAGS_AT + 1 && ENTRY_TAIL_LEN <= TAIL_C
 /// How a row's tail lies behind its key
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Tail {
-    /// A footer entry's sequence, offset, length and flags, the numbers kept as their
-    /// difference from the row before in the same restart block
+    /// A footer entry's tail, its sequence and offset kept as differences from the row before
     #[default]
     Entry,
 
@@ -42,7 +33,7 @@ pub enum Tail {
 }
 
 impl Tail {
-    /// Bytes a tail takes once read back
+    /// A tail's length once read back
     pub(crate) fn len(self) -> usize {
         match self {
             Tail::Entry => ENTRY_TAIL_LEN,
@@ -56,13 +47,13 @@ type Whole = [u8; TAIL_CAP];
 
 /// One row read off the packed bytes
 struct Row<'a> {
-    /// Bytes of key the row shares with the row before it
+    /// The row shares this many key bytes with the row before it
     shared: usize,
 
     /// The rest of the key
     suffix: &'a [u8],
 
-    /// The tail, whole, in the first `Tail::len` bytes
+    /// The tail read back whole, zero past its length
     tail: Whole,
 
     /// Where the next row starts
@@ -100,8 +91,7 @@ impl PrefixRows {
         }
     }
 
-    /// An empty block with room for about this many bytes of rows, so an encode does not
-    /// regrow its buffer a doubling at a time
+    /// An empty block with room for about this many bytes of rows
     pub fn with_capacity(tail: Tail, bytes: usize) -> PrefixRows {
         PrefixRows {
             packed: Vec::with_capacity(bytes),
@@ -287,9 +277,7 @@ impl PrefixRows {
     /// The shape every in-memory reader searches, so the prefix form stays an
     /// on-disk encoding only.
     pub fn unpacked(&self) -> Result<(Vec<u8>, Vec<u32>)> {
-        // Prefix sharing and the tail's differences only remove bytes, so the encoded
-        // length is a floor for the rebuilt one and seeding with it skips the early
-        // doublings.
+        // Packing mostly removes bytes, so the encoded length makes a good starting capacity
         let mut packed = Vec::with_capacity(self.packed.len());
         let mut starts = Vec::with_capacity(self.rows + 1);
         starts.push(0u32);
@@ -361,7 +349,7 @@ fn u32_at(tail: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(tail[at..at + 4].try_into().expect("four bytes"))
 }
 
-/// Append a tail, a footer entry's numbers as their differences from the row before
+/// Append a tail, an entry's sequence and offset as differences from the row before
 fn put_tail(out: &mut Vec<u8>, shape: Tail, tail: &[u8], before: &Whole) {
     match shape {
         Tail::Raw(_) => out.extend_from_slice(tail),
@@ -376,7 +364,7 @@ fn put_tail(out: &mut Vec<u8>, shape: Tail, tail: &[u8], before: &Whole) {
     }
 }
 
-/// Read a tail `put_tail` wrote back whole, stepping past it
+/// Rebuild the whole tail that `put_tail` wrote, stepping past it
 fn get_tail(bytes: &[u8], at: &mut usize, shape: Tail, before: &Whole) -> Result<Whole> {
     let truncated = || ReelError::Corruption("footer row tail is truncated".to_string());
     let mut tail = [0u8; TAIL_CAP];
@@ -574,7 +562,7 @@ impl<'a> PrefixCursor<'a> {
         if self.index >= self.rows.rows {
             return Ok(false);
         }
-        // A restart row holds its numbers whole, so it reads against nothing.
+        // A restart row holds its numbers whole, so it reads against nothing
         if self.index.is_multiple_of(RESTART_INTERVAL) {
             self.tail = [0; TAIL_CAP];
         }
@@ -749,10 +737,7 @@ impl PrefixRows {
             })
     }
 
-    /// The key one row stands for, decoded from its restart block
-    ///
-    /// Costs the restart interval per call, so a walk holds its key and advances
-    /// it instead of asking here per row.
+    /// The key one row stands for, decoded from its whole restart block on every call
     pub fn key_of(&self, index: usize) -> Result<Vec<u8>> {
         Ok(self.row_of(index)?.0)
     }
@@ -905,7 +890,7 @@ pub fn unpack_block(bytes: &[u8], shape: Tail) -> Result<(Vec<u8>, Vec<u32>)> {
     let mut at = 0usize;
     let mut index = 0usize;
     while at < bytes.len() {
-        // Every restart row holds its numbers whole, so it reads against nothing.
+        // Every restart row holds its numbers whole, so it reads against nothing
         if index.is_multiple_of(RESTART_INTERVAL) {
             before = [0; TAIL_CAP];
         }
@@ -981,8 +966,7 @@ impl PrefixRows {
             packed: bytes[..frame.rows_end].to_vec(),
             restarts,
             rows: frame.rows,
-            // Only an append measures against the last key and tail, and a decoded
-            // block is not appended to.
+            // Nothing appends to a decoded block, so it needs no last key or tail
             last: Vec::new(),
             last_tail: [0; TAIL_CAP],
             tail,
@@ -995,10 +979,10 @@ struct Frame {
     /// Bytes of rows, which is where the restarts begin
     rows_end: usize,
 
-    /// Restarts the trailer counts
+    /// The trailer's restart count
     restarts: usize,
 
-    /// Rows the trailer counts
+    /// The trailer's row count
     rows: usize,
 }
 
@@ -1046,11 +1030,7 @@ impl Frame {
     }
 }
 
-/// Rebuild an encoded block's rows whole, read where they lie
-///
-/// What `decode` and `unpacked` do together, with no copy of the rows first. Rows of
-/// one width (`row_len` bytes each, key and tail) come back strided with no starts, in a
-/// buffer sized exactly. Each restart offset has to land on the row it says it opens.
+/// Rebuild an encoded block's rows whole, strided with no starts when `row_len` is set
 pub fn unpack(
     bytes: &[u8],
     tail: Tail,

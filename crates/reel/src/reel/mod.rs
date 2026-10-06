@@ -81,12 +81,7 @@ const DIRECT_RECORD_FLOOR: u32 = 1024 * 1024;
 /// is the case it loses.
 const DIRECT_DEPTH_FLOOR: u64 = 2;
 
-/// Where the spot index reads the records its entries point at
-///
-/// A keyless segment's records hold no key. A key's lone candidate confirms itself
-/// by its record's keyed check, in one read. Every other one is confirmed by its footer
-/// row, which has to be filed under the key at the candidate's offset, and the row
-/// gives the version a lookup orders candidates by.
+/// The spot index reads its candidates' records through this
 impl RecordSource for ReelShared {
     fn head(&self, key: KeyRef<'_>, segment: SegmentId, offset: u32) -> Result<HeadRead> {
         let Some(handle) = self.handle_for(segment)? else {
@@ -175,11 +170,6 @@ impl RecordSource for ReelShared {
 }
 
 /// Settle a lone candidate's keyless record off its own check, or leave it to the footer row
-///
-/// The read took the bound its slot's length class gives, which every length in that
-/// class fits, and the record says where its payload ends inside it. A record that
-/// checks out under the key is the key's one sealed version. Anything else, another
-/// key's record or rot, only the row can tell apart, so nothing comes back for it.
 fn lone_keyless(
     answer: SplitAnswer,
     key: &RecordKey,
@@ -203,6 +193,7 @@ fn lone_keyless(
     body.truncate(len as usize);
     let read = check_keyless(&head, &body, key.as_ref(), Flags::DATA, check);
     recycle_header(head);
+    // Another key's record and rot look alike here, so the row decides
     let KeylessRead::Intact(codec) = read else {
         crate::reel::payload::give(body);
         return Ok(None);
@@ -218,7 +209,7 @@ fn lone_keyless(
     ))
 }
 
-/// A window of a payload a read already holds, in a buffer of its own
+/// Copy a window of a payload already in hand into a buffer of its own
 fn window_of_value(value: &Value, at: u64, len: usize) -> Option<Value> {
     let wanted = (value.len() as u64).saturating_sub(at).min(len as u64) as usize;
     let window = value.get(at as usize..at as usize + wanted)?;
@@ -246,10 +237,8 @@ fn range_of(read: SpotRead, at: u64, len: usize) -> SpotRange {
 }
 
 /// What a keyless segment's row for a key says about the candidate at an offset
-///
-/// The record holds no key, so only the row at the key sitting exactly there makes
-/// the candidate the key's. A range delete covers a span and answers for no key.
 fn keyless_head_of(found: Option<FooterRow>, offset: u32) -> HeadRead {
+    // A range delete covers a span, so its row answers for no single key
     match found {
         Some(row) if row.offset == offset && !row.is_range_tombstone() => HeadRead::Same(Head {
             lsn: row.lsn,
@@ -275,37 +264,51 @@ fn row_at_offset(
     Ok(None)
 }
 
-/// What one spot index range read settled
+/// The outcome of one spot index range read
 pub enum SpotRange {
     /// The key's record at this candidate, and the window of its payload asked for
     Found(Head, Value),
 
     /// The window of a lone candidate's record, confirmed by its own check with no version read
     Newest(Value),
+
+    /// The key's tombstone at this candidate
     Tombstone(Head),
+
+    /// The candidate is not the key's record
     Other,
+
+    /// The candidate's segment is gone
     Gone,
 
     /// A coded record, or one the read came up short on, which the checked path reads
     Unsure,
 }
 
-/// One spot index candidate a batch reads
+/// One spot index candidate in a batch
 pub struct SpotAsk<'a> {
+    /// The key being looked up
     pub key: &'a RecordKey,
+
+    /// The segment holding the candidate
     pub segment: SegmentId,
+
+    /// The candidate's offset in its segment
     pub offset: u32,
+
+    /// The read takes this many payload bytes, enough for any length in the slot's class
     pub bound: u32,
 
-    /// The key's only slot, so a keyless record may confirm itself
+    /// Whether this is the key's only slot, so a keyless record may confirm itself
     pub alone: bool,
 }
 
-/// What one bounded read of a spot index candidate settled
+/// The outcome of one bounded read of a spot index candidate
 enum Verdict {
+    /// The bounded read settled the candidate
     Read(SpotRead),
 
-    /// The file ends inside the bound, so the record reads again at its own length
+    /// The record runs past the bounded read, so it reads again at its own length
     Whole(Head),
 }
 
@@ -326,12 +329,9 @@ enum Asked {
 
 impl ReelShared {
     /// Confirm a candidate in a keyless segment against the footer row filed under its key at its offset
-    ///
-    /// The search finds a key's newest row, which nearly always is the candidate. An
-    /// older version the segment also holds sits elsewhere in the key's run of rows. A
-    /// record no row of the key sits at belongs to another key.
     fn keyless_head(&self, key: KeyRef<'_>, segment: SegmentId, offset: u32) -> Result<HeadRead> {
         let newest = self.find(segment, key.column, key.bytes)?;
+        // The newest row nearly always is the candidate, so only a miss walks the key's run
         if newest.as_ref().is_none_or(|row| row.offset == offset) {
             return Ok(keyless_head_of(newest, offset));
         }
@@ -346,9 +346,6 @@ impl ReelShared {
     }
 
     /// One candidate in a keyless segment, settled off its row and one read of its record
-    ///
-    /// The record is checked against the row's key and version. A record past the
-    /// keyless ceiling keeps its header and reads as a keyed one does.
     fn keyless_record(
         &self,
         handle: &SegmentHandle,
@@ -367,10 +364,7 @@ impl ReelShared {
         self.whole_record(handle, key, head, Loc::new(segment, offset, head.len))
     }
 
-    /// A window of a keyless candidate's record, read whole since only the whole checks
-    ///
-    /// Nothing for a record past the keyless ceiling, which keeps its header and reads
-    /// its window the way a keyed one does.
+    /// A window of a keyless candidate's record read whole, or nothing for a record past the keyless ceiling
     fn keyless_range(
         &self,
         handle: &SegmentHandle,
@@ -500,11 +494,6 @@ impl ReelShared {
     }
 
     /// A window of the record at a place, its header and the window in one round trip
-    ///
-    /// A window near the payload's front comes in one span with the header, and a deeper
-    /// one is a second read submitted with the first. The key is confirmed from the
-    /// header and the window cut to the payload the header gives. A keyless record has
-    /// no header to confirm against, so its row confirms it and it is read whole.
     #[allow(clippy::too_many_arguments)]
     pub fn spot_range(
         &self,
@@ -688,10 +677,7 @@ impl ReelShared {
         Ok(reads)
     }
 
-    /// The read each candidate takes, and the handle holding its segment open
-    ///
-    /// A keyless segment's candidate is confirmed off its row first, so its read is the
-    /// record at its exact length, and a candidate the row rules out reads nothing.
+    /// Plan one read per candidate, with the handle holding its segment open
     fn spot_ops(&self, asks: &[SpotAsk<'_>]) -> Result<(Vec<Op>, Vec<Asked>)> {
         let mut ops = Vec::with_capacity(asks.len());
         let mut asked = Vec::with_capacity(asks.len());
@@ -967,7 +953,7 @@ fn next_split(filled: &mut impl Iterator<Item = SplitRead>) -> Result<SplitAnswe
     }
 }
 
-/// What a record's header says about one key, a pad or another key reading as other
+/// What a record's header says about one key, any other record reading as other
 fn head_read(prefix: &[u8], key: KeyRef<'_>) -> HeadRead {
     match crate::format::record::head_for(prefix, key) {
         Some((lsn, len, flags)) if flags.is_data() || flags.is_tombstone() => {
@@ -1193,7 +1179,7 @@ struct Pending {
     /// Whether a caller is already noting this one's spans
     is_taken: bool,
 
-    /// The footer the seal wrote, so noting and handing over never read it back
+    /// The seal's footer, kept so noting and handing over never read it back
     footer: Arc<SegmentFooter>,
 }
 
@@ -1434,12 +1420,10 @@ impl ReelShared {
         self.sealed_waiting.load(Ordering::Acquire)
     }
 
-    /// The segments sealed since this was last asked, each with the footer its seal wrote
-    ///
-    /// They stay on the queue, where a compaction pass can still see their spans
-    /// are owed; clearing the flag only sends other callers past this batch.
+    /// The segments sealed since the last call, each with its seal's footer
     pub fn peek_sealed(&self) -> Vec<(SegmentId, Arc<SegmentFooter>)> {
         let mut pending = lock(&self.sealed_pending);
+        // Entries stay queued for compaction to see, and the cleared flag only sends other callers past them
         self.sealed_waiting.store(false, Ordering::Release);
         let mut taken = Vec::with_capacity(pending.len());
         for entry in pending.iter_mut().filter(|entry| !entry.is_taken) {
@@ -1870,11 +1854,7 @@ pub struct Reel {
     shared: Arc<ReelShared>,
     tails: Vec<Appender>,
     bands: BandPool,
-
-    /// Tails kept back for compaction at the end of `tails`, one per pass at once
     reserved: usize,
-
-    /// The reserved tails a pass holds, one bit each
     leased: AtomicU64,
 }
 
@@ -1898,7 +1878,7 @@ impl Drop for ReservedLease<'_> {
     }
 }
 
-/// Tails a volume keeps back for compaction: one per pass it runs at once, or none
+/// Only a reserved tail answers to a chosen tier, so a volume with a capacity tier keeps one per compaction pass
 fn reserved_count(shared: &ReelShared) -> usize {
     match shared.volumes.has_capacity() {
         true => shared.config.compact_passes(),
@@ -1906,10 +1886,10 @@ fn reserved_count(shared: &ReelShared) -> usize {
     }
 }
 
-/// Records the mapped check looks ahead by, so that many memory stalls overlap
+/// The mapped check looks this many records ahead, so that many memory stalls overlap
 const PREFETCH_AHEAD: usize = 16;
 
-/// Lines of one record asked for ahead: its header, its key and a small payload
+/// The prefetch asks for this many lines of a record: its header, its key and a small payload
 const PREFETCH_LINES: usize = 4;
 
 const CACHE_LINE: usize = 64;
@@ -1923,21 +1903,14 @@ fn prefetch_record(record: &[u8]) {
 }
 
 impl Reel {
-    /// Open a reel with the configured number of active tails
-    ///
-    /// A volume that owns a capacity tier keeps a tail back for each compaction pass it
-    /// runs at once, since only a reserved tail answers to a chosen tier. The reserved
-    /// tails come last and route never offers them.
-    ///
-    /// Tails a previous process left unsealed are picked up in number order, so a restart
-    /// continues its segments. A reserved tail never resumes, so each pass starts on a
-    /// segment of its own.
+    /// Open a reel with the configured number of active tails, resuming unsealed ones in number order
     pub fn open(shared: Arc<ReelShared>, resumable: Vec<ResumableTail>) -> Result<Reel> {
         let count = shared.config.tail_count();
         let reserved = reserved_count(&shared);
         let mut candidates = resumable.into_iter();
         let mut tails = Vec::with_capacity(count + reserved);
         for index in 0..count + reserved {
+            // Reserved tails come last and never resume, so each pass starts on a segment of its own
             let adopted = match index < count {
                 true => candidates.next(),
                 false => None,
@@ -2592,17 +2565,13 @@ impl Reel {
         scratch.order.clear();
         scratch.plan.clear();
         scratch.handles.clear();
-        // Every mapped record's segment is held before any is read, so the records
-        // below are cut from a handle list nothing moves.
+        // Every mapped segment is held before any read, so the handle list never moves under a borrowed record
         for ask in asks {
             if self.maps(ask.loc.segment, ask.loc.len as usize) {
                 self.hold_segment(ask.loc.segment, &mut scratch.handles)?;
             }
         }
-        // A scan's keys land on records spread over the volume, and the check below
-        // paid one memory stall a record, in turn. Each record is found once and its
-        // lines asked for then, and the check reaches it a window later, so the
-        // stalls overlap.
+        // Each record is prefetched a window ahead of its check, so the memory stalls overlap
         let handles = &scratch.handles;
         let mut ahead: [Option<(&[u8], RecordLayout)>; PREFETCH_AHEAD] = [None; PREFETCH_AHEAD];
         let mut mapped = Vec::new();
@@ -2747,12 +2716,9 @@ impl Reel {
     }
 
     /// Whether a read of `len` bytes in `segment` goes through the segment's mapping
-    ///
-    /// A tail's pages were just written, so they are in the page cache and a mapping
-    /// copies them with no syscall. A scan of 1,000 keys reads its tail keys one at a
-    /// time, which made preads 84% of its time.
     fn maps(&self, segment: SegmentId, len: usize) -> bool {
         let config = &self.shared.config;
+        // A tail's pages were just written, so a mapping reads them from the page cache with no syscall
         config.maps(len)
             || (config.maps_tails()
                 && self

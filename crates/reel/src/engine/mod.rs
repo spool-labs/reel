@@ -428,8 +428,7 @@ impl ReelStore {
                     );
                 }
             }
-            // A journal outlives its segment's seal only when a crash lands between the
-            // two, and a resume a crash cut short leaves its part file.
+            // A crash mid-seal or mid-resume can leave a journal or its part file behind
             for root in &roots {
                 if let Err(error) =
                     crate::index::recovery::remove_stale_journals(&driver, root, &rebuilt.consumed)
@@ -470,8 +469,7 @@ impl ReelStore {
         // And the other direction: a seal writes down what its segment weighs, and
         // these are the counters that know.
         shared.set_segments(index.segments_handle());
-        // A resident volume loads the runs a paged opening wrote too, since a delete
-        // stands while a run holds an older row of its key.
+        // A resident volume loads a paged opening's runs too, since a delete stands while a run holds an older row
         if !is_read_only {
             index
                 .key_runs()
@@ -555,12 +553,7 @@ impl ReelStore {
         self.driver.serving()
     }
 
-    /// One page of a column's live keys, in no promised order
-    ///
-    /// The mark is opaque bytes: hand back whatever the last page answered, and
-    /// nothing to start. `None` back means the column is done. Every live key is
-    /// handed out at least once. A mark another opening minted starts the column
-    /// over, so a caller has to be idempotent, which every caller of this is.
+    /// One page of a column's live keys in no promised order, every key at least once per full sweep
     pub fn sweep_column(
         &self,
         column: ColumnId,
@@ -606,7 +599,7 @@ impl ReelStore {
         &self.cues
     }
 
-    /// Bytes the byte counters may sit from the truth, from overwrites booked by length class
+    /// Slack in the byte counters from overwrites booked by length class
     pub fn spot_slack(&self) -> u64 {
         self.index.spot_slack()
     }
@@ -689,7 +682,7 @@ impl ReelStore {
         self.index.resident_bytes()
     }
 
-    /// Bytes the footer cache holds across its footers, directories and blocks
+    /// Total bytes in the footer cache across its footers, directories and blocks
     pub fn footer_cache_bytes(&self) -> ByteCount {
         ByteCount::from_bytes(self.reel.shared().footers.held_bytes() as u64)
     }

@@ -1,19 +1,5 @@
-//! The spot index point reads under writers, deletes, seals, handovers and compaction, drawn from one seed
-//!
-//! Segments are tiny and the volume pages, so seals hand keys to the spot index, compaction
-//! repoints and retires segments, and the cleaner runs, all while readers run. Each key
-//! has one writer, which marks an op started before it runs and completed after. A read
-//! must answer a put whose op falls between the op completed when it began and the op
-//! started when it ended, and may answer nothing only when a delete falls there too.
-//! Once writers stop, and again after a reopen, every key answers its last op.
-//!
-//! Off Linux the page-cache probe always answers cold, so an overwrite always reads the
-//! displaced header from the device. On Linux the same run takes the cached path too.
-//!
-//! Keys are scattered, the way content addresses spread.
-//!
-//! Knobs: REEL_FF_SEEDS (how many seeds, default 4), REEL_FF_FIRST (the first seed, default
-//! 1), REEL_FF_OPS (ops per writer, default 2000) and REEL_FF_SEED (one seed to replay).
+//! Spot index point reads stay correct under writers, deletes, seals, handovers and compaction
+//! Knobs: REEL_FF_SEEDS (default 4), REEL_FF_FIRST (default 1), REEL_FF_OPS (ops per writer, default 2000), REEL_FF_SEED (replays one seed)
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -80,7 +66,7 @@ fn value_of(key: u64, op: u64, len: usize) -> Vec<u8> {
     out
 }
 
-/// The op a value claims, once its key and filler check out
+/// Returns the op a value claims after checking its key and filler
 fn op_of(seed: u64, key: u64, value: &[u8]) -> u64 {
     assert!(
         value.len() >= 16,
@@ -116,10 +102,10 @@ fn config(rng: &mut SmallRng) -> ReelConfig {
 
 /// What each key's one writer has done, op by op
 struct Ledger {
-    /// The newest op a writer has begun on each key
+    /// Each key's newest started op
     started: Vec<AtomicU64>,
 
-    /// The newest op a writer has finished on each key
+    /// Each key's newest completed op
     completed: Vec<AtomicU64>,
 
     /// The ops that deleted each key
@@ -189,9 +175,6 @@ fn record_key(key: u64) -> RecordKey {
 }
 
 /// Whether a window could have come from a put that falls between `floor` and `ceiling`
-///
-/// A value's filler depends on its key and op alone, so the window's bytes are the same
-/// whatever length that put was written at.
 fn admits_window(
     ledger: &Ledger,
     key: u64,
@@ -204,12 +187,13 @@ fn admits_window(
     (floor..=ceiling)
         .filter(|op| *op > 0 && !ledger.is_delete(key, *op))
         .any(|op| {
+            // The filler depends on key and op alone, so the window reads the same at any put length
             let full = value_of(key, op, end.saturating_sub(16));
             full.len() >= end && full[at as usize..end] == *window
         })
 }
 
-/// Reads one key, or a few, through each of the store's read paths in turn
+/// Reads one key, or a few, through each of the store's read paths at random
 fn reader(store: &ReelStore, ledger: &Ledger, seed: u64, id: u64, done: &AtomicBool) -> u64 {
     let mut rng = SmallRng::seed_from_u64(seed ^ (id << 48) ^ 0x5A5A);
     let mut read = 0u64;
@@ -355,6 +339,7 @@ fn seeds(columns: ColumnSet) {
     }
 }
 
+// every point read answers an op inside its window while writers, seals and compaction run
 #[test]
 fn spot_index_reads_hold_under_writes_and_compaction() {
     seeds(TREE);

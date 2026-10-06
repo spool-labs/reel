@@ -87,9 +87,6 @@ enum TombstoneStep {
 }
 
 /// One record read back from a segment during compaction, a merge or a scrub
-///
-/// A keyless record's header is put together from its footer row and its codec, and
-/// its check stays the one it was written with, which `verify` checks.
 pub struct SourceRecord {
     /// What the record says about itself, key and sequence number included
     pub header: RecordHeader,
@@ -158,12 +155,7 @@ impl SourceRecord {
     }
 }
 
-/// The record one footer row stands for, read the way its segment frames it
-///
-/// A keyless record's key, version, length and kind come off the row and only its
-/// check and codec off the file, so nothing here has been verified yet. A record past
-/// the keyless ceiling keeps its header and is read as a keyed one is. Nothing where
-/// the bytes are not the record the row says sits there.
+/// Read the record behind a footer row in its segment's layout, leaving the payload unverified
 pub fn row_record(
     reader: &mut SegmentReader<'_>,
     layout: RecordLayout,
@@ -336,7 +328,7 @@ struct CopyRun {
     /// The records the appender is handed
     copies: Vec<CopyRecord>,
 
-    /// Each queued record's key, sequence number and span, for its repoint and the tally
+    /// Each queued record's key, source place, sequence number and span, for its repoint and the tally
     moved: Vec<(RecordKey, Loc, Lsn, u64)>,
 
     /// The landed run's repoints, kept for the next run once published
@@ -494,8 +486,7 @@ impl Compactor {
     /// deadlock guard is off: a full disk cannot be compacted out of, because compaction
     /// needs somewhere to write the survivors.
     pub fn new(config: &ReelConfig, capacity_bytes: u64, fast_capacity_bytes: u64) -> Compactor {
-        // One segment for each pass to write survivors into, plus one per tail, since
-        // between two maintenance ticks every tail can roll and claim a fresh segment.
+        // Each pass needs a survivor segment, and every tail can roll to a fresh one between ticks
         let reserve = config.segment_bytes.to_bytes()
             * (config.tail_count() + config.compact_passes()) as u64;
         // Half the fast tier of later ingest: late enough that the hot set stays hot,
@@ -719,8 +710,7 @@ impl Compactor {
         // read once for the pass: where the records end, and their key order where the
         // segment can say what that is, offset order otherwise
         let footer = shared.footer_of(segment)?;
-        // A keyless segment with no footer is a merge's output that never sealed. Its
-        // keys are in no row a rewrite could read, so it stands until a reopen drops it.
+        // No row lists an unsealed keyless segment's keys, so it stands until a reopen drops it
         if source.layout().is_keyless_layout() && footer.is_none() {
             return Ok(());
         }
@@ -732,9 +722,7 @@ impl Compactor {
         // the writer paid for is undone otherwise: every rewrite would put a window's
         // records back into the mixture they were kept out of.
         let band = band_of(shared, &source)?;
-        // A volume that keeps tails back writes each pass into one of its own, the only
-        // tail that answers to a chosen tier. Otherwise the survivors route the way a
-        // fresh write of the same band would.
+        // Only a reserved tail answers to a chosen tier, so a volume with them waits for a free one
         let lease = reel.lease_reserved();
         if reel.keeps_reserved() && lease.is_none() {
             return Ok(());
@@ -744,10 +732,7 @@ impl Compactor {
             None => reel.place(band)?,
         };
 
-        // Only a reserved tail answers to a chosen tier and to the source's band, since
-        // a foreground destination mixes fresh puts in and fresh puts stay fast. A
-        // leftover active segment from another tier or another band is sealed away so
-        // the swap draws under what this pass just set.
+        // Seal a leftover segment of another tier or band, so the swap draws under this pass's settings
         if lease.is_some() {
             let class = self.output_class(shared, segment);
             let dest = &reel.tails()[dest_index];
@@ -781,8 +766,7 @@ impl Compactor {
                 &mut tally,
                 &mut pace,
             ),
-            // a keyless segment's records are listed by its rows alone, so one whose rows
-            // will not decode keeps its records until its footer reads
+            // only rows list a keyless segment's records, so undecodable rows leave it in place
             None if source.layout().is_keyless_layout() => Ok(()),
             None => self.rewrite_scanning(
                 reel,
@@ -1014,7 +998,7 @@ impl Compactor {
         tally: &mut PassTally,
     ) -> Result<()> {
         let cap = reel.tails()[dest_index].copy_run_cap();
-        // what the copy takes in the destination, a keyed tail whatever the source
+        // size the copy as a keyed record, since every destination tail is keyed
         if !record.header.flags.is_data() || run.bytes + record.header.span() > cap {
             self.land_run(reel, dest_index, index, run, tally)?;
         }
@@ -1127,8 +1111,7 @@ impl Compactor {
             if source.layout().is_keyless_layout() {
                 keyless_dead_runs(index, &mut reader, &footer, segment, &mut runs)?;
             }
-            // The footer's rows drive the walk: a hole an earlier pass left reads as
-            // zeroed headers, which a sequential scan takes for the end of data.
+            // Walk by rows, since a scan reads an earlier pass's zeroed hole as the end of data
             let mut offsets: Vec<u32> = Vec::new();
             if source.layout() == RecordLayout::Keyed {
                 for partition in &footer.partitions {
@@ -1229,8 +1212,7 @@ impl Compactor {
             return Ok(CopyStep::Rotted);
         }
 
-        // The appender owns what it writes and the repoint needs the key again, so
-        // the key is cloned once. The span is the copy's, in a keyed destination.
+        // The repoint needs the key again, and the span is the keyed copy's
         let span = record.header.span();
         let header = record.header;
         run.bytes += span;
@@ -1275,8 +1257,7 @@ impl Compactor {
         // the destination has to know it holds these, or it seals with no row and the
         // delete is lost
         index.hold(&record.header.key, record.header.lsn, carried.loc);
-        // A paged column gave the delete's grave up once its segment sealed, and this pass
-        // retires that segment, so the copy stands a grave until its own segment is noted.
+        // A paged grave went with the source's seal, so the copy holds one until its segment is noted
         if record.header.flags.is_tombstone() {
             index.hold_grave(&record.header.key, record.header.lsn, carried.loc.segment);
         }
@@ -1434,8 +1415,7 @@ impl Compactor {
         };
         let mut reader = SegmentReader::new(&shared.driver, handle.file(), region_end);
         if handle.layout().is_keyless_layout() {
-            // a keyless segment with no footer is a merge's output that never sealed,
-            // which holds nothing the index can name
+            // an unsealed keyless segment holds no record the index points at
             let Some(footer) = shared.footer_of(handle.id())? else {
                 return Ok(ScrubStep {
                     hits: 0,
@@ -1522,18 +1502,13 @@ impl Compactor {
 struct KeylessScrub<'a> {
     index: &'a ReelIndex,
     segment: SegmentId,
-
-    /// The segment's layout, which holds the key its records are checked under
     layout: RecordLayout,
     region_end: u64,
     deadline: Instant,
 }
 
 impl Compactor {
-    /// Scrub a keyless segment from its rows, resuming at the first row at or past `from`
-    ///
-    /// The rows go in key order, so they are put in offset order first, and a pass
-    /// resumes at the first record at or past where the last one stopped.
+    /// Scrub a keyless segment's rows in offset order, from the first row at or past `from`
     #[allow(clippy::too_many_arguments)]
     fn scrub_keyless(
         &self,
@@ -1606,9 +1581,6 @@ impl Compactor {
 }
 
 /// The dead runs of a keyless segment, found from its rows and coalesced in offset order
-///
-/// A record past the keyless ceiling keeps its header and is read where it lies, as a
-/// keyed one is.
 fn keyless_dead_runs(
     index: &ReelIndex,
     reader: &mut SegmentReader<'_>,
@@ -1652,11 +1624,7 @@ fn keyless_dead_runs(
     Ok(())
 }
 
-/// One footer's records in key order, per column, as offset and length pairs
-///
-/// The order a rewrite applies its copies in. Nothing where a row will not decode: the
-/// records behind such a footer are still there to be scanned, so the pass reads them in
-/// offset order.
+/// Each column's records in key order as offset and length pairs, nothing if a row will not decode
 fn footer_order(footer: &SegmentFooter) -> Option<(Vec<(u32, u32)>, u64)> {
     let mut order = Vec::with_capacity(footer.entry_count());
     let mut widest = 0usize;
@@ -1685,9 +1653,7 @@ fn should_carry(index: &ReelIndex, tombstone: &RecordHeader, drop_floor: Lsn) ->
             }
         }
     }
-    // A key run keeps the rows of segments a rewrite retired, and the floor knows nothing
-    // of those, so a delete stands while a run still holds what it deleted. A range is
-    // kept whole while any run stands, since no one row says what it reaches.
+    // The floor never sees key run rows, so a delete stands while a run may hold what it deleted
     let key_runs = index.key_runs();
     let is_held_below = match tombstone.flags.is_range_tombstone() {
         true => !key_runs.runs().is_empty(),
@@ -1907,10 +1873,7 @@ impl<'reader, 'driver> RecordScan<'reader, 'driver> {
     }
 }
 
-/// The record a held stretch of a segment opens with, and its payload inside the stretch
-///
-/// Nothing where the bytes are not a whole record a rewrite carries.
-/// What an ordered rewrite walks: the footer's order, and the rows a keyless record is keyed by
+/// Inputs to an ordered rewrite: the footer's order, and the rows that key keyless records
 struct Ordered<'a> {
     order: &'a [(u32, u32)],
     prefix_bound: u64,
@@ -1918,7 +1881,7 @@ struct Ordered<'a> {
     layout: RecordLayout,
 }
 
-/// Every row of a footer with its key, in the order `footer_order` lists their records
+/// Every row of a footer with its key, in the same order as `footer_order`
 fn footer_rows(footer: &SegmentFooter) -> Result<Vec<(RecordKey, FooterRow)>> {
     let mut rows = Vec::with_capacity(footer.entry_count());
     for partition in &footer.partitions {
@@ -1962,6 +1925,7 @@ fn keyless_held(
     ))
 }
 
+/// The record that opens a held stretch and its payload, if it is whole and a rewrite moves it
 fn held_record(offset: u32, held: Part) -> Option<(SourceRecord, Option<Part>)> {
     let bytes = held.as_slice();
     let width = peek_key_width(bytes.get(..HEADER_LEN)?)?;

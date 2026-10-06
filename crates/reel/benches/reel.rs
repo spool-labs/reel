@@ -584,9 +584,7 @@ fn count(c: &mut Criterion) {
     group.finish();
 }
 
-/// The checksum primitives every appended record pays for
-///
-/// A put past the keyless ceiling checksums its header and payload as one record.
+/// Benches the checksum primitives that a put past the keyless ceiling pays for
 fn checksum_primitives(c: &mut Criterion) {
     let mut group = c.benchmark_group("checksum");
     let header = [0x5au8; 24];

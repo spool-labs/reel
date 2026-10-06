@@ -130,7 +130,7 @@ fn filled_under(config: ReelConfig) -> (ReelStore, SimIo) {
 /// Probe a sample of the keys, and say what finding them cost
 fn hit_counts(store: &ReelStore) -> ProbeCounts {
     let stride = keys() / PROBES;
-    // The index's own search as of a cue point, since the spot index answers a store read first.
+    // Ask the index itself as of a cue point, since the spot index answers a store read first
     let cue = store.cue().expect("cue");
     let before = store.filter_probes();
     for at in 0..PROBES {
@@ -219,11 +219,6 @@ fn a_fence_lands_a_search_on_one_block() {
 }
 
 // what an in-range miss costs a fenced sorted run, with a filter and without
-//
-// A key no sealed segment holds is ruled out ahead of the fan-out by the spot index,
-// which holds no slot for it. The miss that survives is the fan-out's own, and a fence cannot
-// stand in for a filter there: the leads say where a key would sit, never whether
-// it is there.
 #[test]
 fn what_a_miss_costs_without_a_filter() {
     let (bare, _) = filled_under(filtered_config(FenceResidency::Resident, 0));
@@ -546,11 +541,7 @@ fn a_fence_finds_nothing_that_is_not_there() {
     }
 }
 
-// a fence a crash left half written is a torn footer, and a torn footer is refused
-//
-// The leads live inside the footer's own checksum, so a flipped bit fails the whole
-// footer. Its records are keyless and its journal went with the seal, so the segment's
-// keys go with the footer and every other segment's stay.
+// a torn fence fails the whole footer, taking that segment's keys and leaving every other segment's
 #[test]
 fn a_torn_fence_costs_the_footer() {
     let (store, sim) = filled(FenceResidency::Resident);

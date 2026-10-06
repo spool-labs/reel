@@ -252,10 +252,7 @@ impl SealedRanges {
             })
     }
 
-    /// The most sealed segments any one key falls inside, leaving out the covered ones
-    ///
-    /// What a walk from that key merges. A segment a key run covers is no run of the
-    /// walk's own, so the walk's depth leaves it out and counts the key run instead.
+    /// The most sealed segments over any one key, leaving out those a key run covers
     pub fn depth_past(&self, covered: &std::collections::HashSet<SegmentId>) -> usize {
         let sealed = read(&self.ranges);
         let mut open: std::collections::BinaryHeap<std::cmp::Reverse<&[u8]>> =

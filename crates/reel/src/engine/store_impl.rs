@@ -595,11 +595,7 @@ impl ReelStore {
         bytes
     }
 
-    /// One page of keys for a sweep, and the mark the next page resumes from
-    ///
-    /// A resident map holds every key and sweeps in its own order. A paged volume's map
-    /// holds only what no footer covers yet, so its sweep pages the column in key order,
-    /// which reads the sealed keys too, and marks with the last key it handed out.
+    /// One page of keys for a sweep, with the next page's resume mark
     fn swept_keys(
         &self,
         column: ColumnId,
@@ -608,6 +604,7 @@ impl ReelStore {
         limit: usize,
     ) -> StoreResult<SweptKeys> {
         let mut page = KeyPage::default();
+        // Only a resident map holds every key, so a paged volume pages the column in key order
         if !self.config.index.pages() {
             let next = match prefix {
                 Some(prefix) => self.sweep_column_prefix(column, prefix, from, limit, &mut page),
@@ -618,8 +615,7 @@ impl ReelStore {
         if limit == 0 {
             return Ok((Vec::new(), from.map(<[u8]>::to_vec)));
         }
-        // A mark another opening minted starts the sweep over, which a promise of every key
-        // at least once allows.
+        // A mark from another opening restarts the sweep, which at-least-once delivery allows
         let after = from
             .and_then(ColumnMark::unpack)
             .filter(|mark| mark.nonce == self.sweep_nonce)
@@ -720,7 +716,6 @@ impl ReelStore {
     }
 
     fn playback(&self, scope: Scope, column: ColumnId) -> Playback<'_> {
-        // The last playback on this thread left its vectors behind, emptied.
         let mut spare = SPARE_WALK.with(std::cell::Cell::take).unwrap_or_default();
         let buffered = spare.buffered.take().unwrap_or_else(KeyPage::reading);
         let page = Page::open(
@@ -755,7 +750,7 @@ impl ReelStore {
         if hint != 0 {
             playback.run = hint;
             playback.page.size = hint.clamp(1, PLAYBACK_PAGE_MAX);
-            // Sized once to the caller's count, so the first page fills without regrowing.
+            // Reserve the caller's count once so the first page fills without regrowing
             let size = playback.page.size;
             playback.staged.reserve(size);
             playback.found.reserve(size);
@@ -896,8 +891,7 @@ impl Page {
             return Some((taken, self.buffered.found_at(taken)));
         }
 
-        // A page comes back empty with the playback still open when every key on it
-        // was a grave the merge dropped, so the next page is asked for.
+        // A page of graves the merge dropped comes back empty, so ask for the next one
         loop {
             let playback = self.playback.as_mut()?;
             if playback.is_done() {
@@ -908,9 +902,7 @@ impl Page {
             if let Some(KeyWidth::Fixed(width)) = store.key_shape(playback.column()) {
                 self.buffered.reserve(wanted, usize::from(width));
             }
-            // A page a paged column could not read ends the playback short, since an
-            // iterator has nowhere to put an error. Counted, because that count is what
-            // separates a short playback from a complete one that found less.
+            // An iterator cannot return an error, so an unreadable page ends the playback and is counted
             if let Err(error) = store.page_from(playback, wanted, &mut self.buffered) {
                 tracing::warn!("a playback stopped at a page it could not read: {error}");
                 store.note_unreadable();
@@ -967,10 +959,7 @@ struct Playback<'store> {
     spare: Option<Box<WalkBuffers>>,
 }
 
-/// The vectors one playback fills, handed to the thread's next playback when it ends
-///
-/// A short walk spent most of its allocations building these afresh and dropping them,
-/// 22 of them a scan of ten keys.
+/// The next playback on this thread reuses these vectors from the last one
 #[derive(Default)]
 struct WalkBuffers {
     staged: Vec<usize>,
@@ -1149,8 +1138,7 @@ impl Playback<'_> {
             self.found.push(entry);
         }
 
-        // A walk that read a record whole already holds its payload, so only the rest
-        // go to the device.
+        // A walk that read a record whole already has its payload, so only the rest go to the device
         let mut carried = Vec::new();
         for (at, slot) in self.staged.iter().enumerate() {
             if let Some(payload) = self.page.buffered.take_payload(*slot) {
@@ -1864,7 +1852,7 @@ mod tests {
 
     const WIDE_KEY_LEN: usize = 34;
 
-    /// A variable tree and a fixed tree, the shapes a prefix sweep meets
+    /// A variable tree and a fixed tree for the prefix sweep tests
     const SWEEP_COLUMNS: ColumnSet = &[
         ColumnSpec {
             id: ColumnId(1),

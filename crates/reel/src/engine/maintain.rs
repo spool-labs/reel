@@ -22,15 +22,13 @@ use crate::reel::checkpoint::{
 use super::{read_only, CompactPass, ReelStore, Totals, GRAVE_WINDOW, INGEST_HOT_BYTES, SWEEP_RUN};
 use crate::sync::lock;
 
-/// Older versions the spot index cleaner takes out on one maintenance tick, with no reads
+/// The spot index cleaner takes out at most this many older versions a tick, with no reads
 const SPOT_SCRUB_BUDGET: usize = 65_536;
 
-/// Runs one walk merges, the uncovered segments and the key runs, before a key merge
-///
-/// A walk seeks once in every run over its start, so this bounds what a short scan pays.
+/// A key merge runs once a walk merges more runs than this, since a walk seeks once in each
 const MERGE_DEPTH: usize = 8;
 
-/// How often the hand-over runs while compaction passes hold the tick, the tick's own second
+/// The hand-over runs this often while compaction passes hold the tick
 const HANDOVER_TICK: Duration = Duration::from_secs(1);
 
 impl ReelStore {
@@ -260,9 +258,6 @@ impl ReelStore {
     }
 
     /// Record the key range each column occupies in one sealed segment
-    ///
-    /// The half of the handover worth doing on every volume: it names the segments a
-    /// search must consider and rules out the rest, without handing a key over.
     fn note_spans(&self, segment: SegmentId, footer: &SegmentFooter) -> Result<()> {
         // The footer is in hand and the spans are not down yet. A retire that lands
         // here takes the file and clears the registry this is about to write into.
@@ -270,7 +265,7 @@ impl ReelStore {
         self.index.note_spans(segment, footer)
     }
 
-    /// The next sealed segment owed a handover, oldest first, with the footer its seal wrote
+    /// The next sealed segment owed a handover, oldest first, with the footer from its seal
     fn next_to_hand_over(&self) -> Option<(SegmentId, Arc<SegmentFooter>)> {
         lock(&self.held).pop_front()
     }
@@ -291,17 +286,13 @@ impl ReelStore {
     }
 
     /// Take the segments sealed since the last tick, record their spans, and queue the handover
-    ///
-    /// Spans go down first and for every residency, and only a paged volume queues the
-    /// handover. A segment stays on the sealed queue until it has been noted, so nothing
-    /// retires a segment the index cannot search yet.
     pub(super) fn hold_sealed(&self) -> Result<()> {
         let sealed = self.reel.shared().peek_sealed();
         if sealed.is_empty() {
             return Ok(());
         }
         for (segment, footer) in &sealed {
-            // A footer with no key range is given up to compaction.
+            // A footer with no key range is given up to compaction
             if let Err(error) = self.note_spans(*segment, footer) {
                 tracing::warn!(
                     "reel segment {} sealed with a footer that holds no key range: {error}",
@@ -309,6 +300,7 @@ impl ReelStore {
                 );
             }
         }
+        // A segment leaves the sealed queue only once noted, so nothing retires one the index cannot search
         let named: Vec<SegmentId> = sealed.iter().map(|(segment, _)| *segment).collect();
         self.reel.shared().settle_sealed(&named);
 
@@ -343,12 +335,6 @@ impl ReelStore {
     }
 
     /// Merge the walk's runs into one key run once too many stand over one key
-    ///
-    /// What the tick drives. The young pile is every sealed segment no key run covers
-    /// yet. Key runs join it smallest first while each is no bigger than twice what is
-    /// taken, so the young runs merge often and cheaply and a large run is merged again
-    /// only once the pile has grown to its size. Nothing comes back where the walk is
-    /// shallow enough, or another pass holds the seat.
     pub fn merge_when_due(&self) -> Result<Option<MergeReport>> {
         if self.is_read_only {
             return Ok(None);
@@ -389,6 +375,7 @@ impl ReelStore {
                 .map(|column| column.rows())
                 .sum::<u64>()
         });
+        // Runs join smallest first while each stays within twice the pile, so young runs merge often and cheaply
         let mut joining = Vec::new();
         for run in runs {
             let rows: u64 = run.columns().iter().map(|column| column.rows()).sum();
@@ -443,9 +430,7 @@ impl ReelStore {
     fn compact_and_merge(&self) -> Result<()> {
         let running = AtomicBool::new(true);
         std::thread::scope(|scope| {
-            // The hand-over keeps its own second while the passes run. A merge holds the
-            // tick for as long as it takes, and the keys sealed meanwhile would wait in the
-            // map for all of it, holding memory the page cache then goes without.
+            // A merge can hold the tick a long time, so the hand-over keeps freeing sealed keys from the map
             let keeper = scope.spawn(|| -> Result<()> {
                 loop {
                     std::thread::park_timeout(HANDOVER_TICK);
@@ -466,13 +451,9 @@ impl ReelStore {
     }
 
     /// Rewrite and merge with every compaction pass the volume runs at once
-    ///
-    /// A one-pass volume rewrites and then merges, so a run the rewrite unlinked whole
-    /// is never bytes the merge reads. A wider one merges on one worker while the rest
-    /// rewrite, and they keep rewriting for as long as the merge holds the tick, since
-    /// the tick waits for it anyway.
     fn run_passes(&self) -> Result<()> {
         let passes = self.config.compact_passes();
+        // One pass rewrites before it merges, so the merge never reads a run the rewrite unlinked whole
         if passes == 1 {
             self.compact_once()?;
             self.merge_owed();
@@ -484,6 +465,7 @@ impl ReelStore {
                 self.merge_owed();
                 merging.store(false, Ordering::Release);
             });
+            // The other passes keep rewriting while the merge holds the tick, since the tick waits for it anyway
             let workers: Vec<_> = (1..passes)
                 .map(|_| {
                     scope.spawn(|| -> Result<()> {

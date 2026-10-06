@@ -191,8 +191,7 @@ fn reads_back_by_key() {
     assert_eq!(stale, RecordRead::Corrupt);
 }
 
-// an overwritten key's old place still reads its own record, since a keyless record
-// holds no version and the index alone decides which version is current
+// an overwritten key's old place still reads its own record, since a keyless record holds no version
 #[test]
 fn a_superseded_place_reads_its_own_record() {
     let (shared, _sim) = harness(1);
@@ -205,8 +204,7 @@ fn a_superseded_place_reads_its_own_record() {
         .expect("put");
     reel.flush().expect("flush");
 
-    // The old location under the new sequence number, which a keyed record turned down
-    // by its header.
+    // An index that moved on can pair the old place with the new sequence number
     let superseded = reel
         .read_record(first.loc, key(7).as_ref(), second.lsn, true)
         .expect("read");

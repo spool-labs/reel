@@ -1,11 +1,4 @@
 //! Key runs answer every walk and get as the footers they merged would
-//!
-//! Rounds of fresh keys, overwrites and deletes seal segment after segment, and the
-//! maintenance tick merges the walk's runs into key runs whenever too many stand over one
-//! key, moving no record. After every round each key answers its model value alone and
-//! in walks both ways, and so does every key after a reopen reads the runs back. A volume
-//! that also rewrites its dead space moves records out from under the runs, which keep
-//! standing.
 
 use std::collections::BTreeMap;
 
@@ -36,16 +29,16 @@ const VARYING: ColumnSet = &[ColumnSpec {
     codec: Codec::None,
 }];
 
-/// Fresh keys each round adds, a few segments' worth
+/// Each round adds this many fresh keys, a few segments' worth
 const PER_ROUND: u64 = 500;
 
 /// Rounds, enough runs that the merge goes several times and merges its own runs
 const ROUNDS: u64 = 14;
 
-/// Ticks a round drives maintenance for, past what its merges take
+/// Each round drives maintenance for this many ticks, more than its merges take
 const TICKS: usize = 10;
 
-/// Runs one key may fall inside once maintenance has caught up
+/// One key may fall inside this many runs once maintenance has caught up
 const SETTLED_DEPTH: usize = 8;
 
 /// Dead share at which a segment is rewritten, never for the runs alone
@@ -118,7 +111,7 @@ fn check(store: &ReelStore, model: &BTreeMap<Vec<u8>, Vec<u8>>, stage: &str) {
         up == want,
         "{stage}: an ascending walk came back out of step with the model"
     );
-    // A keys-only walk reads no record, so a run's row alone decides whether a key shows.
+    // A keys-only walk reads no record, so a run's row alone decides whether a key shows
     let keys = Store::iter_keys_prefix(store, "rows", &[]).expect("keys");
     let want_keys: Vec<Vec<u8>> = model.keys().cloned().collect();
     assert_eq!(
@@ -141,7 +134,6 @@ fn check(store: &ReelStore, model: &BTreeMap<Vec<u8>, Vec<u8>>, stage: &str) {
         down == want_down,
         "{stage}: a descending walk came back out of step with the model"
     );
-    // a walk from the middle lands where the model says
     if let Some((middle, _)) = want.get(want.len() / 2) {
         let from: Vec<Vec<u8>> = Store::iter_from(store, "rows", middle, Direction::Asc)
             .expect("iter from")
@@ -174,7 +166,6 @@ fn rounds_of(tails: u32, dead_ratio: f64, columns: ColumnSet, key_of: fn(u64) ->
             Store::put(&store, "rows", &key_of(n), &value_of(n, round)).expect("put");
             model.insert(key_of(n), value_of(n, round));
         }
-        // every third round overwrites a slice of older keys and deletes another
         if round % 3 == 2 {
             for n in (0..round * PER_ROUND).step_by(7) {
                 Store::put(&store, "rows", &key_of(n), &value_of(n, round)).expect("overwrite");
@@ -254,10 +245,10 @@ fn key_runs_of_varying_keys_answer_as_the_model_on_four_tails() {
     rounds_of(4, RECLAIM, VARYING, varying_key);
 }
 
-/// Dead share a segment is rewritten at in the scenarios below, so half-dead ones go
+/// The scenarios below rewrite a segment at this dead share, so half-dead ones go
 const HALF_DEAD: f64 = 0.3;
 
-/// Whether an older run points into a retired segment for a key a newer run points into a standing one for
+/// Whether an older run points a key at a retired segment and a newer run at a standing one
 fn is_stale_under_fresh(store: &ReelStore, key: &[u8]) -> bool {
     let index = store.index();
     let mut seen = Vec::new();
@@ -299,11 +290,7 @@ fn compact_all(store: &ReelStore) {
     store.page_out_sealed().expect("hand over");
 }
 
-// One tail writes keys in the order of their numbers, so a stretch of numbers is a
-// segment, while the keys themselves scatter and every segment reaches across the column.
-// A rewrite moves half a covered segment's records, and a later merge puts the copies in a
-// newer run while the old run, still pointing into the retired segment, is read first. The copy
-// keeps its record's sequence number, so only the standing segment can break the tie.
+// a rewritten record answers through the newer run even when a stale run is read first
 #[test]
 fn a_rewritten_record_answers_through_the_newer_run() {
     let dir = TempDir::new().expect("temp dir");
@@ -333,7 +320,7 @@ fn a_rewritten_record_answers_through_the_newer_run() {
         "no covered segment was rewritten"
     );
 
-    // Enough fresh segments to merge, and few enough rows that the base run sits it out.
+    // Enough fresh segments to merge, and few enough rows that the base run sits it out
     for n in 20_000..23_000 {
         put(&store, n, 2);
     }
@@ -357,9 +344,7 @@ fn a_rewritten_record_answers_through_the_newer_run() {
     check(&reopened, &model, "after a reopen");
 }
 
-// Every key is deleted, its old segments retire whole, and the deletes' own segment is
-// rewritten while the run over the old segments still holds each key. Dropping a delete
-// there would bring its key back from the run.
+// rewriting a segment of deletes keeps each delete while a run still holds its key
 #[test]
 fn a_delete_stands_while_a_run_still_holds_its_key() {
     let dir = TempDir::new().expect("temp dir");
@@ -376,7 +361,7 @@ fn a_delete_stands_while_a_run_still_holds_its_key() {
         "the base keys did not merge into one run"
     );
 
-    // Fillers between the deletes, overwritten after, give the deletes' segments dead bytes.
+    // Fillers between the deletes, overwritten after, give the deletes' segments dead bytes
     let filler = |n: u64| key_of(50_000 + n);
     for n in 0..10_000 {
         Store::delete(&store, "rows", &key_of(n)).expect("delete");
@@ -389,7 +374,7 @@ fn a_delete_stands_while_a_run_still_holds_its_key() {
         model.insert(filler(n), value_of(n, 2));
     }
     compact_all(&store);
-    // A pass that copies nothing live counts as an unlink whether or not it copied deletes.
+    // A pass that copies nothing live counts as an unlink whether or not it copied deletes
     assert!(
         store.compaction_counters().segments_unlinked_whole > 0,
         "no old segment retired"

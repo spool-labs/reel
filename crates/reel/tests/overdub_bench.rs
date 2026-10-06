@@ -1,40 +1,5 @@
 //! The composed posture driven end to end by a state-shaped write and read stream
-//!
-//! Every knob the posture is made of is priced somewhere on its own. This drives them
-//! together against the traffic they were chosen for: a small hot core rewritten every
-//! round, a mid population whose re-write gaps are long tailed, and a majority of keys
-//! written exactly once. The reads are batched and skewed toward what was just written,
-//! which is what makes a paged get's search count the term that matters.
-//!
-//! Two flavours, each on its own volume. A paged volume folds its walk into key runs on
-//! its own tick, and the merges column counts the rounds that took one.
-//!
-//! Two read columns rather than one: a search that finds its footer parsed and held costs
-//! no device read at all, so a volume small enough to fit its own footer cache prints
-//! nothing in the device column and everything it did in the search one.
-//!
-//! `REEL_OVERDUB_READERS` spreads a round's read batches over that many threads while the
-//! driver keeps the writes and the tick, so a wide box is asked for more than one core can
-//! ask it. One reader is the sequential run: the driver takes the batches itself, in order,
-//! between the writes and the tick. Past one the columns are a contended volume's, the
-//! writes timed against readers on the same store. Whatever the count, a round joins its
-//! readers before it samples, since a run count or a probe total read while the volume is
-//! still being asked is neither this round's nor the next's. `REEL_OVERDUB_TAILS` sets the
-//! append tails the volume runs, which is what a spread write stream needs to land in.
-//!
-//! Knobs, all optional: `REEL_OVERDUB_DIR`, `REEL_OVERDUB_ROUNDS`, `REEL_OVERDUB_SCALE`,
-//! `REEL_OVERDUB_HOT`, `REEL_OVERDUB_MID`, `REEL_OVERDUB_FRESH`, `REEL_OVERDUB_READS`,
-//! `REEL_OVERDUB_BATCH`, `REEL_OVERDUB_VALUE`, `REEL_OVERDUB_SEGMENT`,
-//! `REEL_OVERDUB_PASSES`, `REEL_OVERDUB_FOOTER_CACHE`,
-//! `REEL_OVERDUB_COMPACT_MBPS`, `REEL_OVERDUB_DEAD_RATIO`, `REEL_OVERDUB_READERS`,
-//! `REEL_OVERDUB_TAILS`.
-//!
-//! Point `REEL_OVERDUB_DIR` at the filesystem under test. Without it the cells land
-//! wherever the temporary directory does, which on a machine with a memory backed one
-//! measures no device at all.
-//!
-//! Ignored by default. Run with:
-//!   cargo test -p tape-reel --test overdub_bench --release -- --ignored --nocapture --test-threads=1
+//! Point `REEL_OVERDUB_DIR` at the filesystem under test, since a memory-backed temp directory measures no device
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -110,10 +75,7 @@ const ALLOC_CHUNK: u64 = 256 * 1024;
 /// Rewrite passes one tick drives before it gives the round back
 const COMPACT_PASSES: u64 = 8;
 
-/// Compaction pace, in megabytes a second
-///
-/// Effectively unpaced by default, so every cell drains its debt at the same speed. A box
-/// run should set this to what its device actually gives back.
+/// Compaction pace in megabytes a second, effectively unpaced so every cell drains its debt at the same speed
 const COMPACT_MBPS: u64 = 100_000;
 
 /// Bytes of sealed-footer state a paged volume keeps at once
@@ -855,9 +817,6 @@ fn run_cell(arm: &Arm, knobs: &Knobs, root: &Path) -> Cell {
 }
 
 // what the composed posture does under a state-shaped stream, by flavour
-//
-// Measurement only, apart from the checks that the run was a run: every key the stream
-// asked for came back, and the volume ended holding something.
 #[test]
 #[ignore = "drives a whole workload, run explicitly on the machine under test"]
 fn composed_posture() {

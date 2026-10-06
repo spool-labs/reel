@@ -1,9 +1,4 @@
-//! On-disk record header, its control flags, and the checksum primitives
-//!
-//! A record is a fixed header, then its key, then its payload. The header says
-//! which column the record belongs to and how wide its key is, so every column
-//! stores keys at its own width and a walk still finds the next record without
-//! parsing a variable-length header.
+//! On-disk records: the keyless prefix, the keyed header, their flags and checksums
 
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -34,17 +29,13 @@ pub const BLOCK: u64 = 4096;
 /// A keyless record writes these bytes ahead of its payload: its check, then its shape
 pub const KEYLESS_PREFIX: usize = 10;
 
-/// A keyless segment drops a record's key and header up to this many payload bytes
-///
-/// A keyless record's checksum is its identity, so every read verifies it whole. Past
-/// this a record keeps its header and key, and a window into it reads without the
-/// rest of its payload.
+/// A keyless segment drops a record's key and header up to this many payload bytes, since every read checks it whole
 pub const KEYLESS_MAX: u32 = 4096;
 
 const KEYLESS_CHECK_AT: usize = 0;
 const KEYLESS_SHAPE_AT: usize = 8;
 
-/// Low bits of a keyless record's shape that hold its codec, under its length
+/// A keyless record's shape keeps its codec in this many low bits, under its length
 const CODEC_BITS: u32 = 2;
 
 /// Every keyless length and codec fits the two bytes a shape takes
@@ -54,7 +45,7 @@ const _: () =
 /// The check covers these bytes ahead of the key: column, key width, kind, shape and payload checksum
 const KEYLESS_FIXED: usize = 10;
 
-/// Bytes of the secret a keyless segment's checks are keyed with
+/// A keyless segment keys its checks with a secret this many bytes long
 pub const CHECK_KEY_LEN: usize = 16;
 
 const OFFSET_LENGTH: usize = 0;
@@ -179,7 +170,7 @@ impl Flags {
         self.0 & FLAG_RELOCATED != 0
     }
 
-    /// Whether this is a pad, a segment header or a batch frame, which no key resolves
+    /// Whether this is a control record, which no key resolves
     pub fn is_control(self) -> bool {
         self.0 & CONTROL_MASK != 0
     }
@@ -342,9 +333,6 @@ impl RecordHeader {
     }
 
     /// A header for a segment of this layout, checksummed the way that segment writes it
-    ///
-    /// A keyless record's check is keyed by the segment it lands in, so `pack_in` takes
-    /// it, and this header is never verified with `verify`.
     pub fn framed(
         layout: RecordLayout,
         length: u32,
@@ -357,6 +345,7 @@ impl RecordHeader {
         if !layout.is_keyless(length) || flags.is_control() {
             return RecordHeader::new_coded(length, lsn, flags, key, codec, payload);
         }
+        // pack_in takes the check under the segment's key, so verify never runs on this header
         RecordHeader {
             length,
             crc: 0,
@@ -462,10 +451,7 @@ impl RecordHeader {
         self.compute_crc(covered) == self.crc
     }
 
-    /// Whether this record carries a payload the length describes
-    ///
-    /// Data records, range tombstones and segment headers have one, and point
-    /// tombstones do not.
+    /// Whether this record has a payload
     pub fn has_payload(&self) -> bool {
         self.flags.is_data() || self.flags.is_segment_header() || self.flags.is_range_tombstone()
     }
@@ -494,10 +480,8 @@ impl RecordHeader {
     }
 
     /// Whether this record lies keyless in a segment of this layout
-    ///
-    /// A control record keeps its header whatever the layout, since a walk finds the
-    /// segment header and the pads by their headers.
     pub fn is_keyless_in(&self, layout: RecordLayout) -> bool {
+        // Readers find a control record by its header, so it keeps one in every layout
         layout.is_keyless(self.length) && !self.flags.is_control()
     }
 
@@ -510,9 +494,6 @@ impl RecordHeader {
     }
 
     /// The prefix of this record in a segment of this layout, over the payload it holds
-    ///
-    /// A keyless record's check is keyed by its segment, so it is taken here, once the
-    /// segment the record lands in is known.
     pub fn pack_in(&self, layout: RecordLayout, payload: &[u8]) -> RecordPrefix {
         match (layout, self.is_keyless_in(layout)) {
             (RecordLayout::Keyless(check), true) => {
@@ -564,9 +545,7 @@ pub fn data_codec(prefix: &[u8], key: KeyRef<'_>, lsn: Lsn, length: u32) -> Opti
     is_match.then_some(fixed[OFFSET_CODEC])
 }
 
-/// A record's version, length and kind, when the prefix it starts holds this key
-///
-/// Read in place, so checking a candidate builds no key.
+/// A record's version, length and kind, read in place when its prefix holds this key
 pub fn head_for(prefix: &[u8], key: KeyRef<'_>) -> Option<(Lsn, u32, Flags)> {
     let fixed = prefix.get(..HEADER_LEN)?;
     let is_match = fixed[OFFSET_COLUMN] == key.column.as_u8()
@@ -598,11 +577,7 @@ pub(crate) fn align_up(value: u64, alignment: u64) -> u64 {
     value.div_ceil(alignment) * alignment
 }
 
-/// How a segment frames the records it holds
-///
-/// Stamped in the segment header at the draw, so every reader of the file frames its
-/// records the same way. Which form one record takes follows from the layout and the
-/// record's stored length, and every reader holds that length before it reads.
+/// How a segment frames its records, stamped in its header so every reader agrees
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RecordLayout {
     /// Every record has its header and its key
@@ -614,9 +589,7 @@ pub enum RecordLayout {
 }
 
 impl RecordLayout {
-    /// The keyless layout as a shape alone, for sizing a record before its segment is drawn
-    ///
-    /// Its key is no segment's, so nothing packs a record under it.
+    /// The keyless layout under no segment's key, for sizing a record before its segment is drawn
     pub const KEYLESS: RecordLayout = RecordLayout::Keyless(CheckKey([0; CHECK_KEY_LEN]));
 
     /// A segment header stores this layout as this byte
@@ -637,7 +610,7 @@ impl RecordLayout {
         self.is_keyless_layout() && fits_keyless(len)
     }
 
-    /// The key a record of this stored length is checked under, where it lies keyless
+    /// The check key for a record of this stored length, or nothing when the record keeps its key
     pub fn keyless_key(self, len: u32) -> Option<CheckKey> {
         match self {
             RecordLayout::Keyless(check) if fits_keyless(len) => Some(check),
@@ -659,11 +632,7 @@ pub fn fits_keyless(len: u32) -> bool {
     len <= KEYLESS_MAX
 }
 
-/// The secret a keyless segment's checks are keyed with, drawn at random per segment
-///
-/// A keyless record's check is what ties it to its key, so it has to be one a writer
-/// choosing keys cannot forge: a checksum is linear, and an unkeyed hash can be searched
-/// offline for a key that matches another's.
+/// A random secret per segment that keys its checks, so a writer choosing keys cannot forge a check
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 pub struct CheckKey([u8; CHECK_KEY_LEN]);
 
@@ -679,12 +648,12 @@ impl CheckKey {
         Ok(CheckKey(bytes))
     }
 
-    /// The key a segment header stored
+    /// Rebuild a key from a segment header's bytes
     pub const fn from_bytes(bytes: [u8; CHECK_KEY_LEN]) -> CheckKey {
         CheckKey(bytes)
     }
 
-    /// The bytes a segment header stores
+    /// The key's bytes, for a segment header to store
     pub fn to_bytes(self) -> [u8; CHECK_KEY_LEN] {
         self.0
     }
@@ -697,9 +666,7 @@ impl std::fmt::Debug for CheckKey {
     }
 }
 
-/// A keyless record's stored length and codec, in the two bytes they share
-///
-/// Only the low codec bits are kept, and `pack_in` checks the codec is under them.
+/// Pack a keyless record's stored length and codec into two bytes
 fn keyless_shape(len: u32, codec: u8) -> u16 {
     debug_assert!(
         fits_keyless(len),
@@ -712,25 +679,18 @@ fn keyless_shape(len: u32, codec: u8) -> u16 {
     ((len << CODEC_BITS) | u32::from(codec)) as u16
 }
 
-/// The stored length a keyless record's prefix gives
-///
-/// A spot read knows only a bound on it, so this says where the payload ends.
+/// Read a keyless record's stored length off its prefix, for a read that knows only a bound
 pub fn keyless_len(prefix: &[u8]) -> Option<u32> {
     let shape = prefix.get(KEYLESS_SHAPE_AT..KEYLESS_PREFIX)?;
     Some(u32::from(read_u16_le(shape)) >> CODEC_BITS)
 }
 
-/// The codec a keyless record's prefix gives
+/// Read a keyless record's codec off its prefix
 pub fn keyless_codec(prefix: &[u8; KEYLESS_PREFIX]) -> u8 {
     (read_u16_le(&prefix[KEYLESS_SHAPE_AT..KEYLESS_PREFIX]) & ((1 << CODEC_BITS) - 1)) as u8
 }
 
 /// Check a keyless record over its key, kind, length, codec and payload, under its segment's key
-///
-/// Everything a reader holds is covered except the sequence number, which a spot read
-/// has no row to take from: the check alone says the record is the key's. The payload
-/// goes in as its checksum, so a long payload costs the hardware checksum and the keyed
-/// hash covers a few dozen bytes whatever the record's length.
 pub fn keyless_check(
     check: &CheckKey,
     key: KeyRef<'_>,
@@ -738,11 +698,13 @@ pub fn keyless_check(
     shape: u16,
     payload: &[u8],
 ) -> u64 {
+    // The version stays out, since a spot read has no row to take it from
     let mut fixed = [0u8; KEYLESS_FIXED];
     fixed[0] = key.column.as_u8();
     fixed[1..3].copy_from_slice(&(key.bytes.len() as u16).to_le_bytes());
     fixed[3] = flags.bits() & KIND_MASK;
     fixed[4..6].copy_from_slice(&shape.to_le_bytes());
+    // The payload goes in as its checksum, so the keyed hash stays short at any length
     fixed[6..10].copy_from_slice(&checksum(payload).to_le_bytes());
     let mut hasher = SipHasher13::new_with_key(&check.0);
     hasher.write(&fixed);
@@ -764,9 +726,6 @@ pub enum KeylessRead {
 }
 
 /// Check a keyless record against the key and kind a reader holds, under its segment's key
-///
-/// The payload is the stored bytes at the length the reader expects, so a record of
-/// another length fails like any other mismatch.
 pub fn check_keyless(
     prefix: &[u8],
     payload: &[u8],

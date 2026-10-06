@@ -22,10 +22,10 @@ use reel::format::lsn::Lsn;
 use reel::index::tbtreemap::{node_width, TBTreeMap};
 use reel::Entry;
 
-/// Keys the bare tree holds
+/// The bare tree holds this many keys
 const TREE_KEYS: usize = 1_000_000;
 
-/// Keys a node holds at the thirty-two byte width the probe asks at
+/// A node holds this many thirty-two byte keys
 const NODE: usize = node_width(32);
 
 /// Asks each thread makes per timed arm

@@ -56,10 +56,10 @@ pub struct Differential {
     /// The step and op a divergence is reported against
     at_step: Option<(usize, String)>,
 
-    /// Runs merged before those reopens, counted the same way
+    /// Runs merged by every store before the current one
     merged_before: u64,
 
-    /// Whether the stream runs compaction passes, which a merging run leaves off
+    /// Whether the stream runs compaction passes, off for a merging run
     is_compacting: bool,
 
     /// Whether the stream writes the reel's index down as it goes
@@ -124,9 +124,6 @@ impl Differential {
     }
 
     /// The same pair with compaction left off, so the sealed segments stand for key merges
-    ///
-    /// A stream this small keeps its live keys in a few segments, and compaction retires
-    /// the rest long before the walk stacks deep enough for a merge.
     pub fn open_merging(seed: u64, reel_config: ReelConfig) -> Differential {
         Differential {
             is_compacting: false,
@@ -181,10 +178,7 @@ impl Differential {
         self.checkpointed_keys
     }
 
-    /// Runs the key merges read together over the whole run
-    ///
-    /// Carried across the stream's reopens, since each one is a fresh store with fresh
-    /// counters and the question is what the whole run did.
+    /// Runs read by key merges over the whole stream, summed across its reopens
     pub fn merged_runs(&self) -> u64 {
         self.merged_before + self.reel.compaction_counters().runs_merged
     }
@@ -410,8 +404,6 @@ impl Differential {
     }
 
     /// Fold the walk's runs into a key run, where the stream has stacked them deep enough
-    ///
-    /// A resident volume never stacks any, so this costs the other streams a look.
     fn merge_reel(&self) {
         self.reel.merge_when_due().expect("merge reel");
     }
@@ -469,7 +461,7 @@ impl Differential {
                 self.seed,
                 self.at_step,
             );
-            // An overwrite booked by length class sits up to half a class off.
+            // An overwrite booked by length class sits up to half a class off
             let (counted, slack) = (self.reel.totals().bytes.to_bytes(), self.reel.spot_slack());
             assert!(
                 counted.abs_diff(reel.global.bytes) <= slack,

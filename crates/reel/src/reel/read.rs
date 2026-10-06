@@ -248,9 +248,6 @@ pub(super) fn place_runs(
 }
 
 /// Decide what a framed record read means, once the bytes are in hand
-///
-/// A keyless record is always verified, since its check is the only thing that says
-/// it is the record the entry or row points at.
 pub(super) fn frame_to_read(
     head: Vec<u8>,
     body: Vec<u8>,
@@ -263,6 +260,7 @@ pub(super) fn frame_to_read(
     // Wrapped before anything can return, so a record the checks reject still
     // hands its buffer back to the pool rather than to the allocator.
     let body = Value::pooled(body, crate::reel::payload::give);
+    // A keyless record's check is its only proof of identity, so it is always verified
     if let Some(check) = layout.keyless_key(loc.len) {
         let read = check_keyless(&head, &body, expected, Flags::DATA, &check);
         recycle_header(head);
@@ -298,8 +296,6 @@ pub(super) fn decoded(codec: u8, body: Value) -> RecordRead {
 }
 
 /// A window of a keyless record read whole, since only the whole record checks
-///
-/// A coded record says so, and the caller reads it again to decode and cut.
 pub(super) fn keyless_range(
     head: Vec<u8>,
     body: Vec<u8>,

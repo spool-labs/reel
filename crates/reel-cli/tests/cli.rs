@@ -408,8 +408,7 @@ fn verify_catches_a_truncated_segment() {
     let volume = volume(&dir);
     let target = segments(volume).into_iter().next().expect("a segment file");
     let len = std::fs::metadata(&target).expect("stat").len();
-    // Half of a segment lands inside a record and takes the footer with it, and a
-    // sealed segment's journal went with its seal, so nothing lists its records.
+    // Half the segment tears a record and drops the footer, and a sealed segment has no journal to list its records
     std::fs::File::options()
         .write(true)
         .open(&target)

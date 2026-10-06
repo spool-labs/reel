@@ -1,19 +1,5 @@
-//! Walks of a paged column under writers, deletes, seals, handovers and compaction, drawn from one seed
-//!
-//! Each seed runs a column whose walks merge the map with the footers. The column holds
-//! three kinds of keys. Stable keys are written once before any
-//! thread starts and never touched again. Live keys are written before the threads start
-//! too, and the writers overwrite them but never delete them. Churned keys belong to one
-//! writer each, which overwrites and deletes them while walks run. A key that is live for
-//! the whole of a walk has to come back from it, whatever writes, seals, handovers and
-//! compaction do under the walk. So a walk must come back in order with no key twice,
-//! every stable and live key in its reach present, stable keys with their one value, and
-//! every value starting with the number of the key it came back under. Once the writers stop, and again after a
-//! reopen, a whole walk matches what the writers left.
-//!
-//! Knobs: REEL_PWS_SEEDS (how many seeds, default 3), REEL_PWS_FIRST (the first seed,
-//! default 1), REEL_PWS_OPS (ops per writer, default 3000) and REEL_PWS_SEED (one seed to
-//! replay).
+//! A paged walk returns every key that stays live through it, under writers, deletes, seals, handovers and compaction
+//! Knobs: REEL_PWS_SEEDS (default 3), REEL_PWS_FIRST (default 1), REEL_PWS_OPS (ops per writer, default 3000), REEL_PWS_SEED (replays one seed)
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
@@ -47,13 +33,13 @@ const TREE: ColumnSet = &[rows()];
 /// Keys written once and never touched again
 const STABLE: u64 = 400;
 
-/// Keys the writers overwrite and never delete, numbered after the stable ones
+/// The writers overwrite but never delete these keys, which follow the stable ones
 const LIVE: u64 = 400;
 
-/// Keys the writers overwrite and delete, numbered after the live ones
+/// The writers overwrite and delete these keys, which follow the live ones
 const CHURNED: u64 = 1200;
 
-/// Every key a run writes
+/// A run writes this many keys
 const KEYS: u64 = STABLE + LIVE + CHURNED;
 
 const WRITERS: u64 = 3;
@@ -81,7 +67,7 @@ fn key_of(n: u64) -> Vec<u8> {
     key
 }
 
-/// The key number a key holds in its tail
+/// Reads the key number from a key's tail
 fn number_of(key: &[u8]) -> u64 {
     u64::from_be_bytes(key[8..16].try_into().expect("a sixteen byte key"))
 }
@@ -108,7 +94,7 @@ fn config(rng: &mut SmallRng) -> ReelConfig {
     }
 }
 
-/// The key range a walk crossed, as bounds on the stable and live keys
+/// Bounds of a walk's key range, for ranging over the stable and live keys
 type Reach<'a> = (Bound<&'a [u8]>, Bound<&'a [u8]>);
 
 /// One walk: where it started, which way, and how it was asked for
@@ -159,7 +145,7 @@ fn check_walk(
             );
         }
     }
-    // Every stable and live key between the walk's start and the last key it returned is in it.
+    // Every stable and live key between the walk's start and its last row must be in it
     use std::ops::Bound::{Included, Unbounded};
     let reach: Option<Reach<'_>> = match (down, rows.last()) {
         (false, Some((last, _))) => Some((Included(from), Included(last.as_slice()))),
@@ -243,7 +229,7 @@ fn walker(
                 "lent walk"
             }
             _ => {
-                // A key walk returns no values, so each key stands in with its own number.
+                // A key walk returns no values, so each key stands in with its own number
                 let mut walk = store
                     .iter_keys_from("rows", Some(&from), direction)
                     .expect("keys");
@@ -305,7 +291,7 @@ fn writer(
     }
 }
 
-/// A whole walk against the stable keys and what the writers left
+/// Checks a whole walk against the stable keys and what the writers left
 fn settled(
     store: &ReelStore,
     stable: &BTreeMap<Vec<u8>, Vec<u8>>,
@@ -433,6 +419,7 @@ fn seeds(columns: ColumnSet) {
     }
 }
 
+// walks return every key that stays live through them while writers, seals and compaction run
 #[test]
 fn tree_walks_hold_under_writes_and_compaction() {
     seeds(TREE);

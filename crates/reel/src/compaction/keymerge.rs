@@ -1,9 +1,5 @@
 //! Key-run merges: the walk's runs collapsed into one key run, no record moved
-//!
-//! A merge reads the rows of the runs it takes, a data segment's footer or an earlier
-//! key run, and writes the newest row of each key with the place its record lies. The
-//! records stay where they were written, so neither the spot index nor the map is touched,
-//! and nothing goes down but keys and places.
+//! Only keys and places go down, so neither the spot index nor the map sees a merge
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -20,20 +16,20 @@ use crate::reel::Reel;
 /// What one key-run merge did
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MergeReport {
-    /// Runs the merge read: data segments and key runs together
+    /// The merge read this many runs, data segments and key runs together
     pub runs_merged: u64,
 
-    /// Data segments the new run covers that no run did before
+    /// The new run covers this many data segments that no run covered before
     pub segments_covered: u64,
 
-    /// Rows the new run holds
+    /// The new run holds this many rows
     pub rows_written: u64,
 
-    /// Rows passed over for a newer row of the same key
+    /// A newer row of the same key shadowed this many rows
     pub rows_shadowed: u64,
 }
 
-/// One run a merge reads
+/// One input run of a merge
 enum Source {
     /// A data segment's own footer
     Footer {
@@ -60,7 +56,7 @@ enum Cursor<'a> {
 }
 
 impl Cursor<'_> {
-    /// The key the cursor stands on, nothing once it is past its rows
+    /// The cursor's current key, nothing once it is past its rows
     fn key(&self) -> Option<&[u8]> {
         match self {
             Cursor::Footer { rows, at, .. } => rows.key_at(*at),
@@ -70,7 +66,7 @@ impl Cursor<'_> {
         }
     }
 
-    /// The row the cursor stands on, with the place its record lies
+    /// The cursor's current row, with the place its record lies
     fn row(&self) -> Result<RunRow> {
         match self {
             Cursor::Footer { segment, rows, at } => {
@@ -95,10 +91,6 @@ impl Cursor<'_> {
 }
 
 /// Merge segments and key runs into one key run, which then answers for every segment they covered
-///
-/// Each segment is claimed for the length of the pass, so no rewrite moves its records
-/// while the merge is writing down where they lie. A column whose keys vary in width is
-/// written with each row saying its own width.
 pub fn merge_into_key_run(
     compactor: &Compactor,
     reel: &Reel,
@@ -113,8 +105,7 @@ pub fn merge_into_key_run(
         let Some(claim) = compactor.claim(*segment) else {
             continue;
         };
-        // Chosen from a list taken before the claim, so a rewrite can have retired it
-        // in between, and a run covering a segment that is gone points at nothing.
+        // The list predates the claim, so a rewrite may have retired this segment since
         if !index.holds_sealed(*segment) {
             continue;
         }
@@ -127,8 +118,7 @@ pub fn merge_into_key_run(
             footer,
         });
     }
-    // A run's segments are claimed too, so no rewrite moves their records while the merge
-    // decides which rows still name them. One a rewrite holds puts the merge off a tick.
+    // Claim the runs' segments too, so no rewrite moves a record while the merge picks rows
     let mut claimed: HashSet<SegmentId> = claims.iter().map(PassClaim::segment).collect();
     for run in runs {
         for segment in &run.covered {
@@ -145,8 +135,7 @@ pub fn merge_into_key_run(
     if sources.len() < 2 {
         return Ok(MergeReport::default());
     }
-    // Taken under the claims, so it holds for the whole merge: a row pointing into a
-    // segment outside it points at a record a rewrite moved or dropped.
+    // Taken under the claims so it holds for the whole merge
     let standing: HashSet<SegmentId> = index
         .segments_snapshot()
         .into_iter()
@@ -200,8 +189,7 @@ pub fn merge_into_key_run(
         return Err(error);
     }
 
-    // Only what was merged: a segment a claim turned away keeps its footer in the walk,
-    // and covering it would hide rows no run holds.
+    // Covering a segment the merge skipped would hide its rows from the walk
     let mut covered: BTreeSet<SegmentId> = sources
         .iter()
         .filter_map(|source| match source {
@@ -265,8 +253,7 @@ fn merge_column(
             }
         }
     }
-    // A heap of the cursors still standing on rows, least key on top, so a row costs a
-    // few comparisons however many runs the merge reads.
+    // A heap keeps the least key on top, so a row costs a few comparisons however many runs merge
     let mut heap: Vec<usize> = (0..cursors.len())
         .filter(|at| cursors[*at].key().is_some())
         .collect();
@@ -277,7 +264,7 @@ fn merge_column(
     while let Some(&top) = heap.first() {
         key.clear();
         key.extend_from_slice(cursors[top].key().unwrap_or_default());
-        // Every row of the key goes, and the one with the highest sequence number stays.
+        // Only rows in standing segments count, since the rest point at moved or dropped records
         let mut newest: Option<RunRow> = None;
         let mut seen = 0u64;
         while let Some(&top) = heap.first() {

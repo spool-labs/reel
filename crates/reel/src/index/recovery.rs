@@ -1,12 +1,4 @@
 //! Rebuilding the reel's resident index from its segment files on open
-//!
-//! The files are the truth and the index is a cache, so on open the reel is read
-//! back from disk. A sealed segment is read from the packed sorted footer at its end.
-//! An unsealed tail is read through the journal beside it, a group of rows a write:
-//! a group is kept only when every record it lists sits where its row says and checks
-//! out, so a batch comes back whole or not at all. A file whose segment header holds
-//! an unknown format or another segment number is quarantined. Each key resolves to its
-//! highest sequence number, whichever segment holds it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -47,7 +39,7 @@ const TRAILER_PROBE_LEN: u64 = 4096;
 /// Threads a rebuild opens segment files on, however wide the machine is
 const MAX_READERS: usize = 8;
 
-/// Segment files each reader may read ahead of the join on a resident rebuild
+/// Each reader may read this many segment files ahead of the join on a resident rebuild
 const READ_AHEAD: usize = 4;
 
 /// Records one column batch takes into the index at a time
@@ -56,10 +48,10 @@ const BATCH: usize = 4096;
 /// Segments a resident rebuild holds before it feeds their rows in key order
 const FEED_WINDOW: usize = MAX_READERS * READ_AHEAD;
 
-/// Threads a paged open loads sealed footers into the spot index on
+/// A paged open loads sealed footers into the spot index on this many threads
 const LOADERS: usize = 8;
 
-/// Rows a column's window must hold before its feed splits across threads
+/// A column's feed splits across threads once its window holds this many rows
 const SPLIT_FEED_ROWS: usize = 4 * BATCH;
 
 /// What a reel rebuild hands back beside the index it filled
@@ -76,12 +68,10 @@ pub struct RebuiltReel {
     /// Files set aside as foreign or misplaced
     pub quarantined: Vec<PathBuf>,
 
-    /// Bytes of each tail's journal the rebuild consumed, and SEALED for a segment
-    /// read from its footer
+    /// How far the rebuild read each tail's journal, and SEALED for a segment read from its footer
     pub consumed: HashMap<SegmentId, u64>,
 
-    /// Unsealed tails and their file lengths. A crash keeps their reservation's
-    /// blocks claimed past the end, and a writable open gives those back.
+    /// Unsealed tails and their file lengths, so a writable open gives back what a crash left reserved
     pub walked: Vec<(PathBuf, u64)>,
 
     /// The same tails as appenders can pick them up, lowest number first
@@ -192,18 +182,14 @@ pub fn rebuild_from_persisted(
             placements.push((segment, root));
         }
         if standing.contains(&segment) {
-            // Sealed and vouched for, so the rows the persisted index holds stand in
-            // for reading it.
+            // Sealed and vouched for, so the persisted index's rows stand in for reading it
             consumed.insert(segment, SEALED);
             continue;
         }
         jobs.push((segment, path, len));
     }
     let mut held: Vec<Held> = Vec::new();
-    // A paged open hands each sealed footer to the spot index's loaders as it is swept, so
-    // the loads run beside the reads.
-    // One footer waits for the loaders and each reader reads one ahead: the loaders are
-    // the slower side, so anything deeper only holds footers, 0.6 GiB of a 100M reopen.
+    // The loaders are slower than the reads, so a deeper queue or read-ahead only holds more footers
     let (queue, feed) = std::sync::mpsc::sync_channel::<(SegmentId, SegmentFooter)>(1);
     let feed = Mutex::new(feed);
     let loaders = match pages {
@@ -231,15 +217,14 @@ pub fn rebuild_from_persisted(
                             index.reserve_fast(&footer, jobs.len());
                             is_sized = true;
                         }
-                        // The loaders keep receiving until the queue closes, so a send never waits on nothing.
+                        // The loaders receive until the queue closes, so a send always finds a receiver
                         let _ = queue.send((*segment, footer));
                     }
                 }
                 Loaded::Journaled(end) => {
                     consumed.insert(*segment, end.journal_len);
                     walked.push((path.clone(), *len));
-                    // A segment with no journal had its seal finish once, so an appender
-                    // must not write into it again whatever its footer reads as now.
+                    // A segment with no journal sealed once, so no appender may write into it again
                     if let Some(rows) = end.rows {
                         resumable.push(ResumableTail {
                             segment: *segment,
@@ -324,10 +309,7 @@ fn adopt(
     read
 }
 
-/// Take sealed footers off the queue into the spot index until it closes
-///
-/// A failed load keeps receiving, so the sweep feeding the queue never waits on a loader
-/// that stopped, and the first error comes back once the queue is done.
+/// Take sealed footers off the queue into the spot index until it closes, even after a failed load
 fn load_footers(
     index: &ReelIndex,
     feed: &Mutex<Receiver<(SegmentId, SegmentFooter)>>,
@@ -360,10 +342,7 @@ enum Loaded {
     Foreign,
 }
 
-/// An unsealed tail an appender can pick up where it stopped
-///
-/// The end is where its last accepted record ends. The footer is rebuilt from the
-/// journal's rows, and the rows themselves go down again as the tail's fresh journal.
+/// An unsealed tail, ready for an appender to pick up where it stopped
 pub struct ResumableTail {
     pub segment: SegmentId,
     pub path: PathBuf,
@@ -380,8 +359,7 @@ struct JournaledEnd {
     /// Bytes of whole groups in the journal, where a follower picks up
     journal_len: u64,
 
-    /// The accepted rows, for the tail that resumes them, nothing for a segment no
-    /// appender may write into again
+    /// The accepted rows for a resuming tail, or nothing once the segment is closed to appenders
     rows: Option<Vec<JournalRow>>,
 }
 
@@ -563,10 +541,6 @@ fn read_parts(
 }
 
 /// Fold one segment's parts into the index, holding the rows it installs for the feed
-///
-/// A paging volume sweeps a sealed footer and installs none of its keys. Ranges stand at
-/// once, since a cover settles by sequence number whichever rows it meets first. A
-/// journaled tail's footer goes to the tail resuming it once its window is fed.
 fn absorb_segment(
     segment: SegmentId,
     parts: SegmentParts,
@@ -574,6 +548,7 @@ fn absorb_segment(
     resolver: &mut Resolver<'_>,
     held: &mut Vec<Held>,
 ) -> Result<Loaded> {
+    // A cover settles by sequence number whichever rows it meets first, so ranges stand at once
     match parts {
         SegmentParts::Foreign => Ok(Loaded::Foreign),
         SegmentParts::Sealed(footer, ends) => match pages {
@@ -664,7 +639,7 @@ fn feed_held(
     columns.sort_unstable();
     columns.dedup();
     for column in columns {
-        // A walked partition is put in key order once, and every part reads that.
+        // A walked partition is put in key order once, and every part reads that
         let orders: Vec<Option<Vec<u32>>> =
             held.iter().map(|rows| key_order(rows, column)).collect();
         let cursors: Vec<Cursor<'_>> = held
@@ -720,7 +695,7 @@ fn feed_column(
     if parts.len() < 2 {
         return merge_cursors(&mut cursors, |cursor| cursor.feed(resolver));
     }
-    // Rows queued ahead of this window land before it, as they would on one thread.
+    // Rows queued ahead of this window land before it, as they would on one thread
     resolver.flush();
     let index = resolver.index;
     let cursors = &cursors;
@@ -762,7 +737,7 @@ fn feed_part(
         column,
         ..KeyQueue::default()
     };
-    // Booked here and handed over once, so the parts never meet on a segment's row.
+    // Booked here and handed over once, so the parts never meet on a segment's row
     let tally = Tally::new(index.segments());
     let mut highest = Lsn::NONE;
     merge_cursors(&mut mine, |cursor| {
@@ -779,7 +754,7 @@ fn feed_part(
 /// A part's key bounds, the low one inside it and the high one past it, open where absent
 type Part = (Option<Vec<u8>>, Option<Vec<u8>>);
 
-/// Values a leading key byte can take
+/// How many values a leading key byte can take
 const LEADING_BYTES: usize = 1 << 8;
 
 /// Cut a column's keys into a part per thread at even steps of the leading byte, which keeps shards whole
@@ -811,7 +786,7 @@ struct Cursor<'a> {
     order: Option<&'a [u32]>,
     at: usize,
 
-    /// One past the last place this cursor walks
+    /// One past the cursor's last place
     end: usize,
 }
 
@@ -880,7 +855,7 @@ impl<'a> Cursor<'a> {
         self.partition.key_at(self.row_of(at)).unwrap_or_default()
     }
 
-    /// Hand the row at this place to `put`, a range having stood when its segment was held
+    /// Hand the row at this place to `put`, unless it is a range, which stands when its segment is held
     fn put_with(&self, put: impl FnOnce(&'a [u8], Loc, Lsn, bool)) -> Result<()> {
         let found = self.partition.row_at(self.row())?;
         if !found.flags.is_range_tombstone() {
@@ -1233,7 +1208,7 @@ fn read_range_end(
     Ok(KeyBytes::new(&bytes).ok())
 }
 
-/// One record a follower applies, with everything applying it needs
+/// One record for a follower to apply, with everything applying it needs
 pub struct WalkedRecord {
     /// Column and key the record is addressed by
     pub key: RecordKey,
@@ -1251,7 +1226,7 @@ pub struct WalkedRecord {
     pub range_end: Option<KeyBytes>,
 }
 
-/// The consumed position of a segment read from its footer, which a follower reads no more of
+/// The consumed position of a segment read from its footer, so a follower reads no more of it
 pub const SEALED: u64 = u64::MAX;
 
 /// An unsealed tail read through its journal, its rows packed the way its own footer packs them
@@ -1268,15 +1243,11 @@ struct JournaledTail {
     /// Where the last accepted record ends, which is where the tail resumes
     next_offset: u64,
 
-    /// Bytes of whole groups the journal holds
+    /// Bytes of whole groups in the journal
     journal_len: u64,
 }
 
 /// Read an unsealed tail through its journal, keeping each group whose records all check out
-///
-/// A group is one write, so a batch is kept whole or not at all, and a group listing a
-/// record that did not land as its row says is dropped. A segment with no journal had
-/// its seal finish once and its footer go bad since, and nothing lists its records.
 fn read_journaled(
     driver: &IoDriver,
     file: FileId,
@@ -1300,6 +1271,7 @@ fn read_journaled(
     let mut reader = SegmentReader::new(driver, file, file_len);
     let mut rows = Vec::new();
     let mut ends = Vec::new();
+    // A group is one write, so a batch comes back whole or not at all
     for group in groups {
         if !all_landed(&mut reader, layout, &group)? {
             continue;
@@ -1320,8 +1292,7 @@ fn read_journaled(
             rows.push(row);
         }
     }
-    // The footer holds a column's rows together, and a stable sort keeps each column's
-    // ends in journal order.
+    // The footer groups rows by column, and a stable sort keeps each column's ends in journal order
     ends.sort_by_key(|(column, _)| *column);
     tail.ends = ends.into_iter().map(|(_, end)| end).collect();
     tail.rows = Some(rows);
@@ -1423,7 +1394,7 @@ fn all_landed(
     Ok(true)
 }
 
-/// Every record a sealed footer lists, as a follower applies it
+/// Turn every row of a sealed footer into a record for a follower to apply
 pub(crate) fn footer_records(
     driver: &IoDriver,
     file: FileId,
@@ -1454,7 +1425,7 @@ pub(crate) fn footer_records(
     Ok(records)
 }
 
-/// The rows of a journal as a follower applies them
+/// Turn a journal's rows into records for a follower to apply
 pub(crate) fn journal_records(
     segment: SegmentId,
     groups: Vec<Vec<JournalRow>>,
@@ -1868,7 +1839,7 @@ mod tests {
         let sim = SimIo::new(FaultPlan::new(1));
         let shared = shared(config(SyncPolicy::Never), &sim);
         let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
-        // The leading bytes are a hash of the number, so the keys cover every shard.
+        // The leading bytes are a hash of the number, so the keys cover every shard
         let spread = |at: u32| {
             let mut bytes = [0u8; 34];
             bytes[..4].copy_from_slice(&at.wrapping_mul(0x9E37_79B9).to_be_bytes());
@@ -2089,7 +2060,7 @@ mod tests {
                 },
             ])
             .expect("batch");
-        // A batch leaves its sync to the caller, and the sync is what journals its rows.
+        // A batch leaves its sync to the caller, and the sync is what journals its rows
         appender.flush().expect("flush");
 
         let rebuilt = rebuild(&sim);
@@ -2186,8 +2157,7 @@ mod tests {
     fn a_batch_the_write_never_reached_is_dropped() {
         let sim = SimIo::new(FaultPlan::new(1));
         let (first, _) = tail_with_a_batch(&sim);
-        // The shape a writev that stopped before the batch leaves: the run is the
-        // reservation's own zeros.
+        // A writev that stopped before the batch leaves the reservation's own zeros in its place
         zero_from(&sim, first, 4096);
 
         let rebuilt = rebuild(&sim);
@@ -2228,8 +2198,7 @@ mod tests {
             .is_some());
     }
 
-    /// Cut a sealed segment back to its record region and put back the journal it held,
-    /// the shape a seal that failed partway leaves
+    /// Strip a sealed segment's footer and put back its journal, as a seal that failed partway leaves it
     fn strip_footer(image: &mut DurableImage, name: &str, journal: Vec<u8>) {
         let path = Path::new(REEL_DIR).join(name);
         image.push((journal_path(&path), journal));
@@ -2293,11 +2262,11 @@ mod tests {
         );
     }
 
-    // a failed write lists no row, so records above it survive a reopen. The fault
-    // position is searched for since the op count moves with the write path
+    // a failed write lists no row, so records above it survive a reopen
     #[test]
     fn a_failed_write_does_not_strand_later_records() {
         let mut produced = 0;
+        // The op count moves with the write path, so the fault position is searched for
         for at in 2..32u64 {
             let plan = FaultPlan::new(1).with_fault(at, crate::io::fault::FaultKind::EnospcAppend);
             let sim = SimIo::new(plan);
@@ -2476,7 +2445,7 @@ mod tests {
         );
     }
 
-    // a seal that stopped before its footer was whole reads back through the journal
+    // a seal that stops before its footer is whole reads back through the journal
     #[test]
     fn a_seal_cut_short_reads_its_journal() {
         let sim = SimIo::new(FaultPlan::new(1));

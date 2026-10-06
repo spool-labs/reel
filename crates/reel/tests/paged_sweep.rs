@@ -1,8 +1,4 @@
 //! A sweep hands out every live key, sealed or not, on a paged volume as on a resident one
-//!
-//! A paged volume's map holds only what no footer covers yet, so a sweep of the map alone
-//! would miss every key handed over to the footers. Pages are small, so every sweep resumes
-//! from its mark many times.
 
 use std::collections::BTreeMap;
 
@@ -25,7 +21,7 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
 
 const KEYS: u64 = 2000;
 
-/// Keys a sweep page asks for, small so a sweep resumes from its mark many times
+/// Each sweep page asks for this many keys, so a sweep resumes from its mark many times
 const PAGE: usize = 37;
 
 /// Key number `n`, its first byte one of four groups so a prefix takes a quarter of them
@@ -137,7 +133,7 @@ fn check(index: IndexResidency) {
         "a prefix key sweep differs"
     );
 
-    // A mark from nowhere starts the sweep over, and every key still comes back.
+    // A foreign mark starts the sweep over, so every key still comes back
     let (page, _) =
         Store::sweep(&store, "rows", Some(b"not a mark"), KEYS as usize).expect("sweep");
     assert_eq!(
@@ -147,11 +143,13 @@ fn check(index: IndexResidency) {
     );
 }
 
+// a sweep of a paged volume hands out every key, from the footers and the map alike
 #[test]
 fn a_paged_sweep_hands_out_every_key() {
     check(IndexResidency::Paged);
 }
 
+// a sweep of a resident volume hands out every key
 #[test]
 fn a_resident_sweep_hands_out_every_key() {
     check(IndexResidency::Resident);

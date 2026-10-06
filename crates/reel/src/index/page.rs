@@ -36,7 +36,7 @@ pub struct KeyPage {
     /// Whether graves and covered entries come out too, for a merge that checks them itself
     keeps_graves: bool,
 
-    /// Payloads a walk read with their keys, one place a key once the first arrives
+    /// Payloads read beside their keys, one slot per key once the first arrives
     payloads: Vec<Option<Value>>,
 }
 
@@ -68,9 +68,7 @@ impl KeyPage {
         self.reads_payloads
     }
 
-    /// The map's half of a merge, graves and covered entries included
-    ///
-    /// The merge drops a sealed key the map has deleted, so it has to see the grave.
+    /// The map's half of a merge, graves and covered entries included so it can drop deleted sealed keys
     pub fn merging() -> KeyPage {
         KeyPage {
             keeps_found: true,
@@ -100,14 +98,13 @@ impl KeyPage {
             self.push(key, found);
             return;
         };
-        // The keys before this one came with no payload, and an empty place each keeps the
-        // two lists in step.
+        // An empty slot for each earlier key keeps the two lists in step
         self.payloads.resize_with(self.count, || None);
         self.push(key, found);
         self.payloads.push(Some(payload));
     }
 
-    /// The payload a walk read beside the key at a position, handed over once
+    /// Hand over, at most once, the payload read beside the key at a position
     pub fn take_payload(&mut self, at: usize) -> Option<Value> {
         self.payloads.get_mut(at).and_then(Option::take)
     }

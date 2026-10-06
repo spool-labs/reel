@@ -77,10 +77,7 @@ struct Slot<V> {
     /// Next entry of the same segment, or the next vacancy while free
     next: u32,
 
-    /// The entry before this one in its segment's chain, so taking one out is a step
-    ///
-    /// A block pool holds thousands of one segment's blocks, and an eviction that
-    /// walked the chain for the link before it spent most of a scan.
+    /// Previous entry of the same segment, so an eviction unlinks it without a walk
     prev: u32,
 }
 
@@ -587,8 +584,7 @@ mod tests {
     // evictions out of the middle of long chains leave every chain whole for a retire
     #[test]
     fn evictions_keep_each_chain_whole() {
-        // Room for 64 entries, fed 4,000 blocks of two segments interleaved, so each
-        // segment's chain is long and loses entries from its middle.
+        // Two interleaved segments overflow the hold, so each long chain loses entries from its middle
         let hold: Hold<u64> = Hold::new(64 * 16, 16);
         for block in 0..2_000 {
             for segment in [1u32, 2] {

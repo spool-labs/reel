@@ -82,8 +82,7 @@ fn paired(keys: &[Vec<u8>]) -> (Duration, PrefixRows) {
         tail[..8].copy_from_slice(&(at as u64).to_le_bytes());
         staged.push((key.clone(), tail));
     }
-    // Equal keys go in sequence order, as a footer sorts them, since a tail is written as
-    // its difference from the row before.
+    // Equal keys go in sequence order as in a footer, since a tail is written as its difference from the row before
     staged.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
 
     let mut rows = PrefixRows::new(Tail::Entry);
@@ -145,8 +144,7 @@ fn sort_only(keys: &[Vec<u8>]) -> Duration {
         tail[..8].copy_from_slice(&(at as u64).to_le_bytes());
         staged.push((key.clone(), tail));
     }
-    // Equal keys go in sequence order, as a footer sorts them, since a tail is written as
-    // its difference from the row before.
+    // Equal keys go in sequence order as in a footer, since a tail is written as its difference from the row before
     staged.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
     std::hint::black_box(&staged);
     began.elapsed()

@@ -1,8 +1,4 @@
 //! Keyless records on a paged volume: what a get reads, and what a seal leaves on disk
-//!
-//! A small record holds no key, so a get confirms it by its keyed check. A key's lone
-//! spot slot answers in that one read with no footer search, and a seal leaves the
-//! segment and its footer with the journal gone.
 
 use tempfile::TempDir;
 

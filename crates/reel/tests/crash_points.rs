@@ -374,7 +374,7 @@ fn sealing_stream() -> Vec<StreamOp> {
 // Records roll the tight segment, so the stream seals several times, and the overwrites
 // and deletes leave keys with versions in more than one segment for the open to settle.
 #[test]
-fn every_boundary_fastforward_answers_as_the_footers() {
+fn every_boundary_spot_index_answers_as_the_footers() {
     let ops = sealing_stream();
     let keys: Vec<RecordKey> = (1..=6u8)
         .map(|address| RecordKey::from_bytes(RECORDS, &wire_key(GROUP, address)).expect("key"))

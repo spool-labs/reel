@@ -67,7 +67,7 @@ fn resident_kib() -> u64 {
 // a paged open loads the spot index a footer at a time, and every key reads back
 #[test]
 #[ignore]
-fn a_paged_open_loads_fastforward_in_bounded_memory() {
+fn a_paged_open_loads_the_spot_index_in_bounded_memory() {
     let keys: u64 = std::env::var("REEL_FF_OPEN_KEYS")
         .ok()
         .and_then(|keys| keys.parse().ok())

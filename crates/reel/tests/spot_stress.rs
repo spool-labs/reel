@@ -302,6 +302,6 @@ fn seeds(columns: ColumnSet) {
 }
 
 #[test]
-fn fastforward_reads_hold_under_writes_and_compaction() {
+fn spot_index_reads_hold_under_writes_and_compaction() {
     seeds(TREE);
 }

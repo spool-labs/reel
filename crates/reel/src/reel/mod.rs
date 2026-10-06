@@ -213,13 +213,13 @@ impl ReelShared {
         if at <= MERGE_GAP {
             let span = at as usize + len;
             let answer = self.driver.pread_split_reusing(handle.file(), base, prefix, span, take_header(), self.warm_first());
-            return near_fast_range(answer, key, at, len);
+            return near_spot_range(answer, key, at, len);
         }
         let ops = vec![
             self.driver.split_read(handle.file(), base, 0, prefix),
             self.driver.split_read(handle.file(), base + prefix as u64 + at, 0, len),
         ];
-        deep_fast_range(self.driver.run_split_reads(ops)?, key, at, len)
+        deep_spot_range(self.driver.run_split_reads(ops)?, key, at, len)
     }
 
     /// The same window as a future, through the driver
@@ -242,13 +242,13 @@ impl ReelShared {
                 .driver
                 .wait_split_reusing(handle.file(), base, prefix, span, take_header(), WarmFirst::Skip)
                 .await;
-            return near_fast_range(answer, key, at, len);
+            return near_spot_range(answer, key, at, len);
         }
         let ops = vec![
             self.driver.split_read(handle.file(), base, 0, prefix),
             self.driver.split_read(handle.file(), base + prefix as u64 + at, 0, len),
         ];
-        deep_fast_range(self.driver.wait_split_reads(ops).await?, key, at, len)
+        deep_spot_range(self.driver.wait_split_reads(ops).await?, key, at, len)
     }
 
     /// One bounded read of each the spot index candidate, submitted together
@@ -380,7 +380,7 @@ fn range_head(prefix: &[u8], key: &RecordKey) -> std::result::Result<Head, SpotR
 }
 
 /// A window that came in one span with its record's header
-fn near_fast_range(answer: SplitAnswer, key: &RecordKey, at: u64, len: usize) -> Result<SpotRange> {
+fn near_spot_range(answer: SplitAnswer, key: &RecordKey, at: u64, len: usize) -> Result<SpotRange> {
     let (bytes, body) = match answer {
         Ok(read) => read,
         Err((error, spare)) => {
@@ -415,7 +415,7 @@ fn near_fast_range(answer: SplitAnswer, key: &RecordKey, at: u64, len: usize) ->
 }
 
 /// A window that came as its own read beside its record's header
-fn deep_fast_range(filled: Vec<SplitRead>, key: &RecordKey, at: u64, len: usize) -> Result<SpotRange> {
+fn deep_spot_range(filled: Vec<SplitRead>, key: &RecordKey, at: u64, len: usize) -> Result<SpotRange> {
     let mut filled = filled.into_iter();
     let header = next_split(&mut filled)?;
     let window = next_split(&mut filled)?;

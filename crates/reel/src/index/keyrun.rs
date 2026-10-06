@@ -330,7 +330,9 @@ impl KeyRun {
 /// The key runs a volume holds, and the data segments they answer for in a walk
 ///
 /// A covered segment keeps its records and its footer, which point reads and recovery
-/// still use, and only the walk passes it over for the run that holds its rows.
+/// still use, and only the walk passes it over for the run that holds its rows. A
+/// rewrite of a covered segment leaves its runs standing: each copy keeps its sequence
+/// number, and on a tie the row whose segment still stands wins.
 #[derive(Default)]
 pub struct KeyRunSet {
     held: RwLock<KeyRunsHeld>,
@@ -374,6 +376,24 @@ impl KeyRunSet {
         crate::sync::try_lock(&self.merging)
     }
 
+    /// Whether a run holds a row for a key below a sequence number
+    ///
+    /// Such a row can name a record a rewrite has already dropped, so a tombstone above it
+    /// has to stand for as long as the row does.
+    pub fn holds_older(&self, column: ColumnId, key: &[u8], lsn: Lsn) -> bool {
+        self.runs().iter().any(|run| {
+            let Some(held) = run.column(column) else {
+                return false;
+            };
+            if key.len() != held.key_width as usize {
+                return false;
+            }
+            let at = run.seek(held, key, false);
+            at < held.rows()
+                && row_in(run.rows(held), held, at as usize).is_ok_and(|(found, row)| found == key && row.lsn < lsn)
+        })
+    }
+
     /// The id the next run is written under
     pub fn draw_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::AcqRel) + 1
@@ -391,20 +411,20 @@ impl KeyRunSet {
             }
             false => true,
         });
-        held.covered.extend(run.covered.iter().copied());
         held.runs.push(run);
         held.runs.sort_by_key(|kept| kept.id);
+        held.covered = held.runs.iter().flat_map(|kept| kept.covered.iter().copied()).collect();
         self.generation.fetch_add(1, Ordering::AcqRel);
         retired
     }
 
     /// Read back the key runs a previous opening left
     ///
-    /// A run is derived from the footers it covers, so one that cannot be read, or that
-    /// names a segment no longer standing, is unlinked and its segments go back to the
-    /// walk. So is a run a newer one covers whole, which a merge that stopped between
-    /// writing its run and unlinking its inputs leaves behind.
-    pub fn load(&self, driver: &Arc<IoDriver>, root: &Path, standing: impl Fn(SegmentId) -> bool) -> Result<()> {
+    /// A run that cannot be read is unlinked and its segments go back to the walk. So is
+    /// a run a newer one covers whole, which a merge that stopped between writing its run
+    /// and unlinking its inputs leaves behind. A run naming a segment a rewrite retired
+    /// stays: the rewrite's copies outrank its rows there.
+    pub fn load(&self, driver: &Arc<IoDriver>, root: &Path) -> Result<()> {
         let mut runs = Vec::new();
         for entry in driver.list_or_empty(root)? {
             let path = root.join(&entry.name);
@@ -416,8 +436,7 @@ impl KeyRunSet {
                 continue;
             };
             match KeyRun::open(driver, &path, id) {
-                Ok(run) if run.covered.iter().all(|segment| standing(*segment)) => runs.push(run),
-                Ok(run) => run.retire(),
+                Ok(run) => runs.push(run),
                 Err(_) => {
                     let _ = driver.unlink(&path);
                 }
@@ -438,28 +457,6 @@ impl KeyRunSet {
         Ok(())
     }
 
-    /// Drop every run that answers for a segment about to move, giving the walk its footers back
-    ///
-    /// A run names its records where they lie, so a rewrite of one of its segments would
-    /// leave it pointing at the old places. What it covered goes back to the walk until a
-    /// later merge takes it again.
-    pub fn drop_covering(&self, segment: SegmentId) -> Vec<Arc<KeyRun>> {
-        let mut held = crate::sync::write(&self.held);
-        if !held.covered.contains(&segment) {
-            return Vec::new();
-        }
-        let mut dropped = Vec::new();
-        held.runs.retain(|kept| match kept.covered.contains(&segment) {
-            true => {
-                dropped.push(Arc::clone(kept));
-                false
-            }
-            false => true,
-        });
-        held.covered = held.runs.iter().flat_map(|kept| kept.covered.iter().copied()).collect();
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        dropped
-    }
 }
 
 /// The key and the row at one row of a column's rows

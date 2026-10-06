@@ -454,10 +454,7 @@ impl ReelStore {
         // these are the counters that know.
         shared.set_segments(index.segments_handle());
         if config.key_runs && !is_read_only {
-            // A run names records in the segments it covers, so each has to still be there.
-            index.key_runs().load(&shared.driver, &shared.volumes.roots()[0], |segment| {
-                shared.footer_of(segment).is_ok_and(|footer| footer.is_some())
-            })?;
+            index.key_runs().load(&shared.driver, &shared.volumes.roots()[0])?;
         }
 
         // Nothing is waiting to be handed over: the only keys a rebuild leaves

@@ -5,7 +5,7 @@
 //! records stay where they were written, so neither FastForward nor the map is touched,
 //! and nothing goes down but keys and places.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use crate::compaction::compactor::{Compactor, PassClaim};
@@ -126,10 +126,27 @@ pub fn merge_into_key_run(
             footer,
         });
     }
+    // A run's segments are claimed too, so no rewrite moves their records while the merge
+    // decides which rows still name them. One a rewrite holds puts the merge off a tick.
+    let mut claimed: HashSet<SegmentId> = claims.iter().map(PassClaim::segment).collect();
+    for run in runs {
+        for segment in &run.covered {
+            if !index.holds_sealed(*segment) || !claimed.insert(*segment) {
+                continue;
+            }
+            let Some(claim) = compactor.claim(*segment) else {
+                return Ok(KeyMergeReport::default());
+            };
+            claims.push(claim);
+        }
+    }
     sources.extend(runs.iter().map(|run| Source::Keys(Arc::clone(run))));
     if sources.len() < 2 {
         return Ok(KeyMergeReport::default());
     }
+    // Taken under the claims, so it holds for the whole merge: a row naming a segment
+    // outside it names a record a rewrite moved or dropped.
+    let standing: HashSet<SegmentId> = index.segments_snapshot().into_iter().map(|(segment, _)| segment).collect();
 
     let mut columns: BTreeSet<(ColumnId, u16)> = BTreeSet::new();
     for source in &sources {
@@ -159,7 +176,7 @@ pub fn merge_into_key_run(
     let written = (|| -> Result<()> {
         for (column, width) in &columns {
             writer.begin_column(*column, *width)?;
-            merge_column(&sources, *column, &mut writer, &mut report)?;
+            merge_column(&sources, *column, &standing, &mut writer, &mut report)?;
         }
         Ok(())
     })();
@@ -178,7 +195,7 @@ pub fn merge_into_key_run(
         })
         .collect();
     for run in runs {
-        covered.extend(run.covered.iter().copied());
+        covered.extend(run.covered.iter().copied().filter(|segment| standing.contains(segment)));
     }
     let covered: Vec<SegmentId> = covered.into_iter().collect();
     let before = index.key_runs().covered();
@@ -198,6 +215,7 @@ pub fn merge_into_key_run(
 fn merge_column(
     sources: &[Source],
     column: ColumnId,
+    standing: &HashSet<SegmentId>,
     writer: &mut RunWriter<'_>,
     report: &mut KeyMergeReport,
 ) -> Result<()> {
@@ -243,7 +261,7 @@ fn merge_column(
             }
             let row = cursors[top].row()?;
             seen += 1;
-            if newest.is_none_or(|held| held.lsn < row.lsn) {
+            if standing.contains(&row.loc.segment) && newest.is_none_or(|held| held.lsn < row.lsn) {
                 newest = Some(row);
             }
             cursors[top].advance();

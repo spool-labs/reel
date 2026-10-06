@@ -3,7 +3,9 @@
 //! Rounds of fresh keys, overwrites and deletes seal segment after segment, and the
 //! maintenance tick merges the walk's runs into key runs whenever too many stand over one
 //! key, moving no record. After every round each key answers its model value alone and
-//! in walks both ways, and so does every key after a reopen reads the runs back.
+//! in walks both ways, and so does every key after a reopen reads the runs back. A volume
+//! that also rewrites its dead space moves records out from under the runs, which keep
+//! standing.
 
 use std::collections::BTreeMap;
 
@@ -12,7 +14,7 @@ use tempfile::TempDir;
 use reel::config::{CompactRate, IndexResidency, ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec};
 use reel::units::ByteCount;
-use reel::{KeyWidth, Preallocate, ReelStore};
+use reel::{CompactPass, KeyWidth, Preallocate, ReelStore};
 use reel_core::{Direction, Store};
 
 const COLUMNS: ColumnSet = &[ColumnSpec {
@@ -36,7 +38,13 @@ const TICKS: usize = 10;
 /// Runs one key may fall inside once maintenance has caught up
 const SETTLED_DEPTH: usize = 8;
 
-fn config(tails: u32) -> ReelConfig {
+/// Dead share at which a segment is rewritten, never for the runs alone
+const NEVER: f64 = 1.0;
+
+/// Dead share at which the overwrites and deletes below have a segment rewritten
+const RECLAIM: f64 = 0.1;
+
+fn config(tails: u32, dead_ratio: f64) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(96 * 1024),
         alloc_chunk: ByteCount::from_bytes(32 * 1024),
@@ -45,7 +53,7 @@ fn config(tails: u32) -> ReelConfig {
         active_tails: ThreadBudget::threads(tails),
         index: IndexResidency::Paged,
         key_runs: true,
-        compact_dead_ratio: 1.0,
+        compact_dead_ratio: dead_ratio,
         compact_mbps: CompactRate::Mbps(100_000),
         ..ReelConfig::default()
     }
@@ -79,6 +87,11 @@ fn check(store: &ReelStore, model: &BTreeMap<Vec<u8>, Vec<u8>>, stage: &str) {
     let want: Vec<(Vec<u8>, Vec<u8>)> = model.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
     assert_eq!(up.len(), want.len(), "{stage}: an ascending walk came back with the wrong count");
     assert!(up == want, "{stage}: an ascending walk came back out of step with the model");
+    // A keys-only walk reads no record, so a run's row alone decides whether a key shows.
+    let keys = Store::iter_keys_prefix(store, "rows", &[]).expect("keys");
+    let want_keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    assert_eq!(keys.len(), want_keys.len(), "{stage}: a keys-only walk came back with the wrong count");
+    assert!(keys == want_keys, "{stage}: a keys-only walk came back out of step with the model");
     let down: Vec<(Vec<u8>, Vec<u8>)> = Store::iter_from(store, "rows", &[0xFF; 16], Direction::Desc)
         .expect("iter down")
         .map(|(key, value)| (key, value.to_vec()))
@@ -98,9 +111,9 @@ fn check(store: &ReelStore, model: &BTreeMap<Vec<u8>, Vec<u8>>, stage: &str) {
     }
 }
 
-fn rounds(tails: u32) {
+fn rounds(tails: u32, dead_ratio: f64) {
     let dir = TempDir::new().expect("temp dir");
-    let store = ReelStore::open(dir.path().to_path_buf(), config(tails), COLUMNS).expect("open");
+    let store = ReelStore::open(dir.path().to_path_buf(), config(tails, dead_ratio), COLUMNS).expect("open");
     let mut model = BTreeMap::new();
     for round in 0..ROUNDS {
         for n in round * PER_ROUND..(round + 1) * PER_ROUND {
@@ -130,9 +143,16 @@ fn rounds(tails: u32) {
         check(&store, &model, &format!("round {round}"));
     }
     assert!(!store.index().key_runs().runs().is_empty(), "no key run was ever written");
+    if dead_ratio < NEVER {
+        let counters = store.compaction_counters();
+        assert!(
+            counters.segments_rewritten + counters.segments_unlinked_whole > 0,
+            "no segment was ever rewritten, so the runs never lost a segment under them"
+        );
+    }
     store.close().expect("close");
     drop(store);
-    let reopened = ReelStore::open(dir.path().to_path_buf(), config(tails), COLUMNS).expect("reopen");
+    let reopened = ReelStore::open(dir.path().to_path_buf(), config(tails, dead_ratio), COLUMNS).expect("reopen");
     assert!(!reopened.index().key_runs().runs().is_empty(), "the reopen read no key run back");
     check(&reopened, &model, "after a reopen");
 }
@@ -140,11 +160,148 @@ fn rounds(tails: u32) {
 // one tail's runs merge into key runs and every key answers through them
 #[test]
 fn key_runs_answer_as_the_model_on_one_tail() {
-    rounds(1);
+    rounds(1, NEVER);
 }
 
 // several tails seal side by side, and the merges still leave every key where it was
 #[test]
 fn key_runs_answer_as_the_model_on_four_tails() {
-    rounds(4);
+    rounds(4, NEVER);
+}
+
+// rewrites move records out of covered segments, and the runs over them keep answering
+#[test]
+fn key_runs_answer_as_the_model_while_rewrites_reclaim_their_segments() {
+    rounds(1, RECLAIM);
+}
+
+// the same with four tails, where a rewrite's copy can land in a lower-numbered segment
+#[test]
+fn key_runs_answer_as_the_model_while_four_tails_reclaim() {
+    rounds(4, RECLAIM);
+}
+
+/// Dead share a segment is rewritten at in the scenarios below, so half-dead ones go
+const HALF_DEAD: f64 = 0.3;
+
+/// Whether an older run names a retired segment for a key a newer run names a standing one for
+fn is_stale_under_fresh(store: &ReelStore, key: &[u8]) -> bool {
+    let index = store.index();
+    let mut seen = Vec::new();
+    for run in index.key_runs().runs() {
+        let Some(column) = run.column(ColumnId(1)) else {
+            continue;
+        };
+        let at = run.seek(column, key, false);
+        if at >= column.rows() {
+            continue;
+        }
+        if let Ok((found, row)) = reel::index::keyrun::row_in(run.rows(column), column, at as usize) {
+            if found == key {
+                seen.push(index.holds_sealed(row.loc.segment));
+            }
+        }
+    }
+    seen.windows(2).any(|pair| !pair[0] && pair[1])
+}
+
+/// Seal what the tails hold and run maintenance until its merges have caught up
+fn settle(store: &ReelStore) {
+    store.flush().expect("flush");
+    for _ in 0..TICKS {
+        Store::maintain(store).expect("maintain");
+    }
+}
+
+/// Rewrite every segment the dead share takes, then seal and hand over the copies
+fn compact_all(store: &ReelStore) {
+    store.flush().expect("flush");
+    for _ in 0..1_000 {
+        if matches!(store.compact_once().expect("compact"), CompactPass::Idle) {
+            break;
+        }
+    }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("hand over");
+}
+
+// One tail writes keys in the order of their numbers, so a stretch of numbers is a
+// segment, while the keys themselves scatter and every segment reaches across the column.
+// A rewrite moves half a covered segment's records, and a later merge puts the copies in a
+// newer run while the old run, still naming the retired segment, is read first. The copy
+// keeps its record's sequence number, so only the standing segment can break the tie.
+#[test]
+fn a_rewritten_record_answers_through_the_newer_run() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = ReelStore::open(dir.path().to_path_buf(), config(1, HALF_DEAD), COLUMNS).expect("open");
+    let mut model = BTreeMap::new();
+    let mut put = |store: &ReelStore, n: u64, round: u64| {
+        Store::put(store, "rows", &key_of(n), &value_of(n, round)).expect("put");
+        model.insert(key_of(n), value_of(n, round));
+    };
+    for n in 0..10_000 {
+        put(&store, n, 0);
+    }
+    settle(&store);
+    assert_eq!(store.index().key_runs().runs().len(), 1, "the base keys did not merge into one run");
+
+    for n in (0..900).step_by(2) {
+        put(&store, n, 1);
+    }
+    compact_all(&store);
+    assert!(store.compaction_counters().segments_rewritten > 0, "no covered segment was rewritten");
+
+    // Enough fresh segments to merge, and few enough rows that the base run sits it out.
+    for n in 20_000..23_000 {
+        put(&store, n, 2);
+    }
+    settle(&store);
+    assert!(store.index().key_runs().runs().len() >= 2, "the copies never reached a run of their own");
+    assert!(
+        (1..900).step_by(2).any(|n| is_stale_under_fresh(&store, &key_of(n))),
+        "no key has a run naming its retired segment ahead of a run naming its copy"
+    );
+    check(&store, &model, "after the rewrite");
+
+    store.close().expect("close");
+    drop(store);
+    let reopened = ReelStore::open(dir.path().to_path_buf(), config(1, HALF_DEAD), COLUMNS).expect("reopen");
+    check(&reopened, &model, "after a reopen");
+}
+
+// Every key is deleted, its old segments retire whole, and the deletes' own segment is
+// rewritten while the run over the old segments still names each key. Dropping a delete
+// there would bring its key back from the run.
+#[test]
+fn a_delete_stands_while_a_run_still_holds_its_key() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = ReelStore::open(dir.path().to_path_buf(), config(1, HALF_DEAD), COLUMNS).expect("open");
+    let mut model = BTreeMap::new();
+    for n in 0..10_000 {
+        Store::put(&store, "rows", &key_of(n), &value_of(n, 0)).expect("put");
+    }
+    settle(&store);
+    assert_eq!(store.index().key_runs().runs().len(), 1, "the base keys did not merge into one run");
+
+    // Fillers between the deletes, overwritten after, give the deletes' segments dead bytes.
+    let filler = |n: u64| key_of(50_000 + n);
+    for n in 0..10_000 {
+        Store::delete(&store, "rows", &key_of(n)).expect("delete");
+        if n % 10 == 0 {
+            Store::put(&store, "rows", &filler(n), &value_of(n, 1)).expect("filler");
+        }
+    }
+    for n in (0..10_000).step_by(10) {
+        Store::put(&store, "rows", &filler(n), &value_of(n, 2)).expect("filler again");
+        model.insert(filler(n), value_of(n, 2));
+    }
+    compact_all(&store);
+    // A pass that copies nothing live counts as an unlink whether or not it carried deletes.
+    assert!(store.compaction_counters().segments_unlinked_whole > 0, "no old segment retired");
+    check(&store, &model, "after the rewrite");
+
+    store.close().expect("close");
+    drop(store);
+    let reopened = ReelStore::open(dir.path().to_path_buf(), config(1, HALF_DEAD), COLUMNS).expect("reopen");
+    check(&reopened, &model, "after a reopen");
 }

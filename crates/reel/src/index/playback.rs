@@ -370,8 +370,16 @@ impl Sealed {
     ///
     /// Every cursor standing on the key is stepped past it either way. The sequence
     /// number decides rather than the segment number, since a volume writing through
-    /// several tails can land a rewrite in a lower-numbered segment.
-    fn newest(&mut self, way: Way, key: &[u8], below: Option<Lsn>) -> Result<Option<(SegmentId, FooterRow)>> {
+    /// several tails can land a rewrite in a lower-numbered segment. A rewrite's copy
+    /// keeps its record's number, so on a tie the row whose segment still stands wins
+    /// over a key run's row naming the one the rewrite retired.
+    fn newest(
+        &mut self,
+        way: Way,
+        key: &[u8],
+        below: Option<Lsn>,
+        stands: impl Fn(SegmentId) -> bool,
+    ) -> Result<Option<(SegmentId, FooterRow)>> {
         let mut newest: Option<(SegmentId, FooterRow)> = None;
         while let Some(at) = self.front_on(key) {
             let (segment, found) = match self.run(at) {
@@ -394,7 +402,10 @@ impl Sealed {
             };
             self.step(way, at);
             let is_under = below.is_none_or(|below| found.lsn < below);
-            if is_under && newest.as_ref().is_none_or(|(_, newest)| newest.lsn < found.lsn) {
+            let is_newer = newest.as_ref().is_none_or(|(held, newest)| {
+                newest.lsn < found.lsn || (newest.lsn == found.lsn && !stands(*held) && stands(segment))
+            });
+            if is_under && is_newer {
                 newest = Some((segment, found));
             }
         }
@@ -698,7 +709,7 @@ pub fn merged_page(
         }
         // A key missing from the page can still be one the map took since the page was
         // read. A grave drops it, and a put answers with its own entry.
-        let newest = sealed.newest(way, key, None)?;
+        let newest = sealed.newest(way, key, None, |segment| paged.sealed.holds(segment))?;
         if let Some(entry) = index.entry_or_grave(key) {
             if !entry.is_grave() && !index.is_covered_key(key, entry.lsn) {
                 out.push(key, entry);
@@ -792,7 +803,7 @@ pub fn release_rows(
         examined += 1;
         last_len = key.len();
 
-        let Some((segment, found)) = sealed.newest(way, key, Some(below))? else {
+        let Some((segment, found)) = sealed.newest(way, key, Some(below), |segment| paged.sealed.holds(segment))? else {
             continue;
         };
         if found.is_tombstone() || found.is_range_tombstone() {

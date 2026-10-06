@@ -736,11 +736,6 @@ impl Compactor {
         if reel.tails().is_empty() {
             return Ok(());
         }
-        // A key run names this segment's records where they lie, and the rewrite moves
-        // them, so every run covering it goes and the walk reads its footer again.
-        for run in index.key_runs().drop_covering(segment) {
-            run.retire();
-        }
         // What the other segments hold is only half the floor: a number drawn before
         // this pass can still be published into a segment after it, under an lsn no
         // floor has seen, so a tombstone above what is settled has to come across.
@@ -1584,7 +1579,15 @@ fn should_carry(index: &ReelIndex, tombstone: &RecordHeader, drop_floor: Lsn) ->
             }
         }
     }
-    Ok(tombstone.lsn >= drop_floor)
+    // A key run keeps the rows of segments a rewrite retired, and the floor knows nothing
+    // of those, so a delete stands while a run still holds what it deleted. A range is
+    // carried whole while any run stands, since no one row says what it reaches.
+    let key_runs = index.key_runs();
+    let is_held_below = match tombstone.flags.is_range_tombstone() {
+        true => !key_runs.runs().is_empty(),
+        false => key_runs.holds_older(tombstone.key.column, tombstone.key.as_slice(), tombstone.lsn),
+    };
+    Ok(is_held_below || tombstone.lsn >= drop_floor)
 }
 
 impl Compactor {

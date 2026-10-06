@@ -685,6 +685,15 @@ pub fn keyless_len(prefix: &[u8]) -> Option<u32> {
     Some(u32::from(read_u16_le(shape)) >> CODEC_BITS)
 }
 
+/// Read a keyless record's stored length and codec off its prefix, for a read a row or the map placed
+pub fn keyless_len_codec(prefix: &[u8]) -> Option<(u32, u8)> {
+    let shape = read_u16_le(prefix.get(KEYLESS_SHAPE_AT..KEYLESS_PREFIX)?);
+    Some((
+        u32::from(shape) >> CODEC_BITS,
+        (shape & ((1 << CODEC_BITS) - 1)) as u8,
+    ))
+}
+
 /// Read a keyless record's codec off its prefix
 pub fn keyless_codec(prefix: &[u8; KEYLESS_PREFIX]) -> u8 {
     (read_u16_le(&prefix[KEYLESS_SHAPE_AT..KEYLESS_PREFIX]) & ((1 << CODEC_BITS) - 1)) as u8

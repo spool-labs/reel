@@ -2347,7 +2347,7 @@ mod tests {
         assert!(fixture.sim.durable_bytes(&seg_path(1)).is_none());
         let payload = fixture
             .reel
-            .read_record(live_two.loc, key(2).as_ref(), live_two.lsn, true)
+            .read_record(live_two.loc, key(2).as_ref(), live_two.lsn, true, false)
             .expect("read");
         assert_eq!(payload, RecordRead::Found(Value::new(vec![0x22; 200])));
 

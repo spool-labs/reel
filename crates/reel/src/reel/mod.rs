@@ -54,7 +54,7 @@ use reel_core::{ReadBlock, Value};
 use read::{
     check_in_block, cut_range, decoded, deep_range, frame_to_range, frame_to_read,
     framed_or_nothing, keyless_range, merge_runs_into, merge_span, near_range, place_runs,
-    window_or_nothing, window_start, Planned, Run, MERGE_GAP,
+    window_or_nothing, window_start, Planned, Proof, Run, MERGE_GAP,
 };
 
 /// The first segment number a fresh reel numbers from
@@ -485,7 +485,7 @@ impl ReelShared {
                     head.lsn,
                     loc,
                     layout,
-                    self.config.verify_reads,
+                    Proof::of(self.config.verify_reads, false),
                 ),
                 head,
             ),
@@ -755,7 +755,7 @@ impl ReelShared {
                     head.lsn,
                     loc,
                     layout,
-                    self.config.verify_reads,
+                    Proof::of(self.config.verify_reads, false),
                 ),
                 head,
             ),
@@ -793,7 +793,7 @@ impl ReelShared {
                     head.lsn,
                     loc,
                     RecordLayout::Keyed,
-                    self.config.verify_reads,
+                    Proof::of(self.config.verify_reads, false),
                 );
                 return Ok(Verdict::Read(spot_read_of(read, head)));
             }
@@ -833,7 +833,7 @@ impl ReelShared {
                     head.lsn,
                     loc,
                     layout,
-                    self.config.verify_reads,
+                    Proof::of(self.config.verify_reads, false),
                 ),
                 head,
             ),
@@ -1766,6 +1766,9 @@ pub struct Ask {
 
     /// Which of the caller's keys this ask is for
     pub at: u32,
+
+    /// Whether the index's stamp still vouches for the place, so a keyless record answers to its shape
+    pub certain: bool,
 }
 
 /// The lists one thread's batched reads work through, kept between submissions
@@ -2158,6 +2161,7 @@ impl Reel {
         expected: KeyRef<'_>,
         lsn: Lsn,
         is_verified: bool,
+        is_placed: bool,
     ) -> Result<RecordRead> {
         let handle = match self.handle_for(loc.segment)? {
             Some(handle) => handle,
@@ -2177,7 +2181,7 @@ impl Reel {
             lsn,
             loc,
             layout,
-            is_verified,
+            Proof::of(is_verified, is_placed),
         ))
     }
 
@@ -2191,6 +2195,7 @@ impl Reel {
         expected: KeyRef<'_>,
         lsn: Lsn,
         is_verified: bool,
+        is_placed: bool,
     ) -> Result<RecordRead> {
         let handle = match self.handle_for(loc.segment)? {
             Some(handle) => handle,
@@ -2223,7 +2228,7 @@ impl Reel {
             lsn,
             loc,
             layout,
-            is_verified,
+            Proof::of(is_verified, is_placed),
         ))
     }
 
@@ -2350,6 +2355,7 @@ impl Reel {
         lsn: Lsn,
         at: u64,
         len: usize,
+        is_placed: bool,
     ) -> Result<RecordRead> {
         let handle = match self.handle_for(loc.segment)? {
             Some(handle) => handle,
@@ -2360,7 +2366,15 @@ impl Reel {
         if let Some(check) = handle.layout().keyless_key(loc.len) {
             let framed = self.read_framed(&handle, offset, KEYLESS_PREFIX, loc.len as usize)?;
             return Ok(match framed {
-                Some((head, body)) => keyless_range(head, body, expected, &check, at, len),
+                Some((head, body)) => keyless_range(
+                    head,
+                    body,
+                    expected,
+                    &check,
+                    at,
+                    len,
+                    Proof::of(false, is_placed),
+                ),
                 None => RecordRead::Stale,
             });
         }
@@ -2398,6 +2412,7 @@ impl Reel {
         lsn: Lsn,
         at: u64,
         len: usize,
+        is_placed: bool,
     ) -> Result<RecordRead> {
         let handle = match self.handle_for(loc.segment)? {
             Some(handle) => handle,
@@ -2419,7 +2434,15 @@ impl Reel {
                 )
                 .await;
             return Ok(match framed_or_nothing(read, KEYLESS_PREFIX, whole)? {
-                Some((head, body)) => keyless_range(head, body, expected, &check, at, len),
+                Some((head, body)) => keyless_range(
+                    head,
+                    body,
+                    expected,
+                    &check,
+                    at,
+                    len,
+                    Proof::of(false, is_placed),
+                ),
                 None => RecordRead::Stale,
             });
         }
@@ -2605,7 +2628,7 @@ impl Reel {
                 ask.lsn,
                 ask.loc,
                 layout,
-                is_verified,
+                Proof::of(is_verified, ask.certain),
             ) {
                 if mapped.capacity() == 0 {
                     let wanted = asks.iter().map(|ask| ask.loc.len as usize).sum();

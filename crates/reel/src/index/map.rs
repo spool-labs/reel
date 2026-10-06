@@ -1793,6 +1793,7 @@ impl ReelIndex {
             footers: footers.as_ref(),
             runs: &self.walk_runs[at],
             key_runs: &self.key_runs,
+            segments: &self.segments,
         }
     }
 

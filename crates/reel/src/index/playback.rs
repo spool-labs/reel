@@ -14,9 +14,10 @@ use std::ops::Bound;
 use crate::error::Result;
 use crate::format::column::{ColumnId, KeyBytes, MAX_KEY_LEN};
 use crate::format::footer::{FooterPartition, FooterRow, SegmentFooter};
-use crate::format::loc::{Loc, SegmentId};
+use crate::format::loc::{Loc, SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
 use crate::index::column::ColumnIndex;
+use crate::index::counters::SegmentTable;
 use crate::index::entry::Entry;
 use crate::index::keyrun::{key_in, row_in, KeyRun, KeyRunSet, RunColumn};
 use crate::index::page::KeyPage;
@@ -41,6 +42,9 @@ pub struct Paged<'a> {
 
     /// Merges write these key runs, and walks read them in place of the footers they cover
     pub key_runs: &'a KeyRunSet,
+
+    /// The life each segment wears, which stamps a row's entry so a read can trust its place
+    pub segments: &'a SegmentTable,
 }
 
 impl Paged<'_> {
@@ -67,6 +71,22 @@ thread_local! {
 pub struct RunSet {
     generation: u64,
     runs: Vec<Run>,
+
+    /// The life every segment the runs reach into wore when they were opened, by segment
+    stamps: Vec<(SegmentId, SegmentIncarnation)>,
+}
+
+impl RunSet {
+    /// The life a segment wore when the runs were opened, or none for one the runs do not reach
+    fn stamp_of(&self, segment: SegmentId) -> SegmentIncarnation {
+        match self
+            .stamps
+            .binary_search_by_key(&segment, |(held, _)| *held)
+        {
+            Ok(at) => self.stamps[at].1,
+            Err(_) => SegmentIncarnation::NONE,
+        }
+    }
 }
 
 /// A slot of opened runs, on a cache line of its own
@@ -85,16 +105,18 @@ impl WalkRuns {
     fn current(
         &self,
         generation: u64,
-        open: impl FnOnce() -> Result<Vec<Run>>,
+        open: impl FnOnce() -> Result<(Vec<Run>, Vec<(SegmentId, SegmentIncarnation)>)>,
     ) -> Result<Arc<RunSet>> {
         let slot = &self.slots[RUN_SLOT.with(|slot| *slot)];
         let mut held = crate::sync::lock(&slot.0);
         if let Some(set) = held.as_ref().filter(|set| set.generation == generation) {
             return Ok(Arc::clone(set));
         }
+        let (runs, stamps) = open()?;
         let set = Arc::new(RunSet {
             generation,
-            runs: open()?,
+            runs,
+            stamps,
         });
         *held = Some(Arc::clone(&set));
         Ok(set)
@@ -761,9 +783,13 @@ pub fn merged_page(
         if index.is_covered_key(key, found.lsn) {
             continue;
         }
+        let stamp = sealed
+            .set
+            .as_ref()
+            .map_or(SegmentIncarnation::NONE, |set| set.stamp_of(segment));
         out.push(
             key,
-            Entry::new(Loc::new(segment, found.offset, found.len), found.lsn),
+            Entry::new(Loc::new(segment, found.offset, found.len), found.lsn).stamped(stamp),
         );
     }
 
@@ -913,10 +939,16 @@ impl Paged<'_> {
             let mut runs = Vec::new();
             // Key runs stand in for the segments they cover, so those footers stay shut
             let covered = self.key_runs.covered();
+            // Every segment a row can name is stamped now, so a read later knows whether its place still stands
+            let mut stamps: Vec<(SegmentId, SegmentIncarnation)> = covered
+                .iter()
+                .map(|segment| (*segment, self.segments.incarnation_of(*segment)))
+                .collect();
             for segment in self.sealed.spanning(None, None) {
                 if covered.contains(&segment) {
                     continue;
                 }
+                stamps.push((segment, self.segments.incarnation_of(segment)));
                 // A segment retired since the range read is gone, its live rows already copied on
                 let Some(footer) = self.footers.footer(segment)? else {
                     continue;
@@ -945,7 +977,9 @@ impl Paged<'_> {
                     runs.push(Run::Keys { run, column });
                 }
             }
-            Ok(runs)
+            stamps.sort_unstable_by_key(|(segment, _)| *segment);
+            stamps.dedup_by_key(|(segment, _)| *segment);
+            Ok((runs, stamps))
         })?;
 
         sealed.clear();
@@ -1014,7 +1048,6 @@ mod tests {
     use crate::format::footer::FooterEntry;
     use crate::format::lsn::Lsn;
     use crate::format::record::Flags;
-    use crate::index::counters::SegmentTable;
 
     const COLUMN: ColumnId = ColumnId(1);
 
@@ -1054,6 +1087,7 @@ mod tests {
         footers: CountingFooters,
         runs: WalkRuns,
         key_runs: KeyRunSet,
+        segments: SegmentTable,
     }
 
     impl Fixture {
@@ -1070,6 +1104,7 @@ mod tests {
                 },
                 runs: WalkRuns::default(),
                 key_runs: KeyRunSet::default(),
+                segments: SegmentTable::new(),
             }
         }
 
@@ -1081,6 +1116,7 @@ mod tests {
                 footers: &self.footers,
                 runs: &self.runs,
                 key_runs: &self.key_runs,
+                segments: &self.segments,
             }
         }
 

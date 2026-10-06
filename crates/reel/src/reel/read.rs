@@ -6,7 +6,8 @@ use crate::format::column::KeyRef;
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{
-    check_keyless, data_codec, CheckKey, Flags, KeylessRead, RecordHeader, RecordLayout,
+    check_keyless, data_codec, keyless_len_codec, CheckKey, Flags, KeylessRead, RecordHeader,
+    RecordLayout,
 };
 use crate::io::direct::{DIRECT_ALIGN, DIRECT_REQUEST_BYTES};
 use crate::io::op::FileId;
@@ -15,6 +16,30 @@ use crate::reel::segment::{SplitAnswer, SplitRead};
 
 use super::{is_missing, recycle_header, Ask, ReadScratch, RecordRead, Spot};
 use reel_core::{ReadBlock, Value};
+
+/// What a reader holds against the record at a place
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Proof {
+    /// The index's stamp still vouches for the place, so a keyless record answers to its shape
+    Place,
+
+    /// A spot slot or a stale stamp gave the place, so the record proves itself by its check
+    Check,
+
+    /// A verified read, so the record proves itself and its payload checks out too
+    Verify,
+}
+
+impl Proof {
+    /// The proof a read holds, from whether it verifies and whether the index vouched for the place
+    pub(super) fn of(is_verified: bool, certain: bool) -> Proof {
+        match (is_verified, certain) {
+            (true, _) => Proof::Verify,
+            (false, true) => Proof::Place,
+            (false, false) => Proof::Check,
+        }
+    }
+}
 
 /// A whole framed record, or nothing when the segment no longer holds one there
 ///
@@ -163,7 +188,7 @@ pub(super) fn check_in_block(
     lsn: Lsn,
     loc: Loc,
     layout: RecordLayout,
-    is_verified: bool,
+    proof: Proof,
 ) -> std::result::Result<u8, RecordRead> {
     let Some(body_at) = at.checked_add(prefix) else {
         return Err(RecordRead::Stale);
@@ -175,6 +200,9 @@ pub(super) fn check_in_block(
         return Err(RecordRead::Stale);
     }
     if let Some(check) = layout.keyless_key(loc.len) {
+        if let Some(codec) = placed_keyless(&block[at..body_at], loc.len, proof) {
+            return codec;
+        }
         return match check_keyless(
             &block[at..body_at],
             &block[body_at..body_end],
@@ -191,10 +219,30 @@ pub(super) fn check_in_block(
     let Some(codec) = data_codec(prefix, expected, lsn, loc.len) else {
         return Err(RecordRead::Stale);
     };
-    if is_verified && !is_intact(prefix, &block[body_at..body_end]) {
+    if proof == Proof::Verify && !is_intact(prefix, &block[body_at..body_end]) {
         return Err(RecordRead::Corrupt);
     }
     Ok(codec)
+}
+
+/// A placed keyless record's codec off its shape, or nothing when the check has to run
+///
+/// A footer row, a key run row, a journal row or a map entry gave the place, and a
+/// segment never moves a record, so the shape is all the record has to answer to. A
+/// spot slot only tags the key, so its reads run the check, and so does a verified read.
+/// An empty record's shape is all zeros, which unwritten space shares, so it checks.
+fn placed_keyless(
+    prefix: &[u8],
+    len: u32,
+    proof: Proof,
+) -> Option<std::result::Result<u8, RecordRead>> {
+    if proof != Proof::Place || len == 0 {
+        return None;
+    }
+    Some(match keyless_len_codec(prefix) {
+        Some((stored, codec)) if stored == len => Ok(codec),
+        Some(_) | None => Err(RecordRead::Stale),
+    })
 }
 
 /// Frame every record each run read, leaving its spot in the run's block
@@ -232,7 +280,7 @@ pub(super) fn place_runs(
                 ask.lsn,
                 ask.loc,
                 held.layout,
-                is_verified,
+                Proof::of(is_verified, ask.certain),
             ) {
                 spots[ask.at as usize] = Spot {
                     block: index,
@@ -255,13 +303,20 @@ pub(super) fn frame_to_read(
     lsn: Lsn,
     loc: Loc,
     layout: RecordLayout,
-    is_verified: bool,
+    proof: Proof,
 ) -> RecordRead {
     // Wrapped before anything can return, so a record the checks reject still
     // hands its buffer back to the pool rather than to the allocator.
     let body = Value::pooled(body, crate::reel::payload::give);
-    // A keyless record's check is its only proof of identity, so it is always verified
+    // A keyless record from a spot slot proves itself by its check, one from a row or the map by its shape
     if let Some(check) = layout.keyless_key(loc.len) {
+        if let Some(codec) = placed_keyless(&head, loc.len, proof) {
+            recycle_header(head);
+            return match codec {
+                Ok(codec) => decoded(codec, body),
+                Err(read) => read,
+            };
+        }
         let read = check_keyless(&head, &body, expected, Flags::DATA, &check);
         recycle_header(head);
         return match read {
@@ -271,7 +326,7 @@ pub(super) fn frame_to_read(
         };
     }
     let codec = data_codec(&head, expected, lsn, loc.len);
-    let is_corrupt = codec.is_some() && is_verified && !is_intact(&head, &body);
+    let is_corrupt = codec.is_some() && proof == Proof::Verify && !is_intact(&head, &body);
     recycle_header(head);
     let Some(codec) = codec else {
         return RecordRead::Stale;
@@ -303,8 +358,13 @@ pub(super) fn keyless_range(
     check: &CheckKey,
     at: u64,
     len: usize,
+    proof: Proof,
 ) -> RecordRead {
-    let read = check_keyless(&head, &body, expected, Flags::DATA, check);
+    let read = match placed_keyless(&head, body.len() as u32, proof) {
+        Some(Ok(codec)) => KeylessRead::Intact(codec),
+        Some(Err(_)) => KeylessRead::Unwritten,
+        None => check_keyless(&head, &body, expected, Flags::DATA, check),
+    };
     recycle_header(head);
     if read != KeylessRead::Intact(0) {
         crate::reel::payload::give(body);

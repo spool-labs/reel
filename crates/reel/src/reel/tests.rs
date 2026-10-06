@@ -181,10 +181,10 @@ fn reads_back_by_key() {
     reel.flush().expect("flush");
 
     let found = reel
-        .read_record(committed.loc, key(9).as_ref(), committed.lsn, true)
+        .read_record(committed.loc, key(9).as_ref(), committed.lsn, true, false)
         .expect("read");
     let stale = reel
-        .read_record(committed.loc, key(8).as_ref(), committed.lsn, true)
+        .read_record(committed.loc, key(8).as_ref(), committed.lsn, true, false)
         .expect("read");
 
     assert_eq!(found, RecordRead::Found(Value::new(vec![0x99; 300])));
@@ -206,10 +206,10 @@ fn a_superseded_place_reads_its_own_record() {
 
     // An index that moved on can pair the old place with the new sequence number
     let superseded = reel
-        .read_record(first.loc, key(7).as_ref(), second.lsn, true)
+        .read_record(first.loc, key(7).as_ref(), second.lsn, true, false)
         .expect("read");
     let current = reel
-        .read_record(second.loc, key(7).as_ref(), second.lsn, true)
+        .read_record(second.loc, key(7).as_ref(), second.lsn, true, false)
         .expect("read");
 
     assert_ne!(first.lsn, second.lsn);
@@ -242,4 +242,64 @@ fn concurrent_appends_across_tails() {
     }
     assert_eq!(located.len(), writers as usize);
     reel.flush().expect("flush");
+}
+
+// a keyless record a row placed answers by its shape, and a spot slot's by its check
+#[test]
+fn a_placed_keyless_read_skips_the_check() {
+    use crate::format::record::{
+        CheckKey, Flags, RecordHeader, RecordLayout, CHECK_KEY_LEN, KEYLESS_PREFIX,
+    };
+    use crate::reel::read::{check_in_block, Proof};
+
+    let key = RecordKey::from_bytes(RECORD, &[0x21; RECORD_KEY_LEN]).expect("key");
+    let layout = RecordLayout::Keyless(CheckKey::from_bytes([7; CHECK_KEY_LEN]));
+    let payload = [9u8; 32];
+    let header = RecordHeader::framed(
+        layout,
+        32,
+        Lsn(5),
+        Flags::DATA.relocated(),
+        key.clone(),
+        0,
+        &payload,
+    );
+    let mut block = header.pack_in(layout, &payload).as_slice().to_vec();
+    block.extend_from_slice(&payload);
+    let loc = Loc::new(SegmentId(1), 0, 32);
+    // Read under another segment's key, so the check itself cannot pass.
+    let other = RecordLayout::Keyless(CheckKey::from_bytes([8; CHECK_KEY_LEN]));
+    let read = |loc: Loc, is_verified: bool, is_placed: bool| {
+        check_in_block(
+            &block,
+            0,
+            KEYLESS_PREFIX,
+            key.as_ref(),
+            Lsn(5),
+            loc,
+            other,
+            Proof::of(is_verified, is_placed),
+        )
+    };
+
+    assert_eq!(
+        read(loc, false, true),
+        Ok(0),
+        "a placed read answers by the shape"
+    );
+    assert_eq!(
+        read(loc, false, false),
+        Err(RecordRead::Corrupt),
+        "a spot read runs the check"
+    );
+    assert_eq!(
+        read(loc, true, true),
+        Err(RecordRead::Corrupt),
+        "a verified read runs the check"
+    );
+    assert_eq!(
+        read(Loc::new(SegmentId(1), 0, 31), false, true),
+        Err(RecordRead::Stale),
+        "a shape off the row is stale"
+    );
 }

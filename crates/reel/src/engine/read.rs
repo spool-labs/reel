@@ -457,6 +457,7 @@ impl ReelStore {
                     loc: entry.loc,
                     lsn: entry.lsn,
                     at: at as u32,
+                    certain: self.window_certain(entry),
                 });
             }
         }
@@ -587,7 +588,8 @@ impl ReelStore {
         let Some(entry) = self.index.get_at(key, at)? else {
             return Ok(None);
         };
-        match self.reel.read_record(entry.loc, key.as_ref(), entry.lsn, self.config.verify_reads)? {
+        let certain = self.window_certain(&entry);
+        match self.reel.read_record(entry.loc, key.as_ref(), entry.lsn, self.config.verify_reads, certain)? {
             RecordRead::Found(payload) => Ok(Some(payload)),
             RecordRead::Corrupt if self.config.repair == RepairPath::None => {
                 Err(ReelError::Corruption(format!(
@@ -678,6 +680,7 @@ impl ReelStore {
                 key.as_ref(),
                 entry.lsn,
                 self.config.verify_reads,
+                self.window_certain(&entry),
             )?;
             if let Some(resolved) = resolving.fold(self, key, entry, read)? {
                 return Ok(resolved);
@@ -706,7 +709,13 @@ impl ReelStore {
             };
             let read = self
                 .reel
-                .read_record_wait(entry.loc, key.as_ref(), entry.lsn, self.config.verify_reads)
+                .read_record_wait(
+                    entry.loc,
+                    key.as_ref(),
+                    entry.lsn,
+                    self.config.verify_reads,
+                    self.window_certain(&entry),
+                )
                 .await?;
             if let Some(resolved) = resolving.fold(self, key, entry, read)? {
                 return Ok(resolved);
@@ -814,9 +823,14 @@ impl ReelStore {
                     return Ok(Resolved::Payload(found));
                 }
             }
-            let read = self
-                .reel
-                .read_range(entry.loc, key.as_ref(), entry.lsn, offset, wanted)?;
+            let read = self.reel.read_range(
+                entry.loc,
+                key.as_ref(),
+                entry.lsn,
+                offset,
+                wanted,
+                self.window_certain(&entry),
+            )?;
             if matches!(read, RecordRead::Coded) {
                 return self.whole_range(key, offset, len);
             }
@@ -870,7 +884,14 @@ impl ReelStore {
             }
             let read = self
                 .reel
-                .read_range_wait(entry.loc, key.as_ref(), entry.lsn, offset, wanted)
+                .read_range_wait(
+                    entry.loc,
+                    key.as_ref(),
+                    entry.lsn,
+                    offset,
+                    wanted,
+                    self.window_certain(&entry),
+                )
                 .await?;
             if matches!(read, RecordRead::Coded) {
                 return self.whole_range_wait(key, offset, len).await;

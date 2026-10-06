@@ -508,6 +508,9 @@ impl ReelStore {
         let Some(_pass) = self.compaction_plane.enter() else {
             return Ok(None);
         };
+        let Some(_merging) = self.index.key_runs().try_merge() else {
+            return Ok(None);
+        };
         self.settle_sealed()?;
         if self.index.overlap_depth() <= MERGE_DEPTH || self.index.has_pending_covers() {
             return Ok(None);
@@ -545,6 +548,9 @@ impl ReelStore {
             &segments,
             &joining,
         )?;
+        if merged.runs_merged == 0 {
+            return Ok(None);
+        }
         self.compactor.note_merged_runs(merged.runs_merged);
         Ok(Some(MergeReport {
             runs_merged: merged.runs_merged,

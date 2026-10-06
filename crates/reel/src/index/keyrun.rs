@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use crate::error::{ReelError, Result};
 use crate::format::column::ColumnId;
@@ -276,6 +276,7 @@ pub struct KeyRunSet {
     held: RwLock<KeyRunsHeld>,
     generation: AtomicU64,
     next_id: AtomicU64,
+    merging: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -303,6 +304,14 @@ impl KeyRunSet {
     /// Every segment a run answers for
     pub fn covered(&self) -> HashSet<SegmentId> {
         crate::sync::read(&self.held).covered.clone()
+    }
+
+    /// Hold the set for one merge, nothing while another merge holds it
+    ///
+    /// Key runs carry no claims, so two merges at once could both take one run and leave
+    /// its rows in two.
+    pub fn try_merge(&self) -> Option<MutexGuard<'_, ()>> {
+        crate::sync::try_lock(&self.merging)
     }
 
     /// The id the next run is written under

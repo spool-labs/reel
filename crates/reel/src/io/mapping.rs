@@ -143,7 +143,20 @@ impl WriteMapping {
     /// Map a file read-write over its first `span` bytes, or nothing when it cannot be
     pub fn open(path: &Path, span: u64) -> Option<WriteMapping> {
         let file = OpenOptions::new().read(true).write(true).open(path).ok()?;
-        if span == 0 || span > usize::MAX as u64 || file.metadata().ok()?.len() < span {
+        if file.metadata().ok()?.len() < span {
+            return None;
+        }
+        WriteMapping::over(&file, span)
+    }
+
+    /// Map a file read-write over `span` bytes it grows into, where a write stays below its length
+    pub fn growing(path: &Path, span: u64) -> Option<WriteMapping> {
+        let file = OpenOptions::new().read(true).write(true).open(path).ok()?;
+        WriteMapping::over(&file, span)
+    }
+
+    fn over(file: &File, span: u64) -> Option<WriteMapping> {
+        if span == 0 || span > usize::MAX as u64 {
             return None;
         }
         let base = unsafe {

@@ -168,3 +168,36 @@ fn a_journal_stays_within_its_segment() {
     }
     drop(store);
 }
+
+/// Puts the aborting child makes, enough to seal some segments and leave one open
+#[cfg(target_os = "linux")]
+const ABORT_PUTS: u64 = 1_000;
+
+// every put that returned survives the process dying with no flush, on a mapped volume
+#[cfg(target_os = "linux")]
+#[test]
+fn puts_survive_a_process_crash() {
+    if let Ok(dir) = std::env::var("REEL_CRASH_CHILD_DIR") {
+        let store = ReelStore::open(dir.into(), config(), COLUMNS).expect("open");
+        for at in 0..ABORT_PUTS {
+            store.put(&key(at), &value(at)).expect("put");
+        }
+        // Exits with no destructors run, as a crash would
+        std::process::exit(3);
+    }
+    let dir = TempDir::new().expect("tempdir");
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", "puts_survive_a_process_crash", "--nocapture"])
+        .env("REEL_CRASH_CHILD_DIR", dir.path())
+        .status()
+        .expect("child");
+    assert_eq!(status.code(), Some(3), "the child did not reach its exit");
+    let store = ReelStore::open(dir.path().to_path_buf(), config(), COLUMNS).expect("reopen");
+    for at in 0..ABORT_PUTS {
+        let got = store
+            .get(&key(at))
+            .expect("get")
+            .unwrap_or_else(|| panic!("put {at} was lost"));
+        assert_eq!(got.as_ref(), &value(at)[..], "put {at} read back wrong");
+    }
+}

@@ -12,15 +12,16 @@ takes the process and leaves the page cache standing; a power cut takes both.
 
 | `sync` | a process crash | a power cut |
 |---|---|---|
-| `never`, the default | what landed since the journal last went down, at most one 1 MiB writeback pace a tail | the active segment of each tail since its last seal is at risk, and everything sealed is on the medium |
-| a byte count | everything after the last flush that returned, at most that many bytes | the same |
+| `never`, the default | nothing on Linux with buffered writes. Elsewhere, what landed since the journal last went down, at most one 1 MiB writeback pace a tail | the active segment of each tail since its last seal is at risk, and everything sealed is on the medium |
+| a byte count | nothing on Linux with buffered writes. Elsewhere, what landed since the journal last went down, at most one pace or that many bytes | everything after the last flush that returned, at most that many bytes |
 | `0`, every put | nothing is lost | nothing is lost |
 | any of the above, for a multi-record batch | a batch is confirmed or it never happened | a batch is confirmed or it never happened |
 
 A small record is keyless, so an open segment's journal is what says which key each
-record holds. A record whose row never reached the journal is not found again, even
-when its bytes reached the page cache, which is why a process crash costs what it
-does above.
+record holds. On Linux with buffered writes the journal is mapped like the tail, and
+a put copies its row in before it returns, so a dead process leaves both in the page
+cache. Elsewhere rows wait in memory for the next pace or flush, and a record whose
+row never reached the journal is not found again.
 
 Four things hold at every setting.
 
@@ -290,8 +291,8 @@ one group is what makes the batch atomic across a crash. It goes away at the sea
 ## What is not promised
 
 - Anything the policy did not cover. Under `never` a power cut can take the active
-  segment of each tail since its last seal, and a process crash what landed since
-  the journal last went down.
+  segment of each tail since its last seal. Off Linux, or on a direct volume, a
+  process crash takes what landed since the journal last went down.
 - A view of the volume held across several reads. A batch publishes under a
   barrier, so one read spanning many keys sees all of it or none of it, but the
   index keeps one version per key and two reads can still straddle a batch. The

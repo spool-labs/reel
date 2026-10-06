@@ -164,17 +164,18 @@ A range tombstone's row holds its exclusive end behind its length, `0xFFFF` for
 none. The CRC covers the group's head and rows, so a group a crash cut short fails it
 and the journal ends there.
 
-A flush writes the pending groups and syncs the journal beside the segment, and
-writeback pacing writes them too. A reopen reads the journal's whole groups and keeps
+On Linux with buffered writes the journal is a mapped file, like the tail. A put
+copies its group in before it returns, and the file grows a mebibyte at a time.
+Elsewhere a flush writes the pending groups and syncs the journal, and writeback
+pacing writes them too. A reopen reads the journal's whole groups and keeps
 a group only when every record it lists sits where its row says and checks out, so a
 batch comes back whole or not at all. A resumed tail writes the accepted rows again
 as a fresh journal, renamed over the old one. The seal writes the footer and unlinks
 the journal, and an open unlinks any journal whose segment has a footer.
 
-Two things follow from the key living only in the rows. On a volume that syncs
-`Never` or by `Bytes`, a crash of the process loses what was written since the
-journal last went down, as a crash of the machine does: at most one pace or one sync
-threshold. And a footer that rots after its seal leaves its segment's records
+Two things follow from the key living only in the rows. Off Linux, or on a direct
+volume, a crash of the process under `Never` or `Bytes` loses what was written since
+the journal last went down: at most one pace or one sync threshold. And a footer that rots after its seal leaves its segment's records
 unlisted, since no walk can find a keyless record's key. A volume with peers repairs
 them from a peer.
 

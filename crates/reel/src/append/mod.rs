@@ -1116,13 +1116,13 @@ impl Appender {
                 "a batch wrote fewer bytes than it framed",
             )));
         }
+        // One group for the whole run, so a batch comes back from a crash whole or not at all
+        active.journal.push(&rows)?;
         let mut pending = lock(&active.entries);
         for entry in &entries {
             pending.push(entry);
         }
         drop(pending);
-        // One group for the whole run, so a batch comes back from a crash whole or not at all
-        active.journal.push(&rows);
         Ok(locs)
     }
 
@@ -1196,11 +1196,11 @@ impl Appender {
                 "a record wrote fewer bytes than it framed",
             )));
         }
+        if let Some(row) = row {
+            active.journal.push(&[row])?;
+        }
         if let Some(entry) = listed {
             lock(&active.entries).push(&entry);
-        }
-        if let Some(row) = row {
-            active.journal.push(&[row]);
         }
         Ok(Loc::new(active.handle.id(), base as u32, header.length))
     }
@@ -1638,7 +1638,10 @@ impl Appender {
     fn build_segment(&self, id: SegmentId, holds: Arc<SegmentHolds>) -> Result<Active> {
         let path = self.shared.segment_path(id);
         let file = self.shared.driver.open(&path, true)?;
-        let journal = Journal::create(&self.shared.driver, &path)?;
+        let span = self
+            .maps_writes()
+            .then(|| self.shared.config.segment_bytes.to_bytes());
+        let journal = Journal::create(&self.shared.driver, &path, span)?;
         // One directory sync makes both new entries durable, the segment's and its journal's
         self.shared.driver.sync_dir(self.shared.segment_dir(id))?;
         let map = self.write_mapping(&path, file)?;
@@ -1680,12 +1683,16 @@ impl Appender {
         Ok(active)
     }
 
-    /// A fresh tail's writable mapping, on Linux buffered volumes, whose data sync flushes mapped writes
-    fn write_mapping(&self, path: &std::path::Path, file: FileId) -> Result<Option<WriteMapping>> {
-        let is_eligible = cfg!(target_os = "linux")
+    /// Whether a fresh tail writes through mappings: Linux buffered volumes, whose data sync flushes them
+    fn maps_writes(&self) -> bool {
+        cfg!(target_os = "linux")
             && !self.shared.writes_whole_blocks()
-            && !matches!(self.shared.driver.serving(), ServingBackend::Sim);
-        if !is_eligible {
+            && !matches!(self.shared.driver.serving(), ServingBackend::Sim)
+    }
+
+    /// A fresh tail's writable mapping, its file sized to the whole segment
+    fn write_mapping(&self, path: &std::path::Path, file: FileId) -> Result<Option<WriteMapping>> {
+        if !self.maps_writes() {
             return Ok(None);
         }
         let target = self.shared.config.segment_bytes.to_bytes();

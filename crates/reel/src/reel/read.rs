@@ -225,17 +225,13 @@ pub(super) fn check_in_block(
     Ok(codec)
 }
 
-/// A placed keyless record's codec off its shape, or nothing when the check has to run
-///
-/// A footer row, a key run row, a journal row or a map entry gave the place, and a
-/// segment never moves a record, so the shape is all the record has to answer to. A
-/// spot slot only tags the key, so its reads run the check, and so does a verified read.
-/// An empty record's shape is all zeros, which unwritten space shares, so it checks.
+/// A placed keyless record's codec off its shape, or nothing when the full check has to run
 fn placed_keyless(
     prefix: &[u8],
     len: u32,
     proof: Proof,
 ) -> Option<std::result::Result<u8, RecordRead>> {
+    // An empty record's shape is all zeros like unwritten space, so it takes the full check
     if proof != Proof::Place || len == 0 {
         return None;
     }

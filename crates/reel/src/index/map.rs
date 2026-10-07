@@ -374,6 +374,10 @@ impl ReelIndex {
             // A cue has to see the version, and this answer has none
             Lookup::Newest(_) => Lookup::Unsettled,
             Lookup::Missing if self.spot[at].moved(since) => Lookup::Unsettled,
+            // A range delete after the cue drops what it spans from the map and the spot index, and the footers still hold it
+            Lookup::Missing if self.indexes[at].is_covered_key(key.as_slice(), snapshot) => {
+                Lookup::Unsettled
+            }
             found => found,
         }
     }

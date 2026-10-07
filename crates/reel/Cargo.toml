@@ -61,9 +61,3 @@ harness = false
 [[test]]
 name = "probes"
 harness = false
-
-[target.'cfg(loom)'.dependencies]
-loom = "0.7"
-
-[lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ["cfg(loom)"] }

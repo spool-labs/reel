@@ -5,10 +5,9 @@
 //! ceiling while compaction may still write into the reserve band, so the append-only
 //! deadlock of needing to write in order to free space cannot happen.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-use crate::sync::checked::{AtomicBool, AtomicU64, Ordering};
 
 use crate::config::CompactRate;
 use crate::sync::lock;

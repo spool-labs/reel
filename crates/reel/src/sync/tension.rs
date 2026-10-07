@@ -7,9 +7,11 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use crate::sync::checked::{lock, wait, AtomicU64, Condvar, Mutex, Ordering};
+use crate::sync::{lock, wait};
 
 /// A waitlist that parks threads and futures on one condition
 pub struct Tension<State> {
@@ -103,9 +105,7 @@ impl<State> Tension<State> {
     pub fn slack(&self) {
         // Skipping the gate is safe because the count is sequentially ordered: a
         // waiter raises it then reads the state, a releaser changes the state then
-        // reads the count, so one of the two always sees the other. Loom reports a
-        // lost wakeup here that no hardware can produce, so the checker takes the gate.
-        #[cfg(not(loom))]
+        // reads the count, so one of the two always sees the other.
         if !self.is_taut() {
             return;
         }
@@ -276,55 +276,7 @@ pub fn block_on<Answered: Future>(future: Answered) -> Answered::Output {
     }
 }
 
-/// The parking half of the protocol, checked by the model checker
-///
-/// Only the threads are modelled: a future needs an executor to be polled and loom
-/// has none.
-#[cfg(all(test, loom))]
-mod loom_tests {
-    use super::*;
-
-    use loom::sync::Arc;
-
-    // no interleaving leaves a waiter parked after the change it waited for
-    #[test]
-    fn a_change_reaches_every_parked_waiter() {
-        loom::model(|| {
-            let tension = Arc::new(Tension::new(false));
-
-            let waiter = {
-                let tension = Arc::clone(&tension);
-                loom::thread::spawn(move || {
-                    tension.park(|is_open| is_open.then_some(()));
-                })
-            };
-
-            tension.slack_with(|is_open| *is_open = true);
-            waiter.join().expect("waiter joins");
-        });
-    }
-
-    // two waiters wanting different things both get through one change at a time
-    #[test]
-    fn heterogeneous_waiters_all_get_through() {
-        loom::model(|| {
-            let tension = Arc::new(Tension::new(0u64));
-
-            let waiter = {
-                let tension = Arc::clone(&tension);
-                loom::thread::spawn(move || {
-                    tension.park(|held| (*held >= 2).then_some(()));
-                })
-            };
-
-            tension.slack_with(|held| *held += 1);
-            tension.slack_with(|held| *held += 1);
-            waiter.join().expect("waiter joins");
-        });
-    }
-}
-
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

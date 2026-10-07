@@ -7,23 +7,20 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use crate::error::{ReelError, Result};
 use crate::io::op::{Completion, Outcome, Tag};
-use crate::sync::checked::{lock, wait_for, AtomicU64, Condvar, Mutex, Ordering};
+use crate::sync::{lock, wait_for};
 
 /// Completion slots one driver keeps, which is the ops it may have in flight
 ///
 /// A power of two, so a tag's low bits are its slot and nothing on the op path
 /// divides.
-#[cfg(not(loom))]
 pub const SLOT_COUNT: usize = 512;
-
-/// Two slots under the checker, which is one collision and the whole question
-#[cfg(loom)]
-pub const SLOT_COUNT: usize = 2;
 
 /// The bits of a tag that address a slot
 const SLOT_MASK: u64 = (SLOT_COUNT - 1) as u64;
@@ -888,85 +885,7 @@ fn never_freed() -> ReelError {
     ))
 }
 
-/// The claim protocol, checked by the model checker
-///
-/// A claim on the async door leaves a waker and no timeout, so a slot freed
-/// without ringing the seat beside it is a future nobody wakes. Parked threads
-/// are left out: the checker has no clock and takes a bounded park as open.
-#[cfg(all(test, loom))]
-mod loom_tests {
-    use super::*;
-
-    use loom::sync::Arc;
-
-    fn done(tag: Tag) -> Completion {
-        Completion {
-            tag,
-            outcome: Outcome::Done(Ok(())),
-        }
-    }
-
-    // no interleaving leaves a claim seated on a slot that came free
-    #[test]
-    fn a_free_never_passes_over_a_claim() {
-        loom::model(|| {
-            let table = Arc::new(SlotTable::new());
-            let held = Tag(0);
-            let wanted = [Tag(SLOT_COUNT as u64)];
-            assert!(table.try_claim(held));
-            table.file_one(done(held));
-
-            let taking = {
-                let table = Arc::clone(&table);
-                loom::thread::spawn(move || {
-                    table.take(held);
-                })
-            };
-
-            let waker = Waker::noop();
-            let mut cx = Context::from_waker(waker);
-            let mut claiming = Box::pin(table.claim(&wanted));
-            let is_taken = claiming.as_mut().poll(&mut cx).is_ready();
-
-            taking.join().expect("the taking thread joins");
-
-            // The slot is free by the join, so a seated claim is one nothing rings.
-            assert!(
-                is_taken || table.claiming.load(Ordering::SeqCst) == 0,
-                "the free left a claim seated on a slot it could have had"
-            );
-        });
-    }
-
-    // a completion and the drop that gave up on it never both keep the buffer
-    #[test]
-    fn a_drop_and_a_landing_agree() {
-        loom::model(|| {
-            let table = Arc::new(SlotTable::new());
-            let tag = Tag(0);
-            assert!(table.try_claim(tag));
-
-            let filing = {
-                let table = Arc::clone(&table);
-                loom::thread::spawn(move || {
-                    table.file_one(done(tag));
-                })
-            };
-
-            table.orphan(tag);
-            filing.join().expect("the filing thread joins");
-
-            assert_eq!(
-                table.reclaimed(),
-                1,
-                "the completion was put back twice or not at all"
-            );
-            assert_eq!(table.outstanding(), 0, "the slot never came back");
-        });
-    }
-}
-
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

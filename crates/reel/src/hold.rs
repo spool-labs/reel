@@ -13,11 +13,11 @@
 //! write lock every insert of every tenant queues on.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use crate::format::column::ColumnId;
 use crate::format::loc::SegmentId;
-use crate::sync::checked::lock;
-use crate::sync::checked::Mutex;
+use crate::sync::lock;
 
 /// Shards a hold splits into, each under its own mutex
 const SHARDS: usize = 16;

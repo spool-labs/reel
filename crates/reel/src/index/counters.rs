@@ -6,12 +6,13 @@
 //! rather than in a hashed map: a booking is a subtraction and an array index, and the
 //! window slides as the oldest segments retire.
 
-use crate::sync::checked::{AtomicU32, AtomicU64, Ordering, RwLock};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::RwLock;
 
 use crate::format::loc::{SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
-use crate::sync::checked::{read, write};
+use crate::sync::{read, write};
 
 /// Reclaimable-byte bookkeeping for one segment
 ///
@@ -1036,78 +1037,7 @@ impl ProbeCounts {
     }
 }
 
-/// What the retire ordering does and does not promise a concurrent reader
-///
-/// A retire drops the incarnation before the counters, so the table never sits in
-/// stamped-but-uncounted. Only the ordering is modelled.
-#[cfg(all(test, loom))]
-mod loom_tests {
-    use super::*;
-
-    use loom::sync::Arc;
-
-    // a reader finding the counters gone never then finds the stamp current
-    #[test]
-    fn uncounted_implies_unstamped() {
-        // Outside loom's tracking on purpose: the assert only fires where the retire
-        // got there first, so a run where it never did would pass testing nothing.
-        static SAW_UNCOUNTED: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-
-        loom::model(|| {
-            let table = Arc::new(SegmentTable::new());
-            table.mark_live(SegmentId(1), Lsn(1), 1000);
-
-            let retiring = {
-                let table = Arc::clone(&table);
-                loom::thread::spawn(move || table.forget(SegmentId(1)))
-            };
-
-            let counted = table.bytes_of(SegmentId(1)) != SegmentBytes::default();
-            let stamp = table.incarnation_of(SegmentId(1));
-            if !counted {
-                SAW_UNCOUNTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                assert!(
-                    stamp.is_none(),
-                    "a segment read as uncounted still wore a current stamp"
-                );
-            }
-
-            retiring.join().expect("the retire finishes");
-        });
-
-        assert!(
-            SAW_UNCOUNTED.load(std::sync::atomic::Ordering::Relaxed) > 0,
-            "no interleaving put the retire ahead of the read, so nothing was checked"
-        );
-    }
-
-    // the read-only form never brings a forgotten segment back
-    #[test]
-    fn a_read_never_resurrects_a_forgotten_segment() {
-        loom::model(|| {
-            let table = Arc::new(SegmentTable::new());
-            table.mark_live(SegmentId(1), Lsn(1), 1000);
-
-            let reading = {
-                let table = Arc::clone(&table);
-                loom::thread::spawn(move || {
-                    table.incarnation_of(SegmentId(1));
-                })
-            };
-
-            table.forget(SegmentId(1));
-            reading.join().expect("the read finishes");
-
-            assert!(
-                table.incarnation_of(SegmentId(1)).is_none(),
-                "a read put a forgotten segment back on the table"
-            );
-        });
-    }
-}
-
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

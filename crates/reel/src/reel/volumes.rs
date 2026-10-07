@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 
 use crate::config::VolumeClass;
 use crate::error::{ReelError, Result};
@@ -13,7 +14,7 @@ use crate::format::loc::SegmentId;
 use crate::io::op::WriteBuf;
 use crate::reel::segment::IoDriver;
 use crate::reel::segment_file_name;
-use crate::sync::checked::{read, write, RwLock};
+use crate::sync::{read, write};
 
 /// File on the first volume naming every root this reel spans
 pub const MANIFEST_NAME: &str = "reel.volumes";
@@ -415,7 +416,7 @@ pub fn manifest_bytes(roots: &[PathBuf]) -> Vec<u8> {
     out.into_bytes()
 }
 
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

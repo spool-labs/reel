@@ -1817,7 +1817,7 @@ impl SpotColumn {
     }
 }
 
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;

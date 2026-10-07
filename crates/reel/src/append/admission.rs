@@ -5,9 +5,10 @@
 //! unbounded queue. Per volume, never per tail and never process global, because the
 //! drain rate that returns permits is a device property.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::units::ByteCount;
 
-use crate::sync::checked::{AtomicU64, Ordering};
 use crate::sync::tension::{Tension, Wait};
 
 /// A ceiling of zero disables the bound and admits every request immediately
@@ -156,7 +157,7 @@ impl InflightBudget {
     }
 }
 
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -392,7 +393,3 @@ mod tests {
         assert_eq!(budget.queued_bytes(), ByteCount::from_bytes(0));
     }
 }
-
-// Not model-checked: loom treats SeqCst as AcqRel, so it permits the store-then-load
-// reordering across the release decrement and the waiting count, which is the one
-// reordering SeqCst forbids and the only way to lose a wakeup here.

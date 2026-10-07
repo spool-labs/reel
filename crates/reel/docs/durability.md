@@ -67,11 +67,11 @@ than "this is corrupt".
 
 ## The sync ladder
 
-| `sync_bytes` | policy | what a put's return means |
+| `sync` | policy | what a put's return means |
 |---|---|---|
-| `never` (default) | no hot-path flush at all | the record is in the page cache and the write call succeeded |
-| a byte count | flush once that many bytes have settled since the last flush | the record is durable if the put crossed the threshold, otherwise it is durable once a later one does |
-| `0` | flush before every put returns | the record reached the device |
+| `SyncPolicy::Never` (default) | no hot-path flush at all | the record is in the page cache and the write call succeeded |
+| `SyncPolicy::Bytes` | flush once that many bytes have settled since the last flush | the record is durable if the put crossed the threshold, otherwise it is durable once a later one does |
+| `SyncPolicy::EveryPut` | flush before every put returns | the record reached the device |
 
 Three things flush regardless of the policy. A segment seal takes a full sync after
 writing its footer. Creating a segment syncs the volume directory, because a file's
@@ -175,9 +175,11 @@ through it.
 
 **The rebuild sweeps each sealed footer.** It takes from each footer a key span per
 column, the range tombstones with their footprint, the tombstones the segment
-holds, and its rows booked against that segment, holding one parsed footer at a
-time, so the open's peak is one footer. Sealed keys go to the spot index and are
-answered from there afterwards.
+holds, and the segment's tally. The sealed rows then go into the spot index, a 16
+byte slot a key, on eight loader threads. Up to eight readers parse footers ahead of
+the join, one waits in the hand-off queue and each loader holds one, so the open
+holds up to about eighteen parsed footers at once on posix and about ten on the ring.
+Sealed keys are answered from the spot index afterwards.
 
 **The active tail is read through its journal.** The journal's whole groups are
 read in order, and a group is kept only when every record it lists sits at its
@@ -192,9 +194,14 @@ in key order, a tie going to the earlier segment, and a record that loses is boo
 dead where it lies and dropped. This is also what makes runtime visibility and the
 rebuilt index agree when a later put landed in a lower-numbered segment. Range
 tombstones stand as covers for the length of the pass, since their effect is on
-keys and no per-key comparison can express it. The sweep of the sealed footers
-cannot do the cross-segment join, so it books every sealed row live and the scrub
-settles each segment's dead count as its lap completes the segment.
+keys and no per-key comparison can express it. The sweep books each sealed segment's
+tally, the live and dead split the segment wrote at its seal. The join against the
+tails books dead the newest sealed row each tail entry outversions, and the spot
+index load books dead each sealed version a footer settles against the version that
+came next. Both debit only a shadowing at or past the segment's `sealed_at`, the
+frontier its tally is current to. What neither reaches, a version a key run left out
+or a key only the headers could settle, waits for the scrub to settle each segment's
+dead count as its lap completes the segment.
 
 The rebuild hands back the live entries per column, the sealed key spans,
 per-segment byte counts, live and dead and the tombstone footprint held with its
@@ -296,9 +303,10 @@ one group is what makes the batch atomic across a crash. It goes away at the sea
   records whose bytes never landed. That surfaces as a read-time checksum
   failure and a repair enqueue, which is the designed answer there. A volume
   declaring `RepairPath::None` closes the window by ordering the seal.
-- That the grave and cover windows carry the safety alone. They are the
-  fallback: the volume tracks the draw-to-publish gap exactly, a drawn gauge
-  covering draw to claim and the per-segment holds covering claim to publish,
-  so a tick that finds both empty prunes to the counter itself and only a tick
-  that catches a record in flight falls back to the 2^20 window.
+- That a grave or a cover outlasts a writer stalled past the 2^20 window. Every
+  tick prunes graves and covers at that window, so a write drawn before a delete
+  and published more than 2^20 sequence numbers later can come back until a
+  reopen. Compaction's tombstone floor is exact: a drawn gauge covers draw to claim
+  and the per-segment holds cover claim to publish, so a pass that finds both
+  empty drops tombstones up to the counter itself.
 - Any statement about power loss on macOS, for the reason above.

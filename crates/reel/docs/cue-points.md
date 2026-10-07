@@ -16,7 +16,7 @@ cue point 500 does not want a bounded lookup, it wants a different record
 entirely, and a bound only tells the reader its answer is too new. The
 versions are not gone, though: they are rows in sealed segment footers, and
 finding them costs one key span per segment per column and nothing per key. That
-is why this stayed a small feature and never a rewrite.
+is why this stayed a small feature.
 
 Two properties of the engine are what make it possible at all. `SealedRanges`
 records the span of every sealed segment, so footer search works at a cost that
@@ -34,7 +34,10 @@ footer, so every version the cue point can need is findable by key. Without
 the seal, a version overwritten inside the still-open tail would exist only as
 bytes nothing indexes.
 
-**Reading at S**, which is `get_at`. For key K:
+**Reading at S**, which is `get_at` over `read_as_of`. The read settles the
+sealed queue first, so the segments the cue sealed have their spans noted. A key
+the map has let go asks the spot index, which answers in one read when the key's
+newest sealed version is at or below S. Otherwise, for key K:
 
 1. Ask the map. An entry at lsn L <= S is the answer, grave included, since a
    grave at or below S means the key was deleted before the cue point.
@@ -77,7 +80,8 @@ the same way.
 
 ## What it costs, measured
 
-Measured on macOS, 1 KiB records:
+Measured on macOS, 1 KiB records, on the resident index this volume no longer
+has, and the probe that took them is gone, so they stand until a fresh run:
 
 | what | cost |
 |---|---|
@@ -85,9 +89,10 @@ Measured on macOS, 1 KiB records:
 | reading through one | 0.98 to 1.02x a live read |
 | holding one, writer running | 0.99 to 1.02x |
 
-Holding and reading are free, taking is a seal per tail. The read is free
-because most keys still answer from the map; only a key overwritten since the
-cue pays a footer search.
+Holding is free and taking is a seal per tail. A cue seals every tail and the next
+hand-over takes those keys out of the map, so a key unchanged since the cue answers
+from the spot index in one read, and only a key rewritten since the cue pays a
+footer search.
 
 **The cost nobody should discover later:** `seal()` rolls unconditionally, so
 cueing an idle volume still burns one segment per tail, a gibibyte per tail

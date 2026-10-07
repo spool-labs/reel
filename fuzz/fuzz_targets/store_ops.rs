@@ -1,11 +1,10 @@
 //! The engine itself, against the oracle, under guided mutation
 //!
-//! The other three targets ask whether a parser survives bad bytes. This one asks
+//! The other two targets ask whether a parser survives bad bytes. This one asks
 //! whether the store is right, which is a different question and the one worth the
 //! machine time. Every drawn op runs against a reel over the deterministic simulator
 //! and against the in-memory oracle at once, and the fixture checks after each step
-//! that everything both serve still agrees, across compaction, merges, index
-//! checkpoints and reopens.
+//! that everything both serve still agrees, across compaction, merges and reopens.
 //!
 //! The op stream is the same one the seeded differential suite drives, so the domain
 //! stays in one place. What changes is who chooses the sequence: seeds walk where

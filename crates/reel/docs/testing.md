@@ -19,10 +19,10 @@ marks named points and a test script gates them: hold, pass one arrival at a
 time, release, await an arrival count, everything freed if the test fails.
 
 Every site sits at a plane boundary, among them `seal/queued`, `seal/spans`,
-`paged/handover`, `index/page-shard`, `put/landed`, `compaction/owed`,
-`compaction/retire`, `compaction/repoint`, and the checkpoint pair
-`checkpoint/staged` and `checkpoint/published`. Unarmed cost is one acquire load
-and a cold branch.
+`paged/handover`, `index/page-shard`, `put/landed`, `delete/landed`,
+`batch/landed`, `compaction/owed`, `compaction/retire`, `compaction/repoint`, and
+the checkpoint pair `checkpoint/staged` and `checkpoint/published`. Unarmed cost is
+one acquire load and a cold branch.
 
 The plane is behind the `rendezvous` feature and a build that does not ask for it
 pays nothing at all: `at` is an empty function and there is no stage to load
@@ -32,8 +32,8 @@ dependency on itself, so nothing here needs a flag to run.
 What this bought: interleavings pinned in milliseconds that used to need a
 campaign on a real box per hit. A delete inside the repoint window wins. Every key
 answers while a seal stands unqueued. A read between two paged handovers sees
-every key. A put that publishes after a newer version of its key has sealed and
-been handed over loses to that version.
+every key. A put, a delete or a batch that publishes after a newer version of its
+key has sealed and been handed over loses to that version.
 
 The points also reach where the crash harness cannot, which is the reason to
 prefer them over drawing a crash. A checkpoint's directory work is `std::fs`
@@ -110,8 +110,8 @@ interleaving is about a one in seventy draw, so it wants a campaign to reproduce
 
 ## Backpressure
 
-`src/engine/tests.rs`. An idle tick prunes graves to the counter, and ingest heat is
-a rate rather than a point sample.
+`src/engine/tests.rs`. A tick keeps a grave until the 2^20 window has passed it, and
+ingest heat is a rate over the ask interval.
 
 ## Probes
 

@@ -237,6 +237,9 @@ pub struct ReelIndex {
     /// Segments retired since the spot index last dropped the entries pointing into them
     retired: AtomicU64,
 
+    /// The newest version an open or a hand-over gave the spot index, so a write above it skips the shadow check
+    handed: AtomicU64,
+
     /// Column identifier to its position, so routing a record is one load
     by_id: Vec<Option<usize>>,
 
@@ -285,6 +288,7 @@ impl ReelIndex {
             spot: columns.iter().map(|_| SpotColumn::new()).collect(),
             spot_ready: AtomicBool::new(false),
             retired: AtomicU64::new(0),
+            handed: AtomicU64::new(0),
             by_id,
             segments: Arc::new(SegmentTable::new()),
             footers: OnceLock::new(),
@@ -443,6 +447,9 @@ impl ReelIndex {
 
     /// Take a sealed footer's rows during a paged open, and count each fresh one, unless a key run covers the segment
     pub fn take_sealed_footer(&self, segment: SegmentId, footer: &SegmentFooter) -> Result<()> {
+        // What an open loads counts as handed over, since a follower applies older records after it
+        self.handed
+            .fetch_max(footer.max_lsn.as_u64(), Ordering::AcqRel);
         // The run keeps one row a key, so a version whose newer one died in a retired segment stays out
         if self.key_runs.covers(segment) {
             return Ok(());
@@ -524,11 +531,23 @@ impl ReelIndex {
         let Some(footers) = self.footers.get() else {
             return Ok(());
         };
+        let segments = &self.segments;
         for (at, spot) in self.spot.iter().enumerate() {
             let index = &self.indexes[at];
-            spot.settle_rows(self.columns[at].id, footers.as_ref(), &|key, booking| {
-                index.book_paged(key, booking)
-            })?;
+            spot.settle_rows(
+                self.columns[at].id,
+                footers.as_ref(),
+                &|key, booking| index.book_paged(key, booking),
+                // A seal's tally still counts live a version outversioned at or past that seal
+                &|key, lost, next| {
+                    if segments
+                        .sealed_at_of(lost.segment)
+                        .is_some_and(|sealed| next >= sealed)
+                    {
+                        segments.shadow(lost.segment, span_of(key.len() as u16, lost.len));
+                    }
+                },
+            )?;
             spot.finish_load();
         }
         // A version a tail outversions leaves the spot index, so a pruned grave cannot bring it back
@@ -812,9 +831,10 @@ impl ReelIndex {
     ///
     /// The index holds one version per key, so an entry newer than the snapshot is
     /// the wrong record entirely and what answers is the newest footer row at or
-    /// below the snapshot. The seal taken when the snapshot was made is what makes
-    /// this complete: everything at or below that number is in a segment with a
-    /// footer, so a version this search cannot see does not exist.
+    /// below the snapshot. The seal taken when the snapshot was made puts everything
+    /// at or below that number in a segment with a footer, and the search reaches
+    /// that footer once its spans are noted, so the caller settles the sealed queue
+    /// first.
     pub fn get_at(&self, key: &RecordKey, snapshot: Lsn) -> Result<Option<Entry>> {
         let Some(at) = self.slot(key.column) else {
             return Ok(None);
@@ -892,6 +912,7 @@ impl ReelIndex {
             return Ok(0);
         };
         let mut rows: Vec<(&[u8], Loc)> = Vec::with_capacity(partition.len());
+        let mut newest = Lsn::NONE;
         for row_at in 0..partition.len() {
             // The key is borrowed out of the packed bytes, never decoded into an entry
             let Some(key) = partition.key_at(row_at) else {
@@ -905,8 +926,11 @@ impl ReelIndex {
             if !row.flags.is_data() {
                 continue;
             }
+            newest = newest.max(row.lsn);
             rows.push((key, Loc::new(segment, row.offset, row.len)));
         }
+        // Raised before any key leaves the map, so a write finding its place empty sees it
+        self.handed.fetch_max(newest.as_u64(), Ordering::AcqRel);
         let lanes = match rows.len() >= SPLIT_AT {
             true => HANDOVER_LANES,
             false => 1,
@@ -1023,11 +1047,7 @@ impl ReelIndex {
 
     /// Move the map for a committed record, leaving the paged settle to the caller
     ///
-    /// This half is memory work under a shard lock, which is what a batch does while
-    /// it holds the publish barrier. It reads a record header only where the map holds
-    /// nothing for the key and a segment sealed since the put's draw holds a version of
-    /// it. The other reads a footer, and a reader waiting on the barrier should not be
-    /// waiting on the volume.
+    /// The shard lock can wait on a spot shard and read a record header, for a key with no map entry at or below the newest version the spot index was given.
     pub fn insert_mapped(&self, key: &RecordKey, loc: Loc, lsn: Lsn) -> Result<Landed> {
         let Some(at) = self.slot(key.column) else {
             return Ok(Landed::Newer);
@@ -1037,27 +1057,29 @@ impl ReelIndex {
             key.as_slice(),
             Entry::new(loc, lsn),
             &self.segments,
-            &|key: &[u8], lsn: Lsn| self.is_shadowed(at, key, lsn, &failed),
+            &|key: &[u8], lsn: Lsn| self.is_shadowed(at, key, lsn, &failed, true),
         );
         failed.into_inner().map_or(Ok(landed), Err)
     }
 
-    /// Whether a version newer than `lsn` has left the map for the spot index, a failed read counting as one and kept for the caller
+    /// Whether the spot index holds a version newer than `lsn`, a failed read kept for the caller and answered as `failing`
     fn is_shadowed(
         &self,
         at: usize,
         key: &[u8],
         lsn: Lsn,
         failed: &Cell<Option<ReelError>>,
+        failing: bool,
     ) -> bool {
-        if !self.spot_serves() {
+        // Nothing the spot index was given is newer than a write above this
+        if !self.spot_serves() || lsn.as_u64() > self.handed.load(Ordering::Acquire) {
             return false;
         }
         match self.spot[at].holds_newer(KeyRef::new(self.columns[at].id, key), lsn) {
             Ok(is_newer) => is_newer,
             Err(error) => {
                 failed.set(Some(error));
-                true
+                failing
             }
         }
     }
@@ -1109,17 +1131,21 @@ impl ReelIndex {
     /// Publish a batch's moves under the barrier, so a spanning read sees all or none
     ///
     /// Batches publishing at the same time share one hold and move side by side under
-    /// shard locks. The hold covers the map moves alone; whatever settling they call
-    /// for runs with the barrier given up.
+    /// shard locks. The hold moves the maps, and for a key with no map entry at or below
+    /// the newest version the spot index was given it can wait on a spot shard and read
+    /// one record header. Settling what the moves displaced reads more, so it runs after
+    /// the hold.
     ///
     /// The key moves go in the order the batch built them, with each range standing its
     /// cover at the point of the run it was given at. What comes back is one answer per
-    /// key move; a cover displaces nothing and has no answer to give.
+    /// key move, a cover displacing nothing, and beside them any failed shadow read. A
+    /// key whose shadow read failed publishes, so the batch stays whole, and the caller
+    /// raises the error once its settles have run.
     pub fn publish_batch(
         &self,
         moves: &[KeyMove<'_>],
         ranges: &[RangeMove<'_>],
-    ) -> Result<Vec<Landed>> {
+    ) -> (Vec<Landed>, Result<()>) {
         let failed = Cell::new(None);
         let landed = self.publish.publish_grouped(|| {
             let mut landed = Vec::with_capacity(moves.len());
@@ -1137,7 +1163,7 @@ impl ReelIndex {
             }
             landed
         });
-        failed.into_inner().map_or(Ok(landed), Err)
+        (landed, failed.into_inner().map_or(Ok(()), Err))
     }
 
     /// Resolve every key against one state of the maps
@@ -1266,7 +1292,7 @@ impl ReelIndex {
                 Some(slot) => self.indexes[slot].apply_moves(
                     &moves[at..end],
                     &*self.segments,
-                    &|key: &[u8], lsn: Lsn| self.is_shadowed(slot, key, lsn, failed),
+                    &|key: &[u8], lsn: Lsn| self.is_shadowed(slot, key, lsn, failed, false),
                     landed,
                 ),
                 // A column nothing indexes takes the same answer one key at a
@@ -1279,7 +1305,7 @@ impl ReelIndex {
 
     /// Drop a key from the map alone, leaving the paged settle to the caller
     ///
-    /// The other half of the split `insert_mapped` describes, for the same reason.
+    /// The other half of the split `insert_mapped` describes, with the same shadow check under the shard lock.
     pub fn remove_mapped(&self, key: &RecordKey, lsn: Lsn, tombstone: Loc) -> Result<Landed> {
         let Some(at) = self.slot(key.column) else {
             return Ok(Landed::Newer);
@@ -1290,7 +1316,7 @@ impl ReelIndex {
             lsn,
             tombstone,
             &self.segments,
-            &|key: &[u8], lsn: Lsn| self.is_shadowed(at, key, lsn, &failed),
+            &|key: &[u8], lsn: Lsn| self.is_shadowed(at, key, lsn, &failed, true),
         );
         failed.into_inner().map_or(Ok(landed), Err)
     }
@@ -1544,11 +1570,10 @@ impl ReelIndex {
 
     /// Drop a key while it still resolves one exact location, writing no tombstone
     ///
-    /// The guard is the location rather than a sequence number, so a key that has
-    /// moved on since the caller looked is left alone. A paged key needs a grave
-    /// rather than a removal, since taking it out of a map it is not in would leave
-    /// the footer answering for a record that will not read. That grave names no
-    /// tombstone, so it stands until the segment behind it is retired.
+    /// The guard is the location, so a key that has moved on since the caller looked
+    /// is left alone. A paged key needs a grave, since taking it out of a map it is
+    /// not in would leave the footer answering for a record that will not read. No
+    /// tombstone stands behind that grave, so it stays for the life of the process.
     pub fn evict_at(&self, key: &RecordKey, at: Loc) -> Result<bool> {
         let Some(column_at) = self.slot(key.column) else {
             return Ok(false);
@@ -1592,6 +1617,12 @@ impl ReelIndex {
         });
     }
 
+    /// Take out the grave a tombstone left once compaction drops that tombstone, since nothing older is left for it to hide
+    pub fn drop_grave(&self, key: &RecordKey, lsn: Lsn) -> bool {
+        self.column(key.column)
+            .is_some_and(|index| index.drop_grave(key.as_slice(), lsn))
+    }
+
     /// Book a carried tombstone's footprint in the segment it was copied into
     ///
     /// The key only says which column's width the record was framed at.
@@ -1624,10 +1655,10 @@ impl ReelIndex {
         self.indexes.iter().map(|index| index.cover_count()).sum()
     }
 
-    /// Heap bytes allocated by the maps, the shards and their filters
+    /// Heap bytes allocated by the maps, the shards, their filters and the spot index
     pub fn resident_bytes(&self) -> ByteCount {
-        let bytes: u64 = self.indexes.iter().map(ColumnIndex::heap_bytes).sum();
-        ByteCount::from_bytes(bytes)
+        let maps: u64 = self.indexes.iter().map(ColumnIndex::heap_bytes).sum();
+        ByteCount::from_bytes(maps + self.spot_heap_bytes())
     }
 
     /// Live key count and payload byte total across every column

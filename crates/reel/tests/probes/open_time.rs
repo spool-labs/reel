@@ -2,7 +2,8 @@
 //!
 //! An open joins nothing across the sealed segments: each footer is already the sorted
 //! index its reads search, so the open takes the footers into the spot index and
-//! installs only what the tails hold. Its index column should be flat.
+//! installs only what the tails hold. The spot column grows a 16 byte slot a sealed key,
+//! and the index column is that plus a flat rest.
 //!
 //! The simulator serves every read out of memory, so it times the open's own work. Point
 //! `REEL_OPEN_TIME_DIR` at a directory to run the same open on the real backend, where a
@@ -110,6 +111,7 @@ struct Case {
     keys: u64,
     open: Duration,
     held: u64,
+    spot: u64,
 }
 
 /// Directory the operator asked for a real volume under, if they asked for one
@@ -131,8 +133,8 @@ pub fn open_time_by_segment_count() {
         None => println!("backend simulator"),
     }
     println!(
-        "{:>9}  {:>9}  {:>12}  {:>12}",
-        "segments", "keys", "open", "index"
+        "{:>9}  {:>9}  {:>12}  {:>12}  {:>12}",
+        "segments", "keys", "open", "index", "spot"
     );
 
     for &wanted in CASES {
@@ -141,8 +143,8 @@ pub fn open_time_by_segment_count() {
             None => simulated(wanted),
         };
         println!(
-            "{:>9}  {:>9}  {:>12.2?}  {:>9} KiB",
-            case.segments, case.keys, case.open, case.held
+            "{:>9}  {:>9}  {:>12.2?}  {:>8} KiB  {:>8} KiB",
+            case.segments, case.keys, case.open, case.held, case.spot
         );
     }
 }
@@ -165,11 +167,13 @@ fn simulated(wanted: usize) -> Case {
     let open = start.elapsed();
     // What the open left behind, before any maintenance tick has run.
     let held = store.resident_bytes().to_bytes() / 1024;
+    let spot = store.index().spot_heap_bytes() / 1024;
     Case {
         segments,
         keys,
         open,
         held,
+        spot,
     }
 }
 
@@ -187,10 +191,12 @@ fn on_disk(root: &Path, wanted: usize) -> Case {
     let store = ReelStore::open(built, config(), COLUMNS).expect("reopen");
     let open = start.elapsed();
     let held = store.resident_bytes().to_bytes() / 1024;
+    let spot = store.index().spot_heap_bytes() / 1024;
     Case {
         segments,
         keys,
         open,
         held,
+        spot,
     }
 }

@@ -147,6 +147,9 @@ struct SegmentRow {
     /// Newest row the segment's sealed footer holds, or the reserved zero for none
     max_lsn: AtomicU64,
 
+    /// The frontier the segment's tally is current to, or the reserved zero for none read
+    sealed_at: AtomicU64,
+
     /// Newest tombstone version here, or the reserved zero for none
     held_lsn: AtomicU64,
 
@@ -166,6 +169,7 @@ impl SegmentRow {
             held: AtomicU64::new(0),
             min_lsn: AtomicU64::new(u64::MAX),
             max_lsn: AtomicU64::new(Lsn::NONE.as_u64()),
+            sealed_at: AtomicU64::new(Lsn::NONE.as_u64()),
             held_lsn: AtomicU64::new(Lsn::NONE.as_u64()),
             incarnation: AtomicU32::new(0),
             flags: AtomicU32::new(0),
@@ -229,6 +233,7 @@ impl SegmentRow {
         self.held.store(0, Ordering::Release);
         self.min_lsn.store(u64::MAX, Ordering::Release);
         self.max_lsn.store(Lsn::NONE.as_u64(), Ordering::Release);
+        self.sealed_at.store(Lsn::NONE.as_u64(), Ordering::Release);
         self.held_lsn.store(Lsn::NONE.as_u64(), Ordering::Release);
         self.incarnation.store(0, Ordering::Release);
         self.flags.store(0, Ordering::Release);
@@ -548,6 +553,26 @@ impl SegmentTable {
         self.opened(segment, |row| {
             row.max_lsn.fetch_max(lsn.as_u64(), Ordering::AcqRel);
         });
+    }
+
+    /// Note the frontier a sealed segment's footer says its tally is current to
+    pub fn note_sealed_at(&self, segment: SegmentId, lsn: Lsn) {
+        if lsn == Lsn::NONE {
+            return;
+        }
+        self.opened(segment, |row| {
+            row.sealed_at.fetch_max(lsn.as_u64(), Ordering::AcqRel);
+        });
+    }
+
+    /// The frontier a segment's tally is current to, or nothing for a segment no footer was read for
+    pub fn sealed_at_of(&self, segment: SegmentId) -> Option<Lsn> {
+        let window = read(&self.window);
+        let row = window.counted(segment)?;
+        match row.sealed_at.load(Ordering::Acquire) {
+            0 => None,
+            frontier => Some(Lsn(frontier)),
+        }
     }
 
     /// The newest row a segment can answer with, or nothing recorded for it

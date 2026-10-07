@@ -155,16 +155,15 @@ impl ReelStore {
     }
 
     /// Move the index onto a batch that has landed, under the publish barrier
+    ///
+    /// The barrier lands a read spanning several keys before the batch or after it.
+    /// The hold moves the maps, and a key with no map entry at or below the newest
+    /// version the spot index was given can wait on a spot shard and read one header.
+    /// Settling a displaced sealed version reads more, so it runs after the hold.
     fn publish_batch(&self, keys: &[BatchKey], committed: &[Committed]) -> Result<()> {
-        // The publish moves the index one key at a time, so the barrier is what makes
-        // a read spanning several keys land before it or after it, never inside it.
-        // Only the map moves under that hold: settling a paged column's displaced key
-        // reads a footer, and a reader waiting on the barrier must not be waiting on
-        // the volume, so those are collected and run afterwards.
-
-        // Built before the barrier is taken, so the hold costs only the move. A range
-        // is held apart with the count of moves ahead of it, since the index applies a
-        // run of key moves at a time and a cover is not one of them.
+        // A slow batch stands here with its records down and the index not yet moved
+        crate::sync::rendezvous::at("batch/landed");
+        // Built before the barrier, each range held apart with the count of key moves ahead of it
         let mut moves: Vec<KeyMove<'_>> = Vec::with_capacity(keys.len());
         let mut ranges: Vec<RangeMove<'_>> = Vec::new();
         for (planned, landed) in keys.iter().zip(committed) {
@@ -186,9 +185,9 @@ impl ReelStore {
             }
         }
 
-        let landed = self.index.publish_batch(&moves, &ranges)?;
+        let (landed, shadowed) = self.index.publish_batch(&moves, &ranges);
 
-        // One answer per key move, so the ranges are stepped over rather than paired.
+        // One answer per key move, so a range gets none and is stepped over
         let mut answers = landed.iter();
         let mut displaced = Vec::new();
         for (planned, record) in keys.iter().zip(committed) {
@@ -203,10 +202,14 @@ impl ReelStore {
             }
         }
 
+        // Every displaced key settles past a failure, so one bad read leaves no other counted twice
+        let mut settled: Result<()> = Ok(());
         for (key, lsn) in displaced {
-            self.index.settle_displaced(&key, lsn)?;
+            if let Err(error) = self.index.settle_displaced(&key, lsn) {
+                settled = settled.and(Err(error));
+            }
         }
-        Ok(())
+        shadowed.and(settled)
     }
 
     /// Append a tombstone and drop the key from the index
@@ -216,6 +219,8 @@ impl ReelStore {
         }
         self.check_column(key)?;
         let committed = self.reel.delete(key.clone(), Commit::PerRecord)?;
+        // A slow delete stands here with its tombstone down and the index not yet moved
+        crate::sync::rendezvous::at("delete/landed");
         self.index.remove(key, committed.lsn, committed.loc)?;
         Ok(())
     }

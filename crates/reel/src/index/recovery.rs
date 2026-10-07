@@ -91,8 +91,8 @@ pub struct SealedSpan {
 
 /// Rebuild the reel's index by reading every segment file in its directory into it
 ///
-/// Sealed segments are swept a footer at a time, so the peak is one footer. Only the
-/// tails are resolved into memory.
+/// Sealed footers are swept on the join and loaded into the spot index on `LOADERS`
+/// threads, up to about eighteen parsed footers at once. Only the tails reach the map.
 pub fn rebuild_reel(
     driver: &IoDriver,
     roots: &[PathBuf],
@@ -1035,7 +1035,7 @@ fn belongs_here(driver: &IoDriver, file: FileId, segment: SegmentId) -> Result<b
 /// The keys stay in the footer, so what a rebuild installs is the span, the oldest
 /// record the segment could still surface, and the range tombstones, whose ends live
 /// in payloads. The live and dead split comes from the tally written at the seal, and
-/// the scrub settles shadowing after it.
+/// the frontier that tally is current to goes down for the spot index load's debits.
 fn sweep_footer(
     segment: SegmentId,
     footer: &SegmentFooter,
@@ -1051,6 +1051,10 @@ fn sweep_footer(
         resolver.queue.undeclared.get_or_insert(partition.column);
     }
     resolver.index.segments().note_max(segment, footer.max_lsn);
+    resolver
+        .index
+        .segments()
+        .note_sealed_at(segment, footer.sealed_at);
     for partition in &footer.partitions {
         if let Some((lowest, highest)) = partition.key_range() {
             resolver.sealed.push(SealedSpan {

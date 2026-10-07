@@ -99,19 +99,22 @@ pub fn stat(engine: &ReelStore) -> StatReport {
             total => dead as f64 / total as f64,
         },
         held_cues: engine.cue_points().held().len(),
-        caveats: caveats(&columns),
+        caveats: caveats(&columns, live + dead > 0),
         columns,
     }
 }
 
 /// What a reader has to know before taking any of these figures for a total
-fn caveats(columns: &[StatColumn]) -> Vec<Caveat> {
+fn caveats(columns: &[StatColumn], holds_bytes: bool) -> Vec<Caveat> {
     let mut caveats = Vec::new();
     if columns.is_empty() {
         caveats.push(
             Caveat::new("no columns declared, so the per-column numbers count nothing")
                 .fix("pass --column NAME:ID for each column the volume was written with"),
         );
+    }
+    if holds_bytes {
+        caveats.push(caveat::seal_tally());
     }
     caveats
 }

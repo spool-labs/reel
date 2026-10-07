@@ -232,6 +232,11 @@ impl ColumnIndex {
         on_index!(self, index => index.hold_grave(key, lsn, segment, is_shadowed))
     }
 
+    /// Take out a key's grave while it still holds this tombstone's number
+    pub fn drop_grave(&self, key: &[u8], lsn: Lsn) -> bool {
+        on_index!(self, index => index.drop_grave(key, lsn))
+    }
+
     /// What a record of this column's width and a payload of this length occupies
     pub fn span_of(&self, len: u32) -> u64 {
         span_of(self.key_width(), len)
@@ -1025,6 +1030,23 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         self.note_filled(at, was_empty);
     }
 
+    /// Take out a key's grave while it still holds this tombstone's number, for a tombstone compaction dropped
+    pub fn drop_grave(&self, key: &[u8], lsn: Lsn) -> bool {
+        let Some(key) = K::from_slice(key) else {
+            return false;
+        };
+        let at = self.shard_of(&key);
+        let mut state = write(&self.shards[at]);
+        let held = state.map.at(key.as_slice()).copied();
+        if !held.is_some_and(|entry| entry.is_grave() && entry.lsn == lsn) {
+            return false;
+        }
+        state.map.take(key.as_slice());
+        state.graves -= 1;
+        self.note_emptied(at, &mut state);
+        true
+    }
+
     /// The tombstone itself, with the key parsed and its shard already held
     ///
     /// The caller has already booked the tombstone record's own span.
@@ -1043,6 +1065,12 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         let existing = state.map.at(key.as_slice()).copied();
         if let Some(existing) = existing {
             if existing.lsn >= lsn {
+                // A copy of the same tombstone moves its grave to the segment the copy landed in
+                if existing.is_grave() && existing.lsn == lsn {
+                    state
+                        .map
+                        .put(key, Entry::grave_from(lsn, tombstone.segment));
+                }
                 return Landed::Newer;
             }
         }
@@ -1158,9 +1186,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
 
     /// Take a paged key out with a grave of its own, for a record that will not read
     ///
-    /// The grave carries no origin: no tombstone was written, so nothing on disk
-    /// will ever say this key is gone and the grave cannot be given up while the
-    /// segment behind it stands.
+    /// No tombstone was written, so the grave has no origin and stands for the life of the process.
     pub fn evict_paged(
         &self,
         key: &[u8],
@@ -3103,6 +3129,121 @@ mod tests {
 
         assert!(index.contains(&key(1, 1)));
         assert_eq!(index.totals().count, 1);
+    }
+
+    // a write over an empty place that the shadow check finds outversioned is refused, through every door
+    #[test]
+    fn a_shadowed_write_over_an_empty_place_is_refused() {
+        let index = sharded();
+        let segments = SegmentTable::new();
+        let shadowed = |_: &[u8], _: Lsn| true;
+
+        assert_eq!(
+            index.insert_unless(
+                &key(1, 1),
+                Entry::new(loc(1, 0, 400), Lsn(3)),
+                &segments,
+                &shadowed,
+            ),
+            Landed::Newer
+        );
+        assert!(index.get(&key(1, 1)).is_none(), "the refused put went in");
+        assert_eq!(
+            segments.bytes_of(SegmentId(1)).dead,
+            span_of(34, 400),
+            "the refused put was not booked dead"
+        );
+
+        assert_eq!(
+            index.remove_unless(&key(1, 2), Lsn(4), loc(2, 0, 0), &segments, &shadowed),
+            Landed::Newer
+        );
+        assert!(
+            index.entry_or_grave(&key(1, 2)).is_none(),
+            "the refused delete stood a grave"
+        );
+
+        let (put, deleted) = (key(1, 3), key(1, 4));
+        let moves = [
+            KeyMove {
+                column: SHARDED.id,
+                key: &put,
+                loc: loc(3, 0, 100),
+                lsn: Lsn(5),
+                is_delete: false,
+            },
+            KeyMove {
+                column: SHARDED.id,
+                key: &deleted,
+                loc: loc(3, 128, 0),
+                lsn: Lsn(6),
+                is_delete: true,
+            },
+        ];
+        let mut landed = Vec::new();
+        index.apply_moves(&moves, &segments, &shadowed, &mut landed);
+        assert_eq!(landed, vec![Landed::Newer, Landed::Newer]);
+        assert!(
+            index.entry_or_grave(&put).is_none(),
+            "the batch put went in"
+        );
+        assert!(
+            index.entry_or_grave(&deleted).is_none(),
+            "the batch delete stood a grave"
+        );
+        assert_eq!(index.totals().count, 0);
+
+        // A place the map holds is settled by its own entry, and the check is never asked
+        let asked = std::cell::Cell::new(0u32);
+        let counted = |_: &[u8], _: Lsn| {
+            asked.set(asked.get() + 1);
+            true
+        };
+        index.insert(&key(1, 5), Entry::new(loc(4, 0, 10), Lsn(7)), &segments);
+        assert_eq!(
+            index.insert_unless(
+                &key(1, 5),
+                Entry::new(loc(4, 64, 10), Lsn(8)),
+                &segments,
+                &counted,
+            ),
+            Landed::Record
+        );
+        assert_eq!(asked.get(), 0, "a held place asked the shadow check");
+    }
+
+    // a tombstone compaction drops takes its own grave out, and leaves any other entry alone
+    #[test]
+    fn a_dropped_tombstone_takes_its_grave() {
+        let index = sharded();
+        let segments = SegmentTable::new();
+        index.remove(&key(2, 1), Lsn(9), loc(5, 0, 0), &segments);
+        assert!(
+            !index.drop_grave(&key(2, 1), Lsn(8)),
+            "another delete's grave went"
+        );
+        assert!(index.drop_grave(&key(2, 1), Lsn(9)));
+        assert!(index.entry_or_grave(&key(2, 1)).is_none());
+        assert_eq!(index.grave_count(), 0);
+
+        index.insert(&key(2, 2), Entry::new(loc(5, 64, 10), Lsn(10)), &segments);
+        assert!(!index.drop_grave(&key(2, 2), Lsn(10)), "a live record went");
+        assert!(index.get(&key(2, 2)).is_some());
+    }
+
+    // a copy of a tombstone moves its grave to the segment the copy landed in
+    #[test]
+    fn a_copied_tombstone_moves_its_grave() {
+        let index = sharded();
+        let segments = SegmentTable::new();
+        index.remove(&key(3, 1), Lsn(9), loc(5, 0, 0), &segments);
+        assert_eq!(
+            index.remove(&key(3, 1), Lsn(9), loc(8, 0, 0), &segments),
+            Landed::Newer
+        );
+        let grave = index.entry_or_grave(&key(3, 1)).expect("the grave");
+        assert_eq!(grave.grave_origin(), Some(SegmentId(8)));
+        assert_eq!(index.grave_count(), 1);
     }
 
     // a shard-aligned prefix has its live totals without walking its keys

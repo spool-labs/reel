@@ -13,11 +13,13 @@ else, and the reading order at the bottom says where.
 
 ## A volume on disk
 
-The engine writes four kinds of file and nothing else.
+The engine writes six kinds of file and nothing else.
 
 | name | where | what it is |
 |---|---|---|
 | `NNNNNN.reel` | every root | one segment, zero-padded six digits, monotonic across roots |
+| `NNNNNN.rows` | beside its segment | an open segment's journal of rows, gone at the seal |
+| `<id>.keys` | the first root | a key run a merge wrote, twelve-digit id, `<id>.keys.part` until whole |
 | `reel.volumes` | the first root | the manifest naming every root this reel spans |
 | `reel.volume` | every root past the first | the marker saying this root was mounted where the manifest says |
 | `reel.lock` | the first root | the advisory lock one writing process holds for its lifetime |
@@ -61,10 +63,10 @@ the location and the sequence number, and the read is one device op placed by
 the entry. A sealed key goes to the spot index, which places its record for one
 read.
 
-A key the spot index cannot settle goes to the footers. That search is a funnel: a whole-column filter over every
-sealed key, then the per-segment key spans, then each surviving segment's own
-filter, then its directory, then one block of rows, then the row. The row points at a
-record and the driver fetches it.
+A key the spot index cannot settle goes to the footers. That search is a funnel: the
+per-segment key spans, then each surviving segment's own filter, then its directory,
+then one block of rows, then the row. The row points at a record and the driver
+fetches it.
 
 The search reads every candidate rather than stopping at the first, because a
 segment number is not a version: several tails write at once, so a newer record

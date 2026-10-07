@@ -4,7 +4,9 @@ The design record for the index. The map holds the open tails' keys, the graves 
 the covers. A sealed segment's keys go to its footer, and the spot index places each
 one's record for one device read. It is the gate on the full-history deployment
 class, where holding every key in memory at 95 bytes a key is 19 GB at 200 million
-keys and an open at a billion cannot happen at all.
+keys and an open at a billion cannot happen at all. The spot index costs a 16 byte
+slot a sealed key, 19 to 28 bytes with its tables' spare room, so 200 million sealed
+keys hold 3.8 to 5.6 GB.
 
 Each shard tracks its bytes, its graves and its paged count, so `live_count` is
 `map.len() - graves + paged`.
@@ -14,8 +16,6 @@ what a lookup walks when the spot index cannot settle it, and what each step tak
 
   the map                 unsealed keys, graves, covers
     | miss
-  sealed-key filter       one stack per column over every sealed key
-    | maybe
   per-segment key spans   segments whose range cannot hold the key
     | candidates
   per-segment filter      candidates the bloom rules out
@@ -52,11 +52,19 @@ compaction window one at a time.
   would publish over that version, serve the older value and count the key twice.
   With the shard held, the write reads the header behind each slot of its key whose
   segment may hold anything newer than the write, and a newer version there books the
-  write dead. `late_put` in `rendezvous_races.rs` is the check.
-- **A grave is given up on its own segment, not on a sequence number**, once the
-  segment its tombstone landed in has a footer, which is the point a search finds the
-  tombstone row without it. A range cover is held while any sealed segment overlaps
-  it.
+  write dead. A write above the newest version an open or a hand-over gave the spot
+  index skips the check, which is every fresh write not parked across a hand-over,
+  and a follower's older records stay at or below it. `late_put`, `late_delete` and
+  `late_batch` in `rendezvous_races.rs` drive each door through the race,
+  `a_shadowed_write_over_an_empty_place_is_refused` in `index/column.rs` pins the
+  three arms, and `holds_newer_reads_only_the_slots_a_ceiling_admits` in
+  `index/spot.rs` pins the read.
+- **A grave goes once its tombstone's segment is noted and the 2^20 window has passed
+  it.** The noted segment is the point a search finds the tombstone row without the
+  grave. A tombstone compaction drops takes its grave with it, since nothing older is
+  left for the grave to hide, and an eviction's grave has no tombstone behind it, so it
+  stands for the life of the process. A range cover is held while any sealed segment
+  overlaps it.
 - **A key comes back into the map for a compaction window**, between the source
   retiring and the destination sealing, where nothing else resolves it.
 - **`get` takes the newest candidate, not the first.** A segment number is not a
@@ -90,12 +98,15 @@ the per-key merge cost at 257 sealed segments falls from 1.21 us to 88 ns and th
 whole playback from 160.64 ms to 11.84 ms, and at 2 and 5 segments the two arms tie,
 so nothing was traded for it.
 
-## Lazy open
+## The open
 
-A rebuild sweeps each footer: one key span per partition
-into the sealed ranges, the range covers with their footprint, the tombstones held,
-and each segment's rows booked against that segment, one parsed footer in memory at a
-time. Sealed keys never enter the map, and `an_open_never_installs_its_sealed_keys`
+A rebuild sweeps each footer: one key span per partition into the sealed ranges, the
+range covers with their footprint, the tombstones held, and each segment's tally
+booked against that segment. Every sealed footer's rows then go into the spot index on
+`LOADERS` threads, a 16 byte slot a sealed key. Up to eight readers parse footers
+ahead of the join, one waits in the hand-off queue and eight loaders hold one each, so
+an open holds up to about eighteen parsed footers at once on posix and about ten on
+the ring. Sealed keys never enter the map, and `an_open_never_installs_its_sealed_keys`
 is the check.
 
 Measured 2026-07-30 by `tests/probes/open_time.rs`, before the spot index, reopening
@@ -107,10 +118,10 @@ a volume whose segments are all sealed:
 | 257 | 133,121 | 6.13 ms | 0 KiB |
 | 1025 | 532,481 | 24.68 ms | 0 KiB |
 
-Zero, because nothing is installed: every key stays in the footer it was already in.
-The open reads a span per partition. Two honest edges: the figure is what the key
-maps hold, and the sealed ranges are kilobytes held elsewhere. And this is the
-simulator, so it times index work and no device work.
+Zero then, because the open installed nothing. The spot index load changed both
+columns: the open now takes every sealed row, and the index figure grows a slot a
+sealed key. The probe prints the spot index beside the total, and these rows wait on
+a fresh run. This is the simulator, so it times index work alone.
 
 **Only one derived number is correctness.** A rebuild does not have to reproduce each
 segment's byte split or each column's live count exactly, since those steer
@@ -120,17 +131,17 @@ mispriced pass and cannot lose data. `min_lsn` is the exception, because
 keys. The sweep reads every row anyway, so it folds each non-tombstone mark as it
 passes and the per-segment minimum comes out exactly as the resolver defines it.
 
-**The rest of the accounting is openly stale at open and trued up behind it.** The
-sweep seeds each segment's counters from its own rows, overstating by exactly the
-rows other segments have shadowed. Each segment writes what it weighed into its own
-footer at seal, so what needs truing is only the shadowing after that: the scrub
-settles a segment's dead tally as its lap completes it, and the rebuild's join
-against the sealed footers books dead the newest sealed row each surviving walked
-entry shadows. The footer field `sealed_at` makes that debit exact rather than
-double-counted, being the sequence frontier the segment sealed under, so only
-shadowings at or past it are debited and anything below is already in the tally.
-Sealed-over-sealed shadowing stays the scrub's, being the cross-segment join an open
-exists to avoid. `a_paged_open_recovers_its_split_from_the_tally` and
+**The rest of the accounting is openly stale at open and trued up behind it.** Each
+segment writes what it weighed into its own footer at seal, and the sweep books that
+tally, so what needs truing is only the shadowing after the seal. Three paths true it.
+The rebuild's join against the sealed footers books dead the newest sealed row each
+surviving walked entry shadows. The spot index load meets every version of a key it
+takes, and a footer settles each one against the version that came next. The scrub
+settles a segment's dead tally as its lap completes it. The footer field `sealed_at`
+is the sequence frontier the segment sealed under, so both joins debit only a
+shadowing at or past it, and anything below is already in the tally. A version a key
+run left out and a key only the headers could settle stay the scrub's, and a read-only
+open never scrubs. `a_paged_open_recovers_its_split_from_the_tally` and
 `a_walked_tail_settles_the_sealed_split` are the checks.
 
 ## What the counters promise
@@ -203,29 +214,14 @@ what it just read either way and taking it in would empty the pool for a tenant 
 fits nothing beside it. Losing one costs the next reader a read and a segment it
 cannot rule out, a cache miss rather than a wrong answer.
 
-**A third line above the per-segment filters: the sealed-keys filter.** Those answer
-per segment, so a hash-keyed column pays one check per sealed segment to learn what a
-fresh key already is: absent everywhere. `index/sealed_keys.rs` holds every sealed
-key of a column as one stack of filters, asked ahead of the candidate fan-out in all
-three sealed searches, and a no skips the walk and every per-segment filter behind
-it. Levels start at 256 Ki keys and grow fourfold, so a billion keys is seven levels
-and a ruled-out key costs seven cache lines. It is fed where sealed spans are
-recorded and before they are visible, the rebuild's sweep and `note_spans` at a
-seal, which is the invariant that makes the skip safe. Nothing is removed: a retired
-segment's bits stay as false positives, a search that finds nothing. The overwrite
-probe is one of those three searches, so a fresh key skips the fan-out going in as it
-does coming out. `a_fresh_key_skips_the_sealed_search` pins both feeds and
-`sealed_skips()` counts the skips.
-
 ## The footprint formula reads low, and one shard shape is ruinous
 
 `resident_bytes` was a formula, the key width plus `size_of::<Entry>()` plus the
 shape's own per-key overhead, 37 bytes on a tree, so it could not see the tree at all.
-It now adds up what every shard's
-map allocated, spare capacity included, plus the shard array and the filters in front
-of it, through `ShardMap::heap_bytes`. The weighing route is `Scale` in
-`tests/raw_throughput.rs`, a per-thread counting `GlobalAlloc` behind a `WEIGHING`
-flag, reported by `cpu_terms`. A million keys, node width 64 against 16, counted
+It now adds up what every shard's map allocated, spare capacity included, plus the
+shard array, the filters in front of it through `ShardMap::heap_bytes`, and the spot
+index's buckets. The weighing route is `Scale` in `tests/raw_throughput.rs`, a
+per-thread counting `GlobalAlloc` behind a `WEIGHING` flag, reported by `cpu_terms`. A million keys, node width 64 against 16, counted
 layout bytes rather than timings, so the machine matters little:
 
 | column | width 64 | width 16 | the formula says |
@@ -251,11 +247,10 @@ default to copy.
 
 ## Still open
 
-- **A footer search on the write path.** Every put of a key the map does not hold
-  asks the footers whether it is an overwrite, which a column with uniform keys asks
-  of every segment. The sealed-keys filter answers it for a fresh key and the
-  per-segment filters for the rest, and the probe fires only when the map holds
-  nothing at all for the key.
+- **An overwrite probe on the write path.** Every put of a key the map does not hold
+  asks the spot index whether it is an overwrite. A slot whose segment holds nothing
+  newer than the put is booked from its length class with no read, and the probe fires
+  only when the map holds nothing at all for the key.
 - **The block cursor, owed to the read path.** It would bound the footer cache and a
   playback's residency in bytes rather than in parsed footers, and it is no longer a
   gate on recovery. It has to carry a streaming verify when a footer is first opened,

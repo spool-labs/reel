@@ -237,7 +237,7 @@ The last row is the cohort workload: no copies, no charge, the gate never shuts.
 scattered small-record shape no longer breaks the measured column, since 4 KiB records
 ran within 18% of the 1 MiB shape, 806 against 985 MB/s of reads (ccx33, 2026-08-10).
 
-**Three things scale with the volume, and compaction is the least of them.**
+**Four things scale with the volume, and compaction is the least of them.**
 
 1. **The scrub lap**, the only one that changes what the volume promises rather than
    what it costs. `for_scrub` clamps `scrub_mbps` to `compact_mbps`, so a volume
@@ -245,10 +245,13 @@ ran within 18% of the 1 MiB shape, 806 against 985 MB/s of reads (ccx33, 2026-08
    rate, not a measured lap. The cursor is process-local and `scrub_seed` rotates the
    start, but rotation only mitigates a lap shorter than the uptime. Past that,
    integrity coverage is a sampling rate.
-2. **The tick sweeps every segment.** `index.ranking()` allocates a vector of every
+2. **The spot index holds a slot every sealed key.** A slot is 16 bytes, 19 to 28
+   with its tables' spare room, so 30.79 TB is 0.6 to 0.8 GB at 1 MiB records, 2.2
+   to 3.3 GB at 256 KiB and 8.9 to 13.2 GB at 64 KiB, and an open loads all of it.
+3. **The tick sweeps every segment.** `index.ranking()` allocates a vector of every
    segment under a read lock and folds two atomics per entry, to choose one target.
    The sweep has not been run at 28,672 segments.
-3. **The reserve is 0.031% of the volume.** `Compactor::new` sizes it as one segment
+4. **The reserve is 0.031% of the volume.** `Compactor::new` sizes it as one segment
    per tail plus one, 9 GiB at the defaults, and the slowdown band is
    `SLOWDOWN_RESERVES` of them, 72 GiB, inside which `foreground_throttle` slows
    writers toward a 5% floor before `can_admit_foreground` refuses. On a volume

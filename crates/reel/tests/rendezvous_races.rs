@@ -211,7 +211,7 @@ fn late_put() {
     };
     script.await_reached("put/landed", 1);
 
-    // A batch passes no point, so the newer version publishes while the older put stands parked
+    // A batch passes no held point, so the newer version publishes while the older put stands parked
     let mut batch = WriteBatch::new();
     batch.put("rows", &key, &newer);
     Store::write_batch(&*store, batch).expect("batch");
@@ -232,6 +232,92 @@ fn late_put() {
         got,
         Some(newer.to_vec()),
         "the older put published over the newer version"
+    );
+    let totals = store.column_totals(COLUMNS[0].id);
+    assert_eq!(totals.count, 1, "the key counts twice");
+}
+
+// a delete drawn before a newer version that sealed and was handed over cannot publish over it
+#[test]
+fn late_delete() {
+    let script = rendezvous::script();
+    let store = open("/late-delete", 71);
+    let key = 7u64.to_be_bytes();
+    let newer = [0x0Bu8; 64];
+
+    script.hold("delete/landed");
+    let late = {
+        let store = Arc::clone(&store);
+        script.cast(move || Store::delete(&*store, "rows", &key))
+    };
+    script.await_reached("delete/landed", 1);
+
+    // A batch passes no held point, so the newer version publishes while the delete stands parked
+    let mut batch = WriteBatch::new();
+    batch.put("rows", &key, &newer);
+    Store::write_batch(&*store, batch).expect("batch");
+    drop(store.cue().expect("seal"));
+    assert_eq!(
+        store.page_out_sealed().expect("hand over"),
+        1,
+        "the newer version was not handed over"
+    );
+
+    script.release("delete/landed");
+    late.join()
+        .expect("late delete thread")
+        .expect("late delete");
+
+    let got = Store::get(&*store, "rows", &key)
+        .expect("get")
+        .map(|value| value.to_vec());
+    assert_eq!(
+        got,
+        Some(newer.to_vec()),
+        "the older delete took the newer version"
+    );
+    let totals = store.column_totals(COLUMNS[0].id);
+    assert_eq!(totals.count, 1, "the key went uncounted");
+}
+
+// a batch drawn before a newer version that sealed and was handed over cannot publish over it
+#[test]
+fn late_batch() {
+    let script = rendezvous::script();
+    let store = open("/late-batch", 73);
+    let key = 7u64.to_be_bytes();
+    let (older, newer) = ([0x0Au8; 64], [0x0Bu8; 64]);
+
+    script.hold("batch/landed");
+    let late = {
+        let store = Arc::clone(&store);
+        script.cast(move || {
+            let mut batch = WriteBatch::new();
+            batch.put("rows", &key, &older);
+            Store::write_batch(&*store, batch)
+        })
+    };
+    script.await_reached("batch/landed", 1);
+
+    // A single put passes no held point, so the newer version publishes while the batch stands parked
+    Store::put(&*store, "rows", &key, &newer).expect("put");
+    drop(store.cue().expect("seal"));
+    assert_eq!(
+        store.page_out_sealed().expect("hand over"),
+        1,
+        "the newer version was not handed over"
+    );
+
+    script.release("batch/landed");
+    late.join().expect("late batch thread").expect("late batch");
+
+    let got = Store::get(&*store, "rows", &key)
+        .expect("get")
+        .map(|value| value.to_vec());
+    assert_eq!(
+        got,
+        Some(newer.to_vec()),
+        "the older batch published over the newer version"
     );
     let totals = store.column_totals(COLUMNS[0].id);
     assert_eq!(totals.count, 1, "the key counts twice");

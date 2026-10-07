@@ -170,14 +170,14 @@ pub fn cue(engine: &ReelStore, limit: usize) -> CueReport {
         sweep_owed,
         graves: index.grave_count(),
         held,
-        caveats: caveats(&columns, sweep_owed),
+        caveats: caveats(&columns, sweep_owed, live_bytes + dead_bytes > 0),
         segments,
         columns,
     }
 }
 
 /// What a reader has to know before taking any of these figures for a total
-fn caveats(columns: &[ColumnRow], sweep_owed: bool) -> Vec<Caveat> {
+fn caveats(columns: &[ColumnRow], sweep_owed: bool, holds_bytes: bool) -> Vec<Caveat> {
     let mut caveats = Vec::new();
     if columns.is_empty() {
         caveats.push(
@@ -189,6 +189,9 @@ fn caveats(columns: &[ColumnRow], sweep_owed: bool) -> Vec<Caveat> {
         caveats.push(Caveat::new(
             "a cover is still owed its sweep, so the counters read as a floor",
         ));
+    }
+    if holds_bytes {
+        caveats.push(caveat::seal_tally());
     }
     caveats
 }

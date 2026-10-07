@@ -5,8 +5,9 @@ A log-structured key-value store with sequential writes, immutable segments, and
 A reel is one log of segment files over one or more volume roots. Writers append at the
 head of several active tails, one open segment each, and a segment seals when it fills.
 Nothing is updated in place. A delete writes a tombstone and compaction gives the space back.
-An index maps each live key to its segment and offset. It stays in memory or pages out to the
-footers the seals wrote. One process owns a volume for writing. Others can open it read-only and follow.
+An index maps each live key to its segment and offset. The open tails' keys sit in memory, and a
+sealed key is found through the footers the seals wrote and the spot index. One process owns a
+volume for writing. Others can open it read-only and follow.
 
 - Columns are declared by the caller: key width (fixed or variable), sharding, lz4, and purge
   marks.

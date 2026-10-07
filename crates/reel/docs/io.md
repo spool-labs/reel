@@ -182,7 +182,7 @@ cut out of the middle, which is a copy the buffered path does not pay.
 Against a buffered read that was going to be cached anyway, that is a
 straight loss, and the measured 62x worse reads on the ccx33 are that.
 
-The widening is not itself an amplification. `Advice::Random` is on every reader
+The widening adds no amplification. `Advice::Random` is on every reader
 descriptor, so a buffered miss faults whole pages with no readahead and fetches
 `L + 4095` bytes on average. The covering span fetches `L + BLOCK - 1`, and at
 `BLOCK == 4096` those are the same bytes. The staging copy is the price, and on a

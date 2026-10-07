@@ -48,3 +48,12 @@ impl From<&Caveat> for Note {
 pub fn notes(caveats: &[Caveat]) -> Vec<Note> {
     caveats.iter().map(Note::from).collect()
 }
+
+/// Segment weights start from each seal's tally, which an open trues up only as far as it joins
+pub fn seal_tally() -> Caveat {
+    Caveat::new(
+        "segment live and dead bytes start from each seal's tally, so a version outversioned \
+         since its seal that the open could not join reads as live until a scrub lap settles \
+         it, and a read-only open never scrubs",
+    )
+}

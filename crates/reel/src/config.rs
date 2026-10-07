@@ -376,7 +376,7 @@ impl ReelConfig {
         if let SyncPolicy::Bytes(threshold) = self.sync {
             if threshold.to_bytes() == 0 {
                 return Err(ReelError::Config(
-                    "sync_bytes threshold must be non-zero".to_string(),
+                    "the sync threshold must be non-zero".to_string(),
                 ));
             }
         }
@@ -465,6 +465,8 @@ mod tests {
     fn auto_tails_are_bounded() {
         let auto = ThreadBudget::Auto.resolve_tails();
 
+        assert_eq!(ThreadBudget::threads(3).resolve(), 3);
+        assert!(ThreadBudget::Auto.resolve() >= 1);
         assert!(auto >= 1);
         assert!(auto <= MAX_AUTO_TAILS);
         assert_eq!(ThreadBudget::threads(0).resolve_tails(), auto);

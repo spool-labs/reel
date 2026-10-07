@@ -1206,6 +1206,10 @@ impl Compactor {
         drop_floor: Lsn,
     ) -> Result<TombstoneStep> {
         if !should_carry(index, &record.header, drop_floor)? {
+            // Nothing older is left for its grave to hide, and the retire takes the grave's origin with it
+            if record.header.flags.is_tombstone() {
+                index.drop_grave(&record.header.key, record.header.lsn);
+            }
             return Ok(TombstoneStep::Dropped);
         }
         let tail = &reel.tails()[dest_index];

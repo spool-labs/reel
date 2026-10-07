@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::Result;
+use crate::format::footer::SegmentFooter;
 use crate::format::journal::read_groups;
 use crate::format::loc::SegmentId;
 use crate::format::lsn::Lsn;
@@ -154,6 +155,7 @@ pub fn catch_up(
     }
 
     let mut found: Vec<WalkedRecord> = Vec::new();
+    let mut sealed: Vec<(SegmentId, SegmentFooter)> = Vec::new();
     for (segment, file_len) in present.iter() {
         let from = cursor.positions.get(segment).copied().unwrap_or(0);
         if from == SEALED {
@@ -163,17 +165,27 @@ pub fn catch_up(
         let file = driver.open(&path, false)?;
         let followed = follow_segment(driver, file, &path, *segment, *file_len, from);
         driver.close(file)?;
-        let (records, next) = followed?;
+        let (records, next, footer) = followed?;
         cursor.positions.insert(*segment, next);
         found.extend(records);
+        sealed.extend(footer.map(|footer| (*segment, footer)));
     }
 
-    // The index's guards assume sequence order; across passes the retained ranges
-    // cover what sorting one pass cannot.
+    // The index's guards assume sequence order, and across passes the ranges kept cover what sorting one pass cannot
     found.sort_by_key(|record| record.lsn);
     // A follower serves reads throughout, so the pass publishes under the index's own
     // barrier, with every device read it needed already done above.
     let mut result = index.publish_pass(|| apply_all(index, cursor, found, gone))?;
+
+    // A segment that sealed since the open gets its spans, so the graves its tombstones left can go
+    for (segment, footer) in &sealed {
+        if let Err(error) = index.note_spans(*segment, footer) {
+            tracing::warn!(
+                "reel segment {} sealed with a footer that holds no key range: {error}",
+                segment.as_u32()
+            );
+        }
+    }
 
     // After the pass, since the highest sequence number seen is what decides it.
     cursor.prune_covers(result.highest_lsn);
@@ -181,7 +193,7 @@ pub fn catch_up(
     Ok(result)
 }
 
-/// What a follower has not yet read of one segment, and where it reads from next
+/// What a follower has not yet read of one segment, where it reads from next, and the footer once it has sealed
 fn follow_segment(
     driver: &IoDriver,
     file: FileId,
@@ -189,16 +201,17 @@ fn follow_segment(
     segment: SegmentId,
     file_len: u64,
     from: u64,
-) -> Result<(Vec<WalkedRecord>, u64)> {
+) -> Result<(Vec<WalkedRecord>, u64, Option<SegmentFooter>)> {
     // The sequence guard turns down the footer rows a pass through the journal already applied
     if let Some(footer) = read_footer(driver, file, file_len)? {
-        return Ok((footer_records(driver, file, segment, &footer)?, SEALED));
+        let records = footer_records(driver, file, segment, &footer)?;
+        return Ok((records, SEALED, Some(footer)));
     }
     let Some(bytes) = read_journal(driver, path, from)? else {
-        return Ok((Vec::new(), from));
+        return Ok((Vec::new(), from, None));
     };
     let (groups, valid) = read_groups(&bytes);
-    Ok((journal_records(segment, groups), from + valid as u64))
+    Ok((journal_records(segment, groups), from + valid as u64, None))
 }
 
 fn apply_all(

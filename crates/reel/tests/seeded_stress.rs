@@ -287,6 +287,8 @@ fn drawn_fault(rng: &mut SmallRng) -> (FaultKind, bool) {
 fn shape_of(seed: u64) -> Shape {
     let mut rng = SmallRng::seed_from_u64(seed);
     let callers = rng.gen_range(2..=5);
+    // The draw the index residency took stays spent, so every recorded seed replays the shape it was found on
+    let _ = rng.gen_range(0..10);
     let tails = rng.gen_range(1..=4);
 
     let window = callers * ops_per_caller() * 3;

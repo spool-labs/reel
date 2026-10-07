@@ -19,7 +19,7 @@ and your own flow through them before trusting a line of it.
 | `active_tails` | `auto`, which is already one tail per fast volume | writers contend on one appender, and then upward only |
 | `compact_mbps` | `auto` | foreground p99 has a budget, then pick a cap off the curve below |
 | `compact_dead_ratio` | `0.50` | reclaim is not keeping up with the debt |
-| `sync_bytes` (the `sync` field in code) | whatever the caller promises its own users | never for throughput |
+| `sync` | whatever the caller promises its own users | never for throughput |
 
 ## The read path
 
@@ -136,7 +136,7 @@ ingest, consistently across backends but inside noise's neighborhood.
 
 **One tail per fast volume, writers spread across them.** Measured on a
 16-thread Ryzen 7 3700X with four 7200 rpm SATA drives, 1 MiB records, batch of
-16, `sync_bytes` never, 2026-08: three drives with one tail each sustained 674 MB/s
+16, `sync` at `Never`, 2026-08: three drives with one tail each sustained 674 MB/s
 aggregate, about 220 per drive and 82 percent of that drive's read baseline. On
 one drive, four tails read 180 MB/s and eight read 173, so multi-stream
 interleaving on a single device costs about 20 percent, and eight writers against
@@ -221,7 +221,7 @@ caller, which is why it is the largest single lever the config does not hold.
 
 ## Two knobs that are promises rather than dials
 
-`sync_bytes` decides what a crash may cost. Fitting it to a device trades somebody
+`sync` decides what a crash may cost. Fitting it to a device trades somebody
 else's guarantee for throughput, so set it from what the caller promises its own
 users and leave it there. `repair` says the same thing about corruption: `Peers`
 turns a failed checksum into a miss because another copy exists, and `None` turns

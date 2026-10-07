@@ -170,8 +170,8 @@ pub struct Booking {
     pub came: Option<u32>,
 }
 
-/// Set-aside rows a footer could not settle, and what each of the rest booked
-type Settling = (Vec<usize>, Vec<(usize, Booking)>);
+/// Set-aside rows a footer could not settle, what each of the rest booked, and each version that lost with the number that outversioned it
+type Settling = (Vec<usize>, Vec<(usize, Booking)>, Vec<(usize, Loc, Lsn)>);
 
 /// What an overwrite settled: records it booked dead, and class bookings it corrected
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1093,11 +1093,14 @@ impl SpotColumn {
     }
 
     /// Settle the rows an open set aside against the footers of the slots they met, reading headers for the rest
+    ///
+    /// `lost` hears each data version a footer settled out, with the number of the version that came next, and a key the headers settle tells it nothing.
     pub fn settle_rows(
         &self,
         column: ColumnId,
         footers: &dyn FooterSource,
         book: &(dyn Fn(&[u8], Booking) + Sync),
+        lost: &(dyn Fn(&[u8], Loc, Lsn) + Sync),
     ) -> Result<()> {
         let rows = std::mem::take(&mut *lock(&self.set_aside));
         if rows.is_empty() {
@@ -1126,10 +1129,13 @@ impl SpotColumn {
                         while let Some((segment, group)) =
                             groups.get(next.fetch_add(1, Ordering::Relaxed))
                         {
-                            let (left, booked) =
+                            let (left, booked, gone) =
                                 self.settle_against(column, *segment, group, &rows, footers)?;
                             for (at, booking) in booked {
                                 book(rows[at].key.as_slice(), booking);
+                            }
+                            for (at, loc, after) in gone {
+                                lost(rows[at].key.as_slice(), loc, after);
                             }
                             lock(&unsettled).extend(left);
                         }
@@ -1154,7 +1160,7 @@ impl SpotColumn {
         Ok(())
     }
 
-    /// Settle the rows whose slot sits in one segment, handing back those its footer cannot and what the rest booked
+    /// Settle the rows whose slot sits in one segment, handing back those its footer cannot, what the rest booked and each version that lost
     fn settle_against(
         &self,
         column: ColumnId,
@@ -1164,10 +1170,10 @@ impl SpotColumn {
         footers: &dyn FooterSource,
     ) -> Result<Settling> {
         let Some(footer) = footers.footer_once(segment)? else {
-            return Ok((group.to_vec(), Vec::new()));
+            return Ok((group.to_vec(), Vec::new(), Vec::new()));
         };
         let Some(partition) = footer.partition(column) else {
-            return Ok((group.to_vec(), Vec::new()));
+            return Ok((group.to_vec(), Vec::new(), Vec::new()));
         };
         let mut group = group.to_vec();
         group.sort_unstable_by(|left, right| rows[*left].key.cmp(&rows[*right].key));
@@ -1183,7 +1189,7 @@ impl SpotColumn {
             }
             Ok(rows_at.as_ref().and_then(|rows| rows.get(&offset)).copied())
         };
-        let (mut unsettled, mut booked) = (Vec::new(), Vec::new());
+        let (mut unsettled, mut booked, mut gone) = (Vec::new(), Vec::new(), Vec::new());
         for same_key in group.chunk_by(|left, right| rows[*left].key == rows[*right].key) {
             let Some(newest) = same_key
                 .iter()
@@ -1210,39 +1216,62 @@ impl SpotColumn {
                 .copied();
             let is_newer = (row.lsn, row.loc.segment) > (standing.lsn, segment);
             let came = (!row.is_tombstone).then_some(row.loc.len);
-            let settled = match place {
+            // The version the slot held, with its place when it is data
+            let slotted = match place {
                 // The slot is the version this footer holds, so the newer of the two stands
                 Some(place) if place.slot.offset == standing.offset => {
+                    let data = (!place.slot.is_grave()).then_some(standing.len);
                     if is_newer {
                         table.take(hash, &place.slot);
                         table.insert(slot_of(hash, row));
-                        let gone = (!place.slot.is_grave()).then_some(standing.len);
-                        booked.push((newest, Booking { gone, came }));
+                        booked.push((newest, Booking { gone: data, came }));
                     }
-                    true
+                    let data = data.map(|len| Loc::new(segment, standing.offset, len));
+                    Some((standing.lsn, segment, data))
                 }
                 // The slot is an older version of the key in this row's segment, whose footer points at this row
                 Some(place) if segment == row.loc.segment && standing.offset == row.loc.offset => {
                     match row_at(place.slot.offset)? {
                         Some(older) if partition.key_at(older) == Some(row.key.as_slice()) => {
+                            let older = partition.row_at(older)?;
                             table.take(hash, &place.slot);
                             table.insert(slot_of(hash, row));
-                            let gone = (!place.slot.is_grave())
-                                .then(|| partition.row_at(older).map(|older| older.len))
-                                .transpose()?;
-                            booked.push((newest, Booking { gone, came }));
-                            true
+                            let data = (!place.slot.is_grave()).then_some(older.len);
+                            booked.push((newest, Booking { gone: data, came }));
+                            let data = data.map(|len| Loc::new(segment, place.slot.offset, len));
+                            Some((older.lsn, segment, data))
                         }
-                        Some(_) | None => false,
+                        Some(_) | None => None,
                     }
                 }
-                Some(_) | None => false,
+                Some(_) | None => None,
             };
-            if !settled {
+            drop(table);
+            let Some(slotted) = slotted else {
                 unsettled.extend_from_slice(same_key);
+                continue;
+            };
+            // Every version met here in order, each data version followed by the one that outversioned it
+            let mut versions: Vec<(Lsn, SegmentId, Option<Loc>)> = same_key
+                .iter()
+                .map(|at| {
+                    let met = &rows[*at];
+                    (
+                        met.lsn,
+                        met.loc.segment,
+                        (!met.is_tombstone).then_some(met.loc),
+                    )
+                })
+                .collect();
+            versions.push(slotted);
+            versions.sort_unstable_by_key(|(lsn, segment, _)| (*lsn, *segment));
+            for pair in versions.windows(2) {
+                if let Some(loc) = pair[0].2 {
+                    gone.push((newest, loc, pair[1].0));
+                }
             }
         }
-        Ok((unsettled, booked))
+        Ok((unsettled, booked, gone))
     }
 
     /// Load one sealed row, keeping each key's newest version, a tie to the newer segment, a tombstone as a grave
@@ -2187,6 +2216,44 @@ mod tests {
             matches!(column.entry(&key(9)).expect("entry"), Settled::Entry(Some(entry)) if entry.lsn == Lsn(1))
         );
         assert_eq!(column.held(), 1);
+    }
+
+    // a write reads only the slots whose segment may hold anything newer, and refuses on a newer version there
+    #[test]
+    fn holds_newer_reads_only_the_slots_a_ceiling_admits() {
+        let records = Arc::new(Records::default());
+        let segments = Arc::new(SegmentTable::new());
+        let column = SpotColumn::new();
+        column.attach(
+            Arc::clone(&records) as Arc<dyn RecordSource>,
+            Arc::clone(&segments),
+        );
+        let below = Loc::new(SegmentId(3), 0, 40);
+        let older = Loc::new(SegmentId(1), 0, 40);
+        let newer = Loc::new(SegmentId(2), 0, 40);
+        records.write(below, key(1).as_slice(), Lsn(2));
+        records.write(older, key(1).as_slice(), Lsn(3));
+        records.write(newer, key(1).as_slice(), Lsn(15));
+        segments.note_max(SegmentId(3), Lsn(4));
+        segments.note_max(SegmentId(1), Lsn(10));
+        segments.note_max(SegmentId(2), Lsn(20));
+
+        // A ceiling at or below the write rules its slot out with no read
+        column.insert(key(1).as_slice(), below);
+        assert!(!column.holds_newer(key(1).as_ref(), Lsn(5)).expect("below"));
+        assert_eq!(records.heads.load(Ordering::Relaxed), 0);
+
+        // A ceiling above the write is read, and an older version there refuses nothing
+        column.insert(key(1).as_slice(), older);
+        assert!(!column.holds_newer(key(1).as_ref(), Lsn(5)).expect("older"));
+        assert_eq!(records.heads.load(Ordering::Relaxed), 1);
+
+        // A newer version behind any slot refuses the write
+        column.insert(key(1).as_slice(), newer);
+        assert!(column.holds_newer(key(1).as_ref(), Lsn(5)).expect("newer"));
+        assert!(!column
+            .holds_newer(key(1).as_ref(), Lsn(15))
+            .expect("the same version"));
     }
 
     // entries into a retired segment go without a read

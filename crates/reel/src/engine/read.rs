@@ -484,8 +484,7 @@ impl ReelStore {
             self.fd_cache.remove(*segment);
         }
 
-        // A reader leaves the same graves and covers a writer does and never reaches
-        // the maintenance tick that settles them, so it sweeps and prunes here.
+        // A reader never reaches the tick, so it sweeps and prunes here, a grave once its tombstone's segment sealed and the window passed
         self.index.sweep_covers(SWEEP_RUN)?;
         let floor = caught_up.highest_lsn.as_u64().saturating_sub(GRAVE_WINDOW);
         if floor > 0 {
@@ -555,16 +554,17 @@ impl ReelStore {
 
     /// Read one key as the volume stood at a cue point
     pub fn get_at(&self, key: &RecordKey, cue: &CuePoint) -> Result<Option<Value>> {
-        self.settle_sealed()?;
         self.read_as_of(key, cue.at())
     }
 
     /// Read one key as of a sequence number nothing is holding open
     ///
-    /// Nothing holds the version open, so a miss here means gone rather than absent
-    /// at that number.
+    /// Nothing holds the version open, so compaction may have reclaimed it and a miss
+    /// says nothing about that number.
     pub fn read_as_of(&self, key: &RecordKey, at: Lsn) -> Result<Option<Value>> {
         self.check_column(key)?;
+        // The segments a cue sealed are searchable only once their spans are noted
+        self.settle_sealed()?;
         // The spot index holds a key's newest sealed version, one read away when the cue can see it
         if let Some((column, since)) = self.index.spot_route_at(key) {
             let lookup = self.index.spot_column(column).read_versioned(key)?;

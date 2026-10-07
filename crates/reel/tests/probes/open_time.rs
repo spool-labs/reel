@@ -160,8 +160,8 @@ fn simulated(wanted: usize) -> Case {
 
     let restored = Arc::new(SimIo::from_image(image));
     let start = Instant::now();
-    let store = ReelStore::open_with_io(PathBuf::from(ROOT), config(), COLUMNS, restored)
-        .expect("reopen");
+    let store =
+        ReelStore::open_with_io(PathBuf::from(ROOT), config(), COLUMNS, restored).expect("reopen");
     let open = start.elapsed();
     // What the open left behind, before any maintenance tick has run.
     let held = store.resident_bytes().to_bytes() / 1024;

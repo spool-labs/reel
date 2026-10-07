@@ -228,7 +228,7 @@ impl DoctorReport {
     }
 
     /// The knobs the configuration asks for beside the ones this machine argues for
-    fn knobs(&self) -> [Knob; 4] {
+    fn knobs(&self) -> [Knob; 3] {
         [
             Knob {
                 name: "plane",

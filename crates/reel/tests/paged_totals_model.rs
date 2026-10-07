@@ -86,7 +86,7 @@ fn check_totals(store: &ReelStore, model: &Model, context: &str) {
     }
     let slack = store.spot_slack();
     let (count, bytes) = modelled(model, &[]);
-    let totals = store.column_totals(ROWS).expect("column totals");
+    let totals = store.column_totals(ROWS);
     assert_eq!(totals.count, count, "{context}: column count");
     let off = totals.bytes.to_bytes().abs_diff(bytes);
     assert!(

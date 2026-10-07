@@ -2238,8 +2238,13 @@ mod tests {
             1,
         ));
         let index = fresh_index();
-        let rebuilt = rebuild_reel(driver.as_ref(), &[PathBuf::from(REEL_DIR)], &[false], &index)
-            .expect("rebuild");
+        let rebuilt = rebuild_reel(
+            driver.as_ref(),
+            &[PathBuf::from(REEL_DIR)],
+            &[false],
+            &index,
+        )
+        .expect("rebuild");
         shared.lsn.recover_to(rebuilt.highest_lsn);
         shared.recover_next_segment(rebuilt.highest_segment);
         let reel = Reel::open(Arc::clone(&shared), Vec::new()).expect("reopen reel");

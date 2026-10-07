@@ -667,7 +667,7 @@ fn write_round(
 }
 
 /// Drive the whole workload against one volume and say what it cost
-fn run_cell(arm: &Arm, knobs: &Knobs, root: &Path) -> Cell {
+fn run_cell(knobs: &Knobs, root: &Path) -> Cell {
     std::fs::create_dir_all(root).expect("cell root");
     let store = ReelStore::open(root.to_path_buf(), config(knobs), COLUMNS).expect("open");
 
@@ -845,7 +845,7 @@ fn composed_posture() {
     );
 
     for arm in &ARMS {
-        let cell = run_cell(arm, &knobs, &root.join(arm.name));
+        let cell = run_cell(&knobs, &root.join(arm.name));
 
         assert!(cell.written > 0, "{} wrote nothing", arm.name);
         assert_eq!(

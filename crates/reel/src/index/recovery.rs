@@ -1732,8 +1732,8 @@ mod tests {
     fn rebuild(sim: &SimIo) -> Rebuilt {
         let driver = IoDriver::new(Arc::new(sim.clone()));
         let index = ReelIndex::new(COLUMNS).expect("index");
-        let reel = rebuild_reel(&driver, &[PathBuf::from(REEL_DIR)], &[false], &index)
-            .expect("rebuild");
+        let reel =
+            rebuild_reel(&driver, &[PathBuf::from(REEL_DIR)], &[false], &index).expect("rebuild");
         let volume = shared(config(SyncPolicy::Never), sim);
         index.set_footers(Arc::clone(&volume) as Arc<dyn FooterSource>);
         index.set_records(volume as Arc<dyn RecordSource>);

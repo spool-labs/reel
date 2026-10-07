@@ -6,23 +6,11 @@
 //! asks for one.
 
 mod bias_report;
-mod compact_throughput;
-mod cue_speed;
-mod door_price;
 mod erase_probe;
 mod filter_cost;
-mod handoff_cost;
-mod handover_cost;
 mod interference;
-mod layout;
-mod mapped_reads;
-mod negative_price;
 mod open_time;
 mod past_ram;
-mod playback_speed;
-mod publish_cost;
-mod repoint_hold;
-mod segment_price;
 
 struct Probe {
     name: &'static str,
@@ -54,17 +42,6 @@ const PROBES: &[Probe] = &[
     default(
         "bias_report::the_rule_is_a_function_of_its_facts",
         bias_report::the_rule_is_a_function_of_its_facts,
-    ),
-    opt_in(
-        "compact_throughput::reclaim_throughput_by_rate",
-        compact_throughput::reclaim_throughput_by_rate,
-    ),
-    opt_in("cue_speed::cue_cost", cue_speed::cue_cost),
-    opt_in("cue_speed::read_cost", cue_speed::read_cost),
-    opt_in("cue_speed::write_under_cue", cue_speed::write_under_cue),
-    opt_in(
-        "door_price::a_probe_never_waits",
-        door_price::a_probe_never_waits,
     ),
     opt_in(
         "erase_probe::erase_reclaim_share",
@@ -103,62 +80,13 @@ const PROBES: &[Probe] = &[
         filter_cost::paged_lookup_block_reads,
     ),
     opt_in(
-        "handoff_cost::batching_arithmetic",
-        handoff_cost::batching_arithmetic,
-    ),
-    opt_in(
-        "handoff_cost::aligned_alloc_cost",
-        handoff_cost::aligned_alloc_cost,
-    ),
-    opt_in(
-        "handover_cost::handover_cost_by_segment_count",
-        handover_cost::handover_cost_by_segment_count,
-    ),
-    opt_in(
         "interference::tails_under_a_paced_copier",
         interference::tails_under_a_paced_copier,
-    ),
-    opt_in("layout::what_a_volume_holds", layout::what_a_volume_holds),
-    opt_in(
-        "mapped_reads::mapped_over_unmapped_cold_random",
-        mapped_reads::mapped_over_unmapped_cold_random,
-    ),
-    opt_in(
-        "mapped_reads::mapped_over_unmapped_warm",
-        mapped_reads::mapped_over_unmapped_warm,
-    ),
-    opt_in(
-        "negative_price::a_miss_is_answered_without_the_lock",
-        negative_price::a_miss_is_answered_without_the_lock,
     ),
     opt_in(
         "open_time::open_time_by_segment_count",
         open_time::open_time_by_segment_count,
     ),
-    opt_in(
-        "playback_speed::walk_by_segment_count",
-        playback_speed::walk_by_segment_count,
-    ),
-    opt_in("publish_cost::batch_publish", publish_cost::batch_publish),
-    opt_in(
-        "publish_cost::batch_alloc_only",
-        publish_cost::batch_alloc_only,
-    ),
-    opt_in(
-        "publish_cost::read_under_publish",
-        publish_cost::read_under_publish,
-    ),
-    opt_in(
-        "publish_cost::whole_set_read_under_publish",
-        publish_cost::whole_set_read_under_publish,
-    ),
-    opt_in(
-        "repoint_hold::hold_by_batch_size",
-        repoint_hold::hold_by_batch_size,
-    ),
-    opt_in("segment_price::read_side", segment_price::read_side),
-    opt_in("segment_price::write_side", segment_price::write_side),
-    opt_in("segment_price::tick_side", segment_price::tick_side),
 ];
 
 #[cfg(target_os = "linux")]

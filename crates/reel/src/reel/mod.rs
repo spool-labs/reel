@@ -558,7 +558,7 @@ impl ReelShared {
                         KEYLESS_PREFIX,
                         bound as usize,
                         take_header(),
-                        WarmFirst::Skip,
+                        self.warm_first(),
                     )
                     .await;
                 if let Some(read) = lone_keyless(answer, key, &check)? {
@@ -581,7 +581,7 @@ impl ReelShared {
                     prefix,
                     span,
                     take_header(),
-                    WarmFirst::Skip,
+                    self.warm_first(),
                 )
                 .await;
             return near_spot_range(answer, key, at, len);
@@ -591,7 +591,12 @@ impl ReelShared {
             self.driver
                 .split_read(handle.file(), base + prefix as u64 + at, 0, len),
         ];
-        deep_spot_range(self.driver.wait_split_reads(ops).await?, key, at, len)
+        deep_spot_range(
+            self.driver.wait_split_reads(ops, self.warm_first()).await?,
+            key,
+            at,
+            len,
+        )
     }
 
     /// One bounded read of each spot index candidate, submitted together
@@ -631,7 +636,7 @@ impl ReelShared {
     /// The same batch as a future, one submission and one wait
     pub async fn spot_records_wait(&self, asks: &[SpotAsk<'_>]) -> Result<Vec<SpotRead>> {
         let (ops, asked) = self.spot_ops(asks)?;
-        let filled = self.driver.wait_split_reads(ops).await?;
+        let filled = self.driver.wait_split_reads(ops, self.warm_first()).await?;
         let mut filled = filled.into_iter();
         let mut reads = Vec::with_capacity(asks.len());
         for (ask, asked) in asks.iter().zip(asked) {
@@ -2126,7 +2131,7 @@ impl Reel {
         window_or_nothing(read, len)
     }
 
-    /// Read one window as a future, always through the driver
+    /// Read one window as a future, from an open tail's mapping or through the driver
     pub async fn read_window_wait(
         &self,
         loc: Loc,
@@ -2142,6 +2147,11 @@ impl Reel {
             handle.layout().prefix_len(key_width as usize, loc.len),
             at,
         );
+        if self.maps_tail(loc.segment) {
+            if let Some(window) = self.mapped_window(&handle, start, len) {
+                return Ok(Some(window));
+            }
+        }
         let read = self
             .shared
             .driver
@@ -2150,6 +2160,7 @@ impl Reel {
                 start,
                 len as u64,
                 crate::reel::payload::take(len),
+                self.shared.warm_first(),
             )
             .await;
         window_or_nothing(read, len)
@@ -2236,19 +2247,29 @@ impl Reel {
         let offset = u64::from(loc.offset);
         if let Some(check) = handle.layout().keyless_key(loc.len) {
             let whole = loc.len as usize;
-            let read = self
-                .shared
-                .driver
-                .wait_split_reusing(
-                    handle.file(),
-                    offset,
-                    KEYLESS_PREFIX,
-                    whole,
-                    take_header(),
-                    WarmFirst::Skip,
-                )
-                .await;
-            return Ok(match framed_or_nothing(read, KEYLESS_PREFIX, whole)? {
+            let mapped = match self.maps_tail(loc.segment) {
+                true => self.mapped_framed(&handle, offset, KEYLESS_PREFIX, whole),
+                false => None,
+            };
+            let framed = match mapped {
+                Some(framed) => Some(framed),
+                None => {
+                    let read = self
+                        .shared
+                        .driver
+                        .wait_split_reusing(
+                            handle.file(),
+                            offset,
+                            KEYLESS_PREFIX,
+                            whole,
+                            take_header(),
+                            self.shared.warm_first(),
+                        )
+                        .await;
+                    framed_or_nothing(read, KEYLESS_PREFIX, whole)?
+                }
+            };
+            return Ok(match framed {
                 Some((head, body)) => keyless_range(
                     head,
                     body,
@@ -2263,6 +2284,14 @@ impl Reel {
         }
         let prefix = HEADER_LEN + expected.width();
 
+        if self.maps_tail(loc.segment) {
+            if let Some((head, body)) = self.map_range(&handle, offset, prefix, at, len) {
+                let verdict = frame_to_range(&head, body, expected, lsn, loc);
+                recycle_header(head);
+                return verdict;
+            }
+        }
+
         if at <= MERGE_GAP {
             let span = at as usize + len;
             let read = self
@@ -2274,14 +2303,18 @@ impl Reel {
                     prefix,
                     span,
                     take_header(),
-                    WarmFirst::Skip,
+                    self.shared.warm_first(),
                 )
                 .await;
             return near_range(read, prefix, at, len, expected, lsn, loc);
         }
 
         let ops = self.range_ops(&handle, offset, prefix, at, len);
-        let filled = self.shared.driver.wait_split_reads(ops).await?;
+        let filled = self
+            .shared
+            .driver
+            .wait_split_reads(ops, self.shared.warm_first())
+            .await?;
         deep_range(filled, prefix, len, expected, lsn, loc)
     }
 
@@ -2373,7 +2406,11 @@ impl Reel {
         if self.plan_reads(asks, keys, is_verified, scratch, blocks, spots)? {
             self.shared
                 .driver
-                .wait_split_reads_into(&mut scratch.ops, &mut scratch.filled)
+                .wait_split_reads_into(
+                    &mut scratch.ops,
+                    &mut scratch.filled,
+                    self.shared.warm_first(),
+                )
                 .await?;
             place_runs(scratch, asks, keys, is_verified, blocks, spots)?;
         }
@@ -2599,6 +2636,15 @@ impl Reel {
             self.shared.warm_first(),
         );
         framed_or_nothing(read, prefix, len)
+    }
+
+    /// A window copied out of its segment's mapping, or nothing where the mapping does not cover it
+    fn mapped_window(&self, handle: &SegmentHandle, start: u64, len: usize) -> Option<Value> {
+        let map = handle.mapping(self.shared.config.segment_bytes.to_bytes())?;
+        let bytes = map.slice(start, len)?;
+        let mut window = crate::reel::payload::take(len);
+        window.extend_from_slice(bytes);
+        Some(Value::pooled(window, crate::reel::payload::give))
     }
 
     /// A record's header and payload copied out of its segment's mapping, or nothing where the mapping does not cover it

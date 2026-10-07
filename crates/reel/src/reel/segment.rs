@@ -407,9 +407,20 @@ impl IoDriver {
         offset: u64,
         len: u64,
         reuse: Vec<u8>,
+        warm: WarmFirst,
     ) -> Result<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
+        }
+        let mut reuse = reuse;
+        if warm == WarmFirst::Ask {
+            // The probe takes a split read, so the window goes in as its payload behind an empty head
+            let mut head = ReadBuf::new(0);
+            let mut body = ReadBuf::reusing(reuse, len as usize);
+            if self.backend.warm_split(file, offset, &mut head, &mut body) {
+                return Ok(body.into_vec());
+            }
+            reuse = body.into_vec();
         }
         let op = Op::Pread {
             tag: self.next_tag(),
@@ -547,25 +558,80 @@ impl IoDriver {
     ///
     /// One caller may not hold the whole table, so a batch wider than its share is
     /// sent down as several and each awaited in turn.
-    pub async fn wait_split_reads(&self, mut ops: Vec<Op>) -> Result<Vec<SplitRead>> {
+    pub async fn wait_split_reads(
+        &self,
+        mut ops: Vec<Op>,
+        warm: WarmFirst,
+    ) -> Result<Vec<SplitRead>> {
         let mut filled = Vec::with_capacity(ops.len());
-        self.wait_split_reads_into(&mut ops, &mut filled).await?;
+        self.wait_split_reads_into(&mut ops, &mut filled, warm)
+            .await?;
         Ok(filled)
     }
 
     /// The same awaited batch, taking the ops out of a vector the caller keeps
+    ///
+    /// `WarmFirst::Ask` puts one non-blocking read ahead of each op, so what the page
+    /// cache holds is answered in place and only the rest go down as a batch.
     pub async fn wait_split_reads_into(
         &self,
         ops: &mut Vec<Op>,
         filled: &mut Vec<SplitRead>,
+        warm: WarmFirst,
     ) -> Result<()> {
         filled.clear();
-        while !ops.is_empty() {
-            let run = ops.len().min(self.batch_slots());
-            let batch: Vec<Op> = ops.drain(..run).collect();
-            collect_split_reads(self.wait_batch(batch).await?, filled)?;
+        if warm == WarmFirst::Skip {
+            while !ops.is_empty() {
+                let run = ops.len().min(self.batch_slots());
+                let batch: Vec<Op> = ops.drain(..run).collect();
+                collect_split_reads(self.wait_batch(batch).await?, filled)?;
+            }
+            return Ok(());
+        }
+        let mut cold: Vec<(usize, Op)> = Vec::new();
+        for (at, op) in ops.drain(..).enumerate() {
+            match self.warm_op(op) {
+                Ok(read) => filled.push(read),
+                Err(op) => {
+                    cold.push((at, op));
+                    filled.push(Ok((Vec::new(), Vec::new())));
+                }
+            }
+        }
+        while !cold.is_empty() {
+            let run = cold.len().min(self.batch_slots());
+            let (places, batch): (Vec<usize>, Vec<Op>) = cold.drain(..run).unzip();
+            let mut landed = Vec::with_capacity(run);
+            collect_split_reads(self.wait_batch(batch).await?, &mut landed)?;
+            for (place, read) in places.into_iter().zip(landed) {
+                filled[place] = read;
+            }
         }
         Ok(())
+    }
+
+    /// One split read answered from the page cache, or the op back to go down with the batch
+    fn warm_op(&self, op: Op) -> std::result::Result<SplitRead, Op> {
+        let Op::PreadSplit {
+            tag,
+            file,
+            offset,
+            mut head,
+            mut body,
+        } = op
+        else {
+            return Err(op);
+        };
+        if self.backend.warm_split(file, offset, &mut head, &mut body) {
+            return Ok(Ok((head.into_vec(), body.into_vec())));
+        }
+        Err(Op::PreadSplit {
+            tag,
+            file,
+            offset,
+            head,
+            body,
+        })
     }
 
     /// Append owned buffers at an offset in one vectored write

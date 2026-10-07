@@ -1809,6 +1809,40 @@ fn cue_outlives_a_delete() {
     );
 }
 
+// a cue read past a later delete still finds its version once the window passes the delete's grave
+#[test]
+fn cue_outlives_a_pruned_delete() {
+    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
+    let key = record(7, 1);
+    // Three versions handed over, so the delete reads and takes every spot index slot of the key
+    for version in 1..=3u8 {
+        store.put(&key, &[version; 64]).expect("put");
+        drop(store.cue().expect("seal"));
+        store.page_out_sealed().expect("hand over");
+    }
+    let cue = store.cue().expect("cue");
+    store.delete(&key).expect("delete");
+    drop(store.cue().expect("seal"));
+    store.page_out_sealed().expect("hand over");
+    // As far as the prune can tell, a window of writes has passed the delete
+    store.reel.shared().lsn.recover_to(Lsn(2 * GRAVE_WINDOW));
+
+    store.prune_tombstones();
+
+    assert_eq!(
+        store.get_at(&key, &cue).expect("read at cue"),
+        Some(Value::new(vec![3u8; 64])),
+        "the prune took the version the cue reads",
+    );
+    drop(cue);
+    assert_eq!(
+        store.prune_tombstones(),
+        1,
+        "the grave never became prunable, so this tested nothing"
+    );
+    assert!(store.get(&key).expect("read").is_none());
+}
+
 // a range delete drawn after the cue point is invisible to it
 #[test]
 fn cue_ignores_a_later_drop() {

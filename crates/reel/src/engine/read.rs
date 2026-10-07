@@ -501,7 +501,7 @@ impl ReelStore {
 
         // A reader holding more covers than it will test per record can no longer
         // follow cheaply, and a rebuild needs no covers at all.
-        if caught_up.is_saturated {
+        if caught_up.is_saturated || caught_up.lost > 0 {
             self.rebuild()?;
         }
         Ok(caught_up)

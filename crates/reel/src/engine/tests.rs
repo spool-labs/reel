@@ -4180,6 +4180,41 @@ fn a_read_past_a_retire_finds_the_moved_key() {
     }
 }
 
+// a reader that meets a range delete after the segment holding its keys retired stops counting them
+#[test]
+fn refresh_follows_a_range_delete_past_a_retire() {
+    let mut settings = config(1, SyncPolicy::EveryPut);
+    settings.segment_bytes = ByteCount::from_bytes(8_192);
+    let (writer, sim) = sim_store(settings.clone());
+    for byte in 1..=2u8 {
+        writer.put(&record(7, byte), &[byte; 1_500]).expect("put");
+    }
+    drop(writer.cue().expect("seal"));
+    let reader = ReelStore::open_read_only_with_io(
+        PathBuf::from(ROOT),
+        settings,
+        COLUMNS,
+        Arc::new(sim.clone()),
+    )
+    .expect("read only open");
+    let start = RecordKey::from_bytes(RECORD, &group_bound(7)).expect("key");
+    writer
+        .delete_range(&start, Some(&group_bound(8)))
+        .expect("range delete");
+    while writer.sweep_covers().expect("sweep") {}
+    writer.compact_once().expect("compact");
+
+    let caught = reader.refresh().expect("refresh");
+
+    assert!(!caught.retired.is_empty(), "the compaction retired nothing");
+    assert_eq!(writer.totals().count, 0);
+    assert_eq!(
+        reader.totals().count,
+        0,
+        "a key the range took still counts"
+    );
+}
+
 // a range delete a reader follows keeps its keys deleted
 #[test]
 fn refresh_follows_a_range_delete() {

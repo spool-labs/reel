@@ -1862,16 +1862,16 @@ impl SpotColumn {
         ))))
     }
 
-    /// Drop every entry pointing into a segment no longer standing, with no reads
+    /// Drop every entry pointing into a segment no longer standing, with no reads, and hand back how many were live
     pub fn forget_retired(&self, is_standing: impl Fn(SegmentId) -> bool) -> u64 {
-        let mut forgotten = 0;
+        let mut live = 0;
         for shard in &self.shards {
             let mut table = shard.write();
             let (dropped, displaced) = table.retain(|slot| is_standing(slot.segment()));
             table.count_taken(dropped as u64, displaced);
-            forgotten += dropped as u64;
+            live += dropped as u64 - displaced;
         }
-        forgotten
+        live
     }
 
     /// Drop every entry, for a rebuild starting over

@@ -122,6 +122,9 @@ pub struct CaughtUp {
     /// Whether the reader holds more range deletes than it can keep testing, so it
     /// should rebuild rather than keep following
     pub is_saturated: bool,
+
+    /// The retired segments still held this many counted versions after the pass, and only a rebuild settles them
+    pub lost: u64,
 }
 
 /// Advance a reader's index to what the volume holds now
@@ -177,8 +180,11 @@ pub fn catch_up(
         cursor.retire(*segment);
         index.forget_segment(*segment);
     }
+    // A counted slot left in a retired segment holds a version no record moved or booked, such as one a range delete took
+    let lost = index.forget_retired_slots();
     let mut result = applied?;
     result.retired = gone;
+    result.lost = lost;
 
     // A segment that sealed since the open gets its spans, so the graves its tombstones left can go
     for (segment, footer) in &sealed {

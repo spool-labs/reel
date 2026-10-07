@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{RwLock, RwLockReadGuard};
 
 use crate::format::loc::{SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
@@ -446,6 +446,19 @@ impl Window {
     }
 }
 
+/// The segment table held for reading, for a caller looking up many segments at once
+pub struct Stamps<'table>(RwLockReadGuard<'table, Window>);
+
+impl Stamps<'_> {
+    /// The incarnation a segment currently wears, or none for one that is gone
+    pub fn of(&self, segment: SegmentId) -> SegmentIncarnation {
+        match self.0.row(segment) {
+            Some(row) => SegmentIncarnation(row.incarnation.load(Ordering::Acquire)),
+            None => SegmentIncarnation::NONE,
+        }
+    }
+}
+
 /// Per-segment reclaimable-byte counters for a whole reel
 #[derive(Debug, Default)]
 pub struct SegmentTable {
@@ -693,10 +706,12 @@ impl SegmentTable {
 
     /// The incarnation a segment currently wears, or none for one that is gone
     pub fn incarnation_of(&self, segment: SegmentId) -> SegmentIncarnation {
-        match read(&self.window).row(segment) {
-            Some(row) => SegmentIncarnation(row.incarnation.load(Ordering::Acquire)),
-            None => SegmentIncarnation::NONE,
-        }
+        self.stamps().of(segment)
+    }
+
+    /// The table held for reading, so a batch of lookups takes its lock once
+    pub fn stamps(&self) -> Stamps<'_> {
+        Stamps(read(&self.window))
     }
 
     fn issue_incarnation(&self) -> SegmentIncarnation {

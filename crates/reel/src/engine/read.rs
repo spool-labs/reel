@@ -18,6 +18,7 @@ use crate::reel::cue::CuePoint;
 use crate::reel::{SpotAsk, SpotRange};
 
 use super::{read_only, ReelStore, GRAVE_WINDOW, SWEEP_RUN};
+use crate::index::counters::Stamps;
 use crate::index::entry::Entry;
 use crate::index::recovery::rebuild_reel;
 use crate::index::tailer::{catch_up, CaughtUp, LogCursor};
@@ -459,13 +460,15 @@ impl ReelStore {
     /// An ask for every key the index placed, with every key missing until read
     fn plan_placed(&self, keys: usize, found: &[Option<Entry>], placed: &mut Placed) {
         placed.reset(keys);
+        // One hold of the segment table for the batch, since a lookup per record contends on its lock
+        let stamps = self.index.segments().stamps();
         for (at, entry) in found.iter().enumerate().take(keys) {
             if let Some(entry) = entry {
                 placed.asks.push(Ask {
                     loc: entry.loc,
                     lsn: entry.lsn,
                     at: at as u32,
-                    certain: self.window_certain(entry),
+                    certain: is_certain(&stamps, entry),
                 });
             }
         }
@@ -951,8 +954,7 @@ impl ReelStore {
     /// segment or reuses its space drops the incarnation first, so an uncertain
     /// entry loses the fast path and never its correctness.
     pub(super) fn window_certain(&self, entry: &Entry) -> bool {
-        let current = self.index.segments().incarnation_of(entry.loc.segment);
-        !current.is_none() && current == entry.incarnation
+        is_certain(&self.index.segments().stamps(), entry)
     }
 
     /// What one attempt's read settled, or nothing when the loop is to try again
@@ -1015,6 +1017,12 @@ impl ReelStore {
         }
         Ok(())
     }
+}
+
+/// Whether an entry's segment still wears the incarnation the index stamped it with
+fn is_certain(stamps: &Stamps<'_>, entry: &Entry) -> bool {
+    let current = stamps.of(entry.loc.segment);
+    !current.is_none() && current == entry.incarnation
 }
 
 /// What one resolve attempt has decided, before any record is read

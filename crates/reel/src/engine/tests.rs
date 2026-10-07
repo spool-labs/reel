@@ -4073,6 +4073,57 @@ fn refresh_follows_a_relocation() {
     }
 }
 
+/// A writer with four keys and a reader opened over them, on segments small enough to retire
+fn reader_over_four_keys() -> (ReelStore, ReelStore) {
+    let mut settings = config(1, SyncPolicy::EveryPut);
+    settings.segment_bytes = ByteCount::from_bytes(8_192);
+    let (writer, sim) = sim_store(settings.clone());
+    for byte in 1..=4u8 {
+        writer.put(&record(7, byte), &[byte; 1_500]).expect("put");
+    }
+    writer.flush().expect("flush");
+    let reader = ReelStore::open_read_only_with_io(
+        PathBuf::from(ROOT),
+        settings,
+        COLUMNS,
+        Arc::new(sim.clone()),
+    )
+    .expect("read only open");
+    (writer, reader)
+}
+
+// a reader that meets an overwrite after the overwritten version's segment retired counts the key once
+#[test]
+fn refresh_follows_an_overwrite_past_a_retire() {
+    let (writer, reader) = reader_over_four_keys();
+    for byte in 1..=4u8 {
+        writer
+            .put(&record(7, byte), &[byte + 100; 1_500])
+            .expect("overwrite");
+    }
+    writer.compact_once().expect("compact");
+
+    let caught = reader.refresh().expect("refresh");
+
+    assert!(!caught.retired.is_empty(), "the compaction retired nothing");
+    assert_eq!(reader.totals().count, 4, "an overwritten key counts twice");
+}
+
+// a reader that meets a delete after the deleted version's segment retired stops counting the key
+#[test]
+fn refresh_follows_a_delete_past_a_retire() {
+    let (writer, reader) = reader_over_four_keys();
+    for byte in 1..=2u8 {
+        writer.delete(&record(7, byte)).expect("delete");
+    }
+    writer.compact_once().expect("compact");
+
+    let caught = reader.refresh().expect("refresh");
+
+    assert!(!caught.retired.is_empty(), "the compaction retired nothing");
+    assert_eq!(reader.totals().count, 2, "a deleted key still counts");
+}
+
 // a range delete a reader follows keeps its keys deleted
 #[test]
 fn refresh_follows_a_range_delete() {

@@ -1349,6 +1349,19 @@ impl SpotColumn {
         }
     }
 
+    /// Where a key's one live record sits, nothing for a grave or a second live slot
+    pub fn only_live(&self, key: &[u8]) -> Option<(SegmentId, u32)> {
+        let hash = hash_of(key);
+        let seen = self.shards[shard_of(hash)].read().matches(hash);
+        let mut live = seen.iter().filter(|place| !place.slot.is_displaced());
+        match (live.next(), live.next()) {
+            (Some(place), None) if !place.slot.is_grave() => {
+                Some((place.slot.segment(), place.slot.offset))
+            }
+            (Some(_), _) | (None, _) => None,
+        }
+    }
+
     /// Take out the live entry pointing at one record, leaving a displaced one for compaction to rebook
     pub fn take_live(&self, key: &[u8], loc: Loc) -> bool {
         let hash = hash_of(key);

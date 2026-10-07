@@ -1427,6 +1427,18 @@ impl ReelIndex {
         Ok(run.examined)
     }
 
+    /// Where a follower's copy came from when its source retired before the pass, read off the key's one live slot
+    pub fn retired_source(&self, key: &RecordKey, retired: &[SegmentId], len: u32) -> Option<Loc> {
+        let at = self.slot(key.column)?;
+        if retired.is_empty() || !self.spot_serves() {
+            return None;
+        }
+        let (segment, offset) = self.spot[at].only_live(key.as_slice())?;
+        retired
+            .contains(&segment)
+            .then(|| Loc::new(segment, offset, len))
+    }
+
     /// Repoint a key from a compacted record to its rewritten copy under a guard
     pub fn repoint(
         &self,

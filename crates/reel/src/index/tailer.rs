@@ -149,10 +149,6 @@ pub fn catch_up(
         .map(|(segment, _)| *segment)
         .filter(|segment| !present.contains_key(segment))
         .collect();
-    for segment in &gone {
-        cursor.retire(*segment);
-        index.forget_segment(*segment);
-    }
 
     let mut found: Vec<WalkedRecord> = Vec::new();
     let mut sealed: Vec<(SegmentId, SegmentFooter)> = Vec::new();
@@ -175,7 +171,14 @@ pub fn catch_up(
     found.sort_by_key(|record| record.lsn);
     // A follower serves reads throughout, so the pass publishes under the index's own
     // barrier, with every device read it needed already done above.
-    let mut result = index.publish_pass(|| apply_all(index, cursor, found, gone))?;
+    let applied = index.publish_pass(|| apply_all(index, cursor, found, &gone));
+    // Retired after the pass applies, so its writes can book the versions these segments held
+    for segment in &gone {
+        cursor.retire(*segment);
+        index.forget_segment(*segment);
+    }
+    let mut result = applied?;
+    result.retired = gone;
 
     // A segment that sealed since the open gets its spans, so the graves its tombstones left can go
     for (segment, footer) in &sealed {
@@ -218,17 +221,14 @@ fn apply_all(
     index: &ReelIndex,
     cursor: &mut LogCursor,
     found: Vec<WalkedRecord>,
-    retired: Vec<SegmentId>,
+    retired: &[SegmentId],
 ) -> Result<CaughtUp> {
-    let mut result = CaughtUp {
-        retired,
-        ..CaughtUp::default()
-    };
+    let mut result = CaughtUp::default();
     for record in found {
         if record.lsn > result.highest_lsn {
             result.highest_lsn = record.lsn;
         }
-        if apply_one(index, cursor, &record)? {
+        if apply_one(index, cursor, &record, retired)? {
             result.applied += 1;
         } else {
             result.skipped += 1;
@@ -238,7 +238,12 @@ fn apply_all(
 }
 
 /// Apply one record, and report whether it changed anything
-fn apply_one(index: &ReelIndex, cursor: &mut LogCursor, record: &WalkedRecord) -> Result<bool> {
+fn apply_one(
+    index: &ReelIndex,
+    cursor: &mut LogCursor,
+    record: &WalkedRecord,
+    retired: &[SegmentId],
+) -> Result<bool> {
     if record.flags.is_range_tombstone() {
         let cover = RangeCover {
             start: record.key.clone(),
@@ -271,8 +276,11 @@ fn apply_one(index: &ReelIndex, cursor: &mut LogCursor, record: &WalkedRecord) -
 
     // A relocation is the same version in a new place, so taking it for a stale
     // write would leave the reader on the segment compaction is about to unlink.
-    if record.flags.is_relocated() && index.repoint(&record.key, None, record.loc, record.lsn)? {
-        return Ok(true);
+    if record.flags.is_relocated() {
+        let from = index.retired_source(&record.key, retired, record.loc.len);
+        if index.repoint(&record.key, from, record.loc, record.lsn)? {
+            return Ok(true);
+        }
     }
 
     index.insert(&record.key, record.loc, record.lsn)
@@ -321,8 +329,8 @@ mod tests {
         let index = index();
         let mut cursor = LogCursor::new();
 
-        assert!(apply_one(&index, &mut cursor, &data(1, 5, 2)).expect("apply"));
-        assert!(!apply_one(&index, &mut cursor, &data(1, 3, 1)).expect("apply"));
+        assert!(apply_one(&index, &mut cursor, &data(1, 5, 2), &[]).expect("apply"));
+        assert!(!apply_one(&index, &mut cursor, &data(1, 3, 1), &[]).expect("apply"));
         assert_eq!(
             index.get(&key(1)).expect("read").expect("present").lsn,
             Lsn(5)
@@ -342,17 +350,17 @@ mod tests {
             range_end: None,
         };
 
-        assert!(apply_one(&index, &mut cursor, &range).expect("apply"));
+        assert!(apply_one(&index, &mut cursor, &range, &[]).expect("apply"));
         assert_eq!(cursor.range_count(), 1);
 
         assert!(
-            !apply_one(&index, &mut cursor, &data(4, 9, 2)).expect("apply"),
+            !apply_one(&index, &mut cursor, &data(4, 9, 2), &[]).expect("apply"),
             "older than the delete"
         );
         assert!(!index.contains(&key(4)).expect("read"));
 
         assert!(
-            apply_one(&index, &mut cursor, &data(4, 11, 2)).expect("apply"),
+            apply_one(&index, &mut cursor, &data(4, 11, 2), &[]).expect("apply"),
             "newer than the delete"
         );
         assert!(index.contains(&key(4)).expect("read"));
@@ -374,9 +382,9 @@ mod tests {
         let index = index();
         let mut cursor = LogCursor::new();
         for lsn in [1u64, 2, 3] {
-            apply_one(&index, &mut cursor, &range(lsn as u8, lsn)).expect("apply");
+            apply_one(&index, &mut cursor, &range(lsn as u8, lsn), &[]).expect("apply");
         }
-        apply_one(&index, &mut cursor, &range(9, COVER_WINDOW + 10)).expect("apply");
+        apply_one(&index, &mut cursor, &range(9, COVER_WINDOW + 10), &[]).expect("apply");
         assert_eq!(cursor.range_count(), 4);
 
         cursor.prune_covers(Lsn(COVER_WINDOW + 10));
@@ -393,12 +401,14 @@ mod tests {
     fn a_recent_cover_is_kept() {
         let index = index();
         let mut cursor = LogCursor::new();
-        apply_one(&index, &mut cursor, &range(1, COVER_WINDOW)).expect("apply");
+        apply_one(&index, &mut cursor, &range(1, COVER_WINDOW), &[]).expect("apply");
 
         cursor.prune_covers(Lsn(COVER_WINDOW + 1));
 
         assert_eq!(cursor.range_count(), 1);
-        assert!(!apply_one(&index, &mut cursor, &data(1, COVER_WINDOW - 1, 2)).expect("apply"));
+        assert!(
+            !apply_one(&index, &mut cursor, &data(1, COVER_WINDOW - 1, 2), &[]).expect("apply")
+        );
     }
 
     // a pass that has seen nothing far enough along prunes nothing
@@ -406,7 +416,7 @@ mod tests {
     fn an_early_pass_prunes_nothing() {
         let index = index();
         let mut cursor = LogCursor::new();
-        apply_one(&index, &mut cursor, &range(1, 5)).expect("apply");
+        apply_one(&index, &mut cursor, &range(1, 5), &[]).expect("apply");
 
         cursor.prune_covers(Lsn(7));
 
@@ -420,7 +430,7 @@ mod tests {
         let mut cursor = LogCursor::new();
 
         for at in 0..=MAX_COVERS as u64 {
-            apply_one(&index, &mut cursor, &range(1, COVER_WINDOW + at + 1)).expect("apply");
+            apply_one(&index, &mut cursor, &range(1, COVER_WINDOW + at + 1), &[]).expect("apply");
         }
 
         assert!(
@@ -434,14 +444,14 @@ mod tests {
     fn a_relocation_repoints() {
         let index = index();
         let mut cursor = LogCursor::new();
-        apply_one(&index, &mut cursor, &data(1, 5, 1)).expect("apply");
+        apply_one(&index, &mut cursor, &data(1, 5, 1), &[]).expect("apply");
 
         let moved = WalkedRecord {
             flags: Flags::DATA.relocated(),
             loc: Loc::new(SegmentId(9), 4096, 100),
             ..data(1, 5, 9)
         };
-        assert!(apply_one(&index, &mut cursor, &moved).expect("apply"));
+        assert!(apply_one(&index, &mut cursor, &moved, &[]).expect("apply"));
 
         let entry = index.get(&key(1)).expect("read").expect("present");
         assert_eq!(entry.loc.segment, SegmentId(9));
@@ -453,7 +463,7 @@ mod tests {
     fn tombstones_follow_their_order() {
         let index = index();
         let mut cursor = LogCursor::new();
-        apply_one(&index, &mut cursor, &data(1, 5, 1)).expect("apply");
+        apply_one(&index, &mut cursor, &data(1, 5, 1), &[]).expect("apply");
 
         let stale = WalkedRecord {
             flags: Flags::TOMBSTONE,
@@ -464,9 +474,9 @@ mod tests {
             ..data(1, 6, 1)
         };
 
-        assert!(!apply_one(&index, &mut cursor, &stale).expect("apply"));
+        assert!(!apply_one(&index, &mut cursor, &stale, &[]).expect("apply"));
         assert!(index.contains(&key(1)).expect("read"));
-        assert!(apply_one(&index, &mut cursor, &fresh).expect("apply"));
+        assert!(apply_one(&index, &mut cursor, &fresh, &[]).expect("apply"));
         assert!(!index.contains(&key(1)).expect("read"));
     }
 

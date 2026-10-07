@@ -5,8 +5,6 @@
 //! per record. Keys are packed end to end at the column's width, so a page is one
 //! allocation rather than one per key.
 
-use reel_core::Value;
-
 use crate::index::entry::Entry;
 
 /// A run of keys in index order and, when asked for, where each one's record sits
@@ -30,14 +28,8 @@ pub struct KeyPage {
     /// Whether a caller will read the entries, so a keys-only walk skips them
     keeps_found: bool,
 
-    /// Whether the caller reads every payload, so a walk that met them may hand them over
-    reads_payloads: bool,
-
     /// Whether graves and covered entries come out too, for a merge that checks them itself
     keeps_graves: bool,
-
-    /// Payloads read beside their keys, one slot per key once the first arrives
-    payloads: Vec<Option<Value>>,
 }
 
 impl KeyPage {
@@ -49,23 +41,9 @@ impl KeyPage {
         }
     }
 
-    /// A page for a caller that reads every payload, so a walk that reads a record whole hands it over
-    pub fn reading() -> KeyPage {
-        KeyPage {
-            keeps_found: true,
-            reads_payloads: true,
-            ..KeyPage::default()
-        }
-    }
-
     /// Whether the walk filling this page reads the records it points at
     pub fn keeps_found(&self) -> bool {
         self.keeps_found
-    }
-
-    /// Whether the caller reads every payload, so a payload read beside its key is worth keeping
-    pub fn reads_payloads(&self) -> bool {
-        self.reads_payloads
     }
 
     /// The map's half of a merge, graves and covered entries included so it can drop deleted sealed keys
@@ -87,26 +65,8 @@ impl KeyPage {
         self.keys.clear();
         self.ends.clear();
         self.found.clear();
-        self.payloads.clear();
         self.width = 0;
         self.count = 0;
-    }
-
-    /// Add one key, its entry, and the payload a walk already read for it
-    pub fn push_read(&mut self, key: &[u8], found: Entry, payload: Option<Value>) {
-        let Some(payload) = payload.filter(|_| self.reads_payloads) else {
-            self.push(key, found);
-            return;
-        };
-        // An empty slot for each earlier key keeps the two lists in step
-        self.payloads.resize_with(self.count, || None);
-        self.push(key, found);
-        self.payloads.push(Some(payload));
-    }
-
-    /// Hand over, at most once, the payload read beside the key at a position
-    pub fn take_payload(&mut self, at: usize) -> Option<Value> {
-        self.payloads.get_mut(at).and_then(Option::take)
     }
 
     /// Room for this many more keys at a width, so a fill never regrows its buffers
@@ -114,9 +74,6 @@ impl KeyPage {
         self.keys.reserve(count * width);
         if self.keeps_found {
             self.found.reserve(count);
-        }
-        if self.reads_payloads {
-            self.payloads.reserve(count);
         }
     }
 

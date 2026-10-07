@@ -137,11 +137,6 @@ impl KeyBytes {
         }
     }
 
-    /// Whether this key rides outside the record prefix rather than within it
-    pub fn is_spilled(&self) -> bool {
-        matches!(self, KeyBytes::Spilled(_))
-    }
-
     /// The heap bytes themselves, for a writer that would rather point than copy
     ///
     /// Nothing for a key the prefix stages, which is already copied into it.
@@ -408,11 +403,6 @@ pub fn spec_by_name<'a>(columns: &'a [ColumnSpec], name: &str) -> Option<&'a Col
     columns.iter().find(|spec| spec.name == name)
 }
 
-/// Resolve a column identifier to its declaration
-pub fn spec_by_id(columns: &[ColumnSpec], id: ColumnId) -> Option<&ColumnSpec> {
-    columns.iter().find(|spec| spec.id == id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,15 +534,13 @@ mod tests {
         }
     }
 
-    // columns resolve by name and by identifier
+    // columns resolve by name
     #[test]
     fn resolves_columns() {
         assert_eq!(
             spec_by_name(COLUMNS, "record").expect("record").id,
             ColumnId(1)
         );
-        assert_eq!(spec_by_id(COLUMNS, ColumnId(2)).expect("blob").name, "blob");
         assert!(spec_by_name(COLUMNS, "absent").is_none());
-        assert!(spec_by_id(COLUMNS, ColumnId(9)).is_none());
     }
 }

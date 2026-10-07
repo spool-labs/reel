@@ -701,7 +701,7 @@ impl ReelStore {
 
     fn playback(&self, scope: Scope, column: ColumnId) -> Playback<'_> {
         let mut spare = SPARE_WALK.with(std::cell::Cell::take).unwrap_or_default();
-        let buffered = spare.buffered.take().unwrap_or_else(KeyPage::reading);
+        let buffered = spare.buffered.take().unwrap_or_else(KeyPage::with_lens);
         let page = Page::open(
             &scope,
             column,
@@ -1122,15 +1122,6 @@ impl Playback<'_> {
             self.found.push(entry);
         }
 
-        // A walk that read a record whole already has its payload, so only the rest go to the device
-        let mut carried = Vec::new();
-        for (at, slot) in self.staged.iter().enumerate() {
-            if let Some(payload) = self.page.buffered.take_payload(*slot) {
-                self.found[at] = None;
-                carried.push((at, payload));
-            }
-        }
-
         // The entries came off the page the index already built, so the read goes
         // straight to the device rather than resolving these keys a second time.
         let column = self.column;
@@ -1143,9 +1134,6 @@ impl Playback<'_> {
         // left missing is looked up on its own and an unreadable one drops out.
         if let Err(error) = self.store.read_placed(&keys, &self.found, &mut self.placed) {
             tracing::warn!("a playback read a run one record at a time: {error}");
-        }
-        for (at, payload) in carried {
-            self.placed.hold(at, payload);
         }
         let missed: Vec<usize> = self.placed.missed().collect();
         for at in missed {

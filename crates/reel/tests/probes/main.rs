@@ -9,7 +9,6 @@ mod bias_report;
 mod compact_throughput;
 mod cue_speed;
 mod door_price;
-mod drain_depth;
 mod erase_probe;
 mod filter_cost;
 mod handoff_cost;
@@ -67,14 +66,6 @@ const PROBES: &[Probe] = &[
     opt_in(
         "door_price::a_probe_never_waits",
         door_price::a_probe_never_waits,
-    ),
-    opt_in(
-        "drain_depth::report_drain_depth",
-        drain_depth::report_drain_depth,
-    ),
-    opt_in(
-        "drain_depth::one_writer_is_never_batchable",
-        drain_depth::one_writer_is_never_batchable,
     ),
     opt_in(
         "erase_probe::erase_reclaim_share",

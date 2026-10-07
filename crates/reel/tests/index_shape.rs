@@ -1306,7 +1306,7 @@ fn fill_under_deletion() {
     println!("{:>26}  rebuild cost {rebuild:.1}ns a key", "");
 }
 
-// the sorted and cold batch variants answer what the plain one does
+// the sorted batch variant answers what the plain one does
 #[test]
 fn batch_variants_agree() {
     let held = {
@@ -1340,10 +1340,8 @@ fn batch_variants_agree() {
     asked.sort_unstable();
 
     let mut plain = Vec::new();
-    let mut cold = Vec::new();
     let mut sorted = Vec::new();
     tree.get_many(&asked, &mut plain);
-    tree.get_many_cold(&asked, &mut cold);
     tree.get_many_sorted(&asked, &mut sorted);
 
     let want: Vec<Option<u64>> = asked
@@ -1358,11 +1356,10 @@ fn batch_variants_agree() {
         want,
         "the lane batch disagrees with single gets"
     );
-    assert_eq!(seen(&cold), want, "the unprefetched batch disagrees");
     assert_eq!(seen(&sorted), want, "the sorted batch disagrees");
 }
 
-// what the prefetch is worth, and what sorting the batch is worth on top
+// what sorting the batch is worth on top of the prefetch
 #[test]
 #[ignore = "measurement; run with --ignored --nocapture"]
 fn batch_variants() {
@@ -1402,18 +1399,17 @@ fn batch_variants() {
         ordered.sort_unstable();
 
         for &batch in &[16usize, 64] {
-            for (name, run) in [("cold", 0u8), ("prefetched", 1), ("sorted", 2)] {
-                let source = if run == 2 { &ordered } else { &probes };
+            for (name, is_sorted) in [("prefetched", false), ("sorted", true)] {
+                let source = if is_sorted { &ordered } else { &probes };
                 let mut out = Vec::with_capacity(batch);
                 let mut rows = Vec::new();
                 for _ in 0..3 {
                     let start = Instant::now();
                     let mut answered = 0usize;
                     for chunk in source.chunks(batch) {
-                        match run {
-                            0 => tree.get_many_cold(chunk, &mut out),
-                            1 => tree.get_many(chunk, &mut out),
-                            _ => tree.get_many_sorted(chunk, &mut out),
+                        match is_sorted {
+                            false => tree.get_many(chunk, &mut out),
+                            true => tree.get_many_sorted(chunk, &mut out),
                         }
                         answered += out.iter().filter(|found| found.is_some()).count();
                     }

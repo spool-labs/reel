@@ -95,16 +95,6 @@ impl Volumes {
         self.dead.get(at).copied().unwrap_or(false)
     }
 
-    /// The roots declared dead, for the open that reports what is degraded
-    pub fn dead_roots(&self) -> Vec<&Path> {
-        self.roots
-            .iter()
-            .enumerate()
-            .filter(|(at, _)| self.dead[*at])
-            .map(|(_, root)| root.as_path())
-            .collect()
-    }
-
     /// The first volume, where the lock and the manifest live
     pub fn first(&self) -> &Path {
         &self.roots[0]
@@ -566,7 +556,6 @@ mod tests {
         assert_eq!(volumes.fast_at(1), None);
         assert_eq!(volumes.draw(None, VolumeClass::Fast), 0);
         assert_eq!(volumes.draw_past(&[0], VolumeClass::Fast), None);
-        assert_eq!(volumes.dead_roots(), vec![Path::new("/c")]);
         // Its placements still resolve, which is what keeps the table honest.
         volumes.place(SegmentId(4), 2);
         assert_eq!(

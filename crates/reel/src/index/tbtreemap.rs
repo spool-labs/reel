@@ -108,9 +108,6 @@ pub trait LeadWindow<K: TreeKey>: Clone + Default {
     /// for both at every node it lands on, so a window answers them together.
     fn word(&self, probe: &K::Probe) -> Result<u64, Place>;
 
-    /// Bytes of key this window is reading its lead from past, which nothing needs
-    fn skipped(&self) -> usize;
-
     /// Retune to what the node is holding, saying whether the leads must be redone
     ///
     /// Called where a node's contents change wholesale: a build, a split, and an
@@ -136,10 +133,6 @@ impl<K: TreeKey> LeadWindow<K> for Whole {
 
     fn word(&self, probe: &K::Probe) -> Result<u64, Place> {
         Ok(K::head(probe))
-    }
-
-    fn skipped(&self) -> usize {
-        0
     }
 
     fn tune<'a>(&mut self, _held: impl Iterator<Item = &'a K::Probe>) -> bool
@@ -234,10 +227,6 @@ where
         let probe = probe.as_ref();
         self.inside(probe)?;
         Ok(self.at_window(probe))
-    }
-
-    fn skipped(&self) -> usize {
-        self.off as usize
     }
 
     fn tune<'a>(&mut self, held: impl Iterator<Item = &'a K::Probe>) -> bool
@@ -1648,29 +1637,6 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         }
     }
 
-    /// Bytes of shared prefix the leaves are reading their leads from past
-    ///
-    /// The mean over the leaves, unweighted, since what is wanted is whether the
-    /// windows moved. Zero where a node's keys agree on nothing, which is what a
-    /// column with no scan prefix and no bucket in front holds.
-    pub fn lead_skip(&self) -> f64 {
-        let mut total = 0usize;
-        let mut seen = 0usize;
-        let mut at = self.first;
-        while at != NONE {
-            let leaf = &self.leaves[at as usize];
-            if leaf.len > 0 {
-                total += leaf.win.skipped();
-                seen += 1;
-            }
-            at = leaf.next;
-        }
-        match seen {
-            0 => 0.0,
-            _ => total as f64 / seen as f64,
-        }
-    }
-
     /// The lowest key held and what it holds
     pub fn first_key_value(&self) -> Option<(&K, &V)> {
         let mut at = self.first;
@@ -1680,19 +1646,6 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
                 return Some((&leaf.keys[0], &leaf.vals[0]));
             }
             at = leaf.next;
-        }
-        None
-    }
-
-    /// The highest key held and what it holds
-    pub fn last_key_value(&self) -> Option<(&K, &V)> {
-        let mut at = self.last_leaf()?;
-        while at != NONE {
-            let leaf = &self.leaves[slot_of(at)];
-            if leaf.len > 0 {
-                return Some((&leaf.keys[leaf.len - 1], &leaf.vals[leaf.len - 1]));
-            }
-            at = leaf.prev;
         }
         None
     }
@@ -1729,49 +1682,6 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
                 }
             }
 
-            for slot in 0..run.len() {
-                let leaf = &self.leaves[slot_of(at[slot])];
-                out.push(
-                    match seek(
-                        &leaf.win,
-                        &leaf.lead,
-                        &leaf.keys,
-                        leaf.len,
-                        run[slot].borrow(),
-                    ) {
-                        Ok(found) => Some(&leaf.vals[found]),
-                        Err(_) => None,
-                    },
-                );
-            }
-        }
-    }
-
-    /// The same batched descent with the prefetch left out, to price it
-    ///
-    /// The control the prefetch is priced against, since the two are otherwise
-    /// inseparable.
-    pub fn get_many_cold<'a>(&'a self, keys: &[K], out: &mut Vec<Option<&'a V>>) {
-        out.clear();
-        if self.root == NONE {
-            out.resize(keys.len(), None);
-            return;
-        }
-        for run in keys.chunks(LANES) {
-            let mut at = [0u32; LANES];
-            at[..run.len()].fill(self.root);
-            let mut moving = true;
-            while moving {
-                moving = false;
-                for slot in 0..run.len() {
-                    if !is_inner(at[slot]) {
-                        continue;
-                    }
-                    moving = true;
-                    let inner = &self.inners[slot_of(at[slot])];
-                    at[slot] = inner.kids[inner_seek(inner, run[slot].borrow())];
-                }
-            }
             for slot in 0..run.len() {
                 let leaf = &self.leaves[slot_of(at[slot])];
                 out.push(

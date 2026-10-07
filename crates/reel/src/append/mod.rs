@@ -293,9 +293,6 @@ pub struct Appender {
     /// Records in flight against this tail, the routing load signal
     inflight: AtomicU64,
 
-    /// How many writers were in flight as each record went down
-    depth: DrainDepth,
-
     /// The tier this tail's draws go to, fast except when compaction demotes
     draw_class: AtomicU8,
 
@@ -304,55 +301,6 @@ pub struct Appender {
 
     /// Seals segments this tail has rolled off, so a writer does not
     sealer: Sealer,
-}
-
-/// Writers in flight at the moment a record is written, bucketed
-///
-/// A batch can only collect writers already in flight together, so this is the ceiling
-/// on what batching could save.
-#[derive(Debug, Default)]
-pub struct DrainDepth {
-    buckets: [AtomicU64; DEPTH_BUCKETS],
-}
-
-/// Upper bound of each depth bucket, with the last standing for everything above
-const DEPTH_BOUNDS: [u64; DEPTH_BUCKETS] = [1, 2, 4, 8, 16, 32, 64, u64::MAX];
-
-const DEPTH_BUCKETS: usize = 8;
-
-impl DrainDepth {
-    /// Record that a record went down with this many writers in flight
-    fn observe(&self, inflight: u64) {
-        let at = DEPTH_BOUNDS
-            .iter()
-            .position(|bound| inflight <= *bound)
-            .unwrap_or(DEPTH_BUCKETS - 1);
-        self.buckets[at].fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Counts per bucket, paired with the upper bound each one stands for
-    pub fn snapshot(&self) -> Vec<(u64, u64)> {
-        DEPTH_BOUNDS
-            .iter()
-            .enumerate()
-            .map(|(at, bound)| (*bound, self.buckets[at].load(Ordering::Relaxed)))
-            .collect()
-    }
-
-    /// Share of records written with company, which is what a batch could collect
-    pub fn batchable_fraction(&self) -> f64 {
-        let counts: Vec<u64> = self
-            .buckets
-            .iter()
-            .map(|b| b.load(Ordering::Relaxed))
-            .collect();
-        let total: u64 = counts.iter().sum();
-        if total == 0 {
-            return 0.0;
-        }
-        let alone = counts[0];
-        (total - alone) as f64 / total as f64
-    }
 }
 
 impl Appender {
@@ -372,7 +320,6 @@ impl Appender {
             active,
             spare: Mutex::new(None),
             inflight: AtomicU64::new(0),
-            depth: DrainDepth::default(),
             draw_class: AtomicU8::new(0),
             band: Mutex::new(None),
         };
@@ -392,11 +339,6 @@ impl Appender {
     /// Records in flight against this tail, the routing load signal
     pub fn load(&self) -> u64 {
         self.inflight.load(Ordering::Relaxed)
-    }
-
-    /// How many writers each record went down beside, the batching ceiling
-    pub fn drain_depth(&self) -> &DrainDepth {
-        &self.depth
     }
 
     /// Append a data record and await its committed location
@@ -1108,7 +1050,6 @@ impl Appender {
             bufs.push(WriteBuf::zeros((written - framed) as usize));
         }
 
-        self.depth.observe(self.inflight.load(Ordering::Relaxed));
         let wrote = self.write_framed(active, base, bufs)?;
         if wrote != written {
             return Err(ReelError::Io(std::io::Error::new(
@@ -1188,7 +1129,6 @@ impl Appender {
             bufs.push(WriteBuf::zeros((framed - span) as usize));
         }
 
-        self.depth.observe(self.inflight.load(Ordering::Relaxed));
         let wrote = self.write_framed(active, base, bufs)?;
         if wrote != framed {
             return Err(ReelError::Io(std::io::Error::new(

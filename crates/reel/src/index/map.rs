@@ -246,9 +246,6 @@ pub struct ReelIndex {
     /// Where the footers of sealed segments are read from
     footers: OnceLock<Arc<dyn FooterSource>>,
 
-    /// Compaction copies refused because nothing else pointed at them
-    unclaimed: std::sync::atomic::AtomicU64,
-
     /// Sealed versions a rebuild found a tail outversioning, taken out once the spot index load settles
     shadowed: Mutex<Vec<(usize, KeyBytes, Loc)>>,
 
@@ -291,7 +288,6 @@ impl ReelIndex {
             by_id,
             segments: Arc::new(SegmentTable::new()),
             footers: OnceLock::new(),
-            unclaimed: std::sync::atomic::AtomicU64::new(0),
             shadowed: Mutex::new(Vec::new()),
             publish: PublishBarrier::new(),
         })
@@ -1542,20 +1538,8 @@ impl ReelIndex {
             // and adopting the copy would write the source's sequence number into
             // the map, which a read trusts ahead of any footer row. Refusing is
             // safe, since the source holds the record until the pass retires it.
-            Sealed::Absent => {
-                self.unclaimed
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(None)
-            }
+            Sealed::Absent => Ok(None),
         }
-    }
-
-    /// Copies compaction made that nothing else was pointing at
-    ///
-    /// Zero on a healthy volume. Anything else says a paged key went unresolvable
-    /// while its record was being rewritten, which is the window this counts.
-    pub fn unclaimed_copies(&self) -> u64 {
-        self.unclaimed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Drop a key while it still resolves one exact location, writing no tombstone

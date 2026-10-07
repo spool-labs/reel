@@ -26,11 +26,6 @@ fn ends(book: &Book, oracle: &BTreeMap<u64, u64>, seed: u64, at: usize) {
         oracle.first_key_value().map(|(key, val)| (*key, *val)),
         "seed {seed} step {at}: the lowest key diverged"
     );
-    assert_eq!(
-        book.last_key_value().map(|(key, val)| (*key, *val)),
-        oracle.last_key_value().map(|(key, val)| (*key, *val)),
-        "seed {seed} step {at}: the highest key diverged"
-    );
     let walked: Vec<(u64, u64)> = book.iter().map(|(key, val)| (*key, *val)).collect();
     let wanted: Vec<(u64, u64)> = oracle.iter().map(|(key, val)| (*key, *val)).collect();
     assert_eq!(walked, wanted, "seed {seed} step {at}: the walk diverged");

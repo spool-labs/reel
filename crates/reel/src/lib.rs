@@ -22,9 +22,7 @@ pub use reel_core::{
     Result as StoreResult, Store, StoreIter, StoreVolume, TypedStore, Value, WriteBatch,
 };
 
-pub use append::{
-    Appender, BatchRecord, BatchWrite, Committed, CopyRecord, DrainDepth, Durability, FlushTurn,
-};
+pub use append::{Appender, BatchRecord, BatchWrite, Committed, CopyRecord, Durability, FlushTurn};
 pub use compaction::compactor::{CompactionCounters, Compactor, EraseReport};
 pub use compaction::keymerge::MergeReport;
 pub use compaction::pressure::{GcPressure, GcTier, RateLimiter};

@@ -450,20 +450,6 @@ impl Compactor {
         })
     }
 
-    /// Whether a pass left this segment standing because something in it rotted
-    ///
-    /// Membership alone rather than the dead-byte refinement the ranking uses: a merge
-    /// reads every row of a source, so a segment holding a record that will not verify
-    /// has nothing to offer one until compaction has been through it.
-    pub fn is_rot_pinned(&self, segment: SegmentId) -> bool {
-        lock(&self.rotted).contains_key(&segment)
-    }
-
-    /// Leave a segment standing for rot, at the dead bytes the pass left it with
-    pub fn pin_rot(&self, segment: SegmentId, dead: u64) {
-        lock(&self.rotted).insert(segment, dead);
-    }
-
     /// Book the runs one merge pass read together
     ///
     /// A pass the tick drove hands its report to nobody, so this is where a volume says
@@ -524,27 +510,12 @@ impl Compactor {
         &self.pressure
     }
 
-    /// The resolved compaction rate cap in megabytes per second
-    pub fn compaction_rate_mbps(&self) -> u64 {
-        self.compact_rate.target_mbps()
-    }
-
     /// Whether the compaction rate allows another pass to start now
     ///
     /// A paced pass pays for its steps as it takes them, so what stands here is the
     /// tail past its last step rather than the whole of what it moved.
     pub fn is_compaction_due(&self) -> bool {
         self.compact_rate.is_open()
-    }
-
-    /// The resolved scrub rate, or nothing when the scrub is disabled
-    pub fn scrub_rate_mbps(&self) -> Option<u64> {
-        self.scrub_rate.as_ref().map(RateGate::target_mbps)
-    }
-
-    /// Whether the scrub task runs at all
-    pub fn is_scrub_enabled(&self) -> bool {
-        self.scrub_rate.is_some()
     }
 
     /// Where the next scrub pass picks up, or nothing when the sweep is at its start
@@ -2824,26 +2795,6 @@ mod tests {
 
         assert!(before > 0);
         assert_eq!(fixture.index.dead_bytes(), 0);
-    }
-
-    // the automatic compaction rate is unpaced and the scrub keeps its own rate
-    #[test]
-    fn rate_and_scrub_toggle() {
-        let running = Compactor::new(&settings(), 0, 0);
-        let disabled = Compactor::new(
-            &ReelConfig {
-                scrub_mbps: 0,
-                ..settings()
-            },
-            0,
-            0,
-        );
-
-        assert_eq!(running.compaction_rate_mbps(), 0);
-        assert!(running.is_scrub_enabled());
-        assert_eq!(running.scrub_rate_mbps(), Some(4));
-        assert!(!disabled.is_scrub_enabled());
-        assert_eq!(disabled.scrub_rate_mbps(), None);
     }
 
     // a second claim on a held segment comes back empty and leaves the lock free

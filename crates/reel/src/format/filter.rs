@@ -93,67 +93,6 @@ impl Filter {
         })
     }
 
-    /// An empty filter sized for a key budget, filled by `insert`
-    ///
-    /// For a filter taking its keys as segments seal rather than in one pass.
-    /// Nothing comes back for a zero budget or zero bits, as `build` answers them.
-    pub fn sized(budget: usize, bits_per_key: u8) -> Option<Filter> {
-        if budget == 0 || bits_per_key == 0 {
-            return None;
-        }
-        let bits_per_key = bits_per_key.min(MAX_BITS_PER_KEY);
-        Some(Filter {
-            kind: KIND_BLOOM,
-            seed: SEED,
-            probes: probes_for(bits_per_key) as u8,
-            keys: 0,
-            body: vec![0u8; blocks_for(budget, bits_per_key) * BLOCK_BYTES],
-        })
-    }
-
-    /// Set one key's bits, and say whether the filter did not already hold it
-    ///
-    /// A key whose bits were all set counts for nothing, so one that comes back
-    /// through a rewrite spends none of the filter's budget.
-    pub fn insert(&mut self, key: &[u8]) -> bool {
-        let blocks = self.body.len() / BLOCK_BYTES;
-        if self.kind != KIND_BLOOM || blocks == 0 || self.probes == 0 {
-            return false;
-        }
-        let hash = hash_key(key, self.seed);
-        let block = block_of(hash, blocks) * BLOCK_BYTES;
-        let mut is_new = false;
-        for bit in bits_of(hash, u32::from(self.probes)) {
-            let at = bit as usize / 8;
-            let mask = 1u8 << (bit % 8);
-            is_new |= self.body[block + at] & mask == 0;
-            self.body[block + at] |= mask;
-        }
-        self.keys += u32::from(is_new);
-        is_new
-    }
-
-    /// Start fetching the block a key would set, ahead of the insert that sets it
-    pub fn prefetch(&self, key: &[u8]) {
-        let blocks = self.body.len() / BLOCK_BYTES;
-        if self.kind != KIND_BLOOM || blocks == 0 {
-            return;
-        }
-        let at = block_of(hash_key(key, self.seed), blocks) * BLOCK_BYTES;
-        let block = self.body[at..].as_ptr();
-        // A hint the cpu may drop, which never faults and changes no state.
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(block.cast())
-        };
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            std::arch::asm!("prfm pstl1keep, [{0}]", in(reg) block, options(nostack, readonly, preserves_flags))
-        };
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        let _ = block;
-    }
-
     /// Whether the segment may hold this key, which is only ever a maybe or a no
     pub fn may_hold(&self, key: &[u8]) -> bool {
         match self.kind {

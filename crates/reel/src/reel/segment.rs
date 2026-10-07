@@ -418,32 +418,6 @@ impl IoDriver {
         }
     }
 
-    /// Read a byte range as a future, into a buffer the caller is done with
-    pub async fn wait_pread_reusing(
-        &self,
-        file: FileId,
-        offset: u64,
-        len: u64,
-        reuse: Vec<u8>,
-    ) -> Result<Vec<u8>> {
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        let op = Op::Pread {
-            tag: self.next_tag(),
-            file,
-            offset,
-            buf: ReadBuf::reusing(reuse, len as usize),
-        };
-        match self.wait_op(op).await?.outcome {
-            Outcome::Read { result, buf } => {
-                result?;
-                Ok(buf.into_vec())
-            }
-            other => Err(wrong_shape(&other)),
-        }
-    }
-
     /// Read a window through the plane its route names, into a reused buffer
     ///
     /// One op whatever the route: the plane is chosen inside the backend, so a
@@ -1254,11 +1228,6 @@ impl SegmentHandle {
         self.inner.is_doomed.load(Ordering::Acquire)
     }
 
-    /// Number of live references to this segment, including this handle
-    pub fn reference_count(&self) -> usize {
-        Arc::strong_count(&self.inner)
-    }
-
     /// The segment's read-only mapping, taken on the first ask and kept for the
     /// life of the handle family
     ///
@@ -1633,7 +1602,6 @@ mod tests {
             Arc::clone(&driver),
             RecordLayout::Keyed,
         );
-        assert_eq!(handle.reference_count(), 1);
 
         drop(handle);
         assert_eq!(list(&driver, dir).len(), 1);

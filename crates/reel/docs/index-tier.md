@@ -73,11 +73,10 @@ compaction window one at a time.
   `evict_at` removes an entry with no grave, right for a sealed record whose footer
   goes on answering and data loss for an unsealed one. Refused when no footer covers
   the location.
-- **A copy the index cannot place is dropped, not adopted.** With spans lagging, the
-  adopt branch wrote the source's sequence number into the map, outranking a newer
-  footer row and resurrecting a replaced version. Now a counted refusal,
-  `unclaimed_copies()`, safe because the source holds the record until the pass
-  retires it, so the copy goes rather than the key.
+- **A copy the index cannot place is dropped.** With spans lagging, the adopt branch
+  wrote the source's sequence number into the map, outranking a newer footer row and
+  resurrecting a replaced version. Now the copy is refused, which is safe because the
+  source holds the record until the pass retires it, so the copy goes and the key stays.
 
 ## What a playback costs, measured
 

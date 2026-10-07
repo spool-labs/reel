@@ -296,14 +296,6 @@ impl RecordHeader {
         RecordHeader::new(0, lsn, Flags::TOMBSTONE, key, &[])
     }
 
-    /// A tombstone header recording a delete of a half-open key range
-    ///
-    /// The record's key is the inclusive start of the range and its payload is
-    /// the exclusive end. An empty payload means the range has no upper bound.
-    pub fn range_tombstone(key: RecordKey, lsn: Lsn, end: &[u8]) -> RecordHeader {
-        RecordHeader::new(end.len() as u32, lsn, Flags::RANGE_TOMBSTONE, key, end)
-    }
-
     /// A segment header record carrying the frozen self describing payload
     ///
     /// No sequence number and no key, since it is never indexed, but a payload
@@ -823,7 +815,13 @@ mod tests {
     fn range_tombstone_carries_end() {
         let start = sample_key(RECORD, 0x10, 34);
         let end = vec![0x11u8; 34];
-        let header = RecordHeader::range_tombstone(start.clone(), Lsn(6), &end);
+        let header = RecordHeader::new(
+            end.len() as u32,
+            Lsn(6),
+            Flags::RANGE_TOMBSTONE,
+            start.clone(),
+            &end,
+        );
 
         let parsed = RecordHeader::unpack(header.pack().as_slice()).expect("unpack");
 
@@ -837,7 +835,13 @@ mod tests {
     // an unbounded range tombstone carries no end at all
     #[test]
     fn unbounded_range_tombstone() {
-        let header = RecordHeader::range_tombstone(sample_key(RECORD, 0xff, 34), Lsn(7), &[]);
+        let header = RecordHeader::new(
+            0,
+            Lsn(7),
+            Flags::RANGE_TOMBSTONE,
+            sample_key(RECORD, 0xff, 34),
+            &[],
+        );
 
         let parsed = RecordHeader::unpack(header.pack().as_slice()).expect("unpack");
 
@@ -951,7 +955,7 @@ mod tests {
     fn a_spilled_key_round_trips() {
         let key = sample_key(RECORD, 0x5a, 200);
         assert!(
-            key.key.is_spilled(),
+            matches!(key.key, KeyBytes::Spilled(_)),
             "200 bytes should not be an inline key"
         );
 

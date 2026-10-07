@@ -369,6 +369,86 @@ fn a_page_never_comes_back_holding_half_a_batch() {
     assert_eq!(seen.len(), 4, "the refilled page missed a key: {seen:?}");
 }
 
+/// Fill one ascending page of the sharded column on a thread the script owns
+fn page_on(
+    script: &rendezvous::Script,
+    store: &Arc<ReelStore>,
+) -> thread::JoinHandle<Vec<Vec<u8>>> {
+    let store = Arc::clone(store);
+    script.cast(move || {
+        let mut playback =
+            PlaybackCursor::new(SHARDED[0].id, Way::Up, Bound::Unbounded).expect("playback");
+        let mut page = KeyPage::with_lens();
+        store.page_from(&mut playback, 64, &mut page).expect("page");
+        (0..page.len()).map(|at| page.key_at(at)).collect()
+    })
+}
+
+// a page of the map alone keeps the keys the column's first hand-over takes from under it
+#[test]
+fn a_first_handover_inside_a_page_loses_no_key() {
+    let store = open_columns("/first-handover-page", 71, SHARDED);
+    let (low, high) = (sharded_key(0x00, 1), sharded_key(0x80, 1));
+    for key in [low, high] {
+        Store::put(&*store, "rows", &key, &[0x33; 32]).expect("put");
+    }
+    // Sealed but not noted, so the page starts on the map alone
+    drop(store.cue().expect("seal"));
+
+    let script = rendezvous::script();
+    script.hold("index/page-shard");
+    let reader = page_on(&script, &store);
+    script.await_reached("index/page-shard", 1);
+    script.pass_one("index/page-shard");
+    script.await_reached("index/page-shard", 2);
+
+    assert_eq!(store.page_out_sealed().expect("hand over"), 2);
+
+    script.release("index/page-shard");
+    let seen = reader.join().expect("reader thread");
+    assert_eq!(
+        seen,
+        vec![low.to_vec(), high.to_vec()],
+        "the page lost a handed-over key"
+    );
+}
+
+// a page keeps a key compaction moves out of a footer into the map while the page reads the map
+#[test]
+fn a_compaction_inside_a_page_loses_no_key() {
+    let store = open_columns("/compaction-page", 73, SHARDED);
+    let payload = vec![0x44u8; 4096];
+    let (moved, high) = (sharded_key(0x00, 1), sharded_key(0x80, 1));
+    Store::put(&*store, "rows", &moved, &payload).expect("put");
+    for at in 2..20u8 {
+        Store::put(&*store, "rows", &sharded_key(0x00, at), &payload).expect("put");
+    }
+    drop(store.cue().expect("seal"));
+    store.page_out_sealed().expect("hand over");
+    // Only the moved key stays live, so a pass copies it into the map and retires its segment
+    for at in 2..20u8 {
+        Store::delete(&*store, "rows", &sharded_key(0x00, at)).expect("delete");
+    }
+    Store::put(&*store, "rows", &high, &payload).expect("put");
+
+    let script = rendezvous::script();
+    script.hold("index/page-shard");
+    let reader = page_on(&script, &store);
+    script.await_reached("index/page-shard", 1);
+    script.pass_one("index/page-shard");
+    script.await_reached("index/page-shard", 2);
+
+    assert_eq!(store.compact_once().expect("compact"), CompactPass::Copied);
+
+    script.release("index/page-shard");
+    let seen = reader.join().expect("reader thread");
+    assert_eq!(
+        seen,
+        vec![moved.to_vec(), high.to_vec()],
+        "the page lost the moved key"
+    );
+}
+
 /// A volume with small segments and its simulator, for a test that reads the image
 ///
 /// The image is what says whether a segment is still there.

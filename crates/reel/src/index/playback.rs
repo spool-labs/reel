@@ -727,18 +727,23 @@ pub fn merged_page(
     if limit == 0 {
         return Ok(());
     }
-    let Some(at) = playback.at.as_ref() else {
-        return Ok(());
-    };
-    // The map's page is read before the footers open, so no key is lost while the map hands it over
-    resident_page(
-        index,
-        way,
-        borrowed_bound(at),
-        limit,
-        &mut playback.resident,
-    );
-    playback.open(paged)?;
+    // A hand-over moves a key from the map to a footer and compaction moves one back, so the map page stands only if the sealed set held still around it
+    loop {
+        playback.open(paged)?;
+        let Some(at) = playback.at.as_ref() else {
+            return Ok(());
+        };
+        resident_page(
+            index,
+            way,
+            borrowed_bound(at),
+            limit,
+            &mut playback.resident,
+        );
+        if playback.generation == Some(paged.generation()) {
+            break;
+        }
+    }
 
     let PlaybackCursor {
         sealed, resident, ..

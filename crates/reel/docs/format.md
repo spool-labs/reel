@@ -8,11 +8,12 @@ its walks read in place of the footers they cover. This document says what the
 fields are for, not what the byte offsets are, which `format/` states once and does
 not need restating.
 
-The format version is 6, stamped into every segment header record. A build meeting a
+The format version is 7, stamped into every segment header record. A build meeting a
 version it cannot read refuses the whole file there.
 
-It moved from 5 for keyless records, whose prefix a version 5 build would read as a
-header. A new shape in the segment stream is a version, every time.
+It moved from 6 when the segment header record dropped its band field, and from 5 for
+keyless records, whose prefix a version 5 build would read as a header. A new shape in
+the segment stream is a version, every time.
 
 ## A segment
 
@@ -182,9 +183,9 @@ them from a peer.
 ## The segment header record
 
 Every segment opens with one. Its payload opens with a frozen prefix, a two byte
-format version and a four byte segment number, then the band the tail drew under, a
-layout byte, and the 16-byte secret its keyless records are checked under. It takes
-no sequence number and no key, since nothing resolves it.
+format version and a four byte segment number, then a layout byte and the 16-byte
+secret its keyless records are checked under. It takes no sequence number and no key,
+since nothing resolves it.
 
 Frozen means an older build can read the version and segment number of a file a
 newer build wrote, so a longer payload from a future version parses rather than

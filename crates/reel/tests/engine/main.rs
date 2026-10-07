@@ -4,7 +4,6 @@
 #[path = "../harness/mod.rs"]
 mod harness;
 
-mod bands;
 mod batch_visibility;
 mod capacity_reserve;
 mod compression;

@@ -18,7 +18,6 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
 use reel::append::codec::{admit, decode};
-use reel::format::band::Band;
 use reel::format::column::{Codec, ColumnId};
 use reel::format::filter::Filter;
 use reel::format::footer::{FooterEntry, SegmentFooter};
@@ -335,7 +334,6 @@ fn segment_header_roundtrips() {
             let header = SegmentHeader {
                 version: rng.gen(),
                 segment: SegmentId(rng.gen()),
-                band: rng.gen::<bool>().then(|| Band(rng.gen())),
                 layout: match rng.gen::<bool>() {
                     true => RecordLayout::Keyless(CheckKey::from_bytes(rng.gen())),
                     false => RecordLayout::Keyed,

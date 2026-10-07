@@ -324,7 +324,7 @@ pub struct ColumnSpec {
     /// Leading key bytes that select the index shard a key lives in
     pub shard_bytes: u8,
 
-    /// Where a key says the record dies, and whether the write is placed by it too
+    /// Where a key says the record dies
     pub purge_mark: Option<PurgeMark>,
 
     /// Codec attempted on this column's payloads at admission, not promised
@@ -334,28 +334,17 @@ pub struct ColumnSpec {
 /// Bytes a purge mark takes within a key
 pub const MARK_LEN: usize = 8;
 
-/// Where a column's keys say the record dies, and what the volume does with that
-///
-/// Placement is opt-in on the same offset because it costs open segments, which a
-/// column purging by the mark and nothing else has no reason to pay.
+/// Where a column's keys say the record dies
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PurgeMark {
     /// Bytes into a key where the big endian u64 sits
     pub at: u8,
-
-    /// Whether writes are placed by that mark as well as purged by it
-    pub places: bool,
 }
 
 impl PurgeMark {
-    /// A mark the volume purges by, placing nothing
+    /// A mark the volume purges by
     pub const fn at(at: u8) -> PurgeMark {
-        PurgeMark { at, places: false }
-    }
-
-    /// The same mark, with writes banded by it as well
-    pub const fn placing(at: u8) -> PurgeMark {
-        PurgeMark { at, places: true }
+        PurgeMark { at }
     }
 
     /// Where this key sits on the purge timeline
@@ -375,11 +364,6 @@ impl ColumnSpec {
     /// Where this key sits on the purge timeline, for a column that marks its keys
     pub fn mark_of(&self, key: &[u8]) -> Option<u64> {
         Some(self.purge_mark?.read(key))
-    }
-
-    /// The mark this column's writes are placed by, for a column that asked for that
-    pub fn placement_mark(&self) -> Option<PurgeMark> {
-        self.purge_mark.filter(|mark| mark.places)
     }
 
     /// Number of index shards the column splits into
@@ -512,24 +496,17 @@ mod tests {
         assert_eq!(mark.read(&[0, 0, 0]), 0);
     }
 
-    // placement answers only for a column that asked for it, off the same offset
+    // a marked column reads its mark off the key, and an unmarked one reads none
     #[test]
-    fn placement_is_the_same_fact() {
+    fn marked_column() {
         let key = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 9];
         let purged = ColumnSpec {
             purge_mark: Some(PurgeMark::at(2)),
             ..spec()
         };
-        let placed = ColumnSpec {
-            purge_mark: Some(PurgeMark::placing(2)),
-            ..spec()
-        };
 
         assert_eq!(purged.mark_of(&key), Some(9));
-        assert_eq!(purged.placement_mark(), None);
-        assert_eq!(placed.mark_of(&key), Some(9));
-        assert_eq!(placed.placement_mark().expect("mark").read(&key), 9);
-        assert_eq!(spec().placement_mark(), None);
+        assert_eq!(spec().mark_of(&key), None);
     }
 
     /// An unmarked declaration the mark tests vary one field of

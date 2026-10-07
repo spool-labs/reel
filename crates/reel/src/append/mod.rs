@@ -20,7 +20,6 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::config::{SyncPolicy, VolumeClass};
 use crate::error::{ReelError, Result};
-use crate::format::band::Band;
 use crate::format::column::RecordKey;
 use crate::format::footer::{FooterEntry, SegmentFooter};
 use crate::format::journal::JournalRow;
@@ -299,9 +298,6 @@ pub struct Appender {
     /// The tier this tail's draws go to, fast except when compaction demotes
     draw_class: AtomicU8,
 
-    /// The death window this tail's draws are stamped with, nothing for unbanded traffic
-    band: Mutex<Option<Band>>,
-
     /// Seals segments this tail has rolled off, so a writer does not
     sealer: Sealer,
 }
@@ -374,7 +370,6 @@ impl Appender {
             inflight: AtomicU64::new(0),
             depth: DrainDepth::default(),
             draw_class: AtomicU8::new(0),
-            band: Mutex::new(None),
         };
         let fresh = match resumed {
             Some(tail) => appender.resume_segment(tail)?,
@@ -677,57 +672,6 @@ impl Appender {
         }
         sealed?;
         Ok(id)
-    }
-
-    /// The death window this tail's segments are drawn under
-    pub fn band(&self) -> Option<Band> {
-        *lock(&self.band)
-    }
-
-    /// Point the tail's draws at a band, ending the segment it holds now
-    ///
-    /// A segment says which band it was drawn under in its header, so a change only ever
-    /// reaches the next segment: the one open here is sealed behind it, and one holding
-    /// nothing but its header is scrapped rather than sealed as a shell.
-    pub fn set_band(&self, band: Option<Band>) -> Result<()> {
-        let previous = {
-            // The spare is held across the change, so a writer drawing one ahead either
-            // draws it before this or under the band this leaves behind.
-            let mut spare = lock(&self.spare);
-            let mut held = lock(&self.band);
-            if *held == band {
-                return Ok(());
-            }
-            if let Some(stale) = spare.take() {
-                self.scrap(stale);
-            }
-            std::mem::replace(&mut *held, band)
-        };
-
-        let rolled = {
-            let mut active = write(&self.active);
-            let empty = lock(&active.entries).is_empty();
-            self.swap_in_fresh(&mut active).map(|held| (held, empty))
-        };
-        let (retired, was_empty) = match rolled {
-            Ok(rolled) => rolled,
-            // The draw failed, so the tail is still on a segment stamped with the band it
-            // had, and that is what it must go on saying.
-            Err(error) => {
-                *lock(&self.band) = previous;
-                return Err(error);
-            }
-        };
-        if was_empty {
-            self.scrap(retired);
-            return Ok(());
-        }
-        let end = retired.end();
-        let sealed = retire_segment(&self.shared, &retired, end);
-        if sealed.is_err() {
-            park_broken_seal(&self.shared, retired, end);
-        }
-        sealed
     }
 
     /// Give a drawn segment back unwritten, since nothing points into it
@@ -1668,12 +1612,7 @@ impl Appender {
             .alloc_high
             .store(self.open_window(&active, 0)?, Ordering::Release);
 
-        // Stamped at the draw, since a band is what the segment is for and compaction
-        // reads it off the file to place the survivors it copies out.
-        let payload = SegmentHeader::banded(id, self.band())
-            .laid_out(layout)
-            .pack()
-            .to_vec();
+        let payload = SegmentHeader::new(id).laid_out(layout).pack().to_vec();
         let header = RecordHeader::segment_header(&payload);
         let span = self.reserved_span(&header);
         active.reserved.store(span, Ordering::Release);

@@ -12,7 +12,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::append::CopyRecord;
 use crate::config::{ReelConfig, RepairPath, VolumeClass};
 use crate::error::Result;
-use crate::format::band::Band;
 use crate::format::column::RecordKey;
 use crate::format::footer::{FooterRow, SegmentFooter, FIXED_TAIL_LEN};
 use crate::format::loc::{Loc, SegmentId};
@@ -21,7 +20,6 @@ use crate::format::record::{
     check_keyless, fits_keyless, keyless_codec, peek_key_width, read_u32_le, CheckKey, KeylessRead,
     RecordHeader, RecordLayout, HEADER_LEN, KEYLESS_PREFIX,
 };
-use crate::format::segment_header::SegmentHeader;
 use crate::index::map::{KeyRepoint, ReelIndex};
 use crate::io::op::Part;
 use crate::reel::segment::{SegmentHandle, SegmentReader, READ_CHUNK};
@@ -718,10 +716,6 @@ impl Compactor {
         let order = footer.as_deref().and_then(footer_order);
         let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
         reader.stock(std::mem::take(&mut *lock(&self.spare)));
-        // The band the source was drawn under is where its survivors belong. Placement
-        // the writer paid for is undone otherwise: every rewrite would put a window's
-        // records back into the mixture they were kept out of.
-        let band = band_of(shared, &source)?;
         // Only a reserved tail answers to a chosen tier, so a volume with them waits for a free one
         let lease = reel.lease_reserved();
         if reel.keeps_reserved() && lease.is_none() {
@@ -729,15 +723,14 @@ impl Compactor {
         }
         let dest_index = match &lease {
             Some(lease) => lease.index(),
-            None => reel.place(band)?,
+            None => reel.least_loaded(),
         };
 
-        // Seal a leftover segment of another tier or band, so the swap draws under this pass's settings
+        // Seal a leftover segment of another tier, so the swap draws under this pass's settings
         if lease.is_some() {
             let class = self.output_class(shared, segment);
             let dest = &reel.tails()[dest_index];
             dest.set_draw_class(class);
-            dest.set_band(band)?;
             let active = dest.tail().active_segment();
             if shared.volumes.class_of(shared.volumes.root_of(active)) != class {
                 dest.seal()?;
@@ -1703,33 +1696,6 @@ fn is_purged(floor: u64, index: &ReelIndex, key: &RecordKey) -> bool {
         Some(mark) => mark < floor,
         None => false,
     }
-}
-
-/// The band a sealed segment was drawn under, read off its own header record
-///
-/// One small read at the head of a pass that is about to read the whole file, so a band
-/// comes from the segment rather than from a table a restart would lose.
-fn band_of(shared: &Arc<ReelShared>, source: &SegmentHandle) -> Result<Option<Band>> {
-    let head = shared.driver.pread(source.file(), 0, HEADER_LEN as u64)?;
-    if head.len() < HEADER_LEN {
-        return Ok(None);
-    }
-    let Ok(header) = RecordHeader::unpack(&head) else {
-        return Ok(None);
-    };
-    if !header.flags.is_segment_header() {
-        return Ok(None);
-    }
-    let payload =
-        shared
-            .driver
-            .pread(source.file(), HEADER_LEN as u64, u64::from(header.length))?;
-    if payload.len() < header.length as usize || !header.verify(&payload) {
-        return Ok(None);
-    }
-    Ok(SegmentHeader::unpack(&payload)
-        .map(|parsed| parsed.band)
-        .unwrap_or_default())
 }
 
 /// A handle on one sealed segment, from the descriptor cache or a fresh open

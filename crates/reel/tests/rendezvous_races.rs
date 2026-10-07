@@ -81,12 +81,13 @@ fn a_delete_in_the_repoint_window_wins() {
     let script = rendezvous::script();
     let store = open("/repoint-race", 41);
     let payload = vec![0x2Du8; 4096];
-    for at in 0..60u64 {
+    // One segment seals and the deletes stay in the tail, so the pass can only take key 5's segment
+    for at in 0..40u64 {
         Store::put(&*store, "rows", &at.to_be_bytes(), &payload).expect("put");
     }
     store.flush().expect("flush");
     // Everything but key 5 dies, so the pass has exactly one live record to copy.
-    for at in (0..60u64).filter(|at| *at != 5) {
+    for at in (0..40u64).filter(|at| *at != 5) {
         Store::delete(&*store, "rows", &at.to_be_bytes()).expect("delete");
     }
 

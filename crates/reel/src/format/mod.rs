@@ -5,10 +5,8 @@
 //! that indexes its live records. Every structure is assembled and parsed by hand
 //! with fixed endianness so the layout is stable across targets.
 
-pub mod band;
 pub mod block;
 pub mod column;
-pub mod fence;
 pub mod filter;
 pub mod footer;
 pub mod journal;

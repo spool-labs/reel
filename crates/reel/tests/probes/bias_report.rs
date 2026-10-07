@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use reel::reel::bias::{access_ranges, MachineFacts, Plane, RingAvailability};
-use reel::{ByteCount, IoBackend, RangedReads, ReelConfig, DEFAULT_FD_CACHE};
+use reel::{ByteCount, IoBackend, ReelConfig, DEFAULT_FD_CACHE};
 
 /// How a floor reads in the report, where absent means the volume maps nothing
 fn floor_label(floor: Option<ByteCount>) -> String {
@@ -121,7 +121,7 @@ pub fn what_this_machine_argues_for() {
     println!("mapping: {}", verdict.map_because);
     println!();
 
-    let rows: [(&str, String, String); 3] = [
+    let rows: [(&str, String, String); 2] = [
         (
             "plane",
             format!("{:?}", configured_plane(config.io_backend)),
@@ -136,11 +136,6 @@ pub fn what_this_machine_argues_for() {
                 true => "refused".to_string(),
                 false => floor_label(verdict.map_above),
             },
-        ),
-        (
-            "ranged reads",
-            format!("{:?}", config.ranged_reads),
-            format!("{:?}", verdict.ranged_reads),
         ),
     ];
 
@@ -195,14 +190,12 @@ pub fn the_rule_is_a_function_of_its_facts() {
     let large = large.verdict();
 
     assert_eq!(small.plane, Plane::Buffered, "half of memory stays warm");
-    assert_eq!(small.ranged_reads, RangedReads::Cached);
     // The disk is 64 times memory, so the set that fits today will not once it fills,
     // and a mapped read there loses cold by up to 9x.
     assert_eq!(small.map_above, None, "a 4 TiB disk was advised a mapping");
     assert!(small.map_because.contains("cold"), "{}", small.map_because);
 
     assert_eq!(large.plane, Plane::Direct, "sixty four times memory cannot");
-    assert_eq!(large.ranged_reads, RangedReads::Direct);
     assert_eq!(large.map_above, None);
 
     // The same rule the other way: a disk memory could hold is advised the floor.
@@ -220,7 +213,7 @@ pub fn the_rule_is_a_function_of_its_facts() {
         "a disk under memory was refused a mapping"
     );
 
-    // 1024 descriptors, halved for headroom, halved again where direct doubles.
+    // 1024 descriptors, halved for headroom on either plane.
     assert_eq!(small.fd_cache, 512, "half of 1024, buffered");
-    assert_eq!(large.fd_cache, 256, "half of 1024, halved again for direct");
+    assert_eq!(large.fd_cache, 512, "half of 1024, direct");
 }

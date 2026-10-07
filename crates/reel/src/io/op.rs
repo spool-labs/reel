@@ -18,22 +18,6 @@ pub struct Tag(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FileId(pub u64);
 
-/// Which plane answers one window of a large record
-///
-/// A descriptor carries O_DIRECT or it does not, so a read that may go around the
-/// page cache names a second descriptor on the same file rather than a flag.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ColdRoute {
-    /// The buffered read the volume has always done
-    Cached,
-
-    /// Ask the page cache first and go around it only when the pages are absent
-    Probed(FileId),
-
-    /// Go around the page cache without asking
-    Direct(FileId),
-}
-
 /// Whether an awaited whole-record read asks the page cache before it queues
 ///
 /// One descriptor either way, so this picks only whether the future's first poll
@@ -279,14 +263,10 @@ impl WriteBuf {
 #[derive(Debug)]
 pub enum Op {
     /// Open or create a segment file, yielding a file handle
-    ///
-    /// A direct descriptor is a second view of a segment a buffered volume
-    /// already has open; a volume that is direct throughout opens that way anyway.
     Open {
         tag: Tag,
         path: PathBuf,
         create: bool,
-        direct: bool,
     },
     /// Append owned buffers at an offset in one vectored write
     Writev {
@@ -301,18 +281,6 @@ pub enum Op {
         file: FileId,
         offset: u64,
         buf: ReadBuf,
-    },
-    /// Read a byte range that may go around the page cache
-    ///
-    /// Both descriptors ride along: the warm probe reads the buffered one and the
-    /// cold read the direct one, and a second flight would double slot traffic.
-    PreadCold {
-        tag: Tag,
-        file: FileId,
-        direct: FileId,
-        offset: u64,
-        buf: ReadBuf,
-        probe: bool,
     },
     /// Read one contiguous range into two buffers, so a framed record splits
     /// into its header and its payload without a copy
@@ -377,7 +345,6 @@ impl Op {
             Op::Open { tag, .. } => *tag,
             Op::Writev { tag, .. } => *tag,
             Op::Pread { tag, .. } => *tag,
-            Op::PreadCold { tag, .. } => *tag,
             Op::PreadSplit { tag, .. } => *tag,
             Op::SyncData { tag, .. } => *tag,
             Op::SyncFull { tag, .. } => *tag,

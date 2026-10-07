@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::config::{RangedReads, DEFAULT_FD_CACHE};
+use crate::config::DEFAULT_FD_CACHE;
 use crate::units::ByteCount;
 
 /// Facts about the machine and the device a volume sits on
@@ -90,9 +90,6 @@ pub struct Verdict {
 
     /// Smallest record a mapping is worth, absent where a mapping is not worth having
     pub map_above: Option<ByteCount>,
-
-    /// The plane a window of a large record is read on, which follows the volume's
-    pub ranged_reads: RangedReads,
 
     /// Sealed descriptors the reader cache may hold under this process's limit
     pub fd_cache: u64,
@@ -182,11 +179,7 @@ impl MachineFacts {
         Verdict {
             plane,
             map_above,
-            ranged_reads: match is_direct {
-                true => RangedReads::Direct,
-                false => RangedReads::Cached,
-            },
-            fd_cache: self.fd_cache_for(is_direct),
+            fd_cache: self.fd_cache_for(),
             because,
             map_because,
         }
@@ -194,17 +187,12 @@ impl MachineFacts {
 
     /// Descriptors the reader cache may hold without crowding the process
     ///
-    /// A direct volume keeps a second descriptor per segment, and half the limit is
-    /// left for tails, sockets and everything else the process opens.
-    fn fd_cache_for(&self, is_direct: bool) -> u64 {
+    /// Half the limit is left for tails, sockets and everything else the process opens.
+    fn fd_cache_for(&self) -> u64 {
         let Some(limit) = self.open_file_limit else {
             return DEFAULT_FD_CACHE;
         };
-        let per_segment = match is_direct {
-            true => 2,
-            false => 1,
-        };
-        DEFAULT_FD_CACHE.min(limit / 2 / per_segment)
+        DEFAULT_FD_CACHE.min(limit / 2)
     }
 
     /// Read what this machine will say, for a volume rooted at this path
@@ -688,7 +676,7 @@ mod tests {
         );
     }
 
-    // the reader cache is sized under the process limit, doubled for direct
+    // the reader cache is sized under half the process limit on either plane
     #[test]
     fn the_fd_cache_fits_under_the_open_file_limit() {
         let tight = MachineFacts {
@@ -703,11 +691,7 @@ mod tests {
             open_file_limit: Some(256),
             ..MachineFacts::default()
         };
-        assert_eq!(
-            direct.verdict().fd_cache,
-            64,
-            "halved again, two per segment"
-        );
+        assert_eq!(direct.verdict().fd_cache, 128, "half the limit, direct");
 
         let roomy = MachineFacts {
             open_file_limit: Some(1_048_576),
@@ -718,26 +702,6 @@ mod tests {
             DEFAULT_FD_CACHE,
             "never above the default"
         );
-    }
-
-    // window reads follow the volume's own plane rather than diverging from it
-    #[test]
-    fn ranged_reads_follow_the_plane() {
-        let direct = MachineFacts {
-            memory_bytes: Some(1),
-            volume_bytes: Some(64),
-            ..MachineFacts::default()
-        }
-        .verdict();
-        let buffered = MachineFacts {
-            memory_bytes: Some(64),
-            volume_bytes: Some(64),
-            ..MachineFacts::default()
-        }
-        .verdict();
-
-        assert_eq!(direct.ranged_reads, RangedReads::Direct);
-        assert_eq!(buffered.ranged_reads, RangedReads::Cached);
     }
 
     // an empty volume is not evidence its set is small

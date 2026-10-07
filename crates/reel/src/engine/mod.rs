@@ -25,7 +25,6 @@ use crate::append::admission::InflightBudget;
 use crate::compaction::compactor::{CompactionCounters, Compactor};
 use crate::config::{ReelConfig, DEFAULT_FD_CACHE};
 use crate::error::{ReelError, Result};
-use crate::format::band::Band;
 use crate::format::column::{spec_by_name, ColumnId, ColumnSet, ColumnSpec, RecordKey};
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::SegmentId;
@@ -298,7 +297,6 @@ impl ReelStore {
                 actuator_spans = ?crate::reel::bias::access_ranges(&root),
                 open_file_limit = ?facts.open_file_limit,
                 ring = ?facts.ring,
-                would_read_windows_on = ?verdict.ranged_reads,
                 would_map_above = ?verdict.map_above,
                 mapping_because = verdict.map_because,
                 would_cache_descriptors = verdict.fd_cache,
@@ -631,28 +629,6 @@ impl ReelStore {
     /// A read of the maintenance counters
     pub fn compaction_counters(&self) -> CompactionCounters {
         self.compactor.counters()
-    }
-
-    /// The band each foreground tail is drawing under right now
-    pub fn tail_bands(&self) -> Vec<Option<Band>> {
-        self.reel.tail_bands()
-    }
-
-    /// Banded writes that found no tail free and went to the unbanded ones instead
-    ///
-    /// A number that keeps climbing says the volume holds more live death windows than
-    /// it has tails, so the placement its keys ask for is not the one they are getting.
-    pub fn band_fallbacks(&self) -> u64 {
-        self.reel.band_fallbacks()
-    }
-
-    /// Whether windows may still be read around the page cache on this volume
-    ///
-    /// A filesystem that serves no direct open retires the route, so this tells a
-    /// route that ran apart from one that retired. One segment refused a descriptor
-    /// of its own does not show here.
-    pub fn cold_direct_live(&self) -> bool {
-        self.reel.shared().cold_direct_live()
     }
 
     /// What each column's keys do to the tree's lead search

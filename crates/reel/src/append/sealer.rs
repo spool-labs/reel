@@ -45,10 +45,7 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
     // are the reopen join's to settle, not the tally's.
     footer.sealed_at = shared.lsn.peek();
     let written = (|| -> Result<()> {
-        let (rows, tail) = footer.pack_apart(
-            shared.config.filter_bits,
-            shared.config.seal_fences(),
-        )?;
+        let (rows, tail) = footer.pack_apart(shared.config.filter_bits)?;
         // The rows go down from the partitions that hold them and come back after.
         let rows: Vec<Arc<Vec<u8>>> = rows.into_iter().map(Arc::new).collect();
         let footer_len = rows.iter().map(|piece| piece.len()).sum::<usize>() + tail.len();

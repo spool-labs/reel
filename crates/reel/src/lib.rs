@@ -27,13 +27,11 @@ pub use compaction::compactor::{CompactionCounters, Compactor, EraseReport};
 pub use compaction::keymerge::MergeReport;
 pub use compaction::pressure::{GcPressure, GcTier, RateLimiter};
 pub use config::{
-    CompactRate, FenceResidency, IoBackend, PointReads, RangedReads, ReelConfig, RepairPath,
-    RingTuning, SyncPolicy, ThreadBudget, VolumeClass, VolumeSpec, DEFAULT_FD_CACHE,
-    MAP_EVERYTHING,
+    CompactRate, IoBackend, PointReads, ReelConfig, RepairPath, RingTuning, SyncPolicy,
+    ThreadBudget, VolumeClass, VolumeSpec, DEFAULT_FD_CACHE, MAP_EVERYTHING,
 };
 pub use engine::{CompactPass, RecordWrite, ReelStore, Totals};
 pub use error::{ReelError, Result};
-pub use format::band::Band;
 pub use format::column::{
     Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyRef, KeyWidth, PurgeMark, RecordKey,
     INLINE_KEY_LEN, MARK_LEN, MAX_KEY_LEN, SHORT_KEY_LEN,

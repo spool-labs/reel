@@ -8,11 +8,12 @@ its walks read in place of the footers they cover. This document says what the
 fields are for, not what the byte offsets are, which `format/` states once and does
 not need restating.
 
-The format version is 6, stamped into every segment header record. A build meeting a
+The format version is 7, stamped into every segment header record. A build meeting a
 version it cannot read refuses the whole file there.
 
-It moved from 5 for keyless records, whose prefix a version 5 build would read as a
-header. A new shape in the segment stream is a version, every time.
+It moved from 6 when the segment header record dropped its band field, and from 5 for
+keyless records, whose prefix a version 5 build would read as a header. A new shape in
+the segment stream is a version, every time.
 
 ## A segment
 
@@ -182,9 +183,9 @@ them from a peer.
 ## The segment header record
 
 Every segment opens with one. Its payload opens with a frozen prefix, a two byte
-format version and a four byte segment number, then the band the tail drew under, a
-layout byte, and the 16-byte secret its keyless records are checked under. It takes
-no sequence number and no key, since nothing resolves it.
+format version and a four byte segment number, then a layout byte and the 16-byte
+secret its keyless records are checked under. It takes no sequence number and no key,
+since nothing resolves it.
 
 Frozen means an older build can read the version and segment number of a file a
 newer build wrote, so a longer payload from a future version parses rather than
@@ -298,9 +299,8 @@ because the page was being fetched anyway.
 
 At 1 KiB records that is 20 bytes per four records instead of 33 per record,
 about 6.6x smaller. At 100 byte metadata records it is closer to 100x. It also
-makes front coding work, makes any fence array tiny, and puts a slot's or a
-group's records physically next to each other so `get_many` merges them into one
-read.
+makes front coding work and puts a slot's or a group's records physically next to
+each other so `get_many` merges them into one read.
 
 The shape is two footer kinds behind the directory, dense for tails and sparse
 for sorted segments, picked by a flag the seal already knows.

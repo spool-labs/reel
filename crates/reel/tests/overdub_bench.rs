@@ -10,8 +10,8 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, FenceResidency,
-    KeyWidth, MergeReport, ProbeCounts, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, KeyWidth,
+    MergeReport, ProbeCounts, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 /// The one column the workload writes
@@ -433,23 +433,11 @@ fn reads_of(
 struct Arm {
     /// What the table calls it
     name: &'static str,
-
-    /// Where the fence over a sealed segment's blocks lives
-    fence: FenceResidency,
 }
 
-const ARMS: [Arm; 2] = [
-    Arm {
-        name: "paged-carrying",
-        fence: FenceResidency::Resident,
-    },
-    Arm {
-        name: "paged",
-        fence: FenceResidency::Off,
-    },
-];
+const ARMS: [Arm; 1] = [Arm { name: "paged" }];
 
-/// The column both flavours declare
+/// The column every cell declares
 const COLUMNS: ColumnSet = &[ColumnSpec {
     id: STATE,
     name: "state",
@@ -459,15 +447,14 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     codec: Codec::None,
 }];
 
-/// What one cell opens its volume with, the flavour being all that differs
-fn config(arm: &Arm, knobs: &Knobs) -> ReelConfig {
+/// What one cell opens its volume with
+fn config(knobs: &Knobs) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(knobs.segment_bytes),
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(knobs.tails),
         // Off, so nothing reads the volume behind the reads being timed.
         scrub_mbps: 0,
-        fence: arm.fence,
         filter_bits: FILTER_BITS,
         footer_cache: ByteCount::from_bytes(knobs.footer_cache_bytes),
         compact_mbps: CompactRate::Mbps(knobs.compact_mbps),
@@ -682,7 +669,7 @@ fn write_round(
 /// Drive the whole workload against one volume and say what it cost
 fn run_cell(arm: &Arm, knobs: &Knobs, root: &Path) -> Cell {
     std::fs::create_dir_all(root).expect("cell root");
-    let store = ReelStore::open(root.to_path_buf(), config(arm, knobs), COLUMNS).expect("open");
+    let store = ReelStore::open(root.to_path_buf(), config(knobs), COLUMNS).expect("open");
 
     let population = Population {
         hot: knobs.hot,

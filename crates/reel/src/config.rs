@@ -232,20 +232,6 @@ pub enum IoBackend {
     UringDirect,
 }
 
-/// How a ranged read of a large record reaches the device
-///
-/// Linux is the only platform where the direct open flag means anything, so off it
-/// every arm is the same buffered read with a wider span.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RangedReads {
-    /// Read the window through the page cache
-    Cached,
-    /// Ask the cache without blocking, and go around it when it cannot answer
-    Probed,
-    /// Go around the cache without asking
-    Direct,
-}
-
 /// How an awaited whole-record read reaches its bytes
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PointReads {
@@ -253,23 +239,6 @@ pub enum PointReads {
     Queued,
     /// Ask the cache without blocking, and queue only the reads it cannot answer
     Probed,
-}
-
-/// Where a sealed segment's fence over its blocks lives, off unless asked for
-///
-/// A fence is one lead per block of a partition's rows. Without it a blocked search
-/// pays a block read per halving; with it the halvings happen over the leads and the
-/// search reads one block.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FenceResidency {
-    /// No fence: a search binary searches the blocks themselves
-    Off,
-
-    /// Every lead in memory, so a search reads one block and nothing else
-    Resident,
-
-    /// The sampled level in memory, so a search reads one page of leads and one block
-    Paged,
 }
 
 /// Where a record that fails its checksum can be fetched again from.
@@ -308,9 +277,6 @@ pub struct ReelConfig {
     /// Smallest record served from a read-only mapping of its segment file, unset maps nothing
     pub map_above: Option<ByteCount>,
 
-    /// Which plane a window of a large record is read on
-    pub ranged_reads: RangedReads,
-
     /// Whether an awaited whole-record read asks the page cache before it queues
     pub point_reads: PointReads,
 
@@ -328,9 +294,6 @@ pub struct ReelConfig {
 
     /// Bits per key a seal spends on each column's filter, zero for no filter
     pub filter_bits: u8,
-
-    /// Where a sealed segment's fence over its blocks lives, off unless asked for
-    pub fence: FenceResidency,
 
     /// Bytes of sealed-footer state the volume keeps at once
     pub footer_cache: ByteCount,
@@ -350,7 +313,7 @@ impl ReelConfig {
 
     /// Whether reads into an open tail go through its mapping, whatever `map_above` says
     pub fn maps_tails(&self) -> bool {
-        self.io_backend != IoBackend::UringDirect && self.ranged_reads == RangedReads::Cached
+        self.io_backend != IoBackend::UringDirect
     }
 }
 
@@ -365,7 +328,6 @@ impl Default for ReelConfig {
             verify_reads: false,
             repair: RepairPath::Peers,
             map_above: None,
-            ranged_reads: RangedReads::Cached,
             point_reads: PointReads::Queued,
             footer_cache: ByteCount::mb(DEFAULT_FOOTER_CACHE_MIB),
             active_tails: ThreadBudget::Auto,
@@ -373,7 +335,6 @@ impl Default for ReelConfig {
             io_backend: IoBackend::default(),
             uring: RingTuning::default(),
             filter_bits: DEFAULT_FILTER_BITS,
-            fence: FenceResidency::Off,
         }
     }
 }
@@ -396,11 +357,6 @@ impl ReelConfig {
     pub fn compact_passes(&self) -> usize {
         // One bit in a word leases each reserved tail, which caps the passes at the word's width
         self.tail_count().div_ceil(2).min(64)
-    }
-
-    /// Whether this volume's seals write a fence over each partition's blocks
-    pub fn seal_fences(&self) -> bool {
-        self.fence != FenceResidency::Off
     }
 
     /// Reject settings the on-disk types or the engine cannot represent
@@ -435,24 +391,6 @@ impl ReelConfig {
             return Err(ReelError::Config(
                 "map_above and a direct volume contradict each other: a mapping reads the page cache a direct volume bypasses".to_string(),
             ));
-        }
-
-        if self.ranged_reads != RangedReads::Cached {
-            if self.io_backend == IoBackend::UringDirect {
-                return Err(ReelError::Config(
-                    "ranged_reads and a direct volume contradict each other: a direct volume already reads around the page cache everywhere".to_string(),
-                ));
-            }
-            if self.io_backend == IoBackend::Uring {
-                return Err(ReelError::Config(
-                    "ranged_reads needs the posix backend: a driver has one backend, and a buffered ring serves the read itself, so the direct descriptor would name a file the reader never consults".to_string(),
-                ));
-            }
-            if self.map_above.is_some() {
-                return Err(ReelError::Config(
-                    "ranged_reads and map_above contradict each other: the mapping answers the window before the route is reached".to_string(),
-                ));
-            }
         }
 
         // map_above is not refused here: the mapping serves the blocking door and

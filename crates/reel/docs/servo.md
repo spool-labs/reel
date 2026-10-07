@@ -30,14 +30,6 @@ Some knobs are fixed the moment a file is opened. `O_DIRECT` is the strict case:
 whether the page cache stands behind a descriptor is a property of the file, not
 of the caller. Nothing at runtime can change it without reopening the volume.
 
-What can move per call is which descriptor a read names, and that is the seam
-`ranged_reads` uses: a routed segment holds two descriptors on the same file, one
-buffered and one direct, so a cold window picks a plane per read while neither
-descriptor's own flag ever changes. The binding time is unmoved, and the cost is
-a second descriptor per segment the route touches rather than a reopen. It is not
-a general escape from this section: two descriptors are worth it where the read
-shape is narrow and the win is large, which so far is one of them.
-
 Other knobs are free to move per call. Which submitter takes an op, how deep a
 batch is drained, and whether a waiter spins or sleeps are all per-job choices.
 
@@ -253,7 +245,7 @@ runs a factless bias pass in silence. Confirmed in a Linux VM whose root is
 btrfs and whose host passthrough is virtiofs, where a loop-mounted ext4 on the
 same kernel read its facts normally.
 
-The pass reaches four choices, and their rules are one line each. It logs them and
+The pass reaches three choices, and their rules are one line each. It logs them and
 applies none, and `fd_cache` is no longer a knob at all, so that row is a fact about
 the machine rather than an opinion about a config:
 
@@ -261,8 +253,7 @@ the machine rather than an opinion about a config:
 |---|---|
 | plane | direct once the volume *holds* `DIRECT_AT_OCCUPANCY_RATIO` times memory |
 | `map_above` | sixteen times the device's readahead, but only where the *filesystem* is within `DIRECT_AT_OCCUPANCY_RATIO` of memory; absent otherwise |
-| `ranged_reads` | follows the plane, so windows are read the way the volume is |
-| `fd_cache` | under half of `RLIMIT_NOFILE`, halved again under direct |
+| `fd_cache` | under half of `RLIMIT_NOFILE` |
 
 **The mapping rule turns on capacity where the plane rule turns on occupancy, and
 that asymmetry is deliberate.** A mapped point read wins warm p50 by 13 to 25
@@ -389,23 +380,12 @@ oscillates or lies. The first is built; the second has not earned its place.
    finds are only worth anything once it has run somewhere other than a
    developer's laptop.
 
-   **Steer the one knob that binds per read.** Built, out of order
-   because it needed no loop and no new binding time. A 129-row backend sweep
-   measured the plane on cold reads directly and found direct winning in exactly
-   one cell of the matrix, a megabyte record read eight ways, by 5 percent. It
-   loses everywhere else: 2x at a megabyte read by one reader, 1.2x at 64 KiB
-   read eight ways, 73x at 4 KiB read by one, 123x at a hundred bytes. So
-   `window_route` now asks two questions rather than one. `DIRECT_RECORD_FLOOR`
-   rose from 64 KiB to a megabyte, since 64 KiB was margin against page sharing
-   rather than a measured throughput bar, and a `DIRECT_DEPTH_FLOOR` of two
-   in-flight cold reads was added beside it, because size alone would have sent
-   the lone reader of a large record to the plane it loses 2x on. Both floors err
-   toward the page cache.
-
-   This is the one place read pressure can be answered while a volume runs. It is
-   not the servo loop: there is no bucket, no weighting and no hysteresis, only a
-   counter read at route time. It earns its place because a window picks its
-   descriptor per read, so the answer can change without a reopen.
+   **Steer the one knob that binds per read.** Built and removed. A 129-row
+   backend sweep measured the plane on cold reads and found direct ahead in one
+   cell of the matrix, a megabyte record read eight ways, by 5 percent. It lost
+   everywhere else: 2x at a megabyte read by one reader, 1.2x at 64 KiB read eight
+   ways, 73x at 4 KiB read by one, 123x at a hundred bytes. Every window now reads
+   through the page cache.
 2. **Act at open.** The verdict selects the backend. **Built and reverted, and
    the reason is a hole in the rule rather than in the wiring.** The plane turns
    on `occupied_over_memory()` alone and never reads `is_rotational`, which the
@@ -418,8 +398,7 @@ oscillates or lies. The first is built; the second has not earned its place.
    That is the wrong direction on that hardware, and the numbers behind the rule
    never covered it: every cell that priced direct against buffered ran on NVMe,
    and even there direct lost 2x at a megabyte to one reader, 73x at 4 KiB and
-   123x at a hundred bytes, which is why the per-read floors exist and why both
-   err toward the page cache. Declining the page cache on a spindle costs a seek
+   123x at a hundred bytes. Declining the page cache on a spindle costs a seek
    and a rotation per read and gives up write coalescing on the way in.
 
    Before this is built again it wants `is_rotational` in the rule at minimum,

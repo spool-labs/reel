@@ -424,7 +424,6 @@ fn is_dir_op(op: &Op) -> bool {
         Op::Open { .. }
         | Op::Writev { .. }
         | Op::Pread { .. }
-        | Op::PreadCold { .. }
         | Op::PreadSplit { .. }
         | Op::SyncData { .. }
         | Op::SyncFull { .. }
@@ -476,9 +475,7 @@ fn execute_op(state: &mut SimState, op: Op, position: u64) -> Completion {
         state.faults_fired += 1;
     }
     match op {
-        Op::Open {
-            tag, path, create, ..
-        } => {
+        Op::Open { tag, path, create } => {
             let outcome = if create || state.files.contains_key(&path) {
                 state
                     .files
@@ -507,23 +504,6 @@ fn execute_op(state: &mut SimState, op: Op, position: u64) -> Completion {
             file,
             offset,
             mut buf,
-        } => {
-            let result = match fault {
-                Some(FaultKind::ReadError) => Err(input_output()),
-                _ => read_into(state, file, offset, &mut buf),
-            };
-            Completion {
-                tag,
-                outcome: Outcome::Read { result, buf },
-            }
-        }
-        // The image is in memory, so the buffered descriptor is the only one.
-        Op::PreadCold {
-            tag,
-            file,
-            offset,
-            mut buf,
-            ..
         } => {
             let result = match fault {
                 Some(FaultKind::ReadError) => Err(input_output()),
@@ -1132,7 +1112,6 @@ mod tests {
             tag: Tag(1),
             path: path.to_path_buf(),
             create,
-            direct: false,
         }])
         .expect("submit open");
         let file = opened(one(io).outcome).expect("open result");

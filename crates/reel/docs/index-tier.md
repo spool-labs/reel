@@ -20,13 +20,10 @@ what a lookup walks when the spot index cannot settle it, and what each step tak
     | candidates
   per-segment filter      candidates the bloom rules out
     | survivors
-  directory, then a block of rows       one block read per survivor
+  directory, then blocks of rows        a block per halving
     | rows
   the newest row wins     a segment number is not a version
 ```
-
-A fence, where one is armed, replaces the halvings inside a partition with a scan
-over leads, so a search reads one block rather than one per halving.
 
 ## What the index has to get right
 

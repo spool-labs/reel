@@ -6,9 +6,6 @@
 //! to copy its live records out, so a descriptor never released keeps the extents
 //! after the file leaves the directory. The same seam bounds the handle cache: its
 //! capacity means nothing unless evicting a handle closes the file behind it.
-//!
-//! Set REEL_DIRECT_REQUIRED to refuse a run where no direct plane is live rather
-//! than skipping the half that needs one.
 
 use std::sync::Arc;
 
@@ -16,8 +13,8 @@ use tempfile::TempDir;
 
 use reel::io::posix_backend::PosixBackend;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RangedReads, RecordKey,
-    ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelConfig,
+    ReelStore, SyncPolicy, ThreadBudget,
 };
 
 /// Bytes the group takes at the front of a record key
@@ -141,118 +138,6 @@ fn descriptors_stay_under_the_cache_bound() {
     assert!(
         held <= ceiling,
         "the volume holds {held} descriptors, above the cache bound plus one active tail per group ({ceiling})"
-    );
-}
-
-/// Payload wide enough that a window into it is routed around the page cache
-///
-/// Below the one megabyte floor a window keeps the page cache whatever the knob asks.
-const ROUTED_PAYLOAD: usize = 2 * 1024 * 1024;
-
-/// Records written per group for the routed fixture, enough to roll several segments
-const ROUTED_KEYS: u64 = 24;
-
-/// Readers driving the routed windows at once
-///
-/// The route needs concurrent cold reads, since the direct plane loses to a lone
-/// reader at every record size.
-const ROUTED_READERS: usize = 3;
-
-fn routed_config() -> ReelConfig {
-    ReelConfig {
-        segment_bytes: ByteCount::mb(16),
-        sync: SyncPolicy::Never,
-        // Exact counts, which is the only cadence the plane counters mean anything at
-        active_tails: ThreadBudget::threads(1),
-        ranged_reads: RangedReads::Direct,
-        ..ReelConfig::default()
-    }
-}
-
-// a routed volume holds two descriptors per segment and gives both of them back
-#[test]
-fn direct_windows_double_the_descriptors() {
-    let dir = TempDir::new().expect("tempdir");
-    prepare(dir.path());
-    let backend = Arc::new(PosixBackend::new());
-    let store = ReelStore::open_with_io(
-        dir.path().to_path_buf(),
-        routed_config(),
-        COLUMNS,
-        backend.clone(),
-    )
-    .expect("open");
-
-    let body = vec![0xa5u8; ROUTED_PAYLOAD];
-    for group in GROUPS {
-        for index in 0..ROUTED_KEYS {
-            store
-                .put_owned(&record_key(*group, id(index)), body.clone())
-                .expect("put");
-        }
-    }
-    store.flush().expect("flush");
-
-    // A window from every key asks every sealed segment for a second descriptor and
-    // then evicts the handles that hold them. Driven from several threads, since the
-    // route reads the cold depth it arrived into.
-    std::thread::scope(|scope| {
-        for reader in 0..ROUTED_READERS {
-            let store = &store;
-            scope.spawn(move || {
-                // Readers start on different groups so they overlap without queueing
-                // on one segment.
-                for turn in 0..GROUPS.len() {
-                    let group = GROUPS[(reader + turn) % GROUPS.len()];
-                    for index in 0..ROUTED_KEYS {
-                        store
-                            .get_range(&record_key(group, id(index)), 40_000, 4_000)
-                            .expect("range");
-                    }
-                }
-            });
-        }
-    });
-
-    // The flag only knows one of the two ways there is no plane to count: a refused
-    // direct open retires the route, but a platform without the open flag never
-    // attempts one, so the flag stays true over a plane that was compiled out.
-    if !cfg!(target_os = "linux") || !store.cold_direct_live() {
-        assert!(
-            std::env::var_os("REEL_DIRECT_REQUIRED").is_none(),
-            "there is no cold read plane here and REEL_DIRECT_REQUIRED is set",
-        );
-        println!(
-            "skipped: no direct open on this platform or filesystem, so the cold plane is not live"
-        );
-        return;
-    }
-    let routed = backend.cold_reads();
-    // A live plane is not a reachable one: without cache eviction every read
-    // stays warm and routes buffered, so there is nothing to count on a
-    // machine whose page cache cannot be dropped.
-    if routed.direct == 0 && std::env::var_os("REEL_DIRECT_REQUIRED").is_none() {
-        println!("skipped: the plane is live but every read stayed warm, so nothing went direct");
-        return;
-    }
-    assert!(
-        routed.direct > 0,
-        "no window reached the direct plane, so nothing is proven"
-    );
-
-    let held = backend.open_file_count();
-    let tails = GROUPS.len();
-    let ceiling = 2 * FD_CACHE as usize + tails + GROUPS.len();
-    assert!(
-        held <= ceiling,
-        "the volume holds {held} descriptors, above twice the cache bound plus a tail per group ({ceiling})"
-    );
-
-    drop(store);
-    assert_eq!(
-        backend.open_file_count(),
-        0,
-        "a dropped volume left descriptors open, so a direct one is never closed"
     );
 }
 

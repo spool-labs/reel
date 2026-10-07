@@ -276,13 +276,12 @@ impl ReelStore {
     /// Move the floor everything below which the volume is finished with
     ///
     /// A column that marks its keys has its records dropped by compaction once their
-    /// mark falls below this, and its writes banded against it where it asked for that.
-    /// A floor only ever moves up.
+    /// mark falls below this. A floor only ever moves up.
     pub fn purge_below(&self, floor: u64) {
         self.reel.shared().purge_below(floor);
     }
 
-    /// The floor compaction drops records below, and bands are measured from
+    /// The floor compaction drops records below
     pub fn purge_floor(&self) -> u64 {
         self.reel.shared().purge_floor()
     }

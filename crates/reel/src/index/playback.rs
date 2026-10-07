@@ -414,52 +414,62 @@ impl Sealed {
         }
     }
 
-    /// Step every cursor past a key and return its newest row, under a ceiling when one is given
+    /// Step every cursor past a key and return its newest row
     fn newest(
         &mut self,
         way: Way,
         key: &[u8],
-        below: Option<Lsn>,
         stands: impl Fn(SegmentId) -> bool,
     ) -> Result<Option<(SegmentId, FooterRow)>> {
         let mut newest: Option<(SegmentId, FooterRow)> = None;
-        while let Some(at) = self.front_on(key) {
-            let (segment, found) = match self.run(at) {
-                Run::Footer {
-                    segment,
-                    footer,
-                    partition,
-                    ..
-                } => (
-                    *segment,
-                    footer.partitions[*partition].row_at(self.heads[at].last)?,
-                ),
-                Run::Keys { run, column } => {
-                    let column = &run.columns()[*column];
-                    let (_, row) = row_in(run.rows(column), column, self.heads[at].last)?;
-                    (
-                        row.loc.segment,
-                        FooterRow {
-                            lsn: row.lsn,
-                            offset: row.loc.offset,
-                            len: row.loc.len,
-                            flags: row.flags,
-                        },
-                    )
-                }
-            };
-            self.step(way, at);
-            let is_under = below.is_none_or(|below| found.lsn < below);
+        self.each_row(way, key, |segment, found| {
             // A rewrite keeps its record's number, so on a tie the row in a standing segment wins
             let is_newer = newest.as_ref().is_none_or(|(held, newest)| {
                 newest.lsn < found.lsn
                     || (newest.lsn == found.lsn && !stands(*held) && stands(segment))
             });
-            if is_under && is_newer {
+            if is_newer {
                 newest = Some((segment, found));
             }
-        }
+        })?;
         Ok(newest)
+    }
+
+    /// Step every cursor past a key, handing each of its rows over with the segment its record is in
+    fn each_row(
+        &mut self,
+        way: Way,
+        key: &[u8],
+        mut each: impl FnMut(SegmentId, FooterRow),
+    ) -> Result<()> {
+        while let Some(at) = self.front_on(key) {
+            let head = self.heads[at];
+            match self.run(at) {
+                Run::Footer {
+                    segment,
+                    footer,
+                    partition,
+                    ..
+                } => {
+                    for row in head.first..=head.last {
+                        each(*segment, footer.partitions[*partition].row_at(row)?);
+                    }
+                }
+                Run::Keys { run, column } => {
+                    let column = &run.columns()[*column];
+                    let (_, row) = row_in(run.rows(column), column, head.last)?;
+                    let found = FooterRow {
+                        lsn: row.lsn,
+                        offset: row.loc.offset,
+                        len: row.loc.len,
+                        flags: row.flags,
+                    };
+                    each(row.loc.segment, found);
+                }
+            }
+            self.step(way, at);
+        }
+        Ok(())
     }
 
     /// Move the front cursor off its key and play it up the tree
@@ -773,7 +783,7 @@ pub fn merged_page(
         }
         // The page is read under the publish barrier, so a key missing from it is not in the map
         let Some((segment, found)) =
-            sealed.newest(way, key, None, |segment| paged.sealed.holds(segment))?
+            sealed.newest(way, key, |segment| paged.sealed.holds(segment))?
         else {
             continue;
         };
@@ -823,12 +833,7 @@ pub struct ReleaseRun {
     pub examined: usize,
 }
 
-/// The footer rows a standing cover has taken, newest below the cover per key
-///
-/// Per key, the newest row below the cover is the one still booked live: rows under
-/// it were settled by whichever overwrite shadowed them, and a row at or past the
-/// cover was written after the delete. Bounded by keys examined rather than rows
-/// kept, so a run of skips still moves the cursor.
+/// Every standing data row a cover has taken, the budget counting keys examined so a run of skips still moves
 pub fn release_rows(
     paged: &Paged<'_>,
     playback: &mut PlaybackCursor,
@@ -837,7 +842,6 @@ pub fn release_rows(
     limit: usize,
     out: &mut Vec<(KeyBytes, Loc)>,
 ) -> Result<ReleaseRun> {
-    let index = paged.index;
     out.clear();
     if playback.is_done() {
         return Ok(ReleaseRun {
@@ -867,26 +871,12 @@ pub fn release_rows(
         }
         examined += 1;
         last_len = key.len();
-
-        let Some((segment, found)) =
-            sealed.newest(way, key, Some(below), |segment| paged.sealed.holds(segment))?
-        else {
-            continue;
-        };
-        if found.is_tombstone() || found.is_range_tombstone() {
-            continue;
-        }
-        match index.entry_or_grave(key) {
-            Some(entry) if entry.lsn < below => continue,
-            _ => {}
-        }
-        if index.covered_by_swept(key, found.lsn) {
-            continue;
-        }
-        out.push((
-            KeyBytes::new(key)?,
-            Loc::new(segment, found.offset, found.len),
-        ));
+        let taken = KeyBytes::new(key)?;
+        sealed.each_row(way, key, |segment, found| {
+            if found.lsn < below && found.flags.is_data() && paged.sealed.holds(segment) {
+                out.push((taken.clone(), Loc::new(segment, found.offset, found.len)));
+            }
+        })?;
     }
 
     // The next run starts at the key straight after the last one examined, and

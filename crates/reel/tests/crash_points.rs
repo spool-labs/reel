@@ -25,9 +25,7 @@ use reel_mock::MemoryStore;
 
 use harness::observe::observe;
 use harness::op_stream::{self, StreamOp};
-use harness::reel_harness::{
-    assert_recount, counter_totals, flip_largest_segment, scan_totals, ReelHarness,
-};
+use harness::reel_harness::{assert_recount, flip_largest_segment, ReelHarness};
 use harness::wire::{
     apply_mutation, framed_value, group_prefix, wire_key, RECORDS, RECORDS_CF, RECORD_KEY_LEN,
     TEST_COLUMNS,
@@ -393,14 +391,7 @@ fn every_boundary_spot_index_answers_as_the_footers() {
     for crash_at in 0..total {
         let (sim, _) = harness.run(FaultPlan::new(1).with_crash(crash_at), &ops);
         let reopened = harness.reopen(sim.durable_image());
-        // A paged open counts no sealed segment, so while one stands the counters are a floor
-        match reopened.born_segments() {
-            0 => assert_recount(&reopened, crash_at),
-            _ => assert!(
-                counter_totals(&reopened).count <= scan_totals(&reopened).count,
-                "the counters overcounted under born segments at {crash_at}"
-            ),
-        }
+        assert_recount(&reopened, crash_at);
         loaded = loaded.max(reopened.index().spot_held());
         // A read as of a cue takes the footer search, the answer to match
         let cue = reopened.cue().expect("cue");

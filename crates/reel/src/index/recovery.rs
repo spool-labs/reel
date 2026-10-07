@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Condvar, Mutex};
 
@@ -53,6 +54,9 @@ const LOADERS: usize = 8;
 
 /// A column's feed splits across threads once its window holds this many rows
 const SPLIT_FEED_ROWS: usize = 4 * BATCH;
+
+/// A loader takes a key run's rows this many at a time
+const RUN_STRETCH: u64 = 1 << 16;
 
 /// What a reel rebuild hands back beside the index it filled
 pub struct RebuiltReel {
@@ -251,6 +255,9 @@ pub fn rebuild_from_persisted(
         read
     })?;
     feed_held(&mut held, &mut resolver, &mut resumable)?;
+    if pages {
+        load_key_runs(index, &sealed_files)?;
+    }
     // A file that goes bad partway through its rows starts the rebuild over without it.
     if let Some(reader) = persisted {
         if let Err(error) = adopt(driver, reader, &standing, &mut resolver) {
@@ -307,6 +314,47 @@ fn adopt(
     })();
     reader.close(driver)?;
     read
+}
+
+/// Take the key runs' rows into the spot index on the loaders, a stretch of rows at a time
+fn load_key_runs(index: &ReelIndex, sealed: &[(SegmentId, PathBuf, u64)]) -> Result<()> {
+    let runs = index.key_runs().runs();
+    if runs.is_empty() {
+        return Ok(());
+    }
+    let standing: HashSet<SegmentId> = sealed.iter().map(|(segment, _, _)| *segment).collect();
+    let mut stretches = Vec::new();
+    for run in &runs {
+        for column in run.columns() {
+            let mut first = 0;
+            while first < column.rows() {
+                let end = (first + RUN_STRETCH).min(column.rows());
+                stretches.push((run, column, first..end));
+                first = end;
+            }
+        }
+    }
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| -> Result<()> {
+        let loading: Vec<_> = (0..LOADERS)
+            .map(|_| {
+                scope.spawn(|| -> Result<()> {
+                    while let Some((run, column, rows)) =
+                        stretches.get(next.fetch_add(1, Ordering::Relaxed))
+                    {
+                        index.take_run_rows(run, column, rows.clone(), &standing)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for loader in loading {
+            loader
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+        }
+        Ok(())
+    })
 }
 
 /// Take sealed footers off the queue into the spot index until it closes, even after a failed load
@@ -975,6 +1023,8 @@ fn prune_walked_shadowed(
     // The newest sealed data row each walked entry shadows, across every footer
     // that holds its key, booked once the prune has said the entry survives.
     let mut debits: HashMap<ColumnId, HashMap<usize, (SegmentId, Lsn, u64)>> = HashMap::new();
+    // Each walked key's sealed data rows, one of which the spot index load may hold live
+    let mut older: HashMap<ColumnId, Vec<(usize, Loc)>> = HashMap::new();
     for (segment, path, len) in sealed_files {
         let Some(columns) = probe.get(segment) else {
             continue;
@@ -1007,6 +1057,10 @@ fn prune_walked_shadowed(
                         continue;
                     }
                     let row = partition.row_at(found)?;
+                    if row.flags.is_data() {
+                        let loc = Loc::new(*segment, row.offset, row.len);
+                        older.entry(partition.column).or_default().push((at, loc));
+                    }
                     if row.lsn > entry.lsn {
                         marks.push(at);
                     } else if row.lsn < entry.lsn
@@ -1033,6 +1087,21 @@ fn prune_walked_shadowed(
         })();
         driver.close(file)?;
         outcome?;
+    }
+
+    // A surviving walked entry outversions every sealed row of its key, so none of them stays counted
+    for (column, walked) in older {
+        let pruned: HashSet<usize> = shadowed
+            .get(&column)
+            .map(|marks| marks.iter().copied().collect())
+            .unwrap_or_default();
+        let rows = &suspects[&column];
+        let gone: Vec<(KeyBytes, Loc)> = walked
+            .into_iter()
+            .filter(|(at, _)| !pruned.contains(at))
+            .map(|(at, loc)| (rows[at].0.clone(), loc))
+            .collect();
+        index.shadow_sealed(column, gone);
     }
 
     // A walked entry the prune drops lost to a sealed row, so that row is live
@@ -1092,8 +1161,7 @@ fn belongs_here(driver: &IoDriver, file: FileId, segment: SegmentId) -> Result<b
 /// The keys stay in the footer, so what a rebuild installs is the span, the oldest
 /// record the segment could still surface, and the range tombstones, whose ends live
 /// in payloads. The live and dead split comes from the tally written at the seal, and
-/// the scrub settles shadowing after it. Live key counts are left alone, since a key
-/// rewritten into several segments appears in several footers.
+/// the scrub settles shadowing after it.
 fn sweep_footer(
     segment: SegmentId,
     footer: &SegmentFooter,

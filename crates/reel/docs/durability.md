@@ -212,11 +212,11 @@ and the paths it quarantined. The sequence counter and the segment
 numbering are both raised above what was found, so lost unsynced numbers are
 harmlessly reissued.
 
-**Range covers are reinstalled unswept.** A resident rebuild resolved every
-record against them already, so the sweep finds nothing; a paged rebuild sets
-its paged count to zero, so the release pass declines everything. Either way
-the re-run is a cheap no-op, which is what makes a crash at any point of the
-cover sweep safe. `cue-points.md` carries the sweep itself.
+**Range covers are reinstalled unswept and swept before the open returns.** A
+resident rebuild resolved every record against them already, so the sweep finds
+nothing, and a paged one releases each covered record its load counted. A record
+counts once whichever pass releases it, which is what makes a crash at any point
+of the cover sweep safe. `cue-points.md` describes the sweep itself.
 
 ## Quarantine, never truncate
 

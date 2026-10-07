@@ -6,7 +6,7 @@
 //! rather than in a hashed map: a booking is a subtraction and an array index, and the
 //! window slides as the oldest segments retire.
 
-use crate::sync::checked::{AtomicBool, AtomicU32, AtomicU64, Ordering, RwLock};
+use crate::sync::checked::{AtomicU32, AtomicU64, Ordering, RwLock};
 use std::collections::{HashMap, VecDeque};
 
 use crate::format::loc::{SegmentId, SegmentIncarnation};
@@ -133,11 +133,8 @@ const MAX_WINDOW: u64 = 1 << 20;
 /// The row is counted: it holds bytes, ranks, and answers for its floor
 const PRESENT: u32 = 1;
 
-/// The segment was sealed before any counter saw its keys
-const BORN: u32 = 2;
-
 /// The segment retired, so every booking against it is dropped and counted
-const RETIRED: u32 = 4;
+const RETIRED: u32 = 2;
 
 /// One segment's counters, moved by whichever writer's key points into it
 ///
@@ -168,7 +165,7 @@ struct SegmentRow {
     /// The life this segment is on, or the reserved zero for none issued
     incarnation: AtomicU32,
 
-    /// Present, born and retired together, so one load answers all three
+    /// Present and retired together, so one load answers both
     flags: AtomicU32,
 }
 
@@ -307,9 +304,6 @@ struct Window {
 
     /// Rows carrying the present bit, so a count is not a walk
     present: usize,
-
-    /// Rows carrying the born bit
-    born: usize,
 }
 
 impl Window {
@@ -389,34 +383,18 @@ impl Window {
         self.row(segment)
     }
 
-    /// Mark a row born, opening it without putting it on the count
-    ///
-    /// A born segment holds no bytes any counter saw, so it ranks nothing and the
-    /// present bit stays clear until a booking gives it something to rank.
-    fn open_born(&mut self, segment: SegmentId) -> bool {
-        let fresh = match self.open(segment) {
-            Some(row) => row.flags.fetch_or(BORN, Ordering::AcqRel) & BORN == 0,
-            None => return false,
-        };
-        if fresh {
-            self.born += 1;
-        }
-        true
-    }
-
     /// Clear a retired segment's row and give back the chunks behind it
     ///
     /// A number the table never knew is left alone, since nothing stood there.
     fn retire(&mut self, segment: SegmentId) {
         let cleared = self.row(segment).filter(|row| row.is_known()).map(|row| {
-            let was = row.flags();
+            let was_present = row.is_present();
             row.blank();
             row.raise(RETIRED);
-            (was & PRESENT != 0, was & BORN != 0)
+            was_present
         });
-        if let Some((was_present, was_born)) = cleared {
+        if let Some(was_present) = cleared {
             self.present -= usize::from(was_present);
-            self.born -= usize::from(was_born);
         }
         if self.present == 0 {
             self.reach = self.base;
@@ -472,7 +450,6 @@ impl Window {
         self.gone = 0;
         self.reach = 0;
         self.present = 0;
-        self.born = 0;
     }
 }
 
@@ -481,9 +458,6 @@ impl Window {
 pub struct SegmentTable {
     /// The rows themselves, a window over the numbers this volume has issued
     window: RwLock<Window>,
-
-    /// Whether any segment carries the born bit, so an unborn volume pays one load
-    has_born: AtomicBool,
 
     /// Issues incarnations, starting past the reserved none
     next_incarnation: AtomicU32,
@@ -736,55 +710,22 @@ impl SegmentTable {
     pub fn forget(&self, segment: SegmentId) {
         // The counters and the incarnation go together, so the table is never read as
         // uncounted while the stamp it hands out is still current.
-        let mut window = write(&self.window);
-        window.retire(segment);
-        if window.born == 0 {
-            self.has_born.store(false, Ordering::Relaxed);
-        }
+        write(&self.window).retire(segment);
     }
 
-    /// Mark the segments a rebuild left sealed, whose keys no counter holds
-    ///
-    /// A born segment is on the volume, so it wears an incarnation from here: its
-    /// keys resolve through footers, and those entries are stamped with it.
-    pub fn mark_born(&self, segments: impl IntoIterator<Item = SegmentId>) {
+    /// Give each segment a rebuild left sealed the incarnation its footer entries are stamped with
+    pub fn issue_incarnations(&self, segments: impl IntoIterator<Item = SegmentId>) {
         let mut window = write(&self.window);
         for segment in segments {
-            if !window.open_born(segment) {
+            let Some(row) = window.open(segment) else {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
-            }
-            let issued = self.issue_incarnation();
-            if let Some(row) = window.row(segment) {
-                let _ = row.incarnation.compare_exchange(
-                    0,
-                    issued.0,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                );
+            };
+            if row.incarnation.load(Ordering::Acquire) == 0 {
+                let issued = self.issue_incarnation();
+                row.incarnation.store(issued.0, Ordering::Release);
             }
         }
-        if window.born > 0 {
-            self.has_born.store(true, Ordering::Relaxed);
-        }
-    }
-
-    /// Whether this segment's keys were sealed away before any counter saw them
-    pub fn is_born(&self, segment: SegmentId) -> bool {
-        if !self.has_born.load(Ordering::Relaxed) {
-            return false;
-        }
-        read(&self.window)
-            .row(segment)
-            .is_some_and(|row| row.flags() & BORN != 0)
-    }
-
-    /// Segments still standing whose keys the counters exclude
-    pub fn born_count(&self) -> usize {
-        if !self.has_born.load(Ordering::Relaxed) {
-            return 0;
-        }
-        read(&self.window).born
     }
 
     /// Segments the table is counting
@@ -800,7 +741,6 @@ impl SegmentTable {
     /// Drop every row, for a reel that is going away
     pub fn clear(&self) {
         write(&self.window).clear();
-        self.has_born.store(false, Ordering::Relaxed);
     }
 
     /// Run something against a segment's row, opening one the first time it is touched

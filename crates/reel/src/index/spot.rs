@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard}
 
 use reel_core::Value;
 
-use crate::error::Result;
+use crate::error::{ReelError, Result};
 use crate::format::column::{ColumnId, KeyRef, RecordKey};
 use crate::format::footer::{FooterFind, FooterPartition};
 use crate::format::loc::{Loc, SegmentId};
@@ -144,6 +144,34 @@ pub enum SpotRead {
     /// The checked read has to settle the record, as when it fails its checksum
     Unsure,
 }
+
+/// One sealed row an open takes into the spot index
+pub struct Taken<'a> {
+    /// The row's key
+    pub key: &'a [u8],
+
+    /// Where its record is
+    pub loc: Loc,
+
+    /// The version it holds
+    pub lsn: Lsn,
+
+    /// Whether it is a point tombstone
+    pub is_tombstone: bool,
+}
+
+/// What one load step did to a key's counted version, as payload lengths
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Booking {
+    /// The record whose slot went, nothing for a tombstone or no slot
+    pub gone: Option<u32>,
+
+    /// The record whose slot came in, nothing for a tombstone or no slot
+    pub came: Option<u32>,
+}
+
+/// Set-aside rows a footer could not settle, and what each of the rest booked
+type Settling = (Vec<usize>, Vec<(usize, Booking)>);
 
 /// What an overwrite settled: records it booked dead, and class bookings it corrected
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -982,57 +1010,95 @@ impl SpotColumn {
         }
     }
 
-    /// Take a sealed footer partition's rows during an open, setting aside each row that meets a slot
-    pub fn take_partition(&self, segment: SegmentId, partition: &FooterPartition) -> Result<()> {
-        let mut by_shard: Vec<Vec<(u64, Slot, u32)>> = vec![Vec::new(); SHARDS];
-        for at in 0..partition.len() {
-            let entry = partition.entry_at(at)?;
-            if entry.is_range_tombstone() {
+    /// Take a sealed footer partition's rows during an open, and hand back each fresh record's row and length
+    pub fn take_partition(
+        &self,
+        segment: SegmentId,
+        partition: &FooterPartition,
+    ) -> Result<Vec<(u32, u32)>> {
+        let spread = segment.as_u32() as usize;
+        self.take_rows(partition.column, spread, partition.len(), |at| {
+            let found = partition.row_at(at)?;
+            let key = partition
+                .key_at(at)
+                .ok_or_else(|| ReelError::Corruption("footer row is out of range".to_string()))?;
+            Ok((!found.is_range_tombstone()).then(|| Taken {
+                key,
+                loc: Loc::new(segment, found.offset, found.len),
+                lsn: found.lsn,
+                is_tombstone: found.is_tombstone(),
+            }))
+        })
+    }
+
+    /// Take sealed rows during an open, setting aside each that meets a slot, and hand back each fresh record's row and length
+    pub fn take_rows<'a>(
+        &self,
+        column: ColumnId,
+        spread: usize,
+        count: usize,
+        row: impl Fn(usize) -> Result<Option<Taken<'a>>>,
+    ) -> Result<Vec<(u32, u32)>> {
+        let mut by_shard: Vec<Vec<(u64, Slot, u32, u32)>> = vec![Vec::new(); SHARDS];
+        for at in 0..count {
+            let Some(taken) = row(at)? else {
                 continue;
-            }
-            let hash = hash_of(entry.key.as_slice());
-            let slot = Slot::new(hash, Loc::new(segment, entry.offset, entry.len));
-            let slot = match entry.is_tombstone() {
+            };
+            let hash = hash_of(taken.key);
+            let slot = Slot::new(hash, taken.loc);
+            let slot = match taken.is_tombstone {
                 true => slot.as_grave(),
                 false => slot,
             };
-            by_shard[shard_of(hash)].push((hash, slot, at as u32));
+            by_shard[shard_of(hash)].push((hash, slot, at as u32, taken.loc.len));
         }
         // Loaders start at different shards, so two of them rarely want the same lock
-        let first = segment.as_u32() as usize % SHARDS;
-        let mut aside = Vec::new();
+        let first = spread % SHARDS;
+        let (mut aside, mut fresh) = (Vec::new(), Vec::new());
         for shard in (first..SHARDS).chain(0..first) {
             let rows = &by_shard[shard];
             if rows.is_empty() {
                 continue;
             }
             let mut table = self.shards[shard].write();
-            for (hash, slot, at) in rows {
+            for (hash, slot, at, len) in rows {
                 match table.matches(*hash).is_empty() {
-                    true => table.insert(*slot),
+                    true => {
+                        table.insert(*slot);
+                        if !slot.is_grave() {
+                            fresh.push((*at, *len));
+                        }
+                    }
                     false => aside.push(*at),
                 }
             }
         }
+        fresh.sort_unstable();
         if aside.is_empty() {
-            return Ok(());
+            return Ok(fresh);
         }
         let mut set_aside = Vec::with_capacity(aside.len());
         for at in aside {
-            let entry = partition.entry_at(at as usize)?;
-            set_aside.push(SetAside {
-                loc: Loc::new(segment, entry.offset, entry.len),
-                lsn: entry.lsn,
-                is_tombstone: entry.is_tombstone(),
-                key: entry.key,
-            });
+            if let Some(taken) = row(at as usize)? {
+                set_aside.push(SetAside {
+                    key: RecordKey::from_bytes(column, taken.key)?,
+                    loc: taken.loc,
+                    lsn: taken.lsn,
+                    is_tombstone: taken.is_tombstone,
+                });
+            }
         }
         lock(&self.set_aside).extend(set_aside);
-        Ok(())
+        Ok(fresh)
     }
 
     /// Settle the rows an open set aside against the footers of the slots they met, reading headers for the rest
-    pub fn settle_rows(&self, column: ColumnId, footers: &dyn FooterSource) -> Result<()> {
+    pub fn settle_rows(
+        &self,
+        column: ColumnId,
+        footers: &dyn FooterSource,
+        book: &(dyn Fn(&[u8], Booking) + Sync),
+    ) -> Result<()> {
         let rows = std::mem::take(&mut *lock(&self.set_aside));
         if rows.is_empty() {
             return Ok(());
@@ -1060,8 +1126,11 @@ impl SpotColumn {
                         while let Some((segment, group)) =
                             groups.get(next.fetch_add(1, Ordering::Relaxed))
                         {
-                            let left =
+                            let (left, booked) =
                                 self.settle_against(column, *segment, group, &rows, footers)?;
+                            for (at, booking) in booked {
+                                book(rows[at].key.as_slice(), booking);
+                            }
                             lock(&unsettled).extend(left);
                         }
                         Ok(())
@@ -1077,12 +1146,15 @@ impl SpotColumn {
         })?;
         for at in std::mem::take(&mut *lock(&unsettled)) {
             let row = &rows[at];
-            self.load(&row.key, row.loc, row.lsn, row.is_tombstone)?;
+            book(
+                row.key.as_slice(),
+                self.load(&row.key, row.loc, row.lsn, row.is_tombstone)?,
+            );
         }
         Ok(())
     }
 
-    /// Settle the rows whose slot sits in one segment, handing back those its footer cannot
+    /// Settle the rows whose slot sits in one segment, handing back those its footer cannot and what the rest booked
     fn settle_against(
         &self,
         column: ColumnId,
@@ -1090,31 +1162,28 @@ impl SpotColumn {
         group: &[usize],
         rows: &[SetAside],
         footers: &dyn FooterSource,
-    ) -> Result<Vec<usize>> {
+    ) -> Result<Settling> {
         let Some(footer) = footers.footer_once(segment)? else {
-            return Ok(group.to_vec());
+            return Ok((group.to_vec(), Vec::new()));
         };
         let Some(partition) = footer.partition(column) else {
-            return Ok(group.to_vec());
+            return Ok((group.to_vec(), Vec::new()));
         };
         let mut group = group.to_vec();
         group.sort_unstable_by(|left, right| rows[*left].key.cmp(&rows[*right].key));
         // A slot counts as this key's only when its footer row says so, since keys can share bits
-        let mut keys_at: Option<HashMap<u32, usize>> = None;
-        let mut key_at = |offset: u32| -> Result<Option<&[u8]>> {
-            if keys_at.is_none() {
+        let mut rows_at: Option<HashMap<u32, usize>> = None;
+        let mut row_at = |offset: u32| -> Result<Option<usize>> {
+            if rows_at.is_none() {
                 let mut at_offset = HashMap::with_capacity(partition.len());
                 for at in 0..partition.len() {
                     at_offset.insert(partition.row_at(at)?.offset, at);
                 }
-                keys_at = Some(at_offset);
+                rows_at = Some(at_offset);
             }
-            Ok(keys_at
-                .as_ref()
-                .and_then(|keys| keys.get(&offset))
-                .and_then(|at| partition.key_at(*at)))
+            Ok(rows_at.as_ref().and_then(|rows| rows.get(&offset)).copied())
         };
-        let mut unsettled = Vec::new();
+        let (mut unsettled, mut booked) = (Vec::new(), Vec::new());
         for same_key in group.chunk_by(|left, right| rows[*left].key == rows[*right].key) {
             let Some(newest) = same_key
                 .iter()
@@ -1140,24 +1209,32 @@ impl SpotColumn {
                 .find(|place| place.slot.segment() == segment)
                 .copied();
             let is_newer = (row.lsn, row.loc.segment) > (standing.lsn, segment);
+            let came = (!row.is_tombstone).then_some(row.loc.len);
             let settled = match place {
                 // The slot is the version this footer holds, so the newer of the two stands
                 Some(place) if place.slot.offset == standing.offset => {
                     if is_newer {
                         table.take(hash, &place.slot);
                         table.insert(slot_of(hash, row));
+                        let gone = (!place.slot.is_grave()).then_some(standing.len);
+                        booked.push((newest, Booking { gone, came }));
                     }
                     true
                 }
                 // The slot is an older version of the key in this row's segment, whose footer points at this row
-                Some(place)
-                    if segment == row.loc.segment
-                        && standing.offset == row.loc.offset
-                        && key_at(place.slot.offset)? == Some(row.key.as_slice()) =>
-                {
-                    table.take(hash, &place.slot);
-                    table.insert(slot_of(hash, row));
-                    true
+                Some(place) if segment == row.loc.segment && standing.offset == row.loc.offset => {
+                    match row_at(place.slot.offset)? {
+                        Some(older) if partition.key_at(older) == Some(row.key.as_slice()) => {
+                            table.take(hash, &place.slot);
+                            table.insert(slot_of(hash, row));
+                            let gone = (!place.slot.is_grave())
+                                .then(|| partition.row_at(older).map(|older| older.len))
+                                .transpose()?;
+                            booked.push((newest, Booking { gone, came }));
+                            true
+                        }
+                        Some(_) | None => false,
+                    }
                 }
                 Some(_) | None => false,
             };
@@ -1165,25 +1242,29 @@ impl SpotColumn {
                 unsettled.extend_from_slice(same_key);
             }
         }
-        Ok(unsettled)
+        Ok((unsettled, booked))
     }
 
     /// Load one sealed row, keeping each key's newest version, a tie to the newer segment, a tombstone as a grave
-    pub fn load(&self, key: &RecordKey, loc: Loc, lsn: Lsn, is_tombstone: bool) -> Result<()> {
+    pub fn load(&self, key: &RecordKey, loc: Loc, lsn: Lsn, is_tombstone: bool) -> Result<Booking> {
         let Some(records) = self.records.get() else {
-            return Ok(());
+            return Ok(Booking::default());
         };
         let hash = hash_of(key.as_slice());
         let slot = match is_tombstone {
             true => Slot::new(hash, loc).as_grave(),
             false => Slot::new(hash, loc),
         };
+        let came = Booking {
+            gone: None,
+            came: (!is_tombstone).then_some(loc.len),
+        };
         let shard = shard_of(hash);
         {
             let mut table = self.shards[shard].write();
             if table.matches(hash).is_empty() {
                 table.insert(slot);
-                return Ok(());
+                return Ok(came);
             }
         }
         loop {
@@ -1193,7 +1274,7 @@ impl SpotColumn {
                 if let HeadRead::Same(head) =
                     records.head(key.as_ref(), place.slot.segment(), place.slot.offset)?
                 {
-                    standing = Some((place.slot, head.lsn));
+                    standing = Some((place.slot, head));
                 }
             }
             let mut table = self.shards[shard].write();
@@ -1201,15 +1282,21 @@ impl SpotColumn {
             if *table.matches(hash) != *seen {
                 continue;
             }
-            match standing {
-                Some((held, held_lsn)) if (lsn, slot.segment) > (held_lsn, held.segment) => {
+            return Ok(match standing {
+                Some((held, head)) if (lsn, slot.segment) > (head.lsn, held.segment) => {
                     table.take(hash, &held);
                     table.insert(slot);
+                    Booking {
+                        gone: (!head.is_tombstone).then_some(head.len),
+                        ..came
+                    }
                 }
-                Some(_) => {}
-                None => table.insert(slot),
-            }
-            return Ok(());
+                Some(_) => Booking::default(),
+                None => {
+                    table.insert(slot);
+                    came
+                }
+            });
         }
     }
 
@@ -1233,14 +1320,14 @@ impl SpotColumn {
         }
     }
 
-    /// Take out the entry pointing at one record, for a compaction move, an eviction or a release
-    pub fn remove_at(&self, key: &[u8], loc: Loc) -> bool {
+    /// Take out the live entry pointing at one record, leaving a displaced one for compaction to rebook
+    pub fn take_live(&self, key: &[u8], loc: Loc) -> bool {
         let hash = hash_of(key);
         let mut table = self.shards[shard_of(hash)].write();
         let held = table
             .matches(hash)
             .iter()
-            .find(|place| place.slot.at(loc))
+            .find(|place| place.slot.at(loc) && !place.slot.is_displaced())
             .copied();
         match held {
             Some(place) => table.take(hash, &place.slot),
@@ -2010,7 +2097,7 @@ mod tests {
         assert_eq!(column.beside(), 1, "only the older version is stale");
         let taken = column.scrub(16);
         assert_eq!(taken, vec![(key(7), old)]);
-        assert!(column.remove_at(key(7).as_slice(), new));
+        assert!(column.take_live(key(7).as_slice(), new));
         assert_eq!(version(&column, 7), Some(9), "the copy still answers");
     }
 
@@ -2021,21 +2108,33 @@ mod tests {
         let column = column(&records);
         let rows = [
             (1u64, Loc::new(SegmentId(2), 0, 40), 5u64, false),
-            (1, Loc::new(SegmentId(1), 0, 40), 3, false),
-            (2, Loc::new(SegmentId(1), 64, 40), 4, false),
-            (2, Loc::new(SegmentId(3), 64, 40), 4, false),
-            (3, Loc::new(SegmentId(1), 128, 40), 2, false),
+            (1, Loc::new(SegmentId(1), 0, 30), 3, false),
+            (2, Loc::new(SegmentId(1), 64, 20), 4, false),
+            (2, Loc::new(SegmentId(3), 64, 25), 4, false),
+            (3, Loc::new(SegmentId(1), 128, 10), 2, false),
             (3, Loc::new(SegmentId(2), 128, 0), 6, true),
             (4, Loc::new(SegmentId(2), 192, 0), 1, true),
-            (4, Loc::new(SegmentId(3), 192, 40), 7, false),
+            (4, Loc::new(SegmentId(3), 192, 50), 7, false),
         ];
+        let (mut keys, mut bytes) = (0i64, 0i64);
         for (at, loc, lsn, is_tombstone) in rows {
             records.put(loc, key(at).as_slice(), Lsn(lsn), is_tombstone);
-            column
+            let booked = column
                 .load(&key(at), loc, Lsn(lsn), is_tombstone)
                 .expect("load");
+            for (len, sign) in [(booked.came, 1), (booked.gone, -1)] {
+                if let Some(len) = len {
+                    keys += sign;
+                    bytes += sign * i64::from(len);
+                }
+            }
         }
         column.finish_load();
+        assert_eq!(
+            (keys, bytes),
+            (3, 115),
+            "the loads booked the newest live rows"
+        );
         assert_eq!(version(&column, 1), Some(5), "the newer row stands");
         assert_eq!(version(&column, 3), None, "a newer tombstone drops the key");
         assert_eq!(
@@ -2045,7 +2144,7 @@ mod tests {
         );
         assert_eq!(column.held(), 3);
         assert!(
-            column.remove_at(key(2).as_slice(), Loc::new(SegmentId(3), 64, 40)),
+            column.take_live(key(2).as_slice(), Loc::new(SegmentId(3), 64, 40)),
             "a tie went to the copy"
         );
         assert_eq!(column.held(), 2);

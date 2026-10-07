@@ -175,27 +175,28 @@ Sealed-over-sealed shadowing stays the scrub's, being the cross-segment join a p
 open exists to avoid. `a_paged_open_recovers_its_split_from_the_tally` and
 `a_walked_tail_settles_the_sealed_split` are the checks.
 
-## Born segments, and what the counters promise
+## What the counters promise
 
-Deferring the seal widened when a reopen can see a sealed live segment, a state
-production reaches on any restart, and two defects lived there. Compacting such a
-segment lost its keys, since `repoint_paged` refused a key the counters never held,
-`copy_live` discarded the refusal after appending the copy, and the retire took the
-footer: data loss, pinned by `compaction_carries_a_key_through_a_paged_reopen`. And
-overwrites and deletes of those keys moved shard counters that never held them,
-corrupting the totals once a shard mixed counted and uncounted keys.
+Each shard counts the live keys and bytes the spot index answers for beside what its
+map holds, and the spot index is the ledger: one live slot is one counted key. A
+path that takes a live slot out or marks it displaced books the shard down once, and
+a path that finds no live slot books nothing, so a delete, an overwrite, a cover's
+release, an eviction and a compaction move never count one record twice.
 
-Both are fixed by segment attribution: the segments a rebuild leaves sealed are
-marked born in the `SegmentTable`, and every settle and repoint takes its
-counted-ness from the row's segment, so a born key enters the counters exactly once,
-as compaction or an overwrite touches it.
+| step | what it books |
+|---|---|
+| hand-over | the key moves from the map to `paged`, bytes unchanged |
+| put or delete over a paged key | the displaced slot out, bytes by its length class |
+| cover release | each covered record the spot index holds live |
+| paged open | every key the load takes a fresh slot for, at its row's length |
+| tail over a sealed key at open | the sealed version out of the count and the spot index |
 
-**While a born segment stands, `totals()` is a floor**: never above what a scan
-finds, exact again the moment the last born segment retires. The differential fixture
-asserts strict equality whenever `born_segments()` is zero and the floor otherwise,
-and the visibility assert stays strict throughout. Exact counts at any instant of the
-born window would need the cross-segment join a paged open exists to avoid.
-`paged_sim_backend_storm` covers paged residency under concurrency.
+A paged open loads a covered segment's keys from the key run over it, since the run
+keeps one row a key and a footer can still hold a version whose newer one died in a
+retired segment, and it releases every standing cover before it returns. `totals()`,
+`column_totals` and `prefix_totals` answer exactly, up to spot hash collisions in
+the count and `spot_slack()` in the bytes, and a reopen answers what the volume
+answered before it. `paged_totals_model.rs` and the differential fixture check it.
 
 ## The filter field
 
@@ -309,13 +310,6 @@ would be new is the volume.
   of every segment. The sealed-keys filter answers it for a fresh key and the
   per-segment filters for the rest, and the probe fires only when the map holds
   nothing at all for the key.
-- **What "how many blobs are in here" answers.** `totals().count` is a floor during
-  the born window, right if every consumer of it is a metric. The live candidates are
-  a per-segment live-key count in the footer tail, which `live_rows()` computes at
-  seal for nothing and which turns the floor into an estimate that settles, and an
-  exact counting walk paid by the caller that asked. Refuted: a cross-segment join at
-  open, and counting distinct keys per footer without one, which double-counts
-  rewritten keys.
 - **The block cursor, owed to the read path.** It would bound the footer cache and a
   playback's residency in bytes rather than in parsed footers, and it is no longer a
   gate on recovery. It has to carry a streaming verify when a footer is first opened,

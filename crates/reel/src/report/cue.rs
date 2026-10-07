@@ -79,9 +79,6 @@ pub struct CueReport {
     /// Whether the open leaves sealed keys in their footers
     pub is_paged: bool,
 
-    /// Sealed segments a rebuild left uncounted, so the totals read as a floor
-    pub born_segments: usize,
-
     /// Range deletes still standing over the volume
     pub standing_covers: u64,
 
@@ -162,7 +159,6 @@ pub fn cue(engine: &ReelStore, limit: usize) -> CueReport {
         });
     }
 
-    let born_segments = engine.born_segments();
     let sweep_owed = index.has_pending_covers();
 
     CueReport {
@@ -177,24 +173,18 @@ pub fn cue(engine: &ReelStore, limit: usize) -> CueReport {
             total => dead_bytes as f64 / total as f64,
         },
         is_paged,
-        born_segments,
         standing_covers: index.cover_count(),
         sweep_owed,
         graves: index.grave_count(),
         held,
-        caveats: caveats(&columns, is_paged, sweep_owed, born_segments),
+        caveats: caveats(&columns, is_paged, sweep_owed),
         segments,
         columns,
     }
 }
 
 /// What a reader has to know before taking any of these figures for a total
-fn caveats(
-    columns: &[ColumnRow],
-    is_paged: bool,
-    sweep_owed: bool,
-    born_segments: usize,
-) -> Vec<Caveat> {
+fn caveats(columns: &[ColumnRow], is_paged: bool, sweep_owed: bool) -> Vec<Caveat> {
     let mut caveats = Vec::new();
     match columns.is_empty() {
         true => caveats.push(
@@ -211,11 +201,6 @@ fn caveats(
         caveats.push(Caveat::new(
             "a cover is still owed its sweep, so the counters read as a floor",
         ));
-    }
-    if born_segments > 0 {
-        caveats.push(Caveat::new(format!(
-            "{born_segments} sealed segments a rebuild left uncounted, so the totals are a floor",
-        )));
     }
     caveats
 }
@@ -254,7 +239,7 @@ impl Report for CueReport {
 impl CueReport {
     /// A figure standing on a floor is not the figure, and reads as a caveat
     fn tone(&self) -> Tone {
-        match self.sweep_owed || self.born_segments > 0 {
+        match self.sweep_owed {
             true => Tone::Warn,
             false => Tone::Plain,
         }

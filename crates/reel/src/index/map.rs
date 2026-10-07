@@ -5,9 +5,9 @@
 //! since one holds records from every column and the compactor asks about it whole.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::Bound;
+use std::ops::{Bound, Range};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::units::ByteCount;
 
@@ -22,12 +22,15 @@ use crate::format::lsn::Lsn;
 use crate::index::column::{ColumnIndex, KeyMove, Landed, PendingCover};
 use crate::index::counters::{Floors, SegmentBytes, SegmentStamp, SegmentTable};
 use crate::index::entry::{span_of, Entry};
-use crate::index::keyrun::KeyRunSet;
+use crate::index::keyrun::{key_in, row_in, KeyRun, KeyRunSet, RunColumn};
 use crate::index::page::KeyPage;
 use crate::index::paged::{Candidates, FooterSource, SealedRanges};
 use crate::index::playback::{self, merged_page, Paged, PlaybackCursor, WalkRuns, Way};
 use crate::index::recovery::SealedSpan;
-use crate::index::spot::{Lookup, Pick, RecordSource, Settled, Since, SpotColumn, LOOKUP_TRIES};
+use crate::index::spot::{
+    Booking, Lookup, Pick, RecordSource, Settled, Since, SpotColumn, Taken, LOOKUP_TRIES,
+};
+use crate::sync::lock;
 
 /// Slots in the lookup from a column identifier to its index
 const COLUMN_SLOTS: usize = 256;
@@ -250,6 +253,9 @@ pub struct ReelIndex {
     /// Compaction copies refused because nothing else pointed at them
     unclaimed: std::sync::atomic::AtomicU64,
 
+    /// Sealed versions a rebuild found a tail outversioning, taken out once the spot index load settles
+    shadowed: Mutex<Vec<(usize, KeyBytes, Loc)>>,
+
     /// Held while a batch moves the maps, so no spanning read sees part of one
     publish: PublishBarrier,
 }
@@ -291,6 +297,7 @@ impl ReelIndex {
             footers: OnceLock::new(),
             residency,
             unclaimed: std::sync::atomic::AtomicU64::new(0),
+            shadowed: Mutex::new(Vec::new()),
             publish: PublishBarrier::new(),
         })
     }
@@ -411,12 +418,7 @@ impl ReelIndex {
         let mut settled = 0;
         for (at, spot) in self.spot.iter().enumerate() {
             for (key, loc) in spot.scrub(budget.saturating_sub(settled)) {
-                self.indexes[at].settle_paged(
-                    key.as_slice(),
-                    loc,
-                    self.counted(loc.segment),
-                    &self.segments,
-                );
+                self.indexes[at].settle_paged(key.as_slice(), loc, &self.segments);
                 settled += 1;
             }
         }
@@ -453,14 +455,63 @@ impl ReelIndex {
         self.spot_ready.store(true, Ordering::Release);
     }
 
-    /// Take a sealed footer's rows during a paged open, skipping range tombstones
+    /// Take a sealed footer's rows during a paged open, and count each fresh one, unless a key run covers the segment
     pub fn take_sealed_footer(&self, segment: SegmentId, footer: &SegmentFooter) -> Result<()> {
+        // The run keeps one row a key, so a version whose newer one died in a retired segment stays out
+        if self.key_runs.covers(segment) {
+            return Ok(());
+        }
         for partition in &footer.partitions {
             if let Some(at) = self.slot(partition.column) {
-                self.spot[at].take_partition(segment, partition)?;
+                let fresh = self.spot[at].take_partition(segment, partition)?;
+                self.indexes[at].book_sealed(
+                    fresh
+                        .iter()
+                        .filter_map(|(row, len)| Some((partition.key_at(*row as usize)?, *len))),
+                );
             }
         }
         Ok(())
+    }
+
+    /// Take one stretch of a key run's rows during a paged open, those in standing segments, and count each fresh one
+    pub fn take_run_rows(
+        &self,
+        run: &KeyRun,
+        column: &RunColumn,
+        rows: Range<u64>,
+        standing: &HashSet<SegmentId>,
+    ) -> Result<()> {
+        let Some(at) = self.slot(column.column) else {
+            return Ok(());
+        };
+        let bytes = run.rows(column);
+        let first = rows.start as usize;
+        let count = (rows.end - rows.start) as usize;
+        let fresh = self.spot[at].take_rows(column.column, first, count, |row| {
+            let (key, found) = row_in(bytes, column, first + row)?;
+            let is_taken =
+                standing.contains(&found.loc.segment) && !found.flags.is_range_tombstone();
+            Ok(is_taken.then_some(Taken {
+                key,
+                loc: found.loc,
+                lsn: found.lsn,
+                is_tombstone: found.flags.is_tombstone(),
+            }))
+        })?;
+        self.indexes[at].book_sealed(
+            fresh
+                .iter()
+                .map(|(row, len)| (key_in(bytes, column, first + *row as usize), *len)),
+        );
+        Ok(())
+    }
+
+    /// Hold sealed versions a tail outversions, for the end of the load to take out of the spot index
+    pub fn shadow_sealed(&self, column: ColumnId, rows: Vec<(KeyBytes, Loc)>) {
+        if let Some(at) = self.slot(column) {
+            lock(&self.shadowed).extend(rows.into_iter().map(|(key, loc)| (at, key, loc)));
+        }
     }
 
     /// Size the spot index from the first sealed footer of an open, since segments run to one size
@@ -472,18 +523,37 @@ impl ReelIndex {
         }
     }
 
-    /// Finish the paged open's spot index load once records can be read, then let it answer
-    pub fn finish_spot_load(&self) -> Result<()> {
+    /// Finish an open once records can be read: settle the spot index load, then sweep every cover
+    pub fn finish_open(&self) -> Result<()> {
+        self.finish_spot_load()?;
+        while self.sweep_covers(usize::MAX)? {}
+        Ok(())
+    }
+
+    /// Finish the paged open's spot index load and its counts, then let it answer
+    fn finish_spot_load(&self) -> Result<()> {
         if !self.residency.pages() || self.spot_ready.load(Ordering::Acquire) {
             return Ok(());
         }
         let Some(footers) = self.footers.get() else {
             return Ok(());
         };
-        // A key the map holds keeps any older sealed slot until an overwrite or retire, since reads ask the map first
         for (at, spot) in self.spot.iter().enumerate() {
-            spot.settle_rows(self.columns[at].id, footers.as_ref())?;
+            let index = &self.indexes[at];
+            spot.settle_rows(self.columns[at].id, footers.as_ref(), &|key, booking| {
+                index.book_paged(key, booking)
+            })?;
             spot.finish_load();
+        }
+        // A version a tail outversions leaves the spot index, so a pruned grave cannot bring it back
+        for (at, key, loc) in std::mem::take(&mut *lock(&self.shadowed)) {
+            if self.spot[at].take_live(key.as_slice(), loc) {
+                let gone = Booking {
+                    gone: Some(loc.len),
+                    came: None,
+                };
+                self.indexes[at].book_paged(key.as_slice(), gone);
+            }
         }
         self.mark_spot_ready();
         Ok(())
@@ -999,44 +1069,21 @@ impl ReelIndex {
             let mut settled = false;
             let displaced = self.spot[at].displace(key, lsn)?;
             for loc in displaced.booked {
-                let counted = self.counted(loc.segment);
-                settled |=
-                    self.indexes[at].settle_paged(key.as_slice(), loc, counted, &self.segments);
+                settled |= self.indexes[at].settle_paged(key.as_slice(), loc, &self.segments);
             }
             for (loc, least) in displaced.classed {
-                let counted = self.counted(loc.segment);
-                settled |= self.indexes[at].settle_paged_least(
-                    key.as_slice(),
-                    loc,
-                    least,
-                    counted,
-                    &self.segments,
-                );
+                settled |=
+                    self.indexes[at].settle_paged_least(key.as_slice(), loc, least, &self.segments);
             }
             for (loc, least) in displaced.rebooked {
-                if self.counted(loc.segment) {
-                    self.indexes[at].rebook_paged(key.as_slice(), least, loc.len);
-                }
+                self.indexes[at].rebook_paged(key.as_slice(), least, loc.len);
             }
             return Ok(settled);
         }
         let Some(displaced) = self.paged_entry(at, key)? else {
             return Ok(false);
         };
-        Ok(self.indexes[at].settle_paged(
-            key.as_slice(),
-            displaced.loc,
-            self.counted(displaced.loc.segment),
-            &self.segments,
-        ))
-    }
-
-    /// Whether a footer-held record at this segment was ever in a shard counter
-    ///
-    /// A key handed over at runtime was counted on its way out; one a rebuild left
-    /// sealed never was, and the segment it sits in is what tells the two apart.
-    fn counted(&self, segment: SegmentId) -> bool {
-        !self.segments.is_born(segment)
+        Ok(self.indexes[at].settle_paged(key.as_slice(), displaced.loc, &self.segments))
     }
 
     /// What a footer holds for a key the map does not, if the column pages at all
@@ -1304,12 +1351,7 @@ impl ReelIndex {
         self.indexes.iter().any(|index| index.has_pending_covers())
     }
 
-    /// Settle one bounded run of the footer-held records one cover spans
-    ///
-    /// The rows come newest-below-the-cover per key, so a row rewritten after the
-    /// delete stays. Rows a finished cover spans were settled by that cover's own
-    /// pass and are skipped, which is what lets two overlapping drops share a range
-    /// without booking it dead twice.
+    /// Settle one bounded run of the footer-held records one cover spans, each one the spot index holds live
     fn release_run(
         &self,
         at: usize,
@@ -1334,15 +1376,11 @@ impl ReelIndex {
             limit.min(RELEASE_RUN),
             &mut found,
         )?;
+        let spot = &self.spot[at];
         for (key, loc) in &found {
-            index.release_covered(
-                key.as_slice(),
-                *loc,
-                pending.lsn,
-                self.counted(loc.segment),
-                &self.segments,
-            );
-            self.spot[at].remove_at(key.as_slice(), *loc);
+            index.release_covered(key.as_slice(), *loc, &self.segments, || {
+                spot.take_live(key.as_slice(), *loc)
+            });
         }
         index.advance_release(pending.lsn, run.resume.as_deref());
         Ok(run.examined)
@@ -1461,25 +1499,22 @@ impl ReelIndex {
                 None => {}
             }
         }
+        let spot = &self.spot[at];
         // The pass read the source, so the key's one spot index slot there is this version and needs no read
         if let Some(from) =
-            from.filter(|from| self.spot_serves() && self.spot[at].only_at(key.as_slice(), *from))
+            from.filter(|from| self.spot_serves() && spot.only_at(key.as_slice(), *from))
         {
-            let counted = self.counted(from.segment);
-            if !index.repoint_paged(key.as_slice(), to, expected_lsn, counted, stamp) {
-                return Ok(None);
-            }
-            self.spot[at].remove_at(key.as_slice(), from);
-            return Ok(Some(from));
+            let take = || spot.take_live(key.as_slice(), from);
+            return Ok(index
+                .repoint_paged(key.as_slice(), to, expected_lsn, stamp, take)
+                .then_some(from));
         }
         match self.sealed_state(at, key)? {
             Sealed::Live(entry) if entry.lsn == expected_lsn => {
-                let counted = self.counted(entry.loc.segment);
-                if !index.repoint_paged(key.as_slice(), to, expected_lsn, counted, stamp) {
-                    return Ok(None);
-                }
-                self.spot[at].remove_at(key.as_slice(), entry.loc);
-                Ok(Some(entry.loc))
+                let take = || spot.take_live(key.as_slice(), entry.loc);
+                Ok(index
+                    .repoint_paged(key.as_slice(), to, expected_lsn, stamp, take)
+                    .then_some(entry.loc))
             }
             // A newer version won the race, so the copy is dead on arrival
             Sealed::Live(_) | Sealed::Gone => Ok(None),
@@ -1528,17 +1563,12 @@ impl ReelIndex {
         }
         match self.sealed_entry(column_at, key)? {
             Some(entry) if entry.loc == at => {
-                let evicted = index.evict_paged(
-                    key.as_slice(),
-                    at,
-                    entry.lsn,
-                    self.counted(entry.loc.segment),
-                    &self.segments,
-                );
-                if evicted {
-                    self.spot[column_at].remove_at(key.as_slice(), at);
-                }
-                Ok(evicted)
+                let spot = &self.spot[column_at];
+                Ok(
+                    index.evict_paged(key.as_slice(), at, entry.lsn, &self.segments, || {
+                        spot.take_live(key.as_slice(), at)
+                    }),
+                )
             }
             Some(_) | None => Ok(false),
         }
@@ -1633,16 +1663,9 @@ impl ReelIndex {
             .collect()
     }
 
-    /// Live key count and payload byte total for one column
-    ///
-    /// A column answering keys out of footers holds keys no shard counted, so it
-    /// declines rather than reporting the resident half as the whole. A column the
-    /// map does not hold at all answers zero, which is what it holds.
+    /// Live key count and payload byte total for one column, zero for a column the map does not hold
     pub fn column_totals(&self, column: ColumnId) -> Option<Totals> {
         self.publish.reading_all(|| {
-            if self.answers_from_footers(column) {
-                return None;
-            }
             Some(match self.column(column) {
                 Some(index) => index.totals(),
                 None => Totals {
@@ -1657,22 +1680,8 @@ impl ReelIndex {
     pub fn prefix_totals(&self, column: ColumnId, prefix: &[u8]) -> Option<Totals> {
         self.publish.reading_all(|| {
             let at = self.slot(column)?;
-            // A column answering keys out of footers holds keys no shard counted, so
-            // declining sends the caller to the walk, which sees both halves.
-            if self.answers_from_footers(column) {
-                return None;
-            }
             self.indexes[at].prefix_totals(prefix)
         })
-    }
-
-    /// Whether this column resolves any of its keys through a sealed footer
-    ///
-    /// The counters cover what the shards hold, and a paged column's sealed keys are
-    /// in none of them, so anything counting rather than walking has to decline.
-    pub fn answers_from_footers(&self, column: ColumnId) -> bool {
-        self.slot(column)
-            .is_some_and(|at| self.paged_footers(at).is_some())
     }
 
     /// Sealed segments recorded as covering keys of this column
@@ -1834,10 +1843,9 @@ impl ReelIndex {
         for index in &self.indexes {
             index.fit();
         }
-        // The keys of these segments are in no shard counter, and the settle and
-        // repoint paths ask the table before they count.
+        // Entries a footer answers for are stamped with their segment's incarnation
         self.segments
-            .mark_born(sealed.iter().map(|span| span.segment));
+            .issue_incarnations(sealed.iter().map(|span| span.segment));
         // Spans are grouped per column and installed in one pass each, since a
         // paging volume brings one per sealed segment and reindexing per segment
         // would make the open quadratic in them.
@@ -1885,7 +1893,7 @@ impl ReelIndex {
 
     /// Book the true length of each class-booked overwrite in a retiring segment, before its locks are taken
     fn rebook_retiring(&self, segment: SegmentId) {
-        if !self.counted(segment) || self.spot_displaced() == 0 {
+        if self.spot_displaced() == 0 {
             return;
         }
         let Some(footers) = self.footers.get() else {

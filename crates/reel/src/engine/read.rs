@@ -523,6 +523,7 @@ impl ReelStore {
             self.config.index.pages(),
             &self.index,
         )?;
+        self.index.finish_open()?;
         let mut cursor = lock(&self.cursor);
         *cursor = LogCursor::new();
         cursor.start_from(&rebuilt.consumed);

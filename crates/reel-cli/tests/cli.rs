@@ -296,34 +296,22 @@ fn stat_counts_the_live_records() {
     );
 }
 
-// a paged stat says which numbers it cannot give rather than giving zero
+// a paged stat counts the live records as a resident one does
 #[test]
-fn stat_paged_admits_what_it_cannot_count() {
+fn stat_paged_counts_the_live_records() {
     let dir = tempfile::tempdir().expect("tempdir");
     let volume = volume(&dir);
 
     let stat = run(volume, &["--column", "records:1:32", "--paged", "stat"]);
     assert!(stat.ok, "stat failed: {}", stat.err);
     let row = row(&stat.out, RECORD_CF);
-    assert!(
-        row.contains('-'),
-        "an unanswerable count should be a dash: {row}"
-    );
-    // The caveat has to reach the data too: a consumer reading only the figures
-    // would otherwise take a floor for the total.
-    let caveats = caveats(&json(
-        volume,
-        &["--column", "records:1:32", "--paged", "stat"],
-    ));
-    assert!(
-        caveats.iter().any(|caveat| caveat.contains("floors")),
-        "a paged open owes the reader the floor caveat: {caveats:?}",
-    );
-    assert!(
-        stat.out.contains("floors"),
-        "and owes it in the text as well: {}",
-        stat.out,
-    );
+    // column, id, runs, records, bytes
+    let records: u64 = row
+        .split_whitespace()
+        .nth(3)
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("no record count on the column row: {row}"));
+    assert_eq!(records, u64::from(RECORDS), "the paged count parted: {row}");
 }
 
 // a sound volume verifies clean, and says how much it read

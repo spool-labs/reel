@@ -36,7 +36,7 @@ fn config() -> ReelConfig {
         alloc_chunk: ByteCount::from_bytes(16 * 1024),
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
-        compact_dead_ratio: 0.5,
+        compact_dead_ratio: 0.3,
         scrub_mbps: 0,
         index: IndexResidency::Paged,
         ..ReelConfig::default()

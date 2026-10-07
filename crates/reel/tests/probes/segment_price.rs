@@ -1,11 +1,11 @@
 //! What the segment counters cost the paths that touch them
 //!
 //! Three shapes rather than one, because the table is asked three different things.
-//! A read asks for a stamp and whether the segment was born, once per resolved
-//! entry. A write books bytes, and every writer books into the same active segment,
-//! which is the row false sharing lands on. A maintenance tick walks every row for
-//! the footprints and the floors. Counts of segments are the axis, since the table
-//! this replaces was hashed and the one that replaces it is indexed.
+//! A read asks for a stamp, once per resolved entry. A write books bytes, and every
+//! writer books into the same active segment, which is the row false sharing lands
+//! on. A maintenance tick walks every row for the footprints and the floors. Counts of
+//! segments are the axis, since the table this replaces was hashed and the one that
+//! replaces it is indexed.
 //!
 //! Opt-in. Run with:
 //!   cargo test -p tape-reel --release --test probes -- segment_price
@@ -36,9 +36,6 @@ fn filled(count: u32) -> Arc<SegmentTable> {
         table.mark_live(segment, Lsn(u64::from(number) + 1), 4_096);
         table.live_incarnation(segment);
     }
-    // One born segment, since an unborn volume answers the born question at one
-    // relaxed load and never reaches the structure being priced.
-    table.mark_born([SegmentId(0)]);
     table
 }
 
@@ -74,7 +71,7 @@ where
     took.as_nanos() as f64 / (threads * ASKS) as f64
 }
 
-// what a resolved entry pays to be stamped and to ask whether its segment was born
+// what a resolved entry pays to be stamped
 pub fn read_side() {
     println!();
     println!("| shape | segments | threads | ns per ask |");
@@ -86,12 +83,7 @@ pub fn read_side() {
                 let segment = SegmentId((at % u64::from(count)) as u32);
                 u64::from(table.incarnation_of(segment).0)
             });
-            let born = timed(&table, threads, move |table, at| {
-                let segment = SegmentId((at % u64::from(count)) as u32);
-                u64::from(table.is_born(segment))
-            });
             println!("| stamp | {count} | {threads} | {stamp:.1} |");
-            println!("| born bit | {count} | {threads} | {born:.1} |");
         }
     }
 }

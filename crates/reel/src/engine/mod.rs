@@ -389,6 +389,10 @@ impl ReelStore {
             }
         }
         crate::reel::volumes::ensure_manifest(&driver, &roots, &dead, is_read_only)?;
+        // Ahead of the rebuild, whose paged load takes covered segments' keys from them, and resident too, since a delete stands while a run holds an older row
+        if !is_read_only {
+            index.key_runs().load(&driver, &root)?;
+        }
         let persisted = offered_index(&driver, &root, &config, columns)?;
         let rebuilt = rebuild_from_persisted(
             &driver,
@@ -465,16 +469,10 @@ impl ReelStore {
         // a paged column resolves through. A resident one never asks.
         index.set_footers(Arc::clone(&shared) as Arc<dyn FooterSource>);
         index.set_records(Arc::clone(&shared) as Arc<dyn RecordSource>);
-        index.finish_spot_load()?;
         // And the other direction: a seal writes down what its segment weighs, and
         // these are the counters that know.
         shared.set_segments(index.segments_handle());
-        // A resident volume loads a paged opening's runs too, since a delete stands while a run holds an older row
-        if !is_read_only {
-            index
-                .key_runs()
-                .load(&shared.driver, &shared.volumes.roots()[0])?;
-        }
+        index.finish_open()?;
 
         // Nothing is waiting to be handed over: the only keys a rebuild leaves
         // resident are the tails', and a tail is handed over when it seals.
@@ -602,14 +600,6 @@ impl ReelStore {
     /// Slack in the byte counters from overwrites booked by length class
     pub fn spot_slack(&self) -> u64 {
         self.index.spot_slack()
-    }
-
-    /// Sealed segments a rebuild left uncounted, standing until they retire
-    ///
-    /// While any stand, the totals promise only a floor: their keys were never
-    /// joined, and each enters the counters as compaction or an overwrite touches it.
-    pub fn born_segments(&self) -> usize {
-        self.index.segments().born_count()
     }
 
     /// Sync every active tail, the durability surface

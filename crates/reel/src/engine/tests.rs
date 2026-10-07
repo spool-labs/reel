@@ -888,9 +888,11 @@ fn a_paged_open_never_installs_its_sealed_keys() {
             "the two opens disagree about {byte}"
         );
     }
-    // What it does not carry over is the count: how many sealed records a newer
-    // version shadows is the join a paged open does not do.
-    assert!(paged.totals().count < resident.totals().count);
+    assert_eq!(
+        paged.totals(),
+        resident.totals(),
+        "the two opens count apart"
+    );
 }
 
 // a failed seal parks the segment and the tick's retry finishes it
@@ -1982,7 +1984,7 @@ fn a_resident_volume_records_its_sealed_spans() {
         "nothing is handed over"
     );
     assert!(
-        store.index.answers_from_footers(RECORD) || store.index.sealed_spans(RECORD) > 0,
+        store.index.sealed_spans(RECORD) > 0,
         "a resident volume sealed segments and recorded none of them"
     );
     assert!(
@@ -5103,4 +5105,67 @@ fn a_cue_read_searches_packed_footer_blocks() {
         store.filter_probes().block_reads > before,
         "no search read a packed block"
     );
+}
+
+// a sealed key deleted in a tail stays gone after a paged reopen, once that tail seals and the grave goes
+#[test]
+fn a_tail_delete_of_a_sealed_key_holds_through_a_reopen() {
+    let settings = ReelConfig {
+        index: IndexResidency::Paged,
+        ..config(1, SyncPolicy::Never)
+    };
+    let payload = vec![0xa5u8; 8 * 1024];
+    let (store, sim, handed) = paged_image(&payload, settings.clone());
+    store.delete(&handed).expect("delete");
+    store.flush().expect("flush");
+    let image = sim.durable_image();
+    drop(store);
+
+    let reopened = reopen_image(image, settings);
+    for byte in 0..200u8 {
+        reopened.put(&record(8, byte), &payload).expect("put");
+    }
+    reopened.flush().expect("flush");
+    reopened.page_out_sealed().expect("hand over");
+    reopened.index.prune_tombstones(Lsn(u64::MAX));
+    assert_eq!(
+        reopened.index.grave_count(),
+        0,
+        "the grave stood, so this tested nothing"
+    );
+    assert!(
+        reopened.get(&handed).expect("read").is_none(),
+        "the delete came undone"
+    );
+    assert_eq!(reopened.totals().count, 399);
+}
+
+// a sealed key written again under a range delete still owed its sweep counts once
+#[test]
+fn a_rewrite_under_a_pending_cover_counts_once() {
+    let settings = ReelConfig {
+        index: IndexResidency::Paged,
+        ..config(1, SyncPolicy::Never)
+    };
+    let payload = vec![0xa5u8; 8 * 1024];
+    let (store, _sim, handed) = paged_image(&payload, settings);
+    let mut end = handed.as_slice().to_vec();
+    *end.last_mut().expect("a key") += 1;
+    store
+        .delete_range(&handed, Some(&end))
+        .expect("range delete");
+    store.put(&handed, &payload).expect("rewrite");
+    while store.sweep_covers().expect("sweep") {}
+
+    assert_eq!(
+        store.totals().count,
+        200,
+        "the rewritten key counted twice or not at all"
+    );
+    let off = store
+        .totals()
+        .bytes
+        .to_bytes()
+        .abs_diff(200 * payload.len() as u64);
+    assert!(off <= store.spot_slack(), "the bytes sit {off} off");
 }

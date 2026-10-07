@@ -46,9 +46,6 @@ struct Oracle {
     /// Segments the table has let go of, which no booking brings back
     retired: HashSet<SegmentId>,
 
-    /// Segments a rebuild left sealed
-    born: HashSet<SegmentId>,
-
     /// Segments wearing a life, whether or not they hold bytes
     stamped: HashSet<SegmentId>,
 }
@@ -133,20 +130,10 @@ impl Oracle {
         }
     }
 
-    fn mark_born(&mut self, segment: SegmentId) {
-        if !self.retired.contains(&segment) {
-            self.born.insert(segment);
-            self.stamped.insert(segment);
-        }
-    }
-
     /// A number the table never knew is left alone, since nothing stood there
     fn forget(&mut self, segment: SegmentId) {
-        let known = self.rows.contains_key(&segment)
-            || self.born.contains(&segment)
-            || self.stamped.contains(&segment);
+        let known = self.rows.contains_key(&segment) || self.stamped.contains(&segment);
         self.rows.remove(&segment);
-        self.born.remove(&segment);
         self.stamped.remove(&segment);
         if known {
             self.retired.insert(segment);
@@ -155,7 +142,6 @@ impl Oracle {
 
     fn rebuild(&mut self, segments: &HashMap<SegmentId, SegmentBytes>) {
         self.rows.clear();
-        self.born.clear();
         self.stamped.clear();
         self.retired.clear();
         for (segment, bytes) in segments {
@@ -228,11 +214,6 @@ fn agree(table: &SegmentTable, oracle: &Oracle, step: usize) {
         oracle.dead_bytes(),
         "dead gauge parted at {step}"
     );
-    assert_eq!(
-        table.born_count(),
-        oracle.born.len(),
-        "born count parted at {step}"
-    );
 
     let floors = table.floors();
     let (ranked, ranked_floors) = table.ranking();
@@ -265,11 +246,6 @@ fn agree(table: &SegmentTable, oracle: &Oracle, step: usize) {
             table.max_lsn_of(segment),
             oracle.rows.get(&segment).and_then(|row| row.max_lsn),
             "ceiling of {number} parted at step {step}"
-        );
-        assert_eq!(
-            table.is_born(segment),
-            oracle.born.contains(&segment),
-            "born bit of {number} parted at step {step}"
         );
         assert_eq!(
             !table.incarnation_of(segment).is_none(),
@@ -337,8 +313,8 @@ fn stream(seed: u64) {
                 oracle.live_incarnation(segment);
             }
             12 => {
-                table.mark_born([segment]);
-                oracle.mark_born(segment);
+                table.issue_incarnations([segment]);
+                oracle.live_incarnation(segment);
             }
             _ => {
                 table.forget(segment);
@@ -420,13 +396,12 @@ fn a_late_booking_never_brings_a_segment_back() {
     table.release_live(SegmentId(4), 700);
     table.settle_dead(SegmentId(4), 700);
     table.note_max(SegmentId(4), Lsn(1));
-    table.mark_born([SegmentId(4)]);
+    table.issue_incarnations([SegmentId(4)]);
 
     assert_eq!(table.len(), 1, "the retired row stayed gone");
     assert_eq!(table.bytes_of(SegmentId(4)), SegmentBytes::default());
     assert!(table.incarnation_of(SegmentId(4)).is_none());
     assert!(table.live_incarnation(SegmentId(4)).is_none());
-    assert!(!table.is_born(SegmentId(4)));
     // The floor the retired segment held is gone with it, and the late booking's
     // older number never became one.
     assert_eq!(table.min_lsn_excluding(SegmentId(9)), Some(Lsn(20)));
@@ -486,20 +461,15 @@ fn a_number_below_the_first_one_still_books() {
     assert_eq!(table.dropped_bookings(), 0);
 }
 
-// a rebuild's born marks land whatever order the segments arrive in
+// a rebuild's incarnations land whatever order the segments arrive in
 #[test]
-fn born_marks_land_out_of_number_order() {
+fn incarnations_land_out_of_number_order() {
     let table = SegmentTable::new();
-    table.mark_born([SegmentId(600), SegmentId(300), SegmentId(12)]);
+    table.issue_incarnations([SegmentId(600), SegmentId(300), SegmentId(12)]);
 
     for number in [600u32, 300, 12] {
-        assert!(
-            table.is_born(SegmentId(number)),
-            "segment {number} lost its born mark"
-        );
         assert!(!table.incarnation_of(SegmentId(number)).is_none());
     }
-    assert_eq!(table.born_count(), 3);
 }
 
 // the window gives its chunks back as the oldest segments retire

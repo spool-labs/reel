@@ -30,14 +30,14 @@ const FIXTURE_KEYS: u8 = 4;
 /// Payload length each fixture record carries
 const FIXTURE_LEN: usize = 300;
 
-/// Op position the root listing executes at, the only listing an open makes
+/// Op position the first root listing executes at, the one that finds the key runs
 const ROOT_LIST_AT: u64 = 0;
 
-/// Op position the first segment read executes at, once the listing has resolved
+/// Op position the first segment read executes at, once the listings have resolved
 ///
 /// Past the open every reopen spends looking for an index file to read back, which
 /// on a volume that wrote none is one op that answers missing.
-const FIRST_READ_AT: u64 = 4;
+const FIRST_READ_AT: u64 = 5;
 
 fn config() -> ReelConfig {
     ReelConfig {

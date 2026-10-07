@@ -22,6 +22,7 @@ use crate::index::counters::{Bookings, SegmentTable};
 use crate::index::entry::{span_of, Entry};
 use crate::index::page::KeyPage;
 use crate::index::paged::SealedRanges;
+use crate::index::spot::Booking;
 use crate::index::tbtreemap::{node_width, TBTreeMap, NODE_WIDTH};
 use crate::sync::{read, write};
 
@@ -219,14 +220,8 @@ impl ColumnIndex {
     }
 
     /// Book a record only a footer was answering for as gone
-    pub fn settle_paged(
-        &self,
-        key: &[u8],
-        loc: Loc,
-        counted: bool,
-        segments: &SegmentTable,
-    ) -> bool {
-        on_index!(self, index => index.settle_paged(key, loc, counted, segments))
+    pub fn settle_paged(&self, key: &[u8], loc: Loc, segments: &SegmentTable) -> bool {
+        on_index!(self, index => index.settle_paged(key, loc, segments))
     }
 
     /// Book a footer-held record gone with no read, its segment at `loc` and its live bytes at `least`
@@ -235,15 +230,24 @@ impl ColumnIndex {
         key: &[u8],
         loc: Loc,
         least: u32,
-        counted: bool,
         segments: &SegmentTable,
     ) -> bool {
-        on_index!(self, index => index.settle_paged_least(key, loc, least, counted, segments))
+        on_index!(self, index => index.settle_paged_least(key, loc, least, segments))
     }
 
     /// Swap the length a class booked for a record's true length, once it is known
     pub fn rebook_paged(&self, key: &[u8], booked: u32, actual: u32) {
         on_index!(self, index => index.rebook_paged(key, booked, actual))
+    }
+
+    /// Count sealed records an open put in the spot index, each key with its length, in key order
+    pub fn book_sealed<'a>(&self, rows: impl Iterator<Item = (&'a [u8], u32)>) {
+        on_index!(self, index => index.book_sealed(rows))
+    }
+
+    /// Move one key's sealed count from the version that went to the one that came
+    pub fn book_paged(&self, key: &[u8], booking: Booking) {
+        on_index!(self, index => index.book_paged(key, booking))
     }
 
     /// Take a paged key out with a grave of its own, for a record that will not read
@@ -252,10 +256,10 @@ impl ColumnIndex {
         key: &[u8],
         loc: Loc,
         lsn: Lsn,
-        counted: bool,
         segments: &SegmentTable,
+        take: impl FnOnce() -> bool,
     ) -> bool {
-        on_index!(self, index => index.evict_paged(key, loc, lsn, counted, segments))
+        on_index!(self, index => index.evict_paged(key, loc, lsn, segments, take))
     }
 
     /// Bring a paged key back into the map at the copy compaction rewrote it to
@@ -264,10 +268,10 @@ impl ColumnIndex {
         key: &[u8],
         to: Loc,
         lsn: Lsn,
-        counted: bool,
         stamp: SegmentIncarnation,
+        take: impl FnOnce() -> bool,
     ) -> bool {
-        on_index!(self, index => index.repoint_paged(key, to, lsn, counted, stamp))
+        on_index!(self, index => index.repoint_paged(key, to, lsn, stamp, take))
     }
 
     /// Take a half-open range with one standing cover, sweeping nothing
@@ -300,16 +304,10 @@ impl ColumnIndex {
         &self,
         key: &[u8],
         loc: Loc,
-        below: Lsn,
-        counted: bool,
         segments: &SegmentTable,
+        take: impl FnOnce() -> bool,
     ) -> bool {
-        on_index!(self, index => index.release_covered(key, loc, below, counted, segments))
-    }
-
-    /// Whether a finished cover already settled everything at this key and version
-    pub fn covered_by_swept(&self, key: &[u8], lsn: Lsn) -> bool {
-        on_index!(self, index => index.covered_by_swept(key, lsn))
+        on_index!(self, index => index.release_covered(key, loc, segments, take))
     }
 
     /// Whether an unfinished cover reaches into this inclusive key range
@@ -530,7 +528,7 @@ struct ShardState<K: IndexKey, S: Shape<K>> {
     /// Oldest sequence number any grave carries, a floor that can only understate
     oldest_grave: Lsn,
 
-    /// Live records of this shard that a sealed footer answers for instead
+    /// Live sealed records of this shard the spot index answers for
     paged: usize,
 }
 
@@ -1054,23 +1052,15 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         landed
     }
 
-    /// Book a record only a footer was answering for as gone
-    ///
-    /// The shard cannot find such a record itself, so the caller resolves it and
-    /// says whether any counter ever held it.
-    pub fn settle_paged(
-        &self,
-        key: &[u8],
-        loc: Loc,
-        counted: bool,
-        segments: &SegmentTable,
-    ) -> bool {
+    /// Book a record only a footer was answering for as gone, the caller having resolved it
+    pub fn settle_paged(&self, key: &[u8], loc: Loc, segments: &SegmentTable) -> bool {
         let Some(key) = K::from_slice(key) else {
             return false;
         };
         let at = self.shard_of(&key);
         let mut state = write(&self.shards[at]);
-        settle(&mut state, loc, segments, key.width(), counted)
+        settle(&mut state, loc, segments, key.width(), true);
+        true
     }
 
     /// Book a footer-held record gone with no read, its segment at `loc` and its live bytes at `least`
@@ -1079,7 +1069,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         key: &[u8],
         loc: Loc,
         least: u32,
-        counted: bool,
         segments: &SegmentTable,
     ) -> bool {
         let Some(key) = K::from_slice(key) else {
@@ -1087,16 +1076,52 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         };
         let at = self.shard_of(&key);
         let mut state = write(&self.shards[at]);
-        if counted {
-            if state.paged == 0 {
-                return false;
-            }
-            state.paged -= 1;
-            // A class's least length never exceeds the record's, so this never floors and a rebook lands exactly
-            state.bytes = state.bytes.saturating_sub(u64::from(least));
-        }
+        state.paged = state.paged.saturating_sub(1);
+        // A class's least length never exceeds the record's, so this never floors and a rebook lands exactly
+        state.bytes = state.bytes.saturating_sub(u64::from(least));
         segments.shadow(loc.segment, span_of(key.width(), loc.len));
         true
+    }
+
+    /// Count sealed records an open put in the spot index, one lock a run of keys sharing a shard
+    pub fn book_sealed<'a>(&self, rows: impl Iterator<Item = (&'a [u8], u32)>) {
+        let mut run: Option<(usize, usize, u64)> = None;
+        for (key, len) in rows {
+            let at = self.shard_of_bytes(key);
+            match &mut run {
+                Some((shard, keys, bytes)) if *shard == at => {
+                    *keys += 1;
+                    *bytes += u64::from(len);
+                }
+                _ => {
+                    if let Some((shard, keys, bytes)) = run.replace((at, 1, u64::from(len))) {
+                        self.book(shard, keys, bytes, None);
+                    }
+                }
+            }
+        }
+        if let Some((shard, keys, bytes)) = run {
+            self.book(shard, keys, bytes, None);
+        }
+    }
+
+    /// Move one key's sealed count from the version that went to the one that came
+    pub fn book_paged(&self, key: &[u8], booking: Booking) {
+        let (keys, bytes) = booking.came.map_or((0, 0), |len| (1, u64::from(len)));
+        self.book(self.shard_of_bytes(key), keys, bytes, booking.gone);
+    }
+
+    /// Add sealed keys and their bytes to a shard, less the one version that went
+    fn book(&self, at: usize, keys: usize, bytes: u64, gone: Option<u32>) {
+        let mut state = write(&self.shards[at]);
+        let was_empty = state.map.vacant() && state.paged == 0;
+        state.paged += keys;
+        state.bytes += bytes;
+        if let Some(len) = gone {
+            state.paged = state.paged.saturating_sub(1);
+            state.bytes = state.bytes.saturating_sub(u64::from(len));
+        }
+        self.note_filled(at, was_empty && keys > 0);
     }
 
     /// Swap the length a class booked for a record's true length, once it is known
@@ -1122,8 +1147,8 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         key: &[u8],
         loc: Loc,
         lsn: Lsn,
-        counted: bool,
         segments: &SegmentTable,
+        take: impl FnOnce() -> bool,
     ) -> bool {
         let Some(key) = K::from_slice(key) else {
             return false;
@@ -1131,11 +1156,10 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         let at = self.shard_of(&key);
         let mut state = write(&self.shards[at]);
         let was_empty = state.map.vacant();
-        if state.map.holds(key.as_slice())
-            || !settle(&mut state, loc, segments, key.width(), counted)
-        {
+        if state.map.holds(key.as_slice()) {
             return false;
         }
+        settle(&mut state, loc, segments, key.width(), take());
 
         self.filters.note(at, filter_hash(key.as_slice()));
         state.map.put(key, Entry::grave(lsn));
@@ -1150,8 +1174,8 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         key: &[u8],
         to: Loc,
         lsn: Lsn,
-        counted: bool,
         stamp: SegmentIncarnation,
+        take: impl FnOnce() -> bool,
     ) -> bool {
         let Some(key) = K::from_slice(key) else {
             return false;
@@ -1165,10 +1189,8 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         }
         self.filters.note(at, filter_hash(key.as_slice()));
         state.map.put(key, Entry::new(to, lsn).stamped(stamp));
-        // A rebuild never counted its sealed keys as paged, so those count fresh
-        match counted {
-            // Saturating on purpose: a count that reaches zero early is a count
-            // to fix, not a reason to drop a live record.
+        // A version the spot index held live was counted there, and one it did not counts fresh
+        match take() {
             true => state.paged = state.paged.saturating_sub(1),
             false => state.bytes += u64::from(to.len),
         }
@@ -1562,47 +1584,25 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         }
     }
 
-    /// Settle a footer-held record a standing cover has taken
-    ///
-    /// The release pass owns this settling: every other path declines the record as
-    /// covered, which is what keeps it from being booked dead twice. A map entry
-    /// older than the cover is itself the record's settling, left to the map sweep.
+    /// Settle a footer-held record a standing cover has taken, if the map holds nothing for the key and `take` finds its live slot
     pub fn release_covered(
         &self,
         key: &[u8],
         loc: Loc,
-        below: Lsn,
-        counted: bool,
         segments: &SegmentTable,
+        take: impl FnOnce() -> bool,
     ) -> bool {
         let Some(key) = K::from_slice(key) else {
             return false;
         };
         let at = self.shard_of(&key);
         let mut state = write(&self.shards[at]);
-        if let Some(entry) = state.map.at(key.as_slice()) {
-            if entry.lsn < below {
-                return false;
-            }
-        }
-        if !settle(&mut state, loc, segments, key.width(), counted) {
+        if state.map.holds(key.as_slice()) || !take() {
             return false;
         }
+        settle(&mut state, loc, segments, key.width(), true);
         self.note_emptied(at, &mut state);
         true
-    }
-
-    /// Whether a finished cover already settled everything at this key and version
-    pub fn covered_by_swept(&self, key: &[u8], lsn: Lsn) -> bool {
-        if !self.has_covers.load(Ordering::Relaxed) {
-            return false;
-        }
-        if !K::accepts(key) {
-            return false;
-        }
-        read(&self.covers)
-            .iter()
-            .any(|cover| matches!(cover.phase, SweepPhase::Done) && cover.covers(key, lsn))
     }
 
     /// Whether an unfinished cover reaches into this inclusive key range
@@ -1833,8 +1833,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             self.filters.clear(at);
             state.bytes = 0;
             state.graves = 0;
-            // What a rebuild installs is resident by definition, so a shard that had
-            // handed keys over starts from nothing like any other.
+            // A rebuild counts its sealed keys again, so a shard that had handed keys over starts from nothing
             state.paged = 0;
         }
         write(&self.occupied).clear();
@@ -2218,27 +2217,19 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     }
 }
 
-/// Book a record a footer was answering for as gone, if anything answers for it
-///
-/// What the shard's numbers do turns on whether they ever held this record: a key
-/// handed over at runtime was counted on its way out, and one a rebuild left sealed
-/// never was, so a born row moves the segment's bytes to dead and nothing else.
+/// Book a record a footer was answering for as gone, out of the shard's count where the spot index held it live
 fn settle<K: IndexKey, S: Shape<K>>(
     state: &mut ShardState<K, S>,
     loc: Loc,
     segments: &SegmentTable,
     key_width: u16,
     counted: bool,
-) -> bool {
+) {
     if counted {
-        if state.paged == 0 {
-            return false;
-        }
-        state.paged -= 1;
+        state.paged = state.paged.saturating_sub(1);
         state.bytes = state.bytes.saturating_sub(u64::from(loc.len));
     }
     segments.shadow(loc.segment, span_of(key_width, loc.len));
-    true
 }
 
 /// What a shard holds its keys in

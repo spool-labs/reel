@@ -446,38 +446,25 @@ impl Differential {
         }
 
         assert_eq!(memory, reel, "reel diverged from memory");
-        // A paged rebuild counts nothing sealed, so while a born segment stands the
-        // counters promise a floor rather than the total.
-        if self.reel.born_segments() == 0 {
-            let live: Vec<String> = reel
-                .records
-                .iter()
-                .map(|(key, value)| describe(key, value))
-                .collect();
-            assert_eq!(
-                self.reel.totals().count,
-                reel.global.count,
-                "reel count counter disagreed with a scan, seed {} at {:?}, live keys {live:?}",
-                self.seed,
-                self.at_step,
-            );
-            // An overwrite booked by length class sits up to half a class off
-            let (counted, slack) = (self.reel.totals().bytes.to_bytes(), self.reel.spot_slack());
-            assert!(
-                counted.abs_diff(reel.global.bytes) <= slack,
-                "reel byte counter disagreed with a scan: {counted} against {}, slack {slack}",
-                reel.global.bytes
-            );
-        } else {
-            assert!(
-                self.reel.totals().count <= reel.global.count,
-                "reel count counter overcounted under born segments"
-            );
-            assert!(
-                self.reel.totals().bytes.to_bytes() <= reel.global.bytes + self.reel.spot_slack(),
-                "reel byte counter overcounted under born segments"
-            );
-        }
+        let live: Vec<String> = reel
+            .records
+            .iter()
+            .map(|(key, value)| describe(key, value))
+            .collect();
+        assert_eq!(
+            self.reel.totals().count,
+            reel.global.count,
+            "reel count counter disagreed with a scan, seed {} at {:?}, live keys {live:?}",
+            self.seed,
+            self.at_step,
+        );
+        // An overwrite booked by length class sits up to half a class off
+        let (counted, slack) = (self.reel.totals().bytes.to_bytes(), self.reel.spot_slack());
+        assert!(
+            counted.abs_diff(reel.global.bytes) <= slack,
+            "reel byte counter disagreed with a scan: {counted} against {}, slack {slack}",
+            reel.global.bytes
+        );
     }
 }
 

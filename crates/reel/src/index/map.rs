@@ -1768,9 +1768,12 @@ impl ReelIndex {
             out.clear();
             return Ok(());
         };
+        let generation = self.sealed[slot].generation();
         if self.paged_footers(slot).is_none() {
             playback::resident_page(&self.indexes[slot], way, from, limit, out);
-            return Ok(());
+            if self.sealed[slot].generation() == generation {
+                return Ok(());
+            }
         }
         let mut playback = PlaybackCursor::new(column, way, from)?;
         self.page_from_held(&mut playback, limit, out)
@@ -1811,11 +1814,18 @@ impl ReelIndex {
             out.clear();
             return Ok(());
         };
-        match self.paged_footers(slot) {
-            Some(footers) => {
-                merged_page(&self.paged_at(slot, column, footers), playback, limit, out)
+        loop {
+            let generation = self.sealed[slot].generation();
+            if let Some(footers) = self.paged_footers(slot) {
+                return merged_page(&self.paged_at(slot, column, footers), playback, limit, out);
             }
-            None => playback.page_resident(&self.indexes[slot], limit, out),
+            let mark = playback.mark();
+            playback.page_resident(&self.indexes[slot], limit, out)?;
+            // A seal noted during the read may have handed over keys the page missed
+            if self.sealed[slot].generation() == generation {
+                return Ok(());
+            }
+            playback.rewind(&mark);
         }
     }
 

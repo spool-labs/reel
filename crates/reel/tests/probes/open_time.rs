@@ -20,8 +20,8 @@ use tempfile::TempDir;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IoBackend, KeyWidth, Preallocate,
-    RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IoBackend, KeyWidth, RecordKey, ReelConfig,
+    ReelStore, SyncPolicy, ThreadBudget,
 };
 
 /// Virtual root the simulator's files live under
@@ -71,8 +71,6 @@ const CASES: &[usize] = &[64, 256, 1024];
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT),
-        alloc_chunk: ByteCount::from_bytes(8 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         ..ReelConfig::default()

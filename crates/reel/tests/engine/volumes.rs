@@ -16,7 +16,7 @@ use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, RecordKey};
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::SimIo;
 use reel::units::ByteCount;
-use reel::{KeyWidth, Preallocate, ReelStore};
+use reel::{KeyWidth, ReelStore};
 
 const ROWS: ColumnId = ColumnId(1);
 
@@ -38,8 +38,6 @@ fn key(at: u64) -> RecordKey {
 fn config(extra: &[PathBuf]) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(256 * 1024),
-        alloc_chunk: ByteCount::from_bytes(64 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         volumes: extra.iter().cloned().map(VolumeSpec::fast).collect(),
@@ -388,14 +386,9 @@ fn destroy_walks_the_manifest() {
 }
 
 /// Simulated two-volume config, small segments so a short run rolls
-///
-/// Full preallocation puts exactly one allocate op on each segment creation, which
-/// is the op the ENOSPC sweeps aim at.
 fn sim_config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(32 * 1024),
-        alloc_chunk: ByteCount::from_bytes(32 * 1024),
-        preallocate: Preallocate::Full,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         volumes: vec![VolumeSpec::fast("/extra")],

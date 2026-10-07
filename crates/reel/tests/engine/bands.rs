@@ -14,8 +14,7 @@ use reel::format::record::{RecordHeader, HEADER_LEN};
 use reel::format::segment_header::SegmentHeader;
 use reel::{
     Band, ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, KeyWidth,
-    Preallocate, PurgeMark, RecordKey, RecordWrite, ReelConfig, ReelStore, SyncPolicy,
-    ThreadBudget,
+    PurgeMark, RecordKey, RecordWrite, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 const MARKED: ColumnId = ColumnId(1);
@@ -65,8 +64,6 @@ fn plain_key(at: u64) -> RecordKey {
 fn config(tails: u32) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT_BYTES),
-        alloc_chunk: ByteCount::from_bytes(SEGMENT_BYTES),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(tails),
         compact_mbps: CompactRate::Mbps(0),

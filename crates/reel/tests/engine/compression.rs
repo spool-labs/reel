@@ -13,8 +13,8 @@ use reel_core::Store;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, ReelConfig,
-    ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget,
 };
 
 const RECORDS: u64 = 64;
@@ -37,8 +37,6 @@ const RAW: ColumnSet = &[status(Codec::None)];
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(64 * 1024 * 1024),
-        alloc_chunk: ByteCount::from_bytes(1024 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         ..ReelConfig::default()
@@ -151,7 +149,6 @@ fn compaction_carries_the_codec_byte() {
             // segments small enough that the fill seals a few, and a threshold
             // low enough that the deletes below make them compactable
             segment_bytes: ByteCount::from_bytes(256 * 1024),
-            alloc_chunk: ByteCount::from_bytes(64 * 1024),
             compact_dead_ratio: 0.3,
             ..config()
         },

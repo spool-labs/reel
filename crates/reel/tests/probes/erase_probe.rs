@@ -59,7 +59,6 @@ fn config(segment: ByteCount) -> ReelConfig {
         sync: SyncPolicy::Never,
         scrub_mbps: 0,
         segment_bytes: segment,
-        alloc_chunk: ByteCount::from_bytes(16_384),
         ..ReelConfig::default()
     }
 }

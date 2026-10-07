@@ -20,7 +20,6 @@ mod negative_price;
 mod open_time;
 mod past_ram;
 mod playback_speed;
-mod preallocate_cost;
 mod publish_cost;
 mod repoint_hold;
 mod segment_price;
@@ -139,10 +138,6 @@ const PROBES: &[Probe] = &[
     opt_in(
         "playback_speed::walk_by_segment_count",
         playback_speed::walk_by_segment_count,
-    ),
-    opt_in(
-        "preallocate_cost::preallocation_cost_by_shape",
-        preallocate_cost::preallocation_cost_by_shape,
     ),
     opt_in("publish_cost::batch_publish", publish_cost::batch_publish),
     opt_in(

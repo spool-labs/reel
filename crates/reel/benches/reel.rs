@@ -23,8 +23,8 @@ use reel::format::record::{checksum, RecordHeader};
 use reel::io::posix_backend::PosixBackend;
 use reel::reel::segment::IoDriver;
 use reel::{
-    rebuild_reel, ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate,
-    RecordKey, ReelConfig, ReelIndex, ReelStore, SyncPolicy, ThreadBudget,
+    rebuild_reel, ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey,
+    ReelConfig, ReelIndex, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 const RECORDS: ColumnId = ColumnId(1);
@@ -95,8 +95,6 @@ impl Volume {
 fn base_config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(64 * MIB),
-        alloc_chunk: ByteCount::from_bytes(4 * MIB),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         scrub_mbps: 4,
@@ -430,31 +428,22 @@ fn recovery(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(10));
 
-    for chunk_mib in [1u64, 4] {
-        let config = ReelConfig {
-            alloc_chunk: ByteCount::from_bytes(chunk_mib * MIB),
-            ..base_config()
-        };
-        let volume = Volume::open(config);
-        fill(&volume.store, 64, 1024);
-        let reel_dir = reel_dir_of(volume.root());
-        drop(volume.store);
+    let volume = Volume::open(base_config());
+    fill(&volume.store, 64, 1024);
+    let reel_dir = reel_dir_of(volume.root());
+    drop(volume.store);
 
-        group.bench_function(
-            BenchmarkId::from_parameter(format!("{chunk_mib}MiB_chunk")),
-            |b| {
-                let index = ReelIndex::new(COLUMNS).expect("index");
-                b.iter(|| {
-                    let driver = IoDriver::new(Arc::new(PosixBackend::new()));
-                    black_box(
-                        rebuild_reel(&driver, std::slice::from_ref(&reel_dir), &[false], &index)
-                            .expect("rebuild"),
-                    )
-                })
-            },
-        );
-        drop(volume.dir);
-    }
+    group.bench_function("rebuild", |b| {
+        let index = ReelIndex::new(COLUMNS).expect("index");
+        b.iter(|| {
+            let driver = IoDriver::new(Arc::new(PosixBackend::new()));
+            black_box(
+                rebuild_reel(&driver, std::slice::from_ref(&reel_dir), &[false], &index)
+                    .expect("rebuild"),
+            )
+        })
+    });
+    drop(volume.dir);
     group.finish();
 }
 
@@ -465,7 +454,6 @@ fn scrub_scan(c: &mut Criterion) {
 
     let config = ReelConfig {
         segment_bytes: ByteCount::from_bytes(4 * MIB),
-        alloc_chunk: ByteCount::from_bytes(MIB),
         ..base_config()
     };
     let volume = Volume::open(config);

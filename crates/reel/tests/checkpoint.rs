@@ -40,7 +40,6 @@ fn key(at: u32) -> RecordKey {
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(1),
-        alloc_chunk: ByteCount::from_bytes(64 * 1024),
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(2),
         ..ReelConfig::default()

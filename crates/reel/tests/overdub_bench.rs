@@ -11,8 +11,7 @@ use tempfile::TempDir;
 
 use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, FenceResidency,
-    KeyWidth, MergeReport, Preallocate, ProbeCounts, RecordKey, ReelConfig, ReelStore, SyncPolicy,
-    ThreadBudget,
+    KeyWidth, MergeReport, ProbeCounts, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 /// The one column the workload writes
@@ -65,9 +64,6 @@ const VALUE_MEAN: u64 = 180;
 
 /// Segment size, which is how many rounds' writes stand in one sorted run
 const SEGMENT_BYTES: u64 = 2 * 1024 * 1024;
-
-/// Bytes reserved ahead of the write head per allocation step
-const ALLOC_CHUNK: u64 = 256 * 1024;
 
 /// Rewrite passes one tick drives before it gives the round back
 const COMPACT_PASSES: u64 = 8;
@@ -467,8 +463,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
 fn config(arm: &Arm, knobs: &Knobs) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(knobs.segment_bytes),
-        alloc_chunk: ByteCount::from_bytes(ALLOC_CHUNK),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(knobs.tails),
         // Off, so nothing reads the volume behind the reads being timed.

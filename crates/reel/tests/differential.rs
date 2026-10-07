@@ -9,7 +9,7 @@
 mod harness;
 
 use reel::io::fault::{FaultKind, FaultPlan};
-use reel::{ByteCount, FenceResidency, Preallocate, ReelConfig, SyncPolicy, ThreadBudget};
+use reel::{ByteCount, FenceResidency, ReelConfig, SyncPolicy, ThreadBudget};
 
 use harness::fixture::Differential;
 use harness::op_stream;
@@ -22,9 +22,6 @@ const STREAM_LEN: usize = 120;
 
 /// Segment size that rolls a few times over a default stream
 const SEGMENT_BYTES: u64 = 64 * 1024;
-
-/// Space reserved ahead of the write head per allocation step
-const ALLOC_CHUNK: u64 = 4 * 1024;
 
 /// How often the soak stream checks agreement and compacts the reel
 const SOAK_CHECK_EVERY: usize = 200;
@@ -47,8 +44,6 @@ const PAGED_STREAM_LEN: usize = 640;
 fn reel_config(active_tails: u32) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT_BYTES),
-        alloc_chunk: ByteCount::from_bytes(ALLOC_CHUNK),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::EveryPut,
         active_tails: ThreadBudget::threads(active_tails),
         ..ReelConfig::default()
@@ -58,8 +53,6 @@ fn reel_config(active_tails: u32) -> ReelConfig {
 fn never_config(active_tails: u32) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT_BYTES),
-        alloc_chunk: ByteCount::from_bytes(ALLOC_CHUNK),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(active_tails),
         ..ReelConfig::default()
@@ -69,8 +62,6 @@ fn never_config(active_tails: u32) -> ReelConfig {
 fn paged_config(active_tails: u32) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(PAGED_SEGMENT_BYTES),
-        alloc_chunk: ByteCount::from_bytes(ALLOC_CHUNK),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(active_tails),
         ..ReelConfig::default()
@@ -103,8 +94,6 @@ fn fenced_config(active_tails: u32, fence: FenceResidency) -> ReelConfig {
 fn soak_config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SOAK_SEGMENT_BYTES),
-        alloc_chunk: ByteCount::from_bytes(ALLOC_CHUNK),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(4),
         ..ReelConfig::default()

@@ -9,8 +9,8 @@
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, ReelConfig,
-    ReelStore, Store, StoreResult, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, Store,
+    StoreResult, ThreadBudget,
 };
 
 /// Family both opens are given, since a reader declares the columns it reads
@@ -28,7 +28,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
 
 /// Small enough that the run writes a file rather than a gibibyte of zeros
 const SEGMENT_BYTES: ByteCount = ByteCount::mb(4);
-const ALLOC_CHUNK: ByteCount = ByteCount::mb(1);
 
 /// Records the follower finds at its open, and the records written after it
 const SEEDED: u64 = 3;
@@ -37,8 +36,6 @@ const APPENDED: u64 = 2;
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: SEGMENT_BYTES,
-        alloc_chunk: ALLOC_CHUNK,
-        preallocate: Preallocate::Chunk,
         active_tails: ThreadBudget::threads(1),
         ..ReelConfig::default()
     }

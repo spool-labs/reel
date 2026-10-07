@@ -20,7 +20,7 @@ use tempfile::TempDir;
 use reel::config::{ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, RecordKey};
 use reel::units::ByteCount;
-use reel::{KeyWidth, Preallocate, ReelStore, MAP_EVERYTHING};
+use reel::{KeyWidth, ReelStore, MAP_EVERYTHING};
 
 const ROWS: ColumnId = ColumnId(1);
 
@@ -67,8 +67,6 @@ const READS: usize = 4_000;
 fn config(mapped: bool) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(64 * 1024 * 1024),
-        alloc_chunk: ByteCount::from_bytes(4 * 1024 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         scrub_mbps: 0,

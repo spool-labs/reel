@@ -1184,7 +1184,7 @@ mod tests {
 
     use crate::units::ByteCount;
 
-    use crate::config::{Preallocate, ReelConfig, SyncPolicy, ThreadBudget};
+    use crate::config::{ReelConfig, SyncPolicy, ThreadBudget};
     use crate::format::column::{Codec, ColumnSet, ColumnSpec};
     use crate::io::fault::FaultPlan;
     use crate::io::sim_backend::SimIo;
@@ -1242,8 +1242,6 @@ mod tests {
     fn config() -> ReelConfig {
         ReelConfig {
             segment_bytes: ByteCount::mb(1),
-            alloc_chunk: ByteCount::from_bytes(16_384),
-            preallocate: Preallocate::Chunk,
             sync: SyncPolicy::Never,
             active_tails: ThreadBudget::threads(1),
             ..ReelConfig::default()

@@ -10,8 +10,8 @@
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, RecordKey,
-    ReelConfig, ReelStore, Store, StoreResult, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelConfig, ReelStore,
+    Store, StoreResult, ThreadBudget,
 };
 
 /// Family name the trait addresses, and the identifier its records carry
@@ -30,7 +30,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
 
 /// Small enough that the run writes a file rather than a gibibyte of zeros
 const SEGMENT_BYTES: ByteCount = ByteCount::mb(4);
-const ALLOC_CHUNK: ByteCount = ByteCount::mb(1);
 
 /// Records written, and which one of them is deleted again
 const RECORD_COUNT: u64 = 4;
@@ -48,8 +47,6 @@ fn main() -> StoreResult<()> {
     let root = TempDir::new()?;
     let config = ReelConfig {
         segment_bytes: SEGMENT_BYTES,
-        alloc_chunk: ALLOC_CHUNK,
-        preallocate: Preallocate::Chunk,
         active_tails: ThreadBudget::threads(1),
         ..ReelConfig::default()
     };

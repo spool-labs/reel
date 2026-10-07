@@ -15,8 +15,8 @@ use reel::format::record::HEADER_LEN;
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, ReelConfig,
-    ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget,
 };
 use reel_core::Value;
 
@@ -58,8 +58,6 @@ const SEED: u64 = 1;
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(1),
-        alloc_chunk: ByteCount::from_bytes(64 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::EveryPut,
         active_tails: ThreadBudget::threads(1),
         ..ReelConfig::default()

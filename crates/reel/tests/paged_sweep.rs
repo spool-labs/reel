@@ -41,7 +41,6 @@ fn value_of(n: u64) -> Vec<u8> {
 fn filled(dir: &TempDir) -> (ReelStore, BTreeMap<Vec<u8>, Vec<u8>>) {
     let config = ReelConfig {
         segment_bytes: ByteCount::from_bytes(64 * 1024),
-        alloc_chunk: ByteCount::from_bytes(16 * 1024),
         sync: SyncPolicy::Never,
         ..ReelConfig::default()
     };

@@ -2077,9 +2077,7 @@ mod tests {
 
     use crate::append::admission::InflightBudget;
     use crate::append::Commit;
-    use crate::config::{
-        CompactRate, Preallocate, ReelConfig, SyncPolicy, ThreadBudget, DEFAULT_FD_CACHE,
-    };
+    use crate::config::{CompactRate, ReelConfig, SyncPolicy, ThreadBudget, DEFAULT_FD_CACHE};
     use crate::format::column::{
         Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyWidth, PurgeMark, RecordKey,
     };
@@ -2141,8 +2139,6 @@ mod tests {
     fn settings() -> ReelConfig {
         ReelConfig {
             segment_bytes: ByteCount::mb(1),
-            alloc_chunk: ByteCount::from_bytes(16_384),
-            preallocate: Preallocate::Chunk,
             sync: SyncPolicy::Never,
             active_tails: ThreadBudget::threads(1),
             scrub_mbps: 4,
@@ -2827,8 +2823,6 @@ mod tests {
     fn engine_config() -> ReelConfig {
         ReelConfig {
             segment_bytes: ByteCount::from_bytes(8_192),
-            alloc_chunk: ByteCount::from_bytes(4_096),
-            preallocate: Preallocate::Chunk,
             sync: SyncPolicy::Never,
             active_tails: ThreadBudget::threads(1),
             scrub_mbps: 4,

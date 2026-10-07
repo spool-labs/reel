@@ -21,8 +21,8 @@ use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::units::ByteCount;
 use reel::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, FenceResidency, KeyWidth, Preallocate, ProbeCounts,
-    RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
+    Codec, ColumnId, ColumnSet, ColumnSpec, FenceResidency, KeyWidth, ProbeCounts, RecordKey,
+    ReelConfig, ReelStore, SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
 };
 
 const ROWS: ColumnId = ColumnId(1);
@@ -87,8 +87,6 @@ fn config(fence: FenceResidency) -> ReelConfig {
 fn filtered_config(fence: FenceResidency, filter_bits: u8) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(KEYS_PER_SEGMENT * RECORD_BYTES),
-        alloc_chunk: ByteCount::from_bytes(64 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         footer_cache: FOOTER_CACHE,
@@ -316,8 +314,6 @@ const RUN_PROBES: u64 = 200;
 fn standing_runs(runs: u64, filter_bits: u8) -> (ReelStore, Vec<Vec<u64>>) {
     let config = ReelConfig {
         segment_bytes: ByteCount::from_bytes(RUN_BYTES),
-        alloc_chunk: ByteCount::from_bytes(64 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         footer_cache: FOOTER_CACHE,

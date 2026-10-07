@@ -16,8 +16,8 @@ use tempfile::TempDir;
 
 use reel::io::posix_backend::PosixBackend;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, RangedReads,
-    RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RangedReads, RecordKey,
+    ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 /// Bytes the group takes at the front of a record key
@@ -74,8 +74,6 @@ const PAYLOAD: usize = 3_000;
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT_BYTES),
-        alloc_chunk: ByteCount::from_bytes(8 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         compact_dead_ratio: 0.1,
@@ -163,8 +161,6 @@ const ROUTED_READERS: usize = 3;
 fn routed_config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(16),
-        alloc_chunk: ByteCount::from_bytes(64 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         // Exact counts, which is the only cadence the plane counters mean anything at
         active_tails: ThreadBudget::threads(1),

@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use reel::reel::bias::{access_ranges, MachineFacts, Plane, RingAvailability};
-use reel::{ByteCount, IoBackend, Preallocate, RangedReads, ReelConfig, DEFAULT_FD_CACHE};
+use reel::{ByteCount, IoBackend, RangedReads, ReelConfig, DEFAULT_FD_CACHE};
 
 /// How a floor reads in the report, where absent means the volume maps nothing
 fn floor_label(floor: Option<ByteCount>) -> String {
@@ -52,8 +52,7 @@ pub fn what_this_machine_argues_for() {
     let root = root();
     let config = ReelConfig::default();
     let facts = MachineFacts::read(&root);
-    let reservation = config.segment_bytes.to_bytes() * config.active_tails.resolve_tails() as u64;
-    let verdict = facts.verdict(reservation);
+    let verdict = facts.verdict();
 
     println!();
     println!("root {}", root.display());
@@ -118,15 +117,11 @@ pub fn what_this_machine_argues_for() {
     );
 
     println!();
-    println!(
-        "idle reservation under the shipped default: {}",
-        bytes(Some(reservation))
-    );
     println!("because: {}", verdict.because);
     println!("mapping: {}", verdict.map_because);
     println!();
 
-    let rows: [(&str, String, String); 4] = [
+    let rows: [(&str, String, String); 3] = [
         (
             "plane",
             format!("{:?}", configured_plane(config.io_backend)),
@@ -146,11 +141,6 @@ pub fn what_this_machine_argues_for() {
             "ranged reads",
             format!("{:?}", config.ranged_reads),
             format!("{:?}", verdict.ranged_reads),
-        ),
-        (
-            "preallocate",
-            format!("{:?}", config.preallocate),
-            format!("{:?}", verdict.preallocate),
         ),
     ];
 
@@ -201,9 +191,8 @@ pub fn the_rule_is_a_function_of_its_facts() {
         ..small
     };
 
-    let reservation = ByteCount::gb(8).to_bytes();
-    let small = small.verdict(reservation);
-    let large = large.verdict(reservation);
+    let small = small.verdict();
+    let large = large.verdict();
 
     assert_eq!(small.plane, Plane::Buffered, "half of memory stays warm");
     assert_eq!(small.ranged_reads, RangedReads::Cached);
@@ -224,16 +213,12 @@ pub fn the_rule_is_a_function_of_its_facts() {
         open_file_limit: Some(1024),
         ..MachineFacts::default()
     }
-    .verdict(reservation);
+    .verdict();
     assert_eq!(held.plane, Plane::Buffered);
     assert!(
         held.map_above.is_some(),
         "a disk under memory was refused a mapping"
     );
-
-    // 8 GiB against a 4 TiB disk is far under the eighth that would chunk it.
-    assert_eq!(small.preallocate, Preallocate::Full);
-    assert_eq!(large.preallocate, Preallocate::Full);
 
     // 1024 descriptors, halved for headroom, halved again where direct doubles.
     assert_eq!(small.fd_cache, 512, "half of 1024, buffered");

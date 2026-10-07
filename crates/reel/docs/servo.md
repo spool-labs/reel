@@ -253,7 +253,7 @@ runs a factless bias pass in silence. Confirmed in a Linux VM whose root is
 btrfs and whose host passthrough is virtiofs, where a loop-mounted ext4 on the
 same kernel read its facts normally.
 
-The pass reaches five choices, and their rules are one line each. It logs them and
+The pass reaches four choices, and their rules are one line each. It logs them and
 applies none, and `fd_cache` is no longer a knob at all, so that row is a fact about
 the machine rather than an opinion about a config:
 
@@ -262,7 +262,6 @@ the machine rather than an opinion about a config:
 | plane | direct once the volume *holds* `DIRECT_AT_OCCUPANCY_RATIO` times memory |
 | `map_above` | sixteen times the device's readahead, but only where the *filesystem* is within `DIRECT_AT_OCCUPANCY_RATIO` of memory; absent otherwise |
 | `ranged_reads` | follows the plane, so windows are read the way the volume is |
-| `preallocate` | `Chunk` once the idle reservation passes an eighth of the disk |
 | `fd_cache` | under half of `RLIMIT_NOFILE`, halved again under direct |
 
 **The mapping rule turns on capacity where the plane rule turns on occupancy, and

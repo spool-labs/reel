@@ -70,12 +70,6 @@ pub struct DoctorReport {
     /// Whether this machine argues for ranged reads
     pub verdict_ranged_reads: String,
 
-    /// Whether the configuration preallocates a segment before writing it
-    pub configured_preallocate: String,
-
-    /// Whether this machine argues for preallocation
-    pub verdict_preallocate: String,
-
     /// Open segment files the shipped default caches
     pub shipped_fd_cache: u64,
 
@@ -90,7 +84,7 @@ pub struct DoctorReport {
 pub fn doctor(root: &Path, config: &ReelConfig) -> DoctorReport {
     let facts = MachineFacts::read(root);
     let reservation = config.segment_bytes.to_bytes() * config.tail_count() as u64;
-    let verdict = facts.verdict(reservation);
+    let verdict = facts.verdict();
     let spans = access_ranges(root);
     DoctorReport {
         root: root.display().to_string(),
@@ -111,8 +105,6 @@ pub fn doctor(root: &Path, config: &ReelConfig) -> DoctorReport {
         map_because: verdict.map_because.to_string(),
         configured_ranged_reads: format!("{:?}", config.ranged_reads),
         verdict_ranged_reads: format!("{:?}", verdict.ranged_reads),
-        configured_preallocate: format!("{:?}", config.preallocate),
-        verdict_preallocate: format!("{:?}", verdict.preallocate),
         shipped_fd_cache: DEFAULT_FD_CACHE,
         verdict_fd_cache: verdict.fd_cache,
     }
@@ -244,7 +236,7 @@ impl DoctorReport {
     }
 
     /// The knobs the configuration asks for beside the ones this machine argues for
-    fn knobs(&self) -> [Knob; 5] {
+    fn knobs(&self) -> [Knob; 4] {
         [
             Knob {
                 name: "plane",
@@ -270,12 +262,6 @@ impl DoctorReport {
                 name: "ranged reads",
                 configured: self.configured_ranged_reads.clone(),
                 chosen: self.verdict_ranged_reads.clone(),
-                because: None,
-            },
-            Knob {
-                name: "preallocate",
-                configured: self.configured_preallocate.clone(),
-                chosen: self.verdict_preallocate.clone(),
                 because: None,
             },
             Knob {

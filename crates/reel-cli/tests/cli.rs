@@ -11,8 +11,8 @@ use std::path::Path;
 use std::process::Command;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, RecordKey,
-    ReelConfig, ReelStore, SyncPolicy,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelConfig, ReelStore,
+    SyncPolicy,
 };
 use tempfile::TempDir;
 
@@ -104,8 +104,6 @@ fn key(byte: u8) -> RecordKey {
 fn volume(dir: &TempDir) -> &Path {
     let config = ReelConfig {
         segment_bytes: ByteCount::mb(2),
-        alloc_chunk: ByteCount::mb(1),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         ..ReelConfig::default()
     };

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use reel::config::{ReelConfig, SyncPolicy, ThreadBudget, VolumeSpec};
 use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, RecordKey};
 use reel::units::ByteCount;
-use reel::{KeyWidth, Preallocate, ReelStore};
+use reel::{KeyWidth, ReelStore};
 
 const ROWS: ColumnId = ColumnId(1);
 
@@ -99,8 +99,6 @@ pub fn what_a_volume_holds() {
 
     let config = ReelConfig {
         segment_bytes: ByteCount::from_bytes(256 * 1024),
-        alloc_chunk: ByteCount::from_bytes(64 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(2),
         volumes: vec![VolumeSpec::fast(extra.clone())],

@@ -1611,7 +1611,7 @@ mod tests {
 
     use crate::append::admission::InflightBudget;
     use crate::append::{Appender, BatchRecord, BatchWrite, Commit};
-    use crate::config::{Preallocate, ReelConfig, SyncPolicy, DEFAULT_FD_CACHE};
+    use crate::config::{ReelConfig, SyncPolicy, DEFAULT_FD_CACHE};
     use crate::format::column::{Codec, ColumnSet, ColumnSpec, KeyWidth};
     use crate::index::page::KeyPage;
     use crate::index::paged::FooterSource;
@@ -1651,8 +1651,6 @@ mod tests {
     fn config(sync: SyncPolicy) -> ReelConfig {
         ReelConfig {
             segment_bytes: ByteCount::mb(1),
-            alloc_chunk: ByteCount::from_bytes(4096 * 4),
-            preallocate: Preallocate::Chunk,
             sync,
             ..ReelConfig::default()
         }

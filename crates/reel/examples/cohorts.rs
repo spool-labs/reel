@@ -14,14 +14,13 @@ use tempfile::TempDir;
 
 use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, KeyWidth,
-    Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 const EVENTS: ColumnId = ColumnId(1);
 
 /// Segments small enough that one group spans several, so a drop empties files
 const SEGMENT_BYTES: ByteCount = ByteCount::from_bytes(128 * 1024);
-const ALLOC_CHUNK: ByteCount = ByteCount::from_bytes(32 * 1024);
 const PAYLOAD_BYTES: usize = 4 * 1024;
 const GROUP_COUNT: u32 = 6;
 const PER_GROUP: u64 = 64;
@@ -59,8 +58,6 @@ fn main() {
     let root = TempDir::new().expect("root");
     let config = ReelConfig {
         segment_bytes: SEGMENT_BYTES,
-        alloc_chunk: ALLOC_CHUNK,
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         compact_mbps: CompactRate::Mbps(0),

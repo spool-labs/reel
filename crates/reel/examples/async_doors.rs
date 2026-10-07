@@ -63,7 +63,6 @@ fn main() -> StoreResult<()> {
     let dir = tempfile::tempdir()?;
     let config = ReelConfig {
         segment_bytes: ByteCount::mb(16),
-        alloc_chunk: ByteCount::mb(1),
         ..ReelConfig::default()
     };
     let store = ReelStore::open(dir.path().to_path_buf(), config, COLUMNS)?;

@@ -11,7 +11,6 @@ use crate::units::ByteCount;
 use crate::error::{ReelError, Result};
 
 const DEFAULT_SEGMENT_GIB: u64 = 1;
-const DEFAULT_ALLOC_CHUNK_MIB: u64 = 64;
 const DEFAULT_COMPACT_DEAD_RATIO: f64 = 0.50;
 const DEFAULT_SCRUB_MBPS: u64 = 64;
 
@@ -43,17 +42,6 @@ pub enum SyncPolicy {
     Bytes(ByteCount),
     /// Sync after every put
     EveryPut,
-}
-
-/// Whether a new segment reserves space per step or is pre-written whole
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-pub enum Preallocate {
-    /// Reserve ahead of the write head in allocation chunks
-    Chunk,
-    /// Pre-write the whole segment at creation
-    Full,
 }
 
 /// Compaction rate limit, unpaced unless a cap is named
@@ -299,12 +287,6 @@ pub struct ReelConfig {
     /// Target size of each segment file before it seals
     pub segment_bytes: ByteCount,
 
-    /// Bytes reserved ahead of the write head per allocation step
-    pub alloc_chunk: ByteCount,
-
-    /// Whether a new segment reserves per step or is pre-written whole
-    pub preallocate: Preallocate,
-
     /// Durability sync cadence for group commit drains
     pub sync: SyncPolicy,
 
@@ -376,8 +358,6 @@ impl Default for ReelConfig {
     fn default() -> Self {
         Self {
             segment_bytes: ByteCount::gb(DEFAULT_SEGMENT_GIB),
-            alloc_chunk: ByteCount::mb(DEFAULT_ALLOC_CHUNK_MIB),
-            preallocate: Preallocate::Full,
             sync: SyncPolicy::Never,
             compact_dead_ratio: DEFAULT_COMPACT_DEAD_RATIO,
             compact_mbps: CompactRate::Auto,
@@ -434,18 +414,6 @@ impl ReelConfig {
         if segment > u32::MAX as u64 {
             return Err(ReelError::Config(
                 "segment_bytes must fit a u32 offset, under four gibibytes".to_string(),
-            ));
-        }
-
-        let alloc = self.alloc_chunk.to_bytes();
-        if alloc == 0 {
-            return Err(ReelError::Config(
-                "alloc_chunk must be non-zero".to_string(),
-            ));
-        }
-        if alloc > segment {
-            return Err(ReelError::Config(
-                "alloc_chunk must not exceed segment_bytes".to_string(),
             ));
         }
 
@@ -537,18 +505,6 @@ mod tests {
     fn segment_too_large() {
         let config = ReelConfig {
             segment_bytes: ByteCount::gb(4),
-            ..ReelConfig::default()
-        };
-
-        assert!(config.validate().is_err());
-    }
-
-    // an alloc chunk larger than the segment is rejected
-    #[test]
-    fn alloc_over_segment() {
-        let config = ReelConfig {
-            segment_bytes: ByteCount::gb(1),
-            alloc_chunk: ByteCount::gb(2),
             ..ReelConfig::default()
         };
 

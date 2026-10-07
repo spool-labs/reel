@@ -37,8 +37,8 @@ use reel::format::record::{RecordHeader, HEADER_LEN};
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::{
-    ByteCount, Preallocate, RecordKey, RecordWrite, ReelConfig, ReelStore, Result as ReelResult,
-    SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
+    ByteCount, RecordKey, RecordWrite, ReelConfig, ReelStore, Result as ReelResult, SyncPolicy,
+    ThreadBudget, SEGMENT_SUFFIX,
 };
 
 use harness::wire::{record_key, ID_LEN, TEST_COLUMNS};
@@ -334,8 +334,6 @@ fn stress_passes() -> u32 {
 fn config(shape: &Shape) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(16 * 1024),
-        alloc_chunk: ByteCount::from_bytes(16 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(shape.tails),
         compact_dead_ratio: 0.1,

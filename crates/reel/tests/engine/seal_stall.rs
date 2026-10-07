@@ -14,8 +14,8 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, RecordKey,
-    ReelConfig, ReelStore, SyncPolicy,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelConfig, ReelStore,
+    SyncPolicy,
 };
 
 const RECORDS: ColumnId = ColumnId(1);
@@ -83,8 +83,6 @@ fn record_id(index: usize) -> [u8; 32] {
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT_BYTES),
-        alloc_chunk: ByteCount::from_bytes(1024 * 1024),
-        preallocate: Preallocate::Chunk,
         // The seal is what is measured, so nothing else may sync or move the device.
         sync: SyncPolicy::Never,
         scrub_mbps: 0,

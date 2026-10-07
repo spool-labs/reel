@@ -69,7 +69,6 @@ fn record_key(group: u16, id: [u8; 32]) -> RecordKey {
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT_BYTES),
-        alloc_chunk: ByteCount::from_bytes(SEGMENT_BYTES / 8),
         sync: SyncPolicy::Never,
         compact_mbps: CompactRate::Mbps(0),
         scrub_mbps: 0,

@@ -31,7 +31,7 @@ use reel::format::segment_header::{SegmentHeader, SEGMENT_HEADER_LEN, SEGMENT_HE
 use reel::index::column::ColumnMark;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::{DurableImage, SimIo};
-use reel::{ByteCount, Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget};
+use reel::{ByteCount, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget};
 
 use harness::observe::observe;
 use harness::op_stream::StreamOp;
@@ -76,8 +76,6 @@ const FIXTURE_LEN: usize = 5_000;
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(32 * 1024),
-        alloc_chunk: ByteCount::from_bytes(8 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::EveryPut,
         active_tails: ThreadBudget::threads(1),
         ..ReelConfig::default()

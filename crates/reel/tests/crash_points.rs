@@ -17,8 +17,8 @@ use reel::format::record::KEYLESS_PREFIX;
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::{
-    ByteCount, Preallocate, RecordWrite, ReelConfig, ReelStore, RepairPath, SyncPolicy,
-    ThreadBudget, SEGMENT_SUFFIX,
+    ByteCount, RecordWrite, ReelConfig, ReelStore, RepairPath, SyncPolicy, ThreadBudget,
+    SEGMENT_SUFFIX,
 };
 use reel_core::{Direction, Store, Value};
 use reel_mock::MemoryStore;
@@ -59,9 +59,6 @@ const SEGMENT_SMALL: u64 = 16 * 1024;
 
 /// Segment size large enough that a short run never rolls
 const SEGMENT_LARGE: u64 = 1024 * 1024;
-
-/// Space reserved ahead of the write head per allocation step
-const ALLOC_CHUNK: u64 = 4 * 1024;
 
 /// A small payload for the targeted streams
 const SMALL_PAYLOAD: usize = 200;
@@ -145,8 +142,6 @@ const SCATTER_SECTORS: [u32; 2] = [512, 4096];
 fn crash_config(active_tails: u32, sync: SyncPolicy, segment_bytes: u64) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(segment_bytes),
-        alloc_chunk: ByteCount::from_bytes(ALLOC_CHUNK),
-        preallocate: Preallocate::Chunk,
         sync,
         active_tails: ThreadBudget::threads(active_tails),
         ..ReelConfig::default()

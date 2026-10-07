@@ -13,15 +13,14 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, RecordKey,
-    ReelConfig, ReelStore, SyncPolicy, ThreadBudget, VolumeSpec,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelConfig, ReelStore,
+    SyncPolicy, ThreadBudget, VolumeSpec,
 };
 
 const RECORDS: ColumnId = ColumnId(1);
 
 /// Small segments against an eight kibibyte payload, so a short run seals several
 const SEGMENT_BYTES: ByteCount = ByteCount::from_bytes(256 * 1024);
-const ALLOC_CHUNK: ByteCount = ByteCount::from_bytes(64 * 1024);
 const RECORD_COUNT: u64 = 120;
 const PAYLOAD_BYTES: usize = 8 * 1024;
 
@@ -44,8 +43,6 @@ fn key(at: u64) -> RecordKey {
 fn config(warm: &Path, cold: &Path) -> ReelConfig {
     ReelConfig {
         segment_bytes: SEGMENT_BYTES,
-        alloc_chunk: ALLOC_CHUNK,
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         volumes: vec![VolumeSpec::fast(warm), VolumeSpec::capacity(cold)],

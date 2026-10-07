@@ -15,9 +15,7 @@ use tempfile::{tempdir, TempDir};
 
 use crate::units::ByteCount;
 
-use crate::config::{
-    CompactRate, PointReads, Preallocate, RangedReads, RepairPath, SyncPolicy, ThreadBudget,
-};
+use crate::config::{CompactRate, PointReads, RangedReads, RepairPath, SyncPolicy, ThreadBudget};
 use crate::format::column::{Codec, ColumnId, ColumnSpec};
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::{Loc, SegmentId};
@@ -90,8 +88,6 @@ const NAME_COLUMNS: ColumnSet = &[ColumnSpec {
 fn config(active_tails: u32, sync: SyncPolicy) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(1),
-        alloc_chunk: ByteCount::from_bytes(16_384),
-        preallocate: Preallocate::Chunk,
         sync,
         active_tails: ThreadBudget::threads(active_tails),
         ..ReelConfig::default()
@@ -2340,7 +2336,7 @@ fn a_real_volume_reads_the_machine_and_a_simulated_one_does_not() {
         "a mounted filesystem has a capacity",
     );
     // Whatever the ratio says, the pass reaches a plane rather than nothing.
-    let _ = facts.verdict(0).plane;
+    let _ = facts.verdict().plane;
 
     let (simulated, _sim) = sim_store(config(1, SyncPolicy::Never));
     assert_eq!(
@@ -2350,9 +2346,9 @@ fn a_real_volume_reads_the_machine_and_a_simulated_one_does_not() {
     );
 }
 
-// a record larger than the allocation step survives the steps behind it
+// a large record lands whole on posix, and the record written after it lands too
 #[test]
-fn a_record_past_the_alloc_chunk_lands_whole_on_posix() {
+fn a_large_record_lands_whole_on_posix() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = ReelStore::open(
         dir.path().to_path_buf(),
@@ -2361,7 +2357,6 @@ fn a_record_past_the_alloc_chunk_lands_whole_on_posix() {
     )
     .expect("open");
 
-    // Six small records, then one three times the 16 KiB allocation step.
     for byte in 1..=6u8 {
         store.put(&record(3, byte), &[byte; 400]).expect("put");
     }
@@ -4785,7 +4780,6 @@ fn refresh_reads_only_what_is_new() {
 fn refresh_follows_a_relocation() {
     let mut settings = config(1, SyncPolicy::EveryPut);
     settings.segment_bytes = ByteCount::from_bytes(8_192);
-    settings.alloc_chunk = ByteCount::from_bytes(4_096);
     let (writer, sim) = sim_store(settings.clone());
     for byte in 1..=4u8 {
         writer.put(&record(7, byte), &[byte; 1_500]).expect("put");

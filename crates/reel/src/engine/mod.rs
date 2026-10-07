@@ -285,9 +285,7 @@ impl ReelStore {
         // exist, so the facts stay on the store for a caller that reports them.
         let bias = is_real_fs.then(|| {
             let facts = MachineFacts::read(&root);
-            // What `Preallocate::Full` would claim before a byte is written.
-            let reservation = config.segment_bytes.to_bytes() * config.tail_count() as u64;
-            let verdict = facts.verdict(reservation);
+            let verdict = facts.verdict();
             tracing::info!(
                 configured = ?config.io_backend,
                 would_open_on = ?verdict.plane,
@@ -301,7 +299,6 @@ impl ReelStore {
                 open_file_limit = ?facts.open_file_limit,
                 ring = ?facts.ring,
                 would_read_windows_on = ?verdict.ranged_reads,
-                would_preallocate = ?verdict.preallocate,
                 would_map_above = ?verdict.map_above,
                 mapping_because = verdict.map_because,
                 would_cache_descriptors = verdict.fd_cache,

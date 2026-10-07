@@ -405,8 +405,6 @@ fn config() -> ReelConfig {
         scrub_mbps: 0,
         sync: SyncPolicy::Never,
         segment_bytes: ByteCount::from_bytes(segment_bytes()),
-        // A segment smaller than its own allocation chunk is refused at open.
-        alloc_chunk: ByteCount::from_bytes(segment_bytes().min(64 * 1024 * 1024)),
         io_backend: backend(),
         ..ReelConfig::default()
     }

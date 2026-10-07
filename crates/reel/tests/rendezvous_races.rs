@@ -17,7 +17,7 @@ use reel::io::sim_backend::SimIo;
 use reel::sync::rendezvous;
 use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, KeyPage, KeyWidth,
-    PlaybackCursor, Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget, Way,
+    PlaybackCursor, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget, Way,
 };
 
 const COLUMNS: ColumnSet = &[ColumnSpec {
@@ -32,8 +32,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(128 * 1024),
-        alloc_chunk: ByteCount::from_bytes(32 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         ..ReelConfig::default()
@@ -294,8 +292,6 @@ fn open_sim(root: &str, seed: u64) -> (Arc<ReelStore>, SimIo) {
         PathBuf::from(root),
         ReelConfig {
             segment_bytes: ByteCount::from_bytes(65_536),
-            alloc_chunk: ByteCount::from_bytes(4_096),
-            preallocate: Preallocate::Chunk,
             sync: SyncPolicy::Never,
             active_tails: ThreadBudget::threads(1),
             ..ReelConfig::default()

@@ -92,7 +92,6 @@ fn column(id: ColumnId, name: &'static str, key_width: usize) -> ColumnSpec {
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(64),
-        alloc_chunk: ByteCount::mb(16),
         sync: SyncPolicy::Never,
         ..ReelConfig::default()
     }

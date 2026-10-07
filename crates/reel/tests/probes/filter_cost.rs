@@ -114,6 +114,8 @@ fn miss_counts(store: &ReelStore) -> ProbeCounts {
 fn hit_counts(store: &ReelStore, keys: u64) -> ProbeCounts {
     // Ask the index itself as of a cue point, since the spot index answers a store read first
     let cue = store.cue().expect("cue");
+    // The index searches only the segments it was told of, and a cue's seal is told on the next store read
+    store.page_out_sealed().expect("page out");
     let before = store.filter_probes();
     for at in 0..keys {
         assert!(

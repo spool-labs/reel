@@ -51,8 +51,7 @@ consistently because there is no manifest at all.
 
 ## The procedure
 
-1. Take a cue point. This seals the tails, settles the sealed queue, and
-   pins the floor.
+1. Take a cue point. This seals the tails and pins the floor.
 2. Enumerate the sealed segments. This is the step with two traps in it.
 
    Not from the index's segment table. The directory is what recovery itself reads, and the number

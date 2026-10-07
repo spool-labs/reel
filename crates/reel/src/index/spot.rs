@@ -1,7 +1,7 @@
 //! The spot index keeps record locations for sealed keys and checks each key in its record's header
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use reel_core::Value;
@@ -885,6 +885,12 @@ pub struct SpotColumn {
 
     /// Rows taken by an open before it could read a header, settled once it can
     set_aside: Mutex<Vec<SetAside>>,
+
+    /// Whether a live slot whose segment went stays for the next pass, as a read-only open needs
+    follows: AtomicBool,
+
+    /// How many lookups on a read-only open met a live slot whose segment went
+    behind: AtomicU64,
 }
 
 impl Default for SpotColumn {
@@ -904,6 +910,8 @@ impl SpotColumn {
             beside: AtomicU64::new(0),
             slack: AtomicU64::new(0),
             set_aside: Mutex::new(Vec::new()),
+            follows: AtomicBool::new(false),
+            behind: AtomicU64::new(0),
         }
     }
 
@@ -911,6 +919,25 @@ impl SpotColumn {
     pub fn attach(&self, records: Arc<dyn RecordSource>, segments: Arc<SegmentTable>) {
         let _ = self.records.set(records);
         let _ = self.segments.set(segments);
+    }
+
+    /// Keep each live slot whose segment went, for a read-only open whose next pass moves or books it
+    pub fn follow(&self) {
+        self.follows.store(true, Ordering::Release);
+    }
+
+    /// How many lookups on a read-only open met a live slot whose segment went
+    pub fn behind(&self) -> u64 {
+        self.behind.load(Ordering::Acquire)
+    }
+
+    /// Whether a read-only open keeps this slot whose segment went, counting the lookup that met it
+    fn keeps_gone(&self, slot: &Slot) -> bool {
+        let keeps = self.follows.load(Ordering::Acquire) && !slot.is_displaced();
+        if keeps {
+            self.behind.fetch_add(1, Ordering::AcqRel);
+        }
+        keeps
     }
 
     /// Older versions waiting for the cleaner
@@ -1410,6 +1437,8 @@ impl SpotColumn {
             match answer {
                 HeadRead::Same(head) if head.lsn < newer => older.push((slot, head.len)),
                 HeadRead::Same(_) | HeadRead::Other | HeadRead::Cold => {}
+                // The length went with the segment, so a version still counted is booked from its class
+                HeadRead::Missing if !slot.is_displaced() => unread.push(slot),
                 HeadRead::Missing => gone.push(slot),
             }
         }
@@ -1728,6 +1757,8 @@ impl SpotColumn {
             }
             SpotRead::Tombstone(head) => (head, None),
             SpotRead::Other => return Offered::Next,
+            // A read-only open keeps the slot for the pass that moves or books its version
+            SpotRead::Gone if self.keeps_gone(&candidate.slot) => return Offered::Unsettled,
             // The segment is gone, so the slot points at nothing and goes before the next look
             SpotRead::Gone => {
                 self.shards[shard_of(pick.hash)]
@@ -1808,6 +1839,8 @@ impl SpotColumn {
                 HeadRead::Same(head) if best.is_none_or(|(current, _)| head.lsn > current.lsn) => {
                     best = Some((head, *slot));
                 }
+                // A read-only open keeps the slot for the pass that moves or books its version
+                HeadRead::Missing if self.keeps_gone(slot) => {}
                 // The segment is gone, so the slot points at nothing and goes before the next look
                 HeadRead::Missing => {
                     self.shards[shard_of(hash)].write().take(hash, slot);
@@ -1831,16 +1864,16 @@ impl SpotColumn {
         ))))
     }
 
-    /// Drop every entry pointing into a segment no longer standing, with no reads
+    /// Drop every entry pointing into a segment no longer standing, with no reads, and hand back how many were live
     pub fn forget_retired(&self, is_standing: impl Fn(SegmentId) -> bool) -> u64 {
-        let mut forgotten = 0;
+        let mut live = 0;
         for shard in &self.shards {
             let mut table = shard.write();
             let (dropped, displaced) = table.retain(|slot| is_standing(slot.segment()));
             table.count_taken(dropped as u64, displaced);
-            forgotten += dropped as u64;
+            live += dropped as u64 - displaced;
         }
-        forgotten
+        live
     }
 
     /// Drop every entry, for a rebuild starting over
@@ -2139,6 +2172,35 @@ mod tests {
             "the corrected booking still counted in the slack"
         );
         assert_eq!(column.displaced(), 0);
+    }
+
+    // an overwrite reading every version of a key books the one whose segment went from its class
+    #[test]
+    fn a_gone_version_is_booked_from_its_class() {
+        let records = Arc::new(Records::default());
+        let segments = Arc::new(SegmentTable::new());
+        let column = SpotColumn::new();
+        column.attach(
+            Arc::clone(&records) as Arc<dyn RecordSource>,
+            Arc::clone(&segments),
+        );
+        let gone = Loc::new(SegmentId(1), 0, 200);
+        column.insert(key(6).as_slice(), gone);
+        for at in 0..2u32 {
+            let loc = Loc::new(SegmentId(2), at * 64, 40);
+            records.write(loc, key(6).as_slice(), Lsn(10 + u64::from(at)));
+            column.insert(key(6).as_slice(), loc);
+        }
+        segments.note_max(SegmentId(2), Lsn(11));
+
+        let settled = column.displace(&key(6), Lsn(20)).expect("displace");
+
+        assert_eq!(settled.booked.len(), 2);
+        assert_eq!(
+            settled.classed,
+            vec![(Loc::new(SegmentId(1), 0, 224), 193)],
+            "the version whose segment went was dropped unbooked"
+        );
     }
 
     // the newest version answers, only the older one goes to the cleaner, and a copy answers once its source goes

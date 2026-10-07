@@ -1809,6 +1809,40 @@ fn cue_outlives_a_delete() {
     );
 }
 
+// a cue read past a later delete still finds its version once the window passes the delete's grave
+#[test]
+fn cue_outlives_a_pruned_delete() {
+    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
+    let key = record(7, 1);
+    // Three versions handed over, so the delete reads and takes every spot index slot of the key
+    for version in 1..=3u8 {
+        store.put(&key, &[version; 64]).expect("put");
+        drop(store.cue().expect("seal"));
+        store.page_out_sealed().expect("hand over");
+    }
+    let cue = store.cue().expect("cue");
+    store.delete(&key).expect("delete");
+    drop(store.cue().expect("seal"));
+    store.page_out_sealed().expect("hand over");
+    // As far as the prune can tell, a window of writes has passed the delete
+    store.reel.shared().lsn.recover_to(Lsn(2 * GRAVE_WINDOW));
+
+    store.prune_tombstones();
+
+    assert_eq!(
+        store.get_at(&key, &cue).expect("read at cue"),
+        Some(Value::new(vec![3u8; 64])),
+        "the prune took the version the cue reads",
+    );
+    drop(cue);
+    assert_eq!(
+        store.prune_tombstones(),
+        1,
+        "the grave never became prunable, so this tested nothing"
+    );
+    assert!(store.get(&key).expect("read").is_none());
+}
+
 // a range delete drawn after the cue point is invisible to it
 #[test]
 fn cue_ignores_a_later_drop() {
@@ -4122,6 +4156,97 @@ fn refresh_follows_a_delete_past_a_retire() {
 
     assert!(!caught.retired.is_empty(), "the compaction retired nothing");
     assert_eq!(reader.totals().count, 2, "a deleted key still counts");
+}
+
+// a reader that reads a key the writer moved out of a retired segment finds it, and counts it once after a refresh
+#[test]
+fn a_read_past_a_retire_finds_the_moved_key() {
+    let mut settings = config(1, SyncPolicy::EveryPut);
+    settings.segment_bytes = ByteCount::from_bytes(8_192);
+    let (writer, sim) = sim_store(settings.clone());
+    for byte in 1..=4u8 {
+        writer.put(&record(7, byte), &[byte; 1_500]).expect("put");
+    }
+    drop(writer.cue().expect("seal"));
+    for byte in 1..=3u8 {
+        writer
+            .put(&record(7, byte), &[byte + 100; 1_500])
+            .expect("overwrite");
+    }
+    writer.flush().expect("flush");
+    // One reader for each way a read comes in
+    let readers: Vec<ReelStore> = (0..3)
+        .map(|_| {
+            ReelStore::open_read_only_with_io(
+                PathBuf::from(ROOT),
+                settings.clone(),
+                COLUMNS,
+                Arc::new(sim.clone()),
+            )
+            .expect("read only open")
+        })
+        .collect();
+    writer.compact_once().expect("compact");
+    assert_eq!(
+        writer.compaction_counters().segments_rewritten,
+        1,
+        "the compaction moved nothing"
+    );
+    let moved = record(7, 4);
+
+    let read = readers[0].get(&moved).expect("get");
+    let held = readers[1].contains(&moved).expect("contains");
+    let size = readers[2].size_of(&moved).expect("size");
+
+    assert!(
+        read.as_deref() == Some(&[4u8; 1_500][..]),
+        "the moved key read as gone"
+    );
+    assert!(held, "the moved key read as missing");
+    assert_eq!(
+        size,
+        Some(ByteCount::from_bytes(1_500)),
+        "the moved key lost its size"
+    );
+    for reader in &readers {
+        reader.refresh().expect("refresh");
+        assert_eq!(reader.totals().count, 4, "the moved key counts twice");
+    }
+}
+
+// a reader that meets a range delete after the segment holding its keys retired stops counting them
+#[test]
+fn refresh_follows_a_range_delete_past_a_retire() {
+    let mut settings = config(1, SyncPolicy::EveryPut);
+    settings.segment_bytes = ByteCount::from_bytes(8_192);
+    let (writer, sim) = sim_store(settings.clone());
+    for byte in 1..=2u8 {
+        writer.put(&record(7, byte), &[byte; 1_500]).expect("put");
+    }
+    drop(writer.cue().expect("seal"));
+    let reader = ReelStore::open_read_only_with_io(
+        PathBuf::from(ROOT),
+        settings,
+        COLUMNS,
+        Arc::new(sim.clone()),
+    )
+    .expect("read only open");
+    let start = RecordKey::from_bytes(RECORD, &group_bound(7)).expect("key");
+    writer
+        .delete_range(&start, Some(&group_bound(8)))
+        .expect("range delete");
+    while writer.sweep_covers().expect("sweep") {}
+    writer.compact_once().expect("compact");
+
+    let caught = reader.refresh().expect("refresh");
+
+    assert!(!caught.retired.is_empty(), "the compaction retired nothing");
+    assert_eq!(writer.totals().count, 0);
+    assert_eq!(
+        reader.totals().count,
+        0,
+        "a key the range took still counts"
+    );
 }
 
 // a range delete a reader follows keeps its keys deleted

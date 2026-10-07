@@ -518,7 +518,9 @@ impl ReelStore {
     /// that cannot offer that segment yet then answers an older version.
     pub fn prune_tombstones(&self) -> u64 {
         let peek = self.reel.shared().lsn.peek().as_u64();
-        let floor = peek.saturating_sub(GRAVE_WINDOW);
+        // A cue read past a later delete finds its version through that delete's grave
+        let cue = self.cues.floor().map_or(u64::MAX, |cue| cue.as_u64());
+        let floor = peek.saturating_sub(GRAVE_WINDOW).min(cue);
         if floor == 0 {
             return 0;
         }

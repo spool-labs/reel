@@ -311,6 +311,18 @@ impl ReelIndex {
         }
     }
 
+    /// Keep each live spot index slot whose segment went, for a read-only open that follows its writer
+    pub fn follow(&self) {
+        for spot in &self.spot {
+            spot.follow();
+        }
+    }
+
+    /// How many lookups on a read-only open met a live spot index slot whose segment went
+    pub fn spot_behind(&self) -> u64 {
+        self.spot.iter().map(SpotColumn::behind).sum()
+    }
+
     /// Whether the spot index answers for a column's sealed keys
     fn spot_serves(&self) -> bool {
         self.spot_ready.load(Ordering::Acquire)
@@ -402,13 +414,7 @@ impl ReelIndex {
 
     /// Take out up to `budget` older versions the spot index lookups read past, and book them
     pub fn scrub_spot(&self, budget: usize) -> usize {
-        if self.retired.swap(0, Ordering::AcqRel) > 0 {
-            // The spot index only points into sealed segments, and a retire forgets the span
-            for (at, spot) in self.spot.iter().enumerate() {
-                let standing: HashSet<SegmentId> = self.sealed[at].segments().into_iter().collect();
-                spot.forget_retired(|segment| standing.contains(&segment));
-            }
-        }
+        self.forget_retired_slots();
         let mut settled = 0;
         for (at, spot) in self.spot.iter().enumerate() {
             for (key, loc) in spot.scrub(budget.saturating_sub(settled)) {
@@ -417,6 +423,20 @@ impl ReelIndex {
             }
         }
         settled
+    }
+
+    /// Drop the spot index's slots into retired segments, and hand back how many still held a counted version
+    pub fn forget_retired_slots(&self) -> u64 {
+        if self.retired.swap(0, Ordering::AcqRel) == 0 {
+            return 0;
+        }
+        // The spot index only points into sealed segments, and a retire forgets the span
+        let mut live = 0;
+        for (at, spot) in self.spot.iter().enumerate() {
+            let standing: HashSet<SegmentId> = self.sealed[at].segments().into_iter().collect();
+            live += spot.forget_retired(|segment| standing.contains(&segment));
+        }
+        live
     }
 
     /// Slack in the byte counters from the spot index's class bookings

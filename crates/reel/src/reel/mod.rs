@@ -2394,7 +2394,7 @@ impl Reel {
         // Each record is prefetched a window ahead of its check, so the memory stalls overlap
         let handles = &scratch.handles;
         let mut ahead: [Option<(&[u8], RecordLayout)>; PREFETCH_AHEAD] = [None; PREFETCH_AHEAD];
-        let mut mapped = Vec::new();
+        let mut mapped: Option<Vec<u8>> = None;
         for step in 0..asks.len() + PREFETCH_AHEAD {
             let slot = step % PREFETCH_AHEAD;
             let due = ahead[slot].take();
@@ -2427,20 +2427,20 @@ impl Reel {
                 layout,
                 Proof::of(is_verified, ask.certain),
             ) {
-                if mapped.capacity() == 0 {
-                    let wanted = asks.iter().map(|ask| ask.loc.len as usize).sum();
-                    mapped = crate::reel::payload::take(wanted);
-                }
+                // A batch of empty records still needs its block, or their spots point at nothing
+                let block = mapped.get_or_insert_with(|| {
+                    crate::reel::payload::take(asks.iter().map(|ask| ask.loc.len as usize).sum())
+                });
                 spots[ask.at as usize] = Spot {
                     block: 0,
-                    at: mapped.len() as u32,
+                    at: block.len() as u32,
                     len: len as u32,
                     codec,
                 };
-                mapped.extend_from_slice(&record[prefix..]);
+                block.extend_from_slice(&record[prefix..]);
             }
         }
-        if mapped.capacity() != 0 {
+        if let Some(mapped) = mapped {
             blocks.push(ReadBlock::new(mapped, crate::reel::payload::give));
         }
         scratch.order.sort_unstable_by_key(|&(place, _)| place);

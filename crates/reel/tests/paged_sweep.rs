@@ -141,3 +141,33 @@ fn a_sweep_hands_out_every_key() {
         "a sweep from a foreign mark lost keys"
     );
 }
+
+// an empty value in the open tail comes back from a walk, a sweep and a batched get
+#[test]
+fn empty_values_in_the_tail() {
+    let dir = TempDir::new().expect("dir");
+    let store =
+        ReelStore::open(dir.path().to_path_buf(), ReelConfig::default(), COLUMNS).expect("open");
+    let key = key_of(1);
+    Store::put(&store, "rows", &key, &[]).expect("put");
+
+    let walked: Vec<(Vec<u8>, usize)> = Store::iter_prefix(&store, "rows", &key[..1])
+        .expect("walk")
+        .map(|(key, value)| (key, value.len()))
+        .collect();
+    assert_eq!(
+        walked,
+        vec![(key.clone(), 0)],
+        "a walk lost the empty value"
+    );
+
+    let (swept, _) = Store::sweep(&store, "rows", None, PAGE).expect("sweep");
+    assert_eq!(swept.len(), 1, "a sweep lost the empty value");
+
+    let many = Store::get_many(&store, "rows", &[key.as_slice()]).expect("get many");
+    assert_eq!(
+        many[0].as_ref().map(|value| value.len()),
+        Some(0),
+        "a batched get lost the empty value"
+    );
+}

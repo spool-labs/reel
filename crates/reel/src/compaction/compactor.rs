@@ -3165,17 +3165,17 @@ mod tests {
             .compact_segment(&reopened.reel, &reopened.index, segment)
             .expect("compact");
 
-        // the rotted key itself overwritten, so the segment holds nothing live at all
+        // the rotted key itself overwritten, which books its sealed version dead by length class
         put(&reopened, 1, vec![0x11; 4096]);
         reopened.reel.flush().expect("flush");
 
         assert_eq!(
             reopened
                 .compactor
-                .select_whole_dead(&reopened.reel, &reopened.index, None)
+                .select_target(&reopened.reel, &reopened.index, 0.5, None)
                 .map(|(segment, _)| segment),
             Some(SegmentId(1)),
-            "a segment with nothing live left stays pinned",
+            "a segment something died in stays pinned",
         );
     }
 

@@ -27,8 +27,8 @@ pub use compaction::compactor::{CompactionCounters, Compactor, EraseReport};
 pub use compaction::keymerge::MergeReport;
 pub use compaction::pressure::{GcPressure, GcTier, RateLimiter};
 pub use config::{
-    CompactRate, IoBackend, PointReads, ReelConfig, RepairPath, RingTuning, SyncPolicy,
-    ThreadBudget, VolumeClass, VolumeSpec, DEFAULT_FD_CACHE, MAP_EVERYTHING,
+    CompactRate, IoBackend, ReelConfig, RepairPath, RingTuning, SyncPolicy, ThreadBudget,
+    VolumeClass, VolumeSpec, DEFAULT_FD_CACHE, MAP_EVERYTHING,
 };
 pub use engine::{CompactPass, RecordWrite, ReelStore, Totals};
 pub use error::{ReelError, Result};

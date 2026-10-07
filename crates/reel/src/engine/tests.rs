@@ -15,7 +15,7 @@ use tempfile::{tempdir, TempDir};
 
 use crate::units::ByteCount;
 
-use crate::config::{CompactRate, PointReads, RepairPath, SyncPolicy, ThreadBudget};
+use crate::config::{CompactRate, RepairPath, SyncPolicy, ThreadBudget};
 use crate::format::column::{Codec, ColumnId, ColumnSpec};
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::{Loc, SegmentId};
@@ -3189,9 +3189,9 @@ fn a_posix_read_answers_at_once() {
     assert_eq!(store.driver.outstanding(), 0);
 }
 
-// the async door reads through the driver where a mapping would have served
+// the awaited door copies an open tail's record out of its mapping and asks the cache for a sealed one
 #[test]
-fn async_never_maps() {
+fn awaited_reads_map_only_the_open_tail() {
     let mapped = ReelConfig {
         map_above: crate::config::MAP_EVERYTHING,
         ..config(1, SyncPolicy::Never)
@@ -3200,31 +3200,32 @@ fn async_never_maps() {
     store.put(&record(7, 1), &[0x5a; 4096]).expect("put");
     // The first read of a segment opens it and advises the kernel about it,
     // which are ops of their own, so the counted reads start after that.
-    store.get(&record(7, 1)).expect("warm get");
+    let blocked = store.get(&record(7, 1)).expect("warm get");
 
-    let before = backend.ops();
-    let blocked = store.get(&record(7, 1)).expect("get");
-    let after_block = backend.ops();
-    let awaited = block_on(store.get_wait(&record(7, 1))).expect("awaited get");
-    let after_wait = backend.ops();
-
-    assert_eq!(blocked, awaited, "both doors read the same record");
+    let ops = backend.ops();
+    let asked = backend.warm_reads().asked;
+    let in_tail = block_on(store.get_wait(&record(7, 1))).expect("awaited get");
+    assert_eq!(blocked, in_tail, "both doors read the same record");
+    assert_eq!(backend.ops(), ops, "the tail's record went to the driver");
     assert_eq!(
-        after_block, before,
-        "the mapped read asked the driver for nothing"
+        backend.warm_reads().asked,
+        asked,
+        "the tail's record asked the cache"
     );
+
+    drop(store.cue().expect("seal"));
+    let asked = backend.warm_reads().asked;
+    let sealed = block_on(store.get_wait(&record(7, 1))).expect("awaited get");
+    assert_eq!(blocked, sealed, "both doors read the same record");
     assert!(
-        after_wait > after_block,
-        "the awaited read went to the driver"
+        backend.warm_reads().asked > asked,
+        "the awaited read of a sealed record took its mapping"
     );
 }
 
-/// A volume whose awaited point reads ask the page cache before they queue
+/// A volume read through the page cache, whose point reads ask it before they queue
 fn probed_config() -> ReelConfig {
-    ReelConfig {
-        point_reads: PointReads::Probed,
-        ..config(1, SyncPolicy::Never)
-    }
+    config(1, SyncPolicy::Never)
 }
 
 /// Whether the probe served anything here, so a skip is nobody's silent green
@@ -3297,6 +3298,8 @@ fn a_warm_awaited_read_skips_the_engine() {
     let key = record(7, 1);
     let payload = stripes(8 * 1024);
     store.put(&key, &payload).expect("put");
+    // Sealed, since the awaited door copies an open tail's record out of its mapping
+    drop(store.cue().expect("seal"));
     // The first read opens the segment and advises the kernel about it, which are
     // ops of their own, and it is also what leaves the record's pages resident.
     store.get(&key).expect("warm the descriptor and the cache");
@@ -3346,6 +3349,8 @@ fn a_cold_awaited_read_falls_through() {
     let key = record(7, 1);
     let payload = stripes(8 * 1024);
     store.put(&key, &payload).expect("put");
+    // Sealed, since the awaited door copies an open tail's record out of its mapping
+    drop(store.cue().expect("seal"));
     // Dropping pages leaves the dirty ones where they are, so the record is on
     // the device before anything is dropped.
     store.flush().expect("flush");
@@ -3399,6 +3404,8 @@ fn a_warm_awaited_read_still_verifies() {
     let payload = stripes(8 * 1024);
     store.put(&awaited, &payload).expect("put");
     store.put(&blocked, &payload).expect("put");
+    // Sealed, since the awaited door copies an open tail's record out of its mapping
+    drop(store.cue().expect("seal"));
     store
         .get(&awaited)
         .expect("warm the descriptor and the cache");

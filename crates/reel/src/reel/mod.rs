@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::append::admission::InflightBudget;
 use crate::append::{Appender, BatchRecord, Commit, Committed};
-use crate::config::{PointReads, ReelConfig};
+use crate::config::ReelConfig;
 use crate::error::{ReelError, Result};
 use std::sync::OnceLock;
 
@@ -42,6 +42,7 @@ use crate::index::recovery::{read_footer, ResumableTail};
 use crate::index::spot::{Head, HeadRead, RecordSource, SpotRead};
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
 use crate::io::op::{Advice, Completion, Op, WarmFirst};
+use crate::io::ServingBackend;
 use crate::reel::segment::{FdCache, IoDriver, SegmentHandle, SplitAnswer, SplitRead};
 use crate::sync::{lock, read, write};
 
@@ -1543,11 +1544,17 @@ impl ReelShared {
         }
     }
 
-    /// Whether an awaited whole-record read asks the page cache before it queues
+    /// Whether a point read asks the page cache before it queues, which every volume read through the cache does
+    ///
+    /// A warm record comes back from one non-blocking read with no op, slot or wakeup
+    /// spent, and a cold one costs one refused read more. A direct volume and the sim
+    /// hold no page cache to ask.
     pub fn warm_first(&self) -> WarmFirst {
-        match self.config.point_reads {
-            PointReads::Probed => WarmFirst::Ask,
-            PointReads::Queued => WarmFirst::Skip,
+        match self.driver.serving() {
+            ServingBackend::Posix | ServingBackend::Ring => WarmFirst::Ask,
+            ServingBackend::PosixDirect | ServingBackend::RingDirect | ServingBackend::Sim => {
+                WarmFirst::Skip
+            }
         }
     }
 
@@ -2023,10 +2030,11 @@ impl Reel {
         ))
     }
 
-    /// Read one record as a future, always through the driver
+    /// Read one record as a future, from an open tail's mapping or through the driver
     ///
-    /// The mapping is left to the blocking door: a page fault cannot be awaited and
-    /// a device error inside one arrives as SIGBUS on whichever worker was polling.
+    /// A sealed segment's mapping is left to the blocking door: a page fault cannot be
+    /// awaited and a device error inside one arrives as SIGBUS on whichever worker was
+    /// polling. An open tail's pages were just written, so its mapping answers from memory.
     pub async fn read_record_wait(
         &self,
         loc: Loc,
@@ -2042,22 +2050,30 @@ impl Reel {
         let layout = handle.layout();
         let prefix = layout.prefix_len(expected.width(), loc.len);
         let len = loc.len as usize;
-        let spare = take_header();
-        let read = self
-            .shared
-            .driver
-            .wait_split_reusing(
-                handle.file(),
-                u64::from(loc.offset),
-                prefix,
-                len,
-                spare,
-                self.shared.warm_first(),
-            )
-            .await;
-        let (head, body) = match framed_or_nothing(read, prefix, len)? {
+        let mapped = match self.maps_tail(loc.segment) {
+            true => self.mapped_framed(&handle, u64::from(loc.offset), prefix, len),
+            false => None,
+        };
+        let (head, body) = match mapped {
             Some(framed) => framed,
-            None => return Ok(RecordRead::Stale),
+            None => {
+                let read = self
+                    .shared
+                    .driver
+                    .wait_split_reusing(
+                        handle.file(),
+                        u64::from(loc.offset),
+                        prefix,
+                        len,
+                        take_header(),
+                        self.shared.warm_first(),
+                    )
+                    .await;
+                match framed_or_nothing(read, prefix, len)? {
+                    Some(framed) => framed,
+                    None => return Ok(RecordRead::Stale),
+                }
+            }
         };
         Ok(frame_to_read(
             head,
@@ -2539,12 +2555,16 @@ impl Reel {
     fn maps(&self, segment: SegmentId, len: usize) -> bool {
         let config = &self.shared.config;
         // A tail's pages were just written, so a mapping reads them from the page cache with no syscall
-        config.maps(len)
-            || (config.maps_tails()
-                && self
-                    .tails()
-                    .iter()
-                    .any(|tail| tail.tail().active_segment() == segment))
+        config.maps(len) || self.maps_tail(segment)
+    }
+
+    /// Whether a segment is an open tail whose reads go through its mapping
+    fn maps_tail(&self, segment: SegmentId) -> bool {
+        self.shared.config.maps_tails()
+            && self
+                .tails()
+                .iter()
+                .any(|tail| tail.tail().active_segment() == segment)
     }
 
     /// Resolve a segment number to a handle, opening and caching it on a miss
@@ -2564,17 +2584,8 @@ impl Reel {
         // A mapped volume serves a record the mapping covers straight out of the
         // page cache; anything it does not cover takes the driver below.
         if self.maps(handle.id(), len) {
-            if let Some(map) = handle.mapping(self.shared.config.segment_bytes.to_bytes()) {
-                let head_at = map.slice(offset, prefix);
-                let body_at = map.slice(offset + prefix as u64, len);
-                if let (Some(head_bytes), Some(body_bytes)) = (head_at, body_at) {
-                    let mut head = take_header();
-                    head.clear();
-                    head.extend_from_slice(head_bytes);
-                    let mut body = crate::reel::payload::take(len);
-                    body.extend_from_slice(body_bytes);
-                    return Ok(Some((head, body)));
-                }
+            if let Some(framed) = self.mapped_framed(handle, offset, prefix, len) {
+                return Ok(Some(framed));
             }
         }
 
@@ -2588,6 +2599,25 @@ impl Reel {
             self.shared.warm_first(),
         );
         framed_or_nothing(read, prefix, len)
+    }
+
+    /// A record's header and payload copied out of its segment's mapping, or nothing where the mapping does not cover it
+    fn mapped_framed(
+        &self,
+        handle: &SegmentHandle,
+        offset: u64,
+        prefix: usize,
+        len: usize,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let map = handle.mapping(self.shared.config.segment_bytes.to_bytes())?;
+        let head_bytes = map.slice(offset, prefix)?;
+        let body_bytes = map.slice(offset + prefix as u64, len)?;
+        let mut head = take_header();
+        head.clear();
+        head.extend_from_slice(head_bytes);
+        let mut body = crate::reel::payload::take(len);
+        body.extend_from_slice(body_bytes);
+        Some((head, body))
     }
 
     /// The tail a foreground write goes to, which is the least loaded of them

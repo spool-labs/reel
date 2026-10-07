@@ -308,7 +308,7 @@ the mapping.
 
 The escape is a warm probe: one non-blocking read ahead of the op, so a record the
 page cache holds is answered with no tag, slot or completion spent, and a cold one
-takes EAGAIN and rides the driver. `PointReads::Probed` turns it on. Both doors have
+takes EAGAIN and rides the driver. Every volume read through the page cache asks it. Both doors have
 it now, `wait_split_reusing` and `pread_split_reusing` alike.
 
 Prefer the probe to the mapping on media that fails by sector. A bad sector under a

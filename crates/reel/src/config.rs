@@ -232,15 +232,6 @@ pub enum IoBackend {
     UringDirect,
 }
 
-/// How an awaited whole-record read reaches its bytes
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PointReads {
-    /// Read through the driver, one op per read whatever the cache holds
-    Queued,
-    /// Ask the cache without blocking, and queue only the reads it cannot answer
-    Probed,
-}
-
 /// Where a record that fails its checksum can be fetched again from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RepairPath {
@@ -276,9 +267,6 @@ pub struct ReelConfig {
 
     /// Smallest record served from a read-only mapping of its segment file, unset maps nothing
     pub map_above: Option<ByteCount>,
-
-    /// Whether an awaited whole-record read asks the page cache before it queues
-    pub point_reads: PointReads,
 
     /// Append tails the volume runs, which is how many files it appends into
     pub active_tails: ThreadBudget,
@@ -328,7 +316,6 @@ impl Default for ReelConfig {
             verify_reads: false,
             repair: RepairPath::Peers,
             map_above: None,
-            point_reads: PointReads::Queued,
             footer_cache: ByteCount::mb(DEFAULT_FOOTER_CACHE_MIB),
             active_tails: ThreadBudget::Auto,
             volumes: Vec::new(),
@@ -390,14 +377,6 @@ impl ReelConfig {
         if self.map_above.is_some() && self.io_backend == IoBackend::UringDirect {
             return Err(ReelError::Config(
                 "map_above and a direct volume contradict each other: a mapping reads the page cache a direct volume bypasses".to_string(),
-            ));
-        }
-
-        // map_above is not refused here: the mapping serves the blocking door and
-        // the probe the awaited one, which never maps
-        if self.point_reads == PointReads::Probed && self.io_backend == IoBackend::UringDirect {
-            return Err(ReelError::Config(
-                "point_reads and a direct volume contradict each other: a direct volume holds no page cache to ask".to_string(),
             ));
         }
 

@@ -1165,6 +1165,10 @@ impl Compactor {
             if reel.shared().config.repair == RepairPath::Peers {
                 if index.evict_at(&record.header.key, loc)? {
                     self.metrics.record_hits(1);
+                    tracing::warn!(
+                        "a record in segment {} fails its checksum, evicted so a peer can repair it",
+                        segment.as_u32()
+                    );
                 }
                 return Ok(CopyStep::Skipped);
             }
@@ -1444,6 +1448,10 @@ impl Compactor {
                     RepairPath::Peers => {
                         if index.evict_at(&record.header.key, loc)? {
                             hits += 1;
+                            tracing::warn!(
+                                "the scrub found a record in segment {} failing its checksum and evicted it",
+                                segment.as_u32()
+                            );
                         }
                     }
                     RepairPath::None => {
@@ -1526,6 +1534,10 @@ impl Compactor {
                     RepairPath::Peers => {
                         if walk.index.evict_at(&key, loc)? {
                             hits += 1;
+                            tracing::warn!(
+                                "the scrub found a record in segment {} failing its checksum and evicted it",
+                                walk.segment.as_u32()
+                            );
                         }
                     }
                     RepairPath::None => {

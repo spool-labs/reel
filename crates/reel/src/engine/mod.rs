@@ -422,6 +422,9 @@ impl ReelStore {
         // its sealed keys resolve through.
         index.set_footers(Arc::clone(&shared) as Arc<dyn FooterSource>);
         index.set_records(Arc::clone(&shared) as Arc<dyn RecordSource>);
+        if is_read_only {
+            index.follow();
+        }
         // And the other direction: a seal writes down what its segment weighs, and
         // these are the counters that know.
         shared.set_segments(index.segments_handle());

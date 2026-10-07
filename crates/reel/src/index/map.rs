@@ -311,6 +311,18 @@ impl ReelIndex {
         }
     }
 
+    /// Keep each live spot index slot whose segment went, for a read-only open that follows its writer
+    pub fn follow(&self) {
+        for spot in &self.spot {
+            spot.follow();
+        }
+    }
+
+    /// How many lookups on a read-only open met a live spot index slot whose segment went
+    pub fn spot_behind(&self) -> u64 {
+        self.spot.iter().map(SpotColumn::behind).sum()
+    }
+
     /// Whether the spot index answers for a column's sealed keys
     fn spot_serves(&self) -> bool {
         self.spot_ready.load(Ordering::Acquire)

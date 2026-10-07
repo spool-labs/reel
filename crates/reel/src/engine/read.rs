@@ -162,16 +162,18 @@ impl ReelStore {
     ///
     /// A pointer the index has since moved is re-resolved, and a record that fails
     /// its checksum has its key evicted so the miss becomes a repair enqueue. A
-    /// read-only open rebuilds once before it calls a pointer unresolvable.
+    /// read-only open catches up or rebuilds once before it calls a pointer unresolvable.
     pub fn get(&self, key: &RecordKey) -> Result<Option<Value>> {
         self.settle_sealed()?;
+        let behind = self.index.spot_behind();
         match self.resolve_read(key)? {
+            _ if self.fell_behind(behind) => {}
             Resolved::Payload(payload) => return Ok(Some(payload)),
             Resolved::Missing => return Ok(None),
             Resolved::Unresolved => {}
         }
 
-        self.rebuild()?;
+        self.resync(behind)?;
         match self.resolve_read(key)? {
             Resolved::Payload(payload) => Ok(Some(payload)),
             Resolved::Missing => Ok(None),
@@ -182,13 +184,15 @@ impl ReelStore {
     /// Read one payload as a future, for a caller with no thread to park
     pub async fn get_wait(&self, key: &RecordKey) -> Result<Option<Value>> {
         self.settle_sealed()?;
+        let behind = self.index.spot_behind();
         match self.resolve_read_wait(key).await? {
+            _ if self.fell_behind(behind) => {}
             Resolved::Payload(payload) => return Ok(Some(payload)),
             Resolved::Missing => return Ok(None),
             Resolved::Unresolved => {}
         }
 
-        self.rebuild()?;
+        self.resync(behind)?;
         match self.resolve_read_wait(key).await? {
             Resolved::Payload(payload) => Ok(Some(payload)),
             Resolved::Missing => Ok(None),
@@ -204,13 +208,15 @@ impl ReelStore {
     /// decodes to.
     pub fn get_range(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Option<Value>> {
         self.settle_sealed()?;
+        let behind = self.index.spot_behind();
         match self.resolve_range(key, offset, len)? {
+            _ if self.fell_behind(behind) => {}
             Resolved::Payload(payload) => return Ok(Some(payload)),
             Resolved::Missing => return Ok(None),
             Resolved::Unresolved => {}
         }
 
-        self.rebuild()?;
+        self.resync(behind)?;
         match self.resolve_range(key, offset, len)? {
             Resolved::Payload(payload) => Ok(Some(payload)),
             Resolved::Missing => Ok(None),
@@ -226,13 +232,15 @@ impl ReelStore {
         len: usize,
     ) -> Result<Option<Value>> {
         self.settle_sealed()?;
+        let behind = self.index.spot_behind();
         match self.resolve_range_wait(key, offset, len).await? {
+            _ if self.fell_behind(behind) => {}
             Resolved::Payload(payload) => return Ok(Some(payload)),
             Resolved::Missing => return Ok(None),
             Resolved::Unresolved => {}
         }
 
-        self.rebuild()?;
+        self.resync(behind)?;
         match self.resolve_range_wait(key, offset, len).await? {
             Resolved::Payload(payload) => Ok(Some(payload)),
             Resolved::Missing => Ok(None),
@@ -526,13 +534,38 @@ impl ReelStore {
     /// Recorded length of one record, served from the index with no read
     pub fn size_of(&self, key: &RecordKey) -> Result<Option<ByteCount>> {
         self.settle_sealed()?;
-        self.index.size_of(key)
+        self.followed(|| self.index.size_of(key))
     }
 
     /// Whether a record exists, index only, no read
     pub fn contains(&self, key: &RecordKey) -> Result<bool> {
         self.settle_sealed()?;
-        self.index.contains(key)
+        self.followed(|| self.index.contains(key))
+    }
+
+    /// Whether a read-only open met a segment its writer retired since `behind` was read
+    fn fell_behind(&self, behind: u64) -> bool {
+        self.is_read_only && self.index.spot_behind() != behind
+    }
+
+    /// Bring a read-only open up to its volume, catching up where it fell behind and rebuilding otherwise
+    fn resync(&self, behind: u64) -> Result<()> {
+        if self.fell_behind(behind) {
+            self.refresh()?;
+            return Ok(());
+        }
+        self.rebuild()
+    }
+
+    /// Answer from the index, again after a catch-up where a read-only open met a segment its writer retired
+    fn followed<Answer>(&self, answer: impl Fn() -> Result<Answer>) -> Result<Answer> {
+        let behind = self.index.spot_behind();
+        let found = answer()?;
+        if !self.fell_behind(behind) {
+            return Ok(found);
+        }
+        self.refresh()?;
+        answer()
     }
 
     /// Cue up a view of the volume as it stands now

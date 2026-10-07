@@ -4124,6 +4124,62 @@ fn refresh_follows_a_delete_past_a_retire() {
     assert_eq!(reader.totals().count, 2, "a deleted key still counts");
 }
 
+// a reader that reads a key the writer moved out of a retired segment finds it, and counts it once after a refresh
+#[test]
+fn a_read_past_a_retire_finds_the_moved_key() {
+    let mut settings = config(1, SyncPolicy::EveryPut);
+    settings.segment_bytes = ByteCount::from_bytes(8_192);
+    let (writer, sim) = sim_store(settings.clone());
+    for byte in 1..=4u8 {
+        writer.put(&record(7, byte), &[byte; 1_500]).expect("put");
+    }
+    drop(writer.cue().expect("seal"));
+    for byte in 1..=3u8 {
+        writer
+            .put(&record(7, byte), &[byte + 100; 1_500])
+            .expect("overwrite");
+    }
+    writer.flush().expect("flush");
+    // One reader for each way a read comes in
+    let readers: Vec<ReelStore> = (0..3)
+        .map(|_| {
+            ReelStore::open_read_only_with_io(
+                PathBuf::from(ROOT),
+                settings.clone(),
+                COLUMNS,
+                Arc::new(sim.clone()),
+            )
+            .expect("read only open")
+        })
+        .collect();
+    writer.compact_once().expect("compact");
+    assert_eq!(
+        writer.compaction_counters().segments_rewritten,
+        1,
+        "the compaction moved nothing"
+    );
+    let moved = record(7, 4);
+
+    let read = readers[0].get(&moved).expect("get");
+    let held = readers[1].contains(&moved).expect("contains");
+    let size = readers[2].size_of(&moved).expect("size");
+
+    assert!(
+        read.as_deref() == Some(&[4u8; 1_500][..]),
+        "the moved key read as gone"
+    );
+    assert!(held, "the moved key read as missing");
+    assert_eq!(
+        size,
+        Some(ByteCount::from_bytes(1_500)),
+        "the moved key lost its size"
+    );
+    for reader in &readers {
+        reader.refresh().expect("refresh");
+        assert_eq!(reader.totals().count, 4, "the moved key counts twice");
+    }
+}
+
 // a range delete a reader follows keeps its keys deleted
 #[test]
 fn refresh_follows_a_range_delete() {

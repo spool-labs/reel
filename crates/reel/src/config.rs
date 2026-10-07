@@ -4,9 +4,7 @@ use std::num::NonZeroU32;
 use std::sync::OnceLock;
 
 #[cfg(feature = "serde")]
-use serde::de::Error as SerdeError;
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 
 use crate::units::ByteCount;
 
@@ -35,9 +33,6 @@ const MAX_AUTO_TAILS: usize = 8;
 pub(crate) const KIB: u64 = 1024;
 pub(crate) const MIB: u64 = KIB * 1024;
 pub(crate) const GIB: u64 = MIB * 1024;
-/// Only ever reached by a written unit, so it goes with the parser
-#[cfg(feature = "serde")]
-pub(crate) const TIB: u64 = GIB * 1024;
 
 /// Durability sync cadence for group commit drains
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,8 +115,6 @@ impl ThreadBudget {
 
 /// The tier one volume serves
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum VolumeClass {
     /// The ingest surface: tails, fresh segments, and the hot tier
     #[default]
@@ -137,17 +130,14 @@ pub enum VolumeClass {
 /// over as one entry and a raw drive are the same to the engine. A dead entry
 /// stays in the list, since the placement table is indexed by list order.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Deserialize))]
 pub struct VolumeSpec {
     /// Directory the volume is mounted at
     pub path: std::path::PathBuf,
 
     /// The tier, fast unless the entry says otherwise
-    #[cfg_attr(feature = "serde", serde(default))]
     pub class: VolumeClass,
 
     /// The operator's word that this drive is dead, taking it out of every scan and draw
-    #[cfg_attr(feature = "serde", serde(default))]
     pub dead: bool,
 }
 
@@ -179,8 +169,6 @@ impl VolumeSpec {
 
 /// When the kernel runs the completion work a ring owes its owning thread
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum TaskRun {
     /// Hold it until the thread enters asking for completions, on a kernel from 6.1
     ///
@@ -196,8 +184,6 @@ pub enum TaskRun {
 
 /// Ring tunables
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Deserialize))]
-#[cfg_attr(feature = "serde", serde(default))]
 pub struct RingTuning {
     /// Hand the kernel a pool of aligned buffers, which is what puts direct data ops on the ring
     pub registered_buffers: bool,
@@ -263,8 +249,6 @@ pub enum IoBackend {
 /// Linux is the only platform where the direct open flag means anything, so off it
 /// every arm is the same buffered read with a wider span.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum RangedReads {
     /// Read the window through the page cache
     Cached,
@@ -276,8 +260,6 @@ pub enum RangedReads {
 
 /// How an awaited whole-record read reaches its bytes
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum PointReads {
     /// Read through the driver, one op per read whatever the cache holds
     Queued,
@@ -291,8 +273,6 @@ pub enum PointReads {
 /// pays a block read per halving; with it the halvings happen over the leads and the
 /// search reads one block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum FenceResidency {
     /// No fence: a search binary searches the blocks themselves
     Off,
@@ -306,8 +286,6 @@ pub enum FenceResidency {
 
 /// Where a record that fails its checksum can be fetched again from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum RepairPath {
     /// Another copy exists, so a corrupt record becomes a miss and a refetch
     Peers,
@@ -317,35 +295,23 @@ pub enum RepairPath {
 
 /// Load-time settings for one reel bulk volume
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Deserialize))]
-#[cfg_attr(feature = "serde", serde(default))]
 pub struct ReelConfig {
     /// Target size of each segment file before it seals
-    #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_bytes"))]
     pub segment_bytes: ByteCount,
 
     /// Bytes reserved ahead of the write head per allocation step
-    #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_bytes"))]
     pub alloc_chunk: ByteCount,
 
     /// Whether a new segment reserves per step or is pre-written whole
     pub preallocate: Preallocate,
 
-    /// Durability sync cadence parsed from the sync bytes scalar
-    #[cfg_attr(
-        feature = "serde",
-        serde(rename = "sync_bytes", deserialize_with = "deserialize_sync")
-    )]
+    /// Durability sync cadence for group commit drains
     pub sync: SyncPolicy,
 
     /// Dead fraction at which a sealed segment is rewritten
     pub compact_dead_ratio: f64,
 
     /// Compaction rate limit, automatic or a fixed cap
-    #[cfg_attr(
-        feature = "serde",
-        serde(deserialize_with = "deserialize_compact_rate")
-    )]
     pub compact_mbps: CompactRate,
 
     /// Background scrub rate over sealed segments, off when set to zero
@@ -358,10 +324,6 @@ pub struct ReelConfig {
     pub repair: RepairPath,
 
     /// Smallest record served from a read-only mapping of its segment file, unset maps nothing
-    #[cfg_attr(
-        feature = "serde",
-        serde(deserialize_with = "deserialize_optional_bytes")
-    )]
     pub map_above: Option<ByteCount>,
 
     /// Which plane a window of a large record is read on
@@ -371,14 +333,9 @@ pub struct ReelConfig {
     pub point_reads: PointReads,
 
     /// Append tails the volume runs, which is how many files it appends into
-    #[cfg_attr(
-        feature = "serde",
-        serde(deserialize_with = "deserialize_thread_budget")
-    )]
     pub active_tails: ThreadBudget,
 
     /// Extra volume roots the reel places segments across, past its own fast root
-    #[cfg_attr(feature = "serde", serde(default))]
     pub volumes: Vec<VolumeSpec>,
 
     /// File backend selected for this volume
@@ -394,7 +351,6 @@ pub struct ReelConfig {
     pub fence: FenceResidency,
 
     /// Bytes of sealed-footer state the volume keeps at once
-    #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_bytes"))]
     pub footer_cache: ByteCount,
 }
 
@@ -543,177 +499,6 @@ impl ReelConfig {
     }
 }
 
-/// The two written forms a knob accepts: a bare number, or a number with a unit
-///
-/// Only a deserializer ever produces one, so it and every text parser below it
-/// belong to the feature.
-#[cfg(feature = "serde")]
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Scalar {
-    Int(u64),
-    Text(String),
-}
-
-#[cfg(feature = "serde")]
-fn deserialize_bytes<'de, Deser>(
-    deserializer: Deser,
-) -> std::result::Result<ByteCount, Deser::Error>
-where
-    Deser: Deserializer<'de>,
-{
-    let scalar = Scalar::deserialize(deserializer)?;
-    let bytes = match scalar {
-        Scalar::Int(value) => value,
-        Scalar::Text(text) => parse_byte_size(&text).map_err(SerdeError::custom)?,
-    };
-    Ok(ByteCount::from_bytes(bytes))
-}
-
-/// A byte count that may be absent, for knobs whose default is to do nothing
-#[cfg(feature = "serde")]
-fn deserialize_optional_bytes<'de, Deser>(
-    deserializer: Deser,
-) -> std::result::Result<Option<ByteCount>, Deser::Error>
-where
-    Deser: Deserializer<'de>,
-{
-    let scalar = Option::<Scalar>::deserialize(deserializer)?;
-    let Some(scalar) = scalar else {
-        return Ok(None);
-    };
-    let bytes = match scalar {
-        Scalar::Int(value) => value,
-        Scalar::Text(text) => parse_byte_size(&text).map_err(SerdeError::custom)?,
-    };
-    Ok(Some(ByteCount::from_bytes(bytes)))
-}
-
-#[cfg(feature = "serde")]
-fn deserialize_sync<'de, Deser>(
-    deserializer: Deser,
-) -> std::result::Result<SyncPolicy, Deser::Error>
-where
-    Deser: Deserializer<'de>,
-{
-    let scalar = Scalar::deserialize(deserializer)?;
-    match scalar {
-        Scalar::Int(0) => Ok(SyncPolicy::EveryPut),
-        Scalar::Int(value) => Ok(SyncPolicy::Bytes(ByteCount::from_bytes(value))),
-        Scalar::Text(text) => parse_sync_text(&text).map_err(SerdeError::custom),
-    }
-}
-
-#[cfg(feature = "serde")]
-fn deserialize_compact_rate<'de, Deser>(
-    deserializer: Deser,
-) -> std::result::Result<CompactRate, Deser::Error>
-where
-    Deser: Deserializer<'de>,
-{
-    let scalar = Scalar::deserialize(deserializer)?;
-    match scalar {
-        Scalar::Int(value) => Ok(CompactRate::Mbps(value)),
-        Scalar::Text(text) => parse_compact_rate(&text).map_err(SerdeError::custom),
-    }
-}
-
-#[cfg(feature = "serde")]
-fn deserialize_thread_budget<'de, Deser>(
-    deserializer: Deser,
-) -> std::result::Result<ThreadBudget, Deser::Error>
-where
-    Deser: Deserializer<'de>,
-{
-    let scalar = Scalar::deserialize(deserializer)?;
-    match scalar {
-        Scalar::Int(value) => {
-            let count = u32::try_from(value)
-                .map_err(|_| SerdeError::custom(format!("active_tails `{value}` is too large")))?;
-            Ok(ThreadBudget::threads(count))
-        }
-        Scalar::Text(text) => parse_thread_budget(&text).map_err(SerdeError::custom),
-    }
-}
-
-#[cfg(feature = "serde")]
-fn parse_thread_budget(text: &str) -> std::result::Result<ThreadBudget, String> {
-    let trimmed = text.trim();
-    if trimmed.eq_ignore_ascii_case("auto") {
-        return Ok(ThreadBudget::Auto);
-    }
-
-    let count: u32 = trimmed
-        .parse()
-        .map_err(|error| format!("active_tails `{text}` is not auto or a number: {error}"))?;
-    Ok(ThreadBudget::threads(count))
-}
-
-#[cfg(feature = "serde")]
-fn parse_sync_text(text: &str) -> std::result::Result<SyncPolicy, String> {
-    let trimmed = text.trim();
-    if trimmed.eq_ignore_ascii_case("never") {
-        return Ok(SyncPolicy::Never);
-    }
-
-    let bytes = parse_byte_size(trimmed)?;
-    if bytes == 0 {
-        Ok(SyncPolicy::EveryPut)
-    } else {
-        Ok(SyncPolicy::Bytes(ByteCount::from_bytes(bytes)))
-    }
-}
-
-#[cfg(feature = "serde")]
-fn parse_compact_rate(text: &str) -> std::result::Result<CompactRate, String> {
-    let trimmed = text.trim();
-    if trimmed.eq_ignore_ascii_case("auto") {
-        return Ok(CompactRate::Auto);
-    }
-
-    let value: u64 = trimmed
-        .parse()
-        .map_err(|error| format!("compact_mbps `{text}` is not auto or a number: {error}"))?;
-    Ok(CompactRate::Mbps(value))
-}
-
-#[cfg(feature = "serde")]
-fn parse_byte_size(spec: &str) -> std::result::Result<u64, String> {
-    let trimmed = spec.trim();
-    if trimmed.is_empty() {
-        return Err("empty size".to_string());
-    }
-
-    let split = trimmed
-        .find(|character: char| !character.is_ascii_digit())
-        .unwrap_or(trimmed.len());
-    let (number_part, unit_part) = trimmed.split_at(split);
-    if number_part.is_empty() {
-        return Err(format!("size `{spec}` has no leading number"));
-    }
-
-    let number: u64 = number_part
-        .parse()
-        .map_err(|error| format!("size `{spec}` has an invalid number: {error}"))?;
-    let multiplier = byte_multiplier(unit_part.trim())?;
-
-    number
-        .checked_mul(multiplier)
-        .ok_or_else(|| format!("size `{spec}` overflows"))
-}
-
-#[cfg(feature = "serde")]
-fn byte_multiplier(unit: &str) -> std::result::Result<u64, String> {
-    match unit.to_ascii_lowercase().as_str() {
-        "" | "b" => Ok(1),
-        "k" | "kb" | "kib" => Ok(KIB),
-        "m" | "mb" | "mib" => Ok(MIB),
-        "g" | "gb" | "gib" => Ok(GIB),
-        "t" | "tb" | "tib" => Ok(TIB),
-        other => Err(format!("unknown size unit `{other}`")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,120 +581,16 @@ mod tests {
         );
     }
 
-    // human byte sizes parse to their byte counts
-    #[test]
-    fn parses_sizes() {
-        assert_eq!(parse_byte_size("1 GiB").expect("gib"), GIB);
-        assert_eq!(parse_byte_size("64 MiB").expect("mib"), 64 * MIB);
-        assert_eq!(parse_byte_size("1024").expect("bytes"), 1024);
-        assert!(parse_byte_size("3 QiB").is_err());
-    }
-
-    // sync scalars map to the right policy
-    #[test]
-    fn sync_text() {
-        assert_eq!(parse_sync_text("never").expect("never"), SyncPolicy::Never);
-        assert_eq!(
-            parse_sync_text("64 MiB").expect("bytes"),
-            SyncPolicy::Bytes(ByteCount::mb(64)),
-        );
-        assert_eq!(parse_sync_text("0").expect("zero"), SyncPolicy::EveryPut);
-    }
-
-    // compact rate parses auto and a fixed cap
-    #[test]
-    fn compact_rate() {
-        assert_eq!(parse_compact_rate("auto").expect("auto"), CompactRate::Auto);
-        assert_eq!(
-            parse_compact_rate("20").expect("num"),
-            CompactRate::Mbps(20)
-        );
-        assert!(parse_compact_rate("fast").is_err());
-    }
-
-    // a thread budget parses auto, a cap, and zero as taking the machine's own
-    #[test]
-    fn thread_budget() {
-        assert_eq!(
-            parse_thread_budget("auto").expect("auto"),
-            ThreadBudget::Auto
-        );
-        assert_eq!(parse_thread_budget("0").expect("zero"), ThreadBudget::Auto);
-        assert_eq!(
-            parse_thread_budget("2").expect("two"),
-            ThreadBudget::Fixed(NonZeroU32::new(2).expect("two")),
-        );
-        assert!(parse_thread_budget("many").is_err());
-        assert_eq!(ThreadBudget::threads(3).resolve(), 3);
-        assert!(ThreadBudget::Auto.resolve() >= 1);
-    }
-
     // io backend parses the shipped floor and the ring arms
     #[test]
     fn io_backend() {
-        let posix: ReelConfig = serde_json::from_str(r#"{"io_backend":"posix"}"#).expect("posix");
-        let ring: ReelConfig = serde_json::from_str(r#"{"io_backend":"uring"}"#).expect("uring");
+        let posix: IoBackend = serde_json::from_str(r#""posix""#).expect("posix");
+        let ring: IoBackend = serde_json::from_str(r#""uring""#).expect("uring");
+        let direct: IoBackend = serde_json::from_str(r#""uring_direct""#).expect("uring_direct");
 
-        assert_eq!(posix.io_backend, IoBackend::Posix);
-        assert_eq!(ring.io_backend, IoBackend::Uring);
+        assert_eq!(posix, IoBackend::Posix);
+        assert_eq!(ring, IoBackend::Uring);
+        assert_eq!(direct, IoBackend::UringDirect);
         assert_eq!(IoBackend::default(), IoBackend::Posix);
-    }
-
-    // a non-default config deserializes every knob to its chosen value
-    #[test]
-    fn deserializes_json() {
-        let raw = r#"{
-            "segment_bytes": "512 MiB",
-            "alloc_chunk": "32 MiB",
-            "preallocate": "full",
-            "sync_bytes": 0,
-            "compact_dead_ratio": 0.25,
-            "compact_mbps": 200,
-            "scrub_mbps": 0,
-            "verify_reads": false,
-            "active_tails": 4,
-            "io_backend": "uring_direct"
-        }"#;
-
-        let config: ReelConfig = serde_json::from_str(raw).expect("config");
-
-        assert_eq!(config.segment_bytes, ByteCount::mb(512));
-        assert_eq!(config.preallocate, Preallocate::Full);
-        assert_eq!(config.sync, SyncPolicy::EveryPut);
-        assert_eq!(config.compact_mbps, CompactRate::Mbps(200));
-        assert_eq!(config.active_tails, ThreadBudget::threads(4));
-        assert_eq!(config.io_backend, IoBackend::UringDirect);
-        assert!(config.validate().is_ok());
-    }
-
-    // the full spec config block deserializes to the defaults and validates
-    #[test]
-    fn deserializes_spec_block() {
-        let raw = r#"{
-            "segment_bytes": "1 GiB",
-            "alloc_chunk": "64 MiB",
-            "preallocate": "full",
-            "sync_bytes": "never",
-            "compact_dead_ratio": 0.50,
-            "compact_mbps": "auto",
-            "scrub_mbps": 64,
-            "verify_reads": false,
-            "repair": "peers",
-            "active_tails": "auto",
-            "io_backend": "posix"
-        }"#;
-
-        let config: ReelConfig = serde_json::from_str(raw).expect("spec config");
-
-        assert_eq!(config, ReelConfig::default());
-        assert!(config.validate().is_ok());
-    }
-
-    // missing fields fall back to defaults
-    #[test]
-    fn deserializes_partial() {
-        let config: ReelConfig = serde_json::from_str("{}").expect("empty config");
-
-        assert_eq!(config, ReelConfig::default());
     }
 }

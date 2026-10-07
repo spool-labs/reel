@@ -55,8 +55,9 @@ Compaction, index paging, tombstone pruning, merges, and the scrub run only insi
 the `reel` binary to inspect, verify, and checkpoint a volume ([README](crates/reel-cli/README.md)).
 `tape-reel-mock` is an in-memory `Store` for tests and stays unpublished.
 
-Nothing is on by default. `serde` adds `Deserialize` for `ReelConfig` and its enums. `sim` adds
-the deterministic io simulator and fault plans. `rendezvous` adds points where a test parks a thread.
+Nothing is on by default. `serde` adds `Serialize` for the reports and `Deserialize` for
+`IoBackend`. `sim` adds the deterministic io simulator and fault plans. `rendezvous` adds points
+where a test parks a thread.
 
 ## Docs and tests
 

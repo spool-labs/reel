@@ -34,8 +34,7 @@ default = []
 sim = []
 rendezvous = []
 
-# deserialization for `ReelConfig` and the enums it holds, for an operator who
-# keeps the volume's settings in a file rather than in code.
+# serialization for the reports, and deserialization for `IoBackend`
 serde = ["dep:serde"]
 
 [target.'cfg(target_os = "linux")'.dependencies]

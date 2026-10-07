@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use reel::reel::bias::{access_ranges, available_bytes, MachineFacts, Plane, RingAvailability};
-use reel::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RangedReads, ReelConfig, ReelStore};
+use reel::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore};
 
 const RECORDS: &str = "records";
 
@@ -105,18 +105,12 @@ fn main() -> reel::Result<()> {
             None => "off".to_string(),
         }
     );
-    println!("{:<20}{:?}", "ranged reads", verdict.ranged_reads);
     println!("{:<20}{:?}", "preallocate", verdict.preallocate);
     println!("{:<20}{}", "fd cache", verdict.fd_cache);
 
-    // A window is read where the volume opened: a direct volume is refused mapped
-    // reads at validation, and a mapping is only ever advised on the buffered plane.
-    match verdict.plane {
-        Plane::Direct => {
-            assert_eq!(verdict.map_above, None);
-            assert_eq!(verdict.ranged_reads, RangedReads::Direct);
-        }
-        Plane::Buffered => assert_eq!(verdict.ranged_reads, RangedReads::Cached),
+    // A direct volume refuses a mapping at validation, so the pass advises no floor there
+    if verdict.plane == Plane::Direct {
+        assert_eq!(verdict.map_above, None);
     }
     assert!(
         verdict.fd_cache > 0,

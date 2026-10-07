@@ -58,20 +58,6 @@ impl ReelError {
             _ => false,
         }
     }
-
-    /// Whether this is the filesystem refusing something it will never accept
-    ///
-    /// An O_DIRECT open comes back EINVAL on tmpfs and overlayfs, and EOPNOTSUPP on
-    /// the filesystems that answer more precisely.
-    pub fn is_unsupported(&self) -> bool {
-        match self {
-            ReelError::Io(source) => matches!(
-                source.raw_os_error(),
-                Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
-            ),
-            _ => false,
-        }
-    }
 }
 
 impl From<ReelError> for StoreError {

@@ -1,6 +1,6 @@
 # Unsafe: every site, and what makes it sound
 
-**79 `unsafe` occurrences across 59 items, in 10 files.** 77 of them, in 58 items
+**78 `unsafe` occurrences across 58 items, in 10 files.** 76 of them, in 57 items
 across 9 files, are in `tape-reel`. The other 2 are one item in `tape-reel-cli`.
 `tape-reel-core` and `tape-reel-mock` have none. Test modules are excluded from those
 counts; what follows is what a release build compiles.
@@ -16,16 +16,15 @@ completion has just reported, which is the one place the type system cannot see
 what the kernel did.
 
 Many of the sites below are `cfg` alternatives of each other, so no build
-compiles all 58 in `tape-reel`. A Linux x86_64 build compiles 53 of them. A macOS
-aarch64 build compiles 35, having no ring backend and no Linux-only syscalls.
+compiles all 57 in `tape-reel`. A Linux x86_64 build compiles 52 of them. A macOS
+aarch64 build compiles 34, having no ring backend and no Linux-only syscalls.
 
-## `io/posix_backend.rs`: 28 occurrences, 22 items
+## `io/posix_backend.rs`: 27 occurrences, 21 items
 
 The syscall surface. Six shapes, then the wrappers.
 
 | site | what it does | what makes it sound |
 |---|---|---|
-| `warm_read` | commits what a non-blocking read reported filling | the count came off the kernel's own return, capped at the room the buffer handed over |
 | `nowait_preadv` | `preadv2` with `RWF_NOWAIT`, so a cold page refuses instead of waiting | the list names `count` buffers of the room their owners handed over, and the kernel writes no more than that |
 | the split warm read | one non-blocking vectored read filling a header buffer and a payload buffer | the kernel reported filling the whole of both, and it fills the first before the second |
 | `write_all_at` | `pwrite` in a resume loop over a direct staging buffer | the pointer names an allocation of `len` bytes and the resume offset is always inside it |

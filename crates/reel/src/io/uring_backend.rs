@@ -1948,20 +1948,15 @@ fn ring_file(op: &Op) -> Option<FileId> {
         // calls.
         Op::Writev { bufs, .. } if bufs.len() > MAX_IOVECS => None,
         Op::Writev { bufs, .. } if write_span(bufs) > RING_WRITE_CAP => None,
-        Op::Pread { buf, .. } | Op::PreadCold { buf, .. }
-            if buf.wanted() as u64 > RING_SPAN_CAP =>
-        {
-            None
-        }
+        Op::Pread { buf, .. } if buf.wanted() as u64 > RING_SPAN_CAP => None,
         Op::PreadSplit { head, body, .. }
             if (head.wanted() + body.wanted()) as u64 > RING_SPAN_CAP =>
         {
             None
         }
-        Op::Writev { file, .. }
-        | Op::Pread { file, .. }
-        | Op::PreadCold { file, .. }
-        | Op::PreadSplit { file, .. } => Some(*file),
+        Op::Writev { file, .. } | Op::Pread { file, .. } | Op::PreadSplit { file, .. } => {
+            Some(*file)
+        }
         _ => None,
     }
 }
@@ -1999,13 +1994,7 @@ fn build_entry(
                 .build());
             (entry, Pending::Wrote { tag, bufs })
         }
-        // The routed read takes the buffered descriptor and ignores the direct one
-        // it carries, which is safe because it reads the descriptor the ring
-        // registered rather than a plane the ring does not know about.
         Op::Pread {
-            tag, offset, buf, ..
-        }
-        | Op::PreadCold {
             tag, offset, buf, ..
         } => {
             let mut buf = buf;
@@ -2052,9 +2041,7 @@ fn staged_span(op: &Op) -> Option<usize> {
             }
             return Some(align_up(total as u64) as usize);
         }
-        Op::Pread { offset, buf, .. } | Op::PreadCold { offset, buf, .. } => {
-            (*offset, buf.wanted())
-        }
+        Op::Pread { offset, buf, .. } => (*offset, buf.wanted()),
         Op::PreadSplit {
             offset, head, body, ..
         } => (*offset, head.wanted() + body.wanted()),
@@ -2109,9 +2096,6 @@ fn build_staged(
             )
         }
         Op::Pread {
-            tag, offset, buf, ..
-        }
-        | Op::PreadCold {
             tag, offset, buf, ..
         } => {
             let (start, _) = covering_span(offset, buf.wanted() as u64);

@@ -268,7 +268,6 @@ fn open_through(backend: &UringBackend, path: &std::path::Path) -> FileId {
         tag: Tag(0),
         path: path.to_path_buf(),
         create: false,
-        direct: false,
     };
     backend.submit(vec![open]).expect("submit the open");
     match collect(backend, 1).pop().expect("one completion").outcome {

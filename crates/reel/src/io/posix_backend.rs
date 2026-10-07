@@ -36,15 +36,9 @@ pub(crate) const MAX_IOVECS: usize = 1024;
 /// Answer a read from the page cache or refuse it, rather than waiting on a device
 ///
 /// Resident pages answer for the price of a syscall the read owed anyway, and
-/// anything else comes back EAGAIN, which is what tells the route it is cold.
+/// anything else comes back EAGAIN, which is what tells the probe the read is cold.
 #[cfg(target_os = "linux")]
 const RWF_NOWAIT: c_int = 0x0000_0008;
-
-/// Window length above which the warm probe is skipped
-///
-/// A probe that comes back short has copied whatever was resident for nothing, so
-/// it is worth issuing only where that waste is bounded by a few pages.
-const WARM_PROBE_MAX: usize = 16 * 1024;
 
 /// Largest covering span a thread keeps a staging buffer for
 ///
@@ -53,103 +47,7 @@ const WARM_PROBE_MAX: usize = 16 * 1024;
 /// are this wide too, so one number decides both.
 pub(crate) const STAGE_BYTES: usize = 128 * 1024;
 
-/// Whether the volume may still read a window around the page cache
-///
-/// Its two reads prove themselves separately: EINVAL means both that the kernel
-/// does not know a flag and that a direct read was unaligned, so one latch for
-/// both would let a defect disable the other.
-#[derive(Debug)]
-struct ColdReads {
-    /// Whether the route may still be taken at all
-    is_live: AtomicBool,
-
-    /// Whether one probe has come back, which settles what its refusals mean
-    probe_proven: AtomicBool,
-
-    /// Whether one direct read has come back, which settles what its refusals mean
-    direct_proven: AtomicBool,
-}
-
-impl ColdReads {
-    fn new() -> ColdReads {
-        ColdReads {
-            is_live: AtomicBool::new(true),
-            probe_proven: AtomicBool::new(false),
-            direct_proven: AtomicBool::new(false),
-        }
-    }
-
-    fn is_live(&self) -> bool {
-        self.is_live.load(Ordering::Relaxed)
-    }
-
-    fn is_probe_proven(&self) -> bool {
-        self.probe_proven.load(Ordering::Relaxed)
-    }
-
-    /// Note that a probe came back, which settles what its refusals mean
-    fn note_probe(&self) {
-        prove(&self.probe_proven);
-    }
-
-    /// Note that a direct read came back, which settles what its refusals mean
-    fn note_direct(&self) {
-        prove(&self.direct_proven);
-    }
-
-    /// Retire the plane on a refused direct read, and say whether to fall back
-    ///
-    /// Only a direct read that has never once answered can retire, since past
-    /// that the codes are ones a read can earn honestly. The probe reads the
-    /// other descriptor and vouches for nothing here.
-    fn retire_on_refusal(&self, error: &ReelError) -> bool {
-        if self.direct_proven.load(Ordering::Relaxed) || !is_unknown_flag(error) {
-            return false;
-        }
-        self.retire(error);
-        true
-    }
-
-    fn retire(&self, error: &ReelError) {
-        self.is_live.store(false, Ordering::Relaxed);
-        tracing::warn!(
-            "reel windows fall back to the page cache: the cold read plane was refused: {error}"
-        );
-    }
-
-    /// Answer a window from the page cache without blocking, or say it is cold
-    ///
-    /// A partial fill is never committed: a short read reads as a window the
-    /// volume cannot answer and buys a second read.
-    fn warm_read(&self, fd: RawFd, buf: &mut ReadBuf, offset: u64) -> Result<Option<usize>> {
-        let (ptr, len) = buf.as_mut_ptr();
-        let iovec = libc::iovec {
-            iov_base: ptr as *mut c_void,
-            iov_len: len,
-        };
-        let (ret, errno) = nowait_preadv(fd, &iovec, 1, offset);
-        match warm_verdict(ret, errno, len, self.is_probe_proven()) {
-            WarmVerdict::Warm(filled) => {
-                self.note_probe();
-                // Safety: the kernel reported filling exactly this many bytes of
-                // the room the buffer handed over.
-                unsafe { buf.commit(filled) };
-                Ok(Some(filled))
-            }
-            WarmVerdict::Cold => {
-                self.note_probe();
-                Ok(None)
-            }
-            WarmVerdict::Retire => {
-                self.retire(&ReelError::Io(io::Error::from_raw_os_error(errno)));
-                Ok(None)
-            }
-            WarmVerdict::Failed => Err(ReelError::Io(io::Error::from_raw_os_error(errno))),
-        }
-    }
-}
-
-/// Latch a plane's proof, leaving the line alone once it is set
+/// Latch a probe's proof, leaving the line alone once it is set
 fn prove(flag: &AtomicBool) {
     if !flag.load(Ordering::Relaxed) {
         flag.store(true, Ordering::Relaxed);
@@ -193,20 +91,20 @@ fn nowait_preadv(
 /// What one non-blocking probe of the page cache settled
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WarmVerdict {
-    /// The cache held the whole window, and this is what it filled
+    /// The cache held the whole read, and this is what it filled
     Warm(usize),
 
-    /// The pages are not all resident, so the window goes to the device
+    /// The pages are not all resident, so the read goes to the device
     Cold,
 
-    /// The kernel does not know the flag, so the plane retires
+    /// The kernel does not know the flag, so the probe retires
     Retire,
 
     /// The read failed for a reason of its own
     Failed,
 }
 
-/// What a probe's return and errno mean for the window it was asked about
+/// What a probe's return and errno mean for the read it was asked about
 fn warm_verdict(ret: libc::ssize_t, errno: c_int, wanted: usize, is_proven: bool) -> WarmVerdict {
     if ret >= 0 {
         let filled = ret as usize;
@@ -222,53 +120,10 @@ fn warm_verdict(ret: libc::ssize_t, errno: c_int, wanted: usize, is_proven: bool
     }
 }
 
-/// What the cold-window route did, over every window it was handed
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ColdReadCounts {
-    /// Windows the reel routed to this plane
-    pub routed: u64,
-
-    /// Windows the page cache answered whole, with no device op
-    pub warm: u64,
-
-    /// Windows that went around the cache to the device
-    pub direct: u64,
-
-    /// Bytes those reads asked the device for, the covering span included
-    pub direct_bytes: u64,
-}
-
-/// The counts behind ColdReadCounts
-#[derive(Debug, Default)]
-struct ColdCounts {
-    routed: AtomicU64,
-    warm: AtomicU64,
-    direct: AtomicU64,
-    direct_bytes: AtomicU64,
-}
-
-impl ColdCounts {
-    fn snapshot(&self) -> ColdReadCounts {
-        ColdReadCounts {
-            routed: self.routed.load(Ordering::Relaxed),
-            warm: self.warm.load(Ordering::Relaxed),
-            direct: self.direct.load(Ordering::Relaxed),
-            direct_bytes: self.direct_bytes.load(Ordering::Relaxed),
-        }
-    }
-}
-
 /// Record length above which an awaited point read is not probed
-///
-/// A short probe wastes one memcpy rather than a device read, so the bound sits
-/// well above WARM_PROBE_MAX: an ordinary record runs to tens of kilobytes, and
-/// excluding them would leave the knob armed and firing on nothing.
 const POINT_PROBE_MAX: usize = 1024 * 1024;
 
 /// Whether an awaited point read may still ask the page cache before it queues
-///
-/// Separate from ColdReads: this probe reads a buffered descriptor, and a refusal
-/// earned on the ranged plane's direct one says nothing about it.
 #[derive(Debug)]
 struct WarmReads {
     /// Whether the probe may still be issued at all
@@ -367,18 +222,6 @@ impl WarmCounts {
     }
 }
 
-/// Whether an error is the kernel saying it does not know a flag it was handed
-///
-/// Which of the two a kernel picks depends on how far the call got before the
-/// flag was looked at, so both count.
-fn is_unknown_flag(error: &ReelError) -> bool {
-    let code = match error {
-        ReelError::Io(io) => io.raw_os_error(),
-        _ => None,
-    };
-    matches!(code, Some(libc::EOPNOTSUPP) | Some(libc::EINVAL))
-}
-
 /// Synchronous POSIX backend executing ops at submit and queuing completions
 #[derive(Debug)]
 pub struct PosixBackend {
@@ -390,8 +233,6 @@ pub struct PosixBackend {
     ops: AtomicU64,
     sync_count: AtomicU64,
     sync_nanos: AtomicU64,
-    cold: ColdReads,
-    cold_counts: ColdCounts,
     warm: WarmReads,
     warm_counts: WarmCounts,
     is_direct: bool,
@@ -414,17 +255,10 @@ impl PosixBackend {
             ops: AtomicU64::new(0),
             sync_count: AtomicU64::new(0),
             sync_nanos: AtomicU64::new(0),
-            cold: ColdReads::new(),
-            cold_counts: ColdCounts::default(),
             warm: WarmReads::new(),
             warm_counts: WarmCounts::default(),
             is_direct,
         }
-    }
-
-    /// What the cold-window route has done, over the ops the sampler selected
-    pub fn cold_reads(&self) -> ColdReadCounts {
-        self.cold_counts.snapshot()
     }
 
     /// What the awaited point path's warm probe has done, over the sampled reads
@@ -458,14 +292,6 @@ impl PosixBackend {
             self.warm_counts.served.fetch_add(1, Ordering::Relaxed);
         }
         served
-    }
-
-    /// Whether the cold-window plane is still live on this backend
-    ///
-    /// A refusal retires the plane here rather than on the reel, so this tells a
-    /// routed read that fell back from one that was never routed.
-    pub fn cold_plane_live(&self) -> bool {
-        self.cold.is_live()
     }
 
     /// Descriptors this backend currently holds open
@@ -508,15 +334,10 @@ impl PosixBackend {
 
     fn execute(&self, op: Op) -> Completion {
         match op {
-            Op::Open {
-                tag,
-                path,
-                create,
-                direct,
-            } => {
+            Op::Open { tag, path, create } => {
                 let mut options = OpenOptions::new();
                 options.read(true).write(true).create(create);
-                if self.is_direct || direct {
+                if self.is_direct {
                     direct_open_flag(&mut options);
                 }
                 let outcome = match options.open(&path) {
@@ -554,23 +375,6 @@ impl PosixBackend {
                 let result = match self.fd_of(file) {
                     Ok(fd) if self.is_direct => direct_pread(fd, &mut buf, offset),
                     Ok(fd) => pread_into(fd, &mut buf, offset),
-                    Err(error) => Err(error),
-                };
-                Completion {
-                    tag,
-                    outcome: Outcome::Read { result, buf },
-                }
-            }
-            Op::PreadCold {
-                tag,
-                file,
-                direct,
-                offset,
-                mut buf,
-                probe,
-            } => {
-                let result = match self.fd_of(file) {
-                    Ok(fd) => self.cold_pread(fd, direct, &mut buf, offset, probe),
                     Err(error) => Err(error),
                 };
                 Completion {
@@ -667,49 +471,6 @@ impl PosixBackend {
                 tag,
                 outcome: Outcome::Done(self.advise(file, offset, len, advice)),
             },
-        }
-    }
-
-    /// Serve a window from the plane its route names
-    ///
-    /// The probe and the device read are one op, one slot and one completion: a
-    /// second flight for the probe would double the async door's slot traffic.
-    fn cold_pread(
-        &self,
-        fd: RawFd,
-        direct: FileId,
-        buf: &mut ReadBuf,
-        offset: u64,
-        probe: bool,
-    ) -> Result<usize> {
-        self.cold_counts.routed.fetch_add(1, Ordering::Relaxed);
-        if probe && self.cold.is_live() && buf.wanted() <= WARM_PROBE_MAX {
-            if let Some(filled) = self.cold.warm_read(fd, buf, offset)? {
-                self.cold_counts.warm.fetch_add(1, Ordering::Relaxed);
-                return Ok(filled);
-            }
-        }
-        // A probe that retired the plane leaves the volume with the reads it had
-        // before, since without the probe warm and cold cannot be told apart.
-        if !self.cold.is_live() {
-            return pread_into(fd, buf, offset);
-        }
-
-        let direct_fd = self.fd_of(direct)?;
-        match direct_pread(direct_fd, buf, offset) {
-            Ok(filled) => {
-                self.cold.note_direct();
-                let (_, span) = covering_span(offset, buf.wanted() as u64);
-                self.cold_counts.direct.fetch_add(1, Ordering::Relaxed);
-                self.cold_counts
-                    .direct_bytes
-                    .fetch_add(span, Ordering::Relaxed);
-                Ok(filled)
-            }
-            // A kernel that refuses the direct read leaves the volume with the
-            // plane it had before rather than failing a read the cache can serve.
-            Err(error) if self.cold.retire_on_refusal(&error) => pread_into(fd, buf, offset),
-            Err(error) => Err(error),
         }
     }
 
@@ -1542,7 +1303,6 @@ mod tests {
                 tag: Tag(1),
                 path: path.to_path_buf(),
                 create,
-                direct: false,
             }])
             .expect("submit open");
         opened(drain_one(backend).outcome).expect("open result")
@@ -2114,84 +1874,13 @@ mod tests {
         );
     }
 
-    // a retired plane serves the window off the buffered descriptor
-    #[test]
-    fn a_retired_plane_reads_buffered() {
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("retired");
-        let bytes = striped_file(&path, 16 * 1024);
-
-        let backend = PosixBackend::new();
-        let file = open_file(&backend, &path, false);
-        backend
-            .submit(vec![Op::Open {
-                tag: Tag(2),
-                path: path.clone(),
-                create: false,
-                direct: true,
-            }])
-            .expect("submit the direct open");
-        let direct = opened(drain_one(&backend).outcome).expect("direct open");
-
-        backend.cold.retire(&ReelError::Backend("test".to_string()));
-        backend
-            .submit(vec![Op::PreadCold {
-                tag: Tag(3),
-                file,
-                direct,
-                offset: 5000,
-                buf: ReadBuf::new(1000),
-                probe: true,
-            }])
-            .expect("submit the routed read");
-        let (result, taken) = read_bytes(drain_one(&backend).outcome);
-
-        assert_eq!(result.expect("the buffered fallback read"), 1000);
-        assert_eq!(taken.as_slice(), &bytes[5000..6000]);
-        assert_eq!(backend.cold_reads().routed, 1, "the read was still routed");
-        assert_eq!(
-            backend.cold_reads().direct,
-            0,
-            "and never reached the device plane"
-        );
-    }
-
-    // a probe coming back leaves the direct read's own fallback intact
-    #[test]
-    fn a_probe_leaves_the_direct_plane_unproven() {
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("unproven");
-        striped_file(&path, 16 * 1024);
-        let file = std::fs::File::open(&path).expect("open the probed descriptor");
-        let refused = ReelError::Io(io::Error::from_raw_os_error(libc::EINVAL));
-
-        let cold = ColdReads::new();
-        let mut buf = ReadBuf::new(4000);
-        cold.warm_read(file.as_raw_fd(), &mut buf, 0)
-            .expect("the probe answered");
-        if !cold.is_probe_proven() {
-            println!("skipped: this filesystem refused the probe, so it latched nothing");
-            return;
-        }
-
-        assert!(
-            cold.retire_on_refusal(&refused),
-            "the probe proved the direct plane"
-        );
-        cold.note_direct();
-        assert!(
-            !cold.retire_on_refusal(&refused),
-            "a plane that answered retired anyway"
-        );
-    }
-
-    // a probe that filled the whole window is the answer
+    // a probe that filled the whole read is the answer
     #[test]
     fn warm_verdict_takes_a_full_fill() {
         assert_eq!(warm_verdict(4000, 0, 4000, true), WarmVerdict::Warm(4000));
     }
 
-    // a probe that filled part of the window commits nothing and goes to the device
+    // a probe that filled part of the read commits nothing and goes to the device
     #[test]
     fn warm_verdict_refuses_a_partial_fill() {
         assert_eq!(warm_verdict(2048, 0, 4000, true), WarmVerdict::Cold);
@@ -2207,7 +1896,7 @@ mod tests {
         );
     }
 
-    // a kernel that has never answered and refuses the flag retires the plane
+    // a kernel that has never answered and refuses the flag retires the probe
     #[test]
     fn warm_verdict_retires_an_unknown_flag() {
         assert_eq!(
@@ -2220,7 +1909,7 @@ mod tests {
         );
     }
 
-    // once the plane has answered, the same codes are the read's own error
+    // once the probe has answered, the same codes are the read's own error
     #[test]
     fn warm_verdict_reports_errors_after_proof() {
         assert_eq!(

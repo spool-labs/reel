@@ -277,22 +277,6 @@ pub enum IoBackend {
     UringDirect,
 }
 
-/// How a ranged read of a large record reaches the device
-///
-/// Linux is the only platform where the direct open flag means anything, so off it
-/// every arm is the same buffered read with a wider span.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-pub enum RangedReads {
-    /// Read the window through the page cache
-    Cached,
-    /// Ask the cache without blocking, and go around it when it cannot answer
-    Probed,
-    /// Go around the cache without asking
-    Direct,
-}
-
 /// How an awaited whole-record read reaches its bytes
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Deserialize))]
@@ -367,9 +351,6 @@ pub struct ReelConfig {
     )]
     pub map_above: Option<ByteCount>,
 
-    /// Which plane a window of a large record is read on
-    pub ranged_reads: RangedReads,
-
     /// Whether an awaited whole-record read asks the page cache before it queues
     pub point_reads: PointReads,
 
@@ -412,7 +393,7 @@ impl ReelConfig {
 
     /// Whether reads into an open tail go through its mapping, whatever `map_above` says
     pub fn maps_tails(&self) -> bool {
-        self.io_backend != IoBackend::UringDirect && self.ranged_reads == RangedReads::Cached
+        self.io_backend != IoBackend::UringDirect
     }
 }
 
@@ -430,7 +411,6 @@ impl Default for ReelConfig {
             verify_reads: false,
             repair: RepairPath::Peers,
             map_above: None,
-            ranged_reads: RangedReads::Cached,
             point_reads: PointReads::Queued,
             footer_cache: ByteCount::mb(DEFAULT_FOOTER_CACHE_MIB),
             active_tails: ThreadBudget::Auto,
@@ -517,24 +497,6 @@ impl ReelConfig {
             return Err(ReelError::Config(
                 "map_above and a direct volume contradict each other: a mapping reads the page cache a direct volume bypasses".to_string(),
             ));
-        }
-
-        if self.ranged_reads != RangedReads::Cached {
-            if self.io_backend == IoBackend::UringDirect {
-                return Err(ReelError::Config(
-                    "ranged_reads and a direct volume contradict each other: a direct volume already reads around the page cache everywhere".to_string(),
-                ));
-            }
-            if self.io_backend == IoBackend::Uring {
-                return Err(ReelError::Config(
-                    "ranged_reads needs the posix backend: a driver has one backend, and a buffered ring serves the read itself, so the direct descriptor would name a file the reader never consults".to_string(),
-                ));
-            }
-            if self.map_above.is_some() {
-                return Err(ReelError::Config(
-                    "ranged_reads and map_above contradict each other: the mapping answers the window before the route is reached".to_string(),
-                ));
-            }
         }
 
         // map_above is not refused here: the mapping serves the blocking door and

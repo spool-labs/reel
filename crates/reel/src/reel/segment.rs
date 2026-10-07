@@ -18,8 +18,7 @@ use crate::format::segment_header::{SegmentHeader, SEGMENT_HEADER_SPAN};
 use crate::hold::{segment_key, Hold};
 use crate::io::mapping::Mapping;
 use crate::io::op::{
-    Advice, ColdRoute, Completion, FileId, Op, Outcome, Part, ReadBuf, SegmentEntry, Tag,
-    WarmFirst, WriteBuf,
+    Advice, Completion, FileId, Op, Outcome, Part, ReadBuf, SegmentEntry, Tag, WarmFirst, WriteBuf,
 };
 use crate::io::slots::{runs_of, SlotTable};
 use crate::io::ReelIo;
@@ -360,23 +359,6 @@ impl IoDriver {
             tag: self.next_tag(),
             path: path.to_path_buf(),
             create,
-            direct: false,
-        };
-        match self.run_op(op)?.outcome {
-            Outcome::Opened(result) => result,
-            other => Err(wrong_shape(&other)),
-        }
-    }
-
-    /// Open a second descriptor on a file whose reads skip the page cache
-    ///
-    /// Never creates: this is another view of a file the buffered open already made.
-    pub fn open_direct(&self, path: &Path) -> Result<FileId> {
-        let op = Op::Open {
-            tag: self.next_tag(),
-            path: path.to_path_buf(),
-            create: false,
-            direct: true,
         };
         match self.run_op(op)?.outcome {
             Outcome::Opened(result) => result,
@@ -435,53 +417,6 @@ impl IoDriver {
             offset,
             buf: ReadBuf::reusing(reuse, len as usize),
         };
-        match self.wait_op(op).await?.outcome {
-            Outcome::Read { result, buf } => {
-                result?;
-                Ok(buf.into_vec())
-            }
-            other => Err(wrong_shape(&other)),
-        }
-    }
-
-    /// Read a window through the plane its route names, into a reused buffer
-    ///
-    /// One op whatever the route: the plane is chosen inside the backend, so a
-    /// window is one slot and one completion either way.
-    pub fn pread_cold(
-        &self,
-        file: FileId,
-        route: ColdRoute,
-        offset: u64,
-        len: u64,
-        reuse: Vec<u8>,
-    ) -> Result<Vec<u8>> {
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        let op = cold_read_op(self.next_tag(), file, route, offset, len, reuse);
-        match self.run_op(op)?.outcome {
-            Outcome::Read { result, buf } => {
-                result?;
-                Ok(buf.into_vec())
-            }
-            other => Err(wrong_shape(&other)),
-        }
-    }
-
-    /// The same routed window as a future, awaited rather than parked on
-    pub async fn wait_pread_cold(
-        &self,
-        file: FileId,
-        route: ColdRoute,
-        offset: u64,
-        len: u64,
-        reuse: Vec<u8>,
-    ) -> Result<Vec<u8>> {
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        let op = cold_read_op(self.next_tag(), file, route, offset, len, reuse);
         match self.wait_op(op).await?.outcome {
             Outcome::Read { result, buf } => {
                 result?;
@@ -817,42 +752,6 @@ impl IoDriver {
     }
 }
 
-/// The read one window takes, which is the plain one wherever it is not routed
-fn cold_read_op(
-    tag: Tag,
-    file: FileId,
-    route: ColdRoute,
-    offset: u64,
-    len: u64,
-    reuse: Vec<u8>,
-) -> Op {
-    let buf = ReadBuf::reusing(reuse, len as usize);
-    match route {
-        ColdRoute::Cached => Op::Pread {
-            tag,
-            file,
-            offset,
-            buf,
-        },
-        ColdRoute::Probed(direct) => Op::PreadCold {
-            tag,
-            file,
-            direct,
-            offset,
-            buf,
-            probe: true,
-        },
-        ColdRoute::Direct(direct) => Op::PreadCold {
-            tag,
-            file,
-            direct,
-            offset,
-            buf,
-            probe: false,
-        },
-    }
-}
-
 /// What a split read's completion filled, or its error and the spare it carried
 ///
 /// A read that did not land leaves the payload buffer the pool's and the header
@@ -1099,19 +998,6 @@ impl<'driver> SegmentReader<'driver> {
     }
 }
 
-/// What one segment's single direct open settled on
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DirectOpen {
-    /// The descriptor is open and this segment's windows read the device
-    Ready(FileId),
-
-    /// This file has no direct descriptor, for a reason the next file need not share
-    Refused,
-
-    /// The filesystem serves no direct opens, so no file on it will have one
-    Unsupported,
-}
-
 struct SegmentInner {
     id: SegmentId,
     path: PathBuf,
@@ -1120,7 +1006,6 @@ struct SegmentInner {
     layout: RecordLayout,
     is_doomed: AtomicBool,
     mapping: OnceLock<Option<Mapping>>,
-    direct: OnceLock<DirectOpen>,
 }
 
 impl Drop for SegmentInner {
@@ -1135,15 +1020,6 @@ impl Drop for SegmentInner {
         if self.is_doomed.load(Ordering::Acquire) {
             if let Err(error) = self.driver.unlink(&self.path) {
                 tracing::warn!("failed to unlink a doomed reel segment on last drop: {error}");
-            }
-        }
-        // Both descriptors, since either one left open holds the file's extents
-        // where a directory walk can no longer see them.
-        if let Some(DirectOpen::Ready(direct)) = self.direct.get() {
-            if let Err(error) = self.driver.close(*direct) {
-                tracing::warn!(
-                    "failed to release a reel segment's direct descriptor on last drop: {error}"
-                );
             }
         }
         if let Err(error) = self.driver.close(self.file) {
@@ -1195,7 +1071,6 @@ impl SegmentHandle {
                 layout,
                 is_doomed: AtomicBool::new(false),
                 mapping: OnceLock::new(),
-                direct: OnceLock::new(),
             }),
         }
     }
@@ -1270,36 +1145,6 @@ impl SegmentHandle {
             .mapping
             .get_or_init(|| Mapping::open(&self.inner.path, span))
             .as_ref()
-    }
-
-    /// The segment's direct descriptor, if one has already been settled
-    pub fn direct_file(&self) -> Option<FileId> {
-        match self.inner.direct.get() {
-            Some(DirectOpen::Ready(file)) => Some(*file),
-            _ => None,
-        }
-    }
-
-    /// The segment's direct descriptor, opening one on the first ask
-    ///
-    /// A file that cannot be opened this way stays buffered for the life of the
-    /// handle family rather than buying a failed open per read. Whether the refusal
-    /// is this file's or the whole filesystem's comes back with it, since only the
-    /// second says anything about the segments not opened yet.
-    pub fn direct_file_or_open(&self) -> DirectOpen {
-        *self.inner.direct.get_or_init(|| {
-            match self.inner.driver.open_direct(&self.inner.path) {
-                Ok(file) => DirectOpen::Ready(file),
-                Err(error) => {
-                    tracing::warn!("a reel segment's windows read through the page cache: its direct open failed: {error}");
-                    if error.is_unsupported() {
-                        DirectOpen::Unsupported
-                    } else {
-                        DirectOpen::Refused
-                    }
-                }
-            }
-        })
     }
 }
 
@@ -1538,13 +1383,11 @@ mod tests {
                     tag: Tag(10),
                     path: dir.join("a"),
                     create: true,
-                    direct: false,
                 },
                 Op::Open {
                     tag: Tag(11),
                     path: dir.join("b"),
                     create: true,
-                    direct: false,
                 },
             ])
             .expect("run");
@@ -1943,7 +1786,6 @@ mod tests {
             tag: driver.next_tag(),
             path,
             create: true,
-            direct: false,
         };
         let mut waiting = Box::pin(driver.wait_op(op));
         let woken = Arc::new(Counter(AtomicUsize::new(0)));

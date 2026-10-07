@@ -182,14 +182,13 @@ cut out of the middle, which is a copy the buffered path does not pay.
 Against a buffered read that was going to be cached anyway, that is a
 straight loss, and the measured 62x worse reads on the ccx33 are that.
 
-The widening is not itself an amplification, which is what makes a ranged read
-route possible. `Advice::Random` is on every reader descriptor, so a buffered
-miss faults whole pages with no readahead and fetches `L + 4095` bytes on
-average; the covering span fetches `L + BLOCK - 1`, and at `BLOCK == 4096` those
-are the same bytes. The staging copy is the price, and on a cold read whose pages
-nothing will ask for again it is cheaper than the page cache work it replaces.
-The staging buffer is per thread rather than per read, because the per-read
-aligned allocation is the whole of a small direct read's penalty.
+The widening is not itself an amplification. `Advice::Random` is on every reader
+descriptor, so a buffered miss faults whole pages with no readahead and fetches
+`L + 4095` bytes on average. The covering span fetches `L + BLOCK - 1`, and at
+`BLOCK == 4096` those are the same bytes. The staging copy is the price, and on a
+cold read whose pages nothing will ask for again it is cheaper than the page cache
+work it replaces. The staging buffer is one per thread, because a per-read aligned
+allocation is the whole of a small direct read's penalty.
 
 The ring also takes nothing while a volume is direct. A data op's buffers
 belong to the caller and sit wherever the allocator put them, which a direct
@@ -232,8 +231,8 @@ kernel**: ext4 accepted the per-op flag and btrfs refused it with `ENOTSUP` on t
 same kernel, so a Linux version test is not enough to know whether a flag applies.
 And the retirement rule that made a refusal safe: the first flagged op is the
 probe, and a flag that has once been accepted never retires, so a real error on a
-working kernel is reported rather than swallowed. The cold-window route still runs
-on exactly that rule.
+working kernel is reported and never swallowed. The point read probe still runs on
+exactly that rule.
 
 Writeback is still paced: a megabyte at a time behind the write head, so the device
 is busy while the writer is still copying.
@@ -361,12 +360,6 @@ a metadata volume rather than a bulk one, or a tier whose hot set is genuinely
 held elsewhere such as behind a CDN edge, and none of those is this engine's
 volume.
 
-It was also never the answer for a cold read that wants the cache skipped rather
-than dropped. Dropbehind still copies through a folio and still does the page
-cache insertion and reclaim around it, which is the whole of what perf billed
-the ranged path for; it saves the retention, not the work. That is why the cold
-window route takes a second `O_DIRECT` descriptor rather than a per-op flag.
-
 ## Why not `O_DIRECT` as a default
 
 The write-throughput argument for it is largely spent. A per-op cache hint
@@ -382,9 +375,7 @@ The ruling is about the default for a whole volume, and it is narrower than it
 reads. What the 62x measured was a warm working set served from cache against a
 volume that had no cache; the same loss prices at 7.5x. It
 says nothing about a cold read whose pages nothing will ask for again, which is
-the one shape where there is no warm plane to lose. `ranged_reads` is direct for
-exactly that shape and nothing else: one record class, one read kind, sealed
-segments only, with the buffered plane and the whole-record path untouched.
+the one shape where there is no warm plane to lose.
 
 ## Polled completions, measured and then removed
 

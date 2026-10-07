@@ -244,8 +244,8 @@ turns a failed checksum into a miss because another copy exists, and `None` turn
 it into an error because nothing else holds those bytes. Neither is a tuning
 choice.
 
-`preallocate`, `map_above` and `ranged_reads` are also the three knobs the bias
-pass has an opinion about. It reads the box at open, logs what it would choose and
+`preallocate` and `map_above` are also the two knobs the bias pass has an
+opinion about. It reads the box at open, logs what it would choose and
 changes nothing, so a disagreement between the log line and the config is a
 question for an operator rather than an override. `servo.md` records the rules.
 

@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::append::admission::InflightBudget;
 use crate::append::{Appender, BatchRecord, BatchWrite, Commit, Committed};
-use crate::config::{PointReads, RangedReads, ReelConfig};
+use crate::config::{PointReads, ReelConfig};
 use crate::error::{ReelError, Result};
 use std::sync::OnceLock;
 
@@ -43,9 +43,9 @@ use crate::index::paged::{FooterCache, FooterSource};
 use crate::index::recovery::{read_footer, ResumableTail};
 use crate::index::spot::{Head, HeadRead, RecordSource, SpotRead};
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
-use crate::io::op::{Advice, ColdRoute, Completion, FileId, Op, WarmFirst};
+use crate::io::op::{Advice, Completion, Op, WarmFirst};
 use crate::reel::bands::BandPool;
-use crate::reel::segment::{DirectOpen, FdCache, IoDriver, SegmentHandle, SplitAnswer, SplitRead};
+use crate::reel::segment::{FdCache, IoDriver, SegmentHandle, SplitAnswer, SplitRead};
 use crate::sync::{lock, read, write};
 
 use reel_core::{ReadBlock, Value};
@@ -70,15 +70,6 @@ const SEGMENT_DIGITS: usize = 6;
 
 /// Suffix every segment file carries
 pub const SEGMENT_SUFFIX: &str = ".reel";
-
-/// Record bytes below which a window keeps the page cache
-const DIRECT_RECORD_FLOOR: u32 = 1024 * 1024;
-
-/// Cold reads already in flight before a window may go around the page cache
-///
-/// Direct's only win is a large record under concurrent pressure, and a lone reader
-/// is the case it loses.
-const DIRECT_DEPTH_FLOOR: u64 = 2;
 
 /// The spot index reads its candidates' records through this
 impl RecordSource for ReelShared {
@@ -1097,12 +1088,6 @@ pub struct ReelShared {
     /// Rolled segments whose seals failed, parked for the maintenance tick
     pub(crate) broken_seals: Mutex<Vec<crate::append::BrokenSeal>>,
 
-    /// Whether windows may still be read around the page cache
-    cold_direct: AtomicBool,
-
-    /// Cold window reads in flight right now, on either plane
-    cold_depth: AtomicU64,
-
     /// Sequence numbers drawn for records that have not yet taken a segment hold
     drawn: AtomicU64,
 }
@@ -1119,17 +1104,6 @@ pub struct DrawnRecords<'a> {
 impl Drop for DrawnRecords<'_> {
     fn drop(&mut self) {
         self.shared.drawn.fetch_sub(self.count, Ordering::AcqRel);
-    }
-}
-
-/// One cold window read's place in the depth count, given back when it lands
-struct ColdDepth<'a> {
-    shared: &'a ReelShared,
-}
-
-impl Drop for ColdDepth<'_> {
-    fn drop(&mut self) {
-        self.shared.cold_depth.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1235,8 +1209,6 @@ impl ReelShared {
             unsealed: Mutex::new(std::collections::HashSet::new()),
             past_saving: AtomicU64::new(0),
             broken_seals: Mutex::new(Vec::new()),
-            cold_direct: AtomicBool::new(true),
-            cold_depth: AtomicU64::new(0),
             drawn: AtomicU64::new(0),
         }
     }
@@ -1546,22 +1518,6 @@ impl ReelShared {
         self.past_saving.load(Ordering::Relaxed)
     }
 
-    /// Whether windows may still be read around the page cache on this volume
-    pub fn cold_direct_live(&self) -> bool {
-        self.cold_direct.load(Ordering::Relaxed)
-    }
-
-    /// Stop asking for direct descriptors on a filesystem that serves none
-    pub fn retire_cold_direct(&self) {
-        self.cold_direct.store(false, Ordering::Relaxed);
-    }
-
-    /// Count one cold window read in for as long as its guard is held
-    fn enter_cold(&self) -> ColdDepth<'_> {
-        self.cold_depth.fetch_add(1, Ordering::Relaxed);
-        ColdDepth { shared: self }
-    }
-
     /// Count drawn sequence numbers in until their records take segment holds
     ///
     /// Taken before the numbers are drawn, so there is no instant where a drawn
@@ -1604,26 +1560,11 @@ impl ReelShared {
         }
     }
 
-    /// Cold window reads in flight, not counting the one about to be routed
-    fn cold_depth(&self) -> u64 {
-        self.cold_depth.load(Ordering::Relaxed)
-    }
-
     /// Whether an awaited whole-record read asks the page cache before it queues
     pub fn warm_first(&self) -> WarmFirst {
         match self.config.point_reads {
             PointReads::Probed => WarmFirst::Ask,
             PointReads::Queued => WarmFirst::Skip,
-        }
-    }
-
-    /// The routed read this volume's knob asks for, over a direct descriptor
-    fn routed(&self, file: FileId) -> ColdRoute {
-        match self.config.ranged_reads {
-            RangedReads::Probed => ColdRoute::Probed(file),
-            // Cached never reaches here: the route settles it before any descriptor
-            // is named.
-            RangedReads::Cached | RangedReads::Direct => ColdRoute::Direct(file),
         }
     }
 
@@ -1937,15 +1878,6 @@ impl Reel {
         &self.tails
     }
 
-    /// Count one cold window read in and leave it counted
-    ///
-    /// A lone reader cannot clear the depth floor, so a fixture standing in for a
-    /// busy volume needs pressure that outlives any one call.
-    #[cfg(test)]
-    pub(crate) fn hold_cold_read_open_ended(&self) {
-        self.shared.cold_depth.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Append or overwrite a payload, routed to the tail its key's band is on
     pub fn put(
         &self,
@@ -2217,11 +2149,8 @@ impl Reel {
             }
         }
 
-        let route = self.window_route(&handle, loc);
-        let _depth = self.shared.enter_cold();
-        let read = self.shared.driver.pread_cold(
+        let read = self.shared.driver.pread_reusing(
             handle.file(),
-            route,
             start,
             len as u64,
             crate::reel::payload::take(len),
@@ -2245,53 +2174,17 @@ impl Reel {
             handle.layout().prefix_len(key_width as usize, loc.len),
             at,
         );
-        let route = self.window_route(&handle, loc);
-        let _depth = self.shared.enter_cold();
         let read = self
             .shared
             .driver
-            .wait_pread_cold(
+            .wait_pread_reusing(
                 handle.file(),
-                route,
                 start,
                 len as u64,
                 crate::reel::payload::take(len),
             )
             .await;
         window_or_nothing(read, len)
-    }
-
-    /// Which plane answers this window, and the descriptor it reads
-    ///
-    /// The route picks a descriptor and a staging buffer, never the byte range or
-    /// what the answer means. Both floors err toward the page cache.
-    fn window_route(&self, handle: &SegmentHandle, loc: Loc) -> ColdRoute {
-        if self.shared.config.ranged_reads == RangedReads::Cached
-            || loc.len < DIRECT_RECORD_FLOOR
-            || self.shared.cold_depth() < DIRECT_DEPTH_FLOOR
-            || !self.shared.cold_direct_live()
-        {
-            return ColdRoute::Cached;
-        }
-        if let Some(file) = handle.direct_file() {
-            return self.shared.routed(file);
-        }
-        // A segment anything still holds reads buffered. A direct read of one runs
-        // filemap_write_and_wait_range over its range and flushes the appender's
-        // dirty pages from inside the read.
-        if !self.shared.is_settled(handle.id()) {
-            return ColdRoute::Cached;
-        }
-        match handle.direct_file_or_open() {
-            DirectOpen::Ready(file) => self.shared.routed(file),
-            // One file's refusal costs this segment its plane and nothing more: it
-            // says nothing about whether the next segment can be opened.
-            DirectOpen::Refused => ColdRoute::Cached,
-            DirectOpen::Unsupported => {
-                self.shared.retire_cold_direct();
-                ColdRoute::Cached
-            }
-        }
     }
 
     /// Read part of one record's payload, without reading the rest of it
@@ -2404,8 +2297,6 @@ impl Reel {
 
         if at <= MERGE_GAP {
             let span = at as usize + len;
-            // Unprobed: a window that reached here has already been past the
-            // ranged route.
             let read = self
                 .shared
                 .driver

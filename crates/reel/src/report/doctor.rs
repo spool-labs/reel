@@ -64,12 +64,6 @@ pub struct DoctorReport {
     /// Why the verdict chose that mapping floor
     pub map_because: String,
 
-    /// Whether the configuration reads ranges of a record
-    pub configured_ranged_reads: String,
-
-    /// Whether this machine argues for ranged reads
-    pub verdict_ranged_reads: String,
-
     /// Whether the configuration preallocates a segment before writing it
     pub configured_preallocate: String,
 
@@ -109,8 +103,6 @@ pub fn doctor(root: &Path, config: &ReelConfig) -> DoctorReport {
         configured_map_above: config.map_above.map(ByteCount::to_bytes),
         verdict_map_above: verdict.map_above.map(ByteCount::to_bytes),
         map_because: verdict.map_because.to_string(),
-        configured_ranged_reads: format!("{:?}", config.ranged_reads),
-        verdict_ranged_reads: format!("{:?}", verdict.ranged_reads),
         configured_preallocate: format!("{:?}", config.preallocate),
         verdict_preallocate: format!("{:?}", verdict.preallocate),
         shipped_fd_cache: DEFAULT_FD_CACHE,
@@ -244,7 +236,7 @@ impl DoctorReport {
     }
 
     /// The knobs the configuration asks for beside the ones this machine argues for
-    fn knobs(&self) -> [Knob; 5] {
+    fn knobs(&self) -> [Knob; 4] {
         [
             Knob {
                 name: "plane",
@@ -265,12 +257,6 @@ impl DoctorReport {
                     false => floor_label(self.verdict_map_above),
                 },
                 because: Some(self.map_because.clone()),
-            },
-            Knob {
-                name: "ranged reads",
-                configured: self.configured_ranged_reads.clone(),
-                chosen: self.verdict_ranged_reads.clone(),
-                because: None,
             },
             Knob {
                 name: "preallocate",

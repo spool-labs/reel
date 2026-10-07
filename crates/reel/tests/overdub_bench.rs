@@ -10,9 +10,9 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, FenceResidency,
-    IndexResidency, KeyWidth, MergeReport, Preallocate, ProbeCounts, RecordKey, ReelConfig,
-    ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, IndexResidency,
+    KeyWidth, MergeReport, Preallocate, ProbeCounts, RecordKey, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget,
 };
 
 /// The one column the workload writes
@@ -443,21 +443,16 @@ struct Arm {
 
     /// Where a sealed segment's keys live
     index: IndexResidency,
-
-    /// Where the fence over a sealed segment's blocks lives
-    fence: FenceResidency,
 }
 
 const ARMS: [Arm; 2] = [
     Arm {
-        name: "paged-carrying",
+        name: "paged",
         index: IndexResidency::Paged,
-        fence: FenceResidency::Resident,
     },
     Arm {
         name: "resident",
         index: IndexResidency::Resident,
-        fence: FenceResidency::Off,
     },
 ];
 
@@ -482,7 +477,6 @@ fn config(arm: &Arm, knobs: &Knobs) -> ReelConfig {
         // Off, so nothing reads the volume behind the reads being timed.
         scrub_mbps: 0,
         index: arm.index,
-        fence: arm.fence,
         filter_bits: FILTER_BITS,
         footer_cache: ByteCount::from_bytes(knobs.footer_cache_bytes),
         compact_mbps: CompactRate::Mbps(knobs.compact_mbps),

@@ -29,9 +29,9 @@ pub use compaction::compactor::{CompactionCounters, Compactor, EraseReport};
 pub use compaction::keymerge::MergeReport;
 pub use compaction::pressure::{GcPressure, GcTier, RateLimiter};
 pub use config::{
-    CompactRate, FenceResidency, IndexResidency, IoBackend, PointReads, Preallocate, RangedReads,
-    ReelConfig, RepairPath, RingTuning, SyncPolicy, ThreadBudget, VolumeClass, VolumeSpec,
-    DEFAULT_FD_CACHE, MAP_EVERYTHING,
+    CompactRate, IndexResidency, IoBackend, PointReads, Preallocate, RangedReads, ReelConfig,
+    RepairPath, RingTuning, SyncPolicy, ThreadBudget, VolumeClass, VolumeSpec, DEFAULT_FD_CACHE,
+    MAP_EVERYTHING,
 };
 pub use engine::index_checkpoint::IndexCheckpoint;
 pub use engine::{CompactPass, RecordWrite, ReelStore, Totals};

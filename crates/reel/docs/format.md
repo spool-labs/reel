@@ -298,9 +298,8 @@ because the page was being fetched anyway.
 
 At 1 KiB records that is 20 bytes per four records instead of 33 per record,
 about 6.6x smaller. At 100 byte metadata records it is closer to 100x. It also
-makes front coding work, makes any fence array tiny, and puts a slot's or a
-group's records physically next to each other so `get_many` merges them into one
-read.
+makes front coding work and puts a slot's or a group's records physically next to
+each other so `get_many` merges them into one read.
 
 The shape is two footer kinds behind the directory, dense for tails and sparse
 for sorted segments, picked by a flag the seal already knows.

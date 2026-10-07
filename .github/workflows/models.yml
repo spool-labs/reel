@@ -62,7 +62,7 @@ jobs:
           MIRIFLAGS: "-Zmiri-disable-isolation"
         run: |
           cargo miri test -p tape-reel --lib -- \
-            format::column format::fence format::filter format::prefix \
+            format::column format::filter format::prefix \
             index::tbtreemap
 
   fuzz:

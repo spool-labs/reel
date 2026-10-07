@@ -304,25 +304,6 @@ pub enum PointReads {
     Probed,
 }
 
-/// Where a sealed segment's fence over its blocks lives, off unless asked for
-///
-/// A fence is one lead per block of a partition's rows. Without it a blocked search
-/// pays a block read per halving; with it the halvings happen over the leads and the
-/// search reads one block.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-pub enum FenceResidency {
-    /// No fence: a search binary searches the blocks themselves
-    Off,
-
-    /// Every lead in memory, so a search reads one block and nothing else
-    Resident,
-
-    /// The sampled level in memory, so a search reads one page of leads and one block
-    Paged,
-}
-
 /// Where a record that fails its checksum can be fetched again from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Deserialize))]
@@ -412,9 +393,6 @@ pub struct ReelConfig {
     /// Bits per key a seal spends on each column's filter, zero for no filter
     pub filter_bits: u8,
 
-    /// Where a sealed segment's fence over its blocks lives, off unless asked for
-    pub fence: FenceResidency,
-
     /// Bytes of sealed-footer state a paged volume keeps at once
     #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_bytes"))]
     pub footer_cache: ByteCount,
@@ -460,7 +438,6 @@ impl Default for ReelConfig {
             io_backend: IoBackend::default(),
             uring: RingTuning::default(),
             filter_bits: DEFAULT_FILTER_BITS,
-            fence: FenceResidency::Off,
         }
     }
 }
@@ -494,14 +471,6 @@ impl ReelConfig {
             true => self.filter_bits,
             false => 0,
         }
-    }
-
-    /// Whether this volume's seals write a fence over each partition's blocks
-    ///
-    /// Nothing on a resident index, for the reason the filters are nothing there:
-    /// the leads would be bytes written and never read.
-    pub fn seal_fences(&self) -> bool {
-        self.index.pages() && self.fence != FenceResidency::Off
     }
 
     /// Reject settings the on-disk types or the engine cannot represent

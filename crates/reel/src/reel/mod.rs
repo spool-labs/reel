@@ -31,7 +31,6 @@ use std::sync::OnceLock;
 use crate::format::band::Band;
 use crate::format::block::{lookup_in_span, FooterMap, RowBlock};
 use crate::format::column::{ColumnId, ColumnSet, KeyRef, PurgeMark, RecordKey};
-use crate::format::fence::{FenceCut, FenceReach};
 use crate::format::footer::{FooterFind, FooterPartition, FooterRow, FooterTally, SegmentFooter};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::{Lsn, LsnCounter};
@@ -1008,36 +1007,30 @@ impl FooterSource for ReelShared {
         // The descriptor is resolved inside the loader, so a segment the filter
         // rules out costs no io. A segment gone by then ends the search as missing.
         let mut handle = None;
-        let outcome = lookup_in_span(
-            &span,
-            filter,
-            key,
-            || self.fence_cut(&map, column, key, segment),
-            |at| {
-                self.probes.note_block();
-                if let Some(block) = self.footers.block_of(segment, column, at) {
-                    return Ok(Some(block));
-                }
-                let opened = match handle.as_ref() {
-                    Some(opened) => opened,
-                    None => match self.handle_for(segment)? {
-                        Some(opened) => handle.insert(opened),
-                        None => return Ok(None),
-                    },
-                };
-                self.probes.note_block_read();
-                let block = Arc::new(RowBlock::read(
-                    &self.driver,
-                    opened.file(),
-                    &span,
-                    at,
-                    map.restarts_of(span.column),
-                )?);
-                self.footers
-                    .insert_block(segment, column, at, Arc::clone(&block));
-                Ok(Some(block))
-            },
-        )?;
+        let outcome = lookup_in_span(&span, filter, key, |at| {
+            self.probes.note_block();
+            if let Some(block) = self.footers.block_of(segment, column, at) {
+                return Ok(Some(block));
+            }
+            let opened = match handle.as_ref() {
+                Some(opened) => opened,
+                None => match self.handle_for(segment)? {
+                    Some(opened) => handle.insert(opened),
+                    None => return Ok(None),
+                },
+            };
+            self.probes.note_block_read();
+            let block = Arc::new(RowBlock::read(
+                &self.driver,
+                opened.file(),
+                &span,
+                at,
+                map.restarts_of(span.column),
+            )?);
+            self.footers
+                .insert_block(segment, column, at, Arc::clone(&block));
+            Ok(Some(block))
+        })?;
         Ok(self.answer_of(outcome))
     }
 }
@@ -1184,39 +1177,6 @@ struct Pending {
 }
 
 impl ReelShared {
-    /// The leads a blocked search descends, read off the volume when none are held
-    ///
-    /// Nothing comes back on a volume with no fence, which leaves the search the walk
-    /// it always was.
-    fn fence_cut(
-        &self,
-        map: &FooterMap,
-        column: ColumnId,
-        key: &[u8],
-        segment: SegmentId,
-    ) -> Result<Option<FenceCut>> {
-        let Some(fence) = map.fence_of(column) else {
-            return Ok(None);
-        };
-        match fence.reach(key) {
-            FenceReach::Ready(cut) => Ok(Some(cut)),
-            FenceReach::Read { at, len, first } => {
-                let Some(handle) = self.handle_for(segment)? else {
-                    return Ok(None);
-                };
-                self.probes.note_block();
-                self.probes.note_block_read();
-                let leads = self.driver.pread(handle.file(), at, len as u64)?;
-                if leads.len() < len {
-                    return Err(ReelError::Corruption(
-                        "a footer's fence is truncated".to_string(),
-                    ));
-                }
-                Ok(Some(FenceCut::try_new(Arc::from(&leads[..len]), first)?))
-            }
-        }
-    }
-
     /// Turn a footer lookup into the trait's answer, counting a ruled-out skip
     fn answer_of(&self, outcome: FooterFind) -> Option<FooterRow> {
         match outcome {
@@ -1388,13 +1348,7 @@ impl ReelShared {
             Err(error) if error.is_missing() => return Ok(None),
             Err(error) => return Err(error),
         };
-        let read = FooterMap::read(
-            &self.driver,
-            handle.file(),
-            file_len,
-            self.config.fence,
-            &self.probes,
-        )?;
+        let read = FooterMap::read(&self.driver, handle.file(), file_len, &self.probes)?;
         let Some(map) = read else {
             return Ok(None);
         };

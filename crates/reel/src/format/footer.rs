@@ -8,9 +8,7 @@
 use std::borrow::Cow;
 
 use crate::error::{ReelError, Result};
-use crate::format::block::block_rows_of;
 use crate::format::column::{ColumnId, RecordKey};
-use crate::format::fence::{fence_bytes, lead_of, top_leads, FENCE_LEAD, FENCE_PAGE_LEADS};
 use crate::format::filter::{Filter, HEADER_LEN as FILTER_HEADER_LEN};
 use crate::format::lsn::Lsn;
 use crate::format::prefix::{unpack, PrefixRows, Tail};
@@ -333,27 +331,6 @@ impl FooterPartition {
             .filter_map(|row| self.key_len(row))
             .max()
             .unwrap_or(0)
-    }
-
-    /// Rows one of this partition's blocks holds on disk
-    ///
-    /// The read side cuts its blocks by the same arithmetic off the directory row, both
-    /// through one function: a fence built at a different cut names the wrong block.
-    pub fn block_rows(&self) -> usize {
-        block_rows_of(self.key_width, self.is_packed)
-    }
-
-    /// Blocks this partition's rows divide into on disk
-    pub fn blocks(&self) -> usize {
-        self.len().div_ceil(self.block_rows())
-    }
-
-    /// Bytes this partition's leads take in a fenced footer
-    ///
-    /// The gap left between the rows and the filters is the fence, and this is how long
-    /// that gap has to be, so a fenced footer keeps the trailer an unfenced one has.
-    pub fn fence_len(&self) -> usize {
-        fence_bytes(self.blocks())
     }
 
     /// Whether the records these rows name sit in the order the rows are in
@@ -850,29 +827,6 @@ impl SegmentFooter {
         rows + self.filter_region_len() + self.partitions.len() * DIRECTORY_ROW_LEN + FIXED_TAIL_LEN
     }
 
-    /// Every partition's leads, then the sampled level over each of them
-    ///
-    /// Both halves in directory order, and neither is written down twice: a partition's
-    /// block count follows from the rows and widths its directory row already carries.
-    /// The sampled level sits at the end so a volume holding only it takes one run.
-    fn fence_region(&self) -> Vec<u8> {
-        let blocks: usize = self.partitions.iter().map(FooterPartition::blocks).sum();
-        let mut region = Vec::with_capacity(fence_bytes(blocks));
-        let mut tops = Vec::with_capacity(top_leads(blocks) * FENCE_LEAD);
-        for partition in &self.partitions {
-            let rows = partition.block_rows();
-            for block in 0..partition.blocks() {
-                let lead = lead_of(partition.key_at(block * rows).unwrap_or_default());
-                if block % FENCE_PAGE_LEADS == 0 {
-                    tops.extend_from_slice(&lead);
-                }
-                region.extend_from_slice(&lead);
-            }
-        }
-        region.extend_from_slice(&tops);
-        region
-    }
-
     /// Bytes the filter region takes, which is a header per partition either way
     ///
     /// A partition with no filter still writes its header, so the region is walked in the
@@ -902,18 +856,7 @@ impl SegmentFooter {
     /// prefix compressed on the way out, so every encoded form is in hand before a length
     /// is written anywhere.
     pub fn pack(&mut self, filter_bits: u8) -> Result<Vec<u8>> {
-        self.pack_fenced(filter_bits, false)
-    }
-
-    /// The same footer with a fence over each partition's blocks
-    ///
-    /// The fence is what a blocked search descends instead of reading a block per
-    /// halving, so it is written for the volumes that search that way. It sits below the
-    /// filters, and nothing in the trailer says it is there: its length is what is left
-    /// between the rows and the filters, which follows from the row counts and widths the
-    /// directory already carries.
-    pub fn pack_fenced(&mut self, filter_bits: u8, is_fenced: bool) -> Result<Vec<u8>> {
-        let (rows, tail) = self.pack_apart(filter_bits, is_fenced)?;
+        let (rows, tail) = self.pack_apart(filter_bits)?;
         let mut buf = Vec::with_capacity(rows.iter().map(Vec::len).sum::<usize>() + tail.len());
         for piece in &rows {
             buf.extend_from_slice(piece);
@@ -928,11 +871,7 @@ impl SegmentFooter {
     ///
     /// A seal lands the pieces in one vectored write, so no page of the rows is copied,
     /// and gives the rows back with `put_rows`.
-    pub fn pack_apart(
-        &mut self,
-        filter_bits: u8,
-        is_fenced: bool,
-    ) -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
+    pub fn pack_apart(&mut self, filter_bits: u8) -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
         // A partition opened with room and never written to says nothing on disk.
         self.partitions.retain(|partition| !partition.is_empty());
         self.partitions.sort_by_key(|partition| partition.column);
@@ -949,18 +888,10 @@ impl SegmentFooter {
             .map(encoded_partition_rows)
             .collect::<Result<Vec<_>>>()?;
         let rows_len: usize = encoded.iter().map(|rows| rows.len()).sum();
-        let fences = match is_fenced {
-            true => self.fence_region(),
-            false => Vec::new(),
-        };
         let region_len = self.filter_region_len();
-        let footer_len = rows_len
-            + fences.len()
-            + region_len
-            + self.partitions.len() * DIRECTORY_ROW_LEN
-            + FIXED_TAIL_LEN;
+        let footer_len =
+            rows_len + region_len + self.partitions.len() * DIRECTORY_ROW_LEN + FIXED_TAIL_LEN;
         let mut buf = Vec::with_capacity(footer_len - rows_len);
-        buf.extend_from_slice(&fences);
         if region_len > 0 {
             for partition in &self.partitions {
                 match &partition.filter {
@@ -1105,15 +1036,8 @@ impl SegmentFooter {
             partitions[0].packed = segment_tail;
         }
 
-        // What is left between the rows and the filters is the fence, and nothing here
-        // reads it. It is still checked against the size these partitions imply, since
-        // the only other thing a gap can be is a footer that does not describe itself.
         let listed: usize = partitions.iter().map(|partition| partition.len()).sum();
-        let rows_end = directory_at - bloom_len;
-        let fenced: usize = partitions.iter().map(FooterPartition::fence_len).sum();
-        let gap = rows_end.checked_sub(consumed);
-        let is_tiled = gap.is_some_and(|gap| gap == 0 || gap == fenced);
-        if !is_tiled || listed != entry_count {
+        if consumed != directory_at - bloom_len || listed != entry_count {
             return Err(ReelError::Corruption(
                 "footer entry count is inconsistent with its length".to_string(),
             ));
@@ -1564,52 +1488,7 @@ mod tests {
             .collect()
     }
 
-    // a fenced footer costs a lead a block, and the rows come back unchanged
-    #[test]
-    fn a_fence_costs_a_lead_a_block() {
-        let mut plain = SegmentFooter::build(many_rows(200));
-        let mut fenced = SegmentFooter::build(many_rows(200));
-
-        let bare = plain.pack(0).expect("pack");
-        let leaded = fenced.pack_fenced(0, true).expect("pack");
-
-        let blocks = fenced.partitions[0].blocks();
-        assert!(blocks > 1, "one block would not exercise a fence");
-        assert_eq!(
-            leaded.len() - bare.len(),
-            fence_bytes(blocks),
-            "a fence is a lead a block and one more per page of them",
-        );
-
-        // The fence is on the blocked path alone, so parsing the footer whole reads
-        // exactly what an unfenced one holds.
-        assert_eq!(
-            SegmentFooter::parse(&leaded).expect("parse"),
-            SegmentFooter::parse(&bare).expect("parse"),
-        );
-    }
-
-    // the leads ascend and each one leads the block it names
-    #[test]
-    fn leads_name_their_blocks() {
-        let mut footer = SegmentFooter::build(many_rows(200));
-        let _ = footer.pack_fenced(0, true).expect("pack");
-        let partition = &footer.partitions[0];
-        let region = footer.fence_region();
-
-        let rows = partition.block_rows();
-        for block in 0..partition.blocks() {
-            let at = block * FENCE_LEAD;
-            let first = partition.key_at(block * rows).expect("a block's first row");
-            assert_eq!(
-                &region[at..at + FENCE_LEAD],
-                &lead_of(first)[..],
-                "block {block} is led by another block's key",
-            );
-        }
-    }
-
-    // a fenced sorted run keeps its filter, and only zero bits take one away
+    // a sorted run keeps its filter, and only zero bits take one away
     #[test]
     fn a_sorted_run_keeps_its_filter() {
         let mut sorted = SegmentFooter::build(many_rows(200));
@@ -1626,14 +1505,14 @@ mod tests {
         );
         let mut merged = SegmentFooter::build(many_rows(200));
 
-        let _ = sorted.pack_fenced(10, true).expect("pack");
-        let _ = scattered.pack_fenced(10, true).expect("pack");
-        let _ = merged.pack_fenced(0, true).expect("pack");
+        let _ = sorted.pack(10).expect("pack");
+        let _ = scattered.pack(10).expect("pack");
+        let _ = merged.pack(0).expect("pack");
 
         assert!(sorted.partitions[0].is_sorted_run());
         assert!(
             sorted.partitions[0].filter.is_some(),
-            "a fence brackets a key without answering membership",
+            "a sorted run still needs its filter",
         );
         assert!(!scattered.partitions[0].is_sorted_run());
         assert!(scattered.partitions[0].filter.is_some());

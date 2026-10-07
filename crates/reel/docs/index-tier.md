@@ -26,13 +26,10 @@ what a paged lookup walks, and what each step takes out
     | candidates
   per-segment filter      candidates the bloom rules out
     | survivors
-  directory, then a block of rows       one block read per survivor
+  directory, then blocks of rows        a block per halving
     | rows
   the newest row wins     a segment number is not a version
 ```
-
-A fence, where one is armed, replaces the halvings inside a partition with a scan
-over leads, so a search reads one block rather than one per halving.
 
 ## What a paged index has to get right
 
@@ -294,7 +291,7 @@ default to copy.
 
 ## A resident loc is a pointer, so a merge has to repoint it
 
-Not a defect, a cost that was never written down. Paged mode finds a row by fence and
+Not a defect, a cost that was never written down. Paged mode searches for a row and
 holds no pointer, so a merge repoints nothing. Resident mode holds an exact `Loc` for
 every key, so a merge repoints every entry it moves.
 The per-entry cost is a map write, small against the io the

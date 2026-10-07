@@ -9,9 +9,7 @@
 mod harness;
 
 use reel::io::fault::{FaultKind, FaultPlan};
-use reel::{
-    ByteCount, FenceResidency, IndexResidency, Preallocate, ReelConfig, SyncPolicy, ThreadBudget,
-};
+use reel::{ByteCount, IndexResidency, Preallocate, ReelConfig, SyncPolicy, ThreadBudget};
 
 use harness::fixture::Differential;
 use harness::op_stream;
@@ -89,16 +87,10 @@ fn merging_config(active_tails: u32) -> ReelConfig {
     }
 }
 
-/// A paged volume with barely room for its footers, whose sealed keys answer by fence
-///
-/// A bound this tight gives a footer up as soon as another wants its place, so most
-/// searches descend the blocks rather than read the footer whole, and the residency
-/// decides whether the leads are held or read. Not a bound of nothing: a playback has
-/// to read the footer whole, and one it cannot keep it rereads for every page.
-fn fenced_config(active_tails: u32, fence: FenceResidency) -> ReelConfig {
+/// A paged volume with barely room for its footers, so sealed keys mostly answer from blocks
+fn blocked_config(active_tails: u32) -> ReelConfig {
     ReelConfig {
         footer_cache: ByteCount::from_bytes(64 * 1024),
-        fence,
         ..paged_config(active_tails)
     }
 }
@@ -248,23 +240,12 @@ fn paged_multi_tail() {
     }
 }
 
-// a volume whose searches descend a fence serves what one that walks blocks serves
+// a volume whose sealed keys answer from blocks agrees with the oracle
 #[test]
 #[cfg(not(miri))]
-fn fenced_paged_single_tail() {
+fn blocked_paged() {
     for seed in SEEDS {
-        let mut fixture = Differential::open(*seed, fenced_config(1, FenceResidency::Resident));
-        fixture.run_stream(&op_stream::generate(*seed, PAGED_STREAM_LEN));
-        fixture.assert_paged_out();
-    }
-}
-
-// and with the leads left on the volume, where a search reads them a page at a time
-#[test]
-#[cfg(not(miri))]
-fn fenced_paged_leads() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open(*seed, fenced_config(1, FenceResidency::Paged));
+        let mut fixture = Differential::open(*seed, blocked_config(1));
         fixture.run_stream(&op_stream::generate(*seed, PAGED_STREAM_LEN));
         fixture.assert_paged_out();
     }

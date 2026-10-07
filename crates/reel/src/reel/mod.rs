@@ -473,7 +473,7 @@ impl ReelShared {
                 ),
                 head,
             ),
-            None => SpotRead::Other,
+            None => SpotRead::Unsure,
         })
     }
 
@@ -743,7 +743,7 @@ impl ReelShared {
                 ),
                 head,
             ),
-            None => SpotRead::Other,
+            None => SpotRead::Unsure,
         })
     }
 
@@ -821,7 +821,7 @@ impl ReelShared {
                 ),
                 head,
             ),
-            None => SpotRead::Other,
+            None => SpotRead::Unsure,
         })
     }
 }
@@ -952,11 +952,14 @@ fn head_read(prefix: &[u8], key: KeyRef<'_>) -> HeadRead {
 }
 
 /// What a checked read of one spot index candidate settles
+///
+/// A header or a row put the key here, so bytes that do not frame it are damage for the checked read to evict.
 fn spot_read_of(read: RecordRead, head: Head) -> SpotRead {
     match read {
         RecordRead::Found(value) => SpotRead::Found(head, value),
-        RecordRead::Stale => SpotRead::Other,
-        RecordRead::Gone | RecordRead::Corrupt | RecordRead::Coded => SpotRead::Unsure,
+        RecordRead::Stale | RecordRead::Gone | RecordRead::Corrupt | RecordRead::Coded => {
+            SpotRead::Unsure
+        }
     }
 }
 

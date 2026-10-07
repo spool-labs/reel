@@ -122,4 +122,4 @@ delete drawn after the cue, the cover rule above and the easiest thing to get
 backwards. Compaction and the cover sweep run underneath a held cue point
 without changing what it serves. The suite covers resident volumes too, since
 recording spans unconditionally is what makes cue points not a paged-only
-feature. `tests/probes/cue_speed.rs` is the cost table above.
+feature.

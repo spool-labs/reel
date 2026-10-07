@@ -102,10 +102,10 @@ linear in how many segments overlapped the span.
 
 That is fixed. The cursors are heap ordered by the key each sits on, holding
 positions rather than keys, so a key costs the depth rather than the width and only
-the cursors holding it are touched. By `tests/probes/playback_speed.rs`, index work
-on the simulator rather than device work, the per-key merge cost at 257 sealed
-segments falls from 1.21 us to 88 ns and the whole playback from 160.64 ms to
-11.84 ms, and at 2 and 5 segments the two arms tie, so nothing was traded for it.
+the cursors holding it are touched. On the simulator, which measures index work alone,
+the per-key merge cost at 257 sealed segments falls from 1.21 us to 88 ns and the
+whole playback from 160.64 ms to 11.84 ms, and at 2 and 5 segments the two arms tie,
+so nothing was traded for it.
 
 A point read pays much less: at twenty-five sealed segments it is within a few
 percent of resident at every size, peaking at fourteen percent on the middle rows.

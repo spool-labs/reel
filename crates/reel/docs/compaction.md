@@ -135,8 +135,7 @@ a pass is one whole segment, about 130 ms of device ownership at every cap (ccx3
 2026-08-16), so the 5 ms unit is missed by more than an order of magnitude. Those
 tails say a 130 ms pass is not destructive on NVMe at depth; on a slower device it
 is unmeasured. And an unpaced figure is not quotable unless the volume is bigger
-than memory, which is why `compact_throughput` sizes its volume from `MemTotal` plus
-a quarter.
+than memory.
 
 **Auto is not adaptive because no in-process signal reflects the device under the
 default sync policy**, where a buffered write returns at the page cache. Observed

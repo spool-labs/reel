@@ -259,7 +259,7 @@ a byte floor and not a switch.
 
 ### Remeasured 2026-08-09, and the floor is unfitted
 
-On a ccx33, kernel 7.0, ext4, by `tests/probes/mapped_reads.rs`. Cold is past memory,
+On a ccx33, kernel 7.0, ext4. Cold is past memory,
 40 GiB a leg, so neither plane can retain; warm is a second pass over a set
 already resident. Mapped over unmapped, so above one the mapping wins.
 
@@ -530,8 +530,8 @@ wake against seals that arrive in bursts.
    and this is the knob for it, a `[bounded, unbounded]` pair of worker caps.
    The kernel default scales off cpu count, so on a 9950X a worker herd competes
    with the engine's own threads for the same cores. One call at ring build,
-   plumbed through `RingTuning`. It is the cheapest item here because the
-   depth-fetch bench already points at it.
+   plumbed through `RingTuning`. It is the cheapest item here because that
+   finding already points at it.
 2. `register_iowq_aff` pairs with 1 and is also uncalled. It pins io-wq workers
    to a cpu_set. Ring-per-thread does real work to place engine threads, and
    io-wq workers currently float across every core and undo that placement. Only

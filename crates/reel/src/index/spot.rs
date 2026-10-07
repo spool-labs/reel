@@ -1437,6 +1437,8 @@ impl SpotColumn {
             match answer {
                 HeadRead::Same(head) if head.lsn < newer => older.push((slot, head.len)),
                 HeadRead::Same(_) | HeadRead::Other | HeadRead::Cold => {}
+                // The length went with the segment, so a version still counted is booked from its class
+                HeadRead::Missing if !slot.is_displaced() => unread.push(slot),
                 HeadRead::Missing => gone.push(slot),
             }
         }
@@ -2170,6 +2172,35 @@ mod tests {
             "the corrected booking still counted in the slack"
         );
         assert_eq!(column.displaced(), 0);
+    }
+
+    // an overwrite reading every version of a key books the one whose segment went from its class
+    #[test]
+    fn a_gone_version_is_booked_from_its_class() {
+        let records = Arc::new(Records::default());
+        let segments = Arc::new(SegmentTable::new());
+        let column = SpotColumn::new();
+        column.attach(
+            Arc::clone(&records) as Arc<dyn RecordSource>,
+            Arc::clone(&segments),
+        );
+        let gone = Loc::new(SegmentId(1), 0, 200);
+        column.insert(key(6).as_slice(), gone);
+        for at in 0..2u32 {
+            let loc = Loc::new(SegmentId(2), at * 64, 40);
+            records.write(loc, key(6).as_slice(), Lsn(10 + u64::from(at)));
+            column.insert(key(6).as_slice(), loc);
+        }
+        segments.note_max(SegmentId(2), Lsn(11));
+
+        let settled = column.displace(&key(6), Lsn(20)).expect("displace");
+
+        assert_eq!(settled.booked.len(), 2);
+        assert_eq!(
+            settled.classed,
+            vec![(Loc::new(SegmentId(1), 0, 224), 193)],
+            "the version whose segment went was dropped unbooked"
+        );
     }
 
     // the newest version answers, only the older one goes to the cleaner, and a copy answers once its source goes

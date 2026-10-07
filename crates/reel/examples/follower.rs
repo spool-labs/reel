@@ -55,6 +55,8 @@ fn main() -> StoreResult<()> {
     for number in 0..SEEDED {
         Store::put(&writer, ROWS, &key_of(number), &payload_of(number))?;
     }
+    // A follower reads the writer's journal, which a flush writes down on every platform
+    writer.flush()?;
 
     let follower = ReelStore::open_read_only(root.path().to_path_buf(), config(), COLUMNS)?;
     for number in 0..SEEDED {
@@ -75,6 +77,7 @@ fn main() -> StoreResult<()> {
     assert!(Store::contains(&follower, ROWS, &key_of(0))?);
     println!("writer appended {APPENDED} records: the follower misses them and serves the rest");
 
+    writer.flush()?;
     let caught_up = follower.refresh()?;
     assert!(caught_up.applied >= APPENDED);
 

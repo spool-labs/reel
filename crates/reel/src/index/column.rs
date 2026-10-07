@@ -88,6 +88,11 @@ impl Landed {
     }
 }
 
+/// The shadow check for a map that handed no key over, which never finds a newer version
+pub fn never_shadowed(_key: &[u8], _lsn: Lsn) -> bool {
+    false
+}
+
 /// Run one expression against whichever width a column turned out to hold
 macro_rules! on_index {
     ($self:expr, $bound:ident => $body:expr) => {
@@ -139,9 +144,10 @@ impl ColumnIndex {
         &self,
         moves: &[KeyMove<'_>],
         segments: &Book,
+        is_shadowed: &impl Fn(&[u8], Lsn) -> bool,
         landed: &mut Vec<Landed>,
     ) {
-        on_index!(self, index => index.apply_moves(moves, segments, landed))
+        on_index!(self, index => index.apply_moves(moves, segments, is_shadowed, landed))
     }
 
     /// An empty index for one column, refusing a width nothing indexes
@@ -193,14 +199,27 @@ impl ColumnIndex {
         on_index!(self, index => index.heap_bytes())
     }
 
-    /// Apply a committed data record, guarded by its sequence number
-    pub fn insert(&self, key: &[u8], entry: Entry, segments: &SegmentTable) -> Landed {
-        on_index!(self, index => index.insert(key, entry, segments))
+    /// Apply a committed data record, guarded by its sequence number and by `is_shadowed` over an empty place
+    pub fn insert(
+        &self,
+        key: &[u8],
+        entry: Entry,
+        segments: &SegmentTable,
+        is_shadowed: &impl Fn(&[u8], Lsn) -> bool,
+    ) -> Landed {
+        on_index!(self, index => index.insert_unless(key, entry, segments, is_shadowed))
     }
 
-    /// Drop a key on a tombstone, guarded by its sequence number
-    pub fn remove(&self, key: &[u8], lsn: Lsn, tombstone: Loc, segments: &SegmentTable) -> Landed {
-        on_index!(self, index => index.remove(key, lsn, tombstone, segments))
+    /// Drop a key on a tombstone, guarded by its sequence number and by `is_shadowed` over an empty place
+    pub fn remove(
+        &self,
+        key: &[u8],
+        lsn: Lsn,
+        tombstone: Loc,
+        segments: &SegmentTable,
+        is_shadowed: &impl Fn(&[u8], Lsn) -> bool,
+    ) -> Landed {
+        on_index!(self, index => index.remove_unless(key, lsn, tombstone, segments, is_shadowed))
     }
 
     /// Stand a grave for a tombstone compaction copied into a segment, unless a newer version stands
@@ -816,13 +835,24 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// landed on an empty place may have replaced a record only a footer knows about,
     /// and exactly one put can see the place empty, so exactly one goes looking.
     pub fn insert(&self, key: &[u8], entry: Entry, segments: &SegmentTable) -> Landed {
+        self.insert_unless(key, entry, segments, &never_shadowed)
+    }
+
+    /// The same insert, refused over an empty place where `is_shadowed` finds a newer version
+    pub fn insert_unless(
+        &self,
+        key: &[u8],
+        entry: Entry,
+        segments: &SegmentTable,
+        is_shadowed: &impl Fn(&[u8], Lsn) -> bool,
+    ) -> Landed {
         let key = match K::from_slice(key) {
             Some(key) => key,
             None => return Landed::Newer,
         };
         let at = self.shard_of(&key);
         let mut state = write(&self.shards[at]);
-        self.insert_held(&mut state, at, key, entry, segments)
+        self.insert_held(&mut state, at, key, entry, segments, is_shadowed)
     }
 
     /// Apply a batch's moves, holding a shard once for the run of keys in it
@@ -834,6 +864,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         &self,
         moves: &[KeyMove<'_>],
         segments: &Book,
+        is_shadowed: &impl Fn(&[u8], Lsn) -> bool,
         landed: &mut Vec<Landed>,
     ) {
         let mut at = 0;
@@ -845,7 +876,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             };
             let shard = self.shard_of(&key);
             let mut state = write(&self.shards[shard]);
-            landed.push(self.apply_held(&mut state, shard, key, &moves[at], segments));
+            landed.push(self.apply_held(&mut state, shard, key, &moves[at], segments, is_shadowed));
             at += 1;
             while at < moves.len() {
                 let Some(next) = K::from_slice(moves[at].key) else {
@@ -854,7 +885,14 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 if self.shard_of(&next) != shard {
                     break;
                 }
-                landed.push(self.apply_held(&mut state, shard, next, &moves[at], segments));
+                landed.push(self.apply_held(
+                    &mut state,
+                    shard,
+                    next,
+                    &moves[at],
+                    segments,
+                    is_shadowed,
+                ));
                 at += 1;
             }
         }
@@ -871,6 +909,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         key: K,
         moving: &KeyMove<'_>,
         segments: &Book,
+        is_shadowed: &impl Fn(&[u8], Lsn) -> bool,
     ) -> Landed {
         match moving.is_delete {
             true => {
@@ -879,7 +918,15 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                     moving.lsn,
                     span_of(key.width(), moving.loc.len),
                 );
-                self.remove_held(state, shard, key, moving.lsn, moving.loc, segments)
+                self.remove_held(
+                    state,
+                    shard,
+                    key,
+                    moving.lsn,
+                    moving.loc,
+                    segments,
+                    is_shadowed,
+                )
             }
             false => self.insert_held(
                 state,
@@ -887,6 +934,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 key,
                 Entry::new(moving.loc, moving.lsn),
                 segments,
+                is_shadowed,
             ),
         }
     }
@@ -903,6 +951,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         key: K,
         entry: Entry,
         segments: &Book,
+        is_shadowed: &impl Fn(&[u8], Lsn) -> bool,
     ) -> Landed {
         // The record's own hold keeps its segment from retiring until this publish
         // lands, so the stamp can be issued live here.
@@ -946,6 +995,12 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 state.bytes = resize(state.bytes, old_len, new_len);
                 Landed::Record
             }
+            // A hand-over took the map's version and its sequence number with it
+            None if is_shadowed(key.as_slice(), lsn) => {
+                state.map.take(key.as_slice());
+                segments.mark_dead(loc.segment, lsn, span_of(width, loc.len));
+                return Landed::Newer;
+            }
             None => {
                 state.bytes += new_len;
                 Landed::Nothing
@@ -965,6 +1020,18 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// the segment the tombstone landed in, which is what lets a paged column give it
     /// up once that segment has a footer.
     pub fn remove(&self, key: &[u8], lsn: Lsn, tombstone: Loc, segments: &SegmentTable) -> Landed {
+        self.remove_unless(key, lsn, tombstone, segments, &never_shadowed)
+    }
+
+    /// The same delete, refused over an empty place where `is_shadowed` finds a newer version
+    pub fn remove_unless(
+        &self,
+        key: &[u8],
+        lsn: Lsn,
+        tombstone: Loc,
+        segments: &SegmentTable,
+        is_shadowed: &impl Fn(&[u8], Lsn) -> bool,
+    ) -> Landed {
         let key = match K::from_slice(key) {
             Some(key) => key,
             None => return Landed::Newer,
@@ -975,7 +1042,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         segments.mark_held(tombstone.segment, lsn, span_of(key.width(), tombstone.len));
         let at = self.shard_of(&key);
         let mut state = write(&self.shards[at]);
-        self.remove_held(&mut state, at, key, lsn, tombstone, segments)
+        self.remove_held(&mut state, at, key, lsn, tombstone, segments, is_shadowed)
     }
 
     /// Stand a grave for a tombstone compaction copied into a segment, unless a newer version stands
@@ -1013,6 +1080,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// The tombstone itself, with the key parsed and its shard already held
     ///
     /// The caller has already booked the tombstone record's own span.
+    #[allow(clippy::too_many_arguments)]
     fn remove_held<Book: Bookings>(
         &self,
         state: &mut ShardState<K, S>,
@@ -1021,6 +1089,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         lsn: Lsn,
         tombstone: Loc,
         segments: &Book,
+        is_shadowed: &impl Fn(&[u8], Lsn) -> bool,
     ) -> Landed {
         let was_empty = state.map.vacant();
         let existing = state.map.at(key.as_slice()).copied();
@@ -1040,6 +1109,8 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 state.graves -= 1;
                 Landed::Grave
             }
+            // A hand-over took the map's version and its sequence number with it
+            None if is_shadowed(key.as_slice(), lsn) => return Landed::Newer,
             None => Landed::Nothing,
         };
 
@@ -2969,6 +3040,7 @@ mod tests {
                 name,
                 Entry::new(loc(1, at as u32 * 100, 50), Lsn(at as u64 + 1)),
                 &segments,
+                &never_shadowed,
             );
             assert!(landed.took_place(), "insert {at}");
         }
@@ -3001,7 +3073,12 @@ mod tests {
             b"photosx".to_vec(),
         ];
         for (at, name) in names.iter().enumerate() {
-            index.insert(name, Entry::new(loc(1, at as u32, 10), Lsn(1)), &segments);
+            index.insert(
+                name,
+                Entry::new(loc(1, at as u32, 10), Lsn(1)),
+                &segments,
+                &never_shadowed,
+            );
         }
         names.sort();
 
@@ -3017,8 +3094,18 @@ mod tests {
         let segments = SegmentTable::new();
         let name = b"photos/2026/cat.jpg".as_slice();
 
-        index.insert(name, Entry::new(loc(1, 0, 10), Lsn(1)), &segments);
-        index.insert(name, Entry::new(loc(1, 40, 10), Lsn(2)), &segments);
+        index.insert(
+            name,
+            Entry::new(loc(1, 0, 10), Lsn(1)),
+            &segments,
+            &never_shadowed,
+        );
+        index.insert(
+            name,
+            Entry::new(loc(1, 40, 10), Lsn(2)),
+            &segments,
+            &never_shadowed,
+        );
 
         assert_eq!(index.totals().count, 1);
         assert_eq!(index.get(name).expect("present").lsn, Lsn(2));

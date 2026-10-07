@@ -1592,6 +1592,26 @@ impl SpotColumn {
             })
     }
 
+    /// Whether one of the key's slots points at a version newer than `lsn`, reading the slots in segments that may hold one
+    pub fn holds_newer(&self, key: KeyRef<'_>, lsn: Lsn) -> Result<bool> {
+        let (Some(records), Some(segments)) = (self.records.get(), self.segments.get()) else {
+            return Ok(false);
+        };
+        let hash = hash_of(key.bytes);
+        let seen = self.shards[shard_of(hash)].read().matches(hash);
+        for place in seen.iter() {
+            let segment = place.slot.segment();
+            if segments.max_lsn_of(segment).is_some_and(|max| max <= lsn) {
+                continue;
+            }
+            match records.head(key, segment, place.slot.offset)? {
+                HeadRead::Same(head) if head.lsn > lsn => return Ok(true),
+                HeadRead::Same(_) | HeadRead::Other | HeadRead::Missing | HeadRead::Cold => {}
+            }
+        }
+        Ok(false)
+    }
+
     /// Where the key's shard stands, read before the map is asked
     pub fn since(&self, key: &RecordKey) -> Since {
         let shard = shard_of(hash_of(key.as_slice()));

@@ -205,6 +205,47 @@ fn every_key_answers_between_two_paged_handovers() {
     }
 }
 
+// a put drawn before a newer version that sealed and was handed over cannot publish over it
+#[test]
+fn late_put() {
+    let script = rendezvous::script();
+    let store = open("/late-put", 67, IndexResidency::Paged);
+    let key = 7u64.to_be_bytes();
+    let (older, newer) = ([0x0Au8; 64], [0x0Bu8; 64]);
+
+    script.hold("put/landed");
+    let late = {
+        let store = Arc::clone(&store);
+        script.cast(move || Store::put(&*store, "rows", &key, &older))
+    };
+    script.await_reached("put/landed", 1);
+
+    // A batch passes no point, so the newer version publishes while the older put stands parked
+    let mut batch = WriteBatch::new();
+    batch.put("rows", &key, &newer);
+    Store::write_batch(&*store, batch).expect("batch");
+    drop(store.cue().expect("seal"));
+    assert_eq!(
+        store.page_out_sealed().expect("hand over"),
+        1,
+        "the newer version was not handed over"
+    );
+
+    script.release("put/landed");
+    late.join().expect("late put thread").expect("late put");
+
+    let got = Store::get(&*store, "rows", &key)
+        .expect("get")
+        .map(|value| value.to_vec());
+    assert_eq!(
+        got,
+        Some(newer.to_vec()),
+        "the older put published over the newer version"
+    );
+    let totals = store.column_totals(COLUMNS[0].id).expect("totals");
+    assert_eq!(totals.count, 1, "the key counts twice");
+}
+
 // a whole-column page racing a batch never comes back holding half of it
 #[test]
 fn a_page_never_comes_back_holding_half_a_batch() {

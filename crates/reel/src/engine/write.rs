@@ -29,6 +29,8 @@ impl ReelStore {
             planned.codec,
             Commit::PerRecord,
         )?;
+        // A slow put stands here with its record down and the index not yet moved
+        crate::sync::rendezvous::at("put/landed");
         self.index.insert(key, committed.loc, committed.lsn)?;
         Ok(())
     }
@@ -188,7 +190,7 @@ impl ReelStore {
             }
         }
 
-        let landed = self.index.publish_batch(&moves, &ranges);
+        let landed = self.index.publish_batch(&moves, &ranges)?;
 
         // One answer per key move, so the ranges are stepped over rather than paired.
         let mut answers = landed.iter();

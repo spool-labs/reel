@@ -1038,6 +1038,7 @@ mod tests {
     use crate::format::footer::FooterEntry;
     use crate::format::lsn::Lsn;
     use crate::format::record::Flags;
+    use crate::index::column::never_shadowed;
 
     const COLUMN: ColumnId = ColumnId(1);
 
@@ -1131,6 +1132,7 @@ mod tests {
                 Lsn(1000 + u64::from(byte)),
                 Loc::new(SegmentId(9), 0, 0),
                 &segments,
+                &never_shadowed,
             );
         }
 

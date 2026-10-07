@@ -18,20 +18,22 @@ written, passed, and did not fail when the fix was removed.
 marks named points and a test script gates them: hold, pass one arrival at a
 time, release, await an arrival count, everything freed if the test fails.
 
-Sixteen sites, all at plane boundaries, the first eight being: `seal/queued`, `seal/spans`,
-`paged/handover`, `index/page-shard`, `compaction/owed`, `compaction/retire`,
-`compaction/repoint`, and the checkpoint pair `checkpoint/staged` and
-`checkpoint/published`. Unarmed cost is one acquire load and a cold branch.
+Every site sits at a plane boundary, among them `seal/queued`, `seal/spans`,
+`paged/handover`, `index/page-shard`, `put/landed`, `compaction/owed`,
+`compaction/retire`, `compaction/repoint`, and the checkpoint pair
+`checkpoint/staged` and `checkpoint/published`. Unarmed cost is one acquire load
+and a cold branch.
 
 The plane is behind the `rendezvous` feature and a build that does not ask for it
 pays nothing at all: `at` is an empty function and there is no stage to load
 from. The crate turns the feature on for its own test targets through a dev
 dependency on itself, so nothing here needs a flag to run.
 
-What this bought: three interleavings pinned in milliseconds that used to need a
+What this bought: interleavings pinned in milliseconds that used to need a
 campaign on a real box per hit. A delete inside the repoint window wins. Every key
 answers while a seal stands unqueued. A read between two paged handovers sees
-every key.
+every key. A put that publishes after a newer version of its key has sealed and
+been handed over loses to that version.
 
 The points also reach where the crash harness cannot, which is the reason to
 prefer them over drawing a crash. A checkpoint's directory work is `std::fs`

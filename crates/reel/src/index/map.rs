@@ -4,6 +4,7 @@
 //! width and shard as far as its own write plane needs. The segments are shared,
 //! since one holds records from every column and the compactor asks about it whole.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Bound, Range};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,7 +16,7 @@ use crate::append::publish::PublishBarrier;
 use crate::config::IndexResidency;
 use crate::engine::Totals;
 use crate::error::{ReelError, Result};
-use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, RecordKey};
+use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyRef, RecordKey};
 use crate::format::footer::{FooterPartition, SegmentFooter};
 use crate::format::loc::{Loc, SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
@@ -1041,7 +1042,7 @@ impl ReelIndex {
     /// since a paged column gives its keys up. So the map goes first and only a put
     /// that found nothing asks the footers.
     pub fn insert(&self, key: &RecordKey, loc: Loc, lsn: Lsn) -> Result<bool> {
-        let landed = self.insert_mapped(key, loc, lsn);
+        let landed = self.insert_mapped(key, loc, lsn)?;
         if landed.may_be_paged() {
             self.settle_displaced(key, lsn)?;
         }
@@ -1051,13 +1052,42 @@ impl ReelIndex {
     /// Move the map for a committed record, leaving the paged settle to the caller
     ///
     /// This half is memory work under a shard lock, which is what a batch does while
-    /// it holds the publish barrier. The other reads a footer, and a reader waiting on
-    /// the barrier should not be waiting on the volume.
-    pub fn insert_mapped(&self, key: &RecordKey, loc: Loc, lsn: Lsn) -> Landed {
+    /// it holds the publish barrier. It reads a record header only where the map holds
+    /// nothing for the key and a segment sealed since the put's draw holds a version of
+    /// it. The other reads a footer, and a reader waiting on the barrier should not be
+    /// waiting on the volume.
+    pub fn insert_mapped(&self, key: &RecordKey, loc: Loc, lsn: Lsn) -> Result<Landed> {
         let Some(at) = self.slot(key.column) else {
-            return Landed::Newer;
+            return Ok(Landed::Newer);
         };
-        self.indexes[at].insert(key.as_slice(), Entry::new(loc, lsn), &self.segments)
+        let failed = Cell::new(None);
+        let landed = self.indexes[at].insert(
+            key.as_slice(),
+            Entry::new(loc, lsn),
+            &self.segments,
+            &|key: &[u8], lsn: Lsn| self.is_shadowed(at, key, lsn, &failed),
+        );
+        failed.into_inner().map_or(Ok(landed), Err)
+    }
+
+    /// Whether a version newer than `lsn` has left the map for the spot index, a failed read counting as one and kept for the caller
+    fn is_shadowed(
+        &self,
+        at: usize,
+        key: &[u8],
+        lsn: Lsn,
+        failed: &Cell<Option<ReelError>>,
+    ) -> bool {
+        if !self.spot_serves() {
+            return false;
+        }
+        match self.spot[at].holds_newer(KeyRef::new(self.columns[at].id, key), lsn) {
+            Ok(is_newer) => is_newer,
+            Err(error) => {
+                failed.set(Some(error));
+                true
+            }
+        }
     }
 
     /// Book the footer-held record a mapped mutation displaced, safe to defer since only compaction reads the booking
@@ -1105,7 +1135,7 @@ impl ReelIndex {
     /// grave is what stops the search that would find it. What comes back says
     /// whether a live record went, wherever it was being answered from.
     pub fn remove(&self, key: &RecordKey, lsn: Lsn, tombstone: Loc) -> Result<bool> {
-        let landed = self.remove_mapped(key, lsn, tombstone);
+        let landed = self.remove_mapped(key, lsn, tombstone)?;
         match landed.may_be_paged() && self.settle_displaced(key, lsn)? {
             true => Ok(true),
             false => Ok(landed.dropped_record()),
@@ -1121,23 +1151,29 @@ impl ReelIndex {
     /// The key moves go in the order the batch built them, with each range standing its
     /// cover at the point of the run it was given at. What comes back is one answer per
     /// key move; a cover displaces nothing and has no answer to give.
-    pub fn publish_batch(&self, moves: &[KeyMove<'_>], ranges: &[RangeMove<'_>]) -> Vec<Landed> {
-        self.publish.publish_grouped(|| {
+    pub fn publish_batch(
+        &self,
+        moves: &[KeyMove<'_>],
+        ranges: &[RangeMove<'_>],
+    ) -> Result<Vec<Landed>> {
+        let failed = Cell::new(None);
+        let landed = self.publish.publish_grouped(|| {
             let mut landed = Vec::with_capacity(moves.len());
             let mut at = 0;
             for range in ranges {
                 let upto = range.after.min(moves.len());
                 if upto > at {
-                    self.apply_moves(&moves[at..upto], &mut landed);
+                    self.apply_moves(&moves[at..upto], &failed, &mut landed);
                     at = upto;
                 }
                 self.cover_range(range.start, range.end, range.lsn, range.tombstone);
             }
             if at < moves.len() {
-                self.apply_moves(&moves[at..], &mut landed);
+                self.apply_moves(&moves[at..], &failed, &mut landed);
             }
             landed
-        })
+        });
+        failed.into_inner().map_or(Ok(landed), Err)
     }
 
     /// Resolve every key against one state of the maps
@@ -1250,7 +1286,12 @@ impl ReelIndex {
     /// Runs sharing a column are found here and runs sharing a shard below it.
     /// Nothing is reordered, so a batch publishes exactly what it published. The
     /// answers are appended, since a batch carrying a range applies in several runs.
-    fn apply_moves(&self, moves: &[KeyMove<'_>], landed: &mut Vec<Landed>) {
+    fn apply_moves(
+        &self,
+        moves: &[KeyMove<'_>],
+        failed: &Cell<Option<ReelError>>,
+        landed: &mut Vec<Landed>,
+    ) {
         let mut at = 0;
         while at < moves.len() {
             let column = moves[at].column;
@@ -1259,9 +1300,12 @@ impl ReelIndex {
                 end += 1;
             }
             match self.slot(column) {
-                Some(slot) => {
-                    self.indexes[slot].apply_moves(&moves[at..end], &*self.segments, landed)
-                }
+                Some(slot) => self.indexes[slot].apply_moves(
+                    &moves[at..end],
+                    &*self.segments,
+                    &|key: &[u8], lsn: Lsn| self.is_shadowed(slot, key, lsn, failed),
+                    landed,
+                ),
                 // A column nothing indexes takes the same answer one key at a
                 // time would have given, once for each key it would have gone to.
                 None => landed.resize(landed.len() + (end - at), Landed::Newer),
@@ -1273,11 +1317,19 @@ impl ReelIndex {
     /// Drop a key from the map alone, leaving the paged settle to the caller
     ///
     /// The other half of the split `insert_mapped` describes, for the same reason.
-    pub fn remove_mapped(&self, key: &RecordKey, lsn: Lsn, tombstone: Loc) -> Landed {
+    pub fn remove_mapped(&self, key: &RecordKey, lsn: Lsn, tombstone: Loc) -> Result<Landed> {
         let Some(at) = self.slot(key.column) else {
-            return Landed::Newer;
+            return Ok(Landed::Newer);
         };
-        self.indexes[at].remove(key.as_slice(), lsn, tombstone, &self.segments)
+        let failed = Cell::new(None);
+        let landed = self.indexes[at].remove(
+            key.as_slice(),
+            lsn,
+            tombstone,
+            &self.segments,
+            &|key: &[u8], lsn: Lsn| self.is_shadowed(at, key, lsn, &failed),
+        );
+        failed.into_inner().map_or(Ok(landed), Err)
     }
 
     /// Take a range with one standing cover and one tombstone record, nothing more

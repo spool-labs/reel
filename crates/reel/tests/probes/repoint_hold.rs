@@ -286,7 +286,7 @@ pub fn hold_by_batch_size() {
                 .collect();
             issued += count;
             let began = Instant::now();
-            let landed = index.publish_batch(&moves, &[]).len() as u64;
+            let landed = index.publish_batch(&moves, &[]).expect("publish").len() as u64;
             (began.elapsed().as_nanos() as u64, landed)
         });
         print(&row);

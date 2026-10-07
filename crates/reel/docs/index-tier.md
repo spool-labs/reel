@@ -55,6 +55,13 @@ compaction window one at a time.
 - **A delete of a paged key settles from the footers**, the grave going in over an
   empty place and booking nothing dead otherwise. A range delete enumerates the
   covered rows and settles them a run at a time before the cover goes up.
+- **A put or delete over an empty place asks the spot index for a newer version.** A
+  hand-over takes the key's entry out of the map, and its sequence number with it, so
+  a write drawn before a newer version that has since sealed and been handed over
+  would publish over that version, serve the older value and count the key twice.
+  With the shard held, the write reads the header behind each slot of its key whose
+  segment may hold anything newer than the write, and a newer version there books the
+  write dead. `late_put` in `rendezvous_races.rs` is the check.
 - **A grave is given up on its own segment, not on a sequence number**, once the
   segment its tombstone landed in has a footer, which is the point a search finds the
   tombstone row without it. A range cover is held while any sealed segment overlaps

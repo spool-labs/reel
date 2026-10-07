@@ -20,7 +20,7 @@ use crate::format::record::{
     KEYLESS_PREFIX,
 };
 use crate::format::segment_header::{SegmentHeader, FORMAT_VERSION};
-use crate::index::column::{KeyMove, Landed};
+use crate::index::column::{never_shadowed, KeyMove, Landed};
 use crate::index::counters::{Bookings, SegmentBytes, Tally};
 use crate::index::entry::{span_of, Entry};
 use crate::index::map::ReelIndex;
@@ -1676,7 +1676,7 @@ impl KeyQueue {
                     })
                     .collect();
                 self.landed.clear();
-                column.apply_moves(&moves, segments, &mut self.landed);
+                column.apply_moves(&moves, segments, &never_shadowed, &mut self.landed);
             }
             // A column this open doesn't declare still holds bytes in its segments,
             // and nothing here can shadow them, so its rows are booked live.

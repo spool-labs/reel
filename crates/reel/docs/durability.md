@@ -53,14 +53,12 @@ drive and not about surviving the loss of power.
 
 ## Format stability
 
-Two version numbers are stamped on disk. `FORMAT_VERSION` in
+One version number is stamped on disk. `FORMAT_VERSION` in
 `format/segment_header.rs` is **6**, written into the header record of every
-segment. `FORMAT_VERSION` in `index/persisted.rs` is **2**, written into the
-index checkpoint file. A segment whose header holds another version is
-quarantined whole and never read, and an index checkpoint whose version does
-not match is discarded and rebuilt from the segments.
+segment. A segment whose header holds another version is quarantined whole and
+never read.
 
-**Before 1.0 no cross-version promise is made.** Either number may move without
+**Before 1.0 no cross-version promise is made.** The number may move without
 a conversion path, and the engine ships none: there is no reader for a retired
 version and no writer for an older one. What is promised in the meantime is only
 that the header record's own layout is frozen, so any build can read the version
@@ -175,13 +173,11 @@ magic is wrong, whose length is out of range, or whose checksum fails is not a
 footer. A segment sealed only part way through still has its journal and reads back
 through it.
 
-**A paging volume sweeps the footer instead of collecting it.** The rebuild takes
-whether the volume pages. Resident columns decode every row into entries as
-below. A paging rebuild takes from each footer a key span per column, the range
-tombstones with their footprint, the tombstones the segment holds, and its rows
-booked against that segment, holding one parsed footer at a time, so the open's
-peak is one footer rather than the key set. Sealed keys are answered from their
-footers afterwards rather than installed.
+**The rebuild sweeps each sealed footer.** It takes from each footer a key span per
+column, the range tombstones with their footprint, the tombstones the segment
+holds, and its rows booked against that segment, holding one parsed footer at a
+time, so the open's peak is one footer. Sealed keys go to the spot index and are
+answered from there afterwards.
 
 **The active tail is read through its journal.** The journal's whole groups are
 read in order, and a group is kept only when every record it lists sits at its
@@ -191,32 +187,27 @@ did not land is dropped whole, and the tail resumes past the last record kept, i
 accepted rows written again as a fresh journal. A segment with no footer and no
 journal is one whose footer went bad after its seal, and no tail resumes into it.
 
-**Newest-wins is folded in as records arrive, on the resident path.** Each
-source's run is cut to one version of each key as it lands, and a record that
-loses is booked dead where it lies and dropped, so a rebuild costs memory for the
-keys a source still resolves rather than for every version it ever wrote. The
-winner across sources is settled by the join that follows. This is also what makes
-runtime visibility and the rebuilt index agree when a later put landed in a
-lower-numbered segment. Range tombstones are held for the length of the pass and
-applied at the end, since their effect is on keys rather than on one key and no
-per-key comparison can express it. The paged sweep cannot do the cross-segment
-join, so it books every sealed row live and the scrub settles each segment's
-dead count as its lap completes the segment.
+**Newest-wins is folded in as a tail's records arrive.** The tails' rows are fed
+in key order, a tie going to the earlier segment, and a record that loses is booked
+dead where it lies and dropped. This is also what makes runtime visibility and the
+rebuilt index agree when a later put landed in a lower-numbered segment. Range
+tombstones stand as covers for the length of the pass, since their effect is on
+keys and no per-key comparison can express it. The sweep of the sealed footers
+cannot do the cross-segment join, so it books every sealed row live and the scrub
+settles each segment's dead count as its lap completes the segment.
 
-The rebuild hands back the live entries per column, the sealed key spans where
-the volume pages, per-segment byte counts, live and dead and the tombstone
-footprint held with its newest mark, the oldest data record each segment can
-still surface, the highest sequence number seen, the highest segment number
-present, how far it read each tail's journal so a follower can resume from there,
-and the paths it quarantined. The sequence counter and the segment
+The rebuild hands back the live entries per column, the sealed key spans,
+per-segment byte counts, live and dead and the tombstone footprint held with its
+newest mark, the oldest data record each segment can still surface, the highest
+sequence number seen, the highest segment number present, how far it read each
+tail's journal so a follower can resume from there, and the paths it quarantined. The sequence counter and the segment
 numbering are both raised above what was found, so lost unsynced numbers are
 harmlessly reissued.
 
-**Range covers are reinstalled unswept and swept before the open returns.** A
-resident rebuild resolved every record against them already, so the sweep finds
-nothing, and a paged one releases each covered record its load counted. A record
-counts once whichever pass releases it, which is what makes a crash at any point
-of the cover sweep safe. `cue-points.md` describes the sweep itself.
+**Range covers are reinstalled unswept and swept before the open returns.** The
+sweep releases each covered record the load counted. A record counts once whichever
+pass releases it, which is what makes a crash at any point of the cover sweep safe.
+`cue-points.md` describes the sweep itself.
 
 ## Quarantine, never truncate
 

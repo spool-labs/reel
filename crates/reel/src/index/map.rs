@@ -1,4 +1,4 @@
-//! The reel's resident index: one map per column over one set of segments
+//! The reel's index: one map per column over one set of segments
 //!
 //! Resolving by column first is what lets each column keep its keys at its own
 //! width and shard as far as its own write plane needs. The segments are shared,
@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::units::ByteCount;
 
 use crate::append::publish::PublishBarrier;
-use crate::config::IndexResidency;
 use crate::engine::Totals;
 use crate::error::{ReelError, Result};
 use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyRef, RecordKey};
@@ -21,7 +20,7 @@ use crate::format::footer::{FooterPartition, SegmentFooter};
 use crate::format::loc::{Loc, SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
 use crate::index::column::{ColumnIndex, KeyMove, Landed, PendingCover};
-use crate::index::counters::{Floors, SegmentBytes, SegmentStamp, SegmentTable};
+use crate::index::counters::{Floors, SegmentBytes, SegmentTable};
 use crate::index::entry::{span_of, Entry};
 use crate::index::keyrun::{key_in, row_in, KeyRun, KeyRunSet, RunColumn};
 use crate::index::page::KeyPage;
@@ -177,8 +176,7 @@ pub enum SpotRoute {
 
 /// Paged keys a range delete settles at a time
 ///
-/// Holding every key a range reaches would be the resident footprint a paged column
-/// exists to not have.
+/// Holding every key a range reaches would hold the whole range in memory at once.
 const RELEASE_RUN: usize = 1024;
 
 /// The ceiling of a sealed segment nothing recorded one for, which rules nothing out
@@ -211,9 +209,9 @@ pub struct RangeMove<'batch> {
 
 /// The index of one reel: a map per column and the segments they share
 ///
-/// A resident index holds every live key. A paged one holds the keys of segments no
-/// footer covers yet, and for the rest only the range of keys each sealed segment
-/// covers, so a lookup that misses the map knows which footers to search.
+/// The maps hold the keys of segments no footer covers yet, and for the rest only
+/// the range of keys each sealed segment covers, so a lookup that misses the map
+/// knows which footers to search.
 pub struct ReelIndex {
     /// The columns this index was built over
     columns: ColumnSet,
@@ -221,7 +219,7 @@ pub struct ReelIndex {
     /// One map per column, in the order the columns were declared
     indexes: Vec<ColumnIndex>,
 
-    /// What each column's sealed segments cover, empty unless the column pages
+    /// What each column's sealed segments cover
     sealed: Vec<SealedRanges>,
 
     /// Footers opened by each column's walks, kept while its sealed set stands
@@ -245,11 +243,8 @@ pub struct ReelIndex {
     /// Per-segment counters every column's keys point into
     segments: Arc<SegmentTable>,
 
-    /// Where the footers of sealed segments are read from, for a paged column
+    /// Where the footers of sealed segments are read from
     footers: OnceLock<Arc<dyn FooterSource>>,
-
-    /// Where this volume's operator asked the sealed index to live
-    residency: IndexResidency,
 
     /// Compaction copies refused because nothing else pointed at them
     unclaimed: std::sync::atomic::AtomicU64,
@@ -269,7 +264,7 @@ const SPLIT_AT: usize = 4096;
 
 impl ReelIndex {
     /// An empty index over the columns a reel serves
-    pub fn new(columns: ColumnSet, residency: IndexResidency) -> Result<ReelIndex> {
+    pub fn new(columns: ColumnSet) -> Result<ReelIndex> {
         let mut indexes = Vec::with_capacity(columns.len());
         let mut sealed = Vec::with_capacity(columns.len());
         let mut by_id = vec![None; COLUMN_SLOTS];
@@ -281,7 +276,7 @@ impl ReelIndex {
                 )));
             }
             by_id[spec.id.as_index()] = Some(at);
-            indexes.push(ColumnIndex::new(spec, residency)?);
+            indexes.push(ColumnIndex::new(spec)?);
             sealed.push(SealedRanges::new());
         }
         Ok(ReelIndex {
@@ -296,19 +291,13 @@ impl ReelIndex {
             by_id,
             segments: Arc::new(SegmentTable::new()),
             footers: OnceLock::new(),
-            residency,
             unclaimed: std::sync::atomic::AtomicU64::new(0),
             shadowed: Mutex::new(Vec::new()),
             publish: PublishBarrier::new(),
         })
     }
 
-    /// Where this volume keeps the index of its sealed segments
-    pub fn residency(&self) -> IndexResidency {
-        self.residency
-    }
-
-    /// Tell the index where to read the footers a paged column resolves through
+    /// Tell the index where to read the footers its sealed keys resolve through
     ///
     /// Set once at open, after the volume the footers live on exists.
     pub fn set_footers(&self, footers: Arc<dyn FooterSource>) {
@@ -324,7 +313,7 @@ impl ReelIndex {
 
     /// Whether the spot index answers for a column's sealed keys
     fn spot_serves(&self) -> bool {
-        self.residency.pages() && self.spot_ready.load(Ordering::Acquire)
+        self.spot_ready.load(Ordering::Acquire)
     }
 
     /// A key's newest payload in one read, when the spot index holds the column's sealed keys
@@ -531,9 +520,9 @@ impl ReelIndex {
         Ok(())
     }
 
-    /// Finish the paged open's spot index load and its counts, then let it answer
+    /// Finish the open's spot index load and its counts, then let it answer
     fn finish_spot_load(&self) -> Result<()> {
-        if !self.residency.pages() || self.spot_ready.load(Ordering::Acquire) {
+        if self.spot_ready.load(Ordering::Acquire) {
             return Ok(());
         }
         let Some(footers) = self.footers.get() else {
@@ -560,21 +549,16 @@ impl ReelIndex {
         Ok(())
     }
 
-    /// Where a key's live record is, reading a footer if the column pages
+    /// Where a key's live record is, reading a footer where the map holds nothing
     ///
-    /// One answer for both residencies, so no caller has to know which it is on. A
-    /// resident column stops at the map; a paged one carries on into the sealed
-    /// segments whose key range covers the key, taking the highest sequence number it
-    /// finds, since a segment number is not a version. A grave, a tombstone row and a
-    /// range delete are all applied here, because a footer cannot know about any of
-    /// them.
+    /// A key the map lacks is looked for in the sealed segments whose key range
+    /// covers it, taking the highest sequence number found, since a segment number is
+    /// not a version. A grave, a tombstone row and a range delete are all applied
+    /// here, because a footer cannot know about any of them.
     pub fn get(&self, key: &RecordKey) -> Result<Option<Entry>> {
         let Some(at) = self.slot(key.column) else {
             return Ok(None);
         };
-        if !self.residency.pages() {
-            return Ok(self.mapped(at, key).flatten());
-        }
         for _ in 0..LOOKUP_TRIES {
             let since = self.spot[at].since(key);
             if let Some(answer) = self.mapped(at, key) {
@@ -608,8 +592,7 @@ impl ReelIndex {
         match self.mapped(at, key) {
             Some(answer) => answer.is_some_and(|entry| entry.loc == loc),
             None => {
-                self.residency.pages()
-                    && self.spot_serves()
+                self.spot_serves()
                     && self.spot[at].only_at(key.as_slice(), loc)
                     && !self.indexes[at].is_covered_key(key.as_slice(), lsn)
             }
@@ -878,12 +861,7 @@ impl ReelIndex {
     /// Asked before acting rather than after, since the callers book the copy dead
     /// when they decline and acting first would book it twice.
     fn is_paged_key(&self, at: usize, key: &RecordKey) -> bool {
-        self.residency.pages() && self.indexes[at].entry_or_grave(key.as_slice()).is_none()
-    }
-
-    /// The sealed segments of one column, for the paths that have to wait on them
-    fn sealed_of(&self, at: usize) -> Option<&SealedRanges> {
-        self.residency.pages().then(|| &self.sealed[at])
+        self.indexes[at].entry_or_grave(key.as_slice()).is_none()
     }
 
     /// Where one column's index sits, for the callers that need its sealed ranges
@@ -891,11 +869,9 @@ impl ReelIndex {
         self.by_id[column.as_index()]
     }
 
-    /// Where to read footers for a column that has sealed something, if it pages
+    /// Where to read footers for a column that has sealed something
     fn paged_footers(&self, at: usize) -> Option<&Arc<dyn FooterSource>> {
-        self.footers
-            .get()
-            .filter(|_| self.residency.pages() && !self.sealed[at].is_empty())
+        self.footers.get().filter(|_| !self.sealed[at].is_empty())
     }
 
     /// Whether a key resolves to a live record
@@ -1110,18 +1086,10 @@ impl ReelIndex {
             }
             return Ok(settled);
         }
-        let Some(displaced) = self.paged_entry(at, key)? else {
+        let Some(displaced) = self.sealed_entry(at, key)? else {
             return Ok(false);
         };
         Ok(self.indexes[at].settle_paged(key.as_slice(), displaced.loc, &self.segments))
-    }
-
-    /// What a footer holds for a key the map does not, if the column pages at all
-    fn paged_entry(&self, at: usize, key: &RecordKey) -> Result<Option<Entry>> {
-        match self.residency.pages() {
-            true => self.sealed_entry(at, key),
-            false => Ok(None),
-        }
     }
 
     /// Codec this column asks admission to attempt on its payloads
@@ -1242,14 +1210,13 @@ impl ReelIndex {
                     }
                     Some(entry) => Some(*entry),
                     // A key the map lacks may sit in a sealed segment, so its pick reads later in one batch
-                    None => match (self.spot_pick(*index, key), self.residency.pages()) {
-                        (Some(pick), _) => {
+                    None => match self.spot_pick(*index, key) {
+                        Some(pick) => {
                             picks.push(pick);
                             None
                         }
                         // The map gained the key since the look above, or the spot index is not serving yet, so a full get answers
-                        (None, true) => self.get(key)?,
-                        (None, false) => None,
+                        None => self.get(key)?,
                     },
                 };
             }
@@ -1604,11 +1571,10 @@ impl ReelIndex {
         };
         let index = &self.indexes[column_at];
         if !self.is_paged_key(column_at, key) {
-            // A resident key on a paging column can be one compaction has just
-            // repointed into an open tail, and until that tail seals the map is the
-            // only thing answering for the record, so taking the key out would take
-            // the record with it.
-            if self.residency.pages() && !self.sealed[column_at].holds(at.segment) {
+            // A key in the map can be one compaction has just repointed into an open
+            // tail, and until that tail seals the map is the only thing answering for
+            // the record, so taking the key out would take the record with it.
+            if !self.sealed[column_at].holds(at.segment) {
                 return Ok(false);
             }
             return Ok(index.evict_at(key.as_slice(), at, &self.segments));
@@ -1629,7 +1595,7 @@ impl ReelIndex {
     /// Stand a grave for a point tombstone compaction copied, so no older record answers before its segment is noted
     pub fn hold_grave(&self, key: &RecordKey, lsn: Lsn, segment: SegmentId) {
         // A loading spot index cannot rule out a newer version, so no grave stands yet
-        if !self.residency.pages() || !self.spot_serves() {
+        if !self.spot_serves() {
             return;
         }
         let Some(at) = self.slot(key.column) else {
@@ -1660,7 +1626,7 @@ impl ReelIndex {
         self.indexes
             .iter()
             .enumerate()
-            .map(|(at, index)| index.prune_tombstones(before, self.sealed_of(at)))
+            .map(|(at, index)| index.prune_tombstones(before, &self.sealed[at]))
             .sum()
     }
 
@@ -1716,15 +1682,13 @@ impl ReelIndex {
     }
 
     /// Live key count and payload byte total for one column, zero for a column the map does not hold
-    pub fn column_totals(&self, column: ColumnId) -> Option<Totals> {
-        self.publish.reading_all(|| {
-            Some(match self.column(column) {
-                Some(index) => index.totals(),
-                None => Totals {
-                    count: 0,
-                    bytes: ByteCount::from_bytes(0),
-                },
-            })
+    pub fn column_totals(&self, column: ColumnId) -> Totals {
+        self.publish.reading_all(|| match self.column(column) {
+            Some(index) => index.totals(),
+            None => Totals {
+                count: 0,
+                bytes: ByteCount::from_bytes(0),
+            },
         })
     }
 
@@ -1737,9 +1701,6 @@ impl ReelIndex {
     }
 
     /// Sealed segments recorded as covering keys of this column
-    ///
-    /// Kept on every volume rather than only a paging one, since it says where a
-    /// version the map no longer holds can still be found.
     pub fn sealed_spans(&self, column: ColumnId) -> usize {
         self.slot(column).map_or(0, |at| self.sealed[at].len())
     }
@@ -1774,8 +1735,8 @@ impl ReelIndex {
 
     /// One page and no more, without setting up a playback that will not be resumed
     ///
-    /// A resident column goes straight to its map: a cursor the caller would drop on
-    /// the next line costs two copies of the bound to build.
+    /// A column with nothing sealed goes straight to its map: a cursor the caller
+    /// would drop on the next line costs two copies of the bound to build.
     fn one_page(
         &self,
         column: ColumnId,
@@ -1798,9 +1759,8 @@ impl ReelIndex {
 
     /// Fill a buffer with the next page a playback has reached, and carry it past it
     ///
-    /// A resident column is the map and nothing else, a lock and a range. A paged
-    /// column whose sealed segments hold nothing for this playback takes the same
-    /// path, so the merge is reached only when there is something to merge.
+    /// A column with nothing sealed is the map and nothing else, a lock and a range,
+    /// so the merge is reached only when there is something to merge.
     pub fn page_from(
         &self,
         playback: &mut PlaybackCursor,
@@ -1889,8 +1849,7 @@ impl ReelIndex {
 
     /// Close a rebuild that filled the maps: size them, then stand the sealed spans
     ///
-    /// The spans come off each sealed footer a paged rebuild swept, and a resident one
-    /// brings none.
+    /// The spans come off each sealed footer the rebuild swept.
     pub fn finish_rebuild(&self, sealed: Vec<SealedSpan>) {
         for index in &self.indexes {
             index.fit();
@@ -1899,8 +1858,8 @@ impl ReelIndex {
         self.segments
             .issue_incarnations(sealed.iter().map(|span| span.segment));
         // Spans are grouped per column and installed in one pass each, since a
-        // paging volume brings one per sealed segment and reindexing per segment
-        // would make the open quadratic in them.
+        // rebuild brings one per sealed segment and reindexing per segment would
+        // make the open quadratic in them.
         let mut by_column: HashMap<ColumnId, Vec<(SegmentId, KeyBytes, KeyBytes)>> = HashMap::new();
         for span in sealed {
             by_column.entry(span.column).or_default().push((
@@ -1936,8 +1895,8 @@ impl ReelIndex {
         self.rebook_retiring(segment);
         self.segments.forget(segment);
         self.retired.fetch_add(1, Ordering::AcqRel);
-        // A retired segment's footer goes with its file, so a paged index that
-        // kept searching it would read a file that is no longer there.
+        // A retired segment's footer goes with its file, so an index that kept
+        // searching it would read a file that is no longer there.
         for sealed in &self.sealed {
             sealed.forget(segment);
         }
@@ -1976,11 +1935,6 @@ impl ReelIndex {
     /// Per-segment live and dead footprints, for choosing a compaction target
     pub fn segments_snapshot(&self) -> Vec<(SegmentId, SegmentBytes)> {
         self.segments.snapshot()
-    }
-
-    /// Every segment's footprints and floor together, for stamping a whole file
-    pub fn segment_stamps(&self) -> HashMap<SegmentId, SegmentStamp> {
-        self.segments.stamps()
     }
 
     /// Raise a segment's dead count to what a completed scrub of it counted
@@ -2039,7 +1993,7 @@ mod tests {
     ];
 
     fn index() -> ReelIndex {
-        ReelIndex::new(COLUMNS, IndexResidency::Resident).expect("index")
+        ReelIndex::new(COLUMNS).expect("index")
     }
 
     fn record_key(group: u16, byte: u8) -> RecordKey {
@@ -2075,8 +2029,8 @@ mod tests {
             400
         );
         assert_eq!(index.get(&blob).expect("read").expect("blob").loc.len, 900);
-        assert_eq!(index.column_totals(RECORD).expect("totals").count, 1);
-        assert_eq!(index.column_totals(BLOB).expect("totals").count, 1);
+        assert_eq!(index.column_totals(RECORD).count, 1);
+        assert_eq!(index.column_totals(BLOB).count, 1);
         assert_eq!(index.totals().count, 2);
         assert_eq!(index.totals().bytes, ByteCount::from_bytes(1300));
     }
@@ -2117,7 +2071,7 @@ mod tests {
             },
         ];
 
-        assert!(ReelIndex::new(CLASHING, IndexResidency::Resident).is_err());
+        assert!(ReelIndex::new(CLASHING).is_err());
     }
 
     // both columns book their bytes into the segments they share
@@ -2155,8 +2109,8 @@ mod tests {
             .expect("range delete");
         while index.sweep_covers(usize::MAX).expect("sweep") {}
 
-        assert_eq!(index.column_totals(RECORD).expect("totals").count, 0);
-        assert_eq!(index.column_totals(BLOB).expect("totals").count, 1);
+        assert_eq!(index.column_totals(RECORD).count, 0);
+        assert_eq!(index.column_totals(BLOB).count, 1);
     }
 
     // a playback pages one column's keys and never crosses into another

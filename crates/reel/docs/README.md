@@ -15,8 +15,8 @@ say why it works like that.
 
 - [format.md](format.md): the on-disk record, the flags, the footer, and what would break them
 - [io.md](io.md): backends, direct io, the page cache, mapped reads, and what io_uring is and is not worth
-- [index-shape.md](index-shape.md): what the resident index is held in, node widths, batching, the sweep, and the keys that defeat the lead
-- [index-tier.md](index-tier.md): paging the index into the footers, the filter field, and what a paged open costs
+- [index-shape.md](index-shape.md): what the index map is held in, node widths, batching, the sweep, and the keys that defeat the lead
+- [index-tier.md](index-tier.md): sealed keys in their footers and the spot index, the filter field, and what an open costs
 - [checksum.md](checksum.md): why CRC32C, what 32 bits gave up, and why the choice is now frozen
 - [compression.md](compression.md): the per-column codec, the codec byte, and what never decompresses
 - [multiwriter.md](multiwriter.md): volume ownership, foreign reads, and what more than one writing process would take

@@ -253,12 +253,6 @@ fn agree(table: &SegmentTable, oracle: &Oracle, step: usize) {
             "stamp of {number} parted at step {step}"
         );
     }
-    let stamps = table.stamps();
-    assert_eq!(stamps.len(), oracle.rows.len());
-    for (segment, stamp) in stamps {
-        assert_eq!(stamp.bytes, oracle.bytes_of(segment));
-        assert_eq!(stamp.min_lsn, oracle.rows[&segment].min_lsn);
-    }
 }
 
 /// One seeded stream of every op the table takes, applied to both

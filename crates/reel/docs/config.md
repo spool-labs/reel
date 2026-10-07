@@ -12,9 +12,8 @@ and your own flow through them before trusting a line of it.
 | knob | start at | move it when |
 |---|---|---|
 | `io_backend` | `posix`, which is the default | readers await concurrently, then name `uring` |
-| `index` | `resident` | the live key count outgrows the memory you will give it, then `paged` |
-| `filter_bits` | `10` | never on a resident volume: the seal already spends nothing there |
-| `footer_cache` | `64 MiB`, raised until searches stop reading directories | a paged volume holds more sealed footers than the cache does |
+| `filter_bits` | `10` | rarely: set `footer_cache` first |
+| `footer_cache` | `64 MiB`, raised until searches stop reading directories | the volume holds more sealed footers than the cache does |
 | `map_above` | unset | the working set stays resident and the median matters more than the tail |
 | `segment_bytes` | `1 GiB` | never downward on a rotational device |
 | `active_tails` | `auto`, which is already one tail per fast volume | writers contend on one appender, and then upward only |
@@ -56,7 +55,7 @@ has to name a ring, and it has to name it explicitly.
 ### Lanes or depth: pick the resource you would rather spend
 
 Both answers are valid, and they cost different things. A cold set of 3,000
-point reads against 259M live keys, resident index, on the same box and month:
+point reads against 259M live keys, on the same box and month:
 
 | backend | door | lanes | set ms | cpu ms |
 |---|---|---:|---:|---:|
@@ -94,17 +93,15 @@ page cache for a mapping to read.
 
 ### Filters only pay above a footer cache that holds the directory
 
-`filter_bits` is spent at seal, and only on a volume whose index pages:
-`seal_filter_bits` returns zero under `IndexResidency::Resident`, because a
-column that answers every key from memory never searches a footer. The default of
-10 bits per key is the value the sweeps ran on.
+`filter_bits` is spent at seal. The default of 10 bits per key is the value the
+sweeps ran on.
 
 What the filter changes, measured on an 8-vCPU EPYC Milan cloud box with 30 GiB
 of memory and local NVMe, 2026-08: block reads per search collapse from 63 to
 0.7 to 1.7, except for a key present in every standing run, where it is 63 either
 way. The cost is one directory read per run. **That is why `footer_cache` is the
-knob to set first.** What it names is the ceiling over all of the sealed state a
-paged volume holds, divided three ways between the parsed footers, the segment
+knob to set first.** It is the ceiling over all of the sealed state the volume
+holds, divided three ways between the parsed footers, the segment
 directories and the row blocks, so the room for footers is a third of it. Size it
 so the directory of every sealed segment stays held, and the per-search directory
 reads go to zero rather than growing with the run count. On the 259M key run
@@ -113,23 +110,10 @@ read exactly 1.000.
 
 ## The index
 
-Two arms of the same volume under the same driver, warm, 10,000 rounds of roughly
-180 byte values, single-stream, measured on the 64-thread EPYC 9375F, 2026-08:
-
-| index | writes/s | p50 us | p99 us | reads/get | resident MiB | disk/live |
-|---|---:|---:|---:|---:|---:|---:|
-| paged, carrying | 828,346 | 531.7 | 10,789.8 | 15.88 | 0.4 | 1.99x |
-| resident | 1,023,718 | 70.6 | 134.7 | 0 | 372.2 | 3.30x |
-
-Resident costs 372 MiB against 0.4 MiB and gives back a 7.5x p50 and an 80x p99.
-Warm point reads on the same box read 0.96 to 1.14 us resident against 1.5 to
-2.3 us paged. Take `resident` while the memory is there, and read the paged
-column as what a volume too large for memory pays rather than as an argument
-against paging.
-
-That p99 is not all paging: this arm searched a stack of 427 standing runs on
-every miss, at 15.9 asks per get. A paged get now asks the spot index first, which
-places a sealed key's record for one device read.
+There is no knob for it. A sealed segment's keys stay in its footer, memory holds
+the open tails' keys and what it takes to find the rest, and a get asks the spot
+index first, which places a sealed key's record for one device read.
+`index-tier.md` has the design.
 
 ## The write path
 
@@ -205,7 +189,7 @@ picked when they are mostly dead, so reclaimed bytes run ahead of copied bytes.
 
 ### Walks merge eight runs at most
 
-A paged volume needs no merge knob. Once more than eight runs stand over one key,
+A volume needs no merge knob. Once more than eight runs stand over one key,
 the maintenance tick merges the walk's runs into a key run, and a walk reads it in
 place of the footers it covers. `merge_when_due` runs the same merge for a caller.
 `why-not-an-lsm.md` has the design and its W9 numbers, and `format.md` has the

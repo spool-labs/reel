@@ -16,8 +16,7 @@ use tempfile::{tempdir, TempDir};
 use crate::units::ByteCount;
 
 use crate::config::{
-    CompactRate, IndexResidency, PointReads, Preallocate, RangedReads, RepairPath, SyncPolicy,
-    ThreadBudget,
+    CompactRate, PointReads, Preallocate, RangedReads, RepairPath, SyncPolicy, ThreadBudget,
 };
 use crate::format::column::{Codec, ColumnId, ColumnSpec};
 use crate::format::footer::SegmentFooter;
@@ -137,11 +136,7 @@ fn noise(len: usize) -> Vec<u8> {
 
 /// Bytes a column's live records take on the volume
 fn stored_bytes(store: &ReelStore, column: ColumnId) -> u64 {
-    store
-        .column_totals(column)
-        .expect("totals")
-        .bytes
-        .to_bytes()
+    store.column_totals(column).bytes.to_bytes()
 }
 
 fn coded_store(config: ReelConfig) -> (ReelStore, SimIo) {
@@ -204,10 +199,7 @@ fn sim_store(config: ReelConfig) -> (ReelStore, SimIo) {
 // a paged volume gives a sealed segment's keys to its footer and still reads them
 #[test]
 fn a_paged_column_reads_from_its_footer() {
-    let paged = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let paged = config(1, SyncPolicy::Never);
     let (store, _sim) = sim_store(paged);
 
     // A megabyte of segment against 8 KiB records, so the tail rolls partway.
@@ -246,7 +238,6 @@ fn a_paged_column_reads_from_its_footer() {
 #[test]
 fn spot_answers_sealed_keys() {
     let paged = ReelConfig {
-        index: IndexResidency::Paged,
         compact_mbps: CompactRate::Mbps(64),
         ..config(1, SyncPolicy::Never)
     };
@@ -348,10 +339,7 @@ fn spot_answers_sealed_keys() {
 // every read the spot index answers costs one device read a key, a deep window two in one submission
 #[test]
 fn spot_reads_take_one_read_a_key() {
-    let (store, sim) = sim_store(ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    });
+    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
     let payload = vec![0xa5u8; 8 * 1024];
     for byte in 0..200u8 {
         store.put(&record(7, byte), &payload).expect("put");
@@ -408,7 +396,6 @@ fn spot_reads_take_one_read_a_key() {
 #[test]
 fn compaction_rebooks_class_bookings_at_their_true_length() {
     let (store, _sim) = sim_store(ReelConfig {
-        index: IndexResidency::Paged,
         compact_mbps: CompactRate::Mbps(64),
         ..config(1, SyncPolicy::Never)
     });
@@ -453,10 +440,7 @@ fn compaction_rebooks_class_bookings_at_their_true_length() {
 // a cue read of a key unchanged since the cue takes one read, and one rewritten since reads the footers
 #[test]
 fn a_cue_read_takes_one_read_while_the_key_stands() {
-    let (store, sim) = sim_store(ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    });
+    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
     let (first, second) = (vec![0xa5u8; 8 * 1024], vec![0x5au8; 8 * 1024]);
     for byte in 0..200u8 {
         store.put(&record(7, byte), &first).expect("put");
@@ -508,7 +492,6 @@ fn a_cue_read_takes_one_read_while_the_key_stands() {
 #[test]
 fn spot_keeps_rebuilt_segments_through_a_retire() {
     let paged = ReelConfig {
-        index: IndexResidency::Paged,
         compact_mbps: CompactRate::Mbps(64),
         ..config(1, SyncPolicy::Never)
     };
@@ -548,13 +531,10 @@ fn spot_keeps_rebuilt_segments_through_a_retire() {
     }
 }
 
-// a spot index column takes a range delete and a prefix count, and refuses an index checkpoint cleanly
+// a spot index column takes a range delete and a prefix count
 #[test]
 fn spot_takes_ranges_and_prefix_counts() {
-    let paged = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let paged = config(1, SyncPolicy::Never);
     let (store, sim) = sim_store(paged.clone());
     let payload = vec![0x5au8; 8 * 1024];
     for byte in 0..200u8 {
@@ -592,10 +572,6 @@ fn spot_takes_ranges_and_prefix_counts() {
         store.maintain_once().expect("maintain");
     }
     check(&store, "the cover sweep");
-    assert!(
-        matches!(store.checkpoint_index(), Err(ReelError::Rejected(_))),
-        "a paging volume refuses an index checkpoint"
-    );
 
     store.close().expect("close");
     drop(store);
@@ -608,10 +584,7 @@ fn spot_takes_ranges_and_prefix_counts() {
 // a sealed segment's ceiling covers its tombstone rows and not only its records
 #[test]
 fn a_ceiling_covers_a_tombstone() {
-    let (store, _sim) = sim_store(ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    });
+    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
 
     let payload = vec![0xa5u8; 8 * 1024];
     for byte in 0..8u8 {
@@ -657,7 +630,6 @@ fn a_ceiling_covers_a_tombstone() {
 #[test]
 fn a_handover_never_names_a_retired_segment() {
     let (store, _sim) = sim_store(ReelConfig {
-        index: IndexResidency::Paged,
         compact_mbps: CompactRate::Mbps(64),
         ..config(1, SyncPolicy::Never)
     });
@@ -705,7 +677,6 @@ fn a_handover_never_names_a_retired_segment() {
 #[test]
 fn a_pass_leaves_an_unnamed_segment_alone() {
     let (store, _sim) = sim_store(ReelConfig {
-        index: IndexResidency::Paged,
         compact_mbps: CompactRate::Mbps(64),
         ..config(1, SyncPolicy::Never)
     });
@@ -806,10 +777,7 @@ fn a_second_caller_cannot_take_a_held_segment() {
 // noting and handing over a sealed segment reads nothing back from the device
 #[test]
 fn naming_a_seal_reads_no_footer() {
-    let (store, sim) = sim_store(ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    });
+    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
     let payload = vec![0xa5u8; 8 * 1024];
     for byte in 0..8u8 {
         store.put(&record(7, byte), &payload).expect("put");
@@ -849,50 +817,37 @@ fn naming_a_seal_reads_no_footer() {
     );
 }
 
-// a paged reopen leaves its sealed keys in the footers instead of installing them
+// a reopen installs none of its sealed keys in the map
 #[test]
-fn a_paged_open_never_installs_its_sealed_keys() {
+fn an_open_never_installs_its_sealed_keys() {
     let (store, sim) = sim_store(config(1, SyncPolicy::Never));
     let payload = vec![0xa5u8; 8 * 1024];
     for byte in 0..200u8 {
         store.put(&record(7, byte), &payload).expect("put");
     }
     store.flush().expect("flush");
+    let written = store.totals();
     let image = sim.durable_image();
     drop(store);
 
-    let resident = reopen_image(image.clone(), config(1, SyncPolicy::Never));
-    let paged = reopen_image(
-        image,
-        ReelConfig {
-            index: IndexResidency::Paged,
-            ..config(1, SyncPolicy::Never)
-        },
-    );
+    let reopened = reopen_image(image, config(1, SyncPolicy::Never));
 
     // Nothing was queued to hand over, because nothing was installed to evict.
-    assert_eq!(paged.page_out_sealed().expect("page out"), 0);
+    assert_eq!(reopened.page_out_sealed().expect("page out"), 0);
     assert!(
-        paged.resident_bytes() < resident.resident_bytes(),
-        "the paged open held as much as the resident one: {:?} against {:?}",
-        paged.resident_bytes(),
-        resident.resident_bytes()
+        (0..200u8).any(|byte| is_paged(&reopened, &record(7, byte))),
+        "the open installed every sealed key"
     );
 
     // And it answers every key regardless, from the footers it swept.
     for byte in 0..200u8 {
-        let key = record(7, byte);
         assert_eq!(
-            paged.get(&key).expect("read"),
-            resident.get(&key).expect("read"),
-            "the two opens disagree about {byte}"
+            reopened.get(&record(7, byte)).expect("read"),
+            Some(Value::new(payload.clone())),
+            "the reopen lost {byte}"
         );
     }
-    assert_eq!(
-        paged.totals(),
-        resident.totals(),
-        "the two opens count apart"
-    );
+    assert_eq!(reopened.totals(), written, "the reopen counts apart");
 }
 
 // a failed seal parks the segment and the tick's retry finishes it
@@ -937,13 +892,7 @@ fn a_failed_seal_is_retried_on_the_tick() {
     // keys through the footer the retry wrote.
     let image = sim.durable_image();
     drop(store);
-    let paged = reopen_image(
-        image,
-        ReelConfig {
-            index: IndexResidency::Paged,
-            ..config(1, SyncPolicy::Never)
-        },
-    );
+    let paged = reopen_image(image, config(1, SyncPolicy::Never));
     assert!(paged.get(&record(7, 5)).expect("get").is_some());
 }
 
@@ -981,13 +930,7 @@ fn a_walked_tail_settles_the_sealed_split() {
     let image = sim.durable_image();
     drop(store);
 
-    let paged = reopen_image(
-        image,
-        ReelConfig {
-            index: IndexResidency::Paged,
-            ..settings
-        },
-    );
+    let paged = reopen_image(image, settings);
     let dead_at_open: u64 = paged
         .index
         .segments_snapshot()
@@ -1029,13 +972,7 @@ fn a_paged_open_recovers_its_split_from_the_tally() {
     let image = sim.durable_image();
     drop(store);
 
-    let paged = reopen_image(
-        image,
-        ReelConfig {
-            index: IndexResidency::Paged,
-            ..settings
-        },
-    );
+    let paged = reopen_image(image, settings);
     let dead_at_open: u64 = paged
         .index
         .segments_snapshot()
@@ -1081,7 +1018,6 @@ fn a_paged_open_recovers_its_split_from_the_tally() {
 #[test]
 fn a_paged_read_reads_blocks_not_footers() {
     let paged = ReelConfig {
-        index: IndexResidency::Paged,
         // Small segments against small records, so each footer holds thousands
         // of rows and a block is a fraction of one.
         segment_bytes: ByteCount::from_bytes(256 * 1024),
@@ -1151,7 +1087,6 @@ fn footer_pools_share_one_bound() {
     // pools each held to the whole of it would keep a multiple of what was asked for.
     let knob = ByteCount::from_bytes(24 * 1024);
     let paged = ReelConfig {
-        index: IndexResidency::Paged,
         footer_cache: knob,
         ..config(1, SyncPolicy::Never)
     };
@@ -1203,10 +1138,7 @@ fn footer_pools_share_one_bound() {
 // a key no sealed segment holds is answered without asking any of them
 #[test]
 fn a_fresh_key_skips_the_sealed_search() {
-    let paged = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let paged = config(1, SyncPolicy::Never);
     let sim = SimIo::new(FaultPlan::new(1));
     let store = ReelStore::open_with_io(
         PathBuf::from(ROOT),
@@ -1260,7 +1192,6 @@ fn a_fresh_key_skips_the_sealed_search() {
 #[test]
 fn a_paged_read_of_packed_rows_reads_cuts() {
     let paged = ReelConfig {
-        index: IndexResidency::Paged,
         segment_bytes: ByteCount::from_bytes(256 * 1024),
         ..config(1, SyncPolicy::Never)
     };
@@ -1404,10 +1335,7 @@ fn compaction_leaves_its_output_in_key_order() {
 // paging a key out is not deleting it, so the totals do not move
 #[test]
 fn paging_out_keeps_the_count() {
-    let paged = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let paged = config(1, SyncPolicy::Never);
     let (store, _sim) = sim_store(paged);
 
     let payload = vec![0x5au8; 8 * 1024];
@@ -1429,10 +1357,7 @@ fn paging_out_keeps_the_count() {
 /// The segment is a megabyte against 8 KiB records, so the tail rolls partway
 /// through and the keys of what it sealed go to their footer.
 fn paged_fixture(payload: &[u8]) -> (ReelStore, RecordKey) {
-    let paged = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let paged = config(1, SyncPolicy::Never);
     let (store, _sim) = sim_store(paged);
     for byte in 0..200u8 {
         store.put(&record(7, byte), payload).expect("put");
@@ -1592,9 +1517,9 @@ fn a_deleted_key_stays_gone_once_its_grave_is_pruned() {
     );
 }
 
-// an idle tick prunes a grave to the counter, not to the window
+// a tick keeps a grave the window still covers, though nothing is in flight
 #[test]
-fn an_idle_tick_prunes_graves_to_the_counter() {
+fn a_tick_keeps_a_grave_inside_the_window() {
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
     store.put(&blob(1), &[7u8; 64]).expect("put");
     store.delete(&blob(1)).expect("delete");
@@ -1602,14 +1527,11 @@ fn an_idle_tick_prunes_graves_to_the_counter() {
 
     let pruned = store.prune_tombstones();
 
-    assert_eq!(
-        pruned, 1,
-        "nothing was in flight, so the grave went at once"
-    );
-    assert_eq!(store.index.grave_count(), 0);
+    assert_eq!(pruned, 0, "the grave went before the window passed it");
+    assert_eq!(store.index.grave_count(), 1);
     assert!(
         store.get(&blob(1)).expect("read").is_none(),
-        "the delete still holds without its grave"
+        "the delete still holds"
     );
 }
 
@@ -1659,10 +1581,7 @@ fn paged_image(payload: &[u8], settings: ReelConfig) -> (ReelStore, SimIo, Recor
 // a delete stays done through a paged reopen
 #[test]
 fn a_delete_survives_a_paged_reopen() {
-    let settings = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let settings = config(1, SyncPolicy::Never);
     let payload = vec![0xa5u8; 8 * 1024];
     let (store, sim, handed) = paged_image(&payload, settings.clone());
 
@@ -1691,10 +1610,7 @@ fn a_delete_survives_a_paged_reopen() {
 // a range delete stays done through a paged reopen
 #[test]
 fn a_range_delete_survives_a_paged_reopen() {
-    let settings = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let settings = config(1, SyncPolicy::Never);
     let payload = vec![0xa5u8; 8 * 1024];
     let (store, sim, handed) = paged_image(&payload, settings.clone());
 
@@ -1725,10 +1641,7 @@ fn a_range_delete_survives_a_paged_reopen() {
 // a group drop is one push, and its records settle at the sweep
 #[test]
 fn a_dropped_group_settles_at_the_sweep() {
-    let settings = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let settings = config(1, SyncPolicy::Never);
     let payload = vec![0xa5u8; 8 * 1024];
     let (store, _sim, handed) = paged_image(&payload, settings);
     let before = store.totals();
@@ -1762,10 +1675,7 @@ fn a_dropped_group_settles_at_the_sweep() {
 // two drops over one range settle each record exactly once
 #[test]
 fn overlapping_drops_settle_once() {
-    let settings = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let settings = config(1, SyncPolicy::Never);
     let payload = vec![0xa5u8; 8 * 1024];
     let (store, _sim, _handed) = paged_image(&payload, settings);
 
@@ -1820,10 +1730,7 @@ fn compaction_carries_a_paged_key() {
 // compaction after a paged reopen keeps the footer's keys readable
 #[test]
 fn compaction_carries_a_key_through_a_paged_reopen() {
-    let settings = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let settings = config(1, SyncPolicy::Never);
     let payload = vec![0xa5u8; 8 * 1024];
     let (store, sim, handed) = paged_image(&payload, settings.clone());
     store.flush().expect("flush");
@@ -1966,9 +1873,9 @@ fn floor_lifts_on_drop() {
     assert!(at.as_u64() > 0);
 }
 
-// a resident volume records which segments cover which keys
+// a volume records which segments cover which keys as it hands them over
 #[test]
-fn a_resident_volume_records_its_sealed_spans() {
+fn a_volume_records_its_sealed_spans() {
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
     let payload = vec![0xa5u8; 8 * 1024];
     for byte in 0..200u8 {
@@ -1978,17 +1885,16 @@ fn a_resident_volume_records_its_sealed_spans() {
     // Drain the sealer, whose thread is what records the spans, so the
     // assertions below race nothing.
     store.flush().expect("flush");
-    assert_eq!(
-        store.page_out_sealed().expect("page out"),
-        0,
-        "nothing is handed over"
+    assert!(
+        store.page_out_sealed().expect("page out") > 0,
+        "nothing was handed over"
     );
     assert!(
         store.index.sealed_spans(RECORD) > 0,
-        "a resident volume sealed segments and recorded none of them"
+        "the volume sealed segments and recorded none of them"
     );
     assert!(
-        (0..200u8).all(|byte| !is_paged(&store, &record(7, byte))),
+        (0..200u8).any(|byte| is_paged(&store, &record(7, byte))),
         "every key still answers from the map"
     );
     assert_eq!(store.totals().count, 200);
@@ -2012,7 +1918,6 @@ fn a_slow_scrub_does_not_starve_the_handover() {
     const TICKS: usize = 6;
     const LONG_TICK: Duration = Duration::from_secs(1);
     let paged = ReelConfig {
-        index: IndexResidency::Paged,
         segment_bytes: ByteCount::from_bytes(SEGMENT),
         ..config(1, SyncPolicy::Never)
     };
@@ -2108,7 +2013,6 @@ fn a_slow_scrub_does_not_starve_the_handover() {
 #[test]
 fn scattered_keys_leave_the_filters_small_and_counted() {
     let paged = ReelConfig {
-        index: IndexResidency::Paged,
         segment_bytes: ByteCount::from_bytes(64 * 1024),
         ..config(1, SyncPolicy::Never)
     };
@@ -4257,7 +4161,7 @@ fn async_put_matches_the_block() {
         store.get(&record(7, 2)).expect("get").map(Value::into_vec),
         Some(vec![0x22; 512]),
     );
-    assert_eq!(store.column_totals(RECORD).expect("totals").count, 2);
+    assert_eq!(store.column_totals(RECORD).count, 2);
 }
 
 // an awaited put is as durable as the blocking put beside it
@@ -4388,8 +4292,8 @@ fn columns_are_independent() {
         store.get(&blob(9)).expect("get"),
         Some(Value::new(vec![0x22; 300]))
     );
-    assert_eq!(store.column_totals(RECORD).expect("totals").count, 1);
-    assert_eq!(store.column_totals(BLOB).expect("totals").count, 1);
+    assert_eq!(store.column_totals(RECORD).count, 1);
+    assert_eq!(store.column_totals(BLOB).count, 1);
     assert_eq!(store.totals().bytes, ByteCount::from_bytes(400));
 }
 
@@ -4995,10 +4899,7 @@ fn flip_payload(image: &mut DurableImage, loc: Loc) {
 // a cue read never takes the version hand-over has put in the spot index while the map still holds a newer one
 #[test]
 fn a_cue_read_waits_out_a_hand_over_in_flight() {
-    let (store, _) = sim_store(ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    });
+    let (store, _) = sim_store(config(1, SyncPolicy::Never));
     let store = Arc::new(store);
     let (first, second, third) = (
         vec![0xa5u8; 8 * 1024],
@@ -5044,7 +4945,6 @@ fn a_cue_read_waits_out_a_hand_over_in_flight() {
 #[test]
 fn a_cue_read_searches_packed_footer_blocks() {
     let (store, _) = sim_store(ReelConfig {
-        index: IndexResidency::Paged,
         footer_cache: ByteCount::from_bytes(0),
         ..config(1, SyncPolicy::Never)
     });
@@ -5110,10 +5010,7 @@ fn a_cue_read_searches_packed_footer_blocks() {
 // a sealed key deleted in a tail stays gone after a paged reopen, once that tail seals and the grave goes
 #[test]
 fn a_tail_delete_of_a_sealed_key_holds_through_a_reopen() {
-    let settings = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let settings = config(1, SyncPolicy::Never);
     let payload = vec![0xa5u8; 8 * 1024];
     let (store, sim, handed) = paged_image(&payload, settings.clone());
     store.delete(&handed).expect("delete");
@@ -5143,10 +5040,7 @@ fn a_tail_delete_of_a_sealed_key_holds_through_a_reopen() {
 // a sealed key written again under a range delete still owed its sweep counts once
 #[test]
 fn a_rewrite_under_a_pending_cover_counts_once() {
-    let settings = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let settings = config(1, SyncPolicy::Never);
     let payload = vec![0xa5u8; 8 * 1024];
     let (store, _sim, handed) = paged_image(&payload, settings);
     let mut end = handed.as_slice().to_vec();

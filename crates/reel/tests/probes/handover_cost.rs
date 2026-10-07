@@ -8,8 +8,8 @@ use std::time::Instant;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, Preallocate,
-    RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, RecordKey,
+    ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 /// Virtual root the simulator's files live under
@@ -64,7 +64,6 @@ fn config() -> ReelConfig {
         preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
-        index: IndexResidency::Paged,
         ..ReelConfig::default()
     }
 }

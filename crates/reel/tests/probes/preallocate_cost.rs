@@ -21,8 +21,8 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSpec, IndexResidency, KeyWidth, Preallocate, RecordKey,
-    ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSpec, KeyWidth, Preallocate, RecordKey, ReelConfig,
+    ReelStore, SyncPolicy, ThreadBudget,
 };
 
 const RECORDS: ColumnId = ColumnId(1);
@@ -81,7 +81,6 @@ fn config(mode: Preallocate, segment_mib: u64, tails: u32) -> ReelConfig {
         // flush pins to the device either way.
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(tails),
-        index: IndexResidency::Resident,
         scrub_mbps: 0,
         ..ReelConfig::default()
     }

@@ -9,8 +9,8 @@ use rand::{Rng, SeedableRng};
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, ReelConfig,
-    ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget,
 };
 use reel_core::Store;
 
@@ -68,7 +68,6 @@ fn config(rng: &mut SmallRng) -> ReelConfig {
         active_tails: ThreadBudget::threads(rng.gen_range(1..=3)),
         compact_dead_ratio: 0.1,
         scrub_mbps: 0,
-        index: IndexResidency::Paged,
         ..ReelConfig::default()
     }
 }

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-use reel::config::{IndexResidency, ReelConfig, SyncPolicy};
+use reel::config::{ReelConfig, SyncPolicy};
 use reel::format::column::{Codec, ColumnId, ColumnSpec, RecordKey};
 use reel::units::ByteCount;
 use reel::{KeyWidth, ReelStore};
@@ -47,7 +47,6 @@ fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(64),
         sync: SyncPolicy::Never,
-        index: IndexResidency::Paged,
         ..ReelConfig::default()
     }
 }

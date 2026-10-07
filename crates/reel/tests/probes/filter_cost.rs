@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-use reel::config::{IndexResidency, ReelConfig, SyncPolicy, ThreadBudget};
+use reel::config::{ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, RecordKey};
 use reel::format::loc::SegmentId;
 use reel::io::fault::FaultPlan;
@@ -73,7 +73,6 @@ fn config(filter_bits: u8) -> ReelConfig {
         preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
-        index: IndexResidency::Paged,
         filter_bits,
         // The read path the engine serves callers with
         map_above: MAP_EVERYTHING,

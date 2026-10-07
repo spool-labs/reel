@@ -26,7 +26,7 @@ pub struct SegmentRow {
     pub dead_fraction: f64,
 }
 
-/// What one column has standing over it, as far as this open can say
+/// What one column has standing over it
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ColumnRow {
@@ -36,8 +36,8 @@ pub struct ColumnRow {
     /// The identifier its records are stamped with
     pub id: u8,
 
-    /// Sealed segments covering keys of the column, absent on a resident open
-    pub sealed_segments: Option<usize>,
+    /// Sealed segments covering keys of the column
+    pub sealed_segments: usize,
 }
 
 /// A cue point some part of this process is holding open
@@ -76,9 +76,6 @@ pub struct CueReport {
     /// Dead over live and dead together, the order compaction picks in
     pub dead_share: f64,
 
-    /// Whether the open leaves sealed keys in their footers
-    pub is_paged: bool,
-
     /// Range deletes still standing over the volume
     pub standing_covers: u64,
 
@@ -103,13 +100,10 @@ pub struct CueReport {
 
 /// Ask an open volume where its sequence stands and what its segments weigh
 ///
-/// Fullest of dead first, since that is the order compaction picks in. The per
-/// column figure is what a paged open leaves standing, so a resident open
-/// answers nothing there rather than answering none. A limit of zero asks for
-/// the whole listing, since nobody runs a report to be shown no rows.
+/// Fullest of dead first, since that is the order compaction picks in. A limit of
+/// zero asks for the whole listing, since nobody runs a report to be shown no rows.
 pub fn cue(engine: &ReelStore, limit: usize) -> CueReport {
     let index = engine.index();
-    let is_paged = engine.config().index.pages();
 
     // Both totals are summed here, out of the one snapshot, and neither is asked
     // of the engine again: a second walk of the same rows is a second instant,
@@ -146,7 +140,7 @@ pub fn cue(engine: &ReelStore, limit: usize) -> CueReport {
         columns.push(ColumnRow {
             column: spec.name.to_string(),
             id: spec.id.as_u8(),
-            sealed_segments: is_paged.then(|| index.sealed_spans(spec.id)),
+            sealed_segments: index.sealed_spans(spec.id),
         });
     }
 
@@ -172,30 +166,24 @@ pub fn cue(engine: &ReelStore, limit: usize) -> CueReport {
             0 => 0.0,
             total => dead_bytes as f64 / total as f64,
         },
-        is_paged,
         standing_covers: index.cover_count(),
         sweep_owed,
         graves: index.grave_count(),
         held,
-        caveats: caveats(&columns, is_paged, sweep_owed),
+        caveats: caveats(&columns, sweep_owed),
         segments,
         columns,
     }
 }
 
 /// What a reader has to know before taking any of these figures for a total
-fn caveats(columns: &[ColumnRow], is_paged: bool, sweep_owed: bool) -> Vec<Caveat> {
+fn caveats(columns: &[ColumnRow], sweep_owed: bool) -> Vec<Caveat> {
     let mut caveats = Vec::new();
-    match columns.is_empty() {
-        true => caveats.push(
+    if columns.is_empty() {
+        caveats.push(
             Caveat::new("no columns declared, so sealed spans and standing covers count nothing")
                 .fix("pass --column NAME:ID for each column the volume was written with"),
-        ),
-        false if !is_paged => caveats.push(
-            Caveat::new("sealed spans stand only over a paged open, so this one counts none")
-                .fix("--paged"),
-        ),
-        false => {}
+        );
     }
     if sweep_owed {
         caveats.push(Caveat::new(
@@ -219,10 +207,6 @@ impl Report for CueReport {
                 "segments",
             ))
             .head(fmt::bytes(self.live_bytes + self.dead_bytes))
-            .head(match self.is_paged {
-                true => "paged",
-                false => "resident",
-            })
             .head("read-only")
             .verdict(self.tone(), self.headline(), self.detail())
             .facts(self.facts())
@@ -346,7 +330,7 @@ impl CueReport {
             table = table.row(Row::new([
                 row.column.clone(),
                 row.id.to_string(),
-                fmt::answered(row.sealed_segments),
+                row.sealed_segments.to_string(),
             ]));
         }
         table

@@ -20,9 +20,7 @@ use std::time::Instant;
 use reel::format::loc::{Loc, SegmentId};
 use reel::format::lsn::Lsn;
 use reel::index::column::KeyMove;
-use reel::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, RecordKey, ReelIndex,
-};
+use reel::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelIndex};
 
 const ACCOUNTS: ColumnId = ColumnId(1);
 
@@ -91,7 +89,7 @@ fn merged(at: u64) -> Loc {
 
 /// An index holding every key, each naming a record in the run it was written in
 fn filled() -> ReelIndex {
-    let index = ReelIndex::new(COLUMNS, IndexResidency::Resident).expect("index");
+    let index = ReelIndex::new(COLUMNS).expect("index");
     for at in 0..KEYS {
         index
             .insert(&key(at), source(at), Lsn(at + 1))

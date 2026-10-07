@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use tempfile::TempDir;
 
-use reel::config::{IndexResidency, ReelConfig, SyncPolicy, ThreadBudget};
+use reel::config::{ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, RecordKey};
 use reel::units::ByteCount;
 use reel::{KeyWidth, Preallocate, ReelStore, MAP_EVERYTHING};
@@ -71,7 +71,6 @@ fn config(mapped: bool) -> ReelConfig {
         preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
-        index: IndexResidency::Resident,
         scrub_mbps: 0,
         map_above: match mapped {
             true => MAP_EVERYTHING,

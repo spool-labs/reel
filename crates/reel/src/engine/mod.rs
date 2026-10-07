@@ -5,7 +5,6 @@
 //! and a read resolves a key to a location and the refcounted segment handle that
 //! keeps its file alive.
 
-pub mod index_checkpoint;
 mod maintain;
 mod read;
 pub mod store_impl;
@@ -31,18 +30,15 @@ use crate::format::column::{spec_by_name, ColumnId, ColumnSet, ColumnSpec, Recor
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::SegmentId;
 use crate::format::lsn::Lsn;
-use crate::index::column::ColumnMark;
 use crate::index::counters::ReadCounters;
 use crate::index::lockfile::OwnershipLock;
 use crate::index::map::ReelIndex;
-use crate::index::page::KeyPage;
 use crate::reel::bias::MachineFacts;
 use crate::reel::cue::CuePoints;
 
 use crate::compaction::pressure::PassPlane;
 use crate::index::paged::FooterSource;
-use crate::index::persisted::{admits, PersistedReader};
-use crate::index::recovery::rebuild_from_persisted;
+use crate::index::recovery::rebuild_reel;
 use crate::index::spot::RecordSource;
 use crate::index::tailer::LogCursor;
 use crate::io::select::select_backend;
@@ -197,7 +193,7 @@ pub struct ReelStore {
     /// The append-only log of segment files
     reel: Reel,
 
-    /// Resident index over every column served
+    /// Index over every column served
     index: ReelIndex,
 
     /// Held so this owner keeps the volume until the store drops, never read
@@ -226,36 +222,6 @@ pub struct ReelStore {
 
     /// Admitted bytes at the last heat ask, which turns a counter into a rate
     ingest_marker: AtomicU64,
-}
-
-/// The index a previous cue wrote down, where this open may believe any of it
-///
-/// Read whenever one is there: a paging volume never wrote one, and every other file is
-/// CRC verified per block and joined newest-wins, so believing it can only save reads. A
-/// file describing columns the store no longer serves is refused whole rather than in
-/// part, since dropping a block's rows while skipping its segments loses a live record.
-fn offered_index(
-    driver: &IoDriver,
-    root: &Path,
-    config: &ReelConfig,
-    columns: ColumnSet,
-) -> Result<Option<PersistedReader>> {
-    if config.index.pages() {
-        return Ok(None);
-    }
-    let Some(reader) = PersistedReader::open(driver, root)? else {
-        return Ok(None);
-    };
-    if !admits(&reader.index, columns) {
-        tracing::warn!(
-            "the persisted index at {} describes another column set, so this open \
-             sweeps the footers",
-            root.display(),
-        );
-        reader.close(driver)?;
-        return Ok(None);
-    }
-    Ok(Some(reader))
 }
 
 impl ReelStore {
@@ -372,7 +338,7 @@ impl ReelStore {
         };
         let compactor = Compactor::new(&config, capacity_bytes, fast_capacity);
 
-        let index = ReelIndex::new(columns, config.index)?;
+        let index = ReelIndex::new(columns)?;
         // The manifest names every root before anything reads one, so a missing
         // mount refuses here rather than reading as loss below.
         let dead: Vec<bool> = std::iter::once(false)
@@ -389,19 +355,11 @@ impl ReelStore {
             }
         }
         crate::reel::volumes::ensure_manifest(&driver, &roots, &dead, is_read_only)?;
-        // Ahead of the rebuild, whose paged load takes covered segments' keys from them, and resident too, since a delete stands while a run holds an older row
+        // Ahead of the rebuild, whose load takes covered segments' keys from the key runs
         if !is_read_only {
             index.key_runs().load(&driver, &root)?;
         }
-        let persisted = offered_index(&driver, &root, &config, columns)?;
-        let rebuilt = rebuild_from_persisted(
-            &driver,
-            &roots,
-            &dead,
-            config.index.pages(),
-            persisted,
-            &index,
-        )?;
+        let rebuilt = rebuild_reel(&driver, &roots, &dead, &index)?;
         // Compaction only copies what the index can find, so a writable open over a
         // column it doesn't declare would drop that column's records.
         if let Some(column) = rebuilt.undeclared.filter(|_| !is_read_only) {
@@ -466,7 +424,7 @@ impl ReelStore {
             false => Reel::open(Arc::clone(&shared), rebuilt.resumable)?,
         };
         // The volume exists now, so the index can be told where to read the footers
-        // a paged column resolves through. A resident one never asks.
+        // its sealed keys resolve through.
         index.set_footers(Arc::clone(&shared) as Arc<dyn FooterSource>);
         index.set_records(Arc::clone(&shared) as Arc<dyn RecordSource>);
         // And the other direction: a seal writes down what its segment weighs, and
@@ -475,7 +433,7 @@ impl ReelStore {
         index.finish_open()?;
 
         // Nothing is waiting to be handed over: the only keys a rebuild leaves
-        // resident are the tails', and a tail is handed over when it seals.
+        // in the map are the tails', and a tail is handed over when it seals.
         let held: VecDeque<(SegmentId, Arc<SegmentFooter>)> = VecDeque::new();
 
         Ok(ReelStore {
@@ -523,7 +481,7 @@ impl ReelStore {
         spec_by_name(self.index.columns(), name)
     }
 
-    /// The resident index, for a playback that pages it directly
+    /// The index, for a playback that pages it directly
     pub fn index(&self) -> &ReelIndex {
         &self.index
     }
@@ -549,37 +507,6 @@ impl ReelStore {
     /// whenever a ring was configured and the kernel would not set one up.
     pub fn serving_backend(&self) -> crate::io::ServingBackend {
         self.driver.serving()
-    }
-
-    /// One page of a column's live keys in no promised order, every key at least once per full sweep
-    pub fn sweep_column(
-        &self,
-        column: ColumnId,
-        from: Option<&[u8]>,
-        limit: usize,
-        out: &mut KeyPage,
-    ) -> Option<Vec<u8>> {
-        let resumed = from.and_then(ColumnMark::unpack);
-        let index = self.index.column(column)?;
-        index
-            .sweep(self.sweep_nonce, resumed.as_ref(), limit, out)
-            .map(|mark| mark.pack())
-    }
-
-    /// One page of the keys under a prefix, in key order
-    pub fn sweep_column_prefix(
-        &self,
-        column: ColumnId,
-        prefix: &[u8],
-        from: Option<&[u8]>,
-        limit: usize,
-        out: &mut KeyPage,
-    ) -> Option<Vec<u8>> {
-        let resumed = from.and_then(ColumnMark::unpack);
-        let index = self.index.column(column)?;
-        index
-            .sweep_prefix(self.sweep_nonce, prefix, resumed.as_ref(), limit, out)
-            .map(|mark| mark.pack())
     }
 
     /// The sequence number the volume has reached
@@ -664,7 +591,7 @@ impl ReelStore {
         }
     }
 
-    /// Memory the index is holding, which is what a residency tier trades away
+    /// Memory the index is holding
     ///
     /// Accounted rather than observed, since a process footprint is an allocator's
     /// answer and a warm heap hides what a map just took off the free list.

@@ -1,22 +1,16 @@
 # The index tier
 
-The design record for `Paged`, the on-disk index tier. It is the gate on
-the full-history deployment class, where 95 bytes of resident RAM per key is 19 GB
-at 200 million keys and the open cannot happen at all at a billion.
+The design record for the index. The map holds the open tails' keys, the graves and
+the covers. A sealed segment's keys go to its footer, and the spot index places each
+one's record for one device read. It is the gate on the full-history deployment
+class, where holding every key in memory at 95 bytes a key is 19 GB at 200 million
+keys and an open at a billion cannot happen at all.
 
-`Resident` is the default and what every measurement before the tier used: every live
-key in a sharded map, each shard tracking its bytes, its graves and its paged count,
-so `live_count` is `map.len() - graves + paged`. `Paged` hands a sealed segment's keys
-to its footer and resolves them from there. Neither is a migration of the other, and
-the default is unchanged.
+Each shard tracks its bytes, its graves and its paged count, so `live_count` is
+`map.len() - graves + paged`.
 
 ```
-where a key's location lives                              ops per read
-
-  Resident   every live key in the sharded map                     1
-  Paged      only unsealed keys, graves and covers in the map       2
-
-what a paged lookup walks, and what each step takes out
+what a lookup walks when the spot index cannot settle it, and what each step takes out
 
   the map                 unsealed keys, graves, covers
     | miss
@@ -34,13 +28,13 @@ what a paged lookup walks, and what each step takes out
 A fence, where one is armed, replaces the halvings inside a partition with a scan
 over leads, so a search reads one block rather than one per halving.
 
-## What a paged index has to get right
+## What the index has to get right
 
 Every rule below was a shipped defect first. `paged_single_tail` and `paged_multi_tail`
 in `differential.rs` run seeded streams against a memory oracle
 with `page_out_sealed` driven inside the stream, so every op after a seal runs
 against a half-paged index, and they assert the run paged something out, because a
-paged run that pages nothing is a resident run wearing a config. Five named cases in
+run that pages nothing never reaches a footer. Five cases in
 `src/engine/tests.rs` take the playback, the delete, the overwrite, the grave and the
 compaction window one at a time.
 
@@ -85,27 +79,13 @@ compaction window one at a time.
   `unclaimed_copies()`, safe because the source holds the record until the pass
   retires it, so the copy goes rather than the key.
 
-## What a paged playback costs, measured
+## What a playback costs, measured
 
-Measured 2026-07-29 on a ccx33, cached shape, posix, a playback through `iter_prefix`
-driven by a caller-side backend sweep. The pair that means anything is a resident and
-a paged run at the **same** segment size, since segment size moves the reel on its
-own: at 4 MiB it takes 135 flushes where 32 MiB takes 24, and that costs the resident
-tier its concurrent write throughput regardless of where the keys live.
-
-| payload | resident, 3 sealed | paged, 3 sealed | resident, 25 sealed | paged, 25 sealed |
-|---|---|---|---|---|
-| 1 KiB | 1.45 ms | 1.48 ms | 1.36 ms | 3.14 ms |
-| 2 KiB | 1.48 ms | 2.64 ms | 1.50 ms | 3.91 ms |
-| 4 KiB | 1.49 ms | 2.93 ms | 1.38 ms | 5.62 ms |
-| 16 KiB | 392 us | 709 us | 401 us | 1.38 ms |
-| 64 KiB | 119 us | 190 us | 111 us | 364 us |
-| 1 MiB | 20.9 us | 30.7 us | 20.9 us | 44.4 us |
-
-**A paged playback costs about twice a resident one over three sealed segments and
-about four times over twenty-five.** It was the segment count that moved it: the
-merge scanned every open cursor three times per key emitted, so the per-key work was
-linear in how many segments overlapped the span.
+A playback merges the map's page with a cursor into every sealed segment whose key
+range reaches into the span. Measured 2026-07-29 on a ccx33, a playback over
+twenty-five sealed segments cost about four times one the map answered alone. It was
+the segment count that moved it: the merge scanned every open cursor three times per
+key emitted, so the per-key work was linear in how many segments overlapped the span.
 
 That is fixed. The cursors are heap ordered by the key each sits on, holding
 positions rather than keys, so a key costs the depth rather than the width and only
@@ -114,52 +94,27 @@ on the simulator rather than device work, the per-key merge cost at 257 sealed
 segments falls from 1.21 us to 88 ns and the whole playback from 160.64 ms to
 11.84 ms, and at 2 and 5 segments the two arms tie, so nothing was traded for it.
 
-A point read pays much less: at twenty-five sealed segments it is within a few
-percent of resident at every size, peaking at fourteen percent on the middle rows.
-The footer search is fine; it was the merge that was not.
-
-## What the tier saves, measured
-
-Over fifty thousand record keys on the same box, 2026-07-29:
-
-| residency | index held |
-|---|---|
-| resident | 4,638 KiB |
-| paged | 51 KiB |
-
-**Paged holds ninety-one times less than resident.**
-The resident row is 95.0 bytes a key, the same figure a counting allocator produced
-on another day by another method. Accounted rather than observed, and it had to be:
-the sweep's resident-footprint columns read a process RSS delta, and on a warmed heap
-the allocator satisfies a four megabyte map off its free list without the process
-growing at all.
-
 ## Lazy open
 
-Recovery used to install every sealed key into the map and hand them back on the
-first tick, so a paged volume peaked at exactly the resident footprint it exists to
-avoid, once, at open. A paging rebuild sweeps each footer instead of collecting it:
-one key span per partition into the sealed ranges, the range covers with their
-footprint, the tombstones held, and each segment's rows booked against that segment,
-one parsed footer in memory at a time. Sealed keys are born paged rather than
-installed and evicted, and `a_paged_open_never_installs_its_sealed_keys` is the
-check.
+A rebuild sweeps each footer: one key span per partition
+into the sealed ranges, the range covers with their footprint, the tombstones held,
+and each segment's rows booked against that segment, one parsed footer in memory at a
+time. Sealed keys never enter the map, and `an_open_never_installs_its_sealed_keys`
+is the check.
 
-Measured 2026-07-30 by `tests/probes/open_time.rs`, reopening a volume whose segments
-are all sealed:
+Measured 2026-07-30 by `tests/probes/open_time.rs`, before the spot index, reopening
+a volume whose segments are all sealed:
 
-| segments | keys | resident open | resident index | paged open | paged index |
-|---|---|---|---|---|---|
-| 65 | 33,281 | 11.53 ms | 3,087 KiB | 1.59 ms | 0 KiB |
-| 257 | 133,121 | 55.25 ms | 12,350 KiB | 6.13 ms | 0 KiB |
-| 1025 | 532,481 | 244.40 ms | 49,400 KiB | 24.68 ms | 0 KiB |
+| segments | keys | open | index |
+|---|---|---|---|
+| 65 | 33,281 | 1.59 ms | 0 KiB |
+| 257 | 133,121 | 6.13 ms | 0 KiB |
+| 1025 | 532,481 | 24.68 ms | 0 KiB |
 
 Zero, because nothing is installed: every key stays in the footer it was already in.
-The open is 7.3x to 9.9x faster as well as smaller, and the ratio widens with segment
-count because a resident open resolves every key and a paged one reads a span per
-partition. Two honest edges: the paged figure is what the key maps hold, and the
-sealed ranges are kilobytes held elsewhere; and this is the simulator, so it is index
-work rather than device work.
+The open reads a span per partition. Two honest edges: the figure is what the key
+maps hold, and the sealed ranges are kilobytes held elsewhere. And this is the
+simulator, so it times index work and no device work.
 
 **Only one derived number is correctness.** A rebuild does not have to reproduce each
 segment's byte split or each column's live count exactly, since those steer
@@ -178,8 +133,8 @@ against the sealed footers books dead the newest sealed row each surviving walke
 entry shadows. The footer field `sealed_at` makes that debit exact rather than
 double-counted, being the sequence frontier the segment sealed under, so only
 shadowings at or past it are debited and anything below is already in the tally.
-Sealed-over-sealed shadowing stays the scrub's, being the cross-segment join a paged
-open exists to avoid. `a_paged_open_recovers_its_split_from_the_tally` and
+Sealed-over-sealed shadowing stays the scrub's, being the cross-segment join an open
+exists to avoid. `a_paged_open_recovers_its_split_from_the_tally` and
 `a_walked_tail_settles_the_sealed_split` are the checks.
 
 ## What the counters promise
@@ -195,10 +150,10 @@ release, an eviction and a compaction move never count one record twice.
 | hand-over | the key moves from the map to `paged`, bytes unchanged |
 | put or delete over a paged key | the displaced slot out, bytes by its length class |
 | cover release | each covered record the spot index holds live |
-| paged open | every key the load takes a fresh slot for, at its row's length |
+| open | every key the load takes a fresh slot for, at its row's length |
 | tail over a sealed key at open | the sealed version out of the count and the spot index |
 
-A paged open loads a covered segment's keys from the key run over it, since the run
+An open loads a covered segment's keys from the key run over it, since the run
 keeps one row a key and a footer can still hold a version whose newer one died in a
 retired segment, and it releases every standing cover before it returns. `totals()`,
 `column_totals` and `prefix_totals` answer exactly, up to spot hash collisions in
@@ -210,10 +165,9 @@ answered before it. `paged_totals_model.rs` and the differential fixture check i
 What ships is the seam and one kind: a blocked bloom behind a kind byte, sized by
 `ReelConfig.filter_bits` at ten by default and zero to turn it off. The region sits
 between the packed rows and the directory, one header per partition so the walk stays
-in step with it, and `FooterMap` takes both in one read. A resident volume spends no
-bits whatever the knob says, since it never searches a footer, and merge output
-spends none either: its rows span the whole keyspace, so its fence answers placement
-and a search reaching it is nearly always a hit.
+in step with it, and `FooterMap` takes both in one read. Merge output spends no bits:
+its rows span the whole keyspace, so its fence answers placement and a search
+reaching it is nearly always a hit.
 
 Measured on the counts, which say the same thing on any machine.
 `tests/probes/filter_cost.rs` writes six thousand scattered sixteen byte keys over
@@ -230,8 +184,8 @@ thousand keys nothing wrote:
 
 Ten bits leaves 0.71 percent of searches standing, the textbook rate for the shape,
 which confirms the probes are independent enough. On the same probe a miss goes from
-1.04 us to 0.59 us and a hit from 1.60 to 1.11, hits gaining because a paged read
-searches every candidate even after it finds a row. Both are floors: a search there
+1.04 us to 0.59 us and a hit from 1.60 to 1.11, hits gaining because a footer search
+reads every candidate even after it finds a row. Both are floors: a search there
 is a memcpy off a warm block, about 38 ns, where a cold read costs thousands of times
 more.
 
@@ -260,7 +214,7 @@ key of a column as one stack of filters, asked ahead of the candidate fan-out in
 three sealed searches, and a no skips the walk and every per-segment filter behind
 it. Levels start at 256 Ki keys and grow fourfold, so a billion keys is seven levels
 and a ruled-out key costs seven cache lines. It is fed where sealed spans are
-recorded and before they are visible, the paged rebuild's sweep and `note_spans` at a
+recorded and before they are visible, the rebuild's sweep and `note_spans` at a
 seal, which is the invariant that makes the skip safe. Nothing is removed: a retired
 segment's bits stay as false positives, a search that finds nothing. The overwrite
 probe is one of those three searches, so a fresh key skips the fan-out going in as it
@@ -299,17 +253,6 @@ its caller's allocation rule holds one deployment to about fifty occupied groups
 shard width is a decision to take against the expected occupancy rather than a
 default to copy.
 
-## A resident loc is a pointer, so a merge has to repoint it
-
-Not a defect, a cost that was never written down. Paged mode finds a row by fence and
-holds no pointer, so a merge repoints nothing. Resident mode holds an exact `Loc` for
-every key, so a merge repoints every entry it moves.
-The per-entry cost is a map write, small against the io the
-merge is already paying; what it costs is granularity, since each batch of repoints
-takes the publish barrier, so a jitter bound on a merge applies to its index side and
-not only to its io. The machinery exists, compaction repointing as it copies. What
-would be new is the volume.
-
 ## Still open
 
 - **A footer search on the write path.** Every put of a key the map does not hold
@@ -335,7 +278,7 @@ would be new is the volume.
   counter is per column, so a slot-led volume taking seals at the high end while a
   long playback crosses the low end reopens that playback's cursors on every seal.
   The counter would have to carry the changed range rather than a count.
-- **Benchmarking a paged run honestly.** A backend sweep must tick the handover
+- **Benchmarking a run honestly.** A backend sweep must tick the handover
   between the fill and the reads and print how many keys answered from a footer, so a
   run that pages nothing says so, and it needs `REEL_BENCH_SEGMENT` below the sweep's
   payload or nothing seals at all.

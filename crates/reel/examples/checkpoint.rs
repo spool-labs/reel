@@ -14,8 +14,8 @@ use tempfile::TempDir;
 
 use reel::format::column::RecordKey;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, ReelConfig,
-    ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget,
 };
 use reel_core::Value;
 
@@ -50,7 +50,6 @@ fn config() -> ReelConfig {
         alloc_chunk: ByteCount::from_bytes(64 * 1024),
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(2),
-        index: IndexResidency::Resident,
         ..ReelConfig::default()
     }
 }

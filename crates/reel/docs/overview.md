@@ -5,15 +5,15 @@ whole-segment reclaim. One log of segment files spread over one or more volume
 roots. A write lands at the end of an open segment and that segment seals when
 it fills. Nothing is updated in place, so a delete is a tombstone and space
 comes back from the maintenance plane rather than from the write path. An index
-maps every live key to the segment and offset holding it, either resident in
-memory or paged out of the footers the seals wrote.
+maps every live key to the segment and offset holding it: the open tails' keys sit
+in memory, and a sealed key is found through the footers the seals wrote.
 
 This file is the way in. Everything it states is stated at length somewhere
 else, and the reading order at the bottom says where.
 
 ## A volume on disk
 
-The engine writes five kinds of file and nothing else.
+The engine writes four kinds of file and nothing else.
 
 | name | where | what it is |
 |---|---|---|
@@ -21,7 +21,6 @@ The engine writes five kinds of file and nothing else.
 | `reel.volumes` | the first root | the manifest naming every root this reel spans |
 | `reel.volume` | every root past the first | the marker saying this root was mounted where the manifest says |
 | `reel.lock` | the first root | the advisory lock one writing process holds for its lifetime |
-| `reel.index` | the first root | the resident index a `checkpoint_index()` wrote down at a cue |
 
 A segment opens with a header record carrying the format version and its own
 segment number, so a file that is not this reel's is quarantined rather than
@@ -57,12 +56,12 @@ seal runs off the append path on a per-tail sealer thread.
 
 ## The read path
 
-The index is asked first. A resident column answers from its map: an entry
-holds the location and the sequence number, and the read is one device op
-placed by the entry.
+The index is asked first. The map answers the open tails' keys: an entry holds
+the location and the sequence number, and the read is one device op placed by
+the entry. A sealed key goes to the spot index, which places its record for one
+read.
 
-A paged column answers its unsealed keys the same way and sends the rest
-to the footers. That search is a funnel: a whole-column filter over every
+A key the spot index cannot settle goes to the footers. That search is a funnel: a whole-column filter over every
 sealed key, then the per-segment key spans, then each surviving segment's own
 filter, then its directory, then one block of rows, then the row. The row points at a
 record and the driver fetches it.
@@ -85,7 +84,7 @@ it needs a buffer it owns.
 maintain_once            one tick, every step bounded and paced
   retry broken seals
   publish footprint
-  page out sealed        paged volumes only
+  page out sealed        sealed keys leave the map
   sweep covers
   prune graves
   compact once  ->  drain wholly dead segments        unlink, nothing copied
@@ -114,7 +113,7 @@ Terms this codebase uses with meanings a newcomer cannot guess.
   kernel never serializes them on a shared inode.
 - **run**: three senses. A *sorted run* is a segment whose records sit in key
   order, which is what a compaction rewrite produces. A *key run* is a file of
-  sorted key rows that a paged walk reads in place of the footers it covers. A
+  sorted key rows that a walk reads in place of the footers it covers. A
   *dead run* is a
   contiguous stretch of dead bytes inside a segment, which is what a hole punch
   can give back.
@@ -185,7 +184,7 @@ the io.
 3. [io.md](io.md): the backends, the page cache, and what the ring is and is
    not worth.
 4. [index-shape.md](index-shape.md) then [index-tier.md](index-tier.md): what
-   the resident index is held in, then what happens when it will not fit.
+   the index map is held in, then how sealed keys leave it.
 5. [compaction.md](compaction.md): the maintenance plane, what a pass may retire,
    and what a rate cap costs the foreground.
 6. [why-not-an-lsm.md](why-not-an-lsm.md): where this design sits in the

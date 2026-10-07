@@ -7,7 +7,7 @@
 //! window slides as the oldest segments retire.
 
 use crate::sync::checked::{AtomicU32, AtomicU64, Ordering, RwLock};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use crate::format::loc::{SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
@@ -61,19 +61,6 @@ impl SegmentBytes {
     pub fn reclaimable(&self, floor: Option<Lsn>) -> u64 {
         self.dead + self.droppable(floor)
     }
-}
-
-/// Everything one segment's row holds, taken in one pass of the table
-///
-/// The footprints and the oldest-record mark sit behind the same lock, so a caller
-/// wanting both takes them together rather than locking twice a segment.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct SegmentStamp {
-    /// Live, dead and held footprints
-    pub bytes: SegmentBytes,
-
-    /// Oldest data record the segment can still surface
-    pub min_lsn: Option<Lsn>,
 }
 
 /// The oldest record marks on a reel, enough to answer any one exclusion
@@ -501,7 +488,7 @@ impl SegmentTable {
         });
     }
 
-    /// Add footprints a rebuild read off a footer tally or a persisted stamp
+    /// Add footprints a rebuild read off a footer tally
     pub fn adopt(&self, segment: SegmentId, bytes: SegmentBytes) {
         self.opened(segment, |row| {
             row.add_live(bytes.live);
@@ -608,22 +595,6 @@ impl SegmentTable {
             }
         }
         (out, floors)
-    }
-
-    /// Every segment's footprints and floor together, from one pass under one lock
-    pub fn stamps(&self) -> HashMap<SegmentId, SegmentStamp> {
-        let window = read(&self.window);
-        let mut out = HashMap::with_capacity(window.present);
-        for (segment, row) in window.counted_rows() {
-            out.insert(
-                segment,
-                SegmentStamp {
-                    bytes: row.bytes(),
-                    min_lsn: row.min_lsn(),
-                },
-            );
-        }
-        out
     }
 
     /// The oldest record this segment can still surface

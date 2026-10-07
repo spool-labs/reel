@@ -71,7 +71,7 @@ fails them at the middle cut and at the last.
 
 ## The seeded stresser
 
-`tests/seeded_stress.rs`. Caller count, residency, tails, op mix, batch width,
+`tests/seeded_stress.rs`. Caller count, tails, op mix, batch width,
 door per call, dropped futures, and a fault plan spanning eleven fault kinds,
 scatter and crashes, all drawn from one `u64`.
 
@@ -97,10 +97,9 @@ itself, so a pending future takes the drain turn when it is free, and pinned by
 removed.
 
 **The paged span registry raced the segment lifecycle**, in a family with two
-edges. On the seal edge a resident grave pruned to the exact floor while the
-column's candidate spans did not yet offer the tombstone's segment, so the live
-footer search resurrected an older version; paged volumes keep the 2^20 window as
-the mitigation. On the retire edge candidates kept offering a segment compaction
+edges. On the seal edge a grave pruned to the exact floor while the column's
+candidate spans did not yet offer the tombstone's segment, so the live footer
+search resurrected an older version. Graves keep the 2^20 window for it now. On the retire edge candidates kept offering a segment compaction
 had retired, and the live read met the missing footer and answered `None` while
 its own remaining candidates held the row. `forget_segment` now takes the segment
 out of every sealed shard's candidate registry and out of the footer, map and
@@ -127,9 +126,6 @@ serial run, which is why the binary declines the libtest harness.
   peers leg asserts nothing, so the designed answer there, a checksum miss that
   reads as a repairable absence and never a wrong payload, rests on the design
   rather than on a run.
-- **Exact prune floor raced.** Nothing parks a put between its draw and its claim
-  while a tick prunes, which is what the drawn gauge exists for. Rendezvous
-  candidate at the draw seam.
 - **`compaction/retire` choreography.** The site is gated now, by the plane guard
   in `engine.rs` that holds a pass there and asserts a second caller sees `Held`.
   The interleaving still unpinned is the one the paged seed found: a paged read

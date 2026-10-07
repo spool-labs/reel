@@ -10,9 +10,8 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 
-use reel::config::{IndexResidency, ReelConfig, SyncPolicy, ThreadBudget};
+use reel::config::{ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSpec, RecordKey};
-use reel::index::persisted::PERSISTED_INDEX;
 use reel::reel::checkpoint::staging_of;
 use reel::sync::rendezvous;
 use reel::units::ByteCount;
@@ -44,7 +43,6 @@ fn config() -> ReelConfig {
         alloc_chunk: ByteCount::from_bytes(64 * 1024),
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(2),
-        index: IndexResidency::Resident,
         ..ReelConfig::default()
     }
 }
@@ -187,13 +185,9 @@ fn the_copy_survives_the_original_compacting_it_away() {
     }
 }
 
-// a copy taken from a volume that keeps an index carries one of its own
-//
-// The index over exactly the linked segments comes from the same cue, so the restore
-// reads one file rather than every footer. It lands on home, since its rows name
-// segments across every piece.
+// a restore through the copy serves every key and counts what the volume counts
 #[test]
-fn the_copy_carries_its_own_index() {
+fn the_copy_restores_whole() {
     let home = TempDir::new().expect("tempdir");
     let live = home.path().join("live");
     let copy = home.path().join("copy");
@@ -202,17 +196,12 @@ fn the_copy_carries_its_own_index() {
     fill(&store, 0..400, 0x28);
     store.checkpoint(&copy).expect("checkpoint");
 
-    assert!(
-        copy.join(PERSISTED_INDEX).is_file(),
-        "the copy took the segments and left the index behind",
-    );
-
     let restored = open(&copy);
     for at in 0..400u32 {
         assert_eq!(
             restored.get(&key(at)).expect("read").map(Value::into_vec),
             Some(vec![0x28; 4_096]),
-            "key {at} did not survive a restore through the copy's own index",
+            "key {at} did not survive a restore through the copy",
         );
     }
     assert_eq!(

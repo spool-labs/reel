@@ -165,7 +165,7 @@ impl ReelStore {
         // Only the map moves under that hold: settling a paged column's displaced key
         // reads a footer, and a reader waiting on the barrier must not be waiting on
         // the volume, so those are collected and run afterwards.
-        let pages = self.index.residency().pages();
+
         // Built before the barrier is taken, so the hold costs only the move. A range
         // is held apart with the count of moves ahead of it, since the index applies a
         // run of key moves at a time and a cover is not one of them.
@@ -202,7 +202,7 @@ impl ReelStore {
             let Some(mapped) = answers.next() else {
                 break;
             };
-            if pages && mapped.may_be_paged() {
+            if mapped.may_be_paged() {
                 displaced.push((planned.key.clone(), record.lsn));
             }
         }

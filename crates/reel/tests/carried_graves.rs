@@ -6,8 +6,8 @@ use reel::format::column::RecordKey;
 use reel::format::loc::SegmentId;
 use reel::format::lsn::Lsn;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, ReelConfig,
-    ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget,
 };
 use reel_core::{Direction, Store};
 
@@ -38,7 +38,6 @@ fn config() -> ReelConfig {
         active_tails: ThreadBudget::threads(1),
         compact_dead_ratio: 0.3,
         scrub_mbps: 0,
-        index: IndexResidency::Paged,
         ..ReelConfig::default()
     }
 }

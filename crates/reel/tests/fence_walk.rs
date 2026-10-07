@@ -21,8 +21,8 @@ use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::units::ByteCount;
 use reel::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, FenceResidency, IndexResidency, KeyWidth, Preallocate,
-    ProbeCounts, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
+    Codec, ColumnId, ColumnSet, ColumnSpec, FenceResidency, KeyWidth, Preallocate, ProbeCounts,
+    RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
 };
 
 const ROWS: ColumnId = ColumnId(1);
@@ -91,7 +91,6 @@ fn filtered_config(fence: FenceResidency, filter_bits: u8) -> ReelConfig {
         preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
-        index: IndexResidency::Paged,
         footer_cache: FOOTER_CACHE,
         filter_bits,
         fence,
@@ -321,7 +320,6 @@ fn standing_runs(runs: u64, filter_bits: u8) -> (ReelStore, Vec<Vec<u64>>) {
         preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
-        index: IndexResidency::Paged,
         footer_cache: FOOTER_CACHE,
         filter_bits,
         fence: FenceResidency::Resident,

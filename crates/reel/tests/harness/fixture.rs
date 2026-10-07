@@ -42,15 +42,9 @@ const COMPACT_EVERY: usize = 10;
 
 /// Steps between merge passes inside a default stream
 ///
-/// Coprime with the cadences above, so a merge lands before, after and between the
-/// compaction passes and the checkpoints rather than always at the same point.
+/// Coprime with the cadence above, so a merge lands before, after and between the
+/// compaction passes over a stream.
 const MERGE_EVERY: usize = 3;
-
-/// Steps between index checkpoints inside a default stream
-///
-/// Coprime with the compaction cadence: a file written just before a pass retires the
-/// segments it names is the case the reopens have to survive.
-const CHECKPOINT_EVERY: usize = 7;
 
 pub struct Differential {
     /// The step and op a divergence is reported against
@@ -61,9 +55,6 @@ pub struct Differential {
 
     /// Whether the stream runs compaction passes, off for a merging run
     is_compacting: bool,
-
-    /// Whether the stream writes the reel's index down as it goes
-    is_checkpointing: bool,
 
     /// The seed this run was drawn from, so a failure names the stream to replay
     seed: u64,
@@ -85,9 +76,6 @@ pub struct Differential {
 
     /// Keys the reel has handed over to a footer across the whole run
     paged_out: usize,
-
-    /// Keys the reel wrote into index checkpoints across the whole run
-    checkpointed_keys: u64,
 }
 
 impl Differential {
@@ -106,7 +94,6 @@ impl Differential {
             at_step: None,
             merged_before: 0,
             is_compacting: true,
-            is_checkpointing: false,
             seed,
             memory: MemoryStore::new(),
             reel,
@@ -114,7 +101,6 @@ impl Differential {
             reel_config,
             reel_plan: FaultPlan::new(seed),
             paged_out: 0,
-            checkpointed_keys: 0,
         }
     }
 
@@ -128,17 +114,6 @@ impl Differential {
         Differential {
             is_compacting: false,
             ..Differential::open(seed, reel_config)
-        }
-    }
-
-    /// The same run, writing the reel's index down at a cadence of the stream's
-    ///
-    /// Nothing on the volume schedules this, so a run that wants the reopens to read
-    /// a file back says so here.
-    pub fn checkpointing(self) -> Differential {
-        Differential {
-            is_checkpointing: true,
-            ..self
         }
     }
 
@@ -171,11 +146,6 @@ impl Differential {
     /// Keys the reel has given up to a footer over the whole run
     pub fn paged_out(&self) -> usize {
         self.paged_out
-    }
-
-    /// Keys the reel wrote into index checkpoints over the whole run
-    pub fn checkpointed_keys(&self) -> u64 {
-        self.checkpointed_keys
     }
 
     /// Runs read by key merges over the whole stream, summed across its reopens
@@ -267,9 +237,6 @@ impl Differential {
         for (step, op) in ops.iter().enumerate() {
             self.apply(op);
             self.hand_over_reel();
-            if step % CHECKPOINT_EVERY == CHECKPOINT_EVERY - 1 {
-                self.checkpoint_reel_index();
-            }
             if step % COMPACT_EVERY == COMPACT_EVERY - 1 {
                 self.compact_reel();
             }
@@ -379,20 +346,6 @@ impl Differential {
         self.reel_sim = restored;
     }
 
-    /// Write the reel's index down, on a run that asked for it
-    ///
-    /// The keys are counted across the run so a checkpointing test can tell a run that
-    /// exercised the path from one whose every file stood for nothing.
-    fn checkpoint_reel_index(&mut self) {
-        // A paging volume leaves its sealed keys in the footers and has no resident
-        // index to write down, which the store refuses on.
-        if !self.is_checkpointing || self.reel_config.index.pages() {
-            return;
-        }
-        let taken = self.reel.checkpoint_index().expect("index checkpoint");
-        self.checkpointed_keys += taken.keys;
-    }
-
     /// Bound the reel pass by pass, on a run that compacts
     fn compact_reel(&self) {
         if !self.is_compacting {
@@ -410,9 +363,8 @@ impl Differential {
 
     /// Hand the keys of any newly sealed segment over to their footers
     ///
-    /// A resident volume does nothing here. On a paged volume, running it inside the
-    /// stream rather than at the end is what puts every op after it through a half paged
-    /// index.
+    /// Running it after every op of the stream is what puts every op after it through a
+    /// half paged index.
     fn page_out_reel(&mut self) {
         self.paged_out += self.reel.page_out_sealed().expect("page out sealed");
         // The sweep the maintenance tick would run: agreement is asserted after every op,

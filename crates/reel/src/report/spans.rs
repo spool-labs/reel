@@ -27,9 +27,6 @@ pub struct SpansReport {
     /// The volume's root directory
     pub volume: String,
 
-    /// Whether the open leaves sealed keys in their footers
-    pub is_paged: bool,
-
     /// The columns the volume was opened over
     pub columns: Vec<SpanRow>,
 
@@ -38,9 +35,6 @@ pub struct SpansReport {
 }
 
 /// Ask an open volume what each column has sealed over it
-///
-/// A resident open resolves the sealed keys instead of leaving spans over them,
-/// so every count comes back zero there.
 pub fn spans(engine: &ReelStore) -> SpansReport {
     let index = engine.index();
     let mut columns = Vec::new();
@@ -51,7 +45,6 @@ pub fn spans(engine: &ReelStore) -> SpansReport {
         });
     }
 
-    let is_paged = engine.config().index.pages();
     let mut caveats = Vec::new();
     if columns.is_empty() {
         caveats.push(
@@ -59,16 +52,9 @@ pub fn spans(engine: &ReelStore) -> SpansReport {
                 .fix("pass --column NAME:ID for each column the volume was written with"),
         );
     }
-    if !is_paged {
-        caveats.push(
-            Caveat::new("sealed spans stand only over a paged open, so this one counts none")
-                .fix("--paged"),
-        );
-    }
 
     SpansReport {
         volume: engine.root().display().to_string(),
-        is_paged,
         columns,
         caveats,
     }
@@ -93,10 +79,6 @@ impl Report for SpansReport {
         Doc::new()
             .head(fmt::volume_name(&self.volume))
             .head("spans")
-            .head(match self.is_paged {
-                true => "paged",
-                false => "resident",
-            })
             .verdict(
                 match self.caveats.is_empty() {
                     true => Tone::Plain,

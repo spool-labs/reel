@@ -13,7 +13,7 @@ rather than a measured cell.
 - `compaction/compactor.rs`: selection, the rewrite, the whole-dead drain, the hole
   punch, and the scrub. The scrub evicts a record failing its checksum through the
   same path a read-time failure uses, and settles a segment's dead count when its
-  sweep completes, which is how a paged open's optimistic accounting is trued up.
+  sweep completes, which is how an open's optimistic accounting is trued up.
 - `compaction/pressure.rs`: the tier model, the maintenance reserve, and the rate
   gates for compaction and the scrub.
 - `engine/maintain.rs::maintain_once`, one tick: retry failed seals, publish the
@@ -64,7 +64,7 @@ and a rebuild has to read it back.
 
 **Retire order.** Flush the destination, seal it, have the index forget the segment,
 then mark the file doomed; it unlinks when the last reader's handle drops. The index
-stops naming a segment before the file goes, not after: a paged read chooses its
+forgets a segment before the file goes, since a read of a sealed key chooses its
 segment from a footer search, and the other order offers one already unlinked.
 
 ## Selection and what a rewrite costs
@@ -311,7 +311,7 @@ The last row is the cohort workload: no copies, no charge, the gate never shuts.
 scattered small-record shape no longer breaks the measured column, since 4 KiB records
 ran within 18% of the 1 MiB shape, 806 against 985 MB/s of reads (ccx33, 2026-08-10).
 
-**Four things scale with the volume, and compaction is the least of them.**
+**Three things scale with the volume, and compaction is the least of them.**
 
 1. **The scrub lap**, the only one that changes what the volume promises rather than
    what it costs. `for_scrub` clamps `scrub_mbps` to `compact_mbps`, so a volume
@@ -319,13 +319,10 @@ ran within 18% of the 1 MiB shape, 806 against 985 MB/s of reads (ccx33, 2026-08
    rate, not a measured lap. The cursor is process-local and `scrub_seed` rotates the
    start, but rotation only mitigates a lap shorter than the uptime. Past that,
    integrity coverage is a sampling rate.
-2. **The resident index does not fit.** 95 bytes a key is 2.8 GB at 1 MiB records,
-   11.2 GB at 256 KiB, 44.6 GB at 64 KiB, and `IndexResidency::Resident` is still
-   the default. `Paged` holds about a byte a key, as `index-tier.md` records.
-3. **The tick sweeps every segment.** `index.ranking()` allocates a vector of every
+2. **The tick sweeps every segment.** `index.ranking()` allocates a vector of every
    segment under a read lock and folds two atomics per entry, to choose one target.
    The sweep has not been run at 28,672 segments.
-4. **The reserve is 0.031% of the volume.** `Compactor::new` sizes it as one segment
+3. **The reserve is 0.031% of the volume.** `Compactor::new` sizes it as one segment
    per tail plus one, 9 GiB at the defaults, and the slowdown band is
    `SLOWDOWN_RESERVES` of them, 72 GiB, inside which `foreground_throttle` slows
    writers toward a 5% floor before `can_admit_foreground` refuses. On a volume

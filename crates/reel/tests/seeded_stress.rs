@@ -1,6 +1,6 @@
 //! A seeded walk over both doors, everything drawn from one number
 //!
-//! Caller count, residency, tail count, op mix, batch width, which door each call takes,
+//! Caller count, tail count, op mix, batch width, which door each call takes,
 //! futures dropped mid-flight and the fault plan all come from one u64, so a failure is a
 //! seed anyone can replay. Every stall is bounded and panics with the seed.
 //!
@@ -37,8 +37,8 @@ use reel::format::record::{RecordHeader, HEADER_LEN};
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::{
-    ByteCount, IndexResidency, Preallocate, RecordKey, RecordWrite, ReelConfig, ReelStore,
-    Result as ReelResult, SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
+    ByteCount, Preallocate, RecordKey, RecordWrite, ReelConfig, ReelStore, Result as ReelResult,
+    SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
 };
 
 use harness::wire::{record_key, ID_LEN, TEST_COLUMNS};
@@ -224,9 +224,6 @@ struct Shape {
     /// Caller threads the walk spawns
     callers: u64,
 
-    /// Where the index lives
-    residency: IndexResidency,
-
     /// Active tail threads
     tails: u32,
 
@@ -290,10 +287,6 @@ fn drawn_fault(rng: &mut SmallRng) -> (FaultKind, bool) {
 fn shape_of(seed: u64) -> Shape {
     let mut rng = SmallRng::seed_from_u64(seed);
     let callers = rng.gen_range(2..=5);
-    let residency = match rng.gen_range(0..10) {
-        0..=2 => IndexResidency::Paged,
-        _ => IndexResidency::Resident,
-    };
     let tails = rng.gen_range(1..=4);
 
     let window = callers * ops_per_caller() * 3;
@@ -322,7 +315,6 @@ fn shape_of(seed: u64) -> Shape {
 
     Shape {
         callers,
-        residency,
         tails,
         plan,
         faults,
@@ -346,7 +338,6 @@ fn config(shape: &Shape) -> ReelConfig {
         preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(shape.tails),
-        index: shape.residency,
         compact_dead_ratio: 0.1,
         // A lying plan can leave torn bytes where the index points; verification is what
         // turns serving them into the designed miss.
@@ -604,8 +595,8 @@ fn walk(seed: u64) {
     let shape = shape_of(seed);
     // Captured output only surfaces when a seed fails, which is when the shape is wanted.
     println!(
-        "seed {seed}: {} callers, {:?}, {} tails, {} faults, lies {}, crashes {}",
-        shape.callers, shape.residency, shape.tails, shape.faults, shape.lies, shape.crashes
+        "seed {seed}: {} callers, {} tails, {} faults, lies {}, crashes {}",
+        shape.callers, shape.tails, shape.faults, shape.lies, shape.crashes
     );
     let sim = SimIo::new(shape.plan.clone());
     let root = PathBuf::from("/walk");
@@ -1101,7 +1092,6 @@ fn a_lone_awaited_read_needs_no_pump() {
     let sim = SimIo::new(FaultPlan::new(7));
     let shape = Shape {
         callers: 1,
-        residency: IndexResidency::Resident,
         tails: 1,
         plan: FaultPlan::new(0),
         faults: 0,
@@ -1140,7 +1130,6 @@ fn inline_callers_colliding_on_claims() {
     let root = PathBuf::from("/claims");
     let shape = Shape {
         callers: 4,
-        residency: IndexResidency::Resident,
         tails: 1,
         plan: FaultPlan::new(0),
         faults: 0,
@@ -1211,7 +1200,6 @@ fn a_backlog_of_futures_past_the_tag_table() {
     let root = PathBuf::from("/backlog");
     let shape = Shape {
         callers: 1,
-        residency: IndexResidency::Resident,
         tails: 2,
         plan: FaultPlan::new(0),
         faults: 0,

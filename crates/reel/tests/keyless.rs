@@ -2,7 +2,7 @@
 
 use tempfile::TempDir;
 
-use reel::config::{IndexResidency, ReelConfig, SyncPolicy, ThreadBudget};
+use reel::config::{ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSpec, RecordKey};
 use reel::format::journal::JOURNAL_SUFFIX;
 use reel::units::ByteCount;
@@ -55,7 +55,6 @@ fn config() -> ReelConfig {
         preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
-        index: IndexResidency::Paged,
         ..ReelConfig::default()
     }
 }

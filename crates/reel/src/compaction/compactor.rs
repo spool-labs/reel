@@ -2096,6 +2096,7 @@ mod tests {
 
     use reel_core::Value;
 
+    use std::ops::Bound;
     use std::path::{Path, PathBuf};
     use std::sync::Barrier;
     use std::thread;
@@ -2113,7 +2114,10 @@ mod tests {
     };
     use crate::format::segment_header::SEGMENT_HEADER_SPAN;
     use crate::index::entry::{span_of, Entry};
+    use crate::index::page::KeyPage;
+    use crate::index::paged::FooterSource;
     use crate::index::recovery::rebuild_reel;
+    use crate::index::spot::RecordSource;
     use crate::io::fault::{FaultKind, FaultPlan};
     use crate::io::sim_backend::{DurableImage, SimIo};
     use crate::reel::segment::{FdCache, IoDriver};
@@ -2124,6 +2128,9 @@ mod tests {
     const RECORDS: ColumnId = ColumnId(1);
     const KEY_WIDTH: usize = 34;
     const SEG_HEADER_SPAN: usize = HEADER_LEN + SEGMENT_HEADER_SPAN;
+
+    /// Keys one page of a listing takes
+    const PAGE: usize = 1024;
 
     const COLUMNS: ColumnSet = &[ColumnSpec {
         id: RECORDS,
@@ -2191,8 +2198,7 @@ mod tests {
             1,
         ));
         let reel = Reel::open(Arc::clone(&shared), Vec::new()).expect("open reel");
-        let index =
-            ReelIndex::new(columns, crate::config::IndexResidency::Resident).expect("index");
+        let index = ReelIndex::new(columns).expect("index");
         // What the engine wires at open: the seal reads a segment's tally from these
         // and a landing books its floor into them.
         shared.set_segments(index.segments_handle());
@@ -2231,15 +2237,19 @@ mod tests {
             .expect("remove");
     }
 
-    /// Seal the tail and take the segment off the sealed queue
+    /// Seal the tail, give the index its spans, and take the segment off the sealed queue
     ///
     /// These fixtures hold a reel and an index with no engine between them, and a
     /// segment still owed its spans is left alone by compaction.
     fn seal(fixture: &Fixture) {
         fixture.reel.tails()[0].seal().expect("seal");
         let shared = fixture.reel.shared();
-        let owed = shared.pending_seals();
-        shared.settle_sealed(&owed);
+        let sealed = shared.peek_sealed();
+        for (segment, footer) in &sealed {
+            fixture.index.note_spans(*segment, footer).expect("spans");
+        }
+        let noted: Vec<SegmentId> = sealed.iter().map(|(segment, _)| *segment).collect();
+        shared.settle_sealed(&noted);
     }
 
     fn seg_path(number: u32) -> PathBuf {
@@ -2249,15 +2259,34 @@ mod tests {
     fn rebuilt_from(fixture: &Fixture) -> ReelIndex {
         let image = fixture.sim.durable_image();
         let restored = SimIo::from_image(image);
-        let driver = IoDriver::new(Arc::new(restored));
-        let index = resident_index();
-        rebuild_reel(&driver, &[PathBuf::from(REEL_DIR)], &[false], false, &index)
-            .expect("rebuild");
+        let driver = Arc::new(IoDriver::new(Arc::new(restored)));
+        let index = fresh_index();
+        rebuild_reel(&driver, &[PathBuf::from(REEL_DIR)], &[false], &index).expect("rebuild");
+        let budget = Arc::new(InflightBudget::default());
+        let fd_cache = Arc::new(FdCache::new(DEFAULT_FD_CACHE as usize));
+        let shared = Arc::new(ReelShared::new(
+            PathBuf::from(REEL_DIR),
+            driver,
+            budget,
+            fd_cache,
+            settings(),
+            COLUMNS,
+            1,
+        ));
+        attach(&index, &shared);
         index
     }
 
-    fn resident_index() -> ReelIndex {
-        ReelIndex::new(COLUMNS, crate::config::IndexResidency::Resident).expect("index")
+    fn fresh_index() -> ReelIndex {
+        ReelIndex::new(COLUMNS).expect("index")
+    }
+
+    /// Wire a rebuilt index to its volume the way an open does, so its sealed keys answer
+    fn attach(index: &ReelIndex, shared: &Arc<ReelShared>) {
+        index.set_footers(Arc::clone(shared) as Arc<dyn FooterSource>);
+        index.set_records(Arc::clone(shared) as Arc<dyn RecordSource>);
+        shared.set_segments(index.segments_handle());
+        index.finish_open().expect("finish open");
     }
 
     fn reopen(image: DurableImage, config: ReelConfig) -> Fixture {
@@ -2275,18 +2304,13 @@ mod tests {
             COLUMNS,
             1,
         ));
-        let index = resident_index();
-        let rebuilt = rebuild_reel(
-            driver.as_ref(),
-            &[PathBuf::from(REEL_DIR)],
-            &[false],
-            false,
-            &index,
-        )
-        .expect("rebuild");
+        let index = fresh_index();
+        let rebuilt = rebuild_reel(driver.as_ref(), &[PathBuf::from(REEL_DIR)], &[false], &index)
+            .expect("rebuild");
         shared.lsn.recover_to(rebuilt.highest_lsn);
         shared.recover_next_segment(rebuilt.highest_segment);
         let reel = Reel::open(Arc::clone(&shared), Vec::new()).expect("reopen reel");
+        attach(&index, &shared);
         let compactor = Compactor::new(&config, 0, 0);
         Fixture {
             sim,
@@ -2304,8 +2328,27 @@ mod tests {
             .collect()
     }
 
+    /// Every live key of the record column and where it resolves, from the map and the footers alike
     fn rebuilt_rows(rebuilt: &ReelIndex) -> Vec<(KeyBytes, Entry)> {
-        rebuilt.column(RECORDS).expect("records").held()
+        let mut rows = Vec::new();
+        let mut page = KeyPage::with_lens();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let from = match &after {
+                Some(last) => Bound::Excluded(last.as_slice()),
+                None => Bound::Unbounded,
+            };
+            rebuilt.page(RECORDS, from, PAGE, &mut page).expect("page");
+            for at in 0..page.len() {
+                let key = page.key_ref(at).unwrap_or_default();
+                let entry = page.found_at(at).expect("an entry");
+                rows.push((KeyBytes::new(key).expect("key"), entry));
+            }
+            if page.len() < PAGE {
+                return rows;
+            }
+            after = Some(page.key_at(page.len() - 1));
+        }
     }
 
     /// The bytes of one key, for comparing against a rebuild
@@ -2828,7 +2871,7 @@ mod tests {
     }
 
     /// The op an out of space fault is injected at, past the open's own ops
-    const ENOSPC_AT: u64 = 12;
+    const ENOSPC_AT: u64 = 11;
 
     fn engine_config() -> ReelConfig {
         ReelConfig {

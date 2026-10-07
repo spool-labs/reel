@@ -65,41 +65,6 @@ impl ReelHarness {
         (sim, acknowledged)
     }
 
-    /// Count the boundaries a clean run crossed with an index checkpoint partway
-    pub fn boundary_count_across_index_checkpoint(&self, ops: &[StreamOp], after: usize) -> u64 {
-        let sim = SimIo::new(FaultPlan::new(0));
-        let store = self.open_or_panic(sim.clone());
-        replay_across(&store, &sim, ops, after);
-        store.flush().ok();
-        sim.ops()
-    }
-
-    /// Replay a stream under a plan, writing the index down partway through it
-    ///
-    /// A crash either side of the publishing rename has to reopen to the same durable
-    /// prefix a volume that never wrote a file reopens to.
-    pub fn run_across_index_checkpoint(
-        &self,
-        plan: FaultPlan,
-        ops: &[StreamOp],
-        after: usize,
-    ) -> (SimIo, usize) {
-        let sim = SimIo::new(plan);
-        let mut acknowledged = 0;
-        if let Ok(store) = ReelStore::open_with_io(
-            root(),
-            self.config.clone(),
-            self.columns,
-            Arc::new(sim.clone()),
-        ) {
-            acknowledged = replay_across(&store, &sim, ops, after);
-            if !sim.is_crashed() {
-                store.flush().ok();
-            }
-        }
-        (sim, acknowledged)
-    }
-
     /// Reopen read write from a durable image, rebuilding the index
     pub fn reopen(&self, image: DurableImage) -> ReelStore {
         let restored = SimIo::from_image(image);
@@ -115,22 +80,6 @@ impl ReelHarness {
 
 fn root() -> PathBuf {
     PathBuf::from(REEL_ROOT)
-}
-
-/// The same replay with the index written down once the prefix has landed
-fn replay_across(store: &ReelStore, sim: &SimIo, ops: &[StreamOp], after: usize) -> usize {
-    let mut acknowledged = replay(store, sim, &ops[..after.min(ops.len())]);
-    if sim.is_crashed() || acknowledged < after {
-        return acknowledged;
-    }
-    // A crash inside the checkpoint is one of the boundaries under test, so the
-    // refusal it comes back as is the replay stopping rather than the test failing.
-    let _ = store.checkpoint_index();
-    if sim.is_crashed() {
-        return acknowledged;
-    }
-    acknowledged += replay(store, sim, &ops[after.min(ops.len())..]);
-    acknowledged
 }
 
 fn replay(store: &ReelStore, sim: &SimIo, ops: &[StreamOp]) -> usize {

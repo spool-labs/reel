@@ -3,7 +3,7 @@
 A volume holds segments of records. A sealed segment ends in a footer that indexes
 what it took, and an open one keeps the same rows in a journal beside it until its
 seal. A record of 4 KiB or less is its check, its shape and its payload, and its key
-lives only in its row. Beside the segments a paged volume keeps key runs, sorted rows
+lives only in its row. Beside the segments a volume keeps key runs, sorted rows
 its walks read in place of the footers they cover. This document says what the
 fields are for, not what the byte offsets are, which `format/` states once and does
 not need restating.
@@ -245,7 +245,7 @@ went bad after its seal has nothing that lists its records.
 
 ## Key runs
 
-A paged volume merges its walk's runs into a key run once more than eight stand
+A volume merges its walk's runs into a key run once more than eight stand
 over one key. Its file is `<id>.keys` with a twelve-digit id, written as
 `<id>.keys.part` until it is whole. The writer syncs it, renames it and syncs the
 directory, so a run under its own name is complete. An open unlinks any `.part` it

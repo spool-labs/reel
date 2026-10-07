@@ -17,8 +17,8 @@ use reel::format::record::KEYLESS_PREFIX;
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::{
-    ByteCount, IndexResidency, Preallocate, RecordWrite, ReelConfig, ReelStore, RepairPath,
-    SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
+    ByteCount, Preallocate, RecordWrite, ReelConfig, ReelStore, RepairPath, SyncPolicy,
+    ThreadBudget, SEGMENT_SUFFIX,
 };
 use reel_core::{Direction, Store, Value};
 use reel_mock::MemoryStore;
@@ -49,12 +49,6 @@ const CRASH_LEN: usize = 5;
 /// tails add is the version guard ordering records several appenders committed
 /// independently.
 const MULTI_TAIL_SEEDS: &[u64] = &[1, 42];
-
-/// Seeds the index checkpoint enumeration draws its stream from
-///
-/// One, because the checkpoint is most of the io the stream crosses: a cue seals every
-/// tail and the file is written, synced and published, and every boundary is a replay.
-const CHECKPOINT_SEEDS: &[u64] = &[1];
 
 /// Seeds the scatter enumeration draws its streams from, narrower because scatter
 /// already replays every stream at two sector sizes
@@ -211,31 +205,6 @@ fn every_boundary_multi_tail() {
     }
 }
 
-// every crash boundary of a stream that writes its index down reproduces the prefix
-//
-// A crash mid-write leaves a half file the reopen must refuse, and a crash after it
-// leaves a whole file describing a volume the rest of the stream has moved past, so the
-// segments it vouches for have to be exactly the ones still standing unchanged.
-#[test]
-fn every_boundary_across_an_index_checkpoint() {
-    for seed in CHECKPOINT_SEEDS {
-        let ops = op_stream::generate_durable(*seed, CRASH_LEN);
-        let config = crash_config(1, SyncPolicy::EveryPut, SEGMENT_SMALL);
-        let harness = ReelHarness::new(config);
-        let after = ops.len() / 2;
-        let total = harness.boundary_count_across_index_checkpoint(&ops, after);
-        assert!(total > 0, "the stream crosses no io boundary");
-
-        for crash_at in 0..total {
-            let plan = FaultPlan::new(*seed).with_crash(crash_at);
-            let (sim, acknowledged) = harness.run_across_index_checkpoint(plan, &ops, after);
-            let reopened = harness.reopen(sim.durable_image());
-            assert_recount(&reopened, crash_at);
-            assert_durable_prefix(&reopened, &ops, acknowledged, crash_at);
-        }
-    }
-}
-
 // under the never policy a crash keeps or drops the last records, both consistent
 #[test]
 fn every_boundary_never() {
@@ -379,10 +348,7 @@ fn every_boundary_spot_index_answers_as_the_footers() {
         .map(|address| RecordKey::from_bytes(RECORDS, &wire_key(GROUP, address)).expect("key"))
         .collect();
     // Unsynced, since the test compares the two read paths over whatever landed
-    let paged = ReelConfig {
-        index: IndexResidency::Paged,
-        ..crash_config(1, SyncPolicy::Never, SEGMENT_SMALL)
-    };
+    let paged = crash_config(1, SyncPolicy::Never, SEGMENT_SMALL);
     let harness = ReelHarness::new(paged);
     let total = harness.boundary_count(&ops);
     assert!(total > 0, "the stream crosses no io boundary");
@@ -415,10 +381,7 @@ fn every_boundary_spot_index_answers_as_the_footers() {
 fn every_boundary_walks_answer_as_the_gets() {
     let ops = sealing_stream();
     let keys: Vec<Vec<u8>> = (1..=6u8).map(|address| wire_key(GROUP, address)).collect();
-    let paged = ReelConfig {
-        index: IndexResidency::Paged,
-        ..crash_config(1, SyncPolicy::Never, SEGMENT_SMALL)
-    };
+    let paged = crash_config(1, SyncPolicy::Never, SEGMENT_SMALL);
     let harness = ReelHarness::with_columns(paged, TEST_COLUMNS);
     let total = harness.boundary_count(&ops);
     assert!(total > 0, "the stream crosses no io boundary");
@@ -963,10 +926,7 @@ fn mid_key_merge() {
 
 /// A paged volume, where a key merge folds the walk once it stacks past the merge depth
 fn key_merge_config() -> ReelConfig {
-    ReelConfig {
-        index: IndexResidency::Paged,
-        ..crash_config(1, SyncPolicy::EveryPut, MERGE_SEG_BYTES)
-    }
+    crash_config(1, SyncPolicy::EveryPut, MERGE_SEG_BYTES)
 }
 
 /// A key's fill in one round of the merge stream

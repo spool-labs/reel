@@ -170,8 +170,7 @@ fn declared_columns_are_counted() {
     let dir = tempfile::tempdir().expect("tempdir");
     let volume = volume(&dir);
 
-    // Paged, since only a paged open leaves the sealed spans standing to count.
-    let cue = run(volume, &["--column", "records:1:32", "--paged", "cue"]);
+    let cue = run(volume, &["--column", "records:1:32", "cue"]);
     assert!(cue.ok, "cue failed: {}", cue.err);
     assert!(
         cue.out.contains("standing covers"),
@@ -265,7 +264,7 @@ fn refuses_an_unknown_volume_tag() {
     );
 }
 
-// a resident stat counts what the volume actually holds
+// a stat counts what the volume actually holds
 #[test]
 fn stat_counts_the_live_records() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -294,24 +293,6 @@ fn stat_counts_the_live_records() {
         "the overwrites should weigh something dead: {}",
         stat.out,
     );
-}
-
-// a paged stat counts the live records as a resident one does
-#[test]
-fn stat_paged_counts_the_live_records() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let volume = volume(&dir);
-
-    let stat = run(volume, &["--column", "records:1:32", "--paged", "stat"]);
-    assert!(stat.ok, "stat failed: {}", stat.err);
-    let row = row(&stat.out, RECORD_CF);
-    // column, id, runs, records, bytes
-    let records: u64 = row
-        .split_whitespace()
-        .nth(3)
-        .and_then(|count| count.parse().ok())
-        .unwrap_or_else(|| panic!("no record count on the column row: {row}"));
-    assert_eq!(records, u64::from(RECORDS), "the paged count parted: {row}");
 }
 
 // a sound volume verifies clean, and says how much it read
@@ -443,27 +424,18 @@ fn flip(path: &Path, at: u64) {
     file.write_all(&[byte[0] ^ 0xFF]).expect("write");
 }
 
-// json output parses, for the commands a script would read
-// spans stand only over a paged open, and say so on a resident one
+// spans count the sealed segments standing over each column
 #[test]
-fn paged_spans() {
+fn spans_count_the_sealed_segments() {
     let dir = tempfile::tempdir().expect("tempdir");
     let volume = volume(&dir);
 
-    let resident = run(volume, &["--column", "records:1:32", "spans"]);
-    assert!(resident.ok, "spans failed: {}", resident.err);
+    let spans = run(volume, &["--column", "records:1:32", "spans"]);
+    assert!(spans.ok, "spans failed: {}", spans.err);
     assert!(
-        resident.out.contains("records") && resident.out.contains("--paged"),
-        "a resident open should name the open that answers: {}",
-        resident.out
-    );
-
-    let paged = run(volume, &["--column", "records:1:32", "--paged", "spans"]);
-    assert!(paged.ok, "paged spans failed: {}", paged.err);
-    assert!(
-        counted(&paged.out, "records") > 0,
-        "a paged open should count the sealed segments: {}",
-        paged.out
+        counted(&spans.out, "records") > 0,
+        "the open should count the sealed segments: {}",
+        spans.out
     );
 }
 
@@ -517,6 +489,7 @@ fn counted(out: &str, label: &str) -> u64 {
         .unwrap_or_else(|| panic!("no figure on the {label} row in:\n{out}"))
 }
 
+// json output parses, for the commands a script would read
 #[test]
 fn json_parses() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -627,10 +600,7 @@ fn caveats_travel_with_the_figures() {
     );
 
     // Declaring the columns answers that one, so it stops being said.
-    let declared = caveats(&json(
-        volume,
-        &["--column", "records:1:32", "--paged", "cue"],
-    ));
+    let declared = caveats(&json(volume, &["--column", "records:1:32", "cue"]));
     assert!(
         !declared
             .iter()

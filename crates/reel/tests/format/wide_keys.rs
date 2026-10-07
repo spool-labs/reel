@@ -9,8 +9,8 @@
 use tempfile::TempDir;
 
 use reel::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, RecordKey, RecordWrite,
-    ReelConfig, ReelStore, SyncPolicy, INLINE_KEY_LEN, MAX_KEY_LEN,
+    Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, RecordWrite, ReelConfig,
+    ReelStore, SyncPolicy, INLINE_KEY_LEN, MAX_KEY_LEN,
 };
 
 /// The column these fixtures write into, taking a key of any width
@@ -40,15 +40,10 @@ const WIDTHS: [usize; 6] = [
 const RUN: u8 = 4;
 
 fn config() -> ReelConfig {
-    residency_config(IndexResidency::Resident)
-}
-
-fn residency_config(index: IndexResidency) -> ReelConfig {
     ReelConfig {
         sync: SyncPolicy::Never,
         // Not under test, and it would take the disk away from what is.
         scrub_mbps: 0,
-        index,
         ..ReelConfig::default()
     }
 }
@@ -169,8 +164,8 @@ fn mixed_key_widths_survive_a_reopen() {
 
 // the same mixed widths read a block at a time rather than from a parsed footer
 //
-// A different reader: the paged path cuts a block of rows up from the start table
-// alone, without the footer around them, so the resident case proves nothing for it.
+// The paged path cuts a block of rows up from the start table alone, without the
+// footer around them.
 #[test]
 fn mixed_key_widths_read_through_the_paged_index() {
     let dir = TempDir::new().expect("tempdir");
@@ -187,8 +182,7 @@ fn mixed_key_widths_read_through_the_paged_index() {
     store.flush().expect("flush");
     drop(store);
 
-    let paged = residency_config(IndexResidency::Paged);
-    let store = ReelStore::open(path, paged, WIDE_COLUMNS).expect("reopen paged");
+    let store = ReelStore::open(path, config(), WIDE_COLUMNS).expect("reopen");
     for width in WIDTHS {
         assert_serves(&store, width, 0..RUN, "from the paged index");
     }

@@ -50,25 +50,6 @@ pub enum SyncPolicy {
     EveryPut,
 }
 
-/// Where a volume keeps the index of the segments it has sealed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-pub enum IndexResidency {
-    /// Every live key in memory, one io per read and a footprint per key
-    Resident,
-
-    /// Sealed keys stay in their footers, memory holds what it takes to find them
-    Paged,
-}
-
-impl IndexResidency {
-    /// Whether sealed keys ever leave the map on this volume
-    pub fn pages(&self) -> bool {
-        matches!(self, IndexResidency::Paged)
-    }
-}
-
 /// Whether a new segment reserves space per step or is pre-written whole
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Deserialize))]
@@ -350,9 +331,6 @@ pub struct ReelConfig {
     /// Whether a new segment reserves per step or is pre-written whole
     pub preallocate: Preallocate,
 
-    /// Where the index of a sealed segment lives, in memory or in its footer
-    pub index: IndexResidency,
-
     /// Durability sync cadence parsed from the sync bytes scalar
     #[cfg_attr(
         feature = "serde",
@@ -415,7 +393,7 @@ pub struct ReelConfig {
     /// Where a sealed segment's fence over its blocks lives, off unless asked for
     pub fence: FenceResidency,
 
-    /// Bytes of sealed-footer state a paged volume keeps at once
+    /// Bytes of sealed-footer state the volume keeps at once
     #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_bytes"))]
     pub footer_cache: ByteCount,
 }
@@ -444,7 +422,6 @@ impl Default for ReelConfig {
             segment_bytes: ByteCount::gb(DEFAULT_SEGMENT_GIB),
             alloc_chunk: ByteCount::mb(DEFAULT_ALLOC_CHUNK_MIB),
             preallocate: Preallocate::Full,
-            index: IndexResidency::Resident,
             sync: SyncPolicy::Never,
             compact_dead_ratio: DEFAULT_COMPACT_DEAD_RATIO,
             compact_mbps: CompactRate::Auto,
@@ -485,23 +462,9 @@ impl ReelConfig {
         self.tail_count().div_ceil(2).min(64)
     }
 
-    /// Bits per key this volume's seals actually spend on filters
-    ///
-    /// Nothing on a resident index, whatever the knob says: such a column answers
-    /// every key from its map and never searches a footer.
-    pub fn seal_filter_bits(&self) -> u8 {
-        match self.index.pages() {
-            true => self.filter_bits,
-            false => 0,
-        }
-    }
-
     /// Whether this volume's seals write a fence over each partition's blocks
-    ///
-    /// Nothing on a resident index, for the reason the filters are nothing there:
-    /// the leads would be bytes written and never read.
     pub fn seal_fences(&self) -> bool {
-        self.index.pages() && self.fence != FenceResidency::Off
+        self.fence != FenceResidency::Off
     }
 
     /// Reject settings the on-disk types or the engine cannot represent

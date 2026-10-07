@@ -6,7 +6,7 @@ use crate::report::doc::{Column, Doc, Row, Table, Tone};
 use crate::report::fmt;
 use crate::report::render::Report;
 
-/// What one column holds, as far as this open can say
+/// What one column holds
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct StatColumn {
@@ -16,14 +16,14 @@ pub struct StatColumn {
     /// The identifier its records are stamped with
     pub id: u8,
 
-    /// Sealed segments a search has to consider, absent on a resident open
-    pub runs: Option<usize>,
+    /// Sealed segments a search has to consider
+    pub runs: usize,
 
-    /// Live records in the column, absent on a paged open
-    pub records: Option<u64>,
+    /// Live records in the column
+    pub records: u64,
 
-    /// Live bytes in the column, absent on a paged open
-    pub bytes: Option<u64>,
+    /// Live bytes in the column
+    pub bytes: u64,
 }
 
 /// The operator numbers for a volume
@@ -54,9 +54,6 @@ pub struct StatReport {
     /// Cue points held open in this process
     pub held_cues: usize,
 
-    /// Whether the open leaves sealed keys in their footers
-    pub is_paged: bool,
-
     /// The columns the volume was opened over
     pub columns: Vec<StatColumn>,
 
@@ -64,10 +61,9 @@ pub struct StatReport {
     pub caveats: Vec<Caveat>,
 }
 
-/// Ask an open volume for the operator numbers, the sealed spans unanswered on a resident open
+/// Ask an open volume for the operator numbers
 pub fn stat(engine: &ReelStore) -> StatReport {
     let index = engine.index();
-    let is_paged = engine.config().index.pages();
     let segments = index.segments_snapshot();
 
     let mut live = 0u64;
@@ -85,9 +81,9 @@ pub fn stat(engine: &ReelStore) -> StatReport {
         columns.push(StatColumn {
             column: spec.name.to_string(),
             id: spec.id.as_u8(),
-            runs: is_paged.then(|| index.sealed_spans(spec.id)),
-            records: totals.map(|totals| totals.count),
-            bytes: totals.map(|totals| totals.bytes.to_bytes()),
+            runs: index.sealed_spans(spec.id),
+            records: totals.count,
+            bytes: totals.bytes.to_bytes(),
         });
     }
 
@@ -103,24 +99,18 @@ pub fn stat(engine: &ReelStore) -> StatReport {
             total => dead as f64 / total as f64,
         },
         held_cues: engine.cue_points().held().len(),
-        is_paged,
-        caveats: caveats(&columns, is_paged),
+        caveats: caveats(&columns),
         columns,
     }
 }
 
 /// What a reader has to know before taking any of these figures for a total
-fn caveats(columns: &[StatColumn], is_paged: bool) -> Vec<Caveat> {
+fn caveats(columns: &[StatColumn]) -> Vec<Caveat> {
     let mut caveats = Vec::new();
     if columns.is_empty() {
         caveats.push(
             Caveat::new("no columns declared, so the per-column numbers count nothing")
                 .fix("pass --column NAME:ID for each column the volume was written with"),
-        );
-    } else if !is_paged {
-        caveats.push(
-            Caveat::new("runs stand only over a paged open, so this one counts none")
-                .fix("--paged"),
         );
     }
     caveats
@@ -134,10 +124,6 @@ impl Report for StatReport {
             .head("stat")
             .head(format!("seq {}", self.sequence))
             .head(fmt::plural(self.segments as u64, "segment", "segments"))
-            .head(match self.is_paged {
-                true => "paged",
-                false => "resident",
-            })
             .verdict(
                 Tone::Plain,
                 format!("{} live", fmt::bytes(self.live_bytes)),
@@ -181,9 +167,9 @@ impl StatReport {
             table = table.row(Row::new([
                 row.column.clone(),
                 row.id.to_string(),
-                fmt::answered(row.runs),
-                fmt::answered(row.records),
-                fmt::answered(row.bytes.map(fmt::bytes)),
+                row.runs.to_string(),
+                row.records.to_string(),
+                fmt::bytes(row.bytes),
             ]));
         }
         table

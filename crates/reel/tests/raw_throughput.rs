@@ -37,14 +37,14 @@ use reel::format::loc::{Loc, SegmentId};
 use reel::format::lsn::Lsn;
 use reel::format::record::checksum;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, IoBackend, KeyWidth,
-    RecordKey, RecordWrite, ReelConfig, ReelIndex, ReelStore, SyncPolicy, ThreadBudget,
-    INLINE_KEY_LEN, MAP_EVERYTHING, MAX_KEY_LEN,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IoBackend, KeyWidth, RecordKey, RecordWrite,
+    ReelConfig, ReelIndex, ReelStore, SyncPolicy, ThreadBudget, INLINE_KEY_LEN, MAP_EVERYTHING,
+    MAX_KEY_LEN,
 };
 
 /// The column this bench writes into
 ///
-/// The shard count matters: the resident index splits a column by leading key bytes, so
+/// The shard count matters: the index splits a column by leading key bytes, so
 /// a column with one shard puts every writer behind one lock and measures that lock.
 const BENCH_COLUMNS: ColumnSet = &[ColumnSpec {
     id: ColumnId(1),
@@ -679,8 +679,7 @@ fn narrow_bytes_per_key(ascending: bool) -> f64 {
     weigh_reset();
     WEIGHING.store(true, Ordering::Relaxed);
 
-    let index = ReelIndex::new(BENCH_COLUMNS, IndexResidency::Resident)
-        .expect("index over the bench column");
+    let index = ReelIndex::new(BENCH_COLUMNS).expect("index over the bench column");
     for at in 0..INDEX_KEYS as u64 {
         let loc = Loc::new(SegmentId((at >> 20) as u32 + 1), at as u32, 65_536);
         let key = if ascending {
@@ -707,8 +706,7 @@ fn index_bytes_per_key(groups: u64) -> f64 {
     weigh_reset();
     WEIGHING.store(true, Ordering::Relaxed);
 
-    let index = ReelIndex::new(TEST_COLUMNS, IndexResidency::Resident)
-        .expect("index over the fixture columns");
+    let index = ReelIndex::new(TEST_COLUMNS).expect("index over the fixture columns");
     for at in 0..INDEX_KEYS as u64 {
         let loc = Loc::new(SegmentId((at >> 20) as u32 + 1), at as u32, 65_536);
         index
@@ -724,8 +722,7 @@ fn index_bytes_per_key(groups: u64) -> f64 {
 
 /// One index pass: every key inserted, then every key resolved, across writers
 fn index_pass(groups: u64, writers: usize, keys: usize) -> (f64, f64) {
-    let index = ReelIndex::new(TEST_COLUMNS, IndexResidency::Resident)
-        .expect("index over the fixture columns");
+    let index = ReelIndex::new(TEST_COLUMNS).expect("index over the fixture columns");
     let per_writer = keys / writers;
 
     let insert_secs = std::thread::scope(|scope| {

@@ -15,8 +15,8 @@ use reel::format::record::HEADER_LEN;
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, Preallocate,
-    ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, ReelConfig,
+    ReelStore, SyncPolicy, ThreadBudget,
 };
 use reel_core::Value;
 
@@ -46,8 +46,8 @@ const REFUSED_RECORD: u32 = 7;
 ///
 /// A plan pins faults to op positions rather than calls, so these are read off a run:
 /// at one tail syncing every put, they are the last two records' writes.
-const TORN_AT: u64 = 19;
-const ENOSPC_AT: u64 = 21;
+const TORN_AT: u64 = 18;
+const ENOSPC_AT: u64 = 20;
 
 /// Payload bytes that survive the tear, behind the header that describes them
 const TORN_PAYLOAD_BYTES: u64 = 8;
@@ -62,7 +62,6 @@ fn config() -> ReelConfig {
         preallocate: Preallocate::Chunk,
         sync: SyncPolicy::EveryPut,
         active_tails: ThreadBudget::threads(1),
-        index: IndexResidency::Resident,
         ..ReelConfig::default()
     }
 }

@@ -29,11 +29,10 @@ pub use compaction::compactor::{CompactionCounters, Compactor, EraseReport};
 pub use compaction::keymerge::MergeReport;
 pub use compaction::pressure::{GcPressure, GcTier, RateLimiter};
 pub use config::{
-    CompactRate, FenceResidency, IndexResidency, IoBackend, PointReads, Preallocate, RangedReads,
-    ReelConfig, RepairPath, RingTuning, SyncPolicy, ThreadBudget, VolumeClass, VolumeSpec,
-    DEFAULT_FD_CACHE, MAP_EVERYTHING,
+    CompactRate, FenceResidency, IoBackend, PointReads, Preallocate, RangedReads, ReelConfig,
+    RepairPath, RingTuning, SyncPolicy, ThreadBudget, VolumeClass, VolumeSpec, DEFAULT_FD_CACHE,
+    MAP_EVERYTHING,
 };
-pub use engine::index_checkpoint::IndexCheckpoint;
 pub use engine::{CompactPass, RecordWrite, ReelStore, Totals};
 pub use error::{ReelError, Result};
 pub use format::band::Band;
@@ -46,7 +45,6 @@ pub use index::entry::Entry;
 pub use index::lockfile::OwnershipLock;
 pub use index::map::ReelIndex;
 pub use index::page::KeyPage;
-pub use index::persisted::PersistedIndex;
 pub use index::playback::{PlaybackCursor, Way};
 pub use index::recovery::{rebuild_reel, RebuiltReel};
 pub use io::ServingBackend;

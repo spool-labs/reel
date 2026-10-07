@@ -1,12 +1,11 @@
-//! A sweep hands out every live key, sealed or not, on a paged volume as on a resident one
+//! A sweep hands out every live key, sealed or not
 
 use std::collections::BTreeMap;
 
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, ReelConfig,
-    ReelStore, SyncPolicy,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
 };
 use reel_core::Store;
 
@@ -39,12 +38,11 @@ fn value_of(n: u64) -> Vec<u8> {
 }
 
 /// A volume holding every key, most of them sealed and handed over, the last few still in the map
-fn filled(dir: &TempDir, index: IndexResidency) -> (ReelStore, BTreeMap<Vec<u8>, Vec<u8>>) {
+fn filled(dir: &TempDir) -> (ReelStore, BTreeMap<Vec<u8>, Vec<u8>>) {
     let config = ReelConfig {
         segment_bytes: ByteCount::from_bytes(64 * 1024),
         alloc_chunk: ByteCount::from_bytes(16 * 1024),
         sync: SyncPolicy::Never,
-        index,
         ..ReelConfig::default()
     };
     let store = ReelStore::open(dir.path().to_path_buf(), config, COLUMNS).expect("open");
@@ -105,9 +103,11 @@ fn sorted<T: Ord>(mut rows: Vec<T>) -> Vec<T> {
     rows
 }
 
-fn check(index: IndexResidency) {
+// a sweep hands out every key, from the footers and the map alike
+#[test]
+fn a_sweep_hands_out_every_key() {
     let dir = TempDir::new().expect("temp dir");
-    let (store, model) = filled(&dir, index);
+    let (store, model) = filled(&dir);
     let whole: Vec<(Vec<u8>, Vec<u8>)> = model.clone().into_iter().collect();
     assert_eq!(
         sorted(sweep_all(&store)),
@@ -141,16 +141,4 @@ fn check(index: IndexResidency) {
         KEYS as usize,
         "a sweep from a foreign mark lost keys"
     );
-}
-
-// a sweep of a paged volume hands out every key, from the footers and the map alike
-#[test]
-fn a_paged_sweep_hands_out_every_key() {
-    check(IndexResidency::Paged);
-}
-
-// a sweep of a resident volume hands out every key
-#[test]
-fn a_resident_sweep_hands_out_every_key() {
-    check(IndexResidency::Resident);
 }

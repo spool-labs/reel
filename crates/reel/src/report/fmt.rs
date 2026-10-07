@@ -29,20 +29,6 @@ pub fn plural(count: u64, one: &str, many: &str) -> String {
     }
 }
 
-/// A figure this open could answer, or a dash where it could not
-///
-/// A cell the open cannot fill is not a zero, and printing one would be a wrong
-/// answer where there is no answer.
-pub fn answered<Figure>(value: Option<Figure>) -> String
-where
-    Figure: std::fmt::Display,
-{
-    match value {
-        Some(value) => value.to_string(),
-        None => "-".to_string(),
-    }
-}
-
 /// A byte count the machine could not tell us
 pub fn maybe_bytes(count: Option<u64>) -> String {
     match count {

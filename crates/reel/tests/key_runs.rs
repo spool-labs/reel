@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use tempfile::TempDir;
 
-use reel::config::{CompactRate, IndexResidency, ReelConfig, SyncPolicy, ThreadBudget};
+use reel::config::{CompactRate, ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec};
 use reel::units::ByteCount;
 use reel::{CompactPass, KeyWidth, Preallocate, ReelStore};
@@ -54,7 +54,6 @@ fn config(tails: u32, dead_ratio: f64) -> ReelConfig {
         preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(tails),
-        index: IndexResidency::Paged,
         compact_dead_ratio: dead_ratio,
         compact_mbps: CompactRate::Mbps(100_000),
         ..ReelConfig::default()

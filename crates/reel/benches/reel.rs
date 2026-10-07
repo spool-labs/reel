@@ -23,8 +23,8 @@ use reel::format::record::{checksum, RecordHeader};
 use reel::io::posix_backend::PosixBackend;
 use reel::reel::segment::IoDriver;
 use reel::{
-    rebuild_reel, ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth,
-    Preallocate, RecordKey, ReelConfig, ReelIndex, ReelStore, SyncPolicy, ThreadBudget,
+    rebuild_reel, ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate,
+    RecordKey, ReelConfig, ReelIndex, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 const RECORDS: ColumnId = ColumnId(1);
@@ -443,18 +443,12 @@ fn recovery(c: &mut Criterion) {
         group.bench_function(
             BenchmarkId::from_parameter(format!("{chunk_mib}MiB_chunk")),
             |b| {
-                let index = ReelIndex::new(COLUMNS, IndexResidency::Resident).expect("index");
+                let index = ReelIndex::new(COLUMNS).expect("index");
                 b.iter(|| {
                     let driver = IoDriver::new(Arc::new(PosixBackend::new()));
                     black_box(
-                        rebuild_reel(
-                            &driver,
-                            std::slice::from_ref(&reel_dir),
-                            &[false],
-                            false,
-                            &index,
-                        )
-                        .expect("rebuild"),
+                        rebuild_reel(&driver, std::slice::from_ref(&reel_dir), &[false], &index)
+                            .expect("rebuild"),
                     )
                 })
             },
@@ -485,7 +479,7 @@ fn scrub_scan(c: &mut Criterion) {
     group.finish();
 }
 
-/// Playbacks over the resident index
+/// Playbacks over the index
 ///
 /// The two key counts separate a cost paid per page from a cost paid per key: a
 /// per-page cost shrinks as a fraction of the playback as the group grows.

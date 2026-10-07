@@ -51,7 +51,7 @@ Compaction, index paging, tombstone pruning, merges, and the scrub run only insi
 
 ## Crates and features
 
-`tape-reel-core` holds the `Store` trait, `TypedStore`, and write batches. `tape-reel-cli` builds
+`tape-reel-core` holds the `Store` trait and write batches. `tape-reel-cli` builds
 the `reel` binary to inspect, verify, and checkpoint a volume ([README](crates/reel-cli/README.md)).
 `tape-reel-mock` is an in-memory `Store` for tests and stays unpublished.
 

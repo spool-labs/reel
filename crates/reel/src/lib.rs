@@ -18,8 +18,8 @@ pub mod sync;
 pub mod units;
 
 pub use reel_core::{
-    BatchOp, CfDiskUsage, Column, Direction, DiskVolume, Error as StoreError, KeyValue,
-    Result as StoreResult, Store, StoreIter, StoreVolume, TypedStore, Value, WriteBatch,
+    BatchOp, CfDiskUsage, Direction, DiskVolume, Error as StoreError, KeyValue,
+    Result as StoreResult, Store, StoreIter, StoreVolume, Value, WriteBatch,
 };
 
 pub use append::{Appender, BatchRecord, BatchWrite, Committed, CopyRecord, Durability, FlushTurn};

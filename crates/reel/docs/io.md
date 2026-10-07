@@ -348,9 +348,9 @@ the whole file costs 28% of that. What it buys back is nothing, since one file o
 ever matches a file per writer, which is where segments already sit.
 
 **Preallocation earns that keep only on a shared inode.** With a file per tail,
-reserved, chunked and bare land inside the run-to-run spread of each other, so
-`Preallocate` is a question about when ENOSPC arrives and how many blocks sit idle,
-not about throughput.
+reserved, chunked and bare land inside the run-to-run spread of each other. How a
+segment reserves its blocks decides when ENOSPC arrives and how many blocks sit idle.
+It does not move throughput.
 
 ## Why dropping pages is not a knob
 

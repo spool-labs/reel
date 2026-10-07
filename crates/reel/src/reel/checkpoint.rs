@@ -95,7 +95,6 @@ pub fn checkpoint_name(target: &Path) -> Result<&std::ffi::OsStr> {
     let reserved = segment_number(&text).is_some()
         || text == crate::reel::volumes::MANIFEST_NAME
         || text == crate::reel::volumes::MARKER_NAME
-        || text == crate::index::persisted::PERSISTED_INDEX
         || text == crate::engine::LOCK_FILE;
     if reserved {
         return Err(ReelError::Rejected(format!(

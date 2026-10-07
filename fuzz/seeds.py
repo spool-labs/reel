@@ -8,7 +8,7 @@ import sys
 import tarfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TARGETS = ("format_parsers", "codec_roundtrip", "persisted_index", "store_ops")
+TARGETS = ("format_parsers", "codec_roundtrip", "store_ops")
 MTIME = 946684800
 
 

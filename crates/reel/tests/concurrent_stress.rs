@@ -22,8 +22,8 @@ use reel::index::map::KeySites;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, Preallocate,
-    RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelConfig, ReelStore,
+    SyncPolicy, ThreadBudget,
 };
 
 const RECORDS: ColumnId = ColumnId(1);
@@ -113,22 +113,9 @@ const LEN_SPREAD: usize = 700;
 /// storm fits inside would leave the run checking nothing.
 const SEGMENT_BYTES: u64 = 16 * 1024;
 
-/// The same volume with its sealed keys in footers rather than in the map
-///
-/// The intersection nothing else covers: the paged streams elsewhere are single threaded,
-/// so a seal there can never race a read.
-fn paged_config() -> ReelConfig {
-    ReelConfig {
-        index: IndexResidency::Paged,
-        ..config()
-    }
-}
-
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT_BYTES),
-        alloc_chunk: ByteCount::from_bytes(16 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(2),
         // A dead segment should be worth rewriting quickly, so the compactor repoints
@@ -508,8 +495,15 @@ fn sim_backend_storm() {
             .expect("open"),
     );
 
-    let (written, _paged) = storm(&store);
+    let (written, paged) = storm(&store);
     store.flush().expect("flush");
+    // Counted across the run rather than read off the end: compaction retires a sealed
+    // segment as readily as a tail makes one, so a run that paged plenty can finish
+    // holding nothing sealed at all.
+    assert!(
+        paged > 0,
+        "no key reached a footer, so the storm raced no handover"
+    );
     assert_raced(&store, &written);
     let live = view(&store);
     drop(store);
@@ -521,36 +515,6 @@ fn sim_backend_storm() {
     assert_settles(&live, &view(&reopened), &written);
 }
 
-// the same storm with the sealed keys in footers, which nothing else races
-#[test]
-fn paged_sim_backend_storm() {
-    let sim = SimIo::new(FaultPlan::new(1));
-    let root = PathBuf::from("/paged");
-    let store = Arc::new(
-        ReelStore::open_with_io(root.clone(), paged_config(), COLUMNS, Arc::new(sim.clone()))
-            .expect("open"),
-    );
-
-    let (written, paged) = storm(&store);
-    store.flush().expect("flush");
-    // Counted across the run rather than read off the end: compaction retires a sealed
-    // segment as readily as a tail makes one, so a run that paged plenty can finish
-    // holding nothing sealed at all.
-    assert!(
-        paged > 0,
-        "no key reached a footer, so this raced a resident index"
-    );
-    assert_raced(&store, &written);
-    let live = view(&store);
-    drop(store);
-
-    let restored = SimIo::from_image(sim.durable_image());
-    let reopened =
-        ReelStore::open_with_io(root, paged_config(), COLUMNS, Arc::new(restored)).expect("reopen");
-
-    assert_settles(&live, &view(&reopened), &written);
-}
-
 // the same storm against real descriptors, real unlinks, and the real page cache
 #[test]
 fn posix_backend_storm() {
@@ -558,36 +522,17 @@ fn posix_backend_storm() {
     let store =
         Arc::new(ReelStore::open(dir.path().to_path_buf(), config(), COLUMNS).expect("open"));
 
-    let (written, _paged) = storm(&store);
-    store.flush().expect("flush");
-    assert_raced(&store, &written);
-    let live = view(&store);
-    drop(store);
-
-    let reopened = ReelStore::open(dir.path().to_path_buf(), config(), COLUMNS).expect("reopen");
-
-    assert_settles(&live, &view(&reopened), &written);
-}
-
-// paged keys, real descriptors and a reopen, which nothing else puts together
-#[test]
-fn paged_posix_backend_storm() {
-    let dir = TempDir::new().expect("tempdir");
-    let store =
-        Arc::new(ReelStore::open(dir.path().to_path_buf(), paged_config(), COLUMNS).expect("open"));
-
     let (written, paged) = storm(&store);
     store.flush().expect("flush");
     assert!(
         paged > 0,
-        "no key reached a footer, so this raced a resident index"
+        "no key reached a footer, so the storm raced no handover"
     );
     assert_raced(&store, &written);
     let live = view(&store);
     drop(store);
 
-    let reopened =
-        ReelStore::open(dir.path().to_path_buf(), paged_config(), COLUMNS).expect("reopen");
+    let reopened = ReelStore::open(dir.path().to_path_buf(), config(), COLUMNS).expect("reopen");
 
     assert_settles(&live, &view(&reopened), &written);
 }

@@ -23,7 +23,7 @@ use tempfile::TempDir;
 use reel::config::{ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec};
 use reel::units::ByteCount;
-use reel::{Direction, KeyWidth, Preallocate, ReelStore, Store, Value, WriteBatch};
+use reel::{Direction, KeyWidth, ReelStore, Store, Value, WriteBatch};
 
 thread_local! {
     /// Allocator calls this thread has made since the last reading
@@ -126,8 +126,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(64),
-        alloc_chunk: ByteCount::mb(1),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         ..ReelConfig::default()

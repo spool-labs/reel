@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::config::{Preallocate, RangedReads, DEFAULT_FD_CACHE};
+use crate::config::{RangedReads, DEFAULT_FD_CACHE};
 use crate::units::ByteCount;
 
 /// Facts about the machine and the device a volume sits on
@@ -94,9 +94,6 @@ pub struct Verdict {
     /// The plane a window of a large record is read on, which follows the volume's
     pub ranged_reads: RangedReads,
 
-    /// Chunk where the idle reservation is a large share of the filesystem
-    pub preallocate: Preallocate,
-
     /// Sealed descriptors the reader cache may hold under this process's limit
     pub fd_cache: u64,
 
@@ -112,11 +109,6 @@ pub struct Verdict {
 /// Not centred, because the errors are not the same size: wrongly direct gives up
 /// an order of magnitude on a warm set, wrongly buffered a fraction on a cold one.
 pub const DIRECT_AT_OCCUPANCY_RATIO: f64 = 1.5;
-
-/// Share of a filesystem the idle reservation may take before it stops pre-writing
-///
-/// The default reservation is nothing on a large disk and absurd on a small one.
-const RESERVATION_SHARE_OF_CAPACITY: u64 = 8;
 
 /// Times the device's readahead a record must clear before a mapping pays
 ///
@@ -167,7 +159,7 @@ impl MachineFacts {
     }
 
     /// What plane these facts argue for
-    pub fn verdict(&self, idle_reservation_bytes: u64) -> Verdict {
+    pub fn verdict(&self) -> Verdict {
         // What the volume holds, not what the disk could take: a large disk
         // holding little argues for direct on a set that fits in memory.
         let (plane, because) = match self.occupied_over_memory() {
@@ -194,24 +186,9 @@ impl MachineFacts {
                 true => RangedReads::Direct,
                 false => RangedReads::Cached,
             },
-            preallocate: self.preallocate_for(idle_reservation_bytes),
             fd_cache: self.fd_cache_for(is_direct),
             because,
             map_because,
-        }
-    }
-
-    /// Whether a whole segment may be pre-written at creation
-    ///
-    /// Full reserves real blocks before a byte is written, so it turns on the share
-    /// of the filesystem that takes rather than the absolute size.
-    fn preallocate_for(&self, idle_reservation_bytes: u64) -> Preallocate {
-        let Some(capacity) = self.volume_capacity_bytes else {
-            return Preallocate::Chunk;
-        };
-        match capacity / RESERVATION_SHARE_OF_CAPACITY >= idle_reservation_bytes {
-            true => Preallocate::Full,
-            false => Preallocate::Chunk,
         }
     }
 
@@ -588,7 +565,7 @@ mod tests {
         };
 
         assert_eq!(
-            facts.verdict(0).map_above,
+            facts.verdict().map_above,
             Some(ByteCount::from_bytes(2 * 1024 * 1024)),
         );
     }
@@ -604,7 +581,7 @@ mod tests {
         };
 
         assert_eq!(
-            facts.verdict(0).map_above,
+            facts.verdict().map_above,
             Some(ByteCount::from_bytes(DEFAULT_READAHEAD_BYTES * 16)),
         );
     }
@@ -618,7 +595,7 @@ mod tests {
             volume_bytes: Some(1 << 30),
             ..MachineFacts::default()
         };
-        let verdict = roomy_disk.verdict(0);
+        let verdict = roomy_disk.verdict();
 
         assert_eq!(
             verdict.plane,
@@ -640,7 +617,7 @@ mod tests {
             volume_capacity_bytes: Some(32 << 30),
             ..roomy_disk
         };
-        assert!(small_disk.verdict(0).map_above.is_some());
+        assert!(small_disk.verdict().map_above.is_some());
     }
 
     // a machine that will not say its capacity cannot claim a mapping fits
@@ -651,7 +628,7 @@ mod tests {
             volume_bytes: Some(1),
             ..MachineFacts::default()
         };
-        let verdict = facts.verdict(0);
+        let verdict = facts.verdict();
 
         assert_eq!(verdict.map_above, None);
         assert!(
@@ -674,8 +651,8 @@ mod tests {
             ..under
         };
 
-        assert_eq!(under.verdict(0).plane, Plane::Buffered);
-        assert_eq!(over.verdict(0).plane, Plane::Direct);
+        assert_eq!(under.verdict().plane, Plane::Buffered);
+        assert_eq!(over.verdict().plane, Plane::Direct);
     }
 
     // a direct verdict says mappings are off, since validation refuses the pair
@@ -687,14 +664,14 @@ mod tests {
             volume_bytes: Some(64 * 2),
             ..MachineFacts::default()
         }
-        .verdict(0);
+        .verdict();
         let buffered = MachineFacts {
             memory_bytes: Some(64),
             volume_capacity_bytes: Some(64),
             volume_bytes: Some(64),
             ..MachineFacts::default()
         }
-        .verdict(0);
+        .verdict();
 
         assert_eq!(direct.plane, Plane::Direct);
         assert_eq!(direct.map_above, None, "direct refuses the pairing");
@@ -718,7 +695,7 @@ mod tests {
             open_file_limit: Some(256),
             ..MachineFacts::default()
         };
-        assert_eq!(tight.verdict(0).fd_cache, 128, "half the limit, buffered");
+        assert_eq!(tight.verdict().fd_cache, 128, "half the limit, buffered");
 
         let direct = MachineFacts {
             memory_bytes: Some(1),
@@ -727,7 +704,7 @@ mod tests {
             ..MachineFacts::default()
         };
         assert_eq!(
-            direct.verdict(0).fd_cache,
+            direct.verdict().fd_cache,
             64,
             "halved again, two per segment"
         );
@@ -737,29 +714,9 @@ mod tests {
             ..MachineFacts::default()
         };
         assert_eq!(
-            roomy.verdict(0).fd_cache,
+            roomy.verdict().fd_cache,
             DEFAULT_FD_CACHE,
             "never above the default"
-        );
-    }
-
-    // a reservation that would claim a large share of the disk stops pre-writing
-    #[test]
-    fn a_small_disk_does_not_pre_write_whole_segments() {
-        let facts = MachineFacts {
-            volume_capacity_bytes: Some(64),
-            ..MachineFacts::default()
-        };
-
-        assert_eq!(
-            facts.verdict(8).preallocate,
-            Preallocate::Full,
-            "an eighth fits"
-        );
-        assert_eq!(
-            facts.verdict(9).preallocate,
-            Preallocate::Chunk,
-            "past an eighth"
         );
     }
 
@@ -771,24 +728,16 @@ mod tests {
             volume_bytes: Some(64),
             ..MachineFacts::default()
         }
-        .verdict(0);
+        .verdict();
         let buffered = MachineFacts {
             memory_bytes: Some(64),
             volume_bytes: Some(64),
             ..MachineFacts::default()
         }
-        .verdict(0);
+        .verdict();
 
         assert_eq!(direct.ranged_reads, RangedReads::Direct);
         assert_eq!(buffered.ranged_reads, RangedReads::Cached);
-    }
-
-    // an unreadable root leaves no capacity, so it cannot claim a share of one
-    #[test]
-    fn no_capacity_does_not_pre_write() {
-        let facts = MachineFacts::default();
-
-        assert_eq!(facts.verdict(0).preallocate, Preallocate::Chunk);
     }
 
     // an empty volume is not evidence its set is small
@@ -801,14 +750,14 @@ mod tests {
             ..MachineFacts::default()
         };
 
-        assert_eq!(fresh.verdict(0).plane, Plane::Buffered);
-        assert!(fresh.verdict(0).because.contains("nothing written"));
+        assert_eq!(fresh.verdict().plane, Plane::Buffered);
+        assert!(fresh.verdict().because.contains("nothing written"));
     }
 
     // no facts is not a reason to give up the plane that wins warm
     #[test]
     fn nothing_known_keeps_the_warm_plane() {
-        let verdict = MachineFacts::default().verdict(0);
+        let verdict = MachineFacts::default().verdict();
 
         assert_eq!(verdict.plane, Plane::Buffered);
         assert!(verdict.because.contains("nothing written"));

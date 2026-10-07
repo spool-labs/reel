@@ -2,11 +2,11 @@
 
 use tempfile::TempDir;
 
-use reel::config::{IndexResidency, ReelConfig, SyncPolicy, ThreadBudget};
+use reel::config::{ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSpec, RecordKey};
 use reel::format::journal::JOURNAL_SUFFIX;
 use reel::units::ByteCount;
-use reel::{KeyWidth, Preallocate, ReelStore, SEGMENT_SUFFIX};
+use reel::{KeyWidth, ReelStore, SEGMENT_SUFFIX};
 
 const RECORDS: ColumnId = ColumnId(1);
 
@@ -51,11 +51,8 @@ fn value(at: u64) -> Vec<u8> {
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(64 * 1024),
-        alloc_chunk: ByteCount::from_bytes(16 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
-        index: IndexResidency::Paged,
         ..ReelConfig::default()
     }
 }

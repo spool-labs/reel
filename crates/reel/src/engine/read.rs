@@ -463,7 +463,7 @@ impl ReelStore {
         }
     }
 
-    /// Advance the resident index to what the volume holds now
+    /// Advance the index to what the volume holds now
     ///
     /// How a read-only open picks up appends and sees compaction move records. The
     /// pass reads from where the last one stopped, so one append costs that append.
@@ -516,13 +516,7 @@ impl ReelStore {
         let dead: Vec<bool> = std::iter::once(false)
             .chain(self.config.volumes.iter().map(|volume| volume.dead))
             .collect();
-        let rebuilt = rebuild_reel(
-            &self.driver,
-            &roots,
-            &dead,
-            self.config.index.pages(),
-            &self.index,
-        )?;
+        let rebuilt = rebuild_reel(&self.driver, &roots, &dead, &self.index)?;
         self.index.finish_open()?;
         let mut cursor = lock(&self.cursor);
         *cursor = LogCursor::new();
@@ -550,15 +544,9 @@ impl ReelStore {
         if self.is_read_only {
             return Err(read_only());
         }
-        // A cue seals so everything it can see has a footer, so it settles what those
-        // seals leave behind before anything reads through it.
-        self.settle_sealed()?;
         for tail in self.reel.tails() {
             tail.seal()?;
         }
-        // The seal alone leaves the segments unrecorded, and a read here has to know
-        // which of them could hold a key.
-        self.hold_sealed()?;
         // peek names the number the next write will take, so cueing at peek would
         // include a write that has not happened yet.
         let at = Lsn(self.reel.shared().lsn.peek().as_u64().saturating_sub(1));
@@ -607,8 +595,8 @@ impl ReelStore {
 
     /// Fill a buffer with one bounded page of a column's keys, ascending
     ///
-    /// A paged column reads footers to fill a page, so a page can fail where a
-    /// resident one never could, and the failure is reported rather than swallowed.
+    /// A column reads footers to fill a page, so a page can fail, and the failure goes
+    /// back to the caller.
     pub fn page(
         &self,
         column: ColumnId,

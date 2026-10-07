@@ -26,7 +26,7 @@ use serde::Serialize;
 
 use reel::report::render::{self, Report};
 use reel::report::{checkpoint, cue, doctor, spans, spec, stat, verify};
-use reel::{IndexResidency, ReelConfig, ReelStore};
+use reel::{ReelConfig, ReelStore};
 
 use term::ColorChoice;
 
@@ -81,8 +81,7 @@ where
         ownership lock, so it reads a volume something else is writing.\n\n\
         A volume's columns are the declaration of whatever wrote it, and no \
         part of a segment file names them, so the per-column figures count only \
-        what `--column` declares. A figure an open could not count comes back as \
-        a dash and a note saying so, never as a zero.",
+        what `--column` declares.",
     version
 )]
 struct Cli {
@@ -102,14 +101,6 @@ struct Cli {
     /// the column is that many bytes wide. Only declared columns are counted.
     #[arg(long = "column", value_name = "NAME:ID[:WIDTH]")]
     columns: Vec<String>,
-
-    /// Leave the sealed keys in their footers instead of holding every live key
-    /// in memory. What a volume larger than the memory here needs, and what
-    /// counts the sealed segments standing over each column. It costs the exact
-    /// figures: the dead bytes read as a floor and the per-column record counts
-    /// fall to what the tails hold.
-    #[arg(long)]
-    paged: bool,
 
     /// Output format.
     #[arg(short, long, default_value = "text")]
@@ -199,7 +190,7 @@ fn run(cli: &Cli) -> Fallible<ExitCode> {
 /// which is what keeps it out of a terminal's scrollback as well as out of a
 /// redirected stream.
 fn sweep(cli: &Cli, limit: usize) -> Fallible<ExitCode> {
-    let store = cli.open_named()?;
+    let store = cli.open()?;
     let mut bar = progress::Bar::new("SWEPT", term::watch(cli.color, &stderr()));
     let swept = verify::verify_watched(&store, limit, &mut |swept| bar.show(swept.fraction()));
     bar.done();
@@ -225,34 +216,10 @@ impl Cli {
     /// parsed before anything is opened, so a bad flag fails without touching a
     /// disk. A verb that wants one of the declared columns by name asks the
     /// opened store for it rather than re-reading the flags.
-    ///
-    /// Resident by default, because the numbers are the point: a paged rebuild
-    /// attributes no bytes to the sealed segments it leaves in their footers, so
-    /// the dead figures come back a floor. Paged answers the one thing resident
-    /// cannot, the sealed segments standing over a column, and is what a volume
-    /// larger than this machine's memory has to use.
     fn open(&self) -> Fallible<ReelStore> {
         Ok(ReelStore::open_read_only(
             self.path.clone(),
-            self.config(match self.paged {
-                true => IndexResidency::Paged,
-                false => IndexResidency::Resident,
-            })?,
-            spec::columns(&self.columns)?,
-        )?)
-    }
-
-    /// Open with every sealed segment named, whatever the flags asked for
-    ///
-    /// A resident open lists only the segments still holding a live key, so a
-    /// segment whose every record has been superseded is absent from its table.
-    /// A sweep reading that as the volume's segment list would call those files
-    /// strangers. Paged names them all, and a sweep wants none of the resident
-    /// figures anyway.
-    fn open_named(&self) -> Fallible<ReelStore> {
-        Ok(ReelStore::open_read_only(
-            self.path.clone(),
-            self.config(IndexResidency::Paged)?,
+            self.config()?,
             spec::columns(&self.columns)?,
         )?)
     }
@@ -261,18 +228,14 @@ impl Cli {
     fn open_primary(&self) -> Fallible<ReelStore> {
         Ok(ReelStore::open(
             self.path.clone(),
-            self.config(match self.paged {
-                true => IndexResidency::Paged,
-                false => IndexResidency::Resident,
-            })?,
+            self.config()?,
             spec::columns(&self.columns)?,
         )?)
     }
 
-    fn config(&self, index: IndexResidency) -> Fallible<ReelConfig> {
+    fn config(&self) -> Fallible<ReelConfig> {
         Ok(ReelConfig {
             volumes: spec::volumes(&self.volumes)?,
-            index,
             ..ReelConfig::default()
         })
     }

@@ -20,7 +20,7 @@ mod harness;
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 
-use reel::{ByteCount, Preallocate, ReelConfig, SyncPolicy, ThreadBudget};
+use reel::{ByteCount, ReelConfig, SyncPolicy, ThreadBudget};
 
 use harness::fixture::Differential;
 use harness::op_stream::{StreamOp, ADDRESS_SPACE, GROUPS, MAX_LEN, MIN_LEN};
@@ -35,9 +35,6 @@ const MAX_OPS: usize = 64;
 /// Segment size that rolls a few times over a case, the differential suite's own
 const SEGMENT_BYTES: u64 = 64 * 1024;
 
-/// Space reserved ahead of the write head per allocation step
-const ALLOC_CHUNK: u64 = 4 * 1024;
-
 /// Tails the case drives, at four because that is what puts every insert through the
 /// version guard
 const TAILS: u32 = 4;
@@ -45,8 +42,6 @@ const TAILS: u32 = 4;
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT_BYTES),
-        alloc_chunk: ByteCount::from_bytes(ALLOC_CHUNK),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(TAILS),
         ..ReelConfig::default()

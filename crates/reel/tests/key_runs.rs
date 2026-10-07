@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 
 use tempfile::TempDir;
 
-use reel::config::{CompactRate, IndexResidency, ReelConfig, SyncPolicy, ThreadBudget};
+use reel::config::{CompactRate, ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec};
 use reel::units::ByteCount;
-use reel::{CompactPass, KeyWidth, Preallocate, ReelStore};
+use reel::{CompactPass, KeyWidth, ReelStore};
 use reel_core::{Direction, Store};
 
 const COLUMNS: ColumnSet = &[ColumnSpec {
@@ -50,11 +50,8 @@ const RECLAIM: f64 = 0.1;
 fn config(tails: u32, dead_ratio: f64) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(96 * 1024),
-        alloc_chunk: ByteCount::from_bytes(32 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(tails),
-        index: IndexResidency::Paged,
         compact_dead_ratio: dead_ratio,
         compact_mbps: CompactRate::Mbps(100_000),
         ..ReelConfig::default()

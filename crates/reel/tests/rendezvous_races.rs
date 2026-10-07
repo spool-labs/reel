@@ -16,9 +16,8 @@ use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::sync::rendezvous;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, IndexResidency, KeyPage,
-    KeyWidth, PlaybackCursor, Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy,
-    ThreadBudget, Way,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, KeyPage, KeyWidth,
+    PlaybackCursor, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget, Way,
 };
 
 const COLUMNS: ColumnSet = &[ColumnSpec {
@@ -30,14 +29,11 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     codec: Codec::None,
 }];
 
-fn config(index: IndexResidency) -> ReelConfig {
+fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(128 * 1024),
-        alloc_chunk: ByteCount::from_bytes(32 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
-        index,
         ..ReelConfig::default()
     }
 }
@@ -55,19 +51,14 @@ const SHARDED: ColumnSet = &[ColumnSpec {
     codec: Codec::None,
 }];
 
-fn open(root: &str, seed: u64, index: IndexResidency) -> Arc<ReelStore> {
-    open_columns(root, seed, index, COLUMNS)
+fn open(root: &str, seed: u64) -> Arc<ReelStore> {
+    open_columns(root, seed, COLUMNS)
 }
 
-fn open_columns(
-    root: &str,
-    seed: u64,
-    index: IndexResidency,
-    columns: ColumnSet,
-) -> Arc<ReelStore> {
+fn open_columns(root: &str, seed: u64, columns: ColumnSet) -> Arc<ReelStore> {
     let store = ReelStore::open_with_io(
         PathBuf::from(root),
-        config(index),
+        config(),
         columns,
         Arc::new(SimIo::new(FaultPlan::new(seed))),
     )
@@ -88,7 +79,7 @@ fn sharded_key(shard: u8, at: u8) -> [u8; 8] {
 fn a_delete_in_the_repoint_window_wins() {
     // The script's turn covers the setup too, so no other test holds a point its seals pass
     let script = rendezvous::script();
-    let store = open("/repoint-race", 41, IndexResidency::Resident);
+    let store = open("/repoint-race", 41);
     let payload = vec![0x2Du8; 4096];
     for at in 0..60u64 {
         Store::put(&*store, "rows", &at.to_be_bytes(), &payload).expect("put");
@@ -125,7 +116,7 @@ fn a_delete_in_the_repoint_window_wins() {
 // keys stay readable while a seal is durable but the index has not been told
 #[test]
 fn every_key_answers_while_a_seal_waits_to_be_queued() {
-    let store = open("/seal-race", 43, IndexResidency::Resident);
+    let store = open("/seal-race", 43);
     let script = rendezvous::script();
     script.hold("seal/queued");
 
@@ -161,7 +152,7 @@ fn every_key_answers_while_a_seal_waits_to_be_queued() {
 // a read mid-handover sees every key, from the map or from a footer
 #[test]
 fn every_key_answers_between_two_paged_handovers() {
-    let store = open("/handover-race", 47, IndexResidency::Paged);
+    let store = open("/handover-race", 47);
     let payload = vec![0x71u8; 4096];
     for at in 0..200u64 {
         Store::put(&*store, "rows", &at.to_be_bytes(), &payload).expect("put");
@@ -205,10 +196,51 @@ fn every_key_answers_between_two_paged_handovers() {
     }
 }
 
+// a put drawn before a newer version that sealed and was handed over cannot publish over it
+#[test]
+fn late_put() {
+    let script = rendezvous::script();
+    let store = open("/late-put", 67);
+    let key = 7u64.to_be_bytes();
+    let (older, newer) = ([0x0Au8; 64], [0x0Bu8; 64]);
+
+    script.hold("put/landed");
+    let late = {
+        let store = Arc::clone(&store);
+        script.cast(move || Store::put(&*store, "rows", &key, &older))
+    };
+    script.await_reached("put/landed", 1);
+
+    // A batch passes no point, so the newer version publishes while the older put stands parked
+    let mut batch = WriteBatch::new();
+    batch.put("rows", &key, &newer);
+    Store::write_batch(&*store, batch).expect("batch");
+    drop(store.cue().expect("seal"));
+    assert_eq!(
+        store.page_out_sealed().expect("hand over"),
+        1,
+        "the newer version was not handed over"
+    );
+
+    script.release("put/landed");
+    late.join().expect("late put thread").expect("late put");
+
+    let got = Store::get(&*store, "rows", &key)
+        .expect("get")
+        .map(|value| value.to_vec());
+    assert_eq!(
+        got,
+        Some(newer.to_vec()),
+        "the older put published over the newer version"
+    );
+    let totals = store.column_totals(COLUMNS[0].id);
+    assert_eq!(totals.count, 1, "the key counts twice");
+}
+
 // a whole-column page racing a batch never comes back holding half of it
 #[test]
 fn a_page_never_comes_back_holding_half_a_batch() {
-    let store = open_columns("/optimistic-page", 53, IndexResidency::Resident, SHARDED);
+    let store = open_columns("/optimistic-page", 53, SHARDED);
     for shard in [0x00u8, 0x80] {
         Store::put(&*store, "rows", &sharded_key(shard, 0), &[0x11; 32]).expect("put");
     }
@@ -260,11 +292,8 @@ fn open_sim(root: &str, seed: u64) -> (Arc<ReelStore>, SimIo) {
         PathBuf::from(root),
         ReelConfig {
             segment_bytes: ByteCount::from_bytes(65_536),
-            alloc_chunk: ByteCount::from_bytes(4_096),
-            preallocate: Preallocate::Chunk,
             sync: SyncPolicy::Never,
             active_tails: ThreadBudget::threads(1),
-            index: IndexResidency::Resident,
             ..ReelConfig::default()
         },
         COLUMNS,

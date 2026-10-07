@@ -35,7 +35,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
 fn config(io_backend: IoBackend) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(64),
-        alloc_chunk: ByteCount::mb(16),
         sync: SyncPolicy::Never,
         io_backend,
         ..ReelConfig::default()

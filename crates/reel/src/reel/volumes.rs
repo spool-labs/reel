@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 
 use crate::config::VolumeClass;
 use crate::error::{ReelError, Result};
@@ -13,7 +14,7 @@ use crate::format::loc::SegmentId;
 use crate::io::op::WriteBuf;
 use crate::reel::segment::IoDriver;
 use crate::reel::segment_file_name;
-use crate::sync::checked::{read, write, RwLock};
+use crate::sync::{read, write};
 
 /// File on the first volume naming every root this reel spans
 pub const MANIFEST_NAME: &str = "reel.volumes";
@@ -93,16 +94,6 @@ impl Volumes {
     /// Whether the operator declared this root dead
     pub fn is_dead(&self, at: usize) -> bool {
         self.dead.get(at).copied().unwrap_or(false)
-    }
-
-    /// The roots declared dead, for the open that reports what is degraded
-    pub fn dead_roots(&self) -> Vec<&Path> {
-        self.roots
-            .iter()
-            .enumerate()
-            .filter(|(at, _)| self.dead[*at])
-            .map(|(_, root)| root.as_path())
-            .collect()
     }
 
     /// The first volume, where the lock and the manifest live
@@ -425,7 +416,7 @@ pub fn manifest_bytes(roots: &[PathBuf]) -> Vec<u8> {
     out.into_bytes()
 }
 
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -566,7 +557,6 @@ mod tests {
         assert_eq!(volumes.fast_at(1), None);
         assert_eq!(volumes.draw(None, VolumeClass::Fast), 0);
         assert_eq!(volumes.draw_past(&[0], VolumeClass::Fast), None);
-        assert_eq!(volumes.dead_roots(), vec![Path::new("/c")]);
         // Its placements still resolve, which is what keeps the table honest.
         volumes.place(SegmentId(4), 2);
         assert_eq!(

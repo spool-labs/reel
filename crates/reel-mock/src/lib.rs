@@ -8,7 +8,5 @@ mod memory;
 
 #[cfg(test)]
 mod integration_tests;
-#[cfg(test)]
-mod typed_tests;
 
 pub use memory::MemoryStore;

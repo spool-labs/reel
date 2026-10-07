@@ -16,7 +16,7 @@ use reel_core::{
 use crate::engine::read::Placed;
 use crate::engine::{RecordWrite, ReelStore};
 use crate::format::column::{ColumnId, KeyRef, KeyWidth, RecordKey, MAX_KEY_LEN};
-use crate::index::column::{ColumnMark, Mark};
+use crate::index::column::ColumnMark;
 use crate::index::entry::Entry;
 use crate::index::page::KeyPage;
 use crate::index::playback::{CursorBuffers, PlaybackCursor, Way};
@@ -255,9 +255,7 @@ impl Store for ReelStore {
         let column = self.classify(cf)?;
         let counted = self.counters_agree(column);
         if prefix.is_empty() && counted {
-            if let Some(totals) = self.column_totals(column) {
-                return Ok(totals.count);
-            }
+            return Ok(self.column_totals(column).count);
         }
         if counted {
             if let Some(totals) = self.prefix_totals(column, prefix) {
@@ -299,9 +297,7 @@ impl Store for ReelStore {
         let column = self.classify(cf)?;
         let counted = self.counters_agree(column);
         if prefix.is_empty() && counted {
-            if let Some(totals) = self.column_totals(column) {
-                return Ok(Some(totals.bytes.to_bytes()));
-            }
+            return Ok(Some(self.column_totals(column).bytes.to_bytes()));
         }
         if counted {
             if let Some(totals) = self.prefix_totals(column, prefix) {
@@ -390,7 +386,7 @@ impl Store for ReelStore {
 
     fn key_count_estimate(&self, cf: &str) -> StoreResult<Option<u64>> {
         match self.classify(cf) {
-            Ok(column) => Ok(self.column_totals(column).map(|totals| totals.count)),
+            Ok(column) => Ok(Some(self.column_totals(column).count)),
             Err(_) => Ok(None),
         }
     }
@@ -403,8 +399,8 @@ impl Store for ReelStore {
                 cf: spec.name.to_string(),
                 volume: StoreVolume::Bulk,
                 sst_bytes: 0,
-                blob_bytes: totals.map_or(0, |totals| totals.bytes.to_bytes()),
-                num_keys: totals.map_or(0, |totals| totals.count),
+                blob_bytes: totals.bytes.to_bytes(),
+                num_keys: totals.count,
             });
         }
         Ok(usage)
@@ -604,14 +600,6 @@ impl ReelStore {
         limit: usize,
     ) -> StoreResult<SweptKeys> {
         let mut page = KeyPage::default();
-        // Only a resident map holds every key, so a paged volume pages the column in key order
-        if !self.config.index.pages() {
-            let next = match prefix {
-                Some(prefix) => self.sweep_column_prefix(column, prefix, from, limit, &mut page),
-                None => self.sweep_column(column, from, limit, &mut page),
-            };
-            return Ok(((0..page.len()).map(|at| page.key_at(at)).collect(), next));
-        }
         if limit == 0 {
             return Ok((Vec::new(), from.map(<[u8]>::to_vec)));
         }
@@ -619,10 +607,7 @@ impl ReelStore {
         let after = from
             .and_then(ColumnMark::unpack)
             .filter(|mark| mark.nonce == self.sweep_nonce)
-            .and_then(|mark| match mark.within {
-                Mark::Key(key) => Some(key),
-                Mark::Start => None,
-            });
+            .map(|mark| mark.after);
         let start = match (&after, prefix) {
             (Some(after), _) => Bound::Excluded(after.as_ref()),
             (None, Some(prefix)) => Bound::Included(prefix),
@@ -643,8 +628,7 @@ impl ReelStore {
             (true, Some(last)) => Some(
                 ColumnMark {
                     nonce: self.sweep_nonce,
-                    shard: 0,
-                    within: Mark::Key(Box::from(last.as_slice())),
+                    after: Box::from(last.as_slice()),
                 }
                 .pack(),
             ),
@@ -717,7 +701,7 @@ impl ReelStore {
 
     fn playback(&self, scope: Scope, column: ColumnId) -> Playback<'_> {
         let mut spare = SPARE_WALK.with(std::cell::Cell::take).unwrap_or_default();
-        let buffered = spare.buffered.take().unwrap_or_else(KeyPage::reading);
+        let buffered = spare.buffered.take().unwrap_or_else(KeyPage::with_lens);
         let page = Page::open(
             &scope,
             column,
@@ -1138,15 +1122,6 @@ impl Playback<'_> {
             self.found.push(entry);
         }
 
-        // A walk that read a record whole already has its payload, so only the rest go to the device
-        let mut carried = Vec::new();
-        for (at, slot) in self.staged.iter().enumerate() {
-            if let Some(payload) = self.page.buffered.take_payload(*slot) {
-                self.found[at] = None;
-                carried.push((at, payload));
-            }
-        }
-
         // The entries came off the page the index already built, so the read goes
         // straight to the device rather than resolving these keys a second time.
         let column = self.column;
@@ -1159,9 +1134,6 @@ impl Playback<'_> {
         // left missing is looked up on its own and an unreadable one drops out.
         if let Err(error) = self.store.read_placed(&keys, &self.found, &mut self.placed) {
             tracing::warn!("a playback read a run one record at a time: {error}");
-        }
-        for (at, payload) in carried {
-            self.placed.hold(at, payload);
         }
         let missed: Vec<usize> = self.placed.missed().collect();
         for at in missed {
@@ -1212,7 +1184,7 @@ mod tests {
 
     use crate::units::ByteCount;
 
-    use crate::config::{Preallocate, ReelConfig, SyncPolicy, ThreadBudget};
+    use crate::config::{ReelConfig, SyncPolicy, ThreadBudget};
     use crate::format::column::{Codec, ColumnSet, ColumnSpec};
     use crate::io::fault::FaultPlan;
     use crate::io::sim_backend::SimIo;
@@ -1270,8 +1242,6 @@ mod tests {
     fn config() -> ReelConfig {
         ReelConfig {
             segment_bytes: ByteCount::mb(1),
-            alloc_chunk: ByteCount::from_bytes(16_384),
-            preallocate: Preallocate::Chunk,
             sync: SyncPolicy::Never,
             active_tails: ThreadBudget::threads(1),
             ..ReelConfig::default()
@@ -1370,11 +1340,7 @@ mod tests {
 
         // The guard the case rests on: an uncoded record here would make every
         // assertion below pass without saying anything.
-        let stored = engine
-            .column_totals(ColumnId(4))
-            .expect("totals")
-            .bytes
-            .to_bytes();
+        let stored = engine.column_totals(ColumnId(4)).bytes.to_bytes();
         assert!(
             stored < payload.len() as u64,
             "the codec stored {stored} of {}",

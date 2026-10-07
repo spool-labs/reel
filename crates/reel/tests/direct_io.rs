@@ -9,7 +9,7 @@
 
 use tempfile::TempDir;
 
-use reel::config::{IoBackend, Preallocate, ReelConfig, SyncPolicy};
+use reel::config::{IoBackend, ReelConfig, SyncPolicy};
 use reel::sync::tension::block_on;
 use reel::{ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelStore};
 use reel_core::{Direction, Store};
@@ -59,8 +59,6 @@ fn record_key(group: u16, id: [u8; 32]) -> RecordKey {
 fn direct_config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(16),
-        alloc_chunk: ByteCount::mb(4),
-        preallocate: Preallocate::Full,
         sync: SyncPolicy::Never,
         scrub_mbps: 0,
         io_backend: IoBackend::UringDirect,

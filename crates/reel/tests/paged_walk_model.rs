@@ -9,8 +9,8 @@ use rand::{Rng, SeedableRng};
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, ReelConfig,
-    ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget,
 };
 use reel_core::{Direction, Store};
 
@@ -143,12 +143,10 @@ fn value_of(n: u64, version: u64, len: usize) -> Vec<u8> {
 fn config(rng: &mut SmallRng) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(64 * 1024),
-        alloc_chunk: ByteCount::from_bytes(16 * 1024),
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(rng.gen_range(1..=3)),
         compact_dead_ratio: 0.1,
         scrub_mbps: 0,
-        index: IndexResidency::Paged,
         ..ReelConfig::default()
     }
 }

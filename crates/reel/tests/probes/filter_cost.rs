@@ -12,13 +12,13 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-use reel::config::{IndexResidency, ReelConfig, SyncPolicy, ThreadBudget};
+use reel::config::{ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, RecordKey};
 use reel::format::loc::SegmentId;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::units::ByteCount;
-use reel::{KeyWidth, Preallocate, ProbeCounts, ReelStore, MAP_EVERYTHING};
+use reel::{KeyWidth, ProbeCounts, ReelStore, MAP_EVERYTHING};
 
 const ROWS: ColumnId = ColumnId(1);
 
@@ -69,11 +69,8 @@ fn key(at: u64) -> RecordKey {
 fn config(filter_bits: u8) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(256 * 1024),
-        alloc_chunk: ByteCount::from_bytes(64 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
-        index: IndexResidency::Paged,
         filter_bits,
         // The read path the engine serves callers with
         map_above: MAP_EVERYTHING,

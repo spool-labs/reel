@@ -235,10 +235,10 @@ mod tests {
     // a backtick in the content widens the fence rather than closing it early
     #[test]
     fn markdown_fences_past_its_content() {
-        let ticked = Doc::new().footer(["use `--paged`"]);
+        let ticked = Doc::new().footer(["use `--limit 0`"]);
         let out = markdown(&Rendered(ticked));
         assert!(
-            out.contains("`` use `--paged` ``"),
+            out.contains("`` use `--limit 0` ``"),
             "the fence did not clear the content: {out}",
         );
     }

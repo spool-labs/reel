@@ -297,11 +297,6 @@ impl FooterPartition {
         }
     }
 
-    /// Whether the partition carries a filter at all, which is a property of the segment
-    pub fn is_filtered(&self) -> bool {
-        self.filter.is_some()
-    }
-
     /// Build the filter over every key the partition holds
     ///
     /// Every row, tombstones included: a delete missing from the filter lets a probe skip
@@ -354,21 +349,6 @@ impl FooterPartition {
     /// that gap has to be, so a fenced footer keeps the trailer an unfenced one has.
     pub fn fence_len(&self) -> usize {
         fence_bytes(self.blocks())
-    }
-
-    /// Whether the records these rows name sit in the order the rows are in
-    ///
-    /// Which is what makes a segment a sorted run.
-    pub fn is_sorted_run(&self) -> bool {
-        let mut behind = 0u32;
-        for at in 0..self.len() {
-            let offset = self.offset_at(at);
-            if offset < behind {
-                return false;
-            }
-            behind = offset;
-        }
-        true
     }
 
     /// Where one row begins and ends within the packed rows
@@ -473,21 +453,6 @@ impl FooterPartition {
         }
     }
 
-    /// The offset one row names, read out of the packed row like the key
-    ///
-    /// Zero for a row this cannot reach, which the sortedness test treats as out of
-    /// order rather than as absent.
-    fn offset_at(&self, index: usize) -> u32 {
-        let Some(((start, _), width)) = self.row_span(index).zip(self.key_len(index)) else {
-            return 0;
-        };
-        let at = start + width + U64_BYTES;
-        match self.packed.get(at..at + U32_BYTES) {
-            Some(bytes) => read_u32_le(bytes),
-            None => 0,
-        }
-    }
-
     /// The key one row carries, without decoding the rest of it
     ///
     /// A search compares keys and nothing else, so it reads the key alone and decodes a
@@ -585,24 +550,6 @@ impl FooterPartition {
             return None;
         }
         Some((self.key_at(0)?, self.key_at(count - 1)?))
-    }
-
-    /// Rows that still resolved to a record when the segment sealed
-    ///
-    /// A key overwritten inside its own segment leaves both versions in the partition, so
-    /// once the rows are in key order the live ones are the distinct keys. A record
-    /// shadowed by a rewrite in another tail leaves one row here and is counted live.
-    pub fn live_rows(&self) -> u32 {
-        let mut live = 0u32;
-        let mut last: Option<&[u8]> = None;
-        for at in 0..self.len() {
-            let key = self.key_at(at);
-            if key != last {
-                live += 1;
-                last = key;
-            }
-        }
-        live
     }
 
     /// Whether the rows already sit in the order the sort would put them in
@@ -766,16 +713,6 @@ impl SegmentFooter {
             footer.partitions.push(partition);
         }
         footer
-    }
-
-    /// Make room for this many more rows in every strided partition
-    pub fn reserve_rows(&mut self, rows: usize) {
-        for partition in &mut self.partitions {
-            if !partition.is_varying() {
-                let room = rows * partition.stride();
-                partition.packed.reserve(room);
-            }
-        }
     }
 
     /// Add one row, opening the partition for its column if this is the first
@@ -1630,12 +1567,10 @@ mod tests {
         let _ = scattered.pack_fenced(10, true).expect("pack");
         let _ = merged.pack_fenced(0, true).expect("pack");
 
-        assert!(sorted.partitions[0].is_sorted_run());
         assert!(
             sorted.partitions[0].filter.is_some(),
             "a fence brackets a key without answering membership",
         );
-        assert!(!scattered.partitions[0].is_sorted_run());
         assert!(scattered.partitions[0].filter.is_some());
         assert!(
             merged.partitions[0].filter.is_none(),

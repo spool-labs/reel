@@ -450,20 +450,6 @@ impl Compactor {
         })
     }
 
-    /// Whether a pass left this segment standing because something in it rotted
-    ///
-    /// Membership alone rather than the dead-byte refinement the ranking uses: a merge
-    /// reads every row of a source, so a segment holding a record that will not verify
-    /// has nothing to offer one until compaction has been through it.
-    pub fn is_rot_pinned(&self, segment: SegmentId) -> bool {
-        lock(&self.rotted).contains_key(&segment)
-    }
-
-    /// Leave a segment standing for rot, at the dead bytes the pass left it with
-    pub fn pin_rot(&self, segment: SegmentId, dead: u64) {
-        lock(&self.rotted).insert(segment, dead);
-    }
-
     /// Book the runs one merge pass read together
     ///
     /// A pass the tick drove hands its report to nobody, so this is where a volume says
@@ -524,27 +510,12 @@ impl Compactor {
         &self.pressure
     }
 
-    /// The resolved compaction rate cap in megabytes per second
-    pub fn compaction_rate_mbps(&self) -> u64 {
-        self.compact_rate.target_mbps()
-    }
-
     /// Whether the compaction rate allows another pass to start now
     ///
     /// A paced pass pays for its steps as it takes them, so what stands here is the
     /// tail past its last step rather than the whole of what it moved.
     pub fn is_compaction_due(&self) -> bool {
         self.compact_rate.is_open()
-    }
-
-    /// The resolved scrub rate, or nothing when the scrub is disabled
-    pub fn scrub_rate_mbps(&self) -> Option<u64> {
-        self.scrub_rate.as_ref().map(RateGate::target_mbps)
-    }
-
-    /// Whether the scrub task runs at all
-    pub fn is_scrub_enabled(&self) -> bool {
-        self.scrub_rate.is_some()
     }
 
     /// Where the next scrub pass picks up, or nothing when the sweep is at its start
@@ -2096,6 +2067,7 @@ mod tests {
 
     use reel_core::Value;
 
+    use std::ops::Bound;
     use std::path::{Path, PathBuf};
     use std::sync::Barrier;
     use std::thread;
@@ -2105,15 +2077,16 @@ mod tests {
 
     use crate::append::admission::InflightBudget;
     use crate::append::Commit;
-    use crate::config::{
-        CompactRate, Preallocate, ReelConfig, SyncPolicy, ThreadBudget, DEFAULT_FD_CACHE,
-    };
+    use crate::config::{CompactRate, ReelConfig, SyncPolicy, ThreadBudget, DEFAULT_FD_CACHE};
     use crate::format::column::{
         Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyWidth, PurgeMark, RecordKey,
     };
     use crate::format::segment_header::SEGMENT_HEADER_SPAN;
     use crate::index::entry::{span_of, Entry};
+    use crate::index::page::KeyPage;
+    use crate::index::paged::FooterSource;
     use crate::index::recovery::rebuild_reel;
+    use crate::index::spot::RecordSource;
     use crate::io::fault::{FaultKind, FaultPlan};
     use crate::io::sim_backend::{DurableImage, SimIo};
     use crate::reel::segment::{FdCache, IoDriver};
@@ -2124,6 +2097,9 @@ mod tests {
     const RECORDS: ColumnId = ColumnId(1);
     const KEY_WIDTH: usize = 34;
     const SEG_HEADER_SPAN: usize = HEADER_LEN + SEGMENT_HEADER_SPAN;
+
+    /// Keys one page of a listing takes
+    const PAGE: usize = 1024;
 
     const COLUMNS: ColumnSet = &[ColumnSpec {
         id: RECORDS,
@@ -2163,8 +2139,6 @@ mod tests {
     fn settings() -> ReelConfig {
         ReelConfig {
             segment_bytes: ByteCount::mb(1),
-            alloc_chunk: ByteCount::from_bytes(16_384),
-            preallocate: Preallocate::Chunk,
             sync: SyncPolicy::Never,
             active_tails: ThreadBudget::threads(1),
             scrub_mbps: 4,
@@ -2191,8 +2165,7 @@ mod tests {
             1,
         ));
         let reel = Reel::open(Arc::clone(&shared), Vec::new()).expect("open reel");
-        let index =
-            ReelIndex::new(columns, crate::config::IndexResidency::Resident).expect("index");
+        let index = ReelIndex::new(columns).expect("index");
         // What the engine wires at open: the seal reads a segment's tally from these
         // and a landing books its floor into them.
         shared.set_segments(index.segments_handle());
@@ -2231,15 +2204,19 @@ mod tests {
             .expect("remove");
     }
 
-    /// Seal the tail and take the segment off the sealed queue
+    /// Seal the tail, give the index its spans, and take the segment off the sealed queue
     ///
     /// These fixtures hold a reel and an index with no engine between them, and a
     /// segment still owed its spans is left alone by compaction.
     fn seal(fixture: &Fixture) {
         fixture.reel.tails()[0].seal().expect("seal");
         let shared = fixture.reel.shared();
-        let owed = shared.pending_seals();
-        shared.settle_sealed(&owed);
+        let sealed = shared.peek_sealed();
+        for (segment, footer) in &sealed {
+            fixture.index.note_spans(*segment, footer).expect("spans");
+        }
+        let noted: Vec<SegmentId> = sealed.iter().map(|(segment, _)| *segment).collect();
+        shared.settle_sealed(&noted);
     }
 
     fn seg_path(number: u32) -> PathBuf {
@@ -2249,15 +2226,34 @@ mod tests {
     fn rebuilt_from(fixture: &Fixture) -> ReelIndex {
         let image = fixture.sim.durable_image();
         let restored = SimIo::from_image(image);
-        let driver = IoDriver::new(Arc::new(restored));
-        let index = resident_index();
-        rebuild_reel(&driver, &[PathBuf::from(REEL_DIR)], &[false], false, &index)
-            .expect("rebuild");
+        let driver = Arc::new(IoDriver::new(Arc::new(restored)));
+        let index = fresh_index();
+        rebuild_reel(&driver, &[PathBuf::from(REEL_DIR)], &[false], &index).expect("rebuild");
+        let budget = Arc::new(InflightBudget::default());
+        let fd_cache = Arc::new(FdCache::new(DEFAULT_FD_CACHE as usize));
+        let shared = Arc::new(ReelShared::new(
+            PathBuf::from(REEL_DIR),
+            driver,
+            budget,
+            fd_cache,
+            settings(),
+            COLUMNS,
+            1,
+        ));
+        attach(&index, &shared);
         index
     }
 
-    fn resident_index() -> ReelIndex {
-        ReelIndex::new(COLUMNS, crate::config::IndexResidency::Resident).expect("index")
+    fn fresh_index() -> ReelIndex {
+        ReelIndex::new(COLUMNS).expect("index")
+    }
+
+    /// Wire a rebuilt index to its volume the way an open does, so its sealed keys answer
+    fn attach(index: &ReelIndex, shared: &Arc<ReelShared>) {
+        index.set_footers(Arc::clone(shared) as Arc<dyn FooterSource>);
+        index.set_records(Arc::clone(shared) as Arc<dyn RecordSource>);
+        shared.set_segments(index.segments_handle());
+        index.finish_open().expect("finish open");
     }
 
     fn reopen(image: DurableImage, config: ReelConfig) -> Fixture {
@@ -2275,18 +2271,13 @@ mod tests {
             COLUMNS,
             1,
         ));
-        let index = resident_index();
-        let rebuilt = rebuild_reel(
-            driver.as_ref(),
-            &[PathBuf::from(REEL_DIR)],
-            &[false],
-            false,
-            &index,
-        )
-        .expect("rebuild");
+        let index = fresh_index();
+        let rebuilt = rebuild_reel(driver.as_ref(), &[PathBuf::from(REEL_DIR)], &[false], &index)
+            .expect("rebuild");
         shared.lsn.recover_to(rebuilt.highest_lsn);
         shared.recover_next_segment(rebuilt.highest_segment);
         let reel = Reel::open(Arc::clone(&shared), Vec::new()).expect("reopen reel");
+        attach(&index, &shared);
         let compactor = Compactor::new(&config, 0, 0);
         Fixture {
             sim,
@@ -2304,8 +2295,27 @@ mod tests {
             .collect()
     }
 
+    /// Every live key of the record column and where it resolves, from the map and the footers alike
     fn rebuilt_rows(rebuilt: &ReelIndex) -> Vec<(KeyBytes, Entry)> {
-        rebuilt.column(RECORDS).expect("records").held()
+        let mut rows = Vec::new();
+        let mut page = KeyPage::with_lens();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let from = match &after {
+                Some(last) => Bound::Excluded(last.as_slice()),
+                None => Bound::Unbounded,
+            };
+            rebuilt.page(RECORDS, from, PAGE, &mut page).expect("page");
+            for at in 0..page.len() {
+                let key = page.key_ref(at).unwrap_or_default();
+                let entry = page.found_at(at).expect("an entry");
+                rows.push((KeyBytes::new(key).expect("key"), entry));
+            }
+            if page.len() < PAGE {
+                return rows;
+            }
+            after = Some(page.key_at(page.len() - 1));
+        }
     }
 
     /// The bytes of one key, for comparing against a rebuild
@@ -2783,26 +2793,6 @@ mod tests {
         assert_eq!(fixture.index.dead_bytes(), 0);
     }
 
-    // the automatic compaction rate is unpaced and the scrub keeps its own rate
-    #[test]
-    fn rate_and_scrub_toggle() {
-        let running = Compactor::new(&settings(), 0, 0);
-        let disabled = Compactor::new(
-            &ReelConfig {
-                scrub_mbps: 0,
-                ..settings()
-            },
-            0,
-            0,
-        );
-
-        assert_eq!(running.compaction_rate_mbps(), 0);
-        assert!(running.is_scrub_enabled());
-        assert_eq!(running.scrub_rate_mbps(), Some(4));
-        assert!(!disabled.is_scrub_enabled());
-        assert_eq!(disabled.scrub_rate_mbps(), None);
-    }
-
     // a second claim on a held segment comes back empty and leaves the lock free
     #[test]
     fn second_claim_on_a_held_segment_is_refused() {
@@ -2828,13 +2818,11 @@ mod tests {
     }
 
     /// The op an out of space fault is injected at, past the open's own ops
-    const ENOSPC_AT: u64 = 12;
+    const ENOSPC_AT: u64 = 11;
 
     fn engine_config() -> ReelConfig {
         ReelConfig {
             segment_bytes: ByteCount::from_bytes(8_192),
-            alloc_chunk: ByteCount::from_bytes(4_096),
-            preallocate: Preallocate::Chunk,
             sync: SyncPolicy::Never,
             active_tails: ThreadBudget::threads(1),
             scrub_mbps: 4,

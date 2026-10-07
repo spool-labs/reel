@@ -16,9 +16,8 @@ use std::time::Instant;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyPage, KeyWidth,
-    PlaybackCursor, Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget, Way,
-    MAP_EVERYTHING,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyPage, KeyWidth, PlaybackCursor,
+    RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget, Way, MAP_EVERYTHING,
 };
 
 /// Virtual root the simulator's files live under
@@ -68,11 +67,8 @@ const CASES: &[usize] = &[1, 4, 16, 64, 256];
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT),
-        alloc_chunk: ByteCount::from_bytes(8 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
-        index: IndexResidency::Paged,
         // The read path the engine serves callers with
         map_above: MAP_EVERYTHING,
         ..ReelConfig::default()

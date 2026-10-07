@@ -9,7 +9,6 @@ mod bias_report;
 mod compact_throughput;
 mod cue_speed;
 mod door_price;
-mod drain_depth;
 mod erase_probe;
 mod filter_cost;
 mod handoff_cost;
@@ -21,7 +20,6 @@ mod negative_price;
 mod open_time;
 mod past_ram;
 mod playback_speed;
-mod preallocate_cost;
 mod publish_cost;
 mod repoint_hold;
 mod segment_price;
@@ -67,14 +65,6 @@ const PROBES: &[Probe] = &[
     opt_in(
         "door_price::a_probe_never_waits",
         door_price::a_probe_never_waits,
-    ),
-    opt_in(
-        "drain_depth::report_drain_depth",
-        drain_depth::report_drain_depth,
-    ),
-    opt_in(
-        "drain_depth::one_writer_is_never_batchable",
-        drain_depth::one_writer_is_never_batchable,
     ),
     opt_in(
         "erase_probe::erase_reclaim_share",
@@ -148,10 +138,6 @@ const PROBES: &[Probe] = &[
     opt_in(
         "playback_speed::walk_by_segment_count",
         playback_speed::walk_by_segment_count,
-    ),
-    opt_in(
-        "preallocate_cost::preallocation_cost_by_shape",
-        preallocate_cost::preallocation_cost_by_shape,
     ),
     opt_in("publish_cost::batch_publish", publish_cost::batch_publish),
     opt_in(

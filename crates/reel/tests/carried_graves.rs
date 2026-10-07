@@ -6,8 +6,8 @@ use reel::format::column::RecordKey;
 use reel::format::loc::SegmentId;
 use reel::format::lsn::Lsn;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, ReelConfig,
-    ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget,
 };
 use reel_core::{Direction, Store};
 
@@ -33,12 +33,10 @@ fn paged(dir: &TempDir) -> ReelStore {
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(64 * 1024),
-        alloc_chunk: ByteCount::from_bytes(16 * 1024),
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         compact_dead_ratio: 0.3,
         scrub_mbps: 0,
-        index: IndexResidency::Paged,
         ..ReelConfig::default()
     }
 }

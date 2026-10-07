@@ -1,6 +1,6 @@
-//! Rebuilding the reel's resident index from its segment files on open
+//! Rebuilding the reel's index from its segment files on open
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
@@ -20,11 +20,10 @@ use crate::format::record::{
     KEYLESS_PREFIX,
 };
 use crate::format::segment_header::{SegmentHeader, FORMAT_VERSION};
-use crate::index::column::{KeyMove, Landed};
+use crate::index::column::{never_shadowed, KeyMove, Landed};
 use crate::index::counters::{Bookings, SegmentBytes, Tally};
 use crate::index::entry::{span_of, Entry};
 use crate::index::map::ReelIndex;
-use crate::index::persisted::{trusted, PersistedReader, PersistedSegment};
 use crate::io::op::FileId;
 use crate::io::ServingBackend;
 use crate::reel::segment::{read_segment_header, IoDriver, SegmentReader};
@@ -40,16 +39,13 @@ const TRAILER_PROBE_LEN: u64 = 4096;
 /// Threads a rebuild opens segment files on, however wide the machine is
 const MAX_READERS: usize = 8;
 
-/// Each reader may read this many segment files ahead of the join on a resident rebuild
-const READ_AHEAD: usize = 4;
-
 /// Records one column batch takes into the index at a time
 const BATCH: usize = 4096;
 
-/// Segments a resident rebuild holds before it feeds their rows in key order
-const FEED_WINDOW: usize = MAX_READERS * READ_AHEAD;
+/// Tails a rebuild holds before it feeds their rows in key order
+const FEED_WINDOW: usize = 32;
 
-/// A paged open loads sealed footers into the spot index on this many threads
+/// An open loads sealed footers into the spot index on this many threads
 const LOADERS: usize = 8;
 
 /// A column's feed splits across threads once its window holds this many rows
@@ -95,43 +91,14 @@ pub struct SealedSpan {
 
 /// Rebuild the reel's index by reading every segment file in its directory into it
 ///
-/// A paging volume sweeps its sealed segments rather than resolving them, so the peak
-/// is one footer instead of one key set. Only the tails are resolved into memory.
+/// Sealed segments are swept a footer at a time, so the peak is one footer. Only the
+/// tails are resolved into memory.
 pub fn rebuild_reel(
     driver: &IoDriver,
     roots: &[PathBuf],
     dead: &[bool],
-    pages: bool,
     index: &ReelIndex,
 ) -> Result<RebuiltReel> {
-    rebuild_from_persisted(driver, roots, dead, pages, None, index)
-}
-
-/// The same rebuild, offered an index a previous cue wrote down
-///
-/// The file speaks only for the segments still standing at the length it recorded,
-/// and those are the only ones this skips reading. Everything else is read as it
-/// would be with no file at all, and its rows go through the same sequence number
-/// guard, so a stale file can never be the reason a version is missed.
-///
-/// A paging volume takes no offer, since its sealed keys stay in their footers.
-pub fn rebuild_from_persisted(
-    driver: &IoDriver,
-    roots: &[PathBuf],
-    dead: &[bool],
-    pages: bool,
-    persisted: Option<PersistedReader>,
-    index: &ReelIndex,
-) -> Result<RebuiltReel> {
-    let persisted = match pages {
-        true => {
-            if let Some(reader) = persisted {
-                reader.close(driver)?;
-            }
-            None
-        }
-        false => persisted,
-    };
     let mut files: Vec<(u32, PathBuf, u64, u8)> = Vec::new();
     for (at, root) in roots.iter().enumerate() {
         // A drive the operator declared dead is never read, even when something
@@ -159,18 +126,7 @@ pub fn rebuild_from_persisted(
         }
     }
 
-    let standing = match &persisted {
-        Some(reader) => {
-            let present: HashMap<SegmentId, u64> = files
-                .iter()
-                .map(|(number, _, len, _)| (SegmentId(*number), *len))
-                .collect();
-            trusted(&reader.index, &present)
-        }
-        None => BTreeSet::new(),
-    };
-
-    let mut resolver = Resolver::new(index, pages);
+    let mut resolver = Resolver::new(index);
     let mut quarantined = Vec::new();
     let mut consumed = HashMap::new();
     let mut walked = Vec::new();
@@ -185,45 +141,29 @@ pub fn rebuild_from_persisted(
         if root != 0 {
             placements.push((segment, root));
         }
-        if standing.contains(&segment) {
-            // Sealed and vouched for, so the persisted index's rows stand in for reading it
-            consumed.insert(segment, SEALED);
-            continue;
-        }
         jobs.push((segment, path, len));
     }
     let mut held: Vec<Held> = Vec::new();
     // The loaders are slower than the reads, so a deeper queue or read-ahead only holds more footers
     let (queue, feed) = std::sync::mpsc::sync_channel::<(SegmentId, SegmentFooter)>(1);
     let feed = Mutex::new(feed);
-    let loaders = match pages {
-        true => LOADERS,
-        false => 0,
-    };
     std::thread::scope(|scope| -> Result<()> {
-        let loading: Vec<_> = (0..loaders)
+        let loading: Vec<_> = (0..LOADERS)
             .map(|_| scope.spawn(|| load_footers(index, &feed)))
             .collect();
-        let queue = pages.then_some(queue);
         let mut is_sized = false;
-        let ahead = match pages {
-            true => 1,
-            false => READ_AHEAD,
-        };
-        let read = read_segments(driver, &jobs, ahead, |at, parts| {
+        let read = read_segments(driver, &jobs, |at, parts| {
             let (segment, path, len) = &jobs[at];
-            match absorb_segment(*segment, parts, pages, &mut resolver, &mut held)? {
+            match absorb_segment(*segment, parts, &mut resolver, &mut held)? {
                 Loaded::Sealed(footer) => {
                     consumed.insert(*segment, SEALED);
                     sealed_files.push((*segment, path.clone(), *len));
-                    if let (Some(queue), Some(footer)) = (&queue, footer) {
-                        if !is_sized {
-                            index.reserve_fast(&footer, jobs.len());
-                            is_sized = true;
-                        }
-                        // The loaders receive until the queue closes, so a send always finds a receiver
-                        let _ = queue.send((*segment, footer));
+                    if !is_sized {
+                        index.reserve_fast(&footer, jobs.len());
+                        is_sized = true;
                     }
+                    // The loaders receive until the queue closes, so a send always finds a receiver
+                    let _ = queue.send((*segment, footer));
                 }
                 Loaded::Journaled(end) => {
                     consumed.insert(*segment, end.journal_len);
@@ -255,26 +195,12 @@ pub fn rebuild_from_persisted(
         read
     })?;
     feed_held(&mut held, &mut resolver, &mut resumable)?;
-    if pages {
-        load_key_runs(index, &sealed_files)?;
-    }
-    // A file that goes bad partway through its rows starts the rebuild over without it.
-    if let Some(reader) = persisted {
-        if let Err(error) = adopt(driver, reader, &standing, &mut resolver) {
-            tracing::warn!(
-                "the persisted index went bad partway through its rows, so this open \
-                 sweeps the footers: {error}",
-            );
-            return rebuild_from_persisted(driver, roots, dead, pages, None, index);
-        }
-    }
+    load_key_runs(index, &sealed_files)?;
 
     resolver.flush();
     let undeclared = resolver.queue.undeclared;
-    if pages {
-        prune_walked_shadowed(driver, &sealed_files, &resolver.sealed, index)?;
-    }
-    let highest_lsn = resolver.finish()?;
+    prune_walked_shadowed(driver, &sealed_files, &resolver.sealed, index)?;
+    let highest_lsn = resolver.finish();
     resumable.sort_by_key(|tail| tail.segment.as_u32());
     Ok(RebuiltReel {
         highest_lsn,
@@ -286,34 +212,6 @@ pub fn rebuild_from_persisted(
         resumable,
         undeclared,
     })
-}
-
-/// Fold a persisted index's stamps and rows in after the segments, so a tie falls to the segment
-fn adopt(
-    driver: &IoDriver,
-    mut reader: PersistedReader,
-    standing: &BTreeSet<SegmentId>,
-    resolver: &mut Resolver<'_>,
-) -> Result<()> {
-    for stamp in &reader.index.segments {
-        if standing.contains(&stamp.segment) {
-            resolver.adopt_segment(stamp);
-        }
-    }
-    resolver.see(reader.index.at);
-    let read = (|| -> Result<()> {
-        while reader.advance(driver)? {
-            let loc = reader.loc();
-            if !standing.contains(&loc.segment) {
-                continue;
-            }
-            let key = RecordKey::from_bytes(reader.column(), reader.key())?;
-            resolver.put(key.column, key.as_slice(), loc, reader.lsn(), false);
-        }
-        Ok(())
-    })();
-    reader.close(driver)?;
-    read
 }
 
 /// Take the key runs' rows into the spot index on the loaders, a stretch of rows at a time
@@ -380,8 +278,8 @@ fn load_footers(
 
 /// What reading one segment during a rebuild turned out to be
 enum Loaded {
-    /// A sealed segment, read from its footer, which a paged open still has to load
-    Sealed(Option<SegmentFooter>),
+    /// A sealed segment, read from its footer, which the open still has to load
+    Sealed(SegmentFooter),
 
     /// An unsealed tail read through its journal
     Journaled(JournaledEnd),
@@ -435,7 +333,6 @@ enum SegmentParts {
 fn read_segments(
     driver: &IoDriver,
     jobs: &[(SegmentId, PathBuf, u64)],
-    ahead: usize,
     mut join: impl FnMut(usize, SegmentParts) -> Result<()>,
 ) -> Result<()> {
     let readers = match reads_on_its_caller(driver) {
@@ -459,11 +356,10 @@ fn read_segments(
         stop: false,
     });
     let moved = Condvar::new();
-    let window = readers * ahead;
     let mut outcome = Ok(());
     std::thread::scope(|scope| {
         for _ in 0..readers {
-            scope.spawn(|| read_claimed(driver, jobs, &queue, &moved, window));
+            scope.spawn(|| read_claimed(driver, jobs, &queue, &moved, readers));
         }
         for at in 0..jobs.len() {
             let parts = {
@@ -588,38 +484,25 @@ fn read_parts(
     }
 }
 
-/// Fold one segment's parts into the index, holding the rows it installs for the feed
+/// Fold one segment's parts into the index, holding a tail's rows for the feed
 fn absorb_segment(
     segment: SegmentId,
     parts: SegmentParts,
-    pages: bool,
     resolver: &mut Resolver<'_>,
     held: &mut Vec<Held>,
 ) -> Result<Loaded> {
     // A cover settles by sequence number whichever rows it meets first, so ranges stand at once
     match parts {
         SegmentParts::Foreign => Ok(Loaded::Foreign),
-        SegmentParts::Sealed(footer, ends) => match pages {
-            true => {
-                sweep_footer(segment, &footer, &mut ends.into_iter(), resolver)?;
-                Ok(Loaded::Sealed(Some(footer)))
-            }
-            false => {
-                stand_ranges(segment, &footer, ends, resolver)?;
-                held.push(Held {
-                    segment,
-                    footer,
-                    is_sorted: true,
-                });
-                Ok(Loaded::Sealed(None))
-            }
-        },
+        SegmentParts::Sealed(footer, ends) => {
+            sweep_footer(segment, &footer, &mut ends.into_iter(), resolver)?;
+            Ok(Loaded::Sealed(footer))
+        }
         SegmentParts::Journaled(tail) => {
             stand_ranges(segment, &tail.footer, tail.ends, resolver)?;
             held.push(Held {
                 segment,
                 footer: tail.footer,
-                is_sorted: false,
             });
             Ok(Loaded::Journaled(JournaledEnd {
                 next_offset: tail.next_offset,
@@ -656,13 +539,10 @@ fn stand_ranges(
     Ok(())
 }
 
-/// One segment's rows held until its window is fed in key order
+/// One tail's rows held until its window is fed in key order
 struct Held {
     segment: SegmentId,
     footer: SegmentFooter,
-
-    /// Whether the rows sit in key order, which a sealed footer's do and a walk's do not
-    is_sorted: bool,
 }
 
 /// Feed every held row to the resolver in key order, then hand each walked footer on
@@ -695,7 +575,7 @@ fn feed_held(
             .zip(&orders)
             .enumerate()
             .filter_map(|(source, (rows, order))| {
-                Cursor::open(source, rows, column, order.as_deref())
+                Cursor::open(source, rows, column, order.as_deref()?)
             })
             .collect();
         feed_column(column, cursors, resolver)?;
@@ -713,9 +593,6 @@ fn feed_held(
 
 /// A walked partition's rows in key order, equal keys keeping arrival order
 fn key_order(rows: &Held, column: ColumnId) -> Option<Vec<u32>> {
-    if rows.is_sorted {
-        return None;
-    }
     let partition = rows.footer.partition(column)?;
     let mut order: Vec<u32> = (0..partition.len() as u32).collect();
     order.sort_unstable_by(|one, two| {
@@ -830,8 +707,8 @@ struct Cursor<'a> {
     segment: SegmentId,
     partition: &'a FooterPartition,
 
-    /// Row numbers in key order, for rows that sit in arrival order
-    order: Option<&'a [u32]>,
+    /// Row numbers in key order, since a tail's rows sit in arrival order
+    order: &'a [u32],
     at: usize,
 
     /// One past the cursor's last place
@@ -843,7 +720,7 @@ impl<'a> Cursor<'a> {
         source: usize,
         rows: &'a Held,
         column: ColumnId,
-        order: Option<&'a [u32]>,
+        order: &'a [u32],
     ) -> Option<Cursor<'a>> {
         let partition = rows.footer.partition(column)?;
         Some(Cursor {
@@ -885,10 +762,7 @@ impl<'a> Cursor<'a> {
     }
 
     fn row_of(&self, at: usize) -> usize {
-        match self.order {
-            Some(order) => order[at] as usize,
-            None => at,
-        }
+        self.order[at] as usize
     }
 
     fn row(&self) -> usize {
@@ -962,7 +836,7 @@ fn sift_down(heap: &mut [usize], mut at: usize, cursors: &[Cursor<'_>]) {
     }
 }
 
-/// Drop walked entries a sealed footer outversions, which paged installs must not hold
+/// Drop walked entries a sealed footer outversions, which the map must not hold
 ///
 /// A walked entry installs as its key's newest and shadows the footer search, which
 /// is right for a tail and wrong for a segment whose seal failed. So every walked
@@ -979,7 +853,7 @@ fn prune_walked_shadowed(
 ) -> Result<()> {
     let segments = index.segments();
 
-    // A paged map holds only what the tails brought, so each entry is a suspect, and a
+    // The map holds only what the tails brought, so each entry is a suspect, and a
     // covered record goes now so it cannot stand in front of a newer sealed row.
     let mut suspects: HashMap<ColumnId, Vec<(KeyBytes, Entry)>> = HashMap::new();
     for spec in index.columns() {
@@ -1533,18 +1407,16 @@ struct Resolver<'a> {
     queue: KeyQueue,
     sealed: Vec<SealedSpan>,
     highest: Lsn,
-    pages: bool,
 }
 
 impl<'a> Resolver<'a> {
-    fn new(index: &'a ReelIndex, pages: bool) -> Resolver<'a> {
+    fn new(index: &'a ReelIndex) -> Resolver<'a> {
         index.clear();
         Resolver {
             index,
             queue: KeyQueue::default(),
             sealed: Vec::new(),
             highest: Lsn::NONE,
-            pages,
         }
     }
 
@@ -1588,33 +1460,15 @@ impl<'a> Resolver<'a> {
         self.index.segments().adopt(segment, bytes);
     }
 
-    /// Take a persisted index's counters for a segment, its winners booked as its rows land
-    fn adopt_segment(&mut self, stamp: &PersistedSegment) {
-        let bytes = SegmentBytes {
-            live: stamp.held,
-            dead: stamp.dead,
-            held: stamp.held,
-            held_lsn: stamp.held_lsn,
-        };
-        self.index.segments().adopt(stamp.segment, bytes);
-        if let Some(min) = stamp.min_lsn {
-            self.index.segments().note_min(stamp.segment, min);
-        }
-    }
-
     fn flush(&mut self) {
         self.queue.flush(self.index);
     }
 
-    /// Settle a resident rebuild's covers and graves and hand back the highest sequence number
-    fn finish(mut self) -> Result<Lsn> {
+    /// Stand the sealed spans and hand back the highest sequence number
+    fn finish(mut self) -> Lsn {
         self.flush();
-        if !self.pages {
-            while self.index.sweep_covers(usize::MAX)? {}
-            self.index.prune_tombstones(Lsn(u64::MAX));
-        }
         self.index.finish_rebuild(self.sealed);
-        Ok(self.highest)
+        self.highest
     }
 }
 
@@ -1676,7 +1530,7 @@ impl KeyQueue {
                     })
                     .collect();
                 self.landed.clear();
-                column.apply_moves(&moves, segments, &mut self.landed);
+                column.apply_moves(&moves, segments, &never_shadowed, &mut self.landed);
             }
             // A column this open doesn't declare still holds bytes in its segments,
             // and nothing here can shadow them, so its rows are booked live.
@@ -1749,6 +1603,7 @@ fn is_indexable(flags: Flags) -> bool {
 mod tests {
     use super::*;
 
+    use std::ops::Bound;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -1756,8 +1611,11 @@ mod tests {
 
     use crate::append::admission::InflightBudget;
     use crate::append::{Appender, BatchRecord, BatchWrite, Commit};
-    use crate::config::{IndexResidency, Preallocate, ReelConfig, SyncPolicy, DEFAULT_FD_CACHE};
+    use crate::config::{ReelConfig, SyncPolicy, DEFAULT_FD_CACHE};
     use crate::format::column::{Codec, ColumnSet, ColumnSpec, KeyWidth};
+    use crate::index::page::KeyPage;
+    use crate::index::paged::FooterSource;
+    use crate::index::spot::RecordSource;
     use crate::io::fault::FaultPlan;
     use crate::io::op::WriteBuf;
     use crate::io::sim_backend::{DurableImage, SimIo};
@@ -1767,6 +1625,9 @@ mod tests {
     const REEL_DIR: &str = "/bulk/reel";
     const RECORDS: ColumnId = ColumnId(1);
     const META: ColumnId = ColumnId(2);
+
+    /// Keys one page of a listing takes
+    const PAGE: usize = 1024;
 
     const COLUMNS: ColumnSet = &[
         ColumnSpec {
@@ -1790,8 +1651,6 @@ mod tests {
     fn config(sync: SyncPolicy) -> ReelConfig {
         ReelConfig {
             segment_bytes: ByteCount::mb(1),
-            alloc_chunk: ByteCount::from_bytes(4096 * 4),
-            preallocate: Preallocate::Chunk,
             sync,
             ..ReelConfig::default()
         }
@@ -1835,25 +1694,51 @@ mod tests {
     }
 
     impl Rebuilt {
-        fn rows(&self, column: ColumnId) -> Vec<(KeyBytes, Entry)> {
+        /// What the map holds for a column, graves included
+        fn held(&self, column: ColumnId) -> Vec<(KeyBytes, Entry)> {
             self.index
                 .column(column)
                 .map(|index| index.held())
                 .unwrap_or_default()
         }
+
+        /// Every live key of a column and where it resolves, from the map and the footers alike
+        fn rows(&self, column: ColumnId) -> Vec<(KeyBytes, Entry)> {
+            let mut rows = Vec::new();
+            let mut page = KeyPage::with_lens();
+            let mut after: Option<Vec<u8>> = None;
+            loop {
+                let start = match &after {
+                    Some(last) => Bound::Excluded(last.as_slice()),
+                    None => Bound::Unbounded,
+                };
+                self.index
+                    .page(column, start, PAGE, &mut page)
+                    .expect("page");
+                for at in 0..page.len() {
+                    let key = page.key_ref(at).unwrap_or_default();
+                    let entry = page.found_at(at).expect("an entry");
+                    rows.push((KeyBytes::new(key).expect("key"), entry));
+                }
+                if page.len() < PAGE {
+                    return rows;
+                }
+                after = Some(page.key_at(page.len() - 1));
+            }
+        }
     }
 
-    fn rebuild_on(sim: &SimIo, residency: IndexResidency) -> Rebuilt {
-        let driver = IoDriver::new(Arc::new(sim.clone()));
-        let index = ReelIndex::new(COLUMNS, residency).expect("index");
-        let pages = residency.pages();
-        let reel = rebuild_reel(&driver, &[PathBuf::from(REEL_DIR)], &[false], pages, &index)
-            .expect("rebuild");
-        Rebuilt { reel, index }
-    }
-
+    /// Rebuild over the image, then give the index the volume its sealed keys read through
     fn rebuild(sim: &SimIo) -> Rebuilt {
-        rebuild_on(sim, IndexResidency::Resident)
+        let driver = IoDriver::new(Arc::new(sim.clone()));
+        let index = ReelIndex::new(COLUMNS).expect("index");
+        let reel = rebuild_reel(&driver, &[PathBuf::from(REEL_DIR)], &[false], &index)
+            .expect("rebuild");
+        let volume = shared(config(SyncPolicy::Never), sim);
+        index.set_footers(Arc::clone(&volume) as Arc<dyn FooterSource>);
+        index.set_records(volume as Arc<dyn RecordSource>);
+        index.finish_open().expect("finish open");
+        Rebuilt { reel, index }
     }
 
     fn count(rebuilt: &Rebuilt) -> usize {
@@ -1868,7 +1753,7 @@ mod tests {
             .collect()
     }
 
-    // an overwrite-heavy segment keeps each key's newest version and books the rest dead
+    // an overwrite-heavy tail keeps each key's newest version and books the rest dead
     #[test]
     fn overwrites_resolve_to_their_newest() {
         const KEYS: u8 = 8;
@@ -1883,7 +1768,7 @@ mod tests {
                     .expect("put");
             }
         }
-        appender.seal().expect("seal");
+        appender.flush().expect("flush");
 
         let rebuilt = rebuild(&sim);
 
@@ -1905,7 +1790,12 @@ mod tests {
         const KEYS: u32 = 12_000;
         const DELETE_EVERY: usize = 7;
         let sim = SimIo::new(FaultPlan::new(1));
-        let shared = shared(config(SyncPolicy::Never), &sim);
+        // Room for every record in one tail, since only a tail's rows are fed
+        let roomy = ReelConfig {
+            segment_bytes: ByteCount::mb(16),
+            ..config(SyncPolicy::Never)
+        };
+        let shared = shared(roomy, &sim);
         let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         // The leading bytes are a hash of the number, so the keys cover every shard
         let spread = |at: u32| {
@@ -1930,17 +1820,11 @@ mod tests {
                 .expect("delete");
             newest.remove(at);
         }
-        appender.seal().expect("seal");
+        appender.flush().expect("flush");
 
-        let driver = IoDriver::new(Arc::new(sim.clone()));
-        let index = ReelIndex::new(COLUMNS, IndexResidency::Resident).expect("index");
-        let roots = [PathBuf::from(REEL_DIR)];
-        let rebuilt = rebuild_reel(&driver, &roots, &[false], false, &index).expect("rebuild");
+        let rebuilt = rebuild(&sim);
 
-        let rows = index
-            .column(RECORDS)
-            .map(|column| column.held())
-            .unwrap_or_default();
+        let rows = rebuilt.rows(RECORDS);
         assert_eq!(rows.len(), newest.len());
         for (key, entry) in &rows {
             let at = u32::from_be_bytes(key.as_slice()[4..8].try_into().expect("number"));
@@ -1952,7 +1836,7 @@ mod tests {
         }
         let (mut live, mut dead) = (0, 0);
         for number in 1..=rebuilt.highest_segment.as_u32() {
-            let bytes = index.segment_bytes(SegmentId(number));
+            let bytes = rebuilt.index.segment_bytes(SegmentId(number));
             live += bytes.live;
             dead += bytes.dead;
         }
@@ -2281,9 +2165,9 @@ mod tests {
         }
     }
 
-    // a stale footerless segment cannot shadow what sealed after it on a paged rebuild
+    // a stale footerless segment cannot shadow what sealed after it
     #[test]
-    fn a_stale_footerless_segment_does_not_shadow_paged() {
+    fn a_stale_footerless_segment_does_not_shadow() {
         let sim = SimIo::new(FaultPlan::new(1));
         let shared = shared(config(SyncPolicy::Never), &sim);
         let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
@@ -2312,9 +2196,9 @@ mod tests {
         let mut image = sim.durable_image();
         strip_footer(&mut image, "000001.reel", journal);
         let torn = SimIo::from_image(image);
-        let rebuilt = rebuild_on(&torn, IndexResidency::Paged);
+        let rebuilt = rebuild(&torn);
 
-        let rows = rebuilt.rows(RECORDS);
+        let rows = rebuilt.held(RECORDS);
         assert!(
             !rows.iter().any(|(key, _)| key.as_slice() == [1u8; 34]),
             "the journaled old version shadows the sealed rewrite"
@@ -2476,7 +2360,11 @@ mod tests {
         let entries = (0..rows)
             .map(|at| FooterEntry::new(key(at as u8), Lsn(1), at, 400, Flags::DATA))
             .collect();
-        SegmentFooter::build(entries).pack(0).expect("pack").len() as u64
+        let filter_bits = config(SyncPolicy::Never).filter_bits;
+        SegmentFooter::build(entries)
+            .pack(filter_bits)
+            .expect("pack")
+            .len() as u64
     }
 
     fn sealed_pair(sim: &SimIo) {

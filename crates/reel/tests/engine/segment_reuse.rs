@@ -15,7 +15,7 @@ use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, RecordKey};
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::units::ByteCount;
-use reel::{KeyWidth, Preallocate, ReelStore};
+use reel::{KeyWidth, ReelStore};
 
 const ROWS: ColumnId = ColumnId(1);
 
@@ -42,8 +42,6 @@ fn key(at: u64) -> RecordKey {
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT),
-        alloc_chunk: ByteCount::from_bytes(SEGMENT / 4),
-        preallocate: Preallocate::Full,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         ..ReelConfig::default()
@@ -140,7 +138,6 @@ fn only_a_tail_that_syncs_often_fills_its_next_window() {
         let home = TempDir::new().expect("home");
         let config = ReelConfig {
             segment_bytes: ByteCount::from_bytes(BIG_SEGMENT),
-            alloc_chunk: ByteCount::from_bytes(BIG_SEGMENT / 4),
             sync,
             ..config()
         };

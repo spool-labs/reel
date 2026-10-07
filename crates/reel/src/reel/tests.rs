@@ -8,7 +8,7 @@ use std::thread;
 
 use crate::units::ByteCount;
 
-use crate::config::{Preallocate, SyncPolicy, ThreadBudget, DEFAULT_FD_CACHE};
+use crate::config::{SyncPolicy, ThreadBudget, DEFAULT_FD_CACHE};
 use crate::format::column::{Codec, ColumnId, ColumnSpec, KeyWidth};
 use crate::io::fault::FaultPlan;
 use crate::io::sim_backend::SimIo;
@@ -56,7 +56,6 @@ const TEST_COLUMNS: ColumnSet = &[
 fn harness(active_tails: usize) -> (Arc<ReelShared>, SimIo) {
     let config = ReelConfig {
         segment_bytes: ByteCount::mb(1),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(active_tails as u32),
         ..ReelConfig::default()

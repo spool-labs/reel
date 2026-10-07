@@ -83,7 +83,6 @@ fn check_value(seed: u64, key: u64, value: &[u8]) -> u64 {
 fn config(rng: &mut SmallRng) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(64 * 1024),
-        alloc_chunk: ByteCount::from_bytes(16 * 1024),
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(rng.gen_range(1..=4)),
         compact_dead_ratio: 0.1,

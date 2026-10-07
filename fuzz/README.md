@@ -1,6 +1,6 @@
 # fuzz
 
-Four libFuzzer targets, run weekly by `models.yml` and by hand with a nightly toolchain:
+Three libFuzzer targets, run weekly by `models.yml` and by hand with a nightly toolchain:
 
 ```
 cargo install cargo-fuzz --locked
@@ -21,8 +21,8 @@ macOS and Linux; the gzip wrapper can differ by zlib build, so `check` compares 
 To grow a corpus, run a target for a while, shrink what it kept, pack, and commit:
 
 ```
-cargo +nightly fuzz run persisted_index -- -max_total_time=3600
-cargo +nightly fuzz cmin persisted_index
-python3 seeds.py pack persisted_index
-python3 seeds.py check persisted_index
+cargo +nightly fuzz run format_parsers -- -max_total_time=3600
+cargo +nightly fuzz cmin format_parsers
+python3 seeds.py pack format_parsers
+python3 seeds.py check format_parsers
 ```

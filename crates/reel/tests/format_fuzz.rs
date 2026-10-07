@@ -19,7 +19,7 @@ use rand::{Rng, SeedableRng};
 
 use reel::append::codec::{admit, decode};
 use reel::format::band::Band;
-use reel::format::column::{Codec, ColumnId};
+use reel::format::column::Codec;
 use reel::format::filter::Filter;
 use reel::format::footer::{FooterEntry, SegmentFooter};
 use reel::format::journal::read_groups;
@@ -29,10 +29,9 @@ use reel::format::prefix::{unpack, PrefixRows, Tail};
 use reel::format::record::{CheckKey, Flags, RecordHeader, RecordLayout, HEADER_LEN};
 use reel::format::segment_header::{SegmentHeader, SEGMENT_HEADER_LEN, SEGMENT_HEADER_SPAN};
 use reel::index::column::ColumnMark;
-use reel::index::persisted::{PersistedColumn, PersistedIndex, PersistedSegment};
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::{DurableImage, SimIo};
-use reel::{ByteCount, Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget};
+use reel::{ByteCount, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget};
 
 use harness::observe::observe;
 use harness::op_stream::StreamOp;
@@ -77,8 +76,6 @@ const FIXTURE_LEN: usize = 5_000;
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(32 * 1024),
-        alloc_chunk: ByteCount::from_bytes(8 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::EveryPut,
         active_tails: ThreadBudget::threads(1),
         ..ReelConfig::default()
@@ -94,8 +91,8 @@ fn random_bytes(rng: &mut SmallRng, max: usize) -> Vec<u8> {
 //
 // Length prefixes and counts are the sharp part: a parser that trusts one indexes
 // past its buffer. Every parser the crate exposes to bytes it did not write belongs
-// here, not just the three the segment is made of: the checkpoint head is read at
-// open, and a row block, a mark and a frame are each read off bytes a sweep found.
+// here, the three the segment is made of and the rest: a row block, a mark and a
+// frame are each read off bytes a sweep found.
 #[test]
 fn parsers_never_panic_on_arbitrary_bytes() {
     for seed in SEEDS {
@@ -106,7 +103,6 @@ fn parsers_never_panic_on_arbitrary_bytes() {
             let _ = RecordHeader::unpack(&bytes);
             let _ = SegmentFooter::parse(&bytes);
             let _ = SegmentHeader::unpack(&bytes);
-            let _ = PersistedIndex::unpack(&bytes);
             let _ = PrefixRows::decode(&bytes, Tail::Entry);
             let _ = unpack(&bytes, Tail::Entry, None);
             let _ = unpack(&bytes, Tail::Entry, Some(33));
@@ -116,83 +112,6 @@ fn parsers_never_panic_on_arbitrary_bytes() {
                 let _ = decode(codec.as_byte(), &bytes);
             }
             let _ = read_groups(&bytes);
-        }
-    }
-}
-
-/// A checkpoint head standing for a volume of the drawn shape
-///
-/// Packed by the same writer the store uses, so what the sweeps below damage is a
-/// real file rather than a guess at one.
-fn persisted_index(rng: &mut SmallRng, columns: usize, segments: usize) -> PersistedIndex {
-    PersistedIndex {
-        at: Lsn(rng.gen()),
-        columns: (0..columns)
-            .map(|at| PersistedColumn {
-                column: ColumnId(at as u8),
-                key_width: rng.gen(),
-            })
-            .collect(),
-        segments: (0..segments)
-            .map(|at| PersistedSegment {
-                segment: SegmentId(at as u32),
-                len: rng.gen(),
-                dead: rng.gen(),
-                held: rng.gen(),
-                held_lsn: rng.gen::<bool>().then(|| Lsn(rng.gen())),
-                min_lsn: rng.gen::<bool>().then(|| Lsn(rng.gen())),
-            })
-            .collect(),
-    }
-}
-
-// a checkpoint head cut short at any byte refuses rather than indexes past its end
-//
-// The random sweep above never gets through the magic, so it proves the front door
-// and nothing behind it. A real head cut at every length walks the whole parser:
-// the counts it reads are genuine, and every slice it takes off them is against a
-// buffer that stops early. A short file is what a torn write leaves, so this is the
-// damage the open path actually meets.
-#[test]
-fn a_truncated_checkpoint_head_refuses() {
-    for seed in SEEDS {
-        let mut rng = SmallRng::seed_from_u64(*seed);
-        for shape in [(0usize, 0usize), (1, 1), (4, 9), (17, 40)] {
-            let packed = persisted_index(&mut rng, shape.0, shape.1).pack();
-
-            for cut in 0..packed.len() {
-                assert!(
-                    PersistedIndex::unpack(&packed[..cut]).is_err(),
-                    "a head of {} bytes cut to {cut} parsed",
-                    packed.len(),
-                );
-            }
-            let whole = PersistedIndex::unpack(&packed).expect("a packed head parses");
-            assert_eq!(whole.columns.len(), shape.0);
-            assert_eq!(whole.segments.len(), shape.1);
-        }
-    }
-}
-
-// a wounded checkpoint head refuses or parses, and never takes the open path down
-//
-// A flipped bit is usually the checksum's to catch. The ones that are not are the
-// point: a wound in the trailing bytes past what the counts claim, or one the crc
-// happens to survive, leaves a head that lies about its own shape.
-#[test]
-fn a_wounded_checkpoint_head_never_panics() {
-    for seed in SEEDS {
-        let mut rng = SmallRng::seed_from_u64(*seed);
-        for _ in 0..CASES {
-            let columns = rng.gen_range(0..8);
-            let segments = rng.gen_range(0..24);
-            let mut packed = persisted_index(&mut rng, columns, segments).pack();
-
-            for _ in 0..rng.gen_range(1..=4) {
-                let at = rng.gen_range(0..packed.len());
-                packed[at] ^= 1 << rng.gen_range(0..8);
-            }
-            let _ = PersistedIndex::unpack(&packed);
         }
     }
 }

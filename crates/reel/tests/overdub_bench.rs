@@ -11,8 +11,7 @@ use tempfile::TempDir;
 
 use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, FenceResidency,
-    IndexResidency, KeyWidth, MergeReport, Preallocate, ProbeCounts, RecordKey, ReelConfig,
-    ReelStore, SyncPolicy, ThreadBudget,
+    KeyWidth, MergeReport, ProbeCounts, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 /// The one column the workload writes
@@ -28,9 +27,6 @@ const KEY_WIDTH: usize = 32;
 const SHARD_BYTES: u8 = 1;
 
 /// Bits per key a seal spends on a filter
-///
-/// Declared for both flavours; a resident volume answers from its map and spends none of
-/// them whatever this says.
 const FILTER_BITS: u8 = 10;
 
 /// Keys the hot core holds, every one of them rewritten every round
@@ -68,9 +64,6 @@ const VALUE_MEAN: u64 = 180;
 
 /// Segment size, which is how many rounds' writes stand in one sorted run
 const SEGMENT_BYTES: u64 = 2 * 1024 * 1024;
-
-/// Bytes reserved ahead of the write head per allocation step
-const ALLOC_CHUNK: u64 = 256 * 1024;
 
 /// Rewrite passes one tick drives before it gives the round back
 const COMPACT_PASSES: u64 = 8;
@@ -441,9 +434,6 @@ struct Arm {
     /// What the table calls it
     name: &'static str,
 
-    /// Where a sealed segment's keys live
-    index: IndexResidency,
-
     /// Where the fence over a sealed segment's blocks lives
     fence: FenceResidency,
 }
@@ -451,12 +441,10 @@ struct Arm {
 const ARMS: [Arm; 2] = [
     Arm {
         name: "paged-carrying",
-        index: IndexResidency::Paged,
         fence: FenceResidency::Resident,
     },
     Arm {
-        name: "resident",
-        index: IndexResidency::Resident,
+        name: "paged",
         fence: FenceResidency::Off,
     },
 ];
@@ -475,13 +463,10 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
 fn config(arm: &Arm, knobs: &Knobs) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(knobs.segment_bytes),
-        alloc_chunk: ByteCount::from_bytes(ALLOC_CHUNK),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(knobs.tails),
         // Off, so nothing reads the volume behind the reads being timed.
         scrub_mbps: 0,
-        index: arm.index,
         fence: arm.fence,
         filter_bits: FILTER_BITS,
         footer_cache: ByteCount::from_bytes(knobs.footer_cache_bytes),

@@ -45,8 +45,7 @@ impl ReelStore {
 
     /// What the sealed segments were asked about keys, and what asking them cost
     ///
-    /// Counts rather than times, so they read the same on any machine. All zero on a
-    /// resident volume, which never searches a footer.
+    /// Counts of asks and reads, so they read the same on any machine.
     pub fn filter_probes(&self) -> ProbeCounts {
         self.reel.shared().probes.counts()
     }
@@ -118,7 +117,7 @@ impl ReelStore {
         // Whatever this attempt made short of the home rename is debris. Once that
         // rename lands the copy exists and nothing may be swept again.
         let mut sweep: Vec<PathBuf> = Vec::new();
-        match self.stage_and_publish(&pieces, boundary, cue.at(), &mut sweep) {
+        match self.stage_and_publish(&pieces, boundary, &mut sweep) {
             Ok(segments) => {
                 let at = cue.at();
                 drop(cue);
@@ -133,27 +132,11 @@ impl ReelStore {
         }
     }
 
-    /// Write the copy an index of its own, or leave it to open by sweeping
-    ///
-    /// Best effort: the copy is a whole volume without it and opens the slow way, so
-    /// a refusal here is a slower restore rather than a failed checkpoint. Taken
-    /// under the same cue and boundary as the links beside it, so its rows name the
-    /// segments the copy is about to be given.
-    fn index_for_copy(&self, staging: &Path, at: Lsn, boundary: SegmentId) {
-        if !self.keeps_index() {
-            return;
-        }
-        if let Err(error) = self.write_index(staging, at, boundary) {
-            tracing::warn!("the copy takes no index of its own and will open by sweeping: {error}");
-        }
-    }
-
     /// Stage every piece of a checkpoint, then publish with home last
     fn stage_and_publish(
         &self,
         pieces: &[(usize, PathBuf)],
         boundary: SegmentId,
-        at: Lsn,
         sweep: &mut Vec<PathBuf>,
     ) -> Result<usize> {
         let shared = self.reel.shared();
@@ -177,11 +160,6 @@ impl ReelStore {
                     true => write_copy_manifest(&staging, &published)?,
                     false => write_copy_marker(&staging, piece)?,
                 }
-            }
-            // The index goes beside the manifest, on home, since its rows name
-            // segments across every piece and one file describes the whole copy.
-            if *volume == 0 {
-                self.index_for_copy(&staging, at, boundary);
             }
             // The links are directory entries and nothing else, so this is the only
             // durability point a checkpoint adds per piece.
@@ -210,7 +188,7 @@ impl ReelStore {
     }
 
     /// Live record count and byte total for one column, from counters
-    pub fn column_totals(&self, column: ColumnId) -> Option<Totals> {
+    pub fn column_totals(&self, column: ColumnId) -> Totals {
         self.index.column_totals(column)
     }
 
@@ -235,13 +213,9 @@ impl ReelStore {
     /// The footer is read once, each column's row range is recorded so a later
     /// lookup knows whether to search this segment at all, and every key it still
     /// answers for leaves the map. Paging is guarded by location, so a key
-    /// overwritten since the seal keeps its resident entry.
+    /// overwritten since the seal keeps its entry in the map.
     pub fn page_out_sealed(&self) -> Result<usize> {
         self.hold_sealed()?;
-        if !self.config.index.pages() {
-            return Ok(0);
-        }
-
         let mut paged = 0usize;
         while let Some((segment, footer)) = self.next_to_hand_over() {
             paged += self.hand_over(segment, &footer)?;
@@ -295,10 +269,6 @@ impl ReelStore {
         // A segment leaves the sealed queue only once noted, so nothing retires one the index cannot search
         let named: Vec<SegmentId> = sealed.iter().map(|(segment, _)| *segment).collect();
         self.reel.shared().settle_sealed(&named);
-
-        if !self.config.index.pages() {
-            return Ok(());
-        }
         lock(&self.held).extend(sealed);
         Ok(())
     }
@@ -544,20 +514,12 @@ impl ReelStore {
     /// Give back the places held by tombstones nothing older can still reach
     ///
     /// A delete holds the key's place so a put drawn before it cannot be published
-    /// after it and come back fresh. A tick that finds every drawn number published
-    /// prunes to the counter itself, and one that does not falls back to the window.
+    /// after it and come back fresh. The floor sits a window below the counter: an
+    /// exact floor lets a grave go the moment its origin seals, and a footer search
+    /// that cannot offer that segment yet then answers an older version.
     pub fn prune_tombstones(&self) -> u64 {
-        let shared = self.reel.shared();
-        let peek = shared.lsn.peek().as_u64();
-        // A paging volume keeps the window: the exact floor lets a grave go the
-        // moment its origin seals, and a footer search that cannot offer that segment
-        // yet then answers an older version.
-        let is_exact = shared.nothing_unpublished() && !self.config.index.pages();
-        let floor = if is_exact {
-            peek
-        } else {
-            peek.saturating_sub(GRAVE_WINDOW)
-        };
+        let peek = self.reel.shared().lsn.peek().as_u64();
+        let floor = peek.saturating_sub(GRAVE_WINDOW);
         if floor == 0 {
             return 0;
         }

@@ -84,16 +84,12 @@ fn main() -> reel::Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path();
     let config = ReelConfig::default();
-    // What full preallocation would claim before a byte is written, which is the term
-    // the reservation half of the verdict turns on.
-    let reservation = config.segment_bytes.to_bytes() * config.tail_count() as u64;
 
     let facts = MachineFacts::read(root);
     report(root, &facts);
 
-    let verdict = facts.verdict(reservation);
+    let verdict = facts.verdict();
     println!();
-    println!("{:<20}{}", "reservation", size(Some(reservation)));
     println!("{:<20}{:?}", "plane", verdict.plane);
     println!("{:<20}{}", "because", verdict.because);
     println!("{:<20}{}", "mapping", verdict.map_because);
@@ -106,7 +102,6 @@ fn main() -> reel::Result<()> {
         }
     );
     println!("{:<20}{:?}", "ranged reads", verdict.ranged_reads);
-    println!("{:<20}{:?}", "preallocate", verdict.preallocate);
     println!("{:<20}{}", "fd cache", verdict.fd_cache);
 
     // A window is read where the volume opened: a direct volume is refused mapped
@@ -130,7 +125,7 @@ fn main() -> reel::Result<()> {
     assert_eq!(kept.memory_bytes, facts.memory_bytes);
     assert_eq!(kept.volume_capacity_bytes, facts.volume_capacity_bytes);
     assert_eq!(kept.ring, facts.ring);
-    assert_eq!(kept.verdict(reservation).plane, verdict.plane);
+    assert_eq!(kept.verdict().plane, verdict.plane);
 
     println!();
     println!("the open read these facts for itself and reached the same plane");

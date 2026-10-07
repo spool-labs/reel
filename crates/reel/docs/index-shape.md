@@ -1,4 +1,4 @@
-# What the resident index is held in
+# What the index map is held in
 
 The index started as a `BTreeMap<K, Entry>` per shard. It is a purpose-built B+ tree now at
 both key types. The tree beats the map on every axis that reaches the store, and the largest win is not in the
@@ -323,13 +323,13 @@ record played back and only the first two are the map's.
 
 ## The sweep
 
-A maintenance pass wants complete, resumable coverage of a column. `ShardMap::sweep` walks a
-shard in key order and marks with the last key it handed out. A mark is opaque, and
-`ColumnMark` holds the opening that minted it, since a mark outlives its process through a
-persisted cursor or a peer's request. A mark from another opening starts the sweep over, so
-the promise is at-least-once, which is what the callers need.
+A maintenance pass wants complete, resumable coverage of a column. A sweep pages the column in
+key order, the map and the footers merged, and marks with the last key it handed out. A mark is
+opaque, and `ColumnMark` holds the opening that minted it, since a mark outlives its process
+through a persisted cursor or a peer's request. A mark from another opening starts the sweep
+over, so the promise is at-least-once, which is what the callers need.
 
-`sweep_prefix` narrows it to one prefix, in key order, since the keys under a prefix are one run.
+`sweep_prefix` narrows it to one prefix, whose keys are one run.
 
 ## Resident bytes per key, which the tree does not win
 
@@ -343,7 +343,7 @@ and `span` can yield and that is a trait change this cut does not make.
 
 ## A lossy key must never be the map key
 
-Prefix keys keep getting proposed for the resident index, on the reasoning that the tree could
+Prefix keys keep getting proposed for the index map, on the reasoning that the tree could
 hold eight bytes instead of thirty-four and that a collision costs one wasted read. The first
 half is attractive and the second half is false, and the difference is data loss rather than a
 latency tail. **A collision costs a wasted read for a filter. It costs a key for a map.** Keyed

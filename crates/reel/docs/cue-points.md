@@ -14,14 +14,13 @@ key.** `WidthIndex::insert` replaces the entry outright and books the record
 it displaced dead, so for a key whose live entry is at sequence 900, a read at
 cue point 500 does not want a bounded lookup, it wants a different record
 entirely, and a bound only tells the reader its answer is too new. The
-versions are not gone, though: they are rows in sealed segment footers, which
-a footer lists whatever the index residency is, and finding them costs one key
-span per segment per column rather than anything per key. That is why this
-stayed a small feature rather than a rewrite.
+versions are not gone, though: they are rows in sealed segment footers, and
+finding them costs one key span per segment per column and nothing per key. That
+is why this stayed a small feature and never a rewrite.
 
 Two properties of the engine are what make it possible at all. `SealedRanges`
-records spans unconditionally, on resident volumes too, so footer search works
-on every volume at a cost that tracks segment count. And `Appender::seal()` is
+records the span of every sealed segment, so footer search works at a cost that
+tracks segment count. And `Appender::seal()` is
 synchronous even though the seal itself runs off the append path, because a
 caller reaching for it is asking for a sealed segment, which is the primitive a
 cue point needs.
@@ -51,7 +50,7 @@ drawn at C > S records a deletion that had not happened yet, so it must be
 ignored, and a cover at C <= S applies as usual. Getting this backwards would
 make a cue point show a range delete its own timeline never saw.
 
-**Walks** are the same merge as a paged playback with the same two rules per
+**Walks** are the same merge as a playback with the same two rules per
 key: skip map entries above S, take the newest footer row at or below S.
 
 ## What has to stop reclaiming
@@ -120,6 +119,5 @@ The differential stream takes a cue point, keeps mutating, and checks it still
 serves the older state while the live view moves on, including across a range
 delete drawn after the cue, the cover rule above and the easiest thing to get
 backwards. Compaction and the cover sweep run underneath a held cue point
-without changing what it serves. The suite covers resident volumes too, since
-recording spans unconditionally is what makes cue points not a paged-only
-feature. `tests/probes/cue_speed.rs` is the cost table above.
+without changing what it serves. `tests/probes/cue_speed.rs` is the cost table
+above.

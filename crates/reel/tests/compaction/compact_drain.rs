@@ -10,8 +10,8 @@ use std::sync::Arc;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, Preallocate, ReelConfig,
-    ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget,
 };
 use reel_core::Store;
 
@@ -32,8 +32,6 @@ fn one_pass_drains_every_wholly_dead_segment() {
         PathBuf::from("/drain"),
         ReelConfig {
             segment_bytes: ByteCount::from_bytes(128 * 1024),
-            alloc_chunk: ByteCount::from_bytes(32 * 1024),
-            preallocate: Preallocate::Chunk,
             sync: SyncPolicy::Never,
             active_tails: ThreadBudget::threads(1),
             ..ReelConfig::default()

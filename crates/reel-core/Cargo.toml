@@ -8,7 +8,7 @@ readme = "README.md"
 keywords = ["key-value", "storage", "store", "abstraction"]
 edition.workspace = true
 rust-version.workspace = true
-description = "A thin typed key-value store abstraction: the Store trait, write batches, and ordered iteration"
+description = "A thin key-value store abstraction: the Store trait, write batches, and ordered iteration"
 categories = ["database", "rust-patterns"]
 
 [lib]
@@ -17,4 +17,3 @@ path = "src/lib.rs"
 
 [dependencies]
 thiserror.workspace = true
-wincode.workspace = true

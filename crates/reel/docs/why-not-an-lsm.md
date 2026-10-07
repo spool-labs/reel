@@ -71,15 +71,15 @@ into the end of that same segment as a footer: a packed sorted index of the rows
 the segment took, partitioned by column, each partition sorted by key and
 strided at that column's own key width, behind a directory and a fixed tail. A
 sealed segment is therefore self-describing. It can be indexed with no structure
-outside it, which is what makes both a paged index and a rebuild-from-files
-recovery possible without a manifest.
+outside it, which is what makes both an index kept in the footers and a
+rebuild-from-files recovery possible without a manifest.
 
 **Where it differs from the lineage:** the index shape is not an LSM tree of
 keys. There is no level structure, no key-space partitioning across files, and
-no merge that a read has to walk by construction. The resident form is a sharded
-ordered map, sharded on the leading key bytes the caller declares. The paged
-form is the footers themselves, reached through a funnel of filters and key
-spans. Neither is a tree of files.
+no merge that a read has to walk by construction. The open tails' keys sit in a
+sharded ordered map, sharded on the leading key bytes the caller declares. Sealed
+keys stay in the footers themselves, reached through the spot index or a funnel of
+filters and key spans. Neither is a tree of files.
 
 One thing the separation gives back for free: the garbage collection problem the
 value log creates is not a second mechanism bolted next to a tree compaction. It
@@ -129,10 +129,11 @@ copy path every time.
 
 This is where the level structure comes back, for keys alone.
 
-A paged get asks the spot index, an in-memory table of where each sealed key's
-record lies, and reads the record in one device read. A walk can't do that. The
-log keeps no key order, so a walk merges the footer of every sealed segment whose
-key range reaches into its span, and that fan-in grows with every seal.
+A get of a sealed key asks the spot index, an in-memory table of where each
+sealed key's record lies, and reads the record in one device read. A walk can't do
+that. The log keeps no key order, so a walk merges the footer of every sealed
+segment whose key range reaches into its span, and that fan-in grows with every
+seal.
 
 A key merge bounds it. Once more than eight runs stand over one key, the
 maintenance tick merges the walk's runs into a key run, a file of sorted rows that
@@ -190,8 +191,7 @@ Named rather than argued, because each of these is real.
 - One write per byte on the ingest path, in its final position, with no second
   durable structure to reconcile at open.
 - Reclaim that is an unlink for a workload whose records die together.
-- A resident index that is a choice rather than a level count: one op per read
-  while the memory is there, two when it is not.
+- An index with no level count: a get places its record for one device read.
 - Values stored whole and read back verbatim, in one device op placed by the
   index, with no block framing to unpack around them.
 - Recovery that is a walk of the files, because the files are the truth.

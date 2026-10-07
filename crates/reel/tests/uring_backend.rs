@@ -132,7 +132,6 @@ fn tuning() -> RingTuning {
 fn ring_config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(4),
-        alloc_chunk: ByteCount::mb(1),
         sync: SyncPolicy::Bytes(ByteCount::mb(1)),
         scrub_mbps: 0,
         io_backend: IoBackend::Uring,

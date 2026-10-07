@@ -18,7 +18,6 @@ use reel::format::prefix::PrefixRows;
 use reel::format::record::{BatchFrame, RecordHeader};
 use reel::format::segment_header::SegmentHeader;
 use reel::index::column::ColumnMark;
-use reel::index::persisted::PersistedIndex;
 
 /// Partitions a filter region is read at, kept small so a case stays cheap
 const PARTITIONS: usize = 4;
@@ -30,7 +29,6 @@ fuzz_target!(|bytes: &[u8]| {
     let _ = RecordHeader::unpack(bytes);
     let _ = SegmentFooter::parse(bytes);
     let _ = SegmentHeader::unpack(bytes);
-    let _ = PersistedIndex::unpack(bytes);
     let _ = PrefixRows::decode(bytes);
     let _ = ColumnMark::unpack(bytes);
     let _ = Filter::parse_region(bytes, PARTITIONS);

@@ -25,7 +25,10 @@ pub mod rendezvous {
     pub fn at(_name: &'static str) {}
 }
 
-use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+use std::sync::{
+    Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
+};
+use std::time::Duration;
 
 /// Lock a mutex, recovering the guard when a panicking holder poisoned it
 pub fn lock<Guarded>(mutex: &Mutex<Guarded>) -> MutexGuard<'_, Guarded> {
@@ -60,67 +63,24 @@ pub fn write<Guarded>(shared: &RwLock<Guarded>) -> RwLockWriteGuard<'_, Guarded>
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Primitives that swap for the model checker's under --cfg loom
-///
-/// A module the checker has tests for takes its locks and atomics from here rather
-/// than from std, so what the checker drives is what ships. Everything else keeps
-/// std directly, since the io backends cannot run inside a model.
-pub mod checked {
-    use std::time::Duration;
+/// Wait on a condition variable, recovering the guard from a poisoned lock
+pub fn wait<'guard, Guarded>(
+    condition: &Condvar,
+    guard: MutexGuard<'guard, Guarded>,
+) -> MutexGuard<'guard, Guarded> {
+    condition
+        .wait(guard)
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
-    #[cfg(loom)]
-    pub use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-    #[cfg(loom)]
-    pub use loom::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-
-    #[cfg(not(loom))]
-    pub use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-    #[cfg(not(loom))]
-    pub use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-
-    /// Lock a mutex, recovering the guard when a panicking holder poisoned it
-    pub fn lock<Guarded>(mutex: &Mutex<Guarded>) -> MutexGuard<'_, Guarded> {
-        mutex
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Take a shared read guard, recovering it when a panicking writer poisoned it
-    pub fn read<Guarded>(shared: &RwLock<Guarded>) -> RwLockReadGuard<'_, Guarded> {
-        shared
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Take an exclusive write guard, recovering it when a panicking writer poisoned it
-    pub fn write<Guarded>(shared: &RwLock<Guarded>) -> RwLockWriteGuard<'_, Guarded> {
-        shared
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Wait on a condition variable, recovering the guard from a poisoned lock
-    pub fn wait<'guard, Guarded>(
-        condition: &Condvar,
-        guard: MutexGuard<'guard, Guarded>,
-    ) -> MutexGuard<'guard, Guarded> {
-        condition
-            .wait(guard)
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Wait on a condition variable for a bounded time, recovering a poisoned guard
-    ///
-    /// The checker has no clock and takes this as an open wait, so a park it
-    /// explores ends on the notification or not at all.
-    pub fn wait_for<'guard, Guarded>(
-        condition: &Condvar,
-        guard: MutexGuard<'guard, Guarded>,
-        limit: Duration,
-    ) -> MutexGuard<'guard, Guarded> {
-        let (guard, _) = condition
-            .wait_timeout(guard, limit)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard
-    }
+/// Wait on a condition variable for a bounded time, recovering a poisoned guard
+pub fn wait_for<'guard, Guarded>(
+    condition: &Condvar,
+    guard: MutexGuard<'guard, Guarded>,
+    limit: Duration,
+) -> MutexGuard<'guard, Guarded> {
+    let (guard, _) = condition
+        .wait_timeout(guard, limit)
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
 }

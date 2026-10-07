@@ -20,8 +20,8 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSpec, IndexResidency, KeyPage, KeyWidth, RecordKey,
-    RecordWrite, ReelConfig, ReelStore, SyncPolicy, ThreadBudget, MAP_EVERYTHING,
+    ByteCount, Codec, ColumnId, ColumnSpec, KeyPage, KeyWidth, RecordKey, RecordWrite, ReelConfig,
+    ReelStore, SyncPolicy, ThreadBudget, MAP_EVERYTHING,
 };
 
 const RECORDS: ColumnId = ColumnId(1);
@@ -94,7 +94,6 @@ fn open_at(dir: &TempDir) -> ReelStore {
             segment_bytes: ByteCount::mb(256),
             sync: SyncPolicy::Never,
             active_tails: ThreadBudget::threads(tails()),
-            index: IndexResidency::Resident,
             // The read path the engine serves callers with
             map_above: MAP_EVERYTHING,
             ..ReelConfig::default()

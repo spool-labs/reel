@@ -146,9 +146,7 @@ impl VerifyReport {
 /// Sweep every record an open volume holds against its checksum
 ///
 /// Driven by what is on the disk rather than by what the index remembers: a file
-/// the index never named is exactly the file a sweep must not skip. Open the
-/// volume paged, since a resident open names only the segments still holding a
-/// live key.
+/// the index never listed is exactly the file a sweep must not skip.
 pub fn verify(engine: &ReelStore, limit: usize) -> VerifyReport {
     verify_watched(engine, limit, &mut |_| {})
 }

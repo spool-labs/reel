@@ -9,9 +9,7 @@
 mod harness;
 
 use reel::io::fault::{FaultKind, FaultPlan};
-use reel::{
-    ByteCount, FenceResidency, IndexResidency, Preallocate, ReelConfig, SyncPolicy, ThreadBudget,
-};
+use reel::{ByteCount, FenceResidency, ReelConfig, SyncPolicy, ThreadBudget};
 
 use harness::fixture::Differential;
 use harness::op_stream;
@@ -25,9 +23,6 @@ const STREAM_LEN: usize = 120;
 /// Segment size that rolls a few times over a default stream
 const SEGMENT_BYTES: u64 = 64 * 1024;
 
-/// Space reserved ahead of the write head per allocation step
-const ALLOC_CHUNK: u64 = 4 * 1024;
-
 /// How often the soak stream checks agreement and compacts the reel
 const SOAK_CHECK_EVERY: usize = 200;
 
@@ -39,8 +34,8 @@ const SOAK_SEGMENT_BYTES: u64 = 1024 * 1024;
 
 /// Segment size a paged stream uses, small enough that a stream seals many segments
 ///
-/// A key only reaches a footer once its segment seals, so a paged run over the default
-/// segment would page nothing out and measure the resident index twice.
+/// A key only reaches a footer once its segment seals, so a run over the default
+/// segment would page nothing out.
 const PAGED_SEGMENT_BYTES: u64 = 16 * 1024;
 
 /// Length of a paged stream, long enough to seal several segments at that size
@@ -49,8 +44,6 @@ const PAGED_STREAM_LEN: usize = 640;
 fn reel_config(active_tails: u32) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT_BYTES),
-        alloc_chunk: ByteCount::from_bytes(ALLOC_CHUNK),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::EveryPut,
         active_tails: ThreadBudget::threads(active_tails),
         ..ReelConfig::default()
@@ -60,8 +53,6 @@ fn reel_config(active_tails: u32) -> ReelConfig {
 fn never_config(active_tails: u32) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT_BYTES),
-        alloc_chunk: ByteCount::from_bytes(ALLOC_CHUNK),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(active_tails),
         ..ReelConfig::default()
@@ -71,11 +62,8 @@ fn never_config(active_tails: u32) -> ReelConfig {
 fn paged_config(active_tails: u32) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(PAGED_SEGMENT_BYTES),
-        alloc_chunk: ByteCount::from_bytes(ALLOC_CHUNK),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(active_tails),
-        index: IndexResidency::Paged,
         ..ReelConfig::default()
     }
 }
@@ -106,8 +94,6 @@ fn fenced_config(active_tails: u32, fence: FenceResidency) -> ReelConfig {
 fn soak_config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SOAK_SEGMENT_BYTES),
-        alloc_chunk: ByteCount::from_bytes(ALLOC_CHUNK),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(4),
         ..ReelConfig::default()
@@ -226,7 +212,7 @@ fn never_reopen_multi_tail() {
     }
 }
 
-// a paged volume serves what a resident one serves, with its keys in the footers
+// a volume with its keys in the footers serves what the oracle serves
 #[test]
 #[cfg(not(miri))]
 fn paged_single_tail() {
@@ -291,48 +277,6 @@ fn merged_multi_tail() {
         fixture.run_stream(&op_stream::generate(*seed, PAGED_STREAM_LEN));
         fixture.assert_paged_out();
         fixture.assert_merged_runs();
-    }
-}
-
-// a volume reopening from its written-down index serves what the oracle serves
-#[test]
-#[cfg(not(miri))]
-fn checkpointed_single_tail() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open(*seed, reel_config(1)).checkpointing();
-        fixture.run_stream(&op_stream::generate(*seed, STREAM_LEN));
-        assert!(
-            fixture.checkpointed_keys() > 0,
-            "seed {seed} wrote no key into any index checkpoint",
-        );
-    }
-}
-
-// the same at four tails, where a key can seal in one tail and be rewritten in another
-#[test]
-#[cfg(not(miri))]
-fn checkpointed_multi_tail() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open(*seed, reel_config(4)).checkpointing();
-        fixture.run_stream(&op_stream::generate(*seed, STREAM_LEN));
-        assert!(
-            fixture.checkpointed_keys() > 0,
-            "seed {seed} wrote no key into any index checkpoint",
-        );
-    }
-}
-
-// and under never sync, where a reopen also has to reproduce a rolled segment
-#[test]
-#[cfg(not(miri))]
-fn checkpointed_never_reopen() {
-    for seed in SEEDS {
-        let mut fixture = Differential::open(*seed, never_config(1)).checkpointing();
-        fixture.run_stream(&op_stream::generate(*seed, STREAM_LEN));
-        assert!(
-            fixture.checkpointed_keys() > 0,
-            "seed {seed} wrote no key into any index checkpoint",
-        );
     }
 }
 

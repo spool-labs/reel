@@ -10,8 +10,8 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSpec, IndexResidency, KeyWidth, RecordKey, ReelConfig,
-    ReelStore, SyncPolicy, ThreadBudget, MAP_EVERYTHING,
+    ByteCount, Codec, ColumnId, ColumnSpec, KeyWidth, RecordKey, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget, MAP_EVERYTHING,
 };
 
 const RECORDS: ColumnId = ColumnId(1);
@@ -40,7 +40,6 @@ fn config(tails: u32) -> ReelConfig {
         segment_bytes: ByteCount::mb(64),
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(tails),
-        index: IndexResidency::Resident,
         // The read path the engine serves callers with
         map_above: MAP_EVERYTHING,
         ..ReelConfig::default()

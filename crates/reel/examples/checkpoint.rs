@@ -14,8 +14,8 @@ use tempfile::TempDir;
 
 use reel::format::column::RecordKey;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, ReelConfig,
-    ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget,
 };
 use reel_core::Value;
 
@@ -47,10 +47,8 @@ const OVERWRITE_FILL: u8 = 0xff;
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(1),
-        alloc_chunk: ByteCount::from_bytes(64 * 1024),
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(2),
-        index: IndexResidency::Resident,
         ..ReelConfig::default()
     }
 }

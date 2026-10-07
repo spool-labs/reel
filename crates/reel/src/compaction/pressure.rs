@@ -5,10 +5,9 @@
 //! ceiling while compaction may still write into the reserve band, so the append-only
 //! deadlock of needing to write in order to free space cannot happen.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-use crate::sync::checked::{AtomicBool, AtomicU64, Ordering};
 
 use crate::config::CompactRate;
 use crate::sync::lock;
@@ -151,14 +150,6 @@ impl GcPressure {
         used_bytes + request_bytes <= ceiling
     }
 
-    /// Whether a compaction write of this size fits, the reserve band included
-    pub fn can_admit_compaction(&self, used_bytes: u64, request_bytes: u64) -> bool {
-        if !self.is_bounded() {
-            return true;
-        }
-        used_bytes + request_bytes <= self.capacity_bytes
-    }
-
     /// The share of the write budget a foreground writer should be given
     ///
     /// One while the volume has room, falling linearly to the floor across the band
@@ -179,14 +170,6 @@ impl GcPressure {
         }
         let into = (used_bytes - opens_at) as f64 / band as f64;
         1.0 - into * (1.0 - SLOWDOWN_FLOOR)
-    }
-
-    /// Whether foreground writes are blocked at the reserve ceiling, the alarm
-    pub fn is_foreground_blocked(&self, used_bytes: u64) -> bool {
-        if !self.is_bounded() {
-            return false;
-        }
-        used_bytes >= self.capacity_bytes.saturating_sub(self.reserve_bytes)
     }
 }
 
@@ -269,11 +252,6 @@ impl RateGate {
             // the clock starts at open, so the first pass earns from the stretch before it
             ran_at: Mutex::new(Instant::now()),
         }
-    }
-
-    /// The resolved rate in megabytes per second
-    pub fn target_mbps(&self) -> u64 {
-        self.limiter.target_mbps()
     }
 
     /// Whether the rate allows another pass to start now
@@ -479,8 +457,6 @@ mod tests {
         assert_eq!(bounded.foreground_ceiling_bytes(), Some(900));
         assert!(bounded.can_admit_foreground(800, 100));
         assert!(!bounded.can_admit_foreground(800, 101));
-        // compaction may spend the reserve, which is what the reserve is for
-        assert!(bounded.can_admit_compaction(900, 100));
     }
 
     // escalating and relaxing happen at different marks, so the tier settles
@@ -633,26 +609,13 @@ mod tests {
         assert_eq!(pressure.effective_dead_ratio(0.40, false), 0.20);
     }
 
-    // foreground stops at the reserve ceiling while compaction writes into it
-    #[test]
-    fn reserve_admits_only_compaction() {
-        let pressure = pressure();
-        let at_ceiling = 900;
-
-        assert!(!pressure.can_admit_foreground(at_ceiling, 50));
-        assert!(pressure.is_foreground_blocked(at_ceiling));
-        assert!(pressure.can_admit_compaction(at_ceiling, 50));
-        assert!(!pressure.can_admit_compaction(at_ceiling, 200));
-    }
-
-    // an unbounded volume never blocks either plane
+    // an unbounded volume never refuses a foreground write
     #[test]
     fn unbounded_admits_all() {
         let pressure = GcPressure::new(0, 100, 0.50);
 
         assert!(!pressure.is_bounded());
         assert!(pressure.can_admit_foreground(u64::MAX / 2, 4096));
-        assert!(!pressure.is_foreground_blocked(u64::MAX / 2));
     }
 
     // a zero scrub rate disables the scrub limiter

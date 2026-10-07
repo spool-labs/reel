@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::{DurableImage, SimIo};
-use reel::{ByteCount, Preallocate, ReelConfig, ReelStore, SyncPolicy, ThreadBudget};
+use reel::{ByteCount, ReelConfig, ReelStore, SyncPolicy, ThreadBudget};
 
 use crate::harness::observe::observe;
 use crate::harness::op_stream::StreamOp;
@@ -34,16 +34,11 @@ const FIXTURE_LEN: usize = 300;
 const ROOT_LIST_AT: u64 = 0;
 
 /// Op position the first segment read executes at, once the listings have resolved
-///
-/// Past the open every reopen spends looking for an index file to read back, which
-/// on a volume that wrote none is one op that answers missing.
-const FIRST_READ_AT: u64 = 5;
+const FIRST_READ_AT: u64 = 4;
 
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(1),
-        alloc_chunk: ByteCount::from_bytes(16 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::EveryPut,
         active_tails: ThreadBudget::threads(1),
         ..ReelConfig::default()

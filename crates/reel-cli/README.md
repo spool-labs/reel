@@ -3,7 +3,7 @@
 The operator toolbox for reel volumes. One binary, `reel`, six verbs:
 
 ```
-reel <VOLUME> [--column NAME:ID[:WIDTH]]... [--paged]
+reel <VOLUME> [--column NAME:ID[:WIDTH]]...
               [-o text|json|markdown] [--color auto|always|never] <VERB>
 
   cue         sequence, floor, segments live/dead/held, covers, graves, cues held
@@ -19,7 +19,7 @@ volume something else is writing; `checkpoint` seals the tails to draw the
 line it copies at, so it takes the lock.
 
 A volume's schema is not discoverable from disk, so column names arrive as
-flags. Cells the chosen open cannot fill print `-`, never a false zero.
+flags.
 
 ## What a report looks like
 

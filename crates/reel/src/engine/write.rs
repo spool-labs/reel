@@ -29,6 +29,8 @@ impl ReelStore {
             planned.codec,
             Commit::PerRecord,
         )?;
+        // A slow put stands here with its record down and the index not yet moved
+        crate::sync::rendezvous::at("put/landed");
         self.index.insert(key, committed.loc, committed.lsn)?;
         Ok(())
     }
@@ -163,7 +165,7 @@ impl ReelStore {
         // Only the map moves under that hold: settling a paged column's displaced key
         // reads a footer, and a reader waiting on the barrier must not be waiting on
         // the volume, so those are collected and run afterwards.
-        let pages = self.index.residency().pages();
+
         // Built before the barrier is taken, so the hold costs only the move. A range
         // is held apart with the count of moves ahead of it, since the index applies a
         // run of key moves at a time and a cover is not one of them.
@@ -188,7 +190,7 @@ impl ReelStore {
             }
         }
 
-        let landed = self.index.publish_batch(&moves, &ranges);
+        let landed = self.index.publish_batch(&moves, &ranges)?;
 
         // One answer per key move, so the ranges are stepped over rather than paired.
         let mut answers = landed.iter();
@@ -200,7 +202,7 @@ impl ReelStore {
             let Some(mapped) = answers.next() else {
                 break;
             };
-            if pages && mapped.may_be_paged() {
+            if mapped.may_be_paged() {
                 displaced.push((planned.key.clone(), record.lsn));
             }
         }

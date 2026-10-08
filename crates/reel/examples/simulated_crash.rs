@@ -45,10 +45,10 @@ const REFUSED_RECORD: u32 = 7;
 /// Global op positions the two faulted appends execute at
 ///
 /// A plan pins faults to op positions rather than calls, so these are read off a run:
-/// at one tail syncing every put, a put is a record write, a journal write and two
-/// syncs, and these are the last two records' writes.
-const TORN_AT: u64 = 33;
-const ENOSPC_AT: u64 = 37;
+/// at one tail syncing every put, a put is a record write, a row write and one sync,
+/// and these are the last two records' writes.
+const TORN_AT: u64 = 26;
+const ENOSPC_AT: u64 = 29;
 
 /// Payload bytes that survive the tear, behind the header that describes them
 const TORN_PAYLOAD_BYTES: u64 = 8;

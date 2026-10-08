@@ -4425,7 +4425,11 @@ fn an_overwrite_settles_older_versions_with_no_footer_search() {
 
     let blocks = store.filter_probes().blocks;
     store.put(&key, &[0x33; 100]).expect("overwrite");
-    assert_eq!(store.index.spot_held(), 0, "the older versions are still held");
+    assert_eq!(
+        store.index.spot_held(),
+        0,
+        "the older versions are still held"
+    );
     assert_eq!(store.filter_probes().blocks, blocks, "a footer search ran");
     assert_eq!(
         store.get(&key).expect("get"),
@@ -4438,7 +4442,9 @@ fn an_overwrite_settles_older_versions_with_no_footer_search() {
 fn a_record_at_the_keyless_ceiling_reads_with_no_footer_search() {
     let (store, _backend, _dir) = posix_store(config(1, SyncPolicy::Never));
     let key = record(7, 1);
-    let payload: Vec<u8> = (0..crate::format::record::KEYLESS_MAX).map(|at| at as u8).collect();
+    let payload: Vec<u8> = (0..crate::format::record::KEYLESS_MAX)
+        .map(|at| at as u8)
+        .collect();
     store.put(&key, &payload).expect("put");
     store.reel.tails()[0].seal().expect("seal");
     assert!(store.page_out_sealed().expect("hand over") > 0);
@@ -4460,7 +4466,10 @@ fn the_tick_seals_a_tail_gone_quiet() {
         .find(|at| tails[*at].holds_records())
         .expect("a tail took the put");
     let before = segment(written);
-    let others: Vec<_> = (0..tails.len()).filter(|at| *at != written).map(segment).collect();
+    let others: Vec<_> = (0..tails.len())
+        .filter(|at| *at != written)
+        .map(segment)
+        .collect();
 
     for byte in 2..5u8 {
         store.seal_idle_tails(quiet).expect("look");
@@ -4471,7 +4480,10 @@ fn the_tick_seals_a_tail_gone_quiet() {
     store.seal_idle_tails(quiet).expect("first quiet look");
     store.seal_idle_tails(quiet).expect("second quiet look");
     assert_ne!(segment(written), before, "the quiet tail is still open");
-    let after: Vec<_> = (0..tails.len()).filter(|at| *at != written).map(segment).collect();
+    let after: Vec<_> = (0..tails.len())
+        .filter(|at| *at != written)
+        .map(segment)
+        .collect();
     assert_eq!(after, others, "an empty tail was sealed");
     assert_eq!(
         store.get(&record(7, 4)).expect("get"),
@@ -4499,7 +4511,10 @@ fn an_older_version_reads_its_row_through_the_key_blocks() {
         matches!(head, HeadRead::Same(found) if found.len == 100),
         "the older version's row: {head:?}"
     );
-    assert!(shared.footers.get(segment).is_none(), "the whole footer was read");
+    assert!(
+        shared.footers.get(segment).is_none(),
+        "the whole footer was read"
+    );
 }
 
 // a close compacts until no sealed segment is past the dead ratio
@@ -4548,14 +4563,22 @@ fn a_covered_segment_resumed_and_sealed_again_keeps_its_new_records() {
             store.put(&record(7, byte), &[round; 300]).expect("put");
         }
         store.flush().expect("flush");
-        let path = Path::new(ROOT).join(segment_file_name(store.reel.tails()[0].tail().active_segment()));
+        let path = Path::new(ROOT).join(segment_file_name(
+            store.reel.tails()[0].tail().active_segment(),
+        ));
         unsealed = sim.durable_bytes(&path).expect("open segment durable");
         last = store.reel.tails()[0].seal().expect("seal");
     }
     store.page_out_sealed().expect("page out");
     let merged = store.merge_when_due().expect("merge");
-    assert!(merged.is_some(), "ten stacked segments merge into a key run");
-    assert!(store.index().key_runs().covers(last), "the run covers the last seal");
+    assert!(
+        merged.is_some(),
+        "ten stacked segments merge into a key run"
+    );
+    assert!(
+        store.index().key_runs().covers(last),
+        "the run covers the last seal"
+    );
     store.close().expect("close");
     drop(store);
 
@@ -4572,18 +4595,31 @@ fn a_covered_segment_resumed_and_sealed_again_keeps_its_new_records() {
     }
 
     let second_sim = SimIo::from_image(image);
-    let second = ReelStore::open_with_io(PathBuf::from(ROOT), config(), COLUMNS, Arc::new(second_sim.clone()))
-        .expect("second open");
+    let second = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        config(),
+        COLUMNS,
+        Arc::new(second_sim.clone()),
+    )
+    .expect("second open");
     for byte in 0..4u8 {
-        assert_eq!(second.get(&record(7, byte)).expect("get"), Some(Value::new(vec![10; 300])));
+        assert_eq!(
+            second.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![10; 300]))
+        );
     }
     for byte in 0..4u8 {
-        second.put(&record(7, byte), &[11; 300]).expect("second life put");
+        second
+            .put(&record(7, byte), &[11; 300])
+            .expect("second life put");
     }
     second.reel.tails()[0].seal().expect("second seal");
     second.flush().expect("flush");
     for byte in 0..4u8 {
-        assert_eq!(second.get(&record(7, byte)).expect("get"), Some(Value::new(vec![11; 300])));
+        assert_eq!(
+            second.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![11; 300]))
+        );
     }
     second.close().expect("close");
     drop(second);
@@ -4628,13 +4664,21 @@ fn a_lost_seal_cut_is_found_by_its_mark_and_made_at_open() {
 
     // The cut never landed: the footer, then zeros up to the rows, the rows, and the mark in the block after them
     let (rows_at, rows) = crate::format::journal::rows_region(&unsealed).expect("rows");
-    let footer_len = crate::format::record::read_u32_le(&sealed[sealed.len() - 8..sealed.len() - 4]);
+    let footer_len =
+        crate::format::record::read_u32_le(&sealed[sealed.len() - 8..sealed.len() - 4]);
     let mut lost = sealed.clone();
     lost.resize(rows_at as usize, 0);
     lost.extend_from_slice(rows);
-    lost.resize(lost.len().next_multiple_of(crate::format::record::BLOCK as usize), 0);
+    lost.resize(
+        lost.len()
+            .next_multiple_of(crate::format::record::BLOCK as usize),
+        0,
+    );
     let mark = crate::format::footer::seal_mark(sealed.len() as u64, footer_len);
-    lost.resize(lost.len() + crate::format::record::BLOCK as usize - mark.len(), 0);
+    lost.resize(
+        lost.len() + crate::format::record::BLOCK as usize - mark.len(),
+        0,
+    );
     lost.extend_from_slice(&mark);
     let mut image = sim.durable_image();
     for (at, bytes) in image.iter_mut() {

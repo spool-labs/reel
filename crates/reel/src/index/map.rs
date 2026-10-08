@@ -576,7 +576,10 @@ impl ReelIndex {
                 }
                 for (segment, rows) in run.covered.iter().zip(by_covered) {
                     if !rows.is_empty() {
-                        picks.entry((*segment, column.column)).or_default().extend(rows);
+                        picks
+                            .entry((*segment, column.column))
+                            .or_default()
+                            .extend(rows);
                     }
                 }
             }

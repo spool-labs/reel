@@ -9,7 +9,9 @@ use crate::error::{ReelError, Result};
 use crate::format::column::ColumnId;
 use crate::format::footer::{FooterPartition, SegmentFooter};
 use crate::format::loc::SegmentId;
-use crate::index::keyrun::{FooterRows, KeyRun, RowReader, RunColumn, RunPointer, RunRow, RunWriter};
+use crate::index::keyrun::{
+    FooterRows, KeyRun, RowReader, RunColumn, RunPointer, RunRow, RunWriter,
+};
 use crate::index::map::ReelIndex;
 use crate::index::paged::FooterSource;
 use crate::reel::Reel;
@@ -67,9 +69,12 @@ impl<'a> Cursor<'a> {
         column: &'a RunColumn,
         standing: &HashSet<SegmentId>,
     ) -> Result<Cursor<'a>> {
-        let rows = FooterRows::new(Arc::clone(footers), Arc::clone(run), column.column, &|segment| {
-            standing.contains(&segment)
-        });
+        let rows = FooterRows::new(
+            Arc::clone(footers),
+            Arc::clone(run),
+            column.column,
+            &|segment| standing.contains(&segment),
+        );
         let mut cursor = Cursor::Keys {
             column,
             rows,
@@ -122,7 +127,9 @@ impl<'a> Cursor<'a> {
             Cursor::Keys { current, .. } => current
                 .as_ref()
                 .map(|(_, row, place)| (*row, *place))
-                .ok_or_else(|| ReelError::Corruption("a spent key run cursor was read".to_string())),
+                .ok_or_else(|| {
+                    ReelError::Corruption("a spent key run cursor was read".to_string())
+                }),
         }
     }
 
@@ -251,7 +258,13 @@ pub fn merge_into_key_run(
         for (column, width) in &columns {
             writer.begin_column(*column, *width)?;
             merge_column(
-                &footers, &sources, *column, &standing, &covered, &mut writer, &mut report,
+                &footers,
+                &sources,
+                *column,
+                &standing,
+                &covered,
+                &mut writer,
+                &mut report,
             )?;
         }
         Ok(())

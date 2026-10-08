@@ -1084,9 +1084,9 @@ impl SpotColumn {
         let fresh = self.take_rows(partition.column, spread, picked.len(), |at| {
             let row = picked[at] as usize;
             let found = partition.row_at(row)?;
-            let key = partition
-                .key_at(row)
-                .ok_or_else(|| ReelError::Corruption("a key run picked a row past its footer".to_string()))?;
+            let key = partition.key_at(row).ok_or_else(|| {
+                ReelError::Corruption("a key run picked a row past its footer".to_string())
+            })?;
             Ok((!found.is_range_tombstone()).then(|| Taken {
                 key,
                 loc: Loc::new(segment, found.offset, found.len),
@@ -1505,7 +1505,9 @@ impl SpotColumn {
                 HeadRead::Cold => {
                     // A version in an older segment is older than this write, so its own check settles it with no footer search
                     let checked = match is_older && !slot.is_grave() {
-                        true => records.checked_len(key, slot.segment(), slot.offset, slot.bound())?,
+                        true => {
+                            records.checked_len(key, slot.segment(), slot.offset, slot.bound())?
+                        }
                         false => None,
                     };
                     if let Some(len) = checked {

@@ -668,7 +668,8 @@ mod cursor_tests {
         let (packed, starts, _) = unpack(&encoded, Tail::Entry, None).expect("unpack");
         let frame = Frame::read(&encoded).expect("frame");
         let bytes = &encoded[..frame.rows_end];
-        let restart = |block: usize| (block < frame.restarts).then(|| frame.restart(&encoded, block));
+        let restart =
+            |block: usize| (block < frame.restarts).then(|| frame.restart(&encoded, block));
         let whole = |at: usize| {
             let row = &packed[starts[at] as usize..starts[at + 1] as usize];
             row.split_at(row.len() - ENTRY_TAIL_LEN)
@@ -682,7 +683,11 @@ mod cursor_tests {
             let (key, found) = cursor.read(bytes, restart, at).expect("read");
             let (want_key, want_tail) = whole(at);
             assert_eq!(key, want_key, "row {at} key");
-            assert_eq!(found, FooterRow::read(want_tail, 0).expect("tail"), "row {at} row");
+            assert_eq!(
+                found,
+                FooterRow::read(want_tail, 0).expect("tail"),
+                "row {at} row"
+            );
             assert_eq!(key, keys[at].as_slice(), "row {at} against its key");
         }
     }
@@ -763,7 +768,8 @@ impl PackedCursor {
         let at = &mut self.next;
         let shared = get_varint(bytes, at)? as usize;
         let suffix_len = get_varint(bytes, at)? as usize;
-        let (Some(suffix), true) = (bytes.get(*at..*at + suffix_len), shared <= self.key.len()) else {
+        let (Some(suffix), true) = (bytes.get(*at..*at + suffix_len), shared <= self.key.len())
+        else {
             return Err(bad_row());
         };
         *at += suffix_len;

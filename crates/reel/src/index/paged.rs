@@ -14,11 +14,11 @@ use crate::error::{ReelError, Result};
 use crate::format::block::{FooterMap, PartitionSpan, RowBlock, BLOCK_BYTES};
 use crate::format::column::{ColumnId, KeyBytes};
 use crate::format::footer::{FooterFind, FooterRow, SegmentFooter};
-use crate::format::prefix::PackedCursor;
 use crate::format::loc::SegmentId;
+use crate::format::prefix::PackedCursor;
 use crate::hold::{hold_key, segment_key, Hold, MAX_BLOCK};
-use crate::io::mapping::Mapping;
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
+use crate::io::mapping::Mapping;
 use crate::sync::{read, write};
 
 /// Segments one lookup carries without reaching for the heap
@@ -57,7 +57,11 @@ pub trait FooterSource: Send + Sync {
     }
 
     /// A segment's partition for a column read in place, where it strides and the segment maps
-    fn mapped_rows(&self, _segment: SegmentId, _column: ColumnId) -> Result<Option<Arc<MappedRows>>> {
+    fn mapped_rows(
+        &self,
+        _segment: SegmentId,
+        _column: ColumnId,
+    ) -> Result<Option<Arc<MappedRows>>> {
         Ok(None)
     }
 
@@ -122,9 +126,14 @@ impl MappedRows {
 
     /// The key and row at a place in the partition, a packed one decoded by `cursor`
     #[inline]
-    pub fn read<'a>(&'a self, cursor: &'a mut PackedCursor, row: u32) -> Result<(&'a [u8], FooterRow)> {
+    pub fn read<'a>(
+        &'a self,
+        cursor: &'a mut PackedCursor,
+        row: u32,
+    ) -> Result<(&'a [u8], FooterRow)> {
         let row = row as usize;
-        let missing = || ReelError::Corruption(format!("a key run points past a footer's rows at {row}"));
+        let missing =
+            || ReelError::Corruption(format!("a key run points past a footer's rows at {row}"));
         match self {
             MappedRows::Strided {
                 map,
@@ -172,7 +181,9 @@ impl RowsAt {
             .partitions
             .iter()
             .position(|rows| rows.column == column && (row as usize) < rows.len())
-            .ok_or_else(|| ReelError::Corruption(format!("a key run points past a footer's rows at {row}")))?;
+            .ok_or_else(|| {
+                ReelError::Corruption(format!("a key run points past a footer's rows at {row}"))
+            })?;
         Ok(RowsAt::Whole(footer, partition))
     }
 
@@ -188,7 +199,8 @@ impl RowsAt {
     /// The key and row at a place in the partition
     pub fn read(&self, row: u32) -> Result<(&[u8], FooterRow)> {
         let row = row as usize;
-        let missing = || ReelError::Corruption(format!("a key run points past a footer's rows at {row}"));
+        let missing =
+            || ReelError::Corruption(format!("a key run points past a footer's rows at {row}"));
         match self {
             RowsAt::Block(block) => {
                 let at = row.checked_sub(block.first()).ok_or_else(missing)?;

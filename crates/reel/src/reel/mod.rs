@@ -29,7 +29,9 @@ use crate::config::ReelConfig;
 use crate::error::{ReelError, Result};
 use std::sync::OnceLock;
 
-use crate::format::block::{find_offset_in_span, lookup_in_span, FooterMap, PartitionSpan, RowBlock};
+use crate::format::block::{
+    find_offset_in_span, lookup_in_span, FooterMap, PartitionSpan, RowBlock,
+};
 use crate::format::column::{ColumnId, ColumnSet, KeyRef, RecordKey};
 use crate::format::footer::{FooterFind, FooterPartition, FooterRow, FooterTally, SegmentFooter};
 use crate::format::loc::{Loc, SegmentId};
@@ -146,7 +148,13 @@ impl RecordSource for ReelShared {
             .filter(|len| *len as usize <= body.len())
             .filter(|len| {
                 matches!(
-                    check_keyless(&head, &body[..*len as usize], key.as_ref(), Flags::DATA, &check),
+                    check_keyless(
+                        &head,
+                        &body[..*len as usize],
+                        key.as_ref(),
+                        Flags::DATA,
+                        &check
+                    ),
                     KeylessRead::Intact(_)
                 )
             });
@@ -1014,7 +1022,10 @@ impl FooterSource for ReelShared {
         let Some(map) = self.footer_map_of(segment)? else {
             return Ok(None);
         };
-        let Some((span, _)) = map.locate(column).filter(|(span, _)| (row as usize) < span.rows) else {
+        let Some((span, _)) = map
+            .locate(column)
+            .filter(|(span, _)| (row as usize) < span.rows)
+        else {
             return Err(ReelError::Corruption(format!(
                 "a key run points past segment {}'s rows at {row}",
                 segment.as_u32()

@@ -194,7 +194,8 @@ impl RowReader for FooterRows {
         });
         if let Some(mapped) = mapped {
             if self.cursors.len() <= at {
-                self.cursors.resize_with(self.run.covered.len(), PackedCursor::default);
+                self.cursors
+                    .resize_with(self.run.covered.len(), PackedCursor::default);
             }
             let (key, found) = mapped.read(&mut self.cursors[at], pointer.row)?;
             return Ok(Some((key, RunRow::of(segment, found))));
@@ -884,7 +885,10 @@ mod tests {
                 .map(|(low, high)| (low.to_vec(), high.to_vec())),
             Some((keys[0].clone(), keys[keys.len() - 1].clone()))
         );
-        assert_eq!(run.bytes, std::fs::metadata(&run.path).map_or(run.bytes, |held| held.len()));
+        assert_eq!(
+            run.bytes,
+            std::fs::metadata(&run.path).map_or(run.bytes, |held| held.len())
+        );
     }
 
     // a seek lands on the first row at or past a key, or past it alone
@@ -892,7 +896,9 @@ mod tests {
     fn a_seek_lands_on_the_first_row_at_or_past_the_key() {
         let sim = SimIo::new(FaultPlan::new(1));
         let driver = driver(&sim);
-        let keys: Vec<Vec<u8>> = (0..5_000u64).map(|n| (n * 2).to_be_bytes().to_vec()).collect();
+        let keys: Vec<Vec<u8>> = (0..5_000u64)
+            .map(|n| (n * 2).to_be_bytes().to_vec())
+            .collect();
         let run = written(&driver, 1, &keys, 8);
         let column = run.column(ColumnId(1)).expect("column");
         let mut rows = Keys {
@@ -909,8 +915,16 @@ mod tests {
                 .iter()
                 .position(|key| key.as_slice() > target.as_slice())
                 .unwrap_or(keys.len()) as u64;
-            assert_eq!(run.seek(column, &target, false, &mut rows).expect("seek"), at, "probe {probe} at");
-            assert_eq!(run.seek(column, &target, true, &mut rows).expect("seek"), past, "probe {probe} past");
+            assert_eq!(
+                run.seek(column, &target, false, &mut rows).expect("seek"),
+                at,
+                "probe {probe} at"
+            );
+            assert_eq!(
+                run.seek(column, &target, true, &mut rows).expect("seek"),
+                past,
+                "probe {probe} past"
+            );
         }
     }
 
@@ -919,7 +933,9 @@ mod tests {
     fn a_seek_steps_past_rows_into_segments_gone() {
         let sim = SimIo::new(FaultPlan::new(1));
         let driver = driver(&sim);
-        let keys: Vec<Vec<u8>> = (0..5_000u64).map(|n| (n * 2).to_be_bytes().to_vec()).collect();
+        let keys: Vec<Vec<u8>> = (0..5_000u64)
+            .map(|n| (n * 2).to_be_bytes().to_vec())
+            .collect();
         let run = written(&driver, 2, &keys, 8);
         let column = run.column(ColumnId(1)).expect("column");
         let mut rows = Keys {
@@ -927,9 +943,12 @@ mod tests {
             gone: [1u32].into_iter().collect(),
         };
         let reads = |at: usize| pointer(at as u32).covered != 1;
-        for probe in [0u64, 1, 2, 3, 7, 1_001, 4_000, 9_996, 9_997, 9_998, 9_999, 20_000] {
+        for probe in [
+            0u64, 1, 2, 3, 7, 1_001, 4_000, 9_996, 9_997, 9_998, 9_999, 20_000,
+        ] {
             let target = probe.to_be_bytes();
-            let want = (0..keys.len()).find(|at| reads(*at) && keys[*at].as_slice() >= target.as_slice());
+            let want =
+                (0..keys.len()).find(|at| reads(*at) && keys[*at].as_slice() >= target.as_slice());
             let mut at = run.seek(column, &target, false, &mut rows).expect("seek") as usize;
             while at < keys.len() && !reads(at) {
                 at += 1;
@@ -975,8 +994,16 @@ mod tests {
                 .iter()
                 .position(|key| key > &probe)
                 .unwrap_or(keys.len()) as u64;
-            assert_eq!(run.seek(column, &probe, false, &mut rows).expect("seek"), at, "probe {probe:?} at");
-            assert_eq!(run.seek(column, &probe, true, &mut rows).expect("seek"), past, "probe {probe:?} past");
+            assert_eq!(
+                run.seek(column, &probe, false, &mut rows).expect("seek"),
+                at,
+                "probe {probe:?} at"
+            );
+            assert_eq!(
+                run.seek(column, &probe, true, &mut rows).expect("seek"),
+                past,
+                "probe {probe:?} past"
+            );
         }
     }
 
@@ -1007,6 +1034,10 @@ mod tests {
         // The fences add a key per block, so the wide run grows only by its keys there
         let fences = (4_096 / u64::from(RUN_BLOCK_ROWS) + 1) * 56;
         assert_eq!(wide.bytes - narrow.bytes, fences, "a row grew with its key");
-        assert!(narrow.bytes < rows + rows / 4, "the run weighs {} for {rows} of rows", narrow.bytes);
+        assert!(
+            narrow.bytes < rows + rows / 4,
+            "the run weighs {} for {rows} of rows",
+            narrow.bytes
+        );
     }
 }

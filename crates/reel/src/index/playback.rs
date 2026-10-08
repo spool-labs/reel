@@ -19,7 +19,9 @@ use crate::format::lsn::Lsn;
 use crate::index::column::ColumnIndex;
 use crate::index::counters::SegmentTable;
 use crate::index::entry::Entry;
-use crate::index::keyrun::{is_vanished, FooterRows, KeyRun, KeyRunSet, RowReader, RunColumn, RunRow, RunViews};
+use crate::index::keyrun::{
+    is_vanished, FooterRows, KeyRun, KeyRunSet, RowReader, RunColumn, RunRow, RunViews,
+};
 use crate::index::page::KeyPage;
 use crate::index::paged::{FooterSource, SealedRanges};
 
@@ -579,8 +581,14 @@ impl Sealed {
                 let Some(keyed) = keyed[at].as_mut() else {
                     return Ok(());
                 };
-                let (head, standing) =
-                    key_run_settle(run, column, way, row as u64, &mut keyed.rows, &mut keyed.key)?;
+                let (head, standing) = key_run_settle(
+                    run,
+                    column,
+                    way,
+                    row as u64,
+                    &mut keyed.rows,
+                    &mut keyed.key,
+                )?;
                 if let Some(row) = standing {
                     keyed.row = row;
                 }
@@ -1112,7 +1120,8 @@ impl Paged<'_> {
                     .position(|held| held.column == self.column)
                 {
                     // A segment retired before the open has its live records in the map or a newer footer
-                    let views = Arc::new(RunViews::new(&run, &|segment| self.sealed.holds(segment)));
+                    let views =
+                        Arc::new(RunViews::new(&run, &|segment| self.sealed.holds(segment)));
                     runs.push(Run::Keys { run, column, views });
                 }
             }
@@ -1129,7 +1138,10 @@ impl Paged<'_> {
                     partition,
                     leads,
                     ..
-                } => (Head::placed(&footer.partitions[*partition], leads, way, from), None),
+                } => (
+                    Head::placed(&footer.partitions[*partition], leads, way, from),
+                    None,
+                ),
                 Run::Keys { run, column, views } => {
                     let column = &run.columns()[*column];
                     let mut rows = FooterRows::sharing(
@@ -1139,7 +1151,8 @@ impl Paged<'_> {
                         Arc::clone(views),
                     );
                     let mut key = Vec::new();
-                    let (head, standing) = key_run_head(run, column, way, from, &mut rows, &mut key)?;
+                    let (head, standing) =
+                        key_run_head(run, column, way, from, &mut rows, &mut key)?;
                     let keyed = standing.map(|row| Keyed { rows, key, row });
                     (head, keyed)
                 }

@@ -582,7 +582,9 @@ impl Compactor {
         crate::sync::rendezvous::at("compaction/owed");
         let claimed = lock(&self.in_flight);
         for (segment, bytes) in segments {
-            if shared.is_held(segment) || claimed.contains(&segment) || owed.contains(&segment) {
+            // An unsettled segment is a tail's, or one a failed sync left with no footer to list it by
+            if !shared.is_settled(segment) || claimed.contains(&segment) || owed.contains(&segment)
+            {
                 continue;
             }
             let total = bytes.total();
@@ -630,7 +632,7 @@ impl Compactor {
         best
     }
 
-    /// Rewrite one sealed segment's live records and retire it
+    /// Rewrite one sealed segment's live records and retire it, and say whether it is gone
     ///
     /// A segment whose file is already gone leaves nothing to reclaim, so what it left
     /// in the counters is dropped instead.
@@ -639,7 +641,7 @@ impl Compactor {
         reel: &Reel,
         index: &ReelIndex,
         segment: SegmentId,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // however this pass leaves, the claim drops: a leaked one is a segment nothing
         // ever compacts again
         let _claim = PassClaim {
@@ -648,7 +650,7 @@ impl Compactor {
         };
         let shared = reel.shared();
         if reel.tails().is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         // What the other segments hold is only half the floor: a number drawn before
         // this pass can still be published into a segment after it, under an lsn no
@@ -662,7 +664,7 @@ impl Compactor {
             Err(error) if is_missing(&error) => {
                 index.forget_segment(segment);
                 lock(&self.rotted).remove(&segment);
-                return Ok(());
+                return Ok(true);
             }
             Err(error) => return Err(error),
         };
@@ -673,7 +675,7 @@ impl Compactor {
             None => {
                 index.forget_segment(segment);
                 lock(&self.rotted).remove(&segment);
-                return Ok(());
+                return Ok(true);
             }
         };
         // read once for the pass: where the records end, and their key order where the
@@ -681,7 +683,7 @@ impl Compactor {
         let footer = shared.footer_of(segment)?;
         // No row lists an unsealed keyless segment's keys, so it stands until a reopen drops it
         if source.layout().is_keyless_layout() && footer.is_none() {
-            return Ok(());
+            return Ok(false);
         }
         let region_end = footer_bound(shared, &source, file_len, footer.as_deref())?;
         let order = footer.as_deref().and_then(footer_order);
@@ -690,7 +692,7 @@ impl Compactor {
         // Only a reserved tail answers to a chosen tier, so a volume with them waits for a free one
         let lease = reel.lease_reserved();
         if reel.keeps_reserved() && lease.is_none() {
-            return Ok(());
+            return Ok(false);
         }
         let dest_index = match &lease {
             Some(lease) => lease.index(),
@@ -768,7 +770,7 @@ impl Compactor {
             lock(&self.rotted).insert(segment, index.segment_bytes(segment).dead);
             self.metrics.record_pass(&tally, read_bytes);
             pace.settle(charged);
-            return Ok(());
+            return Ok(false);
         }
 
         // A cover that went up while this pass ran may span rows it skipped as covered,
@@ -777,7 +779,7 @@ impl Compactor {
             drop(source);
             self.metrics.record_pass(&tally, read_bytes);
             pace.settle(charged);
-            return Ok(());
+            return Ok(false);
         }
 
         // Closing per pass keeps one source's records to one destination, so key and
@@ -803,7 +805,7 @@ impl Compactor {
 
         self.metrics.record_pass(&tally, read_bytes);
         pace.settle(charged);
-        Ok(())
+        Ok(true)
     }
 
     /// Rewrite a segment the footer gave an order for: fetch by offset, apply by key

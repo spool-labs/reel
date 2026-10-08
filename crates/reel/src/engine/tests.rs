@@ -892,6 +892,49 @@ fn a_failed_seal_is_retried_on_the_tick() {
     assert!(paged.get(&record(7, 5)).expect("get").is_some());
 }
 
+// a segment a failed sync left without a footer is never offered as wholly dead, since no pass can list it
+#[test]
+fn a_footerless_segment_is_not_offered_to_compaction() {
+    let (store, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let payload = vec![0xa5u8; 8 * 1024];
+    for byte in 0..16u8 {
+        store.put(&record(7, byte), &payload).expect("put");
+    }
+    let doomed = store.reel.tails()[0].tail().active_segment();
+    sim.arm_next_ops(8, FaultKind::SyncError);
+    store
+        .put(&record(7, 99), &payload)
+        .expect_err("a put whose sync failed returned");
+    sim.disarm();
+    for byte in 0..16u8 {
+        store.put(&record(7, byte), &payload).expect("overwrite");
+    }
+    assert!(
+        !store.reel.shared().is_held(doomed) && !store.reel.shared().is_settled(doomed),
+        "the doomed segment is still a tail's"
+    );
+
+    let offered = store
+        .compactor
+        .select_whole_dead(&store.reel, &store.index, None)
+        .map(|(segment, _)| segment);
+    store.compactor.release_spare();
+    assert_ne!(
+        offered,
+        Some(doomed),
+        "the footerless segment was offered whole dead"
+    );
+    let (done, finished) = std::sync::mpsc::channel();
+    let store = Arc::new(store);
+    let compacting = Arc::clone(&store);
+    std::thread::spawn(move || done.send(compacting.compact_once().is_ok()));
+    assert_eq!(
+        finished.recv_timeout(Duration::from_secs(10)),
+        Ok(true),
+        "a pass with a footerless segment standing never came back"
+    );
+}
+
 // a walked tail's overwrites reach the sealed split at open, not at the scrub
 #[test]
 fn a_walked_tail_settles_the_sealed_split() {

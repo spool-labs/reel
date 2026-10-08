@@ -282,13 +282,14 @@ fn stat_counts_the_live_records() {
         u64::from(RECORDS),
         "every key written once survives its overwrite: {row}",
     );
-    // The overwrites left the versions they replaced behind.
-    assert!(
+    // The close compacted away the versions the overwrites replaced.
+    assert_eq!(
         figure(
             &json(volume, &["--column", "records:1:32", "stat"]),
             "dead_bytes"
-        ) > 0,
-        "the overwrites should weigh something dead: {}",
+        ),
+        0,
+        "the close left dead versions behind: {}",
         stat.out,
     );
 }

@@ -4431,6 +4431,21 @@ fn an_overwrite_settles_older_versions_with_no_footer_search() {
     );
 }
 
+// a record at the keyless ceiling reads off its own check, with no footer search
+#[test]
+fn a_record_at_the_keyless_ceiling_reads_with_no_footer_search() {
+    let (store, _backend, _dir) = posix_store(config(1, SyncPolicy::Never));
+    let key = record(7, 1);
+    let payload: Vec<u8> = (0..crate::format::record::KEYLESS_MAX).map(|at| at as u8).collect();
+    store.put(&key, &payload).expect("put");
+    store.reel.tails()[0].seal().expect("seal");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+
+    let blocks = store.filter_probes().blocks;
+    assert_eq!(store.get(&key).expect("get"), Some(Value::new(payload)));
+    assert_eq!(store.filter_probes().blocks, blocks, "a footer search ran");
+}
+
 // a durable put survives a crash on a volume that never syncs, at the cost of one sync
 #[test]
 fn a_durable_put_survives_a_crash_on_one_sync() {

@@ -344,7 +344,6 @@ const fn bounds() -> [u32; CLASSES] {
             false => {
                 let wide = class - SMALL_CLASSES + 1;
                 ((SMALL_CLASSES as u64 * SMALL_STEP) << (wide / 8)) * EIGHTHS[wide % 8] / EIGHTHS[0]
-                    + 1
             }
         };
         bounds[class] = match bound > u32::MAX as u64 {
@@ -2431,5 +2430,12 @@ mod tests {
                 "length {len} over-reads to {bound}"
             );
         }
+    }
+
+    // a class ends at the keyless ceiling, so a lone record that long still reads off its own check
+    #[test]
+    fn the_keyless_ceiling_ends_a_class() {
+        let ceiling = crate::format::record::KEYLESS_MAX;
+        assert_eq!(bound_of(class_of(ceiling)), ceiling);
     }
 }

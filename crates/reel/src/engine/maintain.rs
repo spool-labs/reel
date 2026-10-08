@@ -577,7 +577,7 @@ impl ReelStore {
             self.compactor
                 .select_whole_dead(&self.reel, &self.index, cue_floor)
         {
-            // A segment left standing would be chosen again at once, so the drain stops at it
+            // Stop if the segment is still there, or the next pick would be the same one forever
             if !self
                 .compactor
                 .compact_segment(&self.reel, &self.index, segment)?
@@ -592,7 +592,7 @@ impl ReelStore {
             .select_target(&self.reel, &self.index, ratio, cue_floor)
         {
             Some((segment, _)) => {
-                // A target left standing counts as held, so a caller looping on progress stops
+                // If the target is still there, report Held so a caller looping on progress stops
                 let retired = self
                     .compactor
                     .compact_segment(&self.reel, &self.index, segment)?;

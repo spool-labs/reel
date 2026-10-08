@@ -68,7 +68,7 @@ fn bytes_in(root: &Path) -> u64 {
         .sum()
 }
 
-/// Finds the end of a file's written bytes at its first hole, or its end where the filesystem reports none
+/// Find the first hole in a file, or its end if the filesystem reports no holes
 fn written_end(path: &Path) -> u64 {
     use std::os::unix::io::AsRawFd;
     let file = std::fs::File::open(path).expect("open segment");
@@ -103,7 +103,7 @@ fn a_new_segment_is_written_through() {
         written_end(&segments[0]) >= WINDOW,
         "the window was not written through at creation"
     );
-    // The file runs out to its rows, and everything between the records and them is zeros
+    // An open file reaches its rows, and everything between the records and the rows is zero
     let (rows_at, _) = rows_region(&bytes).expect("an open segment runs out to its rows");
     assert!(
         bytes[WINDOW as usize / 2..rows_at as usize]
@@ -257,7 +257,7 @@ fn a_full_segment_seals_at_its_footer() {
     }
 }
 
-// a crash leaves only the records and their rows: the reservation between them stays zeros
+// a crash image holds the records and their rows, and the reserved space between them stays zero
 #[test]
 fn a_crash_leaves_only_the_records() {
     let config = ReelConfig {

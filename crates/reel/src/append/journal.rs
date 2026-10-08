@@ -1,4 +1,4 @@
-//! An open segment's journal rows, kept in the segment's own file past every record and footer
+//! Journal rows for an open segment, stored in the segment file after the records
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,54 +11,54 @@ use crate::io::ServingBackend;
 use crate::reel::segment::IoDriver;
 use crate::sync::{lock, try_lock};
 
-/// The rows region is zeroed at most this far at a time ahead of its rows, and a sixteenth of its segment when less
+/// Zero the rows region ahead of the rows in steps of at most 1 MiB, or a sixteenth of the segment if smaller
 const FILL: u64 = 1024 * 1024;
 
-/// How a volume puts journal rows down
+/// How journal rows get written on this volume
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Writes {
-    /// Each push writes its group before it returns
+    /// Write each row group before the put returns
     pub through: bool,
 
-    /// Every write covers whole blocks
+    /// Writes must cover whole blocks
     pub whole_blocks: bool,
 }
 
-/// One open segment's journal, a region of the segment file from `rows_at` on
+/// The journal of one open segment, stored from `rows_at` to the end of the segment file
 pub(super) struct Journal {
     /// The driver the file is written through
     driver: Arc<IoDriver>,
 
-    /// The segment file the rows go into, none for a tail that holds no segment yet
+    /// The segment file, or none before the tail has a segment
     file: Option<FileId>,
 
-    /// Where the rows region begins in the segment file
+    /// Offset in the segment file where the rows start
     rows_at: u64,
 
     /// Groups for records that have landed and are not in the file yet
     pending: Mutex<Vec<u8>>,
 
-    /// How far into the region the rows are written, held across a write so groups land in order
+    /// Bytes of rows written so far, locked during a write so groups stay in order
     written: Mutex<u64>,
 
     /// Bytes pushed so far, written or pending, which the segment's room shrinks by
     pushed: AtomicU64,
 
-    /// Whether each push writes its group before it returns, so a process crash keeps every row its record kept
+    /// Write each group before the put returns, so a process crash loses no row
     through: bool,
 
-    /// Whether a write covers whole blocks, its end padded with zeros
+    /// Pad each write with zeros to a whole block
     whole_blocks: bool,
 
-    /// How far into the region the file is zeroed
+    /// Bytes of the rows region already zeroed
     filled: AtomicU64,
 
-    /// The segment's size, which the zeroed region never runs past
+    /// The segment size, which also caps how far the rows region gets zeroed
     span: u64,
 }
 
 impl Journal {
-    /// The journal of a segment being drawn, writing each group as it comes when `through`
+    /// Start the journal for a new segment
     pub(super) fn create(
         driver: &Arc<IoDriver>,
         file: FileId,
@@ -69,10 +69,7 @@ impl Journal {
         Journal::over(driver, Some(file), rows_at, 0, span, writes)
     }
 
-    /// Take a journal up again past the whole groups a reopen read
-    ///
-    /// A whole-block volume zeroes the rest of the block the last group ends in, so the
-    /// next write opens on the boundary and the read steps over the zeros to it.
+    /// Continue a reopened segment's journal after its last whole group
     pub(super) fn resume(
         driver: &Arc<IoDriver>,
         file: FileId,
@@ -82,6 +79,7 @@ impl Journal {
         writes: Writes,
     ) -> Result<Journal> {
         let mut journal = Journal::over(driver, Some(file), rows_at, written, span, writes);
+        // Zero the rest of the last block, so the next group starts on a block boundary
         if journal.whole_blocks && !written.is_multiple_of(BLOCK) {
             let start = written - written % BLOCK;
             let mut block = driver.pread(file, rows_at + start, written - start)?;
@@ -125,7 +123,7 @@ impl Journal {
         }
     }
 
-    /// Where the rows region begins, which the seal's footer must stay below
+    /// Offset where the rows start, which the footer must end before
     pub(super) fn rows_at(&self) -> u64 {
         self.rows_at
     }
@@ -148,8 +146,7 @@ impl Journal {
                 .fetch_add((pending.len() - before) as u64, Ordering::AcqRel);
             return Ok(());
         };
-        // Groups go into the file in push order under the lock, so a crash cuts only the last.
-        // Nothing queues here when rows go through, so the buffer frames each group and comes back.
+        // Write under the lock so groups stay in order. Nothing is pending in this mode, so reuse that buffer.
         pending.clear();
         push_group(rows, &mut pending);
         let at = self.pushed.load(Ordering::Acquire);
@@ -168,13 +165,13 @@ impl Journal {
         Ok(())
     }
 
-    /// Write every pending group into the segment file, whose own sync then covers them
+    /// Write all pending groups to the segment file. The next sync of the file covers them.
     pub(super) fn write_pending(&self) -> Result<()> {
         let mut written = lock(&self.written);
         self.write_locked(&mut written)
     }
 
-    /// The same write, skipped while another caller holds the region
+    /// Same as write_pending, but skip it if another caller is writing
     pub(super) fn try_write_pending(&self) {
         if let Some(mut written) = try_lock(&self.written) {
             let _ = self.write_locked(&mut written);
@@ -203,7 +200,7 @@ impl Journal {
         Ok(())
     }
 
-    /// Zero the region out past `end` before rows land there, so a sync of them settles no extents
+    /// Zero the rows region up to `end` before rows go there, so syncing them needs no block allocation
     fn fill_to(&self, file: FileId, end: u64) -> Result<()> {
         let filled = self.filled.load(Ordering::Acquire);
         if end <= filled || matches!(self.driver.serving(), ServingBackend::Sim) {
@@ -221,7 +218,7 @@ impl Journal {
         Ok(())
     }
 
-    /// Drop what is pending once the segment's footer lists everything the rows did
+    /// Drop pending rows once the sealed footer lists them all
     pub(super) fn remove(&self) {
         lock(&self.pending).clear();
     }

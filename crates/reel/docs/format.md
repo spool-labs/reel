@@ -31,7 +31,7 @@ offsets rising
 ```
 
 Until the seal, the space past the write head is the reservation the tail took from
-the filesystem and reads back as zeros, and the file runs on past it to the journal.
+the filesystem and reads back as zeros, and past that the file holds the journal.
 The seal writes the footer after the last record, syncs it, and cuts the file at the
 footer's end, which takes the journal with it.
 
@@ -152,11 +152,11 @@ Every other backend has the kernel assemble the block and writes the records alo
 
 An open segment keeps its rows in a journal region of its own file, from the offset
 its header record gives, twice `segment_bytes` rounded up to a block. The file is
-sized out to that offset when the segment is drawn, so a file that stops short of it
+sized out to that offset when the segment is created, so a file that ends before it
 was cut by a seal. Each write adds one group: the rows of the records it put down, a
 batch's rows together. The journal's bytes count against `segment_bytes`, so a segment
 rolls once its records and journal together fill it, and the footer a seal writes
-after the records always ends short of the journal. One sync of the file makes a
+after the records always ends before the journal. One sync of the file makes a
 record and its row durable together.
 
 ```
@@ -167,16 +167,16 @@ row: | column, 1 | key width, 2 | key | lsn, 8 | offset, 4 | length, 4 | flags, 
 
 A range tombstone's row holds its exclusive end behind its length, `0xFFFF` for
 none. The CRC covers the group's head and rows, so a group a crash cut short fails it
-and the journal ends there. A direct volume writes whole blocks, so its groups can end
-in zeros out to a block boundary, and the next group opens on the boundary.
+and the journal ends there. A direct volume writes whole blocks, so a group can be
+followed by zeros up to a block boundary, and the next group starts on that boundary.
 
 On Linux with buffered writes a put writes its group into the journal before it
 returns. Elsewhere a flush writes the pending groups ahead of the file's sync, and
 writeback pacing writes them too. A reopen reads the journal's whole groups and keeps
 a group only when every record it lists sits where its row says and checks out, so a
 batch comes back whole or not at all. A resumed tail appends after the last whole
-group and writes its records past every place any whole group names, so a group
-turned down once never meets a record that checks out.
+group and writes new records past every record any group lists, so a dropped group
+can never match a new record.
 
 Two things follow from the key living only in the rows. Off Linux, or on a direct
 volume, a crash of the process under `Never` or `Bytes` loses what was written since
@@ -245,7 +245,7 @@ Anything more is a format version.
 The footer's checksum covers the whole footer with its own field zeroed, including
 the length and the magic. A footer whose magic is wrong, whose length is out of
 range, or whose checksum fails is not a footer. A segment whose seal stopped part
-way through still runs out to its journal and reads back through it, and one whose
+way through still has its journal and is read back through it, and one whose
 footer went bad after its seal has nothing that lists its records.
 
 ## Key runs

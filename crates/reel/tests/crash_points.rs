@@ -725,8 +725,6 @@ fn address_key(address: u8) -> RecordKey {
 }
 
 /// Cut the last batch of the image at a point inside it, as a stopped write would
-///
-/// Only the records tear: the rows sit further on in the same file and stay whole.
 fn cut_the_last_batch(image: &mut DurableImage, tear: Tear) {
     for (path, bytes) in image.iter_mut() {
         if !path.to_string_lossy().ends_with(SEGMENT_SUFFIX) {
@@ -738,6 +736,7 @@ fn cut_the_last_batch(image: &mut DurableImage, tear: Tear) {
         let Some(at) = tear_offset(rows, tear) else {
             continue;
         };
+        // Tear only the records, the rows later in the file stay whole
         bytes[at as usize..rows_at as usize].fill(0);
         return;
     }

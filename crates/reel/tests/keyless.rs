@@ -105,7 +105,7 @@ fn keyless_records_read_back_after_a_reopen() {
     }
 }
 
-/// Every segment file under a volume root, read whole
+/// Read every segment file under a volume root
 fn segment_files(dir: &TempDir) -> Vec<Vec<u8>> {
     std::fs::read_dir(dir.path())
         .expect("list")
@@ -115,7 +115,7 @@ fn segment_files(dir: &TempDir) -> Vec<Vec<u8>> {
         .collect()
 }
 
-// a seal cuts its segment at the footer, so only the open tails still run out to their rows
+// a seal cuts the rows off, so only open tails still have them
 #[test]
 fn a_seal_leaves_no_rows() {
     let dir = TempDir::new().expect("tempdir");
@@ -137,7 +137,7 @@ fn a_seal_leaves_no_rows() {
     drop(store);
 }
 
-// an open segment rolls once its records and rows fill it, however small the records
+// a segment rolls once its records and rows fill it, even with tiny records
 #[test]
 fn rows_stay_within_their_segment() {
     let dir = TempDir::new().expect("tempdir");

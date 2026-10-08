@@ -656,7 +656,7 @@ impl Appender {
         }
         let file = active.handle.file();
         let driver = &self.shared.driver;
-        // The rows stay where they are for the reopen, so one sync covers them and the records
+        // Keep the rows for the next open, and sync once to cover rows and records
         let flushed = active
             .journal
             .write_pending()
@@ -1012,7 +1012,7 @@ impl Appender {
         Ok(locs)
     }
 
-    /// Put framed buffers down at their reservation
+    /// Write the framed buffers at their reserved offset
     fn write_framed(&self, active: &Active, base: u64, bufs: Vec<WriteBuf>) -> Result<u64> {
         let (wrote, bufs) = self
             .shared
@@ -1402,7 +1402,7 @@ impl Appender {
             terminal: AtomicBool::new(false),
             holds,
         };
-        // The file runs out to its rows, so the window starts again at the walked end
+        // The file length reaches the rows, so start the zero window again from the last record
         self.shared.driver.sync_full(active.handle.file())?;
         active.sync.synced_at.store(end, Ordering::Release);
         Ok(active)
@@ -1502,7 +1502,7 @@ impl Appender {
     fn build_segment(&self, id: SegmentId, holds: Arc<SegmentHolds>) -> Result<Active> {
         let path = self.shared.segment_path(id);
         let file = self.shared.driver.open(&path, true)?;
-        // The file reaches its rows from the start, so a length short of them says a seal cut them off
+        // Size the file out to the rows now, so a shorter file means a seal cut the rows off
         let rows_at = self.rows_at();
         self.shared.driver.truncate(file, rows_at)?;
         let target = self.shared.config.segment_bytes.to_bytes();
@@ -1543,7 +1543,7 @@ impl Appender {
         Ok(active)
     }
 
-    /// How this volume puts journal rows down: written through before a put returns on Linux buffered volumes, where a dead process leaves them in the page cache
+    /// On Linux buffered volumes a put writes its row before it returns, so a process crash keeps it
     fn writes(&self) -> Writes {
         Writes {
             through: cfg!(target_os = "linux")
@@ -1553,7 +1553,7 @@ impl Appender {
         }
     }
 
-    /// Where a new segment keeps its journal rows, past any record and the footer a seal writes after them
+    /// Offset for a new segment's rows, far enough past the records that the footer always fits before it
     fn rows_at(&self) -> u64 {
         align_up(2 * self.shared.config.segment_bytes.to_bytes(), ALIGN)
     }

@@ -342,7 +342,7 @@ fn verify_catches_a_flipped_byte() {
     let dir = tempfile::tempdir().expect("tempdir");
     let volume = volume(&dir);
     let target = segments(volume).into_iter().next().expect("a segment file");
-    // An open segment runs out to its rows past a stretch of zeros, so the flip lands among its records
+    // An open segment has zeros before its rows, so flip a byte inside the records
     let bytes = std::fs::read(&target).expect("read");
     let len = match reel::format::journal::rows_region(&bytes) {
         Some((rows_at, _)) => bytes[..rows_at as usize]

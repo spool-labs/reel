@@ -170,8 +170,8 @@ footer length and the magic, the footer body is checksum verified, and its rows 
 decoded. The segment body is read only for the one thing a footer cannot carry,
 which is the exclusive end a range tombstone holds in its payload. A footer whose
 magic is wrong, whose length is out of range, or whose checksum fails is not a
-footer. A segment sealed only part way through still runs out to its journal and
-reads back through it.
+footer. A segment whose seal stopped part way through still has its journal and is
+read back through it.
 
 **The rebuild sweeps each sealed footer.** It takes from each footer a key span per
 column, the range tombstones with their footprint, the tombstones the segment
@@ -185,9 +185,9 @@ Sealed keys are answered from the spot index afterwards.
 read in order, and a group is kept only when every record it lists sits at its
 row's offset and checks out: a keyless record by its keyed check, a larger one by
 its header and checksum. A torn group ends the journal, and a group listing a record
-that did not land is dropped whole. The tail resumes after the last whole group,
-writing its records past every place any whole group names, so a dropped group never
-meets a record that checks out. A segment with no footer that stops short of its
+that did not land is dropped whole. The tail resumes after the last whole group and
+writes new records past every record any group lists, so a dropped group can never
+match a new record. A segment with no footer whose file ends before its
 journal is one whose footer went bad after its seal, and no tail resumes into it.
 
 **Newest-wins is folded in as a tail's records arrive.** The tails' rows are fed

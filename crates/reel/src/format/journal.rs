@@ -1,7 +1,6 @@
 //! The journal format: one checksummed group of rows per write, read back until the first torn group
 //!
-//! The rows sit in their segment's own file, from the offset its header gives, so one
-//! sync makes a record and its row durable together.
+//! The rows live in the segment file at the offset in its header, so one sync covers a record and its row.
 
 use crate::format::column::{ColumnId, KeyBytes, RecordKey};
 use crate::format::lsn::Lsn;
@@ -69,7 +68,7 @@ fn push_row(row: &JournalRow, out: &mut Vec<u8>) {
     }
 }
 
-/// A whole segment file's rows region and where it begins, nothing where the file stops short of it
+/// Return the rows region of a segment file and its offset, or nothing if the file ends before it
 pub fn rows_region(segment: &[u8]) -> Option<(u64, &[u8])> {
     let head = RecordHeader::unpack(segment.get(..HEADER_LEN)?).ok()?;
     let payload = segment.get(HEADER_LEN..HEADER_LEN + head.length as usize)?;
@@ -89,7 +88,7 @@ pub fn read_groups(bytes: &[u8]) -> (Vec<Vec<JournalRow>>, usize) {
             at = next;
             continue;
         }
-        // A whole-block volume pads a write out to its block with zeros, and the next group opens on the boundary
+        // A whole-block volume pads each write with zeros, so skip to the next block boundary
         let boundary = (at as u64).next_multiple_of(BLOCK) as usize;
         let is_padding = boundary > at
             && bytes
@@ -213,7 +212,7 @@ mod tests {
         assert_eq!((groups.len(), len), (0, 0));
     }
 
-    // zeros a whole-block write padded with are stepped over to the group on the next boundary
+    // zero padding up to a block boundary is skipped
     #[test]
     fn padding_to_a_block_is_stepped_over() {
         let mut bytes = Vec::new();

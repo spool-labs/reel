@@ -103,11 +103,14 @@ fn written_through_rows_survive_flushes() {
     journal.push(&groups[2]).expect("push");
     journal.write_pending().expect("flush");
 
-    let bytes = shared.driver.pread(file, rows_at, journal.len()).expect("read");
+    let bytes = shared
+        .driver
+        .pread(file, rows_at, journal.len())
+        .expect("read");
     assert_eq!(read_groups(&bytes).0, groups);
 }
 
-/// Syncs one flush takes: the segment's, which covers its journal rows too
+/// One flush syncs the segment file once, which covers the rows too
 const SYNCS_PER_FLUSH: u64 = 1;
 
 fn key(byte: u8) -> RecordKey {

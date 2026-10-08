@@ -145,7 +145,7 @@ pub fn flip_largest_segment(image: &mut DurableImage) -> bool {
     }
 }
 
-/// Bytes a segment's records take: up to the last one written below an open segment's rows, the whole of a sealed one
+/// Length of a segment's records: up to the last nonzero byte before an open segment's rows, or the whole sealed file
 fn content_len(bytes: &[u8]) -> usize {
     match rows_region(bytes) {
         Some((rows_at, _)) => bytes[..rows_at as usize]

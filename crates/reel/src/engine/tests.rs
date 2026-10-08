@@ -892,7 +892,7 @@ fn a_failed_seal_is_retried_on_the_tick() {
     assert!(paged.get(&record(7, 5)).expect("get").is_some());
 }
 
-// a segment a failed sync left without a footer is never offered as wholly dead, since no pass can list it
+// a segment left without a footer by a failed sync is never picked as wholly dead
 #[test]
 fn a_footerless_segment_is_not_offered_to_compaction() {
     let (store, sim) = sim_store(config(1, SyncPolicy::EveryPut));
@@ -4262,7 +4262,7 @@ fn close_leaves_the_tail_resumable() {
     assert!(reopened.get(&record(7, 2)).expect("get").is_some());
 }
 
-// a reopen that turned a torn group down resumes past it, and the next reopen still turns it down
+// after a torn group is rejected on reopen, new writes go past it and it stays rejected
 #[test]
 fn a_resumed_tail_writes_past_a_group_it_turned_down() {
     let (store, sim) = sim_store(config(1, SyncPolicy::Never));
@@ -4277,7 +4277,7 @@ fn a_resumed_tail_writes_past_a_group_it_turned_down() {
         }
         let (_, rows) = crate::format::journal::rows_region(bytes).expect("an open segment's rows");
         let (groups, _) = crate::format::journal::read_groups(rows);
-        // Inside the last record's payload, past its check and shape
+        // Flip a byte in the last record's payload
         let torn = groups.last().expect("a group")[0].offset as usize + 16;
         bytes[torn] ^= 0xff;
     }

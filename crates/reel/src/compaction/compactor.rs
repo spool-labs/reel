@@ -582,7 +582,7 @@ impl Compactor {
         crate::sync::rendezvous::at("compaction/owed");
         let claimed = lock(&self.in_flight);
         for (segment, bytes) in segments {
-            // An unsettled segment is a tail's, or one a failed sync left with no footer to list it by
+            // Skip unsettled segments: a tail owns them, or a failed sync left them without a footer
             if !shared.is_settled(segment) || claimed.contains(&segment) || owed.contains(&segment)
             {
                 continue;
@@ -632,7 +632,7 @@ impl Compactor {
         best
     }
 
-    /// Rewrite one sealed segment's live records and retire it, and say whether it is gone
+    /// Copy one sealed segment's live records out and retire it, returning whether the segment is gone
     ///
     /// A segment whose file is already gone leaves nothing to reclaim, so what it left
     /// in the counters is dropped instead.

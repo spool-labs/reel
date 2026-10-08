@@ -25,10 +25,10 @@ const LAYOUT_AT: usize = SEGMENT_HEADER_LEN;
 /// Where a keyless segment's check key sits, behind its layout byte
 const CHECK_AT: usize = LAYOUT_AT + 1;
 
-/// Where a keyless segment's rows region begins, behind its check key
+/// Byte position of the rows offset, after the check key
 const ROWS_AT: usize = CHECK_AT + CHECK_KEY_LEN;
 
-/// This build writes the frozen prefix, the record layout, the check key, then where the rows go
+/// This build writes the frozen prefix, the record layout, the check key and the rows offset
 pub const SEGMENT_HEADER_SPAN: usize = ROWS_AT + std::mem::size_of::<u64>();
 
 /// The fixed payload carried by the first record of every segment
@@ -47,7 +47,7 @@ pub struct SegmentHeader {
     /// How the segment frames its records, which every reader of the file needs first
     pub layout: RecordLayout,
 
-    /// Where an open keyless segment keeps its journal rows, past any record or footer, and zero for none
+    /// Offset where an open segment keeps its journal rows, or zero for none
     pub rows_at: u64,
 }
 
@@ -67,7 +67,7 @@ impl SegmentHeader {
         SegmentHeader { layout, ..self }
     }
 
-    /// The same header with its journal rows kept from this offset
+    /// The same header with the rows offset set
     pub fn rows_from(self, rows_at: u64) -> SegmentHeader {
         SegmentHeader { rows_at, ..self }
     }

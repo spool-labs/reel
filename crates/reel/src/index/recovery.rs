@@ -168,7 +168,7 @@ pub fn rebuild_reel(
                 Loaded::Journaled(end) => {
                     consumed.insert(*segment, end.journal_len);
                     walked.push((path.clone(), *len));
-                    // A segment cut short of its rows sealed once, so no appender may write into it again
+                    // A file that ends before its rows was sealed once, so no tail may write into it again
                     if let Some(rows_at) = end.rows_at {
                         resumable.push(ResumableTail {
                             segment: *segment,
@@ -295,7 +295,6 @@ pub struct ResumableTail {
     pub path: PathBuf,
     pub end: u64,
     pub entries: SegmentFooter,
-    /// Where the segment's rows region begins, and the bytes of whole groups in it
     pub rows_at: u64,
     pub rows_len: u64,
 }
@@ -308,7 +307,7 @@ struct JournaledEnd {
     /// Bytes of whole groups in the journal, where a follower picks up
     journal_len: u64,
 
-    /// Where an open segment keeps its rows, or nothing once a seal closed it to appenders
+    /// Rows offset of an open segment, or none once a seal closed it
     rows_at: Option<u64>,
 }
 
@@ -1185,17 +1184,17 @@ struct JournaledTail {
     /// Each range tombstone's end, in the footer's order
     ends: Vec<Option<KeyBytes>>,
 
-    /// Where the rows region begins, nothing once a seal cut it off
+    /// Rows offset, or none once a seal cut the rows off
     rows_at: Option<u64>,
 
-    /// Where the last record any whole group lists ends, which is where the tail resumes
+    /// End of the last record any whole group lists, where the tail resumes
     next_offset: u64,
 
     /// Bytes of whole groups in the journal
     journal_len: u64,
 }
 
-/// Read an unsealed tail through its rows, keeping each group whose records all check out
+/// Read an open tail from its rows, keeping only groups whose records all check out
 fn read_journaled(driver: &IoDriver, file: FileId, file_len: u64) -> Result<JournaledTail> {
     let mut tail = JournaledTail {
         footer: SegmentFooter::empty(),
@@ -1206,7 +1205,7 @@ fn read_journaled(driver: &IoDriver, file: FileId, file_len: u64) -> Result<Jour
     };
     let header = read_segment_header(driver, file)?;
     let layout = header.map_or(RecordLayout::Keyed, |header| header.layout);
-    // A seal cuts the file at its footer, so a file short of its rows sealed once
+    // A seal cuts the file at its footer, so a file that ends before its rows was sealed
     let Some(rows_at) = header
         .map(|header| header.rows_at)
         .filter(|rows_at| *rows_at > 0 && file_len >= *rows_at)
@@ -1221,7 +1220,7 @@ fn read_journaled(driver: &IoDriver, file: FileId, file_len: u64) -> Result<Jour
     let mut ends = Vec::new();
     // A group is one write, so a batch comes back whole or not at all
     for group in groups {
-        // A resumed tail writes past every place a whole group names, so a group turned down here never meets a record that checks out
+        // Count rejected groups too, so new writes land past them and a rejected row never matches a new record
         for row in &group {
             let span = span_of(row.key.width(), row.len);
             tail.next_offset = tail.next_offset.max(u64::from(row.offset) + span);
@@ -1248,7 +1247,7 @@ fn read_journaled(driver: &IoDriver, file: FileId, file_len: u64) -> Result<Jour
     Ok(tail)
 }
 
-/// An open segment's rows region from `from` bytes into it to the end of the file
+/// Read an open segment's rows from `from` bytes in to the end of the file
 pub(crate) fn read_rows(
     driver: &IoDriver,
     file: FileId,
@@ -2130,7 +2129,7 @@ mod tests {
             .is_some());
     }
 
-    /// Put a sealed segment back as it stood before its seal, rows and all, as a seal that failed partway leaves it
+    /// Restore a sealed segment to its bytes before the seal, as a seal that failed partway leaves it
     fn strip_footer(image: &mut DurableImage, name: &str, unsealed: Vec<u8>) {
         for (path, bytes) in image.iter_mut() {
             if path.file_name().map(|found| found == name).unwrap_or(false) {
@@ -2395,7 +2394,7 @@ mod tests {
         let mut image = sim.durable_image();
         let cut = footer_len_for(2);
 
-        // Part of the footer landed and the cut that takes the rows never did
+        // Part of the footer is on disk and the rows were never cut off
         truncate_segment(&mut image, "000001.reel", cut);
         for (path, bytes) in image.iter_mut() {
             if path.ends_with("000001.reel") {

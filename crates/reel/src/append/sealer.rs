@@ -51,7 +51,7 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
             .map(|piece| WriteBuf::Part(Part::new(piece, 0, piece.len())))
             .collect();
         pieces.push(WriteBuf::owned(tail));
-        // The rows stay in place until the footer that lists them is durable
+        // Keep the rows until the footer that lists them is on disk
         let rows_at = active.journal.rows_at();
         let wrote = match sealed_end < rows_at {
             true => shared.driver.writev_all(active.handle.file(), end, pieces),
@@ -66,8 +66,7 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
         );
         wrote?;
         shared.driver.sync_full(active.handle.file())?;
-        // The cut takes the rows and the zeros past the records, so every trailer reader
-        // finds the footer at the end. A crash before the cut is durable leaves the rows to seal again.
+        // Cut the rows off so the footer ends the file. A crash before this lands just seals again from the rows.
         shared.driver.truncate(active.handle.file(), sealed_end)?;
         shared.driver.sync_full(active.handle.file())
     })();
@@ -346,7 +345,7 @@ pub(super) fn flush_active(
         )
     };
 
-    // The rows go into the segment file first, so one sync covers them and the records
+    // Write pending rows first, so this one sync covers rows and records
     journal.write_pending()?;
     shared.driver.sync_data(handle.file())?;
     Ok(Some(covered))

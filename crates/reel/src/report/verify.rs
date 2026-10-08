@@ -435,7 +435,7 @@ fn sweep(engine: &ReelStore, file: &SegmentFile, indexed: bool, watch: &mut Watc
             sweep_rows(&mut file, listed, layout, &mut row, watch);
         }
         Ok(None) => {
-            // A seal cuts the file at its footer, so a file short of its rows lists nothing
+            // A file that ends before its rows was sealed, so without a footer nothing lists its records
             let len = file.metadata().map_or(0, |meta| meta.len());
             let rows = match rows_at > 0 && len >= rows_at {
                 true => read_at(&mut file, rows_at, len - rows_at),
@@ -459,7 +459,7 @@ fn sweep(engine: &ReelStore, file: &SegmentFile, indexed: bool, watch: &mut Watc
     row
 }
 
-/// How a segment file frames its records and where it keeps its rows, falling back to keyed so a bad header gets reported
+/// Read a segment's record layout and rows offset, falling back to keyed so a bad header gets reported
 fn layout_of(file: &mut File) -> (RecordLayout, u64) {
     let Ok(head) = read_at(file, 0, (HEADER_LEN + SEGMENT_HEADER_SPAN) as u64) else {
         return (RecordLayout::Keyed, 0);

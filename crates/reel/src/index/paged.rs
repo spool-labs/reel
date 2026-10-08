@@ -14,6 +14,7 @@ use crate::error::{ReelError, Result};
 use crate::format::block::{FooterMap, PartitionSpan, RowBlock, BLOCK_BYTES};
 use crate::format::column::{ColumnId, KeyBytes};
 use crate::format::footer::{FooterFind, FooterRow, SegmentFooter};
+use crate::format::prefix::PackedCursor;
 use crate::format::loc::SegmentId;
 use crate::hold::{hold_key, segment_key, Hold, MAX_BLOCK};
 use crate::io::mapping::Mapping;
@@ -74,35 +75,84 @@ pub trait FooterSource: Send + Sync {
     }
 }
 
-/// A strided footer partition read in place through its segment's mapping
-pub struct MappedRows {
-    map: Arc<Mapping>,
-    at: u64,
-    stride: usize,
-    key_width: usize,
-    rows: usize,
+/// A footer partition read in place through its segment's mapping
+pub enum MappedRows {
+    /// Rows at a fixed stride, read where they sit
+    Strided {
+        map: Arc<Mapping>,
+        at: u64,
+        stride: usize,
+        key_width: usize,
+        rows: usize,
+    },
+
+    /// Prefix packed rows, decoded from the nearest restart the footer's directory gives
+    Packed {
+        map: Arc<Mapping>,
+        footer: Arc<FooterMap>,
+        column: ColumnId,
+        at: u64,
+        rows: usize,
+    },
 }
 
 impl MappedRows {
-    /// A strided partition's rows in a mapping
-    pub fn new(map: Arc<Mapping>, span: &PartitionSpan) -> MappedRows {
-        MappedRows {
-            map,
-            at: span.at,
-            stride: span.stride(),
-            key_width: span.key_width as usize,
-            rows: span.rows,
+    /// A partition's rows in a mapping, with the directory that places a packed one's restarts
+    pub fn new(map: Arc<Mapping>, footer: Arc<FooterMap>, span: &PartitionSpan) -> MappedRows {
+        match span.is_packed || span.is_varying() {
+            true => MappedRows::Packed {
+                map,
+                footer,
+                column: span.column,
+                at: span.at,
+                rows: span.rows,
+            },
+            false => MappedRows::Strided {
+                map,
+                at: span.at,
+                stride: span.stride(),
+                key_width: span.key_width as usize,
+                rows: span.rows,
+            },
         }
     }
 
-    /// The key and row at a place in the partition
-    pub fn read(&self, row: u32) -> Result<(&[u8], FooterRow)> {
+    /// The key and row at a place in the partition, a packed one decoded by `cursor`
+    pub fn read<'a>(&'a self, cursor: &'a mut PackedCursor, row: u32) -> Result<(&'a [u8], FooterRow)> {
         let row = row as usize;
-        let bytes = (row < self.rows)
-            .then(|| self.map.slice(self.at + (row * self.stride) as u64, self.stride))
-            .flatten()
-            .ok_or_else(|| ReelError::Corruption(format!("a key run points past a footer's rows at {row}")))?;
-        Ok((&bytes[..self.key_width], FooterRow::read(bytes, self.key_width)?))
+        let missing = || ReelError::Corruption(format!("a key run points past a footer's rows at {row}"));
+        match self {
+            MappedRows::Strided {
+                map,
+                at,
+                stride,
+                key_width,
+                rows,
+            } => {
+                let bytes = (row < *rows)
+                    .then(|| map.slice(at + (row * stride) as u64, *stride))
+                    .flatten()
+                    .ok_or_else(missing)?;
+                Ok((&bytes[..*key_width], FooterRow::read(bytes, *key_width)?))
+            }
+            MappedRows::Packed {
+                map,
+                footer,
+                column,
+                at,
+                rows,
+            } => {
+                let restarts = footer
+                    .restarts_of(*column)
+                    .filter(|_| row < *rows)
+                    .ok_or_else(missing)?;
+                let bytes = map
+                    .slice(*at, restarts.rows_end() as usize)
+                    .ok_or_else(missing)?;
+                let (key, tail) = cursor.read(bytes, |block| restarts.start(block), row)?;
+                Ok((key, FooterRow::read(tail, 0)?))
+            }
+        }
     }
 }
 

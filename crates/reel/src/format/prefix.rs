@@ -639,12 +639,118 @@ mod cursor_tests {
         );
     }
 
+    // a packed cursor reads every row the whole unpack does, walking on, jumping ahead and going back
+    #[test]
+    fn a_packed_cursor_reads_what_the_unpack_does() {
+        let mut rows = PrefixRows::new(Tail::Entry);
+        let keys: Vec<Vec<u8>> = (0..300u32)
+            .map(|n| format!("user{:04}/post{:03}", n / 7, n % 7).into_bytes())
+            .collect();
+        for (at, key) in keys.iter().enumerate() {
+            let mut tail = [0u8; ENTRY_TAIL_LEN];
+            tail[..8].copy_from_slice(&(1_000 + at as u64 * 3).to_le_bytes());
+            tail[8..12].copy_from_slice(&(at as u32 * 120).to_le_bytes());
+            tail[12..16].copy_from_slice(&(100 + at as u32 % 5).to_le_bytes());
+            tail[16] = 1;
+            rows.push(key, &tail).expect("push");
+        }
+        let mut encoded = Vec::new();
+        rows.encode(&mut encoded);
+        let (packed, starts, _) = unpack(&encoded, Tail::Entry, None).expect("unpack");
+        let frame = Frame::read(&encoded).expect("frame");
+        let bytes = &encoded[..frame.rows_end];
+        let restart = |block: usize| (block < frame.restarts).then(|| frame.restart(&encoded, block));
+        let whole = |at: usize| {
+            let row = &packed[starts[at] as usize..starts[at + 1] as usize];
+            row.split_at(row.len() - ENTRY_TAIL_LEN)
+        };
+        let mut cursor = PackedCursor::default();
+        let order: Vec<usize> = (0..300)
+            .chain([299, 5, 6, 7, 40, 17, 16, 15, 0, 150, 151, 152])
+            .chain((0..300).rev())
+            .collect();
+        for at in order {
+            let (key, tail) = cursor.read(bytes, restart, at).expect("read");
+            let (want_key, want_tail) = whole(at);
+            assert_eq!(key, want_key, "row {at} key");
+            assert_eq!(tail, want_tail, "row {at} tail");
+            assert_eq!(key, keys[at].as_slice(), "row {at} against its key");
+        }
+    }
+
     // an empty block walks to nothing rather than erroring
     #[test]
     fn an_empty_block_yields_nothing() {
         let rows = PrefixRows::new(TAIL);
         let mut cursor = rows.cursor();
         assert!(!cursor.advance().expect("step"));
+    }
+}
+
+/// Reads a packed footer partition's rows in place, from the nearest restart, keeping its place for the next row
+pub struct PackedCursor {
+    /// The row `key` and `tail` hold, or none
+    row: Option<usize>,
+
+    /// Where the row after it starts
+    next: usize,
+    key: Vec<u8>,
+    tail: Whole,
+}
+
+impl Default for PackedCursor {
+    fn default() -> PackedCursor {
+        PackedCursor {
+            row: None,
+            next: 0,
+            key: Vec::new(),
+            tail: [0; TAIL_CAP],
+        }
+    }
+}
+
+impl PackedCursor {
+    /// The key and entry tail of one row, decoding on from the cursor's row or from the row's restart
+    pub fn read(
+        &mut self,
+        bytes: &[u8],
+        restart: impl Fn(usize) -> Option<u32>,
+        row: usize,
+    ) -> Result<(&[u8], &[u8])> {
+        let block = row / RESTART_INTERVAL;
+        let resumes = self
+            .row
+            .is_some_and(|held| held <= row && held / RESTART_INTERVAL == block);
+        if !resumes {
+            let at = restart(block).ok_or_else(|| {
+                ReelError::Corruption(format!("a packed footer has no restart for row {row}"))
+            })?;
+            let first = read_row(bytes, at as usize, Tail::Entry, &[0; TAIL_CAP])?;
+            if first.shared != 0 {
+                return Err(ReelError::Corruption(
+                    "a restart row does not carry its whole key".to_string(),
+                ));
+            }
+            self.key.clear();
+            self.key.extend_from_slice(first.suffix);
+            self.tail = first.tail;
+            self.next = first.next;
+            self.row = Some(block * RESTART_INTERVAL);
+        }
+        while let Some(held) = self.row.filter(|held| *held < row) {
+            let next = read_row(bytes, self.next, Tail::Entry, &self.tail)?;
+            if next.shared > self.key.len() {
+                return Err(ReelError::Corruption(
+                    "a footer row shares more than the key before it holds".to_string(),
+                ));
+            }
+            self.key.truncate(next.shared);
+            self.key.extend_from_slice(next.suffix);
+            self.tail = next.tail;
+            self.next = next.next;
+            self.row = Some(held + 1);
+        }
+        Ok((&self.key, &self.tail[..ENTRY_TAIL_LEN]))
     }
 }
 

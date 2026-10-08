@@ -968,7 +968,7 @@ impl FooterSource for ReelShared {
         let Some(map) = self.footer_map_of(segment)? else {
             return Ok(None);
         };
-        let Some((span, _)) = map.locate(column).filter(|(span, _)| !span.is_packed && !span.is_varying()) else {
+        let Some((span, _)) = map.locate(column) else {
             return Ok(None);
         };
         // The handle goes on return, so a retire still unlinks the file on time
@@ -977,7 +977,7 @@ impl FooterSource for ReelShared {
         };
         Ok(handle
             .shared_mapping(self.config.segment_bytes.to_bytes())
-            .map(|mapped| MappedRows::new(mapped, &span)))
+            .map(|mapped| MappedRows::new(mapped, Arc::clone(&map), &span)))
     }
 
     /// The block holding one row, read through the footer's directory, or the whole footer when it is already held

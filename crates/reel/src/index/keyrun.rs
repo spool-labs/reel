@@ -10,6 +10,7 @@ use crate::format::column::ColumnId;
 use crate::format::footer::{FooterRow, VARYING_WIDTH};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
+use crate::format::prefix::PackedCursor;
 use crate::format::record::{read_u32_le, read_u64_le, Flags};
 use crate::index::paged::{FooterSource, MappedRows, RowsAt};
 use crate::io::mapping::Mapping;
@@ -132,6 +133,9 @@ pub struct FooterRows {
 
     /// Each covered segment's last block read, where its rows are not mapped
     held: Vec<Option<RowsAt>>,
+
+    /// Each covered segment's place in its packed rows, so a walk decodes on from the row before
+    cursors: Vec<PackedCursor>,
 }
 
 impl FooterRows {
@@ -159,6 +163,7 @@ impl FooterRows {
             column,
             views,
             held: Vec::new(),
+            cursors: Vec::new(),
         }
     }
 
@@ -187,7 +192,10 @@ impl RowReader for FooterRows {
                 .flatten()
         });
         if let Some(mapped) = mapped {
-            let (key, found) = mapped.read(pointer.row)?;
+            if self.cursors.len() <= at {
+                self.cursors.resize_with(self.run.covered.len(), PackedCursor::default);
+            }
+            let (key, found) = mapped.read(&mut self.cursors[at], pointer.row)?;
             return Ok(Some((key, RunRow::of(segment, found))));
         }
         if self.held.len() <= at {

@@ -115,6 +115,16 @@ pub struct RestartTable {
 }
 
 impl RestartTable {
+    /// Where one restart block begins within the partition's rows
+    pub fn start(&self, block: usize) -> Option<u32> {
+        self.offsets.get(block).copied()
+    }
+
+    /// One past the last row byte
+    pub fn rows_end(&self) -> u32 {
+        self.rows_end
+    }
+
     /// Where one restart block's bytes sit within the partition's rows
     fn cut(&self, block: usize) -> Option<(u32, u32)> {
         let start = *self.offsets.get(block)?;

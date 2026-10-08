@@ -174,6 +174,7 @@ impl FooterRows {
 }
 
 impl RowReader for FooterRows {
+    #[inline]
     fn read(&mut self, pointer: RunPointer) -> Result<Option<(&[u8], RunRow)>> {
         let at = pointer.covered as usize;
         let Some(&segment) = self.run.covered.get(at) else {
@@ -443,6 +444,7 @@ impl KeyRun {
     }
 
     /// Where one of a column's rows points
+    #[inline]
     pub fn pointer(&self, column: &RunColumn, at: u64) -> RunPointer {
         // Open checked that every column's rows lie inside the file
         let start = (column.rows_at + at * ROW_LEN as u64) as usize;

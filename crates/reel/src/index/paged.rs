@@ -121,6 +121,7 @@ impl MappedRows {
     }
 
     /// The key and row at a place in the partition, a packed one decoded by `cursor`
+    #[inline]
     pub fn read<'a>(&'a self, cursor: &'a mut PackedCursor, row: u32) -> Result<(&'a [u8], FooterRow)> {
         let row = row as usize;
         let missing = || ReelError::Corruption(format!("a key run points past a footer's rows at {row}"));

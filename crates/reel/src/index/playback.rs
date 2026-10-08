@@ -228,6 +228,7 @@ fn key_run_head(
 }
 
 /// The first row from `row` on, in the playback's direction, that reads through its footer
+#[inline]
 fn key_run_settle(
     run: &KeyRun,
     column: &RunColumn,
@@ -362,6 +363,7 @@ impl Head {
 const LEAD_BYTES: usize = 16;
 
 /// A key's leading sixteen bytes as an integer, which orders keys whenever two leads differ
+#[inline]
 fn head_lead(key: &[u8]) -> u128 {
     let mut lead = [0u8; LEAD_BYTES];
     let led = key.len().min(LEAD_BYTES);
@@ -465,11 +467,12 @@ impl Sealed {
     }
 
     /// The front cursor, when it stands on this key
-    fn front_on(&self, key: &[u8]) -> Option<usize> {
+    #[inline]
+    fn front_on(&self, key: &[u8], lead: u128) -> Option<usize> {
         let at = *self.tree.first()?;
         let head = &self.heads[at];
         // A lead that differs settles it without reading the cursor's key, and so does a short key's length
-        if head.is_spent || head.lead != head_lead(key) {
+        if head.is_spent || head.lead != lead {
             return None;
         }
         if key.len() <= LEAD_BYTES {
@@ -480,7 +483,8 @@ impl Sealed {
 
     /// Step every cursor standing on a key past it, reading none of their rows
     fn skip(&mut self, way: Way, key: &[u8]) -> Result<()> {
-        while let Some(at) = self.front_on(key) {
+        let lead = head_lead(key);
+        while let Some(at) = self.front_on(key, lead) {
             self.step(way, at)?;
         }
         Ok(())
@@ -514,7 +518,8 @@ impl Sealed {
         key: &[u8],
         mut each: impl FnMut(SegmentId, FooterRow),
     ) -> Result<()> {
-        while let Some(at) = self.front_on(key) {
+        let lead = head_lead(key);
+        while let Some(at) = self.front_on(key, lead) {
             let head = self.heads[at];
             match self.run(at) {
                 Run::Footer {

@@ -728,6 +728,7 @@ impl Default for PackedCursor {
 
 impl PackedCursor {
     /// The key and row at a place in the partition, decoding on from the cursor's row or from the row's restart
+    #[inline]
     pub fn read(
         &mut self,
         bytes: &[u8],

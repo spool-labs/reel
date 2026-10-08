@@ -39,7 +39,7 @@ use crate::sync::{lock, read, try_lock, write};
 
 use flush::{turn_at, Owed, SyncState, Turn};
 pub use flush::{Durability, FlushTurn};
-use journal::{Journal, Writes};
+use journal::Journal;
 use sealer::{
     doom_active, flush_active, park_broken_seal, publish_flush, retire_segment, seal_segment,
     Sealer,
@@ -1003,7 +1003,7 @@ impl Appender {
             )));
         }
         // One group for the whole run, so a batch comes back from a crash whole or not at all
-        active.journal.push(&rows)?;
+        active.journal.push(&rows);
         let mut pending = lock(&active.entries);
         for entry in &entries {
             pending.push(entry);
@@ -1069,7 +1069,7 @@ impl Appender {
             )));
         }
         if let Some(row) = row {
-            active.journal.push(&[row])?;
+            active.journal.push(&[row]);
         }
         if let Some(entry) = listed {
             lock(&active.entries).push(&entry);
@@ -1376,7 +1376,7 @@ impl Appender {
             resumed.rows_at,
             resumed.rows_len,
             self.shared.config.segment_bytes.to_bytes(),
-            self.writes(),
+            self.shared.writes_whole_blocks(),
         )?;
         // A whole-block volume pads each record to a block, so the tail resumes at the next block
         let end = match self.shared.writes_whole_blocks() {
@@ -1506,7 +1506,13 @@ impl Appender {
         let rows_at = self.rows_at();
         self.shared.driver.truncate(file, rows_at)?;
         let target = self.shared.config.segment_bytes.to_bytes();
-        let journal = Journal::create(&self.shared.driver, file, rows_at, target, self.writes());
+        let journal = Journal::create(
+            &self.shared.driver,
+            file,
+            rows_at,
+            target,
+            self.shared.writes_whole_blocks(),
+        );
         self.shared.driver.sync_dir(self.shared.segment_dir(id))?;
         // Small records go down keyless, checked under a key of the segment's own
         let layout = RecordLayout::Keyless(CheckKey::random()?);
@@ -1541,16 +1547,6 @@ impl Appender {
         active.settled.store(span, Ordering::Release);
         written?;
         Ok(active)
-    }
-
-    /// On Linux buffered volumes a put writes its row before it returns, so a process crash keeps it
-    fn writes(&self) -> Writes {
-        Writes {
-            through: cfg!(target_os = "linux")
-                && !self.shared.writes_whole_blocks()
-                && !matches!(self.shared.driver.serving(), ServingBackend::Sim),
-            whole_blocks: self.shared.writes_whole_blocks(),
-        }
     }
 
     /// Offset for a new segment's rows, far enough past the records that the footer always fits before it

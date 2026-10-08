@@ -170,9 +170,8 @@ none. The CRC covers the group's head and rows, so a group a crash cut short fai
 and the journal ends there. A direct volume writes whole blocks, so a group can be
 followed by zeros up to a block boundary, and the next group starts on that boundary.
 
-On Linux with buffered writes a put writes its group into the journal before it
-returns. Elsewhere a flush writes the pending groups ahead of the file's sync, and
-writeback pacing writes them too. A reopen reads the journal's whole groups and keeps
+A put leaves its group in memory. A flush writes the pending groups ahead of the
+file's sync, and writeback pacing writes them too. A reopen reads the journal's whole groups and keeps
 a group only when every record it lists sits where its row says and checks out, so a
 batch comes back whole or not at all. A resumed tail appends after the last whole
 group and writes new records past every record any group lists, so a dropped group

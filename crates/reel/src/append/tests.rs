@@ -74,20 +74,16 @@ fn harness_capped(
     (shared, sim)
 }
 
-// written-through rows keep every group in order across flushes, and a flush writes none of them again
+// pending rows keep every group in order across flushes, and a flush writes none of them twice
 #[test]
-fn written_through_rows_survive_flushes() {
+fn pending_rows_survive_flushes() {
     let (shared, _sim) = harness(config(SyncPolicy::Never), FaultPlan::new(1));
     let file = shared
         .driver
         .open(&shared.segment_path(SegmentId(9)), true)
         .expect("open");
     let rows_at = 4096;
-    let writes = Writes {
-        through: true,
-        whole_blocks: false,
-    };
-    let journal = Journal::create(&shared.driver, file, rows_at, 1 << 20, writes);
+    let journal = Journal::create(&shared.driver, file, rows_at, 1 << 20, false);
     let row = |byte: u8| JournalRow {
         key: key(byte),
         lsn: crate::format::lsn::Lsn(u64::from(byte)),
@@ -97,10 +93,10 @@ fn written_through_rows_survive_flushes() {
         range_end: None,
     };
     let groups = vec![vec![row(1)], vec![row(2), row(3)], vec![row(4)]];
-    journal.push(&groups[0]).expect("push");
-    journal.push(&groups[1]).expect("push");
+    journal.push(&groups[0]);
+    journal.push(&groups[1]);
     journal.write_pending().expect("flush");
-    journal.push(&groups[2]).expect("push");
+    journal.push(&groups[2]);
     journal.write_pending().expect("flush");
 
     let bytes = shared

@@ -166,13 +166,17 @@ fn rows_stay_within_their_segment() {
 #[cfg(target_os = "linux")]
 const ABORT_PUTS: u64 = 1_000;
 
-// every put that returned survives the process dying with no flush, on a Linux buffered volume
+// every put a flush covered survives the process dying, and the puts after it may not
 #[cfg(target_os = "linux")]
 #[test]
-fn puts_survive_a_process_crash() {
+fn flushed_puts_survive_a_process_crash() {
     if let Ok(dir) = std::env::var("REEL_CRASH_CHILD_DIR") {
         let store = ReelStore::open(dir.into(), config(), COLUMNS).expect("open");
         for at in 0..ABORT_PUTS {
+            store.put(&key(at), &value(at)).expect("put");
+        }
+        store.flush().expect("flush");
+        for at in ABORT_PUTS..2 * ABORT_PUTS {
             store.put(&key(at), &value(at)).expect("put");
         }
         // Exits with no destructors run, as a crash would
@@ -180,7 +184,11 @@ fn puts_survive_a_process_crash() {
     }
     let dir = TempDir::new().expect("tempdir");
     let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
-        .args(["--exact", "puts_survive_a_process_crash", "--nocapture"])
+        .args([
+            "--exact",
+            "flushed_puts_survive_a_process_crash",
+            "--nocapture",
+        ])
         .env("REEL_CRASH_CHILD_DIR", dir.path())
         .status()
         .expect("child");

@@ -14,16 +14,6 @@ use crate::sync::{lock, try_lock};
 /// Zero the rows region ahead of the rows in steps of at most 1 MiB, or a sixteenth of the segment if smaller
 const FILL: u64 = 1024 * 1024;
 
-/// How journal rows get written on this volume
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct Writes {
-    /// Write each row group before the put returns
-    pub through: bool,
-
-    /// Writes must cover whole blocks
-    pub whole_blocks: bool,
-}
-
 /// The journal of one open segment, stored from `rows_at` to the end of the segment file
 pub(super) struct Journal {
     /// The driver the file is written through
@@ -44,9 +34,6 @@ pub(super) struct Journal {
     /// Bytes pushed so far, written or pending, which the segment's room shrinks by
     pushed: AtomicU64,
 
-    /// Write each group before the put returns, so a process crash loses no row
-    through: bool,
-
     /// Pad each write with zeros to a whole block
     whole_blocks: bool,
 
@@ -64,9 +51,9 @@ impl Journal {
         file: FileId,
         rows_at: u64,
         span: u64,
-        writes: Writes,
+        whole_blocks: bool,
     ) -> Journal {
-        Journal::over(driver, Some(file), rows_at, 0, span, writes)
+        Journal::over(driver, Some(file), rows_at, 0, span, whole_blocks)
     }
 
     /// Continue a reopened segment's journal after its last whole group
@@ -76,9 +63,9 @@ impl Journal {
         rows_at: u64,
         written: u64,
         span: u64,
-        writes: Writes,
+        whole_blocks: bool,
     ) -> Result<Journal> {
-        let mut journal = Journal::over(driver, Some(file), rows_at, written, span, writes);
+        let mut journal = Journal::over(driver, Some(file), rows_at, written, span, whole_blocks);
         // Zero the rest of the last block, so the next group starts on a block boundary
         if journal.whole_blocks && !written.is_multiple_of(BLOCK) {
             let start = written - written % BLOCK;
@@ -98,7 +85,7 @@ impl Journal {
 
     /// A journal with no file, for a tail that holds no segment yet
     pub(super) fn none(driver: &Arc<IoDriver>) -> Journal {
-        Journal::over(driver, None, 0, 0, 0, Writes::default())
+        Journal::over(driver, None, 0, 0, 0, false)
     }
 
     fn over(
@@ -107,7 +94,7 @@ impl Journal {
         rows_at: u64,
         written: u64,
         span: u64,
-        writes: Writes,
+        whole_blocks: bool,
     ) -> Journal {
         Journal {
             driver: Arc::clone(driver),
@@ -116,8 +103,7 @@ impl Journal {
             pending: Mutex::new(Vec::new()),
             written: Mutex::new(written),
             pushed: AtomicU64::new(written),
-            through: writes.through,
-            whole_blocks: writes.whole_blocks,
+            whole_blocks,
             filled: AtomicU64::new(written),
             span,
         }
@@ -133,36 +119,16 @@ impl Journal {
         self.pushed.load(Ordering::Acquire)
     }
 
-    /// Add the rows of one write that has landed, as one group
-    pub(super) fn push(&self, rows: &[JournalRow]) -> Result<()> {
+    /// Add the rows of one write that has landed, as one group, for the next pace or flush to write
+    pub(super) fn push(&self, rows: &[JournalRow]) {
         if rows.is_empty() {
-            return Ok(());
+            return;
         }
         let mut pending = lock(&self.pending);
-        let (Some(file), true) = (self.file, self.through) else {
-            let before = pending.len();
-            push_group(rows, &mut pending);
-            self.pushed
-                .fetch_add((pending.len() - before) as u64, Ordering::AcqRel);
-            return Ok(());
-        };
-        // Write under the lock so groups stay in order. Nothing is pending in this mode, so reuse that buffer.
-        pending.clear();
+        let before = pending.len();
         push_group(rows, &mut pending);
-        let at = self.pushed.load(Ordering::Acquire);
-        let end = at + pending.len() as u64;
-        self.fill_to(file, end)?;
-        let mut bufs = super::take_bufs(1);
-        bufs.push(WriteBuf::owned(std::mem::take(&mut *pending)));
-        let (_, mut bufs) = self.driver.writev_reusing(file, self.rows_at + at, bufs)?;
-        // Empty it on the way back, or the next flush writes this group again over the first
-        if let Some(WriteBuf::Owned(mut group)) = bufs.pop() {
-            group.clear();
-            *pending = group;
-        }
-        super::recycle_bufs(bufs);
-        self.pushed.store(end, Ordering::Release);
-        Ok(())
+        self.pushed
+            .fetch_add((pending.len() - before) as u64, Ordering::AcqRel);
     }
 
     /// Write all pending groups to the segment file. The next sync of the file covers them.

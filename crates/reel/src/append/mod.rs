@@ -1501,7 +1501,12 @@ impl Appender {
     fn build_segment(&self, id: SegmentId, holds: Arc<SegmentHolds>) -> Result<Active> {
         let path = self.shared.segment_path(id);
         let file = self.shared.driver.open(&path, true)?;
-        let journal = Journal::create(&self.shared.driver, &path, self.writes_rows_through())?;
+        let journal = Journal::create(
+            &self.shared.driver,
+            &path,
+            self.shared.config.segment_bytes.to_bytes(),
+            self.writes_rows_through(),
+        )?;
         // One directory sync makes both new entries durable, the segment's and its journal's
         self.shared.driver.sync_dir(self.shared.segment_dir(id))?;
         // Small records go down keyless, checked under a key of the segment's own

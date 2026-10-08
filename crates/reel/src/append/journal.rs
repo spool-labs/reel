@@ -10,6 +10,9 @@ use crate::io::op::{FileId, WriteBuf};
 use crate::reel::segment::IoDriver;
 use crate::sync::{lock, try_lock};
 
+/// A written-through journal is zeroed at most this far at a time ahead of its rows, and a sixteenth of its segment when less
+const FILL: u64 = 1024 * 1024;
+
 /// One open segment's journal
 pub(super) struct Journal {
     /// The driver the file is written through
@@ -29,6 +32,12 @@ pub(super) struct Journal {
 
     /// The file each push writes its group into before it returns, so a process crash keeps every row its record kept
     through: Option<FileId>,
+
+    /// How far the written-through file is zeroed
+    filled: AtomicU64,
+
+    /// The segment's size, which the zeroed file never runs past
+    span: u64,
 }
 
 struct JournalFile {
@@ -37,22 +46,19 @@ struct JournalFile {
 }
 
 impl Journal {
-    /// Create the journal of a segment being drawn, writing each group as it comes when `through`
+    /// Create the journal of a segment of `span` bytes being drawn, writing each group as it comes when `through`
     pub(super) fn create(
         driver: &Arc<IoDriver>,
         segment_path: &Path,
+        span: u64,
         through: bool,
     ) -> Result<Journal> {
         let path = journal_path(segment_path);
         // A drawn number is new and an open unlinks stale journals, so the file starts empty
         let id = driver.open(&path, true)?;
-        Ok(Journal::over(
-            driver,
-            path,
-            Some(id),
-            0,
-            through.then_some(id),
-        ))
+        let mut journal = Journal::over(driver, path, Some(id), 0, through.then_some(id));
+        journal.span = span;
+        Ok(journal)
     }
 
     /// Take a journal up again with only the rows a reopen accepted
@@ -101,6 +107,8 @@ impl Journal {
             file: Mutex::new(JournalFile { id, written }),
             pushed: AtomicU64::new(written),
             through,
+            filled: AtomicU64::new(0),
+            span: 0,
         }
     }
 
@@ -127,6 +135,16 @@ impl Journal {
         push_group(rows, &mut group);
         let at = self.pushed.load(Ordering::Acquire);
         let end = at + group.len() as u64;
+        let filled = self.filled.load(Ordering::Acquire);
+        if end > filled {
+            // A sync over blocks the file already holds settles no extents, as the segment's fill does for its records
+            let step = (self.span / 16).clamp(4096, FILL);
+            let to = (end.div_ceil(step) * step).min(self.span.max(end));
+            self.driver
+                .writev_all(id, filled, vec![WriteBuf::zeros((to - filled) as usize)])?;
+            self.driver.sync_full(id)?;
+            self.filled.store(to, Ordering::Release);
+        }
         self.driver
             .writev_all(id, at, vec![WriteBuf::owned(group)])?;
         self.pushed.store(end, Ordering::Release);

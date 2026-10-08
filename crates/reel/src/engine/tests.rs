@@ -21,6 +21,7 @@ use crate::format::footer::SegmentFooter;
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::record::HEADER_LEN;
 use crate::index::page::KeyPage;
+use crate::index::spot::Lookup;
 use crate::io::fault::{FaultKind, FaultPlan};
 use crate::io::posix_backend::PosixBackend;
 use crate::io::sim_backend::{DurableImage, SimIo};
@@ -1990,6 +1991,73 @@ fn a_prune_waits_out_a_handover() {
         "a read during the hand-over found the deleted version"
     );
     assert!(store.get(&key).expect("read").is_none());
+}
+
+// a hand-over of a partition the map has moved past never puts its rows in the spot index
+#[test]
+fn an_outversioned_handover_skips_the_spot_index() {
+    let script = crate::sync::rendezvous::script();
+    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
+    let store = Arc::new(store);
+    let keys: Vec<RecordKey> = (0..100u8).map(|byte| record(7, byte)).collect();
+    for key in &keys {
+        store.put(key, &[1u8; 64]).expect("put");
+    }
+    store.reel.tails()[0].seal().expect("seal");
+    store.hold_sealed().expect("note the seal");
+    for key in &keys {
+        store.put(key, &[2u8; 64]).expect("rewrite");
+    }
+
+    script.hold("paged/handover-spot");
+    let handing = {
+        let store = Arc::clone(&store);
+        script.cast(move || store.page_out_sealed())
+    };
+    script.await_reached("paged/handover-spot", 1);
+    let held = store.index.spot_held();
+    script.release("paged/handover-spot");
+    let handed = handing
+        .join()
+        .expect("hand-over thread")
+        .expect("hand over");
+
+    assert_eq!(held, 0, "outversioned rows went into the spot index");
+    assert_eq!(handed, 0);
+    for key in &keys {
+        assert_eq!(
+            store.get(key).expect("read").as_deref(),
+            Some(&[2u8; 64][..])
+        );
+    }
+}
+
+// a live row older than a pruned grave still leaves the map for the spot index
+#[test]
+fn an_old_row_under_a_pruned_grave_is_handed_over() {
+    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
+    let (kept, gone) = (record(7, 1), record(7, 2));
+    store.put(&kept, &[1u8; 64]).expect("put");
+    store.put(&gone, &[1u8; 64]).expect("put");
+    store.delete(&gone).expect("delete");
+    store.reel.tails()[0].seal().expect("seal");
+    store.hold_sealed().expect("note the seal");
+    let past = store.reel.shared().lsn.peek().as_u64() + 2 * GRAVE_WINDOW;
+    store.reel.shared().lsn.recover_to(Lsn(past));
+    store.prune_tombstones();
+    assert_eq!(store.index.grave_count(), 0, "the grave stayed");
+
+    assert_eq!(store.page_out_sealed().expect("hand over"), 1);
+    let column = store.index.column(RECORD).expect("column");
+    assert!(
+        column.get(kept.as_slice()).is_none(),
+        "the map kept the row"
+    );
+    assert_eq!(
+        store.get(&kept).expect("read").as_deref(),
+        Some(&[1u8; 64][..])
+    );
+    assert!(store.get(&gone).expect("read").is_none());
 }
 
 // a range delete drawn after the cue point is invisible to it
@@ -4489,8 +4557,14 @@ fn a_cue_read_waits_out_a_hand_over_in_flight() {
         vec![0x3cu8; 8 * 1024],
     );
     let keys: Vec<RecordKey> = (0..200u8).map(|byte| record(7, byte)).collect();
+    // Live keys keep the first partitions mostly live, so their hand-over fills the spot index first
+    let mut filler =
+        (1..=30u16).flat_map(|group| (0..200u8).map(move |byte| record(group + 7, byte)));
     for key in &keys {
         store.put(key, &first).expect("put");
+        for key in filler.by_ref().take(30) {
+            store.put(&key, &[1u8; 64]).expect("put a filler");
+        }
     }
     drop(store.cue().expect("seal"));
     for key in &keys {
@@ -4508,6 +4582,12 @@ fn a_cue_read_waits_out_a_hand_over_in_flight() {
         script.cast(move || store.page_out_sealed().expect("hand over"))
     };
     script.await_reached("paged/handover-spot", 1);
+    let spotted = keys.iter().any(|key| {
+        matches!(
+            store.index.spot_column(0).read(key),
+            Ok(Lookup::Found(_, value) | Lookup::Newest(value)) if value[0] == 0xa5
+        )
+    });
     let stale = keys
         .iter()
         .filter(|key| {
@@ -4518,6 +4598,10 @@ fn a_cue_read_waits_out_a_hand_over_in_flight() {
     script.release("paged/handover-spot");
     handing.join().expect("hand over");
     drop(script);
+    assert!(
+        spotted,
+        "no older version was in the spot index mid hand-over"
+    );
     assert_eq!(
         stale, 0,
         "a cue read answered with a version older than the cue"

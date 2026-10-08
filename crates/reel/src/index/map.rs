@@ -265,8 +265,28 @@ const HANDOVER_LANES: usize = 4;
 /// A partition under this many rows hands over on the calling thread, since lanes cost more to start
 const SPLIT_AT: usize = 4096;
 
+/// Rows a hand-over samples to tell whether a partition is worth asking the map about whole
+const SAMPLE_ROWS: usize = 64;
+
+/// Whether one sampled row in sixteen or more is one the map no longer holds, each costing a spot insert and its removal
+fn mostly_outversioned(index: &ColumnIndex, rows: &[(&[u8], Loc)]) -> bool {
+    if rows.is_empty() {
+        return false;
+    }
+    let step = rows.len().div_ceil(SAMPLE_ROWS);
+    let (mut sampled, mut missing) = (0usize, 0usize);
+    for (key, loc) in rows.iter().step_by(step) {
+        sampled += 1;
+        missing += usize::from(!index.holds(key, *loc));
+    }
+    missing * 16 >= sampled
+}
+
 /// Run one hand-over step over `len` rows, a lane of shards to a thread past the split
 fn in_lanes(len: usize, step: &(dyn Fn(usize, usize) -> Vec<bool> + Sync)) -> Vec<bool> {
+    if len == 0 {
+        return Vec::new();
+    }
     let lanes = match len >= SPLIT_AT {
         true => HANDOVER_LANES,
         false => 1,
@@ -996,24 +1016,22 @@ impl ReelIndex {
         }
         // Raised before any key leaves the map, so a write finding its place empty sees it
         self.handed.fetch_max(newest.as_u64(), Ordering::AcqRel);
-        if !asked.is_empty() {
-            let held = in_lanes(asked.len(), &|lane, lanes| {
-                index.holds_lane(&asked, lane, lanes)
-            });
-            rows.extend(
-                asked
-                    .into_iter()
-                    .zip(held)
-                    .filter_map(|(row, held)| held.then_some(row)),
-            );
+        if mostly_outversioned(index, &rows) {
+            asked.append(&mut rows);
         }
+        // An asked row goes to the spot index under the map's lock, and only if the map still holds it
+        let took = in_lanes(asked.len(), &|lane, lanes| {
+            index.page_out_lane(&asked, lane, lanes, &|key, loc| {
+                spot.insert(key, loc);
+            })
+        });
         let inserted = in_lanes(rows.len(), &|lane, lanes| {
             spot.insert_lane(&rows, lane, lanes)
         });
         // The spot index takes every key before the map lets any go, so no read misses both
         crate::sync::rendezvous::at("paged/handover-spot");
         let handed = in_lanes(rows.len(), &|lane, lanes| {
-            index.page_out_lane(&rows, lane, lanes)
+            index.page_out_lane(&rows, lane, lanes, &|_, _| {})
         });
         let back: Vec<(&[u8], Loc)> = rows
             .iter()
@@ -1025,7 +1043,7 @@ impl ReelIndex {
         if !back.is_empty() {
             spot.remove_lane(&back, 0, 1);
         }
-        Ok(handed.iter().filter(|handed| **handed).count())
+        Ok(handed.iter().chain(&took).filter(|handed| **handed).count())
     }
 
     /// Record the keys one newly sealed segment covers for one column

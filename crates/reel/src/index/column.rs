@@ -419,14 +419,20 @@ impl ColumnIndex {
         on_index!(self, index => index.page_out(key, loc))
     }
 
-    /// Give up the keys in one lane of shards, one lock a chunk, and report which went
-    pub fn page_out_lane(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<bool> {
-        on_index!(self, index => index.page_out_lane(rows, lane, lanes))
+    /// Give up the keys in one lane of shards, one lock a chunk, calling `first` on each under the lock, and report which went
+    pub fn page_out_lane(
+        &self,
+        rows: &[(&[u8], Loc)],
+        lane: usize,
+        lanes: usize,
+        first: &(dyn Fn(&[u8], Loc) + Sync),
+    ) -> Vec<bool> {
+        on_index!(self, index => index.page_out_lane(rows, lane, lanes, first))
     }
 
-    /// Which rows in one lane of shards the map still points at
-    pub fn holds_lane(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<bool> {
-        on_index!(self, index => index.holds_lane(rows, lane, lanes))
+    /// Whether the map points a key at exactly this place, with no grave or cover over it
+    pub fn holds(&self, key: &[u8], loc: Loc) -> bool {
+        on_index!(self, index => index.holds(key, loc))
     }
 
     /// The newest version a pruned grave or cover guarded
@@ -1791,11 +1797,17 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// it over would put it where the map sweep cannot reach and the release pass
     /// may already have been, so nothing would ever settle it.
     pub fn page_out(&self, key: &[u8], loc: Loc) -> bool {
-        self.page_out_lane(&[(key, loc)], 0, 1)[0]
+        self.page_out_lane(&[(key, loc)], 0, 1, &|_, _| {})[0]
     }
 
-    /// Give up the keys in one lane of shards, one lock a chunk, and report which went
-    pub fn page_out_lane(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<bool> {
+    /// Give up the keys in one lane of shards, one lock a chunk, calling `first` on each under the lock, and report which went
+    pub fn page_out_lane(
+        &self,
+        rows: &[(&[u8], Loc)],
+        lane: usize,
+        lanes: usize,
+        first: &(dyn Fn(&[u8], Loc) + Sync),
+    ) -> Vec<bool> {
         let mut handed = vec![false; rows.len()];
         for (shard, ats) in self.lane_shards(rows, lane, lanes).iter().enumerate() {
             for chunk in ats.chunks(LOCK_CHUNK) {
@@ -1808,6 +1820,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                     if !self.holds_at(&state, &key, loc) {
                         continue;
                     }
+                    first(key.as_slice(), loc);
                     state.map.take(key.as_slice());
                     state.paged += 1;
                     handed[at] = true;
@@ -1819,20 +1832,13 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         handed
     }
 
-    /// Which rows in one lane of shards the map still points at
-    pub fn holds_lane(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<bool> {
-        let mut held = vec![false; rows.len()];
-        for (shard, ats) in self.lane_shards(rows, lane, lanes).iter().enumerate() {
-            for chunk in ats.chunks(LOCK_CHUNK) {
-                let state = read(&self.shards[shard]);
-                for &at in chunk {
-                    let (key, loc) = rows[at];
-                    held[at] =
-                        K::from_slice(key).is_some_and(|key| self.holds_at(&state, &key, loc));
-                }
-            }
-        }
-        held
+    /// Whether the map points a key at exactly this place, with no grave or cover over it
+    pub fn holds(&self, key: &[u8], loc: Loc) -> bool {
+        let Some(key) = K::from_slice(key) else {
+            return false;
+        };
+        let state = read(&self.shards[self.shard_of(&key)]);
+        self.holds_at(&state, &key, loc)
     }
 
     /// The rows of one lane, grouped by the shard each key falls in

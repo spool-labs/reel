@@ -31,6 +31,20 @@ const SHARDS: usize = 256;
 /// A batch takes a shard's lock for this many keys at a time, so a write behind it waits a short while
 const LOCK_CHUNK: usize = 512;
 
+/// Put a slot in a held shard unless one already points at the same record
+fn put_in(table: &mut Writing<'_>, hash: u64, loc: Loc) -> bool {
+    let slot = Slot::new(hash, loc);
+    if table
+        .matches(hash)
+        .iter()
+        .any(|place| place.slot.same_place(&slot))
+    {
+        return false;
+    }
+    table.insert(slot);
+    true
+}
+
 /// The rows of one lane of shards, gathered by shard
 fn lane_groups(rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<(usize, Vec<usize>)> {
     let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); SHARDS];
@@ -974,9 +988,10 @@ impl SpotColumn {
             .sum()
     }
 
-    /// Hold the location of a key's newest sealed record, leaving older entries to the cleaner
-    pub fn insert(&self, key: &[u8], loc: Loc) {
-        self.insert_lane(&[(key, loc)], 0, 1);
+    /// Hold the location of a key's newest sealed record, leaving older entries to the cleaner, and say whether it took a new slot
+    pub fn insert(&self, key: &[u8], loc: Loc) -> bool {
+        let hash = hash_of(key);
+        put_in(&mut self.shards[shard_of(hash)].write(), hash, loc)
     }
 
     /// Put in the keys of the shards whose number leaves `lane` over `lanes`, and say which took a new slot
@@ -987,17 +1002,7 @@ impl SpotColumn {
                 let mut table = self.shards[shard].write();
                 for &at in chunk {
                     let (key, loc) = rows[at];
-                    let hash = hash_of(key);
-                    let slot = Slot::new(hash, loc);
-                    if table
-                        .matches(hash)
-                        .iter()
-                        .any(|place| place.slot.same_place(&slot))
-                    {
-                        continue;
-                    }
-                    table.insert(slot);
-                    inserted[at] = true;
+                    inserted[at] = put_in(&mut table, hash_of(key), loc);
                 }
             }
         }

@@ -4344,6 +4344,38 @@ fn a_resumed_tail_writes_past_a_group_it_turned_down() {
     }
 }
 
+// a closed tail gives back the zeros ahead of its records and its rows, and reopens whole
+#[test]
+fn a_closed_tail_holds_little_more_than_its_writes() {
+    use std::os::unix::fs::MetadataExt;
+    let (store, _backend, dir) = posix_store(config(1, SyncPolicy::Never));
+    for byte in 0..5u8 {
+        store.put(&record(7, byte), &[byte; 200]).expect("put");
+    }
+    store.close().expect("close");
+    drop(store);
+
+    let path = dir.path().join(segment_file_name(SegmentId(1)));
+    let held = std::fs::metadata(&path).expect("stat").blocks() * 512;
+    assert!(
+        held <= 64 * 1024,
+        "a closed tail of five records holds {held} bytes"
+    );
+    let reopened = ReelStore::open(
+        dir.path().to_path_buf(),
+        config(1, SyncPolicy::Never),
+        COLUMNS,
+    )
+    .expect("reopen");
+    for byte in 0..5u8 {
+        assert_eq!(
+            reopened.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![byte; 200])),
+            "key {byte} after the reopen"
+        );
+    }
+}
+
 // a read-only open serves reads but rejects every write
 #[test]
 fn read_only_rejects_writes() {

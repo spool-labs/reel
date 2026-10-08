@@ -800,6 +800,19 @@ impl IoDriver {
         })
     }
 
+    /// Give back the blocks under a byte range of zeros, keeping the length
+    pub fn release(&self, file: FileId, offset: u64, len: u64) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        self.done(Op::Release {
+            tag: self.next_tag(),
+            file,
+            offset,
+            len,
+        })
+    }
+
     /// Cut a file to a length, handing reserved space past it back
     pub fn truncate(&self, file: FileId, len: u64) -> Result<()> {
         self.done(Op::Truncate {

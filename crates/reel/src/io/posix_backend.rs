@@ -457,6 +457,15 @@ impl PosixBackend {
                 tag,
                 outcome: Outcome::Done(self.allocate(file, offset, len)),
             },
+            Op::Release {
+                tag,
+                file,
+                offset,
+                len,
+            } => Completion {
+                tag,
+                outcome: Outcome::Done(self.release(file, offset, len)),
+            },
             Op::Truncate { tag, file, len } => Completion {
                 tag,
                 outcome: Outcome::Done(self.truncate(file, len)),
@@ -492,6 +501,11 @@ impl PosixBackend {
     fn allocate(&self, file: FileId, offset: u64, len: u64) -> Result<()> {
         let fd = self.fd_of(file)?;
         raw_allocate(fd, offset, len)
+    }
+
+    fn release(&self, file: FileId, offset: u64, len: u64) -> Result<()> {
+        let fd = self.fd_of(file)?;
+        raw_release(fd, offset, len)
     }
 
     fn truncate(&self, file: FileId, len: u64) -> Result<()> {
@@ -1206,6 +1220,45 @@ fn raw_allocate(fd: RawFd, offset: u64, len: u64) -> Result<()> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn raw_allocate(fd: RawFd, offset: u64, len: u64) -> Result<()> {
     extend_to(fd, offset.saturating_add(len))
+}
+
+/// Punch a hole over a byte range, keeping the length. A filesystem that cannot punch keeps the blocks.
+#[cfg(target_os = "linux")]
+fn raw_release(fd: RawFd, offset: u64, len: u64) -> Result<()> {
+    let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+    let ret = unsafe { libc::fallocate(fd, mode, offset as libc::off_t, len as libc::off_t) };
+    if ret == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == libc::ENOSYS || code == libc::EOPNOTSUPP => Ok(()),
+        _ => Err(ReelError::Io(error)),
+    }
+}
+
+/// Punch a hole over a byte range on macOS, keeping the length. A filesystem that cannot punch keeps the blocks.
+#[cfg(target_os = "macos")]
+fn raw_release(fd: RawFd, offset: u64, len: u64) -> Result<()> {
+    let hole = libc::fpunchhole_t {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: offset as libc::off_t,
+        fp_length: len as libc::off_t,
+    };
+    if unsafe { libc::fcntl(fd, libc::F_PUNCHHOLE, &hole) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == libc::ENOTSUP || code == libc::EINVAL => Ok(()),
+        _ => Err(ReelError::Io(error)),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn raw_release(_fd: RawFd, _offset: u64, _len: u64) -> Result<()> {
+    Ok(())
 }
 
 /// Linux says everything per range, and has nothing to say about a file as a whole

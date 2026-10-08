@@ -433,6 +433,7 @@ fn is_dir_op(op: &Op) -> bool {
         | Op::Length { .. }
         | Op::Close { .. }
         | Op::Allocate { .. }
+        | Op::Release { .. }
         | Op::Truncate { .. }
         | Op::Advise { .. } => false,
     }
@@ -642,6 +643,15 @@ fn execute_op(state: &mut SimState, op: Op, position: u64) -> Completion {
         } => Completion {
             tag,
             outcome: Outcome::Done(allocate(state, file, offset, len, fault)),
+        },
+        Op::Release {
+            tag,
+            file,
+            offset,
+            len,
+        } => Completion {
+            tag,
+            outcome: Outcome::Done(release(state, file, offset, len)),
         },
         Op::Truncate { tag, file, len } => Completion {
             tag,
@@ -877,6 +887,15 @@ fn allocate(
     // written byte the way a real one does under a keep-size fallocate.
     held_file_mut(state, file)?;
     let _ = (offset, len);
+    Ok(())
+}
+
+/// Read a released range back as zeros, at the length the file already has
+fn release(state: &mut SimState, file: FileId, offset: u64, len: u64) -> Result<()> {
+    let file_ref = held_file_mut(state, file)?;
+    let end = (offset.saturating_add(len) as usize).min(file_ref.cached.len());
+    let start = (offset as usize).min(end);
+    file_ref.cached[start..end].fill(0);
     Ok(())
 }
 

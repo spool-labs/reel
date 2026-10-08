@@ -326,6 +326,13 @@ pub enum Op {
         offset: u64,
         len: u64,
     },
+    /// Give back the blocks under a byte range without changing the length
+    Release {
+        tag: Tag,
+        file: FileId,
+        offset: u64,
+        len: u64,
+    },
     /// Cut a file to a length, handing reserved space past it back
     Truncate { tag: Tag, file: FileId, len: u64 },
     /// Advise the kernel on access pattern or drop cached pages
@@ -356,6 +363,7 @@ impl Op {
             Op::List { tag, .. } => *tag,
             Op::Length { tag, .. } => *tag,
             Op::Allocate { tag, .. } => *tag,
+            Op::Release { tag, .. } => *tag,
             Op::Truncate { tag, .. } => *tag,
             Op::Advise { tag, .. } => *tag,
         }

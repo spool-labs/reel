@@ -656,10 +656,14 @@ impl Appender {
         }
         let file = active.handle.file();
         let driver = &self.shared.driver;
-        // Keep the rows for the next open, and sync once to cover rows and records
+        // Give back everything between the records and the rows, keep the rows for the next open, and sync once
+        let end = align_up(active.end(), ALIGN);
+        let rows_at = active.journal.rows_at();
         let flushed = active
             .journal
             .write_pending()
+            .and_then(|()| driver.release(file, end, rows_at.saturating_sub(end)))
+            .and_then(|()| active.journal.release_ahead())
             .and_then(|()| driver.sync_full(file));
         active.terminal.store(true, Ordering::Release);
         match &flushed {

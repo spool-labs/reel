@@ -180,8 +180,25 @@ impl Journal {
             vec![WriteBuf::zeros((to - filled) as usize)],
         )?;
         self.driver.sync_full(file)?;
+        // Some filesystems fill a gap up to the first write past it, and no record ever reaches past the segment size
+        if filled == 0 {
+            let past = self.span.next_multiple_of(BLOCK);
+            self.driver
+                .release(file, past, self.rows_at.saturating_sub(past))?;
+        }
         self.filled.store(to, Ordering::Release);
         Ok(())
+    }
+
+    /// Give back the zeros laid ahead of the written rows, at a close that writes nothing more
+    pub(super) fn release_ahead(&self) -> Result<()> {
+        let Some(file) = self.file else {
+            return Ok(());
+        };
+        let written = lock(&self.written).next_multiple_of(BLOCK);
+        let filled = self.filled.load(Ordering::Acquire);
+        self.driver
+            .release(file, self.rows_at + written, filled.saturating_sub(written))
     }
 
     /// Drop pending rows once the sealed footer lists them all

@@ -18,9 +18,8 @@ takes the process and leaves the page cache standing; a power cut takes both.
 | any of the above, for a multi-record batch | a batch is confirmed or it never happened | a batch is confirmed or it never happened |
 
 A small record is keyless, so an open segment's journal is what says which key each
-record holds. On Linux with buffered writes the journal is mapped like the tail, and
-a put copies its row in before it returns, so a dead process leaves both in the page
-cache. Elsewhere rows wait in memory for the next pace or flush, and a record whose
+record holds. On Linux with buffered writes a put writes its record and its row
+before it returns, so a dead process leaves both in the page cache. Elsewhere rows wait in memory for the next pace or flush, and a record whose
 row never reached the journal is not found again.
 
 Four things hold at every setting.

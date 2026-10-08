@@ -165,9 +165,8 @@ A range tombstone's row holds its exclusive end behind its length, `0xFFFF` for
 none. The CRC covers the group's head and rows, so a group a crash cut short fails it
 and the journal ends there.
 
-On Linux with buffered writes the journal is a mapped file, like the tail. A put
-copies its group in before it returns, and the file grows a mebibyte at a time.
-Elsewhere a flush writes the pending groups and syncs the journal, and writeback
+On Linux with buffered writes a put writes its group into the journal before it
+returns. Elsewhere a flush writes the pending groups and syncs the journal, and writeback
 pacing writes them too. A reopen reads the journal's whole groups and keeps
 a group only when every record it lists sits where its row says and checks out, so a
 batch comes back whole or not at all. A resumed tail writes the accepted rows again

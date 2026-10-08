@@ -1,4 +1,4 @@
-//! An open segment's journal file, mapped where the tail is so rows land with their records
+//! An open segment's journal file, written through where a dead process should leave its rows
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,13 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::Result;
 use crate::format::journal::{journal_path, push_group, JournalRow};
-use crate::io::mapping::WriteMapping;
 use crate::io::op::{FileId, WriteBuf};
 use crate::reel::segment::IoDriver;
 use crate::sync::{lock, try_lock};
-
-/// A mapped journal's file grows by at most this much at a time, and by a sixteenth of its span when less
-const GROW: u64 = 1024 * 1024;
 
 /// One open segment's journal
 pub(super) struct Journal {
@@ -31,8 +27,8 @@ pub(super) struct Journal {
     /// Bytes pushed so far, written or pending, which the segment's room shrinks by
     pushed: AtomicU64,
 
-    /// The file mapped writable, so a process crash keeps every row its record kept
-    mapped: Option<MappedRows>,
+    /// The file each push writes its group into before it returns, so a process crash keeps every row its record kept
+    through: Option<FileId>,
 }
 
 struct JournalFile {
@@ -40,39 +36,23 @@ struct JournalFile {
     written: u64,
 }
 
-struct MappedRows {
-    /// The writable mapping rows are copied into
-    map: WriteMapping,
-
-    /// Bytes the mapping spans, past which a group goes down through the driver
-    span: u64,
-
-    /// The file under the mapping, open until the seal
-    id: FileId,
-
-    /// The file's length, kept one step ahead of the rows copied in
-    grown: AtomicU64,
-}
-
 impl Journal {
-    /// Create the journal of a segment being drawn, mapped over `span` bytes when the tail is mapped
+    /// Create the journal of a segment being drawn, writing each group as it comes when `through`
     pub(super) fn create(
         driver: &Arc<IoDriver>,
         segment_path: &Path,
-        span: Option<u64>,
+        through: bool,
     ) -> Result<Journal> {
         let path = journal_path(segment_path);
         // A drawn number is new and an open unlinks stale journals, so the file starts empty
         let id = driver.open(&path, true)?;
-        let mapped = span
-            .and_then(|span| WriteMapping::growing(&path, span).map(|map| (map, span)))
-            .map(|(map, span)| MappedRows {
-                map,
-                span,
-                id,
-                grown: AtomicU64::new(0),
-            });
-        Ok(Journal::over(driver, path, Some(id), 0, mapped))
+        Ok(Journal::over(
+            driver,
+            path,
+            Some(id),
+            0,
+            through.then_some(id),
+        ))
     }
 
     /// Take a journal up again with only the rows a reopen accepted
@@ -112,7 +92,7 @@ impl Journal {
         path: PathBuf,
         id: Option<FileId>,
         written: u64,
-        mapped: Option<MappedRows>,
+        through: Option<FileId>,
     ) -> Journal {
         Journal {
             driver: Arc::clone(driver),
@@ -120,7 +100,7 @@ impl Journal {
             pending: Mutex::new(Vec::new()),
             file: Mutex::new(JournalFile { id, written }),
             pushed: AtomicU64::new(written),
-            mapped,
+            through,
         }
     }
 
@@ -135,7 +115,7 @@ impl Journal {
             return Ok(());
         }
         let mut pending = lock(&self.pending);
-        let Some(mapped) = &self.mapped else {
+        let Some(id) = self.through else {
             let before = pending.len();
             push_group(rows, &mut pending);
             self.pushed
@@ -143,22 +123,12 @@ impl Journal {
             return Ok(());
         };
         // Groups go into the file in push order under the lock, so a crash cuts only the last
-        pending.clear();
-        push_group(rows, &mut pending);
+        let mut group = Vec::new();
+        push_group(rows, &mut group);
         let at = self.pushed.load(Ordering::Acquire);
-        let end = at + pending.len() as u64;
-        if end > mapped.grown.load(Ordering::Acquire) {
-            let step = (mapped.span / 16).clamp(4096, GROW);
-            let grown = (end.div_ceil(step) * step).min(mapped.span.max(end));
-            self.driver.truncate(mapped.id, grown)?;
-            mapped.grown.store(grown, Ordering::Release);
-        }
-        if !mapped.map.write(at, &pending) {
-            let group = std::mem::take(&mut *pending);
-            self.driver
-                .writev_all(mapped.id, at, vec![WriteBuf::owned(group)])?;
-        }
-        pending.clear();
+        let end = at + group.len() as u64;
+        self.driver
+            .writev_all(id, at, vec![WriteBuf::owned(group)])?;
         self.pushed.store(end, Ordering::Release);
         Ok(())
     }
@@ -212,12 +182,6 @@ impl Drop for Journal {
         let mut file = lock(&self.file);
         let _ = self.write_locked(&mut file);
         if let Some(id) = file.id.take() {
-            // A mapped file runs a step past its rows, so a clean close trims it
-            if self.mapped.is_some() {
-                let _ = self
-                    .driver
-                    .truncate(id, self.pushed.load(Ordering::Acquire));
-            }
             let _ = self.driver.close(id);
         }
     }

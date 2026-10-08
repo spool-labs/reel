@@ -170,7 +170,7 @@ fn a_journal_stays_within_its_segment() {
 #[cfg(target_os = "linux")]
 const ABORT_PUTS: u64 = 1_000;
 
-// every put that returned survives the process dying with no flush, on a mapped volume
+// every put that returned survives the process dying with no flush, on a Linux buffered volume
 #[cfg(target_os = "linux")]
 #[test]
 fn puts_survive_a_process_crash() {

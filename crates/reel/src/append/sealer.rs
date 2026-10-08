@@ -26,7 +26,7 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
         return Ok(());
     }
     // Cut the file at the records, handing preallocated blocks back before the footer goes down
-    if active.alloc_high.load(Ordering::Acquire) > end || active.map.is_some() {
+    if active.alloc_high.load(Ordering::Acquire) > end {
         shared.driver.truncate(active.handle.file(), end)?;
     }
 

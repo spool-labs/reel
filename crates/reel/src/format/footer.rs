@@ -47,6 +47,36 @@ pub const PACKED_WIDTH: u16 = 0x8000;
 /// Bytes one row start takes in a varying partition's table
 pub const START_BYTES: usize = U32_BYTES;
 
+/// A seal writes this after its rows, so an open whose cut never landed still finds the footer
+pub const SEAL_MARK_LEN: usize = U64_BYTES + U32_BYTES + U32_BYTES + U32_BYTES;
+
+const SEAL_MAGIC: u32 = u32::from_le_bytes(*b"SEAL");
+
+/// The mark for a footer of this length ending at this offset: end, length, check, magic last
+pub fn seal_mark(footer_end: u64, footer_len: u32) -> [u8; SEAL_MARK_LEN] {
+    let mut mark = [0u8; SEAL_MARK_LEN];
+    mark[..8].copy_from_slice(&footer_end.to_le_bytes());
+    mark[8..12].copy_from_slice(&footer_len.to_le_bytes());
+    mark[16..].copy_from_slice(&SEAL_MAGIC.to_le_bytes());
+    let check = checksum(&mark);
+    mark[12..16].copy_from_slice(&check.to_le_bytes());
+    mark
+}
+
+/// The footer end and length a seal mark holds, or nothing for bytes that are not one
+pub fn read_seal_mark(bytes: &[u8]) -> Option<(u64, u32)> {
+    let mut mark: [u8; SEAL_MARK_LEN] = bytes.try_into().ok()?;
+    if read_u32_le(&mark[16..]) != SEAL_MAGIC {
+        return None;
+    }
+    let check = read_u32_le(&mark[12..16]);
+    mark[12..16].fill(0);
+    if checksum(&mark) != check {
+        return None;
+    }
+    Some((read_u64_le(&mark[..8]), read_u32_le(&mark[8..12])))
+}
+
 const MAGIC_FROM_END: usize = U32_BYTES;
 const FOOTER_LEN_FROM_END: usize = MAGIC_FROM_END + U32_BYTES;
 const CRC_FROM_END: usize = FOOTER_LEN_FROM_END + U32_BYTES;

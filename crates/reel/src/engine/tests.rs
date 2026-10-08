@@ -503,10 +503,12 @@ fn spot_keeps_rebuilt_segments_through_a_retire() {
     for byte in 0..120u8 {
         store.put(&record(7, byte), &payload).expect("overwrite");
     }
-    store.close().expect("close");
+    // Taken before a close, which would retire the dead segments itself
+    store.flush().expect("flush");
+    let image = sim.durable_image();
     drop(store);
 
-    let restored = SimIo::from_image(sim.durable_image());
+    let restored = SimIo::from_image(image);
     let reopened = ReelStore::open_with_io(PathBuf::from(ROOT), paged, COLUMNS, Arc::new(restored))
         .expect("reopen");
     assert!(
@@ -862,7 +864,7 @@ fn a_failed_seal_is_retried_on_the_tick() {
 
     // Every sync the seal takes fails, so the footer cannot be answered for.
     let sealing = store.reel.tails()[0].tail().active_segment();
-    sim.arm_next_ops(8, FaultKind::SyncError);
+    sim.arm_next_ops(16, FaultKind::SyncError);
     store.reel.tails()[0]
         .seal()
         .expect_err("a seal whose syncs fail reported sealed");
@@ -4498,6 +4500,173 @@ fn an_older_version_reads_its_row_through_the_key_blocks() {
         "the older version's row: {head:?}"
     );
     assert!(shared.footers.get(segment).is_none(), "the whole footer was read");
+}
+
+// a close compacts until no sealed segment is past the dead ratio
+#[test]
+fn a_close_leaves_no_segment_past_the_dead_ratio() {
+    let (store, _backend, _dir) = posix_store(config(1, SyncPolicy::Never));
+    for round in 0..12u8 {
+        for byte in 0..40u8 {
+            store.put(&record(7, byte), &[round; 200]).expect("put");
+        }
+        store.reel.tails()[0].seal().expect("seal");
+    }
+    let ratio = store.config.compact_dead_ratio;
+    let past = |store: &ReelStore| {
+        store.settle_sealed().expect("settle");
+        store
+            .compactor
+            .select_target(&store.reel, &store.index, ratio, store.cues.floor())
+            .is_some()
+    };
+    assert!(past(&store), "the walk left no segment past the ratio");
+    store.close().expect("close");
+    assert!(!past(&store), "the close left a segment past the ratio");
+    for byte in 0..40u8 {
+        assert_eq!(
+            store.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![11; 200]))
+        );
+    }
+}
+
+// a covered segment whose seal cut and mark never landed is never resumed, so the seal its next life writes counts
+#[test]
+fn a_covered_segment_resumed_and_sealed_again_keeps_its_new_records() {
+    let config = || ReelConfig {
+        segment_bytes: ByteCount::from_bytes(16 * 1024),
+        sync: SyncPolicy::Never,
+        active_tails: ThreadBudget::threads(1),
+        ..ReelConfig::default()
+    };
+    let (store, sim) = sim_store(config());
+    let mut last = SegmentId(0);
+    let mut unsealed = Vec::new();
+    for round in 1..=10u8 {
+        for byte in 0..4u8 {
+            store.put(&record(7, byte), &[round; 300]).expect("put");
+        }
+        store.flush().expect("flush");
+        let path = Path::new(ROOT).join(segment_file_name(store.reel.tails()[0].tail().active_segment()));
+        unsealed = sim.durable_bytes(&path).expect("open segment durable");
+        last = store.reel.tails()[0].seal().expect("seal");
+    }
+    store.page_out_sealed().expect("page out");
+    let merged = store.merge_when_due().expect("merge");
+    assert!(merged.is_some(), "ten stacked segments merge into a key run");
+    assert!(store.index().key_runs().covers(last), "the run covers the last seal");
+    store.close().expect("close");
+    drop(store);
+
+    // The seal's sync after its truncate lied: the footer is down and the rows are still there
+    let path = Path::new(ROOT).join(segment_file_name(last));
+    let mut image = sim.durable_image();
+    for (at, bytes) in image.iter_mut() {
+        if *at != path {
+            continue;
+        }
+        let (rows_at, _) = crate::format::journal::rows_region(&unsealed).expect("rows");
+        bytes.resize(rows_at as usize, 0);
+        bytes.extend_from_slice(&unsealed[rows_at as usize..]);
+    }
+
+    let second_sim = SimIo::from_image(image);
+    let second = ReelStore::open_with_io(PathBuf::from(ROOT), config(), COLUMNS, Arc::new(second_sim.clone()))
+        .expect("second open");
+    for byte in 0..4u8 {
+        assert_eq!(second.get(&record(7, byte)).expect("get"), Some(Value::new(vec![10; 300])));
+    }
+    for byte in 0..4u8 {
+        second.put(&record(7, byte), &[11; 300]).expect("second life put");
+    }
+    second.reel.tails()[0].seal().expect("second seal");
+    second.flush().expect("flush");
+    for byte in 0..4u8 {
+        assert_eq!(second.get(&record(7, byte)).expect("get"), Some(Value::new(vec![11; 300])));
+    }
+    second.close().expect("close");
+    drop(second);
+
+    let third = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        config(),
+        COLUMNS,
+        Arc::new(SimIo::from_image(second_sim.durable_image())),
+    )
+    .expect("third open");
+    for byte in 0..4u8 {
+        assert_eq!(
+            third.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![11; 300])),
+            "key {byte} after the third open"
+        );
+    }
+}
+
+// a seal whose cut never landed leaves its mark after the rows, and the next open reads the footer through it and cuts
+#[test]
+fn a_lost_seal_cut_is_found_by_its_mark_and_made_at_open() {
+    let config = || ReelConfig {
+        segment_bytes: ByteCount::from_bytes(16 * 1024),
+        sync: SyncPolicy::Never,
+        active_tails: ThreadBudget::threads(1),
+        ..ReelConfig::default()
+    };
+    let (store, sim) = sim_store(config());
+    for byte in 0..4u8 {
+        store.put(&record(7, byte), &[1; 300]).expect("put");
+    }
+    store.flush().expect("flush");
+    let segment = store.reel.tails()[0].tail().active_segment();
+    let path = std::path::Path::new(ROOT).join(segment_file_name(segment));
+    let unsealed = sim.durable_bytes(&path).expect("open segment");
+    store.reel.tails()[0].seal().expect("seal");
+    let sealed = sim.durable_bytes(&path).expect("sealed segment");
+    store.close().expect("close");
+    drop(store);
+
+    // The cut never landed: the footer, then zeros up to the rows, the rows, and the mark in the block after them
+    let (rows_at, rows) = crate::format::journal::rows_region(&unsealed).expect("rows");
+    let footer_len = crate::format::record::read_u32_le(&sealed[sealed.len() - 8..sealed.len() - 4]);
+    let mut lost = sealed.clone();
+    lost.resize(rows_at as usize, 0);
+    lost.extend_from_slice(rows);
+    lost.resize(lost.len().next_multiple_of(crate::format::record::BLOCK as usize), 0);
+    let mark = crate::format::footer::seal_mark(sealed.len() as u64, footer_len);
+    lost.resize(lost.len() + crate::format::record::BLOCK as usize - mark.len(), 0);
+    lost.extend_from_slice(&mark);
+    let mut image = sim.durable_image();
+    for (at, bytes) in image.iter_mut() {
+        if *at == path {
+            *bytes = lost.clone();
+        }
+    }
+
+    let second_sim = SimIo::from_image(image);
+    let second = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        config(),
+        COLUMNS,
+        Arc::new(second_sim.clone()),
+    )
+    .expect("second open");
+    assert_eq!(
+        second_sim.durable_bytes(&path).expect("segment").len(),
+        sealed.len(),
+        "the open did not make the lost cut"
+    );
+    assert_ne!(
+        second.reel.tails()[0].tail().active_segment(),
+        segment,
+        "the sealed segment was resumed as a tail"
+    );
+    for byte in 0..4u8 {
+        assert_eq!(
+            second.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![1; 300]))
+        );
+    }
 }
 
 // a durable put survives a crash on a volume that never syncs, at the cost of one sync

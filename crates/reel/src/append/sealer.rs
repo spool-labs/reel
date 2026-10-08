@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 
 use crate::config::RepairPath;
 use crate::error::{ReelError, Result};
-use crate::format::footer::SegmentFooter;
+use crate::format::footer::{seal_mark, SegmentFooter};
 use crate::format::loc::SegmentId;
 use crate::io::op::{Advice, Part, WriteBuf};
 use crate::reel::ReelShared;
@@ -65,8 +65,11 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
                 .collect(),
         );
         wrote?;
+        active
+            .journal
+            .mark_sealed(&seal_mark(sealed_end, footer_len as u32))?;
         shared.driver.sync_full(active.handle.file())?;
-        // Cut the rows off so the footer ends the file. A crash before this lands just seals again from the rows.
+        // Cut the rows off so the footer ends the file. A crash before this lands just seals again from the rows, and a cut that is lost leaves the mark for the next open.
         shared.driver.truncate(active.handle.file(), sealed_end)?;
         shared.driver.sync_full(active.handle.file())
     })();

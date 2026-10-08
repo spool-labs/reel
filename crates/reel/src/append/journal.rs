@@ -190,6 +190,23 @@ impl Journal {
         Ok(())
     }
 
+    /// Write what is pending, then a seal's mark in the block after the last row
+    ///
+    /// An open finds the mark at the file's end only when the seal's cut never landed, and
+    /// reads the footer through it.
+    pub(super) fn mark_sealed(&self, mark: &[u8]) -> Result<()> {
+        let Some(file) = self.file else {
+            return Ok(());
+        };
+        let mut written = lock(&self.written);
+        self.write_locked(&mut written)?;
+        let at = (self.rows_at + *written).next_multiple_of(BLOCK);
+        let mut block = vec![0u8; BLOCK as usize];
+        block[BLOCK as usize - mark.len()..].copy_from_slice(mark);
+        self.driver
+            .writev_all(file, at, vec![WriteBuf::owned(block)])
+    }
+
     /// Give back the zeros laid ahead of the written rows, at a close that writes nothing more
     pub(super) fn release_ahead(&self) -> Result<()> {
         let Some(file) = self.file else {

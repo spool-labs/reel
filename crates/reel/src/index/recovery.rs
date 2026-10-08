@@ -10,7 +10,8 @@ use crate::config::ThreadBudget;
 use crate::error::Result;
 use crate::format::column::{ColumnId, KeyBytes, RecordKey};
 use crate::format::footer::{
-    FooterEntry, FooterPartition, FooterTally, SegmentFooter, FIXED_TAIL_LEN,
+    read_seal_mark, FooterEntry, FooterPartition, FooterTally, SegmentFooter, FIXED_TAIL_LEN,
+    SEAL_MARK_LEN,
 };
 use crate::format::journal::{read_groups, JournalRow};
 use crate::format::loc::{Loc, SegmentId};
@@ -74,6 +75,9 @@ pub struct RebuiltReel {
     /// Unsealed tails and their file lengths, so a writable open gives back what a crash left reserved
     pub walked: Vec<(PathBuf, u64)>,
 
+    /// Sealed segments whose cut after the footer never landed, each with the length a writable open cuts it to
+    pub cuts: Vec<(PathBuf, u64)>,
+
     /// The same tails as appenders can pick them up, lowest number first
     pub resumable: Vec<ResumableTail>,
 
@@ -130,6 +134,7 @@ pub fn rebuild_reel(
     let mut quarantined = Vec::new();
     let mut consumed = HashMap::new();
     let mut walked = Vec::new();
+    let mut cuts = Vec::new();
     let mut resumable: Vec<ResumableTail> = Vec::new();
     let mut sealed_files = Vec::new();
     let mut placements = Vec::new();
@@ -155,9 +160,12 @@ pub fn rebuild_reel(
         let read = read_segments(driver, &jobs, |at, parts| {
             let (segment, path, len) = &jobs[at];
             match absorb_segment(*segment, parts, &mut resolver, &mut held)? {
-                Loaded::Sealed(footer) => {
+                Loaded::Sealed(footer, cut) => {
                     consumed.insert(*segment, SEALED);
-                    sealed_files.push((*segment, path.clone(), *len));
+                    if let Some(end) = cut {
+                        cuts.push((path.clone(), end));
+                    }
+                    sealed_files.push((*segment, path.clone(), cut.unwrap_or(*len)));
                     if !is_sized {
                         index.reserve_fast(&footer, jobs.len());
                         is_sized = true;
@@ -168,8 +176,10 @@ pub fn rebuild_reel(
                 Loaded::Journaled(end) => {
                     consumed.insert(*segment, end.journal_len);
                     walked.push((path.clone(), *len));
-                    // A file that ends before its rows was sealed once, so no tail may write into it again
-                    if let Some(rows_at) = end.rows_at {
+                    // A file that ends before its rows was sealed once, and a run covers only sealed
+                    // segments, so neither takes a tail's writes again
+                    let is_covered = index.key_runs().covers(*segment);
+                    if let Some(rows_at) = end.rows_at.filter(|_| !is_covered) {
                         resumable.push(ResumableTail {
                             segment: *segment,
                             path: path.clone(),
@@ -210,6 +220,7 @@ pub fn rebuild_reel(
         quarantined,
         consumed,
         walked,
+        cuts,
         resumable,
         undeclared,
     })
@@ -279,8 +290,8 @@ fn load_footers(
 
 /// What reading one segment during a rebuild turned out to be
 enum Loaded {
-    /// A sealed segment, read from its footer, which the open still has to load
-    Sealed(SegmentFooter),
+    /// A sealed segment, read from its footer, which the open still has to load, and its cut when one is owed
+    Sealed(SegmentFooter, Option<u64>),
 
     /// An unsealed tail read through its journal
     Journaled(JournaledEnd),
@@ -316,8 +327,9 @@ struct JournaledEnd {
 /// Everything the join needs is in here, so absorbing a segment touches no
 /// descriptor and the reads can run wherever there is a thread for them.
 enum SegmentParts {
-    /// A sealed segment's footer, and the range ends its rows do not carry
-    Sealed(SegmentFooter, Vec<Option<KeyBytes>>),
+    /// A sealed segment's footer, the range ends its rows do not carry, and where its file
+    /// ends when a seal's cut never landed
+    Sealed(SegmentFooter, Vec<Option<KeyBytes>>, Option<u64>),
 
     /// An unsealed tail read through its journal
     Journaled(JournaledTail),
@@ -474,15 +486,47 @@ fn read_parts(
         return Ok(SegmentParts::Foreign);
     }
 
-    match read_footer(driver, file, file_len)? {
-        Some(footer) => {
-            let ends = read_range_ends(driver, file, &footer)?;
-            Ok(SegmentParts::Sealed(footer, ends))
-        }
-        None => Ok(SegmentParts::Journaled(read_journaled(
-            driver, file, file_len,
-        )?)),
+    if let Some(footer) = read_footer(driver, file, file_len)? {
+        let ends = read_range_ends(driver, file, &footer)?;
+        return Ok(SegmentParts::Sealed(footer, ends, None));
     }
+    if let Some((footer, end)) = read_marked_footer(driver, file, file_len)? {
+        let ends = read_range_ends(driver, file, &footer)?;
+        return Ok(SegmentParts::Sealed(footer, ends, Some(end)));
+    }
+    Ok(SegmentParts::Journaled(read_journaled(
+        driver, file, file_len,
+    )?))
+}
+
+/// The footer a seal's mark points at, for a segment whose cut after the footer never landed
+fn read_marked_footer(
+    driver: &IoDriver,
+    file: FileId,
+    file_len: u64,
+) -> Result<Option<(SegmentFooter, u64)>> {
+    let probe = file_len.min(TRAILER_PROBE_LEN);
+    let tail = driver.pread(file, file_len - probe, probe)?;
+    let Some(last) = tail.iter().rposition(|byte| *byte != 0) else {
+        return Ok(None);
+    };
+    let Some(start) = (last + 1).checked_sub(SEAL_MARK_LEN) else {
+        return Ok(None);
+    };
+    let Some((end, len)) = read_seal_mark(&tail[start..=last]) else {
+        return Ok(None);
+    };
+    let len = u64::from(len);
+    if len > end || end > file_len {
+        return Ok(None);
+    }
+    let bytes = driver.pread(file, end - len, len)?;
+    if (bytes.len() as u64) < len {
+        return Ok(None);
+    }
+    Ok(SegmentFooter::parse_owned(bytes)
+        .ok()
+        .map(|footer| (footer, end)))
 }
 
 /// Fold one segment's parts into the index, holding a tail's rows for the feed
@@ -495,9 +539,9 @@ fn absorb_segment(
     // A cover settles by sequence number whichever rows it meets first, so ranges stand at once
     match parts {
         SegmentParts::Foreign => Ok(Loaded::Foreign),
-        SegmentParts::Sealed(footer, ends) => {
+        SegmentParts::Sealed(footer, ends, cut) => {
             sweep_footer(segment, &footer, &mut ends.into_iter(), resolver)?;
-            Ok(Loaded::Sealed(footer))
+            Ok(Loaded::Sealed(footer, cut))
         }
         SegmentParts::Journaled(tail) => {
             stand_ranges(segment, &tail.footer, tail.ends, resolver)?;

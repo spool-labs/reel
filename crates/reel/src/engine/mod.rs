@@ -390,6 +390,18 @@ impl ReelStore {
                 }
             }
         }
+        // A seal whose cut was lost left its rows after the footer, and every reader looks
+        // for the footer at the file's end, so the cut is made before anything reads it.
+        if !is_read_only {
+            for (path, end) in &rebuilt.cuts {
+                let file = driver.open(path, false)?;
+                let cut = driver
+                    .truncate(file, *end)
+                    .and_then(|()| driver.sync_full(file));
+                driver.close(file)?;
+                cut?;
+            }
+        }
         // A reader starts its cursor where the rebuild left the volume, so its
         // first catch-up reads only what has been written since the open.
         let mut cursor = LogCursor::new();
@@ -534,7 +546,7 @@ impl ReelStore {
         self.reel.flush_wait().await
     }
 
-    /// Flush and stop every active tail, leaving each where the next open resumes it
+    /// Compact away every sealed segment past the dead ratio, then flush and stop every active tail
     ///
     /// Nothing seals on a close: a tail's segment persists across processes and only
     /// takes a footer when it fills. The open that follows appends where this one stopped.
@@ -542,6 +554,7 @@ impl ReelStore {
         if self.is_read_only {
             return Ok(());
         }
+        self.drain()?;
         self.reel.close()
     }
 

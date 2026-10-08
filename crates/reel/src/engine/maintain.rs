@@ -31,6 +31,9 @@ const MERGE_DEPTH: usize = 8;
 /// The hand-over runs this often while compaction passes hold the tick
 const HANDOVER_TICK: Duration = Duration::from_secs(1);
 
+/// A close waits this long between looks for a free place on the compaction plane
+const DRAIN_WAIT: Duration = Duration::from_millis(1);
+
 /// A tail that takes no write for this long is sealed by the tick
 const IDLE_SEAL: Duration = Duration::from_secs(5);
 
@@ -565,6 +568,52 @@ impl ReelStore {
     /// the segment with the highest dead fraction past the effective threshold,
     /// rewrites its live records, and retires it. A named rate is held inside the
     /// pass, so a paced volume returns when the bytes it moved have been paid for.
+    /// Compact until no sealed segment is past the dead ratio, so a close leaves no debt behind
+    ///
+    /// The rate gate and the pressure model are for a store with foreground work; at a close
+    /// there is none, so every segment past the configured ratio goes.
+    pub fn drain(&self) -> Result<()> {
+        if self.is_read_only {
+            return Ok(());
+        }
+        loop {
+            self.settle_sealed()?;
+            // A tick's pass may hold every place on the plane, so wait for one
+            let _pass = loop {
+                match self.compaction_plane.enter() {
+                    Some(seat) => break seat,
+                    None => std::thread::sleep(DRAIN_WAIT),
+                }
+            };
+            let cue_floor = self.cues.floor();
+            while let Some((segment, _)) =
+                self.compactor
+                    .select_whole_dead(&self.reel, &self.index, cue_floor)
+            {
+                if !self
+                    .compactor
+                    .compact_segment(&self.reel, &self.index, segment)?
+                {
+                    break;
+                }
+            }
+            let ratio = self.config.compact_dead_ratio;
+            let Some((segment, _)) =
+                self.compactor
+                    .select_target(&self.reel, &self.index, ratio, cue_floor)
+            else {
+                return Ok(());
+            };
+            // A target left standing would be picked again forever
+            if !self
+                .compactor
+                .compact_segment(&self.reel, &self.index, segment)?
+            {
+                return Ok(());
+            }
+        }
+    }
+
     pub fn compact_once(&self) -> Result<CompactPass> {
         if self.is_read_only {
             return Ok(CompactPass::Held);

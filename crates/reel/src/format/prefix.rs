@@ -3,7 +3,9 @@
 use std::cmp::Ordering;
 
 use crate::error::{ReelError, Result};
-use crate::format::footer::ENTRY_TAIL_LEN;
+use crate::format::footer::{FooterRow, ENTRY_TAIL_LEN};
+use crate::format::lsn::Lsn;
+use crate::format::record::Flags;
 
 /// Rows between restart points
 ///
@@ -677,10 +679,10 @@ mod cursor_tests {
             .chain((0..300).rev())
             .collect();
         for at in order {
-            let (key, tail) = cursor.read(bytes, restart, at).expect("read");
+            let (key, found) = cursor.read(bytes, restart, at).expect("read");
             let (want_key, want_tail) = whole(at);
             assert_eq!(key, want_key, "row {at} key");
-            assert_eq!(tail, want_tail, "row {at} tail");
+            assert_eq!(found, FooterRow::read(want_tail, 0).expect("tail"), "row {at} row");
             assert_eq!(key, keys[at].as_slice(), "row {at} against its key");
         }
     }
@@ -696,14 +698,22 @@ mod cursor_tests {
 
 /// Reads a packed footer partition's rows in place, from the nearest restart, keeping its place for the next row
 pub struct PackedCursor {
-    /// The row `key` and `tail` hold, or none
+    /// The row `key` and `found` hold, or none
     row: Option<usize>,
 
     /// Where the row after it starts
     next: usize,
     key: Vec<u8>,
-    tail: Whole,
+    found: FooterRow,
 }
+
+/// What a restart row's numbers read against: nothing
+const NO_ROW: FooterRow = FooterRow {
+    lsn: Lsn(0),
+    offset: 0,
+    len: 0,
+    flags: Flags::DATA,
+};
 
 impl Default for PackedCursor {
     fn default() -> PackedCursor {
@@ -711,54 +721,83 @@ impl Default for PackedCursor {
             row: None,
             next: 0,
             key: Vec::new(),
-            tail: [0; TAIL_CAP],
+            found: NO_ROW,
         }
     }
 }
 
 impl PackedCursor {
-    /// The key and entry tail of one row, decoding on from the cursor's row or from the row's restart
+    /// The key and row at a place in the partition, decoding on from the cursor's row or from the row's restart
     pub fn read(
         &mut self,
         bytes: &[u8],
         restart: impl Fn(usize) -> Option<u32>,
         row: usize,
-    ) -> Result<(&[u8], &[u8])> {
+    ) -> Result<(&[u8], FooterRow)> {
         let block = row / RESTART_INTERVAL;
         let resumes = self
             .row
             .is_some_and(|held| held <= row && held / RESTART_INTERVAL == block);
         if !resumes {
-            let at = restart(block).ok_or_else(|| {
-                ReelError::Corruption(format!("a packed footer has no restart for row {row}"))
-            })?;
-            let first = read_row(bytes, at as usize, Tail::Entry, &[0; TAIL_CAP])?;
-            if first.shared != 0 {
-                return Err(ReelError::Corruption(
-                    "a restart row does not carry its whole key".to_string(),
-                ));
-            }
+            let Some(at) = restart(block) else {
+                return Err(no_restart(row));
+            };
+            // A restart row holds its whole key and its numbers against nothing
             self.key.clear();
-            self.key.extend_from_slice(first.suffix);
-            self.tail = first.tail;
-            self.next = first.next;
+            self.found = NO_ROW;
+            self.next = at as usize;
+            self.step(bytes)?;
             self.row = Some(block * RESTART_INTERVAL);
         }
         while let Some(held) = self.row.filter(|held| *held < row) {
-            let next = read_row(bytes, self.next, Tail::Entry, &self.tail)?;
-            if next.shared > self.key.len() {
-                return Err(ReelError::Corruption(
-                    "a footer row shares more than the key before it holds".to_string(),
-                ));
-            }
-            self.key.truncate(next.shared);
-            self.key.extend_from_slice(next.suffix);
-            self.tail = next.tail;
-            self.next = next.next;
+            self.step(bytes)?;
             self.row = Some(held + 1);
         }
-        Ok((&self.key, &self.tail[..ENTRY_TAIL_LEN]))
+        Ok((&self.key, self.found))
     }
+
+    /// Decode the row at `next` against the row the cursor holds
+    #[inline]
+    fn step(&mut self, bytes: &[u8]) -> Result<()> {
+        let at = &mut self.next;
+        let shared = get_varint(bytes, at)? as usize;
+        let suffix_len = get_varint(bytes, at)? as usize;
+        let (Some(suffix), true) = (bytes.get(*at..*at + suffix_len), shared <= self.key.len()) else {
+            return Err(bad_row());
+        };
+        *at += suffix_len;
+        self.key.truncate(shared);
+        self.key.extend_from_slice(suffix);
+        let Some(&flags) = bytes.get(*at) else {
+            return Err(bad_row());
+        };
+        *at += 1;
+        let len = u32::try_from(get_varint(bytes, at)?).map_err(|_| bad_row())?;
+        let offset = i64::from(self.found.offset) + unzigzag(get_varint(bytes, at)?);
+        let offset = u32::try_from(offset).map_err(|_| bad_row())?;
+        let lsn = self
+            .found
+            .lsn
+            .as_u64()
+            .wrapping_add(unzigzag(get_varint(bytes, at)?) as u64);
+        self.found = FooterRow {
+            lsn: Lsn(lsn),
+            offset,
+            len,
+            flags: Flags::from_bits(flags)?,
+        };
+        Ok(())
+    }
+}
+
+#[cold]
+fn no_restart(row: usize) -> ReelError {
+    ReelError::Corruption(format!("a packed footer has no restart for row {row}"))
+}
+
+#[cold]
+fn bad_row() -> ReelError {
+    ReelError::Corruption("a packed footer row does not decode".to_string())
 }
 
 /// Bytes the encoded form spends on its own shape past the rows

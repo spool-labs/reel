@@ -149,8 +149,7 @@ impl MappedRows {
                     .then(|| map.slice(*at, *rows_end as usize))
                     .flatten()
                     .ok_or_else(missing)?;
-                let (key, tail) = cursor.read(bytes, |block| restarts.get(block).copied(), row)?;
-                Ok((key, FooterRow::read(tail, 0)?))
+                cursor.read(bytes, |block| restarts.get(block).copied(), row)
             }
         }
     }

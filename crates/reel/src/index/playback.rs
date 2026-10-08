@@ -193,8 +193,8 @@ fn lead_window(leads: &[u64], key: &[u8], count: usize) -> (usize, usize) {
     )
 }
 
-/// A key run cursor's place, and the key and row it stands on when it stands on one
-type KeyRunPlace = (Head, Option<(Vec<u8>, RunRow)>);
+/// A key run cursor's place, and the row it stands on when it stands on one, its key copied into the caller's buffer
+type KeyRunPlace = (Head, Option<RunRow>);
 
 /// Where a cursor opened at a bound first stands in a key run's column, and the key and row it stands on
 fn key_run_head(
@@ -203,6 +203,7 @@ fn key_run_head(
     way: Way,
     from: Bound<&[u8]>,
     rows: &mut FooterRows,
+    key: &mut Vec<u8>,
 ) -> Result<KeyRunPlace> {
     let count = column.rows();
     let Some((low, high)) = column.key_range() else {
@@ -221,7 +222,7 @@ fn key_run_head(
         (Way::Down, Bound::Excluded(key)) => run.seek(column, key, false, rows)?.checked_sub(1),
     };
     match row {
-        Some(row) => key_run_settle(run, column, way, row, rows),
+        Some(row) => key_run_settle(run, column, way, row, rows, key),
         None => Ok((Head::SPENT, None)),
     }
 }
@@ -233,10 +234,13 @@ fn key_run_settle(
     way: Way,
     mut row: u64,
     rows: &mut FooterRows,
+    key: &mut Vec<u8>,
 ) -> Result<KeyRunPlace> {
     while row < column.rows() {
-        if let Some((key, found)) = rows.read(run.pointer(column, row))? {
-            return Ok((Head::on(key, row as usize), Some((key.to_vec(), found))));
+        if let Some((found_key, found)) = rows.read(run.pointer(column, row))? {
+            key.clear();
+            key.extend_from_slice(found_key);
+            return Ok((Head::on(key, row as usize), Some(found)));
         }
         row = match way {
             Way::Up => row + 1,
@@ -538,9 +542,9 @@ impl Sealed {
                 let Some(keyed) = self.keyed[at].as_mut() else {
                     return Ok(());
                 };
-                let (head, standing) = key_run_settle(run, column, way, row as u64, &mut keyed.rows)?;
-                if let Some((key, row)) = standing {
-                    keyed.key = key;
+                let (head, standing) =
+                    key_run_settle(run, column, way, row as u64, &mut keyed.rows, &mut keyed.key)?;
+                if let Some(row) = standing {
                     keyed.row = row;
                 }
                 head
@@ -1090,8 +1094,9 @@ impl Paged<'_> {
                         self.column,
                         Arc::clone(views),
                     );
-                    let (head, standing) = key_run_head(run, column, way, from, &mut rows)?;
-                    let keyed = standing.map(|(key, row)| Keyed { rows, key, row });
+                    let mut key = Vec::new();
+                    let (head, standing) = key_run_head(run, column, way, from, &mut rows, &mut key)?;
+                    let keyed = standing.map(|row| Keyed { rows, key, row });
                     (head, keyed)
                 }
             };

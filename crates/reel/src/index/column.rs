@@ -754,6 +754,9 @@ pub struct WidthIndex<K: IndexKey, S: Shape<K>> {
     /// Shards holding at least one key, so a walk skips the empty ones
     occupied: RwLock<TBTreeMap<u64, NODE_WIDTH, ()>>,
 
+    /// A bit for each shard whose map holds an entry, so a page skips empty maps without a lock
+    filled: Box<[AtomicU64]>,
+
     /// Width the column declared, for accounting only; a variable column has none
     declared_width: u16,
 
@@ -775,6 +778,9 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             has_covers: AtomicBool::new(false),
             lifted: AtomicU64::new(0),
             occupied: RwLock::new(TBTreeMap::new()),
+            filled: (0..spec.shard_count().div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
             declared_width: spec.key_width.fixed().unwrap_or(0),
             shard_bytes: spec.shard_bytes,
         }
@@ -983,6 +989,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
 
         segments.mark_live(loc.segment, lsn, span_of(width, loc.len));
         self.note_filled(at, was_empty);
+        self.note_held(at, state.map.vacant());
         landed
     }
 
@@ -1049,6 +1056,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         state.map.put(key, Entry::grave_from(lsn, segment));
         state.note_grave(lsn);
         self.note_filled(at, was_empty);
+        self.note_held(at, state.map.vacant());
     }
 
     /// Take out a key's grave while it still holds this tombstone's number, for a tombstone compaction dropped
@@ -1117,6 +1125,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             .put(key.clone(), Entry::grave_from(lsn, tombstone.segment));
         state.note_grave(lsn);
         self.note_filled(at, was_empty);
+        self.note_held(at, state.map.vacant());
         landed
     }
 
@@ -1231,6 +1240,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         state.map.put(key, Entry::grave(lsn));
         state.note_grave(lsn);
         self.note_filled(at, was_empty);
+        self.note_held(at, state.map.vacant());
         true
     }
 
@@ -1261,6 +1271,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             false => state.bytes += u64::from(to.len),
         }
         self.note_filled(at, was_empty);
+        self.note_held(at, state.map.vacant());
         true
     }
 
@@ -1938,6 +1949,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         for at in occupied {
             let mut state = write(&self.shards[at]);
             state.map.empty();
+            self.note_held(at, true);
             self.filters.clear(at);
             state.bytes = 0;
             state.graves = 0;
@@ -2047,7 +2059,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             Bound::Unbounded => 0,
             Bound::Included(key) | Bound::Excluded(key) => self.shard_of_bytes(key),
         };
-        for at in self.occupied_range(first, self.shards.len() - 1) {
+        for at in self.filled_range(first, self.shards.len() - 1) {
             // Between one shard and the next is where a page fill that holds no
             // publish barrier can be caught by a batch.
             crate::sync::rendezvous::at("index/page-shard");
@@ -2102,7 +2114,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             Bound::Unbounded => self.shards.len() - 1,
             Bound::Included(key) | Bound::Excluded(key) => self.shard_of_bytes(key),
         };
-        for at in self.occupied_back(last) {
+        for at in self.filled_back(last) {
             let bound = match at == last {
                 true => high_bound::<K>(end),
                 false => Bound::Unbounded,
@@ -2158,6 +2170,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     fn note_emptied(&self, at: usize, state: &mut ShardState<K, S>) {
         if state.map.vacant() {
             self.filters.clear(at);
+            self.note_held(at, true);
         }
         if state.map.vacant() && state.paged == 0 {
             // The room goes with the walk: nothing visits a shard outside the
@@ -2165,6 +2178,61 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             state.map.release();
             write(&self.occupied).remove(&(at as u64));
         }
+    }
+
+    /// Set or clear a shard's bit in `filled`, under the shard's write lock, writing only on a change
+    fn note_held(&self, at: usize, is_vacant: bool) {
+        let (word, bit) = (&self.filled[at / 64], 1u64 << (at % 64));
+        let is_set = word.load(Ordering::Relaxed) & bit != 0;
+        match (is_vacant, is_set) {
+            (false, false) => {
+                word.fetch_or(bit, Ordering::Release);
+            }
+            (true, true) => {
+                word.fetch_and(!bit, Ordering::Release);
+            }
+            (false, true) | (true, false) => {}
+        }
+    }
+
+    /// Shards within an inclusive range whose map holds an entry, in key order
+    fn filled_range(&self, first: usize, last: usize) -> impl Iterator<Item = usize> + '_ {
+        let mut at = first;
+        std::iter::from_fn(move || {
+            while at <= last {
+                let bits = self.filled.get(at / 64)?.load(Ordering::Acquire) >> (at % 64);
+                if bits == 0 {
+                    at = (at / 64 + 1) * 64;
+                    continue;
+                }
+                let found = at + bits.trailing_zeros() as usize;
+                if found > last {
+                    return None;
+                }
+                at = found + 1;
+                return Some(found);
+            }
+            None
+        })
+    }
+
+    /// Shards at or below a shard whose map holds an entry, in descending key order
+    fn filled_back(&self, last: usize) -> impl Iterator<Item = usize> + '_ {
+        let mut high = Some(last);
+        std::iter::from_fn(move || {
+            while let Some(at) = high {
+                let below = 63 - at % 64;
+                let bits = self.filled.get(at / 64)?.load(Ordering::Acquire) << below;
+                if bits == 0 {
+                    high = (at / 64).checked_sub(1).map(|word| word * 64 + 63);
+                    continue;
+                }
+                let found = at - bits.leading_zeros() as usize;
+                high = found.checked_sub(1);
+                return Some(found);
+            }
+            None
+        })
     }
 
     /// Occupied shards within an inclusive shard range, in key order, found as the walk reaches each
@@ -2176,20 +2244,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 .next()?
                 .0;
             low = at + 1;
-            Some(at as usize)
-        })
-    }
-
-    /// Occupied shards at or below a shard, in descending key order
-    fn occupied_back(&self, last: usize) -> impl Iterator<Item = usize> + '_ {
-        let mut high = Some(last as u64);
-        std::iter::from_fn(move || {
-            let from = high?;
-            let at = *read(&self.occupied)
-                .range_back(Bound::Unbounded, Bound::Included(&from))
-                .next()?
-                .0;
-            high = at.checked_sub(1);
             Some(at as usize)
         })
     }

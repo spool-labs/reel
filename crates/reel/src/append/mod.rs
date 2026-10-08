@@ -646,7 +646,7 @@ impl Appender {
     ///
     /// Nothing seals here on purpose: the tail stays where it is and the next
     /// open resumes it, so a restart costs no segment. Only a full segment ever
-    /// takes a footer. The cut gives the window ahead back, and the sync is what
+    /// takes a footer. The rows stay in the file for the next open, and the sync
     /// makes the stop clean.
     pub fn close(&self) -> Result<()> {
         self.doom_spare();

@@ -484,8 +484,9 @@ impl ReelIndex {
         // The spot index only points into sealed segments, and a retire forgets the span
         let mut live = 0;
         for (at, spot) in self.spot.iter().enumerate() {
-            let standing: HashSet<SegmentId> = self.sealed[at].segments().into_iter().collect();
-            live += spot.forget_retired(|segment| standing.contains(&segment));
+            // The list comes sorted, and a search costs less than hashing every slot under the shard's lock
+            let standing = self.sealed[at].segments();
+            live += spot.forget_retired(|segment| standing.binary_search(&segment).is_ok());
         }
         live
     }

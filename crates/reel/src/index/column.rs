@@ -495,7 +495,7 @@ impl ColumnIndex {
 const BATCH_RUN: usize = 4;
 
 /// A hand-over gives up this many keys per hold of a shard's lock, so a put behind it waits briefly
-const LOCK_CHUNK: usize = 512;
+const LOCK_CHUNK: usize = 64;
 
 /// The shard grouping one thread's batched lookups work through
 ///

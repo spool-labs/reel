@@ -29,7 +29,7 @@ const GROWTH: f64 = 1.5;
 const SHARDS: usize = 256;
 
 /// A batch takes a shard's lock for this many keys at a time, so a write behind it waits a short while
-const LOCK_CHUNK: usize = 512;
+const LOCK_CHUNK: usize = 64;
 
 /// The one slot among a key's candidates that no newer write displaced, when there is exactly one
 fn sole_live(ordered: &[(Option<Lsn>, Slot)]) -> Option<Slot> {
@@ -746,15 +746,11 @@ impl Table {
     /// Keep the slots a test passes and empty the rest, handing back how many went and how many of those were displaced
     fn retain(&mut self, keep: impl Fn(&Slot) -> bool) -> (usize, u64) {
         let before = self.held;
-        let displaced = self
-            .buckets
-            .iter()
-            .flat_map(|bucket| bucket.slots.iter())
-            .filter(|slot| !slot.is_empty() && !keep(slot) && slot.is_displaced())
-            .count() as u64;
+        let mut displaced = 0;
         for bucket in self.buckets.iter_mut() {
             for slot in bucket.slots.iter_mut() {
                 if !slot.is_empty() && !keep(slot) {
+                    displaced += u64::from(slot.is_displaced());
                     *slot = Slot::default();
                     self.held -= 1;
                 }

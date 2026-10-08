@@ -3523,6 +3523,38 @@ fn flip_on_disk(store: &ReelStore, dir: &TempDir, key: &RecordKey) {
     file.write_at(&byte, at).expect("write the payload byte");
 }
 
+// a volume that maps its reads serves a spot index hit from the mapping, with no read call
+#[test]
+fn a_mapped_volume_serves_spot_hits_from_the_mapping() {
+    let (store, backend, _dir) = posix_store(ReelConfig {
+        map_above: crate::config::MAP_EVERYTHING,
+        ..config(1, SyncPolicy::Never)
+    });
+    for byte in 0..200u8 {
+        store.put(&record(7, byte), &[byte; 100]).expect("put");
+    }
+    store.reel.tails()[0].seal().expect("seal");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+    assert!(
+        store.index.spot_held() > 0,
+        "the hand-over filled the spot index"
+    );
+    store.get(&record(7, 1)).expect("get").expect("found");
+
+    let ops = backend.ops();
+    let found = store.get(&record(7, 2)).expect("get").expect("found");
+    let waited = block_on(store.get_wait(&record(7, 3)))
+        .expect("awaited get")
+        .expect("found");
+    assert_eq!(&*found, &[2u8; 100][..]);
+    assert_eq!(&*waited, &[3u8; 100][..]);
+    assert_eq!(
+        backend.ops() - ops,
+        0,
+        "a mapped spot hit went to the driver"
+    );
+}
+
 // a tail mapped on an early read still serves the records written after it
 #[test]
 fn a_tail_read_early_keeps_serving_from_its_mapping() {

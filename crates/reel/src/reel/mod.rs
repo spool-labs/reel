@@ -126,14 +126,8 @@ impl RecordSource for ReelShared {
         };
         if let RecordLayout::Keyless(check) = handle.layout() {
             if alone && fits_keyless(bound) {
-                let answer = self.driver.pread_split_reusing(
-                    handle.file(),
-                    u64::from(offset),
-                    KEYLESS_PREFIX,
-                    bound as usize,
-                    take_header(),
-                    self.warm_first(),
-                );
+                let answer =
+                    self.split_read(&handle, u64::from(offset), KEYLESS_PREFIX, bound as usize);
                 if let Some(read) = lone_keyless(answer, key, &check)? {
                     return Ok(read);
                 }
@@ -141,14 +135,7 @@ impl RecordSource for ReelShared {
             return self.keyless_record(&handle, key, segment, offset);
         }
         let prefix = HEADER_LEN + key.as_slice().len();
-        let answer = self.driver.pread_split_reusing(
-            handle.file(),
-            u64::from(offset),
-            prefix,
-            bound as usize,
-            take_header(),
-            self.warm_first(),
-        );
+        let answer = self.split_read(&handle, u64::from(offset), prefix, bound as usize);
         match self.spot_verdict(answer, key, segment, offset)? {
             Verdict::Read(read) => Ok(read),
             Verdict::Whole(head) => {
@@ -196,6 +183,25 @@ fn lone_keyless(
             }
         },
     ))
+}
+
+/// A record's header and payload copied out of its segment's mapping, or nothing where the mapping does not cover it
+fn mapped_framed(
+    handle: &SegmentHandle,
+    span: u64,
+    offset: u64,
+    prefix: usize,
+    len: usize,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let map = handle.mapping(span)?;
+    let head_bytes = map.slice(offset, prefix)?;
+    let body_bytes = map.slice(offset + prefix as u64, len)?;
+    let mut head = take_header();
+    head.clear();
+    head.extend_from_slice(head_bytes);
+    let mut body = crate::reel::payload::take(len);
+    body.extend_from_slice(body_bytes);
+    Some((head, body))
 }
 
 /// Copy a window of a payload already in hand into a buffer of its own
@@ -397,15 +403,7 @@ impl ReelShared {
         if let RecordLayout::Keyless(check) = handle.layout() {
             if alone && fits_keyless(bound) {
                 let answer = self
-                    .driver
-                    .wait_split_reusing(
-                        handle.file(),
-                        u64::from(offset),
-                        KEYLESS_PREFIX,
-                        bound as usize,
-                        take_header(),
-                        self.warm_first(),
-                    )
+                    .split_read_wait(&handle, u64::from(offset), KEYLESS_PREFIX, bound as usize)
                     .await;
                 if let Some(read) = lone_keyless(answer, key, &check)? {
                     return Ok(read);
@@ -424,15 +422,7 @@ impl ReelShared {
         }
         let prefix = HEADER_LEN + key.as_slice().len();
         let answer = self
-            .driver
-            .wait_split_reusing(
-                handle.file(),
-                u64::from(offset),
-                prefix,
-                bound as usize,
-                take_header(),
-                self.warm_first(),
-            )
+            .split_read_wait(&handle, u64::from(offset), prefix, bound as usize)
             .await;
         match self.spot_verdict(answer, key, segment, offset)? {
             Verdict::Read(read) => Ok(read),
@@ -455,15 +445,7 @@ impl ReelShared {
         let prefix = layout.prefix_len(key.as_slice().len(), loc.len);
         let len = loc.len as usize;
         let read = self
-            .driver
-            .wait_split_reusing(
-                handle.file(),
-                u64::from(loc.offset),
-                prefix,
-                len,
-                take_header(),
-                self.warm_first(),
-            )
+            .split_read_wait(handle, u64::from(loc.offset), prefix, len)
             .await;
         Ok(match framed_or_nothing(read, prefix, len)? {
             Some((bytes, body)) => spot_read_of(
@@ -499,14 +481,8 @@ impl ReelShared {
         };
         if let RecordLayout::Keyless(check) = handle.layout() {
             if alone && fits_keyless(bound) {
-                let answer = self.driver.pread_split_reusing(
-                    handle.file(),
-                    u64::from(offset),
-                    KEYLESS_PREFIX,
-                    bound as usize,
-                    take_header(),
-                    self.warm_first(),
-                );
+                let answer =
+                    self.split_read(&handle, u64::from(offset), KEYLESS_PREFIX, bound as usize);
                 if let Some(read) = lone_keyless(answer, key, &check)? {
                     return Ok(range_of(read, at, len));
                 }
@@ -519,14 +495,7 @@ impl ReelShared {
         let base = u64::from(offset);
         if at <= MERGE_GAP {
             let span = at as usize + len;
-            let answer = self.driver.pread_split_reusing(
-                handle.file(),
-                base,
-                prefix,
-                span,
-                take_header(),
-                self.warm_first(),
-            );
+            let answer = self.split_read(&handle, base, prefix, span);
             return near_spot_range(answer, key, at, len);
         }
         let ops = vec![
@@ -555,15 +524,7 @@ impl ReelShared {
         if let RecordLayout::Keyless(check) = handle.layout() {
             if alone && fits_keyless(bound) {
                 let answer = self
-                    .driver
-                    .wait_split_reusing(
-                        handle.file(),
-                        u64::from(offset),
-                        KEYLESS_PREFIX,
-                        bound as usize,
-                        take_header(),
-                        self.warm_first(),
-                    )
+                    .split_read_wait(&handle, u64::from(offset), KEYLESS_PREFIX, bound as usize)
                     .await;
                 if let Some(read) = lone_keyless(answer, key, &check)? {
                     return Ok(range_of(read, at, len));
@@ -577,17 +538,7 @@ impl ReelShared {
         let base = u64::from(offset);
         if at <= MERGE_GAP {
             let span = at as usize + len;
-            let answer = self
-                .driver
-                .wait_split_reusing(
-                    handle.file(),
-                    base,
-                    prefix,
-                    span,
-                    take_header(),
-                    self.warm_first(),
-                )
-                .await;
+            let answer = self.split_read_wait(&handle, base, prefix, span).await;
             return near_spot_range(answer, key, at, len);
         }
         let ops = vec![
@@ -810,14 +761,7 @@ impl ReelShared {
         let layout = handle.layout();
         let prefix = layout.prefix_len(key.as_slice().len(), loc.len);
         let len = loc.len as usize;
-        let read = self.driver.pread_split_reusing(
-            handle.file(),
-            u64::from(loc.offset),
-            prefix,
-            len,
-            take_header(),
-            self.warm_first(),
-        );
+        let read = self.split_read(handle, u64::from(loc.offset), prefix, len);
         Ok(match framed_or_nothing(read, prefix, len)? {
             Some((bytes, body)) => spot_read_of(
                 frame_to_read(
@@ -1511,6 +1455,70 @@ impl ReelShared {
         Lsn(self.drawn.floor(|| self.lsn.peek().as_u64()))
     }
 
+    /// A record's head and the bytes after it, from the mapping where the volume maps reads this size
+    fn mapped_split(
+        &self,
+        handle: &SegmentHandle,
+        offset: u64,
+        prefix: usize,
+        len: usize,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        match self.config.maps(len) {
+            true => mapped_framed(
+                handle,
+                self.config.segment_bytes.to_bytes(),
+                offset,
+                prefix,
+                len,
+            ),
+            false => None,
+        }
+    }
+
+    /// The same read through the mapping where it covers it, else one pread
+    fn split_read(
+        &self,
+        handle: &SegmentHandle,
+        offset: u64,
+        prefix: usize,
+        len: usize,
+    ) -> SplitAnswer {
+        if let Some(framed) = self.mapped_split(handle, offset, prefix, len) {
+            return Ok(framed);
+        }
+        self.driver.pread_split_reusing(
+            handle.file(),
+            offset,
+            prefix,
+            len,
+            take_header(),
+            self.warm_first(),
+        )
+    }
+
+    /// The same read as a future
+    async fn split_read_wait(
+        &self,
+        handle: &SegmentHandle,
+        offset: u64,
+        prefix: usize,
+        len: usize,
+    ) -> SplitAnswer {
+        if let Some(framed) = self.mapped_split(handle, offset, prefix, len) {
+            return Ok(framed);
+        }
+        self.driver
+            .wait_split_reusing(
+                handle.file(),
+                offset,
+                prefix,
+                len,
+                take_header(),
+                self.warm_first(),
+            )
+            .await
+    }
+
     /// Whether a point read asks the page cache before it queues, which every volume read through the cache does
     ///
     /// A warm record comes back from one non-blocking read with no op, slot or wakeup
@@ -2018,7 +2026,13 @@ impl Reel {
         let prefix = layout.prefix_len(expected.width(), loc.len);
         let len = loc.len as usize;
         let mapped = match self.maps_tail(loc.segment) {
-            true => self.mapped_framed(&handle, u64::from(loc.offset), prefix, len),
+            true => mapped_framed(
+                &handle,
+                self.shared.config.segment_bytes.to_bytes(),
+                u64::from(loc.offset),
+                prefix,
+                len,
+            ),
             false => None,
         };
         let (head, body) = match mapped {
@@ -2210,7 +2224,13 @@ impl Reel {
         if let Some(check) = handle.layout().keyless_key(loc.len) {
             let whole = loc.len as usize;
             let mapped = match self.maps_tail(loc.segment) {
-                true => self.mapped_framed(&handle, offset, KEYLESS_PREFIX, whole),
+                true => mapped_framed(
+                    &handle,
+                    self.shared.config.segment_bytes.to_bytes(),
+                    offset,
+                    KEYLESS_PREFIX,
+                    whole,
+                ),
                 false => None,
             };
             let framed = match mapped {
@@ -2583,7 +2603,13 @@ impl Reel {
         // A mapped volume serves a record the mapping covers straight out of the
         // page cache; anything it does not cover takes the driver below.
         if self.maps(handle.id(), len) {
-            if let Some(framed) = self.mapped_framed(handle, offset, prefix, len) {
+            if let Some(framed) = mapped_framed(
+                handle,
+                self.shared.config.segment_bytes.to_bytes(),
+                offset,
+                prefix,
+                len,
+            ) {
                 return Ok(Some(framed));
             }
         }
@@ -2607,25 +2633,6 @@ impl Reel {
         let mut window = crate::reel::payload::take(len);
         window.extend_from_slice(bytes);
         Some(Value::pooled(window, crate::reel::payload::give))
-    }
-
-    /// A record's header and payload copied out of its segment's mapping, or nothing where the mapping does not cover it
-    fn mapped_framed(
-        &self,
-        handle: &SegmentHandle,
-        offset: u64,
-        prefix: usize,
-        len: usize,
-    ) -> Option<(Vec<u8>, Vec<u8>)> {
-        let map = handle.mapping(self.shared.config.segment_bytes.to_bytes())?;
-        let head_bytes = map.slice(offset, prefix)?;
-        let body_bytes = map.slice(offset + prefix as u64, len)?;
-        let mut head = take_header();
-        head.clear();
-        head.extend_from_slice(head_bytes);
-        let mut body = crate::reel::payload::take(len);
-        body.extend_from_slice(body_bytes);
-        Some((head, body))
     }
 
     /// The tail a foreground write goes to, which is the least loaded of them

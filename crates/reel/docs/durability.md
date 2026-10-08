@@ -303,10 +303,10 @@ one group is what makes the batch atomic across a crash. It goes away at the sea
   records whose bytes never landed. That surfaces as a read-time checksum
   failure and a repair enqueue, which is the designed answer there. A volume
   declaring `RepairPath::None` closes the window by ordering the seal.
-- That a grave or a cover outlasts a writer stalled past the 2^20 window. Every
-  tick prunes graves and covers at that window, so a write drawn before a delete
-  and published more than 2^20 sequence numbers later can come back until a
-  reopen. Compaction's tombstone floor is exact: a drawn gauge covers draw to claim
-  and the per-segment holds cover claim to publish, so a pass that finds both
-  empty drops tombstones up to the counter itself.
+- That a reader's graves outlast a writer stalled past the 2^20 window. A
+  read-only open following the log cannot see which writes are still out, so it
+  prunes a grave once 2^20 sequence numbers have passed it, and a write drawn
+  before a delete and published more than 2^20 numbers later can show on that
+  reader until it reopens. The writer counts every write from its draw to its
+  publish, and neither its prune nor compaction passes a write still out.
 - Any statement about power loss on macOS, for the reason above.

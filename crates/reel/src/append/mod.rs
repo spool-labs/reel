@@ -35,7 +35,7 @@ use crate::io::op::{FileId, Op, OwnedBuf, Part, SyncRangeMode, WriteBuf};
 use crate::io::ServingBackend;
 use crate::reel::segment::{IoDriver, SegmentHandle};
 use crate::reel::tail::Tail;
-use crate::reel::{DrawnRecords, ReelShared, SegmentHolds};
+use crate::reel::{DrawTicket, DrawnRecords, ReelShared, SegmentHolds, MOST_COUNTED};
 use crate::sync::{lock, read, try_lock, write};
 
 use flush::{turn_at, Owed, SyncState, Turn};
@@ -74,7 +74,8 @@ const NO_CUT: u64 = u64::MAX;
 /// Where a committed record landed and the sequence number that orders it
 ///
 /// Holding it stands in for the index entry until that entry exists, since compaction
-/// reads the index to decide what a segment still holds.
+/// reads the index to decide what a segment still holds. A fresh write holds every
+/// grave it could land under until it drops.
 pub struct Committed {
     /// Segment, offset, and length the record occupies
     pub loc: Loc,
@@ -91,10 +92,16 @@ struct SegmentHold {
     shared: Arc<ReelShared>,
     holds: Arc<SegmentHolds>,
     segment: SegmentId,
+
+    /// The drawn count a fresh write took, given back once it is published
+    drawn: Option<DrawTicket>,
 }
 
 impl Drop for SegmentHold {
     fn drop(&mut self) {
+        if let Some(ticket) = self.drawn {
+            self.shared.published(ticket);
+        }
         if self.holds.release_record() {
             self.shared.forget_if_free(self.segment);
         }
@@ -765,8 +772,7 @@ impl Appender {
         origin: Origin,
         commit: Commit,
     ) -> Result<(Committed, Option<Owed>)> {
-        // Gauged before the draw, so no instant holds a number neither the gauge nor a
-        // segment hold accounts for.
+        // Counted before the draw and out once published, so no prune passes this number on its way
         let mut drawn = (origin == Origin::Fresh).then(|| self.shared.draw_gauge(1));
         let lsn = origin.lsn(&self.shared.lsn);
         let (header, mut payload) = build_record(key, lsn, intent, origin);
@@ -793,14 +799,13 @@ impl Appender {
             if base + span + ALIGN <= room && base + span <= MAX_SEGMENT_OFFSET {
                 // The hold is taken with the tail still held shared, so the roll that
                 // seals this segment cannot come between the record landing and the
-                // maintenance plane being told to wait for it. The gauge is given back
-                // only after the hold is up, leaving the prune floor no gap to read.
+                // maintenance plane being told to wait for it. The drawn count goes with the hold.
                 active.holds.hold_record();
-                drawn.take();
                 let hold = SegmentHold {
                     shared: Arc::clone(&self.shared),
                     holds: Arc::clone(&active.holds),
                     segment: active.handle.id(),
+                    drawn: drawn.take().map(DrawnRecords::ticket),
                 };
                 let outcome =
                     self.write_record(&active, base, &header, std::mem::take(&mut payload));
@@ -854,9 +859,13 @@ impl Appender {
     /// and retaken on the next one.
     fn place_batch(&self, records: Vec<BatchRecord>) -> Result<Vec<Committed>> {
         let count = records.len();
-        // Gauged before the first draw, given back once every record of the run holds
-        // its segment.
-        let drawn = self.shared.draw_gauge(count as u64);
+        if count > MOST_COUNTED as usize {
+            return Err(ReelError::Rejected(format!(
+                "a batch of {count} records does not fit a reel segment"
+            )));
+        }
+        // Counted before the first draw and out once the whole batch is published
+        let drawn = self.shared.draw_gauge(count as u32);
         let mut headers = Vec::with_capacity(count);
         let mut payloads = Vec::with_capacity(count);
         let first = self.shared.lsn.issue_run(count as u64);
@@ -906,16 +915,21 @@ impl Appender {
             let room = active.room(target);
             if base + span + ALIGN <= room && base + span <= MAX_SEGMENT_OFFSET {
                 let mut committed = Vec::with_capacity(count);
-                for header in &headers {
+                // The batch's count goes with its last record, which a dropped batch lets go of last
+                let mut ticket = drawn.take().map(DrawnRecords::ticket);
+                for (at, header) in headers.iter().enumerate() {
                     active.holds.hold_record();
                     let hold = SegmentHold {
                         shared: Arc::clone(&self.shared),
                         holds: Arc::clone(&active.holds),
                         segment: active.handle.id(),
+                        drawn: match at + 1 == count {
+                            true => ticket.take(),
+                            false => None,
+                        },
                     };
                     committed.push((header.lsn, hold));
                 }
-                drawn.take();
                 let outcome = self.write_run(
                     &active,
                     base,

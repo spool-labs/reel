@@ -1843,6 +1843,155 @@ fn cue_outlives_a_pruned_delete() {
     assert!(store.get(&key).expect("read").is_none());
 }
 
+/// Park one write at its landed point, delete its key, and push the counter past the window
+fn park_past_the_window(point: &'static str, write: fn(&ReelStore, &RecordKey) -> Result<()>) {
+    let script = crate::sync::rendezvous::script();
+    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
+    let store = Arc::new(store);
+    let key = record(7, 1);
+    store.put(&key, &[1u8; 64]).expect("first version");
+
+    script.hold(point);
+    let parked = {
+        let (store, key) = (Arc::clone(&store), key.clone());
+        script.cast(move || write(&store, &key))
+    };
+    script.await_reached(point, 1);
+
+    // Drawn after the parked write and published ahead of it, so only the floor keeps the grave
+    store.delete(&key).expect("delete");
+    drop(store.cue().expect("seal"));
+    store.page_out_sealed().expect("hand over");
+    let past = store.reel.shared().lsn.peek().as_u64() + 4 * GRAVE_WINDOW;
+    store.reel.shared().lsn.recover_to(Lsn(past));
+    for _ in 0..3 {
+        store.prune_tombstones();
+    }
+    assert_eq!(
+        store.index.grave_count(),
+        1,
+        "the grave went while a write drawn before it was still out"
+    );
+
+    script.release(point);
+    parked.join().expect("parked thread").expect("parked write");
+    assert!(
+        store.get(&key).expect("read").is_none(),
+        "the parked write brought the deleted key back"
+    );
+    assert_eq!(
+        store.prune_tombstones(),
+        1,
+        "the grave stayed once nothing drawn before it was out"
+    );
+    assert!(store.get(&key).expect("read").is_none());
+}
+
+// a put drawn before a delete and parked past the window still loses to the delete
+#[test]
+fn a_put_parked_past_the_window_loses_to_the_delete() {
+    park_past_the_window("put/landed", |store, key| store.put(key, &[2u8; 64]));
+}
+
+// a batch drawn before a delete and parked past the window still loses to the delete
+#[test]
+fn a_batch_parked_past_the_window_loses_to_the_delete() {
+    park_past_the_window("batch/landed", |store, key| {
+        store.apply_batch(vec![RecordWrite::Put {
+            key: key.clone(),
+            payload: vec![2u8; 64],
+        }])
+    });
+}
+
+// a read during the hand-over of an older version never finds the key a delete took
+#[test]
+fn a_handover_never_shows_a_deleted_version() {
+    let script = crate::sync::rendezvous::script();
+    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
+    let store = Arc::new(store);
+    let key = record(7, 1);
+    store.put(&key, &[1u8; 64]).expect("put");
+    store.reel.tails()[0].seal().expect("seal the put");
+    store.delete(&key).expect("delete");
+    store.reel.tails()[0].seal().expect("seal the delete");
+    // Both segments noted and queued, neither handed over yet
+    store.hold_sealed().expect("note the seals");
+    let past = store.reel.shared().lsn.peek().as_u64() + 2 * GRAVE_WINDOW;
+    store.reel.shared().lsn.recover_to(Lsn(past));
+    store.prune_tombstones();
+
+    script.hold("paged/handover-spot");
+    let handing = {
+        let store = Arc::clone(&store);
+        script.cast(move || store.page_out_sealed())
+    };
+    script.await_reached("paged/handover-spot", 1);
+    let seen = store.get(&key).expect("read mid hand-over");
+    script.release("paged/handover-spot");
+    handing
+        .join()
+        .expect("hand-over thread")
+        .expect("hand over");
+
+    assert!(
+        seen.is_none(),
+        "a read during the hand-over found the deleted version"
+    );
+    assert!(store.get(&key).expect("read").is_none());
+    store.prune_tombstones();
+    assert_eq!(store.index.grave_count(), 0, "the grave never went");
+}
+
+// a delete that lands mid hand-over keeps its grave until the hand-over is done with the key
+#[test]
+fn a_prune_waits_out_a_handover() {
+    let script = crate::sync::rendezvous::script();
+    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
+    let store = Arc::new(store);
+    let key = record(7, 1);
+    store.put(&key, &[1u8; 64]).expect("put");
+    store.reel.tails()[0].seal().expect("seal the put");
+    store.hold_sealed().expect("note the put's segment");
+
+    // The hand-over finds the key live, gives it to the spot index, and stands there
+    script.hold("paged/handover-spot");
+    let handing = {
+        let store = Arc::clone(&store);
+        script.cast(move || store.page_out_sealed())
+    };
+    script.await_reached("paged/handover-spot", 1);
+
+    store.delete(&key).expect("delete");
+    store.reel.tails()[0].seal().expect("seal the delete");
+    store.hold_sealed().expect("note the delete's segment");
+    let past = store.reel.shared().lsn.peek().as_u64() + 2 * GRAVE_WINDOW;
+    store.reel.shared().lsn.recover_to(Lsn(past));
+    let (done, pruned) = std::sync::mpsc::channel();
+    let pruning = {
+        let store = Arc::clone(&store);
+        script.cast(move || {
+            store.prune_tombstones();
+            done.send(()).ok();
+        })
+    };
+    // Time enough for a prune that ignored the hand-over to have taken the grave
+    let _ = pruned.recv_timeout(Duration::from_millis(200));
+    let seen = store.get(&key).expect("read mid hand-over");
+    script.release("paged/handover-spot");
+    handing
+        .join()
+        .expect("hand-over thread")
+        .expect("hand over");
+    pruning.join().expect("prune thread");
+
+    assert!(
+        seen.is_none(),
+        "a read during the hand-over found the deleted version"
+    );
+    assert!(store.get(&key).expect("read").is_none());
+}
+
 // a range delete drawn after the cue point is invisible to it
 #[test]
 fn cue_ignores_a_later_drop() {

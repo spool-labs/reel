@@ -424,6 +424,16 @@ impl ColumnIndex {
         on_index!(self, index => index.page_out_lane(rows, lane, lanes))
     }
 
+    /// Which rows in one lane of shards the map still points at
+    pub fn holds_lane(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<bool> {
+        on_index!(self, index => index.holds_lane(rows, lane, lanes))
+    }
+
+    /// The newest version a pruned grave or cover guarded
+    pub fn lifted(&self) -> Lsn {
+        on_index!(self, index => index.lifted())
+    }
+
     /// Every entry the column holds, graves included, in key order
     pub fn held(&self) -> Vec<(KeyBytes, Entry)> {
         on_index!(self, index => index.held())
@@ -731,6 +741,9 @@ pub struct WidthIndex<K: IndexKey, S: Shape<K>> {
     /// Whether the list above holds anything, read with the shard held
     has_covers: AtomicBool,
 
+    /// The newest version a pruned grave or cover guarded
+    lifted: AtomicU64,
+
     /// Shards holding at least one key, so a walk skips the empty ones
     occupied: RwLock<TBTreeMap<u64, NODE_WIDTH, ()>>,
 
@@ -753,6 +766,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             filters: ShardFilters::new(spec.shard_count()),
             covers: RwLock::new(Vec::new()),
             has_covers: AtomicBool::new(false),
+            lifted: AtomicU64::new(0),
             occupied: RwLock::new(TBTreeMap::new()),
             declared_width: spec.key_width.fixed().unwrap_or(0),
             shard_bytes: spec.shard_bytes,
@@ -1404,11 +1418,17 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         }
         let mut covers = write(&self.covers);
         let before_len = covers.len();
+        let mut lifted = Lsn::NONE;
         covers.retain(|cover| {
-            !matches!(cover.phase, SweepPhase::Done)
+            let keep = !matches!(cover.phase, SweepPhase::Done)
                 || cover.lsn > before
-                || cover.reaches_sealed(sealed)
+                || cover.reaches_sealed(sealed);
+            if !keep {
+                lifted = lifted.max(cover.lsn);
+            }
+            keep
         });
+        self.lifted.fetch_max(lifted.as_u64(), Ordering::AcqRel);
         // The flag goes down only with the list held, so an insert reading it false
         // is already ordered after the emptying.
         if covers.is_empty() {
@@ -1427,6 +1447,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             .map(|(at, _)| *at as usize)
             .collect();
         let mut pruned = 0u64;
+        let mut lifted = Lsn::NONE;
         for at in occupied {
             let mut state = write(&self.shards[at]);
             if state.graves == 0 {
@@ -1450,6 +1471,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                         .is_some_and(|from| standing.binary_search(&from).is_ok());
                 if prunable {
                     doomed.push(key.clone());
+                    lifted = lifted.max(entry.lsn);
                 } else if entry.lsn < oldest_left {
                     oldest_left = entry.lsn;
                 }
@@ -1469,6 +1491,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             state.map.pack_owed();
             self.note_emptied(at, &mut state);
         }
+        self.lifted.fetch_max(lifted.as_u64(), Ordering::AcqRel);
         pruned
     }
 
@@ -1755,6 +1778,11 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         true
     }
 
+    /// The newest version a pruned grave or cover guarded
+    pub fn lifted(&self) -> Lsn {
+        Lsn(self.lifted.load(Ordering::Acquire))
+    }
+
     /// Give a key up to the footer of the segment it landed in
     ///
     /// The record stays live and its bytes stay booked live: what changes is only
@@ -1769,16 +1797,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     /// Give up the keys in one lane of shards, one lock a chunk, and report which went
     pub fn page_out_lane(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<bool> {
         let mut handed = vec![false; rows.len()];
-        let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
-        for (at, (key, _)) in rows.iter().enumerate() {
-            if let Some(key) = K::from_slice(key) {
-                let shard = self.shard_of(&key);
-                if shard % lanes == lane {
-                    by_shard[shard].push(at);
-                }
-            }
-        }
-        for (shard, ats) in by_shard.iter().enumerate() {
+        for (shard, ats) in self.lane_shards(rows, lane, lanes).iter().enumerate() {
             for chunk in ats.chunks(LOCK_CHUNK) {
                 let mut state = write(&self.shards[shard]);
                 for &at in chunk {
@@ -1786,12 +1805,8 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                     let Some(key) = K::from_slice(key) else {
                         continue;
                     };
-                    match state.map.at(key.as_slice()) {
-                        Some(existing)
-                            if existing.loc == loc
-                                && !existing.is_grave()
-                                && !self.is_covered(key.as_slice(), existing.lsn) => {}
-                        Some(_) | None => continue,
+                    if !self.holds_at(&state, &key, loc) {
+                        continue;
                     }
                     state.map.take(key.as_slice());
                     state.paged += 1;
@@ -1802,6 +1817,45 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             }
         }
         handed
+    }
+
+    /// Which rows in one lane of shards the map still points at
+    pub fn holds_lane(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<bool> {
+        let mut held = vec![false; rows.len()];
+        for (shard, ats) in self.lane_shards(rows, lane, lanes).iter().enumerate() {
+            for chunk in ats.chunks(LOCK_CHUNK) {
+                let state = read(&self.shards[shard]);
+                for &at in chunk {
+                    let (key, loc) = rows[at];
+                    held[at] =
+                        K::from_slice(key).is_some_and(|key| self.holds_at(&state, &key, loc));
+                }
+            }
+        }
+        held
+    }
+
+    /// The rows of one lane, grouped by the shard each key falls in
+    fn lane_shards(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<Vec<usize>> {
+        let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
+        for (at, (key, _)) in rows.iter().enumerate() {
+            if let Some(key) = K::from_slice(key) {
+                let shard = self.shard_of(&key);
+                if shard % lanes == lane {
+                    by_shard[shard].push(at);
+                }
+            }
+        }
+        by_shard
+    }
+
+    /// Whether the map points a key at exactly this place, with no grave or cover over it
+    fn holds_at(&self, state: &ShardState<K, S>, key: &K, loc: Loc) -> bool {
+        state.map.at(key.as_slice()).is_some_and(|existing| {
+            existing.loc == loc
+                && !existing.is_grave()
+                && !self.is_covered(key.as_slice(), existing.lsn)
+        })
     }
 
     /// Every entry the column holds, graves included, in key order
@@ -3611,15 +3665,22 @@ mod tests {
         index.remove(&key(2, 1), Lsn(9), loc(1, 0, 0), &segments);
 
         let sealed = sealed(&[1]);
+        assert_eq!(index.lifted(), Lsn::NONE);
         assert_eq!(
             index.prune_tombstones(Lsn(6), &sealed),
             1,
             "only the one below the floor"
         );
         assert_eq!(index.grave_count(), 1);
+        assert_eq!(
+            index.lifted(),
+            Lsn(6),
+            "the pruned grave's version is lifted"
+        );
 
         assert_eq!(index.prune_tombstones(Lsn(9), &sealed), 1);
         assert_eq!(index.grave_count(), 0);
+        assert_eq!(index.lifted(), Lsn(9));
     }
 
     // the pack a heavy prune triggers keeps every key the shard still holds
@@ -3856,12 +3917,20 @@ mod tests {
             "an unswept cover outlives the floor"
         );
 
+        assert_eq!(index.lifted(), Lsn::NONE, "a cover kept lifts nothing");
+
         sweep_all(&index, &segments);
         index.prune_tombstones(Lsn(6), &sealed);
         assert_eq!(index.cover_count(), 1, "only the one below the floor");
+        assert_eq!(
+            index.lifted(),
+            Lsn(6),
+            "the pruned cover's version is lifted"
+        );
 
         index.prune_tombstones(Lsn(9), &sealed);
         assert_eq!(index.cover_count(), 0);
+        assert_eq!(index.lifted(), Lsn(9));
 
         // Nothing is held any more, so a record older than the retired delete is
         // taken on its own merits.

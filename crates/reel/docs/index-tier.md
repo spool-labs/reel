@@ -59,12 +59,13 @@ compaction window one at a time.
   `a_shadowed_write_over_an_empty_place_is_refused` in `index/column.rs` pins the
   three arms, and `holds_newer_reads_only_the_slots_a_ceiling_admits` in
   `index/spot.rs` pins the read.
-- **A grave goes once its tombstone's segment is noted and the 2^20 window has passed
-  it.** The noted segment is the point a search finds the tombstone row without the
-  grave. A tombstone compaction drops takes its grave with it, since nothing older is
-  left for the grave to hide, and an eviction's grave has no tombstone behind it, so it
-  stands for the life of the process. A range cover is held while any sealed segment
-  overlaps it.
+- **A grave goes once its tombstone's segment is noted, the 2^20 window has passed
+  it, and no write drawn before it is still out.** The noted segment is the point a
+  search finds the tombstone row without the grave. A hand-over asks the map about a
+  row at or below a pruned grave or cover before the spot index takes it. A tombstone
+  compaction drops takes its grave with it, since nothing older is left for the grave
+  to hide, and an eviction's grave has no tombstone behind it, so it stands for the
+  life of the process. A range cover is held while any sealed segment overlaps it.
 - **A key comes back into the map for a compaction window**, between the source
   retiring and the destination sealing, where nothing else resolves it.
 - **`get` takes the newest candidate, not the first.** A segment number is not a

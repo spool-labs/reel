@@ -8,6 +8,7 @@
 pub mod bias;
 pub mod checkpoint;
 pub mod cue;
+pub mod drawn;
 pub mod payload;
 mod read;
 pub mod segment;
@@ -48,11 +49,14 @@ use crate::sync::{lock, read, write};
 
 use reel_core::{ReadBlock, Value};
 
+use drawn::Drawn;
 use read::{
     check_in_block, cut_range, decoded, deep_range, frame_to_range, frame_to_read,
     framed_or_nothing, keyless_range, merge_runs_into, merge_span, near_range, place_runs,
     window_or_nothing, window_start, Planned, Proof, Run, MERGE_GAP,
 };
+
+pub use drawn::{DrawTicket, DrawnRecords, MOST_COUNTED};
 
 /// The first segment number a fresh reel numbers from
 const FIRST_SEGMENT: u32 = 1;
@@ -1088,23 +1092,8 @@ pub struct ReelShared {
     /// Rolled segments whose seals failed, parked for the maintenance tick
     pub(crate) broken_seals: Mutex<Vec<crate::append::BrokenSeal>>,
 
-    /// Sequence numbers drawn for records that have not yet taken a segment hold
-    drawn: AtomicU64,
-}
-
-/// Drawn sequence numbers' place in the gauge, given back when their records land
-///
-/// A guard rather than a pair of calls, so a placement that fails between the draw
-/// and the claim cannot wedge the prune floor closed for the life of the volume.
-pub struct DrawnRecords<'a> {
-    shared: &'a ReelShared,
-    count: u64,
-}
-
-impl Drop for DrawnRecords<'_> {
-    fn drop(&mut self) {
-        self.shared.drawn.fetch_sub(self.count, Ordering::AcqRel);
-    }
+    /// Writes drawn and not yet published, by the epoch they drew in
+    drawn: Drawn,
 }
 
 /// What is keeping one segment from being retired
@@ -1204,7 +1193,7 @@ impl ReelShared {
             unsealed: Mutex::new(std::collections::HashSet::new()),
             past_saving: AtomicU64::new(0),
             broken_seals: Mutex::new(Vec::new()),
-            drawn: AtomicU64::new(0),
+            drawn: Drawn::default(),
         }
     }
 
@@ -1507,46 +1496,19 @@ impl ReelShared {
         self.past_saving.load(Ordering::Relaxed)
     }
 
-    /// Count drawn sequence numbers in until their records take segment holds
-    ///
-    /// Taken before the numbers are drawn, so there is no instant where a drawn
-    /// number is in flight and neither counter says so.
-    pub fn draw_gauge(&self, count: u64) -> DrawnRecords<'_> {
-        self.drawn.fetch_add(count, Ordering::AcqRel);
-        DrawnRecords {
-            shared: self,
-            count,
-        }
+    /// Count records in before they draw their numbers, so no drawn number is ever outside the count
+    pub fn draw_gauge(&self, count: u32) -> DrawnRecords<'_> {
+        self.drawn.enter(count)
     }
 
-    /// Whether every number drawn so far has been published to the index
-    ///
-    /// A record leaves the drawn gauge only after its segment hold is taken, so the
-    /// gauge has to be read first or both reads could miss it.
-    pub fn nothing_unpublished(&self) -> bool {
-        if self.drawn.load(Ordering::Acquire) > 0 {
-            return false;
-        }
-        let holds = read(&self.holds);
-        // Bound rather than left as the tail expression: the walk borrows the guard.
-        let quiet = holds
-            .iter()
-            .filter_map(|(_, held)| held.as_ref())
-            .all(|held| held.unpublished.load(Ordering::Acquire) == 0);
-        quiet
+    /// Count records out once they are published, from the ticket a hold kept
+    pub fn published(&self, ticket: DrawTicket) {
+        self.drawn.leave(ticket);
     }
 
     /// The number below which no record can still land, the floor a delete is done at
-    ///
-    /// The frontier is read first, so a draw between the two reads is one the check
-    /// sees rather than one the floor lets past. A volume with something in flight
-    /// falls back to the same window a grave holds a key against.
     pub fn settled_below(&self) -> Lsn {
-        let peek = self.lsn.peek().as_u64();
-        match self.nothing_unpublished() {
-            true => Lsn(peek),
-            false => Lsn(peek.saturating_sub(crate::engine::GRAVE_WINDOW)),
-        }
+        Lsn(self.drawn.floor(|| self.lsn.peek().as_u64()))
     }
 
     /// Whether a point read asks the page cache before it queues, which every volume read through the cache does

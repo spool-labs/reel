@@ -517,10 +517,13 @@ impl ReelStore {
     /// exact floor lets a grave go the moment its origin seals, and a footer search
     /// that cannot offer that segment yet then answers an older version.
     pub fn prune_tombstones(&self) -> u64 {
-        let peek = self.reel.shared().lsn.peek().as_u64();
+        let shared = self.reel.shared();
+        let peek = shared.lsn.peek().as_u64();
+        // A write still out holds the floor wherever the window has moved to
+        let settled = shared.settled_below().as_u64();
         // A cue read past a later delete finds its version through that delete's grave
         let cue = self.cues.floor().map_or(u64::MAX, |cue| cue.as_u64());
-        let floor = peek.saturating_sub(GRAVE_WINDOW).min(cue);
+        let floor = peek.saturating_sub(GRAVE_WINDOW).min(settled).min(cue);
         if floor == 0 {
             return 0;
         }

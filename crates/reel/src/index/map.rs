@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Bound, Range};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::units::ByteCount;
 
@@ -30,7 +30,7 @@ use crate::index::recovery::SealedSpan;
 use crate::index::spot::{
     Booking, Lookup, Pick, RecordSource, Settled, Since, SpotColumn, Taken, LOOKUP_TRIES,
 };
-use crate::sync::lock;
+use crate::sync::{lock, read, write};
 
 /// Slots in the lookup from a column identifier to its index
 const COLUMN_SLOTS: usize = 256;
@@ -254,6 +254,9 @@ pub struct ReelIndex {
 
     /// Held while a batch moves the maps, so no spanning read sees part of one
     publish: PublishBarrier,
+
+    /// Held shared by each hand-over and whole by a prune
+    handing: RwLock<()>,
 }
 
 /// One segment's hand-over splits across this many threads, each owning a lane of the spot index shards
@@ -261,6 +264,33 @@ const HANDOVER_LANES: usize = 4;
 
 /// A partition under this many rows hands over on the calling thread, since lanes cost more to start
 const SPLIT_AT: usize = 4096;
+
+/// Run one hand-over step over `len` rows, a lane of shards to a thread past the split
+fn in_lanes(len: usize, step: &(dyn Fn(usize, usize) -> Vec<bool> + Sync)) -> Vec<bool> {
+    let lanes = match len >= SPLIT_AT {
+        true => HANDOVER_LANES,
+        false => 1,
+    };
+    let answers: Vec<Vec<bool>> = match lanes {
+        1 => vec![step(0, 1)],
+        _ => std::thread::scope(|scope| {
+            let running: Vec<_> = (0..lanes)
+                .map(|lane| scope.spawn(move || step(lane, lanes)))
+                .collect();
+            running
+                .into_iter()
+                .map(|lane| lane.join().expect("a hand-over lane panicked"))
+                .collect()
+        }),
+    };
+    let mut all = vec![false; len];
+    for lane in answers {
+        for (all, took) in all.iter_mut().zip(lane) {
+            *all |= took;
+        }
+    }
+    all
+}
 
 impl ReelIndex {
     /// An empty index over the columns a reel serves
@@ -294,6 +324,7 @@ impl ReelIndex {
             footers: OnceLock::new(),
             shadowed: Mutex::new(Vec::new()),
             publish: PublishBarrier::new(),
+            handing: RwLock::new(()),
         })
     }
 
@@ -935,7 +966,13 @@ impl ReelIndex {
         let Some(at) = self.slot(partition.column) else {
             return Ok(0);
         };
+        let spot = &self.spot[at];
+        let index = &self.indexes[at];
+        // No guard goes while a hand-over runs
+        let _handing = read(&self.handing);
+        let lifted = index.lifted();
         let mut rows: Vec<(&[u8], Loc)> = Vec::with_capacity(partition.len());
+        let mut asked: Vec<(&[u8], Loc)> = Vec::new();
         let mut newest = Lsn::NONE;
         for row_at in 0..partition.len() {
             // The key is borrowed out of the packed bytes, never decoded into an entry
@@ -951,41 +988,33 @@ impl ReelIndex {
                 continue;
             }
             newest = newest.max(row.lsn);
-            rows.push((key, Loc::new(segment, row.offset, row.len)));
+            // A row a pruned guard may have hidden goes to the spot index only if the map still points at it
+            match row.lsn <= lifted {
+                true => asked.push((key, Loc::new(segment, row.offset, row.len))),
+                false => rows.push((key, Loc::new(segment, row.offset, row.len))),
+            }
         }
         // Raised before any key leaves the map, so a write finding its place empty sees it
         self.handed.fetch_max(newest.as_u64(), Ordering::AcqRel);
-        let lanes = match rows.len() >= SPLIT_AT {
-            true => HANDOVER_LANES,
-            false => 1,
-        };
-        let spot = &self.spot[at];
-        let index = &self.indexes[at];
-        let in_lanes = |step: &(dyn Fn(usize) -> Vec<bool> + Sync)| -> Vec<bool> {
-            let mut all = vec![false; rows.len()];
-            let lanes: Vec<Vec<bool>> = match lanes {
-                1 => vec![step(0)],
-                _ => std::thread::scope(|scope| {
-                    let running: Vec<_> = (0..lanes)
-                        .map(|lane| scope.spawn(move || step(lane)))
-                        .collect();
-                    running
-                        .into_iter()
-                        .map(|lane| lane.join().expect("a hand-over lane panicked"))
-                        .collect()
-                }),
-            };
-            for lane in lanes {
-                for (all, took) in all.iter_mut().zip(lane) {
-                    *all |= took;
-                }
-            }
-            all
-        };
-        let inserted = in_lanes(&|lane| spot.insert_lane(&rows, lane, lanes));
+        if !asked.is_empty() {
+            let held = in_lanes(asked.len(), &|lane, lanes| {
+                index.holds_lane(&asked, lane, lanes)
+            });
+            rows.extend(
+                asked
+                    .into_iter()
+                    .zip(held)
+                    .filter_map(|(row, held)| held.then_some(row)),
+            );
+        }
+        let inserted = in_lanes(rows.len(), &|lane, lanes| {
+            spot.insert_lane(&rows, lane, lanes)
+        });
         // The spot index takes every key before the map lets any go, so no read misses both
         crate::sync::rendezvous::at("paged/handover-spot");
-        let handed = in_lanes(&|lane| index.page_out_lane(&rows, lane, lanes));
+        let handed = in_lanes(rows.len(), &|lane, lanes| {
+            index.page_out_lane(&rows, lane, lanes)
+        });
         let back: Vec<(&[u8], Loc)> = rows
             .iter()
             .zip(inserted.iter().zip(&handed))
@@ -1674,6 +1703,8 @@ impl ReelIndex {
     /// The floor is the caller's to choose, since what a tombstone holds out against
     /// is bounded by what the admission budget lets a writer hold in flight.
     pub fn prune_tombstones(&self, before: Lsn) -> u64 {
+        // A hand-over's rows sit in the spot index until the map is asked about them
+        let _handing = write(&self.handing);
         self.indexes
             .iter()
             .enumerate()

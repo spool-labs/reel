@@ -113,6 +113,44 @@ impl RecordSource for ReelShared {
         )
     }
 
+    fn checked_len(
+        &self,
+        key: &RecordKey,
+        segment: SegmentId,
+        offset: u32,
+        bound: u32,
+    ) -> Result<Option<u32>> {
+        let Some(handle) = self.handle_for(segment)? else {
+            return Ok(None);
+        };
+        let RecordLayout::Keyless(check) = handle.layout() else {
+            return Ok(None);
+        };
+        if !fits_keyless(bound) {
+            return Ok(None);
+        }
+        // A failed read falls back to the footer, which reports it
+        let (head, body) =
+            match self.split_read(&handle, u64::from(offset), KEYLESS_PREFIX, bound as usize) {
+                Ok(read) => read,
+                Err((_, spare)) => {
+                    recycle_header(spare);
+                    return Ok(None);
+                }
+            };
+        let proven = keyless_len(&head)
+            .filter(|len| *len as usize <= body.len())
+            .filter(|len| {
+                matches!(
+                    check_keyless(&head, &body[..*len as usize], key.as_ref(), Flags::DATA, &check),
+                    KeylessRead::Intact(_)
+                )
+            });
+        recycle_header(head);
+        crate::reel::payload::give(body);
+        Ok(proven)
+    }
+
     fn record(
         &self,
         key: &RecordKey,

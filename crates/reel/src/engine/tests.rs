@@ -4409,6 +4409,28 @@ fn an_overwritten_key_reads_its_live_slot_in_one_read() {
     assert_eq!(store.filter_probes().blocks, blocks, "a footer search ran");
 }
 
+// an overwrite settles a key's older versions off their own records, with no footer search
+#[test]
+fn an_overwrite_settles_older_versions_with_no_footer_search() {
+    let (store, _backend, _dir) = posix_store(config(1, SyncPolicy::Never));
+    let key = record(7, 1);
+    for byte in 0..3u8 {
+        store.put(&key, &[byte; 100]).expect("put");
+        store.reel.tails()[0].seal().expect("seal");
+        assert!(store.page_out_sealed().expect("hand over") > 0);
+    }
+    assert_eq!(store.index.spot_held(), 3, "every version holds a slot");
+
+    let blocks = store.filter_probes().blocks;
+    store.put(&key, &[0x33; 100]).expect("overwrite");
+    assert_eq!(store.index.spot_held(), 0, "the older versions are still held");
+    assert_eq!(store.filter_probes().blocks, blocks, "a footer search ran");
+    assert_eq!(
+        store.get(&key).expect("get"),
+        Some(Value::new(vec![0x33; 100]))
+    );
+}
+
 // a durable put survives a crash on a volume that never syncs, at the cost of one sync
 #[test]
 fn a_durable_put_survives_a_crash_on_one_sync() {

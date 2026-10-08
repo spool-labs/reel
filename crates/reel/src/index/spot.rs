@@ -314,6 +314,15 @@ pub trait RecordSource: Send + Sync {
     /// The header at a place, answered only from memory
     fn cached_head(&self, key: KeyRef<'_>, segment: SegmentId, offset: u32) -> Result<HeadRead>;
 
+    /// The length of the key's data record at a place, read whole up to `bound`, when the record's own check proves it is the key's
+    fn checked_len(
+        &self,
+        key: &RecordKey,
+        segment: SegmentId,
+        offset: u32,
+        bound: u32,
+    ) -> Result<Option<u32>>;
+
     /// The record at a place, in one read of its header and up to `bound` payload bytes
     fn record(
         &self,
@@ -1456,7 +1465,18 @@ impl SpotColumn {
                 (false, false, false) | (true, _, _) => {}
             }
             let answer = match records.cached_head(key.as_ref(), slot.segment(), slot.offset)? {
-                HeadRead::Cold => records.head(key.as_ref(), slot.segment(), slot.offset)?,
+                HeadRead::Cold => {
+                    // A version in an older segment is older than this write, so its own check settles it with no footer search
+                    let checked = match is_older && !slot.is_grave() {
+                        true => records.checked_len(key, slot.segment(), slot.offset, slot.bound())?,
+                        false => None,
+                    };
+                    if let Some(len) = checked {
+                        older.push((slot, len));
+                        continue;
+                    }
+                    records.head(key.as_ref(), slot.segment(), slot.offset)?
+                }
                 answer => answer,
             };
             match answer {
@@ -1995,6 +2015,16 @@ mod tests {
                 true => HeadRead::Cold,
                 false => self.answer(key, segment, offset),
             })
+        }
+
+        fn checked_len(
+            &self,
+            _key: &RecordKey,
+            _segment: SegmentId,
+            _offset: u32,
+            _bound: u32,
+        ) -> Result<Option<u32>> {
+            Ok(None)
         }
 
         fn record(

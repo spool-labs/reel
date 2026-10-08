@@ -4262,6 +4262,56 @@ fn close_leaves_the_tail_resumable() {
     assert!(reopened.get(&record(7, 2)).expect("get").is_some());
 }
 
+// a reopen that turned a torn group down resumes past it, and the next reopen still turns it down
+#[test]
+fn a_resumed_tail_writes_past_a_group_it_turned_down() {
+    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
+    store.put(&record(7, 1), &[0x11; 512]).expect("put");
+    store.put(&record(7, 2), &[0x22; 512]).expect("put");
+    store.close().expect("close");
+    let path = Path::new(ROOT).join(segment_file_name(SegmentId(1)));
+    let mut image = sim.durable_image();
+    for (at, bytes) in image.iter_mut() {
+        if *at != path {
+            continue;
+        }
+        let (_, rows) = crate::format::journal::rows_region(bytes).expect("an open segment's rows");
+        let (groups, _) = crate::format::journal::read_groups(rows);
+        // Inside the last record's payload, past its check and shape
+        let torn = groups.last().expect("a group")[0].offset as usize + 16;
+        bytes[torn] ^= 0xff;
+    }
+    let open = |sim: &SimIo| {
+        ReelStore::open_with_io(
+            PathBuf::from(ROOT),
+            config(1, SyncPolicy::Never),
+            COLUMNS,
+            Arc::new(sim.clone()),
+        )
+        .expect("reopen")
+    };
+
+    let resumed_sim = SimIo::from_image(image);
+    let resumed = open(&resumed_sim);
+    assert!(resumed.get(&record(7, 1)).expect("get").is_some());
+    assert!(
+        resumed.get(&record(7, 2)).expect("get").is_none(),
+        "a torn record came back"
+    );
+    resumed.put(&record(7, 2), &[0x22; 512]).expect("put again");
+    resumed.put(&record(7, 3), &[0x33; 512]).expect("put");
+    resumed.close().expect("close");
+
+    let again = open(&SimIo::from_image(resumed_sim.durable_image()));
+    for (byte, fill) in [(1u8, 0x11u8), (2, 0x22), (3, 0x33)] {
+        assert_eq!(
+            again.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![fill; 512])),
+            "key {byte} after the second reopen"
+        );
+    }
+}
+
 // a read-only open serves reads but rejects every write
 #[test]
 fn read_only_rejects_writes() {

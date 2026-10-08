@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::engine::ReelStore;
 use crate::format::column::RecordKey;
-use crate::format::journal::{journal_path, read_groups};
+use crate::format::journal::read_groups;
 use crate::format::loc::SegmentId;
 use crate::format::record::{
     check_keyless, Flags, KeylessRead, RecordHeader, RecordLayout, HEADER_LEN, KEYLESS_PREFIX,
@@ -416,7 +416,7 @@ fn sweep(engine: &ReelStore, file: &SegmentFile, indexed: bool, watch: &mut Watc
         Ok(file) => file,
         Err(error) => return row.faulted(format!("{name} will not open: {error}")),
     };
-    let layout = layout_of(&mut file);
+    let (layout, rows_at) = layout_of(&mut file);
     if !layout.is_keyless_layout() {
         return row.faulted(format!(
             "{name} opens with no segment header this build reads"
@@ -435,12 +435,18 @@ fn sweep(engine: &ReelStore, file: &SegmentFile, indexed: bool, watch: &mut Watc
             sweep_rows(&mut file, listed, layout, &mut row, watch);
         }
         Ok(None) => {
-            let Ok(journal) = std::fs::read(journal_path(path)) else {
+            // A seal cuts the file at its footer, so a file short of its rows lists nothing
+            let len = file.metadata().map_or(0, |meta| meta.len());
+            let rows = match rows_at > 0 && len >= rows_at {
+                true => read_at(&mut file, rows_at, len - rows_at),
+                false => Err(std::io::ErrorKind::NotFound.into()),
+            };
+            let Ok(rows) = rows else {
                 return row.faulted(format!(
-                    "{name} has no footer, and no journal lists its records"
+                    "{name} has no footer, and no rows list its records"
                 ));
             };
-            let (groups, _) = read_groups(&journal);
+            let (groups, _) = read_groups(&rows);
             let listed = groups
                 .into_iter()
                 .flatten()
@@ -453,20 +459,22 @@ fn sweep(engine: &ReelStore, file: &SegmentFile, indexed: bool, watch: &mut Watc
     row
 }
 
-/// How a segment file frames its records, falling back to keyed so a bad header gets reported
-fn layout_of(file: &mut File) -> RecordLayout {
+/// How a segment file frames its records and where it keeps its rows, falling back to keyed so a bad header gets reported
+fn layout_of(file: &mut File) -> (RecordLayout, u64) {
     let Ok(head) = read_at(file, 0, (HEADER_LEN + SEGMENT_HEADER_SPAN) as u64) else {
-        return RecordLayout::Keyed;
+        return (RecordLayout::Keyed, 0);
     };
     let Ok(header) = RecordHeader::unpack(&head) else {
-        return RecordLayout::Keyed;
+        return (RecordLayout::Keyed, 0);
     };
     let end = HEADER_LEN + header.length as usize;
     match head.get(HEADER_LEN..end) {
         Some(payload) if header.flags.is_segment_header() && header.verify(payload) => {
-            SegmentHeader::unpack(payload).map_or(RecordLayout::Keyed, |parsed| parsed.layout)
+            SegmentHeader::unpack(payload).map_or((RecordLayout::Keyed, 0), |parsed| {
+                (parsed.layout, parsed.rows_at)
+            })
         }
-        Some(_) | None => RecordLayout::Keyed,
+        Some(_) | None => (RecordLayout::Keyed, 0),
     }
 }
 

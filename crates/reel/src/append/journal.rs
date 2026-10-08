@@ -1,123 +1,133 @@
-//! An open segment's journal file, written through where a dead process should leave its rows
+//! An open segment's journal rows, kept in the segment's own file past every record and footer
 
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::error::Result;
-use crate::format::journal::{journal_path, push_group, JournalRow};
+use crate::format::journal::{push_group, JournalRow};
+use crate::format::record::BLOCK;
 use crate::io::op::{FileId, WriteBuf};
+use crate::io::ServingBackend;
 use crate::reel::segment::IoDriver;
 use crate::sync::{lock, try_lock};
 
-/// A written-through journal is zeroed at most this far at a time ahead of its rows, and a sixteenth of its segment when less
+/// The rows region is zeroed at most this far at a time ahead of its rows, and a sixteenth of its segment when less
 const FILL: u64 = 1024 * 1024;
 
-/// One open segment's journal
+/// How a volume puts journal rows down
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Writes {
+    /// Each push writes its group before it returns
+    pub through: bool,
+
+    /// Every write covers whole blocks
+    pub whole_blocks: bool,
+}
+
+/// One open segment's journal, a region of the segment file from `rows_at` on
 pub(super) struct Journal {
     /// The driver the file is written through
     driver: Arc<IoDriver>,
 
-    /// Where the journal sits, beside its segment
-    path: PathBuf,
+    /// The segment file the rows go into, none for a tail that holds no segment yet
+    file: Option<FileId>,
+
+    /// Where the rows region begins in the segment file
+    rows_at: u64,
 
     /// Groups for records that have landed and are not in the file yet
     pending: Mutex<Vec<u8>>,
 
-    /// The file and how far it is written, held across a write so groups land in order
-    file: Mutex<JournalFile>,
+    /// How far into the region the rows are written, held across a write so groups land in order
+    written: Mutex<u64>,
 
     /// Bytes pushed so far, written or pending, which the segment's room shrinks by
     pushed: AtomicU64,
 
-    /// The file each push writes its group into before it returns, so a process crash keeps every row its record kept
-    through: Option<FileId>,
+    /// Whether each push writes its group before it returns, so a process crash keeps every row its record kept
+    through: bool,
 
-    /// How far the written-through file is zeroed
+    /// Whether a write covers whole blocks, its end padded with zeros
+    whole_blocks: bool,
+
+    /// How far into the region the file is zeroed
     filled: AtomicU64,
 
-    /// The segment's size, which the zeroed file never runs past
+    /// The segment's size, which the zeroed region never runs past
     span: u64,
 }
 
-struct JournalFile {
-    id: Option<FileId>,
-    written: u64,
-}
-
 impl Journal {
-    /// Create the journal of a segment of `span` bytes being drawn, writing each group as it comes when `through`
+    /// The journal of a segment being drawn, writing each group as it comes when `through`
     pub(super) fn create(
         driver: &Arc<IoDriver>,
-        segment_path: &Path,
+        file: FileId,
+        rows_at: u64,
         span: u64,
-        through: bool,
-    ) -> Result<Journal> {
-        let path = journal_path(segment_path);
-        // A drawn number is new and an open unlinks stale journals, so the file starts empty
-        let id = driver.open(&path, true)?;
-        Ok(Journal::over(driver, path, Some(id), 0, span, through))
+        writes: Writes,
+    ) -> Journal {
+        Journal::over(driver, Some(file), rows_at, 0, span, writes)
     }
 
-    /// Take a journal up again with only the rows a reopen accepted, written through as `create` says
+    /// Take a journal up again past the whole groups a reopen read
+    ///
+    /// A whole-block volume zeroes the rest of the block the last group ends in, so the
+    /// next write opens on the boundary and the read steps over the zeros to it.
     pub(super) fn resume(
         driver: &Arc<IoDriver>,
-        segment_path: &Path,
-        rows: &[JournalRow],
+        file: FileId,
+        rows_at: u64,
+        written: u64,
         span: u64,
-        through: bool,
+        writes: Writes,
     ) -> Result<Journal> {
-        let path = journal_path(segment_path);
-        let fresh = path.with_extension("rows.part");
-        let id = driver.open(&fresh, true)?;
-        driver.truncate(id, 0)?;
-        let mut bytes = Vec::new();
-        if !rows.is_empty() {
-            push_group(rows, &mut bytes);
+        let mut journal = Journal::over(driver, Some(file), rows_at, written, span, writes);
+        if journal.whole_blocks && !written.is_multiple_of(BLOCK) {
+            let start = written - written % BLOCK;
+            let mut block = driver.pread(file, rows_at + start, written - start)?;
+            block.resize(BLOCK as usize, 0);
+            driver.writev_all(file, rows_at + start, vec![WriteBuf::owned(block)])?;
+            let next = start + BLOCK;
+            *journal
+                .written
+                .get_mut()
+                .unwrap_or_else(|held| held.into_inner()) = next;
+            journal.pushed.store(next, Ordering::Release);
+            journal.filled.store(next, Ordering::Release);
         }
-        let written = bytes.len() as u64;
-        if written > 0 {
-            driver.writev_all(id, 0, vec![WriteBuf::owned(bytes)])?;
-        }
-        driver.sync_data(id)?;
-        // The rename swaps whole journals, so a crash leaves one or the other
-        driver.rename(&fresh, &path)?;
-        if let Some(dir) = path.parent() {
-            driver.sync_dir(dir)?;
-        }
-        Ok(Journal::over(
-            driver,
-            path,
-            Some(id),
-            written,
-            span,
-            through,
-        ))
+        Ok(journal)
     }
 
     /// A journal with no file, for a tail that holds no segment yet
     pub(super) fn none(driver: &Arc<IoDriver>) -> Journal {
-        Journal::over(driver, PathBuf::new(), None, 0, 0, false)
+        Journal::over(driver, None, 0, 0, 0, Writes::default())
     }
 
     fn over(
         driver: &Arc<IoDriver>,
-        path: PathBuf,
-        id: Option<FileId>,
+        file: Option<FileId>,
+        rows_at: u64,
         written: u64,
         span: u64,
-        through: bool,
+        writes: Writes,
     ) -> Journal {
         Journal {
             driver: Arc::clone(driver),
-            path,
+            file,
+            rows_at,
             pending: Mutex::new(Vec::new()),
-            file: Mutex::new(JournalFile { id, written }),
+            written: Mutex::new(written),
             pushed: AtomicU64::new(written),
-            through: id.filter(|_| through),
+            through: writes.through,
+            whole_blocks: writes.whole_blocks,
             filled: AtomicU64::new(written),
             span,
         }
+    }
+
+    /// Where the rows region begins, which the seal's footer must stay below
+    pub(super) fn rows_at(&self) -> u64 {
+        self.rows_at
     }
 
     /// Bytes the journal holds once everything pushed is written
@@ -131,7 +141,7 @@ impl Journal {
             return Ok(());
         }
         let mut pending = lock(&self.pending);
-        let Some(id) = self.through else {
+        let (Some(file), true) = (self.file, self.through) else {
             let before = pending.len();
             push_group(rows, &mut pending);
             self.pushed
@@ -143,72 +153,75 @@ impl Journal {
         push_group(rows, &mut group);
         let at = self.pushed.load(Ordering::Acquire);
         let end = at + group.len() as u64;
-        let filled = self.filled.load(Ordering::Acquire);
-        if end > filled {
-            // A sync over blocks the file already holds settles no extents, as the segment's fill does for its records
-            let step = (self.span / 16).clamp(4096, FILL);
-            let to = (end.div_ceil(step) * step).min(self.span.max(end));
-            self.driver
-                .writev_all(id, filled, vec![WriteBuf::zeros((to - filled) as usize)])?;
-            self.driver.sync_full(id)?;
-            self.filled.store(to, Ordering::Release);
-        }
+        self.fill_to(file, end)?;
         self.driver
-            .writev_all(id, at, vec![WriteBuf::owned(group)])?;
+            .writev_all(file, self.rows_at + at, vec![WriteBuf::owned(group)])?;
         self.pushed.store(end, Ordering::Release);
         Ok(())
     }
 
-    /// Write every pending group and sync, under the file's lock so a seal waits for it
-    pub(super) fn sync_pending(&self) -> Result<()> {
-        let mut file = lock(&self.file);
-        self.write_locked(&mut file)?;
-        match file.id {
-            Some(id) => self.driver.sync_data(id),
-            None => Ok(()),
-        }
+    /// Write every pending group into the segment file, whose own sync then covers them
+    pub(super) fn write_pending(&self) -> Result<()> {
+        let mut written = lock(&self.written);
+        self.write_locked(&mut written)
     }
 
-    /// The same write, skipped while another caller holds the file
+    /// The same write, skipped while another caller holds the region
     pub(super) fn try_write_pending(&self) {
-        if let Some(mut file) = try_lock(&self.file) {
-            let _ = self.write_locked(&mut file);
+        if let Some(mut written) = try_lock(&self.written) {
+            let _ = self.write_locked(&mut written);
         }
     }
 
-    fn write_locked(&self, file: &mut JournalFile) -> Result<()> {
-        let Some(id) = file.id else {
+    fn write_locked(&self, written: &mut u64) -> Result<()> {
+        let Some(file) = self.file else {
             return Ok(());
         };
-        let bytes = std::mem::take(&mut *lock(&self.pending));
+        let mut bytes = std::mem::take(&mut *lock(&self.pending));
         if bytes.is_empty() {
             return Ok(());
         }
+        if self.whole_blocks {
+            let padded = (bytes.len() as u64).next_multiple_of(BLOCK);
+            self.pushed
+                .fetch_add(padded - bytes.len() as u64, Ordering::AcqRel);
+            bytes.resize(padded as usize, 0);
+        }
         let len = bytes.len() as u64;
+        self.fill_to(file, *written + len)?;
         self.driver
-            .writev_all(id, file.written, vec![WriteBuf::owned(bytes)])?;
-        file.written += len;
+            .writev_all(file, self.rows_at + *written, vec![WriteBuf::owned(bytes)])?;
+        *written += len;
         Ok(())
     }
 
-    /// Close and unlink the journal, once the segment's footer lists everything it held
-    pub(super) fn remove(&self) {
-        let mut file = lock(&self.file);
-        lock(&self.pending).clear();
-        if let Some(id) = file.id.take() {
-            let _ = self.driver.close(id);
-            let _ = self.driver.unlink(&self.path);
+    /// Zero the region out past `end` before rows land there, so a sync of them settles no extents
+    fn fill_to(&self, file: FileId, end: u64) -> Result<()> {
+        let filled = self.filled.load(Ordering::Acquire);
+        if end <= filled || matches!(self.driver.serving(), ServingBackend::Sim) {
+            return Ok(());
         }
+        let step = (self.span / 16).clamp(BLOCK, FILL).next_multiple_of(BLOCK);
+        let to = (end.div_ceil(step) * step).min(self.span.max(end).next_multiple_of(BLOCK));
+        self.driver.writev_all(
+            file,
+            self.rows_at + filled,
+            vec![WriteBuf::zeros((to - filled) as usize)],
+        )?;
+        self.driver.sync_full(file)?;
+        self.filled.store(to, Ordering::Release);
+        Ok(())
+    }
+
+    /// Drop what is pending once the segment's footer lists everything the rows did
+    pub(super) fn remove(&self) {
+        lock(&self.pending).clear();
     }
 }
 
 impl Drop for Journal {
     /// Write what is pending on the way out, so a store dropped without a seal leaves its rows
     fn drop(&mut self) {
-        let mut file = lock(&self.file);
-        let _ = self.write_locked(&mut file);
-        if let Some(id) = file.id.take() {
-            let _ = self.driver.close(id);
-        }
+        let _ = self.write_pending();
     }
 }

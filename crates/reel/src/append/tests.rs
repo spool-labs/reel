@@ -15,7 +15,7 @@ use crate::append::admission::InflightBudget;
 use crate::config::{IoBackend, ReelConfig, DEFAULT_FD_CACHE};
 use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth};
 use crate::format::footer::SegmentFooter;
-use crate::format::journal::{journal_path, read_groups, JournalRow};
+use crate::format::journal::{read_groups, rows_region, JournalRow};
 use crate::format::loc::SegmentId;
 use crate::format::record::{check_keyless, KeylessRead, KEYLESS_MAX, KEYLESS_PREFIX};
 use crate::format::segment_header::{SegmentHeader, SEGMENT_HEADER_SPAN};
@@ -74,8 +74,8 @@ fn harness_capped(
     (shared, sim)
 }
 
-/// Syncs one flush takes: the segment's, then its journal's
-const SYNCS_PER_FLUSH: u64 = 2;
+/// Syncs one flush takes: the segment's, which covers its journal rows too
+const SYNCS_PER_FLUSH: u64 = 1;
 
 fn key(byte: u8) -> RecordKey {
     RecordKey::from_bytes(RECORDS, &[byte; KEY_WIDTH]).expect("key")
@@ -94,8 +94,8 @@ fn framed(payload_len: usize) -> u64 {
 /// The groups of rows the open segment has journaled, which a flush writes down
 fn journaled(shared: &ReelShared, appender: &Appender, segment: SegmentId) -> Vec<Vec<JournalRow>> {
     appender.flush().expect("flush");
-    let bytes = read_segment(shared, &journal_path(&shared.segment_path(segment)));
-    read_groups(&bytes).0
+    let bytes = read_segment(shared, &shared.segment_path(segment));
+    read_groups(rows_region(&bytes).map_or(&[][..], |(_, rows)| rows)).0
 }
 
 /// Whether the record at a place checks out as the key its payload's byte gives

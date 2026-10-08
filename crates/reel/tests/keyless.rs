@@ -4,7 +4,7 @@ use tempfile::TempDir;
 
 use reel::config::{ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSpec, RecordKey};
-use reel::format::journal::JOURNAL_SUFFIX;
+use reel::format::journal::rows_region;
 use reel::units::ByteCount;
 use reel::{KeyWidth, ReelStore, SEGMENT_SUFFIX};
 
@@ -105,40 +105,41 @@ fn keyless_records_read_back_after_a_reopen() {
     }
 }
 
-// a sealed segment keeps its footer and loses its journal, and only the open tail has one
+/// Every segment file under a volume root, read whole
+fn segment_files(dir: &TempDir) -> Vec<Vec<u8>> {
+    std::fs::read_dir(dir.path())
+        .expect("list")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| path.to_string_lossy().ends_with(SEGMENT_SUFFIX))
+        .map(|path| std::fs::read(path).expect("read"))
+        .collect()
+}
+
+// a seal cuts its segment at the footer, so only the open tails still run out to their rows
 #[test]
-fn a_seal_leaves_no_journal() {
+fn a_seal_leaves_no_rows() {
     let dir = TempDir::new().expect("tempdir");
     let store = filled(&dir);
-    let names: Vec<String> = std::fs::read_dir(dir.path())
-        .expect("list")
-        .map(|entry| {
-            entry
-                .expect("entry")
-                .file_name()
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
-    let segments = names
+    let files = segment_files(&dir);
+    let open = files
         .iter()
-        .filter(|name| name.ends_with(SEGMENT_SUFFIX))
+        .filter(|bytes| rows_region(bytes).is_some())
         .count();
-    let journals = names
-        .iter()
-        .filter(|name| name.ends_with(JOURNAL_SUFFIX))
-        .count();
-    assert!(segments > 2, "the stream sealed too little to say anything");
     assert!(
-        journals <= 2,
-        "{journals} journals stand beside {segments} segments"
+        files.len() > 2,
+        "the stream sealed too little to say anything"
+    );
+    assert!(
+        open <= 2,
+        "{open} of {} segments still hold rows",
+        files.len()
     );
     drop(store);
 }
 
-// an open segment rolls once its records and journal fill it, however small the records
+// an open segment rolls once its records and rows fill it, however small the records
 #[test]
-fn a_journal_stays_within_its_segment() {
+fn rows_stay_within_their_segment() {
     let dir = TempDir::new().expect("tempdir");
     let store = ReelStore::open(dir.path().to_path_buf(), config(), COLUMNS).expect("open");
     for at in 0..KEYS {
@@ -149,17 +150,12 @@ fn a_journal_stays_within_its_segment() {
     }
     store.flush().expect("flush");
     let limit = config().segment_bytes.to_bytes();
-    for entry in std::fs::read_dir(dir.path()).expect("list") {
-        let entry = entry.expect("entry");
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .ends_with(JOURNAL_SUFFIX)
-        {
-            let len = entry.metadata().expect("stat").len();
+    for bytes in segment_files(&dir) {
+        if let Some((_, rows)) = rows_region(&bytes) {
+            let len = rows.len() as u64;
             assert!(
                 len <= limit,
-                "a journal of {len} bytes outgrew its {limit} byte segment"
+                "rows of {len} bytes outgrew their {limit} byte segment"
             );
         }
     }

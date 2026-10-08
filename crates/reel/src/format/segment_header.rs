@@ -8,7 +8,7 @@ use crate::format::record::{read_u32_le, CheckKey, RecordLayout, CHECK_KEY_LEN};
 ///
 /// A build meeting a version it cannot read refuses the whole file here, rather
 /// than truncating its walk at an unknown record kind and losing the tail silently.
-pub const FORMAT_VERSION: u16 = 7;
+pub const FORMAT_VERSION: u16 = 8;
 
 const VERSION_LEN: usize = std::mem::size_of::<u16>();
 const SEGMENT_LEN: usize = std::mem::size_of::<u32>();
@@ -25,8 +25,11 @@ const LAYOUT_AT: usize = SEGMENT_HEADER_LEN;
 /// Where a keyless segment's check key sits, behind its layout byte
 const CHECK_AT: usize = LAYOUT_AT + 1;
 
-/// This build writes the frozen prefix, the record layout, then the check key
-pub const SEGMENT_HEADER_SPAN: usize = CHECK_AT + CHECK_KEY_LEN;
+/// Where a keyless segment's rows region begins, behind its check key
+const ROWS_AT: usize = CHECK_AT + CHECK_KEY_LEN;
+
+/// This build writes the frozen prefix, the record layout, the check key, then where the rows go
+pub const SEGMENT_HEADER_SPAN: usize = ROWS_AT + std::mem::size_of::<u64>();
 
 /// The fixed payload carried by the first record of every segment
 ///
@@ -43,6 +46,9 @@ pub struct SegmentHeader {
 
     /// How the segment frames its records, which every reader of the file needs first
     pub layout: RecordLayout,
+
+    /// Where an open keyless segment keeps its journal rows, past any record or footer, and zero for none
+    pub rows_at: u64,
 }
 
 impl SegmentHeader {
@@ -52,12 +58,18 @@ impl SegmentHeader {
             version: FORMAT_VERSION,
             segment,
             layout: RecordLayout::Keyed,
+            rows_at: 0,
         }
     }
 
     /// The same header for a segment whose records lie in this layout
     pub fn laid_out(self, layout: RecordLayout) -> SegmentHeader {
         SegmentHeader { layout, ..self }
+    }
+
+    /// The same header with its journal rows kept from this offset
+    pub fn rows_from(self, rows_at: u64) -> SegmentHeader {
+        SegmentHeader { rows_at, ..self }
     }
 
     /// Serialize to the on-disk payload bytes
@@ -67,8 +79,9 @@ impl SegmentHeader {
         out[SEGMENT_AT..SEGMENT_HEADER_LEN].copy_from_slice(&self.segment.as_u32().to_le_bytes());
         out[LAYOUT_AT] = self.layout.as_u8();
         if let RecordLayout::Keyless(check) = self.layout {
-            out[CHECK_AT..SEGMENT_HEADER_SPAN].copy_from_slice(&check.to_bytes());
+            out[CHECK_AT..ROWS_AT].copy_from_slice(&check.to_bytes());
         }
+        out[ROWS_AT..SEGMENT_HEADER_SPAN].copy_from_slice(&self.rows_at.to_le_bytes());
         out
     }
 
@@ -87,7 +100,7 @@ impl SegmentHeader {
             None | Some(0) => RecordLayout::Keyed,
             Some(1) => {
                 let check: [u8; CHECK_KEY_LEN] = bytes
-                    .get(CHECK_AT..SEGMENT_HEADER_SPAN)
+                    .get(CHECK_AT..ROWS_AT)
                     .and_then(|key| key.try_into().ok())
                     .ok_or_else(|| {
                         ReelError::Corruption(
@@ -103,10 +116,14 @@ impl SegmentHeader {
             }
         };
 
+        let rows_at = bytes.get(ROWS_AT..SEGMENT_HEADER_SPAN).map_or(0, |at| {
+            u64::from_le_bytes(at.try_into().unwrap_or_default())
+        });
         Ok(SegmentHeader {
             version,
             segment: SegmentId(segment),
             layout,
+            rows_at,
         })
     }
 }
@@ -133,13 +150,18 @@ mod tests {
             version: 2,
             segment: SegmentId(0x0302_0100),
             layout: RecordLayout::Keyless(CHECK),
+            rows_at: 0x0807_0605_0403_0201,
         };
 
         let mut wanted = vec![0x02, 0x00, 0x00, 0x01, 0x02, 0x03, 0x01];
         wanted.extend_from_slice(&[0xc0; CHECK_KEY_LEN]);
+        wanted.extend_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
         assert_eq!(header.pack().to_vec(), wanted);
         assert_eq!(SEGMENT_HEADER_LEN, VERSION_LEN + SEGMENT_LEN);
-        assert_eq!(SEGMENT_HEADER_SPAN, SEGMENT_HEADER_LEN + 1 + CHECK_KEY_LEN);
+        assert_eq!(
+            SEGMENT_HEADER_SPAN,
+            SEGMENT_HEADER_LEN + 1 + CHECK_KEY_LEN + 8
+        );
     }
 
     // a keyless layout survives a round trip, and a payload without the layout byte reads keyed
@@ -162,7 +184,7 @@ mod tests {
             .laid_out(RecordLayout::Keyless(CHECK))
             .pack();
 
-        assert!(SegmentHeader::unpack(&packed[..SEGMENT_HEADER_SPAN - 1]).is_err());
+        assert!(SegmentHeader::unpack(&packed[..ROWS_AT - 1]).is_err());
     }
 
     // a layout byte no writer stores refuses the file

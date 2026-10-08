@@ -13,12 +13,11 @@ else, and the reading order at the bottom says where.
 
 ## A volume on disk
 
-The engine writes six kinds of file and nothing else.
+The engine writes five kinds of file and nothing else.
 
 | name | where | what it is |
 |---|---|---|
-| `NNNNNN.reel` | every root | one segment, zero-padded six digits, monotonic across roots |
-| `NNNNNN.rows` | beside its segment | an open segment's journal of rows, gone at the seal |
+| `NNNNNN.reel` | every root | one segment, zero-padded six digits, monotonic across roots, an open one with its journal of rows past its records |
 | `<id>.keys` | the first root | a key run a merge wrote, twelve-digit id, `<id>.keys.part` until whole |
 | `reel.volumes` | the first root | the manifest naming every root this reel spans |
 | `reel.volume` | every root past the first | the marker saying this root was mounted where the manifest says |

@@ -39,7 +39,7 @@ use crate::sync::{lock, read, try_lock, write};
 
 use flush::{turn_at, Owed, SyncState, Turn};
 pub use flush::{Durability, FlushTurn};
-use journal::Journal;
+use journal::{Journal, Writes};
 use sealer::{
     doom_active, flush_active, park_broken_seal, publish_flush, retire_segment, seal_segment,
     Sealer,
@@ -656,9 +656,10 @@ impl Appender {
         }
         let file = active.handle.file();
         let driver = &self.shared.driver;
-        let flushed = driver
-            .truncate(file, active.end())
-            .and_then(|()| active.journal.sync_pending())
+        // The rows stay where they are for the reopen, so one sync covers them and the records
+        let flushed = active
+            .journal
+            .write_pending()
             .and_then(|()| driver.sync_full(file));
         active.terminal.store(true, Ordering::Release);
         match &flushed {
@@ -1371,10 +1372,11 @@ impl Appender {
         let file = self.shared.driver.open(&resumed.path, false)?;
         let journal = Journal::resume(
             &self.shared.driver,
-            &resumed.path,
-            &resumed.rows,
+            file,
+            resumed.rows_at,
+            resumed.rows_len,
             self.shared.config.segment_bytes.to_bytes(),
-            self.writes_rows_through(),
+            self.writes(),
         )?;
         // A whole-block volume pads each record to a block, so the tail resumes at the next block
         let end = match self.shared.writes_whole_blocks() {
@@ -1400,9 +1402,7 @@ impl Appender {
             terminal: AtomicBool::new(false),
             holds,
         };
-        // What the file holds is already zeroed past the walked end, so the window starts where the file ends
-        let filled = self.shared.driver.length(active.handle.file())?;
-        active.alloc_high.store(filled.max(end), Ordering::Release);
+        // The file runs out to its rows, so the window starts again at the walked end
         self.shared.driver.sync_full(active.handle.file())?;
         active.sync.synced_at.store(end, Ordering::Release);
         Ok(active)
@@ -1492,11 +1492,6 @@ impl Appender {
     fn scrap_attempt(&self, id: SegmentId) -> Result<()> {
         let driver = &self.shared.driver;
         let path = self.shared.segment_path(id);
-        match driver.unlink(&crate::format::journal::journal_path(&path)) {
-            Ok(()) => {}
-            Err(error) if error.is_missing() => {}
-            Err(error) => return Err(error),
-        }
         match driver.unlink(&path) {
             Ok(()) => driver.sync_dir(self.shared.segment_dir(id)),
             Err(error) if error.is_missing() => Ok(()),
@@ -1507,13 +1502,11 @@ impl Appender {
     fn build_segment(&self, id: SegmentId, holds: Arc<SegmentHolds>) -> Result<Active> {
         let path = self.shared.segment_path(id);
         let file = self.shared.driver.open(&path, true)?;
-        let journal = Journal::create(
-            &self.shared.driver,
-            &path,
-            self.shared.config.segment_bytes.to_bytes(),
-            self.writes_rows_through(),
-        )?;
-        // One directory sync makes both new entries durable, the segment's and its journal's
+        // The file reaches its rows from the start, so a length short of them says a seal cut them off
+        let rows_at = self.rows_at();
+        self.shared.driver.truncate(file, rows_at)?;
+        let target = self.shared.config.segment_bytes.to_bytes();
+        let journal = Journal::create(&self.shared.driver, file, rows_at, target, self.writes());
         self.shared.driver.sync_dir(self.shared.segment_dir(id))?;
         // Small records go down keyless, checked under a key of the segment's own
         let layout = RecordLayout::Keyless(CheckKey::random()?);
@@ -1536,7 +1529,11 @@ impl Appender {
             .alloc_high
             .store(self.open_window(&active, 0)?, Ordering::Release);
 
-        let payload = SegmentHeader::new(id).laid_out(layout).pack().to_vec();
+        let payload = SegmentHeader::new(id)
+            .laid_out(layout)
+            .rows_from(rows_at)
+            .pack()
+            .to_vec();
         let header = RecordHeader::segment_header(&payload);
         let span = self.reserved_span(&header);
         active.reserved.store(span, Ordering::Release);
@@ -1546,11 +1543,19 @@ impl Appender {
         Ok(active)
     }
 
-    /// Whether a put writes its journal row before it returns: Linux buffered volumes, where a dead process leaves it in the page cache
-    fn writes_rows_through(&self) -> bool {
-        cfg!(target_os = "linux")
-            && !self.shared.writes_whole_blocks()
-            && !matches!(self.shared.driver.serving(), ServingBackend::Sim)
+    /// How this volume puts journal rows down: written through before a put returns on Linux buffered volumes, where a dead process leaves them in the page cache
+    fn writes(&self) -> Writes {
+        Writes {
+            through: cfg!(target_os = "linux")
+                && !self.shared.writes_whole_blocks()
+                && !matches!(self.shared.driver.serving(), ServingBackend::Sim),
+            whole_blocks: self.shared.writes_whole_blocks(),
+        }
+    }
+
+    /// Where a new segment keeps its journal rows, past any record and the footer a seal writes after them
+    fn rows_at(&self) -> u64 {
+        align_up(2 * self.shared.config.segment_bytes.to_bytes(), ALIGN)
     }
 
     /// Zero the next window only when syncs land close enough together to pay for it

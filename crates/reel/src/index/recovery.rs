@@ -12,7 +12,7 @@ use crate::format::column::{ColumnId, KeyBytes, RecordKey};
 use crate::format::footer::{
     FooterEntry, FooterPartition, FooterTally, SegmentFooter, FIXED_TAIL_LEN,
 };
-use crate::format::journal::{journal_path, read_groups, JournalRow, JOURNAL_SUFFIX};
+use crate::format::journal::{read_groups, JournalRow};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{
@@ -168,14 +168,15 @@ pub fn rebuild_reel(
                 Loaded::Journaled(end) => {
                     consumed.insert(*segment, end.journal_len);
                     walked.push((path.clone(), *len));
-                    // A segment with no journal sealed once, so no appender may write into it again
-                    if let Some(rows) = end.rows {
+                    // A segment cut short of its rows sealed once, so no appender may write into it again
+                    if let Some(rows_at) = end.rows_at {
                         resumable.push(ResumableTail {
                             segment: *segment,
                             path: path.clone(),
                             end: end.next_offset,
                             entries: SegmentFooter::empty(),
-                            rows,
+                            rows_at,
+                            rows_len: end.journal_len,
                         });
                     }
                 }
@@ -294,7 +295,9 @@ pub struct ResumableTail {
     pub path: PathBuf,
     pub end: u64,
     pub entries: SegmentFooter,
-    pub rows: Vec<JournalRow>,
+    /// Where the segment's rows region begins, and the bytes of whole groups in it
+    pub rows_at: u64,
+    pub rows_len: u64,
 }
 
 /// What a journaled tail's read leaves for the rebuild beside its rows
@@ -305,8 +308,8 @@ struct JournaledEnd {
     /// Bytes of whole groups in the journal, where a follower picks up
     journal_len: u64,
 
-    /// The accepted rows for a resuming tail, or nothing once the segment is closed to appenders
-    rows: Option<Vec<JournalRow>>,
+    /// Where an open segment keeps its rows, or nothing once a seal closed it to appenders
+    rows_at: Option<u64>,
 }
 
 /// One segment file read off the medium, before any of it is joined
@@ -457,7 +460,7 @@ fn read_segment(
     file_len: u64,
 ) -> Result<SegmentParts> {
     let file = driver.open(path, false)?;
-    let read = read_parts(driver, file, path, segment, file_len);
+    let read = read_parts(driver, file, segment, file_len);
     driver.close(file)?;
     read
 }
@@ -465,7 +468,6 @@ fn read_segment(
 fn read_parts(
     driver: &IoDriver,
     file: FileId,
-    path: &Path,
     segment: SegmentId,
     file_len: u64,
 ) -> Result<SegmentParts> {
@@ -479,7 +481,7 @@ fn read_parts(
             Ok(SegmentParts::Sealed(footer, ends))
         }
         None => Ok(SegmentParts::Journaled(read_journaled(
-            driver, file, path, file_len,
+            driver, file, file_len,
         )?)),
     }
 }
@@ -507,7 +509,7 @@ fn absorb_segment(
             Ok(Loaded::Journaled(JournaledEnd {
                 next_offset: tail.next_offset,
                 journal_len: tail.journal_len,
-                rows: tail.rows,
+                rows_at: tail.rows_at,
             }))
         }
     }
@@ -1183,48 +1185,51 @@ struct JournaledTail {
     /// Each range tombstone's end, in the footer's order
     ends: Vec<Option<KeyBytes>>,
 
-    /// The accepted rows as the journal holds them, nothing where there is no journal
-    rows: Option<Vec<JournalRow>>,
+    /// Where the rows region begins, nothing once a seal cut it off
+    rows_at: Option<u64>,
 
-    /// Where the last accepted record ends, which is where the tail resumes
+    /// Where the last record any whole group lists ends, which is where the tail resumes
     next_offset: u64,
 
     /// Bytes of whole groups in the journal
     journal_len: u64,
 }
 
-/// Read an unsealed tail through its journal, keeping each group whose records all check out
-fn read_journaled(
-    driver: &IoDriver,
-    file: FileId,
-    path: &Path,
-    file_len: u64,
-) -> Result<JournaledTail> {
+/// Read an unsealed tail through its rows, keeping each group whose records all check out
+fn read_journaled(driver: &IoDriver, file: FileId, file_len: u64) -> Result<JournaledTail> {
     let mut tail = JournaledTail {
         footer: SegmentFooter::empty(),
         ends: Vec::new(),
-        rows: None,
+        rows_at: None,
         next_offset: header_end(driver, file)?,
         journal_len: 0,
     };
-    let Some(bytes) = read_journal(driver, path, 0)? else {
+    let header = read_segment_header(driver, file)?;
+    let layout = header.map_or(RecordLayout::Keyed, |header| header.layout);
+    // A seal cuts the file at its footer, so a file short of its rows sealed once
+    let Some(rows_at) = header
+        .map(|header| header.rows_at)
+        .filter(|rows_at| *rows_at > 0 && file_len >= *rows_at)
+    else {
         return Ok(tail);
     };
+    tail.rows_at = Some(rows_at);
+    let bytes = read_rows(driver, file, rows_at, file_len, 0)?;
     let (groups, valid) = read_groups(&bytes);
     tail.journal_len = valid as u64;
-    let layout =
-        read_segment_header(driver, file)?.map_or(RecordLayout::Keyed, |header| header.layout);
-    let mut reader = SegmentReader::new(driver, file, file_len);
-    let mut rows = Vec::new();
+    let mut reader = SegmentReader::new(driver, file, rows_at);
     let mut ends = Vec::new();
     // A group is one write, so a batch comes back whole or not at all
     for group in groups {
+        // A resumed tail writes past every place a whole group names, so a group turned down here never meets a record that checks out
+        for row in &group {
+            let span = span_of(row.key.width(), row.len);
+            tail.next_offset = tail.next_offset.max(u64::from(row.offset) + span);
+        }
         if !all_landed(&mut reader, layout, &group)? {
             continue;
         }
         for row in group {
-            let span = span_of(row.key.width(), row.len);
-            tail.next_offset = tail.next_offset.max(u64::from(row.offset) + span);
             if row.flags.is_range_tombstone() {
                 ends.push((row.key.column, row.range_end.clone()));
             }
@@ -1235,55 +1240,26 @@ fn read_journaled(
                 row.len,
                 row.flags,
             ));
-            rows.push(row);
         }
     }
     // The footer groups rows by column, and a stable sort keeps each column's ends in journal order
     ends.sort_by_key(|(column, _)| *column);
     tail.ends = ends.into_iter().map(|(_, end)| end).collect();
-    tail.rows = Some(rows);
     Ok(tail)
 }
 
-/// Unlink every journal a footer has taken over, and every journal part a resume left
-pub fn remove_stale_journals(
+/// An open segment's rows region from `from` bytes into it to the end of the file
+pub(crate) fn read_rows(
     driver: &IoDriver,
-    root: &Path,
-    consumed: &HashMap<SegmentId, u64>,
-) -> Result<()> {
-    for entry in driver.list_or_empty(root)? {
-        let is_stale = match entry.name.strip_suffix(JOURNAL_SUFFIX) {
-            Some(number) => number.parse().ok().is_none_or(|number| {
-                consumed
-                    .get(&SegmentId(number))
-                    .is_none_or(|at| *at == SEALED)
-            }),
-            None => entry.name.ends_with(".rows.part"),
-        };
-        if is_stale {
-            driver.unlink(&root.join(&entry.name))?;
-        }
-    }
-    Ok(())
-}
-
-/// A segment's journal from an offset to its end, nothing where it has no journal
-pub(crate) fn read_journal(
-    driver: &IoDriver,
-    segment_path: &Path,
+    file: FileId,
+    rows_at: u64,
+    file_len: u64,
     from: u64,
-) -> Result<Option<Vec<u8>>> {
-    let journal = match driver.open(&journal_path(segment_path), false) {
-        Ok(journal) => journal,
-        Err(error) if error.is_missing() => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let read = driver.length(journal).and_then(|len| match len > from {
-        true => driver.pread(journal, from, len - from),
+) -> Result<Vec<u8>> {
+    match file_len > rows_at + from {
+        true => driver.pread(file, rows_at + from, file_len - rows_at - from),
         false => Ok(Vec::new()),
-    });
-    driver.close(journal)?;
-    read.map(Some)
+    }
 }
 
 /// Where the segment header record ends, which is where an empty tail resumes
@@ -2154,17 +2130,11 @@ mod tests {
             .is_some());
     }
 
-    /// Strip a sealed segment's footer and put back its journal, as a seal that failed partway leaves it
-    fn strip_footer(image: &mut DurableImage, name: &str, journal: Vec<u8>) {
-        let path = Path::new(REEL_DIR).join(name);
-        image.push((journal_path(&path), journal));
+    /// Put a sealed segment back as it stood before its seal, rows and all, as a seal that failed partway leaves it
+    fn strip_footer(image: &mut DurableImage, name: &str, unsealed: Vec<u8>) {
         for (path, bytes) in image.iter_mut() {
             if path.file_name().map(|found| found == name).unwrap_or(false) {
-                let len = bytes.len();
-                let footer_len =
-                    u32::from_le_bytes(bytes[len - 8..len - 4].try_into().expect("trailer"))
-                        as usize;
-                bytes.truncate(len - footer_len);
+                *bytes = unsealed.clone();
             }
         }
     }
@@ -2185,9 +2155,9 @@ mod tests {
             .append_tombstone(key(3), Commit::PerRecord)
             .expect("old delete");
         appender.flush().expect("flush");
-        let journal = sim
-            .durable_bytes(&journal_path(&Path::new(REEL_DIR).join("000001.reel")))
-            .expect("journal");
+        let unsealed = sim
+            .durable_bytes(&Path::new(REEL_DIR).join("000001.reel"))
+            .expect("segment");
         appender.seal().expect("seal one");
         appender
             .append_data(key(1), vec![0x33; 300], 0, Commit::PerRecord)
@@ -2198,7 +2168,7 @@ mod tests {
         appender.seal().expect("seal two");
 
         let mut image = sim.durable_image();
-        strip_footer(&mut image, "000001.reel", journal);
+        strip_footer(&mut image, "000001.reel", unsealed);
         let torn = SimIo::from_image(image);
         let rebuilt = rebuild(&torn);
 
@@ -2418,18 +2388,22 @@ mod tests {
             .append_data(key(2), vec![0x22; 600], 0, Commit::PerRecord)
             .expect("put");
         appender.flush().expect("flush");
-        let journal = sim
-            .durable_bytes(&journal_path(&Path::new(REEL_DIR).join("000001.reel")))
-            .expect("journal");
+        let unsealed = sim
+            .durable_bytes(&Path::new(REEL_DIR).join("000001.reel"))
+            .expect("segment");
         appender.seal().expect("seal");
         let mut image = sim.durable_image();
         let cut = footer_len_for(2);
 
+        // Part of the footer landed and the cut that takes the rows never did
         truncate_segment(&mut image, "000001.reel", cut);
-        image.push((
-            journal_path(&Path::new(REEL_DIR).join("000001.reel")),
-            journal,
-        ));
+        for (path, bytes) in image.iter_mut() {
+            if path.ends_with("000001.reel") {
+                let mut torn = unsealed.clone();
+                torn[..bytes.len()].copy_from_slice(bytes);
+                *bytes = torn;
+            }
+        }
         let torn = SimIo::from_image(image);
         let rebuilt = rebuild(&torn);
 

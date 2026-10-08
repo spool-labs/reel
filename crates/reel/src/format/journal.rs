@@ -1,18 +1,14 @@
 //! The journal format: one checksummed group of rows per write, read back until the first torn group
-
-use std::path::{Path, PathBuf};
+//!
+//! The rows sit in their segment's own file, from the offset its header gives, so one
+//! sync makes a record and its row durable together.
 
 use crate::format::column::{ColumnId, KeyBytes, RecordKey};
 use crate::format::lsn::Lsn;
-use crate::format::record::{checksum, read_u16_le, read_u32_le, read_u64_le, Flags};
-
-/// What a journal's file name ends in, which no segment scan takes for a segment
-pub const JOURNAL_SUFFIX: &str = ".rows";
-
-/// Where a segment's journal sits: beside it, under its number
-pub fn journal_path(segment_path: &Path) -> PathBuf {
-    segment_path.with_extension(&JOURNAL_SUFFIX[1..])
-}
+use crate::format::record::{
+    checksum, read_u16_le, read_u32_le, read_u64_le, Flags, RecordHeader, BLOCK, HEADER_LEN,
+};
+use crate::format::segment_header::SegmentHeader;
 
 /// A group opens with its row count and the byte length of its rows
 const GROUP_HEAD: usize = 4 + 4;
@@ -73,16 +69,37 @@ fn push_row(row: &JournalRow, out: &mut Vec<u8>) {
     }
 }
 
+/// A whole segment file's rows region and where it begins, nothing where the file stops short of it
+pub fn rows_region(segment: &[u8]) -> Option<(u64, &[u8])> {
+    let head = RecordHeader::unpack(segment.get(..HEADER_LEN)?).ok()?;
+    let payload = segment.get(HEADER_LEN..HEADER_LEN + head.length as usize)?;
+    let rows_at = SegmentHeader::unpack(payload).ok()?.rows_at;
+    let rows = segment.get(rows_at as usize..).filter(|_| rows_at > 0)?;
+    Some((rows_at, rows))
+}
+
 /// Every whole group at the front of a journal, and the bytes they take
 pub fn read_groups(bytes: &[u8]) -> (Vec<Vec<JournalRow>>, usize) {
     let mut groups = Vec::new();
     let mut at = 0usize;
     // Nothing past a torn group landed whole, so the read stops there
-    while let Some((rows, next)) = read_group(bytes, at) {
-        groups.push(rows);
-        at = next;
+    loop {
+        if let Some((rows, next)) = read_group(bytes, at) {
+            groups.push(rows);
+            at = next;
+            continue;
+        }
+        // A whole-block volume pads a write out to its block with zeros, and the next group opens on the boundary
+        let boundary = (at as u64).next_multiple_of(BLOCK) as usize;
+        let is_padding = boundary > at
+            && bytes
+                .get(at..boundary)
+                .is_some_and(|pad| pad.iter().all(|byte| *byte == 0));
+        match is_padding && read_group(bytes, boundary).is_some() {
+            true => at = boundary,
+            false => return (groups, at),
+        }
     }
-    (groups, at)
 }
 
 fn read_group(bytes: &[u8], at: usize) -> Option<(Vec<JournalRow>, usize)> {
@@ -194,5 +211,19 @@ mod tests {
 
         let (groups, len) = read_groups(&[0u8; 64]);
         assert_eq!((groups.len(), len), (0, 0));
+    }
+
+    // zeros a whole-block write padded with are stepped over to the group on the next boundary
+    #[test]
+    fn padding_to_a_block_is_stepped_over() {
+        let mut bytes = Vec::new();
+        push_group(&[row(1, 10, Flags::DATA)], &mut bytes);
+        bytes.resize(BLOCK as usize, 0);
+        push_group(&[row(2, 11, Flags::DATA)], &mut bytes);
+        let whole = bytes.len();
+        bytes.resize(2 * BLOCK as usize, 0);
+
+        let (groups, len) = read_groups(&bytes);
+        assert_eq!((groups.len(), len), (2, whole));
     }
 }

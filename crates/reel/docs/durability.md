@@ -18,8 +18,9 @@ takes the process and leaves the page cache standing; a power cut takes both.
 | any of the above, for a multi-record batch | a batch is confirmed or it never happened | a batch is confirmed or it never happened |
 
 A small record is keyless, so an open segment's journal is what says which key each
-record holds. On Linux with buffered writes a put writes its record and its row
-before it returns, so a dead process leaves both in the page cache. Elsewhere rows wait in memory for the next pace or flush, and a record whose
+record holds. The journal is a region of the segment's own file, so one sync makes a
+record and its row durable together. On Linux with buffered writes a put writes its
+record and its row before it returns, so a dead process leaves both in the page cache. Elsewhere rows wait in memory for the next pace or flush, and a record whose
 row never reached the journal is not found again.
 
 Four things hold at every setting.
@@ -36,7 +37,7 @@ Four things hold at every setting.
 - **A torn record in an open segment costs its write's group**, one record or one
   batch, and not the records behind it.
 - **A footer that rots after its seal costs its segment.** The records are keyless
-  and the journal went with the seal, so nothing lists them. A volume with peers
+  and the seal cut the journal off, so nothing lists them. A volume with peers
   repairs them from a peer.
 
 What the batch row does not say is as fixed as what it does. The group promises
@@ -84,7 +85,7 @@ a per-tail sealer thread, `flush()` drains that thread before syncing so a
 durability ask still covers everything rolled before it, and an explicit
 `Appender::seal()` stays synchronous because a caller reaching for it is
 asking for a sealed segment. A crash can land while a footer is queued but
-unwritten. The segment's journal is unlinked only after its footer is down, so
+unwritten. The seal cuts the journal off only after its footer is synced, so
 recovery reads it back through the journal, and the crash suite covers it.
 
 So under the default, what a power cut can take is the active segment of each tail,
@@ -169,8 +170,8 @@ footer length and the magic, the footer body is checksum verified, and its rows 
 decoded. The segment body is read only for the one thing a footer cannot carry,
 which is the exclusive end a range tombstone holds in its payload. A footer whose
 magic is wrong, whose length is out of range, or whose checksum fails is not a
-footer. A segment sealed only part way through still has its journal and reads back
-through it.
+footer. A segment sealed only part way through still runs out to its journal and
+reads back through it.
 
 **The rebuild sweeps each sealed footer.** It takes from each footer a key span per
 column, the range tombstones with their footprint, the tombstones the segment
@@ -183,9 +184,10 @@ Sealed keys are answered from the spot index afterwards.
 **The active tail is read through its journal.** The journal's whole groups are
 read in order, and a group is kept only when every record it lists sits at its
 row's offset and checks out: a keyless record by its keyed check, a larger one by
-its header and checksum. A torn group ends the journal, a group listing a record that
-did not land is dropped whole, and the tail resumes past the last record kept, its
-accepted rows written again as a fresh journal. A segment with no footer and no
+its header and checksum. A torn group ends the journal, and a group listing a record
+that did not land is dropped whole. The tail resumes after the last whole group,
+writing its records past every place any whole group names, so a dropped group never
+meets a record that checks out. A segment with no footer that stops short of its
 journal is one whose footer went bad after its seal, and no tail resumes into it.
 
 **Newest-wins is folded in as a tail's records arrive.** The tails' rows are fed
@@ -280,10 +282,11 @@ segment, and it is written there once, in its final position. A WAL in front of
 that would write every byte twice, and it would sync twice, to protect a window
 between the log and the store that does not exist.
 
-The journal is the one second file, and it holds rows, never values: what each
-record's key, version and place are, until the footer says the same at the seal.
-It is what lets a small record drop its key, and a batch's rows going into it as
-one group is what makes the batch atomic across a crash. It goes away at the seal.
+The journal holds rows, never values: what each record's key, version and place
+are, until the footer says the same at the seal. It sits in the segment's own file,
+past the records and the footer, so it costs no second file and no second sync. It is
+what lets a small record drop its key, and a batch's rows going into it as one group
+is what makes the batch atomic across a crash. The seal cuts it off.
 
 ## What is not promised
 

@@ -17,11 +17,11 @@ use crate::format::lsn::Lsn;
 use crate::index::entry::RangeCover;
 use crate::index::map::ReelIndex;
 use crate::index::recovery::{
-    footer_records, journal_records, read_footer, read_journal, WalkedRecord, SEALED,
+    footer_records, journal_records, read_footer, read_rows, WalkedRecord, SEALED,
 };
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
 use crate::io::op::FileId;
-use crate::reel::segment::IoDriver;
+use crate::reel::segment::{read_segment_header, IoDriver};
 use crate::reel::{segment_file_name, segment_number};
 
 /// Sequence numbers a range delete is kept for once the pass has moved past it
@@ -162,7 +162,7 @@ pub fn catch_up(
         }
         let path = reel_dir.join(segment_file_name(*segment));
         let file = driver.open(&path, false)?;
-        let followed = follow_segment(driver, file, &path, *segment, *file_len, from);
+        let followed = follow_segment(driver, file, *segment, *file_len, from);
         driver.close(file)?;
         let (records, next, footer) = followed?;
         cursor.positions.insert(*segment, next);
@@ -206,7 +206,6 @@ pub fn catch_up(
 fn follow_segment(
     driver: &IoDriver,
     file: FileId,
-    path: &Path,
     segment: SegmentId,
     file_len: u64,
     from: u64,
@@ -216,9 +215,13 @@ fn follow_segment(
         let records = footer_records(driver, file, segment, &footer)?;
         return Ok((records, SEALED, Some(footer)));
     }
-    let Some(bytes) = read_journal(driver, path, from)? else {
+    let Some(rows_at) = read_segment_header(driver, file)?
+        .map(|header| header.rows_at)
+        .filter(|rows_at| *rows_at > 0 && file_len >= *rows_at)
+    else {
         return Ok((Vec::new(), from, None));
     };
+    let bytes = read_rows(driver, file, rows_at, file_len, from)?;
     let (groups, valid) = read_groups(&bytes);
     Ok((journal_records(segment, groups), from + valid as u64, None))
 }

@@ -12,7 +12,7 @@ mod harness;
 use std::collections::{BTreeMap, BTreeSet};
 
 use reel::format::column::RecordKey;
-use reel::format::journal::{journal_path, read_groups, JOURNAL_SUFFIX};
+use reel::format::journal::{read_groups, rows_region};
 use reel::format::record::KEYLESS_PREFIX;
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::{DurableImage, SimIo};
@@ -725,26 +725,20 @@ fn address_key(address: u8) -> RecordKey {
 }
 
 /// Cut the last batch of the image at a point inside it, as a stopped write would
+///
+/// Only the records tear: the rows sit further on in the same file and stay whole.
 fn cut_the_last_batch(image: &mut DurableImage, tear: Tear) {
-    let journals: Vec<(std::path::PathBuf, Vec<u8>)> = image
-        .iter()
-        .filter(|(path, _)| path.to_string_lossy().ends_with(JOURNAL_SUFFIX))
-        .cloned()
-        .collect();
     for (path, bytes) in image.iter_mut() {
         if !path.to_string_lossy().ends_with(SEGMENT_SUFFIX) {
             continue;
         }
-        let Some((_, journal)) = journals
-            .iter()
-            .find(|(journal, _)| *journal == journal_path(path))
-        else {
+        let Some((rows_at, rows)) = rows_region(bytes) else {
             continue;
         };
-        let Some(at) = tear_offset(journal, tear) else {
+        let Some(at) = tear_offset(rows, tear) else {
             continue;
         };
-        bytes[at as usize..].fill(0);
+        bytes[at as usize..rows_at as usize].fill(0);
         return;
     }
     panic!("no segment of the image holds a batch");

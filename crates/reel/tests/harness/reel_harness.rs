@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use reel::format::journal::rows_region;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::{ColumnSet, ReelConfig, ReelStore, SEGMENT_SUFFIX};
@@ -128,19 +129,30 @@ pub fn flip_largest_segment(image: &mut DurableImage) -> bool {
     let mut chosen: Option<usize> = None;
     let mut largest = 0usize;
     for (index, (path, bytes)) in image.iter().enumerate() {
-        if is_segment(path) && bytes.len() > largest {
-            largest = bytes.len();
+        if is_segment(path) && content_len(bytes) > largest {
+            largest = content_len(bytes);
             chosen = Some(index);
         }
     }
     match chosen {
         Some(index) => {
             let bytes = &mut image[index].1;
-            let middle = bytes.len() / 2;
+            let middle = content_len(bytes) / 2;
             bytes[middle] ^= 0xff;
             true
         }
         None => false,
+    }
+}
+
+/// Bytes a segment's records take: up to the last one written below an open segment's rows, the whole of a sealed one
+fn content_len(bytes: &[u8]) -> usize {
+    match rows_region(bytes) {
+        Some((rows_at, _)) => bytes[..rows_at as usize]
+            .iter()
+            .rposition(|byte| *byte != 0)
+            .map_or(0, |last| last + 1),
+        None => bytes.len(),
     }
 }
 

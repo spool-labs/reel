@@ -257,6 +257,7 @@ fn segment_header_roundtrips() {
                     true => RecordLayout::Keyless(CheckKey::from_bytes(rng.gen())),
                     false => RecordLayout::Keyed,
                 },
+                rows_at: rng.gen(),
             };
 
             let parsed = SegmentHeader::unpack(&header.pack()).expect("a packed header parses");

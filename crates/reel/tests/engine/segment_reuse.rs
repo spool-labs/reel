@@ -12,6 +12,7 @@ use tempfile::TempDir;
 
 use reel::config::{ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, RecordKey};
+use reel::format::journal::rows_region;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::units::ByteCount;
@@ -67,7 +68,7 @@ fn bytes_in(root: &Path) -> u64 {
         .sum()
 }
 
-/// Finds the end of a file's written bytes at its first hole, since a mapped tail spans the whole segment
+/// Finds the end of a file's written bytes at its first hole, or its end where the filesystem reports none
 fn written_end(path: &Path) -> u64 {
     use std::os::unix::io::AsRawFd;
     let file = std::fs::File::open(path).expect("open segment");
@@ -98,13 +99,16 @@ fn a_new_segment_is_written_through() {
     let segments = segments_in(home.path());
     assert_eq!(segments.len(), 1, "the tail drew more than one segment");
     let bytes = std::fs::read(&segments[0]).expect("read segment");
-    assert_eq!(
-        written_end(&segments[0]),
-        WINDOW,
+    assert!(
+        written_end(&segments[0]) >= WINDOW,
         "the window was not written through at creation"
     );
+    // The file runs out to its rows, and everything between the records and them is zeros
+    let (rows_at, _) = rows_region(&bytes).expect("an open segment runs out to its rows");
     assert!(
-        bytes[WINDOW as usize / 2..].iter().all(|byte| *byte == 0),
+        bytes[WINDOW as usize / 2..rows_at as usize]
+            .iter()
+            .all(|byte| *byte == 0),
         "the fill past the records is not zeros"
     );
 
@@ -253,7 +257,7 @@ fn a_full_segment_seals_at_its_footer() {
     }
 }
 
-// a crash leaves only the records: the reservation never lives in the length
+// a crash leaves only the records and their rows: the reservation between them stays zeros
 #[test]
 fn a_crash_leaves_only_the_records() {
     let config = ReelConfig {
@@ -274,7 +278,13 @@ fn a_crash_leaves_only_the_records() {
     let widest = image
         .iter()
         .filter(|(path, _)| is_segment(path))
-        .map(|(_, bytes)| bytes.len() as u64)
+        .map(|(_, bytes)| {
+            let (rows_at, _) = rows_region(bytes).expect("an open segment runs out to its rows");
+            bytes[..rows_at as usize]
+                .iter()
+                .rposition(|byte| *byte != 0)
+                .map_or(0, |last| last as u64 + 1)
+        })
         .max()
         .expect("the crash image holds the tail");
     assert!(

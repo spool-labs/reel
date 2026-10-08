@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 
 use crate::config::RepairPath;
-use crate::error::Result;
+use crate::error::{ReelError, Result};
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::SegmentId;
 use crate::io::op::{Advice, Part, WriteBuf};
@@ -25,11 +25,6 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
     if active.terminal.load(Ordering::Acquire) {
         return Ok(());
     }
-    // Cut the file at the records, handing preallocated blocks back before the footer goes down
-    if active.alloc_high.load(Ordering::Acquire) > end {
-        shared.driver.truncate(active.handle.file(), end)?;
-    }
-
     // Writeback orders nothing, so under the one-sync seal a crash can leave a durable
     // footer naming bytes that never landed. With peers that resolves to a read-time
     // miss and a repair; with none the second flush is the whole guarantee.
@@ -56,7 +51,14 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
             .map(|piece| WriteBuf::Part(Part::new(piece, 0, piece.len())))
             .collect();
         pieces.push(WriteBuf::owned(tail));
-        let wrote = shared.driver.writev_all(active.handle.file(), end, pieces);
+        // The rows stay in place until the footer that lists them is durable
+        let rows_at = active.journal.rows_at();
+        let wrote = match sealed_end < rows_at {
+            true => shared.driver.writev_all(active.handle.file(), end, pieces),
+            false => Err(ReelError::Corruption(format!(
+                "a footer ending at {sealed_end} reaches the rows at {rows_at}"
+            ))),
+        };
         footer.put_rows(
             rows.into_iter()
                 .map(|piece| Arc::try_unwrap(piece).unwrap_or_else(|piece| Vec::clone(&piece)))
@@ -64,9 +66,10 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
         );
         wrote?;
         shared.driver.sync_full(active.handle.file())?;
-        // An aligned write can leave zeros after the footer. The file ends at
-        // the footer, so every trailer reader finds it at the end.
-        shared.driver.truncate(active.handle.file(), sealed_end)
+        // The cut takes the rows and the zeros past the records, so every trailer reader
+        // finds the footer at the end. A crash before the cut is durable leaves the rows to seal again.
+        shared.driver.truncate(active.handle.file(), sealed_end)?;
+        shared.driver.sync_full(active.handle.file())
     })();
     if let Err(error) = written {
         // The footer is the one copy of what this segment holds, so a failed seal puts
@@ -343,8 +346,8 @@ pub(super) fn flush_active(
         )
     };
 
-    // Rows first, so whatever this flush makes durable a reopen finds without a footer
-    journal.sync_pending()?;
+    // The rows go into the segment file first, so one sync covers them and the records
+    journal.write_pending()?;
     shared.driver.sync_data(handle.file())?;
     Ok(Some(covered))
 }

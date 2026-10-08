@@ -458,6 +458,11 @@ impl Sealed {
     /// The front cursor, when it stands on this key
     fn front_on(&self, key: &[u8]) -> Option<usize> {
         let at = *self.tree.first()?;
+        let head = &self.heads[at];
+        // A lead that differs settles it without reading the cursor's key
+        if head.is_spent || head.lead != head_lead(key) {
+            return None;
+        }
         (self.key_of(at) == Some(key)).then_some(at)
     }
 

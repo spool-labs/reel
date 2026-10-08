@@ -56,16 +56,16 @@ impl Journal {
         let path = journal_path(segment_path);
         // A drawn number is new and an open unlinks stale journals, so the file starts empty
         let id = driver.open(&path, true)?;
-        let mut journal = Journal::over(driver, path, Some(id), 0, through.then_some(id));
-        journal.span = span;
-        Ok(journal)
+        Ok(Journal::over(driver, path, Some(id), 0, span, through))
     }
 
-    /// Take a journal up again with only the rows a reopen accepted
+    /// Take a journal up again with only the rows a reopen accepted, written through as `create` says
     pub(super) fn resume(
         driver: &Arc<IoDriver>,
         segment_path: &Path,
         rows: &[JournalRow],
+        span: u64,
+        through: bool,
     ) -> Result<Journal> {
         let path = journal_path(segment_path);
         let fresh = path.with_extension("rows.part");
@@ -85,12 +85,19 @@ impl Journal {
         if let Some(dir) = path.parent() {
             driver.sync_dir(dir)?;
         }
-        Ok(Journal::over(driver, path, Some(id), written, None))
+        Ok(Journal::over(
+            driver,
+            path,
+            Some(id),
+            written,
+            span,
+            through,
+        ))
     }
 
     /// A journal with no file, for a tail that holds no segment yet
     pub(super) fn none(driver: &Arc<IoDriver>) -> Journal {
-        Journal::over(driver, PathBuf::new(), None, 0, None)
+        Journal::over(driver, PathBuf::new(), None, 0, 0, false)
     }
 
     fn over(
@@ -98,7 +105,8 @@ impl Journal {
         path: PathBuf,
         id: Option<FileId>,
         written: u64,
-        through: Option<FileId>,
+        span: u64,
+        through: bool,
     ) -> Journal {
         Journal {
             driver: Arc::clone(driver),
@@ -106,9 +114,9 @@ impl Journal {
             pending: Mutex::new(Vec::new()),
             file: Mutex::new(JournalFile { id, written }),
             pushed: AtomicU64::new(written),
-            through,
-            filled: AtomicU64::new(0),
-            span: 0,
+            through: id.filter(|_| through),
+            filled: AtomicU64::new(written),
+            span,
         }
     }
 

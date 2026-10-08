@@ -1369,7 +1369,13 @@ impl Appender {
     fn resume_segment(&self, resumed: ResumableTail) -> Result<Active> {
         let holds = self.shared.adopt_segment(resumed.segment);
         let file = self.shared.driver.open(&resumed.path, false)?;
-        let journal = Journal::resume(&self.shared.driver, &resumed.path, &resumed.rows)?;
+        let journal = Journal::resume(
+            &self.shared.driver,
+            &resumed.path,
+            &resumed.rows,
+            self.shared.config.segment_bytes.to_bytes(),
+            self.writes_rows_through(),
+        )?;
         // A whole-block volume pads each record to a block, so the tail resumes at the next block
         let end = match self.shared.writes_whole_blocks() {
             true => align_up(resumed.end + HEADER_LEN as u64, ALIGN),

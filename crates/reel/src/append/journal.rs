@@ -148,14 +148,22 @@ impl Journal {
                 .fetch_add((pending.len() - before) as u64, Ordering::AcqRel);
             return Ok(());
         };
-        // Groups go into the file in push order under the lock, so a crash cuts only the last
-        let mut group = Vec::new();
-        push_group(rows, &mut group);
+        // Groups go into the file in push order under the lock, so a crash cuts only the last.
+        // Nothing queues here when rows go through, so the buffer frames each group and comes back.
+        pending.clear();
+        push_group(rows, &mut pending);
         let at = self.pushed.load(Ordering::Acquire);
-        let end = at + group.len() as u64;
+        let end = at + pending.len() as u64;
         self.fill_to(file, end)?;
-        self.driver
-            .writev_all(file, self.rows_at + at, vec![WriteBuf::owned(group)])?;
+        let mut bufs = super::take_bufs(1);
+        bufs.push(WriteBuf::owned(std::mem::take(&mut *pending)));
+        let (_, mut bufs) = self.driver.writev_reusing(file, self.rows_at + at, bufs)?;
+        // Empty it on the way back, or the next flush writes this group again over the first
+        if let Some(WriteBuf::Owned(mut group)) = bufs.pop() {
+            group.clear();
+            *pending = group;
+        }
+        super::recycle_bufs(bufs);
         self.pushed.store(end, Ordering::Release);
         Ok(())
     }

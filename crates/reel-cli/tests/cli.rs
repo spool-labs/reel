@@ -342,7 +342,15 @@ fn verify_catches_a_flipped_byte() {
     let dir = tempfile::tempdir().expect("tempdir");
     let volume = volume(&dir);
     let target = segments(volume).into_iter().next().expect("a segment file");
-    let len = std::fs::metadata(&target).expect("stat").len();
+    // An open segment runs out to its rows past a stretch of zeros, so the flip lands among its records
+    let bytes = std::fs::read(&target).expect("read");
+    let len = match reel::format::journal::rows_region(&bytes) {
+        Some((rows_at, _)) => bytes[..rows_at as usize]
+            .iter()
+            .rposition(|byte| *byte != 0)
+            .map_or(0, |last| last as u64 + 1),
+        None => bytes.len() as u64,
+    };
     flip(&target, len * 3 / 5);
 
     let verify = run(volume, &["verify"]);

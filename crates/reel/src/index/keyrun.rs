@@ -21,7 +21,7 @@ use crate::reel::segment::IoDriver;
 pub const ROW_LEN: usize = 4 + 4;
 
 /// A block holds this many rows, and each block's first key stands as its fence
-const RUN_BLOCK_ROWS: u32 = 64;
+const RUN_BLOCK_ROWS: u32 = 8;
 
 /// The writer gathers this many bytes before each write, so rows go down in large writes
 const WRITE_BYTES: usize = 1 << 20;

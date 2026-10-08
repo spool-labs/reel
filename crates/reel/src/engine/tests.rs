@@ -4376,6 +4376,36 @@ fn a_closed_tail_holds_little_more_than_its_writes() {
     }
 }
 
+// an overwritten key reads its one live slot in one read, and compaction knows the old record is dead with no read
+#[test]
+fn an_overwritten_key_reads_its_live_slot_in_one_read() {
+    let (store, backend, _dir) = posix_store(config(1, SyncPolicy::Never));
+    let key = record(7, 1);
+    store.put(&key, &[0x11; 100]).expect("put");
+    let old = store.index.get(&key).expect("get").expect("entry").loc;
+    store.reel.tails()[0].seal().expect("seal");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+    store.put(&key, &[0x22; 100]).expect("overwrite");
+    let new = store.index.get(&key).expect("get").expect("entry").loc;
+    store.reel.tails()[0].seal().expect("seal");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+    assert_eq!(store.index.spot_held(), 2, "the old version's slot is gone");
+    store.get(&key).expect("get").expect("found");
+
+    let (ops, blocks) = (backend.ops(), store.filter_probes().blocks);
+    let found = store.get(&key).expect("get");
+    assert_eq!(found, Some(Value::new(vec![0x22; 100])));
+    let none = crate::format::lsn::Lsn::NONE;
+    assert!(!store.index.is_live_at(&key, old, none).expect("old"));
+    assert!(store.index.is_live_at(&key, new, none).expect("new"));
+    assert_eq!(
+        backend.ops() - ops,
+        1,
+        "the get and the liveness checks took more than one read"
+    );
+    assert_eq!(store.filter_probes().blocks, blocks, "a footer search ran");
+}
+
 // a read-only open serves reads but rejects every write
 #[test]
 fn read_only_rejects_writes() {

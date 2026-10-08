@@ -671,7 +671,21 @@ impl ReelIndex {
         if self.surely_at(key, loc, lsn) {
             return Ok(true);
         }
+        if self.surely_elsewhere(key, loc) {
+            return Ok(false);
+        }
         Ok(self.get(key)?.is_some_and(|entry| entry.loc == loc))
+    }
+
+    /// Whether the index surely points a key somewhere other than `loc` with no read, where false is only unsure
+    fn surely_elsewhere(&self, key: &RecordKey, loc: Loc) -> bool {
+        let Some(at) = self.slot(key.column) else {
+            return false;
+        };
+        match self.mapped(at, key) {
+            Some(answer) => answer.is_none_or(|entry| entry.loc != loc),
+            None => self.spot_serves() && self.spot[at].live_elsewhere(key.as_slice(), loc),
+        }
     }
 
     /// Whether the index surely points a key at the record at `loc` with no read, where false is only unsure

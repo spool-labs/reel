@@ -31,6 +31,15 @@ const SHARDS: usize = 256;
 /// A batch takes a shard's lock for this many keys at a time, so a write behind it waits a short while
 const LOCK_CHUNK: usize = 512;
 
+/// The one slot among a key's candidates that no newer write displaced, when there is exactly one
+fn sole_live(ordered: &[(Option<Lsn>, Slot)]) -> Option<Slot> {
+    let mut live = ordered.iter().filter(|(_, slot)| !slot.is_displaced());
+    match (live.next(), live.next()) {
+        (Some((_, slot)), None) => Some(*slot),
+        (Some(_), Some(_)) | (None, _) => None,
+    }
+}
+
 /// Put a slot in a held shard unless one already points at the same record
 fn put_in(table: &mut Writing<'_>, hash: u64, loc: Loc) -> bool {
     let slot = Slot::new(hash, loc);
@@ -1381,6 +1390,17 @@ impl SpotColumn {
         }
     }
 
+    /// Whether a key's one live slot points somewhere other than this record, which makes the record an older version
+    pub fn live_elsewhere(&self, key: &[u8], loc: Loc) -> bool {
+        let hash = hash_of(key);
+        let seen = self.shards[shard_of(hash)].read().matches(hash);
+        let mut live = seen.iter().filter(|place| !place.slot.is_displaced());
+        match (live.next(), live.next()) {
+            (Some(place), None) => !place.slot.at(loc),
+            (Some(_), Some(_)) | (None, _) => false,
+        }
+    }
+
     /// Where a key's one live record sits, nothing for a grave or a second live slot
     pub fn only_live(&self, key: &[u8]) -> Option<(SegmentId, u32)> {
         let hash = hash_of(key);
@@ -1635,18 +1655,14 @@ impl SpotColumn {
     /// The key's one live candidate, which a single read can answer for, leaving displaced ones to the full lookup
     pub fn sole(&self, key: &RecordKey) -> Option<Candidate> {
         let pick = self.pick(key)?;
-        let alone = pick.ordered.len() == 1;
-        let mut live = pick.ordered.iter().filter(|(_, slot)| !slot.is_displaced());
-        match (live.next(), live.next()) {
-            (Some((_, slot)), None) => Some(Candidate {
-                segment: slot.segment(),
-                offset: slot.offset,
-                bound: slot.bound(),
-                alone: alone && !slot.is_grave(),
-                slot: *slot,
-            }),
-            (Some(_), Some(_)) | (None, _) => None,
-        }
+        let slot = sole_live(&pick.ordered)?;
+        Some(Candidate {
+            segment: slot.segment(),
+            offset: slot.offset,
+            bound: slot.bound(),
+            alone: !slot.is_grave(),
+            slot,
+        })
     }
 
     /// Whether a slot for the key's bits sits in a segment holding anything newer than `lsn`, with no header read
@@ -1721,8 +1737,20 @@ impl SpotColumn {
 
     /// The next candidate to read, past any whose segment's ceiling rules it out
     pub fn next(&self, pick: &mut Pick) -> Option<Candidate> {
-        // A key's only live slot holding data is its newest sealed version, whatever its sequence number
-        let alone = pick.takes_newest && pick.ordered.len() == 1;
+        // A key's only live slot holding data is its newest sealed version, and every displaced slot beside it is older
+        if pick.takes_newest {
+            if let Some(slot) = sole_live(&pick.ordered).filter(|slot| !slot.is_grave()) {
+                let first = pick.next == 0;
+                pick.next = pick.ordered.len();
+                return first.then(|| Candidate {
+                    segment: slot.segment(),
+                    offset: slot.offset,
+                    bound: slot.bound(),
+                    alone: true,
+                    slot,
+                });
+            }
+        }
         while let Some((ceiling, slot)) = pick.ordered.get(pick.next).copied() {
             pick.next += 1;
             if let (Some((head, _)), Some(ceiling)) = (&pick.best, ceiling) {
@@ -1734,7 +1762,7 @@ impl SpotColumn {
                 segment: slot.segment(),
                 offset: slot.offset,
                 bound: slot.bound(),
-                alone: alone && !slot.is_displaced() && !slot.is_grave(),
+                alone: false,
                 slot,
             });
         }

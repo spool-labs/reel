@@ -1896,6 +1896,14 @@ impl Reel {
         self.route().append_batch_wait(records).await
     }
 
+    /// Append a batch and sync the one tail it went to before returning
+    pub fn write_batch_durable(&self, records: Vec<BatchRecord>) -> Result<Vec<Committed>> {
+        let tail = self.route();
+        let committed = tail.append_batch(records)?;
+        tail.flush()?;
+        Ok(committed)
+    }
+
     /// The least loaded foreground tail, where a write or a compaction pass lands
     pub fn least_loaded(&self) -> usize {
         let mut chosen = 0;

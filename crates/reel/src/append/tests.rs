@@ -25,6 +25,9 @@ use crate::io::sim_backend::SimIo;
 use crate::reel::segment::{FdCache, IoDriver};
 use crate::sync::tension::block_on;
 
+/// A sync on every write, for tests that need each one durable
+const EVERY_WRITE: SyncPolicy = SyncPolicy::Bytes(ByteCount::from_bytes(0));
+
 const REEL_DIR: &str = "/bulk";
 const RECORDS: ColumnId = ColumnId(1);
 const KEY_WIDTH: usize = 34;
@@ -175,7 +178,7 @@ fn entry_len(entries: &[SegmentEntry], name: &str) -> u64 {
 // opening a tail writes the segment header as record zero and nothing else
 #[test]
 fn open_writes_segment_header() {
-    let (shared, _sim) = harness(config(SyncPolicy::EveryPut), FaultPlan::new(1));
+    let (shared, _sim) = harness(config(EVERY_WRITE), FaultPlan::new(1));
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
 
     assert_eq!(appender.tail().active_segment(), SegmentId(1));
@@ -194,7 +197,7 @@ fn open_writes_segment_header() {
 // a whole-block volume closes the header drain with zeros to the boundary
 #[test]
 fn whole_block_open_fills_to_boundary() {
-    let mut settings = config(SyncPolicy::EveryPut);
+    let mut settings = config(EVERY_WRITE);
     settings.io_backend = IoBackend::UringDirect;
     let (shared, _sim) = harness(settings, FaultPlan::new(1));
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
@@ -264,7 +267,7 @@ fn every_whole_block_drain_is_aligned() {
 // a sync leaves the write head exactly where the records left it
 #[test]
 fn a_sync_adds_no_bytes() {
-    let (shared, sim) = harness(config(SyncPolicy::EveryPut), FaultPlan::new(1));
+    let (shared, sim) = harness(config(EVERY_WRITE), FaultPlan::new(1));
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
 
     appender
@@ -329,7 +332,7 @@ fn nothing_owed_settles_at_once() {
 // the wait hands back the turn rather than taking the device on its own thread
 #[test]
 fn an_owed_sync_hands_back_the_turn() {
-    let (shared, sim) = harness(config(SyncPolicy::EveryPut), FaultPlan::new(1));
+    let (shared, sim) = harness(config(EVERY_WRITE), FaultPlan::new(1));
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
 
     appender
@@ -360,7 +363,7 @@ fn an_owed_sync_hands_back_the_turn() {
 // a writer waiting on another writer's flush holds no turn and no thread
 #[test]
 fn a_second_writer_waits_on_the_first() {
-    let (shared, sim) = harness(config(SyncPolicy::EveryPut), FaultPlan::new(1));
+    let (shared, sim) = harness(config(EVERY_WRITE), FaultPlan::new(1));
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
 
     appender
@@ -399,7 +402,7 @@ fn a_second_writer_waits_on_the_first() {
 // a turn nobody takes goes back, so the writer behind it is not left waiting
 #[test]
 fn a_dropped_turn_frees_the_device() {
-    let (shared, _sim) = harness(config(SyncPolicy::EveryPut), FaultPlan::new(1));
+    let (shared, _sim) = harness(config(EVERY_WRITE), FaultPlan::new(1));
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
 
     appender
@@ -419,7 +422,7 @@ fn a_dropped_turn_frees_the_device() {
 // a turn the async door draws is run by the sealer and answers the caller
 #[test]
 fn a_forwarded_turn_settles_the_segment() {
-    let (shared, sim) = harness(config(SyncPolicy::EveryPut), FaultPlan::new(1));
+    let (shared, sim) = harness(config(EVERY_WRITE), FaultPlan::new(1));
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
 
     appender
@@ -440,7 +443,7 @@ fn a_forwarded_turn_settles_the_segment() {
 // one forwarded flush answers the writer that drew it and the one behind it
 #[test]
 fn a_forwarded_flush_answers_both_writers() {
-    let (shared, sim) = harness(config(SyncPolicy::EveryPut), FaultPlan::new(1));
+    let (shared, sim) = harness(config(EVERY_WRITE), FaultPlan::new(1));
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
 
     appender
@@ -468,7 +471,7 @@ fn a_forwarded_flush_answers_both_writers() {
 // a caller that walks away from a forwarded flush leaves the turn where it is
 #[test]
 fn a_dropped_wait_keeps_the_flush() {
-    let (shared, sim) = harness(config(SyncPolicy::EveryPut), FaultPlan::new(1));
+    let (shared, sim) = harness(config(EVERY_WRITE), FaultPlan::new(1));
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
 
     appender
@@ -517,7 +520,7 @@ fn an_awaited_append_waits_for_room() {
 #[test]
 fn a_dropped_append_holds_no_admission() {
     let (shared, _sim) = harness_capped(
-        config(SyncPolicy::EveryPut),
+        config(EVERY_WRITE),
         FaultPlan::new(1),
         InflightBudget::new(ByteCount::from_bytes(4096)),
     );
@@ -971,7 +974,7 @@ fn failed_drain_leaves_no_footer_entry() {
 fn failed_sync_rolls_off_the_segment() {
     // The tail's first sync is the eighth op, after both opens, the directory sync, the reservation and three writes
     let plan = FaultPlan::new(1).with_fault(7, FaultKind::SyncError);
-    let (shared, _sim) = harness(config(SyncPolicy::EveryPut), plan);
+    let (shared, _sim) = harness(config(EVERY_WRITE), plan);
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
 
     let outcome = appender.append_data(key(1), vec![0x11; 300], 0, Commit::PerRecord);
@@ -983,7 +986,7 @@ fn failed_sync_rolls_off_the_segment() {
 #[test]
 fn a_doomed_segment_never_settles() {
     let plan = FaultPlan::new(1).with_fault(7, FaultKind::SyncError);
-    let (shared, _sim) = harness(config(SyncPolicy::EveryPut), plan);
+    let (shared, _sim) = harness(config(EVERY_WRITE), plan);
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
 
     let outcome = appender.append_data(key(1), vec![0x11; 300], 0, Commit::PerRecord);
@@ -1031,7 +1034,7 @@ fn concurrent_appends_all_commit() {
 // records land intact while another writer's sync is out at the device
 #[test]
 fn appends_land_during_a_sync() {
-    let (shared, _sim) = harness(config(SyncPolicy::EveryPut), FaultPlan::new(1));
+    let (shared, _sim) = harness(config(EVERY_WRITE), FaultPlan::new(1));
     let appender = Arc::new(Appender::open(Arc::clone(&shared), 0, None).expect("open"));
 
     let writers = 8u8;

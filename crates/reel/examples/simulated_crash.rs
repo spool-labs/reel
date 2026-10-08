@@ -59,7 +59,7 @@ const SEED: u64 = 1;
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(1),
-        sync: SyncPolicy::EveryPut,
+        sync: SyncPolicy::Bytes(ByteCount::from_bytes(0)),
         active_tails: ThreadBudget::threads(1),
         ..ReelConfig::default()
     }

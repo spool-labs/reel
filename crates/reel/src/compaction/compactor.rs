@@ -2822,7 +2822,7 @@ mod tests {
     // a sync per put, so a scrub pass reads bytes the device already has
     fn scrub_config() -> ReelConfig {
         ReelConfig {
-            sync: SyncPolicy::EveryPut,
+            sync: SyncPolicy::Bytes(ByteCount::from_bytes(0)),
             ..engine_config()
         }
     }

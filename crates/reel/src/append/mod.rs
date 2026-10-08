@@ -115,6 +115,9 @@ pub enum Commit {
 
     /// The append leaves the sync to whoever closes the batch
     Batched,
+
+    /// The append takes a sync of its own tail before it returns, whatever the policy
+    Durable,
 }
 
 /// What a writer wants appended, resolved to a header once a sequence number is drawn
@@ -811,7 +814,11 @@ impl Appender {
                 self.shared.note_landed(loc.segment, lsn);
                 self.tail.publish_committed(base + span);
                 self.paced_writeback(&active);
-                let is_owed = commit == Commit::PerRecord && self.owes_sync(&active);
+                let is_owed = match commit {
+                    Commit::Durable => true,
+                    Commit::PerRecord => self.owes_sync(&active),
+                    Commit::Batched => false,
+                };
                 let owed = is_owed.then(|| Owed {
                     sync: Arc::clone(&active.sync),
                     segment: active.handle.id(),
@@ -1085,7 +1092,6 @@ impl Appender {
         let settled = active.settled.load(Ordering::Acquire);
         match self.shared.config.sync {
             SyncPolicy::Never => false,
-            SyncPolicy::EveryPut => true,
             SyncPolicy::Bytes(threshold) => {
                 let synced = active.sync.synced_at.load(Ordering::Acquire);
                 settled.saturating_sub(synced) >= threshold.to_bytes()
@@ -1159,9 +1165,6 @@ impl Appender {
     ///
     /// The ask is not waited on.
     fn paced_writeback(&self, active: &Active) {
-        if matches!(self.shared.config.sync, SyncPolicy::EveryPut) {
-            return;
-        }
         let settled = active.settled.load(Ordering::Acquire);
         // Another writer is already pacing this segment, and the next writer through
         // takes the chunk it does not.

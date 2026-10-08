@@ -31,6 +31,9 @@ use harness::wire::{
     TEST_COLUMNS,
 };
 
+/// A sync on every write, for tests that need each one durable
+const EVERY_WRITE: SyncPolicy = SyncPolicy::Bytes(ByteCount::from_bytes(0));
+
 /// Group most targeted tests write into
 const GROUP: u16 = 7;
 
@@ -178,7 +181,7 @@ fn every_boundary_single_tail() {
     for seed in CRASH_SEEDS {
         let ops = op_stream::generate_durable(*seed, CRASH_LEN);
         enumerate(
-            crash_config(1, SyncPolicy::EveryPut, SEGMENT_SMALL),
+            crash_config(1, EVERY_WRITE, SEGMENT_SMALL),
             &ops,
             *seed,
             true,
@@ -192,7 +195,7 @@ fn every_boundary_multi_tail() {
     for seed in MULTI_TAIL_SEEDS {
         let ops = op_stream::generate_durable(*seed, CRASH_LEN);
         enumerate(
-            crash_config(4, SyncPolicy::EveryPut, SEGMENT_SMALL),
+            crash_config(4, EVERY_WRITE, SEGMENT_SMALL),
             &ops,
             *seed,
             true,
@@ -222,7 +225,7 @@ fn every_boundary_never() {
 fn scattered_crash_keeps_the_durable_prefix() {
     for (seed, sector) in seeds_and_sectors() {
         let ops = op_stream::generate_durable(seed, CRASH_LEN);
-        let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, SEGMENT_SMALL));
+        let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, SEGMENT_SMALL));
         let total = harness.boundary_count(&ops);
         assert!(total > 0, "the stream crosses no io boundary");
 
@@ -421,7 +424,7 @@ fn scattered_crash_multi_tail() {
     for seed in SCATTER_SEEDS.iter().copied() {
         let sector = SCATTER_SECTORS[0];
         let ops = op_stream::generate_durable(seed, CRASH_LEN);
-        let harness = ReelHarness::new(crash_config(4, SyncPolicy::EveryPut, SEGMENT_SMALL));
+        let harness = ReelHarness::new(crash_config(4, EVERY_WRITE, SEGMENT_SMALL));
         let total = harness.boundary_count(&ops);
 
         let mut at_risk = 0u64;
@@ -483,7 +486,7 @@ fn scattered_hole_inside_a_record_is_rejected() {
 fn every_boundary_of_a_sub_group_range_delete() {
     // A fixed stream rather than a generated one, so a seed only names the plan.
     let ops = sub_range_stream();
-    let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, SEGMENT_LARGE));
+    let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, SEGMENT_LARGE));
     let total = harness.boundary_count(&ops);
     assert!(total > 0, "the stream crosses no io boundary");
 
@@ -533,7 +536,7 @@ fn assert_outside_the_range_survives(reopened: &ReelStore, acknowledged: usize, 
 fn sync_error() {
     // The op a sync lands on moves whenever the open sequence changes, so the scheduled
     // position is searched for rather than pinned.
-    let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, SEGMENT_LARGE));
+    let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, SEGMENT_LARGE));
     let mut proven = false;
 
     for at in SYNC_ERROR_FROM..=SYNC_ERROR_TO {
@@ -627,7 +630,7 @@ enum Tear {
 #[test]
 fn a_torn_batch_leaves_nothing_of_itself() {
     for tear in [Tear::FirstRecord, Tear::MidBatch, Tear::LastRecord] {
-        let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, SEGMENT_LARGE));
+        let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, SEGMENT_LARGE));
         let sim = SimIo::new(FaultPlan::new(1));
         let store = harness.open_or_panic(sim.clone());
         store
@@ -672,7 +675,7 @@ fn a_torn_batch_leaves_nothing_of_itself() {
 #[test]
 fn a_torn_range_batch_applies_neither_half() {
     for tear in [Tear::FirstRecord, Tear::MidBatch, Tear::LastRecord] {
-        let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, SEGMENT_LARGE));
+        let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, SEGMENT_LARGE));
         let sim = SimIo::new(FaultPlan::new(1));
         let store = harness.open_or_panic(sim.clone());
         for address in 0..RANGE_KEYS {
@@ -761,7 +764,7 @@ fn tear_offset(journal: &[u8], tear: Tear) -> Option<u64> {
 // a read time checksum failure treats a corrupted record as missing and stays consistent
 #[test]
 fn bit_rot() {
-    let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, SEGMENT_TIGHT));
+    let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, SEGMENT_TIGHT));
     let sim = SimIo::new(FaultPlan::new(1));
     let store = harness.open_or_panic(sim.clone());
     apply_mutation(&store, &put(GROUP, 1, LARGE_PAYLOAD, 1)).expect("large put");
@@ -792,7 +795,7 @@ fn bit_rot() {
 // a crash under multi tail same key traffic recovers by highest version
 #[test]
 fn multi_tail_same_key() {
-    let harness = ReelHarness::new(crash_config(4, SyncPolicy::EveryPut, SEGMENT_LARGE));
+    let harness = ReelHarness::new(crash_config(4, EVERY_WRITE, SEGMENT_LARGE));
     let ops = same_key_stream(OVERWRITE_COUNT);
     let total = harness.boundary_count(&ops);
     assert!(total > 0, "the stream crosses no io boundary");
@@ -817,7 +820,7 @@ fn multi_tail_same_key() {
 // a crash mid group drop rebuilds the rest and a re drop is idempotent
 #[test]
 fn group_drop() {
-    let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, SEGMENT_LARGE));
+    let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, SEGMENT_LARGE));
     let ops = drop_stream();
     let total = harness.boundary_count(&ops);
     assert!(total > 0, "the stream crosses no io boundary");
@@ -844,7 +847,7 @@ fn group_drop() {
 // a crash in the middle of a compaction rewrite keeps the live key and restarts
 #[test]
 fn mid_compaction() {
-    let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, COMPACT_SEG_BYTES));
+    let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, COMPACT_SEG_BYTES));
 
     let probe_sim = SimIo::new(FaultPlan::new(0));
     let probe = harness.open_or_panic(probe_sim.clone());
@@ -914,7 +917,7 @@ fn mid_key_merge() {
 
 /// A paged volume, where a key merge folds the walk once it stacks past the merge depth
 fn key_merge_config() -> ReelConfig {
-    crash_config(1, SyncPolicy::EveryPut, MERGE_SEG_BYTES)
+    crash_config(1, EVERY_WRITE, MERGE_SEG_BYTES)
 }
 
 /// A key's fill in one round of the merge stream

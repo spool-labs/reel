@@ -28,6 +28,9 @@ use crate::io::sim_backend::{DurableImage, SimIo};
 use crate::reel::segment_file_name;
 use crate::sync::tension::block_on;
 
+/// A sync on every write, for tests that need each one durable
+const EVERY_WRITE: SyncPolicy = SyncPolicy::Bytes(ByteCount::from_bytes(0));
+
 /// Virtual volume root the simulator files live under
 const ROOT: &str = "/bulk";
 
@@ -895,7 +898,7 @@ fn a_failed_seal_is_retried_on_the_tick() {
 // a segment left without a footer by a failed sync is never picked as wholly dead
 #[test]
 fn a_footerless_segment_is_not_offered_to_compaction() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, sim) = sim_store(config(1, EVERY_WRITE));
     let payload = vec![0xa5u8; 8 * 1024];
     for byte in 0..16u8 {
         store.put(&record(7, byte), &payload).expect("put");
@@ -3731,7 +3734,7 @@ fn a_warm_awaited_read_still_verifies() {
 // an awaited put lands the record and the index exactly as the blocking one
 #[test]
 fn async_put_matches_the_block() {
-    let (store, _sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, _sim) = sim_store(config(1, EVERY_WRITE));
 
     store.put(&record(7, 1), &[0x11; 512]).expect("put");
     block_on(store.put_owned_wait(&record(7, 2), vec![0x22; 512])).expect("awaited put");
@@ -3751,7 +3754,7 @@ fn async_put_matches_the_block() {
 // an awaited put is as durable as the blocking put beside it
 #[test]
 fn async_put_is_durable() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, sim) = sim_store(config(1, EVERY_WRITE));
 
     store.put(&record(7, 1), &[0x11; 512]).expect("put");
     let blocked = sim.unsynced_bytes();
@@ -3767,7 +3770,7 @@ fn async_put_is_durable() {
 // an awaited batch is one durability point and one publish, as the blocking one
 #[test]
 fn async_batch_matches_the_block() {
-    let (store, _sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, _sim) = sim_store(config(1, EVERY_WRITE));
     store.put(&record(7, 9), &[0x99; 128]).expect("put");
 
     let writes = vec![
@@ -3923,7 +3926,7 @@ fn delete_updates_totals() {
 // a batch lands every one of its writes and moves the index once
 #[test]
 fn batch_applies_together() {
-    let (store, _sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, _sim) = sim_store(config(1, EVERY_WRITE));
     store.put(&record(7, 9), &[0x99; 100]).expect("put");
 
     store
@@ -3958,7 +3961,7 @@ fn batch_applies_together() {
 // range in the middle of its batch does not have to cut the batch around it.
 #[test]
 fn a_batch_carries_a_range_delete() {
-    let (store, _sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, _sim) = sim_store(config(1, EVERY_WRITE));
     store.put(&record(7, 1), &[0x11; 100]).expect("put");
     store
         .put(&record(8, 1), &[0x88; 100])
@@ -4004,7 +4007,7 @@ fn a_batch_carries_a_range_delete() {
 // a batch carrying a range delete comes back the same way after a reopen
 #[test]
 fn a_batched_range_delete_survives_a_reopen() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, sim) = sim_store(config(1, EVERY_WRITE));
     store.put(&record(7, 1), &[0x11; 100]).expect("put");
 
     let start = RecordKey::from_bytes(RECORD, &group_bound(7)).expect("key");
@@ -4021,7 +4024,7 @@ fn a_batched_range_delete_survives_a_reopen() {
         ])
         .expect("batch");
 
-    let reopened = reopen(&sim, config(1, SyncPolicy::EveryPut));
+    let reopened = reopen(&sim, config(1, EVERY_WRITE));
 
     assert!(
         !reopened.contains(&record(7, 1)).expect("read"),
@@ -4036,7 +4039,7 @@ fn a_batched_range_delete_survives_a_reopen() {
 // an empty range in a batch writes no record, the same refusal the single door makes
 #[test]
 fn a_batched_empty_range_writes_nothing() {
-    let (store, _sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, _sim) = sim_store(config(1, EVERY_WRITE));
     store.put(&record(7, 1), &[0x11; 100]).expect("put");
 
     let start = RecordKey::from_bytes(RECORD, &group_bound(7)).expect("key");
@@ -4056,7 +4059,7 @@ fn a_batched_empty_range_writes_nothing() {
 // a whole batch survives a reopen, since the frame that declares it landed
 #[test]
 fn batch_survives_a_reopen() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, sim) = sim_store(config(1, EVERY_WRITE));
     store
         .apply_batch(vec![
             RecordWrite::Put {
@@ -4070,7 +4073,7 @@ fn batch_survives_a_reopen() {
         ])
         .expect("batch");
 
-    let reopened = reopen(&sim, config(1, SyncPolicy::EveryPut));
+    let reopened = reopen(&sim, config(1, EVERY_WRITE));
 
     assert_eq!(reopened.totals().count, 2);
     assert_eq!(
@@ -4082,7 +4085,7 @@ fn batch_survives_a_reopen() {
 // a batch a crash landed inside leaves none of itself behind
 #[test]
 fn torn_batch_leaves_nothing() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, sim) = sim_store(config(1, EVERY_WRITE));
     store.put(&record(7, 9), &[0x99; 100]).expect("put");
     store
         .apply_batch(vec![
@@ -4105,7 +4108,7 @@ fn torn_batch_leaves_nothing() {
 
     let mut image = sim.durable_image();
     flip_payload(&mut image, torn);
-    let reopened = reopen_image(image, config(1, SyncPolicy::EveryPut));
+    let reopened = reopen_image(image, config(1, EVERY_WRITE));
 
     assert!(
         reopened.contains(&record(7, 9)).expect("read"),
@@ -4210,7 +4213,7 @@ fn an_empty_range_writes_nothing() {
 // a clean reopen reproduces the whole index and its totals
 #[test]
 fn reopen_reproduces_index() {
-    let (store, sim) = sim_store(config(2, SyncPolicy::EveryPut));
+    let (store, sim) = sim_store(config(2, EVERY_WRITE));
     for byte in 1..=8u8 {
         store.put(&record(7, byte), &[byte; 400]).expect("put");
     }
@@ -4218,7 +4221,7 @@ fn reopen_reproduces_index() {
     let before = store.totals();
     store.close().expect("close");
 
-    let reopened = reopen(&sim, config(2, SyncPolicy::EveryPut));
+    let reopened = reopen(&sim, config(2, EVERY_WRITE));
 
     assert_eq!(reopened.totals(), before);
     assert_eq!(
@@ -4230,7 +4233,7 @@ fn reopen_reproduces_index() {
 // an open that leaves out a written column still counts its bytes, and only a read-only one goes on
 #[test]
 fn an_undeclared_column_is_counted_and_refused_writable() {
-    let (store, sim) = sim_store(config(2, SyncPolicy::EveryPut));
+    let (store, sim) = sim_store(config(2, EVERY_WRITE));
     store.put(&record(7, 1), &[0x11; 400]).expect("put");
     store.put(&blob(1), &[0x33; 900]).expect("blob");
     store.close().expect("close");
@@ -4239,7 +4242,7 @@ fn an_undeclared_column_is_counted_and_refused_writable() {
     let restored = Arc::new(SimIo::from_image(sim.durable_image()));
     let writable = ReelStore::open_with_io(
         PathBuf::from(ROOT),
-        config(2, SyncPolicy::EveryPut),
+        config(2, EVERY_WRITE),
         records_only,
         restored.clone(),
     );
@@ -4250,7 +4253,7 @@ fn an_undeclared_column_is_counted_and_refused_writable() {
 
     let read_only = ReelStore::open_read_only_with_io(
         PathBuf::from(ROOT),
-        config(2, SyncPolicy::EveryPut),
+        config(2, EVERY_WRITE),
         records_only,
         restored,
     )
@@ -4398,23 +4401,56 @@ fn an_overwritten_key_reads_its_live_slot_in_one_read() {
     let none = crate::format::lsn::Lsn::NONE;
     assert!(!store.index.is_live_at(&key, old, none).expect("old"));
     assert!(store.index.is_live_at(&key, new, none).expect("new"));
-    assert_eq!(
-        backend.ops() - ops,
-        1,
+    // Linux serves the get from the mapping and takes no read at all
+    assert!(
+        backend.ops() - ops <= 1,
         "the get and the liveness checks took more than one read"
     );
     assert_eq!(store.filter_probes().blocks, blocks, "a footer search ran");
 }
 
+// a durable put survives a crash on a volume that never syncs, at the cost of one sync
+#[test]
+fn a_durable_put_survives_a_crash_on_one_sync() {
+    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
+    store.put(&record(7, 1), &[0x11; 300]).expect("put");
+    let before = sim.sync_count();
+    store
+        .put_durable(&record(7, 2), &[0x22; 300])
+        .expect("durable put");
+    assert_eq!(
+        sim.sync_count() - before,
+        1,
+        "a durable put took more than one sync"
+    );
+    store
+        .apply_batch_durable(vec![RecordWrite::Put {
+            key: record(7, 3),
+            payload: vec![0x33; 300],
+        }])
+        .expect("durable batch");
+
+    let image = sim.durable_image();
+    drop(store);
+    let reopened = reopen_image(image, config(1, SyncPolicy::Never));
+    for (byte, fill) in [(1u8, 0x11u8), (2, 0x22), (3, 0x33)] {
+        assert_eq!(
+            reopened.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![fill; 300])),
+            "key {byte} after the crash"
+        );
+    }
+}
+
 // a read-only open serves reads but rejects every write
 #[test]
 fn read_only_rejects_writes() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, sim) = sim_store(config(1, EVERY_WRITE));
     store.put(&record(7, 1), &[0x11; 400]).expect("put");
 
     let reader = ReelStore::open_read_only_with_io(
         PathBuf::from(ROOT),
-        config(1, SyncPolicy::EveryPut),
+        config(1, EVERY_WRITE),
         COLUMNS,
         Arc::new(SimIo::from_image(sim.durable_image())),
     )
@@ -4432,12 +4468,12 @@ fn read_only_rejects_writes() {
 // a reader picks up the writer's later appends only once it refreshes
 #[test]
 fn refresh_picks_up_later_writes() {
-    let (writer, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (writer, sim) = sim_store(config(1, EVERY_WRITE));
     writer.put(&record(7, 1), &[0x11; 400]).expect("put");
 
     let reader = ReelStore::open_read_only_with_io(
         PathBuf::from(ROOT),
-        config(1, SyncPolicy::EveryPut),
+        config(1, EVERY_WRITE),
         COLUMNS,
         Arc::new(sim.clone()),
     )
@@ -4455,14 +4491,14 @@ fn refresh_picks_up_later_writes() {
 // a reader follows the log rather than reading the volume again
 #[test]
 fn refresh_reads_only_what_is_new() {
-    let (writer, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (writer, sim) = sim_store(config(1, EVERY_WRITE));
     for byte in 1..=8u8 {
         writer.put(&record(7, byte), &[byte; 400]).expect("put");
     }
 
     let reader = ReelStore::open_read_only_with_io(
         PathBuf::from(ROOT),
-        config(1, SyncPolicy::EveryPut),
+        config(1, EVERY_WRITE),
         COLUMNS,
         Arc::new(sim.clone()),
     )
@@ -4479,7 +4515,7 @@ fn refresh_reads_only_what_is_new() {
 // a reader following the log across a compaction keeps the key it repointed
 #[test]
 fn refresh_follows_a_relocation() {
-    let mut settings = config(1, SyncPolicy::EveryPut);
+    let mut settings = config(1, EVERY_WRITE);
     settings.segment_bytes = ByteCount::from_bytes(8_192);
     let (writer, sim) = sim_store(settings.clone());
     for byte in 1..=4u8 {
@@ -4520,7 +4556,7 @@ fn refresh_follows_a_relocation() {
 
 /// A writer with four keys and a reader opened over them, on segments small enough to retire
 fn reader_over_four_keys() -> (ReelStore, ReelStore) {
-    let mut settings = config(1, SyncPolicy::EveryPut);
+    let mut settings = config(1, EVERY_WRITE);
     settings.segment_bytes = ByteCount::from_bytes(8_192);
     let (writer, sim) = sim_store(settings.clone());
     for byte in 1..=4u8 {
@@ -4572,7 +4608,7 @@ fn refresh_follows_a_delete_past_a_retire() {
 // a reader that reads a key the writer moved out of a retired segment finds it, and counts it once after a refresh
 #[test]
 fn a_read_past_a_retire_finds_the_moved_key() {
-    let mut settings = config(1, SyncPolicy::EveryPut);
+    let mut settings = config(1, EVERY_WRITE);
     settings.segment_bytes = ByteCount::from_bytes(8_192);
     let (writer, sim) = sim_store(settings.clone());
     for byte in 1..=4u8 {
@@ -4628,7 +4664,7 @@ fn a_read_past_a_retire_finds_the_moved_key() {
 // a reader that meets a range delete after the segment holding its keys retired stops counting them
 #[test]
 fn refresh_follows_a_range_delete_past_a_retire() {
-    let mut settings = config(1, SyncPolicy::EveryPut);
+    let mut settings = config(1, EVERY_WRITE);
     settings.segment_bytes = ByteCount::from_bytes(8_192);
     let (writer, sim) = sim_store(settings.clone());
     for byte in 1..=2u8 {
@@ -4663,13 +4699,13 @@ fn refresh_follows_a_range_delete_past_a_retire() {
 // a range delete a reader follows keeps its keys deleted
 #[test]
 fn refresh_follows_a_range_delete() {
-    let (writer, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (writer, sim) = sim_store(config(1, EVERY_WRITE));
     writer.put(&record(7, 1), &[0x11; 100]).expect("put");
     writer.put(&record(8, 1), &[0x22; 100]).expect("put");
 
     let reader = ReelStore::open_read_only_with_io(
         PathBuf::from(ROOT),
-        config(1, SyncPolicy::EveryPut),
+        config(1, EVERY_WRITE),
         COLUMNS,
         Arc::new(sim.clone()),
     )
@@ -4697,11 +4733,11 @@ fn refresh_rejects_a_writer() {
 // a read-only volume is driven by the same timer and never writes on the pass
 #[test]
 fn maintain_once_is_inert_read_only() {
-    let (writer, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (writer, sim) = sim_store(config(1, EVERY_WRITE));
     writer.put(&record(7, 1), &[0x11; 400]).expect("put");
     let reader = ReelStore::open_read_only_with_io(
         PathBuf::from(ROOT),
-        config(1, SyncPolicy::EveryPut),
+        config(1, EVERY_WRITE),
         COLUMNS,
         Arc::new(SimIo::from_image(sim.durable_image())),
     )

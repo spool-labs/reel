@@ -32,6 +32,16 @@ impl ReelStore {
         Ok(())
     }
 
+    /// A put that is durable when it returns, syncing only the tail it went to
+    pub fn put_durable(&self, key: &RecordKey, payload: &[u8]) -> Result<()> {
+        let planned = self.plan_put(key, payload.to_vec())?;
+        let committed =
+            self.reel
+                .put(key.clone(), planned.payload, planned.codec, Commit::Durable)?;
+        self.index.insert(key, committed.loc, committed.lsn)?;
+        Ok(())
+    }
+
     /// The same put awaited, for a caller with a runtime worker to protect
     ///
     /// The record reaches the device on this thread either way; what is awaited is
@@ -88,6 +98,15 @@ impl ReelStore {
 
         let committed = self.reel.write_batch(records)?;
         self.reel.sync_if_owed()?;
+        self.publish_batch(&keys, &committed)
+    }
+
+    /// A batch that is durable when it returns, syncing only the tail it went to
+    pub fn apply_batch_durable(&self, writes: Vec<RecordWrite>) -> Result<()> {
+        let Some((records, keys)) = self.plan_batch(writes)? else {
+            return Ok(());
+        };
+        let committed = self.reel.write_batch_durable(records)?;
         self.publish_batch(&keys, &committed)
     }
 

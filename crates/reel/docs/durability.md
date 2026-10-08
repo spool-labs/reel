@@ -14,7 +14,7 @@ takes the process and leaves the page cache standing; a power cut takes both.
 |---|---|---|
 | `never`, the default | what landed since the rows last went down, at most one 1 MiB writeback pace a tail | the active segment of each tail since its last seal is at risk, and everything sealed is on the medium |
 | a byte count | what landed since the rows last went down, at most one pace or that many bytes | everything after the last flush that returned, at most that many bytes |
-| `0`, every put | nothing is lost | nothing is lost |
+| a durable put or batch, any setting | nothing is lost | nothing is lost |
 | any of the above, for a multi-record batch | a batch is confirmed or it never happened | a batch is confirmed or it never happened |
 
 A small record is keyless, so an open segment's journal is what says which key each
@@ -71,7 +71,7 @@ than "this is corrupt".
 |---|---|---|
 | `SyncPolicy::Never` (default) | no hot-path flush at all | the record is in the page cache and the write call succeeded |
 | `SyncPolicy::Bytes` | flush once that many bytes have settled since the last flush | the record is durable if the put crossed the threshold, otherwise it is durable once a later one does |
-| `SyncPolicy::EveryPut` | flush before every put returns | the record reached the device |
+| `put_durable`, `apply_batch_durable` | flush the one tail the write went to before it returns | the record reached the device |
 
 Three things flush regardless of the policy. A segment seal takes a full sync after
 writing its footer. Creating a segment syncs the volume directory, because a file's

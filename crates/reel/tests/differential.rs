@@ -44,7 +44,7 @@ const PAGED_STREAM_LEN: usize = 640;
 fn reel_config(active_tails: u32) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT_BYTES),
-        sync: SyncPolicy::EveryPut,
+        sync: SyncPolicy::Bytes(ByteCount::from_bytes(0)),
         active_tails: ThreadBudget::threads(active_tails),
         ..ReelConfig::default()
     }

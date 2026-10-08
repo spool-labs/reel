@@ -38,10 +38,8 @@ pub(crate) const GIB: u64 = MIB * 1024;
 pub enum SyncPolicy {
     /// Never sync on the hot path, and a seal still syncs, so only the tail is at risk
     Never,
-    /// Sync once this many bytes accumulate across a drain
+    /// Sync once this many bytes accumulate across a drain, and zero syncs every write
     Bytes(ByteCount),
-    /// Sync after every put
-    EveryPut,
 }
 
 /// Compaction rate limit, unpaced unless a cap is named
@@ -358,14 +356,6 @@ impl ReelConfig {
             return Err(ReelError::Config(
                 "segment_bytes must fit a u32 offset, under four gibibytes".to_string(),
             ));
-        }
-
-        if let SyncPolicy::Bytes(threshold) = self.sync {
-            if threshold.to_bytes() == 0 {
-                return Err(ReelError::Config(
-                    "the sync threshold must be non-zero".to_string(),
-                ));
-            }
         }
 
         if !(0.0..=1.0).contains(&self.compact_dead_ratio) {

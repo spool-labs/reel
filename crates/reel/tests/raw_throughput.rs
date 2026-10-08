@@ -386,7 +386,7 @@ fn syncs() -> Vec<(String, SyncPolicy)> {
             let name = name.trim();
             let policy = match name {
                 "never" => SyncPolicy::Never,
-                "0" => SyncPolicy::EveryPut,
+                "0" => SyncPolicy::Bytes(ByteCount::from_bytes(0)),
                 bytes => SyncPolicy::Bytes(ByteCount::from_bytes(bytes.parse().ok()?)),
             };
             Some((name.to_string(), policy))

@@ -1958,7 +1958,7 @@ mod tests {
     #[test]
     fn rebuilds_active_tail() {
         let sim = SimIo::new(FaultPlan::new(1));
-        let shared = shared(config(SyncPolicy::EveryPut), &sim);
+        let shared = shared(config(SyncPolicy::Bytes(ByteCount::from_bytes(0))), &sim);
         let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_data(key(1), vec![0x11; 400], 0, Commit::PerRecord)
@@ -1977,7 +1977,7 @@ mod tests {
     #[test]
     fn whole_batch_rebuilds() {
         let sim = SimIo::new(FaultPlan::new(1));
-        let shared = shared(config(SyncPolicy::EveryPut), &sim);
+        let shared = shared(config(SyncPolicy::Bytes(ByteCount::from_bytes(0))), &sim);
         let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_batch(vec![
@@ -2003,7 +2003,7 @@ mod tests {
     #[test]
     fn torn_batch_is_dropped() {
         let sim = SimIo::new(FaultPlan::new(1));
-        let shared = shared(config(SyncPolicy::EveryPut), &sim);
+        let shared = shared(config(SyncPolicy::Bytes(ByteCount::from_bytes(0))), &sim);
         let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_data(key(9), vec![0x99; 200], 0, Commit::PerRecord)
@@ -2032,7 +2032,7 @@ mod tests {
     #[test]
     fn batch_with_first_record_torn_is_dropped() {
         let sim = SimIo::new(FaultPlan::new(1));
-        let shared = shared(config(SyncPolicy::EveryPut), &sim);
+        let shared = shared(config(SyncPolicy::Bytes(ByteCount::from_bytes(0))), &sim);
         let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_data(key(9), vec![0x99; 200], 0, Commit::PerRecord)
@@ -2059,7 +2059,7 @@ mod tests {
 
     /// Write a batch of two behind one plain record, journal it, and say where its records sit
     fn tail_with_a_batch(sim: &SimIo) -> (u64, u64) {
-        let shared = shared(config(SyncPolicy::EveryPut), sim);
+        let shared = shared(config(SyncPolicy::Bytes(ByteCount::from_bytes(0))), sim);
         let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
         appender
             .append_data(key(9), vec![0x99; 200], 0, Commit::PerRecord)

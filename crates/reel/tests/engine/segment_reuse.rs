@@ -162,7 +162,7 @@ fn only_a_tail_that_syncs_often_fills_its_next_window() {
         );
     }
     assert_eq!(
-        length_after(SyncPolicy::EveryPut),
+        length_after(SyncPolicy::Bytes(ByteCount::from_bytes(0))),
         2 * BIG_WINDOW,
         "a tail that syncs every put did not zero its next window"
     );
@@ -261,7 +261,7 @@ fn a_full_segment_seals_at_its_footer() {
 #[test]
 fn a_crash_leaves_only_the_records() {
     let config = ReelConfig {
-        sync: SyncPolicy::EveryPut,
+        sync: SyncPolicy::Bytes(ByteCount::from_bytes(0)),
         ..config()
     };
     let sim = SimIo::new(FaultPlan::new(1));

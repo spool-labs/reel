@@ -75,7 +75,7 @@ const FIXTURE_LEN: usize = 5_000;
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(32 * 1024),
-        sync: SyncPolicy::EveryPut,
+        sync: SyncPolicy::Bytes(ByteCount::from_bytes(0)),
         active_tails: ThreadBudget::threads(1),
         ..ReelConfig::default()
     }

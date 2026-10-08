@@ -191,9 +191,6 @@ impl Journal {
     }
 
     /// Write what is pending, then a seal's mark in the block after the last row
-    ///
-    /// An open finds the mark at the file's end only when the seal's cut never landed, and
-    /// reads the footer through it.
     pub(super) fn mark_sealed(&self, mark: &[u8]) -> Result<()> {
         let Some(file) = self.file else {
             return Ok(());

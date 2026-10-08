@@ -1073,6 +1073,34 @@ impl SpotColumn {
         })
     }
 
+    /// Take the rows of a partition a key run picked, by their places in it, and hand back each fresh record's row and length
+    pub fn take_picked(
+        &self,
+        segment: SegmentId,
+        partition: &FooterPartition,
+        picked: &[u32],
+    ) -> Result<Vec<(u32, u32)>> {
+        let spread = segment.as_u32() as usize;
+        let fresh = self.take_rows(partition.column, spread, picked.len(), |at| {
+            let row = picked[at] as usize;
+            let found = partition.row_at(row)?;
+            let key = partition
+                .key_at(row)
+                .ok_or_else(|| ReelError::Corruption("a key run picked a row past its footer".to_string()))?;
+            Ok((!found.is_range_tombstone()).then(|| Taken {
+                key,
+                loc: Loc::new(segment, found.offset, found.len),
+                lsn: found.lsn,
+                is_tombstone: found.is_tombstone(),
+            }))
+        })?;
+        // The fresh rows come back by their place in `picked`, which the caller reads keys by in the partition
+        Ok(fresh
+            .into_iter()
+            .map(|(at, len)| (picked[at as usize], len))
+            .collect())
+    }
+
     /// Take sealed rows during an open, setting aside each that meets a slot, and hand back each fresh record's row and length
     pub fn take_rows<'a>(
         &self,

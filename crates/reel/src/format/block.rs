@@ -516,10 +516,7 @@ pub fn lookup_in_span(
     }
 }
 
-/// The row of a key that sits at an offset, reading only the blocks the key's rows lie in
-///
-/// A key's versions sit together in write order, so the walk goes back from the key's
-/// last row until the key changes, into earlier blocks while the run reaches their end.
+/// The row of a key at an offset, walking back from the key's last row through only the blocks its rows lie in
 pub fn find_offset_in_span(
     span: &PartitionSpan,
     filter: Option<&Filter>,

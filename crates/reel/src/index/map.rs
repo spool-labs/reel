@@ -5,8 +5,8 @@
 //! since one holds records from every column and the compactor asks about it whole.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
-use std::ops::{Bound, Range};
+use std::collections::HashMap;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -22,13 +22,13 @@ use crate::format::lsn::Lsn;
 use crate::index::column::{ColumnIndex, KeyMove, Landed, PendingCover};
 use crate::index::counters::{Floors, SegmentBytes, SegmentTable};
 use crate::index::entry::{span_of, Entry};
-use crate::index::keyrun::{key_in, row_in, KeyRun, KeyRunSet, RunColumn};
+use crate::index::keyrun::KeyRunSet;
 use crate::index::page::KeyPage;
 use crate::index::paged::{Candidates, FooterSource, SealedRanges};
 use crate::index::playback::{self, merged_page, Paged, PlaybackCursor, WalkRuns, Way};
 use crate::index::recovery::SealedSpan;
 use crate::index::spot::{
-    Booking, Lookup, Pick, RecordSource, Settled, Since, SpotColumn, Taken, LOOKUP_TRIES,
+    Booking, Lookup, Pick, RecordSource, Settled, Since, SpotColumn, LOOKUP_TRIES,
 };
 use crate::sync::{lock, read, write};
 
@@ -228,6 +228,9 @@ pub struct ReelIndex {
     /// Merges write these key runs, and a walk reads them in place of the footers they cover
     key_runs: KeyRunSet,
 
+    /// Each key run's rows by the segment and column they point into, taken by an open's footer loads
+    run_picks: Mutex<HashMap<(SegmentId, ColumnId), Vec<u32>>>,
+
     /// Each column's sealed keys as record locations, answering a get in one read
     spot: Vec<SpotColumn>,
 
@@ -334,6 +337,7 @@ impl ReelIndex {
             indexes,
             walk_runs: sealed.iter().map(|_| WalkRuns::default()).collect(),
             key_runs: KeyRunSet::default(),
+            run_picks: Mutex::new(HashMap::new()),
             sealed,
             spot: columns.iter().map(|_| SpotColumn::new()).collect(),
             spot_ready: AtomicBool::new(false),
@@ -528,6 +532,20 @@ impl ReelIndex {
             .fetch_max(footer.max_lsn.as_u64(), Ordering::AcqRel);
         // The run keeps one row a key, so a version whose newer one died in a retired segment stays out
         if self.key_runs.covers(segment) {
+            for partition in &footer.partitions {
+                let Some(at) = self.slot(partition.column) else {
+                    continue;
+                };
+                let picked = lock(&self.run_picks)
+                    .remove(&(segment, partition.column))
+                    .unwrap_or_default();
+                let fresh = self.spot[at].take_picked(segment, partition, &picked)?;
+                self.indexes[at].book_sealed(
+                    fresh
+                        .iter()
+                        .filter_map(|(row, len)| Some((partition.key_at(*row as usize)?, *len))),
+                );
+            }
             return Ok(());
         }
         for partition in &footer.partitions {
@@ -543,37 +561,23 @@ impl ReelIndex {
         Ok(())
     }
 
-    /// Take one stretch of a key run's rows during a paged open, those in standing segments, and count each fresh one
-    pub fn take_run_rows(
-        &self,
-        run: &KeyRun,
-        column: &RunColumn,
-        rows: Range<u64>,
-        standing: &HashSet<SegmentId>,
-    ) -> Result<()> {
-        let Some(at) = self.slot(column.column) else {
-            return Ok(());
-        };
-        let bytes = run.rows(column);
-        let first = rows.start as usize;
-        let count = (rows.end - rows.start) as usize;
-        let fresh = self.spot[at].take_rows(column.column, first, count, |row| {
-            let (key, found) = row_in(bytes, column, first + row)?;
-            let is_taken =
-                standing.contains(&found.loc.segment) && !found.flags.is_range_tombstone();
-            Ok(is_taken.then_some(Taken {
-                key,
-                loc: found.loc,
-                lsn: found.lsn,
-                is_tombstone: found.flags.is_tombstone(),
-            }))
-        })?;
-        self.indexes[at].book_sealed(
-            fresh
-                .iter()
-                .map(|(row, len)| (key_in(bytes, column, first + *row as usize), *len)),
-        );
-        Ok(())
+    /// Gather each key run's rows by the segment and column they point into, for the footer loads of an open
+    pub fn pick_run_rows(&self) {
+        let mut picks: HashMap<(SegmentId, ColumnId), Vec<u32>> = HashMap::new();
+        for run in self.key_runs.runs() {
+            for column in run.columns() {
+                for at in 0..column.rows() {
+                    let pointer = run.pointer(column, at);
+                    if let Some(segment) = run.segment_of(pointer) {
+                        picks
+                            .entry((segment, column.column))
+                            .or_default()
+                            .push(pointer.row);
+                    }
+                }
+            }
+        }
+        *lock(&self.run_picks) = picks;
     }
 
     /// Hold sealed versions a tail outversions, for the end of the load to take out of the spot index
@@ -978,6 +982,11 @@ impl ReelIndex {
     /// Where to read footers for a column that has sealed something
     fn paged_footers(&self, at: usize) -> Option<&Arc<dyn FooterSource>> {
         self.footers.get().filter(|_| !self.sealed[at].is_empty())
+    }
+
+    /// Where sealed footers are read from, once the volume has wired it
+    pub fn footers(&self) -> Option<&Arc<dyn FooterSource>> {
+        self.footers.get()
     }
 
     /// Whether a key resolves to a live record
@@ -1936,7 +1945,7 @@ impl ReelIndex {
             column,
             index: &self.indexes[at],
             sealed: &self.sealed[at],
-            footers: footers.as_ref(),
+            footers,
             runs: &self.walk_runs[at],
             key_runs: &self.key_runs,
             segments: &self.segments,

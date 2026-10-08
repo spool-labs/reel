@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Condvar, Mutex};
 
@@ -51,9 +50,6 @@ const LOADERS: usize = 8;
 
 /// A column's feed splits across threads once its window holds this many rows
 const SPLIT_FEED_ROWS: usize = 4 * BATCH;
-
-/// A loader takes a key run's rows this many at a time
-const RUN_STRETCH: u64 = 1 << 16;
 
 /// What a reel rebuild hands back beside the index it filled
 pub struct RebuiltReel {
@@ -148,6 +144,8 @@ pub fn rebuild_reel(
         }
         jobs.push((segment, path, len));
     }
+    // A covered segment's footer loads only the rows its key run picked, so the picks are ready before any footer is read
+    index.pick_run_rows();
     let mut held: Vec<Held> = Vec::new();
     // The loaders are slower than the reads, so a deeper queue or read-ahead only holds more footers
     let (queue, feed) = std::sync::mpsc::sync_channel::<(SegmentId, SegmentFooter)>(1);
@@ -176,8 +174,7 @@ pub fn rebuild_reel(
                 Loaded::Journaled(end) => {
                     consumed.insert(*segment, end.journal_len);
                     walked.push((path.clone(), *len));
-                    // A file that ends before its rows was sealed once, and a run covers only sealed
-                    // segments, so neither takes a tail's writes again
+                    // A file that ends before its rows, or one a run covers, was sealed once and takes no tail's writes again
                     let is_covered = index.key_runs().covers(*segment);
                     if let Some(rows_at) = end.rows_at.filter(|_| !is_covered) {
                         resumable.push(ResumableTail {
@@ -206,7 +203,6 @@ pub fn rebuild_reel(
         read
     })?;
     feed_held(&mut held, &mut resolver, &mut resumable)?;
-    load_key_runs(index, &sealed_files)?;
 
     resolver.flush();
     let undeclared = resolver.queue.undeclared;
@@ -223,47 +219,6 @@ pub fn rebuild_reel(
         cuts,
         resumable,
         undeclared,
-    })
-}
-
-/// Take the key runs' rows into the spot index on the loaders, a stretch of rows at a time
-fn load_key_runs(index: &ReelIndex, sealed: &[(SegmentId, PathBuf, u64)]) -> Result<()> {
-    let runs = index.key_runs().runs();
-    if runs.is_empty() {
-        return Ok(());
-    }
-    let standing: HashSet<SegmentId> = sealed.iter().map(|(segment, _, _)| *segment).collect();
-    let mut stretches = Vec::new();
-    for run in &runs {
-        for column in run.columns() {
-            let mut first = 0;
-            while first < column.rows() {
-                let end = (first + RUN_STRETCH).min(column.rows());
-                stretches.push((run, column, first..end));
-                first = end;
-            }
-        }
-    }
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| -> Result<()> {
-        let loading: Vec<_> = (0..LOADERS)
-            .map(|_| {
-                scope.spawn(|| -> Result<()> {
-                    while let Some((run, column, rows)) =
-                        stretches.get(next.fetch_add(1, Ordering::Relaxed))
-                    {
-                        index.take_run_rows(run, column, rows.clone(), &standing)?;
-                    }
-                    Ok(())
-                })
-            })
-            .collect();
-        for loader in loading {
-            loader
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
-        }
-        Ok(())
     })
 }
 
@@ -327,8 +282,7 @@ struct JournaledEnd {
 /// Everything the join needs is in here, so absorbing a segment touches no
 /// descriptor and the reads can run wherever there is a thread for them.
 enum SegmentParts {
-    /// A sealed segment's footer, the range ends its rows do not carry, and where its file
-    /// ends when a seal's cut never landed
+    /// A sealed segment's footer, the range ends its rows lack, and its end when a seal's cut never landed
     Sealed(SegmentFooter, Vec<Option<KeyBytes>>, Option<u64>),
 
     /// An unsealed tail read through its journal

@@ -395,9 +395,6 @@ impl ReelStore {
     }
 
     /// Seal each tail whose segment took no write for `idle`, so compaction can reach what it holds
-    ///
-    /// Compaction never rewrites an open segment, so a tail that stops getting writes would
-    /// hold its records, dead or not, until the volume closes.
     pub(crate) fn seal_idle_tails(&self, idle: Duration) -> Result<()> {
         let now = Instant::now();
         let mut seen = lock(&self.idle);
@@ -568,10 +565,7 @@ impl ReelStore {
     /// the segment with the highest dead fraction past the effective threshold,
     /// rewrites its live records, and retires it. A named rate is held inside the
     /// pass, so a paced volume returns when the bytes it moved have been paid for.
-    /// Compact until no sealed segment is past the dead ratio, so a close leaves no debt behind
-    ///
-    /// The rate gate and the pressure model are for a store with foreground work; at a close
-    /// there is none, so every segment past the configured ratio goes.
+    /// Compact every sealed segment past the dead ratio, ignoring the rate gate, so a close leaves no debt behind
     pub fn drain(&self) -> Result<()> {
         if self.is_read_only {
             return Ok(());

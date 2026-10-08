@@ -137,7 +137,7 @@ seal.
 
 A key merge bounds it. Once more than eight runs stand over one key, the
 maintenance tick merges the walk's runs into a key run, a file of sorted rows that
-each hold a key, its sequence number and the place its record lies. The merge
+each give the place of a footer row: which segment, and which row of its footer. The merge
 keeps the newest row of each key and moves no record. The spot index never hears
 of it, and a covered segment keeps its records and its footer for gets and for
 recovery. A walk reads the key run in place of the footers it covers, so it merges
@@ -146,8 +146,9 @@ twice what the merge has taken, so young runs merge often and cheaply, and a lar
 run is merged again only once the pile below it has grown to its size.
 
 That is a leveled merge of the keys alone. WiscKey splits keys from values the same
-way, and here the values already sit apart in the log. A row costs its key plus 21
-bytes, so a merge rewrites a small share of what was written.
+way, and here the values already sit apart in the log. A row is 8 bytes, since the
+key and the rest of the row are already in the footer, so a merge rewrites a small
+share of what was written and the run adds little to the volume.
 
 Compaction still reclaims dead space by rewriting segments, and a rewrite moves
 records out from under a key run. The run keeps standing. Each copy keeps its

@@ -161,9 +161,10 @@ release, an eviction and a compaction move never count one record twice.
 | open | every key the load takes a fresh slot for, at its row's length |
 | tail over a sealed key at open | the sealed version out of the count and the spot index |
 
-An open loads a covered segment's keys from the key run over it, since the run
-keeps one row a key and a footer can still hold a version whose newer one died in a
-retired segment, and it releases every standing cover before it returns. `totals()`,
+An open loads a covered segment's footer through the key run over it, taking only
+the rows the run picked, since the run keeps one row a key and a footer can still
+hold a version whose newer one died in a retired segment, and it releases every
+standing cover before it returns. `totals()`,
 `column_totals` and `prefix_totals` answer exactly, up to spot hash collisions in
 the count and `spot_slack()` in the bytes, and a reopen answers what the volume
 answered before it. `paged_totals_model.rs` and the differential fixture check it.

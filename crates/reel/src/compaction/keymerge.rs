@@ -8,9 +8,10 @@ use crate::compaction::compactor::{Compactor, PassClaim};
 use crate::error::{ReelError, Result};
 use crate::format::column::ColumnId;
 use crate::format::footer::{FooterPartition, SegmentFooter};
-use crate::format::loc::{Loc, SegmentId};
-use crate::index::keyrun::{key_in, row_in, KeyRun, RunColumn, RunRow, RunWriter};
+use crate::format::loc::SegmentId;
+use crate::index::keyrun::{FooterRows, KeyRun, RowReader, RunColumn, RunPointer, RunRow, RunWriter};
 use crate::index::map::ReelIndex;
+use crate::index::paged::FooterSource;
 use crate::reel::Reel;
 
 /// What one key-run merge did
@@ -49,43 +50,93 @@ enum Cursor<'a> {
         at: usize,
     },
     Keys {
-        rows: &'a [u8],
         column: &'a RunColumn,
+        rows: FooterRows,
         at: u64,
+
+        /// The row the cursor stands on, read through its footer, or nothing once past the last
+        current: Option<(Vec<u8>, RunRow, u32)>,
     },
 }
 
-impl Cursor<'_> {
+impl<'a> Cursor<'a> {
+    /// A cursor on a key run's column, standing on its first row that reads
+    fn keys(
+        footers: &Arc<dyn FooterSource>,
+        run: &Arc<KeyRun>,
+        column: &'a RunColumn,
+        standing: &HashSet<SegmentId>,
+    ) -> Result<Cursor<'a>> {
+        let rows = FooterRows::new(Arc::clone(footers), Arc::clone(run), column.column, &|segment| {
+            standing.contains(&segment)
+        });
+        let mut cursor = Cursor::Keys {
+            column,
+            rows,
+            at: 0,
+            current: None,
+        };
+        cursor.settle()?;
+        Ok(cursor)
+    }
+
+    /// Read the key run cursor's row at `at`, stepping past rows into segments gone
+    fn settle(&mut self) -> Result<()> {
+        let Cursor::Keys {
+            column,
+            rows,
+            at,
+            current,
+        } = self
+        else {
+            return Ok(());
+        };
+        let mut key = current.take().map(|(key, _, _)| key).unwrap_or_default();
+        while *at < column.rows() {
+            let pointer = rows.run().pointer(column, *at);
+            if let Some((found, row)) = rows.read(pointer)? {
+                key.clear();
+                key.extend_from_slice(found);
+                *current = Some((key, row, pointer.row));
+                return Ok(());
+            }
+            *at += 1;
+        }
+        Ok(())
+    }
+
     /// The cursor's current key, nothing once it is past its rows
     fn key(&self) -> Option<&[u8]> {
         match self {
             Cursor::Footer { rows, at, .. } => rows.key_at(*at),
-            Cursor::Keys { rows, column, at } => {
-                (*at < column.rows()).then(|| key_in(rows, column, *at as usize))
-            }
+            Cursor::Keys { current, .. } => current.as_ref().map(|(key, _, _)| key.as_slice()),
         }
     }
 
-    /// The cursor's current row, with the place its record lies
-    fn row(&self) -> Result<RunRow> {
+    /// The cursor's current row, and the row's place in its own segment's footer partition
+    fn row(&self) -> Result<(RunRow, u32)> {
         match self {
             Cursor::Footer { segment, rows, at } => {
-                let row = rows.row_at(*at)?;
-                Ok(RunRow {
-                    lsn: row.lsn,
-                    loc: Loc::new(*segment, row.offset, row.len),
-                    flags: row.flags,
-                })
+                Ok((RunRow::of(*segment, rows.row_at(*at)?), *at as u32))
             }
-            Cursor::Keys { rows, column, at } => Ok(row_in(rows, column, *at as usize)?.1),
+            Cursor::Keys { current, .. } => current
+                .as_ref()
+                .map(|(_, row, place)| (*row, *place))
+                .ok_or_else(|| ReelError::Corruption("a spent key run cursor was read".to_string())),
         }
     }
 
     /// Step to the next row
-    fn advance(&mut self) {
+    fn advance(&mut self) -> Result<()> {
         match self {
-            Cursor::Footer { at, .. } => *at += 1,
-            Cursor::Keys { at, .. } => *at += 1,
+            Cursor::Footer { at, .. } => {
+                *at += 1;
+                Ok(())
+            }
+            Cursor::Keys { at, .. } => {
+                *at += 1;
+                self.settle()
+            }
         }
     }
 }
@@ -170,26 +221,7 @@ pub fn merge_into_key_run(
         ));
     }
 
-    let root = shared.volumes.roots()[0].clone();
-    let id = index.key_runs().draw_id();
-    let mut writer = RunWriter::create(&shared.driver, &root, id)?;
-    let mut report = MergeReport {
-        runs_merged: sources.len() as u64,
-        ..MergeReport::default()
-    };
-    let written = (|| -> Result<()> {
-        for (column, width) in &columns {
-            writer.begin_column(*column, *width)?;
-            merge_column(&sources, *column, &standing, &mut writer, &mut report)?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = written {
-        writer.abandon();
-        return Err(error);
-    }
-
-    // Covering a segment the merge skipped would hide its rows from the walk
+    // Covering a segment the merge skipped would hide its rows from the walk, and the rows point into this list by place
     let mut covered: BTreeSet<SegmentId> = sources
         .iter()
         .filter_map(|source| match source {
@@ -206,6 +238,28 @@ pub fn merge_into_key_run(
         );
     }
     let covered: Vec<SegmentId> = covered.into_iter().collect();
+
+    let root = shared.volumes.roots()[0].clone();
+    let id = index.key_runs().draw_id();
+    let mut writer = RunWriter::create(&shared.driver, &root, id)?;
+    let mut report = MergeReport {
+        runs_merged: sources.len() as u64,
+        ..MergeReport::default()
+    };
+    let footers: Arc<dyn FooterSource> = Arc::clone(shared) as Arc<dyn FooterSource>;
+    let written = (|| -> Result<()> {
+        for (column, width) in &columns {
+            writer.begin_column(*column, *width)?;
+            merge_column(
+                &footers, &sources, *column, &standing, &covered, &mut writer, &mut report,
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = written {
+        writer.abandon();
+        return Err(error);
+    }
     let before = index.key_runs().covered();
     report.segments_covered = covered
         .iter()
@@ -224,9 +278,11 @@ pub fn merge_into_key_run(
 
 /// Write one column's newest row of each key across every source, in key order
 fn merge_column(
+    footers: &Arc<dyn FooterSource>,
     sources: &[Source],
     column: ColumnId,
     standing: &HashSet<SegmentId>,
+    covered: &[SegmentId],
     writer: &mut RunWriter<'_>,
     report: &mut MergeReport,
 ) -> Result<()> {
@@ -244,11 +300,7 @@ fn merge_column(
             }
             Source::Keys(run) => {
                 if let Some(held) = run.column(column) {
-                    cursors.push(Cursor::Keys {
-                        rows: run.rows(held),
-                        column: held,
-                        at: 0,
-                    });
+                    cursors.push(Cursor::keys(footers, run, held, standing)?);
                 }
             }
         }
@@ -265,26 +317,40 @@ fn merge_column(
         key.clear();
         key.extend_from_slice(cursors[top].key().unwrap_or_default());
         // Only rows in standing segments count, since the rest point at moved or dropped records
-        let mut newest: Option<RunRow> = None;
+        let mut newest: Option<(RunRow, u32)> = None;
         let mut seen = 0u64;
         while let Some(&top) = heap.first() {
             if cursors[top].key() != Some(key.as_slice()) {
                 break;
             }
-            let row = cursors[top].row()?;
+            let (row, place) = cursors[top].row()?;
             seen += 1;
-            if standing.contains(&row.loc.segment) && newest.is_none_or(|held| held.lsn < row.lsn) {
-                newest = Some(row);
+            if standing.contains(&row.loc.segment)
+                && newest.is_none_or(|(held, _)| held.lsn < row.lsn)
+            {
+                newest = Some((row, place));
             }
-            cursors[top].advance();
+            cursors[top].advance()?;
             if cursors[top].key().is_none() {
                 heap.swap_remove(0);
             }
             sift_down(&mut heap, &cursors, 0);
         }
         report.rows_shadowed += seen.saturating_sub(1);
-        if let Some(row) = newest {
-            writer.push(&key, row)?;
+        if let Some((row, place)) = newest {
+            let at = covered.binary_search(&row.loc.segment).map_err(|_| {
+                ReelError::Corruption(format!(
+                    "a merged row points at segment {}, which the run does not cover",
+                    row.loc.segment.as_u32()
+                ))
+            })?;
+            writer.push(
+                &key,
+                RunPointer {
+                    covered: at as u32,
+                    row: place,
+                },
+            )?;
         }
     }
     Ok(())

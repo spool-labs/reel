@@ -21,6 +21,7 @@ use crate::format::record::{
     RecordHeader, RecordLayout, HEADER_LEN, KEYLESS_PREFIX,
 };
 use crate::index::map::{KeyRepoint, ReelIndex};
+use crate::index::paged::FooterSource;
 use crate::io::op::Part;
 use crate::reel::segment::{SegmentHandle, SegmentReader, READ_CHUNK};
 use crate::reel::{Reel, ReelShared, NOTHING_PURGED};
@@ -1211,7 +1212,7 @@ impl Compactor {
         staged: Option<Part>,
         drop_floor: Lsn,
     ) -> Result<TombstoneStep> {
-        if !should_carry(index, &record.header, drop_floor)? {
+        if !should_carry(reel, index, &record.header, drop_floor)? {
             // Nothing older is left for its grave to hide, and the retire takes the grave's origin with it
             if record.header.flags.is_tombstone() {
                 index.drop_grave(&record.header.key, record.header.lsn);
@@ -1627,7 +1628,12 @@ fn footer_order(footer: &SegmentFooter) -> Option<(Vec<(u32, u32)>, u64)> {
 /// A newer entry in the index says the key is live again, so the delete is finished.
 /// Otherwise the floor decides: a tombstone at or above it is still holding its key's
 /// place against a record that has not landed yet.
-fn should_carry(index: &ReelIndex, tombstone: &RecordHeader, drop_floor: Lsn) -> Result<bool> {
+fn should_carry(
+    reel: &Reel,
+    index: &ReelIndex,
+    tombstone: &RecordHeader,
+    drop_floor: Lsn,
+) -> Result<bool> {
     if tombstone.flags.is_tombstone() {
         if let Some(entry) = index.get(&tombstone.key)? {
             if entry.lsn > tombstone.lsn {
@@ -1643,7 +1649,9 @@ fn should_carry(index: &ReelIndex, tombstone: &RecordHeader, drop_floor: Lsn) ->
             tombstone.key.column,
             tombstone.key.as_slice(),
             tombstone.lsn,
-        ),
+            &(Arc::clone(reel.shared()) as Arc<dyn FooterSource>),
+            &|segment| index.holds_sealed(segment),
+        )?,
     };
     Ok(is_held_below || tombstone.lsn >= drop_floor)
 }

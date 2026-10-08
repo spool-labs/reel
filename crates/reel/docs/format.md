@@ -259,20 +259,23 @@ finds, and any run a newer run covers whole.
 | column rows, in column order | column fences | directory | covered segments | trailer |
 ```
 
-A row is the key, then the sequence number, the segment, offset and length of the
-record, and its flags, which is 21 bytes past the key. A column of one key width
-strides at it. A column whose keys vary puts each key's two-byte length ahead of
-it, and a table of eight-byte row starts after its rows. A block is the span of
-rows a search lands in: 8 KiB of rows at a fixed width, 128 rows at a varying one.
+A row is 8 bytes: the place of its segment in the covered list, then the place of
+its row in that segment's footer partition for the column. Everything else a row
+says, the key, the sequence number, the offset, the length and the flags, is in
+that footer row, which never changes once the seal writes it. A block is 64 rows.
 Each column's fences hold the first key of every block and the column's last key,
-each behind its length. The directory gives each column its id, key width, block
-rows, row count, where its rows start, their length and where its fences start,
-39 bytes a column. The covered segments are the ones whose footers the run answers
-for in a walk. The trailer is 20 bytes: where the directory starts, the column
-count, the covered count and the magic `KRUN`.
+each behind its length, so a seek finds its block without reading a row and then
+searches the block through the footers. The directory gives each column its id,
+key width, block rows, row count, where its rows start and where its fences start,
+31 bytes a column. The covered segments are the ones whose footers the run answers
+for in a walk, in the order the rows point into them. The trailer is 20 bytes: where the
+directory starts, the column count, the covered count and the magic `KRN2`.
 
-A key run holds nothing the footers lack. The footers stay the authority for gets
-and for recovery, so a run that is lost only gives its segments back to the walk.
+A key run holds nothing the footers lack, only an order over their rows. The
+footers stay the authority for gets and for recovery, so a run that is lost only
+gives its segments back to the walk. A row into a segment compaction has retired
+reads as nothing: its live records were copied into the map or a newer footer
+before the retire, and a walk skips it.
 An open unlinks a run it cannot parse, so this layout changes without a format
 version.
 

@@ -390,8 +390,7 @@ impl ReelStore {
                 }
             }
         }
-        // A seal whose cut was lost left its rows after the footer, and every reader looks
-        // for the footer at the file's end, so the cut is made before anything reads it.
+        // Every reader looks for the footer at the file's end, so a lost cut is made before anything reads
         if !is_read_only {
             for (path, end) in &rebuilt.cuts {
                 let file = driver.open(path, false)?;

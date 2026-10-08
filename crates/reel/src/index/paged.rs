@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::error::Result;
+use crate::error::{ReelError, Result};
 use crate::format::block::{FooterMap, RowBlock, BLOCK_BYTES};
 use crate::format::column::{ColumnId, KeyBytes};
 use crate::format::footer::{FooterFind, FooterRow, SegmentFooter};
@@ -51,6 +51,67 @@ pub trait FooterSource: Send + Sync {
         match partition.lookup(key)? {
             FooterFind::Found(row) => Ok(Some(row)),
             FooterFind::RuledOut | FooterFind::Missing => Ok(None),
+        }
+    }
+
+    /// The rows of a segment's partition that hold one row, by its place in the partition, or nothing for a segment gone
+    fn rows_holding(
+        &self,
+        segment: SegmentId,
+        column: ColumnId,
+        row: u32,
+    ) -> Result<Option<RowsAt>> {
+        let Some(footer) = self.footer(segment)? else {
+            return Ok(None);
+        };
+        RowsAt::whole(footer, column, row).map(Some)
+    }
+}
+
+/// Footer rows that hold a row a key run points at: one block, or a whole partition already parsed
+pub enum RowsAt {
+    /// One block of a partition, read through the footer's directory
+    Block(Arc<RowBlock>),
+
+    /// A whole parsed footer and which of its partitions holds the column
+    Whole(Arc<SegmentFooter>, usize),
+}
+
+impl RowsAt {
+    /// A parsed footer's partition for a column, refused when it holds no such row
+    pub fn whole(footer: Arc<SegmentFooter>, column: ColumnId, row: u32) -> Result<RowsAt> {
+        let partition = footer
+            .partitions
+            .iter()
+            .position(|rows| rows.column == column && (row as usize) < rows.len())
+            .ok_or_else(|| ReelError::Corruption(format!("a key run points past a footer's rows at {row}")))?;
+        Ok(RowsAt::Whole(footer, partition))
+    }
+
+    /// Whether these rows hold the row at a place in the partition
+    pub fn holds(&self, row: u32) -> bool {
+        let row = row as usize;
+        match self {
+            RowsAt::Block(block) => (block.first()..block.first() + block.len()).contains(&row),
+            RowsAt::Whole(footer, partition) => row < footer.partitions[*partition].len(),
+        }
+    }
+
+    /// The key and row at a place in the partition
+    pub fn read(&self, row: u32) -> Result<(&[u8], FooterRow)> {
+        let row = row as usize;
+        let missing = || ReelError::Corruption(format!("a key run points past a footer's rows at {row}"));
+        match self {
+            RowsAt::Block(block) => {
+                let at = row.checked_sub(block.first()).ok_or_else(missing)?;
+                let key = block.key_at(at).ok_or_else(missing)?;
+                Ok((key, block.row_at(at)?))
+            }
+            RowsAt::Whole(footer, partition) => {
+                let rows = &footer.partitions[*partition];
+                let key = rows.key_at(row).ok_or_else(missing)?;
+                Ok((key, rows.row_at(row)?))
+            }
         }
     }
 }

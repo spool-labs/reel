@@ -1,11 +1,13 @@
 //! Key runs answer every walk and get as the footers they merged would
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use tempfile::TempDir;
 
 use reel::config::{CompactRate, ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec};
+use reel::index::keyrun::{FooterRows, RowReader};
 use reel::units::ByteCount;
 use reel::{CompactPass, KeyWidth, ReelStore};
 use reel_core::{Direction, Store};
@@ -245,26 +247,40 @@ fn key_runs_of_varying_keys_answer_as_the_model_on_four_tails() {
 /// The scenarios below rewrite a segment at this dead share, so half-dead ones go
 const HALF_DEAD: f64 = 0.3;
 
-/// Whether an older run points a key at a retired segment and a newer run at a standing one
+/// Whether an older run still points into a retired segment while a later run reads this key from a standing one
 fn is_stale_under_fresh(store: &ReelStore, key: &[u8]) -> bool {
     let index = store.index();
-    let mut seen = Vec::new();
+    let Some(footers) = index.footers() else {
+        return false;
+    };
+    let stands = |segment| index.holds_sealed(segment);
+    let mut is_stale = false;
     for run in index.key_runs().runs() {
         let Some(column) = run.column(ColumnId(1)) else {
             continue;
         };
-        let at = run.seek(column, key, false);
-        if at >= column.rows() {
+        let mut rows = FooterRows::new(Arc::clone(footers), Arc::clone(&run), ColumnId(1), &stands);
+        let Ok(mut at) = run.seek(column, key, false, &mut rows) else {
             continue;
-        }
-        if let Ok((found, row)) = reel::index::keyrun::row_in(run.rows(column), column, at as usize)
-        {
-            if found == key {
-                seen.push(index.holds_sealed(row.loc.segment));
+        };
+        while at < column.rows() {
+            match rows.read(run.pointer(column, at)) {
+                Ok(Some((found, _))) => {
+                    if found == key && is_stale {
+                        return true;
+                    }
+                    break;
+                }
+                Ok(None) => at += 1,
+                Err(_) => break,
             }
         }
+        is_stale |= (0..column.rows()).any(|at| {
+            run.segment_of(run.pointer(column, at))
+                .is_some_and(|segment| !stands(segment))
+        });
     }
-    seen.windows(2).any(|pair| !pair[0] && pair[1])
+    false
 }
 
 /// Seal what the tails hold and run maintenance until its merges have caught up
@@ -330,7 +346,7 @@ fn a_rewritten_record_answers_through_the_newer_run() {
         (1..900)
             .step_by(2)
             .any(|n| is_stale_under_fresh(&store, &key_of(n))),
-        "no key has a run pointing into its retired segment ahead of a run pointing at its copy"
+        "no older run points into a retired segment ahead of a run reading the key from its copy"
     );
     check(&store, &model, "after the rewrite");
 

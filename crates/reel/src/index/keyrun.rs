@@ -1,5 +1,4 @@
-//! Key runs: sorted rows pointing at each record where it lies, merged without moving one
-//! Footers still serve point reads and recovery, so a lost run just returns its segments to the walk
+//! Key runs: the address of each key's newest footer row, in key order, so a lost run only returns its segments to the walk
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -8,33 +7,31 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use crate::error::{ReelError, Result};
 use crate::format::column::ColumnId;
-use crate::format::footer::VARYING_WIDTH;
+use crate::format::footer::{FooterRow, VARYING_WIDTH};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{read_u32_le, read_u64_le, Flags};
+use crate::index::paged::{FooterSource, RowsAt};
 use crate::io::mapping::Mapping;
 use crate::io::op::{FileId, WriteBuf};
 use crate::reel::segment::IoDriver;
 
-/// One fence lead covers this many bytes of rows, so a search touches a page or two
-const BLOCK_BYTES: usize = 8 * 1024;
+/// A row takes this many bytes: its segment's place in the covered list, then its place in that segment's footer partition
+pub const ROW_LEN: usize = 4 + 4;
 
-/// A row takes this many bytes past its key: sequence, segment, offset, length and flags
-pub const ROW_TAIL: usize = 8 + 4 + 4 + 4 + 1;
+/// A block holds this many rows, and each block's first key stands as its fence
+const RUN_BLOCK_ROWS: u32 = 64;
 
 /// The writer gathers this many bytes before each write, so rows go down in large writes
 const WRITE_BYTES: usize = 1 << 20;
 
-/// A block of a varying-width column holds this many rows
-const VARYING_BLOCK_ROWS: u32 = 128;
-
-/// A directory row takes this many bytes: column, width, block rows, rows, rows at, row bytes, fences at
-const DIRECTORY_ROW: usize = 1 + 2 + 4 + 8 + 8 + 8 + 8;
+/// A directory row takes this many bytes: column, width, block rows, rows, rows at, fences at
+const DIRECTORY_ROW: usize = 1 + 2 + 4 + 8 + 8 + 8;
 
 /// The trailer takes this many bytes: directory at, columns, covered count, magic
 const TRAILER: usize = 8 + 4 + 4 + 4;
 
-const MAGIC: u32 = u32::from_le_bytes(*b"KRUN");
+const MAGIC: u32 = u32::from_le_bytes(*b"KRN2");
 
 /// Every key run's file name ends in this, so no segment scan mistakes one for a segment
 pub const KEY_RUN_SUFFIX: &str = ".keys";
@@ -54,7 +51,7 @@ pub fn key_run_path(root: &Path, id: u64) -> PathBuf {
     root.join(key_run_name(id))
 }
 
-/// What one row says about its record
+/// What one row says about its record, once read through its footer
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RunRow {
     /// Sequence number of the record, which orders a key's versions
@@ -67,13 +64,119 @@ pub struct RunRow {
     pub flags: Flags,
 }
 
+impl RunRow {
+    /// A footer row of a segment, as a run row
+    pub fn of(segment: SegmentId, found: FooterRow) -> RunRow {
+        RunRow {
+            lsn: found.lsn,
+            loc: Loc::new(segment, found.offset, found.len),
+            flags: found.flags,
+        }
+    }
+}
+
+/// Where a run row's footer row lies: which covered segment, and the row's place in its partition
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RunPointer {
+    /// The segment's place in the run's covered list
+    pub covered: u32,
+
+    /// The row's place in that segment's footer partition for the column
+    pub row: u32,
+}
+
+/// Reads the footer row a run row points at
+pub trait RowReader {
+    /// The key and row a pointer leads to, or nothing for a segment the reader skips
+    fn read(&mut self, pointer: RunPointer) -> Result<Option<(&[u8], RunRow)>>;
+}
+
+/// A segment a reader was told stands had gone by the time its rows were asked for
+pub fn vanished(segment: SegmentId) -> ReelError {
+    ReelError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("segment {} retired under a key run read", segment.as_u32()),
+    ))
+}
+
+/// Whether an error is a standing segment gone mid-read, which a caller retries or skips
+pub fn is_vanished(error: &ReelError) -> bool {
+    matches!(error, ReelError::Io(source) if source.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Reads one run column's rows through the footers, keeping each covered segment's last block so a walk in key order reads each block once
+pub struct FooterRows {
+    footers: Arc<dyn FooterSource>,
+    run: Arc<KeyRun>,
+    column: ColumnId,
+
+    /// Whether each covered segment still stands, by its place in the covered list
+    stands: Vec<bool>,
+
+    /// Each covered segment's last rows read
+    held: Vec<Option<RowsAt>>,
+}
+
+impl FooterRows {
+    /// A reader of one run's column, skipping rows into segments `stands` rules out
+    pub fn new(
+        footers: Arc<dyn FooterSource>,
+        run: Arc<KeyRun>,
+        column: ColumnId,
+        stands: &dyn Fn(SegmentId) -> bool,
+    ) -> FooterRows {
+        let stands = run.covered.iter().map(|segment| stands(*segment)).collect();
+        let held = (0..run.covered.len()).map(|_| None).collect();
+        FooterRows {
+            footers,
+            run,
+            column,
+            stands,
+            held,
+        }
+    }
+
+    /// The run this reader reads
+    pub fn run(&self) -> &Arc<KeyRun> {
+        &self.run
+    }
+}
+
+impl RowReader for FooterRows {
+    fn read(&mut self, pointer: RunPointer) -> Result<Option<(&[u8], RunRow)>> {
+        let at = pointer.covered as usize;
+        let Some(&segment) = self.run.covered.get(at) else {
+            return Err(ReelError::Corruption(format!(
+                "a key run row names covered segment {at} of {}",
+                self.run.covered.len()
+            )));
+        };
+        if !self.stands[at] {
+            return Ok(None);
+        }
+        if !self.held[at]
+            .as_ref()
+            .is_some_and(|rows| rows.holds(pointer.row))
+        {
+            let rows = self
+                .footers
+                .rows_holding(segment, self.column, pointer.row)?
+                .ok_or_else(|| vanished(segment))?;
+            self.held[at] = Some(rows);
+        }
+        let rows = self.held[at].as_ref().ok_or_else(|| vanished(segment))?;
+        let (key, found) = rows.read(pointer.row)?;
+        Ok(Some((key, RunRow::of(segment, found))))
+    }
+}
+
 /// One column's rows in a key run
 #[derive(Clone, Debug)]
 pub struct RunColumn {
     /// Every row belongs to this column
     pub column: ColumnId,
 
-    /// Every key in the column has this width, or VARYING_WIDTH where each row says its own
+    /// Every key in the column has this width, or VARYING_WIDTH where keys differ
     pub key_width: u16,
 
     /// Each block holds this many rows, the last one holding the rest
@@ -84,9 +187,6 @@ pub struct RunColumn {
 
     /// Where the column's first row lies in the file
     rows_at: u64,
-
-    /// The rows' length in bytes, ahead of a varying column's table of row starts
-    rows_len: u64,
 
     /// Each block's first key, back to back
     fences: Vec<u8>,
@@ -99,24 +199,6 @@ pub struct RunColumn {
 }
 
 impl RunColumn {
-    /// Row size in bytes, in a column of one key width
-    pub fn stride(&self) -> usize {
-        self.key_width as usize + ROW_TAIL
-    }
-
-    /// Whether each row holds its own key width
-    pub fn is_varying(&self) -> bool {
-        self.key_width == VARYING_WIDTH
-    }
-
-    /// The region's length in bytes: its rows, and a varying column's table of starts
-    fn region_len(&self) -> u64 {
-        match self.is_varying() {
-            true => self.rows_len + self.rows * 8,
-            false => self.rows_len,
-        }
-    }
-
     /// The column's row count
     pub fn rows(&self) -> u64 {
         self.rows
@@ -125,11 +207,6 @@ impl RunColumn {
     /// The column's block count
     pub fn blocks(&self) -> u32 {
         self.rows.div_ceil(u64::from(self.block_rows)) as u32
-    }
-
-    /// Rows per block, fewer only in the last one
-    pub fn block_rows(&self) -> u32 {
-        self.block_rows
     }
 
     /// The column's lowest and highest key, nothing for an empty column
@@ -200,7 +277,7 @@ pub struct KeyRun {
     /// Each column's rows, in column order
     columns: Vec<RunColumn>,
 
-    /// The run stands in for these data segments' footers in a walk
+    /// The segments whose footers the run stands in for, which its rows point into by place
     pub covered: Vec<SegmentId>,
 
     /// The file's size in bytes, which a merge reading it pays
@@ -252,26 +329,13 @@ impl KeyRun {
             let block_rows = read_u32_le(&row[3..7]);
             let rows = read_u64_le(&row[7..15]);
             let rows_at = read_u64_le(&row[15..23]);
-            let rows_len = read_u64_le(&row[23..31]);
-            let fences_at = read_u64_le(&row[31..39]);
+            let fences_at = read_u64_le(&row[23..31]);
             if key_width == 0 || block_rows == 0 {
                 return Err(corrupt("a column with no width or no block size"));
             }
-            let is_varying = key_width == VARYING_WIDTH;
-            let stride = u64::from(key_width) + ROW_TAIL as u64;
-            if !is_varying && rows.checked_mul(stride) != Some(rows_len) {
-                return Err(corrupt("a column's rows do not fill its stride"));
-            }
-            let table = match is_varying {
-                true => rows
-                    .checked_mul(8)
-                    .ok_or_else(|| corrupt("a column too long to hold"))?,
-                false => 0,
-            };
             span(
                 rows_at,
-                rows_len
-                    .checked_add(table)
+                rows.checked_mul(ROW_LEN as u64)
                     .ok_or_else(|| corrupt("a column too long to hold"))?,
             )?;
             let blocks = rows.div_ceil(u64::from(block_rows));
@@ -297,7 +361,6 @@ impl KeyRun {
                 block_rows,
                 rows,
                 rows_at,
-                rows_len,
                 fences,
                 fence_at,
                 last,
@@ -332,31 +395,56 @@ impl KeyRun {
         &self.columns
     }
 
-    /// A column's rows back to back, and a varying column's table of starts, in place in the file
-    pub fn rows(&self, column: &RunColumn) -> &[u8] {
-        let at = column.rows_at as usize;
-        // Open checked that every column's region lies inside the file
-        &self.backing.bytes()[at..at + column.region_len() as usize]
+    /// Where one of a column's rows points
+    pub fn pointer(&self, column: &RunColumn, at: u64) -> RunPointer {
+        // Open checked that every column's rows lie inside the file
+        let start = (column.rows_at + at * ROW_LEN as u64) as usize;
+        let row = &self.backing.bytes()[start..start + ROW_LEN];
+        RunPointer {
+            covered: read_u32_le(&row[0..4]),
+            row: read_u32_le(&row[4..8]),
+        }
     }
 
-    /// The first row at or past a key, or strictly past it with `is_past`
-    pub fn seek(&self, column: &RunColumn, key: &[u8], is_past: bool) -> u64 {
-        let rows = self.rows(column);
+    /// The segment a pointer points into, or nothing for a place past the covered list
+    pub fn segment_of(&self, pointer: RunPointer) -> Option<SegmentId> {
+        self.covered.get(pointer.covered as usize).copied()
+    }
+
+    /// The first row at or past a key, or strictly past it with `is_past`, stepping over rows the reader skips
+    pub fn seek(
+        &self,
+        column: &RunColumn,
+        key: &[u8],
+        is_past: bool,
+        rows: &mut dyn RowReader,
+    ) -> Result<u64> {
+        if column.rows == 0 {
+            return Ok(0);
+        }
         let (first, count) = column.block_span(column.block_for(key));
         let (mut low, mut high) = (first, first + u64::from(count));
         while low < high {
             let mid = (low + high) / 2;
-            let held = key_in(rows, column, mid as usize);
-            let is_before = match is_past {
-                true => held <= key,
-                false => held < key,
-            };
-            match is_before {
-                true => low = mid + 1,
-                false => high = mid,
+            // The first row from the middle on that reads, standing in for the skipped ones before it
+            let mut probe = mid;
+            let mut found = None;
+            while probe < high {
+                if let Some((held, _)) = rows.read(self.pointer(column, probe))? {
+                    found = Some(match is_past {
+                        true => held <= key,
+                        false => held < key,
+                    });
+                    break;
+                }
+                probe += 1;
+            }
+            match found {
+                Some(true) => low = probe + 1,
+                Some(false) | None => high = mid,
             }
         }
-        low
+        Ok(low)
     }
 
     /// Unlink a retired run's file, which walks still holding the run can keep reading
@@ -406,20 +494,41 @@ impl KeyRunSet {
         crate::sync::try_lock(&self.merging)
     }
 
-    /// Whether a run holds a row for a key below a sequence number
-    pub fn holds_older(&self, column: ColumnId, key: &[u8], lsn: Lsn) -> bool {
-        self.runs().iter().any(|run| {
+    /// Whether a run holds a row for a key below a sequence number in a standing segment, the only rows a walk can serve
+    pub fn holds_older(
+        &self,
+        column: ColumnId,
+        key: &[u8],
+        lsn: Lsn,
+        footers: &Arc<dyn FooterSource>,
+        stands: &dyn Fn(SegmentId) -> bool,
+    ) -> Result<bool> {
+        for run in self.runs() {
             let Some(held) = run.column(column) else {
-                return false;
+                continue;
             };
-            if !held.is_varying() && key.len() != held.key_width as usize {
-                return false;
+            let mut rows = FooterRows::new(Arc::clone(footers), Arc::clone(&run), column, stands);
+            let mut at = match run.seek(held, key, false, &mut rows) {
+                Ok(at) => at,
+                Err(error) if is_vanished(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            // The seek lands past rows whose segment is gone, so the first one that reads is the answer
+            while at < held.rows() {
+                match rows.read(run.pointer(held, at)) {
+                    Ok(Some((found, row))) => {
+                        if found == key && row.lsn < lsn {
+                            return Ok(true);
+                        }
+                        break;
+                    }
+                    Ok(None) => at += 1,
+                    Err(error) if is_vanished(&error) => at += 1,
+                    Err(error) => return Err(error),
+                }
             }
-            let at = run.seek(held, key, false);
-            at < held.rows()
-                && row_in(run.rows(held), held, at as usize)
-                    .is_ok_and(|(found, row)| found == key && row.lsn < lsn)
-        })
+        }
+        Ok(false)
     }
 
     /// Take the id for the next run
@@ -489,68 +598,14 @@ impl KeyRunSet {
     }
 }
 
-/// Where one row's key starts in a column's rows, and how long it is
-fn key_span(rows: &[u8], column: &RunColumn, at: usize) -> Option<(usize, usize)> {
-    if !column.is_varying() {
-        return Some((at * column.stride(), column.key_width as usize));
-    }
-    let table = column.rows_len as usize + at * 8;
-    let start = read_u64_le(rows.get(table..table + 8)?) as usize;
-    let len = u16::from_le_bytes([*rows.get(start)?, *rows.get(start + 1)?]) as usize;
-    Some((start + 2, len))
-}
-
-/// The key and the row at one row of a column's rows
-pub fn row_in<'a>(rows: &'a [u8], column: &RunColumn, at: usize) -> Result<(&'a [u8], RunRow)> {
-    let corrupt = || ReelError::Corruption("key run row is past its column".to_string());
-    let (start, width) = key_span(rows, column, at).ok_or_else(corrupt)?;
-    let row = rows
-        .get(start..start + width + ROW_TAIL)
-        .ok_or_else(corrupt)?;
-    let tail = &row[width..];
-    Ok((
-        &row[..width],
-        RunRow {
-            lsn: Lsn(read_u64_le(&tail[0..8])),
-            loc: Loc::new(
-                SegmentId(read_u32_le(&tail[8..12])),
-                read_u32_le(&tail[12..16]),
-                read_u32_le(&tail[16..20]),
-            ),
-            flags: Flags::from_bits(tail[20])?,
-        },
-    ))
-}
-
-/// The key at one row of a column's rows, without decoding the row
-pub fn key_in<'a>(rows: &'a [u8], column: &RunColumn, at: usize) -> &'a [u8] {
-    if !column.is_varying() {
-        let stride = column.stride();
-        return &rows[at * stride..at * stride + column.key_width as usize];
-    }
-    match key_span(rows, column, at) {
-        Some((start, width)) => rows.get(start..start + width).unwrap_or_default(),
-        None => &[],
-    }
-}
-
 /// A column being written, its rows already down and its fences gathered
 struct Building {
     column: ColumnId,
     key_width: u16,
-    block_rows: u32,
     rows: u64,
     rows_at: u64,
-    rows_len: u64,
     fences: Vec<u8>,
     last: Vec<u8>,
-    starts: Vec<u64>,
-}
-
-impl Building {
-    fn is_varying(&self) -> bool {
-        self.key_width == VARYING_WIDTH
-    }
 }
 
 /// Writes one key run, which shows up under its own name only once whole and synced
@@ -594,41 +649,19 @@ impl<'d> RunWriter<'d> {
                 "a key run's columns arrived out of order".to_string(),
             ));
         }
-        self.end_column()?;
-        let block_rows = match key_width == VARYING_WIDTH {
-            true => VARYING_BLOCK_ROWS,
-            false => (BLOCK_BYTES / (key_width as usize + ROW_TAIL)).max(1) as u32,
-        };
         self.columns.push(Building {
             column,
             key_width,
-            block_rows,
             rows: 0,
             rows_at: self.at + self.pending.len() as u64,
-            rows_len: 0,
             fences: Vec::new(),
             last: Vec::new(),
-            starts: Vec::new(),
         });
         Ok(())
     }
 
-    /// Close the open column, writing a varying one's table of row starts after its rows
-    fn end_column(&mut self) -> Result<()> {
-        let Some(building) = self.columns.last_mut() else {
-            return Ok(());
-        };
-        for start in std::mem::take(&mut building.starts) {
-            self.pending.extend_from_slice(&start.to_le_bytes());
-            if self.pending.len() >= WRITE_BYTES {
-                self.write_pending()?;
-            }
-        }
-        Ok(())
-    }
-
     /// Add one row to the open column, at a key above the last one it took
-    pub fn push(&mut self, key: &[u8], row: RunRow) -> Result<()> {
+    pub fn push(&mut self, key: &[u8], pointer: RunPointer) -> Result<()> {
         let building = self.columns.last_mut().ok_or_else(|| {
             ReelError::Rejected("a key run row came before any column".to_string())
         })?;
@@ -636,7 +669,7 @@ impl<'d> RunWriter<'d> {
             .ok()
             .filter(|width| *width != VARYING_WIDTH)
             .ok_or_else(|| ReelError::Rejected("a key run row's key is too wide".to_string()))?;
-        if !building.is_varying() && width != building.key_width {
+        if building.key_width != VARYING_WIDTH && width != building.key_width {
             return Err(ReelError::Rejected(
                 "a key run row is not its column's width".to_string(),
             ));
@@ -646,27 +679,16 @@ impl<'d> RunWriter<'d> {
                 "a key run's rows arrived out of order".to_string(),
             ));
         }
-        if building.rows.is_multiple_of(u64::from(building.block_rows)) {
+        if building.rows.is_multiple_of(u64::from(RUN_BLOCK_ROWS)) {
             building.fences.extend_from_slice(&width.to_le_bytes());
             building.fences.extend_from_slice(key);
         }
         building.last.clear();
         building.last.extend_from_slice(key);
         building.rows += 1;
-        if building.is_varying() {
-            building.starts.push(building.rows_len);
-            building.rows_len += 2;
-            self.pending.extend_from_slice(&width.to_le_bytes());
-        }
-        building.rows_len += (key.len() + ROW_TAIL) as u64;
-        self.pending.extend_from_slice(key);
-        self.pending.extend_from_slice(&row.lsn.pack());
         self.pending
-            .extend_from_slice(&row.loc.segment.as_u32().to_le_bytes());
-        self.pending
-            .extend_from_slice(&row.loc.offset.to_le_bytes());
-        self.pending.extend_from_slice(&row.loc.len.to_le_bytes());
-        self.pending.push(row.flags.bits());
+            .extend_from_slice(&pointer.covered.to_le_bytes());
+        self.pending.extend_from_slice(&pointer.row.to_le_bytes());
         if self.pending.len() >= WRITE_BYTES {
             self.write_pending()?;
         }
@@ -690,9 +712,8 @@ impl<'d> RunWriter<'d> {
         Ok(())
     }
 
-    /// Write the fences, the covered segments, the directory and the trailer, and put the run under its name
+    /// Write the fences, the covered segments the rows were written against, the directory and the trailer, and rename the run in place
     pub fn finish(mut self, covered: &[SegmentId]) -> Result<PathBuf> {
-        self.end_column()?;
         self.write_pending()?;
         let mut tail = Vec::new();
         let mut fences_at = Vec::with_capacity(self.columns.len());
@@ -706,10 +727,9 @@ impl<'d> RunWriter<'d> {
         for (building, fences_at) in self.columns.iter().zip(&fences_at) {
             tail.push(building.column.0);
             tail.extend_from_slice(&building.key_width.to_le_bytes());
-            tail.extend_from_slice(&building.block_rows.to_le_bytes());
+            tail.extend_from_slice(&RUN_BLOCK_ROWS.to_le_bytes());
             tail.extend_from_slice(&building.rows.to_le_bytes());
             tail.extend_from_slice(&building.rows_at.to_le_bytes());
-            tail.extend_from_slice(&building.rows_len.to_le_bytes());
             tail.extend_from_slice(&fences_at.to_le_bytes());
         }
         for segment in covered {
@@ -737,6 +757,7 @@ impl<'d> RunWriter<'d> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use super::*;
@@ -753,47 +774,68 @@ mod tests {
         u64::from(n).wrapping_mul(0x9E37_79B9).to_be_bytes()
     }
 
-    fn row(n: u32) -> RunRow {
-        RunRow {
-            lsn: Lsn(u64::from(n) + 7),
-            loc: Loc::new(SegmentId(n % 5 + 1), n * 3, n + 1),
-            flags: Flags::DATA,
+    /// Row n of the run points at row n of covered segment n % 3
+    fn pointer(n: u32) -> RunPointer {
+        RunPointer {
+            covered: n % 3,
+            row: n,
         }
     }
 
-    // a run reads back every row it was written with, in order
+    /// Reads a pointer's key out of the keys the run was written with, skipping the covered places listed gone
+    struct Keys {
+        keys: Vec<Vec<u8>>,
+        gone: HashSet<u32>,
+    }
+
+    impl RowReader for Keys {
+        fn read(&mut self, pointer: RunPointer) -> Result<Option<(&[u8], RunRow)>> {
+            if self.gone.contains(&pointer.covered) {
+                return Ok(None);
+            }
+            let row = RunRow {
+                lsn: Lsn(u64::from(pointer.row)),
+                loc: Loc::new(SegmentId(pointer.covered + 1), pointer.row, 1),
+                flags: Flags::DATA,
+            };
+            Ok(Some((self.keys[pointer.row as usize].as_slice(), row)))
+        }
+    }
+
+    fn written(driver: &Arc<IoDriver>, id: u64, keys: &[Vec<u8>], width: u16) -> KeyRun {
+        let mut writer = RunWriter::create(driver, Path::new(ROOT), id).expect("create");
+        writer.begin_column(ColumnId(1), width).expect("column");
+        for (n, key) in keys.iter().enumerate() {
+            writer.push(key, pointer(n as u32)).expect("push");
+        }
+        let path = writer
+            .finish(&[SegmentId(4), SegmentId(9), SegmentId(12)])
+            .expect("finish");
+        KeyRun::open(driver, &path, id).expect("open")
+    }
+
+    // a run reads back every pointer it was written with, in order, and its fences bound its keys
     #[test]
-    fn a_written_run_reads_back_its_rows() {
+    fn a_written_run_reads_back_its_pointers() {
         let sim = SimIo::new(FaultPlan::new(1));
         let driver = driver(&sim);
-        let mut keys: Vec<(Vec<u8>, u32)> = (0..2_000u32).map(|n| (key(n).to_vec(), n)).collect();
+        let mut keys: Vec<Vec<u8>> = (0..2_000u32).map(|n| key(n).to_vec()).collect();
         keys.sort();
-        let mut writer = RunWriter::create(&driver, Path::new(ROOT), 3).expect("create");
-        writer.begin_column(ColumnId(1), 8).expect("column");
-        for (key, n) in &keys {
-            writer.push(key, row(*n)).expect("push");
-        }
-        writer.begin_column(ColumnId(2), 8).expect("second column");
-        writer.push(&key(1), row(1)).expect("push");
-        let path = writer
-            .finish(&[SegmentId(4), SegmentId(9)])
-            .expect("finish");
-
-        let run = KeyRun::open(&driver, &path, 3).expect("open");
-        assert_eq!(run.covered, vec![SegmentId(4), SegmentId(9)]);
-        let column = run.column(ColumnId(1)).expect("column one");
+        let run = written(&driver, 3, &keys, 8);
+        assert_eq!(run.covered, vec![SegmentId(4), SegmentId(9), SegmentId(12)]);
+        let column = run.column(ColumnId(1)).expect("column");
         assert_eq!(column.rows(), 2_000);
-        let rows = run.rows(column);
-        for (at, (want, n)) in keys.iter().enumerate() {
-            let (got, got_row) = row_in(rows, column, at).expect("row");
-            assert_eq!(got, want.as_slice());
-            assert_eq!(got_row, row(*n));
+        for at in 0..keys.len() as u32 {
+            assert_eq!(run.pointer(column, u64::from(at)), pointer(at));
         }
-        assert!(
-            row_in(rows, column, keys.len()).is_err(),
-            "a row past the column read back"
+        assert_eq!(run.segment_of(pointer(4)), Some(SegmentId(9)));
+        assert_eq!(
+            column
+                .key_range()
+                .map(|(low, high)| (low.to_vec(), high.to_vec())),
+            Some((keys[0].clone(), keys[keys.len() - 1].clone()))
         );
-        assert_eq!(run.column(ColumnId(2)).expect("column two").rows(), 1);
+        assert_eq!(run.bytes, std::fs::metadata(&run.path).map_or(run.bytes, |held| held.len()));
     }
 
     // a seek lands on the first row at or past a key, or past it alone
@@ -801,33 +843,55 @@ mod tests {
     fn a_seek_lands_on_the_first_row_at_or_past_the_key() {
         let sim = SimIo::new(FaultPlan::new(1));
         let driver = driver(&sim);
-        let keys: Vec<[u8; 8]> = (0..5_000u64).map(|n| (n * 2).to_be_bytes()).collect();
-        let mut writer = RunWriter::create(&driver, Path::new(ROOT), 1).expect("create");
-        writer.begin_column(ColumnId(1), 8).expect("column");
-        for (n, key) in keys.iter().enumerate() {
-            writer.push(key, row(n as u32)).expect("push");
-        }
-        let path = writer.finish(&[]).expect("finish");
-        let run = KeyRun::open(&driver, &path, 1).expect("open");
+        let keys: Vec<Vec<u8>> = (0..5_000u64).map(|n| (n * 2).to_be_bytes().to_vec()).collect();
+        let run = written(&driver, 1, &keys, 8);
         let column = run.column(ColumnId(1)).expect("column");
+        let mut rows = Keys {
+            keys: keys.clone(),
+            gone: HashSet::new(),
+        };
         for probe in [0u64, 1, 2, 1_001, 4_000, 9_998, 9_999, 20_000] {
             let target = probe.to_be_bytes();
             let at = keys
                 .iter()
-                .position(|key| key >= &target)
+                .position(|key| key.as_slice() >= target.as_slice())
                 .unwrap_or(keys.len()) as u64;
             let past = keys
                 .iter()
-                .position(|key| key > &target)
+                .position(|key| key.as_slice() > target.as_slice())
                 .unwrap_or(keys.len()) as u64;
-            assert_eq!(run.seek(column, &target, false), at, "probe {probe} at");
-            assert_eq!(run.seek(column, &target, true), past, "probe {probe} past");
+            assert_eq!(run.seek(column, &target, false, &mut rows).expect("seek"), at, "probe {probe} at");
+            assert_eq!(run.seek(column, &target, true, &mut rows).expect("seek"), past, "probe {probe} past");
         }
     }
 
-    // a column whose keys vary in width reads back every row and seeks the way a fixed one does
+    // a seek steps past rows whose segment is gone, landing where the first row that reads at or past the key is next
     #[test]
-    fn a_varying_column_reads_back_and_seeks() {
+    fn a_seek_steps_past_rows_into_segments_gone() {
+        let sim = SimIo::new(FaultPlan::new(1));
+        let driver = driver(&sim);
+        let keys: Vec<Vec<u8>> = (0..5_000u64).map(|n| (n * 2).to_be_bytes().to_vec()).collect();
+        let run = written(&driver, 2, &keys, 8);
+        let column = run.column(ColumnId(1)).expect("column");
+        let mut rows = Keys {
+            keys: keys.clone(),
+            gone: [1u32].into_iter().collect(),
+        };
+        let reads = |at: usize| pointer(at as u32).covered != 1;
+        for probe in [0u64, 1, 2, 3, 7, 1_001, 4_000, 9_996, 9_997, 9_998, 9_999, 20_000] {
+            let target = probe.to_be_bytes();
+            let want = (0..keys.len()).find(|at| reads(*at) && keys[*at].as_slice() >= target.as_slice());
+            let mut at = run.seek(column, &target, false, &mut rows).expect("seek") as usize;
+            while at < keys.len() && !reads(at) {
+                at += 1;
+            }
+            assert_eq!((at < keys.len()).then_some(at), want, "probe {probe}");
+        }
+    }
+
+    // keys of different widths keep their own widths in the fences and seek the way fixed ones do
+    #[test]
+    fn a_varying_column_seeks_through_its_fences() {
         let sim = SimIo::new(FaultPlan::new(1));
         let driver = driver(&sim);
         let mut keys: Vec<Vec<u8>> = (0..3_000u32)
@@ -835,33 +899,18 @@ mod tests {
             .collect();
         keys.sort();
         keys.dedup();
-        let mut writer = RunWriter::create(&driver, Path::new(ROOT), 5).expect("create");
-        writer.begin_column(ColumnId(1), 8).expect("fixed column");
-        writer.push(&key(1), row(1)).expect("push");
-        writer
-            .begin_column(ColumnId(2), VARYING_WIDTH)
-            .expect("varying column");
-        for (n, key) in keys.iter().enumerate() {
-            writer.push(key, row(n as u32)).expect("push");
-        }
-        let path = writer.finish(&[SegmentId(2)]).expect("finish");
-        let run = KeyRun::open(&driver, &path, 5).expect("open");
-        assert_eq!(run.column(ColumnId(1)).expect("fixed").rows(), 1);
-        let column = run.column(ColumnId(2)).expect("varying");
-        assert!(column.is_varying());
-        let rows = run.rows(column);
-        for (at, want) in keys.iter().enumerate() {
-            let (got, got_row) = row_in(rows, column, at).expect("row");
-            assert_eq!(got, want.as_slice());
-            assert_eq!(key_in(rows, column, at), want.as_slice());
-            assert_eq!(got_row, row(at as u32));
-        }
+        let run = written(&driver, 5, &keys, VARYING_WIDTH);
+        let column = run.column(ColumnId(1)).expect("varying");
         assert_eq!(
             column
                 .key_range()
                 .map(|(low, high)| (low.to_vec(), high.to_vec())),
             Some((keys[0].clone(), keys[keys.len() - 1].clone()))
         );
+        let mut rows = Keys {
+            keys: keys.clone(),
+            gone: HashSet::new(),
+        };
         for probe in [
             b"k".to_vec(),
             b"k0".to_vec(),
@@ -877,8 +926,8 @@ mod tests {
                 .iter()
                 .position(|key| key > &probe)
                 .unwrap_or(keys.len()) as u64;
-            assert_eq!(run.seek(column, &probe, false), at, "probe {probe:?} at");
-            assert_eq!(run.seek(column, &probe, true), past, "probe {probe:?} past");
+            assert_eq!(run.seek(column, &probe, false, &mut rows).expect("seek"), at, "probe {probe:?} at");
+            assert_eq!(run.seek(column, &probe, true, &mut rows).expect("seek"), past, "probe {probe:?} past");
         }
     }
 
@@ -889,8 +938,26 @@ mod tests {
         let driver = driver(&sim);
         let mut writer = RunWriter::create(&driver, Path::new(ROOT), 2).expect("create");
         writer.begin_column(ColumnId(1), 8).expect("column");
-        writer.push(&key(9), row(9)).expect("push");
-        assert!(writer.push(&key(9), row(9)).is_err());
+        writer.push(&key(9), pointer(9)).expect("push");
+        assert!(writer.push(&key(9), pointer(9)).is_err());
         writer.abandon();
+    }
+
+    // a row takes eight bytes, whatever the key
+    #[test]
+    fn a_row_takes_eight_bytes_whatever_the_key() {
+        let sim = SimIo::new(FaultPlan::new(1));
+        let driver = driver(&sim);
+        let narrow: Vec<Vec<u8>> = (0..4_096u64).map(|n| n.to_be_bytes().to_vec()).collect();
+        let wide: Vec<Vec<u8>> = (0..4_096u64)
+            .map(|n| [n.to_be_bytes().as_slice(), &[7u8; 56]].concat())
+            .collect();
+        let narrow = written(&driver, 7, &narrow, 8);
+        let wide = written(&driver, 8, &wide, 64);
+        let rows = 4_096 * ROW_LEN as u64;
+        // The fences add a key per block, so the wide run grows only by its keys there
+        let fences = (4_096 / u64::from(RUN_BLOCK_ROWS) + 1) * 56;
+        assert_eq!(wide.bytes - narrow.bytes, fences, "a row grew with its key");
+        assert!(narrow.bytes < rows + rows / 4, "the run weighs {} for {rows} of rows", narrow.bytes);
     }
 }

@@ -20,11 +20,7 @@ pub mod spot;
 pub mod tailer;
 pub mod tbtreemap;
 
-/// Each group's rows a chunk at a time, one chunk per group per round
-///
-/// A lock taken per chunk then sits free while the other groups take theirs, so a
-/// put or a get waiting on it gets in. Taking the next chunk of the same group
-/// straight away would win the lock back before the waiter wakes.
+/// Each group's rows a chunk at a time, one chunk per group per round, so a lock taken per chunk sits free long enough for a waiter to get in
 pub(crate) fn in_turns(
     groups: &[(usize, Vec<usize>)],
     chunk: usize,

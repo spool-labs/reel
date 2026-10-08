@@ -38,7 +38,7 @@ use crate::format::record::{
     HEADER_LEN, KEYLESS_PREFIX,
 };
 use crate::index::counters::{FilterProbes, SegmentTable};
-use crate::index::paged::{FooterCache, FooterSource};
+use crate::index::paged::{FooterCache, FooterSource, RowsAt};
 use crate::index::recovery::{read_footer, ResumableTail};
 use crate::index::spot::{Head, HeadRead, RecordSource, SpotRead};
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
@@ -962,6 +962,31 @@ impl FooterSource for ReelShared {
             return Ok(Some(footer));
         }
         Ok(self.footer_from_disk(segment)?.map(Arc::new))
+    }
+
+    /// The block holding one row, read through the footer's directory, or the whole footer when it is already held
+    fn rows_holding(
+        &self,
+        segment: SegmentId,
+        column: ColumnId,
+        row: u32,
+    ) -> Result<Option<RowsAt>> {
+        if let Some(footer) = self.footers.get(segment) {
+            return RowsAt::whole(footer, column, row).map(Some);
+        }
+        let Some(map) = self.footer_map_of(segment)? else {
+            return Ok(None);
+        };
+        let Some((span, _)) = map.locate(column).filter(|(span, _)| (row as usize) < span.rows) else {
+            return Err(ReelError::Corruption(format!(
+                "a key run points past segment {}'s rows at {row}",
+                segment.as_u32()
+            )));
+        };
+        let block = row as usize / span.block_rows();
+        Ok(self
+            .load_block(segment, &map, &span, &mut None, block)?
+            .map(RowsAt::Block))
     }
 
     /// One key, answered by reading the blocks the search touches and no more

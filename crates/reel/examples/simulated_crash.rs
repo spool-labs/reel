@@ -42,11 +42,7 @@ const RECORD_COUNT: u32 = 8;
 const TORN_RECORD: u32 = 6;
 const REFUSED_RECORD: u32 = 7;
 
-/// Global op positions the two faulted appends execute at
-///
-/// A plan pins faults to op positions rather than calls, so these are read off a run:
-/// at one tail syncing every put, a put is a record write, a row write and one sync,
-/// and these are the last two records' writes.
+/// Op positions of the last two records' writes, at one tail syncing every put
 const TORN_AT: u64 = 26;
 const ENOSPC_AT: u64 = 29;
 

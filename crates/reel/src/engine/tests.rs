@@ -4669,6 +4669,22 @@ fn a_lost_seal_cut_is_found_by_its_mark_and_made_at_open() {
     }
 }
 
+// a volume's size counts what its files take on disk, so an open tail's sparse rows region is not counted whole
+#[test]
+fn a_volume_counts_the_bytes_its_files_take() {
+    let (store, _backend, _dir) = posix_store(config(1, SyncPolicy::Never));
+    for byte in 0..20u8 {
+        store.put(&record(7, byte), &[byte; 200]).expect("put");
+    }
+    store.flush().expect("flush");
+    let rows_at = 2 * store.config.segment_bytes.to_bytes();
+    let used = reel_core::store::Store::actual_size_bytes(&store).expect("size");
+    assert!(
+        used < rows_at,
+        "the volume reports {used} bytes for twenty small records, its open tail is {rows_at} long"
+    );
+}
+
 // a durable put survives a crash on a volume that never syncs, at the cost of one sync
 #[test]
 fn a_durable_put_survives_a_crash_on_one_sync() {

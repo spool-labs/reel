@@ -373,7 +373,20 @@ pub fn range_of(value: Value, offset: u64, len: usize) -> Value {
     Value::new(value[at..end].to_vec())
 }
 
-/// Total bytes of every file under a directory tree, zero when it is absent
+/// Bytes a file takes on disk, which for a sparse file is less than its length
+fn file_bytes(metadata: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.len()
+    }
+}
+
+/// Bytes every file under a directory tree takes on disk, zero when it is absent
 pub fn directory_size_bytes(path: &Path) -> Result<u64> {
     let entries = match std::fs::read_dir(path) {
         Ok(entries) => entries,
@@ -388,7 +401,7 @@ pub fn directory_size_bytes(path: &Path) -> Result<u64> {
         if file_type.is_dir() {
             total = total.saturating_add(directory_size_bytes(&entry.path())?);
         } else if file_type.is_file() {
-            total = total.saturating_add(entry.metadata().map_err(Error::Io)?.len());
+            total = total.saturating_add(file_bytes(&entry.metadata().map_err(Error::Io)?));
         }
     }
 

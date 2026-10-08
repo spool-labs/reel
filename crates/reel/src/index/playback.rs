@@ -259,6 +259,9 @@ struct Head {
     /// The key's leading sixteen bytes, big-endian, which settle nearly every compare
     lead: u128,
 
+    /// The key's length, which with the lead settles every compare of keys up to sixteen bytes
+    len: usize,
+
     /// The first row sharing the key
     first: usize,
     /// The last row sharing the key, which is the live one since rows keep write order
@@ -271,6 +274,7 @@ struct Head {
 impl Head {
     const SPENT: Head = Head {
         lead: 0,
+        len: 0,
         first: 0,
         last: 0,
         is_spent: true,
@@ -280,6 +284,7 @@ impl Head {
     fn on(key: &[u8], row: usize) -> Head {
         Head {
             lead: head_lead(key),
+            len: key.len(),
             first: row,
             last: row,
             is_spent: false,
@@ -306,6 +311,7 @@ impl Head {
         }
         Head {
             lead: head_lead(key),
+            len: key.len(),
             first,
             last,
             is_spent: false,
@@ -352,10 +358,13 @@ impl Head {
     }
 }
 
+/// A head holds this many leading key bytes
+const LEAD_BYTES: usize = 16;
+
 /// A key's leading sixteen bytes as an integer, which orders keys whenever two leads differ
 fn head_lead(key: &[u8]) -> u128 {
-    let mut lead = [0u8; 16];
-    let led = key.len().min(16);
+    let mut lead = [0u8; LEAD_BYTES];
+    let led = key.len().min(LEAD_BYTES);
     lead[..led].copy_from_slice(&key[..led]);
     u128::from_be_bytes(lead)
 }
@@ -459,9 +468,12 @@ impl Sealed {
     fn front_on(&self, key: &[u8]) -> Option<usize> {
         let at = *self.tree.first()?;
         let head = &self.heads[at];
-        // A lead that differs settles it without reading the cursor's key
+        // A lead that differs settles it without reading the cursor's key, and so does a short key's length
         if head.is_spent || head.lead != head_lead(key) {
             return None;
+        }
+        if key.len() <= LEAD_BYTES {
+            return (head.len == key.len()).then_some(at);
         }
         (self.key_of(at) == Some(key)).then_some(at)
     }
@@ -599,6 +611,13 @@ impl Sealed {
             return match way {
                 Way::Up => one.lead < other.lead,
                 Way::Down => one.lead > other.lead,
+            };
+        }
+        // Two keys within the lead differ only in length, the shorter sorting first
+        if one.len <= LEAD_BYTES && other.len <= LEAD_BYTES {
+            return match way {
+                Way::Up => one.len < other.len,
+                Way::Down => one.len > other.len,
             };
         }
         match (self.key_of(left), self.key_of(right)) {

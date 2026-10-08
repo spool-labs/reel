@@ -28,7 +28,7 @@ use crate::format::lsn::{Lsn, LsnCounter};
 use crate::format::record::{
     align_up, CheckKey, Flags, RecordHeader, RecordLayout, BLOCK, HEADER_LEN,
 };
-use crate::format::segment_header::SegmentHeader;
+use crate::format::segment_header::{SegmentHeader, SEGMENT_HEADER_SPAN};
 use crate::index::recovery::ResumableTail;
 use crate::io::op::{Op, OwnedBuf, Part, SyncRangeMode, WriteBuf};
 use crate::io::ServingBackend;
@@ -587,6 +587,12 @@ impl Appender {
             segment: active.handle.id(),
             target,
         })
+    }
+
+    /// Whether the active segment holds a record past its header
+    pub fn holds_records(&self) -> bool {
+        let header = RecordHeader::segment_header(&[0; SEGMENT_HEADER_SPAN]);
+        self.tail.committed_len() > self.reserved_span(&header)
     }
 
     /// Seal the active segment with a footer and roll to a fresh one

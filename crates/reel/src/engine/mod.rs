@@ -16,6 +16,7 @@ mod tests;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::units::ByteCount;
 
@@ -212,6 +213,9 @@ pub struct ReelStore {
 
     /// Read views held open, whose floor bounds what compaction may reclaim
     cues: Arc<CuePoints>,
+
+    /// Where each tail's write head stood when it last moved, so the tick can seal a tail gone quiet
+    idle: Mutex<Vec<Option<(SegmentId, u64, Instant)>>>,
 
     /// What the machine said about itself at open, absent on a simulated volume
     bias: Option<MachineFacts>,
@@ -448,6 +452,7 @@ impl ReelStore {
             is_read_only,
             is_real_fs,
             cues: Arc::new(CuePoints::new()),
+            idle: Mutex::new(Vec::new()),
         })
     }
 

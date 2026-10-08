@@ -516,6 +516,45 @@ pub fn lookup_in_span(
     }
 }
 
+/// The row of a key that sits at an offset, reading only the blocks the key's rows lie in
+///
+/// A key's versions sit together in write order, so the walk goes back from the key's
+/// last row until the key changes, into earlier blocks while the run reaches their end.
+pub fn find_offset_in_span(
+    span: &PartitionSpan,
+    filter: Option<&Filter>,
+    key: &[u8],
+    offset: u32,
+    mut load: impl FnMut(usize) -> Result<Option<Arc<RowBlock>>>,
+) -> Result<Option<FooterRow>> {
+    if filter.is_some_and(|filter| !filter.may_hold(key)) {
+        return Ok(None);
+    }
+    let Some(mut at) = landing(key, span.blocks(), &mut load)? else {
+        return Ok(None);
+    };
+    loop {
+        let Some(block) = load(at)? else {
+            return Ok(None);
+        };
+        let mut row = block.upper_bound(key);
+        while let Some(before) = row.checked_sub(1) {
+            row = before;
+            if block.key_at(row) != Some(key) {
+                return Ok(None);
+            }
+            let found = block.row_at(row)?;
+            if found.offset == offset {
+                return Ok(Some(found));
+            }
+        }
+        match at.checked_sub(1) {
+            Some(previous) => at = previous,
+            None => return Ok(None),
+        }
+    }
+}
+
 /// Find a key in one column's rows, reading only the blocks the search touches
 ///
 /// A binary search over blocks by their first key, then a search inside the one block

@@ -4446,6 +4446,60 @@ fn a_record_at_the_keyless_ceiling_reads_with_no_footer_search() {
     assert_eq!(store.filter_probes().blocks, blocks, "a footer search ran");
 }
 
+// a tail that stops taking writes is sealed, a busy one and an empty one are left open
+#[test]
+fn the_tick_seals_a_tail_gone_quiet() {
+    let (store, _backend, _dir) = posix_store(config(2, SyncPolicy::Never));
+    let quiet = std::time::Duration::ZERO;
+    let tails = store.reel.tails();
+    let segment = |at: usize| tails[at].tail().active_segment();
+    store.put(&record(7, 1), &[1; 100]).expect("put");
+    let written = (0..tails.len())
+        .find(|at| tails[*at].holds_records())
+        .expect("a tail took the put");
+    let before = segment(written);
+    let others: Vec<_> = (0..tails.len()).filter(|at| *at != written).map(segment).collect();
+
+    for byte in 2..5u8 {
+        store.seal_idle_tails(quiet).expect("look");
+        store.put(&record(7, byte), &[byte; 100]).expect("put");
+    }
+    assert_eq!(segment(written), before, "a tail taking writes was sealed");
+
+    store.seal_idle_tails(quiet).expect("first quiet look");
+    store.seal_idle_tails(quiet).expect("second quiet look");
+    assert_ne!(segment(written), before, "the quiet tail is still open");
+    let after: Vec<_> = (0..tails.len()).filter(|at| *at != written).map(segment).collect();
+    assert_eq!(after, others, "an empty tail was sealed");
+    assert_eq!(
+        store.get(&record(7, 4)).expect("get"),
+        Some(Value::new(vec![4; 100]))
+    );
+}
+
+// an older version in a segment that also holds the newer one is found through the key's blocks, never the whole footer
+#[test]
+fn an_older_version_reads_its_row_through_the_key_blocks() {
+    use crate::index::spot::{HeadRead, RecordSource};
+    let (store, _backend, _dir) = posix_store(config(1, SyncPolicy::Never));
+    let key = record(7, 1);
+    store.put(&key, &[0x11; 100]).expect("put");
+    let old = store.index.get(&key).expect("get").expect("entry").loc;
+    store.put(&key, &[0x22; 120]).expect("overwrite");
+    let segment = store.reel.tails()[0].seal().expect("seal");
+    let shared = store.reel.shared();
+    shared.footers.forget(segment);
+
+    let head = shared
+        .head(key.as_ref(), segment, old.offset)
+        .expect("head");
+    assert!(
+        matches!(head, HeadRead::Same(found) if found.len == 100),
+        "the older version's row: {head:?}"
+    );
+    assert!(shared.footers.get(segment).is_none(), "the whole footer was read");
+}
+
 // a durable put survives a crash on a volume that never syncs, at the cost of one sync
 #[test]
 fn a_durable_put_survives_a_crash_on_one_sync() {

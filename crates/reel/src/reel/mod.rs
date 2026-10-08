@@ -28,7 +28,7 @@ use crate::config::ReelConfig;
 use crate::error::{ReelError, Result};
 use std::sync::OnceLock;
 
-use crate::format::block::{lookup_in_span, FooterMap, RowBlock};
+use crate::format::block::{find_offset_in_span, lookup_in_span, FooterMap, PartitionSpan, RowBlock};
 use crate::format::column::{ColumnId, ColumnSet, KeyRef, RecordKey};
 use crate::format::footer::{FooterFind, FooterPartition, FooterRow, FooterTally, SegmentFooter};
 use crate::format::loc::{Loc, SegmentId};
@@ -368,14 +368,10 @@ impl ReelShared {
         if newest.as_ref().is_none_or(|row| row.offset == offset) {
             return Ok(keyless_head_of(newest, offset));
         }
-        let Some(footer) = self.footer_of(segment)? else {
-            return Ok(HeadRead::Missing);
-        };
-        let row = match footer.partition(key.column) {
-            Some(partition) => row_at_offset(partition, key.bytes, offset)?,
-            None => None,
-        };
-        Ok(keyless_head_of(row, offset))
+        match self.row_at_offset_in(segment, key, offset)? {
+            Some(row) => Ok(keyless_head_of(row, offset)),
+            None => Ok(HeadRead::Missing),
+        }
     }
 
     /// One candidate in a keyless segment, settled off its row and one read of its record
@@ -988,28 +984,7 @@ impl FooterSource for ReelShared {
         // rules out costs no io. A segment gone by then ends the search as missing.
         let mut handle = None;
         let outcome = lookup_in_span(&span, filter, key, |at| {
-            self.probes.note_block();
-            if let Some(block) = self.footers.block_of(segment, column, at) {
-                return Ok(Some(block));
-            }
-            let opened = match handle.as_ref() {
-                Some(opened) => opened,
-                None => match self.handle_for(segment)? {
-                    Some(opened) => handle.insert(opened),
-                    None => return Ok(None),
-                },
-            };
-            self.probes.note_block_read();
-            let block = Arc::new(RowBlock::read(
-                &self.driver,
-                opened.file(),
-                &span,
-                at,
-                map.restarts_of(span.column),
-            )?);
-            self.footers
-                .insert_block(segment, column, at, Arc::clone(&block));
-            Ok(Some(block))
+            self.load_block(segment, &map, &span, &mut handle, at)
         })?;
         Ok(self.answer_of(outcome))
     }
@@ -1212,6 +1187,65 @@ impl ReelShared {
     }
 
     /// The parsed footer of a sealed segment, from the cache or from the file
+    /// One block of a segment's footer rows, from the cache or read and cached, opening the segment once per search
+    fn load_block(
+        &self,
+        segment: SegmentId,
+        map: &FooterMap,
+        span: &PartitionSpan,
+        handle: &mut Option<SegmentHandle>,
+        at: usize,
+    ) -> Result<Option<Arc<RowBlock>>> {
+        self.probes.note_block();
+        if let Some(block) = self.footers.block_of(segment, span.column, at) {
+            return Ok(Some(block));
+        }
+        let opened = match handle.as_ref() {
+            Some(opened) => opened,
+            None => match self.handle_for(segment)? {
+                Some(opened) => handle.insert(opened),
+                None => return Ok(None),
+            },
+        };
+        self.probes.note_block_read();
+        let block = Arc::new(RowBlock::read(
+            &self.driver,
+            opened.file(),
+            span,
+            at,
+            map.restarts_of(span.column),
+        )?);
+        self.footers
+            .insert_block(segment, span.column, at, Arc::clone(&block));
+        Ok(Some(block))
+    }
+
+    /// The row of a key at one offset in a sealed segment, read through the key's own blocks, or nothing for a segment gone
+    fn row_at_offset_in(
+        &self,
+        segment: SegmentId,
+        key: KeyRef<'_>,
+        offset: u32,
+    ) -> Result<Option<Option<FooterRow>>> {
+        if let Some(footer) = self.footers.get(segment) {
+            return Ok(Some(match footer.partition(key.column) {
+                Some(partition) => row_at_offset(partition, key.bytes, offset)?,
+                None => None,
+            }));
+        }
+        let Some(map) = self.footer_map_of(segment)? else {
+            return Ok(None);
+        };
+        let Some((span, filter)) = map.locate(key.column) else {
+            return Ok(Some(None));
+        };
+        let mut handle = None;
+        let found = find_offset_in_span(&span, filter, key.bytes, offset, |at| {
+            self.load_block(segment, &map, &span, &mut handle, at)
+        })?;
+        Ok(Some(found))
+    }
+
     pub fn footer_of(&self, segment: SegmentId) -> Result<Option<Arc<SegmentFooter>>> {
         if let Some(footer) = self.footers.get(segment) {
             return Ok(Some(footer));

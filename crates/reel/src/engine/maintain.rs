@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::compaction::compactor::EraseReport;
 use crate::compaction::keymerge::{merge_into_key_run, MergeReport};
@@ -30,6 +30,9 @@ const MERGE_DEPTH: usize = 8;
 
 /// The hand-over runs this often while compaction passes hold the tick
 const HANDOVER_TICK: Duration = Duration::from_secs(1);
+
+/// A tail that takes no write for this long is sealed by the tick
+const IDLE_SEAL: Duration = Duration::from_secs(5);
 
 impl ReelStore {
     /// Tell the index about every segment that has sealed since it was last told
@@ -373,6 +376,7 @@ impl ReelStore {
             return Ok(());
         }
         self.retry_broken_seals();
+        self.seal_idle_tails(IDLE_SEAL)?;
         self.publish_footprint();
         self.page_out_sealed()?;
         self.sweep_covers()?;
@@ -384,6 +388,31 @@ impl ReelStore {
         self.scrub_once()?;
         self.index.scrub_spot(SPOT_SCRUB_BUDGET);
         self.index.sweep_walk_runs();
+        Ok(())
+    }
+
+    /// Seal each tail whose segment took no write for `idle`, so compaction can reach what it holds
+    ///
+    /// Compaction never rewrites an open segment, so a tail that stops getting writes would
+    /// hold its records, dead or not, until the volume closes.
+    pub(crate) fn seal_idle_tails(&self, idle: Duration) -> Result<()> {
+        let now = Instant::now();
+        let mut seen = lock(&self.idle);
+        let tails = self.reel.tails();
+        seen.resize(tails.len(), None);
+        for (tail, watch) in tails.iter().zip(seen.iter_mut()) {
+            let head = (tail.tail().active_segment(), tail.tail().committed_len());
+            match *watch {
+                Some((segment, len, since)) if (segment, len) == head => {
+                    if !tail.holds_records() || now.duration_since(since) < idle {
+                        continue;
+                    }
+                    tail.seal()?;
+                    *watch = None;
+                }
+                Some(_) | None => *watch = Some((head.0, head.1, now)),
+            }
+        }
         Ok(())
     }
 

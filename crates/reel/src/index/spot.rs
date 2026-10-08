@@ -1192,14 +1192,31 @@ impl SpotColumn {
             }
             Ok(())
         })?;
-        for at in std::mem::take(&mut *lock(&unsettled)) {
-            let row = &rows[at];
-            book(
-                row.key.as_slice(),
-                self.load(&row.key, row.loc, row.lsn, row.is_tombstone)?,
-            );
-        }
-        Ok(())
+        // A load settles against whatever slots it meets and retries a race, so these spread over the same threads
+        let left = std::mem::take(&mut *lock(&unsettled));
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| -> Result<()> {
+            let workers: Vec<_> = (0..SETTLE_THREADS)
+                .map(|_| {
+                    scope.spawn(|| -> Result<()> {
+                        while let Some(at) = left.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let row = &rows[*at];
+                            book(
+                                row.key.as_slice(),
+                                self.load(&row.key, row.loc, row.lsn, row.is_tombstone)?,
+                            );
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+            }
+            Ok(())
+        })
     }
 
     /// Settle the rows whose slot sits in one segment, handing back those its footer cannot, what the rest booked and each version that lost

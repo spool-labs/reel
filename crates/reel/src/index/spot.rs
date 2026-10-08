@@ -13,6 +13,7 @@ use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::index::counters::SegmentTable;
 use crate::index::entry::Entry;
+use crate::index::in_turns;
 use crate::index::paged::FooterSource;
 use crate::sync::{lock, read, write};
 
@@ -1010,13 +1011,11 @@ impl SpotColumn {
     /// Put in the keys of the shards whose number leaves `lane` over `lanes`, and say which took a new slot
     pub fn insert_lane(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<bool> {
         let mut inserted = vec![false; rows.len()];
-        for (shard, ats) in lane_groups(rows, lane, lanes) {
-            for chunk in ats.chunks(LOCK_CHUNK) {
-                let mut table = self.shards[shard].write();
-                for &at in chunk {
-                    let (key, loc) = rows[at];
-                    inserted[at] = put_in(&mut table, hash_of(key), loc);
-                }
+        for (shard, chunk) in in_turns(&lane_groups(rows, lane, lanes), LOCK_CHUNK) {
+            let mut table = self.shards[shard].write();
+            for &at in chunk {
+                let (key, loc) = rows[at];
+                inserted[at] = put_in(&mut table, hash_of(key), loc);
             }
         }
         inserted
@@ -1024,20 +1023,18 @@ impl SpotColumn {
 
     /// Take out the slots of one lane of shards that point at these records
     pub fn remove_lane(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) {
-        for (shard, ats) in lane_groups(rows, lane, lanes) {
-            for chunk in ats.chunks(LOCK_CHUNK) {
-                let mut table = self.shards[shard].write();
-                for &at in chunk {
-                    let (key, loc) = rows[at];
-                    let hash = hash_of(key);
-                    let held = table
-                        .matches(hash)
-                        .iter()
-                        .find(|place| place.slot.at(loc))
-                        .copied();
-                    if let Some(place) = held {
-                        table.take(hash, &place.slot);
-                    }
+        for (shard, chunk) in in_turns(&lane_groups(rows, lane, lanes), LOCK_CHUNK) {
+            let mut table = self.shards[shard].write();
+            for &at in chunk {
+                let (key, loc) = rows[at];
+                let hash = hash_of(key);
+                let held = table
+                    .matches(hash)
+                    .iter()
+                    .find(|place| place.slot.at(loc))
+                    .copied();
+                if let Some(place) = held {
+                    table.take(hash, &place.slot);
                 }
             }
         }

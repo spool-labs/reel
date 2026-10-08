@@ -19,6 +19,7 @@ use crate::format::loc::{Loc, SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
 use crate::index::counters::{Bookings, SegmentTable};
 use crate::index::entry::{span_of, Entry};
+use crate::index::in_turns;
 use crate::index::page::KeyPage;
 use crate::index::paged::SealedRanges;
 use crate::index::spot::Booking;
@@ -1809,25 +1810,24 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         first: &(dyn Fn(&[u8], Loc) + Sync),
     ) -> Vec<bool> {
         let mut handed = vec![false; rows.len()];
-        for (shard, ats) in self.lane_shards(rows, lane, lanes).iter().enumerate() {
-            for chunk in ats.chunks(LOCK_CHUNK) {
-                let mut state = write(&self.shards[shard]);
-                for &at in chunk {
-                    let (key, loc) = rows[at];
-                    let Some(key) = K::from_slice(key) else {
-                        continue;
-                    };
-                    if !self.holds_at(&state, &key, loc) {
-                        continue;
-                    }
-                    first(key.as_slice(), loc);
-                    state.map.take(key.as_slice());
-                    state.paged += 1;
-                    handed[at] = true;
+        let groups = self.lane_shards(rows, lane, lanes);
+        for (shard, chunk) in in_turns(&groups, LOCK_CHUNK) {
+            let mut state = write(&self.shards[shard]);
+            for &at in chunk {
+                let (key, loc) = rows[at];
+                let Some(key) = K::from_slice(key) else {
+                    continue;
+                };
+                if !self.holds_at(&state, &key, loc) {
+                    continue;
                 }
-                state.map.pack_owed();
-                self.note_emptied(shard, &mut state);
+                first(key.as_slice(), loc);
+                state.map.take(key.as_slice());
+                state.paged += 1;
+                handed[at] = true;
             }
+            state.map.pack_owed();
+            self.note_emptied(shard, &mut state);
         }
         handed
     }
@@ -1842,7 +1842,12 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     }
 
     /// The rows of one lane, grouped by the shard each key falls in
-    fn lane_shards(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<Vec<usize>> {
+    fn lane_shards(
+        &self,
+        rows: &[(&[u8], Loc)],
+        lane: usize,
+        lanes: usize,
+    ) -> Vec<(usize, Vec<usize>)> {
         let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); self.shards.len()];
         for (at, (key, _)) in rows.iter().enumerate() {
             if let Some(key) = K::from_slice(key) {
@@ -1853,6 +1858,10 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             }
         }
         by_shard
+            .into_iter()
+            .enumerate()
+            .filter(|(_, ats)| !ats.is_empty())
+            .collect()
     }
 
     /// Whether the map points a key at exactly this place, with no grave or cover over it

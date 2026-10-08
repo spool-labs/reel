@@ -566,13 +566,17 @@ impl ReelIndex {
         let mut picks: HashMap<(SegmentId, ColumnId), Vec<u32>> = HashMap::new();
         for run in self.key_runs.runs() {
             for column in run.columns() {
+                // Grouped by place in the covered list first, so a row costs a push and no hash
+                let mut by_covered: Vec<Vec<u32>> = vec![Vec::new(); run.covered.len()];
                 for at in 0..column.rows() {
                     let pointer = run.pointer(column, at);
-                    if let Some(segment) = run.segment_of(pointer) {
-                        picks
-                            .entry((segment, column.column))
-                            .or_default()
-                            .push(pointer.row);
+                    if let Some(rows) = by_covered.get_mut(pointer.covered as usize) {
+                        rows.push(pointer.row);
+                    }
+                }
+                for (segment, rows) in run.covered.iter().zip(by_covered) {
+                    if !rows.is_empty() {
+                        picks.entry((*segment, column.column)).or_default().extend(rows);
                     }
                 }
             }

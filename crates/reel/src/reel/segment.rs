@@ -1084,7 +1084,7 @@ struct SegmentInner {
     driver: Arc<IoDriver>,
     layout: RecordLayout,
     is_doomed: AtomicBool,
-    mapping: OnceLock<Option<Mapping>>,
+    mapping: OnceLock<Option<Arc<Mapping>>>,
 }
 
 impl Drop for SegmentInner {
@@ -1217,8 +1217,14 @@ impl SegmentHandle {
     pub fn mapping(&self, span: u64) -> Option<&Mapping> {
         self.inner
             .mapping
-            .get_or_init(|| Mapping::open(&self.inner.path, span))
-            .as_ref()
+            .get_or_init(|| Mapping::open(&self.inner.path, span).map(Arc::new))
+            .as_deref()
+    }
+
+    /// The same mapping by count, for a reader that keeps it after letting the handle go
+    pub fn shared_mapping(&self, span: u64) -> Option<Arc<Mapping>> {
+        self.mapping(span)?;
+        self.inner.mapping.get().and_then(|held| held.clone())
     }
 }
 

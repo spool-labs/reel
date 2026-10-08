@@ -11,11 +11,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::error::{ReelError, Result};
-use crate::format::block::{FooterMap, RowBlock, BLOCK_BYTES};
+use crate::format::block::{FooterMap, PartitionSpan, RowBlock, BLOCK_BYTES};
 use crate::format::column::{ColumnId, KeyBytes};
 use crate::format::footer::{FooterFind, FooterRow, SegmentFooter};
 use crate::format::loc::SegmentId;
 use crate::hold::{hold_key, segment_key, Hold, MAX_BLOCK};
+use crate::io::mapping::Mapping;
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
 use crate::sync::{read, write};
 
@@ -54,6 +55,11 @@ pub trait FooterSource: Send + Sync {
         }
     }
 
+    /// A segment's partition for a column read in place, where it strides and the segment maps
+    fn mapped_rows(&self, _segment: SegmentId, _column: ColumnId) -> Result<Option<MappedRows>> {
+        Ok(None)
+    }
+
     /// The rows of a segment's partition that hold one row, by its place in the partition, or nothing for a segment gone
     fn rows_holding(
         &self,
@@ -65,6 +71,38 @@ pub trait FooterSource: Send + Sync {
             return Ok(None);
         };
         RowsAt::whole(footer, column, row).map(Some)
+    }
+}
+
+/// A strided footer partition read in place through its segment's mapping
+pub struct MappedRows {
+    map: Arc<Mapping>,
+    at: u64,
+    stride: usize,
+    key_width: usize,
+    rows: usize,
+}
+
+impl MappedRows {
+    /// A strided partition's rows in a mapping
+    pub fn new(map: Arc<Mapping>, span: &PartitionSpan) -> MappedRows {
+        MappedRows {
+            map,
+            at: span.at,
+            stride: span.stride(),
+            key_width: span.key_width as usize,
+            rows: span.rows,
+        }
+    }
+
+    /// The key and row at a place in the partition
+    pub fn read(&self, row: u32) -> Result<(&[u8], FooterRow)> {
+        let row = row as usize;
+        let bytes = (row < self.rows)
+            .then(|| self.map.slice(self.at + (row * self.stride) as u64, self.stride))
+            .flatten()
+            .ok_or_else(|| ReelError::Corruption(format!("a key run points past a footer's rows at {row}")))?;
+        Ok((&bytes[..self.key_width], FooterRow::read(bytes, self.key_width)?))
     }
 }
 

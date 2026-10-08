@@ -38,7 +38,7 @@ use crate::format::record::{
     HEADER_LEN, KEYLESS_PREFIX,
 };
 use crate::index::counters::{FilterProbes, SegmentTable};
-use crate::index::paged::{FooterCache, FooterSource, RowsAt};
+use crate::index::paged::{FooterCache, FooterSource, MappedRows, RowsAt};
 use crate::index::recovery::{read_footer, ResumableTail};
 use crate::index::spot::{Head, HeadRead, RecordSource, SpotRead};
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
@@ -962,6 +962,22 @@ impl FooterSource for ReelShared {
             return Ok(Some(footer));
         }
         Ok(self.footer_from_disk(segment)?.map(Arc::new))
+    }
+
+    fn mapped_rows(&self, segment: SegmentId, column: ColumnId) -> Result<Option<MappedRows>> {
+        let Some(map) = self.footer_map_of(segment)? else {
+            return Ok(None);
+        };
+        let Some((span, _)) = map.locate(column).filter(|(span, _)| !span.is_packed && !span.is_varying()) else {
+            return Ok(None);
+        };
+        // The handle goes on return, so a retire still unlinks the file on time
+        let Some(handle) = self.handle_for(segment)? else {
+            return Ok(None);
+        };
+        Ok(handle
+            .shared_mapping(self.config.segment_bytes.to_bytes())
+            .map(|mapped| MappedRows::new(mapped, &span)))
     }
 
     /// The block holding one row, read through the footer's directory, or the whole footer when it is already held

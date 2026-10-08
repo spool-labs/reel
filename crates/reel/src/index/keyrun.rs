@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use crate::error::{ReelError, Result};
 use crate::format::column::ColumnId;
@@ -11,7 +11,7 @@ use crate::format::footer::{FooterRow, VARYING_WIDTH};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{read_u32_le, read_u64_le, Flags};
-use crate::index::paged::{FooterSource, RowsAt};
+use crate::index::paged::{FooterSource, MappedRows, RowsAt};
 use crate::io::mapping::Mapping;
 use crate::io::op::{FileId, WriteBuf};
 use crate::reel::segment::IoDriver;
@@ -104,16 +104,33 @@ pub fn is_vanished(error: &ReelError) -> bool {
     matches!(error, ReelError::Io(source) if source.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// What every reader of one run column shares while the sealed set stands: which covered segments stand, and each one's mapped rows
+pub struct RunViews {
+    /// Whether each covered segment still stands, by its place in the covered list
+    stands: Vec<bool>,
+
+    /// Each covered segment's strided partition in place, taken on the first read
+    mapped: Vec<OnceLock<Option<MappedRows>>>,
+}
+
+impl RunViews {
+    /// The views of a run's covered segments, standing as `stands` says now
+    pub fn new(run: &KeyRun, stands: &dyn Fn(SegmentId) -> bool) -> RunViews {
+        RunViews {
+            stands: run.covered.iter().map(|segment| stands(*segment)).collect(),
+            mapped: (0..run.covered.len()).map(|_| OnceLock::new()).collect(),
+        }
+    }
+}
+
 /// Reads one run column's rows through the footers, keeping each covered segment's last block so a walk in key order reads each block once
 pub struct FooterRows {
     footers: Arc<dyn FooterSource>,
     run: Arc<KeyRun>,
     column: ColumnId,
+    views: Arc<RunViews>,
 
-    /// Whether each covered segment still stands, by its place in the covered list
-    stands: Vec<bool>,
-
-    /// Each covered segment's last rows read
+    /// Each covered segment's last block read, where its rows are not mapped
     held: Vec<Option<RowsAt>>,
 }
 
@@ -125,14 +142,23 @@ impl FooterRows {
         column: ColumnId,
         stands: &dyn Fn(SegmentId) -> bool,
     ) -> FooterRows {
-        let stands = run.covered.iter().map(|segment| stands(*segment)).collect();
-        let held = (0..run.covered.len()).map(|_| None).collect();
+        let views = Arc::new(RunViews::new(&run, stands));
+        FooterRows::sharing(footers, run, column, views)
+    }
+
+    /// A reader sharing views another reader of the same run column already holds
+    pub fn sharing(
+        footers: Arc<dyn FooterSource>,
+        run: Arc<KeyRun>,
+        column: ColumnId,
+        views: Arc<RunViews>,
+    ) -> FooterRows {
         FooterRows {
             footers,
             run,
             column,
-            stands,
-            held,
+            views,
+            held: Vec::new(),
         }
     }
 
@@ -151,8 +177,21 @@ impl RowReader for FooterRows {
                 self.run.covered.len()
             )));
         };
-        if !self.stands[at] {
+        if !self.views.stands[at] {
             return Ok(None);
+        }
+        let mapped = self.views.mapped[at].get_or_init(|| {
+            self.footers
+                .mapped_rows(segment, self.column)
+                .ok()
+                .flatten()
+        });
+        if let Some(mapped) = mapped {
+            let (key, found) = mapped.read(pointer.row)?;
+            return Ok(Some((key, RunRow::of(segment, found))));
+        }
+        if self.held.len() <= at {
+            self.held.resize_with(self.run.covered.len(), || None);
         }
         if !self.held[at]
             .as_ref()

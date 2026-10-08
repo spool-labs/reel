@@ -256,8 +256,8 @@ fn key_run_settle(
 /// Where one cursor stands: the rows sharing its key, and the key's leading bytes
 #[derive(Clone, Copy)]
 struct Head {
-    /// The key's leading eight bytes, big-endian, which settle nearly every compare
-    lead: u64,
+    /// The key's leading sixteen bytes, big-endian, which settle nearly every compare
+    lead: u128,
 
     /// The first row sharing the key
     first: usize,
@@ -279,7 +279,7 @@ impl Head {
     /// The head of a cursor on a run's only row of a key
     fn on(key: &[u8], row: usize) -> Head {
         Head {
-            lead: lead_of(key),
+            lead: head_lead(key),
             first: row,
             last: row,
             is_spent: false,
@@ -305,7 +305,7 @@ impl Head {
             }
         }
         Head {
-            lead: lead_of(key),
+            lead: head_lead(key),
             first,
             last,
             is_spent: false,
@@ -350,6 +350,14 @@ impl Head {
             None => Head::SPENT,
         }
     }
+}
+
+/// A key's leading sixteen bytes as an integer, which orders keys whenever two leads differ
+fn head_lead(key: &[u8]) -> u128 {
+    let mut lead = [0u8; 16];
+    let led = key.len().min(16);
+    lead[..led].copy_from_slice(&key[..led]);
+    u128::from_be_bytes(lead)
 }
 
 /// A key's leading eight bytes as an integer, which orders keys whenever two leads differ
@@ -527,9 +535,16 @@ impl Sealed {
             Way::Up => Some(head.last + 1),
             Way::Down => head.first.checked_sub(1),
         };
-        let set = Arc::clone(self.set.as_ref().expect("cursors stand in a set"));
-        let run = &set.runs[self.at[at] as usize];
-        self.heads[at] = match (next, run) {
+        let Sealed {
+            set,
+            at: runs_at,
+            heads,
+            keyed,
+            ..
+        } = self;
+        let set = set.as_ref().expect("cursors stand in a set");
+        let run = &set.runs[runs_at[at] as usize];
+        heads[at] = match (next, run) {
             (None, _) => Head::SPENT,
             (
                 Some(row),
@@ -539,7 +554,7 @@ impl Sealed {
             ) => Head::at(&footer.partitions[*partition], way, row),
             (Some(row), Run::Keys { run, column, .. }) => {
                 let column = &run.columns()[*column];
-                let Some(keyed) = self.keyed[at].as_mut() else {
+                let Some(keyed) = keyed[at].as_mut() else {
                     return Ok(());
                 };
                 let (head, standing) =

@@ -110,8 +110,8 @@ pub struct RunViews {
     /// Whether each covered segment still stands, by its place in the covered list
     stands: Vec<bool>,
 
-    /// Each covered segment's strided partition in place, taken on the first read
-    mapped: Vec<OnceLock<Option<MappedRows>>>,
+    /// Each covered segment's partition in place, taken on the first read
+    mapped: Vec<OnceLock<Option<Arc<MappedRows>>>>,
 }
 
 impl RunViews {

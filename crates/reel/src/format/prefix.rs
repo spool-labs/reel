@@ -295,12 +295,13 @@ fn put_varint(out: &mut Vec<u8>, mut value: u64) {
 }
 
 /// Read a number `put_varint` wrote, stepping past it
+#[inline]
 fn get_varint(bytes: &[u8], at: &mut usize) -> Result<u64> {
     let mut value = 0u64;
     for shift in (0..64).step_by(7) {
-        let byte = *bytes
-            .get(*at)
-            .ok_or_else(|| ReelError::Corruption("a footer row number is truncated".to_string()))?;
+        let Some(&byte) = bytes.get(*at) else {
+            return Err(truncated_number());
+        };
         *at += 1;
         value |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
@@ -310,6 +311,11 @@ fn get_varint(bytes: &[u8], at: &mut usize) -> Result<u64> {
     Err(ReelError::Corruption(
         "a footer row number runs past ten bytes".to_string(),
     ))
+}
+
+#[cold]
+fn truncated_number() -> ReelError {
+    ReelError::Corruption("a footer row number is truncated".to_string())
 }
 
 /// A signed difference folded so small ones of either sign stay small
@@ -374,6 +380,7 @@ fn get_tail(bytes: &[u8], at: &mut usize, shape: Tail, before: &Whole) -> Result
 }
 
 /// One row off packed bytes, its tail read against the row before it in its block
+#[inline]
 fn read_row<'a>(bytes: &'a [u8], at: usize, shape: Tail, before: &Whole) -> Result<Row<'a>> {
     let mut next = at;
     let shared = get_varint(bytes, &mut next)? as usize;

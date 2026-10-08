@@ -57,7 +57,7 @@ pub trait FooterSource: Send + Sync {
     }
 
     /// A segment's partition for a column read in place, where it strides and the segment maps
-    fn mapped_rows(&self, _segment: SegmentId, _column: ColumnId) -> Result<Option<MappedRows>> {
+    fn mapped_rows(&self, _segment: SegmentId, _column: ColumnId) -> Result<Option<Arc<MappedRows>>> {
         Ok(None)
     }
 
@@ -86,27 +86,30 @@ pub enum MappedRows {
         rows: usize,
     },
 
-    /// Prefix packed rows, decoded from the nearest restart the footer's directory gives
+    /// Prefix packed rows, decoded from the nearest restart
     Packed {
         map: Arc<Mapping>,
-        footer: Arc<FooterMap>,
-        column: ColumnId,
+        restarts: Box<[u32]>,
+        rows_end: u32,
         at: u64,
         rows: usize,
     },
 }
 
 impl MappedRows {
-    /// A partition's rows in a mapping, with the directory that places a packed one's restarts
-    pub fn new(map: Arc<Mapping>, footer: Arc<FooterMap>, span: &PartitionSpan) -> MappedRows {
-        match span.is_packed || span.is_varying() {
-            true => MappedRows::Packed {
-                map,
-                footer,
-                column: span.column,
-                at: span.at,
-                rows: span.rows,
-            },
+    /// A partition's rows in a mapping, a packed one with the restarts the footer's directory gives
+    pub fn new(map: Arc<Mapping>, footer: &FooterMap, span: &PartitionSpan) -> Option<MappedRows> {
+        Some(match span.is_packed || span.is_varying() {
+            true => {
+                let restarts = footer.restarts_of(span.column)?;
+                MappedRows::Packed {
+                    map,
+                    restarts: restarts.offsets().into(),
+                    rows_end: restarts.rows_end(),
+                    at: span.at,
+                    rows: span.rows,
+                }
+            }
             false => MappedRows::Strided {
                 map,
                 at: span.at,
@@ -114,7 +117,7 @@ impl MappedRows {
                 key_width: span.key_width as usize,
                 rows: span.rows,
             },
-        }
+        })
     }
 
     /// The key and row at a place in the partition, a packed one decoded by `cursor`
@@ -137,19 +140,16 @@ impl MappedRows {
             }
             MappedRows::Packed {
                 map,
-                footer,
-                column,
+                restarts,
+                rows_end,
                 at,
                 rows,
             } => {
-                let restarts = footer
-                    .restarts_of(*column)
-                    .filter(|_| row < *rows)
+                let bytes = (row < *rows)
+                    .then(|| map.slice(*at, *rows_end as usize))
+                    .flatten()
                     .ok_or_else(missing)?;
-                let bytes = map
-                    .slice(*at, restarts.rows_end() as usize)
-                    .ok_or_else(missing)?;
-                let (key, tail) = cursor.read(bytes, |block| restarts.start(block), row)?;
+                let (key, tail) = cursor.read(bytes, |block| restarts.get(block).copied(), row)?;
                 Ok((key, FooterRow::read(tail, 0)?))
             }
         }

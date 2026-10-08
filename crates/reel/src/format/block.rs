@@ -125,6 +125,11 @@ impl RestartTable {
         self.rows_end
     }
 
+    /// Where every restart block begins within the partition's rows
+    pub fn offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+
     /// Where one restart block's bytes sit within the partition's rows
     fn cut(&self, block: usize) -> Option<(u32, u32)> {
         let start = *self.offsets.get(block)?;

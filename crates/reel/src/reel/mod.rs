@@ -18,6 +18,7 @@ pub mod volumes;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -66,6 +67,9 @@ pub const NOTHING_PURGED: u64 = 0;
 
 /// Width of the zero-padded segment number in a file name
 const SEGMENT_DIGITS: usize = 6;
+
+/// The shared rows table sweeps out entries no reader holds once it reaches this many
+const MAPPED_ROWS_SWEEP: usize = 4096;
 
 /// Suffix every segment file carries
 pub const SEGMENT_SUFFIX: &str = ".reel";
@@ -964,7 +968,13 @@ impl FooterSource for ReelShared {
         Ok(self.footer_from_disk(segment)?.map(Arc::new))
     }
 
-    fn mapped_rows(&self, segment: SegmentId, column: ColumnId) -> Result<Option<MappedRows>> {
+    fn mapped_rows(&self, segment: SegmentId, column: ColumnId) -> Result<Option<Arc<MappedRows>>> {
+        if let Some(held) = lock(&self.mapped_rows)
+            .get(&(segment, column))
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Ok(Some(held));
+        }
         let Some(map) = self.footer_map_of(segment)? else {
             return Ok(None);
         };
@@ -975,9 +985,20 @@ impl FooterSource for ReelShared {
         let Some(handle) = self.handle_for(segment)? else {
             return Ok(None);
         };
-        Ok(handle
+        let Some(rows) = handle
             .shared_mapping(self.config.segment_bytes.to_bytes())
-            .map(|mapped| MappedRows::new(mapped, Arc::clone(&map), &span)))
+            .and_then(|mapped| MappedRows::new(mapped, &map, &span))
+        else {
+            return Ok(None);
+        };
+        let rows = Arc::new(rows);
+        let mut held = lock(&self.mapped_rows);
+        // Segment numbers never come back, so an entry no reader holds is only dropped
+        if held.len() >= MAPPED_ROWS_SWEEP {
+            held.retain(|_, kept| kept.strong_count() > 0);
+        }
+        held.insert((segment, column), Arc::downgrade(&rows));
+        Ok(Some(rows))
     }
 
     /// The block holding one row, read through the footer's directory, or the whole footer when it is already held
@@ -1056,6 +1077,9 @@ pub struct ReelShared {
 
     /// Footers of sealed segments, which a paged column resolves its keys through
     pub footers: FooterCache,
+
+    /// Each sealed partition's rows in place, shared by every key run reader holding one
+    mapped_rows: Mutex<HashMap<(SegmentId, ColumnId), std::sync::Weak<MappedRows>>>,
 
     /// Load-time settings for the volume
     pub config: ReelConfig,
@@ -1180,6 +1204,7 @@ impl ReelShared {
             probes: FilterProbes::default(),
             segments: OnceLock::new(),
             footers: FooterCache::new(config.footer_cache.to_bytes() as usize),
+            mapped_rows: Mutex::new(HashMap::new()),
             config,
             columns,
             purge_floor: AtomicU64::new(NOTHING_PURGED),

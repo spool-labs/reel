@@ -14,19 +14,13 @@ const DEFAULT_SEGMENT_GIB: u64 = 1;
 const DEFAULT_COMPACT_DEAD_RATIO: f64 = 0.50;
 const DEFAULT_SCRUB_MBPS: u64 = 64;
 
-/// Sealed descriptors the reader cache holds, unless the open-file limit says fewer
-///
-/// A store with more sealed segments than this drops a handle on every miss and remaps
-/// the segment on the next read, so the default sits well above a volume's segment count.
+/// The reader cache holds this many sealed descriptors, unless the open-file limit is lower
 pub const DEFAULT_FD_CACHE: u64 = 4096;
 
 const DEFAULT_FOOTER_CACHE_MIB: u64 = 64;
 const DEFAULT_FILTER_BITS: u8 = 10;
 
-/// Tails one volume will open however wide the machine is
-///
-/// Each tail is an open segment reserving its whole size up front, so tails
-/// multiply what a volume claims before it has written anything.
+/// An automatic budget opens at most this many tails per volume, however wide the machine
 const MAX_AUTO_TAILS: usize = 8;
 
 pub(crate) const KIB: u64 = 1024;
@@ -42,20 +36,16 @@ pub enum SyncPolicy {
     Bytes(ByteCount),
 }
 
-/// Compaction rate limit, unpaced unless a cap is named
-///
-/// The cap is device traffic, read plus write, and not reclaimed space: a pass
-/// reads the segment it retires and writes the survivors, so an operator sizing
-/// this against a reclaim deadline should divide.
+/// Compaction rate limit, unpaced unless a cap is set
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompactRate {
     /// Unpaced: the pass runs at device speed while there is debt to drain
     Auto,
-    /// Cap at this many megabytes per second, held inside a pass as well as between passes
+    /// Cap read plus write traffic at this many megabytes per second, inside and between passes
     Mbps(u64),
 }
 
-/// Append tails a volume may run, automatic or a fixed count.
+/// How many append tails a volume may run, automatic or a fixed count
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ThreadBudget {
     /// Take the machine's parallelism as the cap
@@ -87,10 +77,7 @@ impl ThreadBudget {
         }
     }
 
-    /// The cap resolved for append tails, which cost disk rather than only cpu
-    ///
-    /// A tail costs a whole reserved segment, so an automatic budget stops well
-    /// short of a wide machine's core count and a named number is taken as given.
+    /// The cap resolved for append tails, held to `MAX_AUTO_TAILS` for an automatic budget
     pub fn resolve_tails(self) -> usize {
         match self {
             ThreadBudget::Auto => self.resolve().clamp(1, MAX_AUTO_TAILS),
@@ -111,13 +98,9 @@ pub enum VolumeClass {
 }
 
 /// One volume root past the reel's own, with the tier it serves
-///
-/// A class describes the volume, not how the volume was built: a stripe handed
-/// over as one entry and a raw drive are the same to the engine. A dead entry
-/// stays in the list, since the placement table is indexed by list order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VolumeSpec {
-    /// Directory the volume is mounted at
+    /// The volume's mount directory
     pub path: std::path::PathBuf,
 
     /// The tier, fast unless the entry says otherwise
@@ -156,15 +139,13 @@ impl VolumeSpec {
 /// When the kernel runs the completion work a ring owes its owning thread
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskRun {
-    /// Hold it until the thread enters asking for completions, on a kernel from 6.1
-    ///
-    /// Rests on a ring belonging to one thread, which is the promise this backend keeps.
+    /// Hold it until the owning thread asks for completions, on a kernel from 6.1
     Deferred,
 
-    /// Run it at the next kernel exit rather than interrupting for it, from 5.19
+    /// Run it at the next kernel exit, on a kernel from 5.19
     Cooperative,
 
-    /// Interrupt the thread for every completion, which is what a ring does unasked
+    /// Interrupt the thread for every completion, the ring's default
     Interrupt,
 }
 
@@ -189,9 +170,6 @@ impl Default for RingTuning {
 
 impl TaskRun {
     /// This mode and the ones below it, for a kernel that refuses the one asked for
-    ///
-    /// Deferred wants 6.1 and cooperative 5.19, and a refusal comes back as one errno with
-    /// nothing naming the flag, so the answer is to try the next one down.
     pub fn and_below(self) -> &'static [TaskRun] {
         match self {
             TaskRun::Deferred => &[TaskRun::Deferred, TaskRun::Cooperative, TaskRun::Interrupt],
@@ -201,9 +179,6 @@ impl TaskRun {
     }
 
     /// Whether a thread has to ask the kernel before it reads its own queue
-    ///
-    /// Both non-default modes set `IORING_SQ_TASKRUN` when work is waiting, so a peek is a
-    /// flag read; only under deferred is the ask what makes a completion appear.
     pub fn is_asked_for(self) -> bool {
         !matches!(self, TaskRun::Interrupt)
     }
@@ -230,12 +205,12 @@ pub enum IoBackend {
     UringDirect,
 }
 
-/// Where a record that fails its checksum can be fetched again from.
+/// Where a record that fails its checksum can be fetched again from
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RepairPath {
     /// Another copy exists, so a corrupt record becomes a miss and a refetch
     Peers,
-    /// Nothing else holds these bytes, so corruption is an error, never a miss
+    /// Nothing else holds these bytes, so corruption is an error
     None,
 }
 
@@ -263,25 +238,25 @@ pub struct ReelConfig {
     /// Where a record that fails its checksum can be fetched again from
     pub repair: RepairPath,
 
-    /// Smallest record served from a read-only mapping of its segment file, unset maps nothing
+    /// Records this size and up are served from a read-only mapping, unset maps nothing
     pub map_above: Option<ByteCount>,
 
-    /// Append tails the volume runs, which is how many files it appends into
+    /// How many append tails the volume runs, one file each
     pub active_tails: ThreadBudget,
 
-    /// Extra volume roots the reel places segments across, past its own fast root
+    /// Extra volume roots for segments, past the reel's own fast root
     pub volumes: Vec<VolumeSpec>,
 
-    /// File backend selected for this volume
+    /// The volume's file backend
     pub io_backend: IoBackend,
 
     /// Ring tunables, which only mean anything under a ring backend
     pub uring: RingTuning,
 
-    /// Bits per key a seal spends on each column's filter, zero for no filter
+    /// Filter bits per key for each column at seal, zero for no filter
     pub filter_bits: u8,
 
-    /// Bytes of sealed-footer state the volume keeps at once
+    /// How many bytes of sealed-footer state the volume keeps at once
     pub footer_cache: ByteCount,
 }
 
@@ -325,10 +300,7 @@ impl Default for ReelConfig {
 }
 
 impl ReelConfig {
-    /// Append tails this volume runs, floored at one per fast volume
-    ///
-    /// A named count is taken as a minimum rather than as given, and capacity
-    /// volumes take no tail, since nothing fresh is ever placed on one.
+    /// How many append tails this volume runs, floored at one per fast volume
     pub fn tail_count(&self) -> usize {
         let fast = 1 + self
             .volumes

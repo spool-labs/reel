@@ -1,12 +1,4 @@
-//! What compaction has to rewrite, depending on how the garbage was made
-//!
-//! A delete leaves its dead bytes where they lie, among records that are still live,
-//! so reclaiming that segment means copying the survivors out first. An update
-//! shadows the old copy where it sits and writes the new one to the tail, so a volume
-//! whose keys are all rewritten leaves older segments holding nothing live, and a
-//! segment with no survivors is unlinked whole. move_ratio, the fraction of retired
-//! segments that had to be rewritten, is what separates the two shapes. The question
-//! is structural rather than a rate, so the volume is small enough to run anywhere.
+//! Measures whether compaction rewrites or unlinks segments, by how the garbage was made
 
 use tempfile::TempDir;
 
@@ -38,21 +30,18 @@ const COLUMNS: ColumnSet = &[
 ];
 
 /// Bytes written before any garbage is made
-///
-/// Which way a segment retires does not need a volume larger than memory.
 const VOLUME_BYTES: u64 = 512 * 1024 * 1024;
 
 /// One record's payload
 const RECORD_BYTES: usize = 256 * 1024;
 
-/// Segments small enough that a volume this size spans a useful number of them
+/// Segment size, small enough that the volume spans many segments
 const SEGMENT_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Times every key is rewritten in the update shape
+/// The update shape rewrites every key this many times
 const ROUNDS: usize = 3;
 
-/// Fraction of keys deleted in the delete shape, matched to what the rewrites
-/// leave dead so the two shapes are asked to reclaim comparable amounts
+/// The delete shape deletes this share of keys, about what the rewrites leave dead
 const KILL_FRACTION: f64 = 0.66;
 
 fn unique_id() -> [u8; 32] {
@@ -80,7 +69,7 @@ fn open(dir: &TempDir) -> ReelStore {
     ReelStore::open(dir.path().to_path_buf(), config(), COLUMNS).expect("open")
 }
 
-/// Drive compaction until two passes running give nothing further back
+/// Compact until two passes in a row reclaim nothing
 fn drain(store: &ReelStore) {
     let mut idle = 0u32;
     let mut last = store.dead_bytes().to_bytes();
@@ -117,8 +106,7 @@ fn report(shape: &str, store: &ReelStore, dead_before: u64) {
 #[test]
 #[ignore = "writes real files, run explicitly with --ignored --nocapture"]
 fn what_compaction_rewrites_by_churn_shape() {
-    // libtest leaves "test name ... " open, so a header printed into it lands a
-    // screen-width right of the rows underneath it.
+    // libtest leaves the test name line open, so start the table on a fresh line
     println!();
     let count = (VOLUME_BYTES / RECORD_BYTES as u64) as usize;
     let group = 1u16;
@@ -135,8 +123,7 @@ fn what_compaction_rewrites_by_churn_shape() {
         "shape", "rewritten", "unlinked", "move_ratio", "copied", "reclaimed"
     );
 
-    // Updates: every key rewritten in place, so the live copy walks forward and
-    // the segments behind it are left holding only shadows.
+    // Updates: every key rewritten, so the segments behind hold only shadows
     {
         let dir = TempDir::new().expect("tempdir");
         let store = open(&dir);
@@ -160,8 +147,7 @@ fn what_compaction_rewrites_by_churn_shape() {
         report("update", &store, dead_before);
     }
 
-    // Mixed: only some keys are rewritten, so the untouched records keep their
-    // segments partly alive, which is the shape a metadata-heavy caller makes.
+    // Mixed: half the keys rewritten, so untouched records keep segments partly alive
     {
         let dir = TempDir::new().expect("tempdir");
         let store = open(&dir);
@@ -185,8 +171,7 @@ fn what_compaction_rewrites_by_churn_shape() {
         report("mixed", &store, dead_before);
     }
 
-    // Deletes: the dead bytes stay where they were written, interleaved with the
-    // records that are still live.
+    // Deletes: dead bytes stay interleaved with live records where they were written
     {
         let dir = TempDir::new().expect("tempdir");
         let store = open(&dir);

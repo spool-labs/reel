@@ -1,9 +1,5 @@
-//! Per-tail observation points over the active segment
-//!
-//! Each active tail publishes which segment it is appending to and how far its
-//! write head has reached. Neither number gates anything and read safety must not
-//! be built on them: what keeps the maintenance plane off a segment still being
-//! written is the reel's claim on the segment number.
+//! What each tail publishes: the segment it appends to and how far its write head has reached
+//! These numbers are for observing a tail, and read safety must not rely on them
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -47,9 +43,7 @@ impl Tail {
         self.committed_len.store(0, Ordering::Release);
     }
 
-    /// Publish how far the write head has reached
-    ///
-    /// Writers land their records out of order, so this only ever moves forward.
+    /// Publish how far the write head has reached, moving only forward
     pub fn publish_committed(&self, length: u64) {
         self.committed_len.fetch_max(length, Ordering::Relaxed);
     }

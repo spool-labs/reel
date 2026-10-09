@@ -1,13 +1,5 @@
-//! What filling a segment costs the writer that happens to fill it
-//!
-//! The seal runs once per segment roll, so it is one or two samples in many thousands
-//! and a mean cannot see it, while the writer that lands on it pays a footer sort, a
-//! multi megabyte write and an fsync inside its own put. So this reports the tail,
-//! times every put rather than the batch, and asserts on the roll count, since a run
-//! that never rolled is a bench of nothing.
-//!
-//! Ignored by default. Run with:
-//!   cargo test -p tape-reel --test seal_stall --release -- --ignored --nocapture
+//! Measures the put latency tail that the writer filling a segment pays for its seal
+//! Run `cargo test -p tape-reel --test engine seal_stall --release -- --ignored --nocapture`
 
 use std::time::Instant;
 
@@ -44,13 +36,13 @@ const COLUMNS: ColumnSet = &[
 /// Segment size, small enough that the run rolls many times over
 const SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
 
-/// One record, sized so a segment takes a few hundred of them
+/// Record size, so a segment takes a few hundred records
 const RECORD_BYTES: usize = 16 * 1024;
 
 /// Records written, which at the sizes above is a few dozen rolls
 const RECORD_COUNT: usize = 24_000;
 
-/// Group every record is addressed under
+/// Every record is written under this group
 const GROUP: u16 = 7;
 
 /// The record column key for a group and an id, big endian group at the front
@@ -83,7 +75,7 @@ fn record_id(index: usize) -> [u8; 32] {
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT_BYTES),
-        // The seal is what is measured, so nothing else may sync or move the device.
+        // No syncs or scrub, so only the seal touches the device
         sync: SyncPolicy::Never,
         scrub_mbps: 0,
         ..ReelConfig::default()
@@ -99,12 +91,11 @@ fn at(sorted: &[u128], percentile: f64) -> u128 {
     sorted[at]
 }
 
-// what the segment-filling writer pays, at the tail rather than on average
+// prints the put latency tail a segment-filling writer pays
 #[test]
 #[ignore]
 fn seal_stall() {
-    // libtest leaves "test name ... " open, so a header printed into it lands a
-    // screen-width right of the rows underneath it.
+    // libtest leaves the test name line open, so start the table on a fresh line
     println!();
     let dir = TempDir::new().expect("tempdir");
     let store = ReelStore::open(dir.path().to_path_buf(), config(), COLUMNS).expect("open");
@@ -142,7 +133,7 @@ fn seal_stall() {
         "  max        {:>10.2} us",
         taken[taken.len() - 1] as f64 / 1000.0
     );
-    // The tail against the middle, which is what a mean cannot show.
+    // The tail against the median
     println!(
         "  max/p50    {:>10.1}x",
         taken[taken.len() - 1] as f64 / at(&taken, 0.50).max(1) as f64

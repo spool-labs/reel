@@ -37,7 +37,7 @@ fn value_of(n: u64) -> Vec<u8> {
     value
 }
 
-/// A volume holding every key, most of them sealed and handed over, the last few still in the map
+/// A volume holding every key, most sealed and handed over, the last few still in the map
 fn filled(dir: &TempDir) -> (ReelStore, BTreeMap<Vec<u8>, Vec<u8>>) {
     let config = ReelConfig {
         segment_bytes: ByteCount::from_bytes(64 * 1024),

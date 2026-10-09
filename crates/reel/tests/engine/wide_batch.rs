@@ -1,12 +1,4 @@
 //! A batch wider than the kernel's iovec cap lands whole, on either backend
-//!
-//! A vectored call carries at most 1024 spans on Linux and macOS alike, and past that
-//! the kernel refuses the whole call rather than writing a prefix of it. Posix walks
-//! a wide drain in capped calls; the ring carries a write's span list in one
-//! submission and cannot split it, so an oversized write takes the posix path. A
-//! batch reaches the cap in records rather than bytes, so small payloads are what
-//! gets there. Off Linux a ring request downgrades to posix, so this is the posix leg
-//! run twice.
 
 use tempfile::TempDir;
 
@@ -15,7 +7,7 @@ use reel::{
     ReelConfig, ReelStore, SyncPolicy,
 };
 
-/// Spans one vectored call carries, which is the bound this file is about
+/// One vectored call takes at most this many spans
 const IOVEC_CAP: usize = 1024;
 
 /// Records in the batch, comfortably past the cap so no rounding lands under it
@@ -53,8 +45,7 @@ fn a_batch_past_the_cap(io_backend: IoBackend) {
     let store =
         ReelStore::open(dir.path().to_path_buf(), config(io_backend), COLUMNS).expect("open");
 
-    // Small payloads on purpose: large ones would reach the cap in bytes long before
-    // the batch reached it in records.
+    // Small payloads, so the batch reaches the cap in records before any byte bound
     let writes: Vec<RecordWrite> = (0..RECORDS)
         .map(|at| RecordWrite::Put {
             key: key(at),
@@ -75,16 +66,13 @@ fn a_batch_past_the_cap(io_backend: IoBackend) {
     }
 }
 
-// the posix backend splits a wide batch, as it always has
+// the posix backend splits a wide batch into capped calls
 #[test]
 fn a_wide_batch_lands_on_posix() {
     a_batch_past_the_cap(IoBackend::Posix);
 }
 
 // the ring hands a wide batch to the path that can split it
-//
-// Without that hand-off the kernel refuses the whole call: nothing written, and the
-// batch reported to the caller as an io error.
 #[test]
 fn a_wide_batch_lands_on_the_ring() {
     a_batch_past_the_cap(IoBackend::Uring);

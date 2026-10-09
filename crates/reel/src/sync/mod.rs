@@ -1,26 +1,19 @@
 //! Poison-recovering wrappers over the standard locks
-//!
-//! Every lock in the crate recovers a poisoned guard instead of panicking, so a
-//! writer that panicked while holding a lock cannot wedge every later caller.
 
 #[cfg(feature = "rendezvous")]
 pub mod rendezvous;
 pub mod tension;
 
-/// The rendezvous surface a build without the feature keeps, so the sites stay put
-///
-/// Every marked moment lives on a production path and every one of them is a call
-/// to nothing here. There is no stage to arm, so `Script` has no counterpart: only
-/// a test ever held one.
+/// No-op rendezvous calls for a build without the feature, so the sites stay put
 #[cfg(not(feature = "rendezvous"))]
 pub mod rendezvous {
-    /// Whether a script has refused the point, which without one it never has
+    /// Whether a script has refused the point, always false without the feature
     #[inline(always)]
     pub fn refused(_name: &'static str) -> bool {
         false
     }
 
-    /// Mark a named moment, which nothing is watching for
+    /// Mark a rendezvous point, which nothing watches
     #[inline(always)]
     pub fn at(_name: &'static str) {}
 }
@@ -38,9 +31,6 @@ pub fn lock<Guarded>(mutex: &Mutex<Guarded>) -> MutexGuard<'_, Guarded> {
 }
 
 /// Take a mutex only if it is free, for work another thread is already doing
-///
-/// Nothing comes back when someone else holds it, which is an answer rather than a
-/// failure: the caller has something better to do than queue for work under way.
 pub fn try_lock<Guarded>(mutex: &Mutex<Guarded>) -> Option<MutexGuard<'_, Guarded>> {
     match mutex.try_lock() {
         Ok(guard) => Some(guard),

@@ -162,7 +162,7 @@ fn rows_stay_within_their_segment() {
     drop(store);
 }
 
-/// Puts the aborting child makes, enough to seal some segments and leave one open
+/// The aborting child makes this many puts, enough to seal some segments and leave one open
 #[cfg(target_os = "linux")]
 const ABORT_PUTS: u64 = 1_000;
 

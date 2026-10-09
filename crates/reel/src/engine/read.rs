@@ -29,11 +29,7 @@ use reel_core::{range_of, ReadBlock, Value};
 /// How many times a read re-resolves a stale index pointer before giving up
 const RESOLVE_RETRIES: u32 = 4;
 
-/// One batch read in place: the blocks it filled, a spot per key, and the records
-/// it had to own
-///
-/// A walk lends from it until its next batch, and a caller keeping records takes
-/// them out as values.
+/// One batch read in place, with its blocks, a spot per key and any owned records
 #[derive(Default)]
 pub(crate) struct Placed {
     /// What the device is asked for, one per key the index placed
@@ -49,7 +45,7 @@ pub(crate) struct Placed {
     owned: Vec<Value>,
 }
 
-/// A spot's block when the record is held owned, its index into `owned`
+/// A spot's block value for an owned record, whose `at` indexes `owned`
 const OWNED: u32 = u32::MAX - 1;
 
 impl Placed {
@@ -126,8 +122,7 @@ impl Placed {
             let stored = &self.blocks[spot.block as usize][spot.at as usize..][..spot.len as usize];
             match crate::append::codec::decode(spot.codec, stored) {
                 Some(decoded) => self.hold(at, Value::pooled(decoded, crate::reel::payload::give)),
-                // A decode that fails is corruption wearing a valid checksum, left for
-                // the single-key path to answer.
+                // A failed decode is corruption behind a good checksum, for the single-key path
                 None => self.spots[at] = Spot::MISS,
             }
         }
@@ -151,8 +146,7 @@ impl HeldPlaced {
 impl Drop for HeldPlaced {
     fn drop(&mut self) {
         let mut held = std::mem::take(&mut self.0);
-        // Cleared rather than dropped, so a block a failed batch left goes back to
-        // the payload pool here rather than being held until this thread reads again.
+        // Reset on drop so blocks a failed batch left go back to the payload pool now
         held.reset(0);
         PLACED.with(|spare| spare.set(held));
     }
@@ -160,10 +154,6 @@ impl Drop for HeldPlaced {
 
 impl ReelStore {
     /// Read one payload, verified against its header key and checksum
-    ///
-    /// A pointer the index has since moved is re-resolved, and a record that fails
-    /// its checksum has its key evicted so the miss becomes a repair enqueue. A
-    /// read-only open catches up or rebuilds once before it calls a pointer unresolvable.
     pub fn get(&self, key: &RecordKey) -> Result<Option<Value>> {
         self.settle_sealed()?;
         let behind = self.index.spot_behind();
@@ -202,11 +192,6 @@ impl ReelStore {
     }
 
     /// Read part of one payload, clamped to it, at the caller's logical offsets
-    ///
-    /// The record's own header decides which way it is served. A raw record's
-    /// window skips the whole-payload checksum but keeps identity. A coded record
-    /// decodes whole, checksum verified, and the window is cut from the payload it
-    /// decodes to.
     pub fn get_range(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Option<Value>> {
         self.settle_sealed()?;
         let behind = self.index.spot_behind();
@@ -250,16 +235,9 @@ impl ReelStore {
     }
 
     /// Read several keys with one submission, answered in the order asked
-    ///
-    /// The index is asked for every key first, so what reaches the device is one
-    /// batch of reads. Only a clean answer is batched: a moved pointer, a retired
-    /// segment or a bad checksum falls back to the single-key path, which is the one
-    /// that retries, rebuilds and evicts.
     pub fn get_many(&self, keys: &[RecordKey]) -> Result<Vec<Option<Value>>> {
         self.settle_sealed()?;
         let located = self.locate_many(keys)?;
-        // Borrowed for the read: the batch holds the caller's keys the whole way
-        // through and the read path only ever reads them.
         let borrowed: Vec<KeyRef<'_>> = keys.iter().map(RecordKey::as_ref).collect();
         let mut values = self.read_found(&borrowed, &located.found)?;
         if located.picks.is_empty() {
@@ -325,8 +303,6 @@ impl ReelStore {
     }
 
     /// Read several keys as one future, answered in the order asked
-    ///
-    /// One submission and one wait, with no thread held per read.
     pub async fn get_many_wait(&self, keys: &[RecordKey]) -> Result<Vec<Option<Value>>> {
         self.settle_sealed()?;
         let located = self.locate_many(keys)?;
@@ -372,18 +348,12 @@ impl ReelStore {
         Ok(values)
     }
 
-    /// Ask the index where every key sits, all of them against one state of it
-    ///
-    /// The index takes its own barrier, so a batch publishing beside this cannot
-    /// answer some keys from before it and the rest from after.
+    /// Ask the index where every key sits, all against one state of the index
     fn locate_many(&self, keys: &[RecordKey]) -> Result<Located> {
         self.index.get_many(keys)
     }
 
     /// Read a batch whose entries the caller already resolved
-    ///
-    /// The index already answered where every key sits, so nothing is resolved
-    /// twice. An entry of nothing is a key the caller found no record for.
     pub fn read_found(
         &self,
         keys: &[KeyRef<'_>],
@@ -392,8 +362,7 @@ impl ReelStore {
         let mut held = HeldPlaced::take();
         let placed = &mut held.0;
         self.read_placed(keys, found, placed)?;
-        // The record moved or went bad since the caller resolved it, which is what
-        // compaction does under a playback.
+        // The record moved or went bad since the caller resolved it, as compaction does
         let missed: Vec<usize> = placed.missed().collect();
         for at in missed {
             if let Some(value) = self.get(&keys[at].to_owned_key()?)? {
@@ -404,8 +373,6 @@ impl ReelStore {
     }
 
     /// Read a resolved batch as a future, answered in the order asked
-    ///
-    /// The retry a moved record needs stays on the async door.
     pub async fn read_found_wait(
         &self,
         keys: &[KeyRef<'_>],
@@ -460,7 +427,7 @@ impl ReelStore {
     /// An ask for every key the index placed, with every key missing until read
     fn plan_placed(&self, keys: usize, found: &[Option<Entry>], placed: &mut Placed) {
         placed.reset(keys);
-        // One hold of the segment table for the batch, since a lookup per record contends on its lock
+        // Take the segment stamps once, since a lookup per record contends on the table's lock
         let stamps = self.index.segments().stamps();
         for (at, entry) in found.iter().enumerate().take(keys) {
             if let Some(entry) = entry {
@@ -475,9 +442,6 @@ impl ReelStore {
     }
 
     /// Advance the index to what the volume holds now
-    ///
-    /// How a read-only open picks up appends and sees compaction move records. The
-    /// pass reads from where the last one stopped, so one append costs that append.
     pub fn refresh(&self) -> Result<CaughtUp> {
         if !self.is_read_only {
             return Err(ReelError::Rejected(
@@ -489,21 +453,19 @@ impl ReelStore {
             catch_up(&self.driver, &self.root, &self.index, &mut cursor)?
         };
 
-        // Only a retired segment leaves a stale descriptor behind, so the rest of the
-        // cache keeps its descriptors and the advice set on each one.
+        // Only retired segments leave stale descriptors, so the rest of the cache stays
         for segment in &caught_up.retired {
             self.fd_cache.remove(*segment);
         }
 
-        // A reader never reaches the tick, so it sweeps and prunes here, a grave once its tombstone's segment sealed and the window passed
+        // A reader never runs the tick, so it sweeps covers and prunes old graves here
         self.index.sweep_covers(SWEEP_RUN)?;
         let floor = caught_up.highest_lsn.as_u64().saturating_sub(GRAVE_WINDOW);
         if floor > 0 {
             self.index.prune_tombstones(Lsn(floor));
         }
 
-        // A reader holding more covers than it will test per record can no longer
-        // follow cheaply, and a rebuild needs no covers at all.
+        // A reader with too many covers or lost segments rebuilds, which needs no covers
         if caught_up.is_saturated || caught_up.lost > 0 {
             self.rebuild()?;
         }
@@ -511,9 +473,6 @@ impl ReelStore {
     }
 
     /// Rebuild the whole index from the volume, discarding where the reader was
-    ///
-    /// For the case following the log cannot answer: a reader so far behind that
-    /// segments it never read have been compacted away.
     pub fn rebuild(&self) -> Result<()> {
         if !self.is_read_only {
             return Err(ReelError::Rejected(
@@ -534,7 +493,7 @@ impl ReelStore {
         Ok(())
     }
 
-    /// Recorded length of one record, served from the index with no read
+    /// The recorded length of one record, from the index with no read
     pub fn size_of(&self, key: &RecordKey) -> Result<Option<ByteCount>> {
         self.settle_sealed()?;
         self.followed(|| self.index.size_of(key))
@@ -551,7 +510,7 @@ impl ReelStore {
         self.is_read_only && self.index.spot_behind() != behind
     }
 
-    /// Bring a read-only open up to its volume, catching up where it fell behind and rebuilding otherwise
+    /// Bring a read-only open up to date, catching up if it fell behind, else rebuilding
     fn resync(&self, behind: u64) -> Result<()> {
         if self.fell_behind(behind) {
             self.refresh()?;
@@ -560,7 +519,7 @@ impl ReelStore {
         self.rebuild()
     }
 
-    /// Answer from the index, again after a catch-up where a read-only open met a segment its writer retired
+    /// Answer from the index, asking again after a catch-up if a writer retired a segment
     fn followed<Answer>(&self, answer: impl Fn() -> Result<Answer>) -> Result<Answer> {
         let behind = self.index.spot_behind();
         let found = answer()?;
@@ -571,10 +530,7 @@ impl ReelStore {
         answer()
     }
 
-    /// Cue up a view of the volume as it stands now
-    ///
-    /// The tails are sealed first, so every version at or below the number returned
-    /// sits in a segment with a footer and can be found again.
+    /// Cue up a view of the volume as it stands now, sealing the tails first
     pub fn cue(&self) -> Result<CuePoint> {
         if self.is_read_only {
             return Err(read_only());
@@ -582,8 +538,7 @@ impl ReelStore {
         for tail in self.reel.tails() {
             tail.seal()?;
         }
-        // peek names the number the next write will take, so cueing at peek would
-        // include a write that has not happened yet.
+        // peek is the next write's number, so the cue sits one below it
         let at = Lsn(self.reel.shared().lsn.peek().as_u64().saturating_sub(1));
         Ok(CuePoint::hold(at, Arc::clone(&self.cues)))
     }
@@ -594,9 +549,6 @@ impl ReelStore {
     }
 
     /// Read one key as of a sequence number nothing is holding open
-    ///
-    /// Nothing holds the version open, so compaction may have reclaimed it and a miss
-    /// says nothing about that number.
     pub fn read_as_of(&self, key: &RecordKey, at: Lsn) -> Result<Option<Value>> {
         self.check_column(key)?;
         // The segments a cue sealed are searchable only once their spans are noted
@@ -622,7 +574,7 @@ impl ReelStore {
                     entry.loc.segment.as_u32()
                 )))
             }
-            // Never retried: a newer version is not this reader's to see.
+            // Never retried, since a newer version is outside this reader's view
             RecordRead::Stale | RecordRead::Gone | RecordRead::Corrupt | RecordRead::Coded => {
                 Ok(None)
             }
@@ -630,9 +582,6 @@ impl ReelStore {
     }
 
     /// Fill a buffer with one bounded page of a column's keys, ascending
-    ///
-    /// A column reads footers to fill a page, so a page can fail, and the failure goes
-    /// back to the caller.
     pub fn page(
         &self,
         column: ColumnId,
@@ -654,12 +603,7 @@ impl ReelStore {
         self.index.page_back(column, end, limit, out)
     }
 
-    /// Fill a buffer with the next page a playback has reached, and carry it past it
-    ///
-    /// The cursor holds the playback's place and, on a paged column, the footers it
-    /// is reading, so a playback opens those once rather than once per page. One
-    /// page is filled against one state of the index, so no page holds part of a
-    /// batch, but a walk of many pages is not a view of the volume at one moment.
+    /// Fill a buffer with the playback's next page and move the playback past it
     pub fn page_from(
         &self,
         playback: &mut PlaybackCursor,
@@ -670,10 +614,6 @@ impl ReelStore {
     }
 
     /// Whether a column's records can hold what a codec produced
-    ///
-    /// The declaration says what may have happened and the record header says what
-    /// did, so this only decides whether the header has to be read. A column the
-    /// volume does not serve is left to the read.
     fn is_coded(&self, column: ColumnId) -> bool {
         self.index
             .spec(column)
@@ -681,11 +621,6 @@ impl ReelStore {
     }
 
     /// Resolve one key, re-resolving a moved pointer and evicting a rotted record
-    ///
-    /// A writable index moves under its own writes, so a pointer that will not
-    /// resolve is retried and finally evicted. A read-only index reports the same
-    /// pointer unresolved, since evicting would delete a key from a volume the
-    /// reader does not own.
     fn resolve_read(&self, key: &RecordKey) -> Result<Resolved> {
         match self.index.spot_read(key)? {
             Lookup::Found(_, payload) | Lookup::Newest(payload) => {
@@ -715,9 +650,6 @@ impl ReelStore {
     }
 
     /// Resolve one key as a future, always through the driver
-    ///
-    /// Nothing here maps, since an async caller has a runtime worker to protect and
-    /// a fault cannot be woken.
     async fn resolve_read_wait(&self, key: &RecordKey) -> Result<Resolved> {
         match self.spot_read_wait(key).await? {
             Lookup::Found(_, payload) | Lookup::Newest(payload) => {
@@ -792,7 +724,7 @@ impl ReelStore {
         Some((at, since, self.index.spot_column(at).sole(key)?))
     }
 
-    /// Turn a spot index range read into an answer, or nothing when the checked path must settle it
+    /// Turn a spot index range read into an answer, or nothing for the checked path to settle
     fn spot_range_answer(
         &self,
         at: usize,
@@ -814,10 +746,6 @@ impl ReelStore {
     }
 
     /// Resolve one key and read the range its entry places, retrying as a read does
-    ///
-    /// An entry whose incarnation stamp is still current takes one device read and no
-    /// header echo. Everything else takes the header-checked read, and a header saying a
-    /// codec produced the record sends the window to the whole read.
     fn resolve_range(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Resolved> {
         if let Some((at, since, candidate)) = self.spot_range_candidate(key) {
             let read = self.reel.shared().spot_range(
@@ -929,10 +857,6 @@ impl ReelStore {
     }
 
     /// Read the record whole and cut the window out of what it decodes to
-    ///
-    /// Where a record whose header says a codec produced its bytes is served: the
-    /// offsets the caller asked at address the decoded payload, which no read off
-    /// the volume reaches.
     fn whole_range(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Resolved> {
         Ok(match self.get(key)? {
             Some(payload) => Resolved::Payload(range_of(payload, offset, len)),
@@ -949,10 +873,6 @@ impl ReelStore {
     }
 
     /// Whether the index can vouch for this entry without the on-disk echo
-    ///
-    /// A live segment's record bytes never change, and anything that retires the
-    /// segment or reuses its space drops the incarnation first, so an uncertain
-    /// entry loses the fast path and never its correctness.
     pub(super) fn window_certain(&self, entry: &Entry) -> bool {
         is_certain(&self.index.segments().stamps(), entry)
     }
@@ -967,8 +887,7 @@ impl ReelStore {
     ) -> Result<Option<Resolved>> {
         match read {
             RecordRead::Found(payload) => Ok(Some(Resolved::Payload(payload))),
-            // A sole copy has nobody to repair from, so evicting would hide the loss:
-            // the key keeps its place and the read fails and says so, every time.
+            // A sole copy can't be repaired, so the key stays and every read fails loudly
             RecordRead::Corrupt if self.config.repair == RepairPath::None => {
                 Err(ReelError::Corruption(format!(
                     "the record for a key in segment {} fails its checksum, and this volume is its only copy",
@@ -980,24 +899,18 @@ impl ReelStore {
                 Ok(Some(Resolved::Missing))
             }
             RecordRead::Gone if self.is_read_only => Ok(Some(Resolved::Unresolved)),
-            // The segment is not on the volume, which on one that compacts means a
-            // retire ran under this read. Retried, never evicted.
+            // A retire ran under this read, so retry without evicting
             RecordRead::Gone => Ok(None),
             RecordRead::Stale => {
                 *framed_nothing = Some(entry.loc);
                 Ok(None)
             }
-            // A whole read decodes what a codec produced, and a window is answered
-            // by the range door before it folds, so nothing arrives here coded.
+            // Whole reads decode and the range door takes coded windows, so nothing here is coded
             RecordRead::Coded => Ok(None),
         }
     }
 
-    /// What a key the retries never resolved leaves behind
-    ///
-    /// A location whose bytes do not frame this record is one no further retry will
-    /// fix. A missing file is not that: it is a race a reader can lose for longer
-    /// than the loop waits, so evicting on it would bury a live key.
+    /// After the retries, evict a location that never framed the record and answer missing
     fn give_up(&self, key: &RecordKey, framed_nothing: Option<Loc>) -> Result<Resolved> {
         if self.is_read_only {
             return Ok(Resolved::Unresolved);
@@ -1026,8 +939,6 @@ fn is_certain(stamps: &Stamps<'_>, entry: &Entry) -> bool {
 }
 
 /// What one resolve attempt has decided, before any record is read
-///
-/// The deciding lives here so each door is left holding only its own wait.
 enum Step {
     /// The attempt answered without asking the volume
     Done(Resolved),
@@ -1036,7 +947,7 @@ enum Step {
     Read(Entry),
 }
 
-/// The same for a window, which the record itself can send to the whole read
+/// What one range resolve attempt has decided, before any record is read
 enum RangeStep {
     /// The attempt answered without asking the volume
     Done(Resolved),
@@ -1048,10 +959,7 @@ enum RangeStep {
     Whole,
 }
 
-/// What a resolve carries across its retries
-///
-/// Both doors hold one of these and hand it back the read they made, so the lookup,
-/// the clamp, the stale-pointer fold and the giving up happen here once.
+/// The state one resolve keeps across its retries
 struct Resolving {
     /// Whether the column's records can hold what a codec produced
     coded: bool,
@@ -1069,9 +977,6 @@ impl Resolving {
     }
 
     /// Whether this record's window can be read off the volume with no header
-    ///
-    /// A column that declares a codec holds raw and coded records side by side and
-    /// only the header tells them apart, so a window of one is never read bare.
     fn window_bare(&self, store: &ReelStore, entry: &Entry) -> bool {
         !self.coded && store.window_certain(entry)
     }
@@ -1085,11 +990,6 @@ impl Resolving {
     }
 
     /// The same for a window of one record, which also clamps what is wanted
-    ///
-    /// A window past the end of the payload wants nothing, and a caller asking for
-    /// nothing is answered without a trip to the volume. The
-    /// clamp is against the stored length, which is the payload's only on a record
-    /// no codec produced.
     fn step_range(
         &self,
         store: &ReelStore,
@@ -1102,8 +1002,7 @@ impl Resolving {
         };
         let wanted = clamped(entry.loc.len, offset, len);
         match wanted {
-            // A coded record is stored at a length of its own, so nothing left to
-            // clamp against it says nothing about where the payload ends.
+            // A coded record's stored length isn't its payload length, so read it whole
             0 if self.coded => Ok(RangeStep::Whole),
             0 => Ok(RangeStep::Done(Resolved::Payload(Value::default()))),
             wanted => Ok(RangeStep::Read(entry, wanted)),
@@ -1135,13 +1034,13 @@ struct FirstAsks<'a> {
 
 /// What resolving one key against the reel produced
 enum Resolved {
-    /// The payload the pointer named
+    /// The payload the pointer led to
     Payload(Value),
 
     /// The reel does not hold this key
     Missing,
 
-    /// The index names a record the files cannot answer, so it has to be rebuilt
+    /// The index points at a record the files can't answer, so it has to be rebuilt
     Unresolved,
 }
 
@@ -1153,10 +1052,7 @@ fn unresolved(key: &RecordKey) -> ReelError {
     ))
 }
 
-/// Bytes of a payload a range actually covers, once it is clamped to the record
-///
-/// A range past the end of the record is the bytes that are there, and one starting
-/// at or past the end is none of them.
+/// How many payload bytes a range covers once it is clamped to the record
 fn clamped(payload_len: u32, offset: u64, len: usize) -> usize {
     let left = u64::from(payload_len).saturating_sub(offset);
     left.min(len as u64) as usize

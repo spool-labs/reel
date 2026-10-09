@@ -1,7 +1,4 @@
-//! Interleavings pinned by name, so yesterday's races fail tomorrow's commit
-//!
-//! Each test parks a thread at a named point in another plane, moves the
-//! volume while it stands there, and asserts the answer the engine promises.
+//! Each test parks a thread at a rendezvous point, moves the volume, and checks the answer
 
 use std::collections::BTreeSet;
 use std::ops::Bound;
@@ -38,10 +35,7 @@ fn config() -> ReelConfig {
     }
 }
 
-/// The same column shared into 256 shards, so a page fill crosses more than one
-///
-/// A page reads a shard at a time and gives its lock up between them, which is the
-/// only seam a batch can land in the middle of a fill through.
+/// The same column split into 256 shards, so a page fill crosses more than one
 const SHARDED: ColumnSet = &[ColumnSpec {
     id: ColumnId(1),
     name: "rows",
@@ -66,7 +60,7 @@ fn open_columns(root: &str, seed: u64, columns: ColumnSet) -> Arc<ReelStore> {
     Arc::new(store)
 }
 
-/// A key in a named shard, since the shard is the leading byte
+/// A key in the given shard, which is its leading byte
 fn sharded_key(shard: u8, at: u8) -> [u8; 8] {
     let mut key = [0u8; 8];
     key[0] = shard;
@@ -86,7 +80,7 @@ fn a_delete_in_the_repoint_window_wins() {
         Store::put(&*store, "rows", &at.to_be_bytes(), &payload).expect("put");
     }
     store.flush().expect("flush");
-    // Everything but key 5 dies, so the pass has exactly one live record to copy.
+    // Everything but key 5 dies, so the pass has exactly one live record to copy
     for at in (0..40u64).filter(|at| *at != 5) {
         Store::delete(&*store, "rows", &at.to_be_bytes()).expect("delete");
     }
@@ -99,8 +93,7 @@ fn a_delete_in_the_repoint_window_wins() {
     };
     script.await_reached("compaction/repoint", 1);
 
-    // The copy of key 5 is down and unrepointed, and this delete draws a newer sequence
-    // number, so the repoint waking up must find its version gone.
+    // This delete draws a newer sequence than the parked copy, so the repoint must find it gone
     Store::delete(&*store, "rows", &5u64.to_be_bytes()).expect("delete");
 
     script.release("compaction/repoint");
@@ -121,8 +114,7 @@ fn every_key_answers_while_a_seal_waits_to_be_queued() {
     let script = rendezvous::script();
     script.hold("seal/queued");
 
-    // Enough records to roll the first segment, whose seal then parks on the way to the
-    // queue. The writes must not block on it.
+    // Roll the first segment so its seal parks before the queue, and the writes must not block
     let payload = vec![0x4Bu8; 4096];
     for at in 0..40u64 {
         Store::put(&*store, "rows", &at.to_be_bytes(), &payload).expect("put");
@@ -168,8 +160,7 @@ fn every_key_answers_between_two_paged_handovers() {
         thread::spawn(move || store.page_out_sealed().expect("page out"))
     };
 
-    // At the second arrival the first segment's keys are footer-answered and the rest
-    // are still resident.
+    // At the second arrival the first segment's keys answer from a footer and the rest from the map
     script.await_reached("paged/handover", 1);
     script.pass_one("paged/handover");
     script.await_reached("paged/handover", 2);
@@ -212,7 +203,7 @@ fn late_put() {
     };
     script.await_reached("put/landed", 1);
 
-    // A batch passes no held point, so the newer version publishes while the older put stands parked
+    // A batch passes no held point, so the newer version publishes while the old put is parked
     let mut batch = WriteBatch::new();
     batch.put("rows", &key, &newer);
     Store::write_batch(&*store, batch).expect("batch");
@@ -300,7 +291,7 @@ fn late_batch() {
     };
     script.await_reached("batch/landed", 1);
 
-    // A single put passes no held point, so the newer version publishes while the batch stands parked
+    // A single put passes no held point, so the newer version publishes while the batch is parked
     Store::put(&*store, "rows", &key, &newer).expect("put");
     drop(store.cue().expect("seal"));
     assert_eq!(
@@ -348,8 +339,7 @@ fn a_page_never_comes_back_holding_half_a_batch() {
         })
     };
 
-    // Parked at the head of the high shard, holding no shard lock, which is what lets the
-    // batch below land at all.
+    // Parked at the high shard's head with no shard lock held, so the batch below can land
     script.await_reached("index/page-shard", 1);
     script.pass_one("index/page-shard");
     script.await_reached("index/page-shard", 2);
@@ -370,7 +360,7 @@ fn a_page_never_comes_back_holding_half_a_batch() {
     assert_eq!(seen.len(), 4, "the refilled page missed a key: {seen:?}");
 }
 
-/// Fill one ascending page of the sharded column on a thread the script owns
+/// Fills one ascending page of the sharded column on a script-owned thread
 fn page_on(
     script: &rendezvous::Script,
     store: &Arc<ReelStore>,
@@ -451,8 +441,6 @@ fn a_compaction_inside_a_page_loses_no_key() {
 }
 
 /// A volume with small segments and its simulator, for a test that reads the image
-///
-/// The image is what says whether a segment is still there.
 fn open_sim(root: &str, seed: u64) -> (Arc<ReelStore>, SimIo) {
     let sim = SimIo::new(FaultPlan::new(seed));
     let store = ReelStore::open_with_io(
@@ -470,7 +458,7 @@ fn open_sim(root: &str, seed: u64) -> (Arc<ReelStore>, SimIo) {
     (Arc::new(store), sim)
 }
 
-/// The number of the segment this path names, for a file in a durable image
+/// The segment number in this path, for a file in a durable image
 fn segment_number_of(path: &std::path::Path) -> Option<u32> {
     path.file_name()?
         .to_str()?
@@ -492,23 +480,20 @@ fn a_late_note_cannot_bring_back_a_retired_segment() {
             .collect()
     };
 
-    // Roll the tail once. Counted rather than computed: how many records a segment holds
-    // is a property of the framing, and a hard-coded count stops rolling the day it moves.
+    // Roll the tail once, counting records since the framing sets how many fit
     let mut next = 1u64;
     while segments(&sim).len() < 2 {
         put(next);
         next += 1;
     }
 
-    // Dead bytes in the segment still being written to and none in the sealed one, so the
-    // sealed one cannot be what the pass takes.
+    // Dirty only the tail, so the already sealed segment cannot be the pass's target
     let dirtied = next;
     for _ in 0..10 {
         put(next);
         next += 1;
     }
-    // Twice, so more than half of what the segment holds is dead: the ranked selection
-    // takes the best segment past the plane's ratio, which is half.
+    // Twice, so over half the segment is dead, past the plane's ratio of one half
     for _ in 0..2 {
         for at in dirtied..next {
             put(at);
@@ -519,7 +504,7 @@ fn a_late_note_cannot_bring_back_a_retired_segment() {
         2,
         "the tail rolled while it was being dirtied"
     );
-    // A read settles the queue, so the pass below is entitled to the sealed segment.
+    // A read settles the queue, so the pass below is entitled to the sealed segment
     assert!(Store::get(&*store, "rows", &1u64.to_be_bytes())
         .expect("get")
         .is_some());
@@ -531,22 +516,19 @@ fn a_late_note_cannot_bring_back_a_retired_segment() {
         let store = Arc::clone(&store);
         thread::spawn(move || store.compact_once().expect("compact"))
     };
-    // Twice: the drain asks for wholly dead segments and finds none, then the ranked
-    // selection asks. The second copy is the one this is about.
+    // The drain asks first and finds no wholly dead segment, then the ranked selection asks
     script.await_reached("compaction/owed", 1);
     script.pass_one("compaction/owed");
     script.await_reached("compaction/owed", 2);
 
-    // The tail rolls while the pass stands on its copies, so the segment it seals is in
-    // the copied ranking as a live tail and not in the copied queue.
+    // Roll the tail while the pass holds its copies, so the new seal is a live tail in its ranking
     while segments(&sim).len() < 3 {
         put(next);
         next += 1;
     }
 
     script.hold("seal/spans");
-    // The tail opens the next segment before the sealer has queued the note for the one
-    // it left, so a reader that asks once may ask too early.
+    // The sealer may queue the note after the tail opens the next segment, so keep reading
     let stop = Arc::new(AtomicBool::new(false));
     let reader = {
         let store = Arc::clone(&store);
@@ -557,7 +539,7 @@ fn a_late_note_cannot_bring_back_a_retired_segment() {
             }
         })
     };
-    // The note holds the footer of the segment that just sealed, with no span recorded.
+    // The note holds the footer of the segment that just sealed, with no span recorded
     script.await_reached("seal/spans", 1);
 
     let before = segments(&sim);
@@ -589,8 +571,7 @@ fn a_late_note_cannot_bring_back_a_retired_segment() {
         "the live store still searches retired segments {phantom:?}, standing {standing:?}"
     );
 
-    // The pass above declined a real target rather than finding none, and the same
-    // segment goes once its spans are down.
+    // The pass above declined a real target, which goes once its spans are down
     assert_eq!(store.compact_once().expect("compact"), CompactPass::Copied);
     assert!(
         segments(&sim).len() < standing.len(),

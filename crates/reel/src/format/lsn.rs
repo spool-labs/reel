@@ -28,7 +28,7 @@ impl crate::index::tbtreemap::TreeKey for Lsn {
 }
 
 impl Lsn {
-    /// The reserved sequence number carried by filler and control records
+    /// The reserved sequence number of filler and control records
     pub const NONE: Lsn = Lsn(0);
 
     /// Read the underlying sequence value
@@ -47,7 +47,7 @@ impl Lsn {
     }
 }
 
-/// The atomic counter a reel draws its append sequence numbers from
+/// The atomic counter that issues a reel's append sequence numbers
 pub struct LsnCounter(AtomicU64);
 
 impl LsnCounter {

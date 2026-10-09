@@ -55,8 +55,6 @@ enum Cursor<'a> {
         column: &'a RunColumn,
         rows: FooterRows,
         at: u64,
-
-        /// The row the cursor stands on, read through its footer, or nothing once past the last
         current: Option<(Vec<u8>, RunRow, u32)>,
     },
 }
@@ -118,7 +116,7 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    /// The cursor's current row, and the row's place in its own segment's footer partition
+    /// The cursor's current row and its place in its segment's footer partition
     fn row(&self) -> Result<(RunRow, u32)> {
         match self {
             Cursor::Footer { segment, rows, at } => {
@@ -133,7 +131,6 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    /// Step to the next row
     fn advance(&mut self) -> Result<()> {
         match self {
             Cursor::Footer { at, .. } => {
@@ -148,7 +145,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Merge segments and key runs into one key run, which then answers for every segment they covered
+/// Merge segments and key runs into one key run, which then answers for their segments
 pub fn merge_into_key_run(
     compactor: &Compactor,
     reel: &Reel,
@@ -228,7 +225,7 @@ pub fn merge_into_key_run(
         ));
     }
 
-    // Covering a segment the merge skipped would hide its rows from the walk, and the rows point into this list by place
+    // A covered segment the merge skipped would hide its rows from the walk
     let mut covered: BTreeSet<SegmentId> = sources
         .iter()
         .filter_map(|source| match source {
@@ -318,7 +315,7 @@ fn merge_column(
             }
         }
     }
-    // A heap keeps the least key on top, so a row costs a few comparisons however many runs merge
+    // A heap keeps the least key on top, so each row costs a few comparisons
     let mut heap: Vec<usize> = (0..cursors.len())
         .filter(|at| cursors[*at].key().is_some())
         .collect();

@@ -1,9 +1,5 @@
 //! What this machine says about itself, and what the bias pass makes of it
 //!
-//! Nothing here is measured: every fact is a file the kernel already wrote or a
-//! stat an opening volume already takes. The engine reads the same facts on open
-//! and keeps them, which the open at the end checks against these.
-//!
 //! cargo run --example servo
 
 use std::path::Path;
@@ -23,7 +19,7 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     codec: Codec::None,
 }];
 
-/// A byte count as a person reads it, or the absence the platform reported
+/// A byte count as a person reads it, or unknown
 fn size(value: Option<u64>) -> String {
     match value {
         None => "unknown".to_string(),

@@ -1,8 +1,4 @@
-//! Test double for the store trait, not a backend choice
-//!
-//! Column families are hash maps under one lock over the whole store, and every
-//! read copies its value. That is the shape an oracle wants and the wrong one for
-//! production.
+//! In-memory test double for the store trait, with one lock over every column family
 
 mod memory;
 

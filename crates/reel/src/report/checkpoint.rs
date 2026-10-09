@@ -1,8 +1,4 @@
-//! What a checkpoint stood at and what it linked to get there
-//!
-//! Taking one seals every tail to draw the line it copies at, which is a write
-//! and needs the ownership lock, so it stays an engine method. Only saying what
-//! came back belongs here.
+//! Reports a checkpoint the engine has already taken
 
 use std::path::Path;
 
@@ -18,7 +14,7 @@ pub struct CheckpointReport {
     /// The sequence number every version in the copy is at or below
     pub at: u64,
 
-    /// Segment files linked into the target, which is the size of the work
+    /// Segment files linked into the target
     pub segments: usize,
 
     /// The directory the copy was published under

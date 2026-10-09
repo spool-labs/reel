@@ -1,5 +1,5 @@
 //! The composed posture driven end to end by a state-shaped write and read stream
-//! Point `REEL_OVERDUB_DIR` at the filesystem under test, since a memory-backed temp directory measures no device
+//! Set `REEL_OVERDUB_DIR` to the filesystem under test, since a temp dir in memory has no device
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -21,9 +21,6 @@ const STATE: ColumnId = ColumnId(1);
 const KEY_WIDTH: usize = 32;
 
 /// Leading key bytes the column shards on
-///
-/// One, so a scattered key spreads over two hundred and fifty six shards. Two would give
-/// a population this size about three keys a shard, which measures the shard array.
 const SHARD_BYTES: u8 = 1;
 
 /// Bits per key a seal spends on a filter
@@ -33,9 +30,6 @@ const FILTER_BITS: u8 = 10;
 const HOT_KEYS: u64 = 1_400;
 
 /// Keys the mid population holds, each with a re-write gap of its own
-///
-/// Sized so the gap distribution below draws about a thousand of them a round, which is
-/// what the mid share of the write stream comes to.
 const MID_KEYS: u64 = 3_000;
 
 /// Keys each round opens and never writes again
@@ -51,9 +45,6 @@ const BATCH_KEYS: u64 = 128;
 const ROUNDS: u64 = 200;
 
 /// Threads a round's read batches are spread over
-///
-/// One, so a bare run is the sequential stream it always was. A box with cores to spare
-/// wants enough of them that the reads stop being what the wall clock is waiting on.
 const READER_THREADS: u64 = 1;
 
 /// Append tails the volume runs, zero for the machine's own count
@@ -68,14 +59,10 @@ const SEGMENT_BYTES: u64 = 2 * 1024 * 1024;
 /// Rewrite passes one tick drives before it gives the round back
 const COMPACT_PASSES: u64 = 8;
 
-/// Compaction pace in megabytes a second, effectively unpaced so every cell drains its debt at the same speed
+/// Compaction pace in megabytes a second, high enough that compaction runs unpaced
 const COMPACT_MBPS: u64 = 100_000;
 
 /// Bytes of sealed-footer state a paged volume keeps at once
-///
-/// The shipped size, which on a volume this small holds every footer, so a search reads
-/// no blocks and the device column stays at nothing. A box run wanting that column to
-/// mean something has to set this below what the volume ends up holding.
 const FOOTER_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Dead fraction at which a sealed segment is rewritten, the shipped one
@@ -93,10 +80,7 @@ const RECENT_SHARE: u64 = 65;
 /// Share of a round's reads, in hundredths, that go to mid recency
 const MID_RECENCY_SHARE: u64 = 30;
 
-/// Quantiles of the measured re-write gap, in rounds, with the ends the run is capped at
-///
-/// Interpolated on a log scale between the knots, so the drawn gaps reproduce the
-/// measured p50, p90 and p99 exactly and stay smooth in between.
+/// Quantiles of the measured re-write gap in rounds, interpolated on a log scale
 const GAP_QUANTILES: [(f64, f64); 5] = [
     (0.0, 1.0),
     (0.5, 3.0),
@@ -165,10 +149,7 @@ struct Knobs {
     compact_dead_ratio: f64,
 }
 
-/// A number from the environment, or the fallback
-///
-/// Loud on anything it cannot read: a mistyped knob that falls back quietly is a run
-/// measuring a cell nobody asked for.
+/// A number from the environment or the fallback, loud on junk
 fn env_num(name: &str, fallback: u64) -> u64 {
     let Ok(raw) = std::env::var(name) else {
         return fallback;
@@ -288,8 +269,7 @@ fn phase_of(number: u64, gap: u64) -> u64 {
     mix(number, PHASE_SALT) % gap
 }
 
-/// How the key numbers are laid out: the hot core, then the mid population, then a block
-/// of fresh keys for every round
+/// Key number layout: the hot core, the mid population, then one fresh block per round
 struct Population {
     /// Keys the hot core holds
     hot: u64,
@@ -313,8 +293,7 @@ impl Population {
     }
 }
 
-/// The key numbers a round writes: the whole hot core, the mid keys their gaps are due
-/// on, and a block of keys nothing will write again
+/// The key numbers a round writes: the hot core, mid keys due this round, a fresh block
 fn writes_of(population: &Population, round: u64, into: &mut Vec<u64>) {
     into.clear();
     for at in 0..population.hot {
@@ -333,9 +312,6 @@ fn writes_of(population: &Population, round: u64, into: &mut Vec<u64>) {
 }
 
 /// Whether this round's writes are the first this key ever gets
-///
-/// A concurrent round holds these reads back until its writes have landed: a read racing
-/// the put that opens a key is answered with a miss, and a miss is not a read.
 fn is_opened_in(population: &Population, number: u64, round: u64) -> bool {
     if number < population.hot {
         return round == 0;
@@ -394,12 +370,7 @@ impl Recency {
     }
 }
 
-/// The key numbers a round reads back, skewed the way the traffic was measured
-///
-/// Two thirds land on what the last few rounds wrote, a slice on the rounds behind those,
-/// and the rest on keys written once and long since aged out of the window. The cold draw
-/// is computed from the round rather than remembered, since keeping every fresh block
-/// would be the whole key space in memory.
+/// The key numbers a round reads, mostly recent writes, some mid recency, a few cold
 fn reads_of(
     population: &Population,
     knobs: &Knobs,
@@ -423,8 +394,7 @@ fn reads_of(
                 }
             },
         };
-        // A window that has not filled yet answers with nothing, and the hot core is the
-        // one population that exists from the first round on.
+        // Before the window fills, fall back to the hot core, which exists from round zero
         into.push(drawn.unwrap_or_else(|| roll % population.hot.max(1)));
     }
 }
@@ -464,9 +434,6 @@ fn config(knobs: &Knobs) -> ReelConfig {
 }
 
 /// One maintenance tick, identical on every cell, with the merge report handed back
-///
-/// The pieces rather than the whole plane: the tick that ships swallows its merge report
-/// and the driven column would have nothing to print.
 fn tick(store: &ReelStore, knobs: &Knobs) -> MergeReport {
     store.page_out_sealed().expect("page out");
     for _ in 0..knobs.passes {
@@ -525,7 +492,7 @@ struct Cell {
     /// What asking the sealed segments cost, over the whole run
     probes: ProbeCounts,
 
-    /// Bytes the index held at the end, before any tick ran under it
+    /// Bytes the index held at the end of the run
     resident: u64,
 
     /// Bytes the volume occupied at the end
@@ -556,9 +523,6 @@ impl Cell {
     }
 
     /// Device reads one key of a batch cost, over both halves of a search
-    ///
-    /// Nothing where every footer the searches touched was already parsed and held, which
-    /// is what a footer cache the size of the volume gives.
     fn reads_per_get(&self) -> f64 {
         (self.probes.block_reads + self.probes.map_reads) as f64 / self.gets.max(1) as f64
     }
@@ -583,9 +547,6 @@ impl Cell {
 }
 
 /// What a round's reads cost, kept per thread and merged once the round closes
-///
-/// Per thread rather than shared: a batch that takes a lock to post its own latency is
-/// timing the lock as well, and at eight readers that is what the tail would be.
 struct Reads {
     /// Keys the batches asked for
     gets: u64,
@@ -614,10 +575,7 @@ impl Reads {
     }
 }
 
-/// Take batches off a round's read list until it is empty, timing each one
-///
-/// The cursor is what makes a batch one thread's: it hands out the same chunks a
-/// sequential pass would walk, in the same order, to whoever asks next.
+/// Take batches off a round's read list through a shared cursor, timing each one
 fn read_batches(
     store: &ReelStore,
     reading: &[u64],
@@ -742,8 +700,7 @@ fn run_cell(knobs: &Knobs, root: &Path) -> Cell {
                     cell.write_secs += write_round(&store, &writing, round, knobs, &mut payload);
                 });
 
-                // The reads the writes were holding back, taken against the tick rather
-                // than after it: a volume in the field is asked while it is collapsing.
+                // The held-back reads run beside the tick, so the volume is read while it compacts
                 let cursor = AtomicUsize::new(0);
                 let mut report = MergeReport::default();
                 std::thread::scope(|scope| {
@@ -767,14 +724,12 @@ fn run_cell(knobs: &Knobs, root: &Path) -> Cell {
         if report.runs_merged > 0 {
             cell.merges += 1;
         }
-        // Every reader is joined by here, so the run count is this round's and not a
-        // reading taken while the volume was still being asked.
+        // Every reader has joined, so the segment count is this round's
         cell.standing.push(store.index().segments_snapshot().len());
     }
 
     store.flush().expect("flush");
-    // Taken with the last round joined. A probe count is a handful of counters read one
-    // at a time, so a reading taken beside a live reader is torn as well as short.
+    // Read the probe counters with every reader joined, since a live reader tears them
     cell.probes = store.filter_probes().since(probes_before);
     cell.resident = store.resident_bytes().to_bytes();
     cell.live = store.totals().bytes.to_bytes();
@@ -792,8 +747,7 @@ fn run_cell(knobs: &Knobs, root: &Path) -> Cell {
 #[test]
 #[ignore = "drives a whole workload, run explicitly on the machine under test"]
 fn composed_posture() {
-    // libtest leaves the test name line open, so a header printed into it starts a
-    // screen-width right of the rows underneath.
+    // libtest leaves the test name line open, so start a fresh one
     println!();
     let knobs = knobs();
     let held = TempDir::new().expect("tempdir");
@@ -872,6 +826,5 @@ fn composed_posture() {
             cell.merges,
         );
     }
-    // Nothing is asserted about the timing columns: a microsecond figure held against
-    // another would fail on a busy laptop and prove nothing about the posture.
+    // The timing columns go unasserted, since a busy machine would fail them
 }

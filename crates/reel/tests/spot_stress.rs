@@ -1,5 +1,5 @@
 //! Spot index point reads stay correct under writers, deletes, seals, handovers and compaction
-//! Knobs: REEL_FF_SEEDS (default 4), REEL_FF_FIRST (default 1), REEL_FF_OPS (ops per writer, default 2000), REEL_FF_SEED (replays one seed)
+//! Knobs: REEL_FF_SEEDS, REEL_FF_FIRST, REEL_FF_OPS, and REEL_FF_SEED to replay one seed
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -51,7 +51,7 @@ fn key_bytes(key: u64) -> [u8; 8] {
     (mixed ^ (mixed >> 31)).to_be_bytes()
 }
 
-/// A value that holds its key and op and fills the rest from both, so a torn or misplaced read cannot pass
+/// A value holding its key and op, filled from both, so a torn or misplaced read fails
 fn value_of(key: u64, op: u64, len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + len);
     out.extend_from_slice(&key.to_be_bytes());
@@ -126,7 +126,7 @@ impl Ledger {
             .contains(&op)
     }
 
-    /// Whether a read that began after `floor` completed and ended before `ceiling` started may answer this
+    /// Whether a read may answer this, with `floor` done before it and `ceiling` begun by its end
     fn admits(&self, key: u64, floor: u64, ceiling: u64, answer: Option<u64>) -> bool {
         match answer {
             Some(op) => op >= floor && op <= ceiling && !self.is_delete(key, op),
@@ -185,7 +185,7 @@ fn admits_window(
     (floor..=ceiling)
         .filter(|op| *op > 0 && !ledger.is_delete(key, *op))
         .any(|op| {
-            // The filler depends on key and op alone, so the window reads the same at any put length
+            // The filler depends on key and op alone, so any put length gives the same window
             let full = value_of(key, op, end.saturating_sub(16));
             full.len() >= end && full[at as usize..end] == *window
         })

@@ -1,14 +1,5 @@
-//! What each door costs the allocator, counted rather than reasoned about
-//!
-//! The counter is a global allocator wrapping the system one and tallying into a
-//! thread-local, so a background sealer or compactor allocating on its own thread
-//! never lands in a number here. What is counted is what the calling thread pays
-//! per operation, which is the quantity every borrow, pool and scratch buffer in
-//! the engine exists to hold down.
-//!
-//! Run with:
-//!
-//!   cargo test -p tape-reel --test alloc_counts -- --nocapture
+//! Allocator calls per operation on each store door, counted on the calling thread
+//! Run with `cargo test -p tape-reel --test alloc_counts -- --nocapture`
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -26,7 +17,7 @@ use reel::units::ByteCount;
 use reel::{Direction, KeyWidth, ReelStore, Store, Value, WriteBatch};
 
 thread_local! {
-    /// Allocator calls this thread has made since the last reading
+    /// How many allocator calls this thread has made since the last reading
     static CALLS: Cell<usize> = const { Cell::new(0) };
 
     /// Whether this thread is inside a counted stretch
@@ -57,7 +48,7 @@ unsafe impl GlobalAlloc for Counting {
     }
 }
 
-/// Count one allocator call, and nothing at all outside a counted stretch
+/// Counts one allocator call while this thread is counting
 fn note() {
     let _ = COUNTING.try_with(|on| {
         if on.get() {
@@ -69,7 +60,7 @@ fn note() {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-/// Allocator calls one stretch of work made on this thread
+/// Counts the allocator calls `work` makes on this thread
 fn counted<Out>(work: impl FnOnce() -> Out) -> (usize, Out) {
     CALLS.with(|calls| calls.set(0));
     COUNTING.with(|on| on.set(true));
@@ -78,12 +69,12 @@ fn counted<Out>(work: impl FnOnce() -> Out) -> (usize, Out) {
     (CALLS.with(Cell::get), out)
 }
 
-/// The same, per operation, rounded to two places
+/// Allocator calls per operation
 fn per_op(calls: usize, ops: usize) -> f64 {
     calls as f64 / ops as f64
 }
 
-/// Unparks the thread a future was driven from
+/// Unparks the thread that polls the future
 struct Unparker(thread::Thread);
 
 impl Wake for Unparker {
@@ -96,10 +87,7 @@ impl Wake for Unparker {
     }
 }
 
-/// Drive one future to its answer without allocating to do it
-///
-/// Pinned on the stack and handed a waker built outside the reading, so what is
-/// counted is the door's own cost rather than the driver's.
+/// Drives one future to its answer without allocating
 fn drive<Answered: Future>(future: Answered, context: &mut Context<'_>) -> Answered::Output {
     let mut future = std::pin::pin!(future);
     loop {
@@ -145,19 +133,13 @@ fn key(at: u64) -> [u8; KEY_LEN as usize] {
     bytes
 }
 
-/// Records every reading is taken over
+/// Each reading covers this many records
 const OPS: usize = 2_000;
 
-/// Allocations one record of a batch may cost, well under a single put's one
-///
-/// The reading is a third of this, and the room left over is for the lists a batch
-/// works through rather than for anything per record.
+/// A batched write makes fewer than this many allocations per record
 const BATCHED_WRITE_CEILING: f64 = 0.5;
 
-/// Payload every record carries, above the payload pool's floor
-///
-/// A shred is 1228 bytes, and the pool keeps nothing under 512, so a reading taken
-/// on a smaller record prices the allocator rather than the engine.
+/// Payload bytes per record, large enough for the payload pool to keep its buffers
 const PAYLOAD: usize = 1_200;
 
 // what one operation of each door costs the allocator, printed as a table
@@ -167,8 +149,7 @@ fn the_doors_are_priced() {
     let store: &dyn Store = &store;
     let payload = vec![0xABu8; PAYLOAD];
 
-    // The first writes open a segment and warm every thread-local pool, so the
-    // reading is taken over a second run of the same work.
+    // The first writes open a segment and warm the pools, so count a second run
     for at in 0..OPS as u64 {
         store.put(CF, &key(at), &payload).expect("put");
     }
@@ -194,8 +175,7 @@ fn the_doors_are_priced() {
         }
     });
 
-    // Built outside the reading, since the caller's own key and payload buffers
-    // are the caller's cost rather than the engine's.
+    // Build the batches outside the reading, since the caller's buffers are the caller's cost
     let staged: Vec<WriteBatch> = (0..OPS as u64 / 64)
         .map(|round| {
             let mut batch = WriteBatch::new();
@@ -234,28 +214,22 @@ fn the_doors_are_priced() {
         rows
     });
 
-    // A prefix that cuts across the shard, so the counters cannot answer it and
-    // the walk steps every key.
+    // A prefix across the shard, so the counters cannot answer it and the walk steps every key
     let (keys_only, key_rows) = counted(|| store.count_prefix(CF, &[0u8]).expect("count"));
 
-    // One malloc a put, which is the payload copy the tail takes ownership of and
-    // nothing else. The framing list is this thread's, kept between writes.
+    // One allocation per put, the payload copy the tail takes ownership of
     assert!(
         per_op(puts, OPS) < 1.2,
         "a put costs {:.2} allocations against a floor of one",
         per_op(puts, OPS),
     );
-    // A warm point read costs nothing: the key is inline, the payload buffer comes
-    // off the pool, and the value is lent rather than handed over.
+    // A warm point read allocates nothing: the key is inline and the buffer comes off the pool
     assert!(
         per_op(gets, OPS) < 0.1,
         "a warm point read costs {:.2} allocations against a floor of none",
         per_op(gets, OPS),
     );
-    // A batched write costs a fraction of a record: its payload was handed over
-    // owned, so what is left is the lists the batch works through, one per batch
-    // rather than one per record. The frame a batch opens with is not in here at
-    // all, since it is staged inline the way a record header is.
+    // A batched write's payloads arrive owned, so it only allocates its lists, once per batch
     assert!(
         per_op(batches, OPS) < BATCHED_WRITE_CEILING,
         "a batched write costs {:.2} allocations against a ceiling of {BATCHED_WRITE_CEILING}",
@@ -275,7 +249,7 @@ fn the_doors_are_priced() {
     );
 }
 
-// a batched read costs the allocator the same however many keys it carries
+// a wider batched read costs no more allocations than a narrow one
 #[test]
 fn a_batched_read_does_not_scale_with_its_width() {
     let (_home, store) = open();
@@ -289,7 +263,7 @@ fn a_batched_read_does_not_scale_with_its_width() {
     for width in [8usize, 64, 256] {
         let asked: Vec<[u8; KEY_LEN as usize]> = (0..width as u64).map(key).collect();
         let borrowed: Vec<&[u8]> = asked.iter().map(|held| held.as_slice()).collect();
-        // Warm, so the first call's one-off work is not in the reading.
+        // Warm up so the first call's one-off work stays out of the reading
         let _ = store.get_many(CF, &borrowed).expect("many");
         let (calls, ()) = counted(|| {
             for _ in 0..32 {
@@ -304,8 +278,7 @@ fn a_batched_read_does_not_scale_with_its_width() {
         println!("get_many of {width:>4} keys: {calls} allocs");
     }
 
-    // Flat: every list the submission works through is as wide as the batch and
-    // belongs to the reading thread, so widening the batch widens no allocation.
+    // Every list the submission uses belongs to the reading thread, so width adds no allocation
     let narrow = readings[0].1;
     for (width, calls) in &readings {
         assert!(
@@ -316,12 +289,6 @@ fn a_batched_read_does_not_scale_with_its_width() {
 }
 
 // what the batched read door costs per submission beside the single door
-//
-// A loop of point reads answers each key inline, off the pool, and allocates
-// nothing. A batch resolves, plans, merges, submits and cuts, and every list it
-// works through is the reading thread's rather than bought per submission, so what
-// is left is the answers it hands out, the index's own answer, and the block a
-// merged read is cut out of.
 #[test]
 fn the_batch_door_has_a_fixed_price() {
     let (_home, store) = open();
@@ -364,16 +331,10 @@ fn the_batch_door_has_a_fixed_price() {
     }
 }
 
-/// Allocations a batched read may cost per submission, whatever its width
-///
-/// One key costs four: the answers vector, the borrowed key list, the index's own
-/// answer, and one more. A wider batch costs two beyond that, both inside the
-/// index's batched descent, which stages the run in the column's own key type and
-/// takes its answers borrowed from the shard it read them under. The ceiling leaves
-/// room for one more without letting the twenty-four back in.
+/// A batched read makes fewer than this many allocations per submission, at any width
 const BATCH_CEILING: usize = 8;
 
-// what one run of a lent walk costs, which is the same batch price per run
+// a lent walk pays the batch price once per run
 #[test]
 fn a_lent_walk_pays_per_run_not_per_row() {
     let (_home, store) = open();
@@ -383,8 +344,7 @@ fn a_lent_walk_pays_per_run_not_per_row() {
         store.put(CF, &key(at), &payload).expect("put");
     }
 
-    // One walk first, so the key buffers, payload pool and read lists a walk works
-    // through are warm and the readings price the walk rather than the first one.
+    // Walk once first so the buffers, pool and read lists are warm
     store
         .walk_from(CF, &key(0), Direction::Asc, 0, &mut |_key, _value| true)
         .expect("walk");
@@ -408,9 +368,7 @@ fn a_lent_walk_pays_per_run_not_per_row() {
         readings.push((rows, per_op(calls, taken)));
     }
 
-    // The two ends are gated: a short walk is one page and one run, so its price is
-    // mostly what a walk sets up, and a deep one has amortised both away. The rows
-    // between are on the curve from one to the other and are reported, not gated.
+    // Gate only the shortest and deepest walks and report the rows between
     for (rows, rate) in readings {
         let ceiling = match rows {
             8 => SHORT_WALK_CEILING,
@@ -424,21 +382,13 @@ fn a_lent_walk_pays_per_run_not_per_row() {
     }
 }
 
-/// Allocations a row of an eight-row lent walk may cost
-///
-/// One page and one run, so what the walk sets up is most of the reading and eight
-/// rows is a thin denominator to divide it by. The gate is here to catch the run's
-/// price growing again rather than to price a row.
+/// An eight-row lent walk costs fewer than this many allocations per row
 const SHORT_WALK_CEILING: f64 = 6.0;
 
-/// Allocations a row of a walk deep enough to have amortised its runs may cost
+/// A deep lent walk costs fewer than this many allocations per row
 const LONG_WALK_CEILING: f64 = 0.12;
 
-// an awaited read carries its one op down without a vector to hold it
-//
-// The awaited door hands its op to a backend that may complete it on another
-// thread, and a channel that takes a batch made the caller box a single op to use
-// it. What is counted here is one op through that door and nothing around it.
+// an awaited read submits its one op without a vector to hold it
 #[test]
 fn an_awaited_read_carries_no_submission_vector() {
     let (_home, store) = open();
@@ -447,12 +397,11 @@ fn an_awaited_read_carries_no_submission_vector() {
         Store::put(&store, CF, &key(at), &payload).expect("put");
     }
 
-    // Built once, outside the reading: the waker is the driver's cost rather than
-    // the door's.
+    // Build the waker outside the reading, since it is the driver's cost
     let waker = Waker::from(Arc::new(Unparker(thread::current())));
     let mut context = Context::from_waker(&waker);
 
-    // Warm, so the first read's one-off work is not in the reading.
+    // Warm up so the first read's one-off work stays out of the reading
     let _ = drive(Store::get_wait(&store, CF, &key(0)), &mut context).expect("wait");
     let (awaited, ()) = counted(|| {
         for at in 0..OPS as u64 {
@@ -469,11 +418,7 @@ fn an_awaited_read_carries_no_submission_vector() {
     );
 }
 
-/// Allocations one awaited read may cost
-///
-/// The submission itself costs none: the op goes down its own arm rather than in a
-/// vector, and its completion is filed straight into the slot rather than through
-/// one. What the ceiling leaves room for is the rest of the read path.
+/// An awaited read costs fewer than this many allocations
 const AWAITED_CEILING: f64 = 0.4;
 
 // a key walk that lends its buffer down steps without calling the allocator
@@ -508,18 +453,10 @@ fn a_key_walk_lends_its_buffer() {
     );
 }
 
-/// Allocations one step of a lending key walk may cost
-///
-/// The floor is none per step: the caller's buffer is written over and the page
-/// behind it is pulled once per page rather than per key.
+/// One step of a lending key walk costs fewer than this many allocations
 const KEY_STEP_CEILING: f64 = 0.05;
 
 // the key walk hands out an owned buffer per step and takes none back
-//
-// The surface a positioned cursor steps: keys alone, no payload staged. The buffer
-// leaves on every step because the `Iterator` item is a `Vec<u8>`, which is the
-// price of the trait rather than of the walk: a caller that overwrites its own held
-// key on every step takes the lending step above instead and pays none of this.
 #[test]
 fn a_key_walk_allocates_per_step() {
     let (_home, store) = open();

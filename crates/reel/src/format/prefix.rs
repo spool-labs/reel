@@ -7,9 +7,7 @@ use crate::format::footer::{FooterRow, ENTRY_TAIL_LEN};
 use crate::format::lsn::Lsn;
 use crate::format::record::Flags;
 
-/// Rows between restart points
-///
-/// Fewer restarts saves bytes and makes the walk after a seek longer.
+/// Number of rows per restart block
 pub const RESTART_INTERVAL: usize = 16;
 
 /// Every tail fits in this many bytes once read back
@@ -62,22 +60,22 @@ struct Row<'a> {
     next: usize,
 }
 
-/// A column's rows, each carrying only what it does not share with the one before
+/// A column's rows, each keeping only the key bytes it does not share with the one before
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PrefixRows {
-    /// The rows themselves, in the shape they are written in
+    /// The encoded rows
     packed: Vec<u8>,
 
     /// Where each restart row begins, which is what a search bisects
     restarts: Vec<u32>,
 
-    /// Rows held, since a variable stride cannot divide it out of the length
+    /// Number of rows held
     rows: usize,
 
-    /// The last key appended, which the next append measures its share against
+    /// The last key appended, for the next row's shared prefix
     last: Vec<u8>,
 
-    /// The last tail appended, which the next append writes its numbers against
+    /// The last tail appended, for the next row's differences
     last_tail: Whole,
 
     /// How every row's tail lies
@@ -101,7 +99,7 @@ impl PrefixRows {
         }
     }
 
-    /// Rows the block holds
+    /// Number of rows in the block
     pub fn len(&self) -> usize {
         self.rows
     }
@@ -110,20 +108,17 @@ impl PrefixRows {
         self.rows == 0
     }
 
-    /// Bytes the packed rows occupy, which is what the saving is measured on
+    /// Length of the packed rows
     pub fn packed_len(&self) -> usize {
         self.packed.len()
     }
 
-    /// Restart points held, one per `RESTART_INTERVAL` rows
+    /// Number of restart points, one per `RESTART_INTERVAL` rows
     pub fn restarts(&self) -> usize {
         self.restarts.len()
     }
 
     /// Append one row, which must not sort before the row already at the end
-    ///
-    /// Ascending order is the encoding's premise: rows arriving out of order would
-    /// each share almost nothing and the block would grow rather than shrink.
     pub fn push(&mut self, key: &[u8], tail: &[u8]) -> Result<()> {
         if self.rows > 0 && key < self.last.as_slice() {
             return Err(ReelError::Rejected(
@@ -142,8 +137,7 @@ impl PrefixRows {
             self.last_tail = [0; TAIL_CAP];
         }
         let shared = match restart {
-            // A restart carries its key whole, so the array of them is searchable
-            // without walking anything.
+            // A restart keeps its whole key, so a search can bisect the restarts
             true => 0,
             false => shared_prefix(&self.last, key),
         };
@@ -178,16 +172,12 @@ impl PrefixRows {
     }
 
     /// The first row at or after a key, and the bytes behind it
-    ///
-    /// Bisects the restarts, then walks the one block that can hold the answer,
-    /// comparing against the packed form rather than against rebuilt keys.
     pub fn seek(&self, target: &[u8]) -> Result<Option<Found>> {
         if self.rows == 0 {
             return Ok(None);
         }
 
-        // The last restart at or below the target, whose block is the only one
-        // that can hold the first row at or after it.
+        // Bisect for the last restart at or below the target, where the walk starts
         let mut low = 0usize;
         let mut high = self.restarts.len();
         while low < high {
@@ -202,9 +192,6 @@ impl PrefixRows {
     }
 
     /// Walk one restart block for the first row at or after the target
-    ///
-    /// No case rebuilds a key: what the walk carries is how far the target matched
-    /// the previous row, and a row's shared length against that decides it.
     fn walk(&self, block: usize, target: &[u8]) -> Result<Option<Found>> {
         let mut at = self.restarts[block] as usize;
         let mut index = block * RESTART_INTERVAL;
@@ -213,8 +200,7 @@ impl PrefixRows {
             None => self.packed.len(),
         };
 
-        // How much of the target matched the key of the row just examined, which
-        // is what lets the next row be decided without being rebuilt.
+        // How much of the target matched the last row's key, so no row is rebuilt
         let mut matched = 0usize;
         let mut order = Ordering::Less;
         let mut before = [0u8; TAIL_CAP];
@@ -222,8 +208,7 @@ impl PrefixRows {
         while at < end {
             let row = self.row_at(at, &before)?;
             let cmp = match row.shared.cmp(&matched) {
-                // The row agrees with the previous key past where the target
-                // stopped agreeing, so the previous comparison still decides.
+                // The row shares more with the previous key than the target, so the order holds
                 Ordering::Greater => order,
                 // The row leaves the previous key first, so one byte decides.
                 Ordering::Less => match row.suffix.first() {
@@ -241,8 +226,7 @@ impl PrefixRows {
                 }));
             }
 
-            // Carry forward how far the target agrees with the row just passed,
-            // which for a row the target sorts above is the whole of the row.
+            // Keep how far the target agrees with the row just passed
             matched = match row.shared.cmp(&matched) {
                 Ordering::Equal => row.shared + shared_prefix(&target[matched..], row.suffix),
                 Ordering::Less => row.shared,
@@ -254,15 +238,14 @@ impl PrefixRows {
             index += 1;
         }
 
-        // Past the end of this block, so the answer is the next block's first row
-        // when there is one.
+        // Past this block, so the answer is the next block's first row, if any
         match self.restarts.get(block + 1) {
             Some(_) => self.walk(block + 1, target),
             None => Ok(None),
         }
     }
 
-    /// Every key the block holds, rebuilt, which only a filter build asks for
+    /// Every key the block holds, rebuilt
     pub fn keys(&self) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::with_capacity(self.rows);
         let mut cursor = PrefixCursor::new(self);
@@ -273,7 +256,7 @@ impl PrefixRows {
     }
 }
 
-/// Where a seek landed and what the row carried
+/// Where a seek landed and the row's tail
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Found {
     /// The row's position in the partition
@@ -472,7 +455,7 @@ mod tests {
         }
     }
 
-    // rows out of order are refused rather than encoded badly
+    // rows out of order are refused
     #[test]
     fn an_unsorted_row_is_refused() {
         let mut rows = PrefixRows::new(TAIL);
@@ -494,25 +477,20 @@ mod tests {
 }
 
 /// A walk over the rows, holding the key it sits on
-///
-/// A compressed row is a length and a difference, so the key it stands for exists
-/// only once something has added it up. Stepping truncates the held key to what
-/// the row shares and appends what it does not, so a walk copies the packed suffix
-/// bytes rather than the sum of the keys.
 pub struct PrefixCursor<'a> {
     /// The rows being walked
     rows: &'a PrefixRows,
 
-    /// Byte the next row starts at
+    /// Offset of the next row
     at: usize,
 
-    /// Row the cursor is about to yield
+    /// Index of the next row to yield
     index: usize,
 
-    /// The key of the row last yielded, which the next one is measured against
+    /// The key of the row last yielded
     key: Vec<u8>,
 
-    /// The tail of the row last yielded, whole, which the next one is read against
+    /// The whole tail of the row last yielded
     tail: Whole,
 }
 
@@ -544,9 +522,6 @@ impl<'a> PrefixCursor<'a> {
     }
 
     /// Move to the next row, or report that there is not one
-    ///
-    /// Advance and read rather than yield, since returning the key from the same
-    /// call would borrow the cursor for as long as the caller held it.
     pub fn advance(&mut self) -> Result<bool> {
         if self.index >= self.rows.rows {
             return Ok(false);
@@ -624,7 +599,7 @@ mod cursor_tests {
         assert_eq!(seen, keys.len());
     }
 
-    // the walk copies the difference between rows, not the keys
+    // the walk copies only the difference between rows
     #[test]
     fn a_walk_copies_the_difference_not_the_keys() {
         let keys = paths(400);
@@ -635,8 +610,7 @@ mod cursor_tests {
         let mut cursor = rows.cursor();
         let mut before = 0usize;
         while cursor.advance().expect("step") {
-            // What a step appended is the key past what survived the truncate,
-            // which is exactly the row's suffix.
+            // A step appends the row's suffix past the truncated key
             let now = cursor.key().len();
             copied += now.saturating_sub(before.min(now));
             before = now;
@@ -648,7 +622,7 @@ mod cursor_tests {
         );
     }
 
-    // a packed cursor reads every row the whole unpack does, walking on, jumping ahead and going back
+    // a packed cursor reads every row the unpack does, walking on, jumping ahead and going back
     #[test]
     fn a_packed_cursor_reads_what_the_unpack_does() {
         let mut rows = PrefixRows::new(Tail::Entry);
@@ -692,7 +666,7 @@ mod cursor_tests {
         }
     }
 
-    // an empty block walks to nothing rather than erroring
+    // an empty block walks to nothing without an error
     #[test]
     fn an_empty_block_yields_nothing() {
         let rows = PrefixRows::new(TAIL);
@@ -701,18 +675,16 @@ mod cursor_tests {
     }
 }
 
-/// Reads a packed footer partition's rows in place, from the nearest restart, keeping its place for the next row
+/// Reads a packed footer partition's rows in place, resuming from its last row or a restart
 pub struct PackedCursor {
-    /// The row `key` and `found` hold, or none
     row: Option<usize>,
 
-    /// Where the row after it starts
     next: usize,
     key: Vec<u8>,
     found: FooterRow,
 }
 
-/// What a restart row's numbers read against: nothing
+/// A restart row's numbers are read against this zero row
 const NO_ROW: FooterRow = FooterRow {
     lsn: Lsn(0),
     offset: 0,
@@ -732,7 +704,7 @@ impl Default for PackedCursor {
 }
 
 impl PackedCursor {
-    /// The key and row at a place in the partition, decoding on from the cursor's row or from the row's restart
+    /// The key and row at an index, decoding on from the cursor's row or the row's restart
     #[inline]
     pub fn read(
         &mut self,
@@ -807,14 +779,10 @@ fn bad_row() -> ReelError {
     ReelError::Corruption("a packed footer row does not decode".to_string())
 }
 
-/// Bytes the encoded form spends on its own shape past the rows
+/// Length of the trailer: the restart count and the row count
 pub const TRAILER_LEN: usize = 8;
 
-/// Rebuild one restart block's rows, keys and tails whole behind starts
-///
-/// The bytes are a cut of the packed rows between two restart offsets. The cut
-/// has to open on a restart and end on a row boundary, and both are checked
-/// rather than assumed, since the offsets came off a disk this code did not write.
+/// Rebuild one restart block's rows whole, with a start per row, checking the cut
 pub fn unpack_block(bytes: &[u8], shape: Tail) -> Result<(Vec<u8>, Vec<u32>)> {
     let mut packed = Vec::with_capacity(bytes.len() * 2);
     let mut starts = vec![0u32];
@@ -851,15 +819,12 @@ pub fn unpack_block(bytes: &[u8], shape: Tail) -> Result<(Vec<u8>, Vec<u32>)> {
 }
 
 impl PrefixRows {
-    /// Bytes this block takes on disk
+    /// The block's encoded length
     pub fn encoded_len(&self) -> usize {
         self.packed.len() + self.restarts.len() * 4 + TRAILER_LEN
     }
 
-    /// Write the block out: the rows, then the restarts, then their count
-    ///
-    /// The restarts trail the rows because a writer learns them as it goes, and
-    /// the trailer at the very end is what lets a reader find them backwards.
+    /// Write the block out: the rows, the restarts, then the restart and row counts
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.packed);
         for restart in &self.restarts {
@@ -887,9 +852,6 @@ impl PrefixRows {
     }
 
     /// Read a block back, checking that it describes itself consistently
-    ///
-    /// Everything a reader trusts comes off the bytes, so everything is checked:
-    /// the trailer, the restart count, every offset, and the row count.
     pub fn decode(bytes: &[u8], tail: Tail) -> Result<PrefixRows> {
         let frame = Frame::read(bytes)?;
         let restarts = (0..frame.restarts)
@@ -934,8 +896,7 @@ impl Frame {
                 "a packed row block claims more restarts than it holds".to_string(),
             )
         })?;
-        // The rows and the restarts have to agree, or a search bisects an array
-        // that does not describe the rows it is searching.
+        // The restarts must match the row count, or a search bisects the wrong array
         if restarts != rows.div_ceil(RESTART_INTERVAL) {
             return Err(ReelError::Corruption(format!(
                 "a packed row block holds {rows} rows under {restarts} restarts",
@@ -1066,7 +1027,7 @@ mod block_tests {
         assert_eq!(rebuilt, keys);
     }
 
-    // a cut that opens mid-block is refused rather than misread
+    // a cut that opens mid-block is refused
     #[test]
     fn a_cut_off_a_restart_is_refused() {
         let mut rows = PrefixRows::new(TAIL);
@@ -1141,7 +1102,7 @@ mod encoding_tests {
         assert!(back.seek(b"anything").expect("seek").is_none());
     }
 
-    // bytes that do not describe a block are refused rather than walked
+    // bytes that do not describe a block are refused
     #[test]
     fn a_damaged_block_is_refused() {
         let keys = paths(64);

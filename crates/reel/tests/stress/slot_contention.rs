@@ -1,17 +1,5 @@
-//! What the completion slots cost when callers stack up on them
-//!
-//! Every claim, waker seat, deposit and take on the async door goes through the
-//! slot table, so this drives the table alone with no device under it, in the three
-//! shapes the door meets: inline files the completion before the first poll, pending
-//! seats the waker first and lands on the caller's own thread, detached lands in
-//! batches on a thread of its own. The completions carry no payload, so a row
-//! measures the table's bookkeeping and the locks around it.
-//!
-//! Ignored by default, since it spawns threads and holds cores. Run with:
-//!   cargo test -p tape-reel --test slot_contention --release -- --ignored --nocapture --test-threads=1
-//!
-//! Knobs, all optional: REEL_SLOT_MODES, REEL_SLOT_THREADS, REEL_SLOT_DEPTHS,
-//! REEL_SLOT_OPS.
+//! What the completion slot table costs as callers stack up, with no device under it
+//! Run with `cargo test -p tape-reel -r --test stress -- report_slot --ignored --nocapture`
 
 use std::future::Future;
 use std::pin::Pin;
@@ -24,13 +12,13 @@ use std::time::Instant;
 use reel::io::op::{Completion, Outcome, Tag};
 use reel::io::slots::{IoWait, SlotTable};
 
-/// Caller threads the matrix sweeps, which is the axis the ceiling shows up on
+/// The matrix sweeps these caller thread counts unless REEL_SLOT_THREADS is set
 const DEFAULT_THREADS: &str = "1,2,4,8";
 
-/// Ops in flight per caller thread
+/// Ops in flight per caller thread unless REEL_SLOT_DEPTHS is set
 const DEFAULT_DEPTHS: &str = "8,32";
 
-/// Ops each caller thread drives per cell
+/// Each caller thread drives this many ops per cell unless REEL_SLOT_OPS is set
 const DEFAULT_OPS: u64 = 300_000;
 
 /// How a cell's completions reach the futures waiting for them
@@ -42,7 +30,7 @@ enum Mode {
     /// Seated first and filed by the caller itself, so the waker path runs
     Pending,
 
-    /// Filed in batches by a thread of its own, which is the ring engine's shape
+    /// Filed in batches by a thread of its own, like the ring engine
     Detached,
 }
 
@@ -99,8 +87,7 @@ impl Wake for Unparker {
     }
 }
 
-/// What one caller hands the lander, one queue per caller so the handoff is not
-/// what the cell measures
+/// What callers hand the lander, with one queue per caller to keep the handoff out of the cell
 struct Inbox {
     /// Tags handed over, per caller thread
     handed: Vec<Mutex<Vec<Tag>>>,
@@ -143,10 +130,7 @@ fn answered(tag: Tag) -> Completion {
     }
 }
 
-/// File what the callers hand over, until the last of them has stopped handing
-///
-/// A caller only stops once every tag it handed has come back, so a sweep that
-/// finds nothing with no caller left is a lander with nothing owed.
+/// Files what the callers hand over until the last of them stops
 fn land(table: &SlotTable, inbox: &Inbox) {
     let mut tags: Vec<Tag> = Vec::new();
     let mut batch: Vec<Completion> = Vec::new();
@@ -168,8 +152,7 @@ fn land(table: &SlotTable, inbox: &Inbox) {
         if inbox.running.load(Ordering::Acquire) == 0 {
             return;
         }
-        // Holding the core to find out again that the callers are behind costs them
-        // the core they are behind on.
+        // Yield so the callers get the core back
         thread::yield_now();
     }
 }
@@ -198,11 +181,7 @@ enum Step {
     Answered,
 }
 
-/// Take one flight as far as it will go right now
-///
-/// The claim is polled as a fresh future every sweep rather than held: seating is
-/// idempotent, and a caller blocked on one claim would hold the slots its other
-/// flights already took.
+/// Takes one flight as far as it will go right now
 fn advance<'table>(
     table: &'table SlotTable,
     mode: Mode,
@@ -238,7 +217,7 @@ fn advance<'table>(
         }
     }
 
-    // The poll above left the waker, which is what the pending shape lands behind.
+    // The poll above left the waker, and the pending shape files behind it
     if !flight.is_handed {
         table.file_one(answered(flight.tag));
         flight.is_handed = true;
@@ -337,8 +316,7 @@ fn measure(mode: Mode, threads: usize, depth: usize, ops: u64) -> f64 {
 #[test]
 #[ignore]
 fn report_slot_contention() {
-    // libtest leaves "test name ... " open, so a header printed into it lands a
-    // screen-width right of the rows underneath it.
+    // libtest leaves the test name line open, so start the table on a fresh line
     println!();
     let ops = env_num("REEL_SLOT_OPS", DEFAULT_OPS);
     let threads = env_list("REEL_SLOT_THREADS", DEFAULT_THREADS);

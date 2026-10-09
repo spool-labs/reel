@@ -1,5 +1,5 @@
-//! Walks of a paged column answer as a model does, through writes, deletes, seals, compaction and reopens
-//! Knobs: REEL_PWM_SEEDS (default 6), REEL_PWM_FIRST (default 1), REEL_PWM_OPS (ops per seed, default 3000), REEL_PWM_SEED (replays one seed)
+//! Paged column walks match a model through writes, deletes, seals, compaction and reopens
+//! Knobs: REEL_PWM_SEEDS, REEL_PWM_FIRST, REEL_PWM_OPS, and REEL_PWM_SEED to replay one seed
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -131,7 +131,7 @@ fn key_of(n: u64) -> Vec<u8> {
     key
 }
 
-/// A value that starts with its key's number and version, so a value served for the wrong key fails
+/// A value that opens with its key's number and version, so a misplaced value fails
 fn value_of(n: u64, version: u64, len: usize) -> Vec<u8> {
     let mut value = Vec::with_capacity(16 + len);
     value.extend_from_slice(&n.to_be_bytes());
@@ -151,7 +151,7 @@ fn config(rng: &mut SmallRng) -> ReelConfig {
     }
 }
 
-/// Describes where two walks first part, with the keys on each side, or returns nothing when they agree
+/// Where two walks first part, with the keys on each side, or `None` when they agree
 fn parting(got: &[(Vec<u8>, Vec<u8>)], want: &[(Vec<u8>, Vec<u8>)]) -> Option<String> {
     let at = (0..got.len().max(want.len())).find(|&at| got.get(at) != want.get(at))?;
     let side = |rows: &[(Vec<u8>, Vec<u8>)]| {

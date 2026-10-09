@@ -1,14 +1,5 @@
-//! Walks served from segment mappings, under writers, deletes and compaction, drawn from one seed
-//!
-//! Every read is mapped and segments are tiny, so seals, compaction, handle eviction and
-//! remaps all happen while walkers run. A walk must hand back keys in order, inside its
-//! bound, each value whole and a version somebody wrote for that key. Once writers stop,
-//! a walk up, a walk down and a point read of every key must agree.
-//!
-//! Knobs: REEL_MW_SEEDS (how many seeds, default 6), REEL_MW_FIRST (the first seed, default 1,
-//! so parallel processes split a campaign), REEL_MW_OPS (ops per writer, default 2500),
-//! REEL_MW_SEED (one seed to replay), REEL_MW_UNMAPPED (reads through the driver) and
-//! REEL_MW_URING (the buffered ring backend, Linux only).
+//! Walks served from segment mappings stay correct under writers, deletes and compaction
+//! Knobs: REEL_MW_SEEDS, REEL_MW_FIRST, REEL_MW_OPS, REEL_MW_SEED, REEL_MW_UNMAPPED, REEL_MW_URING
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,8 +34,7 @@ fn knob(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// A value that names its key and version and fills the rest from both, so a torn or
-/// misplaced read cannot pass
+/// A value holding its key and version, filled from both, so a torn or misplaced read fails
 fn value_of(key: u64, version: u64, len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + len);
     out.extend_from_slice(&key.to_be_bytes());
@@ -59,7 +49,7 @@ fn value_of(key: u64, version: u64, len: usize) -> Vec<u8> {
     out
 }
 
-/// The key and version a value claims, once its filler checks out
+/// The version a value claims, once its key and filler check out
 fn check_value(seed: u64, key: u64, value: &[u8]) -> u64 {
     assert!(
         value.len() >= 16,
@@ -122,7 +112,7 @@ fn writer(store: &ReelStore, attempted: &Attempted, seed: u64, id: u64, ops: u64
                 Store::delete(store, "rows", &key.to_be_bytes()).expect("delete");
             }
             _ => {
-                // A run of neighbours, so a walk meets fresh records side by side.
+                // A run of neighbours, so a walk meets fresh records side by side
                 let width = rng.gen_range(2..20u64);
                 for k in key..(key + width).min(KEYS) {
                     let len = rng.gen_range(0..300);
@@ -239,7 +229,7 @@ fn run(seed: u64) {
     });
     assert!(walked > 0, "seed {seed}: walkers took nothing");
 
-    // Quiet now: a full walk up, a full walk down and a point read of every key agree.
+    // Once writers stop, a full walk up, a full walk down and a point read of every key agree
     let mut up = BTreeMap::new();
     Store::walk_from(
         &*store,
@@ -289,6 +279,7 @@ fn run(seed: u64) {
     }
 }
 
+// mapped walks stay ordered and whole while writers, deletes and compaction run
 #[test]
 fn mapped_walks_hold_under_writes_and_compaction() {
     if let Some(seed) = std::env::var("REEL_MW_SEED")

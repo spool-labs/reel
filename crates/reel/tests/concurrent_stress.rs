@@ -1,14 +1,4 @@
 //! Concurrent read, write, and compact stress over the reel store
-//!
-//! What a one-op-at-a-time suite cannot reach: the stale-pointer retry a read takes when
-//! an overwrite moves a record out from under it, the sequence-number guard that decides
-//! whether a compaction repoint or a racing put wins, and the refcounted handle that keeps
-//! a segment readable while compaction unlinks it.
-//!
-//! Every payload carries the version that wrote it, so a reader can tell a whole payload
-//! from a torn or foreign one without knowing what the writers are doing. That is the
-//! live invariant; the settled one is that once the threads stop, what the store serves
-//! from memory and what it serves after a reopen are the same thing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -49,36 +39,31 @@ const COLUMNS: ColumnSet = &[
     },
 ];
 
-/// One key, as the group and id a writer names it by
+/// One key as its group and id
 type Key = (u16, u8);
 
-/// Versions each key was successfully written with
+/// Maps each key to the versions written to it
 type Written = BTreeMap<Key, BTreeSet<u64>>;
 
-/// Virtual bulk root the simulator files live under
+/// The simulator's files live under this virtual root
 const SIM_ROOT: &str = "/bulk";
 
-/// Groups the writers spread their keys across
+/// The writers spread their keys across these groups
 const GROUPS: &[u16] = &[7, 8];
 
-/// Distinct ids each group holds, small enough that writers collide
+/// Each group holds this many contested ids, few enough that writers collide
 const ID_SPACE: u8 = 12;
 
-/// Ids written once and never again, so their records stay live throughout
-///
-/// Compaction only repoints when a segment it retires still holds something live, and
-/// every contested key is overwritten enough that its segments go fully dead. These stay
-/// part live for the whole run, so the repoint is the workload's doing rather than the
-/// scheduler's.
+/// Ids written once, so their records stay live and compaction has to repoint them
 const COLD_IDS: u8 = 3;
 
-/// The version the cold keys carry, outside anything a writer can produce
+/// The cold keys' version, which no writer can produce
 const COLD_VERSION: u64 = u64::MAX;
 
-/// Every id a group holds, contested and cold together
+/// Ids per group, contested and cold together
 const KEY_SPACE: u8 = ID_SPACE + COLD_IDS;
 
-/// Compaction passes the drain will take before giving up on making progress
+/// The drain gives up after this many compaction passes
 const DRAIN_PASSES: usize = 64;
 
 /// Writer threads racing each other over the shared key space
@@ -87,13 +72,10 @@ const WRITERS: usize = 4;
 /// Reader threads checking what the writers publish
 const READERS: usize = 4;
 
-/// Writes each writer thread issues
-///
-/// Enough that every tail rolls several times in a suite run and no more. A race hunt
-/// sets REEL_STORM_WRITES rather than editing this.
+/// Writes per writer thread, overridden by REEL_STORM_WRITES
 const WRITES_PER_WRITER: u64 = 150;
 
-/// Writes per writer this run uses, from the environment or the constant above
+/// Writes per writer, from REEL_STORM_WRITES or `WRITES_PER_WRITER`
 fn writes_per_writer() -> u64 {
     std::env::var("REEL_STORM_WRITES")
         .ok()
@@ -101,16 +83,13 @@ fn writes_per_writer() -> u64 {
         .unwrap_or(WRITES_PER_WRITER)
 }
 
-/// Shortest payload a stamped version carries, wide enough to hold its version
+/// The shortest stamped payload, wide enough to hold its version
 const MIN_LEN: usize = 16;
 
 /// How much longer than the shortest a payload can be
 const LEN_SPREAD: usize = 700;
 
-/// Segment size small enough that every tail rolls several times over the storm
-///
-/// Nothing in the segment still being appended to can be repointed, so a segment the whole
-/// storm fits inside would leave the run checking nothing.
+/// Small enough that every tail rolls several times over the storm
 const SEGMENT_BYTES: u64 = 16 * 1024;
 
 fn config() -> ReelConfig {
@@ -118,8 +97,7 @@ fn config() -> ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT_BYTES),
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(2),
-        // A dead segment should be worth rewriting quickly, so the compactor repoints
-        // while the writers are still moving records.
+        // A low dead ratio makes the compactor repoint while writers still move records
         compact_dead_ratio: 0.1,
         ..ReelConfig::default()
     }
@@ -137,10 +115,7 @@ fn record_id(byte: u8) -> [u8; 32] {
     [byte; 32]
 }
 
-/// A payload that carries the version which wrote it
-///
-/// Both the length and every byte follow from that version, so a reader can recompute the
-/// whole payload from what it read and reject anything that does not match.
+/// A payload whose length and bytes all follow from the version that wrote it
 fn stamped(id: u8, version: u64) -> Vec<u8> {
     let len = MIN_LEN + (version as usize % LEN_SPREAD);
     let mut out = Vec::with_capacity(len);
@@ -149,7 +124,7 @@ fn stamped(id: u8, version: u64) -> Vec<u8> {
     out
 }
 
-/// Whether a payload is a whole version of this key rather than a torn or foreign one
+/// Whether a payload is a whole version of this key
 fn is_stamped(id: u8, payload: &[u8]) -> bool {
     if payload.len() < std::mem::size_of::<u64>() {
         return false;
@@ -160,21 +135,15 @@ fn is_stamped(id: u8, payload: &[u8]) -> bool {
 }
 
 /// What one store serves and where each answer came from
-///
-/// The sites are taken on both sides of the reopen, since with them in hand a failure
-/// says which side is stale and why, and without them only that the two differ.
 struct View {
-    /// Everything the store serves, in key order
+    /// The store's answers, in key order
     held: BTreeMap<Key, Vec<u8>>,
 
     /// Where each of those answers came from
     sites: BTreeMap<Key, KeySites>,
 }
 
-/// Everything the store serves, in key order, for comparing across a reopen
-///
-/// The cold keys are in here too: they are the records compaction had to repoint, so
-/// checking they come back after a reopen is what tests the repoint rather than counting it.
+/// Reads everything the store serves, cold keys included, for comparing across a reopen
 fn view(store: &ReelStore) -> View {
     let mut held = BTreeMap::new();
     let mut sites = BTreeMap::new();
@@ -190,10 +159,7 @@ fn view(store: &ReelStore) -> View {
     View { held, sites }
 }
 
-/// Write each cold key once, before anything else reaches the store
-///
-/// They land in the first segments, which the contested writes then fill with dead
-/// records, so those segments are the part-live ones compaction has to repoint.
+/// Writes each cold key once, before anything else reaches the store
 fn seed_cold_keys(store: &ReelStore) -> Written {
     let mut written = Written::new();
     for group in GROUPS {
@@ -213,10 +179,7 @@ fn seed_cold_keys(store: &ReelStore) -> Written {
     written
 }
 
-/// Compact until a pass stops finding anything to do
-///
-/// The racing compactor stops when the writers do, which may be before it reached the
-/// segments holding the cold keys.
+/// Compacts until a pass finds nothing to do, since the racing compactor may stop early
 fn drain_compaction(store: &ReelStore) {
     for _ in 0..DRAIN_PASSES {
         let before = store.compaction_counters();
@@ -230,12 +193,7 @@ fn drain_compaction(store: &ReelStore) {
     }
 }
 
-/// Drive writers, readers, compaction, and handover against one open store
-///
-/// Returns the versions each key was successfully written with, and how many keys reached
-/// a footer while the run was moving. The handover runs on its own thread rather than once
-/// at the end, since a single call after every thread has joined hands keys to footers
-/// nobody is reading.
+/// Races writers, readers, compaction, and handover on one store
 fn storm(store: &Arc<ReelStore>) -> (Written, usize) {
     let written: Arc<Mutex<Written>> = Arc::new(Mutex::new(seed_cold_keys(store)));
     let is_running = Arc::new(AtomicBool::new(true));
@@ -327,8 +285,7 @@ fn storm(store: &Arc<ReelStore>) -> (Written, usize) {
     compactor.join().expect("compactor joins");
     pager.join().expect("pager joins");
     drain_compaction(store);
-    // Whatever sealed after the pager stopped, so the store is left in the state a
-    // paged volume would be in rather than mid handover.
+    // Hand over whatever sealed after the pager stopped, so the store ends fully paged
     paged.fetch_add(
         store.page_out_sealed().expect("page out"),
         Ordering::Relaxed,
@@ -341,11 +298,7 @@ fn storm(store: &Arc<ReelStore>) -> (Written, usize) {
     (written, paged.load(Ordering::Relaxed))
 }
 
-/// Assert the storm actually raced, so a pass is not a pass over an idle store
-///
-/// The overlap is the whole point: keys rewritten while readers resolve them and segments
-/// retired underneath both. A run that stops producing it still passes while checking
-/// nothing.
+/// Asserts the storm actually raced, so an idle run cannot pass
 fn assert_raced(store: &ReelStore, written: &Written) {
     let counters = store.compaction_counters();
     let retired = counters.segments_rewritten + counters.segments_unlinked_whole;
@@ -368,11 +321,7 @@ fn assert_raced(store: &ReelStore, written: &Written) {
     );
 }
 
-/// Name the keys two views disagree about, and what each said
-///
-/// A plain equality failure prints two screens of bytes and says nothing about which key
-/// moved. The version stamped in whichever payload exists is what tells a lost key from a
-/// stale one.
+/// Lists the keys two views disagree about, and what each said
 fn disagreement(live: &View, reopened: &View) -> String {
     let mut out = format!(
         "live holds {} keys, the reopen holds {}\n",
@@ -400,10 +349,7 @@ fn disagreement(live: &View, reopened: &View) -> String {
     out
 }
 
-/// One view's account of where a key is answered from, a line per place
-///
-/// A row the search would not have read is marked, since a row that is present, newest
-/// and unreachable is a different fault from one that is not there at all.
+/// Lists where one view answers a key from, one line per place
 fn sites_of(side: &str, sites: Option<&KeySites>) -> String {
     let Some(sites) = sites else {
         return format!("   {side} no sites recorded\n");
@@ -443,7 +389,7 @@ fn sites_of(side: &str, sites: Option<&KeySites>) -> String {
     out
 }
 
-/// The version a payload carries, or that it is not there at all
+/// The version in a payload, or absent when there is none
 fn stamp_of(payload: Option<&Vec<u8>>) -> String {
     match payload {
         None => "absent".to_string(),
@@ -460,7 +406,7 @@ fn stamp_of(payload: Option<&Vec<u8>>) -> String {
     }
 }
 
-/// Assert what settled is a version that was written, and survives a reopen
+/// Asserts what settled is a written version and survives a reopen
 fn assert_settles(live: &View, reopened: &View, written: &Written) {
     assert!(!live.held.is_empty(), "the storm left nothing behind");
     if live.held != reopened.held {
@@ -497,9 +443,7 @@ fn sim_backend_storm() {
 
     let (written, paged) = storm(&store);
     store.flush().expect("flush");
-    // Counted across the run rather than read off the end: compaction retires a sealed
-    // segment as readily as a tail makes one, so a run that paged plenty can finish
-    // holding nothing sealed at all.
+    // Count across the run, since compaction can retire every sealed segment by the end
     assert!(
         paged > 0,
         "no key reached a footer, so the storm raced no handover"

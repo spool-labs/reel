@@ -1,6 +1,4 @@
-//! A thin key-value store abstraction
-//!
-//! Byte-oriented access through the `Store` trait. Backends implement `Store`.
+//! A thin key-value store abstraction behind the `Store` trait
 
 pub mod batch;
 mod error;

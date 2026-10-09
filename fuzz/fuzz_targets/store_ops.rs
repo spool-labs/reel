@@ -1,14 +1,4 @@
-//! The engine itself, against the oracle, under guided mutation
-//!
-//! The other two targets ask whether a parser survives bad bytes. This one asks
-//! whether the store is right, which is a different question and the one worth the
-//! machine time. Every drawn op runs against a reel over the deterministic simulator
-//! and against the in-memory oracle at once, and the fixture checks after each step
-//! that everything both serve still agrees, across compaction, merges and reopens.
-//!
-//! The op stream is the same one the seeded differential suite drives, so the domain
-//! stays in one place. What changes is who chooses the sequence: seeds walk where
-//! they happen to fall, a guided run walks toward orderings nothing has reached.
+//! Fuzzes the engine against the in-memory oracle with the differential suite's op stream
 
 #![no_main]
 
@@ -24,18 +14,13 @@ use reel::{ByteCount, ReelConfig, SyncPolicy, ThreadBudget};
 use harness::fixture::Differential;
 use harness::op_stream::{StreamOp, ADDRESS_SPACE, GROUPS, MAX_LEN, MIN_LEN};
 
-/// Ops a case runs at most
-///
-/// A case opens a store and checks agreement after every step, so the run is dominated
-/// by the checks rather than by the ops. Short enough to keep executions per second
-/// somewhere a guided run can work with, long enough to reach a reopen.
+/// A case runs at most this many ops, enough to reach a reopen
 const MAX_OPS: usize = 64;
 
-/// Segment size that rolls a few times over a case, the differential suite's own
+/// The differential suite's segment size, which rolls a few times per case
 const SEGMENT_BYTES: u64 = 64 * 1024;
 
-/// Tails the case drives, at four because that is what puts every insert through the
-/// version guard
+/// Four tails, which puts every insert through the version guard
 const TAILS: u32 = 4;
 
 fn config() -> ReelConfig {
@@ -47,12 +32,7 @@ fn config() -> ReelConfig {
     }
 }
 
-/// One op drawn inside the domain the generator emits
-///
-/// Drawn rather than derived, so the case bytes cannot ask for a key outside the
-/// harness key space or a payload the fixture would not have written. A stream that
-/// leaves the domain would diverge on the wire keys rather than on the engine, which
-/// is not the question.
+/// Draw one op inside the generator's key space and payload range
 fn draw_op(u: &mut Unstructured) -> arbitrary::Result<StreamOp> {
     let group = GROUPS[usize::from(u8::arbitrary(u)?) % GROUPS.len()];
     let address = u8::arbitrary(u)? % ADDRESS_SPACE;
@@ -102,8 +82,6 @@ fuzz_target!(|case: &[u8]| {
         return;
     }
 
-    // The seed only names the simulator's fault plan, and the plan is quiet here: a
-    // divergence must come from the ops, not from an injected fault. The crash suite
-    // is where faults belong.
+    // The seed only sets the fault plan, which is quiet here, so any divergence comes from the ops
     Differential::open(0, config()).run_stream(&ops);
 });

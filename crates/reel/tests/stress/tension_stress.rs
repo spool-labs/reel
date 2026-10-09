@@ -1,11 +1,4 @@
-//! Many waiters on one waitlist, in both shapes at once
-//!
-//! A lost wakeup is a hang rather than a bad answer, so every test runs behind a
-//! deadline and fails on it instead of wedging the suite. What is checked after is
-//! that the books balance: every permit came back and nothing is left waiting.
-//!
-//! The conditions are deliberately unlike each other, so a release that satisfies
-//! one waiter leaves the next short. That seat churn is the case that matters.
+//! Many parking and async waiters on one waitlist, each test behind a deadline
 
 use std::future::Future;
 use std::pin::Pin;
@@ -19,16 +12,16 @@ use std::time::Duration;
 use reel::append::admission::InflightBudget;
 use reel::{ByteCount, Tension};
 
-/// How long any of these may take before the run counts as hung
+/// A run that takes longer than this counts as hung
 const DEADLINE: Duration = Duration::from_secs(60);
 
 /// Threads per shape, so a run has this many parking and this many holding futures
 const PER_SHAPE: usize = 8;
 
-/// Rounds each thread takes
+/// Each thread runs this many rounds
 const ROUNDS: usize = 2_000;
 
-/// Permits the pool holds, well under what its threads want at once
+/// The pool holds this many permits, well under what its threads want at once
 const PERMITS: u64 = 4;
 
 /// Drive one future to its answer on the calling thread
@@ -56,7 +49,7 @@ fn block_on<Answered: Future>(future: Answered) -> Answered::Output {
     }
 }
 
-/// Run the workers behind a deadline, failing rather than hanging on a lost wakeup
+/// Join the workers behind a deadline, so a lost wakeup fails the test
 fn within_deadline(workers: Vec<thread::JoinHandle<()>>, doing: &str) {
     let (done, finished) = mpsc::channel();
     thread::spawn(move || {
@@ -70,17 +63,13 @@ fn within_deadline(workers: Vec<thread::JoinHandle<()>>, doing: &str) {
         .unwrap_or_else(|_| panic!("{doing} did not finish, so a waiter was never woken"));
 }
 
-/// Bytes the round of one thread asks for, unlike its neighbour's
+/// Bytes one thread asks for in one round, unlike its neighbour's ask
 fn ask(thread: usize, round: usize) -> u64 {
     let steps = [512u64, 1024, 1536, 2048, 3072];
     steps[(thread + round) % steps.len()]
 }
 
 // every writer on a bounded budget gets through, in whichever shape it took
-//
-// The budget keeps its condition to itself, so what a waiter did is not countable
-// from out here: all this adds is that a crowd of both shapes on one budget finishes
-// and leaves nothing behind.
 #[test]
 fn a_budget_admits_both_shapes_under_contention() {
     let budget = Arc::new(InflightBudget::new(ByteCount::from_bytes(4096)));
@@ -135,8 +124,7 @@ fn a_waitlist_hands_out_every_permit() {
     let pool = Arc::new(Tension::new(PERMITS));
     let start = Arc::new(Barrier::new(PER_SHAPE * 2));
 
-    // A condition found unmet is a waiter that had to go on the list, so a run that
-    // never counts one took the uncontended path throughout and checked nothing.
+    // Count unmet conditions, since a run with none never contended
     let blocked = Arc::new(AtomicU64::new(0));
 
     let mut workers = Vec::new();
@@ -148,8 +136,7 @@ fn a_waitlist_hands_out_every_permit() {
         workers.push(thread::spawn(move || {
             start.wait();
             for round in 0..ROUNDS {
-                // A thread wanting three permits cannot proceed on a release that
-                // leaves two, which is the wake that has to churn a seat.
+                // Ask for one to three permits, so a release can wake a waiter that is still short
                 let wanted = 1 + ((thread_index + round) % 3) as u64;
                 let take = |held: &mut u64| {
                     if *held < wanted {
@@ -164,8 +151,7 @@ fn a_waitlist_hands_out_every_permit() {
                 } else {
                     block_on(pool.wait(take));
                 }
-                // Held across a yield, so the permits are actually out of the pool
-                // while the threads behind are asking for them.
+                // Hold the permits across a yield, so the threads behind ask while they are out
                 thread::yield_now();
                 pool.slack_with(|held| *held += wanted);
             }
@@ -195,8 +181,7 @@ fn abandoned_waits_leave_no_seats() {
         workers.push(thread::spawn(move || {
             start.wait();
             for _ in 0..ROUNDS {
-                // Polled once so the seat goes down, then dropped without ever
-                // being answered, while another thread is waking the list.
+                // One poll takes a seat, and the drop abandons it while the list is being woken
                 let mut abandoned = Box::pin(pool.wait(|held: &mut u64| (*held > 0).then_some(())));
                 let _ = Pin::as_mut(&mut abandoned).poll(&mut Context::from_waker(Waker::noop()));
                 drop(abandoned);

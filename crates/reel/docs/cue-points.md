@@ -1,87 +1,42 @@
-# Cue points: reading a volume as it stood, and what that costs
+# Cue points
 
-`src/reel/cue.rs`. Called a cue point rather than a snapshot: a cue point is the
-tape-transport term for a marked position you can return to, which is exactly
-what this is.
+A cue point reads the volume as it stood at one sequence number S. The name is the tape-transport term for a marked position you can return to.
 
-The feature looked almost free, and the half of that claim that was wrong
-shaped what got built. The pitch was that every record carries a sequence
-number from a total order, sealed segments are immutable, and the index only
-ever replaces a version with a strictly newer one, so a read at a cue point is
-the same index lookup with a bound on the version it accepts. Everything there
-is true except the last clause: **the index holds exactly one version per
-key.** `WidthIndex::insert` replaces the entry outright and books the record
-it displaced dead, so for a key whose live entry is at sequence 900, a read at
-cue point 500 does not want a bounded lookup, it wants a different record
-entirely, and a bound only tells the reader its answer is too new. The
-versions are not gone, though: they are rows in sealed segment footers, and
-finding them costs one key span per segment per column and nothing per key. That
-is why this stayed a small feature.
+**The index holds one version per key.** `WidthIndex::insert` replaces the entry outright and books the displaced record dead. So for a key whose live entry is at 900, a read at cue 500 needs a different record entirely, and a version bound would only tell the reader its answer is too new. The older versions are rows in sealed segment footers. Finding them costs one key span per segment per column and nothing per key, which is why this stayed a small feature.
 
-Two properties of the engine are what make it possible at all. `SealedRanges`
-records the span of every sealed segment, so footer search works at a cost that
-tracks segment count. And `Appender::seal()` is
-synchronous even though the seal itself runs off the append path, because a
-caller reaching for it is asking for a sealed segment, which is the primitive a
-cue point needs.
+Two engine properties make it possible. `SealedRanges` records the key span of every sealed segment, so a footer search costs in proportion to the segment count. And `Appender::seal()` is synchronous even though seals normally run off the append path, which gives a cue the sealed segment it needs.
 
-## The design
+## Taking one
 
-**Taking one seals first.** `cue()` seals every active tail, then reads the
-sequence number, then registers it. Sealing first is what makes the cue point
-answerable: after it, every record at or below S sits in a segment with a
-footer, so every version the cue point can need is findable by key. Without
-the seal, a version overwritten inside the still-open tail would exist only as
-bytes nothing indexes.
+`cue()` seals every active tail, reads the sequence number, then registers the hold. After the seal every record at or below S sits in a segment with a footer, so every version the cue can need is findable by key. Without the seal, a version overwritten inside the open tail would exist only as bytes nothing indexes. A read-only volume cannot take one.
 
-**Reading at S**, which is `get_at` over `read_as_of`. The read settles the
-sealed queue first, so the segments the cue sealed have their spans noted. A key
-the map has let go asks the spot index, which answers in one read when the key's
-newest sealed version is at or below S. Otherwise, for key K:
+## Reading at S
 
-1. Ask the map. An entry at lsn L <= S is the answer, grave included, since a
-   grave at or below S means the key was deleted before the cue point.
+`get_at` calls `read_as_of`. The read settles the sealed queue first, so the segments the cue sealed have their spans noted. A key the map has let go asks the spot index, which answers in one read when the key's newest sealed version is at or below S. Otherwise, for key K:
+
+1. Ask the map. An entry at lsn L <= S is the answer. A grave there, or a cover at or below S over it, means the key was gone at S.
 2. An entry with L > S is invisible to this read. Fall through to the footers.
-3. Search the candidate sealed segments and take the newest row with lsn <= S,
-   which is `sealed_entry` with one changed comparison.
-4. A tombstone or range-tombstone row winning that search means the key was
-   gone at S.
+3. Search the candidate sealed segments and take the newest row with lsn <= S, which is `sealed_entry_at`.
+4. A tombstone or range-tombstone row winning that search means the key was gone at S.
 
-**Covers need their own rule, and it is the opposite of the runtime one.** A
-standing cover hides entries older than itself. For a cue point at S, a cover
-drawn at C > S records a deletion that had not happened yet, so it must be
-ignored, and a cover at C <= S applies as usual. Getting this backwards would
-make a cue point show a range delete its own timeline never saw.
+**Covers follow the opposite rule from the runtime one.** A standing cover hides entries older than itself. For a cue at S, a cover drawn at C > S records a deletion that had not happened yet, so it is ignored. A cover at C <= S applies as usual. Getting this backwards would show a range delete the cue's own timeline never saw.
 
-**Walks** are the same merge as a playback with the same two rules per
-key: skip map entries above S, take the newest footer row at or below S.
+There is no walk at a cue point. A cue read is one key at a time.
 
 ## What has to stop reclaiming
 
-Three mechanisms can destroy a version a live cue point still needs, and each
-answers to the same floor, `S_min`, the oldest live cue point.
+Four mechanisms can destroy a version a live cue still needs. Each one answers to the cue floor, the oldest held cue.
 
-**Compaction.** `copy_live` keeps a record only when the index still points at
-that exact location, so a shadowed version is dropped on the next pass over
-its segment. The floor is consulted in `select_target`, beside
-`has_pending_covers`, refusing segments that could hold versions a cue point
-needs. Coarse, since it pins whole segments rather than records, and
-acceptable because a cue point is meant to be held for a scan or a backup
-rather than forever.
+| mechanism | how the floor holds it |
+|---|---|
+| compaction | `copy_live` keeps a record only when the index still points at that exact location, so a shadowed version goes on the next pass over its segment. Selection skips every segment whose oldest mark is at or below the floor, beside the `has_pending_covers` check. It pins whole segments, which suits a cue held for a scan or a backup |
+| the cover sweep | it drops covered map entries and books their footer rows dead. Dropping from the map is harmless once spans are recorded, since the row is still findable, and the compaction rule keeps the segments |
+| grave pruning | `prune_tombstones` keeps its floor at or below the oldest cue, since a cue read past a later delete finds its version through that delete's grave |
+| the purge floor | `is_purged` drops records whose column mark is below the operator's floor. It runs only inside a compaction pass, so the compaction rule bounds it too |
 
-**The cover sweep.** It drops covered map entries and books their footer rows
-dead. Dropping from the map is harmless once spans are recorded, because the
-row is still findable; what matters is that the segments survive, which the
-same floor guarantees.
+## What it costs
 
-**The purge floor.** `is_purged` drops records whose column mark falls below
-an operator floor, and it answers to nothing else. A live cue point bounds it
-the same way.
-
-## What it costs, measured
-
-Measured on macOS, 1 KiB records, on the resident index this volume no longer
-has, and the probe that took them is gone, so they stand until a fresh run:
+Measured on macOS with 1 KiB records, on a resident index this volume no longer has. The probe that took them is gone, so these stand until a fresh run.
 
 | what | cost |
 |---|---|
@@ -89,39 +44,26 @@ has, and the probe that took them is gone, so they stand until a fresh run:
 | reading through one | 0.98 to 1.02x a live read |
 | holding one, writer running | 0.99 to 1.02x |
 
-Holding is free and taking is a seal per tail. A cue seals every tail and the next
-hand-over takes those keys out of the map, so a key unchanged since the cue answers
-from the spot index in one read, and only a key rewritten since the cue pays a
-footer search.
+Holding is free and taking is a seal per tail. A cue seals every tail and the next hand-over takes those keys out of the map, so a key unchanged since the cue answers from the spot index in one read. Only a key rewritten since the cue pays a footer search. `a_cue_read_takes_one_read_while_the_key_stands` checks this.
 
-**The cost nobody should discover later:** `seal()` rolls unconditionally, so
-cueing an idle volume still burns one segment per tail, a gibibyte per tail
-per cue at the default segment size, reclaimed only when compaction notices
-the empty segments. Frequent cueing needs either a seal that declines an
-untouched segment or a caller that cues sparingly. Fine weekly, wrong on a
-timer.
+**An idle volume still pays a segment per tail.** `seal()` rolls unconditionally, so cueing an idle volume seals one empty segment per tail. The seal cuts each file down to its header and footer, so each costs a file and a segment number. Compaction and merges both skip a segment with no record bytes, so nothing retires these files. Frequent cueing needs a seal that declines an untouched segment, or a caller that cues sparingly. Fine weekly, wrong on a timer.
 
-When nobody takes one, the read path pays nothing: the cue-aware lookup is a
-separate entry point, span recording is bounded by segment count, and the
-floor is one atomic read in `select_target`.
+When nobody holds a cue the read path pays nothing. The cue-aware lookup is a separate entry point, span recording is bounded by the segment count, and the floor is one atomic read per compaction pass.
 
 ## What it does not give you
 
-**Not serialisable transactions.** A cue point is a consistent read view.
-There is no conflict detection and no write set, and there never will be:
-transactions are a caller-side concern above an engine whose writes are
-appends with one durability point per batch.
+- **Serialisable transactions.** A cue point is a consistent read view. There is no conflict detection and no write set, and there never will be. Transactions belong to the caller, above an engine whose writes are appends with one durability point per batch.
+- **Survival across a restart.** Cue points live in memory and a crash drops them. That keeps the on-disk format unchanged.
+- **Free reads of unsealed data.** The seal inside `cue()` is what buys correctness, paid once per cue and never per read.
 
-**Not durable across a restart.** Cue points live in memory. A crash drops
-them, which is the normal contract and keeps the on-disk format unchanged.
+## Tests
 
-**Not free for unsealed data.** The seal inside `cue()` is what buys
-correctness, paid once per cue rather than per read.
-
-## Gates, and where they live
-
-The differential stream takes a cue point, keeps mutating, and checks it still
-serves the older state while the live view moves on, including across a range
-delete drawn after the cue, the cover rule above and the easiest thing to get
-backwards. Compaction and the cover sweep run underneath a held cue point
-without changing what it serves.
+| test | checks |
+|---|---|
+| `cue_holds_the_old_version` | a cue keeps serving the old value after an overwrite |
+| `cue_hides_later_writes` | a key written after the cue is invisible to it |
+| `cue_outlives_a_delete` | a delete after the cue leaves the value readable at the cue |
+| `cue_outlives_a_pruned_delete` | a cue read past a later delete still finds its version once the window passes the delete's grave |
+| `cue_ignores_a_later_drop` | a range delete drawn after the cue is invisible to it, the easiest rule to get backwards |
+| `cue_pins_compaction` | compaction cannot retire what a held cue still reads |
+| `floor_lifts_on_drop` | the floor lifts once the last holder lets go |

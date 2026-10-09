@@ -1,16 +1,5 @@
-//! The reserve refusing a foreground write before the disk is full
-//!
-//! An append-only volume that fills its disk cannot compact its way out, because
-//! compaction has to write the survivors somewhere. The engine holds a segment
-//! back from foreground writes for exactly that, and this checks the guard fires
-//! while the space it is protecting is still there.
-//!
-//! It needs a filesystem small enough to reach a ceiling, so the volume is a loopback
-//! file mounted for the test and torn down after, which needs root and Linux. Without
-//! either, the test says what it skipped rather than passing quietly.
-//!
-//! Ignored by default. Run with:
-//!   cargo test -p tape-reel --test capacity_reserve --release -- --ignored --nocapture
+//! The reserve refuses a foreground write before the disk fills, on a root-only loopback mount
+//! Run `cargo test -p tape-reel --test engine capacity_reserve --release -- --ignored --nocapture`
 
 #![cfg(target_os = "linux")]
 
@@ -44,16 +33,16 @@ const COLUMNS: ColumnSet = &[
     },
 ];
 
-/// Backing file for the loopback filesystem
+/// Size of the loopback filesystem's backing file
 const IMAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// One segment; the reserve is this per tail plus one for compaction
+/// Segment size
 const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Tails, pinned so the reserve the test reasons about does not vary by box
+/// Tail count, pinned so the reserve is the same on every machine
 const TAILS: u32 = 4;
 
-/// What the engine holds back: a segment per tail, plus one for compaction
+/// The reserve this test prints: a segment per tail, plus one for compaction
 const RESERVE_BYTES: u64 = SEGMENT_BYTES * (TAILS as u64 + 1);
 
 const RECORD_BYTES: usize = 1024 * 1024;
@@ -89,8 +78,7 @@ impl Loopback {
         let image_path = image.to_str().expect("image path is utf8");
         let mount_path = mount.to_str().expect("mount path is utf8");
         run("truncate", &["-s", &IMAGE_BYTES.to_string(), image_path])?;
-        // Zero reserved blocks, so the numbers the test reasons about are the
-        // ones the filesystem will actually hand out.
+        // Zero reserved blocks, so the test's numbers match what the filesystem hands out
         run("mkfs.ext4", &["-q", "-F", "-m", "0", image_path])?;
         run("mount", &["-o", "loop", image_path, mount_path])?;
 
@@ -111,7 +99,6 @@ impl Drop for Loopback {
 }
 
 fn is_root() -> bool {
-    // Cheaper than pulling a dependency in for one number.
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|status| {
@@ -137,7 +124,7 @@ fn run(program: &str, args: &[&str]) -> Result<(), String> {
     ))
 }
 
-/// Bytes the filesystem still has free, which is what the reserve protects
+/// Free bytes on the filesystem
 fn free_bytes(path: &Path) -> u64 {
     let out = Command::new("df")
         .args(["-B1", "--output=avail"])
@@ -151,7 +138,7 @@ fn free_bytes(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// Bytes the volume's files actually occupy, which is what ENOSPC counts
+/// Bytes the volume's files occupy on disk, which is what ENOSPC counts
 fn disk_used(path: &Path) -> u64 {
     let out = Command::new("du")
         .args(["-sb"])
@@ -216,13 +203,11 @@ fn reserve_refuses_before_the_disk_is_full() {
     let mut written = Vec::new();
     let mut refusal = None;
 
-    // The slow half of the door, watched across the fill. A volume that goes
-    // from its full budget straight to a refusal never entered the band.
+    // Track the lowest write budget, which must drop below full before the refusal
     let full_budget = store.write_budget_bytes().to_bytes();
     let mut slowest = full_budget;
 
-    // The ceiling is republished by the maintenance tick rather than per put, so the
-    // tick has to be driven or the footprint the guard reads never moves off zero.
+    // The maintenance tick republishes the ceiling, so the loop drives it every 16 puts
     for i in 0..(capacity / RECORD_BYTES as u64 + 64) {
         let id = unique_id();
         match store.put(&record_key(group, id), &body) {
@@ -232,8 +217,7 @@ fn reserve_refuses_before_the_disk_is_full() {
                 break;
             }
             Err(other) => {
-                // The disk filling before the guard fires is the deadlock this exists
-                // to catch, so report what the guard was looking at.
+                // The disk filled before the guard fired, so report what the guard saw
                 let accounted = store.totals().bytes.to_bytes() + store.dead_bytes().to_bytes();
                 panic!(
                     "put failed for a reason that is not the reserve: {other}\n  \
@@ -275,8 +259,7 @@ fn reserve_refuses_before_the_disk_is_full() {
         "the refusal says what the space is being held for: {why}",
     );
 
-    // The point of refusing early is that compaction still has room, so a filesystem
-    // out of space here means the guard fired too late.
+    // Compaction still needs a segment of free space at the refusal
     let free = free_bytes(volume.path());
     println!(
         "free at refusal {} MiB, one segment is {} MiB",
@@ -289,7 +272,7 @@ fn reserve_refuses_before_the_disk_is_full() {
          segment compaction needs to write survivors into",
     );
 
-    // And compaction has to be able to work inside that band.
+    // Compaction must reclaim space inside the reserve
     for (i, id) in written.iter().enumerate() {
         if (i % 5) < 3 {
             store.delete(&record_key(group, *id)).expect("delete");
@@ -325,7 +308,7 @@ fn reserve_refuses_before_the_disk_is_full() {
          the reserve exists to prevent",
     );
 
-    // Having reclaimed, the volume takes writes again.
+    // After reclaiming, the volume takes writes again
     store.maintain_once().expect("maintain");
     let id = unique_id();
     store

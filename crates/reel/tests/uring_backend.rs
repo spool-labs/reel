@@ -1,11 +1,5 @@
-//! The ring backend serving a whole volume, on the platform that has one
-//!
-//! The simulator cannot stand in here: what these cover is the real ring taking
-//! real submissions, so they run against a temporary directory on Linux and are
-//! absent everywhere else.
-//!
-//! Knobs, all optional, so one binary sweeps the ring instead of one build each:
-//! REEL_RING_NO_REGISTERED_BUFFERS, REEL_RING_TASKRUN (deferred|cooperative|interrupt).
+//! The ring backend serving a whole volume on a real Linux directory
+//! Knobs: REEL_RING_NO_REGISTERED_BUFFERS, REEL_RING_TASKRUN=deferred|cooperative|interrupt
 
 #![cfg(target_os = "linux")]
 
@@ -25,10 +19,10 @@ use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelConfig, ReelStore,
 };
 
-/// Bytes the group takes at the front of a record key
+/// The group takes this many bytes at the front of a record key
 const GROUP_PREFIX_LEN: usize = 2;
 
-/// Bytes a record key occupies
+/// Length of a record key
 const RECORD_KEY_LEN: usize = GROUP_PREFIX_LEN + 32;
 
 const RECORDS: ColumnId = ColumnId(1);
@@ -56,7 +50,7 @@ const COLUMNS: ColumnSet = &[
     },
 ];
 
-/// Group the fixtures write into
+/// The fixtures write into this group
 const GROUP: u16 = 7;
 
 /// A record key: the group big endian, then the identifier
@@ -71,11 +65,7 @@ fn id(byte: u8) -> [u8; 32] {
     [byte; 32]
 }
 
-/// Open a volume on a ring built here, so a downgrade cannot pass for a pass
-///
-/// Letting the selector choose would make these tests agree with themselves anywhere: a
-/// machine that refuses the ring hands back the posix backend and every assertion below
-/// still holds, having tested nothing.
+/// Opens a volume on a ring built here, so a fallback to posix cannot pass
 fn open_on_ring(root: &std::path::Path) -> ReelStore {
     let ring = UringBackend::new(false, tuning()).unwrap_or_else(|error| {
         panic!(
@@ -86,18 +76,13 @@ fn open_on_ring(root: &std::path::Path) -> ReelStore {
                  leaves the rest of the filtering in place."
         )
     });
-    // The engine only creates directories on the path that owns the filesystem,
-    // and handing it a backend puts it on the other one, so the layout is made here.
+    // Handing the engine a backend skips its directory setup, so make the layout here
     std::fs::create_dir_all(root.join("reel-0007")).expect("reel dir");
     ReelStore::open_with_io(root.to_path_buf(), ring_config(), COLUMNS, Arc::new(ring))
         .expect("open")
 }
 
-/// Open a volume whose descriptors bypass the page cache, on a ring built here
-///
-/// Direct is named here rather than read off the environment, since the registered
-/// buffers a direct volume's ops fly through are reachable no other way. The backend
-/// comes back beside the store so a caller can ask which door its ops took.
+/// Opens a direct volume, which bypasses the page cache, on a ring built here
 fn open_direct_on_ring(root: &std::path::Path) -> (ReelStore, Arc<UringBackend>) {
     let ring = Arc::new(UringBackend::new(true, tuning()).expect("ring"));
     std::fs::create_dir_all(root.join("reel-0007")).expect("reel dir");
@@ -110,9 +95,7 @@ fn open_direct_on_ring(root: &std::path::Path) -> (ReelStore, Arc<UringBackend>)
     (store, ring)
 }
 
-/// Ring tunables for this run, so one binary sweeps the ring instead of one build each
-///
-///   REEL_RING_TASKRUN=interrupt cargo test --test uring_backend
+/// Ring tunables for this run, read from the environment
 fn tuning() -> RingTuning {
     let flag = |name: &str, unset: bool| {
         std::env::var(name)
@@ -166,7 +149,7 @@ fn ring_serves_a_volume() {
         );
     }
 
-    // A batch read goes down as one submission on the reading thread's own ring.
+    // A batch read goes down as one submission on the reading thread's own ring
     let wanted: Vec<_> = (1..=32u8).map(|byte| record_key(GROUP, id(byte))).collect();
     let many = store.get_many(&wanted).expect("get_many");
     assert_eq!(many.len(), 32);
@@ -195,7 +178,7 @@ fn the_ring_serves_a_window() {
     store.put(&key, &payload).expect("put");
     store.flush().expect("flush");
 
-    // Near and deep windows both take the vouched single read down the ring.
+    // Near and deep windows both take a single vouched read down the ring
     for (at, len) in [
         (0u64, 64usize),
         (128, 4096),
@@ -250,9 +233,7 @@ fn ring_reopens() {
     }
 }
 
-/// Ask the backend for completions until it has handed back this many
-///
-/// Nothing else is submitting here, so a ring reporting nothing is still working.
+/// Asks the backend for completions until it has handed back this many
 fn collect(backend: &UringBackend, wanted: usize) -> Vec<Completion> {
     let mut out = Vec::with_capacity(wanted);
     while out.len() < wanted {
@@ -286,7 +267,7 @@ fn a_batch_past_the_completion_queue_answers_every_read() {
     let backend = UringBackend::new(false, tuning()).expect("ring");
     let file = open_through(&backend, &path);
 
-    // Well past the completion queue a 256 entry submission queue is built with.
+    // Far more reads than the completion queue of a 256-entry ring holds
     const READS: usize = 4096;
     let mut ops = Vec::with_capacity(READS);
     for at in 0..READS {
@@ -330,7 +311,7 @@ fn a_batch_answers_in_submit_order() {
     let backend = UringBackend::new(false, tuning()).expect("ring");
     let file = open_through(&backend, &path);
 
-    // Read backwards, so submit order and offset order disagree.
+    // Read backwards, so submit order and offset order disagree
     let mut ops = Vec::new();
     for step in 0..128u64 {
         ops.push(Op::Pread {
@@ -378,8 +359,7 @@ fn a_mid_batch_close_keeps_queued_reads_whole() {
     let second = open_through(&backend, &second_path);
     let closed = open_through(&backend, &closed_path);
 
-    // The two reads queue against registered slots 0 and 1, and the rebuild seats the
-    // second file where the first sat, so a stale entry reads the wrong file.
+    // The rebuild seats the second file in slot 0, so a stale queued read gets the wrong file
     let mut ops = vec![
         Op::Pread {
             tag: Tag(1),
@@ -444,7 +424,7 @@ fn a_wide_batch_keeps_its_places() {
     let backend = UringBackend::new(false, tuning()).expect("ring");
     let file = open_through(&backend, &path);
 
-    // Well past the completion queue a 256 entry submission queue is built with.
+    // Far more reads than the completion queue of a 256-entry ring holds
     const READS: usize = 4096;
     let mut ops = Vec::with_capacity(READS);
     for at in 0..READS {
@@ -565,8 +545,7 @@ fn a_dropped_future_leaks_nothing() {
     const DROPPED: usize = 8;
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
-    // Only a poll that came back pending left an op on the ring to abandon: a read the
-    // kernel finishes inside the first poll leaves nothing in flight to drop.
+    // Only a pending poll leaves an op on the ring to abandon
     let mut abandoned = 0usize;
     for _ in 0..DROPPED {
         let op = Op::Pread {
@@ -643,9 +622,7 @@ fn the_backend_says_which_door_its_ops_took() {
     let path = dir.path().join("doors");
     std::fs::write(&path, vec![7u8; 4096]).expect("the file the reads come from");
 
-    // Buffered explicitly rather than off the environment: a direct volume takes no ring
-    // at all, which is one of the fall-throughs under test. The polled flag goes with it,
-    // since the kernel refuses polled completions over the page cache.
+    // A buffered backend, since a direct volume takes no ring at all
     let backend = UringBackend::new(false, tuning()).expect("ring");
 
     let fresh = ReelIo::door_counts(&backend);
@@ -658,7 +635,7 @@ fn the_backend_says_which_door_its_ops_took() {
         "a backend that has read nothing fell off one"
     );
 
-    // An open names no ring file either, so every count below is read against it.
+    // An open also goes off the ring, so later counts start from it
     let file = open_through(&backend, &path);
     let opened = ReelIo::door_counts(&backend).off_ring;
     assert_eq!(opened, 1, "an open is not a ring op and was counted as one");
@@ -681,7 +658,7 @@ fn the_backend_says_which_door_its_ops_took() {
     );
     assert_eq!(after_read.off_ring, opened, "a read fell off the ring");
 
-    // A sync is not a ring op on this backend, so it takes the posix door.
+    // A sync takes the posix door on this backend
     ReelIo::submit_inline(&backend, Op::SyncData { tag: Tag(2), file }).expect("the sync answered");
     assert_eq!(
         ReelIo::door_counts(&backend).off_ring,
@@ -702,8 +679,7 @@ fn a_direct_read_reaches_the_ring() {
     let file = open_through(&backend, &path);
     let opened = ReelIo::door_counts(&backend).off_ring;
 
-    // Offsets and lengths aligned to nothing, so the read is widened to the blocks
-    // holding them and cut back down on the way out.
+    // Unaligned offsets and lengths, so the read widens to whole blocks and is cut back after
     let windows = [(100u64, 300usize), (4095, 4098), (4096, 64), (8191, 1)];
     let mut ops = Vec::new();
     for (at, (offset, len)) in windows.into_iter().enumerate() {
@@ -857,10 +833,7 @@ fn a_reopened_file_reads_itself() {
     }
 }
 
-/// Drive one future to its answer on the calling thread, with no runtime
-///
-/// The waker unparks the polling thread, so a future the engine never wakes hangs here
-/// rather than passing.
+/// Drives one future to its answer on the calling thread, with no runtime
 fn block_on<Answered: Future>(future: Answered) -> Answered::Output {
     struct Unparker(Thread);
 
@@ -885,10 +858,7 @@ fn block_on<Answered: Future>(future: Answered) -> Answered::Output {
     }
 }
 
-/// Wait a bounded while for something the engine thread does out of band
-///
-/// The ring answers in microseconds, so anything still false after this is a completion
-/// that never landed.
+/// Waits a bounded while for something the engine thread does out of band
 fn settles(mut ready: impl FnMut() -> bool) -> bool {
     for _ in 0..2_000 {
         if ready() {
@@ -933,11 +903,6 @@ fn ring_takes_concurrent_writers() {
 }
 
 // a write only batch comes back without giving up on its spin
-//
-// The wait spins while the ring holds only writes, and a ring holding its completion
-// work posts nothing into a queue that a spin reads without asking. The batch coming
-// back proves nothing on its own, since a spin that gave up sleeps and gets the same
-// answer: the proof is that it never gave up.
 #[test]
 fn a_write_batch_spins_without_giving_up() {
     let dir = tempdir().expect("tempdir");

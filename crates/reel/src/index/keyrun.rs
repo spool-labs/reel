@@ -1,4 +1,4 @@
-//! Key runs: the address of each key's newest footer row, in key order, so a lost run only returns its segments to the walk
+//! Key runs: the address of each key's newest footer row, in key order
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ use crate::io::mapping::Mapping;
 use crate::io::op::{FileId, WriteBuf};
 use crate::reel::segment::IoDriver;
 
-/// A row takes this many bytes: its segment's place in the covered list, then its place in that segment's footer partition
+/// A row takes this many bytes: its segment's place in the covered list, then its footer row
 pub const ROW_LEN: usize = 4 + 4;
 
 /// A block holds this many rows, and each block's first key stands as its fence
@@ -105,7 +105,7 @@ pub fn is_vanished(error: &ReelError) -> bool {
     matches!(error, ReelError::Io(source) if source.kind() == std::io::ErrorKind::NotFound)
 }
 
-/// What every reader of one run column shares while the sealed set stands: which covered segments stand, and each one's mapped rows
+/// What every reader of one run column shares while the sealed set stands
 pub struct RunViews {
     /// Whether each covered segment still stands, by its place in the covered list
     stands: Vec<bool>,
@@ -124,17 +124,13 @@ impl RunViews {
     }
 }
 
-/// Reads one run column's rows through the footers, keeping each covered segment's last block so a walk in key order reads each block once
+/// Reads one run column's rows through the footers, keeping each segment's last block read
 pub struct FooterRows {
     footers: Arc<dyn FooterSource>,
     run: Arc<KeyRun>,
     column: ColumnId,
     views: Arc<RunViews>,
-
-    /// Each covered segment's last block read, where its rows are not mapped
     held: Vec<Option<RowsAt>>,
-
-    /// Each covered segment's place in its packed rows, so a walk decodes on from the row before
     cursors: Vec<PackedCursor>,
 }
 
@@ -461,7 +457,7 @@ impl KeyRun {
         self.covered.get(pointer.covered as usize).copied()
     }
 
-    /// The first row at or past a key, or strictly past it with `is_past`, stepping over rows the reader skips
+    /// The first row at or past a key, or past it with `is_past`, stepping over skipped rows
     pub fn seek(
         &self,
         column: &RunColumn,
@@ -476,7 +472,7 @@ impl KeyRun {
         let (mut low, mut high) = (first, first + u64::from(count));
         while low < high {
             let mid = (low + high) / 2;
-            // The first row from the middle on that reads, standing in for the skipped ones before it
+            // The first readable row from the middle on stands in for the skipped ones before it
             let mut probe = mid;
             let mut found = None;
             while probe < high {
@@ -544,7 +540,7 @@ impl KeyRunSet {
         crate::sync::try_lock(&self.merging)
     }
 
-    /// Whether a run holds a row for a key below a sequence number in a standing segment, the only rows a walk can serve
+    /// Whether a run holds a row for a key below a sequence number in a standing segment
     pub fn holds_older(
         &self,
         column: ColumnId,
@@ -563,7 +559,7 @@ impl KeyRunSet {
                 Err(error) if is_vanished(&error) => continue,
                 Err(error) => return Err(error),
             };
-            // The seek lands past rows whose segment is gone, so the first one that reads is the answer
+            // The seek skips rows whose segment is gone, so the first readable row is the answer
             while at < held.rows() {
                 match rows.read(run.pointer(held, at)) {
                     Ok(Some((found, row))) => {
@@ -609,7 +605,7 @@ impl KeyRunSet {
         retired
     }
 
-    /// Read back the key runs on disk, unlinking unreadable ones and any covered whole by a newer run
+    /// Read back the key runs on disk, unlinking unreadable ones and any a newer run covers whole
     pub fn load(&self, driver: &Arc<IoDriver>, root: &Path) -> Result<()> {
         let mut runs = Vec::new();
         for entry in driver.list_or_empty(root)? {
@@ -762,7 +758,7 @@ impl<'d> RunWriter<'d> {
         Ok(())
     }
 
-    /// Write the fences, the covered segments the rows were written against, the directory and the trailer, and rename the run in place
+    /// Write the fences, covered segments, directory and trailer, then rename the run in place
     pub fn finish(mut self, covered: &[SegmentId]) -> Result<PathBuf> {
         self.write_pending()?;
         let mut tail = Vec::new();
@@ -832,7 +828,7 @@ mod tests {
         }
     }
 
-    /// Reads a pointer's key out of the keys the run was written with, skipping the covered places listed gone
+    /// Reads a pointer's key from the run's written keys, skipping the covered places in `gone`
     struct Keys {
         keys: Vec<Vec<u8>>,
         gone: HashSet<u32>,
@@ -928,7 +924,7 @@ mod tests {
         }
     }
 
-    // a seek steps past rows whose segment is gone, landing where the first row that reads at or past the key is next
+    // a seek over rows into gone segments leads to the first readable row at or past the key
     #[test]
     fn a_seek_steps_past_rows_into_segments_gone() {
         let sim = SimIo::new(FaultPlan::new(1));

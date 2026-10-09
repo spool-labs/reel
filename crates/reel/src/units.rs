@@ -1,7 +1,4 @@
 //! Bytes, counted
-//!
-//! Only a quantity of storage carries a type here. The engine's other u64 are
-//! offsets, sequence numbers and record counts, and they stay bare.
 
 use crate::config::{GIB, MIB};
 

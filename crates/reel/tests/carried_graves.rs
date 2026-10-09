@@ -115,7 +115,7 @@ fn a_carried_tombstone_keeps_its_key_out_of_walks() {
     fill(&store, 2);
     let store = reopen(store, &dir);
     write_only(&store, 2, 3);
-    // Walked right after the pass that copies it, before anything notes the copy's segment
+    // Walk right after the pass that copies it, before anything notes the copy's segment
     let mut is_copied = false;
     for _ in 0..8 {
         let carried = store.compaction_counters().tombstones_carried;

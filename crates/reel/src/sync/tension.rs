@@ -1,9 +1,4 @@
 //! Waits a caller may take either way, blocking or as a future
-//!
-//! One waitlist carries both shapes: a caller with a thread to spend parks on the
-//! condition variable, a caller with a runtime worker to protect leaves a waker.
-//! Neither shape is built on the other, so a deployment with no async caller pays
-//! nothing.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -33,7 +28,7 @@ struct Held<State> {
     /// One seat per future currently pending
     seats: Vec<Seat>,
 
-    /// Ticket for the next seat, so a drop can find its own and no other
+    /// The next seat's ticket, so a drop finds its own seat and no other
     next_ticket: u64,
 }
 
@@ -69,10 +64,6 @@ impl<State> Tension<State> {
     }
 
     /// Block the calling thread until the condition yields
-    ///
-    /// A condition that already holds is answered without the caller ever counting
-    /// itself in. One that does not puts the count up before it is read again, so a
-    /// release that lands between the two still finds a waiter to signal.
     pub fn park<Out>(&self, mut ready: impl FnMut(&mut State) -> Option<Out>) -> Out {
         let mut held = lock(&self.gate);
         if let Some(out) = ready(&mut held.state) {
@@ -103,9 +94,7 @@ impl<State> Tension<State> {
 
     /// Wake everything waiting, since one waiter's condition is not another's
     pub fn slack(&self) {
-        // Skipping the gate is safe because the count is sequentially ordered: a
-        // waiter raises it then reads the state, a releaser changes the state then
-        // reads the count, so one of the two always sees the other.
+        // The count is SeqCst, so either the waiter or this releaser sees the other's change
         if !self.is_taut() {
             return;
         }
@@ -145,9 +134,6 @@ impl<State> Tension<State> {
 }
 
 /// A wait that has not been taken yet, polled by whoever holds it
-///
-/// The condition takes the thing waited for, a permit or a turn, so asking it twice
-/// would take twice: the wait is spent once it answers and never asks again.
 pub struct Wait<'tension, State, Ready> {
     /// The waitlist this seat is on
     tension: &'tension Tension<State>,
@@ -164,9 +150,6 @@ pub struct Wait<'tension, State, Ready> {
 
 impl<State, Ready> Wait<'_, State, Ready> {
     /// Leave a seat, or refresh the waker in the one already left
-    ///
-    /// A wake takes the seat away, so a future polled again after one finds itself
-    /// unseated and leaves a fresh seat rather than assuming its old one survived.
     fn take_seat(&mut self, held: &mut Held<State>, waker: &Waker) {
         if let Some(ticket) = self.ticket {
             if let Some(seat) = held.seats.iter_mut().find(|seat| seat.ticket == ticket) {
@@ -245,9 +228,6 @@ impl<State, Ready> Drop for Wait<'_, State, Ready> {
 }
 
 /// Drive one future to its answer on the calling thread, for tests with no runtime
-///
-/// The waker unparks the polling thread, so a future that fails to leave one hangs
-/// here rather than passing.
 pub fn block_on<Answered: Future>(future: Answered) -> Answered::Output {
     use std::sync::Arc;
     use std::task::Wake;

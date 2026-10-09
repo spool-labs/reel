@@ -1,10 +1,4 @@
-//! One reel spread over three roots, and what survives losing one of them
-//!
-//! Two fast roots take the writes and a capacity root takes nothing fresh. The
-//! manifest on the home root names the set and each extra root carries a marker
-//! proving it belongs. Once a root is gone an open that has not been told about
-//! it refuses; declared dead, the same open serves the survivors, answers the
-//! lost records as plain misses, and keeps taking writes.
+//! One reel over three roots, and how an open behaves after losing one of them
 //!
 //! cargo run --example volumes
 
@@ -39,7 +33,7 @@ fn key(at: u64) -> RecordKey {
     RecordKey::from_bytes(RECORDS, &bytes).expect("key")
 }
 
-/// The extra roots as config states them: home is the root `open` is given
+/// Config listing the extra roots, with home passed to `open` itself
 fn config(warm: &Path, cold: &Path) -> ReelConfig {
     ReelConfig {
         segment_bytes: SEGMENT_BYTES,
@@ -81,7 +75,7 @@ fn main() {
     store.close().expect("close");
     drop(store);
 
-    // Each fast root opens with a tail of its own; capacity takes nothing fresh.
+    // Each fast root opens with a tail of its own, and capacity takes nothing fresh
     for (label, root) in [
         ("home", home.path()),
         ("warm", &warm),
@@ -110,8 +104,7 @@ fn main() {
     }
     println!("manifest on home, marker on each extra root");
 
-    // Segment files plus the list in config are the store, so a sealed segment carried
-    // to another configured root keeps serving what it holds.
+    // A sealed segment moved to another configured root still serves what it holds
     let sealed = segments_in(home.path());
     assert!(sealed.len() > 1, "the run sealed nothing to carry");
     let name = sealed[0]

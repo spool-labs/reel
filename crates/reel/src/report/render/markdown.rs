@@ -1,8 +1,4 @@
-//! A report as markdown, for a pull request, an issue, or a CI summary
-//!
-//! The same blocks the terminal renderer draws, said in the markup a review
-//! surface renders: the head as a heading, tables as tables, and every caveat as
-//! a bullet that survives the paste.
+//! Markdown renderer for pull requests, issues and CI summaries
 
 use std::fmt::Write;
 
@@ -73,8 +69,7 @@ fn table_block<Sink>(table: &Table, out: &mut Sink) -> std::fmt::Result
 where
     Sink: Write,
 {
-    // A note hangs off a row's end in the terminal; here it earns a column, so
-    // that a row carrying one stays a row rather than becoming loose prose.
+    // Notes get their own column so a noted row stays a table row
     let noted = table.rows.iter().any(|row| row.note.is_some());
     let mut heads: Vec<String> = table.columns.iter().map(|c| escape(&c.head)).collect();
     let mut rules: Vec<&str> = table
@@ -96,8 +91,7 @@ where
         let mut cells: Vec<String> = Vec::new();
         for at in 0..table.columns.len() {
             let cell = row.cells.get(at).map(String::as_str).unwrap_or("");
-            // The first cell names the row, so weighting that one is enough to
-            // pick the row out; weighting all of them shouts the figures too.
+            // Only the first cell of a toned row is bolded, which is enough to mark the row
             cells.push(match row.tone {
                 Tone::Bad | Tone::Warn if at == 0 && !cell.trim().is_empty() => {
                     format!("**{}**", escape(cell))
@@ -136,11 +130,7 @@ where
     Ok(())
 }
 
-/// Text inside a code span, where nothing is escaped because nothing is read
-///
-/// A backslash is literal between backticks, so escaping a path or a flag on the
-/// way in leaves the reader looking at the backslash. Only a backtick in the
-/// content matters, and the fence grows past the longest run of them.
+/// Wrap text unescaped in a code span, with a fence longer than any backtick run inside
 fn code(text: &str) -> String {
     let longest = text
         .split(|char| char != '`')
@@ -148,15 +138,14 @@ fn code(text: &str) -> String {
         .max()
         .unwrap_or(0);
     let fence = "`".repeat(longest + 1);
-    // A span whose content opens or closes with a backtick needs a space inside
-    // the fence, which markdown strips back off.
+    // Content that starts or ends with a backtick needs a space inside the fence
     match text.starts_with('`') || text.ends_with('`') {
         true => format!("{fence} {text} {fence}"),
         false => format!("{fence}{text}{fence}"),
     }
 }
 
-/// A label as a heading in prose reads it, where a terminal would shout it
+/// A label with its first letter capitalised, for a markdown heading
 fn capitalised(label: &str) -> String {
     let mut chars = label.chars();
     match chars.next() {
@@ -165,10 +154,7 @@ fn capitalised(label: &str) -> String {
     }
 }
 
-/// Blunt the characters that would otherwise close a cell or open a style
-///
-/// A path or a flag reaches here verbatim, and a pipe inside one would end its
-/// cell three columns early.
+/// Escape the characters that would close a cell or open a style
 fn escape(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace('|', "\\|")

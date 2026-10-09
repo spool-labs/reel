@@ -1,9 +1,4 @@
 //! Reel only crash driver over the deterministic simulator
-//!
-//! Replays a durable op stream over a simulated volume until the first crash boundary
-//! or error, then hands the simulator back so a test can reopen from its durable
-//! image. A clean pass with per op sampling counts the boundaries a stream crosses, so
-//! a test can crash before each one in turn.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,7 +12,7 @@ use crate::harness::observe::{observe, Totals};
 use crate::harness::op_stream::StreamOp;
 use crate::harness::wire::{apply_mutation, TEST_COLUMNS};
 
-/// Virtual bulk root the reel simulator files live under
+/// The reel simulator's files live under this virtual bulk root
 const REEL_ROOT: &str = "/bulk";
 
 pub struct ReelHarness {
@@ -31,7 +26,7 @@ impl ReelHarness {
         ReelHarness::with_columns(config, TEST_COLUMNS)
     }
 
-    /// The same driver over a named column set
+    /// The same driver over a given column set
     pub fn with_columns(config: ReelConfig, columns: ColumnSet) -> ReelHarness {
         ReelHarness { config, columns }
     }
@@ -45,10 +40,7 @@ impl ReelHarness {
         sim.ops()
     }
 
-    /// Replay a stream under a plan, returning the simulator and how many ops acknowledged
-    ///
-    /// Under a synced policy every acknowledged op is durable, so the count names the
-    /// durable prefix a reopen must reproduce.
+    /// Replay a stream under a plan, returning the simulator and how many ops were acknowledged
     pub fn run(&self, plan: FaultPlan, ops: &[StreamOp]) -> (SimIo, usize) {
         let sim = SimIo::new(plan);
         let mut acknowledged = 0;
@@ -109,14 +101,10 @@ pub fn scan_totals(store: &ReelStore) -> Totals {
 }
 
 /// Assert the constant time counters equal a scan of what the reel serves
-///
-/// The scan runs first and the counters are read after it: a scan is not a passive
-/// observer, since a record whose bytes fail their checksum is evicted by the read
-/// that found it, which moves the counters.
 pub fn assert_recount(store: &ReelStore, context: u64) {
     let scanned = scan_totals(store);
     let counted = counter_totals(store);
-    // An overwrite booked by length class sits up to half a class off in bytes, never in count
+    // An overwrite booked by length class can be up to half a class off in bytes
     let slack = store.spot_slack();
     assert!(
         counted.count == scanned.count && counted.bytes.abs_diff(scanned.bytes) <= slack,
@@ -145,7 +133,7 @@ pub fn flip_largest_segment(image: &mut DurableImage) -> bool {
     }
 }
 
-/// Length of a segment's records: up to the last nonzero byte before an open segment's rows, or the whole sealed file
+/// Record bytes: up to the last nonzero byte before an open segment's rows, else the whole file
 fn content_len(bytes: &[u8]) -> usize {
     match rows_region(bytes) {
         Some((rows_at, _)) => bytes[..rows_at as usize]

@@ -1,5 +1,5 @@
-//! A paged column's counters answer as a model does, through writes, deletes, range deletes, seals, compaction and reopens
-//! Knobs: REEL_PTM_SEEDS (default 6), REEL_PTM_FIRST (default 1), REEL_PTM_OPS (ops per seed, default 3000), REEL_PTM_SEED (replays one seed)
+//! A paged column's counters match a model through writes, deletes, seals, compaction and reopens
+//! Knobs: REEL_PTM_SEEDS, REEL_PTM_FIRST, REEL_PTM_OPS, and REEL_PTM_SEED to replay one seed
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -96,7 +96,7 @@ fn check_totals(store: &ReelStore, model: &Model, context: &str) {
     assert_eq!(store.totals(), totals, "{context}: store totals");
 }
 
-/// Checks every spool's prefix totals and the whole column, through the engine and the store trait
+/// Checks every spool's prefix totals and the whole column, through the engine and the trait
 fn check(store: &ReelStore, model: &Model, context: &str) {
     assert!(
         store.counters_agree(ROWS),

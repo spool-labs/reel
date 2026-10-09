@@ -1,8 +1,5 @@
-//! Ring-shaped file I/O trait and its backends
-//!
-//! Ops move into the ring by value on submit and each yields one tagged
-//! completion drained on poll, so a completion backend can stand in for a
-//! synchronous one without a call site changing shape.
+//! File I/O trait and its backends
+//! Ops move in by value on submit and each yields one tagged completion on poll
 
 pub mod direct;
 #[cfg(feature = "sim")]
@@ -24,20 +21,17 @@ use crate::io::op::{Completion, FileId, Op, ReadBuf};
 use crate::io::slots::SlotTable;
 
 thread_local! {
-    /// Completions this thread's inline batches come back through
-    ///
-    /// A detached submit the backend answers on the spot has nowhere of the
-    /// caller's to file into, so the list it files through is this thread's.
+    /// This thread's spare completion list for detached submits answered inline
     static FILED: std::cell::Cell<Vec<Completion>> = const { std::cell::Cell::new(Vec::new()) };
 }
 
-/// Which door a backend's ops took, asked of a leg that has to know
+/// Which door a backend's ops took
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DoorCounts {
     /// Whether any op on this backend reached a ring
     pub reached_ring: bool,
 
-    /// Ops handed to another backend instead of going on a ring
+    /// Ops handed to another backend, which never went on a ring
     pub off_ring: u64,
 
     /// Whether the kernel refused a thread's buffer pool
@@ -47,12 +41,7 @@ pub struct DoorCounts {
     pub files_refused: bool,
 }
 
-/// Which backend actually serves a volume, as opposed to the one it asked for
-///
-/// A configured ring downgrades to posix when the kernel will not set one up, so
-/// the request and the outcome are two different facts. Each backend answers
-/// from its own state rather than from the request that built it, which is what
-/// keeps the answer from drifting into a restatement of the config.
+/// The backend that actually serves a volume, which may differ from the configured one
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServingBackend {
     /// Synchronous posix ops through the page cache
@@ -85,7 +74,7 @@ impl ServingBackend {
         )
     }
 
-    /// The name this backend reports itself under
+    /// This backend as a short lowercase string
     pub fn as_str(self) -> &'static str {
         match self {
             ServingBackend::Posix => "posix",
@@ -103,49 +92,28 @@ impl std::fmt::Display for ServingBackend {
     }
 }
 
-/// Ring-shaped file I/O every reel backend implements
+/// The file I/O interface every reel backend implements
 pub trait ReelIo: Send + Sync {
-    /// Which backend is serving, answered from what this one is rather than
-    /// from what was asked for
-    ///
-    /// Required rather than defaulted: a backend that forgot to answer would
-    /// report someone else's identity, which is the failure this exists to stop.
+    /// Which backend is serving, from this backend's own state
     fn serving(&self) -> ServingBackend;
 
-    /// Move owned ops into the ring, each yielding one tagged completion later
-    ///
-    /// Only a poll on the submitting thread can take those completions; pairing
-    /// a submit on one thread with a poll on another strands them.
+    /// Move owned ops into the ring, and only a poll on this thread takes their completions
     fn submit(&self, ops: Vec<Op>) -> Result<()>;
 
-    /// Drain ready completions into the output vector, returning how many moved
-    ///
-    /// Takes only what this thread submitted.
+    /// Drain this thread's ready completions into the vector, returning how many moved
     fn poll(&self, out: &mut Vec<Completion>) -> Result<usize>;
 
-    /// Service one op in place, handing its completion straight back
-    ///
-    /// A backend that runs the op on the calling thread answers here and the
-    /// driver skips the tag inbox. One that completes out of band hands the op
-    /// back.
+    /// Run one op on the calling thread and return its completion, or hand the op back
     fn submit_inline(&self, op: Op) -> std::result::Result<Completion, Op> {
         Err(op)
     }
 
-    /// Service a whole batch in place, filling its completions in submit order
-    ///
-    /// The same bargain as submit_inline, and a batch is where the inbox costs
-    /// most: two locks and a tag lookup per op the caller already has in order.
-    /// False leaves the ops untouched for the caller to send another way, and the
-    /// op list stays the caller's either way, so a batching thread keeps one.
+    /// Run a batch in place with completions in submit order, false leaves the ops untouched
     fn submit_batch(&self, _ops: &mut Vec<Op>, _out: &mut Vec<Completion>) -> bool {
         false
     }
 
-    /// Submit ops for a caller that has no thread to come back and reap them
-    ///
-    /// The caller may be polled on a different worker every time, so completions
-    /// go into the slot table where the future left its waker.
+    /// Submit ops with completions filed to the slot table, for callers with no reaping thread
     fn submit_detached(&self, mut ops: Vec<Op>, sink: &Arc<SlotTable>) -> Result<()> {
         let mut filed = FILED.with(std::cell::Cell::take);
         let served = self.submit_batch(&mut ops, &mut filed);
@@ -160,26 +128,19 @@ pub trait ReelIo: Send + Sync {
         }
     }
 
-    /// Submit one op for a caller with no thread to reap it, without a list to hold it
-    ///
-    /// The awaited door sends one op at a time, and a channel that takes a batch
-    /// made every one of them buy a vector to travel in.
+    /// Submit one detached op without allocating a list for it
     fn submit_detached_one(&self, op: Op, sink: &Arc<SlotTable>) -> Result<()> {
         match self.submit_inline(op) {
             Ok(completion) => {
                 sink.file_one(completion);
                 Ok(())
             }
-            // Nothing left but the batch door, for a backend that answers at
-            // neither of the two above.
+            // The backend cannot answer inline, so submit a batch of one.
             Err(op) => self.submit(vec![op]),
         }
     }
 
-    /// Answer one framed record from resident pages, without blocking or queueing
-    ///
-    /// True means both buffers hold every byte they asked for; false leaves them
-    /// exactly as they arrived and the read goes down as an op.
+    /// Fill both buffers from resident pages without blocking, false leaves them untouched
     fn warm_split(
         &self,
         _file: FileId,
@@ -191,16 +152,11 @@ pub trait ReelIo: Send + Sync {
     }
 
     /// Which door this backend's ops actually took
-    ///
-    /// A ring backend hands some ops to the posix backend it holds without
-    /// saying so, and a leg that cannot tell cannot claim it measured the ring.
     fn door_counts(&self) -> DoorCounts {
         DoorCounts::default()
     }
 
-    /// Device flushes asked for so far, the count durability is billed in
-    ///
-    /// A backend that cannot count them answers zero.
+    /// Device flushes asked for so far, zero when the backend cannot count them
     fn sync_count(&self) -> u64 {
         0
     }
@@ -210,14 +166,12 @@ pub trait ReelIo: Send + Sync {
         0
     }
 
-    /// Wait in the kernel until at least one completion is ready, then drain
-    ///
-    /// A backend that cannot park drains whatever is ready and the driver spins.
+    /// Wait in the kernel for at least one completion, then drain
     fn poll_blocking(&self, out: &mut Vec<Completion>) -> Result<usize> {
         self.poll(out)
     }
 
-    /// Whether waiting on this backend parks rather than spins
+    /// Whether waiting on this backend parks the thread
     fn parks_on_wait(&self) -> bool {
         false
     }

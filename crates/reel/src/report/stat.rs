@@ -1,4 +1,4 @@
-//! What each column holds and what the segments weigh, live against dead
+//! What each column holds and how much of the segments is live or dead
 
 use crate::engine::ReelStore;
 use crate::report::caveat::{self, Caveat};
@@ -57,7 +57,7 @@ pub struct StatReport {
     /// The columns the volume was opened over
     pub columns: Vec<StatColumn>,
 
-    /// What stands between these figures and what a reader would take them for
+    /// What the counts leave unaccounted for
     pub caveats: Vec<Caveat>,
 }
 
@@ -104,7 +104,6 @@ pub fn stat(engine: &ReelStore) -> StatReport {
     }
 }
 
-/// What a reader has to know before taking any of these figures for a total
 fn caveats(columns: &[StatColumn], holds_bytes: bool) -> Vec<Caveat> {
     let mut caveats = Vec::new();
     if columns.is_empty() {

@@ -1,4 +1,4 @@
-//! Writes counted from draw to publish by the epoch they drew in, so a prune never passes a number still on its way
+//! Writes counted from draw to publish by epoch, so a prune never passes a number in flight
 
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use crate::sync::lock;
 
-/// Two epochs can hold writers while the third waits empty
+/// Three epoch slots: two can hold writers while the third waits empty
 const SLOTS: u64 = 3;
 
 /// The most writers one ticket counts, leaving its low two bits to the slot

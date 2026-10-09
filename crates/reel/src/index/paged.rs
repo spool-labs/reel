@@ -1,11 +1,4 @@
-//! What stays resident when the keys do not
-//!
-//! A paged index answers outright only for the segments no footer covers yet; for
-//! everything else it answers with the segments the key could be in, and the caller
-//! finds it in one binary search per footer. What stays resident is a key range per
-//! column per sealed segment, so the footprint follows the segment count rather than
-//! the record count. Ruling a segment out by its range only works on a column
-//! written in key order; uniform keys need the filter the footer reserves room for.
+//! What stays resident when the keys do not: a key range per column per sealed segment
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -21,20 +14,15 @@ use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
 use crate::io::mapping::Mapping;
 use crate::sync::{read, write};
 
-/// Segments one lookup carries without reaching for the heap
+/// A lookup holds this many segments inline before it reaches for the heap
 const CANDIDATES_INLINE: usize = 4;
 
-/// Pools the footer cache splits its bound across: footers, directories, blocks
+/// The footer cache splits its bound across this many pools: footers, directories, blocks
 const POOLS: usize = 3;
 
 /// Where a paged index reads the footers it resolves its sealed keys through
-///
-/// The index owns which segments to ask and what an answer means; io is the one
-/// thing it asks somebody else for.
 pub trait FooterSource: Send + Sync {
-    /// One sealed segment's footer, parsed
-    ///
-    /// The whole footer rather than one row, because a playback cannot ask by key.
+    /// One sealed segment's footer, parsed whole since a playback cannot ask by key
     fn footer(&self, segment: SegmentId) -> Result<Option<Arc<SegmentFooter>>>;
 
     /// One sealed segment's footer for a single pass, leaving no copy in any cache
@@ -65,7 +53,7 @@ pub trait FooterSource: Send + Sync {
         Ok(None)
     }
 
-    /// The rows of a segment's partition that hold one row, by its place in the partition, or nothing for a segment gone
+    /// The partition rows that hold the row at a place, or nothing once the segment is gone
     fn rows_holding(
         &self,
         segment: SegmentId,
@@ -217,10 +205,6 @@ impl RowsAt {
 }
 
 /// One sealed segment's key range, and how far the ranges before it reach
-///
-/// The runs are sorted by their low end, but a range starting earlier can still
-/// reach past a key's place and hold it. The furthest reach at or before each run
-/// says when to stop: once that is below the key, nothing earlier can hold it.
 struct Run {
     /// The segment's low and high key, shared with the segment-ordered view
     span: Arc<Span>,
@@ -239,9 +223,6 @@ struct Span {
 }
 
 /// The sealed segments holding one column, and the keys each of them covers
-///
-/// Held twice over, by segment number and sorted by key. Seals are rare and lookups
-/// are not, so the key-ordered view is rebuilt on the seal.
 #[derive(Default)]
 pub struct SealedRanges {
     /// The sealed set, held both ways
@@ -254,16 +235,15 @@ pub struct SealedRanges {
 /// What one column knows about its sealed segments
 #[derive(Default)]
 struct Sealed {
-    /// By segment, which is what a retire names; the option is how the tree fills a
-    /// node's value array and is never None here
+    /// By segment, for a retire. The option fills the tree's value array and is never None
     by_segment: TBTreeMap<SegmentId, NODE_WIDTH, Option<Arc<Span>>>,
 
-    /// The same ranges sorted by their low end, with the reach carried along
+    /// The same ranges sorted by their low end, each with its reach
     by_key: Vec<Run>,
 }
 
 impl Sealed {
-    /// Rebuild the key-ordered view, which the two mutations share
+    /// Rebuild the key-ordered view, which every mutation shares
     fn reindex(&mut self) {
         self.by_key = self
             .by_segment
@@ -283,8 +263,7 @@ impl Sealed {
                 .cmp(right.span.lowest.as_slice())
         });
 
-        // The furthest reach at or before each run, carried as the index of the run
-        // holding it rather than as a third copy of the key.
+        // The furthest reach at or before each run, kept as the index of the run holding it
         let mut furthest = 0usize;
         for at in 0..self.by_key.len() {
             let held = self.by_key[furthest].span.highest.as_slice();
@@ -297,9 +276,6 @@ impl Sealed {
     }
 
     /// Every run that could hold a key, in the order they are held
-    ///
-    /// The search lands past the last run that starts at or below the key, then
-    /// walks back while anything before it still reaches far enough.
     fn covering(&self, key: &[u8], mut take: impl FnMut(SegmentId)) {
         let past = self
             .by_key
@@ -321,10 +297,7 @@ impl SealedRanges {
         SealedRanges::default()
     }
 
-    /// Record what one newly sealed segment covers for this column
-    ///
-    /// A segment seals once, so a repeat is a rebuild seeing what it already saw
-    /// and replaces rather than duplicates.
+    /// Record what one newly sealed segment covers for this column, replacing a repeat
     pub fn note(&self, segment: SegmentId, lowest: KeyBytes, highest: KeyBytes) {
         let mut sealed = write(&self.ranges);
         sealed
@@ -336,8 +309,6 @@ impl SealedRanges {
     }
 
     /// Replace every span with what a rebuild swept out of the footers
-    ///
-    /// Nothing is kept, since a rebuild is the authority on what is on disk.
     pub fn replace(&self, spans: Vec<(SegmentId, KeyBytes, KeyBytes)>) {
         let mut sealed = write(&self.ranges);
         sealed.by_segment.clear();
@@ -351,15 +322,10 @@ impl SealedRanges {
         self.generation.fetch_add(1, Ordering::Release);
     }
 
-    /// Forget a segment the compactor has retired
-    ///
-    /// One retired segment is offered to every column, and most of them never held
-    /// it, so the generation moves only where the set actually changed.
+    /// Forget a segment the compactor has retired, moving the generation only if the set changed
     pub fn forget(&self, segment: SegmentId) {
         let mut sealed = write(&self.ranges);
-        // Packed, since the segment numbers climb and the compactor retires from the
-        // low end, where a bare removal leaves the emptied leaves behind in the chain
-        // reindex walks on every seal and every forget.
+        // Packed, since retires hit the low end, where a bare removal leaves empty leaves to walk
         if sealed.by_segment.remove_packed(&segment).is_none() {
             return;
         }
@@ -373,23 +339,16 @@ impl SealedRanges {
         self.generation.load(Ordering::Acquire)
     }
 
-    /// The segments a key could be in, newest first
-    ///
-    /// Newest first is load-bearing: a compaction copy carries its source's sequence
-    /// number, so while both segments are sealed the two rows tie, and this order
-    /// breaks the tie for the copy.
+    /// The segments a key could be in, newest first, so a compaction copy wins its tie
     pub fn candidates(&self, key: &[u8]) -> Candidates {
         let mut found = Candidates::default();
         read(&self.ranges).covering(key, |segment| found.push(segment));
-        // The search walks the runs by key, so what it finds is in no segment order.
+        // The search walks the runs by key, so what it finds is in no segment order
         found.newest_first();
         found
     }
 
     /// Every segment this column has sealed, in order
-    ///
-    /// One lock and one copy rather than a lock per question, for a prune asking
-    /// about every grave it holds. Sorted, since the map it comes from is.
     pub fn segments(&self) -> Vec<SegmentId> {
         read(&self.ranges)
             .by_segment
@@ -399,9 +358,6 @@ impl SealedRanges {
     }
 
     /// Whether any sealed segment holds keys inside a half-open range
-    ///
-    /// The one caller is a range delete, whose end is exclusive, which is why this
-    /// is not the closed test below.
     pub fn overlaps(&self, low: &[u8], high: Option<&[u8]>) -> bool {
         read(&self.ranges)
             .by_segment
@@ -438,10 +394,6 @@ impl SealedRanges {
     }
 
     /// The segments whose keys fall inside a range, oldest first
-    ///
-    /// What a playback asks for, since it crosses keys rather than landing on one.
-    /// The order is the segments' own, which a merge preferring the highest sequence
-    /// number never has to think about.
     pub fn spanning(&self, low: Option<&[u8]>, high: Option<&[u8]>) -> Vec<SegmentId> {
         read(&self.ranges)
             .by_segment
@@ -452,10 +404,6 @@ impl SealedRanges {
     }
 
     /// Whether this column has a footer covering one segment
-    ///
-    /// Asked before anything takes a key out of the map on a paging column: a record
-    /// in a segment no footer covers has nothing behind it, so removing the key
-    /// removes the record with it.
     pub fn holds(&self, segment: SegmentId) -> bool {
         read(&self.ranges).by_segment.contains_key(&segment)
     }
@@ -465,16 +413,13 @@ impl SealedRanges {
         read(&self.ranges).by_segment.is_empty()
     }
 
-    /// Sealed segments recorded for this column
+    /// How many sealed segments this column has recorded
     pub fn len(&self) -> usize {
         read(&self.ranges).by_segment.len()
     }
 }
 
 /// A short run of segment numbers, held without allocating while it stays short
-///
-/// One or two on a column whose segments cover disjoint ranges, every segment on
-/// the volume on one whose keys are uniform.
 #[derive(Default)]
 pub struct Candidates {
     /// The first few, held in the answer itself
@@ -483,7 +428,7 @@ pub struct Candidates {
     /// How many of those are filled
     held: usize,
 
-    /// The rest, once there are more than the answer carries
+    /// The rest, once there are more than fit inline
     spilled: Vec<SegmentId>,
 }
 
@@ -511,7 +456,7 @@ impl Candidates {
         self.held == 0
     }
 
-    /// Segments the key was not ruled out of
+    /// How many segments the key was not ruled out of
     pub fn len(&self) -> usize {
         self.held + self.spilled.len()
     }
@@ -520,8 +465,7 @@ impl Candidates {
     fn newest_first(&mut self) {
         self.inline[..self.held.min(CANDIDATES_INLINE)].sort_unstable_by(|a, b| b.cmp(a));
         self.spilled.sort_unstable_by(|a, b| b.cmp(a));
-        // A spilled run holds the segments the inline part could not, and both are
-        // now descending, so the larger ones have to come first overall.
+        // Each part is descending on its own, so merge them to put the largest first overall
         if !self.spilled.is_empty() {
             let mut all: Vec<SegmentId> = self.inline[..self.held]
                 .iter()
@@ -544,11 +488,6 @@ fn reaches(span: &Span, low: Option<&[u8]>, high: Option<&[u8]>) -> bool {
 }
 
 /// Parsed footers of sealed segments, kept so a repeated search rereads nothing
-///
-/// A footer is the sorted index of its own segment, so the first search costs two
-/// reads and every search after it costs none. Bounded, since the point of a paged
-/// index is that resident memory stops following the volume. Three tenants over one
-/// slab, a third of the bound and a weight function apiece.
 pub struct FooterCache {
     /// Parsed footers, by the segment they came from
     footers: Hold<Arc<SegmentFooter>>,
@@ -561,13 +500,7 @@ pub struct FooterCache {
 }
 
 impl FooterCache {
-    /// A cache holding at most this many bytes of parsed footer state
-    ///
-    /// Bytes rather than a count, since a footer is sized by its segment's key count.
-    /// The footers, the directories and the blocks take a third of it each, so the
-    /// number asked for is what all three together weigh rather than what one does.
-    /// A bound too small for a single entry holds nothing, which is what asking for
-    /// no cache on a paged volume means.
+    /// A cache holding at most this many bytes of parsed footer state, split evenly over the pools
     pub fn new(capacity: usize) -> FooterCache {
         let share = capacity / POOLS;
         FooterCache {
@@ -577,7 +510,7 @@ impl FooterCache {
         }
     }
 
-    /// Bytes the cache is holding across its three pools
+    /// The bytes the cache holds across its three pools
     pub fn held_bytes(&self) -> usize {
         let (footers, maps, blocks) = self.held_split();
         footers + maps + blocks
@@ -599,9 +532,6 @@ impl FooterCache {
     }
 
     /// Hold a segment's directory, giving up a cold one when full
-    ///
-    /// Losing one costs the next reader a directory read and a segment it cannot
-    /// rule out, never a wrong answer.
     pub fn insert_map(&self, segment: SegmentId, map: Arc<FooterMap>) {
         let weight = map.weight();
         self.maps.insert(segment_key(segment), map, weight);
@@ -628,8 +558,7 @@ impl FooterCache {
         at: usize,
         block: Arc<RowBlock>,
     ) {
-        // A block index past what a packed key names is not held rather than held
-        // under a key another block would answer to.
+        // A packed key cannot hold a block index this high, so the block is not cached
         if at > MAX_BLOCK {
             return;
         }
@@ -638,21 +567,13 @@ impl FooterCache {
             .insert(hold_key(segment, column, at), block, weight);
     }
 
-    /// Hold a footer, giving up a cold one if the cache is full
-    ///
-    /// One weighing more than the pool is turned away rather than taken in alone: the
-    /// caller keeps the footer it just read either way, so admitting it would empty
-    /// the pool for a tenant that fits nothing beside it.
+    /// Hold a footer, giving up a cold one when full, and refuse one bigger than the pool
     pub fn insert(&self, segment: SegmentId, footer: Arc<SegmentFooter>) {
         let weight = footer.encoded_len();
         self.footers.insert(segment_key(segment), footer, weight);
     }
 
-    /// Give up a segment's footer, for one the compactor has retired
-    ///
-    /// A retired segment's blocks name bytes in a file that is gone, so they go with
-    /// it rather than waiting to be evicted by pressure. Each pool walks that
-    /// segment's own chain rather than everything it holds.
+    /// Give up a segment's footer, directory and blocks, for one the compactor has retired
     pub fn forget(&self, segment: SegmentId) {
         self.footers.forget(segment);
         self.maps.forget(segment);
@@ -779,13 +700,12 @@ mod tests {
         );
     }
 
-    // the cache gives footers up by what they weigh, not by how many there are
+    // the cache gives footers up by what they weigh
     #[test]
     fn footers_are_held_by_weight() {
         let small = footer_of(4);
         let large = footer_of(64);
-        // The footer pool takes a third of the knob, and this leaves it room for the
-        // small ones several times over but not for two large.
+        // The footer pool gets a third of the bound, room for small footers but not two large ones
         let pool = large.encoded_len() + small.encoded_len();
         let cache = FooterCache::new(pool * POOLS);
 
@@ -803,12 +723,12 @@ mod tests {
         assert!(cache.held_bytes() <= pool);
     }
 
-    // a footer larger than the pool is turned away instead of emptying it
+    // a footer larger than the pool is turned away and the pool keeps what it holds
     #[test]
     fn an_oversized_footer_keeps_the_pool() {
         let small = footer_of(4);
         let large = footer_of(64);
-        // A footer pool of exactly two small ones, which the large one is well past.
+        // A footer pool of exactly two small ones, which the large one is well past
         let cache = FooterCache::new(2 * small.encoded_len() * POOLS);
         assert!(
             large.encoded_len() > 2 * small.encoded_len(),
@@ -831,7 +751,7 @@ mod tests {
         assert_eq!(cache.held_bytes(), 2 * small.encoded_len());
     }
 
-    // a bound too small for one entry holds nothing rather than one of everything
+    // a bound too small for one entry holds nothing
     #[test]
     fn a_bound_of_nothing_holds_nothing() {
         let large = footer_of(64);

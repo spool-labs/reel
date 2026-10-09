@@ -5,12 +5,10 @@ use std::sync::RwLock;
 
 use reel_core::{batch::BatchOp, Direction, Result, Store, StoreIter, Value, WriteBatch};
 
-/// One column family's keys and the values they hold
+/// One column family's keys and values
 type ColumnData = HashMap<Vec<u8>, Vec<u8>>;
 
-/// In-memory key-value store using HashMap
-///
-/// Thread-safe through an RwLock, with column families created on first write.
+/// In-memory key-value store, thread-safe behind one RwLock
 pub struct MemoryStore {
     data: RwLock<HashMap<String, ColumnData>>,
 }
@@ -23,7 +21,7 @@ impl MemoryStore {
         }
     }
 
-    /// Total byte size of all keys and values across all column families.
+    /// Total byte size of all keys and values across all column families
     pub fn total_size_bytes(&self) -> usize {
         let data = self.data.read().unwrap();
         data.values()
@@ -114,7 +112,7 @@ impl Store for MemoryStore {
     }
 
     fn count_prefix(&self, cf: &str, prefix: &[u8]) -> Result<u64> {
-        // Counting in place, so neither the keys nor the values are cloned.
+        // Counts in place without cloning keys or values
         let data = self.data.read().unwrap();
         let count = data
             .get(cf)
@@ -125,8 +123,7 @@ impl Store for MemoryStore {
     }
 
     fn bytes_prefix(&self, cf: &str, prefix: &[u8]) -> Result<Option<u64>> {
-        // Summed in place: the values are already in memory, so nothing is faulted
-        // in to weigh them.
+        // Sums value lengths in place without cloning
         let data = self.data.read().unwrap();
         let bytes = data
             .get(cf)

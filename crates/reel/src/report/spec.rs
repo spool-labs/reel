@@ -1,8 +1,4 @@
-//! The flag grammar, without a command line library
-//!
-//! Two strings name what a report runs against: a volume of a set, and a column
-//! the volume was written with. Parsing them here rather than in a frontend's
-//! argument attributes is what keeps every frontend on one spelling.
+//! Parses the volume and column spec strings so every frontend uses one spelling
 
 use std::path::PathBuf;
 
@@ -15,16 +11,13 @@ use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth};
 pub type SpecResult<T> = std::result::Result<T, SpecError>;
 
 /// A spec string the grammar does not accept
-///
-/// Names the fault rather than the flag it arrived on, since the flag is the
-/// frontend's own word for it.
 #[derive(Debug, Error)]
 pub enum SpecError {
     /// Nothing before the first colon of a volume spec
     #[error("a volume spec needs a path")]
     VolumePath,
 
-    /// A tag behind a volume path naming no tier and no state
+    /// An unknown volume tag
     #[error("volume tag `{0}` is not fast, capacity, or dead")]
     VolumeTag(String),
 
@@ -54,10 +47,7 @@ pub fn volumes<Spec: AsRef<str>>(specs: &[Spec]) -> SpecResult<Vec<VolumeSpec>> 
     Ok(parsed)
 }
 
-/// Read one volume spec, a path with its tags riding behind colons
-///
-/// `PATH` alone is a fast volume, `PATH:capacity` the capacity tier and
-/// `PATH:dead` a drive declared dead. Both tags may ride together.
+/// Read one volume spec, a path followed by colon-separated tags
 pub fn volume(spec: &str) -> SpecResult<VolumeSpec> {
     let mut parts = spec.split(':');
     let path = parts.next().unwrap_or_default();
@@ -77,11 +67,7 @@ pub fn volume(spec: &str) -> SpecResult<VolumeSpec> {
     Ok(volume)
 }
 
-/// Read a list of column specs into the set a volume is opened over
-///
-/// The engine wants a set that outlives the store, and one assembled from
-/// arguments cannot be a constant, so what is parsed here is leaked. It lives
-/// until the process ends either way.
+/// Read a list of column specs into a leaked set that lives as long as the process
 pub fn columns<Spec: AsRef<str>>(specs: &[Spec]) -> SpecResult<ColumnSet> {
     let mut parsed = Vec::with_capacity(specs.len());
     for spec in specs {
@@ -90,10 +76,7 @@ pub fn columns<Spec: AsRef<str>>(specs: &[Spec]) -> SpecResult<ColumnSet> {
     Ok(Vec::leak(parsed))
 }
 
-/// Read one column spec, a name, an identifier, and the width of its keys
-///
-/// The rest of a declaration shapes how records are written, and a report only
-/// reads, so what comes back is the plainest column that can hold the keys.
+/// Read one `NAME:ID[:WIDTH]` column spec into the plainest column that holds the keys
 pub fn column(spec: &str) -> SpecResult<ColumnSpec> {
     let parts: Vec<&str> = spec.split(':').collect();
     let (name, id, width) = match parts[..] {

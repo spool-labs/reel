@@ -1,8 +1,4 @@
-//! Every wholly dead segment drains in one pass, not one per tick
-//!
-//! A rolling purge can retire segments faster than the maintenance tick fires,
-//! and a one-segment-per-pass limit builds a dead backlog behind a bound meant
-//! for copying. An unlink copies nothing, so a single pass takes them all.
+//! One compaction pass unlinks every wholly dead segment
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,7 +20,7 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     codec: Codec::None,
 }];
 
-// kill five segments, compact once, and all five are gone
+// kill several segments, compact once, and every wholly dead one is gone
 #[test]
 fn one_pass_drains_every_wholly_dead_segment() {
     let sim = SimIo::new(FaultPlan::new(23));

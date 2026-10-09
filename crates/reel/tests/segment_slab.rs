@@ -1,11 +1,4 @@
-//! The segment counter window against the map it replaced
-//!
-//! The oracle is the hashed table this window was built from: the same arithmetic in
-//! `HashMap`s, with the two rules the window adds written out. A booking that names a
-//! segment the table has let go of is dropped rather than given a row back, and a
-//! booking that only moves bytes somebody else counted needs a row already standing.
-//! Everything else has to agree op for op, and the floors are what the agreement is
-//! for: a lost floor is a tombstone dropped early and a key that comes back.
+//! The segment counter window against the hashed map it replaced, op for op
 
 use std::collections::{HashMap, HashSet};
 
@@ -17,13 +10,13 @@ use reel::format::lsn::Lsn;
 use reel::index::counters::SegmentTable;
 use reel::SegmentBytes;
 
-/// Segment numbers the streams draw from, banded so the window spans chunks
+/// The streams draw from these segment numbers, banded so the window spans several blocks
 const NUMBERS: [u32; 36] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 300, 301, 302, 303, 304, 305, 306, 307, 308, 309, 310,
     311, 900, 901, 902, 903, 904, 905, 906, 907, 908, 909, 910, 911,
 ];
 
-/// Ops one stream applies
+/// Each stream applies this many ops
 const OPS: usize = 4_000;
 
 /// One segment's row in the oracle, holding what the map held
@@ -40,13 +33,13 @@ struct Row {
 /// The hashed table, plus the two rules the window adds
 #[derive(Default)]
 struct Oracle {
-    /// Rows the table counts, which is what ranks and what holds a floor
+    /// The table's counted rows, which rank segments and hold floors
     rows: HashMap<SegmentId, Row>,
 
-    /// Segments the table has let go of, which no booking brings back
+    /// Retired segments, which no booking brings back
     retired: HashSet<SegmentId>,
 
-    /// Segments wearing a life, whether or not they hold bytes
+    /// Segments with a live incarnation, whether or not they hold bytes
     stamped: HashSet<SegmentId>,
 }
 
@@ -130,7 +123,7 @@ impl Oracle {
         }
     }
 
-    /// A number the table never knew is left alone, since nothing stood there
+    /// Drops a segment and retires it, unless the table never knew the number
     fn forget(&mut self, segment: SegmentId) {
         let known = self.rows.contains_key(&segment) || self.stamped.contains(&segment);
         self.rows.remove(&segment);
@@ -171,7 +164,7 @@ impl Oracle {
             .unwrap_or_default()
     }
 
-    /// The oldest number any segment but this one can still surface
+    /// The oldest lsn still visible in any segment but this one
     fn min_lsn_excluding(&self, segment: SegmentId) -> Option<Lsn> {
         self.rows
             .iter()
@@ -200,7 +193,7 @@ fn sorted(mut rows: Vec<(SegmentId, SegmentBytes)>) -> Vec<(SegmentId, SegmentBy
     rows
 }
 
-/// Every question the table answers, asked of both and compared
+/// Asks both every question the table answers and compares the replies
 fn agree(table: &SegmentTable, oracle: &Oracle, step: usize) {
     assert_eq!(
         sorted(table.snapshot()),
@@ -255,7 +248,7 @@ fn agree(table: &SegmentTable, oracle: &Oracle, step: usize) {
     }
 }
 
-/// One seeded stream of every op the table takes, applied to both
+/// Applies one seeded stream of every op the table takes to both
 fn stream(seed: u64) {
     let mut rng = SmallRng::seed_from_u64(seed);
     let table = SegmentTable::new();
@@ -315,8 +308,7 @@ fn stream(seed: u64) {
                 oracle.forget(segment);
             }
         }
-        // Every step is compared on a short stream; a long one checks every hundredth
-        // and the last, since the walk is quadratic in the segment count.
+        // A long stream compares every hundredth step and the last, since the walk is quadratic
         if OPS <= 200 || step % 100 == 0 || step + 1 == OPS {
             agree(&table, &oracle, step);
         }
@@ -364,7 +356,7 @@ fn a_rebuild_starts_the_window_over() {
     }
     oracle.rebuild(&segments);
 
-    // The retire is undone by the clear, so the number books again.
+    // The clear undoes the retire, so the number books again
     table.mark_live(SegmentId(3), Lsn(2), 100);
     oracle.mark_live(SegmentId(3), Lsn(2), 100);
     assert_eq!(table.bytes_of(SegmentId(3)).live, 800);
@@ -372,7 +364,7 @@ fn a_rebuild_starts_the_window_over() {
     agree(&table, &oracle, 0);
 }
 
-// a booking that arrives after the retire is dropped rather than reopening the row
+// a booking that arrives after the retire is dropped and the row stays gone
 #[test]
 fn a_late_booking_never_brings_a_segment_back() {
     let table = SegmentTable::new();
@@ -396,8 +388,7 @@ fn a_late_booking_never_brings_a_segment_back() {
     assert_eq!(table.bytes_of(SegmentId(4)), SegmentBytes::default());
     assert!(table.incarnation_of(SegmentId(4)).is_none());
     assert!(table.live_incarnation(SegmentId(4)).is_none());
-    // The floor the retired segment held is gone with it, and the late booking's
-    // older number never became one.
+    // The retired segment's floor is gone, and the late booking's older lsn never became one
     assert_eq!(table.min_lsn_excluding(SegmentId(9)), Some(Lsn(20)));
     assert_eq!(table.dropped_bookings() - before, 10);
 }
@@ -412,7 +403,7 @@ fn a_landing_floor_holds_through_its_publish() {
 
     assert_eq!(table.min_lsn_of(SegmentId(1)), Some(Lsn(7)));
     assert_eq!(table.min_lsn_excluding(SegmentId(2)), Some(Lsn(7)));
-    // The landing alone is enough: a caller that never publishes still holds it.
+    // The landing alone is enough: a caller that never publishes still holds it
     table.note_min(SegmentId(3), Lsn(2));
     assert_eq!(table.min_lsn_excluding(SegmentId(1)), Some(Lsn(2)));
 }
@@ -421,8 +412,7 @@ fn a_landing_floor_holds_through_its_publish() {
 #[test]
 fn an_unbooked_number_is_not_slid_past() {
     let table = SegmentTable::new();
-    // Ten is a tail's fresh segment: drawn, no record landed in it yet. The tails
-    // above it fill, seal and retire while it sits there.
+    // Ten is a tail's fresh segment with no record yet, while the tails above it come and go
     for number in 11..40 {
         table.mark_live(SegmentId(number), Lsn(u64::from(number)), 100);
     }
@@ -431,7 +421,7 @@ fn an_unbooked_number_is_not_slid_past() {
     }
     assert!(table.is_empty());
 
-    // The first record lands in ten long after every number above it went away.
+    // The first record lands in ten long after every number above it went away
     table.note_min(SegmentId(10), Lsn(3));
     table.mark_live(SegmentId(10), Lsn(3), 100);
 
@@ -466,7 +456,7 @@ fn incarnations_land_out_of_number_order() {
     }
 }
 
-// the window gives its chunks back as the oldest segments retire
+// the window gives its blocks back as the oldest segments retire
 #[test]
 fn the_window_slides_as_it_retires() {
     let table = SegmentTable::new();
@@ -479,12 +469,12 @@ fn the_window_slides_as_it_retires() {
 
     assert_eq!(table.len(), 100);
     assert_eq!(table.min_lsn_excluding(SegmentId(9_999)), Some(Lsn(2_901)));
-    // A number below the slid floor is gone whether or not its chunk still stands.
+    // A number below the slid floor is gone whether or not its block still stands
     table.mark_live(SegmentId(7), Lsn(1), 10);
     assert_eq!(table.len(), 100);
     assert_eq!(table.min_lsn_excluding(SegmentId(9_999)), Some(Lsn(2_901)));
 
-    // And the window keeps taking numbers above it.
+    // And the window keeps taking numbers above it
     table.mark_live(SegmentId(3_000), Lsn(3_001), 10);
     assert_eq!(table.len(), 101);
 }

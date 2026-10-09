@@ -1,20 +1,12 @@
-//! A read-only shared mapping of one segment file
-//!
-//! Taken once per segment on the first mapped read and unmapped when the last
-//! handle drops, copying page-cache-warm bytes straight into the same pooled
-//! buffers a pread would fill. A file that cannot be mapped reads through the
-//! driver instead.
-//!
-//! The mapping reserves the whole span a segment may grow to, so a tail that keeps
-//! growing after its first read stays mapped. Reads stop at the length the file was
-//! last seen at, and a read past it looks at the file again before it gives up.
+//! A read-only shared mapping of one segment file, sized to the span it may grow to
+//! A read past the last seen length checks the file again, then falls back to the driver
 
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Ask the machine for a line without waiting on it
+/// Prefetch the cache line at `ptr` without waiting for it
 #[inline(always)]
 pub(crate) fn prefetch(ptr: *const u8) {
     // Inline asm, since the aarch64 prefetch intrinsic is unstable
@@ -28,7 +20,7 @@ pub(crate) fn prefetch(ptr: *const u8) {
         );
     }
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: as above, `_mm_prefetch` is a hint and never faults.
+    // SAFETY: `_mm_prefetch` is a hint and never faults.
     unsafe {
         std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
     }
@@ -44,21 +36,13 @@ pub struct Mapping {
     path: PathBuf,
 }
 
-// Immutable shared memory over a file the format never cuts below its records:
-// the only truncates release reservation blocks past the length or trim an
-// aligned write's padding, both beyond what any record read touches. A read
-// stops at a length the file has had, so no record read reaches past its end.
-// Crossing threads is sound.
+// Read-only memory, and the format only truncates past every record read's end,
+// so sharing it across threads is sound.
 unsafe impl Send for Mapping {}
 unsafe impl Sync for Mapping {}
 
 impl Mapping {
     /// Map a file read-only over the span it may grow to, or nothing when it cannot be
-    ///
-    /// The span is the segment size, and a file already longer is mapped whole.
-    /// Nothing rather than an error, since a volume whose files cannot be mapped
-    /// falls back to the driver and stays correct. A mapping outlives the
-    /// descriptor that made it, so the file closes on return.
     pub fn open(path: &Path, span: u64) -> Option<Mapping> {
         let file = File::open(path).ok()?;
         let len = file.metadata().ok()?.len();
@@ -79,8 +63,7 @@ impl Mapping {
         if base == libc::MAP_FAILED {
             return None;
         }
-        // Deliberately unadvised: MADV_RANDOM switches off fault-around, and a
-        // record spanning many pages then faults a page at a time.
+        // Left unadvised, since MADV_RANDOM turns off fault-around for many-page records.
         Some(Mapping {
             base: base as *const u8,
             span: span as usize,
@@ -100,9 +83,6 @@ impl Mapping {
     }
 
     /// The mapped bytes at an offset, or nothing when the span runs past the file
-    ///
-    /// A span past the length last seen looks at the file once more, since a tail
-    /// grows after its first read. One the file still does not hold is the driver's.
     pub fn slice(&self, offset: u64, wanted: usize) -> Option<&[u8]> {
         let end = offset.checked_add(wanted as u64)?;
         if end > self.len() && (end > self.span as u64 || end > self.refresh()) {
@@ -157,13 +137,13 @@ mod tests {
         assert!(map.slice(u64::MAX, 1).is_none());
     }
 
-    // a path that does not open maps as nothing rather than an error
+    // a path that does not open maps as nothing
     #[test]
     fn absent_file_is_no_mapping() {
         assert!(Mapping::open(Path::new("/nonexistent/reel/segment"), 0).is_none());
     }
 
-    // an empty file with no span maps as nothing, since there is nothing to serve
+    // an empty file with no span maps as nothing
     #[test]
     fn empty_file_is_no_mapping() {
         let dir = tempfile::tempdir().expect("tempdir");

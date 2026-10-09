@@ -1,16 +1,5 @@
-//! What opening a volume costs as its segment count grows
-//!
-//! An open joins nothing across the sealed segments: each footer is already the sorted
-//! index its reads search, so the open takes the footers into the spot index and
-//! installs only what the tails hold. The spot column grows a 16 byte slot a sealed key,
-//! and the index column is that plus a flat rest.
-//!
-//! The simulator serves every read out of memory, so it times the open's own work. Point
-//! `REEL_OPEN_TIME_DIR` at a directory to run the same open on the real backend, where a
-//! per-segment read costs a seek. The volume was just written, so it is a warm open.
-//!
-//! Opt-in. Run with:
-//!   cargo test -p tape-reel --release --test probes -- open_time
+//! Measures open time as segments grow, on the simulator or under `REEL_OPEN_TIME_DIR`
+//! Run `cargo test -p tape-reel --release --test probes -- open_time`
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,16 +14,15 @@ use reel::{
     ReelStore, SyncPolicy, ThreadBudget,
 };
 
-/// Virtual root the simulator's files live under
+/// The simulator's files live under this virtual root
 const ROOT: &str = "/bulk";
 
 const RECORDS: ColumnId = ColumnId(1);
 const BLOB: ColumnId = ColumnId(2);
 
-/// Bytes a record key occupies: two group bytes then a thirty-two byte id
+/// Record key length: two group bytes then a thirty-two byte id
 const RECORD_KEY_LEN: usize = 34;
 
-/// The columns the volume is opened with
 const COLUMNS: ColumnSet = &[
     ColumnSpec {
         id: RECORDS,
@@ -54,19 +42,16 @@ const COLUMNS: ColumnSet = &[
     },
 ];
 
-/// The group every record here is written under
+/// Every record here is written under this group
 const GROUP: u16 = 7;
 
-/// Payload every record carries
-///
-/// Small, since the question is how many keys and segments an open has to resolve
-/// rather than how many bytes it moves.
+/// Each record's payload size, small since the probe counts keys and segments
 const PAYLOAD: usize = 64;
 
 /// Segment size, which sets how many keys land in each one
 const SEGMENT: u64 = 64 * 1024;
 
-/// Segment counts the sweep reports, and the keys it takes to reach them
+/// The sweep reports each of these segment counts and the keys it took to reach them
 const CASES: &[usize] = &[64, 256, 1024];
 
 fn config() -> ReelConfig {
@@ -92,7 +77,7 @@ fn id(at: u64) -> [u8; 32] {
     bytes
 }
 
-/// Fill a volume until it holds this many sealed segments, and say what it took
+/// Fill a volume until it holds this many sealed segments, and return the keys written
 fn fill_to_segments(store: &ReelStore, wanted: usize) -> u64 {
     let payload = vec![0xa5u8; PAYLOAD];
     let mut written = 0u64;
@@ -114,14 +99,13 @@ struct Case {
     spot: u64,
 }
 
-/// Directory the operator asked for a real volume under, if they asked for one
+/// The real volume directory from `REEL_OPEN_TIME_DIR`, if set
 fn named_root() -> Option<PathBuf> {
     std::env::var_os("REEL_OPEN_TIME_DIR").map(PathBuf::from)
 }
 
 // how long an open takes, and what it holds afterwards, as segments multiply
 pub fn open_time_by_segment_count() {
-    // libtest leaves the test name line open, so a header needs a newline ahead of it.
     println!();
     let root = named_root();
     match &root {
@@ -165,7 +149,7 @@ fn simulated(wanted: usize) -> Case {
     let store =
         ReelStore::open_with_io(PathBuf::from(ROOT), config(), COLUMNS, restored).expect("reopen");
     let open = start.elapsed();
-    // What the open left behind, before any maintenance tick has run.
+    // What the open left behind, before any maintenance tick runs
     let held = store.resident_bytes().to_bytes() / 1024;
     let spot = store.index().spot_heap_bytes() / 1024;
     Case {

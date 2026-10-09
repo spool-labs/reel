@@ -1,9 +1,5 @@
-//! Measurement probes, run one at a time so no probe times another's noise
-//!
-//! A bare run executes only the probes that assert. The rest are opt-in and run
-//! when the argument names them: `cargo test -p tape-reel --test probes -- <substring>`
-//! runs every probe whose name contains it, in release where the module's doc
-//! asks for one.
+//! Measurement probes, run one at a time, where a bare run skips the opt-in ones
+//! `cargo test -p tape-reel --test probes -- <substring>` runs every probe matching it
 
 mod bias_report;
 mod erase_probe;

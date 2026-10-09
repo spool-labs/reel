@@ -1,9 +1,4 @@
-//! One column's resident keys, split into shards at the column's own key width
-//!
-//! Keys are held at the width the column declares and split into shards by their
-//! leading bytes, so writers to unrelated parts of a column do not queue behind one
-//! another. Every mutation is guarded by sequence number, so a late stale write is
-//! a no-op and runtime visibility matches what a crash rebuild would resolve.
+//! One column's resident keys at its declared width, split into shards by leading bytes
 
 use std::borrow::Borrow;
 use std::ops::Bound;
@@ -26,9 +21,7 @@ use crate::index::spot::Booking;
 use crate::index::tbtreemap::{node_width, TBTreeMap, NODE_WIDTH};
 use crate::sync::{read, write};
 
-/// One column's resident index, held at the key width the column declares
-///
-/// A width not listed here is refused at open rather than padded up to a wider one.
+/// One column's resident index at its declared key width, or on the heap for variable keys
 pub enum ColumnIndex {
     W0(WidthIndex<[u8; 0], Trees<0>>),
     W2(WidthIndex<[u8; 2], Trees<2>>),
@@ -47,24 +40,19 @@ pub enum ColumnIndex {
     W96(WidthIndex<[u8; 96], Trees<96>>),
     W108(WidthIndex<[u8; 108], Trees<108>>),
 
-    /// A column whose keys are whatever length they are, held on the heap
     Var(WidthIndex<Box<[u8]>, VarTrees>),
 }
 
-/// What a mutation found in the map where the key was
-///
-/// A paged column needs more than a boolean: a key the map does not hold is not a
-/// key that is gone, and telling an empty place from a grave is what says whether a
-/// footer is still answering for it.
+/// What a mutation found in the map at its key
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Landed {
-    /// Nothing at all was there, so a footer may still be answering for the key
+    /// Nothing was there, so a footer may still hold the key
     Nothing,
 
-    /// A live record was, which the mutation has dealt with
+    /// A live record was there and the mutation dealt with it
     Record,
 
-    /// A place an earlier tombstone was holding, so the key was already gone
+    /// An earlier tombstone's grave was there, so the key was already gone
     Grave,
 
     /// A version at least as new, so nothing moved
@@ -119,10 +107,8 @@ macro_rules! on_index {
 }
 
 /// One key's move as a batch hands it to the index
-///
-/// Carrying them together is what lets keys sharing a shard share its lock.
 pub struct KeyMove<'batch> {
-    /// The column the key belongs to
+    /// The key's column
     pub column: ColumnId,
 
     /// The key being moved
@@ -134,7 +120,7 @@ pub struct KeyMove<'batch> {
     /// The sequence number it was written under
     pub lsn: Lsn,
 
-    /// Whether this is a tombstone rather than a put
+    /// Whether this is a tombstone
     pub is_delete: bool,
 }
 
@@ -179,27 +165,27 @@ impl ColumnIndex {
         }
     }
 
-    /// Bytes every key in this column occupies
+    /// The declared key width in bytes, zero for a variable column
     pub fn key_width(&self) -> u16 {
         on_index!(self, index => index.key_width())
     }
 
-    /// Leading key bytes that pick a shard, so keys apart in them share no lock
+    /// How many leading key bytes pick a shard
     pub fn shard_bytes(&self) -> u8 {
         on_index!(self, index => index.shard_bytes)
     }
 
-    /// Bytes the filters in front of the shards hold
+    /// Heap bytes of the filters in front of the shards
     pub fn filter_bytes(&self) -> u64 {
         on_index!(self, index => index.filter_bytes())
     }
 
-    /// Bytes the column's index holds, counted from what its maps allocated
+    /// Heap bytes of the column's index, counted from what its maps allocated
     pub fn heap_bytes(&self) -> u64 {
         on_index!(self, index => index.heap_bytes())
     }
 
-    /// Apply a committed data record, guarded by its sequence number and by `is_shadowed` over an empty place
+    /// Apply a committed record, guarded by sequence number and by `is_shadowed` at an empty place
     pub fn insert(
         &self,
         key: &[u8],
@@ -210,7 +196,7 @@ impl ColumnIndex {
         on_index!(self, index => index.insert_unless(key, entry, segments, is_shadowed))
     }
 
-    /// Drop a key on a tombstone, guarded by its sequence number and by `is_shadowed` over an empty place
+    /// Drop a key on a tombstone, guarded by sequence number and by `is_shadowed` at an empty place
     pub fn remove(
         &self,
         key: &[u8],
@@ -222,7 +208,7 @@ impl ColumnIndex {
         on_index!(self, index => index.remove_unless(key, lsn, tombstone, segments, is_shadowed))
     }
 
-    /// Stand a grave for a tombstone compaction copied into a segment, unless a newer version stands
+    /// Stand a grave for a tombstone that compaction copied, unless a newer version stands
     pub fn hold_grave(
         &self,
         key: &[u8],
@@ -238,17 +224,17 @@ impl ColumnIndex {
         on_index!(self, index => index.drop_grave(key, lsn))
     }
 
-    /// What a record of this column's width and a payload of this length occupies
+    /// The span of a record in this column with a `len`-byte payload
     pub fn span_of(&self, len: u32) -> u64 {
         span_of(self.key_width(), len)
     }
 
-    /// Book a record only a footer was answering for as gone
+    /// Book a record that only a footer held as gone
     pub fn settle_paged(&self, key: &[u8], loc: Loc, segments: &SegmentTable) -> bool {
         on_index!(self, index => index.settle_paged(key, loc, segments))
     }
 
-    /// Book a footer-held record gone with no read, its segment at `loc` and its live bytes at `least`
+    /// Book a footer-held record at `loc` gone without a read, taking `least` off the live bytes
     pub fn settle_paged_least(
         &self,
         key: &[u8],
@@ -264,7 +250,7 @@ impl ColumnIndex {
         on_index!(self, index => index.rebook_paged(key, booked, actual))
     }
 
-    /// Count sealed records an open put in the spot index, each key with its length, in key order
+    /// Count sealed records an open put in the spot index, as keys with lengths in key order
     pub fn book_sealed<'a>(&self, rows: impl Iterator<Item = (&'a [u8], u32)>) {
         on_index!(self, index => index.book_sealed(rows))
     }
@@ -286,7 +272,7 @@ impl ColumnIndex {
         on_index!(self, index => index.evict_paged(key, loc, lsn, segments, take))
     }
 
-    /// Bring a paged key back into the map at the copy compaction rewrote it to
+    /// Bring a paged key back into the map at its rewritten copy
     pub fn repoint_paged(
         &self,
         key: &[u8],
@@ -344,7 +330,7 @@ impl ColumnIndex {
         on_index!(self, index => index.has_pending_covers())
     }
 
-    /// Whether any range delete stands over the column, which an answer with no version cannot be tested against
+    /// Whether any range delete stands over the column
     pub fn has_covers(&self) -> bool {
         on_index!(self, index => index.has_covers())
     }
@@ -354,12 +340,12 @@ impl ColumnIndex {
         on_index!(self, index => index.prune_tombstones(before, sealed))
     }
 
-    /// Graves the column is holding, the memory a prune would give back
+    /// How many graves the column holds, the memory a prune would give back
     pub fn grave_count(&self) -> u64 {
         on_index!(self, index => index.grave_count())
     }
 
-    /// Ranges the column is still testing inserts against
+    /// How many covers the column still tests inserts against
     pub fn cover_count(&self) -> u64 {
         on_index!(self, index => index.cover_count())
     }
@@ -420,7 +406,7 @@ impl ColumnIndex {
         on_index!(self, index => index.page_out(key, loc))
     }
 
-    /// Give up the keys in one lane of shards, one lock a chunk, calling `first` on each under the lock, and report which went
+    /// Page out one lane's keys, calling `first` on each under the lock, and report which went
     pub fn page_out_lane(
         &self,
         rows: &[(&[u8], Loc)],
@@ -466,12 +452,12 @@ impl ColumnIndex {
         on_index!(self, index => index.totals())
     }
 
-    /// Keys the maps are holding, graves included, for weighing what they cost
+    /// How many keys the maps hold, graves included, for weighing their cost
     pub fn resident_keys(&self) -> u64 {
         on_index!(self, index => index.resident_keys())
     }
 
-    /// Share of neighbouring keys the shards cannot tell apart by their leads
+    /// The share of neighbouring keys with equal leads
     pub fn lead_tie_rate(&self) -> Option<f64> {
         on_index!(self, index => index.lead_tie_rate())
     }
@@ -492,16 +478,13 @@ impl ColumnIndex {
     }
 }
 
-/// Keys in one shard's run before a batch is worth its bookkeeping
+/// A shard's run needs this many keys before a batched descent pays for itself
 const BATCH_RUN: usize = 4;
 
-/// A hand-over gives up this many keys per hold of a shard's lock, so a put behind it waits briefly
+/// A hand-over gives up this many keys per hold of a shard's lock
 const LOCK_CHUNK: usize = 64;
 
-/// The shard grouping one thread's batched lookups work through
-///
-/// Four bytes a key and nothing borrowed, so it stays with the thread rather than
-/// being bought per batch.
+/// Per-thread scratch for grouping a batched lookup's keys by shard
 #[derive(Default)]
 struct KeyGroups {
     /// Each key's shard and the position it was asked at, sorted by shard
@@ -536,16 +519,16 @@ struct ShardState<K: IndexKey, S: Shape<K>> {
     /// Every key the shard holds, live records and graves alike
     map: S::Entries,
 
-    /// Payload bytes the live records add up to
+    /// Total payload bytes of the live records
     bytes: u64,
 
-    /// How many of the map's places are held by a tombstone rather than a record
+    /// How many of the map's places hold a grave
     graves: usize,
 
-    /// Oldest sequence number any grave carries, a floor that can only understate
+    /// The oldest grave's sequence number, a floor that can only understate
     oldest_grave: Lsn,
 
-    /// Live sealed records of this shard the spot index answers for
+    /// How many of this shard's live sealed records the spot index answers for
     paged: usize,
 }
 
@@ -560,7 +543,7 @@ impl<K: IndexKey, S: Shape<K>> ShardState<K, S> {
         }
     }
 
-    /// Count a grave in, keeping the floor the prune skips untouched shards by
+    /// Count a grave and lower `oldest_grave`, the floor a prune uses to skip shards
     fn note_grave(&mut self, lsn: Lsn) {
         self.graves += 1;
         if lsn < self.oldest_grave {
@@ -568,54 +551,40 @@ impl<K: IndexKey, S: Shape<K>> ShardState<K, S> {
         }
     }
 
-    /// Live keys the shard holds: its map without the graves, plus what it paged
+    /// The shard's live keys: its map less the graves, plus what it paged
     fn live_count(&self) -> u64 {
         (self.map.count() - self.graves + self.paged) as u64
     }
 }
 
-/// One cover still owed its sweep, as the driver above the column sees it
-///
-/// Held as plain bytes rather than at the column's own width, since the driver
-/// spans columns of every width.
+/// One cover still owed its sweep, in plain bytes for the driver above the column
 pub struct PendingCover {
-    /// Sequence number the delete was drawn under
+    /// The delete's sequence number
     pub lsn: Lsn,
 
-    /// Exclusive end of the range, or nothing to the top of the column
+    /// The range's exclusive end, or none to run to the top of the column
     pub end: Option<Vec<u8>>,
 
-    /// Key the release pass resumes from, while that phase is still running
+    /// The release pass resumes from this key while that phase runs
     pub release_from: Option<Vec<u8>>,
 }
 
-/// A range one tombstone covered, held at the column's own key width
-///
-/// The cover is the delete itself, standing: every read, walk and insert consults
-/// it, and the records it covers are settled behind it in bounded passes on the
-/// maintenance tick. A grave per key is impossible, since a range also covers keys
-/// it has not seen yet, and those are unbounded where the range is not.
+/// A range one tombstone covered, which every read, walk and insert checks
 struct Covered<K: IndexKey> {
     /// Inclusive start of the range
     low: K,
 
-    /// Exclusive end, or nothing when the range ran to the top of the column
+    /// Exclusive end, or none when the range runs to the top of the column
     high: Option<K>,
 
-    /// Sequence number the delete was drawn under
+    /// The delete's sequence number
     lsn: Lsn,
 
     /// How far the lazy sweep has taken this cover toward retirement
     phase: SweepPhase<K>,
 }
 
-/// Where the lazy sweep stands on one cover
-///
-/// The order of the phases is load-bearing. Records only footers answer for are
-/// settled first, while the covered map entries still stand, or the release pass
-/// would settle the same record twice. The map entries drop second, and outright
-/// rather than into graves: the cover itself refuses anything drawn before the
-/// delete, and it retires no earlier than a grave would.
+/// Where the lazy sweep stands on one cover. Release runs before Sweep so no record settles twice
 enum SweepPhase<K: IndexKey> {
     /// Settling records only footers answer for, resuming at this key
     Release(K),
@@ -623,16 +592,12 @@ enum SweepPhase<K: IndexKey> {
     /// Dropping covered map entries, resuming at this key
     Sweep(K),
 
-    /// Nothing left to settle; the cover stands only to refuse
+    /// Nothing left to settle, and the cover stands only to refuse
     Done,
 }
 
 impl<K: IndexKey> Covered<K> {
     /// Whether any sealed segment still holds keys this range would take
-    ///
-    /// A footer never hears about a range delete, so on a paged column the range is
-    /// the only thing standing between a covered key and a search that would find
-    /// it. It is finished when the segments it reaches into are gone.
     fn reaches_sealed(&self, sealed: &SealedRanges) -> bool {
         sealed.overlaps(
             self.low.as_slice(),
@@ -641,9 +606,6 @@ impl<K: IndexKey> Covered<K> {
     }
 
     /// Whether this covered a key and was drawn after that key was written
-    ///
-    /// Compares the bytes rather than the keys so a lookup can ask without building
-    /// one; both key shapes order borrowed exactly as they order owned.
     fn covers(&self, key: &[u8], lsn: Lsn) -> bool {
         if lsn >= self.lsn || key < self.low.as_slice() {
             return false;
@@ -655,7 +617,7 @@ impl<K: IndexKey> Covered<K> {
     }
 }
 
-/// Words one shard's filter takes at most, sixteen kibibytes
+/// One shard's filter takes at most this many words, sixteen kibibytes
 const FILTER_WORDS: usize = 2048;
 
 /// A column's filters share this many words, a mebibyte, across all of its shards
@@ -666,7 +628,7 @@ struct ShardFilters {
     /// The column's words, every shard's run of them in shard order
     shared: Box<[AtomicU64]>,
 
-    /// Words each shard owns, a power of two
+    /// How many words each shard owns, a power of two
     per_shard: usize,
 }
 
@@ -709,7 +671,7 @@ impl ShardFilters {
         }
     }
 
-    /// Bytes the filters hold
+    /// Heap bytes of the filters
     fn heap_bytes(&self) -> u64 {
         std::mem::size_of_val(&*self.shared) as u64
     }
@@ -734,7 +696,7 @@ fn filter_hash(key: &[u8]) -> u64 {
     hash
 }
 
-/// One column's index at a fixed key width
+/// One column's index over one key type, fixed width or variable
 pub struct WidthIndex<K: IndexKey, S: Shape<K>> {
     /// The column's keys, split by their leading bytes
     shards: Vec<RwLock<ShardState<K, S>>>,
@@ -742,10 +704,10 @@ pub struct WidthIndex<K: IndexKey, S: Shape<K>> {
     /// A filter beside each shard's lock, so a definite miss never takes it
     filters: ShardFilters,
 
-    /// Ranges a tombstone swept, tested against records that arrive after it
+    /// Ranges a range tombstone covers, tested against records that arrive after it
     covers: RwLock<Vec<Covered<K>>>,
 
-    /// Whether the list above holds anything, read with the shard held
+    /// Whether `covers` holds anything, so a test against no covers skips the lock
     has_covers: AtomicBool,
 
     /// The newest version a pruned grave or cover guarded
@@ -757,10 +719,10 @@ pub struct WidthIndex<K: IndexKey, S: Shape<K>> {
     /// A bit for each shard whose map holds an entry, so a page skips empty maps without a lock
     filled: Box<[AtomicU64]>,
 
-    /// Width the column declared, for accounting only; a variable column has none
+    /// The column's declared key width, zero for a variable column
     declared_width: u16,
 
-    /// Leading key bytes that pick a shard
+    /// How many leading key bytes pick a shard
     shard_bytes: u8,
 }
 
@@ -786,20 +748,17 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         }
     }
 
-    /// Bytes every key occupies, the declared width rather than any one key's
+    /// The declared key width in bytes, zero for a variable column
     pub fn key_width(&self) -> u16 {
         self.declared_width
     }
 
-    /// Bytes the filters in front of the shards hold
+    /// Heap bytes of the filters in front of the shards
     pub fn filter_bytes(&self) -> u64 {
         self.filters.heap_bytes()
     }
 
-    /// Bytes the column's index holds: its shards, their maps' allocations and the filters
-    ///
-    /// Counts capacity, since a shard's arenas grow by doubling and hold what they
-    /// allocated until a pack gives it back.
+    /// Heap bytes of the shards, their maps' allocations and the filters, counting capacity
     pub fn heap_bytes(&self) -> u64 {
         let fixed = (self.shards.capacity() * std::mem::size_of::<RwLock<ShardState<K, S>>>())
             as u64
@@ -808,12 +767,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     }
 
     /// Apply a committed data record, guarded by its sequence number
-    ///
-    /// A newer put shadows the record it replaces and moves its bytes to dead. A put
-    /// that lost the ordering race books its own bytes dead to keep the counters
-    /// exact. What comes back is what the map held: on a paged column a put that
-    /// landed on an empty place may have replaced a record only a footer knows about,
-    /// and exactly one put can see the place empty, so exactly one goes looking.
     pub fn insert(&self, key: &[u8], entry: Entry, segments: &SegmentTable) -> Landed {
         self.insert_unless(key, entry, segments, &never_shadowed)
     }
@@ -835,11 +788,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         self.insert_held(&mut state, at, key, entry, segments, is_shadowed)
     }
 
-    /// Apply a batch's moves, holding a shard once for the run of keys in it
-    ///
-    /// Applied strictly in the order given, so what a reader can see is what it saw
-    /// before. Consecutive keys landing in the same shard hold it together; keys
-    /// that scatter across shards cost one lock each.
+    /// Apply a batch's moves in order, holding a shard once for each run of keys in it
     pub fn apply_moves<Book: Bookings>(
         &self,
         moves: &[KeyMove<'_>],
@@ -879,9 +828,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     }
 
     /// One move of either kind, with its shard already held
-    ///
-    /// The tombstone's own span is booked from in here rather than before the lock,
-    /// which adds no lock order the crate did not already have.
     fn apply_held<Book: Bookings>(
         &self,
         state: &mut ShardState<K, S>,
@@ -920,10 +866,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     }
 
     /// The insert itself, with the key parsed and its shard already held
-    ///
-    /// Split out so a batch takes a shard once for the keys landing in it rather
-    /// than once per key. The publish barrier serialises this work, so an extra
-    /// lock take is time every other writer spends queued behind it.
     fn insert_held<Book: Bookings>(
         &self,
         state: &mut ShardState<K, S>,
@@ -933,37 +875,30 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         segments: &Book,
         is_shadowed: &impl Fn(&[u8], Lsn) -> bool,
     ) -> Landed {
-        // The record's own hold keeps its segment from retiring until this publish
-        // lands, so the stamp can be issued live here.
+        // The record's hold keeps its segment from retiring, so the stamp can be issued live here
         let entry = entry.stamped(segments.live_incarnation(entry.loc.segment));
         let (loc, lsn) = (entry.loc, entry.lsn);
         let was_empty = state.map.vacant();
         let new_len = u64::from(loc.len);
 
-        // A record drawn before a range delete is taken by it, key seen or not. The
-        // test is under the shard because that is what orders it against the sweep.
+        // The cover test runs under the shard lock, which orders it against the sweep
         if self.is_covered(key.as_slice(), lsn) {
             segments.mark_dead(loc.segment, lsn, span_of(key.width(), loc.len));
             return Landed::Newer;
         }
 
-        // The entry goes in on the way past and a refusal puts back what it
-        // displaced, so an accepted put is one descent rather than a lookup and an
-        // insert.
+        // Put first and restore on refusal, so an accepted put is one descent
         self.filters.note(at, filter_hash(key.as_slice()));
-        // Taken before the key moves into the map, since a variable column's key
-        // owns the bytes the span is measured from.
+        // Taken before the map takes the key, since a variable key owns its bytes
         let width = key.width();
         let landed = match state.map.put(key.clone(), entry) {
-            // A grave is refused like any newer version: the delete that left it
-            // was drawn after this record.
+            // A grave this new refuses the put like any newer version
             Some(existing) if existing.lsn >= lsn => {
                 state.map.put(key, existing);
                 segments.mark_dead(loc.segment, lsn, span_of(width, loc.len));
                 return Landed::Newer;
             }
-            // An older grave holds a place and nothing else, so the key comes back
-            // fresh and the segment table hears nothing.
+            // An older grave holds only a place, so the segment table hears nothing
             Some(existing) if existing.is_grave() => {
                 state.graves -= 1;
                 state.bytes += new_len;
@@ -993,13 +928,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         landed
     }
 
-    /// Drop a key on a tombstone, guarded by its sequence number
-    ///
-    /// The shadowed record's bytes move to dead and the tombstone's sequence number
-    /// stays on the key as a grave, since forgetting the key would leave nothing to
-    /// refuse a put drawn before the delete and published after it. The grave carries
-    /// the segment the tombstone landed in, which is what lets a paged column give it
-    /// up once that segment has a footer.
+    /// Drop a key on a tombstone, guarded by its sequence number, leaving a grave
     pub fn remove(&self, key: &[u8], lsn: Lsn, tombstone: Loc, segments: &SegmentTable) -> Landed {
         self.remove_unless(key, lsn, tombstone, segments, &never_shadowed)
     }
@@ -1017,16 +946,14 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             Some(key) => key,
             None => return Landed::Newer,
         };
-        // The tombstone record holds space in the segment that took it, whatever it
-        // does to the key it names: a segment with no row is one neither compaction
-        // nor the scrub can see.
+        // The tombstone holds space in its segment whatever it does to the key
         segments.mark_held(tombstone.segment, lsn, span_of(key.width(), tombstone.len));
         let at = self.shard_of(&key);
         let mut state = write(&self.shards[at]);
         self.remove_held(&mut state, at, key, lsn, tombstone, segments, is_shadowed)
     }
 
-    /// Stand a grave for a tombstone compaction copied into a segment, unless a newer version stands
+    /// Stand a grave for a tombstone that compaction copied, unless a newer version stands
     pub fn hold_grave(
         &self,
         key: &[u8],
@@ -1059,7 +986,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         self.note_held(at, state.map.vacant());
     }
 
-    /// Take out a key's grave while it still holds this tombstone's number, for a tombstone compaction dropped
+    /// Take out a key's grave while it still holds this tombstone's number
     pub fn drop_grave(&self, key: &[u8], lsn: Lsn) -> bool {
         let Some(key) = K::from_slice(key) else {
             return false;
@@ -1076,9 +1003,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         true
     }
 
-    /// The tombstone itself, with the key parsed and its shard already held
-    ///
-    /// The caller has already booked the tombstone record's own span.
+    /// The tombstone itself, with the key parsed, its shard held and its span already booked
     #[allow(clippy::too_many_arguments)]
     fn remove_held<Book: Bookings>(
         &self,
@@ -1129,7 +1054,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         landed
     }
 
-    /// Book a record only a footer was answering for as gone, the caller having resolved it
+    /// Book a record that only a footer held as gone, once the caller has resolved it
     pub fn settle_paged(&self, key: &[u8], loc: Loc, segments: &SegmentTable) -> bool {
         let Some(key) = K::from_slice(key) else {
             return false;
@@ -1140,7 +1065,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         true
     }
 
-    /// Book a footer-held record gone with no read, its segment at `loc` and its live bytes at `least`
+    /// Book a footer-held record at `loc` gone without a read, taking `least` off the live bytes
     pub fn settle_paged_least(
         &self,
         key: &[u8],
@@ -1154,13 +1079,13 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         let at = self.shard_of(&key);
         let mut state = write(&self.shards[at]);
         state.paged = state.paged.saturating_sub(1);
-        // A class's least length never exceeds the record's, so this never floors and a rebook lands exactly
+        // A class's least length never exceeds the record's, so a later rebook lands exactly
         state.bytes = state.bytes.saturating_sub(u64::from(least));
         segments.shadow(loc.segment, span_of(key.width(), loc.len));
         true
     }
 
-    /// Count sealed records an open put in the spot index, one lock a run of keys sharing a shard
+    /// Count sealed records an open put in the spot index, one lock per run of keys in a shard
     pub fn book_sealed<'a>(&self, rows: impl Iterator<Item = (&'a [u8], u32)>) {
         let mut run: Option<(usize, usize, u64)> = None;
         for (key, len) in rows {
@@ -1215,8 +1140,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     }
 
     /// Take a paged key out with a grave of its own, for a record that will not read
-    ///
-    /// No tombstone was written, so the grave has no origin and stands for the life of the process.
     pub fn evict_paged(
         &self,
         key: &[u8],
@@ -1244,7 +1167,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         true
     }
 
-    /// Bring a paged key back into the map at its rewritten copy, leaving the segment bookings to the caller
+    /// Bring a paged key back at its rewritten copy, leaving segment bookings to the caller
     pub fn repoint_paged(
         &self,
         key: &[u8],
@@ -1275,10 +1198,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         true
     }
 
-    /// Whether a range delete took a record this new, asked of a key from outside
-    ///
-    /// A footer is written once and never told about a range delete that came after
-    /// it, so the version it names is offered here before it is believed.
+    /// Whether a range delete took a version this new, asked of a footer's answer
     pub fn is_covered_key(&self, key: &[u8], lsn: Lsn) -> bool {
         match K::accepts(key) {
             true => self.is_covered(key, lsn),
@@ -1286,10 +1206,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         }
     }
 
-    /// The same test made as of an older sequence number
-    ///
-    /// A cover drawn after the snapshot records a deletion that had not happened
-    /// yet, so it hides nothing from that reader.
+    /// The same test as a reader at an older sequence number would make it
     pub fn is_covered_key_at(&self, key: &[u8], lsn: Lsn, snapshot: Lsn) -> bool {
         if !self.has_covers.load(Ordering::Relaxed) {
             return false;
@@ -1303,9 +1220,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     }
 
     /// The entry for a key, a grave included, so absent and deleted are different
-    ///
-    /// A key with no entry may still be in a sealed footer; a key holding a grave
-    /// was deleted and must not be looked for there.
     pub fn entry_or_grave(&self, key: &[u8]) -> Option<Entry> {
         if !K::accepts(key) {
             return None;
@@ -1318,18 +1232,11 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     }
 
     /// The same for many keys at once, answered in the order asked
-    ///
-    /// The keys are named by their positions in the caller's own list rather than
-    /// copied into one of this column's, so a batch borrows nothing here. They are
-    /// grouped by shard, so a run is one lock take and one batched descent. What
-    /// comes back is what the map holds, graves included, one answer per position.
     pub fn entry_many(&self, keys: &[RecordKey], run: &[usize], out: &mut Vec<Option<Entry>>) {
         out.clear();
         out.resize(run.len(), None);
 
-        // A key this column cannot hold and a key its filter rules out are both
-        // absences, and neither reaches a lock. The sort below moves the shard and
-        // the position it was asked at, four bytes each, rather than the keys.
+        // Keys the filter rules out or the column cannot hold are absent and take no lock
         let mut held = HeldGroups::take();
         let groups = &mut held.0;
         groups.wanted.clear();
@@ -1354,9 +1261,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 end += 1;
             }
 
-            // A short run is looked up under one lock rather than batched: below a
-            // handful of keys the batch's own bookkeeping costs more than the
-            // overlap buys. The lock is still taken once for the run.
+            // A short run is looked up key by key under one lock
             if end - at < BATCH_RUN {
                 let state = read(&self.shards[shard]);
                 for (_, slot) in &groups.wanted[at..end] {
@@ -1367,21 +1272,14 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 continue;
             }
 
-            // The run goes in the order it was asked: sorting whole keys to share a
-            // descent costs more than it saves, and `at_many` needs no order. The two
-            // lists here are bought per batched run: one is keyed by the column's own
-            // key type and one borrows from the shard guard, so neither can be kept
-            // by the thread the way `wanted` above is.
-            // The filter hides the count from the iterator, so the room is asked for
-            // outright rather than grown into a doubling at a time.
+            // The run goes in the order it was asked, since `at_many` needs no order
             let mut staged: Vec<K> = Vec::with_capacity(end - at);
             staged.extend(
                 groups.wanted[at..end]
                     .iter()
                     .filter_map(|(_, slot)| K::from_slice(keys[run[*slot as usize]].as_slice())),
             );
-            // Nothing can be dropped here, since `accepts` above is the same test
-            // `from_slice` makes, and the zip below depends on it.
+            // `accepts` above is the test `from_slice` makes, so the zip below lines up
             debug_assert_eq!(
                 staged.len(),
                 end - at,
@@ -1397,9 +1295,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         }
     }
 
-    /// Whether a range delete already took a record this new, the guarded test
-    ///
-    /// The flag keeps a volume that never deletes a range off a lock per insert.
+    /// Whether a range delete already took a record this new
     fn is_covered(&self, key: &[u8], lsn: Lsn) -> bool {
         if !self.has_covers.load(Ordering::Relaxed) {
             return false;
@@ -1409,27 +1305,19 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             .any(|cover| cover.covers(key, lsn))
     }
 
-    /// Ranges the column is still testing inserts against
+    /// How many covers the column still tests inserts against
     pub fn cover_count(&self) -> u64 {
         read(&self.covers).len() as u64
     }
 
     /// Drop what tombstones are holding once nothing older can still be published
-    ///
-    /// The floor comes from the caller, since what a writer can have drawn but not
-    /// published is bounded by the admission budget rather than by anything the
-    /// index holds. A grave also waits until the tombstone that left it has a footer
-    /// of its own, and a cover until no sealed segment holds keys inside it.
     pub fn prune_tombstones(&self, before: Lsn, sealed: &SealedRanges) -> u64 {
         let mut pruned = self.prune_covers(before, sealed);
         pruned += self.prune_graves(before, sealed);
         pruned
     }
 
-    /// Drop the ranges nothing older than can still be published
-    ///
-    /// A cover the sweep has not finished is kept whatever the floor says: it is
-    /// the only thing saying the records it covers are gone.
+    /// Drop swept covers once nothing older than them can still be published
     fn prune_covers(&self, before: Lsn, sealed: &SealedRanges) -> u64 {
         if !self.has_covers.load(Ordering::Relaxed) {
             return 0;
@@ -1447,8 +1335,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             keep
         });
         self.lifted.fetch_max(lifted.as_u64(), Ordering::AcqRel);
-        // The flag goes down only with the list held, so an insert reading it false
-        // is already ordered after the emptying.
+        // Clear the flag with the list held, which orders a reader of false after the emptying
         if covers.is_empty() {
             self.has_covers.store(false, Ordering::Relaxed);
         }
@@ -1456,9 +1343,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     }
 
     fn prune_graves(&self, before: Lsn, sealed: &SealedRanges) -> u64 {
-        // Taken once for the pass rather than per grave: the test below runs with a
-        // shard held, and reaching for another lock from under one is an ordering
-        // every other path would have to know about.
+        // Taken once per pass so the test below takes no other lock under the shard
         let mut snapshot: Option<Vec<SegmentId>> = None;
         let occupied: Vec<usize> = read(&self.occupied)
             .iter()
@@ -1471,8 +1356,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             if state.graves == 0 {
                 continue;
             }
-            // The floor understates at worst, so a shard whose graves are all newer
-            // than the prune line is skipped without walking its map.
+            // The floor can only understate, so a shard with all graves past the line is skipped
             if state.oldest_grave > before {
                 continue;
             }
@@ -1504,8 +1388,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             }
             state.graves -= doomed.len();
             pruned += doomed.len() as u64;
-            // Deletion leaves room behind in a map that never merges, and this is
-            // the pass that just made the most of it.
+            // Pack the room the deletes left, since the map never merges
             state.map.pack_owed();
             self.note_emptied(at, &mut state);
         }
@@ -1513,15 +1396,12 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         pruned
     }
 
-    /// Graves the column is holding, the memory a prune would give back
+    /// How many graves the column holds, the memory a prune would give back
     pub fn grave_count(&self) -> u64 {
         self.sum_shards(|state| state.graves as u64)
     }
 
-    /// Sum one number over every shard holding anything
-    ///
-    /// Not a snapshot: shards move while it steps them, so a total can miss a key
-    /// that arrived after its shard was read.
+    /// Sum one number over every occupied shard, without a snapshot
     fn sum_shards(&self, of: impl Fn(&ShardState<K, S>) -> u64) -> u64 {
         let occupied: Vec<usize> = read(&self.occupied)
             .iter()
@@ -1534,20 +1414,11 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     }
 
     /// Take a half-open range with one standing cover, sweeping nothing
-    ///
-    /// The end is exclusive, and no end runs to the top of the column. The drop is
-    /// one push at any key count, and the records it covers are settled by the lazy
-    /// sweep on the maintenance tick. A key written after the tombstone was drawn
-    /// keeps its place, which is what makes a range delete and a concurrent put
-    /// resolve the same way at runtime as on a rebuild.
     pub fn remove_range(&self, start: &[u8], end: Option<&[u8]>, lsn: Lsn) {
         self.push_cover(start, end.map(K::low_bound), lsn);
     }
 
     /// The cover the sweep should settle next, oldest first
-    ///
-    /// Oldest first is load-bearing: a later cover's release pass skips rows a
-    /// finished cover already settled.
     pub fn next_pending_cover(&self) -> Option<PendingCover> {
         read(&self.covers)
             .iter()
@@ -1575,11 +1446,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         };
     }
 
-    /// Drop one bounded run of the map entries a cover has taken
-    ///
-    /// The budget counts keys examined rather than keys dropped, so a run of newer
-    /// keys inside the range still moves the cursor. What comes back is what was
-    /// dropped, how much budget went, and whether the cover's map half finished.
+    /// Drop one bounded run of a cover's map entries, returning (dropped, examined, finished)
     pub fn sweep_run(
         &self,
         lsn: Lsn,
@@ -1608,8 +1475,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             let mut state = write(&self.shards[at]);
             let state = &mut *state;
             let mut doomed: Vec<(K, Entry)> = Vec::new();
-            // The trait takes its bounds borrowed, so the high end is held here for
-            // as long as the walk it bounds.
+            // The trait borrows its bounds, so the high end lives here for the walk
             let ceiling = upper_bound(high.clone());
             let span_high = borrowed(&ceiling);
             for (key, entry) in state.map.span(Bound::Included(&resume), span_high) {
@@ -1636,8 +1502,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 }
                 state.bytes = state.bytes.saturating_sub(freed);
                 dropped += doomed.len() as u64;
-                // Once for the run rather than once a key, since the whole run goes
-                // under one take of the shard.
+                // Once per run, since the whole run goes under one take of the shard
                 state.map.pack_owed();
                 self.note_emptied(at, state);
             }
@@ -1664,7 +1529,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         }
     }
 
-    /// Settle a footer-held record a standing cover has taken, if the map holds nothing for the key and `take` finds its live slot
+    /// Settle a covered footer-held record if the map lacks the key and `take` finds its slot
     pub fn release_covered(
         &self,
         key: &[u8],
@@ -1717,10 +1582,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             .any(|cover| !matches!(cover.phase, SweepPhase::Done))
     }
 
-    /// Resolve a key to its live entry
-    ///
-    /// A grave answers the same as no key at all, and so does an entry older than a
-    /// spanning cover: the delete stands whether or not the sweep has been through.
+    /// Resolve a key to its live entry, with graves and covered entries as absent
     pub fn get(&self, key: &[u8]) -> Option<Entry> {
         if !K::accepts(key) {
             return None;
@@ -1747,7 +1609,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             .map(|entry| ByteCount::from_bytes(u64::from(entry.loc.len)))
     }
 
-    /// Repoint a key to its rewritten copy if it still resolves the same version, returning the old location
+    /// Repoint a key to its rewritten copy while it holds the same version, returning the old place
     pub fn repoint(
         &self,
         key: &[u8],
@@ -1758,8 +1620,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         let key = K::from_slice(key)?;
         let at = self.shard_of(&key);
         let mut state = write(&self.shards[at]);
-        // Changed where it sits: the entry was just found, and putting it back would
-        // walk the map to it a second time.
+        // Changed in place, so the map is walked once
         match state.map.at_mut(key.as_slice()) {
             Some(existing) if existing.lsn == expected_lsn && !existing.is_grave() => {
                 let from = existing.loc;
@@ -1772,9 +1633,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     }
 
     /// Drop a key while it still resolves one exact location, writing no tombstone
-    ///
-    /// The bytes stay on disk as dead space until the segment is retired, and a
-    /// version that overtook the named location keeps its place.
     pub fn evict_at(&self, key: &[u8], loc: Loc, segments: &SegmentTable) -> bool {
         let key = match K::from_slice(key) {
             Some(key) => key,
@@ -1801,18 +1659,12 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         Lsn(self.lifted.load(Ordering::Acquire))
     }
 
-    /// Give a key up to the footer of the segment it landed in
-    ///
-    /// The record stays live and its bytes stay booked live: what changes is only
-    /// who answers for it. Guarded by the location, so a key overwritten since the
-    /// segment sealed is left alone. A covered entry is refused too, since handing
-    /// it over would put it where the map sweep cannot reach and the release pass
-    /// may already have been, so nothing would ever settle it.
+    /// Give a key up to its segment's footer if it still points there and no cover holds it
     pub fn page_out(&self, key: &[u8], loc: Loc) -> bool {
         self.page_out_lane(&[(key, loc)], 0, 1, &|_, _| {})[0]
     }
 
-    /// Give up the keys in one lane of shards, one lock a chunk, calling `first` on each under the lock, and report which went
+    /// Page out one lane's keys, calling `first` on each under the lock, and report which went
     pub fn page_out_lane(
         &self,
         rows: &[(&[u8], Loc)],
@@ -1927,7 +1779,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     fn push_cover(&self, start: &[u8], high: Option<K>, lsn: Lsn) {
         let low = K::low_bound(start);
         let mut covers = write(&self.covers);
-        // A copied range delete stands in two segments, so one at this sequence number is this cover
+        // A copied range delete is in two segments, so a cover at this number is this one
         if covers.iter().any(|cover| cover.lsn == lsn) {
             return;
         }
@@ -1953,7 +1805,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             self.filters.clear(at);
             state.bytes = 0;
             state.graves = 0;
-            // A rebuild counts its sealed keys again, so a shard that had handed keys over starts from nothing
+            // A rebuild counts its sealed keys again, so the paged count starts from zero
             state.paged = 0;
         }
         write(&self.occupied).clear();
@@ -1962,11 +1814,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         self.has_covers.store(false, Ordering::Relaxed);
     }
 
-    /// Live key count and payload byte total for the column
-    ///
-    /// Summed from the shards rather than kept in atomics, which would put two
-    /// read-modify-writes on one shared cache line in every insert. Not a snapshot:
-    /// a total can miss a key that arrived after its shard was read.
+    /// Live key count and payload byte total for the column, summed without a snapshot
     pub fn totals(&self) -> Totals {
         let occupied: Vec<usize> = read(&self.occupied)
             .iter()
@@ -1985,20 +1833,12 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         }
     }
 
-    /// Keys the shards are holding, graves included
-    ///
-    /// Counts places in the map rather than live keys: a grave takes a place and a
-    /// paged key does not.
+    /// How many places the shards' maps hold, graves included and paged keys left out
     pub fn resident_keys(&self) -> u64 {
         self.sum_shards(|state| state.map.count() as u64)
     }
 
-    /// Share of neighbouring keys the shards cannot tell apart by their leads
-    ///
-    /// Weighted by keys rather than averaged over shards, since most shards of a
-    /// two-byte column hold a handful. Nothing comes back from a shape with no leads
-    /// or from an empty column: a rate over no keys is not zero, it is unasked. Walks
-    /// every occupied shard's leaves, so it is a diagnostic rather than a counter.
+    /// The share of neighbouring keys with equal leads, weighted by keys, none when empty
     pub fn lead_tie_rate(&self) -> Option<f64> {
         let occupied: Vec<usize> = read(&self.occupied)
             .iter()
@@ -2022,17 +1862,12 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         }
     }
 
-    /// Live totals for one shard-aligned prefix, or nothing if it is not one
-    ///
-    /// A prefix naming exactly one shard is a total the shard already keeps, so the
-    /// answer is a lock and two loads rather than a walk of its keys.
+    /// Live totals for one shard-aligned prefix, read from the shard's own counters
     pub fn prefix_totals(&self, prefix: &[u8]) -> Option<Totals> {
         if prefix.len() != self.shard_bytes as usize || self.shard_bytes == 0 {
             return None;
         }
-        // An unswept cover over this shard means the counters still hold entries a
-        // reader is already told are gone, so declining sends the caller to the
-        // walk, which filters.
+        // An unswept cover leaves dead entries in the counters, so the caller walks
         if self.pending_overlaps(prefix, prefix) {
             return None;
         }
@@ -2044,10 +1879,6 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     }
 
     /// Fill a page with one bounded run of live keys, ascending from a bound
-    ///
-    /// Each key's location goes into the page with it, so a playback stages its reads
-    /// from what this already resolved. A bound shorter than a key is read as its
-    /// zero-filled extension, the low end of the range the prefix names.
     pub fn page(&self, start: Bound<&[u8]>, limit: usize, out: &mut KeyPage) {
         out.clear();
         if limit == 0 {
@@ -2060,23 +1891,20 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             Bound::Included(key) | Bound::Excluded(key) => self.shard_of_bytes(key),
         };
         for at in self.filled_range(first, self.shards.len() - 1) {
-            // Between one shard and the next is where a page fill that holds no
-            // publish barrier can be caught by a batch.
+            // A page fill holds no publish barrier, so a batch can land between shards
             crate::sync::rendezvous::at("index/page-shard");
             let bound = match at == first {
                 true => low_bound::<K>(start),
                 false => Bound::Unbounded,
             };
-            // The trait takes its bounds borrowed, so the owned one is held here
-            // for as long as the walk it opens.
+            // The trait borrows its bounds, so the owned one lives here for the walk
             let low = borrowed(&bound);
             let state = read(&self.shards[at]);
             // A merge checks graves and covers itself, so its page takes every entry
             let judged = out.keeps_graves();
             let covers = self.has_covers.load(Ordering::Relaxed);
             for (keys, entries) in state.map.span_runs(low) {
-                // A run with nothing dead in it goes over in one copy of keys and one of entries,
-                // cut at the room the page has left.
+                // A run with nothing dead goes over as one copy of keys and one of entries
                 let take = keys.len().min(limit - out.len());
                 let clean = judged || (!covers && !entries[..take].iter().any(Entry::is_grave));
                 let width = keys.first().map_or(0, |key| key.as_slice().len());
@@ -2152,35 +1980,27 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         state.map.take(key.as_slice());
     }
 
-    /// Record a shard that has just taken its first key
-    ///
-    /// The transition is already visible with the shard held, so no insert pays the
-    /// walk set's shared lock to ask whether the shard was in it.
+    /// Add a shard that just took its first key to the walk set
     fn note_filled(&self, at: usize, was_empty: bool) {
         if was_empty {
             write(&self.occupied).insert(at as u64, ());
         }
     }
 
-    /// Record a shard whose last key has just left it
-    ///
-    /// A shard that gave its keys up to a footer stays on the walk with an empty
-    /// map: dropping it there would take its paged count out of every total, which
-    /// reads as the keys having been deleted rather than handed over.
+    /// Clean up after a shard's map empties, keeping it on the walk while it has paged keys
     fn note_emptied(&self, at: usize, state: &mut ShardState<K, S>) {
         if state.map.vacant() {
             self.filters.clear(at);
             self.note_held(at, true);
         }
         if state.map.vacant() && state.paged == 0 {
-            // The room goes with the walk: nothing visits a shard outside the
-            // occupied set, so a shard left here is one nothing will pack.
+            // Release the room now, since no pass visits a shard outside the walk set
             state.map.release();
             write(&self.occupied).remove(&(at as u64));
         }
     }
 
-    /// Set or clear a shard's bit in `filled`, under the shard's write lock, writing only on a change
+    /// Set or clear a shard's bit in `filled` under its write lock, writing only on a change
     fn note_held(&self, at: usize, is_vacant: bool) {
         let (word, bit) = (&self.filled[at / 64], 1u64 << (at % 64));
         let is_set = word.load(Ordering::Relaxed) & bit != 0;
@@ -2235,7 +2055,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         })
     }
 
-    /// Occupied shards within an inclusive shard range, in key order, found as the walk reaches each
+    /// Occupied shards in an inclusive range, in key order, looked up as the walk reaches each
     fn occupied_range(&self, first: usize, last: usize) -> impl Iterator<Item = usize> + '_ {
         let (mut low, high) = (first as u64, last as u64);
         std::iter::from_fn(move || {
@@ -2262,7 +2082,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
     }
 }
 
-/// Book a record a footer was answering for as gone, out of the shard's count where the spot index held it live
+/// Book a footer-held record gone, taking it off the shard's count when `counted`
 fn settle<K: IndexKey, S: Shape<K>>(
     state: &mut ShardState<K, S>,
     loc: Loc,
@@ -2277,7 +2097,7 @@ fn settle<K: IndexKey, S: Shape<K>>(
     segments.shadow(loc.segment, span_of(key_width, loc.len));
 }
 
-/// Bytes a packed mark spends on the opening that minted it
+/// A packed mark spends this many bytes on its opening's nonce
 const NONCE_LEN: usize = 8;
 
 /// Where a sweep of a whole column left off, at the last key it handed out
@@ -2291,10 +2111,7 @@ pub struct ColumnMark {
 }
 
 impl ColumnMark {
-    /// The mark as bytes, for a caller that carries it over a wire or a restart
-    ///
-    /// Opaque on purpose: the shape of it is this engine's business, and a peer
-    /// or a cursor that stored one only ever hands it back.
+    /// The mark as opaque bytes, for a caller to send over a wire or keep across a restart
     pub fn pack(&self) -> Vec<u8> {
         let mut packed = Vec::with_capacity(NONCE_LEN + self.after.len());
         packed.extend_from_slice(&self.nonce.to_le_bytes());
@@ -2302,10 +2119,7 @@ impl ColumnMark {
         packed
     }
 
-    /// A mark read back from bytes, or nothing where they are not one
-    ///
-    /// Nothing rather than an error: bytes that do not decode are bytes from
-    /// somewhere else, and the sweep that gets them starts over.
+    /// A mark read back from bytes, or none when they do not decode
     pub fn unpack(packed: &[u8]) -> Option<ColumnMark> {
         let (nonce, after) = packed.split_at_checked(NONCE_LEN)?;
         Some(ColumnMark {
@@ -2315,15 +2129,15 @@ impl ColumnMark {
     }
 }
 
-/// What a shard holds its keys in
+/// The map type that holds one shard's keys
 pub trait ShardMap<K: IndexKey, V: 'static>: Default {
     /// Put a value in, handing back the one it displaced
     fn put(&mut self, key: K, val: V) -> Option<V>;
 
-    /// What is held for a key, borrowed rather than built
+    /// The value held for a key, looked up by borrowed bytes
     fn at(&self, key: &[u8]) -> Option<&V>;
 
-    /// What is held for a key, to be changed where it sits
+    /// The value held for a key, mutable in place
     fn at_mut(&mut self, key: &[u8]) -> Option<&mut V>;
 
     /// Whether a key is held at all
@@ -2332,13 +2146,13 @@ pub trait ShardMap<K: IndexKey, V: 'static>: Default {
     /// Take a key out, handing back what it held
     fn take(&mut self, key: &[u8]) -> Option<V>;
 
-    /// Keys held, graves included
+    /// How many keys the map holds, graves included
     fn count(&self) -> usize;
 
     /// Whether the shard holds nothing
     fn vacant(&self) -> bool;
 
-    /// Bytes the map has allocated, spare room included
+    /// The map's heap allocation in bytes, spare room included
     fn heap_bytes(&self) -> u64;
 
     /// Drop every key, keeping whatever room was already taken
@@ -2361,7 +2175,7 @@ pub trait ShardMap<K: IndexKey, V: 'static>: Default {
         high: Bound<&K>,
     ) -> impl Iterator<Item = (&'a K, &'a V)>;
 
-    /// Pairs from a low bound on, in runs. One pair per run unless the map keeps leaves.
+    /// Pairs from a low bound on, in runs of one pair unless the map keeps leaves
     fn span_runs<'a>(
         &'a self,
         low: Bound<&'a K>,
@@ -2373,10 +2187,6 @@ pub trait ShardMap<K: IndexKey, V: 'static>: Default {
     }
 
     /// Many keys at once, answered in the order asked
-    ///
-    /// The default asks one at a time. A map with a batched descent takes the whole
-    /// run, since a descent is a chain of dependent cache misses that nothing but
-    /// other work in flight can shorten.
     fn at_many<'a>(&'a self, keys: &[K], out: &mut Vec<Option<&'a V>>) {
         out.clear();
         for key in keys {
@@ -2387,34 +2197,21 @@ pub trait ShardMap<K: IndexKey, V: 'static>: Default {
     /// Give back the room a map grown a key at a time holds past its fill
     fn fit(&mut self) {}
 
-    /// Pack the map back up once deletion has doubled its spare room, which keeps asking cheap
+    /// Pack the map once deletion has doubled its spare room
     fn pack_owed(&mut self) {}
 
-    /// Give the map's room back, for a shard that is holding nothing at all
-    ///
-    /// `empty` keeps what was allocated, since a shard cleared by a group drop takes
-    /// its next fill straight back. This is the other case: a shard drained to
-    /// nothing leaves the ordered walk, so no pass visits it again to pack it.
+    /// Give the map's room back, for a shard that holds nothing and leaves the walk
     fn release(&mut self) {
         *self = Self::default();
     }
 
-    /// Share of neighbouring keys this shard cannot tell apart by their leads
-    ///
-    /// A shard whose keys all share their first eight bytes falls out of the vector
-    /// compare into a walk of full keys. It stays correct and says nothing, which is
-    /// why this is asked rather than assumed. A map with no leads has no answer.
+    /// The share of neighbouring keys with equal leads, none for a map without leads
     fn lead_tie_rate(&self) -> Option<f64> {
         None
     }
 }
 
-/// The same shard for a column whose keys have no width, held in the same tree
-///
-/// The keys sit on the heap and the node holds pointers to them, so a shift moves
-/// sixteen bytes a slot and the lead array stays inline and vectorised. An object
-/// key is a bucket address and then a name, so a node tunes its lead window past
-/// the bytes its own keys agree on.
+/// A variable column's shard, with keys on the heap and pointers in the node
 impl<const B: usize, V: Default + 'static> ShardMap<Box<[u8]>, V> for TBTreeMap<Box<[u8]>, B, V> {
     fn put(&mut self, key: Box<[u8]>, val: V) -> Option<V> {
         self.insert(key, val)
@@ -2493,11 +2290,7 @@ impl<const B: usize, V: Default + 'static> ShardMap<Box<[u8]>, V> for TBTreeMap<
     }
 }
 
-/// The same shard, held in the tree a declared width allows
-///
-/// The width is the const the key type is an array of, which is why this can only
-/// exist for a fixed column: `Box<[u8]>` has nothing to hold inline and no lead to
-/// take without chasing a pointer.
+/// A fixed column's shard, with its keys inline in the tree
 impl<const N: usize, const B: usize, V: Default + 'static> ShardMap<[u8; N], V>
     for TBTreeMap<[u8; N], B, V>
 {
@@ -2506,8 +2299,7 @@ impl<const N: usize, const B: usize, V: Default + 'static> ShardMap<[u8; N], V>
     }
 
     fn at(&self, key: &[u8]) -> Option<&V> {
-        // A probe of the wrong width is a key this column cannot hold, which is
-        // an absence rather than a fault.
+        // A probe of the wrong width is a key this column cannot hold, so it is absent
         let key: &[u8; N] = key.try_into().ok()?;
         self.get(key)
     }
@@ -2590,10 +2382,7 @@ impl<const N: usize, const B: usize, V: Default + 'static> ShardMap<[u8; N], V>
     }
 }
 
-/// Which pair of maps a column's shards are built from
-///
-/// Per column rather than once for the whole index, because a column's key decides
-/// its node: a declared width holds its keys inline, and a name holds a pointer.
+/// Which map a column's shards are built from, chosen per column by its key type
 pub trait Shape<K: IndexKey> {
     /// Where the shard's entries live
     type Entries: ShardMap<K, Entry>;
@@ -2603,10 +2392,6 @@ pub trait Shape<K: IndexKey> {
 pub struct Trees<const N: usize>;
 
 /// Give each declared key width the node width `node_width` sizes for it
-///
-/// One impl a width rather than one over every width, since a const parameter
-/// cannot be arithmetic on another one without `generic_const_exprs`. A width that
-/// is not listed fails to compile rather than falling back to a default.
 macro_rules! tree_shapes {
     ($($width:literal),* $(,)?) => {
         $(
@@ -2619,12 +2404,7 @@ macro_rules! tree_shapes {
 
 tree_shapes!(0, 2, 8, 12, 16, 20, 24, 32, 34, 36, 40, 44, 48, 72, 96, 108);
 
-/// Keys a node holds on a column whose keys have no declared width
-///
-/// The budget the fixed arms take is a count of key bytes, since a node there holds
-/// whole keys and an insert shifts them. A node holding names shifts pointers
-/// instead, sixteen bytes a slot whatever the name weighs, so the budget has nothing
-/// to divide and this width is chosen rather than derived.
+/// Keys per node on a column whose keys have no declared width
 pub const VAR_NODE_WIDTH: usize = 32;
 
 /// The shape a column whose keys have no width takes
@@ -2634,12 +2414,7 @@ impl Shape<Box<[u8]>> for VarTrees {
     type Entries = TBTreeMap<Box<[u8]>, VAR_NODE_WIDTH, Entry>;
 }
 
-/// A key as the resident map holds it
-///
-/// A fixed column instantiates it at `K` and keeps its keys inline; a variable
-/// column instantiates it at `Box<[u8]>` and pays a pointer and an allocation per
-/// key. Both borrow as their bytes and order the same borrowed as owned, so a lookup
-/// takes a plain `&[u8]` and touches the heap only for a key worth keeping.
+/// A key as the resident map holds it, inline for a fixed column and boxed for a variable one
 pub trait IndexKey: Ord + Clone + Send + Sync + Borrow<[u8]> + 'static {
     /// The key these bytes make, or nothing when the column cannot hold them
     fn from_slice(bytes: &[u8]) -> Option<Self>
@@ -2668,7 +2443,7 @@ pub trait IndexKey: Ord + Clone + Send + Sync + Borrow<[u8]> + 'static {
         None
     }
 
-    /// Bytes this key occupies, which a record's span is measured with
+    /// The key's width in bytes, used to measure a record's span
     fn width(&self) -> u16 {
         self.as_slice().len() as u16
     }
@@ -2727,13 +2502,12 @@ impl IndexKey for Box<[u8]> {
         true
     }
 
-    /// A prefix is already the low end of everything that begins with it.
+    /// A prefix is already the low end of everything that begins with it
     fn low_bound(bytes: &[u8]) -> Box<[u8]> {
         Box::from(bytes)
     }
 
-    /// The high end needs a byte no stored key can carry past the prefix, and
-    /// `MAX_KEY_LEN` bytes of 0xFF is above every key the format admits.
+    /// The prefix padded with 0xFF to `MAX_KEY_LEN`, above every key the format admits
     fn high_bound(bytes: &[u8]) -> Box<[u8]> {
         let mut out = Vec::with_capacity(MAX_KEY_LEN);
         out.extend_from_slice(bytes);
@@ -2871,7 +2645,7 @@ mod tests {
         assert_eq!(keys_in(&page), names);
     }
 
-    // an overwrite replaces the key rather than adding a second one
+    // an overwrite replaces the key in place and adds no second one
     #[test]
     fn a_variable_key_overwrites_in_place() {
         let index = ColumnIndex::new(&VARIABLE).expect("index");
@@ -2913,7 +2687,7 @@ mod tests {
         codec: Codec::None,
     };
 
-    /// The sharded column's keys in one shard, so the shard's filter gets every word a shard can own
+    /// One shard at the sharded width, so its filter gets every word a shard can own
     const SINGLE: ColumnSpec = ColumnSpec {
         id: ColumnId(4),
         name: "single",
@@ -3012,9 +2786,7 @@ mod tests {
         });
     }
 
-    /// Run the lazy sweep to completion, the way the maintenance tick would
-    ///
-    /// Nothing here pages, so the release phase is stepped straight past.
+    /// Run the lazy sweep to completion, stepping straight past the release phase
     fn sweep_all<K: IndexKey, S: Shape<K>>(index: &WidthIndex<K, S>, segments: &SegmentTable) {
         let mut steps = 0;
         while let Some(pending) = index.next_pending_cover() {
@@ -3135,8 +2907,7 @@ mod tests {
             "a shard that never held a key"
         );
 
-        // A grave must pass the filter, since deleted and absent answer alike from
-        // get but differently from entry_or_grave.
+        // A grave must pass the filter, since `entry_or_grave` tells it from an absence
         index.remove(&key(1, 1), Lsn(2), loc(2, 0, 20), &segments);
         assert!(index.get(&key(1, 1)).is_none());
         assert!(
@@ -3164,7 +2935,7 @@ mod tests {
         assert_eq!(index.totals().bytes, ByteCount::from_bytes(400));
     }
 
-    // a key of the wrong width is refused rather than padded into the column
+    // a key of the wrong width is refused and never padded into the column
     #[test]
     fn wrong_width_refused() {
         let index = sharded();
@@ -3254,7 +3025,7 @@ mod tests {
         assert_eq!(index.totals().count, 1);
     }
 
-    // a write over an empty place that the shadow check finds outversioned is refused, through every door
+    // a write over an empty place the shadow check finds outversioned is refused, by every door
     #[test]
     fn a_shadowed_write_over_an_empty_place_is_refused() {
         let index = sharded();
@@ -3488,8 +3259,7 @@ mod tests {
         index.page(Bound::Unbounded, 8, &mut out);
         assert_eq!(keys_in(&out), vec![key(41, 41), key(43, 43)]);
 
-        // Three spans are dead: the overwrite of the doubled key booked one on the
-        // way in, and the sweep settled the two live covered records.
+        // Three spans are dead: one overwritten on the way in, two settled by the sweep
         sweep_all(&index, &segments);
         assert_eq!(index.totals().count, 2);
         assert_eq!(segments.bytes_of(SegmentId(1)).dead, 3 * span_of(34, 100));
@@ -3622,8 +3392,7 @@ mod tests {
 
         index.remove(&key(1, 1), Lsn(3), loc(1, 0, 0), &segments);
 
-        // The shard is not empty yet: the delete left a grave holding the key's
-        // place.
+        // The delete left a grave, so the shard is still occupied
         assert_eq!(read(&index.occupied).len(), 2);
         let mut out = KeyPage::default();
         index.page(Bound::Unbounded, 8, &mut out);
@@ -3646,8 +3415,7 @@ mod tests {
         let index = sharded();
         let segments = SegmentTable::new();
 
-        // The delete is drawn second and published first, against a key the index
-        // has never seen.
+        // The delete is drawn second and published first, on a key the index never saw
         index.remove(&key(1, 1), Lsn(6), loc(1, 0, 0), &segments);
         assert!(!index
             .insert(&key(1, 1), Entry::new(loc(1, 0, 400), Lsn(5)), &segments,)
@@ -3890,8 +3658,7 @@ mod tests {
             "paging 95% out left {packed} of {filled} leaves"
         );
 
-        // A shard that pages keeps its place in the walk, since its paged count is
-        // not zero.
+        // A shard that pages stays in the walk while its paged count is above zero
         assert_eq!(read(&index.occupied).len(), 1);
         for key in &held[1900..] {
             assert!(index.get(key).is_some(), "a resident key went missing");
@@ -4001,8 +3768,7 @@ mod tests {
         assert_eq!(index.cover_count(), 0);
         assert_eq!(index.lifted(), Lsn(9));
 
-        // Nothing is held any more, so a record older than the retired delete is
-        // taken on its own merits.
+        // The retired delete holds nothing, so an older record goes in on its own merits
         assert!(index
             .insert(&key(1, 5), Entry::new(loc(1, 0, 400), Lsn(5)), &segments,)
             .took_place());
@@ -4101,7 +3867,7 @@ mod tests {
         assert_eq!(segments.bytes_of(SegmentId(1)).dead, span_of(34, 100));
     }
 
-    // a shard under an unswept cover declines its totals instead of lying
+    // a shard under an unswept cover declines its totals until the sweep
     #[test]
     fn prefix_totals_decline_under_a_pending_cover() {
         let index = sharded();
@@ -4138,7 +3904,7 @@ mod tests {
         );
     }
 
-    // a delete twice over holds one place, not one per delete
+    // a second delete of one key replaces its grave and holds one place
     #[test]
     fn a_second_delete_replaces_the_grave() {
         let index = sharded();

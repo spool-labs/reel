@@ -1,10 +1,5 @@
 //! Crash point enumeration for the reel store
-//!
-//! Representative streams are driven over the simulator and crashed before every io
-//! boundary in turn, then reopened, and after each reopen the constant time counters
-//! must equal a from scratch scan of what the reel serves. Torn footers and partial
-//! seals are out of reach here, since a footer is only written by an explicit seal the
-//! public engine surface does not expose.
+//! Each stream crashes before every io boundary, reopens, and must match a full scan
 
 #[allow(dead_code)]
 mod harness;
@@ -34,27 +29,19 @@ use harness::wire::{
 /// A sync on every write, for tests that need each one durable
 const EVERY_WRITE: SyncPolicy = SyncPolicy::Bytes(ByteCount::from_bytes(0));
 
-/// Group most targeted tests write into
+/// Most targeted tests write into this group
 const GROUP: u16 = 7;
 
-/// Seeds the general enumeration draws its streams from
-///
-/// Every boundary of a stream is crashed at and each crash replays the stream from the
-/// start, so a stream costs the square of its length while a seed costs one stream.
+/// The general enumeration draws its streams from these seeds
 const CRASH_SEEDS: &[u64] = &[1, 42, 7, 1337];
 
-/// Length of each general enumeration stream, quadratic in what it costs to raise
+/// Length of each general enumeration stream, whose cost grows with its square
 const CRASH_LEN: usize = 5;
 
-/// Seeds the multi tail enumerations draw their streams from
-///
-/// At four tails the variable is the configuration rather than the stream: what four
-/// tails add is the version guard ordering records several appenders committed
-/// independently.
+/// The multi tail enumerations draw their streams from these seeds
 const MULTI_TAIL_SEEDS: &[u64] = &[1, 42];
 
-/// Seeds the scatter enumeration draws its streams from, narrower because scatter
-/// already replays every stream at two sector sizes
+/// The scatter enumeration draws its streams from these seeds
 const SCATTER_SEEDS: &[u64] = &[1, 42];
 
 /// Segment size that rolls a few times over a short stream
@@ -75,31 +62,28 @@ const SEGMENT_TIGHT: u64 = 24 * 1024;
 /// Payload bytes that fill a small segment in three records, so a short stream seals often
 const SEAL_PAYLOAD: usize = 5_000;
 
-/// First op position the sync error search schedules at
+/// The sync error search starts at this op position
 const SYNC_ERROR_FROM: u64 = 4;
 
-/// Last op position the sync error search schedules at
+/// The sync error search ends at this op position
 const SYNC_ERROR_TO: u64 = 20;
 
-/// First op position the out of space fault is scheduled at
+/// The out of space fault starts at this op position
 const ENOSPC_FROM: u64 = 12;
 
-/// Last op position the out of space fault is scheduled at
+/// The out of space fault ends at this op position
 const ENOSPC_TO: u64 = 28;
 
 /// Overwrites of one key for the multi tail stream
 const OVERWRITE_COUNT: u8 = 6;
 
-/// Payload length every version of the multi tail key carries
+/// Payload length of every version of the multi tail key
 const SAME_KEY_LEN: usize = 200;
 
 /// Segment size that holds several compaction records before it rolls
-///
-/// The fill records plus the segment header reach this size, so the first overwrite is
-/// what rolls the segment, leaving it half shadowed and worth compacting.
 const COMPACT_SEG_BYTES: u64 = 20 * 1024;
 
-/// Payload length each compaction record carries
+/// Payload length of each compaction record
 const COMPACT_PAYLOAD: usize = 3000;
 
 /// Records written into the compaction source segment before overwrites
@@ -108,10 +92,10 @@ const COMPACT_FILL: u8 = 4;
 /// The merge stream rolls a segment of this size, about one round of its keys
 const MERGE_SEG_BYTES: u64 = 20 * 1024;
 
-/// Keys the merge stream writes per round
+/// The merge stream writes this many keys per round
 const MERGE_KEYS: u8 = 6;
 
-/// Payload each of those keys carries
+/// Payload length of each merge key
 const MERGE_PAYLOAD: usize = 3000;
 
 /// Rounds over every key before the delete, a sealed segment each, past the merge depth
@@ -120,13 +104,13 @@ const MERGE_ROUNDS: u8 = 12;
 /// Rounds over the kept keys after the delete, enough to seal the segment holding it
 const MERGE_AFTER_ROUNDS: u8 = 2;
 
-/// The key the merge stream deletes, which is the resurrection gate
+/// The key the merge stream deletes, which must stay deleted
 const MERGE_DELETED: u8 = 3;
 
 /// The keys that must still read back after a crash inside the merge
 const MERGE_KEPT: &[u8] = &[1, 2, 4, 5, 6];
 
-/// Keys the sub group range delete stream writes before it deletes
+/// The sub group range delete stream writes this many keys first
 const RANGE_KEYS: u8 = 9;
 
 /// First address the sub group range delete covers
@@ -135,11 +119,7 @@ const RANGE_LO: u8 = 3;
 /// First address past the sub group range delete
 const RANGE_HI: u8 = 7;
 
-/// Sector sizes a scattered crash is replayed at
-///
-/// At block size a hole takes a whole aligned block, so a header and whatever packs in
-/// behind it go together. The smaller size is where the model gets stronger than a torn
-/// prefix: a hole can drop a payload while keeping its header, or land inside a payload.
+/// A scattered crash replays at each of these sector sizes
 const SCATTER_SECTORS: [u32; 2] = [512, 4096];
 
 fn crash_config(active_tails: u32, sync: SyncPolicy, segment_bytes: u64) -> ReelConfig {
@@ -203,7 +183,7 @@ fn every_boundary_multi_tail() {
     }
 }
 
-// under the never policy a crash keeps or drops the last records, both consistent
+// under `SyncPolicy::Never` a crash keeps or drops the last records, both consistent
 #[test]
 fn every_boundary_never() {
     for seed in CRASH_SEEDS {
@@ -218,9 +198,6 @@ fn every_boundary_never() {
 }
 
 // every crash boundary reproduces the acknowledged prefix when sectors scatter
-//
-// A device does not lose a clean suffix: what it had not committed comes back in
-// whatever order it scheduled, so the image can hold a fresh sector after a stale one.
 #[test]
 fn scattered_crash_keeps_the_durable_prefix() {
     for (seed, sector) in seeds_and_sectors() {
@@ -249,9 +226,6 @@ fn scattered_crash_keeps_the_durable_prefix() {
 }
 
 // a scattered crash with the hot path unsynced still reopens self consistent
-//
-// Nothing was promised durable here, so records may be missing in any pattern. What may
-// not happen is the reel disagreeing with itself about what it serves.
 #[test]
 fn scattered_crash_stays_consistent() {
     for (seed, sector) in seeds_and_sectors() {
@@ -277,20 +251,14 @@ fn scattered_crash_stays_consistent() {
     }
 }
 
-// on a sole copy no crash schedule leaves a footer naming unlanded bytes
-//
-// The peerless seal syncs the records before the footer that speaks for them. With
-// peers a resolved key whose bytes never landed is a checksum miss that enqueues a
-// repair; on a sole copy it would be silent loss.
+// on a sole copy no crash schedule leaves a footer pointing at bytes that never landed
 #[test]
 fn a_sole_copy_footer_never_outlives_its_records() {
-    // Each record rolls the tight segment, so the stream crosses several seals. A stream
-    // that never seals makes this sweep pass for any ordering at all.
+    // Each record rolls the tight segment, so the stream crosses several seals
     let ops: Vec<StreamOp> = (1..=5u8)
         .map(|address| put(GROUP, address, LARGE_PAYLOAD, address))
         .collect();
-    // One seed, both sectors: the schedule variety here is the sector size and the
-    // per-file scatter hash.
+    // One seed at both sector sizes
     for (seed, sector) in seeds_and_sectors().into_iter().take(SCATTER_SECTORS.len()) {
         let sole = ReelConfig {
             verify_reads: true,
@@ -446,11 +414,7 @@ fn scattered_crash_multi_tail() {
     }
 }
 
-// a hole inside a record is rejected rather than served with the bytes that survived
-//
-// A payload spanning many sectors keeps a header that still describes its record while
-// the bytes behind it are only partly committed. Nothing structural says that record is
-// bad, so recovery has to reject it on its checksum.
+// a record with a hole inside it is rejected on its checksum
 #[test]
 fn scattered_hole_inside_a_record_is_rejected() {
     let ops: Vec<StreamOp> = (1..=4u8)
@@ -479,12 +443,9 @@ fn scattered_hole_inside_a_record_is_rejected() {
 }
 
 // every crash boundary of a sub group range delete leaves each key whole or gone
-//
-// A range inside a group walks the keys and appends a tombstone for each, so a crash
-// lands between tombstones and half applies the delete, which is allowed.
 #[test]
 fn every_boundary_of_a_sub_group_range_delete() {
-    // A fixed stream rather than a generated one, so a seed only names the plan.
+    // A fixed stream, so the seed only drives the fault plan
     let ops = sub_range_stream();
     let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, SEGMENT_LARGE));
     let total = harness.boundary_count(&ops);
@@ -513,10 +474,7 @@ fn sub_range_stream() -> Vec<StreamOp> {
     ops
 }
 
-// Assert the keys the range never covered are untouched by however far it got
-//
-// Only the puts that acknowledged before the crash are expected at all, since under
-// this policy an acknowledged put is a durable one and the rest never happened.
+// Assert the keys outside the range survive, for each put acknowledged before the crash
 fn assert_outside_the_range_survives(reopened: &ReelStore, acknowledged: usize, context: u64) {
     for byte in 0..RANGE_KEYS {
         if (RANGE_LO..RANGE_HI).contains(&byte) || usize::from(byte) >= acknowledged {
@@ -534,8 +492,7 @@ fn assert_outside_the_range_survives(reopened: &ReelStore, acknowledged: usize, 
 // a sync error rejects the put and keeps every acknowledged record consistent
 #[test]
 fn sync_error() {
-    // The op a sync lands on moves whenever the open sequence changes, so the scheduled
-    // position is searched for rather than pinned.
+    // The op a sync lands on shifts with the open sequence, so the fault position is searched
     let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, SEGMENT_LARGE));
     let mut proven = false;
 
@@ -609,10 +566,10 @@ fn enospc_append() {
     }
 }
 
-/// Addresses the batch that survives every torn-batch arm carries
+/// The batch at these addresses survives every torn-batch arm
 const KEPT_BATCH: &[u8] = &[1, 2, 3];
 
-/// Addresses the batch that is torn in every torn-batch arm
+/// The batch at these addresses tears in every torn-batch arm
 const TORN_BATCH: &[u8] = &[4, 5, 6];
 
 /// Address of the point write standing between the two batches
@@ -642,8 +599,7 @@ fn a_torn_batch_leaves_nothing_of_itself() {
             .expect("the batch that tears");
         store.flush().expect("flush");
 
-        // Taken with the store still open, so the tail is unsealed and is walked back
-        // rather than read from a footer.
+        // The image is taken with the store open, so recovery walks the unsealed tail
         let mut image = sim.durable_image();
         cut_the_last_batch(&mut image, tear);
         let reopened = harness.reopen(image);
@@ -668,10 +624,7 @@ fn a_torn_batch_leaves_nothing_of_itself() {
     }
 }
 
-// a torn batch carrying a range delete applies neither the range nor its puts
-//
-// The range is a record of the run like any other, so the crash that drops the run
-// drops the delete with it and the keys it covered are still there.
+// a torn batch holding a range delete applies neither the range nor its puts
 #[test]
 fn a_torn_range_batch_applies_neither_half() {
     for tear in [Tear::FirstRecord, Tear::MidBatch, Tear::LastRecord] {
@@ -711,7 +664,7 @@ fn a_torn_range_batch_applies_neither_half() {
     }
 }
 
-/// The puts one batch carries, one small record an address
+/// One small put per address, as one batch's writes
 fn puts(addresses: &[u8]) -> Vec<RecordWrite> {
     addresses
         .iter()
@@ -722,7 +675,7 @@ fn puts(addresses: &[u8]) -> Vec<RecordWrite> {
         .collect()
 }
 
-/// The record key one address of the test group is addressed by
+/// The record key for one address in the test group
 fn address_key(address: u8) -> RecordKey {
     RecordKey::from_bytes(RECORDS, &wire_key(GROUP, address)).expect("key")
 }
@@ -993,10 +946,6 @@ fn assert_merged_answers(store: &ReelStore, crash_at: u64) {
 }
 
 // Assert every record the reopened reel serves is a version the stream actually wrote
-//
-// A crash may drop any record, so what survives is not fixed, but a surviving record is
-// one that was written. The counters agree with a scan either way and a damaged record
-// is still internally consistent, so this is the only check that catches one.
 fn assert_only_written_values(reopened: &ReelStore, ops: &[StreamOp], context: u64) {
     let mut written: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>> = BTreeMap::new();
     for op in ops {
@@ -1086,8 +1035,7 @@ fn redrop_group(store: &ReelStore) {
     let start = group_prefix(7);
     let end = group_prefix(8);
     Store::delete_range(store, RECORDS_CF, &start, &end).expect("re drop records");
-    // The counters converge at the sweep the maintenance tick runs, so the recount that
-    // follows checks the sweep's own accounting.
+    // The counters converge at the tick's sweep, so the recount checks the sweep's accounting
     while store.sweep_covers().expect("sweep") {}
 }
 
@@ -1102,10 +1050,6 @@ fn get(store: &ReelStore, address: u8) -> Option<Vec<u8>> {
 }
 
 // Assert the reopened reel reproduces the acknowledged prefix on every untouched key
-//
-// A memory store replays the ops that acknowledged before the crash, which under a
-// synced policy are exactly the durable ones. The op that crashed is excluded, since its
-// effect may or may not have reached the durable image.
 fn assert_durable_prefix(
     reopened: &ReelStore,
     ops: &[StreamOp],

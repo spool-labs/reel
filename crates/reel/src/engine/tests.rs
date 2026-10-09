@@ -31,7 +31,7 @@ use crate::sync::tension::block_on;
 /// A sync on every write, for tests that need each one durable
 const EVERY_WRITE: SyncPolicy = SyncPolicy::Bytes(ByteCount::from_bytes(0));
 
-/// Virtual volume root the simulator files live under
+/// The simulator's files live under this root
 const ROOT: &str = "/bulk";
 
 const RECORD: ColumnId = ColumnId(1);
@@ -151,9 +151,6 @@ fn coded_store(config: ReelConfig) -> (ReelStore, SimIo) {
 }
 
 /// Run work with a thread draining the simulator behind it
-///
-/// The simulator neither answers at submission nor files from a thread of its
-/// own, so a pending read lands only when somebody drains it.
 fn reaping<Out>(store: &ReelStore, work: impl FnOnce() -> Out) -> Out {
     let is_done = AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -170,10 +167,7 @@ fn reaping<Out>(store: &ReelStore, work: impl FnOnce() -> Out) -> Out {
     })
 }
 
-/// A store over a real directory and a backend that services ops in place
-///
-/// The directory comes back with it, since a temporary one dropped early
-/// takes the volume with it.
+/// A store over a real temp directory and a backend that services ops in place
 fn posix_store(config: ReelConfig) -> (ReelStore, Arc<PosixBackend>, TempDir) {
     let dir = tempdir().expect("tempdir");
     let backend = Arc::new(PosixBackend::new());
@@ -206,8 +200,7 @@ fn a_paged_column_reads_from_its_footer() {
     for byte in 0..200u8 {
         store.put(&record(7, byte), &payload).expect("put");
     }
-    // The seal runs on the sealer thread and the flush is what drains it, so the
-    // handover below is asserted against a seal that has finished.
+    // The flush drains the sealer thread, so the handover below sees a finished seal
     store.flush().expect("flush");
     let sealed = store.page_out_sealed().expect("page out");
     assert!(
@@ -335,7 +328,7 @@ fn spot_answers_sealed_keys() {
     check(&reopened, &expected, "a reopen");
 }
 
-// every read the spot index answers costs one device read a key, a deep window two in one submission
+// each spot index read costs one device read a key, a deep window two in one submission
 #[test]
 fn spot_reads_take_one_read_a_key() {
     let (store, sim) = sim_store(config(1, SyncPolicy::Never));
@@ -391,7 +384,7 @@ fn spot_reads_take_one_read_a_key() {
     );
 }
 
-// compaction gives each overwrite booked from its length class its true length back as the segment retires
+// compaction rebooks each class-booked overwrite at its true length as the segment retires
 #[test]
 fn compaction_rebooks_class_bookings_at_their_true_length() {
     let (store, _sim) = sim_store(ReelConfig {
@@ -436,7 +429,7 @@ fn compaction_rebooks_class_bookings_at_their_true_length() {
     );
 }
 
-// a cue read of a key unchanged since the cue takes one read, and one rewritten since reads the footers
+// a cue read of a key unchanged since the cue takes one read, a rewritten one reads the footers
 #[test]
 fn a_cue_read_takes_one_read_while_the_key_stands() {
     let (store, sim) = sim_store(config(1, SyncPolicy::Never));
@@ -487,7 +480,7 @@ fn a_cue_read_takes_one_read_while_the_key_stands() {
     }
 }
 
-// a retire leaves the spot index's entries in segments an open rebuilt, which wear no incarnation yet
+// a retire keeps the spot index's entries in rebuilt segments, which have no incarnation yet
 #[test]
 fn spot_keeps_rebuilt_segments_through_a_retire() {
     let paged = ReelConfig {
@@ -582,7 +575,7 @@ fn spot_takes_ranges_and_prefix_counts() {
     check(&reopened, "a reopen");
 }
 
-// a sealed segment's ceiling covers its tombstone rows and not only its records
+// a sealed segment's ceiling covers its tombstone rows as well as its records
 #[test]
 fn a_ceiling_covers_a_tombstone() {
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
@@ -641,8 +634,7 @@ fn a_handover_never_names_a_retired_segment() {
     let retired = store.reel.tails()[0].seal().expect("seal");
     store.flush().expect("flush");
 
-    // Named and queued, which is the state the retire raced: the segment is
-    // in the search, and its number is still sitting on the handover queue.
+    // Noted and queued: the segment is in the search and still on the handover queue
     store.hold_sealed().expect("name the sealed segment");
 
     // Everything it holds is written again, so the pass takes it whole.
@@ -691,8 +683,7 @@ fn a_pass_leaves_an_unnamed_segment_alone() {
     }
     store.flush().expect("flush");
 
-    // Wholly dead by the counters and named by nothing. The selection is asked
-    // directly, since a whole pass would settle the queue before it picked.
+    // Ask the selection directly, since a whole pass would settle the queue first
     let picked = store
         .compactor
         .select_whole_dead(&store.reel, &store.index, None);
@@ -738,8 +729,7 @@ fn a_second_caller_cannot_take_a_held_segment() {
     // The footer is in hand and the spans are not down
     script.await_reached("seal/spans", 1);
 
-    // The second caller, which is what a read behind a fresh seal is. It must
-    // come away with nothing rather than with the segment somebody is holding.
+    // A second caller, like a read behind a fresh seal, must leave the held segment alone
     store.hold_sealed().expect("second caller");
     assert!(
         store.reel.shared().pending_seals().contains(&sealed),
@@ -793,7 +783,7 @@ fn naming_a_seal_reads_no_footer() {
     store.reel.shared().footers.forget(first);
     store.reel.shared().footers.forget(second);
 
-    // Every read fails, so reading a footer back would fail the pass or leave a segment out of the candidates
+    // Every read fails, so reading a footer back would fail the pass or drop a candidate
     sim.arm_next_ops(64, FaultKind::ReadError);
     let outcome = store.page_out_sealed();
     sim.disarm();
@@ -859,8 +849,7 @@ fn a_failed_seal_is_retried_on_the_tick() {
     for byte in 0..64u8 {
         store.put(&record(7, byte), &payload).expect("put");
     }
-    // Nothing flushed: the records are acknowledged and cached, which is
-    // what makes a failed seal cost a past-saving count.
+    // Nothing is flushed, so the records are only cached and a failed seal counts past saving
 
     // Every sync the seal takes fails, so the footer cannot be answered for.
     let sealing = store.reel.tails()[0].tail().active_segment();
@@ -889,8 +878,7 @@ fn a_failed_seal_is_retried_on_the_tick() {
         .flush()
         .expect("a volume with every seal down flushes clean");
 
-    // And the segment is a real sealed segment: a paged reopen resolves its
-    // keys through the footer the retry wrote.
+    // A paged reopen resolves the segment's keys through the footer the retry wrote
     let image = sim.durable_image();
     drop(store);
     let paged = reopen_image(image, config(1, SyncPolicy::Never));
@@ -940,7 +928,7 @@ fn a_footerless_segment_is_not_offered_to_compaction() {
     );
 }
 
-// a walked tail's overwrites reach the sealed split at open, not at the scrub
+// a walked tail's overwrites reach the sealed split at open, before any scrub
 #[test]
 fn a_walked_tail_settles_the_sealed_split() {
     let settings = config(1, SyncPolicy::Never);
@@ -957,8 +945,7 @@ fn a_walked_tail_settles_the_sealed_split() {
         "nothing sealed, so there is no tally to settle"
     );
 
-    // Rewrite a few of the sealed keys. These land in the open tail, after
-    // every seal, which is the shadowing no tally can carry.
+    // Rewrites land in the open tail after every seal, which no tally can account for
     for byte in 0..20u8 {
         store.put(&record(7, byte), &payload).expect("rewrite");
     }
@@ -987,7 +974,7 @@ fn a_walked_tail_settles_the_sealed_split() {
     );
 }
 
-// the tally carries the split through a paged open, and the scrub finishes it
+// the tally keeps the split through a paged open, and the scrub finishes it
 #[test]
 fn a_paged_open_recovers_its_split_from_the_tally() {
     let settings = ReelConfig {
@@ -1032,8 +1019,7 @@ fn a_paged_open_recovers_its_split_from_the_tally() {
         "the tally claimed {dead_at_open} dead against the {dead_when_written} actually booked"
     );
 
-    // Sweep the volume. The scrub earns its budget from the clock, so a pass
-    // taken the instant a volume opens has almost nothing to spend.
+    // The scrub earns its budget from the clock, so sleep between passes
     for _ in 0..64 {
         std::thread::sleep(Duration::from_millis(20));
         paged.scrub_once().expect("scrub");
@@ -1058,12 +1044,11 @@ fn a_paged_open_recovers_its_split_from_the_tally() {
     );
 }
 
-// a paged read reaches its key through blocks rather than the whole footer
+// a paged read reaches its key through blocks, skipping the whole footer
 #[test]
 fn a_paged_read_reads_blocks_not_footers() {
     let paged = ReelConfig {
-        // Small segments against small records, so each footer holds thousands
-        // of rows and a block is a fraction of one.
+        // Small segments and small records, so each footer holds thousands of rows
         segment_bytes: ByteCount::from_bytes(256 * 1024),
         ..config(1, SyncPolicy::Never)
     };
@@ -1090,8 +1075,7 @@ fn a_paged_read_reads_blocks_not_footers() {
         .collect();
     assert!(!handed.is_empty(), "some keys went to their footer");
 
-    // What one pass of the footers weighs, which is what answering a single key
-    // costs without the blocks.
+    // One pass of the footers, the cost of answering a key without the blocks
     let footers: usize = store
         .index
         .segments_snapshot()
@@ -1107,8 +1091,7 @@ fn a_paged_read_reads_blocks_not_footers() {
         .sum();
     assert!(footers > 0, "the sealed segments carry footers");
 
-    // Resolving a key rather than reading it, so what this counts is the index
-    // and not the record behind it. The cache starts empty either way.
+    // Resolve keys without reading records, so this counts only the index, from an empty cache
     store.reel.shared().footers.clear();
     let before = sim.read_bytes();
     for key in handed.iter().take(16) {
@@ -1116,8 +1099,7 @@ fn a_paged_read_reads_blocks_not_footers() {
     }
     let through_blocks = sim.read_bytes() - before;
 
-    // A quarter, not merely less: parsing whole footers also comes in under one
-    // pass once the cache holds them, so a bound of one pass would pin nothing.
+    // Bound at a quarter, since cached whole footers also come in under one pass
     assert!(
         through_blocks * 4 < footers as u64,
         "16 resolves through blocks cost {through_blocks} bytes against {footers} for one pass of the footers"
@@ -1127,8 +1109,7 @@ fn a_paged_read_reads_blocks_not_footers() {
 // the footers, the directories and the blocks answer for one bound between them
 #[test]
 fn footer_pools_share_one_bound() {
-    // A bound every pool has more than enough sealed state to fill on its own, so
-    // pools each held to the whole of it would keep a multiple of what was asked for.
+    // Each pool alone could fill this bound, so separate bounds would hold a multiple of it
     let knob = ByteCount::from_bytes(24 * 1024);
     let paged = ReelConfig {
         footer_cache: knob,
@@ -1156,7 +1137,7 @@ fn footer_pools_share_one_bound() {
         .collect();
     assert!(!handed.is_empty(), "some keys went to their footer");
 
-    // Clear the cache and resolve at a snapshot, since a parsed footer or the spot index would skip the blocks
+    // Clear the cache and resolve at a snapshot, so no parsed footer or spot index skips the blocks
     store.reel.shared().footers.clear();
     for key in &handed {
         let found = store.index.get_at(key, Lsn(u64::MAX)).expect("resolve");
@@ -1232,7 +1213,7 @@ fn a_fresh_key_skips_the_sealed_search() {
     assert!(reopened.get(&sealed).expect("get").is_some());
 }
 
-// the same resolve on a packed partition reads restart cuts, not the partition
+// the same resolve on a packed partition reads only its restart cuts
 #[test]
 fn a_paged_read_of_packed_rows_reads_cuts() {
     let paged = ReelConfig {
@@ -1270,8 +1251,7 @@ fn a_paged_read_of_packed_rows_reads_cuts() {
         .collect();
     assert!(!handed.is_empty(), "some keys went to their footer");
 
-    // What the partitions weigh on disk, which is what answering one key costs
-    // without the cuts.
+    // The packed partitions' size on disk, the cost of answering a key without the cuts
     let packed: u64 = store
         .index
         .segments_snapshot()
@@ -1301,12 +1281,12 @@ fn a_paged_read_of_packed_rows_reads_cuts() {
     );
 }
 
-// compaction leaves what it rewrote sorted on disk, not in the order it found it
+// compaction writes what it rewrote in key order on disk
 #[test]
 fn compaction_leaves_its_output_in_key_order() {
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
 
-    // Written in an order that is not key order, which is the case that matters.
+    // Write out of key order, which is the case that matters
     let payload = vec![0xa5u8; 8 * 1024];
     let mut wrote: Vec<u8> = (0..120u8).collect();
     wrote.rotate_left(37);
@@ -1320,8 +1300,7 @@ fn compaction_leaves_its_output_in_key_order() {
     store.reel.tails()[0].seal().expect("seal");
     store.flush().expect("flush");
 
-    // Which segments existed before the pass, so the check below looks only at
-    // what compaction wrote.
+    // Note the segments before the pass, so the check below sees only compaction's output
     let existing: std::collections::HashSet<SegmentId> = store
         .index
         .segments_snapshot()
@@ -1341,8 +1320,7 @@ fn compaction_leaves_its_output_in_key_order() {
         "nothing was rewritten, so this proves nothing"
     );
 
-    // Where every surviving key now sits, grouped by the segment holding it,
-    // since an offset only means anything inside its own file.
+    // Group every surviving key's offset by segment, since offsets compare only within a file
     let mut placed: std::collections::HashMap<SegmentId, Vec<(u8, u32)>> =
         std::collections::HashMap::new();
     for byte in 0..120u8 {
@@ -1386,8 +1364,7 @@ fn paging_out_keeps_the_count() {
     for byte in 0..200u8 {
         store.put(&record(7, byte), &payload).expect("put");
     }
-    // A roll hands its segment to the sealer thread and returns, so without this
-    // there is nothing sealed to page out yet.
+    // The flush drains the sealer thread, so there is something sealed to page out
     store.flush().expect("flush");
     let before = store.totals();
 
@@ -1397,17 +1374,13 @@ fn paging_out_keeps_the_count() {
 }
 
 /// A paged volume holding one filled group, and one key it has handed over
-///
-/// The segment is a megabyte against 8 KiB records, so the tail rolls partway
-/// through and the keys of what it sealed go to their footer.
 fn paged_fixture(payload: &[u8]) -> (ReelStore, RecordKey) {
     let paged = config(1, SyncPolicy::Never);
     let (store, _sim) = sim_store(paged);
     for byte in 0..200u8 {
         store.put(&record(7, byte), payload).expect("put");
     }
-    // The roll seals on the sealer thread, so a handover asked for the instant
-    // the last put returns can find nothing sealed yet.
+    // The roll seals on the sealer thread, so flush before asking for the handover
     store.flush().expect("flush");
     assert!(store.page_out_sealed().expect("page out") > 0);
 
@@ -1484,7 +1457,7 @@ fn a_paged_delete_settles_its_record() {
     assert_eq!(played(&store, RECORD).len(), 199, "the playback agrees");
 }
 
-// overwriting a key a footer answers for is one key, not two
+// overwriting a key a footer answers for leaves one key
 #[test]
 fn a_paged_overwrite_replaces_rather_than_adds() {
     let payload = vec![0xa5u8; 8 * 1024];
@@ -1579,7 +1552,7 @@ fn a_tick_keeps_a_grave_inside_the_window() {
     );
 }
 
-// ingest heat is a rate over the ask interval, not a point sample
+// ingest heat is a rate over the ask interval
 #[test]
 fn ingest_heat_is_a_rate_not_a_point_sample() {
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
@@ -1611,8 +1584,7 @@ fn paged_image(payload: &[u8], settings: ReelConfig) -> (ReelStore, SimIo, Recor
     for byte in 0..200u8 {
         store.put(&record(7, byte), payload).expect("put");
     }
-    // The roll seals on the sealer thread, so a handover asked for the instant
-    // the last put returns can find nothing sealed yet.
+    // The roll seals on the sealer thread, so flush before asking for the handover
     store.flush().expect("flush");
     assert!(store.page_out_sealed().expect("page out") > 0);
     let handed = (0..200u8)
@@ -2176,8 +2148,7 @@ fn a_volume_records_its_sealed_spans() {
         store.put(&record(7, byte), &payload).expect("put");
     }
 
-    // Drain the sealer, whose thread is what records the spans, so the
-    // assertions below race nothing.
+    // Drain the sealer thread, which records the spans, so the asserts below race nothing
     store.flush().expect("flush");
     assert!(
         store.page_out_sealed().expect("page out") > 0,
@@ -2267,7 +2238,7 @@ fn a_slow_scrub_does_not_starve_the_handover() {
                 let scrubbed = store.compaction_counters().scrub_bytes - before;
                 let took = started.elapsed();
                 ticks.push((took, scrubbed));
-                // one long tick is the failure, and the ones after it only grow
+                // One long tick is the failure, and the ones after it only grow
                 if took > LONG_TICK {
                     break;
                 }
@@ -2360,8 +2331,7 @@ fn a_segment_of_only_tombstones_is_accounted_for() {
         .map(|(segment, _)| segment)
         .collect();
 
-    // Now delete every one of them. The tombstones land in the fresh tail,
-    // which holds nothing else.
+    // Delete every key, so the fresh tail holds only tombstones
     for byte in 0..200u8 {
         store.delete(&record(7, byte)).expect("delete");
     }
@@ -2383,8 +2353,7 @@ fn a_segment_of_only_tombstones_is_accounted_for() {
             bytes.total() > 0,
             "and the row counts the space they hold, not zero"
         );
-        // Not yet reclaimable: the records these tombstones shadow are still on
-        // disk in the sealed segments, so dropping them would resurrect those.
+        // Dropping these tombstones now would resurrect the sealed records they shadow
         assert_eq!(
             bytes.droppable(store.index.min_lsn_excluding(segment)),
             0,
@@ -2392,13 +2361,11 @@ fn a_segment_of_only_tombstones_is_accounted_for() {
         );
     }
 
-    // Seal the tombstones' own segment, so it is a candidate rather than the
-    // open tail the compactor skips.
+    // Seal the tombstones' segment, since the compactor skips the open tail
     store.reel.tails()[0].seal().expect("seal");
     store.flush().expect("flush");
 
-    // Compact until nothing more moves. The sealed data segments retire, and
-    // once they are gone the tombstones have nothing left to shadow.
+    // Compact until nothing moves, so the data segments retire and the tombstones follow
     for _ in 0..16 {
         let before = store.compaction_counters();
         store.compact_once().expect("compact");
@@ -2408,8 +2375,7 @@ fn a_segment_of_only_tombstones_is_accounted_for() {
         }
     }
 
-    // Nothing at all is left. Ranking on dead alone leaves the tombstone segment
-    // at a fraction of zero forever, so it is never chosen.
+    // Nothing is left, including the tombstone segment that ranking on dead alone never picks
     let left = store.index.segments_snapshot();
     assert!(
         left.iter().all(|(_, bytes)| bytes.total() == 0),
@@ -2417,7 +2383,7 @@ fn a_segment_of_only_tombstones_is_accounted_for() {
     );
 }
 
-// a compaction pass under way turns a second caller away rather than queueing it
+// a compaction pass under way turns a second caller away at once
 #[test]
 fn a_running_pass_turns_the_next_caller_away() {
     let script = crate::sync::rendezvous::script();
@@ -2437,8 +2403,7 @@ fn a_running_pass_turns_the_next_caller_away() {
     let turned_away = AtomicU64::new(0);
     let is_stopped = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        // The winner cannot finish a pass while the point is held, so a Held here
-        // is the guard turning a caller away rather than a charged gate.
+        // The winner can't finish while the point is held, so a Held here comes from the guard
         let racers: Vec<_> = (0..2)
             .map(|_| {
                 let store = &store;
@@ -2561,7 +2526,7 @@ fn a_full_volume_refuses_a_foreground_write() {
         .put(&record(3, 1), &[0xa1; 128])
         .expect("put under the ceiling");
 
-    // Standing where the last tick left it far past any ceiling refuses.
+    // A footprint far past any ceiling refuses the write
     store.footprint.store(u64::MAX / 2, Ordering::Relaxed);
     let refused = store.put(&record(3, 2), &[0xa2; 128]);
 
@@ -2588,8 +2553,7 @@ fn a_filling_volume_is_slowed_before_it_is_refused() {
     .expect("open");
 
     let Some(ceiling) = store.compactor.pressure().foreground_ceiling_bytes() else {
-        // Nothing could say how large the disk is, which leaves the model
-        // unbounded and both halves of the door open.
+        // With no disk size the model is unbounded and both halves of the door stay open
         println!("skipped: this filesystem does not report a capacity");
         return;
     };
@@ -2600,8 +2564,7 @@ fn a_filling_volume_is_slowed_before_it_is_refused() {
     store.apply_footprint(0);
     assert_eq!(budget.effective_ceiling(), configured);
 
-    // Deep in the band the budget is squeezed, and the write still lands:
-    // that is the whole difference between this door and the one above.
+    // Deep in the band the budget is squeezed, and the write still lands
     store.apply_footprint(ceiling - 4096);
     let squeezed = budget.effective_ceiling();
     assert!(
@@ -2633,7 +2596,7 @@ fn a_real_volume_reads_the_machine_and_a_simulated_one_does_not() {
         facts.volume_capacity_bytes.unwrap_or(0) > 0,
         "a mounted filesystem has a capacity",
     );
-    // Whatever the ratio says, the pass reaches a plane rather than nothing.
+    // Whatever the ratio says, the pass reaches some plane
     let _ = facts.verdict().plane;
 
     let (simulated, _sim) = sim_store(config(1, SyncPolicy::Never));
@@ -2896,7 +2859,7 @@ fn async_get_many_in_order() {
 // an awaited read dropped mid flight puts its slot and its buffer back
 #[test]
 fn a_dropped_get_leaks_nothing() {
-    // Refused, so the futures stay pending: the premise here is the passive path.
+    // Refuse the self-drain, so the futures stay pending on the passive path
     let script = crate::sync::rendezvous::script();
     script.refuse("slots/self-drain");
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
@@ -2927,7 +2890,7 @@ fn a_dropped_get_leaks_nothing() {
 // an awaited batch dropped mid flight orphans every read it had in flight
 #[test]
 fn a_dropped_get_many_leaks_nothing() {
-    // Refused, so the futures stay pending: the premise here is the passive path.
+    // Refuse the self-drain, so the futures stay pending on the passive path
     let script = crate::sync::rendezvous::script();
     script.refuse("slots/self-drain");
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
@@ -2978,7 +2941,7 @@ fn a_range_matches_the_read() {
     assert_eq!(&*deep, &payload[20_000..24_000]);
 }
 
-// a window starting at or past the end answers no bytes rather than nothing
+// a window starting at or past the end answers an empty value
 #[test]
 fn a_range_at_the_end() {
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
@@ -3017,8 +2980,7 @@ fn a_raw_record_in_a_coded_column_ranges() {
     let payload = noise(64 * 1024);
     store.put(&coded(2), &payload).expect("put");
 
-    // The guard the case rests on: a record the codec kept would be served by the
-    // whole read and say nothing about the ranged path.
+    // The record must be stored raw, or the whole read serves it and the ranged path goes untested
     assert_eq!(
         stored_bytes(&store, CODED),
         payload.len() as u64,
@@ -3059,8 +3021,7 @@ fn a_coded_column_answers_a_window() {
     let payload = stripes(4096);
     store.put(&coded(1), &payload).expect("put");
 
-    // The same guard the other way: this record has to have shrunk, or the window
-    // never reaches the decode.
+    // The record must have shrunk, or the window never reaches the decode
     assert!(
         stored_bytes(&store, CODED) < payload.len() as u64,
         "the codec kept nothing"
@@ -3136,7 +3097,7 @@ fn async_range_matches_the_block() {
 // an awaited window dropped mid flight puts its slots and its buffers back
 #[test]
 fn a_dropped_range_leaks_nothing() {
-    // Refused, so the futures stay pending: the premise here is the passive path.
+    // Refuse the self-drain, so the futures stay pending on the passive path
     let script = crate::sync::rendezvous::script();
     script.refuse("slots/self-drain");
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
@@ -3334,7 +3295,7 @@ fn a_moved_range_converges() {
     assert_eq!(found, awaited);
 }
 
-// a new record at an old offset is never served as the record the entry named
+// a new record at an old offset is never served as the entry's record
 #[test]
 fn a_reused_offset_serves_nobody() {
     use std::os::unix::fs::FileExt;
@@ -3345,8 +3306,7 @@ fn a_reused_offset_serves_nobody() {
     store.flush().expect("flush");
     let entry = store.index.get(&key).expect("read").expect("present");
 
-    // A second volume lays out an identical segment holding another record,
-    // which is what the offset would hold if the space were ever reused.
+    // A second volume lays out the same segment with another record, as reused space would
     let (other, _other_backend, other_dir) = posix_store(config(1, SyncPolicy::Never));
     let reused = vec![0xb7u8; 4096];
     other.put(&blob(2), &reused).expect("put");
@@ -3368,8 +3328,7 @@ fn a_reused_offset_serves_nobody() {
     source
         .read_exact_at(&mut framed, u64::from(planted.loc.offset))
         .expect("read framed");
-    // Reuse begins by dropping the incarnation, which is the contract the
-    // fast path stands on, and only then do the bytes change under the entry.
+    // Reuse drops the incarnation before the bytes change, which the fast path relies on
     store.index.segments().forget(entry.loc.segment);
     let target = std::fs::OpenOptions::new()
         .write(true)
@@ -3390,7 +3349,7 @@ fn a_reused_offset_serves_nobody() {
     );
 }
 
-// a record wider than a segment is refused, not retried for ever
+// a record wider than a segment is refused without a retry
 #[test]
 fn a_record_wider_than_a_segment_is_refused() {
     // The shared fixture's segment is a megabyte.
@@ -3405,8 +3364,7 @@ fn a_record_wider_than_a_segment_is_refused() {
         "an oversize record failed as {refused} rather than as a rejection",
     );
 
-    // The volume is still usable, which is what says the refusal happened before
-    // anything was reserved rather than after a segment was spent on it.
+    // The volume still takes writes, so the refusal came before anything was reserved
     let small = stripes(1024);
     store
         .put(&record(7, 2), &small)
@@ -3416,8 +3374,6 @@ fn a_record_wider_than_a_segment_is_refused() {
 }
 
 /// Drop a segment's pages, so a read of it is genuinely cold
-///
-/// posix_fadvise needs no privilege, so a test can make a cold read as itself.
 #[cfg(target_os = "linux")]
 fn drop_cache(store: &ReelStore, key: &RecordKey) {
     use std::os::fd::AsRawFd;
@@ -3425,8 +3381,7 @@ fn drop_cache(store: &ReelStore, key: &RecordKey) {
     let entry = store.index.get(key).expect("read").expect("present");
     let path = store.reel.shared().segment_path(entry.loc.segment);
     let file = std::fs::File::open(&path).expect("open the segment");
-    // SAFETY: the descriptor is open for the whole call and fadvise takes no
-    // pointer, so the only thing it can touch is the kernel's page state.
+    // SAFETY: the descriptor stays open for the call and fadvise takes no pointer
     let ret = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
     assert_eq!(ret, 0, "dropping the segment's pages failed");
 }
@@ -3454,7 +3409,7 @@ fn a_posix_read_answers_at_once() {
     assert_eq!(store.driver.outstanding(), 0);
 }
 
-// the awaited door copies an open tail's record out of its mapping and asks the cache for a sealed one
+// the awaited door maps an open tail's record and asks the cache for a sealed one
 #[test]
 fn awaited_reads_map_only_the_open_tail() {
     let mapped = ReelConfig {
@@ -3463,8 +3418,7 @@ fn awaited_reads_map_only_the_open_tail() {
     };
     let (store, backend, _dir) = posix_store(mapped);
     store.put(&record(7, 1), &[0x5a; 4096]).expect("put");
-    // The first read of a segment opens it and advises the kernel about it,
-    // which are ops of their own, so the counted reads start after that.
+    // The first read opens and advises the segment, so counting starts after it
     let blocked = store.get(&record(7, 1)).expect("warm get");
 
     let ops = backend.ops();
@@ -3493,11 +3447,7 @@ fn probed_config() -> ReelConfig {
     config(1, SyncPolicy::Never)
 }
 
-/// Whether the probe served anything here, so a skip is nobody's silent green
-///
-/// The shim answers EAGAIN off linux, and on it a filesystem can refuse the flag
-/// outright, so neither can serve a warm read. REEL_DIRECT_REQUIRED turns the
-/// skip back into a failure where the probe is supposed to work.
+/// Whether the probe served anything, failing a skip when REEL_DIRECT_REQUIRED is set
 fn warm_serve_or_skip(served: u64) -> bool {
     if served > 0 {
         return true;
@@ -3597,8 +3547,7 @@ fn a_warm_awaited_read_skips_the_engine() {
     store.put(&key, &payload).expect("put");
     // Sealed, since the awaited door copies an open tail's record out of its mapping
     drop(store.cue().expect("seal"));
-    // The first read opens the segment and advises the kernel about it, which are
-    // ops of their own, and it is also what leaves the record's pages resident.
+    // The first read opens and advises the segment and leaves the record's pages resident
     store.get(&key).expect("warm the descriptor and the cache");
 
     let ops = backend.ops();
@@ -3648,8 +3597,7 @@ fn a_cold_awaited_read_falls_through() {
     store.put(&key, &payload).expect("put");
     // Sealed, since the awaited door copies an open tail's record out of its mapping
     drop(store.cue().expect("seal"));
-    // Dropping pages leaves the dirty ones where they are, so the record is on
-    // the device before anything is dropped.
+    // Dropping pages skips dirty ones, so flush the record to the device first
     store.flush().expect("flush");
     store.get(&key).expect("warm the descriptor");
     drop_cache(&store, &key);
@@ -3672,8 +3620,7 @@ fn a_cold_awaited_read_falls_through() {
         "the first poll never asked the cache"
     );
     if after.served > before.served {
-        // A filesystem whose pages are the file, tmpfs above all, drops nothing,
-        // and there is no cold read to be had on one.
+        // A filesystem whose pages are the file, like tmpfs, drops nothing and has no cold read
         assert!(
             std::env::var_os("REEL_DIRECT_REQUIRED").is_none(),
             "dropping the pages left them resident and REEL_DIRECT_REQUIRED is set",
@@ -3807,8 +3754,7 @@ fn a_dropped_put_leaks_nothing() {
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
     let budget = Arc::clone(&store.reel.shared().budget);
     let key = record(7, 1);
-    // One record in flight and the ceiling squeezed to nothing behind it, so the next
-    // write has to wait: the idle escape only lets a writer past an empty budget.
+    // One record in flight under a zero ceiling, so the next write has to wait
     budget.acquire(4096);
     budget.throttle(0.0);
 
@@ -3886,7 +3832,7 @@ fn columns_are_independent() {
     assert_eq!(store.totals().bytes, ByteCount::from_bytes(400));
 }
 
-// a key naming a column the volume does not serve is refused, not stored
+// a key for a column the volume does not serve is refused
 #[test]
 fn unknown_column_refused() {
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
@@ -3957,10 +3903,7 @@ fn batch_applies_together() {
     assert_eq!(store.totals().count, 2);
 }
 
-// a range delete rides a batch, sweeping what came before it and sparing what follows
-//
-// One reservation and one durability point for the whole of it, so a caller with a
-// range in the middle of its batch does not have to cut the batch around it.
+// a range delete in a batch sweeps what came before it and spares what follows
 #[test]
 fn a_batch_carries_a_range_delete() {
     let (store, _sim) = sim_store(config(1, EVERY_WRITE));
@@ -4006,7 +3949,7 @@ fn a_batch_carries_a_range_delete() {
     );
 }
 
-// a batch carrying a range delete comes back the same way after a reopen
+// a batch with a range delete comes back the same way after a reopen
 #[test]
 fn a_batched_range_delete_survives_a_reopen() {
     let (store, sim) = sim_store(config(1, EVERY_WRITE));
@@ -4124,7 +4067,7 @@ fn torn_batch_leaves_nothing() {
     assert_eq!(reopened.totals().count, 1);
 }
 
-// corruption on a sole copy is an error that keeps the key, not a silent miss
+// corruption on a sole copy is an error that keeps the key
 #[test]
 fn a_sole_copy_reports_corruption_and_keeps_the_key() {
     let sole = ReelConfig {
@@ -4381,7 +4324,7 @@ fn a_closed_tail_holds_little_more_than_its_writes() {
     }
 }
 
-// an overwritten key reads its one live slot in one read, and compaction knows the old record is dead with no read
+// an overwritten key reads in one read, and the old record is known dead without a read
 #[test]
 fn an_overwritten_key_reads_its_live_slot_in_one_read() {
     let (store, backend, _dir) = posix_store(config(1, SyncPolicy::Never));
@@ -4491,7 +4434,7 @@ fn the_tick_seals_a_tail_gone_quiet() {
     );
 }
 
-// an older version in a segment that also holds the newer one is found through the key's blocks, never the whole footer
+// an older version beside the newer one in a segment is found through the key's blocks
 #[test]
 fn an_older_version_reads_its_row_through_the_key_blocks() {
     use crate::index::spot::{HeadRead, RecordSource};
@@ -4546,7 +4489,7 @@ fn a_close_leaves_no_segment_past_the_dead_ratio() {
     }
 }
 
-// a covered segment whose seal cut and mark never landed is never resumed, so the seal its next life writes counts
+// a covered segment whose seal cut and mark were lost is never resumed, so its next seal counts
 #[test]
 fn a_covered_segment_resumed_and_sealed_again_keeps_its_new_records() {
     let config = || ReelConfig {
@@ -4640,7 +4583,7 @@ fn a_covered_segment_resumed_and_sealed_again_keeps_its_new_records() {
     }
 }
 
-// a seal whose cut never landed leaves its mark after the rows, and the next open reads the footer through it and cuts
+// a lost seal cut leaves its mark after the rows, and the next open finds the footer and cuts
 #[test]
 fn a_lost_seal_cut_is_found_by_its_mark_and_made_at_open() {
     let config = || ReelConfig {
@@ -4662,7 +4605,7 @@ fn a_lost_seal_cut_is_found_by_its_mark_and_made_at_open() {
     store.close().expect("close");
     drop(store);
 
-    // The cut never landed: the footer, then zeros up to the rows, the rows, and the mark in the block after them
+    // The cut never landed: footer, zeros to the rows, the rows, and the mark in the next block
     let (rows_at, rows) = crate::format::journal::rows_region(&unsealed).expect("rows");
     let footer_len =
         crate::format::record::read_u32_le(&sealed[sealed.len() - 8..sealed.len() - 4]);
@@ -4713,7 +4656,7 @@ fn a_lost_seal_cut_is_found_by_its_mark_and_made_at_open() {
     }
 }
 
-// a volume's size counts what its files take on disk, so an open tail's sparse rows region is not counted whole
+// a volume's size counts the disk its files take, so a sparse open tail counts less
 #[test]
 fn a_volume_counts_the_bytes_its_files_take() {
     let (store, _backend, _dir) = posix_store(config(1, SyncPolicy::Never));
@@ -4808,7 +4751,7 @@ fn refresh_picks_up_later_writes() {
     assert!(reader.contains(&record(7, 2)).expect("read"));
 }
 
-// a reader follows the log rather than reading the volume again
+// a reader follows the log and reads only what is new
 #[test]
 fn refresh_reads_only_what_is_new() {
     let (writer, sim) = sim_store(config(1, EVERY_WRITE));
@@ -4893,7 +4836,7 @@ fn reader_over_four_keys() -> (ReelStore, ReelStore) {
     (writer, reader)
 }
 
-// a reader that meets an overwrite after the overwritten version's segment retired counts the key once
+// a reader meeting an overwrite after the old version's segment retired counts the key once
 #[test]
 fn refresh_follows_an_overwrite_past_a_retire() {
     let (writer, reader) = reader_over_four_keys();
@@ -4925,7 +4868,7 @@ fn refresh_follows_a_delete_past_a_retire() {
     assert_eq!(reader.totals().count, 2, "a deleted key still counts");
 }
 
-// a reader that reads a key the writer moved out of a retired segment finds it, and counts it once after a refresh
+// a read of a key moved out of a retired segment finds it, and a refresh counts it once
 #[test]
 fn a_read_past_a_retire_finds_the_moved_key() {
     let mut settings = config(1, EVERY_WRITE);
@@ -5076,7 +5019,7 @@ fn group_bound(group: u16) -> Vec<u8> {
     bytes
 }
 
-/// Corrupt the payload of the record a location names
+/// Corrupt the payload of the record at a location
 fn flip_payload(image: &mut DurableImage, loc: Loc) {
     let path = Path::new(ROOT).join(segment_file_name(loc.segment));
     for (candidate, bytes) in image.iter_mut() {
@@ -5089,7 +5032,7 @@ fn flip_payload(image: &mut DurableImage, loc: Loc) {
     }
 }
 
-// a cue read never takes the version hand-over has put in the spot index while the map still holds a newer one
+// a cue read never takes a handed-over spot version while the map holds a newer one
 #[test]
 fn a_cue_read_waits_out_a_hand_over_in_flight() {
     let (store, _) = sim_store(config(1, SyncPolicy::Never));
@@ -5100,7 +5043,7 @@ fn a_cue_read_waits_out_a_hand_over_in_flight() {
         vec![0x3cu8; 8 * 1024],
     );
     let keys: Vec<RecordKey> = (0..200u8).map(|byte| record(7, byte)).collect();
-    // Live keys keep the first partitions mostly live, so their hand-over fills the spot index first
+    // Live keys keep the first partitions mostly live, so their hand-over fills the spot index
     let mut filler =
         (1..=30u16).flat_map(|group| (0..200u8).map(move |byte| record(group + 7, byte)));
     for key in &keys {
@@ -5150,7 +5093,7 @@ fn a_cue_read_waits_out_a_hand_over_in_flight() {
         "a cue read answered with a version older than the cue"
     );
 }
-// keys sharing their fronts lie packed in their footers, and a footer search with no cached footer reads their blocks back
+// keys with shared fronts pack in their footers, and an uncached footer search reads the blocks
 #[test]
 fn a_cue_read_searches_packed_footer_blocks() {
     let (store, _) = sim_store(ReelConfig {
@@ -5216,7 +5159,7 @@ fn a_cue_read_searches_packed_footer_blocks() {
     );
 }
 
-// a sealed key deleted in a tail stays gone after a paged reopen, once that tail seals and the grave goes
+// a sealed key deleted in a tail stays gone after a paged reopen once the tail seals
 #[test]
 fn a_tail_delete_of_a_sealed_key_holds_through_a_reopen() {
     let settings = config(1, SyncPolicy::Never);

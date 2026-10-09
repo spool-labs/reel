@@ -1,6 +1,4 @@
-//! The journal format: one checksummed group of rows per write, read back until the first torn group
-//!
-//! The rows live in the segment file at the offset in its header, so one sync covers a record and its row.
+//! The journal: one checksummed group of rows per write, read back until the first torn group
 
 use crate::format::column::{ColumnId, KeyBytes, RecordKey};
 use crate::format::lsn::Lsn;

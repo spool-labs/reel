@@ -1,13 +1,4 @@
-//! Where the dead bytes sit inside a segment, and what could be taken back
-//! without copying anything
-//!
-//! A page chain, a smaller segment and a PUNCH_HOLE all reclaim a region only when
-//! the whole region is dead, so they live or die on how long the contiguous dead
-//! stretches are. Two things keep a number honest: whole-dead segments are left out,
-//! since those are already unlinked at no cost, and a run is charged at block
-//! alignment, since a punch can only take the whole blocks strictly inside it.
-//! Record size is swept because it decides the answer, a dead 256 KiB record being a
-//! run past any page size worth having and a dead 256 byte one a run below the block.
+//! Where the dead bytes sit inside a segment, and what could be reclaimed without copying
 
 use std::path::Path;
 
@@ -44,17 +35,15 @@ const COLUMNS: ColumnSet = &[
 ];
 
 /// Bytes of first-write payload before any key is rewritten
-///
-/// A ratio inside a segment rather than a rate, so a laptop-sized volume answers it.
 const VOLUME_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Small enough that the volume spans sixteen of them
 const SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Times the hot keys are rewritten
+/// The hot keys are rewritten this many times
 const ROUNDS: usize = 3;
 
-/// The page size a fixed-page reclamation scheme would be framed at
+/// Page size of a fixed-page reclamation scheme
 const PAGE: u64 = 1024 * 1024;
 
 /// Record sizes: a large record, a middling one, and the metadata shape
@@ -84,7 +73,7 @@ fn config() -> ReelConfig {
     }
 }
 
-/// What one segment's dead space looks like once the survivors are removed
+/// What the sealed segments' dead space looks like around the survivors
 #[derive(Default)]
 struct Shape {
     /// Segments holding at least one live record
@@ -96,13 +85,19 @@ struct Shape {
     /// Dead bytes in the partly-live segments
     dead: u64,
 
-    /// Those bytes again, by the length of the run they sit in
+    /// Dead bytes in runs shorter than a block
     under_block: u64,
+
+    /// Dead bytes in runs from a block up to 64 KiB
     to_64k: u64,
+
+    /// Dead bytes in runs from 64 KiB up to a page
     to_page: u64,
+
+    /// Dead bytes in runs of a page or longer
     from_page: u64,
 
-    /// What a block-aligned punch could actually take out of those runs
+    /// What a block-aligned punch could take out of those runs
     punchable: u64,
 
     /// Longest single dead run seen
@@ -129,12 +124,7 @@ fn pct(part: u64, whole: u64) -> f64 {
     }
 }
 
-/// Walk every sealed segment and classify its bytes against the live index
-///
-/// A row is live when the index still resolves its key to this exact place. A
-/// tombstone counts as live, since compaction carries it until nothing older can
-/// surface. Everything the live spans do not cover is dead, which folds pads and
-/// shadowed records together the way a reclaimer would meet them.
+/// Walks every sealed segment and classifies its bytes against the live index
 fn measure(dir: &Path, store: &ReelStore) -> Shape {
     let mut shape = Shape::default();
     let mut files: Vec<_> = std::fs::read_dir(dir)
@@ -146,8 +136,7 @@ fn measure(dir: &Path, store: &ReelStore) -> Shape {
 
     for path in files {
         let bytes = std::fs::read(&path).expect("read segment");
-        // An unsealed tail has no footer, and it holds the newest writes rather
-        // than the shadows, so skipping it leaves the question unchanged.
+        // An unsealed tail has no footer and holds the newest writes, so skip it
         let Ok(footer) = SegmentFooter::parse(&bytes) else {
             continue;
         };
@@ -175,9 +164,7 @@ fn measure(dir: &Path, store: &ReelStore) -> Shape {
                 region_end = region_end.max(start + span);
 
                 let held = row.is_tombstone() || row.is_range_tombstone();
-                // The lsn alone would not do it: a compaction copy carries its
-                // source's lsn, so the place has to be compared as well or a
-                // relocated record would keep its source counted as live.
+                // Compare the place too, since a compaction copy keeps its source's lsn
                 let resolved = match store.index().get(&row.key).expect("index get") {
                     Some(found) => found.loc.segment == segment && found.loc.offset as u64 == start,
                     None => false,
@@ -189,8 +176,7 @@ fn measure(dir: &Path, store: &ReelStore) -> Shape {
             }
         }
 
-        // A segment with no survivors is retired by unlinking the file, so counting
-        // its bytes as punchable would credit a punch with free reclamation.
+        // A segment with no survivors is unlinked whole, so its bytes are not punchable
         if live_rows == 0 {
             shape.whole_dead += 1;
             continue;

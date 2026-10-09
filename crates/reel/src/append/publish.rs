@@ -1,8 +1,4 @@
-//! The barrier that makes a batch's index moves land together
-//!
-//! A batch reaches the device as one reservation, one write and one sync, and only then
-//! moves the index key by key. Batches reaching it together move under one exclusive
-//! hold and a read of several keys holds it shared, so such a read sees all or none.
+//! The barrier that makes a batch's index moves land together for multi-key reads
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,9 +48,6 @@ struct Queue {
 
 impl Queue {
     /// Whether this waiter is at the front and what it wants is free
-    ///
-    /// A reader behind a waiting publisher stays behind it even though the lock is
-    /// readable, which is what keeps publishers from stepping in front of it forever.
     fn may_enter(&self, place: u64) -> bool {
         match self.waiting.front() {
             Some(front) if front.place == place => match front.want {
@@ -65,10 +58,7 @@ impl Queue {
         }
     }
 
-    /// Wake the waiters whose turn it now is, by name, and no others
-    ///
-    /// Waking the front by name is one wake per handover however many are waiting. A run
-    /// of readers at the front is woken together, since they do not exclude each other.
+    /// Wake only the waiters whose turn it now is, a run of readers together
     fn wake_front(&self) {
         let Some(front) = self.waiting.front() else {
             return;
@@ -91,15 +81,10 @@ impl Queue {
     }
 }
 
-/// How many times a whole-set read fills before it stops trying to dodge the queue
-///
-/// A fill a batch landed under is thrown away, and a batch landing means the fair queue
-/// is where a reader belongs.
+/// A whole-set read tries this many fills outside the queue before it joins it
 const OPTIMISTIC_FILLS: usize = 1;
 
-/// The batch counts a whole-set read checks itself against
-///
-/// Started apart from finished says both that one is running and that one has run.
+/// Started and finished batch counts, which a whole-set read checks itself against
 #[derive(Debug, Default)]
 #[repr(align(128))]
 struct Publishes {
@@ -110,7 +95,6 @@ struct Publishes {
 /// Batches moving the index under one hold of the barrier
 #[derive(Debug, Default)]
 struct Group {
-    /// Whether the leader holds the barrier, and how many joiners are still moving
     state: Mutex<(bool, usize)>,
     turn: Condvar,
 }
@@ -144,11 +128,7 @@ impl Drop for Moving<'_> {
     }
 }
 
-/// Holds a batch's index moves apart from the reads that span several keys
-///
-/// A fair queue rather than a plain reader-writer lock: arrivals are served in the order
-/// they arrive, so a reader waits for the publishers already queued and no more. It is
-/// no snapshot, since the index holds one version per key and nothing older to offer.
+/// A fair queue that keeps a batch's index moves apart from reads spanning several keys
 #[derive(Debug)]
 pub struct PublishBarrier {
     queue: Mutex<Queue>,
@@ -186,9 +166,6 @@ impl PublishBarrier {
     }
 
     /// Run a batch's moves under the barrier, beside every batch that arrives meanwhile
-    ///
-    /// The first batch leads and takes the barrier. Batches arriving before its own
-    /// moves are done join and move beside it, and it gives the barrier back once they finish.
     pub fn publish_grouped<Moved>(&self, moves: impl FnOnce() -> Moved) -> Moved {
         let mut gathering = lock(&self.gathering);
         if let Some(group) = gathering.clone() {
@@ -224,11 +201,7 @@ impl PublishBarrier {
         moves()
     }
 
-    /// Serve a read spanning keys it cannot name
-    ///
-    /// The fill runs holding nothing and its answer is kept only if no batch published
-    /// across it. It may be called more than once, so a caller carrying state into it
-    /// puts that state back itself, and a fill with an effect belongs under the barrier.
+    /// Serve a read over keys it cannot list, where `fill` may run more than once
     pub fn reading_all<Filled>(&self, mut fill: impl FnMut() -> Filled) -> Filled {
         for _ in 0..OPTIMISTIC_FILLS {
             let Some(quiet) = self.quiet() else {
@@ -244,9 +217,6 @@ impl PublishBarrier {
     }
 
     /// The started count while no batch is publishing, or nothing while one is
-    ///
-    /// A batch that finishes between the two loads reads as quiet and is not a false
-    /// one: it finished before the fill began, and the acquire carries its moves in.
     fn quiet(&self) -> Option<u64> {
         let started = self.publishes.started.load(Ordering::Acquire);
         let finished = self.publishes.finished.load(Ordering::Acquire);
@@ -263,9 +233,7 @@ impl PublishBarrier {
             want,
             thread: thread::current(),
         });
-        // The waiter is in the queue before the lock is given up, so a handover landing
-        // between the check and the park still has a thread to name. The loop rechecks
-        // rather than trusts the token, which can be left over from an earlier wake.
+        // Queued before unlocking so no wake is lost, and the loop rechecks a stale wake
         while !queue.may_enter(place) {
             drop(queue);
             thread::park();
@@ -301,8 +269,7 @@ pub struct PublishGuard<'barrier> {
 
 impl Drop for PublishGuard<'_> {
     fn drop(&mut self) {
-        // Before the barrier goes back, so the count falls once the moves are done rather
-        // than once the locks are free.
+        // Count the batch finished before the barrier goes back
         if self.want == Want::Exclusive {
             self.barrier
                 .publishes
@@ -361,7 +328,7 @@ mod tests {
         );
     }
 
-    // several readers hold it at once rather than queueing behind each other
+    // several readers hold it at once
     #[test]
     fn readers_share() {
         let barrier = Arc::new(PublishBarrier::new());

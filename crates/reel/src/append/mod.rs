@@ -1,9 +1,4 @@
-//! Per-tail append path over one active segment
-//!
-//! Writers reserve their own byte range in the active segment and copy their record
-//! into it, so the copy runs on the thread that wanted the write. The reservation is a
-//! single atomic step over the write head and the only point writers contend on; one
-//! that runs past the end of the segment is given up, and its writer rolls and retries.
+//! Per-tail append path, where each writer reserves its own range of the active segment
 
 pub mod admission;
 pub mod codec;
@@ -46,43 +41,36 @@ use sealer::{
 };
 pub(crate) use sealer::{retry_broken_seals, BrokenSeal};
 
-/// The block boundary a whole-block volume starts every record on
+/// A whole-block volume starts every record on this boundary
 const ALIGN: u64 = BLOCK;
 
-/// Bytes a tail lets build behind the write head before it starts the device on them
+/// A tail starts writeback once this many settled bytes build up behind the write head
 const WRITEBACK_CHUNK: u64 = 1024 * 1024;
 
-/// Bytes one write of the zero fill covers
+/// One write of the zero fill covers this many bytes
 const FILL_SPAN: u64 = 1024 * 1024;
 
-/// Zeros one sync pays for: it saves 0.5 ms and a 4 MiB fill costs 3.6 ms
+/// Zeroing ahead pays for its sync only while syncs land less than this many bytes apart
 const SYNC_WORTH: u64 = 512 * 1024;
 
-/// Draw margins of zeros a tail keeps ahead of its write head
-///
-/// The margin is where the tail draws the segment it rolls to, so four of them puts
-/// the last fill well before the draw instead of beside it.
+/// A tail keeps this many draw margins of zeros ahead of its write head
 const FILL_WINDOWS: u64 = 4;
 
-/// Highest byte offset a resident pointer can name within a segment
+/// A resident pointer can address offsets up to this within a segment
 const MAX_SEGMENT_OFFSET: u64 = u32::MAX as u64;
 
 /// No reservation has been given up yet, so the segment ends at its write head
 const NO_CUT: u64 = u64::MAX;
 
 /// Where a committed record landed and the sequence number that orders it
-///
-/// Holding it stands in for the index entry until that entry exists, since compaction
-/// reads the index to decide what a segment still holds. A fresh write holds every
-/// grave it could land under until it drops.
 pub struct Committed {
-    /// Segment, offset, and length the record occupies
+    /// The record's segment, offset, and length
     pub loc: Loc,
 
-    /// Append sequence number the record was written under
+    /// The record's append sequence number
     pub lsn: Lsn,
 
-    /// The segment's stay of retirement, given up when this is dropped
+    /// Keeps the segment from retiring until this drops
     _hold: SegmentHold,
 }
 
@@ -92,7 +80,6 @@ struct SegmentHold {
     holds: Arc<SegmentHolds>,
     segment: SegmentId,
 
-    /// The drawn count a fresh write took, given back once it is published
     drawn: Option<DrawTicket>,
 }
 
@@ -110,25 +97,25 @@ impl Drop for SegmentHold {
 /// When the sync that makes an append durable is taken
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Commit {
-    /// The append takes the sync its policy owes before it returns
+    /// The append takes the sync its sync setting owes before it returns
     PerRecord,
 
     /// The append leaves the sync to whoever closes the batch
     Batched,
 
-    /// The append takes a sync of its own tail before it returns, whatever the policy
+    /// The append syncs its own tail before it returns, whatever the sync setting
     Durable,
 }
 
 /// What a writer wants appended, resolved to a header once a sequence number is drawn
 enum Intent {
-    /// A data record carrying a payload, and the codec byte that produced it
+    /// A data record with its payload and the codec byte that produced it
     Data(OwnedBuf, u8),
 
     /// A delete marker for one key, with no payload
     Tombstone,
 
-    /// A delete marker for a key range, carrying the exclusive end of the range
+    /// A delete marker for a key range, with the range's exclusive end as payload
     RangeTombstone(OwnedBuf),
 }
 
@@ -151,7 +138,7 @@ impl Origin {
         }
     }
 
-    /// The flags a record of this origin carries past its kind
+    /// The record's flags, marked relocated for a compaction copy
     fn applied(self, flags: Flags) -> Flags {
         match self {
             Origin::Fresh => flags,
@@ -168,14 +155,12 @@ pub enum BatchWrite {
     /// Drop the key
     Delete,
 
-    /// Drop the half-open range opening at the key, carrying its exclusive end
-    ///
-    /// No end at all is an empty buffer, the same shape the single-record door takes.
+    /// Drop the half-open range from the key to this exclusive end, empty for no end
     DeleteRange(OwnedBuf),
 }
 
 impl BatchWrite {
-    /// Payload bytes the write carries, none for a delete
+    /// The write's payload length, zero for a delete
     fn len(&self) -> usize {
         match self {
             BatchWrite::Put(payload, _) => payload.len(),
@@ -185,22 +170,21 @@ impl BatchWrite {
     }
 }
 
-/// One record a batch carries
+/// One record in a batch
 pub struct BatchRecord {
-    /// Column and key the record is addressed by
+    /// The record's column and key
     pub key: RecordKey,
 
     /// What the record does to that key
     pub write: BatchWrite,
 }
 
-/// Bytes one run of copies holds at most, short enough that a foreground write to the
-/// same segment never waits long behind it
+/// A run of compaction copies holds at most this many bytes, so foreground writes wait little
 const COPY_RUN_BYTES: u64 = 64 * 1024;
 
-/// One live record compaction carries across, under the number it was written with
+/// One live record that compaction copies under its original sequence number
 pub struct CopyRecord {
-    /// Column and key the record is addressed by
+    /// The record's column and key
     pub key: RecordKey,
 
     /// The source record's own sequence number
@@ -236,16 +220,16 @@ struct Active {
     /// Rows for the records written so far, which the seal packs into the footer
     entries: Mutex<SegmentFooter>,
 
-    /// The same rows as the journal beside the segment takes them, until the seal
+    /// The same rows as journal groups in the segment file, kept until the seal
     journal: Arc<Journal>,
 
     /// Durability state, shared with whichever writers are flushing this segment
     sync: Arc<SyncState>,
 
-    /// Whether a failed sync has made this segment unwritable
+    /// Whether this segment takes no more writes, after a failed sync or a stop
     terminal: AtomicBool,
 
-    /// What stands between this segment and its retirement, drawn with its number
+    /// The holds that keep this segment from retiring, taken when its number was drawn
     holds: Arc<SegmentHolds>,
 }
 
@@ -257,15 +241,12 @@ impl Active {
             .min(self.reserved.load(Ordering::Acquire))
     }
 
-    /// Land one claim, however its write went
-    ///
-    /// Every claim settles exactly once, the turned-away and the failed with the landed,
-    /// or the settled count never catches the reservation head.
+    /// Count one claim as settled, whether its write landed, failed or was turned away
     fn settle(&self, span: u64) {
         self.settled.fetch_add(span, Ordering::AcqRel);
     }
 
-    /// The bytes records may reach, so records and journal together stay within the segment
+    /// How far records may reach, so records and journal together fit the segment
     fn room(&self, target: u64) -> u64 {
         target.saturating_sub(self.journal.len())
     }
@@ -273,10 +254,10 @@ impl Active {
 
 /// One append tail: a reservation head over one active segment
 pub struct Appender {
-    /// Everything the tails of one reel hold in common
+    /// State the tails of one reel share
     shared: Arc<ReelShared>,
 
-    /// Watermarks a reader consults before resolving a record here
+    /// Readers check these watermarks before resolving a record here
     tail: Arc<Tail>,
 
     /// The segment being appended to right now, shared with the sealer
@@ -291,7 +272,7 @@ pub struct Appender {
     /// The tier this tail's draws go to, fast except when compaction demotes
     draw_class: AtomicU8,
 
-    /// Seals segments this tail has rolled off, so a writer does not
+    /// Seals the segments this tail rolls off, so writers do not pay for it
     sealer: Sealer,
 }
 
@@ -322,7 +303,7 @@ impl Appender {
         Ok(appender)
     }
 
-    /// Watermarks a reader consults before resolving a record in this tail
+    /// Readers check these watermarks before resolving a record in this tail
     pub fn tail(&self) -> &Arc<Tail> {
         &self.tail
     }
@@ -350,7 +331,7 @@ impl Appender {
         )
     }
 
-    /// The same append for a caller with a runtime worker to protect
+    /// The same append, awaited, for a caller on a runtime worker
     pub async fn append_data_wait(
         &self,
         key: RecordKey,
@@ -380,10 +361,7 @@ impl Appender {
         )
     }
 
-    /// Append a tombstone covering a half-open key range within one column
-    ///
-    /// The key is the inclusive start and the payload the exclusive end. No end at all
-    /// runs to the top of the column, which a prefix with no successor needs.
+    /// Append a tombstone over a key range in one column, where no end runs to the column's top
     pub fn append_range_tombstone(
         &self,
         start: RecordKey,
@@ -401,12 +379,7 @@ impl Appender {
         )
     }
 
-    /// Append a run of compaction copies as one reservation and one write
-    ///
-    /// Every record keeps the sequence number of the one it copies, so a crash that
-    /// leaves both copies sees one version. Each stands alone, with no frame and no
-    /// batch mark, so a crash part way through the run leaves whole records. A run
-    /// wider than a segment is refused, and `copy_run_cap` keeps a caller under that.
+    /// Append compaction copies as one reservation and one write, each under its source's number
     pub fn append_copies(&self, copies: Vec<CopyRecord>) -> Result<Vec<Committed>> {
         if copies.is_empty() {
             return Ok(Vec::new());
@@ -434,16 +407,13 @@ impl Appender {
         self.place_run(headers, payloads, None)
     }
 
-    /// Bytes one run of copies may hold, a small share of a segment at most
-    ///
-    /// A run that does not fit what is left of a segment rolls it, so the cap is also
-    /// the most a roll leaves unused.
+    /// The most bytes one run of copies may hold, a small share of a segment
     pub fn copy_run_cap(&self) -> u64 {
         let target = self.shared.config.segment_bytes.to_bytes();
         COPY_RUN_BYTES.min(target / 16)
     }
 
-    /// Carry a tombstone into a rewritten segment under its own sequence number
+    /// Copy a tombstone into a rewritten segment under its own sequence number
     pub fn append_carried_tombstone(&self, key: RecordKey, lsn: Lsn) -> Result<Committed> {
         self.admit(
             framed_bytes(&key, 0),
@@ -454,7 +424,7 @@ impl Appender {
         )
     }
 
-    /// Carry a range tombstone into a rewritten segment under its own number
+    /// Copy a range tombstone into a rewritten segment under its own number
     pub fn append_carried_range(
         &self,
         start: RecordKey,
@@ -471,11 +441,7 @@ impl Appender {
         )
     }
 
-    /// Append a whole batch as one reservation, one write, and one frame
-    ///
-    /// The records take one contiguous range behind a frame declaring how many of them
-    /// there are and how many bytes they take, so a crash part way through leaves a run
-    /// recovery drops whole. A batch larger than a segment is refused rather than split.
+    /// Append a whole batch as one reservation and one write, recovered whole or not at all
     pub fn append_batch(&self, records: Vec<BatchRecord>) -> Result<Vec<Committed>> {
         if records.is_empty() {
             return Ok(Vec::new());
@@ -487,7 +453,7 @@ impl Appender {
         self.place_batch(records)
     }
 
-    /// The same batch with admission awaited rather than parked on
+    /// The same batch with admission awaited
     pub async fn append_batch_wait(&self, records: Vec<BatchRecord>) -> Result<Vec<Committed>> {
         if records.is_empty() {
             return Ok(Vec::new());
@@ -499,10 +465,9 @@ impl Appender {
         self.place_batch(records)
     }
 
-    /// Sync everything the tail has settled, the durability surface
+    /// Sync everything the tail has settled
     pub fn flush(&self) -> Result<()> {
-        // A segment this tail rolled off is durable only once its footer is down, so a
-        // flush waits for the sealer.
+        // A rolled-off segment is durable only once its footer is down, so wait for the sealer
         self.sealer.drain();
         let Some(owed) = self.settled_sync() else {
             return Ok(());
@@ -510,7 +475,7 @@ impl Appender {
         self.sync_up_to(&owed)
     }
 
-    /// The same flush awaited, for a caller with a worker rather than a thread
+    /// The same flush, awaited
     pub async fn flush_wait(&self) -> Result<()> {
         self.sealer.drain_wait().await;
         let Some(owed) = self.settled_sync() else {
@@ -519,7 +484,7 @@ impl Appender {
         self.sync_up_to_wait(&owed).await
     }
 
-    /// Take the sync a batch of appends left owed, the end of a batch
+    /// Take the sync a batch of appends left owed
     pub fn sync_if_owed(&self) -> Result<()> {
         let Some(owed) = self.owed_sync() else {
             return Ok(());
@@ -527,7 +492,7 @@ impl Appender {
         self.sync_up_to(&owed)
     }
 
-    /// The same durability point awaited, with the turn forwarded not taken
+    /// The same sync, awaited, with its turn forwarded to the sealer
     pub async fn sync_if_owed_wait(&self) -> Result<()> {
         let Some(owed) = self.owed_sync() else {
             return Ok(());
@@ -535,10 +500,7 @@ impl Appender {
         self.sync_up_to_wait(&owed).await
     }
 
-    /// The turn behind an owed sync, for a caller that will run it itself
-    ///
-    /// A writer that finds another already at the device waits here; finding nobody
-    /// answers with the turn, which the caller runs where blocking is allowed.
+    /// Wait for an owed sync, or get its turn back to run where blocking is allowed
     pub async fn owed_turn(&self) -> Result<Durability> {
         let Some(owed) = self.owed_sync() else {
             return Ok(Durability::Settled);
@@ -553,10 +515,7 @@ impl Appender {
         self.sync_up_to(&turn.owed)
     }
 
-    /// Hand a turn to the sealer, which is where an fsync is allowed to block
-    ///
-    /// How the flush went reaches the caller through the segment's durability state,
-    /// not through this call.
+    /// Hand a turn to the sealer, where an fsync may block
     fn forward_turn(&self, mut turn: FlushTurn) -> Result<()> {
         turn.is_taken = true;
         self.sealer.forward(turn.owed.clone())
@@ -595,23 +554,18 @@ impl Appender {
         self.tail.committed_len() > self.reserved_span(&header)
     }
 
-    /// Seal the active segment with a footer and roll to a fresh one
-    ///
-    /// The segment that closed comes back, so a caller that wrote rows nothing points
-    /// at can say which segment now speaks for them.
+    /// Seal the active segment with a footer, roll to a fresh one, and return the sealed id
     pub fn seal(&self) -> Result<SegmentId> {
         let retired = {
             let mut active = write(&self.active);
             self.swap_in_fresh(&mut active)?
         };
-        // Sealed here rather than handed off: this door promises a sealed segment when
-        // it returns.
+        // Seal inline, since this call promises a sealed segment on return
         let end = retired.end();
         let id = retired.handle.id();
         let sealed = retire_segment(&self.shared, &retired, end);
         if sealed.is_err() {
-            // Parked as the sealer's failures are, so the tick finishes what this door
-            // started.
+            // Park it like a sealer failure, so the tick finishes the seal
             park_broken_seal(&self.shared, retired, end);
         }
         sealed?;
@@ -623,11 +577,9 @@ impl Appender {
         let drawn = held.handle.id();
         held.handle.mark_doomed();
         held.journal.remove();
-        // Durable because nothing is owed: the file is going away, and a flush that
-        // arrives later must settle rather than park forever.
+        // Nothing is owed on a file that is going away, so a later flush settles at once
         held.sync.mark_durable();
-        // A hold or a mark left behind would stop the held floor ever advancing past a
-        // segment that is not there.
+        // A leftover hold or mark would pin the held floor at a segment that is gone
         self.shared.release_segment(drawn);
     }
 
@@ -638,11 +590,7 @@ impl Appender {
         }
     }
 
-    /// Flush, seal the last segment, and give its hold up, for a tail that ends
-    ///
-    /// The hold is what keeps the maintenance plane off a segment, so a tail that lives
-    /// for one pass has to give it up or leak a segment nothing can ever merge, compact
-    /// or reclaim again. A failed seal keeps the hold.
+    /// Flush, seal the last segment, and release its hold, which a failed seal keeps
     pub fn finish(&self) -> Result<()> {
         self.flush()?;
         self.seal_terminal()?;
@@ -651,12 +599,7 @@ impl Appender {
         Ok(())
     }
 
-    /// Flush the tail and stop it, leaving its segment open for the next process
-    ///
-    /// Nothing seals here on purpose: the tail stays where it is and the next
-    /// open resumes it, so a restart costs no segment. Only a full segment ever
-    /// takes a footer. The rows stay in the file for the next open, and the sync
-    /// makes the stop clean.
+    /// Flush the tail and stop it, leaving its segment open for the next process to resume
     pub fn close(&self) -> Result<()> {
         self.doom_spare();
         let active = write(&self.active);
@@ -665,7 +608,7 @@ impl Appender {
         }
         let file = active.handle.file();
         let driver = &self.shared.driver;
-        // Give back everything between the records and the rows, keep the rows for the next open, and sync once
+        // Free the space between the records and the rows, keep the rows, and sync once
         let end = align_up(active.end(), ALIGN);
         let rows_at = active.journal.rows_at();
         let flushed = active
@@ -682,24 +625,19 @@ impl Appender {
         flushed
     }
 
-    /// Seal the active segment and stop the tail, for a tail that ends for good
-    ///
-    /// The tail is left with nothing to append to, so a write that still arrives
-    /// rolls first.
+    /// Seal the active segment and stop the tail, so a later write rolls first
     fn seal_terminal(&self) -> Result<()> {
         self.doom_spare();
         let active = write(&self.active);
         if active.terminal.load(Ordering::Acquire) {
             return Ok(());
         }
-        // A tail whose footer lists nothing holds a header and a reservation. It
-        // goes the way the spare goes rather than sealing a shell.
+        // An empty tail is scrapped like the spare, with no seal
         if lock(&active.entries).is_empty() {
             let drawn = active.handle.id();
             active.handle.mark_doomed();
             active.terminal.store(true, Ordering::Release);
-            // Durable because nothing is owed: the file is going away, and a
-            // flush that arrives later must settle rather than park forever.
+            // Nothing is owed on a file that is going away, so a later flush settles at once
             active.sync.mark_durable();
             self.shared.release_segment(drawn);
             return Ok(());
@@ -726,14 +664,13 @@ impl Appender {
         let _admitted = self.admitted(bytes);
         let (committed, owed) = self.place(key, intent, origin, commit)?;
         if let Some(owed) = owed {
-            // A failed sync leaves nothing making the record durable, so the writer is
-            // told rather than handed a location the next crash could take back.
+            // A failed sync leaves the record not durable, so the writer gets the error
             self.sync_up_to(&owed)?;
         }
         Ok(committed)
     }
 
-    /// The same admission awaited, and the same durability point forwarded
+    /// The same admission, awaited, with the owed sync forwarded
     async fn admit_wait(
         &self,
         bytes: u64,
@@ -751,20 +688,13 @@ impl Appender {
         Ok(committed)
     }
 
-    /// Count one record in flight, counted back out however the caller leaves
-    ///
-    /// The async door may leave by being dropped at either of its waits, so the release
-    /// rides on a value rather than on reaching the end of the call.
+    /// Count one record in flight, released when the returned guard drops
     fn admitted(&self, bytes: u64) -> Admission<'_> {
         self.inflight.fetch_add(1, Ordering::Relaxed);
         Admission { tail: self, bytes }
     }
 
-    /// Reserve room for one record, write it there, and hand back where it landed
-    ///
-    /// A reservation that runs past the segment is given up and the tail rolls, which is
-    /// the only case that loops. The owed sync comes back rather than being taken here,
-    /// drawn with the tail held so it names the segment the record is in.
+    /// Reserve room for one record, write it, and return where it landed with any owed sync
     fn place(
         &self,
         key: RecordKey,
@@ -772,15 +702,14 @@ impl Appender {
         origin: Origin,
         commit: Commit,
     ) -> Result<(Committed, Option<Owed>)> {
-        // Counted before the draw and out once published, so no prune passes this number on its way
+        // Count before the draw and release once published, so no prune passes this number
         let mut drawn = (origin == Origin::Fresh).then(|| self.shared.draw_gauge(1));
         let lsn = origin.lsn(&self.shared.lsn);
         let (header, mut payload) = build_record(key, lsn, intent, origin);
         let span = self.reserved_span(&header);
         let target = self.shared.config.segment_bytes.to_bytes();
 
-        // A record wider than a whole segment fits in none, so the roll below would draw
-        // a fresh one, fail the same test, and roll again for as long as there is room.
+        // A record wider than a segment fits in none and would roll forever
         if span + ALIGN > target {
             return Err(ReelError::Rejected(format!(
                 "a record of {span} bytes does not fit a reel segment of {target}"
@@ -797,9 +726,7 @@ impl Appender {
             let base = self.claim_filled(&active, span);
             let room = active.room(target);
             if base + span + ALIGN <= room && base + span <= MAX_SEGMENT_OFFSET {
-                // The hold is taken with the tail still held shared, so the roll that
-                // seals this segment cannot come between the record landing and the
-                // maintenance plane being told to wait for it. The drawn count goes with the hold.
+                // Take the hold under the shared lock, so no seal can land before it
                 active.holds.hold_record();
                 let hold = SegmentHold {
                     shared: Arc::clone(&self.shared),
@@ -815,8 +742,7 @@ impl Appender {
                     self.tail.publish_committed(base + span);
                 }
                 let loc = outcome?;
-                // The bytes are down, so the segment can surface this number whether or
-                // not the caller stays to publish it.
+                // The bytes are down, so the segment may surface this number now
                 self.shared.note_landed(loc.segment, lsn);
                 self.tail.publish_committed(base + span);
                 self.paced_writeback(&active);
@@ -845,8 +771,7 @@ impl Appender {
                 ));
             }
 
-            // The reservation ran past the segment, so it names bytes that will never be
-            // written and the seal has to cut below it.
+            // The reservation ran past the segment, so the seal cuts below it
             active.cut_at.fetch_min(base, Ordering::AcqRel);
             active.settle(span);
             let doomed = active.handle.id().as_u32();
@@ -855,12 +780,7 @@ impl Appender {
         }
     }
 
-    /// Reserve one range for a whole batch, write it, and hand back where it landed
-    ///
-    /// One reservation covers the frame and every record, so the run is contiguous and
-    /// nothing another writer appends falls inside it. That is also what keeps a batch
-    /// inside one segment: a reservation that runs past the segment is given up whole
-    /// and retaken on the next one.
+    /// Reserve one range for a whole batch, write it, and return where each record landed
     fn place_batch(&self, records: Vec<BatchRecord>) -> Result<Vec<Committed>> {
         let count = records.len();
         if count > MOST_COUNTED as usize {
@@ -868,7 +788,7 @@ impl Appender {
                 "a batch of {count} records does not fit a reel segment"
             )));
         }
-        // Counted before the first draw and out once the whole batch is published
+        // Count before the first draw and release once the whole batch is published
         let drawn = self.shared.draw_gauge(count as u32);
         let mut headers = Vec::with_capacity(count);
         let mut payloads = Vec::with_capacity(count);
@@ -919,7 +839,7 @@ impl Appender {
             let room = active.room(target);
             if base + span + ALIGN <= room && base + span <= MAX_SEGMENT_OFFSET {
                 let mut committed = Vec::with_capacity(count);
-                // The batch's count goes with its last record, which a dropped batch lets go of last
+                // The batch's draw ticket goes with its last record, which drops last
                 let mut ticket = drawn.take().map(DrawnRecords::ticket);
                 for (at, header) in headers.iter().enumerate() {
                     active.holds.hold_record();
@@ -946,8 +866,7 @@ impl Appender {
                     self.tail.publish_committed(base + span);
                 }
                 let locs = outcome?;
-                // A batch's numbers were issued in order and a run of copies brings its
-                // own, so the oldest is looked for.
+                // Copies keep their own numbers, so note the oldest
                 if let Some(oldest) = headers.iter().map(|header| header.lsn).min() {
                     self.shared.note_landed(active.handle.id(), oldest);
                 }
@@ -1052,7 +971,7 @@ impl Appender {
         self.reserved_batch_span(header.span_in(RecordLayout::KEYLESS))
     }
 
-    /// Write one record into the range a reservation named
+    /// Write one record into its reserved range
     fn write_record(
         &self,
         active: &Active,
@@ -1065,7 +984,7 @@ impl Appender {
             .as_ref()
             .map(|_| journal_row(header, base as u32, payload.as_slice()));
 
-        // Five rather than four, since a spilled key rides in a buffer of its own.
+        // Five buffers, since a spilled key takes one of its own
         let layout = active.handle.layout();
         let mut bufs = take_bufs(5);
         WriteBuf::push_prefix(&mut bufs, header.pack_in(layout, &payload));
@@ -1106,10 +1025,6 @@ impl Appender {
     }
 
     /// Make everything the segment has settled below a byte position durable
-    ///
-    /// The target is a byte count rather than a record, so one flush answers for every
-    /// writer already under it. The loop is what a flush that started too early costs:
-    /// it covers less than was asked for, and its waiters take a turn of their own.
     fn sync_up_to(&self, owed: &Owed) -> Result<()> {
         loop {
             match owed
@@ -1152,9 +1067,6 @@ impl Appender {
     }
 
     /// Run the flush this caller holds the turn for, and hand the turn back
-    ///
-    /// What comes back says the turn is over, not that the target is durable, so a
-    /// caller a short flush left wanting goes round again.
     fn run_flush(&self, owed: &Owed) -> Result<()> {
         let flushed = flush_active(&self.shared, &self.active, owed.segment);
         publish_flush(owed, &flushed);
@@ -1167,19 +1079,15 @@ impl Appender {
         }
     }
 
-    /// Start the device on what has settled
-    ///
-    /// The ask is not waited on.
+    /// Start writeback on what has settled, without waiting for it
     fn paced_writeback(&self, active: &Active) {
         let settled = active.settled.load(Ordering::Acquire);
-        // Another writer is already pacing this segment, and the next writer through
-        // takes the chunk it does not.
+        // Another writer is pacing this segment, and the next writer picks up what it misses
         let Some(mut pacing) = try_lock(&active.sync.pacing) else {
             return;
         };
 
-        // The ask is rare next to the puts through here, so what is due is settled
-        // before anything is allocated to carry it.
+        // Most puts have nothing due, so check before allocating anything
         if settled.saturating_sub(pacing.started_to) < WRITEBACK_CHUNK {
             return;
         }
@@ -1199,9 +1107,6 @@ impl Appender {
     }
 
     /// Roll the tail off a segment a writer could not fit in
-    ///
-    /// Taking the segment exclusively is itself the wait for the reservations still in
-    /// flight, since every writer holds it shared until its write has landed.
     fn roll_from(&self, doomed: u32) -> Result<()> {
         let retired = {
             let mut active = write(&self.active);
@@ -1213,10 +1118,7 @@ impl Appender {
         self.retire(retired)
     }
 
-    /// Roll off a segment whose sync failed, leaving it for recovery to read back
-    ///
-    /// The doomed segment is left unsealed on purpose: its footer would claim its
-    /// records are all there, which is what a failed sync cannot promise.
+    /// Roll off a segment whose sync failed, leaving it unsealed for recovery to read back
     fn roll_terminal(&self) -> Result<()> {
         let doomed = {
             let mut active = write(&self.active);
@@ -1225,20 +1127,15 @@ impl Appender {
             }
             self.swap_in_fresh(&mut active)?
         };
-        // Nothing more will be made durable here, so a writer still waiting on the
-        // segment hears that rather than waiting on a flush nobody will take.
+        // Nothing more will be made durable here, so tell the waiters now
         doomed.sync.mark_broken();
-        // No footer and its pages still dirty, so a window must not read it around the
-        // cache once the holds come off.
+        // With no footer and dirty pages, a window must not read it around the cache
         self.shared.note_unsealed(doomed.handle.id());
         self.shared.release_segment(doomed.handle.id());
         Ok(())
     }
 
-    /// Put a fresh segment in place of the active one and hand the old one back
-    ///
-    /// The outgoing segment stays claimed until its seal has landed, so the maintenance
-    /// plane leaves alone a segment that is neither being appended to nor finished.
+    /// Put a fresh segment in place of the active one and return the old one, still claimed
     fn swap_in_fresh(&self, active: &mut Active) -> Result<Active> {
         let fresh = match lock(&self.spare).take() {
             Some(spare) => spare,
@@ -1255,8 +1152,6 @@ impl Appender {
     }
 
     /// Hand a segment the tail rolled off to the sealer
-    ///
-    /// The writer that filled it did not ask for a seal, so it does not pay for one.
     fn retire(&self, retired: Active) -> Result<()> {
         let end = retired.end();
         self.sealer.hand_over(retired, end)
@@ -1274,10 +1169,7 @@ impl Appender {
             .publish_committed(active.settled.load(Ordering::Acquire));
     }
 
-    /// Give up on a segment whose sync failed and roll the tail to a fresh one
-    ///
-    /// A tail that has already rolled off it is left alone, since the failure belongs to
-    /// the segment rather than to whichever one replaced it.
+    /// Give up on a segment whose sync failed and roll the tail, unless it already rolled off
     fn doom(&self, segment: SegmentId) {
         if !doom_active(&self.active, segment) {
             return;
@@ -1286,21 +1178,11 @@ impl Appender {
     }
 
     /// Close a segment with its footer, leaving it readable and never written again
-    ///
-    /// One sync closes it, taken after the footer rather than one on each side: a footer
-    /// describing records that never landed reads back as a checksum failure.
     fn seal_active(&self, active: &Active, end: u64) -> Result<()> {
         seal_segment(&self.shared, active, end)
     }
 
-    /// Claim a range, laying the next window of zeros down first if the claim needs it
-    ///
-    /// The rule the fill rests on: no claim passes the filled edge. A fill therefore
-    /// starts above every offset any writer holds and cannot land on a record being
-    /// written. A claimer that would pass the edge lays the next window down itself and
-    /// publishes the edge only once the zeros are on the medium; the claimers behind it
-    /// wait for that edge rather than claiming past it. Past the end of the segment
-    /// there is nothing left to fill, so the claim goes through and its caller rolls.
+    /// Claim a range, laying down zeros first so no claim passes the filled edge
     fn claim_filled(&self, active: &Active, span: u64) -> u64 {
         let target = self.shared.config.segment_bytes.to_bytes();
         loop {
@@ -1315,12 +1197,7 @@ impl Appender {
                     let next = align_up((filled + want).min(target), ALIGN);
                     match self.settle_ahead(active, filled, next) {
                         Ok(()) => active.alloc_high.fetch_max(next, Ordering::AcqRel),
-                        // A volume with no room for a window still has room for this
-                        // record. The edge moves to the end of this claim and no
-                        // further, so the claim covers every byte the window did not
-                        // reach and a later fill still starts above every claim. What
-                        // it costs is the allocation the window would have taken off
-                        // the commit.
+                        // Without room for a window, move the edge only to this claim's end
                         Err(error) => {
                             tracing::warn!(
                                 "failed to zero the window ahead of a reel segment: {error}"
@@ -1354,11 +1231,7 @@ impl Appender {
         (self.shared.config.segment_bytes.to_bytes() / 16).min(WRITEBACK_CHUNK)
     }
 
-    /// Draw the segment the tail will roll to next, before it needs it
-    ///
-    /// Opening a segment costs a creation, a space reservation and the header write, so
-    /// paying that inside the roll would hold every writer on the tail behind it. The
-    /// lock is tried rather than taken, since only the first writer in has work to do.
+    /// Draw the segment the tail rolls to next, before it needs it
     fn prepare_spare(&self) {
         if self.is_class_managed() {
             return;
@@ -1378,8 +1251,6 @@ impl Appender {
     }
 
     /// Take up the segment a previous process left unsealed, at its walked end
-    ///
-    /// One sync makes the resumed bytes durable before anything new rides behind them.
     fn resume_segment(&self, resumed: ResumableTail) -> Result<Active> {
         let holds = self.shared.adopt_segment(resumed.segment);
         let file = self.shared.driver.open(&resumed.path, false)?;
@@ -1415,16 +1286,13 @@ impl Appender {
             terminal: AtomicBool::new(false),
             holds,
         };
-        // The file length reaches the rows, so start the zero window again from the last record
+        // The file already reaches the rows, so the zero window restarts at the last record
         self.shared.driver.sync_full(active.handle.file())?;
         active.sync.synced_at.store(end, Ordering::Release);
         Ok(active)
     }
 
     /// Draw a fresh segment, reserve its space, and write its header as record zero
-    ///
-    /// Drawing the number claims it, so a segment that never came together gives it
-    /// back: nothing was written there and no seal will ever come to release it.
     fn prepare_segment(&self) -> Result<Active> {
         let (id, holds) = self.shared.next_segment()?;
         let prepared = self.place_and_build(id, holds);
@@ -1434,18 +1302,12 @@ impl Appender {
         prepared
     }
 
-    /// The volume this tail draws on, one tail per fast volume in tail order
-    ///
-    /// Tails past the fast list, and the rewriter's reserved tail behind them, are
-    /// unpinned: their draws take the most free volume in class.
+    /// The fast volume this tail is pinned to, none for tails past the fast list
     fn pinned_volume(&self) -> Option<usize> {
         self.shared.volumes.fast_at(self.tail.index() as usize)
     }
 
-    /// Place a fresh segment where the draw policy says, hopping a full volume
-    ///
-    /// ENOSPC is the one failure a draw survives by going elsewhere; everything else
-    /// reports as it happened.
+    /// Place a fresh segment on the drawn volume, moving to another only when one is full
     fn place_and_build(&self, id: SegmentId, holds: Arc<SegmentHolds>) -> Result<Active> {
         let volumes = &self.shared.volumes;
         let class = self.draw_class();
@@ -1486,10 +1348,7 @@ impl Appender {
         self.draw_class.store(raw, Ordering::Relaxed);
     }
 
-    /// Whether this tail's draws answer to a per-pass tier
-    ///
-    /// Such a tail skips the spare drawn ahead, since a spare built under one tier would
-    /// be the wrong file the moment a pass names the other.
+    /// Whether this tail's draws follow a per-pass tier, so it draws no spare
     fn is_class_managed(&self) -> bool {
         if !self.shared.volumes.has_capacity() {
             return false;
@@ -1499,9 +1358,6 @@ impl Appender {
     }
 
     /// Remove what a failed creation left behind, before its id moves volumes
-    ///
-    /// An id standing on two volumes refuses the next open, so the retry only proceeds
-    /// once the scrap is gone and its directory has said so.
     fn scrap_attempt(&self, id: SegmentId) -> Result<()> {
         let driver = &self.shared.driver;
         let path = self.shared.segment_path(id);
@@ -1562,7 +1418,7 @@ impl Appender {
         Ok(active)
     }
 
-    /// Offset for a new segment's rows, far enough past the records that the footer always fits before it
+    /// Where a new segment's rows start, far enough out that the footer always fits below them
     fn rows_at(&self) -> u64 {
         align_up(2 * self.shared.config.segment_bytes.to_bytes(), ALIGN)
     }
@@ -1580,16 +1436,7 @@ impl Appender {
         self.fill_ahead(active, from, to)
     }
 
-    /// Zero the window a tail writes into next, so its records overwrite blocks
-    ///
-    /// A file that grows write by write makes every durable commit pay for block
-    /// allocation. Measured on ext4 over NVMe, a durable commit takes 47 us while the
-    /// file is growing and 16 us once the blocks under it have been written; fallocate
-    /// on its own does not close that, because the first write still has to convert
-    /// the unwritten extent. The sync is what settles those extents, so it belongs
-    /// here rather than on the commit that would otherwise pay for them. The sim
-    /// backend keeps its files in memory and has no extents to settle, so there this
-    /// just reserves.
+    /// Zero the window a tail writes into next, so its records overwrite written blocks
     fn fill_ahead(&self, active: &Active, from: u64, to: u64) -> Result<()> {
         let file = active.handle.file();
         if matches!(self.shared.driver.serving(), ServingBackend::Sim) {
@@ -1637,10 +1484,7 @@ impl Drop for Admission<'_> {
 }
 
 thread_local! {
-    /// One vectored-write list per writing thread, handed back after every write
-    ///
-    /// The buffers come off the completion either way, so the list a write is framed
-    /// into is the same one the last write on this thread framed into.
+    /// One vectored-write list per writing thread, reused by every write
     static BUFS_SPARE: std::cell::Cell<Vec<WriteBuf>> = const { std::cell::Cell::new(Vec::new()) };
 }
 
@@ -1651,10 +1495,7 @@ fn take_bufs(wanted: usize) -> Vec<WriteBuf> {
     bufs
 }
 
-/// Hand a write list back for the next write on this thread to frame into
-///
-/// Cleared on the way in, so the payloads it carried are released here rather than
-/// held until this thread writes again.
+/// Hand a write list back, cleared, for the next write on this thread
 fn recycle_bufs(mut bufs: Vec<WriteBuf>) {
     bufs.clear();
     BUFS_SPARE.with(|held| {
@@ -1690,8 +1531,6 @@ fn framed_bytes(key: &RecordKey, payload_len: usize) -> u64 {
 }
 
 /// Resolve an intent to the header and payload the record writes
-///
-/// The batch mark goes on before the checksum, which covers the flags.
 fn build_record(
     key: RecordKey,
     lsn: Lsn,

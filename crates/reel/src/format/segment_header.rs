@@ -5,9 +5,6 @@ use crate::format::loc::SegmentId;
 use crate::format::record::{read_u32_le, CheckKey, RecordLayout, CHECK_KEY_LEN};
 
 /// The format version this build stamps into every new segment header
-///
-/// A build meeting a version it cannot read refuses the whole file here, rather
-/// than truncating its walk at an unknown record kind and losing the tail silently.
 pub const FORMAT_VERSION: u16 = 8;
 
 const VERSION_LEN: usize = std::mem::size_of::<u16>();
@@ -16,7 +13,7 @@ const SEGMENT_LEN: usize = std::mem::size_of::<u32>();
 const VERSION_AT: usize = 0;
 const SEGMENT_AT: usize = VERSION_AT + VERSION_LEN;
 
-/// Bytes the frozen segment header payload occupies
+/// Length of the frozen prefix of the segment header payload
 pub const SEGMENT_HEADER_LEN: usize = SEGMENT_AT + SEGMENT_LEN;
 
 /// Where the record layout byte sits, behind the frozen prefix
@@ -28,26 +25,22 @@ const CHECK_AT: usize = LAYOUT_AT + 1;
 /// Byte position of the rows offset, after the check key
 const ROWS_AT: usize = CHECK_AT + CHECK_KEY_LEN;
 
-/// This build writes the frozen prefix, the record layout, the check key and the rows offset
+/// Length of the payload this build writes: prefix, layout, check key and rows offset
 pub const SEGMENT_HEADER_SPAN: usize = ROWS_AT + std::mem::size_of::<u64>();
 
-/// The fixed payload carried by the first record of every segment
-///
-/// The prefix's layout never changes, so any build can identify any file ever written.
-/// What follows is read where the payload reaches it and defaulted where it does not,
-/// which is how the record layout joined a format already in the field.
+/// The payload of every segment's first record
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SegmentHeader {
-    /// Format version the segment was written under
+    /// The segment's format version
     pub version: u16,
 
     /// Monotonic segment number within the reel
     pub segment: SegmentId,
 
-    /// How the segment frames its records, which every reader of the file needs first
+    /// How the segment frames its records
     pub layout: RecordLayout,
 
-    /// Offset where an open segment keeps its journal rows, or zero for none
+    /// Offset of an open segment's journal rows, or zero for none
     pub rows_at: u64,
 }
 

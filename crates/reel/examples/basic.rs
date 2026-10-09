@@ -1,10 +1,5 @@
 //! Open a reel on a temporary directory and work one caller-declared column
 //!
-//! Puts, a point read, a delete, a batched read, and a close that seals the open
-//! segment, through both doors onto a record: the store trait, which resolves a
-//! column family name per call, and the inherent method, which takes a key the
-//! caller resolved once.
-//!
 //! cargo run --example basic
 
 use tempfile::TempDir;
@@ -14,7 +9,7 @@ use reel::{
     Store, StoreResult, ThreadBudget,
 };
 
-/// Family name the trait addresses, and the identifier its records carry
+/// The family name the trait uses, and its column identifier
 const RECORDS: &str = "records";
 const RECORDS_COLUMN: ColumnId = ColumnId(1);
 
@@ -28,7 +23,7 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     codec: Codec::None,
 }];
 
-/// Small enough that the run writes a file rather than a gibibyte of zeros
+/// A small segment size, so the run does not write a gibibyte of zeros
 const SEGMENT_BYTES: ByteCount = ByteCount::mb(4);
 
 /// Records written, and which one of them is deleted again
@@ -60,8 +55,7 @@ fn main() -> StoreResult<()> {
     let by_name = Store::get(&store, RECORDS, &key_of(0))?.expect("record 0");
     assert_eq!(&*by_name, payload_of(0).as_slice());
 
-    // A RecordKey is the name resolution held, so the inherent call skips the
-    // lookup the trait call repeats per read.
+    // A RecordKey holds the resolved column, so the inherent call skips the per-read lookup
     let resolved = RecordKey::from_bytes(RECORDS_COLUMN, &key_of(0))?;
     let by_key = store.get(&resolved)?.expect("record 0 by resolved key");
     assert_eq!(&*by_key, &*by_name);

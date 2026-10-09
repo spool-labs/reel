@@ -11,7 +11,7 @@ use crate::io::ServingBackend;
 use crate::reel::segment::IoDriver;
 use crate::sync::{lock, try_lock};
 
-/// Zero the rows region ahead of the rows in steps of at most 1 MiB, or a sixteenth of the segment if smaller
+/// Zero the rows region in steps of a sixteenth of the segment, at most this many bytes
 const FILL: u64 = 1024 * 1024;
 
 /// The journal of one open segment, stored from `rows_at` to the end of the segment file
@@ -34,7 +34,7 @@ pub(super) struct Journal {
     /// Bytes pushed so far, written or pending, which the segment's room shrinks by
     pushed: AtomicU64,
 
-    /// Pad each write with zeros to a whole block
+    /// Whether each write is padded with zeros to a whole block
     whole_blocks: bool,
 
     /// Bytes of the rows region already zeroed
@@ -119,7 +119,7 @@ impl Journal {
         self.pushed.load(Ordering::Acquire)
     }
 
-    /// Add the rows of one write that has landed, as one group, for the next pace or flush to write
+    /// Add the rows of one landed write as one group, for the next pace or flush to write
     pub(super) fn push(&self, rows: &[JournalRow]) {
         if rows.is_empty() {
             return;
@@ -131,7 +131,7 @@ impl Journal {
             .fetch_add((pending.len() - before) as u64, Ordering::AcqRel);
     }
 
-    /// Write all pending groups to the segment file. The next sync of the file covers them.
+    /// Write all pending groups to the segment file for the next sync to cover
     pub(super) fn write_pending(&self) -> Result<()> {
         let mut written = lock(&self.written);
         self.write_locked(&mut written)
@@ -166,7 +166,7 @@ impl Journal {
         Ok(())
     }
 
-    /// Zero the rows region up to `end` before rows go there, so syncing them needs no block allocation
+    /// Zero the rows region up to `end` first, so syncing rows needs no block allocation
     fn fill_to(&self, file: FileId, end: u64) -> Result<()> {
         let filled = self.filled.load(Ordering::Acquire);
         if end <= filled || matches!(self.driver.serving(), ServingBackend::Sim) {
@@ -180,7 +180,7 @@ impl Journal {
             vec![WriteBuf::zeros((to - filled) as usize)],
         )?;
         self.driver.sync_full(file)?;
-        // Some filesystems fill a gap up to the first write past it, and no record ever reaches past the segment size
+        // Some filesystems fill a gap up to the next write, so free the space past the segment size
         if filled == 0 {
             let past = self.span.next_multiple_of(BLOCK);
             self.driver

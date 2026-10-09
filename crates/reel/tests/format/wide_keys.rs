@@ -1,10 +1,4 @@
 //! Keys on both sides of the inline bound, driven through the store
-//!
-//! A key past the inline bound spills outside the record's prefix, so the drain has
-//! to put the two pieces on the wire adjacent or the record frames wider than it
-//! writes. Every write path runs at widths either side of the bound and reads back
-//! through a reopen, which is what says the tail landed in the order a walk expects
-//! rather than merely that a put returned.
 
 use tempfile::TempDir;
 
@@ -13,7 +7,7 @@ use reel::{
     ReelStore, SyncPolicy, INLINE_KEY_LEN, MAX_KEY_LEN,
 };
 
-/// The column these fixtures write into, taking a key of any width
+/// A column that takes a key of any width
 const WIDE_COLUMNS: ColumnSet = &[ColumnSpec {
     id: ColumnId(1),
     name: "wide",
@@ -23,10 +17,7 @@ const WIDE_COLUMNS: ColumnSet = &[ColumnSpec {
     codec: Codec::None,
 }];
 
-/// Widths every case runs, straddling the bound a key spills at
-///
-/// One below, exactly at and one above is where the representation changes, and the
-/// ceiling is the widest key the format admits.
+/// Widths around the inline bound, up to the widest key the format admits
 const WIDTHS: [usize; 6] = [
     8,
     32,
@@ -36,13 +27,13 @@ const WIDTHS: [usize; 6] = [
     MAX_KEY_LEN,
 ];
 
-/// Records each reopen case writes at one width
+/// Each reopen case writes this many records at one width
 const RUN: u8 = 4;
 
 fn config() -> ReelConfig {
     ReelConfig {
         sync: SyncPolicy::Never,
-        // Not under test, and it would take the disk away from what is.
+        // Scrub is not under test, so it stays off
         scrub_mbps: 0,
         ..ReelConfig::default()
     }
@@ -57,7 +48,7 @@ fn key(width: usize, seed: u8) -> RecordKey {
     RecordKey::from_bytes(ColumnId(1), &bytes).expect("key fits")
 }
 
-/// The payload a key carries, distinct for the same reason
+/// A payload distinct per width and per seed
 fn payload(width: usize, seed: u8) -> Vec<u8> {
     vec![(width % 251) as u8 ^ seed; 64 + width % 17]
 }
@@ -76,7 +67,7 @@ fn assert_serves(store: &ReelStore, width: usize, seeds: impl Iterator<Item = u8
     }
 }
 
-// one record per call, which is the path a caller takes by default
+// every width survives one record per put, the default write path
 #[test]
 fn a_spilled_key_survives_a_put() {
     let dir = TempDir::new().expect("tempdir");
@@ -91,7 +82,7 @@ fn a_spilled_key_survives_a_put() {
     }
 }
 
-// the batched drain, which gathers many records into one vectored write
+// every width survives the batched drain, which gathers records into one vectored write
 #[test]
 fn a_spilled_key_survives_a_batch() {
     let dir = TempDir::new().expect("tempdir");
@@ -111,9 +102,7 @@ fn a_spilled_key_survives_a_batch() {
     }
 }
 
-// the bytes on disk, read back through the footer a seal wrote
-//
-// One width per store, which is the case a strided footer partition covers.
+// every width reads back through the footer a seal wrote, one width per store
 #[test]
 fn a_spilled_key_survives_a_reopen() {
     for width in WIDTHS {
@@ -140,9 +129,6 @@ fn a_spilled_key_survives_a_reopen() {
 }
 
 // a segment holding records of differing key widths recovers all of them
-//
-// A strided footer cannot hold this: rows carry their own starts, so the reader asks
-// the table where a row begins rather than multiplying by one width.
 #[test]
 fn mixed_key_widths_survive_a_reopen() {
     let dir = TempDir::new().expect("tempdir");
@@ -162,10 +148,7 @@ fn mixed_key_widths_survive_a_reopen() {
     }
 }
 
-// the same mixed widths read a block at a time rather than from a parsed footer
-//
-// The paged path cuts a block of rows up from the start table alone, without the
-// footer around them.
+// the same mixed widths read back a block at a time through the paged index
 #[test]
 fn mixed_key_widths_read_through_the_paged_index() {
     let dir = TempDir::new().expect("tempdir");
@@ -188,7 +171,7 @@ fn mixed_key_widths_read_through_the_paged_index() {
     }
 }
 
-// a key wider than the format admits is refused rather than truncated
+// a key wider than the format admits is refused
 #[test]
 fn an_over_wide_key_is_refused() {
     let bytes = vec![0u8; MAX_KEY_LEN + 1];

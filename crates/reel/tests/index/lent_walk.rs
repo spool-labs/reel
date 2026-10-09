@@ -1,11 +1,4 @@
-//! The walk that lends its keys instead of handing them over
-//!
-//! An owned walk allocates and frees a key per row to move as little as eight bytes,
-//! where the lending walk keeps the entry in the playback and takes the buffer back
-//! on the next step. Reuse is the hazard: a buffer that served a wide key and then a
-//! narrow one leaves the tail of the wide one behind unless it is cleared, and a page
-//! or run boundary is where a buffer changes hands. So every case runs past both
-//! boundaries and compares against the owned walk, which cannot carry that defect.
+//! The lending walk matches the owned walk across page and run boundaries
 
 use tempfile::TempDir;
 
@@ -16,10 +9,7 @@ use reel::{
     MAP_EVERYTHING,
 };
 
-/// Rows every walk steps
-///
-/// Well past the 32 row page floor and the 128 row run ceiling, so a walk refills its
-/// page many times and settles at the widest run it will take.
+/// Rows every walk steps, enough that a walk refills its page many times
 const ROWS: u64 = 1000;
 
 const COLUMNS: ColumnSet = &[
@@ -54,9 +44,6 @@ fn payload(row: u64) -> Vec<u8> {
 }
 
 /// A key whose width swings row to row, so a reused buffer meets both directions
-///
-/// The widths cycle rather than climb, so a narrow key lands straight after a wide
-/// one and back again inside one run.
 fn wide_key(row: u64) -> Vec<u8> {
     let width = 4 + (row % 29) as usize;
     let mut bytes = row.to_be_bytes().to_vec();
@@ -137,7 +124,7 @@ fn a_mapped_walk_matches_the_owned_one() {
     }
 }
 
-// a narrow key after a wide one is the whole key, not the tail of the last one
+// a narrow key after a wide one comes back at its own width
 #[test]
 fn a_reused_buffer_does_not_widen_the_key_after_it() {
     let (_dir, store) = filled();
@@ -146,7 +133,7 @@ fn a_reused_buffer_does_not_widen_the_key_after_it() {
     assert_eq!(lent.len(), ROWS as usize, "the lending walk lost rows");
     assert_eq!(lent, owned(&store, "wide", None, Direction::Asc));
 
-    // The comparison is worth nothing unless the widths really do move.
+    // The widths must actually vary for the comparison to mean anything
     let widths: std::collections::BTreeSet<usize> = lent.iter().map(|(key, _)| key.len()).collect();
     assert!(widths.len() > 1, "the wide column walked one key width");
 }

@@ -33,7 +33,7 @@ const RECORDS: ColumnId = ColumnId(1);
 const KEY_WIDTH: usize = 34;
 const SEG_HEADER_SPAN: u64 = HEADER_LEN as u64 + SEGMENT_HEADER_SPAN as u64;
 
-/// One fixed-key column, the shape the append path is exercised over
+/// One fixed-key column for the append path tests
 const COLUMNS: ColumnSet = &[ColumnSpec {
     id: RECORDS,
     name: "records",
@@ -55,7 +55,7 @@ fn harness(config: ReelConfig, plan: FaultPlan) -> (Arc<ReelShared>, SimIo) {
     harness_capped(config, plan, InflightBudget::default())
 }
 
-/// The same harness under a named admission ceiling, for the backpressure cells
+/// The same harness with an admission ceiling, for the backpressure tests
 fn harness_capped(
     config: ReelConfig,
     plan: FaultPlan,
@@ -116,24 +116,24 @@ fn key(byte: u8) -> RecordKey {
     RecordKey::from_bytes(RECORDS, &[byte; KEY_WIDTH]).expect("key")
 }
 
-/// Poll a wait once with a waker that does nothing, for the waits that must not
+/// Poll a future once with a waker that does nothing
 fn poll_once<Awaited: Future>(future: Pin<&mut Awaited>) -> Poll<Awaited::Output> {
     future.poll(&mut Context::from_waker(Waker::noop()))
 }
 
-/// Bytes a record with a key of this column's width and this payload takes
+/// How many bytes a record with this payload takes in this column
 fn framed(payload_len: usize) -> u64 {
     crate::index::entry::span_of(KEY_WIDTH as u16, payload_len as u32)
 }
 
-/// The groups of rows the open segment has journaled, which a flush writes down
+/// Flush, then read back the row groups the open segment journaled
 fn journaled(shared: &ReelShared, appender: &Appender, segment: SegmentId) -> Vec<Vec<JournalRow>> {
     appender.flush().expect("flush");
     let bytes = read_segment(shared, &shared.segment_path(segment));
     read_groups(rows_region(&bytes).map_or(&[][..], |(_, rows)| rows)).0
 }
 
-/// Whether the record at a place checks out as the key its payload's byte gives
+/// Whether the record at a location checks out against the key its payload's byte gives
 fn lands_intact(shared: &ReelShared, loc: Loc) -> bool {
     let bytes = read_segment(shared, &shared.segment_path(loc.segment));
     let header = RecordHeader::unpack(&bytes).expect("segment header");
@@ -274,7 +274,7 @@ fn a_sync_adds_no_bytes() {
         .append_data(key(1), vec![0x11; 500], 0, Commit::PerRecord)
         .expect("first");
 
-    // Durability is the flush and nothing else: no bookkeeping is written for it.
+    // The flush writes no bookkeeping record
     let record_end = SEG_HEADER_SPAN + framed(500);
     assert_eq!(appender.tail().committed_len(), record_end);
     assert!(sim.sync_count() > 0, "the put reached the device");
@@ -329,7 +329,7 @@ fn nothing_owed_settles_at_once() {
     );
 }
 
-// the wait hands back the turn rather than taking the device on its own thread
+// the awaitable wait hands the turn back to the caller and leaves the device alone
 #[test]
 fn an_owed_sync_hands_back_the_turn() {
     let (shared, sim) = harness(config(EVERY_WRITE), FaultPlan::new(1));
@@ -452,8 +452,7 @@ fn a_forwarded_flush_answers_both_writers() {
     let before = sim.sync_count();
 
     let mut first = Box::pin(appender.sync_if_owed_wait());
-    // The poll that draws the turn and hands it over. What it answers depends on whether
-    // the sealer got there first, which is a race this door has by design.
+    // This poll draws the turn and hands it over, and its answer races the sealer
     let handed = poll_once(first.as_mut());
     block_on(appender.sync_if_owed_wait()).expect("second writer");
     match handed {
@@ -484,7 +483,7 @@ fn a_dropped_wait_keeps_the_flush() {
         let _ = poll_once(walked.as_mut());
     }
 
-    // The sealer holds the turn now, so this waits for it rather than hanging.
+    // The sealer holds the turn now, so this waits for it
     appender.sync_if_owed().expect("blocking sync");
     assert_eq!(
         sim.sync_count(),
@@ -493,7 +492,7 @@ fn a_dropped_wait_keeps_the_flush() {
     );
 }
 
-// an awaited append waits for admission rather than holding a thread for it
+// an awaited append waits for admission without holding a thread
 #[test]
 fn an_awaited_append_waits_for_room() {
     let (shared, _sim) = harness_capped(
@@ -562,7 +561,7 @@ fn a_dropped_append_holds_no_admission() {
     drop(held);
 }
 
-/// The batch of three the framing cells write, each record the same width
+/// A batch of three records of the same width, for the framing tests
 fn batch_of(payload_len: usize) -> Vec<BatchRecord> {
     (1..=3u8)
         .map(|byte| BatchRecord {
@@ -648,11 +647,7 @@ fn a_whole_block_batch_fills_behind_its_run() {
         .all(|byte| *byte == 0));
 }
 
-// a batch too wide for the room left rolls whole rather than splitting in two
-//
-// The reservation covers the frame and every record at once, so a batch that runs past
-// the segment gives the whole range up and retakes it on the next one. That is what
-// keeps a frame and its run in one file, which recovery walks one file at a time.
+// a batch too wide for the room left rolls whole into the next segment
 #[test]
 fn a_batch_never_spans_segments() {
     let mut settings = config(SyncPolicy::Never);
@@ -697,14 +692,13 @@ fn a_batch_never_spans_segments() {
     );
 }
 
-// a writer that finds the spare being drawn walks away rather than queueing
+// a writer that finds the spare being drawn walks away without queueing
 #[test]
 fn drawing_a_spare_never_queues_a_writer() {
     let (shared, _sim) = harness(config(SyncPolicy::Never), FaultPlan::new(1));
     let appender = Arc::new(Appender::open(Arc::clone(&shared), 0, None).expect("open"));
 
-    // Standing in for the writer part way through the build, which holds this across a
-    // file creation, a directory sync and the header write.
+    // Stands in for a writer part way through building the spare
     let building = lock(&appender.spare);
 
     let passing = Arc::clone(&appender);
@@ -742,8 +736,7 @@ fn a_seal_hints_against_readahead() {
 
     appender.seal().expect("seal");
 
-    // The tail's own handle is what readers find in the cache after a seal, so the hint
-    // has to be on it and not only on a handle a read-path open made.
+    // Readers find the tail's own handle in the cache after a seal, so it needs the hint
     let hinted = sim
         .advise_traces()
         .into_iter()
@@ -776,8 +769,7 @@ fn a_rolled_segment_is_sealed_once_a_flush_returns() {
     }
     assert!(rolled, "the tail never rolled, so this proves nothing");
 
-    // The write that rolled has returned, and its footer may not be down yet: the writer
-    // did not wait for it.
+    // The rolling write has returned without waiting for its footer
     appender.flush().expect("flush");
 
     // And after the flush it is, which is the guarantee a caller still has.
@@ -804,8 +796,7 @@ fn a_tail_holds_its_segment_until_it_is_sealed() {
         "the tail holds the segment it opened on"
     );
 
-    // The spare is drawn before the roll needs it, and the maintenance plane has to leave
-    // it alone from then on rather than from when the tail adopts it.
+    // The spare is held from when it is drawn, before the tail adopts it
     appender.prepare_spare();
     assert!(
         shared.is_held(SegmentId(2)),
@@ -943,7 +934,7 @@ fn spare_is_drawn_before_the_roll() {
 // a drain that never landed leaves no footer entry at the offset it framed
 #[test]
 fn failed_drain_leaves_no_footer_entry() {
-    // The record's write is the sixth op, after both opens, the directory sync, the reservation and the header
+    // Op six is the record's write, after both opens, the dir sync, the reservation and the header
     let plan = FaultPlan::new(1).with_fault(5, FaultKind::EnospcAppend);
     let (shared, sim) = harness(config(SyncPolicy::Never), plan);
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
@@ -972,7 +963,7 @@ fn failed_drain_leaves_no_footer_entry() {
 // a failed cadence sync gives up on the segment and rolls off it
 #[test]
 fn failed_sync_rolls_off_the_segment() {
-    // The tail's first sync is the eighth op, after both opens, the directory sync, the reservation and three writes
+    // Op eight is the first sync, after both opens, the dir sync, the reservation and three writes
     let plan = FaultPlan::new(1).with_fault(7, FaultKind::SyncError);
     let (shared, _sim) = harness(config(EVERY_WRITE), plan);
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
@@ -1060,7 +1051,7 @@ fn appends_land_during_a_sync() {
     }
 }
 
-// writers crossing one threshold together share a flush instead of each buying one
+// writers crossing one threshold together share one flush
 #[test]
 fn writers_share_one_flush() {
     let mut settings = config(SyncPolicy::Bytes(ByteCount::from_bytes(4096)));
@@ -1088,8 +1079,7 @@ fn writers_share_one_flush() {
         handle.join().expect("join");
     }
 
-    // Every record is a quarter of the threshold, so the bytes written owe this many
-    // flushes, where a writer asking on its own would pay a multiple of it.
+    // Each record is a quarter of the threshold, so the bytes written owe this many flushes
     let written = u64::from(writers) * rounds * 1000;
     let owed = written / 4096;
     assert!(
@@ -1116,8 +1106,7 @@ fn flush_survives_a_roll_underneath_it() {
         let barrier = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
             barrier.wait();
-            // Every record carries its writer's byte, so a record read back where it was
-            // reported is checked against what that writer wrote.
+            // Each record holds its writer's byte, so a read back is checked against that writer
             let byte = writer + 1;
             let mut committed = Vec::new();
             for _ in 0..per_writer {

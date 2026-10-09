@@ -1,9 +1,4 @@
-//! Completion slots the driver's ops land in, addressed by the tag's low bits
-//!
-//! A tag comes off a monotonic counter, so its low bits index a power-of-two
-//! table sized to the ops one driver keeps in flight, which is what replaces a
-//! tag-keyed map. A caller with a thread parks on the condition variable; one on
-//! a runtime worker leaves a waker where a parked thread would have signalled.
+//! Completion slots for the driver's ops, indexed by each tag's low bits
 
 use std::future::Future;
 use std::pin::Pin;
@@ -16,60 +11,48 @@ use crate::error::{ReelError, Result};
 use crate::io::op::{Completion, Outcome, Tag};
 use crate::sync::{lock, wait_for};
 
-/// Completion slots one driver keeps, which is the ops it may have in flight
-///
-/// A power of two, so a tag's low bits are its slot and nothing on the op path
-/// divides.
+/// A driver's completion slots, a power of two so a tag's low bits pick the slot
 pub const SLOT_COUNT: usize = 512;
 
 /// The bits of a tag that address a slot
 const SLOT_MASK: u64 = (SLOT_COUNT - 1) as u64;
 
-/// How long a parked caller waits before it looks at the table itself
-///
-/// Every change signals, so a park normally ends on that; the timeout covers an
-/// orphan's slot and the window before a counted-in thread reaches the wait.
+/// A parked caller rechecks the table after this long, in case it missed a signal
 const CLAIM_PARK: Duration = Duration::from_micros(200);
 
-/// How long a parked claim waits for its slot before it gives up on it
-///
-/// A slot turns over in the time one op takes, so a claim still waiting is
-/// waiting on a flight nobody will answer, which waiting longer does not fix.
+/// A parked claim gives up on its slot after this long
 const CLAIM_LIMIT: Duration = Duration::from_secs(5);
 
-/// The slot a tag addresses, which is the whole of the correlation
+/// The slot a tag addresses
 fn index_of(tag: Tag) -> usize {
     (tag.0 & SLOT_MASK) as usize
 }
 
-/// How far the flight one slot carries has got
+/// How far a slot's op has got
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SlotState {
-    /// Nothing in flight, so the slot is there to be claimed
+    /// Nothing in flight, so the slot can be claimed
     Free,
 
-    /// An op is in flight and its caller means to take the completion
+    /// An op is in flight and its caller will take the completion
     Flight,
 
     /// The completion has landed and nobody has taken it yet
     Landed,
 
-    /// The caller walked away, so whoever reaps the completion puts it back
+    /// The caller left, so whoever reaps the completion reclaims it
     Orphan,
 }
 
-/// One tag's place in the table, holding whatever its flight has reached
-///
-/// Behind a gate of its own, since a tag names one slot and the callers on the
-/// table are only ever on the same one by collision.
+/// One tag's place in the table, with its own lock
 struct Slot {
-    /// The tag whose flight owns the slot, so a stale completion is not filed
+    /// The tag whose op owns the slot, so a stale completion is not filed
     tag: Tag,
 
     /// How far that flight has got
     state: SlotState,
 
-    /// The completion, from where it lands until its caller takes it
+    /// The completion, from when it lands until its caller takes it
     completion: Option<Completion>,
 
     /// The waker a pending future left, taken by the completion that wakes it
@@ -77,17 +60,14 @@ struct Slot {
 }
 
 impl Slot {
-    /// Empty the slot, whatever it was carrying
-    ///
-    /// The tag stays, and since tags are never reused a late completion or drop
-    /// finds nothing rather than another flight.
+    /// Empty the slot and keep its tag, which is never reused
     fn clear(&mut self) {
         self.state = SlotState::Free;
         self.completion = None;
         self.waker = None;
     }
 
-    /// Leave a waker for the completion to ring, unless the same one is already in
+    /// Leave a waker for the completion to wake, unless the same one is already there
     fn seat(&mut self, waker: &Waker) {
         let is_seated = match &self.waker {
             Some(seated) => seated.will_wake(waker),
@@ -104,16 +84,16 @@ struct Door {
     /// Whether a thread is inside the backend's poll right now
     is_polling: bool,
 
-    /// Buffer the polling thread drains into, kept so a drain allocates nothing
+    /// The polling thread drains into this, so a drain allocates nothing
     scratch: Vec<Completion>,
 }
 
 /// The completion slots one driver files its ops into
 pub struct SlotTable {
-    /// One gate per slot, since a tag names one slot and never two
+    /// One lock per slot
     slots: Vec<Mutex<Slot>>,
 
-    /// The drain turn and its buffer, which is all both doors share
+    /// The drain turn and its buffer, the only state both doors share
     door: Mutex<Door>,
 
     /// Signalled whenever a slot changes, for the threads parked on the door
@@ -125,22 +105,22 @@ pub struct SlotTable {
     /// Wakers left by claims that found no room, rung when any slot frees
     claims: Mutex<Vec<Waker>>,
 
-    /// Claims seated in that list, read without taking it by whoever frees a slot
+    /// How many claims are in that list, read without its lock by whoever frees a slot
     claiming: AtomicU64,
 
-    /// The turn a batch takes to claim its whole run against another batch
+    /// Serializes batches claiming their whole runs
     batching: Mutex<()>,
 
-    /// Completions put back because nothing was waiting for them any more
+    /// Completions reclaimed because nothing was waiting for them
     reclaimed: AtomicU64,
 
     /// Completions filed into a slot whose flight was waiting for them
     landed: AtomicU64,
 
-    /// Completions discarded because their slot had moved on to another tag
+    /// Completions discarded because their slot had moved on or was not waiting
     stale: AtomicU64,
 
-    /// Draws the tags whose low bits address the slots
+    /// The counter tags are drawn from
     next_tag: AtomicU64,
 }
 
@@ -179,15 +159,12 @@ impl SlotTable {
         SLOT_COUNT
     }
 
-    /// A fresh tag unique for the life of this table
-    ///
-    /// Monotonic, so a batch draws a contiguous run and no tag is reused: a late
-    /// completion lands on a slot naming another tag and is reclaimed.
+    /// A fresh tag from a monotonic counter, unique for the life of this table
     pub fn next_tag(&self) -> Tag {
         Tag(self.next_tag.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Take a slot for a tag, or say it is still carrying another flight
+    /// Take a slot for a tag, or return false if another op holds it
     pub fn try_claim(&self, tag: Tag) -> bool {
         let mut slot = lock(&self.slots[index_of(tag)]);
         if slot.state != SlotState::Free {
@@ -198,10 +175,7 @@ impl SlotTable {
         true
     }
 
-    /// Claim as much of a batch's leading run as the table has room for
-    ///
-    /// The run stops at the first tag whose slot is taken, so a batch wider than
-    /// the table splits where its own tags collide.
+    /// Claim a batch's tags in order up to the first taken slot, returning how many
     pub fn claim_run(&self, wanted: &[Tag]) -> usize {
         let mut taken = 0;
         for tag in wanted {
@@ -214,10 +188,6 @@ impl SlotTable {
     }
 
     /// Claim every tag of a batch or none of them
-    ///
-    /// All or nothing keeps two batches from each holding half the table and
-    /// waiting on the other, and a rollback rings nobody. The turn keeps two
-    /// batches from rolling back over each other.
     pub fn claim_all(&self, wanted: &[Tag]) -> bool {
         if wanted.len() < 2 {
             return self.claim_whole(wanted);
@@ -255,9 +225,6 @@ impl SlotTable {
     }
 
     /// Take the completion, or leave a waker in the slot for when it lands
-    ///
-    /// A landing takes the waker away, so a future polled again leaves a fresh
-    /// one rather than assuming the old survived.
     pub fn take_or_seat(&self, tag: Tag, waker: &Waker) -> Option<Completion> {
         let taken = {
             let mut slot = lock(&self.slots[index_of(tag)]);
@@ -281,7 +248,7 @@ impl SlotTable {
         taken
     }
 
-    /// Give up on a flight, so its completion is reclaimed rather than delivered
+    /// Give up on an op, so its completion is reclaimed
     pub fn orphan(&self, tag: Tag) {
         let abandoned = {
             let mut slot = lock(&self.slots[index_of(tag)]);
@@ -308,15 +275,13 @@ impl SlotTable {
         self.signal(true);
     }
 
-    /// Put back what a completion nobody is waiting for is carrying
+    /// Reclaim the buffers of a completion nobody is waiting for
     pub fn discard(&self, completion: Completion) {
         reclaim(completion);
         self.reclaimed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Flights claimed and not yet answered
-    ///
-    /// Walked rather than counted, since nothing on the op path reads the count.
+    /// Slots that are not free, counted by walking the table
     pub fn outstanding(&self) -> usize {
         let mut held = 0;
         for slot in &self.slots {
@@ -338,15 +303,12 @@ impl SlotTable {
         seated
     }
 
-    /// Completions put back rather than delivered, since the table was opened
+    /// Completions reclaimed since the table was opened
     pub fn reclaimed(&self) -> u64 {
         self.reclaimed.load(Ordering::Relaxed)
     }
 
     /// Wait on a condition over the slots, draining the backend when nobody else is
-    ///
-    /// One thread polls the backend at a time and the rest park, so an empty
-    /// drain means the backend is empty rather than busy elsewhere.
     pub fn pump<Out, Ready, Drain>(&self, mut ready: Ready, mut drain: Drain) -> Result<Out>
     where
         Ready: FnMut() -> Option<Out>,
@@ -370,8 +332,7 @@ impl SlotTable {
             let polled = drain(&mut scratch);
             self.end_poll(scratch);
 
-            // The budget is the backend's, so a completion another thread filed
-            // while it ran still answers before this gives up on it.
+            // Another thread may have filed the answer during the drain, so check once more
             if polled? == 0 {
                 return match ready() {
                     Some(out) => Ok(out),
@@ -381,11 +342,7 @@ impl SlotTable {
         }
     }
 
-    /// Park a thread until a slot comes free rather than until the backend answers
-    ///
-    /// A slot frees when its caller takes the completion, so draining cannot free
-    /// one on its own; the drain is there for an orphan's slot, which frees where
-    /// its completion lands. For the blocking door alone.
+    /// Park a blocking caller until a slot comes free, giving up after `CLAIM_LIMIT`
     pub fn wait_free<Out, Ready, Drain>(&self, mut ready: Ready, mut drain: Drain) -> Result<Out>
     where
         Ready: FnMut() -> Option<Out>,
@@ -416,10 +373,6 @@ impl SlotTable {
     }
 
     /// Take the turn to drain the backend, or nothing if a thread already has it
-    ///
-    /// The buffer comes back with it, kept across turns so a drain allocates
-    /// nothing. One thread drains at a time, so an empty drain means an empty
-    /// backend.
     pub fn begin_poll(&self) -> Option<Vec<Completion>> {
         let mut door = lock(&self.door);
         if door.is_polling {
@@ -429,24 +382,20 @@ impl SlotTable {
         Some(std::mem::take(&mut door.scratch))
     }
 
-    /// Give the turn back, filing what the drain moved and ringing what it wakes
+    /// Give the turn back, filing what the drain moved and waking its waiters
     pub fn end_poll(&self, mut drained: Vec<Completion>) {
         self.file(&mut drained);
 
         let mut door = lock(&self.door);
         door.is_polling = false;
         door.scratch = drained;
-        // The turn coming back is what a thread parked for it is waiting on, and
-        // nothing outside this gate can tell it.
+        // Threads parked for the drain turn need to hear that it is free
         if self.parked.load(Ordering::SeqCst) > 0 {
             self.delivered.notify_all();
         }
     }
 
-    /// File completions into the slots waiting for them and ring what they wake
-    ///
-    /// The door a ring backend deposits through, taking no turn because the
-    /// reaping thread drained a queue of its own. The vector comes back empty.
+    /// File completions into their slots and wake their waiters, leaving the vector empty
     pub fn file(&self, drained: &mut Vec<Completion>) {
         let mut is_freed = false;
         for completion in drained.drain(..) {
@@ -469,9 +418,6 @@ impl SlotTable {
     }
 
     /// A claim on every slot a submission needs, taken as a future
-    ///
-    /// For the async door, where the thread a park would take is the one holding
-    /// the futures whose completions free the slots this is waiting for.
     pub fn claim<'table>(&'table self, wanted: &'table [Tag]) -> Claim<'table> {
         Claim {
             table: self,
@@ -511,10 +457,7 @@ impl SlotTable {
         true
     }
 
-    /// File one completion into its slot, answering the waker it has to ring
-    ///
-    /// A completion whose slot has moved on is one whose caller is gone. What
-    /// comes back is the waker to ring and whether the slot came free.
+    /// File one completion, returning the waker to wake and whether the slot came free
     fn land(&self, completion: Completion) -> (Option<Waker>, bool) {
         let (stale, is_freed) = {
             let mut slot = lock(&self.slots[index_of(completion.tag)]);
@@ -544,12 +487,9 @@ impl SlotTable {
         (None, is_freed)
     }
 
-    /// Take the drain turn if it is free, file what one poll moves, say so
-    ///
-    /// The awaited door's self-service, since the caller holding the future may
-    /// be the only one polling. A turn already taken is not waited for.
+    /// Take the drain turn if free, file what one poll moves, and say whether it moved any
     pub fn drain_once(&self, drain: impl FnOnce(&mut Vec<Completion>) -> Result<usize>) -> bool {
-        // Refused, the future stays passive and whoever else drains must wake it.
+        // When refused, the future waits for another drainer to wake it
         if crate::sync::rendezvous::refused("slots/self-drain") {
             return false;
         }
@@ -563,10 +503,6 @@ impl SlotTable {
     }
 
     /// Every non-free slot and the filing counters, for stall diagnosis
-    ///
-    /// Flight with no completion means the backend never answered, Landed
-    /// unclaimed means the future stopped polling, and no slot at all means the
-    /// claim or the submit never happened.
     pub fn debug_flights(&self) -> String {
         let mut out = format!(
             "landed {} stale {} reclaimed {} claiming {} parked {}\n",
@@ -591,10 +527,7 @@ impl SlotTable {
         out
     }
 
-    /// Ring what a change to a slot owes the callers waiting on the table
-    ///
-    /// The counts are read without taking either lock, and a count raised before
-    /// the table was read is what keeps this from passing over a waiting caller.
+    /// Wake the callers waiting on the table after a slot changes
     fn signal(&self, is_freed: bool) {
         if self.parked.load(Ordering::SeqCst) > 0 {
             let _door = lock(&self.door);
@@ -605,7 +538,7 @@ impl SlotTable {
         }
     }
 
-    /// Ring the claims a slot coming free owes a look at the table
+    /// Wake every seated claim after a slot comes free
     fn ring_claims(&self) {
         if self.claiming.load(Ordering::SeqCst) == 0 {
             return;
@@ -618,10 +551,7 @@ impl SlotTable {
         ring(owed);
     }
 
-    /// Leave a waker for a claim that found its slot carrying another flight
-    ///
-    /// One list for the whole table: an unwanted wake costs a look at the table,
-    /// where a seat never taken would cost the wait.
+    /// Seat a waker for a claim whose slot holds another op
     fn seat_claim(&self, waker: &Waker) {
         let mut claims = lock(&self.claims);
         for seated in claims.iter() {
@@ -642,11 +572,7 @@ impl SlotTable {
         }
     }
 
-    /// Ask the condition with this thread counted in, then park for a bounded time
-    ///
-    /// The count goes up before the table is read and down after the park, so a
-    /// change between the two finds a thread to signal. The park is bounded
-    /// because a notify landing between the ask and the wait would be missed.
+    /// Check the condition with this thread counted as parked, then park for a bounded time
     fn ask_parked<Out>(&self, ready: &mut impl FnMut() -> Option<Out>) -> Option<Out> {
         self.parked.fetch_add(1, Ordering::SeqCst);
         let answer = ready();
@@ -659,7 +585,7 @@ impl SlotTable {
     }
 }
 
-/// Ring what a change to the table owed, once its gates have been given back
+/// Wake these wakers, once the table's locks are released
 fn ring(woken: Vec<Waker>) {
     for waker in woken {
         waker.wake();
@@ -672,7 +598,7 @@ impl Default for SlotTable {
     }
 }
 
-/// A contiguous run of tags one submission went down as
+/// A contiguous run of tags from one submission
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TagRun {
     /// First tag of the run
@@ -683,9 +609,6 @@ pub struct TagRun {
 }
 
 /// The runs a batch's tags fall into, which is one run when nothing interleaved
-///
-/// Tags come off the counter in order, so an uninterrupted batch is a single run
-/// however many ops it carries.
 pub fn runs_of(wanted: &[Tag]) -> Vec<TagRun> {
     let mut runs: Vec<TagRun> = Vec::new();
     for tag in wanted {
@@ -703,12 +626,9 @@ pub fn runs_of(wanted: &[Tag]) -> Vec<TagRun> {
     runs
 }
 
-/// A submission waiting for the slots its tags name, taken as a future
-///
-/// Whole or nothing, so two claims cannot each hold half of what they need. It
-/// resolves before the ops go down, so a drop here has claimed nothing.
+/// A future that claims every slot a submission's tags need, all or nothing
 pub struct Claim<'table> {
-    /// The table the tags name slots in
+    /// The table holding the slots
     table: &'table SlotTable,
 
     /// The tags whose slots the submission needs, taken together
@@ -724,8 +644,7 @@ impl Future for Claim<'_> {
             return Poll::Ready(());
         }
 
-        // The seat goes down before the table is asked again, so a slot freed
-        // between the two rings this claim rather than passing over it.
+        // Seat the waker before asking again, so a slot freed in between wakes this claim
         waiter.table.seat_claim(cx.waker());
         if waiter.table.claim_all(waiter.wanted) {
             waiter.table.unseat_claim(cx.waker());
@@ -735,10 +654,7 @@ impl Future for Claim<'_> {
     }
 }
 
-/// One op in flight, taken as a future rather than by parking a thread
-///
-/// The op owns its buffers until its completion returns them, so dropping this
-/// abandons a slot and never a buffer.
+/// A future over one op in flight
 pub struct IoWait<'table> {
     /// The table holding the slot this flight owns
     table: &'table SlotTable,
@@ -761,18 +677,12 @@ impl Future for IoWait<'_> {
 
 impl Drop for IoWait<'_> {
     /// A future dropped while pending leaves its slot orphaned
-    ///
-    /// A future that already took its completion names a slot that moved on, so
-    /// this is a lookup that finds nothing rather than a state to track.
     fn drop(&mut self) {
         self.table.orphan(self.tag);
     }
 }
 
 /// A batch in flight, one future over the runs of tags it went down as
-///
-/// The batch holds its tags as runs and counts what is outstanding, so a hundred
-/// reads cost a range and a counter rather than a hundred futures.
 pub struct BatchWait<'table> {
     /// The table holding the slots these flights own
     table: &'table SlotTable,
@@ -783,7 +693,7 @@ pub struct BatchWait<'table> {
     /// What each tag came back with, in submit order
     filled: Vec<Option<Completion>>,
 
-    /// Completions still to land, which is when the batch answers
+    /// Completions still to land before the batch answers
     outstanding: usize,
 }
 
@@ -819,8 +729,7 @@ impl Future for BatchWait<'_> {
             return Poll::Pending;
         }
 
-        // The runs go with the completions, so the drop of an answered batch has
-        // no range left to orphan and no slot left to put back.
+        // Clear the runs, so dropping an answered batch orphans nothing
         let mut answered = Vec::with_capacity(waiter.filled.len());
         for completion in waiter.filled.drain(..).flatten() {
             answered.push(completion);
@@ -831,10 +740,7 @@ impl Future for BatchWait<'_> {
 }
 
 impl Drop for BatchWait<'_> {
-    /// A batch dropped while pending orphans its whole range
-    ///
-    /// The completions it already took are put back the same way an orphan's is,
-    /// since they came out of the pool and the caller never saw them.
+    /// A batch dropped while pending orphans its range and reclaims what it took
     fn drop(&mut self) {
         let mut at = 0;
         for index in 0..self.runs.len() {
@@ -850,10 +756,7 @@ impl Drop for BatchWait<'_> {
     }
 }
 
-/// Put back what a completion nobody is waiting for is carrying
-///
-/// The read buffers are the pool's and go back to it. An open that lands
-/// orphaned keeps its descriptor.
+/// Return an unwanted completion's read buffers to the pool
 fn reclaim(completion: Completion) {
     match completion.outcome {
         Outcome::Read { buf, .. } => crate::reel::payload::give(buf.into_vec()),
@@ -895,7 +798,7 @@ mod tests {
 
     use crate::io::op::ReadBuf;
 
-    /// A waker that counts what it takes, for a poll that must ring none
+    /// A waker that counts its wakes
     struct Counter(AtomicUsize);
 
     impl Wake for Counter {
@@ -971,7 +874,7 @@ mod tests {
         assert_eq!(run, 2);
     }
 
-    // a completion for a flight nobody is waiting on is reclaimed, not filed
+    // a completion for a flight nobody is waiting on is reclaimed
     #[test]
     fn a_stale_completion_is_reclaimed() {
         let table = SlotTable::new();
@@ -1046,7 +949,7 @@ mod tests {
         );
     }
 
-    // a claim that cannot take its whole run rings nobody, itself least of all
+    // a claim that cannot take its whole run wakes nobody, itself included
     #[test]
     fn a_rolled_back_claim_rings_nobody() {
         let table = SlotTable::new();
@@ -1071,7 +974,7 @@ mod tests {
             "the rollback rang its own claim"
         );
 
-        // The take is what a claim waits for, and the one change that has to ring it.
+        // The take frees the slot, which has to wake the claim
         table.file_one(done(1));
         assert!(table.take(Tag(1)).is_some());
 

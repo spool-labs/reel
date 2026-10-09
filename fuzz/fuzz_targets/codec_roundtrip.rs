@@ -1,10 +1,5 @@
-//! Admission and decode, as a contract rather than as two functions
-//!
-//! Three things must hold whatever the payload is. What admission kept must decode
-//! back to exactly the bytes it was given. What admission refused must be handed back
-//! untouched, since the caller stores whatever it returns. And decode must refuse or
-//! return on any byte string at all, because the bytes it is handed at read time are
-//! only as trustworthy as the checksum that let them through.
+//! Admission round-trips what it keeps and returns what it refuses untouched
+//! Decode must refuse or return on any bytes at all
 
 #![no_main]
 
@@ -14,13 +9,13 @@ use libfuzzer_sys::fuzz_target;
 use reel::append::codec::{admit, decode};
 use reel::format::column::Codec;
 
-/// Every codec the format names, drawn from so a second one is fuzzed on arrival
+/// Every codec in the format, so a new one is fuzzed as soon as it is listed
 const CODECS: &[Codec] = &[Codec::Lz4];
 
 /// One admission the case asks for
 #[derive(Arbitrary, Debug)]
 struct Case<'a> {
-    /// Which of the codecs the column would have named
+    /// Index into `CODECS` for the column's codec
     codec: u8,
 
     /// The bytes offered to admission
@@ -45,8 +40,7 @@ fuzz_target!(|case: Case| {
         }
     }
 
-    // The stored form under every byte, including the one that did not write it: a
-    // crossed byte is what a corrupt header looks like, and it must read as damage.
+    // Decode the stored form under every codec byte, as a crossed byte is how corruption looks
     for other in [0u8, Codec::Lz4.as_byte(), 0xff] {
         let _ = decode(other, &stored);
     }

@@ -1,8 +1,4 @@
-//! The store trait implementation over the reel engine
-//!
-//! The reel serves the columns it was opened with and rejects every other family.
-//! A value is stored exactly as it arrives and read back verbatim, and a playback
-//! steps the column's index in key order and reads payloads lazily.
+//! The store trait over the reel engine, serving only the columns it was opened with
 
 use std::ops::Bound;
 use std::path::Path;
@@ -21,37 +17,24 @@ use crate::index::entry::Entry;
 use crate::index::page::KeyPage;
 use crate::index::playback::{CursorBuffers, PlaybackCursor, Way};
 
-/// Keys a playback's first trip to the index pulls
-///
-/// A caller paging wants its page and nothing more, so the first trip is small. A
-/// caller walking a whole column wants few trips, so each trip doubles.
+/// A playback's first trip to the index pulls this many keys, and each trip doubles
 const PLAYBACK_PAGE_MIN: usize = 32;
 
-/// Ceiling the page size stops doubling at
+/// The page size stops doubling at this ceiling
 const PLAYBACK_PAGE_MAX: usize = 8192;
 
-/// Records a playback's first run asks the device for
-///
-/// A caller that stops after the keys it wanted still pays for every payload the run
-/// read ahead of it, so the first run is small and each one after it doubles.
+/// A playback's first run reads this many records, and each run after it doubles
 const PLAYBACK_RUN_MIN: usize = 8;
 
-/// Payload bytes a playback lets a run reach before it stops adding to it
-///
-/// Depth is worth having on small records, which are almost all wait, and worth
-/// nothing on large ones, which already keep the device busy on their own.
+/// A run stops adding records once its payloads reach this many bytes
 const PLAYBACK_READ_BYTES: u64 = 4 * 1024 * 1024;
 
 thread_local! {
-    /// The keys one thread's batched asks are resolved into, kept between batches
-    ///
-    /// A caller of the store trait hands over borrowed bytes and the engine addresses
-    /// records by a key of its own, so every batch builds one list of them. It goes
-    /// nowhere, so it stays with the thread.
+    /// This thread's batched asks resolve their keys into this list, kept between batches
     static BATCH_KEYS: std::cell::Cell<Vec<RecordKey>> = const { std::cell::Cell::new(Vec::new()) };
 }
 
-/// This thread's key list, given back however the batch that took it ends
+/// This thread's key list, given back however the batch ends
 struct HeldKeys(Vec<RecordKey>);
 
 impl HeldKeys {
@@ -63,8 +46,7 @@ impl HeldKeys {
 impl Drop for HeldKeys {
     fn drop(&mut self) {
         let mut held = std::mem::take(&mut self.0);
-        // Cleared here rather than on the way out, so a wide key's bytes are released
-        // when the batch ends rather than held until this thread asks again.
+        // Clear on drop so a wide key's bytes are freed when the batch ends
         held.clear();
         BATCH_KEYS.with(|spare| spare.set(held));
     }
@@ -73,7 +55,7 @@ impl Drop for HeldKeys {
 /// Where one key sits relative to a playback's bounds
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Position {
-    /// Behind the playback, so skip it and carry on
+    /// Behind the playback, so skip it
     Before,
 
     /// Inside the playback
@@ -90,7 +72,7 @@ impl Store for ReelStore {
         self.get(&key).map_err(StoreError::from)
     }
 
-    /// Ask the device for every key at once rather than one after another
+    /// Ask the device for every key at once
     fn get_many(&self, cf: &str, keys: &[&[u8]]) -> StoreResult<Vec<Option<Value>>> {
         let column = self.classify(cf)?;
         let mut held = HeldKeys::take();
@@ -102,9 +84,6 @@ impl Store for ReelStore {
     }
 
     /// Read a window of one value, moving only the bytes the window covers
-    ///
-    /// The index places the payload, so the range is a read of its own rather than
-    /// a whole record read and thrown away.
     fn get_range(
         &self,
         cf: &str,
@@ -117,7 +96,7 @@ impl Store for ReelStore {
         self.get_range(&key, offset, len).map_err(StoreError::from)
     }
 
-    /// The same window awaited rather than waited for, never through a mapping
+    /// The same window read awaited, never through a mapping
     async fn get_range_wait(
         &self,
         cf: &str,
@@ -132,7 +111,7 @@ impl Store for ReelStore {
             .map_err(StoreError::from)
     }
 
-    /// The same read awaited rather than waited for, never through a mapping
+    /// The same read awaited, never through a mapping
     async fn get_wait(&self, cf: &str, key: &[u8]) -> StoreResult<Option<Value>> {
         let column = self.classify(cf)?;
         let key = self.record_key(column, key)?;
@@ -158,7 +137,7 @@ impl Store for ReelStore {
         self.put(&key, value).map_err(StoreError::from)
     }
 
-    /// The same write awaited, with the sync forwarded rather than taken here
+    /// The same write awaited, with the sync forwarded to the engine
     async fn put_wait(&self, cf: &str, key: &[u8], value: &[u8]) -> StoreResult<()> {
         let column = self.classify(cf)?;
         let key = self.record_key(column, key)?;
@@ -179,7 +158,7 @@ impl Store for ReelStore {
         Ok(self.contains(&key)?)
     }
 
-    /// Apply a batch as one durability point rather than one per record
+    /// Apply a batch as one durability point for every record in it
     fn write_batch(&self, batch: WriteBatch) -> StoreResult<()> {
         let writes = self.record_writes(batch)?;
         self.apply_batch(writes).map_err(StoreError::from)
@@ -225,13 +204,7 @@ impl Store for ReelStore {
         Ok(self.scan_keys(&mut scope, column))
     }
 
-    /// Exact key count under a prefix, from the counters wherever they answer it
-    ///
-    /// An empty prefix is the column's live count and a prefix naming one shard is a
-    /// count that shard already keeps. Only a prefix cutting across shards steps
-    /// keys, and never payloads
-    ///
-    /// One page of a column, in no promised order, resumable by an opaque mark.
+    /// One page of a column, in no promised order, resumable by an opaque mark
     fn sweep(&self, cf: &str, from: Option<&[u8]>, limit: usize) -> StoreResult<SweptPage> {
         let column = self.classify(cf)?;
         let (keys, next) = self.swept_keys(column, None, from, limit)?;
@@ -445,9 +418,6 @@ impl Scope {
     }
 
     /// Where one key sits relative to the playback, in a single pass over the bounds
-    ///
-    /// Keys arrive in playback order, so the first key past the far bound ends the
-    /// playback and the near bound retires once one key has satisfied it.
     fn locate(&mut self, key: &[u8]) -> Position {
         if let Some(prefix) = &self.prefix {
             if !key.starts_with(prefix) {
@@ -508,10 +478,7 @@ impl ReelStore {
         }
     }
 
-    /// Resolve a batch to the writes the reel takes, refusing an unserved family
-    ///
-    /// Every family is classified before anything is converted, so a batch naming
-    /// one the reel does not serve is refused whole rather than half applied.
+    /// Resolve a batch to reel writes, refusing the whole batch if any family is unserved
     fn record_writes(&self, batch: WriteBatch) -> StoreResult<Vec<RecordWrite>> {
         for op in batch.iter() {
             self.classify(op.cf())?;
@@ -574,12 +541,7 @@ impl ReelStore {
             .map_err(|error| StoreError::Database(error.to_string()))
     }
 
-    /// A range bound at the shape the column's keys take
-    ///
-    /// A fixed column extends a short bound with zeros, since a bound shorter than a
-    /// key names the low end of the range that prefix covers, which is the right
-    /// reading for both ends of a half-open range. A variable column has no width to
-    /// extend to.
+    /// A range bound at the column's key shape, zero-padded or cut to a fixed width
     fn bound_bytes(&self, column: ColumnId, bound: &[u8]) -> Vec<u8> {
         let Some(KeyWidth::Fixed(width)) = self.key_shape(column) else {
             return bound.to_vec();
@@ -648,10 +610,7 @@ impl ReelStore {
             .collect())
     }
 
-    /// Walk keys alone from a bound, values never read
-    ///
-    /// The cursor a one-key question wants: a highest-key ask through a value
-    /// playback stages payloads it drops, where this stages nothing.
+    /// Walk keys alone from a bound, reading no values
     pub fn iter_keys_from(
         &self,
         cf: &str,
@@ -693,8 +652,7 @@ impl ReelStore {
         keys
     }
 
-    /// The entries inside a playback, in key order, reading each payload only when
-    /// the caller pulls it
+    /// The entries in a playback, in key order, with payloads read as the caller pulls
     fn scan_values(&self, scope: Scope, column: ColumnId) -> StoreIter<'_> {
         Box::new(self.playback(scope, column))
     }
@@ -724,11 +682,7 @@ impl ReelStore {
         }
     }
 
-    /// The same playback with its first page and run sized to what a caller wants
-    ///
-    /// A playback opens at the minimum page and run and doubles as it goes, which is
-    /// wrong for a caller that wants one row. A hint starts both at the caller's own
-    /// count, and zero keeps the defaults.
+    /// A playback whose first page and run start at the caller's hint, zero keeps defaults
     fn playback_sized(&self, scope: Scope, column: ColumnId, hint: usize) -> Playback<'_> {
         let mut playback = self.playback(scope, column);
         if hint != 0 {
@@ -742,11 +696,7 @@ impl ReelStore {
         playback
     }
 
-    /// A walk that lends both halves of each entry instead of handing them over
-    ///
-    /// `StoreIter` fixes its item at `(Vec<u8>, Value)`, so every caller takes an
-    /// owned key whether it wanted one or not. Here the key is lent from a buffer
-    /// the walk takes back on the next step.
+    /// A walk that lends each entry's key and value until the next step
     pub fn iter_lent(
         &self,
         cf: &str,
@@ -772,16 +722,12 @@ impl ReelStore {
     }
 }
 
-/// Keys one column contributes to a playback, pulled a page at a time
-///
-/// A page is a contiguous run of the index in playback order, so the next page picks
-/// up strictly past the last key the previous one carried. The index lock is taken
-/// once per page and never held across a payload read.
+/// A playback's keys from one column, pulled from the index a page at a time
 struct Page {
     /// Keys the last page pulled, with where each record sits
     buffered: KeyPage,
 
-    /// Whether the reel holds the column at all, since one it does not has no keys
+    /// Whether the reel holds the column, since an unserved one has no keys
     serves: bool,
 
     /// How many of the buffered keys the caller has already stepped past
@@ -806,7 +752,7 @@ impl Page {
         )
     }
 
-    /// A cursor carrying each key's payload length, for a playback that stages reads
+    /// A cursor that keeps each key's payload length, for a playback that stages reads
     fn with_lens(scope: &Scope, column: ColumnId, serves: bool) -> Page {
         Page::open(
             scope,
@@ -829,8 +775,7 @@ impl Page {
             Direction::Desc => Way::Down,
         };
         let bound = scope.start_bound();
-        // A bound wider than any key a column holds matches nothing, so a cursor that
-        // will not take it is a playback with no keys in it.
+        // A bound wider than any key matches nothing, so a refused cursor means no keys
         Page {
             buffered,
             serves,
@@ -856,7 +801,7 @@ impl Page {
         self.buffered.key_ref(slot).unwrap_or_default()
     }
 
-    /// The same step with the key written into a buffer the caller keeps
+    /// Step, writing the key into a buffer the caller keeps
     fn next_into(&mut self, store: &ReelStore, key: &mut Vec<u8>) -> Option<Option<Entry>> {
         let (slot, found) = self.step(store)?;
         key.clear();
@@ -886,7 +831,7 @@ impl Page {
             if let Some(KeyWidth::Fixed(width)) = store.key_shape(playback.column()) {
                 self.buffered.reserve(wanted, usize::from(width));
             }
-            // An iterator cannot return an error, so an unreadable page ends the playback and is counted
+            // An unreadable page ends the playback and is counted, since an iterator can't fail
             if let Err(error) = store.page_from(playback, wanted, &mut self.buffered) {
                 tracing::warn!("a playback stopped at a page it could not read: {error}");
                 store.note_unreadable();
@@ -904,10 +849,6 @@ impl Page {
 }
 
 /// A lazy ordered playback over one column
-///
-/// The keys come from the index a page at a time and the payloads from the device a
-/// run at a time, so a cold playback is a queue of reads rather than one read, one
-/// wait, and the next read.
 struct Playback<'store> {
     /// The engine the keys and payloads come from
     store: &'store ReelStore,
@@ -939,7 +880,7 @@ struct Playback<'store> {
     /// Whether the playback has run out of keys
     is_done: bool,
 
-    /// Where this playback's vectors go back to when it ends, for the thread's next one
+    /// The vectors go back here when the playback ends, for the thread's next one
     spare: Option<Box<WalkBuffers>>,
 }
 
@@ -977,10 +918,7 @@ impl Drop for Playback<'_> {
     }
 }
 
-/// A walk that lends each entry rather than handing it over
-///
-/// Not an `Iterator`, because the item borrows the walk and the trait cannot say
-/// so. Each step invalidates what the last one lent.
+/// A walk that lends each entry until the next step
 pub struct LentIter<'db> {
     playback: Playback<'db>,
 }
@@ -999,16 +937,11 @@ pub struct KeyIter<'db> {
     page: Page,
     scope: Scope,
 
-    /// One buffer for the whole walk, so a skipped key costs no allocation
     spare: Vec<u8>,
 }
 
 impl KeyIter<'_> {
     /// The next key written into a buffer the caller keeps, false at the end
-    ///
-    /// The lending step, mirroring the one the page itself offers: a caller that
-    /// overwrites its own held key on every step has nowhere to give the last one
-    /// back to, so the walk writes into the caller's buffer and keeps its own spare.
     pub fn next_into(&mut self, key: &mut Vec<u8>) -> bool {
         loop {
             if self.page.next_into(self.store, key).is_none() {
@@ -1052,7 +985,7 @@ impl Iterator for Playback<'_> {
 type ScopedKey = (usize, Option<Entry>);
 
 impl Playback<'_> {
-    /// The next key inside the playback's scope, and nothing past a page that staged keys point into
+    /// The next key in scope, stopping at the end of a page that staged keys point into
     fn next_in_scope(&mut self, is_staging: bool) -> Option<ScopedKey> {
         loop {
             if is_staging && self.page.is_drained() {
@@ -1100,12 +1033,7 @@ impl Playback<'_> {
         }
     }
 
-    /// Take the next run of keys off the page and read all of their payloads at once
-    ///
-    /// The run stops at the depth, the byte ceiling, the end of its page, or the end of
-    /// the playback. The ceiling is tested after a record is added, so a record larger
-    /// than the whole ceiling is read on its own rather than never. The depth doubles
-    /// per run, so a caller that stops early pays for what it nearly wanted.
+    /// Take the next run of keys off the page and read all their payloads at once
     fn read_run(&mut self) {
         let wanted = self.run;
         self.run = self.run.saturating_mul(2);
@@ -1122,23 +1050,20 @@ impl Playback<'_> {
             self.found.push(entry);
         }
 
-        // The entries came off the page the index already built, so the read goes
-        // straight to the device rather than resolving these keys a second time.
+        // The page already resolved these keys, so the read goes straight to the device
         let column = self.column;
         let keys: Vec<KeyRef<'_>> = self
             .staged
             .iter()
             .map(|&slot| KeyRef::new(column, self.page.key(slot)))
             .collect();
-        // A failed read says nothing about which record failed it, so every key it
-        // left missing is looked up on its own and an unreadable one drops out.
+        // A failed read doesn't say which record failed, so missed keys are read one at a time
         if let Err(error) = self.store.read_placed(&keys, &self.found, &mut self.placed) {
             tracing::warn!("a playback read a run one record at a time: {error}");
         }
         let missed: Vec<usize> = self.placed.missed().collect();
         for at in missed {
-            // The record moved or went bad since the page resolved it, which is what
-            // compaction does under a playback.
+            // The record moved or went bad since the page resolved it, as compaction does
             match keys[at].to_owned_key().and_then(|key| self.store.get(&key)) {
                 Ok(Some(value)) => self.placed.hold(at, value),
                 Ok(None) => {}
@@ -1164,8 +1089,7 @@ fn available_bytes(root: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
 
     let path = std::ffi::CString::new(root.as_os_str().as_bytes()).ok()?;
-    // SAFETY: statvfs writes the whole struct it is handed, and the path is a
-    // NUL-terminated buffer that outlives the call.
+    // SAFETY: statvfs fills the whole struct and the NUL-terminated path outlives the call
     let mut stats = unsafe { std::mem::zeroed::<libc::statvfs>() };
     match unsafe { libc::statvfs(path.as_ptr(), &mut stats) } {
         0 => Some(stats.f_bavail as u64 * stats.f_frsize as u64),
@@ -1190,7 +1114,7 @@ mod tests {
     use crate::io::sim_backend::SimIo;
     use crate::sync::tension::block_on;
 
-    /// Virtual volume root the simulator files live under
+    /// The simulator's files live under this root
     const ROOT: &str = "/bulk";
 
     const RECORD_CF: &str = "record";
@@ -1203,7 +1127,7 @@ mod tests {
     const BLOB_KEY_LEN: usize = 32;
     const ARTIFACT_KEY_LEN: usize = 24;
 
-    /// The columns these cases open the engine with, the way any caller declares its own
+    /// The columns these tests open the engine with
     const TEST_COLUMNS: ColumnSet = &[
         ColumnSpec {
             id: ColumnId(1),
@@ -1253,9 +1177,6 @@ mod tests {
     }
 
     /// Run work with a thread draining the simulator behind it
-    ///
-    /// The simulator neither answers at submission nor files from a thread of its
-    /// own, so a pending read lands only when somebody drains it.
     fn reaping<Out>(store: &ReelStore, work: impl FnOnce() -> Out) -> Out {
         let is_done = AtomicBool::new(false);
         std::thread::scope(|scope| {
@@ -1284,10 +1205,7 @@ mod tests {
         (store, sim)
     }
 
-    /// The engine seen through the store trait, which is what these cases drive
-    ///
-    /// The engine's own methods shadow the trait's, so going through the trait has
-    /// to be said out loud.
+    /// The engine as a `Store`, since its own methods shadow the trait's
     fn trait_store(store: &ReelStore) -> &dyn Store {
         store
     }
@@ -1338,8 +1256,7 @@ mod tests {
             .put(CODED_CF, &[9u8; BLOB_KEY_LEN], &payload)
             .expect("put coded");
 
-        // The guard the case rests on: an uncoded record here would make every
-        // assertion below pass without saying anything.
+        // An uncoded record here would make every assertion below pass vacuously
         let stored = engine.column_totals(ColumnId(4)).bytes.to_bytes();
         assert!(
             stored < payload.len() as u64,
@@ -1364,8 +1281,7 @@ mod tests {
                 .map(Value::into_vec);
             assert_eq!(coded, raw, "range at {offset} for {len}");
 
-            // Asked of the engine itself, since the awaited reads are not
-            // dispatchable through a trait object.
+            // Awaited reads go through the engine, since a trait object can't dispatch them
             let awaited = block_on(Store::get_range_wait(
                 &engine,
                 CODED_CF,
@@ -1378,14 +1294,14 @@ mod tests {
             assert_eq!(awaited, raw, "awaited range at {offset} for {len}");
         }
 
-        // A key nothing wrote answers nothing rather than no bytes, coded or not.
+        // A key nothing wrote answers nothing
         assert!(store
             .get_range(CODED_CF, &[1u8; BLOB_KEY_LEN], 0, 4)
             .expect("missing coded range")
             .is_none());
     }
 
-    // a playback asks the device for a run of payloads rather than one at a time
+    // a playback asks the device for a run of payloads at once
     #[test]
     fn a_walk_reads_in_runs() {
         let (store, sim) = store_with_io();
@@ -1397,8 +1313,7 @@ mod tests {
                 .expect("put");
         }
 
-        // Records written in one batch are one byte range, so a playback over them
-        // takes fewer reads than records.
+        // Puts from one thread land side by side, so the playback takes fewer reads than records
         let before = sim.read_count();
         let played: Vec<(Vec<u8>, Vec<u8>)> = store
             .iter(RECORD_CF)
@@ -1426,7 +1341,7 @@ mod tests {
             store.put(RECORD_CF, &bytes, &[7u8; 64]).expect("put");
         }
 
-        // One key wanted, so one run at the floor rather than one sized to the column.
+        // One key wanted, so one run at the floor
         let before = sim.read_bytes();
         let first = store.iter(RECORD_CF).expect("iter").next();
         assert!(first.is_some(), "the playback found its first key");
@@ -1438,8 +1353,7 @@ mod tests {
         let taking_all = sim.read_bytes() - before;
         assert_eq!(played, count);
 
-        // Far more bytes than one run's, so the first caller was never charged for
-        // the whole column.
+        // The full walk reads far more, so the single-key caller never paid for the column
         assert!(
             taking_all > taking_one * 3,
             "taking one key read {taking_one} bytes against {taking_all} for all {count}"
@@ -1512,10 +1426,7 @@ mod tests {
         assert_eq!(looped[7], None);
     }
 
-    // the awaited reads through the trait answer what the blocking ones answer
-    //
-    // Through the concrete store, since the futures are the backend's own types and
-    // the async door is not dispatchable.
+    // the awaited reads answer what the blocking reads answer
     #[test]
     fn awaited_reads_match() {
         let store = store();
@@ -1603,7 +1514,7 @@ mod tests {
         assert!(block_on(Store::write_batch_wait(&store, batch)).is_err());
     }
 
-    // an unserved family is refused by the batch just as it is by the single read
+    // a batch read refuses an unserved family
     #[test]
     fn get_many_refuses_an_unserved_family() {
         let store = store();
@@ -1613,7 +1524,7 @@ mod tests {
         assert!(store.get_many("not_a_reel_family", &asked).is_err());
     }
 
-    // the reel serves the columns it was opened with and refuses every other name
+    // the reel serves the columns it was opened with and refuses every other family
     #[test]
     fn serves_the_declared_columns() {
         let store = store();
@@ -1657,7 +1568,7 @@ mod tests {
         );
     }
 
-    // a key that is not the column's width is refused rather than padded
+    // a key of the wrong width is refused
     #[test]
     fn wrong_width_key_refused() {
         let store = store();
@@ -1741,8 +1652,7 @@ mod tests {
             .put(RECORD_CF, &record(7, 2), &[0x22; 16])
             .expect("put");
 
-        // The shard prefix is answered from the counters, the deeper one by a walk,
-        // and the two have to agree about the same records.
+        // The counters answer the shard prefix and a walk answers the deeper one
         assert_eq!(
             store
                 .bytes_prefix(RECORD_CF, &7u16.to_be_bytes())
@@ -1780,7 +1690,7 @@ mod tests {
         assert_eq!(store.bytes_prefix(RECORD_CF, &[]).expect("bytes"), Some(0));
     }
 
-    // a count that cuts across shards steps the keys rather than the counters
+    // a count under a prefix the shards can't answer steps the keys
     #[test]
     fn count_across_shards() {
         let store = store();
@@ -1844,7 +1754,7 @@ mod tests {
             .expect("open")
     }
 
-    /// Two big-endian words, the shape the store's plain columns key on
+    /// Two big-endian words, the key shape of the plain columns
     fn pair(high: u64, low: u64) -> Vec<u8> {
         let mut bytes = high.to_be_bytes().to_vec();
         bytes.extend_from_slice(&low.to_be_bytes());
@@ -2009,7 +1919,7 @@ mod tests {
         assert_eq!(found.len(), 15);
     }
 
-    // the usage report names every column the reel serves
+    // the usage report lists every column the reel serves
     #[test]
     fn usage_covers_every_family() {
         let store = store();

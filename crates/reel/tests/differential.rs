@@ -1,9 +1,4 @@
-//! Differential property tests of the reel store against an in-memory oracle
-//!
-//! Each seeded op stream runs against a reel-mock store and a reel store at once, and the
-//! observable state of both must agree after every step. Streams run at one active tail
-//! and at four, since four tails is what puts the reel through the version guard on every
-//! insert.
+//! Differential tests of the reel store against the reel-mock oracle at one and four tails
 
 #[allow(dead_code)]
 mod harness;
@@ -14,28 +9,25 @@ use reel::{ByteCount, ReelConfig, SyncPolicy, ThreadBudget};
 use harness::fixture::Differential;
 use harness::op_stream;
 
-/// Seeds the default streams are drawn from
+/// The default streams draw from these seeds
 const SEEDS: &[u64] = &[1, 2, 3, 7, 42, 99, 123, 2024];
 
 /// Length of each default stream
 const STREAM_LEN: usize = 120;
 
-/// Segment size that rolls a few times over a default stream
+/// Segment size, small enough that a default stream rolls a few segments
 const SEGMENT_BYTES: u64 = 64 * 1024;
 
 /// How often the soak stream checks agreement and compacts the reel
 const SOAK_CHECK_EVERY: usize = 200;
 
-/// Length of the soak stream when the environment does not override it
+/// Soak stream length unless `REEL_SOAK_OPS` overrides it
 const DEFAULT_SOAK_OPS: usize = 1_000_000;
 
-/// Segment size the soak uses so segments roll slowly enough for compaction to keep pace
+/// The soak's segment size, large enough that compaction keeps pace with sealing
 const SOAK_SEGMENT_BYTES: u64 = 1024 * 1024;
 
-/// Segment size a paged stream uses, small enough that a stream seals many segments
-///
-/// A key only reaches a footer once its segment seals, so a run over the default
-/// segment would page nothing out.
+/// Paged segment size, small enough that a stream seals many segments into footers
 const PAGED_SEGMENT_BYTES: u64 = 16 * 1024;
 
 /// Length of a paged stream, long enough to seal several segments at that size
@@ -71,7 +63,7 @@ fn paged_config(active_tails: u32) -> ReelConfig {
 /// A paged volume that seals enough segments for its walk to pass the merge depth
 fn merging_config(active_tails: u32) -> ReelConfig {
     ReelConfig {
-        // Half the paged segment is the smallest that fits a batch and its block, and the paged size seals too few to merge
+        // Half the paged size, the smallest segment that fits a batch and its block
         segment_bytes: ByteCount::from_bytes(8 * 1024),
         ..paged_config(active_tails)
     }
@@ -111,10 +103,7 @@ fn single_tail() {
     }
 }
 
-/// A plan that only moves when a caller is answered, never what it is answered with
-///
-/// Delays every few ops and drains in reverse of submit order, so a caller never sees the
-/// order it filed in. Neither can fail an op, which is what lets the exact oracle stand.
+/// A plan that delays every seventh op's completion and drains completions in reverse order
 fn completion_plan(seed: u64) -> FaultPlan {
     let mut plan = FaultPlan::new(seed).with_reorder();
     for at in (0..20_000u64).step_by(7) {

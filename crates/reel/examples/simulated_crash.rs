@@ -1,9 +1,4 @@
-//! Crash behaviour with no device: a fault plan, a simulated volume, a reopen
-//!
-//! The plan tears one append so the device keeps a header and drops the payload,
-//! then refuses the next one for want of space. The image taken afterwards is what
-//! a power cut would have left, and reopening from it shows the durable prefix
-//! whole, the torn record gone, and the refused record never there.
+//! Crash behaviour on a simulated device: a torn append, a refused one, then a reopen
 //!
 //! cargo run --example simulated_crash
 
@@ -31,25 +26,25 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     codec: Codec::None,
 }];
 
-/// Virtual root the simulated files live under, since no directory is touched
+/// The simulated files live under this virtual root, so no real directory is touched
 const ROOT: &str = "/bulk";
 
 const KEY_LEN: usize = 16;
 const PAYLOAD_LEN: usize = 512;
 
-/// Records the run writes, and the two the plan singles out
+/// The run writes this many records, and the plan targets the last two
 const RECORD_COUNT: u32 = 8;
 const TORN_RECORD: u32 = 6;
 const REFUSED_RECORD: u32 = 7;
 
-/// Op positions of the last two records' writes, at one tail syncing every put
+/// Op positions of the last two records' writes, with one tail syncing every put
 const TORN_AT: u64 = 26;
 const ENOSPC_AT: u64 = 29;
 
-/// Payload bytes that survive the tear, behind the header that describes them
+/// The tear keeps the header and this many payload bytes
 const TORN_PAYLOAD_BYTES: u64 = 8;
 
-/// Seed the plan reproduces from
+/// The fault plan's seed
 const SEED: u64 = 1;
 
 fn config() -> ReelConfig {
@@ -94,8 +89,7 @@ fn main() -> reel::Result<()> {
         }
     }
 
-    // A torn append reports the whole write, so the volume counts a record the device
-    // kept only the head of.
+    // A torn append still reports success, so the volume counts that record as live
     assert_eq!(
         refused,
         vec![REFUSED_RECORD],
@@ -107,8 +101,7 @@ fn main() -> reel::Result<()> {
         store.totals().count
     );
 
-    // Power cut: nothing closed, nothing flushed, so the image is what the medium
-    // holds at this instant.
+    // Power cut: nothing is closed or flushed, so the image is what the medium holds now
     let image = sim.durable_image();
     drop(store);
 

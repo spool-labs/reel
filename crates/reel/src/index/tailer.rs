@@ -1,10 +1,4 @@
 //! Following the log from a reader that does not own it
-//!
-//! A read-only open holds an index nothing advances, so a reader does what recovery
-//! does from where it last stopped. Ordering is the whole difficulty: a
-//! segment-by-segment read is not in sequence order, and range tombstones are not
-//! guarded by sequence number the way puts and point tombstones are, so the reader
-//! keeps the ranges it has seen and tests later records against them.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,23 +18,13 @@ use crate::io::op::FileId;
 use crate::reel::segment::{read_segment_header, IoDriver};
 use crate::reel::{segment_file_name, segment_number};
 
-/// Sequence numbers a range delete is kept for once the pass has moved past it
-///
-/// A cover is for a later pass delivering something older, which happens when a
-/// record drew its sequence number before the cover but had not landed where the
-/// reader had read to. The admission budget bounds how far apart those can be.
+/// A pass keeps a range delete for this many sequence numbers after it moves past it
 const COVER_WINDOW: u64 = 1 << 20;
 
-/// Covers a reader holds before it stops trusting the list at all
-///
-/// Quietly dropping a cover would let a deleted key come back, so a reader past
-/// this says so and the caller rebuilds instead, which needs no covers at all.
+/// A reader holding more covers than this says so, and the caller rebuilds
 const MAX_COVERS: usize = 4096;
 
 /// How far a reader has consumed the log, and what it still has to remember
-///
-/// The positions are per segment because that is where a walk resumes. The ranges
-/// outlive any one pass, since a record old enough to hide may arrive much later.
 #[derive(Debug, Default)]
 pub struct LogCursor {
     /// How far the last pass read in each segment
@@ -56,7 +40,7 @@ impl LogCursor {
         LogCursor::default()
     }
 
-    /// Segments the cursor is tracking a position in
+    /// How many segments the cursor tracks a position in
     pub fn len(&self) -> usize {
         self.positions.len()
     }
@@ -66,7 +50,7 @@ impl LogCursor {
         self.positions.is_empty()
     }
 
-    /// Range deletes the reader is still holding against older records
+    /// How many range deletes the reader still holds against older records
     pub fn range_count(&self) -> usize {
         self.ranges.len()
     }
@@ -80,15 +64,11 @@ impl LogCursor {
 
     /// Forget a segment the volume no longer has
     fn retire(&mut self, segment: SegmentId) {
-        // Packed, since the segment numbers climb and retirement drains the low
-        // end, where the bare removal would leave the emptied leaves behind.
+        // Packed, since retirement drains the low end, where a bare removal leaves empty leaves
         self.positions.remove_packed(&segment);
     }
 
-    /// Drop the covers nothing older than can still arrive
-    ///
-    /// No writer can hold a record unlanded a whole window, so a cover that far
-    /// below the highest sequence number seen has outlived what it could hide.
+    /// Drop the covers too far below the highest sequence number to hide anything still arriving
     fn prune_covers(&mut self, highest_lsn: Lsn) {
         let floor = highest_lsn.as_u64().saturating_sub(COVER_WINDOW);
         if floor == 0 {
@@ -112,26 +92,20 @@ pub struct CaughtUp {
     /// Records the pass read and declined as stale or covered
     pub skipped: u64,
 
-    /// Segments the volume has retired since the last pass, named so a reader can
-    /// drop exactly those descriptors
+    /// Segments the volume has retired since the last pass, so a reader drops those descriptors
     pub retired: Vec<SegmentId>,
 
     /// Highest sequence number the pass saw
     pub highest_lsn: Lsn,
 
-    /// Whether the reader holds more range deletes than it can keep testing, so it
-    /// should rebuild rather than keep following
+    /// Whether the reader holds more range deletes than it can keep testing, so it should rebuild
     pub is_saturated: bool,
 
-    /// The retired segments still held this many counted versions after the pass, and only a rebuild settles them
+    /// Versions still counted in retired segments after the pass, which only a rebuild settles
     pub lost: u64,
 }
 
 /// Advance a reader's index to what the volume holds now
-///
-/// The walk starts where the last pass stopped in every segment still present,
-/// picks up the segments that have appeared and drops the ones that have gone.
-/// Applying in sequence order is what makes a pass match the writer's own.
 pub fn catch_up(
     driver: &IoDriver,
     reel_dir: &Path,
@@ -170,17 +144,16 @@ pub fn catch_up(
         sealed.extend(footer.map(|footer| (*segment, footer)));
     }
 
-    // The index's guards assume sequence order, and across passes the ranges kept cover what sorting one pass cannot
+    // The index's guards assume sequence order, and kept ranges cover what one pass's sort cannot
     found.sort_by_key(|record| record.lsn);
-    // A follower serves reads throughout, so the pass publishes under the index's own
-    // barrier, with every device read it needed already done above.
+    // A follower serves reads throughout, so the pass publishes under the index's barrier
     let applied = index.publish_pass(|| apply_all(index, cursor, found, &gone));
     // Retired after the pass applies, so its writes can book the versions these segments held
     for segment in &gone {
         cursor.retire(*segment);
         index.forget_segment(*segment);
     }
-    // A counted slot left in a retired segment holds a version no record moved or booked, such as one a range delete took
+    // A counted slot left in a retired segment holds a version no record moved or booked
     let lost = index.forget_retired_slots();
     let mut result = applied?;
     result.retired = gone;
@@ -196,13 +169,13 @@ pub fn catch_up(
         }
     }
 
-    // After the pass, since the highest sequence number seen is what decides it.
+    // Prune after the pass, since the highest sequence number seen decides it
     cursor.prune_covers(result.highest_lsn);
     result.is_saturated = cursor.is_saturated();
     Ok(result)
 }
 
-/// What a follower has not yet read of one segment, where it reads from next, and the footer once it has sealed
+/// What a follower has not read of one segment, where it reads next, and its footer once sealed
 fn follow_segment(
     driver: &IoDriver,
     file: FileId,
@@ -273,8 +246,7 @@ fn apply_one(
         return index.remove(&record.key, record.lsn, record.loc);
     }
 
-    // A record a range delete already covered must not come back, and nothing in
-    // the index would refuse it: the key is absent, so the put looks fresh.
+    // A record a range delete covered must stay gone, and the index would take it as fresh
     if cursor
         .ranges
         .iter()
@@ -283,8 +255,7 @@ fn apply_one(
         return Ok(false);
     }
 
-    // A relocation is the same version in a new place, so taking it for a stale
-    // write would leave the reader on the segment compaction is about to unlink.
+    // A relocation is the same version in a new place, so the key follows it
     if record.flags.is_relocated() {
         let from = index.retired_source(&record.key, retired, record.loc.len);
         if index.repoint(&record.key, from, record.loc, record.lsn)? {
@@ -432,7 +403,7 @@ mod tests {
         assert_eq!(cursor.range_count(), 1);
     }
 
-    // a reader past the ceiling says so rather than quietly dropping a cover
+    // a reader past the ceiling reports saturation
     #[test]
     fn too_many_covers_saturates() {
         let index = index();
@@ -448,7 +419,7 @@ mod tests {
         );
     }
 
-    // a relocation repoints the key rather than being taken for a stale write
+    // a relocation repoints the key to its new place
     #[test]
     fn a_relocation_repoints() {
         let index = index();

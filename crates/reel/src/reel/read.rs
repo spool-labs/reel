@@ -20,7 +20,7 @@ use reel_core::{ReadBlock, Value};
 /// What a reader holds against the record at a place
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Proof {
-    /// The index's stamp still vouches for the place, so a keyless record answers to its shape
+    /// The index's stamp still vouches for the place, so a keyless record is checked by its shape
     Place,
 
     /// A spot slot or a stale stamp gave the place, so the record proves itself by its check
@@ -41,10 +41,7 @@ impl Proof {
     }
 }
 
-/// A whole framed record, or nothing when the segment no longer holds one there
-///
-/// A short read hands both buffers back where they came from, and a segment that is
-/// gone reads as nothing rather than as an error.
+/// A whole framed record, or nothing when the segment is gone or no longer holds one there
 pub(super) fn framed_or_nothing(
     read: SplitAnswer,
     prefix: usize,
@@ -72,10 +69,7 @@ pub(super) fn window_start(loc: Loc, prefix: usize, at: u64) -> u64 {
     u64::from(loc.offset) + prefix as u64 + at
 }
 
-/// A whole window, or nothing when the volume cannot answer it
-///
-/// A short read and a missing segment both read as nothing rather than as an error,
-/// since the caller has a header-checked read to fall back to.
+/// A whole window, or nothing when the read comes up short or the segment is gone
 pub(super) fn window_or_nothing(read: Result<Vec<u8>>, len: usize) -> Result<Option<Value>> {
     match read {
         Ok(bytes) if bytes.len() == len => {
@@ -90,27 +84,18 @@ pub(super) fn window_or_nothing(read: Result<Vec<u8>>, len: usize) -> Result<Opt
     }
 }
 
-/// Whether a record's header and key hash to the checksum it was written with
+/// Whether a record's header, key and payload hash to the checksum it was written with
 fn is_intact(prefix: &[u8], payload: &[u8]) -> bool {
     RecordHeader::unpack(prefix).is_ok_and(|header| header.verify(payload))
 }
 
-/// Bytes of gap a merged read spans rather than breaking the run
-///
-/// Reading a small gap costs the bytes and saves the round trip.
+/// A merged read spans a gap of up to this many bytes and keeps the run going
 pub(super) const MERGE_GAP: u64 = 4 * 1024;
 
-/// Bytes one merged read reaches before the run is broken
-///
-/// A bound on what a single answer can hold, since every window cut from a block
-/// keeps the whole block alive until it drops.
+/// One merged read reaches at most this many bytes before the run is broken
 const MERGE_SPAN: u64 = 1024 * 1024;
 
-/// The same bound on a volume whose reads bypass the page cache
-///
-/// A read the registered buffer cannot serve leaves the ring for the posix path a record
-/// at a time. The cap is the request width less the block a covering read rounds out by,
-/// so every run that merges is one the ring can still carry whole.
+/// The same bound on a direct volume, the request width less one alignment block
 const DIRECT_MERGE_SPAN: u64 = (DIRECT_REQUEST_BYTES - DIRECT_ALIGN) as u64;
 
 /// Bytes a merged read on this backend reaches before the run is broken
@@ -147,10 +132,7 @@ pub(super) struct Run {
     pub(super) span: u64,
 }
 
-/// Group records that sit next to each other into the reads that will serve them
-///
-/// Only forward, only within one segment, and only across a small gap: a run that
-/// went backwards or jumped would read the bytes between for nothing.
+/// Group records that sit next to each other in one segment into the reads that serve them
 pub(super) fn merge_runs_into(plan: &[Planned], span: u64, runs: &mut Vec<Run>) {
     runs.clear();
     let mut start = 0usize;
@@ -176,9 +158,7 @@ pub(super) fn joins(last: &Planned, next: &Planned, from: u64, span: u64) -> boo
         && next.end() - from <= span
 }
 
-/// Check one record framed inside a merged read, yielding why it was rejected
-///
-/// Nothing rather than a verdict means the record is good and its window stands.
+/// Check one record framed inside a merged read, returning its codec or why it was rejected
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_in_block(
     block: &[u8],
@@ -241,10 +221,7 @@ fn placed_keyless(
     })
 }
 
-/// Frame every record each run read, leaving its spot in the run's block
-///
-/// A run that came back short, or a segment gone under it, leaves its records as
-/// misses for the caller to resolve again.
+/// Frame every record each run read, leaving the records of short or missing runs as misses
 pub(super) fn place_runs(
     scratch: &mut ReadScratch,
     asks: &[Ask],
@@ -301,10 +278,9 @@ pub(super) fn frame_to_read(
     layout: RecordLayout,
     proof: Proof,
 ) -> RecordRead {
-    // Wrapped before anything can return, so a record the checks reject still
-    // hands its buffer back to the pool rather than to the allocator.
+    // Wrapped first, so a rejected record still hands its buffer back to the pool
     let body = Value::pooled(body, crate::reel::payload::give);
-    // A keyless record from a spot slot proves itself by its check, one from a row or the map by its shape
+    // A spot slot's keyless record proves itself by its check, a row's or the map's by its shape
     if let Some(check) = layout.keyless_key(loc.len) {
         if let Some(codec) = placed_keyless(&head, loc.len, proof) {
             recycle_header(head);
@@ -336,8 +312,7 @@ pub(super) fn frame_to_read(
 /// A checked record's payload, decoded where a codec produced it
 pub(super) fn decoded(codec: u8, body: Value) -> RecordRead {
     if codec != 0 {
-        // A decode that fails is corruption wearing a valid checksum, answered
-        // exactly as a failed checksum is.
+        // A failed decode is corruption under a valid checksum, so it reads as corrupt
         return match crate::append::codec::decode(codec, &body) {
             Some(decoded) => RecordRead::Found(Value::pooled(decoded, crate::reel::payload::give)),
             None => RecordRead::Corrupt,
@@ -400,17 +375,11 @@ pub(super) fn near_range(
 }
 
 /// The window of a block a range asked for, or nothing when the block is short
-///
-/// One window and no neighbours, so the value owns the block outright rather than
-/// sharing it by refcount.
 pub(super) fn cut_range(block: Vec<u8>, at: usize, len: usize) -> Option<Value> {
     Value::cut(block, crate::reel::payload::give, at, len)
 }
 
-/// Turn a deep range's two reads into one answer
-///
-/// Either read coming back short says the same thing a short framed read does: the
-/// segment no longer holds what the pointer described.
+/// Turn a deep range's two reads into one answer, a short read reading as stale
 pub(super) fn deep_range(
     filled: Vec<SplitRead>,
     prefix: usize,
@@ -419,8 +388,7 @@ pub(super) fn deep_range(
     lsn: Lsn,
     loc: Loc,
 ) -> Result<RecordRead> {
-    // Taken apart in place: a ranged read is always exactly its header and its
-    // window, so there is nothing to stage them through.
+    // A ranged read is always exactly its header and its window
     let Ok([first, second]) = <[SplitRead; 2]>::try_from(filled) else {
         return Err(ReelError::Backend(
             "a ranged read came back with something other than its two reads".to_string(),
@@ -428,8 +396,7 @@ pub(super) fn deep_range(
     };
     let head = match ranged_bytes(first)? {
         Some(bytes) => bytes,
-        // A segment retired under the read, which a reader can lose without
-        // anything being wrong with the record.
+        // A segment retired under the read, which leaves nothing wrong with the record
         None => return Ok(RecordRead::Stale),
     };
     let range = match ranged_bytes(second) {
@@ -456,9 +423,6 @@ pub(super) fn deep_range(
 }
 
 /// What one read of a ranged pair filled, or nothing when its segment is gone
-///
-/// The header buffer a split read carries is empty here, since both reads of a deep
-/// range are whole-body reads, so it goes straight back to the pool.
 fn ranged_bytes(read: SplitRead) -> Result<Option<Vec<u8>>> {
     match read {
         Ok((empty, body)) => {
@@ -471,8 +435,6 @@ fn ranged_bytes(read: SplitRead) -> Result<Option<Vec<u8>>> {
 }
 
 /// Decide what a ranged read means, once its bytes and its record's header are in hand
-///
-/// What is missing is the checksum, which covers bytes this read does not hold.
 pub(super) fn frame_to_range(
     head: &[u8],
     body: Value,
@@ -483,9 +445,7 @@ pub(super) fn frame_to_range(
     let Some(codec) = data_codec(head, expected, lsn, loc.len) else {
         return Ok(RecordRead::Stale);
     };
-    // The offsets the caller asked at address the payload this record decodes to,
-    // and none of that payload is on the volume, so the window is left to a whole
-    // read that decodes and cuts.
+    // A coded record's window addresses its decoded payload, so a whole read must cut it
     if codec != 0 {
         return Ok(RecordRead::Coded);
     }

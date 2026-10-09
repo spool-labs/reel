@@ -1,7 +1,4 @@
-//! Backend selection: the configured choice, with a posix downgrade
-//!
-//! A ring the kernel refuses to set up, or a platform without one, downgrades to
-//! posix with one warning rather than failing the volume open.
+//! Picks the configured backend, falling back to posix with a warning when no ring sets up
 
 use std::sync::Arc;
 
@@ -16,15 +13,13 @@ enum BackendDecision {
     Posix,
     /// A ring was set up and serves the volume
     Ring,
-    /// A ring was requested and could not be set up, so posix serves instead
+    /// A ring was requested and could not be set up, so posix serves
     RingUnavailable,
 }
 
-/// Choose a backend from config, downgrading to posix when the ring cannot serve
-/// the request
+/// Choose a backend from config, falling back to posix when the ring cannot be set up
 pub fn select_backend(config: &ReelConfig) -> Arc<dyn ReelIo> {
-    // What is announced is asked of the backend that was built, not derived from
-    // the config beside it, so the line cannot say ring while posix serves.
+    // The log line asks the built backend what it is, so it cannot say ring while posix serves.
     if wants_ring(config.io_backend) {
         if let Some(ring) = open_ring(config) {
             announce(BackendDecision::Ring, ring.serving());
@@ -39,18 +34,12 @@ pub fn select_backend(config: &ReelConfig) -> Arc<dyn ReelIo> {
     posix
 }
 
-/// The posix backend a volume runs when the ring is not serving it
-///
-/// A direct volume that loses the ring keeps its direct descriptors: the backend
-/// choice picks who submits the op, not whether the page cache stands behind it.
+/// The posix backend for a volume without a ring, still direct when the config wants it
 fn fallback_posix(config: &ReelConfig) -> PosixBackend {
     PosixBackend::with_direct(wants_direct(config))
 }
 
-/// Whether this volume's descriptors bypass the page cache
-///
-/// Only Linux has an open flag that means it, so a direct request anywhere else
-/// resolves to a buffered volume.
+/// Whether this volume's descriptors bypass the page cache, which only Linux supports
 fn wants_direct(config: &ReelConfig) -> bool {
     cfg!(target_os = "linux") && config.io_backend.is_direct()
 }
@@ -78,12 +67,7 @@ fn wants_ring(backend: IoBackend) -> bool {
     }
 }
 
-/// Say which backend took the volume, on every arm rather than only the bad one
-///
-/// A silent success and a silent downgrade look identical in a log, so an
-/// operator reading one could not tell a ring from the fallback under it. The
-/// downgrade stays a warning because it is the one arm that loses what was
-/// asked for.
+/// Log which backend took the volume, with a warning when the ring fell back to posix
 fn announce(decision: BackendDecision, serving: ServingBackend) {
     match decision {
         BackendDecision::Posix | BackendDecision::Ring => {
@@ -117,8 +101,7 @@ mod tests {
         assert!(!selected.serving().is_ring());
     }
 
-    // off linux there is no ring to have, and the volume says so rather than
-    // repeating the request back
+    // off linux a ring request is served by posix
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn a_ring_request_is_posix_without_a_ring() {
@@ -131,8 +114,7 @@ mod tests {
         }
     }
 
-    // the answer is the backend's own, so it disagrees with the request whenever
-    // the ring could not be had
+    // the backend reports itself, so a ring only serves a volume that asked for one
     #[test]
     fn serving_is_the_outcome_not_the_request() {
         for backend in [IoBackend::Posix, IoBackend::Uring, IoBackend::UringDirect] {

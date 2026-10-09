@@ -1,14 +1,5 @@
 //! What a paced background copier costs the reads running underneath it
-//!
-//! Drives real compaction over a past-memory volume at swept pace targets while
-//! reader threads take scattered point reads and record every latency. Three
-//! things keep the answer honest: the fill has to beat MemTotal, every loud arm
-//! needs a quiet arm beside it because a closed-loop reader warms the live set as
-//! the run goes, and the volume has to still owe dead space at the end or a late
-//! arm is a quiet arm wearing another arm's label.
-//!
-//! Opt-in, since it writes over a hundred gigabytes and runs for twenty minutes:
-//!   TMPDIR=/some/device cargo test -p tape-reel --release --test probes -- interference
+//! Run with `TMPDIR=/some/device cargo test -p tape-reel --release --test probes -- interference`
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -27,7 +18,7 @@ const GROUP_PREFIX_LEN: usize = 2;
 /// Bytes a record key occupies: the group then a thirty-two byte identifier
 const RECORD_KEY_LEN: usize = GROUP_PREFIX_LEN + 32;
 
-/// Group every record in the fill lands in
+/// Every record in the fill lands in this group
 const GROUP: u16 = 7;
 
 const RECORDS: ColumnId = ColumnId(1);
@@ -42,19 +33,13 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     codec: Codec::None,
 }];
 
-/// One in five records the kill leaves alive, at this position and the next
-///
-/// A stride rather than a prefix: a prefix empties whole early segments, and an
-/// empty segment is unlinked rather than rewritten, so there is nothing to pace.
+/// Records per kill stride
 const KILL_STRIDE: u64 = 5;
 
-/// Positions in each stride the kill takes, leaving the rest alive
+/// The kill takes this many leading positions in each stride
 const KILLED_PER_STRIDE: u64 = 3;
 
-/// What one compaction pass spent, for the duty and burst columns
-///
-/// Taken in the driver, not by sampling: a pass posts its bytes only when it
-/// finishes, so a sampler would read every pass as instant.
+/// What the compaction passes spent, for the duty and burst columns
 struct Occupancy {
     /// Nanoseconds spent inside passes that moved something
     busy_nanos: AtomicU64,
@@ -72,7 +57,7 @@ enum Arm {
     /// Compaction held to this many megabytes a second of read plus write
     Paced(u64),
 
-    /// Compaction held by the engine's own `compact_mbps` rather than the governor
+    /// Compaction held by the engine's own `compact_mbps`, with the governor open
     Engine,
 
     /// Compaction driven as fast as it will go
@@ -80,7 +65,7 @@ enum Arm {
 }
 
 impl Arm {
-    /// The arm named by one entry of `REEL_INTERFERENCE_RATES`
+    /// Parses one entry of `REEL_INTERFERENCE_RATES`
     fn parse(text: &str) -> Arm {
         match text {
             "quiet" => Arm::Quiet,
@@ -100,7 +85,7 @@ impl Arm {
         }
     }
 
-    /// What the arm asks for in megabytes a second, or nothing when it names no rate
+    /// What the arm asks for in megabytes a second, `None` when unpaced
     fn requested_mbps(&self) -> Option<u64> {
         match self {
             Arm::Quiet => Some(0),
@@ -121,9 +106,6 @@ impl Arm {
 }
 
 /// A log-linear latency histogram, eight buckets an octave
-///
-/// Counts rather than samples, since a p99.9 off a reservoir is a guess. The
-/// maximum is kept exactly, being the one number a bucket would round down.
 struct Latencies {
     /// Reads that landed in each bucket
     buckets: Vec<u64>,
@@ -144,7 +126,7 @@ const SUB_BUCKETS: u32 = 8;
 /// Octave the sub-bucketing starts at, below which a nanosecond is its own bucket
 const SUB_SHIFT: u32 = 3;
 
-/// Buckets held, which covers a read of up to about a minute
+/// Buckets held, enough for any u64 nanosecond count
 const BUCKETS: usize = 512;
 
 impl Latencies {
@@ -224,10 +206,6 @@ impl Latencies {
 }
 
 /// A rate gate over the background copier, the engine's control law in the harness
-///
-/// `compact_mbps` is fixed at open, so sweeping it would mean a fill an arm. This
-/// holds the same average rate but not the same pass shape: the engine charges
-/// step by step as it copies, and this waits between whole passes.
 struct Governor {
     /// Megabytes a second of read plus write, zero for off and negative for unpaced
     target: AtomicI64,
@@ -252,10 +230,6 @@ impl Governor {
     }
 
     /// How long the copier must wait before its next pass, given what it has moved
-    ///
-    /// `since` is when the driver's last pass began, and the debt is added on top
-    /// of it rather than on top of now, which is what stops the pass's own runtime
-    /// going free.
     fn owed(&self, moved: u64, since: Instant) -> Duration {
         let target = self.target.load(Ordering::Relaxed);
         if target <= 0 {
@@ -287,7 +261,7 @@ fn machine_memory_bytes() -> Option<u64> {
     None
 }
 
-/// Bytes the fill holds, twice memory unless told otherwise
+/// Bytes the fill holds, twice memory with a 48 GiB floor unless set
 fn volume_bytes() -> u64 {
     if let Ok(value) = std::env::var("REEL_INTERFERENCE_VOLUME_BYTES") {
         return value
@@ -309,9 +283,6 @@ fn record_bytes() -> usize {
 }
 
 /// Bytes a segment holds, which is the granularity one compaction pass moves
-///
-/// Well under the gibibyte default: a pass is charged whole, so a gibibyte at
-/// 40 MB/s is one burst and half a minute of silence, and an arm gets one sample.
 fn segment_bytes() -> u64 {
     match std::env::var("REEL_INTERFERENCE_SEGMENT_BYTES") {
         Ok(value) => value
@@ -362,10 +333,6 @@ fn settle_seconds() -> f64 {
 }
 
 /// The arms the run takes, a quiet arm between every loud one
-///
-/// Readers in a closed loop warm the live set as the run goes, so a one-directional
-/// sweep cannot tell warmth from interference. A quiet arm beside each loud one
-/// gives every loud row a baseline at its own warmth.
 fn arms() -> Vec<Arm> {
     let list = std::env::var("REEL_INTERFERENCE_RATES").unwrap_or_else(|_| {
         "quiet,40,quiet,100,quiet,200,quiet,400,quiet,unpaced,quiet".to_string()
@@ -411,9 +378,6 @@ fn config() -> ReelConfig {
 }
 
 /// A record identifier for a position in the fill
-///
-/// splitmix64 is a bijection, so no two records share a key and the fill needs no
-/// table of what it wrote. Key order and offset order disagree by construction.
 fn id_of(position: u64) -> [u8; 32] {
     let mut id = [0u8; 32];
     for lane in 0..4u64 {
@@ -443,9 +407,6 @@ fn is_killed(position: u64) -> bool {
 }
 
 /// The position of the nth surviving record
-///
-/// The readers draw over the live records only, so the sample never asks for a key
-/// the kill took and never counts a miss as a read.
 fn live_position(nth: u64) -> u64 {
     let alive = KILL_STRIDE - KILLED_PER_STRIDE;
     (nth / alive) * KILL_STRIDE + KILLED_PER_STRIDE + (nth % alive)
@@ -464,10 +425,7 @@ fn payload(seed: u64, bytes: usize) -> Vec<u8> {
     out
 }
 
-/// Bytes the devices have served since boot, for the page-cache share
-///
-/// Sectors are always 512 bytes in `/proc/diskstats` whatever the device's own
-/// block size is. Zero on a machine that cannot answer the question.
+/// Bytes the devices have served since boot, zero without `/proc/diskstats`
 fn device_read_bytes() -> u64 {
     let Ok(stats) = std::fs::read_to_string("/proc/diskstats") else {
         return 0;
@@ -479,8 +437,7 @@ fn device_read_bytes() -> u64 {
             continue;
         }
         let name = parts[2];
-        // Whole devices only. Counting a partition and its disk would double every
-        // byte, and loop devices are not the drive under test.
+        // Whole devices only, skipping partitions and loop devices
         if name.starts_with("loop") || name.chars().last().is_some_and(char::is_numeric) {
             continue;
         }
@@ -512,8 +469,6 @@ fn refuse_tmpfs(dir: &std::path::Path) {
 }
 
 /// Empty the page cache, so the opening quiet arm is not reading the fill back
-///
-/// Needs root. Without it the opening arm reads warmer than the ones after it.
 fn drop_caches() -> bool {
     std::fs::write("/proc/sys/vm/drop_caches", "3").is_ok()
 }
@@ -550,8 +505,7 @@ pub fn tails_under_a_paced_copier() {
     let readers = reader_count();
     let drivers = driver_count();
 
-    // A run that sized itself has to land past memory or every latency is a
-    // page-cache latency. A named size is a calibration and skips the guards.
+    // A self-sized run must land past memory, and a set volume size skips the guards
     let past_memory = memory > 0 && volume > memory;
     assert!(
         past_memory || std::env::var("REEL_INTERFERENCE_VOLUME_BYTES").is_ok(),
@@ -577,8 +531,7 @@ pub fn tails_under_a_paced_copier() {
         settle_seconds(),
     );
 
-    // The engine's rate is fixed at open, so mixing it with governor arms would
-    // cap those too and every swept row would read as the engine's cap.
+    // The engine's rate caps every arm, so an engine run takes only quiet and engine arms
     let has_engine_arm = arms.contains(&Arm::Engine);
     assert_eq!(
         has_engine_arm,
@@ -633,8 +586,7 @@ pub fn tails_under_a_paced_copier() {
 
     println!("caches dropped: {}", drop_caches());
 
-    // One slot a phase, settle and measure alternating, so a reader labels its
-    // reads by an atomic load and the settle's reads never enter a window.
+    // One slot a phase, settle and measure alternating, so settle reads stay out of a window
     let slots = arms.len() * 2 + 1;
     let slot = AtomicUsize::new(0);
     let done = AtomicBool::new(false);
@@ -708,8 +660,7 @@ pub fn tails_under_a_paced_copier() {
             let governor = &governor;
             let occupancy = &occupancy;
             scope.spawn(move || {
-                // The debt is added on top of when the pass began, not on top of
-                // now, or the pass's own runtime is spent twice.
+                // The debt counts from when the last pass began, so its runtime is paid once
                 let mut began_at = Instant::now();
                 while !done.load(Ordering::Relaxed) {
                     if governor.target.load(Ordering::Relaxed) == 0 {
@@ -729,8 +680,7 @@ pub fn tails_under_a_paced_copier() {
                     store.compact_once().expect("compact");
                     let elapsed = start.elapsed();
                     let after = store.compaction_counters();
-                    // A pass that moved nothing is not occupancy, and spinning on
-                    // it would spend the core the rewrite needs.
+                    // An idle pass counts for nothing and backs off for a moment
                     if after.read_bytes + after.compaction_bytes > moved {
                         occupancy
                             .busy_nanos
@@ -778,15 +728,13 @@ pub fn tails_under_a_paced_copier() {
             let written = closing
                 .compaction_bytes
                 .saturating_sub(opening.compaction_bytes);
-            // Share of the window a pass held the device, over the drivers that
-            // could be holding it at once.
+            // Share of the window a pass held the device, per driver
             let duty = busy as f64 / 1e9 / elapsed / drivers as f64;
             let burst = match busy {
                 0 => 0.0,
                 busy => background as f64 / (busy as f64 / 1e9) / 1e6,
             };
-            // Exact on a quiet arm and an estimate elsewhere, since a compaction
-            // read may be served from the page cache it just filled.
+            // Exact on a quiet arm, an estimate elsewhere since compaction reads may hit the cache
             let foreground_device =
                 device.saturating_sub(closing.read_bytes.saturating_sub(opening.read_bytes));
             let row = Row {
@@ -834,8 +782,7 @@ pub fn tails_under_a_paced_copier() {
         live_bytes as f64 / 1e9
     );
 
-    // Every compaction arm has to have moved bytes, or its label is a fiction. An
-    // arm that opened under a segment of dead space is the drained-volume case.
+    // Every compaction arm must move bytes unless it opened under a segment of dead space
     for row in &rows {
         if row.arm == Arm::Quiet {
             continue;
@@ -866,9 +813,7 @@ pub fn tails_under_a_paced_copier() {
          no background load to pace",
     );
 
-    // The opening quiet arm runs straight off the cache drop and is the one arm
-    // whose reads are known cold. The arms after it warm as readers revisit keys,
-    // which the amp column reports rather than asserts.
+    // The opening quiet arm runs right after the cache drop, so its reads are cold
     let first_quiet = rows
         .iter()
         .find(|row| row.arm == Arm::Quiet)
@@ -882,8 +827,7 @@ pub fn tails_under_a_paced_copier() {
         );
     }
 
-    // A flat curve here is a broken harness, not a store that copies for free.
-    // Measured against the best quiet arm, the hardest baseline to beat.
+    // The loudest arm must move p99.9 past the best quiet arm, or the harness is broken
     let quiet_p999 = rows
         .iter()
         .filter(|row| row.arm == Arm::Quiet)

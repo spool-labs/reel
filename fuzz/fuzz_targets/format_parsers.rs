@@ -1,10 +1,4 @@
-//! Every parser the crate exposes to bytes it did not write, under guided mutation
-//!
-//! The seeded sweep in `tests/format_fuzz.rs` offers each of these random strings and
-//! proves none of them indexes before it checks. What it cannot do is get through a
-//! magic number or a checksum, so everything behind the front door goes unvisited. A
-//! coverage-guided run finds those gates on its own, which is the whole reason this
-//! target exists beside the sweep.
+//! Feeds every parser the crate exposes bytes it did not write, under guided mutation
 
 #![no_main]
 
@@ -23,7 +17,7 @@ use reel::index::column::ColumnMark;
 /// Partitions a filter region is read at, kept small so a case stays cheap
 const PARTITIONS: usize = 4;
 
-/// Every codec the format names, so a codec added behind the byte is swept with it
+/// Every codec in the format, so a new one is swept as soon as it is listed
 const CODECS: &[Codec] = &[Codec::Lz4];
 
 /// A strided row width, the one the seeded sweep offers too

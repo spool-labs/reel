@@ -33,16 +33,16 @@ use crate::sync::lock;
 /// Bytes at the very end of a sealed segment holding its footer length and magic
 const TRAILER_LEN: u64 = 8;
 
-/// Bytes of the file end searched for the trailer past any aligned-write zeros
+/// The trailer search reads this many bytes off the file end, past any aligned-write zeros
 const TRAILER_PROBE_LEN: u64 = 4096;
 
-/// Threads a rebuild opens segment files on, however wide the machine is
+/// A rebuild opens segment files on at most this many threads
 const MAX_READERS: usize = 8;
 
-/// Records one column batch takes into the index at a time
+/// One column batch takes this many records into the index at a time
 const BATCH: usize = 4096;
 
-/// Tails a rebuild holds before it feeds their rows in key order
+/// A rebuild holds this many tails before it feeds their rows in key order
 const FEED_WINDOW: usize = 32;
 
 /// An open loads sealed footers into the spot index on this many threads
@@ -68,10 +68,10 @@ pub struct RebuiltReel {
     /// How far the rebuild read each tail's journal, and SEALED for a segment read from its footer
     pub consumed: HashMap<SegmentId, u64>,
 
-    /// Unsealed tails and their file lengths, so a writable open gives back what a crash left reserved
+    /// Unsealed tails and their file lengths, so a writable open frees what a crash left reserved
     pub walked: Vec<(PathBuf, u64)>,
 
-    /// Sealed segments whose cut after the footer never landed, each with the length a writable open cuts it to
+    /// Sealed segments whose cut after the footer never landed, with the length to cut each to
     pub cuts: Vec<(PathBuf, u64)>,
 
     /// The same tails as appenders can pick them up, lowest number first
@@ -90,9 +90,6 @@ pub struct SealedSpan {
 }
 
 /// Rebuild the reel's index by reading every segment file in its directory into it
-///
-/// Sealed footers are swept on the join and loaded into the spot index on `LOADERS`
-/// threads, up to about eighteen parsed footers at once. Only the tails reach the map.
 pub fn rebuild_reel(
     driver: &IoDriver,
     roots: &[PathBuf],
@@ -101,8 +98,7 @@ pub fn rebuild_reel(
 ) -> Result<RebuiltReel> {
     let mut files: Vec<(u32, PathBuf, u64, u8)> = Vec::new();
     for (at, root) in roots.iter().enumerate() {
-        // A drive the operator declared dead is never read, even when something
-        // still answers at its mountpoint.
+        // A drive the operator declared dead is never read, even if its mountpoint still answers
         if dead.get(at).copied().unwrap_or(false) {
             continue;
         }
@@ -113,8 +109,7 @@ pub fn rebuild_reel(
         }
     }
     files.sort_by_key(|file| (file.0, file.3));
-    // One id on two volumes is the store disagreeing with itself, and guessing which
-    // file wins is how a stale copy shadows a live one. Refused, naming both.
+    // One id on two volumes is refused, since a guess could let a stale copy shadow a live one
     for pair in files.windows(2) {
         if pair[0].0 == pair[1].0 {
             return Err(crate::error::ReelError::Corruption(format!(
@@ -144,10 +139,10 @@ pub fn rebuild_reel(
         }
         jobs.push((segment, path, len));
     }
-    // A covered segment's footer loads only the rows its key run picked, so the picks are ready before any footer is read
+    // A covered segment's footer loads only the rows its key run picked, so pick them first
     index.pick_run_rows();
     let mut held: Vec<Held> = Vec::new();
-    // The loaders are slower than the reads, so a deeper queue or read-ahead only holds more footers
+    // Loaders are slower than reads, so a deeper queue or read-ahead only holds more footers
     let (queue, feed) = std::sync::mpsc::sync_channel::<(SegmentId, SegmentFooter)>(1);
     let feed = Mutex::new(feed);
     std::thread::scope(|scope| -> Result<()> {
@@ -168,13 +163,13 @@ pub fn rebuild_reel(
                         index.reserve_fast(&footer, jobs.len());
                         is_sized = true;
                     }
-                    // The loaders receive until the queue closes, so a send always finds a receiver
+                    // Loaders receive until the queue closes, so a send always finds a receiver
                     let _ = queue.send((*segment, footer));
                 }
                 Loaded::Journaled(end) => {
                     consumed.insert(*segment, end.journal_len);
                     walked.push((path.clone(), *len));
-                    // A file that ends before its rows, or one a run covers, was sealed once and takes no tail's writes again
+                    // A file cut before its rows, or covered by a run, was sealed and never resumes
                     let is_covered = index.key_runs().covers(*segment);
                     if let Some(rows_at) = end.rows_at.filter(|_| !is_covered) {
                         resumable.push(ResumableTail {
@@ -245,7 +240,7 @@ fn load_footers(
 
 /// What reading one segment during a rebuild turned out to be
 enum Loaded {
-    /// A sealed segment, read from its footer, which the open still has to load, and its cut when one is owed
+    /// A sealed segment's footer, still to load, and its cut when one is owed
     Sealed(SegmentFooter, Option<u64>),
 
     /// An unsealed tail read through its journal
@@ -277,12 +272,9 @@ struct JournaledEnd {
     rows_at: Option<u64>,
 }
 
-/// One segment file read off the medium, before any of it is joined
-///
-/// Everything the join needs is in here, so absorbing a segment touches no
-/// descriptor and the reads can run wherever there is a thread for them.
+/// One segment file read off the medium, so the join touches no descriptor
 enum SegmentParts {
-    /// A sealed segment's footer, the range ends its rows lack, and its end when a seal's cut never landed
+    /// A sealed footer, the range ends its rows lack, and its end if the seal's cut never landed
     Sealed(SegmentFooter, Vec<Option<KeyBytes>>, Option<u64>),
 
     /// An unsealed tail read through its journal
@@ -292,12 +284,7 @@ enum SegmentParts {
     Foreign,
 }
 
-/// Read every job's segment file, handing each to the join in job order
-///
-/// The reads are independent and the join is not: an exact tie between two runs falls
-/// to the earliest source. So the files are read across threads while the join takes
-/// them in order, and a reader runs no further ahead than the window, which holds the
-/// peak at a few segments' parts rather than the volume's.
+/// Read every job's segment file across threads, handing each to the join in job order
 fn read_segments(
     driver: &IoDriver,
     jobs: &[(SegmentId, PathBuf, u64)],
@@ -356,11 +343,6 @@ fn read_segments(
 }
 
 /// Whether a reader thread on this backend is another read in flight
-///
-/// A synchronous backend runs its syscall on whichever thread submitted it, so a second
-/// thread is a second seek the drive can be working on. A ring has one queue and one
-/// drain, and the simulator answers under one lock in submit order, so on both a
-/// fan-out buys contention rather than depth.
 fn reads_on_its_caller(driver: &IoDriver) -> bool {
     matches!(
         driver.serving(),
@@ -376,10 +358,10 @@ struct ReadQueue {
     /// Parts read and not yet joined, by job
     done: HashMap<usize, Result<SegmentParts>>,
 
-    /// Jobs the join has taken, which is what the read-ahead window is measured from
+    /// Jobs the join has taken, where the read-ahead window starts
     taken: usize,
 
-    /// Set where the join gave up, so the readers stop with it
+    /// Set when the join gives up, so the readers stop too
     stop: bool,
 }
 
@@ -415,9 +397,6 @@ fn read_claimed(
 }
 
 /// Read one segment file, releasing its descriptor either way
-///
-/// A rebuild opens every segment file, so a descriptor left behind here is one per
-/// segment on every open of the volume.
 fn read_segment(
     driver: &IoDriver,
     path: &Path,
@@ -545,10 +524,6 @@ struct Held {
 }
 
 /// Feed every held row to the resolver in key order, then hand each walked footer on
-///
-/// A key's versions keep segment order, so a tie still falls to the earlier source and
-/// every key settles to the version it did. Ascending keys append, so each shard's tree
-/// fills one leaf at a time and the open owes it no repack.
 fn feed_held(
     held: &mut Vec<Held>,
     resolver: &mut Resolver<'_>,
@@ -661,7 +636,7 @@ fn feed_part(
         column,
         ..KeyQueue::default()
     };
-    // Booked here and handed over once, so the parts never meet on a segment's row
+    // Each part books its own tally and settles it once, so parts never meet on a segment row
     let tally = Tally::new(index.segments());
     let mut highest = Lsn::NONE;
     merge_cursors(&mut mine, |cursor| {
@@ -681,7 +656,7 @@ type Part = (Option<Vec<u8>>, Option<Vec<u8>>);
 /// How many values a leading key byte can take
 const LEADING_BYTES: usize = 1 << 8;
 
-/// Cut a column's keys into a part per thread at even steps of the leading byte, which keeps shards whole
+/// Cut a column's keys into a part per thread at even leading-byte steps, keeping shards whole
 fn split_by_shard(shard_bytes: u8, threads: usize) -> Vec<Part> {
     let parts = threads.min(LEADING_BYTES);
     if shard_bytes == 0 || parts < 2 {
@@ -701,16 +676,11 @@ fn split_by_shard(shard_bytes: u8, threads: usize) -> Vec<Part> {
 /// One held partition walked in key order, over a span of its places
 #[derive(Clone, Copy)]
 struct Cursor<'a> {
-    /// Position among the held segments, which breaks a tie between equal keys
     source: usize,
     segment: SegmentId,
     partition: &'a FooterPartition,
-
-    /// Row numbers in key order, since a tail's rows sit in arrival order
     order: &'a [u32],
     at: usize,
-
-    /// One past the cursor's last place
     end: usize,
 }
 
@@ -776,7 +746,7 @@ impl<'a> Cursor<'a> {
         self.partition.key_at(self.row_of(at)).unwrap_or_default()
     }
 
-    /// Hand the row at this place to `put`, unless it is a range, which stands when its segment is held
+    /// Hand the row here to `put`, skipping a range, which stands when its segment is held
     fn put_with(&self, put: impl FnOnce(&'a [u8], Loc, Lsn, bool)) -> Result<()> {
         let found = self.partition.row_at(self.row())?;
         if !found.flags.is_range_tombstone() {
@@ -799,7 +769,7 @@ fn merge_cursors(
     mut take: impl FnMut(&Cursor<'_>) -> Result<()>,
 ) -> Result<()> {
     cursors.retain(|cursor| !cursor.is_done());
-    // A binary heap of cursor positions with the least key on top.
+    // A binary heap of cursor positions with the least key on top
     let mut heap: Vec<usize> = (0..cursors.len()).collect();
     for at in (0..heap.len() / 2).rev() {
         sift_down(&mut heap, at, cursors);
@@ -836,14 +806,6 @@ fn sift_down(heap: &mut [usize], mut at: usize, cursors: &[Cursor<'_>]) {
 }
 
 /// Drop walked entries a sealed footer outversions, which the map must not hold
-///
-/// A walked entry installs as its key's newest and shadows the footer search, which
-/// is right for a tail and wrong for a segment whose seal failed. So every walked
-/// entry is checked against the sealed footers whose span admits its key and dropped
-/// where a newer version stands; one newer than every sealed row cannot lose that
-/// comparison, which exempts a tail's fresh writes without leaning on segment
-/// numbers. The other direction is owed too: a surviving walked entry books the
-/// newest sealed data row it shadows dead, since the sealed tally froze at the seal.
 fn prune_walked_shadowed(
     driver: &IoDriver,
     sealed_files: &[(SegmentId, PathBuf, u64)],
@@ -852,8 +814,7 @@ fn prune_walked_shadowed(
 ) -> Result<()> {
     let segments = index.segments();
 
-    // The map holds only what the tails brought, so each entry is a suspect, and a
-    // covered record goes now so it cannot stand in front of a newer sealed row.
+    // Every map entry came from a tail and is a suspect, and a covered one goes now
     let mut suspects: HashMap<ColumnId, Vec<(KeyBytes, Entry)>> = HashMap::new();
     for spec in index.columns() {
         let Some(column) = index.column(spec.id) else {
@@ -875,7 +836,7 @@ fn prune_walked_shadowed(
         return Ok(());
     }
 
-    // Only the segments whose span admits a suspect key are worth reopening.
+    // Only the segments whose span admits a suspect key are worth reopening
     let mut probe: HashMap<SegmentId, Vec<ColumnId>> = HashMap::new();
     for span in sealed {
         let Some(rows) = suspects.get(&span.column) else {
@@ -893,8 +854,7 @@ fn prune_walked_shadowed(
     }
 
     let mut shadowed: HashMap<ColumnId, Vec<usize>> = HashMap::new();
-    // The newest sealed data row each walked entry shadows, across every footer
-    // that holds its key, booked once the prune has said the entry survives.
+    // The newest sealed data row each walked entry shadows, booked if the entry survives
     let mut debits: HashMap<ColumnId, HashMap<usize, (SegmentId, Lsn, u64)>> = HashMap::new();
     // Each walked key's sealed data rows, one of which the spot index load may hold live
     let mut older: HashMap<ColumnId, Vec<(usize, Loc)>> = HashMap::new();
@@ -913,9 +873,7 @@ fn prune_walked_shadowed(
                 }
                 let rows = &suspects[&partition.column];
                 let marks = shadowed.entry(partition.column).or_default();
-                // The footer rows and the suspects are both in key order, so
-                // one forward pass joins them, and only a row whose key matches is
-                // read past its key.
+                // Footer rows and suspects are both in key order, so one forward pass joins them
                 let mut at = 0usize;
                 for found in 0..partition.len() {
                     let key = partition.key_at(found).unwrap_or_default();
@@ -941,9 +899,7 @@ fn prune_walked_shadowed(
                         && !row.flags.is_tombstone()
                         && !row.flags.is_range_tombstone()
                     {
-                        // At or past the frontier, so the tally froze without this
-                        // shadowing. Below it the tally already counted the death and
-                        // a debit here would count it twice.
+                        // The tally froze before this shadowing, so it owes a debit
                         let span = span_of(key.len() as u16, row.len);
                         let held = debits
                             .entry(partition.column)
@@ -962,7 +918,7 @@ fn prune_walked_shadowed(
         outcome?;
     }
 
-    // A surviving walked entry outversions every sealed row of its key, so none of them stays counted
+    // A surviving walked entry outversions every sealed row of its key, so none stays counted
     for (column, walked) in older {
         let pruned: HashSet<usize> = shadowed
             .get(&column)
@@ -977,8 +933,7 @@ fn prune_walked_shadowed(
         index.shadow_sealed(column, gone);
     }
 
-    // A walked entry the prune drops lost to a sealed row, so that row is live
-    // and owes no debit; the debit belongs only to the entries that survive.
+    // A pruned walked entry lost to a sealed row, so only the survivors owe a debit
     for (column, walked) in debits {
         let pruned: HashSet<usize> = shadowed
             .get(&column)
@@ -991,8 +946,7 @@ fn prune_walked_shadowed(
         }
     }
 
-    // Take the shadowed entries out, booking a dropped record dead where it lies. A
-    // dropped grave keeps its tombstone booking, which is bytes the segment holds.
+    // Drop shadowed entries and book each record dead where it lies. A grave keeps its booking
     for (column, marks) in shadowed {
         let Some(index) = index.column(column) else {
             continue;
@@ -1030,11 +984,6 @@ fn belongs_here(driver: &IoDriver, file: FileId, segment: SegmentId) -> Result<b
 }
 
 /// Tally one sealed segment's footer without installing any of its keys
-///
-/// The keys stay in the footer, so what a rebuild installs is the span, the oldest
-/// record the segment could still surface, and the range tombstones, whose ends live
-/// in payloads. The live and dead split comes from the tally written at the seal, and
-/// the frontier that tally is current to goes down for the spot index load's debits.
 fn sweep_footer(
     segment: SegmentId,
     footer: &SegmentFooter,
@@ -1064,8 +1013,7 @@ fn sweep_footer(
             });
         }
 
-        // The table hears the partition once, with its oldest record and its
-        // tombstones' spans summed, since a call a row took its lock a row.
+        // The table hears each partition once, with its oldest record and summed tombstone spans
         let mut oldest = Lsn(u64::MAX);
         let (mut held, mut held_lsn) = (0u64, Lsn::NONE);
         for at in 0..partition.len() {
@@ -1097,10 +1045,6 @@ fn sweep_footer(
 }
 
 /// Read back the end of every range tombstone the footer lists, in its own order
-///
-/// A footer row says where its record sits and not where its range stops, so the ends
-/// are the one thing a sealed segment still owes the medium. Taken here so the join
-/// that follows reads nothing at all.
 fn read_range_ends(
     driver: &IoDriver,
     file: FileId,
@@ -1134,7 +1078,7 @@ fn read_range_ends(
     Ok(ends)
 }
 
-/// Read the exclusive end a range tombstone carries as its payload
+/// Read a range tombstone's exclusive end from its payload
 fn read_range_end(
     driver: &IoDriver,
     file: FileId,
@@ -1155,10 +1099,10 @@ fn read_range_end(
 
 /// One record for a follower to apply, with everything applying it needs
 pub struct WalkedRecord {
-    /// Column and key the record is addressed by
+    /// The record's column and key
     pub key: RecordKey,
 
-    /// Sequence number that orders it
+    /// The sequence number that orders it
     pub lsn: Lsn,
 
     /// Where it sits on the volume
@@ -1218,7 +1162,7 @@ fn read_journaled(driver: &IoDriver, file: FileId, file_len: u64) -> Result<Jour
     let mut ends = Vec::new();
     // A group is one write, so a batch comes back whole or not at all
     for group in groups {
-        // Count rejected groups too, so new writes land past them and a rejected row never matches a new record
+        // Count rejected groups too, so new writes land past them and no rejected row matches one
         for row in &group {
             let span = span_of(row.key.width(), row.len);
             tail.next_offset = tail.next_offset.max(u64::from(row.offset) + span);
@@ -1483,7 +1427,7 @@ impl KeyQueue {
         self.flush_into(index, index.segments());
     }
 
-    /// Apply what is queued in order, a shard lock a run of keys
+    /// Apply what is queued in order, taking one shard lock per run of keys
     fn flush_into<Book: Bookings>(&mut self, index: &ReelIndex, segments: &Book) {
         if self.rows.is_empty() {
             return;
@@ -1509,8 +1453,7 @@ impl KeyQueue {
                 self.landed.clear();
                 column.apply_moves(&moves, segments, &never_shadowed, &mut self.landed);
             }
-            // A column this open doesn't declare still holds bytes in its segments,
-            // and nothing here can shadow them, so its rows are booked live.
+            // Nothing here can shadow an undeclared column's rows, so they are booked live
             None => {
                 self.undeclared.get_or_insert(self.column);
                 let mut start = 0;
@@ -1538,8 +1481,7 @@ pub(crate) fn read_footer(
     if file_len < min_footer {
         return Ok(None);
     }
-    // An aligned write can land the footer with a block's worth of zeros after it, so
-    // the trailer is read at the last byte that is not padding.
+    // Aligned writes can leave zeros after the footer, so the trailer ends at the last nonzero byte
     let probe = file_len.min(TRAILER_PROBE_LEN);
     let padded = driver.pread(file, file_len - probe, probe)?;
     if (padded.len() as u64) < probe {
@@ -1603,7 +1545,7 @@ mod tests {
     const RECORDS: ColumnId = ColumnId(1);
     const META: ColumnId = ColumnId(2);
 
-    /// Keys one page of a listing takes
+    /// One page of a listing takes this many keys
     const PAGE: usize = 1024;
 
     const COLUMNS: ColumnSet = &[
@@ -1761,7 +1703,7 @@ mod tests {
         assert_eq!(bytes.live, KEYS as u64 * span);
     }
 
-    // a window split across threads keeps every key's newest version and books what one thread would
+    // a feed split across threads keeps newest versions and books what one thread would
     #[test]
     fn a_split_feed_keeps_newest_versions() {
         const KEYS: u32 = 12_000;
@@ -2094,7 +2036,7 @@ mod tests {
         assert_eq!(keys_of(&rebuilt, RECORDS), vec![vec![9u8; 34]]);
     }
 
-    // a batch missing its last record is dropped rather than half applied
+    // a batch missing its last record is dropped whole
     #[test]
     fn a_batch_cut_short_is_dropped() {
         let sim = SimIo::new(FaultPlan::new(1));
@@ -2106,7 +2048,7 @@ mod tests {
         assert_eq!(keys_of(&rebuilt, RECORDS), vec![vec![9u8; 34]]);
     }
 
-    // a segment header naming another segment is quarantined, not indexed
+    // a segment header for another segment is quarantined
     #[test]
     fn foreign_segment_quarantined() {
         let sim = SimIo::new(FaultPlan::new(1));
@@ -2127,7 +2069,7 @@ mod tests {
             .is_some());
     }
 
-    /// Restore a sealed segment to its bytes before the seal, as a seal that failed partway leaves it
+    /// Restore a sealed segment to its bytes before the seal, as a seal that failed partway would
     fn strip_footer(image: &mut DurableImage, name: &str, unsealed: Vec<u8>) {
         for (path, bytes) in image.iter_mut() {
             if path.file_name().map(|found| found == name).unwrap_or(false) {
@@ -2189,7 +2131,7 @@ mod tests {
     #[test]
     fn a_failed_write_does_not_strand_later_records() {
         let mut produced = 0;
-        // The op count moves with the write path, so the fault position is searched for
+        // The op count changes with the write path, so the test searches for the fault position
         for at in 2..32u64 {
             let plan = FaultPlan::new(1).with_fault(at, crate::io::fault::FaultKind::EnospcAppend);
             let sim = SimIo::new(plan);
@@ -2280,13 +2222,12 @@ mod tests {
         write_at(&driver, file, offset, bytes);
     }
 
-    /// Put the tail back to the zeros a reservation reads as from an offset
+    /// Zero the tail from an offset, the way an unwritten reservation reads
     fn zero_from(sim: &SimIo, offset: u64, len: usize) {
         corrupt_at(sim, offset, &vec![0u8; len]);
     }
 
-    // The directory is synced behind a creation the way a real one is, so the file
-    // is on the volume rather than only in a cache a crash would drop.
+    // Sync the directory after a creation, so a crash cannot drop the file
     fn open_created(driver: &IoDriver, path: &Path) -> FileId {
         let file = driver.open(path, true).expect("open");
         driver
@@ -2324,7 +2265,7 @@ mod tests {
         }
     }
 
-    /// Bytes a sealed footer of this many record rows takes
+    /// The size of a sealed footer with this many record rows
     fn footer_len_for(rows: u32) -> u64 {
         use crate::format::footer::{FooterEntry, SegmentFooter};
 

@@ -1,10 +1,4 @@
-//! Drive the built binary against a real volume
-//!
-//! The commands are exercised through the executable rather than by calling into
-//! it, since argument parsing, volume opening and the column declaration are most
-//! of what could break and none of them are reachable from a unit test. The
-//! volume is written and closed before the tool opens it, because a writer holds
-//! an ownership lock a second writer would be refused.
+//! Runs the built binary against a real volume that is written and closed first
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -24,7 +18,7 @@ const RECORD_BYTES: usize = 64 * 1024;
 
 const RECORD_CF: &str = "records";
 
-/// The columns the volume under test is written with, as any caller declares its own
+/// The columns the test volume is written with
 const COLUMNS: ColumnSet = &[ColumnSpec {
     id: ColumnId(1),
     name: RECORD_CF,
@@ -41,17 +35,12 @@ struct Run {
     err: String,
 }
 
-/// One command run again as json, which is where the exact figures live
-///
-/// The text form is written for a reader and its wording is allowed to change;
-/// the json is the report's data and is what a test should be pinned to. Only
-/// the assertions that are actually about presentation read the text.
+/// Run a command again as json, where tests pin exact figures
 fn json(volume: &Path, args: &[&str]) -> serde_json::Value {
     let mut all = vec!["-o", "json"];
     all.extend_from_slice(args);
     let run = run(volume, &all);
-    // Not asserted on the exit code: a sweep that finds a fault reports it and
-    // exits nonzero, and its report is exactly the one a test wants to read.
+    // The exit code is unchecked, since a sweep that finds a fault exits nonzero
     assert!(!run.out.is_empty(), "{all:?} answered nothing: {}", run.err);
     serde_json::from_str(&run.out)
         .unwrap_or_else(|error| panic!("{all:?} produced invalid json ({error}): {}", run.out))
@@ -64,8 +53,7 @@ fn figure(report: &serde_json::Value, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("no `{name}` figure in {report}"))
 }
 
-/// What a report says stands between its figures and what a reader would take
-/// them for
+/// The text of each caveat in a json report
 fn caveats(report: &serde_json::Value) -> Vec<String> {
     report["caveats"]
         .as_array()
@@ -75,7 +63,7 @@ fn caveats(report: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// A table row by the name in its first cell, which is indented under its heading
+/// The first line that starts with this label once indentation is trimmed
 fn row<'a>(out: &'a str, name: &str) -> &'a str {
     out.lines()
         .map(str::trim_start)
@@ -223,7 +211,7 @@ fn limits_the_segment_listing() {
     );
 }
 
-// the doctor reads the machine, on a root nothing has written
+// the doctor reads the machine on a root nothing has written
 #[test]
 fn doctor_reads_the_machine() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -247,7 +235,7 @@ fn doctor_reads_the_machine() {
     );
 }
 
-// a volume flag the tool cannot read is refused rather than ignored
+// an unknown volume tag is refused
 #[test]
 fn refuses_an_unknown_volume_tag() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -282,7 +270,7 @@ fn stat_counts_the_live_records() {
         u64::from(RECORDS),
         "every key written once survives its overwrite: {row}",
     );
-    // The close compacted away the versions the overwrites replaced.
+    // The close compacted away the versions the overwrites replaced
     assert_eq!(
         figure(
             &json(volume, &["--column", "records:1:32", "stat"]),
@@ -328,8 +316,7 @@ fn verify_passes_a_sound_volume() {
         figure(&swept, "records") > 0,
         "a sweep of nothing is not a clean bill: {swept}",
     );
-    // Every segment file on the root is swept, not just the ones still holding
-    // a live key.
+    // Every segment file on the root is swept, including ones with no live key
     assert_eq!(
         figure(&swept, "segments_swept"),
         segments(volume).len() as u64,
@@ -384,7 +371,7 @@ fn verify_catches_a_truncated_segment() {
     let volume = volume(&dir);
     let target = segments(volume).into_iter().next().expect("a segment file");
     let len = std::fs::metadata(&target).expect("stat").len();
-    // Half the segment tears a record and drops the footer, and a sealed segment has no journal to list its records
+    // Halving a sealed segment drops its footer, and it has no journal to list its records
     std::fs::File::options()
         .write(true)
         .open(&target)
@@ -417,7 +404,7 @@ fn segments(volume: &Path) -> Vec<std::path::PathBuf> {
     files
 }
 
-/// Turn one byte of a file over, which is what a checksum is for
+/// Invert one byte of a file
 fn flip(path: &Path, at: u64) {
     let mut file = std::fs::File::options()
         .read(true)
@@ -475,7 +462,7 @@ fn checkpoint_copy() {
         copied.err
     );
 
-    // Publishing over one is refused, so the second run leaves the first alone.
+    // A second checkpoint to the same target is refused
     let again = run(
         volume,
         &["--column", "records:1:32", "checkpoint", &target_arg],
@@ -518,7 +505,7 @@ fn json_parses() {
     }
 }
 
-// markdown carries the tables, for a pull request or a CI summary
+// markdown keeps the tables
 #[test]
 fn markdown_carries_the_tables() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -558,8 +545,7 @@ fn text_is_plain_off_a_terminal() {
     let dir = tempfile::tempdir().expect("tempdir");
     let volume = volume(&dir);
 
-    // The test harness gives the child a pipe, which is the case that matters:
-    // escape sequences in a captured log are noise a reader cannot turn off.
+    // The harness gives the child a pipe, so output should be plain
     for args in [vec!["cue"], vec!["--color", "never", "cue"]] {
         let cue = run(volume, &args);
         assert!(cue.ok, "{args:?} failed: {}", cue.err);
@@ -584,7 +570,7 @@ fn text_is_plain_off_a_terminal() {
     );
 }
 
-// a caveat is a figure's own, and travels with it into the data
+// caveats reach the json data and the text
 #[test]
 fn caveats_travel_with_the_figures() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -606,7 +592,7 @@ fn caveats_travel_with_the_figures() {
         "and should reach the text as its own block",
     );
 
-    // Declaring the columns answers that one, so it stops being said.
+    // Declaring the columns clears that caveat
     let declared = caveats(&json(volume, &["--column", "records:1:32", "cue"]));
     assert!(
         !declared

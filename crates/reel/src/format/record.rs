@@ -11,25 +11,18 @@ use crate::format::column::{ColumnId, KeyRef, RecordKey, INLINE_KEY_LEN, MAX_KEY
 use crate::format::lsn::Lsn;
 
 /// Fixed size of a record header in bytes
-///
-/// The key width takes two bytes rather than one, because a key runs to
-/// `MAX_KEY_LEN` and one byte cannot say more than 255.
 pub const HEADER_LEN: usize = 21;
 
-/// Bytes a record's header and an inline key take together
-///
-/// Sized by the inline key bound and not by the format's key ceiling, since it is
-/// a stack buffer built per record. A wider key is written from a borrowed slice
-/// rather than staged here.
+/// Room for a record's header and an inline key
 pub const PREFIX_CAP: usize = HEADER_LEN + INLINE_KEY_LEN;
 
-/// Alignment boundary every group commit drain starts on
+/// Every group commit drain starts on this alignment
 pub const BLOCK: u64 = 4096;
 
 /// A keyless record writes these bytes ahead of its payload: its check, then its shape
 pub const KEYLESS_PREFIX: usize = 10;
 
-/// A keyless segment drops a record's key and header up to this many payload bytes, since every read checks it whole
+/// A keyless segment drops the key and header of records up to this many payload bytes
 pub const KEYLESS_MAX: u32 = 4096;
 
 const KEYLESS_CHECK_AT: usize = 0;
@@ -42,7 +35,7 @@ const CODEC_BITS: u32 = 2;
 const _: () =
     assert!(((KEYLESS_MAX as u64) << CODEC_BITS) | ((1 << CODEC_BITS) - 1) <= u16::MAX as u64);
 
-/// The check covers these bytes ahead of the key: column, key width, kind, shape and payload checksum
+/// The check covers this many bytes before the key: column, width, kind, shape, payload crc
 const KEYLESS_FIXED: usize = 10;
 
 /// A keyless segment keys its checks with a secret this many bytes long
@@ -56,7 +49,7 @@ const OFFSET_COLUMN: usize = 17;
 const OFFSET_KEY_WIDTH: usize = 18;
 const OFFSET_CODEC: usize = 20;
 
-/// Bits saying what kind of record this is, the low five
+/// The low five bits give the record's kind
 const KIND_MASK: u8 = 0b0001_1111;
 
 const FLAG_TOMBSTONE: u8 = 0b0000_0001;
@@ -64,19 +57,16 @@ const FLAG_RANGE_TOMBSTONE: u8 = 0b0000_0010;
 const FLAG_SEGMENT_HEADER: u8 = 0b0000_1000;
 const FLAG_RELOCATED: u8 = 0b0100_0000;
 
-/// The kinds nothing resolves by key, which a mark never rides on
+/// The kinds no key resolves, which never take a mark
 const CONTROL_MASK: u8 = FLAG_SEGMENT_HEADER;
 
-/// The marks that ride along with a kind rather than being one
+/// The mark bits, which go with a kind
 const MARK_MASK: u8 = FLAG_RELOCATED;
 
 /// Every bit a writer sets, so anything else is a torn or foreign header
 const KNOWN_MASK: u8 = KIND_MASK | MARK_MASK;
 
-/// The checksum every record and footer is covered by
-///
-/// Part of the on-disk format: a stored value only reproduces under the same
-/// algorithm, so changing it makes every segment already written unreadable.
+/// The checksum over every record and footer, fixed by the on-disk format
 const CRC: CrcAlgorithm = CrcAlgorithm::Crc32Iscsi;
 
 /// A prefix has to fit the inline write buffer, or every record would allocate
@@ -109,18 +99,11 @@ pub fn checksum(bytes: &[u8]) -> u32 {
 }
 
 /// The same checksum, fed a piece at a time
-///
-/// For a caller whose bytes are not one range: a record covers its header, its
-/// key and its payload, which never exist in one buffer.
 pub fn digest() -> Digest {
     Digest::new(CRC)
 }
 
-/// The control bits a record header carries
-///
-/// The low five bits say what kind of record it is and are exclusive; the two
-/// above them say how it was committed and ride along with a data record or a
-/// tombstone.
+/// The kind and mark bits in a record header
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Flags(u8);
 
@@ -134,13 +117,10 @@ impl Flags {
     /// A delete marker for a range of keys, its payload the exclusive end
     pub const RANGE_TOMBSTONE: Flags = Flags(FLAG_RANGE_TOMBSTONE);
 
-    /// The first record of a segment, carrying its self describing payload
+    /// The first record of a segment, with its self describing payload
     pub const SEGMENT_HEADER: Flags = Flags(FLAG_SEGMENT_HEADER);
 
     /// The same record written again elsewhere by compaction
-    ///
-    /// A copy carries the sequence number of the record it copied, so without
-    /// this nothing tells it apart from a write that lost an ordering race.
     pub fn relocated(self) -> Flags {
         Flags(self.0 | FLAG_RELOCATED)
     }
@@ -181,10 +161,6 @@ impl Flags {
     }
 
     /// Read flags from a header byte, rejecting shapes no writer produces
-    ///
-    /// The kind bits are exclusive, and the marks ride only on records a batch or
-    /// a compaction can contain, which no control record is. A bit outside both
-    /// sets was never written by this format.
     pub fn from_bits(byte: u8) -> Result<Flags> {
         if byte & !KNOWN_MASK != 0 {
             return Err(ReelError::Corruption(format!(
@@ -207,9 +183,6 @@ impl Flags {
 }
 
 /// The bytes a record writes ahead of its payload: its header and then its key
-///
-/// Carried inline because one is built for every record appended and handed
-/// straight to an inline write buffer.
 pub struct RecordPrefix {
     /// Staging array for the header and, where it fits, the key
     bytes: [u8; PREFIX_CAP],
@@ -232,20 +205,17 @@ impl RecordPrefix {
         self.tail.as_deref()
     }
 
-    /// Bytes the prefix occupies on disk, staged and gathered together
+    /// The prefix's length on disk, staged bytes and spilled key together
     pub fn len(&self) -> usize {
         self.len + self.tail.as_ref().map_or(0, |tail| tail.len())
     }
 
     /// The staging array, the bytes of it occupied, and any spilled key
-    ///
-    /// The tail comes out with the head, since a caller taking one and leaving
-    /// the other frames a record wider than it writes.
     pub fn into_parts(self) -> ([u8; PREFIX_CAP], usize, Option<Arc<[u8]>>) {
         (self.bytes, self.len, self.tail)
     }
 
-    /// Whether the prefix carries nothing, which no real record produces
+    /// Whether the prefix is empty, which no real record produces
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -263,10 +233,10 @@ impl RecordPrefix {
     }
 }
 
-/// The fixed size header that precedes every record on disk
+/// The fixed size header ahead of a keyed record's key and payload
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordHeader {
-    /// Length of the payload, or pad fill, that follows the key
+    /// Length of the payload that follows the key
     pub length: u32,
 
     /// Checksum over the header with this field zeroed, the key, and the payload
@@ -275,10 +245,10 @@ pub struct RecordHeader {
     /// Append sequence number that orders this record within its reel
     pub lsn: Lsn,
 
-    /// Control bits marking tombstones, pads, and batch membership
+    /// Kind and mark bits: tombstone, range tombstone, segment header, relocated
     pub flags: Flags,
 
-    /// Column and key this record is addressed by, empty for control records
+    /// The record's column and key, empty for control records
     pub key: RecordKey,
 
     /// Codec that produced the stored payload, zero for raw bytes
@@ -296,10 +266,7 @@ impl RecordHeader {
         RecordHeader::new(0, lsn, Flags::TOMBSTONE, key, &[])
     }
 
-    /// A segment header record carrying the frozen self describing payload
-    ///
-    /// No sequence number and no key, since it is never indexed, but a payload
-    /// the checksum covers.
+    /// A segment header record with its self describing payload
     pub fn segment_header(payload: &[u8]) -> RecordHeader {
         RecordHeader::new(
             payload.len() as u32,
@@ -310,10 +277,7 @@ impl RecordHeader {
         )
     }
 
-    /// A header of any kind, checksummed over the payload it will carry
-    ///
-    /// The checksum covers the flags, so a caller needing flags no constructor
-    /// above sets builds here rather than remarking afterwards.
+    /// A header of any kind, checksummed over its payload
     pub fn new(
         length: u32,
         lsn: Lsn,
@@ -349,8 +313,6 @@ impl RecordHeader {
     }
 
     /// A header whose payload a codec produced, checksummed over the stored bytes
-    ///
-    /// The codec byte is covered by the crc, so it cannot be patched afterwards.
     pub fn new_coded(
         length: u32,
         lsn: Lsn,
@@ -391,10 +353,7 @@ impl RecordHeader {
         prefix
     }
 
-    /// Parse a header and its key from the bytes that begin a record
-    ///
-    /// A slice too short for the fixed part or the key it claims is rejected
-    /// rather than filled in, so a truncated tail ends a walk.
+    /// Parse a header and its key from the bytes that begin a record, rejecting a short slice
     pub fn unpack(bytes: &[u8]) -> Result<RecordHeader> {
         if bytes.len() < HEADER_LEN {
             return Err(ReelError::Corruption(
@@ -435,9 +394,6 @@ impl RecordHeader {
     }
 
     /// Recompute the checksum and compare it to the stored one
-    ///
-    /// For a record with a payload pass the bytes the length describes; the ones
-    /// without a payload carry no bytes past their key and ignore the argument.
     pub fn verify(&self, payload: &[u8]) -> bool {
         let covered = if self.has_payload() { payload } else { &[] };
         self.compute_crc(covered) == self.crc
@@ -448,10 +404,7 @@ impl RecordHeader {
         self.flags.is_data() || self.flags.is_segment_header() || self.flags.is_range_tombstone()
     }
 
-    /// Whether these bytes are unwritten space rather than a record
-    ///
-    /// Reserved space reads back as zeros, which parse as a data record with no
-    /// sequence number, and every real one draws a sequence number above zero.
+    /// Whether these bytes are unwritten space, which parse as data with no sequence number
     pub fn is_unwritten(&self) -> bool {
         self.flags.is_data() && self.lsn == Lsn::NONE
     }
@@ -461,7 +414,7 @@ impl RecordHeader {
         HEADER_LEN as u64 + u64::from(self.key.width())
     }
 
-    /// Total bytes this record spans on disk: header, key, and payload or fill
+    /// Total bytes this record spans on disk: header, key and payload
     pub fn span(&self) -> u64 {
         self.prefix_len() + u64::from(self.length)
     }
@@ -523,9 +476,7 @@ impl RecordHeader {
     }
 }
 
-/// The codec of the data record a prefix starts, when it is this key's at this sequence number and length
-///
-/// Read in place, so checking a record builds no key.
+/// The codec of the data record a prefix starts, if its key, sequence number and length match
 pub fn data_codec(prefix: &[u8], key: KeyRef<'_>, lsn: Lsn, length: u32) -> Option<u8> {
     let fixed = prefix.get(..HEADER_LEN)?;
     let is_match = Flags::from_bits(fixed[OFFSET_FLAGS]).is_ok_and(Flags::is_data)
@@ -552,9 +503,6 @@ pub fn head_for(prefix: &[u8], key: KeyRef<'_>) -> Option<(Lsn, u32, Flags)> {
 }
 
 /// The key width a record claims, read from the fixed part of its header
-///
-/// A walk needs this before it can parse the record, since the key sits between
-/// the fixed header and the payload.
 pub fn peek_key_width(bytes: &[u8]) -> Option<usize> {
     let field = bytes.get(OFFSET_KEY_WIDTH..OFFSET_CODEC)?;
     let width = read_u16_le(field) as usize;
@@ -677,7 +625,7 @@ pub fn keyless_len(prefix: &[u8]) -> Option<u32> {
     Some(u32::from(read_u16_le(shape)) >> CODEC_BITS)
 }
 
-/// Read a keyless record's stored length and codec off its prefix, for a read a row or the map placed
+/// Read a keyless record's stored length and codec off its prefix
 pub fn keyless_len_codec(prefix: &[u8]) -> Option<(u32, u8)> {
     let shape = read_u16_le(prefix.get(KEYLESS_SHAPE_AT..KEYLESS_PREFIX)?);
     Some((
@@ -770,7 +718,7 @@ mod tests {
         assert_eq!(checksum(b"123456789"), 0xe306_9283);
     }
 
-    // the staged prefix is sized by the inline key, never by the format's ceiling
+    // the staged prefix is sized by the inline key bound
     #[test]
     fn header_size() {
         assert_eq!(HEADER_LEN, OFFSET_CODEC + 1);
@@ -810,7 +758,7 @@ mod tests {
         assert!(tombstone.flags.is_tombstone());
     }
 
-    // a range tombstone carries its exclusive end as its payload
+    // a range tombstone holds its exclusive end as its payload
     #[test]
     fn range_tombstone_carries_end() {
         let start = sample_key(RECORD, 0x10, 34);
@@ -832,7 +780,7 @@ mod tests {
         assert_eq!(parsed.key, start);
     }
 
-    // an unbounded range tombstone carries no end at all
+    // an unbounded range tombstone has no end at all
     #[test]
     fn unbounded_range_tombstone() {
         let header = RecordHeader::new(
@@ -870,7 +818,7 @@ mod tests {
         assert_ne!(moved.crc, plain.crc, "the mark is covered by the checksum");
     }
 
-    // a segment header record round trips, carries its payload, and verifies
+    // a segment header record round trips, keeps its payload, and verifies
     #[test]
     fn segment_header_record() {
         let payload = [0x01u8, 0x00, 0x07, 0x00, 0x00, 0x01, 0x02, 0x03];
@@ -939,7 +887,7 @@ mod tests {
         assert!(RecordHeader::unpack(&packed).is_ok());
     }
 
-    // a key width past what the format carries is rejected before any read
+    // a key width past the format's ceiling is rejected before any read
     #[test]
     fn over_wide_key_rejected() {
         let header = RecordHeader::data(sample_key(RECORD, 0x01, 34), Lsn(1), &[]);
@@ -1013,7 +961,7 @@ mod tests {
         }
     }
 
-    // an empty key is what a control record carries and what zeros parse as
+    // an empty key is what a control record has and what zeros parse as
     #[test]
     fn unwritten_space() {
         let zeros = RecordHeader::unpack(&[0u8; HEADER_LEN]).expect("unpack");

@@ -1,27 +1,5 @@
-//! Raw put and get throughput, and the CPU terms underneath them
-//!
-//! The engine measured as a store of arbitrary bytes. The CPU probes measure checksum,
-//! copy and index-insert rates with no io at all, which is the ceiling this machine
-//! could ever reach; the matrix then drives the real store across backends, page cache
-//! settings, sync policies, thread counts, record sizes and write modes, so the gap
-//! between the two says whether a cell is CPU bound, syscall bound or device bound.
-//!
-//! Point `REEL_RAW_DIR` at the filesystem under test. A run on tmpfs measures the engine
-//! with no block device beneath it, and a run whose total bytes exceed the machine's
-//! memory measures the drive; a run that is neither measures the page cache and says
-//! nothing about either.
-//!
-//! On the key sweep, read the microsecond columns rather than the MB/s ones: a wider
-//! key grows the record without growing the payload the rate is computed from.
-//!
-//! Knobs, all optional: `REEL_RAW_BACKEND`, `REEL_RAW_SYNC`,
-//! `REEL_RAW_SIZES`, `REEL_RAW_KEYS`, `REEL_RAW_KEY_SHAPES`, `REEL_RAW_THREADS`,
-//! `REEL_RAW_WRITE`, `REEL_RAW_BYTES`, `REEL_RAW_SHARDS`, `REEL_RAW_MAX_OPS`,
-//! `REEL_RAW_TAILS`, `REEL_RAW_SEGMENT`, `REEL_RAW_VOLUMES`, `REEL_RAW_DROP_CACHES`,
-//! `REEL_RAW_RANDOM_READS`, `REEL_RAW_SKIP_READS`, `REEL_RAW_WEIGH`, `REEL_RAW_CSV`.
-//!
-//! Ignored by default. Run with:
-//!   cargo test -p tape-reel --test raw_throughput --release -- --ignored --nocapture --test-threads=1
+//! Raw put and get throughput, plus the CPU cost of checksums, copies and index inserts
+//! Run `cargo test -p tape-reel -r --test raw_throughput -- --ignored --nocapture --test-threads=1`
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::RefCell;
@@ -42,10 +20,7 @@ use reel::{
     MAX_KEY_LEN,
 };
 
-/// The column this bench writes into
-///
-/// The shard count matters: the index splits a column by leading key bytes, so
-/// a column with one shard puts every writer behind one lock and measures that lock.
+/// The bench column at the default key width, split over two shard bytes
 const BENCH_COLUMNS: ColumnSet = &[ColumnSpec {
     id: ColumnId(1),
     name: "raw",
@@ -70,10 +45,7 @@ const ID_LEN: usize = 32;
 /// Bytes a record key occupies
 const RECORD_KEY_LEN: usize = GROUP_PREFIX_LEN + ID_LEN;
 
-/// A caller-declared column set of the shape a deployment hands the engine
-///
-/// Records lead with the group, so their shards are the groups a volume holds; blobs
-/// lead with a content address, which is uniform, so sharding them buys nothing.
+/// A deployment-shaped column set: records sharded by group, blobs unsharded
 const TEST_COLUMNS: ColumnSet = &[
     ColumnSpec {
         id: RECORDS,
@@ -103,9 +75,6 @@ const DEFAULT_KEYS: &str = "16";
 const DEFAULT_KEY_SHAPES: &str = "fixed";
 
 /// The fixed key widths the resident index is monomorphised over
-///
-/// A fixed column of any other width is refused at open, so the matrix checks the list
-/// before it runs. Anything wider than `INLINE_KEY_LEN` needs a variable column.
 const INDEXED_WIDTHS: [u64; 11] = [8, 12, 16, 24, 32, 34, 40, 44, 48, 72, 108];
 
 /// Bytes each matrix cell writes, before the read phase reads them back
@@ -120,22 +89,16 @@ const DEFAULT_THREADS: &str = "1,4,16";
 /// Write modes the matrix sweeps, one record per call against batched runs
 const DEFAULT_WRITES: &str = "put,batch16";
 
-/// Shards the keys are spread across, which is one reel and one tail each
+/// Warm puts made before the write phase starts
 const DEFAULT_SHARDS: u64 = 8;
 
-/// Records one cell will write however small they are
-///
-/// Without a cap a two gigabyte cell of hundred byte records is twenty million keys and
-/// about a gigabyte of resident index, which measures the index and not the write path.
+/// Caps the records one cell writes, so small records do not just measure the index
 const DEFAULT_MAX_OPS: u64 = 2_000_000;
 
 /// Bytes each CPU probe moves in total, whatever buffer it moves them through
 const CPU_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-/// Buffer sizes the streaming probes run at
-///
-/// The small one fits in cache and is the per-record case; the large one fits in no last
-/// level cache, so it says whether a core keeps up with a drive streaming at GB/s.
+/// Buffer sizes the streaming probes run at, one in cache and one past it
 const CPU_BUFFERS: [usize; 2] = [1024 * 1024, 256 * 1024 * 1024];
 
 /// Record sizes the per-call probe charges the checksum at
@@ -145,12 +108,9 @@ const CPU_RECORDS: [usize; 4] = [100, 4096, 65_536, 1024 * 1024];
 const CRC64: CrcAlgorithm = CrcAlgorithm::Crc64Nvme;
 
 /// The checksum the record header ships
-///
-/// Named here rather than reached through `record::checksum`, so a column labelled crc64
-/// measures crc64 whatever the header currently uses.
 const CRC32C: CrcAlgorithm = CrcAlgorithm::Crc32Iscsi;
 
-/// Vector the shipped entry point is held to the algorithm this probe names
+/// Input used to check that the shipped checksum is crc32c
 const CHECK_VECTOR: &[u8] = b"123456789";
 
 /// Keys the index probe inserts
@@ -166,15 +126,9 @@ const INDEX_WRITERS: [usize; 3] = [1, 4, 8];
 const INDEX_ROUNDS: usize = 5;
 
 /// Whether allocations are being weighed
-///
-/// Off, this is one relaxed load per allocation, so a weighed run stays comparable
-/// against a run taken without the scale.
 static WEIGHING: AtomicBool = AtomicBool::new(false);
 
 /// One thread's running allocation totals
-///
-/// Per thread rather than global: a global counter would put every allocation in the
-/// engine on one contended cache line, which taxes the cells the scale exists to weigh.
 #[derive(Clone, Copy, Default)]
 struct Scales {
     /// Bytes handed to this thread, only ever counting upward
@@ -209,8 +163,7 @@ struct Scale;
 unsafe impl GlobalAlloc for Scale {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if WEIGHING.load(Ordering::Relaxed) {
-            // A thread late enough in teardown to have lost its locals is past anything
-            // the scale is weighing, so a failed lookup is dropped rather than counted.
+            // A thread past teardown has no locals left, and its allocation goes uncounted
             let _ = SCALE.try_with(|scale| {
                 let mut now = scale.get();
                 now.taken += layout.size() as u64;
@@ -260,10 +213,7 @@ fn env_string(name: &str, fallback: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| fallback.to_string())
 }
 
-/// A comma separated number list from the environment, or the fallback
-///
-/// Loud on anything it cannot read: dropping a malformed entry quietly is how a mistyped
-/// axis becomes a run measuring a different cell than the one that was asked for.
+/// A comma separated number list from the environment or the fallback, loud on junk
 fn env_list(name: &str, fallback: &str) -> Vec<u64> {
     let raw = env_string(name, fallback);
     let list: Vec<u64> = raw
@@ -278,10 +228,7 @@ fn env_list(name: &str, fallback: &str) -> Vec<u64> {
     list
 }
 
-/// A byte count, in bytes or with a binary suffix
-///
-/// Cell sizes are quoted in GiB everywhere they are discussed, so `16GiB` is what gets
-/// typed.
+/// A byte count from the environment, in bytes or with a KiB, MiB or GiB suffix
 fn env_bytes(name: &str, fallback: u64) -> u64 {
     let Some(value) = std::env::var(name).ok() else {
         return fallback;
@@ -311,8 +258,7 @@ fn backends() -> Vec<(String, IoBackend)> {
                 "posix" => IoBackend::Posix,
                 "uring" => IoBackend::Uring,
                 "uring_direct" => IoBackend::UringDirect,
-                // Dropping the name would run the sweep a column short and print a table
-                // that looks complete.
+                // An unknown backend panics, so the sweep never runs a column short
                 other => panic!("REEL_RAW_BACKEND holds `{other}`, which is not a backend"),
             };
             (name.trim().to_string(), backend)
@@ -331,7 +277,7 @@ enum WriteMode {
 }
 
 impl WriteMode {
-    /// Records one call carries
+    /// Records one call writes
     fn span(self) -> u64 {
         match self {
             WriteMode::PerRecord => 1,
@@ -349,8 +295,7 @@ fn writes() -> Vec<(String, WriteMode)> {
             if name == "put" {
                 return (name.to_string(), WriteMode::PerRecord);
             }
-            // Dropping the name would run the sweep a column short and print a table
-            // that looks complete.
+            // An unknown mode panics, so the sweep never runs a column short
             let records: usize = name
                 .strip_prefix("batch")
                 .and_then(|count| count.parse().ok())
@@ -364,9 +309,6 @@ fn writes() -> Vec<(String, WriteMode)> {
 }
 
 /// Key shapes the matrix sweeps, a fixed-width column against a variable one
-///
-/// Two different index paths at the same width, which separates what declaring a column
-/// variable costs from what a wide key costs.
 fn key_shapes() -> Vec<(String, bool)> {
     env_string("REEL_RAW_KEY_SHAPES", DEFAULT_KEY_SHAPES)
         .split(',')
@@ -378,7 +320,7 @@ fn key_shapes() -> Vec<(String, bool)> {
         .collect()
 }
 
-/// Sync policies, given as `never`, `0` for every put, or a byte cadence
+/// Sync settings, given as `never`, `0` for every put, or a byte cadence
 fn syncs() -> Vec<(String, SyncPolicy)> {
     env_string("REEL_RAW_SYNC", "never")
         .split(',')
@@ -410,18 +352,12 @@ fn payload(size: usize) -> Vec<u8> {
 
 thread_local! {
     /// The buffer every key of this thread is cut from
-    ///
-    /// Held rather than built per call, so key construction costs the same at sixteen
-    /// bytes as at a kibibyte and every width-dependent cost in a row is the engine's.
     static KEY_BUF: RefCell<[u8; MAX_KEY_LEN]> = const {
         RefCell::new([0x5A; MAX_KEY_LEN])
     };
 }
 
 /// The key for one record, derived from its index so a reader can rebuild it
-///
-/// The scrambled half leads, so consecutive records land in different index shards and
-/// the ordered map is not built by a sorted insert, which is a BTreeMap's cheapest case.
 fn key_at(index: u64, width: usize) -> RecordKey {
     KEY_BUF.with(|buf| {
         let mut buf = buf.borrow_mut();
@@ -431,10 +367,7 @@ fn key_at(index: u64, width: usize) -> RecordKey {
     })
 }
 
-/// The bench column at one key width, declared fixed or variable
-///
-/// Leaked because a `ColumnSet` is a `&'static [ColumnSpec]` and the swept width is only
-/// known at run time. One spec per cell, in a test binary that exits.
+/// The bench column at one key width, fixed or variable, leaked into a `'static` set
 fn bench_columns(key_width: usize, variable: bool) -> ColumnSet {
     let spec = ColumnSpec {
         id: ColumnId(1),
@@ -451,10 +384,7 @@ fn bench_columns(key_width: usize, variable: bool) -> ColumnSet {
     &Box::leak(Box::new([spec]))[..]
 }
 
-/// Extra volume roots from the environment, the sweep's multi-device axis
-///
-/// Comma separated paths, `:capacity` marking the capacity tier, empty for a
-/// single-volume run. The tail floor rises with the list on its own.
+/// Extra volume roots from `REEL_RAW_VOLUMES`, a `:capacity` suffix marks the capacity tier
 fn raw_volumes() -> Vec<VolumeSpec> {
     env_string("REEL_RAW_VOLUMES", "")
         .split(',')
@@ -473,19 +403,16 @@ fn config(backend: IoBackend, sync: SyncPolicy) -> ReelConfig {
         io_backend: backend,
         sync,
         volumes: raw_volumes(),
-        // The sweep can name a segment size; zero keeps what ships.
+        // Zero keeps the shipped segment size
         segment_bytes: match env_bytes("REEL_RAW_SEGMENT", 0) {
             0 => shipped.segment_bytes,
             bytes => ByteCount::from_bytes(bytes),
         },
-        // One reel serves every writer, so the tail count is the parallelism knob. Zero
-        // takes the shipped default, which resolves against the machine.
+        // One reel serves every writer, so tails set write parallelism, zero means auto
         active_tails: ThreadBudget::threads(env_bytes("REEL_RAW_TAILS", 0) as u32),
-        // The maintenance plane is not under test and would take the device away from
-        // the phase that is.
+        // Scrub is off so the maintenance plane does not take the device
         scrub_mbps: 0,
-        // A direct volume bypasses the page cache a mapping reads and pairing the two is
-        // refused at validation, so the direct leg keeps the driver.
+        // A direct volume cannot pair with a mapping, so only buffered legs map reads
         map_above: match backend.is_direct() {
             true => None,
             false => MAP_EVERYTHING,
@@ -525,8 +452,7 @@ where
 #[test]
 #[ignore = "cpu probe, run explicitly"]
 fn cpu_terms() {
-    // libtest leaves the test name line open, so a header printed into it starts a
-    // screen-width right of the rows underneath.
+    // libtest leaves the test name line open, so start a fresh one
     println!();
     assert_eq!(
         checksum(CHECK_VECTOR),
@@ -562,8 +488,7 @@ fn cpu_terms() {
             })
             * 1000.0;
 
-        // Both ends go through black_box, or the copy has no observable effect and the
-        // optimiser deletes the loop.
+        // Both ends go through black_box, or the optimiser deletes the copy
         let copy_mbps = per_round
             / charge(rounds, || {
                 std::hint::black_box(&mut copy).copy_from_slice(std::hint::black_box(&buffer));
@@ -575,8 +500,7 @@ fn cpu_terms() {
         } else {
             format!("{} KiB", size / 1024)
         };
-        // The combined column charges the shipped checksum against the one copy a write
-        // already pays, which is the per-byte cost the engine cannot avoid.
+        // The last column is the shipped checksum plus the one copy every write pays
         println!(
             "{label:>12} {crc64_mbps:>12.0} {crc32c_mbps:>12.0} {xxh3_mbps:>12.0} {copy_mbps:>12.0} {:>16.0}",
             1.0 / (1.0 / crc32c_mbps + 1.0 / copy_mbps)
@@ -613,10 +537,7 @@ fn cpu_terms() {
     index_terms();
 }
 
-/// What the resident index charges per key, on the shape a caller actually holds
-///
-/// Shards bound the depth of the tree under each of them, so the same key count costs
-/// more the fewer groups it is spread across.
+/// Prints what the resident index costs per key on the record column
 fn index_terms() {
     println!("\nresident index, record column, group prefix ahead of a content address");
     println!(
@@ -626,8 +547,7 @@ fn index_terms() {
 
     for groups in INDEX_GROUPS {
         for writers in INDEX_WRITERS {
-            // Best of a few rounds: a contended cell swings by a third between runs,
-            // wider than the effects this probe exists to see.
+            // Best of a few rounds, since contended cells swing between runs
             let mut insert_ns = f64::MAX;
             let mut lookup_ns = f64::MAX;
             for _ in 0..INDEX_ROUNDS {
@@ -646,8 +566,7 @@ fn index_terms() {
         let label = format!("record, {RECORD_KEY_LEN} B key, {groups} groups");
         println!("{label:>28} {:>16.0}", index_bytes_per_key(groups));
     }
-    // Both spreads are weighed because many thinly filled maps cost more per key than
-    // one full one.
+    // Both key spreads, since thinly filled maps cost more per key
     println!(
         "{:>28} {:>16.0}",
         "16 B key, ascending",
@@ -659,8 +578,7 @@ fn index_terms() {
         narrow_bytes_per_key(false)
     );
 
-    // One flat map keyed by a heap allocated Vec, printed beside the real index so the
-    // difference between the two shapes is measured rather than assumed.
+    // A flat `BTreeMap` keyed by a fresh Vec, printed for reference
     let start = Instant::now();
     let mut flat = std::collections::BTreeMap::new();
     for at in 0..INDEX_KEYS as u64 {
@@ -671,10 +589,7 @@ fn index_terms() {
     println!("{flat_ns:.1} ns per insert, against the one writer rows above");
 }
 
-/// What one key of a 16 byte column costs, at the two key spreads a column can have
-///
-/// Ascending keys concentrate in one shard, which is what a counter-led key does, and
-/// scattered keys spread over every shard, which is what a content address does.
+/// Resident bytes per key of a 16 byte column, keys ascending or scattered
 fn narrow_bytes_per_key(ascending: bool) -> f64 {
     weigh_reset();
     WEIGHING.store(true, Ordering::Relaxed);
@@ -698,10 +613,7 @@ fn narrow_bytes_per_key(ascending: bool) -> f64 {
     held as f64 / INDEX_KEYS as f64
 }
 
-/// What one key of the record column costs in resident memory
-///
-/// Weighed rather than estimated: the index is built with the allocator counting, and
-/// what it holds afterwards divided by its keys is the answer.
+/// Resident bytes per key of the record column, weighed by the allocator
 fn index_bytes_per_key(groups: u64) -> f64 {
     weigh_reset();
     WEIGHING.store(true, Ordering::Relaxed);
@@ -768,8 +680,6 @@ fn index_pass(groups: u64, writers: usize, keys: usize) -> (f64, f64) {
 }
 
 /// The record column key for a group and a content address
-///
-/// The group leads big endian, so the key space groups by it.
 fn record_key(group: u16, id: [u8; ID_LEN]) -> RecordKey {
     let mut bytes = [0u8; RECORD_KEY_LEN];
     bytes[..GROUP_PREFIX_LEN].copy_from_slice(&group.to_be_bytes());
@@ -778,9 +688,6 @@ fn record_key(group: u16, id: [u8; ID_LEN]) -> RecordKey {
 }
 
 /// A record column key, spread over a given number of groups
-///
-/// The address half is scattered so keys arrive at a shard's map in no order, and the
-/// counter is kept in the low bytes so a lookup can rebuild the key it wants.
 fn index_key(groups: u64, at: u64) -> RecordKey {
     let mut id = [0u8; ID_LEN];
     let scattered = at.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -789,12 +696,11 @@ fn index_key(groups: u64, at: u64) -> RecordKey {
     record_key((at % groups.max(1)) as u16, id)
 }
 
-// raw put and get across backend, page cache, sync policy, threads and size
+// raw put and get across backend, page cache, sync setting, threads and size
 #[test]
 #[ignore = "writes gigabytes, run explicitly on the box under test"]
 fn raw_matrix() {
-    // libtest leaves the test name line open, so a header printed into it starts a
-    // screen-width right of the rows underneath.
+    // libtest leaves the test name line open, so start a fresh one
     println!();
     let sizes = env_list("REEL_RAW_SIZES", DEFAULT_SIZES);
     let key_widths = env_list("REEL_RAW_KEYS", DEFAULT_KEYS);
@@ -897,8 +803,7 @@ fn raw_matrix() {
                                     root: root.clone(),
                                 };
                                 let result = run_cell(&cell);
-                                // A shorter phase is thread spawn and timer noise
-                                // wearing a throughput number's clothes.
+                                // A phase under `MIN_PHASE_SECS` is mostly spawn and timer noise
                                 let flag = match (
                                     result.read_secs < MIN_PHASE_SECS,
                                     result.is_cache_resident,
@@ -994,16 +899,16 @@ struct CellResult {
     /// Microseconds one get took
     read_micros: f64,
 
-    /// Seconds the read phase ran for, so a window too short to trust is visible
+    /// Seconds the read phase ran for, so a window too short to trust shows
     read_secs: f64,
 
-    /// Whether the data written could have fitted in the machine's memory
+    /// Whether the cell fit in memory with the page cache left warm
     is_cache_resident: bool,
 
     /// Device flushes the write phase asked for, per thousand records
     syncs_per_kop: f64,
 
-    /// Bytes the calling thread allocated per record, read as a difference between rows
+    /// Bytes the write path allocated per record
     write_alloc_bytes: f64,
 
     /// Allocation calls the write path made per record
@@ -1017,7 +922,7 @@ struct CellResult {
 }
 
 fn run_cell(cell: &Cell) -> CellResult {
-    // The temp dir has to outlive the store, so it is bound whether or not a root came in.
+    // Bound even when a root is given, so the temp dir outlives the store
     let temp = TempDir::new().expect("tempdir");
     let base = match &cell.root {
         Some(root) => std::path::PathBuf::from(root).join(format!(
@@ -1036,8 +941,7 @@ fn run_cell(cell: &Cell) -> CellResult {
     .expect("open");
     let body = payload(cell.size);
     let span = cell.write.span();
-    // Every writer's share is a whole number of calls, so a batched cell writes the same
-    // records a per-record cell does and the two rows compare directly.
+    // Each writer's share is a whole number of calls
     let per_thread = (cell.cell_bytes / cell.size.max(1) as u64)
         .min(cell.max_ops)
         .max(cell.threads * span)
@@ -1047,9 +951,7 @@ fn run_cell(cell: &Cell) -> CellResult {
     let count = per_thread * cell.threads;
     let payload_bytes = (count * cell.size as u64) as f64;
 
-    // Open every shard before the clock starts: creating a reel writes a mount file,
-    // syncs the root and preallocates a whole segment, so a small cell charged for that
-    // measures preallocation. Rolls inside the phase still count.
+    // Warm puts before the clock starts, so a small cell does not time segment preallocation
     let warm = payload(cell.size.min(64));
     for shard in 0..cell.shards {
         store
@@ -1058,8 +960,7 @@ fn run_cell(cell: &Cell) -> CellResult {
     }
     store.flush().expect("warm flush");
 
-    // Each thread weighs itself and folds its totals in once at the end, so the phase
-    // pays one atomic per thread rather than one per allocation.
+    // Each thread folds its allocation totals in once at the end, one atomic per thread
     let write_taken = AtomicU64::new(0);
     let write_calls = AtomicU64::new(0);
     let syncs_before = store.sync_count();
@@ -1094,21 +995,17 @@ fn run_cell(cell: &Cell) -> CellResult {
     WEIGHING.store(false, Ordering::Relaxed);
     let write_syncs = store.sync_count() - syncs_before;
 
-    // The put loop returns when the bytes are in the page cache, which under the default
-    // policy is before any have reached the drive, so timing only that is a memcpy rate.
-    // The durable column covers the flush too and is the one to compare against a device.
+    // The put loop returns at the page cache, so the durable column adds the flush
     let flush_start = Instant::now();
     store.flush().expect("flush");
     let durable_secs = write_secs + flush_start.elapsed().as_secs_f64();
 
-    // The only way to get a cold read on a box whose memory is comparable to the cell:
-    // without it most reads come out of memory, at microseconds no device could answer in.
+    // Dropping the page cache makes the reads cold
     if cell.drop_caches {
         drop_page_cache();
     }
 
-    // Read in a stride rather than in write order, so a reader is not simply walking the
-    // file the writer just laid down.
+    // Reads go in key order, or in a stride when `REEL_RAW_RANDOM_READS` is set
     let hits = AtomicU64::new(0);
     let read_taken = AtomicU64::new(0);
     let read_calls = AtomicU64::new(0);
@@ -1122,8 +1019,6 @@ fn run_cell(cell: &Cell) -> CellResult {
             weigh_reset();
             let mut found = 0u64;
             for step in 0..per_thread {
-                // Insertion order makes the read pattern follow the file layout, which
-                // measures layout rather than the engine.
                 let at = if cell.random_reads {
                     (step.wrapping_mul(READ_STRIDE).wrapping_add(thread)) % count
                 } else {
@@ -1170,9 +1065,7 @@ fn run_cell(cell: &Cell) -> CellResult {
     }
 }
 
-/// Give the whole page cache back to the kernel, so the next read reaches the drive
-///
-/// Needs root and Linux. Anywhere else this is a no-op and the numbers stay warm.
+/// Drop the page cache so the next read reaches the drive, Linux and root only
 fn drop_page_cache() {
     #[cfg(target_os = "linux")]
     {
@@ -1193,9 +1086,6 @@ fn drop_page_cache() {
 }
 
 /// Bytes of memory the machine has, for deciding whether a cell could be cached
-///
-/// A cell smaller than this was read out of the page cache whatever the drive underneath
-/// is, so a row that does not say so invites a memcpy being read as a device.
 fn machine_memory_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {

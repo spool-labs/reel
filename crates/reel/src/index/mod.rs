@@ -1,10 +1,4 @@
 //! The index: per-column key maps, the spot index, segment counters, rebuild, and locks
-//!
-//! A reel keeps the record locations of its open tails in one ordered map per
-//! column, guarded by sequence number and backed by per-segment reclaimable-byte
-//! counters, and finds a sealed key through its footer and the spot index. On open
-//! the maps are rebuilt from the tails and the spot index from the footers, and a
-//! writable open takes an ownership lock so a second writer fails loudly.
 
 pub mod column;
 pub mod counters;
@@ -20,7 +14,7 @@ pub mod spot;
 pub mod tailer;
 pub mod tbtreemap;
 
-/// Each group's rows a chunk at a time, one chunk per group per round, so a lock taken per chunk sits free long enough for a waiter to get in
+/// Hand out each group's rows in slices of `chunk`, one per group a round, so waiters get the lock
 pub(crate) fn in_turns(
     groups: &[(usize, Vec<usize>)],
     chunk: usize,
@@ -42,7 +36,7 @@ pub(crate) fn in_turns(
 mod tests {
     use super::in_turns;
 
-    // every group gives up one chunk before any group gives a second
+    // every group gives up one slice before any group gives a second
     #[test]
     fn groups_take_their_chunks_in_turns() {
         let groups = vec![(3, vec![0, 1, 2, 3, 4]), (7, vec![5, 6])];

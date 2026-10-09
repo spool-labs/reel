@@ -1,11 +1,4 @@
-//! The filter a sealed segment carries so a miss can skip it
-//!
-//! One filter per column per segment, built at seal, saying either "not here" or
-//! "search". Everything fails open, because saying no wrongly is a key that has
-//! vanished: an unknown kind, a truncated region and a length that disagrees with
-//! itself all mean search the segment. For the same reason a filter covers every
-//! row the partition holds, tombstones included, since a delete missing from it
-//! lets a probe skip past to an older version.
+//! A sealed segment's per-column filters, which let a miss skip it and fail open
 
 use crate::format::record::read_u32_le;
 
@@ -15,30 +8,21 @@ pub const KIND_ABSENT: u8 = 0;
 /// A blocked bloom filter: one cache line per key, several bits inside it
 pub const KIND_BLOOM: u8 = 1;
 
-/// Bytes of header every encoded filter carries
-///
-/// Kind, seed, probe count, a spare byte, the keys covered, and its own total
-/// length, which is what lets a reader walk a region of them with no directory.
-/// The probe count is stored rather than recomputed, since a bloom queried at a
-/// different count than it was built at loses keys it holds.
+/// Header length of an encoded filter: kind, seed, probes, spare, keys and total length
 pub const HEADER_LEN: usize = 1 + 1 + 1 + 1 + 4 + 4;
 
-/// Bytes one block covers, which is the cache line a probe wants to touch once
+/// One block is one cache line
 const BLOCK_BYTES: usize = 64;
 
-/// Bits one block holds
 const BLOCK_BITS: u32 = (BLOCK_BYTES * 8) as u32;
 
-/// Most probes one key makes, whatever its bits per key would ask for
+/// A key makes at most this many probes
 const MAX_PROBES: u32 = 8;
 
-/// Seed every filter is built under
-///
-/// One value rather than a search, since a bloom cannot fail to build. Written
-/// into the header all the same, for a kind that would have to retry seeds.
+/// Every filter is built under this seed
 const SEED: u8 = 0;
 
-/// Bits per key past which more bits buy less than the probes cost
+/// Bits per key are capped here, where more bits buy less than the probes cost
 const MAX_BITS_PER_KEY: u8 = 32;
 
 /// One column's filter for one sealed segment
@@ -47,13 +31,13 @@ pub struct Filter {
     /// Which structure the body holds, so an unknown one can fail open
     kind: u8,
 
-    /// Hash seed the build settled on
+    /// The build's hash seed
     seed: u8,
 
-    /// Bits one key sets, which a query must repeat exactly
+    /// Each key sets this many bits, and a query must use the same count
     probes: u8,
 
-    /// Keys the filter was built over, kept for sizing and for reporting
+    /// Number of keys the filter was built over
     keys: u32,
 
     /// The structure itself
@@ -61,10 +45,7 @@ pub struct Filter {
 }
 
 impl Filter {
-    /// Build a filter over every key a partition holds
-    ///
-    /// Nothing comes back for no keys or no bits, and a partition without a
-    /// filter is searched.
+    /// Build a filter over every key a partition holds, or nothing for no keys or no bits
     pub fn build<'keys, Keys>(keys: Keys, count: usize, bits_per_key: u8) -> Option<Filter>
     where
         Keys: Iterator<Item = &'keys [u8]>,
@@ -118,12 +99,12 @@ impl Filter {
         true
     }
 
-    /// Keys this filter was built over
+    /// Number of keys the filter was built over
     pub fn keys(&self) -> u32 {
         self.keys
     }
 
-    /// Bytes this filter takes on disk, header and all
+    /// The filter's on-disk length, header included
     pub fn encoded_len(&self) -> usize {
         HEADER_LEN + self.body.len()
     }
@@ -140,10 +121,6 @@ impl Filter {
     }
 
     /// Take one filter per partition off a footer's filter region
-    ///
-    /// One header per partition either way, so the walk stays in step with the
-    /// directory. A region that is absent, short, or unparsable leaves the
-    /// partitions behind it without filters, which searches them.
     pub fn parse_region(region: &[u8], partitions: usize) -> Vec<Option<Filter>> {
         let mut filters = Vec::with_capacity(partitions);
         let mut at = 0usize;
@@ -197,33 +174,24 @@ impl Filter {
     }
 }
 
-/// Blocks a filter of this many keys at this many bits takes
+/// Number of blocks for this many keys at this many bits per key
 fn blocks_for(count: usize, bits_per_key: u8) -> usize {
     let bits = (count as u64).saturating_mul(u64::from(bits_per_key));
     bits.div_ceil(u64::from(BLOCK_BITS)) as usize
 }
 
-/// Probes one key makes at this many bits per key
-///
-/// The bloom optimum is bits times ln 2, capped so a fat filter does not spend
-/// its time probing.
+/// Probes per key at this many bits per key, bits times ln 2 capped at `MAX_PROBES`
 fn probes_for(bits_per_key: u8) -> u32 {
     let probes = (f64::from(bits_per_key) * std::f64::consts::LN_2).round() as u32;
     probes.min(MAX_PROBES)
 }
 
-/// Which block a hash lands in, without a division
-///
-/// From the high half only, leaving the low half free to pick bits inside the
-/// block without the two being one number twice.
+/// Which block a hash lands in, from its high half and without a division
 fn block_of(hash: u64, blocks: usize) -> usize {
     (((hash >> 32) * blocks as u64) >> 32) as usize
 }
 
 /// The bits inside a block one key sets, by double hashing
-///
-/// The step is a fresh mix rather than the other half of the same word, which
-/// would make the two terms equal and leave every probe on one sequence.
 fn bits_of(hash: u64, probes: u32) -> impl Iterator<Item = u32> {
     let first = hash as u32;
     let step = (hash.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as u32 | 1;
@@ -231,9 +199,6 @@ fn bits_of(hash: u64, probes: u32) -> impl Iterator<Item = u32> {
 }
 
 /// A 64 bit hash of a key under a seed
-///
-/// The key is mixed rather than sliced: keys here are close to uniform already,
-/// but the bits a probe wants are not independent just because the key is.
 fn hash_key(key: &[u8], seed: u8) -> u64 {
     const ODD: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut state = 0xcbf2_9ce4_8422_2325u64 ^ u64::from(seed).wrapping_mul(ODD);
@@ -278,7 +243,7 @@ mod tests {
         }
     }
 
-    // keys that never went in are mostly ruled out, which is what makes it worth carrying
+    // keys that never went in are mostly ruled out, which is what makes it worth keeping
     #[test]
     fn rules_most_out() {
         let filter = built(10_000, 10);
@@ -341,7 +306,7 @@ mod tests {
         assert_eq!(two.as_ref(), Some(&second));
     }
 
-    // a truncated region rules nothing out rather than ruling everything out
+    // a truncated region rules nothing out
     #[test]
     fn truncation_fails_open() {
         let filter = built(100, 10);

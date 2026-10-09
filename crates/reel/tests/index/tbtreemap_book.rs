@@ -1,9 +1,4 @@
-//! The tree as the crate's small books use it, against the map it replaced
-//!
-//! A book keyed by an offset or a segment number takes its keys in ascending order
-//! and gives them back in any order, and ascending inserts are the one path that
-//! splits a leaf by its tail rather than down the middle. What every one of these
-//! books then asks for is the lowest key still held.
+//! The tree as the crate's small books use it, checked against `BTreeMap`
 
 use std::collections::BTreeMap;
 
@@ -42,8 +37,7 @@ fn a_book_of_ascending_keys_agrees() {
         let mut next = 0u64;
 
         for step in 0..4_000 {
-            // A reservation goes in above everything drawn so far, which is what
-            // an appending writer does and what splits a leaf by its tail.
+            // Each reservation goes above all drawn so far, which splits a leaf by its tail
             let taking = held.is_empty() || rng.gen_bool(0.6);
             match taking {
                 true => {
@@ -68,7 +62,7 @@ fn a_book_of_ascending_keys_agrees() {
             ends(&book, &oracle, seed, step);
         }
 
-        // Everything lands, which walks the book down to nothing one key at a time.
+        // Land everything, emptying the book one key at a time
         held.shuffle(&mut rng);
         for (at, base) in held.iter().enumerate() {
             assert_eq!(book.remove(base), oracle.remove(base));
@@ -78,7 +72,7 @@ fn a_book_of_ascending_keys_agrees() {
     }
 }
 
-// the same book keyed the other way, since a segment number only ever climbs
+// a book emptied and refilled with ever higher keys, as segment numbers climb
 #[test]
 fn a_book_emptied_and_refilled_agrees() {
     let mut book = Book::default();
@@ -98,11 +92,7 @@ fn a_book_emptied_and_refilled_agrees() {
     }
 }
 
-// a book's room tracks what it holds, not what it has ever been handed
-//
-// Removal leaves the emptied leaf in the chain, and these books drain their low end
-// while their keys climb, so a bare removal grows the tree forever and the frontier
-// read walks all of it. The packing removal is what the books take instead.
+// a book's room tracks what it holds while its low end drains
 #[test]
 fn a_drained_book_gives_its_room_back() {
     const DEPTH: u64 = 32;
@@ -133,16 +123,14 @@ fn a_drained_book_gives_its_room_back() {
     }
     ends(&book, &oracle, 0, 20_000);
 
-    // Four leaves would hold the 33 keys in flight, and the doubling guard packs
-    // at twice that. Ten is room for the guard and no room for a leak.
+    // Four leaves hold the 33 keys in flight and the doubling guard packs at twice that
     assert!(
         worst <= 10,
         "the book grew to {worst} leaves holding {}",
         book.len()
     );
 
-    // Everything lands, and the book comes to rest on the one leaf the guard will not
-    // pack below, not on the room it held at its busiest.
+    // Once everything lands, the book rests on the one leaf the guard will not pack below
     let held: Vec<u64> = book.iter().map(|(key, _)| *key).collect();
     for key in &held {
         book.remove_packed(key);

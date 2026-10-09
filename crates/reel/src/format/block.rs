@@ -1,11 +1,4 @@
-//! Reading a sealed footer a block of rows at a time rather than whole
-//!
-//! The rows are sorted and mostly fixed stride, so a row's place is arithmetic: the
-//! directory in the last few bytes of the file says where each column's rows begin, and a
-//! key is then a binary search over blocks of rows read on demand. This path does not
-//! verify the footer's checksum, which covers the whole footer and cannot be checked
-//! without reading all of it; that is safe only because a row from here names a record,
-//! and the record carries its own checksum, key and sequence number for the read.
+//! Reads a sealed footer one block of rows at a time, trusting each record's own checksum
 
 use std::sync::Arc;
 
@@ -23,21 +16,12 @@ use crate::io::op::FileId;
 use crate::reel::segment::IoDriver;
 
 /// Bytes read from the end of a segment to reach its directory
-///
-/// The fixed tail plus room for the directory rows of every column a volume is likely to
-/// serve. A directory that does not fit is read again at its real size.
 const TAIL_PROBE: u64 = 512;
 
-/// Rows one block holds at most
-///
-/// Large enough that a run of neighbouring keys is answered from one read, small enough
-/// that a point lookup does not buy a megabyte to use fifty bytes.
+/// A strided block holds at most this many rows
 pub const BLOCK_ROWS: usize = 64;
 
-/// Bytes one block holds at most, whatever the row count would allow
-///
-/// A cap rather than a target: reading more rows a block means fewer probes that each
-/// move more bytes, and for a cold lookup that runs the wrong way.
+/// A strided block holds at most this many bytes, whatever the row count would allow
 pub const BLOCK_BYTES: usize = 8 * 1024;
 
 /// Rows per block of a partition with this key width and packing
@@ -52,43 +36,43 @@ pub fn block_rows_of(key_width: u16, is_packed: bool) -> usize {
 /// Where one column's rows sit inside a sealed segment
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PartitionSpan {
-    /// Column the rows belong to
+    /// The rows' column
     pub column: ColumnId,
 
-    /// Width every row strides by, or the varying sentinel
+    /// The key width of every row, or `VARYING_WIDTH`
     pub key_width: u16,
 
     /// Whether the rows lie prefix packed, so a read opens on a restart block
     pub is_packed: bool,
 
-    /// Rows this column contributed to the footer
+    /// Number of rows the column has in the footer
     pub rows: usize,
 
     /// Byte offset of the first row within the segment file
     pub at: u64,
 
-    /// Bytes the partition's encoded rows occupy on disk, which only a varying one needs
+    /// Length of the partition's encoded rows on disk, which a packed read needs
     pub encoded: u64,
 }
 
 impl PartitionSpan {
-    /// Whether the rows carry their own starts rather than striding
+    /// Whether the rows vary in key width
     pub fn is_varying(&self) -> bool {
         self.key_width == VARYING_WIDTH
     }
 
-    /// Bytes one row takes, where every row takes the same
+    /// Bytes per row in a strided partition
     pub fn stride(&self) -> usize {
         debug_assert!(!self.is_varying(), "a varying partition has no stride");
         self.key_width as usize + ENTRY_TAIL_LEN
     }
 
-    /// Rows one of this partition's blocks holds, the row count under the byte cap
+    /// Rows per block of this partition
     pub fn block_rows(&self) -> usize {
         block_rows_of(self.key_width, self.is_packed)
     }
 
-    /// Blocks the rows divide into
+    /// Number of blocks the rows divide into
     pub fn blocks(&self) -> usize {
         self.rows.div_ceil(self.block_rows())
     }
@@ -102,9 +86,6 @@ impl PartitionSpan {
 }
 
 /// Where a packed partition's restart blocks begin, read once with the map
-///
-/// The offsets are the prefix encoding's own, relative to the partition's rows. Held
-/// beside the spans because reading them per probe would spend the seek they save.
 #[derive(Clone, Debug)]
 pub struct RestartTable {
     /// Where each restart block begins within the partition's rows
@@ -148,7 +129,7 @@ struct Partition {
     /// Where the column's rows sit
     span: PartitionSpan,
 
-    /// What the segment says about keys it does not hold, when it says anything
+    /// The filter over the column's keys, if any
     filter: Option<Filter>,
 
     /// Where the restart blocks begin, present only where the rows are packed
@@ -156,22 +137,14 @@ struct Partition {
 }
 
 /// A sealed segment's directory, which is all that has to be resident to read it
-///
-/// Bytes rather than rows: a volume holding a thousand sealed segments holds a thousand
-/// of these, and each is a handful of spans whatever the segment holds. One vector holds
-/// every partition, since every lookup here finds a position and then reads what that
-/// one partition says.
 #[derive(Clone, Debug, Default)]
 pub struct FooterMap {
-    /// Each column's rows and what was read about them, in directory order
+    /// Each column's rows and what was read about them, in column order
     partitions: Vec<Partition>,
 }
 
 impl FooterMap {
     /// Read a sealed segment's directory without reading its rows
-    ///
-    /// Nothing comes back for a file with no footer, which is a tail rather than a sealed
-    /// segment and is answered from the map instead.
     pub fn read(
         driver: &IoDriver,
         file: FileId,
@@ -191,9 +164,7 @@ impl FooterMap {
         let Some(span) = directory_span(&tail, file_len)? else {
             return Ok(None);
         };
-        // The directory sat above the probe, so it is read again at the size the trailer
-        // just gave. The filters sit immediately below it and are taken in the same read,
-        // since paying a second read for them would spend what they came to save.
+        // Read the directory and the filters below it in one read, reusing the probe when it fits
         let wanted = span.footer_len - span.directory_at + span.filter_len;
         let tailed = match wanted as u64 <= probe {
             true => tail[tail.len() - wanted..].to_vec(),
@@ -207,7 +178,7 @@ impl FooterMap {
         }
         let (region, directory) = tailed.split_at(span.filter_len);
 
-        // Rows begin where the footer does, which is that far back from the end.
+        // Rows begin where the footer does
         let rows_at = file_len - span.footer_len as u64;
         let spans = partition_spans(directory, span.partitions, rows_at)?;
         let restarts = spans
@@ -225,21 +196,17 @@ impl FooterMap {
                 restarts,
             })
             .collect();
-        // held in column order, which a lookup by column searches
+        // Held in column order, which a lookup by column searches
         partitions.sort_by_key(|held| held.span.column);
         Ok(Some(FooterMap { partitions }))
     }
 
-    /// Where one column sits in the directory, which every lookup here starts from
+    /// One column's partition, if the segment has rows for it
     fn at(&self, column: ColumnId) -> Option<&Partition> {
         crate::format::footer::partition_in(&self.partitions, column, |held| held.span.column)
     }
 
     /// Where one column's rows sit and what its filter says, in one lookup
-    ///
-    /// Nothing comes back for a column this segment holds no rows for. A column with no
-    /// filter, or one this reader could not follow, comes back with none, which means
-    /// search: only a filter that parsed ever stops one.
     pub fn locate(&self, column: ColumnId) -> Option<(PartitionSpan, Option<&Filter>)> {
         let held = self.at(column)?;
         Some((held.span, held.filter.as_ref()))
@@ -279,10 +246,6 @@ impl FooterMap {
 }
 
 /// Read one packed partition's restart table, or nothing for a strided one
-///
-/// The table's place needs no read to find: the restart count follows from the directory's
-/// row count, and the table and trailer close the partition's encoded span. The trailer
-/// has to agree with the directory, or the offsets describe other rows than these.
 fn read_restarts(
     driver: &IoDriver,
     file: FileId,
@@ -337,27 +300,24 @@ fn read_restarts(
 /// One block of a column's rows, as read off the volume
 #[derive(Debug)]
 pub struct RowBlock {
-    /// The rows themselves, whole rather than prefix compressed
+    /// The rows, unpacked to whole keys and tails
     packed: Vec<u8>,
 
-    /// Bytes one row takes, zero when the rows carry their own starts
+    /// Bytes per row, zero when the rows have their own starts
     stride: usize,
 
-    /// Width every row's key was written at, zero when they vary
+    /// Every row's key width, zero when the rows have their own starts
     key_width: usize,
 
     /// Where each of this block's rows begins, rebased on the block, empty when strided
     starts: Vec<u32>,
 
-    /// Row index the block's first row holds, so a hit can be reported absolutely
+    /// Partition row index of the block's first row
     first: usize,
 }
 
 impl RowBlock {
     /// Read one block of a column's rows
-    ///
-    /// A strided column reads the rows alone, since where they sit is arithmetic. A
-    /// varying one reads the cut of the packed rows its restart table names.
     pub fn read(
         driver: &IoDriver,
         file: FileId,
@@ -379,7 +339,7 @@ impl RowBlock {
             });
         }
 
-        // Prefix compression makes the unit of read the cut between two restart offsets
+        // A packed block is the cut between two restart offsets
         let Some(table) = restarts else {
             return Err(ReelError::Corruption(
                 "a packed partition was read without its restart table".to_string(),
@@ -411,7 +371,7 @@ impl RowBlock {
         })
     }
 
-    /// Rows the block actually read back
+    /// Number of rows the block read back
     pub fn len(&self) -> usize {
         if !self.starts.is_empty() {
             return self.starts.len() - 1;
@@ -452,22 +412,19 @@ impl RowBlock {
         (end - start).checked_sub(ENTRY_TAIL_LEN)
     }
 
-    /// The key one of the block's rows carries
+    /// The key of one of the block's rows
     pub fn key_at(&self, at: usize) -> Option<&[u8]> {
         let (start, _) = self.row_span(at)?;
         let width = self.key_len(at)?;
         self.packed.get(start..start + width)
     }
 
-    /// The first key the block holds, which is what orders it against a search
+    /// The block's first key, which a search orders blocks by
     pub fn first_key(&self) -> Option<&[u8]> {
         self.key_at(0)
     }
 
     /// The newest row for a key inside this block, if the block holds it
-    ///
-    /// A segment that overwrote its own record holds both versions under one key in the
-    /// order they were written, so the last of an equal run is the live one.
     pub fn find(&self, key: &[u8]) -> Option<Result<FooterRow>> {
         let at = self.upper_bound(key).checked_sub(1)?;
         if self.key_at(at)? != key {
@@ -506,16 +463,13 @@ impl RowBlock {
         FooterRow::read(bytes, width)
     }
 
-    /// Where this block's rows sit among the partition's
+    /// Partition row index of the block's first row
     pub fn first(&self) -> usize {
         self.first
     }
 }
 
-/// One key against a column's blocked rows, the filter asked before any search
-///
-/// The loader hands back the block asked for, or nothing when the segment has gone from
-/// under the search, which ends the lookup as missing.
+/// Look up one key in a column's blocked rows, asking the filter before any search
 pub fn lookup_in_span(
     span: &PartitionSpan,
     filter: Option<&Filter>,
@@ -531,7 +485,7 @@ pub fn lookup_in_span(
     }
 }
 
-/// The row of a key at an offset, walking back from the key's last row through only the blocks its rows lie in
+/// The row of a key at an offset, walking back through the blocks the key's rows lie in
 pub fn find_offset_in_span(
     span: &PartitionSpan,
     filter: Option<&Filter>,
@@ -568,9 +522,6 @@ pub fn find_offset_in_span(
 }
 
 /// Find a key in one column's rows, reading only the blocks the search touches
-///
-/// A binary search over blocks by their first key, then a search inside the one block
-/// that could hold it, with the blocks read through the caller's own loader.
 fn find_in_span(
     span: &PartitionSpan,
     key: &[u8],
@@ -581,8 +532,7 @@ fn find_in_span(
         return Ok(None);
     }
 
-    // The block whose first key is the last one at or below the search key: any earlier
-    // block ends below it and any later one begins above it.
+    // Land on the block whose first key is the last one at or below the search key
     let Some(at) = landing(key, blocks, &mut load)? else {
         return Ok(None);
     };
@@ -592,8 +542,7 @@ fn find_in_span(
     };
     match block.find(key) {
         Some(found) => found.map(Some),
-        // A key equal to a later block's first key would have placed the search there, so
-        // a miss here is a miss outright.
+        // A key equal to a later block's first key would have landed there, so this is a miss
         None => Ok(None),
     }
 }

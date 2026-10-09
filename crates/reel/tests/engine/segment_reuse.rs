@@ -1,9 +1,4 @@
-//! What a restart costs on disk: an empty tail leaves no file behind, and a
-//! sealed segment keeps its records rather than its reservation
-//!
-//! Before these held, every clean stop sealed a header-only tail at its full
-//! preallocation, and a node restarted daily banked a segment of slack per tail
-//! per day. A store holding megabytes could sit on tens of gigabytes of shells.
+//! What a restart costs on disk: an idle restart keeps its one tail, and segments keep no slack
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,7 +26,7 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
 
 const SEGMENT: u64 = 1024 * 1024;
 
-/// Zeros a tail lays down ahead of its head: four of this segment's draw margins
+/// A tail zeros this many bytes ahead of its head, four of this segment's draw margins
 const WINDOW: u64 = (SEGMENT / 16) * 4;
 
 fn key(at: u64) -> RecordKey {
@@ -112,7 +107,7 @@ fn a_new_segment_is_written_through() {
         "the fill past the records is not zeros"
     );
 
-    // Flush so a reopen finds the record's journaled row, then copy with the tail open as a crash leaves it
+    // Flush so a reopen finds the journaled row, then copy the open tail as a crash leaves it
     store.flush().expect("flush");
     let crashed = TempDir::new().expect("crashed");
     copy_root(home.path(), crashed.path());
@@ -168,7 +163,7 @@ fn only_a_tail_that_syncs_often_fills_its_next_window() {
     );
 }
 
-// a store restarted idle keeps its one tail rather than drawing another
+// a store restarted idle keeps its one tail
 #[test]
 fn an_idle_restart_keeps_one_segment() {
     let home = TempDir::new().expect("home");
@@ -257,7 +252,7 @@ fn a_full_segment_seals_at_its_footer() {
     }
 }
 
-// a crash image holds the records and their rows, and the reserved space between them stays zero
+// a crash image holds the records and their rows, with zeros in the reserved space between
 #[test]
 fn a_crash_leaves_only_the_records() {
     let config = ReelConfig {
@@ -303,7 +298,7 @@ fn a_crash_leaves_only_the_records() {
     assert!(reopened.get(&key(0)).expect("get").is_some());
 }
 
-// a flush after a close settles instead of parking on the doomed tail
+// a flush after a close settles without parking on the doomed tail
 #[test]
 fn a_flush_after_close_settles() {
     let home = TempDir::new().expect("home");

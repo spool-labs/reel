@@ -1,10 +1,4 @@
-//! What the footer filter removes, in searches and in time
-//!
-//! A paged column answers a key its map gave up by searching every sealed segment
-//! whose key range covers it, and the keys here are uniform, so every range covers
-//! every key and a miss visits the whole volume. Counts rather than microseconds: how
-//! many searches a miss makes is the engine's answer and is the same everywhere, while
-//! how long one costs is the device's and wants a real box.
+//! How many segment searches the footer filter removes, and what that saves in time
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,27 +28,19 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
 /// Keys written, spread over the space so every segment's range covers every key
 const KEYS: u64 = 6_000;
 
-/// Payload each key carries, sized so the volume seals several segments
+/// Payload bytes per key, enough that the volume seals several segments
 const PAYLOAD: usize = 512;
 
 /// Keys looked up that were never written
 const MISSES: u64 = 2_000;
 
-/// Searches a get the per-segment bits have to leave, past the one holding the key
-///
-/// One, plus room for the odd false positive. What a filter is worth is what it leaves
-/// rather than the share of asks it removes, since the walk stops once no segment left
-/// can hold a newer row.
+/// A filtered get may average this many searches: one for the key plus room for false positives
 const SEARCHES_PER_GET: f64 = 1.5;
 
-/// How much of the unfiltered search work the bits have to remove to earn them
+/// Filters must cut the unfiltered searches by more than this factor
 const SEARCH_SAVING: u64 = 4;
 
-/// A key nothing about its bytes tells you the order of
-///
-/// The segments each take a run of writes, so ordered keys would give each a tidy
-/// range and the range check alone would rule most of them out. Scattering is what a
-/// column keyed by hash or address does on its own.
+/// A key scattered over the space, so segment key ranges cannot rule it out
 fn key(at: u64) -> RecordKey {
     let mixed = at
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -72,7 +58,7 @@ fn config(filter_bits: u8) -> ReelConfig {
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         filter_bits,
-        // The read path the engine serves callers with
+        // Callers read on this path
         map_above: MAP_EVERYTHING,
         ..ReelConfig::default()
     }
@@ -97,7 +83,7 @@ fn filled(filter_bits: u8) -> ReelStore {
     store
 }
 
-/// Probe for keys that were never written, and say what the segments were asked
+/// Looks up keys that were never written and counts the segment probes
 fn miss_counts(store: &ReelStore) -> ProbeCounts {
     let cue = store.cue().expect("cue");
     let before = store.filter_probes();
@@ -110,11 +96,11 @@ fn miss_counts(store: &ReelStore) -> ProbeCounts {
     store.filter_probes().since(before)
 }
 
-/// Probe for keys that were written, and say what finding them cost
+/// Looks up written keys and counts the segment probes
 fn hit_counts(store: &ReelStore, keys: u64) -> ProbeCounts {
-    // Ask the index itself as of a cue point, since the spot index answers a store read first
+    // Ask the index directly at a cue point, since the spot index answers store reads first
     let cue = store.cue().expect("cue");
-    // The index searches only the segments it was told of, and a cue's seal is told on the next store read
+    // The index only searches segments it knows of, and learns a cue's seal on the next store read
     store.page_out_sealed().expect("page out");
     let before = store.filter_probes();
     for at in 0..keys {
@@ -130,7 +116,7 @@ fn hit_counts(store: &ReelStore, keys: u64) -> ProbeCounts {
     store.filter_probes().since(before)
 }
 
-// a probe costs what its class deserves: a miss no segment, a hit one search
+// a miss searches no segment and a filtered hit searches about one
 pub fn filters_remove_the_searches() {
     let unfiltered = filled(0);
 
@@ -142,7 +128,7 @@ pub fn filters_remove_the_searches() {
         bare_misses.asked,
     );
 
-    // Hits are the per-segment filters' remaining work.
+    // Hits are what the per-segment filters have left to do
     let bare = hit_counts(&unfiltered, KEYS);
     assert!(
         bare.asked > KEYS,
@@ -167,9 +153,7 @@ pub fn filters_remove_the_searches() {
         counts.skipped as f64 / counts.asked as f64 * 100.0,
     );
 
-    // Weighed on the searches the bits leave rather than the share of the asks they
-    // remove, since the walk stops once no segment left can hold a newer row and most
-    // of the segments a filter used to rule out are no longer asked about at all.
+    // The walk already stops early, so check the searches left per get
     let searches = counts.searched() as f64 / KEYS as f64;
     assert!(
         searches < SEARCHES_PER_GET,
@@ -183,7 +167,7 @@ pub fn filters_remove_the_searches() {
     );
 }
 
-// every key written is still found through a filter, which is the only hard rule
+// every written key is still found through a filter
 pub fn nothing_written_is_lost() {
     let store = filled(10);
 
@@ -218,12 +202,12 @@ pub fn tombstones_are_filtered_in() {
     }
 }
 
-/// A volume and whatever has to stay alive beside it
+/// A store and the directory it lives in
 struct Volume {
-    /// The volume the rows are timed against
+    /// The store under test
     store: ReelStore,
 
-    /// Held so a real directory outlives the store rooted in it
+    /// Keeps a real directory alive as long as the store
     _dir: Option<TempDir>,
 }
 
@@ -232,11 +216,7 @@ fn filled_posix(bits: u8) -> Volume {
     filled_at(config(bits))
 }
 
-/// A real volume that gives its read pages back, so a search is a read again
-///
-/// The rows above are floors because a footer block a search wants sits in the page
-/// cache from the write that put it there. Only Linux honours the request, so on any
-/// other machine this row is the warm one wearing a label.
+/// A real volume for the cold row, with the same config as `filled_posix`
 fn filled_cold(bits: u8) -> Volume {
     filled_at(ReelConfig { ..config(bits) })
 }
@@ -266,8 +246,7 @@ fn miss_gain(sizes: &[u8], open: impl Fn(u8) -> Volume) {
     let mut bare_miss = 0f64;
     for bits in sizes {
         let volume = open(*bits);
-        // Warm first, so what is timed is the search rather than the first touch of
-        // every footer on the volume.
+        // Warm up first so the timing leaves out the first touch of every footer
         miss_counts(&volume.store);
 
         let began = Instant::now();
@@ -295,12 +274,8 @@ fn miss_gain(sizes: &[u8], open: impl Fn(u8) -> Volume) {
     }
 }
 
-// what a miss costs with the searches and without them, which is the floor of the win
-//
-// The simulator holds its files in memory, so a search here is a memcpy off a warm
-// buffer. That is the cheapest a search can be, which makes the ratio a lower bound.
+// what a miss costs at each filter size in memory, a lower bound on the gain
 pub fn miss_time() {
-    // libtest leaves the test name line open, so a header needs a newline ahead of it.
     println!();
     miss_gain(&[0, 4, 7, 10, 14], |bits| Volume {
         store: filled(bits),
@@ -310,24 +285,18 @@ pub fn miss_time() {
 
 // the same pair against real descriptors and the real page cache
 pub fn miss_time_posix() {
-    // libtest leaves the test name line open, so a header needs a newline ahead of it.
     println!();
     miss_gain(&[0, 10], filled_posix);
 }
 
-// and against a volume that gives its pages back, where a search is a real read
-//
-// The only one of the three rows that is not a floor, and Linux only in any
-// meaningful sense.
+// the same timing on a real directory at every filter size
 pub fn miss_time_cold() {
-    // libtest leaves the test name line open, so a header needs a newline ahead of it.
     println!();
     miss_gain(&[0, 4, 7, 10, 14], filled_cold);
 }
 
-// what the filter costs and what it removes, at the sizes worth considering
+// filter bytes against the searches they remove, at each filter size
 pub fn filter_cost() {
-    // libtest leaves the test name line open, so a header needs a newline ahead of it.
     println!();
     println!(
         "{:>6} {:>12} {:>12} {:>10} {:>14} {:>14}",
@@ -350,10 +319,6 @@ pub fn filter_cost() {
 }
 
 /// The same volume with no room to hold a parsed footer
-///
-/// A volume whose footers fit answers a key by searching one in memory and never
-/// touches a block, so shrinking the bound is what puts a laptop on the path a volume
-/// past it runs on all the time.
 fn filled_blocked(filter_bits: u8) -> ReelStore {
     let store = ReelStore::open_with_io(
         PathBuf::from("/blocked"),
@@ -378,7 +343,7 @@ fn filled_blocked(filter_bits: u8) -> ReelStore {
 // a hit against a held footer reads no blocks at all
 pub fn a_held_footer_costs_no_blocks() {
     let store = filled(0);
-    // A seal hands its footer to the index and leaves the cache empty, so seal the tail and load each footer first
+    // A seal leaves the footer cache empty, so seal the tail and then load each footer
     store.cue().expect("cue");
     for segment in 0..256 {
         store.segment_footer(SegmentId(segment)).expect("footer");
@@ -392,11 +357,7 @@ pub fn a_held_footer_costs_no_blocks() {
     );
 }
 
-// a hit past the footer bound costs a run of block loads before it reaches its row
-//
-// The search binary searches the partition's blocks by their first key and then reads
-// the one block that could hold it, so the bound is one load per halving of the block
-// count plus the final block. A count above that is no longer a binary search.
+// a hit past the footer bound costs a binary search of block loads
 pub fn a_blocked_hit_costs_a_run_of_block_loads() {
     let store = filled_blocked(0);
     let counts = hit_counts(&store, KEYS);
@@ -406,8 +367,7 @@ pub fn a_blocked_hit_costs_a_run_of_block_loads() {
         "a search that loaded no block found its row somewhere else",
     );
     let per_search = counts.blocks as f64 / counts.searched() as f64;
-    // Blocks in the partition a search crosses. Segments take equal runs of the writes
-    // here, so one segment's share of the keys is what the halvings count against.
+    // Each segment holds an equal share of the keys, which bounds its block count
     let segments = store.index().segments_snapshot().len().max(1) as f64;
     let blocks = (KEYS as f64 / segments).max(2.0);
     let bound = blocks.log2() + 2.0;
@@ -417,19 +377,13 @@ pub fn a_blocked_hit_costs_a_run_of_block_loads() {
     );
 }
 
-/// Record the depth sweep carries, small so the depth comes from the segment size
+/// The depth sweep writes records this small, so the segment size sets the depth
 const DEEP_PAYLOAD: usize = 64;
 
-/// Bytes a record of that size costs a segment, key, header and all
-///
-/// Sizes a segment by the keys wanted in it rather than by bytes. Near enough is
-/// enough, since the row prints the segments it actually got.
+/// One such record takes about this many bytes in a segment, key and header included
 const DEEP_RECORD_BYTES: u64 = 128;
 
-/// Sealed segments each row of the sweep writes
-///
-/// Held constant across the rows, since a moving segment count would fold the fan-out
-/// into the depth the sweep is trying to measure.
+/// Each row of the sweep writes this many sealed segments
 const DEEP_SEGMENTS: u64 = 4;
 
 /// A blocked volume of a given depth, with the whole of it handed to footers
@@ -456,13 +410,7 @@ fn paged_blocked(keys_per_segment: u64, filter_bits: u8) -> (ReelStore, u64) {
     (store, keys)
 }
 
-// what a paged lookup asks for before it touches its record, as the partition deepens
-//
-// The segment count is held still and only the keys in each one move, so what
-// separates the rows is the depth of one binary search. The reads column is what the
-// block cache leaves for the device once the search has asked, and it sits just under
-// the loads column by construction: one bound covers footers, directories and blocks
-// alike, so a volume with no room for a footer has none for a block either.
+// block loads and device reads per paged lookup as the partition deepens
 pub fn paged_lookup_block_reads() {
     println!();
     println!(
@@ -484,17 +432,13 @@ pub fn paged_lookup_block_reads() {
     }
 }
 
-/// Keys a bounded-cache row reads over and over, the working set inside the volume
+/// The bounded-cache rows read these keys over and over
 const HOT_KEYS: u64 = 200;
 
-/// Rounds the hot set is read for, so a policy has passes to get it wrong in
+/// The bounded-cache rows read the hot set this many times
 const HOT_ROUNDS: u64 = 20;
 
-/// A paged volume whose footer cache holds a share of what it would like to
-///
-/// Big enough that the hot working set fits several times over, small enough that a
-/// scan of the whole volume cannot stay resident beside it. That gap is where an
-/// eviction policy is the only thing separating two caches.
+/// A paged volume whose footer cache holds only part of its footers
 fn filled_bounded(cache_bytes: u64) -> ReelStore {
     let store = ReelStore::open_with_io(
         PathBuf::from("/bounded"),
@@ -516,20 +460,14 @@ fn filled_bounded(cache_bytes: u64) -> ReelStore {
     store
 }
 
-// what a hot working set costs once the cache cannot hold the whole volume
-//
-// Counts rather than time: how many reads a policy leaves is the engine's answer and
-// is the same on any machine. The scan between rounds is the term that decides it,
-// since strict insertion order gives up the hot entries on schedule however often
-// they were read, and a hand that clears a bit only on the way past does not.
+// device reads for a hot working set once the cache cannot hold the whole volume
 pub fn a_bounded_cache_keeps_its_working_set() {
     println!();
     println!("| cache bytes | reads/hot ask | reads/scan ask |");
     println!("|---|---|---|");
     for cache_bytes in [64u64 * 1024, 256 * 1024, 1024 * 1024] {
         let store = filled_bounded(cache_bytes);
-        // One pass over everything first, so the rows below are steady state rather
-        // than the cost of filling an empty cache.
+        // Fill the cache with one full pass so the rows show steady state
         let _ = hit_counts(&store, KEYS);
 
         let mut hot = ProbeCounts::default();
@@ -541,7 +479,7 @@ pub fn a_bounded_cache_keeps_its_working_set() {
             }
             hot = add(hot, store.filter_probes().since(before));
 
-            // The scan is what evicts: it walks keys the hot set never asks for.
+            // The scan evicts: it reads every key outside the hot set
             let before = store.filter_probes();
             for at in HOT_KEYS..KEYS {
                 assert!(store.get(&key(at)).expect("get").is_some());
@@ -557,7 +495,7 @@ pub fn a_bounded_cache_keeps_its_working_set() {
     }
 }
 
-/// Two readings of the counters, added rather than differenced
+/// Sums two counter readings
 fn add(left: ProbeCounts, right: ProbeCounts) -> ProbeCounts {
     ProbeCounts {
         asked: left.asked + right.asked,

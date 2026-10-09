@@ -1,7 +1,4 @@
 //! Sealed segments standing over each column
-//!
-//! What a lookup narrows its search with, and what a read at an older sequence
-//! number needs to find a version the map no longer holds.
 
 use crate::engine::ReelStore;
 use crate::report::caveat::{self, Caveat};
@@ -30,7 +27,7 @@ pub struct SpansReport {
     /// The columns the volume was opened over
     pub columns: Vec<SpanRow>,
 
-    /// What stands between these figures and what a reader would take them for
+    /// What the counts leave unaccounted for
     pub caveats: Vec<Caveat>,
 }
 
@@ -68,8 +65,7 @@ impl Report for SpansReport {
         let mut table = Table::new([Column::left("column"), Column::right("sealed segments")]);
         for row in &self.columns {
             let cells = Row::new([row.column.clone(), row.sealed_segments.to_string()]);
-            // The deepest column is the one a lookup pays the most for, so it is
-            // the row worth pointing at.
+            // The deepest column costs a lookup the most, so its row gets a note
             table = table.row(match Some(row.sealed_segments) == widest && total > 0 {
                 true => cells.note("deepest search"),
                 false => cells,
@@ -89,8 +85,7 @@ impl Report for SpansReport {
                     None => "nothing counted".to_string(),
                 },
                 match widest {
-                    // The deepest column is what a lookup pays for, so it is
-                    // the figure the verdict carries rather than the total.
+                    // The detail shows the deepest column, which is what a lookup pays for
                     Some(widest) => format!(
                         "standing over {}, deepest {widest}",
                         fmt::plural(self.columns.len() as u64, "column", "columns"),

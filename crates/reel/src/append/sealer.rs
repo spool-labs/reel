@@ -18,30 +18,23 @@ use super::flush::Owed;
 use super::Active;
 
 /// Seal a segment, which closes it and leaves it readable and never written again
-///
-/// Free of the tail on purpose: on a full segment the seal is a sort, megabytes of io
-/// and an fsync that the writer filling it would otherwise pay inside its own put.
 pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) -> Result<()> {
     if active.terminal.load(Ordering::Acquire) {
         return Ok(());
     }
-    // Writeback orders nothing, so under the one-sync seal a crash can leave a durable
-    // footer naming bytes that never landed. With peers that resolves to a read-time
-    // miss and a repair; with none the second flush is the whole guarantee.
+    // With no peers to repair from, sync the records before the footer goes down
     if shared.config.repair == RepairPath::None {
         shared.driver.sync_full(active.handle.file())?;
     }
 
     let mut footer = std::mem::replace(&mut *lock(&active.entries), SegmentFooter::empty());
-    // What the segment weighs, live against dead. A rebuild cannot work this out
-    // without joining every segment on the volume.
+    // The segment's live and dead tally, which a rebuild cannot work out cheaply
     footer.tally = shared.tally_of(active.handle.id());
-    // The frontier the tally is current to. Bookings from writes issued at or past this
-    // are the reopen join's to settle, not the tally's.
+    // The tally is current up to this sequence number
     footer.sealed_at = shared.lsn.peek();
     let written = (|| -> Result<()> {
         let (rows, tail) = footer.pack_apart(shared.config.filter_bits)?;
-        // The rows go down from the partitions that hold them and come back after.
+        // Write the rows straight from their partitions and put them back after
         let rows: Vec<Arc<Vec<u8>>> = rows.into_iter().map(Arc::new).collect();
         let footer_len = rows.iter().map(|piece| piece.len()).sum::<usize>() + tail.len();
         let sealed_end = end + footer_len as u64;
@@ -69,20 +62,18 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
             .journal
             .mark_sealed(&seal_mark(sealed_end, footer_len as u32))?;
         shared.driver.sync_full(active.handle.file())?;
-        // Cut the rows off so the footer ends the file. A crash before this lands just seals again from the rows, and a cut that is lost leaves the mark for the next open.
+        // Cut the rows so the footer ends the file, and a lost cut leaves the mark for reopen
         shared.driver.truncate(active.handle.file(), sealed_end)?;
         shared.driver.sync_full(active.handle.file())
     })();
     if let Err(error) = written {
-        // The footer is the one copy of what this segment holds, so a failed seal puts
-        // it back for the retry the maintenance tick owes.
+        // A failed seal puts the footer back for the maintenance tick to retry
         *lock(&active.entries) = footer;
         return Err(error);
     }
     // The packed footer goes to the index as is, so the index never reads it back
     let footer = Arc::new(footer);
-    // The handle stops being a write head here and becomes the one readers find in the
-    // cache, so it takes the hint a read-path open would have given it.
+    // The handle now serves readers from the cache, so give it the read-path hint
     let _ = shared
         .driver
         .advise(active.handle.file(), 0, 0, Advice::Random);
@@ -90,39 +81,30 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
     // The synced footer lists every record the journal did, so the journal can go
     active.journal.remove();
     shared.forget_unsealed(active.handle.id());
-    // The footer is on disk now, so a paged index can take this segment's keys over from
-    // the map. The tail does not hold the index, so it leaves the number instead.
+    // The footer is on disk, so a paged index can take this segment's keys from the map
     shared.note_sealed(active.handle.id(), footer);
     Ok(())
 }
 
 /// Seal a retired segment and say what it did to its durability
-///
-/// The order is load bearing: the segment is released only once its footer is down,
-/// since releasing it is what makes it a compaction candidate.
 pub(super) fn retire_segment(shared: &Arc<ReelShared>, retired: &Active, end: u64) -> Result<()> {
     let sealed = seal_segment(shared, retired, end);
     let is_terminal = retired.terminal.load(Ordering::Acquire);
     match &sealed {
-        // A terminal segment's seal was skipped, not performed: nothing new went
-        // durable, and the broken mark its failed sync left has to keep standing.
+        // A terminal segment skipped its seal, so its broken mark stays
         Ok(()) if is_terminal => {}
         Ok(()) => retired.sync.mark_durable(),
         Err(_) => retired.sync.mark_broken(),
     }
-    // What the segment still owed a sync when it broke. Counting it is what stops every
-    // later flush answering clean over records the next open will not have.
+    // Count a segment that broke with bytes unsynced, so later flushes stop answering clean
     if (sealed.is_err() || is_terminal) && retired.sync.covered() < end {
         shared.note_past_saving();
     }
-    // No footer went down on either of these. The release is what takes the holds off,
-    // so the mark has to be on first.
+    // No footer went down, so mark it unsealed before the release takes the holds off
     if sealed.is_err() || is_terminal {
         shared.note_unsealed(retired.handle.id());
     }
-    // A failed non-terminal seal keeps the segment unreleased on purpose: a candidate
-    // with no footer can be retired wholly dead while its seal waits parked, and the
-    // retry would then seal a corpse and reinstall spans the index had forgotten.
+    // A failed seal keeps the segment unreleased, so compaction cannot retire it while it waits
     if sealed.is_ok() || is_terminal {
         shared.release_segment(retired.handle.id());
     }
@@ -134,13 +116,10 @@ pub(crate) struct BrokenSeal {
     active: Active,
     end: u64,
 
-    /// Whether the failure was counted past saving, so a success uncounts it
     counted: bool,
 }
 
 /// Park a segment whose seal failed, unless its tail is closing
-///
-/// A terminal segment's seal was skipped by design and closing takes the tick with it.
 pub(super) fn park_broken_seal(shared: &Arc<ReelShared>, active: Active, end: u64) {
     if active.terminal.load(Ordering::Acquire) {
         return;
@@ -154,9 +133,6 @@ pub(super) fn park_broken_seal(shared: &Arc<ReelShared>, active: Active, end: u6
 }
 
 /// Retry the seals of parked broken segments, from the maintenance tick
-///
-/// A success gives back the past-saving count the failure took, which is what lets
-/// flush answer clean again.
 pub(crate) fn retry_broken_seals(shared: &Arc<ReelShared>) -> usize {
     let parked = std::mem::take(&mut *lock(&shared.broken_seals));
     if parked.is_empty() {
@@ -164,8 +140,7 @@ pub(crate) fn retry_broken_seals(shared: &Arc<ReelShared>) -> usize {
     }
     let mut sealed = 0usize;
     for job in parked {
-        // A tail that turned terminal while the segment was parked skips the seal rather
-        // than performing it, so the hold goes back: nothing will seal this segment now.
+        // A segment that turned terminal while parked will never seal, so release it
         if job.active.terminal.load(Ordering::Acquire) {
             shared.release_segment(job.active.handle.id());
             continue;
@@ -198,11 +173,7 @@ pub(super) enum Job {
     Flush(Owed),
 }
 
-/// The thread that seals segments a tail has rolled off
-///
-/// One per tail, idle almost always: it wakes once per segment roll. What it takes off
-/// the write path is a footer sort, a multi-megabyte write and an fsync, and it takes
-/// the async door's owed flushes for the same reason. A flush still waits for it.
+/// The per-tail thread that seals rolled-off segments and runs forwarded flushes
 pub(super) struct Sealer {
     /// Everything a job needs, for the fallback with no worker to hand it to
     shared: Arc<ReelShared>,
@@ -210,7 +181,7 @@ pub(super) struct Sealer {
     /// The tail's active segment, which is what a forwarded flush flushes
     active: Arc<RwLock<Active>>,
 
-    /// Jobs the worker has yet to finish, counted since a job is done only at its footer
+    /// The count of jobs the worker has not finished
     unfinished: Arc<Tension<usize>>,
 
     /// Where a roll hands its segment over, dropped to stop the worker
@@ -250,14 +221,13 @@ impl Sealer {
         self.send(Job::Seal { retired, end })
     }
 
-    /// Hand an owed flush over, so no runtime worker is the one holding the fsync
+    /// Hand an owed flush over, so no runtime worker blocks on the fsync
     pub(super) fn forward(&self, owed: Owed) -> Result<()> {
         self.send(Job::Flush(owed))
     }
 
     pub(super) fn send(&self, job: Job) -> Result<()> {
-        // Counted before it is sent, so a flush cannot see nothing unfinished while a
-        // job is in the channel.
+        // Count before sending, so a flush never sees zero while a job is in the channel
         self.unfinished.with(|count| *count += 1);
         let sent = match &self.hand {
             Some(hand) => hand.send(job).map_err(|held| held.0),
@@ -267,7 +237,7 @@ impl Sealer {
             return Ok(());
         };
 
-        // No thread, or a dead one, so the caller pays the work instead.
+        // No thread, or a dead one, so the caller does the work
         self.unfinished
             .slack_with(|count| *count = count.saturating_sub(1));
         match job {
@@ -290,7 +260,7 @@ impl Sealer {
         self.unfinished.park(|count| (*count == 0).then_some(()));
     }
 
-    /// The same wait for a caller with a worker to protect rather than a thread
+    /// The same wait, awaited
     pub(super) async fn drain_wait(&self) {
         self.unfinished
             .wait(|count| (*count == 0).then_some(()))
@@ -303,8 +273,7 @@ pub(super) fn run_job(shared: &Arc<ReelShared>, active: &RwLock<Active>, job: Jo
     match job {
         Job::Seal { retired, end } => {
             if let Err(error) = retire_segment(shared, &retired, end) {
-                // The segment stays unsealed, which recovery reads by walking it, and
-                // parking it is what lets the maintenance tick finish the seal.
+                // Recovery can walk the unsealed segment, and the tick finishes the parked seal
                 tracing::warn!("a rolled segment did not seal: {error}");
                 park_broken_seal(shared, retired, end);
             }
@@ -314,9 +283,6 @@ pub(super) fn run_job(shared: &Arc<ReelShared>, active: &RwLock<Active>, job: Jo
 }
 
 /// Run a flush the async door handed over, and leave the answer on the segment
-///
-/// A failed flush leaves the segment marked terminal rather than rolled, and the next
-/// writer through finds the mark and rolls.
 pub(super) fn run_forwarded(shared: &Arc<ReelShared>, active: &RwLock<Active>, owed: &Owed) {
     let flushed = flush_active(shared, active, owed.segment);
     publish_flush(owed, &flushed);
@@ -326,10 +292,7 @@ pub(super) fn run_forwarded(shared: &Arc<ReelShared>, active: &RwLock<Active>, o
     }
 }
 
-/// Flush one segment, holding the tail only long enough to say what that covers
-///
-/// Nothing comes back when the tail has already left the segment, since the roll seals
-/// it and the seal answers for its bytes.
+/// Flush one segment, holding the tail only long enough to read what that covers
 pub(super) fn flush_active(
     shared: &Arc<ReelShared>,
     active: &RwLock<Active>,
@@ -358,11 +321,9 @@ pub(super) fn flush_active(
 pub(super) fn publish_flush(owed: &Owed, flushed: &Result<Option<u64>>) {
     match flushed {
         Ok(Some(covered)) => owed.sync.flush.slack_with(|flush| {
-            // Two flushes of one segment can finish out of order, and the one answering
-            // for less must not walk the watermark back.
+            // Flushes can finish out of order, so never move the watermark back
             let before = owed.sync.synced_at.fetch_max(*covered, Ordering::AcqRel);
-            // What the volume wrote between these two flushes. A flush that finished out
-            // of order answers for less than one already counted and says nothing.
+            // The bytes written since the last flush, zero for one that finished out of order
             let span = covered.saturating_sub(before);
             if span > 0 {
                 owed.sync.last_span.store(span, Ordering::Release);
@@ -393,7 +354,7 @@ pub(super) fn doom_active(active: &RwLock<Active>, segment: SegmentId) -> bool {
 impl Drop for Sealer {
     /// Stop the worker and wait for it, so a volume outlives its last seal
     fn drop(&mut self) {
-        // Dropping the sender is what ends the worker's loop once it has drained.
+        // Dropping the sender ends the worker's loop once it drains
         self.hand = None;
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

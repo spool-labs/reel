@@ -1,9 +1,4 @@
 //! What a read hands back: bytes, and who owns the buffer holding them
-//!
-//! A value derefs to its bytes and records where the buffer goes afterwards, so a
-//! backend with a pool can lend a buffer rather than give it away, and one read's
-//! buffer can be cut into windows returned once the last window drops. Reading
-//! through the borrow copies nothing; `into_vec` copies when the buffer is shared.
 
 use std::ops::Deref;
 use std::sync::Arc;
@@ -22,9 +17,6 @@ impl Drop for Block {
 }
 
 /// One read's buffer, lent by reference and cut into values by window
-///
-/// A walk borrows records straight out of it, and a caller that keeps one takes a
-/// window, which holds the buffer until the last window drops.
 #[derive(Clone, Debug)]
 pub struct ReadBlock(Arc<Block>);
 
@@ -61,7 +53,7 @@ pub struct Value {
     held: Held,
 }
 
-/// Which of the arrangements a value's bytes are under
+/// How a value holds its bytes
 #[derive(Debug, Default)]
 enum Held {
     /// Bytes this value has to itself, with where the buffer goes when dropped
@@ -78,9 +70,6 @@ enum Held {
     },
 
     /// A window into a buffer this value has to itself
-    ///
-    /// What one read of a wider span than the caller asked for leaves: there are no
-    /// neighbours to share the buffer with, so there is nothing to refcount.
     Cut {
         bytes: Vec<u8>,
         at: usize,
@@ -125,9 +114,6 @@ impl Value {
     }
 
     /// One window of a buffer nothing else holds, or nothing when the buffer is short
-    ///
-    /// The single-window case, which needs no refcount: this value owns the whole
-    /// buffer and hands it back when it drops.
     pub fn cut(bytes: Vec<u8>, recycle: fn(Vec<u8>), at: usize, len: usize) -> Option<Value> {
         let end = at.checked_add(len)?;
         if end > bytes.len() {
@@ -144,9 +130,7 @@ impl Value {
         })
     }
 
-    /// Take the buffer itself, which keeps it from going back
-    ///
-    /// A window has no buffer of its own to give, so it copies here.
+    /// Take the buffer itself, which keeps it from going back, or a copy for a window
     pub fn into_vec(mut self) -> Vec<u8> {
         match &mut self.held {
             Held::Owned { bytes, recycle } => {
@@ -154,8 +138,7 @@ impl Value {
                 std::mem::take(bytes)
             }
             Held::Window { block, at, len } => block.bytes[*at..*at + *len].to_vec(),
-            // The window sits inside a buffer that is longer than it, so the bytes
-            // are copied out rather than the buffer handed over.
+            // The window sits inside a longer buffer, so copy its bytes out
             Held::Cut { bytes, at, len, .. } => bytes[*at..*at + *len].to_vec(),
             Held::Shared { bytes } => bytes.to_vec(),
             Held::Nothing => Vec::new(),
@@ -363,7 +346,7 @@ mod tests {
         );
     }
 
-    // a cut past the buffer is nothing, and hands the buffer back rather than losing it
+    // a cut past the buffer is nothing, and hands the buffer back
     #[test]
     fn a_cut_past_the_buffer_gives_it_back() {
         RETURNED.with(|held| held.set(0));

@@ -1,11 +1,4 @@
-//! Descriptor and disk-space reclamation against a real filesystem
-//!
-//! Posix backend only: the simulator models an unlink as removing the bytes, while
-//! a real filesystem frees a file's blocks only once its last link and its last
-//! descriptor are both gone. A segment retired by compaction was necessarily opened
-//! to copy its live records out, so a descriptor never released keeps the extents
-//! after the file leaves the directory. The same seam bounds the handle cache: its
-//! capacity means nothing unless evicting a handle closes the file behind it.
+//! Descriptor and disk-space reclamation against a real filesystem, on the posix backend
 
 use std::sync::Arc;
 
@@ -17,10 +10,10 @@ use reel::{
     SyncPolicy, ThreadBudget,
 };
 
-/// Bytes the group takes at the front of a record key
+/// Length of the group prefix at the front of a record key
 const GROUP_PREFIX_LEN: usize = 2;
 
-/// Bytes a record key occupies
+/// Record key length
 const RECORD_KEY_LEN: usize = GROUP_PREFIX_LEN + 32;
 
 const RECORDS: ColumnId = ColumnId(1);
@@ -48,15 +41,10 @@ const COLUMNS: ColumnSet = &[
     },
 ];
 
-/// Groups the fixtures write into
+/// The fixtures write into these groups
 const GROUPS: &[u16] = &[7, 8, 9];
 
-/// Sealed descriptors the reader cache holds, which is what these ceilings are read
-/// against
-///
-/// The fixtures below roll tens of segments rather than hundreds, so the ceilings catch
-/// a table that grows per segment touched rather than the eviction itself. Eviction at a
-/// full cache is pinned in `FdCache`'s own tests.
+/// The reader cache holds this many sealed descriptors, the base of each ceiling below
 const FD_CACHE: u64 = reel::DEFAULT_FD_CACHE;
 
 /// Segment size small enough that a fixture rolls many segments
@@ -65,7 +53,7 @@ const SEGMENT_BYTES: u64 = 32 * 1024;
 /// Records written per group
 const KEYS: u64 = 40;
 
-/// Payload length each record carries
+/// Each record's payload length
 const PAYLOAD: usize = 3_000;
 
 fn config() -> ReelConfig {
@@ -123,8 +111,7 @@ fn descriptors_stay_under_the_cache_bound() {
 
     fill(&store);
     store.flush().expect("flush");
-    // Reading every key touches every sealed segment, which is what grows the
-    // descriptor table if nothing ever closes.
+    // Read every key, so every sealed segment gets opened
     for group in GROUPS {
         for index in 0..KEYS {
             store.get(&record_key(*group, id(index))).expect("get");
@@ -142,9 +129,6 @@ fn descriptors_stay_under_the_cache_bound() {
 }
 
 // retiring segments does not accumulate the descriptors that hold their blocks
-//
-// du cannot answer this: it walks directory entries, and an unlinked file has
-// none, so it reports the space as returned either way.
 #[test]
 fn retiring_segments_releases_their_descriptors() {
     let dir = TempDir::new().expect("tempdir");

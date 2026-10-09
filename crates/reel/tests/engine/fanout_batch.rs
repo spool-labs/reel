@@ -1,17 +1,5 @@
-//! What a batch costs when each item also writes its own index rows
-//!
-//! Each item is written under its own wide identifier plus several secondary index
-//! rows, all under one durability point, which is what any store keeping a secondary
-//! index does on ingest. Two things make it its own shape: the keys are wide, 72 and
-//! 108 bytes against payloads of a couple of hundred and one, so a record is mostly
-//! key, and it fans out, so a batch of 64 items is 320 records across two columns.
-//! The legs run each column alone, both together, the same records at narrow keys and
-//! the same records in one column, which says whether the cost is the width, the
-//! split or the fan-out.
-//!
-//! Ignored by default. Run with:
-//!   cargo test -p tape-reel --test fanout_batch --release -- --ignored --nocapture
-//! Knobs: FANOUT_ITEMS, FANOUT_WIDTH, FANOUT_BATCHES, FANOUT_VALUE, FANOUT_INDEX_VALUE
+//! Measures what a batch costs when each item also writes its own secondary index rows
+//! Run `cargo test -p tape-reel --test engine fanout_batch --release -- --ignored --nocapture`
 
 use std::time::{Duration, Instant};
 
@@ -22,13 +10,13 @@ use reel::{
     ReelConfig, ReelStore, SyncPolicy,
 };
 
-/// Bytes an item's own key takes: an identifier and the ordinal it landed under
+/// Item key length: an identifier and the ordinal it landed under
 const ITEM_KEY: usize = 72;
 
-/// Bytes an index row's key takes: an address, the ordinal, a position, the identifier
+/// Index row key length: an address, the ordinal, a position, the identifier
 const INDEX_KEY: usize = 108;
 
-/// A narrow key, for the leg that asks what the width alone is worth
+/// Narrow key length, for the leg that isolates the cost of width
 const NARROW_KEY: usize = 16;
 
 const ITEM: ColumnId = ColumnId(1);
@@ -38,7 +26,7 @@ fn items() -> usize {
     knob("FANOUT_ITEMS", 64)
 }
 
-/// Index rows each item writes beside itself
+/// Each item writes this many index rows beside itself
 fn fanout() -> usize {
     knob("FANOUT_WIDTH", 4)
 }
@@ -62,7 +50,7 @@ fn knob(name: &str, fallback: usize) -> usize {
         .unwrap_or(fallback)
 }
 
-/// Both columns at the widths the shape actually carries
+/// Both columns at the shape's real key widths
 fn wide_columns() -> ColumnSet {
     Box::leak(Box::new([
         column(ITEM, "item", ITEM_KEY),
@@ -70,7 +58,7 @@ fn wide_columns() -> ColumnSet {
     ]))
 }
 
-/// The same two columns with the width taken out of them
+/// The same two columns at the narrow key width
 fn narrow_columns() -> ColumnSet {
     Box::leak(Box::new([
         column(ITEM, "item", NARROW_KEY),
@@ -97,10 +85,7 @@ fn config() -> ReelConfig {
     }
 }
 
-/// A key of the asked width, distinct per (batch, item, position)
-///
-/// The leading bytes move per record rather than per batch: a repeated prefix would
-/// let the index share descents this shape does not get to share.
+/// A key of the asked width with mixed leading bytes, distinct per (batch, item, position)
 fn key(column: ColumnId, width: usize, batch: usize, item: usize, position: usize) -> RecordKey {
     let mut bytes = vec![0u8; width];
     let stamp = ((batch as u64) << 40) ^ ((item as u64) << 16) ^ position as u64;
@@ -166,7 +151,7 @@ fn leg(name: &str, shape: Shape, columns: ColumnSet, width: (usize, usize)) {
     let dir = TempDir::new().expect("tempdir");
     let store = ReelStore::open(dir.path().to_path_buf(), config(), columns).expect("open");
 
-    // One batch untimed, so segment creation is not charged to the first row.
+    // One untimed batch first, so segment creation stays out of the timing
     store.apply_batch(batch(shape, width, 0)).expect("warmup");
 
     let mut elapsed = Duration::ZERO;

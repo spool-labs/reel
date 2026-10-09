@@ -1,9 +1,5 @@
-//! The maintenance-plane driver: dead-space compaction and the crc scrub
-//!
-//! A sealed segment past the rewrite threshold has its live records copied into an
-//! active tail and its file retired once those copies are durable, under an index
-//! repoint guarded by sequence number. Both tasks are bounded per pass and priced
-//! against a rate gate, and the bytes charged are read plus write.
+//! The maintenance plane: dead-space compaction and the crc scrub
+//! Compaction copies a segment's live records to a tail and retires the file once they are durable
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,21 +28,16 @@ use crate::compaction::pressure::{GcPressure, PassPace, RateGate, RateLimiter};
 /// Bytes at the end of a sealed segment holding its footer length and magic
 const TRAILER_LEN: u64 = 8;
 
-/// Earnings one scrub pass will carry over from a stretch with no ticks in it
-///
-/// A pass takes what the rate earned since the last one, and this bounds how much of a
-/// quiet stretch it will honour at once.
+/// A scrub pass takes at most this much of a quiet stretch's earnings
 const SCRUB_PASS_MAX: Duration = Duration::from_secs(60);
 
-/// Payload bytes one rewrite stripe may hold between its fetch and its apply
+/// One rewrite stripe holds at most this many payload bytes between fetch and apply
 const STRIPE_STAGE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Ranges one fetch wave holds in flight at once
-///
-/// A wave goes down the driver's batch door, so a ring holds all of it outstanding.
+/// One fetch wave holds at most this many ranges in flight
 const FETCH_DEPTH: usize = 8;
 
-/// What rewriting one of a segment's records produced, whichever order reached it
+/// What rewriting one of a segment's records produced
 enum Rewrote {
     /// A live record joined the run waiting to land
     Queued,
@@ -54,7 +45,7 @@ enum Rewrote {
     /// The record was dead, corrupt, or below the purge floor
     Skipped,
 
-    /// A tombstone was carried into the destination
+    /// A tombstone was copied into the destination
     Carried,
 
     /// A tombstone was safe to drop
@@ -78,7 +69,7 @@ enum CopyStep {
 
 /// What handling one tombstone produced
 enum TombstoneStep {
-    /// The tombstone was carried into the destination
+    /// The tombstone was copied into the destination
     Carried,
 
     /// The tombstone was safe to drop
@@ -87,21 +78,21 @@ enum TombstoneStep {
 
 /// One record read back from a segment during compaction, a merge or a scrub
 pub struct SourceRecord {
-    /// What the record says about itself, key and sequence number included
+    /// The record's header, with its key and sequence number
     pub header: RecordHeader,
 
-    /// Where the record header begins within its segment
+    /// The header's offset within its segment
     pub offset: u32,
 
     /// Bytes ahead of the payload: the header and key, or a keyless record's check and shape
     prefix: u32,
 
-    /// A keyless record's own prefix and the key its segment checks under, nothing for a keyed one
+    /// A keyless record's stored prefix and check key, nothing for a keyed record
     keyless: Option<([u8; KEYLESS_PREFIX], CheckKey)>,
 }
 
 impl SourceRecord {
-    /// A record whose header and key were read where it lies
+    /// A keyed record, its header read from the segment
     pub fn keyed(header: RecordHeader, offset: u32) -> SourceRecord {
         SourceRecord {
             prefix: header.prefix_len() as u32,
@@ -136,7 +127,7 @@ impl SourceRecord {
         u64::from(self.prefix) + u64::from(self.header.length)
     }
 
-    /// Offset the record's payload begins at within its segment
+    /// The payload's offset within its segment
     pub fn payload_at(&self) -> u64 {
         u64::from(self.offset) + u64::from(self.prefix)
     }
@@ -194,7 +185,7 @@ pub struct CompactionCounters {
     /// Segments retired with no live records, unlinked whole
     pub segments_unlinked_whole: u64,
 
-    /// Tombstones carried into a destination segment
+    /// Tombstones copied into a destination segment
     pub tombstones_carried: u64,
 
     /// Tombstones dropped because nothing could resurrect their key
@@ -206,13 +197,13 @@ pub struct CompactionCounters {
     /// Record bytes the scrub has read back and checked
     pub scrub_bytes: u64,
 
-    /// Records dropped for sitting below the purge floor rather than copied
+    /// Records dropped for sitting below the purge floor
     pub records_purged: u64,
 
-    /// Sorted runs merge passes read together, the only trace a tick-driven merge leaves
+    /// Sorted runs that merge passes have read together
     pub runs_merged: u64,
 
-    /// Segments standing because a pass met rot, a gauge that falls when they retire
+    /// Segments left standing for rot, a gauge that falls as they retire
     pub segments_pinned_by_rot: u64,
 
     /// Bytes rewrite passes read back, counted at the reader's refills
@@ -220,9 +211,7 @@ pub struct CompactionCounters {
 }
 
 impl CompactionCounters {
-    /// Fraction of retired segments that had to be rewritten rather than unlinked
-    ///
-    /// The closer to zero, the more reclamation was a plain unlink of a dead segment.
+    /// The fraction of retired segments that were rewritten, the rest were unlinked whole
     pub fn move_ratio(&self) -> f64 {
         let retired = self.segments_rewritten + self.segments_unlinked_whole;
         if retired == 0 {
@@ -305,7 +294,7 @@ impl Metrics {
             records_purged: self.records_purged.load(Ordering::Acquire),
             runs_merged: self.runs_merged.load(Ordering::Acquire),
             read_bytes: self.read_bytes.load(Ordering::Acquire),
-            // the compactor holds the pins, so the gauge is filled by its reader
+            // counters() fills this from the compactor's pins
             segments_pinned_by_rot: 0,
         }
     }
@@ -324,38 +313,35 @@ struct PassTally {
 /// Live records waiting to land in the destination as one write, in the order queued
 #[derive(Default)]
 struct CopyRun {
-    /// The records the appender is handed
+    /// The records to hand the appender
     copies: Vec<CopyRecord>,
 
-    /// Each queued record's key, source place, sequence number and span, for its repoint and the tally
+    /// Each record's key, source loc, sequence number and span, for the repoint and tally
     moved: Vec<(RecordKey, Loc, Lsn, u64)>,
 
     /// The landed run's repoints, kept for the next run once published
     repoints: Vec<KeyRepoint>,
 
-    /// Bytes the queued records frame
+    /// Framed bytes of the queued records
     bytes: u64,
 }
 
-/// Where the last scrub pass stopped, so the next one carries on from there
-///
-/// Nothing about it survives the process, which is why a fresh sweep starts at a
-/// rotated segment rather than the lowest one.
+/// Where the last scrub pass stopped, so the next one resumes there
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 struct ScrubCursor {
-    /// Segment this sweep began at, which is also where its lap ends
+    /// This sweep began at this segment, and its lap ends here
     origin: SegmentId,
 
-    /// Segment the next pass resumes in
+    /// The next pass resumes in this segment
     segment: SegmentId,
 
-    /// Offset within that segment the next pass resumes at
+    /// The next pass resumes at this offset in that segment
     offset: u64,
 
-    /// End of that segment's record region, so a resume need not read the footer again
+    /// End of that segment's record region, so a resume skips rereading the footer
     region_end: u64,
 
-    /// Dead bytes counted in this segment so far, across however many passes
+    /// Dead bytes counted in this segment so far, across passes
     dead: u64,
 }
 
@@ -373,7 +359,7 @@ struct ScrubStep {
     /// Keys evicted for failing their checksum
     hits: usize,
 
-    /// Dead bytes counted in this segment, including whatever was carried in
+    /// Dead bytes counted in this segment, including those from earlier passes
     dead: u64,
 
     /// Resume offset and record-region end, when the budget ran out mid-segment
@@ -385,10 +371,10 @@ pub struct Compactor {
     /// Free-space pressure and tiering for the volume
     pressure: GcPressure,
 
-    /// Byte cadence compaction passes are charged against
+    /// Compaction passes are charged against this byte rate
     compact_rate: RateGate,
 
-    /// Byte cadence scrub passes are charged against, nothing when the scrub is off
+    /// Scrub passes are charged against this byte rate, nothing when the scrub is off
     scrub_rate: Option<RateGate>,
 
     /// Where the last scrub pass stopped, nothing at the start of a sweep
@@ -397,22 +383,22 @@ pub struct Compactor {
     /// Held for the length of one scrub pass, so passes never stack
     scrub_guard: Mutex<()>,
 
-    /// Where this process starts a fresh sweep, so restarts do not all start alike
+    /// Seeds where a fresh sweep starts, so restarts do not all start at the same segment
     scrub_seed: u64,
 
-    /// Bytes of later ingest past which a fast segment's survivors demote
+    /// A fast segment's survivors demote after this many bytes of later ingest
     demote_after_bytes: Option<u64>,
 
-    /// Counters the maintenance plane publishes
+    /// The maintenance plane's published counters
     metrics: Metrics,
 
     /// Segments a pass is rewriting right now, so a second pass picks another
     in_flight: Mutex<std::collections::HashSet<SegmentId>>,
 
-    /// Segments a pass left standing for rot, against the dead bytes it left them at
+    /// Segments a pass left standing for rot, with their dead bytes at that time
     rotted: Mutex<std::collections::HashMap<SegmentId, u64>>,
 
-    /// Read buffers the last pass finished with, which the next pass reads into
+    /// Read buffers from the last pass, reused by the next
     spare: Mutex<Vec<Vec<u8>>>,
 }
 
@@ -437,11 +423,8 @@ impl Drop for PassClaim<'_> {
 
 impl Compactor {
     /// Claim one segment for a pass, or nothing when another pass already holds it
-    ///
-    /// The claim is what stops two passes reading and retiring the same file. A merge
-    /// takes one per source and holds them all for the length of its pass.
     pub fn claim(&self, segment: SegmentId) -> Option<PassClaim<'_>> {
-        // a dropped claim relocks in_flight, so the guard ends here and only a won insert builds one
+        // the guard drops here, since a dropped claim relocks in_flight
         let won = lock(&self.in_flight).insert(segment);
         won.then(|| PassClaim {
             compactor: self,
@@ -449,33 +432,23 @@ impl Compactor {
         })
     }
 
-    /// Book the runs one merge pass read together
-    ///
-    /// A pass the tick drove hands its report to nobody, so this is where a volume says
-    /// whether its runs are being collapsed at all.
+    /// Count the runs one merge pass read together
     pub fn note_merged_runs(&self, runs: u64) {
         self.metrics.record_merge(runs);
     }
 
-    /// Whether a foreground write of this size fits outside the reserve
-    ///
-    /// The reserve is what compaction works in, so a foreground write may not spend it.
+    /// Whether a foreground write of this size fits outside the compaction reserve
     pub fn can_admit_foreground(&self, used_bytes: u64, request_bytes: u64) -> bool {
         self.pressure
             .can_admit_foreground(used_bytes, request_bytes)
     }
 
-    /// A maintenance plane sized from the volume settings and the disk under it
-    ///
-    /// A capacity of zero leaves the pressure model unbounded, so the append-only
-    /// deadlock guard is off: a full disk cannot be compacted out of, because compaction
-    /// needs somewhere to write the survivors.
+    /// A maintenance plane sized from the settings and disk, unbounded at zero capacity
     pub fn new(config: &ReelConfig, capacity_bytes: u64, fast_capacity_bytes: u64) -> Compactor {
         // Each pass needs a survivor segment, and every tail can roll to a fresh one between ticks
         let reserve = config.segment_bytes.to_bytes()
             * (config.tail_count() + config.compact_passes()) as u64;
-        // Half the fast tier of later ingest: late enough that the hot set stays hot,
-        // early enough that the tier never fills before demotion starts.
+        // Demote after half the fast tier of later ingest, so the tier never fills first
         let demote_after_bytes = (fast_capacity_bytes > 1).then_some(fast_capacity_bytes / 2);
         let compact = RateLimiter::for_compaction(config.compact_mbps);
         let scrub = RateLimiter::for_scrub(config.scrub_mbps, compact.target_mbps());
@@ -488,8 +461,7 @@ impl Compactor {
             in_flight: Mutex::new(std::collections::HashSet::new()),
             rotted: Mutex::new(std::collections::HashMap::new()),
             spare: Mutex::new(Vec::new()),
-            // nothing about the sweep survives the process, so the rotation comes from
-            // something that differs between runs of it
+            // the sweep start must differ between runs, so seed it from the clock
             scrub_seed: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|since| since.as_nanos() as u64)
@@ -510,9 +482,6 @@ impl Compactor {
     }
 
     /// Whether the compaction rate allows another pass to start now
-    ///
-    /// A paced pass pays for its steps as it takes them, so what stands here is the
-    /// tail past its last step rather than the whole of what it moved.
     pub fn is_compaction_due(&self) -> bool {
         self.compact_rate.is_open()
     }
@@ -557,11 +526,7 @@ impl Compactor {
         self.select_ranked(reel, index, 1.0, cue_floor)
     }
 
-    /// The ranking walk itself, claiming whatever it chooses
-    ///
-    /// Nothing retires while a cover is still owed its sweep, which both callers check
-    /// before they get here: an unsettled record would leave the shard counters holding
-    /// a segment that is gone.
+    /// The ranking walk behind both selectors, claiming whatever it picks
     fn select_ranked(
         &self,
         reel: &Reel,
@@ -571,19 +536,17 @@ impl Compactor {
     ) -> Option<(SegmentId, f64)> {
         let shared = reel.shared();
         let mut best: Option<(SegmentId, f64)> = None;
-        // one pass rather than two, since this lock is the one every insert takes
+        // one call for both, since every insert takes this lock
         let (segments, floors) = index.ranking();
         // read before the claim, so the two locks are never held at once
         let pinned = lock(&self.rotted).clone();
-        // A segment whose spans the index has not been told about yet answers every
-        // liveness question with nothing, so a pass over one would read its records as
-        // dead and retire the file they were in.
+        // A segment still owed its spans reads as all dead, so the walk skips it
         let owed = shared.pending_seals();
         // the list is a copy, so everything sealed from here on is invisible to the walk
         crate::sync::rendezvous::at("compaction/owed");
         let claimed = lock(&self.in_flight);
         for (segment, bytes) in segments {
-            // Skip unsettled segments: a tail owns them, or a failed sync left them without a footer
+            // Skip unsettled segments: a tail owns them, or a failed sync left no footer
             if !shared.is_settled(segment) || claimed.contains(&segment) || owed.contains(&segment)
             {
                 continue;
@@ -592,8 +555,7 @@ impl Compactor {
             if total == 0 {
                 continue;
             }
-            // A cue point can still read versions this segment holds: dead only means
-            // no live entry points at them, which is what an older reader came for.
+            // Skip a segment holding versions a cue point may still read
             if cue_floor.is_some_and(|floor| {
                 index
                     .min_lsn_of(segment)
@@ -601,14 +563,12 @@ impl Compactor {
             }) {
                 continue;
             }
-            // dead bytes plus whatever tombstones this segment could stop carrying
+            // dead bytes plus the tombstones this segment no longer needs to keep
             let fraction = bytes.reclaimable(floors.excluding(segment)) as f64 / total as f64;
             if fraction < effective_dead_ratio {
                 continue;
             }
-            // A segment pinned by rot is worth another pass only once something in it
-            // has died since: otherwise a pass reads the whole file, meets the same
-            // checksum miss and leaves it standing again.
+            // A rot-pinned segment returns only once something in it has died since
             if pinned.get(&segment) == Some(&bytes.dead) {
                 continue;
             }
@@ -617,13 +577,9 @@ impl Compactor {
                 best = Some((segment, fraction));
             }
         }
-        // claimed under the lock the choice was made under, or two callers arriving
-        // together both leave with the same segment
+        // claim under the walk's lock, or two callers could leave with the same segment
         if let Some((segment, _)) = best {
-            // A segment that sealed inside the walk reads as a tail just freed: in the
-            // ranking, absent from a queue taken before its note existed. Asking the
-            // queue again settles it, since a seal queues its note before it gives up
-            // its hold.
+            // A seal during the walk queues its note first, so asking the queue again catches it
             if shared.pending_seals().contains(&segment) {
                 return None;
             }
@@ -633,18 +589,14 @@ impl Compactor {
         best
     }
 
-    /// Copy one sealed segment's live records out and retire it, returning whether the segment is gone
-    ///
-    /// A segment whose file is already gone leaves nothing to reclaim, so what it left
-    /// in the counters is dropped instead.
+    /// Copy a sealed segment's live records out and retire it, returning whether it is gone
     pub fn compact_segment(
         &self,
         reel: &Reel,
         index: &ReelIndex,
         segment: SegmentId,
     ) -> Result<bool> {
-        // however this pass leaves, the claim drops: a leaked one is a segment nothing
-        // ever compacts again
+        // the claim drops however this pass leaves, or nothing would compact the segment again
         let _claim = PassClaim {
             compactor: self,
             segment,
@@ -653,9 +605,7 @@ impl Compactor {
         if reel.tails().is_empty() {
             return Ok(false);
         }
-        // What the other segments hold is only half the floor: a number drawn before
-        // this pass can still be published into a segment after it, under an lsn no
-        // floor has seen, so a tombstone above what is settled has to come across.
+        // A number drawn before this pass may land after it, so the floor is capped at settled
         let settled = shared.settled_below();
         let drop_floor = index
             .min_lsn_excluding(segment)
@@ -671,16 +621,14 @@ impl Compactor {
         };
         let file_len = match segment_len(shared, &source)? {
             Some(len) => len,
-            // the handle is fresh, so a missing length is a missing file rather than a
-            // stale descriptor
+            // the handle is fresh, so a missing length means a missing file
             None => {
                 index.forget_segment(segment);
                 lock(&self.rotted).remove(&segment);
                 return Ok(true);
             }
         };
-        // read once for the pass: where the records end, and their key order where the
-        // segment can say what that is, offset order otherwise
+        // read once: where the records end, and their key order when the footer has one
         let footer = shared.footer_of(segment)?;
         // No row lists an unsealed keyless segment's keys, so it stands until a reopen drops it
         if source.layout().is_keyless_layout() && footer.is_none() {
@@ -690,7 +638,7 @@ impl Compactor {
         let order = footer.as_deref().and_then(footer_order);
         let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
         reader.stock(std::mem::take(&mut *lock(&self.spare)));
-        // Only a reserved tail answers to a chosen tier, so a volume with them waits for a free one
+        // Only a reserved tail takes a chosen tier, so a volume with them waits for a free one
         let lease = reel.lease_reserved();
         if reel.keeps_reserved() && lease.is_none() {
             return Ok(false);
@@ -711,8 +659,7 @@ impl Compactor {
             }
         }
 
-        // created where the charged reads begin, so the footer the order came from is
-        // off the gate's books
+        // created after the footer read, so the gate is not charged for it
         let mut pace = self.compact_rate.pace();
 
         let mut tally = PassTally::default();
@@ -756,26 +703,22 @@ impl Compactor {
             return Err(error);
         }
 
-        // The gate prices the device, so the pass is charged what its reader bought,
-        // refills at dead records included, plus the copies it wrote.
+        // Charge the pass every byte its reader fetched, dead records included, plus the copies
         let read_bytes = reader.read_bytes();
         let charged = read_bytes.saturating_add(tally.copied_bytes);
         *lock(&self.spare) = reader.into_spare();
 
-        // A rotted record on a sole copy keeps its segment: the key still resolves into
-        // this file, and retiring it would unlink the last copy of those bytes.
+        // A rotted record on a sole copy keeps its segment, which holds the last copy of its bytes
         if tally.rotted {
             drop(source);
-            // pinned at the dead bytes left behind, so the ranking does not offer the
-            // segment back on the next tick
+            // pin it at its current dead bytes, so the ranking skips it until more dies
             lock(&self.rotted).insert(segment, index.segment_bytes(segment).dead);
             self.metrics.record_pass(&tally, read_bytes);
             pace.settle(charged);
             return Ok(false);
         }
 
-        // A cover that went up while this pass ran may span rows it skipped as covered,
-        // and retiring the segment would take them out from under the release pass.
+        // A cover raised during this pass may span rows it skipped, so the segment stays
         if index.has_pending_covers() {
             drop(source);
             self.metrics.record_pass(&tally, read_bytes);
@@ -783,17 +726,14 @@ impl Compactor {
             return Ok(false);
         }
 
-        // Closing per pass keeps one source's records to one destination, so key and
-        // offset order agree in it.
+        // Seal per pass, so the destination holds one source and its key and offset orders agree
         if tally.had_live {
             if let Some(lease) = &lease {
                 reel.tails()[lease.index()].seal()?;
             }
         }
 
-        // The index stops naming the segment before the file goes, not after: a paged
-        // read chooses its segment from a footer search, and the other order offers one
-        // whose file is already unlinked.
+        // Forget the segment in the index before the unlink, so no paged read picks a gone file
         crate::sync::rendezvous::at("compaction/retire");
         index.forget_segment(segment);
         lock(&self.rotted).remove(&segment);
@@ -809,15 +749,7 @@ impl Compactor {
         Ok(true)
     }
 
-    /// Rewrite a segment the footer gave an order for: fetch by offset, apply by key
-    ///
-    /// Only the applies need key order, since theirs is the order records land in the
-    /// destination. The two orders meet in a stripe: fetch its records ascending down
-    /// the driver's batch door, hold their payloads, then apply the stripe in key
-    /// order, stripes themselves in key order so the destination stays one sorted run.
-    ///
-    /// A wave is outstanding as one unit, so the gate can interrupt the fetch between
-    /// waves and nowhere inside one.
+    /// Rewrite a segment the footer orders: fetch stripes by offset, apply them by key
     #[allow(clippy::too_many_arguments)]
     fn rewrite_ordered(
         &self,
@@ -852,8 +784,7 @@ impl Compactor {
             plan.sort_unstable_by_key(|&(_, offset)| offset);
             let ranges = chunk_ranges(&plan, order, prefix_bound, reader.limit());
 
-            // One held stretch per record, in the slot its key order gives it, so the
-            // apply walks them in order with nothing to sort.
+            // Each record goes in the slot its key order gives it, so the apply needs no sort
             staged.clear();
             staged.resize(end - start, None);
             let mut wave_at = 0usize;
@@ -867,8 +798,7 @@ impl Compactor {
                 for (range, buffer) in wave.iter().zip(buffers) {
                     reader.preload(range.start, buffer);
                     for &(position, offset) in &plan[range.members.clone()] {
-                        // Held where the read left it and parsed at the apply, so a
-                        // record costs the fetch sixteen bytes whatever its key weighs.
+                        // Held in place and parsed at apply, so staging ignores key size
                         let span = prefix_bound as usize + order[position].1 as usize;
                         staged[position - start] = Some(reader.held(u64::from(offset), span)?);
                     }
@@ -898,8 +828,7 @@ impl Compactor {
                             };
                             (record, payload)
                         }
-                        // a footer offset the records disagree with gives up the
-                        // record, not the pass
+                        // an offset the records disagree with skips only this record
                         None => continue,
                     },
                 };
@@ -909,8 +838,7 @@ impl Compactor {
                 )?;
                 pace.reached(reader.read_bytes() + tally.copied_bytes);
             }
-            // The copies are written out of the stripe's read buffers, so landing them
-            // is what frees those buffers for the next stripe.
+            // Landing the copies frees the stripe's read buffers for the next stripe
             self.land_run(reel, dest_index, index, &mut run, tally)?;
             start = end;
         }
@@ -918,9 +846,6 @@ impl Compactor {
     }
 
     /// Rewrite a segment with no footer by walking its records where they lie
-    ///
-    /// Metered per record, so the stretch the gate cannot interrupt is one window
-    /// refill, whatever the rate asks for.
     #[allow(clippy::too_many_arguments)]
     fn rewrite_scanning(
         &self,
@@ -945,11 +870,7 @@ impl Compactor {
         self.land_run(reel, dest_index, index, &mut run, tally)
     }
 
-    /// Rewrite one record and fold what happened into the pass's tally
-    ///
-    /// A live record only joins the run. The run lands first when the record is a
-    /// tombstone, which has to go down where its key sorts, or when the record would
-    /// take the run past what one write may hold.
+    /// Rewrite one record, landing the run first for a tombstone or a full run
     #[allow(clippy::too_many_arguments)]
     fn apply_one(
         &self,
@@ -980,11 +901,7 @@ impl Compactor {
         Ok(())
     }
 
-    /// Write the queued copies as one run and point the index at where they landed
-    ///
-    /// The copies are down while the index still points at the source, which is the
-    /// window a concurrent delete or overwrite has to win in, so every repoint is
-    /// guarded by the sequence number its copy was made under.
+    /// Land the queued copies as one run and repoint each, guarded by its sequence number
     fn land_run(
         &self,
         reel: &Reel,
@@ -1015,7 +932,7 @@ impl Compactor {
         Ok(())
     }
 
-    /// Rewrite one of a segment's records, whichever order the caller reached it in
+    /// Rewrite one of a segment's records
     #[allow(clippy::too_many_arguments)]
     fn rewrite_one(
         &self,
@@ -1048,11 +965,7 @@ impl Compactor {
         )
     }
 
-    /// Punch the dead runs out of sealed segments, and say what came back
-    ///
-    /// Sealed, footer-bearing segments only: a rebuild reads those from their footers
-    /// rather than by walking them, so a punched record's zeroed header never ends a
-    /// recovery walk. Only records the index has already moved past are punched.
+    /// Punch the dead runs out of sealed footer-bearing segments and report what came back
     pub fn erase_dead_runs(&self, reel: &Reel, index: &ReelIndex) -> Result<EraseReport> {
         let shared = reel.shared();
         let mut report = EraseReport::default();
@@ -1141,16 +1054,12 @@ impl Compactor {
         run: &mut CopyRun,
     ) -> Result<CopyStep> {
         let loc = record.loc(segment);
-        // Asked here, where a stripe arrives in key order and one key's walk of the map
-        // leaves the next one's path warm. The repoint is guarded on the version this
-        // saw, so a record that dies before its run lands loses there.
+        // The repoint is guarded on this version, so a record that dies before landing loses there
         if !index.is_live_at(&record.header.key, loc, record.header.lsn)? {
             return Ok(CopyStep::Skipped);
         }
 
-        // A record the floor has passed is dropped and its key goes with it. No
-        // tombstone is written: the key is below a floor the whole volume agrees on, so
-        // absence tells a later reader everything one would.
+        // A record below the purge floor is dropped with its key, and no tombstone is needed
         if is_purged(reel.shared().purge_floor(), index, &record.header.key) {
             index.evict_at(&record.header.key, loc)?;
             self.metrics.record_purged(1);
@@ -1162,9 +1071,8 @@ impl Compactor {
             None => held_payload(reader, &record)?,
         };
         if !record.verify(payload.as_slice()) {
-            // With peers the eviction turns the miss into a repair enqueue. A sole copy
-            // keeps its bytes where they are: rewriting them would stamp a fresh
-            // checksum over rot and serve it as good.
+            // With peers the eviction queues a repair. A sole copy stays put, since a rewrite
+            // would stamp a fresh checksum over rot.
             if reel.shared().config.repair == RepairPath::Peers {
                 if index.evict_at(&record.header.key, loc)? {
                     self.metrics.record_hits(1);
@@ -1197,10 +1105,7 @@ impl Compactor {
         Ok(CopyStep::Queued)
     }
 
-    /// Carry a tombstone into the destination, or drop one nothing can undo
-    ///
-    /// A range tombstone carries under the same rule as a point one and takes its
-    /// exclusive end with it, since that is what says how far the delete reached.
+    /// Copy a tombstone into the destination, or drop one nothing can undo
     #[allow(clippy::too_many_arguments)]
     fn carry_or_drop(
         &self,
@@ -1213,7 +1118,7 @@ impl Compactor {
         drop_floor: Lsn,
     ) -> Result<TombstoneStep> {
         if !should_carry(reel, index, &record.header, drop_floor)? {
-            // Nothing older is left for its grave to hide, and the retire takes the grave's origin with it
+            // Nothing older is left for the grave to hide, and the retire removes its origin
             if record.header.flags.is_tombstone() {
                 index.drop_grave(&record.header.key, record.header.lsn);
             }
@@ -1229,10 +1134,9 @@ impl Compactor {
         } else {
             tail.append_carried_tombstone(record.header.key.clone(), record.header.lsn)?
         };
-        // the destination has to know it holds these, or it seals with no row and the
-        // delete is lost
+        // the destination must hold these, or it seals with no row and the delete is lost
         index.hold(&record.header.key, record.header.lsn, carried.loc);
-        // A paged grave went with the source's seal, so the copy holds one until its segment is noted
+        // A paged grave left with the source's seal, so hold one until the copy's segment is noted
         if record.header.flags.is_tombstone() {
             index.hold_grave(&record.header.key, record.header.lsn, carried.loc.segment);
         }
@@ -1240,28 +1144,22 @@ impl Compactor {
     }
 
     /// One bounded scrub pass across the volume, resuming where the last stopped
-    ///
-    /// A pass reads what the rate has earned since the last one and then stops,
-    /// remembering where. Running off the end starts the sweep over.
     pub fn scrub_pass(&self, reel: &Reel, index: &ReelIndex) -> Result<usize> {
         let gate = match &self.scrub_rate {
             Some(gate) => gate,
             None => return Ok(0),
         };
-        // One pass at a time, tried rather than queued for, and taken before drawing on
-        // the gate so the loser does not reset the running pass's clock.
+        // One pass at a time, taken before the gate so a loser does not reset the running clock
         let Some(_pass) = try_lock(&self.scrub_guard) else {
             return Ok(0);
         };
-        // the rate decides how much this pass may read, so the sweep runs at its
-        // configured rate whether the plane is ticked once a minute or in a tight loop
+        // the rate sets this pass's read budget, however often the plane ticks
         let (mut budget, stretch) = gate.allowance(SCRUB_PASS_MAX);
         let _rest = Rest(gate);
         if budget == 0 {
             return Ok(0);
         }
-        // A pass stops at its bytes or at the stretch it earned, whichever comes first,
-        // so a scrub slower than its rate holds the tick no longer than it waited.
+        // Stop at the budget or at the earned stretch, whichever comes first
         let deadline = Instant::now() + stretch;
 
         let shared = reel.shared();
@@ -1277,13 +1175,9 @@ impl Compactor {
             return Ok(0);
         }
 
-        // The cursor is copied out here and written back at the pass's end, never held
-        // across the sweep, so a resume-point probe does not wait out the pass's reads.
+        // The cursor is copied out and written back at the end, so a probe never waits on the pass
         let stored = *lock(&self.scrub_cursor);
-        // A sweep that always began at the lowest segment leaves a node restarting often
-        // verifying the front of the volume over and over, so a fresh sweep starts at a
-        // rotated point and wraps. It is not a resume: taken as one, its first segment
-        // would hand the scan a record region ending at offset zero.
+        // A fresh sweep starts at a rotated segment so restarts do not rescan the front
         let is_resuming = stored.is_some();
         let from = stored.unwrap_or_else(|| {
             let origin = plan[(self.scrub_seed % plan.len() as u64) as usize];
@@ -1296,8 +1190,7 @@ impl Compactor {
             }
         });
 
-        // turning the plan so the sweep's origin leads makes the lap a plain sequence,
-        // rather than each pass setting off on a fresh lap and the sweep never ending
+        // rotate the plan so the origin leads, which makes one lap a plain sequence
         let origin_at = plan.partition_point(|segment| *segment < from.origin);
         plan.rotate_left(origin_at);
         let resume_at = plan
@@ -1335,8 +1228,7 @@ impl Compactor {
                 });
                 return Ok(hits);
             }
-            // the sweep reached this segment's end, so its tally is the whole of what
-            // the index no longer resolves into it
+            // the sweep reached this segment's end, so its dead tally is complete
             index.settle_dead(*segment, step.dead);
         }
 
@@ -1355,8 +1247,7 @@ impl Compactor {
         budget: &mut u64,
         deadline: Instant,
     ) -> Result<ScrubStep> {
-        // a sweep runs behind whatever the plane is retiring, so a segment can go
-        // between the plan and the pass
+        // a segment can retire between the plan and the pass
         let handle = match source_handle(shared, segment) {
             Ok(handle) => handle,
             Err(error) if is_missing(&error) => {
@@ -1445,8 +1336,8 @@ impl Compactor {
             let is_intact =
                 payload.len() == record.header.length as usize && record.verify(payload);
             if !is_intact {
-                // With peers the eviction is the repair enqueue. A sole copy keeps the
-                // key resolving so every read reports the loss.
+                // With peers the eviction queues a repair. A sole copy keeps the key
+                // resolving so every read reports the loss.
                 match shared.config.repair {
                     RepairPath::Peers => {
                         if index.evict_at(&record.header.key, loc)? {
@@ -1607,7 +1498,7 @@ fn keyless_dead_runs(
     Ok(())
 }
 
-/// Each column's records in key order as offset and length pairs, nothing if a row will not decode
+/// Each column's records in key order as offset and length pairs, nothing on a bad row
 fn footer_order(footer: &SegmentFooter) -> Option<(Vec<(u32, u32)>, u64)> {
     let mut order = Vec::with_capacity(footer.entry_count());
     let mut widest = 0usize;
@@ -1623,11 +1514,7 @@ fn footer_order(footer: &SegmentFooter) -> Option<(Vec<(u32, u32)>, u64)> {
     Some((order, HEADER_LEN as u64 + widest as u64))
 }
 
-/// Whether a tombstone has to come across, or nothing it shadows can still turn up
-///
-/// A newer entry in the index says the key is live again, so the delete is finished.
-/// Otherwise the floor decides: a tombstone at or above it is still holding its key's
-/// place against a record that has not landed yet.
+/// Whether a tombstone must be copied because something it shadows may still turn up
 fn should_carry(
     reel: &Reel,
     index: &ReelIndex,
@@ -1657,11 +1544,7 @@ fn should_carry(
 }
 
 impl Compactor {
-    /// The tier one pass's survivors land in
-    ///
-    /// Demotion is one-way: a capacity segment's records stay on capacity, and a fast
-    /// segment's survivors demote once enough later ingest has passed them and a
-    /// capacity volume stands ready.
+    /// Pick the tier for a pass's survivors, demoting fast segments once enough ingest passes them
     fn output_class(&self, shared: &ReelShared, segment: SegmentId) -> VolumeClass {
         let source = shared.volumes.class_of(shared.volumes.root_of(segment));
         if source == VolumeClass::Capacity {
@@ -1697,9 +1580,7 @@ fn is_purged(floor: u64, index: &ReelIndex, key: &RecordKey) -> bool {
 
 /// A handle on one sealed segment, from the descriptor cache or a fresh open
 pub fn source_handle(shared: &Arc<ReelShared>, segment: SegmentId) -> Result<SegmentHandle> {
-    // A closed descriptor answers every op with not-found, which reads exactly like a
-    // segment somebody unlinked, so asking its length here turns a stale handle into a
-    // reopen rather than into a retirement that never happens.
+    // A closed descriptor reads like an unlinked file, so check the length and reopen if stale
     if let Some(handle) = shared.fd_cache.get(segment) {
         match shared.driver.length(handle.file()) {
             Ok(_) => return Ok(handle),
@@ -1723,9 +1604,6 @@ pub fn source_handle(shared: &Arc<ReelShared>, segment: SegmentId) -> Result<Seg
 }
 
 /// Length of a segment the caller already holds open
-///
-/// Asking the descriptor is one call, where asking the directory would be one per file
-/// in it on every segment a pass visits.
 pub fn segment_len(shared: &Arc<ReelShared>, handle: &SegmentHandle) -> Result<Option<u64>> {
     match shared.driver.length(handle.file()) {
         Ok(len) => Ok(Some(len)),
@@ -1734,7 +1612,7 @@ pub fn segment_len(shared: &Arc<ReelShared>, handle: &SegmentHandle) -> Result<O
     }
 }
 
-/// Whether an error is a file that is not there rather than a device refusing
+/// Whether an error means the file is not there
 pub fn is_missing(error: &crate::error::ReelError) -> bool {
     if let crate::error::ReelError::Io(source) = error {
         return source.kind() == std::io::ErrorKind::NotFound;
@@ -1743,9 +1621,6 @@ pub fn is_missing(error: &crate::error::ReelError) -> bool {
 }
 
 /// Where a sealed segment's record region ends, which is where its footer begins
-///
-/// The caller brings the footer it read, or nothing for a segment that has none, so a
-/// pass that needs the rows as well reads the footer once.
 pub fn footer_bound(
     shared: &Arc<ReelShared>,
     handle: &SegmentHandle,
@@ -1769,10 +1644,7 @@ pub fn footer_bound(
     Ok(file_len - footer_len)
 }
 
-/// A forward walk over one segment's records, buying its bytes in chunks
-///
-/// One record at a time rather than a list of all of them, since collecting a large
-/// segment's headers first would cost tens of megabytes of transient memory.
+/// A forward walk over one segment's records, one at a time
 pub struct RecordScan<'reader, 'driver> {
     reader: &'reader mut SegmentReader<'driver>,
     offset: u64,
@@ -1797,10 +1669,7 @@ impl<'reader, 'driver> RecordScan<'reader, 'driver> {
         self.offset
     }
 
-    /// The next record worth visiting, or nothing once the walk runs out
-    ///
-    /// Anything the walk cannot make sense of ends it, since the records after it are
-    /// no longer where a span says.
+    /// The next record worth visiting, or nothing at the end or at a record that will not parse
     pub fn next_record(&mut self) -> Result<Option<SourceRecord>> {
         let region_end = self.reader.limit();
         while self.offset + HEADER_LEN as u64 <= region_end {
@@ -1919,10 +1788,7 @@ pub fn read_payload(reader: &mut SegmentReader<'_>, record: &SourceRecord) -> Re
     Ok(bytes.to_vec())
 }
 
-/// Where the stripe opening at this position closes, bounded by staged bytes
-///
-/// The bound counts every row's length, dead rows included, which only makes stripes
-/// smaller. One record always advances, so a record wider than the cap gets its own.
+/// The end of the stripe that starts here, capped by staged bytes, at least one record
 fn stripe_end(order: &[(u32, u32)], start: usize) -> usize {
     let mut end = start + 1;
     let mut staged = u64::from(order[start].1);
@@ -1938,9 +1804,6 @@ fn stripe_end(order: &[(u32, u32)], start: usize) -> usize {
 }
 
 /// What one punch pass over the volume found and gave back
-///
-/// On anything but linux the punch itself is skipped and the erased count is what the
-/// pass would have punched, so the report still prices the layout.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EraseReport {
     /// Sealed segments the pass examined
@@ -1953,7 +1816,7 @@ pub struct EraseReport {
     pub erased_bytes: u64,
 }
 
-/// Bytes a filesystem block holds, the granularity a punch can act at
+/// A filesystem block, the smallest unit a punch frees
 const ERASE_BLOCK: u64 = 4096;
 
 /// Give a range's blocks back to the filesystem, keeping the file's length
@@ -1976,7 +1839,7 @@ fn erase_range(file: &std::fs::File, offset: u64, len: u64) -> Result<()> {
     }
 }
 
-/// The punch is a linux call; elsewhere the pass only reports what it found
+/// Off linux there is no punch, so the pass only reports what it found
 #[cfg(not(target_os = "linux"))]
 fn erase_range(_file: &std::fs::File, _offset: u64, _len: u64) -> Result<()> {
     Ok(())
@@ -1984,7 +1847,7 @@ fn erase_range(_file: &std::fs::File, _offset: u64, _len: u64) -> Result<()> {
 
 /// One coalesced read covering a run of a stripe's records
 struct ChunkRange {
-    /// Offset in the segment the read begins at
+    /// The read's start offset in the segment
     start: u64,
 
     /// Bytes the read covers
@@ -1994,12 +1857,7 @@ struct ChunkRange {
     members: std::ops::Range<usize>,
 }
 
-/// Ranges the next fetch wave takes from what is left of a stripe's chunking
-///
-/// The whole batch door unpaced, which is the shape the ring was sized for. A paced
-/// pass stops at the first range that fills its step, since a wave wider than a step is
-/// device time the gate has no way to interrupt. One range is the floor: the chunking
-/// has already cut at the reader's chunk and a lower cap cannot have less.
+/// How many ranges the next fetch wave takes, stopping at the first that fills the pace step
 fn wave_len(ranges: &[ChunkRange], step_bytes: u64) -> usize {
     let depth = ranges.len().min(FETCH_DEPTH);
     if step_bytes == 0 {
@@ -2015,12 +1873,7 @@ fn wave_len(ranges: &[ChunkRange], step_bytes: u64) -> usize {
     depth
 }
 
-/// Coalesce a stripe's offset-sorted records into ranged reads
-///
-/// Consecutive records pack into one range up to the reader's chunk, so a dense stripe
-/// reads as sequential chunks and a sparse one skips the dead between its survivors.
-/// The span behind each offset is a hint, and a record wider than its hint is served by
-/// the window's own refill.
+/// Coalesce a stripe's offset-sorted records into ranged reads up to `READ_CHUNK` wide
 fn chunk_ranges(
     plan: &[(usize, u32)],
     order: &[(u32, u32)],
@@ -2090,7 +1943,7 @@ mod tests {
     const KEY_WIDTH: usize = 34;
     const SEG_HEADER_SPAN: usize = HEADER_LEN + SEGMENT_HEADER_SPAN;
 
-    /// Keys one page of a listing takes
+    /// Keys per listing page
     const PAGE: usize = 1024;
 
     const COLUMNS: ColumnSet = &[ColumnSpec {
@@ -2102,7 +1955,7 @@ mod tests {
         codec: Codec::None,
     }];
 
-    /// Bytes a marked key takes: the mark, then an index within it
+    /// A marked key's width: the mark, then an index within it
     const MARKED_WIDTH: usize = 16;
 
     const MARKED: ColumnSet = &[ColumnSpec {
@@ -2158,8 +2011,7 @@ mod tests {
         ));
         let reel = Reel::open(Arc::clone(&shared), Vec::new()).expect("open reel");
         let index = ReelIndex::new(columns).expect("index");
-        // What the engine wires at open: the seal reads a segment's tally from these
-        // and a landing books its floor into them.
+        // Wire the index the way the engine does at open
         shared.set_segments(index.segments_handle());
         let compactor = Compactor::new(&config, 0, 0);
         Fixture {
@@ -2197,9 +2049,6 @@ mod tests {
     }
 
     /// Seal the tail, give the index its spans, and take the segment off the sealed queue
-    ///
-    /// These fixtures hold a reel and an index with no engine between them, and a
-    /// segment still owed its spans is left alone by compaction.
     fn seal(fixture: &Fixture) {
         fixture.reel.tails()[0].seal().expect("seal");
         let shared = fixture.reel.shared();
@@ -2292,7 +2141,7 @@ mod tests {
             .collect()
     }
 
-    /// Every live key of the record column and where it resolves, from the map and the footers alike
+    /// Every live key in the record column and its entry, from the map and the footers
     fn rebuilt_rows(rebuilt: &ReelIndex) -> Vec<(KeyBytes, Entry)> {
         let mut rows = Vec::new();
         let mut page = KeyPage::with_lens();
@@ -2366,7 +2215,7 @@ mod tests {
         assert_eq!(rebuilt_keys(&rebuilt), vec![key_bytes(1), key_bytes(2)]);
     }
 
-    // a record the purge floor has passed is dropped rather than copied forward
+    // a record the purge floor has passed is dropped from the copy
     #[test]
     fn purged_records_are_not_copied() {
         let fixture = fixture_over(settings(), MARKED);
@@ -2495,7 +2344,7 @@ mod tests {
         );
     }
 
-    // key order running against offset order is fetched forward, not a refill each
+    // a key order running against offset order still reads the region once
     #[test]
     fn a_reversed_key_order_reads_the_region_once() {
         let wide = ReelConfig {
@@ -2538,7 +2387,7 @@ mod tests {
         );
     }
 
-    // a drained volume reports idle rather than claiming work for ever
+    // a drained volume goes idle
     #[test]
     fn a_drained_volume_goes_idle() {
         let fixture = fixture(settings());
@@ -2551,7 +2400,7 @@ mod tests {
         }
         fixture.reel.flush().expect("flush");
 
-        // bounded, so a plane that never settles fails here instead of hanging
+        // bounded, so a plane that never settles fails here
         let mut verdicts = Vec::new();
         for _ in 0..64 {
             let before = fixture.index.dead_bytes();
@@ -2641,7 +2490,7 @@ mod tests {
         );
     }
 
-    // a tombstone that another segment can still resurrect is carried across
+    // a tombstone that another segment can still resurrect is copied across
     #[test]
     fn carries_shadowing_tombstone() {
         let fixture = fixture(settings());
@@ -2702,8 +2551,7 @@ mod tests {
         seal(&fixture);
         put(&fixture, 3, vec![0x33; 200]);
 
-        // one writer past its draw and short of its segment, which is what the floor
-        // the standing segments show cannot see
+        // one writer holds a drawn number short of its segment, which the segment floor misses
         let drawn = fixture.reel.shared().draw_gauge(1);
         fixture
             .compactor
@@ -2720,8 +2568,7 @@ mod tests {
     #[test]
     fn a_landed_orphan_keeps_its_tombstone() {
         let fixture = fixture(settings());
-        // What a dropped future leaves: the bytes are on the device under the oldest
-        // number on the volume, and no index entry ever names them.
+        // A dropped future leaves bytes under the oldest number and no index entry for them
         drop(
             fixture
                 .reel
@@ -2814,7 +2661,7 @@ mod tests {
         );
     }
 
-    /// The op an out of space fault is injected at, past the open's own ops
+    /// The out-of-space fault fires at this op, past the open's own ops
     const ENOSPC_AT: u64 = 11;
 
     fn engine_config() -> ReelConfig {
@@ -2894,8 +2741,7 @@ mod tests {
             "half the fast tier is what a segment has to fall behind",
         );
 
-        // A tier nothing can say the size of leaves every survivor in its own class,
-        // since a threshold read off nothing would demote on the first pass.
+        // With no fast tier size there is no threshold, so nothing demotes on the first pass
         let unknown = Compactor::new(&config, 0, 0);
         assert_eq!(unknown.demote_after_bytes, None);
     }
@@ -2913,9 +2759,7 @@ mod tests {
         flip_first_payload(&mut image, &seg_path(1));
         let reopened = reopen(image, settings());
 
-        // The scrub earns its bytes from the clock and starts wherever this process's
-        // rotation puts it, so the sweep is run to completion and the hit counted over
-        // the whole of it.
+        // The sweep start rotates per process, so run it to completion and count every hit
         let mut hits = 0;
         for _ in 0..64 {
             std::thread::sleep(Duration::from_millis(20));
@@ -2971,7 +2815,7 @@ mod tests {
         assert!(reopened.index.get(&key(2)).expect("read").is_some());
     }
 
-    // compaction leaves a rotted sole-copy segment standing rather than unlinking it
+    // compaction leaves a rotted sole-copy segment standing
     #[test]
     fn a_sole_copy_rotted_segment_is_not_retired() {
         let sole = ReelConfig {
@@ -3035,7 +2879,7 @@ mod tests {
     fn a_range_covers_the_prefix_the_footer_declares() {
         const KEY: u64 = 34;
         const PAYLOAD: u32 = 4096;
-        // further apart than a read chunk, so nothing coalesces and every range holds one
+        // further apart than `READ_CHUNK`, so every range holds one record
         let order: Vec<(u32, u32)> = (0..4u32)
             .map(|at| (at * 4 * READ_CHUNK as u32, PAYLOAD))
             .collect();
@@ -3076,13 +2920,12 @@ mod tests {
         );
         assert_eq!(wave_len(&ranges, RANGE as u64), 1);
         assert_eq!(wave_len(&ranges, 3 * RANGE as u64), 3);
-        // a step no range fits under still takes one, and one wider than the door does
-        // not widen it
+        // a step below one range still takes one, and a huge step stops at the door's depth
         assert_eq!(wave_len(&ranges, 1), 1);
         assert_eq!(wave_len(&ranges, u64::MAX), FETCH_DEPTH);
     }
 
-    // a paced pass holds itself to its rate while it copies, not only after
+    // a paced pass holds itself to its rate while it copies
     #[test]
     fn a_copying_pass_paces_itself() {
         let slow = ReelConfig {
@@ -3112,7 +2955,7 @@ mod tests {
         );
     }
 
-    // a rotted sole copy is compacted once, not on every tick
+    // a rotted sole copy stops being a compaction target after one pass
     #[test]
     fn a_rotted_segment_stops_being_a_target() {
         let sole = ReelConfig {

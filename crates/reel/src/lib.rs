@@ -1,7 +1,4 @@
-//! A log-structured key-value store engine
-//!
-//! One append-only log of segment files over one or more volumes, holding every
-//! column behind an index and serving them behind the store trait.
+//! A log-structured key-value store engine over append-only segment files
 
 pub mod append;
 pub mod compaction;

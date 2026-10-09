@@ -1,24 +1,20 @@
 //! The columns the harness opens, the wire keys and values, and the mutation applier
-//!
-//! A record key is a group big endian then a thirty two byte id, and a value is
-//! verbatim. Building the same bytes for every backend and applying each mutation
-//! through the trait is what makes the reel and the memory oracle comparable.
 
 use reel::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey};
 use reel_core::{Result as StoreResult, Store, WriteBatch};
 
 use crate::harness::op_stream::StreamOp;
 
-/// Bytes a wire record key occupies, a group big endian then an id
+/// Wire record key length: a big endian group then an id
 pub const RECORD_KEY_LEN: usize = GROUP_PREFIX_LEN + ID_LEN;
 
-/// Bytes the group takes at the front of a record key
+/// Length of the group prefix at the front of a record key
 pub const GROUP_PREFIX_LEN: usize = 2;
 
-/// Bytes an id occupies at the tail of a record key
+/// Length of the id at the end of a record key
 pub const ID_LEN: usize = 32;
 
-/// Bytes of length framing a stored value carries ahead of its payload
+/// Bytes the length frame adds ahead of a value's payload
 const VALUE_FRAME_LEN: usize = 0;
 
 /// The record column, which every generated stream writes into
@@ -27,17 +23,13 @@ pub const RECORDS: ColumnId = ColumnId(1);
 /// The blob column, wide payloads addressed by a bare id
 pub const BLOB: ColumnId = ColumnId(2);
 
-/// Family name the record column is addressed by through the store trait
+/// The store trait addresses the record column by this family name
 pub const RECORDS_CF: &str = "records";
 
-/// Family name the blob column is addressed by
+/// The store trait addresses the blob column by this family name
 pub const BLOB_CF: &str = "blob_data";
 
-/// The columns every harness store is opened with
-///
-/// A column shards as far as its leading bytes let it: records lead with their group,
-/// blobs lead with a uniform id that spreads on its own and take one shard. Neither
-/// inlines, since both hold payloads past what an index entry can carry.
+/// Every harness store opens with these columns
 pub const TEST_COLUMNS: ColumnSet = &[
     ColumnSpec {
         id: RECORDS,
@@ -57,9 +49,7 @@ pub const TEST_COLUMNS: ColumnSet = &[
     },
 ];
 
-/// The record column key for a group and an id
-///
-/// Two big endian group bytes then the id, so the key space sorts by group.
+/// The record column key: two big endian group bytes then the id, so keys sort by group
 pub fn record_key(group: u16, id: [u8; ID_LEN]) -> RecordKey {
     let mut bytes = [0u8; RECORD_KEY_LEN];
     bytes[..GROUP_PREFIX_LEN].copy_from_slice(&group.to_be_bytes());
@@ -75,7 +65,7 @@ pub fn wire_key(group: u16, address: u8) -> Vec<u8> {
     key
 }
 
-/// Build a framed value, an eight byte length then the payload nonce bytes
+/// Build a `len` byte value: the length as eight little endian bytes, then fill, cut to `len`
 pub fn framed_value(len: usize, fill: u8) -> Vec<u8> {
     let mut value = (len as u64).to_le_bytes().to_vec();
     value.resize(VALUE_FRAME_LEN + len, fill);
@@ -87,9 +77,7 @@ pub fn group_prefix(group: u16) -> Vec<u8> {
     group.to_be_bytes().to_vec()
 }
 
-/// Apply one mutation to a store through the trait
-///
-/// A reopen and the ordered read ops are handled by the fixture and are a no op here.
+/// Apply one mutation to a store through the trait, skipping reopens and reads
 pub fn apply_mutation<Backend: Store>(store: &Backend, op: &StreamOp) -> StoreResult<()> {
     match op {
         StreamOp::Put {

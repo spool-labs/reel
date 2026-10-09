@@ -34,7 +34,7 @@ const VARYING: ColumnSet = &[ColumnSpec {
 /// Each round adds this many fresh keys, a few segments' worth
 const PER_ROUND: u64 = 500;
 
-/// Rounds, enough runs that the merge goes several times and merges its own runs
+/// Enough rounds that the merge runs several times and merges its own runs
 const ROUNDS: u64 = 14;
 
 /// Each round drives maintenance for this many ticks, more than its merges take
@@ -43,10 +43,10 @@ const TICKS: usize = 10;
 /// One key may fall inside this many runs once maintenance has caught up
 const SETTLED_DEPTH: usize = 8;
 
-/// Dead share at which a segment is rewritten, never for the runs alone
+/// A dead share that never triggers a rewrite, so the runs are tested alone
 const NEVER: f64 = 1.0;
 
-/// Dead share at which the overwrites and deletes below have a segment rewritten
+/// At this dead share the overwrites and deletes below get segments rewritten
 const RECLAIM: f64 = 0.1;
 
 fn config(tails: u32, dead_ratio: f64) -> ReelConfig {
@@ -247,7 +247,7 @@ fn key_runs_of_varying_keys_answer_as_the_model_on_four_tails() {
 /// The scenarios below rewrite a segment at this dead share, so half-dead ones go
 const HALF_DEAD: f64 = 0.3;
 
-/// Whether an older run still points into a retired segment while a later run reads this key from a standing one
+/// Whether an older run points into a retired segment and a later run still finds this key
 fn is_stale_under_fresh(store: &ReelStore, key: &[u8]) -> bool {
     let index = store.index();
     let Some(footers) = index.footers() else {

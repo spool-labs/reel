@@ -1,9 +1,4 @@
-//! Turning a report into the text somebody reads
-//!
-//! A report says itself once, as a `Doc`, and the renderers here are the only
-//! places that decide what that looks like. Adding a format is a module beside
-//! these two rather than another set of format strings per report, and a report
-//! that grows a block gets it in every format at once.
+//! Renders a report's `Doc` as terminal text or markdown
 
 use std::fmt::Write;
 
@@ -15,7 +10,7 @@ pub use style::Style;
 
 use super::doc::Doc;
 
-/// A report that can say its own shape
+/// A report that can describe itself as a `Doc`
 pub trait Report {
     /// The report as blocks, before any format has been chosen
     fn doc(&self) -> Doc;
@@ -24,7 +19,7 @@ pub trait Report {
 /// Render a report for a terminal
 pub fn text<Model: Report>(report: &Model, style: &Style) -> String {
     let mut out = String::new();
-    // A String is the one sink that cannot fail, so there is nothing to report.
+    // Writing to a String cannot fail
     let _ = text::render(&report.doc(), style, &mut out);
     out
 }
@@ -36,8 +31,7 @@ pub fn markdown<Model: Report>(report: &Model) -> String {
     out
 }
 
-/// Write a report straight into a sink, for a caller that would rather not build
-/// a string
+/// Write a report as terminal text straight into a sink
 pub fn write<Model, Sink>(report: &Model, style: &Style, out: &mut Sink) -> std::fmt::Result
 where
     Model: Report,
@@ -66,9 +60,7 @@ mod tests {
                     .caption("2 of 9 segments"),
             )
             .table(
-                // A left-hand last column with a note on one row and not the
-                // other, which is the shape a knob table takes and the one the
-                // trailing-space exemption has to get right.
+                // A left-aligned last column with a note on only one row, as in the knob table
                 Table::new([Column::left("knob"), Column::left("verdict")])
                     .row(Row::new(["plane", "off"]))
                     .row(Row::new(["map above", "refused"]).note("disagrees")),
@@ -168,8 +160,7 @@ mod tests {
             rows[1].contains("a-very-long-identifier"),
             "the long cell was clipped: {out}"
         );
-        // A column of figures ends where every other row's does, whatever the
-        // widths of the names beside them.
+        // The figures column ends at the same width on every row
         let ends: Vec<usize> = rows.iter().map(|line| line.chars().count()).collect();
         assert!(
             ends.windows(2).all(|pair| pair[0] == pair[1]),
@@ -191,7 +182,7 @@ mod tests {
         );
     }
 
-    // a verdict that is only a word is only a word
+    // a verdict with no detail leaves no trailing space
     #[test]
     fn a_bare_verdict_carries_nothing_after_it() {
         let bare = Doc::new().verdict(Tone::Good, "CLEAN", "");
@@ -232,7 +223,7 @@ mod tests {
         );
     }
 
-    // a backtick in the content widens the fence rather than closing it early
+    // a backtick in the content widens the fence so the span does not close early
     #[test]
     fn markdown_fences_past_its_content() {
         let ticked = Doc::new().footer(["use `--limit 0`"]);

@@ -1,10 +1,4 @@
-//! Refcounted segment handles, unlink on last drop, and the bounded fd cache
-//!
-//! A segment file is reached through a refcounted handle so it is never unlinked
-//! while a reader holds a reference; the last handle to drop performs the unlink.
-//! Sealed handles are kept in a bounded cache, and all handle io runs through a
-//! shared driver that hands each caller its own completions back through the slot
-//! a tag addresses.
+//! Refcounted segment handles that unlink on last drop, the bounded fd cache, and the io driver
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -24,34 +18,23 @@ use crate::io::slots::{runs_of, SlotTable};
 use crate::io::ReelIo;
 
 /// What one read of a batch filled, or why that read alone could not be served
-///
-/// The header and key come back apart from the payload, which is what lets a
-/// caller keep the payload buffer it was read into rather than shifting it down.
 pub type SplitRead = std::result::Result<(Vec<u8>, Vec<u8>), ReelError>;
 
 /// What one split read filled, or its error and the spare buffer it came in with
-///
-/// The spare comes back on a failure, so a read that did not land leaves the
-/// caller's own header buffer with the caller rather than with the allocator.
 pub type SplitAnswer = std::result::Result<(Vec<u8>, Vec<u8>), (ReelError, Vec<u8>)>;
 
 /// How many empty poll rounds the driver waits for a completion before giving up
 const MAX_POLL_ROUNDS: u32 = 1_000_000;
 
-/// Empty poll rounds the driver spins before it starts yielding the core
+/// The driver spins this many empty poll rounds before it yields the core
 const SPIN_ROUNDS: u32 = 64;
 
 /// Correlates concurrent submitters with one backend's shared completion queue
-///
-/// Submit takes no driver-wide lock, so the synchronous backends run their syscalls
-/// on the caller threads. One thread's drain can surface another thread's
-/// completion, so every drain is filed into the slot its tag addresses and each
-/// caller takes only its own.
 pub struct IoDriver {
     /// The backend every op goes down to
     backend: Arc<dyn ReelIo>,
 
-    /// The slots every op lands in, shared so a backend's own threads can file
+    /// The slots every op lands in, shared so a backend's own threads can file into them
     slots: Arc<SlotTable>,
 }
 
@@ -69,7 +52,7 @@ impl IoDriver {
         self.backend.serving()
     }
 
-    /// Device flushes the backend under this driver has asked for
+    /// How many device flushes the backend under this driver has asked for
     pub fn sync_count(&self) -> u64 {
         self.backend.sync_count()
     }
@@ -79,7 +62,7 @@ impl IoDriver {
         self.backend.door_counts()
     }
 
-    /// Nanoseconds the backend spent waiting inside those flushes
+    /// Nanoseconds the backend spent waiting inside its flushes
     pub fn sync_nanos(&self) -> u64 {
         self.backend.sync_nanos()
     }
@@ -94,10 +77,7 @@ impl IoDriver {
         self.slots.slots()
     }
 
-    /// How many ops one awaited batch asks for at a time
-    ///
-    /// A batch future claims its whole run or none of it, so a quarter of the table
-    /// leaves room for three more callers.
+    /// How many ops one awaited batch asks for at a time, a quarter of the table
     pub fn batch_slots(&self) -> usize {
         self.slots.slots() / 4
     }
@@ -112,15 +92,12 @@ impl IoDriver {
         self.slots.wakers()
     }
 
-    /// Completions put back rather than delivered, which is what a drop costs
+    /// Completions put back undelivered, which is what a dropped future costs
     pub fn reclaimed(&self) -> u64 {
         self.slots.reclaimed()
     }
 
-    /// Drain what the backend has ready into the slots waiting for it
-    ///
-    /// A thread already draining is left to it, and that turn is answered as nothing
-    /// moved.
+    /// Drain ready completions into their slots, zero when another thread is already draining
     pub fn reap(&self) -> Result<usize> {
         let Some(mut drained) = self.slots.begin_poll() else {
             return Ok(0);
@@ -139,14 +116,9 @@ impl IoDriver {
     }
 
     /// The same batch into vectors the caller keeps, taking the ops out of theirs
-    ///
-    /// The completions land in the caller's list and the op list comes back empty
-    /// but with its room intact, so a thread batching reads keeps both between
-    /// submissions.
     pub fn run_into(&self, ops: &mut Vec<Op>, out: &mut Vec<Completion>) -> Result<()> {
         out.clear();
-        // A backend that runs the batch on this thread hands the completions back
-        // in submit order, so the slots have nothing left to correlate.
+        // A backend that runs the batch on this thread answers in submit order, with no slots
         if self.backend.submit_batch(ops, out) {
             return Ok(());
         }
@@ -155,8 +127,7 @@ impl IoDriver {
         let mut filled: Vec<Option<Completion>> = Vec::new();
         filled.resize_with(wanted.len(), || None);
 
-        // A run is as much of the batch as the table has slots for, so a batch
-        // wider than the table goes down in runs as the ones ahead of it free.
+        // A batch wider than the table goes down in runs as earlier runs free their slots
         let mut at = 0;
         while at < wanted.len() {
             let run = self.claim_run(&wanted[at..])?;
@@ -184,10 +155,7 @@ impl IoDriver {
         self.slots.debug_flights()
     }
 
-    /// Submit one op and collect its completion without the batch bookkeeping
-    ///
-    /// A backend that services ops on the calling thread answers in place, which
-    /// skips the slot and its lock.
+    /// Submit one op and collect its completion, answered in place by an inline backend
     fn run_op(&self, op: Op) -> Result<Completion> {
         let op = match self.backend.submit_inline(op) {
             Ok(completion) => return Ok(completion),
@@ -208,9 +176,6 @@ impl IoDriver {
     }
 
     /// Submit one op and await its completion
-    ///
-    /// The claim is awaited rather than parked on, because the caller polling this
-    /// is the caller holding the futures whose completions free the slots.
     pub async fn wait_op(&self, op: Op) -> Result<Completion> {
         let wanted = [op.tag()];
         self.slots.claim(&wanted).await;
@@ -218,9 +183,7 @@ impl IoDriver {
             self.slots.release_run(&wanted);
             return Err(error);
         }
-        // The awaited door serves itself: a poll that finds the slot empty drains
-        // the backend if nobody else is. The waker is seated before that drain, so
-        // a completion another thread files in the gap still wakes this future.
+        // A pending poll drains the backend itself, with its waker seated before the drain
         let wait = self.slots.wait_op(wanted[0]);
         let mut wait = std::pin::pin!(wait);
         Ok(std::future::poll_fn(move |context| {
@@ -238,10 +201,7 @@ impl IoDriver {
         .await)
     }
 
-    /// Submit a batch and await its completions, in submit order
-    ///
-    /// The whole batch is claimed at once or not at all, so two batches cannot each
-    /// hold half of what they need and wait on the other for the rest.
+    /// Submit a batch and await its completions in submit order, claiming all slots at once
     pub async fn wait_batch(&self, ops: Vec<Op>) -> Result<Vec<Completion>> {
         if ops.len() > self.batch_slots() {
             return Err(ReelError::Rejected(format!(
@@ -257,8 +217,7 @@ impl IoDriver {
             self.slots.release_run(&wanted);
             return Err(error);
         }
-        // The same self-service the single op takes: a pending batch drains the
-        // backend when nobody else is.
+        // A pending batch drains the backend itself, the same as a single op
         let wait = self.slots.wait_batch(runs_of(&wanted), wanted.len());
         let mut wait = std::pin::pin!(wait);
         Ok(std::future::poll_fn(move |context| {
@@ -276,10 +235,7 @@ impl IoDriver {
         .await)
     }
 
-    /// Claim slots for as much of a batch as the table has room for right now
-    ///
-    /// At least one, and a slot comes back only when whoever holds it takes its
-    /// completion, so this waits on the table rather than on the backend.
+    /// Claim slots for as much of a batch as the table has room for, waiting for at least one
     fn claim_run(&self, wanted: &[Tag]) -> Result<usize> {
         self.slots.wait_free(
             || {
@@ -290,11 +246,7 @@ impl IoDriver {
         )
     }
 
-    /// Wait until every wanted tag has landed a completion in its slot
-    ///
-    /// A wait that gives up orphans the flights it never saw rather than freeing
-    /// their slots, so a late completion is reclaimed instead of filed against
-    /// whoever holds the slot by then.
+    /// Wait until every wanted tag has landed, orphaning the rest if the wait gives up
     fn collect(&self, wanted: &[Tag], slots: &mut [Option<Completion>]) -> Result<()> {
         let mut rounds = 0u32;
         let mut missing = slots.len();
@@ -326,10 +278,6 @@ impl IoDriver {
     }
 
     /// Poll the backend until it drains something or the round budget runs out
-    ///
-    /// The first rounds spin, since a completion already in flight lands within a
-    /// few of them. Past that a backend that can park is asked to, since a spinning
-    /// thread holds a core to find out.
     fn poll_until_drained(&self, scratch: &mut Vec<Completion>, rounds: &mut u32) -> Result<usize> {
         loop {
             let drained = self.backend.poll(scratch)?;
@@ -353,7 +301,7 @@ impl IoDriver {
         }
     }
 
-    /// Open or create a file, yielding the handle later ops name
+    /// Open or create a file, returning the handle later ops use
     pub fn open(&self, path: &Path, create: bool) -> Result<FileId> {
         let op = Op::Open {
             tag: self.next_tag(),
@@ -372,9 +320,6 @@ impl IoDriver {
     }
 
     /// Read a byte range into a buffer the caller is done with
-    ///
-    /// The buffer comes back holding what the read filled, so a caller stepping a
-    /// file keeps one allocation for the whole walk instead of one per read.
     pub fn pread_reusing(
         &self,
         file: FileId,
@@ -414,7 +359,7 @@ impl IoDriver {
         }
         let mut reuse = reuse;
         if warm == WarmFirst::Ask {
-            // The probe takes a split read, so the window goes in as its payload behind an empty head
+            // The probe is a split read, so the window is its payload behind an empty head
             let mut head = ReadBuf::new(0);
             let mut body = ReadBuf::reusing(reuse, len as usize);
             if self.backend.warm_split(file, offset, &mut head, &mut body) {
@@ -437,14 +382,7 @@ impl IoDriver {
         }
     }
 
-    /// Read one contiguous range split across a header buffer and a payload buffer
-    ///
-    /// The header buffer is the caller's spare and comes back either way, including
-    /// alongside the error when the read fails. Only a failed submission loses it.
-    /// Read one split range, parking the caller for the completion
-    ///
-    /// `WarmFirst::Ask` puts one non-blocking read ahead of the op, the same way
-    /// the awaited twin does.
+    /// Read one range into a header buffer and a payload buffer, parking the caller
     pub fn pread_split_reusing(
         &self,
         file: FileId,
@@ -486,10 +424,7 @@ impl IoDriver {
         }
     }
 
-    /// Read one split range as a future rather than by parking the caller
-    ///
-    /// WarmFirst::Ask puts one non-blocking read ahead of the op, so a record the
-    /// page cache already holds is answered with no tag, slot or completion spent.
+    /// Read one split range as a future, asking the page cache first on `WarmFirst::Ask`
     pub async fn wait_split_reusing(
         &self,
         file: FileId,
@@ -529,11 +464,7 @@ impl IoDriver {
         }
     }
 
-    /// Run a batch of split reads and hand back what each of them filled
-    ///
-    /// One read failing comes back in its own slot; the batch failing comes back as
-    /// the error, so a caller can tell a record it cannot have from a device it
-    /// cannot reach.
+    /// Run a batch of split reads, one failed read in its slot and a failed batch as the error
     pub fn run_split_reads(&self, ops: Vec<Op>) -> Result<Vec<SplitRead>> {
         let mut ops = ops;
         let mut completions = Vec::new();
@@ -555,9 +486,6 @@ impl IoDriver {
     }
 
     /// Run a batch of split reads as a future, in runs the slot table can hold
-    ///
-    /// One caller may not hold the whole table, so a batch wider than its share is
-    /// sent down as several and each awaited in turn.
     pub async fn wait_split_reads(
         &self,
         mut ops: Vec<Op>,
@@ -570,9 +498,6 @@ impl IoDriver {
     }
 
     /// The same awaited batch, taking the ops out of a vector the caller keeps
-    ///
-    /// `WarmFirst::Ask` puts one non-blocking read ahead of each op, so what the page
-    /// cache holds is answered in place and only the rest go down as a batch.
     pub async fn wait_split_reads_into(
         &self,
         ops: &mut Vec<Op>,
@@ -648,11 +573,7 @@ impl IoDriver {
         }
     }
 
-    /// The same write, refused where it landed short of what it framed
-    ///
-    /// A vectored write answers with a count, and every caller here is placing bytes
-    /// something else is measured against, so short is a fault rather than a number
-    /// to carry.
+    /// The same write, failing if it landed short of what it framed
     pub fn writev_all(&self, file: FileId, offset: u64, bufs: Vec<WriteBuf>) -> Result<()> {
         let framed: u64 = bufs.iter().map(|buf| buf.len() as u64).sum();
         let wrote = self.writev(file, offset, bufs)?;
@@ -666,9 +587,6 @@ impl IoDriver {
     }
 
     /// The same write, handing the buffers back so a caller reusing one keeps its room
-    ///
-    /// A write takes its buffers by value, since the device holds their addresses
-    /// until the completion.
     pub fn writev_reusing(
         &self,
         file: FileId,
@@ -687,10 +605,7 @@ impl IoDriver {
         }
     }
 
-    /// List a directory, reporting one that does not exist yet as empty
-    ///
-    /// Only absence is an empty listing: answering an unreadable directory that way
-    /// would let an open conclude the volume holds nothing.
+    /// List a directory, reporting a missing one as empty and any other failure as an error
     pub fn list_or_empty(&self, dir: &Path) -> Result<Vec<SegmentEntry>> {
         match self.list(dir) {
             Ok(entries) => Ok(entries),
@@ -735,10 +650,7 @@ impl IoDriver {
         })
     }
 
-    /// Tell the kernel how a range will be read, or that a range is no longer wanted
-    ///
-    /// A zero length names the whole file, which is how a descriptor-wide access
-    /// pattern is set.
+    /// Tell the kernel how a range will be read, a zero length covering the whole file
     pub fn advise(&self, file: FileId, offset: u64, len: u64, advice: Advice) -> Result<()> {
         self.done(Op::Advise {
             tag: self.next_tag(),
@@ -787,10 +699,6 @@ impl IoDriver {
     }
 
     /// Reserve space ahead of the write head without extending the length
-    ///
-    /// The file always ends at its last written byte, so a walk ends at the
-    /// records and a crash leaves no reservation inside the length. The blocks
-    /// claimed past the end are given back by the seal's cut.
     pub fn allocate(&self, file: FileId, offset: u64, len: u64) -> Result<()> {
         self.done(Op::Allocate {
             tag: self.next_tag(),
@@ -822,7 +730,7 @@ impl IoDriver {
         })
     }
 
-    /// Run one op whose completion carries no payload
+    /// Run one op whose completion has no payload
     fn done(&self, op: Op) -> Result<()> {
         match self.run_op(op)?.outcome {
             Outcome::Done(result) => result,
@@ -831,10 +739,7 @@ impl IoDriver {
     }
 }
 
-/// What a split read's completion filled, or its error and the spare it carried
-///
-/// A read that did not land leaves the payload buffer the pool's and the header
-/// buffer the caller's spare, so each goes back where it came from.
+/// What a split read's completion filled, or its error and the spare header buffer
 fn split_answer(completion: Completion) -> SplitAnswer {
     match completion.outcome {
         Outcome::ReadSplit { result, head, body } => match result {
@@ -889,20 +794,13 @@ fn outcome_label(outcome: &Outcome) -> &'static str {
     }
 }
 
-/// Bytes a segment reader buys per trip to the backend
+/// A segment reader fetches this many bytes per trip to the backend
 pub(crate) const READ_CHUNK: usize = 1 << 20;
 
-/// The handle a tail holds before it has opened anything, naming no real file
-///
-/// Backends number their handles from zero, so a stand-in cannot borrow a number
-/// they might issue: releasing it would release someone else's live segment.
+/// The handle a tail holds before it opens anything, a number no backend issues
 const NO_FILE: FileId = FileId(u64::MAX);
 
-/// A forward reader over one segment that buys its bytes a chunk at a time
-///
-/// A record walk asks for a header and then the payload behind it, so a resident
-/// window turns one read per record into one read per chunk. The window only ever
-/// moves forward.
+/// A forward-only reader over one segment that reads its bytes a window at a time
 pub struct SegmentReader<'driver> {
     driver: &'driver IoDriver,
     file: FileId,
@@ -911,10 +809,8 @@ pub struct SegmentReader<'driver> {
     window_at: u64,
     read_bytes: u64,
 
-    /// Buffers no window or write holds, kept for the next read
     spare: Vec<Vec<u8>>,
 
-    /// Windows the reader moved off while a write still held part of them
     lent: Vec<Arc<Vec<u8>>>,
 }
 
@@ -945,10 +841,7 @@ impl<'driver> SegmentReader<'driver> {
         self.spare
     }
 
-    /// The payload at this offset as a stretch of the window, for a write to hold
-    ///
-    /// The window stays alive for as long as the write holds it, and the reader's
-    /// next read goes into another buffer.
+    /// The payload at this offset as a stretch of the window, kept alive while a write holds it
     pub fn held(&mut self, offset: u64, len: usize) -> Result<Part> {
         let len = self.range(offset, len)?.len();
         let start = match len {
@@ -989,15 +882,12 @@ impl<'driver> SegmentReader<'driver> {
         self.spare.pop().unwrap_or_default()
     }
 
-    /// Byte the reader stops at
+    /// The offset the reader stops at
     pub fn limit(&self) -> u64 {
         self.limit
     }
 
-    /// Bytes the reader has bought from the backend across every refill
-    ///
-    /// What the reads cost the device rather than what callers asked for, which is
-    /// what the rate gate charges from.
+    /// Bytes the reader has fetched from the backend across every refill
     pub fn read_bytes(&self) -> u64 {
         self.read_bytes
     }
@@ -1034,10 +924,7 @@ impl<'driver> SegmentReader<'driver> {
         Ok(())
     }
 
-    /// Bytes several ranges hold, fetched as one batch of outstanding reads
-    ///
-    /// Buffers come back in ask order, short only where the segment runs out, and a
-    /// range past the limit comes back empty without an op.
+    /// Bytes several ranges hold, fetched as one batch and returned in ask order
     pub fn read_ranges(&mut self, ranges: &[(u64, usize)]) -> Result<Vec<Vec<u8>>> {
         let mut asked = Vec::with_capacity(ranges.len());
         let mut ops = Vec::with_capacity(ranges.len());
@@ -1089,9 +976,6 @@ struct SegmentInner {
 
 impl Drop for SegmentInner {
     /// Unlink a doomed segment, then release the descriptor either way
-    ///
-    /// The order is what reclaims the space: a filesystem frees a file's blocks only
-    /// once its last link and its last descriptor are both gone.
     fn drop(&mut self) {
         if self.file == NO_FILE {
             return;
@@ -1123,10 +1007,7 @@ pub fn read_segment_header(driver: &IoDriver, file: FileId) -> Result<Option<Seg
     Ok(SegmentHeader::unpack(payload).ok())
 }
 
-/// A refcounted reference to one open segment file
-///
-/// Cloning shares the underlying file; the file is unlinked only when the last
-/// clone drops and the segment has been marked doomed.
+/// A refcounted reference to one open segment file, unlinked at the last drop once doomed
 #[derive(Clone)]
 pub struct SegmentHandle {
     inner: Arc<SegmentInner>,
@@ -1161,7 +1042,7 @@ impl SegmentHandle {
         file: FileId,
         driver: Arc<IoDriver>,
     ) -> Result<SegmentHandle> {
-        // A file with no readable header reads as keyed, so its keyless records fail and are never served wrong
+        // A file with no readable header reads as keyed, so its keyless records fail their checks
         let layout =
             read_segment_header(&driver, file)?.map_or(RecordLayout::Keyed, |header| header.layout);
         Ok(SegmentHandle::new(id, path, file, driver, layout))
@@ -1208,12 +1089,7 @@ impl SegmentHandle {
         self.inner.is_doomed.load(Ordering::Acquire)
     }
 
-    /// The segment's read-only mapping, taken on the first ask and kept for the
-    /// life of the handle family
-    ///
-    /// The mapping reserves `span` bytes, the size a segment may grow to, so a tail
-    /// read early still serves what it writes after. A file that cannot be mapped
-    /// stays unmapped for that life rather than buying a failed map per read.
+    /// The segment's read-only mapping of `span` bytes, made on the first ask and then kept
     pub fn mapping(&self, span: u64) -> Option<&Mapping> {
         self.inner
             .mapping
@@ -1229,31 +1105,22 @@ impl SegmentHandle {
 }
 
 /// A bounded cache of open sealed segment handles, reclaimed by second chance
-///
-/// A fourth tenant of the hold: the entry shape fits because a segment number is
-/// the whole key and a handle weighs one, so the byte budget the other three split
-/// is a handle count here and nothing else changes. Eviction drops the cache's
-/// reference only; a reader still holding the handle keeps the file open.
 pub struct FdCache {
     id: u64,
     entries: Hold<SegmentHandle>,
 }
 
-/// Names the next cache, so two volumes never share a memo
+/// The next cache's id, so two volumes never share a memo
 static NEXT_CACHE_ID: AtomicU64 = AtomicU64::new(0);
 
-/// A handle a thread resolved, answered without the map's guard
-///
-/// The reference is weak, so the memo never keeps a file alive: a doomed segment
-/// unlinks the moment its real readers drain, and an upgrade that fails falls
-/// through to the map.
+/// A handle a thread resolved, held weakly so the memo never keeps a file alive
 struct HandleMemo {
     cache: u64,
     segment: SegmentId,
     handle: std::sync::Weak<SegmentInner>,
 }
 
-/// Each thread remembers this many handles by segment id, so reads spread over a volume's segments skip the map's guard
+/// Each thread remembers this many handles by segment id, so repeat reads skip the map's guard
 const MEMO_SLOTS: usize = 64;
 
 thread_local! {
@@ -1261,11 +1128,7 @@ thread_local! {
         const { RefCell::new([const { None }; MEMO_SLOTS]) };
 }
 
-/// Hash for a key this reel issues and no caller chooses
-///
-/// A segment id is a counter this volume allocates in order, so SipHash has no
-/// adversary to defend against. The multiply spreads the low bits the counter
-/// concentrates, since the table takes its bucket from those.
+/// A cheap hash for segment ids, which this volume allocates in order
 #[derive(Clone, Copy, Default)]
 pub struct SegmentIdHash;
 
@@ -1277,7 +1140,7 @@ impl std::hash::BuildHasher for SegmentIdHash {
     }
 }
 
-/// The hasher above, holding the mix as it goes
+/// The `SegmentIdHash` hasher, holding the mix as it goes
 #[derive(Default)]
 pub struct SegmentIdHasher(u64);
 
@@ -1313,9 +1176,6 @@ impl FdCache {
     }
 
     /// Fetch a cached handle, giving it another chance at the next sweep
-    ///
-    /// The thread's memo answers first, and a segment id is never reused within a
-    /// volume, so a memo that matches the cache cannot answer with the wrong bytes.
     pub fn get(&self, id: SegmentId) -> Option<SegmentHandle> {
         let at = id.0 as usize % MEMO_SLOTS;
         let memoized = HANDLES.with(|slots| {
@@ -1341,15 +1201,12 @@ impl FdCache {
     }
 
     /// Insert a handle, giving up a cold one when at capacity
-    ///
-    /// A handle already held is left as it stands, since the two name the same file
-    /// and the held one may be the warmer of the pair.
     pub fn insert(&self, handle: SegmentHandle) {
         let key = segment_key(handle.id());
         self.entries.insert(key, handle, 1);
     }
 
-    /// Drop a doomed segment from the cache when it is doomed
+    /// Take a segment's handle out of the cache, as when the segment is doomed
     pub fn remove(&self, id: SegmentId) -> Option<SegmentHandle> {
         self.entries.take(segment_key(id))
     }
@@ -1388,7 +1245,7 @@ mod tests {
     use crate::io::slots::SLOT_COUNT;
     use crate::sync::tension::block_on;
 
-    /// A waker that counts what it takes, for a poll that must leave none
+    /// A waker that counts how often it is woken
     struct Counter(AtomicUsize);
 
     impl Wake for Counter {
@@ -1417,7 +1274,7 @@ mod tests {
         driver.list(dir).expect("list")
     }
 
-    /// A file holding these bytes, for the reads the futures fly
+    /// Open a file holding these bytes
     fn written(driver: &IoDriver, path: &Path, bytes: &[u8]) -> FileId {
         let file = open(driver, path);
         driver
@@ -1506,8 +1363,7 @@ mod tests {
         assert!(list(&driver, dir).is_empty());
     }
 
-    // the memo answers a repeat without the map, pins nothing, and never answers
-    // for another cache
+    // the memo answers a repeat, pins nothing, and never answers for another cache
     #[test]
     fn a_repeat_resolution_is_memoized_without_pinning() {
         let driver = driver();
@@ -1529,8 +1385,7 @@ mod tests {
         let repeat = cache.get(SegmentId(9)).expect("memoized get");
         assert_eq!(first.id(), repeat.id());
 
-        // Removal drops the map's reference, leaving the weak memo nothing to
-        // upgrade once the real readers drain.
+        // After removal the weak memo has nothing to upgrade once the readers drain
         cache.remove(SegmentId(9));
         drop(handle);
         drop(first);
@@ -1540,8 +1395,7 @@ mod tests {
             "nothing left to upgrade once readers drain"
         );
 
-        // A second cache on the same thread cannot be answered by the first one's
-        // memo, whatever ids it holds.
+        // A second cache on the same thread is never answered by the first one's memo
         let other = FdCache::new(4);
         assert!(other.get(SegmentId(9)).is_none());
     }
@@ -1601,7 +1455,7 @@ mod tests {
         assert_eq!(list(&driver, dir).len(), 1);
     }
 
-    // the cache evicts the least recently used handle at capacity
+    // at capacity the cache evicts the handle no read has touched since its insert
     #[test]
     fn evicts_least_recently_used() {
         let driver = driver();
@@ -1659,7 +1513,7 @@ mod tests {
         assert!(cache.get(SegmentId(9)).is_none());
     }
 
-    // a batch wider than the table goes down in runs rather than all at once
+    // a batch wider than the table goes down in runs
     #[test]
     fn a_wide_batch_goes_down_in_runs() {
         let sim = SimIo::new(FaultPlan::new(1));
@@ -1684,8 +1538,7 @@ mod tests {
         let driver = driver();
         let file = written(&driver, &Path::new("/reel").join("wait.reel"), b"payload");
 
-        // The door serves itself, so the out-of-band path has to be forced: with
-        // the self-drain seam refused, a thread that submitted nothing drains.
+        // Refusing the self-drain forces the out-of-band path, so another thread drains
         let script = crate::sync::rendezvous::script();
         script.refuse("slots/self-drain");
 
@@ -1717,8 +1570,7 @@ mod tests {
         let second_op = read_op(&driver, file, 7);
         let (first_tag, second_tag) = (first_op.tag(), second_op.tag());
 
-        // Refused, so both futures stay pending until the reap: reordering only
-        // means anything once both completions queue behind one drain.
+        // Refused, so both futures stay pending until one reap drains both completions
         let script = crate::sync::rendezvous::script();
         script.refuse("slots/self-drain");
 
@@ -1748,7 +1600,7 @@ mod tests {
         let driver = driver();
         let file = written(&driver, &Path::new("/reel").join("repoll.reel"), b"payload");
 
-        // Refused, so the polls stay pending and the seat count is askable.
+        // Refused, so the polls stay pending and the waker count can be checked
         let script = crate::sync::rendezvous::script();
         script.refuse("slots/self-drain");
 
@@ -1769,7 +1621,7 @@ mod tests {
     // futures dropped mid flight give back their slots and their buffers
     #[test]
     fn dropped_futures_leak_nothing() {
-        // Refused, so the futures stay pending on the passive path.
+        // Refused, so the futures stay pending on the passive path
         let script = crate::sync::rendezvous::script();
         script.refuse("slots/self-drain");
         let driver = driver();
@@ -1813,7 +1665,7 @@ mod tests {
     // a batch future answers in submit order under reordered and delayed completions
     #[test]
     fn a_batch_future_survives_faults() {
-        // Refused, so the futures stay pending on the passive path.
+        // Refused, so the futures stay pending on the passive path
         let script = crate::sync::rendezvous::script();
         script.refuse("slots/self-drain");
         let plan = FaultPlan::new(1)
@@ -1858,7 +1710,7 @@ mod tests {
     // a batch future dropped mid flight orphans its whole range
     #[test]
     fn a_dropped_batch_orphans_its_range() {
-        // Refused, so the futures stay pending on the passive path.
+        // Refused, so the futures stay pending on the passive path
         let script = crate::sync::rendezvous::script();
         script.refuse("slots/self-drain");
         let plan = FaultPlan::new(1).with_fault(3, FaultKind::DelayCompletion { polls: 2 });
@@ -1880,8 +1732,7 @@ mod tests {
             let mut cx = Context::from_waker(waker);
             assert!(waiting.as_mut().poll(&mut cx).is_pending());
 
-            // Two of the three are in hand and the delayed one is still out, so
-            // the drop has both shapes to put back.
+            // Two reads are in and the delayed one is still out, so the drop puts back both
             driver.reap().expect("reap");
             assert!(waiting.as_mut().poll(&mut cx).is_pending());
         }
@@ -1920,10 +1771,10 @@ mod tests {
         assert_eq!(driver.outstanding(), 0);
     }
 
-    // a wrapped claim yields to the caller rather than parking it
+    // a wrapped claim yields to the caller without parking it
     #[test]
     fn a_wrapped_claim_yields_rather_than_parking() {
-        // Refused, so the futures stay pending on the passive path.
+        // Refused, so the futures stay pending on the passive path
         let script = crate::sync::rendezvous::script();
         script.refuse("slots/self-drain");
         let driver = driver();
@@ -1936,8 +1787,7 @@ mod tests {
         let waker = Waker::from(Arc::clone(&woken));
         let mut cx = Context::from_waker(&waker);
 
-        // The holder's completion lands in its slot and stays there, and the tags
-        // burnt after it leave the next op exactly one table on.
+        // The holder's completion stays in its slot, and burnt tags put the next op a table on
         let holder = read_op(&driver, file, 7);
         let at = holder.tag();
         let mut holding = Box::pin(driver.wait_op(holder));
@@ -1953,7 +1803,7 @@ mod tests {
             "the wrapped claim took a slot the holder is carrying"
         );
 
-        // The take the claim is waiting for, which nothing but this thread makes.
+        // Only this thread makes the take the claim is waiting for
         let landed = ready(holding.as_mut().poll(&mut cx))
             .expect("the holder landed")
             .expect("submit");

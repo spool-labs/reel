@@ -1,5 +1,5 @@
-//! A paged walk returns every key that stays live through it, under writers, deletes, seals, handovers and compaction
-//! Knobs: REEL_PWS_SEEDS (default 3), REEL_PWS_FIRST (default 1), REEL_PWS_OPS (ops per writer, default 3000), REEL_PWS_SEED (replays one seed)
+//! A paged walk returns every key live throughout it while writers, seals and compaction run
+//! Knobs: REEL_PWS_SEEDS, REEL_PWS_FIRST, REEL_PWS_OPS, and REEL_PWS_SEED to replay one seed
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
@@ -33,7 +33,7 @@ const TREE: ColumnSet = &[rows()];
 /// Keys written once and never touched again
 const STABLE: u64 = 400;
 
-/// The writers overwrite but never delete these keys, which follow the stable ones
+/// The writers only overwrite these keys, which follow the stable ones
 const LIVE: u64 = 400;
 
 /// The writers overwrite and delete these keys, which follow the live ones
@@ -72,7 +72,7 @@ fn number_of(key: &[u8]) -> u64 {
     u64::from_be_bytes(key[8..16].try_into().expect("a sixteen byte key"))
 }
 
-/// A value that starts with its key's number and op, so a value served under the wrong key fails
+/// A value that opens with its key's number and op, so a misplaced value fails
 fn value_of(n: u64, op: u64, len: usize) -> Vec<u8> {
     let mut value = Vec::with_capacity(16 + len);
     value.extend_from_slice(&n.to_be_bytes());
@@ -103,7 +103,7 @@ struct Walk<'a> {
     shape: &'static str,
 }
 
-/// Check one walk's rows against the keys it crossed that were live throughout, and the values it returned
+/// Check a walk's rows and values against the keys it crossed that stayed live
 fn check_walk(
     store: &ReelStore,
     case: &str,

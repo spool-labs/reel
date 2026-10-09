@@ -25,7 +25,7 @@ const RECORD_KEY_LEN: usize = GROUP_PREFIX_LEN + 32;
 const BLOB_KEY_LEN: usize = 32;
 const ARTIFACT_KEY_LEN: usize = 24;
 
-/// The columns these cases open the reel with, the way any caller declares its own
+/// The columns these tests open the reel with
 const TEST_COLUMNS: ColumnSet = &[
     ColumnSpec {
         id: ColumnId(1),
@@ -80,7 +80,7 @@ fn key(byte: u8) -> RecordKey {
     RecordKey::from_bytes(RECORD, &[byte; 34]).expect("key")
 }
 
-// a reel names segment files with a zero-padded number and suffix
+// a segment file name is a zero-padded number and the suffix
 #[test]
 fn names_segment_files() {
     assert_eq!(segment_file_name(SegmentId(1)), "000001.reel");
@@ -94,7 +94,7 @@ fn parses_segment_numbers() {
     assert_eq!(segment_number("reel.lock"), None);
 }
 
-// a reel runs out of segment numbers rather than wrapping onto a live one
+// a reel refuses to draw past the last segment number and never wraps
 #[test]
 fn refuses_to_wrap_segment_numbers() {
     let (shared, _sim) = harness(1);
@@ -190,7 +190,7 @@ fn reads_back_by_key() {
     assert_eq!(stale, RecordRead::Corrupt);
 }
 
-// an overwritten key's old place still reads its own record, since a keyless record holds no version
+// an old place still reads its own record, since a keyless record holds no version
 #[test]
 fn a_superseded_place_reads_its_own_record() {
     let (shared, _sim) = harness(1);
@@ -266,7 +266,7 @@ fn a_placed_keyless_read_skips_the_check() {
     let mut block = header.pack_in(layout, &payload).as_slice().to_vec();
     block.extend_from_slice(&payload);
     let loc = Loc::new(SegmentId(1), 0, 32);
-    // Read under another segment's key, so the check itself cannot pass.
+    // Read under another segment's key, so the check itself cannot pass
     let other = RecordLayout::Keyless(CheckKey::from_bytes([8; CHECK_KEY_LEN]));
     let read = |loc: Loc, is_verified: bool, is_placed: bool| {
         check_in_block(

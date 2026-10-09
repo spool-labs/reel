@@ -1,10 +1,5 @@
 //! Differential fixture over the harness columns
-//!
-//! Opens a memory store and a reel store over a deterministic simulator, applies one
-//! stream operation to each at once, and checks that everything they serve still agrees.
-//! A reopen flushes and rebuilds the reel from what it made durable while the memory
-//! store keeps its live state, so an equal observation after one means recovery
-//! reproduced the live state exactly.
+//! Applies each stream op to a memory store and a simulated reel and checks they agree
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,35 +14,23 @@ use crate::harness::observe::observe;
 use crate::harness::op_stream::StreamOp;
 use crate::harness::wire::{apply_mutation, group_prefix, wire_key, RECORDS_CF, TEST_COLUMNS};
 
-/// Rounds of driving a guard gives the reel to reach a state the stream should have
-/// taken it to
-///
-/// Counted in passes rather than in seconds, since every round runs the work the state
-/// needs rather than waiting for somebody else to run it. The passes are idempotent, so
-/// a run that has not reached it by here will not reach it at all.
+/// A guard drives the reel this many rounds to reach the state the stream should reach
 const LIVENESS_ROUNDS: u32 = 64;
 
-/// Virtual bulk root the reel simulator files live under
+/// The reel simulator's files live under this virtual root
 const REEL_ROOT: &str = "/bulk";
 
-/// Compaction passes a sampled run takes each time it stops to bound the reel
+/// Each compaction stop runs this many passes
 const COMPACT_PASSES: u32 = 8;
 
 /// Steps between compaction passes inside a default stream
-///
-/// Compaction has to be invisible: it rewrites live records into a new segment, repoints
-/// the index at the copies and retires the source, and none of that may reach what the
-/// store serves.
 const COMPACT_EVERY: usize = 10;
 
-/// Steps between merge passes inside a default stream
-///
-/// Coprime with the cadence above, so a merge lands before, after and between the
-/// compaction passes over a stream.
+/// Steps between merge passes inside a default stream, coprime with `COMPACT_EVERY`
 const MERGE_EVERY: usize = 3;
 
 pub struct Differential {
-    /// The step and op a divergence is reported against
+    /// The last step and op, reported with a divergence
     at_step: Option<(usize, String)>,
 
     /// Runs merged by every store before the current one
@@ -56,25 +39,25 @@ pub struct Differential {
     /// Whether the stream runs compaction passes, off for a merging run
     is_compacting: bool,
 
-    /// The seed this run was drawn from, so a failure names the stream to replay
+    /// The seed this run was drawn from, so a failure points at the stream to replay
     seed: u64,
 
-    /// The oracle every observation is compared against
+    /// The oracle for every observation
     memory: MemoryStore,
 
     /// The store under test
     reel: ReelStore,
 
-    /// The device that store runs over
+    /// The reel's simulated device
     reel_sim: SimIo,
 
-    /// The configuration every reopen rebuilds it with
+    /// Every reopen rebuilds the reel with this configuration
     reel_config: ReelConfig,
 
-    /// The plan every incarnation of the device replays, reopens included
+    /// Every incarnation of the device replays this plan, reopens included
     reel_plan: FaultPlan,
 
-    /// Keys the reel has handed over to a footer across the whole run
+    /// How many keys the reel has handed to a footer across the whole run
     paged_out: usize,
 }
 
@@ -104,12 +87,12 @@ impl Differential {
         }
     }
 
-    /// The same pair, under the name a long soak calls for
+    /// The same pair, for a long soak
     pub fn open_memory_only(seed: u64, reel_config: ReelConfig) -> Differential {
         Differential::open(seed, reel_config)
     }
 
-    /// The same pair with compaction left off, so the sealed segments stand for key merges
+    /// The same pair with compaction off, so sealed segments stay for key merges
     pub fn open_merging(seed: u64, reel_config: ReelConfig) -> Differential {
         Differential {
             is_compacting: false,
@@ -117,11 +100,7 @@ impl Differential {
         }
     }
 
-    /// Open both stores with a plan the reel's device replays
-    ///
-    /// Only a plan that never fails an op belongs here, since the oracle is exact and
-    /// every mutation is expected to succeed. Delays and reordering fit, changing when a
-    /// caller is answered and never what it is answered with.
+    /// Opens both stores with a plan the reel's device replays, which must never fail an op
     pub fn open_with_plan(seed: u64, reel_config: ReelConfig, plan: FaultPlan) -> Differential {
         let mut fixture = Differential::open(seed, reel_config);
         fixture.reopen_device(plan);
@@ -143,7 +122,7 @@ impl Differential {
         self.reel_plan = plan_for_reopen;
     }
 
-    /// Keys the reel has given up to a footer over the whole run
+    /// How many keys the reel has handed to a footer over the whole run
     pub fn paged_out(&self) -> usize {
         self.paged_out
     }
@@ -153,16 +132,12 @@ impl Differential {
         self.merged_before + self.reel.compaction_counters().runs_merged
     }
 
-    /// Faults the reel's device reached, against the count its plan scheduled
+    /// How many faults the reel's device reached, and how many its plan scheduled
     pub fn fault_reach(&self) -> (u64, usize) {
         self.reel_sim.fault_reach()
     }
 
-    /// The stream handed keys over to a footer
-    ///
-    /// Driven rather than read: the handover is a pass this fixture calls, so a run that
-    /// has not paged yet is asked again rather than failed. What runs the bound out is a
-    /// handover that never comes, which is the defect the guard is here for.
+    /// Asserts the stream handed keys over to a footer, driving the handover until it does
     pub fn assert_paged_out(&mut self) {
         let seed = self.seed;
         self.drive_until(
@@ -188,20 +163,14 @@ impl Differential {
         );
     }
 
-    /// Hand over every segment the stream rolled, with nothing left to a clock
-    ///
-    /// A rolled segment seals on the sealer's thread and only a sealed one can give its
-    /// keys up, so the flush is what makes the handover due rather than likely: it
-    /// returns once every footer the stream owed is down. The retry after it takes the
-    /// segments a device failure left footerless, which is a fault landing on the
-    /// sealer's write and so is a property of the interleaving rather than of the seed.
+    /// Flushes, retries broken seals and pages out every segment the stream rolled
     fn hand_over_reel(&mut self) {
         self.reel.flush().expect("flush reel");
         self.reel.retry_broken_seals();
         self.page_out_reel();
     }
 
-    /// Segments standing on the device, which says whether anything sealed at all
+    /// Counts the segment files on the device
     fn segments_standing(&self) -> usize {
         self.reel_sim
             .durable_image()
@@ -210,12 +179,7 @@ impl Differential {
             .count()
     }
 
-    /// Run the passes behind a condition until it holds, or fail on the bound
-    ///
-    /// The bound is rounds of the passes themselves, not seconds: every round flushes,
-    /// which waits the sealer out rather than sleeping past it, so a saturated machine
-    /// makes each round slower and never makes one fewer. What runs the bound out is a
-    /// condition the passes cannot reach, which is the defect the guard is here for.
+    /// Runs the passes behind a condition until it holds, or fails after `LIVENESS_ROUNDS`
     fn drive_until(&mut self, mut reached: impl FnMut(&mut Differential) -> bool, what: &str) {
         for _ in 0..LIVENESS_ROUNDS {
             if reached(self) {
@@ -243,7 +207,7 @@ impl Differential {
             if step % MERGE_EVERY == MERGE_EVERY - 1 {
                 self.merge_reel();
             }
-            // Named, so a divergence reports which op produced it.
+            // Record the step so a divergence reports which op produced it
             self.at_step = Some((step, format!("{op:?}")));
             self.assert_agrees();
         }
@@ -305,9 +269,7 @@ impl Differential {
             StreamOp::IterKeysPrefix { group } => {
                 let prefix = group_prefix(*group);
                 let memory = read_keys(&self.memory, &prefix);
-                // Reads specifically, not the op total: the sealer lands deferred seals
-                // on its own clock, so a write of its can fall inside this window, and the
-                // guard is owed only that the playback fetched no payload.
+                // Count reads only, since the sealer may write in this window on its own clock
                 let before = self.reel_sim.read_count();
                 let reel = read_keys(&self.reel, &prefix);
                 assert_eq!(
@@ -346,7 +308,7 @@ impl Differential {
         self.reel_sim = restored;
     }
 
-    /// Bound the reel pass by pass, on a run that compacts
+    /// Runs `COMPACT_PASSES` compaction passes, on a run that compacts
     fn compact_reel(&self) {
         if !self.is_compacting {
             return;
@@ -362,13 +324,9 @@ impl Differential {
     }
 
     /// Hand the keys of any newly sealed segment over to their footers
-    ///
-    /// Running it after every op of the stream is what puts every op after it through a
-    /// half paged index.
     fn page_out_reel(&mut self) {
         self.paged_out += self.reel.page_out_sealed().expect("page out sealed");
-        // The sweep the maintenance tick would run: agreement is asserted after every op,
-        // and a drop's counters converge at the sweep rather than in the drop itself.
+        // Sweep as the maintenance tick would, since a drop's counters converge at the sweep
         while self.reel.sweep_covers().expect("sweep covers") {}
     }
 
@@ -420,7 +378,7 @@ impl Differential {
     }
 }
 
-/// One key and the size of what it serves, for a failure that has to name keys
+/// One key in hex and the size of its value, for failure messages
 fn describe(key: &[u8], value: &[u8]) -> String {
     let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
     format!("{hex}={}B", value.len())

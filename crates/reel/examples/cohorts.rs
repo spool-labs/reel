@@ -1,9 +1,4 @@
-//! Whole-segment reclaim: two groups dropped by range, then taken back by unlink
-//!
-//! Records are written a group at a time under a shared key prefix, so a group's
-//! records sit together in the log. Dropping two of them costs two range records and
-//! leaves whole segments holding nothing live, which compaction retires by unlinking
-//! the file rather than copying survivors out of it.
+//! Whole-segment reclaim: two key-prefix groups dropped by range, then unlinked
 //!
 //! cargo run --example cohorts
 
@@ -25,7 +20,7 @@ const PAYLOAD_BYTES: usize = 4 * 1024;
 const GROUP_COUNT: u32 = 6;
 const PER_GROUP: u64 = 64;
 
-/// The two groups dropped, and the ceiling on passes driving their space back
+/// The two dropped groups, and the most compaction passes the run allows
 const DROPPED: [u32; 2] = [2, 3];
 const MAX_PASSES: u32 = 200;
 const SETTLE: Duration = Duration::from_millis(10);
@@ -85,8 +80,7 @@ fn main() {
             .delete_range(&start, Some(&group_bound(group + 1)))
             .expect("drop the group");
     }
-    // The bytes a range covers reach the dead gauge on the sweep, so a caller wanting
-    // the whole total runs it out.
+    // Range-deleted bytes reach the dead gauge on the sweep, so run it to the end
     while store.sweep_covers().expect("sweep") {}
 
     let dead_before = store.dead_bytes().to_bytes();
@@ -102,8 +96,7 @@ fn main() {
         if store.compact_once().expect("compact") == CompactPass::Copied {
             passes += 1;
         }
-        // Compaction only takes a segment its sealer has settled, and the sealers
-        // run on their own threads, so the loop waits rather than counting tries.
+        // Compaction only takes segments their sealer has settled, so wait between passes
         sleep(SETTLE);
     }
 

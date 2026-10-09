@@ -1,9 +1,4 @@
 //! Columns, the keys they are addressed by, and the widths those keys take
-//!
-//! A reel holds every column on one log, so a record says which column it belongs
-//! to and how wide its key is. Keys are stored at their own column's width rather
-//! than padded to the widest, and the common widths are carried in place rather
-//! than on the heap, since one is built per record read and written.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -11,28 +6,16 @@ use std::sync::Arc;
 
 use crate::error::{ReelError, Result};
 
-/// Widest key the format carries
-///
-/// A 32 byte id and a name at the 1024 byte ceiling. Nothing is padded to this:
-/// it is what a width field has to be able to say, not a size anything occupies.
+/// The format's widest key, a 32 byte id plus a 1024 byte name
 pub const MAX_KEY_LEN: usize = 1056;
 
-/// Widest key a record's prefix stages, past which a key rides as a shared tail
-///
-/// Every fixed-width column the reel serves sits at or under this, so none of them
-/// splits its record into a second buffer; a wider variable key does.
+/// A record's prefix stages keys up to this width, and a wider key goes as a shared tail
 pub const INLINE_KEY_LEN: usize = 108;
 
-/// Widest key held in the key's own bytes, past which it holds a pointer
-///
-/// Sized so the common fixed widths, a 32 byte id and the 34 byte record key, sit
-/// in place: a walk builds one key per row it steps, and this is what each weighs.
+/// Keys up to this width sit in place, and wider ones go on the heap
 pub const SHORT_KEY_LEN: usize = 40;
 
 /// How a stored payload was encoded, stamped into the record header
-///
-/// Zero is raw bytes and a nonzero byte names the codec that produced the stored
-/// bytes, so a reader needs no column context to open a record.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u8)]
 pub enum Codec {
@@ -67,15 +50,10 @@ impl ColumnId {
     }
 }
 
-/// A key's bytes, carried in place where they fit and on the heap where they do not
-///
-/// Three widths rather than two, because a rebuild holds one of these per record
-/// version and every one of them would otherwise be as wide as the widest key a
-/// prefix stages. A key past the staging width holds an `Arc`, so cloning stays a
-/// refcount rather than a copy of the name, and the type cannot be `Copy`.
+/// A key's bytes, in place where they fit and on the heap where they do not
 #[derive(Clone)]
 pub enum KeyBytes {
-    /// Bytes in place, which is what the common fixed widths carry
+    /// Bytes in place, which fits the common fixed widths
     Inline {
         width: u8,
         bytes: [u8; SHORT_KEY_LEN],
@@ -84,12 +62,12 @@ pub enum KeyBytes {
     /// Bytes on the heap, owned by the one key, still staged in a record's prefix
     Boxed(Box<[u8]>),
 
-    /// Bytes on the heap, shared by refcount rather than copied
+    /// Bytes on the heap, shared by refcount
     Spilled(Arc<[u8]>),
 }
 
 impl KeyBytes {
-    /// A key from its bytes, rejecting one wider than the format carries
+    /// A key from its bytes, rejecting one wider than `MAX_KEY_LEN`
     pub fn new(bytes: &[u8]) -> Result<KeyBytes> {
         if bytes.len() > MAX_KEY_LEN {
             return Err(ReelError::Rejected(format!(
@@ -111,7 +89,7 @@ impl KeyBytes {
         })
     }
 
-    /// The empty key, which control records that address nothing carry
+    /// The empty key of a control record
     pub fn empty() -> KeyBytes {
         KeyBytes::Inline {
             width: 0,
@@ -128,7 +106,7 @@ impl KeyBytes {
         }
     }
 
-    /// Bytes this key occupies on disk and in an index
+    /// The key's width in bytes
     pub fn width(&self) -> u16 {
         match self {
             KeyBytes::Inline { width, .. } => u16::from(*width),
@@ -137,9 +115,7 @@ impl KeyBytes {
         }
     }
 
-    /// The heap bytes themselves, for a writer that would rather point than copy
-    ///
-    /// Nothing for a key the prefix stages, which is already copied into it.
+    /// The shared heap bytes of a key the prefix does not stage
     pub fn spilled_bytes(&self) -> Option<Arc<[u8]>> {
         match self {
             KeyBytes::Inline { .. } | KeyBytes::Boxed(_) => None,
@@ -185,28 +161,22 @@ impl fmt::Debug for KeyBytes {
 }
 
 /// The full address of one record: its column and its key within that column
-///
-/// Not `Copy`, because a key that can spill to the heap cannot be. Cloning one is
-/// a memcpy of the inline buffer or a refcount bump, never a copy of a name.
 #[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RecordKey {
-    /// Column the record belongs to
+    /// The record's column
     pub column: ColumnId,
 
-    /// Key within the column, at the column's declared width
+    /// The key within the column, at the column's width
     pub key: KeyBytes,
 }
 
 /// A record's address borrowed from wherever the caller already holds the bytes
-///
-/// Sixteen bytes whatever the key's width, so a read path never owns a key beside
-/// the buffer it was already lent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyRef<'bytes> {
-    /// Column the record belongs to
+    /// The record's column
     pub column: ColumnId,
 
-    /// The key's bytes, at the column's declared width
+    /// The key's bytes, at the column's width
     pub bytes: &'bytes [u8],
 }
 
@@ -221,12 +191,12 @@ impl<'bytes> KeyRef<'bytes> {
         self.bytes
     }
 
-    /// Bytes the key occupies, which is what a record's prefix is sized by
+    /// The key's width in bytes
     pub fn width(&self) -> usize {
         self.bytes.len()
     }
 
-    /// An owned key, for the one path that keeps one
+    /// An owned copy of the key
     pub fn to_owned_key(&self) -> Result<RecordKey> {
         RecordKey::from_bytes(self.column, self.bytes)
     }
@@ -253,7 +223,7 @@ impl RecordKey {
         self.key.as_slice()
     }
 
-    /// This key borrowed, for the read paths that only read it
+    /// This key, borrowed
     pub fn as_ref(&self) -> KeyRef<'_> {
         KeyRef {
             column: self.column,
@@ -261,31 +231,24 @@ impl RecordKey {
         }
     }
 
-    /// Bytes the key occupies
+    /// The key's width in bytes
     pub fn width(&self) -> u16 {
         self.key.width()
     }
 }
 
-/// What a column's keys measure, which is a width or the absence of one
-///
-/// A fixed column's width is what a footer partition strides by and what the
-/// index monomorphises over; a variable column has neither. The distinction is a
-/// type so a variable column cannot be declared as some number and strided by it.
+/// A column's key width, fixed or variable
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeyWidth {
     /// Every key in the column is exactly this many bytes
     Fixed(u16),
 
-    /// Keys run to whatever they run to, up to the format's ceiling
+    /// Keys of any width up to `MAX_KEY_LEN`
     Variable,
 }
 
 impl KeyWidth {
     /// The width, for a column that has one
-    ///
-    /// Nothing for a variable column, whose caller has to read each record's own
-    /// width instead.
     pub fn fixed(self) -> Option<u16> {
         match self {
             KeyWidth::Fixed(width) => Some(width),
@@ -303,36 +266,33 @@ impl KeyWidth {
 }
 
 /// One column the reel serves and the shape of the keys it holds
-///
-/// Shards split the column by leading key bytes, so writers to unrelated parts do
-/// not contend and a playback is the shards in turn.
 pub struct ColumnSpec {
     /// Identifier stamped into every record of the column
     pub id: ColumnId,
 
-    /// Column family name the store trait addresses the column by
+    /// The column family name the store trait uses
     pub name: &'static str,
 
-    /// How wide the keys in this column are, or that they are not one width
+    /// The width of the column's keys
     pub key_width: KeyWidth,
 
-    /// Leading key bytes that select the index shard a key lives in
+    /// This many leading key bytes select a key's index shard
     pub shard_bytes: u8,
 
     /// Where a key says the record dies
     pub purge_mark: Option<PurgeMark>,
 
-    /// Codec attempted on this column's payloads at admission, not promised
+    /// The codec tried on this column's payloads at admission
     pub codec: Codec,
 }
 
-/// Bytes a purge mark takes within a key
+/// Length of a purge mark within a key
 pub const MARK_LEN: usize = 8;
 
 /// Where a column's keys say the record dies
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PurgeMark {
-    /// Bytes into a key where the big endian u64 sits
+    /// Offset of the big endian u64 within a key
     pub at: u8,
 }
 
@@ -345,7 +305,7 @@ impl PurgeMark {
     /// Where this key sits on the purge timeline
     pub fn read(&self, key: &[u8]) -> u64 {
         let at = self.at as usize;
-        // A key too short to carry the mark reads as the bottom, so it is purged.
+        // A key too short to hold the mark reads as the bottom, so it is purged
         let Some(bytes) = key.get(at..at + MARK_LEN) else {
             return 0;
         };
@@ -366,10 +326,7 @@ impl ColumnSpec {
         1usize << (8 * self.shard_bytes as usize)
     }
 
-    /// Which shard a key belongs to, from its leading bytes
-    ///
-    /// A lookup may be handed a bound rather than a key, so bytes short of the
-    /// shard prefix read as zero.
+    /// Which shard a key belongs to, from its leading bytes, reading missing bytes as zero
     pub fn shard_of(&self, key: &[u8]) -> usize {
         let mut shard = 0usize;
         for at in 0..self.shard_bytes as usize {
@@ -436,7 +393,7 @@ mod tests {
         assert!(KeyBytes::new(&[0u8; MAX_KEY_LEN + 1]).is_err());
     }
 
-    // keys order lexicographically over their used bytes, not their padding
+    // keys order lexicographically over their used bytes
     #[test]
     fn key_order() {
         let low = KeyBytes::new(&[1u8, 0xff]).expect("key");
@@ -499,7 +456,7 @@ mod tests {
         assert_eq!(spec().mark_of(&key), None);
     }
 
-    /// An unmarked declaration the mark tests vary one field of
+    /// An unmarked column for the mark tests to vary
     fn spec() -> ColumnSpec {
         ColumnSpec {
             id: ColumnId(1),

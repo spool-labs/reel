@@ -1,10 +1,4 @@
 //! Observable state extracted from any store over the harness columns
-//!
-//! Every backend is scanned through the store trait and reduced to the same snapshot:
-//! an ordered dump of the record column, the global live count and bytes, and those
-//! totals split per group. The dump is the ground truth a differential run compares
-//! across backends, and the totals are what a crash recount checks the counters
-//! against.
 
 use std::collections::BTreeMap;
 
@@ -59,9 +53,7 @@ pub fn observe<Backend: Store>(store: &Backend) -> Observation {
         let count = store
             .count_prefix(RECORDS_CF, &prefix)
             .expect("count a group");
-        // The failure names keys rather than only numbers: the walk and the dump take
-        // the same keys from the same index and part company at the payload, so a key
-        // in one and not the other is a key whose value the store could not produce.
+        // On a mismatch, list the keys the walk has and the dump lacks
         if count != totals.count {
             let walked = store
                 .iter_keys_prefix(RECORDS_CF, &prefix)
@@ -88,8 +80,7 @@ pub fn observe<Backend: Store>(store: &Backend) -> Observation {
     let whole = store
         .count_prefix(RECORDS_CF, &[])
         .expect("count every group");
-    // This is the one that catches a key whose group the dump never saw at all, since
-    // the loop above only visits groups the dump already knows about.
+    // The whole-store count catches a key in a group the dump never saw
     if whole != global.count {
         let walked = store
             .iter_keys_prefix(RECORDS_CF, &[])
@@ -131,7 +122,7 @@ fn group_of(key: &[u8]) -> u16 {
     u16::from_be_bytes([key[0], key[1]])
 }
 
-/// A key as hex, for a failure that has to name one
+/// A key as hex, for a failure message
 fn hex(key: &[u8]) -> String {
     key.iter().map(|byte| format!("{byte:02x}")).collect()
 }

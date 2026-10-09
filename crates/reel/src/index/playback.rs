@@ -1,11 +1,4 @@
 //! One ordered run of a paged column, taken from the map and the footers at once
-//!
-//! A paged column holds its keys in two places: the map has what no footer covers
-//! yet, and every sealed segment has a sorted run of its own. Both are already in
-//! key order, so a playback is a merge rather than a sort. Three rules decide a
-//! merged key: one the map holds wins outright, among footers the highest sequence
-//! number wins since a segment number is not a version, and the map is asked about
-//! every footer key before its row is believed.
 
 use std::sync::Arc;
 
@@ -36,7 +29,7 @@ pub struct Paged<'a> {
     /// What each of its sealed segments covers, so most can be ruled out
     pub sealed: &'a SealedRanges,
 
-    /// Where the footers themselves are read from, held by count so a key run's reader outlives one page
+    /// The footer source, shared by count so a key run's reader outlives one page
     pub footers: &'a Arc<dyn FooterSource>,
 
     /// Walks keep their opened runs here while the sealed set stands
@@ -50,7 +43,7 @@ pub struct Paged<'a> {
 }
 
 impl Paged<'_> {
-    /// Where the walk's runs stand: the sealed set and the key runs, each only ever growing
+    /// The generation of the walk's runs, from the sealed set and the key runs, which only grow
     fn generation(&self) -> u64 {
         self.sealed
             .generation()
@@ -58,7 +51,7 @@ impl Paged<'_> {
     }
 }
 
-/// A column keeps its opened runs in this many slots, so walks on different threads share none
+/// A column keeps its opened runs in this many slots, so walks on other threads rarely share one
 const RUN_SLOTS: usize = 16;
 
 /// Hands out each thread's run slot, once
@@ -73,8 +66,6 @@ thread_local! {
 pub struct RunSet {
     generation: u64,
     runs: Vec<Run>,
-
-    /// The life every segment the runs reach into wore when they were opened, by segment
     stamps: Vec<(SegmentId, SegmentIncarnation)>,
 }
 
@@ -195,10 +186,10 @@ fn lead_window(leads: &[u64], key: &[u8], count: usize) -> (usize, usize) {
     )
 }
 
-/// A key run cursor's place, and the row it stands on when it stands on one, its key copied into the caller's buffer
+/// A key run cursor's place and its row, if any, with the key copied into the caller's buffer
 type KeyRunPlace = (Head, Option<RunRow>);
 
-/// Where a cursor opened at a bound first stands in a key run's column, and the key and row it stands on
+/// Where a cursor opened at a bound first stands in a key run's column, with its key and row
 fn key_run_head(
     run: &KeyRun,
     column: &RunColumn,
@@ -473,7 +464,7 @@ impl Sealed {
     fn front_on(&self, key: &[u8], lead: u128) -> Option<usize> {
         let at = *self.tree.first()?;
         let head = &self.heads[at];
-        // A lead that differs settles it without reading the cursor's key, and so does a short key's length
+        // A differing lead or a short key's length settles it without reading the cursor's key
         if head.is_spent || head.lead != lead {
             return None;
         }
@@ -513,7 +504,7 @@ impl Sealed {
         Ok(newest)
     }
 
-    /// Step every cursor past a key, handing each of its rows over with the segment its record is in
+    /// Step every cursor past a key, handing over each of its rows with its record's segment
     fn each_row(
         &mut self,
         way: Way,
@@ -614,7 +605,7 @@ impl Sealed {
         self.tree[0] = winner;
     }
 
-    /// Whether one cursor's key comes before another's, a spent cursor sorting behind every live one
+    /// Whether one cursor's key comes first, with a spent cursor sorting behind every live one
     fn ahead(&self, way: Way, left: usize, right: usize) -> bool {
         let (one, other) = (&self.heads[left], &self.heads[right]);
         if one.is_spent || other.is_spent {
@@ -641,13 +632,11 @@ impl Sealed {
 }
 
 /// Where one playback has reached, and the sources it is reading to get there
-///
-/// Every page wants the same cursors standing where the last page left them, since
-/// rebuilding them per page would cost a footer fetch per segment per page. Held by
-/// the caller, since two playbacks of one column are two places in it.
 pub struct PlaybackCursor {
-    /// The column being played and the direction it is crossed in
+    /// The column being played
     column: ColumnId,
+
+    /// Which way the playback crosses it
     way: Way,
 
     /// Where the next page starts, or nothing once the playback has run out
@@ -740,25 +729,17 @@ impl PlaybackCursor {
     }
 
     /// Where the playback stands, enough to put it back if a page is abandoned
-    ///
-    /// A page filled without the publish barrier has already carried the playback
-    /// past itself by the time the fill learns a batch landed under it.
     pub(crate) fn mark(&self) -> Option<Bound<KeyBytes>> {
         self.at.clone()
     }
 
     /// Put the playback back where a mark was taken, so its page can be filled again
-    ///
-    /// The open cursors are opened again rather than wound back, since they stand
-    /// wherever the abandoned page left them and nothing here knows how far that was.
     pub(crate) fn rewind(&mut self, mark: &Option<Bound<KeyBytes>>) {
         self.at = mark.clone();
         self.generation = None;
     }
 
-    /// Fill a page from the column's own map and carry the playback past it
-    ///
-    /// What a column with nothing sealed answers with.
+    /// Fill a page from a column's map when nothing is sealed, and move the playback past it
     pub fn page_resident(
         &mut self,
         index: &ColumnIndex,
@@ -773,10 +754,7 @@ impl PlaybackCursor {
         self.advance(out, limit)
     }
 
-    /// Carry the playback past the last key a page delivered
-    ///
-    /// A page that came back short is the end of the column, so the playback stops
-    /// there rather than asking again for what is not coming.
+    /// Move the playback past the last key a page delivered, stopping at a short page
     fn advance(&mut self, page: &KeyPage, wanted: usize) -> Result<()> {
         let last = match page.is_empty() {
             true => None,
@@ -788,10 +766,7 @@ impl PlaybackCursor {
         Ok(())
     }
 
-    /// Where the next run picks up, given what this one delivered
-    ///
-    /// A run that filled what was asked of it resumes strictly past its own last key;
-    /// a short one is the end of the playback.
+    /// Where the next run picks up, past the last key of a full run, or nowhere after a short one
     fn resume_after(&mut self, last: Option<KeyBytes>, filled: usize, wanted: usize) {
         self.at = match last {
             Some(last) if filled == wanted && wanted > 0 => Some(Bound::Excluded(last)),
@@ -799,10 +774,7 @@ impl PlaybackCursor {
         };
     }
 
-    /// Open the cursors, or reopen them if the sealed set has moved under the playback
-    ///
-    /// Reopening puts them where the playback has reached rather than where it began,
-    /// so a segment sealing mid-playback is picked up without redelivering pages.
+    /// Open the cursors, or reopen them where the playback has reached if the sealed set moved
     fn open(&mut self, paged: &Paged<'_>) -> Result<()> {
         let generation = paged.generation();
         if self.generation == Some(generation) {
@@ -820,7 +792,7 @@ impl PlaybackCursor {
 /// A page fill tries this many times when a segment a key run points into retires under it
 const REFILLS: usize = 8;
 
-/// Fill a page with one merged run of a paged column's keys, starting again when a segment retires under it
+/// Fill a page with one merged run of a paged column's keys, retrying when a segment retires
 pub fn merged_page(
     paged: &Paged<'_>,
     playback: &mut PlaybackCursor,
@@ -841,9 +813,6 @@ pub fn merged_page(
 }
 
 /// One try at a merged page
-///
-/// The map's own page is taken first, since it both supplies keys and says how far
-/// the run may reach. What comes back is a contiguous run in playback order.
 fn fill_merged_page(
     paged: &Paged<'_>,
     playback: &mut PlaybackCursor,
@@ -856,7 +825,7 @@ fn fill_merged_page(
     if limit == 0 {
         return Ok(());
     }
-    // A hand-over moves a key from the map to a footer and compaction moves one back, so the map page stands only if the sealed set held still around it
+    // Keys move between map and footers, so the map page stands only if the sealed set held still
     loop {
         playback.open(paged)?;
         let Some(at) = playback.at.as_ref() else {
@@ -877,15 +846,14 @@ fn fill_merged_page(
     let PlaybackCursor {
         sealed, resident, ..
     } = playback;
-    // A page that came back full says nothing about the keys past its last, so the
-    // merge stops there rather than emitting a footer key over an unread one.
+    // A full map page says nothing past its last key, so the merge stops at that edge
     let edge = (resident.len() == limit)
         .then(|| resident.key_ref(limit - 1))
         .flatten();
 
     let mut taken = 0usize;
     let mut want = [0u8; MAX_KEY_LEN];
-    // The next page resumes past the last key decided, grave or not, copied since a peek reuses `want`
+    // Resume past the last key decided, grave or not, copied since a peek reuses `want`
     let mut resume = [0u8; MAX_KEY_LEN];
     let mut resume_len = 0usize;
     let mut exhausted = false;
@@ -959,14 +927,14 @@ pub fn resident_page(
 
 /// What one bounded release run covered
 pub struct ReleaseRun {
-    /// Key the next run resumes from, or nothing when the range is exhausted
+    /// The key the next run resumes from, or nothing when the range is exhausted
     pub resume: Option<Vec<u8>>,
 
-    /// Keys the run examined, the budget it spent
+    /// How many keys the run examined, which is the budget it spent
     pub examined: usize,
 }
 
-/// Every standing data row a cover has taken, the budget counting keys examined so a run of skips still moves
+/// Every standing data row a cover has taken, with a budget of keys examined so skips still move
 pub fn release_rows(
     paged: &Paged<'_>,
     playback: &mut PlaybackCursor,
@@ -1034,9 +1002,7 @@ fn fill_release_rows(
         })?;
     }
 
-    // The next run starts at the key straight after the last one examined, and
-    // rebuilding the cursor from that bound is what makes a segment sealing between
-    // runs safe: its rows below the bound belong to keys the map still holds.
+    // The next run starts right after the last key examined, which keeps a seal between runs safe
     Ok(ReleaseRun {
         resume: successor(&want[..last_len]),
         examined,
@@ -1058,7 +1024,7 @@ fn successor(key: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Copy a borrowed bound, for a playback that carries its place between pages
+/// Copy a borrowed bound, for a playback that keeps its place between pages
 fn owned_bound(bound: Bound<&[u8]>) -> Result<Bound<KeyBytes>> {
     Ok(match bound {
         Bound::Unbounded => Bound::Unbounded,
@@ -1067,7 +1033,7 @@ fn owned_bound(bound: Bound<&[u8]>) -> Result<Bound<KeyBytes>> {
     })
 }
 
-/// Borrow a carried bound back
+/// Borrow an owned bound back
 fn borrowed_bound(bound: &Bound<KeyBytes>) -> Bound<&[u8]> {
     match bound {
         Bound::Unbounded => Bound::Unbounded,
@@ -1084,7 +1050,7 @@ impl Paged<'_> {
             let mut runs = Vec::new();
             // Key runs stand in for the segments they cover, so those footers stay shut
             let covered = self.key_runs.covered();
-            // Every segment a row can name is stamped now, so a read later knows whether its place still stands
+            // Stamp every segment a row can point at, so a later read knows if its place stands
             let mut stamps: Vec<(SegmentId, SegmentIncarnation)> = covered
                 .iter()
                 .map(|segment| (*segment, self.segments.incarnation_of(*segment)))
@@ -1119,7 +1085,7 @@ impl Paged<'_> {
                     .iter()
                     .position(|held| held.column == self.column)
                 {
-                    // A segment retired before the open has its live records in the map or a newer footer
+                    // Rows of a segment retired before the open live in the map or a newer footer
                     let views =
                         Arc::new(RunViews::new(&run, &|segment| self.sealed.holds(segment)));
                     runs.push(Run::Keys { run, column, views });
@@ -1169,10 +1135,7 @@ impl Paged<'_> {
     }
 }
 
-/// The next key in playback order across the map's page and every open cursor
-///
-/// Copied into the caller's buffer rather than borrowed from whichever source won,
-/// since the merge steps those sources while it still has the key in hand.
+/// The next key in playback order across the map's page and every cursor, copied to `want`
 fn next_key<'a>(
     resident: Option<&[u8]>,
     sealed: &Sealed,
@@ -1216,7 +1179,7 @@ mod tests {
 
     const COLUMN: ColumnId = ColumnId(1);
 
-    /// Keys per page the fixture pages in, small enough to take several
+    /// The fixture pages this many keys at a time, so a playback takes several pages
     const PAGE: usize = 2;
 
     const SPEC: ColumnSpec = ColumnSpec {
@@ -1250,8 +1213,6 @@ mod tests {
         index: ColumnIndex,
         sealed: SealedRanges,
         footers: Arc<CountingFooters>,
-
-        /// The same footers as the walk asks for them
         source: Arc<dyn FooterSource>,
         runs: WalkRuns,
         key_runs: KeyRunSet,
@@ -1316,7 +1277,7 @@ mod tests {
             );
         }
 
-        /// Take one page, and say which keys it carried
+        /// Take one page and list the keys it held
         fn page(&self, playback: &mut PlaybackCursor, page: &mut KeyPage) -> Vec<u8> {
             merged_page(&self.paged(), playback, PAGE, page).expect("page");
             (0..page.len()).map(|row| page.key_at(row)[0]).collect()
@@ -1446,7 +1407,7 @@ mod tests {
         let mut page = KeyPage::with_lens();
         assert_eq!(fixture.page(&mut playback, &mut page), vec![1, 2]);
 
-        // The second segment seals while the playback is partway through the first.
+        // The second segment seals while the playback is partway through the first
         fixture.seal(SegmentId(2), 5, 6);
 
         assert_eq!(

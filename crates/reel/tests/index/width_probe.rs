@@ -1,8 +1,4 @@
 //! The shipped node widths against BTreeMap, on integer and on byte keys
-//!
-//! Every op is applied to both and compared. The walks and ranges are checked
-//! periodically rather than per op, so a run reaches the widths where a node has
-//! split and merged many times over.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -12,7 +8,7 @@ use rand::{Rng, SeedableRng};
 
 use reel::index::tbtreemap::{node_width, TBTreeMap, NODE_WIDTH};
 
-/// Nodes a tree of record keys holds, which the budget makes an odd number
+/// Keys per node in a tree of 34-byte record keys
 const RECORD_NODES: usize = node_width(34);
 
 // integer keys at the shipped node width answer what BTreeMap answers
@@ -24,7 +20,7 @@ fn integer_keys_at_shipped_width() {
         let mut model: BTreeMap<u64, u64> = BTreeMap::new();
 
         for op in 0..60_000u64 {
-            // Ascending with occasional scatter, the segment id and lsn shape.
+            // Mostly ascending with some scatter, like segment ids and lsns
             let key = match rng.gen_range(0..10) {
                 0..=6 => op / 3,
                 7 => rng.gen_range(0..op + 1),

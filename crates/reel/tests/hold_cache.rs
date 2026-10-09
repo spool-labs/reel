@@ -1,11 +1,4 @@
 //! The held-entry slab against a ring written the obvious way
-//!
-//! The oracle is a plain vector with a hand walked over it, which is what the caches
-//! this replaces documented and could not run: a hash map has no stable hand, so the
-//! fd cache's sweep took whatever iteration order handed it and the block cache did
-//! not sweep at all. Held one shard against one ring, the two have to agree entry for
-//! entry after every op. Across shards the questions are the ones a shard split does
-//! not change: what a hit answers, what a retire takes, and that the bound holds.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -16,14 +9,13 @@ use reel::format::column::ColumnId;
 use reel::format::loc::SegmentId;
 use reel::hold::{hold_key, Hold};
 
-/// Entries the single-shard streams work over
+/// The single-shard streams work over this many keys
 const KEYS: u64 = 64;
 
-/// Ops the shortest stream applies, the rest running one longer apiece
+/// The shortest stream applies this many ops, and each later seed one more
 const OPS: usize = 200;
 
-/// The map and the queue the cache was, which is what a hold with nothing read
-/// behaves exactly like
+/// The old cache's map and queue, which an unread hold matches exactly
 struct Oracle {
     budget: usize,
     held: HashMap<u64, (u64, usize)>,
@@ -67,7 +59,7 @@ fn key_of(at: u64) -> u64 {
     hold_key(SegmentId(1), ColumnId(0), at as usize)
 }
 
-/// Everything the hold answers about the keys in play, against the queue
+/// Checks everything the hold answers about the keys in play against the queue
 fn agree(hold: &Hold<u64>, oracle: &Oracle, step: usize) {
     for at in 0..KEYS {
         let key = key_of(at);
@@ -83,24 +75,16 @@ fn agree(hold: &Hold<u64>, oracle: &Oracle, step: usize) {
 }
 
 // with nothing read and one entry given up per insert, the hand is the queue
-//
-// Clock falls back to the order of arrival exactly when every insert takes one
-// entry and puts one back, which is the regime the deque this replaces was always
-// in. Uneven weights break the equality rather than the policy: an insert that has
-// to take three back leaves slots the hand meets in its own order, and which of
-// three cold entries goes is what owning the eviction was for.
 #[test]
 fn an_unread_hold_of_even_weights_evicts_like_the_deque() {
     for seed in 0..64u64 {
-        // Small enough that the hold stays one shard, so the hand is the one thing
-        // being compared rather than which shard a key landed in.
+        // Small enough that the hold stays one shard, so only the hand is compared
         let budget = 40;
         let hold: Hold<u64> = Hold::new(budget, budget);
         let mut oracle = Oracle::new(budget);
         let mut rng = SmallRng::seed_from_u64(seed);
 
-        // Asking what the hold holds is itself a read, so the two are held up once
-        // at the end and the stream length is what varies instead.
+        // Asking the hold is a read, so compare once at the end and vary the stream length
         let ops = OPS + seed as usize;
         for _ in 0..ops {
             let at = rng.gen_range(0..KEYS);
@@ -128,8 +112,7 @@ fn uneven_weights_still_hold_the_same_bound() {
             oracle.insert(key_of(at), at, weight);
             assert!(hold.bytes() <= budget, "the bound broke on seed {seed}");
         }
-        // Both are full to within one entry of the bound, which is what the eviction
-        // loop promises; which entries fill it is the hand's business.
+        // Both stay within one entry of the bound, as the eviction loop promises
         assert!(
             hold.bytes() > budget - 6,
             "the hold gave up more than it had to"
@@ -143,8 +126,7 @@ fn uneven_weights_still_hold_the_same_bound() {
 fn a_hit_always_answers_with_what_was_held() {
     let budget = 40;
     let hold: Hold<u64> = Hold::new(budget, budget);
-    // Every value ever put under a key, since a key evicted and put back holds the
-    // newer one and the question here is whether a hit ever answers for another key.
+    // Every value ever put under a key, since a key evicted and put back holds the newer one
     let mut written: HashMap<u64, HashSet<u64>> = HashMap::new();
     let mut rng = SmallRng::seed_from_u64(21);
 
@@ -173,16 +155,13 @@ fn a_hit_always_answers_with_what_was_held() {
 }
 
 // an entry read since the hand passed it outlives the sweep that makes room
-//
-// The policy the fd cache documented and a hash map's iteration order could not
-// run, and the one `insert_block` did not attempt at all.
 #[test]
 fn a_read_entry_outlives_a_sweep() {
     let hold: Hold<u64> = Hold::new(4, 4);
     for at in 0..4 {
         hold.insert(key_of(at), at, 1);
     }
-    // The oldest is read, so strict insertion order would take it and clock does not.
+    // Read the oldest, so clock keeps it where strict insertion order would evict it
     assert_eq!(hold.get(key_of(0)), Some(0));
     hold.insert(key_of(4), 4, 1);
 
@@ -267,7 +246,7 @@ fn the_bound_holds_across_shards() {
     assert!(hold.is_empty());
 }
 
-// an entry heavier than the whole hold is turned away rather than emptying it
+// an entry heavier than the whole hold is turned away and the rest stay
 #[test]
 fn an_oversized_entry_keeps_the_rest() {
     let hold: Hold<u64> = Hold::new(64, 64);

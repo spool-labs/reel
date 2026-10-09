@@ -1282,23 +1282,30 @@ impl Compactor {
             }
         };
         let mut reader = SegmentReader::new(&shared.driver, handle.file(), region_end);
-        if handle.layout().is_keyless_layout() {
+        // A sealed segment is walked by its rows, so a given-back hole never ends the walk early
+        match (
+            shared.footer_of(handle.id())?,
+            handle.layout().is_keyless_layout(),
+        ) {
+            (Some(footer), _) => {
+                let walk = RowScrub {
+                    index,
+                    segment,
+                    layout: handle.layout(),
+                    region_end,
+                    deadline,
+                };
+                return self.scrub_rows(shared, &walk, &mut reader, &footer, from, carried, budget);
+            }
             // an unsealed keyless segment holds no record the index points at
-            let Some(footer) = shared.footer_of(handle.id())? else {
+            (None, true) => {
                 return Ok(ScrubStep {
                     hits: 0,
                     dead: carried,
                     resume_at: None,
-                });
-            };
-            let walk = KeylessScrub {
-                index,
-                segment,
-                layout: handle.layout(),
-                region_end,
-                deadline,
-            };
-            return self.scrub_keyless(shared, &walk, &mut reader, &footer, from, carried, budget);
+                })
+            }
+            (None, false) => {}
         }
         let mut scan = RecordScan::resuming(&mut reader, from);
 
@@ -1370,8 +1377,8 @@ impl Compactor {
     }
 }
 
-/// Where one keyless scrub pass reads and when it has to stop
-struct KeylessScrub<'a> {
+/// Where one scrub pass over a sealed segment reads and when it has to stop
+struct RowScrub<'a> {
     index: &'a ReelIndex,
     segment: SegmentId,
     layout: RecordLayout,
@@ -1380,12 +1387,12 @@ struct KeylessScrub<'a> {
 }
 
 impl Compactor {
-    /// Scrub a keyless segment's rows in offset order, from the first row at or past `from`
+    /// Scrub a sealed segment by its rows in offset order, from the first row at or past `from`
     #[allow(clippy::too_many_arguments)]
-    fn scrub_keyless(
+    fn scrub_rows(
         &self,
         shared: &Arc<ReelShared>,
-        walk: &KeylessScrub<'_>,
+        walk: &RowScrub<'_>,
         reader: &mut SegmentReader<'_>,
         footer: &SegmentFooter,
         from: u64,

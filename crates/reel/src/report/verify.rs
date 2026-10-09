@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use crate::engine::ReelStore;
 use crate::format::column::RecordKey;
 use crate::format::journal::read_groups;
-use crate::format::loc::SegmentId;
+use crate::format::loc::{Loc, SegmentId};
+use crate::format::lsn::Lsn;
 use crate::format::record::{
     check_keyless, Flags, KeylessRead, RecordHeader, RecordLayout, HEADER_LEN, KEYLESS_PREFIX,
 };
@@ -40,6 +41,9 @@ pub struct VerifyRow {
     /// Records that would not read or would not match
     pub faults: u64,
 
+    /// Records a newer version or a delete has replaced, which no read reaches and the sweep skips
+    pub dead: u64,
+
     /// The first fault, which the report shows
     pub fault: Option<String>,
 }
@@ -53,6 +57,7 @@ impl VerifyRow {
             records: 0,
             bytes: 0,
             faults: 0,
+            dead: 0,
             fault: None,
         }
     }
@@ -98,6 +103,9 @@ pub struct VerifyReport {
 
     /// Records that would not read or would not match
     pub faults: u64,
+
+    /// Records no read reaches, left unchecked
+    pub dead: u64,
 
     /// Reads the engine itself failed before this sweep began
     pub unreadable_records: u64,
@@ -182,6 +190,7 @@ pub fn verify_watched(
         records: rows.iter().map(|row| row.records).sum(),
         bytes: rows.iter().map(|row| row.bytes).sum(),
         faults: rows.iter().map(|row| row.faults).sum(),
+        dead: rows.iter().map(|row| row.dead).sum(),
         unreadable_records: engine.unreadable_records(),
         caveats: caveats(&not_indexed, engine.unreadable_records()),
         not_indexed,
@@ -377,11 +386,17 @@ fn sweep(engine: &ReelStore, file: &SegmentFile, indexed: bool, watch: &mut Watc
             let mut listed = Vec::new();
             for entry in footer.entries() {
                 match entry {
-                    Ok(entry) => listed.push((entry.key, entry.offset, entry.len, entry.flags)),
+                    Ok(entry) => listed.push(Listed {
+                        key: entry.key,
+                        lsn: entry.lsn,
+                        offset: entry.offset,
+                        len: entry.len,
+                        flags: entry.flags,
+                    }),
                     Err(error) => row.fault(format!("footer row does not decode: {error}")),
                 }
             }
-            sweep_rows(&mut file, listed, layout, &mut row, watch);
+            sweep_rows(engine, segment, &mut file, listed, layout, &mut row, watch);
         }
         Ok(None) => {
             // A file shorter than its rows offset was sealed, so only a footer lists its records
@@ -399,9 +414,15 @@ fn sweep(engine: &ReelStore, file: &SegmentFile, indexed: bool, watch: &mut Watc
             let listed = groups
                 .into_iter()
                 .flatten()
-                .map(|entry| (entry.key, entry.offset, entry.len, entry.flags))
+                .map(|entry| Listed {
+                    key: entry.key,
+                    lsn: entry.lsn,
+                    offset: entry.offset,
+                    len: entry.len,
+                    flags: entry.flags,
+                })
                 .collect();
-            sweep_rows(&mut file, listed, layout, &mut row, watch);
+            sweep_rows(engine, segment, &mut file, listed, layout, &mut row, watch);
         }
         Err(error) => row.fault(format!("footer does not parse: {error}")),
     }
@@ -427,17 +448,47 @@ fn layout_of(file: &mut File) -> (RecordLayout, u64) {
     }
 }
 
-/// Check every record a footer or a journal lists, against the row it came through
+/// A record a footer or a journal lists
+struct Listed {
+    key: RecordKey,
+    lsn: Lsn,
+    offset: u32,
+    len: u32,
+    flags: Flags,
+}
+
+/// Check every live record a footer or a journal lists, against the row it came through
 fn sweep_rows(
+    engine: &ReelStore,
+    segment: SegmentId,
     file: &mut File,
-    mut listed: Vec<(RecordKey, u32, u32, Flags)>,
+    mut listed: Vec<Listed>,
     layout: RecordLayout,
     row: &mut VerifyRow,
     watch: &mut Watch,
 ) {
     // Sort by offset so the file is read front to back
-    listed.sort_unstable_by_key(|(_, offset, _, _)| *offset);
-    for (key, offset, len, flags) in listed {
+    listed.sort_unstable_by_key(|listed| listed.offset);
+    // Only a column the volume was opened with can say which of its versions are replaced
+    let known = engine.columns();
+    for Listed {
+        key,
+        lsn,
+        offset,
+        len,
+        flags,
+    } in listed
+    {
+        // A replaced version is never read again, and its bytes may already be given back
+        let loc = Loc::new(segment, offset, len);
+        let is_known = known.iter().any(|spec| spec.id == key.column);
+        if flags.is_data()
+            && is_known
+            && engine.index().is_live_at(&key, loc, lsn).ok() == Some(false)
+        {
+            row.dead += 1;
+            continue;
+        }
         let Some(check) = layout.keyless_key(len) else {
             match keyed(file, u64::from(offset), key.width(), len) {
                 Ok(span) => {
@@ -518,6 +569,7 @@ impl Report for VerifyReport {
             .facts([
                 ("volume".to_string(), self.volume.clone()),
                 ("records checked".to_string(), self.records.to_string()),
+                ("replaced, skipped".to_string(), self.dead.to_string()),
                 ("bytes checked".to_string(), fmt::bytes(self.bytes)),
             ])
             .notes("faults", Tone::Bad, self.faults())
@@ -531,9 +583,9 @@ impl Report for VerifyReport {
                 "checked",
                 [
                     "every sealed segment's footer decodes",
-                    "every record a footer indexes matches its checksum",
+                    "every live record a footer indexes matches its checksum",
                     "a segment with no footer is walked to its write frontier",
-                    "every segment file on the roots holding a record is one the index names",
+                    "every segment file on the roots holding a record is one the index lists",
                 ],
             )
             .term(
@@ -662,6 +714,7 @@ mod tests {
             records,
             bytes: records * 1024,
             faults,
+            dead: 0,
             fault: (faults > 0).then(|| format!("record at {segment} fails its checksum")),
         }
     }
@@ -675,6 +728,7 @@ mod tests {
             records: rows.iter().map(|row| row.records).sum(),
             bytes: rows.iter().map(|row| row.bytes).sum(),
             faults: rows.iter().map(|row| row.faults).sum(),
+            dead: rows.iter().map(|row| row.dead).sum(),
             unreadable_records: 0,
             not_indexed: Vec::new(),
             empty_segments,

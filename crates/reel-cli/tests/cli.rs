@@ -364,6 +364,115 @@ fn verify_catches_a_flipped_byte() {
     );
 }
 
+// a replaced record whose bytes were given back is skipped, and a live one zeroed still faults
+#[test]
+fn verify_skips_replaced_records_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let volume = dir.path();
+    // A few overwrites leave the first segment below the dead ratio, so the close keeps it
+    let store = ReelStore::open(volume.to_path_buf(), config(), COLUMNS).expect("open volume");
+    for byte in 0..RECORDS {
+        store
+            .put(&key(byte), &vec![byte; RECORD_BYTES])
+            .expect("put record");
+    }
+    for byte in 0..4 {
+        store
+            .put(&key(byte), &vec![!byte; RECORD_BYTES])
+            .expect("overwrite record");
+    }
+    store.close().expect("close volume");
+    drop(store);
+    let (replaced, live) = sealed_records(volume);
+    let declared = ["--column", "records:1:32", "verify"];
+
+    zero(&replaced.0, replaced.1, replaced.2);
+    let swept = json(volume, &declared);
+    assert_eq!(
+        figure(&swept, "faults"),
+        0,
+        "a replaced record's zeros faulted: {swept}"
+    );
+    assert!(
+        figure(&swept, "dead") > 0,
+        "nothing was skipped as replaced: {swept}"
+    );
+    assert!(run(volume, &declared).ok, "a sound volume should pass");
+
+    zero(&live.0, live.1, live.2);
+    let swept = json(volume, &declared);
+    assert!(
+        figure(&swept, "faults") > 0,
+        "a zeroed live record passed: {swept}"
+    );
+}
+
+/// A sealed segment's file, offset and span of one replaced record and one live record
+type Placed = (std::path::PathBuf, u64, u64);
+
+/// The first replaced record and the first live record in a sealed segment
+fn sealed_records(volume: &Path) -> (Placed, Placed) {
+    let store = ReelStore::open_read_only(volume.to_path_buf(), config(), COLUMNS).expect("open");
+    let (mut replaced, mut live) = (None, None);
+    for path in segments(volume) {
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default();
+        let Ok(number) = stem.parse::<u32>() else {
+            continue;
+        };
+        let Some(footer) = store
+            .segment_footer(reel::format::loc::SegmentId(number))
+            .expect("footer")
+        else {
+            continue;
+        };
+        for entry in footer.entries().flatten() {
+            let span = (reel::format::record::HEADER_LEN + 32) as u64 + u64::from(entry.len);
+            let placed = (path.clone(), u64::from(entry.offset), span);
+            match is_newest(&store, &entry) {
+                true => live = live.or(Some(placed)),
+                false => replaced = replaced.or(Some(placed)),
+            }
+        }
+    }
+    store.close().expect("close");
+    (
+        replaced.expect("a replaced record in a sealed segment"),
+        live.expect("a live record in a sealed segment"),
+    )
+}
+
+/// The settings every test volume is written with
+fn config() -> ReelConfig {
+    ReelConfig {
+        segment_bytes: ByteCount::mb(2),
+        sync: SyncPolicy::Never,
+        ..ReelConfig::default()
+    }
+}
+
+/// Whether a footer entry is the version the index resolves its key to
+fn is_newest(store: &ReelStore, entry: &reel::format::footer::FooterEntry) -> bool {
+    store
+        .index()
+        .get(&entry.key)
+        .ok()
+        .flatten()
+        .is_some_and(|resolved| resolved.lsn == entry.lsn)
+}
+
+/// Overwrite a stretch of a file with zeros, as a punched hole reads
+fn zero(path: &Path, at: u64, len: u64) {
+    let mut file = std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open");
+    file.seek(SeekFrom::Start(at)).expect("seek");
+    file.write_all(&vec![0u8; len as usize]).expect("zero");
+}
+
 // a truncated segment is caught, footer and all
 #[test]
 fn verify_catches_a_truncated_segment() {

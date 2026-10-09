@@ -473,6 +473,30 @@ fn zero(path: &Path, at: u64, len: u64) {
     file.write_all(&vec![0u8; len as usize]).expect("zero");
 }
 
+// a path with no volume behind it fails every verb that reads one, and creates nothing
+#[test]
+fn refuses_a_missing_volume() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("missing");
+    let target = dir.path().join("copy");
+    let copy = ["checkpoint", target.to_str().expect("utf-8 path")];
+    for args in [&["cue"][..], &["stat"], &["spans"], &["verify"], &copy] {
+        let run = run(&missing, args);
+        assert!(
+            !run.ok,
+            "{args:?} on a missing volume should fail: {}",
+            run.out
+        );
+        assert!(
+            run.err.contains("no volume at"),
+            "{args:?} should say why: {}",
+            run.err
+        );
+    }
+    assert!(!missing.exists(), "a refused open created the volume");
+    assert!(!target.exists(), "a refused checkpoint wrote a copy");
+}
+
 // a truncated segment is caught, footer and all
 #[test]
 fn verify_catches_a_truncated_segment() {

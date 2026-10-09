@@ -166,10 +166,18 @@ fn copy(cli: &Cli, target: &Path) -> Fallible<ExitCode> {
 }
 
 impl Cli {
+    /// The volume root, refused when nothing is there so a mistyped path never reads as an empty volume
+    fn root(&self) -> Fallible<PathBuf> {
+        match self.path.is_dir() {
+            true => Ok(self.path.clone()),
+            false => Err(format!("no volume at {}", self.path.display()).into()),
+        }
+    }
+
     /// Open the volume read-only without the lock, parsing every flag before touching disk
     fn open(&self) -> Fallible<ReelStore> {
         Ok(ReelStore::open_read_only(
-            self.path.clone(),
+            self.root()?,
             self.config()?,
             spec::columns(&self.columns)?,
         )?)
@@ -178,7 +186,7 @@ impl Cli {
     /// Open for writing, which sealing a tail needs and which takes the lock
     fn open_primary(&self) -> Fallible<ReelStore> {
         Ok(ReelStore::open(
-            self.path.clone(),
+            self.root()?,
             self.config()?,
             spec::columns(&self.columns)?,
         )?)

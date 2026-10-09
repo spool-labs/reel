@@ -1,7 +1,7 @@
 # Unsafe: every site, and what makes it sound
 
-**80 `unsafe` occurrences in 60 items across 10 files.** `tape-reel` has 78 of them in 59 items
-across 9 files, and `tape-reel-cli` has 2 in one item. `tape-reel-core` and `tape-reel-mock` have
+**79 `unsafe` occurrences in 59 items across 9 files.** `tape-reel` has 77 of them in 58 items
+across 8 files, and `tape-reel-cli` has 2 in one item. `tape-reel-core` and `tape-reel-mock` have
 none. The count is the keyword in code outside test modules, with comments stripped, so it covers
 what a release build compiles. An item is the function or impl a site sits in, and each `cfg`
 alternative counts on its own.
@@ -11,8 +11,8 @@ descriptor or a pointer is an `unsafe` call with no safe wrapper worth writing. 
 buffer whose leading bytes a completion just reported, the one place the type system cannot see
 what the kernel did.
 
-Many sites are `cfg` alternatives of each other, so no build compiles all 59 items in
-`tape-reel`. A Linux x86_64 build compiles 53. A macOS aarch64 build compiles 35, with no ring
+Many sites are `cfg` alternatives of each other, so no build compiles all 58 items in
+`tape-reel`. A Linux x86_64 build compiles 52. A macOS aarch64 build compiles 35, with no ring
 backend, no x86 scans and no Linux-only syscalls.
 
 | file | occurrences | items | Linux x86_64 | macOS aarch64 |
@@ -25,7 +25,6 @@ backend, no x86 scans and no Linux-only syscalls.
 | `crates/reel/src/reel/bias.rs` | 5 | 4 | 3 | 3 |
 | `crates/reel/src/io/op.rs` | 2 | 1 | 1 | 1 |
 | `crates/reel/src/engine/store_impl.rs` | 2 | 1 | 1 | 1 |
-| `crates/reel/src/compaction/compactor.rs` | 1 | 1 | 1 | 0 |
 | `crates/reel-cli/src/term.rs` | 2 | 1 | 1 | 1 |
 
 ## Posix backend
@@ -124,12 +123,6 @@ The startup pass that reads what the machine already knows. All commented.
 | site | what it does | what makes it sound |
 |---|---|---|
 | `available_bytes` | `statvfs` behind the write path's capacity check | `statvfs` fills the whole struct it is handed, and the nul-terminated path outlives the call |
-
-## Compaction
-
-| site | what it does | what makes it sound |
-|---|---|---|
-| `erase_range`, Linux | `fallocate` with hole-punch and keep-size, giving a dead run's blocks back | an ffi call on a descriptor the caller holds open across it |
 
 ## CLI terminal width
 

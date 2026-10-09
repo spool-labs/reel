@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::compaction::compactor::EraseReport;
+use crate::compaction::compactor::{EraseReport, ERASE_QUIET};
 use crate::compaction::keymerge::{merge_into_key_run, MergeReport};
 use crate::error::{ReelError, Result};
 use crate::format::column::ColumnId;
@@ -333,12 +333,25 @@ impl ReelStore {
         self.sweep_covers()?;
         self.prune_tombstones();
         self.compact_and_merge()?;
+        self.erase_when_due()?;
         // Hand over again before the scrub, since a long rewrite or merge lets sealed keys pile up
         self.page_out_sealed()?;
         self.scrub_once()?;
         self.index.scrub_spot(SPOT_SCRUB_BUDGET);
         self.index.sweep_walk_runs();
         Ok(())
+    }
+
+    /// Give back the blocks under one sealed segment's replaced records, once its dead bytes stop growing
+    fn erase_when_due(&self) -> Result<Option<EraseReport>> {
+        let ratio = self.config.compact_dead_ratio;
+        self.compactor.erase_when_due(
+            &self.reel,
+            &self.index,
+            ratio,
+            self.cues.floor(),
+            ERASE_QUIET,
+        )
     }
 
     /// Seal each tail that took no write for `idle`, so compaction can reach what it holds

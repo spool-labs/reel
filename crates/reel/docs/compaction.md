@@ -86,7 +86,7 @@ What a cap costs the foreground, from the interference probe on a ccx33, 2026-08
 
 ## Reclaiming without copying
 
-A hole punch, a smaller segment and the proposed page chain all reclaim a region only when the whole region is dead. So all three depend on how long the dead stretches inside a segment are. `erase_dead_runs` punches real `fallocate` holes, and a rebuild test shows a punched volume answers every live key after reopen. Nothing schedules it, a caller runs it. It punches on Linux only. Elsewhere it reports what it would punch.
+A hole punch, a smaller segment and the proposed page chain all reclaim a region only when the whole region is dead. So all three depend on how long the dead stretches inside a segment are. Each maintenance tick punches one sealed segment's replaced records, reading only its footer. A segment qualifies when it sits below the copy ratio, its records average a block or more, its dead bytes grew 4 MiB since its last punch and have not changed for 10 seconds, no checkpoint links its file, and no cue can read it. The punch goes through the driver, `fallocate` on Linux and `F_PUNCHHOLE` on macOS. `erase_dead_runs` runs the same punch over every segment on request, and a rebuild test shows a punched volume answers every live key after reopen.
 
 Measured with the erase probe on ext4 on a ccx33, 2026-08-11:
 

@@ -131,7 +131,7 @@ Terms this codebase uses in ways a newcomer can't guess.
 | warm cache probe | yes | reports cold, read goes to the driver |
 | range sync | yes | no-op |
 | preallocation | one call | reserve then extend |
-| hole punch over dead runs | yes | reported, never punched |
+| hole punch over dead runs | yes | yes |
 | power-cut durability | yes, under the sync setting | no claim: the call that waits for the drive is not issued |
 | tail count | `min(cores, 8)`, floored at one per fast volume | same |
 | compaction rate | unpaced | unpaced |

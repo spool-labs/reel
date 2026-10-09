@@ -13,8 +13,8 @@ use crate::format::footer::{FooterRow, SegmentFooter, FIXED_TAIL_LEN};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{
-    check_keyless, fits_keyless, keyless_codec, peek_key_width, read_u32_le, CheckKey, KeylessRead,
-    RecordHeader, RecordLayout, HEADER_LEN, KEYLESS_PREFIX,
+    check_keyless, keyless_codec, peek_key_width, read_u32_le, CheckKey, KeylessRead, RecordHeader,
+    RecordLayout, HEADER_LEN, KEYLESS_PREFIX,
 };
 use crate::index::map::{KeyRepoint, ReelIndex};
 use crate::index::paged::FooterSource;
@@ -208,6 +208,9 @@ pub struct CompactionCounters {
 
     /// Bytes rewrite passes read back, counted at the reader's refills
     pub read_bytes: u64,
+
+    /// Bytes of whole blocks under replaced records that punches gave back
+    pub erased_bytes: u64,
 }
 
 impl CompactionCounters {
@@ -233,6 +236,7 @@ struct Metrics {
     records_purged: AtomicU64,
     runs_merged: AtomicU64,
     read_bytes: AtomicU64,
+    erased_bytes: AtomicU64,
 }
 
 impl Metrics {
@@ -248,6 +252,7 @@ impl Metrics {
             records_purged: AtomicU64::new(0),
             runs_merged: AtomicU64::new(0),
             read_bytes: AtomicU64::new(0),
+            erased_bytes: AtomicU64::new(0),
         }
     }
 
@@ -294,6 +299,7 @@ impl Metrics {
             records_purged: self.records_purged.load(Ordering::Acquire),
             runs_merged: self.runs_merged.load(Ordering::Acquire),
             read_bytes: self.read_bytes.load(Ordering::Acquire),
+            erased_bytes: self.erased_bytes.load(Ordering::Acquire),
             // counters() fills this from the compactor's pins
             segments_pinned_by_rot: 0,
         }
@@ -400,6 +406,17 @@ pub struct Compactor {
 
     /// Read buffers from the last pass, reused by the next
     spare: Mutex<Vec<Vec<u8>>>,
+
+    /// Each segment's dead bytes as the punch last saw them, and since when
+    erasing: Mutex<std::collections::HashMap<SegmentId, EraseWatch>>,
+}
+
+/// Dead bytes a segment held at its last punch, and the last change seen since
+#[derive(Clone, Copy)]
+struct EraseWatch {
+    punched: u64,
+    seen: u64,
+    since: Instant,
 }
 
 /// Takes a segment out of the in-flight set however its pass leaves
@@ -461,6 +478,7 @@ impl Compactor {
             in_flight: Mutex::new(std::collections::HashSet::new()),
             rotted: Mutex::new(std::collections::HashMap::new()),
             spare: Mutex::new(Vec::new()),
+            erasing: Mutex::new(std::collections::HashMap::new()),
             // the sweep start must differ between runs, so seed it from the clock
             scrub_seed: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -972,73 +990,148 @@ impl Compactor {
         let shared = reel.shared();
         let mut report = EraseReport::default();
         for (segment, _) in index.segments_snapshot() {
-            if shared.is_held(segment) {
+            if shared.is_held(segment) || !shared.is_settled(segment) {
                 continue;
             }
-            let Some(footer) = shared.footer_of(segment).ok().flatten() else {
-                continue;
-            };
-            let source = match source_handle(shared, segment) {
-                Ok(source) => source,
-                Err(error) if is_missing(&error) => continue,
-                Err(error) => return Err(error),
-            };
-            let file_len = match segment_len(shared, &source)? {
-                Some(len) => len,
-                None => continue,
-            };
-            let region_end = footer_bound(shared, &source, file_len, Some(&footer))?;
-            let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
-            let mut runs: Vec<(u64, u64)> = Vec::new();
-            if source.layout().is_keyless_layout() {
-                keyless_dead_runs(index, &mut reader, &footer, segment, &mut runs)?;
-            }
-            // Walk by rows, since a scan reads an earlier pass's zeroed hole as the end of data
-            let mut offsets: Vec<u32> = Vec::new();
-            if source.layout() == RecordLayout::Keyed {
-                for partition in &footer.partitions {
-                    for at in 0..partition.len() {
-                        let row = partition.row_at(at)?;
-                        if !row.flags.is_data() {
-                            continue;
-                        }
-                        offsets.push(row.offset);
-                    }
+            report.add(self.erase_segment(shared, index, segment)?);
+        }
+        Ok(report)
+    }
+
+    /// Punch the segment whose dead bytes grew most since its last punch, once they have stopped growing
+    ///
+    /// Only segments below the copy ratio qualify, since a copy reclaims the rest whole.
+    pub fn erase_when_due(
+        &self,
+        reel: &Reel,
+        index: &ReelIndex,
+        copy_ratio: f64,
+        cue_floor: Option<Lsn>,
+        quiet: Duration,
+    ) -> Result<Option<EraseReport>> {
+        let shared = reel.shared();
+        let now = Instant::now();
+        let (segments, _) = index.ranking();
+        let owed = shared.pending_seals();
+        let pick = {
+            let mut erasing = lock(&self.erasing);
+            erasing.retain(|segment, _| segments.iter().any(|(held, _)| held == segment));
+            let claimed = lock(&self.in_flight);
+            let mut pick: Option<(SegmentId, u64)> = None;
+            for (segment, bytes) in &segments {
+                let watch = erasing.entry(*segment).or_insert(EraseWatch {
+                    punched: 0,
+                    seen: bytes.dead,
+                    since: now,
+                });
+                if watch.seen != bytes.dead {
+                    watch.seen = bytes.dead;
+                    watch.since = now;
                 }
-            }
-            offsets.sort_unstable();
-            for offset in offsets {
-                let record =
-                    match RecordScan::resuming(&mut reader, u64::from(offset)).next_record()? {
-                        // a row whose record no longer parses is one an earlier pass erased
-                        None => continue,
-                        Some(record) if record.offset != offset => continue,
-                        Some(record) => record,
-                    };
-                if index.is_live_at(&record.header.key, record.loc(segment), record.header.lsn)? {
+                let grown = bytes.dead.saturating_sub(watch.punched);
+                let is_quiet = now.duration_since(watch.since) >= quiet;
+                let total = bytes.total();
+                let is_copy_target = total > 0 && bytes.dead as f64 >= copy_ratio * total as f64;
+                // A cue may still read a replaced version here, and a pass or a seal owns it
+                let is_held = shared.is_held(*segment)
+                    || !shared.is_settled(*segment)
+                    || claimed.contains(segment)
+                    || owed.contains(segment)
+                    || cue_floor.is_some_and(|floor| {
+                        index
+                            .min_lsn_of(*segment)
+                            .is_some_and(|oldest| oldest <= floor)
+                    });
+                if grown < ERASE_DUE || !is_quiet || is_copy_target || is_held {
                     continue;
                 }
-                let start = u64::from(record.offset);
-                let end = start + record.span();
-                match runs.last_mut() {
-                    Some(run) if run.1 == start => run.1 = end,
-                    _ => runs.push((start, end)),
+                if pick.is_none_or(|(_, best)| grown > best) {
+                    pick = Some((*segment, grown));
                 }
             }
-            drop(source);
+            let Some((segment, _)) = pick else {
+                return Ok(None);
+            };
+            if let Some(watch) = erasing.get_mut(&segment) {
+                watch.punched = watch.seen;
+            }
+            drop(claimed);
+            lock(&self.in_flight).insert(segment);
+            segment
+        };
+        let _claim = PassClaim {
+            compactor: self,
+            segment: pick,
+        };
+        let report = self.erase_segment(shared, index, pick)?;
+        self.metrics
+            .erased_bytes
+            .fetch_add(report.erased_bytes, Ordering::AcqRel);
+        Ok(Some(report))
+    }
 
-            report.segments += 1;
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(shared.segment_path(segment))?;
-            for (start, end) in runs {
-                report.dead_run_bytes += end - start;
-                let hole_start = start.next_multiple_of(ERASE_BLOCK);
-                let hole_end = (end / ERASE_BLOCK) * ERASE_BLOCK;
-                if hole_end > hole_start {
-                    erase_range(&file, hole_start, hole_end - hole_start)?;
-                    report.erased_bytes += hole_end - hole_start;
+    /// Give back the blocks under one sealed segment's replaced records, reading only its footer
+    fn erase_segment(
+        &self,
+        shared: &Arc<ReelShared>,
+        index: &ReelIndex,
+        segment: SegmentId,
+    ) -> Result<EraseReport> {
+        let mut report = EraseReport::default();
+        let Some(footer) = shared.footer_of(segment)? else {
+            return Ok(report);
+        };
+        let source = match source_handle(shared, segment) {
+            Ok(source) => source,
+            Err(error) if is_missing(&error) => return Ok(report),
+            Err(error) => return Err(error),
+        };
+        report.segments = 1;
+        // A checkpoint links the file, and a punch would reach its copy too
+        if is_linked(&shared.segment_path(segment)) {
+            return Ok(report);
+        }
+        // Records under a block each leave few whole blocks to give back
+        let bytes = index.segment_bytes(segment).total();
+        let rows = footer.entry_count() as u64;
+        if rows == 0 || bytes / rows < ERASE_BLOCK {
+            return Ok(report);
+        }
+        let layout = source.layout();
+        let mut dead: Vec<(u64, u64)> = Vec::new();
+        for partition in &footer.partitions {
+            for at in 0..partition.len() {
+                let row = partition.row_at(at)?;
+                if !row.flags.is_data() {
+                    continue;
                 }
+                let key = partition.key_at(at).unwrap_or(&[]);
+                let loc = Loc::new(segment, row.offset, row.len);
+                if index.is_live_at(&RecordKey::from_bytes(partition.column, key)?, loc, row.lsn)? {
+                    continue;
+                }
+                let start = u64::from(row.offset);
+                let span = layout.prefix_len(key.len(), row.len) as u64 + u64::from(row.len);
+                dead.push((start, start + span));
+            }
+        }
+        dead.sort_unstable();
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for (start, end) in dead {
+            match runs.last_mut() {
+                Some(run) if run.1 == start => run.1 = end,
+                _ => runs.push((start, end)),
+            }
+        }
+        for (start, end) in runs {
+            report.dead_run_bytes += end - start;
+            let hole_start = start.next_multiple_of(ERASE_BLOCK);
+            let hole_end = (end / ERASE_BLOCK) * ERASE_BLOCK;
+            if hole_end > hole_start {
+                shared
+                    .driver
+                    .release(source.file(), hole_start, hole_end - hole_start)?;
+                report.erased_bytes += hole_end - hole_start;
             }
         }
         Ok(report)
@@ -1463,50 +1556,6 @@ impl Compactor {
     }
 }
 
-/// The dead runs of a keyless segment, found from its rows and coalesced in offset order
-fn keyless_dead_runs(
-    index: &ReelIndex,
-    reader: &mut SegmentReader<'_>,
-    footer: &SegmentFooter,
-    segment: SegmentId,
-    runs: &mut Vec<(u64, u64)>,
-) -> Result<()> {
-    let mut dead = Vec::new();
-    for partition in &footer.partitions {
-        for at in 0..partition.len() {
-            let row = partition.row_at(at)?;
-            if !row.flags.is_data() {
-                continue;
-            }
-            let Some(key) = partition.key_at(at) else {
-                continue;
-            };
-            let key = RecordKey::from_bytes(partition.column, key)?;
-            // a keyless record's span is its row's, so only a keyed one is read
-            let span = match fits_keyless(row.len) {
-                true => KEYLESS_PREFIX as u64 + u64::from(row.len),
-                false => match RecordScan::resuming(reader, u64::from(row.offset)).next_record()? {
-                    Some(record) if record.offset == row.offset => record.span(),
-                    Some(_) | None => continue,
-                },
-            };
-            if index.is_live_at(&key, Loc::new(segment, row.offset, row.len), row.lsn)? {
-                continue;
-            }
-            let start = u64::from(row.offset);
-            dead.push((start, start + span));
-        }
-    }
-    dead.sort_unstable();
-    for (start, end) in dead {
-        match runs.last_mut() {
-            Some(run) if run.1 == start => run.1 = end,
-            _ => runs.push((start, end)),
-        }
-    }
-    Ok(())
-}
-
 /// Each column's records in key order as offset and length pairs, nothing on a bad row
 fn footer_order(footer: &SegmentFooter) -> Option<(Vec<(u32, u32)>, u64)> {
     let mut order = Vec::with_capacity(footer.entry_count());
@@ -1854,37 +1903,32 @@ pub struct EraseReport {
     /// Bytes sitting in dead data-record runs, before block alignment
     pub dead_run_bytes: u64,
 
-    /// Bytes of whole filesystem blocks inside those runs, punched on linux
+    /// Bytes of whole filesystem blocks inside those runs, given back to the filesystem
     pub erased_bytes: u64,
+}
+
+impl EraseReport {
+    /// Fold another segment's report into this one
+    fn add(&mut self, other: EraseReport) {
+        self.segments += other.segments;
+        self.dead_run_bytes += other.dead_run_bytes;
+        self.erased_bytes += other.erased_bytes;
+    }
 }
 
 /// A filesystem block, the smallest unit a punch frees
 const ERASE_BLOCK: u64 = 4096;
 
-/// Give a range's blocks back to the filesystem, keeping the file's length
-#[cfg(target_os = "linux")]
-fn erase_range(file: &std::fs::File, offset: u64, len: u64) -> Result<()> {
-    use std::os::fd::AsRawFd;
-    let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
-    // SAFETY: an ffi call against a descriptor the caller holds open across it.
-    let ret = unsafe {
-        libc::fallocate(
-            file.as_raw_fd(),
-            mode,
-            offset as libc::off_t,
-            len as libc::off_t,
-        )
-    };
-    match ret {
-        0 => Ok(()),
-        _ => Err(std::io::Error::last_os_error().into()),
-    }
-}
+/// A segment is punched again once its dead bytes grew this much since the last punch
+const ERASE_DUE: u64 = 4 * 1024 * 1024;
 
-/// Off linux there is no punch, so the pass only reports what it found
-#[cfg(not(target_os = "linux"))]
-fn erase_range(_file: &std::fs::File, _offset: u64, _len: u64) -> Result<()> {
-    Ok(())
+/// A segment's dead bytes have to hold still this long, so every replaced record in it has been replaced at least this long
+pub const ERASE_QUIET: Duration = Duration::from_secs(10);
+
+/// Whether another name links this file, as a checkpoint does
+fn is_linked(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).is_ok_and(|meta| meta.nlink() > 1)
 }
 
 /// One coalesced read covering a run of a stripe's records
@@ -2792,6 +2836,115 @@ mod tests {
         // With no fast tier size there is no threshold, so nothing demotes on the first pass
         let unknown = Compactor::new(&config, 0, 0);
         assert_eq!(unknown.demote_after_bytes, None);
+    }
+
+    /// A sealed segment of 200 large records, the first 70 replaced by later writes
+    fn punchable(config: ReelConfig) -> Fixture {
+        let fixture = fixture(ReelConfig {
+            segment_bytes: ByteCount::mb(16),
+            ..config
+        });
+        for byte in 0..200u8 {
+            put(&fixture, byte, vec![byte; LARGE]);
+        }
+        seal(&fixture);
+        for byte in 0..70u8 {
+            put(&fixture, byte, vec![!byte; LARGE]);
+        }
+        fixture
+    }
+
+    /// A record large enough that a run of them spans whole blocks
+    const LARGE: usize = 64 * 1024;
+
+    // a punch gives back the blocks under replaced large records, and every live key still reads
+    #[test]
+    fn a_punch_gives_back_replaced_runs() {
+        let fixture = punchable(settings());
+        let report = fixture
+            .compactor
+            .erase_when_due(&fixture.reel, &fixture.index, 0.5, None, Duration::ZERO)
+            .expect("erase")
+            .expect("the segment was due");
+
+        assert!(
+            report.erased_bytes >= 4 << 20,
+            "70 replaced records gave back {} bytes",
+            report.erased_bytes
+        );
+        assert_eq!(
+            fixture.compactor.counters().erased_bytes,
+            report.erased_bytes
+        );
+        for byte in 0..200u8 {
+            let entry = fixture.index.get(&key(byte)).expect("get").expect("live");
+            let want = if byte < 70 { !byte } else { byte };
+            let read = fixture
+                .reel
+                .read_record(entry.loc, key(byte).as_ref(), entry.lsn, true, false)
+                .expect("read");
+            assert_eq!(
+                read,
+                RecordRead::Found(Value::new(vec![want; LARGE])),
+                "key {byte}"
+            );
+        }
+        let again = fixture
+            .compactor
+            .erase_when_due(&fixture.reel, &fixture.index, 0.5, None, Duration::ZERO)
+            .expect("erase");
+        assert!(again.is_none(), "nothing new died, so nothing is due");
+    }
+
+    // a cue that may read the replaced versions keeps them in place
+    #[test]
+    fn a_cue_keeps_its_versions_unpunched() {
+        let fixture = punchable(settings());
+        let report = fixture
+            .compactor
+            .erase_when_due(
+                &fixture.reel,
+                &fixture.index,
+                0.5,
+                Some(Lsn(u64::MAX)),
+                Duration::ZERO,
+            )
+            .expect("erase");
+        assert!(report.is_none(), "a segment a cue reads was punched");
+        assert_eq!(fixture.compactor.counters().erased_bytes, 0);
+    }
+
+    // a scrub after a punch reads no rot and still checks every live byte
+    #[test]
+    fn a_scrub_walks_past_a_punched_hole() {
+        let fixture = punchable(ReelConfig {
+            scrub_mbps: 1024,
+            ..settings()
+        });
+        fixture
+            .compactor
+            .erase_when_due(&fixture.reel, &fixture.index, 0.5, None, Duration::ZERO)
+            .expect("erase")
+            .expect("the segment was due");
+
+        let live = (130 * LARGE) as u64;
+        let mut hits = 0;
+        for _ in 0..64 {
+            std::thread::sleep(Duration::from_millis(20));
+            hits += fixture
+                .compactor
+                .scrub_pass(&fixture.reel, &fixture.index)
+                .expect("scrub");
+            if fixture.compactor.counters().scrub_bytes >= live {
+                break;
+            }
+        }
+        assert_eq!(hits, 0, "a given-back hole read as rot");
+        let scrubbed = fixture.compactor.counters().scrub_bytes;
+        assert!(
+            scrubbed >= live,
+            "the scrub checked {scrubbed} of {live} live bytes and stopped at the hole"
+        );
     }
 
     // a scrub pass finds an injected bit flip in a sealed segment and evicts the key

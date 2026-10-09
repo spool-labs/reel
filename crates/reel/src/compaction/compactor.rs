@@ -769,10 +769,12 @@ impl Compactor {
             footer,
             layout,
         } = ordered;
-        let rows = match (layout, footer) {
-            (RecordLayout::Keyless(_), Some(footer)) => Some(footer_rows(footer)?),
-            _ => None,
+        // The index says which rows still hold the live copy, so no dead record is read
+        let (order, rows) = match footer {
+            Some(footer) => live_rows(index, segment, footer, layout)?,
+            None => (order.to_vec(), None),
         };
+        let order = order.as_slice();
         let mut run = CopyRun::default();
         let mut staged: Vec<Option<Part>> = Vec::new();
         let mut start = 0usize;
@@ -1713,6 +1715,39 @@ struct Ordered<'a> {
     layout: RecordLayout,
 }
 
+/// The footer rows the index still points at, and every tombstone, in `footer_order`'s order
+///
+/// A keyless segment also gets each kept row's key, since its records hold none
+fn live_rows(
+    index: &ReelIndex,
+    segment: SegmentId,
+    footer: &SegmentFooter,
+    layout: RecordLayout,
+) -> Result<KeptRows> {
+    let mut order = Vec::with_capacity(footer.entry_count());
+    let mut rows = layout
+        .is_keyless_layout()
+        .then(|| Vec::with_capacity(footer.entry_count()));
+    for partition in &footer.partitions {
+        for at in 0..partition.len() {
+            let row = partition.row_at(at)?;
+            let key = RecordKey::from_bytes(partition.column, partition.key_at(at).unwrap_or(&[]))?;
+            let loc = Loc::new(segment, row.offset, row.len);
+            if row.flags.is_data() && !index.is_live_at(&key, loc, row.lsn)? {
+                continue;
+            }
+            order.push((row.offset, row.len));
+            if let Some(rows) = rows.as_mut() {
+                rows.push((key, row));
+            }
+        }
+    }
+    Ok((order, rows))
+}
+
+/// The offsets and lengths a rewrite reads, and the keyless rows beside them
+type KeptRows = (Vec<(u32, u32)>, Option<Vec<(RecordKey, FooterRow)>>);
+
 /// Every row of a footer with its key, in the same order as `footer_order`
 fn footer_rows(footer: &SegmentFooter) -> Result<Vec<(RecordKey, FooterRow)>> {
     let mut rows = Vec::with_capacity(footer.entry_count());
@@ -1873,6 +1908,9 @@ fn wave_len(ranges: &[ChunkRange], step_bytes: u64) -> usize {
     depth
 }
 
+/// A dead stretch at least this wide between two live records splits the read around it
+const SKIP_GAP: u64 = 64 * 1024;
+
 /// Coalesce a stripe's offset-sorted records into ranged reads up to `READ_CHUNK` wide
 fn chunk_ranges(
     plan: &[(usize, u32)],
@@ -1890,7 +1928,9 @@ fn chunk_ranges(
             let (position, offset) = plan[end_at];
             let record_end =
                 (u64::from(offset) + prefix_hint + u64::from(order[position].1)).min(region_end);
-            if end_at > begin && record_end.saturating_sub(start) > READ_CHUNK as u64 {
+            let is_wide = record_end.saturating_sub(start) > READ_CHUNK as u64;
+            let is_apart = u64::from(offset) >= reach.saturating_add(SKIP_GAP);
+            if end_at > begin && (is_wide || is_apart) {
                 break;
             }
             reach = reach.max(record_end);
@@ -2312,9 +2352,9 @@ mod tests {
         assert!(fixture.sim.durable_bytes(&seg_path(1)).is_none());
     }
 
-    // retiring a segment is paced by its scan even when nothing is copied
+    // a wholly dead segment retires without reading its records
     #[test]
-    fn a_retirement_charges_its_scan() {
+    fn a_dead_segment_retires_unread() {
         let slow = ReelConfig {
             compact_mbps: CompactRate::Mbps(1),
             ..settings()
@@ -2338,9 +2378,10 @@ mod tests {
         let counters = fixture.compactor.counters();
         assert_eq!(counters.segments_unlinked_whole, 1);
         assert_eq!(counters.compaction_bytes, 0, "nothing was copied");
+        assert_eq!(counters.read_bytes, 0, "the dead record was read");
         assert!(
-            elapsed >= Duration::from_millis(150),
-            "the scan's reads left the pass free to run, {elapsed:?}",
+            elapsed < Duration::from_millis(150),
+            "a pass that read nothing waited on the gate, {elapsed:?}",
         );
     }
 
@@ -2933,11 +2974,11 @@ mod tests {
             ..settings()
         };
         let fixture = fixture(slow);
-        for byte in 0..4u8 {
+        for byte in 0..6u8 {
             put(&fixture, byte, vec![byte; 50_000]);
         }
         seal(&fixture);
-        // two of the four go dead, so the pass has both copies and skips to pace
+        // two of the six go dead, so the pass reads and copies the other four under its rate
         put(&fixture, 0, vec![0x33; 200]);
         put(&fixture, 1, vec![0x33; 200]);
 

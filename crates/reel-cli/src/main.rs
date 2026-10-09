@@ -64,7 +64,7 @@ where
         back to. Every verb but `checkpoint` opens read-only and takes no \
         ownership lock, so it reads a volume something else is writing.\n\n\
         A volume's columns are the declaration of whatever wrote it, and no \
-        part of a segment file names them, so the per-column figures count only \
+        part of a segment file lists them, so the per-column figures count only \
         what `--column` declares.",
     version
 )]

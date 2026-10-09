@@ -36,10 +36,8 @@ fn worth_keeping(logical: usize, stored: usize) -> bool {
 /// Compress a payload at admission when the column asks and the payload cooperates
 ///
 /// Returns the bytes to store and the codec byte for the header, raw with the byte at
-/// zero unless the payload shrinks by an eighth. A form that would fit the column's
-/// inline ceiling stays raw too: the inline paths serve stored bytes as the value, so a
-/// record they could serve must never carry codec bytes.
-pub fn admit(codec: Codec, inline_max: u16, payload: Vec<u8>) -> (Vec<u8>, u8) {
+/// zero unless the payload shrinks by an eighth.
+pub fn admit(codec: Codec, payload: Vec<u8>) -> (Vec<u8>, u8) {
     if !matches!(codec, Codec::Lz4) || payload.len() < MIN_ATTEMPT {
         return (payload, 0);
     }
@@ -57,7 +55,7 @@ pub fn admit(codec: Codec, inline_max: u16, payload: Vec<u8>) -> (Vec<u8>, u8) {
     };
 
     let stored = LOGICAL_PREFIX + written;
-    if !worth_keeping(logical, stored) || stored <= inline_max as usize {
+    if !worth_keeping(logical, stored) {
         return (payload, 0);
     }
 
@@ -116,7 +114,7 @@ mod tests {
     #[test]
     fn roundtrip_shrinks() {
         let raw = compressible(4096);
-        let (stored, codec) = admit(Codec::Lz4, 0, raw.clone());
+        let (stored, codec) = admit(Codec::Lz4, raw.clone());
         assert_eq!(codec, Codec::Lz4.as_byte());
         assert!(stored.len() < raw.len() - raw.len() / 8);
         assert_eq!(decode(codec, &stored).expect("decode"), raw);
@@ -126,7 +124,7 @@ mod tests {
     #[test]
     fn incompressible_stays_raw() {
         let raw = incompressible(4096);
-        let (stored, codec) = admit(Codec::Lz4, 0, raw.clone());
+        let (stored, codec) = admit(Codec::Lz4, raw.clone());
         assert_eq!(codec, 0);
         assert_eq!(stored, raw);
     }
@@ -135,21 +133,7 @@ mod tests {
     #[test]
     fn small_skips_the_attempt() {
         let raw = compressible(MIN_ATTEMPT - 1);
-        let (stored, codec) = admit(Codec::Lz4, 0, raw.clone());
-        assert_eq!(codec, 0);
-        assert_eq!(stored, raw);
-    }
-
-    // a record that would shrink into the inline ceiling stays raw instead
-    #[test]
-    fn inline_ceiling_refuses_codec_bytes() {
-        let raw = compressible(300);
-        let shrunk = admit(Codec::Lz4, 0, raw.clone());
-        assert!(
-            shrunk.1 != 0 && shrunk.0.len() <= 255,
-            "premise: 300 compressible bytes shrink under 255"
-        );
-        let (stored, codec) = admit(Codec::Lz4, 255, raw.clone());
+        let (stored, codec) = admit(Codec::Lz4, raw.clone());
         assert_eq!(codec, 0);
         assert_eq!(stored, raw);
     }
@@ -158,7 +142,7 @@ mod tests {
     #[test]
     fn no_codec_no_attempt() {
         let raw = compressible(4096);
-        let (stored, codec) = admit(Codec::None, 0, raw.clone());
+        let (stored, codec) = admit(Codec::None, raw.clone());
         assert_eq!(codec, 0);
         assert_eq!(stored, raw);
     }

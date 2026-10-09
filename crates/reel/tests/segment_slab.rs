@@ -153,7 +153,7 @@ impl Oracle {
         }
     }
 
-    fn install(&mut self, segments: &HashMap<SegmentId, SegmentBytes>) {
+    fn rebuild(&mut self, segments: &HashMap<SegmentId, SegmentBytes>) {
         self.rows.clear();
         self.born.clear();
         self.stamped.clear();
@@ -170,7 +170,6 @@ impl Oracle {
                     max_lsn: None,
                 },
             );
-            self.stamped.insert(*segment);
         }
     }
 
@@ -362,9 +361,9 @@ fn the_window_agrees_with_the_map() {
     }
 }
 
-// an install replaces the whole table and takes the retires with it
+// a rebuild clears the whole table and takes the retires with it
 #[test]
-fn an_install_starts_the_window_over() {
+fn a_rebuild_starts_the_window_over() {
     let table = SegmentTable::new();
     let mut oracle = Oracle::default();
 
@@ -389,10 +388,13 @@ fn an_install_starts_the_window_over() {
             ..SegmentBytes::default()
         },
     );
-    table.install(segments.clone(), HashMap::new(), HashMap::new());
-    oracle.install(&segments);
+    table.clear();
+    for (segment, bytes) in &segments {
+        table.adopt(*segment, *bytes);
+    }
+    oracle.rebuild(&segments);
 
-    // The retire is undone by the install, so the number books again.
+    // The retire is undone by the clear, so the number books again.
     table.mark_live(SegmentId(3), Lsn(2), 100);
     oracle.mark_live(SegmentId(3), Lsn(2), 100);
     assert_eq!(table.bytes_of(SegmentId(3)).live, 800);

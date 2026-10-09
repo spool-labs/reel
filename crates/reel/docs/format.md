@@ -207,16 +207,13 @@ sit together, sorted by key, fixed-stride at that column's own key width.
 ```
 
 One row is the key, then the sequence number, the offset, the payload length,
-the record's own flags, which is 17 bytes past the key, then, where the column
-declares a `row_carry` width, a row checksum and that many of the value's
-leading bytes, padded, at most 256. A partition whose keys
+the record's own flags, which is 17 bytes past the key. A partition whose keys
 are all one width strides at it. One whose keys vary is prefix compressed
 instead, `format/prefix.rs`'s restart-block encoding, because its keys are
 names and sorted names share their fronts; the parse rebuilds whole rows, so
 the encoding lives only on disk. The directory names each
-partition by column, key width, inline width and row count, which is what lets
-the rows stride at the natural width instead of the widest one and lets a
-column declaring no inlining pay nothing for it. The fixed tail is 64 bytes and
+partition by column, key width, row count and encoded span, which is what lets
+the rows stride at the natural width instead of the widest one. The fixed tail is 64 bytes and
 holds, reading backwards from the end: the magic, the footer length, the footer's
 own checksum, the highest and lowest sequence numbers in it, the live and dead
 byte tally, the row count, the partition count, the filter length, and the
@@ -284,8 +281,8 @@ The shape is two footer kinds behind the directory, dense for tails and sparse
 for sorted segments, picked by a flag the seal already knows.
 
 Why this ranks above bit-packing the tail: footer size is not a large-record
-problem, it is a small-record problem. A row is the key plus 17 fixed bytes plus
-any inline bytes, at the column's own key width, which lands very differently per
+problem, it is a small-record problem. A row is the key plus 17 fixed bytes, at
+the column's own key width, which lands very differently per
 shape:
 
 | shape | key | row | footer as a share of a 1 GiB segment |

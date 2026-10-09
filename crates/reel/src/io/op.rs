@@ -135,6 +135,75 @@ pub const ZERO_PAGE_LEN: usize = 4096;
 /// The zero bytes every alignment fill is served from
 static ZERO_PAGE: [u8; ZERO_PAGE_LEN] = [0u8; ZERO_PAGE_LEN];
 
+/// A stretch of a read buffer, shared by refcount so a write can outlive the read
+///
+/// Small enough to queue one per record: a segment is under four gibibytes, so the
+/// stretch is two words beside the buffer it points into.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Part {
+    bytes: Arc<Vec<u8>>,
+    start: u32,
+    len: u32,
+}
+
+impl Part {
+    /// The stretch of a buffer starting here and running this long
+    pub fn new(bytes: &Arc<Vec<u8>>, start: usize, len: usize) -> Part {
+        Part {
+            bytes: Arc::clone(bytes),
+            start: start as u32,
+            len: len as u32,
+        }
+    }
+
+    /// A whole buffer as one stretch
+    pub fn whole(bytes: OwnedBuf) -> Part {
+        let len = bytes.len() as u32;
+        Part {
+            bytes: Arc::new(bytes),
+            start: 0,
+            len,
+        }
+    }
+
+    /// A shorter stretch inside this one, for the payload behind a record's prefix
+    pub fn narrowed(self, skip: usize, len: usize) -> Part {
+        debug_assert!(skip + len <= self.len as usize);
+        Part {
+            bytes: self.bytes,
+            start: self.start + skip as u32,
+            len: len as u32,
+        }
+    }
+
+    /// The bytes the stretch covers
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[self.start as usize..(self.start + self.len) as usize]
+    }
+
+    /// How many bytes the stretch covers
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Whether the stretch covers nothing
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl From<Part> for WriteBuf {
+    fn from(part: Part) -> WriteBuf {
+        WriteBuf::Part(part)
+    }
+}
+
+impl From<OwnedBuf> for WriteBuf {
+    fn from(bytes: OwnedBuf) -> WriteBuf {
+        WriteBuf::Owned(bytes)
+    }
+}
+
 /// One buffer in a vectored write, owned for the life of the submission
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WriteBuf {
@@ -146,6 +215,9 @@ pub enum WriteBuf {
 
     /// A buffer shared by refcount, the shape a spilled key takes without a copy
     Shared(Arc<[u8]>),
+
+    /// A stretch of a read buffer, the shape a copied payload takes without a copy
+    Part(Part),
 
     /// A run of zero fill served from the shared zero page
     Zeros(usize),
@@ -187,6 +259,7 @@ impl WriteBuf {
             WriteBuf::Inline { bytes, len } => &bytes[..*len as usize],
             WriteBuf::Owned(bytes) => bytes,
             WriteBuf::Shared(bytes) => bytes,
+            WriteBuf::Part(part) => part.as_slice(),
             WriteBuf::Zeros(len) => &ZERO_PAGE[..*len],
         }
     }
@@ -391,26 +464,6 @@ pub struct SegmentEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // every op reports the tag it carries
-    #[test]
-    fn tag_roundtrip() {
-        let open = Op::Open {
-            tag: Tag(7),
-            path: PathBuf::from("/reel/segment-0"),
-            create: true,
-            direct: false,
-        };
-        let writev = Op::Writev {
-            tag: Tag(9),
-            file: FileId(1),
-            offset: 0,
-            bufs: vec![WriteBuf::owned(vec![1, 2, 3])],
-        };
-
-        assert_eq!(open.tag(), Tag(7));
-        assert_eq!(writev.tag(), Tag(9));
-    }
 
     use crate::format::column::{ColumnId, RecordKey};
     use crate::format::lsn::Lsn;

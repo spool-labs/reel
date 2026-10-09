@@ -14,62 +14,138 @@ use crate::index::page::KeyPage;
 use crate::index::playback::PlaybackCursor;
 use crate::reel::cue::CuePoint;
 
-use super::{read_only, FoundPlan, ReelStore, GRAVE_WINDOW, SWEEP_RUN};
+use super::{read_only, ReelStore, GRAVE_WINDOW, SWEEP_RUN};
 use crate::index::entry::Entry;
 use crate::index::recovery::rebuild_reel;
 use crate::index::tailer::{catch_up, CaughtUp, LogCursor};
-use crate::reel::{Ask, RecordRead};
+use crate::reel::{Ask, RecordRead, Spot};
 use crate::sync::lock;
-use reel_core::{range_of, Value};
+use reel_core::{range_of, ReadBlock, Value};
 
 /// How many times a read re-resolves a stale index pointer before giving up
 const RESOLVE_RETRIES: u32 = 4;
 
-/// The lists one thread's resolved batches work through, kept between reads
+/// One batch read in place: the blocks it filled, a spot per key, and the records
+/// it had to own
 ///
-/// Both are as wide as the batch and neither leaves, so they stay with the thread:
-/// only the answers a batch hands back are bought per read.
+/// A walk lends from it until its next batch, and a caller keeping records takes
+/// them out as values.
 #[derive(Default)]
-struct FoundAsks {
+pub(crate) struct Placed {
     /// What the device is asked for, one per key the index placed
     asks: Vec<Ask>,
 
-    /// What it answered, in the order asked
-    read: Vec<RecordRead>,
+    /// One block per merged read
+    blocks: Vec<ReadBlock>,
+
+    /// Where each key's record sits, by the caller's position
+    spots: Vec<Spot>,
+
+    /// Records a lookup or a decode answered, which no block holds
+    owned: Vec<Value>,
 }
 
-impl FoundAsks {
-    const fn empty() -> FoundAsks {
-        FoundAsks {
-            asks: Vec::new(),
-            read: Vec::new(),
+/// A spot's block when the record is held owned, its index into `owned`
+const OWNED: u32 = u32::MAX - 1;
+
+impl Placed {
+    /// The record at a key's position, lent until the next batch
+    pub(crate) fn lend(&self, at: usize) -> Option<&[u8]> {
+        let spot = self.spots.get(at)?;
+        match spot.block {
+            OWNED => Some(&self.owned[spot.at as usize]),
+            block => {
+                let start = spot.at as usize;
+                let block = self.blocks.get(block as usize)?;
+                block.get(start..start + spot.len as usize)
+            }
+        }
+    }
+
+    /// The record at a key's position, as a value of its own
+    pub(crate) fn take(&mut self, at: usize) -> Option<Value> {
+        let spot = *self.spots.get(at)?;
+        match spot.block {
+            OWNED => Some(std::mem::take(&mut self.owned[spot.at as usize])),
+            block => self
+                .blocks
+                .get(block as usize)?
+                .window(spot.at as usize, spot.len as usize),
+        }
+    }
+
+    /// Whether the batch holds a record for the key at this position
+    pub(crate) fn holds(&self, at: usize) -> bool {
+        self.spots.get(at).is_some_and(|spot| *spot != Spot::MISS)
+    }
+
+    /// Hold a record the blocks cannot answer, at a key's position
+    pub(crate) fn hold(&mut self, at: usize, value: Value) {
+        self.spots[at] = Spot {
+            block: OWNED,
+            at: self.owned.len() as u32,
+            len: 0,
+            codec: 0,
+        };
+        self.owned.push(value);
+    }
+
+    /// Start over on a batch of this many keys, with every one missing
+    fn reset(&mut self, keys: usize) {
+        self.asks.clear();
+        self.blocks.clear();
+        self.owned.clear();
+        self.spots.clear();
+        self.spots.resize(keys, Spot::MISS);
+    }
+
+    /// Keys the index placed that the read did not find, which have to be resolved again
+    pub(crate) fn missed(&self) -> impl Iterator<Item = usize> + '_ {
+        self.asks
+            .iter()
+            .map(|ask| ask.at as usize)
+            .filter(|&at| self.spots[at] == Spot::MISS)
+    }
+
+    /// Decode every record the read left as stored bytes
+    fn decode_coded(&mut self) {
+        for at in 0..self.spots.len() {
+            let spot = self.spots[at];
+            if spot.codec == 0 || spot.block == OWNED {
+                continue;
+            }
+            let stored = &self.blocks[spot.block as usize][spot.at as usize..][..spot.len as usize];
+            match crate::append::codec::decode(spot.codec, stored) {
+                Some(decoded) => self.hold(at, Value::pooled(decoded, crate::reel::payload::give)),
+                // A decode that fails is corruption wearing a valid checksum, left for
+                // the single-key path to answer.
+                None => self.spots[at] = Spot::MISS,
+            }
         }
     }
 }
 
 thread_local! {
-    /// One set of batch lists per reading thread, handed back after every read
-    static FOUND_ASKS: std::cell::Cell<FoundAsks> =
-        const { std::cell::Cell::new(FoundAsks::empty()) };
+    /// One placed batch per reading thread, handed back after every read
+    static PLACED: std::cell::Cell<Placed> = std::cell::Cell::new(Placed::default());
 }
 
-/// This thread's batch lists, given back however the read that borrowed them ends
-struct HeldAsks(FoundAsks);
+/// This thread's placed batch, given back however the read that borrowed it ends
+struct HeldPlaced(Placed);
 
-impl HeldAsks {
-    fn take() -> HeldAsks {
-        HeldAsks(FOUND_ASKS.with(std::cell::Cell::take))
+impl HeldPlaced {
+    fn take() -> HeldPlaced {
+        HeldPlaced(PLACED.with(std::cell::Cell::take))
     }
 }
 
-impl Drop for HeldAsks {
+impl Drop for HeldPlaced {
     fn drop(&mut self) {
         let mut held = std::mem::take(&mut self.0);
-        held.asks.clear();
-        // Cleared rather than dropped, so a value a failed batch left goes back to
+        // Cleared rather than dropped, so a block a failed batch left goes back to
         // the payload pool here rather than being held until this thread reads again.
-        held.read.clear();
-        FOUND_ASKS.with(|spare| spare.set(held));
+        held.reset(0);
+        PLACED.with(|spare| spare.set(held));
     }
 }
 
@@ -168,7 +244,7 @@ impl ReelStore {
         // Borrowed for the read: the batch holds the caller's keys the whole way
         // through and the read path only ever reads them.
         let borrowed: Vec<KeyRef<'_>> = keys.iter().map(RecordKey::as_ref).collect();
-        self.read_found(&borrowed, &found, &mut [])
+        self.read_found(&borrowed, &found)
     }
 
     /// Read several keys as one future, answered in the order asked
@@ -178,7 +254,7 @@ impl ReelStore {
         self.settle_sealed()?;
         let found = self.locate_many(keys)?;
         let borrowed: Vec<KeyRef<'_>> = keys.iter().map(RecordKey::as_ref).collect();
-        self.read_found_wait(&borrowed, &found, &mut []).await
+        self.read_found_wait(&borrowed, &found).await
     }
 
     /// Ask the index where every key sits, all of them against one state of it
@@ -197,31 +273,19 @@ impl ReelStore {
         &self,
         keys: &[KeyRef<'_>],
         found: &[Option<Entry>],
-        carried: &mut [Option<Arc<[u8]>>],
     ) -> Result<Vec<Option<Value>>> {
-        let mut held = HeldAsks::take();
-        let asked = &mut held.0;
-        let mut plan = self.plan_found(keys, found, carried, &mut asked.asks);
-        if asked.asks.is_empty() {
-            return Ok(plan.answers);
-        }
-
-        self.reel
-            .read_records(&asked.asks, keys, self.config.verify_reads, &mut asked.read)?;
-        // Stepped by position rather than by a draining iterator, since the retry
-        // below re-enters the engine and must not be holding these lists when it does.
-        for slot in 0..asked.asks.len().min(asked.read.len()) {
-            let ask = asked.asks[slot];
-            let outcome = std::mem::replace(&mut asked.read[slot], RecordRead::Stale);
-            let at = ask.at as usize;
-            match self.keep_found(keys[at], ask.lsn, outcome) {
-                Some(payload) => plan.answers[at] = Some(payload),
-                // The record moved or went bad since the caller resolved it, which is
-                // what compaction does under a playback.
-                None => plan.answers[at] = self.get(&keys[at].to_owned_key()?)?,
+        let mut held = HeldPlaced::take();
+        let placed = &mut held.0;
+        self.read_placed(keys, found, placed)?;
+        // The record moved or went bad since the caller resolved it, which is what
+        // compaction does under a playback.
+        let missed: Vec<usize> = placed.missed().collect();
+        for at in missed {
+            if let Some(value) = self.get(&keys[at].to_owned_key()?)? {
+                placed.hold(at, value);
             }
         }
-        Ok(plan.answers)
+        Ok((0..keys.len()).map(|at| placed.take(at)).collect())
     }
 
     /// Read a resolved batch as a future, answered in the order asked
@@ -231,73 +295,64 @@ impl ReelStore {
         &self,
         keys: &[KeyRef<'_>],
         found: &[Option<Entry>],
-        carried: &mut [Option<Arc<[u8]>>],
     ) -> Result<Vec<Option<Value>>> {
-        let mut held = HeldAsks::take();
-        let asked = &mut held.0;
-        let mut plan = self.plan_found(keys, found, carried, &mut asked.asks);
-        if asked.asks.is_empty() {
-            return Ok(plan.answers);
+        let mut held = HeldPlaced::take();
+        let placed = &mut held.0;
+        self.plan_placed(keys.len(), found, placed);
+        if !placed.asks.is_empty() {
+            self.reel
+                .read_placed_wait(
+                    &placed.asks,
+                    keys,
+                    self.config.verify_reads,
+                    &mut placed.blocks,
+                    &mut placed.spots,
+                )
+                .await?;
+            placed.decode_coded();
         }
-
-        self.reel
-            .read_records_wait(&asked.asks, keys, self.config.verify_reads, &mut asked.read)
-            .await?;
-        for slot in 0..asked.asks.len().min(asked.read.len()) {
-            let ask = asked.asks[slot];
-            let outcome = std::mem::replace(&mut asked.read[slot], RecordRead::Stale);
-            let at = ask.at as usize;
-            match self.keep_found(keys[at], ask.lsn, outcome) {
-                Some(payload) => plan.answers[at] = Some(payload),
-                None => plan.answers[at] = self.get_wait(&keys[at].to_owned_key()?).await?,
+        let missed: Vec<usize> = placed.missed().collect();
+        for at in missed {
+            if let Some(value) = self.get_wait(&keys[at].to_owned_key()?).await? {
+                placed.hold(at, value);
             }
         }
-        Ok(plan.answers)
+        Ok((0..keys.len()).map(|at| placed.take(at)).collect())
     }
 
-    /// Split a resolved batch into what the index answers and what the device must
-    ///
-    /// A value carried out of the index is answered without taking a place in the
-    /// submission, so the batch is only the keys that need the device.
-    fn plan_found(
+    /// Read a resolved batch into place, leaving every record it could not find a miss
+    pub(crate) fn read_placed(
         &self,
         keys: &[KeyRef<'_>],
         found: &[Option<Entry>],
-        carried: &mut [Option<Arc<[u8]>>],
-        asks: &mut Vec<Ask>,
-    ) -> FoundPlan {
-        let mut answers: Vec<Option<Value>> = (0..keys.len()).map(|_| None).collect();
-        asks.clear();
-        asks.reserve(keys.len());
+        placed: &mut Placed,
+    ) -> Result<()> {
+        self.plan_placed(keys.len(), found, placed);
+        if placed.asks.is_empty() {
+            return Ok(());
+        }
+        self.reel.read_placed(
+            &placed.asks,
+            keys,
+            self.config.verify_reads,
+            &mut placed.blocks,
+            &mut placed.spots,
+        )?;
+        placed.decode_coded();
+        Ok(())
+    }
 
-        for (at, entry) in found.iter().enumerate().take(keys.len()) {
+    /// An ask for every key the index placed, with every key missing until read
+    fn plan_placed(&self, keys: usize, found: &[Option<Entry>], placed: &mut Placed) {
+        placed.reset(keys);
+        for (at, entry) in found.iter().enumerate().take(keys) {
             if let Some(entry) = entry {
-                if let Some(value) = carried.get_mut(at).and_then(Option::take) {
-                    answers[at] = Some(Value::shared(value));
-                    continue;
-                }
-                asks.push(Ask {
+                placed.asks.push(Ask {
                     loc: entry.loc,
                     lsn: entry.lsn,
                     at: at as u32,
                 });
             }
-        }
-        FoundPlan { answers }
-    }
-
-    /// What one batched read answered, or nothing when the key has to be re-resolved
-    fn keep_found(&self, key: KeyRef<'_>, lsn: Lsn, outcome: RecordRead) -> Option<Value> {
-        match outcome {
-            RecordRead::Found(payload) => {
-                // A scan must not displace the point-get working set, so an armed
-                // carried tier admits nothing the bulk path read.
-                if self.config.carried_budget.to_bytes() == 0 {
-                    self.index.warm_carried(key, lsn, &payload, false);
-                }
-                Some(payload)
-            }
-            RecordRead::Stale | RecordRead::Gone | RecordRead::Corrupt | RecordRead::Coded => None,
         }
     }
 
@@ -354,16 +409,13 @@ impl ReelStore {
         let dead: Vec<bool> = std::iter::once(false)
             .chain(self.config.volumes.iter().map(|volume| volume.dead))
             .collect();
-        let rebuilt = rebuild_reel(&self.driver, &roots, &dead, self.config.index.pages())?;
-        self.index.install(
-            rebuilt.entries,
-            rebuilt.covers,
-            rebuilt.segments,
-            rebuilt.segment_min_lsn,
-            rebuilt.segment_max_lsn,
-            rebuilt.sealed,
-            rebuilt.sealed_keys,
-        );
+        let rebuilt = rebuild_reel(
+            &self.driver,
+            &roots,
+            &dead,
+            self.config.index.pages(),
+            &self.index,
+        )?;
         let mut cursor = lock(&self.cursor);
         *cursor = LogCursor::new();
         cursor.start_from(&rebuilt.consumed);
@@ -493,7 +545,6 @@ impl ReelStore {
     /// pointer unresolved, since evicting would delete a key from a volume the
     /// reader does not own.
     fn resolve_read(&self, key: &RecordKey) -> Result<Resolved> {
-        // Resolved once, so a column that carries nothing pays no lookup per retry.
         let mut resolving = Resolving::new(self, key);
         for _ in 0..RESOLVE_RETRIES {
             let entry = match resolving.step(self, key)? {
@@ -537,11 +588,9 @@ impl ReelStore {
 
     /// Resolve one key and read the range its entry places, retrying as a read does
     ///
-    /// The carried tier is read from and never written to here, since a range holds
-    /// a piece of a record and the tier holds records. An entry whose incarnation
-    /// stamp is still current takes one device read and no header echo; everything
-    /// else takes the header-checked read, and a header saying a codec produced the
-    /// record sends the window to the whole read.
+    /// An entry whose incarnation stamp is still current takes one device read and no
+    /// header echo. Everything else takes the header-checked read, and a header saying a
+    /// codec produced the record sends the window to the whole read.
     fn resolve_range(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Resolved> {
         let mut resolving = Resolving::new(self, key);
         for _ in 0..RESOLVE_RETRIES {
@@ -564,7 +613,7 @@ impl ReelStore {
             if matches!(read, RecordRead::Coded) {
                 return self.whole_range(key, offset, len);
             }
-            if let Some(resolved) = resolving.fold_range(self, key, entry, read)? {
+            if let Some(resolved) = resolving.fold(self, key, entry, read)? {
                 return Ok(resolved);
             }
         }
@@ -601,7 +650,7 @@ impl ReelStore {
             if matches!(read, RecordRead::Coded) {
                 return self.whole_range_wait(key, offset, len).await;
             }
-            if let Some(resolved) = resolving.fold_range(self, key, entry, read)? {
+            if let Some(resolved) = resolving.fold(self, key, entry, read)? {
                 return Ok(resolved);
             }
         }
@@ -638,59 +687,16 @@ impl ReelStore {
         !current.is_none() && current == entry.incarnation
     }
 
-    /// What the index alone answers for one key, before the volume is asked
-    fn resolve_index(&self, key: &RecordKey, carries: bool) -> Result<Ready> {
-        // A column whose rows carry their values asks the search to bring the value
-        // back with the row, since the block holding it was read either way.
-        let row_carry = self.reel.shared().row_carry(key.column);
-        let mut from_row = match row_carry {
-            0 => Vec::new(),
-            carry => crate::reel::payload::take(carry as usize),
-        };
-        let asking = (row_carry > 0).then_some(&mut from_row);
-        let entry = match self.index.get_carried(key, asking)? {
-            Some(entry) => entry,
-            None => {
-                crate::reel::payload::give(from_row);
-                return Ok(Ready::Missing);
-            }
-        };
-        // A value the row did not carry leaves the buffer cleared, and its length can
-        // only match by being zero, which the record answers with the same bytes.
-        if row_carry > 0 && from_row.len() == entry.loc.len as usize {
-            return Ok(Ready::Payload(Value::pooled(
-                from_row,
-                crate::reel::payload::give,
-            )));
-        }
-        crate::reel::payload::give(from_row);
-        if carries {
-            if let Some(payload) = self.index.carried_value(key, entry.lsn) {
-                return Ok(Ready::Payload(Value::shared(payload)));
-            }
-        }
-        Ok(Ready::Read(entry))
-    }
-
     /// What one attempt's read settled, or nothing when the loop is to try again
     fn after_read(
         &self,
         key: &RecordKey,
         entry: Entry,
         read: RecordRead,
-        carries: bool,
         framed_nothing: &mut Option<Loc>,
     ) -> Result<Option<Resolved>> {
         match read {
-            RecordRead::Found(payload) => {
-                // A carrying column remembers what the device answered, guarded on
-                // the sequence number so a racing overwrite is never captured.
-                if carries {
-                    let two_touch = self.config.carried_budget.to_bytes() > 0;
-                    self.index.warm_carried(key.as_ref(), entry.lsn, &payload, two_touch);
-                }
-                Ok(Some(Resolved::Payload(payload)))
-            }
+            RecordRead::Found(payload) => Ok(Some(Resolved::Payload(payload))),
             // A sole copy has nobody to repair from, so evicting would hide the loss:
             // the key keeps its place and the read fails and says so, every time.
             RecordRead::Corrupt if self.config.repair == RepairPath::None => {
@@ -771,9 +777,6 @@ enum RangeStep {
 /// Both doors hold one of these and hand it back the read they made, so the lookup,
 /// the clamp, the stale-pointer fold and the giving up happen here once.
 struct Resolving {
-    /// Whether the key's column carries values in the index
-    carries: bool,
-
     /// Whether the column's records can hold what a codec produced
     coded: bool,
 
@@ -784,7 +787,6 @@ struct Resolving {
 impl Resolving {
     fn new(store: &ReelStore, key: &RecordKey) -> Resolving {
         Resolving {
-            carries: store.index.carry_max(key.column) != 0,
             coded: store.is_coded(key.column),
             framed_nothing: None,
         }
@@ -800,10 +802,9 @@ impl Resolving {
 
     /// What the index says about a whole-record read
     fn step(&self, store: &ReelStore, key: &RecordKey) -> Result<Step> {
-        Ok(match store.resolve_index(key, self.carries)? {
-            Ready::Payload(payload) => Step::Done(Resolved::Payload(payload)),
-            Ready::Missing => Step::Done(Resolved::Missing),
-            Ready::Read(entry) => Step::Read(entry),
+        Ok(match store.index.get(key)? {
+            Some(entry) => Step::Read(entry),
+            None => Step::Done(Resolved::Missing),
         })
     }
 
@@ -820,14 +821,8 @@ impl Resolving {
         offset: u64,
         len: usize,
     ) -> Result<RangeStep> {
-        let entry = match store.resolve_index(key, self.carries)? {
-            Ready::Payload(payload) => {
-                return Ok(RangeStep::Done(Resolved::Payload(range_of(
-                    payload, offset, len,
-                ))))
-            }
-            Ready::Missing => return Ok(RangeStep::Done(Resolved::Missing)),
-            Ready::Read(entry) => entry,
+        let Some(entry) = store.index.get(key)? else {
+            return Ok(RangeStep::Done(Resolved::Missing));
         };
         let wanted = clamped(entry.loc.len, offset, len);
         match wanted {
@@ -839,7 +834,7 @@ impl Resolving {
         }
     }
 
-    /// Fold a whole-record read back in: an answer, or nothing and go round again
+    /// Fold a read back in: an answer, or nothing and go round again
     fn fold(
         &mut self,
         store: &ReelStore,
@@ -847,39 +842,13 @@ impl Resolving {
         entry: Entry,
         read: RecordRead,
     ) -> Result<Option<Resolved>> {
-        store.after_read(key, entry, read, self.carries, &mut self.framed_nothing)
-    }
-
-    /// The same for a window, which is never answered from the carried tier
-    ///
-    /// A carried value is a whole payload, and one was already answered from before
-    /// a window reached a read.
-    fn fold_range(
-        &mut self,
-        store: &ReelStore,
-        key: &RecordKey,
-        entry: Entry,
-        read: RecordRead,
-    ) -> Result<Option<Resolved>> {
-        store.after_read(key, entry, read, false, &mut self.framed_nothing)
+        store.after_read(key, entry, read, &mut self.framed_nothing)
     }
 
     /// Out of retries, which is where a pointer that never framed is evicted
     fn give_up(self, store: &ReelStore, key: &RecordKey) -> Result<Resolved> {
         store.give_up(key, self.framed_nothing)
     }
-}
-
-/// What the index alone can say about one key, before the volume is asked
-enum Ready {
-    /// The value, from the entry itself or from the carried tier
-    Payload(Value),
-
-    /// The entry whose record has to be read off the volume
-    Read(Entry),
-
-    /// The reel does not hold this key
-    Missing,
 }
 
 /// What resolving one key against the reel produced

@@ -2,8 +2,7 @@
 //!
 //! Column families are hash maps under one lock over the whole store, and every
 //! read copies its value. That is the shape an oracle wants and the wrong one for
-//! production; a store that serves hot values from memory is reel itself with
-//! `carried_budget` armed.
+//! production.
 
 mod memory;
 

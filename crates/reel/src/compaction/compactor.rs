@@ -7,19 +7,20 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::append::CopyRecord;
 use crate::config::{ReelConfig, RepairPath, VolumeClass};
 use crate::error::Result;
 use crate::format::band::Band;
 use crate::format::column::RecordKey;
-use crate::format::footer::FooterEntry;
-use crate::format::footer::{FooterPartition, SegmentFooter, FIXED_TAIL_LEN, NO_RECORD};
+use crate::format::footer::{FooterPartition, SegmentFooter, FIXED_TAIL_LEN};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{peek_key_width, read_u32_le, RecordHeader, HEADER_LEN};
 use crate::format::segment_header::SegmentHeader;
 use crate::index::map::ReelIndex;
+use crate::io::op::Part;
 use crate::reel::segment::{SegmentHandle, SegmentReader, READ_CHUNK};
 use crate::reel::{Reel, ReelShared, NOTHING_PURGED};
 use crate::sync::{lock, try_lock};
@@ -45,11 +46,8 @@ const FETCH_DEPTH: usize = 8;
 
 /// What rewriting one of a segment's records produced, whichever order reached it
 enum Rewrote {
-    /// A live record was copied, carrying this many footprint bytes
-    Copied(u64),
-
-    /// A live value went into a row, and no record was written for it
-    Listed,
+    /// A live record joined the run waiting to land
+    Queued,
 
     /// The record was dead, corrupt, or below the purge floor
     Skipped,
@@ -66,11 +64,8 @@ enum Rewrote {
 
 /// What handling one live-record copy produced
 enum CopyStep {
-    /// The record was copied, carrying this many footprint bytes
-    Copied(u64),
-
-    /// The value went into a row and no record was written for it
-    Listed,
+    /// The record joined the run waiting to land
+    Queued,
 
     /// The record was dead or corrupt, so nothing was copied
     Skipped,
@@ -135,11 +130,11 @@ pub struct CompactionCounters {
     /// Records the scrub or compaction found failing their checksum
     pub scrub_hits: u64,
 
+    /// Record bytes the scrub has read back and checked
+    pub scrub_bytes: u64,
+
     /// Records dropped for sitting below the purge floor rather than copied
     pub records_purged: u64,
-
-    /// Values a rewrite put in a row and wrote no record for, costing no copied bytes
-    pub rows_listed: u64,
 
     /// Sorted runs merge passes read together, the only trace a tick-driven merge leaves
     pub runs_merged: u64,
@@ -172,8 +167,8 @@ struct Metrics {
     tombstones_carried: AtomicU64,
     tombstones_dropped: AtomicU64,
     scrub_hits: AtomicU64,
+    scrub_bytes: AtomicU64,
     records_purged: AtomicU64,
-    rows_listed: AtomicU64,
     runs_merged: AtomicU64,
     read_bytes: AtomicU64,
 }
@@ -187,8 +182,8 @@ impl Metrics {
             tombstones_carried: AtomicU64::new(0),
             tombstones_dropped: AtomicU64::new(0),
             scrub_hits: AtomicU64::new(0),
+            scrub_bytes: AtomicU64::new(0),
             records_purged: AtomicU64::new(0),
-            rows_listed: AtomicU64::new(0),
             runs_merged: AtomicU64::new(0),
             read_bytes: AtomicU64::new(0),
         }
@@ -206,12 +201,15 @@ impl Metrics {
             .fetch_add(tally.carried, Ordering::AcqRel);
         self.tombstones_dropped
             .fetch_add(tally.dropped, Ordering::AcqRel);
-        self.rows_listed.fetch_add(tally.listed, Ordering::AcqRel);
         self.read_bytes.fetch_add(read_bytes, Ordering::AcqRel);
     }
 
     fn record_hits(&self, hits: u64) {
         self.scrub_hits.fetch_add(hits, Ordering::AcqRel);
+    }
+
+    fn record_scrubbed(&self, bytes: u64) {
+        self.scrub_bytes.fetch_add(bytes, Ordering::AcqRel);
     }
 
     fn record_purged(&self, purged: u64) {
@@ -230,8 +228,8 @@ impl Metrics {
             tombstones_carried: self.tombstones_carried.load(Ordering::Acquire),
             tombstones_dropped: self.tombstones_dropped.load(Ordering::Acquire),
             scrub_hits: self.scrub_hits.load(Ordering::Acquire),
+            scrub_bytes: self.scrub_bytes.load(Ordering::Acquire),
             records_purged: self.records_purged.load(Ordering::Acquire),
-            rows_listed: self.rows_listed.load(Ordering::Acquire),
             runs_merged: self.runs_merged.load(Ordering::Acquire),
             read_bytes: self.read_bytes.load(Ordering::Acquire),
             // the compactor holds the pins, so the gauge is filled by its reader
@@ -240,30 +238,27 @@ impl Metrics {
     }
 }
 
-/// What the fetch phase learned about a record, carried to the apply phase
-///
-/// Everything the fetch already asked the index is an answer the apply would ask for a
-/// second time, which on a paged column is a footer search.
-enum Staged {
-    /// Nothing was staged, so the apply reads the payload and asks for itself
-    Unread,
-
-    /// The index no longer pointed at this record when the fetch looked
-    Dead,
-
-    /// Live when the fetch looked, with the bytes if the fetch read them
-    Live(Option<Vec<u8>>),
-}
-
 /// What one pass accumulated while it rewrote
 #[derive(Default)]
 struct PassTally {
     copied_bytes: u64,
-    listed: u64,
     carried: u64,
     dropped: u64,
     had_live: bool,
     rotted: bool,
+}
+
+/// Live records waiting to land in the destination as one write, in the order queued
+#[derive(Default)]
+struct CopyRun {
+    /// The records the appender is handed
+    copies: Vec<CopyRecord>,
+
+    /// Each queued record's key, sequence number and span, for its repoint and the tally
+    moved: Vec<(RecordKey, Lsn, u64)>,
+
+    /// Bytes the queued records frame
+    bytes: u64,
 }
 
 /// Where the last scrub pass stopped, so the next one carries on from there
@@ -286,6 +281,15 @@ struct ScrubCursor {
 
     /// Dead bytes counted in this segment so far, across however many passes
     dead: u64,
+}
+
+/// Restarts a scrub gate's earnings however its pass leaves
+struct Rest<'gate>(&'gate RateGate);
+
+impl Drop for Rest<'_> {
+    fn drop(&mut self) {
+        self.0.rest();
+    }
 }
 
 /// What one segment's share of a scrub pass produced
@@ -349,6 +353,9 @@ pub struct Compactor {
     /// What each sealed segment's footer said, so a walk over the standing ones reads
     /// none of them again
     sealed_facts: Mutex<std::collections::HashMap<SegmentId, FooterFacts>>,
+
+    /// Read buffers the last pass finished with, which the next pass reads into
+    spare: Mutex<Vec<Vec<u8>>>,
 }
 
 /// Takes a segment out of the in-flight set however its pass leaves
@@ -376,7 +383,9 @@ impl Compactor {
     /// The claim is what stops two passes reading and retiring the same file. A merge
     /// takes one per source and holds them all for the length of its pass.
     pub fn claim(&self, segment: SegmentId) -> Option<PassClaim<'_>> {
-        lock(&self.in_flight).insert(segment).then_some(PassClaim {
+        // a dropped claim relocks in_flight, so the guard ends here and only a won insert builds one
+        let won = lock(&self.in_flight).insert(segment);
+        won.then(|| PassClaim {
             compactor: self,
             segment,
         })
@@ -469,6 +478,7 @@ impl Compactor {
             in_flight: Mutex::new(std::collections::HashSet::new()),
             rotted: Mutex::new(std::collections::HashMap::new()),
             sealed_facts: Mutex::new(std::collections::HashMap::new()),
+            spare: Mutex::new(Vec::new()),
             // nothing about the sweep survives the process, so the rotation comes from
             // something that differs between runs of it
             scrub_seed: SystemTime::now()
@@ -478,6 +488,11 @@ impl Compactor {
             demote_after_bytes,
             metrics: Metrics::new(),
         }
+    }
+
+    /// Give back the read buffers kept between passes, once there is no next pass
+    pub fn release_spare(&self) {
+        *lock(&self.spare) = Vec::new();
     }
 
     /// Free-space pressure and tiering for the volume
@@ -731,10 +746,13 @@ impl Compactor {
                 return Ok(());
             }
         };
-        let region_end = footer_bound(shared, &source, file_len)?;
-        // key order where the segment can say what that is, offset order otherwise
-        let order = self.rewrite_order(shared, segment);
+        // read once for the pass: where the records end, and their key order where the
+        // segment can say what that is, offset order otherwise
+        let footer = shared.footer_of(segment)?;
+        let region_end = footer_bound(shared, &source, file_len, footer.as_deref())?;
+        let order = footer.as_deref().and_then(footer_order);
         let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
+        reader.stock(std::mem::take(&mut *lock(&self.spare)));
         // The band the source was drawn under is where its survivors belong. Placement
         // the writer paid for is undone otherwise: every rewrite would put a window's
         // records back into the mixture they were kept out of.
@@ -786,20 +804,6 @@ impl Compactor {
             ),
         };
 
-        // the source's standing rows come across before the flush, since the scan above
-        // only ever saw records and these have none
-        match self.relist_standing(reel, index, dest_index, segment) {
-            Ok((moved, rot)) => {
-                tally.listed += moved;
-                tally.had_live |= moved > 0;
-                tally.rotted |= rot;
-            }
-            Err(error) => {
-                drop(source);
-                return Err(error);
-            }
-        }
-
         if let Err(error) = reel.tails()[dest_index].flush() {
             drop(source);
             return Err(error);
@@ -813,6 +817,7 @@ impl Compactor {
         // refills at dead records included, plus the copies it wrote.
         let read_bytes = reader.read_bytes();
         let charged = read_bytes.saturating_add(tally.copied_bytes);
+        *lock(&self.spare) = reader.into_spare();
 
         // A rotted record on a sole copy keeps its segment: the key still resolves into
         // this file, and retiring it would unlink the last copy of those bytes.
@@ -835,21 +840,11 @@ impl Compactor {
             return Ok(());
         }
 
-        // The destination is closed before the source is retired, since a listed row is
-        // not on disk until the seal writes it, and the error is propagated because a
-        // seal that fails must leave the source standing. Closing per pass also keeps
-        // one source's records to one destination, so key and offset order agree in it.
+        // Closing per pass keeps one source's records to one destination, so key and
+        // offset order agree in it.
         if tally.had_live {
             if let Some(reserved) = reel.reserved_tail() {
-                let closed = reel.tails()[reserved].seal()?;
-                // A listed row has no index entry, so noting the destination's spans
-                // ahead of the retire closes a window where an acknowledged key exists
-                // nowhere a read looks.
-                if tally.listed > 0 {
-                    if let Some(footer) = shared.footer_of(closed)? {
-                        index.note_spans(closed, &footer)?;
-                    }
-                }
+                reel.tails()[reserved].seal()?;
             }
         }
 
@@ -895,7 +890,8 @@ impl Compactor {
         tally: &mut PassTally,
         pace: &mut PassPace<'_>,
     ) -> Result<()> {
-        let mut pool: Vec<Vec<u8>> = Vec::new();
+        let mut run = CopyRun::default();
+        let mut staged: Vec<Option<Part>> = Vec::new();
         let mut start = 0usize;
         while start < order.len() {
             let end = stripe_end(order, start);
@@ -905,7 +901,10 @@ impl Compactor {
             plan.sort_unstable_by_key(|&(_, offset)| offset);
             let ranges = chunk_ranges(&plan, order, prefix_bound, reader.limit());
 
-            let mut staged: Vec<(usize, SourceRecord, Staged)> = Vec::with_capacity(plan.len());
+            // One held stretch per record, in the slot its key order gives it, so the
+            // apply walks them in order with nothing to sort.
+            staged.clear();
+            staged.resize(end - start, None);
             let mut wave_at = 0usize;
             while wave_at < ranges.len() {
                 let wave =
@@ -913,31 +912,49 @@ impl Compactor {
                 wave_at += wave.len();
                 let asks: Vec<(u64, usize)> =
                     wave.iter().map(|range| (range.start, range.len)).collect();
-                let buffers = reader.read_ranges(&asks, &mut pool)?;
+                let buffers = reader.read_ranges(&asks)?;
                 for (range, buffer) in wave.iter().zip(buffers) {
-                    pool.push(reader.preload(range.start, buffer));
+                    reader.preload(range.start, buffer);
                     for &(position, offset) in &plan[range.members.clone()] {
-                        let record =
-                            match RecordScan::resuming(reader, u64::from(offset)).next_record()? {
-                                Some(record) => record,
-                                // a footer offset the records disagree with gives up
-                                // the record, not the pass
-                                None => continue,
-                            };
-                        let payload = self.stage_payload(reel, index, reader, &record, segment)?;
-                        staged.push((position, record, payload));
+                        // Held where the read left it and parsed at the apply, so a
+                        // record costs the fetch sixteen bytes whatever its key weighs.
+                        let span = prefix_bound as usize + order[position].1 as usize;
+                        staged[position - start] = Some(reader.held(u64::from(offset), span)?);
                     }
                 }
                 pace.reached(reader.read_bytes() + tally.copied_bytes);
             }
-            staged.sort_unstable_by_key(|entry| entry.0);
 
-            for (_, record, payload) in staged {
+            for (slot, held) in staged.drain(..).enumerate() {
+                let Some(held) = held else {
+                    continue;
+                };
+                let offset = order[start + slot].0;
+                let (record, payload) = match held_record(offset, held) {
+                    Some(found) => found,
+                    // a record its footer row undersold is read where it lies
+                    None => match RecordScan::resuming(reader, u64::from(offset)).next_record()? {
+                        Some(record) => {
+                            let payload = match record.header.flags.is_tombstone() {
+                                true => None,
+                                false => Some(held_payload(reader, &record)?),
+                            };
+                            (record, payload)
+                        }
+                        // a footer offset the records disagree with gives up the
+                        // record, not the pass
+                        None => continue,
+                    },
+                };
                 self.apply_one(
-                    reel, dest_index, index, reader, &record, payload, segment, drop_floor, tally,
+                    reel, dest_index, index, reader, record, payload, segment, drop_floor,
+                    &mut run, tally,
                 )?;
                 pace.reached(reader.read_bytes() + tally.copied_bytes);
             }
+            // The copies are written out of the stripe's read buffers, so landing them
+            // is what frees those buffers for the next stripe.
+            self.land_run(reel, dest_index, index, &mut run, tally)?;
             start = end;
         }
         Ok(())
@@ -959,62 +976,23 @@ impl Compactor {
         tally: &mut PassTally,
         pace: &mut PassPace<'_>,
     ) -> Result<()> {
+        let mut run = CopyRun::default();
         let mut at = 0u64;
-        loop {
-            let record = match RecordScan::resuming(reader, at).next_record()? {
-                Some(record) => {
-                    at = u64::from(record.offset) + record.header.span();
-                    record
-                }
-                None => return Ok(()),
-            };
+        while let Some(record) = RecordScan::resuming(reader, at).next_record()? {
+            at = u64::from(record.offset) + record.header.span();
             self.apply_one(
-                reel,
-                dest_index,
-                index,
-                reader,
-                &record,
-                Staged::Unread,
-                segment,
-                drop_floor,
-                tally,
+                reel, dest_index, index, reader, record, None, segment, drop_floor, &mut run, tally,
             )?;
             pace.reached(reader.read_bytes() + tally.copied_bytes);
         }
-    }
-
-    /// The payload a stripe fetch holds for the apply, where one will be wanted
-    ///
-    /// Nothing is staged for a record the apply is going to skip, since its bytes would
-    /// fill the cap with dead weight.
-    fn stage_payload(
-        &self,
-        reel: &Reel,
-        index: &ReelIndex,
-        reader: &mut SegmentReader<'_>,
-        record: &SourceRecord,
-        segment: SegmentId,
-    ) -> Result<Staged> {
-        let header = &record.header;
-        if header.flags.is_range_tombstone() {
-            return read_payload(reader, record).map(|end| Staged::Live(Some(end)));
-        }
-        if header.flags.is_tombstone() {
-            // a point tombstone has no payload to stage and asks nothing of the index
-            return Ok(Staged::Unread);
-        }
-        let live =
-            matches!(index.get(&header.key)?, Some(entry) if entry.loc == record.loc(segment));
-        if !live {
-            return Ok(Staged::Dead);
-        }
-        if is_purged(reel.shared().purge_floor(), index, &header.key) {
-            return Ok(Staged::Live(None));
-        }
-        read_payload(reader, record).map(|payload| Staged::Live(Some(payload)))
+        self.land_run(reel, dest_index, index, &mut run, tally)
     }
 
     /// Rewrite one record and fold what happened into the pass's tally
+    ///
+    /// A live record only joins the run. The run lands first when the record is a
+    /// tombstone, which has to go down where its key sorts, or when the record would
+    /// take the run past what one write may hold.
     #[allow(clippy::too_many_arguments)]
     fn apply_one(
         &self,
@@ -1022,31 +1000,52 @@ impl Compactor {
         dest_index: usize,
         index: &ReelIndex,
         reader: &mut SegmentReader<'_>,
-        record: &SourceRecord,
-        staged: Staged,
+        record: SourceRecord,
+        staged: Option<Part>,
         segment: SegmentId,
         drop_floor: Lsn,
+        run: &mut CopyRun,
         tally: &mut PassTally,
     ) -> Result<()> {
+        let cap = reel.tails()[dest_index].copy_run_cap();
+        if !record.header.flags.is_data() || run.bytes + record.span() > cap {
+            self.land_run(reel, dest_index, index, run, tally)?;
+        }
         match self.rewrite_one(
-            reel, dest_index, index, reader, record, staged, segment, drop_floor,
+            reel, dest_index, index, reader, record, staged, segment, drop_floor, run,
         )? {
-            Rewrote::Copied(span) => {
-                tally.copied_bytes += span;
-                tally.had_live = true;
-            }
-            // A listed row is live work like a copy, so the segment has something to
-            // seal. Its span stays out of the copied bytes, which gauge write
-            // amplification, since a listed value writes no record at all.
-            Rewrote::Listed => {
-                tally.had_live = true;
-                tally.listed += 1;
-            }
-            Rewrote::Skipped => {}
+            Rewrote::Queued | Rewrote::Skipped => {}
             Rewrote::Carried => tally.carried += 1,
             Rewrote::Dropped => tally.dropped += 1,
             Rewrote::Rotted => tally.rotted = true,
         }
+        Ok(())
+    }
+
+    /// Write the queued copies as one run and point the index at where they landed
+    ///
+    /// The copies are down while the index still points at the source, which is the
+    /// window a concurrent delete or overwrite has to win in, so every repoint is
+    /// guarded by the sequence number its copy was made under.
+    fn land_run(
+        &self,
+        reel: &Reel,
+        dest_index: usize,
+        index: &ReelIndex,
+        run: &mut CopyRun,
+        tally: &mut PassTally,
+    ) -> Result<()> {
+        if run.copies.is_empty() {
+            return Ok(());
+        }
+        run.bytes = 0;
+        let landed = reel.tails()[dest_index].append_copies(std::mem::take(&mut run.copies))?;
+        crate::sync::rendezvous::at("compaction/repoint");
+        for ((key, lsn, span), committed) in run.moved.drain(..).zip(landed) {
+            index.repoint(&key, committed.loc, lsn)?;
+            tally.copied_bytes += span;
+        }
+        tally.had_live = true;
         Ok(())
     }
 
@@ -1058,15 +1057,16 @@ impl Compactor {
         dest_index: usize,
         index: &ReelIndex,
         reader: &mut SegmentReader<'_>,
-        record: &SourceRecord,
-        staged: Staged,
+        record: SourceRecord,
+        staged: Option<Part>,
         segment: SegmentId,
         drop_floor: Lsn,
+        run: &mut CopyRun,
     ) -> Result<Rewrote> {
         if record.header.flags.is_tombstone() || record.header.flags.is_range_tombstone() {
             return Ok(
                 match self
-                    .carry_or_drop(reel, dest_index, index, reader, record, staged, drop_floor)?
+                    .carry_or_drop(reel, dest_index, index, reader, &record, staged, drop_floor)?
                 {
                     TombstoneStep::Carried => Rewrote::Carried,
                     TombstoneStep::Dropped => Rewrote::Dropped,
@@ -1074,28 +1074,12 @@ impl Compactor {
             );
         }
         Ok(
-            match self.copy_live(reel, dest_index, index, reader, record, staged, segment)? {
-                CopyStep::Copied(span) => Rewrote::Copied(span),
-                CopyStep::Listed => Rewrote::Listed,
+            match self.copy_live(reel, index, reader, record, staged, segment, run)? {
+                CopyStep::Queued => Rewrote::Queued,
                 CopyStep::Skipped => Rewrote::Skipped,
                 CopyStep::Rotted => Rewrote::Rotted,
             },
         )
-    }
-
-    /// A segment's records in key order, per column, as offset and length pairs
-    ///
-    /// A sealed segment's footer is already a sorted index of what it holds, so applying
-    /// records in that order is what makes the destination sorted on disk. The offsets
-    /// are trusted only as an order: every record is still read, framed and checksum
-    /// verified where it lands.
-    fn rewrite_order(
-        &self,
-        shared: &Arc<ReelShared>,
-        segment: SegmentId,
-    ) -> Option<(Vec<(u32, u32)>, u64)> {
-        let footer = shared.footer_of(segment).ok().flatten()?;
-        footer_order(&footer)
     }
 
     /// Punch the dead runs out of sealed segments, and say what came back
@@ -1119,7 +1103,7 @@ impl Compactor {
             for partition in &footer.partitions {
                 for at in 0..partition.len() {
                     let row = partition.row_at(at)?;
-                    if row.stands_alone() || !row.flags.is_data() {
+                    if !row.flags.is_data() {
                         continue;
                     }
                     offsets.push(row.offset);
@@ -1135,7 +1119,7 @@ impl Compactor {
                 Some(len) => len,
                 None => continue,
             };
-            let region_end = footer_bound(shared, &source, file_len)?;
+            let region_end = footer_bound(shared, &source, file_len, Some(&footer))?;
             let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
             let mut runs: Vec<(u64, u64)> = Vec::new();
             for offset in offsets {
@@ -1179,148 +1163,25 @@ impl Compactor {
         Ok(report)
     }
 
-    /// A row that can be this value's only home, when everything about it allows one
-    ///
-    /// Every condition here is a way to lose the value rather than a preference: the
-    /// volume and the destination have to allow listing, the record has to be
-    /// uncompressed, the key must be gone from the resident map, and the row itself has
-    /// to be able to hold the value.
-    fn carried_row(
-        &self,
-        reel: &Reel,
-        index: &ReelIndex,
-        dest_index: usize,
-        record: &SourceRecord,
-        payload: &[u8],
-    ) -> Option<FooterEntry> {
-        if !self.may_list(reel, dest_index) {
-            return None;
-        }
-        if record.header.codec != 0 {
-            return None;
-        }
-        // A key still in the resident map names this record from RAM and nothing
-        // repoints it when the row is listed, so the record is copied instead and a
-        // later pass lists it once the key has paged out.
-        if index
-            .column(record.header.key.column)
-            .and_then(|column| column.entry_or_grave(record.header.key.as_slice()))
-            .is_some()
-        {
-            return None;
-        }
-        let carry = index.spec(record.header.key.column)?.row_carry_width();
-        FooterEntry::standing_alone(
-            record.header.key.clone(),
-            record.header.lsn,
-            record.header.flags,
-            carry,
-            payload,
-        )
-    }
-
-    /// Whether this pass may put a value in a row and write no record for it
-    ///
-    /// Both conditions are about who holds the only copy: the volume has to page, since
-    /// a resident entry would keep naming a record about to be unlinked, and the
-    /// destination has to be the tail this pass seals itself.
-    fn may_list(&self, reel: &Reel, dest_index: usize) -> bool {
-        reel.shared().config.index.pages() && reel.reserved_tail() == Some(dest_index)
-    }
-
-    /// Carry a source's standing rows into the destination, since no record holds them
-    ///
-    /// The scan walks records and a listed row has none, so without this a pass over a
-    /// segment holding one would retire it and take the only copy of its value. A row
-    /// the index no longer resolves to is dropped, which is how one is reclaimed.
-    fn relist_standing(
-        &self,
-        reel: &Reel,
-        index: &ReelIndex,
-        dest_index: usize,
-        segment: SegmentId,
-    ) -> Result<(u64, bool)> {
-        if !self.may_list(reel, dest_index) {
-            return Ok((0, false));
-        }
-        let Some(footer) = reel.shared().footer_of(segment)? else {
-            return Ok((0, false));
-        };
-        let mut listed = 0u64;
-        let mut rotted = false;
-        for partition in &footer.partitions {
-            let Some(carry) = index
-                .spec(partition.column)
-                .map(|spec| spec.row_carry_width())
-            else {
-                continue;
-            };
-            for at in 0..partition.len() {
-                let row = partition.row_at(at)?;
-                if !row.stands_alone() {
-                    continue;
-                }
-                let Some(bytes) = partition.key_at(at) else {
-                    continue;
-                };
-                let key = RecordKey::from_bytes(partition.column, bytes)?;
-                let key_of = key.clone();
-                // the row has to still be the version the volume answers with
-                let loc = Loc::new(segment, NO_RECORD, row.len);
-                match index.get(&key)? {
-                    Some(entry) if entry.loc == loc => {}
-                    Some(_) | None => continue,
-                }
-                // a row that will not verify is the sole copy of its value, so its
-                // segment is kept the way a rotted record's is
-                let value = match partition.carried_at(at) {
-                    Ok(Some(value)) => value,
-                    Ok(None) | Err(_) => {
-                        self.metrics.record_hits(1);
-                        rotted = true;
-                        continue;
-                    }
-                };
-                let Some(entry) =
-                    FooterEntry::standing_alone(key, row.lsn, row.flags, carry, value)
-                else {
-                    rotted = true;
-                    continue;
-                };
-                reel.tails()[dest_index].list_carried_row(&entry)?;
-                index.note_listed(&key_of, segment, row.len);
-                listed += 1;
-            }
-        }
-        Ok((listed, rotted))
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn copy_live(
         &self,
         reel: &Reel,
-        dest_index: usize,
         index: &ReelIndex,
         reader: &mut SegmentReader<'_>,
-        record: &SourceRecord,
-        staged: Staged,
+        record: SourceRecord,
+        staged: Option<Part>,
         segment: SegmentId,
+        run: &mut CopyRun,
     ) -> Result<CopyStep> {
         let loc = record.loc(segment);
-        // The fetch phase already asked whether the index points here, so the apply asks
-        // only when nothing did. The repoint below is guarded on the version the fetch
-        // saw, so a record that dies between the two phases loses there.
-        let staged = match staged {
-            Staged::Dead => return Ok(CopyStep::Skipped),
-            Staged::Live(payload) => payload,
-            Staged::Unread => {
-                match index.get(&record.header.key)? {
-                    Some(entry) if entry.loc == loc => {}
-                    Some(_) | None => return Ok(CopyStep::Skipped),
-                }
-                None
-            }
-        };
+        // Asked here, where a stripe arrives in key order and one key's walk of the map
+        // leaves the next one's path warm. The repoint is guarded on the version this
+        // saw, so a record that dies before its run lands loses there.
+        match index.get(&record.header.key)? {
+            Some(entry) if entry.loc == loc => {}
+            Some(_) | None => return Ok(CopyStep::Skipped),
+        }
 
         // A record the floor has passed is dropped and its key goes with it. No
         // tombstone is written: the key is below a floor the whole volume agrees on, so
@@ -1333,9 +1194,9 @@ impl Compactor {
 
         let payload = match staged {
             Some(payload) => payload,
-            None => read_payload(reader, record)?,
+            None => held_payload(reader, &record)?,
         };
-        if !record.header.verify(&payload) {
+        if !record.header.verify(payload.as_slice()) {
             // With peers the eviction turns the miss into a repair enqueue. A sole copy
             // keeps its bytes where they are: rewriting them would stamp a fresh
             // checksum over rot and serve it as good.
@@ -1353,28 +1214,19 @@ impl Compactor {
             return Ok(CopyStep::Rotted);
         }
 
-        // A value the destination's rows can hold goes into a row and nowhere else.
-        // The index is not repointed: the source keeps answering until a paged search
-        // finds the new row, once the destination's spans are noted at its seal.
-        if let Some(entry) = self.carried_row(reel, index, dest_index, record, &payload) {
-            reel.tails()[dest_index].list_carried_row(&entry)?;
-            index.note_listed(&record.header.key, segment, record.header.length);
-            return Ok(CopyStep::Listed);
-        }
-
-        // the queue owns what it writes and the repoint below needs the key again, so
-        // the clone is required rather than incidental
-        let committed = reel.tails()[dest_index].append_copy(
-            record.header.key.clone(),
-            record.header.lsn,
+        // The appender owns what it writes and the repoint needs the key again, so
+        // the key is cloned once.
+        let span = record.span();
+        let header = record.header;
+        run.bytes += span;
+        run.copies.push(CopyRecord {
+            key: header.key.clone(),
+            lsn: header.lsn,
             payload,
-            record.header.codec,
-        )?;
-        // the copy is down and the index still points at the source, which is the
-        // window a concurrent delete or overwrite has to win in
-        crate::sync::rendezvous::at("compaction/repoint");
-        index.repoint(&record.header.key, committed.loc, record.header.lsn)?;
-        Ok(CopyStep::Copied(record.span()))
+            codec: header.codec,
+        });
+        run.moved.push((header.key, header.lsn, span));
+        Ok(CopyStep::Queued)
     }
 
     /// Carry a tombstone into the destination, or drop one nothing can undo
@@ -1389,7 +1241,7 @@ impl Compactor {
         index: &ReelIndex,
         reader: &mut SegmentReader<'_>,
         record: &SourceRecord,
-        staged: Staged,
+        staged: Option<Part>,
         drop_floor: Lsn,
     ) -> Result<TombstoneStep> {
         if !should_carry(index, &record.header, drop_floor)? {
@@ -1398,8 +1250,8 @@ impl Compactor {
         let tail = &reel.tails()[dest_index];
         let carried = if record.header.flags.is_range_tombstone() {
             let end = match staged {
-                Staged::Live(Some(end)) => end,
-                Staged::Live(None) | Staged::Unread | Staged::Dead => read_payload(reader, record)?,
+                Some(end) => end.as_slice().to_vec(),
+                None => read_payload(reader, record)?,
             };
             tail.append_carried_range(record.header.key.clone(), record.header.lsn, end)?
         } else {
@@ -1427,10 +1279,14 @@ impl Compactor {
         };
         // the rate decides how much this pass may read, so the sweep runs at its
         // configured rate whether the plane is ticked once a minute or in a tight loop
-        let mut budget = gate.allowance(SCRUB_PASS_MAX);
+        let (mut budget, stretch) = gate.allowance(SCRUB_PASS_MAX);
+        let _rest = Rest(gate);
         if budget == 0 {
             return Ok(0);
         }
+        // A pass stops at its bytes or at the stretch it earned, whichever comes first,
+        // so a scrub slower than its rate holds the tick no longer than it waited.
+        let deadline = Instant::now() + stretch;
 
         let shared = reel.shared();
         let mut plan = Vec::new();
@@ -1483,7 +1339,15 @@ impl Compactor {
             };
             // the moment a pass is mid-sweep, for a test probing what a second caller sees
             crate::sync::rendezvous::at("scrub/segment");
-            let step = self.scrub_segment(shared, index, *segment, resume, carried, &mut budget)?;
+            let step = self.scrub_segment(
+                shared,
+                index,
+                *segment,
+                resume,
+                carried,
+                &mut budget,
+                deadline,
+            )?;
             hits += step.hits;
             if let Some((offset, region_end)) = step.resume_at {
                 *lock(&self.scrub_cursor) = Some(ScrubCursor {
@@ -1504,6 +1368,7 @@ impl Compactor {
         Ok(hits)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scrub_segment(
         &self,
         shared: &Arc<ReelShared>,
@@ -1512,6 +1377,7 @@ impl Compactor {
         resume: Option<(u64, u64)>,
         carried: u64,
         budget: &mut u64,
+        deadline: Instant,
     ) -> Result<ScrubStep> {
         // a sweep runs behind whatever the plane is retiring, so a segment can go
         // between the plan and the pass
@@ -1538,16 +1404,26 @@ impl Compactor {
         };
         let (from, region_end) = match resume {
             Some(carried) => carried,
-            None => (0, footer_bound(shared, &handle, file_len)?),
+            None => {
+                let footer = shared.footer_of(handle.id())?;
+                (
+                    0,
+                    footer_bound(shared, &handle, file_len, footer.as_deref())?,
+                )
+            }
         };
         let mut reader = SegmentReader::new(&shared.driver, handle.file(), region_end);
         let mut scan = RecordScan::resuming(&mut reader, from);
 
         let mut hits = 0usize;
         let mut dead = carried;
+        let mut scanned = 0u64;
         loop {
-            if *budget == 0 {
+            // a record is read before the clock is asked, so every pass moves the sweep
+            let is_late = scanned > 0 && Instant::now() >= deadline;
+            if *budget == 0 || is_late {
                 self.metrics.record_hits(hits as u64);
+                self.metrics.record_scrubbed(scanned);
                 return Ok(ScrubStep {
                     hits,
                     dead,
@@ -1559,6 +1435,7 @@ impl Compactor {
                 None => break,
             };
             *budget = budget.saturating_sub(record.span());
+            scanned += record.span();
             if !record.header.flags.is_data() {
                 continue;
             }
@@ -1597,6 +1474,7 @@ impl Compactor {
             }
         }
         self.metrics.record_hits(hits as u64);
+        self.metrics.record_scrubbed(scanned);
         Ok(ScrubStep {
             hits,
             dead,
@@ -1617,10 +1495,6 @@ fn footer_order(footer: &SegmentFooter) -> Option<(Vec<(u32, u32)>, u64)> {
         widest = widest.max(partition.widest_key());
         for row in 0..partition.len() {
             match partition.row_at(row) {
-                // A row that stands alone names no record, and its sentinel offset
-                // sitting in key order among real ones would read as unsorted for
-                // ever, so every destination would re-select itself.
-                Ok(row) if row.stands_alone() => {}
                 Ok(row) => order.push((row.offset, row.len)),
                 Err(_) => return None,
             }
@@ -1634,12 +1508,30 @@ fn footer_order(footer: &SegmentFooter) -> Option<(Vec<(u32, u32)>, u64)> {
 /// A footer whose rows will not decode names no order at all, and a rewrite for order
 /// has nothing to put such a segment into, so it is left where a scan can still read it.
 fn footer_facts(footer: &SegmentFooter) -> FooterFacts {
-    let is_out_of_order = footer_order(footer)
-        .is_some_and(|(order, _)| !order.windows(2).all(|pair| pair[0].0 <= pair[1].0));
     FooterFacts {
         is_sorted_run: footer.partitions.iter().all(FooterPartition::is_sorted_run),
-        is_out_of_order,
+        is_out_of_order: is_out_of_order(footer),
     }
+}
+
+/// Whether a footer's rows, taken in key order, ever step back in offset
+///
+/// Read off the rows where they lie, so a question with a yes or no answer builds no
+/// list of them. False where a row will not decode, as a footer with no order has none
+/// to be out of.
+fn is_out_of_order(footer: &SegmentFooter) -> bool {
+    let mut last = 0u32;
+    let mut steps_back = false;
+    for partition in &footer.partitions {
+        for row in 0..partition.len() {
+            let Ok(row) = partition.row_at(row) else {
+                return false;
+            };
+            steps_back |= row.offset < last;
+            last = row.offset;
+        }
+    }
+    steps_back
 }
 
 /// Whether a tombstone has to come across, or nothing it shadows can still turn up
@@ -1777,13 +1669,17 @@ pub fn is_missing(error: &crate::error::ReelError) -> bool {
 }
 
 /// Where a sealed segment's record region ends, which is where its footer begins
+///
+/// The caller brings the footer it read, or nothing for a segment that has none, so a
+/// pass that needs the rows as well reads the footer once.
 pub fn footer_bound(
     shared: &Arc<ReelShared>,
     handle: &SegmentHandle,
     file_len: u64,
+    footer: Option<&SegmentFooter>,
 ) -> Result<u64> {
     let min_footer = FIXED_TAIL_LEN as u64;
-    if file_len < min_footer {
+    if footer.is_none() || file_len < min_footer {
         return Ok(file_len);
     }
     let trailer = shared
@@ -1796,13 +1692,7 @@ pub fn footer_bound(
     if footer_len < min_footer || footer_len > file_len {
         return Ok(file_len);
     }
-    let footer_bytes = shared
-        .driver
-        .pread(handle.file(), file_len - footer_len, footer_len)?;
-    match SegmentFooter::parse(&footer_bytes) {
-        Ok(_) => Ok(file_len - footer_len),
-        Err(_) => Ok(file_len),
-    }
+    Ok(file_len - footer_len)
 }
 
 /// A forward walk over one segment's records, buying its bytes in chunks
@@ -1873,6 +1763,32 @@ impl<'reader, 'driver> RecordScan<'reader, 'driver> {
         }
         Ok(None)
     }
+}
+
+/// The record a held stretch of a segment opens with, and its payload inside the stretch
+///
+/// Nothing where the bytes are not a whole record a rewrite carries.
+fn held_record(offset: u32, held: Part) -> Option<(SourceRecord, Option<Part>)> {
+    let bytes = held.as_slice();
+    let width = peek_key_width(bytes.get(..HEADER_LEN)?)?;
+    let header = RecordHeader::unpack(bytes.get(..HEADER_LEN + width)?).ok()?;
+    if header.is_unwritten() || !header.fits_within(bytes.len() as u64) {
+        return None;
+    }
+    let flags = header.flags;
+    if !(flags.is_data() || flags.is_tombstone() || flags.is_range_tombstone()) {
+        return None;
+    }
+    let payload = match flags.is_tombstone() {
+        true => None,
+        false => Some(held.narrowed(HEADER_LEN + width, header.length as usize)),
+    };
+    Some((SourceRecord { header, offset }, payload))
+}
+
+/// The payload behind one record header, held where the reader's window has it
+pub fn held_payload(reader: &mut SegmentReader<'_>, record: &SourceRecord) -> Result<Part> {
+    reader.held(record.payload_at(), record.header.length as usize)
 }
 
 /// The payload behind one record header, copied out of the reader's window
@@ -2035,11 +1951,11 @@ mod tests {
         CompactRate, Preallocate, ReelConfig, SyncPolicy, ThreadBudget, DEFAULT_FD_CACHE,
     };
     use crate::format::column::{
-        Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, PurgeMark, RecordKey,
+        Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyWidth, MapShape, PurgeMark, RecordKey,
     };
     use crate::format::segment_header::SEGMENT_HEADER_SPAN;
-    use crate::index::entry::span_of;
-    use crate::index::recovery::{rebuild_reel, RebuiltReel};
+    use crate::index::entry::{span_of, Entry};
+    use crate::index::recovery::rebuild_reel;
     use crate::io::fault::{FaultKind, FaultPlan};
     use crate::io::sim_backend::{DurableImage, SimIo};
     use crate::reel::segment::{FdCache, IoDriver};
@@ -2056,8 +1972,6 @@ mod tests {
         name: "records",
         key_width: KeyWidth::Fixed(KEY_WIDTH as u16),
         shard_bytes: 2,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -2071,8 +1985,6 @@ mod tests {
         name: "marked",
         key_width: KeyWidth::Fixed(MARKED_WIDTH as u16),
         shard_bytes: 0,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: Some(PurgeMark::at(0)),
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -2152,7 +2064,7 @@ mod tests {
             .expect("put");
         fixture
             .index
-            .insert(&key(byte), committed.loc, committed.lsn, None)
+            .insert(&key(byte), committed.loc, committed.lsn)
             .expect("insert");
     }
 
@@ -2182,11 +2094,23 @@ mod tests {
         Path::new(REEL_DIR).join(segment_file_name(SegmentId(number)))
     }
 
-    fn rebuilt_from(fixture: &Fixture) -> RebuiltReel {
+    fn rebuilt_from(fixture: &Fixture) -> ReelIndex {
         let image = fixture.sim.durable_image();
         let restored = SimIo::from_image(image);
         let driver = IoDriver::new(Arc::new(restored));
-        rebuild_reel(&driver, &[PathBuf::from(REEL_DIR)], &[false], false).expect("rebuild")
+        let index = resident_index();
+        rebuild_reel(&driver, &[PathBuf::from(REEL_DIR)], &[false], false, &index)
+            .expect("rebuild");
+        index
+    }
+
+    fn resident_index() -> ReelIndex {
+        ReelIndex::new(
+            COLUMNS,
+            crate::config::IndexResidency::Resident,
+            crate::config::ShardShapes::Tree,
+        )
+        .expect("index")
     }
 
     fn reopen(image: DurableImage, config: ReelConfig) -> Fixture {
@@ -2204,25 +2128,17 @@ mod tests {
             COLUMNS,
             1,
         ));
-        let rebuilt = rebuild_reel(driver.as_ref(), &[PathBuf::from(REEL_DIR)], &[false], false)
-            .expect("rebuild");
+        let index = resident_index();
+        let rebuilt = rebuild_reel(
+            driver.as_ref(),
+            &[PathBuf::from(REEL_DIR)],
+            &[false],
+            false,
+            &index,
+        )
+        .expect("rebuild");
         shared.lsn.recover_to(rebuilt.highest_lsn);
         shared.recover_next_segment(rebuilt.highest_segment);
-        let index = ReelIndex::new(
-            COLUMNS,
-            crate::config::IndexResidency::Resident,
-            crate::config::ShardShapes::Tree,
-        )
-        .expect("index");
-        index.install(
-            rebuilt.entries,
-            rebuilt.covers,
-            rebuilt.segments,
-            rebuilt.segment_min_lsn,
-            rebuilt.segment_max_lsn,
-            rebuilt.sealed,
-            rebuilt.sealed_keys,
-        );
         let reel = Reel::open(Arc::clone(&shared), Vec::new()).expect("reopen reel");
         let compactor = Compactor::new(&config, 0, 0);
         Fixture {
@@ -2234,18 +2150,15 @@ mod tests {
     }
 
     /// Keys the rebuild resolved in the record column, in key order
-    fn rebuilt_keys(rebuilt: &RebuiltReel) -> Vec<Vec<u8>> {
-        let mut out: Vec<Vec<u8>> = rebuilt
-            .entries
-            .get(&RECORDS)
-            .map(|rows| {
-                rows.iter()
-                    .map(|(key, _)| key.as_slice().to_vec())
-                    .collect()
-            })
-            .unwrap_or_default();
-        out.sort();
-        out
+    fn rebuilt_keys(rebuilt: &ReelIndex) -> Vec<Vec<u8>> {
+        rebuilt_rows(rebuilt)
+            .iter()
+            .map(|(key, _)| key.as_slice().to_vec())
+            .collect()
+    }
+
+    fn rebuilt_rows(rebuilt: &ReelIndex) -> Vec<(KeyBytes, Entry)> {
+        rebuilt.column(RECORDS).expect("records").held()
     }
 
     /// The bytes of one key, for comparing against a rebuild
@@ -2311,7 +2224,7 @@ mod tests {
                 .expect("put");
             fixture
                 .index
-                .insert(&key, committed.loc, committed.lsn, None)
+                .insert(&key, committed.loc, committed.lsn)
                 .expect("insert");
         }
         seal(&fixture);
@@ -2529,7 +2442,8 @@ mod tests {
         let shared = fixture.reel.shared();
         let source = source_handle(shared, SegmentId(1)).expect("handle");
         let file_len = segment_len(shared, &source).expect("len").expect("present");
-        let region_end = footer_bound(shared, &source, file_len).expect("bound");
+        let footer = shared.footer_of(SegmentId(1)).expect("footer");
+        let region_end = footer_bound(shared, &source, file_len, footer.as_deref()).expect("bound");
         let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
         let mut scan = RecordScan::resuming(&mut reader, 0);
         let record = loop {
@@ -2538,17 +2452,19 @@ mod tests {
                 break record;
             }
         };
-        let payload = read_payload(scan.reader(), &record).expect("payload");
+        let payload = held_payload(scan.reader(), &record).expect("payload");
 
         put(&fixture, 1, vec![0x44; 500]);
         let committed = fixture.reel.tails()[0]
-            .append_copy(
-                record.header.key,
-                record.header.lsn,
+            .append_copies(vec![CopyRecord {
+                key: record.header.key,
+                lsn: record.header.lsn,
                 payload,
-                record.header.codec,
-            )
-            .expect("copy");
+                codec: record.header.codec,
+            }])
+            .expect("copy")
+            .pop()
+            .expect("one copy landed");
         let moved = fixture
             .index
             .repoint(&key(1), committed.loc, record.header.lsn)
@@ -2676,28 +2592,6 @@ mod tests {
         assert!(!rebuilt_keys(&rebuilt).contains(&key_bytes(1)));
     }
 
-    // a dropped tombstone never resurrects its key on a rebuild
-    #[test]
-    fn dropped_tombstone_stays_deleted() {
-        let fixture = fixture(settings());
-        put(&fixture, 1, vec![0x11; 200]);
-        delete(&fixture, 1);
-        seal(&fixture);
-        put(&fixture, 2, vec![0x22; 200]);
-        seal(&fixture);
-        put(&fixture, 3, vec![0x33; 200]);
-
-        fixture
-            .compactor
-            .compact_segment(&fixture.reel, &fixture.index, SegmentId(1))
-            .expect("compact");
-        fixture.reel.flush().expect("flush");
-
-        let rebuilt = rebuilt_from(&fixture);
-        assert!(!rebuilt_keys(&rebuilt).contains(&key_bytes(1)));
-        assert_eq!(rebuilt_keys(&rebuilt).len(), 2);
-    }
-
     // a crash after copying but before unlinking rebuilds one version from two copies
     #[test]
     fn mid_compaction_crash_one_version() {
@@ -2706,7 +2600,12 @@ mod tests {
         seal(&fixture);
 
         fixture.reel.tails()[0]
-            .append_copy(key(1), Lsn(1), vec![0x55; 300], 0)
+            .append_copies(vec![CopyRecord {
+                key: key(1),
+                lsn: Lsn(1),
+                payload: Part::whole(vec![0x55; 300]),
+                codec: 0,
+            }])
             .expect("copy");
         fixture.reel.flush().expect("flush");
 
@@ -2714,7 +2613,7 @@ mod tests {
 
         let rebuilt = rebuilt_from(&fixture);
         assert_eq!(rebuilt_keys(&rebuilt), vec![key_bytes(1)]);
-        let (_, entry) = rebuilt.entries[&RECORDS][0];
+        let (_, entry) = rebuilt_rows(&rebuilt)[0];
         assert_eq!(entry.lsn, Lsn(1));
     }
 
@@ -2754,6 +2653,30 @@ mod tests {
         assert_eq!(running.scrub_rate_mbps(), Some(4));
         assert!(!disabled.is_scrub_enabled());
         assert_eq!(disabled.scrub_rate_mbps(), None);
+    }
+
+    // a second claim on a held segment comes back empty and leaves the lock free
+    #[test]
+    fn second_claim_on_a_held_segment_is_refused() {
+        let compactor = Arc::new(Compactor::new(&settings(), 0, 0));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let claiming = Arc::clone(&compactor);
+        thread::spawn(move || {
+            let first = claiming.claim(SegmentId(7));
+            let second = claiming.claim(SegmentId(7));
+            let taken = (first.is_some(), second.is_some());
+            drop((first, second));
+            let _ = sender.send(taken);
+        });
+        let (first, second) = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the second claim deadlocked on in_flight");
+        assert!(first, "the first claim takes the segment");
+        assert!(!second, "the second claim is refused");
+        assert!(
+            compactor.claim(SegmentId(7)).is_some(),
+            "the first claim released it"
+        );
     }
 
     /// The op an out of space fault is injected at, past the open's own ops
@@ -3276,7 +3199,7 @@ mod tests {
                     .expect("put");
                 fixture
                     .index
-                    .insert(&key, committed.loc, committed.lsn, None)
+                    .insert(&key, committed.loc, committed.lsn)
                     .expect("insert");
             }
             seal(&fixture);

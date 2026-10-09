@@ -1470,6 +1470,39 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         })
     }
 
+    /// Every pair from a low bound on, a leaf's run at a time
+    ///
+    /// One descent places the bound, then each leaf hands over its keys and values as
+    /// two slices, so a caller copying a page copies runs instead of pairs.
+    pub fn range_runs<'a>(&'a self, low: Bound<&K>) -> impl Iterator<Item = (&'a [K], &'a [V])> {
+        let (mut at, mut slot) = match low {
+            Bound::Unbounded => (self.first, 0usize),
+            Bound::Included(key) => self.seat(key.borrow()).unwrap_or((NONE, 0)),
+            Bound::Excluded(key) => match self.seat(key.borrow()) {
+                Some((at, slot)) => {
+                    let leaf = &self.leaves[slot_of(at)];
+                    match slot < leaf.len && leaf.keys[slot] == *key {
+                        true => (at, slot + 1),
+                        false => (at, slot),
+                    }
+                }
+                None => (NONE, 0),
+            },
+        };
+        std::iter::from_fn(move || loop {
+            if at == NONE {
+                return None;
+            }
+            let leaf = &self.leaves[slot_of(at)];
+            let from = slot;
+            at = leaf.next;
+            slot = 0;
+            if from < leaf.len {
+                return Some((&leaf.keys[from..leaf.len], &leaf.vals[from..leaf.len]));
+            }
+        })
+    }
+
     /// The same span walked from its high end down
     ///
     /// The leaves are chained both ways, so this is the forward walk with the links
@@ -1580,6 +1613,29 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
     /// Leaves the tree occupies, emptied ones included
     pub fn leaf_count(&self) -> usize {
         self.leaves.len()
+    }
+
+    /// Bytes the node arenas have allocated, spare capacity included
+    ///
+    /// The arenas grow by doubling, so a tree holds its whole capacity. A key held
+    /// behind a pointer is left out.
+    pub fn heap_bytes(&self) -> u64 {
+        let spills: usize = self
+            .inners
+            .iter()
+            .map(|inner| inner.spill.capacity() * std::mem::size_of::<(u8, K)>())
+            .sum();
+        (self.leaves.capacity() * std::mem::size_of::<Leaf<K, B, V>>()
+            + self.inners.capacity() * std::mem::size_of::<Inner<K, B>>()
+            + spills) as u64
+    }
+
+    /// Whether every leaf is as full as a sorted build would leave it
+    ///
+    /// Ascending inserts leave each leaf one short, since an append splits off the
+    /// last key, and that counts: a repack would win back one slot in a node.
+    pub fn is_packed(&self) -> bool {
+        self.leaves.len() <= self.len.div_ceil(B - 1).max(1)
     }
 
     /// Whether packing would give back room worth the pass

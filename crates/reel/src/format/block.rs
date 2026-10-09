@@ -15,8 +15,8 @@ use crate::format::column::ColumnId;
 use crate::format::fence::{fence_bytes, top_leads, Fence, FenceCut, FENCE_LEAD};
 use crate::format::filter::Filter;
 use crate::format::footer::{
-    carry_region, directory_span, partition_spans, verify_row, DirectorySpan, FooterFind,
-    FooterRow, DIRECTORY_ROW_LEN, ENTRY_TAIL_LEN, FIXED_TAIL_LEN, VARYING_WIDTH,
+    directory_span, partition_spans, DirectorySpan, FooterFind, FooterRow, DIRECTORY_ROW_LEN,
+    ENTRY_TAIL_LEN, FIXED_TAIL_LEN, VARYING_WIDTH,
 };
 use crate::format::prefix::{unpack_block, RESTART_INTERVAL, TRAILER_LEN};
 use crate::format::record::read_u32_le;
@@ -48,11 +48,11 @@ pub const BLOCK_BYTES: usize = 8 * 1024;
 /// its unit of read is the restart block, whose first row carries its key whole. Free of
 /// the span because the seal cuts its fence at the same boundaries, and two copies of
 /// this arithmetic would be a fence naming the wrong block past the first cut.
-pub fn block_rows_of(key_width: u16, inline_width: u16) -> usize {
+pub fn block_rows_of(key_width: u16) -> usize {
     if key_width == VARYING_WIDTH {
         return RESTART_INTERVAL;
     }
-    let stride = key_width as usize + ENTRY_TAIL_LEN + carry_region(inline_width);
+    let stride = key_width as usize + ENTRY_TAIL_LEN;
     BLOCK_ROWS.min((BLOCK_BYTES / stride.max(1)).max(1))
 }
 
@@ -64,9 +64,6 @@ pub struct PartitionSpan {
 
     /// Width every row strides by, or the varying sentinel
     pub key_width: u16,
-
-    /// Bytes each row reserves for a value the column carries
-    pub inline_width: u16,
 
     /// Rows this column contributed to the footer
     pub rows: usize,
@@ -87,12 +84,12 @@ impl PartitionSpan {
     /// Bytes one row takes, where every row takes the same
     pub fn stride(&self) -> usize {
         debug_assert!(!self.is_varying(), "a varying partition has no stride");
-        self.key_width as usize + ENTRY_TAIL_LEN + carry_region(self.inline_width)
+        self.key_width as usize + ENTRY_TAIL_LEN
     }
 
     /// Rows one of this partition's blocks holds, the row count under the byte cap
     pub fn block_rows(&self) -> usize {
-        block_rows_of(self.key_width, self.inline_width)
+        block_rows_of(self.key_width)
     }
 
     /// Blocks the rows divide into
@@ -212,27 +209,26 @@ impl FooterMap {
             .collect::<Result<Vec<_>>>()?;
         let fences = read_fences(driver, file, file_len, &span, &spans, fence, probes)?;
         let filters = Filter::parse_region(region, spans.len());
-        Ok(Some(FooterMap {
-            partitions: spans
-                .into_iter()
-                .zip(filters)
-                .zip(restarts)
-                .zip(fences)
-                .map(|(((span, filter), restarts), fence)| Partition {
-                    span,
-                    filter,
-                    restarts,
-                    fence,
-                })
-                .collect(),
-        }))
+        let mut partitions: Vec<Partition> = spans
+            .into_iter()
+            .zip(filters)
+            .zip(restarts)
+            .zip(fences)
+            .map(|(((span, filter), restarts), fence)| Partition {
+                span,
+                filter,
+                restarts,
+                fence,
+            })
+            .collect();
+        // held in column order, which a lookup by column searches
+        partitions.sort_by_key(|held| held.span.column);
+        Ok(Some(FooterMap { partitions }))
     }
 
     /// Where one column sits in the directory, which every lookup here starts from
     fn at(&self, column: ColumnId) -> Option<&Partition> {
-        self.partitions
-            .iter()
-            .find(|held| held.span.column == column)
+        crate::format::footer::partition_in(&self.partitions, column, |held| held.span.column)
     }
 
     /// Where one column's rows sit and what its filter says, in one lookup
@@ -428,9 +424,6 @@ pub struct RowBlock {
     /// Width every row's key was written at, zero when they vary
     key_width: usize,
 
-    /// Bytes each row reserves for a value the column carries
-    inline_width: u16,
-
     /// Where each of this block's rows begins, rebased on the block, empty when strided
     starts: Vec<u32>,
 
@@ -459,7 +452,6 @@ impl RowBlock {
                 packed,
                 stride,
                 key_width: span.key_width as usize,
-                inline_width: span.inline_width,
                 starts: Vec::new(),
                 first,
             });
@@ -483,8 +475,7 @@ impl RowBlock {
                 "footer partition is truncated".to_string(),
             ));
         }
-        let tail_len = ENTRY_TAIL_LEN + carry_region(span.inline_width);
-        let (packed, starts) = unpack_block(&bytes, tail_len)?;
+        let (packed, starts) = unpack_block(&bytes, ENTRY_TAIL_LEN)?;
         if starts.len() - 1 != rows {
             return Err(ReelError::Corruption(
                 "a restart block holds a row count its table denies".to_string(),
@@ -494,7 +485,6 @@ impl RowBlock {
             packed,
             stride: 0,
             key_width: 0,
-            inline_width: span.inline_width,
             starts,
             first,
         })
@@ -538,7 +528,7 @@ impl RowBlock {
             return Some(self.key_width);
         }
         let (start, end) = self.row_span(at)?;
-        (end - start).checked_sub(ENTRY_TAIL_LEN + carry_region(self.inline_width))
+        (end - start).checked_sub(ENTRY_TAIL_LEN)
     }
 
     /// The key one of the block's rows carries
@@ -556,43 +546,13 @@ impl RowBlock {
     /// The newest row for a key inside this block, if the block holds it
     ///
     /// A segment that overwrote its own record holds both versions under one key in the
-    /// order they were written, so the last of an equal run is the live one. A caller
-    /// wanting the value passes a buffer, since the block goes out of scope behind the row.
-    pub fn find(&self, key: &[u8], carry: Option<&mut Vec<u8>>) -> Option<Result<FooterRow>> {
+    /// order they were written, so the last of an equal run is the live one.
+    pub fn find(&self, key: &[u8]) -> Option<Result<FooterRow>> {
         let at = self.upper_bound(key).checked_sub(1)?;
         if self.key_at(at)? != key {
             return None;
         }
-        let row = self.row_at(at);
-        if let (Some(into), Ok(found)) = (carry, row.as_ref()) {
-            into.clear();
-            if found.carries() {
-                match self.carry_at(at, found.len as usize) {
-                    Ok(Some(held)) => into.extend_from_slice(held),
-                    Ok(None) => {}
-                    Err(error) => return Some(Err(error)),
-                }
-            }
-        }
-        Some(row)
-    }
-
-    /// The value bytes one row carries, once the row's own checksum has answered
-    ///
-    /// A block read is not checksummed, which is safe while a row only names a record. A
-    /// row that answers with its own bytes carries a checksum, and this is where it is
-    /// spent.
-    fn carry_at(&self, at: usize, len: usize) -> Result<Option<&[u8]>> {
-        let Some((start, end)) = self.row_span(at) else {
-            return Ok(None);
-        };
-        let Some(width) = self.key_len(at) else {
-            return Ok(None);
-        };
-        match verify_row(&self.packed[start..end], width, self.inline_width)? {
-            Some(held) => Ok(held.get(..len)),
-            None => Ok(None),
-        }
+        Some(self.row_at(at))
     }
 
     /// The first row past a key, or the row count if none is
@@ -610,7 +570,7 @@ impl RowBlock {
         low
     }
 
-    /// Decode one of the block's rows, value and all
+    /// Decode one of the block's rows
     pub fn row_at(&self, at: usize) -> Result<FooterRow> {
         let (start, end) = self
             .row_span(at)
@@ -622,7 +582,7 @@ impl RowBlock {
             .packed
             .get(start..end)
             .ok_or_else(|| ReelError::Corruption("footer row is out of range".to_string()))?;
-        FooterRow::from_packed(bytes, width, self.inline_width)
+        FooterRow::read(bytes, width)
     }
 
     /// Where this block's rows sit among the partition's
@@ -642,12 +602,11 @@ pub fn lookup_in_span(
     key: &[u8],
     fence: impl FnOnce() -> Result<Option<FenceCut>>,
     load: impl FnMut(usize) -> Result<Option<Arc<RowBlock>>>,
-    carry: Option<&mut Vec<u8>>,
 ) -> Result<FooterFind> {
     if filter.is_some_and(|filter| !filter.may_hold(key)) {
         return Ok(FooterFind::RuledOut);
     }
-    match find_in_span(span, key, fence()?, load, carry)? {
+    match find_in_span(span, key, fence()?, load)? {
         None => Ok(FooterFind::Missing),
         Some(row) => Ok(FooterFind::Found(row)),
     }
@@ -664,7 +623,6 @@ fn find_in_span(
     key: &[u8],
     fence: Option<FenceCut>,
     mut load: impl FnMut(usize) -> Result<Option<Arc<RowBlock>>>,
-    carry: Option<&mut Vec<u8>>,
 ) -> Result<Option<FooterRow>> {
     let blocks = span.blocks();
     if blocks == 0 {
@@ -689,7 +647,7 @@ fn find_in_span(
     let Some(block) = load(at)? else {
         return Ok(None);
     };
-    match block.find(key, carry) {
+    match block.find(key) {
         Some(found) => found.map(Some),
         // A key equal to a later block's first key would have placed the search there, so
         // a miss here is a miss outright.

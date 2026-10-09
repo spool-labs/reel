@@ -84,8 +84,6 @@ fn column(id: ColumnId, name: &'static str, key_width: usize) -> ColumnSpec {
         name,
         key_width: KeyWidth::Fixed(key_width as u16),
         shard_bytes: 0,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,

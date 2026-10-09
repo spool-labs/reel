@@ -4,10 +4,8 @@
 //! A value is stored exactly as it arrives and read back verbatim, and a playback
 //! steps the column's index in key order and reads payloads lazily.
 
-use std::collections::VecDeque;
 use std::ops::Bound;
 use std::path::Path;
-use std::sync::Arc;
 
 use reel_core::store::{SweptKeys, SweptPage};
 use reel_core::{
@@ -15,6 +13,7 @@ use reel_core::{
     Result as StoreResult, Store, StoreIter, StoreVolume, Value, WriteBatch,
 };
 
+use crate::engine::read::Placed;
 use crate::engine::{RecordWrite, ReelStore};
 use crate::format::column::{ColumnId, KeyRef, KeyWidth, RecordKey, MAX_KEY_LEN};
 use crate::index::entry::Entry;
@@ -35,12 +34,6 @@ const PLAYBACK_PAGE_MAX: usize = 8192;
 /// A caller that stops after the keys it wanted still pays for every payload the run
 /// read ahead of it, so the first run is small and each one after it doubles.
 const PLAYBACK_RUN_MIN: usize = 8;
-
-/// Ceiling the run stops doubling at
-///
-/// A page of keys costs one trip to the index, but each payload behind them is a
-/// round trip the thread spends waiting, so a run of them is what fills the queue.
-const PLAYBACK_RUN_MAX: usize = 128;
 
 /// Payload bytes a playback lets a run reach before it stops adding to it
 ///
@@ -261,7 +254,7 @@ impl Store for ReelStore {
         Ok((rows, next))
     }
 
-    /// One page under a shard-aligned prefix, in no promised order
+    /// One page under a prefix, in key order on a tree and slot order on an open table
     fn sweep_prefix(
         &self,
         cf: &str,
@@ -321,7 +314,7 @@ impl Store for ReelStore {
         Ok(total)
     }
 
-    /// One page of keys under a shard-aligned prefix, in no promised order
+    /// One page of keys under a prefix, the same promise as `sweep_prefix`
     fn sweep_keys_prefix(
         &self,
         cf: &str,
@@ -359,10 +352,10 @@ impl Store for ReelStore {
             prefix: Some(prefix.to_vec()),
             ..Scope::empty(Direction::Asc)
         };
-        let mut page = Page::entries_only(&scope, column, self.serves(column));
+        let mut page = Page::with_lens(&scope, column, self.serves(column));
         let mut total = 0u64;
         let mut key = Vec::new();
-        while let Some((found, _)) = page.next_into(self, &mut key) {
+        while let Some(found) = page.next_into(self, &mut key) {
             match scope.locate(&key) {
                 Position::Past => break,
                 Position::Before => continue,
@@ -698,11 +691,10 @@ impl ReelStore {
             scope,
             column,
             page,
-            ready: VecDeque::new(),
-            spare: Vec::new(),
             staged: Vec::new(),
-            placed: Vec::new(),
-            held: Vec::new(),
+            found: Vec::new(),
+            placed: Placed::default(),
+            cursor: 0,
             run: PLAYBACK_RUN_MIN,
             is_done: false,
         }
@@ -716,7 +708,7 @@ impl ReelStore {
     fn playback_sized(&self, scope: Scope, column: ColumnId, hint: usize) -> Playback<'_> {
         let mut playback = self.playback(scope, column);
         if hint != 0 {
-            playback.run = hint.clamp(1, PLAYBACK_RUN_MAX);
+            playback.run = hint;
             playback.page.size = hint.clamp(1, PLAYBACK_PAGE_MAX);
         }
         playback
@@ -758,7 +750,7 @@ impl ReelStore {
 /// up strictly past the last key the previous one carried. The index lock is taken
 /// once per page and never held across a payload read.
 struct Page {
-    /// Keys the last page pulled, with whatever the column carries beside them
+    /// Keys the last page pulled, with where each record sits
     buffered: KeyPage,
 
     /// Whether the reel holds the column at all, since one it does not has no keys
@@ -774,9 +766,6 @@ struct Page {
     size: usize,
 }
 
-/// Where a key's record sits, beside the value the page already carries for it
-type Placed = (Option<Entry>, Option<Arc<[u8]>>);
-
 impl Page {
     /// A cursor over keys alone, for a playback that reads no payloads
     fn keys_only(scope: &Scope, column: ColumnId, serves: bool) -> Page {
@@ -786,12 +775,6 @@ impl Page {
     /// A cursor carrying each key's payload length, for a playback that stages reads
     fn with_lens(scope: &Scope, column: ColumnId, serves: bool) -> Page {
         Page::open(scope, column, serves, KeyPage::with_lens())
-    }
-
-    /// The same cursor without the values a carrying column keeps, for a walk that
-    /// weighs records rather than reading them
-    fn entries_only(scope: &Scope, column: ColumnId, serves: bool) -> Page {
-        Page::open(scope, column, serves, KeyPage::entries_only())
     }
 
     fn open(scope: &Scope, column: ColumnId, serves: bool, buffered: KeyPage) -> Page {
@@ -816,28 +799,33 @@ impl Page {
         self.buffered.len()
     }
 
-    /// The key at a position, written over whatever the buffer was holding
-    fn key_into(&self, index: usize, dst: &mut Vec<u8>) {
-        dst.clear();
-        dst.extend_from_slice(self.buffered.key_ref(index).unwrap_or_default());
+    /// Whether every key the buffer holds has been stepped past
+    fn is_drained(&self) -> bool {
+        self.taken == self.buffered_count()
+    }
+
+    /// The key at a position in the buffer, valid until the next fill
+    fn key(&self, slot: usize) -> &[u8] {
+        self.buffered.key_ref(slot).unwrap_or_default()
     }
 
     /// The same step with the key written into a buffer the caller keeps
-    ///
-    /// A walk that steps a million rows hands the same buffer back every time, where
-    /// an owned key allocates and frees per row to move as little as eight bytes.
-    fn next_into(&mut self, store: &ReelStore, key: &mut Vec<u8>) -> Option<Placed> {
+    fn next_into(&mut self, store: &ReelStore, key: &mut Vec<u8>) -> Option<Option<Entry>> {
+        let (slot, found) = self.step(store)?;
+        key.clear();
+        key.extend_from_slice(self.key(slot));
+        Some(found)
+    }
+
+    /// Step to the next key, filling the buffer when it runs out, and yield its slot
+    fn step(&mut self, store: &ReelStore) -> Option<(usize, Option<Entry>)> {
         if !self.serves {
             return None;
         }
         if self.taken < self.buffered_count() {
             let taken = self.taken;
             self.taken += 1;
-            self.key_into(taken, key);
-            return Some((
-                self.buffered.found_at(taken),
-                self.buffered.take_carried(taken),
-            ));
+            return Some((taken, self.buffered.found_at(taken)));
         }
 
         let playback = self.playback.as_mut()?;
@@ -846,6 +834,9 @@ impl Page {
             return None;
         }
         let wanted = self.size;
+        if let Some(KeyWidth::Fixed(width)) = store.key_shape(playback.column()) {
+            self.buffered.reserve(wanted, usize::from(width));
+        }
         // A page a paged column could not read ends the playback short, since an
         // iterator has nowhere to put an error. Counted, because that count is what
         // separates a short playback from a complete one that found less.
@@ -861,8 +852,7 @@ impl Page {
             return None;
         }
         self.taken = 1;
-        self.key_into(0, key);
-        Some((self.buffered.found_at(0), self.buffered.take_carried(0)))
+        Some((0, self.buffered.found_at(0)))
     }
 }
 
@@ -884,30 +874,17 @@ struct Playback<'store> {
     /// Keys pulled from the index, a page at a time
     page: Page,
 
-    /// What the last run read, in key order, waiting for the caller to take it
-    ///
-    /// Values rather than their bytes, since a merged read hands every record in a
-    /// run a window onto one block and owned vectors would copy them apart again.
-    ready: VecDeque<(Vec<u8>, Value)>,
-
-    /// Key buffers a lending walk gave back, waiting to be filled again
-    ///
-    /// Empty for a caller taking owned keys, since those leave and never come back.
-    spare: Vec<Vec<u8>>,
-
-    /// The keys one run stages, kept across the runs of a walk
-    ///
-    /// A walk of a million rows is hundreds of runs, and every list a run works
-    /// through is exactly as wide as the run, so they belong to the walk rather than
-    /// to the run. What leaves is the key buffers themselves, which come back through
-    /// `spare`; the lists holding them stay here.
-    staged: Vec<Vec<u8>>,
+    /// The page slots the last run staged, kept across the runs of a walk
+    staged: Vec<usize>,
 
     /// Where the index placed each of those keys
-    placed: Vec<Option<Entry>>,
+    found: Vec<Option<Entry>>,
 
-    /// The payload the index already carries for each of them, where it does
-    held: Vec<Option<Arc<[u8]>>>,
+    /// What the last run read, in place, by staged position
+    placed: Placed,
+
+    /// The staged position the walk reaches next
+    cursor: usize,
 
     /// Records the next run reads, doubling while the caller keeps draining them
     run: usize,
@@ -928,8 +905,7 @@ impl LentIter<'_> {
     /// The next entry, valid until the next step
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<(&[u8], &[u8])> {
-        let (key, value) = self.playback.next_lent()?;
-        Some((key, &**value))
+        self.playback.next_lent()
     }
 }
 
@@ -982,157 +958,105 @@ impl Iterator for Playback<'_> {
     type Item = (Vec<u8>, Value);
 
     fn next(&mut self) -> Option<(Vec<u8>, Value)> {
-        loop {
-            if let Some(found) = self.ready.pop_front() {
-                return Some(found);
-            }
-            if self.is_done {
-                return None;
-            }
-            self.read_run();
-        }
+        let at = self.step()?;
+        let value = self.placed.take(at)?;
+        Some((self.page.key(self.staged[at]).to_vec(), value))
     }
 }
 
-/// A key the playback reached, with what the index held for it and any carried bytes
-type ScopedKey = (Vec<u8>, Option<Entry>, Option<Arc<[u8]>>);
+/// A key's slot in the page, with what the index held for it
+type ScopedKey = (usize, Option<Entry>);
 
 impl Playback<'_> {
-    /// The next key inside the playback's scope, or nothing once the playback is over
-    fn next_in_scope(&mut self) -> Option<ScopedKey> {
-        // One buffer for the whole search, so a skipped key costs no allocation.
-        let mut key = self.spare.pop().unwrap_or_default();
+    /// The next key inside the playback's scope, and nothing past a page that staged keys point into
+    fn next_in_scope(&mut self, is_staging: bool) -> Option<ScopedKey> {
         loop {
-            let (found, carried) = match self.page.next_into(self.store, &mut key) {
-                Some(found) => found,
-                None => {
-                    self.is_done = true;
-                    self.recycle(key);
-                    return None;
-                }
+            if is_staging && self.page.is_drained() {
+                return None;
+            }
+            let Some((slot, found)) = self.page.step(self.store) else {
+                self.is_done = true;
+                return None;
             };
-            match self.scope.locate(&key) {
+            let key = self.page.key(slot);
+            match self.scope.locate(key) {
                 Position::Past => {
                     self.is_done = true;
-                    self.recycle(key);
                     return None;
                 }
                 Position::Before => continue,
                 Position::Inside => {}
             }
-            // The width is the one thing a key can fail on, and nothing owned is
-            // built here: the run lends these to the read path borrowed.
             if key.len() <= MAX_KEY_LEN {
-                return Some((key, found, carried));
+                return Some((slot, found));
             }
         }
     }
 
-    /// Take a key buffer back, up to about a run's worth
-    ///
-    /// Bounded so a walk that reads far more keys than it hands out cannot turn the
-    /// pool into a second copy of the column.
-    fn recycle(&mut self, key: Vec<u8>) {
-        if self.spare.len() < PLAYBACK_RUN_MAX {
-            self.spare.push(key);
-        }
+    /// The next entry with both halves lent until the caller's next step
+    fn next_lent(&mut self) -> Option<(&[u8], &[u8])> {
+        let at = self.step()?;
+        Some((self.page.key(self.staged[at]), self.placed.lend(at)?))
     }
 
-    /// The next entry with both halves lent until the caller's next step
-    ///
-    /// The entry stays in `ready` while the caller reads it and is retired on the
-    /// step after, which is what lets the key buffer come back rather than be freed.
-    fn next_lent(&mut self) -> Option<(&[u8], &Value)> {
-        if let Some((key, _value)) = self.ready.pop_front() {
-            self.recycle(key);
-        }
-        while self.ready.is_empty() {
+    /// The staged position of the next record read, reading a run when these ran out
+    fn step(&mut self) -> Option<usize> {
+        loop {
+            while self.cursor < self.staged.len() {
+                let at = self.cursor;
+                self.cursor += 1;
+                if self.placed.holds(at) {
+                    return Some(at);
+                }
+            }
             if self.is_done {
                 return None;
             }
             self.read_run();
         }
-        let (key, value) = self.ready.front()?;
-        Some((key.as_slice(), value))
     }
 
     /// Take the next run of keys off the page and read all of their payloads at once
     ///
-    /// The run stops at the depth, the byte ceiling, or the end of the playback. The
-    /// ceiling is tested after a record is added, so a record larger than the whole
-    /// ceiling is read on its own rather than never. The depth doubles per run, so a
-    /// caller that stops early pays for what it nearly wanted.
+    /// The run stops at the depth, the byte ceiling, the end of its page, or the end of
+    /// the playback. The ceiling is tested after a record is added, so a record larger
+    /// than the whole ceiling is read on its own rather than never. The depth doubles
+    /// per run, so a caller that stops early pays for what it nearly wanted.
     fn read_run(&mut self) {
         let wanted = self.run;
-        // Sized to the run, since these grow to exactly it on a draining walk. Taken
-        // out of the walk's own lists so a run past the first buys none of them.
-        let mut keys = std::mem::take(&mut self.staged);
-        let mut found = std::mem::take(&mut self.placed);
-        let mut carried = std::mem::take(&mut self.held);
-        keys.clear();
-        found.clear();
-        carried.clear();
-        keys.reserve(wanted);
-        found.reserve(wanted);
-        carried.reserve(wanted);
+        self.run = self.run.saturating_mul(2);
+        self.staged.clear();
+        self.found.clear();
+        self.cursor = 0;
         let mut bytes = 0u64;
-        self.run = (self.run * 2).min(PLAYBACK_RUN_MAX);
-
-        while keys.len() < wanted && bytes < PLAYBACK_READ_BYTES {
-            let Some((key, entry, value)) = self.next_in_scope() else {
+        while self.staged.len() < wanted && bytes < PLAYBACK_READ_BYTES {
+            let Some((slot, entry)) = self.next_in_scope(!self.staged.is_empty()) else {
                 break;
             };
-            // A value the page already carries costs the run nothing to stage.
-            bytes += match value {
-                Some(_) => 0,
-                None => entry.map(|entry| u64::from(entry.loc.len)).unwrap_or(0),
-            };
-            keys.push(key);
-            found.push(entry);
-            carried.push(value);
+            bytes += entry.map(|entry| u64::from(entry.loc.len)).unwrap_or(0);
+            self.staged.push(slot);
+            self.found.push(entry);
         }
 
         // The entries came off the page the index already built, so the read goes
         // straight to the device rather than resolving these keys a second time.
         let column = self.column;
-        let asked: Vec<KeyRef<'_>> = keys.iter().map(|key| KeyRef::new(column, key)).collect();
-        let read = self.store.read_found(&asked, &found, &mut carried);
-        drop(asked);
-        self.placed = found;
-        self.held = carried;
-        match read {
-            Ok(values) => {
-                for (key, value) in keys.drain(..).zip(values) {
-                    match value {
-                        Some(value) => self.ready.push_back((key, value)),
-                        None => self.recycle(key),
-                    }
-                }
-                self.staged = keys;
-            }
-            // A failed run says nothing about which record failed it, so it is read
-            // again one at a time and the unreadable record drops out on its own.
-            Err(_) => {
-                self.read_singly(&mut keys, column);
-                self.staged = keys;
-            }
+        let keys: Vec<KeyRef<'_>> = self
+            .staged
+            .iter()
+            .map(|&slot| KeyRef::new(column, self.page.key(slot)))
+            .collect();
+        // A failed read says nothing about which record failed it, so every key it
+        // left missing is looked up on its own and an unreadable one drops out.
+        if let Err(error) = self.store.read_placed(&keys, &self.found, &mut self.placed) {
+            tracing::warn!("a playback read a run one record at a time: {error}");
         }
-    }
-
-    /// Read a run one record at a time, dropping the ones that cannot be read
-    ///
-    /// The store iterator has no way to carry an error, so a key the playback cannot
-    /// read drops out of the results and is counted as unreadable.
-    fn read_singly(&mut self, keys: &mut Vec<Vec<u8>>, column: ColumnId) {
-        for key in keys.drain(..) {
-            // The one place a run builds an owned key, on the path a device error
-            // already sent one record at a time.
-            let Ok(record) = RecordKey::from_bytes(column, &key) else {
-                self.recycle(key);
-                continue;
-            };
-            match self.store.get(&record) {
-                Ok(Some(value)) => self.ready.push_back((key, value)),
+        let missed: Vec<usize> = self.placed.missed().collect();
+        for at in missed {
+            // The record moved or went bad since the page resolved it, which is what
+            // compaction does under a playback.
+            match keys[at].to_owned_key().and_then(|key| self.store.get(&key)) {
+                Ok(Some(value)) => self.placed.hold(at, value),
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!("a playback skipped a record it could not read: {error}");
@@ -1176,7 +1100,7 @@ mod tests {
 
     use crate::units::ByteCount;
 
-    use crate::config::{Preallocate, ReelConfig, SyncPolicy, ThreadBudget};
+    use crate::config::{Preallocate, ReelConfig, ShardShapes, SyncPolicy, ThreadBudget};
     use crate::format::column::{Codec, ColumnSet, ColumnSpec, MapShape};
     use crate::io::fault::FaultPlan;
     use crate::io::sim_backend::SimIo;
@@ -1202,8 +1126,6 @@ mod tests {
             name: RECORD_CF,
             key_width: KeyWidth::Fixed(RECORD_KEY_LEN as u16),
             shard_bytes: GROUP_PREFIX_LEN as u8,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
             map_shape: MapShape::Tree,
@@ -1213,8 +1135,6 @@ mod tests {
             name: BLOB_CF,
             key_width: KeyWidth::Fixed(BLOB_KEY_LEN as u16),
             shard_bytes: 1,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
             map_shape: MapShape::Tree,
@@ -1224,8 +1144,6 @@ mod tests {
             name: ARTIFACT_CF,
             key_width: KeyWidth::Fixed(ARTIFACT_KEY_LEN as u16),
             shard_bytes: 0,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::None,
             map_shape: MapShape::Tree,
@@ -1235,8 +1153,6 @@ mod tests {
             name: CODED_CF,
             key_width: KeyWidth::Fixed(BLOB_KEY_LEN as u16),
             shard_bytes: 1,
-            inline_max: 0,
-            row_carry: 0,
             purge_mark: None,
             codec: Codec::Lz4,
             map_shape: MapShape::Tree,
@@ -1424,34 +1340,34 @@ mod tests {
         );
     }
 
-    // the run starts small and reaches its ceiling only for a playback that keeps going
+    // the run starts small and grows only for a playback that keeps going
     #[test]
-    fn a_run_ramps_to_its_ceiling() {
+    fn a_run_ramps_from_the_floor() {
         let (store, sim) = store_with_io();
         let store = trait_store(&store);
-        let count = PLAYBACK_RUN_MAX * 3;
+        let count = PLAYBACK_RUN_MIN * 48;
         for key in 0..count {
             let mut bytes = record(1, 0);
             bytes[2..6].copy_from_slice(&(key as u32).to_be_bytes());
             store.put(RECORD_CF, &bytes, &[7u8; 64]).expect("put");
         }
 
-        // One key wanted, so one run at the floor rather than one at the ceiling.
+        // One key wanted, so one run at the floor rather than one sized to the column.
         let before = sim.read_bytes();
         let first = store.iter(RECORD_CF).expect("iter").next();
         assert!(first.is_some(), "the playback found its first key");
         let taking_one = sim.read_bytes() - before;
 
-        // The whole column wanted, so the run doubles until it reaches the ceiling.
+        // The whole column wanted, so the run doubles as the walk goes.
         let before = sim.read_bytes();
         let played = store.iter(RECORD_CF).expect("iter").count();
         let taking_all = sim.read_bytes() - before;
         assert_eq!(played, count);
 
         // Far more bytes than one run's, so the first caller was never charged for
-        // the ceiling.
+        // the whole column.
         assert!(
-            taking_all > taking_one * (count / PLAYBACK_RUN_MAX) as u64,
+            taking_all > taking_one * 3,
             "taking one key read {taking_one} bytes against {taking_all} for all {count}"
         );
     }
@@ -1823,25 +1739,245 @@ mod tests {
         assert!(store.contains(BLOB_CF, &[0x22; 32]).expect("contains"));
     }
 
-    // a range delete through the trait drops the keys the range covers
+    const PLAIN_CF: &str = "plain";
+    const WIDE_CF: &str = "wide";
+    const OPEN_CF: &str = "open";
+
+    const WIDE_KEY_LEN: usize = 34;
+
+    /// A variable tree, a fixed tree and an open table, the shapes a prefix sweep meets
+    const SWEEP_COLUMNS: ColumnSet = &[
+        ColumnSpec {
+            id: ColumnId(1),
+            name: PLAIN_CF,
+            key_width: KeyWidth::Variable,
+            shard_bytes: 0,
+            purge_mark: None,
+            codec: Codec::None,
+            map_shape: MapShape::Tree,
+        },
+        ColumnSpec {
+            id: ColumnId(2),
+            name: WIDE_CF,
+            key_width: KeyWidth::Fixed(WIDE_KEY_LEN as u16),
+            shard_bytes: GROUP_PREFIX_LEN as u8,
+            purge_mark: None,
+            codec: Codec::None,
+            map_shape: MapShape::Tree,
+        },
+        ColumnSpec {
+            id: ColumnId(3),
+            name: OPEN_CF,
+            key_width: KeyWidth::Fixed(WIDE_KEY_LEN as u16),
+            shard_bytes: GROUP_PREFIX_LEN as u8,
+            purge_mark: None,
+            codec: Codec::None,
+            map_shape: MapShape::Open,
+        },
+    ];
+
+    fn sweep_store() -> ReelStore {
+        let sim = SimIo::new(FaultPlan::new(1));
+        let config = ReelConfig {
+            shard_shapes: ShardShapes::Declared,
+            ..config()
+        };
+        ReelStore::open_with_io(PathBuf::from(ROOT), config, SWEEP_COLUMNS, Arc::new(sim))
+            .expect("open")
+    }
+
+    /// Two big-endian words, the shape the store's plain columns key on
+    fn pair(high: u64, low: u64) -> Vec<u8> {
+        let mut bytes = high.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&low.to_be_bytes());
+        bytes
+    }
+
+    /// Every page of a prefix sweep, and how many pages it took
+    fn swept(store: &dyn Store, cf: &str, prefix: &[u8], limit: usize) -> (Vec<Vec<u8>>, usize) {
+        let mut found = Vec::new();
+        let mut mark: Option<Vec<u8>> = None;
+        let mut pages = 0;
+        loop {
+            let (rows, next) = store
+                .sweep_prefix(cf, prefix, mark.as_deref(), limit)
+                .expect("sweep");
+            assert!(rows.len() <= limit, "a page ran past its limit");
+            for (key, value) in rows {
+                assert_eq!(
+                    store.get(cf, &key).expect("get"),
+                    Some(value),
+                    "a swept row came back with another value"
+                );
+                found.push(key);
+            }
+            pages += 1;
+            match next {
+                Some(next) => mark = Some(next),
+                None => break,
+            }
+            assert!(pages <= 1_000, "a prefix sweep never finished");
+        }
+        found.sort();
+        (found, pages)
+    }
+
+    // a prefix with no rows answers an empty page and no mark
     #[test]
-    fn range_delete_through_the_trait() {
-        let store = store();
+    fn prefix_sweep_of_an_empty_prefix() {
+        let store = sweep_store();
         let store = trait_store(&store);
-        for group in [6u16, 7, 8] {
+        for high in [1u64, 3] {
             store
-                .put(RECORD_CF, &record(group, 1), &[0x11; 64])
+                .put(PLAIN_CF, &pair(high, 1), &[0x11; 8])
                 .expect("put");
         }
 
+        let (rows, next) = store
+            .sweep_prefix(PLAIN_CF, &2u64.to_be_bytes(), None, 16)
+            .expect("sweep");
+
+        assert!(rows.is_empty());
+        assert!(next.is_none());
+    }
+
+    // a prefix at the top of the key space sweeps to the end and stops
+    #[test]
+    fn prefix_sweep_at_the_end_of_the_key_space() {
+        let store = sweep_store();
+        let store = trait_store(&store);
+        let top = u64::MAX.to_be_bytes();
+        for low in [0u64, 7, u64::MAX] {
+            store
+                .put(PLAIN_CF, &pair(u64::MAX, low), &[0x22; 8])
+                .expect("put");
+        }
         store
-            .delete_range(RECORD_CF, &7u16.to_be_bytes(), &8u16.to_be_bytes())
-            .expect("range delete");
+            .put(PLAIN_CF, &pair(u64::MAX - 1, 1), &[0x22; 8])
+            .expect("put");
+
+        let (found, _) = swept(store, PLAIN_CF, &top, 2);
 
         assert_eq!(
-            keys(store, RECORD_CF, &[]),
-            vec![record(6, 1), record(8, 1)]
+            found,
+            vec![
+                pair(u64::MAX, 0),
+                pair(u64::MAX, 7),
+                pair(u64::MAX, u64::MAX)
+            ]
         );
+        assert_eq!(found, keys(store, PLAIN_CF, &top));
+    }
+
+    // keys of different lengths under one prefix all come back
+    #[test]
+    fn prefix_sweep_over_mixed_lengths() {
+        let store = sweep_store();
+        let store = trait_store(&store);
+        let prefix = 9u64.to_be_bytes();
+        let mut wrote = vec![prefix.to_vec()];
+        for tail in [&[0u8][..], &[0, 0], &[1, 2, 3], &[0xff; 40]] {
+            let mut key = prefix.to_vec();
+            key.extend_from_slice(tail);
+            wrote.push(key);
+        }
+        for key in &wrote {
+            store.put(PLAIN_CF, key, &[0x33; 16]).expect("put");
+        }
+        store.put(PLAIN_CF, &[9u8; 4], &[0x33; 16]).expect("put");
+        store.put(PLAIN_CF, &pair(10, 0), &[0x33; 16]).expect("put");
+        wrote.sort();
+
+        for limit in [1usize, 2, 16] {
+            let (found, _) = swept(store, PLAIN_CF, &prefix, limit);
+            assert_eq!(found, wrote, "limit {limit} lost a key");
+        }
+        assert_eq!(keys(store, PLAIN_CF, &prefix), wrote);
+    }
+
+    // the sweep and the prefix walk agree on every prefix of the same data
+    #[test]
+    fn prefix_sweep_matches_the_prefix_walk() {
+        let store = sweep_store();
+        let store = trait_store(&store);
+        for high in 0..6u64 {
+            for low in 0..high * 3 {
+                store
+                    .put(PLAIN_CF, &pair(high, low), &[high as u8; 32])
+                    .expect("put");
+            }
+        }
+        store.delete(PLAIN_CF, &pair(4, 2)).expect("delete");
+
+        for high in 0..7u64 {
+            let prefix = high.to_be_bytes();
+            let (found, _) = swept(store, PLAIN_CF, &prefix, 4);
+            assert_eq!(found, keys(store, PLAIN_CF, &prefix), "prefix {high}");
+        }
+        let mut short = 0u64.to_be_bytes().to_vec();
+        short.truncate(7);
+        let (found, _) = swept(store, PLAIN_CF, &short, 5);
+        assert_eq!(found, keys(store, PLAIN_CF, &short));
+        let (found, _) = swept(store, PLAIN_CF, &[], 5);
+        assert_eq!(found, keys(store, PLAIN_CF, &[]));
+    }
+
+    // a fixed tree sweeps its shard key and any prefix inside or across shards
+    #[test]
+    fn prefix_sweep_on_a_fixed_tree() {
+        let store = sweep_store();
+        let store = trait_store(&store);
+        for group in [6u16, 7, 8] {
+            for byte in 0..5u8 {
+                store
+                    .put(WIDE_CF, &record(group, byte), &[byte; 16])
+                    .expect("put");
+            }
+        }
+
+        let (found, _) = swept(store, WIDE_CF, &7u16.to_be_bytes(), 2);
+        assert_eq!(
+            found,
+            (0..5u8).map(|byte| record(7, byte)).collect::<Vec<_>>()
+        );
+
+        let mut deeper = 7u16.to_be_bytes().to_vec();
+        deeper.push(3);
+        let (found, _) = swept(store, WIDE_CF, &deeper, 1);
+        assert_eq!(found, vec![record(7, 3)]);
+
+        let (found, _) = swept(store, WIDE_CF, &[0], 4);
+        assert_eq!(found, keys(store, WIDE_CF, &[0]));
+        assert_eq!(found.len(), 15);
+    }
+
+    // an open table sweeps its shard key and answers nothing for any other width
+    #[test]
+    fn prefix_sweep_on_an_open_table() {
+        let store = sweep_store();
+        let store = trait_store(&store);
+        for group in [6u16, 7, 8] {
+            for byte in 0..5u8 {
+                store
+                    .put(OPEN_CF, &record(group, byte), &[byte; 16])
+                    .expect("put");
+            }
+        }
+
+        let (found, _) = swept(store, OPEN_CF, &7u16.to_be_bytes(), 2);
+        assert_eq!(
+            found,
+            (0..5u8).map(|byte| record(7, byte)).collect::<Vec<_>>()
+        );
+
+        let mut deeper = 7u16.to_be_bytes().to_vec();
+        deeper.push(3);
+        for prefix in [&deeper[..], &[0][..], &[][..]] {
+            let (rows, next) = store
+                .sweep_prefix(OPEN_CF, prefix, None, 16)
+                .expect("sweep");
+            assert!(rows.is_empty() && next.is_none(), "{prefix:?} was served");
+        }
     }
 
     // the usage report names every column the reel serves

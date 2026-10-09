@@ -23,8 +23,9 @@ use reel::format::record::{checksum, RecordHeader};
 use reel::io::posix_backend::PosixBackend;
 use reel::reel::segment::IoDriver;
 use reel::{
-    rebuild_reel, ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape,
-    Preallocate, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    rebuild_reel, ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth,
+    MapShape, Preallocate, RecordKey, ReelConfig, ReelIndex, ReelStore, ShardShapes, SyncPolicy,
+    ThreadBudget,
 };
 
 const RECORDS: ColumnId = ColumnId(1);
@@ -44,8 +45,6 @@ const COLUMNS: ColumnSet = &[
         name: RECORDS_CF,
         key_width: KeyWidth::Fixed(RECORD_KEY_LEN as u16),
         shard_bytes: 2,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -55,8 +54,6 @@ const COLUMNS: ColumnSet = &[
         name: "blob_data",
         key_width: KeyWidth::Fixed(32),
         shard_bytes: 0,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -66,8 +63,6 @@ const COLUMNS: ColumnSet = &[
         name: "coded_data",
         key_width: KeyWidth::Fixed(32),
         shard_bytes: 0,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::Lz4,
         map_shape: MapShape::Tree,
@@ -452,11 +447,19 @@ fn recovery(c: &mut Criterion) {
         group.bench_function(
             BenchmarkId::from_parameter(format!("{chunk_mib}MiB_chunk")),
             |b| {
+                let index = ReelIndex::new(COLUMNS, IndexResidency::Resident, ShardShapes::Tree)
+                    .expect("index");
                 b.iter(|| {
                     let driver = IoDriver::new(Arc::new(PosixBackend::new()));
                     black_box(
-                        rebuild_reel(&driver, std::slice::from_ref(&reel_dir), &[false], false)
-                            .expect("rebuild"),
+                        rebuild_reel(
+                            &driver,
+                            std::slice::from_ref(&reel_dir),
+                            &[false],
+                            false,
+                            &index,
+                        )
+                        .expect("rebuild"),
                     )
                 })
             },

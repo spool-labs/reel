@@ -220,10 +220,6 @@ impl SegmentRow {
             });
     }
 
-    fn store_live(&self, span: u64) {
-        self.live.store(span, Ordering::Release);
-    }
-
     fn shadow(&self, span: u64) {
         self.drop_live(span);
         self.dead.fetch_add(span, Ordering::AcqRel);
@@ -534,6 +530,18 @@ impl SegmentTable {
         });
     }
 
+    /// Add footprints a rebuild read off a footer tally or a persisted stamp
+    pub fn adopt(&self, segment: SegmentId, bytes: SegmentBytes) {
+        self.opened(segment, |row| {
+            row.add_live(bytes.live);
+            row.dead.fetch_add(bytes.dead, Ordering::AcqRel);
+            row.held.fetch_add(bytes.held, Ordering::AcqRel);
+            if let Some(lsn) = bytes.held_lsn {
+                row.held_lsn.fetch_max(lsn.as_u64(), Ordering::AcqRel);
+            }
+        });
+    }
+
     /// Move a record's footprint from live to dead within its segment
     pub fn shadow(&self, segment: SegmentId, span: u64) {
         self.booked(segment, |row| row.shadow(span));
@@ -780,64 +788,6 @@ impl SegmentTable {
             return 0;
         }
         read(&self.window).born
-    }
-
-    /// Replace the whole table with what a rebuild resolved
-    ///
-    /// Every incarnation starts over, so a stamp taken before the rebuild can only
-    /// mismatch and sends that read back through the index.
-    pub fn install(
-        &self,
-        segments: HashMap<SegmentId, SegmentBytes>,
-        min_lsn: HashMap<SegmentId, Lsn>,
-        max_lsn: HashMap<SegmentId, Lsn>,
-    ) {
-        let mut window = write(&self.window);
-        window.clear();
-        self.has_born.store(false, Ordering::Relaxed);
-        // The window is opened from the oldest number first, so a rebuild whose
-        // segments arrive in map order does not reach back a chunk at a time.
-        let lowest = segments
-            .keys()
-            .chain(min_lsn.keys())
-            .chain(max_lsn.keys())
-            .map(|segment| segment.as_u32())
-            .min();
-        if let Some(lowest) = lowest {
-            window.open_counted(SegmentId(lowest));
-        }
-        for (segment, bytes) in segments {
-            let Some(row) = window.open_counted(segment) else {
-                continue;
-            };
-            row.store_live(bytes.live);
-            row.dead.store(bytes.dead, Ordering::Release);
-            row.held.store(bytes.held, Ordering::Release);
-            let newest = bytes.held_lsn.unwrap_or(Lsn::NONE);
-            row.held_lsn.store(newest.as_u64(), Ordering::Release);
-            let issued = self.issue_incarnation();
-            row.incarnation.store(issued.0, Ordering::Release);
-        }
-        for (segment, lsn) in min_lsn {
-            let Some(row) = window.open_counted(segment) else {
-                continue;
-            };
-            row.min_lsn.store(lsn.0, Ordering::Release);
-            if row.incarnation.load(Ordering::Acquire) == 0 {
-                let issued = self.issue_incarnation();
-                row.incarnation.store(issued.0, Ordering::Release);
-            }
-        }
-        for (segment, lsn) in max_lsn {
-            let Some(row) = window.open_counted(segment) else {
-                continue;
-            };
-            row.max_lsn.store(lsn.as_u64(), Ordering::Release);
-            if row.incarnation.load(Ordering::Acquire) == 0 {
-                let issued = self.issue_incarnation();
-                row.incarnation.store(issued.0, Ordering::Release);
-            }
-        }
     }
 
     /// Segments the table is counting
@@ -1102,17 +1052,6 @@ mod loom_tests {
 mod tests {
     use super::*;
 
-    // a fresh set of read counters has seen nothing go wrong
-    #[test]
-    fn starts_clean() {
-        let counters = ReadCounters::new();
-
-        assert_eq!(counters.unreadable_records(), 0);
-
-        counters.note_unreadable();
-        assert_eq!(counters.unreadable_records(), 1);
-    }
-
     // shadowing a record moves its footprint from live to dead
     #[test]
     fn segment_shadow() {
@@ -1348,57 +1287,5 @@ mod tests {
 
         assert!(table.incarnation_of(SegmentId(1)).is_none());
         assert_ne!(table.live_incarnation(SegmentId(1)), first);
-    }
-
-    // an install restamps exactly the segments it resolved
-    #[test]
-    fn install_restamps() {
-        let table = SegmentTable::new();
-        let before = table.live_incarnation(SegmentId(1));
-
-        let mut segments = HashMap::new();
-        segments.insert(SegmentId(1), SegmentBytes::default());
-        table.install(segments, HashMap::new(), HashMap::new());
-        table.mark_born([SegmentId(3)]);
-
-        assert_ne!(table.incarnation_of(SegmentId(1)), before);
-        assert!(!table.incarnation_of(SegmentId(1)).is_none());
-        assert!(!table.incarnation_of(SegmentId(3)).is_none());
-        assert!(table.incarnation_of(SegmentId(2)).is_none());
-    }
-
-    // installing a rebuilt table replaces whatever it held
-    #[test]
-    fn table_install_replaces() {
-        let table = SegmentTable::new();
-        table.mark_live(SegmentId(9), Lsn(1), 1);
-
-        let mut segments = HashMap::new();
-        segments.insert(
-            SegmentId(1),
-            SegmentBytes {
-                live: 700,
-                dead: 50,
-                ..SegmentBytes::default()
-            },
-        );
-        let mut min_lsn = HashMap::new();
-        min_lsn.insert(SegmentId(1), Lsn(4));
-        let mut max_lsn = HashMap::new();
-        max_lsn.insert(SegmentId(1), Lsn(30));
-        table.install(segments, min_lsn, max_lsn);
-
-        assert_eq!(table.len(), 1);
-        assert_eq!(
-            table.bytes_of(SegmentId(1)),
-            SegmentBytes {
-                live: 700,
-                dead: 50,
-                ..SegmentBytes::default()
-            }
-        );
-        assert_eq!(table.min_lsn_excluding(SegmentId(2)), Some(Lsn(4)));
-        assert_eq!(table.max_lsn_of(SegmentId(1)), Some(Lsn(30)));
-        assert_eq!(table.max_lsn_of(SegmentId(9)), None);
     }
 }

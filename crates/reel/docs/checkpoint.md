@@ -55,10 +55,7 @@ consistently because there is no manifest at all.
    pins the floor.
 2. Enumerate the sealed segments. This is the step with two traps in it.
 
-   Not from the index's segment table: that table books footprint per record,
-   and a destination holding nothing but listed rows has no record to book, so
-   enumerating from it would miss a segment whose footer is the only home of a
-   carried value. The directory is what recovery itself reads, and the number
+   Not from the index's segment table. The directory is what recovery itself reads, and the number
    the next segment will take, read once the cue has sealed, is the boundary
    that keeps a later roll out of the set.
 

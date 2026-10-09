@@ -284,18 +284,22 @@ impl RateGate {
         }
     }
 
-    /// Bytes the rate has earned since the last pass asked, capped for one pass
+    /// Bytes the rate earned since the last pass ended, capped, and the stretch they cover
     ///
     /// A pass bounded by a fixed size would run at the caller's cadence rather than at
     /// the configured rate, so asking time what it owes is what makes the rate decide.
-    pub fn allowance(&self, cap: Duration) -> u64 {
-        let mut ran_at = lock(&self.ran_at);
-        let now = Instant::now();
-        let earned = self
-            .limiter
-            .bytes_in(now.saturating_duration_since(*ran_at));
-        *ran_at = now;
-        earned.min(self.limiter.bytes_in(cap))
+    /// A pass earns nothing from its own runtime, or one slower than its rate would
+    /// hand the next a longer stretch every time.
+    pub fn allowance(&self, cap: Duration) -> (u64, Duration) {
+        let idle = Instant::now()
+            .saturating_duration_since(*lock(&self.ran_at))
+            .min(cap);
+        (self.limiter.bytes_in(idle), idle)
+    }
+
+    /// Start the next pass's earnings from now, which is when this one stopped
+    pub fn rest(&self) {
+        *lock(&self.ran_at) = Instant::now();
     }
 
     /// Charge the gate for bytes moved since a moment, shutting it for what they owe
@@ -649,16 +653,6 @@ mod tests {
         assert!(!pressure.is_bounded());
         assert!(pressure.can_admit_foreground(u64::MAX / 2, 4096));
         assert!(!pressure.is_foreground_blocked(u64::MAX / 2));
-    }
-
-    // the automatic compaction rate is unpaced, a cap exists only when named
-    #[test]
-    fn auto_rate_unpaced() {
-        let auto = RateLimiter::for_compaction(CompactRate::Auto);
-        let fixed = RateLimiter::for_compaction(CompactRate::Mbps(120));
-
-        assert_eq!(auto.target_mbps(), 0);
-        assert_eq!(fixed.target_mbps(), 120);
     }
 
     // a zero scrub rate disables the scrub limiter

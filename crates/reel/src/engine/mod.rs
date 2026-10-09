@@ -49,7 +49,6 @@ use crate::io::select::select_backend;
 use crate::io::ReelIo;
 use crate::reel::segment::{FdCache, IoDriver};
 use crate::reel::{Reel, ReelShared};
-use reel_core::Value;
 
 /// Name of the file a writable open takes the volume's ownership lock on
 pub(crate) const LOCK_FILE: &str = "reel.lock";
@@ -135,21 +134,6 @@ struct Planned {
 
     /// The codec byte that produced those bytes
     codec: u8,
-
-    /// The whole payload where the column carries it in the index
-    carried: Option<Arc<[u8]>>,
-}
-
-/// A resolved batch split into what the index answered and what the device owes
-///
-/// Both doors plan through this, so a batch reaches the device having done the same
-/// work whichever one it came in through.
-struct FoundPlan {
-    /// One place per key asked for, filled where the index answered
-    ///
-    /// The one list a batch buys, since it is the one the caller takes away. What
-    /// the device is asked for goes in the reading thread's own list beside it.
-    answers: Vec<Option<Value>>,
 }
 
 /// One key of a planned batch and what the index needs to land it
@@ -159,9 +143,6 @@ struct BatchKey {
 
     /// What the index does for this key once the record has landed
     op: KeyOp,
-
-    /// The whole payload where the column carries it in the index
-    carried: Option<Arc<[u8]>>,
 }
 
 /// What one record of a batch asks of the index
@@ -427,8 +408,22 @@ impl ReelStore {
         }
         crate::reel::volumes::ensure_manifest(&driver, &roots, &dead, is_read_only)?;
         let persisted = offered_index(&driver, &root, &config, columns)?;
-        let rebuilt =
-            rebuild_from_persisted(&driver, &roots, &dead, config.index.pages(), persisted)?;
+        let rebuilt = rebuild_from_persisted(
+            &driver,
+            &roots,
+            &dead,
+            config.index.pages(),
+            persisted,
+            &index,
+        )?;
+        // Compaction only copies what the index can find, so a writable open over a
+        // column it doesn't declare would drop that column's records.
+        if let Some(column) = rebuilt.undeclared.filter(|_| !is_read_only) {
+            return Err(ReelError::Config(format!(
+                "the volume holds column {} and this open doesn't declare it",
+                column.0,
+            )));
+        }
         for path in &rebuilt.quarantined {
             tracing::warn!("quarantined a foreign reel segment at {}", path.display());
         }
@@ -452,21 +447,6 @@ impl ReelStore {
                 }
             }
         }
-        // Taken before the install, which takes the map with it.
-        let mut on_disk: Vec<SegmentId> = rebuilt.segments.keys().copied().collect();
-        on_disk.sort();
-        // A paged rebuild left its sealed keys in the footers, so what it installs for
-        // them is the span each segment covers, with nothing queued to hand over.
-        index.install(
-            rebuilt.entries,
-            rebuilt.covers,
-            rebuilt.segments,
-            rebuilt.segment_min_lsn,
-            rebuilt.segment_max_lsn,
-            rebuilt.sealed,
-            rebuilt.sealed_keys,
-        );
-
         // A reader starts its cursor where the rebuild left the volume, so its
         // first catch-up reads only what has been written since the open.
         let mut cursor = LogCursor::new();
@@ -595,11 +575,7 @@ impl ReelStore {
             .map(|mark| mark.pack())
     }
 
-    /// One page of the keys under a shard-aligned prefix, in no promised order
-    ///
-    /// Nothing back where the prefix is not exactly the column's shard key, so a
-    /// caller cannot turn a prefix walk into a scan of the family by asking for
-    /// the wrong width.
+    /// One page of the keys under a prefix, where an open column serves only its exact shard key
     pub fn sweep_column_prefix(
         &self,
         column: ColumnId,
@@ -706,11 +682,6 @@ impl ReelStore {
     /// answer and a warm heap hides what a map just took off the free list.
     pub fn resident_bytes(&self) -> ByteCount {
         self.index.resident_bytes()
-    }
-
-    /// Bytes of carried values resident across every column
-    pub fn carried_bytes(&self) -> ByteCount {
-        ByteCount::from_bytes(self.index.carried_total())
     }
 
     /// The volumes the operator declared dead, empty on a whole store

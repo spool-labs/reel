@@ -236,6 +236,6 @@ pub fn the_rule_is_a_function_of_its_facts() {
     assert_eq!(large.preallocate, Preallocate::Full);
 
     // 1024 descriptors, halved for headroom, halved again where direct doubles.
-    assert_eq!(small.fd_cache, 256, "the default is under half of 1024");
-    assert_eq!(large.fd_cache, 256);
+    assert_eq!(small.fd_cache, 512, "half of 1024, buffered");
+    assert_eq!(large.fd_cache, 256, "half of 1024, halved again for direct");
 }

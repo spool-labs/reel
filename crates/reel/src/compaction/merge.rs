@@ -16,22 +16,21 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::append::Appender;
+use crate::append::{Appender, CopyRecord};
 use crate::config::RepairPath;
 use crate::error::{ReelError, Result};
-use crate::format::column::{Codec, ColumnId, RecordKey};
-use crate::format::footer::{FooterEntry, FooterPartition, FooterRow, SegmentFooter, NO_RECORD};
+use crate::format::column::{ColumnId, RecordKey};
+use crate::format::footer::{FooterPartition, FooterRow, SegmentFooter};
 use crate::format::loc::SegmentId;
 use crate::format::lsn::Lsn;
-use crate::format::record::Flags;
 use crate::index::map::{KeyRepoint, ReelIndex};
 use crate::reel::segment::{SegmentHandle, SegmentReader};
 use crate::reel::{Reel, ReelShared};
 use crate::sync::rendezvous;
 
 use crate::compaction::compactor::{
-    footer_bound, is_missing, read_payload, segment_len, source_handle, Compactor, PassClaim,
-    RecordScan, SourceRecord,
+    footer_bound, held_payload, is_missing, read_payload, segment_len, source_handle, Compactor,
+    PassClaim, RecordScan, SourceRecord,
 };
 use crate::compaction::pressure::PassPace;
 
@@ -64,9 +63,6 @@ pub struct MergeReport {
 
     /// Rows written into the output, one per key the merge kept
     pub rows_written: u64,
-
-    /// Rows written as a value in the row itself, with no record behind them
-    pub rows_listed: u64,
 
     /// Tombstones carried forward, which a merge never drops
     pub tombstones_kept: u64,
@@ -108,10 +104,7 @@ struct MergeSource {
 impl MergeSource {
     /// The partition holding one column's rows, or nothing where it holds none
     fn partition_of(&self, column: ColumnId) -> Option<&FooterPartition> {
-        self.footer
-            .partitions
-            .iter()
-            .find(|partition| partition.column == column)
+        self.footer.partition(column)
     }
 }
 
@@ -131,6 +124,15 @@ struct Winner {
 struct MergeState {
     /// What the pass will report when it is done
     report: MergeReport,
+
+    /// Winning records waiting to go down as one write, in key order
+    copies: Vec<CopyRecord>,
+
+    /// Each queued record's key, sequence number and span, for its repoint and the report
+    queued: Vec<(RecordKey, Lsn, u64)>,
+
+    /// Bytes the queued records frame
+    queued_bytes: u64,
 
     /// Moved records waiting for a hold of the publish barrier
     pending: Vec<KeyRepoint>,
@@ -175,6 +177,9 @@ pub fn merge_once(
             runs_merged: sources.len() as u64,
             ..MergeReport::default()
         },
+        copies: Vec::new(),
+        queued: Vec::new(),
+        queued_bytes: 0,
         pending: Vec::with_capacity(REPOINT_BATCH),
         written: BTreeSet::new(),
     };
@@ -193,14 +198,13 @@ pub fn merge_once(
     finished?;
     state.report.segments_written = state.written.len() as u64;
 
-    // nothing is repointed at a listed row: the output's own spans are what a search
-    // follows to reach it, and they go down before any source is retired
+    // the output's own spans go down before any source is retired
     let is_output_sealed = note_output_spans(shared, index, &state)?;
     rendezvous::at("merge/sealed");
 
     // The sources are the authority until the output can answer for what it took from
     // them: a segment with no footer answers for nothing no repoint names, which is
-    // every listed row and every tombstone it carried.
+    // every tombstone it carried.
     if is_output_sealed && !index.has_pending_covers() {
         retire_sources(compactor, shared, index, sources, &mut state);
     }
@@ -221,7 +225,7 @@ pub fn merge_once(
 /// A rolled segment whose seal the device refused is parked for the maintenance tick
 /// rather than reported, so the footers are what the pass believes rather than the seal
 /// call. A segment without one holds rows nothing can reach: a repointed key still
-/// reads, but a listed row and a carried tombstone are reachable only through a footer.
+/// reads, but a carried tombstone is reachable only through a footer.
 fn note_output_spans(
     shared: &Arc<ReelShared>,
     index: &ReelIndex,
@@ -358,7 +362,7 @@ fn select_runs<'compactor>(
             continue;
         };
         claims.push(claim);
-        let region_end = footer_bound(shared, &handle, file_len)?;
+        let region_end = footer_bound(shared, &handle, file_len, Some(&footer))?;
         sources.push(MergeSource {
             segment,
             handle,
@@ -446,7 +450,7 @@ fn merge_column(
     let mut cursors: Vec<usize> = vec![0; sources.len()];
     loop {
         let Some(key) = least_key(sources, &cursors, column) else {
-            return Ok(());
+            return land_copies(writer, state);
         };
         let winner = take_key(sources, &mut cursors, column, &key, &mut state.report);
         let Some(winner) = winner else {
@@ -539,6 +543,8 @@ fn emit_row(
     // there to survive: a pruned grave reads as nothing here, and dropping the record
     // on that is how a merge resurrects the version underneath it.
     if row.is_tombstone() || row.is_range_tombstone() {
+        // a tombstone goes down where its key sorts, after the copies queued ahead of it
+        land_copies(writer, state)?;
         return carry_tombstone(index, writer, sources, readers, state, key, winner);
     }
 
@@ -551,9 +557,6 @@ fn emit_row(
         return Ok(());
     }
 
-    if row.stands_alone() {
-        return relist(index, writer, sources, state, key, winner);
-    }
     copy_record(reel, index, writer, sources, readers, state, key, winner)
 }
 
@@ -565,51 +568,6 @@ fn row_of(sources: &[MergeSource], column: ColumnId, winner: &Winner) -> Result<
             ReelError::Corruption("a merge lost the partition it was walking".to_string())
         })?
         .row_at(winner.row)
-}
-
-/// Carry a row that holds its own value into the output, still holding it
-///
-/// A scan walks records and a standing row has none, so a merge that passed over these
-/// would retire their source and take the only copy of the value with it. Nothing is
-/// repointed, since the source keeps answering until it retires.
-fn relist(
-    index: &ReelIndex,
-    writer: &Appender,
-    sources: &mut [MergeSource],
-    state: &mut MergeState,
-    key: &RecordKey,
-    winner: &Winner,
-) -> Result<()> {
-    if !index.residency().pages() {
-        return Err(ReelError::Corruption(format!(
-            "segment {} holds a row carrying its own value on a volume whose index does not page",
-            sources[winner.at].segment.as_u32(),
-        )));
-    }
-    let row = row_of(sources, key.column, winner)?;
-    let carry = index
-        .spec(key.column)
-        .map(|spec| spec.row_carry_width())
-        .unwrap_or(0);
-    // a row that will not verify is the only copy of its value, so its source keeps
-    // standing the way a rotted record's does
-    let carried = sources[winner.at]
-        .partition_of(key.column)
-        .and_then(|partition| partition.carried_at(winner.row).ok().flatten())
-        .and_then(|value| {
-            FooterEntry::standing_alone(key.clone(), row.lsn, row.flags, carry, value)
-        });
-    let Some(entry) = carried else {
-        sources[winner.at].is_rotted = true;
-        return Ok(());
-    };
-
-    let landed = writer.list_carried_row(&entry)?;
-    index.note_listed(key, sources[winner.at].segment, row.len);
-    state.written.insert(landed);
-    state.report.rows_written += 1;
-    state.report.rows_listed += 1;
-    Ok(())
 }
 
 /// Carry one tombstone forward, whatever it shadows
@@ -653,7 +611,7 @@ fn carry_tombstone(
     Ok(())
 }
 
-/// Copy one live record into the output, or put its value in a row and write none
+/// Copy one live record into the output
 #[allow(clippy::too_many_arguments)]
 fn copy_record(
     reel: &Reel,
@@ -670,10 +628,10 @@ fn copy_record(
         sources[winner.at].is_rotted = true;
         return Ok(());
     };
-    let payload = read_payload(&mut readers[winner.at], &record)?;
+    let payload = held_payload(&mut readers[winner.at], &record)?;
     let segment = sources[winner.at].segment;
 
-    if !record.header.verify(&payload) {
+    if !record.header.verify(payload.as_slice()) {
         // With peers the eviction turns the miss into a repair enqueue and the source
         // may still retire. A sole copy keeps its bytes where they are: rewriting them
         // would stamp a fresh checksum over rot and serve it as good.
@@ -689,56 +647,39 @@ fn copy_record(
         return Ok(());
     }
 
-    // a value the output's rows can hold goes into a row and nowhere else
-    if let Some(entry) = carried_row(index, key, record.header.lsn, &payload) {
-        let landed = writer.list_carried_row(&entry)?;
-        index.note_listed(key, segment, record.header.length);
-        state.written.insert(landed);
-        state.report.rows_written += 1;
-        state.report.rows_listed += 1;
-        return Ok(());
+    let span = record.span();
+    if state.queued_bytes + span > writer.copy_run_cap() {
+        land_copies(writer, state)?;
     }
-
-    let committed =
-        writer.append_copy(key.clone(), record.header.lsn, payload, record.header.codec)?;
-    state.written.insert(committed.loc.segment);
-    state.report.rows_written += 1;
-    state.report.bytes_written += record.span();
-    state.pending.push(KeyRepoint {
+    state.queued_bytes += span;
+    state.copies.push(CopyRecord {
         key: key.clone(),
-        to: committed.loc,
         lsn: record.header.lsn,
+        payload,
+        codec: record.header.codec,
     });
+    state.queued.push((key.clone(), record.header.lsn, span));
     Ok(())
 }
 
-/// A row that can be this value's only home, when everything about it allows one
-///
-/// Every condition is a way to lose the value rather than a preference: the volume has
-/// to page and the key must be gone from the resident map, since a resident entry would
-/// keep naming a record about to be unlinked, the record has to be uncompressed, and
-/// the row has to be able to hold the value at all.
-fn carried_row(
-    index: &ReelIndex,
-    key: &RecordKey,
-    lsn: Lsn,
-    payload: &[u8],
-) -> Option<FooterEntry> {
-    if !index.residency().pages() {
-        return None;
+/// Write the queued copies as one run and line their repoints up for the barrier
+fn land_copies(writer: &Appender, state: &mut MergeState) -> Result<()> {
+    if state.copies.is_empty() {
+        return Ok(());
     }
-    if index.codec_of(key.column) != Codec::None {
-        return None;
+    state.queued_bytes = 0;
+    let landed = writer.append_copies(std::mem::take(&mut state.copies))?;
+    for ((key, lsn, span), committed) in state.queued.drain(..).zip(landed) {
+        state.written.insert(committed.loc.segment);
+        state.report.rows_written += 1;
+        state.report.bytes_written += span;
+        state.pending.push(KeyRepoint {
+            key,
+            to: committed.loc,
+            lsn,
+        });
     }
-    if index
-        .column(key.column)
-        .and_then(|column| column.entry_or_grave(key.as_slice()))
-        .is_some()
-    {
-        return None;
-    }
-    let carry = index.spec(key.column)?.row_carry_width();
-    FooterEntry::standing_alone(key.clone(), lsn, Flags::DATA, carry, payload)
+    Ok(())
 }
 
 /// The record one row names, or nothing where the records disagree with the footer
@@ -747,9 +688,6 @@ fn read_source_record(
     winner: &Winner,
     offset: u32,
 ) -> Result<Option<SourceRecord>> {
-    if offset == NO_RECORD {
-        return Ok(None);
-    }
     let found = RecordScan::resuming(&mut readers[winner.at], u64::from(offset)).next_record()?;
     Ok(found.filter(|record| record.offset == offset))
 }

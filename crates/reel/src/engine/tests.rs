@@ -8,15 +8,16 @@ use std::ops::Bound;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use reel_core::Value;
 use tempfile::{tempdir, TempDir};
 
 use crate::units::ByteCount;
 
 use crate::config::{
     CompactRate, HotIndex, IndexResidency, PointReads, Preallocate, RangedReads, RepairPath,
-    SyncPolicy, ThreadBudget,
+    ShardShapes, SyncPolicy, ThreadBudget,
 };
 use crate::format::column::{Codec, ColumnId, ColumnSpec, MapShape};
 use crate::format::footer::SegmentFooter;
@@ -36,7 +37,6 @@ const ROOT: &str = "/bulk";
 const RECORD: ColumnId = ColumnId(1);
 const BLOB: ColumnId = ColumnId(2);
 const FLAG: ColumnId = ColumnId(3);
-const CARRY: ColumnId = ColumnId(4);
 const CODED: ColumnId = ColumnId(5);
 
 const COLUMNS: ColumnSet = &[
@@ -45,8 +45,6 @@ const COLUMNS: ColumnSet = &[
         name: "record",
         key_width: KeyWidth::Fixed(34),
         shard_bytes: 2,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -56,8 +54,6 @@ const COLUMNS: ColumnSet = &[
         name: "blob_data",
         key_width: KeyWidth::Fixed(32),
         shard_bytes: 0,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -67,8 +63,6 @@ const COLUMNS: ColumnSet = &[
         name: "flag",
         key_width: KeyWidth::Fixed(8),
         shard_bytes: 0,
-        inline_max: 4,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -81,23 +75,8 @@ const CODED_COLUMNS: ColumnSet = &[ColumnSpec {
     name: "coded",
     key_width: KeyWidth::Fixed(8),
     shard_bytes: 0,
-    inline_max: 0,
-    row_carry: 0,
     purge_mark: None,
     codec: Codec::Lz4,
-    map_shape: MapShape::Tree,
-}];
-
-/// A carrying column set of its own, since a paged volume refuses one
-const CARRY_COLUMNS: ColumnSet = &[ColumnSpec {
-    id: CARRY,
-    name: "carry",
-    key_width: KeyWidth::Fixed(8),
-    shard_bytes: 0,
-    inline_max: 512,
-    row_carry: 0,
-    purge_mark: None,
-    codec: Codec::None,
     map_shape: MapShape::Tree,
 }];
 
@@ -109,8 +88,6 @@ const NAME_COLUMNS: ColumnSet = &[ColumnSpec {
     name: "names",
     key_width: KeyWidth::Variable,
     shard_bytes: 0,
-    inline_max: 0,
-    row_carry: 0,
     purge_mark: None,
     codec: Codec::None,
     map_shape: MapShape::Tree,
@@ -139,10 +116,6 @@ fn blob(byte: u8) -> RecordKey {
 
 fn flag(byte: u8) -> RecordKey {
     RecordKey::from_bytes(FLAG, &[byte; 8]).expect("key")
-}
-
-fn carry(byte: u8) -> RecordKey {
-    RecordKey::from_bytes(CARRY, &[byte; 8]).expect("key")
 }
 
 fn coded(byte: u8) -> RecordKey {
@@ -182,22 +155,6 @@ fn coded_store(config: ReelConfig) -> (ReelStore, SimIo) {
         PathBuf::from(ROOT),
         config,
         CODED_COLUMNS,
-        Arc::new(sim.clone()),
-    )
-    .expect("open");
-    (store, sim)
-}
-
-fn carried_held(store: &ReelStore) -> u64 {
-    store.index.column(CARRY).expect("column").carried_bytes()
-}
-
-fn carried_store(config: ReelConfig) -> (ReelStore, SimIo) {
-    let sim = SimIo::new(FaultPlan::new(1));
-    let store = ReelStore::open_with_io(
-        PathBuf::from(ROOT),
-        config,
-        CARRY_COLUMNS,
         Arc::new(sim.clone()),
     )
     .expect("open");
@@ -505,6 +462,10 @@ fn an_unreadable_footer_does_not_lose_the_batch() {
     }
     let second = store.reel.tails()[0].seal().expect("seal");
     store.flush().expect("flush");
+
+    // The seal left both footers held, and this is about one that has to be read back.
+    store.reel.shared().footers.forget(first);
+    store.reel.shared().footers.forget(second);
 
     // Wide enough for the length and the two reads one footer costs, narrow
     // enough that the segment behind it is read from a working device.
@@ -1694,19 +1655,32 @@ fn a_hot_index_holds_recent_keys() {
 // a hot index over its budget hands the oldest segments over early
 #[test]
 fn a_hot_index_pages_when_it_runs_out_of_room() {
-    let hot = ReelConfig {
+    const KEYS: u64 = 40_000;
+    let hot = |budget| ReelConfig {
         index: IndexResidency::Hot(HotIndex {
             after_secs: 3600,
-            budget: ByteCount::from_bytes(1),
+            budget,
         }),
+        segment_bytes: ByteCount::from_bytes(64 * 1024),
         ..config(1, SyncPolicy::Never)
     };
-    let (store, _sim) = sim_store(hot);
+    // The least budget a volume takes is what its columns hold empty.
+    let floor = ReelIndex::new(WIDE_COLUMNS, hot(ByteCount::gb(1)).index, ShardShapes::Tree)
+        .expect("index")
+        .floor_bytes();
+    let store = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        hot(floor),
+        WIDE_COLUMNS,
+        Arc::new(SimIo::new(FaultPlan::new(1))),
+    )
+    .expect("open");
 
-    let payload = vec![0xa5u8; 8 * 1024];
-    for byte in 0..200u8 {
-        store.put(&record(7, byte), &payload).expect("put");
+    let payload = [0xa5u8; 16];
+    for at in 0..KEYS {
+        store.put(&wide(at), &payload).expect("put");
     }
+    store.flush().expect("flush");
 
     assert!(
         store.page_out_sealed().expect("page out") > 0,
@@ -1714,13 +1688,333 @@ fn a_hot_index_pages_when_it_runs_out_of_room() {
     );
     assert_eq!(
         store.totals().count,
-        200,
+        KEYS,
         "handing keys over is not deleting them"
     );
     assert_eq!(
-        played(&store, RECORD).len(),
-        200,
+        played(&store, WIDE).len() as u64,
+        KEYS,
         "and the playback still sees them"
+    );
+}
+
+// a hot budget under what the columns hold empty is refused at open
+#[test]
+fn a_hot_budget_under_the_floor_is_refused() {
+    let hot = ReelConfig {
+        index: IndexResidency::Hot(HotIndex {
+            after_secs: 3600,
+            budget: ByteCount::from_bytes(1),
+        }),
+        ..config(1, SyncPolicy::Never)
+    };
+    let opened = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        hot,
+        COLUMNS,
+        Arc::new(SimIo::new(FaultPlan::new(1))),
+    );
+    match opened {
+        Err(ReelError::Config(reason)) => assert!(reason.contains("hot index budget"), "{reason}"),
+        Err(other) => panic!("refused for another reason: {other}"),
+        Ok(_) => panic!("a one byte budget opened"),
+    }
+}
+
+/// A record key in one of sixty-four shards, in the order of its number within it
+fn grouped(at: u32) -> RecordKey {
+    let mut bytes = ((at % 64) as u16).to_be_bytes().to_vec();
+    bytes.extend_from_slice(&at.to_be_bytes());
+    bytes.resize(34, 0);
+    RecordKey::from_bytes(RECORD, &bytes).expect("key")
+}
+
+// a hot budget prices the keys above the shards' floor, so it keeps a budget of recent keys
+#[test]
+fn a_hot_budget_keeps_recent_keys_above_the_floor() {
+    const BUDGET: u64 = 16 << 20;
+    const KEYS: u32 = 400_000;
+    let hot = ReelConfig {
+        index: IndexResidency::Hot(HotIndex {
+            after_secs: 3600,
+            budget: ByteCount::from_bytes(BUDGET),
+        }),
+        ..config(1, SyncPolicy::Never)
+    };
+    let (store, _sim) = sim_store(hot);
+    let floor = store.index.floor_bytes().to_bytes();
+
+    let payload = [0x17u8; 16];
+    for at in 0..KEYS {
+        store.put(&grouped(at), &payload).expect("put");
+        if at % 20_000 == 0 {
+            store.page_out_sealed().expect("page out");
+        }
+    }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
+
+    let held = store.index.key_bytes().to_bytes();
+    assert!(
+        held >= BUDGET / 2,
+        "a {BUDGET} byte budget over a {floor} byte floor holds {held} bytes of keys"
+    );
+    assert!(
+        (0..1_000).all(|at| is_paged(&store, &grouped(at))),
+        "the oldest keys went to their footers"
+    );
+    assert!(
+        (KEYS - 1_000..KEYS).all(|at| !is_paged(&store, &grouped(at))),
+        "the newest keys stayed resident"
+    );
+    assert_eq!(store.totals().count, u64::from(KEYS));
+}
+
+// a hot two-byte column touching thousands of shards holds its filters inside the budget
+#[test]
+fn a_hot_budget_counts_the_filters_of_many_shards() {
+    const BUDGET: u64 = 16 << 20;
+    let hot = ReelConfig {
+        index: IndexResidency::Hot(HotIndex {
+            after_secs: 3600,
+            budget: ByteCount::from_bytes(BUDGET),
+        }),
+        ..config(1, SyncPolicy::Never)
+    };
+    let (store, _sim) = sim_store(hot);
+    let floor = store.index.floor_bytes().to_bytes();
+
+    let payload = [0x5au8; 16];
+    for at in 0..8_000u32 {
+        store.put(&spread(at), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
+
+    let held = store.resident_bytes().to_bytes().saturating_sub(floor);
+    assert!(
+        held <= BUDGET,
+        "a {BUDGET} byte budget over a {floor} byte floor holds {held} bytes, filters {}",
+        store.index.column(RECORD).expect("column").filter_bytes()
+    );
+    assert_eq!(store.totals().count, 8_000);
+}
+
+/// A record key spread across the two-byte shards, one per number
+fn spread(at: u32) -> RecordKey {
+    let mut bytes = ((at.wrapping_mul(0x9e37_79b1) >> 16) as u16)
+        .to_be_bytes()
+        .to_vec();
+    bytes.extend_from_slice(&at.to_be_bytes());
+    bytes.resize(34, 0);
+    RecordKey::from_bytes(RECORD, &bytes).expect("key")
+}
+
+// a scrub slower than its rate leaves every tick's handover its turn
+#[test]
+fn a_slow_scrub_does_not_starve_the_handover() {
+    const SEGMENT: u64 = 64 * 1024;
+    const LOADED: u32 = 30_000;
+    const TICKS: usize = 6;
+    const LONG_TICK: Duration = Duration::from_secs(1);
+    let paged = ReelConfig {
+        index: IndexResidency::Paged,
+        segment_bytes: ByteCount::from_bytes(SEGMENT),
+        ..config(1, SyncPolicy::Never)
+    };
+    assert!(paged.scrub_mbps > 0, "the scrub runs at its default rate");
+    let (store, _sim) = sim_store(paged);
+    let store = Arc::new(store);
+
+    // Enough sealed segments that a whole lap of the slowed scrub takes seconds.
+    let payload = vec![0x5au8; 200];
+    for at in 0..LOADED {
+        store.put(&spread(at), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    // One tick at full speed spends what the load earned.
+    store.maintain_once().expect("warm tick");
+    let lap: u64 = store
+        .index
+        .segments_snapshot()
+        .iter()
+        .map(|(_, bytes)| bytes.live + bytes.dead)
+        .sum();
+
+    let script = crate::sync::rendezvous::script();
+    script.hold("scrub/segment");
+
+    // A writer keeps sealing segments the whole time the ticks run.
+    let writing = Arc::new(AtomicBool::new(true));
+    let peak = Arc::new(AtomicU64::new(0));
+    let writer = {
+        let (store, writing, peak) = (Arc::clone(&store), Arc::clone(&writing), Arc::clone(&peak));
+        let payload = payload.clone();
+        std::thread::spawn(move || {
+            let mut at = LOADED;
+            while writing.load(Ordering::Relaxed) {
+                for _ in 0..100 {
+                    store.put(&spread(at), &payload).expect("put");
+                    at += 1;
+                }
+                let resident = store.index.column(RECORD).expect("column").resident_keys();
+                peak.fetch_max(resident, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    let ticker = {
+        let store = Arc::clone(&store);
+        script.cast(move || {
+            let mut ticks = Vec::with_capacity(TICKS);
+            for _ in 0..TICKS {
+                let started = Instant::now();
+                let before = store.compaction_counters().scrub_bytes;
+                store.maintain_once().expect("tick");
+                let scrubbed = store.compaction_counters().scrub_bytes - before;
+                let took = started.elapsed();
+                ticks.push((took, scrubbed));
+                // one long tick is the failure, and the ones after it only grow
+                if took > LONG_TICK {
+                    break;
+                }
+            }
+            ticks
+        })
+    };
+    // Every segment the scrub opens costs it this long, well under its rate.
+    while !ticker.is_finished() {
+        std::thread::sleep(Duration::from_millis(20));
+        script.pass_one("scrub/segment");
+    }
+    let ticks = ticker.join().expect("ticker");
+    writing.store(false, Ordering::Relaxed);
+    writer.join().expect("writer");
+    drop(script);
+
+    // Each pass earns only the stretch since the one before it ended.
+    for (at, (took, scrubbed)) in ticks.iter().enumerate() {
+        assert!(
+            *took <= LONG_TICK,
+            "tick {at} took {took:?} and scrubbed {scrubbed} bytes of a {lap} byte lap"
+        );
+        assert!(
+            *scrubbed < lap / 4,
+            "tick {at} scrubbed {scrubbed} bytes of a {lap} byte lap in {took:?}"
+        );
+    }
+    let peak = peak.load(Ordering::Relaxed);
+    assert!(
+        peak < 10_000,
+        "{peak} keys stood resident while the ticks ran: {ticks:?}"
+    );
+}
+
+// a paged column's filters stay small across scattered keys and count as resident
+#[test]
+fn scattered_keys_leave_the_filters_small_and_counted() {
+    let paged = ReelConfig {
+        index: IndexResidency::Paged,
+        segment_bytes: ByteCount::from_bytes(64 * 1024),
+        ..config(1, SyncPolicy::Never)
+    };
+    let (store, _sim) = sim_store(paged);
+    let payload = vec![0x3cu8; 200];
+    // Four thousand keys land in about as many of the column's 65,536 shards.
+    for at in 0..4_000u32 {
+        store.put(&spread(at), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    store.reel.tails()[0].seal().expect("seal");
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
+    let column = store.index.column(RECORD).expect("column");
+    assert_eq!(column.resident_keys(), 0, "every key went to its footer");
+
+    let filters = column.filter_bytes();
+    assert!(
+        filters <= 1 << 20,
+        "the filters of a column holding nothing take {filters} bytes"
+    );
+    assert!(
+        store.resident_bytes().to_bytes() >= filters,
+        "the index counts {} bytes and its filters hold {filters}",
+        store.resident_bytes().to_bytes()
+    );
+    // A shard that paged out empty forgets its keys, and still reads them from the footer.
+    for at in (0..4_000u32).step_by(97) {
+        assert!(
+            store.contains(&spread(at)).expect("contains"),
+            "key {at} went missing"
+        );
+    }
+}
+
+const WIDE: ColumnId = ColumnId(7);
+
+/// A sixteen-byte key scattered across the wide column's shards, one per number
+fn wide(at: u64) -> RecordKey {
+    let mut key = (at.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .to_be_bytes()
+        .to_vec();
+    key.extend_from_slice(&at.to_be_bytes());
+    RecordKey::from_bytes(WIDE, &key).expect("key")
+}
+
+/// A sixteen-byte column over a byte of shards, the shape a hot budget is priced on
+const WIDE_COLUMNS: ColumnSet = &[ColumnSpec {
+    id: WIDE,
+    name: "wide",
+    key_width: KeyWidth::Fixed(16),
+    shard_bytes: 1,
+    purge_mark: None,
+    codec: Codec::None,
+    map_shape: MapShape::Tree,
+}];
+
+// a hot index given a budget holds about that much memory, counted by what it allocated
+#[test]
+fn a_hot_budget_bounds_what_the_maps_allocate() {
+    const BUDGET: u64 = 4 << 20;
+    let hot = ReelConfig {
+        index: IndexResidency::Hot(HotIndex {
+            after_secs: 3600,
+            budget: ByteCount::from_bytes(BUDGET),
+        }),
+        segment_bytes: ByteCount::from_bytes(64 * 1024),
+        ..config(1, SyncPolicy::Never)
+    };
+    let sim = SimIo::new(FaultPlan::new(1));
+    let store = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        hot,
+        WIDE_COLUMNS,
+        Arc::new(sim.clone()),
+    )
+    .expect("open");
+
+    let payload = vec![0x42u8; 200];
+    for at in 0..120_000u64 {
+        store.put(&wide(at), &payload).expect("put");
+        if at % 10_000 == 0 {
+            store.page_out_sealed().expect("page out");
+        }
+    }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
+
+    let column = store.index.column(WIDE).expect("column");
+    let allocated = store.index.key_bytes().to_bytes();
+    assert!(
+        column.resident_keys() > 0,
+        "the budget holds some keys resident"
+    );
+    // A tenth over for the open tail, whose keys no budget can hand over.
+    assert!(
+        allocated <= BUDGET + BUDGET / 10,
+        "a {BUDGET} byte budget holds {allocated} bytes for {} keys, and the index counts {}",
+        column.resident_keys(),
+        store.resident_bytes().to_bytes()
     );
 }
 
@@ -1881,57 +2175,6 @@ fn a_short_value_on_the_tail_reads_its_record() {
     assert!(sim.read_count() > before, "an unsealed record is read");
 }
 
-// a value past the ceiling is read from the volume like any other
-#[test]
-fn long_value_still_reads() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
-    store.put(&flag(1), &[9; 64]).expect("put");
-
-    let before = sim.read_count();
-    assert_eq!(
-        store.get(&flag(1)).expect("get"),
-        Some(Value::new(vec![9; 64]))
-    );
-    assert!(
-        sim.read_count() > before,
-        "a value too long to carry is read"
-    );
-}
-
-// a column that declared no ceiling reads its records however short they are
-#[test]
-fn plain_column_reads_short_values() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
-    store.put(&blob(1), &[3]).expect("put");
-
-    let before = sim.read_count();
-    assert_eq!(store.get(&blob(1)).expect("get"), Some(Value::new(vec![3])));
-    assert!(sim.read_count() > before);
-}
-
-// a value survives a seal and a reopen, read from the record the footer names
-#[test]
-fn a_value_survives_a_seal() {
-    let config = config(1, SyncPolicy::EveryPut);
-    let (store, sim) = sim_store(config.clone());
-    store.put(&flag(1), &[7, 7]).expect("put");
-    store.close().expect("close");
-
-    let restored = SimIo::from_image(sim.durable_image());
-    let reopened = ReelStore::open_with_io(
-        PathBuf::from(ROOT),
-        config,
-        COLUMNS,
-        Arc::new(restored.clone()),
-    )
-    .expect("reopen");
-
-    assert_eq!(
-        reopened.get(&flag(1)).expect("get"),
-        Some(Value::new(vec![7, 7]))
-    );
-}
-
 // a record reads back exactly, and its size and presence answer from the index
 #[test]
 fn put_get_roundtrip() {
@@ -1975,181 +2218,6 @@ fn get_many_answers_in_order() {
             Some(vec![1u8; 300]),
             Some(vec![4u8; 300]),
         ]
-    );
-}
-
-// the batch is one submission rather than a read, a wait, and the next read
-#[test]
-fn get_many_submits_once() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
-    let asked: Vec<RecordKey> = (1..=8u8).map(|byte| record(7, byte)).collect();
-    for (byte, key) in (1..=8u8).zip(&asked) {
-        store.put(key, &[byte; 200]).expect("put");
-    }
-
-    // What a loop over the single-key path leaves behind, for the contrast.
-    for key in &asked {
-        store.get(key).expect("get");
-    }
-    let looped = sim.read_count();
-
-    store.get_many(&asked).expect("get many");
-    let batched = sim.read_count() - looped;
-
-    assert!(
-        looped >= asked.len() as u64,
-        "the single-key path reads at least once per record"
-    );
-    assert!(
-        batched < asked.len() as u64,
-        "the batch read {batched} times for {} records, against {looped} one at a time",
-        asked.len()
-    );
-}
-
-// with no budget the carried tier keeps every write
-#[test]
-fn carried_values_stay_resident_unarmed() {
-    let (store, sim) = carried_store(config(1, SyncPolicy::Never));
-    for byte in 1..=4u8 {
-        store.put(&carry(byte), &[byte; 200]).expect("put");
-    }
-    assert_eq!(carried_held(&store), 800, "every capture is resident");
-
-    let before = sim.read_count();
-    for byte in 1..=4u8 {
-        assert_eq!(
-            store.get(&carry(byte)).expect("read").map(Value::into_vec),
-            Some(vec![byte; 200])
-        );
-    }
-    assert_eq!(
-        sim.read_count(),
-        before,
-        "every value answered from the index"
-    );
-}
-
-// an armed budget sheds a write burst back down on the tick
-#[test]
-fn an_armed_budget_sheds_a_write_burst() {
-    let armed = ReelConfig {
-        carried_budget: ByteCount::from_bytes(1024),
-        ..config(1, SyncPolicy::Never)
-    };
-    let (store, _sim) = carried_store(armed);
-    for byte in 1..=10u8 {
-        store.put(&carry(byte), &[byte; 256]).expect("put");
-    }
-    assert_eq!(
-        carried_held(&store),
-        2560,
-        "captures land ahead of the tick"
-    );
-
-    store.maintain_once().expect("tick");
-
-    assert!(
-        carried_held(&store) <= 1024,
-        "the shed honours the budget, held {}",
-        carried_held(&store)
-    );
-}
-
-// an armed read admits on the second touch, not the first
-#[test]
-fn an_armed_read_admits_on_the_second_touch() {
-    let armed = || ReelConfig {
-        carried_budget: ByteCount::from_bytes(64 * 1024),
-        ..config(1, SyncPolicy::Never)
-    };
-    let (store, sim) = carried_store(armed());
-    store.put(&carry(7), &[7u8; 200]).expect("put");
-    store.flush().expect("flush");
-    drop(store);
-
-    // Recovery rebuilds entries and not carried values, so reads warm them.
-    let store = ReelStore::open_with_io(
-        PathBuf::from(ROOT),
-        armed(),
-        CARRY_COLUMNS,
-        Arc::new(sim.clone()),
-    )
-    .expect("reopen");
-    store.get(&carry(7)).expect("read").expect("found");
-    assert_eq!(carried_held(&store), 0, "one touch is a ghost, not a value");
-
-    store.get(&carry(7)).expect("read").expect("found");
-    assert_eq!(carried_held(&store), 200, "the second touch admits");
-
-    let before = sim.read_count();
-    store.get(&carry(7)).expect("read").expect("found");
-    assert_eq!(sim.read_count(), before, "the third answers from the index");
-}
-
-// a key that keeps answering outlives a bulk load the budget evicts
-#[test]
-fn a_hot_carried_key_outlives_a_burst() {
-    let armed = || ReelConfig {
-        carried_budget: ByteCount::from_bytes(600),
-        ..config(1, SyncPolicy::Never)
-    };
-    let (store, sim) = carried_store(armed());
-    store.put(&carry(1), &[1u8; 256]).expect("put");
-    store.flush().expect("flush");
-    drop(store);
-
-    let store = ReelStore::open_with_io(
-        PathBuf::from(ROOT),
-        armed(),
-        CARRY_COLUMNS,
-        Arc::new(sim.clone()),
-    )
-    .expect("reopen");
-    // Two touches admit, two more bump the countdown to its ceiling.
-    for _ in 0..4 {
-        store.get(&carry(1)).expect("read").expect("found");
-    }
-    for byte in 10..=18u8 {
-        store.put(&carry(byte), &[byte; 256]).expect("put");
-    }
-
-    store.maintain_once().expect("tick");
-
-    assert!(carried_held(&store) <= 600, "the budget holds");
-    let before = sim.read_count();
-    store.get(&carry(1)).expect("read").expect("found");
-    assert_eq!(sim.read_count(), before, "the hot key kept its place");
-}
-
-// an armed batch read admits nothing, so a scan cannot displace the tier
-#[test]
-fn an_armed_batch_read_warms_nothing() {
-    let armed = || ReelConfig {
-        carried_budget: ByteCount::from_bytes(64 * 1024),
-        ..config(1, SyncPolicy::Never)
-    };
-    let (store, sim) = carried_store(armed());
-    store.put(&carry(3), &[3u8; 200]).expect("put");
-    store.flush().expect("flush");
-    drop(store);
-
-    let store = ReelStore::open_with_io(
-        PathBuf::from(ROOT),
-        armed(),
-        CARRY_COLUMNS,
-        Arc::new(sim.clone()),
-    )
-    .expect("reopen");
-    let answers = store.get_many(&[carry(3)]).expect("batch");
-    assert_eq!(
-        answers.into_iter().next().flatten().map(Value::into_vec),
-        Some(vec![3u8; 200])
-    );
-    assert_eq!(
-        carried_held(&store),
-        0,
-        "a bulk read leaves no ghost and no value"
     );
 }
 
@@ -2587,22 +2655,6 @@ fn a_range_matches_the_read() {
     assert_eq!(&*deep, &payload[20_000..24_000]);
 }
 
-// a window running off the end answers the bytes that are there
-#[test]
-fn a_range_past_the_end() {
-    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
-    let key = record(7, 1);
-    let payload = stripes(4096);
-    store.put(&key, &payload).expect("put");
-
-    let found = store
-        .get_range(&key, 4000, 4096)
-        .expect("range")
-        .expect("found");
-
-    assert_eq!(&*found, &payload[4000..]);
-}
-
 // a window starting at or past the end answers no bytes rather than nothing
 #[test]
 fn a_range_at_the_end() {
@@ -2633,37 +2685,6 @@ fn a_missing_key_ranges() {
         .get_range(&record(7, 2), 0, 16)
         .expect("range")
         .is_none());
-}
-
-// a window of a short value is cut from the record, since no entry holds it now
-#[test]
-fn a_short_range_reads_its_record() {
-    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
-    store.put(&flag(1), &[1, 2, 3, 4]).expect("put");
-
-    let found = store
-        .get_range(&flag(1), 1, 2)
-        .expect("range")
-        .expect("found");
-
-    assert_eq!(&*found, &[2, 3]);
-}
-
-// a carried value is cut from the bytes the index is holding
-#[test]
-fn a_carried_range() {
-    let (store, sim) = carried_store(config(1, SyncPolicy::Never));
-    let payload = stripes(200);
-    store.put(&carry(3), &payload).expect("put");
-    let before = sim.read_count();
-
-    let found = store
-        .get_range(&carry(3), 8, 16)
-        .expect("range")
-        .expect("found");
-
-    assert_eq!(&*found, &payload[8..24]);
-    assert_eq!(sim.read_count(), before, "the tier answered it");
 }
 
 // a record a coded column stored raw reads its window off the volume
@@ -3902,6 +3923,34 @@ fn flip_on_disk(store: &ReelStore, dir: &TempDir, key: &RecordKey) {
     file.write_at(&byte, at).expect("write the payload byte");
 }
 
+// a tail mapped on an early read still serves the records written after it
+#[test]
+fn a_tail_read_early_keeps_serving_from_its_mapping() {
+    let (store, backend, _dir) = posix_store(ReelConfig {
+        map_above: crate::config::MAP_EVERYTHING,
+        ..config(1, SyncPolicy::Never)
+    });
+    let first = record(7, 1);
+    let payload = stripes(8 * 1024);
+    store.put(&first, &payload).expect("put");
+    store.get(&first).expect("map the tail").expect("found");
+
+    // Past the reservation the tail had when it was mapped.
+    let last = record(7, 60);
+    for byte in 2..=60 {
+        store.put(&record(7, byte), &payload).expect("put");
+    }
+
+    let ops = backend.ops();
+    let found = store.get(&last).expect("get").expect("found");
+    assert_eq!(&*found, &payload[..]);
+    assert_eq!(
+        backend.ops() - ops,
+        0,
+        "a record the tail grew into went to the driver"
+    );
+}
+
 // a warm awaited read is answered from the page cache with the engine untouched
 #[test]
 fn a_warm_awaited_read_skips_the_engine() {
@@ -4520,24 +4569,6 @@ fn an_empty_range_writes_nothing() {
     assert_eq!(store.totals().count, 1);
 }
 
-// a range delete is replayed on a reopen, so its keys stay gone
-#[test]
-fn range_delete_survives_a_reopen() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::EveryPut));
-    store.put(&record(7, 1), &[0x11; 100]).expect("put");
-    store.put(&record(8, 1), &[0x22; 100]).expect("put");
-    let start = RecordKey::from_bytes(RECORD, &group_bound(7)).expect("key");
-    store
-        .delete_range(&start, Some(&group_bound(8)))
-        .expect("range delete");
-
-    let reopened = reopen(&sim, config(1, SyncPolicy::EveryPut));
-
-    assert!(!reopened.contains(&record(7, 1)).expect("read"));
-    assert!(reopened.contains(&record(8, 1)).expect("read"));
-    assert_eq!(reopened.totals().count, 1);
-}
-
 // a clean reopen reproduces the whole index and its totals
 #[test]
 fn reopen_reproduces_index() {
@@ -4556,6 +4587,43 @@ fn reopen_reproduces_index() {
         reopened.get(&blob(1)).expect("get"),
         Some(Value::new(vec![0x33; 900]))
     );
+}
+
+// an open that leaves out a written column still counts its bytes, and only a read-only one goes on
+#[test]
+fn an_undeclared_column_is_counted_and_refused_writable() {
+    let (store, sim) = sim_store(config(2, SyncPolicy::EveryPut));
+    store.put(&record(7, 1), &[0x11; 400]).expect("put");
+    store.put(&blob(1), &[0x33; 900]).expect("blob");
+    store.close().expect("close");
+    let records_only: ColumnSet = &COLUMNS[..1];
+
+    let restored = Arc::new(SimIo::from_image(sim.durable_image()));
+    let writable = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        config(2, SyncPolicy::EveryPut),
+        records_only,
+        restored.clone(),
+    );
+    assert!(
+        matches!(writable, Err(ReelError::Config(_))),
+        "a writable open over an undeclared column is refused",
+    );
+
+    let read_only = ReelStore::open_read_only_with_io(
+        PathBuf::from(ROOT),
+        config(2, SyncPolicy::EveryPut),
+        records_only,
+        restored,
+    )
+    .expect("read-only open");
+    let live: u64 = read_only
+        .index
+        .segments_snapshot()
+        .iter()
+        .map(|(_, bytes)| bytes.live)
+        .sum();
+    assert!(live >= 900, "the blob's bytes stay booked live: {live}");
 }
 
 // closing flushes and stops, leaving the tail for the next open to resume

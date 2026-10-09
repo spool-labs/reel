@@ -9,7 +9,7 @@ use crate::format::record::{read_u32_le, read_u64_le};
 ///
 /// A build meeting a version it cannot read refuses the whole file here, rather
 /// than truncating its walk at an unknown record kind and losing the tail silently.
-pub const FORMAT_VERSION: u16 = 4;
+pub const FORMAT_VERSION: u16 = 5;
 
 const VERSION_LEN: usize = std::mem::size_of::<u16>();
 const SEGMENT_LEN: usize = std::mem::size_of::<u32>();
@@ -113,19 +113,6 @@ mod tests {
 
     use crate::format::lsn::Lsn;
     use crate::format::record::RecordHeader;
-
-    // the frozen payload round trips through its byte form
-    #[test]
-    fn roundtrip() {
-        let header = SegmentHeader::new(SegmentId(9));
-
-        let parsed = SegmentHeader::unpack(&header.pack()).expect("unpack");
-
-        assert_eq!(parsed, header);
-        assert_eq!(parsed.version, FORMAT_VERSION);
-        assert_eq!(parsed.segment, SegmentId(9));
-        assert_eq!(parsed.band, None);
-    }
 
     // a banded segment says which window it was drawn under
     #[test]

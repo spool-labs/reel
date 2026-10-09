@@ -1,8 +1,7 @@
 //! What a merge of overlapping sorted runs costs, before any policy decides when
 //!
 //! A prototype rather than the mechanism: it opens sealed footers, k-way merges their
-//! rows newest-wins, and writes the winners through a plain file, at a carried row
-//! shape and a pointer one. Three things keep the answer honest: each run gets its own
+//! rows newest-wins, and writes the winners through a plain file. Three things keep the answer honest: each run gets its own
 //! volume, since a single volume shadows its own rows and reel's compaction reclaims
 //! them before a merge could see them, leaving the output ratio exactly 1.000 at every
 //! run count; no key is written twice inside a run, so nothing is dead and nothing is
@@ -22,7 +21,6 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use reel::format::footer::{FooterPartition, SegmentFooter};
-use reel::format::record::checksum;
 use reel::units::ByteCount;
 use reel::{
     Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, IndexResidency, KeyWidth,
@@ -35,13 +33,10 @@ const ACCOUNTS: ColumnId = ColumnId(1);
 /// Key width every run is keyed at, a pubkey
 const KEY_WIDTH: usize = 32;
 
-/// Bytes past the key that every row carries whether or not it carries a value
+/// Bytes past the key that every row holds
 const ROW_TAIL: usize = 17;
 
-/// Bytes a carried row spends on its own checksum
-const ROW_CRC: usize = 4;
-
-/// Value each record holds, and what a carrying column declares room for
+/// Value each record holds
 const VALUE: usize = 200;
 
 /// Bytes one record spans on disk: header, key and payload
@@ -90,22 +85,15 @@ const REPEATS: usize = 5;
 /// passes, since a two millisecond merge is scheduler noise at this width.
 const TARGET_ROWS: u64 = 2_000_000;
 
-const fn column(row_carry: u16) -> ColumnSpec {
-    ColumnSpec {
-        id: ACCOUNTS,
-        name: "accounts",
-        key_width: KeyWidth::Fixed(KEY_WIDTH as u16),
-        shard_bytes: 0,
-        inline_max: 0,
-        row_carry,
-        purge_mark: None,
-        codec: Codec::None,
-        map_shape: MapShape::Tree,
-    }
-}
-
-const CARRIED: ColumnSet = &[column(VALUE as u16)];
-const POINTER: ColumnSet = &[column(0)];
+const COLUMNS: ColumnSet = &[ColumnSpec {
+    id: ACCOUNTS,
+    name: "accounts",
+    key_width: KeyWidth::Fixed(KEY_WIDTH as u16),
+    shard_bytes: 0,
+    purge_mark: None,
+    codec: Codec::None,
+    map_shape: MapShape::Tree,
+}];
 
 fn config() -> ReelConfig {
     ReelConfig {
@@ -290,7 +278,6 @@ struct Merged {
 /// later run first and the higher sequence number inside a run, each volume counting
 /// its sequence numbers from its own start.
 fn merge(runs: &[&FooterPartition], into: &Path) -> Merged {
-    let carry = runs[0].inline_width as usize;
     let in_rows: u64 = runs.iter().map(|rows| rows.len() as u64).sum();
     let in_bytes: u64 = runs.iter().map(|rows| rows.encoded_len() as u64).sum();
 
@@ -298,7 +285,7 @@ fn merge(runs: &[&FooterPartition], into: &Path) -> Merged {
     let mut out = BufWriter::with_capacity(1 << 20, file);
     let mut cursors: Vec<Cursor<'_>> = runs.iter().map(|rows| Cursor { rows, at: 0 }).collect();
     let mut heap: BinaryHeap<Reverse<Head>> = BinaryHeap::with_capacity(runs.len());
-    let mut row = Vec::with_capacity(KEY_WIDTH + ROW_TAIL + ROW_CRC + carry);
+    let mut row = Vec::with_capacity(KEY_WIDTH + ROW_TAIL);
     let mut out_rows = 0u64;
     let mut out_bytes = 0u64;
 
@@ -346,15 +333,6 @@ fn merge(runs: &[&FooterPartition], into: &Path) -> Merged {
         row.extend_from_slice(&found.offset.to_le_bytes());
         row.extend_from_slice(&found.len.to_le_bytes());
         row.push(found.flags.bits());
-        if carry > 0 {
-            let crc_at = row.len();
-            row.extend_from_slice(&0u32.to_le_bytes());
-            let held = rows.carried_at(best.at).expect("carried").unwrap_or(&[]);
-            row.extend_from_slice(held);
-            row.resize(crc_at + ROW_CRC + carry, 0);
-            let crc = checksum(&row);
-            row[crc_at..crc_at + ROW_CRC].copy_from_slice(&crc.to_le_bytes());
-        }
         out.write_all(&row).expect("write row");
         out_bytes += row.len() as u64;
         out_rows += 1;
@@ -430,7 +408,7 @@ pub fn merge_by_run_count() {
     );
 
     let out = TempDir::new().expect("tempdir");
-    for (shape, columns) in [("carried", CARRIED), ("pointer", POINTER)] {
+    for (shape, columns) in [("pointer", COLUMNS)] {
         let built = Instant::now();
         let footers = runs(columns);
         let standing: Vec<&FooterPartition> = footers

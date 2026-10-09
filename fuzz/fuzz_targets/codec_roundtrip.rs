@@ -23,9 +23,6 @@ struct Case<'a> {
     /// Which of the codecs the column would have named
     codec: u8,
 
-    /// The column's inline ceiling, which a small enough stored form is refused under
-    inline_max: u16,
-
     /// The bytes offered to admission
     payload: &'a [u8],
 }
@@ -33,7 +30,7 @@ struct Case<'a> {
 fuzz_target!(|case: Case| {
     let codec = CODECS[usize::from(case.codec) % CODECS.len()];
     let logical = case.payload.to_vec();
-    let (stored, byte) = admit(codec, case.inline_max, logical.clone());
+    let (stored, byte) = admit(codec, logical.clone());
 
     match byte {
         0 => assert_eq!(stored, logical, "a refused payload was not handed back"),

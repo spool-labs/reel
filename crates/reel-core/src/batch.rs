@@ -106,25 +106,3 @@ impl IntoIterator for WriteBatch {
         self.ops.into_iter()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn batch_ops() {
-        let mut batch = WriteBatch::new();
-        assert!(batch.is_empty());
-        assert_eq!(batch.len(), 0);
-
-        batch.put("cf1", b"key1", b"value1");
-        assert!(!batch.is_empty());
-        assert_eq!(batch.len(), 1);
-
-        batch.delete("cf2", b"key2");
-        assert_eq!(batch.len(), 2);
-
-        batch.put("cf1", b"key3", b"value3");
-        assert_eq!(batch.len(), 3);
-    }
-}

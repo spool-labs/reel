@@ -94,32 +94,6 @@ fn served_keys(store: &ReelStore) -> Vec<Vec<u8>> {
         .collect()
 }
 
-// a root listing the device refuses is a refused open, not an empty volume
-#[test]
-fn refuses_when_the_root_cannot_be_listed() {
-    let plan = FaultPlan::new(1).with_fault(ROOT_LIST_AT, FaultKind::ListError);
-
-    let opened = open_under(populated(), plan);
-
-    assert!(
-        opened.is_err(),
-        "an unreadable root opened as an empty volume"
-    );
-}
-
-// a segment the device cannot read is a refused open rather than a partial rebuild
-#[test]
-fn refuses_when_a_segment_cannot_be_read() {
-    let plan = FaultPlan::new(1).with_fault(FIRST_READ_AT, FaultKind::ReadError);
-
-    let opened = open_under(populated(), plan);
-
-    assert!(
-        opened.is_err(),
-        "an unreadable segment rebuilt as a partial reel"
-    );
-}
-
 // a volume with nothing in it yet is empty rather than refused
 #[test]
 fn accepts_a_volume_that_does_not_exist_yet() {

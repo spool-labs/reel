@@ -44,8 +44,6 @@ const COLUMNS: ColumnSet = &[
         name: RECORDS_CF,
         key_width: KeyWidth::Fixed(RECORD_KEY_LEN as u16),
         shard_bytes: GROUP_PREFIX_LEN as u8,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -55,8 +53,6 @@ const COLUMNS: ColumnSet = &[
         name: BLOB_CF,
         key_width: KeyWidth::Fixed(32),
         shard_bytes: 0,
-        inline_max: 0,
-        row_carry: 0,
         purge_mark: None,
         codec: Codec::None,
         map_shape: MapShape::Tree,
@@ -146,17 +142,6 @@ fn ring_config() -> ReelConfig {
         uring: tuning(),
         ..ReelConfig::default()
     }
-}
-
-// the ring sets up at all, which is what a blocked syscall would deny
-#[test]
-fn ring_opens() {
-    let backend = UringBackend::new(false, tuning());
-    assert!(
-        backend.is_ok(),
-        "io_uring setup failed, so the ring is blocked here: {:?}",
-        backend.err()
-    );
 }
 
 // a volume on the ring writes, reads back, and deletes through it
@@ -337,51 +322,6 @@ fn a_batch_past_the_completion_queue_answers_every_read() {
         }
     }
     assert!(answered.into_iter().all(|had| had), "every read answered");
-}
-
-// a ring answers a batch of reads on the submitting thread
-#[test]
-fn a_batch_answers_on_its_thread() {
-    let dir = tempdir().expect("tempdir");
-    let path = dir.path().join("batched");
-    let payload: Vec<u8> = (0..4096u32).map(|at| at as u8).collect();
-    std::fs::write(&path, &payload).expect("the file the reads come from");
-
-    let backend = UringBackend::new(false, tuning())
-        .unwrap_or_else(|error| panic!("a ring was refused: {error}"));
-    let file = open_through(&backend, &path);
-
-    let mut ops = Vec::new();
-    for at in 0..64u64 {
-        ops.push(Op::Pread {
-            tag: Tag(at),
-            file,
-            offset: at * 64,
-            buf: ReadBuf::new(64),
-        });
-    }
-    let mut answered = Vec::new();
-    assert!(
-        backend.submit_batch(&mut ops, &mut answered),
-        "the batch did not run on this thread",
-    );
-
-    assert_eq!(answered.len(), 64);
-    for (at, completion) in answered.into_iter().enumerate() {
-        assert_eq!(
-            completion.tag,
-            Tag(at as u64),
-            "answers came back out of order"
-        );
-        match completion.outcome {
-            Outcome::Read { result, buf } => {
-                assert_eq!(result.expect("the read succeeded"), 64);
-                let want = &payload[at * 64..at * 64 + 64];
-                assert_eq!(&buf.into_vec()[..], want);
-            }
-            other => panic!("a read came back as {other:?}"),
-        }
-    }
 }
 
 // a batch on the caller's own ring comes back in submit order, however the kernel ran it

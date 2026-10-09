@@ -21,6 +21,40 @@ impl Drop for Block {
     }
 }
 
+/// One read's buffer, lent by reference and cut into values by window
+///
+/// A walk borrows records straight out of it, and a caller that keeps one takes a
+/// window, which holds the buffer until the last window drops.
+#[derive(Clone, Debug)]
+pub struct ReadBlock(Arc<Block>);
+
+impl ReadBlock {
+    /// A buffer that goes back through `recycle` once nothing holds it
+    pub fn new(bytes: Vec<u8>, recycle: fn(Vec<u8>)) -> ReadBlock {
+        ReadBlock(Arc::new(Block { bytes, recycle }))
+    }
+
+    /// The record at a window of the buffer, or nothing when it falls outside
+    pub fn window(&self, at: usize, len: usize) -> Option<Value> {
+        let end = at.checked_add(len)?;
+        (end <= self.0.bytes.len()).then(|| Value {
+            held: Held::Window {
+                block: Arc::clone(&self.0),
+                at,
+                len,
+            },
+        })
+    }
+}
+
+impl Deref for ReadBlock {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0.bytes
+    }
+}
+
 /// Bytes a read produced, with the buffer's owner recorded
 #[derive(Debug, Default)]
 pub struct Value {
@@ -88,35 +122,6 @@ impl Value {
                 recycle: Some(recycle),
             },
         }
-    }
-
-    /// Cut one read's buffer into the windows the records inside it occupy
-    ///
-    /// The block goes back to the pool once every window has dropped, so a caller
-    /// keeping one record keeps the whole run's buffer with it. A cut falling
-    /// outside the buffer yields nothing for that record. The windows land in a
-    /// vector the caller keeps, so a thread cutting one run after another buys one
-    /// list rather than one per run.
-    pub fn windows_into(
-        bytes: Vec<u8>,
-        recycle: fn(Vec<u8>),
-        cuts: &[(usize, usize)],
-        out: &mut Vec<Option<Value>>,
-    ) {
-        out.clear();
-        out.reserve(cuts.len());
-        let held = bytes.len();
-        let block = Arc::new(Block { bytes, recycle });
-        out.extend(cuts.iter().map(|&(at, len)| {
-            let end = at.checked_add(len)?;
-            (end <= held).then(|| Value {
-                held: Held::Window {
-                    block: Arc::clone(&block),
-                    at,
-                    len,
-                },
-            })
-        }));
     }
 
     /// One window of a buffer nothing else holds, or nothing when the buffer is short
@@ -273,8 +278,12 @@ mod tests {
         let mut block = Vec::with_capacity(64);
         block.extend_from_slice(b"onetwothree");
 
-        let mut cut = Vec::new();
-        Value::windows_into(block, count_it, &[(0, 3), (3, 3), (6, 5), (9, 9)], &mut cut);
+        let read = ReadBlock::new(block, count_it);
+        let cut: Vec<Option<Value>> = [(0, 3), (3, 3), (6, 5), (9, 9)]
+            .iter()
+            .map(|&(at, len)| read.window(at, len))
+            .collect();
+        drop(read);
 
         assert_eq!(&**cut[0].as_ref().expect("first"), b"one");
         assert_eq!(&**cut[1].as_ref().expect("second"), b"two");
@@ -289,8 +298,9 @@ mod tests {
         RETURNED.with(|held| held.set(0));
         let mut block = Vec::with_capacity(64);
         block.extend_from_slice(b"onetwo");
-        let mut cut = Vec::new();
-        Value::windows_into(block, count_it, &[(0, 3), (3, 3)], &mut cut);
+        let read = ReadBlock::new(block, count_it);
+        let mut cut: Vec<Option<Value>> = vec![read.window(0, 3), read.window(3, 3)];
+        drop(read);
 
         drop(cut.pop());
         assert_eq!(
@@ -313,8 +323,9 @@ mod tests {
         RETURNED.with(|held| held.set(0));
         let mut block = Vec::with_capacity(64);
         block.extend_from_slice(b"onetwo");
-        let mut cut = Vec::new();
-        Value::windows_into(block, count_it, &[(0, 3), (3, 3)], &mut cut);
+        let read = ReadBlock::new(block, count_it);
+        let mut cut: Vec<Option<Value>> = vec![read.window(0, 3), read.window(3, 3)];
+        drop(read);
 
         let taken = cut.pop().expect("second").expect("window").into_vec();
 

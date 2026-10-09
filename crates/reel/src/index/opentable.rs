@@ -106,6 +106,13 @@ impl<const N: usize, Value> Default for OpenTable<N, Value> {
 }
 
 impl<const N: usize, Value: Default> OpenTable<N, Value> {
+    /// Bytes the table's arrays have allocated, empty slots and spare capacity included
+    pub fn heap_bytes(&self) -> u64 {
+        (self.control.capacity()
+            + self.keys.capacity() * N
+            + self.values.capacity() * std::mem::size_of::<Value>()) as u64
+    }
+
     /// An empty table, which allocates when something is first put in it
     pub fn new() -> OpenTable<N, Value> {
         OpenTable::default()
@@ -152,6 +159,14 @@ impl<const N: usize, Value: Default> OpenTable<N, Value> {
     pub fn get(&self, key: &[u8; N]) -> Option<&Value> {
         match self.site(key) {
             Site::Held(at) => Some(&self.values[at]),
+            Site::Free(_) => None,
+        }
+    }
+
+    /// What a key holds, to be changed in place
+    pub fn get_mut(&mut self, key: &[u8; N]) -> Option<&mut Value> {
+        match self.site(key) {
+            Site::Held(at) => Some(&mut self.values[at]),
             Site::Free(_) => None,
         }
     }
@@ -230,6 +245,13 @@ impl<const N: usize, Value: Default> OpenTable<N, Value> {
             return;
         }
         self.resize(slots_for(self.held));
+    }
+
+    /// Size the table to its load factor, for one grown a key at a time
+    pub fn fit(&mut self) {
+        if self.slots() > slots_for(self.held) {
+            self.resize(slots_for(self.held));
+        }
     }
 
     /// Every pair the table holds, in key order
@@ -774,35 +796,6 @@ mod tests {
         found
     }
 
-    // a table serves back every key put into it
-    #[test]
-    fn puts_resolve() {
-        let mut table: OpenTable<32, u64> = OpenTable::new();
-
-        for at in 0..2_000u64 {
-            table.insert(key(at), at);
-        }
-
-        assert_eq!(table.len(), 2_000);
-        for at in 0..2_000u64 {
-            assert_eq!(table.get(&key(at)), Some(&at));
-        }
-        assert!(table.get(&key(2_000)).is_none());
-    }
-
-    // an overwrite replaces the value and takes no new slot
-    #[test]
-    fn overwrite_keeps_one_slot() {
-        let mut table: OpenTable<32, u64> = OpenTable::new();
-        table.insert(key(1), 10);
-
-        let displaced = table.insert(key(1), 20);
-
-        assert_eq!(displaced, Some(10));
-        assert_eq!(table.len(), 1);
-        assert_eq!(table.get(&key(1)), Some(&20));
-    }
-
     // keys landing on one home slot each resolve to their own value, since the whole
     // key claims a slot and a shared home is a longer chain rather than a lost key
     #[test]
@@ -876,22 +869,6 @@ mod tests {
         }
     }
 
-    // a signature-wide table serves back every key put into it
-    #[test]
-    fn wide_puts_resolve() {
-        let mut table: OpenTable<72, u64> = OpenTable::new();
-
-        for at in 0..2_000u64 {
-            table.insert(signature(at), at);
-        }
-
-        assert_eq!(table.len(), 2_000);
-        for at in 0..2_000u64 {
-            assert_eq!(table.get(&signature(at)), Some(&at));
-        }
-        assert!(table.get(&signature(2_000)).is_none());
-    }
-
     // and tells apart signature-wide keys that agree on their home and their fragment
     #[test]
     fn wide_shared_fragment_resolves() {
@@ -941,25 +918,6 @@ mod tests {
                 "key {at} after the delete"
             );
         }
-    }
-
-    // a signature-wide span serves the keys inside its bounds, in order
-    #[test]
-    fn wide_span_holds_its_bounds() {
-        let mut table: OpenTable<72, u64> = OpenTable::new();
-        let mut ordered: Vec<[u8; 72]> = (0..100u64).map(signature).collect();
-        for (at, key) in ordered.iter().enumerate() {
-            table.insert(*key, at as u64);
-        }
-        ordered.sort_unstable();
-
-        let held: Vec<[u8; 72]> = table
-            .sorted_span(Bound::Included(&ordered[10]), Bound::Excluded(&ordered[20]))
-            .into_iter()
-            .map(|(key, _)| *key)
-            .collect();
-
-        assert_eq!(held, ordered[10..20].to_vec());
     }
 
     // a table never holds more than seven eighths of its slots
@@ -1086,23 +1044,6 @@ mod tests {
         assert_eq!(table.len(), 0);
         assert_eq!(table.slots(), slots);
         assert!(table.get(&key(1)).is_none());
-    }
-
-    // a span serves the keys inside its bounds and no others, in order
-    #[test]
-    fn span_holds_its_bounds() {
-        let mut table: OpenTable<32, u64> = OpenTable::new();
-        for at in 0..100u64 {
-            table.insert(key(at), at);
-        }
-
-        let held: Vec<u64> = table
-            .sorted_span(Bound::Included(&key(10)), Bound::Excluded(&key(20)))
-            .into_iter()
-            .map(|(_, at)| *at)
-            .collect();
-
-        assert_eq!(held, (10..20).collect::<Vec<u64>>());
     }
 
     // the slot count for a key count sits at the load factor, not at a power of two

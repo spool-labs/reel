@@ -36,27 +36,14 @@ pub trait FooterSource: Send + Sync {
     fn footer(&self, segment: SegmentId) -> Result<Option<Arc<SegmentFooter>>>;
 
     /// What a sealed segment's footer says about a key, if it says anything
-    ///
-    /// A caller wanting the value the row carries passes a buffer for it, left
-    /// empty by a row that carries none.
-    fn find(
-        &self,
-        segment: SegmentId,
-        column: ColumnId,
-        key: &[u8],
-        carry: Option<&mut Vec<u8>>,
-    ) -> Result<Option<FooterRow>> {
+    fn find(&self, segment: SegmentId, column: ColumnId, key: &[u8]) -> Result<Option<FooterRow>> {
         let Some(footer) = self.footer(segment)? else {
             return Ok(None);
         };
-        let Some(partition) = footer
-            .partitions
-            .iter()
-            .find(|partition| partition.column == column)
-        else {
+        let Some(partition) = footer.partition(column) else {
             return Ok(None);
         };
-        match partition.lookup(key, carry)? {
+        match partition.lookup(key)? {
             FooterFind::Found(row) => Ok(Some(row)),
             FooterFind::RuledOut | FooterFind::Missing => Ok(None),
         }

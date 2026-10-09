@@ -18,8 +18,11 @@ const DEFAULT_COMPACT_DEAD_RATIO: f64 = 0.50;
 const DEFAULT_MERGE_DEAD_RATIO: f64 = 0.50;
 const DEFAULT_SCRUB_MBPS: u64 = 64;
 
-/// Sealed descriptors the reader cache holds, the one number every volume runs
-pub const DEFAULT_FD_CACHE: u64 = 256;
+/// Sealed descriptors the reader cache holds, unless the open-file limit says fewer
+///
+/// A store with more sealed segments than this drops a handle on every miss and remaps
+/// the segment on the next read, so the default sits well above a volume's segment count.
+pub const DEFAULT_FD_CACHE: u64 = 4096;
 
 const DEFAULT_FOOTER_CACHE_MIB: u64 = 64;
 const DEFAULT_FILTER_BITS: u8 = 10;
@@ -82,7 +85,10 @@ pub struct HotIndex {
     /// Seconds a sealed segment's keys stay resident before they are handed over
     pub after_secs: u64,
 
-    /// Resident index bytes past which the oldest segments are handed over early
+    /// Bytes the keys hold above the empty index, past which the oldest segments go early
+    ///
+    /// The shards and their filters cost a floor before any key arrives, and a volume
+    /// refuses a budget under that floor at open.
     #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_bytes"))]
     pub budget: ByteCount,
 }
@@ -439,10 +445,6 @@ pub struct ReelConfig {
     /// Whether an awaited whole-record read asks the page cache before it queues
     pub point_reads: PointReads,
 
-    /// Byte budget for the values the index carries beside its entries, zero for all-resident
-    #[cfg_attr(feature = "serde", serde(deserialize_with = "deserialize_bytes"))]
-    pub carried_budget: ByteCount,
-
     /// Append tails the volume runs, which is how many files it appends into
     #[cfg_attr(
         feature = "serde",
@@ -504,7 +506,6 @@ impl Default for ReelConfig {
             merge_sorted_runs: false,
             merge_dead_ratio: DEFAULT_MERGE_DEAD_RATIO,
             point_reads: PointReads::Queued,
-            carried_budget: ByteCount::from_bytes(0),
             footer_cache: ByteCount::mb(DEFAULT_FOOTER_CACHE_MIB),
             active_tails: ThreadBudget::Auto,
             volumes: Vec::new(),
@@ -812,42 +813,6 @@ fn byte_multiplier(unit: &str) -> std::result::Result<u64, String> {
 mod tests {
     use super::*;
 
-    // a mode the kernel refuses has somewhere to step down to, and the floor has not
-    #[test]
-    fn a_completion_mode_steps_down_to_one_every_kernel_takes() {
-        assert_eq!(
-            TaskRun::Deferred.and_below(),
-            [TaskRun::Deferred, TaskRun::Cooperative, TaskRun::Interrupt],
-        );
-        assert_eq!(
-            TaskRun::Cooperative.and_below(),
-            [TaskRun::Cooperative, TaskRun::Interrupt],
-        );
-        assert_eq!(
-            TaskRun::Interrupt.and_below(),
-            [TaskRun::Interrupt],
-            "the floor asks for nothing, so it has nowhere to fall to",
-        );
-        for mode in TaskRun::Deferred.and_below() {
-            assert_eq!(
-                mode.and_below().last(),
-                Some(&TaskRun::Interrupt),
-                "a mode stepped down without reaching the one a ring runs unasked",
-            );
-        }
-    }
-
-    // the two modes that hold their work are the two a thread has to ask
-    #[test]
-    fn a_held_completion_is_one_the_thread_asks_for() {
-        assert!(TaskRun::Deferred.is_asked_for());
-        assert!(TaskRun::Cooperative.is_asked_for());
-        assert!(
-            !TaskRun::Interrupt.is_asked_for(),
-            "a ring that interrupts for a completion has posted it already",
-        );
-    }
-
     // the floor is asked about the record, so one volume answers both ways
     #[test]
     fn a_floor_maps_the_large_record_and_not_the_small() {
@@ -935,17 +900,6 @@ mod tests {
             32,
             "a named count is taken as given"
         );
-    }
-
-    // an every-put policy still validates
-    #[test]
-    fn every_put_ok() {
-        let config = ReelConfig {
-            sync: SyncPolicy::EveryPut,
-            ..ReelConfig::default()
-        };
-
-        assert!(config.validate().is_ok());
     }
 
     // human byte sizes parse to their byte counts

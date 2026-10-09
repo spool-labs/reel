@@ -1242,7 +1242,7 @@ pub struct FdCache {
 /// Names the next cache, so two volumes never share a memo
 static NEXT_CACHE_ID: AtomicU64 = AtomicU64::new(0);
 
-/// The last handle a thread resolved, answered without the map's guard
+/// A handle a thread resolved, answered without the map's guard
 ///
 /// The reference is weak, so the memo never keeps a file alive: a doomed segment
 /// unlinks the moment its real readers drain, and an upgrade that fails falls
@@ -1253,8 +1253,12 @@ struct HandleMemo {
     handle: std::sync::Weak<SegmentInner>,
 }
 
+/// Each thread remembers this many handles by segment id, so reads spread over a volume's segments skip the map's guard
+const MEMO_SLOTS: usize = 64;
+
 thread_local! {
-    static LAST_HANDLE: RefCell<Option<HandleMemo>> = const { RefCell::new(None) };
+    static HANDLES: RefCell<[Option<HandleMemo>; MEMO_SLOTS]> =
+        const { RefCell::new([const { None }; MEMO_SLOTS]) };
 }
 
 /// Hash for a key this reel issues and no caller chooses
@@ -1313,8 +1317,9 @@ impl FdCache {
     /// The thread's memo answers first, and a segment id is never reused within a
     /// volume, so a memo that matches the cache cannot answer with the wrong bytes.
     pub fn get(&self, id: SegmentId) -> Option<SegmentHandle> {
-        let memoized = LAST_HANDLE.with(|slot| {
-            slot.borrow()
+        let at = id.0 as usize % MEMO_SLOTS;
+        let memoized = HANDLES.with(|slots| {
+            slots.borrow()[at]
                 .as_ref()
                 .filter(|memo| memo.cache == self.id && memo.segment == id)
                 .and_then(|memo| memo.handle.upgrade())
@@ -1325,8 +1330,8 @@ impl FdCache {
         }
 
         let handle = self.entries.get(segment_key(id))?;
-        LAST_HANDLE.with(|slot| {
-            *slot.borrow_mut() = Some(HandleMemo {
+        HANDLES.with(|slots| {
+            slots.borrow_mut()[at] = Some(HandleMemo {
                 cache: self.id,
                 segment: id,
                 handle: Arc::downgrade(&handle.inner),
@@ -1539,6 +1544,41 @@ mod tests {
         // memo, whatever ids it holds.
         let other = FdCache::new(4);
         assert!(other.get(SegmentId(9)).is_none());
+    }
+
+    // reads moving between segments keep each one memoized
+    #[test]
+    fn reads_across_segments_each_stay_memoized() {
+        let driver = driver();
+        let dir = Path::new("/reel");
+        let cache = FdCache::new(4);
+        let handles: Vec<SegmentHandle> = (1..=2u32)
+            .map(|number| {
+                let path = dir.join(format!("{number:06}.reel"));
+                let file = open(&driver, &path);
+                let handle = SegmentHandle::new(
+                    SegmentId(number),
+                    path,
+                    file,
+                    Arc::clone(&driver),
+                    RecordLayout::Keyed,
+                );
+                cache.insert(handle.clone());
+                handle
+            })
+            .collect();
+        assert!(cache.get(SegmentId(1)).is_some());
+        assert!(cache.get(SegmentId(2)).is_some());
+
+        // Out of the map, each one still answers from the memo while its handle lives
+        cache.remove(SegmentId(1));
+        cache.remove(SegmentId(2));
+        assert_eq!(cache.get(SegmentId(1)).map(|h| h.id()), Some(SegmentId(1)));
+        assert_eq!(cache.get(SegmentId(2)).map(|h| h.id()), Some(SegmentId(2)));
+
+        drop(handles);
+        assert!(cache.get(SegmentId(1)).is_none());
+        assert!(cache.get(SegmentId(2)).is_none());
     }
 
     // a live segment that is never doomed survives every handle drop

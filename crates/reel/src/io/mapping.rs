@@ -83,6 +83,7 @@ impl Mapping {
     }
 
     /// The mapped bytes at an offset, or nothing when the span runs past the file
+    #[inline]
     pub fn slice(&self, offset: u64, wanted: usize) -> Option<&[u8]> {
         let end = offset.checked_add(wanted as u64)?;
         if end > self.len() && (end > self.span as u64 || end > self.refresh()) {

@@ -280,7 +280,7 @@ fn put_varint(out: &mut Vec<u8>, mut value: u64) {
 }
 
 /// Read a number `put_varint` wrote, stepping past it
-#[inline]
+#[inline(always)]
 fn get_varint(bytes: &[u8], at: &mut usize) -> Result<u64> {
     let mut value = 0u64;
     for shift in (0..64).step_by(7) {

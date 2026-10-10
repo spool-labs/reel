@@ -1,10 +1,13 @@
 //! The spot index keeps record locations for sealed keys and checks each key in its record's header
 
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
+use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use reel_core::Value;
+use siphasher::sip::SipHasher13;
 
 use crate::error::{ReelError, Result};
 use crate::format::column::{ColumnId, KeyRef, RecordKey};
@@ -55,22 +58,6 @@ fn put_in(table: &mut Writing<'_>, hash: u64, loc: Loc) -> bool {
     true
 }
 
-/// The rows of one lane of shards, gathered by shard
-fn lane_groups(rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<(usize, Vec<usize>)> {
-    let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); SHARDS];
-    for (at, (key, _)) in rows.iter().enumerate() {
-        let shard = shard_of(hash_of(key));
-        if shard % lanes == lane {
-            by_shard[shard].push(at);
-        }
-    }
-    by_shard
-        .into_iter()
-        .enumerate()
-        .filter(|(_, ats)| !ats.is_empty())
-        .collect()
-}
-
 /// The lowest rung of a shard's ladder holds this many buckets
 const FIRST_BUCKETS: usize = 8;
 
@@ -92,8 +79,11 @@ const MAX_STALE: usize = 1 << 20;
 /// One bucket takes this many bytes
 const BUCKET_BYTES: u64 = 64;
 
-/// One key can have this many candidates, with both of its buckets full
+/// One key's two buckets hold this many candidates, and the spill holds any past them
 const MAX_CANDIDATES: usize = 2 * WAYS;
+
+/// A spilled slot's place takes this as its bucket and its index in the spill as its way
+const SPILLED: usize = usize::MAX;
 
 /// An overwrite reads every version of a key holding this many, so its two buckets never fill
 const SETTLE_AT: usize = 3;
@@ -365,25 +355,10 @@ fn bound_of(class: u32) -> u32 {
     BOUNDS[(class as usize).min(CLASSES - 1)]
 }
 
-/// A key's 64 bit hash, mixed so structured keys spread like random ones
-fn hash_of(key: &[u8]) -> u64 {
-    #[cfg(test)]
-    if let Some(shared) = tests::shared_hash(key) {
-        return shared;
-    }
-    const ODD: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut state = 0xCBF2_9CE4_8422_2325 ^ key.len() as u64;
-    let mut chunks = key.chunks_exact(8);
-    for chunk in &mut chunks {
-        let mut word = [0u8; 8];
-        word.copy_from_slice(chunk);
-        state = (state ^ u64::from_le_bytes(word))
-            .wrapping_mul(ODD)
-            .rotate_left(29);
-    }
-    let mut tail = [0u8; 8];
-    tail[..chunks.remainder().len()].copy_from_slice(chunks.remainder());
-    mix(state ^ u64::from_le_bytes(tail))
+/// A SipHash keyed from the system's randomness, so nobody can pick keys that share a hash
+fn keyed_hasher() -> SipHasher13 {
+    let state = RandomState::new();
+    SipHasher13::new_with_keys(state.hash_one(0u64), state.hash_one(1u64))
 }
 
 fn mix(mut value: u64) -> u64 {
@@ -524,11 +499,14 @@ struct Place {
     slot: Slot,
 }
 
-/// The slots holding one key's bits, at most both of its buckets full
+/// The slots holding one key's bits, from both of its buckets and the spill
 #[derive(Clone, Debug)]
 struct Places {
     held: [Place; MAX_CANDIDATES],
     count: usize,
+
+    /// Every place, once spilled slots take the count past what both buckets hold
+    more: Vec<Place>,
 }
 
 impl Places {
@@ -536,6 +514,7 @@ impl Places {
         Places {
             held: [Place::default(); MAX_CANDIDATES],
             count: 0,
+            more: Vec::new(),
         }
     }
 
@@ -543,13 +522,28 @@ impl Places {
         self.held[self.count] = place;
         self.count += 1;
     }
+
+    /// Add a spilled slot's place, moving every place to the heap once the array is full
+    fn push_spilled(&mut self, place: Place) {
+        if self.count < MAX_CANDIDATES {
+            self.push(place);
+            return;
+        }
+        if self.more.is_empty() {
+            self.more.extend_from_slice(&self.held);
+        }
+        self.more.push(place);
+    }
 }
 
 impl std::ops::Deref for Places {
     type Target = [Place];
 
     fn deref(&self) -> &[Place] {
-        &self.held[..self.count]
+        match self.more.is_empty() {
+            true => &self.held[..self.count],
+            false => &self.more,
+        }
     }
 }
 
@@ -564,6 +558,9 @@ impl Eq for Places {}
 struct Table {
     /// The buckets, one cache line of slots each
     buckets: Vec<Bucket>,
+
+    /// Slots whose pair had no room, which every look scans while any are held
+    spilled: Vec<Slot>,
 
     /// How many buckets a key's mid can land on as its home, which is every bucket
     homes: usize,
@@ -601,6 +598,7 @@ impl Table {
         let homes = count.max(2);
         Table {
             buckets: vec![Bucket::default(); homes],
+            spilled: Vec::new(),
             homes,
             held: 0,
             seed: count as u64,
@@ -649,7 +647,57 @@ impl Table {
                 }
             }
         }
+        if !self.spilled.is_empty() {
+            self.spilled_matches(hash, &mut found);
+        }
         found
+    }
+
+    /// Add the spilled slots holding a key's bits, out of line so a look with no spill skips it
+    #[cold]
+    #[inline(never)]
+    fn spilled_matches(&self, hash: u64, found: &mut Places) {
+        for (way, slot) in self.spilled.iter().enumerate() {
+            if slot.holds(hash) {
+                found.push_spilled(Place {
+                    bucket: SPILLED,
+                    way,
+                    slot: *slot,
+                });
+            }
+        }
+    }
+
+    /// The slot at a place, in its bucket or in the spill
+    fn slot_mut(&mut self, place: &Place) -> &mut Slot {
+        match place.bucket == SPILLED {
+            true => &mut self.spilled[place.way],
+            false => &mut self.buckets[place.bucket].slots[place.way],
+        }
+    }
+
+    /// Whether both of a slot's buckets are full of slots with its hash, which no growth splits
+    fn pair_shared(&self, slot: &Slot) -> bool {
+        let home = self.home(slot.mid);
+        let second = (home + self.step(slot.tag())) % self.buckets.len();
+        [home, second].iter().all(|bucket| {
+            self.buckets[*bucket]
+                .slots
+                .iter()
+                .all(|held| !held.is_empty() && held.mid == slot.mid && held.tag() == slot.tag())
+        })
+    }
+
+    /// Hold a slot that found no room in its pair
+    fn spill(&mut self, slot: Slot) {
+        self.spilled.push(slot);
+        self.held += 1;
+    }
+
+    /// How many bytes the buckets and the spill take
+    fn heap_bytes(&self) -> u64 {
+        let spill = self.spilled.capacity() * std::mem::size_of::<Slot>();
+        self.buckets.len() as u64 * BUCKET_BYTES + spill as u64
     }
 
     fn free_way(&self, bucket: usize) -> Option<usize> {
@@ -666,6 +714,10 @@ impl Table {
                 self.held += 1;
                 return Ok(());
             }
+        }
+        // Kicks can't free a pair whose slots all share this hash
+        if self.pair_shared(&slot) {
+            return Err(slot);
         }
         let (mut bucket, mut moving) = (home, slot.in_second(false));
         for _ in 0..MAX_KICKS {
@@ -687,43 +739,51 @@ impl Table {
         self.held as f64 >= (self.homes * WAYS) as f64 * LOAD
     }
 
-    /// A copy of this table at the next rung that fits every slot
+    /// A copy of this table at the next rung, spilling each slot that finds no room there
     fn grown(&self) -> Table {
-        let mut count = next_rung(self.homes, self.phase);
-        loop {
-            let mut table = Table::with_buckets(count, self.phase);
-            let slots = self
-                .buckets
-                .iter()
-                .flat_map(|bucket| bucket.slots.iter())
-                .copied();
-            if slots
-                .filter(|slot| !slot.is_empty())
-                .all(|slot| table.place(slot).is_ok())
-            {
-                return table;
+        let mut table = Table::with_buckets(next_rung(self.homes, self.phase), self.phase);
+        let slots = self
+            .buckets
+            .iter()
+            .flat_map(|bucket| bucket.slots.iter())
+            .chain(&self.spilled);
+        for slot in slots.filter(|slot| !slot.is_empty()) {
+            if let Err(homeless) = table.place(*slot) {
+                table.spill(homeless);
             }
-            count = next_rung(count, self.phase);
         }
+        table
     }
 
-    /// Put a slot in, growing the table first when it is full or the pair has no room
+    /// Put a slot in, growing when the table is full or once when the pair has no room, else spill
     fn insert(&mut self, slot: Slot) {
         if self.is_full() {
             *self = self.grown();
         }
-        let mut homeless = slot;
-        while let Err(left) = self.place(homeless) {
+        let Err(mut homeless) = self.place(slot) else {
+            return;
+        };
+        // A pair full of one hash stays full at every size, so only another pair earns a growth
+        if !self.pair_shared(&homeless) {
             *self = self.grown();
-            homeless = left;
+            match self.place(homeless) {
+                Ok(()) => return,
+                Err(left) => homeless = left,
+            }
         }
+        self.spill(homeless);
     }
 
     /// Take out the slot pointing at one record, wherever displacement moved it, and return it
     fn take(&mut self, hash: u64, slot: &Slot) -> Option<Slot> {
         let found = self.matches(hash);
         let place = *found.iter().find(|place| place.slot.same_place(slot))?;
-        self.set_at(place.bucket * WAYS + place.way, Slot::default());
+        match place.bucket == SPILLED {
+            true => {
+                self.spilled.swap_remove(place.way);
+            }
+            false => self.set_at(place.bucket * WAYS + place.way, Slot::default()),
+        }
         self.held -= 1;
         Some(place.slot)
     }
@@ -736,7 +796,7 @@ impl Table {
             .find(|place| place.slot.same_place(slot) && !place.slot.is_displaced())
         {
             Some(place) => {
-                self.buckets[place.bucket].slots[place.way].meta |= DISPLACED;
+                self.slot_mut(place).meta |= DISPLACED;
                 true
             }
             None => false,
@@ -756,6 +816,15 @@ impl Table {
                 }
             }
         }
+        let held = &mut self.held;
+        self.spilled.retain(|slot| {
+            let kept = keep(slot);
+            if !kept {
+                displaced += u64::from(slot.is_displaced());
+                *held -= 1;
+            }
+            kept
+        });
         (before - self.held, displaced)
     }
 }
@@ -919,6 +988,9 @@ pub struct SpotColumn {
 
     /// How many lookups on a read-only open met a live slot whose segment went
     behind: AtomicU64,
+
+    /// The column hashes keys under its own random key, drawn when it is made
+    hasher: SipHasher13,
 }
 
 impl Default for SpotColumn {
@@ -940,7 +1012,38 @@ impl SpotColumn {
             set_aside: Mutex::new(Vec::new()),
             follows: AtomicBool::new(false),
             behind: AtomicU64::new(0),
+            hasher: keyed_hasher(),
         }
+    }
+
+    /// A key's 64 bit hash under the column's key, which stays in memory and changes per open
+    fn hash_of(&self, key: &[u8]) -> u64 {
+        #[cfg(test)]
+        if let Some(shared) = tests::shared_hash(key) {
+            return shared;
+        }
+        self.hasher.hash(key)
+    }
+
+    /// The rows of one lane of shards, gathered by shard
+    fn lane_groups(
+        &self,
+        rows: &[(&[u8], Loc)],
+        lane: usize,
+        lanes: usize,
+    ) -> Vec<(usize, Vec<usize>)> {
+        let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); SHARDS];
+        for (at, (key, _)) in rows.iter().enumerate() {
+            let shard = shard_of(self.hash_of(key));
+            if shard % lanes == lane {
+                by_shard[shard].push(at);
+            }
+        }
+        by_shard
+            .into_iter()
+            .enumerate()
+            .filter(|(_, ats)| !ats.is_empty())
+            .collect()
     }
 
     /// Set where lookups read records and the counters that order segments
@@ -998,24 +1101,24 @@ impl SpotColumn {
     pub fn heap_bytes(&self) -> u64 {
         self.shards
             .iter()
-            .map(|shard| shard.read().buckets.len() as u64 * BUCKET_BYTES)
+            .map(|shard| shard.read().heap_bytes())
             .sum()
     }
 
     /// Hold where a key's newest sealed record is and return whether it took a new slot
     pub fn insert(&self, key: &[u8], loc: Loc) -> bool {
-        let hash = hash_of(key);
+        let hash = self.hash_of(key);
         put_in(&mut self.shards[shard_of(hash)].write(), hash, loc)
     }
 
     /// Put in the rows whose shard number is `lane` mod `lanes`, returning which took a new slot
     pub fn insert_lane(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) -> Vec<bool> {
         let mut inserted = vec![false; rows.len()];
-        for (shard, chunk) in in_turns(&lane_groups(rows, lane, lanes), LOCK_CHUNK) {
+        for (shard, chunk) in in_turns(&self.lane_groups(rows, lane, lanes), LOCK_CHUNK) {
             let mut table = self.shards[shard].write();
             for &at in chunk {
                 let (key, loc) = rows[at];
-                inserted[at] = put_in(&mut table, hash_of(key), loc);
+                inserted[at] = put_in(&mut table, self.hash_of(key), loc);
             }
         }
         inserted
@@ -1023,11 +1126,11 @@ impl SpotColumn {
 
     /// Take out the slots of one lane of shards that point at these records
     pub fn remove_lane(&self, rows: &[(&[u8], Loc)], lane: usize, lanes: usize) {
-        for (shard, chunk) in in_turns(&lane_groups(rows, lane, lanes), LOCK_CHUNK) {
+        for (shard, chunk) in in_turns(&self.lane_groups(rows, lane, lanes), LOCK_CHUNK) {
             let mut table = self.shards[shard].write();
             for &at in chunk {
                 let (key, loc) = rows[at];
-                let hash = hash_of(key);
+                let hash = self.hash_of(key);
                 let held = table
                     .matches(hash)
                     .iter()
@@ -1114,7 +1217,7 @@ impl SpotColumn {
             let Some(taken) = row(at)? else {
                 continue;
             };
-            let hash = hash_of(taken.key);
+            let hash = self.hash_of(taken.key);
             let slot = Slot::new(hash, taken.loc);
             let slot = match taken.is_tombstone {
                 true => slot.as_grave(),
@@ -1177,7 +1280,7 @@ impl SpotColumn {
         let mut by_segment: HashMap<SegmentId, Vec<usize>> = HashMap::new();
         let mut by_header = Vec::new();
         for (at, row) in rows.iter().enumerate() {
-            let hash = hash_of(row.key.as_slice());
+            let hash = self.hash_of(row.key.as_slice());
             let seen = self.shards[shard_of(hash)].read().matches(hash);
             match seen.len() {
                 1 => by_segment
@@ -1292,7 +1395,7 @@ impl SpotColumn {
                     continue;
                 }
             };
-            let hash = hash_of(row.key.as_slice());
+            let hash = self.hash_of(row.key.as_slice());
             let mut table = self.shards[shard_of(hash)].write();
             let held = table.matches(hash);
             let place = held
@@ -1364,7 +1467,7 @@ impl SpotColumn {
         let Some(records) = self.records.get() else {
             return Ok(Booking::default());
         };
-        let hash = hash_of(key.as_slice());
+        let hash = self.hash_of(key.as_slice());
         let slot = match is_tombstone {
             true => Slot::new(hash, loc).as_grave(),
             false => Slot::new(hash, loc),
@@ -1425,7 +1528,7 @@ impl SpotColumn {
 
     /// Whether a key's one live slot points at this record, so a caller can trust it with no read
     pub fn only_at(&self, key: &[u8], loc: Loc) -> bool {
-        let hash = hash_of(key);
+        let hash = self.hash_of(key);
         let seen = self.shards[shard_of(hash)].read().matches(hash);
         let mut live = seen.iter().filter(|place| !place.slot.is_displaced());
         match (live.next(), live.next()) {
@@ -1436,7 +1539,7 @@ impl SpotColumn {
 
     /// Whether a key's one live slot points elsewhere, which makes this record an older version
     pub fn live_elsewhere(&self, key: &[u8], loc: Loc) -> bool {
-        let hash = hash_of(key);
+        let hash = self.hash_of(key);
         let seen = self.shards[shard_of(hash)].read().matches(hash);
         let mut live = seen.iter().filter(|place| !place.slot.is_displaced());
         match (live.next(), live.next()) {
@@ -1447,7 +1550,7 @@ impl SpotColumn {
 
     /// Where a key's one live record sits, nothing for a grave or a second live slot
     pub fn only_live(&self, key: &[u8]) -> Option<(SegmentId, u32)> {
-        let hash = hash_of(key);
+        let hash = self.hash_of(key);
         let seen = self.shards[shard_of(hash)].read().matches(hash);
         let mut live = seen.iter().filter(|place| !place.slot.is_displaced());
         match (live.next(), live.next()) {
@@ -1460,7 +1563,7 @@ impl SpotColumn {
 
     /// Take out the live entry for one record, leaving a displaced one for compaction to rebook
     pub fn take_live(&self, key: &[u8], loc: Loc) -> bool {
-        let hash = hash_of(key);
+        let hash = self.hash_of(key);
         let mut table = self.shards[shard_of(hash)].write();
         let held = table
             .matches(hash)
@@ -1478,7 +1581,7 @@ impl SpotColumn {
         let (Some(records), Some(segments)) = (self.records.get(), self.segments.get()) else {
             return Ok(Displaced::default());
         };
-        let hash = hash_of(key.as_slice());
+        let hash = self.hash_of(key.as_slice());
         let shard = shard_of(hash);
         let seen = self.shards[shard].read().matches(hash);
         if seen.is_empty() {
@@ -1579,7 +1682,7 @@ impl SpotColumn {
             if entry.is_tombstone() || entry.is_range_tombstone() {
                 continue;
             }
-            let hash = hash_of(entry.key.as_slice());
+            let hash = self.hash_of(entry.key.as_slice());
             let shard = &self.shards[shard_of(hash)];
             if shard.displaced.load(Ordering::Relaxed) == 0 {
                 continue;
@@ -1635,7 +1738,7 @@ impl SpotColumn {
 
     /// The candidates for a key, newest segment ceiling first, ties to the newer segment
     fn ordered(&self, key: &RecordKey, segments: &SegmentTable) -> (u64, Vec<(Option<Lsn>, Slot)>) {
-        let hash = hash_of(key.as_slice());
+        let hash = self.hash_of(key.as_slice());
         let seen = self.shards[shard_of(hash)].read().matches(hash);
         let mut ordered: Vec<(Option<Lsn>, Slot)> =
             seen.iter().map(|place| (None, place.slot)).collect();
@@ -1727,7 +1830,7 @@ impl SpotColumn {
         let Some(segments) = self.segments.get() else {
             return true;
         };
-        let hash = hash_of(key);
+        let hash = self.hash_of(key);
         self.shards[shard_of(hash)]
             .read()
             .matches(hash)
@@ -1746,7 +1849,7 @@ impl SpotColumn {
         let (Some(records), Some(segments)) = (self.records.get(), self.segments.get()) else {
             return Ok(false);
         };
-        let hash = hash_of(key.bytes);
+        let hash = self.hash_of(key.bytes);
         let seen = self.shards[shard_of(hash)].read().matches(hash);
         for place in seen.iter() {
             let segment = place.slot.segment();
@@ -1763,7 +1866,7 @@ impl SpotColumn {
 
     /// Where the key's shard stands, read before the map is asked
     pub fn since(&self, key: &RecordKey) -> Since {
-        let shard = shard_of(hash_of(key.as_slice()));
+        let shard = shard_of(self.hash_of(key.as_slice()));
         Since {
             shard,
             taken: self.shards[shard].taken.load(Ordering::Acquire),
@@ -2143,6 +2246,144 @@ mod tests {
         // a single-candidate read and a move's shortcut leave a displaced slot to the full lookup
         assert!(column.sole(&bystander).is_none());
         assert!(!column.only_at(bystander.as_slice(), other));
+    }
+
+    fn shared_version(column: &SpotColumn, at: u64) -> Option<u64> {
+        match column.read(&shared_key(at)).expect("read") {
+            Lookup::Found(lsn, _) => Some(lsn.as_u64()),
+            Lookup::Missing => None,
+            Lookup::Newest(_) | Lookup::Unsettled => panic!("shared key {at} did not settle"),
+        }
+    }
+
+    // keys past what one pair holds share a hash and spill, and each is found, moved and taken out
+    #[test]
+    fn keys_past_a_full_pair_spill_and_stay_found() {
+        let records = Arc::new(Records::default());
+        let column = column(&records);
+        let shard = shard_of(SHARED_HASH);
+        let buckets = column.shards[shard].read().buckets.len();
+        let count = 3 * MAX_CANDIDATES as u64;
+        let first = |at: u64| Loc::new(SegmentId(1), at as u32 * 64, 40);
+        let moved = |at: u64| Loc::new(SegmentId(2), at as u32 * 64, 50);
+        for at in 0..count {
+            records.write(first(at), shared_key(at).as_slice(), Lsn(at + 1));
+            assert!(
+                column.insert(shared_key(at).as_slice(), first(at)),
+                "key {at}"
+            );
+        }
+        {
+            let table = column.shards[shard].read();
+            assert_eq!(table.held as u64, count);
+            assert_eq!(table.spilled.len() as u64, count - MAX_CANDIDATES as u64);
+            assert_eq!(table.buckets.len(), buckets, "a shared pair grew the table");
+        }
+        for at in 0..count {
+            assert!(
+                !column.insert(shared_key(at).as_slice(), first(at)),
+                "key {at} went in twice"
+            );
+            assert_eq!(shared_version(&column, at), Some(at + 1), "key {at}");
+        }
+
+        // a newer row moves each key's slot to its new record
+        for at in 0..count {
+            records.write(moved(at), shared_key(at).as_slice(), Lsn(100 + at));
+            let booked = column
+                .load(&shared_key(at), moved(at), Lsn(100 + at), false)
+                .expect("load");
+            let expected = Booking {
+                gone: Some(40),
+                came: Some(50),
+            };
+            assert_eq!(booked, expected, "key {at}");
+        }
+        assert_eq!(column.held(), count);
+        for at in 0..count {
+            assert_eq!(shared_version(&column, at), Some(100 + at), "key {at}");
+        }
+
+        // a lane removal takes out the even keys and a live take the odd ones
+        let keys: Vec<RecordKey> = (0..count).step_by(2).map(shared_key).collect();
+        let rows: Vec<(&[u8], Loc)> = keys
+            .iter()
+            .zip((0..count).step_by(2))
+            .map(|(key, at)| (key.as_slice(), moved(at)))
+            .collect();
+        column.remove_lane(&rows, 0, 1);
+        for at in (1..count).step_by(2) {
+            assert!(
+                column.take_live(shared_key(at).as_slice(), moved(at)),
+                "key {at}"
+            );
+        }
+        for at in 0..count {
+            assert_eq!(shared_version(&column, at), None, "key {at}");
+        }
+        let table = column.shards[shard].read();
+        assert_eq!((table.held, table.spilled.len()), (0, 0));
+        assert_eq!(table.buckets.len(), buckets);
+    }
+
+    // a pair full of one hash spills the rest, and growth, marks and sweeps all reach the spill
+    #[test]
+    fn spilled_slots_survive_growth_and_sweeps() {
+        let mut table = Table::with_buckets(first_rung(0.0), 0.0);
+        let first = table.buckets.len();
+        let slots: Vec<Slot> = (0..3 * MAX_CANDIDATES as u32)
+            .map(|at| Slot::new(SHARED_HASH, Loc::new(SegmentId(1 + at % 2), at * 64, 40)))
+            .collect();
+        for slot in &slots {
+            table.insert(*slot);
+        }
+        assert_eq!(table.held, slots.len());
+        assert_eq!(table.spilled.len(), slots.len() - MAX_CANDIDATES);
+        assert_eq!(table.buckets.len(), first, "a shared pair grew the table");
+        assert_eq!(table.matches(SHARED_HASH).len(), slots.len());
+        for slot in slots.iter().step_by(3) {
+            assert!(table.mark_displaced(SHARED_HASH, slot));
+        }
+        let displaced = |table: &Table| {
+            table
+                .matches(SHARED_HASH)
+                .iter()
+                .filter(|place| place.slot.is_displaced())
+                .count()
+        };
+        assert_eq!(displaced(&table), 8);
+
+        // a growth takes one rung and carries every slot with its mark
+        let mut table = table.grown();
+        assert_eq!(table.buckets.len(), next_rung(first, 0.0));
+        assert_eq!(table.held, slots.len());
+        let found = table.matches(SHARED_HASH);
+        assert!(slots
+            .iter()
+            .all(|slot| found.iter().any(|place| place.slot.same_place(slot))));
+        assert_eq!(displaced(&table), 8);
+
+        // a sweep empties spilled slots too and counts the displaced ones among them
+        assert_eq!(table.retain(|slot| slot.segment != 2), (12, 4));
+        assert_eq!(table.held, 12);
+        assert_eq!(table.matches(SHARED_HASH).len(), 12);
+        for slot in slots.iter().filter(|slot| slot.segment == 1) {
+            assert!(table.take(SHARED_HASH, slot).is_some());
+        }
+        assert_eq!((table.held, table.spilled.len()), (0, 0));
+
+        // a thousand slots of one hash grow the table only as far as their count needs
+        let mut table = Table::with_buckets(first_rung(0.0), 0.0);
+        for at in 0..1_000u32 {
+            table.insert(Slot::new(SHARED_HASH, Loc::new(SegmentId(1), at * 64, 40)));
+        }
+        assert_eq!(table.held, 1_000);
+        assert!(
+            table.buckets.len() * WAYS < 2 * table.held,
+            "{} buckets for {} slots",
+            table.buckets.len(),
+            table.held
+        );
     }
 
     fn column(records: &Arc<Records>) -> SpotColumn {

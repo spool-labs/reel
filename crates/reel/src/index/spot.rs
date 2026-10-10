@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use reel_core::Value;
-use siphasher::sip::SipHasher13;
+use xxhash_rust::xxh3::xxh3_64_with_secret;
 
 use crate::error::{ReelError, Result};
 use crate::format::column::{ColumnId, KeyRef, RecordKey};
@@ -355,10 +355,17 @@ fn bound_of(class: u32) -> u32 {
     BOUNDS[(class as usize).min(CLASSES - 1)]
 }
 
-/// A SipHash keyed from the system's randomness, so nobody can pick keys that share a hash
-fn keyed_hasher() -> SipHasher13 {
+/// Bytes of the random secret every key's hash is mixed with
+const SECRET_LEN: usize = 192;
+
+/// A secret drawn from the system's randomness, so nobody can pick keys that share a hash
+fn random_secret() -> [u8; SECRET_LEN] {
     let state = RandomState::new();
-    SipHasher13::new_with_keys(state.hash_one(0u64), state.hash_one(1u64))
+    let mut secret = [0u8; SECRET_LEN];
+    for (at, chunk) in secret.chunks_exact_mut(8).enumerate() {
+        chunk.copy_from_slice(&state.hash_one(at as u64).to_le_bytes());
+    }
+    secret
 }
 
 fn mix(mut value: u64) -> u64 {
@@ -989,8 +996,8 @@ pub struct SpotColumn {
     /// How many lookups on a read-only open met a live slot whose segment went
     behind: AtomicU64,
 
-    /// The column hashes keys under its own random key, drawn when it is made
-    hasher: SipHasher13,
+    /// The column hashes keys under its own random secret, drawn when it is made
+    secret: [u8; SECRET_LEN],
 }
 
 impl Default for SpotColumn {
@@ -1012,17 +1019,17 @@ impl SpotColumn {
             set_aside: Mutex::new(Vec::new()),
             follows: AtomicBool::new(false),
             behind: AtomicU64::new(0),
-            hasher: keyed_hasher(),
+            secret: random_secret(),
         }
     }
 
-    /// A key's 64 bit hash under the column's key, which stays in memory and changes per open
+    /// A key's 64 bit hash under the column's secret, which stays in memory and changes per open
     fn hash_of(&self, key: &[u8]) -> u64 {
         #[cfg(test)]
         if let Some(shared) = tests::shared_hash(key) {
             return shared;
         }
-        self.hasher.hash(key)
+        xxh3_64_with_secret(key, &self.secret)
     }
 
     /// The rows of one lane of shards, gathered by shard

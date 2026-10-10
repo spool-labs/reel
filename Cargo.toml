@@ -26,6 +26,7 @@ serde_json = "1.0"
 crc-fast = "1.10"
 getrandom = "0.2"
 siphasher = "1.0"
+xxhash-rust = { version = "=0.8.18", features = ["xxh3"] }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
 libc = "0.2"
 rand = { version = "0.8", features = ["small_rng"] }

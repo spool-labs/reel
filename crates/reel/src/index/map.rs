@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ops::Bound;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::units::ByteCount;
@@ -49,6 +49,18 @@ thread_local! {
             answers: Vec::new(),
         })
     };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Counts the indexes this thread built and has yet to drop, for the rebuild leak test
+    static LIVE_INDEXES: Cell<i64> = const { Cell::new(0) };
+}
+
+/// How many indexes this thread holds, for the rebuild leak test
+#[cfg(test)]
+pub(crate) fn live_indexes() -> i64 {
+    LIVE_INDEXES.with(Cell::get)
 }
 
 /// This thread's lookup lists, given back however the batch that took them ends
@@ -238,6 +250,16 @@ pub struct ReelIndex {
 
     /// Held shared by each hand-over and whole by a prune
     handing: RwLock<()>,
+
+    /// Odd while a rebuilt index swaps in and even otherwise, so a read can tell it spanned one
+    installs: AtomicU64,
+}
+
+#[cfg(test)]
+impl Drop for ReelIndex {
+    fn drop(&mut self) {
+        LIVE_INDEXES.with(|live| live.set(live.get() - 1));
+    }
 }
 
 /// A segment's hand-over splits across this many threads, each owning a lane of shards
@@ -310,6 +332,8 @@ impl ReelIndex {
             indexes.push(ColumnIndex::new(spec)?);
             sealed.push(SealedRanges::new());
         }
+        #[cfg(test)]
+        LIVE_INDEXES.with(|live| live.set(live.get() + 1));
         Ok(ReelIndex {
             columns,
             indexes,
@@ -327,7 +351,81 @@ impl ReelIndex {
             shadowed: Mutex::new(Vec::new()),
             publish: PublishBarrier::new(),
             handing: RwLock::new(()),
+            installs: AtomicU64::new(0),
         })
+    }
+
+    /// An empty index for a rebuild to fill and swap into this one
+    pub(crate) fn new_beside(&self) -> Result<ReelIndex> {
+        let mut fresh = ReelIndex::new(self.columns)?;
+        // The spot tables move whole, so both hash a key to the same shard and slot
+        for (built, live) in fresh.spot.iter_mut().zip(&self.spot) {
+            built.hash_like(live);
+        }
+        // Stamps climb past the live ones, so an entry read before the swap is never certain after
+        fresh.segments.issue_past(&self.segments);
+        Ok(fresh)
+    }
+
+    /// Wait for any running install to finish, then return the install count
+    pub(crate) fn settled_installs(&self) -> u64 {
+        let mut spins = 0u32;
+        loop {
+            // Acquire pairs with the closing Release, so a read sees every table the install put in
+            let seen = self.installs.load(Ordering::Acquire);
+            if seen & 1 == 0 {
+                return seen;
+            }
+            spins += 1;
+            match spins < 64 {
+                true => std::hint::spin_loop(),
+                false => std::thread::yield_now(),
+            }
+        }
+    }
+
+    /// Whether no install began since `seen`, so a read that started there saw one whole index
+    pub(crate) fn installs_held(&self, seen: u64) -> bool {
+        // Orders the read's own loads before the recheck, so a table it saw swapped shows here
+        fence(Ordering::Acquire);
+        self.installs.load(Ordering::Relaxed) == seen
+    }
+
+    /// Swap a rebuilt index's tables into this one, each under the lock that guards it
+    pub(crate) fn install(&self, fresh: ReelIndex) {
+        {
+            // Spanning reads and catch-up passes wait, and so does a prune or a hand-over
+            let _publishing = self.publish.publishing();
+            let _handing = write(&self.handing);
+            self.installs.fetch_add(1, Ordering::Relaxed);
+            // Orders the odd count before every table write, so a read that sees one sees it odd
+            fence(Ordering::Release);
+            for (live, built) in self.indexes.iter().zip(&fresh.indexes) {
+                live.install(built);
+            }
+            for (live, built) in self.spot.iter().zip(&fresh.spot) {
+                live.install(built);
+            }
+            for (live, built) in self.sealed.iter().zip(&fresh.sealed) {
+                live.install(built);
+            }
+            // The sealed sets moved, so every walk's cached runs are stale
+            self.sweep_walk_runs();
+            self.key_runs.install_set(&fresh.key_runs);
+            std::mem::swap(&mut *lock(&self.run_picks), &mut *lock(&fresh.run_picks));
+            std::mem::swap(&mut *lock(&self.shadowed), &mut *lock(&fresh.shadowed));
+            self.segments.install(&fresh.segments);
+            let ready = fresh.spot_ready.load(Ordering::Acquire);
+            self.spot_ready.store(ready, Ordering::Release);
+            let retired = fresh.retired.load(Ordering::Acquire);
+            self.retired.fetch_add(retired, Ordering::AcqRel);
+            let handed = fresh.handed.load(Ordering::Acquire);
+            self.handed.fetch_max(handed, Ordering::AcqRel);
+            // Release pairs with a read's Acquire load, which then sees every table above
+            self.installs.fetch_add(1, Ordering::Release);
+        }
+        // The old tables sit in `fresh` now, out of every reader's reach, and go once it drops
+        drop(fresh);
     }
 
     /// Tell the index where to read footers, once at open after the volume exists

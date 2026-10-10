@@ -681,6 +681,21 @@ impl SegmentTable {
         write(&self.window).clear();
     }
 
+    /// Issue incarnations past every one the live table issued, for a rebuild that swaps into it
+    pub(crate) fn issue_past(&self, live: &SegmentTable) {
+        let issued = live.next_incarnation.load(Ordering::Relaxed);
+        self.next_incarnation.fetch_max(issued, Ordering::Relaxed);
+    }
+
+    /// Swap in a rebuilt table's rows, keeping incarnations and drop counts climbing
+    pub(crate) fn install(&self, fresh: &SegmentTable) {
+        std::mem::swap(&mut *write(&self.window), &mut *write(&fresh.window));
+        let issued = fresh.next_incarnation.load(Ordering::Relaxed);
+        self.next_incarnation.fetch_max(issued, Ordering::Relaxed);
+        let dropped = fresh.dropped.load(Ordering::Relaxed);
+        self.dropped.fetch_add(dropped, Ordering::Relaxed);
+    }
+
     /// Run `act` on a segment's row, opening it on first touch, or drop a booking to a retired one
     fn opened<T>(&self, segment: SegmentId, act: impl FnOnce(&SegmentRow) -> T) -> Option<T> {
         {

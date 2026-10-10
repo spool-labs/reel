@@ -2090,6 +2090,30 @@ impl SpotColumn {
         self.beside.store(0, Ordering::Relaxed);
         self.slack.store(0, Ordering::Relaxed);
     }
+
+    /// Hash keys under another column's secret, for a rebuild whose tables swap into it
+    pub(crate) fn hash_like(&mut self, live: &SpotColumn) {
+        self.secret = live.secret;
+    }
+
+    /// Swap in a rebuilt column's tables shard by shard, and its queues and gauges
+    pub(crate) fn install(&self, fresh: &SpotColumn) {
+        for (live, built) in self.shards.iter().zip(&fresh.shards) {
+            let mut table = live.write();
+            let held = table.held as u64;
+            std::mem::swap(&mut *table.table, &mut *built.write().table);
+            // The old slots count as taken, so a lookup that missed across the swap looks again
+            live.taken.fetch_add(held.max(1), Ordering::Release);
+            let displaced = built.displaced.load(Ordering::Relaxed);
+            live.displaced.store(displaced, Ordering::Relaxed);
+        }
+        std::mem::swap(&mut *lock(&self.stale), &mut *lock(&fresh.stale));
+        std::mem::swap(&mut *lock(&self.set_aside), &mut *lock(&fresh.set_aside));
+        self.beside
+            .store(fresh.beside.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.slack
+            .store(fresh.slack.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]

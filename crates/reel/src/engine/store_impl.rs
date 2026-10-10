@@ -575,8 +575,7 @@ impl ReelStore {
             (None, Some(prefix)) => Bound::Included(prefix),
             (None, None) => Bound::Unbounded,
         };
-        self.index
-            .page(column, start, limit, &mut page)
+        self.page(column, start, limit, &mut page)
             .map_err(StoreError::from)?;
         let mut keys = Vec::with_capacity(page.len());
         for at in 0..page.len() {

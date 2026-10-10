@@ -447,6 +447,20 @@ impl ColumnIndex {
         on_index!(self, index => index.clear())
     }
 
+    /// Swap in the tables of a column rebuilt from the same declaration
+    pub(crate) fn install(&self, fresh: &ColumnIndex) {
+        macro_rules! paired {
+            ($($width:ident),*) => {
+                match (self, fresh) {
+                    $((ColumnIndex::$width(live), ColumnIndex::$width(built)) => live.install(built),)*
+                    // One declaration builds both, so their widths always agree
+                    _ => debug_assert!(false, "a rebuilt column changed its key width"),
+                }
+            };
+        }
+        paired!(W0, W2, W8, W12, W16, W20, W24, W32, W34, W36, W40, W44, W48, W72, W96, W108, Var)
+    }
+
     /// Live key count and payload byte total for the column
     pub fn totals(&self) -> Totals {
         on_index!(self, index => index.totals())
@@ -668,6 +682,20 @@ impl ShardFilters {
     fn clear(&self, shard: usize) {
         for word in self.of(shard) {
             word.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Add another column's bits for a shard, so this filter passes every key either holds
+    fn widen(&self, shard: usize, other: &ShardFilters) {
+        for (word, theirs) in self.of(shard).iter().zip(other.of(shard)) {
+            word.fetch_or(theirs.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+
+    /// Take another column's bits for a shard, under the shard's write lock
+    fn copy(&self, shard: usize, other: &ShardFilters) {
+        for (word, theirs) in self.of(shard).iter().zip(other.of(shard)) {
+            word.store(theirs.load(Ordering::Relaxed), Ordering::Relaxed);
         }
     }
 
@@ -1812,6 +1840,26 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         // A rebuild reads no sealed row, so it puts its ranges back after this
         write(&self.covers).clear();
         self.has_covers.store(false, Ordering::Relaxed);
+    }
+
+    /// Swap in a rebuilt column's shards, filters, walk set and covers, each under its own lock
+    pub(crate) fn install(&self, fresh: &WidthIndex<K, S>) {
+        for at in 0..self.shards.len() {
+            let mut state = write(&self.shards[at]);
+            // The filter passes both key sets until the swap, so a lock-free miss stays a miss
+            self.filters.widen(at, &fresh.filters);
+            std::mem::swap(&mut *state, &mut *write(&fresh.shards[at]));
+            self.filters.copy(at, &fresh.filters);
+            self.note_held(at, state.map.vacant());
+        }
+        std::mem::swap(&mut *write(&self.occupied), &mut *write(&fresh.occupied));
+        let mut covers = write(&self.covers);
+        self.has_covers.store(true, Ordering::Relaxed);
+        std::mem::swap(&mut *covers, &mut *write(&fresh.covers));
+        self.has_covers.store(!covers.is_empty(), Ordering::Relaxed);
+        // A prune before the rebuild still guards what it lifted, as an in-place rebuild keeps it
+        self.lifted
+            .fetch_max(fresh.lifted.load(Ordering::Acquire), Ordering::AcqRel);
     }
 
     /// Live key count and payload byte total for the column, summed without a snapshot

@@ -1,5 +1,6 @@
 //! Point reads, ranges and batches, and the resolve loop they share
 
+use std::future::Future;
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -12,8 +13,9 @@ use crate::format::loc::Loc;
 use crate::format::lsn::Lsn;
 use crate::index::map::{Located, SpotPick, SpotRoute};
 use crate::index::page::KeyPage;
+use crate::index::paged::FooterSource;
 use crate::index::playback::PlaybackCursor;
-use crate::index::spot::{Candidate, Lookup, Offered, Since, SpotRead, LOOKUP_TRIES};
+use crate::index::spot::{Candidate, Lookup, Offered, RecordSource, Since, SpotRead, LOOKUP_TRIES};
 use crate::reel::cue::CuePoint;
 use crate::reel::{SpotAsk, SpotRange};
 
@@ -153,19 +155,53 @@ impl Drop for HeldPlaced {
 }
 
 impl ReelStore {
+    /// Run a read against one whole index, again if a rebuilt one swapped in under it
+    fn steady<Answer>(&self, mut read: impl FnMut() -> Result<Answer>) -> Result<Answer> {
+        // Only a read-only open ever installs, so a writable one reads straight through
+        if !self.is_read_only {
+            return read();
+        }
+        loop {
+            let seen = self.index.settled_installs();
+            let answer = read();
+            if self.index.installs_held(seen) {
+                return answer;
+            }
+        }
+    }
+
+    /// The same check around a read as a future
+    async fn steady_wait<Answer, Read: Future<Output = Result<Answer>>>(
+        &self,
+        read: impl Fn() -> Read,
+    ) -> Result<Answer> {
+        if !self.is_read_only {
+            return read().await;
+        }
+        loop {
+            let seen = self.index.settled_installs();
+            let answer = read().await;
+            if self.index.installs_held(seen) {
+                return answer;
+            }
+        }
+    }
+
     /// Read one payload, verified against its header key and checksum
     pub fn get(&self, key: &RecordKey) -> Result<Option<Value>> {
         self.settle_sealed()?;
-        let behind = self.index.spot_behind();
-        match self.resolve_read(key)? {
+        let (behind, first) =
+            self.steady(|| Ok((self.index.spot_behind(), self.resolve_read(key)?)))?;
+        match first {
             _ if self.fell_behind(behind) => {}
             Resolved::Payload(payload) => return Ok(Some(payload)),
             Resolved::Missing => return Ok(None),
             Resolved::Unresolved => {}
         }
 
+        // The resync may rebuild, so it runs outside the check that would see its own install
         self.resync(behind)?;
-        match self.resolve_read(key)? {
+        match self.steady(|| self.resolve_read(key))? {
             Resolved::Payload(payload) => Ok(Some(payload)),
             Resolved::Missing => Ok(None),
             Resolved::Unresolved => Err(unresolved(key)),
@@ -175,8 +211,13 @@ impl ReelStore {
     /// Read one payload as a future, for a caller with no thread to park
     pub async fn get_wait(&self, key: &RecordKey) -> Result<Option<Value>> {
         self.settle_sealed()?;
-        let behind = self.index.spot_behind();
-        match self.resolve_read_wait(key).await? {
+        let (behind, first) = self
+            .steady_wait(|| async {
+                let behind = self.index.spot_behind();
+                Ok((behind, self.resolve_read_wait(key).await?))
+            })
+            .await?;
+        match first {
             _ if self.fell_behind(behind) => {}
             Resolved::Payload(payload) => return Ok(Some(payload)),
             Resolved::Missing => return Ok(None),
@@ -184,7 +225,7 @@ impl ReelStore {
         }
 
         self.resync(behind)?;
-        match self.resolve_read_wait(key).await? {
+        match self.steady_wait(|| self.resolve_read_wait(key)).await? {
             Resolved::Payload(payload) => Ok(Some(payload)),
             Resolved::Missing => Ok(None),
             Resolved::Unresolved => Err(unresolved(key)),
@@ -194,19 +235,24 @@ impl ReelStore {
     /// Read part of one payload, clamped to it, at the caller's logical offsets
     pub fn get_range(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Option<Value>> {
         self.settle_sealed()?;
-        let behind = self.index.spot_behind();
-        match self.resolve_range(key, offset, len)? {
+        let (behind, first) = self.steady(|| {
+            let behind = self.index.spot_behind();
+            Ok((behind, self.resolve_range(key, offset, len)?))
+        })?;
+        match first {
             _ if self.fell_behind(behind) => {}
-            Resolved::Payload(payload) => return Ok(Some(payload)),
-            Resolved::Missing => return Ok(None),
-            Resolved::Unresolved => {}
+            Some(Resolved::Payload(payload)) => return Ok(Some(payload)),
+            Some(Resolved::Missing) => return Ok(None),
+            None => return self.whole_range(key, offset, len),
+            Some(Resolved::Unresolved) => {}
         }
 
         self.resync(behind)?;
-        match self.resolve_range(key, offset, len)? {
-            Resolved::Payload(payload) => Ok(Some(payload)),
-            Resolved::Missing => Ok(None),
-            Resolved::Unresolved => Err(unresolved(key)),
+        match self.steady(|| self.resolve_range(key, offset, len))? {
+            Some(Resolved::Payload(payload)) => Ok(Some(payload)),
+            Some(Resolved::Missing) => Ok(None),
+            None => self.whole_range(key, offset, len),
+            Some(Resolved::Unresolved) => Err(unresolved(key)),
         }
     }
 
@@ -218,30 +264,50 @@ impl ReelStore {
         len: usize,
     ) -> Result<Option<Value>> {
         self.settle_sealed()?;
-        let behind = self.index.spot_behind();
-        match self.resolve_range_wait(key, offset, len).await? {
+        let (behind, first) = self
+            .steady_wait(|| async {
+                let behind = self.index.spot_behind();
+                Ok((behind, self.resolve_range_wait(key, offset, len).await?))
+            })
+            .await?;
+        match first {
             _ if self.fell_behind(behind) => {}
-            Resolved::Payload(payload) => return Ok(Some(payload)),
-            Resolved::Missing => return Ok(None),
-            Resolved::Unresolved => {}
+            Some(Resolved::Payload(payload)) => return Ok(Some(payload)),
+            Some(Resolved::Missing) => return Ok(None),
+            None => return self.whole_range_wait(key, offset, len).await,
+            Some(Resolved::Unresolved) => {}
         }
 
         self.resync(behind)?;
-        match self.resolve_range_wait(key, offset, len).await? {
-            Resolved::Payload(payload) => Ok(Some(payload)),
-            Resolved::Missing => Ok(None),
-            Resolved::Unresolved => Err(unresolved(key)),
+        let again = self
+            .steady_wait(|| self.resolve_range_wait(key, offset, len))
+            .await?;
+        match again {
+            Some(Resolved::Payload(payload)) => Ok(Some(payload)),
+            Some(Resolved::Missing) => Ok(None),
+            None => self.whole_range_wait(key, offset, len).await,
+            Some(Resolved::Unresolved) => Err(unresolved(key)),
         }
     }
 
     /// Read several keys with one submission, answered in the order asked
     pub fn get_many(&self, keys: &[RecordKey]) -> Result<Vec<Option<Value>>> {
         self.settle_sealed()?;
+        let (mut values, unsettled) = self.steady(|| self.get_many_once(keys))?;
+        // A key the batch could not settle reads alone, since that read may rebuild
+        for at in unsettled {
+            values[at] = self.get(&keys[at])?;
+        }
+        Ok(values)
+    }
+
+    /// One try at a batch read, with the keys it left for a lone read
+    fn get_many_once(&self, keys: &[RecordKey]) -> Result<(Vec<Option<Value>>, Vec<usize>)> {
         let located = self.locate_many(keys)?;
         let borrowed: Vec<KeyRef<'_>> = keys.iter().map(RecordKey::as_ref).collect();
-        let mut values = self.read_found(&borrowed, &located.found)?;
+        let (mut values, mut unsettled) = self.read_found_once(&borrowed, &located.found)?;
         if located.picks.is_empty() {
-            return Ok(values);
+            return Ok((values, unsettled));
         }
         let mut picks = located.picks;
         let asks = self.first_asks(keys, &mut picks);
@@ -254,13 +320,13 @@ impl ReelStore {
                 Offered::Next => column.read_on(key, spot.pick)?,
                 Offered::Again | Offered::Unsettled => Lookup::Unsettled,
             };
-            values[spot.at] = match self.index.spot_finish(spot.column, key, spot.since, lookup) {
-                Lookup::Found(_, value) | Lookup::Newest(value) => Some(value),
-                Lookup::Missing => None,
-                Lookup::Unsettled => self.get(key)?,
-            };
+            match self.index.spot_finish(spot.column, key, spot.since, lookup) {
+                Lookup::Found(_, value) | Lookup::Newest(value) => values[spot.at] = Some(value),
+                Lookup::Missing => values[spot.at] = None,
+                Lookup::Unsettled => unsettled.push(spot.at),
+            }
         }
-        Ok(values)
+        Ok((values, unsettled))
     }
 
     /// Each pick's first candidate, as one batch of asks, and which picks have one
@@ -305,11 +371,24 @@ impl ReelStore {
     /// Read several keys as one future, answered in the order asked
     pub async fn get_many_wait(&self, keys: &[RecordKey]) -> Result<Vec<Option<Value>>> {
         self.settle_sealed()?;
+        let (mut values, unsettled) = self.steady_wait(|| self.get_many_wait_once(keys)).await?;
+        for at in unsettled {
+            values[at] = self.get_wait(&keys[at]).await?;
+        }
+        Ok(values)
+    }
+
+    /// One try at an awaited batch read, with the keys it left for a lone read
+    async fn get_many_wait_once(
+        &self,
+        keys: &[RecordKey],
+    ) -> Result<(Vec<Option<Value>>, Vec<usize>)> {
         let located = self.locate_many(keys)?;
         let borrowed: Vec<KeyRef<'_>> = keys.iter().map(RecordKey::as_ref).collect();
-        let mut values = self.read_found_wait(&borrowed, &located.found).await?;
+        let (mut values, mut unsettled) =
+            self.read_found_wait_once(&borrowed, &located.found).await?;
         if located.picks.is_empty() {
-            return Ok(values);
+            return Ok((values, unsettled));
         }
         let mut picks = located.picks;
         let asks = self.first_asks(keys, &mut picks);
@@ -339,13 +418,13 @@ impl ReelStore {
                 Offered::Next => column.settle(key, spot.pick),
                 Offered::Again | Offered::Unsettled => Lookup::Unsettled,
             };
-            values[spot.at] = match self.index.spot_finish(spot.column, key, spot.since, lookup) {
-                Lookup::Found(_, value) | Lookup::Newest(value) => Some(value),
-                Lookup::Missing => None,
-                Lookup::Unsettled => self.get_wait(key).await?,
-            };
+            match self.index.spot_finish(spot.column, key, spot.since, lookup) {
+                Lookup::Found(_, value) | Lookup::Newest(value) => values[spot.at] = Some(value),
+                Lookup::Missing => values[spot.at] = None,
+                Lookup::Unsettled => unsettled.push(spot.at),
+            }
         }
-        Ok(values)
+        Ok((values, unsettled))
     }
 
     /// Ask the index where every key sits, all against one state of the index
@@ -359,17 +438,25 @@ impl ReelStore {
         keys: &[KeyRef<'_>],
         found: &[Option<Entry>],
     ) -> Result<Vec<Option<Value>>> {
+        let (mut values, missed) = self.steady(|| self.read_found_once(keys, found))?;
+        // The record moved or went bad since the caller resolved it, as compaction does
+        for at in missed {
+            values[at] = self.get(&keys[at].to_owned_key()?)?;
+        }
+        Ok(values)
+    }
+
+    /// One try at a resolved batch, with the keys it missed for a lone read
+    fn read_found_once(
+        &self,
+        keys: &[KeyRef<'_>],
+        found: &[Option<Entry>],
+    ) -> Result<(Vec<Option<Value>>, Vec<usize>)> {
         let mut held = HeldPlaced::take();
         let placed = &mut held.0;
         self.read_placed(keys, found, placed)?;
-        // The record moved or went bad since the caller resolved it, as compaction does
         let missed: Vec<usize> = placed.missed().collect();
-        for at in missed {
-            if let Some(value) = self.get(&keys[at].to_owned_key()?)? {
-                placed.hold(at, value);
-            }
-        }
-        Ok((0..keys.len()).map(|at| placed.take(at)).collect())
+        Ok(((0..keys.len()).map(|at| placed.take(at)).collect(), missed))
     }
 
     /// Read a resolved batch as a future, answered in the order asked
@@ -378,6 +465,21 @@ impl ReelStore {
         keys: &[KeyRef<'_>],
         found: &[Option<Entry>],
     ) -> Result<Vec<Option<Value>>> {
+        let (mut values, missed) = self
+            .steady_wait(|| self.read_found_wait_once(keys, found))
+            .await?;
+        for at in missed {
+            values[at] = self.get_wait(&keys[at].to_owned_key()?).await?;
+        }
+        Ok(values)
+    }
+
+    /// One try at an awaited resolved batch, with the keys it missed for a lone read
+    async fn read_found_wait_once(
+        &self,
+        keys: &[KeyRef<'_>],
+        found: &[Option<Entry>],
+    ) -> Result<(Vec<Option<Value>>, Vec<usize>)> {
         let mut held = HeldPlaced::take();
         let placed = &mut held.0;
         self.plan_placed(keys.len(), found, placed);
@@ -394,12 +496,7 @@ impl ReelStore {
             placed.decode_coded();
         }
         let missed: Vec<usize> = placed.missed().collect();
-        for at in missed {
-            if let Some(value) = self.get_wait(&keys[at].to_owned_key()?).await? {
-                placed.hold(at, value);
-            }
-        }
-        Ok((0..keys.len()).map(|at| placed.take(at)).collect())
+        Ok(((0..keys.len()).map(|at| placed.take(at)).collect(), missed))
     }
 
     /// Read a resolved batch into place, leaving every record it could not find a miss
@@ -448,10 +545,9 @@ impl ReelStore {
                 "a writable reel already holds the current index".to_string(),
             ));
         }
-        let caught_up = {
-            let mut cursor = lock(&self.cursor);
-            catch_up(&self.driver, &self.root, &self.index, &mut cursor)?
-        };
+        // The cursor's lock keeps a rebuild out until this pass and its sweep are done
+        let mut cursor = lock(&self.cursor);
+        let caught_up = catch_up(&self.driver, &self.root, &self.index, &mut cursor)?;
 
         // Only retired segments leave stale descriptors, so the rest of the cache stays
         for segment in &caught_up.retired {
@@ -467,7 +563,7 @@ impl ReelStore {
 
         // A reader with too many covers or lost segments rebuilds, which needs no covers
         if caught_up.is_saturated || caught_up.lost > 0 {
-            self.rebuild()?;
+            self.rebuild_held(&mut cursor)?;
         }
         Ok(caught_up)
     }
@@ -479,15 +575,33 @@ impl ReelStore {
                 "a writable reel already holds the current index".to_string(),
             ));
         }
+        let seen = self.index.settled_installs();
+        // The cursor's lock keeps catch-ups and other rebuilds out until the new index is in
+        let mut cursor = lock(&self.cursor);
+        // A rebuild another reader finished while this one waited serves both
+        if self.index.settled_installs() != seen {
+            return Ok(());
+        }
+        self.rebuild_held(&mut cursor)
+    }
+
+    /// Build a new index beside the live one and swap it in, leaving both alone on a failure
+    fn rebuild_held(&self, cursor: &mut LogCursor) -> Result<()> {
         self.fd_cache.clear();
         let mut roots = vec![self.root.clone()];
         roots.extend(self.config.volumes.iter().map(|volume| volume.path.clone()));
         let dead: Vec<bool> = std::iter::once(false)
             .chain(self.config.volumes.iter().map(|volume| volume.dead))
             .collect();
-        let rebuilt = rebuild_reel(&self.driver, &roots, &dead, &self.index)?;
-        self.index.finish_open()?;
-        let mut cursor = lock(&self.cursor);
+        // Set up the way an open sets up its index, so reads keep the old one until the swap
+        let fresh = self.index.new_beside()?;
+        let rebuilt = rebuild_reel(&self.driver, &roots, &dead, &fresh)?;
+        let shared = self.reel.shared();
+        fresh.set_footers(Arc::clone(shared) as Arc<dyn FooterSource>);
+        fresh.set_records(Arc::clone(shared) as Arc<dyn RecordSource>);
+        fresh.follow();
+        fresh.finish_open()?;
+        self.index.install(fresh);
         *cursor = LogCursor::new();
         cursor.start_from(&rebuilt.consumed);
         Ok(())
@@ -521,13 +635,13 @@ impl ReelStore {
 
     /// Answer from the index, asking again after a catch-up if a writer retired a segment
     fn followed<Answer>(&self, answer: impl Fn() -> Result<Answer>) -> Result<Answer> {
-        let behind = self.index.spot_behind();
-        let found = answer()?;
+        let (behind, found) = self.steady(|| Ok((self.index.spot_behind(), answer()?)))?;
         if !self.fell_behind(behind) {
             return Ok(found);
         }
+        // The catch-up may rebuild, so it runs outside the check that would see its own install
         self.refresh()?;
-        answer()
+        self.steady(&answer)
     }
 
     /// Cue up a view of the volume as it stands now, sealing the tails first
@@ -550,6 +664,11 @@ impl ReelStore {
 
     /// Read one key as of a sequence number nothing is holding open
     pub fn read_as_of(&self, key: &RecordKey, at: Lsn) -> Result<Option<Value>> {
+        self.steady(|| self.read_as_of_once(key, at))
+    }
+
+    /// One try at a versioned read
+    fn read_as_of_once(&self, key: &RecordKey, at: Lsn) -> Result<Option<Value>> {
         self.check_column(key)?;
         // The segments a cue sealed are searchable only once their spans are noted
         self.settle_sealed()?;
@@ -589,7 +708,7 @@ impl ReelStore {
         limit: usize,
         out: &mut KeyPage,
     ) -> Result<()> {
-        self.index.page(column, start, limit, out)
+        self.steady(|| self.index.page(column, start, limit, out))
     }
 
     /// Fill a buffer with one bounded page of a column's keys, descending
@@ -600,7 +719,7 @@ impl ReelStore {
         limit: usize,
         out: &mut KeyPage,
     ) -> Result<()> {
-        self.index.page_back(column, end, limit, out)
+        self.steady(|| self.index.page_back(column, end, limit, out))
     }
 
     /// Fill a buffer with the playback's next page and move the playback past it
@@ -610,7 +729,19 @@ impl ReelStore {
         limit: usize,
         out: &mut KeyPage,
     ) -> Result<()> {
-        self.index.page_from(playback, limit, out)
+        if !self.is_read_only {
+            return self.index.page_from(playback, limit, out);
+        }
+        // A page thrown away has moved the playback, so the next try starts from the mark
+        let mark = playback.mark();
+        let mut again = false;
+        self.steady(|| {
+            if again {
+                playback.rewind(&mark);
+            }
+            again = true;
+            self.index.page_from(playback, limit, out)
+        })
     }
 
     /// Whether a column's records can hold what a codec produced
@@ -745,8 +876,8 @@ impl ReelStore {
         }
     }
 
-    /// Resolve one key and read the range its entry places, retrying as a read does
-    fn resolve_range(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Resolved> {
+    /// Resolve one key and read the range its entry places, or nothing when it has to read whole
+    fn resolve_range(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Option<Resolved>> {
         if let Some((at, since, candidate)) = self.spot_range_candidate(key) {
             let read = self.reel.shared().spot_range(
                 key,
@@ -758,14 +889,14 @@ impl ReelStore {
                 len,
             )?;
             if let Some(resolved) = self.spot_range_answer(at, key, since, read) {
-                return Ok(resolved);
+                return Ok(Some(resolved));
             }
         }
         let mut resolving = Resolving::new(self, key);
         for _ in 0..RESOLVE_RETRIES {
             let (entry, wanted) = match resolving.step_range(self, key, offset, len)? {
-                RangeStep::Done(resolved) => return Ok(resolved),
-                RangeStep::Whole => return self.whole_range(key, offset, len),
+                RangeStep::Done(resolved) => return Ok(Some(resolved)),
+                RangeStep::Whole => return Ok(None),
                 RangeStep::Read(entry, wanted) => (entry, wanted),
             };
             if resolving.window_bare(self, &entry) {
@@ -773,7 +904,7 @@ impl ReelStore {
                     self.reel
                         .read_window(entry.loc, key.width(), offset, wanted)?
                 {
-                    return Ok(Resolved::Payload(found));
+                    return Ok(Some(Resolved::Payload(found)));
                 }
             }
             let read = self.reel.read_range(
@@ -785,22 +916,22 @@ impl ReelStore {
                 self.window_certain(&entry),
             )?;
             if matches!(read, RecordRead::Coded) {
-                return self.whole_range(key, offset, len);
+                return Ok(None);
             }
             if let Some(resolved) = resolving.fold(self, key, entry, read)? {
-                return Ok(resolved);
+                return Ok(Some(resolved));
             }
         }
-        resolving.give_up(self, key)
+        resolving.give_up(self, key).map(Some)
     }
 
-    /// Resolve one key and await the range its entry places, always through the driver
+    /// Resolve one key and await the range its entry places, or nothing when it has to read whole
     async fn resolve_range_wait(
         &self,
         key: &RecordKey,
         offset: u64,
         len: usize,
-    ) -> Result<Resolved> {
+    ) -> Result<Option<Resolved>> {
         if let Some((at, since, candidate)) = self.spot_range_candidate(key) {
             let read = self
                 .reel
@@ -816,14 +947,14 @@ impl ReelStore {
                 )
                 .await?;
             if let Some(resolved) = self.spot_range_answer(at, key, since, read) {
-                return Ok(resolved);
+                return Ok(Some(resolved));
             }
         }
         let mut resolving = Resolving::new(self, key);
         for _ in 0..RESOLVE_RETRIES {
             let (entry, wanted) = match resolving.step_range(self, key, offset, len)? {
-                RangeStep::Done(resolved) => return Ok(resolved),
-                RangeStep::Whole => return self.whole_range_wait(key, offset, len).await,
+                RangeStep::Done(resolved) => return Ok(Some(resolved)),
+                RangeStep::Whole => return Ok(None),
                 RangeStep::Read(entry, wanted) => (entry, wanted),
             };
             if resolving.window_bare(self, &entry) {
@@ -832,7 +963,7 @@ impl ReelStore {
                     .read_window_wait(entry.loc, key.width(), offset, wanted)
                     .await?;
                 if let Some(found) = found {
-                    return Ok(Resolved::Payload(found));
+                    return Ok(Some(Resolved::Payload(found)));
                 }
             }
             let read = self
@@ -847,29 +978,31 @@ impl ReelStore {
                 )
                 .await?;
             if matches!(read, RecordRead::Coded) {
-                return self.whole_range_wait(key, offset, len).await;
+                return Ok(None);
             }
             if let Some(resolved) = resolving.fold(self, key, entry, read)? {
-                return Ok(resolved);
+                return Ok(Some(resolved));
             }
         }
-        resolving.give_up(self, key)
+        resolving.give_up(self, key).map(Some)
     }
 
     /// Read the record whole and cut the window out of what it decodes to
-    fn whole_range(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Resolved> {
-        Ok(match self.get(key)? {
-            Some(payload) => Resolved::Payload(range_of(payload, offset, len)),
-            None => Resolved::Missing,
-        })
+    fn whole_range(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Option<Value>> {
+        Ok(self.get(key)?.map(|payload| range_of(payload, offset, len)))
     }
 
     /// The same as a future, for a caller with no thread to park
-    async fn whole_range_wait(&self, key: &RecordKey, offset: u64, len: usize) -> Result<Resolved> {
-        Ok(match self.get_wait(key).await? {
-            Some(payload) => Resolved::Payload(range_of(payload, offset, len)),
-            None => Resolved::Missing,
-        })
+    async fn whole_range_wait(
+        &self,
+        key: &RecordKey,
+        offset: u64,
+        len: usize,
+    ) -> Result<Option<Value>> {
+        Ok(self
+            .get_wait(key)
+            .await?
+            .map(|payload| range_of(payload, offset, len)))
     }
 
     /// Whether the index can vouch for this entry without the on-disk echo

@@ -4836,6 +4836,198 @@ fn refresh_reads_only_what_is_new() {
     assert_eq!(reader.totals().count, 9);
 }
 
+/// A writer with sealed segments and a tail, and a reader opened over it
+fn follower_over_segments() -> (ReelStore, ReelStore, SimIo) {
+    let mut settings = config(1, EVERY_WRITE);
+    settings.segment_bytes = ByteCount::from_bytes(8_192);
+    let (writer, sim) = sim_store(settings.clone());
+    for byte in 1..=6u8 {
+        writer.put(&record(7, byte), &[byte; 1_500]).expect("put");
+    }
+    writer.flush().expect("flush");
+    let reader = ReelStore::open_read_only_with_io(
+        PathBuf::from(ROOT),
+        settings,
+        COLUMNS,
+        Arc::new(sim.clone()),
+    )
+    .expect("read only open");
+    (writer, reader, sim)
+}
+
+// a rebuild that fails partway leaves the reader on the index it had
+#[test]
+fn a_failed_rebuild_keeps_the_old_index() {
+    let (writer, reader, sim) = follower_over_segments();
+
+    sim.arm_next_ops(1_000, FaultKind::ReadError);
+    assert!(reader.rebuild().is_err(), "the rebuild met a failed read");
+    sim.disarm();
+
+    // The cursor stayed where it was, so a catch-up reads only the later put
+    writer.put(&record(7, 9), &[9; 1_500]).expect("later put");
+    // Both opens share one simulated device, so the writer goes before the reader polls alone
+    drop(writer);
+    assert_eq!(reader.refresh().expect("refresh").applied, 1);
+    assert!(reader.contains(&record(7, 9)).expect("contains"));
+
+    for byte in 1..=6u8 {
+        assert!(
+            reader.contains(&record(7, byte)).expect("contains"),
+            "key {byte} left the index"
+        );
+        assert_eq!(
+            reader.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![byte; 1_500])),
+            "key {byte} after the failed rebuild"
+        );
+    }
+}
+
+// fifty rebuilds free every index they replace, so memory holds flat
+#[test]
+fn rebuilds_free_the_index_they_replace() {
+    let mut settings = config(1, EVERY_WRITE);
+    settings.segment_bytes = ByteCount::from_bytes(8_192);
+    let (writer, sim) = sim_store(settings.clone());
+    for byte in 0..=255u8 {
+        writer
+            .put(&record(u16::from(byte), byte), &[byte; 100])
+            .expect("put");
+    }
+    writer.flush().expect("flush");
+    drop(writer);
+    let reader =
+        ReelStore::open_read_only_with_io(PathBuf::from(ROOT), settings, COLUMNS, Arc::new(sim))
+            .expect("read only open");
+    reader.rebuild().expect("first rebuild");
+    let indexes = crate::index::map::live_indexes();
+    let resident = reader.resident_bytes();
+
+    for _ in 0..50 {
+        reader.rebuild().expect("rebuild");
+    }
+
+    assert_eq!(
+        crate::index::map::live_indexes(),
+        indexes,
+        "a rebuild kept an index alive"
+    );
+    assert_eq!(
+        reader.resident_bytes(),
+        resident,
+        "the index grew across rebuilds"
+    );
+    for byte in 0..=255u8 {
+        assert_eq!(
+            reader.get(&record(u16::from(byte), byte)).expect("get"),
+            Some(Value::new(vec![byte; 100])),
+            "key {byte} after the rebuilds"
+        );
+    }
+}
+
+// a walk that spans rebuilds goes on from its last key and yields each key once
+#[test]
+fn a_walk_across_rebuilds_sees_every_key_once() {
+    use reel_core::Store;
+
+    let mut settings = config(1, EVERY_WRITE);
+    settings.segment_bytes = ByteCount::from_bytes(8_192);
+    let (writer, sim) = sim_store(settings.clone());
+    for byte in 0..=255u8 {
+        writer
+            .put(&record(u16::from(byte), byte), &[byte; 100])
+            .expect("put");
+    }
+    writer.flush().expect("flush");
+    drop(writer);
+    let reader =
+        ReelStore::open_read_only_with_io(PathBuf::from(ROOT), settings, COLUMNS, Arc::new(sim))
+            .expect("read only open");
+
+    let mut seen = Vec::new();
+    for (key, value) in Store::iter(&reader, "record").expect("walk") {
+        assert_eq!(
+            value.as_ref(),
+            &[key[2]; 100][..],
+            "the value under {key:?}"
+        );
+        seen.push(key);
+        reader.rebuild().expect("rebuild");
+    }
+
+    let wanted: Vec<Vec<u8>> = (0..=255u8)
+        .map(|byte| record(u16::from(byte), byte).as_slice().to_vec())
+        .collect();
+    assert_eq!(seen, wanted);
+
+    // Walks and batch reads on other threads see every key while rebuilds run under them
+    let keys: Vec<RecordKey> = (0..=255u8)
+        .map(|byte| record(u16::from(byte), byte))
+        .collect();
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let walking = scope.spawn(|| {
+            let mut wrong = 0u32;
+            while !done.load(Ordering::Acquire) {
+                let walked: Vec<Vec<u8>> = Store::iter(&reader, "record")
+                    .expect("walk")
+                    .map(|(key, _)| key)
+                    .collect();
+                wrong += u32::from(walked != wanted);
+            }
+            wrong
+        });
+        let batching = scope.spawn(|| {
+            let mut missed = 0usize;
+            while !done.load(Ordering::Acquire) {
+                let values = reader.get_many(&keys).expect("get many");
+                missed += values.iter().filter(|value| value.is_none()).count();
+            }
+            missed
+        });
+        for _ in 0..50 {
+            reader.rebuild().expect("rebuild");
+        }
+        done.store(true, Ordering::Release);
+        assert_eq!(
+            walking.join().expect("walker"),
+            0,
+            "a walk lost or repeated a key"
+        );
+        assert_eq!(
+            batching.join().expect("batch"),
+            0,
+            "a batch read missed a key"
+        );
+    });
+}
+
+// a read during a rebuild finds every key the reader held before it
+#[test]
+fn a_read_during_a_rebuild_misses_nothing() {
+    let (writer, reader, _sim) = follower_over_segments();
+    drop(writer);
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let reading = scope.spawn(|| {
+            let mut missed = 0u32;
+            while !done.load(Ordering::Acquire) {
+                for byte in 1..=6u8 {
+                    missed += u32::from(!reader.contains(&record(7, byte)).expect("contains"));
+                }
+            }
+            missed
+        });
+        for _ in 0..50 {
+            reader.rebuild().expect("rebuild");
+        }
+        done.store(true, Ordering::Release);
+        assert_eq!(reading.join().expect("reader"), 0, "a read missed a key");
+    });
+}
+
 // a reader following the log across a compaction keeps the key it repointed
 #[test]
 fn refresh_follows_a_relocation() {

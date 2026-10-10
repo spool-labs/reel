@@ -322,6 +322,12 @@ impl SealedRanges {
         self.generation.fetch_add(1, Ordering::Release);
     }
 
+    /// Swap in a rebuilt column's sealed set, moving the generation so every playback reopens
+    pub(crate) fn install(&self, fresh: &SealedRanges) {
+        std::mem::swap(&mut *write(&self.ranges), &mut *write(&fresh.ranges));
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
     /// Forget a segment the compactor has retired, moving the generation only if the set changed
     pub fn forget(&self, segment: SegmentId) {
         let mut sealed = write(&self.ranges);

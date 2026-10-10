@@ -535,6 +535,19 @@ impl KeyRunSet {
         crate::sync::read(&self.held).covered.clone()
     }
 
+    /// Swap in a rebuilt index's runs, moving the generation so every playback reopens
+    pub(crate) fn install_set(&self, fresh: &KeyRunSet) {
+        // A merge holds this, so none runs on the set while it changes
+        let _merging = crate::sync::lock(&self.merging);
+        std::mem::swap(
+            &mut *crate::sync::write(&self.held),
+            &mut *crate::sync::write(&fresh.held),
+        );
+        self.next_id
+            .fetch_max(fresh.next_id.load(Ordering::Acquire), Ordering::AcqRel);
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
     /// Hold the set for one merge, so two merges never take the same run
     pub fn try_merge(&self) -> Option<MutexGuard<'_, ()>> {
         crate::sync::try_lock(&self.merging)

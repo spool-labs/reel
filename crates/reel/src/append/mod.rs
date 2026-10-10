@@ -1609,3 +1609,11 @@ fn placeholder_active(driver: Arc<IoDriver>) -> Active {
         holds: Arc::default(),
     }
 }
+
+#[cfg(test)]
+impl Appender {
+    /// Run the pace's journal write, for a test that fails it
+    pub(crate) fn pace_journal(&self) {
+        read(&self.active).journal.try_write_pending();
+    }
+}

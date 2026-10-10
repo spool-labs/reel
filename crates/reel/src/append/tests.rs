@@ -109,6 +109,79 @@ fn pending_rows_survive_flushes() {
     assert_eq!(read_groups(&bytes).0, groups);
 }
 
+// a short journal write keeps its rows, and the next write lands them whole over the torn part
+#[test]
+fn a_short_journal_write_lands_whole_on_retry() {
+    for whole_blocks in [false, true] {
+        let (shared, sim) = harness(config(SyncPolicy::Never), FaultPlan::new(1));
+        let file = shared
+            .driver
+            .open(&shared.segment_path(SegmentId(9)), true)
+            .expect("open");
+        let rows_at = 4096;
+        let journal = Journal::create(&shared.driver, file, rows_at, 1 << 20, whole_blocks);
+        let row = |byte: u8| JournalRow {
+            key: key(byte),
+            lsn: crate::format::lsn::Lsn(u64::from(byte)),
+            offset: 100 * u32::from(byte),
+            len: 40,
+            flags: crate::format::record::Flags::DATA,
+            range_end: None,
+        };
+        let groups = vec![vec![row(1), row(2)], vec![row(3)]];
+        journal.push(&groups[0]);
+        sim.arm_next_ops(1, FaultKind::ShortWrite { written_bytes: 10 });
+        assert!(
+            journal.write_pending().is_err(),
+            "the short write is refused"
+        );
+        journal.push(&groups[1]);
+        journal.write_pending().expect("the retry lands");
+
+        let bytes = shared
+            .driver
+            .pread(file, rows_at, journal.len())
+            .expect("read");
+        let (read, valid) = read_groups(&bytes);
+        assert_eq!(read, groups, "whole blocks: {whole_blocks}");
+        let padded = match whole_blocks {
+            true => (valid as u64).next_multiple_of(BLOCK),
+            false => valid as u64,
+        };
+        assert_eq!(journal.len(), padded, "the retry counted its padding twice");
+    }
+}
+
+// a failed pace write keeps its rows, so the flush after it makes them durable
+#[test]
+fn a_failed_journal_write_keeps_its_rows() {
+    let (shared, sim) = harness(config(SyncPolicy::Never), FaultPlan::new(1));
+    let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
+    appender
+        .append_data(key(1), vec![0x11; 500], 0, Commit::PerRecord)
+        .expect("append 1");
+    sim.arm_next_ops(1, FaultKind::EnospcAppend);
+    let fired = sim.fault_reach().0;
+    read(&appender.active).journal.try_write_pending();
+    assert_eq!(sim.fault_reach().0, fired + 1, "the pace write failed");
+    appender
+        .append_data(key(2), vec![0x22; 500], 0, Commit::PerRecord)
+        .expect("append 2");
+    appender.flush().expect("flush");
+
+    let bytes = sim
+        .durable_bytes(&shared.segment_path(SegmentId(1)))
+        .expect("durable");
+    let rows = rows_region(&bytes).map_or(&[][..], |(_, rows)| rows);
+    let keys: Vec<RecordKey> = read_groups(rows)
+        .0
+        .into_iter()
+        .flatten()
+        .map(|row| row.key)
+        .collect();
+    assert_eq!(keys, vec![key(1), key(2)], "a flushed record lost its row");
+}
+
 /// One flush syncs the segment file once, which covers the rows too
 const SYNCS_PER_FLUSH: u64 = 1;
 

@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::error::Result;
+use crate::error::{ReelError, Result};
 use crate::format::journal::{push_group, JournalRow};
 use crate::format::record::BLOCK;
 use crate::io::op::{FileId, WriteBuf};
@@ -13,6 +13,15 @@ use crate::sync::{lock, try_lock};
 
 /// Zero the rows region in steps of a sixteenth of the segment, at most this many bytes
 const FILL: u64 = 1024 * 1024;
+
+/// How far a journal's rows reach in the file
+struct Written {
+    /// Bytes of rows written so far
+    bytes: u64,
+
+    /// Whether a failed write lost rows it could not put back, which fails every later write
+    lost: bool,
+}
 
 /// The journal of one open segment, stored from `rows_at` to the end of the segment file
 pub(super) struct Journal {
@@ -28,8 +37,8 @@ pub(super) struct Journal {
     /// Groups for records that have landed and are not in the file yet
     pending: Mutex<Vec<u8>>,
 
-    /// Bytes of rows written so far, locked during a write so groups stay in order
-    written: Mutex<u64>,
+    /// How far the rows reach, locked during a write so groups stay in order
+    written: Mutex<Written>,
 
     /// Bytes pushed so far, written or pending, which the segment's room shrinks by
     pushed: AtomicU64,
@@ -73,10 +82,11 @@ impl Journal {
             block.resize(BLOCK as usize, 0);
             driver.writev_all(file, rows_at + start, vec![WriteBuf::owned(block)])?;
             let next = start + BLOCK;
-            *journal
+            journal
                 .written
                 .get_mut()
-                .unwrap_or_else(|held| held.into_inner()) = next;
+                .unwrap_or_else(|held| held.into_inner())
+                .bytes = next;
             journal.pushed.store(next, Ordering::Release);
             journal.filled.store(next, Ordering::Release);
         }
@@ -101,7 +111,10 @@ impl Journal {
             file,
             rows_at,
             pending: Mutex::new(Vec::new()),
-            written: Mutex::new(written),
+            written: Mutex::new(Written {
+                bytes: written,
+                lost: false,
+            }),
             pushed: AtomicU64::new(written),
             whole_blocks,
             filled: AtomicU64::new(written),
@@ -140,30 +153,75 @@ impl Journal {
     /// Same as write_pending, but skip it if another caller is writing
     pub(super) fn try_write_pending(&self) {
         if let Some(mut written) = try_lock(&self.written) {
+            // A failed write keeps its rows, so the next flush writes them or fails
             let _ = self.write_locked(&mut written);
         }
     }
 
-    fn write_locked(&self, written: &mut u64) -> Result<()> {
+    fn write_locked(&self, written: &mut Written) -> Result<()> {
         let Some(file) = self.file else {
             return Ok(());
         };
+        if written.lost {
+            return Err(lost_rows());
+        }
         let mut bytes = std::mem::take(&mut *lock(&self.pending));
         if bytes.is_empty() {
             return Ok(());
         }
+        let rows = bytes.len();
         if self.whole_blocks {
-            let padded = (bytes.len() as u64).next_multiple_of(BLOCK);
+            let padded = (rows as u64).next_multiple_of(BLOCK);
             self.pushed
-                .fetch_add(padded - bytes.len() as u64, Ordering::AcqRel);
+                .fetch_add(padded - rows as u64, Ordering::AcqRel);
             bytes.resize(padded as usize, 0);
         }
         let len = bytes.len() as u64;
-        self.fill_to(file, *written + len)?;
-        self.driver
-            .writev_all(file, self.rows_at + *written, vec![WriteBuf::owned(bytes)])?;
-        *written += len;
-        Ok(())
+        if let Err(error) = self.fill_to(file, written.bytes + len) {
+            self.put_back(bytes, rows);
+            return Err(error);
+        }
+        let at = self.rows_at + written.bytes;
+        let (wrote, bufs) = match self
+            .driver
+            .writev_back(file, at, vec![WriteBuf::owned(bytes)])
+        {
+            Ok(back) => back,
+            Err(error) => {
+                // The buffer went with the op, so no later write may claim these rows landed
+                written.lost = true;
+                return Err(error);
+            }
+        };
+        match wrote {
+            Ok(wrote) if wrote == len => {
+                written.bytes += len;
+                Ok(())
+            }
+            failed => {
+                // The next write starts at `written` again and covers whatever part landed
+                match bufs.into_iter().next() {
+                    Some(WriteBuf::Owned(bytes)) => self.put_back(bytes, rows),
+                    _ => written.lost = true,
+                }
+                Err(failed.err().unwrap_or_else(|| {
+                    ReelError::Io(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "a journal write landed short",
+                    ))
+                }))
+            }
+        }
+    }
+
+    /// Put a failed write's rows back in front of pending, without the padding it added
+    fn put_back(&self, mut bytes: Vec<u8>, rows: usize) {
+        self.pushed
+            .fetch_sub((bytes.len() - rows) as u64, Ordering::AcqRel);
+        bytes.truncate(rows);
+        let mut pending = lock(&self.pending);
+        bytes.extend_from_slice(&pending);
+        *pending = bytes;
     }
 
     /// Zero the rows region up to `end` first, so syncing rows needs no block allocation
@@ -197,7 +255,7 @@ impl Journal {
         };
         let mut written = lock(&self.written);
         self.write_locked(&mut written)?;
-        let at = (self.rows_at + *written).next_multiple_of(BLOCK);
+        let at = (self.rows_at + written.bytes).next_multiple_of(BLOCK);
         let mut block = vec![0u8; BLOCK as usize];
         block[BLOCK as usize - mark.len()..].copy_from_slice(mark);
         self.driver
@@ -209,7 +267,7 @@ impl Journal {
         let Some(file) = self.file else {
             return Ok(());
         };
-        let written = lock(&self.written).next_multiple_of(BLOCK);
+        let written = lock(&self.written).bytes.next_multiple_of(BLOCK);
         let filled = self.filled.load(Ordering::Acquire);
         self.driver
             .release(file, self.rows_at + written, filled.saturating_sub(written))
@@ -219,6 +277,13 @@ impl Journal {
     pub(super) fn remove(&self) {
         lock(&self.pending).clear();
     }
+}
+
+/// The error every write returns once a failed write lost rows
+fn lost_rows() -> ReelError {
+    ReelError::Io(std::io::Error::other(
+        "a journal write failed and lost its rows",
+    ))
 }
 
 impl Drop for Journal {

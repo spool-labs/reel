@@ -593,6 +593,17 @@ impl IoDriver {
         offset: u64,
         bufs: Vec<WriteBuf>,
     ) -> Result<(u64, Vec<WriteBuf>)> {
+        let (wrote, bufs) = self.writev_back(file, offset, bufs)?;
+        Ok((wrote?, bufs))
+    }
+
+    /// The same write, handing the buffers back beside a failed result too
+    pub fn writev_back(
+        &self,
+        file: FileId,
+        offset: u64,
+        bufs: Vec<WriteBuf>,
+    ) -> Result<(Result<u64>, Vec<WriteBuf>)> {
         let op = Op::Writev {
             tag: self.next_tag(),
             file,
@@ -600,7 +611,7 @@ impl IoDriver {
             bufs,
         };
         match self.run_op(op)?.outcome {
-            Outcome::Wrote { result, bufs } => Ok((result?, bufs)),
+            Outcome::Wrote { result, bufs } => Ok((result, bufs)),
             other => Err(wrong_shape(&other)),
         }
     }

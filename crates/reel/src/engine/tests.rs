@@ -5276,3 +5276,23 @@ fn a_rewrite_under_a_pending_cover_counts_once() {
         .abs_diff(200 * payload.len() as u64);
     assert!(off <= store.spot_slack(), "the bytes sit {off} off");
 }
+
+// a failed pace write loses no record a later flush acked, across a crash
+#[test]
+fn a_failed_pace_write_loses_no_flushed_record() {
+    let settings = config(1, SyncPolicy::Never);
+    let (store, sim) = sim_store(settings.clone());
+    store.put(&record(7, 1), &[0x11; 100]).expect("put 1");
+    sim.arm_next_ops(1, FaultKind::EnospcAppend);
+    let fired = sim.fault_reach().0;
+    store.reel.tails()[0].pace_journal();
+    assert_eq!(sim.fault_reach().0, fired + 1, "the pace write failed");
+    store.put(&record(7, 2), &[0x22; 100]).expect("put 2");
+    store.flush().expect("flush");
+
+    let reopened = reopen(&sim, settings);
+    let one = reopened.get(&record(7, 1)).expect("get 1");
+    let two = reopened.get(&record(7, 2)).expect("get 2");
+    assert!(one.is_some(), "the flushed record was lost");
+    assert!(two.is_some());
+}

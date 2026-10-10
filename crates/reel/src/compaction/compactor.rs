@@ -716,7 +716,8 @@ impl Compactor {
             ),
         };
 
-        if let Err(error) = reel.tails()[dest_index].flush() {
+        // The pass dropped what newer records on any tail replace, so every tail syncs before the retire
+        if let Err(error) = reel.flush() {
             drop(source);
             return Err(error);
         }
@@ -997,7 +998,7 @@ impl Compactor {
             if shared.is_held(segment) || !shared.is_settled(segment) {
                 continue;
             }
-            report.add(self.erase_segment(shared, index, segment)?);
+            report.add(self.erase_segment(reel, index, segment)?);
         }
         Ok(report)
     }
@@ -1067,7 +1068,7 @@ impl Compactor {
             compactor: self,
             segment: pick,
         };
-        let report = self.erase_segment(shared, index, pick)?;
+        let report = self.erase_segment(reel, index, pick)?;
         self.metrics
             .erased_bytes
             .fetch_add(report.erased_bytes, Ordering::AcqRel);
@@ -1077,10 +1078,11 @@ impl Compactor {
     /// Give back the blocks under one sealed segment's replaced records, reading only its footer
     fn erase_segment(
         &self,
-        shared: &Arc<ReelShared>,
+        reel: &Reel,
         index: &ReelIndex,
         segment: SegmentId,
     ) -> Result<EraseReport> {
+        let shared = reel.shared();
         let mut report = EraseReport::default();
         let Some(footer) = shared.footer_of(segment)? else {
             return Ok(report);
@@ -1127,16 +1129,25 @@ impl Compactor {
                 _ => runs.push((start, end)),
             }
         }
+        let mut holes: Vec<(u64, u64)> = Vec::new();
         for (start, end) in runs {
             report.dead_run_bytes += end - start;
             let hole_start = start.next_multiple_of(ERASE_BLOCK);
             let hole_end = (end / ERASE_BLOCK) * ERASE_BLOCK;
             if hole_end > hole_start {
-                shared
-                    .driver
-                    .release(source.file(), hole_start, hole_end - hole_start)?;
-                report.erased_bytes += hole_end - hole_start;
+                holes.push((hole_start, hole_end));
             }
+        }
+        if holes.is_empty() {
+            return Ok(report);
+        }
+        // A newer record on any tail may be what made these bytes dead, so every tail syncs first
+        reel.flush()?;
+        for (hole_start, hole_end) in holes {
+            shared
+                .driver
+                .release(source.file(), hole_start, hole_end - hole_start)?;
+            report.erased_bytes += hole_end - hole_start;
         }
         Ok(report)
     }

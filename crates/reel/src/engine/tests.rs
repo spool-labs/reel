@@ -5488,3 +5488,40 @@ fn a_failed_pace_write_loses_no_flushed_record() {
     assert!(one.is_some(), "the flushed record was lost");
     assert!(two.is_some());
 }
+
+// a flush whose journal write fails never lets a later flush answer clean over records a reopen loses
+#[test]
+fn a_failed_journal_write_in_a_flush_is_never_flushed_clean() {
+    for fault in [
+        FaultKind::EnospcAppend,
+        FaultKind::ShortWrite { written_bytes: 10 },
+    ] {
+        let settings = config(1, SyncPolicy::Never);
+        let (store, sim) = sim_store(settings.clone());
+        store.put(&record(7, 1), &[0x11; 100]).expect("put 1");
+        store.flush().expect("flush 1");
+        store.put(&record(7, 2), &[0x22; 100]).expect("put 2");
+        // The flush's journal write is its first op, so the fault lands there
+        sim.arm_next_ops(1, fault);
+        let fired = sim.fault_reach().0;
+        store
+            .flush()
+            .expect_err("a flush whose rows did not land answered clean");
+        assert_eq!(sim.fault_reach().0, fired + 1, "the journal write failed");
+        sim.disarm();
+        let flushed = store.flush().is_ok();
+        assert_eq!(
+            store.get(&record(7, 2)).expect("get"),
+            Some(Value::new(vec![0x22; 100])),
+            "the live store dropped the record"
+        );
+
+        let reopened = reopen(&sim, settings);
+        let two = reopened.get(&record(7, 2)).expect("get 2");
+        assert!(
+            !flushed || two.is_some(),
+            "{fault:?}: a clean flush left a record the reopen lost"
+        );
+        assert!(reopened.get(&record(7, 1)).expect("get 1").is_some());
+    }
+}

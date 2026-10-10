@@ -1129,6 +1129,10 @@ impl Appender {
         };
         // Nothing more will be made durable here, so tell the waiters now
         doomed.sync.mark_broken();
+        // Count what no sync covered, so later flushes stop answering clean over it
+        if doomed.sync.covered() < doomed.end() {
+            self.shared.note_past_saving();
+        }
         // With no footer and dirty pages, a window must not read it around the cache
         self.shared.note_unsealed(doomed.handle.id());
         self.shared.release_segment(doomed.handle.id());

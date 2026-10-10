@@ -22,7 +22,7 @@ pub enum ReelError {
     #[error("reel corruption: {0}")]
     Corruption(String),
 
-    /// The I/O backend broke its own contract, which is not data corruption
+    /// The I/O backend broke its own contract
     #[error("reel backend fault: {0}")]
     Backend(String),
 
@@ -36,11 +36,7 @@ pub enum ReelError {
 }
 
 impl ReelError {
-    /// Whether this is the filesystem saying the thing simply is not there
-    ///
-    /// A directory that does not exist yet is an empty volume; one that cannot be
-    /// read is a volume of unknown contents, and taking it for the first is how a
-    /// store decides it holds nothing and starts overwriting.
+    /// Whether the filesystem reports the thing as not found
     pub fn is_missing(&self) -> bool {
         match self {
             ReelError::Io(source) => source.kind() == std::io::ErrorKind::NotFound,
@@ -49,26 +45,9 @@ impl ReelError {
     }
 
     /// Whether this is the filesystem out of space
-    ///
-    /// The one refusal a draw survives by going elsewhere: a reel spanning several
-    /// volumes retries a full one's draw on the next.
     pub fn is_full(&self) -> bool {
         match self {
             ReelError::Io(source) => source.kind() == std::io::ErrorKind::StorageFull,
-            _ => false,
-        }
-    }
-
-    /// Whether this is the filesystem refusing something it will never accept
-    ///
-    /// An O_DIRECT open comes back EINVAL on tmpfs and overlayfs, and EOPNOTSUPP on
-    /// the filesystems that answer more precisely.
-    pub fn is_unsupported(&self) -> bool {
-        match self {
-            ReelError::Io(source) => matches!(
-                source.raw_os_error(),
-                Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
-            ),
             _ => false,
         }
     }

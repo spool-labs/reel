@@ -1,8 +1,4 @@
 //! A checkpoint is the volume at a cue, and opens as one
-//!
-//! The copy is exactly the volume at the sequence number it reports, nothing written
-//! afterwards reaches it, a restore is an open rather than a procedure, and the copy
-//! survives the original compacting away every segment it was made from.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -10,9 +6,8 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 
-use reel::config::{IndexResidency, ReelConfig, SyncPolicy, ThreadBudget};
-use reel::format::column::{Codec, ColumnId, ColumnSpec, MapShape, RecordKey};
-use reel::index::persisted::PERSISTED_INDEX;
+use reel::config::{ReelConfig, SyncPolicy, ThreadBudget};
+use reel::format::column::{Codec, ColumnId, ColumnSpec, RecordKey};
 use reel::reel::checkpoint::staging_of;
 use reel::sync::rendezvous;
 use reel::units::ByteCount;
@@ -28,7 +23,6 @@ const COLUMNS: &[ColumnSpec] = &[ColumnSpec {
     shard_bytes: 2,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 fn key(at: u32) -> RecordKey {
@@ -38,14 +32,12 @@ fn key(at: u32) -> RecordKey {
     RecordKey::from_bytes(RECORDS, &bytes).expect("key")
 }
 
-/// Small segments, so a modest write count rolls several and the link set is real
+/// Small segments, so a few hundred writes roll several for the checkpoint to link
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(1),
-        alloc_chunk: ByteCount::from_bytes(64 * 1024),
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(2),
-        index: IndexResidency::Resident,
         ..ReelConfig::default()
     }
 }
@@ -118,7 +110,7 @@ fn writes_after_the_cue_stay_out_of_the_copy() {
     fill(&store, 0..200, 0xb2);
     let taken = store.checkpoint(&copy).expect("checkpoint");
 
-    // Written afterwards, and an overwrite of a key the copy already holds.
+    // New keys after the cue, and an overwrite of a key the copy already holds
     fill(&store, 200..400, 0xc3);
     store.put(&key(0), &vec![0xff; 4_096]).expect("overwrite");
     store.flush().expect("flush");
@@ -148,9 +140,6 @@ fn writes_after_the_cue_stay_out_of_the_copy() {
 }
 
 // the copy is whole once the original has compacted every segment it came from
-//
-// The volume unlinks its own name for a segment and the checkpoint's link keeps the
-// inode alive, so a copy that read through to the original would end up empty.
 #[test]
 fn the_copy_survives_the_original_compacting_it_away() {
     let home = TempDir::new().expect("tempdir");
@@ -163,7 +152,7 @@ fn the_copy_survives_the_original_compacting_it_away() {
     let linked = segment_files(&copy);
     assert!(!linked.is_empty(), "nothing was linked");
 
-    // Overwrite everything, so every segment the checkpoint linked goes wholly dead.
+    // Overwrite everything, so every segment the checkpoint linked goes wholly dead
     fill(&store, 0..300, 0xe5);
     for _ in 0..64 {
         if matches!(store.compact_once().expect("compact"), CompactPass::Idle) {
@@ -188,13 +177,9 @@ fn the_copy_survives_the_original_compacting_it_away() {
     }
 }
 
-// a copy taken from a volume that keeps an index carries one of its own
-//
-// The index over exactly the linked segments comes from the same cue, so the restore
-// reads one file rather than every footer. It lands on home, since its rows name
-// segments across every piece.
+// a restore through the copy serves every key and counts what the volume counts
 #[test]
-fn the_copy_carries_its_own_index() {
+fn the_copy_restores_whole() {
     let home = TempDir::new().expect("tempdir");
     let live = home.path().join("live");
     let copy = home.path().join("copy");
@@ -203,17 +188,12 @@ fn the_copy_carries_its_own_index() {
     fill(&store, 0..400, 0x28);
     store.checkpoint(&copy).expect("checkpoint");
 
-    assert!(
-        copy.join(PERSISTED_INDEX).is_file(),
-        "the copy took the segments and left the index behind",
-    );
-
     let restored = open(&copy);
     for at in 0..400u32 {
         assert_eq!(
             restored.get(&key(at)).expect("read").map(Value::into_vec),
             Some(vec![0x28; 4_096]),
-            "key {at} did not survive a restore through the copy's own index",
+            "key {at} did not survive a restore through the copy",
         );
     }
     assert_eq!(
@@ -223,7 +203,7 @@ fn the_copy_carries_its_own_index() {
     );
 }
 
-// a target that exists is refused rather than published over
+// a checkpoint onto an existing target is refused
 #[test]
 fn a_checkpoint_refuses_a_target_that_exists() {
     let home = TempDir::new().expect("tempdir");
@@ -240,7 +220,7 @@ fn a_checkpoint_refuses_a_target_that_exists() {
         "a second checkpoint published over the first"
     );
 
-    // And the refusal leaves the first one exactly as it was.
+    // The refusal leaves the first checkpoint as it was
     let restored = open(&copy);
     assert_eq!(
         restored.get(&key(0)).expect("read").map(Value::into_vec),
@@ -248,7 +228,7 @@ fn a_checkpoint_refuses_a_target_that_exists() {
     );
 }
 
-// a read-only volume has no tails to seal, so it does not answer to this name
+// a read-only volume has no tails to seal, so it refuses to checkpoint
 #[test]
 fn a_read_only_volume_refuses_to_checkpoint() {
     let home = TempDir::new().expect("tempdir");
@@ -269,10 +249,6 @@ fn a_read_only_volume_refuses_to_checkpoint() {
 }
 
 // a crash before the rename leaves a staging directory and no target
-//
-// Parked at the rename the links are all down and synced, so this is what a crash
-// leaves. The staging name is also the refusal the next attempt meets, which makes
-// the leftover a thing to sweep rather than a thing to build on.
 #[test]
 fn a_crash_before_the_rename_leaves_only_staging() {
     let home = TempDir::new().expect("tempdir");
@@ -305,7 +281,7 @@ fn a_crash_before_the_rename_leaves_only_staging() {
         !segment_files(&staging).is_empty(),
         "the staging directory holds no segments, so the link pass did nothing",
     );
-    // The volume is untouched by a checkpoint that never finished.
+    // A checkpoint that never finished leaves the volume untouched
     assert_eq!(
         store.get(&key(0)).expect("read").map(Value::into_vec),
         Some(vec![0xd4; 4_096]),
@@ -322,10 +298,6 @@ fn a_crash_before_the_rename_leaves_only_staging() {
 }
 
 // a crash after the rename leaves a whole copy, one that opens
-//
-// The parent directory is not synced yet, so only the weaker promise is asserted:
-// the copy is complete and readable. Whether the name survives a power cut is the
-// parent sync's job, not something a test in this process can ask.
 #[test]
 fn a_crash_after_the_rename_leaves_a_whole_copy() {
     let home = TempDir::new().expect("tempdir");
@@ -358,7 +330,7 @@ fn a_crash_after_the_rename_leaves_a_whole_copy() {
     script.release("checkpoint/published");
     taking.join().expect("checkpoint thread");
 
-    // What stood on disk at the rename, not what the call did afterwards.
+    // The copy on disk is what stood there at the rename
     assert_eq!(
         segment_files(&copy),
         staged,

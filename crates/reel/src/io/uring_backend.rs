@@ -1,10 +1,4 @@
-//! Ring backend over io_uring, one ring per thread on both doors
-//!
-//! A ring belongs to the thread that submits to it, so there is no shard lock and
-//! no completion handed to a thread that did not ask for it, which is what makes
-//! SINGLE_ISSUER and DEFER_TASKRUN legal. A caller with no thread has no ring, so
-//! an engine thread owns one per shard, takes ops through a bounded inbox, and
-//! files the completions into the driver's slot table.
+//! io_uring backend with one ring per submitting thread, so no ring needs a lock
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -29,64 +23,45 @@ use crate::io::ServingBackend;
 use crate::io::{DoorCounts, ReelIo};
 use crate::sync::lock;
 
-/// Submission slots each ring is built with
+/// Each ring has this many submission slots
 const RING_ENTRIES: u32 = 256;
 
-/// Entries a slot's iovec list holds without going back to the allocator
-///
-/// A split read is exactly two, which is the op the list is built for most often.
+/// Each slot's iovec list starts with room for this many entries, enough for a split read
 const IOVEC_ROOM: usize = 2;
 
-/// Registered descriptor slots one ring keeps, the ceiling on files it can hold
+/// Each ring's registered file table has this many slots
 const MAX_REGISTERED_FILES: u32 = 4096;
 
-/// Bytes one registered buffer holds, the room a staged op lands in
-///
-/// A block over the staging width, since a read aligned to nothing rounds down at
-/// the front and up at the back. A span past what the pool serves goes off the ring.
+/// Bytes in one registered buffer, one block over the staging width for an unaligned read
 const REGISTERED_BUFFER_BYTES: usize = STAGE_BYTES + DIRECT_ALIGN;
 
-/// Registered buffers one ring keeps, the ceiling on direct ops it can have out
-///
-/// What the direct door costs per submitting thread. Too few and a wide batch
-/// waits on a buffer the way it waits on a slot, too many and every thread pins
-/// pages it never fills.
+/// Each ring registers this many buffers, which caps its direct ops in flight
 const REGISTERED_BUFFERS: usize = 32;
 
-/// The place a completion goes back to when no batch is holding one for it
+/// The order of a completion that no batch is waiting on
 const UNORDERED: u32 = u32::MAX;
 
-/// The user data the engine thread's inbox poll carries, which names no op
-///
-/// Every slot the slab addresses is below its capacity, so this reaches none of
-/// them and a completion carrying it can only be the poll's own.
+/// User data for the engine thread's inbox poll, which matches no slot
 const KICK_TAG: u64 = u64::MAX;
 
-/// Rounds a spinning wait asks the queue before it starts yielding the core
+/// A spinning wait polls the queue this many times before it yields the core
 const SPIN_ROUNDS: u32 = 64;
 
-/// Rounds a spinning wait gives up on and sleeps for a completion instead
+/// A spinning wait sleeps for a completion after this many rounds
 const MAX_SPIN_ROUNDS: u32 = 1_000_000;
 
-/// The iovec array a vectored op hands the ring, owned by the slot it flies in
-///
-/// The pointers name buffers the same record owns for the whole flight, and the
-/// slot holds list and record together until the completion comes back. It lives
-/// in the slot so the allocation is bought once per slot, not once per op.
+/// A vectored op's iovec array, kept in its slot so each slot allocates it once
 struct IoVecs(Vec<libc::iovec>);
 
+// SAFETY: the slot holds every buffer the pointers target until the completion returns
 unsafe impl Send for IoVecs {}
 
 impl IoVecs {
-    /// An empty list with room for the ops that take the fewest entries
     fn new() -> IoVecs {
         IoVecs(Vec::with_capacity(IOVEC_ROOM))
     }
 
-    /// Point the list at these spans and nothing else
-    ///
-    /// The room already bought serves anything that fits it, so a list refilled
-    /// with what it held last time touches the allocator not at all.
+    /// Point the list at these spans, reusing its allocation
     fn refill(&mut self, spans: impl IntoIterator<Item = (*mut libc::c_void, usize)>) {
         self.0.clear();
         self.0.extend(
@@ -105,22 +80,17 @@ impl IoVecs {
     }
 }
 
-/// The aligned buffers one ring registered, which its direct ops fly through
-///
-/// A direct descriptor refuses a buffer wherever the allocator put it, so an op is
-/// staged through one of these. Registering hands the kernel the pages once, so a
-/// submission names an index rather than pinning a span per op. The pool belongs
-/// to one thread's ring, so nothing locks it.
+/// One ring's registered aligned buffers, which stage its direct ops
 struct Buffers {
-    /// The buffers themselves, at the addresses the kernel pinned
+    /// The buffers, at the addresses the kernel pinned
     held: Vec<AlignedBuf>,
 
-    /// Buffers carrying no op, popped from the back
+    /// Free buffers, popped from the back
     free: Vec<u16>,
 }
 
 impl Buffers {
-    /// A pool holding nothing, for a ring whose ops carry the caller's own buffers
+    /// An empty pool, for a ring whose ops use the caller's buffers
     fn none() -> Buffers {
         Buffers {
             held: Vec::new(),
@@ -128,7 +98,7 @@ impl Buffers {
         }
     }
 
-    /// The buffers a pool is made of, before any ring has been told about them
+    /// Allocate the buffers unregistered, or an empty pool if allocation fails
     fn allocate() -> Buffers {
         let mut held = Vec::with_capacity(REGISTERED_BUFFERS);
         let mut free = Vec::with_capacity(REGISTERED_BUFFERS);
@@ -137,17 +107,13 @@ impl Buffers {
                 return Buffers::none();
             };
             held.push(buf);
-            // Popped from the back, so the first ops take the low buffers and a trace
-            // of the indices reads in the order they were claimed.
+            // Reversed so pops hand out the low buffers first
             free.push((REGISTERED_BUFFERS - 1 - at) as u16);
         }
         Buffers { held, free }
     }
 
-    /// Hand a ring a pool of its own, or none when the kernel will not take one
-    ///
-    /// A refusal leaves the volume where it was before the pool existed, with its
-    /// direct ops answered one at a time on the posix path.
+    /// Register a pool with this ring, or return an empty one if the kernel refuses
     fn register(ring: &IoUring) -> Buffers {
         let pool = Buffers::allocate();
         if !pool.is_live() {
@@ -160,8 +126,7 @@ impl Buffers {
                 iov_len: buf.len(),
             });
         }
-        // SAFETY: every span names a buffer this pool owns and never moves, and
-        // the ring is dropped before the pool.
+        // SAFETY: each span is a buffer the pool owns and never moves, and the ring drops first
         if unsafe { ring.submitter().register_buffers(&spans) }.is_err() {
             tracing::debug!("this ring has no buffer pool, so its direct ops take the posix path");
             return Buffers::none();
@@ -169,23 +134,17 @@ impl Buffers {
         pool
     }
 
-    /// Whether the kernel took a pool for this ring at all
+    /// Whether this ring has a pool
     fn is_live(&self) -> bool {
         !self.held.is_empty()
     }
 
-    /// Whether every buffer the kernel took is carrying an op
-    ///
-    /// A pool that was refused is never starved: its volume's ops go to the posix
-    /// path one at a time rather than waiting on a buffer that is not coming.
+    /// Whether every buffer is in use, which an empty pool never is
     fn is_starved(&self) -> bool {
         self.is_live() && self.free.is_empty()
     }
 
-    /// Take a buffer for an op of this span, or nothing when none can serve it
-    ///
-    /// The ceiling is the request width rather than the buffer's, so an op the pool
-    /// has room for but the device would answer in two goes off the ring instead.
+    /// Take a buffer for a span of at most one device request, or nothing
     fn claim(&mut self, span: usize) -> Option<u16> {
         if span > DIRECT_REQUEST_BYTES {
             return None;
@@ -193,38 +152,32 @@ impl Buffers {
         self.free.pop()
     }
 
-    /// Give a buffer back, its op having come off the ring
     fn release(&mut self, at: u16) {
         self.free.push(at);
     }
 
-    /// One buffer as writable bytes, for gathering a write into it
     fn as_mut_slice(&mut self, at: u16) -> &mut [u8] {
         self.held[at as usize].as_mut_slice()
     }
 
-    /// The address a submission names, which the allocation guarantees is aligned
+    /// A buffer's address, aligned by its allocation
     fn as_ptr(&self, at: u16) -> *mut u8 {
         self.held[at as usize].as_ptr()
     }
 
-    /// The leading bytes a read landed in one buffer
+    /// The first `count` bytes a read landed in one buffer
     ///
     /// # Safety
     ///
-    /// The count has to be one a completion reported, so the range named is exactly
-    /// what the kernel filled.
+    /// `count` must be at most the byte count a completion reported for this buffer
     unsafe fn filled(&self, at: u16, count: usize) -> &[u8] {
         unsafe { self.held[at as usize].filled(count) }
     }
 }
 
-/// What a submitted op is waiting on, held until the ring hands it back
-///
-/// The buffers live here for the length of the flight, since the kernel fills them
-/// after the submission returns. A record the kernel refuses is answered from here.
+/// A submitted op and the buffers it owns, held until its completion returns
 enum Pending {
-    /// A write, holding the buffers it is copying out of
+    /// A write, holding the buffers it copies from
     Wrote { tag: Tag, bufs: Vec<WriteBuf> },
 
     /// A read into one buffer
@@ -237,10 +190,7 @@ enum Pending {
         body: ReadBuf,
     },
 
-    /// A write gathered into a registered buffer, holding the caller's buffers too
-    ///
-    /// The framed count is what the caller asked to write and is told landed; the
-    /// buffer rounds it up to whole blocks.
+    /// A write gathered into a registered buffer, `framed` bytes before block padding
     StagedWrite {
         tag: Tag,
         staged: u16,
@@ -248,10 +198,7 @@ enum Pending {
         framed: usize,
     },
 
-    /// A read landing in a registered buffer, cut into the caller's on completion
-    ///
-    /// The read was widened to the blocks holding the range, so the bytes the caller
-    /// asked for start `skip` into whatever lands.
+    /// A read into a registered buffer, with the caller's bytes starting `skip` in
     StagedRead {
         tag: Tag,
         staged: u16,
@@ -270,10 +217,7 @@ enum Pending {
 }
 
 impl Pending {
-    /// Turn a ring result into the completion the op's shape calls for
-    ///
-    /// The pool comes in because a staged op reads its bytes out of the buffer it
-    /// flew through and hands that buffer back, neither of which it can do alone.
+    /// Turn a ring result into the op's completion, releasing any staged buffer
     fn complete(self, result: i32, buffers: &mut Buffers) -> Completion {
         let failed = ring_error(result);
         match self {
@@ -289,8 +233,7 @@ impl Pending {
             },
             Pending::Read { tag, mut buf } => {
                 let filled = result.max(0) as usize;
-                // The kernel wrote this many bytes into the buffer's room, which is
-                // the one thing that makes committing them sound.
+                // The kernel wrote this many bytes into the buffer, so committing them is sound
                 unsafe { buf.commit(filled) };
                 Completion {
                     tag,
@@ -310,8 +253,7 @@ impl Pending {
             } => {
                 let filled = result.max(0) as usize;
                 let head_len = head.wanted();
-                // A vectored read fills the first buffer before the second, so a
-                // short read cuts the body and a shorter one cuts the head itself.
+                // A vectored read fills the head first, so a short read cuts the body first
                 unsafe {
                     head.commit(filled.min(head_len));
                     body.commit(filled.saturating_sub(head_len));
@@ -353,8 +295,7 @@ impl Pending {
                 mut buf,
             } => {
                 let (from, to) = wanted_window(result.max(0) as usize, skip, buf.wanted());
-                // Safety: the completion reported filling this many bytes from the
-                // buffer's start, so the range named is exactly what the kernel wrote.
+                // Safety: the completion says the kernel filled at least this many bytes
                 let landed = unsafe { buffers.filled(staged, to) };
                 let taken = cut_into(&landed[from..], &mut buf);
                 buffers.release(staged);
@@ -378,7 +319,7 @@ impl Pending {
             } => {
                 let wanted = head.wanted() + body.wanted();
                 let (from, to) = wanted_window(result.max(0) as usize, skip, wanted);
-                // Safety: as above, the count came off the completion.
+                // Safety: as above, the count comes from the completion
                 let landed = unsafe { buffers.filled(staged, to) };
                 let taken = cut_split_into(&landed[from..], &mut head, &mut body);
                 buffers.release(staged);
@@ -398,12 +339,12 @@ impl Pending {
     }
 }
 
-/// One slot: what is in flight there, where its answer belongs, and its generation
+/// One slab slot: its op in flight, its batch order, and its generation
 struct Slot {
-    /// Bumped on every reuse, so a completion for a flight that is over is stale
+    /// Bumped on every reuse, so a completion from an earlier op is stale
     generation: u32,
 
-    /// The place in a batch's answers this op's completion goes back to
+    /// Where this op's completion goes in its batch's answers
     order: u32,
 
     /// The op and the buffers it owns, held here until its completion returns
@@ -413,28 +354,24 @@ struct Slot {
     iovecs: IoVecs,
 }
 
-/// One completion and the place in a batch's answers it belongs to
+/// One completion and its place in a batch's answers
 struct Reaped {
     order: u32,
     completion: Completion,
 }
 
-/// Ops in flight against one ring, each in the slot its completion names
-///
-/// A submission's user data carries the slot rather than a key to hash back, with
-/// a generation in the high half so a completion for an op already taken cannot
-/// land on whatever moved in. One slot per queue entry bounds the ops in flight.
+/// Ops in flight on one ring, keyed by user data that holds slot and generation
 struct Inflight {
     /// Every slot, live or free
     slots: Vec<Slot>,
 
-    /// Slots carrying nothing, popped from the back
+    /// Free slots, popped from the back
     free: Vec<u32>,
 
-    /// Completions taken off the ring and not yet handed to whoever wanted them
+    /// Completions taken off the ring and not yet handed out
     reaped: Vec<Reaped>,
 
-    /// Reads out on the ring, which is what decides whether a wait spins or sleeps
+    /// Reads and direct writes in flight, which decide whether a wait spins or sleeps
     reads_out: usize,
 }
 
@@ -450,8 +387,7 @@ impl Inflight {
                 pending: None,
                 iovecs: IoVecs::new(),
             });
-            // Popped from the back, so the first ops land in the low slots and a
-            // trace of the user data reads in the order it was submitted.
+            // Reversed so pops hand out the low slots first
             free.push((entries - 1 - at) as u32);
         }
         Inflight {
@@ -462,35 +398,31 @@ impl Inflight {
         }
     }
 
-    /// Whether every op out on this ring is a write
+    /// Whether every op in flight on this ring is a buffered write
     fn holds_only_writes(&self) -> bool {
         self.reads_out == 0
     }
 
-    /// Whether every slot is carrying an op
+    /// Whether every slot is in use
     fn is_full(&self) -> bool {
         self.free.is_empty()
     }
 
-    /// Whether the kernel owes this ring nothing at all
+    /// Whether this ring has no op in flight
     fn is_idle(&self) -> bool {
         self.free.len() == self.slots.len()
     }
 
-    /// The slot the next insert will place an op in
-    ///
-    /// A vectored op points the kernel into its slot's iovec list, so the list is
-    /// filled before the op is placed and one thread owns the slab throughout.
+    /// The slot the next insert will use, so a vectored op can fill its iovec list first
     fn next_free(&self) -> u32 {
         *self.free.last().expect("a slot is free before an insert")
     }
 
-    /// The iovec list a slot lends the op it is about to carry
     fn iovecs_mut(&mut self, at: u32) -> &mut IoVecs {
         &mut self.slots[at as usize].iovecs
     }
 
-    /// Place an op and return the user data its completion will carry
+    /// Place an op and return the user data for its submission
     fn insert(&mut self, pending: Pending, order: u32) -> u64 {
         if !matches!(pending, Pending::Wrote { .. }) {
             self.reads_out += 1;
@@ -503,7 +435,7 @@ impl Inflight {
         (slot.generation as u64) << 32 | at as u64
     }
 
-    /// Take the op a completion names, or nothing when it names no live op
+    /// Take the op for this user data, or nothing if no live op matches
     fn take(&mut self, user_data: u64) -> Option<(u32, Pending)> {
         let at = (user_data & 0xffff_ffff) as usize;
         let generation = (user_data >> 32) as u32;
@@ -520,7 +452,7 @@ impl Inflight {
         Some((order, pending))
     }
 
-    /// Move the completions no batch is holding a place for into the output
+    /// Move completions that no batch is waiting on into the output
     fn take_free(&mut self, out: &mut Vec<Completion>) -> usize {
         let mut taken = 0;
         let mut at = 0;
@@ -535,7 +467,7 @@ impl Inflight {
         taken
     }
 
-    /// Move the completions a batch is holding places for into its answers
+    /// Move completions a batch is waiting on into their places in its answers
     fn take_ordered(&mut self, filled: &mut [Option<Completion>]) -> usize {
         let mut taken = 0;
         let mut at = 0;
@@ -552,39 +484,32 @@ impl Inflight {
     }
 }
 
-/// Which descriptor a submission names
-///
-/// A plain one is resolved by the kernel per op; a registered one was handed over
-/// once and is named by its slot, which is a table lookup against an index.
+/// The descriptor a submission uses, a plain fd or a registered file slot
 enum RingTarget {
     Plain(types::Fd),
     Registered(types::Fixed),
 }
 
-/// The registered descriptor table one ring holds, keyed by the handle not the fd
-///
-/// Identifiers are never reused, so only a close stales a slot, and a table built
-/// against an older close count is given up whole before the next op. A
-/// registration pins the file, which is why the table is bounded rather than grown.
+/// One ring's registered file table, keyed by handle and cleared whole after any close
 struct Files {
-    /// Whether the kernel took a descriptor table for this ring at all
+    /// Whether the kernel accepted a file table for this ring
     is_registered: bool,
 
-    /// The volume's close count this table was built against
+    /// The volume's close count when this table was built
     generation: u64,
 
-    /// The slot each handle was placed in
+    /// The slot each handle sits in
     held: HashMap<FileId, u32>,
 
-    /// The handle the last op named, since ops arrive in runs against one file
+    /// The last op's handle and slot, since ops arrive in runs against one file
     last: Option<(FileId, u32)>,
 
-    /// The next slot to hand out, which only rewinds when the table is given up
+    /// The next slot to hand out, which rewinds only when the table is given up
     next: u32,
 }
 
 impl Files {
-    /// An empty table, registered when the kernel took one
+    /// An empty table, registered if the kernel accepted one
     fn new(is_registered: bool, generation: u64) -> Files {
         Files {
             is_registered,
@@ -595,7 +520,7 @@ impl Files {
         }
     }
 
-    /// The descriptor a submission names, placing the file in a slot the first time
+    /// The descriptor for this file, registering it in a slot the first time
     fn target_for(
         &mut self,
         ring: &IoUring,
@@ -631,16 +556,12 @@ impl Files {
         Ok(RingTarget::Registered(types::Fixed(slot)))
     }
 
-    /// Whether a close has moved the volume past this table
+    /// Whether a close on the volume has made this table stale
     fn is_stale(&self, posix: &PosixBackend) -> bool {
         self.is_registered && self.generation != posix.close_generation()
     }
 
-    /// Hand every slot back, because a file somewhere on the volume has closed
-    ///
-    /// A refused clear is not a hazard, since a slot handed out again is registered
-    /// again. The caller flushes first, since the kernel resolves a fixed slot at
-    /// submission and a queued entry would read whatever moved in.
+    /// Clear every slot after a close, once the caller has flushed queued entries
     fn give_up(&mut self, ring: &IoUring, generation: u64) {
         if self.next > 0 {
             let emptied = vec![-1; self.next as usize];
@@ -659,37 +580,33 @@ struct Kick {
     is_armed: bool,
 }
 
-/// One ring and the ops in flight against it, owned by one thread
-///
-/// Every method takes &mut self and there is no lock anywhere in it, which is what
-/// a ring under SINGLE_ISSUER needs.
+/// One ring and its ops in flight, owned by one thread as SINGLE_ISSUER requires
 struct Ring {
-    /// The kernel's own ring, submitted to and reaped from this thread alone
+    /// The kernel ring, used from this thread alone
     ring: IoUring,
 
-    /// The ops in flight against it, each in the slot its completion names
+    /// The ops in flight on it
     inflight: Inflight,
 
-    /// The descriptors registered with it, so an op names a slot rather than an fd
+    /// The files registered with it
     files: Files,
 
     /// The buffers registered with it, declared after the ring so it drops first
     buffers: Buffers,
 
-    /// Whether descriptors bypass the page cache, so no op carries a caller buffer
+    /// Whether descriptors bypass the page cache, so ops go through registered buffers
     is_direct: bool,
 
     /// User data of entries queued for the kernel, taken back when an enter fails
     queued: Vec<u64>,
 
-    /// The inbox this ring watches, on an engine thread and nowhere else
+    /// The inbox eventfd this ring watches, set only on an engine thread
     kick: Option<Kick>,
 
-    /// Whether the kernel holds this ring's completion work, as the kernel answered
-    /// and not as the tuning asked
+    /// Whether the kernel defers this ring's completion work, per the mode it accepted
     asks_for_completions: bool,
 
-    /// The volume's door tally, which this ring's per-op decisions feed
+    /// The volume's door tally, which this ring updates per op
     doors: Arc<DoorTally>,
 }
 
@@ -697,8 +614,7 @@ impl Ring {
     /// Build this thread's ring under the volume's tuning
     fn new(core: &Core) -> Result<Ring> {
         let ring = ring_under(core.taskrun)?;
-        // A kernel that will not take the table leaves the ring on plain
-        // descriptors, so a refusal is a lost optimization not a lost volume.
+        // A refused file table leaves the ring on plain descriptors
         let is_registered = ring
             .submitter()
             .register_files_sparse(MAX_REGISTERED_FILES)
@@ -706,11 +622,9 @@ impl Ring {
         if !is_registered {
             core.doors.note_files_refused();
         }
-        // The kernel clamps the completion queue, so the bound on ops in flight is
-        // read back from the ring rather than assumed.
+        // The kernel clamps the completion queue, so its size is read back from the ring
         let entries = ring.params().cq_entries() as usize;
-        // A direct descriptor refuses the caller's own buffer. A buffered volume
-        // registers none, since staging there would buy a copy for nothing.
+        // Only a direct volume needs a pool, since its descriptors refuse caller buffers
         let buffers = match core.is_direct && core.tuning.registered_buffers {
             true => Buffers::register(&ring),
             false => Buffers::none(),
@@ -731,36 +645,22 @@ impl Ring {
         })
     }
 
-    /// Whether a thread spins for what the ring is holding rather than sleeping for it
-    ///
-    /// A write lands in page cache, and spinning for one is 8.1 us against 13.0 us at
-    /// the commit p50. One read out is a device round trip, where the same spin burns
-    /// 10.8x the cycles for nothing.
-    ///
-    /// Reads the ops out rather than `&self`, so the rule can be asserted without a
-    /// kernel to build a ring on.
+    /// Whether a wait spins, which it does only while every op in flight is a buffered write
     fn spins_for(inflight: &Inflight) -> bool {
         inflight.holds_only_writes()
     }
 
-    /// Whether the ring has room to take another op
-    ///
-    /// A direct op needs a registered buffer as much as a slot, so a starved pool
-    /// is a ring with no room. A pool the kernel refused never says this.
+    /// Whether the ring has no free slot or no free registered buffer
     fn is_full(&self) -> bool {
         self.inflight.is_full() || self.buffers.is_starved()
     }
 
-    /// Whether the kernel owes this ring nothing at all
+    /// Whether this ring has no op in flight
     fn is_idle(&self) -> bool {
         self.inflight.is_idle()
     }
 
-    /// Hand the kernel what is queued, answering what it refuses on the spot
-    ///
-    /// A busy ring is a full completion queue rather than a failure, so the answer
-    /// is to empty it and ask again. An enter that fails outright consumed nothing,
-    /// so the entries still queued are taken back and answered.
+    /// Submit what is queued, draining on EBUSY and answering every entry if the enter fails
     fn flush(&mut self) -> bool {
         if self.ring.submission().is_empty() {
             self.queued.clear();
@@ -793,34 +693,24 @@ impl Ring {
         }
     }
 
-    /// Run the completion work the kernel is holding for this thread, if any
-    ///
-    /// The crate's submit asks only when it is also waiting for a completion, so a
-    /// thread that means to peek has to ask by hand: this is the ask and not the wait.
-    /// The mode is read before the flag because reading the flag borrows the submission
-    /// queue, whose drop stores the tail back, and a spin comes through here every round.
+    /// Run any completion work the kernel deferred for this thread, without waiting
     fn run_owed_work(&mut self) {
         if !self.asks_for_completions || !self.ring.submission().taskrun() {
             return;
         }
-        // SAFETY: an enter submitting nothing and waiting for nothing, on the thread
-        // that owns this ring, which is what the mode requires.
+        // SAFETY: this enter submits and waits for nothing, on the thread that owns the ring
         let entered = unsafe {
             self.ring
                 .submitter()
                 .enter::<libc::sigset_t>(0, 0, EnterFlags::GETEVENTS.bits(), None)
         };
         if let Err(error) = entered {
-            // The work stays queued and the flag stays up, so the next look asks again.
+            // The work stays queued and the flag stays up, so the next look asks again
             tracing::debug!("the ring refused to run its own completion work: {error}");
         }
     }
 
-    /// Move whatever the ring has finished into the reaped list
-    ///
-    /// A completion queue is shared memory, so this costs no syscall on a ring the
-    /// kernel posts into as it goes. One holding its work is asked first, so every
-    /// reader of the queue goes through here.
+    /// Move finished ops into the reaped list, running deferred work first
     fn drain(&mut self) -> usize {
         self.run_owed_work();
         let mut drained = 0;
@@ -848,11 +738,7 @@ impl Ring {
         drained
     }
 
-    /// Sleep until the ring has finished at least one of the ops it holds
-    ///
-    /// The wait hands the kernel what is queued on its way in, so it is the submission
-    /// as much as the sleep. An interrupted or busy wait means look again; an enter
-    /// that failed outright took nothing.
+    /// Submit what is queued and sleep until at least one op completes
     fn park(&mut self) -> Result<()> {
         let waited = self.ring.submit_and_wait(1);
         match waited {
@@ -875,17 +761,13 @@ impl Ring {
         }
     }
 
-    /// Wait for the ring to report at least one more completion
-    ///
-    /// The ops out own buffers the kernel may still be writing into, so a wait that
-    /// fails keeps asking rather than taking that memory back.
+    /// Spin or sleep until the ring reports at least one more completion
     fn wait_more(&mut self) {
         if !Ring::spins_for(&self.inflight) {
             self.sleep_once();
             return;
         }
-        // The spin never enters the kernel, so it has to hand the entries over itself
-        // or the loop below would ask a queue that stays empty.
+        // The spin never enters the kernel, so it submits the queued entries first
         self.flush();
         let mut rounds = 0u32;
         loop {
@@ -894,8 +776,7 @@ impl Ring {
             }
             rounds += 1;
             if rounds > MAX_SPIN_ROUNDS {
-                // A spin this long is not a completion about to land, so the thread
-                // sleeps for one rather than holding a core to find out.
+                // A spin this long means no completion is close, so sleep for one
                 self.doors.note_spun_out();
                 self.sleep_once();
                 return;
@@ -906,7 +787,7 @@ impl Ring {
         }
     }
 
-    /// Sleep in the kernel once and take whatever that woke it for
+    /// Sleep in the kernel once, then drain what completed
     fn sleep_once(&mut self) {
         if let Err(error) = self.park() {
             tracing::debug!("the ring refused a wait: {error}");
@@ -921,10 +802,7 @@ impl Ring {
         self.inflight.take_ordered(filled)
     }
 
-    /// Put one op on the ring, or answer it here when it cannot go there
-    ///
-    /// An op the ring does not serve and a handle it does not know are both facts
-    /// about one op, so they answer on the posix path rather than fail the batch.
+    /// Queue one op on the ring, or answer it on the posix path when the ring cannot take it
     fn stage(&mut self, op: Op, posix: &PosixBackend, order: u32) -> Option<Completion> {
         let file = match ring_file(&op) {
             Some(file) => file,
@@ -933,8 +811,7 @@ impl Ring {
                 return Some(posix.dispatch(op));
             }
         };
-        // A close anywhere retires the table, and queued entries still name its
-        // slots, so they go over while the table they were built against stands.
+        // A close makes the table stale. Flush entries that use its slots, then clear it
         if self.files.is_stale(posix) {
             self.flush();
             let generation = posix.close_generation();
@@ -948,9 +825,7 @@ impl Ring {
             }
         };
 
-        // The submission is built against the slot the op is about to take, since a
-        // vectored one points at that slot's iovec list, and the record goes in
-        // before the entry because the kernel may complete the moment it does.
+        // A vectored op points at its slot's iovec list, so build against the next free slot
         let at = self.inflight.next_free();
         let built = match self.is_direct {
             true => build_staged(target, op, &mut self.buffers),
@@ -958,8 +833,7 @@ impl Ring {
         };
         let (entry, pending) = match built {
             Ok(built) => built,
-            // The pool cannot serve this one, so it goes where every direct op went
-            // before there was a pool.
+            // The pool cannot serve this op, so it goes to the posix path
             Err(op) => {
                 self.doors.note_off_ring(1);
                 return Some(posix.dispatch(op));
@@ -970,18 +844,13 @@ impl Ring {
         let entry = entry.user_data(user_data);
 
         loop {
-            // A full submission queue is not an error, only a queue that has to go
-            // to the kernel before it can take more.
-            //
-            // SAFETY: the entry names buffers held for the whole flight, either the
-            // caller's own or a registered buffer the record holds.
+            // SAFETY: the entry's buffers live in the record or the pool for the whole flight
             if unsafe { self.ring.submission().push(&entry) }.is_ok() {
                 self.queued.push(user_data);
                 return None;
             }
             if !self.flush() {
-                // The entry never reached the queue, so the record is taken back and
-                // answered rather than left waiting for a completion that cannot come.
+                // The entry never reached the queue, so answer its record with an error
                 let taken = self.inflight.take(user_data);
                 return taken.map(|(_, pending)| pending.complete(-libc::EIO, &mut self.buffers));
             }
@@ -1011,8 +880,7 @@ impl Ring {
             .build()
             .user_data(KICK_TAG);
         loop {
-            // SAFETY: the poll names a descriptor the inbox owns for as long as the
-            // engine thread runs, and no buffer at all.
+            // SAFETY: the poll has no buffer, and its eventfd outlives the engine thread
             if unsafe { self.ring.submission().push(&entry) }.is_ok() {
                 break;
             }
@@ -1033,30 +901,23 @@ impl Ring {
         };
         kick.is_armed = is_still_armed;
         let mut ticks = [0u8; 8];
-        // SAFETY: an ffi read of the eight bytes an eventfd counter holds.
+        // SAFETY: an ffi read of the eight bytes an eventfd counter holds
         let _ = unsafe { libc::read(kick.fd, ticks.as_mut_ptr().cast(), ticks.len()) };
     }
 }
 
-/// What every thread's ring for one backend is built from
-///
-/// Behind an Arc because the engine thread owns a ring of its own, and a thread
-/// holding a ring for a closed volume drops it the next time it looks.
+/// Shared settings every thread's ring for one backend is built from
 struct Core {
     posix: Arc<PosixBackend>,
     tuning: RingTuning,
 
-    /// The completion mode this kernel took, settled once for every thread's ring
     taskrun: TaskRun,
 
     is_direct: bool,
     doors: Arc<DoorTally>,
 }
 
-/// Ops that reached a ring against ops that went to posix instead
-///
-/// Every fall-through is silent by design, which is fine until a leg reports a
-/// ring number it never took.
+/// Which doors this volume's ops took, and what the kernel refused
 #[derive(Default)]
 struct DoorTally {
     reached_ring: AtomicBool,
@@ -1067,35 +928,31 @@ struct DoorTally {
 }
 
 impl DoorTally {
-    /// One op went on a ring
-    ///
-    /// A load first, so the line stays shared once the flag is up and the hot
-    /// path pays a predictable branch rather than a store per op.
+    /// Note one op went on a ring, loading first so the cache line stays shared
     fn note_ring(&self) {
         if !self.reached_ring.load(Ordering::Relaxed) {
             self.reached_ring.store(true, Ordering::Relaxed);
         }
     }
 
-    /// Ops that took another door
+    /// Note ops that took another door
     fn note_off_ring(&self, ops: usize) {
         self.off_ring.fetch_add(ops as u64, Ordering::Relaxed);
     }
 
-    /// A thread's pool was refused by the kernel
+    /// Note that the kernel refused a thread's pool
     fn note_pool_refused(&self) {
         if !self.pool_refused.load(Ordering::Relaxed) {
             self.pool_refused.store(true, Ordering::Relaxed);
         }
     }
 
-    /// A spinning wait gave up and slept instead, which reads as the ring's completion
-    /// mode and its wait no longer agreeing
+    /// Note that a spinning wait gave up and slept
     fn note_spun_out(&self) {
         self.spun_out.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A ring's sparse file table was refused by the kernel
+    /// Note that the kernel refused a ring's sparse file table
     fn note_files_refused(&self) {
         if !self.files_refused.load(Ordering::Relaxed) {
             self.files_refused.store(true, Ordering::Relaxed);
@@ -1113,32 +970,26 @@ impl DoorTally {
 }
 
 thread_local! {
-    /// Rings this thread owns, one for each backend it has submitted to
-    ///
-    /// A ring belongs to the thread that built it, so nothing locks one. An entry
-    /// whose backend has been dropped goes the next time this thread looks.
+    /// This thread's rings, one per backend it has submitted to
     static RINGS: RefCell<Vec<Owned>> = const { RefCell::new(Vec::new()) };
 }
 
-/// One thread's ring for one backend, named by the core it was built from
+/// One thread's ring for one backend, keyed by the core it was built from
 struct Owned {
     core: Weak<Core>,
     ring: Ring,
 }
 
-/// Ops handed to the engine thread, each moved into a slot the inbox already owns
-///
-/// The driver claims a completion slot before it submits, so a push that finds no
-/// room is a caller that submitted without claiming.
+/// Ops waiting for the engine thread, plus the eventfd that wakes it
 struct Inbox {
-    /// The ops waiting for the engine thread, and what it is doing about them
+    /// The ops waiting for the engine thread, and its state
     queue: Mutex<Queue>,
 
     /// Written to wake the engine thread out of its ring's wait
     kick: OwnedFd,
 }
 
-/// The ops waiting for the engine thread and what it is doing about them
+/// A circular queue of ops waiting for the engine thread, and the thread's state
 struct Queue {
     /// One slot per op the driver can have claimed, so a push never allocates
     slots: Vec<Option<Op>>,
@@ -1146,16 +997,16 @@ struct Queue {
     /// Where the next take comes from
     head: usize,
 
-    /// How many slots from the head are carrying an op
+    /// How many slots from the head hold an op
     len: usize,
 
-    /// Whether the engine thread is in its ring's wait rather than working
+    /// Whether the engine thread is parked in its ring's wait
     is_parked: bool,
 
     /// Whether the engine thread has been asked to stop
     is_stopping: bool,
 
-    /// Whether the engine thread gave up, so a later caller is told rather than queued
+    /// Whether the engine thread gave up, so later callers get an error
     is_failed: bool,
 }
 
@@ -1176,12 +1027,12 @@ impl Queue {
         }
     }
 
-    /// Slots carrying nothing
+    /// Free slots
     fn room(&self) -> usize {
         self.slots.len() - self.len
     }
 
-    /// Move one op into the slot behind the last
+    /// Add one op behind the last
     fn push(&mut self, op: Op) {
         let at = (self.head + self.len) % self.slots.len();
         self.slots[at] = Some(op);
@@ -1201,14 +1052,14 @@ impl Queue {
 }
 
 impl Inbox {
-    /// An inbox with an eventfd of its own, or why the kernel would not give one
+    /// An inbox with its own eventfd, or the error from creating it
     fn new() -> Result<Inbox> {
-        // SAFETY: an ffi call taking two integers and answering with a descriptor.
+        // SAFETY: an ffi call that takes two integers and returns a descriptor
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if fd < 0 {
             return Err(ReelError::Io(std::io::Error::last_os_error()));
         }
-        // SAFETY: the descriptor is fresh from the kernel and owned by nothing else.
+        // SAFETY: the descriptor is fresh from the kernel and owned by nothing else
         let kick = unsafe { OwnedFd::from_raw_fd(fd) };
         Ok(Inbox {
             queue: Mutex::new(Queue::new()),
@@ -1221,7 +1072,7 @@ impl Inbox {
         self.kick.as_raw_fd()
     }
 
-    /// Hand the engine a whole batch, which costs one kick however wide it is
+    /// Hand the engine a whole batch with at most one kick
     fn hand(&self, ops: Vec<Op>) -> Result<()> {
         let should_kick = {
             let mut queue = lock(&self.queue);
@@ -1242,7 +1093,7 @@ impl Inbox {
         }
     }
 
-    /// Hand the engine one op, taking the lock and the kick once as a batch does
+    /// Hand the engine one op with at most one kick
     fn hand_one(&self, op: Op) -> Result<()> {
         let should_kick = {
             let mut queue = lock(&self.queue);
@@ -1264,14 +1115,12 @@ impl Inbox {
     /// Wake the engine thread out of its ring's wait
     fn kick(&self) -> Result<()> {
         let tick = 1u64.to_ne_bytes();
-        // SAFETY: an ffi write of exactly the eight bytes an eventfd counter takes,
-        // from a buffer of that width.
+        // SAFETY: an ffi write of eight bytes from an eight-byte buffer to an eventfd
         let written =
             unsafe { libc::write(self.kick.as_raw_fd(), tick.as_ptr().cast(), tick.len()) };
         if written < 0 {
             let error = std::io::Error::last_os_error();
-            // A counter that will not take another tick already has one pending,
-            // which is the wake this was asking for.
+            // A full counter already has a wake pending
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 return Ok(());
             }
@@ -1297,12 +1146,12 @@ impl Inbox {
         true
     }
 
-    /// Say the engine is working again
+    /// Mark the engine as working again
     fn unpark(&self) {
         lock(&self.queue).is_parked = false;
     }
 
-    /// Say the engine gave up, so nothing else is queued for it
+    /// Mark the engine failed, so nothing more is queued for it
     fn fail(&self) {
         lock(&self.queue).is_failed = true;
     }
@@ -1322,10 +1171,7 @@ struct Engine {
 }
 
 impl Engine {
-    /// Start the engine thread, or report why it could not take a ring
-    ///
-    /// The ring is built on the thread that will own it, since SINGLE_ISSUER binds
-    /// a ring to its creating task, so the outcome comes back over a channel.
+    /// Start the engine thread, which builds its own ring and reports back over a channel
     fn start(core: &Arc<Core>, sink: &Arc<SlotTable>, shard: usize) -> Result<Engine> {
         let inbox = Arc::new(Inbox::new()?);
         let (opened, answer) = channel();
@@ -1349,7 +1195,7 @@ impl Engine {
         }
     }
 
-    /// Hand the engine a batch, which costs one kick however wide it is
+    /// Hand the engine a batch with at most one kick
     fn hand(&self, ops: Vec<Op>, sink: &Arc<SlotTable>) -> Result<()> {
         debug_assert!(
             Arc::ptr_eq(&self.sink, sink),
@@ -1358,7 +1204,7 @@ impl Engine {
         self.inbox.hand(ops)
     }
 
-    /// Hand the engine one op, the awaited door's own arm
+    /// Hand the engine one op, for the awaited door
     fn hand_one(&self, op: Op, sink: &Arc<SlotTable>) -> Result<()> {
         debug_assert!(
             Arc::ptr_eq(&self.sink, sink),
@@ -1378,10 +1224,7 @@ impl Drop for Engine {
     }
 }
 
-/// Run one ring for every caller that has no thread to run one with
-///
-/// The inbox's poll sits on the same ring, so the park is the only place the loop
-/// sleeps and either side wakes it.
+/// Run one ring for every caller with no thread of its own
 fn serve(core: Arc<Core>, inbox: Arc<Inbox>, sink: Arc<SlotTable>, opened: Sender<Result<()>>) {
     let mut ring = match Ring::new(&core) {
         Ok(ring) => ring,
@@ -1427,9 +1270,6 @@ fn serve(core: Arc<Core>, inbox: Arc<Inbox>, sink: Arc<SlotTable>, opened: Sende
 }
 
 /// Put a batch on the engine's ring, answering off ring ops on the engine thread
-///
-/// An op the kernel has to block to serve runs here rather than on the caller, so
-/// the async door's promise holds for every op it takes.
 fn deliver(
     ring: &mut Ring,
     ops: &mut Vec<Op>,
@@ -1453,10 +1293,7 @@ fn deliver(
     ring.inflight.take_free(drained);
 }
 
-/// Wait until the slab has a free slot, taking what lands for the batch on the way
-///
-/// What is queued goes over inside the wait rather than in front of it, since both
-/// the sleep and the spin hand the entries to the kernel on their own.
+/// Wait until the ring has room, taking what lands for the batch on the way
 fn make_room(ring: &mut Ring, filled: &mut [Option<Completion>]) -> usize {
     let mut taken = 0;
     while ring.is_full() {
@@ -1470,17 +1307,13 @@ fn make_room(ring: &mut Ring, filled: &mut [Option<Completion>]) -> usize {
 }
 
 /// Run a whole batch on this thread's ring and answer it in submit order
-///
-/// The thread that submits is the thread that waits and reaps: no lock, no
-/// handoff, no completion delivered to a thread that did not ask for it.
 fn run_batch(ring: &mut Ring, ops: &mut Vec<Op>, posix: &PosixBackend, out: &mut Vec<Completion>) {
     let mut filled: Vec<Option<Completion>> = Vec::new();
     filled.resize_with(ops.len(), || None);
     let mut outstanding = 0usize;
 
     for (order, op) in ops.drain(..).enumerate() {
-        // A ring with more out than its completion queue can report can lose one, so
-        // a full slab waits rather than growing.
+        // More ops in flight than the completion queue holds could lose one, so wait for room
         outstanding = outstanding.saturating_sub(make_room(ring, &mut filled));
         match ring.stage(op, posix, order as u32) {
             Some(completion) => filled[order] = Some(completion),
@@ -1548,15 +1381,11 @@ pub struct UringBackend {
 }
 
 thread_local! {
-    /// This thread's place in the engine fan-out, taken once and kept
-    ///
-    /// A thread keeps its shard for life, so one engine's descriptor table stays
-    /// warm. Arrival order rather than hashing puts the first N threads on N
-    /// distinct engines.
+    /// This thread's shard, taken in arrival order on first use and kept for life
     static SHARD: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
-/// Shards handed out so far, which is the next caller's place in the fan-out
+/// How many threads have taken a shard so far
 static SHARDS_TAKEN: AtomicUsize = AtomicUsize::new(0);
 
 /// The shard this thread submits through, taken on its first async submit
@@ -1574,17 +1403,12 @@ fn shard_of(count: usize) -> usize {
     })
 }
 
-/// Build one ring under one completion mode
-///
-/// A setup the kernel refuses is reported rather than retried, so an operator
-/// finds out that the volume is not on a ring.
+/// Build one ring under one completion mode, or return the kernel's error
 fn ring_under(taskrun: TaskRun) -> Result<IoUring> {
     let mut builder = IoUring::builder();
-    // The kernel clamps an oversized request rather than refusing it, so asking past
-    // the limit is how a ring ends up as deep as the machine allows.
+    // The kernel clamps an oversized ring size to its limit
     builder.setup_clamp();
-    // A ring belongs to the thread that built it, so the deferred mode below can rest
-    // on the promise this flag makes.
+    // Each ring has one submitting thread, which the deferred mode requires
     builder.setup_single_issuer();
     match taskrun {
         TaskRun::Deferred => {
@@ -1595,18 +1419,14 @@ fn ring_under(taskrun: TaskRun) -> Result<IoUring> {
         }
         TaskRun::Interrupt => {}
     }
-    // Both modes leave the work queued rather than run, so the ring has to say when
-    // it is holding some or a thread reading its own queue would read an old one.
+    // Both modes queue completion work, so the ring flags when some is pending
     if taskrun.is_asked_for() {
         builder.setup_taskrun_flag();
     }
     builder.build(RING_ENTRIES).map_err(ReelError::Io)
 }
 
-/// Build one ring under the best completion mode this kernel will take
-///
-/// A refusal is one errno with nothing in it naming the flag, so the step down is by
-/// trial: a kernel too old for deferred work gets cooperative, then plain.
+/// Build one ring under the best completion mode the kernel accepts, stepping down on refusal
 fn build_ring(wanted: TaskRun) -> Result<(IoUring, TaskRun)> {
     let mut refused = None;
     for &taskrun in wanted.and_below() {
@@ -1637,23 +1457,17 @@ impl std::fmt::Debug for UringBackend {
 
 impl UringBackend {
     /// Build a ring backend, or report why the ring could not be set up
-    ///
-    /// Rings are built by the threads that own them, so this one setup proves the
-    /// kernel takes the tuning at all rather than failing on the first put.
     pub fn new(is_direct: bool, tuning: RingTuning) -> Result<UringBackend> {
-        // The mode settles here rather than per ring, so a kernel that refuses the
-        // one asked for is found out once instead of by every thread in turn.
+        // Settle the completion mode once, so every thread's ring uses what the kernel accepted
         let (probe, taskrun) = build_ring(tuning.taskrun)?;
         drop(probe);
-        // One engine per thread the machine can run, which is where an async caller
-        // lands: a machine that will not say its width gets one.
+        // One engine shard per hardware thread, or one if the count is unknown
         let shards = std::thread::available_parallelism()
             .map(|width| width.get())
             .unwrap_or(1);
         Ok(UringBackend {
             core: Arc::new(Core {
-                // The descriptor table is the inner backend's, so a direct volume's
-                // opens carry the flag from here.
+                // The inner backend opens every file, so it gets the direct flag here
                 posix: Arc::new(PosixBackend::with_direct(is_direct)),
                 tuning,
                 taskrun,
@@ -1664,23 +1478,17 @@ impl UringBackend {
         })
     }
 
-    /// Ops the posix path under this ring has answered
+    /// Ops the posix backend under this ring has answered
     pub fn ops(&self) -> u64 {
         self.core.posix.ops()
     }
 
-    /// Spinning waits on this volume that gave up and slept instead
-    ///
-    /// Zero is the working answer; anything else is a spin that asked a queue no
-    /// completion could reach.
+    /// How many spinning waits on this volume gave up and slept
     pub fn spin_outs(&self) -> u64 {
         self.core.doors.spun_out.load(Ordering::Relaxed)
     }
 
-    /// Run something against this thread's ring, building it the first time
-    ///
-    /// A thread that cannot build a ring is handed nothing and answers on the posix
-    /// path.
+    /// Run something on this thread's ring, building it first, or with None if that fails
     fn on_ring<Out>(&self, act: impl FnOnce(Option<&mut Ring>) -> Out) -> Out {
         RINGS.with(|held| {
             let mut held = held.borrow_mut();
@@ -1720,9 +1528,6 @@ impl UringBackend {
     }
 
     /// This thread's engine, started the first time a caller lands on its shard
-    ///
-    /// A deployment that never takes the async door starts none, and one that takes
-    /// it from four threads starts four rather than the fan-out's whole width.
     fn engine(&self, sink: &Arc<SlotTable>) -> Result<&Engine> {
         let shard = shard_of(self.engines.len());
         let held = &self.engines[shard];
@@ -1730,27 +1535,19 @@ impl UringBackend {
             return Ok(engine);
         }
         let started = Engine::start(&self.core, sink, shard)?;
-        // Two callers can arrive at once and only one engine is kept. The loser's
-        // thread is stopped by the drop of the value the set hands back.
+        // Two callers can race here. Dropping the loser's engine stops its thread
         drop(held.set(started));
         held.get().ok_or_else(engine_gone)
     }
 
-    /// Whether this volume's data ops go on a ring at all
-    ///
-    /// A direct volume's ops fly through the ring's registered buffers, since a
-    /// direct descriptor refuses the caller's own. An operator who turns those off
-    /// closes the door here rather than having every op walk in to be handed back.
+    /// Whether data ops use the ring, which a direct volume does only with registered buffers
     fn takes_ring(&self) -> bool {
         !self.core.is_direct || self.core.tuning.registered_buffers
     }
 }
 
 impl ReelIo for UringBackend {
-    /// A ring, told apart by the descriptors its core opened
-    ///
-    /// This backend only exists when `UringBackend::new` set a ring up, so
-    /// answering ring here cannot outlive the ring it names.
+    /// A ring, direct when its descriptors bypass the page cache
     fn serving(&self) -> ServingBackend {
         match self.core.is_direct {
             true => ServingBackend::RingDirect,
@@ -1758,29 +1555,22 @@ impl ReelIo for UringBackend {
         }
     }
 
-    /// Which door this volume's ops took, which a ring leg has to be able to ask
+    /// Which doors this volume's ops took
     fn door_counts(&self) -> DoorCounts {
         self.core.doors.counts()
     }
 
-    /// Flushes this volume asked the drive for, counted where they are issued
-    ///
-    /// A ring volume syncs through the inner backend like every other control op,
-    /// so the count lives there and this forwards it.
+    /// Flushes this volume asked the drive for, counted by the inner posix backend
     fn sync_count(&self) -> u64 {
         PosixBackend::sync_count(&self.core.posix)
     }
 
-    /// Nanoseconds spent waiting inside those flushes, from the same place
+    /// Nanoseconds spent waiting inside those flushes, from the inner backend
     fn sync_nanos(&self) -> u64 {
         PosixBackend::sync_nanos(&self.core.posix)
     }
 
-    /// The warm probe reads the descriptor table this backend already shares
-    ///
-    /// The inner backend owns the descriptors every ring op names, so the probe is
-    /// the same non-blocking read of the same file. A direct volume's inner backend
-    /// refuses it, since there is no page cache there to ask.
+    /// Forward the warm probe to the inner backend, which refuses it on a direct volume
     fn warm_split(
         &self,
         file: FileId,
@@ -1807,7 +1597,7 @@ impl ReelIo for UringBackend {
         if !on_ring.is_empty() {
             self.on_ring(|ring| match ring {
                 Some(ring) => queue_batch(ring, on_ring, &self.core.posix),
-                // No ring on this thread, so ops that named one go with the rest.
+                // No ring on this thread, so ring ops join the posix batch
                 None => off_ring.append(&mut on_ring),
             });
         }
@@ -1819,9 +1609,6 @@ impl ReelIo for UringBackend {
     }
 
     /// Service one op on this thread's own ring and hand its completion back
-    ///
-    /// Waiting here is what a ring per thread makes safe: the thread that submitted
-    /// is the thread that waits, and nothing is shared with another.
     fn submit_inline(&self, op: Op) -> std::result::Result<Completion, Op> {
         if !self.takes_ring() || ring_file(&op).is_none() {
             self.core.doors.note_off_ring(1);
@@ -1854,10 +1641,7 @@ impl ReelIo for UringBackend {
         true
     }
 
-    /// Hand a batch to the engine thread, for a caller with no thread of its own
-    ///
-    /// The completions come back through the slot table where the future left its
-    /// waker, so nothing here waits or runs on the caller.
+    /// Hand a batch to the engine thread, which files completions into the slot table
     fn submit_detached(&self, ops: Vec<Op>, sink: &Arc<SlotTable>) -> Result<()> {
         if !self.takes_ring() {
             self.core.doors.note_off_ring(ops.len());
@@ -1867,9 +1651,6 @@ impl ReelIo for UringBackend {
     }
 
     /// Hand the engine one op, which is what the awaited door sends
-    ///
-    /// The inbox takes ops one at a time on the way in either way, so a single op
-    /// goes down its own arm rather than in a vector built to be taken apart.
     fn submit_detached_one(&self, op: Op, sink: &Arc<SlotTable>) -> Result<()> {
         if !self.takes_ring() {
             self.core.doors.note_off_ring(1);
@@ -1889,17 +1670,12 @@ impl ReelIo for UringBackend {
         Ok(drained)
     }
 
-    /// Whether a wait on this volume's rings ever sleeps rather than spinning
-    ///
-    /// A wait sleeps for a read and spins for a write, so it counts as a door that parks.
+    /// Waits on this volume can sleep, since a read in flight makes them park
     fn parks_on_wait(&self) -> bool {
         true
     }
 
-    /// Sleep on this thread's own completion queue rather than asking it in a loop
-    ///
-    /// A thread with nothing outstanding has nothing to sleep for, and a ring that
-    /// owes it nothing would hold the wait forever.
+    /// Wait on this thread's completion queue, skipping the wait when nothing is in flight
     fn poll_blocking(&self, out: &mut Vec<Completion>) -> Result<usize> {
         let drained = self.poll(out)?;
         if drained > 0 {
@@ -1914,21 +1690,13 @@ impl ReelIo for UringBackend {
     }
 }
 
-/// Bytes one ring submission may move
-///
-/// The kernel serves at most this much per call, and a submission is one call with
-/// nothing behind it to issue the rest, so a wider op would come back short and be
-/// taken for a whole one. Those go to the posix backend, which loops.
+/// The most bytes the kernel moves in one call, so wider reads go to the posix backend
 const RING_SPAN_CAP: u64 = 0x7fff_f000;
 
-/// Bytes a write hands the ring before it is worth more as a blocking call
-///
-/// Every write reel issues waits for its own completion, so the ring's part is the
-/// batching, and a write this wide has nothing to batch with. Set to the direct
-/// door's own ceiling, so the two doors agree on what a ring write is.
+/// The widest write the ring takes, matching the direct door's request ceiling
 const RING_WRITE_CAP: u64 = DIRECT_REQUEST_BYTES as u64;
 
-/// Bytes a vectored write hands over across all its buffers
+/// Total bytes across a vectored write's buffers
 fn write_span(bufs: &[WriteBuf]) -> u64 {
     let mut span = 0u64;
     for buf in bufs {
@@ -1937,46 +1705,32 @@ fn write_span(bufs: &[WriteBuf]) -> u64 {
     span
 }
 
-/// The file a ring op works on, or nothing when the op is not one
-///
-/// Only a write and the two reads qualify: an op the kernel has to block to serve
-/// gains nothing but a worker thread holding the same wait.
+/// The op's file if it belongs on the ring, or nothing
 fn ring_file(op: &Op) -> Option<FileId> {
     match op {
-        // A write past the iovec cap is refused whole with EINVAL and a submission
-        // has nowhere to split it, so it goes to posix, which walks it in capped
-        // calls.
+        // The kernel refuses a write past the iovec cap, and posix splits it
         Op::Writev { bufs, .. } if bufs.len() > MAX_IOVECS => None,
         Op::Writev { bufs, .. } if write_span(bufs) > RING_WRITE_CAP => None,
-        Op::Pread { buf, .. } | Op::PreadCold { buf, .. }
-            if buf.wanted() as u64 > RING_SPAN_CAP =>
-        {
-            None
-        }
+        Op::Pread { buf, .. } if buf.wanted() as u64 > RING_SPAN_CAP => None,
         Op::PreadSplit { head, body, .. }
             if (head.wanted() + body.wanted()) as u64 > RING_SPAN_CAP =>
         {
             None
         }
-        Op::Writev { file, .. }
-        | Op::Pread { file, .. }
-        | Op::PreadCold { file, .. }
-        | Op::PreadSplit { file, .. } => Some(*file),
+        Op::Writev { file, .. } | Op::Pread { file, .. } | Op::PreadSplit { file, .. } => {
+            Some(*file)
+        }
         _ => None,
     }
 }
 
-/// Build the submission an op takes and the record that keeps its buffers alive
-///
-/// The buffers move into the record and the ring is handed their addresses through
-/// the slot's iovec list. The user data is stamped on later.
+/// Build an op's submission and the record that keeps its buffers alive
 fn build_entry(
     target: RingTarget,
     op: Op,
     iovecs: &mut IoVecs,
 ) -> (io_uring::squeue::Entry, Pending) {
-    // The opcode builders are generic over how a descriptor is named, so the choice
-    // cannot be handed over as a value and is made at each site.
+    // The opcode builders are generic over the descriptor type, so each site matches on it
     macro_rules! on_target {
         (|$fd:ident| $build:expr) => {
             match target {
@@ -1999,13 +1753,7 @@ fn build_entry(
                 .build());
             (entry, Pending::Wrote { tag, bufs })
         }
-        // The routed read takes the buffered descriptor and ignores the direct one
-        // it carries, which is safe because it reads the descriptor the ring
-        // registered rather than a plane the ring does not know about.
         Op::Pread {
-            tag, offset, buf, ..
-        }
-        | Op::PreadCold {
             tag, offset, buf, ..
         } => {
             let mut buf = buf;
@@ -2038,11 +1786,7 @@ fn build_entry(
     }
 }
 
-/// The span a direct op takes in a registered buffer, or nothing when it takes none
-///
-/// A write is already framed on a boundary, so all it owes the buffer is the
-/// rounding; a read is aligned to nothing and is widened to the blocks that
-/// contain it. A write starting off a boundary is refused rather than staged.
+/// A direct op's span in a registered buffer, or nothing if it cannot be staged
 fn staged_span(op: &Op) -> Option<usize> {
     let (offset, wanted) = match op {
         Op::Writev { offset, bufs, .. } => {
@@ -2052,9 +1796,7 @@ fn staged_span(op: &Op) -> Option<usize> {
             }
             return Some(align_up(total as u64) as usize);
         }
-        Op::Pread { offset, buf, .. } | Op::PreadCold { offset, buf, .. } => {
-            (*offset, buf.wanted())
-        }
+        Op::Pread { offset, buf, .. } => (*offset, buf.wanted()),
         Op::PreadSplit {
             offset, head, body, ..
         } => (*offset, head.wanted() + body.wanted()),
@@ -2067,11 +1809,7 @@ fn staged_span(op: &Op) -> Option<usize> {
     Some(span as usize)
 }
 
-/// Build the submission a direct op takes through one of the ring's own buffers
-///
-/// A write is gathered into a registered buffer before its entry goes in and a
-/// read lands in one and is cut into the caller's on completion. The op comes back
-/// untouched when the pool cannot serve it.
+/// Build a direct op's submission through a registered buffer, or hand the op back
 fn build_staged(
     target: RingTarget,
     op: Op,
@@ -2094,8 +1832,7 @@ fn build_staged(
                 bytes[at..at + held.len()].copy_from_slice(held);
                 at += held.len();
             }
-            // Only the rounding tail is left unwritten and it reaches the device,
-            // so it is the one part that has to be zeroed.
+            // Zero the rounding tail, since it reaches the device too
             bytes[at..span].fill(0);
             let entry = write_fixed(target, buffers.as_ptr(staged), span, staged, offset);
             (
@@ -2109,9 +1846,6 @@ fn build_staged(
             )
         }
         Op::Pread {
-            tag, offset, buf, ..
-        }
-        | Op::PreadCold {
             tag, offset, buf, ..
         } => {
             let (start, _) = covering_span(offset, buf.wanted() as u64);
@@ -2151,10 +1885,7 @@ fn build_staged(
     })
 }
 
-/// A read into a registered buffer, which names the buffer by index not by address
-///
-/// Matched at the site, since the opcode builders are generic over how a
-/// descriptor is named and the choice cannot be handed over as a value.
+/// A read into the registered buffer at this index
 fn read_fixed(
     target: RingTarget,
     buf: *mut u8,
@@ -2172,7 +1903,7 @@ fn read_fixed(
     }
 }
 
-/// A write out of a registered buffer, named the same way
+/// A write out of the registered buffer at this index
 fn write_fixed(
     target: RingTarget,
     buf: *mut u8,
@@ -2190,7 +1921,7 @@ fn write_fixed(
     }
 }
 
-/// The error a negative ring result carries, or nothing when the op succeeded
+/// The error for a negative ring result, or nothing when the op succeeded
 fn ring_error(result: i32) -> Option<ReelError> {
     if result >= 0 {
         return None;
@@ -2279,7 +2010,7 @@ mod tests {
         assert!(Ring::spins_for(&inflight), "the read came back");
     }
 
-    // a refused entry takes the read count it carried back with it
+    // taking back a refused read drops it from the read count
     #[test]
     fn a_taken_back_read_stops_counting() {
         let mut inflight = Inflight::with_capacity(2);
@@ -2329,7 +2060,7 @@ mod tests {
         assert!(kept < 3);
     }
 
-    // the slot is what a completion names, so a full slab is waited on not overrun
+    // the slab reports full at its capacity and frees a slot on take
     #[test]
     fn the_slab_fills_at_its_capacity() {
         let mut inflight = Inflight::with_capacity(2);
@@ -2343,7 +2074,7 @@ mod tests {
         assert!(!inflight.is_full(), "taking one frees the slot it held");
     }
 
-    // the slot named before a vectored op is built is the slot it lands in
+    // the slot next_free reports is the slot the next insert uses
     #[test]
     fn the_named_slot_is_the_one_the_op_takes() {
         let mut inflight = Inflight::with_capacity(3);
@@ -2367,7 +2098,7 @@ mod tests {
         assert!(inflight.take(second).is_some());
     }
 
-    // a completion naming nothing is dropped rather than mistaken for an op
+    // a completion that matches no live op is dropped
     #[test]
     fn an_unknown_completion_names_no_op() {
         let mut inflight = Inflight::with_capacity(1);
@@ -2405,7 +2136,7 @@ mod tests {
         );
     }
 
-    // the inbox wraps rather than grows, and hands ops back in the order given
+    // the inbox wraps around and hands ops back in the order given
     #[test]
     fn the_inbox_wraps() {
         let mut queue = Queue::new();
@@ -2434,7 +2165,7 @@ mod tests {
         assert_eq!(wrapped[0].tag(), Tag(99));
     }
 
-    // an entry the kernel never took is answered with the error, not left waiting
+    // an entry the kernel never took is answered with the error
     #[test]
     fn a_refused_entry_answers_its_op() {
         let mut inflight = Inflight::with_capacity(2);
@@ -2555,16 +2286,14 @@ mod tests {
             buffers.claim(DIRECT_REQUEST_BYTES + 1).is_none(),
             "a span past one device request was staged into a buffer that had room",
         );
-        // The worst offset a record of the staging width can sit at: one byte past
-        // a boundary, so the covering read pays a block at each end. The buffer has
-        // the room and the device would answer it in two, so it goes off the ring.
+        // A staging-width read one byte short of a boundary widens past one request
         let (_, span) = covering_span(DIRECT_ALIGN as u64 - 1, STAGE_BYTES as u64);
         assert_eq!(span as usize, REGISTERED_BUFFER_BYTES, "the widening moved");
         assert!(
             buffers.claim(span as usize).is_none(),
             "a read widened past one request took the ring anyway",
         );
-        // A run the planner capped, which is the widest read that does reach it.
+        // A run at the planner's cap is the widest read that still takes the ring
         let (_, capped) = covering_span(
             DIRECT_ALIGN as u64 - 1,
             (DIRECT_REQUEST_BYTES - DIRECT_ALIGN) as u64,
@@ -2668,7 +2397,7 @@ mod tests {
         }
     }
 
-    // a staged write reports the bytes the caller framed, not the blocks it padded to
+    // a staged write reports the bytes the caller framed, without the padding
     #[test]
     fn a_staged_write_reports_what_it_framed() {
         let mut buffers = Buffers::allocate();
@@ -2700,7 +2429,7 @@ mod tests {
         );
     }
 
-    // a direct read is widened to whole blocks, a write rounded up, and neither else
+    // a direct read widens to whole blocks, an aligned write rounds up, other ops get none
     #[test]
     fn a_staged_span_covers_its_op() {
         let read = Op::Pread {

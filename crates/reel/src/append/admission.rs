@@ -1,25 +1,18 @@
 //! Per-volume in-flight byte budget that bounds admission
-//!
-//! A counting byte-semaphore: a record acquires its bytes and a writer that cannot
-//! acquire blocks, so a stalled device becomes slow acknowledgements rather than an
-//! unbounded queue. Per volume, never per tail and never process global, because the
-//! drain rate that returns permits is a device property.
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::units::ByteCount;
 
-use crate::sync::checked::{AtomicU64, Ordering};
 use crate::sync::tension::{Tension, Wait};
 
 /// A ceiling of zero disables the bound and admits every request immediately
 const UNBOUNDED: u64 = 0;
 
-/// Bytes one volume admits before a writer waits
-///
-/// Wide enough that an ordinary drain never meets it, narrow enough that a stalled
-/// device becomes slow acknowledgements rather than an unbounded queue.
+/// A volume admits this many bytes in flight before a writer waits
 pub const DEFAULT_INFLIGHT_BYTES: u64 = 512 * 1024 * 1024;
 
-/// Counting byte-semaphore bounding the bytes in flight against one volume
+/// A counting byte-semaphore that bounds the bytes in flight against one volume
 pub struct InflightBudget {
     /// The configured byte ceiling, zero for unbounded
     ceiling: u64,
@@ -33,7 +26,7 @@ pub struct InflightBudget {
     /// Every byte ever admitted, monotonic, for rate signals over a window
     admitted: AtomicU64,
 
-    /// The waitlist carrying the writers that had to wait for room
+    /// The waitlist of writers that had to wait for room
     tension: Tension<()>,
 }
 
@@ -55,11 +48,7 @@ impl InflightBudget {
         }
     }
 
-    /// Squeeze the budget to a share of its ceiling, for a volume filling up
-    ///
-    /// The share is of the configured ceiling rather than of whatever is in force, which
-    /// is what stops repeated ticks ratcheting the budget toward nothing. A raise wakes
-    /// the waiters itself, since a volume that stopped writing has no release to give.
+    /// Squeeze the budget to a share of its configured ceiling, for a volume filling up
     pub fn throttle(&self, share: f64) {
         if self.ceiling == UNBOUNDED {
             return;
@@ -80,10 +69,7 @@ impl InflightBudget {
         self.ceiling != UNBOUNDED
     }
 
-    /// Acquire bytes for a record, blocking until the budget has room
-    ///
-    /// A request larger than the whole ceiling waits until the volume is idle and then
-    /// proceeds alone, so an oversized record can never deadlock the budget.
+    /// Acquire bytes for a record, blocking until the budget has room or is idle
     pub fn acquire(&self, bytes: u64) {
         if self.try_acquire(bytes) {
             return;
@@ -91,19 +77,13 @@ impl InflightBudget {
         self.tension.park(|_| self.try_acquire(bytes).then_some(()));
     }
 
-    /// Acquire bytes as a future, for a writer with a worker worth keeping
-    ///
-    /// The same admission the blocking call takes, resolved when the budget has room. It
-    /// is dearer where nothing waits, since every poll takes the gate.
+    /// Acquire bytes as a future that resolves when the budget has room
     pub fn reserve(&self, bytes: u64) -> Wait<'_, (), impl FnMut(&mut ()) -> Option<()> + '_> {
         self.tension
             .wait(move |_: &mut ()| self.try_acquire(bytes).then_some(()))
     }
 
     /// Release bytes a completed record held, waking any waiting writer
-    ///
-    /// The subtraction is unconditional rather than a compare and swap clamping at
-    /// zero, since every release answers an acquire of the same count.
     pub fn release(&self, bytes: u64) {
         let held = self.in_flight.fetch_sub(bytes, Ordering::SeqCst);
         debug_assert!(held >= bytes, "a release answered no acquire");
@@ -146,8 +126,7 @@ impl InflightBudget {
         }
     }
 
-    /// The idle escape is what keeps a throttle a slowdown rather than a stall: however
-    /// far the budget has been squeezed, a writer that finds it empty proceeds.
+    /// An empty budget always admits, so a throttle slows writers and never stalls them
     fn can_admit(&self, in_flight: u64, bytes: u64) -> bool {
         if in_flight == 0 {
             return true;
@@ -156,7 +135,7 @@ impl InflightBudget {
     }
 }
 
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -282,7 +261,7 @@ mod tests {
         assert_eq!(budget.queued_bytes(), ByteCount::from_bytes(0));
     }
 
-    // a throttle takes its share of the configured ceiling, not of the last one
+    // a throttle always takes its share of the configured ceiling
     #[test]
     fn throttle_is_always_a_share_of_the_configured_ceiling() {
         let budget = budget(1000);
@@ -367,7 +346,7 @@ mod tests {
         assert_eq!(budget.queued_bytes(), ByteCount::from_bytes(4096));
     }
 
-    // a stalled device caps the gauge instead of growing memory without bound
+    // a stalled device caps the gauge, so memory stays bounded
     #[test]
     fn stalled_device_caps_gauge() {
         let budget = Arc::new(budget(2048));
@@ -392,7 +371,3 @@ mod tests {
         assert_eq!(budget.queued_bytes(), ByteCount::from_bytes(0));
     }
 }
-
-// Not model-checked: loom treats SeqCst as AcqRel, so it permits the store-then-load
-// reordering across the release decrement and the waiting count, which is the one
-// reordering SeqCst forbids and the only way to lose a wakeup here.

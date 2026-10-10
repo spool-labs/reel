@@ -1,54 +1,35 @@
 //! Free-space pressure tiers, the maintenance reserve, and rate pacing
-//!
-//! Dead bytes are debt, and the pressure model turns that debt into a tier. A hard
-//! fullness ceiling sits one segment below capacity: foreground writes stop at that
-//! ceiling while compaction may still write into the reserve band, so the append-only
-//! deadlock of needing to write in order to free space cannot happen.
+//! Foreground writes stop one reserve below capacity, so compaction always has room to write
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-use crate::sync::checked::{AtomicBool, AtomicU64, Ordering};
 
 use crate::config::CompactRate;
 use crate::sync::lock;
 
-/// Store-wide dead fraction below which the plane defers to hot ingest
+/// The plane defers to hot ingest while the store-wide dead fraction is below this
 const DEFAULT_SOFT_DEAD_FRACTION: f64 = 0.20;
 
-/// Rewrite threshold the escalated tier lowers the base ratio toward
+/// The escalated tier lowers the rewrite threshold to at most this
 const ESCALATED_DEAD_RATIO_FLOOR: f64 = 0.20;
 
-/// Share of the escalation mark the plane holds escalated down to
-///
-/// Without a gap between the mark that escalates and the one that relaxes, a volume
-/// resting on the mark re-decides every tick and moves the rewrite threshold under
-/// whoever is reading it.
+/// Once escalated, the plane stays escalated down to this share of the mark
 const ESCALATION_RELEASE: f64 = 0.75;
 
-/// Reserves' worth of room above the ceiling where writers are slowed, not refused
-///
-/// Stated in reserves so a volume with larger segments gets a proportionally wider
-/// band without a second number to keep in step with the first.
+/// The slowdown band below the ceiling is this many reserves wide
 const SLOWDOWN_RESERVES: u64 = 8;
 
-/// Share of the write budget still admitted at the refusal ceiling itself
-///
-/// Not zero: zero would stall the writers this band exists to merely slow, and
-/// stopping them is the refusal door's job one byte further on.
+/// Writers still get this share of the write budget at the refusal ceiling
 const SLOWDOWN_FLOOR: f64 = 0.05;
 
 /// Nanoseconds in one second, for turning a byte budget into a cadence
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
-/// Bytes in one megabyte, decimal as bandwidth figures are quoted
+/// Bytes in one decimal megabyte, the unit bandwidth is quoted in
 const BYTES_PER_MEGABYTE: u64 = 1_000_000;
 
-/// Stretch of device time one unit of paced maintenance work may hold
-///
-/// Stated in time rather than bytes, since the byte count it stands for is whatever
-/// the rate earns in it, which is what makes a low cap take smaller bites rather than
-/// the same bite less often.
+/// One unit of paced maintenance work may hold the device this long
 const PACE_STEP: Duration = Duration::from_millis(5);
 
 /// What the maintenance plane should do given the current debt and ingest load
@@ -65,9 +46,6 @@ pub enum GcTier {
 }
 
 /// Free-space pressure and the maintenance reserve for one volume
-///
-/// A capacity of zero leaves the volume unbounded, so the reserve gate is dormant and
-/// only the tier and threshold logic apply.
 pub struct GcPressure {
     /// Bytes the volume may hold, or zero when it is unbounded
     capacity_bytes: u64,
@@ -78,7 +56,7 @@ pub struct GcPressure {
     /// Per-segment dead fraction that selects a rewrite outside escalation
     base_dead_ratio: f64,
 
-    /// Store-wide dead fraction the plane escalates at
+    /// The plane escalates at this store-wide dead fraction
     soft_dead_fraction: f64,
 
     /// Whether the plane stands escalated, which `tier` both reads and writes
@@ -86,7 +64,7 @@ pub struct GcPressure {
 }
 
 impl GcPressure {
-    /// A pressure model over a capacity, a one-segment reserve, and a base ratio
+    /// A pressure model over a capacity, a reserve, and a base ratio
     pub fn new(capacity_bytes: u64, reserve_bytes: u64, base_dead_ratio: f64) -> GcPressure {
         GcPressure {
             capacity_bytes,
@@ -102,16 +80,13 @@ impl GcPressure {
         self.capacity_bytes != 0
     }
 
-    /// The ceiling a foreground write is measured against, when there is one
+    /// The foreground write ceiling, when the volume is bounded
     pub fn foreground_ceiling_bytes(&self) -> Option<u64> {
         self.is_bounded()
             .then(|| self.capacity_bytes.saturating_sub(self.reserve_bytes))
     }
 
-    /// The tier the plane runs at for a store-wide dead fraction and ingest state
-    ///
-    /// Escalating and relaxing happen at different marks, so a volume sitting on the
-    /// mark settles on one answer rather than re-deciding every tick.
+    /// Pick the plane's tier from the store-wide dead fraction and ingest state
     pub fn tier(&self, dead_fraction: f64, is_ingest_hot: bool) -> GcTier {
         let mark = match self.is_escalated.load(Ordering::Relaxed) {
             true => self.soft_dead_fraction * ESCALATION_RELEASE,
@@ -129,7 +104,7 @@ impl GcPressure {
         }
     }
 
-    /// Whether a compaction pass should run now rather than defer to hot ingest
+    /// Whether a compaction pass should run now
     pub fn should_compact(&self, dead_fraction: f64, is_ingest_hot: bool) -> bool {
         !matches!(self.tier(dead_fraction, is_ingest_hot), GcTier::Deferred)
     }
@@ -151,19 +126,7 @@ impl GcPressure {
         used_bytes + request_bytes <= ceiling
     }
 
-    /// Whether a compaction write of this size fits, the reserve band included
-    pub fn can_admit_compaction(&self, used_bytes: u64, request_bytes: u64) -> bool {
-        if !self.is_bounded() {
-            return true;
-        }
-        used_bytes + request_bytes <= self.capacity_bytes
-    }
-
-    /// The share of the write budget a foreground writer should be given
-    ///
-    /// One while the volume has room, falling linearly to the floor across the band
-    /// below the refusal ceiling. It is spent by shrinking the in-flight budget rather
-    /// than by delaying anyone, and an unbounded volume is never throttled.
+    /// The share of the write budget a foreground writer gets, falling across the band to the floor
     pub fn foreground_throttle(&self, used_bytes: u64) -> f64 {
         let Some(ceiling) = self.foreground_ceiling_bytes() else {
             return 1.0;
@@ -180,28 +143,15 @@ impl GcPressure {
         let into = (used_bytes - opens_at) as f64 / band as f64;
         1.0 - into * (1.0 - SLOWDOWN_FLOOR)
     }
-
-    /// Whether foreground writes are blocked at the reserve ceiling, the alarm
-    pub fn is_foreground_blocked(&self, used_bytes: u64) -> bool {
-        if !self.is_bounded() {
-            return false;
-        }
-        used_bytes >= self.capacity_bytes.saturating_sub(self.reserve_bytes)
-    }
 }
 
-/// Byte-rate pacing for the maintenance plane
-///
-/// The bytes are device traffic, read plus write, not the bytes a pass reclaims.
+/// Byte-rate pacing for the maintenance plane, counting device reads plus writes
 pub struct RateLimiter {
     target_mbps: u64,
 }
 
 impl RateLimiter {
     /// A limiter for the compaction rate, where zero and auto are unpaced
-    ///
-    /// There is no default cap: an uncapped pass runs at device speed only while there
-    /// is debt to drain, and a volume wanting maintenance held back names a number.
     pub fn for_compaction(rate: CompactRate) -> RateLimiter {
         let target_mbps = match rate {
             CompactRate::Auto => 0,
@@ -210,11 +160,7 @@ impl RateLimiter {
         RateLimiter { target_mbps }
     }
 
-    /// A limiter for the scrub rate, or nothing when the scrub is disabled
-    ///
-    /// Held at or below a named compaction rate, since an integrity sweep must never
-    /// outbid space reclamation. An unpaced compaction rate names no bid to protect, so
-    /// the scrub keeps its own rate rather than inheriting unpaced.
+    /// A limiter for the scrub rate, capped at a set compaction rate, or nothing when disabled
     pub fn for_scrub(scrub_mbps: u64, compact_mbps: u64) -> Option<RateLimiter> {
         if scrub_mbps == 0 {
             return None;
@@ -248,12 +194,7 @@ impl RateLimiter {
     }
 }
 
-/// A gate that stays shut for as long as the work already done owes at its rate
-///
-/// Whether a pass may start is asked and never waited on, since the caller drives
-/// maintenance on a thread carrying other work. Inside a pass the thread is already
-/// the plane's, and the meter consults the gate step by step so that one pass does not
-/// own the device from end to end.
+/// A gate that stays shut until the work already done is paid for at its rate
 pub struct RateGate {
     limiter: RateLimiter,
     ready_at: Mutex<Option<Instant>>,
@@ -271,11 +212,6 @@ impl RateGate {
         }
     }
 
-    /// The resolved rate in megabytes per second
-    pub fn target_mbps(&self) -> u64 {
-        self.limiter.target_mbps()
-    }
-
     /// Whether the rate allows another pass to start now
     pub fn is_open(&self) -> bool {
         match *lock(&self.ready_at) {
@@ -285,11 +221,6 @@ impl RateGate {
     }
 
     /// Bytes the rate earned since the last pass ended, capped, and the stretch they cover
-    ///
-    /// A pass bounded by a fixed size would run at the caller's cadence rather than at
-    /// the configured rate, so asking time what it owes is what makes the rate decide.
-    /// A pass earns nothing from its own runtime, or one slower than its rate would
-    /// hand the next a longer stretch every time.
     pub fn allowance(&self, cap: Duration) -> (u64, Duration) {
         let idle = Instant::now()
             .saturating_duration_since(*lock(&self.ran_at))
@@ -302,16 +233,7 @@ impl RateGate {
         *lock(&self.ran_at) = Instant::now();
     }
 
-    /// Charge the gate for bytes moved since a moment, shutting it for what they owe
-    ///
-    /// Debt accumulates: a charge landing while the gate is already shut pushes the
-    /// reopening out rather than replacing it, or a drain loop retiring many segments
-    /// would owe only the last of them.
-    ///
-    /// The moment the charged work began is what makes the target the achieved rate,
-    /// since charging from now hands the mover its own runtime for free. And a charge
-    /// never earns credit from before the work it charges for, so a plane left quiet
-    /// banks nothing.
+    /// Charge the gate for bytes moved since a moment, adding to any debt still standing
     pub fn charge_from(&self, since: Instant, bytes: u64) {
         let owed = self.limiter.cadence(bytes);
         if owed.is_zero() {
@@ -325,11 +247,7 @@ impl RateGate {
         *ready_at = Some(standing + owed);
     }
 
-    /// Hold the caller until the rate lets the next unit of work start
-    ///
-    /// For a caller already inside a pass, where the alternative to waiting is owning
-    /// the device until the pass ends. A caller deciding whether to begin one asks
-    /// whether the gate is open and goes and does something else.
+    /// Sleep until the rate lets the next unit of work start, for callers inside a pass
     pub fn wait_until_open(&self) {
         loop {
             let owed = match *lock(&self.ready_at) {
@@ -355,11 +273,6 @@ impl RateGate {
 }
 
 /// One pass's running account with its rate gate
-///
-/// The meter charges what the pass has moved as it moves it and waits out the last step
-/// before the next one starts, so the rate binds inside a pass and the device is held in
-/// step-sized bites. An unpaced gate earns nothing in a step, so the meter is then a
-/// comparison and a return.
 pub struct PassPace<'gate> {
     /// The gate this pass charges as it moves bytes
     gate: &'gate RateGate,
@@ -376,17 +289,11 @@ pub struct PassPace<'gate> {
 
 impl PassPace<'_> {
     /// Bytes one step may move, zero when the gate is unpaced
-    ///
-    /// A caller that cannot get its own unit of work under the step charges what it
-    /// moved and the gate waits the difference out.
     pub fn step_bytes(&self) -> u64 {
         self.step_bytes
     }
 
-    /// Wait out the step before, then charge the gate for what the pass has moved
-    ///
-    /// The count is the pass's running total rather than a delta, so a caller reading a
-    /// counter sums nothing and cannot double-charge by asking twice.
+    /// Wait out the last step, then charge for the pass's running total of moved bytes
     pub fn reached(&mut self, moved: u64) {
         if self.step_bytes == 0 {
             return;
@@ -402,9 +309,6 @@ impl PassPace<'_> {
     }
 
     /// Charge whatever the pass moved past its last step, without waiting for it
-    ///
-    /// The tail of a pass is left standing on the gate rather than slept off inside it,
-    /// so the debt it leaves is what holds the next pass back.
     pub fn settle(&mut self, moved: u64) {
         let fresh = moved.saturating_sub(self.charged);
         self.charged = moved;
@@ -414,9 +318,6 @@ impl PassPace<'_> {
 }
 
 /// How many segment rewrites may be under way at once
-///
-/// A counter rather than a mutex: each pass claims its own segment, so what has to be
-/// bounded is how many run together. Entry is tried and never queued for.
 pub struct PassPlane {
     running: AtomicU64,
     width: u64,
@@ -431,7 +332,7 @@ impl PassPlane {
         }
     }
 
-    /// Places the plane admits at once, for a caller that wants all of them
+    /// How many passes the plane admits at once
     pub fn width(&self) -> usize {
         self.width as usize
     }
@@ -479,8 +380,6 @@ mod tests {
         assert_eq!(bounded.foreground_ceiling_bytes(), Some(900));
         assert!(bounded.can_admit_foreground(800, 100));
         assert!(!bounded.can_admit_foreground(800, 101));
-        // compaction may spend the reserve, which is what the reserve is for
-        assert!(bounded.can_admit_compaction(900, 100));
     }
 
     // escalating and relaxing happen at different marks, so the tier settles
@@ -522,7 +421,7 @@ mod tests {
         }
     }
 
-    // deciding twice in one pass is what the two callers do, and it is stable
+    // asking twice in one pass gives the same answer
     #[test]
     fn asking_twice_in_one_pass_answers_the_same() {
         let pressure = GcPressure::new(0, 0, 0.5);
@@ -572,7 +471,7 @@ mod tests {
         }
     }
 
-    // slowing is a region before refusing, so the two doors cannot swap places
+    // writers are slowed before they are refused
     #[test]
     fn writers_are_slowed_before_they_are_refused() {
         let bounded = GcPressure::new(1000, 100, 0.5);
@@ -633,26 +532,13 @@ mod tests {
         assert_eq!(pressure.effective_dead_ratio(0.40, false), 0.20);
     }
 
-    // foreground stops at the reserve ceiling while compaction writes into it
-    #[test]
-    fn reserve_admits_only_compaction() {
-        let pressure = pressure();
-        let at_ceiling = 900;
-
-        assert!(!pressure.can_admit_foreground(at_ceiling, 50));
-        assert!(pressure.is_foreground_blocked(at_ceiling));
-        assert!(pressure.can_admit_compaction(at_ceiling, 50));
-        assert!(!pressure.can_admit_compaction(at_ceiling, 200));
-    }
-
-    // an unbounded volume never blocks either plane
+    // an unbounded volume never refuses a foreground write
     #[test]
     fn unbounded_admits_all() {
         let pressure = GcPressure::new(0, 100, 0.50);
 
         assert!(!pressure.is_bounded());
         assert!(pressure.can_admit_foreground(u64::MAX / 2, 4096));
-        assert!(!pressure.is_foreground_blocked(u64::MAX / 2));
     }
 
     // a zero scrub rate disables the scrub limiter
@@ -667,7 +553,7 @@ mod tests {
         );
     }
 
-    // the scrub never outbids a named compaction cap
+    // the scrub never outbids a set compaction cap
     #[test]
     fn scrub_held_under_compaction() {
         assert_eq!(
@@ -784,9 +670,7 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(elapsed >= Duration::from_millis(90), "the passes ran free");
-        // Judge the gate on what it added, not on how far a loaded machine
-        // oversleeps: the old law charged the pass its own runtime again and
-        // would add about a hundred milliseconds here.
+        // Check only the wait the gate added, since a loaded machine oversleeps
         let gate_wait = elapsed.saturating_sub(slept);
         assert!(
             gate_wait < Duration::from_millis(60),
@@ -794,7 +678,7 @@ mod tests {
         );
     }
 
-    // a paced pass consults its gate as it runs rather than only at its end
+    // a paced pass consults its gate as it runs
     #[test]
     fn a_pass_paces_itself() {
         const STEPS: u64 = 4;
@@ -829,7 +713,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(5));
     }
 
-    // the tail of a pass is left owed on the gate rather than slept off inside it
+    // the tail of a pass is left owed on the gate
     #[test]
     fn a_settled_tail_shuts_the_gate() {
         let gate = RateGate::new(RateLimiter::for_compaction(CompactRate::Mbps(1)));

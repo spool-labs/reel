@@ -1,9 +1,4 @@
-//! Crash behaviour with no device: a fault plan, a simulated volume, a reopen
-//!
-//! The plan tears one append so the device keeps a header and drops the payload,
-//! then refuses the next one for want of space. The image taken afterwards is what
-//! a power cut would have left, and reopening from it shows the durable prefix
-//! whole, the torn record gone, and the refused record never there.
+//! Crash behaviour on a simulated device: a torn append, a refused one, then a reopen
 //!
 //! cargo run --example simulated_crash
 
@@ -15,8 +10,8 @@ use reel::format::record::HEADER_LEN;
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, MapShape,
-    Preallocate, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget,
 };
 use reel_core::Value;
 
@@ -29,41 +24,34 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 2,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
-/// Virtual root the simulated files live under, since no directory is touched
+/// The simulated files live under this virtual root, so no real directory is touched
 const ROOT: &str = "/bulk";
 
 const KEY_LEN: usize = 16;
 const PAYLOAD_LEN: usize = 512;
 
-/// Records the run writes, and the two the plan singles out
+/// The run writes this many records, and the plan targets the last two
 const RECORD_COUNT: u32 = 8;
 const TORN_RECORD: u32 = 6;
 const REFUSED_RECORD: u32 = 7;
 
-/// Global op positions the two faulted appends execute at
-///
-/// A plan pins faults to op positions rather than calls, so these are read off a run:
-/// at one tail syncing every put, they are the last two records' writes.
-const TORN_AT: u64 = 19;
-const ENOSPC_AT: u64 = 21;
+/// Op positions of the last two records' writes, with one tail syncing every put
+const TORN_AT: u64 = 26;
+const ENOSPC_AT: u64 = 29;
 
-/// Payload bytes that survive the tear, behind the header that describes them
+/// The tear keeps the header and this many payload bytes
 const TORN_PAYLOAD_BYTES: u64 = 8;
 
-/// Seed the plan reproduces from
+/// The fault plan's seed
 const SEED: u64 = 1;
 
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(1),
-        alloc_chunk: ByteCount::from_bytes(64 * 1024),
-        preallocate: Preallocate::Chunk,
-        sync: SyncPolicy::EveryPut,
+        sync: SyncPolicy::Bytes(ByteCount::from_bytes(0)),
         active_tails: ThreadBudget::threads(1),
-        index: IndexResidency::Resident,
         ..ReelConfig::default()
     }
 }
@@ -101,8 +89,7 @@ fn main() -> reel::Result<()> {
         }
     }
 
-    // A torn append reports the whole write, so the volume counts a record the device
-    // kept only the head of.
+    // A torn append still reports success, so the volume counts that record as live
     assert_eq!(
         refused,
         vec![REFUSED_RECORD],
@@ -114,8 +101,7 @@ fn main() -> reel::Result<()> {
         store.totals().count
     );
 
-    // Power cut: nothing closed, nothing flushed, so the image is what the medium
-    // holds at this instant.
+    // Power cut: nothing is closed or flushed, so the image is what the medium holds now
     let image = sim.durable_image();
     drop(store);
 

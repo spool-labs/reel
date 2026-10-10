@@ -1,8 +1,4 @@
 //! Owned file operations and their completions for the ring-shaped I/O trait
-//!
-//! Every op owns the buffers it carries and echoes a tag its completion returns,
-//! so a completion backend can move ops through a real ring while a synchronous
-//! backend services them in place, and neither borrows a caller buffer.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,30 +10,11 @@ use crate::format::record::{RecordPrefix, PREFIX_CAP};
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Tag(pub u64);
 
-/// Handle to an open file, returned by an open and named by later ops
+/// Handle to an open file, returned by an open and used by later ops
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FileId(pub u64);
 
-/// Which plane answers one window of a large record
-///
-/// A descriptor carries O_DIRECT or it does not, so a read that may go around the
-/// page cache names a second descriptor on the same file rather than a flag.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ColdRoute {
-    /// The buffered read the volume has always done
-    Cached,
-
-    /// Ask the page cache first and go around it only when the pages are absent
-    Probed(FileId),
-
-    /// Go around the page cache without asking
-    Direct(FileId),
-}
-
 /// Whether an awaited whole-record read asks the page cache before it queues
-///
-/// One descriptor either way, so this picks only whether the future's first poll
-/// issues a non-blocking read before anything reaches the driver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WarmFirst {
     /// Ask the page cache without blocking, and queue the op only if it refuses
@@ -51,9 +28,6 @@ pub enum WarmFirst {
 pub type OwnedBuf = Vec<u8>;
 
 /// A buffer a read fills, handed over empty and returned holding what it read
-///
-/// The buffer travels with room and no length, and the backend commits the count
-/// it filled, so nothing outside this type can name what was never written.
 #[derive(Debug, Eq, PartialEq)]
 pub struct ReadBuf {
     bytes: Vec<u8>,
@@ -69,10 +43,7 @@ impl ReadBuf {
         }
     }
 
-    /// Room for this many bytes, taken from a buffer a caller is done reading
-    ///
-    /// Growth goes to the pool's capacity class, never the exact want: the pool
-    /// takes back only exact classes, and an odd capacity is refused forever.
+    /// Room for this many bytes, reusing a spent buffer grown to the pool's capacity class
     pub fn reusing(mut bytes: Vec<u8>, wanted: usize) -> ReadBuf {
         bytes.clear();
         let room = crate::reel::payload::pooled_capacity(wanted);
@@ -92,9 +63,7 @@ impl ReadBuf {
         self.bytes.len()
     }
 
-    /// The room a backend reads into, as the pointer and length a syscall takes
-    ///
-    /// The bytes behind the pointer are uninitialized until a read commits them.
+    /// The uninitialized room a backend reads into, as a pointer and length
     pub fn as_mut_ptr(&mut self) -> (*mut u8, usize) {
         (self.bytes.as_mut_ptr(), self.wanted)
     }
@@ -103,8 +72,7 @@ impl ReadBuf {
     ///
     /// # Safety
     ///
-    /// The caller must have written at least filled bytes to the pointer
-    /// as_mut_ptr returned; committing more hands out memory nothing wrote.
+    /// The caller must have written at least `filled` bytes through `as_mut_ptr`
     pub unsafe fn commit(&mut self, filled: usize) {
         let filled = filled.min(self.wanted);
         unsafe { self.bytes.set_len(filled) }
@@ -123,22 +91,16 @@ impl ReadBuf {
     }
 }
 
-/// Bytes a write buffer carries inline before it needs the heap
-///
-/// Wide enough for a record header and an inline key. A key past the bound is
-/// not staged at all: it rides in its own buffer, shared from the index.
+/// An inline write buffer holds up to this many bytes, enough for a header and inline key
 pub const INLINE_CAP: usize = PREFIX_CAP;
 
-/// Span of the shared zero page a fill buffer names
+/// Length of the shared zero page that fill buffers point into
 pub const ZERO_PAGE_LEN: usize = 4096;
 
 /// The zero bytes every alignment fill is served from
 static ZERO_PAGE: [u8; ZERO_PAGE_LEN] = [0u8; ZERO_PAGE_LEN];
 
 /// A stretch of a read buffer, shared by refcount so a write can outlive the read
-///
-/// Small enough to queue one per record: a segment is under four gibibytes, so the
-/// stretch is two words beside the buffer it points into.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Part {
     bytes: Arc<Vec<u8>>,
@@ -207,16 +169,16 @@ impl From<OwnedBuf> for WriteBuf {
 /// One buffer in a vectored write, owned for the life of the submission
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WriteBuf {
-    /// A short buffer carried in place, the shape a record header takes
+    /// A short buffer stored in place, for a record header
     Inline { bytes: [u8; INLINE_CAP], len: u8 },
 
-    /// A heap buffer the caller handed over, the shape a payload takes
+    /// A heap buffer the caller handed over, for a payload
     Owned(OwnedBuf),
 
-    /// A buffer shared by refcount, the shape a spilled key takes without a copy
+    /// A buffer shared by refcount, for a spilled key without a copy
     Shared(Arc<[u8]>),
 
-    /// A stretch of a read buffer, the shape a copied payload takes without a copy
+    /// A stretch of a read buffer, so a copied payload needs no memcpy
     Part(Part),
 
     /// A run of zero fill served from the shared zero page
@@ -224,11 +186,7 @@ pub enum WriteBuf {
 }
 
 impl WriteBuf {
-    /// Push the buffers one record prefix occupies onto a vectored write
-    ///
-    /// A prefix is one buffer when its key is staged beside the header and two
-    /// when the key spilled, and both go on here so that no caller can push the
-    /// head and drop the key.
+    /// Push a record prefix onto a vectored write, as one buffer or two when the key spilled
     pub fn push_prefix(bufs: &mut Vec<WriteBuf>, prefix: RecordPrefix) {
         let (bytes, len, tail) = prefix.into_parts();
         bufs.push(WriteBuf::Inline {
@@ -275,18 +233,14 @@ impl WriteBuf {
     }
 }
 
-/// One owned file operation carrying the tag its completion echoes back
+/// One owned file operation, with the tag its completion echoes back
 #[derive(Debug)]
 pub enum Op {
     /// Open or create a segment file, yielding a file handle
-    ///
-    /// A direct descriptor is a second view of a segment a buffered volume
-    /// already has open; a volume that is direct throughout opens that way anyway.
     Open {
         tag: Tag,
         path: PathBuf,
         create: bool,
-        direct: bool,
     },
     /// Append owned buffers at an offset in one vectored write
     Writev {
@@ -302,20 +256,7 @@ pub enum Op {
         offset: u64,
         buf: ReadBuf,
     },
-    /// Read a byte range that may go around the page cache
-    ///
-    /// Both descriptors ride along: the warm probe reads the buffered one and the
-    /// cold read the direct one, and a second flight would double slot traffic.
-    PreadCold {
-        tag: Tag,
-        file: FileId,
-        direct: FileId,
-        offset: u64,
-        buf: ReadBuf,
-        probe: bool,
-    },
-    /// Read one contiguous range into two buffers, so a framed record splits
-    /// into its header and its payload without a copy
+    /// Read one contiguous range into a header buffer and a payload buffer
     PreadSplit {
         tag: Tag,
         file: FileId,
@@ -358,6 +299,13 @@ pub enum Op {
         offset: u64,
         len: u64,
     },
+    /// Give back the blocks under a byte range without changing the length
+    Release {
+        tag: Tag,
+        file: FileId,
+        offset: u64,
+        len: u64,
+    },
     /// Cut a file to a length, handing reserved space past it back
     Truncate { tag: Tag, file: FileId, len: u64 },
     /// Advise the kernel on access pattern or drop cached pages
@@ -371,13 +319,12 @@ pub enum Op {
 }
 
 impl Op {
-    /// Tag this op will echo back in its completion
+    /// The tag this op's completion echoes back
     pub fn tag(&self) -> Tag {
         match self {
             Op::Open { tag, .. } => *tag,
             Op::Writev { tag, .. } => *tag,
             Op::Pread { tag, .. } => *tag,
-            Op::PreadCold { tag, .. } => *tag,
             Op::PreadSplit { tag, .. } => *tag,
             Op::SyncData { tag, .. } => *tag,
             Op::SyncFull { tag, .. } => *tag,
@@ -389,6 +336,7 @@ impl Op {
             Op::List { tag, .. } => *tag,
             Op::Length { tag, .. } => *tag,
             Op::Allocate { tag, .. } => *tag,
+            Op::Release { tag, .. } => *tag,
             Op::Truncate { tag, .. } => *tag,
             Op::Advise { tag, .. } => *tag,
         }
@@ -398,7 +346,7 @@ impl Op {
 /// One completion, tagged back to the op that produced it
 #[derive(Debug)]
 pub struct Completion {
-    /// Tag echoed from the op this completes
+    /// The tag of the op this completes
     pub tag: Tag,
 
     /// Result of the op and any buffers it returns
@@ -486,7 +434,7 @@ mod tests {
         assert_eq!(bufs[0].as_slice(), wanted.as_slice());
     }
 
-    // a spilled key rides beside its header, the pair carrying the framed bytes
+    // a spilled key gets its own buffer, and the pair holds the framed bytes
     #[test]
     fn a_spilled_key_rides_in_its_own_buffer() {
         let key = RecordKey::from_bytes(ColumnId(1), &[0x5a; 200]).expect("key");

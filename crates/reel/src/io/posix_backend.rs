@@ -1,9 +1,4 @@
-//! Synchronous POSIX backend for the ring-shaped I/O trait
-//!
-//! Ops execute at submit against blocking libc syscalls and their completions
-//! queue for the next poll, so this stands in for a completion backend without a
-//! call site changing shape. A sync hands the bytes to the drive; whether the
-//! drive has written them before it answers is the drive's business.
+//! Synchronous POSIX backend that runs each op at submit and queues its completion
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -27,139 +22,24 @@ use crate::io::op::{
 use crate::io::{ReelIo, ServingBackend};
 use crate::sync::{lock, read, write};
 
-/// Buffers one vectored call carries, the portable floor of the kernel's own cap
-///
-/// Linux and macOS both stop at 1024 iovecs and fail the whole call past it, so a
-/// drain wider than this is split across several calls rather than rejected.
+/// The most buffers one vectored call takes on Linux and macOS, so wider writes split
 pub(crate) const MAX_IOVECS: usize = 1024;
 
-/// Answer a read from the page cache or refuse it, rather than waiting on a device
-///
-/// Resident pages answer for the price of a syscall the read owed anyway, and
-/// anything else comes back EAGAIN, which is what tells the route it is cold.
+/// The preadv2 flag that answers a read from the page cache or fails with EAGAIN
 #[cfg(target_os = "linux")]
 const RWF_NOWAIT: c_int = 0x0000_0008;
 
-/// Window length above which the warm probe is skipped
-///
-/// A probe that comes back short has copied whatever was resident for nothing, so
-/// it is worth issuing only where that waste is bounded by a few pages.
-const WARM_PROBE_MAX: usize = 16 * 1024;
-
-/// Largest covering span a thread keeps a staging buffer for
-///
-/// A window is a few blocks and a record can be sixty four megabytes, and
-/// keeping the larger would hold that per thread. The ring's registered buffers
-/// are this wide too, so one number decides both.
+/// The widest span a thread's pooled staging buffer serves, which also sizes ring buffers
 pub(crate) const STAGE_BYTES: usize = 128 * 1024;
 
-/// Whether the volume may still read a window around the page cache
-///
-/// Its two reads prove themselves separately: EINVAL means both that the kernel
-/// does not know a flag and that a direct read was unaligned, so one latch for
-/// both would let a defect disable the other.
-#[derive(Debug)]
-struct ColdReads {
-    /// Whether the route may still be taken at all
-    is_live: AtomicBool,
-
-    /// Whether one probe has come back, which settles what its refusals mean
-    probe_proven: AtomicBool,
-
-    /// Whether one direct read has come back, which settles what its refusals mean
-    direct_proven: AtomicBool,
-}
-
-impl ColdReads {
-    fn new() -> ColdReads {
-        ColdReads {
-            is_live: AtomicBool::new(true),
-            probe_proven: AtomicBool::new(false),
-            direct_proven: AtomicBool::new(false),
-        }
-    }
-
-    fn is_live(&self) -> bool {
-        self.is_live.load(Ordering::Relaxed)
-    }
-
-    fn is_probe_proven(&self) -> bool {
-        self.probe_proven.load(Ordering::Relaxed)
-    }
-
-    /// Note that a probe came back, which settles what its refusals mean
-    fn note_probe(&self) {
-        prove(&self.probe_proven);
-    }
-
-    /// Note that a direct read came back, which settles what its refusals mean
-    fn note_direct(&self) {
-        prove(&self.direct_proven);
-    }
-
-    /// Retire the plane on a refused direct read, and say whether to fall back
-    ///
-    /// Only a direct read that has never once answered can retire, since past
-    /// that the codes are ones a read can earn honestly. The probe reads the
-    /// other descriptor and vouches for nothing here.
-    fn retire_on_refusal(&self, error: &ReelError) -> bool {
-        if self.direct_proven.load(Ordering::Relaxed) || !is_unknown_flag(error) {
-            return false;
-        }
-        self.retire(error);
-        true
-    }
-
-    fn retire(&self, error: &ReelError) {
-        self.is_live.store(false, Ordering::Relaxed);
-        tracing::warn!(
-            "reel windows fall back to the page cache: the cold read plane was refused: {error}"
-        );
-    }
-
-    /// Answer a window from the page cache without blocking, or say it is cold
-    ///
-    /// A partial fill is never committed: a short read reads as a window the
-    /// volume cannot answer and buys a second read.
-    fn warm_read(&self, fd: RawFd, buf: &mut ReadBuf, offset: u64) -> Result<Option<usize>> {
-        let (ptr, len) = buf.as_mut_ptr();
-        let iovec = libc::iovec {
-            iov_base: ptr as *mut c_void,
-            iov_len: len,
-        };
-        let (ret, errno) = nowait_preadv(fd, &iovec, 1, offset);
-        match warm_verdict(ret, errno, len, self.is_probe_proven()) {
-            WarmVerdict::Warm(filled) => {
-                self.note_probe();
-                // Safety: the kernel reported filling exactly this many bytes of
-                // the room the buffer handed over.
-                unsafe { buf.commit(filled) };
-                Ok(Some(filled))
-            }
-            WarmVerdict::Cold => {
-                self.note_probe();
-                Ok(None)
-            }
-            WarmVerdict::Retire => {
-                self.retire(&ReelError::Io(io::Error::from_raw_os_error(errno)));
-                Ok(None)
-            }
-            WarmVerdict::Failed => Err(ReelError::Io(io::Error::from_raw_os_error(errno))),
-        }
-    }
-}
-
-/// Latch a plane's proof, leaving the line alone once it is set
+/// Set the flag, skipping the store once it is already set
 fn prove(flag: &AtomicBool) {
     if !flag.load(Ordering::Relaxed) {
         flag.store(true, Ordering::Relaxed);
     }
 }
 
-/// Read what the page cache already holds, refusing rather than waiting on a device
-///
-/// The result and the errno come back together, so the classification is one pure
-/// function over both. Vectored, since a framed record fills two buffers at once.
+/// Read from resident pages only, returning the result and errno together
 #[cfg(target_os = "linux")]
 fn nowait_preadv(
     fd: RawFd,
@@ -167,8 +47,7 @@ fn nowait_preadv(
     count: c_int,
     offset: u64,
 ) -> (libc::ssize_t, c_int) {
-    // Safety: the list names count buffers of the room their owners handed over,
-    // and the kernel writes no more than that.
+    // Safety: the list holds count buffers with owned room, and the kernel writes no more
     let ret = unsafe { libc::preadv2(fd, iov, count, offset as libc::off_t, RWF_NOWAIT) };
     let errno = match ret < 0 {
         true => io::Error::last_os_error().raw_os_error().unwrap_or(0),
@@ -177,9 +56,7 @@ fn nowait_preadv(
     (ret, errno)
 }
 
-/// No kernel anywhere else answers a read only from its resident pages
-///
-/// Reported cold, which sends the read to the driver rather than guessing.
+/// Other kernels have no page-cache-only read, so every probe reports cold
 #[cfg(not(target_os = "linux"))]
 fn nowait_preadv(
     _fd: RawFd,
@@ -190,23 +67,23 @@ fn nowait_preadv(
     (-1, libc::EAGAIN)
 }
 
-/// What one non-blocking probe of the page cache settled
+/// The outcome of one non-blocking page cache probe
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WarmVerdict {
-    /// The cache held the whole window, and this is what it filled
+    /// The cache held the whole read, and this is what it filled
     Warm(usize),
 
-    /// The pages are not all resident, so the window goes to the device
+    /// The pages are not all resident, so the read goes to the device
     Cold,
 
-    /// The kernel does not know the flag, so the plane retires
+    /// The kernel does not know the flag, so the probe retires
     Retire,
 
     /// The read failed for a reason of its own
     Failed,
 }
 
-/// What a probe's return and errno mean for the window it was asked about
+/// Classify a probe's return and errno
 fn warm_verdict(ret: libc::ssize_t, errno: c_int, wanted: usize, is_proven: bool) -> WarmVerdict {
     if ret >= 0 {
         let filled = ret as usize;
@@ -222,59 +99,16 @@ fn warm_verdict(ret: libc::ssize_t, errno: c_int, wanted: usize, is_proven: bool
     }
 }
 
-/// What the cold-window route did, over every window it was handed
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ColdReadCounts {
-    /// Windows the reel routed to this plane
-    pub routed: u64,
-
-    /// Windows the page cache answered whole, with no device op
-    pub warm: u64,
-
-    /// Windows that went around the cache to the device
-    pub direct: u64,
-
-    /// Bytes those reads asked the device for, the covering span included
-    pub direct_bytes: u64,
-}
-
-/// The counts behind ColdReadCounts
-#[derive(Debug, Default)]
-struct ColdCounts {
-    routed: AtomicU64,
-    warm: AtomicU64,
-    direct: AtomicU64,
-    direct_bytes: AtomicU64,
-}
-
-impl ColdCounts {
-    fn snapshot(&self) -> ColdReadCounts {
-        ColdReadCounts {
-            routed: self.routed.load(Ordering::Relaxed),
-            warm: self.warm.load(Ordering::Relaxed),
-            direct: self.direct.load(Ordering::Relaxed),
-            direct_bytes: self.direct_bytes.load(Ordering::Relaxed),
-        }
-    }
-}
-
-/// Record length above which an awaited point read is not probed
-///
-/// A short probe wastes one memcpy rather than a device read, so the bound sits
-/// well above WARM_PROBE_MAX: an ordinary record runs to tens of kilobytes, and
-/// excluding them would leave the knob armed and firing on nothing.
+/// An awaited point read longer than this skips the probe
 const POINT_PROBE_MAX: usize = 1024 * 1024;
 
 /// Whether an awaited point read may still ask the page cache before it queues
-///
-/// Separate from ColdReads: this probe reads a buffered descriptor, and a refusal
-/// earned on the ranged plane's direct one says nothing about it.
 #[derive(Debug)]
 struct WarmReads {
     /// Whether the probe may still be issued at all
     is_live: AtomicBool,
 
-    /// Whether one probe has come back, which settles what its refusals mean
+    /// Whether any probe has answered, after which a refusal counts as a read error
     is_proven: AtomicBool,
 }
 
@@ -296,12 +130,7 @@ impl WarmReads {
         tracing::warn!("reel point reads stop asking the page cache first: {error}");
     }
 
-    /// Fill both buffers from resident pages, or leave them untouched and say so
-    ///
-    /// The header and payload go into one call. Nothing is committed unless the
-    /// whole record came, since a partial fill reaches the caller as a record it
-    /// cannot frame. A failure of its own is not reported: the queued read behind
-    /// it meets the same condition on the same descriptor.
+    /// Fill both buffers from resident pages, committing only if the whole record came
     fn warm_split(&self, fd: RawFd, offset: u64, head: &mut ReadBuf, body: &mut ReadBuf) -> bool {
         let (head_ptr, head_len) = head.as_mut_ptr();
         let (body_ptr, body_len) = body.as_mut_ptr();
@@ -320,8 +149,7 @@ impl WarmReads {
         match warm_verdict(ret, errno, wanted, self.is_proven.load(Ordering::Relaxed)) {
             WarmVerdict::Warm(_) => {
                 prove(&self.is_proven);
-                // Safety: the kernel reported filling the whole of both buffers, and
-                // it fills the first before the second.
+                // Safety: the kernel reported filling both buffers whole
                 unsafe {
                     head.commit(head_len);
                     body.commit(body_len);
@@ -341,13 +169,13 @@ impl WarmReads {
     }
 }
 
-/// What the awaited point path's warm probe did, over every read it was handed
+/// Counts of the awaited point path's warm probes
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WarmReadCounts {
     /// Awaited point reads that asked the page cache before queueing anything
     pub asked: u64,
 
-    /// Those the cache answered whole, with no op, no slot and no completion
+    /// Reads the cache answered whole, with no op queued
     pub served: u64,
 }
 
@@ -367,18 +195,6 @@ impl WarmCounts {
     }
 }
 
-/// Whether an error is the kernel saying it does not know a flag it was handed
-///
-/// Which of the two a kernel picks depends on how far the call got before the
-/// flag was looked at, so both count.
-fn is_unknown_flag(error: &ReelError) -> bool {
-    let code = match error {
-        ReelError::Io(io) => io.raw_os_error(),
-        _ => None,
-    };
-    matches!(code, Some(libc::EOPNOTSUPP) | Some(libc::EINVAL))
-}
-
 /// Synchronous POSIX backend executing ops at submit and queuing completions
 #[derive(Debug)]
 pub struct PosixBackend {
@@ -390,8 +206,6 @@ pub struct PosixBackend {
     ops: AtomicU64,
     sync_count: AtomicU64,
     sync_nanos: AtomicU64,
-    cold: ColdReads,
-    cold_counts: ColdCounts,
     warm: WarmReads,
     warm_counts: WarmCounts,
     is_direct: bool,
@@ -403,7 +217,7 @@ impl PosixBackend {
         PosixBackend::with_direct(false)
     }
 
-    /// Build a backend whose opens bypass the page cache entirely
+    /// Build a backend whose opens bypass the page cache on Linux when `is_direct` is set
     pub fn with_direct(is_direct: bool) -> PosixBackend {
         PosixBackend {
             files: RwLock::new(HashMap::new()),
@@ -414,28 +228,18 @@ impl PosixBackend {
             ops: AtomicU64::new(0),
             sync_count: AtomicU64::new(0),
             sync_nanos: AtomicU64::new(0),
-            cold: ColdReads::new(),
-            cold_counts: ColdCounts::default(),
             warm: WarmReads::new(),
             warm_counts: WarmCounts::default(),
             is_direct,
         }
     }
 
-    /// What the cold-window route has done, over the ops the sampler selected
-    pub fn cold_reads(&self) -> ColdReadCounts {
-        self.cold_counts.snapshot()
-    }
-
-    /// What the awaited point path's warm probe has done, over the sampled reads
+    /// Counts of the awaited point path's warm probes so far
     pub fn warm_reads(&self) -> WarmReadCounts {
         self.warm_counts.snapshot()
     }
 
     /// Answer a whole framed record from resident pages, or leave it to the driver
-    ///
-    /// A direct volume is never asked, since the probe could only refuse; neither
-    /// is a record past the probe bound or one on a retired backend.
     pub fn warm_split(
         &self,
         file: FileId,
@@ -460,17 +264,7 @@ impl PosixBackend {
         served
     }
 
-    /// Whether the cold-window plane is still live on this backend
-    ///
-    /// A refusal retires the plane here rather than on the reel, so this tells a
-    /// routed read that fell back from one that was never routed.
-    pub fn cold_plane_live(&self) -> bool {
-        self.cold.is_live()
-    }
-
     /// Descriptors this backend currently holds open
-    ///
-    /// The count a handle cache bounds, since nothing else sees a descriptor leak.
     pub fn open_file_count(&self) -> usize {
         self.read_files().len()
     }
@@ -490,7 +284,7 @@ impl PosixBackend {
         self.sync_nanos.load(Ordering::Relaxed)
     }
 
-    /// Run one flush, billing its count and the time the drive took
+    /// Run one flush, counting it and the time it took
     fn billed_sync(&self, run: impl FnOnce() -> Result<()>) -> Result<()> {
         let started = Instant::now();
         let outcome = run();
@@ -508,15 +302,10 @@ impl PosixBackend {
 
     fn execute(&self, op: Op) -> Completion {
         match op {
-            Op::Open {
-                tag,
-                path,
-                create,
-                direct,
-            } => {
+            Op::Open { tag, path, create } => {
                 let mut options = OpenOptions::new();
                 options.read(true).write(true).create(create);
-                if self.is_direct || direct {
+                if self.is_direct {
                     direct_open_flag(&mut options);
                 }
                 let outcome = match options.open(&path) {
@@ -554,23 +343,6 @@ impl PosixBackend {
                 let result = match self.fd_of(file) {
                     Ok(fd) if self.is_direct => direct_pread(fd, &mut buf, offset),
                     Ok(fd) => pread_into(fd, &mut buf, offset),
-                    Err(error) => Err(error),
-                };
-                Completion {
-                    tag,
-                    outcome: Outcome::Read { result, buf },
-                }
-            }
-            Op::PreadCold {
-                tag,
-                file,
-                direct,
-                offset,
-                mut buf,
-                probe,
-            } => {
-                let result = match self.fd_of(file) {
-                    Ok(fd) => self.cold_pread(fd, direct, &mut buf, offset, probe),
                     Err(error) => Err(error),
                 };
                 Completion {
@@ -629,8 +401,7 @@ impl PosixBackend {
             },
             Op::Close { tag, file } => Completion {
                 tag,
-                // Dropping the owned descriptor is the close, and for a file whose
-                // last link is already gone it is also what returns its blocks.
+                // Dropping the descriptor closes it and frees an unlinked file's blocks
                 outcome: Outcome::Done(match self.close_file(file) {
                     Some(_) => Ok(()),
                     None => Err(unknown_file()),
@@ -653,6 +424,15 @@ impl PosixBackend {
                 tag,
                 outcome: Outcome::Done(self.allocate(file, offset, len)),
             },
+            Op::Release {
+                tag,
+                file,
+                offset,
+                len,
+            } => Completion {
+                tag,
+                outcome: Outcome::Done(self.release(file, offset, len)),
+            },
             Op::Truncate { tag, file, len } => Completion {
                 tag,
                 outcome: Outcome::Done(self.truncate(file, len)),
@@ -667,49 +447,6 @@ impl PosixBackend {
                 tag,
                 outcome: Outcome::Done(self.advise(file, offset, len, advice)),
             },
-        }
-    }
-
-    /// Serve a window from the plane its route names
-    ///
-    /// The probe and the device read are one op, one slot and one completion: a
-    /// second flight for the probe would double the async door's slot traffic.
-    fn cold_pread(
-        &self,
-        fd: RawFd,
-        direct: FileId,
-        buf: &mut ReadBuf,
-        offset: u64,
-        probe: bool,
-    ) -> Result<usize> {
-        self.cold_counts.routed.fetch_add(1, Ordering::Relaxed);
-        if probe && self.cold.is_live() && buf.wanted() <= WARM_PROBE_MAX {
-            if let Some(filled) = self.cold.warm_read(fd, buf, offset)? {
-                self.cold_counts.warm.fetch_add(1, Ordering::Relaxed);
-                return Ok(filled);
-            }
-        }
-        // A probe that retired the plane leaves the volume with the reads it had
-        // before, since without the probe warm and cold cannot be told apart.
-        if !self.cold.is_live() {
-            return pread_into(fd, buf, offset);
-        }
-
-        let direct_fd = self.fd_of(direct)?;
-        match direct_pread(direct_fd, buf, offset) {
-            Ok(filled) => {
-                self.cold.note_direct();
-                let (_, span) = covering_span(offset, buf.wanted() as u64);
-                self.cold_counts.direct.fetch_add(1, Ordering::Relaxed);
-                self.cold_counts
-                    .direct_bytes
-                    .fetch_add(span, Ordering::Relaxed);
-                Ok(filled)
-            }
-            // A kernel that refuses the direct read leaves the volume with the
-            // plane it had before rather than failing a read the cache can serve.
-            Err(error) if self.cold.retire_on_refusal(&error) => pread_into(fd, buf, offset),
-            Err(error) => Err(error),
         }
     }
 
@@ -733,6 +470,11 @@ impl PosixBackend {
         raw_allocate(fd, offset, len)
     }
 
+    fn release(&self, file: FileId, offset: u64, len: u64) -> Result<()> {
+        let fd = self.fd_of(file)?;
+        raw_release(fd, offset, len)
+    }
+
     fn truncate(&self, file: FileId, len: u64) -> Result<()> {
         let fd = self.fd_of(file)?;
         truncate_to(fd, len)
@@ -748,11 +490,7 @@ impl PosixBackend {
         raw_advise(fd, offset, len, advice)
     }
 
-    /// The descriptor behind a handle, for a backend that shares this table
-    ///
-    /// Answered from a per-thread cache before the table, since ops arrive in runs
-    /// against one file. Identifiers are never reused, so only a close can stale a
-    /// cached pair, and every close moves a generation the hit checks.
+    /// The descriptor behind a handle, from a per-thread cache checked against the close count
     pub(crate) fn fd_of(&self, file: FileId) -> Result<RawFd> {
         let generation = self.closes.load(Ordering::Relaxed);
         let way = resolved_way(self.id, file);
@@ -790,10 +528,7 @@ impl PosixBackend {
         write(&self.files)
     }
 
-    /// Take a file out of the table and stale every thread's cached descriptor
-    ///
-    /// The count moves before the descriptor is dropped, so a thread that resolved
-    /// the old one has already been staled by the time the fd could be reused.
+    /// Remove a file and stale every cached fd, bumping the count before the fd closes
     fn close_file(&self, file: FileId) -> Option<OwnedFd> {
         let taken = self.write_files().remove(&file);
         self.closes.fetch_add(1, Ordering::AcqRel);
@@ -812,7 +547,7 @@ impl Default for PosixBackend {
 }
 
 impl ReelIo for PosixBackend {
-    /// Posix, told apart by the descriptors this backend opened for itself
+    /// Posix, direct when this backend was built for direct opens
     fn serving(&self) -> ServingBackend {
         match self.is_direct {
             true => ServingBackend::PosixDirect,
@@ -891,10 +626,7 @@ fn truncate_to(fd: RawFd, length: u64) -> Result<()> {
     checked(unsafe { libc::ftruncate(fd, length as libc::off_t) })
 }
 
-/// Ask for a descriptor the page cache does not stand behind
-///
-/// Only Linux spells this as an open flag. The macOS fcntl is not the same
-/// promise: the transfer still goes through the cache. Direct means Linux.
+/// Open with O_DIRECT so the page cache is bypassed, on Linux only
 #[cfg(target_os = "linux")]
 fn direct_open_flag(options: &mut OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
@@ -905,10 +637,6 @@ fn direct_open_flag(options: &mut OpenOptions) {
 fn direct_open_flag(_options: &mut OpenOptions) {}
 
 /// Write a drain through one aligned buffer, since the device takes whole blocks
-///
-/// The volume already framed the drain on a boundary, so only the address is
-/// left. The buffers are gathered into one aligned run because a vectored direct
-/// write needs every buffer block sized, which a header and payload are not.
 fn direct_writev(fd: RawFd, bufs: &[WriteBuf], offset: u64) -> Result<u64> {
     let total: usize = bufs.iter().map(|buf| buf.as_slice().len()).sum();
     if total == 0 {
@@ -927,14 +655,12 @@ fn direct_writev(fd: RawFd, bufs: &[WriteBuf], offset: u64) -> Result<u64> {
         staged.as_mut_slice()[at..at + bytes.len()].copy_from_slice(bytes);
         at += bytes.len();
     }
-    // Only the rounding tail is left unwritten, and it reaches the device, so it
-    // is the one part that has to be zeroed rather than whatever was on the heap.
+    // Zero the rounding tail, since it reaches the device too
     staged.zero_from(at);
 
     let span = staged.len();
     let wrote = write_all_at(fd, staged.as_ptr(), span, offset)?;
-    // What the caller framed is what it gets told landed, since the rounding is
-    // this function's business and not the write head's.
+    // Report the caller's framed length, without the rounding
     Ok(wrote.min(total as u64))
 }
 
@@ -943,8 +669,7 @@ fn write_all_at(fd: RawFd, ptr: *mut u8, len: usize, offset: u64) -> Result<u64>
     let mut written = 0usize;
     while written < len {
         let at = offset.saturating_add(written as u64) as libc::off_t;
-        // Safety: the pointer names an allocation of len bytes and written is
-        // always inside it, so the range handed over is owned and initialized.
+        // Safety: written stays inside the len-byte allocation, which is owned and initialized
         let ret = unsafe { libc::pwrite(fd, ptr.add(written) as *const c_void, len - written, at) };
         if ret < 0 {
             let error = io::Error::last_os_error();
@@ -965,10 +690,7 @@ fn write_all_at(fd: RawFd, ptr: *mut u8, len: usize, offset: u64) -> Result<u64>
 }
 
 thread_local! {
-    /// The aligned buffer this thread stages a direct read through
-    ///
-    /// Allocated once at full size rather than grown, since a per-read aligned
-    /// allocation is the whole of a small direct read's penalty.
+    /// This thread's aligned staging buffer for direct reads, allocated once at full size
     static STAGE: RefCell<Option<AlignedBuf>> = const { RefCell::new(None) };
 }
 
@@ -978,8 +700,6 @@ thread_local! {
     static STAGE_ALLOCS: Cell<usize> = const { Cell::new(0) };
 
     /// Bytes this thread's covering reads have asked the kernel to fill
-    ///
-    /// What separates reading the covering span from reading the whole stage.
     static COVERING_BYTES: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -995,11 +715,7 @@ fn covering_bytes() -> u64 {
     COVERING_BYTES.with(|count| count.get())
 }
 
-/// Run something against an aligned buffer wide enough for a span
-///
-/// The borrow is held for the whole call, so neither an error nor a panic loses
-/// the buffer. Re-entering would panic on the double borrow and cannot happen:
-/// all that runs inside is a pread and a memcpy.
+/// Run something against an aligned buffer wide enough for a span, pooled up to the cap
 fn with_stage<Answer>(
     span: usize,
     run: impl FnOnce(&AlignedBuf) -> Result<Answer>,
@@ -1019,11 +735,7 @@ fn with_stage<Answer>(
     })
 }
 
-/// Read a range that is aligned to nothing by reading the blocks around it
-///
-/// The read is widened to the blocks holding the record and the caller is handed
-/// the middle; the padding is never named outside this function. A read off the
-/// end comes back short, cut against what actually landed.
+/// Read an unaligned range through the blocks around it and hand the window to `cut`
 fn read_covering(
     fd: RawFd,
     offset: u64,
@@ -1034,30 +746,23 @@ fn read_covering(
     let span = span as usize;
     let skip = (offset - start) as usize;
     with_stage(span, |staged| {
-        // The read takes the span, never the buffer's own length: a pooled stage
-        // is as wide as the cap, and reading that much would fetch many blocks
-        // for one small window.
+        // Read only the span, since the pooled stage is as wide as the cap
         let filled = read_at(fd, staged.as_ptr(), span, start)?;
         let (from, to) = wanted_window(filled, skip, len as usize);
-        // Safety: the read reported filling this many bytes from the buffer's start,
-        // so the range named is exactly what the kernel wrote.
+        // Safety: the read reported filling at least this many bytes from the start
         let bytes = unsafe { staged.filled(to) };
         Ok(cut(&bytes[from..]))
     })
 }
 
-/// Issue one direct read, stopping at the end of the file rather than short-cycling
-///
-/// A direct descriptor refuses a resume off a block boundary, so a read that
-/// stopped part way into a block is the end of the file rather than a read to
-/// continue; resuming would earn EINVAL instead of the short read.
+/// Issue one direct read, treating a stop inside a block as the end of the file
 fn read_at(fd: RawFd, ptr: *mut u8, len: usize, offset: u64) -> Result<usize> {
     #[cfg(test)]
     COVERING_BYTES.with(|count| count.set(count.get() + len as u64));
     let mut filled = 0usize;
     while filled < len {
         let at = offset.saturating_add(filled as u64) as libc::off_t;
-        // Safety: as in write_all_at, the range is inside the owned allocation.
+        // Safety: as in write_all_at, the range is inside the owned allocation
         let ret = unsafe { libc::pread(fd, ptr.add(filled) as *mut c_void, len - filled, at) };
         if ret < 0 {
             let error = io::Error::last_os_error();
@@ -1102,12 +807,7 @@ fn direct_pread_split(
     })
 }
 
-/// Write every buffer at the offset, however many calls the kernel needs
-///
-/// A vectored write is capped at a fixed number of buffers and may report fewer
-/// bytes than it was handed, so a wide drain is split and a partial write resumes
-/// where it stopped. All or nothing: every byte lands or an error comes back, so
-/// a caller can trust the write head it advances.
+/// Write every buffer at the offset, however many calls it takes, or return an error
 fn pwritev_all(fd: RawFd, bufs: &[WriteBuf], offset: u64) -> Result<u64> {
     let mut iovecs = IOVEC_SCRATCH.with(|held| held.take());
     let written = pwritev_all_into(&mut iovecs, fd, bufs, offset);
@@ -1116,31 +816,28 @@ fn pwritev_all(fd: RawFd, bufs: &[WriteBuf], offset: u64) -> Result<u64> {
 }
 
 thread_local! {
-    /// The iovec list this thread writes through, kept rather than rebuilt
+    /// The iovec list this thread reuses for vectored writes
     static IOVEC_SCRATCH: Cell<Vec<libc::iovec>> = const { Cell::new(Vec::new()) };
 }
 
-/// Files this thread remembers a descriptor for at once
+/// Each thread caches descriptors for this many files at once
 const RESOLVED_WAYS: usize = 4;
 
 thread_local! {
-    /// The descriptors this thread last resolved, one way per file it is working
+    /// This thread's recently resolved descriptors, indexed by way
     static RESOLVED: [Cell<Resolved>; RESOLVED_WAYS] =
         const { [const { Cell::new(Resolved::none()) }; RESOLVED_WAYS] };
 }
 
-/// Identity handed to the next backend, so a cached descriptor names whose it is
+/// The next backend's id, so a cached descriptor records which backend owns it
 static NEXT_BACKEND: AtomicU64 = AtomicU64::new(0);
 
-/// The way a file's descriptor is remembered in
-///
-/// Mixed with the backend, since each numbers its files from zero and two volumes
-/// would otherwise land in the same way and evict each other.
+/// A file's cache way, mixed with the backend id since every backend numbers files from zero
 fn resolved_way(backend: u64, file: FileId) -> usize {
     (backend ^ file.0) as usize % RESOLVED_WAYS
 }
 
-/// One thread's memory of the descriptor behind a file
+/// One cached descriptor for a file
 #[derive(Clone, Copy)]
 struct Resolved {
     backend: u64,
@@ -1150,10 +847,7 @@ struct Resolved {
 }
 
 impl Resolved {
-    /// A thread that has resolved nothing yet
-    ///
-    /// The sentinel is the generation, not the identifier: no close can precede
-    /// the first resolve, so a generation of all ones matches nothing.
+    /// An empty entry, whose all-ones generation never matches a real close count
     const fn none() -> Resolved {
         Resolved {
             backend: u64::MAX,
@@ -1163,14 +857,14 @@ impl Resolved {
         }
     }
 
-    /// The descriptor, if this memory is of the right file and nothing has closed
+    /// The descriptor, if this entry is for this file and nothing has closed since
     fn hit(self, backend: u64, file: FileId, generation: u64) -> Option<RawFd> {
         (self.backend == backend && self.file == file && self.generation == generation)
             .then_some(self.fd)
     }
 }
 
-/// The vectored write itself, filling a list it is handed rather than its own
+/// The vectored write itself, using the iovec list it is handed
 fn pwritev_all_into(
     iovecs: &mut Vec<libc::iovec>,
     fd: RawFd,
@@ -1206,8 +900,7 @@ fn pwritev_all_into(
 
         let count = c_int::try_from(iovecs.len()).unwrap_or(c_int::MAX);
         let at = offset.saturating_add(written) as libc::off_t;
-        // Safety: the list names count buffers of the bytes their owners handed
-        // over, and the kernel reads no more than that.
+        // Safety: the list holds count owned buffers, and the kernel reads no more
         let ret = unsafe { libc::pwritev(fd, iovecs.as_ptr(), count, at) };
         if ret < 0 {
             let error = io::Error::last_os_error();
@@ -1249,17 +942,12 @@ fn skip_spent(bufs: &[WriteBuf], cursor: &mut usize, consumed: &mut usize) {
     }
 }
 
-/// Read into a buffer's uninitialized room, going back for whatever a call left
-///
-/// One read call is capped at 0x7ffff000 bytes however much was asked for, so
-/// taking a short answer at its word is a silent truncation at the two gigabyte
-/// line. Only a call that read nothing ends the loop, which is the end of file.
+/// Read into a buffer's room, looping on short reads until one returns nothing
 fn pread_into(fd: RawFd, buf: &mut ReadBuf, offset: u64) -> Result<usize> {
     let (base, wanted) = buf.as_mut_ptr();
     let mut filled = 0usize;
     while filled < wanted {
-        // Safety: filled is never past the room, so the pointer and length name
-        // room the buffer owns.
+        // Safety: filled never passes the room, so the pointer stays in the buffer
         let ptr = unsafe { base.add(filled) };
         let read = one_pread(fd, ptr, wanted - filled, offset + filled as u64)?;
         if read == 0 {
@@ -1273,8 +961,7 @@ fn pread_into(fd: RawFd, buf: &mut ReadBuf, offset: u64) -> Result<usize> {
 
 /// One read call at an offset, without moving the descriptor's own cursor
 fn one_pread(fd: RawFd, ptr: *mut u8, len: usize, offset: u64) -> Result<usize> {
-    // Safety: the pointer and length name room the caller's buffer owns, and the
-    // kernel writes no more than that.
+    // Safety: the caller's buffer owns this room, and the kernel writes no more than len
     let ret = unsafe { libc::pread(fd, ptr as *mut c_void, len, offset as libc::off_t) };
     if ret < 0 {
         return Err(ReelError::Io(io::Error::last_os_error()));
@@ -1283,9 +970,6 @@ fn one_pread(fd: RawFd, ptr: *mut u8, len: usize, offset: u64) -> Result<usize> 
 }
 
 /// Read one contiguous range into two buffers in a single call
-///
-/// A framed record is a header followed by its payload, so the split hands the
-/// payload buffer straight back rather than shifting it down over the header.
 fn preadv_into(fd: RawFd, head: &mut ReadBuf, body: &mut ReadBuf, offset: u64) -> Result<usize> {
     let (head_ptr, head_len) = head.as_mut_ptr();
     let (body_ptr, body_len) = body.as_mut_ptr();
@@ -1301,14 +985,12 @@ fn preadv_into(fd: RawFd, head: &mut ReadBuf, body: &mut ReadBuf, offset: u64) -
     ];
     let count = iovecs.len() as c_int;
     let at = offset as libc::off_t;
-    // Safety: the list names two buffers of the room their owners handed over, and
-    // the kernel writes no more than that.
+    // Safety: the list holds two buffers with owned room, and the kernel writes no more
     let ret = unsafe { libc::preadv(fd, iovecs.as_ptr(), count, at) };
     if ret < 0 {
         return Err(ReelError::Io(io::Error::last_os_error()));
     }
-    // The kernel fills the first buffer before the second, so a short read leaves
-    // the head whole and cuts the body, and a shorter one cuts the head itself.
+    // The kernel fills the head first, so a short read cuts the body first
     let filled = ret as usize;
     unsafe {
         head.commit(filled.min(head_len));
@@ -1387,9 +1069,7 @@ fn raw_sync_range(_fd: RawFd, _offset: u64, _len: u64, _mode: SyncRangeMode) -> 
 
 #[cfg(target_os = "linux")]
 fn raw_allocate(fd: RawFd, offset: u64, len: u64) -> Result<()> {
-    // The reservation claims blocks without touching the length, so the file
-    // always ends at its last written byte and a crash leaves no slack inside
-    // it. A filesystem that cannot reserve just lets the writes allocate.
+    // Reserve blocks but keep the length. Without support, writes allocate as they go
     let ret = unsafe {
         libc::fallocate(
             fd,
@@ -1408,17 +1088,11 @@ fn raw_allocate(fd: RawFd, offset: u64, len: u64) -> Result<()> {
     }
 }
 
-/// Reserve a byte range on macOS, which counts its length differently from Linux
-///
-/// F_PEOFPOSMODE reserves its length past the current end of file, so the ask is
-/// how much to add rather than where to reach: handing it the absolute end
-/// reserves the whole file again on every extension. The shortfall is worked out
-/// here, and a range already covered asks for nothing.
+/// Reserve a byte range on macOS, where F_PEOFPOSMODE takes a length past the end of file
 #[cfg(target_os = "macos")]
 fn raw_allocate(fd: RawFd, offset: u64, len: u64) -> Result<()> {
     let end = offset.saturating_add(len);
-    // Measured in allocated blocks rather than length: the length stays at the
-    // last written byte, and blocks are what the reservation actually holds.
+    // Measure in allocated blocks, since the length stays at the last written byte
     let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
     checked(unsafe { libc::fstat(fd, &mut status) })?;
     let held = status.st_blocks as u64 * 512;
@@ -1437,8 +1111,7 @@ fn raw_allocate(fd: RawFd, offset: u64, len: u64) -> Result<()> {
         }
         let _ = reserved;
     }
-    // The length is left alone on purpose: the file ends at its last written
-    // byte, and the reservation lives past it.
+    // The length stays at the last written byte, and the reservation lives past it
     Ok(())
 }
 
@@ -1447,10 +1120,46 @@ fn raw_allocate(fd: RawFd, offset: u64, len: u64) -> Result<()> {
     extend_to(fd, offset.saturating_add(len))
 }
 
-/// Linux says everything per range, and has nothing to say about a file as a whole
-///
-/// Cache hygiene here is the running stream of range hints, so the file-wide ask
-/// is the one with nothing behind it.
+/// Punch a hole over a byte range and keep the length, or do nothing if unsupported
+#[cfg(target_os = "linux")]
+fn raw_release(fd: RawFd, offset: u64, len: u64) -> Result<()> {
+    let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+    let ret = unsafe { libc::fallocate(fd, mode, offset as libc::off_t, len as libc::off_t) };
+    if ret == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == libc::ENOSYS || code == libc::EOPNOTSUPP => Ok(()),
+        _ => Err(ReelError::Io(error)),
+    }
+}
+
+/// Punch a hole over a byte range on macOS and keep the length, or do nothing if unsupported
+#[cfg(target_os = "macos")]
+fn raw_release(fd: RawFd, offset: u64, len: u64) -> Result<()> {
+    let hole = libc::fpunchhole_t {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: offset as libc::off_t,
+        fp_length: len as libc::off_t,
+    };
+    if unsafe { libc::fcntl(fd, libc::F_PUNCHHOLE, &hole) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == libc::ENOTSUP || code == libc::EINVAL => Ok(()),
+        _ => Err(ReelError::Io(error)),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn raw_release(_fd: RawFd, _offset: u64, _len: u64) -> Result<()> {
+    Ok(())
+}
+
+/// Pass the hint to posix_fadvise for the range
 #[cfg(target_os = "linux")]
 fn raw_advise(fd: RawFd, offset: u64, len: u64, advice: Advice) -> Result<()> {
     let flag = match advice {
@@ -1466,10 +1175,7 @@ fn raw_advise(fd: RawFd, offset: u64, len: u64, advice: Advice) -> Result<()> {
     }
 }
 
-/// macOS says everything per descriptor, and has nothing to say about a range
-///
-/// Its flags stick to the descriptor rather than the range, so a range hint has
-/// no honest translation and is dropped rather than made permanent.
+/// Map the hint to per-descriptor read-ahead on macOS, dropping DontNeed
 #[cfg(target_os = "macos")]
 fn raw_advise(fd: RawFd, _offset: u64, _len: u64, advice: Advice) -> Result<()> {
     let (command, argument) = match advice {
@@ -1542,13 +1248,12 @@ mod tests {
                 tag: Tag(1),
                 path: path.to_path_buf(),
                 create,
-                direct: false,
             }])
             .expect("submit open");
         opened(drain_one(backend).outcome).expect("open result")
     }
 
-    // a closed file's descriptor is not answered from the cache the next op checks
+    // a closed file's cached descriptor stops answering
     #[test]
     fn closing_a_file_stales_the_cached_descriptor() {
         let dir = tempdir().expect("tempdir");
@@ -1564,7 +1269,7 @@ mod tests {
             }])
             .expect("submit write");
         assert_eq!(wrote(drain_one(&backend).outcome).expect("wrote"), 5);
-        // Resolve it, so this thread is holding its descriptor.
+        // Resolve it so this thread caches its descriptor
         assert!(backend.fd_of(first).is_ok());
 
         backend
@@ -1575,7 +1280,7 @@ mod tests {
             .expect("submit close");
         done(drain_one(&backend).outcome).expect("close");
 
-        // The next open is free to take the number the close gave up.
+        // The next open may reuse the fd number the close gave up
         let second = open_file(&backend, &dir.path().join("segment-1"), true);
         assert!(backend.fd_of(second).is_ok(), "the new file resolves");
         assert!(
@@ -1584,7 +1289,7 @@ mod tests {
         );
     }
 
-    // one thread reading two volumes does not confuse their files for each other
+    // one thread reading two volumes keeps their cached descriptors apart
     #[test]
     fn two_backends_do_not_share_a_cached_descriptor() {
         let dir = tempdir().expect("tempdir");
@@ -1602,12 +1307,12 @@ mod tests {
             "one backend answered with the other's descriptor"
         );
 
-        // And back the other way, so the cache is not merely ordered correctly once.
+        // Ask each again, so the cache holds both at once
         assert_eq!(first.fd_of(here).expect("still the first"), mine);
         assert_eq!(second.fd_of(there).expect("still the second"), yours);
     }
 
-    // a direct backend's descriptors really carry the flag, read back off the fd
+    // a direct backend's descriptors have O_DIRECT set, read back off the fd
     #[cfg(target_os = "linux")]
     #[test]
     fn direct_backend_opens_direct() {
@@ -1696,7 +1401,7 @@ mod tests {
         assert_eq!(entries[0].len, 0, "a reservation extended the length");
     }
 
-    // extending a segment chunk by chunk reserves the segment, not the sum of offsets
+    // reserving a segment in pieces reserves about the segment's size
     #[test]
     fn extending_in_chunks_reserves_only_the_segment() {
         use std::os::fd::AsRawFd;
@@ -1727,8 +1432,7 @@ mod tests {
         assert_eq!(unsafe { libc::fstat(held.as_raw_fd(), &mut status) }, 0);
         assert_eq!(status.st_size, 0, "a reservation extended the length");
 
-        // Blocks are reported in 512 byte units on both platforms this builds for.
-        // A little slack, since a filesystem may round a reservation up.
+        // Blocks are 512-byte units, with slack for a filesystem that rounds up
         let blocks = status.st_blocks as u64 * 512;
         assert!(
             blocks <= logical * 2,
@@ -1908,7 +1612,7 @@ mod tests {
         let bytes = striped_file(&path, 64 * 1024);
         let file = read_only_fd(&path);
 
-        // On its own thread, so the count is of this test's reads alone.
+        // On its own thread, so the count is of this test's reads alone
         let allocs = std::thread::spawn(move || {
             let before = stage_allocations();
             for step in 0..1000u64 {
@@ -1932,7 +1636,7 @@ mod tests {
         assert_eq!(bytes.len(), 64 * 1024);
     }
 
-    // a covering read asks the kernel for the covering span, not for the stage
+    // a covering read asks the kernel for the covering span only
     #[test]
     fn a_covering_read_asks_for_the_span() {
         let dir = tempdir().expect("tempdir");
@@ -1960,16 +1664,14 @@ mod tests {
         let bytes = striped_file(&path, 2 * STAGE_BYTES);
         let file = read_only_fd(&path);
 
-        // Off a block boundary and past the cap, so the span is wider than the
-        // window on both ends and wider than the pooled buffer.
+        // Off a block boundary and past the cap, so the span outgrows the pooled buffer
         let at = 4_095u64;
         let wide = STAGE_BYTES as u64 + 4_096;
         let (allocs, taken) = std::thread::spawn(move || {
             let before = stage_allocations();
             let mut taken = Vec::new();
             for step in 0..8u64 {
-                // A narrow read between the wide ones, so a wide read that replaced
-                // the pool shows up in the count rather than being absorbed.
+                // A narrow read between wide ones shows if a wide read replaced the pool
                 read_covering(file.as_raw_fd(), 100 + step, 64, |window| window.len())
                     .expect("narrow covering read");
 
@@ -2031,12 +1733,12 @@ mod tests {
         }
     }
 
-    // a window running off the end of the file comes back short, not as an error
+    // a window running off the end of the file comes back short
     #[test]
     fn a_covering_read_at_the_end_is_short() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("truncated");
-        // Not a multiple of the block, so the last read stops mid-block.
+        // Not a multiple of the block, so the last read stops mid-block
         let bytes = striped_file(&path, 6000);
         let file = read_only_fd(&path);
 
@@ -2060,7 +1762,7 @@ mod tests {
     fn a_covering_read_stopping_before_the_window_cuts_nothing() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("before");
-        // One byte into the second block, so the read of that block fills one byte.
+        // One byte into the second block, so the read of that block fills one byte
         striped_file(&path, DIRECT_ALIGN + 1);
         let file = read_only_fd(&path);
 
@@ -2078,7 +1780,7 @@ mod tests {
         );
     }
 
-    // a direct descriptor's read past the end comes back short, not EINVAL
+    // a direct read past the end comes back short and without EINVAL
     #[cfg(target_os = "linux")]
     #[test]
     fn a_direct_covering_read_at_the_end_is_short() {
@@ -2114,91 +1816,20 @@ mod tests {
         );
     }
 
-    // a retired plane serves the window off the buffered descriptor
-    #[test]
-    fn a_retired_plane_reads_buffered() {
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("retired");
-        let bytes = striped_file(&path, 16 * 1024);
-
-        let backend = PosixBackend::new();
-        let file = open_file(&backend, &path, false);
-        backend
-            .submit(vec![Op::Open {
-                tag: Tag(2),
-                path: path.clone(),
-                create: false,
-                direct: true,
-            }])
-            .expect("submit the direct open");
-        let direct = opened(drain_one(&backend).outcome).expect("direct open");
-
-        backend.cold.retire(&ReelError::Backend("test".to_string()));
-        backend
-            .submit(vec![Op::PreadCold {
-                tag: Tag(3),
-                file,
-                direct,
-                offset: 5000,
-                buf: ReadBuf::new(1000),
-                probe: true,
-            }])
-            .expect("submit the routed read");
-        let (result, taken) = read_bytes(drain_one(&backend).outcome);
-
-        assert_eq!(result.expect("the buffered fallback read"), 1000);
-        assert_eq!(taken.as_slice(), &bytes[5000..6000]);
-        assert_eq!(backend.cold_reads().routed, 1, "the read was still routed");
-        assert_eq!(
-            backend.cold_reads().direct,
-            0,
-            "and never reached the device plane"
-        );
-    }
-
-    // a probe coming back leaves the direct read's own fallback intact
-    #[test]
-    fn a_probe_leaves_the_direct_plane_unproven() {
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("unproven");
-        striped_file(&path, 16 * 1024);
-        let file = std::fs::File::open(&path).expect("open the probed descriptor");
-        let refused = ReelError::Io(io::Error::from_raw_os_error(libc::EINVAL));
-
-        let cold = ColdReads::new();
-        let mut buf = ReadBuf::new(4000);
-        cold.warm_read(file.as_raw_fd(), &mut buf, 0)
-            .expect("the probe answered");
-        if !cold.is_probe_proven() {
-            println!("skipped: this filesystem refused the probe, so it latched nothing");
-            return;
-        }
-
-        assert!(
-            cold.retire_on_refusal(&refused),
-            "the probe proved the direct plane"
-        );
-        cold.note_direct();
-        assert!(
-            !cold.retire_on_refusal(&refused),
-            "a plane that answered retired anyway"
-        );
-    }
-
-    // a probe that filled the whole window is the answer
+    // a probe that filled the whole read is the answer
     #[test]
     fn warm_verdict_takes_a_full_fill() {
         assert_eq!(warm_verdict(4000, 0, 4000, true), WarmVerdict::Warm(4000));
     }
 
-    // a probe that filled part of the window commits nothing and goes to the device
+    // a probe that filled part of the read commits nothing and goes to the device
     #[test]
     fn warm_verdict_refuses_a_partial_fill() {
         assert_eq!(warm_verdict(2048, 0, 4000, true), WarmVerdict::Cold);
         assert_eq!(warm_verdict(0, 0, 4000, true), WarmVerdict::Cold);
     }
 
-    // the pages are not resident, which is what the probe exists to find out
+    // EAGAIN means the pages are not resident, so the read is cold
     #[test]
     fn warm_verdict_reads_eagain_as_cold() {
         assert_eq!(
@@ -2207,7 +1838,7 @@ mod tests {
         );
     }
 
-    // a kernel that has never answered and refuses the flag retires the plane
+    // a kernel that has never answered and refuses the flag retires the probe
     #[test]
     fn warm_verdict_retires_an_unknown_flag() {
         assert_eq!(
@@ -2220,7 +1851,7 @@ mod tests {
         );
     }
 
-    // once the plane has answered, the same codes are the read's own error
+    // once the probe has answered, the same codes are the read's own error
     #[test]
     fn warm_verdict_reports_errors_after_proof() {
         assert_eq!(

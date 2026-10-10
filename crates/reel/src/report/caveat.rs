@@ -1,14 +1,8 @@
-//! What a reader has to know to read a report's numbers right
-//!
-//! A figure this open could not count is not a zero, and a total a rebuild left
-//! bytes out of is a floor rather than the number. Saying so used to be prose the
-//! text renderer wrote, which left every other consumer of a report reading
-//! floors as totals. A caveat is a field on the report instead, so it serialises
-//! with the figures it qualifies and no format can drop it.
+//! Caveats on a report's figures, kept as data so every format shows them
 
 use super::doc::Note;
 
-/// Something standing between a figure and what a reader would take it for
+/// A note that a figure is uncounted or only a floor
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Caveat {
@@ -20,7 +14,7 @@ pub struct Caveat {
 }
 
 impl Caveat {
-    /// A caveat nothing can be run about
+    /// A caveat with no fix
     pub fn new(what: impl Into<String>) -> Caveat {
         Caveat {
             what: what.into(),
@@ -28,7 +22,7 @@ impl Caveat {
         }
     }
 
-    /// Name the flag or command that answers the caveat
+    /// Set the flag or command that answers the caveat
     pub fn fix(mut self, fix: impl Into<String>) -> Caveat {
         self.fix = Some(fix.into());
         self
@@ -44,7 +38,16 @@ impl From<&Caveat> for Note {
     }
 }
 
-/// The findings a block of caveats renders as
+/// The caveats as notes for a report block
 pub fn notes(caveats: &[Caveat]) -> Vec<Note> {
     caveats.iter().map(Note::from).collect()
+}
+
+/// The caveat that segment weights start from each seal's tally and may count dead bytes as live
+pub fn seal_tally() -> Caveat {
+    Caveat::new(
+        "segment live and dead bytes start from each seal's tally, so a version outversioned \
+         since its seal that the open could not join reads as live until a scrub lap settles \
+         it, and a read-only open never scrubs",
+    )
 }

@@ -1,9 +1,5 @@
-//! Deterministic fault-injecting simulator backend for the ring-shaped I/O trait
-//!
-//! An in-memory filesystem models a cached view reads see and a durable view a
-//! crash keeps, and a seeded plan injects torn writes, lying syncs, bit flips,
-//! crash points, and lost completions. The backend is a pure function of an op
-//! stream and a plan, so a seed reproduces an image exactly.
+//! Deterministic in-memory I/O backend that injects faults from a seeded plan
+//! Each file has a cached view for reads and a durable view that a crash keeps
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -30,13 +26,13 @@ pub struct AdviseTrace {
 
 #[derive(Clone, Debug, Default)]
 struct SimFile {
-    /// Bytes a read sees, whether or not they reached the medium
+    /// What a read sees, synced or not
     cached: Vec<u8>,
 
-    /// Bytes a crash keeps
+    /// What a crash keeps
     durable: Vec<u8>,
 
-    /// Whether the entry naming this file is durable, so a crash can drop it
+    /// Whether the directory entry is durable, a crash drops the file without it
     is_linked: bool,
 }
 
@@ -56,16 +52,13 @@ impl SimFile {
     }
 }
 
-/// What one open handle names
-///
-/// An unlink takes the name and nothing else, so open handles go on reading and
-/// only the last close frees the file.
+/// The file an open handle points at, which outlives an unlink until the last close
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FileRef {
     /// A file still reachable by its path
     Named(PathBuf),
 
-    /// A file whose name is gone, held open by the handles that share this number
+    /// An unlinked file, held open by the handles that share this number
     Detached(u64),
 }
 
@@ -79,8 +72,6 @@ struct DelayedCompletion {
 struct SimState {
     plan: FaultPlan,
 
-    // Ordered by path so a listing or a subtree rename costs the subtree rather
-    // than the whole image.
     files: BTreeMap<PathBuf, SimFile>,
     handles: HashMap<FileId, FileRef>,
     detached: HashMap<u64, SimFile>,
@@ -140,7 +131,6 @@ impl SimState {
 struct SimShared {
     state: Mutex<SimState>,
 
-    /// Ops this backend has executed, the count a leg proves an op count against
     ops: AtomicU64,
 }
 
@@ -180,31 +170,24 @@ impl SimIo {
         }
     }
 
-    /// Seed the simulator was built with
+    /// The seed of the fault plan
     pub fn seed(&self) -> u64 {
         lock(&self.shared.state).plan.seed
     }
 
-    /// Fault plan the simulator replays
+    /// A copy of the fault plan
     pub fn plan(&self) -> FaultPlan {
         lock(&self.shared.state).plan.clone()
     }
 
-    /// Stop scheduling new faults, keeping the damage the plan has already done
-    ///
-    /// A caller disarms before inspecting the result, so the inspection reads the
-    /// damage rather than taking its own. Reordering and scatter stay, since they
-    /// model a device rather than a failure.
+    /// Clear pending faults and the crash point, keeping reorder, scatter and damage done
     pub fn disarm(&self) {
         let mut state = lock(&self.shared.state);
         state.plan.faults.clear();
         state.plan.crash_at = None;
     }
 
-    /// Arm one fault kind across the next few ops the volume submits
-    ///
-    /// A plan pins faults to global op positions a caller can only name by
-    /// counting every io so far; this arms the window one call runs in instead.
+    /// Arm one fault kind on each of the next `ops` ops the volume submits
     pub fn arm_next_ops(&self, ops: u64, kind: FaultKind) {
         let mut state = lock(&self.shared.state);
         let from = state.op_position;
@@ -214,10 +197,7 @@ impl SimIo {
         state.faults_drawn = state.plan.faults.len();
     }
 
-    /// Faults the plan actually reached, against the count it scheduled
-    ///
-    /// A run finishing short of its op estimate leaves the tail of its plan
-    /// unreached, so its fault count overstates what it searched.
+    /// Faults fired so far and faults scheduled
     pub fn fault_reach(&self) -> (u64, usize) {
         let state = lock(&self.shared.state);
         (state.faults_fired, state.faults_drawn)
@@ -228,10 +208,7 @@ impl SimIo {
         lock(&self.shared.state).is_crashed
     }
 
-    /// The bytes every file holds if power is lost now, sorted for a stable image
-    ///
-    /// A file created without a directory sync behind it is absent rather than
-    /// empty, since the crash took the entry that named it.
+    /// The bytes every linked file holds if power is lost now, sorted by path
     pub fn durable_image(&self) -> DurableImage {
         let state = lock(&self.shared.state);
         let mut image: DurableImage = state
@@ -244,7 +221,7 @@ impl SimIo {
         image
     }
 
-    /// The bytes one file holds if power is lost now, for crash reopen assertions
+    /// The bytes one file holds if power is lost now
     pub fn durable_bytes(&self, path: &Path) -> Option<Vec<u8>> {
         let state = lock(&self.shared.state);
         state
@@ -254,7 +231,7 @@ impl SimIo {
             .map(|file| crashed_bytes(path, file, &state.plan))
     }
 
-    /// Bytes written but not yet synced, the region a crash is free to scatter
+    /// Bytes written but not yet synced, which a crash may scatter
     pub fn unsynced_bytes(&self) -> u64 {
         let state = lock(&self.shared.state);
         let mut total = 0u64;
@@ -276,15 +253,12 @@ impl SimIo {
         lock(&self.shared.state).advise_traces.clone()
     }
 
-    /// Order directory renames and unlinks were actually applied in
+    /// Directory renames and unlinks, in the order they were applied
     pub fn dir_op_order(&self) -> Vec<String> {
         lock(&self.shared.state).dir_op_order.clone()
     }
 
-    /// The op ledger against the slot table's, for stall diagnosis
-    ///
-    /// Submitted minus dropped minus ready and delayed is what callers should
-    /// have seen, and a gap says which side of the seam lost a completion.
+    /// Submitted, swallowed, dropped, ready and delayed counts, for diagnosing stalls
     pub fn debug_counts(&self) -> String {
         let state = lock(&self.shared.state);
         format!(
@@ -298,27 +272,27 @@ impl SimIo {
         )
     }
 
-    /// Reads that reached the volume, so a caller can prove one never happened
+    /// Reads that reached the volume
     pub fn read_count(&self) -> u64 {
         lock(&self.shared.state).read_count
     }
 
-    /// Bytes the backend has handed back, which is what a read costs past its count
+    /// Bytes the backend has returned from reads
     pub fn read_bytes(&self) -> u64 {
         lock(&self.shared.state).read_bytes
     }
 
-    /// File syncs asked for so far, the count a durability cadence is judged by
+    /// Data syncs asked for so far
     pub fn sync_count(&self) -> u64 {
         lock(&self.shared.state).sync_count
     }
 
-    /// Most ops handed over in one submission, the depth a caller actually built
+    /// The most ops handed over in one submission
     pub fn widest_batch(&self) -> usize {
         lock(&self.shared.state).widest_batch
     }
 
-    /// Ops this backend has executed, for a leg counting what a read cost
+    /// Ops this backend has executed
     pub fn ops(&self) -> u64 {
         self.shared.ops.load(Ordering::Relaxed)
     }
@@ -424,7 +398,6 @@ fn is_dir_op(op: &Op) -> bool {
         Op::Open { .. }
         | Op::Writev { .. }
         | Op::Pread { .. }
-        | Op::PreadCold { .. }
         | Op::PreadSplit { .. }
         | Op::SyncData { .. }
         | Op::SyncFull { .. }
@@ -434,6 +407,7 @@ fn is_dir_op(op: &Op) -> bool {
         | Op::Length { .. }
         | Op::Close { .. }
         | Op::Allocate { .. }
+        | Op::Release { .. }
         | Op::Truncate { .. }
         | Op::Advise { .. } => false,
     }
@@ -476,9 +450,7 @@ fn execute_op(state: &mut SimState, op: Op, position: u64) -> Completion {
         state.faults_fired += 1;
     }
     match op {
-        Op::Open {
-            tag, path, create, ..
-        } => {
+        Op::Open { tag, path, create } => {
             let outcome = if create || state.files.contains_key(&path) {
                 state
                     .files
@@ -507,23 +479,6 @@ fn execute_op(state: &mut SimState, op: Op, position: u64) -> Completion {
             file,
             offset,
             mut buf,
-        } => {
-            let result = match fault {
-                Some(FaultKind::ReadError) => Err(input_output()),
-                _ => read_into(state, file, offset, &mut buf),
-            };
-            Completion {
-                tag,
-                outcome: Outcome::Read { result, buf },
-            }
-        }
-        // The image is in memory, so the buffered descriptor is the only one.
-        Op::PreadCold {
-            tag,
-            file,
-            offset,
-            mut buf,
-            ..
         } => {
             let result = match fault {
                 Some(FaultKind::ReadError) => Err(input_output()),
@@ -586,8 +541,7 @@ fn execute_op(state: &mut SimState, op: Op, position: u64) -> Completion {
             state.dir_op_order.push(file_label(&from));
             let outcome = match state.files.remove(&from) {
                 Some(file) => {
-                    // A handle follows the file it was opened on, not the name,
-                    // so handles on the old path move with it.
+                    // Handles open on the old path follow the file to the new one
                     for held in state.handles.values_mut() {
                         if *held == FileRef::Named(from.clone()) {
                             *held = FileRef::Named(to.clone());
@@ -619,7 +573,7 @@ fn execute_op(state: &mut SimState, op: Op, position: u64) -> Completion {
             }
         }
         Op::List { tag, dir } => {
-            // The directory's files are contiguous, so a listing costs the directory.
+            // A directory's files sort together, so the listing walks only that range
             let mut entries: Vec<SegmentEntry> = state
                 .files
                 .range(dir.clone()..)
@@ -638,7 +592,7 @@ fn execute_op(state: &mut SimState, op: Op, position: u64) -> Completion {
         }
         Op::Close { tag, file } => {
             let outcome = match state.handles.remove(&file) {
-                // The last close of a file nothing names any more is what frees it.
+                // The last handle on an unlinked file frees it
                 Some(FileRef::Detached(id)) => {
                     if !holds_detached(state, id) {
                         state.detached.remove(&id);
@@ -662,6 +616,15 @@ fn execute_op(state: &mut SimState, op: Op, position: u64) -> Completion {
         } => Completion {
             tag,
             outcome: Outcome::Done(allocate(state, file, offset, len, fault)),
+        },
+        Op::Release {
+            tag,
+            file,
+            offset,
+            len,
+        } => Completion {
+            tag,
+            outcome: Outcome::Done(release(state, file, offset, len)),
         },
         Op::Truncate { tag, file, len } => Completion {
             tag,
@@ -765,7 +728,7 @@ fn write_effect(fault: Option<FaultKind>, full_len: u64) -> (u64, u64) {
     }
 }
 
-/// The file one handle was opened on, by name or after its name was taken
+/// The file a handle was opened on, whether or not it was unlinked since
 fn held_file(state: &SimState, file: FileId) -> Result<&SimFile> {
     match state.handles.get(&file) {
         Some(FileRef::Named(path)) => state.files.get(path).ok_or_else(no_such_file),
@@ -782,10 +745,7 @@ fn held_file_mut(state: &mut SimState, file: FileId) -> Result<&mut SimFile> {
     }
 }
 
-/// Hand an unlinked file to the handles still open on it, or let it go
-///
-/// A file nobody has open goes with its name; one still open outlives it until
-/// the last handle closes.
+/// Hand an unlinked file to the handles still open on it, or drop it when none are
 fn detach(state: &mut SimState, path: &Path, file: SimFile) {
     let named = FileRef::Named(path.to_path_buf());
     let holders: Vec<FileId> = state
@@ -892,15 +852,22 @@ fn allocate(
     if matches!(fault, Some(FaultKind::EnospcAllocate)) {
         return Err(out_of_space());
     }
-    // The reservation is invisible to the format: it claims blocks without
-    // touching the length, so the simulated file keeps ending at its last
-    // written byte the way a real one does under a keep-size fallocate.
+    // Like a keep-size fallocate, the reservation leaves the length unchanged
     held_file_mut(state, file)?;
     let _ = (offset, len);
     Ok(())
 }
 
-/// Cut the cached view to a length; the durable image follows at the next sync
+/// Zero a released range without changing the file length
+fn release(state: &mut SimState, file: FileId, offset: u64, len: u64) -> Result<()> {
+    let file_ref = held_file_mut(state, file)?;
+    let end = (offset.saturating_add(len) as usize).min(file_ref.cached.len());
+    let start = (offset as usize).min(end);
+    file_ref.cached[start..end].fill(0);
+    Ok(())
+}
+
+/// Cut the cached view to a length, the durable view follows at the next sync
 fn truncate(state: &mut SimState, file: FileId, len: u64, fault: Option<FaultKind>) -> Result<()> {
     if matches!(fault, Some(FaultKind::TruncateError)) {
         return Err(input_output());
@@ -910,11 +877,7 @@ fn truncate(state: &mut SimState, file: FileId, len: u64, fault: Option<FaultKin
     Ok(())
 }
 
-/// The bytes a medium holds for one file if power is lost now
-///
-/// A synced byte is kept and an unsynced byte is absent, so what survives is a
-/// prefix. Under a scatter setting each unsynced sector lands independently, so
-/// a fresh sector can come back after a stale one.
+/// The bytes one file keeps on power loss, where under scatter each unsynced sector may land
 fn crashed_bytes(path: &Path, file: &SimFile, plan: &FaultPlan) -> Vec<u8> {
     let sector = match plan.scatter_bytes {
         Some(bytes) => bytes as usize,
@@ -939,7 +902,7 @@ fn crashed_bytes(path: &Path, file: &SimFile, plan: &FaultPlan) -> Vec<u8> {
     out
 }
 
-/// Whether the device had committed one sector when the power went, from the plan
+/// Whether one sector landed before the power went, from a seeded hash
 fn sector_persists(stream: u64, ordinal: u64) -> bool {
     let mut hash = stream.wrapping_add(ordinal.wrapping_mul(0x9E37_79B9_7F4A_7C15));
     hash = (hash ^ (hash >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -948,7 +911,7 @@ fn sector_persists(stream: u64, ordinal: u64) -> bool {
     hash & 1 == 0
 }
 
-/// A per-file discriminator, so two files do not scatter identically
+/// A per-path seed, so two files do not scatter identically
 fn path_seed(path: &Path) -> u64 {
     let mut hash = 0xCBF2_9CE4_8422_2325u64;
     for byte in path.as_os_str().as_encoded_bytes() {
@@ -1034,7 +997,7 @@ mod tests {
         }
     }
 
-    // a scatter leaves unsynced sectors partly landed rather than truncated
+    // a scatter lands some unsynced sectors and loses others
     #[test]
     fn scatter_lands_some_unsynced_sectors() {
         let sectors = 64usize;
@@ -1059,7 +1022,7 @@ mod tests {
         );
     }
 
-    // a scattered image is not a prefix, which is the whole point of the fault
+    // a scattered image can keep a sector after a lost one
     #[test]
     fn scatter_is_not_a_prefix() {
         let sectors = 64usize;
@@ -1126,13 +1089,12 @@ mod tests {
         );
     }
 
-    // A created file is linked down first, since these tests are about bytes.
+    // Opens a file, marking a created one linked so a crash keeps it
     fn open(io: &SimIo, path: &Path, create: bool) -> FileId {
         io.submit(vec![Op::Open {
             tag: Tag(1),
             path: path.to_path_buf(),
             create,
-            direct: false,
         }])
         .expect("submit open");
         let file = opened(one(io).outcome).expect("open result");
@@ -1142,7 +1104,7 @@ mod tests {
         file
     }
 
-    // Marked durable in place: a directory sync op would shift every fault position.
+    // Sets the link flag directly, since a directory sync op would shift every fault position
     fn link_down(io: &SimIo, path: &Path) {
         lock(&io.shared.state)
             .files

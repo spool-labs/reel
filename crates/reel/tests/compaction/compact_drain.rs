@@ -1,8 +1,4 @@
-//! Every wholly dead segment drains in one pass, not one per tick
-//!
-//! A rolling purge can retire segments faster than the maintenance tick fires,
-//! and a one-segment-per-pass limit builds a dead backlog behind a bound meant
-//! for copying. An unlink copies nothing, so a single pass takes them all.
+//! One compaction pass unlinks every wholly dead segment
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,8 +6,8 @@ use std::sync::Arc;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, Preallocate, ReelConfig,
-    ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget,
 };
 use reel_core::Store;
 
@@ -22,10 +18,9 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
-// kill five segments, compact once, and all five are gone
+// kill several segments, compact once, and every wholly dead one is gone
 #[test]
 fn one_pass_drains_every_wholly_dead_segment() {
     let sim = SimIo::new(FaultPlan::new(23));
@@ -33,8 +28,6 @@ fn one_pass_drains_every_wholly_dead_segment() {
         PathBuf::from("/drain"),
         ReelConfig {
             segment_bytes: ByteCount::from_bytes(128 * 1024),
-            alloc_chunk: ByteCount::from_bytes(32 * 1024),
-            preallocate: Preallocate::Chunk,
             sync: SyncPolicy::Never,
             active_tails: ThreadBudget::threads(1),
             ..ReelConfig::default()

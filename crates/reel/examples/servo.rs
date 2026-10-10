@@ -1,17 +1,11 @@
 //! What this machine says about itself, and what the bias pass makes of it
 //!
-//! Nothing here is measured: every fact is a file the kernel already wrote or a
-//! stat an opening volume already takes. The engine reads the same facts on open
-//! and keeps them, which the open at the end checks against these.
-//!
 //! cargo run --example servo
 
 use std::path::Path;
 
 use reel::reel::bias::{access_ranges, available_bytes, MachineFacts, Plane, RingAvailability};
-use reel::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, RangedReads, ReelConfig, ReelStore,
-};
+use reel::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore};
 
 const RECORDS: &str = "records";
 
@@ -23,10 +17,9 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 1,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
-/// A byte count as a person reads it, or the absence the platform reported
+/// A byte count as a person reads it, or unknown
 fn size(value: Option<u64>) -> String {
     match value {
         None => "unknown".to_string(),
@@ -87,16 +80,12 @@ fn main() -> reel::Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path();
     let config = ReelConfig::default();
-    // What full preallocation would claim before a byte is written, which is the term
-    // the reservation half of the verdict turns on.
-    let reservation = config.segment_bytes.to_bytes() * config.tail_count() as u64;
 
     let facts = MachineFacts::read(root);
     report(root, &facts);
 
-    let verdict = facts.verdict(reservation);
+    let verdict = facts.verdict();
     println!();
-    println!("{:<20}{}", "reservation", size(Some(reservation)));
     println!("{:<20}{:?}", "plane", verdict.plane);
     println!("{:<20}{}", "because", verdict.because);
     println!("{:<20}{}", "mapping", verdict.map_because);
@@ -108,18 +97,11 @@ fn main() -> reel::Result<()> {
             None => "off".to_string(),
         }
     );
-    println!("{:<20}{:?}", "ranged reads", verdict.ranged_reads);
-    println!("{:<20}{:?}", "preallocate", verdict.preallocate);
     println!("{:<20}{}", "fd cache", verdict.fd_cache);
 
-    // A window is read where the volume opened: a direct volume is refused mapped
-    // reads at validation, and a mapping is only ever advised on the buffered plane.
-    match verdict.plane {
-        Plane::Direct => {
-            assert_eq!(verdict.map_above, None);
-            assert_eq!(verdict.ranged_reads, RangedReads::Direct);
-        }
-        Plane::Buffered => assert_eq!(verdict.ranged_reads, RangedReads::Cached),
+    // A direct volume refuses a mapping at validation, so the pass advises no floor there
+    if verdict.plane == Plane::Direct {
+        assert_eq!(verdict.map_above, None);
     }
     assert!(
         verdict.fd_cache > 0,
@@ -133,7 +115,7 @@ fn main() -> reel::Result<()> {
     assert_eq!(kept.memory_bytes, facts.memory_bytes);
     assert_eq!(kept.volume_capacity_bytes, facts.volume_capacity_bytes);
     assert_eq!(kept.ring, facts.ring);
-    assert_eq!(kept.verdict(reservation).plane, verdict.plane);
+    assert_eq!(kept.verdict().plane, verdict.plane);
 
     println!();
     println!("the open read these facts for itself and reached the same plane");

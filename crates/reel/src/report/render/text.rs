@@ -1,20 +1,11 @@
-//! A report as a terminal reads it
-//!
-//! Head and verdict first, inside a frame where the frontend says there is a
-//! terminal to draw one on, then the blocks in the order the report said them.
-//! Column widths are measured off the content, so nothing here declares a layout
-//! and a wider name widens its column rather than colliding with the next.
+//! Terminal renderer: framed head and verdict, then the blocks in order
 
 use std::fmt::Write;
 
 use super::style::{pad, paint, width, Paint, Style};
 use crate::report::doc::{Align, Block, Doc, Note, Notes, Table, Tone, Verdict};
 
-/// Text a line is built from, kept beside the width it actually occupies
-///
-/// An escape sequence has no width, so a painted string cannot be measured for
-/// padding. Building both forms at once is what keeps a coloured table's columns
-/// standing where an uncoloured one's do.
+/// A line's painted text and its visible width, since escape codes have no width
 #[derive(Default)]
 struct Painted {
     plain: usize,
@@ -31,7 +22,7 @@ impl Painted {
         }
     }
 
-    /// Append unpainted spaces, which pad a line without colouring it
+    /// Append unpainted spaces for padding
     fn space(&mut self, count: usize) {
         self.plain += count;
         for _ in 0..count {
@@ -60,8 +51,7 @@ where
         writeln!(out, "{line}")?;
     }
 
-    // A blank line between anything already written and whatever comes next,
-    // which is the whole of how the blocks are held apart.
+    // Blocks are separated by one blank line
     let mut written = !banner.is_empty();
     for block in &doc.blocks {
         if written {
@@ -101,17 +91,14 @@ fn banner(doc: &Doc, style: &Style) -> Vec<String> {
     }
 }
 
-/// The verdict as its own rows, the word carried heavier than the figures
+/// The verdict's rows, with the word set heavier than the figures
 fn verdict_rows(verdict: &Verdict, style: &Style) -> Vec<Painted> {
     let mut word = Painted::default();
     word.push(style, Some(Paint::Strong), &verdict.label);
     if let Some(role) = role(verdict.tone) {
-        // The word is what carries, so it takes the colour and the weight
-        // together where a terminal can show both.
         word.rich = paint(style, role, &word.rich);
     }
-    // A verdict that is only a word is only a word: nothing is written after it
-    // to hold a detail that was never given.
+    // A verdict with no detail is just the word
     if verdict.detail.is_empty() {
         return vec![word];
     }
@@ -141,8 +128,6 @@ fn verdict_rows(verdict: &Verdict, style: &Style) -> Vec<Painted> {
 fn loose(head: Vec<Painted>, verdict: Vec<Painted>) -> Vec<String> {
     let mut lines: Vec<String> = head.into_iter().map(|row| row.rich).collect();
     if !lines.is_empty() && !verdict.is_empty() {
-        // A blank line between the two is the whole of the separation here,
-        // since there is no frame to sit them in.
         lines.push(String::new());
     }
     lines.extend(verdict.into_iter().map(|row| row.rich));
@@ -212,10 +197,10 @@ where
     Ok(())
 }
 
-/// Two spaces of rail down the left of every table, so a table reads as a block
+/// Every table is indented by this many spaces
 const RAIL: usize = 2;
 
-/// Two spaces between columns, which is enough to separate and no more
+/// Spaces between columns
 const GAP: usize = 2;
 
 fn table_block<Sink>(table: &Table, style: &Style, out: &mut Sink) -> std::fmt::Result
@@ -224,12 +209,7 @@ where
 {
     let widths = widths(table);
 
-    // Nothing is padded out past the last thing on its line: trailing spaces are
-    // invisible to a reader and noise to everything else that reads output. A
-    // column of figures is exempt, since its padding leads rather than trails and
-    // dropping it would leave the figures unaligned. Whether anything follows the
-    // last cell is asked of each line rather than of the table, since a note on
-    // one row is no reason to pad out the rows that carry none.
+    // A left-aligned last column is padded only on rows with a note, so no line ends in spaces
     let ragged = matches!(table.columns.last(), Some(column) if column.align == Align::Left);
     let last = table.columns.len().saturating_sub(1);
 
@@ -265,8 +245,7 @@ where
         if let Some(note) = &row.note {
             line.space(GAP);
             let tone = match row.tone {
-                // A note on a plain row is an aside; on a toned row it is the
-                // reason the row is toned, so it keeps the row's colour.
+                // A note on a toned row explains the tone, so it keeps the row's colour
                 Tone::Plain => Some(Paint::Dim),
                 tone => role(tone),
             };
@@ -297,7 +276,7 @@ fn widths(table: &Table) -> Vec<usize> {
     widths
 }
 
-/// The bullet a finding is marked with, and the arrow its answer is marked with
+/// The marks for a finding and for the command that answers it
 const BULLET: &str = "●";
 const ARROW: &str = "→";
 
@@ -394,8 +373,7 @@ fn footer_block<Sink>(commands: &[String], style: &Style, out: &mut Sink) -> std
 where
     Sink: Write,
 {
-    // Packed whole rather than wrapped: half a command on each of two lines is
-    // not a command anybody can copy.
+    // Commands are packed whole so each one stays on a single line to copy
     let mut line = String::new();
     for command in commands {
         let would = match line.is_empty() {
@@ -419,10 +397,7 @@ where
     Ok(())
 }
 
-/// Break text into lines no wider than a limit, at the spaces between words
-///
-/// A word longer than the limit is left whole and overhangs, since breaking a
-/// path or a flag in the middle costs the reader more than the overhang does.
+/// Break text at spaces into lines no wider than the limit, leaving longer words whole
 fn wrap(text: &str, limit: usize) -> Vec<String> {
     if text.is_empty() {
         return vec![String::new()];

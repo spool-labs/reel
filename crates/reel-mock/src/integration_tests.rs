@@ -1,4 +1,4 @@
-//! Tests for MemoryStore against the Store trait.
+//! Tests for MemoryStore against the Store trait
 
 use reel_core::Value;
 use reel_core::{Store, WriteBatch};

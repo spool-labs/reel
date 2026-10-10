@@ -1,7 +1,4 @@
-//! Consistent read views, held open against a volume that keeps changing
-//!
-//! A cue point is one sequence number plus a promise that everything needed to
-//! answer reads at that number is still on disk.
+//! Cue points: consistent read views that keep what they can see on disk until dropped
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,8 +36,7 @@ impl CuePoints {
         if let Some(count) = held.get_mut(&at) {
             *count -= 1;
             if *count == 0 {
-                // Packed, since the numbers climb and the releases drain the low
-                // end: a bare removal leaves emptied leaves in the floor's walk.
+                // Packed, so the drained low end leaves no empty leaves in the floor's walk
                 held.remove_packed(&at);
             }
         }
@@ -76,10 +72,7 @@ impl CuePoints {
     }
 }
 
-/// A view of the volume as it stood at one sequence number
-///
-/// Holding one keeps the versions it can see from being reclaimed; dropping it
-/// gives that back, which is why it is a guard rather than a bare number.
+/// A view of the volume at one sequence number, holding its versions until dropped
 pub struct CuePoint {
     at: Lsn,
     points: Arc<CuePoints>,
@@ -133,7 +126,7 @@ mod tests {
         assert_eq!(points.floor(), None);
     }
 
-    // two holders of one number share it, so the first to go holds nothing back
+    // two holders of one number share it, so it stays held until the last one goes
     #[test]
     fn holders_share() {
         let points = points();

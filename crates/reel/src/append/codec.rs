@@ -1,42 +1,23 @@
 //! Per-column payload compression, applied at admission and undone at read
-//!
-//! The record header's codec byte says what happened, so the read side needs no column
-//! context: zero is raw, nonzero names the codec that produced the stored bytes. The
-//! header's length field and the checksum both keep meaning the stored bytes, so scrub,
-//! recovery and compaction never decompress.
 
 use crate::format::column::Codec;
 use crate::reel::payload;
 
-/// Bytes the logical length prefix takes ahead of the codec bytes
-///
-/// A stored compressed payload opens with its logical length, little endian, so a read
-/// can size the output buffer exactly.
+/// A compressed payload opens with its logical length in this many little-endian bytes
 const LOGICAL_PREFIX: usize = 4;
 
 /// Payloads below this never attempt compression
-///
-/// A payload this small cannot repay the codec byte and the length prefix even when it
-/// shrinks, and the attempt itself costs a pass over the bytes.
 const MIN_ATTEMPT: usize = 256;
 
 /// Logical lengths past this are rejected as corruption at decode
-///
-/// A record is bounded by its segment, so a prefix claiming more is a lie behind a
-/// checksum that happened to pass, and the read reports corrupt rather than allocating.
 const MAX_LOGICAL: usize = 1 << 30;
 
 /// A kept compression must shrink the stored bytes by at least an eighth
-///
-/// Anything less trades a decode on every future read for noise.
 fn worth_keeping(logical: usize, stored: usize) -> bool {
     stored <= logical - logical / 8
 }
 
-/// Compress a payload at admission when the column asks and the payload cooperates
-///
-/// Returns the bytes to store and the codec byte for the header, raw with the byte at
-/// zero unless the payload shrinks by an eighth.
+/// Compress a payload when the column asks, returning the bytes to store and the codec byte
 pub fn admit(codec: Codec, payload: Vec<u8>) -> (Vec<u8>, u8) {
     if !matches!(codec, Codec::Lz4) || payload.len() < MIN_ATTEMPT {
         return (payload, 0);
@@ -45,8 +26,7 @@ pub fn admit(codec: Codec, payload: Vec<u8>) -> (Vec<u8>, u8) {
     let logical = payload.len();
     let ceiling = LOGICAL_PREFIX + lz4_flex::block::get_maximum_output_size(logical);
 
-    // Sized exactly and outside the pool: this buffer leaves as the stored bytes, so
-    // pooling it would take a buffer out of this thread's reads and put nothing back.
+    // Allocated outside the pool, since this buffer leaves as the stored bytes
     let mut out = vec![0u8; ceiling];
     out[..LOGICAL_PREFIX].copy_from_slice(&(logical as u32).to_le_bytes());
 
@@ -65,9 +45,6 @@ pub fn admit(codec: Codec, payload: Vec<u8>) -> (Vec<u8>, u8) {
 }
 
 /// Decode a stored payload into a pooled buffer, or say it cannot be done
-///
-/// Nothing here distinguishes an unknown codec byte from codec bytes that do not decode:
-/// both are corruption wearing a valid checksum.
 pub fn decode(codec_byte: u8, stored: &[u8]) -> Option<Vec<u8>> {
     if codec_byte != Codec::Lz4.as_byte() || stored.len() < LOGICAL_PREFIX {
         return None;
@@ -78,8 +55,7 @@ pub fn decode(codec_byte: u8, stored: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
-    // Taken at its length rather than empty and grown, since growing it zeroes the whole
-    // output before the codec overwrites every byte of it.
+    // Take it at full length, since growing it would zero bytes the codec overwrites anyway
     let mut out = payload::take_written(logical);
     match lz4_flex::block::decompress_into(&stored[LOGICAL_PREFIX..], &mut out) {
         Ok(written) if written == logical => Some(out),
@@ -110,7 +86,7 @@ mod tests {
             .collect()
     }
 
-    // a compressible payload shrinks, carries the codec byte, and round trips
+    // a compressible payload shrinks, sets the codec byte, and round trips
     #[test]
     fn roundtrip_shrinks() {
         let raw = compressible(4096);
@@ -147,7 +123,7 @@ mod tests {
         assert_eq!(stored, raw);
     }
 
-    // garbage codec bytes and lying prefixes read as corrupt, not as panics
+    // garbage codec bytes and lying prefixes read as corrupt without panicking
     #[test]
     fn decode_rejects_garbage() {
         assert!(decode(Codec::Lz4.as_byte(), &[1, 2]).is_none());

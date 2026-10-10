@@ -1,21 +1,14 @@
-//! What the machine says about itself, read once when a volume opens
-//!
-//! Nothing here measures: every fact is a file the kernel already wrote or a stat
-//! the volume already needs. Every field is optional and every failure is silent,
-//! so a volume never fails to open over a fact it wanted for a log line. The pass
-//! logs a verdict and acts on nothing.
+//! What the machine says about itself, read once when a volume opens and only logged
 
 use std::path::Path;
 
-use crate::config::{Preallocate, RangedReads, DEFAULT_FD_CACHE};
+use crate::config::DEFAULT_FD_CACHE;
 use crate::units::ByteCount;
 
-/// Facts about the machine and the device a volume sits on
-///
-/// Absent means the platform did not offer it, which is not the same as zero.
+/// Facts about the machine and the volume's device, absent where the platform does not say
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MachineFacts {
-    /// Total usable memory, which bounds what a working set can stay warm in
+    /// Total usable memory, the most a working set can stay warm in
     pub memory_bytes: Option<u64>,
 
     /// Capacity of the filesystem holding the volume, a proxy for its ceiling
@@ -24,7 +17,7 @@ pub struct MachineFacts {
     /// What the volume already occupies, summed from its segment files
     pub volume_bytes: Option<u64>,
 
-    /// Bytes the device takes or refuses, which direct io has to be framed on
+    /// The device's logical block size, which direct io must align to
     pub logical_block_bytes: Option<u64>,
 
     /// Whether the device seeks
@@ -33,7 +26,7 @@ pub struct MachineFacts {
     /// How many actuators the device seeks with, when it says
     pub access_ranges: Option<u64>,
 
-    /// Readahead the device is configured for, which sizes a cold fault's window
+    /// The device's readahead, which sizes a cold fault's window
     pub readahead_bytes: Option<u64>,
 
     /// Descriptors this process may hold at once
@@ -43,17 +36,14 @@ pub struct MachineFacts {
     pub ring: RingAvailability,
 }
 
-/// Why a ring is or is not available, which the probe's errno already knows
-///
-/// A kernel that cannot and a policy that will not are different problems for an
-/// operator, and collapsing both to "unavailable" makes the second unfindable.
+/// Why a ring is or is not available, from the probe's errno
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RingAvailability {
     /// `io_uring_setup` succeeded
     Available,
     /// The syscall is absent, so the kernel has no io_uring
     Unsupported,
-    /// Refused, which is `kernel.io_uring_disabled` or a seccomp policy
+    /// Refused, by `kernel.io_uring_disabled` or a seccomp filter
     Denied,
     /// Not probed, because this platform has no ring to probe for
     #[default]
@@ -79,10 +69,7 @@ pub enum Plane {
     Direct,
 }
 
-/// What the pass would choose, and why
-///
-/// Durability settings are deliberately absent: they are a promise about what a
-/// crash may cost, not a fit to hardware.
+/// What the pass would choose, and why, leaving durability settings out
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Verdict {
     /// Whether the volume's descriptors go around the page cache
@@ -91,38 +78,20 @@ pub struct Verdict {
     /// Smallest record a mapping is worth, absent where a mapping is not worth having
     pub map_above: Option<ByteCount>,
 
-    /// The plane a window of a large record is read on, which follows the volume's
-    pub ranged_reads: RangedReads,
-
-    /// Chunk where the idle reservation is a large share of the filesystem
-    pub preallocate: Preallocate,
-
     /// Sealed descriptors the reader cache may hold under this process's limit
     pub fd_cache: u64,
 
     /// The sentence a disagreement gets logged with
     pub because: &'static str,
 
-    /// Why the mapping is advised or withheld, which is a separate argument
+    /// Why the mapping is advised or withheld
     pub map_because: &'static str,
 }
 
-/// Times larger than memory a volume's own contents must be before direct is picked
-///
-/// Not centred, because the errors are not the same size: wrongly direct gives up
-/// an order of magnitude on a warm set, wrongly buffered a fraction on a cold one.
+/// Direct is picked once a volume's own contents exceed memory by this factor
 pub const DIRECT_AT_OCCUPANCY_RATIO: f64 = 1.5;
 
-/// Share of a filesystem the idle reservation may take before it stops pre-writing
-///
-/// The default reservation is nothing on a large disk and absurd on a small one.
-const RESERVATION_SHARE_OF_CAPACITY: u64 = 8;
-
-/// Times the device's readahead a record must clear before a mapping pays
-///
-/// A cold mapped read pulls in a window around the record rather than the record,
-/// so the floor sits where that toll has gone rather than where the warm gain
-/// starts.
+/// A record must be this many times the device's readahead before a mapping pays
 const MAP_AT_READAHEAD_MULTIPLE: u64 = 16;
 
 /// The readahead assumed when the device will not say what its own is
@@ -135,14 +104,7 @@ impl MachineFacts {
         ByteCount::from_bytes(readahead.saturating_mul(MAP_AT_READAHEAD_MULTIPLE))
     }
 
-    /// The floor a mapping is worth on this machine, and why
-    ///
-    /// Measured: mapped point reads win warm p50 by 13 to 25 percent, lose p99 by 1.7
-    /// to 1.8x, and lose a cold read by up to 9x. So the gain is real only where the
-    /// records stay resident, and the term that decides that is the filesystem rather
-    /// than what has been written: a disk that cannot fit in memory serves cold records
-    /// eventually however small its set is today. The bar is the plane's own, and a
-    /// machine that will not say either term cannot claim it fits.
+    /// The mapping floor and why, none unless the filesystem is known to fit in memory
     fn mapping_for(&self, is_direct: bool) -> (Option<ByteCount>, &'static str) {
         if is_direct {
             return (
@@ -167,9 +129,8 @@ impl MachineFacts {
     }
 
     /// What plane these facts argue for
-    pub fn verdict(&self, idle_reservation_bytes: u64) -> Verdict {
-        // What the volume holds, not what the disk could take: a large disk
-        // holding little argues for direct on a set that fits in memory.
+    pub fn verdict(&self) -> Verdict {
+        // The volume's contents decide, so a large disk holding little stays buffered
         let (plane, because) = match self.occupied_over_memory() {
             None => (
                 Plane::Buffered,
@@ -190,44 +151,18 @@ impl MachineFacts {
         Verdict {
             plane,
             map_above,
-            ranged_reads: match is_direct {
-                true => RangedReads::Direct,
-                false => RangedReads::Cached,
-            },
-            preallocate: self.preallocate_for(idle_reservation_bytes),
-            fd_cache: self.fd_cache_for(is_direct),
+            fd_cache: self.fd_cache_for(),
             because,
             map_because,
         }
     }
 
-    /// Whether a whole segment may be pre-written at creation
-    ///
-    /// Full reserves real blocks before a byte is written, so it turns on the share
-    /// of the filesystem that takes rather than the absolute size.
-    fn preallocate_for(&self, idle_reservation_bytes: u64) -> Preallocate {
-        let Some(capacity) = self.volume_capacity_bytes else {
-            return Preallocate::Chunk;
-        };
-        match capacity / RESERVATION_SHARE_OF_CAPACITY >= idle_reservation_bytes {
-            true => Preallocate::Full,
-            false => Preallocate::Chunk,
-        }
-    }
-
-    /// Descriptors the reader cache may hold without crowding the process
-    ///
-    /// A direct volume keeps a second descriptor per segment, and half the limit is
-    /// left for tails, sockets and everything else the process opens.
-    fn fd_cache_for(&self, is_direct: bool) -> u64 {
+    /// Descriptors the reader cache may hold, half the process limit at most
+    fn fd_cache_for(&self) -> u64 {
         let Some(limit) = self.open_file_limit else {
             return DEFAULT_FD_CACHE;
         };
-        let per_segment = match is_direct {
-            true => 2,
-            false => 1,
-        };
-        DEFAULT_FD_CACHE.min(limit / 2 / per_segment)
+        DEFAULT_FD_CACHE.min(limit / 2)
     }
 
     /// Read what this machine will say, for a volume rooted at this path
@@ -260,10 +195,7 @@ impl MachineFacts {
         (memory > 0).then(|| capacity as f64 / memory as f64)
     }
 
-    /// How many times what the volume holds exceeds memory
-    ///
-    /// Absent on a volume with nothing in it, since zero is not evidence that the
-    /// set is small.
+    /// How many times what the volume holds exceeds memory, absent for an empty volume
     pub fn occupied_over_memory(&self) -> Option<f64> {
         let occupied = self.volume_bytes.filter(|bytes| *bytes > 0)?;
         let memory = self.memory_bytes?;
@@ -273,7 +205,7 @@ impl MachineFacts {
 
 /// Descriptors this process may hold at once
 fn open_file_limit() -> Option<u64> {
-    // Safety: getrlimit writes into the struct it is handed and reads nothing else.
+    // Safety: getrlimit writes into the struct it is handed and reads nothing else
     let limit = unsafe {
         let mut limit: libc::rlimit = std::mem::zeroed();
         (libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0).then_some(limit)?
@@ -285,8 +217,7 @@ fn open_file_limit() -> Option<u64> {
 #[cfg(target_os = "linux")]
 fn probe_ring() -> RingAvailability {
     let mut params = [0u8; 256];
-    // Safety: the kernel writes at most one io_uring_params into a buffer wider
-    // than one, and the return is a descriptor this closes.
+    // Safety: the kernel writes at most one io_uring_params into a wider buffer
     let ring = unsafe {
         libc::syscall(
             libc::SYS_io_uring_setup,
@@ -295,7 +226,7 @@ fn probe_ring() -> RingAvailability {
         )
     };
     if ring >= 0 {
-        // Safety: the syscall returned this descriptor and nothing else holds it.
+        // Safety: the syscall returned this descriptor and nothing else holds it
         unsafe { libc::close(ring as libc::c_int) };
         return RingAvailability::Available;
     }
@@ -323,14 +254,13 @@ fn memory_bytes() -> Option<u64> {
     None
 }
 
-/// Total memory, from the sysctl that carries it
+/// Total memory, from the `hw.memsize` sysctl
 #[cfg(target_os = "macos")]
 fn memory_bytes() -> Option<u64> {
     let mut value = 0u64;
     let mut len = std::mem::size_of::<u64>();
     let name = c"hw.memsize";
-    // Safety: the name is a nul-terminated literal and the kernel writes at most
-    // len bytes into a u64 this owns.
+    // Safety: the name is a nul-terminated literal and the kernel writes at most len bytes
     let ok = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
@@ -368,11 +298,7 @@ pub fn capacity_bytes(root: &Path) -> Option<u64> {
     stat_volume(root).map(|stats| stats.f_blocks as u64 * stats.f_frsize)
 }
 
-/// What the filesystem will still hand out, which is what ENOSPC counts down
-///
-/// Not the capacity less what the reel accounts for: preallocation, footers,
-/// filesystem metadata and another tenant are all invisible to a sum over record
-/// bytes and all visible here.
+/// Free space the filesystem will still hand out, which is what ENOSPC counts down
 #[allow(clippy::unnecessary_cast)]
 pub fn available_bytes(root: &Path) -> Option<u64> {
     stat_volume(root).map(|stats| stats.f_bavail as u64 * stats.f_frsize)
@@ -380,8 +306,7 @@ pub fn available_bytes(root: &Path) -> Option<u64> {
 
 fn stat_volume(root: &Path) -> Option<libc::statvfs> {
     let path = std::ffi::CString::new(root.as_os_str().as_encoded_bytes()).ok()?;
-    // Safety: statvfs writes into the struct it is handed and reads a path this
-    // owns for the duration of the call.
+    // Safety: statvfs fills the struct and the path outlives the call
     unsafe {
         let mut stats: libc::statvfs = std::mem::zeroed();
         (libc::statvfs(path.as_ptr(), &mut stats) == 0).then_some(stats)
@@ -392,10 +317,7 @@ fn stat_volume(root: &Path) -> Option<libc::statvfs> {
 #[cfg(target_os = "linux")]
 const RANGES: &str = "queue/independent_access_ranges";
 
-/// The span each of the device's actuators serves, in device order
-///
-/// Empty on every ordinary drive, which reports no ranges at all rather than one
-/// covering the whole device.
+/// The span each of the device's actuators serves, in device order, empty on ordinary drives
 pub fn access_ranges(root: &Path) -> Vec<AccessRange> {
     match ranges_dir(root) {
         Some(at) => ranges_under(&at),
@@ -403,10 +325,7 @@ pub fn access_ranges(root: &Path) -> Vec<AccessRange> {
     }
 }
 
-/// One actuator per numbered directory under a device's ranges, in device order
-///
-/// Anything the kernel puts beside the numbered directories is not an actuator, and
-/// a range missing either half of its span is not one either.
+/// One actuator per numbered directory with both halves of its span, in device order
 fn ranges_under(at: &Path) -> Vec<AccessRange> {
     let Ok(entries) = std::fs::read_dir(at) else {
         return Vec::new();
@@ -425,7 +344,7 @@ fn ranges_under(at: &Path) -> Vec<AccessRange> {
             Some((index, range))
         })
         .collect();
-    // A directory read comes back unordered and a span list only reads in order.
+    // A directory read comes back unordered, so sort by index
     ranges.sort_by_key(|(index, _)| *index);
     ranges.into_iter().map(|(_, range)| range).collect()
 }
@@ -438,7 +357,7 @@ fn ranges_dir(root: &Path) -> Option<std::path::PathBuf> {
     let device = std::fs::metadata(root).ok()?.dev();
     let (major, minor) = (libc::major(device), libc::minor(device));
     let base = std::path::PathBuf::from(format!("/sys/dev/block/{major}:{minor}"));
-    // A partition keeps its queue facts on the disk above it.
+    // A partition keeps its queue facts on the disk above it
     [base.join(RANGES), base.join("..").join(RANGES)]
         .into_iter()
         .find(|at| at.is_dir())
@@ -449,9 +368,7 @@ fn ranges_dir(_root: &Path) -> Option<std::path::PathBuf> {
     None
 }
 
-/// One `/sys/block` fact about the device holding this path
-///
-/// A partition does not carry the queue facts, so a miss walks up to the disk.
+/// One `/sys/block` fact about the device holding this path, falling back to the disk
 #[cfg(target_os = "linux")]
 fn device_fact(root: &Path, leaf: &str) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
@@ -464,7 +381,7 @@ fn device_fact(root: &Path, leaf: &str) -> Option<String> {
     if let Some(found) = read(&base) {
         return Some(found.trim().to_string());
     }
-    // A partition keeps its queue facts on the disk above it.
+    // A partition keeps its queue facts on the disk above it
     read(&base.join("..")).map(|found| found.trim().to_string())
 }
 
@@ -483,7 +400,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let facts = MachineFacts::read(dir.path());
 
-        // Capacity comes from statvfs, which every unix this builds on has.
+        // Capacity comes from statvfs, which every unix this builds on has
         let capacity = facts.volume_capacity_bytes.expect("filesystem capacity");
         assert!(capacity > 0, "a mounted filesystem has capacity");
 
@@ -492,7 +409,7 @@ mod tests {
         }
     }
 
-    // a missing fact is absent rather than a zero standing in for one
+    // a missing fact reads as absent, with no zero standing in for it
     #[test]
     fn an_unreadable_root_answers_nothing_rather_than_zero() {
         let facts = MachineFacts::read(Path::new("/definitely/not/a/path"));
@@ -515,7 +432,7 @@ mod tests {
             std::fs::write(range.join("sector"), format!("{sector}\n")).expect("sector");
             std::fs::write(range.join("nr_sectors"), format!("{HALF}\n")).expect("nr_sectors");
         }
-        // Neither a file beside them nor a directory holding half a span is one.
+        // A file beside them and a directory with half a span are not actuators
         std::fs::write(dir.path().join("uevent"), "").expect("uevent");
         let partial = dir.path().join("2");
         std::fs::create_dir(&partial).expect("partial");
@@ -588,12 +505,12 @@ mod tests {
         };
 
         assert_eq!(
-            facts.verdict(0).map_above,
+            facts.verdict().map_above,
             Some(ByteCount::from_bytes(2 * 1024 * 1024)),
         );
     }
 
-    // a device that will not say falls back rather than mapping everything
+    // a device with unknown readahead falls back to the default floor
     #[test]
     fn an_unknown_readahead_still_names_a_floor() {
         let facts = MachineFacts {
@@ -604,7 +521,7 @@ mod tests {
         };
 
         assert_eq!(
-            facts.verdict(0).map_above,
+            facts.verdict().map_above,
             Some(ByteCount::from_bytes(DEFAULT_READAHEAD_BYTES * 16)),
         );
     }
@@ -618,7 +535,7 @@ mod tests {
             volume_bytes: Some(1 << 30),
             ..MachineFacts::default()
         };
-        let verdict = roomy_disk.verdict(0);
+        let verdict = roomy_disk.verdict();
 
         assert_eq!(
             verdict.plane,
@@ -635,12 +552,12 @@ mod tests {
             verdict.map_because
         );
 
-        // The same machine with a disk memory could hold is advised the floor.
+        // The same machine with a disk memory could hold is advised the floor
         let small_disk = MachineFacts {
             volume_capacity_bytes: Some(32 << 30),
             ..roomy_disk
         };
-        assert!(small_disk.verdict(0).map_above.is_some());
+        assert!(small_disk.verdict().map_above.is_some());
     }
 
     // a machine that will not say its capacity cannot claim a mapping fits
@@ -651,7 +568,7 @@ mod tests {
             volume_bytes: Some(1),
             ..MachineFacts::default()
         };
-        let verdict = facts.verdict(0);
+        let verdict = facts.verdict();
 
         assert_eq!(verdict.map_above, None);
         assert!(
@@ -661,7 +578,7 @@ mod tests {
         );
     }
 
-    // the bar is a floor rather than a midpoint, so just under it stays buffered
+    // the bar is a floor, so a volume just under it stays buffered
     #[test]
     fn the_bar_is_not_centred() {
         let under = MachineFacts {
@@ -674,8 +591,8 @@ mod tests {
             ..under
         };
 
-        assert_eq!(under.verdict(0).plane, Plane::Buffered);
-        assert_eq!(over.verdict(0).plane, Plane::Direct);
+        assert_eq!(under.verdict().plane, Plane::Buffered);
+        assert_eq!(over.verdict().plane, Plane::Direct);
     }
 
     // a direct verdict says mappings are off, since validation refuses the pair
@@ -687,14 +604,14 @@ mod tests {
             volume_bytes: Some(64 * 2),
             ..MachineFacts::default()
         }
-        .verdict(0);
+        .verdict();
         let buffered = MachineFacts {
             memory_bytes: Some(64),
             volume_capacity_bytes: Some(64),
             volume_bytes: Some(64),
             ..MachineFacts::default()
         }
-        .verdict(0);
+        .verdict();
 
         assert_eq!(direct.plane, Plane::Direct);
         assert_eq!(direct.map_above, None, "direct refuses the pairing");
@@ -711,14 +628,14 @@ mod tests {
         );
     }
 
-    // the reader cache is sized under the process limit, doubled for direct
+    // the reader cache is sized under half the process limit on either plane
     #[test]
     fn the_fd_cache_fits_under_the_open_file_limit() {
         let tight = MachineFacts {
             open_file_limit: Some(256),
             ..MachineFacts::default()
         };
-        assert_eq!(tight.verdict(0).fd_cache, 128, "half the limit, buffered");
+        assert_eq!(tight.verdict().fd_cache, 128, "half the limit, buffered");
 
         let direct = MachineFacts {
             memory_bytes: Some(1),
@@ -726,69 +643,17 @@ mod tests {
             open_file_limit: Some(256),
             ..MachineFacts::default()
         };
-        assert_eq!(
-            direct.verdict(0).fd_cache,
-            64,
-            "halved again, two per segment"
-        );
+        assert_eq!(direct.verdict().fd_cache, 128, "half the limit, direct");
 
         let roomy = MachineFacts {
             open_file_limit: Some(1_048_576),
             ..MachineFacts::default()
         };
         assert_eq!(
-            roomy.verdict(0).fd_cache,
+            roomy.verdict().fd_cache,
             DEFAULT_FD_CACHE,
             "never above the default"
         );
-    }
-
-    // a reservation that would claim a large share of the disk stops pre-writing
-    #[test]
-    fn a_small_disk_does_not_pre_write_whole_segments() {
-        let facts = MachineFacts {
-            volume_capacity_bytes: Some(64),
-            ..MachineFacts::default()
-        };
-
-        assert_eq!(
-            facts.verdict(8).preallocate,
-            Preallocate::Full,
-            "an eighth fits"
-        );
-        assert_eq!(
-            facts.verdict(9).preallocate,
-            Preallocate::Chunk,
-            "past an eighth"
-        );
-    }
-
-    // window reads follow the volume's own plane rather than diverging from it
-    #[test]
-    fn ranged_reads_follow_the_plane() {
-        let direct = MachineFacts {
-            memory_bytes: Some(1),
-            volume_bytes: Some(64),
-            ..MachineFacts::default()
-        }
-        .verdict(0);
-        let buffered = MachineFacts {
-            memory_bytes: Some(64),
-            volume_bytes: Some(64),
-            ..MachineFacts::default()
-        }
-        .verdict(0);
-
-        assert_eq!(direct.ranged_reads, RangedReads::Direct);
-        assert_eq!(buffered.ranged_reads, RangedReads::Cached);
-    }
-
-    // an unreadable root leaves no capacity, so it cannot claim a share of one
-    #[test]
-    fn no_capacity_does_not_pre_write() {
-        let facts = MachineFacts::default();
-
-        assert_eq!(facts.verdict(0).preallocate, Preallocate::Chunk);
     }
 
     // an empty volume is not evidence its set is small
@@ -801,20 +666,20 @@ mod tests {
             ..MachineFacts::default()
         };
 
-        assert_eq!(fresh.verdict(0).plane, Plane::Buffered);
-        assert!(fresh.verdict(0).because.contains("nothing written"));
+        assert_eq!(fresh.verdict().plane, Plane::Buffered);
+        assert!(fresh.verdict().because.contains("nothing written"));
     }
 
     // no facts is not a reason to give up the plane that wins warm
     #[test]
     fn nothing_known_keeps_the_warm_plane() {
-        let verdict = MachineFacts::default().verdict(0);
+        let verdict = MachineFacts::default().verdict();
 
         assert_eq!(verdict.plane, Plane::Buffered);
         assert!(verdict.because.contains("nothing written"));
     }
 
-    // memory of zero would divide rather than answer
+    // a memory of zero gives no ratio, so nothing divides by it
     #[test]
     fn zero_memory_does_not_divide() {
         let facts = MachineFacts {

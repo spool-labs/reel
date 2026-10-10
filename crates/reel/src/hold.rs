@@ -1,28 +1,16 @@
 //! One slab beneath the caches that hold what this volume issued
-//!
-//! Every key these caches take is a number the reel allocated: a segment, a small
-//! column, a block index. None is chosen by a caller and none needs defending, so
-//! the key is packed into one word and mixed with the multiply the fd cache already
-//! hashes segment ids with, rather than run through SipHash as a tuple. What the
-//! tenants differ in is what an entry weighs, which is a number the caller passes.
-//!
-//! Three things fall out of owning the structure. Eviction is clock over the slots
-//! with a hot bit, which is the policy the fd cache documented and could not run off
-//! a hash map's iteration order. Retiring a segment walks that segment's own chain
-//! rather than the whole cache. And the lock is one mutex per shard rather than one
-//! write lock every insert of every tenant queues on.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use crate::format::column::ColumnId;
 use crate::format::loc::SegmentId;
-use crate::sync::checked::lock;
-use crate::sync::checked::Mutex;
+use crate::sync::lock;
 
-/// Shards a hold splits into, each under its own mutex
+/// A hold splits into at most this many shards, each under its own mutex
 const SHARDS: usize = 16;
 
-/// Entries a shard has to fit before splitting into one more of them is worth it
+/// Each shard must fit this many typical entries for a split to be worth it
 const PER_SHARD: usize = 8;
 
 /// The empty table slot and the end of a chain
@@ -31,10 +19,10 @@ const NONE: u32 = u32::MAX;
 /// The multiplier, 2^64 divided by the golden ratio
 const MIX: u64 = 0x9e37_79b9_7f4a_7c15;
 
-/// Bits the block index takes, the low end of the packed key
+/// The block index takes this many bits, at the low end of the packed key
 const BLOCK_BITS: u32 = 24;
 
-/// Block indices a key can name, past which an entry is not held
+/// The highest block index a packed key can hold, past which an entry is not held
 pub const MAX_BLOCK: usize = (1 << BLOCK_BITS) - 1;
 
 /// One cache key packed into a word: segment, column, block
@@ -49,7 +37,7 @@ pub fn segment_key(segment: SegmentId) -> u64 {
     u64::from(segment.as_u32()) << 32
 }
 
-/// The segment a packed key names
+/// The segment in a packed key
 fn segment_of(key: u64) -> u32 {
     (key >> 32) as u32
 }
@@ -76,6 +64,9 @@ struct Slot<V> {
 
     /// Next entry of the same segment, or the next vacancy while free
     next: u32,
+
+    /// Previous entry of the same segment, so an eviction unlinks it without a walk
+    prev: u32,
 }
 
 /// What one shard holds, behind its own mutex
@@ -83,13 +74,10 @@ struct Inner<V> {
     /// The entries themselves, vacancies threaded onto the free list
     slots: Vec<Slot<V>>,
 
-    /// Ends of the free list, taken from the head and given back at the tail
-    ///
-    /// In order rather than newest first, so a slot reused stands where the entry
-    /// that freed it stood and the hand still meets entries in the order they
-    /// arrived. Taken from the newest end, clock would give up a fresh entry ahead
-    /// of ones put in before it.
+    /// Head of the free list, oldest vacancy first, so the hand meets entries in arrival order
     free: u32,
+
+    /// Tail of the free list, where a freed slot goes back
     free_tail: u32,
 
     /// Open addressed, a power of two, holding slot indices
@@ -98,7 +86,7 @@ struct Inner<V> {
     /// Head of each segment's chain, hashed on the segment alone
     chains: Vec<u32>,
 
-    /// Entries the shard is holding
+    /// How many entries the shard holds
     filled: usize,
 
     /// The slot the hand is standing on, which is the next one it looks at
@@ -113,21 +101,14 @@ struct Shard<V> {
     inner: Mutex<Inner<V>>,
 }
 
-/// A bounded cache over keys this volume issued
-///
-/// The budget is the whole hold's rather than a shard's, so what one entry may
-/// weigh does not shrink with the shard count and the bound stays what the caller
-/// asked for. A shard that has to make room gives up one of its own.
+/// A bounded cache over keys this volume issued, with one budget across all shards
 pub struct Hold<V> {
     budget: usize,
     bytes: AtomicUsize,
     shards: Box<[Shard<V>]>,
 }
 
-/// Shards a budget is worth splitting into, given what an entry typically weighs
-///
-/// A cache too small to give every shard a working set of its own is left whole,
-/// which is what a test-sized bound and the fd cache's smallest settings ask for.
+/// How many shards a budget is worth, given what an entry typically weighs
 fn shards_for(budget: usize, typical: usize) -> usize {
     let mut shards = SHARDS;
     while shards > 1 && budget / shards < typical.max(1) * PER_SHARD {
@@ -154,9 +135,6 @@ impl<V: Clone> Hold<V> {
     }
 
     /// What one entry may weigh and still be taken in
-    ///
-    /// One weighing more than the whole hold is turned away rather than emptying
-    /// it: the caller keeps what it just read either way.
     pub fn share(&self) -> usize {
         self.budget
     }
@@ -175,11 +153,7 @@ impl<V: Clone> Hold<V> {
         inner.slots[at].val.clone()
     }
 
-    /// Hold a value, giving up cold entries until it fits
-    ///
-    /// A key already held is left as it stands, which is what the caches this
-    /// replaces did: two readers racing on the same block both hold a copy and
-    /// only the first one's is kept.
+    /// Hold a value, giving up cold entries until it fits, and leave a held key as it stands
     pub fn insert(&self, key: u64, value: V, weight: usize) {
         if weight > self.budget {
             return;
@@ -190,8 +164,7 @@ impl<V: Clone> Hold<V> {
             return;
         }
         while self.bytes.load(Ordering::Relaxed) + weight > self.budget {
-            // A shard with nothing of its own left turns the entry away rather
-            // than taking the hold past what it was given.
+            // A shard with nothing left to evict turns the entry away to stay in budget
             match inner.evict() {
                 Some(freed) => {
                     self.bytes.fetch_sub(freed, Ordering::Relaxed);
@@ -237,7 +210,7 @@ impl<V: Clone> Hold<V> {
         self.bytes.load(Ordering::Relaxed)
     }
 
-    /// Entries held across every shard
+    /// How many entries are held across every shard
     pub fn len(&self) -> usize {
         self.shards
             .iter()
@@ -251,7 +224,7 @@ impl<V: Clone> Hold<V> {
     }
 }
 
-/// Table slots per entry held, so a probe run stays short
+/// The table keeps this many slots per entry held, so a probe run stays short
 const SPREAD: usize = 2;
 
 impl<V> Inner<V> {
@@ -306,8 +279,7 @@ impl<V> Inner<V> {
                 return;
             }
             let home = mix(self.slots[slot as usize].key) as usize & mask;
-            // The entry moves back only if the hole is no further from its home
-            // than where it sits, which is what keeps every run contiguous.
+            // Move the entry back only if the hole is no further from home than where it sits
             if (probe.wrapping_sub(hole)) & mask <= (probe.wrapping_sub(home)) & mask {
                 self.table[hole] = slot;
                 self.table[probe] = NONE;
@@ -345,24 +317,29 @@ impl<V> Inner<V> {
 
     fn chain_link(&mut self, slot: u32) {
         let bucket = self.chain_at(self.slots[slot as usize].key);
-        self.slots[slot as usize].next = self.chains[bucket];
+        let head = self.chains[bucket];
+        self.slots[slot as usize].next = head;
+        self.slots[slot as usize].prev = NONE;
+        if head != NONE {
+            self.slots[head as usize].prev = slot;
+        }
         self.chains[bucket] = slot;
     }
 
     fn chain_unlink(&mut self, slot: u32) {
-        let bucket = self.chain_at(self.slots[slot as usize].key);
-        let mut at = self.chains[bucket];
-        if at == slot {
-            self.chains[bucket] = self.slots[slot as usize].next;
-            return;
-        }
-        while at != NONE {
-            let next = self.slots[at as usize].next;
-            if next == slot {
-                self.slots[at as usize].next = self.slots[slot as usize].next;
-                return;
+        let (prev, next) = (
+            self.slots[slot as usize].prev,
+            self.slots[slot as usize].next,
+        );
+        match prev {
+            NONE => {
+                let bucket = self.chain_at(self.slots[slot as usize].key);
+                self.chains[bucket] = next;
             }
-            at = next;
+            prev => self.slots[prev as usize].next = next,
+        }
+        if next != NONE {
+            self.slots[next as usize].prev = prev;
         }
     }
 
@@ -379,6 +356,7 @@ impl<V> Inner<V> {
                     weight: 0,
                     hot: false,
                     next: NONE,
+                    prev: NONE,
                 });
                 (self.slots.len() - 1) as u32
             }
@@ -394,8 +372,7 @@ impl<V> Inner<V> {
         held.key = key;
         held.val = Some(value);
         held.weight = weight;
-        // Entering cold, so a block read once on the way past leaves on the next
-        // sweep and one read again stays.
+        // Enter cold, so a block read once leaves on the next sweep and one read again stays
         held.hot = false;
         self.bytes += weight;
         self.filled += 1;
@@ -429,9 +406,6 @@ impl<V> Inner<V> {
     }
 
     /// Give up one entry the hand passed twice without a read in between
-    ///
-    /// A sweep where everything is hot clears every bit on the way, so the second
-    /// time around takes the first entry it reaches and making room always does.
     fn evict(&mut self) -> Option<usize> {
         if self.filled == 0 {
             return None;
@@ -453,9 +427,6 @@ impl<V> Inner<V> {
     }
 
     /// Unlink every entry of one segment, walking that segment's chain alone
-    ///
-    /// The chain is rebuilt in the one pass that finds them, so retiring a segment
-    /// costs its own entries rather than its entries times the chain they sit in.
     fn forget(&mut self, segment: u32) -> usize {
         let bucket = mix(segment_key(SegmentId(segment))) as usize & (self.chains.len() - 1);
         let mut at = self.chains[bucket];
@@ -468,6 +439,10 @@ impl<V> Inner<V> {
                 true => going.push(at as usize),
                 false => {
                     self.slots[at as usize].next = kept;
+                    self.slots[at as usize].prev = NONE;
+                    if kept != NONE {
+                        self.slots[kept as usize].prev = at;
+                    }
                     kept = at;
                 }
             }
@@ -490,14 +465,14 @@ mod tests {
         hold_key(SegmentId(segment), ColumnId(column), block)
     }
 
-    // a packed key names one segment, column and block and nothing else
+    // a packed key holds one segment, column and block and nothing else
     #[test]
     fn keys_pack_apart() {
         assert_ne!(key_of(1, 0, 0), key_of(0, 1, 0));
         assert_ne!(key_of(0, 1, 0), key_of(0, 0, 1));
         assert_eq!(segment_of(key_of(9, 3, 77)), 9);
         assert_eq!(key_of(9, 3, 77), key_of(9, 3, 77));
-        // The block field is the low end, so a segment's blocks share a chain.
+        // The block field is the low end, so a segment's blocks share a chain
         assert_eq!(segment_of(key_of(4, 255, MAX_BLOCK)), 4);
     }
 
@@ -518,7 +493,7 @@ mod tests {
         assert!(hold.is_empty());
     }
 
-    // an entry heavier than a shard is turned away rather than emptying one
+    // an entry heavier than the whole hold is turned away
     #[test]
     fn refuses_what_it_cannot_hold() {
         let hold: Hold<u64> = Hold::new(64, 64);
@@ -530,14 +505,14 @@ mod tests {
     // the hand gives up what was not read since it last passed
     #[test]
     fn clock_keeps_what_is_read() {
-        // One shard, so the eviction order is the one being checked.
+        // One shard, so the eviction order is the one being checked
         let hold: Hold<u64> = Hold::new(4, 4);
         for block in 0..4 {
             hold.insert(key_of(1, 0, block), block as u64, 1);
         }
         assert_eq!(hold.len(), 4);
 
-        // Block two is read, so the sweep passes it and takes a cold one.
+        // Block two is read, so the sweep passes it and takes a cold one
         assert_eq!(hold.get(key_of(1, 0, 2)), Some(2));
         hold.insert(key_of(1, 0, 4), 4, 1);
 
@@ -568,6 +543,41 @@ mod tests {
         }
     }
 
+    // evictions out of the middle of long chains leave every chain whole for a retire
+    #[test]
+    fn evictions_keep_each_chain_whole() {
+        // Two interleaved segments overflow the hold, so each chain loses entries from its middle
+        let hold: Hold<u64> = Hold::new(64 * 16, 16);
+        for block in 0..2_000 {
+            for segment in [1u32, 2] {
+                hold.insert(key_of(segment, 0, block), u64::from(segment), 16);
+                // A read block is passed over by the hand, so evictions skip around
+                if block % 3 == 0 {
+                    hold.get(key_of(segment, 0, block));
+                }
+            }
+        }
+        assert!(!hold.is_empty() && hold.len() <= 64);
+
+        hold.forget(SegmentId(1));
+        for block in 0..2_000 {
+            assert_eq!(
+                hold.get(key_of(1, 0, block)),
+                None,
+                "block {block} outlived its segment"
+            );
+        }
+        let left = (0..2_000)
+            .filter(|block| hold.get(key_of(2, 0, *block)).is_some())
+            .count();
+        assert_eq!(hold.len(), left);
+        assert_eq!(hold.bytes(), left * 16);
+
+        hold.forget(SegmentId(2));
+        assert!(hold.is_empty());
+        assert_eq!(hold.bytes(), 0);
+    }
+
     // the table grows and everything held is still found afterwards
     #[test]
     fn regrows_without_losing_a_key() {
@@ -580,7 +590,7 @@ mod tests {
         }
         assert_eq!(hold.len(), 2_000);
 
-        // Taking half out leaves the other half findable through the shifted runs.
+        // Taking half out leaves the other half findable through the shifted runs
         for block in (0..2_000).step_by(2) {
             assert_eq!(hold.take(key_of(1, 0, block)), Some(block as u64));
         }

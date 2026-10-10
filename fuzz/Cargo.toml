@@ -36,13 +36,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "persisted_index"
-path = "fuzz_targets/persisted_index.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "store_ops"
 path = "fuzz_targets/store_ops.rs"
 test = false

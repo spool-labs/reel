@@ -1,9 +1,9 @@
 # tape-reel-cli
 
-The operator toolbox for reel volumes. One binary, `reel`, six verbs:
+The `reel` binary inspects, verifies and checkpoints reel volumes. It has six verbs:
 
 ```
-reel <VOLUME> [--column NAME:ID[:WIDTH]]... [--paged]
+reel <VOLUME> [--column NAME:ID[:WIDTH]]...
               [-o text|json|markdown] [--color auto|always|never] <VERB>
 
   cue         sequence, floor, segments live/dead/held, covers, graves, cues held
@@ -14,16 +14,20 @@ reel <VOLUME> [--column NAME:ID[:WIDTH]]... [--paged]
   doctor      machine facts and the bias verdict, opens no volume
 ```
 
-Every verb but `checkpoint` opens read-only and lockless, so it reads a
-volume something else is writing; `checkpoint` seals the tails to draw the
-line it copies at, so it takes the lock.
+`--volume PATH[:capacity][:dead]` adds another root of the same volume set, in the order the set
+was written. A bare path is a fast volume, `:capacity` marks the capacity tier and `:dead` marks a
+drive declared dead. A set spanning several roots refuses to open without its full list.
 
-A volume's schema is not discoverable from disk, so column names arrive as
-flags. Cells the chosen open cannot fill print `-`, never a false zero.
+`cue`, `stat`, `spans` and `verify` open the volume read-only and take no lock, so they can read a
+volume another process is writing. `checkpoint` seals the tails to fix the point it copies at, so it
+takes the ownership lock.
+
+A volume's schema isn't stored on disk, so you declare its columns with `--column`. Only declared
+columns are counted.
 
 ## What a report looks like
 
-Head, then the answer, then the figures behind it:
+A head, then the answer, then the figures behind it:
 
 ```
 ╭───────────────────────────────────────────────────────────────╮
@@ -49,8 +53,8 @@ NOT CHECKED  versions a footer no longer indexes · whether the segments agree
              with each other
 ```
 
-A figure this open could not count comes back beside a caveat saying so,
-under `NOT COUNTED`, with the flag that would answer it:
+A figure the open could not count comes back with a caveat under `NOT COUNTED`, and with the flag
+that would answer it:
 
 ```
 NOT COUNTED
@@ -58,46 +62,41 @@ NOT COUNTED
   → pass --column NAME:ID for each column the volume was written with
 ```
 
-Nothing is ever dropped silently. A listing that truncates says what it
-truncated and how to see the rest, faults included; segments that swept clean
-and empty are counted in the caption rather than given a row of zeroes each.
-Totals are never taken from a truncated listing: `--limit` shortens the rows
-and never the figures above them.
+Nothing is dropped silently. A truncated listing, faults included, says what it cut and how to see
+the rest. Segments that swept clean and empty are counted in the caption, with no row of zeroes
+each. Totals never come from a truncated listing: `--limit` shortens the rows and leaves the figures
+above them whole.
 
 ## Formats
 
-`-o text` is for a person, `-o json` for a script or an agent, `-o markdown`
-for a pull request, an issue, or a CI job summary.
+| `-o` | for |
+|---|---|
+| `text` | a person |
+| `json` | a script or an agent |
+| `markdown` | a pull request, an issue, or a CI job summary |
 
-Frames and colour are drawn only where the output is a terminal. A pipe, a
-file and a CI log get the plain form, `NO_COLOR` is honoured, and `--color`
-overrides both ways.
+Frames and colour appear only when the output is a terminal. A pipe, a file and a CI log get the
+plain form. `NO_COLOR` is honoured, and `--color` overrides both ways.
 
-**Json is the complete record.** It carries every row a text listing
-truncates, and every caveat the text form renders as a note, as a
-`caveats` array of `{what, fix}`. A consumer never has to parse prose to
-learn that a figure is a floor rather than a total.
+**Json is the complete record.** It holds every row a text listing truncates, and every caveat the
+text shows as a note, as a `caveats` array of `{what, fix}`. A consumer never parses prose to learn
+whether a figure is a floor or a total.
 
-The `verify` sweep can run for minutes, so it draws a progress bar on
-standard error where somebody is watching, and erases it before the report
-is written. A redirected sweep draws nothing, so `reel vol verify > out` and
-`reel vol -o json verify | jq` both arrive clean.
+`verify` can run for minutes, so it draws a progress bar on standard error when someone is watching
+and erases it before the report is written. A redirected sweep draws nothing, so
+`reel vol verify > out` and `reel vol -o json verify | jq` both come out clean.
 
-## The layer behind it
+## The report layer
 
-The reports themselves are `reel::report`, not this binary. `report::cue`
-answers a `CueReport`; the report says its own shape as a `report::doc::Doc`
-of head, verdict, facts, tables, notes and footer; `report::render::text`
-and `report::render::markdown` draw that shape, and serde serialises the
-struct. A crate embedding the engine gets the same rows without a command
-line library or a copied format string.
+The reports live in the engine crate as `reel::report`. `report::cue` returns a `CueReport`. Each
+report describes its own shape as a `report::doc::Doc` of head, verdict, facts, tables, notes and
+footer. `report::render::text` and `report::render::markdown` draw that shape, and serde serialises
+the struct. A crate embedding the engine gets the same rows without a command line library or a
+copied format string.
 
-Adding a format is a module beside those two rather than another set of
-format strings per report, and a report that grows a block gets it in every
-format at once. Column widths are measured off the content, so nothing
-declares a layout.
+A new format is one module beside those two. A block added to a report shows up in every format at
+once. Column widths are measured from the content, so nothing declares a layout.
 
-`report::spec` parses the same `PATH[:capacity][:dead]` and
-`NAME:ID[:WIDTH]` strings whatever the frontend parses arguments with. What
-belongs to the frontend and not the engine is deciding whether there is a
-terminal out there: `render::Style` is handed down, never discovered.
+`report::spec` parses the `PATH[:capacity][:dead]` and `NAME:ID[:WIDTH]` strings, whatever argument
+parser the frontend uses. The frontend decides whether a terminal is attached and hands
+`render::Style` down.

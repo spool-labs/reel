@@ -1,11 +1,8 @@
-//! The devices one reel places its segments across
-//!
-//! One reel owns a list of volume roots and places whole segments: ids stay
-//! global, the index never encodes a path, and this table built at open is the
-//! only thing that knows where a segment's file lives.
+//! The devices one reel places its segments across, and the table of which holds which
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 
 use crate::config::VolumeClass;
 use crate::error::{ReelError, Result};
@@ -13,28 +10,18 @@ use crate::format::loc::SegmentId;
 use crate::io::op::WriteBuf;
 use crate::reel::segment::IoDriver;
 use crate::reel::segment_file_name;
-use crate::sync::checked::{read, write, RwLock};
+use crate::sync::{read, write};
 
-/// File on the first volume naming every root this reel spans
+/// The file on the first volume that lists every root this reel spans
 pub const MANIFEST_NAME: &str = "reel.volumes";
 
-/// File on every root past the first, naming the root it was mounted as
-///
-/// What tells a fresh empty volume apart from an unmounted mountpoint. A
-/// manifest-named root without its marker refuses the open, and a marker naming
-/// some other path is two stores' volumes crossed.
+/// The file on every later root that holds the path it was mounted as
 pub const MARKER_NAME: &str = "reel.volume";
 
-/// Segments of headroom a volume keeps to stay in the draw
-///
-/// The segment being drawn plus room for compaction to land output beside it,
-/// since compaction is how a full volume gets space back.
+/// A volume stays in the draw while it has this many segments of headroom
 pub const WATERMARK_SEGMENTS: u64 = 2;
 
 /// A free-space reading no filesystem has answered yet, which reads as plenty
-///
-/// Erring toward plenty keeps a volume the machine cannot measure in the draw,
-/// and the ENOSPC retry is what catches the ones that lied.
 const UNKNOWN_FREE: u64 = u64::MAX;
 
 /// The roots one reel places segments across, and which root holds which
@@ -54,7 +41,7 @@ pub struct Volumes {
     /// Which roots the operator declared dead, in root order, keeping their index
     dead: Vec<bool>,
 
-    /// Free bytes under which a volume stops attracting draws
+    /// A volume with fewer free bytes than this stops attracting draws
     watermark: u64,
 }
 
@@ -93,16 +80,6 @@ impl Volumes {
     /// Whether the operator declared this root dead
     pub fn is_dead(&self, at: usize) -> bool {
         self.dead.get(at).copied().unwrap_or(false)
-    }
-
-    /// The roots declared dead, for the open that reports what is degraded
-    pub fn dead_roots(&self) -> Vec<&Path> {
-        self.roots
-            .iter()
-            .enumerate()
-            .filter(|(at, _)| self.dead[*at])
-            .map(|(_, root)| root.as_path())
-            .collect()
     }
 
     /// The first volume, where the lock and the manifest live
@@ -177,11 +154,7 @@ impl Volumes {
             .map(|(at, _)| at)
     }
 
-    /// The root a fresh segment lands on, within one tier
-    ///
-    /// A pinned tail draws on its own volume while that volume stands above the
-    /// watermark, which keeps one sequential stream per device. Every other draw
-    /// takes the volume in class with the most free space.
+    /// The root a fresh segment lands on within one tier, a pinned tail's own while it has room
     pub fn draw(&self, pin: Option<usize>, class: VolumeClass) -> usize {
         if self.roots.len() == 1 {
             return 0;
@@ -196,18 +169,11 @@ impl Volumes {
     }
 
     /// The next root after a draw came back full, or nothing left in class
-    ///
-    /// The readings were refreshed by the draw that failed, and a retry is racing
-    /// ENOSPC either way, so this does not ask the filesystem again.
     pub fn draw_past(&self, ruled_out: &[usize], class: VolumeClass) -> Option<usize> {
         self.pick(ruled_out, class)
     }
 
-    /// The most free root in class above the watermark, else in class at all
-    ///
-    /// Below the watermark placement is degraded, not refused. The class boundary
-    /// still holds: a full fast tier never spills fresh writes onto spindles priced
-    /// for bytes at rest. Ties keep the lowest index.
+    /// The most free root in class above the watermark, else the most free in class at all
     fn pick(&self, ruled_out: &[usize], class: VolumeClass) -> Option<usize> {
         let mut best: Option<(usize, u64)> = None;
         let mut afloat: Option<(usize, u64)> = None;
@@ -226,9 +192,7 @@ impl Volumes {
         afloat.or(best).map(|(at, _)| at)
     }
 
-    /// Ask every root's filesystem what it will still hand out
-    ///
-    /// A filesystem that cannot answer leaves the last reading standing.
+    /// Ask every root's filesystem what it will still hand out, keeping old readings on failure
     fn refresh_free(&self) {
         for (at, root) in self.roots.iter().enumerate() {
             if let Some(bytes) = crate::reel::bias::available_bytes(root) {
@@ -238,8 +202,7 @@ impl Volumes {
     }
 
     fn root_at(&self, at: usize) -> &Path {
-        // A table byte can only name a root place() checked, but a table from a
-        // manifestless future degrades to home rather than panicking.
+        // Every table byte was checked by place(), and an unknown one falls back to home
         self.roots
             .get(at)
             .map(PathBuf::as_path)
@@ -247,12 +210,7 @@ impl Volumes {
     }
 }
 
-/// What the manifest says, compared against what the config gave
-///
-/// The manifest is authoritative about presence and order: the placement table
-/// stores root indices, so a reordered list would silently remap every placed
-/// segment. New roots append, which is how a drive is added, and anything else
-/// refuses rather than reading a typo as loss.
+/// Check the manifest against the configured roots, which may only append new ones
 pub fn reconcile_manifest(stored: &str, roots: &[PathBuf]) -> Result<()> {
     let named: Vec<&str> = stored
         .lines()
@@ -281,10 +239,6 @@ pub fn reconcile_manifest(stored: &str, roots: &[PathBuf]) -> Result<()> {
 }
 
 /// Read the manifest, verify it against the roots, and keep it current
-///
-/// Written on the first open and rewritten whenever the list grows, with every
-/// named root proving it is mounted through its marker. A read-only open verifies
-/// without writing, since a reader holds no lock.
 pub fn ensure_manifest(
     driver: &IoDriver,
     roots: &[PathBuf],
@@ -315,16 +269,11 @@ pub fn ensure_manifest(
             .count();
         current = bytes == wanted;
     } else if read_only || roots.len() == 1 {
-        // Nothing stands to be verified and nothing is owed: a reader holds no
-        // lock, and a single-volume store defers its manifest until it grows a
-        // second root, which is when missing-mount protection starts protecting
-        // anything.
+        // A reader holds no lock, and a single-volume store writes no manifest until a second root
         return Ok(());
     }
 
-    // Every root the manifest names answers for itself on every open: a missing
-    // mount is an empty directory in the right place, and only the marker tells it
-    // from a fresh volume. A root declared dead is excused.
+    // Every root the manifest lists proves it is mounted through its marker, unless it is dead
     for at in 1..named.min(roots.len()) {
         if !dead[at] {
             verify_marker(driver, &roots[at])?;
@@ -334,18 +283,14 @@ pub fn ensure_manifest(
         return Ok(());
     }
 
-    // A root joining now takes its marker before the manifest names it, so a crash
-    // between the two leaves an unnamed root the next open re-adds rather than a
-    // named root that cannot prove itself.
+    // A joining root gets its marker before the manifest lists it, so a crash just re-adds it
     for at in named.max(1)..roots.len() {
         if !dead[at] {
             write_marker(driver, &roots[at])?;
         }
     }
 
-    // The reconcile only lets the list grow, so writing from zero never leaves a
-    // stale tail behind the new bytes. Best effort: a full device must still open,
-    // since opening is how compaction gets the room back.
+    // Best effort, since a full device must still open for compaction to free room
     let written = (|| -> Result<()> {
         let file = driver.open(&path, true)?;
         let outcome = (|| -> Result<()> {
@@ -362,7 +307,7 @@ pub fn ensure_manifest(
     Ok(())
 }
 
-/// Prove a manifest-named root is the volume it claims to be
+/// Prove a root in the manifest is the volume it claims to be
 fn verify_marker(driver: &IoDriver, root: &Path) -> Result<()> {
     let path = root.join(MARKER_NAME);
     let file = match driver.open(&path, false) {
@@ -394,14 +339,14 @@ fn verify_marker(driver: &IoDriver, root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The marker's bytes for a root, which are the root's own name
+/// The marker's bytes for a root, which are the root's own path
 pub(crate) fn marker_bytes(root: &Path) -> Vec<u8> {
     let mut bytes = root.as_os_str().to_string_lossy().into_owned().into_bytes();
     bytes.push(b'\n');
     bytes
 }
 
-/// Stamp a joining root with its own name, durably, before the manifest grows
+/// Stamp a joining root with its own path, durably, before the manifest grows
 fn write_marker(driver: &IoDriver, root: &Path) -> Result<()> {
     let path = root.join(MARKER_NAME);
     let bytes = marker_bytes(root);
@@ -425,7 +370,7 @@ pub fn manifest_bytes(roots: &[PathBuf]) -> Vec<u8> {
     out.into_bytes()
 }
 
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -544,7 +489,7 @@ mod tests {
         volumes.free[2].store(300, Ordering::Relaxed);
         assert_eq!(volumes.draw(None, VolumeClass::Fast), 2);
         assert_eq!(volumes.draw(None, VolumeClass::Capacity), 1);
-        // A full fast tier fails in class rather than spilling onto spindles.
+        // A full fast tier fails in class and never spills onto spindles
         assert_eq!(volumes.draw_past(&[0, 2], VolumeClass::Fast), None);
     }
 
@@ -566,8 +511,7 @@ mod tests {
         assert_eq!(volumes.fast_at(1), None);
         assert_eq!(volumes.draw(None, VolumeClass::Fast), 0);
         assert_eq!(volumes.draw_past(&[0], VolumeClass::Fast), None);
-        assert_eq!(volumes.dead_roots(), vec![Path::new("/c")]);
-        // Its placements still resolve, which is what keeps the table honest.
+        // Its placements still resolve, which keeps the table honest
         volumes.place(SegmentId(4), 2);
         assert_eq!(
             volumes.path_of(SegmentId(4)),
@@ -587,7 +531,7 @@ mod tests {
         assert!(!volumes.has_capacity());
     }
 
-    // a manifest naming a root the config dropped or moved refuses the open
+    // a manifest listing a root the config dropped or moved refuses the open
     #[test]
     fn a_missing_mount_refuses() {
         let roots = vec![PathBuf::from("/a")];
@@ -595,7 +539,7 @@ mod tests {
         assert!(reconcile_manifest("/a\n", &roots).is_ok());
         let grown = vec![PathBuf::from("/a"), PathBuf::from("/b")];
         assert!(reconcile_manifest("/a\n", &grown).is_ok());
-        // Order is the placement table's index, so a reorder is a refusal too.
+        // Order is the placement table's index, so a reorder is a refusal too
         let swapped = vec![PathBuf::from("/b"), PathBuf::from("/a")];
         assert!(reconcile_manifest("/a\n/b\n", &swapped).is_err());
     }

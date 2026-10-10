@@ -1,50 +1,68 @@
-//! Sealed segment footer: a packed sorted index of the segment's live records
-//!
-//! One segment holds records from every column, so its footer is partitioned: each
-//! column's rows sit together, sorted by key and strided at that column's own key width,
-//! behind a directory naming the partitions. Striding at the natural width keeps a footer
-//! the size of the keys it describes rather than of the widest key declared anywhere.
+//! Sealed segment footer: a sorted index of the segment's records, one partition per column
 
 use std::borrow::Cow;
 
 use crate::error::{ReelError, Result};
-use crate::format::block::block_rows_of;
 use crate::format::column::{ColumnId, RecordKey};
-use crate::format::fence::{fence_bytes, lead_of, top_leads, FENCE_LEAD, FENCE_PAGE_LEADS};
 use crate::format::filter::{Filter, HEADER_LEN as FILTER_HEADER_LEN};
 use crate::format::lsn::Lsn;
-use crate::format::prefix::PrefixRows;
+use crate::format::prefix::{unpack, PrefixRows, Tail};
 use crate::format::record::{checksum, digest, read_u32_le, read_u64_le, Flags, RecordHeader};
 
 /// Marker in the final bytes of a sealed segment
 const FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"REEL");
 
-/// Bytes a little endian word takes
 const U32_BYTES: usize = std::mem::size_of::<u32>();
 
-/// Bytes a wide little endian word takes
 const U64_BYTES: usize = std::mem::size_of::<u64>();
 
-/// Bytes one packed entry takes past its key
+/// Length of one row past its key: sequence number, offset, length and flags
 pub const ENTRY_TAIL_LEN: usize = U64_BYTES + U32_BYTES + U32_BYTES + 1;
 
-/// Bytes one directory row takes: the column, its widths, its rows, and its span
-///
-/// The span is there because a varying partition's length is not its row count times
-/// anything, and a reader holding only the directory has to step from one to the next.
+/// Length of one directory row: column, width, row count and span
 pub const DIRECTORY_ROW_LEN: usize = 1 + 2 + U32_BYTES + U32_BYTES;
 
-/// Where a directory row's span field begins
+/// Offset of the span field in a directory row
 const DIRECTORY_SPAN_AT: usize = 1 + 2 + U32_BYTES;
 
-/// The width a partition declares when its rows are not all one width
-///
-/// Past the longest key by a wide margin, so it can never collide with a width a column
-/// really keyed its rows at. Such a partition carries a start per row ahead of the rows.
+/// A partition with rows of more than one width declares this width
 pub const VARYING_WIDTH: u16 = u16::MAX;
 
-/// Bytes one row start takes in a varying partition's table
+/// A fixed width sets this bit when its rows lie prefix packed, and no key width reaches it
+pub const PACKED_WIDTH: u16 = 0x8000;
+
+/// Size of one row start in a varying partition's table
 pub const START_BYTES: usize = U32_BYTES;
+
+/// Length of the seal mark, which lets an open find the footer when the cut never landed
+pub const SEAL_MARK_LEN: usize = U64_BYTES + U32_BYTES + U32_BYTES + U32_BYTES;
+
+const SEAL_MAGIC: u32 = u32::from_le_bytes(*b"SEAL");
+
+/// The mark for a footer of this length ending at this offset: end, length, check, magic last
+pub fn seal_mark(footer_end: u64, footer_len: u32) -> [u8; SEAL_MARK_LEN] {
+    let mut mark = [0u8; SEAL_MARK_LEN];
+    mark[..8].copy_from_slice(&footer_end.to_le_bytes());
+    mark[8..12].copy_from_slice(&footer_len.to_le_bytes());
+    mark[16..].copy_from_slice(&SEAL_MAGIC.to_le_bytes());
+    let check = checksum(&mark);
+    mark[12..16].copy_from_slice(&check.to_le_bytes());
+    mark
+}
+
+/// Read a seal mark's footer end and length, or nothing for bytes that are not a mark
+pub fn read_seal_mark(bytes: &[u8]) -> Option<(u64, u32)> {
+    let mut mark: [u8; SEAL_MARK_LEN] = bytes.try_into().ok()?;
+    if read_u32_le(&mark[16..]) != SEAL_MAGIC {
+        return None;
+    }
+    let check = read_u32_le(&mark[12..16]);
+    mark[12..16].fill(0);
+    if checksum(&mark) != check {
+        return None;
+    }
+    Some((read_u64_le(&mark[..8]), read_u32_le(&mark[8..12])))
+}
 
 const MAGIC_FROM_END: usize = U32_BYTES;
 const FOOTER_LEN_FROM_END: usize = MAGIC_FROM_END + U32_BYTES;
@@ -58,24 +76,20 @@ const PARTITION_COUNT_FROM_END: usize = ENTRY_COUNT_FROM_END + U32_BYTES;
 const BLOOM_LEN_FROM_END: usize = PARTITION_COUNT_FROM_END + U32_BYTES;
 const SEALED_AT_FROM_END: usize = BLOOM_LEN_FROM_END + U64_BYTES;
 
-/// Bytes the footer holds after its partitions, with the filter region empty
+/// Bytes of the fixed fields that close every footer, after the directory
 pub const FIXED_TAIL_LEN: usize = SEALED_AT_FROM_END;
 
-/// Live and dead record bytes a segment held when it sealed, frozen into the file
+/// Live and dead record bytes in a segment when it sealed
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FooterTally {
     pub live: u64,
     pub dead: u64,
 }
 
-/// One sealed record's index entry, as packed in a segment footer
-///
-/// A point tombstone carries a zero length, a data entry its payload length, and a range
-/// tombstone the length of the end key it names. Each also says which kind it is, since a
-/// zero length fits an empty data record too.
+/// One record's index row in a segment footer
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FooterEntry {
-    /// Column and key this entry resolves
+    /// The entry's column and key
     pub key: RecordKey,
 
     /// Append sequence number of the record
@@ -87,11 +101,11 @@ pub struct FooterEntry {
     /// Payload length in bytes, zero for a point tombstone
     pub len: u32,
 
-    /// The record's own flags, which say which kind of record it is
+    /// The record's flags, which give its kind
     pub flags: Flags,
 }
 
-/// What one sealed segment says about a key, the filter consulted first
+/// What one sealed segment says about a key, asking the filter first
 #[derive(Debug)]
 pub enum FooterFind {
     /// The filter rules the key out, so nothing was searched
@@ -100,17 +114,14 @@ pub enum FooterFind {
     /// Searched, and the segment holds nothing under the key
     Missing,
 
-    /// The newest row the segment holds for the key
+    /// The segment's newest row for the key
     Found(FooterRow),
 }
 
-/// What one row says about its record, without the key it is filed under
-///
-/// A merge already holds the key it is asking about, so decoding the row's copy of it is
-/// a memcpy per candidate row that is then thrown away.
+/// One footer row's record fields, without its key
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FooterRow {
-    /// Append sequence number of the record, which is what orders two rows
+    /// Append sequence number of the record, which orders two rows of one key
     pub lsn: Lsn,
 
     /// Byte offset of the record header within the segment
@@ -119,7 +130,7 @@ pub struct FooterRow {
     /// Payload length in bytes, zero for a point tombstone
     pub len: u32,
 
-    /// The record's own flags, which say which kind of record it is
+    /// The record's flags, which give its kind
     pub flags: Flags,
 }
 
@@ -137,17 +148,16 @@ impl FooterRow {
         })
     }
 
-    /// The same row filed under its key, for a caller that wants one
     fn into_entry(self, key: RecordKey) -> FooterEntry {
         FooterEntry::new(key, self.lsn, self.offset, self.len, self.flags)
     }
 
-    /// Whether the row says its key was deleted rather than written
+    /// Whether the row marks a deleted key
     pub fn is_tombstone(&self) -> bool {
         self.flags.is_tombstone()
     }
 
-    /// Whether the row is a range delete, which names a span rather than a key
+    /// Whether the row is a range delete
     pub fn is_range_tombstone(&self) -> bool {
         self.flags.is_range_tombstone()
     }
@@ -166,9 +176,6 @@ impl FooterEntry {
     }
 
     /// An entry for a record if the footer lists its kind, else nothing
-    ///
-    /// Data records and both kinds of tombstone are listed, pads and segment headers
-    /// are not.
     pub fn from_record(header: &RecordHeader, offset: u32) -> Option<FooterEntry> {
         if !is_listed(header.flags) {
             return None;
@@ -182,7 +189,7 @@ impl FooterEntry {
         ))
     }
 
-    /// Whether this entry marks a delete of one key rather than a payload
+    /// Whether this entry marks a delete of one key
     pub fn is_tombstone(&self) -> bool {
         self.flags.is_tombstone()
     }
@@ -198,33 +205,32 @@ fn is_listed(flags: Flags) -> bool {
     flags.is_data() || flags.is_tombstone() || flags.is_range_tombstone()
 }
 
-/// One column's rows within a footer, packed at that column's stride
-///
-/// The rows are held in the shape they take on disk rather than as structs, since a tail
-/// accumulates one per record. A column whose keys are all one width strides by it and
-/// stores no row offsets; one whose keys vary carries a start per row instead.
+/// One column's rows within a footer
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FooterPartition {
-    /// Column every row in the partition belongs to
+    /// Every row in the partition belongs to this column
     pub column: ColumnId,
 
-    /// Key width every row in the partition strides by, or the varying sentinel
+    /// The key width of every row, or `VARYING_WIDTH`
     pub key_width: u16,
 
-    /// The rows themselves, in the shape they are written in
+    /// The rows back to back, each a key and its fixed tail
     packed: Vec<u8>,
 
     /// Where each row begins, and a closing sentinel, empty when the rows stride
     starts: Vec<u32>,
 
-    /// What the segment says about keys it does not hold, when it says anything
+    /// The filter over the partition's keys, if one was built
     filter: Option<Filter>,
+
+    /// Whether the rows lie prefix packed on disk, as varying rows always do
+    is_packed: bool,
 }
 
 impl FooterPartition {
     /// An empty partition for one column at its key width
     pub fn new(column: ColumnId, key_width: u16) -> FooterPartition {
-        // a varying partition's starts open with the first row's, which is 0
+        // A varying partition's starts open with 0, the first row's start
         let starts = match key_width == VARYING_WIDTH {
             true => vec![0],
             false => Vec::new(),
@@ -235,26 +241,26 @@ impl FooterPartition {
             packed: Vec::new(),
             starts,
             filter: None,
+            is_packed: key_width == VARYING_WIDTH,
         }
     }
 
-    /// Bytes the partition holds in memory, which prices its on-disk form
-    ///
-    /// Exact for a strided partition, which is written as it stands. A varying one is
-    /// prefix compressed on the way out, so this is only an estimate.
+    /// Bytes the partition holds in memory, an estimate of its on-disk size
     pub fn encoded_len(&self) -> usize {
         self.starts.len() * START_BYTES + self.packed.len()
     }
 
-    /// Whether the partition records a start per row rather than striding
+    /// Whether the partition records a start per row
     pub fn is_varying(&self) -> bool {
         self.key_width == VARYING_WIDTH
     }
 
+    /// Whether the rows lie prefix packed on disk, so a block of them opens on a restart
+    pub fn is_packed(&self) -> bool {
+        self.is_packed
+    }
+
     /// Stop striding, keeping the rows already packed
-    ///
-    /// The rows in hand were all written at the old width, so their starts are the
-    /// strides they were packed at, and everything appended after this records its own.
     fn stop_striding(&mut self) {
         if self.is_varying() {
             return;
@@ -263,12 +269,10 @@ impl FooterPartition {
         let rows = self.len();
         self.starts = (0..=rows).map(|row| (row * stride) as u32).collect();
         self.key_width = VARYING_WIDTH;
+        self.is_packed = true;
     }
 
     /// Whether this partition may hold the key, which only its filter can deny
-    ///
-    /// A partition with no filter answers yes to everything, so the search happens and
-    /// the answer is right either way.
     pub fn may_hold(&self, key: &[u8]) -> bool {
         match &self.filter {
             Some(filter) => filter.may_hold(key),
@@ -276,7 +280,7 @@ impl FooterPartition {
         }
     }
 
-    /// One key against this partition, the filter asked before any search
+    /// Look up one key, asking the filter before any search
     pub fn lookup(&self, key: &[u8]) -> Result<FooterFind> {
         if !self.may_hold(key) {
             return Ok(FooterFind::RuledOut);
@@ -287,34 +291,20 @@ impl FooterPartition {
         }
     }
 
-    /// Whether the partition carries a filter at all, which is a property of the segment
-    pub fn is_filtered(&self) -> bool {
-        self.filter.is_some()
-    }
-
-    /// Build the filter over every key the partition holds
-    ///
-    /// Every row, tombstones included: a delete missing from the filter lets a probe skip
-    /// the segment and find an older version still standing behind it.
+    /// Build the filter over every key the partition holds, tombstones included
     fn build_filter(&mut self, bits_per_key: u8) {
         let rows = self.len();
         let keys = (0..rows).filter_map(|at| self.key_at(at));
         self.filter = Filter::build(keys, rows, bits_per_key);
     }
 
-    /// Bytes one row of this partition occupies, where every row occupies the same
-    ///
-    /// Only a strided partition has an answer; a varying one is asked for a row span,
-    /// which is the door every reader goes through whatever the shape.
+    /// Bytes per row in a strided partition
     pub fn stride(&self) -> usize {
         debug_assert!(!self.is_varying(), "a varying partition has no stride");
         self.key_width as usize + ENTRY_TAIL_LEN
     }
 
-    /// The widest key any row in this partition opens with
-    ///
-    /// A record's prefix is the header plus its key, so this bounds how far past a footer
-    /// offset the payload can begin.
+    /// The width of the longest key in the partition
     pub fn widest_key(&self) -> usize {
         if !self.is_varying() {
             return self.key_width as usize;
@@ -323,42 +313,6 @@ impl FooterPartition {
             .filter_map(|row| self.key_len(row))
             .max()
             .unwrap_or(0)
-    }
-
-    /// Rows one of this partition's blocks holds on disk
-    ///
-    /// The read side cuts its blocks by the same arithmetic off the directory row, both
-    /// through one function: a fence built at a different cut names the wrong block.
-    pub fn block_rows(&self) -> usize {
-        block_rows_of(self.key_width)
-    }
-
-    /// Blocks this partition's rows divide into on disk
-    pub fn blocks(&self) -> usize {
-        self.len().div_ceil(self.block_rows())
-    }
-
-    /// Bytes this partition's leads take in a fenced footer
-    ///
-    /// The gap left between the rows and the filters is the fence, and this is how long
-    /// that gap has to be, so a fenced footer keeps the trailer an unfenced one has.
-    pub fn fence_len(&self) -> usize {
-        fence_bytes(self.blocks())
-    }
-
-    /// Whether the records these rows name sit in the order the rows are in
-    ///
-    /// Which is what makes a segment a sorted run.
-    pub fn is_sorted_run(&self) -> bool {
-        let mut behind = 0u32;
-        for at in 0..self.len() {
-            let offset = self.offset_at(at);
-            if offset < behind {
-                return false;
-            }
-            behind = offset;
-        }
-        true
     }
 
     /// Where one row begins and ends within the packed rows
@@ -374,10 +328,7 @@ impl FooterPartition {
         (end <= self.packed.len()).then_some((start, end))
     }
 
-    /// The key width one row was written at
-    ///
-    /// Derived from the row's own length rather than stored: the tail is one size on
-    /// every row, so whatever the row holds past it is its key.
+    /// One row's key width, which is the row's length less the fixed tail
     fn key_len(&self, index: usize) -> Option<usize> {
         if !self.is_varying() {
             return Some(self.key_width as usize);
@@ -386,7 +337,7 @@ impl FooterPartition {
         (end - start).checked_sub(ENTRY_TAIL_LEN)
     }
 
-    /// Rows the partition holds
+    /// Number of rows in the partition
     pub fn len(&self) -> usize {
         match self.is_varying() {
             true => self.starts.len().saturating_sub(1),
@@ -399,10 +350,7 @@ impl FooterPartition {
         self.packed.is_empty()
     }
 
-    /// Append one row
-    ///
-    /// A strided partition takes rows keyed at its width. A varying one records where the
-    /// row started, and that start is the only thing separating this row from the next.
+    /// Append one row, recording where it ends when the partition varies
     pub fn push(&mut self, entry: &FooterEntry) {
         self.packed.extend_from_slice(entry.key.as_slice());
         self.packed.extend_from_slice(&entry.lsn.pack());
@@ -425,12 +373,12 @@ impl FooterPartition {
         Ok(FooterRow::read(row, width)?.into_entry(key))
     }
 
-    /// Every row in the order the partition holds them
+    /// Every row in the partition, in order
     pub fn entries(&self) -> impl Iterator<Item = Result<FooterEntry>> + '_ {
         (0..self.len()).map(|index| self.entry_at(index))
     }
 
-    /// What one row says about its record, without decoding the key it repeats
+    /// One row's record fields, without decoding its key
     pub fn row_at(&self, index: usize) -> Result<FooterRow> {
         let width = self
             .key_len(index)
@@ -438,7 +386,6 @@ impl FooterPartition {
         FooterRow::read(self.row_bytes(index)?, width)
     }
 
-    /// The bytes of one row, which is where every reading of one starts
     fn row_bytes(&self, index: usize) -> Result<&[u8]> {
         let (start, end) = self
             .row_span(index)
@@ -448,10 +395,7 @@ impl FooterPartition {
             .ok_or_else(|| ReelError::Corruption("footer row is out of range".to_string()))
     }
 
-    /// The sequence number one row carries, for ordering a key's versions
-    ///
-    /// Read straight out of the packed row like the key, since the sort asks for it per
-    /// comparison and decoding a whole row to answer would be the sort's cost.
+    /// One row's sequence number, read straight from the packed row
     fn lsn_at(&self, index: usize) -> u64 {
         let Some(((start, _), width)) = self.row_span(index).zip(self.key_len(index)) else {
             return 0;
@@ -463,51 +407,26 @@ impl FooterPartition {
         }
     }
 
-    /// The offset one row names, read out of the packed row like the key
-    ///
-    /// Zero for a row this cannot reach, which the sortedness test treats as out of
-    /// order rather than as absent.
-    fn offset_at(&self, index: usize) -> u32 {
-        let Some(((start, _), width)) = self.row_span(index).zip(self.key_len(index)) else {
-            return 0;
-        };
-        let at = start + width + U64_BYTES;
-        match self.packed.get(at..at + U32_BYTES) {
-            Some(bytes) => read_u32_le(bytes),
-            None => 0,
-        }
-    }
-
-    /// The key one row carries, without decoding the rest of it
-    ///
-    /// A search compares keys and nothing else, so it reads the key alone and decodes a
-    /// row only once it has found the one it wants.
+    /// One row's key, without decoding the rest of the row
     pub fn key_at(&self, index: usize) -> Option<&[u8]> {
         let (start, _) = self.row_span(index)?;
         let width = self.key_len(index)?;
         self.packed.get(start..start + width)
     }
 
-    /// The newest row this partition holds for a key, if it holds one at all
-    ///
-    /// A segment that overwrote its own record holds both versions under one key, in the
-    /// order they were written, so the search walks to the last of an equal run.
+    /// The newest row for a key, if the partition holds one
     pub fn find(&self, key: &[u8]) -> Option<Result<FooterEntry>> {
         let at = self.locate(key)?;
         Some(self.entry_at(at))
     }
 
-    /// What the newest row for a key says, without rebuilding the key to say it
+    /// The newest row's record fields for a key, without rebuilding the key
     pub fn find_row(&self, key: &[u8]) -> Option<Result<FooterRow>> {
         let at = self.locate(key)?;
         Some(self.row_at(at))
     }
 
-    /// The first and last row sharing the key at a position
-    ///
-    /// Two rows share a key when a segment overwrote its own record, and the sort keeps
-    /// versions in sequence order, so the last of a run is the live one. Nearly every key
-    /// is written once, so each end is a compare against its neighbour before a search.
+    /// The first and last row sharing the key at a position, the last one live
     pub fn run(&self, index: usize) -> Option<(usize, usize)> {
         let key = self.key_at(index)?;
         let first = match index.checked_sub(1).and_then(|before| self.key_at(before)) {
@@ -521,16 +440,13 @@ impl FooterPartition {
         Some((first, last))
     }
 
-    /// Where the newest row for a key sits, if the partition holds one
+    /// The index of the newest row for a key, if the partition holds one
     fn locate(&self, key: &[u8]) -> Option<usize> {
         let at = self.upper_bound(key).checked_sub(1)?;
         (self.key_at(at)? == key).then_some(at)
     }
 
     /// The first row at or past a key, or the row count if every row is below it
-    ///
-    /// A bound shorter than the partition's keys is a prefix, and a prefix sorts below
-    /// every key that begins with it, so the answer is the first row the prefix reaches.
     pub fn lower_bound(&self, key: &[u8]) -> usize {
         self.bound(key, false)
     }
@@ -542,7 +458,12 @@ impl FooterPartition {
 
     /// Binary search for the first row past a key, counting equal rows or not
     fn bound(&self, key: &[u8], past_equal: bool) -> usize {
-        let (mut low, mut high) = (0usize, self.len());
+        self.bound_within(key, 0, self.len(), past_equal)
+    }
+
+    /// Binary search for the first row past a key, within a window that holds the answer
+    pub fn bound_within(&self, key: &[u8], low: usize, high: usize, past_equal: bool) -> usize {
+        let (mut low, mut high) = (low, high.min(self.len()));
         while low < high {
             let middle = low + (high - low) / 2;
             let Some(found) = self.key_at(middle) else {
@@ -561,9 +482,6 @@ impl FooterPartition {
     }
 
     /// The lowest and highest key the partition holds
-    ///
-    /// What a paged index keeps resident per sealed segment, so a lookup can rule a
-    /// segment out without reading its footer at all.
     pub fn key_range(&self) -> Option<(&[u8], &[u8])> {
         let count = self.len();
         if count == 0 {
@@ -572,44 +490,21 @@ impl FooterPartition {
         Some((self.key_at(0)?, self.key_at(count - 1)?))
     }
 
-    /// Rows that still resolved to a record when the segment sealed
-    ///
-    /// A key overwritten inside its own segment leaves both versions in the partition, so
-    /// once the rows are in key order the live ones are the distinct keys. A record
-    /// shadowed by a rewrite in another tail leaves one row here and is counted live.
-    pub fn live_rows(&self) -> u32 {
-        let mut live = 0u32;
-        let mut last: Option<&[u8]> = None;
-        for at in 0..self.len() {
-            let key = self.key_at(at);
-            if key != last {
-                live += 1;
-                last = key;
-            }
-        }
-        live
-    }
-
-    /// Whether the rows already sit in the order the sort would put them in
-    ///
-    /// One pass of n compares against the n log n the sort costs, and arrival order is no
-    /// shuffle: a column whose producer advances a counter is already in key order. The
-    /// compare is the whole key, since adjacent rows of these columns tie on a lead.
+    /// Whether the rows are already in the order the sort would leave them
     fn in_key_order(&self) -> bool {
         let count = self.len();
         let Some(mut before) = self.key_at(0) else {
             return true;
         };
         for at in 1..count {
-            // A row this cannot read is one the sort has to handle rather than skip.
+            // The sort has to handle a row this cannot read
             let Some(here) = self.key_at(at) else {
                 return false;
             };
             match before.cmp(here) {
                 std::cmp::Ordering::Less => {}
                 std::cmp::Ordering::Greater => return false,
-                // Equal keys are the sort's tie break: the rows a rewrite left behind are
-                // in order when their sequence numbers ascend with them.
+                // Equal keys are in order when their sequence numbers ascend
                 std::cmp::Ordering::Equal => {
                     if self.lsn_at(at - 1) >= self.lsn_at(at) {
                         return false;
@@ -621,7 +516,7 @@ impl FooterPartition {
         true
     }
 
-    /// Bytes every key in the partition opens with, which tell no two rows apart
+    /// Length of the prefix every key in the partition shares
     fn shared_prefix(&self) -> usize {
         let Some(first) = self.key_at(0) else {
             return 0;
@@ -638,11 +533,7 @@ impl FooterPartition {
         shared
     }
 
-    /// Eight bytes of one row's key past the shared prefix, as a number that orders as
-    /// the key does
-    ///
-    /// A key that runs out is padded with zeros, which can only tie it with a longer
-    /// one, and a tie is settled on the whole key.
+    /// The key's next eight bytes past the shared prefix, as a number that sorts like the key
     fn key_head(&self, index: usize, shared: usize) -> u64 {
         let key = self.key_at(index).unwrap_or_default();
         let rest = key.get(shared..).unwrap_or_default();
@@ -653,32 +544,24 @@ impl FooterPartition {
     }
 
     /// Put the rows in key order, ordering a key's versions by sequence number
-    ///
-    /// Two rows can share a key when a segment holds an overwrite of its own record, and
-    /// the one written later has the higher sequence number.
     pub fn sort(&mut self) {
-        // Rows that arrived in order are left where they are, which skips the permute
-        // below as well as the sort.
+        // Rows that arrived in order skip both the sort and the permute
         if self.in_key_order() {
             return;
         }
 
         let count = self.len();
-        // Each row brings the head of its key along, so a comparison is settled by two
-        // words already in hand and only a tie goes back to the rows.
+        // Compare key heads first and go back to the rows only on a tie
         let shared = self.shared_prefix();
         let mut order: Vec<(u64, u32)> = (0..count as u32)
             .map(|at| (self.key_head(at as usize, shared), at))
             .collect();
-        // Unstable, with the sequence number as the tie break. Writers finish in whatever
-        // order they finish, so a key rewritten within one segment can arrive newest
-        // first, and ordering that run by arrival leaves the older row where a lookup
-        // takes it.
+        // A rewritten key can arrive newest first, so its versions sort by sequence number
         order.sort_unstable_by(|left, right| {
             left.0.cmp(&right.0).then_with(|| {
                 let left = left.1 as usize;
                 let right = right.1 as usize;
-                // In range by construction, since the order came from the row count.
+                // In range, since the order came from the row count
                 let one = self.key_at(left).unwrap_or_default();
                 let two = self.key_at(right).unwrap_or_default();
                 one.cmp(two)
@@ -692,7 +575,7 @@ impl FooterPartition {
             starts.push(0u32);
         }
         for (_, index) in order {
-            // In range by construction, as above.
+            // In range, as above
             let (start, end) = self.row_span(index as usize).unwrap_or((0, 0));
             sorted.extend_from_slice(&self.packed[start..end]);
             if self.is_varying() {
@@ -721,7 +604,7 @@ pub struct SegmentFooter {
     /// The sequence number frontier when the segment sealed, which bounds the tally
     pub sealed_at: Lsn,
 
-    /// What the segment's records weighed, live and dead, at the moment it sealed
+    /// Live and dead record bytes when the segment sealed
     pub tally: FooterTally,
 }
 
@@ -738,10 +621,6 @@ impl SegmentFooter {
     }
 
     /// An empty footer with room for as many rows as this one holds, column by column
-    ///
-    /// A tail's next segment takes about the rows its last one did, and rows that fit the
-    /// room never move. Growing into them a doubling at a time copied the rows again
-    /// into fresh pages at every step.
     pub fn empty_like(&self) -> SegmentFooter {
         let mut footer = SegmentFooter::empty();
         for held in &self.partitions {
@@ -753,22 +632,7 @@ impl SegmentFooter {
         footer
     }
 
-    /// Make room for this many more rows in every strided partition
-    pub fn reserve_rows(&mut self, rows: usize) {
-        for partition in &mut self.partitions {
-            if !partition.is_varying() {
-                let room = rows * partition.stride();
-                partition.packed.reserve(room);
-            }
-        }
-    }
-
     /// Add one row, opening the partition for its column if this is the first
-    ///
-    /// A partition opens at the width of the first key its column offers and strides by
-    /// it. A key of a second width stops the striding and is never padded into it. A new
-    /// partition goes in at its column's place, so a lookup by column can search the
-    /// footer at every stage.
     pub fn push(&mut self, entry: &FooterEntry) {
         let column = entry.key.column;
         let width = entry.key.width();
@@ -805,7 +669,7 @@ impl SegmentFooter {
         footer
     }
 
-    /// Rows across every partition
+    /// Number of rows across every partition
     pub fn entry_count(&self) -> usize {
         self.partitions
             .iter()
@@ -825,7 +689,7 @@ impl SegmentFooter {
             .flat_map(|partition| partition.entries())
     }
 
-    /// On-disk length this footer packs to
+    /// The footer's length with each partition's rows sized as held in memory
     pub fn encoded_len(&self) -> usize {
         let rows: usize = self
             .partitions
@@ -835,33 +699,7 @@ impl SegmentFooter {
         rows + self.filter_region_len() + self.partitions.len() * DIRECTORY_ROW_LEN + FIXED_TAIL_LEN
     }
 
-    /// Every partition's leads, then the sampled level over each of them
-    ///
-    /// Both halves in directory order, and neither is written down twice: a partition's
-    /// block count follows from the rows and widths its directory row already carries.
-    /// The sampled level sits at the end so a volume holding only it takes one run.
-    fn fence_region(&self) -> Vec<u8> {
-        let blocks: usize = self.partitions.iter().map(FooterPartition::blocks).sum();
-        let mut region = Vec::with_capacity(fence_bytes(blocks));
-        let mut tops = Vec::with_capacity(top_leads(blocks) * FENCE_LEAD);
-        for partition in &self.partitions {
-            let rows = partition.block_rows();
-            for block in 0..partition.blocks() {
-                let lead = lead_of(partition.key_at(block * rows).unwrap_or_default());
-                if block % FENCE_PAGE_LEADS == 0 {
-                    tops.extend_from_slice(&lead);
-                }
-                region.extend_from_slice(&lead);
-            }
-        }
-        region.extend_from_slice(&tops);
-        region
-    }
-
-    /// Bytes the filter region takes, which is a header per partition either way
-    ///
-    /// A partition with no filter still writes its header, so the region is walked in the
-    /// same order as the directory with nothing else to say where each one begins.
+    /// Bytes of the filter region, which is empty when no partition has a filter
     fn filter_region_len(&self) -> usize {
         match self
             .partitions
@@ -881,24 +719,8 @@ impl SegmentFooter {
     }
 
     /// Serialize the footer to its on-disk bytes with checksum and magic
-    ///
-    /// The partitions are put in column order and their rows in key order first, since a
-    /// footer is written once and read as a sorted index from then on. Varying rows are
-    /// prefix compressed on the way out, so every encoded form is in hand before a length
-    /// is written anywhere.
     pub fn pack(&mut self, filter_bits: u8) -> Result<Vec<u8>> {
-        self.pack_fenced(filter_bits, false)
-    }
-
-    /// The same footer with a fence over each partition's blocks
-    ///
-    /// The fence is what a blocked search descends instead of reading a block per
-    /// halving, so it is written for the volumes that search that way. It sits below the
-    /// filters, and nothing in the trailer says it is there: its length is what is left
-    /// between the rows and the filters, which follows from the row counts and widths the
-    /// directory already carries.
-    pub fn pack_fenced(&mut self, filter_bits: u8, is_fenced: bool) -> Result<Vec<u8>> {
-        let (rows, tail) = self.pack_apart(filter_bits, is_fenced)?;
+        let (rows, tail) = self.pack_apart(filter_bits)?;
         let mut buf = Vec::with_capacity(rows.iter().map(Vec::len).sum::<usize>() + tail.len());
         for piece in &rows {
             buf.extend_from_slice(piece);
@@ -908,22 +730,16 @@ impl SegmentFooter {
         Ok(buf)
     }
 
-    /// The same footer as each partition's rows, lent out where they sit, and the bytes
-    /// after them
-    ///
-    /// A seal lands the pieces in one vectored write, so no page of the rows is copied,
-    /// and gives the rows back with `put_rows`.
-    pub fn pack_apart(
-        &mut self,
-        filter_bits: u8,
-        is_fenced: bool,
-    ) -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
-        // A partition opened with room and never written to says nothing on disk.
+    /// Pack the footer as per-partition rows and the bytes after them, for a vectored write
+    pub fn pack_apart(&mut self, filter_bits: u8) -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
+        // Drop partitions that were opened with room and never written
         self.partitions.retain(|partition| !partition.is_empty());
         self.partitions.sort_by_key(|partition| partition.column);
         for partition in self.partitions.iter_mut() {
             partition.sort();
             partition.build_filter(filter_bits);
+            // Packing saves bytes on the row tails even where keys share nothing
+            partition.is_packed = true;
         }
 
         let encoded = self
@@ -932,18 +748,10 @@ impl SegmentFooter {
             .map(encoded_partition_rows)
             .collect::<Result<Vec<_>>>()?;
         let rows_len: usize = encoded.iter().map(|rows| rows.len()).sum();
-        let fences = match is_fenced {
-            true => self.fence_region(),
-            false => Vec::new(),
-        };
         let region_len = self.filter_region_len();
-        let footer_len = rows_len
-            + fences.len()
-            + region_len
-            + self.partitions.len() * DIRECTORY_ROW_LEN
-            + FIXED_TAIL_LEN;
+        let footer_len =
+            rows_len + region_len + self.partitions.len() * DIRECTORY_ROW_LEN + FIXED_TAIL_LEN;
         let mut buf = Vec::with_capacity(footer_len - rows_len);
-        buf.extend_from_slice(&fences);
         if region_len > 0 {
             for partition in &self.partitions {
                 match &partition.filter {
@@ -978,8 +786,7 @@ impl SegmentFooter {
         let crc = crc.finalize() as u32;
         buf[crc_at..crc_at + U32_BYTES].copy_from_slice(&crc.to_le_bytes());
 
-        // A varying partition writes an encoded copy and keeps its rows, and a strided
-        // one lends the rows it holds.
+        // A packed partition lends an encoded copy, and a strided one lends its own rows
         let encoded: Vec<Option<Vec<u8>>> = encoded
             .into_iter()
             .map(|rows| match rows {
@@ -1000,22 +807,18 @@ impl SegmentFooter {
     /// Take back the rows `pack_apart` lent
     pub fn put_rows(&mut self, rows: Vec<Vec<u8>>) {
         for (partition, rows) in self.partitions.iter_mut().zip(rows) {
-            if !partition.is_varying() {
+            if !partition.is_packed() {
                 partition.packed = rows;
             }
         }
     }
 
     /// Parse a footer from the trailing bytes of a segment
-    ///
-    /// The slice must end at the segment end. An absent magic, a length out of range, or
-    /// a checksum mismatch is reported so the caller falls back to a record scan.
     pub fn parse(segment_tail: &[u8]) -> Result<SegmentFooter> {
         SegmentFooter::parse_owned(segment_tail.to_vec())
     }
 
-    /// The same parse, keeping the buffer as the first partition's rows so no page of
-    /// them is copied
+    /// The same parse, keeping the buffer as a strided first partition's rows
     pub fn parse_owned(mut segment_tail: Vec<u8>) -> Result<SegmentFooter> {
         let total = segment_tail.len();
         if total < FIXED_TAIL_LEN {
@@ -1089,22 +892,14 @@ impl SegmentFooter {
             partitions[0].packed = segment_tail;
         }
 
-        // What is left between the rows and the filters is the fence, and nothing here
-        // reads it. It is still checked against the size these partitions imply, since
-        // the only other thing a gap can be is a footer that does not describe itself.
         let listed: usize = partitions.iter().map(|partition| partition.len()).sum();
-        let rows_end = directory_at - bloom_len;
-        let fenced: usize = partitions.iter().map(FooterPartition::fence_len).sum();
-        let gap = rows_end.checked_sub(consumed);
-        let is_tiled = gap.is_some_and(|gap| gap == 0 || gap == fenced);
-        if !is_tiled || listed != entry_count {
+        if consumed != directory_at - bloom_len || listed != entry_count {
             return Err(ReelError::Corruption(
                 "footer entry count is inconsistent with its length".to_string(),
             ));
         }
 
-        // Packed in column order, and held that way whatever a file says, since every
-        // lookup by column is a binary search.
+        // Lookups by column binary search, so hold the partitions in column order
         partitions.sort_by_key(|partition| partition.column);
         Ok(SegmentFooter {
             partitions,
@@ -1115,15 +910,13 @@ impl SegmentFooter {
         })
     }
 
-    /// One column's partition, found by a binary search over the column order
+    /// One column's partition, if the footer has one
     pub fn partition(&self, column: ColumnId) -> Option<&FooterPartition> {
         partition_in(&self.partitions, column, |partition| partition.column)
     }
 }
 
-/// One column's entry in a run held in column order
-///
-/// A handful is scanned outright, since a scan of a few beats the branches of a search.
+/// One column's entry in a slice held in column order, scanned when short
 pub(crate) fn partition_in<Held>(
     held: &[Held],
     column: ColumnId,
@@ -1138,15 +931,11 @@ pub(crate) fn partition_in<Held>(
 }
 
 /// One partition's rows in their on-disk form
-///
-/// A strided partition writes its rows as they stand. A varying one writes the
-/// prefix-compressed block, which shares each key's front with the row before it and so
-/// needs the rows already sorted.
 fn encoded_partition_rows(partition: &FooterPartition) -> Result<Cow<'_, [u8]>> {
-    if !partition.is_varying() {
+    if !partition.is_packed() {
         return Ok(Cow::Borrowed(partition.packed.as_slice()));
     }
-    let mut rows = PrefixRows::new();
+    let mut rows = PrefixRows::with_capacity(Tail::Entry, partition.packed.len());
     for index in 0..partition.len() {
         let width = partition.key_len(index).ok_or_else(|| {
             ReelError::Corruption(
@@ -1156,27 +945,22 @@ fn encoded_partition_rows(partition: &FooterPartition) -> Result<Cow<'_, [u8]>> 
         let row = partition.row_bytes(index)?;
         rows.push(&row[..width], &row[width..])?;
     }
-    let mut out = Vec::with_capacity(rows.encoded_len());
-    rows.encode(&mut out);
-    Ok(Cow::Owned(out))
+    Ok(Cow::Owned(rows.into_encoded()))
 }
 
-/// Write one partition's directory row
-///
-/// The span is the encoded rows' length, handed in rather than derived, because a varying
-/// partition's on-disk form is built at write time.
+/// Write one partition's directory row, with the span of its encoded rows
 fn write_directory_row(buf: &mut Vec<u8>, partition: &FooterPartition, span: usize) {
     buf.push(partition.column.as_u8());
-    buf.extend_from_slice(&partition.key_width.to_le_bytes());
+    let width = match partition.is_packed() && !partition.is_varying() {
+        true => partition.key_width | PACKED_WIDTH,
+        false => partition.key_width,
+    };
+    buf.extend_from_slice(&width.to_le_bytes());
     buf.extend_from_slice(&(partition.len() as u32).to_le_bytes());
     buf.extend_from_slice(&(span as u32).to_le_bytes());
 }
 
-/// Decode the directory and take each partition's packed rows behind it
-///
-/// Also answers how many bytes of the rows region the partitions consumed, since the
-/// in-memory form's length is not the on-disk one for prefix packed rows. A strided
-/// first partition comes back empty with its span, for the caller's buffer to fill.
+/// Decode the directory and each partition's rows, plus the row bytes consumed
 fn read_partitions(
     footer: &[u8],
     directory_at: usize,
@@ -1192,32 +976,35 @@ fn read_partitions(
             .get(at..at + DIRECTORY_ROW_LEN)
             .ok_or_else(|| ReelError::Corruption("footer directory is truncated".to_string()))?;
         let column = ColumnId(row[0]);
-        // A lookup by column finds one partition, so a second would be rows no read sees.
+        // A lookup by column finds one partition, so a second one is unreachable
         if std::mem::replace(&mut listed[row[0] as usize], true) {
             return Err(ReelError::Corruption(
                 "footer directory lists a column twice".to_string(),
             ));
         }
-        let key_width = u16::from_le_bytes([row[1], row[2]]);
+        let (key_width, is_packed) = width_field(u16::from_le_bytes([row[1], row[2]]));
         let count = read_u32_le(&row[3..DIRECTORY_SPAN_AT]) as usize;
         let listed_span = read_u32_le(&row[DIRECTORY_SPAN_AT..DIRECTORY_ROW_LEN]) as usize;
 
         let mut partition = FooterPartition::new(column, key_width);
-        if partition.is_varying() {
-            // The varying rows land prefix compressed, so the parse rebuilds the
-            // whole-row form every in-memory reader searches.
+        partition.is_packed = is_packed;
+        if is_packed {
+            // In-memory readers search whole rows, so the parse unpacks them
             let blob = footer.get(rows_at..rows_at + listed_span).ok_or_else(|| {
                 ReelError::Corruption("footer partition is truncated".to_string())
             })?;
-            let rows = PrefixRows::decode(blob)?;
-            if rows.len() != count {
+            let row_len = (!partition.is_varying()).then(|| partition.stride());
+            let (packed, starts, rows) = unpack(blob, Tail::Entry, row_len)?;
+            if rows != count {
                 return Err(ReelError::Corruption(
                     "footer partition holds a row count its directory row denies".to_string(),
                 ));
             }
-            let (packed, starts) = rows.unpacked(ENTRY_TAIL_LEN)?;
             partition.packed = packed;
-            partition.starts = starts;
+            // One width strides in memory, however it lay on disk
+            if partition.is_varying() {
+                partition.starts = starts;
+            }
             rows_at += listed_span;
             partitions.push(partition);
             continue;
@@ -1241,11 +1028,7 @@ fn read_partitions(
     Ok((partitions, rows_at, lead))
 }
 
-/// Read a sealed segment's trailer without reading the footer it describes
-///
-/// The caller supplies the trailing bytes of the file and its full length, since every
-/// offset in a footer is measured from the end. Nothing comes back for a file carrying no
-/// footer; a footer whose length does not fit the file is reported as corruption.
+/// Locate a sealed segment's directory from its trailer, or nothing without a footer
 pub fn directory_span(tail: &[u8], file_len: u64) -> Result<Option<DirectorySpan>> {
     let total = tail.len();
     if total < FIXED_TAIL_LEN {
@@ -1288,13 +1071,13 @@ pub fn directory_span(tail: &[u8], file_len: u64) -> Result<Option<DirectorySpan
 /// Where a sealed segment's directory and filters sit, without reading its rows
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DirectorySpan {
-    /// Bytes the whole footer occupies at the end of the file
+    /// Length of the whole footer at the end of the file
     pub footer_len: usize,
 
     /// Where the directory begins, counted from the start of the footer
     pub directory_at: usize,
 
-    /// Partitions the directory names
+    /// Number of partitions in the directory
     pub partitions: usize,
 
     /// Bytes of filters, sitting immediately below the directory
@@ -1302,9 +1085,6 @@ pub struct DirectorySpan {
 }
 
 /// Decode a directory into where each column's rows sit in the segment file
-///
-/// The offsets are absolute, taken from where the footer begins, so a reader can go
-/// straight to a row without holding anything between it and the file.
 pub fn partition_spans(
     directory: &[u8],
     partitions: usize,
@@ -1317,12 +1097,13 @@ pub fn partition_spans(
         let row = directory
             .get(start..start + DIRECTORY_ROW_LEN)
             .ok_or_else(|| ReelError::Corruption("footer directory is truncated".to_string()))?;
-        let key_width = u16::from_le_bytes([row[1], row[2]]);
+        let (key_width, is_packed) = width_field(u16::from_le_bytes([row[1], row[2]]));
         let rows = read_u32_le(&row[3..DIRECTORY_SPAN_AT]) as usize;
         let encoded = read_u32_le(&row[DIRECTORY_SPAN_AT..DIRECTORY_ROW_LEN]) as u64;
         let span = crate::format::block::PartitionSpan {
             column: ColumnId(row[0]),
             key_width,
+            is_packed,
             rows,
             at,
             encoded,
@@ -1331,6 +1112,15 @@ pub fn partition_spans(
         spans.push(span);
     }
     Ok(spans)
+}
+
+/// A directory row's width field, read as its rows' key width and whether they lie packed
+fn width_field(field: u16) -> (u16, bool) {
+    match field {
+        VARYING_WIDTH => (VARYING_WIDTH, true),
+        field if field & PACKED_WIDTH != 0 => (field & !PACKED_WIDTH, true),
+        field => (field, false),
+    }
 }
 
 fn read_at_u32(footer: &[u8], footer_len: usize, from_end: usize) -> u32 {
@@ -1387,6 +1177,26 @@ mod tests {
             .collect()
     }
 
+    // a tail's next segment keeps its first row when its last one's partition varied
+    #[test]
+    fn the_next_footer_of_a_varying_partition_keeps_its_first_row() {
+        let mut last = SegmentFooter::empty();
+        last.push(&entry(RECORD, 1, 8, 1, 36, 64));
+        last.push(&entry(RECORD, 2, 12, 2, 136, 64));
+        assert!(last.partition(RECORD).expect("partition").is_varying());
+
+        let mut next = last.empty_like();
+        let first = entry(RECORD, 3, 22, 3, 36, 64);
+        next.push(&first);
+        next.push(&entry(RECORD, 4, 9, 4, 136, 64));
+        assert_eq!(
+            collect(&next).first(),
+            Some(&first),
+            "the first row of the next segment went missing"
+        );
+        assert_eq!(next.entry_count(), 2);
+    }
+
     // an entry stays in its size class, since a merge holds one per row it walks
     #[test]
     fn an_entry_stays_in_its_size_class() {
@@ -1397,7 +1207,7 @@ mod tests {
         );
     }
 
-    // shaped names spend most of their bytes on shared fronts, which packing drops
+    // object keys spend most of their bytes on shared fronts, which packing drops
     #[test]
     fn packed_object_names_shrink_the_partition() {
         let mut rows = Vec::new();
@@ -1416,7 +1226,7 @@ mod tests {
                 Flags::DATA,
             ));
         }
-        // A second width, so the partition varies and takes the packed form.
+        // A second width makes the partition vary
         rows.push(entry(RECORD, 1, 8, 2000, 0, 64));
 
         let mut footer = SegmentFooter::build(rows);
@@ -1445,6 +1255,66 @@ mod tests {
         footer.partitions.remove(0)
     }
 
+    /// Rows of a few owners whose keys share their first 32 bytes, like one address's signatures
+    fn owned_rows(owners: u8, rows: u16) -> Vec<FooterEntry> {
+        let mut entries = Vec::new();
+        for owner in 0..owners {
+            for row in 0..rows {
+                let mut bytes = [owner; 48];
+                bytes[32..34].copy_from_slice(&row.to_be_bytes());
+                bytes[34..].copy_from_slice(&[(row as u8) ^ 0x5a; 14]);
+                let key = RecordKey::from_bytes(RECORD, &bytes).expect("key");
+                let at = u32::from(owner) * 1000 + u32::from(row);
+                entries.push(FooterEntry::new(
+                    key,
+                    Lsn(u64::from(at) + 1),
+                    at * 100,
+                    64,
+                    Flags::DATA,
+                ));
+            }
+        }
+        entries
+    }
+
+    // a one-width column whose keys share their fronts lies packed on disk and parses back whole
+    #[test]
+    fn a_one_width_column_with_shared_fronts_lies_packed() {
+        let rows = owned_rows(4, 200);
+        let strided = rows.len() * (48 + ENTRY_TAIL_LEN);
+        let mut footer = SegmentFooter::build(rows);
+        let packed = footer.pack(0).expect("pack");
+        assert!(
+            packed.len() < strided * 3 / 4,
+            "{} bytes against {strided} strided",
+            packed.len()
+        );
+
+        let parsed = SegmentFooter::parse(&packed).expect("parse");
+        let partition = parsed.partition(RECORD).expect("partition");
+        assert!(partition.is_packed(), "shared fronts pay for packing");
+        assert!(!partition.is_varying(), "one width still strides in memory");
+        assert_eq!(parsed, footer);
+        assert_eq!(collect(&parsed), collect(&footer));
+    }
+
+    // keys spread like hashes still pack smaller than strided rows
+    #[test]
+    fn spread_keys_pack_smaller_than_strided() {
+        let rows = many_rows(200);
+        let strided = rows.len() * (34 + ENTRY_TAIL_LEN);
+        let mut footer = SegmentFooter::build(rows);
+        let packed = footer.pack(0).expect("pack");
+        assert!(footer.partition(RECORD).expect("partition").is_packed());
+        assert!(
+            packed.len() < strided,
+            "{} bytes against {strided} strided",
+            packed.len()
+        );
+        let parsed = SegmentFooter::parse(&packed).expect("parse");
+        assert_eq!(parsed, footer);
+    }
+
     /// Rows enough to fill several blocks, in the order a fresh segment writes them
     fn many_rows(count: u32) -> Vec<FooterEntry> {
         (0..count)
@@ -1457,57 +1327,11 @@ mod tests {
             .collect()
     }
 
-    // a fenced footer costs a lead a block, and the rows come back unchanged
-    #[test]
-    fn a_fence_costs_a_lead_a_block() {
-        let mut plain = SegmentFooter::build(many_rows(200));
-        let mut fenced = SegmentFooter::build(many_rows(200));
-
-        let bare = plain.pack(0).expect("pack");
-        let leaded = fenced.pack_fenced(0, true).expect("pack");
-
-        let blocks = fenced.partitions[0].blocks();
-        assert!(blocks > 1, "one block would not exercise a fence");
-        assert_eq!(
-            leaded.len() - bare.len(),
-            fence_bytes(blocks),
-            "a fence is a lead a block and one more per page of them",
-        );
-
-        // The fence is on the blocked path alone, so parsing the footer whole reads
-        // exactly what an unfenced one holds.
-        assert_eq!(
-            SegmentFooter::parse(&leaded).expect("parse"),
-            SegmentFooter::parse(&bare).expect("parse"),
-        );
-    }
-
-    // the leads ascend and each one leads the block it names
-    #[test]
-    fn leads_name_their_blocks() {
-        let mut footer = SegmentFooter::build(many_rows(200));
-        let _ = footer.pack_fenced(0, true).expect("pack");
-        let partition = &footer.partitions[0];
-        let region = footer.fence_region();
-
-        let rows = partition.block_rows();
-        for block in 0..partition.blocks() {
-            let at = block * FENCE_LEAD;
-            let first = partition.key_at(block * rows).expect("a block's first row");
-            assert_eq!(
-                &region[at..at + FENCE_LEAD],
-                &lead_of(first)[..],
-                "block {block} is led by another block's key",
-            );
-        }
-    }
-
-    // a fenced sorted run keeps its filter, and only zero bits take one away
+    // a sorted run keeps its filter, and only zero bits take one away
     #[test]
     fn a_sorted_run_keeps_its_filter() {
         let mut sorted = SegmentFooter::build(many_rows(200));
-        // The same rows with the records where a fresh segment would have put them,
-        // which is arrival order rather than key order.
+        // The same rows, with the records where a fresh segment would have put them
         let mut scattered = SegmentFooter::build(
             many_rows(200)
                 .into_iter()
@@ -1519,16 +1343,14 @@ mod tests {
         );
         let mut merged = SegmentFooter::build(many_rows(200));
 
-        let _ = sorted.pack_fenced(10, true).expect("pack");
-        let _ = scattered.pack_fenced(10, true).expect("pack");
-        let _ = merged.pack_fenced(0, true).expect("pack");
+        let _ = sorted.pack(10).expect("pack");
+        let _ = scattered.pack(10).expect("pack");
+        let _ = merged.pack(0).expect("pack");
 
-        assert!(sorted.partitions[0].is_sorted_run());
         assert!(
             sorted.partitions[0].filter.is_some(),
-            "a fence brackets a key without answering membership",
+            "a sorted run still needs its filter",
         );
-        assert!(!scattered.partitions[0].is_sorted_run());
         assert!(scattered.partitions[0].filter.is_some());
         assert!(
             merged.partitions[0].filter.is_none(),
@@ -1663,8 +1485,7 @@ mod tests {
         assert!(partition.is_varying());
         assert_eq!(partition.len(), widths.len());
 
-        // Every key comes back at its own width, and a search finds each one where
-        // the sort left it rather than where a stride would have put it.
+        // Every key comes back at its own width, at the row the sort left it
         for row in &rows {
             let found = partition
                 .find(row.key.as_slice())
@@ -1742,7 +1563,7 @@ mod tests {
         const KEYS: u64 = 512;
         const VERSIONS: u64 = 8;
 
-        // Round robin, so a key's versions are KEYS apart rather than adjacent.
+        // Round robin, so a key's versions are KEYS apart
         let mut rows = Vec::new();
         let mut lsn = 1u64;
         for version in 0..VERSIONS {
@@ -1754,8 +1575,7 @@ mod tests {
         }
         let rows = packed(rows);
 
-        // Keys are one byte wide here, so KEYS above 256 collapses into 256 runs of
-        // more versions each, which is the same property under a denser shape.
+        // Keys take one of 256 values, so KEYS above 256 folds into 256 runs of more versions
         let mut checked = 0usize;
         let mut at = 0usize;
         while at < rows.len() {
@@ -1778,8 +1598,7 @@ mod tests {
     // a key whose versions arrived newest first still ends its run on the newest
     #[test]
     fn a_run_ends_on_the_newest_however_it_arrived() {
-        // One key, versions appended newest first, which is what an out of order
-        // completion looks like once the footer is packed.
+        // One key, versions appended newest first, like an out of order completion
         let mut rows = Vec::new();
         for lsn in [596u64, 590, 584] {
             rows.push(entry(RECORD, 7, 34, lsn, lsn as u32 * 10, 100));
@@ -1863,7 +1682,7 @@ mod tests {
         assert_eq!(parsed.entry_count(), 3);
     }
 
-    // a narrow column costs its own width per row, not the widest column's
+    // a narrow column costs its own width per row
     #[test]
     fn width_sets_the_cost() {
         let mut narrow = SegmentFooter::build(vec![entry(BLOB, 0x01, 24, 1, 0, 10)]);
@@ -1875,7 +1694,7 @@ mod tests {
         );
     }
 
-    // a range tombstone is listed with the length of the end key it names
+    // a range tombstone is listed with the length of its end key
     #[test]
     fn range_tombstone_entry() {
         let row = FooterEntry::new(
@@ -1956,7 +1775,7 @@ mod tests {
 
     // a mixed record stream keeps only the listed kinds in the footer
     #[test]
-    fn excludes_pads_and_headers() {
+    fn excludes_segment_headers() {
         let key_a = key(RECORD, 0x11, 34);
         let key_b = key(RECORD, 0x22, 34);
 
@@ -1966,7 +1785,6 @@ mod tests {
                 RecordHeader::data(key_a.clone(), Lsn(5), &[0xab; 100]),
                 4096,
             ),
-            (RecordHeader::pad(4252), 4252),
             (RecordHeader::tombstone(key_b.clone(), Lsn(7)), 8248),
         ];
 

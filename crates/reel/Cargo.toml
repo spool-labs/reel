@@ -6,7 +6,7 @@ homepage.workspace = true
 repository.workspace = true
 readme = "../../README.md"
 keywords = ["key-value", "storage", "log-structured", "database", "embedded"]
-exclude = ["tests/", "benches/", "docs/"]
+exclude = ["tests/", "docs/"]
 edition.workspace = true
 rust-version.workspace = true
 description = "A log-structured key-value store: sequential writes, immutable segments, whole-segment reclaim"
@@ -20,6 +20,9 @@ path = "src/lib.rs"
 reel-core.workspace = true
 thiserror.workspace = true
 crc-fast.workspace = true
+getrandom.workspace = true
+siphasher.workspace = true
+xxhash-rust.workspace = true
 lz4_flex.workspace = true
 libc.workspace = true
 tracing.workspace = true
@@ -32,8 +35,7 @@ default = []
 sim = []
 rendezvous = []
 
-# deserialization for `ReelConfig` and the enums it holds, for an operator who
-# keeps the volume's settings in a file rather than in code.
+# serialization for the reports, and deserialization for `IoBackend`
 serde = ["dep:serde"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -45,24 +47,12 @@ rand.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 reel-mock.workspace = true
-criterion = "0.5"
 indexset = "0.16"
 crossbeam-skiplist = "0.1"
 scc = "3"
 foldhash = "0.2"
 rustc-hash = "2"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
-
-[[bench]]
-name = "reel"
-harness = false
 
 [[test]]
 name = "probes"
 harness = false
-
-[target.'cfg(loom)'.dependencies]
-loom = "0.7"
-
-[lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ["cfg(loom)"] }

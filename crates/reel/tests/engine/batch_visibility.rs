@@ -1,11 +1,4 @@
-//! A batch is visible whole or not at all, never halfway through its publish
-//!
-//! A batch lands on the device as one write and one sync, but the index moves key by
-//! key behind a publish barrier, and a reader that caught that loop halfway would
-//! answer from a state the volume was never in. The writer alternates a batch that
-//! writes every key with one that deletes every key, so all present and all gone are
-//! the only two states, and anything between them is the defect. A follower applying
-//! a catch-up pass is held to the same rule.
+//! Readers see a whole batch or none of it, on the writer and on a follower
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,8 +12,8 @@ use reel_core::{Store, WriteBatch};
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, Preallocate, ReelConfig,
-    ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget,
 };
 
 const COLUMNS: ColumnSet = &[ColumnSpec {
@@ -30,23 +23,20 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
-/// Keys one batch carries, enough that publishing them takes a visible while
+/// Each batch writes this many keys, enough that publishing them takes a while
 const KEYS: u64 = 48;
 
-/// Rounds the writer alternates over
+/// The writer alternates this many rounds
 const ROUNDS: u64 = 400;
 
-/// Readers looking at the column while the writer works
+/// This many readers watch the column while the writer works
 const READERS: usize = 3;
 
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(4 * 1024 * 1024),
-        alloc_chunk: ByteCount::from_bytes(256 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         ..ReelConfig::default()
@@ -68,9 +58,6 @@ fn all_keys() -> Vec<[u8; 8]> {
 }
 
 /// A thread that reads every key at once until told to stop, counting torn reads
-///
-/// A read spanning every key must find them all present or all gone, since those are
-/// the only two states the writer leaves the volume in.
 fn tearing_reader(
     store: Arc<ReelStore>,
     is_writing: Arc<AtomicBool>,
@@ -111,9 +98,6 @@ fn alternating_rounds(store: &ReelStore, keys: &[[u8; 8]], payload: &[u8]) {
 }
 
 // a follower applying a pass shows the same all-or-nothing to its own readers
-//
-// The simulator serves one store at a time, so this leg runs on a real directory,
-// which is what a follower is anyway: a second process reading the writer's files.
 #[test]
 fn follower_or_nothing() {
     let root = TempDir::new().expect("tempdir");
@@ -166,7 +150,7 @@ fn follower_or_nothing() {
     assert!(reads > 0, "the follower never got a read in");
 }
 
-// a read spanning every key sees all of a batch or none of it, never a prefix
+// a read spanning every key sees all of a batch or none of it
 #[test]
 fn batch_or_nothing() {
     let store = Arc::new(open());
@@ -203,13 +187,13 @@ const SPREAD: ColumnSet = &[ColumnSpec {
     ..COLUMNS[0]
 }];
 
-/// Key groups the many-writer test spreads its batches over
+/// The many-writer test spreads its batches over this many key groups
 const GROUPS: u64 = 8;
 
-/// Keys in one group, every one of them written by each batch on the group
+/// Keys per group, and each batch on a group writes all of them
 const GROUP_KEYS: u64 = 64;
 
-/// Batches each writer lands in the many-writer test
+/// Each writer in the many-writer test lands this many batches
 const WRITER_BATCHES: u64 = 1500;
 
 /// A group's key, led by its place in the group so a batch crosses every shard
@@ -299,7 +283,7 @@ fn many_writers_or_nothing() {
                         torn += 1;
                     }
 
-                    // One page of the whole column, where every group is all there or gone.
+                    // One page of the whole column, where every group is all there or all gone
                     let whole = (GROUPS * GROUP_KEYS) as usize;
                     store
                         .page(ColumnId(1), std::ops::Bound::Unbounded, whole, &mut page)

@@ -8,8 +8,7 @@ pub struct WriteBatch {
     ops: Vec<BatchOp>,
 }
 
-/// The column family an operation names, static for a column constant and owned
-/// for a name computed at runtime
+/// An operation's column family, static for a constant and owned when computed at runtime
 pub type ColumnName = Cow<'static, str>;
 
 #[derive(Debug, Clone)]
@@ -52,9 +51,6 @@ impl WriteBatch {
     }
 
     /// Add a Put operation, taking ownership of key and value
-    ///
-    /// The borrowing form copies the whole value, so freshly serialized bytes
-    /// belong here.
     pub fn put_owned(&mut self, cf: &'static str, key: Vec<u8>, value: Vec<u8>) {
         self.ops.push(BatchOp::Put {
             cf: Cow::Borrowed(cf),

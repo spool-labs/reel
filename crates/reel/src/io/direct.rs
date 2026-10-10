@@ -1,9 +1,4 @@
-//! Aligned staging for direct io, where the kernel takes whole blocks or nothing
-//!
-//! Bypassing the page cache puts the file offset, the byte count, and the
-//! buffer's own address on a block boundary. The format frames writes that way
-//! already; a read is widened to the blocks that contain it and the caller's
-//! bytes are cut out of the middle.
+//! Block-aligned buffers and spans for direct io, which takes whole blocks or nothing
 
 use std::alloc::{alloc, dealloc, Layout};
 use std::ptr::NonNull;
@@ -13,26 +8,16 @@ use crate::format::record::BLOCK;
 use crate::io::op::ReadBuf;
 use crate::io::posix_backend::STAGE_BYTES;
 
-/// Boundary every direct op's offset, length, and buffer address sits on
-///
-/// A superset rather than a discovered value: devices report 512 more often, and
-/// a buffer aligned to the larger is aligned to the smaller.
+/// Every direct op's offset, length and buffer address sit on this boundary
 pub const DIRECT_ALIGN: usize = BLOCK as usize;
 
-/// Bytes one direct op asks the device for, at most
-///
-/// A request wider than the queue's max_hw_sectors is cut up by the block layer and
-/// arrives as two, and behind an IOMMU that ceiling is 128 KiB. The staging buffer is a
-/// block wider so a covering read can round out at both ends; what is asked for stops short.
+/// The most bytes one direct op asks the device for
 pub const DIRECT_REQUEST_BYTES: usize = STAGE_BYTES;
 
-// A request that does not divide into blocks is one the kernel refuses whole.
+// The kernel refuses a request that does not divide into blocks.
 const _: () = assert!(DIRECT_REQUEST_BYTES.is_multiple_of(DIRECT_ALIGN));
 
-/// The unit a buffered read faults, which is what a covering span is priced against
-///
-/// A direct read of the blocks around a range fetches no more than a buffered
-/// read would, as long as the block divides the page.
+/// A buffered read faults in units of this many bytes
 pub const PAGE_BYTES: usize = 4096;
 
 // A block wider than a page would fetch bytes the buffered read does not.
@@ -49,33 +34,25 @@ pub fn align_up(len: u64) -> u64 {
     len.saturating_add(align - 1) & !(align - 1)
 }
 
-/// The block-aligned span that contains a byte range
-///
-/// Never less than the range asked for and never more than a block either side.
+/// The block-aligned span around a byte range, at most a block wider at each end
 pub fn covering_span(offset: u64, len: u64) -> (u64, u64) {
     let start = align_down(offset);
     let end = align_up(offset.saturating_add(len));
     (start, end.saturating_sub(start))
 }
 
-/// The part of a covering read that holds the range the caller asked for
-///
-/// Both ends are cut against what actually landed, since naming bytes the kernel
-/// never wrote would be a slice over uninitialised memory.
+/// The part of a covering read that holds the asked range, cut to what landed
 pub fn wanted_window(filled: usize, skip: usize, wanted: usize) -> (usize, usize) {
     let from = filled.min(skip);
     let to = filled.min(skip.saturating_add(wanted));
     (from, to)
 }
 
-/// Copy the window a covering read landed on into the buffer that asked for it
-///
-/// The buffer commits exactly what was copied, so no unwritten room is nameable.
+/// Copy a covering read's window into the buffer and commit exactly what was copied
 pub fn cut_into(bytes: &[u8], buf: &mut ReadBuf) -> usize {
     let (ptr, room) = buf.as_mut_ptr();
     let taken = bytes.len().min(room);
-    // Safety: taken is capped by the destination's room, and the commit names
-    // exactly the bytes the copy wrote.
+    // Safety: taken fits the destination's room, and the commit covers exactly the copied bytes.
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, taken);
         buf.commit(taken);
@@ -83,19 +60,13 @@ pub fn cut_into(bytes: &[u8], buf: &mut ReadBuf) -> usize {
     taken
 }
 
-/// Copy the window into a header buffer and a payload buffer, in that order
-///
-/// The two buffers are one contiguous range on disk, so the split is wherever the
-/// header ends.
+/// Copy the window into a header buffer, then the rest into a payload buffer
 pub fn cut_split_into(bytes: &[u8], head: &mut ReadBuf, body: &mut ReadBuf) -> usize {
     let split = bytes.len().min(head.wanted());
     cut_into(&bytes[..split], head) + cut_into(&bytes[split..], body)
 }
 
-/// A heap buffer whose address is on a block boundary, for handing to a direct op
-///
-/// A vector's bytes land wherever the size class puts them, and a direct op
-/// against an unaligned address is refused rather than fixed up.
+/// A heap buffer whose address is on a block boundary, for a direct op
 pub struct AlignedBuf {
     ptr: NonNull<u8>,
     len: usize,
@@ -106,9 +77,6 @@ unsafe impl Send for AlignedBuf {}
 
 impl AlignedBuf {
     /// Room for this many bytes, rounded up to whole blocks and zeroed
-    ///
-    /// A record padded to a block boundary leaves a gap, and whatever the
-    /// allocator left there would otherwise reach the device.
     pub fn new(len: usize) -> Result<AlignedBuf> {
         let buf = AlignedBuf::uninit(len)?;
         // Safety: the allocation is buf.len bytes, so zeroing it is in bounds.
@@ -117,9 +85,6 @@ impl AlignedBuf {
     }
 
     /// Room for this many bytes, rounded up to whole blocks and left unwritten
-    ///
-    /// A read fills the buffer before anything looks at it, so zeroing first is a
-    /// second pass for nothing. Nothing may read past what a caller has filled.
     pub fn uninit(len: usize) -> Result<AlignedBuf> {
         let len = align_up(len as u64) as usize;
         if len == 0 {
@@ -144,11 +109,11 @@ impl AlignedBuf {
         Ok(AlignedBuf { ptr, len })
     }
 
-    /// The leading bytes something has written into the buffer
+    /// The leading `count` bytes a read wrote into the buffer
     ///
     /// # Safety
     ///
-    /// The count has to be one a read reported; past that is memory nothing wrote.
+    /// The count must come from a read, since the bytes past it are uninitialized
     pub unsafe fn filled(&self, count: usize) -> &[u8] {
         debug_assert!(count <= self.len, "a fill past the buffer was claimed");
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), count.min(self.len)) }
@@ -175,7 +140,7 @@ impl AlignedBuf {
 
     /// The buffer as writable bytes, for gathering a write into it
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // Safety: as above, and the exclusive borrow rules out an overlapping read.
+        // Safety: the allocation is len bytes and the exclusive borrow rules out other reads.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
@@ -231,7 +196,7 @@ mod tests {
         }
     }
 
-    // a zeroed buffer reads back as zeros, so a padded write carries no stale bytes
+    // a zeroed buffer reads back as zeros, so a padded write has no stale bytes
     #[test]
     fn buffer_starts_zeroed() {
         let buf = AlignedBuf::new(100).expect("aligned buffer");
@@ -259,7 +224,7 @@ mod tests {
         );
     }
 
-    // an empty buffer is refused rather than allocated with a zero layout
+    // an empty buffer is refused
     #[test]
     fn empty_buffer_refused() {
         assert!(AlignedBuf::new(0).is_err());
@@ -296,7 +261,7 @@ mod tests {
         }
     }
 
-    /// Pages a buffered read faults for a range, with readahead off
+    /// How many pages a buffered read of the range faults in, with readahead off
     fn pages_fetched(offset: u64, len: u64) -> u64 {
         let page = PAGE_BYTES as u64;
         let head = offset % page;
@@ -345,7 +310,7 @@ mod tests {
         );
     }
 
-    // the window is cut against what landed, never naming bytes the kernel skipped
+    // the window is cut against what landed, so it never covers bytes the kernel skipped
     #[test]
     fn window_follows_the_read() {
         assert_eq!(

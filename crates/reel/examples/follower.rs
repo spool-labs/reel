@@ -1,19 +1,15 @@
 //! Follow a writer from a second, read-only open of the same directory
 //!
-//! One process owns a reel for writing; another opens it read-only, serves reads from
-//! an index of its own, and catches that index up when it wants to. A follower behind
-//! an append answers a miss rather than a stale record, until a refresh pass.
-//!
 //! cargo run --example follower
 
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, Preallocate, ReelConfig,
-    ReelStore, Store, StoreResult, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, Store,
+    StoreResult, ThreadBudget,
 };
 
-/// Family both opens are given, since a reader declares the columns it reads
+/// Both opens declare this family, since a reader declares the columns it reads
 const ROWS: &str = "rows";
 
 /// Eight byte keys, one index shard, values stored raw
@@ -24,22 +20,18 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
-/// Small enough that the run writes a file rather than a gibibyte of zeros
+/// A small segment size, so the run does not write a gibibyte of zeros
 const SEGMENT_BYTES: ByteCount = ByteCount::mb(4);
-const ALLOC_CHUNK: ByteCount = ByteCount::mb(1);
 
-/// Records the follower finds at its open, and the records written after it
+/// The follower finds `SEEDED` records at open, then `APPENDED` more arrive
 const SEEDED: u64 = 3;
 const APPENDED: u64 = 2;
 
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: SEGMENT_BYTES,
-        alloc_chunk: ALLOC_CHUNK,
-        preallocate: Preallocate::Chunk,
         active_tails: ThreadBudget::threads(1),
         ..ReelConfig::default()
     }
@@ -59,6 +51,8 @@ fn main() -> StoreResult<()> {
     for number in 0..SEEDED {
         Store::put(&writer, ROWS, &key_of(number), &payload_of(number))?;
     }
+    // A follower reads the writer's journal, which a flush writes down on every platform
+    writer.flush()?;
 
     let follower = ReelStore::open_read_only(root.path().to_path_buf(), config(), COLUMNS)?;
     for number in 0..SEEDED {
@@ -67,8 +61,7 @@ fn main() -> StoreResult<()> {
     }
     println!("follower opened read-only beside the writer and read {SEEDED} records");
 
-    // One process owns a reel for writing, so the second open takes no lock and
-    // takes no writes either.
+    // A read-only open takes no lock and refuses writes
     let refused = Store::put(&follower, ROWS, &key_of(SEEDED), &payload_of(SEEDED));
     assert!(refused.is_err());
 
@@ -79,6 +72,7 @@ fn main() -> StoreResult<()> {
     assert!(Store::contains(&follower, ROWS, &key_of(0))?);
     println!("writer appended {APPENDED} records: the follower misses them and serves the rest");
 
+    writer.flush()?;
     let caught_up = follower.refresh()?;
     assert!(caught_up.applied >= APPENDED);
 
@@ -92,8 +86,7 @@ fn main() -> StoreResult<()> {
         caught_up.highest_lsn.as_u64(),
     );
 
-    // The next pass starts where this one stopped, so following an append costs
-    // that append rather than a walk of the volume.
+    // The next pass starts where this one stopped, so it only reads new appends
     let idle = follower.refresh()?;
     assert_eq!(idle.applied, 0);
     println!("a second refresh applied {} records", idle.applied);

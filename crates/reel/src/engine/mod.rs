@@ -1,11 +1,5 @@
-//! Reel store engine root type
-//!
-//! The engine owns one reel over the volume and routes every operation by column:
-//! a write appends through a tail and moves the index once the record has landed,
-//! and a read resolves a key to a location and the refcounted segment handle that
-//! keeps its file alive.
+//! Reel store engine, which routes every write and read by column
 
-pub mod index_checkpoint;
 mod maintain;
 mod read;
 pub mod store_impl;
@@ -27,81 +21,49 @@ use crate::append::admission::InflightBudget;
 use crate::compaction::compactor::{CompactionCounters, Compactor};
 use crate::config::{ReelConfig, DEFAULT_FD_CACHE};
 use crate::error::{ReelError, Result};
-use crate::format::band::Band;
 use crate::format::column::{spec_by_name, ColumnId, ColumnSet, ColumnSpec, RecordKey};
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::SegmentId;
 use crate::format::lsn::Lsn;
-use crate::index::column::ColumnMark;
 use crate::index::counters::ReadCounters;
 use crate::index::lockfile::OwnershipLock;
 use crate::index::map::ReelIndex;
-use crate::index::page::KeyPage;
 use crate::reel::bias::MachineFacts;
 use crate::reel::cue::CuePoints;
 
 use crate::compaction::pressure::PassPlane;
 use crate::index::paged::FooterSource;
-use crate::index::persisted::{admits, PersistedReader};
-use crate::index::recovery::rebuild_from_persisted;
+use crate::index::recovery::rebuild_reel;
+use crate::index::spot::RecordSource;
 use crate::index::tailer::LogCursor;
 use crate::io::select::select_backend;
 use crate::io::ReelIo;
 use crate::reel::segment::{FdCache, IoDriver};
 use crate::reel::{Reel, ReelShared};
 
-/// Name of the file a writable open takes the volume's ownership lock on
+/// A writable open takes the volume's ownership lock on this file
 pub(crate) const LOCK_FILE: &str = "reel.lock";
 
-/// Sequence numbers a tombstone holds a key's place for before it is given back
-///
-/// A grave refuses a record drawn before it and published after it, so it is done
-/// once no such record can still arrive.
+/// A tombstone holds a key's place for this many sequence numbers
 pub(crate) const GRAVE_WINDOW: u64 = 1 << 20;
 
-/// Bytes admitted between maintenance asks that make ingest hot
-///
-/// Deferring compaction is worth it only while ingest is spending the device, so a
-/// trickle below this floor never holds a pass off. Escalated debt overrides hot.
+/// Ingest is hot once this many bytes are admitted between maintenance asks
 const INGEST_HOT_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Keys one maintenance tick spends settling what standing covers took
-///
-/// Bounded so a tick stays a bounded pass whatever was dropped.
+/// One maintenance tick settles at most this many keys under standing covers
 const SWEEP_RUN: usize = 1 << 16;
 
-/// Segment rewrites the volume admits at once
-///
-/// One, because a second pass buys reclaim the device was already spending on the
-/// first and takes the foreground's tail with it.
-const COMPACT_PASSES: usize = 1;
-
-/// Openings this process has made, which is what tells their sweep marks apart
-///
-/// A counter rather than a clock or a random source: the only thing a mark has
-/// to distinguish is one opening from another.
+/// Counts this process's openings so each opening mints distinct sweep marks
 static OPENINGS: AtomicU32 = AtomicU32::new(0);
-
-/// A sealed segment whose keys are still resident, and when they stop being
-///
-/// A paged volume drains this queue every tick. A hot one keeps a segment here until
-/// its wait is over or the budget reaches it, which makes the recent past cost one io.
-struct Held {
-    /// The sealed segment, kept in seal order so the oldest leaves first
-    segment: SegmentId,
-
-    /// When its keys may be handed over, at once for one an earlier process sealed
-    ready_at: Instant,
-}
 
 /// One write in a batch
 pub enum RecordWrite {
     /// A payload to land under a key
     Put {
-        /// Column and key the record is addressed by
+        /// The record's column and key
         key: RecordKey,
 
-        /// Payload to store, handed to the tail without a copy
+        /// The payload, handed to the tail without a copy
         payload: Vec<u8>,
     },
 
@@ -111,10 +73,7 @@ pub enum RecordWrite {
         key: RecordKey,
     },
 
-    /// A half-open key range to tombstone, which rides the batch like any record
-    ///
-    /// One record covers the whole range, so a caller cutting its batch around a range
-    /// delete would be paying for reservations the engine does not need.
+    /// A half-open key range to tombstone, written as one record in the batch
     DeleteRange {
         /// Column and inclusive start of the range
         start: RecordKey,
@@ -124,10 +83,7 @@ pub enum RecordWrite {
     },
 }
 
-/// What one put settles before the tail takes its buffer
-///
-/// Both doors plan through this, so a write reaches the device having done the same
-/// work whichever one it came in through.
+/// A put's stored payload and codec, settled before the tail takes the buffer
 struct Planned {
     /// Payload as it will be stored, compressed if the column asks for it
     payload: Vec<u8>,
@@ -138,7 +94,7 @@ struct Planned {
 
 /// One key of a planned batch and what the index needs to land it
 struct BatchKey {
-    /// Column and key the record is addressed by
+    /// The record's column and key
     key: RecordKey,
 
     /// What the index does for this key once the record has landed
@@ -153,7 +109,7 @@ enum KeyOp {
     /// Drop the key
     Delete,
 
-    /// Stand a cover over the half-open range opening at the key
+    /// Put a cover over the half-open range that starts at the key
     Range(Option<Vec<u8>>),
 }
 
@@ -168,9 +124,6 @@ pub struct Totals {
 }
 
 /// What one compaction pass did
-///
-/// A caller driving compaction to completion has to tell being held back from
-/// having nothing left.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompactPass {
     /// The rate gate, the pressure model, read-only, or a running pass held it back
@@ -185,16 +138,16 @@ pub enum CompactPass {
 
 /// Reel bulk-volume store over one directory of segment files
 pub struct ReelStore {
-    /// Directory the volume's home piece lives in
+    /// The volume's home directory
     root: PathBuf,
 
-    /// What this opening stamps into the sweep marks it mints
+    /// This opening stamps this nonce into the sweep marks it mints
     sweep_nonce: u64,
 
-    /// Configuration this volume was opened with
+    /// The configuration at open
     config: ReelConfig,
 
-    /// The io backend every op is filed through
+    /// Every op goes through this io driver
     driver: Arc<IoDriver>,
 
     /// Ceiling on the bytes writers may have in flight
@@ -206,16 +159,16 @@ pub struct ReelStore {
     /// Segment descriptors kept open across reads
     fd_cache: Arc<FdCache>,
 
-    /// Selection, rewrites and the scrub
+    /// Picks segments, rewrites them and runs the scrub
     compactor: Compactor,
 
-    /// Segment rewrites admitted at once
+    /// Caps how many segment rewrites run at once
     compaction_plane: PassPlane,
 
     /// The append-only log of segment files
     reel: Reel,
 
-    /// Resident index over every column served
+    /// Index over every column served
     index: ReelIndex,
 
     /// Held so this owner keeps the volume until the store drops, never read
@@ -224,17 +177,20 @@ pub struct ReelStore {
     /// How far a read-only follower has read the log
     cursor: Mutex<LogCursor>,
 
-    /// Sealed segments whose keys have not been handed to their footers yet
-    held: Mutex<VecDeque<Held>>,
+    /// Sealed segments whose keys have not been handed to their footers yet, in seal order
+    held: Mutex<VecDeque<(SegmentId, Arc<SegmentFooter>)>>,
 
     /// Whether this open refuses every write
     is_read_only: bool,
 
-    /// Whether the volume runs against a real filesystem rather than a harness
+    /// Whether the volume runs on a real filesystem, false under a harness
     is_real_fs: bool,
 
-    /// Read views held open, whose floor bounds what compaction may reclaim
+    /// Open read views, whose floor bounds what compaction may reclaim
     cues: Arc<CuePoints>,
+
+    /// Each tail's write head at its last move, so the tick can seal a quiet tail
+    idle: Mutex<Vec<Option<(SegmentId, u64, Instant)>>>,
 
     /// What the machine said about itself at open, absent on a simulated volume
     bias: Option<MachineFacts>,
@@ -244,36 +200,6 @@ pub struct ReelStore {
 
     /// Admitted bytes at the last heat ask, which turns a counter into a rate
     ingest_marker: AtomicU64,
-}
-
-/// The index a previous cue wrote down, where this open may believe any of it
-///
-/// Read whenever one is there: a paging volume never wrote one, and every other file is
-/// CRC verified per block and joined newest-wins, so believing it can only save reads. A
-/// file describing columns the store no longer serves is refused whole rather than in
-/// part, since dropping a block's rows while skipping its segments loses a live record.
-fn offered_index(
-    driver: &IoDriver,
-    root: &Path,
-    config: &ReelConfig,
-    columns: ColumnSet,
-) -> Result<Option<PersistedReader>> {
-    if config.index.pages() {
-        return Ok(None);
-    }
-    let Some(reader) = PersistedReader::open(driver, root)? else {
-        return Ok(None);
-    };
-    if !admits(&reader.index, columns) {
-        tracing::warn!(
-            "the persisted index at {} describes another column set, so this open \
-             sweeps the footers",
-            root.display(),
-        );
-        reader.close(driver)?;
-        return Ok(None);
-    }
-    Ok(Some(reader))
 }
 
 impl ReelStore {
@@ -289,7 +215,7 @@ impl ReelStore {
         ReelStore::open_inner(root, config, columns, backend, true, true)
     }
 
-    /// Open against a supplied backend, the injection point the harnesses drive
+    /// Open against a supplied backend, for test harnesses
     pub fn open_with_io(
         root: PathBuf,
         config: ReelConfig,
@@ -321,8 +247,7 @@ impl ReelStore {
         let driver = Arc::new(IoDriver::new(io));
         let budget = Arc::new(InflightBudget::default());
         let reads = Arc::new(ReadCounters::new());
-        // One cache for the volume: a descriptor is a process-wide resource, so a
-        // bound per anything smaller would not be the ceiling it names.
+        // One cache for the volume, since descriptors are a process-wide resource
         let fd_cache = Arc::new(FdCache::new(DEFAULT_FD_CACHE as usize));
         let is_writable = is_real_fs && !is_read_only;
         if is_writable {
@@ -333,13 +258,10 @@ impl ReelStore {
             false => None,
         };
 
-        // Logged and kept, acted on by nothing: a log line needs a subscriber to
-        // exist, so the facts stay on the store for a caller that reports them.
+        // The facts are logged and kept for callers, nothing acts on them
         let bias = is_real_fs.then(|| {
             let facts = MachineFacts::read(&root);
-            // What `Preallocate::Full` would claim before a byte is written.
-            let reservation = config.segment_bytes.to_bytes() * config.tail_count() as u64;
-            let verdict = facts.verdict(reservation);
+            let verdict = facts.verdict();
             tracing::info!(
                 configured = ?config.io_backend,
                 would_open_on = ?verdict.plane,
@@ -352,8 +274,6 @@ impl ReelStore {
                 actuator_spans = ?crate::reel::bias::access_ranges(&root),
                 open_file_limit = ?facts.open_file_limit,
                 ring = ?facts.ring,
-                would_read_windows_on = ?verdict.ranged_reads,
-                would_preallocate = ?verdict.preallocate,
                 would_map_above = ?verdict.map_above,
                 mapping_because = verdict.map_because,
                 would_cache_descriptors = verdict.fd_cache,
@@ -365,8 +285,7 @@ impl ReelStore {
         let mut roots = vec![root.clone()];
         roots.extend(config.volumes.iter().map(|volume| volume.path.clone()));
 
-        // The disks the volumes sit on, together, so the append-only deadlock guard
-        // has a ceiling. Zero where nothing can say, which admits every write.
+        // Total capacity under every root caps the deadlock guard, zero admits every write
         let capacity_bytes = match is_real_fs {
             true => roots
                 .iter()
@@ -374,8 +293,7 @@ impl ReelStore {
                 .sum(),
             false => 0,
         };
-        // The fast tier alone sizes the demotion threshold, since that tier's room
-        // is what demotion protects.
+        // The fast tier's capacity alone sizes the demotion threshold
         let fast_capacity = match is_real_fs {
             true => {
                 crate::reel::bias::capacity_bytes(&root).unwrap_or(0)
@@ -390,9 +308,8 @@ impl ReelStore {
         };
         let compactor = Compactor::new(&config, capacity_bytes, fast_capacity);
 
-        let index = ReelIndex::new(columns, config.index, config.shard_shapes)?;
-        // The manifest names every root before anything reads one, so a missing
-        // mount refuses here rather than reading as loss below.
+        let index = ReelIndex::new(columns)?;
+        // The manifest lists every root before any read, so a missing mount fails here
         let dead: Vec<bool> = std::iter::once(false)
             .chain(config.volumes.iter().map(|volume| volume.dead))
             .collect();
@@ -407,17 +324,12 @@ impl ReelStore {
             }
         }
         crate::reel::volumes::ensure_manifest(&driver, &roots, &dead, is_read_only)?;
-        let persisted = offered_index(&driver, &root, &config, columns)?;
-        let rebuilt = rebuild_from_persisted(
-            &driver,
-            &roots,
-            &dead,
-            config.index.pages(),
-            persisted,
-            &index,
-        )?;
-        // Compaction only copies what the index can find, so a writable open over a
-        // column it doesn't declare would drop that column's records.
+        // The rebuild takes covered segments' keys from the key runs, so load them first
+        if !is_read_only {
+            index.key_runs().load(&driver, &root)?;
+        }
+        let rebuilt = rebuild_reel(&driver, &roots, &dead, &index)?;
+        // Compaction copies only declared columns, so a writable open must declare every column
         if let Some(column) = rebuilt.undeclared.filter(|_| !is_read_only) {
             return Err(ReelError::Config(format!(
                 "the volume holds column {} and this open doesn't declare it",
@@ -427,10 +339,7 @@ impl ReelStore {
         for path in &rebuilt.quarantined {
             tracing::warn!("quarantined a foreign reel segment at {}", path.display());
         }
-        // A crash keeps a tail's reservation claimed past its end, and nothing
-        // writes that file again. Cutting each walked tail at its own length
-        // gives the blocks back without touching a byte it holds. Best effort:
-        // a store that cannot release still serves.
+        // Cut each walked tail to its length to free what a crash left reserved, best effort
         if !is_read_only {
             for (path, len) in &rebuilt.walked {
                 let released = (|| -> Result<()> {
@@ -447,8 +356,18 @@ impl ReelStore {
                 }
             }
         }
-        // A reader starts its cursor where the rebuild left the volume, so its
-        // first catch-up reads only what has been written since the open.
+        // Readers look for the footer at the file's end, so redo lost cuts before any read
+        if !is_read_only {
+            for (path, end) in &rebuilt.cuts {
+                let file = driver.open(path, false)?;
+                let cut = driver
+                    .truncate(file, *end)
+                    .and_then(|()| driver.sync_full(file));
+                driver.close(file)?;
+                cut?;
+            }
+        }
+        // The cursor starts where the rebuild stopped, so catch-up reads only newer writes
         let mut cursor = LogCursor::new();
         cursor.start_from(&rebuilt.consumed);
 
@@ -471,16 +390,18 @@ impl ReelStore {
             true => Reel::open_read_only(Arc::clone(&shared)),
             false => Reel::open(Arc::clone(&shared), rebuilt.resumable)?,
         };
-        // The volume exists now, so the index can be told where to read the footers
-        // a paged column resolves through. A resident one never asks.
+        // The volume exists now, so the index can read footers and records through it
         index.set_footers(Arc::clone(&shared) as Arc<dyn FooterSource>);
-        // And the other direction: a seal writes down what its segment weighs, and
-        // these are the counters that know.
+        index.set_records(Arc::clone(&shared) as Arc<dyn RecordSource>);
+        if is_read_only {
+            index.follow();
+        }
+        // A seal records its segment's weight in the index's segment counters
         shared.set_segments(index.segments_handle());
+        index.finish_open()?;
 
-        // Nothing is waiting to be handed over: the only keys a rebuild leaves
-        // resident are the tails', and a tail is handed over when it seals.
-        let held: VecDeque<Held> = VecDeque::new();
+        // A rebuild leaves only tail keys in the map, and a tail hands its keys over at seal
+        let held: VecDeque<(SegmentId, Arc<SegmentFooter>)> = VecDeque::new();
 
         Ok(ReelStore {
             bias,
@@ -494,7 +415,7 @@ impl ReelStore {
             reads,
             fd_cache,
             compactor,
-            compaction_plane: PassPlane::new(COMPACT_PASSES),
+            compaction_plane: PassPlane::new(config.compact_passes()),
             config,
             reel,
             index,
@@ -504,10 +425,11 @@ impl ReelStore {
             is_read_only,
             is_real_fs,
             cues: Arc::new(CuePoints::new()),
+            idle: Mutex::new(Vec::new()),
         })
     }
 
-    /// Bulk directory this store is rooted at
+    /// The store's bulk root directory
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -527,68 +449,24 @@ impl ReelStore {
         spec_by_name(self.index.columns(), name)
     }
 
-    /// The resident index, for a playback that pages it directly
+    /// The index, for a playback that pages it directly
     pub fn index(&self) -> &ReelIndex {
         &self.index
     }
 
-    /// What one sealed segment's footer says it holds, for a caller inspecting it
-    ///
-    /// Nothing for a segment with no footer, still being written or left by a seal.
+    /// A sealed segment's footer, or nothing when the segment has none
     pub fn segment_footer(&self, segment: SegmentId) -> Result<Option<Arc<SegmentFooter>>> {
         self.reel.shared().footer_of(segment)
     }
 
     /// The io driver, for a caller that has to drain the backend itself
-    ///
-    /// A backend that neither files its own completions nor answers at submission
-    /// leaves a pending future waiting for somebody to reap it.
     pub fn driver(&self) -> &Arc<IoDriver> {
         &self.driver
     }
 
-    /// Which backend serves this volume, which is not always the one asked for
-    ///
-    /// `config().io_backend` is the request; this is the outcome. They differ
-    /// whenever a ring was configured and the kernel would not set one up.
+    /// The backend serving this volume, which may differ from the one configured
     pub fn serving_backend(&self) -> crate::io::ServingBackend {
         self.driver.serving()
-    }
-
-    /// One page of a column's live keys, in no promised order
-    ///
-    /// The mark is opaque bytes: hand back whatever the last page answered, and
-    /// nothing to start. `None` back means the column is done. Every live key is
-    /// handed out at least once; a shard that resizes mid sweep starts over, so
-    /// a caller has to be idempotent, which every caller of this is.
-    pub fn sweep_column(
-        &self,
-        column: ColumnId,
-        from: Option<&[u8]>,
-        limit: usize,
-        out: &mut KeyPage,
-    ) -> Option<Vec<u8>> {
-        let resumed = from.and_then(ColumnMark::unpack);
-        let index = self.index.column(column)?;
-        index
-            .sweep(self.sweep_nonce, resumed.as_ref(), limit, out)
-            .map(|mark| mark.pack())
-    }
-
-    /// One page of the keys under a prefix, where an open column serves only its exact shard key
-    pub fn sweep_column_prefix(
-        &self,
-        column: ColumnId,
-        prefix: &[u8],
-        from: Option<&[u8]>,
-        limit: usize,
-        out: &mut KeyPage,
-    ) -> Option<Vec<u8>> {
-        let resumed = from.and_then(ColumnMark::unpack);
-        let index = self.index.column(column)?;
-        index
-            .sweep_prefix(self.sweep_nonce, prefix, resumed.as_ref(), limit, out)
-            .map(|mark| mark.pack())
     }
 
     /// The sequence number the volume has reached
@@ -606,15 +484,12 @@ impl ReelStore {
         &self.cues
     }
 
-    /// Sealed segments a rebuild left uncounted, standing until they retire
-    ///
-    /// While any stand, the totals promise only a floor: their keys were never
-    /// joined, and each enters the counters as compaction or an overwrite touches it.
-    pub fn born_segments(&self) -> usize {
-        self.index.segments().born_count()
+    /// Slack in the byte counters from overwrites booked by length class
+    pub fn spot_slack(&self) -> u64 {
+        self.index.spot_slack()
     }
 
-    /// Sync every active tail, the durability surface
+    /// Sync every active tail
     pub fn flush(&self) -> Result<()> {
         self.reel.flush()
     }
@@ -624,23 +499,16 @@ impl ReelStore {
         self.reel.flush_wait().await
     }
 
-    /// Flush and stop every active tail, leaving each where the next open resumes it
-    ///
-    /// Nothing seals on a close: a tail's segment persists across processes and only
-    /// takes a footer when it fills. The open that follows appends where this one stopped.
+    /// Compact away every sealed segment past the dead ratio, then flush and stop every active tail
     pub fn close(&self) -> Result<()> {
         if self.is_read_only {
             return Ok(());
         }
+        self.drain()?;
         self.reel.close()
     }
 
-    /// Take a store off the disk, refusing one another owner still holds
-    ///
-    /// The ownership lock is taken first, since unlinking the files under a live
-    /// writer leaves it appending into nothing. Every root the manifest names goes
-    /// under that one claim, extras first and home last, so a destroy that dies
-    /// partway leaves the manifest standing to finish the job.
+    /// Delete a store from disk, failing if another owner holds its lock
     pub fn destroy(root: &Path) -> Result<()> {
         if !root.exists() {
             return Ok(());
@@ -676,18 +544,17 @@ impl ReelStore {
         }
     }
 
-    /// Memory the index is holding, which is what a residency tier trades away
-    ///
-    /// Accounted rather than observed, since a process footprint is an allocator's
-    /// answer and a warm heap hides what a map just took off the free list.
+    /// The memory the index holds, by its own accounting
     pub fn resident_bytes(&self) -> ByteCount {
         self.index.resident_bytes()
     }
 
+    /// Total bytes in the footer cache across its footers, directories and blocks
+    pub fn footer_cache_bytes(&self) -> ByteCount {
+        ByteCount::from_bytes(self.reel.shared().footers.held_bytes() as u64)
+    }
+
     /// The volumes the operator declared dead, empty on a whole store
-    ///
-    /// The records those drives held answer as missing, and the reel has nothing
-    /// more to say about what was lost.
     pub fn dead_volumes(&self) -> Vec<PathBuf> {
         self.config
             .volumes
@@ -703,10 +570,6 @@ impl ReelStore {
     }
 
     /// The in-flight budget in force, which pressure lowers as the volume fills
-    ///
-    /// Equal to the shipped ceiling while there is room, and falling through the band
-    /// below the refusal ceiling. Tells a volume that is slow apart from one that is
-    /// being slowed.
     pub fn write_budget_bytes(&self) -> ByteCount {
         self.reel.shared().budget.effective_ceiling()
     }
@@ -716,62 +579,32 @@ impl ReelStore {
         self.compactor.counters()
     }
 
-    /// The band each foreground tail is drawing under right now
-    pub fn tail_bands(&self) -> Vec<Option<Band>> {
-        self.reel.tail_bands()
-    }
-
-    /// Banded writes that found no tail free and went to the unbanded ones instead
-    ///
-    /// A number that keeps climbing says the volume holds more live death windows than
-    /// it has tails, so the placement its keys ask for is not the one they are getting.
-    pub fn band_fallbacks(&self) -> u64 {
-        self.reel.band_fallbacks()
-    }
-
-    /// Whether windows may still be read around the page cache on this volume
-    ///
-    /// A filesystem that serves no direct open retires the route, so this tells a
-    /// route that ran apart from one that retired. One segment refused a descriptor
-    /// of its own does not show here.
-    pub fn cold_direct_live(&self) -> bool {
-        self.reel.shared().cold_direct_live()
-    }
-
-    /// What each column's keys do to the tree's lead search
-    ///
-    /// A column whose keys share their first eight bytes gets nothing from the lead
-    /// array and falls back to comparing whole keys, which is correct and silent.
+    /// Each column's tie rate on the tree's eight-byte lead search
     pub fn lead_tie_rates(&self) -> Vec<(ColumnId, Option<f64>, u64)> {
         self.index.lead_tie_rates()
     }
 
-    /// Which door this volume's ops took, ring or the fallback beside it
-    ///
-    /// A ring backend hands what it cannot serve to posix without saying so, so a
-    /// leg that reports a ring number reports an assumption unless it reads this.
+    /// Which door this volume's ops took, ring or the fallback
     pub fn door_counts(&self) -> crate::io::DoorCounts {
         self.driver.door_counts()
     }
 
-    /// Device flushes this volume has asked for, the bill durability is paid in
+    /// How many device flushes this volume has asked for
     pub fn sync_count(&self) -> u64 {
         self.driver.sync_count()
     }
 
-    /// What the machine said about itself when this volume opened
-    ///
-    /// Absent on a simulated volume. Nothing acts on it.
+    /// What the machine reported at open, absent on a simulated volume
     pub fn bias(&self) -> Option<MachineFacts> {
         self.bias
     }
 
-    /// Nanoseconds this volume spent waiting on the drive inside those flushes
+    /// Nanoseconds this volume has spent waiting on device flushes
     pub fn sync_nanos(&self) -> u64 {
         self.driver.sync_nanos()
     }
 
-    /// Records a playback could not read and left out of its results
+    /// How many records a playback could not read and left out of its results
     pub fn unreadable_records(&self) -> u64 {
         self.reads.unreadable_records()
     }
@@ -781,17 +614,14 @@ impl ReelStore {
         self.reads.note_unreadable();
     }
 
-    /// Whether the volume runs against a real filesystem rather than a harness
+    /// Whether the volume runs on a real filesystem, false under a harness
     pub fn is_real_fs(&self) -> bool {
         self.is_real_fs
     }
 }
 
 impl Drop for ReelStore {
-    /// Flush the tails on the way out, so what they hold is durable
-    ///
-    /// A caller that wants to hear about a failure calls close itself; here a failure
-    /// is traced and the volume is left the way a crash would leave it.
+    /// Close the store on the way out, so what the tails hold is durable
     fn drop(&mut self) {
         if let Err(error) = self.close() {
             tracing::warn!("failed to seal a reel tail while closing the store: {error}");

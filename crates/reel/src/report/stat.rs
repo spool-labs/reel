@@ -1,4 +1,4 @@
-//! What each column holds and what the segments weigh, live against dead
+//! What each column holds and how much of the segments is live or dead
 
 use crate::engine::ReelStore;
 use crate::report::caveat::{self, Caveat};
@@ -6,7 +6,7 @@ use crate::report::doc::{Column, Doc, Row, Table, Tone};
 use crate::report::fmt;
 use crate::report::render::Report;
 
-/// What one column holds, as far as this open can say
+/// What one column holds
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct StatColumn {
@@ -16,14 +16,14 @@ pub struct StatColumn {
     /// The identifier its records are stamped with
     pub id: u8,
 
-    /// Sealed segments a search has to consider, absent on a resident open
-    pub runs: Option<usize>,
+    /// Sealed segments a search has to consider
+    pub runs: usize,
 
-    /// Live records in the column, absent on a paged open
-    pub records: Option<u64>,
+    /// Live records in the column
+    pub records: u64,
 
-    /// Live bytes in the column, absent on a paged open
-    pub bytes: Option<u64>,
+    /// Live bytes in the column
+    pub bytes: u64,
 }
 
 /// The operator numbers for a volume
@@ -54,28 +54,16 @@ pub struct StatReport {
     /// Cue points held open in this process
     pub held_cues: usize,
 
-    /// Whether the open leaves sealed keys in their footers
-    pub is_paged: bool,
-
-    /// Sealed segments this open attributed no bytes to
-    pub born_segments: usize,
-
     /// The columns the volume was opened over
     pub columns: Vec<StatColumn>,
 
-    /// What stands between these figures and what a reader would take them for
+    /// What the counts leave unaccounted for
     pub caveats: Vec<Caveat>,
 }
 
 /// Ask an open volume for the operator numbers
-///
-/// A paged index holds the tails' keys and no others, so its record and byte
-/// counts would be a fraction of the column presented as the whole. Those cells
-/// go unanswered there, and the sealed spans go unanswered on a resident open.
-/// Neither is a zero.
 pub fn stat(engine: &ReelStore) -> StatReport {
     let index = engine.index();
-    let is_paged = engine.config().index.pages();
     let segments = index.segments_snapshot();
 
     let mut live = 0u64;
@@ -93,13 +81,12 @@ pub fn stat(engine: &ReelStore) -> StatReport {
         columns.push(StatColumn {
             column: spec.name.to_string(),
             id: spec.id.as_u8(),
-            runs: is_paged.then(|| index.sealed_spans(spec.id)),
-            records: totals.map(|totals| totals.count),
-            bytes: totals.map(|totals| totals.bytes.to_bytes()),
+            runs: index.sealed_spans(spec.id),
+            records: totals.count,
+            bytes: totals.bytes.to_bytes(),
         });
     }
 
-    let born_segments = engine.born_segments();
     StatReport {
         volume: engine.root().display().to_string(),
         sequence: engine.sequence().as_u64(),
@@ -112,15 +99,12 @@ pub fn stat(engine: &ReelStore) -> StatReport {
             total => dead as f64 / total as f64,
         },
         held_cues: engine.cue_points().held().len(),
-        is_paged,
-        born_segments,
-        caveats: caveats(&columns, is_paged, born_segments),
+        caveats: caveats(&columns, live + dead > 0),
         columns,
     }
 }
 
-/// What a reader has to know before taking any of these figures for a total
-fn caveats(columns: &[StatColumn], is_paged: bool, born_segments: usize) -> Vec<Caveat> {
+fn caveats(columns: &[StatColumn], holds_bytes: bool) -> Vec<Caveat> {
     let mut caveats = Vec::new();
     if columns.is_empty() {
         caveats.push(
@@ -128,27 +112,8 @@ fn caveats(columns: &[StatColumn], is_paged: bool, born_segments: usize) -> Vec<
                 .fix("pass --column NAME:ID for each column the volume was written with"),
         );
     }
-    // Every sealed segment is born under a paged open, and its bytes are in no
-    // counter, so the live and dead figures are floors rather than the volume's
-    // totals. Saying so is the difference between a floor and a wrong number.
-    if born_segments > 0 {
-        caveats.push(
-            Caveat::new(format!(
-                "{born_segments} sealed segments carry no attributed bytes, so the live, dead \
-                 and share figures are floors"
-            ))
-            .fix("a resident open attributes them all: drop --paged"),
-        );
-    }
-    if !columns.is_empty() {
-        caveats.push(match is_paged {
-            true => Caveat::new(
-                "a paged open holds only the tails' keys, so record and byte counts go unanswered",
-            )
-            .fix("drop --paged"),
-            false => Caveat::new("runs stand only over a paged open, so this one counts none")
-                .fix("--paged"),
-        });
+    if holds_bytes {
+        caveats.push(caveat::seal_tally());
     }
     caveats
 }
@@ -161,15 +126,8 @@ impl Report for StatReport {
             .head("stat")
             .head(format!("seq {}", self.sequence))
             .head(fmt::plural(self.segments as u64, "segment", "segments"))
-            .head(match self.is_paged {
-                true => "paged",
-                false => "resident",
-            })
             .verdict(
-                match self.born_segments > 0 {
-                    true => Tone::Warn,
-                    false => Tone::Plain,
-                },
+                Tone::Plain,
                 format!("{} live", fmt::bytes(self.live_bytes)),
                 match stored {
                     0 => "nothing written here yet".to_string(),
@@ -211,9 +169,9 @@ impl StatReport {
             table = table.row(Row::new([
                 row.column.clone(),
                 row.id.to_string(),
-                fmt::answered(row.runs),
-                fmt::answered(row.records),
-                fmt::answered(row.bytes.map(fmt::bytes)),
+                row.runs.to_string(),
+                row.records.to_string(),
+                fmt::bytes(row.bytes),
             ]));
         }
         table

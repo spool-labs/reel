@@ -1,26 +1,17 @@
-//! Payload buffers the engine lends to a reader rather than gives away
-//!
-//! A read hands back a reel_core::Value rather than a Vec: a caller that only
-//! reads the bytes drops the handle and the buffer comes back for the next read on
-//! that thread, and one that needs an owned vector takes it with into_vec. Nothing
-//! is copied on either path. The pool is per thread and bounded per size class, so
-//! a volume with idle readers gives its memory back.
+//! Payload buffers the engine lends to readers, pooled per thread and per size class
 
 use std::cell::RefCell;
 
-/// Smallest buffer worth keeping, below which the allocator is already cheap
+/// The smallest buffer worth pooling, since the allocator is cheap below it
 const MIN_POOLED: usize = 512;
 
-/// Largest buffer worth keeping, above which one reader's high-water mark is
-/// more memory than the faults it saves are worth
+/// The largest buffer worth pooling, since a bigger high-water mark costs more than it saves
 const MAX_POOLED: usize = 16 * 1024 * 1024;
 
-/// Deepest a size class goes, whatever room its budget leaves
+/// A size class never keeps more than this many buffers
 const PER_CLASS: usize = 4;
 
-/// Bytes one size class may hold across the buffers it keeps
-///
-/// A flat count per class would price a 16 MiB buffer the same as a 512 byte one.
+/// One size class may hold this many bytes across the buffers it keeps
 const CLASS_BUDGET: usize = 2 * 1024 * 1024;
 
 /// Size classes, one per power of two from MIN_POOLED to MAX_POOLED
@@ -32,10 +23,7 @@ thread_local! {
         const { RefCell::new([const { Vec::new() }; CLASSES]) };
 }
 
-/// The class a request of this size is served from, or nothing if it is outside
-///
-/// A buffer serves a request no larger than its class, so a class holds buffers
-/// of exactly its capacity and a request rounds up to the class that fits it.
+/// The class a request of this size rounds up to, or nothing outside the classes
 fn class_of(wanted: usize) -> Option<usize> {
     if !(MIN_POOLED..=MAX_POOLED).contains(&wanted) {
         return None;
@@ -60,12 +48,7 @@ const fn depth_of(class: usize) -> usize {
     }
 }
 
-/// The capacity a buffer of this size is pooled at, or the size itself when it
-/// falls outside the classes
-///
-/// A capacity that is not exactly a class's is one the pool refuses, so a caller
-/// growing a buffer it means to hand back grows to this rather than to what it
-/// needs.
+/// The capacity the pool takes back for this size, or the size itself outside the classes
 pub fn pooled_capacity(wanted: usize) -> usize {
     match class_of(wanted) {
         Some(class) => capacity_of(class),
@@ -73,10 +56,7 @@ pub fn pooled_capacity(wanted: usize) -> usize {
     }
 }
 
-/// This thread's spare buffer of a class, if it has one
-///
-/// A thread whose pool has already been torn down is answered as an empty one,
-/// since this runs from Drop where a panic during an unwind aborts the process.
+/// This thread's spare buffer of a class, or nothing once the pool is torn down
 fn pop(class: usize) -> Option<Vec<u8>> {
     SPARE
         .try_with(|spare| spare.borrow_mut()[class].pop())
@@ -84,10 +64,7 @@ fn pop(class: usize) -> Option<Vec<u8>> {
         .flatten()
 }
 
-/// A buffer with room for this many bytes, from the pool when it has one
-///
-/// What comes back is always empty and always has at least the room asked for,
-/// so a caller fills it exactly as it would fill a fresh allocation.
+/// An empty buffer with room for at least this many bytes, from the pool when it has one
 pub fn take(wanted: usize) -> Vec<u8> {
     let Some(class) = class_of(wanted) else {
         return Vec::with_capacity(wanted);
@@ -102,18 +79,13 @@ pub fn take(wanted: usize) -> Vec<u8> {
 }
 
 /// A buffer of exactly this length, holding whatever was last written into it
-///
-/// For the caller that fills every byte, since zeroing first is a pass over the
-/// payload that nothing reads. The bytes are not cleared, so a caller that writes
-/// less than the whole length hands out what the previous record left behind.
 pub fn take_written(wanted: usize) -> Vec<u8> {
     let Some(class) = class_of(wanted) else {
         return vec![0u8; wanted];
     };
     let mut bytes = match pop(class) {
         Some(bytes) => bytes,
-        // Asked for zeroed rather than reserved, so a large buffer comes back as
-        // blank pages the allocator never touched.
+        // A zeroed allocation comes back as blank pages the allocator never touched
         None => vec![0u8; capacity_of(class)],
     };
     match bytes.len() >= wanted {
@@ -123,11 +95,7 @@ pub fn take_written(wanted: usize) -> Vec<u8> {
     bytes
 }
 
-/// Offer a buffer back for the next read on this thread
-///
-/// A buffer whose capacity is not a class's, or whose class is full, is dropped
-/// here. What it holds is left alone rather than cleared, since the length is how
-/// far the buffer is known to be written.
+/// Offer a buffer back for the next read on this thread, dropping it if it does not fit
 pub fn give(bytes: Vec<u8>) {
     let capacity = bytes.capacity();
     let Some(class) = class_of(capacity) else {
@@ -136,8 +104,7 @@ pub fn give(bytes: Vec<u8>) {
     if capacity_of(class) != capacity {
         return;
     }
-    // A pool already torn down drops the offer, since this runs from Drop on
-    // whichever thread let the last reader go.
+    // A pool already torn down drops the offer, since this can run from Drop
     let _ = SPARE.try_with(|spare| {
         let mut spare = spare.borrow_mut();
         if spare[class].len() < depth_of(class) {
@@ -237,7 +204,7 @@ mod tests {
         first.iter_mut().for_each(|byte| *byte = 7);
         give(first);
 
-        // Back at the same length, which is the case that zeroes nothing.
+        // Back at the same length, which zeroes nothing
         let again = take_written(MIN_POOLED);
         assert_eq!(again.len(), MIN_POOLED);
         assert!(

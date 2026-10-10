@@ -1,40 +1,28 @@
 //! What it costs to accumulate a footer's rows and pack them at seal
-//!
-//! A tail appends rows as records land, in whatever order the writers finish, and a seal
-//! puts them in key order and writes them out. Prefix-packed rows cannot be appended out
-//! of order, so the packing happens after the sort, on the foreground write path. Two
-//! accumulators are measured: paired holds a key and a tail per row as their own
-//! allocations, flat holds every row in one buffer at a fixed stride. Paired moves less
-//! memory and allocates far more, flat is the reverse.
-//!
-//! Ignored by default. Run with:
-//!   cargo test -p tape-reel --test footer_build --release -- --ignored --nocapture
+//! Run with `cargo test -p tape-reel --test format --release -- footer_build --ignored --nocapture`
 
 use std::time::{Duration, Instant};
 
 use reel::format::footer::{FooterEntry, FooterPartition, SegmentFooter};
 use reel::format::lsn::Lsn;
-use reel::format::prefix::PrefixRows;
+use reel::format::prefix::{PrefixRows, Tail};
 use reel::format::record::Flags;
 use reel::{ColumnId, RecordKey};
 
-/// Bytes a row carries behind its key, matching the footer's entry tail
+/// Bytes behind each row's key, the size of the footer's entry tail
 const TAIL: usize = 17;
 
-/// Row counts a real segment reaches
+/// Each cell runs at these row counts, sizes a real segment reaches
 const COUNTS: [usize; 3] = [10_000, 100_000, 1_000_000];
 
-/// Passes per cell, reporting the best, so a stray preemption is not the result
+/// Passes per cell, and the best one is reported
 const ROUNDS: usize = 3;
 
-/// Keys shaped like the column this packing exists for
-///
-/// Object names, in the order writers would finish rather than in key order, so the sort
-/// has real work to do. A slot-led column arrives nearly sorted and flatters both.
+/// Object-name keys in writer finish order, so the sort has real work
 fn keys(count: usize) -> Vec<Vec<u8>> {
     (0..count)
         .map(|at| {
-            // Scattered so the sort is a sort, and shaped so neighbours share a front.
+            // Scattered so the sort has work, and shaped so neighbours share a prefix
             let scattered = (at as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
             format!(
                 "tenants/{:016x}/exports/2026/08/02/part-{:08}.parquet",
@@ -46,16 +34,12 @@ fn keys(count: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Names of wildly different lengths, which is what an object bucket holds
-///
-/// Flat pads every key to the widest one in the partition, so a column whose keys are all
-/// one length costs it nothing. Real names run from a handful of bytes to a kibibyte, so
-/// the padding is the whole question rather than a rounding error.
+/// Object keys of wildly different lengths, like a bucket holds
 fn mixed_keys(count: usize) -> Vec<Vec<u8>> {
     (0..count)
         .map(|at| {
             let scattered = (at as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            // A few long names among many short ones, which is the shape a bucket takes.
+            // A few long keys among many short ones
             let depth = match scattered % 32 {
                 0 => 24,
                 1..=3 => 8,
@@ -82,19 +66,17 @@ fn paired(keys: &[Vec<u8>]) -> (Duration, PrefixRows) {
         tail[..8].copy_from_slice(&(at as u64).to_le_bytes());
         staged.push((key.clone(), tail));
     }
-    staged.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    // Equal keys sort by sequence as in a footer, since a tail is a delta from the row before
+    staged.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
 
-    let mut rows = PrefixRows::new();
+    let mut rows = PrefixRows::new(Tail::Entry);
     for (key, tail) in &staged {
         rows.push(key, tail).expect("push");
     }
     (began.elapsed(), rows)
 }
 
-/// Hold every row in one buffer at a fixed stride, sort an index, pack
-///
-/// The stride is the widest key the partition holds, so a short key is padded to it for
-/// as long as the accumulation lasts.
+/// Hold every row in one buffer at a stride of the widest key, sort an index, pack
 fn flat(keys: &[Vec<u8>]) -> (Duration, PrefixRows) {
     let width = keys.iter().map(Vec::len).max().unwrap_or(0);
     let stride = width + 2 + TAIL;
@@ -115,9 +97,9 @@ fn flat(keys: &[Vec<u8>]) -> (Duration, PrefixRows) {
         let len = u16::from_le_bytes([packed[row], packed[row + 1]]) as usize;
         &packed[row + 2..row + 2 + len]
     };
-    order.sort_unstable_by(|left, right| key_of(*left).cmp(key_of(*right)));
+    order.sort_unstable_by(|left, right| key_of(*left).cmp(key_of(*right)).then(left.cmp(right)));
 
-    let mut rows = PrefixRows::new();
+    let mut rows = PrefixRows::new(Tail::Entry);
     for at in &order {
         let row = *at as usize * stride;
         let len = u16::from_le_bytes([packed[row], packed[row + 1]]) as usize;
@@ -132,9 +114,6 @@ fn flat(keys: &[Vec<u8>]) -> (Duration, PrefixRows) {
 }
 
 /// Sort the rows and stop, which is what a seal does today
-///
-/// The number that decides whether packing is affordable, since the sort is already paid
-/// and only the pack is new.
 fn sort_only(keys: &[Vec<u8>]) -> Duration {
     let began = Instant::now();
     let mut staged: Vec<(Vec<u8>, [u8; TAIL])> = Vec::with_capacity(keys.len());
@@ -143,29 +122,27 @@ fn sort_only(keys: &[Vec<u8>]) -> Duration {
         tail[..8].copy_from_slice(&(at as u64).to_le_bytes());
         staged.push((key.clone(), tail));
     }
-    staged.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    // Equal keys sort by sequence as in a footer, since a tail is a delta from the row before
+    staged.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
     std::hint::black_box(&staged);
     began.elapsed()
 }
 
-/// Bytes each strategy holds while it is accumulating, which is the other half
-///
-/// This runs on the foreground write path when a segment fills, so what it holds is
-/// memory a node cannot use for anything else until the seal finishes.
+/// How many bytes each strategy holds while it accumulates
 fn held(keys: &[Vec<u8>]) -> (usize, usize) {
-    // Paired: a heap allocation per key rounded as an allocator rounds, plus the pair.
+    // Paired: a heap allocation per key rounded as an allocator rounds, plus the pair
     let paired: usize = keys
         .iter()
         .map(|key| (key.len() + 16).div_ceil(16) * 16 + 24 + TAIL)
         .sum();
 
-    // Flat: one buffer, every key padded to the widest, plus the index vector.
+    // Flat: one buffer, every key padded to the widest, plus the index vector
     let width = keys.iter().map(Vec::len).max().unwrap_or(0);
     let flat = keys.len() * (width + 2 + TAIL) + keys.len() * 4;
     (paired, flat)
 }
 
-// which accumulator a seal should use, measured rather than assumed
+// time and memory of the paired and flat accumulators per key shape
 #[test]
 #[ignore = "performance benchmark; run with --ignored --nocapture"]
 fn accumulator_shapes() {
@@ -200,8 +177,7 @@ fn accumulator_shapes() {
             let (took, other) = flat(&corpus);
             best_flat = best_flat.min(took);
 
-            // Both have to produce the same block, or this compares two answers rather
-            // than two ways of reaching one.
+            // Both have to produce the same block
             assert_eq!(other.len(), rows.len(), "row counts differ");
             assert_eq!(other.packed_len(), rows.packed_len(), "packed bytes differ");
         }
@@ -233,13 +209,13 @@ fn both_accumulators_pack_the_same_block() {
     assert_eq!(one.len(), two.len());
     assert_eq!(one.packed_len(), two.packed_len());
     assert_eq!(
-        one.keys(TAIL).expect("keys"),
-        two.keys(TAIL).expect("keys"),
+        one.keys().expect("keys"),
+        two.keys().expect("keys"),
         "the two accumulators disagree about the order",
     );
 }
 
-/// Keys led by a counter the producer advances, big endian so they sort by it
+/// Keys led by a big-endian counter, so they sort in write order
 fn slot_keys(count: usize) -> Vec<Vec<u8>> {
     (0..count as u64)
         .map(|at| {
@@ -250,7 +226,7 @@ fn slot_keys(count: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Keys that share nothing, which is what a content address is
+/// Random keys, like content addresses
 fn random_keys(count: usize) -> Vec<Vec<u8>> {
     let mut keys: Vec<Vec<u8>> = (0..count)
         .map(|at| {
@@ -270,7 +246,7 @@ fn random_keys(count: usize) -> Vec<Vec<u8>> {
     keys
 }
 
-// what the packing is worth per column shape, which is not one number
+// how many bytes prefix packing saves per column shape
 #[test]
 #[ignore = "performance benchmark; run with --ignored --nocapture"]
 fn what_packing_is_worth_by_column_shape() {
@@ -285,7 +261,7 @@ fn what_packing_is_worth_by_column_shape() {
     ] {
         let mut sorted = corpus.clone();
         sorted.sort();
-        let mut rows = PrefixRows::new();
+        let mut rows = PrefixRows::new(Tail::Raw(TAIL.min(8)));
         for (at, key) in sorted.iter().enumerate() {
             rows.push(key, &(at as u64).to_le_bytes()[..TAIL.min(8)])
                 .ok();
@@ -300,13 +276,10 @@ fn what_packing_is_worth_by_column_shape() {
     println!();
 }
 
-/// Column every row in the sort bench below belongs to
+/// The column of every row in the sort bench
 const COLUMN: ColumnId = ColumnId(1);
 
-/// One column's rows in the order they reached the partition
-///
-/// Built through the footer's own build rather than by hand, so a corpus of mixed widths
-/// stops the striding exactly where the write path would stop it.
+/// One column's rows in arrival order, built through the footer's own build
 fn staged(keys: &[Vec<u8>]) -> FooterPartition {
     let rows: Vec<FooterEntry> = keys
         .iter()
@@ -325,7 +298,7 @@ fn staged(keys: &[Vec<u8>]) -> FooterPartition {
     footer.partitions.remove(0)
 }
 
-// what the seal's sort costs per shape; the scattered column is not comparable across runs
+// the seal's sort time per key shape, for rows as written and in key order
 #[test]
 #[ignore = "performance benchmark; run with --ignored --nocapture"]
 fn seal_sort_by_arrival_order() {
@@ -350,8 +323,7 @@ fn seal_sort_by_arrival_order() {
             for (rows, best) in [(&corpus, &mut best_written), (&ordered, &mut best_ordered)] {
                 let held = staged(rows);
                 for _ in 0..ROUNDS {
-                    // A fresh copy per round, since a sorted partition is a different
-                    // input from the one that arrived.
+                    // A fresh copy per round, since sorting changes the input
                     let mut one = held.clone();
                     let began = Instant::now();
                     one.sort();
@@ -371,7 +343,7 @@ fn seal_sort_by_arrival_order() {
 fn a_partition_in_key_order_sorts_to_itself() {
     let mut corpus = keys(2_000);
     corpus.sort();
-    // Duplicates arrive after their first version, so their sequence numbers ascend.
+    // Duplicates arrive after their first version, so their sequence numbers ascend
     for at in (0..2_000).step_by(7) {
         corpus.insert(at, corpus[at].clone());
     }
@@ -380,7 +352,7 @@ fn a_partition_in_key_order_sorts_to_itself() {
     let mut one = held.clone();
     one.sort();
 
-    // Every row of the arrival, in arrival order, since nothing needed moving.
+    // Every row of the arrival, in arrival order, since nothing needed moving
     let arrived: Vec<Vec<u8>> = (0..held.len())
         .map(|row| held.key_at(row).expect("key").to_vec())
         .collect();

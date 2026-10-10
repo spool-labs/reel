@@ -1,9 +1,4 @@
 //! One page of keys taken off the index, with the size each one resolves to
-//!
-//! The page carries where every key's record sits, because the index had the entry
-//! in hand when it copied the key out and asking again costs a lock and a descent
-//! per record. Keys are packed end to end at the column's width, so a page is one
-//! allocation rather than one per key.
 
 use crate::index::entry::Entry;
 
@@ -16,7 +11,7 @@ pub struct KeyPage {
     /// Where each key's record sits, empty on a keys-only page
     found: Vec<Entry>,
 
-    /// Stride the keys were packed at, meaningful only while the ends are empty
+    /// The keys' packing stride, meaningful only while `ends` is empty
     width: usize,
 
     /// Where each key ends, filled only once a page holds two lengths
@@ -27,15 +22,37 @@ pub struct KeyPage {
 
     /// Whether a caller will read the entries, so a keys-only walk skips them
     keeps_found: bool,
+
+    /// Whether graves and covered entries come out too, for a merge that checks them itself
+    keeps_graves: bool,
 }
 
 impl KeyPage {
-    /// A page that carries where each key's record is, for a walk that reads them
+    /// A page that keeps each key's entry, for a walk that reads the records
     pub fn with_lens() -> KeyPage {
         KeyPage {
             keeps_found: true,
             ..KeyPage::default()
         }
+    }
+
+    /// Whether the walk filling this page reads the records it points at
+    pub fn keeps_found(&self) -> bool {
+        self.keeps_found
+    }
+
+    /// The map's half of a merge, keeping graves and covered entries to drop deleted sealed keys
+    pub fn merging() -> KeyPage {
+        KeyPage {
+            keeps_found: true,
+            keeps_graves: true,
+            ..KeyPage::default()
+        }
+    }
+
+    /// Whether the page holds graves and covered entries for its reader to check
+    pub fn keeps_graves(&self) -> bool {
+        self.keeps_graves
     }
 
     /// Drop the page's contents, keeping its allocations for the next fill
@@ -47,7 +64,7 @@ impl KeyPage {
         self.count = 0;
     }
 
-    /// Room for this many more keys at a width, so a fill never regrows its buffers
+    /// Reserve room for this many more keys at a width, so a fill never regrows its buffers
     pub fn reserve(&mut self, count: usize, width: usize) {
         self.keys.reserve(count * width);
         if self.keeps_found {
@@ -55,12 +72,9 @@ impl KeyPage {
         }
     }
 
-    /// Add one key and the payload length its record holds
-    ///
-    /// The page takes its stride from whichever key is added first.
+    /// Add one key and its entry, taking the stride from the first key
     pub fn push(&mut self, key: &[u8], found: Entry) {
-        // A page of one width is cut by arithmetic. A second width ends that, so
-        // the ends are filled in for the keys already packed and kept from then on.
+        // A second width switches the page to explicit ends, backfilled for the keys so far
         if self.ends.is_empty() && self.count > 0 && key.len() != self.width {
             self.ends
                 .extend((1..=self.count).map(|at| (at * self.width) as u32));
@@ -78,9 +92,7 @@ impl KeyPage {
         self.count += 1;
     }
 
-    /// Add a run of keys packed at one width, with each key's entry, in one copy each
-    ///
-    /// False, with nothing added, when the run's width differs from the page's.
+    /// Add a run of same-width keys and their entries, false with nothing added on a width mismatch
     pub fn push_packed(&mut self, keys: &[u8], width: usize, found: &[Entry]) -> bool {
         if found.is_empty() {
             return true;
@@ -128,7 +140,7 @@ impl KeyPage {
         self.keys.get(start..*self.ends.get(at)? as usize)
     }
 
-    /// Payload bytes the key at a position resolves to, or zero on a keys-only page
+    /// The payload length the key at a position resolves to, or zero on a keys-only page
     pub fn len_at(&self, at: usize) -> u64 {
         self.found_at(at)
             .map(|found| u64::from(found.loc.len))

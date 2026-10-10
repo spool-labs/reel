@@ -1,9 +1,4 @@
-//! What a restart costs on disk: an empty tail leaves no file behind, and a
-//! sealed segment keeps its records rather than its reservation
-//!
-//! Before these held, every clean stop sealed a header-only tail at its full
-//! preallocation, and a node restarted daily banked a segment of slack per tail
-//! per day. A store holding megabytes could sit on tens of gigabytes of shells.
+//! What a restart costs on disk: an idle restart keeps its one tail, and segments keep no slack
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,11 +6,12 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use reel::config::{ReelConfig, SyncPolicy, ThreadBudget};
-use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, MapShape, RecordKey};
+use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, RecordKey};
+use reel::format::journal::rows_region;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::units::ByteCount;
-use reel::{KeyWidth, Preallocate, ReelStore};
+use reel::{KeyWidth, ReelStore};
 
 const ROWS: ColumnId = ColumnId(1);
 
@@ -26,12 +22,11 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 const SEGMENT: u64 = 1024 * 1024;
 
-/// Zeros a tail lays down ahead of its head: four of this segment's draw margins
+/// A tail zeros this many bytes ahead of its head, four of this segment's draw margins
 const WINDOW: u64 = (SEGMENT / 16) * 4;
 
 fn key(at: u64) -> RecordKey {
@@ -43,8 +38,6 @@ fn key(at: u64) -> RecordKey {
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(SEGMENT),
-        alloc_chunk: ByteCount::from_bytes(SEGMENT / 4),
-        preallocate: Preallocate::Full,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         ..ReelConfig::default()
@@ -70,6 +63,15 @@ fn bytes_in(root: &Path) -> u64 {
         .sum()
 }
 
+/// Find the first hole in a file, or its end if the filesystem reports no holes
+fn written_end(path: &Path) -> u64 {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::File::open(path).expect("open segment");
+    let end = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_HOLE) };
+    assert!(end >= 0, "a seek for the first hole failed");
+    end as u64
+}
+
 /// Copy every file in a root, the image a process that died would leave behind
 fn copy_root(from: &Path, to: &Path) {
     for entry in std::fs::read_dir(from).expect("read root") {
@@ -92,18 +94,21 @@ fn a_new_segment_is_written_through() {
     let segments = segments_in(home.path());
     assert_eq!(segments.len(), 1, "the tail drew more than one segment");
     let bytes = std::fs::read(&segments[0]).expect("read segment");
-    assert_eq!(
-        bytes.len() as u64,
-        WINDOW,
+    assert!(
+        written_end(&segments[0]) >= WINDOW,
         "the window was not written through at creation"
     );
+    // An open file reaches its rows, and everything between the records and the rows is zero
+    let (rows_at, _) = rows_region(&bytes).expect("an open segment runs out to its rows");
     assert!(
-        bytes[WINDOW as usize / 2..].iter().all(|byte| *byte == 0),
+        bytes[WINDOW as usize / 2..rows_at as usize]
+            .iter()
+            .all(|byte| *byte == 0),
         "the fill past the records is not zeros"
     );
 
-    // The fill reads back as a data record with no sequence number, which is where the
-    // walk stops, and a written record always draws a sequence number above zero.
+    // Flush so a reopen finds the journaled row, then copy the open tail as a crash leaves it
+    store.flush().expect("flush");
     let crashed = TempDir::new().expect("crashed");
     copy_root(home.path(), crashed.path());
     store.close().expect("close");
@@ -132,7 +137,6 @@ fn only_a_tail_that_syncs_often_fills_its_next_window() {
         let home = TempDir::new().expect("home");
         let config = ReelConfig {
             segment_bytes: ByteCount::from_bytes(BIG_SEGMENT),
-            alloc_chunk: ByteCount::from_bytes(BIG_SEGMENT / 4),
             sync,
             ..config()
         };
@@ -142,7 +146,7 @@ fn only_a_tail_that_syncs_often_fills_its_next_window() {
         }
         let segments = segments_in(home.path());
         assert_eq!(segments.len(), 1, "the tail drew more than one segment");
-        std::fs::metadata(&segments[0]).expect("metadata").len()
+        written_end(&segments[0])
     };
 
     for sync in [SyncPolicy::Never, SyncPolicy::Bytes(ByteCount::mb(1))] {
@@ -153,13 +157,13 @@ fn only_a_tail_that_syncs_often_fills_its_next_window() {
         );
     }
     assert_eq!(
-        length_after(SyncPolicy::EveryPut),
+        length_after(SyncPolicy::Bytes(ByteCount::from_bytes(0))),
         2 * BIG_WINDOW,
         "a tail that syncs every put did not zero its next window"
     );
 }
 
-// a store restarted idle keeps its one tail rather than drawing another
+// a store restarted idle keeps its one tail
 #[test]
 fn an_idle_restart_keeps_one_segment() {
     let home = TempDir::new().expect("home");
@@ -248,11 +252,11 @@ fn a_full_segment_seals_at_its_footer() {
     }
 }
 
-// a crash leaves only the records: the reservation never lives in the length
+// a crash image holds the records and their rows, with zeros in the reserved space between
 #[test]
 fn a_crash_leaves_only_the_records() {
     let config = ReelConfig {
-        sync: SyncPolicy::EveryPut,
+        sync: SyncPolicy::Bytes(ByteCount::from_bytes(0)),
         ..config()
     };
     let sim = SimIo::new(FaultPlan::new(1));
@@ -269,7 +273,13 @@ fn a_crash_leaves_only_the_records() {
     let widest = image
         .iter()
         .filter(|(path, _)| is_segment(path))
-        .map(|(_, bytes)| bytes.len() as u64)
+        .map(|(_, bytes)| {
+            let (rows_at, _) = rows_region(bytes).expect("an open segment runs out to its rows");
+            bytes[..rows_at as usize]
+                .iter()
+                .rposition(|byte| *byte != 0)
+                .map_or(0, |last| last as u64 + 1)
+        })
         .max()
         .expect("the crash image holds the tail");
     assert!(
@@ -288,7 +298,7 @@ fn a_crash_leaves_only_the_records() {
     assert!(reopened.get(&key(0)).expect("get").is_some());
 }
 
-// a flush after a close settles instead of parking on the doomed tail
+// a flush after a close settles without parking on the doomed tail
 #[test]
 fn a_flush_after_close_settles() {
     let home = TempDir::new().expect("home");

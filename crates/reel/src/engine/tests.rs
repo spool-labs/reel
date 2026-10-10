@@ -15,23 +15,23 @@ use tempfile::{tempdir, TempDir};
 
 use crate::units::ByteCount;
 
-use crate::config::{
-    CompactRate, HotIndex, IndexResidency, PointReads, Preallocate, RangedReads, RepairPath,
-    ShardShapes, SyncPolicy, ThreadBudget,
-};
-use crate::format::column::{Codec, ColumnId, ColumnSpec, MapShape};
+use crate::config::{CompactRate, RepairPath, SyncPolicy, ThreadBudget};
+use crate::format::column::{Codec, ColumnId, ColumnSpec};
 use crate::format::footer::SegmentFooter;
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::record::HEADER_LEN;
 use crate::index::page::KeyPage;
-use crate::io::direct::{covering_span, DIRECT_ALIGN};
+use crate::index::spot::Lookup;
 use crate::io::fault::{FaultKind, FaultPlan};
 use crate::io::posix_backend::PosixBackend;
 use crate::io::sim_backend::{DurableImage, SimIo};
 use crate::reel::segment_file_name;
 use crate::sync::tension::block_on;
 
-/// Virtual volume root the simulator files live under
+/// A sync on every write, for tests that need each one durable
+const EVERY_WRITE: SyncPolicy = SyncPolicy::Bytes(ByteCount::from_bytes(0));
+
+/// The simulator's files live under this root
 const ROOT: &str = "/bulk";
 
 const RECORD: ColumnId = ColumnId(1);
@@ -47,7 +47,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 2,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -56,7 +55,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: FLAG,
@@ -65,7 +63,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 
@@ -77,7 +74,6 @@ const CODED_COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::Lz4,
-    map_shape: MapShape::Tree,
 }];
 
 const NAMES: ColumnId = ColumnId(6);
@@ -90,14 +86,11 @@ const NAME_COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 fn config(active_tails: u32, sync: SyncPolicy) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(1),
-        alloc_chunk: ByteCount::from_bytes(16_384),
-        preallocate: Preallocate::Chunk,
         sync,
         active_tails: ThreadBudget::threads(active_tails),
         ..ReelConfig::default()
@@ -142,11 +135,7 @@ fn noise(len: usize) -> Vec<u8> {
 
 /// Bytes a column's live records take on the volume
 fn stored_bytes(store: &ReelStore, column: ColumnId) -> u64 {
-    store
-        .column_totals(column)
-        .expect("totals")
-        .bytes
-        .to_bytes()
+    store.column_totals(column).bytes.to_bytes()
 }
 
 fn coded_store(config: ReelConfig) -> (ReelStore, SimIo) {
@@ -162,9 +151,6 @@ fn coded_store(config: ReelConfig) -> (ReelStore, SimIo) {
 }
 
 /// Run work with a thread draining the simulator behind it
-///
-/// The simulator neither answers at submission nor files from a thread of its
-/// own, so a pending read lands only when somebody drains it.
 fn reaping<Out>(store: &ReelStore, work: impl FnOnce() -> Out) -> Out {
     let is_done = AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -181,10 +167,7 @@ fn reaping<Out>(store: &ReelStore, work: impl FnOnce() -> Out) -> Out {
     })
 }
 
-/// A store over a real directory and a backend that services ops in place
-///
-/// The directory comes back with it, since a temporary one dropped early
-/// takes the volume with it.
+/// A store over a real temp directory and a backend that services ops in place
 fn posix_store(config: ReelConfig) -> (ReelStore, Arc<PosixBackend>, TempDir) {
     let dir = tempdir().expect("tempdir");
     let backend = Arc::new(PosixBackend::new());
@@ -209,10 +192,7 @@ fn sim_store(config: ReelConfig) -> (ReelStore, SimIo) {
 // a paged volume gives a sealed segment's keys to its footer and still reads them
 #[test]
 fn a_paged_column_reads_from_its_footer() {
-    let paged = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let paged = config(1, SyncPolicy::Never);
     let (store, _sim) = sim_store(paged);
 
     // A megabyte of segment against 8 KiB records, so the tail rolls partway.
@@ -220,8 +200,7 @@ fn a_paged_column_reads_from_its_footer() {
     for byte in 0..200u8 {
         store.put(&record(7, byte), &payload).expect("put");
     }
-    // The seal runs on the sealer thread and the flush is what drains it, so the
-    // handover below is asserted against a seal that has finished.
+    // The flush drains the sealer thread, so the handover below sees a finished seal
     store.flush().expect("flush");
     let sealed = store.page_out_sealed().expect("page out");
     assert!(
@@ -247,13 +226,359 @@ fn a_paged_column_reads_from_its_footer() {
     assert!(store.contains(&handed).expect("read"));
 }
 
-// a sealed segment's ceiling covers its tombstone rows and not only its records
+// the spot index answers a paged column's sealed keys through overwrites, deletes and compaction
 #[test]
-fn a_ceiling_covers_a_tombstone() {
+fn spot_answers_sealed_keys() {
+    let paged = ReelConfig {
+        compact_mbps: CompactRate::Mbps(64),
+        ..config(1, SyncPolicy::Never)
+    };
+    let (store, sim) = sim_store(paged.clone());
+    let value = |byte: u8, version: u8| vec![byte.wrapping_add(version); 8 * 1024];
+    let mut expected: Vec<Option<Vec<u8>>> = (0..200u8).map(|byte| Some(value(byte, 0))).collect();
+    for byte in 0..200u8 {
+        store.put(&record(7, byte), &value(byte, 0)).expect("put");
+    }
+    store.flush().expect("flush");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+    assert!(
+        store.index.spot_held() > 0,
+        "the handover filled the spot index"
+    );
+
+    let check = |store: &ReelStore, expected: &[Option<Vec<u8>>], stage: &str| {
+        let keys: Vec<RecordKey> = (0..expected.len())
+            .map(|byte| record(7, byte as u8))
+            .collect();
+        let many = store.get_many(&keys).expect("get many");
+        let waited_many = block_on(store.get_many_wait(&keys)).expect("awaited get many");
+        for (byte, value) in expected.iter().enumerate() {
+            let found = store
+                .get(&keys[byte])
+                .expect("read")
+                .map(|found| found.to_vec());
+            assert_eq!(&found, value, "key {byte} after {stage}");
+            let waited = block_on(store.get_wait(&keys[byte])).expect("awaited get");
+            assert_eq!(
+                &waited.map(|found| found.to_vec()),
+                value,
+                "awaited key {byte} after {stage}"
+            );
+            assert_eq!(
+                &many[byte].as_ref().map(|found| found.to_vec()),
+                value,
+                "batched key {byte} after {stage}"
+            );
+            let waited = waited_many[byte].as_ref().map(|found| found.to_vec());
+            assert_eq!(&waited, value, "awaited batched key {byte} after {stage}");
+            // A window near the front, one deep in the payload, and one cut short at its end
+            for (at, len) in [(10u64, 100usize), (6_000, 1_000), (8_000, 1_000)] {
+                let want = value.as_ref().map(|value| {
+                    let from = (at as usize).min(value.len());
+                    value[from..(from + len).min(value.len())].to_vec()
+                });
+                let window = store
+                    .get_range(&keys[byte], at, len)
+                    .expect("range")
+                    .map(|found| found.to_vec());
+                assert_eq!(window, want, "key {byte} window {at}+{len} after {stage}");
+                let waited =
+                    block_on(store.get_range_wait(&keys[byte], at, len)).expect("awaited range");
+                assert_eq!(
+                    waited.map(|found| found.to_vec()),
+                    want,
+                    "awaited key {byte} window {at}+{len} after {stage}"
+                );
+            }
+        }
+    };
+    check(&store, &expected, "the handover");
+
+    for byte in (0..200u8).step_by(3) {
+        store
+            .put(&record(7, byte), &value(byte, 1))
+            .expect("overwrite");
+        expected[byte as usize] = Some(value(byte, 1));
+    }
+    for byte in (1..200u8).step_by(5) {
+        store.delete(&record(7, byte)).expect("delete");
+        expected[byte as usize] = None;
+    }
+    check(&store, &expected, "overwrites and deletes");
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("hand over");
+    while store.index.scrub_spot(1024) > 0 {}
+    check(&store, &expected, "the cleaner");
+
+    store.compact_once().expect("compact");
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("hand over");
+    while store.index.scrub_spot(1024) > 0 {}
+    check(&store, &expected, "compaction");
+
+    store.close().expect("close");
+    drop(store);
+    let restored = SimIo::from_image(sim.durable_image());
+    let reopened = ReelStore::open_with_io(PathBuf::from(ROOT), paged, COLUMNS, Arc::new(restored))
+        .expect("reopen");
+    assert!(
+        reopened.index.spot_held() > 0,
+        "the open loaded the spot index"
+    );
+    check(&reopened, &expected, "a reopen");
+}
+
+// each spot index read costs one device read a key, a deep window two in one submission
+#[test]
+fn spot_reads_take_one_read_a_key() {
+    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
+    let payload = vec![0xa5u8; 8 * 1024];
+    for byte in 0..200u8 {
+        store.put(&record(7, byte), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+    let handed: Vec<RecordKey> = (0..200u8)
+        .map(|byte| record(7, byte))
+        .filter(|key| is_paged(&store, key))
+        .take(10)
+        .collect();
+    assert_eq!(handed.len(), 10, "ten keys went to the spot index");
+    // One read first, so the segment's handle is open and no count below includes it
+    store.get(&handed[0]).expect("warm");
+
+    let reads = |read: &dyn Fn()| {
+        let before = sim.ops();
+        read();
+        sim.ops() - before
+    };
+    assert_eq!(
+        reads(&|| drop(store.get(&handed[1]).expect("get"))),
+        1,
+        "a get"
+    );
+    assert_eq!(
+        reads(&|| drop(block_on(store.get_wait(&handed[2])).expect("get"))),
+        1,
+        "an awaited get"
+    );
+    assert_eq!(
+        reads(&|| drop(store.get_range(&handed[3], 10, 100).expect("range"))),
+        1,
+        "a near window"
+    );
+    assert_eq!(
+        reads(&|| drop(store.get_range(&handed[4], 6_000, 1_000).expect("range"))),
+        2,
+        "a deep window"
+    );
+    assert_eq!(
+        reads(&|| drop(store.get_many(&handed).expect("many"))),
+        10,
+        "a batch"
+    );
+    assert_eq!(
+        reads(&|| drop(block_on(store.get_many_wait(&handed)).expect("many"))),
+        10,
+        "an awaited batch"
+    );
+}
+
+// compaction rebooks each class-booked overwrite at its true length as the segment retires
+#[test]
+fn compaction_rebooks_class_bookings_at_their_true_length() {
     let (store, _sim) = sim_store(ReelConfig {
-        index: IndexResidency::Paged,
+        compact_mbps: CompactRate::Mbps(64),
         ..config(1, SyncPolicy::Never)
     });
+    let payload = vec![0xa5u8; 8_000];
+    for byte in 0..200u8 {
+        store.put(&record(7, byte), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+    let exact = store.totals().bytes;
+
+    for byte in 0..200u8 {
+        store.put(&record(7, byte), &payload).expect("overwrite");
+    }
+    store.flush().expect("flush");
+    assert!(
+        store.spot_slack() > 0,
+        "no overwrite was booked from its class"
+    );
+    assert_ne!(
+        store.totals().bytes,
+        exact,
+        "the class middle happened to equal the payload"
+    );
+
+    for _ in 0..8 {
+        store.compact_once().expect("compact");
+        store.maintain_once().expect("maintain");
+    }
+    assert_eq!(
+        store.spot_slack(),
+        0,
+        "a class booking outlived its segment"
+    );
+    assert_eq!(
+        store.totals().bytes,
+        exact,
+        "the live bytes kept a class booking's error"
+    );
+}
+
+// a cue read of a key unchanged since the cue takes one read, a rewritten one reads the footers
+#[test]
+fn a_cue_read_takes_one_read_while_the_key_stands() {
+    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
+    let (first, second) = (vec![0xa5u8; 8 * 1024], vec![0x5au8; 8 * 1024]);
+    for byte in 0..200u8 {
+        store.put(&record(7, byte), &first).expect("put");
+    }
+    let cue = store.cue().expect("cue");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+    for byte in 0..10u8 {
+        store.put(&record(7, byte), &second).expect("rewrite");
+    }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("hand over");
+    let standing: Vec<RecordKey> = (10..200u8)
+        .map(|byte| record(7, byte))
+        .filter(|key| is_paged(&store, key))
+        .take(2)
+        .collect();
+    assert_eq!(
+        standing.len(),
+        2,
+        "two unchanged keys went to the spot index"
+    );
+    store.get_at(&standing[0], &cue).expect("warm");
+
+    let before = sim.ops();
+    let read = store.get_at(&standing[1], &cue).expect("cue read");
+    assert_eq!(
+        sim.ops() - before,
+        1,
+        "an unchanged key read more than once"
+    );
+    assert_eq!(read.as_deref(), Some(&first[..]));
+    for byte in 0..10u8 {
+        let read = store.get_at(&record(7, byte), &cue).expect("cue read");
+        assert_eq!(
+            read.as_deref(),
+            Some(&first[..]),
+            "key {byte} answered past the cue"
+        );
+        let live = store.get(&record(7, byte)).expect("get");
+        assert_eq!(
+            live.as_deref(),
+            Some(&second[..]),
+            "key {byte} lost its rewrite"
+        );
+    }
+}
+
+// a retire keeps the spot index's entries in rebuilt segments, which have no incarnation yet
+#[test]
+fn spot_keeps_rebuilt_segments_through_a_retire() {
+    let paged = ReelConfig {
+        compact_mbps: CompactRate::Mbps(64),
+        ..config(1, SyncPolicy::Never)
+    };
+    let (store, sim) = sim_store(paged.clone());
+    let payload = vec![0xa5u8; 8 * 1024];
+    for byte in 0..200u8 {
+        store.put(&record(7, byte), &payload).expect("put");
+    }
+    // The first segment's keys are written again, so a pass can retire it whole
+    for byte in 0..120u8 {
+        store.put(&record(7, byte), &payload).expect("overwrite");
+    }
+    // Taken before a close, which would retire the dead segments itself
+    store.flush().expect("flush");
+    let image = sim.durable_image();
+    drop(store);
+
+    let restored = SimIo::from_image(image);
+    let reopened = ReelStore::open_with_io(PathBuf::from(ROOT), paged, COLUMNS, Arc::new(restored))
+        .expect("reopen");
+    assert!(
+        reopened.index.spot_held() > 0,
+        "the open loaded the spot index"
+    );
+    for _ in 0..4 {
+        reopened.compact_once().expect("compact");
+        reopened.maintain_once().expect("maintain");
+    }
+    let compaction = reopened.compaction_counters();
+    assert!(
+        compaction.segments_rewritten + compaction.segments_unlinked_whole > 0,
+        "nothing retired, so the sweep never ran"
+    );
+    for byte in 0..200u8 {
+        assert!(
+            reopened.get(&record(7, byte)).expect("get").is_some(),
+            "key {byte} went missing"
+        );
+    }
+}
+
+// a spot index column takes a range delete and a prefix count
+#[test]
+fn spot_takes_ranges_and_prefix_counts() {
+    let paged = config(1, SyncPolicy::Never);
+    let (store, sim) = sim_store(paged.clone());
+    let payload = vec![0x5au8; 8 * 1024];
+    for byte in 0..200u8 {
+        store.put(&record(7, byte), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+    assert!(
+        store.index.spot_held() > 0,
+        "the handover filled the spot index"
+    );
+
+    let dropped = 50..150u8;
+    store
+        .delete_range(
+            &record(7, dropped.start),
+            Some(record(7, dropped.end).as_slice()),
+        )
+        .expect("delete range");
+    let check = |store: &ReelStore, stage: &str| {
+        for byte in 0..200u8 {
+            let found = store.get(&record(7, byte)).expect("get");
+            assert_eq!(
+                found.is_some(),
+                !dropped.contains(&byte),
+                "key {byte} after {stage}"
+            );
+        }
+        let counted =
+            reel_core::Store::count_prefix(store, "record", &7u16.to_be_bytes()).expect("count");
+        assert_eq!(counted, 100, "the prefix count after {stage}");
+    };
+    check(&store, "the range delete");
+    for _ in 0..4 {
+        store.maintain_once().expect("maintain");
+    }
+    check(&store, "the cover sweep");
+
+    store.close().expect("close");
+    drop(store);
+    let restored = SimIo::from_image(sim.durable_image());
+    let reopened = ReelStore::open_with_io(PathBuf::from(ROOT), paged, COLUMNS, Arc::new(restored))
+        .expect("reopen");
+    check(&reopened, "a reopen");
+}
+
+// a sealed segment's ceiling covers its tombstone rows as well as its records
+#[test]
+fn a_ceiling_covers_a_tombstone() {
+    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
 
     let payload = vec![0xa5u8; 8 * 1024];
     for byte in 0..8u8 {
@@ -299,7 +624,6 @@ fn a_ceiling_covers_a_tombstone() {
 #[test]
 fn a_handover_never_names_a_retired_segment() {
     let (store, _sim) = sim_store(ReelConfig {
-        index: IndexResidency::Paged,
         compact_mbps: CompactRate::Mbps(64),
         ..config(1, SyncPolicy::Never)
     });
@@ -310,8 +634,7 @@ fn a_handover_never_names_a_retired_segment() {
     let retired = store.reel.tails()[0].seal().expect("seal");
     store.flush().expect("flush");
 
-    // Named and queued, which is the state the retire raced: the segment is
-    // in the search, and its number is still sitting on the handover queue.
+    // Noted and queued: the segment is in the search and still on the handover queue
     store.hold_sealed().expect("name the sealed segment");
 
     // Everything it holds is written again, so the pass takes it whole.
@@ -347,7 +670,6 @@ fn a_handover_never_names_a_retired_segment() {
 #[test]
 fn a_pass_leaves_an_unnamed_segment_alone() {
     let (store, _sim) = sim_store(ReelConfig {
-        index: IndexResidency::Paged,
         compact_mbps: CompactRate::Mbps(64),
         ..config(1, SyncPolicy::Never)
     });
@@ -361,8 +683,7 @@ fn a_pass_leaves_an_unnamed_segment_alone() {
     }
     store.flush().expect("flush");
 
-    // Wholly dead by the counters and named by nothing. The selection is asked
-    // directly, since a whole pass would settle the queue before it picked.
+    // Ask the selection directly, since a whole pass would settle the queue first
     let picked = store
         .compactor
         .select_whole_dead(&store.reel, &store.index, None);
@@ -405,11 +726,10 @@ fn a_second_caller_cannot_take_a_held_segment() {
         let store = Arc::clone(&store);
         std::thread::spawn(move || store.hold_sealed())
     };
-    // The footer is read and the spans are not down.
+    // The footer is in hand and the spans are not down
     script.await_reached("seal/spans", 1);
 
-    // The second caller, which is what a read behind a fresh seal is. It must
-    // come away with nothing rather than with the segment somebody is holding.
+    // A second caller, like a read behind a fresh seal, must leave the held segment alone
     store.hold_sealed().expect("second caller");
     assert!(
         store.reel.shared().pending_seals().contains(&sealed),
@@ -445,13 +765,10 @@ fn a_second_caller_cannot_take_a_held_segment() {
     }
 }
 
-// one unreadable footer costs its own segment and none of the batch behind it
+// noting and handing over a sealed segment reads nothing back from the device
 #[test]
-fn an_unreadable_footer_does_not_lose_the_batch() {
-    let (store, sim) = sim_store(ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    });
+fn naming_a_seal_reads_no_footer() {
+    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
     let payload = vec![0xa5u8; 8 * 1024];
     for byte in 0..8u8 {
         store.put(&record(7, byte), &payload).expect("put");
@@ -462,103 +779,66 @@ fn an_unreadable_footer_does_not_lose_the_batch() {
     }
     let second = store.reel.tails()[0].seal().expect("seal");
     store.flush().expect("flush");
-
-    // The seal left both footers held, and this is about one that has to be read back.
+    // Forget both footers, as a cache too small to keep them would
     store.reel.shared().footers.forget(first);
     store.reel.shared().footers.forget(second);
 
-    // Wide enough for the length and the two reads one footer costs, narrow
-    // enough that the segment behind it is read from a working device.
-    sim.arm_next_ops(3, FaultKind::ReadError);
-    let outcome = store.hold_sealed();
+    // Every read fails, so reading a footer back would fail the pass or drop a candidate
+    sim.arm_next_ops(64, FaultKind::ReadError);
+    let outcome = store.page_out_sealed();
     sim.disarm();
-    assert!(
-        outcome.is_ok(),
-        "one unreadable footer failed the whole pass: {outcome:?}"
-    );
+    assert!(outcome.is_ok(), "noting the seals failed: {outcome:?}");
     let (fired, _) = sim.fault_reach();
-    assert!(
-        fired > 0,
-        "the armed read error never landed, so nothing was tested"
-    );
+    assert_eq!(fired, 0, "noting the seals read the device");
 
+    for (byte, segment) in [(0u8, first), (8u8, second)] {
+        assert!(
+            store
+                .index
+                .sites(&record(7, byte))
+                .expect("sites")
+                .candidates
+                .contains(&segment),
+            "{segment:?} went unnamed"
+        );
+    }
     assert!(
-        store
-            .index
-            .sites(&record(7, 8))
-            .expect("sites")
-            .candidates
-            .contains(&second),
-        "the segment behind the failure went unnamed: {second:?}"
-    );
-    assert!(
-        !store
-            .index
-            .sites(&record(7, 0))
-            .expect("sites")
-            .candidates
-            .contains(&first),
-        "the failed read named {first:?} anyway, so nothing was tested"
-    );
-    assert!(
-        store.reel.shared().pending_seals().contains(&first),
-        "the segment whose footer would not read was dropped rather than kept"
-    );
-
-    store.hold_sealed().expect("name what the fault held back");
-    assert!(
-        store
-            .index
-            .sites(&record(7, 0))
-            .expect("sites")
-            .candidates
-            .contains(&first),
-        "the retry never named {first:?}"
+        store.reel.shared().pending_seals().is_empty(),
+        "a seal stayed owed"
     );
 }
 
-// a paged reopen leaves its sealed keys in the footers instead of installing them
+// a reopen installs none of its sealed keys in the map
 #[test]
-fn a_paged_open_never_installs_its_sealed_keys() {
+fn an_open_never_installs_its_sealed_keys() {
     let (store, sim) = sim_store(config(1, SyncPolicy::Never));
     let payload = vec![0xa5u8; 8 * 1024];
     for byte in 0..200u8 {
         store.put(&record(7, byte), &payload).expect("put");
     }
     store.flush().expect("flush");
+    let written = store.totals();
     let image = sim.durable_image();
     drop(store);
 
-    let resident = reopen_image(image.clone(), config(1, SyncPolicy::Never));
-    let paged = reopen_image(
-        image,
-        ReelConfig {
-            index: IndexResidency::Paged,
-            ..config(1, SyncPolicy::Never)
-        },
-    );
+    let reopened = reopen_image(image, config(1, SyncPolicy::Never));
 
     // Nothing was queued to hand over, because nothing was installed to evict.
-    assert_eq!(paged.page_out_sealed().expect("page out"), 0);
+    assert_eq!(reopened.page_out_sealed().expect("page out"), 0);
     assert!(
-        paged.resident_bytes() < resident.resident_bytes(),
-        "the paged open held as much as the resident one: {:?} against {:?}",
-        paged.resident_bytes(),
-        resident.resident_bytes()
+        (0..200u8).any(|byte| is_paged(&reopened, &record(7, byte))),
+        "the open installed every sealed key"
     );
 
     // And it answers every key regardless, from the footers it swept.
     for byte in 0..200u8 {
-        let key = record(7, byte);
         assert_eq!(
-            paged.get(&key).expect("read"),
-            resident.get(&key).expect("read"),
-            "the two opens disagree about {byte}"
+            reopened.get(&record(7, byte)).expect("read"),
+            Some(Value::new(payload.clone())),
+            "the reopen lost {byte}"
         );
     }
-    // What it does not carry over is the count: how many sealed records a newer
-    // version shadows is the join a paged open does not do.
-    assert!(paged.totals().count < resident.totals().count);
+    assert_eq!(reopened.totals(), written, "the reopen counts apart");
 }
 
 // a failed seal parks the segment and the tick's retry finishes it
@@ -569,12 +849,11 @@ fn a_failed_seal_is_retried_on_the_tick() {
     for byte in 0..64u8 {
         store.put(&record(7, byte), &payload).expect("put");
     }
-    // Nothing flushed: the records are acknowledged and cached, which is
-    // what makes a failed seal cost a past-saving count.
+    // Nothing is flushed, so the records are only cached and a failed seal counts past saving
 
     // Every sync the seal takes fails, so the footer cannot be answered for.
     let sealing = store.reel.tails()[0].tail().active_segment();
-    sim.arm_next_ops(8, FaultKind::SyncError);
+    sim.arm_next_ops(16, FaultKind::SyncError);
     store.reel.tails()[0]
         .seal()
         .expect_err("a seal whose syncs fail reported sealed");
@@ -599,21 +878,57 @@ fn a_failed_seal_is_retried_on_the_tick() {
         .flush()
         .expect("a volume with every seal down flushes clean");
 
-    // And the segment is a real sealed segment: a paged reopen resolves its
-    // keys through the footer the retry wrote.
+    // A paged reopen resolves the segment's keys through the footer the retry wrote
     let image = sim.durable_image();
     drop(store);
-    let paged = reopen_image(
-        image,
-        ReelConfig {
-            index: IndexResidency::Paged,
-            ..config(1, SyncPolicy::Never)
-        },
-    );
+    let paged = reopen_image(image, config(1, SyncPolicy::Never));
     assert!(paged.get(&record(7, 5)).expect("get").is_some());
 }
 
-// a walked tail's overwrites reach the sealed split at open, not at the scrub
+// a segment left without a footer by a failed sync is never picked as wholly dead
+#[test]
+fn a_footerless_segment_is_not_offered_to_compaction() {
+    let (store, sim) = sim_store(config(1, EVERY_WRITE));
+    let payload = vec![0xa5u8; 8 * 1024];
+    for byte in 0..16u8 {
+        store.put(&record(7, byte), &payload).expect("put");
+    }
+    let doomed = store.reel.tails()[0].tail().active_segment();
+    sim.arm_next_ops(8, FaultKind::SyncError);
+    store
+        .put(&record(7, 99), &payload)
+        .expect_err("a put whose sync failed returned");
+    sim.disarm();
+    for byte in 0..16u8 {
+        store.put(&record(7, byte), &payload).expect("overwrite");
+    }
+    assert!(
+        !store.reel.shared().is_held(doomed) && !store.reel.shared().is_settled(doomed),
+        "the doomed segment is still a tail's"
+    );
+
+    let offered = store
+        .compactor
+        .select_whole_dead(&store.reel, &store.index, None)
+        .map(|(segment, _)| segment);
+    store.compactor.release_spare();
+    assert_ne!(
+        offered,
+        Some(doomed),
+        "the footerless segment was offered whole dead"
+    );
+    let (done, finished) = std::sync::mpsc::channel();
+    let store = Arc::new(store);
+    let compacting = Arc::clone(&store);
+    std::thread::spawn(move || done.send(compacting.compact_once().is_ok()));
+    assert_eq!(
+        finished.recv_timeout(Duration::from_secs(10)),
+        Ok(true),
+        "a pass with a footerless segment standing never came back"
+    );
+}
+
+// a walked tail's overwrites reach the sealed split at open, before any scrub
 #[test]
 fn a_walked_tail_settles_the_sealed_split() {
     let settings = config(1, SyncPolicy::Never);
@@ -630,8 +945,7 @@ fn a_walked_tail_settles_the_sealed_split() {
         "nothing sealed, so there is no tally to settle"
     );
 
-    // Rewrite a few of the sealed keys. These land in the open tail, after
-    // every seal, which is the shadowing no tally can carry.
+    // Rewrites land in the open tail after every seal, which no tally can account for
     for byte in 0..20u8 {
         store.put(&record(7, byte), &payload).expect("rewrite");
     }
@@ -647,13 +961,7 @@ fn a_walked_tail_settles_the_sealed_split() {
     let image = sim.durable_image();
     drop(store);
 
-    let paged = reopen_image(
-        image,
-        ReelConfig {
-            index: IndexResidency::Paged,
-            ..settings
-        },
-    );
+    let paged = reopen_image(image, settings);
     let dead_at_open: u64 = paged
         .index
         .segments_snapshot()
@@ -666,7 +974,7 @@ fn a_walked_tail_settles_the_sealed_split() {
     );
 }
 
-// the tally carries the split through a paged open, and the scrub finishes it
+// the tally keeps the split through a paged open, and the scrub finishes it
 #[test]
 fn a_paged_open_recovers_its_split_from_the_tally() {
     let settings = ReelConfig {
@@ -695,13 +1003,7 @@ fn a_paged_open_recovers_its_split_from_the_tally() {
     let image = sim.durable_image();
     drop(store);
 
-    let paged = reopen_image(
-        image,
-        ReelConfig {
-            index: IndexResidency::Paged,
-            ..settings
-        },
-    );
+    let paged = reopen_image(image, settings);
     let dead_at_open: u64 = paged
         .index
         .segments_snapshot()
@@ -717,8 +1019,7 @@ fn a_paged_open_recovers_its_split_from_the_tally() {
         "the tally claimed {dead_at_open} dead against the {dead_when_written} actually booked"
     );
 
-    // Sweep the volume. The scrub earns its budget from the clock, so a pass
-    // taken the instant a volume opens has almost nothing to spend.
+    // The scrub earns its budget from the clock, so sleep between passes
     for _ in 0..64 {
         std::thread::sleep(Duration::from_millis(20));
         paged.scrub_once().expect("scrub");
@@ -743,13 +1044,11 @@ fn a_paged_open_recovers_its_split_from_the_tally() {
     );
 }
 
-// a paged read reaches its key through blocks rather than the whole footer
+// a paged read reaches its key through blocks, skipping the whole footer
 #[test]
 fn a_paged_read_reads_blocks_not_footers() {
     let paged = ReelConfig {
-        index: IndexResidency::Paged,
-        // Small segments against small records, so each footer holds thousands
-        // of rows and a block is a fraction of one.
+        // Small segments and small records, so each footer holds thousands of rows
         segment_bytes: ByteCount::from_bytes(256 * 1024),
         ..config(1, SyncPolicy::Never)
     };
@@ -776,8 +1075,7 @@ fn a_paged_read_reads_blocks_not_footers() {
         .collect();
     assert!(!handed.is_empty(), "some keys went to their footer");
 
-    // What one pass of the footers weighs, which is what answering a single key
-    // costs without the blocks.
+    // One pass of the footers, the cost of answering a key without the blocks
     let footers: usize = store
         .index
         .segments_snapshot()
@@ -793,8 +1091,7 @@ fn a_paged_read_reads_blocks_not_footers() {
         .sum();
     assert!(footers > 0, "the sealed segments carry footers");
 
-    // Resolving a key rather than reading it, so what this counts is the index
-    // and not the record behind it. The cache starts empty either way.
+    // Resolve keys without reading records, so this counts only the index, from an empty cache
     store.reel.shared().footers.clear();
     let before = sim.read_bytes();
     for key in handed.iter().take(16) {
@@ -802,8 +1099,7 @@ fn a_paged_read_reads_blocks_not_footers() {
     }
     let through_blocks = sim.read_bytes() - before;
 
-    // A quarter, not merely less: parsing whole footers also comes in under one
-    // pass once the cache holds them, so a bound of one pass would pin nothing.
+    // Bound at a quarter, since cached whole footers also come in under one pass
     assert!(
         through_blocks * 4 < footers as u64,
         "16 resolves through blocks cost {through_blocks} bytes against {footers} for one pass of the footers"
@@ -813,11 +1109,9 @@ fn a_paged_read_reads_blocks_not_footers() {
 // the footers, the directories and the blocks answer for one bound between them
 #[test]
 fn footer_pools_share_one_bound() {
-    // A bound every pool has more than enough sealed state to fill on its own, so
-    // pools each held to the whole of it would keep a multiple of what was asked for.
+    // Each pool alone could fill this bound, so separate bounds would hold a multiple of it
     let knob = ByteCount::from_bytes(24 * 1024);
     let paged = ReelConfig {
-        index: IndexResidency::Paged,
         footer_cache: knob,
         ..config(1, SyncPolicy::Never)
     };
@@ -843,11 +1137,11 @@ fn footer_pools_share_one_bound() {
         .collect();
     assert!(!handed.is_empty(), "some keys went to their footer");
 
-    // Cleared first, since a resolve that finds a footer the handover parsed never
-    // reaches for a block. The resolves fill two pools and the pass after them the third.
+    // Clear the cache and resolve at a snapshot, so no parsed footer or spot index skips the blocks
     store.reel.shared().footers.clear();
     for key in &handed {
-        assert!(store.contains(key).expect("resolve"), "a key went missing");
+        let found = store.index.get_at(key, Lsn(u64::MAX)).expect("resolve");
+        assert!(found.is_some(), "a key went missing");
     }
     for (segment, _) in store.index.segments_snapshot() {
         let _ = store.reel.shared().footer_of(segment).expect("footer");
@@ -869,10 +1163,7 @@ fn footer_pools_share_one_bound() {
 // a key no sealed segment holds is answered without asking any of them
 #[test]
 fn a_fresh_key_skips_the_sealed_search() {
-    let paged = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let paged = config(1, SyncPolicy::Never);
     let sim = SimIo::new(FaultPlan::new(1));
     let store = ReelStore::open_with_io(
         PathBuf::from(ROOT),
@@ -895,38 +1186,37 @@ fn a_fresh_key_skips_the_sealed_search() {
         .find(|key| is_paged(&store, key));
     let sealed = sealed.expect("a key went to its footer");
 
-    // A key never written: ruled out by the filter, no candidate asked.
-    let before = store.index.sealed_skips();
+    // A key never written: the spot index holds nothing for it, so no footer is asked
+    let before = store.filter_probes();
     assert!(store.get(&record(9, 250)).expect("get").is_none());
-    assert!(
-        store.index.sealed_skips() > before,
+    assert_eq!(
+        store.filter_probes(),
+        before,
         "the fresh key searched segments"
     );
-    // A sealed key still resolves through the fan-out the filter guards.
     assert!(store.get(&sealed).expect("get").is_some());
 
     store.close().expect("close");
     drop(store);
 
-    // The paged rebuild feeds the filter from the footer sweep, so the same
-    // pair of answers holds on the reopened volume.
+    // The paged open loads the spot index from the footers, so the reopened volume answers the same
     let restored = SimIo::from_image(sim.durable_image());
     let reopened = ReelStore::open_with_io(PathBuf::from(ROOT), paged, COLUMNS, Arc::new(restored))
         .expect("reopen");
-    let before = reopened.index.sealed_skips();
+    let before = reopened.filter_probes();
     assert!(reopened.get(&record(9, 250)).expect("get").is_none());
-    assert!(
-        reopened.index.sealed_skips() > before,
-        "the rebuild fed no filter"
+    assert_eq!(
+        reopened.filter_probes(),
+        before,
+        "the reopened fresh key searched segments"
     );
     assert!(reopened.get(&sealed).expect("get").is_some());
 }
 
-// the same resolve on a packed partition reads restart cuts, not the partition
+// the same resolve on a packed partition reads only its restart cuts
 #[test]
 fn a_paged_read_of_packed_rows_reads_cuts() {
     let paged = ReelConfig {
-        index: IndexResidency::Paged,
         segment_bytes: ByteCount::from_bytes(256 * 1024),
         ..config(1, SyncPolicy::Never)
     };
@@ -961,8 +1251,7 @@ fn a_paged_read_of_packed_rows_reads_cuts() {
         .collect();
     assert!(!handed.is_empty(), "some keys went to their footer");
 
-    // What the partitions weigh on disk, which is what answering one key costs
-    // without the cuts.
+    // The packed partitions' size on disk, the cost of answering a key without the cuts
     let packed: u64 = store
         .index
         .segments_snapshot()
@@ -992,12 +1281,12 @@ fn a_paged_read_of_packed_rows_reads_cuts() {
     );
 }
 
-// compaction leaves what it rewrote sorted on disk, not in the order it found it
+// compaction writes what it rewrote in key order on disk
 #[test]
 fn compaction_leaves_its_output_in_key_order() {
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
 
-    // Written in an order that is not key order, which is the case that matters.
+    // Write out of key order, which is the case that matters
     let payload = vec![0xa5u8; 8 * 1024];
     let mut wrote: Vec<u8> = (0..120u8).collect();
     wrote.rotate_left(37);
@@ -1011,8 +1300,7 @@ fn compaction_leaves_its_output_in_key_order() {
     store.reel.tails()[0].seal().expect("seal");
     store.flush().expect("flush");
 
-    // Which segments existed before the pass, so the check below looks only at
-    // what compaction wrote.
+    // Note the segments before the pass, so the check below sees only compaction's output
     let existing: std::collections::HashSet<SegmentId> = store
         .index
         .segments_snapshot()
@@ -1032,8 +1320,7 @@ fn compaction_leaves_its_output_in_key_order() {
         "nothing was rewritten, so this proves nothing"
     );
 
-    // Where every surviving key now sits, grouped by the segment holding it,
-    // since an offset only means anything inside its own file.
+    // Group every surviving key's offset by segment, since offsets compare only within a file
     let mut placed: std::collections::HashMap<SegmentId, Vec<(u8, u32)>> =
         std::collections::HashMap::new();
     for byte in 0..120u8 {
@@ -1070,18 +1357,14 @@ fn compaction_leaves_its_output_in_key_order() {
 // paging a key out is not deleting it, so the totals do not move
 #[test]
 fn paging_out_keeps_the_count() {
-    let paged = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let paged = config(1, SyncPolicy::Never);
     let (store, _sim) = sim_store(paged);
 
     let payload = vec![0x5au8; 8 * 1024];
     for byte in 0..200u8 {
         store.put(&record(7, byte), &payload).expect("put");
     }
-    // A roll hands its segment to the sealer thread and returns, so without this
-    // there is nothing sealed to page out yet.
+    // The flush drains the sealer thread, so there is something sealed to page out
     store.flush().expect("flush");
     let before = store.totals();
 
@@ -1091,20 +1374,13 @@ fn paging_out_keeps_the_count() {
 }
 
 /// A paged volume holding one filled group, and one key it has handed over
-///
-/// The segment is a megabyte against 8 KiB records, so the tail rolls partway
-/// through and the keys of what it sealed go to their footer.
 fn paged_fixture(payload: &[u8]) -> (ReelStore, RecordKey) {
-    let paged = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let paged = config(1, SyncPolicy::Never);
     let (store, _sim) = sim_store(paged);
     for byte in 0..200u8 {
         store.put(&record(7, byte), payload).expect("put");
     }
-    // The roll seals on the sealer thread, so a handover asked for the instant
-    // the last put returns can find nothing sealed yet.
+    // The roll seals on the sealer thread, so flush before asking for the handover
     store.flush().expect("flush");
     assert!(store.page_out_sealed().expect("page out") > 0);
 
@@ -1181,7 +1457,7 @@ fn a_paged_delete_settles_its_record() {
     assert_eq!(played(&store, RECORD).len(), 199, "the playback agrees");
 }
 
-// overwriting a key a footer answers for is one key, not two
+// overwriting a key a footer answers for leaves one key
 #[test]
 fn a_paged_overwrite_replaces_rather_than_adds() {
     let payload = vec![0xa5u8; 8 * 1024];
@@ -1221,9 +1497,46 @@ fn a_paged_grave_outlives_the_window() {
     assert_eq!(store.totals().count, 199);
 }
 
-// an idle tick prunes a grave to the counter, not to the window
+// a deleted key stays gone once its grave is pruned, though its old version still stands displaced
 #[test]
-fn an_idle_tick_prunes_graves_to_the_counter() {
+fn a_deleted_key_stays_gone_once_its_grave_is_pruned() {
+    let payload = vec![0xa5u8; 8 * 1024];
+    let (store, handed) = paged_fixture(&payload);
+    store.delete(&handed).expect("delete");
+    // Enough to roll the tail, so the tombstone's segment seals and its grave may go
+    for byte in 0..200u8 {
+        store.put(&record(8, byte), &payload).expect("put");
+    }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
+    store.index.prune_tombstones(Lsn(u64::MAX));
+    assert_eq!(
+        store.index.grave_count(),
+        0,
+        "the grave stood, so this tested nothing"
+    );
+
+    assert!(
+        store.get(&handed).expect("read").is_none(),
+        "a get brought the key back"
+    );
+    assert!(
+        block_on(store.get_wait(&handed)).expect("read").is_none(),
+        "an awaited get brought the key back"
+    );
+    let many = store
+        .get_many(&[handed.clone(), record(8, 1)])
+        .expect("many");
+    assert!(many[0].is_none(), "a batch brought the key back");
+    assert!(
+        store.get_range(&handed, 0, 64).expect("range").is_none(),
+        "a range brought the key back"
+    );
+}
+
+// a tick keeps a grave the window still covers, though nothing is in flight
+#[test]
+fn a_tick_keeps_a_grave_inside_the_window() {
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
     store.put(&blob(1), &[7u8; 64]).expect("put");
     store.delete(&blob(1)).expect("delete");
@@ -1231,18 +1544,15 @@ fn an_idle_tick_prunes_graves_to_the_counter() {
 
     let pruned = store.prune_tombstones();
 
-    assert_eq!(
-        pruned, 1,
-        "nothing was in flight, so the grave went at once"
-    );
-    assert_eq!(store.index.grave_count(), 0);
+    assert_eq!(pruned, 0, "the grave went before the window passed it");
+    assert_eq!(store.index.grave_count(), 1);
     assert!(
         store.get(&blob(1)).expect("read").is_none(),
-        "the delete still holds without its grave"
+        "the delete still holds"
     );
 }
 
-// ingest heat is a rate over the ask interval, not a point sample
+// ingest heat is a rate over the ask interval
 #[test]
 fn ingest_heat_is_a_rate_not_a_point_sample() {
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
@@ -1274,8 +1584,7 @@ fn paged_image(payload: &[u8], settings: ReelConfig) -> (ReelStore, SimIo, Recor
     for byte in 0..200u8 {
         store.put(&record(7, byte), payload).expect("put");
     }
-    // The roll seals on the sealer thread, so a handover asked for the instant
-    // the last put returns can find nothing sealed yet.
+    // The roll seals on the sealer thread, so flush before asking for the handover
     store.flush().expect("flush");
     assert!(store.page_out_sealed().expect("page out") > 0);
     let handed = (0..200u8)
@@ -1288,10 +1597,7 @@ fn paged_image(payload: &[u8], settings: ReelConfig) -> (ReelStore, SimIo, Recor
 // a delete stays done through a paged reopen
 #[test]
 fn a_delete_survives_a_paged_reopen() {
-    let settings = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let settings = config(1, SyncPolicy::Never);
     let payload = vec![0xa5u8; 8 * 1024];
     let (store, sim, handed) = paged_image(&payload, settings.clone());
 
@@ -1320,10 +1626,7 @@ fn a_delete_survives_a_paged_reopen() {
 // a range delete stays done through a paged reopen
 #[test]
 fn a_range_delete_survives_a_paged_reopen() {
-    let settings = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let settings = config(1, SyncPolicy::Never);
     let payload = vec![0xa5u8; 8 * 1024];
     let (store, sim, handed) = paged_image(&payload, settings.clone());
 
@@ -1354,10 +1657,7 @@ fn a_range_delete_survives_a_paged_reopen() {
 // a group drop is one push, and its records settle at the sweep
 #[test]
 fn a_dropped_group_settles_at_the_sweep() {
-    let settings = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let settings = config(1, SyncPolicy::Never);
     let payload = vec![0xa5u8; 8 * 1024];
     let (store, _sim, handed) = paged_image(&payload, settings);
     let before = store.totals();
@@ -1391,10 +1691,7 @@ fn a_dropped_group_settles_at_the_sweep() {
 // two drops over one range settle each record exactly once
 #[test]
 fn overlapping_drops_settle_once() {
-    let settings = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let settings = config(1, SyncPolicy::Never);
     let payload = vec![0xa5u8; 8 * 1024];
     let (store, _sim, _handed) = paged_image(&payload, settings);
 
@@ -1449,10 +1746,7 @@ fn compaction_carries_a_paged_key() {
 // compaction after a paged reopen keeps the footer's keys readable
 #[test]
 fn compaction_carries_a_key_through_a_paged_reopen() {
-    let settings = ReelConfig {
-        index: IndexResidency::Paged,
-        ..config(1, SyncPolicy::Never)
-    };
+    let settings = config(1, SyncPolicy::Never);
     let payload = vec![0xa5u8; 8 * 1024];
     let (store, sim, handed) = paged_image(&payload, settings.clone());
     store.flush().expect("flush");
@@ -1536,6 +1830,317 @@ fn cue_outlives_a_delete() {
     );
 }
 
+// a cue read past a later delete still finds its version once the window passes the delete's grave
+#[test]
+fn cue_outlives_a_pruned_delete() {
+    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
+    let key = record(7, 1);
+    // Three versions handed over, so the delete reads and takes every spot index slot of the key
+    for version in 1..=3u8 {
+        store.put(&key, &[version; 64]).expect("put");
+        drop(store.cue().expect("seal"));
+        store.page_out_sealed().expect("hand over");
+    }
+    let cue = store.cue().expect("cue");
+    store.delete(&key).expect("delete");
+    drop(store.cue().expect("seal"));
+    store.page_out_sealed().expect("hand over");
+    // As far as the prune can tell, a window of writes has passed the delete
+    store.reel.shared().lsn.recover_to(Lsn(2 * GRAVE_WINDOW));
+
+    store.prune_tombstones();
+
+    assert_eq!(
+        store.get_at(&key, &cue).expect("read at cue"),
+        Some(Value::new(vec![3u8; 64])),
+        "the prune took the version the cue reads",
+    );
+    drop(cue);
+    assert_eq!(
+        store.prune_tombstones(),
+        1,
+        "the grave never became prunable, so this tested nothing"
+    );
+    assert!(store.get(&key).expect("read").is_none());
+}
+
+/// Park one write at its landed point, delete its key, and push the counter past the window
+fn park_past_the_window(point: &'static str, write: fn(&ReelStore, &RecordKey) -> Result<()>) {
+    let script = crate::sync::rendezvous::script();
+    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
+    let store = Arc::new(store);
+    let key = record(7, 1);
+    store.put(&key, &[1u8; 64]).expect("first version");
+
+    script.hold(point);
+    let parked = {
+        let (store, key) = (Arc::clone(&store), key.clone());
+        script.cast(move || write(&store, &key))
+    };
+    script.await_reached(point, 1);
+
+    // Drawn after the parked write and published ahead of it, so only the floor keeps the grave
+    store.delete(&key).expect("delete");
+    drop(store.cue().expect("seal"));
+    store.page_out_sealed().expect("hand over");
+    let past = store.reel.shared().lsn.peek().as_u64() + 4 * GRAVE_WINDOW;
+    store.reel.shared().lsn.recover_to(Lsn(past));
+    for _ in 0..3 {
+        store.prune_tombstones();
+    }
+    assert_eq!(
+        store.index.grave_count(),
+        1,
+        "the grave went while a write drawn before it was still out"
+    );
+
+    script.release(point);
+    parked.join().expect("parked thread").expect("parked write");
+    assert!(
+        store.get(&key).expect("read").is_none(),
+        "the parked write brought the deleted key back"
+    );
+    assert_eq!(
+        store.prune_tombstones(),
+        1,
+        "the grave stayed once nothing drawn before it was out"
+    );
+    assert!(store.get(&key).expect("read").is_none());
+}
+
+// a put drawn before a delete and parked past the window still loses to the delete
+#[test]
+fn a_put_parked_past_the_window_loses_to_the_delete() {
+    park_past_the_window("put/landed", |store, key| store.put(key, &[2u8; 64]));
+}
+
+// a batch drawn before a delete and parked past the window still loses to the delete
+#[test]
+fn a_batch_parked_past_the_window_loses_to_the_delete() {
+    park_past_the_window("batch/landed", |store, key| {
+        store.apply_batch(vec![RecordWrite::Put {
+            key: key.clone(),
+            payload: vec![2u8; 64],
+        }])
+    });
+}
+
+// a batch whose shadow lookup fails reports it and leaves the newer sealed version standing
+#[test]
+fn a_batch_with_a_failed_shadow_lookup_keeps_the_newer_version() {
+    let script = crate::sync::rendezvous::script();
+    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
+    let store = Arc::new(store);
+    let key = record(7, 1);
+    let other = record(7, 2);
+    store.put(&key, &[1u8; 64]).expect("first version");
+
+    script.hold("batch/landed");
+    let parked = {
+        let (store, key, other) = (Arc::clone(&store), key.clone(), other.clone());
+        script.cast(move || {
+            store.apply_batch(vec![
+                RecordWrite::Put {
+                    key,
+                    payload: vec![2u8; 64],
+                },
+                RecordWrite::Put {
+                    key: other,
+                    payload: vec![2u8; 64],
+                },
+            ])
+        })
+    };
+    script.await_reached("batch/landed", 1);
+
+    // Drawn after the parked batch, sealed and handed to the spot index ahead of it
+    store.put(&key, &[3u8; 64]).expect("newer version");
+    drop(store.cue().expect("seal"));
+    store.page_out_sealed().expect("hand over");
+    assert!(
+        store
+            .index
+            .column(key.column)
+            .expect("column")
+            .get(key.as_slice())
+            .is_none(),
+        "the newer version never left the map, so this tested nothing"
+    );
+
+    // With no footer held, the batch's lookup reads one from the device and fails
+    store.reel.shared().footers.clear();
+    sim.arm_next_ops(64, FaultKind::ReadError);
+    script.release("batch/landed");
+    let published = parked.join().expect("parked thread");
+    sim.disarm();
+
+    assert!(published.is_err(), "the batch hid its failed lookup");
+    assert_eq!(
+        store.get(&key).expect("read"),
+        Some(Value::new(vec![3u8; 64])),
+        "the batch put its older version over the sealed newer one",
+    );
+    assert!(
+        store.get(&other).expect("read").is_none(),
+        "half of the failed batch published"
+    );
+}
+
+// a read during the hand-over of an older version never finds the key a delete took
+#[test]
+fn a_handover_never_shows_a_deleted_version() {
+    let script = crate::sync::rendezvous::script();
+    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
+    let store = Arc::new(store);
+    let key = record(7, 1);
+    store.put(&key, &[1u8; 64]).expect("put");
+    store.reel.tails()[0].seal().expect("seal the put");
+    store.delete(&key).expect("delete");
+    store.reel.tails()[0].seal().expect("seal the delete");
+    // Both segments noted and queued, neither handed over yet
+    store.hold_sealed().expect("note the seals");
+    let past = store.reel.shared().lsn.peek().as_u64() + 2 * GRAVE_WINDOW;
+    store.reel.shared().lsn.recover_to(Lsn(past));
+    store.prune_tombstones();
+
+    script.hold("paged/handover-spot");
+    let handing = {
+        let store = Arc::clone(&store);
+        script.cast(move || store.page_out_sealed())
+    };
+    script.await_reached("paged/handover-spot", 1);
+    let seen = store.get(&key).expect("read mid hand-over");
+    script.release("paged/handover-spot");
+    handing
+        .join()
+        .expect("hand-over thread")
+        .expect("hand over");
+
+    assert!(
+        seen.is_none(),
+        "a read during the hand-over found the deleted version"
+    );
+    assert!(store.get(&key).expect("read").is_none());
+    store.prune_tombstones();
+    assert_eq!(store.index.grave_count(), 0, "the grave never went");
+}
+
+// a delete that lands mid hand-over keeps its grave until the hand-over is done with the key
+#[test]
+fn a_prune_waits_out_a_handover() {
+    let script = crate::sync::rendezvous::script();
+    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
+    let store = Arc::new(store);
+    let key = record(7, 1);
+    store.put(&key, &[1u8; 64]).expect("put");
+    store.reel.tails()[0].seal().expect("seal the put");
+    store.hold_sealed().expect("note the put's segment");
+
+    // The hand-over finds the key live, gives it to the spot index, and stands there
+    script.hold("paged/handover-spot");
+    let handing = {
+        let store = Arc::clone(&store);
+        script.cast(move || store.page_out_sealed())
+    };
+    script.await_reached("paged/handover-spot", 1);
+
+    store.delete(&key).expect("delete");
+    store.reel.tails()[0].seal().expect("seal the delete");
+    store.hold_sealed().expect("note the delete's segment");
+    let past = store.reel.shared().lsn.peek().as_u64() + 2 * GRAVE_WINDOW;
+    store.reel.shared().lsn.recover_to(Lsn(past));
+    let (done, pruned) = std::sync::mpsc::channel();
+    let pruning = {
+        let store = Arc::clone(&store);
+        script.cast(move || {
+            store.prune_tombstones();
+            done.send(()).ok();
+        })
+    };
+    // Time enough for a prune that ignored the hand-over to have taken the grave
+    let _ = pruned.recv_timeout(Duration::from_millis(200));
+    let seen = store.get(&key).expect("read mid hand-over");
+    script.release("paged/handover-spot");
+    handing
+        .join()
+        .expect("hand-over thread")
+        .expect("hand over");
+    pruning.join().expect("prune thread");
+
+    assert!(
+        seen.is_none(),
+        "a read during the hand-over found the deleted version"
+    );
+    assert!(store.get(&key).expect("read").is_none());
+}
+
+// a hand-over of a partition the map has moved past never puts its rows in the spot index
+#[test]
+fn an_outversioned_handover_skips_the_spot_index() {
+    let script = crate::sync::rendezvous::script();
+    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
+    let store = Arc::new(store);
+    let keys: Vec<RecordKey> = (0..100u8).map(|byte| record(7, byte)).collect();
+    for key in &keys {
+        store.put(key, &[1u8; 64]).expect("put");
+    }
+    store.reel.tails()[0].seal().expect("seal");
+    store.hold_sealed().expect("note the seal");
+    for key in &keys {
+        store.put(key, &[2u8; 64]).expect("rewrite");
+    }
+
+    script.hold("paged/handover-spot");
+    let handing = {
+        let store = Arc::clone(&store);
+        script.cast(move || store.page_out_sealed())
+    };
+    script.await_reached("paged/handover-spot", 1);
+    let held = store.index.spot_held();
+    script.release("paged/handover-spot");
+    let handed = handing
+        .join()
+        .expect("hand-over thread")
+        .expect("hand over");
+
+    assert_eq!(held, 0, "outversioned rows went into the spot index");
+    assert_eq!(handed, 0);
+    for key in &keys {
+        assert_eq!(
+            store.get(key).expect("read").as_deref(),
+            Some(&[2u8; 64][..])
+        );
+    }
+}
+
+// a live row older than a pruned grave still leaves the map for the spot index
+#[test]
+fn an_old_row_under_a_pruned_grave_is_handed_over() {
+    let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
+    let (kept, gone) = (record(7, 1), record(7, 2));
+    store.put(&kept, &[1u8; 64]).expect("put");
+    store.put(&gone, &[1u8; 64]).expect("put");
+    store.delete(&gone).expect("delete");
+    store.reel.tails()[0].seal().expect("seal");
+    store.hold_sealed().expect("note the seal");
+    let past = store.reel.shared().lsn.peek().as_u64() + 2 * GRAVE_WINDOW;
+    store.reel.shared().lsn.recover_to(Lsn(past));
+    store.prune_tombstones();
+    assert_eq!(store.index.grave_count(), 0, "the grave stayed");
+
+    assert_eq!(store.page_out_sealed().expect("hand over"), 1);
+    let column = store.index.column(RECORD).expect("column");
+    assert!(
+        column.get(kept.as_slice()).is_none(),
+        "the map kept the row"
+    );
+    assert_eq!(
+        store.get(&kept).expect("read").as_deref(),
+        Some(&[1u8; 64][..])
+    );
+    assert!(store.get(&gone).expect("read").is_none());
+}
+
 // a range delete drawn after the cue point is invisible to it
 #[test]
 fn cue_ignores_a_later_drop() {
@@ -1595,209 +2200,30 @@ fn floor_lifts_on_drop() {
     assert!(at.as_u64() > 0);
 }
 
-// a resident volume records which segments cover which keys
+// a volume records which segments cover which keys as it hands them over
 #[test]
-fn a_resident_volume_records_its_sealed_spans() {
+fn a_volume_records_its_sealed_spans() {
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
     let payload = vec![0xa5u8; 8 * 1024];
     for byte in 0..200u8 {
         store.put(&record(7, byte), &payload).expect("put");
     }
 
-    // Drain the sealer, whose thread is what records the spans, so the
-    // assertions below race nothing.
+    // Drain the sealer thread, which records the spans, so the asserts below race nothing
     store.flush().expect("flush");
-    assert_eq!(
-        store.page_out_sealed().expect("page out"),
-        0,
-        "nothing is handed over"
-    );
-    assert!(
-        store.index.answers_from_footers(RECORD) || store.index.sealed_spans(RECORD) > 0,
-        "a resident volume sealed segments and recorded none of them"
-    );
-    assert!(
-        (0..200u8).all(|byte| !is_paged(&store, &record(7, byte))),
-        "every key still answers from the map"
-    );
-    assert_eq!(store.totals().count, 200);
-}
-
-// a hot index keeps a freshly sealed segment resident and reads it from the map
-#[test]
-fn a_hot_index_holds_recent_keys() {
-    let hot = ReelConfig {
-        index: IndexResidency::Hot(HotIndex {
-            after_secs: 3600,
-            budget: ByteCount::gb(1),
-        }),
-        ..config(1, SyncPolicy::Never)
-    };
-    let (store, _sim) = sim_store(hot);
-
-    let payload = vec![0xa5u8; 8 * 1024];
-    for byte in 0..200u8 {
-        store.put(&record(7, byte), &payload).expect("put");
-    }
-
-    assert_eq!(
-        store.page_out_sealed().expect("page out"),
-        0,
-        "nothing is old enough or dear enough to hand over"
-    );
-    assert!(
-        (0..200u8).all(|byte| !is_paged(&store, &record(7, byte))),
-        "every key still answers from the map"
-    );
-    assert_eq!(store.totals().count, 200);
-}
-
-// a hot index over its budget hands the oldest segments over early
-#[test]
-fn a_hot_index_pages_when_it_runs_out_of_room() {
-    const KEYS: u64 = 40_000;
-    let hot = |budget| ReelConfig {
-        index: IndexResidency::Hot(HotIndex {
-            after_secs: 3600,
-            budget,
-        }),
-        segment_bytes: ByteCount::from_bytes(64 * 1024),
-        ..config(1, SyncPolicy::Never)
-    };
-    // The least budget a volume takes is what its columns hold empty.
-    let floor = ReelIndex::new(WIDE_COLUMNS, hot(ByteCount::gb(1)).index, ShardShapes::Tree)
-        .expect("index")
-        .floor_bytes();
-    let store = ReelStore::open_with_io(
-        PathBuf::from(ROOT),
-        hot(floor),
-        WIDE_COLUMNS,
-        Arc::new(SimIo::new(FaultPlan::new(1))),
-    )
-    .expect("open");
-
-    let payload = [0xa5u8; 16];
-    for at in 0..KEYS {
-        store.put(&wide(at), &payload).expect("put");
-    }
-    store.flush().expect("flush");
-
     assert!(
         store.page_out_sealed().expect("page out") > 0,
-        "over budget, the oldest sealed segment goes"
-    );
-    assert_eq!(
-        store.totals().count,
-        KEYS,
-        "handing keys over is not deleting them"
-    );
-    assert_eq!(
-        played(&store, WIDE).len() as u64,
-        KEYS,
-        "and the playback still sees them"
-    );
-}
-
-// a hot budget under what the columns hold empty is refused at open
-#[test]
-fn a_hot_budget_under_the_floor_is_refused() {
-    let hot = ReelConfig {
-        index: IndexResidency::Hot(HotIndex {
-            after_secs: 3600,
-            budget: ByteCount::from_bytes(1),
-        }),
-        ..config(1, SyncPolicy::Never)
-    };
-    let opened = ReelStore::open_with_io(
-        PathBuf::from(ROOT),
-        hot,
-        COLUMNS,
-        Arc::new(SimIo::new(FaultPlan::new(1))),
-    );
-    match opened {
-        Err(ReelError::Config(reason)) => assert!(reason.contains("hot index budget"), "{reason}"),
-        Err(other) => panic!("refused for another reason: {other}"),
-        Ok(_) => panic!("a one byte budget opened"),
-    }
-}
-
-/// A record key in one of sixty-four shards, in the order of its number within it
-fn grouped(at: u32) -> RecordKey {
-    let mut bytes = ((at % 64) as u16).to_be_bytes().to_vec();
-    bytes.extend_from_slice(&at.to_be_bytes());
-    bytes.resize(34, 0);
-    RecordKey::from_bytes(RECORD, &bytes).expect("key")
-}
-
-// a hot budget prices the keys above the shards' floor, so it keeps a budget of recent keys
-#[test]
-fn a_hot_budget_keeps_recent_keys_above_the_floor() {
-    const BUDGET: u64 = 16 << 20;
-    const KEYS: u32 = 400_000;
-    let hot = ReelConfig {
-        index: IndexResidency::Hot(HotIndex {
-            after_secs: 3600,
-            budget: ByteCount::from_bytes(BUDGET),
-        }),
-        ..config(1, SyncPolicy::Never)
-    };
-    let (store, _sim) = sim_store(hot);
-    let floor = store.index.floor_bytes().to_bytes();
-
-    let payload = [0x17u8; 16];
-    for at in 0..KEYS {
-        store.put(&grouped(at), &payload).expect("put");
-        if at % 20_000 == 0 {
-            store.page_out_sealed().expect("page out");
-        }
-    }
-    store.flush().expect("flush");
-    store.page_out_sealed().expect("page out");
-
-    let held = store.index.key_bytes().to_bytes();
-    assert!(
-        held >= BUDGET / 2,
-        "a {BUDGET} byte budget over a {floor} byte floor holds {held} bytes of keys"
+        "nothing was handed over"
     );
     assert!(
-        (0..1_000).all(|at| is_paged(&store, &grouped(at))),
-        "the oldest keys went to their footers"
+        store.index.sealed_spans(RECORD) > 0,
+        "the volume sealed segments and recorded none of them"
     );
     assert!(
-        (KEYS - 1_000..KEYS).all(|at| !is_paged(&store, &grouped(at))),
-        "the newest keys stayed resident"
+        (0..200u8).any(|byte| is_paged(&store, &record(7, byte))),
+        "every key still answers from the map"
     );
-    assert_eq!(store.totals().count, u64::from(KEYS));
-}
-
-// a hot two-byte column touching thousands of shards holds its filters inside the budget
-#[test]
-fn a_hot_budget_counts_the_filters_of_many_shards() {
-    const BUDGET: u64 = 16 << 20;
-    let hot = ReelConfig {
-        index: IndexResidency::Hot(HotIndex {
-            after_secs: 3600,
-            budget: ByteCount::from_bytes(BUDGET),
-        }),
-        ..config(1, SyncPolicy::Never)
-    };
-    let (store, _sim) = sim_store(hot);
-    let floor = store.index.floor_bytes().to_bytes();
-
-    let payload = [0x5au8; 16];
-    for at in 0..8_000u32 {
-        store.put(&spread(at), &payload).expect("put");
-    }
-    store.flush().expect("flush");
-    store.page_out_sealed().expect("page out");
-
-    let held = store.resident_bytes().to_bytes().saturating_sub(floor);
-    assert!(
-        held <= BUDGET,
-        "a {BUDGET} byte budget over a {floor} byte floor holds {held} bytes, filters {}",
-        store.index.column(RECORD).expect("column").filter_bytes()
-    );
-    assert_eq!(store.totals().count, 8_000);
+    assert_eq!(store.totals().count, 200);
 }
 
 /// A record key spread across the two-byte shards, one per number
@@ -1818,7 +2244,6 @@ fn a_slow_scrub_does_not_starve_the_handover() {
     const TICKS: usize = 6;
     const LONG_TICK: Duration = Duration::from_secs(1);
     let paged = ReelConfig {
-        index: IndexResidency::Paged,
         segment_bytes: ByteCount::from_bytes(SEGMENT),
         ..config(1, SyncPolicy::Never)
     };
@@ -1874,7 +2299,7 @@ fn a_slow_scrub_does_not_starve_the_handover() {
                 let scrubbed = store.compaction_counters().scrub_bytes - before;
                 let took = started.elapsed();
                 ticks.push((took, scrubbed));
-                // one long tick is the failure, and the ones after it only grow
+                // One long tick is the failure, and the ones after it only grow
                 if took > LONG_TICK {
                     break;
                 }
@@ -1914,7 +2339,6 @@ fn a_slow_scrub_does_not_starve_the_handover() {
 #[test]
 fn scattered_keys_leave_the_filters_small_and_counted() {
     let paged = ReelConfig {
-        index: IndexResidency::Paged,
         segment_bytes: ByteCount::from_bytes(64 * 1024),
         ..config(1, SyncPolicy::Never)
     };
@@ -1950,74 +2374,6 @@ fn scattered_keys_leave_the_filters_small_and_counted() {
     }
 }
 
-const WIDE: ColumnId = ColumnId(7);
-
-/// A sixteen-byte key scattered across the wide column's shards, one per number
-fn wide(at: u64) -> RecordKey {
-    let mut key = (at.wrapping_mul(0x9e37_79b9_7f4a_7c15))
-        .to_be_bytes()
-        .to_vec();
-    key.extend_from_slice(&at.to_be_bytes());
-    RecordKey::from_bytes(WIDE, &key).expect("key")
-}
-
-/// A sixteen-byte column over a byte of shards, the shape a hot budget is priced on
-const WIDE_COLUMNS: ColumnSet = &[ColumnSpec {
-    id: WIDE,
-    name: "wide",
-    key_width: KeyWidth::Fixed(16),
-    shard_bytes: 1,
-    purge_mark: None,
-    codec: Codec::None,
-    map_shape: MapShape::Tree,
-}];
-
-// a hot index given a budget holds about that much memory, counted by what it allocated
-#[test]
-fn a_hot_budget_bounds_what_the_maps_allocate() {
-    const BUDGET: u64 = 4 << 20;
-    let hot = ReelConfig {
-        index: IndexResidency::Hot(HotIndex {
-            after_secs: 3600,
-            budget: ByteCount::from_bytes(BUDGET),
-        }),
-        segment_bytes: ByteCount::from_bytes(64 * 1024),
-        ..config(1, SyncPolicy::Never)
-    };
-    let sim = SimIo::new(FaultPlan::new(1));
-    let store = ReelStore::open_with_io(
-        PathBuf::from(ROOT),
-        hot,
-        WIDE_COLUMNS,
-        Arc::new(sim.clone()),
-    )
-    .expect("open");
-
-    let payload = vec![0x42u8; 200];
-    for at in 0..120_000u64 {
-        store.put(&wide(at), &payload).expect("put");
-        if at % 10_000 == 0 {
-            store.page_out_sealed().expect("page out");
-        }
-    }
-    store.flush().expect("flush");
-    store.page_out_sealed().expect("page out");
-
-    let column = store.index.column(WIDE).expect("column");
-    let allocated = store.index.key_bytes().to_bytes();
-    assert!(
-        column.resident_keys() > 0,
-        "the budget holds some keys resident"
-    );
-    // A tenth over for the open tail, whose keys no budget can hand over.
-    assert!(
-        allocated <= BUDGET + BUDGET / 10,
-        "a {BUDGET} byte budget holds {allocated} bytes for {} keys, and the index counts {}",
-        column.resident_keys(),
-        store.resident_bytes().to_bytes()
-    );
-}
-
 // a segment holding only tombstones is still accounted for, so it can be seen
 #[test]
 fn a_segment_of_only_tombstones_is_accounted_for() {
@@ -2036,8 +2392,7 @@ fn a_segment_of_only_tombstones_is_accounted_for() {
         .map(|(segment, _)| segment)
         .collect();
 
-    // Now delete every one of them. The tombstones land in the fresh tail,
-    // which holds nothing else.
+    // Delete every key, so the fresh tail holds only tombstones
     for byte in 0..200u8 {
         store.delete(&record(7, byte)).expect("delete");
     }
@@ -2059,8 +2414,7 @@ fn a_segment_of_only_tombstones_is_accounted_for() {
             bytes.total() > 0,
             "and the row counts the space they hold, not zero"
         );
-        // Not yet reclaimable: the records these tombstones shadow are still on
-        // disk in the sealed segments, so dropping them would resurrect those.
+        // Dropping these tombstones now would resurrect the sealed records they shadow
         assert_eq!(
             bytes.droppable(store.index.min_lsn_excluding(segment)),
             0,
@@ -2068,13 +2422,11 @@ fn a_segment_of_only_tombstones_is_accounted_for() {
         );
     }
 
-    // Seal the tombstones' own segment, so it is a candidate rather than the
-    // open tail the compactor skips.
+    // Seal the tombstones' segment, since the compactor skips the open tail
     store.reel.tails()[0].seal().expect("seal");
     store.flush().expect("flush");
 
-    // Compact until nothing more moves. The sealed data segments retire, and
-    // once they are gone the tombstones have nothing left to shadow.
+    // Compact until nothing moves, so the data segments retire and the tombstones follow
     for _ in 0..16 {
         let before = store.compaction_counters();
         store.compact_once().expect("compact");
@@ -2084,8 +2436,7 @@ fn a_segment_of_only_tombstones_is_accounted_for() {
         }
     }
 
-    // Nothing at all is left. Ranking on dead alone leaves the tombstone segment
-    // at a fraction of zero forever, so it is never chosen.
+    // Nothing is left, including the tombstone segment that ranking on dead alone never picks
     let left = store.index.segments_snapshot();
     assert!(
         left.iter().all(|(_, bytes)| bytes.total() == 0),
@@ -2093,7 +2444,7 @@ fn a_segment_of_only_tombstones_is_accounted_for() {
     );
 }
 
-// a compaction pass under way turns a second caller away rather than queueing it
+// a compaction pass under way turns a second caller away at once
 #[test]
 fn a_running_pass_turns_the_next_caller_away() {
     let script = crate::sync::rendezvous::script();
@@ -2113,8 +2464,7 @@ fn a_running_pass_turns_the_next_caller_away() {
     let turned_away = AtomicU64::new(0);
     let is_stopped = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        // The winner cannot finish a pass while the point is held, so a Held here
-        // is the guard turning a caller away rather than a charged gate.
+        // The winner can't finish while the point is held, so a Held here comes from the guard
         let racers: Vec<_> = (0..2)
             .map(|_| {
                 let store = &store;
@@ -2237,7 +2587,7 @@ fn a_full_volume_refuses_a_foreground_write() {
         .put(&record(3, 1), &[0xa1; 128])
         .expect("put under the ceiling");
 
-    // Standing where the last tick left it far past any ceiling refuses.
+    // A footprint far past any ceiling refuses the write
     store.footprint.store(u64::MAX / 2, Ordering::Relaxed);
     let refused = store.put(&record(3, 2), &[0xa2; 128]);
 
@@ -2264,8 +2614,7 @@ fn a_filling_volume_is_slowed_before_it_is_refused() {
     .expect("open");
 
     let Some(ceiling) = store.compactor.pressure().foreground_ceiling_bytes() else {
-        // Nothing could say how large the disk is, which leaves the model
-        // unbounded and both halves of the door open.
+        // With no disk size the model is unbounded and both halves of the door stay open
         println!("skipped: this filesystem does not report a capacity");
         return;
     };
@@ -2276,8 +2625,7 @@ fn a_filling_volume_is_slowed_before_it_is_refused() {
     store.apply_footprint(0);
     assert_eq!(budget.effective_ceiling(), configured);
 
-    // Deep in the band the budget is squeezed, and the write still lands:
-    // that is the whole difference between this door and the one above.
+    // Deep in the band the budget is squeezed, and the write still lands
     store.apply_footprint(ceiling - 4096);
     let squeezed = budget.effective_ceiling();
     assert!(
@@ -2309,8 +2657,8 @@ fn a_real_volume_reads_the_machine_and_a_simulated_one_does_not() {
         facts.volume_capacity_bytes.unwrap_or(0) > 0,
         "a mounted filesystem has a capacity",
     );
-    // Whatever the ratio says, the pass reaches a plane rather than nothing.
-    let _ = facts.verdict(0).plane;
+    // Whatever the ratio says, the pass reaches some plane
+    let _ = facts.verdict().plane;
 
     let (simulated, _sim) = sim_store(config(1, SyncPolicy::Never));
     assert_eq!(
@@ -2320,9 +2668,9 @@ fn a_real_volume_reads_the_machine_and_a_simulated_one_does_not() {
     );
 }
 
-// a record larger than the allocation step survives the steps behind it
+// a large record lands whole on posix, and the record written after it lands too
 #[test]
-fn a_record_past_the_alloc_chunk_lands_whole_on_posix() {
+fn a_large_record_lands_whole_on_posix() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = ReelStore::open(
         dir.path().to_path_buf(),
@@ -2331,7 +2679,6 @@ fn a_record_past_the_alloc_chunk_lands_whole_on_posix() {
     )
     .expect("open");
 
-    // Six small records, then one three times the 16 KiB allocation step.
     for byte in 1..=6u8 {
         store.put(&record(3, byte), &[byte; 400]).expect("put");
     }
@@ -2573,7 +2920,7 @@ fn async_get_many_in_order() {
 // an awaited read dropped mid flight puts its slot and its buffer back
 #[test]
 fn a_dropped_get_leaks_nothing() {
-    // Refused, so the futures stay pending: the premise here is the passive path.
+    // Refuse the self-drain, so the futures stay pending on the passive path
     let script = crate::sync::rendezvous::script();
     script.refuse("slots/self-drain");
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
@@ -2604,7 +2951,7 @@ fn a_dropped_get_leaks_nothing() {
 // an awaited batch dropped mid flight orphans every read it had in flight
 #[test]
 fn a_dropped_get_many_leaks_nothing() {
-    // Refused, so the futures stay pending: the premise here is the passive path.
+    // Refuse the self-drain, so the futures stay pending on the passive path
     let script = crate::sync::rendezvous::script();
     script.refuse("slots/self-drain");
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
@@ -2655,7 +3002,7 @@ fn a_range_matches_the_read() {
     assert_eq!(&*deep, &payload[20_000..24_000]);
 }
 
-// a window starting at or past the end answers no bytes rather than nothing
+// a window starting at or past the end answers an empty value
 #[test]
 fn a_range_at_the_end() {
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
@@ -2694,8 +3041,7 @@ fn a_raw_record_in_a_coded_column_ranges() {
     let payload = noise(64 * 1024);
     store.put(&coded(2), &payload).expect("put");
 
-    // The guard the case rests on: a record the codec kept would be served by the
-    // whole read and say nothing about the ranged path.
+    // The record must be stored raw, or the whole read serves it and the ranged path goes untested
     assert_eq!(
         stored_bytes(&store, CODED),
         payload.len() as u64,
@@ -2736,8 +3082,7 @@ fn a_coded_column_answers_a_window() {
     let payload = stripes(4096);
     store.put(&coded(1), &payload).expect("put");
 
-    // The same guard the other way: this record has to have shrunk, or the window
-    // never reaches the decode.
+    // The record must have shrunk, or the window never reaches the decode
     assert!(
         stored_bytes(&store, CODED) < payload.len() as u64,
         "the codec kept nothing"
@@ -2813,7 +3158,7 @@ fn async_range_matches_the_block() {
 // an awaited window dropped mid flight puts its slots and its buffers back
 #[test]
 fn a_dropped_range_leaks_nothing() {
-    // Refused, so the futures stay pending: the premise here is the passive path.
+    // Refuse the self-drain, so the futures stay pending on the passive path
     let script = crate::sync::rendezvous::script();
     script.refuse("slots/self-drain");
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
@@ -2846,13 +3191,37 @@ fn a_dropped_range_leaks_nothing() {
     );
 }
 
-// a vouched window takes one device read wherever it sits in the record
+// a window of a record in an open tail is copied out of the tail's mapping, with no device read
+#[test]
+fn an_open_tail_answers_a_window_from_its_mapping() {
+    let (store, backend, _dir) = posix_store(config(1, SyncPolicy::Never));
+    let key = record(7, 1);
+    let payload = stripes(64 * 1024);
+    store.put(&key, &payload).expect("put");
+    store.get(&key).expect("warm the descriptor");
+
+    let before = backend.ops();
+    let window = store
+        .get_range(&key, 40_000, 4_000)
+        .expect("range")
+        .expect("found");
+    assert_eq!(&*window, &payload[40_000..44_000]);
+    assert_eq!(
+        backend.ops() - before,
+        0,
+        "a window of an open tail went to the device"
+    );
+}
+
+// a vouched window of a sealed record takes one device read wherever it sits in the record
 #[test]
 fn a_posix_range_reads_a_window() {
     let (store, backend, _dir) = posix_store(config(1, SyncPolicy::Never));
     let key = record(7, 1);
     let payload = stripes(64 * 1024);
     store.put(&key, &payload).expect("put");
+    // An open tail answers from its mapping, so the record is sealed first
+    store.reel.tails()[0].seal().expect("seal");
     store.get(&key).expect("warm the descriptor");
 
     let before = backend.ops();
@@ -2987,7 +3356,7 @@ fn a_moved_range_converges() {
     assert_eq!(found, awaited);
 }
 
-// a new record at an old offset is never served as the record the entry named
+// a new record at an old offset is never served as the entry's record
 #[test]
 fn a_reused_offset_serves_nobody() {
     use std::os::unix::fs::FileExt;
@@ -2998,8 +3367,7 @@ fn a_reused_offset_serves_nobody() {
     store.flush().expect("flush");
     let entry = store.index.get(&key).expect("read").expect("present");
 
-    // A second volume lays out an identical segment holding another record,
-    // which is what the offset would hold if the space were ever reused.
+    // A second volume lays out the same segment with another record, as reused space would
     let (other, _other_backend, other_dir) = posix_store(config(1, SyncPolicy::Never));
     let reused = vec![0xb7u8; 4096];
     other.put(&blob(2), &reused).expect("put");
@@ -3021,8 +3389,7 @@ fn a_reused_offset_serves_nobody() {
     source
         .read_exact_at(&mut framed, u64::from(planted.loc.offset))
         .expect("read framed");
-    // Reuse begins by dropping the incarnation, which is the contract the
-    // fast path stands on, and only then do the bytes change under the entry.
+    // Reuse drops the incarnation before the bytes change, which the fast path relies on
     store.index.segments().forget(entry.loc.segment);
     let target = std::fs::OpenOptions::new()
         .write(true)
@@ -3043,208 +3410,7 @@ fn a_reused_offset_serves_nobody() {
     );
 }
 
-/// A volume whose segments can hold a record above the routing floor
-///
-/// The shared config's segment is a megabyte, which is the routing floor, so a
-/// record large enough to be routed would not fit in one.
-fn routed_config(ranged: RangedReads) -> ReelConfig {
-    ReelConfig {
-        ranged_reads: ranged,
-        segment_bytes: ByteCount::mb(16),
-        ..config(1, SyncPolicy::Never)
-    }
-}
-
-/// A record above the megabyte size floor the route asks for
-const ROUTED_RECORD_LEN: usize = 2 * 1024 * 1024;
-
-/// Put a volume under the read pressure the depth floor asks for
-///
-/// A window goes around the page cache only where a large record meets
-/// concurrent readers, and a single-threaded test supplies neither on its own.
-fn under_read_pressure(store: &ReelStore) {
-    for _ in 0..2 {
-        store.reel.hold_cold_read_open_ended();
-    }
-}
-
-/// Whether the route can be taken here, so a skip is nobody's silent green
-///
-/// A filesystem that refuses the direct open retires the plane, and a plane test
-/// on one asserts nothing. Setting REEL_DIRECT_REQUIRED makes that a failure.
-fn cold_plane_or_skip(store: &ReelStore) -> bool {
-    if store.cold_direct_live() {
-        return true;
-    }
-    assert!(
-        std::env::var_os("REEL_DIRECT_REQUIRED").is_none(),
-        "the cold read plane retired on this filesystem and REEL_DIRECT_REQUIRED is set",
-    );
-    println!("skipped: this filesystem refused a direct open, so the cold plane retired");
-    false
-}
-
-/// Where a window into one record starts in its segment file
-fn window_offset(store: &ReelStore, key: &RecordKey, at: u64) -> u64 {
-    let entry = store.index.get(key).expect("read").expect("present");
-    u64::from(entry.loc.offset) + HEADER_LEN as u64 + u64::from(key.width()) + at
-}
-
-/// A sealed volume holding one record above the routing floor, under pressure
-///
-/// A window read from a live tail routes to the cache by the settled check, and
-/// the depth floor sends a lone reader there whatever the record size.
-fn routed_store(
-    ranged: RangedReads,
-    len: usize,
-) -> (ReelStore, Arc<PosixBackend>, TempDir, RecordKey, Vec<u8>) {
-    let (store, backend, dir) = posix_store(routed_config(ranged));
-    let key = record(7, 1);
-    let payload = stripes(len);
-    store.put(&key, &payload).expect("put");
-    store.reel.tails()[0].seal().expect("seal");
-    store.get(&key).expect("warm the descriptor");
-    under_read_pressure(&store);
-    (store, backend, dir, key, payload)
-}
-
-// a window on a sealed segment reads around the page cache in one driver op
-#[test]
-fn a_direct_window_takes_one_read() {
-    let (store, backend, _dir, key, payload) = routed_store(RangedReads::Direct, ROUTED_RECORD_LEN);
-    // The first routed window opens the direct descriptor, which is a driver op
-    // of its own. Measuring past it is measuring the read.
-    store
-        .get_range(&key, 100, 4)
-        .expect("range")
-        .expect("found");
-    if !cold_plane_or_skip(&store) {
-        return;
-    }
-
-    let ops = backend.ops();
-    let before = backend.cold_reads();
-    let found = store
-        .get_range(&key, 40_000, 4_000)
-        .expect("range")
-        .expect("found");
-    let after = backend.cold_reads();
-
-    assert_eq!(&*found, &payload[40_000..44_000]);
-    assert_eq!(backend.ops() - ops, 1, "the window took one op");
-    assert_eq!(after.routed - before.routed, 1, "the window was routed");
-    assert_eq!(
-        after.direct - before.direct,
-        1,
-        "and answered on the device plane"
-    );
-    assert_eq!(
-        after.warm - before.warm,
-        0,
-        "with no probe under the direct knob"
-    );
-}
-
-// a routed window asks the device for exactly the blocks that cover it
-#[test]
-fn a_direct_window_reads_one_covering_span() {
-    let (store, backend, _dir, key, _payload) =
-        routed_store(RangedReads::Direct, ROUTED_RECORD_LEN);
-    store
-        .get_range(&key, 100, 4)
-        .expect("range")
-        .expect("found");
-    if !cold_plane_or_skip(&store) {
-        return;
-    }
-
-    let base = window_offset(&store, &key, 0);
-    let align = DIRECT_ALIGN as u64;
-    // One window sits inside a single block, the next straddles two.
-    let inside = (align - base % align) % align;
-    let across = inside + align - 1;
-
-    for (at, len, want) in [(inside, 4_000usize, align), (across, 2usize, 2 * align)] {
-        let before = backend.cold_reads();
-        store
-            .get_range(&key, at, len)
-            .expect("range")
-            .expect("found");
-        let after = backend.cold_reads();
-
-        let (_, span) = covering_span(window_offset(&store, &key, at), len as u64);
-        assert_eq!(
-            span, want,
-            "the span for {len} bytes at {at} is not what was set up"
-        );
-        assert_eq!(
-            after.direct - before.direct,
-            1,
-            "the window at {at} took one read"
-        );
-        assert_eq!(
-            after.direct_bytes - before.direct_bytes,
-            span,
-            "the window at {at} asked the device for more than its covering span",
-        );
-    }
-}
-
-// the routed window and the buffered one answer the same bytes
-#[test]
-fn a_direct_window_matches_the_buffered_one() {
-    let (routed, _backend, _dir, key, payload) =
-        routed_store(RangedReads::Direct, ROUTED_RECORD_LEN);
-    let (cached, _cached_backend, _cached_dir) = posix_store(routed_config(RangedReads::Cached));
-    cached.put(&key, &payload).expect("put");
-    cached.reel.tails()[0].seal().expect("seal");
-
-    for (at, len) in [
-        (0u64, 64usize),
-        (4096, 4096),
-        (40_000, 4_000),
-        (199_000, 4_000),
-    ] {
-        let blocked = routed
-            .get_range(&key, at, len)
-            .expect("range")
-            .expect("found");
-        let awaited = block_on(routed.get_range_wait(&key, at, len))
-            .expect("awaited range")
-            .expect("found");
-        let buffered = cached
-            .get_range(&key, at, len)
-            .expect("range")
-            .expect("found");
-
-        let at = at as usize;
-        let end = at.saturating_add(len).min(payload.len());
-        assert_eq!(&*blocked, &payload[at..end], "the routed window at {at}");
-        assert_eq!(
-            blocked, awaited,
-            "the doors disagree about the window at {at}"
-        );
-        assert_eq!(
-            blocked, buffered,
-            "the planes disagree about the window at {at}"
-        );
-    }
-}
-
-// a record below the floor keeps the page cache, whatever the knob says
-#[test]
-fn a_small_record_window_keeps_the_cache() {
-    let (store, backend, _dir, key, payload) = routed_store(RangedReads::Direct, 8 * 1024);
-    let found = store
-        .get_range(&key, 4_000, 1_000)
-        .expect("range")
-        .expect("found");
-
-    assert_eq!(&*found, &payload[4_000..5_000]);
-    assert_eq!(backend.cold_reads().routed, 0, "a small record was routed");
-}
-
-// a record wider than a segment is refused, not retried for ever
+// a record wider than a segment is refused without a retry
 #[test]
 fn a_record_wider_than_a_segment_is_refused() {
     // The shared fixture's segment is a megabyte.
@@ -3259,8 +3425,7 @@ fn a_record_wider_than_a_segment_is_refused() {
         "an oversize record failed as {refused} rather than as a rejection",
     );
 
-    // The volume is still usable, which is what says the refusal happened before
-    // anything was reserved rather than after a segment was spent on it.
+    // The volume still takes writes, so the refusal came before anything was reserved
     let small = stripes(1024);
     store
         .put(&record(7, 2), &small)
@@ -3269,551 +3434,7 @@ fn a_record_wider_than_a_segment_is_refused() {
     assert_eq!(&*found, small.as_slice());
 }
 
-// a large record read by one reader keeps the page cache
-#[test]
-fn a_lone_reader_keeps_the_cache_on_a_large_record() {
-    let (store, backend, _dir) = posix_store(routed_config(RangedReads::Direct));
-    let key = record(7, 1);
-    let payload = stripes(ROUTED_RECORD_LEN);
-    store.put(&key, &payload).expect("put");
-    store.reel.tails()[0].seal().expect("seal");
-    store.get(&key).expect("warm the descriptor");
-
-    let found = store
-        .get_range(&key, 40_000, 4_000)
-        .expect("range")
-        .expect("found");
-    assert_eq!(&*found, &payload[40_000..44_000]);
-    assert_eq!(backend.cold_reads().routed, 0, "a lone reader was routed");
-
-    // And the same read under pressure is, which is what says the first
-    // assertion is the depth floor rather than something else refusing.
-    under_read_pressure(&store);
-    store
-        .get_range(&key, 40_000, 4_000)
-        .expect("range")
-        .expect("found");
-    if !cold_plane_or_skip(&store) {
-        return;
-    }
-    assert_eq!(
-        backend.cold_reads().routed,
-        1,
-        "pressure did not route the same read"
-    );
-}
-
-// a window on a segment something still holds keeps the page cache
-#[test]
-fn a_held_window_keeps_the_cache() {
-    let (store, backend, _dir) = posix_store(routed_config(RangedReads::Direct));
-    let key = record(7, 1);
-    let payload = stripes(ROUTED_RECORD_LEN);
-    store.put(&key, &payload).expect("put");
-    store.get(&key).expect("warm the descriptor");
-    under_read_pressure(&store);
-
-    let held = store
-        .get_range(&key, 40_000, 4_000)
-        .expect("range")
-        .expect("found");
-    assert_eq!(&*held, &payload[40_000..44_000]);
-    assert_eq!(
-        backend.cold_reads().routed,
-        0,
-        "a window on a live tail was routed"
-    );
-
-    store.reel.tails()[0].seal().expect("seal");
-    let sealed = store
-        .get_range(&key, 40_000, 4_000)
-        .expect("range")
-        .expect("found");
-    if !cold_plane_or_skip(&store) {
-        return;
-    }
-
-    assert_eq!(&*sealed, &payload[40_000..44_000]);
-    assert_eq!(
-        backend.cold_reads().routed,
-        1,
-        "the sealed segment never routed"
-    );
-}
-
-// a sealed segment beside an idle tail still routes
-#[test]
-fn a_settled_window_routes_beside_an_idle_tail() {
-    let config = ReelConfig {
-        active_tails: ThreadBudget::threads(2),
-        ..routed_config(RangedReads::Direct)
-    };
-    let (store, backend, _dir) = posix_store(config);
-    // Roll off the segment the tail opened with, so the record lands in one drawn
-    // after open, which is every segment a running volume writes.
-    store.put(&record(7, 2), &stripes(1024)).expect("put");
-    store.reel.tails()[0].seal().expect("seal");
-
-    let key = record(7, 1);
-    let payload = stripes(ROUTED_RECORD_LEN);
-    store.put(&key, &payload).expect("put");
-    store.reel.tails()[0].seal().expect("seal");
-    store.get(&key).expect("warm the descriptor");
-    under_read_pressure(&store);
-
-    let sealed = store
-        .get_range(&key, 40_000, 4_000)
-        .expect("range")
-        .expect("found");
-    if !cold_plane_or_skip(&store) {
-        return;
-    }
-    assert_eq!(&*sealed, &payload[40_000..44_000]);
-    assert_eq!(
-        backend.cold_reads().routed,
-        1,
-        "the sealed segment never routed"
-    );
-}
-
-// a new record at an old offset is never served as the old one, route on
-#[test]
-fn a_direct_reused_offset_serves_nobody() {
-    use std::os::unix::fs::FileExt;
-
-    let (store, backend, dir) = posix_store(routed_config(RangedReads::Direct));
-    let key = blob(1);
-    let payload = stripes(ROUTED_RECORD_LEN);
-    store.put(&key, &payload).expect("put");
-    store.reel.tails()[0].seal().expect("seal");
-    under_read_pressure(&store);
-    let entry = store.index.get(&key).expect("read").expect("present");
-
-    let served = store
-        .get_range(&key, 40_000, 4_000)
-        .expect("range")
-        .expect("found");
-    assert_eq!(&*served, &payload[40_000..44_000]);
-    if !cold_plane_or_skip(&store) {
-        return;
-    }
-    assert!(
-        backend.cold_reads().direct >= 1,
-        "the route never reached the device"
-    );
-
-    // A second volume lays out an identical segment holding another record,
-    // which is what the offset would hold if the space were ever reused.
-    let (other, _other_backend, other_dir) = posix_store(routed_config(RangedReads::Direct));
-    let reused = vec![0xb7u8; payload.len()];
-    other.put(&blob(2), &reused).expect("put");
-    other.reel.tails()[0].seal().expect("seal");
-    let planted = other.index.get(&blob(2)).expect("read").expect("present");
-    assert_eq!(
-        planted.loc, entry.loc,
-        "the two volumes lay the record out alike"
-    );
-
-    let span = HEADER_LEN + blob(2).width() as usize + reused.len();
-    let mut framed = vec![0u8; span];
-    let source = std::fs::File::open(
-        other_dir
-            .path()
-            .join(segment_file_name(planted.loc.segment)),
-    )
-    .expect("open source");
-    source
-        .read_exact_at(&mut framed, u64::from(planted.loc.offset))
-        .expect("read framed");
-    // Reuse begins by dropping the incarnation, which is the contract the fast
-    // path stands on, and only then do the bytes change under the entry.
-    store.index.segments().forget(entry.loc.segment);
-    let target = std::fs::OpenOptions::new()
-        .write(true)
-        .open(dir.path().join(segment_file_name(entry.loc.segment)))
-        .expect("open target");
-    target
-        .write_all_at(&framed, u64::from(entry.loc.offset))
-        .expect("plant record");
-
-    assert!(
-        !store.window_certain(&entry),
-        "a dropped incarnation vouches for nothing"
-    );
-    let found = store.get_range(&key, 40_000, 4_000).expect("range");
-    assert!(
-        found.is_none(),
-        "the planted record answered as the old one"
-    );
-}
-
-// the awaited door routes its windows too, and takes the same one read
-#[test]
-fn an_awaited_direct_window_takes_one_read() {
-    let (store, backend, _dir, key, payload) = routed_store(RangedReads::Direct, ROUTED_RECORD_LEN);
-    // The first routed window opens the direct descriptor, which is a driver op
-    // of its own. Measuring past it is measuring the read.
-    block_on(store.get_range_wait(&key, 100, 4))
-        .expect("range")
-        .expect("found");
-    if !cold_plane_or_skip(&store) {
-        return;
-    }
-
-    let ops = backend.ops();
-    let before = backend.cold_reads();
-    let found = block_on(store.get_range_wait(&key, 40_000, 4_000))
-        .expect("awaited range")
-        .expect("found");
-    let after = backend.cold_reads();
-
-    assert_eq!(&*found, &payload[40_000..44_000]);
-    assert_eq!(backend.ops() - ops, 1, "the awaited window took one op");
-    assert_eq!(
-        after.routed - before.routed,
-        1,
-        "the awaited window was not routed"
-    );
-    assert_eq!(
-        after.direct - before.direct,
-        1,
-        "the awaited window kept the cache"
-    );
-}
-
-// a window wider than the staging cap still takes one read and answers whole
-#[test]
-fn a_wide_direct_window_takes_one_read() {
-    let (store, backend, _dir, key, payload) = routed_store(RangedReads::Direct, ROUTED_RECORD_LEN);
-    store
-        .get_range(&key, 100, 4)
-        .expect("range")
-        .expect("found");
-    if !cold_plane_or_skip(&store) {
-        return;
-    }
-
-    // Off a block boundary, so the span is wider than the window on both ends.
-    let at = 4_095u64;
-    let len = 192 * 1024;
-    let ops = backend.ops();
-    let before = backend.cold_reads();
-    let found = store
-        .get_range(&key, at, len)
-        .expect("range")
-        .expect("found");
-    let after = backend.cold_reads();
-
-    let (_, span) = covering_span(window_offset(&store, &key, at), len as u64);
-    assert_eq!(&*found, &payload[at as usize..at as usize + len]);
-    assert_eq!(backend.ops() - ops, 1, "the wide window took one op");
-    assert_eq!(
-        after.direct - before.direct,
-        1,
-        "the wide window kept the cache"
-    );
-    assert_eq!(
-        after.direct_bytes - before.direct_bytes,
-        span,
-        "the wide window asked the device for more than its covering span",
-    );
-}
-
-// a run of windows takes one device read each and asks for exactly its blocks
-#[test]
-fn a_run_of_direct_windows_keeps_its_blocks_per_read() {
-    let (store, backend, _dir, key, payload) = routed_store(RangedReads::Direct, ROUTED_RECORD_LEN);
-    store
-        .get_range(&key, 100, 4)
-        .expect("range")
-        .expect("found");
-    if !cold_plane_or_skip(&store) {
-        return;
-    }
-
-    let end = payload.len() as u64;
-    let asked = 4_000u64;
-    // A prime stride, so the run lands on every offset within a block rather
-    // than on a handful of them.
-    let mut offsets: Vec<u64> = (0..200)
-        .map(|step| (step * 2_609) % (end - asked))
-        .collect();
-    offsets.extend([end - 1, end - 3, end - 4_096]);
-
-    // Resolved once, since asking the index inside the run would count against
-    // the ops the run is measured by.
-    let base = window_offset(&store, &key, 0);
-    let spans: u64 = offsets
-        .iter()
-        .map(|at| covering_span(base + at, (at + asked).min(end) - at).1)
-        .sum();
-
-    let ops = backend.ops();
-    let before = backend.cold_reads();
-    for at in &offsets {
-        let at = *at;
-        let found = store
-            .get_range(&key, at, asked as usize)
-            .expect("range")
-            .unwrap_or_else(|| panic!("the window at {at} went missing"));
-        let want = &payload[at as usize..(at + asked).min(end) as usize];
-        assert_eq!(&*found, want, "the window at {at}");
-    }
-    let after = backend.cold_reads();
-
-    let windows = offsets.len() as u64;
-    assert_eq!(
-        after.direct - before.direct,
-        windows,
-        "a window left the device plane"
-    );
-    assert_eq!(backend.ops() - ops, windows, "a window took two ops");
-    assert_eq!(
-        after.direct_bytes - before.direct_bytes,
-        spans,
-        "the run asked the device for more than its covering spans",
-    );
-}
-
-// a segment whose direct open is refused reads buffered, and no other segment does
-#[test]
-fn a_refused_direct_open_reads_buffered() {
-    let (store, backend, dir, key, payload) = routed_store(RangedReads::Direct, ROUTED_RECORD_LEN);
-    // A second record on a segment of its own, so what a refusal costs shows.
-    let other = record(7, 2);
-    let other_payload: Vec<u8> = stripes(ROUTED_RECORD_LEN)
-        .into_iter()
-        .map(|byte| byte ^ 0x5a)
-        .collect();
-    store.put(&other, &other_payload).expect("put");
-    store.reel.tails()[0].seal().expect("seal");
-    store.get(&other).expect("warm the descriptor");
-
-    let entry = store.index.get(&key).expect("read").expect("present");
-    let standing = store.index.get(&other).expect("read").expect("present");
-    assert_ne!(
-        entry.loc.segment, standing.loc.segment,
-        "the two share a segment"
-    );
-    // The standing segment takes its descriptor before anything is unlinked, so a
-    // filesystem with no direct open skips rather than faking the refusal.
-    store
-        .get_range(&other, 100, 4)
-        .expect("range")
-        .expect("found");
-    if !cold_plane_or_skip(&store) {
-        return;
-    }
-    // The buffered descriptor is already open and keeps serving, so the only
-    // thing the unlink takes away is the open the route has not made yet.
-    std::fs::remove_file(dir.path().join(segment_file_name(entry.loc.segment)))
-        .expect("unlink the segment");
-
-    let ops = backend.ops();
-    let before = backend.cold_reads();
-    let found = store
-        .get_range(&key, 40_000, 4_000)
-        .expect("range")
-        .expect("found");
-    let refused = backend.ops() - ops;
-    let after = backend.cold_reads();
-
-    assert_eq!(
-        &*found,
-        &payload[40_000..44_000],
-        "the buffered descriptor stopped serving"
-    );
-    assert_eq!(
-        refused, 2,
-        "the refused window was not one failed open and one buffered read"
-    );
-    assert_eq!(
-        after.routed - before.routed,
-        0,
-        "a refused open still routed"
-    );
-    assert_eq!(
-        after.direct - before.direct,
-        0,
-        "a refused open still reached the device"
-    );
-    assert!(
-        store.cold_direct_live(),
-        "one refused open retired the whole volume"
-    );
-
-    // The segment's own memo is what keeps the refusal from being bought again.
-    let ops = backend.ops();
-    store
-        .get_range(&key, 60_000, 4_000)
-        .expect("range")
-        .expect("found");
-    assert_eq!(
-        backend.ops() - ops,
-        1,
-        "the second window on the refused segment asked for the open again",
-    );
-
-    let before = backend.cold_reads();
-    let served = store
-        .get_range(&other, 40_000, 4_000)
-        .expect("range")
-        .expect("found");
-    let after = backend.cold_reads();
-
-    assert_eq!(&*served, &other_payload[40_000..44_000]);
-    assert_eq!(
-        after.routed - before.routed,
-        1,
-        "the standing segment went unrouted"
-    );
-    assert_eq!(
-        after.direct - before.direct,
-        1,
-        "the standing segment lost the device"
-    );
-}
-
-// the direct descriptor is opened once per segment, whoever reaches it first
-#[test]
-fn racing_direct_windows_open_one_descriptor() {
-    let (store, backend, _dir, key, payload) = routed_store(RangedReads::Direct, ROUTED_RECORD_LEN);
-    let settled = backend.open_file_count();
-
-    let readers = 32;
-    let barrier = std::sync::Barrier::new(readers);
-    let ready = &barrier;
-    let racing = &store;
-    let asked = &key;
-    let want = &payload;
-    std::thread::scope(|scope| {
-        for reader in 0..readers {
-            scope.spawn(move || {
-                ready.wait();
-                let at = 40_000 + (reader as u64 % 8);
-                let found = racing
-                    .get_range(asked, at, 4_000)
-                    .expect("range")
-                    .expect("found");
-                let at = at as usize;
-                assert_eq!(&*found, &want[at..at + 4_000], "a racing window at {at}");
-            });
-        }
-    });
-    if !cold_plane_or_skip(&store) {
-        return;
-    }
-
-    assert_eq!(
-        backend.cold_reads().routed,
-        readers as u64,
-        "a window went unrouted"
-    );
-    assert_eq!(
-        backend.open_file_count(),
-        settled + 1,
-        "{readers} racing windows opened more than one direct descriptor",
-    );
-}
-
-/// Whether the non-blocking probe survives on this filesystem
-///
-/// RWF_NOWAIT is per filesystem, not per kernel, and a refusal retires the plane
-/// and leaves a probe test with nothing to assert. REEL_DIRECT_REQUIRED makes
-/// the skip a failure.
-#[cfg(target_os = "linux")]
-fn warm_probe_or_skip(backend: &PosixBackend) -> bool {
-    if backend.cold_plane_live() {
-        return true;
-    }
-    assert!(
-        std::env::var_os("REEL_DIRECT_REQUIRED").is_none(),
-        "this filesystem refused RWF_NOWAIT and REEL_DIRECT_REQUIRED is set",
-    );
-    println!("skipped: this filesystem refused RWF_NOWAIT, so the probe retired");
-    false
-}
-
-// a window the cache already holds is answered without a device read
-#[cfg(target_os = "linux")]
-#[test]
-fn a_warm_window_skips_the_device() {
-    let (store, backend, _dir, key, payload) = routed_store(RangedReads::Probed, ROUTED_RECORD_LEN);
-    // Settle the direct descriptor before anything is measured.
-    store
-        .get_range(&key, 100, 4)
-        .expect("range")
-        .expect("found");
-    if !cold_plane_or_skip(&store) {
-        return;
-    }
-    // A whole read leaves the record's pages resident, which is what the probe
-    // is supposed to find.
-    store.get(&key).expect("populate the cache");
-
-    let ops = backend.ops();
-    let before = backend.cold_reads();
-    let found = store
-        .get_range(&key, 40_000, 4_000)
-        .expect("range")
-        .expect("found");
-    let after = backend.cold_reads();
-
-    assert_eq!(&*found, &payload[40_000..44_000]);
-    assert_eq!(after.routed - before.routed, 1, "the window was not routed");
-    assert_eq!(backend.ops() - ops, 1, "the window took one op");
-    if !warm_probe_or_skip(&backend) {
-        return;
-    }
-    assert_eq!(
-        after.warm - before.warm,
-        1,
-        "the cache did not answer a resident window"
-    );
-    assert_eq!(
-        after.direct - before.direct,
-        0,
-        "a resident window still hit the device"
-    );
-}
-
-// a cold window on a real filesystem asks for its covering span and no more
-#[cfg(target_os = "linux")]
-#[test]
-fn a_cold_window_reads_its_range_and_no_more() {
-    let (store, backend, _dir, key, payload) = routed_store(RangedReads::Direct, ROUTED_RECORD_LEN);
-    store
-        .get_range(&key, 100, 4)
-        .expect("range")
-        .expect("found");
-    if !cold_plane_or_skip(&store) {
-        return;
-    }
-    drop_cache(&store, &key);
-
-    let before = backend.cold_reads();
-    let found = store
-        .get_range(&key, 40_000, 4_000)
-        .expect("range")
-        .expect("found");
-    let after = backend.cold_reads();
-    let bytes = after.direct_bytes - before.direct_bytes;
-
-    assert_eq!(&*found, &payload[40_000..44_000]);
-    assert_eq!(
-        after.direct - before.direct,
-        1,
-        "a cold window did not reach the device"
-    );
-    assert!(
-        (4_000..=4_000 + 2 * DIRECT_ALIGN as u64).contains(&bytes),
-        "a four kilobyte window asked the device for {bytes} bytes",
-    );
-}
-
 /// Drop a segment's pages, so a read of it is genuinely cold
-///
-/// posix_fadvise needs no privilege, so a test can make a cold read as itself.
 #[cfg(target_os = "linux")]
 fn drop_cache(store: &ReelStore, key: &RecordKey) {
     use std::os::fd::AsRawFd;
@@ -3821,8 +3442,7 @@ fn drop_cache(store: &ReelStore, key: &RecordKey) {
     let entry = store.index.get(key).expect("read").expect("present");
     let path = store.reel.shared().segment_path(entry.loc.segment);
     let file = std::fs::File::open(&path).expect("open the segment");
-    // SAFETY: the descriptor is open for the whole call and fadvise takes no
-    // pointer, so the only thing it can touch is the kernel's page state.
+    // SAFETY: the descriptor stays open for the call and fadvise takes no pointer
     let ret = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
     assert_eq!(ret, 0, "dropping the segment's pages failed");
 }
@@ -3850,49 +3470,45 @@ fn a_posix_read_answers_at_once() {
     assert_eq!(store.driver.outstanding(), 0);
 }
 
-// the async door reads through the driver where a mapping would have served
+// the awaited door maps an open tail's record and asks the cache for a sealed one
 #[test]
-fn async_never_maps() {
+fn awaited_reads_map_only_the_open_tail() {
     let mapped = ReelConfig {
         map_above: crate::config::MAP_EVERYTHING,
         ..config(1, SyncPolicy::Never)
     };
     let (store, backend, _dir) = posix_store(mapped);
     store.put(&record(7, 1), &[0x5a; 4096]).expect("put");
-    // The first read of a segment opens it and advises the kernel about it,
-    // which are ops of their own, so the counted reads start after that.
-    store.get(&record(7, 1)).expect("warm get");
+    // The first read opens and advises the segment, so counting starts after it
+    let blocked = store.get(&record(7, 1)).expect("warm get");
 
-    let before = backend.ops();
-    let blocked = store.get(&record(7, 1)).expect("get");
-    let after_block = backend.ops();
-    let awaited = block_on(store.get_wait(&record(7, 1))).expect("awaited get");
-    let after_wait = backend.ops();
-
-    assert_eq!(blocked, awaited, "both doors read the same record");
+    let ops = backend.ops();
+    let asked = backend.warm_reads().asked;
+    let in_tail = block_on(store.get_wait(&record(7, 1))).expect("awaited get");
+    assert_eq!(blocked, in_tail, "both doors read the same record");
+    assert_eq!(backend.ops(), ops, "the tail's record went to the driver");
     assert_eq!(
-        after_block, before,
-        "the mapped read asked the driver for nothing"
+        backend.warm_reads().asked,
+        asked,
+        "the tail's record asked the cache"
     );
+
+    drop(store.cue().expect("seal"));
+    let asked = backend.warm_reads().asked;
+    let sealed = block_on(store.get_wait(&record(7, 1))).expect("awaited get");
+    assert_eq!(blocked, sealed, "both doors read the same record");
     assert!(
-        after_wait > after_block,
-        "the awaited read went to the driver"
+        backend.warm_reads().asked > asked,
+        "the awaited read of a sealed record took its mapping"
     );
 }
 
-/// A volume whose awaited point reads ask the page cache before they queue
+/// A volume read through the page cache, whose point reads ask it before they queue
 fn probed_config() -> ReelConfig {
-    ReelConfig {
-        point_reads: PointReads::Probed,
-        ..config(1, SyncPolicy::Never)
-    }
+    config(1, SyncPolicy::Never)
 }
 
-/// Whether the probe served anything here, so a skip is nobody's silent green
-///
-/// The shim answers EAGAIN off linux, and on it a filesystem can refuse the flag
-/// outright, so neither can serve a warm read. REEL_DIRECT_REQUIRED turns the
-/// skip back into a failure where the probe is supposed to work.
+/// Whether the probe served anything, failing a skip when REEL_DIRECT_REQUIRED is set
 fn warm_serve_or_skip(served: u64) -> bool {
     if served > 0 {
         return true;
@@ -3921,6 +3537,38 @@ fn flip_on_disk(store: &ReelStore, dir: &TempDir, key: &RecordKey) {
     file.read_at(&mut byte, at).expect("read the payload byte");
     byte[0] ^= 0xff;
     file.write_at(&byte, at).expect("write the payload byte");
+}
+
+// a volume that maps its reads serves a spot index hit from the mapping, with no read call
+#[test]
+fn a_mapped_volume_serves_spot_hits_from_the_mapping() {
+    let (store, backend, _dir) = posix_store(ReelConfig {
+        map_above: crate::config::MAP_EVERYTHING,
+        ..config(1, SyncPolicy::Never)
+    });
+    for byte in 0..200u8 {
+        store.put(&record(7, byte), &[byte; 100]).expect("put");
+    }
+    store.reel.tails()[0].seal().expect("seal");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+    assert!(
+        store.index.spot_held() > 0,
+        "the hand-over filled the spot index"
+    );
+    store.get(&record(7, 1)).expect("get").expect("found");
+
+    let ops = backend.ops();
+    let found = store.get(&record(7, 2)).expect("get").expect("found");
+    let waited = block_on(store.get_wait(&record(7, 3)))
+        .expect("awaited get")
+        .expect("found");
+    assert_eq!(&*found, &[2u8; 100][..]);
+    assert_eq!(&*waited, &[3u8; 100][..]);
+    assert_eq!(
+        backend.ops() - ops,
+        0,
+        "a mapped spot hit went to the driver"
+    );
 }
 
 // a tail mapped on an early read still serves the records written after it
@@ -3958,8 +3606,9 @@ fn a_warm_awaited_read_skips_the_engine() {
     let key = record(7, 1);
     let payload = stripes(8 * 1024);
     store.put(&key, &payload).expect("put");
-    // The first read opens the segment and advises the kernel about it, which are
-    // ops of their own, and it is also what leaves the record's pages resident.
+    // Sealed, since the awaited door copies an open tail's record out of its mapping
+    drop(store.cue().expect("seal"));
+    // The first read opens and advises the segment and leaves the record's pages resident
     store.get(&key).expect("warm the descriptor and the cache");
 
     let ops = backend.ops();
@@ -4007,8 +3656,9 @@ fn a_cold_awaited_read_falls_through() {
     let key = record(7, 1);
     let payload = stripes(8 * 1024);
     store.put(&key, &payload).expect("put");
-    // Dropping pages leaves the dirty ones where they are, so the record is on
-    // the device before anything is dropped.
+    // Sealed, since the awaited door copies an open tail's record out of its mapping
+    drop(store.cue().expect("seal"));
+    // Dropping pages skips dirty ones, so flush the record to the device first
     store.flush().expect("flush");
     store.get(&key).expect("warm the descriptor");
     drop_cache(&store, &key);
@@ -4031,8 +3681,7 @@ fn a_cold_awaited_read_falls_through() {
         "the first poll never asked the cache"
     );
     if after.served > before.served {
-        // A filesystem whose pages are the file, tmpfs above all, drops nothing,
-        // and there is no cold read to be had on one.
+        // A filesystem whose pages are the file, like tmpfs, drops nothing and has no cold read
         assert!(
             std::env::var_os("REEL_DIRECT_REQUIRED").is_none(),
             "dropping the pages left them resident and REEL_DIRECT_REQUIRED is set",
@@ -4060,6 +3709,8 @@ fn a_warm_awaited_read_still_verifies() {
     let payload = stripes(8 * 1024);
     store.put(&awaited, &payload).expect("put");
     store.put(&blocked, &payload).expect("put");
+    // Sealed, since the awaited door copies an open tail's record out of its mapping
+    drop(store.cue().expect("seal"));
     store
         .get(&awaited)
         .expect("warm the descriptor and the cache");
@@ -4093,7 +3744,7 @@ fn a_warm_awaited_read_still_verifies() {
 // an awaited put lands the record and the index exactly as the blocking one
 #[test]
 fn async_put_matches_the_block() {
-    let (store, _sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, _sim) = sim_store(config(1, EVERY_WRITE));
 
     store.put(&record(7, 1), &[0x11; 512]).expect("put");
     block_on(store.put_owned_wait(&record(7, 2), vec![0x22; 512])).expect("awaited put");
@@ -4107,13 +3758,13 @@ fn async_put_matches_the_block() {
         store.get(&record(7, 2)).expect("get").map(Value::into_vec),
         Some(vec![0x22; 512]),
     );
-    assert_eq!(store.column_totals(RECORD).expect("totals").count, 2);
+    assert_eq!(store.column_totals(RECORD).count, 2);
 }
 
 // an awaited put is as durable as the blocking put beside it
 #[test]
 fn async_put_is_durable() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, sim) = sim_store(config(1, EVERY_WRITE));
 
     store.put(&record(7, 1), &[0x11; 512]).expect("put");
     let blocked = sim.unsynced_bytes();
@@ -4129,7 +3780,7 @@ fn async_put_is_durable() {
 // an awaited batch is one durability point and one publish, as the blocking one
 #[test]
 fn async_batch_matches_the_block() {
-    let (store, _sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, _sim) = sim_store(config(1, EVERY_WRITE));
     store.put(&record(7, 9), &[0x99; 128]).expect("put");
 
     let writes = vec![
@@ -4164,8 +3815,7 @@ fn a_dropped_put_leaks_nothing() {
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
     let budget = Arc::clone(&store.reel.shared().budget);
     let key = record(7, 1);
-    // One record in flight and the ceiling squeezed to nothing behind it, so the next
-    // write has to wait: the idle escape only lets a writer past an empty budget.
+    // One record in flight under a zero ceiling, so the next write has to wait
     budget.acquire(4096);
     budget.throttle(0.0);
 
@@ -4238,12 +3888,12 @@ fn columns_are_independent() {
         store.get(&blob(9)).expect("get"),
         Some(Value::new(vec![0x22; 300]))
     );
-    assert_eq!(store.column_totals(RECORD).expect("totals").count, 1);
-    assert_eq!(store.column_totals(BLOB).expect("totals").count, 1);
+    assert_eq!(store.column_totals(RECORD).count, 1);
+    assert_eq!(store.column_totals(BLOB).count, 1);
     assert_eq!(store.totals().bytes, ByteCount::from_bytes(400));
 }
 
-// a key naming a column the volume does not serve is refused, not stored
+// a key for a column the volume does not serve is refused
 #[test]
 fn unknown_column_refused() {
     let (store, _sim) = sim_store(config(1, SyncPolicy::Never));
@@ -4285,7 +3935,7 @@ fn delete_updates_totals() {
 // a batch lands every one of its writes and moves the index once
 #[test]
 fn batch_applies_together() {
-    let (store, _sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, _sim) = sim_store(config(1, EVERY_WRITE));
     store.put(&record(7, 9), &[0x99; 100]).expect("put");
 
     store
@@ -4314,13 +3964,10 @@ fn batch_applies_together() {
     assert_eq!(store.totals().count, 2);
 }
 
-// a range delete rides a batch, sweeping what came before it and sparing what follows
-//
-// One reservation and one durability point for the whole of it, so a caller with a
-// range in the middle of its batch does not have to cut the batch around it.
+// a range delete in a batch sweeps what came before it and spares what follows
 #[test]
 fn a_batch_carries_a_range_delete() {
-    let (store, _sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, _sim) = sim_store(config(1, EVERY_WRITE));
     store.put(&record(7, 1), &[0x11; 100]).expect("put");
     store
         .put(&record(8, 1), &[0x88; 100])
@@ -4363,10 +4010,10 @@ fn a_batch_carries_a_range_delete() {
     );
 }
 
-// a batch carrying a range delete comes back the same way after a reopen
+// a batch with a range delete comes back the same way after a reopen
 #[test]
 fn a_batched_range_delete_survives_a_reopen() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, sim) = sim_store(config(1, EVERY_WRITE));
     store.put(&record(7, 1), &[0x11; 100]).expect("put");
 
     let start = RecordKey::from_bytes(RECORD, &group_bound(7)).expect("key");
@@ -4383,7 +4030,7 @@ fn a_batched_range_delete_survives_a_reopen() {
         ])
         .expect("batch");
 
-    let reopened = reopen(&sim, config(1, SyncPolicy::EveryPut));
+    let reopened = reopen(&sim, config(1, EVERY_WRITE));
 
     assert!(
         !reopened.contains(&record(7, 1)).expect("read"),
@@ -4398,7 +4045,7 @@ fn a_batched_range_delete_survives_a_reopen() {
 // an empty range in a batch writes no record, the same refusal the single door makes
 #[test]
 fn a_batched_empty_range_writes_nothing() {
-    let (store, _sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, _sim) = sim_store(config(1, EVERY_WRITE));
     store.put(&record(7, 1), &[0x11; 100]).expect("put");
 
     let start = RecordKey::from_bytes(RECORD, &group_bound(7)).expect("key");
@@ -4418,7 +4065,7 @@ fn a_batched_empty_range_writes_nothing() {
 // a whole batch survives a reopen, since the frame that declares it landed
 #[test]
 fn batch_survives_a_reopen() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, sim) = sim_store(config(1, EVERY_WRITE));
     store
         .apply_batch(vec![
             RecordWrite::Put {
@@ -4432,7 +4079,7 @@ fn batch_survives_a_reopen() {
         ])
         .expect("batch");
 
-    let reopened = reopen(&sim, config(1, SyncPolicy::EveryPut));
+    let reopened = reopen(&sim, config(1, EVERY_WRITE));
 
     assert_eq!(reopened.totals().count, 2);
     assert_eq!(
@@ -4444,7 +4091,7 @@ fn batch_survives_a_reopen() {
 // a batch a crash landed inside leaves none of itself behind
 #[test]
 fn torn_batch_leaves_nothing() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, sim) = sim_store(config(1, EVERY_WRITE));
     store.put(&record(7, 9), &[0x99; 100]).expect("put");
     store
         .apply_batch(vec![
@@ -4467,7 +4114,7 @@ fn torn_batch_leaves_nothing() {
 
     let mut image = sim.durable_image();
     flip_payload(&mut image, torn);
-    let reopened = reopen_image(image, config(1, SyncPolicy::EveryPut));
+    let reopened = reopen_image(image, config(1, EVERY_WRITE));
 
     assert!(
         reopened.contains(&record(7, 9)).expect("read"),
@@ -4481,7 +4128,7 @@ fn torn_batch_leaves_nothing() {
     assert_eq!(reopened.totals().count, 1);
 }
 
-// corruption on a sole copy is an error that keeps the key, not a silent miss
+// corruption on a sole copy is an error that keeps the key
 #[test]
 fn a_sole_copy_reports_corruption_and_keeps_the_key() {
     let sole = ReelConfig {
@@ -4572,7 +4219,7 @@ fn an_empty_range_writes_nothing() {
 // a clean reopen reproduces the whole index and its totals
 #[test]
 fn reopen_reproduces_index() {
-    let (store, sim) = sim_store(config(2, SyncPolicy::EveryPut));
+    let (store, sim) = sim_store(config(2, EVERY_WRITE));
     for byte in 1..=8u8 {
         store.put(&record(7, byte), &[byte; 400]).expect("put");
     }
@@ -4580,7 +4227,7 @@ fn reopen_reproduces_index() {
     let before = store.totals();
     store.close().expect("close");
 
-    let reopened = reopen(&sim, config(2, SyncPolicy::EveryPut));
+    let reopened = reopen(&sim, config(2, EVERY_WRITE));
 
     assert_eq!(reopened.totals(), before);
     assert_eq!(
@@ -4592,7 +4239,7 @@ fn reopen_reproduces_index() {
 // an open that leaves out a written column still counts its bytes, and only a read-only one goes on
 #[test]
 fn an_undeclared_column_is_counted_and_refused_writable() {
-    let (store, sim) = sim_store(config(2, SyncPolicy::EveryPut));
+    let (store, sim) = sim_store(config(2, EVERY_WRITE));
     store.put(&record(7, 1), &[0x11; 400]).expect("put");
     store.put(&blob(1), &[0x33; 900]).expect("blob");
     store.close().expect("close");
@@ -4601,7 +4248,7 @@ fn an_undeclared_column_is_counted_and_refused_writable() {
     let restored = Arc::new(SimIo::from_image(sim.durable_image()));
     let writable = ReelStore::open_with_io(
         PathBuf::from(ROOT),
-        config(2, SyncPolicy::EveryPut),
+        config(2, EVERY_WRITE),
         records_only,
         restored.clone(),
     );
@@ -4612,7 +4259,7 @@ fn an_undeclared_column_is_counted_and_refused_writable() {
 
     let read_only = ReelStore::open_read_only_with_io(
         PathBuf::from(ROOT),
-        config(2, SyncPolicy::EveryPut),
+        config(2, EVERY_WRITE),
         records_only,
         restored,
     )
@@ -4656,15 +4303,478 @@ fn close_leaves_the_tail_resumable() {
     assert!(reopened.get(&record(7, 2)).expect("get").is_some());
 }
 
+// after a torn group is rejected on reopen, new writes go past it and it stays rejected
+#[test]
+fn a_resumed_tail_writes_past_a_group_it_turned_down() {
+    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
+    store.put(&record(7, 1), &[0x11; 512]).expect("put");
+    store.put(&record(7, 2), &[0x22; 512]).expect("put");
+    store.close().expect("close");
+    let path = Path::new(ROOT).join(segment_file_name(SegmentId(1)));
+    let mut image = sim.durable_image();
+    for (at, bytes) in image.iter_mut() {
+        if *at != path {
+            continue;
+        }
+        let (_, rows) = crate::format::journal::rows_region(bytes).expect("an open segment's rows");
+        let (groups, _) = crate::format::journal::read_groups(rows);
+        // Flip a byte in the last record's payload
+        let torn = groups.last().expect("a group")[0].offset as usize + 16;
+        bytes[torn] ^= 0xff;
+    }
+    let open = |sim: &SimIo| {
+        ReelStore::open_with_io(
+            PathBuf::from(ROOT),
+            config(1, SyncPolicy::Never),
+            COLUMNS,
+            Arc::new(sim.clone()),
+        )
+        .expect("reopen")
+    };
+
+    let resumed_sim = SimIo::from_image(image);
+    let resumed = open(&resumed_sim);
+    assert!(resumed.get(&record(7, 1)).expect("get").is_some());
+    assert!(
+        resumed.get(&record(7, 2)).expect("get").is_none(),
+        "a torn record came back"
+    );
+    resumed.put(&record(7, 2), &[0x22; 512]).expect("put again");
+    resumed.put(&record(7, 3), &[0x33; 512]).expect("put");
+    resumed.close().expect("close");
+
+    let again = open(&SimIo::from_image(resumed_sim.durable_image()));
+    for (byte, fill) in [(1u8, 0x11u8), (2, 0x22), (3, 0x33)] {
+        assert_eq!(
+            again.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![fill; 512])),
+            "key {byte} after the second reopen"
+        );
+    }
+}
+
+// a closed tail gives back the zeros ahead of its records and its rows, and reopens whole
+#[test]
+fn a_closed_tail_holds_little_more_than_its_writes() {
+    use std::os::unix::fs::MetadataExt;
+    let (store, _backend, dir) = posix_store(config(1, SyncPolicy::Never));
+    for byte in 0..5u8 {
+        store.put(&record(7, byte), &[byte; 200]).expect("put");
+    }
+    store.close().expect("close");
+    drop(store);
+
+    let path = dir.path().join(segment_file_name(SegmentId(1)));
+    let held = std::fs::metadata(&path).expect("stat").blocks() * 512;
+    assert!(
+        held <= 64 * 1024,
+        "a closed tail of five records holds {held} bytes"
+    );
+    let reopened = ReelStore::open(
+        dir.path().to_path_buf(),
+        config(1, SyncPolicy::Never),
+        COLUMNS,
+    )
+    .expect("reopen");
+    for byte in 0..5u8 {
+        assert_eq!(
+            reopened.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![byte; 200])),
+            "key {byte} after the reopen"
+        );
+    }
+}
+
+// an overwritten key reads in one read, and the old record is known dead without a read
+#[test]
+fn an_overwritten_key_reads_its_live_slot_in_one_read() {
+    let (store, backend, _dir) = posix_store(config(1, SyncPolicy::Never));
+    let key = record(7, 1);
+    store.put(&key, &[0x11; 100]).expect("put");
+    let old = store.index.get(&key).expect("get").expect("entry").loc;
+    store.reel.tails()[0].seal().expect("seal");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+    store.put(&key, &[0x22; 100]).expect("overwrite");
+    let new = store.index.get(&key).expect("get").expect("entry").loc;
+    store.reel.tails()[0].seal().expect("seal");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+    assert_eq!(store.index.spot_held(), 2, "the old version's slot is gone");
+    store.get(&key).expect("get").expect("found");
+
+    let (ops, blocks) = (backend.ops(), store.filter_probes().blocks);
+    let found = store.get(&key).expect("get");
+    assert_eq!(found, Some(Value::new(vec![0x22; 100])));
+    let none = crate::format::lsn::Lsn::NONE;
+    assert!(!store.index.is_live_at(&key, old, none).expect("old"));
+    assert!(store.index.is_live_at(&key, new, none).expect("new"));
+    // Linux serves the get from the mapping and takes no read at all
+    assert!(
+        backend.ops() - ops <= 1,
+        "the get and the liveness checks took more than one read"
+    );
+    assert_eq!(store.filter_probes().blocks, blocks, "a footer search ran");
+}
+
+// an overwrite settles a key's older versions off their own records, with no footer search
+#[test]
+fn an_overwrite_settles_older_versions_with_no_footer_search() {
+    let (store, _backend, _dir) = posix_store(config(1, SyncPolicy::Never));
+    let key = record(7, 1);
+    for byte in 0..3u8 {
+        store.put(&key, &[byte; 100]).expect("put");
+        store.reel.tails()[0].seal().expect("seal");
+        assert!(store.page_out_sealed().expect("hand over") > 0);
+    }
+    assert_eq!(store.index.spot_held(), 3, "every version holds a slot");
+
+    let blocks = store.filter_probes().blocks;
+    store.put(&key, &[0x33; 100]).expect("overwrite");
+    assert_eq!(
+        store.index.spot_held(),
+        0,
+        "the older versions are still held"
+    );
+    assert_eq!(store.filter_probes().blocks, blocks, "a footer search ran");
+    assert_eq!(
+        store.get(&key).expect("get"),
+        Some(Value::new(vec![0x33; 100]))
+    );
+}
+
+// a record at the keyless ceiling reads off its own check, with no footer search
+#[test]
+fn a_record_at_the_keyless_ceiling_reads_with_no_footer_search() {
+    let (store, _backend, _dir) = posix_store(config(1, SyncPolicy::Never));
+    let key = record(7, 1);
+    let payload: Vec<u8> = (0..crate::format::record::KEYLESS_MAX)
+        .map(|at| at as u8)
+        .collect();
+    store.put(&key, &payload).expect("put");
+    store.reel.tails()[0].seal().expect("seal");
+    assert!(store.page_out_sealed().expect("hand over") > 0);
+
+    let blocks = store.filter_probes().blocks;
+    assert_eq!(store.get(&key).expect("get"), Some(Value::new(payload)));
+    assert_eq!(store.filter_probes().blocks, blocks, "a footer search ran");
+}
+
+// a tail that stops taking writes is sealed, a busy one and an empty one are left open
+#[test]
+fn the_tick_seals_a_tail_gone_quiet() {
+    let (store, _backend, _dir) = posix_store(config(2, SyncPolicy::Never));
+    let quiet = std::time::Duration::ZERO;
+    let tails = store.reel.tails();
+    let segment = |at: usize| tails[at].tail().active_segment();
+    store.put(&record(7, 1), &[1; 100]).expect("put");
+    let written = (0..tails.len())
+        .find(|at| tails[*at].holds_records())
+        .expect("a tail took the put");
+    let before = segment(written);
+    let others: Vec<_> = (0..tails.len())
+        .filter(|at| *at != written)
+        .map(segment)
+        .collect();
+
+    for byte in 2..5u8 {
+        store.seal_idle_tails(quiet).expect("look");
+        store.put(&record(7, byte), &[byte; 100]).expect("put");
+    }
+    assert_eq!(segment(written), before, "a tail taking writes was sealed");
+
+    store.seal_idle_tails(quiet).expect("first quiet look");
+    store.seal_idle_tails(quiet).expect("second quiet look");
+    assert_ne!(segment(written), before, "the quiet tail is still open");
+    let after: Vec<_> = (0..tails.len())
+        .filter(|at| *at != written)
+        .map(segment)
+        .collect();
+    assert_eq!(after, others, "an empty tail was sealed");
+    assert_eq!(
+        store.get(&record(7, 4)).expect("get"),
+        Some(Value::new(vec![4; 100]))
+    );
+}
+
+// an older version beside the newer one in a segment is found through the key's blocks
+#[test]
+fn an_older_version_reads_its_row_through_the_key_blocks() {
+    use crate::index::spot::{HeadRead, RecordSource};
+    let (store, _backend, _dir) = posix_store(config(1, SyncPolicy::Never));
+    let key = record(7, 1);
+    store.put(&key, &[0x11; 100]).expect("put");
+    let old = store.index.get(&key).expect("get").expect("entry").loc;
+    store.put(&key, &[0x22; 120]).expect("overwrite");
+    let segment = store.reel.tails()[0].seal().expect("seal");
+    let shared = store.reel.shared();
+    shared.footers.forget(segment);
+
+    let head = shared
+        .head(key.as_ref(), segment, old.offset)
+        .expect("head");
+    assert!(
+        matches!(head, HeadRead::Same(found) if found.len == 100),
+        "the older version's row: {head:?}"
+    );
+    assert!(
+        shared.footers.get(segment).is_none(),
+        "the whole footer was read"
+    );
+}
+
+// a close compacts until no sealed segment is past the dead ratio
+#[test]
+fn a_close_leaves_no_segment_past_the_dead_ratio() {
+    let (store, _backend, _dir) = posix_store(config(1, SyncPolicy::Never));
+    for round in 0..12u8 {
+        for byte in 0..40u8 {
+            store.put(&record(7, byte), &[round; 200]).expect("put");
+        }
+        store.reel.tails()[0].seal().expect("seal");
+    }
+    let ratio = store.config.compact_dead_ratio;
+    let past = |store: &ReelStore| {
+        store.settle_sealed().expect("settle");
+        store
+            .compactor
+            .select_target(&store.reel, &store.index, ratio, store.cues.floor())
+            .is_some()
+    };
+    assert!(past(&store), "the walk left no segment past the ratio");
+    store.close().expect("close");
+    assert!(!past(&store), "the close left a segment past the ratio");
+    for byte in 0..40u8 {
+        assert_eq!(
+            store.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![11; 200]))
+        );
+    }
+}
+
+// a covered segment whose seal cut and mark were lost is never resumed, so its next seal counts
+#[test]
+fn a_covered_segment_resumed_and_sealed_again_keeps_its_new_records() {
+    let config = || ReelConfig {
+        segment_bytes: ByteCount::from_bytes(16 * 1024),
+        sync: SyncPolicy::Never,
+        active_tails: ThreadBudget::threads(1),
+        ..ReelConfig::default()
+    };
+    let (store, sim) = sim_store(config());
+    let mut last = SegmentId(0);
+    let mut unsealed = Vec::new();
+    for round in 1..=10u8 {
+        for byte in 0..4u8 {
+            store.put(&record(7, byte), &[round; 300]).expect("put");
+        }
+        store.flush().expect("flush");
+        let path = Path::new(ROOT).join(segment_file_name(
+            store.reel.tails()[0].tail().active_segment(),
+        ));
+        unsealed = sim.durable_bytes(&path).expect("open segment durable");
+        last = store.reel.tails()[0].seal().expect("seal");
+    }
+    store.page_out_sealed().expect("page out");
+    let merged = store.merge_when_due().expect("merge");
+    assert!(
+        merged.is_some(),
+        "ten stacked segments merge into a key run"
+    );
+    assert!(
+        store.index().key_runs().covers(last),
+        "the run covers the last seal"
+    );
+    store.close().expect("close");
+    drop(store);
+
+    // The seal's sync after its truncate lied: the footer is down and the rows are still there
+    let path = Path::new(ROOT).join(segment_file_name(last));
+    let mut image = sim.durable_image();
+    for (at, bytes) in image.iter_mut() {
+        if *at != path {
+            continue;
+        }
+        let (rows_at, _) = crate::format::journal::rows_region(&unsealed).expect("rows");
+        bytes.resize(rows_at as usize, 0);
+        bytes.extend_from_slice(&unsealed[rows_at as usize..]);
+    }
+
+    let second_sim = SimIo::from_image(image);
+    let second = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        config(),
+        COLUMNS,
+        Arc::new(second_sim.clone()),
+    )
+    .expect("second open");
+    for byte in 0..4u8 {
+        assert_eq!(
+            second.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![10; 300]))
+        );
+    }
+    for byte in 0..4u8 {
+        second
+            .put(&record(7, byte), &[11; 300])
+            .expect("second life put");
+    }
+    second.reel.tails()[0].seal().expect("second seal");
+    second.flush().expect("flush");
+    for byte in 0..4u8 {
+        assert_eq!(
+            second.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![11; 300]))
+        );
+    }
+    second.close().expect("close");
+    drop(second);
+
+    let third = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        config(),
+        COLUMNS,
+        Arc::new(SimIo::from_image(second_sim.durable_image())),
+    )
+    .expect("third open");
+    for byte in 0..4u8 {
+        assert_eq!(
+            third.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![11; 300])),
+            "key {byte} after the third open"
+        );
+    }
+}
+
+// a lost seal cut leaves its mark after the rows, and the next open finds the footer and cuts
+#[test]
+fn a_lost_seal_cut_is_found_by_its_mark_and_made_at_open() {
+    let config = || ReelConfig {
+        segment_bytes: ByteCount::from_bytes(16 * 1024),
+        sync: SyncPolicy::Never,
+        active_tails: ThreadBudget::threads(1),
+        ..ReelConfig::default()
+    };
+    let (store, sim) = sim_store(config());
+    for byte in 0..4u8 {
+        store.put(&record(7, byte), &[1; 300]).expect("put");
+    }
+    store.flush().expect("flush");
+    let segment = store.reel.tails()[0].tail().active_segment();
+    let path = std::path::Path::new(ROOT).join(segment_file_name(segment));
+    let unsealed = sim.durable_bytes(&path).expect("open segment");
+    store.reel.tails()[0].seal().expect("seal");
+    let sealed = sim.durable_bytes(&path).expect("sealed segment");
+    store.close().expect("close");
+    drop(store);
+
+    // The cut never landed: footer, zeros to the rows, the rows, and the mark in the next block
+    let (rows_at, rows) = crate::format::journal::rows_region(&unsealed).expect("rows");
+    let footer_len =
+        crate::format::record::read_u32_le(&sealed[sealed.len() - 8..sealed.len() - 4]);
+    let mut lost = sealed.clone();
+    lost.resize(rows_at as usize, 0);
+    lost.extend_from_slice(rows);
+    lost.resize(
+        lost.len()
+            .next_multiple_of(crate::format::record::BLOCK as usize),
+        0,
+    );
+    let mark = crate::format::footer::seal_mark(sealed.len() as u64, footer_len);
+    lost.resize(
+        lost.len() + crate::format::record::BLOCK as usize - mark.len(),
+        0,
+    );
+    lost.extend_from_slice(&mark);
+    let mut image = sim.durable_image();
+    for (at, bytes) in image.iter_mut() {
+        if *at == path {
+            *bytes = lost.clone();
+        }
+    }
+
+    let second_sim = SimIo::from_image(image);
+    let second = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        config(),
+        COLUMNS,
+        Arc::new(second_sim.clone()),
+    )
+    .expect("second open");
+    assert_eq!(
+        second_sim.durable_bytes(&path).expect("segment").len(),
+        sealed.len(),
+        "the open did not make the lost cut"
+    );
+    assert_ne!(
+        second.reel.tails()[0].tail().active_segment(),
+        segment,
+        "the sealed segment was resumed as a tail"
+    );
+    for byte in 0..4u8 {
+        assert_eq!(
+            second.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![1; 300]))
+        );
+    }
+}
+
+// a volume's size counts the disk its files take, so a sparse open tail counts less
+#[test]
+fn a_volume_counts_the_bytes_its_files_take() {
+    let (store, _backend, _dir) = posix_store(config(1, SyncPolicy::Never));
+    for byte in 0..20u8 {
+        store.put(&record(7, byte), &[byte; 200]).expect("put");
+    }
+    store.flush().expect("flush");
+    let rows_at = 2 * store.config.segment_bytes.to_bytes();
+    let used = reel_core::store::Store::actual_size_bytes(&store).expect("size");
+    assert!(
+        used < rows_at,
+        "the volume reports {used} bytes for twenty small records, its open tail is {rows_at} long"
+    );
+}
+
+// a durable put survives a crash on a volume that never syncs, at the cost of one sync
+#[test]
+fn a_durable_put_survives_a_crash_on_one_sync() {
+    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
+    store.put(&record(7, 1), &[0x11; 300]).expect("put");
+    let before = sim.sync_count();
+    store
+        .put_durable(&record(7, 2), &[0x22; 300])
+        .expect("durable put");
+    assert_eq!(
+        sim.sync_count() - before,
+        1,
+        "a durable put took more than one sync"
+    );
+    store
+        .apply_batch_durable(vec![RecordWrite::Put {
+            key: record(7, 3),
+            payload: vec![0x33; 300],
+        }])
+        .expect("durable batch");
+
+    let image = sim.durable_image();
+    drop(store);
+    let reopened = reopen_image(image, config(1, SyncPolicy::Never));
+    for (byte, fill) in [(1u8, 0x11u8), (2, 0x22), (3, 0x33)] {
+        assert_eq!(
+            reopened.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![fill; 300])),
+            "key {byte} after the crash"
+        );
+    }
+}
+
 // a read-only open serves reads but rejects every write
 #[test]
 fn read_only_rejects_writes() {
-    let (store, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (store, sim) = sim_store(config(1, EVERY_WRITE));
     store.put(&record(7, 1), &[0x11; 400]).expect("put");
 
     let reader = ReelStore::open_read_only_with_io(
         PathBuf::from(ROOT),
-        config(1, SyncPolicy::EveryPut),
+        config(1, EVERY_WRITE),
         COLUMNS,
         Arc::new(SimIo::from_image(sim.durable_image())),
     )
@@ -4682,12 +4792,12 @@ fn read_only_rejects_writes() {
 // a reader picks up the writer's later appends only once it refreshes
 #[test]
 fn refresh_picks_up_later_writes() {
-    let (writer, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (writer, sim) = sim_store(config(1, EVERY_WRITE));
     writer.put(&record(7, 1), &[0x11; 400]).expect("put");
 
     let reader = ReelStore::open_read_only_with_io(
         PathBuf::from(ROOT),
-        config(1, SyncPolicy::EveryPut),
+        config(1, EVERY_WRITE),
         COLUMNS,
         Arc::new(sim.clone()),
     )
@@ -4702,17 +4812,17 @@ fn refresh_picks_up_later_writes() {
     assert!(reader.contains(&record(7, 2)).expect("read"));
 }
 
-// a reader follows the log rather than reading the volume again
+// a reader follows the log and reads only what is new
 #[test]
 fn refresh_reads_only_what_is_new() {
-    let (writer, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (writer, sim) = sim_store(config(1, EVERY_WRITE));
     for byte in 1..=8u8 {
         writer.put(&record(7, byte), &[byte; 400]).expect("put");
     }
 
     let reader = ReelStore::open_read_only_with_io(
         PathBuf::from(ROOT),
-        config(1, SyncPolicy::EveryPut),
+        config(1, EVERY_WRITE),
         COLUMNS,
         Arc::new(sim.clone()),
     )
@@ -4726,12 +4836,203 @@ fn refresh_reads_only_what_is_new() {
     assert_eq!(reader.totals().count, 9);
 }
 
+/// A writer with sealed segments and a tail, and a reader opened over it
+fn follower_over_segments() -> (ReelStore, ReelStore, SimIo) {
+    let mut settings = config(1, EVERY_WRITE);
+    settings.segment_bytes = ByteCount::from_bytes(8_192);
+    let (writer, sim) = sim_store(settings.clone());
+    for byte in 1..=6u8 {
+        writer.put(&record(7, byte), &[byte; 1_500]).expect("put");
+    }
+    writer.flush().expect("flush");
+    let reader = ReelStore::open_read_only_with_io(
+        PathBuf::from(ROOT),
+        settings,
+        COLUMNS,
+        Arc::new(sim.clone()),
+    )
+    .expect("read only open");
+    (writer, reader, sim)
+}
+
+// a rebuild that fails partway leaves the reader on the index it had
+#[test]
+fn a_failed_rebuild_keeps_the_old_index() {
+    let (writer, reader, sim) = follower_over_segments();
+
+    sim.arm_next_ops(1_000, FaultKind::ReadError);
+    assert!(reader.rebuild().is_err(), "the rebuild met a failed read");
+    sim.disarm();
+
+    // The cursor stayed where it was, so a catch-up reads only the later put
+    writer.put(&record(7, 9), &[9; 1_500]).expect("later put");
+    // Both opens share one simulated device, so the writer goes before the reader polls alone
+    drop(writer);
+    assert_eq!(reader.refresh().expect("refresh").applied, 1);
+    assert!(reader.contains(&record(7, 9)).expect("contains"));
+
+    for byte in 1..=6u8 {
+        assert!(
+            reader.contains(&record(7, byte)).expect("contains"),
+            "key {byte} left the index"
+        );
+        assert_eq!(
+            reader.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![byte; 1_500])),
+            "key {byte} after the failed rebuild"
+        );
+    }
+}
+
+// fifty rebuilds free every index they replace, so memory holds flat
+#[test]
+fn rebuilds_free_the_index_they_replace() {
+    let mut settings = config(1, EVERY_WRITE);
+    settings.segment_bytes = ByteCount::from_bytes(8_192);
+    let (writer, sim) = sim_store(settings.clone());
+    for byte in 0..=255u8 {
+        writer
+            .put(&record(u16::from(byte), byte), &[byte; 100])
+            .expect("put");
+    }
+    writer.flush().expect("flush");
+    drop(writer);
+    let reader =
+        ReelStore::open_read_only_with_io(PathBuf::from(ROOT), settings, COLUMNS, Arc::new(sim))
+            .expect("read only open");
+    reader.rebuild().expect("first rebuild");
+    let indexes = crate::index::map::live_indexes();
+    let resident = reader.resident_bytes();
+
+    for _ in 0..50 {
+        reader.rebuild().expect("rebuild");
+    }
+
+    assert_eq!(
+        crate::index::map::live_indexes(),
+        indexes,
+        "a rebuild kept an index alive"
+    );
+    assert_eq!(
+        reader.resident_bytes(),
+        resident,
+        "the index grew across rebuilds"
+    );
+    for byte in 0..=255u8 {
+        assert_eq!(
+            reader.get(&record(u16::from(byte), byte)).expect("get"),
+            Some(Value::new(vec![byte; 100])),
+            "key {byte} after the rebuilds"
+        );
+    }
+}
+
+// a walk that spans rebuilds goes on from its last key and yields each key once
+#[test]
+fn a_walk_across_rebuilds_sees_every_key_once() {
+    use reel_core::Store;
+
+    let mut settings = config(1, EVERY_WRITE);
+    settings.segment_bytes = ByteCount::from_bytes(8_192);
+    let (writer, sim) = sim_store(settings.clone());
+    for byte in 0..=255u8 {
+        writer
+            .put(&record(u16::from(byte), byte), &[byte; 100])
+            .expect("put");
+    }
+    writer.flush().expect("flush");
+    drop(writer);
+    let reader =
+        ReelStore::open_read_only_with_io(PathBuf::from(ROOT), settings, COLUMNS, Arc::new(sim))
+            .expect("read only open");
+
+    let mut seen = Vec::new();
+    for (key, value) in Store::iter(&reader, "record").expect("walk") {
+        assert_eq!(
+            value.as_ref(),
+            &[key[2]; 100][..],
+            "the value under {key:?}"
+        );
+        seen.push(key);
+        reader.rebuild().expect("rebuild");
+    }
+
+    let wanted: Vec<Vec<u8>> = (0..=255u8)
+        .map(|byte| record(u16::from(byte), byte).as_slice().to_vec())
+        .collect();
+    assert_eq!(seen, wanted);
+
+    // Walks and batch reads on other threads see every key while rebuilds run under them
+    let keys: Vec<RecordKey> = (0..=255u8)
+        .map(|byte| record(u16::from(byte), byte))
+        .collect();
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let walking = scope.spawn(|| {
+            let mut wrong = 0u32;
+            while !done.load(Ordering::Acquire) {
+                let walked: Vec<Vec<u8>> = Store::iter(&reader, "record")
+                    .expect("walk")
+                    .map(|(key, _)| key)
+                    .collect();
+                wrong += u32::from(walked != wanted);
+            }
+            wrong
+        });
+        let batching = scope.spawn(|| {
+            let mut missed = 0usize;
+            while !done.load(Ordering::Acquire) {
+                let values = reader.get_many(&keys).expect("get many");
+                missed += values.iter().filter(|value| value.is_none()).count();
+            }
+            missed
+        });
+        for _ in 0..50 {
+            reader.rebuild().expect("rebuild");
+        }
+        done.store(true, Ordering::Release);
+        assert_eq!(
+            walking.join().expect("walker"),
+            0,
+            "a walk lost or repeated a key"
+        );
+        assert_eq!(
+            batching.join().expect("batch"),
+            0,
+            "a batch read missed a key"
+        );
+    });
+}
+
+// a read during a rebuild finds every key the reader held before it
+#[test]
+fn a_read_during_a_rebuild_misses_nothing() {
+    let (writer, reader, _sim) = follower_over_segments();
+    drop(writer);
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let reading = scope.spawn(|| {
+            let mut missed = 0u32;
+            while !done.load(Ordering::Acquire) {
+                for byte in 1..=6u8 {
+                    missed += u32::from(!reader.contains(&record(7, byte)).expect("contains"));
+                }
+            }
+            missed
+        });
+        for _ in 0..50 {
+            reader.rebuild().expect("rebuild");
+        }
+        done.store(true, Ordering::Release);
+        assert_eq!(reading.join().expect("reader"), 0, "a read missed a key");
+    });
+}
+
 // a reader following the log across a compaction keeps the key it repointed
 #[test]
 fn refresh_follows_a_relocation() {
-    let mut settings = config(1, SyncPolicy::EveryPut);
+    let mut settings = config(1, EVERY_WRITE);
     settings.segment_bytes = ByteCount::from_bytes(8_192);
-    settings.alloc_chunk = ByteCount::from_bytes(4_096);
     let (writer, sim) = sim_store(settings.clone());
     for byte in 1..=4u8 {
         writer.put(&record(7, byte), &[byte; 1_500]).expect("put");
@@ -4769,16 +5070,158 @@ fn refresh_follows_a_relocation() {
     }
 }
 
+/// A writer with four keys and a reader opened over them, on segments small enough to retire
+fn reader_over_four_keys() -> (ReelStore, ReelStore) {
+    let mut settings = config(1, EVERY_WRITE);
+    settings.segment_bytes = ByteCount::from_bytes(8_192);
+    let (writer, sim) = sim_store(settings.clone());
+    for byte in 1..=4u8 {
+        writer.put(&record(7, byte), &[byte; 1_500]).expect("put");
+    }
+    writer.flush().expect("flush");
+    let reader = ReelStore::open_read_only_with_io(
+        PathBuf::from(ROOT),
+        settings,
+        COLUMNS,
+        Arc::new(sim.clone()),
+    )
+    .expect("read only open");
+    (writer, reader)
+}
+
+// a reader meeting an overwrite after the old version's segment retired counts the key once
+#[test]
+fn refresh_follows_an_overwrite_past_a_retire() {
+    let (writer, reader) = reader_over_four_keys();
+    for byte in 1..=4u8 {
+        writer
+            .put(&record(7, byte), &[byte + 100; 1_500])
+            .expect("overwrite");
+    }
+    writer.compact_once().expect("compact");
+
+    let caught = reader.refresh().expect("refresh");
+
+    assert!(!caught.retired.is_empty(), "the compaction retired nothing");
+    assert_eq!(reader.totals().count, 4, "an overwritten key counts twice");
+}
+
+// a reader that meets a delete after the deleted version's segment retired stops counting the key
+#[test]
+fn refresh_follows_a_delete_past_a_retire() {
+    let (writer, reader) = reader_over_four_keys();
+    for byte in 1..=2u8 {
+        writer.delete(&record(7, byte)).expect("delete");
+    }
+    writer.compact_once().expect("compact");
+
+    let caught = reader.refresh().expect("refresh");
+
+    assert!(!caught.retired.is_empty(), "the compaction retired nothing");
+    assert_eq!(reader.totals().count, 2, "a deleted key still counts");
+}
+
+// a read of a key moved out of a retired segment finds it, and a refresh counts it once
+#[test]
+fn a_read_past_a_retire_finds_the_moved_key() {
+    let mut settings = config(1, EVERY_WRITE);
+    settings.segment_bytes = ByteCount::from_bytes(8_192);
+    let (writer, sim) = sim_store(settings.clone());
+    for byte in 1..=4u8 {
+        writer.put(&record(7, byte), &[byte; 1_500]).expect("put");
+    }
+    drop(writer.cue().expect("seal"));
+    for byte in 1..=3u8 {
+        writer
+            .put(&record(7, byte), &[byte + 100; 1_500])
+            .expect("overwrite");
+    }
+    writer.flush().expect("flush");
+    // One reader for each way a read comes in
+    let readers: Vec<ReelStore> = (0..3)
+        .map(|_| {
+            ReelStore::open_read_only_with_io(
+                PathBuf::from(ROOT),
+                settings.clone(),
+                COLUMNS,
+                Arc::new(sim.clone()),
+            )
+            .expect("read only open")
+        })
+        .collect();
+    writer.compact_once().expect("compact");
+    assert_eq!(
+        writer.compaction_counters().segments_rewritten,
+        1,
+        "the compaction moved nothing"
+    );
+    let moved = record(7, 4);
+
+    let read = readers[0].get(&moved).expect("get");
+    let held = readers[1].contains(&moved).expect("contains");
+    let size = readers[2].size_of(&moved).expect("size");
+
+    assert!(
+        read.as_deref() == Some(&[4u8; 1_500][..]),
+        "the moved key read as gone"
+    );
+    assert!(held, "the moved key read as missing");
+    assert_eq!(
+        size,
+        Some(ByteCount::from_bytes(1_500)),
+        "the moved key lost its size"
+    );
+    for reader in &readers {
+        reader.refresh().expect("refresh");
+        assert_eq!(reader.totals().count, 4, "the moved key counts twice");
+    }
+}
+
+// a reader that meets a range delete after the segment holding its keys retired stops counting them
+#[test]
+fn refresh_follows_a_range_delete_past_a_retire() {
+    let mut settings = config(1, EVERY_WRITE);
+    settings.segment_bytes = ByteCount::from_bytes(8_192);
+    let (writer, sim) = sim_store(settings.clone());
+    for byte in 1..=2u8 {
+        writer.put(&record(7, byte), &[byte; 1_500]).expect("put");
+    }
+    drop(writer.cue().expect("seal"));
+    let reader = ReelStore::open_read_only_with_io(
+        PathBuf::from(ROOT),
+        settings,
+        COLUMNS,
+        Arc::new(sim.clone()),
+    )
+    .expect("read only open");
+    let start = RecordKey::from_bytes(RECORD, &group_bound(7)).expect("key");
+    writer
+        .delete_range(&start, Some(&group_bound(8)))
+        .expect("range delete");
+    while writer.sweep_covers().expect("sweep") {}
+    writer.compact_once().expect("compact");
+
+    let caught = reader.refresh().expect("refresh");
+
+    assert!(!caught.retired.is_empty(), "the compaction retired nothing");
+    assert_eq!(writer.totals().count, 0);
+    assert_eq!(
+        reader.totals().count,
+        0,
+        "a key the range took still counts"
+    );
+}
+
 // a range delete a reader follows keeps its keys deleted
 #[test]
 fn refresh_follows_a_range_delete() {
-    let (writer, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (writer, sim) = sim_store(config(1, EVERY_WRITE));
     writer.put(&record(7, 1), &[0x11; 100]).expect("put");
     writer.put(&record(8, 1), &[0x22; 100]).expect("put");
 
     let reader = ReelStore::open_read_only_with_io(
         PathBuf::from(ROOT),
-        config(1, SyncPolicy::EveryPut),
+        config(1, EVERY_WRITE),
         COLUMNS,
         Arc::new(sim.clone()),
     )
@@ -4806,11 +5249,11 @@ fn refresh_rejects_a_writer() {
 // a read-only volume is driven by the same timer and never writes on the pass
 #[test]
 fn maintain_once_is_inert_read_only() {
-    let (writer, sim) = sim_store(config(1, SyncPolicy::EveryPut));
+    let (writer, sim) = sim_store(config(1, EVERY_WRITE));
     writer.put(&record(7, 1), &[0x11; 400]).expect("put");
     let reader = ReelStore::open_read_only_with_io(
         PathBuf::from(ROOT),
-        config(1, SyncPolicy::EveryPut),
+        config(1, EVERY_WRITE),
         COLUMNS,
         Arc::new(SimIo::from_image(sim.durable_image())),
     )
@@ -4829,7 +5272,7 @@ fn group_bound(group: u16) -> Vec<u8> {
     bytes
 }
 
-/// Corrupt the payload of the record a location names
+/// Corrupt the payload of the record at a location
 fn flip_payload(image: &mut DurableImage, loc: Loc) {
     let path = Path::new(ROOT).join(segment_file_name(loc.segment));
     for (candidate, bytes) in image.iter_mut() {
@@ -4839,5 +5282,246 @@ fn flip_payload(image: &mut DurableImage, loc: Loc) {
                 bytes[at] ^= 0xff;
             }
         }
+    }
+}
+
+// a cue read never takes a handed-over spot version while the map holds a newer one
+#[test]
+fn a_cue_read_waits_out_a_hand_over_in_flight() {
+    let (store, _) = sim_store(config(1, SyncPolicy::Never));
+    let store = Arc::new(store);
+    let (first, second, third) = (
+        vec![0xa5u8; 8 * 1024],
+        vec![0x5au8; 8 * 1024],
+        vec![0x3cu8; 8 * 1024],
+    );
+    let keys: Vec<RecordKey> = (0..200u8).map(|byte| record(7, byte)).collect();
+    // Live keys keep the first partitions mostly live, so their hand-over fills the spot index
+    let mut filler =
+        (1..=30u16).flat_map(|group| (0..200u8).map(move |byte| record(group + 7, byte)));
+    for key in &keys {
+        store.put(key, &first).expect("put");
+        for key in filler.by_ref().take(30) {
+            store.put(&key, &[1u8; 64]).expect("put a filler");
+        }
+    }
+    drop(store.cue().expect("seal"));
+    for key in &keys {
+        store.put(key, &second).expect("rewrite");
+    }
+    let cue = store.cue().expect("cue");
+    for key in &keys {
+        store.put(key, &third).expect("rewrite past the cue");
+    }
+
+    let script = crate::sync::rendezvous::script();
+    script.hold("paged/handover-spot");
+    let handing = {
+        let store = Arc::clone(&store);
+        script.cast(move || store.page_out_sealed().expect("hand over"))
+    };
+    script.await_reached("paged/handover-spot", 1);
+    let spotted = keys.iter().any(|key| {
+        matches!(
+            store.index.spot_column(0).read(key),
+            Ok(Lookup::Found(_, value) | Lookup::Newest(value)) if value[0] == 0xa5
+        )
+    });
+    let stale = keys
+        .iter()
+        .filter(|key| {
+            let read = store.get_at(key, &cue).expect("cue read");
+            read.as_deref().map(|value| value[0]) != Some(0x5a)
+        })
+        .count();
+    script.release("paged/handover-spot");
+    handing.join().expect("hand over");
+    drop(script);
+    assert!(
+        spotted,
+        "no older version was in the spot index mid hand-over"
+    );
+    assert_eq!(
+        stale, 0,
+        "a cue read answered with a version older than the cue"
+    );
+}
+// keys with shared fronts pack in their footers, and an uncached footer search reads the blocks
+#[test]
+fn a_cue_read_searches_packed_footer_blocks() {
+    let (store, _) = sim_store(ReelConfig {
+        footer_cache: ByteCount::from_bytes(0),
+        ..config(1, SyncPolicy::Never)
+    });
+    let owned = |owner: u8, row: u32| {
+        let mut bytes = vec![owner; 30];
+        bytes.extend_from_slice(&row.to_be_bytes());
+        RecordKey::from_bytes(RECORD, &bytes).expect("key")
+    };
+    let (first, second) = (vec![0x11u8; 64], vec![0x22u8; 64]);
+    for owner in 0..4u8 {
+        for row in 0..300u32 {
+            store.put(&owned(owner, row), &first).expect("put");
+        }
+    }
+    let cue = store.cue().expect("cue");
+    for owner in 0..4u8 {
+        for row in 0..300u32 {
+            store.put(&owned(owner, row), &second).expect("rewrite");
+        }
+    }
+    drop(store.cue().expect("seal"));
+    store.page_out_sealed().expect("hand over");
+    let packed = store
+        .index
+        .segments_snapshot()
+        .iter()
+        .filter_map(|(segment, _)| store.reel.shared().footer_of(*segment).expect("footer"))
+        .filter(|footer| {
+            footer
+                .partition(RECORD)
+                .is_some_and(|partition| partition.is_packed())
+        })
+        .count();
+    assert!(packed > 0, "no footer packed the shared fronts");
+
+    let before = store.filter_probes().block_reads;
+    for owner in 0..4u8 {
+        for row in (0..300u32).step_by(7) {
+            let read = store.get_at(&owned(owner, row), &cue).expect("cue read");
+            assert_eq!(
+                read.as_deref(),
+                Some(&first[..]),
+                "owner {owner} row {row} answered past the cue"
+            );
+            let live = store.get(&owned(owner, row)).expect("get");
+            assert_eq!(
+                live.as_deref(),
+                Some(&second[..]),
+                "owner {owner} row {row} lost its rewrite"
+            );
+        }
+    }
+    assert!(store
+        .get_at(&owned(9, 1), &cue)
+        .expect("cue read")
+        .is_none());
+    assert!(
+        store.filter_probes().block_reads > before,
+        "no search read a packed block"
+    );
+}
+
+// a sealed key deleted in a tail stays gone after a paged reopen once the tail seals
+#[test]
+fn a_tail_delete_of_a_sealed_key_holds_through_a_reopen() {
+    let settings = config(1, SyncPolicy::Never);
+    let payload = vec![0xa5u8; 8 * 1024];
+    let (store, sim, handed) = paged_image(&payload, settings.clone());
+    store.delete(&handed).expect("delete");
+    store.flush().expect("flush");
+    let image = sim.durable_image();
+    drop(store);
+
+    let reopened = reopen_image(image, settings);
+    for byte in 0..200u8 {
+        reopened.put(&record(8, byte), &payload).expect("put");
+    }
+    reopened.flush().expect("flush");
+    reopened.page_out_sealed().expect("hand over");
+    reopened.index.prune_tombstones(Lsn(u64::MAX));
+    assert_eq!(
+        reopened.index.grave_count(),
+        0,
+        "the grave stood, so this tested nothing"
+    );
+    assert!(
+        reopened.get(&handed).expect("read").is_none(),
+        "the delete came undone"
+    );
+    assert_eq!(reopened.totals().count, 399);
+}
+
+// a sealed key written again under a range delete still owed its sweep counts once
+#[test]
+fn a_rewrite_under_a_pending_cover_counts_once() {
+    let settings = config(1, SyncPolicy::Never);
+    let payload = vec![0xa5u8; 8 * 1024];
+    let (store, _sim, handed) = paged_image(&payload, settings);
+    let mut end = handed.as_slice().to_vec();
+    *end.last_mut().expect("a key") += 1;
+    store
+        .delete_range(&handed, Some(&end))
+        .expect("range delete");
+    store.put(&handed, &payload).expect("rewrite");
+    while store.sweep_covers().expect("sweep") {}
+
+    assert_eq!(
+        store.totals().count,
+        200,
+        "the rewritten key counted twice or not at all"
+    );
+    let off = store
+        .totals()
+        .bytes
+        .to_bytes()
+        .abs_diff(200 * payload.len() as u64);
+    assert!(off <= store.spot_slack(), "the bytes sit {off} off");
+}
+
+// a failed pace write loses no record a later flush acked, across a crash
+#[test]
+fn a_failed_pace_write_loses_no_flushed_record() {
+    let settings = config(1, SyncPolicy::Never);
+    let (store, sim) = sim_store(settings.clone());
+    store.put(&record(7, 1), &[0x11; 100]).expect("put 1");
+    sim.arm_next_ops(1, FaultKind::EnospcAppend);
+    let fired = sim.fault_reach().0;
+    store.reel.tails()[0].pace_journal();
+    assert_eq!(sim.fault_reach().0, fired + 1, "the pace write failed");
+    store.put(&record(7, 2), &[0x22; 100]).expect("put 2");
+    store.flush().expect("flush");
+
+    let reopened = reopen(&sim, settings);
+    let one = reopened.get(&record(7, 1)).expect("get 1");
+    let two = reopened.get(&record(7, 2)).expect("get 2");
+    assert!(one.is_some(), "the flushed record was lost");
+    assert!(two.is_some());
+}
+
+// a flush whose journal write fails never lets a later flush answer clean over records a reopen loses
+#[test]
+fn a_failed_journal_write_in_a_flush_is_never_flushed_clean() {
+    for fault in [
+        FaultKind::EnospcAppend,
+        FaultKind::ShortWrite { written_bytes: 10 },
+    ] {
+        let settings = config(1, SyncPolicy::Never);
+        let (store, sim) = sim_store(settings.clone());
+        store.put(&record(7, 1), &[0x11; 100]).expect("put 1");
+        store.flush().expect("flush 1");
+        store.put(&record(7, 2), &[0x22; 100]).expect("put 2");
+        // The flush's journal write is its first op, so the fault lands there
+        sim.arm_next_ops(1, fault);
+        let fired = sim.fault_reach().0;
+        store
+            .flush()
+            .expect_err("a flush whose rows did not land answered clean");
+        assert_eq!(sim.fault_reach().0, fired + 1, "the journal write failed");
+        sim.disarm();
+        let flushed = store.flush().is_ok();
+        assert_eq!(
+            store.get(&record(7, 2)).expect("get"),
+            Some(Value::new(vec![0x22; 100])),
+            "the live store dropped the record"
+        );
+
+        let reopened = reopen(&sim, settings);
+        let two = reopened.get(&record(7, 2)).expect("get 2");
+        assert!(
+            !flushed || two.is_some(),
+            "{fault:?}: a clean flush left a record the reopen lost"
+        );
+        assert!(reopened.get(&record(7, 1)).expect("get 1").is_some());
     }
 }

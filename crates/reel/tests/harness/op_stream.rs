@@ -1,21 +1,14 @@
 //! Seeded random op stream generator for the differential and crash suites
-//!
-//! A stream is a deterministic sequence drawn from a seed over a small key space, so
-//! overwrites, deletes and group drops land on live keys often. The generator tracks
-//! the live set as it emits, so an overwrite or delete always names a key the stream
-//! created, and a fresh nonce makes each version distinct. The durable mix leaves out
-//! the reopens and reads, so the crash suite can crash at raw io boundaries without a
-//! mid stream reopen resetting the boundary count.
 
 use std::collections::BTreeSet;
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
-/// Groups the generator draws from
+/// The generator draws from these groups
 pub const GROUPS: &[u16] = &[7, 8, 9];
 
-/// Distinct addresses per group the generator draws from
+/// Distinct addresses per group
 pub const ADDRESS_SPACE: u8 = 12;
 
 /// Smallest payload the generator emits
@@ -39,7 +32,7 @@ const DELETE_CUTOFF: u32 = 84;
 /// A roll below this emits a group drop
 const DROP_CUTOFF: u32 = 92;
 
-/// Ways the differential tail of the roll splits across reopen, reads, and range delete
+/// The roll's last band splits this many ways across reopen, reads and range delete
 const QUERY_CHOICES: u32 = 5;
 
 /// One operation in a generated stream

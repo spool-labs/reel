@@ -1,36 +1,35 @@
-//! Sweep a volume's records against their checksums
-//!
-//! A sealed segment is swept through its footer, which names where each record
-//! it indexes sits; a segment with no footer is walked record by record from the
-//! start until the write frontier. Nothing here writes, and nothing is repaired.
-//! A sweep only means what it says on a volume nothing is appending to.
+//! Read-only checksum sweep of a volume, valid while nothing appends to it
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::engine::ReelStore;
-use crate::format::column::MAX_KEY_LEN;
-use crate::format::footer::SegmentFooter;
-use crate::format::loc::SegmentId;
-use crate::format::record::{RecordHeader, HEADER_LEN};
+use crate::format::column::RecordKey;
+use crate::format::journal::read_groups;
+use crate::format::loc::{Loc, SegmentId};
+use crate::format::lsn::Lsn;
+use crate::format::record::{
+    check_keyless, Flags, KeylessRead, RecordHeader, RecordLayout, HEADER_LEN, KEYLESS_PREFIX,
+};
+use crate::format::segment_header::{SegmentHeader, SEGMENT_HEADER_SPAN};
 use crate::reel::{segment_file_name, SEGMENT_SUFFIX};
 use crate::report::caveat::{self, Caveat};
 use crate::report::doc::{Column, Doc, Note, Row, Table, Tone};
 use crate::report::fmt;
 use crate::report::render::Report;
 
-/// One segment's sweep, and the first thing wrong with it
+/// One segment's sweep result and its first fault
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct VerifyRow {
     /// Segment number, taken from the file's name
     pub segment: u32,
 
-    /// Whether it was swept through a footer rather than walked
+    /// Whether it was swept through its footer
     pub sealed: bool,
 
-    /// Whether the index names the file at all
+    /// Whether the index lists the segment
     pub indexed: bool,
 
     /// Records that read and matched their checksum
@@ -42,7 +41,10 @@ pub struct VerifyRow {
     /// Records that would not read or would not match
     pub faults: u64,
 
-    /// The first fault, which is the one the report names
+    /// Records a newer version or a delete has replaced, which no read reaches and the sweep skips
+    pub dead: u64,
+
+    /// The first fault, which the report shows
     pub fault: Option<String>,
 }
 
@@ -55,17 +57,17 @@ impl VerifyRow {
             records: 0,
             bytes: 0,
             faults: 0,
+            dead: 0,
             fault: None,
         }
     }
 
-    /// One sound record of this many bytes
     fn sound(&mut self, bytes: u64) {
         self.records += 1;
         self.bytes += bytes;
     }
 
-    /// One fault, keeping the first as the one the report names
+    /// Counts a fault and keeps the first one's reason
     fn fault(&mut self, why: String) {
         self.faults += 1;
         self.fault.get_or_insert(why);
@@ -77,11 +79,7 @@ impl VerifyRow {
         self
     }
 
-    /// Whether the segment carries nothing a listing would be read for
-    ///
-    /// A volume seals segments whose every record has since been superseded, and
-    /// they sweep clean with nothing in them. They are swept and counted either
-    /// way; this is only whether a row of zeroes is worth a reader's line.
+    /// Whether the segment has no records and no faults
     pub fn is_empty(&self) -> bool {
         self.records == 0 && self.faults == 0
     }
@@ -94,7 +92,7 @@ pub struct VerifyReport {
     /// The volume's root directory
     pub volume: String,
 
-    /// Segment files swept, before the listing below is truncated
+    /// Segment files swept, counted before the listing is truncated
     pub segments_swept: usize,
 
     /// Records checked across every segment
@@ -106,33 +104,28 @@ pub struct VerifyReport {
     /// Records that would not read or would not match
     pub faults: u64,
 
-    /// Reads the engine itself failed, counted before this sweep read a byte
+    /// Records no read reaches, left unchecked
+    pub dead: u64,
+
+    /// Reads the engine itself failed before this sweep began
     pub unreadable_records: u64,
 
-    /// Segment files holding records the index does not name, so nothing reads them
-    ///
-    /// A segment holding nothing but its own header is left out: an idle tail
-    /// keeps one across a close for the next open to resume, and the index names
-    /// a segment only once a record has landed in it.
+    /// Segment files with records the index does not list, so nothing reads them
     pub not_indexed: Vec<String>,
 
-    /// Segments swept that hold no record at all, which is a listing's noise
+    /// Segments swept that hold no record at all
     pub empty_segments: usize,
 
-    /// Segments swept that carry something, before the listing is truncated
+    /// Segments swept that are not empty, counted before the listing is truncated
     pub holding_segments: usize,
 
-    /// Segments that faulted, before the listing is truncated
-    ///
-    /// The verdict counts from here rather than from the rows below it: a
-    /// listing capped at twenty rows would otherwise report twenty faulted
-    /// segments however many faulted.
+    /// Segments that faulted, counted before the listing is truncated
     pub faulted_segments: usize,
 
     /// Segments, the faulted ones first, truncated to the limit asked for
     pub segments: Vec<VerifyRow>,
 
-    /// What stands between these figures and what a reader would take them for
+    /// What the counts leave unaccounted for
     pub caveats: Vec<Caveat>,
 }
 
@@ -143,22 +136,12 @@ impl VerifyReport {
     }
 }
 
-/// Sweep every record an open volume holds against its checksum
-///
-/// Driven by what is on the disk rather than by what the index remembers: a file
-/// the index never named is exactly the file a sweep must not skip. Open the
-/// volume paged, since a resident open names only the segments still holding a
-/// live key.
+/// Check every record in every segment file on disk against its checksum
 pub fn verify(engine: &ReelStore, limit: usize) -> VerifyReport {
     verify_watched(engine, limit, &mut |_| {})
 }
 
 /// Sweep, telling a watcher how far it has got as it goes
-///
-/// A sweep of a full volume is minutes of reading with nothing to show for it
-/// until the end, so a frontend that has somebody waiting takes this form and
-/// draws what comes back. The watcher is called often and told everything; how
-/// often that is worth drawing is the frontend's to decide, not the engine's.
 pub fn verify_watched(
     engine: &ReelStore,
     limit: usize,
@@ -194,9 +177,7 @@ pub fn verify_watched(
     rows.sort_by_key(|row| row.segment);
 
     let empty_segments = rows.iter().filter(|row| row.is_empty()).count();
-    // A file holding nothing is nothing to lose: an idle tail keeps its
-    // header-only segment across a close so the next open resumes it, and no
-    // index names a segment before a record lands in it.
+    // An empty segment is skipped, since the index only lists a segment once a record lands in it
     let not_indexed: Vec<String> = rows
         .iter()
         .filter(|row| !row.indexed && !row.is_empty())
@@ -209,6 +190,7 @@ pub fn verify_watched(
         records: rows.iter().map(|row| row.records).sum(),
         bytes: rows.iter().map(|row| row.bytes).sum(),
         faults: rows.iter().map(|row| row.faults).sum(),
+        dead: rows.iter().map(|row| row.dead).sum(),
         unreadable_records: engine.unreadable_records(),
         caveats: caveats(&not_indexed, engine.unreadable_records()),
         not_indexed,
@@ -216,16 +198,14 @@ pub fn verify_watched(
         holding_segments: rows.len() - empty_segments,
         faulted_segments: rows.iter().filter(|row| row.faults > 0).count(),
         segments: {
-            // The faulted ones first, since a sweep is run to find them, and the
-            // segments carrying nothing last, so a limit spends its rows on the
-            // segments that have something to say.
+            // Faulted first and empty last, so a limit keeps the rows that matter
             rows.sort_by(|a, b| {
                 b.faults
                     .cmp(&a.faults)
                     .then(a.is_empty().cmp(&b.is_empty()))
                     .then(a.segment.cmp(&b.segment))
             });
-            // A limit of zero asks for the whole listing rather than none of it.
+            // A limit of zero keeps the whole listing
             if limit > 0 {
                 rows.truncate(limit);
             }
@@ -234,7 +214,6 @@ pub fn verify_watched(
     }
 }
 
-/// What a reader has to know beyond the counts, where anything is unaccounted
 fn caveats(not_indexed: &[String], unreadable: u64) -> Vec<Caveat> {
     let mut caveats = Vec::new();
     if !not_indexed.is_empty() {
@@ -255,7 +234,7 @@ fn caveats(not_indexed: &[String], unreadable: u64) -> Vec<Caveat> {
     caveats
 }
 
-/// The first few of a list, with the rest counted rather than printed
+/// The first eight entries, then a count of the rest
 fn listed(names: &[String]) -> String {
     const SHOWN: usize = 8;
     match names.len() > SHOWN {
@@ -268,27 +247,24 @@ fn listed(names: &[String]) -> String {
     }
 }
 
-/// How far a sweep has got, for a frontend with somebody waiting on it
+/// Sweep progress for a frontend to draw
 #[derive(Clone, Copy, Debug)]
 pub struct Swept {
     /// Segment files finished
     pub segments_done: usize,
 
-    /// Segment files there are to finish
+    /// Segment files in the sweep
     pub segments_total: usize,
 
     /// Bytes read and checked so far
     pub bytes_done: u64,
 
-    /// Bytes the files weigh, which is what the sweep is working through
+    /// Total bytes of the segment files
     pub bytes_total: u64,
 }
 
 impl Swept {
-    /// How far through, as the fraction a bar is drawn from
-    ///
-    /// Falls back to counting files where the files weigh nothing the sweep can
-    /// divide by, which is a volume of empty segments and a volume of none.
+    /// Fraction done, counting files when the files hold no bytes
     pub fn fraction(&self) -> f64 {
         match self.bytes_total {
             0 => match self.segments_total {
@@ -300,35 +276,21 @@ impl Swept {
     }
 }
 
-/// The sweep's progress and whoever asked to hear about it
-///
-/// Progress is counted as files finished plus the reading done inside the file
-/// in hand, rather than as records checked against the weight of every file. A
-/// record's bytes are not its file's bytes: footers are never read as records,
-/// a faulted record is read and counted nowhere, and a preallocated segment
-/// reserves extents no record will ever sit in. Counted the other way a bar
-/// stalls short of its end and every estimate drawn off it runs long.
+/// Tracks progress as whole finished files plus the bytes read in the current one
 struct Watch<'a> {
     swept: Swept,
 
-    /// Weight of the files already finished, which progress never falls below
     finished: u64,
 
-    /// Records checked since the watcher was last told, which paces the telling
     since_tell: u32,
 
     tell: &'a mut dyn FnMut(&Swept),
 }
 
 impl Watch<'_> {
-    /// Records between one telling and the next
-    ///
-    /// A sweep checks millions of records and a watcher that repaints on each
-    /// would cost more than the reading does, so the count is batched here where
-    /// the loop is rather than left for every frontend to rediscover.
+    /// The watcher is told after this many records
     const STRIDE: u32 = 64;
 
-    /// One record of this many bytes checked, inside the file in hand
     fn record(&mut self, bytes: u64) {
         self.swept.bytes_done += bytes;
         self.since_tell += 1;
@@ -337,10 +299,7 @@ impl Watch<'_> {
         }
     }
 
-    /// One segment file finished, whatever it held
-    ///
-    /// Progress snaps to the file's whole weight here, so the bar arrives at its
-    /// end exactly once the last file is done however little of it was records.
+    /// Moves progress to the end of this file, however few bytes its records covered
     fn segment_done(&mut self, weight: u64) {
         self.finished += weight;
         self.swept.segments_done += 1;
@@ -354,18 +313,15 @@ impl Watch<'_> {
     }
 }
 
-/// One segment file on disk, and what it weighs before anything reads it
+/// A segment file on disk and its size
 struct SegmentFile {
-    /// Segment number, taken from the file's name
+    /// Segment number, taken from the file name
     segment: SegmentId,
 
-    /// Where the file sits, which root and all
+    /// Full path to the file
     path: PathBuf,
 
-    /// Bytes the file occupies, which is what a sweep has to work through
-    ///
-    /// Read from the directory entry rather than from the sweep, so a progress
-    /// bar has a denominator before the first record is checked.
+    /// File size, known before any record is read
     weight: u64,
 }
 
@@ -394,7 +350,7 @@ fn segment_files(roots: &[PathBuf]) -> Vec<SegmentFile> {
     files
 }
 
-/// The roots a segment of this volume can sit under, in the volume's own order
+/// The roots a segment of this volume can sit under
 fn roots(engine: &ReelStore) -> Vec<PathBuf> {
     std::iter::once(engine.root().to_path_buf())
         .chain(
@@ -418,127 +374,165 @@ fn sweep(engine: &ReelStore, file: &SegmentFile, indexed: bool, watch: &mut Watc
         Ok(file) => file,
         Err(error) => return row.faulted(format!("{name} will not open: {error}")),
     };
-    let len = match file.metadata() {
-        Ok(data) => data.len(),
-        Err(error) => return row.faulted(format!("{name} will not stat: {error}")),
-    };
-    // A footer says where every record it indexes sits, so a sealed segment is
-    // swept through it. Without one there is no boundary between the records and
-    // whatever follows them, so the segment is walked instead.
+    let (layout, rows_at) = layout_of(&mut file);
+    if !layout.is_keyless_layout() {
+        return row.faulted(format!(
+            "{name} opens with no segment header this build reads"
+        ));
+    }
     match engine.segment_footer(segment) {
         Ok(Some(footer)) => {
             row.sealed = true;
-            sweep_footer(&mut file, &footer, &mut row, watch);
+            let mut listed = Vec::new();
+            for entry in footer.entries() {
+                match entry {
+                    Ok(entry) => listed.push(Listed {
+                        key: entry.key,
+                        lsn: entry.lsn,
+                        offset: entry.offset,
+                        len: entry.len,
+                        flags: entry.flags,
+                    }),
+                    Err(error) => row.fault(format!("footer row does not decode: {error}")),
+                }
+            }
+            sweep_rows(engine, segment, &mut file, listed, layout, &mut row, watch);
         }
-        Ok(None) => walk(&mut file, len, &mut row, watch),
+        Ok(None) => {
+            // A file shorter than its rows offset was sealed, so only a footer lists its records
+            let len = file.metadata().map_or(0, |meta| meta.len());
+            let rows = match rows_at > 0 && len >= rows_at {
+                true => read_at(&mut file, rows_at, len - rows_at),
+                false => Err(std::io::ErrorKind::NotFound.into()),
+            };
+            let Ok(rows) = rows else {
+                return row.faulted(format!(
+                    "{name} has no footer, and no rows list its records"
+                ));
+            };
+            let (groups, _) = read_groups(&rows);
+            let listed = groups
+                .into_iter()
+                .flatten()
+                .map(|entry| Listed {
+                    key: entry.key,
+                    lsn: entry.lsn,
+                    offset: entry.offset,
+                    len: entry.len,
+                    flags: entry.flags,
+                })
+                .collect();
+            sweep_rows(engine, segment, &mut file, listed, layout, &mut row, watch);
+        }
         Err(error) => row.fault(format!("footer does not parse: {error}")),
     }
     row
 }
 
-/// Check every record a footer indexes, in the order they sit on disk
-fn sweep_footer(file: &mut File, footer: &SegmentFooter, row: &mut VerifyRow, watch: &mut Watch) {
-    let mut at: Vec<(u32, u16, u32)> = Vec::new();
-    for entry in footer.entries() {
-        match entry {
-            Ok(entry) => at.push((entry.offset, entry.key.width(), entry.len)),
-            Err(error) => row.fault(format!("footer row does not decode: {error}")),
+/// Read a segment's layout and rows offset, or keyed when the header is bad so it gets reported
+fn layout_of(file: &mut File) -> (RecordLayout, u64) {
+    let Ok(head) = read_at(file, 0, (HEADER_LEN + SEGMENT_HEADER_SPAN) as u64) else {
+        return (RecordLayout::Keyed, 0);
+    };
+    let Ok(header) = RecordHeader::unpack(&head) else {
+        return (RecordLayout::Keyed, 0);
+    };
+    let end = HEADER_LEN + header.length as usize;
+    match head.get(HEADER_LEN..end) {
+        Some(payload) if header.flags.is_segment_header() && header.verify(payload) => {
+            SegmentHeader::unpack(payload).map_or((RecordLayout::Keyed, 0), |parsed| {
+                (parsed.layout, parsed.rows_at)
+            })
         }
+        Some(_) | None => (RecordLayout::Keyed, 0),
     }
-    // Ascending, so a sweep of a spinning disk reads the file forwards.
-    at.sort_unstable();
-    for (offset, width, len) in at {
-        let span = HEADER_LEN as u64 + u64::from(width) + u64::from(len);
-        match check(file, u64::from(offset), span) {
-            // A footer names records rather than the header, but one that points
-            // there is answered rather than skipped.
-            Checked::Sound(bytes) | Checked::Header(bytes) => {
-                row.sound(bytes);
-                watch.record(bytes);
+}
+
+/// A record a footer or a journal lists
+struct Listed {
+    key: RecordKey,
+    lsn: Lsn,
+    offset: u32,
+    len: u32,
+    flags: Flags,
+}
+
+/// Check every live record a footer or a journal lists, against the row it came through
+fn sweep_rows(
+    engine: &ReelStore,
+    segment: SegmentId,
+    file: &mut File,
+    mut listed: Vec<Listed>,
+    layout: RecordLayout,
+    row: &mut VerifyRow,
+    watch: &mut Watch,
+) {
+    // Sort by offset so the file is read front to back
+    listed.sort_unstable_by_key(|listed| listed.offset);
+    // Only a column the volume was opened with can say which of its versions are replaced
+    let known = engine.columns();
+    for Listed {
+        key,
+        lsn,
+        offset,
+        len,
+        flags,
+    } in listed
+    {
+        // A replaced version is never read again, and its bytes may already be given back
+        let loc = Loc::new(segment, offset, len);
+        let is_known = known.iter().any(|spec| spec.id == key.column);
+        if flags.is_data()
+            && is_known
+            && engine.index().is_live_at(&key, loc, lsn).ok() == Some(false)
+        {
+            row.dead += 1;
+            continue;
+        }
+        let Some(check) = layout.keyless_key(len) else {
+            match keyed(file, u64::from(offset), key.width(), len) {
+                Ok(span) => {
+                    row.sound(span);
+                    watch.record(span);
+                }
+                Err(why) => row.fault(why),
             }
-            Checked::Fault(why) => row.fault(why),
-            // A footer named the record, so unwritten space where it pointed is
-            // the pointer being wrong rather than the end of anything.
-            Checked::Frontier => row.fault(format!("record at {offset} is unwritten space")),
+            continue;
+        };
+        let span = KEYLESS_PREFIX as u64 + u64::from(len);
+        let bytes = match read_at(file, u64::from(offset), span) {
+            Ok(bytes) if bytes.len() as u64 == span => bytes,
+            Ok(_) => {
+                row.fault(format!("record at {offset} is short"));
+                continue;
+            }
+            Err(error) => {
+                row.fault(format!("read at {offset} failed: {error}"));
+                continue;
+            }
+        };
+        let (prefix, payload) = bytes.split_at(KEYLESS_PREFIX);
+        match check_keyless(prefix, payload, key.as_ref(), flags, &check) {
+            KeylessRead::Intact(_) => {
+                row.sound(span);
+                watch.record(span);
+            }
+            KeylessRead::Unwritten => row.fault(format!("record at {offset} is unwritten space")),
+            KeylessRead::Corrupt => row.fault(format!("record at {offset} fails its checksum")),
         }
     }
 }
 
-/// Walk a segment with no footer, record by record, up to its write frontier
-fn walk(file: &mut File, len: u64, row: &mut VerifyRow, watch: &mut Watch) {
-    let mut at = 0u64;
-    while at + HEADER_LEN as u64 <= len {
-        match check(file, at, (HEADER_LEN + MAX_KEY_LEN) as u64) {
-            Checked::Sound(bytes) => {
-                row.sound(bytes);
-                watch.record(bytes);
-                at += bytes;
-            }
-            // Read and checked like anything else, then stepped over: it is what
-            // the segment is, not something written into it.
-            Checked::Header(bytes) => {
-                watch.record(bytes);
-                at += bytes;
-            }
-            Checked::Fault(why) => {
-                row.fault(why);
-                return;
-            }
-            Checked::Frontier => return,
-        }
-    }
-}
-
-/// What one record's bytes came back as
-enum Checked {
-    /// The record checks out, and this is what it spans on disk
-    Sound(u64),
-
-    /// The header a segment opens with, which spans bytes but is no record of its own
-    Header(u64),
-
-    /// The record is not sound, and this says why
-    Fault(String),
-
-    /// Unwritten space, so a walk has reached the frontier and stops
-    Frontier,
-}
-
-/// Read the record at this offset and check it against its own checksum
-///
-/// The hint is what to read before the header has said how long the record is:
-/// a footer knows exactly, and a walk asks for a header and the widest key the
-/// format admits.
-fn check(file: &mut File, at: u64, hint: u64) -> Checked {
-    let head = match read_at(file, at, hint) {
-        Ok(head) => head,
-        Err(error) => return Checked::Fault(format!("read at {at} failed: {error}")),
-    };
-    let header = match RecordHeader::unpack(&head) {
-        Ok(header) => header,
-        Err(error) => return Checked::Fault(format!("header at {at} does not parse: {error}")),
-    };
-    if header.is_unwritten() {
-        return Checked::Frontier;
-    }
-    // A pad's fill is never written and never checksummed, so it is stepped over
-    // rather than read.
-    if header.flags.is_pad() {
-        return Checked::Sound(header.span());
-    }
-    let payload = match header.has_payload() {
-        false => Vec::new(),
-        true => match read_at(file, at + header.prefix_len(), u64::from(header.length)) {
-            Ok(payload) => payload,
-            Err(error) => return Checked::Fault(format!("payload at {at} is short: {error}")),
-        },
-    };
-    match header.verify(&payload) {
-        true => match header.flags.is_segment_header() {
-            true => Checked::Header(header.span()),
-            false => Checked::Sound(header.span()),
-        },
-        false => Checked::Fault(format!("record at {at} fails its checksum")),
+/// Check a keyed record against its own checksum, and say what it spans on disk
+fn keyed(file: &mut File, at: u64, width: u16, len: u32) -> std::result::Result<u64, String> {
+    let span = HEADER_LEN as u64 + u64::from(width) + u64::from(len);
+    let bytes = read_at(file, at, span).map_err(|error| format!("read at {at} failed: {error}"))?;
+    let header = RecordHeader::unpack(&bytes)
+        .map_err(|error| format!("header at {at} does not parse: {error}"))?;
+    let payload = bytes.get(header.prefix_len() as usize..).unwrap_or(&[]);
+    match header.verify(payload) {
+        true => Ok(header.span()),
+        false => Err(format!("record at {at} fails its checksum")),
     }
 }
 
@@ -575,6 +569,7 @@ impl Report for VerifyReport {
             .facts([
                 ("volume".to_string(), self.volume.clone()),
                 ("records checked".to_string(), self.records.to_string()),
+                ("replaced, skipped".to_string(), self.dead.to_string()),
                 ("bytes checked".to_string(), fmt::bytes(self.bytes)),
             ])
             .notes("faults", Tone::Bad, self.faults())
@@ -588,9 +583,9 @@ impl Report for VerifyReport {
                 "checked",
                 [
                     "every sealed segment's footer decodes",
-                    "every record a footer indexes matches its checksum",
+                    "every live record a footer indexes matches its checksum",
                     "a segment with no footer is walked to its write frontier",
-                    "every segment file on the roots holding a record is one the index names",
+                    "every segment file on the roots holding a record is one the index lists",
                 ],
             )
             .term(
@@ -608,7 +603,6 @@ impl Report for VerifyReport {
 }
 
 impl VerifyReport {
-    /// The figures behind the verdict, which differ by what the verdict is
     fn detail(&self) -> String {
         match self.is_sound() {
             true => match self.records {
@@ -624,12 +618,7 @@ impl VerifyReport {
         }
     }
 
-    /// The first fault of each faulted segment, which is the one worth naming
-    ///
-    /// One segment can fault many times over and the first is the one that says
-    /// what went wrong; the rest are usually the same thing again. The others are
-    /// counted rather than listed, so the block stays readable without the count
-    /// in the verdict looking like it came from nowhere.
+    /// One note per faulted segment with its first fault, plus a line for any the listing cut
     fn faults(&self) -> Vec<Note> {
         let mut notes: Vec<Note> = self
             .segments
@@ -646,8 +635,7 @@ impl VerifyReport {
                 }))
             })
             .collect();
-        // The listing is capped, and a cap that hides faults without saying so
-        // is the one thing a sweep must never do.
+        // Say how many faulted segments the capped listing left out
         if self.faulted_segments > notes.len() {
             notes.push(Note::new(format!(
                 "{} further faulted segments the listing does not reach — --limit 0 for all",
@@ -657,13 +645,7 @@ impl VerifyReport {
         notes
     }
 
-    /// The per-segment listing, with the files holding nothing counted rather
-    /// than listed
-    ///
-    /// A volume seals segments whose every record has since been superseded, and
-    /// a row of zeroes for each of them buries the rows that carry something. A
-    /// faulted segment is never one of those, so nothing that matters is dropped
-    /// and the caption says how many were.
+    /// The per-segment listing, counting empty segments in the caption
     fn segment_table(&self) -> Table {
         let mut table = Table::new([
             Column::left("segment"),
@@ -707,10 +689,7 @@ impl VerifyReport {
                 self.holding_segments,
             ),
         };
-        // Never silently: a file that swept clean and empty is still a file that
-        // was read, and the count says so even though the row does not. It points
-        // at --limit 0 and not at -o json, because the limit truncates the rows
-        // before either format sees them and the empty ones are dropped first.
+        // The limit cuts empty rows before -o json sees them, so the hint is --limit 0
         if self.empty_segments > 0 {
             caption.push_str(&format!(
                 "; {} swept clean and empty — --limit 0 to list them",
@@ -735,14 +714,12 @@ mod tests {
             records,
             bytes: records * 1024,
             faults,
+            dead: 0,
             fault: (faults > 0).then(|| format!("record at {segment} fails its checksum")),
         }
     }
 
-    /// A report over these rows, listing at most `limit` of them
-    ///
-    /// Built the way `verify` builds one, so the totals stand over every row and
-    /// only the listing is cut.
+    /// A report over these rows built the way `verify` builds one, listing at most `limit`
     fn swept(mut rows: Vec<VerifyRow>, limit: usize) -> VerifyReport {
         let empty_segments = rows.iter().filter(|row| row.is_empty()).count();
         let report = VerifyReport {
@@ -751,6 +728,7 @@ mod tests {
             records: rows.iter().map(|row| row.records).sum(),
             bytes: rows.iter().map(|row| row.bytes).sum(),
             faults: rows.iter().map(|row| row.faults).sum(),
+            dead: rows.iter().map(|row| row.dead).sum(),
             unreadable_records: 0,
             not_indexed: Vec::new(),
             empty_segments,
@@ -786,7 +764,7 @@ mod tests {
             .collect()
     }
 
-    /// What the segment table says it is a listing out of
+    /// The segment table's caption
     fn caption(report: &VerifyReport) -> String {
         report
             .doc()
@@ -799,7 +777,7 @@ mod tests {
             .expect("a segment table")
     }
 
-    // the verdict counts every faulted segment, not every listed one
+    // the verdict counts every faulted segment, listed or not
     #[test]
     fn a_capped_listing_does_not_cap_the_verdict() {
         let rows: Vec<VerifyRow> = (1..=32).map(|at| row(at, 9, 1)).collect();
@@ -830,11 +808,10 @@ mod tests {
         assert_eq!(notes.len(), 4, "an invented remainder: {notes:?}");
     }
 
-    // the empty segments are pointed at where they can actually be found
+    // the caption points at a listing that holds the empty segments
     #[test]
     fn empty_segments_are_pointed_at_a_listing_that_holds_them() {
-        // Empties sort last and so are the first rows a cap drops, which is why
-        // the caption cannot send a reader to the serialised rows for them.
+        // Empties sort last, so a cap drops them before -o json sees them
         let mut rows: Vec<VerifyRow> = (1..=6).map(|at| row(at, 9, 0)).collect();
         rows.extend((7..=13).map(|at| row(at, 0, 0)));
         let report = swept(rows, 20);
@@ -857,8 +834,7 @@ mod tests {
     // progress is files finished plus the reading inside the file in hand
     #[test]
     fn progress_reaches_its_end() {
-        // Records never account for a whole file: footers are not records, and a
-        // preallocated segment reserves extents no record will sit in.
+        // Records never cover a whole file, footers and preallocated space hold none
         let mut swept = Swept {
             segments_done: 0,
             segments_total: 2,

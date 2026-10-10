@@ -16,27 +16,33 @@ impl ReelStore {
         self.put_owned(key, payload.to_vec())
     }
 
-    /// Owned-payload put that hands the buffer to the tail without a copy
-    ///
-    /// A column placed by its purge mark is banded off the key; every other routes to
-    /// the least loaded tail.
+    /// Put an owned payload, handing the buffer to the tail without a copy
     pub fn put_owned(&self, key: &RecordKey, payload: Vec<u8>) -> Result<()> {
         let planned = self.plan_put(key, payload)?;
-        // The tail owns the key it queues, and the index insert below needs it too.
+        // The tail owns the key it queues, so clone it for the index insert below
         let committed = self.reel.put(
             key.clone(),
             planned.payload,
             planned.codec,
             Commit::PerRecord,
         )?;
+        // A slow put stands here with its record down and the index not yet moved
+        crate::sync::rendezvous::at("put/landed");
+        self.index.insert(key, committed.loc, committed.lsn)?;
+        Ok(())
+    }
+
+    /// A put that is durable when it returns, syncing only the tail it went to
+    pub fn put_durable(&self, key: &RecordKey, payload: &[u8]) -> Result<()> {
+        let planned = self.plan_put(key, payload.to_vec())?;
+        let committed =
+            self.reel
+                .put(key.clone(), planned.payload, planned.codec, Commit::Durable)?;
         self.index.insert(key, committed.loc, committed.lsn)?;
         Ok(())
     }
 
     /// The same put awaited, for a caller with a runtime worker to protect
-    ///
-    /// The record reaches the device on this thread either way; what is awaited is
-    /// admission and the sync.
     pub async fn put_owned_wait(&self, key: &RecordKey, payload: Vec<u8>) -> Result<()> {
         let planned = self.plan_put(key, payload)?;
         let committed = self
@@ -53,9 +59,6 @@ impl ReelStore {
     }
 
     /// Refuse a write the disk cannot take, leaving the reserve for compaction
-    ///
-    /// Compaction needs somewhere to write the survivors, so a full disk is a dead
-    /// end. A volume whose disk will not say how large it is admits everything.
     fn check_capacity(&self, request_bytes: u64) -> Result<()> {
         let used = self.footprint.load(Ordering::Relaxed);
         if self.compactor.can_admit_foreground(used, request_bytes) {
@@ -79,10 +82,6 @@ impl ReelStore {
     }
 
     /// Apply a batch of writes as one reservation, one write, and one sync
-    ///
-    /// A batch is one durability point: the sync is taken once the last record has
-    /// landed, and the index moves only after it comes back clean. One tail takes all
-    /// of it, so a placed batch takes the band covering the last of it to die.
     pub fn apply_batch(&self, writes: Vec<RecordWrite>) -> Result<()> {
         let Some((records, keys)) = self.plan_batch(writes)? else {
             return Ok(());
@@ -93,10 +92,16 @@ impl ReelStore {
         self.publish_batch(&keys, &committed)
     }
 
+    /// A batch that is durable when it returns, syncing only the tail it went to
+    pub fn apply_batch_durable(&self, writes: Vec<RecordWrite>) -> Result<()> {
+        let Some((records, keys)) = self.plan_batch(writes)? else {
+            return Ok(());
+        };
+        let committed = self.reel.write_batch_durable(records)?;
+        self.publish_batch(&keys, &committed)
+    }
+
     /// The same batch awaited, one submission and one durability point
-    ///
-    /// The plan and the publish are the blocking batch's own, so the only thing a
-    /// row racing the doors sees is where the two waits went.
     pub async fn apply_batch_wait(&self, writes: Vec<RecordWrite>) -> Result<()> {
         let Some((records, keys)) = self.plan_batch(writes)? else {
             return Ok(());
@@ -134,9 +139,7 @@ impl ReelStore {
                 }
                 RecordWrite::DeleteRange { start, end } => {
                     self.check_column(&start)?;
-                    // The empty range the single-record door refuses, refused here for
-                    // the same reason: its row is filed under the start key, which a
-                    // sealed search would read as a grave over the key it excluded.
+                    // Skip an empty range, whose row would read as a grave on its start key
                     if end.as_deref().is_some_and(|end| end <= start.as_slice()) {
                         continue;
                     }
@@ -158,15 +161,9 @@ impl ReelStore {
 
     /// Move the index onto a batch that has landed, under the publish barrier
     fn publish_batch(&self, keys: &[BatchKey], committed: &[Committed]) -> Result<()> {
-        // The publish moves the index one key at a time, so the barrier is what makes
-        // a read spanning several keys land before it or after it, never inside it.
-        // Only the map moves under that hold: settling a paged column's displaced key
-        // reads a footer, and a reader waiting on the barrier must not be waiting on
-        // the volume, so those are collected and run afterwards.
-        let pages = self.index.residency().pages();
-        // Built before the barrier is taken, so the hold costs only the move. A range
-        // is held apart with the count of moves ahead of it, since the index applies a
-        // run of key moves at a time and a cover is not one of them.
+        // A slow batch stands here with its records down and the index not yet moved
+        crate::sync::rendezvous::at("batch/landed");
+        // Built before the barrier, each range held apart with the count of key moves ahead of it
         let mut moves: Vec<KeyMove<'_>> = Vec::with_capacity(keys.len());
         let mut ranges: Vec<RangeMove<'_>> = Vec::new();
         for (planned, landed) in keys.iter().zip(committed) {
@@ -188,27 +185,31 @@ impl ReelStore {
             }
         }
 
-        let landed = self.index.publish_batch(&moves, &ranges);
+        let (landed, shadowed) = self.index.publish_batch(&moves, &ranges);
 
-        // One answer per key move, so the ranges are stepped over rather than paired.
+        // One answer per key move, so a range gets none and is stepped over
         let mut answers = landed.iter();
         let mut displaced = Vec::new();
-        for planned in keys {
+        for (planned, record) in keys.iter().zip(committed) {
             if matches!(planned.op, KeyOp::Range(_)) {
                 continue;
             }
             let Some(mapped) = answers.next() else {
                 break;
             };
-            if pages && mapped.may_be_paged() {
-                displaced.push(planned.key.clone());
+            if mapped.may_be_paged() {
+                displaced.push((planned.key.clone(), record.lsn));
             }
         }
 
-        for key in displaced {
-            self.index.settle_displaced(&key)?;
+        // Every displaced key settles past a failure, so one bad read leaves no other counted twice
+        let mut settled: Result<()> = Ok(());
+        for (key, lsn) in displaced {
+            if let Err(error) = self.index.settle_displaced(&key, lsn) {
+                settled = settled.and(Err(error));
+            }
         }
-        Ok(())
+        shadowed.and(settled)
     }
 
     /// Append a tombstone and drop the key from the index
@@ -218,22 +219,19 @@ impl ReelStore {
         }
         self.check_column(key)?;
         let committed = self.reel.delete(key.clone(), Commit::PerRecord)?;
+        // A slow delete stands here with its tombstone down and the index not yet moved
+        crate::sync::rendezvous::at("delete/landed");
         self.index.remove(key, committed.lsn, committed.loc)?;
         Ok(())
     }
 
     /// Drop a half-open key range with one tombstone covering the whole of it
-    ///
-    /// One record stands for however many keys the range holds, and the compactor
-    /// carries it until nothing old enough for it to hide is left.
     pub fn delete_range(&self, start: &RecordKey, end: Option<&[u8]>) -> Result<()> {
         if self.is_read_only {
             return Err(read_only());
         }
         self.check_column(start)?;
-        // An empty range's record would not be harmless: its row is filed under the
-        // start key, and a sealed search reads any tombstone row as a grave, so it
-        // would delete the very key the range excluded.
+        // An empty range's row would read as a grave on its start key, so skip it
         if end.is_some_and(|end| end <= start.as_slice()) {
             return Ok(());
         }
@@ -245,7 +243,7 @@ impl ReelStore {
         Ok(())
     }
 
-    /// Refuse a key naming a column this volume does not serve
+    /// Refuse a key whose column this volume does not serve
     pub(super) fn check_column(&self, key: &RecordKey) -> Result<()> {
         match self.index.spec(key.column) {
             Some(_) => Ok(()),

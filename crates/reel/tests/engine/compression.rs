@@ -1,9 +1,4 @@
 //! Compression at admission, observed end to end over the simulator
-//!
-//! A codec column's compressible payloads shrink on disk and read back whole through
-//! every path a caller has, an incompressible payload stays raw, and a compaction
-//! copy carries the codec byte rather than decoding anything. The volume's live-byte
-//! accounting is the on-disk observation, since it counts stored bytes.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,8 +8,8 @@ use reel_core::Store;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, Preallocate, ReelConfig,
-    ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget,
 };
 
 const RECORDS: u64 = 64;
@@ -28,7 +23,6 @@ const fn status(codec: Codec) -> ColumnSpec {
         shard_bytes: 0,
         purge_mark: None,
         codec,
-        map_shape: MapShape::Tree,
     }
 }
 
@@ -38,8 +32,6 @@ const RAW: ColumnSet = &[status(Codec::None)];
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(64 * 1024 * 1024),
-        alloc_chunk: ByteCount::from_bytes(1024 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         ..ReelConfig::default()
@@ -149,10 +141,8 @@ fn compaction_carries_the_codec_byte() {
     let store = ReelStore::open_with_io(
         PathBuf::from("/compaction"),
         ReelConfig {
-            // segments small enough that the fill seals a few, and a threshold
-            // low enough that the deletes below make them compactable
+            // Small segments so the fill seals a few, and a dead ratio the deletes below exceed
             segment_bytes: ByteCount::from_bytes(256 * 1024),
-            alloc_chunk: ByteCount::from_bytes(64 * 1024),
             compact_dead_ratio: 0.3,
             ..config()
         },

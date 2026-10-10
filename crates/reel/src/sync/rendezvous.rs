@@ -1,8 +1,4 @@
-//! Named rendezvous points, so a race is a test rather than a lottery
-//!
-//! One script runs at a time, and arming takes a global turn, so choreographed
-//! tests serialise against each other while everything else pays one load. A
-//! script that panics or finishes releases everyone it held.
+//! Rendezvous points, so a test can script a race between threads
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,16 +8,10 @@ use std::time::{Duration, Instant};
 
 use crate::sync::lock;
 
-/// How long a script waits for an arrival before failing the test instead
-///
-/// A rendezvous that never happens must fail loudly, not hang the suite.
+/// A script fails the test if an arrival takes longer than this
 const STALL: Duration = Duration::from_secs(10);
 
-/// How long a parked arrival waits before proceeding as though unheld
-///
-/// The gates are process global, so a held point parks bystanders belonging to
-/// tests the script never met. Three stalls is longer than any live script can
-/// hold a thread, since every scripted wait is bounded by one.
+/// A parked arrival goes on as though unheld after this long
 const PARKED: Duration = Duration::from_secs(30);
 
 /// Whether any script is armed, the one load every site pays
@@ -65,10 +55,6 @@ impl Stage {
     }
 
     /// Whether the thread is one the script itself runs on
-    ///
-    /// A gate holds whoever reaches it, but a refusal takes work away from the
-    /// thread that meets it, and a thread of some other test cannot be asked to
-    /// go without work it is waiting on.
     fn owns(&self, who: ThreadId) -> bool {
         self.owner == Some(who) || self.cast.contains(&who)
     }
@@ -102,11 +88,7 @@ fn stage() -> &'static (Mutex<Stage>, Condvar) {
     })
 }
 
-/// Whether a script has refused the point, for a site guarding optional work
-///
-/// Only for the script's own threads: the refused work is what a caller elsewhere
-/// in the suite is waiting on, and taking it away wedges that caller for good.
-/// One load while nothing is armed.
+/// Whether a script has refused the point on its own threads, for a site guarding optional work
 #[inline]
 pub fn refused(name: &'static str) -> bool {
     if !ARMED.load(Ordering::Acquire) {
@@ -117,10 +99,7 @@ pub fn refused(name: &'static str) -> bool {
     stage.owns(thread::current().id()) && stage.refused.contains(name)
 }
 
-/// Mark a named moment, parking here while a script gates it
-///
-/// The arrival is counted before any wait, so a script watching for it sees the
-/// thread while it stands parked.
+/// Mark a rendezvous point, counting the arrival and parking here while a script gates it
 #[inline]
 pub fn at(name: &'static str) {
     if !ARMED.load(Ordering::Acquire) {
@@ -173,10 +152,7 @@ fn arrive(name: &'static str) {
     }
 }
 
-/// One choreographed interleaving, exclusive while it lives
-///
-/// Dropping it disarms the sites, clears every hold, and wakes whoever was
-/// parked, so the threads a failing test held are released rather than wedged.
+/// One choreographed interleaving, exclusive while it lives, which frees every hold on drop
 pub struct Script {
     _turn: MutexGuard<'static, ()>,
 }
@@ -201,10 +177,6 @@ pub fn script() -> Script {
 
 impl Script {
     /// Spawn a thread of this script's own, and narrow every point to its cast
-    ///
-    /// From the first cast on, a thread the script did not name crosses its points
-    /// uncounted and unparked, engine threads included. The narrowing lands before
-    /// the spawn, so a neighbour already parked at the hold leaves on this wake.
     pub fn cast<T: Send + 'static>(
         &self,
         body: impl FnOnce() -> T + Send + 'static,
@@ -257,10 +229,7 @@ impl Script {
         condvar.notify_all();
     }
 
-    /// Wait until the point has been reached this many times in all
-    ///
-    /// Bounded, and the bound failing is the test failing: an arrival that cannot
-    /// happen is an interleaving the engine no longer has.
+    /// Wait until the point has been reached this many times in all, failing the test past `STALL`
     pub fn await_reached(&self, name: &'static str, count: u64) {
         let (mutex, condvar) = stage();
         let deadline = Instant::now() + STALL;
@@ -309,8 +278,7 @@ mod tests {
         let script = script();
         script.refuse("test/refusal");
 
-        // Asked before the script casts anything, which is the window a refusal
-        // used to speak for every thread in the process through.
+        // Asked before the script casts anything
         let bystander = thread::spawn(|| refused("test/refusal"))
             .join()
             .expect("the bystander joins");

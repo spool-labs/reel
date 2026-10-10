@@ -8,8 +8,8 @@ use std::thread;
 
 use crate::units::ByteCount;
 
-use crate::config::{Preallocate, SyncPolicy, ThreadBudget, DEFAULT_FD_CACHE};
-use crate::format::column::{Codec, ColumnId, ColumnSpec, KeyWidth, MapShape};
+use crate::config::{SyncPolicy, ThreadBudget, DEFAULT_FD_CACHE};
+use crate::format::column::{Codec, ColumnId, ColumnSpec, KeyWidth};
 use crate::io::fault::FaultPlan;
 use crate::io::sim_backend::SimIo;
 
@@ -25,7 +25,7 @@ const RECORD_KEY_LEN: usize = GROUP_PREFIX_LEN + 32;
 const BLOB_KEY_LEN: usize = 32;
 const ARTIFACT_KEY_LEN: usize = 24;
 
-/// The columns these cases open the reel with, the way any caller declares its own
+/// The columns these tests open the reel with
 const TEST_COLUMNS: ColumnSet = &[
     ColumnSpec {
         id: ColumnId(1),
@@ -34,7 +34,6 @@ const TEST_COLUMNS: ColumnSet = &[
         shard_bytes: GROUP_PREFIX_LEN as u8,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: ColumnId(2),
@@ -43,7 +42,6 @@ const TEST_COLUMNS: ColumnSet = &[
         shard_bytes: 1,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: ColumnId(3),
@@ -52,14 +50,12 @@ const TEST_COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 
 fn harness(active_tails: usize) -> (Arc<ReelShared>, SimIo) {
     let config = ReelConfig {
         segment_bytes: ByteCount::mb(1),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(active_tails as u32),
         ..ReelConfig::default()
@@ -84,7 +80,38 @@ fn key(byte: u8) -> RecordKey {
     RecordKey::from_bytes(RECORD, &[byte; 34]).expect("key")
 }
 
-// a reel names segment files with a zero-padded number and suffix
+// a mapped record starts a fresh block before the block's offsets pass four bytes
+#[test]
+fn a_mapped_block_splits_before_its_offsets_wrap() {
+    const GIB: usize = 1 << 30;
+    // Five asks for one gigabyte record each go through the placement plan_reads uses
+    let mut block = 0u32;
+    let mut filled = 0usize;
+    let mut placed = Vec::new();
+    for _ in 0..5 {
+        let at = match mapped_at(filled, GIB) {
+            Some(at) => at,
+            None => {
+                block += 1;
+                filled = 0;
+                0
+            }
+        };
+        assert_eq!(at as usize, filled, "a spot's offset wrapped");
+        placed.push((block, filled));
+        filled += GIB;
+    }
+    assert_eq!(
+        placed,
+        vec![(0, 0), (0, GIB), (0, 2 * GIB), (1, 0), (1, GIB)]
+    );
+    assert!(placed.iter().all(|(_, at)| at + GIB <= MAPPED_BLOCK_BYTES));
+    // A record as large as a block still fits an empty one
+    assert_eq!(mapped_at(0, MAPPED_BLOCK_BYTES), Some(0));
+    assert_eq!(mapped_at(1, MAPPED_BLOCK_BYTES), None);
+}
+
+// a segment file name is a zero-padded number and the suffix
 #[test]
 fn names_segment_files() {
     assert_eq!(segment_file_name(SegmentId(1)), "000001.reel");
@@ -98,7 +125,7 @@ fn parses_segment_numbers() {
     assert_eq!(segment_number("reel.lock"), None);
 }
 
-// a reel runs out of segment numbers rather than wrapping onto a live one
+// a reel refuses to draw past the last segment number and never wraps
 #[test]
 fn refuses_to_wrap_segment_numbers() {
     let (shared, _sim) = harness(1);
@@ -173,7 +200,7 @@ fn range_delete_commits() {
     assert_eq!(dropped.loc.len, end.len() as u32);
 }
 
-// a record read back resolves its own key and rejects another
+// a record read back resolves its own key, and another key fails its check
 #[test]
 fn reads_back_by_key() {
     let (shared, _sim) = harness(1);
@@ -184,19 +211,19 @@ fn reads_back_by_key() {
     reel.flush().expect("flush");
 
     let found = reel
-        .read_record(committed.loc, key(9).as_ref(), committed.lsn, true)
+        .read_record(committed.loc, key(9).as_ref(), committed.lsn, true, false)
         .expect("read");
     let stale = reel
-        .read_record(committed.loc, key(8).as_ref(), committed.lsn, true)
+        .read_record(committed.loc, key(8).as_ref(), committed.lsn, true, false)
         .expect("read");
 
     assert_eq!(found, RecordRead::Found(Value::new(vec![0x99; 300])));
-    assert_eq!(stale, RecordRead::Stale);
+    assert_eq!(stale, RecordRead::Corrupt);
 }
 
-// an overwritten key's old pointer reads as stale rather than as the old value
+// an old place still reads its own record, since a keyless record holds no version
 #[test]
-fn reads_reject_a_superseded_version() {
+fn a_superseded_place_reads_its_own_record() {
     let (shared, _sim) = harness(1);
     let reel = Reel::open(shared, Vec::new()).expect("open");
     let first = reel
@@ -207,17 +234,16 @@ fn reads_reject_a_superseded_version() {
         .expect("put");
     reel.flush().expect("flush");
 
-    // The stale read names the old location under the new sequence number,
-    // which is what an index that moved on leaves behind.
+    // An index that moved on can pair the old place with the new sequence number
     let superseded = reel
-        .read_record(first.loc, key(7).as_ref(), second.lsn, true)
+        .read_record(first.loc, key(7).as_ref(), second.lsn, true, false)
         .expect("read");
     let current = reel
-        .read_record(second.loc, key(7).as_ref(), second.lsn, true)
+        .read_record(second.loc, key(7).as_ref(), second.lsn, true, false)
         .expect("read");
 
     assert_ne!(first.lsn, second.lsn);
-    assert_eq!(superseded, RecordRead::Stale);
+    assert_eq!(superseded, RecordRead::Found(Value::new(vec![0x11; 300])));
     assert_eq!(current, RecordRead::Found(Value::new(vec![0x22; 300])));
 }
 
@@ -246,4 +272,64 @@ fn concurrent_appends_across_tails() {
     }
     assert_eq!(located.len(), writers as usize);
     reel.flush().expect("flush");
+}
+
+// a keyless record a row placed answers by its shape, and a spot slot's by its check
+#[test]
+fn a_placed_keyless_read_skips_the_check() {
+    use crate::format::record::{
+        CheckKey, Flags, RecordHeader, RecordLayout, CHECK_KEY_LEN, KEYLESS_PREFIX,
+    };
+    use crate::reel::read::{check_in_block, Proof};
+
+    let key = RecordKey::from_bytes(RECORD, &[0x21; RECORD_KEY_LEN]).expect("key");
+    let layout = RecordLayout::Keyless(CheckKey::from_bytes([7; CHECK_KEY_LEN]));
+    let payload = [9u8; 32];
+    let header = RecordHeader::framed(
+        layout,
+        32,
+        Lsn(5),
+        Flags::DATA.relocated(),
+        key.clone(),
+        0,
+        &payload,
+    );
+    let mut block = header.pack_in(layout, &payload).as_slice().to_vec();
+    block.extend_from_slice(&payload);
+    let loc = Loc::new(SegmentId(1), 0, 32);
+    // Read under another segment's key, so the check itself cannot pass
+    let other = RecordLayout::Keyless(CheckKey::from_bytes([8; CHECK_KEY_LEN]));
+    let read = |loc: Loc, is_verified: bool, is_placed: bool| {
+        check_in_block(
+            &block,
+            0,
+            KEYLESS_PREFIX,
+            key.as_ref(),
+            Lsn(5),
+            loc,
+            other,
+            Proof::of(is_verified, is_placed),
+        )
+    };
+
+    assert_eq!(
+        read(loc, false, true),
+        Ok(0),
+        "a placed read answers by the shape"
+    );
+    assert_eq!(
+        read(loc, false, false),
+        Err(RecordRead::Corrupt),
+        "a spot read runs the check"
+    );
+    assert_eq!(
+        read(loc, true, true),
+        Err(RecordRead::Corrupt),
+        "a verified read runs the check"
+    );
+    assert_eq!(
+        read(Loc::new(SegmentId(1), 0, 31), false, true),
+        Err(RecordRead::Stale),
+        "a shape off the row is stale"
+    );
 }

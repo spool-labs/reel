@@ -1,9 +1,4 @@
 //! Per-reel ownership lock that makes a second writer fail loudly
-//!
-//! A writable open takes an exclusive advisory lock on a file in the volume, so a
-//! second writer is rejected at open instead of interleaving two appenders. The lock
-//! lives on the open file description, so it dies with the descriptor when the owner
-//! exits or crashes. A read-only open takes no lock.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write;
@@ -17,7 +12,7 @@ const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 
 /// An exclusive advisory lock held for the lifetime of a writable reel
 pub struct OwnershipLock {
-    /// Held so the advisory lock outlives this value, never read
+    /// Keeps the file open so the lock lasts as long as this value, never read
     _holder: File,
 }
 
@@ -44,10 +39,7 @@ fn acquire_exclusive(holder: &File, path: &Path) -> Result<()> {
     }
 }
 
-/// The contention error, carrying whatever the owner recorded about itself
-///
-/// The read races the owner rewriting the file, which can only stale the message,
-/// never the verdict the kernel lock already gave.
+/// The contention error, with whatever the owner recorded about itself
 fn held_message(path: &Path) -> String {
     let recorded = std::fs::read_to_string(path).unwrap_or_default();
     let recorded = recorded.trim().to_string();
@@ -107,7 +99,7 @@ mod tests {
         assert!(contents.contains("version="));
     }
 
-    // a second acquire against a held lock fails loudly, naming the owner
+    // a second acquire against a held lock fails loudly and reports the owner
     #[test]
     fn second_acquire_fails() {
         let dir = tempdir().expect("tempdir");

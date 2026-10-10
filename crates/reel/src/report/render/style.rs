@@ -1,9 +1,4 @@
-//! What a renderer is allowed to dress its output with
-//!
-//! The engine reads no terminal and consults no environment: a frontend decides
-//! whether it is talking to a person and hands the answer down. That keeps the
-//! renderers pure, so a test can ask for the dressed form and the plain one from
-//! the same report and compare them.
+//! Colour, frame and width settings a frontend hands to the renderers
 
 /// Whether a renderer may colour and frame, and how wide it may draw
 #[derive(Clone, Copy, Debug)]
@@ -14,7 +9,7 @@ pub struct Style {
     /// Whether the head and verdict sit inside a drawn frame
     pub frames: bool,
 
-    /// Columns available, which is what a frame is sized against
+    /// Terminal width in columns, which sizes the frame
     pub width: usize,
 }
 
@@ -25,14 +20,14 @@ impl Default for Style {
 }
 
 impl Style {
-    /// No colour and no frame, which is what a pipe and a file want
+    /// No colour and no frame, for a pipe or a file
     pub const PLAIN: Style = Style {
         color: false,
         frames: false,
         width: 80,
     };
 
-    /// Dressed for a terminal of this width
+    /// Colour and frames for a terminal of this width
     pub fn rich(width: usize) -> Style {
         Style {
             color: true,
@@ -47,22 +42,22 @@ impl Style {
     }
 }
 
-/// The escape sequence a role is painted with, or nothing where colour is off
+/// The roles text can be painted in, each with its own escape sequence
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Paint {
-    /// Labels, units and anything the eye should slide over
+    /// Labels, units and other text the eye should skip
     Dim,
 
-    /// The answer, where the answer is the one hoped for
+    /// The answer that was hoped for
     Good,
 
-    /// A caveat: true, but not the whole of it
+    /// A caveat, true but partial
     Warn,
 
     /// A fault
     Bad,
 
-    /// The line that carries the most, drawn heavier than the rest
+    /// The line that matters most, drawn heavier than the rest
     Strong,
 }
 
@@ -86,11 +81,7 @@ pub(super) fn paint(style: &Style, role: Paint, text: &str) -> String {
     }
 }
 
-/// Columns a string occupies, which is its characters rather than its bytes
-///
-/// Every character these reports draw with is one column wide, so counting them
-/// is the width. Counting bytes instead would over-measure the separators and
-/// the box edges, and every table drawn beside one would sit crooked.
+/// A string's width in columns, one per character
 pub(super) fn width(text: &str) -> usize {
     text.chars().count()
 }

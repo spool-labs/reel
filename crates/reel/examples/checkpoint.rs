@@ -1,10 +1,5 @@
 //! A checkpoint is the volume at a cue, and it opens as a volume
 //!
-//! A cue holds a consistent view open in process; a checkpoint puts that same view
-//! on disk in a sibling directory, as one hard link per sealed segment, so the cost
-//! is metadata rather than bytes. The copy then opens as a store of its own while
-//! the original keeps taking writes that never reach it.
-//!
 //! cargo run --example checkpoint
 
 use std::ops::Range;
@@ -14,8 +9,8 @@ use tempfile::TempDir;
 
 use reel::format::column::RecordKey;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IndexResidency, KeyWidth, MapShape,
-    ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
+    ThreadBudget,
 };
 use reel_core::Value;
 
@@ -28,13 +23,12 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 2,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 const KEY_LEN: usize = 16;
 const PAYLOAD_LEN: usize = 4_096;
 
-/// Records written before the cue, which is everything the copy owes back
+/// Records written before the cue, all of which the copy must hold
 const COPIED: u32 = 300;
 
 /// Records written after it, which the copy must not have
@@ -44,14 +38,12 @@ const EARLY_FILL: u8 = 0xa1;
 const LATE_FILL: u8 = 0xc3;
 const OVERWRITE_FILL: u8 = 0xff;
 
-/// Small segments, so a modest write count rolls several and the link set is real
+/// Small segments, so a modest write count seals several to link
 fn config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(1),
-        alloc_chunk: ByteCount::from_bytes(64 * 1024),
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(2),
-        index: IndexResidency::Resident,
         ..ReelConfig::default()
     }
 }
@@ -90,7 +82,7 @@ fn main() -> reel::Result<()> {
         taken.segments,
     );
 
-    // The original moves on: new keys, and a new version of one the copy holds.
+    // The original moves on: new keys, and a new version of one the copy holds
     fill(&store, COPIED..COPIED + LATER, LATE_FILL)?;
     store.put(&key(0), &vec![OVERWRITE_FILL; PAYLOAD_LEN])?;
     store.flush()?;

@@ -1,14 +1,5 @@
-//! What the resident index costs, per shape, at the sizes a shard actually holds
-//!
-//! The index is not one map: a column declaring two shard bytes is 65,536 maps under
-//! 65,536 locks, so what a replacement has to beat is a small map, under a lock already
-//! spread thinner than any concurrent candidate would spread it. Ordering is a gate
-//! rather than a score, since a listing seeks by prefix and resumes from a name, so the
-//! hash arm is the ceiling ordering is measured against and not a candidate. Keys are
-//! the record shape, 34 bytes fixed, held inline as the real index holds them.
-//!
-//! Ignored by default. Run with:
-//!   cargo test -p tape-reel --test index_shape --release -- --ignored --nocapture
+//! What each resident index shape costs at the sizes one shard holds
+//! Run with `cargo test -p tape-reel --test index_shape --release -- --ignored --nocapture`
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::{BTreeMap, HashMap};
@@ -22,31 +13,27 @@ use rand::{Rng, SeedableRng};
 use rustc_hash::FxBuildHasher;
 use scc::{Guard, TreeIndex};
 
-use reel::format::column::{Codec, ColumnId, ColumnSpec, KeyWidth, MapShape, RecordKey};
+use reel::format::column::{Codec, ColumnId, ColumnSpec, KeyWidth, RecordKey};
 use reel::format::loc::{Loc, SegmentId};
 use reel::format::lsn::Lsn;
 use reel::index::column::{Shape, ShardMap, Trees, VarTrees, WidthIndex, VAR_NODE_WIDTH};
 use reel::index::counters::SegmentTable;
 use reel::index::entry::Entry;
-use reel::index::opentable::OpenTable;
 use reel::index::tbtreemap::{
     node_width, scan_backend, scans, Shared, TBTreeMap, TreeKey, Whole, MAX_NODE_WIDTH,
     MIN_NODE_WIDTH, NODE_BUDGET, SHARED_CAP,
 };
-use reel::IndexResidency;
 
-/// Nodes a tree of record keys holds, which is what the records column takes
+/// Each node holds this many 34 byte record keys
 const RECORD_NODES: usize = node_width(34);
 
-/// Nodes a tree of addresses holds, the width a bare address column takes
+/// Each node holds this many 32 byte address keys
 const ADDRESS_NODES: usize = node_width(32);
 
 /// The record key shape, two group bytes and a thirty-two byte id
 type Key = [u8; 34];
 
-/// What the tree holds, standing in for an index entry
-///
-/// `Default` because a node's value array is made before it is filled.
+/// A stand-in index entry for the tree
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct TreeVal {
     segment: u32,
@@ -78,10 +65,10 @@ impl Val {
     }
 }
 
-/// Per-shard occupancies worth pricing, spanning what a real shard holds
+/// Per-shard occupancies, spanning what a real shard holds
 const SIZES: &[usize] = &[64, 256, 1024, 4096, 16384];
 
-/// Lookups timed per arm, enough that one slow path shows
+/// Lookups timed per arm
 const PROBES: usize = 200_000;
 
 fn keys(count: usize, seed: u64) -> Vec<Key> {
@@ -95,10 +82,7 @@ fn keys(count: usize, seed: u64) -> Vec<Key> {
         .collect()
 }
 
-/// Repetitions each arm runs, so one contended sample cannot set the number
-///
-/// A single timing moves further on a shared machine than the gaps between the arms are
-/// wide, so the median of a few is what makes the columns comparable.
+/// Each arm runs this many times and reports the median
 const REPEATS: usize = 5;
 
 /// One arm's three timings: insert, get, scan, in nanoseconds per operation
@@ -124,10 +108,7 @@ fn median_of<K>(run: Arm<K>, held: &[K], probes: &[K]) -> Timings {
     (inserts[REPEATS / 2], gets[REPEATS / 2], scans[REPEATS / 2])
 }
 
-/// Which lead scan this build counted with, printed above every table
-///
-/// `scan_backend` picks once per process from what the processor reports, and a box that
-/// fell back quietly reads exactly like one that did not.
+/// Prints the lead scan backend this process picked
 fn scan_note() {
     println!("scan backend: {}", scan_backend());
 }
@@ -264,8 +245,7 @@ fn bench_hash(keys: &[Key], probes: &[Key]) -> (f64, f64, f64) {
     let get = per_op(start.elapsed(), probes.len());
     assert!(hits > 0, "the probe set never hit");
 
-    // Unordered: a scan has to sort to mean the same thing, which is the cost
-    // ordering is being compared against rather than a walk.
+    // A hash map has no order, so its scan sorts the keys
     let start = Instant::now();
     let mut all: Vec<&Key> = map.keys().collect();
     all.sort_unstable();
@@ -310,10 +290,6 @@ fn shard_sized_shapes() {
 }
 
 /// The hand-rolled tree at one key width and one node width, same three timings
-///
-/// Generic in the key width because a node holds `B` whole keys: the shift an insert
-/// pays and the comparisons a tied run pays scale with `B` times the width, while the
-/// levels a descent walks fall with `B` whatever the width is.
 fn time_tree<const N: usize, const B: usize>(
     keys: &[[u8; N]],
     probes: &[[u8; N]],
@@ -394,18 +370,10 @@ fn handrolled_node_width() {
     }
 }
 
-/// Distinct leads a tied draw spreads its keys over
-///
-/// Eight leaves a descent something to route on while still filling every leaf with keys
-/// that share their whole lead, which is the run `seek` walks.
+/// A tied draw spreads its keys over this many distinct leads
 const TIED_LEADS: usize = 8;
 
-/// How a column's keys sit against the eight byte lead the tree searches on
-///
-/// `shared` is how many leading bytes a run of keys holds in common, and zero is a column
-/// whose keys differ inside their lead. `ascending` is whether the run arrives in key
-/// order, which is the worst case for the tied walk: the wanted key sits past every key
-/// the leaf already holds, so the walk runs the leaf's whole length.
+/// Keys whose first `shared` bytes repeat across a few leads, ascending if asked
 fn drawn<const N: usize>(count: usize, shared: usize, ascending: bool, seed: u64) -> Vec<[u8; N]> {
     let mut rng = SmallRng::seed_from_u64(seed);
     let leads: Vec<[u8; 32]> = (0..TIED_LEADS)
@@ -429,8 +397,7 @@ fn drawn<const N: usize>(count: usize, shared: usize, ascending: bool, seed: u64
             }
         }
         true => {
-            // Round major, so each lead's keys ascend through the counter and land at the
-            // right edge of their leaf.
+            // Round major, so each lead's keys ascend and land at the right edge of their leaf
             let rounds = count.div_ceil(TIED_LEADS);
             for round in 0..rounds {
                 for lead in &leads {
@@ -483,11 +450,7 @@ fn sweep_widths<const N: usize>(size: usize, shared: usize) {
     println!();
 }
 
-// what a node width costs at the key widths the columns actually declare
-//
-// A node holds `B` whole keys beside the leads, so what a width costs is `B` times the
-// key rather than `B`: an insert shifts the keys right of its slot and a tied run
-// compares whole keys along the leaf, and both grow with the product.
+// what a node width costs at the key widths the columns declare
 #[test]
 #[ignore = "measurement; run with --ignored --nocapture"]
 fn node_width_by_key_size() {
@@ -499,10 +462,7 @@ fn node_width_by_key_size() {
     );
 
     for &size in &[1024usize, 16384] {
-        // Sixteen is a slot and an index, sharing the whole lead within a slot.
-        // Thirty-two and thirty-four are the engine's own address and record keys, which
-        // differ inside their lead, so their tied rows are the width's cost rather than a
-        // column's. Seventy-two and a hundred and eight are the status columns.
+        // Widths: slot and index, address, record, and the two status columns
         sweep_widths::<16>(size, 8);
         sweep_widths::<32>(size, 24);
         sweep_widths::<34>(size, 26);
@@ -512,10 +472,6 @@ fn node_width_by_key_size() {
 }
 
 // every declared key width takes the node width its bytes ask for
-//
-// The width a column holds is arithmetic on the width it declared, and the paired type
-// assertions say that arithmetic reaches the columns: a `Shape` holding some other width
-// would fail to compile against them.
 #[test]
 fn declared_widths_take_the_budget() {
     // The widths `ColumnIndex` declares, against the node width each takes.
@@ -552,8 +508,7 @@ fn declared_widths_take_the_budget() {
             width <= MAX_NODE_WIDTH,
             "{key} byte keys went past the ceiling"
         );
-        // Inside the budget wherever the budget decided the width. A key held up by the
-        // floor overshoots, because levels cost more there than bytes save.
+        // A width at the floor may overshoot the budget, every other width stays inside it
         let bytes = width * key;
         match width {
             MIN_NODE_WIDTH => assert!(
@@ -567,8 +522,7 @@ fn declared_widths_take_the_budget() {
         }
     }
 
-    // The wide status columns are what the budget is for: at 64 keys a node they would
-    // hold 6,912 and 4,608 bytes of key.
+    // At 64 keys a node the status columns would hold 6,912 and 4,608 bytes of key
     assert_eq!(node_width(108) * 108, 1728, "address_signatures node bytes");
     assert_eq!(node_width(72) * 72, 1152, "transaction_status node bytes");
 
@@ -629,10 +583,7 @@ fn bulk_load_agrees_and_packs() {
     }
 }
 
-// what an install costs, driven by inserts against built from the sorted run
-//
-// Recovery absorbs sorted runs, so this is the comparison the reopen actually
-// faces rather than a synthetic one.
+// what an install costs, insert-driven against built from the sorted run
 #[test]
 #[ignore = "measurement; run with --ignored --nocapture"]
 fn install_from_sorted() {
@@ -713,10 +664,6 @@ fn install_from_sorted() {
 }
 
 // keys sharing their eight byte lead still order and resolve exactly
-//
-// The node search bisects on an eight byte lead and only reaches for a whole key where
-// leads tie. Every other test here draws keys that differ inside those eight bytes, so
-// none of them exercise the fallback at all.
 #[test]
 fn shared_leads_still_resolve() {
     let mut model: BTreeMap<Key, u64> = BTreeMap::new();
@@ -753,7 +700,7 @@ fn shared_leads_still_resolve() {
     let expected: Vec<Key> = model.keys().copied().collect();
     assert_eq!(walked, expected, "tied leads walk out of order");
 
-    // The chunked walk has to agree with the pair walk it exists to replace.
+    // `chunks` walks the same keys as the pair walk
     let chunked: Vec<Key> = tree
         .chunks()
         .flat_map(|(keys, _)| keys.iter().copied())
@@ -784,11 +731,7 @@ fn level_footprints() {
     }
 }
 
-/// A live-bytes counter in front of the system allocator
-///
-/// An open-addressed table's cost is its load factor and its control bytes, which live
-/// inside hashbrown, so the only way to compare it against a structure this file owns is
-/// to count what each asks the allocator for and does not give back.
+/// Counts live heap bytes in front of the system allocator
 struct Counted;
 
 static ARMED: AtomicBool = AtomicBool::new(false);
@@ -827,7 +770,7 @@ fn weighed<T>(build: impl FnOnce() -> T) -> (T, i64) {
     (held, LIVE.load(Ordering::Relaxed))
 }
 
-/// A 32 byte address, which is what a state-shaped column is keyed by
+/// A 32 byte address key
 type Pubkey = [u8; 32];
 
 fn pubkeys(count: usize, seed: u64) -> Vec<Pubkey> {
@@ -841,18 +784,12 @@ fn pubkeys(count: usize, seed: u64) -> Vec<Pubkey> {
         .collect()
 }
 
-/// The index entry every arm holds
-///
-/// The engine's own `Entry`, since its size is what the container overhead is divided
-/// against.
+/// The engine's own `Entry`, which every arm holds
 fn entry_at(at: u64) -> Entry {
     Entry::new(Loc::new(SegmentId(1), at as u32, 200), Lsn(at))
 }
 
-/// The same pairs in key order, which is the shape a bulk load takes
-///
-/// Built inside whatever is being weighed rather than handed to it: a run allocated and
-/// freed inside the armed window nets out, and one allocated before it would not.
+/// The pairs in key order, built inside the weighed closure so they net out
 fn sorted_run(keys: &[Pubkey]) -> Vec<(Pubkey, Entry)> {
     let mut run: Vec<(Pubkey, Entry)> = Vec::with_capacity(keys.len());
     for (at, key) in keys.iter().enumerate() {
@@ -898,22 +835,7 @@ fn hash_at(keys: &[Pubkey], is_installed: bool) -> HashMap<Pubkey, Entry, FxBuil
     map
 }
 
-/// The open-addressed table, grown from empty or sized once for its keys
-fn open_at(keys: &[Pubkey], is_installed: bool) -> OpenTable<32, Entry> {
-    let mut map = match is_installed {
-        true => OpenTable::with_keys(keys.len()),
-        false => OpenTable::new(),
-    };
-    for (at, key) in keys.iter().enumerate() {
-        map.insert(*key, entry_at(at as u64));
-    }
-    map
-}
-
-/// Weigh one container over the keys and time a probe of every one of them
-///
-/// Every probe is a key the container holds, so a count short of the whole set is
-/// an arm that lost something and the timing beside it means nothing.
+/// Weigh one container and time a probe of every key it holds
 fn weigh_arm<Map>(
     build: impl FnOnce() -> Map,
     probes: &[Pubkey],
@@ -932,38 +854,18 @@ fn weigh_arm<Map>(
     (bytes as f64 / probes.len() as f64, per_probe)
 }
 
-/// What a resident 32 byte key costs, tree against open addressing
-///
-/// The full 32 byte key in every arm: a prefix as the map key loses a key outright when
-/// two collide, and the keys are chosen by whoever writes them. `HashMap` is the ceiling
-/// the shape is measured against; `OpenTable` is what would actually go in, and it
-/// answers an ordered walk by gathering and sorting.
-///
-/// Every arm is weighed at both loads, since a container's footprint is as much the load
-/// as the structure. `grown` puts the keys in one at a time, which is what a running
-/// volume does; `installed` is the bulk path a rebuild takes, the tree from its sorted
-/// run and the table sized once for a key count known at open.
+// what a resident 32 byte key costs, tree against the standard maps
 #[test]
 #[ignore = "measurement; run with --ignored --nocapture"]
 fn key_footprint() {
-    // Bare maps: no shards, no locks, no occupied sets, no payload pool, since a whole
-    // store's live allocation is not the tree's cost.
+    // Bare maps with no shards, locks or payload pool, so only the container is weighed
     println!(
         "value is the engine's Entry, {} bytes",
         std::mem::size_of::<Entry>()
     );
     println!(
-        "{:>9} {:>10} {:>10} {:>9} {:>10} {:>9} {:>10} {:>9} {:>10} {:>9}",
-        "keys",
-        "load",
-        "tbtree B",
-        "get ns",
-        "btree B",
-        "get ns",
-        "hash B",
-        "get ns",
-        "open B",
-        "get ns",
+        "{:>9} {:>10} {:>10} {:>9} {:>10} {:>9} {:>10} {:>9}",
+        "keys", "load", "tbtree B", "get ns", "btree B", "get ns", "hash B", "get ns",
     );
 
     for count in [262_144usize, 1_048_576] {
@@ -985,11 +887,6 @@ fn key_footprint() {
                 &probes,
                 |map, key| map.get(key).is_some(),
             );
-            let (open_bytes, open_ns) = weigh_arm(
-                || open_at(&keys, is_installed),
-                &probes,
-                |map, key| map.get(key).is_some(),
-            );
 
             let load = match is_installed {
                 true => "installed",
@@ -997,17 +894,13 @@ fn key_footprint() {
             };
             println!(
                 "{count:>9} {load:>10} {tb_bytes:>10.1} {tb_ns:>9.1} {bt_bytes:>10.1} \
-                 {bt_ns:>9.1} {hash_bytes:>10.1} {hash_ns:>9.1} {open_bytes:>10.1} {open_ns:>9.1}",
+                 {bt_ns:>9.1} {hash_bytes:>10.1} {hash_ns:>9.1}",
             );
         }
     }
 }
 
-/// What each byte of an index entry is worth, per step of the shrink
-///
-/// Stand-in values of each width rather than real ones, since the question is what the
-/// structure does with a smaller value and not what the fields mean. Twenty-four is what
-/// ships; the rest are cuts that would each cost something to make.
+// what each byte of an index entry is worth, per step of the shrink
 #[test]
 #[ignore = "measurement; run with --ignored --nocapture"]
 fn entry_shrink_is_worth() {
@@ -1085,11 +978,7 @@ fn entry_shrink_is_worth() {
     }
 }
 
-/// What the node width costs in resident bytes, beside what it costs in time
-///
-/// A leaf at width B holds B slots of a lead, a key and an entry whether or not they are
-/// filled, so a width also decides how much of an insert-built tree is empty node, and
-/// the arenas double on top of that.
+// what the node width costs in resident bytes and fill
 #[test]
 #[ignore = "measurement; run with --ignored --nocapture"]
 fn node_width_costs() {
@@ -1135,13 +1024,10 @@ fn node_width_costs() {
     println!("{:>7} {b:>12.1} {ns:>10.1} {fill:>8.2}", 128);
 }
 
-/// Occupancies past the last level of cache, where the layout is meant to pay
-///
-/// Everything in the sweep above fits in L2, and in cache the arena's premise of
-/// contiguous runs a prefetcher can follow buys nothing over a shallow node.
+/// Occupancies past the last level of cache
 const BIG: &[usize] = &[262_144, 1_048_576, 4_194_304];
 
-/// Fewer repeats out here, since one arm at four million keys is not cheap
+/// Fewer repeats past cache, where one arm is slow
 const BIG_REPEATS: usize = 3;
 
 fn big_median(run: Arm<Key>, held: &[Key], probes: &[Key]) -> Timings {
@@ -1189,7 +1075,7 @@ fn past_cache() {
     }
 }
 
-/// Keys handed to the tree at once, spanning what memory level parallelism allows
+/// Batch sizes handed to `get_many`
 const BATCHES: &[usize] = &[1, 4, 16, 64];
 
 // what overlapping the descents buys, past cache where the misses are the cost
@@ -1344,7 +1230,7 @@ fn fill_under_deletion() {
     println!("{:>26}  rebuild cost {rebuild:.1}ns a key", "");
 }
 
-// the sorted and cold batch variants answer what the plain one does
+// the sorted batch variant answers what the plain one does
 #[test]
 fn batch_variants_agree() {
     let held = {
@@ -1378,10 +1264,8 @@ fn batch_variants_agree() {
     asked.sort_unstable();
 
     let mut plain = Vec::new();
-    let mut cold = Vec::new();
     let mut sorted = Vec::new();
     tree.get_many(&asked, &mut plain);
-    tree.get_many_cold(&asked, &mut cold);
     tree.get_many_sorted(&asked, &mut sorted);
 
     let want: Vec<Option<u64>> = asked
@@ -1396,11 +1280,10 @@ fn batch_variants_agree() {
         want,
         "the lane batch disagrees with single gets"
     );
-    assert_eq!(seen(&cold), want, "the unprefetched batch disagrees");
     assert_eq!(seen(&sorted), want, "the sorted batch disagrees");
 }
 
-// what the prefetch is worth, and what sorting the batch is worth on top
+// what sorting the batch is worth on top of the prefetch
 #[test]
 #[ignore = "measurement; run with --ignored --nocapture"]
 fn batch_variants() {
@@ -1440,18 +1323,17 @@ fn batch_variants() {
         ordered.sort_unstable();
 
         for &batch in &[16usize, 64] {
-            for (name, run) in [("cold", 0u8), ("prefetched", 1), ("sorted", 2)] {
-                let source = if run == 2 { &ordered } else { &probes };
+            for (name, is_sorted) in [("prefetched", false), ("sorted", true)] {
+                let source = if is_sorted { &ordered } else { &probes };
                 let mut out = Vec::with_capacity(batch);
                 let mut rows = Vec::new();
                 for _ in 0..3 {
                     let start = Instant::now();
                     let mut answered = 0usize;
                     for chunk in source.chunks(batch) {
-                        match run {
-                            0 => tree.get_many_cold(chunk, &mut out),
-                            1 => tree.get_many(chunk, &mut out),
-                            _ => tree.get_many_sorted(chunk, &mut out),
+                        match is_sorted {
+                            false => tree.get_many(chunk, &mut out),
+                            true => tree.get_many_sorted(chunk, &mut out),
                         }
                         answered += out.iter().filter(|found| found.is_some()).count();
                     }
@@ -1467,9 +1349,6 @@ fn batch_variants() {
 }
 
 // an unsorted run handed to the sorted batch is answered correctly anyway
-//
-// The variant partitions against separators and would route some keys wrongly if the run
-// were out of order. Every other test feeds it sorted input, which cannot reach the guard.
 #[test]
 fn unsorted_run_still_answers() {
     let held = {
@@ -1522,10 +1401,7 @@ fn unsorted_run_still_answers() {
     assert_eq!(seen, want, "an unsorted run was answered wrongly");
 }
 
-// the tree holds a column's own width, not one baked in
-//
-// The narrow end is where the lead covers the whole key, so every comparison is a tie
-// the full key settles.
+// the tree holds keys of any declared width
 #[test]
 fn any_declared_width_holds() {
     fn round_trip<const N: usize>(seed: u64) {
@@ -1568,10 +1444,7 @@ fn any_declared_width_holds() {
     round_trip::<108>(5);
 }
 
-// range, clear, contains_key and is_empty against the map they replace
-//
-// The bounds that bite: both ends of the key space, an excluded low landing exactly on a
-// held key, and a resume from a deleted key, which is what a budgeted sweep hands back.
+// range, clear, contains_key and is_empty agree with a `BTreeMap`
 #[test]
 fn range_and_the_rest_agree() {
     let mut held = keys(6000, 41);
@@ -1704,11 +1577,7 @@ fn range_and_the_rest_agree() {
     );
 }
 
-// what a span costs, against the map it replaces
-//
-// The seek is paid once a resumption and the walk once a key, so they are timed apart: a
-// structure that walks fast but seeks slowly loses on a small budget, and the reverse
-// loses on a large one.
+// what a span costs against a `BTreeMap`, per span and per key
 #[test]
 #[ignore = "measurement; run with --ignored --nocapture"]
 fn range_cost() {
@@ -1781,12 +1650,7 @@ fn range_cost() {
     }
 }
 
-// the map a name column reaches answers what a `BTreeMap` of names answers
-//
-// The index reaches its map through `ShardMap` and does not know what it got, so the tree
-// holding names has to be indistinguishable through that door. The keys are bucket-led
-// names, so every call here runs through a node whose window has retuned past a bucket
-// and through the leaves where two buckets meet.
+// the name map answers what a `BTreeMap` answers through `ShardMap`
 #[test]
 fn the_name_map_agrees_with_a_btreemap() {
     let entry = |lsn: u64| Entry::new(Loc::new(SegmentId(1), lsn as u32, 16), Lsn(lsn));
@@ -1819,7 +1683,7 @@ fn the_name_map_agrees_with_a_btreemap() {
         assert_eq!(model.get(key), tree.at(key), "a lookup differs");
         assert_eq!(model.contains_key(key), tree.holds(key), "presence differs");
     }
-    // A key no bucket holds, which is the miss a shard filter would not catch.
+    // Keys no bucket holds
     for absent in [b"".as_slice(), b"zzz".as_slice(), &[0xffu8; 40]] {
         assert_eq!(model.get(absent), tree.at(absent), "a miss differs");
     }
@@ -1846,8 +1710,7 @@ fn the_name_map_agrees_with_a_btreemap() {
         .collect();
     assert_eq!(back_model, back_tree, "the backward spans differ");
 
-    // The batched door partitions a run against a node's own separators rather than
-    // descending each key, so a window that placed one key wrongly shows up here.
+    // `at_many` partitions the run against node separators, so a misplaced key shows here
     let asked: Vec<Box<[u8]>> = held.iter().step_by(7).take(64).cloned().collect();
     let by_model: Vec<Option<&Entry>> = asked.iter().map(|key| model.get(key)).collect();
     let mut by_tree: Vec<Option<&Entry>> = Vec::new();
@@ -1872,10 +1735,7 @@ fn the_name_map_agrees_with_a_btreemap() {
     assert_eq!(Some(&entry(1)), tree.at(&held[0]), "a refill differs");
 }
 
-// a bulk build of names holds what a key at a time holds
-//
-// `from_sorted` tunes a leaf's window in one pass rather than shrinking it as keys
-// arrive, so the two roads are compared on what they answer, not on how they are shaped.
+// a bulk build of name keys holds what a key at a time holds
 #[test]
 fn a_bulk_name_build_matches_insertion() {
     let entry = |lsn: u64| Entry::new(Loc::new(SegmentId(1), lsn as u32, 16), Lsn(lsn));
@@ -1913,12 +1773,7 @@ fn a_bulk_name_build_matches_insertion() {
     }
 }
 
-// every scan counts a lead array the same, whatever width it works at
-//
-// The backend is a `OnceLock`, so a running process picks one and never asks the others,
-// and the narrow arms are the ones a wide machine would never exercise. The arrays are
-// drawn to include the shapes that break vector code: lengths that are not a multiple of
-// a lane, every value below, every value above, and a run of equal leads.
+// every scan backend counts a lead array the same
 #[test]
 fn every_scan_counts_alike() {
     let mut rng = SmallRng::seed_from_u64(101);
@@ -1966,10 +1821,7 @@ fn every_scan_counts_alike() {
     }
 }
 
-// what a rebuild holds a shard's lock for, and what it gives back
-//
-// A rebuild is `from_sorted` over one shard's survivors with that shard held exclusively.
-// Reported per shard rather than per key, because the lock is held for the whole of it.
+// how long a rebuild holds a shard's lock, and how many leaves it gives back
 #[test]
 #[ignore = "measurement; run with --ignored --nocapture"]
 fn rebuild_lock_hold() {
@@ -2003,7 +1855,7 @@ fn rebuild_lock_hold() {
             TBTreeMap::from_sorted(pairs, RECORD_NODES);
         let before = tree.leaf_count();
 
-        // The shape a grave prune leaves: scattered, not a whole shard.
+        // Delete three keys in four, scattered the way a grave prune leaves them
         let mut survivors: Vec<(Key, TreeVal)> = Vec::new();
         for (at, key) in held.iter().enumerate() {
             match at % 4 {
@@ -2049,12 +1901,7 @@ fn rebuild_lock_hold() {
     }
 }
 
-// what the batch buys at the index rather than at the tree
-//
-// The door the store reaches the tree through, which carries what a microbench leaves
-// out: building each key, grouping by shard, sorting inside the shard, and one lock take
-// for the run instead of one a key. The arms answer the same thing, so a row is only the
-// cost of asking.
+// what batched reads save at the index, against one lookup at a time
 #[test]
 #[ignore = "measurement; run with --ignored --nocapture"]
 fn batched_index_reads() {
@@ -2065,11 +1912,9 @@ fn batched_index_reads() {
         shard_bytes: 2,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     };
 
-    // Held per group rather than per volume, since a read locks and descends one shard
-    // at a time and a shard is one group.
+    // Keys are spread over this many groups, one shard each
     const GROUPS: u16 = 50;
 
     println!();
@@ -2079,8 +1924,7 @@ fn batched_index_reads() {
     );
 
     for &per_group in &[65_536usize, 1_048_576] {
-        let index: WidthIndex<[u8; 34], Trees<34>> =
-            WidthIndex::new(&RECORDS, IndexResidency::Resident);
+        let index: WidthIndex<[u8; 34], Trees<34>> = WidthIndex::new(&RECORDS);
         let segments = SegmentTable::new();
         let mut rng = SmallRng::seed_from_u64(0x51ce);
         let mut held: Vec<[u8; 34]> = Vec::with_capacity(per_group * GROUPS as usize);
@@ -2101,14 +1945,9 @@ fn batched_index_reads() {
         }
 
         for &batch in &[8usize, 64, 256] {
-            // One group is what a targeted read asks for; every group is what a read
-            // crossing blobs asks for, and is the case the grouping cannot help.
+            // One group is a targeted read, every group is a read across blobs
             for (spread, name) in [(1usize, "one group"), (GROUPS as usize, "all")] {
-                // A fresh batch per round, since a batch is worth its bookkeeping only
-                // where the levels it overlaps are misses and repeats serve them warm.
-                // Each arm draws its own rounds and the arms alternate: one shared set
-                // hands the second arm the first arm's leaf warmth, which would turn the
-                // gain column into a report of arm order.
+                // Each arm draws fresh rounds and the arms alternate, so neither starts warm
                 let rounds = (65_536 / batch).max(16);
                 let draw = |rng: &mut SmallRng| -> Vec<Vec<Vec<u8>>> {
                     (0..rounds)
@@ -2172,17 +2011,12 @@ fn batched_index_reads() {
     }
 }
 
-/// Object keys in the shapes buckets actually hold
-///
-/// An object listing key is a thirty-two byte bucket address and then a name, so these
-/// are the name distributions a gateway sees, carried onto whole keys. `mixed` spreads
-/// the same names over several buckets, since a shard is one leading address byte and
-/// not one bucket.
+/// Object keys in the shapes buckets hold: a 32 byte bucket address, then a name
 mod names {
     /// Bytes of bucket address in front of every object key
     const BUCKET: usize = 32;
 
-    /// Names at the length the gateway accepts
+    /// The longest object name the gateway accepts
     const MAX_NAME: usize = 1024;
 
     pub struct Corpus {
@@ -2207,7 +2041,7 @@ mod names {
         out
     }
 
-    /// Whole keys, one bucket unless the caller asks for several
+    /// Prefixes each name with a bucket address, over `buckets` buckets
     fn keyed(buckets: u64, names: impl Iterator<Item = Vec<u8>>) -> Vec<Box<[u8]>> {
         let mut keys: Vec<Box<[u8]>> = names
             .enumerate()
@@ -2253,7 +2087,7 @@ mod names {
         })
     }
 
-    /// Every shape, each in the one bucket that makes its prefix worst
+    /// Every name shape in one bucket, plus dated keys over 8 and 256 buckets
     pub fn corpora(count: u64) -> Vec<Corpus> {
         vec![
             Corpus {
@@ -2283,16 +2117,13 @@ mod names {
         ]
     }
 
-    /// Dated names over several buckets, which is the shape a shard really holds
+    /// Dated keys over eight buckets, the shape a shard holds
     pub fn mixed(count: u64) -> Vec<Box<[u8]>> {
         keyed(8, dated(count))
     }
 }
 
-/// The same key with the window switched off, as the control the window is priced against
-///
-/// The same key, heap, pointer chase and lead array, reading its lead from the front of
-/// the key the way every fixed column does, so what separates the rows is the window.
+/// A name key with the window off, as the control for the window
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
 struct Flat(Box<[u8]>);
 
@@ -2375,8 +2206,7 @@ fn time_var<const B: usize>(keys: &[Box<[u8]>], probes: &[usize]) -> VarRow {
     }
     let walk = per_op(start.elapsed(), walked.max(1));
 
-    // The key bytes are already in the total: every arm clones its keys into the map
-    // inside the weighed closure, so the allocator saw one owned copy of each.
+    // The weighed closure clones every key, so the total includes the key bytes
     VarRow {
         insert,
         get,
@@ -2487,12 +2317,7 @@ fn probe_slots(count: usize, held: usize, seed: u64) -> Vec<usize> {
     (0..count).map(|_| rng.gen_range(0..held)).collect()
 }
 
-// what a node width costs a column whose keys are names rather than a width
-//
-// A node holding names shifts sixteen byte pointers whatever the name weighs, so the byte
-// budget the fixed arms divide has nothing to divide and the width has to be measured.
-// Both controls run in every row: the `BTreeMap` this replaces, and the same tree with
-// its window off, which is what separates the width from the lead.
+// what a node width costs a column of name keys, against `BTreeMap` and the flat key
 #[test]
 #[ignore = "measurement; run with --ignored --nocapture"]
 fn var_node_width() {
@@ -2547,10 +2372,7 @@ fn var_node_width() {
                 row.tie,
             );
         }
-        // A node keeps a pointer and the whole key on the heap; front coded inside the
-        // leaf it would be a shared length, an end offset and the bytes the key does not
-        // share with the one before it. Both sides are the key's own share and neither
-        // counts the lead, the value or the node.
+        // Key bytes a slot: boxed is pointer plus key, front coded is length, offset, suffix
         let shared: f64 = held
             .windows(2)
             .map(|pair| {
@@ -2572,11 +2394,7 @@ fn var_node_width() {
     }
 }
 
-// a bucket stops defeating the lead once the node's window moves past it
-//
-// The leading eight bytes are the same on every key in a bucket, so the lead array
-// discriminates nothing and the `flat` arm ties by construction. The window reads the
-// lead from past what a node's own keys agree on, which on these keys is the name.
+// a bucket stops tying the lead once the node's window moves past it
 #[test]
 fn a_bucket_stops_tying_once_the_window_moves() {
     let mut taken: Vec<(&str, f64)> = Vec::new();
@@ -2611,18 +2429,14 @@ fn a_bucket_stops_tying_once_the_window_moves() {
             corpus.name
         );
 
-        // A shard holds several buckets, so pairs straddling two of them do not tie even
-        // without a window, which is what the bar is set under.
+        // Pairs straddling two buckets do not tie, so the bar sits under one
         assert!(
             flat.tie_rate() > 0.9,
             "{}: a bucket-led key should tie on its lead, and {:.4} says it does not",
             corpus.name,
             flat.tie_rate(),
         );
-        // The window can only move past what a node's own keys agree on, so what it takes
-        // back is a property of the names. It never costs: a corpus it cannot reach reads
-        // its lead where the flat arm reads it and ties the same, and is held to no worse
-        // rather than excused.
+        // The window never ties more than the flat arm
         assert!(
             window.tie_rate() <= flat.tie_rate() + f64::EPSILON,
             "{}: a window should never tie more than no window, and {:.4} against {:.4} says it did",
@@ -2641,9 +2455,6 @@ fn a_bucket_stops_tying_once_the_window_moves() {
 }
 
 /// A name key at one inline window cap, so the cap can be swept like a width
-///
-/// The cap is a const on the window rather than a runtime field, so pricing it means
-/// instantiating the tree at each one.
 macro_rules! capped_key {
     ($name:ident, $cap:literal) => {
         #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
@@ -2688,7 +2499,7 @@ capped_key!(Cap64, 64);
 capped_key!(Cap128, 128);
 capped_key!(Cap256, 256);
 
-/// What one capped arm cost, held against the same corpus at every other cap
+/// Times one capped arm over a corpus
 fn time_capped<K, const B: usize>(
     keys: &[Box<[u8]>],
     probes: &[usize],
@@ -2744,10 +2555,6 @@ where
 }
 
 // how many shared bytes a node should hold inline to move its lead past them
-//
-// Held inline costs every node the cap whether or not its keys are that alike, and a cap
-// under what a corpus shares buys nothing: the lead lands back inside the shared run and
-// ties as if there were no window.
 #[test]
 #[ignore = "measurement; run with --ignored --nocapture"]
 fn var_shared_cap() {
@@ -2795,12 +2602,7 @@ fn var_shared_cap() {
     }
 }
 
-// the name columns take the width the sweep settled, and nothing is a BTreeMap
-//
-// The width is not arithmetic on anything: a node of names holds pointers, so
-// `NODE_BUDGET` has nothing to divide and the width was measured. The second half is that
-// the map is gone from the resident index rather than merely unused, which a type cannot
-// say and a reader of the source can.
+// the name columns use the swept width and cap, and the index holds no `BTreeMap`
 #[test]
 fn the_name_columns_are_pinned_and_nothing_is_a_btreemap() {
     assert_eq!(
@@ -2824,13 +2626,11 @@ fn the_name_columns_are_pinned_and_nothing_is_a_btreemap() {
         let held = std::fs::read_to_string(&path).expect("a source file");
         for (at, line) in held.lines().enumerate() {
             let code = line.trim_start();
-            // Prose may name it, so what is looked for is a type: the name followed by
-            // its parameters or by a path separator.
+            // Skip comment lines, which may mention the type
             if code.starts_with("//") || code.starts_with("*") {
                 continue;
             }
-            // The crate's own tree ends in the same eight letters, so the byte
-            // in front of a hit is what tells `BTreeMap<` from `TBTreeMap<`.
+            // `TBTreeMap` ends in `BTreeMap`, so a hit with a letter in front is the crate's tree
             for form in ["BTreeMap<", "BTreeMap::"] {
                 let mut from = 0usize;
                 while let Some(hit) = code[from..].find(form) {

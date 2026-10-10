@@ -6,14 +6,14 @@ use crate::report::doc::{Column, Doc, Row, Table, Tone};
 use crate::report::fmt;
 use crate::report::render::Report;
 
-/// One segment's weight, live against what is waiting to be reclaimed
+/// One segment's live and dead bytes
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct SegmentRow {
     /// Segment number, which is also the order it was written in
     pub segment: u32,
 
-    /// Bytes of it a read can still reach
+    /// Bytes a read can still reach
     pub live: u64,
 
     /// Bytes superseded or deleted, reclaimed by erasing the whole file
@@ -22,11 +22,11 @@ pub struct SegmentRow {
     /// Bytes a cue point is holding back from the dead figure
     pub held: u64,
 
-    /// Dead over the segment's whole weight, the order compaction picks in
+    /// Dead bytes over the segment's total, which orders compaction
     pub dead_fraction: f64,
 }
 
-/// What one column has standing over it, as far as this open can say
+/// One column the volume was opened over
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ColumnRow {
@@ -36,22 +36,22 @@ pub struct ColumnRow {
     /// The identifier its records are stamped with
     pub id: u8,
 
-    /// Sealed segments covering keys of the column, absent on a resident open
-    pub sealed_segments: Option<usize>,
+    /// Sealed segments covering keys of the column
+    pub sealed_segments: usize,
 }
 
 /// A cue point some part of this process is holding open
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct HeldCue {
-    /// The sequence number the cue stands at
+    /// The cue's sequence number
     pub at: u64,
 
     /// How many holders are keeping it open
     pub holders: usize,
 }
 
-/// Where the volume stands and what it is holding to get there
+/// The volume's sequence, segment weights and held cue points
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct CueReport {
@@ -64,62 +64,45 @@ pub struct CueReport {
     /// The oldest sequence a read can still reach back to
     pub floor: Option<u64>,
 
-    /// Segments the volume holds, before the listing is truncated
+    /// Segments the volume holds, counted before the listing is truncated
     pub total_segments: usize,
 
     /// Bytes a read can still reach, summed over the segments
     pub live_bytes: u64,
 
-    /// Dead bytes store wide, which is what compaction has to work through
+    /// Dead bytes across the volume, which compaction has to work through
     pub dead_bytes: u64,
 
-    /// Dead over live and dead together, the order compaction picks in
+    /// Dead bytes over live and dead together
     pub dead_share: f64,
-
-    /// Whether the open leaves sealed keys in their footers
-    pub is_paged: bool,
-
-    /// Sealed segments a rebuild left uncounted, so the totals read as a floor
-    pub born_segments: usize,
 
     /// Range deletes still standing over the volume
     pub standing_covers: u64,
 
-    /// Whether a cover is still owed the sweep that resolves it
+    /// Whether a cover still waits for the sweep that resolves it
     pub sweep_owed: bool,
 
-    /// Tombstones the index is carrying
+    /// Tombstones the index holds
     pub graves: u64,
 
     /// Cue points held open in this process
     pub held: Vec<HeldCue>,
 
-    /// Segments, fullest of dead first, truncated to the limit asked for
+    /// Segments, highest dead fraction first, truncated to the limit asked for
     pub segments: Vec<SegmentRow>,
 
     /// The columns the volume was opened over
     pub columns: Vec<ColumnRow>,
 
-    /// What stands between these figures and what a reader would take them for
+    /// What the counts leave unaccounted for
     pub caveats: Vec<Caveat>,
 }
 
-/// Ask an open volume where its sequence stands and what its segments weigh
-///
-/// Fullest of dead first, since that is the order compaction picks in. The per
-/// column figure is what a paged open leaves standing, so a resident open
-/// answers nothing there rather than answering none. A limit of zero asks for
-/// the whole listing, since nobody runs a report to be shown no rows.
+/// Report where an open volume's sequence stands and what its segments weigh
 pub fn cue(engine: &ReelStore, limit: usize) -> CueReport {
     let index = engine.index();
-    let is_paged = engine.config().index.pages();
 
-    // Both totals are summed here, out of the one snapshot, and neither is asked
-    // of the engine again: a second walk of the same rows is a second instant,
-    // and every verb here is built to read a volume something else is writing.
-    // Two instants would let the share and the head disagree with the table
-    // beneath them. Summed as the rows are built, so the listing can be sorted
-    // and cut afterwards without the totals following it down.
+    // Totals come from the same snapshot as the rows, so they agree with the table
     let mut live_bytes = 0u64;
     let mut dead_bytes = 0u64;
     let mut segments: Vec<SegmentRow> = Vec::new();
@@ -149,7 +132,7 @@ pub fn cue(engine: &ReelStore, limit: usize) -> CueReport {
         columns.push(ColumnRow {
             column: spec.name.to_string(),
             id: spec.id.as_u8(),
-            sealed_segments: is_paged.then(|| index.sealed_spans(spec.id)),
+            sealed_segments: index.sealed_spans(spec.id),
         });
     }
 
@@ -162,7 +145,6 @@ pub fn cue(engine: &ReelStore, limit: usize) -> CueReport {
         });
     }
 
-    let born_segments = engine.born_segments();
     let sweep_owed = index.has_pending_covers();
 
     CueReport {
@@ -176,46 +158,31 @@ pub fn cue(engine: &ReelStore, limit: usize) -> CueReport {
             0 => 0.0,
             total => dead_bytes as f64 / total as f64,
         },
-        is_paged,
-        born_segments,
         standing_covers: index.cover_count(),
         sweep_owed,
         graves: index.grave_count(),
         held,
-        caveats: caveats(&columns, is_paged, sweep_owed, born_segments),
+        caveats: caveats(&columns, sweep_owed, live_bytes + dead_bytes > 0),
         segments,
         columns,
     }
 }
 
-/// What a reader has to know before taking any of these figures for a total
-fn caveats(
-    columns: &[ColumnRow],
-    is_paged: bool,
-    sweep_owed: bool,
-    born_segments: usize,
-) -> Vec<Caveat> {
+fn caveats(columns: &[ColumnRow], sweep_owed: bool, holds_bytes: bool) -> Vec<Caveat> {
     let mut caveats = Vec::new();
-    match columns.is_empty() {
-        true => caveats.push(
+    if columns.is_empty() {
+        caveats.push(
             Caveat::new("no columns declared, so sealed spans and standing covers count nothing")
                 .fix("pass --column NAME:ID for each column the volume was written with"),
-        ),
-        false if !is_paged => caveats.push(
-            Caveat::new("sealed spans stand only over a paged open, so this one counts none")
-                .fix("--paged"),
-        ),
-        false => {}
+        );
     }
     if sweep_owed {
         caveats.push(Caveat::new(
             "a cover is still owed its sweep, so the counters read as a floor",
         ));
     }
-    if born_segments > 0 {
-        caveats.push(Caveat::new(format!(
-            "{born_segments} sealed segments a rebuild left uncounted, so the totals are a floor",
-        )));
+    if holds_bytes {
+        caveats.push(caveat::seal_tally());
     }
     caveats
 }
@@ -234,10 +201,6 @@ impl Report for CueReport {
                 "segments",
             ))
             .head(fmt::bytes(self.live_bytes + self.dead_bytes))
-            .head(match self.is_paged {
-                true => "paged",
-                false => "resident",
-            })
             .head("read-only")
             .verdict(self.tone(), self.headline(), self.detail())
             .facts(self.facts())
@@ -252,15 +215,15 @@ impl Report for CueReport {
 }
 
 impl CueReport {
-    /// A figure standing on a floor is not the figure, and reads as a caveat
+    /// A count that waits on a sweep is a floor, so it reads as a warning
     fn tone(&self) -> Tone {
-        match self.sweep_owed || self.born_segments > 0 {
+        match self.sweep_owed {
             true => Tone::Warn,
             false => Tone::Plain,
         }
     }
 
-    /// The one line a reader came for: what compaction still has to work through
+    /// The headline: what compaction still has to work through
     fn headline(&self) -> String {
         match self.total_segments {
             0 => "empty".to_string(),
@@ -297,8 +260,7 @@ impl CueReport {
                 },
             ),
             ("graves".to_string(), self.graves.to_string()),
-            // Cue points live in the process that took them, so a tool looking
-            // in from outside sees none even while a writer holds several.
+            // Cue points live in the process that took them, so another process sees none
             (
                 "cue points".to_string(),
                 match self.held.is_empty() {
@@ -361,7 +323,7 @@ impl CueReport {
             table = table.row(Row::new([
                 row.column.clone(),
                 row.id.to_string(),
-                fmt::answered(row.sealed_segments),
+                row.sealed_segments.to_string(),
             ]));
         }
         table

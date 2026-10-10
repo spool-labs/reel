@@ -1,32 +1,21 @@
-//! Whether the filesystem lets concurrent writers into one file
-//!
-//! A buffered write takes the inode exclusively on Linux, serialising writers however
-//! many the engine admits. A direct write is documented to take it shared when it is
-//! aligned and does not extend the file, which the reel is shaped for. What the
-//! documentation does not settle is an append-only log, where preallocation leaves
-//! extents unwritten and no write is ever a true overwrite, so that is measured rather
-//! than reasoned about. Nothing here touches the reel, which is the point: the
-//! reservation head, the holds and the ring all sit between a writer and the inode.
-//!
-//! Point REEL_LOCK_DIR at the filesystem under test. REEL_LOCK_THREADS and
-//! REEL_LOCK_BYTES size the sweep. Run with:
-//!   cargo test -p tape-reel --test inode_lock --release -- --ignored --nocapture --test-threads=1
+//! Whether the filesystem at REEL_LOCK_DIR lets concurrent writers into one file
+//! Run with `cargo test -p tape-reel -r --test stress -- one_file_many --ignored --nocapture`
 
 use std::os::unix::io::RawFd;
 use std::time::Instant;
 
 use tempfile::TempDir;
 
-/// Writer counts the probe sweeps
+/// The probe sweeps these writer counts unless REEL_LOCK_THREADS is set
 const DEFAULT_THREADS: &str = "1,2,4,8,16";
 
-/// Bytes each writer writes per pass
+/// Each writer writes this many bytes per pass unless REEL_LOCK_BYTES is set
 const DEFAULT_PER_THREAD: u64 = 64 * 1024 * 1024;
 
-/// Size of one write, which has to be block aligned for the direct path
+/// Size of one write, block aligned for the direct path
 const BLOCK: u64 = 65_536;
 
-/// Alignment a direct write's buffer needs
+/// A direct write's buffer needs this alignment
 const ALIGN: usize = 4096;
 
 fn env_list(name: &str, fallback: &str) -> Vec<u64> {
@@ -50,7 +39,7 @@ enum Mode {
     /// Through the page cache, which takes the inode exclusively on Linux
     Buffered,
 
-    /// Straight to the device, which is the case that may take it shared
+    /// Straight to the device, which may take the inode shared
     Direct,
 }
 
@@ -63,11 +52,7 @@ impl Mode {
     }
 }
 
-/// Which time the probe has written these blocks
-///
-/// The first pass writes into extents preallocation left unwritten, the only case an
-/// append-only log produces; the rewrite is the allocated case the shared path is
-/// documented against.
+/// A first pass writes unwritten extents, a rewrite writes allocated ones
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Pass {
     First,
@@ -89,8 +74,7 @@ struct Aligned {
     len: usize,
 }
 
-// The pointer is handed to pwrite from several threads at once and never written
-// through, so sharing it is sound.
+// Threads only pass the pointer to pwrite and never write through it, so sharing is sound
 unsafe impl Send for Aligned {}
 unsafe impl Sync for Aligned {}
 
@@ -122,8 +106,7 @@ fn open_for(path: &std::path::Path, mode: Mode) -> RawFd {
     let fd = unsafe { libc::open(text.as_ptr(), flags, 0o644) };
     assert!(fd >= 0, "open failed: {}", std::io::Error::last_os_error());
 
-    // macOS has no O_DIRECT. F_NOCACHE is the nearest thing and does not carry
-    // the same locking rules, so a direct row here is not the experiment.
+    // macOS has no O_DIRECT, and F_NOCACHE locks differently, so a direct row here is a stand-in
     #[cfg(target_os = "macos")]
     if mode == Mode::Direct {
         unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
@@ -165,10 +148,7 @@ fn write_at(fd: RawFd, buffer: &Aligned, offset: u64) {
     );
 }
 
-/// Run one pass across threads and return the seconds it took
-///
-/// The writers stride rather than taking contiguous halves, so they interleave the
-/// way concurrent appenders to one tail would.
+/// Runs one pass with strided writers and returns the seconds it took
 fn run_pass(fd: RawFd, threads: u64, blocks_each: u64, buffer: &Aligned) -> f64 {
     let start = Instant::now();
     std::thread::scope(|scope| {
@@ -211,8 +191,7 @@ fn filesystem_of(path: &std::path::Path) -> String {
 #[test]
 #[ignore = "kernel probe, run explicitly on the filesystem under test"]
 fn one_file_many_writers() {
-    // libtest leaves "test name ... " open, so a header printed into it lands a
-    // screen-width right of the rows underneath it.
+    // libtest leaves the test name line open, so start the table on a fresh line
     println!();
     let threads_sweep = env_list("REEL_LOCK_THREADS", DEFAULT_THREADS);
     let per_thread = env_bytes("REEL_LOCK_BYTES", DEFAULT_PER_THREAD);
@@ -249,8 +228,7 @@ fn one_file_many_writers() {
                 let blocks_each = (per_thread / BLOCK).max(1);
                 let bytes = (blocks_each * threads * BLOCK) as f64;
 
-                // Each cell gets its own file, so a first pass is always a first
-                // pass and a rewrite is always over blocks this cell has written.
+                // Each cell gets its own file, so a rewrite only covers blocks this cell wrote
                 let path = base.join(format!("probe-{}-{}-{threads}", mode.label(), pass.label()));
                 let _ = std::fs::remove_file(&path);
                 let fd = open_for(&path, mode);

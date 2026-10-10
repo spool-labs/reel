@@ -1,7 +1,4 @@
-//! What this machine argues a volume's knobs should be, beside the configured ones
-//!
-//! The one report that asks the machine under a root rather than the volume on
-//! it, so it answers where nothing has been written yet and opens nothing.
+//! Compares a configuration's knobs with what this machine suggests, without opening a volume
 
 use std::path::Path;
 
@@ -19,7 +16,7 @@ pub struct DoctorReport {
     /// The directory the facts were read under
     pub root: String,
 
-    /// Memory this machine has, where it says
+    /// Memory this machine has, if known
     pub memory_bytes: Option<u64>,
 
     /// The filesystem's capacity under the root
@@ -31,66 +28,51 @@ pub struct DoctorReport {
     /// The block size the device reads and writes in
     pub logical_block_bytes: Option<u64>,
 
-    /// Whether the drive is spinning, where it says
+    /// Whether the drive is spinning, if known
     pub is_rotational: Option<bool>,
 
-    /// Independent access ranges the drive declares, one actuator apiece
+    /// Independent access ranges the drive declares, one per actuator
     pub actuator_ranges: usize,
 
-    /// Open files this process may hold, where there is a limit
+    /// Open files this process may hold, if limited
     pub open_file_limit: Option<u64>,
 
-    /// Whether io_uring is reachable here, and what stops it where it is not
+    /// Whether io_uring is available here, or what blocks it
     pub ring: String,
 
     /// Bytes the tails hold open while the volume is idle
     pub idle_reservation_bytes: u64,
 
-    /// Why the verdict chose the plane it chose
+    /// Why the verdict chose its plane
     pub because: String,
 
     /// The plane the configuration opens on
     pub configured_plane: String,
 
-    /// The plane this machine argues for
+    /// The plane this machine suggests
     pub verdict_plane: String,
 
-    /// The record size the configuration maps above, absent where it maps none
+    /// The record size the configuration maps above, if any
     pub configured_map_above: Option<u64>,
 
-    /// The record size this machine argues for mapping above
+    /// The record size this machine suggests mapping above
     pub verdict_map_above: Option<u64>,
 
     /// Why the verdict chose that mapping floor
     pub map_because: String,
 
-    /// Whether the configuration reads ranges of a record
-    pub configured_ranged_reads: String,
-
-    /// Whether this machine argues for ranged reads
-    pub verdict_ranged_reads: String,
-
-    /// Whether the configuration preallocates a segment before writing it
-    pub configured_preallocate: String,
-
-    /// Whether this machine argues for preallocation
-    pub verdict_preallocate: String,
-
     /// Open segment files the shipped default caches
     pub shipped_fd_cache: u64,
 
-    /// Open segment files this machine argues for caching
+    /// Open segment files this machine suggests caching
     pub verdict_fd_cache: u64,
 }
 
-/// Read this machine's facts under a root and weigh them against a configuration
-///
-/// The root need not hold a volume: nothing is opened, and the facts are the
-/// filesystem's and the kernel's.
+/// Read this machine's facts under a root and compare them with a configuration
 pub fn doctor(root: &Path, config: &ReelConfig) -> DoctorReport {
     let facts = MachineFacts::read(root);
     let reservation = config.segment_bytes.to_bytes() * config.tail_count() as u64;
-    let verdict = facts.verdict(reservation);
+    let verdict = facts.verdict();
     let spans = access_ranges(root);
     DoctorReport {
         root: root.display().to_string(),
@@ -109,32 +91,27 @@ pub fn doctor(root: &Path, config: &ReelConfig) -> DoctorReport {
         configured_map_above: config.map_above.map(ByteCount::to_bytes),
         verdict_map_above: verdict.map_above.map(ByteCount::to_bytes),
         map_because: verdict.map_because.to_string(),
-        configured_ranged_reads: format!("{:?}", config.ranged_reads),
-        verdict_ranged_reads: format!("{:?}", verdict.ranged_reads),
-        configured_preallocate: format!("{:?}", config.preallocate),
-        verdict_preallocate: format!("{:?}", verdict.preallocate),
         shipped_fd_cache: DEFAULT_FD_CACHE,
         verdict_fd_cache: verdict.fd_cache,
     }
 }
 
-/// One knob, as the configuration asks for it beside what this machine argues
+/// One knob's configured value beside this machine's choice
 struct Knob {
-    /// What the knob is called
+    /// The knob's label
     name: &'static str,
 
-    /// What the configuration asks for
+    /// The configured value
     configured: String,
 
-    /// What this machine argues for
+    /// This machine's choice
     chosen: String,
 
-    /// Why the machine argues that, where the verdict gave a reason
+    /// The verdict's reason, if it gave one
     because: Option<String>,
 }
 
 impl Knob {
-    /// Whether the configuration and the machine want different things
     fn disagrees(&self) -> bool {
         self.configured != self.chosen
     }
@@ -162,8 +139,7 @@ impl Report for DoctorReport {
             });
         }
 
-        // A reason belongs beside the knob it explains rather than adrift at the
-        // top of the report, where a reader has to carry it back down.
+        // Each reason is prefixed with the knob it explains
         let notes: Vec<Note> = knobs
             .iter()
             .filter_map(|knob| {
@@ -243,8 +219,8 @@ impl DoctorReport {
         ]
     }
 
-    /// The knobs the configuration asks for beside the ones this machine argues for
-    fn knobs(&self) -> [Knob; 5] {
+    /// Each knob's configured value beside this machine's choice
+    fn knobs(&self) -> [Knob; 3] {
         [
             Knob {
                 name: "plane",
@@ -255,9 +231,7 @@ impl DoctorReport {
             Knob {
                 name: "map above",
                 configured: floor_label(self.configured_map_above),
-                // A verdict names the floor a record has to clear, and a direct
-                // plane names none at all, so a volume asking for a mapping
-                // there disagrees.
+                // A direct plane has no mapping floor, so a configured mapping there is refused
                 chosen: match self.configured_map_above.is_some()
                     && self.verdict_map_above.is_none()
                 {
@@ -265,18 +239,6 @@ impl DoctorReport {
                     false => floor_label(self.verdict_map_above),
                 },
                 because: Some(self.map_because.clone()),
-            },
-            Knob {
-                name: "ranged reads",
-                configured: self.configured_ranged_reads.clone(),
-                chosen: self.verdict_ranged_reads.clone(),
-                because: None,
-            },
-            Knob {
-                name: "preallocate",
-                configured: self.configured_preallocate.clone(),
-                chosen: self.verdict_preallocate.clone(),
-                because: None,
             },
             Knob {
                 name: "fd cache",
@@ -288,7 +250,7 @@ impl DoctorReport {
     }
 }
 
-/// How a floor reads in the report, where absent means the volume maps nothing
+/// A mapping floor as text, or off when the volume maps nothing
 fn floor_label(floor: Option<u64>) -> String {
     match floor {
         Some(bytes) => fmt::bytes(bytes),

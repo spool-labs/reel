@@ -1,20 +1,12 @@
-//! What the bias pass would choose on this machine, and where it disagrees
-//!
-//! The pass is a comparison before it is an actuator: it says what it would do, an
-//! operator's config says what was done, and a disagreement is either a bug in the rule
-//! or a misconfigured volume. Point `REEL_BIAS_DIR` at the volume under test; without
-//! one it reports on a temporary directory, which measures the machine rather than the
-//! disk the engine will run on.
-//!
-//! Opt-in. Run with:
-//!   cargo test -p tape-reel --test probes -- bias_report
+//! Prints what the bias pass would choose on this machine and where the config disagrees
+//! Run `cargo test -p tape-reel --test probes -- bias_report`, with `REEL_BIAS_DIR` at the volume
 
 use std::path::PathBuf;
 
 use reel::reel::bias::{access_ranges, MachineFacts, Plane, RingAvailability};
-use reel::{ByteCount, IoBackend, Preallocate, RangedReads, ReelConfig, DEFAULT_FD_CACHE};
+use reel::{ByteCount, IoBackend, ReelConfig, DEFAULT_FD_CACHE};
 
-/// How a floor reads in the report, where absent means the volume maps nothing
+/// A floor's report label, where none means the volume maps nothing
 fn floor_label(floor: Option<ByteCount>) -> String {
     match floor {
         Some(bytes) => format!("{} bytes", bytes.to_bytes()),
@@ -22,7 +14,7 @@ fn floor_label(floor: Option<ByteCount>) -> String {
     }
 }
 
-/// Directory the report reads its facts from
+/// The report reads its facts from this directory
 fn root() -> PathBuf {
     match std::env::var("REEL_BIAS_DIR") {
         Ok(path) => PathBuf::from(path),
@@ -39,7 +31,7 @@ fn bytes(value: Option<u64>) -> String {
     }
 }
 
-/// The plane a configured backend actually opens on
+/// The plane a configured backend opens on
 fn configured_plane(backend: IoBackend) -> Plane {
     match backend.is_direct() {
         true => Plane::Direct,
@@ -52,8 +44,7 @@ pub fn what_this_machine_argues_for() {
     let root = root();
     let config = ReelConfig::default();
     let facts = MachineFacts::read(&root);
-    let reservation = config.segment_bytes.to_bytes() * config.active_tails.resolve_tails() as u64;
-    let verdict = facts.verdict(reservation);
+    let verdict = facts.verdict();
 
     println!();
     println!("root {}", root.display());
@@ -118,39 +109,24 @@ pub fn what_this_machine_argues_for() {
     );
 
     println!();
-    println!(
-        "idle reservation under the shipped default: {}",
-        bytes(Some(reservation))
-    );
     println!("because: {}", verdict.because);
     println!("mapping: {}", verdict.map_because);
     println!();
 
-    let rows: [(&str, String, String); 4] = [
+    let rows: [(&str, String, String); 2] = [
         (
             "plane",
             format!("{:?}", configured_plane(config.io_backend)),
             format!("{:?}", verdict.plane),
         ),
         (
-            // A verdict names the floor a record has to clear, and a direct plane
-            // names none at all, so a volume asking for a mapping there disagrees.
+            // A configured mapping disagrees with a verdict that has no map floor
             "map above",
             floor_label(config.map_above),
             match config.map_above.is_some() && verdict.map_above.is_none() {
                 true => "refused".to_string(),
                 false => floor_label(verdict.map_above),
             },
-        ),
-        (
-            "ranged reads",
-            format!("{:?}", config.ranged_reads),
-            format!("{:?}", verdict.ranged_reads),
-        ),
-        (
-            "preallocate",
-            format!("{:?}", config.preallocate),
-            format!("{:?}", verdict.preallocate),
         ),
     ];
 
@@ -171,8 +147,7 @@ pub fn what_this_machine_argues_for() {
         "fd cache", DEFAULT_FD_CACHE, verdict.fd_cache, cache_flag
     );
 
-    // A verdict that cannot be acted on is worse than none, so the pairing the engine
-    // refuses is checked here rather than left to a volume that will not open.
+    // The verdict must be one the engine accepts, so check the pairing validation refuses
     assert!(
         !(verdict.plane == Plane::Direct && verdict.map_above.is_some()),
         "a direct verdict that keeps mapped reads is refused at validation",
@@ -184,11 +159,8 @@ pub fn what_this_machine_argues_for() {
 }
 
 // the rule answers the same way for the same facts, whatever the machine says
-//
-// The report above depends on where it runs, which is why it cannot check the rule.
 pub fn the_rule_is_a_function_of_its_facts() {
-    // The rule turns on what the volume holds rather than how large the disk is, so
-    // both of these sit on the same 4 TiB disk and differ only in occupancy.
+    // Both sit on the same 4 TiB disk and differ only in how much the volume holds
     let small = MachineFacts {
         memory_bytes: Some(64 << 30),
         volume_capacity_bytes: Some(4096u64 << 30),
@@ -201,22 +173,18 @@ pub fn the_rule_is_a_function_of_its_facts() {
         ..small
     };
 
-    let reservation = ByteCount::gb(8).to_bytes();
-    let small = small.verdict(reservation);
-    let large = large.verdict(reservation);
+    let small = small.verdict();
+    let large = large.verdict();
 
     assert_eq!(small.plane, Plane::Buffered, "half of memory stays warm");
-    assert_eq!(small.ranged_reads, RangedReads::Cached);
-    // The disk is 64 times memory, so the set that fits today will not once it fills,
-    // and a mapped read there loses cold by up to 9x.
+    // The disk is 64 times memory, so the warm set will not fit once it fills
     assert_eq!(small.map_above, None, "a 4 TiB disk was advised a mapping");
     assert!(small.map_because.contains("cold"), "{}", small.map_because);
 
     assert_eq!(large.plane, Plane::Direct, "sixty four times memory cannot");
-    assert_eq!(large.ranged_reads, RangedReads::Direct);
     assert_eq!(large.map_above, None);
 
-    // The same rule the other way: a disk memory could hold is advised the floor.
+    // The other way round, a disk that fits in memory is advised a map floor
     let held = MachineFacts {
         memory_bytes: Some(64 << 30),
         volume_capacity_bytes: Some(32 << 30),
@@ -224,18 +192,14 @@ pub fn the_rule_is_a_function_of_its_facts() {
         open_file_limit: Some(1024),
         ..MachineFacts::default()
     }
-    .verdict(reservation);
+    .verdict();
     assert_eq!(held.plane, Plane::Buffered);
     assert!(
         held.map_above.is_some(),
         "a disk under memory was refused a mapping"
     );
 
-    // 8 GiB against a 4 TiB disk is far under the eighth that would chunk it.
-    assert_eq!(small.preallocate, Preallocate::Full);
-    assert_eq!(large.preallocate, Preallocate::Full);
-
-    // 1024 descriptors, halved for headroom, halved again where direct doubles.
+    // Half the 1024 descriptor limit on either plane
     assert_eq!(small.fd_cache, 512, "half of 1024, buffered");
-    assert_eq!(large.fd_cache, 256, "half of 1024, halved again for direct");
+    assert_eq!(large.fd_cache, 512, "half of 1024, direct");
 }

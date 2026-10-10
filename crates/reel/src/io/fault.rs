@@ -1,8 +1,4 @@
-//! Fault plan the deterministic simulator replays
-//!
-//! A plan pins a seed, an optional crash boundary, and a list of faults keyed to
-//! global op positions. The simulator is a pure function of an op stream and a
-//! plan, so the same plan reproduces the same on-disk image.
+//! The fault plan the deterministic simulator replays, keyed to global op positions
 
 /// One fault the simulator injects when a scheduled op executes or completes
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,16 +36,16 @@ pub enum FaultKind {
 /// A fault scheduled against a global op position
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScheduledFault {
-    /// Global op position this fault triggers at
+    /// The fault fires at this global op position
     pub at_op: u64,
-    /// Fault injected at that position
+    /// The fault to inject
     pub kind: FaultKind,
 }
 
-/// Seeded description of the faults the simulator injects
+/// A seeded schedule of the faults the simulator injects
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FaultPlan {
-    /// Seed identifying this plan for reproduction
+    /// The seed that reproduces this plan
     pub seed: u64,
     /// Global op position to crash before, if any
     pub crash_at: Option<u64>,
@@ -57,12 +53,12 @@ pub struct FaultPlan {
     pub faults: Vec<ScheduledFault>,
     /// Whether drained completions come back in reverse of their submit order
     pub reorder_completions: bool,
-    /// Sector size a crash scatters unsynced bytes at, leaving holes not a prefix
+    /// Sector size for scattering unsynced bytes on a crash, if set
     pub scatter_bytes: Option<u32>,
 }
 
 impl FaultPlan {
-    /// Build a fault free plan from a seed
+    /// Build a fault-free plan from a seed
     pub fn new(seed: u64) -> Self {
         Self {
             seed,
@@ -91,13 +87,13 @@ impl FaultPlan {
         self
     }
 
-    /// Let a crash leave unsynced sectors scattered rather than truncated
+    /// Let a crash scatter unsynced sectors of this size
     pub fn with_scatter(mut self, sector_bytes: u32) -> Self {
         self.scatter_bytes = Some(sector_bytes.max(1));
         self
     }
 
-    /// Fault scheduled at a global op position, if any
+    /// The fault scheduled at a global op position, if any
     pub fn fault_at(&self, position: u64) -> Option<FaultKind> {
         self.faults
             .iter()

@@ -1,11 +1,4 @@
-//! `TBTreeMap`: a B+ tree shaped for what a shard actually holds
-//!
-//! Nodes live in two arenas, leaves in one `Vec` and inner nodes in another, with a
-//! child an index and a tag bit rather than a pointer. A node is searched on eight
-//! bytes of every key, kept as a `u64` beside them and read from past whatever that
-//! node's own keys share, with full keys consulted only where those tie. The leaves
-//! are chained both ways, so an ordered walk runs backwards at the speed it runs
-//! forwards, and a tree holds nothing until something is put in it.
+//! `TBTreeMap`: a B+ tree with arena nodes searched on an eight-byte lead per key
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
@@ -13,49 +6,26 @@ use std::ops::Bound;
 
 const NONE: u32 = u32::MAX;
 
-/// A key the tree can both order and discriminate in one word
-///
-/// Handing over the leading bytes as an integer is what lets a whole node be
-/// searched with word compares, and generality is what that trades away. A key is
-/// moved rather than copied, so one that owns its bytes is allowed here.
+/// A key the tree can order and search by one leading word
 pub trait TreeKey: Ord + Clone + Borrow<Self::Probe> + Sized {
-    /// What a lookup is given, which is the key itself where holding one is free
-    ///
-    /// A key that owns its bytes probes as the bytes, since the alternative is an
-    /// allocation on every read of a key the reader may not even find.
+    /// What a lookup takes: the key itself, or the bytes for a key that owns them
     type Probe: Ord + ?Sized;
 
-    /// Which word a node searches its lead array with
-    ///
-    /// `Whole` for a key whose leading bytes always discriminate, which is a number.
-    /// `Shared` for bytes, where a scan prefix or a bucket in front leaves the lead
-    /// reading what every key in the node holds identically.
+    /// How a node derives its search word: `Whole` for numbers, `Shared` for bytes
     type Window: LeadWindow<Self>;
 
-    /// A key for a place a node has made but not filled
-    ///
-    /// Nothing reads them: every search and every walk is bounded by the node's own
-    /// length rather than by the array's.
+    /// A placeholder key for an unused slot, which nothing reads
     fn filler() -> Self;
 
-    /// The leading bytes as an integer, ordering the way the key itself does
-    ///
-    /// The contract is monotonicity: where two keys differ in their lead, the lead
-    /// settles them the way `Ord` would, and where they tie the whole key is
-    /// consulted. A lead that breaks that orders the tree wrongly.
+    /// The leading bytes as an integer, which must agree with `Ord` wherever two leads differ
     fn head(probe: &Self::Probe) -> u64;
 
-    /// Open a slot in a node's keys, moving the run right of it along
-    ///
-    /// A move rather than a copy, since a key may own its bytes. A key that cannot
-    /// own any overrides this with a memmove.
+    /// Open a slot in a node's keys, moving the keys right of it up one
     fn open(keys: &mut [Self], slot: usize, len: usize) {
         keys[slot..=len].rotate_right(1);
     }
 
-    /// Close the slot a key left, moving the run right of it down over it
-    ///
-    /// The leaving key ends at the tail, where the caller replaces it with a filler.
+    /// Close a key's slot, moving the keys right of it down so the leaving key ends at the tail
     fn close(keys: &mut [Self], slot: usize, len: usize) {
         keys[slot..len].rotate_left(1);
     }
@@ -67,20 +37,11 @@ pub trait TreeKey: Ord + Clone + Borrow<Self::Probe> + Sized {
         }
     }
 
-    /// A separator between two subtrees, and whether its lead can route alone
-    ///
-    /// Any value above everything left of a boundary and at or below everything right
-    /// of it routes a descent exactly, so the shortest prefix of `right` that clears
-    /// `left` is a separator. The flag says whether the eight bytes a lead holds reach
-    /// the byte the boundary turned on; where they do not, the key rides along to
-    /// settle the tie the lead cannot. `left` must sort strictly below `right`.
+    /// A separator between `left` and a greater `right`, and whether it must be kept whole
     fn separator(left: &Self, right: &Self) -> (Self, bool);
 }
 
-/// Which edge a probe takes that a node's window puts outside the node
-///
-/// A probe carrying the bytes the node's entries have in common has no edge: it is
-/// ordered against them by the lead, which is what the window hands back instead.
+/// The edge a probe takes when a node's window puts it outside the node
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Place {
     /// Under everything the node holds, so the answer is its left edge
@@ -90,42 +51,21 @@ pub enum Place {
     Above,
 }
 
-/// How one node turns a probe into the word its lead array is searched with
-///
-/// The lead array is sorted, so whatever this hands back has to be monotone in the
-/// key order across the entries of that one node. Nothing is asked to be monotone
-/// across nodes: a descent asks each node it lands on.
+/// How a node turns a probe into its search word, which must be monotone within the node
 pub trait LeadWindow<K: TreeKey>: Clone + Default {
-    /// The word this node's lead array is searched with, for an entry it holds
-    ///
-    /// Only a node rebuilding its own leads asks this, since what it holds carries the
-    /// bytes it agreed on by construction. A search asks `word`.
+    /// The search word for an entry the node holds, used when it rebuilds its leads
     fn lead(&self, probe: &K::Probe) -> u64;
 
-    /// The word to search the leads with, or the edge a probe outside the node takes
-    ///
-    /// A placement and a lead read the same bytes of the same probe, and a search asks
-    /// for both at every node it lands on, so a window answers them together.
+    /// The search word for a probe, or the edge a probe outside the node takes
     fn word(&self, probe: &K::Probe) -> Result<u64, Place>;
 
-    /// Bytes of key this window is reading its lead from past, which nothing needs
-    fn skipped(&self) -> usize;
-
-    /// Retune to what the node is holding, saying whether the leads must be redone
-    ///
-    /// Called where a node's contents change wholesale: a build, a split, and an
-    /// insert that broke what the node had in common. The leads are rebuilt from the
-    /// entries when this says so, so every entry a retuning node holds has to be
-    /// recoverable from the node.
+    /// Retune to the node's entries, returning whether the leads must be rebuilt
     fn tune<'a>(&mut self, held: impl Iterator<Item = &'a K::Probe>) -> bool
     where
         K::Probe: 'a;
 }
 
-/// The lead a key's own leading bytes make, which is what a number takes
-///
-/// Zero sized, and every branch it decides folds away: a probe is always inside a
-/// window that shares nothing, and a node that never retunes never rebuilds a lead.
+/// The window for numbers, which reads the key's own leading bytes
 #[derive(Clone, Default)]
 pub struct Whole;
 
@@ -138,10 +78,6 @@ impl<K: TreeKey> LeadWindow<K> for Whole {
         Ok(K::head(probe))
     }
 
-    fn skipped(&self) -> usize {
-        0
-    }
-
     fn tune<'a>(&mut self, _held: impl Iterator<Item = &'a K::Probe>) -> bool
     where
         K::Probe: 'a,
@@ -150,32 +86,20 @@ impl<K: TreeKey> LeadWindow<K> for Whole {
     }
 }
 
-/// Bytes of shared prefix a node holds inline to move its lead past
-///
-/// An object key is a thirty-two byte bucket address and then a name, so anything
-/// under thirty-three leaves the lead reading bucket bytes and discriminating
-/// nothing. A fixed key caps at its own width instead, which is all it can share.
+/// A node holds up to this many shared prefix bytes inline and reads its lead past them
 pub const SHARED_CAP: usize = 128;
 
-/// The lead taken from past the bytes a node's own entries share
-///
-/// The one invariant: every entry in the node begins with `pre[..off]`. A probe that
-/// does too is ordered against them by the eight bytes after it; one that does not is
-/// below all of them or above all of them, decided by the same comparison that found
-/// out, so nothing is left for the lead array to get wrong.
+/// A window that reads the lead past the prefix every entry in the node shares
 #[derive(Clone)]
 pub struct Shared<const CAP: usize = SHARED_CAP> {
-    /// Bytes of `pre` the node's entries are known to agree on, a word of them or none
+    /// How many bytes of `pre` the node's entries agree on, zero or at least eight
     off: u16,
 
     /// The agreed bytes themselves, held inline so a placement chases no pointer
     pre: [u8; CAP],
 }
 
-/// A window agreeing on nothing, which reads the lead from the front of the key
-///
-/// A fresh window has to hand back the same lead `TreeKey::head` does, or a bulk
-/// build would fill its leads under one window and search them under another.
+/// An empty window reads the lead from the front of the key, the same as `TreeKey::head`
 impl<const CAP: usize> Default for Shared<CAP> {
     fn default() -> Shared<CAP> {
         Shared {
@@ -190,8 +114,6 @@ impl<const CAP: usize> Shared<CAP> {
     fn at_window(&self, probe: &[u8]) -> u64 {
         let at = self.off as usize;
         let mut wide = [0u8; 8];
-        // The whole word in one load where the key has eight bytes past the window,
-        // which is every fixed key wider than its shared run and most names.
         if at + 8 <= probe.len() {
             wide.copy_from_slice(&probe[at..at + 8]);
         } else if at < probe.len() {
@@ -201,10 +123,7 @@ impl<const CAP: usize> Shared<CAP> {
         u64::from_be_bytes(wide)
     }
 
-    /// Whether a probe carries the bytes the node agreed on, and its edge if it does not
-    ///
-    /// A window agreeing on nothing holds every probe inside itself, which is what a
-    /// node whose keys share less than a lead is left at.
+    /// Whether a probe holds the node's agreed bytes, or the edge it takes if it does not
     fn inside(&self, probe: &[u8]) -> Result<(), Place> {
         let at = self.off as usize;
         if at == 0 {
@@ -214,8 +133,7 @@ impl<const CAP: usize> Shared<CAP> {
         match against(&probe[..cut], &self.pre[..cut]) {
             Ordering::Less => Err(Place::Below),
             Ordering::Greater => Err(Place::Above),
-            // A probe that runs out inside the shared bytes is a prefix of every
-            // key the node holds, and a prefix sorts below what extends it.
+            // A probe shorter than the shared bytes is a prefix of every key here and sorts below
             Ordering::Equal if probe.len() < at => Err(Place::Below),
             Ordering::Equal => Ok(()),
         }
@@ -236,10 +154,6 @@ where
         Ok(self.at_window(probe))
     }
 
-    fn skipped(&self) -> usize {
-        self.off as usize
-    }
-
     fn tune<'a>(&mut self, held: impl Iterator<Item = &'a K::Probe>) -> bool
     where
         K::Probe: 'a,
@@ -255,18 +169,12 @@ where
                 break;
             }
         }
-        // A window narrower than the lead is dropped rather than kept. The lead is eight
-        // bytes wide, so a run shorter than that is one the lead already reads past, and
-        // moving the window there buys no discrimination and costs every probe the node
-        // sees a placement against bytes that were going to order it anyway.
+        // A shared run under eight bytes adds nothing the lead does not already read
         let shared = match shared < 8 {
             true => 0,
             false => shared,
         };
-        // The bytes settle it rather than the count of them: a node emptied and filled
-        // again agrees on as many bytes as it did and on other ones, and a window
-        // calling that unchanged would go on placing probes against what it used to
-        // hold. A count alone never moves at all where every key is one width.
+        // Compare the bytes too, since a refilled node can share as many bytes but other ones
         if shared == self.off as usize && self.pre[..shared] == first[..shared] {
             return false;
         }
@@ -276,11 +184,7 @@ where
     }
 }
 
-/// How a probe's leading bytes sit against the ones a node's window holds
-///
-/// A word at a time, because `[u8]::cmp` over a run whose length is not a constant is
-/// a `memcmp` call and a descent pays one at every level it lands on. The tail is the
-/// bytes past the last whole word, at most seven of them.
+/// How a probe's leading bytes compare with a node's window, a word at a time
 fn against(probe: &[u8], pre: &[u8]) -> Ordering {
     let mut done = 0;
     while done + 8 <= probe.len() {
@@ -299,7 +203,7 @@ fn against(probe: &[u8], pre: &[u8]) -> Ordering {
     Ordering::Equal
 }
 
-/// Leading bytes two probes agree on, up to what a window will hold
+/// How many leading bytes two probes share, capped at `CAP`
 fn agreed<const CAP: usize>(left: &[u8], right: &[u8]) -> usize {
     let cut = left.len().min(right.len()).min(CAP);
     left[..cut]
@@ -309,11 +213,7 @@ fn agreed<const CAP: usize>(left: &[u8], right: &[u8]) -> usize {
         .count()
 }
 
-/// A key of the width its column declared, held inline
-///
-/// Short keys pad with zero, which keeps the order: the pad is the lowest byte, so a
-/// key that is a prefix of another still sorts below it. The window is capped at the
-/// width, since a node's entries cannot agree on more bytes than a key has.
+/// A fixed-width key held inline, its window capped at the key's width
 impl<const N: usize> TreeKey for [u8; N] {
     type Probe = [u8; N];
     type Window = Shared<N>;
@@ -322,7 +222,6 @@ impl<const N: usize> TreeKey for [u8; N] {
         [0u8; N]
     }
 
-    /// One memmove, which is what a key held inline costs
     fn open(keys: &mut [Self], slot: usize, len: usize) {
         keys.copy_within(slot..len, slot + 1);
     }
@@ -343,9 +242,7 @@ impl<const N: usize> TreeKey for [u8; N] {
     }
 
     fn separator(left: &Self, right: &Self) -> (Self, bool) {
-        // The first byte the boundary's keys disagree on. Cutting there gives the
-        // shortest prefix of `right` that still clears `left`, and zero padding keeps
-        // it at or below `right`, which is the routing contract.
+        // Cut `right` just past the first byte that differs from `left`, zero padding the rest
         let differs = left
             .iter()
             .zip(right.iter())
@@ -353,18 +250,12 @@ impl<const N: usize> TreeKey for [u8; N] {
         let mut cut = [0u8; N];
         let take = differs.map_or(N, |at| at + 1);
         cut[..take].copy_from_slice(&right[..take]);
-        // Held whole whatever the cut reaches: a node that retunes reads its
-        // separators again at the new offset, so one kept as a lead alone would
-        // leave a slot with nothing to rebuild from.
+        // Always kept whole, since a retuning node rebuilds its leads from the separators
         (cut, true)
     }
 }
 
-/// A name, held on the heap and probed as the bytes it holds
-///
-/// The separator is a truncation rather than a padding, since there is no width to
-/// pad to, and it is always held whole beside its lead, which is what lets a node
-/// that retunes rebuild its lead array from the separators it already keeps.
+/// A heap-held key probed as its bytes, with separators cut short and always kept whole
 impl TreeKey for Box<[u8]> {
     type Probe = [u8];
     type Window = Shared;
@@ -381,8 +272,7 @@ impl TreeKey for Box<[u8]> {
     }
 
     fn separator(left: &Self, right: &Self) -> (Self, bool) {
-        // Where `left` is a prefix of `right` there is no disagreeing byte, and
-        // the first byte past `left` is what clears it.
+        // If `left` is a prefix of `right`, the first byte past `left` clears it
         let differs = left
             .iter()
             .zip(right.iter())
@@ -427,31 +317,18 @@ impl TreeKey for u32 {
     }
 }
 
-/// Bytes of key a node holds, which is where a column's width comes from
-///
-/// A node holds `B` whole keys beside the leads, so an insert shifts `B` times the
-/// key's bytes and a tied run compares that many whole keys along the leaf. Both
-/// scale with the product rather than the width, which is why a width taken at one
-/// key size does not carry to another.
+/// Each node holds about this many bytes of key, which sets a column's node width
 pub const NODE_BUDGET: usize = 1024;
 
 /// The narrowest node the budget may ask for
-///
-/// Under sixteen the extra levels cost more than the bytes save.
 pub const MIN_NODE_WIDTH: usize = 16;
 
 /// The widest node the budget may ask for
-///
-/// A key of one word would take a hundred and twenty-eight on the budget alone, and
-/// the returns are flat past sixty-four.
 pub const MAX_NODE_WIDTH: usize = 64;
 
-/// Keys a node holds, for a column whose keys are this many bytes
-///
-/// A kibibyte of key a node, held between the two bounds above.
+/// How many keys a node holds for a key of `key_bytes`, clamped between the width bounds
 pub const fn node_width(key_bytes: usize) -> usize {
-    // A column may declare a zero width key, so the divisor is floored rather than
-    // left to trap at compile time.
+    // A column may declare a zero width key, so floor the divisor at one
     let key = match key_bytes {
         0 => 1,
         held => held,
@@ -463,28 +340,19 @@ pub const fn node_width(key_bytes: usize) -> usize {
     }
 }
 
-/// Node width for the trees the crate keys by one of its own scalars
-///
-/// A segment id, an lsn and a frontier's sequence number are a word or narrower,
-/// which the budget takes to the ceiling.
+/// Node width for trees keyed by one of the crate's own word-sized scalars
 pub const NODE_WIDTH: usize = node_width(size_of::<u64>());
 
-/// Keys a batched descent keeps in flight at once
-///
-/// The line fill buffers cap how many misses a core can have outstanding, so this
-/// is set where overlap stops being available rather than at what a caller asks for.
+/// A batched descent keeps this many keys in flight at once
 const LANES: usize = 16;
 
 thread_local! {
-    /// The stack one thread's sorted batched descents work down, kept between them
-    ///
-    /// A node number and the run beneath it, so nothing here is borrowed from a map
-    /// and one thread's list serves every shard it descends.
+    /// Each thread keeps its sorted batched descent stack here between calls
     static DESCENT_STACK: std::cell::Cell<Vec<(u32, usize, usize)>> =
         const { std::cell::Cell::new(Vec::new()) };
 }
 
-/// This thread's descent stack, given back however the descent that took it ends
+/// This thread's descent stack, returned on drop however the descent ends
 struct HeldDescent(Vec<(u32, usize, usize)>);
 
 impl HeldDescent {
@@ -501,17 +369,11 @@ impl Drop for HeldDescent {
     }
 }
 
-/// How many of a sorted lead array fall below the wanted one, on x86
-///
-/// The 512 bit form answers in the shape the question is asked, an unsigned compare
-/// to a mask register a population count turns into the tally, where AVX2 has no
-/// unsigned 64 bit compare and biases into signed space first. Chosen at runtime, so
-/// one binary serves a fleet that is not all one generation.
+/// How many leads fall below `want`, using the widest scan this x86 core has
 #[cfg(target_arch = "x86_64")]
 fn count_below(leads: &[u64], want: u64) -> usize {
     match backend() {
-        // SAFETY: each arm runs only where the detection above found its
-        // feature, and every load is bounded by the chunk iterator.
+        // SAFETY: each arm runs only where `backend` found its feature, and loads stay in bounds
         Scan::Avx512 => unsafe { count_avx512(leads, want) },
         Scan::Avx2 => unsafe { count_avx2(leads, want) },
         Scan::Scalar => count_scalar(leads, want),
@@ -532,8 +394,7 @@ fn backend() -> Scan {
     use std::sync::OnceLock;
     static CHOSEN: OnceLock<Scan> = OnceLock::new();
     *CHOSEN.get_or_init(|| {
-        // Detection takes the widest the processor has, so forcing the choice is
-        // what lets one box exercise the narrower arms.
+        // `REEL_SCAN` forces a narrower arm so one box can test them all
         match std::env::var("REEL_SCAN").ok().as_deref() {
             Some("avx2") => return Scan::Avx2,
             Some("scalar") => return Scan::Scalar,
@@ -549,7 +410,7 @@ fn backend() -> Scan {
     })
 }
 
-/// Eight lanes a step, the compare answering as a mask the tally counts
+/// Eight lanes a step, counting the bits of the compare mask
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn count_avx512(leads: &[u64], want: u64) -> usize {
@@ -571,39 +432,32 @@ unsafe fn count_avx512(leads: &[u64], want: u64) -> usize {
 unsafe fn count_avx2(leads: &[u64], want: u64) -> usize {
     use std::arch::x86_64::*;
 
-    // The high bit flipped turns an unsigned order into the signed one the
-    // compare implements, which is exact rather than approximate.
+    // Flipping the high bit maps unsigned order onto the signed compare
     let bias = _mm256_set1_epi64x(i64::MIN);
     let wanted = _mm256_xor_si256(_mm256_set1_epi64x(want as i64), bias);
     let mut below = 0usize;
     let mut lanes = leads.chunks_exact(4);
     for lane in &mut lanes {
         let held = _mm256_xor_si256(_mm256_loadu_si256(lane.as_ptr() as *const __m256i), bias);
-        // Greater-than with the operands swapped is the less-than wanted.
+        // Greater-than with swapped operands is the less-than we want
         let mask = _mm256_cmpgt_epi64(wanted, held);
         below += (_mm256_movemask_pd(_mm256_castsi256_pd(mask)) as u32).count_ones() as usize;
     }
     below + count_scalar(lanes.remainder(), want)
 }
 
-/// The same count, written so the optimiser is free to widen it
-///
-/// The idiomatic form on purpose: on aarch64 this compiles to eight lanes a step
-/// against four accumulators, which is twice what a hand written NEON arm managed.
+/// The same count in plain Rust, which the optimiser widens on its own
 fn count_scalar(leads: &[u64], want: u64) -> usize {
     leads.iter().filter(|held| **held < want).count()
 }
 
-/// The same count, everywhere the hand arms are not carried
+/// The same count on targets without the hand-written arms
 #[cfg(not(target_arch = "x86_64"))]
 fn count_below(leads: &[u64], want: u64) -> usize {
     count_scalar(leads, want)
 }
 
-/// The three scans, callable directly, so a test can hold them against each other
-///
-/// `backend()` is a `OnceLock`, so a process gets one scan and cannot otherwise ask
-/// the others what they would have said.
+/// The three scans, callable directly so a test can compare them
 #[cfg(target_arch = "x86_64")]
 pub mod scans {
     /// The widest form, where the processor has it
@@ -628,16 +482,16 @@ pub mod scans {
     }
 }
 
-/// The one scan every other machine counts with
+/// The only scan on targets other than x86_64
 #[cfg(not(target_arch = "x86_64"))]
 pub mod scans {
-    /// The form this build uses, which is the only one it carries
+    /// The form this build uses
     pub fn scalar(leads: &[u64], want: u64) -> usize {
         super::count_scalar(leads, want)
     }
 }
 
-/// Which scan this build counts leads with, for a box that fell back quietly
+/// The scan this process counts leads with, to spot a box that fell back quietly
 pub fn scan_backend() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     return match backend() {
@@ -649,13 +503,8 @@ pub fn scan_backend() -> &'static str {
     return "scalar";
 }
 
-/// Whether a run is in key order, cheaply enough to ask on every call
-///
-/// Leads first, since two adjacent keys almost always differ inside their first
-/// eight bytes, and the whole key only where they do not.
+/// Whether a run is in key order, comparing leads first and whole keys only on a tie
 fn ordered<K: TreeKey>(keys: &[K]) -> bool {
-    // A scalar loop rather than a vectorised one: the leads are not packed here,
-    // they sit in keys `N` bytes apart, so there is no run to load.
     let Some(first) = keys.first() else {
         return true;
     };
@@ -670,31 +519,7 @@ fn ordered<K: TreeKey>(keys: &[K]) -> bool {
     true
 }
 
-/// Ask the machine for a line without waiting on it
-#[inline(always)]
-fn prefetch(ptr: *const u8) {
-    // Inline asm because `core::arch::aarch64::_prefetch` is still unstable and
-    // this crate builds on stable; the x86 intrinsic below is not.
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: a prefetch of any address is architecturally a hint and cannot
-    // fault, and the pointer comes from a live arena slot regardless.
-    unsafe {
-        std::arch::asm!(
-            "prfm pldl1keep, [{0}]",
-            in(reg) ptr,
-            options(nostack, readonly, preserves_flags)
-        );
-    }
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: as above, `_mm_prefetch` is a hint and never faults.
-    unsafe {
-        std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let _ = ptr;
-}
-
-/// Set on a child index that names an inner node rather than a leaf
+/// The tag bit set on a child index that points at an inner node
 const INNER: u32 = 1 << 31;
 
 fn is_inner(at: u32) -> bool {
@@ -705,10 +530,7 @@ fn slot_of(at: u32) -> usize {
     (at & !INNER) as usize
 }
 
-/// Where a key sits among a node's keys, or where it would go
-///
-/// A count rather than a bisect: bisecting the lead array costs data-dependent
-/// branches no predictor can learn. Whole keys are read only across a tied run.
+/// Where a key sits among a node's keys, or where it would go, found by counting leads
 fn seek<K: TreeKey>(
     win: &K::Window,
     leads: &[u64],
@@ -732,10 +554,7 @@ fn seek<K: TreeKey>(
     Err(at)
 }
 
-/// The order is the layout, so the window sits on the line the length is read from
-///
-/// Left to the compiler the window lands past the values, a kilobyte from the length,
-/// and a search waits on a second line of the node to learn where to read its lead.
+/// `repr(C)` keeps the window on the same cache line as the length
 #[repr(C)]
 struct Leaf<K: TreeKey, const B: usize, V: Default> {
     len: usize,
@@ -747,16 +566,16 @@ struct Leaf<K: TreeKey, const B: usize, V: Default> {
     prev: u32,
 }
 
-/// Laid out like the leaf, and for the same reason
+/// An inner node, laid out like `Leaf` so the window shares the length's cache line
 #[repr(C)]
 struct Inner<K: TreeKey, const B: usize> {
-    /// Separators the node routes by
+    /// How many separators the node routes by
     len: usize,
 
-    /// How this node turns a probe into the word its leads are searched with
+    /// How this node turns a probe into its search word
     win: K::Window,
 
-    /// Leading bytes of each separator, the array a descent counts over
+    /// The lead of each separator, which a descent counts over
     lead: [u64; B],
 
     /// The children a descent routes into
@@ -786,7 +605,7 @@ fn spill_at<'a, K: TreeKey>(
     }
 }
 
-/// The separator at one slot, for a caller with no walk to carry a cursor for
+/// The separator at one slot, found by search without a cursor
 fn spill_of<K: TreeKey>(spill: &[(u8, K)], slot: usize) -> Option<&K> {
     let at = spill_from(spill, slot);
     match spill.get(at) {
@@ -833,14 +652,9 @@ fn shift_spill<K: TreeKey>(spill: &mut [(u8, K)], slot: usize) {
     }
 }
 
-/// The child a key descends into, counted from truncated separator leads
-///
-/// A separator's bytes past its lead are zeros, so across a tied lead it sorts at or
-/// below every key sharing that lead and only a spilled separator has to be read. A
-/// key equal to a separator belongs to its right.
+/// The child a key descends into, where a key equal to a separator goes right
 fn inner_seek<K: TreeKey, const B: usize>(inner: &Inner<K, B>, probe: &K::Probe) -> usize {
-    // A node dividing nothing routes everything the one way it can, and it is
-    // also the one node whose window has no separator to have been tuned from.
+    // A node with no separators has one child and an untuned window
     if inner.len == 0 {
         return 0;
     }
@@ -850,8 +664,7 @@ fn inner_seek<K: TreeKey, const B: usize>(inner: &Inner<K, B>, probe: &K::Probe)
         Err(Place::Above) => return inner.len,
     };
     let mut at = count_below(&inner.lead[..inner.len], want);
-    // The cursor starts at the front and steps, so a whole tied walk costs one pass
-    // over the spill rather than a search per slot.
+    // One cursor walks the spill once across the whole tied run
     let mut cursor = 0;
     while at < inner.len && inner.lead[at] == want {
         match spill_at(&inner.spill, &mut cursor, at) {
@@ -862,10 +675,7 @@ fn inner_seek<K: TreeKey, const B: usize>(inner: &Inner<K, B>, probe: &K::Probe)
     at
 }
 
-/// A probe's place in one node's order, as the pair a sorted run partitions on
-///
-/// The lead alone cannot order a probe the node's window puts outside itself, since
-/// its bytes at the window are not comparable with the ones held.
+/// A probe's place in one node's order, ranking probes outside the window at the edges
 fn rank<K: TreeKey>(win: &K::Window, probe: &K::Probe) -> (u8, u64) {
     match win.word(probe) {
         Ok(lead) => (1, lead),
@@ -874,7 +684,7 @@ fn rank<K: TreeKey>(win: &K::Window, probe: &K::Probe) -> (u8, u64) {
     }
 }
 
-/// A B+ tree over fixed width keys, nodes held in two arenas
+/// A B+ tree with its nodes held in two arenas
 pub struct TBTreeMap<K: TreeKey, const B: usize, V: Default> {
     leaves: Vec<Leaf<K, B, V>>,
     inners: Vec<Inner<K, B>>,
@@ -883,10 +693,7 @@ pub struct TBTreeMap<K: TreeKey, const B: usize, V: Default> {
     len: usize,
 }
 
-/// A fresh node index, checked against the bit that tags an inner node
-///
-/// Leaf and inner indices share a `u32` with the top bit as the tag, so the arena's
-/// ceiling is 2^31 nodes and nothing else checks it.
+/// The index of the node just pushed, debug-checked against the inner tag bit
 fn arena_index(len: usize) -> u32 {
     debug_assert!(
         len < INNER as usize,
@@ -919,9 +726,6 @@ fn empty_inner<K: TreeKey, const B: usize>() -> Inner<K, B> {
 
 impl<K: TreeKey, const B: usize, V: Default> Leaf<K, B, V> {
     /// Retune the window to the keys held and redo the leads it moved
-    ///
-    /// A split does this on each half; an insert only where the arriving key broke
-    /// what the rest agreed on.
     fn retune(&mut self) {
         if !self
             .win
@@ -936,10 +740,7 @@ impl<K: TreeKey, const B: usize, V: Default> Leaf<K, B, V> {
 }
 
 impl<K: TreeKey, const B: usize> Inner<K, B> {
-    /// The same, over the separators, which a retuning key always holds whole
-    ///
-    /// A node that retunes rebuilds its leads out of its separators, so a separator
-    /// held as a lead alone would leave a slot with nothing to rebuild from.
+    /// Retune the window to the separators, which a retuning node always keeps whole
     fn retune(&mut self) {
         if !self
             .win
@@ -959,10 +760,7 @@ impl<K: TreeKey, const B: usize> Inner<K, B> {
     }
 }
 
-/// What the tree is holding, without asking its keys to be printable
-///
-/// Keys held and leaves occupied, since the two together say whether a repack is
-/// owed, and a key's bytes are not what a surrounding `Debug` wants to see.
+/// Prints key and leaf counts, which say whether a repack is owed
 impl<K: TreeKey, const B: usize, V: Default> std::fmt::Debug for TBTreeMap<K, B, V> {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -981,8 +779,7 @@ impl<K: TreeKey, const B: usize, V: Default> Default for TBTreeMap<K, B, V> {
 }
 
 impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
-    /// A node holds at most `B` pairs and `B - 1` separators, so a width below two
-    /// leaves no room to split; the ceiling is the spill slot's `u8`.
+    /// `B` must be at least two to split and at most 256 to fit a spill slot's `u8`
     const WIDE_ENOUGH: () = assert!(
         B >= 2 && B <= 256,
         "a node width below two cannot split, one past 256 cannot spill"
@@ -1025,10 +822,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         }
     }
 
-    /// What a key holds, to be changed in place rather than put back
-    ///
-    /// A counter beside a key is read, stepped and written again, and doing that
-    /// through `insert` is a second descent for what the first one had.
+    /// A mutable reference to a key's value, for changing it in place
     pub fn get_mut(&mut self, probe: &K::Probe) -> Option<&mut V> {
         let mut at = self.root;
         if at == NONE {
@@ -1059,14 +853,12 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         let (lift_lead, lift_spill, fresh) = if is_inner(child) {
             let at = slot_of(child);
             let half = self.inners[at].len / 2;
-            // The middle separator moves up a level, its spilled key with it:
-            // it divided these halves down here and divides them from above.
+            // The middle separator moves up a level, with its spilled key
             let lift_lead = self.inners[at].lead[half];
             let lift_spill = take_spill(&mut self.inners[at].spill, half);
             let mut right: Inner<K, B> = empty_inner();
             right.len = self.inners[at].len - half - 1;
-            // The window rides across with the leads it was tuned for, so the
-            // half arrives consistent and its own retune can only tighten it.
+            // The right half starts with the left's window, which matches the copied leads
             right.win = self.inners[at].win.clone();
             right.lead[..right.len]
                 .copy_from_slice(&self.inners[at].lead[half + 1..self.inners[at].len]);
@@ -1085,8 +877,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             )
         } else {
             let at = slot_of(child);
-            // A half split would leave every left leaf at half fill forever under
-            // ascending keys, so an append splits off only the tail.
+            // An append splits off only the last key so ascending inserts keep leaves nearly full
             let half = match appending {
                 true => self.leaves[at].len - 1,
                 false => self.leaves[at].len / 2,
@@ -1096,8 +887,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             right.win = self.leaves[at].win.clone();
             right.lead[..right.len]
                 .copy_from_slice(&self.leaves[at].lead[half..self.leaves[at].len]);
-            // A key and a value are moved rather than copied: either may own
-            // bytes, and nothing here is allowed to duplicate one.
+            // Keys and values move, since either may own bytes
             K::hand_over(&mut self.leaves[at].keys, &mut right.keys, half, right.len);
             for step in 0..right.len {
                 right.vals[step] = std::mem::take(&mut self.leaves[at].vals[half + step]);
@@ -1105,8 +895,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             right.next = self.leaves[at].next;
             right.prev = at as u32;
             self.leaves[at].len = half;
-            // A B+ leaf keeps its keys, so the separator is cut fresh at the
-            // boundary: the shortest lead that clears the left half.
+            // Cut a fresh separator at the boundary, since a B+ leaf keeps its keys
             let (lift_key, lift_whole) =
                 K::separator(&self.leaves[at].keys[half - 1], &right.keys[0]);
             let lift_lead = K::head(lift_key.borrow());
@@ -1127,10 +916,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         inner.lead.copy_within(slot..inner.len, slot + 1);
         inner.kids.copy_within(slot + 1..inner.len + 1, slot + 2);
         shift_spill(&mut inner.spill, slot);
-        // A lifted separator's lead was taken under whatever window cut it, and the
-        // node taking it in reads its leads under its own, so where the two differ
-        // the separator itself is what they are recomputed from. One the window puts
-        // outside itself has no lead to route by until the retune below rebuilds them.
+        // Re-lead a spilled separator under this node's window, and retune if it falls outside
         let lifted = lift_spill
             .as_ref()
             .map(|full| inner.win.word(full.borrow()));
@@ -1150,10 +936,6 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
     }
 
     /// Put a key in, handing back what it displaced
-    ///
-    /// The displaced value is what the index decides by: whether a write landed, lost
-    /// to a newer version, or fell on a grave, and it puts the older one back when
-    /// the newcomer loses.
     pub fn insert(&mut self, key: K, val: V) -> Option<V> {
         if self.root == NONE {
             self.leaves.push(empty_leaf());
@@ -1176,9 +958,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             let down = inner_seek(inner, key.borrow());
             let child = inner.kids[down];
             if self.full(child) {
-                // An append is a key past the end of the whole tree, not past one
-                // leaf's local end: a local test fires on every scattered insert at
-                // a leaf's right edge and cuts off a leaf nothing ever fills.
+                // Only a key past the last key of the last leaf counts as an append
                 let appending = !is_inner(child) && {
                     let leaf = &self.leaves[slot_of(child)];
                     leaf.next == NONE && leaf.len > 0 && key > leaf.keys[leaf.len - 1]
@@ -1195,13 +975,10 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         match seek(&leaf.win, &leaf.lead, &leaf.keys, leaf.len, key.borrow()) {
             Ok(found) => Some(std::mem::replace(&mut leaf.vals[found], val)),
             Err(slot) => {
-                // A key the window puts outside itself is one the rest of the leaf
-                // no longer agrees with, so the leads are owed a rebuild and it has
-                // none of its own until that runs.
+                // A key outside the window breaks what the leaf shares, so the leads are rebuilt
                 let word = leaf.win.word(key.borrow());
                 leaf.lead.copy_within(slot..leaf.len, slot + 1);
-                // The tail slot holds a filler the shift carries down to `slot`,
-                // where the arriving key replaces it, so nothing is cloned.
+                // The shift moves the tail filler down to `slot`, where the new key replaces it
                 K::open(&mut leaf.keys, slot, leaf.len);
                 leaf.vals[slot..=leaf.len].rotate_right(1);
                 leaf.lead[slot] = word.unwrap_or(0);
@@ -1217,21 +994,14 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         }
     }
 
-    /// Build from sorted input in one pass, packing leaves to a target fill
-    ///
-    /// Driving a sorted run through `insert` pays a descent and a split per key to
-    /// rediscover an order the input already had, where bottom up there are no splits
-    /// at all. `fill` is how full a leaf is packed, full being densest and short
-    /// leaving room for later inserts. The input must be in key order, which only a
-    /// `debug_assert` says, and repeats are allowed with the last one winning.
+    /// Build from key-ordered input in one pass with `fill` keys a leaf, the last repeat wins
     pub fn from_sorted<I: IntoIterator<Item = (K, V)>>(
         sorted: I,
         fill: usize,
     ) -> TBTreeMap<K, B, V> {
         let fill = fill.clamp(1, B);
         let sorted = sorted.into_iter();
-        // A leaf is kilobytes wide, so growing the arena by doubling copies those
-        // kilobytes again at every step.
+        // Reserve up front, since each leaf is kilobytes wide and doubling would copy them
         let expected = sorted.size_hint().0.div_ceil(fill).max(1);
         let mut tree: TBTreeMap<K, B, V> = TBTreeMap {
             leaves: Vec::with_capacity(expected),
@@ -1242,9 +1012,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         };
 
         for (key, val) in sorted {
-            // A repeat takes the previous key's value rather than a place of its own.
-            // Without this the tree holds the key twice: `len` counts both, `get`
-            // answers with the first, and `remove` leaves the other behind.
+            // A repeat overwrites the previous key's value, or the tree would hold the key twice
             if let Some(leaf) = tree.leaves.last_mut() {
                 if leaf.len > 0 {
                     debug_assert!(
@@ -1273,9 +1041,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
                 }
             }
             let leaf = tree.leaves.last_mut().expect("a leaf was just made");
-            // The lead goes in under the window the leaf has so far. Tuning happens
-            // once the leaf is closed, since what its keys share is not known until
-            // the last of them has arrived.
+            // Tune once the leaf is closed, when what its keys share is known
             leaf.lead[leaf.len] = leaf.win.lead(key.borrow());
             leaf.keys[leaf.len] = key;
             leaf.vals[leaf.len] = val;
@@ -1291,9 +1057,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         }
         tree.first = 0;
 
-        // Each level names the level below by the leaves at its two ends rather than
-        // by their keys, so a separator is cut where the keys already sit and nothing
-        // is copied to carry a span upward.
+        // Each entry is a subtree's first leaf, last leaf and node index
         let mut level: Vec<(u32, u32, u32)> = (0..tree.leaves.len())
             .map(|at| (at as u32, at as u32, at as u32))
             .collect();
@@ -1331,12 +1095,6 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
     }
 
     /// Pack the tree back to full leaves, dropping the room deletion left
-    ///
-    /// `remove` has no borrow and no merge, so a leaf keeps its place in the chain
-    /// however few keys are left in it and an ordered walk pays for every one it
-    /// steps over. One pass over the live pairs, already in order, and a bottom-up
-    /// build with no splits. The whole tree is rebuilt at once, so a caller holding
-    /// a lock holds it for the pass.
     pub fn repack(&mut self, fill: usize) {
         if self.root == NONE {
             return;
@@ -1361,10 +1119,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         *self = TBTreeMap::from_sorted(pairs, fill);
     }
 
-    /// What a key holds, put there first if it was holding nothing
-    ///
-    /// The tally shape: a book keyed by segment or by sequence number is read,
-    /// stepped and written back.
+    /// A key's value, inserting `val` first if the key is absent
     pub fn get_or_insert(&mut self, key: K, val: V) -> &mut V {
         if self.get(key.borrow()).is_none() {
             self.insert(key.clone(), val);
@@ -1372,15 +1127,12 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         self.get_mut(key.borrow()).expect("the key was just put in")
     }
 
-    /// Whether a key is held, without reaching for what it holds
+    /// Whether a key is held
     pub fn contains_key(&self, probe: &K::Probe) -> bool {
         self.get(probe).is_some()
     }
 
-    /// Drop every key, keeping the arenas for what comes next
-    ///
-    /// The `Vec`s keep their capacity, so a shard cleared by a group drop takes its
-    /// next fill without asking the allocator again.
+    /// Drop every key, keeping the arenas' capacity for the next fill
     pub fn clear(&mut self) {
         self.leaves.clear();
         self.inners.clear();
@@ -1420,10 +1172,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         Some(at)
     }
 
-    /// Every pair inside a span, in key order
-    ///
-    /// One descent to place the low bound and then a walk along the leaves, so a
-    /// resumable sweep pays one descent per resumption rather than one per key.
+    /// Every pair inside a span in key order, from one descent and a walk along the leaves
     pub fn range<'a>(
         &'a self,
         low: Bound<&K>,
@@ -1435,8 +1184,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             Bound::Excluded(key) => match self.seat(key.borrow()) {
                 Some((at, slot)) => {
                     let leaf = &self.leaves[slot_of(at)];
-                    // Bounded by the leaf's own length, not the array's: past the
-                    // length sit fillers a remove or a split left behind.
+                    // Past the leaf's length sit fillers, so check `slot < leaf.len` first
                     match slot < leaf.len && leaf.keys[slot] == *key {
                         true => (at, slot + 1),
                         false => (at, slot),
@@ -1471,9 +1219,6 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
     }
 
     /// Every pair from a low bound on, a leaf's run at a time
-    ///
-    /// One descent places the bound, then each leaf hands over its keys and values as
-    /// two slices, so a caller copying a page copies runs instead of pairs.
     pub fn range_runs<'a>(&'a self, low: Bound<&K>) -> impl Iterator<Item = (&'a [K], &'a [V])> {
         let (mut at, mut slot) = match low {
             Bound::Unbounded => (self.first, 0usize),
@@ -1504,10 +1249,6 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
     }
 
     /// The same span walked from its high end down
-    ///
-    /// The leaves are chained both ways, so this is the forward walk with the links
-    /// reversed. Walking forward and reversing would have to hold a whole shard to
-    /// hand back the last few keys of it.
     pub fn range_back<'a>(
         &'a self,
         low: Bound<&'a K>,
@@ -1558,11 +1299,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         })
     }
 
-    /// Take a key out, leaving the leaf that held it shorter
-    ///
-    /// No borrow and no merge, which is a choice: this tree is rebuilt from sorted
-    /// input at every install and every compaction, so the cheaper answer to a sparse
-    /// tree is to rebuild it rather than carry merge logic down every delete.
+    /// Take a key out, leaving its leaf shorter with no borrow or merge
     pub fn remove(&mut self, probe: &K::Probe) -> Option<V> {
         let mut at = self.root;
         if at == NONE {
@@ -1576,8 +1313,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         let leaf = &mut self.leaves[slot_of(at)];
         let found = seek(&leaf.win, &leaf.lead, &leaf.keys, leaf.len, probe).ok()?;
         leaf.lead.copy_within(found + 1..leaf.len, found);
-        // The shift carries the leaving key and value to the tail, where taking them
-        // leaves a filler behind. A key that owns bytes moves rather than copies.
+        // Shift the leaving key and value to the tail and leave a filler there
         K::close(&mut leaf.keys, found, leaf.len);
         leaf.vals[found..leaf.len].rotate_left(1);
         drop(std::mem::replace(&mut leaf.keys[leaf.len - 1], K::filler()));
@@ -1587,10 +1323,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         Some(held)
     }
 
-    /// Take a key out and pack behind it where the room is worth taking back
-    ///
-    /// `repack_owed` is the doubling guard, so the pass runs once per doubling of the
-    /// room it would give back.
+    /// Take a key out and repack once `repack_owed` says the room is worth taking back
     pub fn remove_packed(&mut self, probe: &K::Probe) -> Option<V> {
         let held = self.remove(probe)?;
         if self.repack_owed() {
@@ -1599,10 +1332,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         Some(held)
     }
 
-    /// Live keys against the room the leaves occupy, one being a packed tree
-    ///
-    /// A separator left behind by a delete still routes, so an emptied leaf keeps
-    /// its place in the chain and its share of the footprint.
+    /// Live keys over leaf slots, where one means packed
     pub fn fill_factor(&self) -> f64 {
         match self.leaves.is_empty() {
             true => 1.0,
@@ -1610,15 +1340,12 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         }
     }
 
-    /// Leaves the tree occupies, emptied ones included
+    /// How many leaves the tree occupies, emptied ones included
     pub fn leaf_count(&self) -> usize {
         self.leaves.len()
     }
 
-    /// Bytes the node arenas have allocated, spare capacity included
-    ///
-    /// The arenas grow by doubling, so a tree holds its whole capacity. A key held
-    /// behind a pointer is left out.
+    /// How many bytes the arenas and spills allocated, spare capacity included
     pub fn heap_bytes(&self) -> u64 {
         let spills: usize = self
             .inners
@@ -1630,28 +1357,17 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             + spills) as u64
     }
 
-    /// Whether every leaf is as full as a sorted build would leave it
-    ///
-    /// Ascending inserts leave each leaf one short, since an append splits off the
-    /// last key, and that counts: a repack would win back one slot in a node.
+    /// Whether the tree is packed, counting leaves one key short as full
     pub fn is_packed(&self) -> bool {
         self.leaves.len() <= self.len.div_ceil(B - 1).max(1)
     }
 
-    /// Whether packing would give back room worth the pass
-    ///
-    /// Fill alone cannot say: a shard holding three keys reads as badly under-filled,
-    /// and packing it would move three keys into the same one leaf. What decides it
-    /// is the leaves held against the leaves needed.
+    /// Whether the tree holds at least twice the leaves it needs, so a repack is worth it
     pub fn repack_owed(&self) -> bool {
         self.leaves.len() > 1 && self.leaves.len() >= 2 * self.len.div_ceil(B).max(1)
     }
 
-    /// The share of held keys whose lead is already taken by the key before them
-    ///
-    /// The lead is a bet that a few bytes separate most pairs: near zero where they
-    /// do, climbing toward one where every slot in a node holds the same lead. Costs
-    /// a walk, so it is asked rather than kept.
+    /// The share of held keys whose lead equals the lead before them, found by a walk
     pub fn tie_rate(&self) -> f64 {
         let mut tied = 0usize;
         let mut seen = 0usize;
@@ -1672,29 +1388,6 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         }
     }
 
-    /// Bytes of shared prefix the leaves are reading their leads from past
-    ///
-    /// The mean over the leaves, unweighted, since what is wanted is whether the
-    /// windows moved. Zero where a node's keys agree on nothing, which is what a
-    /// column with no scan prefix and no bucket in front holds.
-    pub fn lead_skip(&self) -> f64 {
-        let mut total = 0usize;
-        let mut seen = 0usize;
-        let mut at = self.first;
-        while at != NONE {
-            let leaf = &self.leaves[at as usize];
-            if leaf.len > 0 {
-                total += leaf.win.skipped();
-                seen += 1;
-            }
-            at = leaf.next;
-        }
-        match seen {
-            0 => 0.0,
-            _ => total as f64 / seen as f64,
-        }
-    }
-
     /// The lowest key held and what it holds
     pub fn first_key_value(&self) -> Option<(&K, &V)> {
         let mut at = self.first;
@@ -1708,25 +1401,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         None
     }
 
-    /// The highest key held and what it holds
-    pub fn last_key_value(&self) -> Option<(&K, &V)> {
-        let mut at = self.last_leaf()?;
-        while at != NONE {
-            let leaf = &self.leaves[slot_of(at)];
-            if leaf.len > 0 {
-                return Some((&leaf.keys[leaf.len - 1], &leaf.vals[leaf.len - 1]));
-            }
-            at = leaf.prev;
-        }
-        None
-    }
-
-    /// Many keys at once, descending them in lockstep
-    ///
-    /// A single descent is a chain of dependent cache misses, one a level. Stepping a
-    /// batch a level at a time issues every key's load for that level before waiting
-    /// on any, so the misses overlap rather than queue. Fixed lanes rather than a
-    /// vector per call, which would allocate on every single-key call.
+    /// Many keys at once, descending them in lockstep so their cache misses overlap
     pub fn get_many<'a>(&'a self, keys: &[K], out: &mut Vec<Option<&'a V>>) {
         out.clear();
         if self.root == NONE {
@@ -1747,8 +1422,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
                     moving = true;
                     let inner = &self.inners[slot_of(at[slot])];
                     at[slot] = inner.kids[inner_seek(inner, run[slot].borrow())];
-                    // Start the next level's miss now rather than trusting the out
-                    // of order window to reach it on the following pass.
+                    // Prefetch the next level now
                     self.touch(at[slot]);
                 }
             }
@@ -1771,56 +1445,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         }
     }
 
-    /// The same batched descent with the prefetch left out, to price it
-    ///
-    /// The control the prefetch is priced against, since the two are otherwise
-    /// inseparable.
-    pub fn get_many_cold<'a>(&'a self, keys: &[K], out: &mut Vec<Option<&'a V>>) {
-        out.clear();
-        if self.root == NONE {
-            out.resize(keys.len(), None);
-            return;
-        }
-        for run in keys.chunks(LANES) {
-            let mut at = [0u32; LANES];
-            at[..run.len()].fill(self.root);
-            let mut moving = true;
-            while moving {
-                moving = false;
-                for slot in 0..run.len() {
-                    if !is_inner(at[slot]) {
-                        continue;
-                    }
-                    moving = true;
-                    let inner = &self.inners[slot_of(at[slot])];
-                    at[slot] = inner.kids[inner_seek(inner, run[slot].borrow())];
-                }
-            }
-            for slot in 0..run.len() {
-                let leaf = &self.leaves[slot_of(at[slot])];
-                out.push(
-                    match seek(
-                        &leaf.win,
-                        &leaf.lead,
-                        &leaf.keys,
-                        leaf.len,
-                        run[slot].borrow(),
-                    ) {
-                        Ok(found) => Some(&leaf.vals[found]),
-                        Err(_) => None,
-                    },
-                );
-            }
-        }
-    }
-
     /// A sorted batch, seeking each shared node once for the run beneath it
-    ///
-    /// Neighbouring sorted keys descend through the same upper nodes, so this
-    /// partitions the run against a node's separators in one pass and hands each
-    /// child the run that belongs to it, turning the top levels from a cost per key
-    /// into a cost per node. A run that is not sorted is answered by the lane batch,
-    /// which needs no order.
     pub fn get_many_sorted<'a>(&'a self, keys: &[K], out: &mut Vec<Option<&'a V>>) {
         if !ordered(keys) {
             return self.get_many(keys, out);
@@ -1831,9 +1456,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             return;
         }
 
-        // The descent's own stack, kept by the thread: it holds node numbers and
-        // positions and nothing borrowed, and a wide run grows it a level at a time,
-        // which was an allocation or two per batch on top of the first.
+        // Reuse this thread's stack so a batch does not allocate
         let mut held = HeldDescent::take();
         let work = &mut held.0;
         work.push((self.root, 0usize, keys.len()));
@@ -1862,14 +1485,9 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
                     break;
                 }
                 let end = match sep < inner.len {
-                    // A key equal to the separator belongs to its right, the same
-                    // rule the single key descent takes. An unspilled separator's
-                    // bytes past the lead are zeros, which no key sharing the lead
-                    // sorts under, and the rank carries what the lead cannot: a key
-                    // the node's window puts outside itself.
+                    // Equal keys go right, and `rank` orders keys outside the window
                     true => {
-                        // The separator belongs to the slot rather than to the key,
-                        // so it is found once for the run instead of once per key.
+                        // Look the separator up once for the whole run
                         let held = spill_of(&inner.spill, sep);
                         let mut walk = slot;
                         while walk < high && {
@@ -1900,13 +1518,10 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             true => self.inners[slot_of(at)].lead.as_ptr(),
             false => self.leaves[slot_of(at)].lead.as_ptr(),
         };
-        prefetch(ptr as *const u8);
+        crate::io::mapping::prefetch(ptr as *const u8);
     }
 
     /// Whole leaves in key order, for a caller that wants to run its own loop
-    ///
-    /// `iter` yields a pair at a time and pays the closure and its bounds checks on
-    /// every one, where a B+ leaf is already a run to loop over tightly.
     pub fn chunks(&self) -> impl Iterator<Item = (&[K], &[V])> {
         let mut at = self.first;
         std::iter::from_fn(move || {

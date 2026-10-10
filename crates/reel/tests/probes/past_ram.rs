@@ -1,16 +1,5 @@
-//! What a volume does once it no longer fits in memory
-//!
-//! Sweeps cold reads at three record shapes against a fill sized from MemTotal. Three
-//! things make a past-memory number honest: the fill has to beat memory rather than a
-//! file's own cache, the sample has to be a stride over distinct keys many times
-//! smaller than the fill or the repeats come back warm and print an amplification
-//! under one, and the temp directory must not be tmpfs, which this refuses. The
-//! headline is device bytes per useful byte rather than throughput.
-//!
-//! Knobs: REEL_PAST_RAM_SIZES, REEL_PAST_RAM_BACKEND, REEL_PAST_RAM_VOLUME_BYTES.
-//!
-//! Linux only, and root for `drop_caches`. Opt-in. Run with:
-//!   sudo -E cargo test -p tape-reel --release --test probes -- past_ram
+//! Cold read cost and device amplification once the volume no longer fits in memory
+//! Linux, as root: `sudo -E cargo test -p tape-reel --release --test probes -- past_ram`
 
 #![cfg(target_os = "linux")]
 
@@ -20,14 +9,14 @@ use rand::{thread_rng, Rng};
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactRate, IoBackend, KeyWidth, MapShape,
-    RecordKey, ReelConfig, ReelStore, SyncPolicy,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactRate, IoBackend, KeyWidth, RecordKey,
+    ReelConfig, ReelStore, SyncPolicy,
 };
 
-/// Bytes the group takes at the front of a record key
+/// The group takes this many bytes at the front of a record key
 const GROUP_PREFIX_LEN: usize = 2;
 
-/// Bytes a record key occupies
+/// Length of a record key
 const RECORD_KEY_LEN: usize = GROUP_PREFIX_LEN + 32;
 
 const RECORDS: ColumnId = ColumnId(1);
@@ -44,7 +33,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: GROUP_PREFIX_LEN as u8,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -53,23 +41,16 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 
-/// Group the fill writes into
+/// The fill writes into this group
 const GROUP: u16 = 7;
 
-/// Record sizes swept, smallest first, overridable for one shape
-///
-/// The three are the shapes the engine behaves differently at: a metadata row
-/// under a filesystem block, a record at a block, and a bulk payload.
+/// Record sizes swept, smallest first, unless REEL_PAST_RAM_SIZES is set
 const SIZES: &[usize] = &[4096, 65536, 1024 * 1024];
 
-/// Reads taken per size, against a fill many times larger
-///
-/// Small on purpose: the fill has to dwarf the sample or later reads find the earlier
-/// ones' pages resident, which is the collision that fakes an amplification below one.
+/// Reads per size, few enough that the fill dwarfs the sample
 const READS: usize = 2_000;
 
 /// A record key: the group big endian, then the identifier
@@ -80,7 +61,7 @@ fn record_key(group: u16, id: [u8; 32]) -> RecordKey {
     RecordKey::from_bytes(RECORDS, &bytes).expect("record key")
 }
 
-/// An identifier no other record in the fill holds
+/// A random identifier, unique within the fill
 fn unique_id() -> [u8; 32] {
     let mut bytes = [0u8; 32];
     thread_rng().fill(&mut bytes[..]);
@@ -127,7 +108,7 @@ fn machine_memory_bytes() -> u64 {
     panic!("no MemTotal in /proc/meminfo");
 }
 
-/// Bytes the fill holds, a quarter again past memory unless told otherwise
+/// The fill holds this many bytes, a quarter past memory unless REEL_PAST_RAM_VOLUME_BYTES is set
 fn volume_bytes() -> u64 {
     if let Ok(value) = std::env::var("REEL_PAST_RAM_VOLUME_BYTES") {
         return value
@@ -164,10 +145,7 @@ fn drop_caches() {
         .expect("write /proc/sys/vm/drop_caches, which needs root");
 }
 
-/// Bytes the device has served since boot, for the amplification column
-///
-/// Sectors are always 512 bytes in `/proc/diskstats` whatever the device's own block
-/// size is.
+/// How many bytes the device has served since boot, for the amplification column
 fn device_read_bytes() -> u64 {
     let stats = std::fs::read_to_string("/proc/diskstats").expect("read /proc/diskstats");
     let mut total = 0u64;
@@ -177,11 +155,7 @@ fn device_read_bytes() -> u64 {
             continue;
         }
         let name = parts[2];
-        // Whole devices only: counting a partition and its disk would double every
-        // byte. A trailing-digit test gets that wrong on nvme, where whole disks
-        // end in digits too, so ask the kernel: whole devices are the entries of
-        // /sys/block, partitions are not. Loop devices are listed there and still
-        // are not the drive under test.
+        // Whole devices only, which are the entries of /sys/block, and no loop devices
         if name.starts_with("loop") || !std::path::Path::new(&format!("/sys/block/{name}")).exists()
         {
             continue;
@@ -196,14 +170,12 @@ fn config(record: usize) -> ReelConfig {
         sync: SyncPolicy::Never,
         scrub_mbps: 0,
         io_backend: backend(),
-        // Compaction is not what this measures and a pass mid-read would steal the
-        // device from the sample.
+        // A pass mid-read would steal the device from the sample, so throttle compaction
         compact_mbps: CompactRate::Mbps(1),
         segment_bytes: ByteCount::gb(1),
         ..ReelConfig::default()
     };
-    // A segment has to hold many records or the fill is mostly segment rolls, and it
-    // has to hold a whole one or the put is refused.
+    // A segment has to hold many records, or the fill is mostly segment rolls
     if record as u64 * 16 > config.segment_bytes.to_bytes() {
         config.segment_bytes = ByteCount::from_bytes(record as u64 * 1024);
     }
@@ -269,16 +241,13 @@ pub fn cold_reads_past_ram() {
         }
         store.flush().expect("flush");
 
-        // The store's own maps and the kernel's cache both have to forget, so the
-        // volume is closed and reopened around the drop.
+        // Close and reopen around the drop so the store's maps and the kernel's cache both forget
         drop(store);
         drop_caches();
         let store =
             ReelStore::open(dir.path().to_path_buf(), config(record), COLUMNS).expect("reopen");
 
-        // A stride rather than a prefix or a random walk: a prefix reads one end of the
-        // key space and a random walk repeats keys, while a stride visits distinct keys
-        // spread across the whole volume.
+        // A stride visits distinct keys spread across the whole volume
         let stride = count / READS;
         let device_before = device_read_bytes();
         let start = Instant::now();
@@ -304,8 +273,7 @@ pub fn cold_reads_past_ram() {
             device as f64 / served.max(1) as f64,
         );
 
-        // Under one means the sample was served from memory somewhere, which makes
-        // every column beside it a memory number rather than a device one.
+        // Under one means the sample was served from memory somewhere
         assert!(
             device as f64 / served.max(1) as f64 >= 1.0,
             "device read {device} bytes to serve {served}, so the sample was warm",

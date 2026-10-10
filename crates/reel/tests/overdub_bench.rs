@@ -1,45 +1,5 @@
 //! The composed posture driven end to end by a state-shaped write and read stream
-//!
-//! Every knob the posture is made of is priced somewhere on its own. This drives them
-//! together against the traffic they were chosen for: a small hot core rewritten every
-//! round, a mid population whose re-write gaps are long tailed, and a majority of keys
-//! written exactly once. The reads are batched and skewed toward what was just written,
-//! which is what makes a paged get's search count the term that matters.
-//!
-//! Two flavours, each on its own volume, each run with the merge armed and with it left
-//! standing. The merge column is the one to read first: an armed volume collapses its
-//! sorted runs on its own tick, and the undriven cell is the same traffic with the runs
-//! left to pile up, so the pair prices what the collapse is worth. At the shipped
-//! triggers the pair comes out identical, because the reclaim rewrite takes a segment's
-//! dead bytes long before the stack as a whole reaches the collapse mark; putting
-//! `REEL_OVERDUB_MERGE_RATIO` under where the stack settles is what makes the merge fire.
-//!
-//! Two read columns rather than one: a search that finds its footer parsed and held costs
-//! no device read at all, so a volume small enough to fit its own footer cache prints
-//! nothing in the device column and everything it did in the search one.
-//!
-//! `REEL_OVERDUB_READERS` spreads a round's read batches over that many threads while the
-//! driver keeps the writes and the tick, so a wide box is asked for more than one core can
-//! ask it. One reader is the sequential run: the driver takes the batches itself, in order,
-//! between the writes and the tick. Past one the columns are a contended volume's, the
-//! writes timed against readers on the same store. Whatever the count, a round joins its
-//! readers before it samples, since a run count or a probe total read while the volume is
-//! still being asked is neither this round's nor the next's. `REEL_OVERDUB_TAILS` sets the
-//! append tails the volume runs, which is what a spread write stream needs to land in.
-//!
-//! Knobs, all optional: `REEL_OVERDUB_DIR`, `REEL_OVERDUB_ROUNDS`, `REEL_OVERDUB_SCALE`,
-//! `REEL_OVERDUB_HOT`, `REEL_OVERDUB_MID`, `REEL_OVERDUB_FRESH`, `REEL_OVERDUB_READS`,
-//! `REEL_OVERDUB_BATCH`, `REEL_OVERDUB_VALUE`, `REEL_OVERDUB_SEGMENT`,
-//! `REEL_OVERDUB_PASSES`, `REEL_OVERDUB_FOOTER_CACHE`,
-//! `REEL_OVERDUB_COMPACT_MBPS`, `REEL_OVERDUB_DEAD_RATIO`, `REEL_OVERDUB_MERGE_RATIO`,
-//! `REEL_OVERDUB_READERS`, `REEL_OVERDUB_TAILS`.
-//!
-//! Point `REEL_OVERDUB_DIR` at the filesystem under test. Without it the cells land
-//! wherever the temporary directory does, which on a machine with a memory backed one
-//! measures no device at all.
-//!
-//! Ignored by default. Run with:
-//!   cargo test -p tape-reel --test overdub_bench --release -- --ignored --nocapture --test-threads=1
+//! Set `REEL_OVERDUB_DIR` to the filesystem under test, since a temp dir in memory has no device
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -50,9 +10,8 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, FenceResidency,
-    IndexResidency, KeyWidth, MapShape, MergeReport, Preallocate, ProbeCounts, RecordKey,
-    ReelConfig, ReelStore, ShardShapes, SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, CompactRate, KeyWidth,
+    MergeReport, ProbeCounts, RecordKey, ReelConfig, ReelStore, SyncPolicy, ThreadBudget,
 };
 
 /// The one column the workload writes
@@ -62,24 +21,15 @@ const STATE: ColumnId = ColumnId(1);
 const KEY_WIDTH: usize = 32;
 
 /// Leading key bytes the column shards on
-///
-/// One, so a scattered key spreads over two hundred and fifty six shards. Two would give
-/// a population this size about three keys a shard, which measures the shard array.
 const SHARD_BYTES: u8 = 1;
 
 /// Bits per key a seal spends on a filter
-///
-/// Declared for both flavours; a resident volume answers from its map and spends none of
-/// them whatever this says.
 const FILTER_BITS: u8 = 10;
 
 /// Keys the hot core holds, every one of them rewritten every round
 const HOT_KEYS: u64 = 1_400;
 
 /// Keys the mid population holds, each with a re-write gap of its own
-///
-/// Sized so the gap distribution below draws about a thousand of them a round, which is
-/// what the mid share of the write stream comes to.
 const MID_KEYS: u64 = 3_000;
 
 /// Keys each round opens and never writes again
@@ -95,9 +45,6 @@ const BATCH_KEYS: u64 = 128;
 const ROUNDS: u64 = 200;
 
 /// Threads a round's read batches are spread over
-///
-/// One, so a bare run is the sequential stream it always was. A box with cores to spare
-/// wants enough of them that the reads stop being what the wall clock is waiting on.
 const READER_THREADS: u64 = 1;
 
 /// Append tails the volume runs, zero for the machine's own count
@@ -109,35 +56,17 @@ const VALUE_MEAN: u64 = 180;
 /// Segment size, which is how many rounds' writes stand in one sorted run
 const SEGMENT_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Bytes reserved ahead of the write head per allocation step
-const ALLOC_CHUNK: u64 = 256 * 1024;
-
 /// Rewrite passes one tick drives before it gives the round back
 const COMPACT_PASSES: u64 = 8;
 
-/// Compaction pace, in megabytes a second
-///
-/// Effectively unpaced by default, so both cells of a pair drain their debt at the same
-/// speed and the merge column is the only thing that differs between them. A box run
-/// should set this to what its device actually gives back.
+/// Compaction pace in megabytes a second, high enough that compaction runs unpaced
 const COMPACT_MBPS: u64 = 100_000;
 
 /// Bytes of sealed-footer state a paged volume keeps at once
-///
-/// The shipped size, which on a volume this small holds every footer, so a search reads
-/// no blocks and the device column stays at nothing. A box run wanting that column to
-/// mean something has to set this below what the volume ends up holding.
 const FOOTER_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Dead fraction at which a sealed segment is rewritten, the shipped one
 const COMPACT_DEAD_RATIO: f64 = 0.50;
-
-/// Dead share of the standing runs at which the tick collapses them, the shipped one
-///
-/// The rewrite above is what keeps this from ever being reached under steady traffic: it
-/// reclaims a segment's dead bytes long before the stack as a whole goes half dead. A run
-/// wanting to price the collapse has to put this under where the stack actually settles.
-const MERGE_DEAD_RATIO: f64 = 0.50;
 
 /// Rounds back a read still counts as recent
 const RECENT_ROUNDS: usize = 3;
@@ -151,10 +80,7 @@ const RECENT_SHARE: u64 = 65;
 /// Share of a round's reads, in hundredths, that go to mid recency
 const MID_RECENCY_SHARE: u64 = 30;
 
-/// Quantiles of the measured re-write gap, in rounds, with the ends the run is capped at
-///
-/// Interpolated on a log scale between the knots, so the drawn gaps reproduce the
-/// measured p50, p90 and p99 exactly and stay smooth in between.
+/// Quantiles of the measured re-write gap in rounds, interpolated on a log scale
 const GAP_QUANTILES: [(f64, f64); 5] = [
     (0.0, 1.0),
     (0.5, 3.0),
@@ -221,15 +147,9 @@ struct Knobs {
 
     /// Dead fraction at which a sealed segment is rewritten
     compact_dead_ratio: f64,
-
-    /// Dead share of the standing runs at which the tick collapses them
-    merge_dead_ratio: f64,
 }
 
-/// A number from the environment, or the fallback
-///
-/// Loud on anything it cannot read: a mistyped knob that falls back quietly is a run
-/// measuring a cell nobody asked for.
+/// A number from the environment or the fallback, loud on junk
 fn env_num(name: &str, fallback: u64) -> u64 {
     let Ok(raw) = std::env::var(name) else {
         return fallback;
@@ -297,7 +217,6 @@ fn knobs() -> Knobs {
         footer_cache_bytes: env_bytes("REEL_OVERDUB_FOOTER_CACHE", FOOTER_CACHE_BYTES),
         compact_mbps: env_num("REEL_OVERDUB_COMPACT_MBPS", COMPACT_MBPS).max(1),
         compact_dead_ratio: env_share("REEL_OVERDUB_DEAD_RATIO", COMPACT_DEAD_RATIO),
-        merge_dead_ratio: env_share("REEL_OVERDUB_MERGE_RATIO", MERGE_DEAD_RATIO),
     }
 }
 
@@ -350,8 +269,7 @@ fn phase_of(number: u64, gap: u64) -> u64 {
     mix(number, PHASE_SALT) % gap
 }
 
-/// How the key numbers are laid out: the hot core, then the mid population, then a block
-/// of fresh keys for every round
+/// Key number layout: the hot core, the mid population, then one fresh block per round
 struct Population {
     /// Keys the hot core holds
     hot: u64,
@@ -375,8 +293,7 @@ impl Population {
     }
 }
 
-/// The key numbers a round writes: the whole hot core, the mid keys their gaps are due
-/// on, and a block of keys nothing will write again
+/// The key numbers a round writes: the hot core, mid keys due this round, a fresh block
 fn writes_of(population: &Population, round: u64, into: &mut Vec<u64>) {
     into.clear();
     for at in 0..population.hot {
@@ -395,9 +312,6 @@ fn writes_of(population: &Population, round: u64, into: &mut Vec<u64>) {
 }
 
 /// Whether this round's writes are the first this key ever gets
-///
-/// A concurrent round holds these reads back until its writes have landed: a read racing
-/// the put that opens a key is answered with a miss, and a miss is not a read.
 fn is_opened_in(population: &Population, number: u64, round: u64) -> bool {
     if number < population.hot {
         return round == 0;
@@ -456,12 +370,7 @@ impl Recency {
     }
 }
 
-/// The key numbers a round reads back, skewed the way the traffic was measured
-///
-/// Two thirds land on what the last few rounds wrote, a slice on the rounds behind those,
-/// and the rest on keys written once and long since aged out of the window. The cold draw
-/// is computed from the round rather than remembered, since keeping every fresh block
-/// would be the whole key space in memory.
+/// The key numbers a round reads, mostly recent writes, some mid recency, a few cold
 fn reads_of(
     population: &Population,
     knobs: &Knobs,
@@ -485,8 +394,7 @@ fn reads_of(
                 }
             },
         };
-        // A window that has not filled yet answers with nothing, and the hot core is the
-        // one population that exists from the first round on.
+        // Before the window fills, fall back to the hot core, which exists from round zero
         into.push(drawn.unwrap_or_else(|| roll % population.hot.max(1)));
     }
 }
@@ -495,28 +403,11 @@ fn reads_of(
 struct Arm {
     /// What the table calls it
     name: &'static str,
-
-    /// Where a sealed segment's keys live
-    index: IndexResidency,
-
-    /// Where the fence over a sealed segment's blocks lives
-    fence: FenceResidency,
 }
 
-const ARMS: [Arm; 2] = [
-    Arm {
-        name: "paged-carrying",
-        index: IndexResidency::Paged,
-        fence: FenceResidency::Resident,
-    },
-    Arm {
-        name: "resident",
-        index: IndexResidency::Resident,
-        fence: FenceResidency::Off,
-    },
-];
+const ARMS: [Arm; 1] = [Arm { name: "paged" }];
 
-/// The column both flavours declare
+/// The column every cell declares
 const COLUMNS: ColumnSet = &[ColumnSpec {
     id: STATE,
     name: "state",
@@ -524,37 +415,25 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: SHARD_BYTES,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Open,
 }];
 
-/// What one cell opens its volume with, the flavour and the merge being all that differ
-fn config(arm: &Arm, is_merge_driven: bool, knobs: &Knobs) -> ReelConfig {
+/// What one cell opens its volume with
+fn config(knobs: &Knobs) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(knobs.segment_bytes),
-        alloc_chunk: ByteCount::from_bytes(ALLOC_CHUNK),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(knobs.tails),
         // Off, so nothing reads the volume behind the reads being timed.
         scrub_mbps: 0,
-        index: arm.index,
-        fence: arm.fence,
-        shard_shapes: ShardShapes::Declared,
-        rewrite_on_seal: true,
-        merge_sorted_runs: is_merge_driven,
         filter_bits: FILTER_BITS,
         footer_cache: ByteCount::from_bytes(knobs.footer_cache_bytes),
         compact_mbps: CompactRate::Mbps(knobs.compact_mbps),
         compact_dead_ratio: knobs.compact_dead_ratio,
-        merge_dead_ratio: knobs.merge_dead_ratio,
         ..ReelConfig::default()
     }
 }
 
 /// One maintenance tick, identical on every cell, with the merge report handed back
-///
-/// The pieces rather than the whole plane: the tick that ships swallows its merge report
-/// and the driven column would have nothing to print.
 fn tick(store: &ReelStore, knobs: &Knobs) -> MergeReport {
     store.page_out_sealed().expect("page out");
     for _ in 0..knobs.passes {
@@ -613,7 +492,7 @@ struct Cell {
     /// What asking the sealed segments cost, over the whole run
     probes: ProbeCounts,
 
-    /// Bytes the index held at the end, before any tick ran under it
+    /// Bytes the index held at the end of the run
     resident: u64,
 
     /// Bytes the volume occupied at the end
@@ -628,11 +507,8 @@ struct Cell {
     /// Segments standing after every round
     standing: Vec<usize>,
 
-    /// Passes that collapsed at least one run
+    /// Rounds whose tick took a key merge
     merges: u64,
-
-    /// Bytes those passes read and did not write out again
-    collapsed: u64,
 }
 
 impl Cell {
@@ -647,9 +523,6 @@ impl Cell {
     }
 
     /// Device reads one key of a batch cost, over both halves of a search
-    ///
-    /// Nothing where every footer the searches touched was already parsed and held, which
-    /// is what a footer cache the size of the volume gives.
     fn reads_per_get(&self) -> f64 {
         (self.probes.block_reads + self.probes.map_reads) as f64 / self.gets.max(1) as f64
     }
@@ -674,9 +547,6 @@ impl Cell {
 }
 
 /// What a round's reads cost, kept per thread and merged once the round closes
-///
-/// Per thread rather than shared: a batch that takes a lock to post its own latency is
-/// timing the lock as well, and at eight readers that is what the tail would be.
 struct Reads {
     /// Keys the batches asked for
     gets: u64,
@@ -705,10 +575,7 @@ impl Reads {
     }
 }
 
-/// Take batches off a round's read list until it is empty, timing each one
-///
-/// The cursor is what makes a batch one thread's: it hands out the same chunks a
-/// sequential pass would walk, in the same order, to whoever asks next.
+/// Take batches off a round's read list through a shared cursor, timing each one
 fn read_batches(
     store: &ReelStore,
     reading: &[u64],
@@ -758,14 +625,9 @@ fn write_round(
 }
 
 /// Drive the whole workload against one volume and say what it cost
-fn run_cell(arm: &Arm, is_merge_driven: bool, knobs: &Knobs, root: &Path) -> Cell {
+fn run_cell(knobs: &Knobs, root: &Path) -> Cell {
     std::fs::create_dir_all(root).expect("cell root");
-    let store = ReelStore::open(
-        root.to_path_buf(),
-        config(arm, is_merge_driven, knobs),
-        COLUMNS,
-    )
-    .expect("open");
+    let store = ReelStore::open(root.to_path_buf(), config(knobs), COLUMNS).expect("open");
 
     let population = Population {
         hot: knobs.hot,
@@ -793,7 +655,6 @@ fn run_cell(arm: &Arm, is_merge_driven: bool, knobs: &Knobs, root: &Path) -> Cel
         rewritten: 0,
         standing: Vec::with_capacity(knobs.rounds as usize),
         merges: 0,
-        collapsed: 0,
     };
     let mut batch_nanos: Vec<u64> =
         Vec::with_capacity((knobs.rounds * knobs.reads / BATCH_KEYS) as usize);
@@ -839,8 +700,7 @@ fn run_cell(arm: &Arm, is_merge_driven: bool, knobs: &Knobs, root: &Path) -> Cel
                     cell.write_secs += write_round(&store, &writing, round, knobs, &mut payload);
                 });
 
-                // The reads the writes were holding back, taken against the tick rather
-                // than after it: a volume in the field is asked while it is collapsing.
+                // The held-back reads run beside the tick, so the volume is read while it compacts
                 let cursor = AtomicUsize::new(0);
                 let mut report = MergeReport::default();
                 std::thread::scope(|scope| {
@@ -863,16 +723,13 @@ fn run_cell(arm: &Arm, is_merge_driven: bool, knobs: &Knobs, root: &Path) -> Cel
 
         if report.runs_merged > 0 {
             cell.merges += 1;
-            cell.collapsed += report.bytes_read.saturating_sub(report.bytes_written);
         }
-        // Every reader is joined by here, so the run count is this round's and not a
-        // reading taken while the volume was still being asked.
+        // Every reader has joined, so the segment count is this round's
         cell.standing.push(store.index().segments_snapshot().len());
     }
 
     store.flush().expect("flush");
-    // Taken with the last round joined. A probe count is a handful of counters read one
-    // at a time, so a reading taken beside a live reader is torn as well as short.
+    // Read the probe counters with every reader joined, since a live reader tears them
     cell.probes = store.filter_probes().since(probes_before);
     cell.resident = store.resident_bytes().to_bytes();
     cell.live = store.totals().bytes.to_bytes();
@@ -886,15 +743,11 @@ fn run_cell(arm: &Arm, is_merge_driven: bool, knobs: &Knobs, root: &Path) -> Cel
     cell
 }
 
-// what the composed posture does under a state-shaped stream, by flavour and by merge
-//
-// Measurement only, apart from the checks that the run was a run: every key the stream
-// asked for came back, and the volume ended holding something.
+// what the composed posture does under a state-shaped stream, by flavour
 #[test]
 #[ignore = "drives a whole workload, run explicitly on the machine under test"]
 fn composed_posture() {
-    // libtest leaves the test name line open, so a header printed into it starts a
-    // screen-width right of the rows underneath.
+    // libtest leaves the test name line open, so start a fresh one
     println!();
     let knobs = knobs();
     let held = TempDir::new().expect("tempdir");
@@ -924,16 +777,14 @@ fn composed_posture() {
         },
     );
     println!(
-        "trigger: rewrite at {:.2} dead, collapse at {:.2}, footers held {} MiB, pace {} MB/s",
+        "trigger: rewrite at {:.2} dead, footers held {} MiB, pace {} MB/s",
         knobs.compact_dead_ratio,
-        knobs.merge_dead_ratio,
         knobs.footer_cache_bytes / (1 << 20),
         knobs.compact_mbps,
     );
     println!(
-        "{:>15} {:>9} {:>11} {:>8} {:>8} {:>11} {:>10} {:>13} {:>10} {:>12} {:>9} {:>9} {:>7} {:>10}",
+        "{:>15} {:>11} {:>8} {:>8} {:>11} {:>10} {:>13} {:>10} {:>12} {:>9} {:>9} {:>7}",
         "arm",
-        "merge",
         "writes/s",
         "p50 us",
         "p99 us",
@@ -945,54 +796,35 @@ fn composed_posture() {
         "runs avg",
         "runs max",
         "merges",
-        "freed MiB",
     );
 
     for arm in &ARMS {
-        for is_merge_driven in [true, false] {
-            let name = match is_merge_driven {
-                true => "driven",
-                false => "standing",
-            };
-            let cell = run_cell(
-                arm,
-                is_merge_driven,
-                &knobs,
-                &root.join(format!("{}-{name}", arm.name)),
-            );
+        let cell = run_cell(&knobs, &root.join(arm.name));
 
-            assert!(cell.written > 0, "{} {name} wrote nothing", arm.name);
-            assert_eq!(
-                cell.misses, 0,
-                "{} {name} lost keys the stream had written",
-                arm.name
-            );
-            assert!(
-                cell.live > 0,
-                "{} {name} ended holding no live bytes",
-                arm.name
-            );
-            assert!(cell.on_disk > 0, "{} {name} left nothing on disk", arm.name);
+        assert!(cell.written > 0, "{} wrote nothing", arm.name);
+        assert_eq!(
+            cell.misses, 0,
+            "{} lost keys the stream had written",
+            arm.name
+        );
+        assert!(cell.live > 0, "{} ended holding no live bytes", arm.name);
+        assert!(cell.on_disk > 0, "{} left nothing on disk", arm.name);
 
-            println!(
-                "{:>15} {:>9} {:>11.0} {:>8.1} {:>8.1} {:>11.3} {:>10.3} {:>13.1} {:>9.2}x {:>12.1} {:>9.1} {:>9} {:>7} {:>10.1}",
-                arm.name,
-                name,
-                cell.writes_per_sec(),
-                cell.get_p50 as f64 / 1e3,
-                cell.get_p99 as f64 / 1e3,
-                cell.searches_per_get(),
-                cell.reads_per_get(),
-                cell.resident as f64 / (1 << 20) as f64,
-                cell.disk_over_live(),
-                cell.rewritten as f64 / (1 << 20) as f64,
-                cell.standing_mean(),
-                cell.standing_max(),
-                cell.merges,
-                cell.collapsed as f64 / (1 << 20) as f64,
-            );
-        }
+        println!(
+            "{:>15} {:>11.0} {:>8.1} {:>8.1} {:>11.3} {:>10.3} {:>13.1} {:>9.2}x {:>12.1} {:>9.1} {:>9} {:>7}",
+            arm.name,
+            cell.writes_per_sec(),
+            cell.get_p50 as f64 / 1e3,
+            cell.get_p99 as f64 / 1e3,
+            cell.searches_per_get(),
+            cell.reads_per_get(),
+            cell.resident as f64 / (1 << 20) as f64,
+            cell.disk_over_live(),
+            cell.rewritten as f64 / (1 << 20) as f64,
+            cell.standing_mean(),
+            cell.standing_max(),
+            cell.merges,
+        );
     }
-    // Nothing is asserted about the timing columns: a microsecond figure held against
-    // another would fail on a busy laptop and prove nothing about the posture.
+    // The timing columns go unasserted, since a busy machine would fail them
 }

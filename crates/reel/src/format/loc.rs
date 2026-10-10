@@ -29,11 +29,7 @@ impl SegmentId {
     }
 }
 
-/// One life of a segment in the live table, gone when its space goes
-///
-/// Retiring a segment or reusing its space must drop or advance the incarnation
-/// before the bytes change, and a stamp is never reissued, so an index entry
-/// whose stamp is current still names the record it was made from.
+/// One life of a segment in the live table, gone when its space goes and never reissued
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SegmentIncarnation(pub u32);
 
@@ -41,18 +37,16 @@ impl SegmentIncarnation {
     /// The stamp of no live segment, which no issued incarnation ever equals
     pub const NONE: SegmentIncarnation = SegmentIncarnation(0);
 
-    /// Whether this stamp names no live segment
+    /// Whether this stamp belongs to no live segment
     pub fn is_none(self) -> bool {
         self == SegmentIncarnation::NONE
     }
 }
 
 /// A resident pointer to one record: which segment, where in it, and how long
-///
-/// The offset and length stay raw so the index packs densely.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Loc {
-    /// Segment file the record lives in
+    /// The record's segment file
     pub segment: SegmentId,
 
     /// Byte offset of the record header within the segment

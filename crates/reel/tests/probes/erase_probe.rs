@@ -1,15 +1,5 @@
-//! What a hole punch gives back, measured instead of argued
-//!
-//! A punch is page-granular reclamation through the filesystem's own extent map, so
-//! the reclaim it reports is the ceiling any fixed-page scheme reaches without moving
-//! survivors. TMPDIR must not sit on tmpfs, or the punch frees RAM and the number is
-//! fiction.
-//!
-//! Probe knobs: REEL_ERASE_VOLUME_BYTES (default 8 GiB),
-//! REEL_ERASE_RECORD_BYTES (default 4096), REEL_ERASE_MODE (stride or random).
-//!
-//! Run with:
-//!   cargo test -p tape-reel --release --test probes -- erase_probe
+//! Measures what a hole punch reclaims from dead runs, and checks a punched volume reads back
+//! Run `cargo test -p tape-reel --release --test probes -- erase_probe` with TMPDIR off tmpfs
 
 #[cfg(target_os = "linux")]
 use std::path::Path;
@@ -17,8 +7,8 @@ use std::path::Path;
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, RecordKey, ReelConfig,
-    ReelStore, SyncPolicy,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelConfig, ReelStore,
+    SyncPolicy,
 };
 
 const RECORDS: ColumnId = ColumnId(1);
@@ -32,7 +22,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 2,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -41,7 +30,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 
@@ -61,7 +49,6 @@ fn config(segment: ByteCount) -> ReelConfig {
         sync: SyncPolicy::Never,
         scrub_mbps: 0,
         segment_bytes: segment,
-        alloc_chunk: ByteCount::from_bytes(16_384),
         ..ReelConfig::default()
     }
 }
@@ -70,7 +57,7 @@ fn payload(byte: u8, len: usize) -> Vec<u8> {
     vec![byte; len]
 }
 
-/// Bytes the filesystem is actually holding for the tree, from block counts
+/// Bytes the filesystem allocates for the tree, from block counts
 #[cfg(target_os = "linux")]
 fn held_bytes(dir: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
@@ -90,10 +77,6 @@ fn held_bytes(dir: &Path) -> u64 {
 }
 
 // a punched volume answers every live key after a rebuild
-//
-// The one hazard a punch carries is zeroing a dead record's header inside a sealed
-// segment, and recovery reads sealed segments from their footers rather than by
-// walking them.
 #[cfg(target_os = "linux")]
 pub fn an_erased_volume_rebuilds_every_live_key() {
     let dir = TempDir::new().expect("tempdir");
@@ -110,8 +93,7 @@ pub fn an_erased_volume_rebuilds_every_live_key() {
                 .put(&record_key(group, *id), &payload(i as u8, record))
                 .expect("put");
         }
-        // Overwrite every other key, so dead records scatter through the sealed
-        // segments rather than emptying whole ones.
+        // Overwrite every other key, so dead records scatter through the sealed segments
         for (i, id) in ids.iter().enumerate() {
             if i % 2 == 0 {
                 store
@@ -147,10 +129,6 @@ pub fn an_erased_volume_rebuilds_every_live_key() {
 }
 
 // a second erase finds deaths behind the holes the first one left
-//
-// A hole reads as zeroed headers, so a sequential scan takes it for the end of the
-// data and would leave every death behind it unfound. The walk resumes at each footer
-// row's own offset instead.
 #[cfg(target_os = "linux")]
 pub fn a_second_erase_reaches_past_the_first_holes() {
     let dir = TempDir::new().expect("tempdir");
@@ -166,7 +144,7 @@ pub fn a_second_erase_reaches_past_the_first_holes() {
             .put(&record_key(group, *id), &payload(i as u8, record))
             .expect("put");
     }
-    // Roll the tail so the first segment seals and carries a footer.
+    // Roll the tail so the first segment seals with a footer
     for i in 0..count {
         store
             .put(
@@ -195,7 +173,7 @@ pub fn a_second_erase_reaches_past_the_first_holes() {
     );
 }
 
-// the number: reclaim share of a churned volume, real fill, real drive
+// prints the share of dead bytes a punch reclaims on a churned volume
 pub fn erase_reclaim_share() {
     println!();
     let volume: u64 = std::env::var("REEL_ERASE_VOLUME_BYTES")
@@ -226,9 +204,7 @@ pub fn erase_reclaim_share() {
         store.put(&record_key(group, id), &body).expect("put");
         ids.push(id);
     }
-    // Two kill orders, because run length is the measurand and the order is what makes
-    // it: `stride` is correlated death and manufactures multi-record runs, `random` is
-    // scattered churn and leaves mostly single-record ones. The pair brackets the real.
+    // `stride` kills three of every five in a row, `random` scatters the same share
     let mode = std::env::var("REEL_ERASE_MODE").unwrap_or_else(|_| "stride".to_string());
     let mut victims: Vec<usize> = (0..count).filter(|i| (i % 5) < 3).collect();
     if mode == "random" {

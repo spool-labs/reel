@@ -1,10 +1,4 @@
-//! A reel spanning two roots: the scan finds what either holds, a moved
-//! segment keeps serving, the manifest refuses a missing mount, pinned tails
-//! put a stream on every volume, and a full volume's draw hops to the next
-//!
-//! Segment files copied between roots, with the list in config, open as the same
-//! store. The ENOSPC coverage is a positional sweep rather than a named op, so it
-//! keeps holding when open's op sequence moves.
+//! A reel spanning two roots, from scans and moved segments to refused opens and full volumes
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,11 +6,11 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use reel::config::{ReelConfig, SyncPolicy, ThreadBudget, VolumeSpec};
-use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, MapShape, RecordKey};
+use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, RecordKey};
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::SimIo;
 use reel::units::ByteCount;
-use reel::{KeyWidth, Preallocate, ReelStore};
+use reel::{KeyWidth, ReelStore};
 
 const ROWS: ColumnId = ColumnId(1);
 
@@ -27,7 +21,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 0,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 fn key(at: u64) -> RecordKey {
@@ -39,8 +32,6 @@ fn key(at: u64) -> RecordKey {
 fn config(extra: &[PathBuf]) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(256 * 1024),
-        alloc_chunk: ByteCount::from_bytes(64 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         volumes: extra.iter().cloned().map(VolumeSpec::fast).collect(),
@@ -48,7 +39,7 @@ fn config(extra: &[PathBuf]) -> ReelConfig {
     }
 }
 
-/// The segment files a root holds, smallest id first
+/// Lists a root's segment files, smallest id first
 fn segments_in(root: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(root)
         .expect("read root")
@@ -75,8 +66,7 @@ fn a_moved_segment_keeps_serving() {
     store.close().expect("close");
     drop(store);
 
-    // Single-threaded puts all ride the first tail, which pins home, so the
-    // sealed run sits there.
+    // Single-threaded puts all use the first tail, pinned to home, so the sealed run sits there
     let sealed = segments_in(home.path());
     assert!(
         sealed.len() > 1,
@@ -101,7 +91,7 @@ fn a_moved_segment_keeps_serving() {
     );
 }
 
-// an open whose config dropped a manifest-named root refuses, loudly
+// an open whose config dropped a root the manifest lists refuses, loudly
 #[test]
 fn a_missing_volume_refuses_the_open() {
     let home = TempDir::new().expect("home");
@@ -119,7 +109,7 @@ fn a_missing_volume_refuses_the_open() {
     );
 }
 
-// the same id standing on two roots is refused rather than resolved by luck
+// the same segment id standing on two roots refuses the open
 #[test]
 fn a_duplicated_segment_refuses_the_open() {
     let home = TempDir::new().expect("home");
@@ -143,7 +133,7 @@ fn a_duplicated_segment_refuses_the_open() {
     assert!(refused.is_err(), "a segment on two volumes was let through");
 }
 
-// a manifest-named root whose directory is gone refuses the open
+// a root the manifest lists whose directory is gone refuses the open
 #[test]
 fn an_unmounted_volume_refuses_the_open() {
     let home = TempDir::new().expect("home");
@@ -160,8 +150,7 @@ fn an_unmounted_volume_refuses_the_open() {
     let refused = ReelStore::open(home.path().to_path_buf(), config(&extras), COLUMNS);
     assert!(refused.is_err(), "an absent volume was read as empty");
 
-    // The unmounted-mountpoint lookalike: an empty directory standing exactly
-    // where the volume should be, with no marker to prove it is one.
+    // An empty directory where the volume should be, with no marker to prove it is one
     std::fs::create_dir(&vol).expect("mountpoint");
     let refused = ReelStore::open(home.path().to_path_buf(), config(&extras), COLUMNS);
     assert!(
@@ -170,7 +159,7 @@ fn an_unmounted_volume_refuses_the_open() {
     );
 }
 
-// a marker naming another path is a crossed mount, refused by name
+// a marker for another path is a crossed mount and refuses the open
 #[test]
 fn a_crossed_mount_refuses_the_open() {
     let home = TempDir::new().expect("home");
@@ -190,8 +179,7 @@ fn a_crossed_mount_refuses_the_open() {
     );
 }
 
-// the tail floor gives every volume a pinned tail, visible as one fresh
-// segment per root the moment the store opens
+// the tail floor gives every volume a pinned tail and a fresh segment at open
 #[test]
 fn every_volume_opens_with_a_tail_of_its_own() {
     let home = TempDir::new().expect("home");
@@ -233,8 +221,7 @@ fn a_capacity_volume_attracts_nothing_fresh() {
     assert!(!segments_in(home.path()).is_empty());
 }
 
-// a volume declared dead opens degraded: its records miss cleanly, the
-// survivors serve, and the store keeps taking writes
+// a dead volume opens degraded: its records miss, survivors serve, writes still land
 #[test]
 fn a_dead_volume_opens_degraded() {
     let home = TempDir::new().expect("home");
@@ -265,8 +252,7 @@ fn a_dead_volume_opens_degraded() {
     }
     std::fs::remove_dir_all(&vol).expect("lose the drive");
 
-    // Without the operator's word the open refuses; with it, the lost records are
-    // misses rather than errors.
+    // Without the operator's word the open refuses, and with it the lost records are misses
     let refused = ReelStore::open(home.path().to_path_buf(), config(&extras), COLUMNS);
     assert!(
         refused.is_err(),
@@ -303,8 +289,7 @@ fn a_dead_volume_opens_degraded() {
     assert!(degraded.get(&key(500)).expect("get").is_some());
 }
 
-// a checkpoint of a multi-volume store is itself a multi-volume store: each
-// live volume stages its own piece, and the copy opens and serves everything
+// a checkpoint of a multi-volume store stages a piece per volume and opens as one store
 #[test]
 fn a_checkpoint_spans_the_volumes() {
     let home = TempDir::new().expect("home");
@@ -320,7 +305,7 @@ fn a_checkpoint_spans_the_volumes() {
     store.close().expect("close");
     drop(store);
 
-    // Put real data on the extra volume, so the copy has to link across both.
+    // Put real data on the extra volume, so the copy has to link across both
     let sealed = segments_in(home.path());
     let landed = extra.path().join(sealed[0].file_name().expect("name"));
     std::fs::rename(&sealed[0], &landed).expect("move");
@@ -331,10 +316,10 @@ fn a_checkpoint_spans_the_volumes() {
     let taken = store.checkpoint(&target).expect("checkpoint");
     assert!(taken.segments > 0);
 
-    // A name the reel itself uses is refused before anything seals.
+    // A file name the reel itself uses is refused before anything seals
     assert!(store.checkpoint(&cues.path().join("000007.reel")).is_err());
     assert!(store.checkpoint(&cues.path().join("reel.volumes")).is_err());
-    // Publishing over the copy just taken is refused too.
+    // Publishing over the copy just taken is refused too
     assert!(store.checkpoint(&target).is_err());
     drop(store);
 
@@ -369,7 +354,7 @@ fn a_leftover_piece_refuses_the_next_checkpoint() {
     );
 }
 
-// destroying a multi-volume store takes every manifest-named root with it
+// destroying a multi-volume store removes every root the manifest lists
 #[test]
 fn destroy_walks_the_manifest() {
     let home = TempDir::new().expect("home");
@@ -389,14 +374,9 @@ fn destroy_walks_the_manifest() {
 }
 
 /// Simulated two-volume config, small segments so a short run rolls
-///
-/// Full preallocation puts exactly one allocate op on each segment creation, which
-/// is the op the ENOSPC sweeps aim at.
 fn sim_config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(32 * 1024),
-        alloc_chunk: ByteCount::from_bytes(32 * 1024),
-        preallocate: Preallocate::Full,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(1),
         volumes: vec![VolumeSpec::fast("/extra")],
@@ -404,12 +384,7 @@ fn sim_config() -> ReelConfig {
     }
 }
 
-// one ENOSPC anywhere in the stream never fails a write and never leaves a
-// segment standing on two volumes
-//
-// A single allocate failure is scheduled at every op position of the run in turn.
-// At the positions holding an allocate that is the draw hopping volumes, open
-// included; everywhere else the fault is a no-op.
+// one ENOSPC anywhere in the stream never fails a write or leaves a segment on two volumes
 #[test]
 fn a_full_volume_hops_the_draw() {
     let payload = vec![0x5Au8; 4 * 1024];
@@ -430,8 +405,7 @@ fn a_full_volume_hops_the_draw() {
                 .unwrap_or_else(|error| panic!("put {key_at} under a fault at op {at}: {error}"));
         }
         store.close().expect("close");
-        // Read before the reopen runs more ops, so an unreached position ends
-        // the sweep at the stream's own length rather than at a guess.
+        // Read before the reopen runs more ops, so the sweep ends at the stream's own length
         let (fired, _) = sim.fault_reach();
         drop(store);
 
@@ -473,9 +447,7 @@ fn a_full_class_refuses_and_a_drained_one_recovers() {
     )
     .expect("open");
 
-    // Every allocate in the window is ENOSPC, so the spare drawn ahead runs out and
-    // the first roll that needs a fresh segment has nowhere to go on either volume.
-    // The window outlasts the loop by an order of magnitude.
+    // Every allocate in the window is ENOSPC, so the next roll has nowhere to go on either volume
     sim.arm_next_ops(2_000, FaultKind::EnospcAllocate);
     let mut refused = false;
     let mut acked = Vec::new();
@@ -493,7 +465,7 @@ fn a_full_class_refuses_and_a_drained_one_recovers() {
         "a store with every volume full kept accepting writes"
     );
 
-    // Space comes back, and the tail that failed its roll draws again.
+    // Space comes back, and the tail that failed its roll draws again
     sim.disarm();
     store
         .put(&key(900), &payload)

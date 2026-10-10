@@ -1,39 +1,30 @@
-//! What the compaction rate and the rewrite threshold are worth, per segment
-//!
-//! Selection always rewrites the deadest eligible segment, so the threshold decides
-//! what is allowed rather than what is chosen, and lowering it costs anything only
-//! once nothing sits above the base ratio. Two death shapes bracket the answer:
-//! spread evenly over live bytes, which ages every segment together, and weighted
-//! toward older segments, which builds the gradient greedy selection wants. The
-//! device is a number rather than a drive, so nothing here says anything about io.
-//!
-//! Run with:
-//!   cargo test -p tape-reel --test compact_rate_sim -- --nocapture
+//! Models compaction rate laws and rewrite thresholds over a simulated volume, with no real io
+//! Run with `cargo test -p tape-reel --test compaction compact_rate_sim -- --nocapture`
 
 use reel::{CompactRate, GcPressure, GcTier, RateLimiter};
 
 const MB: f64 = 1_000_000.0;
 
-/// Segments in the volume, and the bytes each one holds
+/// The volume's segment count and the bytes in each segment
 const SEGMENTS: usize = 1_000;
 const SEGMENT_BYTES: f64 = 1_000.0 * MB;
 
-/// Live bytes the volume settles at, so dead space is the only thing moving
+/// The volume holds this many live bytes, so only dead space grows
 const LIVE_TARGET: f64 = 600.0 * 1_000.0 * MB;
 
-/// What the drive under the volume can actually move, in MB/s
+/// Device bandwidth in MB/s
 const DEVICE_MBPS: f64 = 230.0;
 
-/// Ticks per run, one simulated day at one second each
+/// One simulated day of one-second ticks
 const TICKS: usize = 86_400;
 
-/// Rewrite threshold a relaxed volume selects segments at
+/// A relaxed volume rewrites segments at or above this dead ratio
 const BASE_DEAD_RATIO: f64 = 0.50;
 
-/// Threshold the escalated tier lowers to
+/// The escalated tier lowers the threshold to this ratio
 const ESCALATED_RATIO: f64 = 0.20;
 
-/// One sealed segment's accounting, the same split the index keeps
+/// One sealed segment's live and dead bytes, split as the index splits them
 #[derive(Clone, Copy)]
 struct Segment {
     live: f64,
@@ -57,12 +48,11 @@ impl Segment {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Law {
-    /// Today: one rate whatever the tier, threshold drops when escalated
+    /// The current law: one rate at every tier, and the threshold drops when escalated
     Fixed,
-    /// Today's threshold, with the rate scaled by what a reclaimed byte costs
-    /// at the segment actually being rewritten
+    /// The current threshold, with the rate scaled by the cost of reclaiming the target segment
     CostScaled,
-    /// Today's rate, with the threshold never lowered
+    /// The current rate, and the threshold never drops
     HoldRatio,
 }
 
@@ -92,11 +82,11 @@ impl Death {
         }
     }
 
-    /// Relative weight of this segment in the next byte to die
+    /// Relative chance that the next dying byte is in this segment
     fn weight(self, segment: &Segment) -> f64 {
         match self {
             Death::Uniform => segment.live,
-            // Linear in age, so the oldest segments carry most of the deaths.
+            // Linear in age, so the oldest segments take most of the deaths
             Death::Aged => segment.live * segment.age,
         }
     }
@@ -117,8 +107,7 @@ fn run(law: Law, death: Death, debt_mbps: f64) -> Outcome {
     let pressure = GcPressure::new((SEGMENTS as f64 * SEGMENT_BYTES) as u64, 0, BASE_DEAD_RATIO);
     let base_mbps = RateLimiter::for_compaction(CompactRate::Auto).target_mbps() as f64;
 
-    // Start full of sealed segments holding the live target, spread evenly, with
-    // ages fanned out so the aged shape has a gradient to work with from tick 0.
+    // Spread the live target evenly with fanned-out ages, so aged death has a gradient at tick 0
     let per_segment = LIVE_TARGET / SEGMENTS as f64;
     let mut segments: Vec<Segment> = (0..SEGMENTS)
         .map(|i| Segment {
@@ -136,8 +125,7 @@ fn run(law: Law, death: Death, debt_mbps: f64) -> Outcome {
     let mut filled_at = None;
 
     for tick in 0..TICKS {
-        // Ingest replaces what dies, so the volume holds its live set and dead bytes
-        // are the only thing accumulating. Without it nothing is under pressure.
+        // Ingest replaces what dies, so only dead bytes accumulate
         let arriving = debt_mbps * MB;
         if let Some(slot) = segments
             .iter_mut()
@@ -172,7 +160,7 @@ fn run(law: Law, death: Death, debt_mbps: f64) -> Outcome {
             break;
         }
 
-        // Foreground takes its cut of the device first.
+        // Foreground io takes its share of the device first
         let foreground = 40.0 * MB;
         let is_hot = true;
         let tier = pressure.tier(dead_fraction, is_hot);
@@ -191,7 +179,7 @@ fn run(law: Law, death: Death, debt_mbps: f64) -> Outcome {
             }
         };
 
-        // The real selection: deadest eligible segment, not merely an eligible one.
+        // Pick the deadest eligible segment, as the real selection does
         let target = segments
             .iter()
             .enumerate()
@@ -204,8 +192,7 @@ fn run(law: Law, death: Death, debt_mbps: f64) -> Outcome {
             continue;
         };
 
-        // Cost scaling grants the extra bandwidth a poorer segment needs, so reclaim
-        // throughput holds rather than the write budget.
+        // Cost scaling gives a poorer segment the bandwidth it needs, so reclaim throughput holds
         let cost = (1.0 - ratio) / ratio;
         let rate_mbps = match law {
             Law::Fixed | Law::HoldRatio => base_mbps,
@@ -215,7 +202,7 @@ fn run(law: Law, death: Death, debt_mbps: f64) -> Outcome {
         let headroom = (DEVICE_MBPS * MB - foreground).max(0.0);
         let budget = (rate_mbps * MB).min(headroom);
 
-        // A pass that cannot afford the whole segment does the share it can.
+        // A pass that cannot afford the whole segment does the share it can
         let segment = segments[index];
         let affordable = (budget / segment.live.max(1.0)).min(1.0);
         let copied = segment.live * affordable;
@@ -231,8 +218,7 @@ fn run(law: Law, death: Death, debt_mbps: f64) -> Outcome {
             };
         }
 
-        // The live bytes land in a fresh segment, which is why compaction moves bytes
-        // without freeing them all.
+        // The copied live bytes land in an empty segment
         if let Some(slot) = segments.iter_mut().find(|segment| segment.total() == 0.0) {
             slot.live += copied;
             slot.age = 0.0;
@@ -265,7 +251,7 @@ fn run(law: Law, death: Death, debt_mbps: f64) -> Outcome {
     }
 }
 
-// the three rate laws, priced against both death shapes and two debt rates
+// prints the three rate laws against both death shapes and two debt rates
 #[test]
 fn compare_thresholds_and_rates() {
     for death in [Death::Uniform, Death::Aged] {

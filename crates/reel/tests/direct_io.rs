@@ -1,25 +1,18 @@
-//! Direct io on a real filesystem, where the kernel checks the alignment for us
-//!
-//! Nothing here can be simulated: only a real descriptor opened with the flag
-//! refuses an op whose offset, length or buffer address is off a block boundary.
-//! The flag is a Linux one and not every filesystem takes it, so a volume that
-//! cannot open direct reports that rather than failing.
+//! Direct io on a real Linux filesystem, where the kernel checks every op's alignment
 
 #![cfg(target_os = "linux")]
 
 use tempfile::TempDir;
 
-use reel::config::{IoBackend, Preallocate, ReelConfig, SyncPolicy};
+use reel::config::{IoBackend, ReelConfig, SyncPolicy};
 use reel::sync::tension::block_on;
-use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, RecordKey, ReelStore,
-};
+use reel::{ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelStore};
 use reel_core::{Direction, Store};
 
-/// Bytes the group takes at the front of a record key
+/// Length of the group prefix at the front of a record key
 const GROUP_PREFIX_LEN: usize = 2;
 
-/// Bytes a record key occupies
+/// Record key length
 const RECORD_KEY_LEN: usize = GROUP_PREFIX_LEN + 32;
 
 const RECORDS: ColumnId = ColumnId(1);
@@ -36,7 +29,6 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: GROUP_PREFIX_LEN as u8,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
     ColumnSpec {
         id: BLOB,
@@ -45,11 +37,10 @@ const COLUMNS: ColumnSet = &[
         shard_bytes: 0,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     },
 ];
 
-/// Group the fixtures write into
+/// The fixtures write into this group
 const GROUP: u16 = 7;
 
 /// A record key: the group big endian, then the identifier
@@ -63,8 +54,6 @@ fn record_key(group: u16, id: [u8; 32]) -> RecordKey {
 fn direct_config() -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::mb(16),
-        alloc_chunk: ByteCount::mb(4),
-        preallocate: Preallocate::Full,
         sync: SyncPolicy::Never,
         scrub_mbps: 0,
         io_backend: IoBackend::UringDirect,
@@ -93,9 +82,6 @@ fn open_direct(dir: &TempDir) -> Option<ReelStore> {
 }
 
 // records of every awkward size round trip through a direct volume
-//
-// The sizes straddle the block, and a read asks for the record's exact length at the
-// offset the format chose, so every one lands off a boundary on at least one end.
 #[test]
 fn records_round_trip_unaligned() {
     let dir = TempDir::new().expect("tempdir");
@@ -122,12 +108,7 @@ fn records_round_trip_unaligned() {
     }
 }
 
-// an awaited read on a direct volume answers rather than refusing the buffer
-//
-// The async door hands its ops to the engine thread's ring, where a data op's buffer
-// is the caller's own and sits wherever the allocator put it. A green run is only as
-// strong as the filesystem under the temporary directory: btrfs serves the unaligned
-// direct reads that ext4 refuses.
+// an awaited read on a direct volume answers whatever the caller's buffer alignment
 #[test]
 fn an_awaited_read_answers_direct() {
     let dir = TempDir::new().expect("tempdir");
@@ -155,8 +136,7 @@ fn an_awaited_read_answers_direct() {
     }
 }
 
-// a direct volume survives a reopen, so what the kernel wrote is what a rebuild
-// reads back out of the segment footers and the tail
+// a direct volume reopens with every record intact
 #[test]
 fn direct_volume_reopens() {
     let dir = TempDir::new().expect("tempdir");
@@ -210,8 +190,7 @@ fn direct_volume_iterates() {
     assert_eq!(keys.len(), 16, "the playback repeated a key");
 }
 
-// an overwrite and a delete resolve on a direct volume, so the index and the
-// records agree about which version is live
+// an overwrite and a delete resolve on a direct volume
 #[test]
 fn direct_volume_overwrites_and_deletes() {
     let dir = TempDir::new().expect("tempdir");
@@ -250,8 +229,7 @@ fn direct_volume_walks_backwards() {
         .expect("asc")
         .map(|(key, _)| key)
         .collect();
-    // Above every key written, so the playback starts past the end and comes back
-    // through all of them.
+    // Start above every key written, so the walk covers them all
     let descending: Vec<_> = Store::iter_from(&store, RECORDS_CF, &key(255), Direction::Desc)
         .expect("desc")
         .map(|(key, _)| key)
@@ -261,10 +239,7 @@ fn direct_volume_walks_backwards() {
     assert_eq!(ascending, descending, "the two directions disagreed");
 }
 
-// a ranged read on a direct volume answers through the bounce, both doors
-//
-// A window is one pread of exactly the window, and its offset and length land off a
-// block boundary by construction, which ext4 refuses unless the bounce carries it.
+// a ranged read on a direct volume answers through the bounce on both doors
 #[test]
 fn a_direct_range_reads_a_window() {
     let dir = TempDir::new().expect("tempdir");

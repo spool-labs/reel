@@ -1,22 +1,16 @@
-//! The shape a report takes before it is a string
-//!
-//! A report says itself once, as a head, a verdict and a list of blocks, and a
-//! renderer turns that into a terminal's text or into markdown. Widths are
-//! measured from the content rather than declared, so a long column name widens
-//! its column instead of running into the next one, and the two renderers cannot
-//! drift from each other because neither holds a layout of its own.
+//! A report's structure before rendering, shared by the text and markdown renderers
 
 /// How a line reads: a plain fact, a clean verdict, a caveat, or a fault
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tone {
-    /// A fact, which is most of what a report says
+    /// A plain fact
     #[default]
     Plain,
 
     /// The answer a reader hoped for
     Good,
 
-    /// True, but not the whole of it: a floor, or a figure nothing counted
+    /// True but partial, such as a floor or an uncounted figure
     Warn,
 
     /// Something is wrong
@@ -26,10 +20,10 @@ pub enum Tone {
 /// Which side of its column a cell sits on
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Align {
-    /// Names, which read down their left edge
+    /// Labels, aligned on the left edge
     Left,
 
-    /// Figures, which compare down their right
+    /// Figures, aligned on the right edge
     Right,
 }
 
@@ -44,7 +38,7 @@ pub struct Column {
 }
 
 impl Column {
-    /// A column of names
+    /// A left-aligned column
     pub fn left(head: impl Into<String>) -> Column {
         Column {
             head: head.into(),
@@ -52,7 +46,7 @@ impl Column {
         }
     }
 
-    /// A column of figures
+    /// A right-aligned column
     pub fn right(head: impl Into<String>) -> Column {
         Column {
             head: head.into(),
@@ -61,16 +55,16 @@ impl Column {
     }
 }
 
-/// One row of a table, with the note a renderer hangs off its end
+/// One table row, with an optional note at its end
 #[derive(Clone, Debug, Default)]
 pub struct Row {
-    /// The cells, in the order the columns were declared
+    /// The cells, in column order
     pub cells: Vec<String>,
 
-    /// What is worth saying about this row and no other
+    /// A note about this row
     pub note: Option<String>,
 
-    /// How the row reads, which is what colours it
+    /// The row's tone, which sets its colour
     pub tone: Tone,
 }
 
@@ -87,29 +81,29 @@ impl Row {
         }
     }
 
-    /// Hang a note off the end of the row
+    /// Add a note to the end of the row
     pub fn note(mut self, note: impl Into<String>) -> Row {
         self.note = Some(note.into());
         self
     }
 
-    /// Say how the row reads
+    /// Set the row's tone
     pub fn toned(mut self, tone: Tone) -> Row {
         self.tone = tone;
         self
     }
 }
 
-/// Rows under headings, and what the listing left out
+/// Rows under headings, and a caption for what the listing left out
 #[derive(Clone, Debug)]
 pub struct Table {
-    /// The headings, which also declare how many cells a row has
+    /// The headings, which also set how many cells a row has
     pub columns: Vec<Column>,
 
-    /// The rows, in the order they should be read
+    /// The rows, in reading order
     pub rows: Vec<Row>,
 
-    /// What the listing is out of, said rather than left silent
+    /// What the listing is out of
     pub caption: Option<String>,
 }
 
@@ -161,33 +155,33 @@ impl Note {
         }
     }
 
-    /// Name the command that answers the finding
+    /// Set the command that answers the finding
     pub fn fix(mut self, fix: impl Into<String>) -> Note {
         self.fix = Some(fix.into());
         self
     }
 }
 
-/// A named block of findings, which is how a caveat reaches the reader
+/// A labelled block of findings, which is how caveats reach the reader
 #[derive(Clone, Debug)]
 pub struct Notes {
-    /// What the block is, as its heading
+    /// The block's heading
     pub label: String,
 
-    /// How the block reads, which is what colours it
+    /// The block's tone, which sets its colour
     pub tone: Tone,
 
     /// The findings, most worth reading first
     pub items: Vec<Note>,
 }
 
-/// The answer, which is the line the reader came for
+/// The answer, the line the reader came for
 #[derive(Clone, Debug)]
 pub struct Verdict {
-    /// How it reads, which is what colours it
+    /// The verdict's tone, which sets its colour
     pub tone: Tone,
 
-    /// The word, which carries on its own
+    /// The one-word answer
     pub label: String,
 
     /// The figures behind the word
@@ -197,7 +191,7 @@ pub struct Verdict {
 /// One part of a report
 #[derive(Clone, Debug)]
 pub enum Block {
-    /// Prose, one line per line
+    /// Lines of prose
     Lines(Vec<String>),
 
     /// Labels and their values, aligned down the label
@@ -206,17 +200,17 @@ pub enum Block {
     /// Rows under headings
     Table(Table),
 
-    /// A named block of findings
+    /// A labelled block of findings
     Notes(Notes),
 
-    /// A term and what stands under it, for the checked against the not checked
+    /// Terms with their items, such as checked and not checked
     Terms(Vec<(String, Vec<String>)>),
 
     /// Commands worth running next
     Footer(Vec<String>),
 }
 
-/// A whole report, said once and rendered any number of ways
+/// A whole report, built once and rendered any number of ways
 #[derive(Clone, Debug, Default)]
 pub struct Doc {
     /// What was looked at, rendered as one line of parts
@@ -241,7 +235,7 @@ impl Doc {
         self
     }
 
-    /// Say the answer
+    /// Set the verdict
     pub fn verdict(
         mut self,
         tone: Tone,
@@ -295,7 +289,7 @@ impl Doc {
         }
     }
 
-    /// Add a named block of findings, unless there are none
+    /// Add a labelled block of findings, unless there are none
     pub fn notes(mut self, label: impl Into<String>, tone: Tone, items: Vec<Note>) -> Doc {
         match items.is_empty() {
             true => self,
@@ -310,7 +304,7 @@ impl Doc {
         }
     }
 
-    /// Add a term and what stands under it
+    /// Add a term and its items
     pub fn term<Item>(
         mut self,
         term: impl Into<String>,
@@ -328,7 +322,7 @@ impl Doc {
         self
     }
 
-    /// Name the commands worth running next
+    /// Add the commands worth running next
     pub fn footer<Item>(mut self, commands: impl IntoIterator<Item = Item>) -> Doc
     where
         Item: Into<String>,

@@ -1,9 +1,4 @@
-//! The awaited door beside the blocking one
-//!
-//! Every read and write has both forms, they land the same records, and a batch
-//! is one durability point either way. The engine is runtime agnostic: any
-//! executor drives these futures, and the park and unpark one below is here to
-//! prove that none is required rather than to be reached for.
+//! The awaited door beside the blocking one, on a minimal park and unpark executor
 //!
 //! cargo run --example async_doors
 
@@ -13,8 +8,8 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, ReelConfig, ReelStore,
-    Store, StoreResult, Value, WriteBatch,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, Store,
+    StoreResult, Value, WriteBatch,
 };
 
 const RECORDS: &str = "records";
@@ -27,7 +22,6 @@ const COLUMNS: ColumnSet = &[ColumnSpec {
     shard_bytes: 1,
     purge_mark: None,
     codec: Codec::None,
-    map_shape: MapShape::Tree,
 }];
 
 /// The whole runtime: a wake unparks the thread that is polling
@@ -64,14 +58,11 @@ fn main() -> StoreResult<()> {
     let dir = tempfile::tempdir()?;
     let config = ReelConfig {
         segment_bytes: ByteCount::mb(16),
-        alloc_chunk: ByteCount::mb(1),
         ..ReelConfig::default()
     };
     let store = ReelStore::open(dir.path().to_path_buf(), config, COLUMNS)?;
 
-    // Through the trait rather than the engine's own methods of the same names, which
-    // take a resolved key. The awaited door is not object safe, since the futures are
-    // the backend's own types.
+    // Through the trait, since the engine's own put and get take a resolved key
     Store::put(&store, RECORDS, &key(1), b"landed on this thread")?;
     block_on(Store::put_wait(
         &store,
@@ -104,8 +95,7 @@ fn main() -> StoreResult<()> {
     }
     println!("batches: a put and a tombstone landed together through both doors");
 
-    // The awaited flush runs its fsync where blocking is allowed rather than on the
-    // caller's worker, and both doors pay for it in device flushes.
+    // The awaited flush runs its fsync off the caller's worker, and both doors cost a device flush
     let before = store.sync_count();
     store.flush()?;
     let after_blocking = store.sync_count();

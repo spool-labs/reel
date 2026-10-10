@@ -1,41 +1,30 @@
 //! Following the log from a reader that does not own it
-//!
-//! A read-only open holds an index nothing advances, so a reader does what recovery
-//! does from where it last stopped. Ordering is the whole difficulty: a
-//! segment-by-segment read is not in sequence order, and range tombstones are not
-//! guarded by sequence number the way puts and point tombstones are, so the reader
-//! keeps the ranges it has seen and tests later records against them.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::Result;
+use crate::format::footer::SegmentFooter;
+use crate::format::journal::read_groups;
 use crate::format::loc::SegmentId;
 use crate::format::lsn::Lsn;
 use crate::index::entry::RangeCover;
 use crate::index::map::ReelIndex;
-use crate::index::recovery::{walk_records, WalkedRecord};
+use crate::index::recovery::{
+    footer_records, journal_records, read_footer, read_rows, WalkedRecord, SEALED,
+};
 use crate::index::tbtreemap::{TBTreeMap, NODE_WIDTH};
-use crate::reel::segment::{IoDriver, SegmentReader};
+use crate::io::op::FileId;
+use crate::reel::segment::{read_segment_header, IoDriver};
 use crate::reel::{segment_file_name, segment_number};
 
-/// Sequence numbers a range delete is kept for once the pass has moved past it
-///
-/// A cover is for a later pass delivering something older, which happens when a
-/// record drew its sequence number before the cover but had not landed where the
-/// reader had read to. The admission budget bounds how far apart those can be.
+/// A pass keeps a range delete for this many sequence numbers after it moves past it
 const COVER_WINDOW: u64 = 1 << 20;
 
-/// Covers a reader holds before it stops trusting the list at all
-///
-/// Quietly dropping a cover would let a deleted key come back, so a reader past
-/// this says so and the caller rebuilds instead, which needs no covers at all.
+/// A reader holding more covers than this says so, and the caller rebuilds
 const MAX_COVERS: usize = 4096;
 
 /// How far a reader has consumed the log, and what it still has to remember
-///
-/// The positions are per segment because that is where a walk resumes. The ranges
-/// outlive any one pass, since a record old enough to hide may arrive much later.
 #[derive(Debug, Default)]
 pub struct LogCursor {
     /// How far the last pass read in each segment
@@ -51,7 +40,7 @@ impl LogCursor {
         LogCursor::default()
     }
 
-    /// Segments the cursor is tracking a position in
+    /// How many segments the cursor tracks a position in
     pub fn len(&self) -> usize {
         self.positions.len()
     }
@@ -61,7 +50,7 @@ impl LogCursor {
         self.positions.is_empty()
     }
 
-    /// Range deletes the reader is still holding against older records
+    /// How many range deletes the reader still holds against older records
     pub fn range_count(&self) -> usize {
         self.ranges.len()
     }
@@ -75,15 +64,11 @@ impl LogCursor {
 
     /// Forget a segment the volume no longer has
     fn retire(&mut self, segment: SegmentId) {
-        // Packed, since the segment numbers climb and retirement drains the low
-        // end, where the bare removal would leave the emptied leaves behind.
+        // Packed, since retirement drains the low end, where a bare removal leaves empty leaves
         self.positions.remove_packed(&segment);
     }
 
-    /// Drop the covers nothing older than can still arrive
-    ///
-    /// No writer can hold a record unlanded a whole window, so a cover that far
-    /// below the highest sequence number seen has outlived what it could hide.
+    /// Drop the covers too far below the highest sequence number to hide anything still arriving
     fn prune_covers(&mut self, highest_lsn: Lsn) {
         let floor = highest_lsn.as_u64().saturating_sub(COVER_WINDOW);
         if floor == 0 {
@@ -107,23 +92,20 @@ pub struct CaughtUp {
     /// Records the pass read and declined as stale or covered
     pub skipped: u64,
 
-    /// Segments the volume has retired since the last pass, named so a reader can
-    /// drop exactly those descriptors
+    /// Segments the volume has retired since the last pass, so a reader drops those descriptors
     pub retired: Vec<SegmentId>,
 
     /// Highest sequence number the pass saw
     pub highest_lsn: Lsn,
 
-    /// Whether the reader holds more range deletes than it can keep testing, so it
-    /// should rebuild rather than keep following
+    /// Whether the reader holds more range deletes than it can keep testing, so it should rebuild
     pub is_saturated: bool,
+
+    /// Versions still counted in retired segments after the pass, which only a rebuild settles
+    pub lost: u64,
 }
 
 /// Advance a reader's index to what the volume holds now
-///
-/// The walk starts where the last pass stopped in every segment still present,
-/// picks up the segments that have appeared and drops the ones that have gone.
-/// Applying in sequence order is what makes a pass match the writer's own.
 pub fn catch_up(
     driver: &IoDriver,
     reel_dir: &Path,
@@ -144,54 +126,91 @@ pub fn catch_up(
         .map(|(segment, _)| *segment)
         .filter(|segment| !present.contains_key(segment))
         .collect();
+
+    let mut found: Vec<WalkedRecord> = Vec::new();
+    let mut sealed: Vec<(SegmentId, SegmentFooter)> = Vec::new();
+    for (segment, file_len) in present.iter() {
+        let from = cursor.positions.get(segment).copied().unwrap_or(0);
+        if from == SEALED {
+            continue;
+        }
+        let path = reel_dir.join(segment_file_name(*segment));
+        let file = driver.open(&path, false)?;
+        let followed = follow_segment(driver, file, *segment, *file_len, from);
+        driver.close(file)?;
+        let (records, next, footer) = followed?;
+        cursor.positions.insert(*segment, next);
+        found.extend(records);
+        sealed.extend(footer.map(|footer| (*segment, footer)));
+    }
+
+    // The index's guards assume sequence order, and kept ranges cover what one pass's sort cannot
+    found.sort_by_key(|record| record.lsn);
+    // A follower serves reads throughout, so the pass publishes under the index's barrier
+    let applied = index.publish_pass(|| apply_all(index, cursor, found, &gone));
+    // Retired after the pass applies, so its writes can book the versions these segments held
     for segment in &gone {
         cursor.retire(*segment);
         index.forget_segment(*segment);
     }
+    // A counted slot left in a retired segment holds a version no record moved or booked
+    let lost = index.forget_retired_slots();
+    let mut result = applied?;
+    result.retired = gone;
+    result.lost = lost;
 
-    let mut found: Vec<WalkedRecord> = Vec::new();
-    for (segment, file_len) in present.iter() {
-        let from = cursor.positions.get(segment).copied().unwrap_or(0);
-        if from >= *file_len {
-            continue;
+    // A segment that sealed since the open gets its spans, so the graves its tombstones left can go
+    for (segment, footer) in &sealed {
+        if let Err(error) = index.note_spans(*segment, footer) {
+            tracing::warn!(
+                "reel segment {} sealed with a footer that holds no key range: {error}",
+                segment.as_u32()
+            );
         }
-        let file = driver.open(&reel_dir.join(segment_file_name(*segment)), false)?;
-        let mut reader = SegmentReader::new(driver, file, *file_len);
-        let walked = walk_records(&mut reader, *segment, from, *file_len);
-        driver.close(file)?;
-        let walked = walked?;
-        cursor.positions.insert(*segment, walked.next_offset);
-        found.extend(walked.records);
     }
 
-    // The index's guards assume sequence order; across passes the retained ranges
-    // cover what sorting one pass cannot.
-    found.sort_by_key(|record| record.lsn);
-    // A follower serves reads throughout, so the pass publishes under the index's own
-    // barrier, with every device read it needed already done above.
-    let mut result = index.publish_pass(|| apply_all(index, cursor, found, gone))?;
-
-    // After the pass, since the highest sequence number seen is what decides it.
+    // Prune after the pass, since the highest sequence number seen decides it
     cursor.prune_covers(result.highest_lsn);
     result.is_saturated = cursor.is_saturated();
     Ok(result)
+}
+
+/// What a follower has not read of one segment, where it reads next, and its footer once sealed
+fn follow_segment(
+    driver: &IoDriver,
+    file: FileId,
+    segment: SegmentId,
+    file_len: u64,
+    from: u64,
+) -> Result<(Vec<WalkedRecord>, u64, Option<SegmentFooter>)> {
+    // The sequence guard turns down the footer rows a pass through the journal already applied
+    if let Some(footer) = read_footer(driver, file, file_len)? {
+        let records = footer_records(driver, file, segment, &footer)?;
+        return Ok((records, SEALED, Some(footer)));
+    }
+    let Some(rows_at) = read_segment_header(driver, file)?
+        .map(|header| header.rows_at)
+        .filter(|rows_at| *rows_at > 0 && file_len >= *rows_at)
+    else {
+        return Ok((Vec::new(), from, None));
+    };
+    let bytes = read_rows(driver, file, rows_at, file_len, from)?;
+    let (groups, valid) = read_groups(&bytes);
+    Ok((journal_records(segment, groups), from + valid as u64, None))
 }
 
 fn apply_all(
     index: &ReelIndex,
     cursor: &mut LogCursor,
     found: Vec<WalkedRecord>,
-    retired: Vec<SegmentId>,
+    retired: &[SegmentId],
 ) -> Result<CaughtUp> {
-    let mut result = CaughtUp {
-        retired,
-        ..CaughtUp::default()
-    };
+    let mut result = CaughtUp::default();
     for record in found {
         if record.lsn > result.highest_lsn {
             result.highest_lsn = record.lsn;
         }
-        if apply_one(index, cursor, &record)? {
+        if apply_one(index, cursor, &record, retired)? {
             result.applied += 1;
         } else {
             result.skipped += 1;
@@ -201,7 +220,12 @@ fn apply_all(
 }
 
 /// Apply one record, and report whether it changed anything
-fn apply_one(index: &ReelIndex, cursor: &mut LogCursor, record: &WalkedRecord) -> Result<bool> {
+fn apply_one(
+    index: &ReelIndex,
+    cursor: &mut LogCursor,
+    record: &WalkedRecord,
+    retired: &[SegmentId],
+) -> Result<bool> {
     if record.flags.is_range_tombstone() {
         let cover = RangeCover {
             start: record.key.clone(),
@@ -222,8 +246,7 @@ fn apply_one(index: &ReelIndex, cursor: &mut LogCursor, record: &WalkedRecord) -
         return index.remove(&record.key, record.lsn, record.loc);
     }
 
-    // A record a range delete already covered must not come back, and nothing in
-    // the index would refuse it: the key is absent, so the put looks fresh.
+    // A record a range delete covered must stay gone, and the index would take it as fresh
     if cursor
         .ranges
         .iter()
@@ -232,10 +255,12 @@ fn apply_one(index: &ReelIndex, cursor: &mut LogCursor, record: &WalkedRecord) -
         return Ok(false);
     }
 
-    // A relocation is the same version in a new place, so taking it for a stale
-    // write would leave the reader on the segment compaction is about to unlink.
-    if record.flags.is_relocated() && index.repoint(&record.key, record.loc, record.lsn)? {
-        return Ok(true);
+    // A relocation is the same version in a new place, so the key follows it
+    if record.flags.is_relocated() {
+        let from = index.retired_source(&record.key, retired, record.loc.len);
+        if index.repoint(&record.key, from, record.loc, record.lsn)? {
+            return Ok(true);
+        }
     }
 
     index.insert(&record.key, record.loc, record.lsn)
@@ -245,9 +270,7 @@ fn apply_one(index: &ReelIndex, cursor: &mut LogCursor, record: &WalkedRecord) -
 mod tests {
     use super::*;
 
-    use crate::format::column::{
-        Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, MapShape, RecordKey,
-    };
+    use crate::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey};
     use crate::format::loc::Loc;
     use crate::format::record::Flags;
 
@@ -260,7 +283,6 @@ mod tests {
         shard_bytes: 1,
         purge_mark: None,
         codec: Codec::None,
-        map_shape: MapShape::Tree,
     }];
 
     fn key(byte: u8) -> RecordKey {
@@ -278,12 +300,7 @@ mod tests {
     }
 
     fn index() -> ReelIndex {
-        ReelIndex::new(
-            COLUMNS,
-            crate::config::IndexResidency::Resident,
-            crate::config::ShardShapes::Tree,
-        )
-        .expect("index")
+        ReelIndex::new(COLUMNS).expect("index")
     }
 
     // an older version arriving after a newer one is refused by the index guard
@@ -292,8 +309,8 @@ mod tests {
         let index = index();
         let mut cursor = LogCursor::new();
 
-        assert!(apply_one(&index, &mut cursor, &data(1, 5, 2)).expect("apply"));
-        assert!(!apply_one(&index, &mut cursor, &data(1, 3, 1)).expect("apply"));
+        assert!(apply_one(&index, &mut cursor, &data(1, 5, 2), &[]).expect("apply"));
+        assert!(!apply_one(&index, &mut cursor, &data(1, 3, 1), &[]).expect("apply"));
         assert_eq!(
             index.get(&key(1)).expect("read").expect("present").lsn,
             Lsn(5)
@@ -313,17 +330,17 @@ mod tests {
             range_end: None,
         };
 
-        assert!(apply_one(&index, &mut cursor, &range).expect("apply"));
+        assert!(apply_one(&index, &mut cursor, &range, &[]).expect("apply"));
         assert_eq!(cursor.range_count(), 1);
 
         assert!(
-            !apply_one(&index, &mut cursor, &data(4, 9, 2)).expect("apply"),
+            !apply_one(&index, &mut cursor, &data(4, 9, 2), &[]).expect("apply"),
             "older than the delete"
         );
         assert!(!index.contains(&key(4)).expect("read"));
 
         assert!(
-            apply_one(&index, &mut cursor, &data(4, 11, 2)).expect("apply"),
+            apply_one(&index, &mut cursor, &data(4, 11, 2), &[]).expect("apply"),
             "newer than the delete"
         );
         assert!(index.contains(&key(4)).expect("read"));
@@ -345,9 +362,9 @@ mod tests {
         let index = index();
         let mut cursor = LogCursor::new();
         for lsn in [1u64, 2, 3] {
-            apply_one(&index, &mut cursor, &range(lsn as u8, lsn)).expect("apply");
+            apply_one(&index, &mut cursor, &range(lsn as u8, lsn), &[]).expect("apply");
         }
-        apply_one(&index, &mut cursor, &range(9, COVER_WINDOW + 10)).expect("apply");
+        apply_one(&index, &mut cursor, &range(9, COVER_WINDOW + 10), &[]).expect("apply");
         assert_eq!(cursor.range_count(), 4);
 
         cursor.prune_covers(Lsn(COVER_WINDOW + 10));
@@ -364,12 +381,14 @@ mod tests {
     fn a_recent_cover_is_kept() {
         let index = index();
         let mut cursor = LogCursor::new();
-        apply_one(&index, &mut cursor, &range(1, COVER_WINDOW)).expect("apply");
+        apply_one(&index, &mut cursor, &range(1, COVER_WINDOW), &[]).expect("apply");
 
         cursor.prune_covers(Lsn(COVER_WINDOW + 1));
 
         assert_eq!(cursor.range_count(), 1);
-        assert!(!apply_one(&index, &mut cursor, &data(1, COVER_WINDOW - 1, 2)).expect("apply"));
+        assert!(
+            !apply_one(&index, &mut cursor, &data(1, COVER_WINDOW - 1, 2), &[]).expect("apply")
+        );
     }
 
     // a pass that has seen nothing far enough along prunes nothing
@@ -377,21 +396,21 @@ mod tests {
     fn an_early_pass_prunes_nothing() {
         let index = index();
         let mut cursor = LogCursor::new();
-        apply_one(&index, &mut cursor, &range(1, 5)).expect("apply");
+        apply_one(&index, &mut cursor, &range(1, 5), &[]).expect("apply");
 
         cursor.prune_covers(Lsn(7));
 
         assert_eq!(cursor.range_count(), 1);
     }
 
-    // a reader past the ceiling says so rather than quietly dropping a cover
+    // a reader past the ceiling reports saturation
     #[test]
     fn too_many_covers_saturates() {
         let index = index();
         let mut cursor = LogCursor::new();
 
         for at in 0..=MAX_COVERS as u64 {
-            apply_one(&index, &mut cursor, &range(1, COVER_WINDOW + at + 1)).expect("apply");
+            apply_one(&index, &mut cursor, &range(1, COVER_WINDOW + at + 1), &[]).expect("apply");
         }
 
         assert!(
@@ -400,19 +419,19 @@ mod tests {
         );
     }
 
-    // a relocation repoints the key rather than being taken for a stale write
+    // a relocation repoints the key to its new place
     #[test]
     fn a_relocation_repoints() {
         let index = index();
         let mut cursor = LogCursor::new();
-        apply_one(&index, &mut cursor, &data(1, 5, 1)).expect("apply");
+        apply_one(&index, &mut cursor, &data(1, 5, 1), &[]).expect("apply");
 
         let moved = WalkedRecord {
             flags: Flags::DATA.relocated(),
             loc: Loc::new(SegmentId(9), 4096, 100),
             ..data(1, 5, 9)
         };
-        assert!(apply_one(&index, &mut cursor, &moved).expect("apply"));
+        assert!(apply_one(&index, &mut cursor, &moved, &[]).expect("apply"));
 
         let entry = index.get(&key(1)).expect("read").expect("present");
         assert_eq!(entry.loc.segment, SegmentId(9));
@@ -424,7 +443,7 @@ mod tests {
     fn tombstones_follow_their_order() {
         let index = index();
         let mut cursor = LogCursor::new();
-        apply_one(&index, &mut cursor, &data(1, 5, 1)).expect("apply");
+        apply_one(&index, &mut cursor, &data(1, 5, 1), &[]).expect("apply");
 
         let stale = WalkedRecord {
             flags: Flags::TOMBSTONE,
@@ -435,9 +454,9 @@ mod tests {
             ..data(1, 6, 1)
         };
 
-        assert!(!apply_one(&index, &mut cursor, &stale).expect("apply"));
+        assert!(!apply_one(&index, &mut cursor, &stale, &[]).expect("apply"));
         assert!(index.contains(&key(1)).expect("read"));
-        assert!(apply_one(&index, &mut cursor, &fresh).expect("apply"));
+        assert!(apply_one(&index, &mut cursor, &fresh, &[]).expect("apply"));
         assert!(!index.contains(&key(1)).expect("read"));
     }
 

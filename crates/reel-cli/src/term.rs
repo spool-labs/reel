@@ -1,9 +1,4 @@
-//! What kind of thing is on the other end of the output
-//!
-//! The engine renders into whatever style it is handed and reads no terminal of
-//! its own, so deciding whether there is a person out there is this binary's
-//! job. A pipe, a file and a CI log all get the plain form, because escape
-//! sequences in a captured log are noise a reader cannot turn off.
+//! Decides whether output goes to a person, so pipes, files and CI logs stay plain
 
 use std::io::{IsTerminal, Stderr, Stdout};
 
@@ -11,7 +6,7 @@ use clap::ValueEnum;
 
 use reel::report::Style;
 
-/// Whether output may be dressed, where the caller wants a say
+/// When output may be coloured and framed
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 #[clap(rename_all = "lowercase")]
 pub enum ColorChoice {
@@ -19,7 +14,7 @@ pub enum ColorChoice {
     #[default]
     Auto,
 
-    /// Dressed whatever it is writing to, for a pager that renders escapes
+    /// Always dressed, for a pager that renders escapes
     Always,
 
     /// Never dressed
@@ -27,23 +22,18 @@ pub enum ColorChoice {
 }
 
 impl ColorChoice {
-    /// Whether this choice dresses output going to the given stream
+    /// Whether to dress output, given whether the stream is a terminal
     fn dresses(self, tty: bool) -> bool {
         match self {
             ColorChoice::Always => true,
             ColorChoice::Never => false,
-            // NO_COLOR is honoured whatever its value, which is what the
-            // convention asks: setting it at all is the request.
+            // Setting NO_COLOR to any value turns colour off
             ColorChoice::Auto => tty && std::env::var_os("NO_COLOR").is_none(),
         }
     }
 }
 
-/// The style a report going to standard output should be rendered in
-///
-/// Measured on the stream the report is written to, not on the other one: a
-/// frame drawn to a wide stdout while stderr is redirected would otherwise be
-/// sized from the fallback and sit narrow in the middle of the terminal.
+/// The style for a report on standard output, sized from standard output's width
 pub fn style(choice: ColorChoice, out: &Stdout) -> Style {
     match choice.dresses(out.is_terminal()) {
         true => Style::rich(columns(libc::STDOUT_FILENO)),
@@ -63,18 +53,7 @@ pub struct Watch {
     pub width: usize,
 }
 
-/// What a progress bar on standard error is allowed to do
-///
-/// Progress goes to standard error so that a report piped into a file or into
-/// `jq` arrives clean, and it is drawn only where somebody is actually watching:
-/// a bar repaints in place, so a redirected stream collects every frame of it as
-/// a line of its own. `--color always` is a request about colour and not about
-/// that, so it cannot force a bar into a pipe the way it can force an escape
-/// sequence into one.
-///
-/// Painting is asked separately, because moving the cursor and colouring are two
-/// different requests: a bar that erases itself is how it stays out of the
-/// scrollback, and `NO_COLOR` is about the colour it would otherwise paint with.
+/// Progress bar settings, drawn only on a terminal stderr unless --color never
 pub fn watch(choice: ColorChoice, err: &Stderr) -> Watch {
     let tty = err.is_terminal();
     Watch {

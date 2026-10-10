@@ -1,7 +1,4 @@
-//! A log-structured key-value store engine
-//!
-//! One append-only log of segment files over one or more volumes, holding every
-//! column behind an index and serving them behind the store trait.
+//! A log-structured key-value store engine over append-only segment files
 
 pub mod append;
 pub mod compaction;
@@ -18,36 +15,29 @@ pub mod sync;
 pub mod units;
 
 pub use reel_core::{
-    BatchOp, CfDiskUsage, Column, Direction, DiskVolume, Error as StoreError, KeyValue,
-    Result as StoreResult, Store, StoreIter, StoreVolume, TypedStore, Value, WriteBatch,
+    BatchOp, CfDiskUsage, Direction, DiskVolume, Error as StoreError, KeyValue,
+    Result as StoreResult, Store, StoreIter, StoreVolume, Value, WriteBatch,
 };
 
-pub use append::{
-    Appender, BatchRecord, BatchWrite, Committed, CopyRecord, DrainDepth, Durability, FlushTurn,
-};
+pub use append::{Appender, BatchRecord, BatchWrite, Committed, CopyRecord, Durability, FlushTurn};
 pub use compaction::compactor::{CompactionCounters, Compactor, EraseReport};
-pub use compaction::merge::MergeReport;
+pub use compaction::keymerge::MergeReport;
 pub use compaction::pressure::{GcPressure, GcTier, RateLimiter};
 pub use config::{
-    CompactRate, FenceResidency, HotIndex, IndexResidency, IoBackend, PointReads, Preallocate,
-    RangedReads, ReelConfig, RepairPath, RingTuning, ShardShapes, SyncPolicy, ThreadBudget,
+    CompactRate, IoBackend, ReelConfig, RepairPath, RingTuning, SyncPolicy, ThreadBudget,
     VolumeClass, VolumeSpec, DEFAULT_FD_CACHE, MAP_EVERYTHING,
 };
-pub use engine::index_checkpoint::IndexCheckpoint;
 pub use engine::{CompactPass, RecordWrite, ReelStore, Totals};
 pub use error::{ReelError, Result};
-pub use format::band::Band;
 pub use format::column::{
-    Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyRef, KeyWidth, MapShape, PurgeMark,
-    RecordKey, INLINE_KEY_LEN, MARK_LEN, MAX_KEY_LEN, SHORT_KEY_LEN,
+    Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyRef, KeyWidth, PurgeMark, RecordKey,
+    INLINE_KEY_LEN, MARK_LEN, MAX_KEY_LEN, SHORT_KEY_LEN,
 };
 pub use index::counters::{ProbeCounts, ReadCounters, SegmentBytes, SegmentTable};
 pub use index::entry::Entry;
 pub use index::lockfile::OwnershipLock;
 pub use index::map::ReelIndex;
-pub use index::opentable::OpenTable;
 pub use index::page::KeyPage;
-pub use index::persisted::PersistedIndex;
 pub use index::playback::{PlaybackCursor, Way};
 pub use index::recovery::{rebuild_reel, RebuiltReel};
 pub use io::ServingBackend;

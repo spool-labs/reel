@@ -1,10 +1,5 @@
 //! Crash point enumeration for the reel store
-//!
-//! Representative streams are driven over the simulator and crashed before every io
-//! boundary in turn, then reopened, and after each reopen the constant time counters
-//! must equal a from scratch scan of what the reel serves. Torn footers and partial
-//! seals are out of reach here, since a footer is only written by an explicit seal the
-//! public engine surface does not expose.
+//! Each stream crashes before every io boundary, reopens, and must match a full scan
 
 #[allow(dead_code)]
 mod harness;
@@ -12,49 +7,41 @@ mod harness;
 use std::collections::{BTreeMap, BTreeSet};
 
 use reel::format::column::RecordKey;
-use reel::format::record::{BatchFrame, RecordHeader, HEADER_LEN};
+use reel::format::journal::{read_groups, rows_region};
+use reel::format::record::KEYLESS_PREFIX;
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::{
-    ByteCount, CompactPass, CompactRate, Preallocate, RecordWrite, ReelConfig, ReelStore,
-    RepairPath, ShardShapes, SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
+    ByteCount, RecordWrite, ReelConfig, ReelStore, RepairPath, SyncPolicy, ThreadBudget,
+    SEGMENT_SUFFIX,
 };
-use reel_core::{Store, Value};
+use reel_core::{Direction, Store, Value};
 use reel_mock::MemoryStore;
 
-use harness::fixture::OPEN_COLUMNS;
 use harness::observe::observe;
 use harness::op_stream::{self, StreamOp};
 use harness::reel_harness::{assert_recount, flip_largest_segment, ReelHarness};
-use harness::wire::{apply_mutation, framed_value, group_prefix, wire_key, RECORDS, RECORDS_CF};
+use harness::wire::{
+    apply_mutation, framed_value, group_prefix, wire_key, RECORDS, RECORDS_CF, RECORD_KEY_LEN,
+    TEST_COLUMNS,
+};
 
-/// Group most targeted tests write into
+/// A sync on every write, for tests that need each one durable
+const EVERY_WRITE: SyncPolicy = SyncPolicy::Bytes(ByteCount::from_bytes(0));
+
+/// Most targeted tests write into this group
 const GROUP: u16 = 7;
 
-/// Seeds the general enumeration draws its streams from
-///
-/// Every boundary of a stream is crashed at and each crash replays the stream from the
-/// start, so a stream costs the square of its length while a seed costs one stream.
+/// The general enumeration draws its streams from these seeds
 const CRASH_SEEDS: &[u64] = &[1, 42, 7, 1337];
 
-/// Length of each general enumeration stream, quadratic in what it costs to raise
+/// Length of each general enumeration stream, whose cost grows with its square
 const CRASH_LEN: usize = 5;
 
-/// Seeds the multi tail enumerations draw their streams from
-///
-/// At four tails the variable is the configuration rather than the stream: what four
-/// tails add is the version guard ordering records several appenders committed
-/// independently.
+/// The multi tail enumerations draw their streams from these seeds
 const MULTI_TAIL_SEEDS: &[u64] = &[1, 42];
 
-/// Seeds the index checkpoint enumeration draws its stream from
-///
-/// One, because the checkpoint is most of the io the stream crosses: a cue seals every
-/// tail and the file is written, synced and published, and every boundary is a replay.
-const CHECKPOINT_SEEDS: &[u64] = &[1];
-
-/// Seeds the scatter enumeration draws its streams from, narrower because scatter
-/// already replays every stream at two sector sizes
+/// The scatter enumeration draws its streams from these seeds
 const SCATTER_SEEDS: &[u64] = &[1, 42];
 
 /// Segment size that rolls a few times over a short stream
@@ -62,9 +49,6 @@ const SEGMENT_SMALL: u64 = 16 * 1024;
 
 /// Segment size large enough that a short run never rolls
 const SEGMENT_LARGE: u64 = 1024 * 1024;
-
-/// Space reserved ahead of the write head per allocation step
-const ALLOC_CHUNK: u64 = 4 * 1024;
 
 /// A small payload for the targeted streams
 const SMALL_PAYLOAD: usize = 200;
@@ -75,55 +59,58 @@ const LARGE_PAYLOAD: usize = 20_000;
 /// Segment size that rolls right after one large record
 const SEGMENT_TIGHT: u64 = 24 * 1024;
 
-/// First op position the sync error search schedules at
+/// Payload bytes that fill a small segment in three records, so a short stream seals often
+const SEAL_PAYLOAD: usize = 5_000;
+
+/// The sync error search starts at this op position
 const SYNC_ERROR_FROM: u64 = 4;
 
-/// Last op position the sync error search schedules at
+/// The sync error search ends at this op position
 const SYNC_ERROR_TO: u64 = 20;
 
-/// First op position the out of space fault is scheduled at
-const ENOSPC_FROM: u64 = 8;
+/// The out of space fault starts at this op position
+const ENOSPC_FROM: u64 = 12;
 
-/// Last op position the out of space fault is scheduled at
-const ENOSPC_TO: u64 = 24;
+/// The out of space fault ends at this op position
+const ENOSPC_TO: u64 = 28;
 
 /// Overwrites of one key for the multi tail stream
 const OVERWRITE_COUNT: u8 = 6;
 
-/// Payload length every version of the multi tail key carries
+/// Payload length of every version of the multi tail key
 const SAME_KEY_LEN: usize = 200;
 
 /// Segment size that holds several compaction records before it rolls
-///
-/// The fill records plus the segment header reach this size, so the first overwrite is
-/// what rolls the segment, leaving it half shadowed and worth compacting.
 const COMPACT_SEG_BYTES: u64 = 20 * 1024;
 
-/// Payload length each compaction record carries
+/// Payload length of each compaction record
 const COMPACT_PAYLOAD: usize = 3000;
 
 /// Records written into the compaction source segment before overwrites
 const COMPACT_FILL: u8 = 4;
 
-/// Segment size the merge stream rolls a run out of
+/// The merge stream rolls a segment of this size, about one round of its keys
 const MERGE_SEG_BYTES: u64 = 20 * 1024;
 
-/// Keys the merge stream writes per round
+/// The merge stream writes this many keys per round
 const MERGE_KEYS: u8 = 6;
 
-/// Payload each of those keys carries
-const MERGE_PAYLOAD: usize = 900;
+/// Payload length of each merge key
+const MERGE_PAYLOAD: usize = 3000;
 
-/// The key the merge stream deletes, which is the resurrection gate
+/// Rounds over every key before the delete, a sealed segment each, past the merge depth
+const MERGE_ROUNDS: u8 = 12;
+
+/// Rounds over the kept keys after the delete, enough to seal the segment holding it
+const MERGE_AFTER_ROUNDS: u8 = 2;
+
+/// The key the merge stream deletes, which must stay deleted
 const MERGE_DELETED: u8 = 3;
 
 /// The keys that must still read back after a crash inside the merge
 const MERGE_KEPT: &[u8] = &[1, 2, 4, 5, 6];
 
-/// Rewrite passes the merge setup drives before it gives up on the volume settling
-const MERGE_SETTLE_PASSES: u32 = 64;
-
-/// Keys the sub group range delete stream writes before it deletes
+/// The sub group range delete stream writes this many keys first
 const RANGE_KEYS: u8 = 9;
 
 /// First address the sub group range delete covers
@@ -132,18 +119,12 @@ const RANGE_LO: u8 = 3;
 /// First address past the sub group range delete
 const RANGE_HI: u8 = 7;
 
-/// Sector sizes a scattered crash is replayed at
-///
-/// At block size a hole takes a whole aligned block, so a header and whatever packs in
-/// behind it go together. The smaller size is where the model gets stronger than a torn
-/// prefix: a hole can drop a payload while keeping its header, or land inside a payload.
+/// A scattered crash replays at each of these sector sizes
 const SCATTER_SECTORS: [u32; 2] = [512, 4096];
 
 fn crash_config(active_tails: u32, sync: SyncPolicy, segment_bytes: u64) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(segment_bytes),
-        alloc_chunk: ByteCount::from_bytes(ALLOC_CHUNK),
-        preallocate: Preallocate::Chunk,
         sync,
         active_tails: ThreadBudget::threads(active_tails),
         ..ReelConfig::default()
@@ -160,10 +141,7 @@ fn put(group: u16, address: u8, len: usize, fill: u8) -> StreamOp {
 }
 
 fn enumerate(config: ReelConfig, ops: &[StreamOp], seed: u64, durable: bool) {
-    enumerate_over(ReelHarness::new(config), ops, seed, durable);
-}
-
-fn enumerate_over(harness: ReelHarness, ops: &[StreamOp], seed: u64, durable: bool) {
+    let harness = ReelHarness::new(config);
     let total = harness.boundary_count(ops);
     assert!(total > 0, "the stream crosses no io boundary");
 
@@ -183,7 +161,7 @@ fn every_boundary_single_tail() {
     for seed in CRASH_SEEDS {
         let ops = op_stream::generate_durable(*seed, CRASH_LEN);
         enumerate(
-            crash_config(1, SyncPolicy::EveryPut, SEGMENT_SMALL),
+            crash_config(1, EVERY_WRITE, SEGMENT_SMALL),
             &ops,
             *seed,
             true,
@@ -197,7 +175,7 @@ fn every_boundary_multi_tail() {
     for seed in MULTI_TAIL_SEEDS {
         let ops = op_stream::generate_durable(*seed, CRASH_LEN);
         enumerate(
-            crash_config(4, SyncPolicy::EveryPut, SEGMENT_SMALL),
+            crash_config(4, EVERY_WRITE, SEGMENT_SMALL),
             &ops,
             *seed,
             true,
@@ -205,53 +183,7 @@ fn every_boundary_multi_tail() {
     }
 }
 
-// every crash boundary reproduces the durable prefix into open-addressed shards
-//
-// The other side of the reopen: a rebuild lands each shard's keys in one bulk pass, and
-// crashing mid-write makes that pass absorb a different run at every boundary.
-#[test]
-fn every_boundary_open_shards() {
-    for seed in MULTI_TAIL_SEEDS {
-        let ops = op_stream::generate_durable(*seed, CRASH_LEN);
-        let config = ReelConfig {
-            shard_shapes: ShardShapes::Declared,
-            ..crash_config(1, SyncPolicy::EveryPut, SEGMENT_SMALL)
-        };
-        enumerate_over(
-            ReelHarness::with_columns(config, OPEN_COLUMNS),
-            &ops,
-            *seed,
-            true,
-        );
-    }
-}
-
-// every crash boundary of a stream that writes its index down reproduces the prefix
-//
-// A crash mid-write leaves a half file the reopen must refuse, and a crash after it
-// leaves a whole file describing a volume the rest of the stream has moved past, so the
-// segments it vouches for have to be exactly the ones still standing unchanged.
-#[test]
-fn every_boundary_across_an_index_checkpoint() {
-    for seed in CHECKPOINT_SEEDS {
-        let ops = op_stream::generate_durable(*seed, CRASH_LEN);
-        let config = crash_config(1, SyncPolicy::EveryPut, SEGMENT_SMALL);
-        let harness = ReelHarness::new(config);
-        let after = ops.len() / 2;
-        let total = harness.boundary_count_across_index_checkpoint(&ops, after);
-        assert!(total > 0, "the stream crosses no io boundary");
-
-        for crash_at in 0..total {
-            let plan = FaultPlan::new(*seed).with_crash(crash_at);
-            let (sim, acknowledged) = harness.run_across_index_checkpoint(plan, &ops, after);
-            let reopened = harness.reopen(sim.durable_image());
-            assert_recount(&reopened, crash_at);
-            assert_durable_prefix(&reopened, &ops, acknowledged, crash_at);
-        }
-    }
-}
-
-// under the never policy a crash keeps or drops the last records, both consistent
+// under `SyncPolicy::Never` a crash keeps or drops the last records, both consistent
 #[test]
 fn every_boundary_never() {
     for seed in CRASH_SEEDS {
@@ -266,14 +198,11 @@ fn every_boundary_never() {
 }
 
 // every crash boundary reproduces the acknowledged prefix when sectors scatter
-//
-// A device does not lose a clean suffix: what it had not committed comes back in
-// whatever order it scheduled, so the image can hold a fresh sector after a stale one.
 #[test]
 fn scattered_crash_keeps_the_durable_prefix() {
     for (seed, sector) in seeds_and_sectors() {
         let ops = op_stream::generate_durable(seed, CRASH_LEN);
-        let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, SEGMENT_SMALL));
+        let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, SEGMENT_SMALL));
         let total = harness.boundary_count(&ops);
         assert!(total > 0, "the stream crosses no io boundary");
 
@@ -297,9 +226,6 @@ fn scattered_crash_keeps_the_durable_prefix() {
 }
 
 // a scattered crash with the hot path unsynced still reopens self consistent
-//
-// Nothing was promised durable here, so records may be missing in any pattern. What may
-// not happen is the reel disagreeing with itself about what it serves.
 #[test]
 fn scattered_crash_stays_consistent() {
     for (seed, sector) in seeds_and_sectors() {
@@ -325,20 +251,14 @@ fn scattered_crash_stays_consistent() {
     }
 }
 
-// on a sole copy no crash schedule leaves a footer naming unlanded bytes
-//
-// The peerless seal syncs the records before the footer that speaks for them. With
-// peers a resolved key whose bytes never landed is a checksum miss that enqueues a
-// repair; on a sole copy it would be silent loss.
+// on a sole copy no crash schedule leaves a footer pointing at bytes that never landed
 #[test]
 fn a_sole_copy_footer_never_outlives_its_records() {
-    // Each record rolls the tight segment, so the stream crosses several seals. A stream
-    // that never seals makes this sweep pass for any ordering at all.
+    // Each record rolls the tight segment, so the stream crosses several seals
     let ops: Vec<StreamOp> = (1..=5u8)
         .map(|address| put(GROUP, address, LARGE_PAYLOAD, address))
         .collect();
-    // One seed, both sectors: the schedule variety here is the sector size and the
-    // per-file scatter hash.
+    // One seed at both sector sizes
     for (seed, sector) in seeds_and_sectors().into_iter().take(SCATTER_SECTORS.len()) {
         let sole = ReelConfig {
             verify_reads: true,
@@ -361,13 +281,118 @@ fn a_sole_copy_footer_never_outlives_its_records() {
     }
 }
 
+/// A stream that seals several times, leaving keys with versions in more than one segment
+fn sealing_stream() -> Vec<StreamOp> {
+    let mut ops: Vec<StreamOp> = (1..=5u8)
+        .map(|address| put(GROUP, address, SEAL_PAYLOAD, address))
+        .collect();
+    ops.push(StreamOp::Overwrite {
+        group: GROUP,
+        address: 2,
+        len: SEAL_PAYLOAD,
+        fill: 20,
+    });
+    ops.push(StreamOp::Delete {
+        group: GROUP,
+        address: 3,
+    });
+    ops.push(put(GROUP, 6, SEAL_PAYLOAD, 6));
+    ops.push(StreamOp::Overwrite {
+        group: GROUP,
+        address: 4,
+        len: SEAL_PAYLOAD,
+        fill: 40,
+    });
+    ops
+}
+
+// every crash boundary of a paged stream reopens with the spot index answering as the footers do
+#[test]
+fn every_boundary_spot_index_answers_as_the_footers() {
+    let ops = sealing_stream();
+    let keys: Vec<RecordKey> = (1..=6u8)
+        .map(|address| RecordKey::from_bytes(RECORDS, &wire_key(GROUP, address)).expect("key"))
+        .collect();
+    // Unsynced, since the test compares the two read paths over whatever landed
+    let paged = crash_config(1, SyncPolicy::Never, SEGMENT_SMALL);
+    let harness = ReelHarness::new(paged);
+    let total = harness.boundary_count(&ops);
+    assert!(total > 0, "the stream crosses no io boundary");
+
+    let mut loaded = 0u64;
+    for crash_at in 0..total {
+        let (sim, _) = harness.run(FaultPlan::new(1).with_crash(crash_at), &ops);
+        let reopened = harness.reopen(sim.durable_image());
+        assert_recount(&reopened, crash_at);
+        loaded = loaded.max(reopened.index().spot_held());
+        // A read as of a cue takes the footer search, the answer to match
+        let cue = reopened.cue().expect("cue");
+        for key in &keys {
+            let live = reopened.get(key).expect("get").map(|value| value.to_vec());
+            let footers = reopened
+                .get_at(key, &cue)
+                .expect("cue read")
+                .map(|value| value.to_vec());
+            assert_eq!(live, footers, "key {key:?} after a crash at {crash_at}");
+        }
+    }
+    assert!(
+        loaded > 0,
+        "no reopen loaded the spot index, so the comparison proved nothing"
+    );
+}
+
+// every crash boundary of a paged stream reopens with its walks answering as the gets do
+#[test]
+fn every_boundary_walks_answer_as_the_gets() {
+    let ops = sealing_stream();
+    let keys: Vec<Vec<u8>> = (1..=6u8).map(|address| wire_key(GROUP, address)).collect();
+    let paged = crash_config(1, SyncPolicy::Never, SEGMENT_SMALL);
+    let harness = ReelHarness::with_columns(paged, TEST_COLUMNS);
+    let total = harness.boundary_count(&ops);
+    assert!(total > 0, "the stream crosses no io boundary");
+
+    for crash_at in 0..total {
+        let (sim, _) = harness.run(FaultPlan::new(1).with_crash(crash_at), &ops);
+        let reopened = harness.reopen(sim.durable_image());
+        let mut want: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for key in &keys {
+            if let Some(value) = Store::get(&reopened, RECORDS_CF, key).expect("get") {
+                want.push((key.clone(), value.to_vec()));
+            }
+        }
+        let up: Vec<(Vec<u8>, Vec<u8>)> = Store::iter(&reopened, RECORDS_CF)
+            .expect("iter")
+            .map(|(key, value)| (key, value.to_vec()))
+            .collect();
+        assert_eq!(up, want, "a walk up after a crash at {crash_at}");
+        let mut down: Vec<(Vec<u8>, Vec<u8>)> = Store::iter_from(
+            &reopened,
+            RECORDS_CF,
+            &[0xFF; RECORD_KEY_LEN],
+            Direction::Desc,
+        )
+        .expect("iter from")
+        .map(|(key, value)| (key, value.to_vec()))
+        .collect();
+        down.reverse();
+        assert_eq!(down, want, "a walk down after a crash at {crash_at}");
+        let alone: Vec<Vec<u8>> = reopened
+            .iter_keys_from(RECORDS_CF, None, Direction::Asc)
+            .expect("keys")
+            .collect();
+        let want_keys: Vec<Vec<u8>> = want.iter().map(|(key, _)| key.clone()).collect();
+        assert_eq!(alone, want_keys, "a key walk after a crash at {crash_at}");
+    }
+}
+
 // a scattered crash across four tails keeps the acknowledged prefix too
 #[test]
 fn scattered_crash_multi_tail() {
     for seed in SCATTER_SEEDS.iter().copied() {
         let sector = SCATTER_SECTORS[0];
         let ops = op_stream::generate_durable(seed, CRASH_LEN);
-        let harness = ReelHarness::new(crash_config(4, SyncPolicy::EveryPut, SEGMENT_SMALL));
+        let harness = ReelHarness::new(crash_config(4, EVERY_WRITE, SEGMENT_SMALL));
         let total = harness.boundary_count(&ops);
 
         let mut at_risk = 0u64;
@@ -389,11 +414,7 @@ fn scattered_crash_multi_tail() {
     }
 }
 
-// a hole inside a record is rejected rather than served with the bytes that survived
-//
-// A payload spanning many sectors keeps a header that still describes its record while
-// the bytes behind it are only partly committed. Nothing structural says that record is
-// bad, so recovery has to reject it on its checksum.
+// a record with a hole inside it is rejected on its checksum
 #[test]
 fn scattered_hole_inside_a_record_is_rejected() {
     let ops: Vec<StreamOp> = (1..=4u8)
@@ -422,14 +443,11 @@ fn scattered_hole_inside_a_record_is_rejected() {
 }
 
 // every crash boundary of a sub group range delete leaves each key whole or gone
-//
-// A range inside a group walks the keys and appends a tombstone for each, so a crash
-// lands between tombstones and half applies the delete, which is allowed.
 #[test]
 fn every_boundary_of_a_sub_group_range_delete() {
-    // A fixed stream rather than a generated one, so a seed only names the plan.
+    // A fixed stream, so the seed only drives the fault plan
     let ops = sub_range_stream();
-    let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, SEGMENT_LARGE));
+    let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, SEGMENT_LARGE));
     let total = harness.boundary_count(&ops);
     assert!(total > 0, "the stream crosses no io boundary");
 
@@ -456,10 +474,7 @@ fn sub_range_stream() -> Vec<StreamOp> {
     ops
 }
 
-// Assert the keys the range never covered are untouched by however far it got
-//
-// Only the puts that acknowledged before the crash are expected at all, since under
-// this policy an acknowledged put is a durable one and the rest never happened.
+// Assert the keys outside the range survive, for each put acknowledged before the crash
 fn assert_outside_the_range_survives(reopened: &ReelStore, acknowledged: usize, context: u64) {
     for byte in 0..RANGE_KEYS {
         if (RANGE_LO..RANGE_HI).contains(&byte) || usize::from(byte) >= acknowledged {
@@ -477,9 +492,8 @@ fn assert_outside_the_range_survives(reopened: &ReelStore, acknowledged: usize, 
 // a sync error rejects the put and keeps every acknowledged record consistent
 #[test]
 fn sync_error() {
-    // The op a sync lands on moves whenever the open sequence changes, so the scheduled
-    // position is searched for rather than pinned.
-    let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, SEGMENT_LARGE));
+    // The op a sync lands on shifts with the open sequence, so the fault position is searched
+    let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, SEGMENT_LARGE));
     let mut proven = false;
 
     for at in SYNC_ERROR_FROM..=SYNC_ERROR_TO {
@@ -552,42 +566,28 @@ fn enospc_append() {
     }
 }
 
-/// Addresses the batch that survives every torn-batch arm carries
+/// The batch at these addresses survives every torn-batch arm
 const KEPT_BATCH: &[u8] = &[1, 2, 3];
 
-/// Addresses the batch that is torn in every torn-batch arm
+/// The batch at these addresses tears in every torn-batch arm
 const TORN_BATCH: &[u8] = &[4, 5, 6];
 
 /// Address of the point write standing between the two batches
 const NEIGHBOUR: u8 = 9;
 
 /// Where inside a batch a write is cut off
-///
-/// The frame, the first record, one in the middle and the last: a writev that stopped
-/// at any of them leaves a run that must not be applied at all.
 #[derive(Clone, Copy, Debug)]
 enum Tear {
-    Frame,
     FirstRecord,
     MidBatch,
     LastRecord,
 }
 
 // a batch cut off part way through leaves nothing of itself behind
-//
-// The reservation is one range and the write is one writev, so a crash inside it lands
-// at some byte of the run and the bytes past it stay the zeros the tail reserved. The
-// frame is what recovery reads that by: it declares how many records follow and how
-// many bytes they take, so a run that stops short is dropped whole.
 #[test]
 fn a_torn_batch_leaves_nothing_of_itself() {
-    for tear in [
-        Tear::Frame,
-        Tear::FirstRecord,
-        Tear::MidBatch,
-        Tear::LastRecord,
-    ] {
-        let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, SEGMENT_LARGE));
+    for tear in [Tear::FirstRecord, Tear::MidBatch, Tear::LastRecord] {
+        let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, SEGMENT_LARGE));
         let sim = SimIo::new(FaultPlan::new(1));
         let store = harness.open_or_panic(sim.clone());
         store
@@ -599,8 +599,7 @@ fn a_torn_batch_leaves_nothing_of_itself() {
             .expect("the batch that tears");
         store.flush().expect("flush");
 
-        // Taken with the store still open, so the tail is unsealed and is walked back
-        // rather than read from a footer.
+        // The image is taken with the store open, so recovery walks the unsealed tail
         let mut image = sim.durable_image();
         cut_the_last_batch(&mut image, tear);
         let reopened = harness.reopen(image);
@@ -625,14 +624,11 @@ fn a_torn_batch_leaves_nothing_of_itself() {
     }
 }
 
-// a torn batch carrying a range delete applies neither the range nor its puts
-//
-// The range is a record of the run like any other, so the crash that drops the run
-// drops the delete with it and the keys it covered are still there.
+// a torn batch holding a range delete applies neither the range nor its puts
 #[test]
 fn a_torn_range_batch_applies_neither_half() {
-    for tear in [Tear::Frame, Tear::MidBatch, Tear::LastRecord] {
-        let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, SEGMENT_LARGE));
+    for tear in [Tear::FirstRecord, Tear::MidBatch, Tear::LastRecord] {
+        let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, SEGMENT_LARGE));
         let sim = SimIo::new(FaultPlan::new(1));
         let store = harness.open_or_panic(sim.clone());
         for address in 0..RANGE_KEYS {
@@ -668,7 +664,7 @@ fn a_torn_range_batch_applies_neither_half() {
     }
 }
 
-/// The puts one batch carries, one small record an address
+/// One small put per address, as one batch's writes
 fn puts(addresses: &[u8]) -> Vec<RecordWrite> {
     addresses
         .iter()
@@ -679,75 +675,49 @@ fn puts(addresses: &[u8]) -> Vec<RecordWrite> {
         .collect()
 }
 
-/// The record key one address of the test group is addressed by
+/// The record key for one address in the test group
 fn address_key(address: u8) -> RecordKey {
     RecordKey::from_bytes(RECORDS, &wire_key(GROUP, address)).expect("key")
 }
 
 /// Cut the last batch of the image at a point inside it, as a stopped write would
-///
-/// Everything from the cut to the end of the segment goes back to the zeros the tail
-/// had reserved there, which is what a writev that never got that far leaves.
 fn cut_the_last_batch(image: &mut DurableImage, tear: Tear) {
     for (path, bytes) in image.iter_mut() {
         if !path.to_string_lossy().ends_with(SEGMENT_SUFFIX) {
             continue;
         }
-        let Some(at) = tear_offset(bytes, tear) else {
+        let Some((rows_at, rows)) = rows_region(bytes) else {
             continue;
         };
-        bytes[at as usize..].fill(0);
+        let Some(at) = tear_offset(rows, tear) else {
+            continue;
+        };
+        // Tear only the records, the rows later in the file stay whole
+        bytes[at as usize..rows_at as usize].fill(0);
         return;
     }
-    panic!("no segment of the image holds a framed batch");
+    panic!("no segment of the image holds a batch");
 }
 
-/// Where in the last batch of a segment a tear falls
-fn tear_offset(bytes: &[u8], tear: Tear) -> Option<u64> {
-    let (frame_at, frame) = last_frame(bytes)?;
-    let run_at = frame_at + BatchFrame::SPAN;
-    let mut starts = Vec::new();
-    let mut at = run_at;
-    while at < run_at + frame.span {
-        let header = RecordHeader::unpack(&bytes[at as usize..]).ok()?;
-        starts.push(at);
-        at += header.span();
-    }
-    let last = *starts.last()?;
+/// Find the tear's offset inside the journal's last batch
+fn tear_offset(journal: &[u8], tear: Tear) -> Option<u64> {
+    let (groups, _) = read_groups(journal);
+    let batch = groups.into_iter().rev().find(|group| group.len() > 1)?;
+    let mut starts: Vec<u64> = batch.iter().map(|row| u64::from(row.offset)).collect();
+    starts.sort_unstable();
+    // Past a record's own check, so the bytes that tear are its payload
+    let inside = KEYLESS_PREFIX as u64;
     Some(match tear {
-        // Inside the declaration, which the frame's own checksum covers.
-        Tear::Frame => frame_at + HEADER_LEN as u64 + 2,
-        Tear::FirstRecord => run_at + HEADER_LEN as u64,
+        Tear::FirstRecord => starts[0] + inside,
         Tear::MidBatch => starts[starts.len() / 2],
-        Tear::LastRecord => last + HEADER_LEN as u64,
+        Tear::LastRecord => *starts.last()? + inside,
     })
-}
-
-/// The last batch frame a segment holds, and where it sits
-fn last_frame(bytes: &[u8]) -> Option<(u64, BatchFrame)> {
-    let mut found = None;
-    let mut at = 0u64;
-    while at + HEADER_LEN as u64 <= bytes.len() as u64 {
-        let Ok(header) = RecordHeader::unpack(&bytes[at as usize..]) else {
-            break;
-        };
-        if header.is_unwritten() || !header.fits_within(bytes.len() as u64 - at) {
-            break;
-        }
-        if header.flags.is_batch_frame() {
-            let from = (at + header.prefix_len()) as usize;
-            let declaration = &bytes[from..from + header.length as usize];
-            found = BatchFrame::unpack(&header, declaration).map(|frame| (at, frame));
-        }
-        at += header.span();
-    }
-    found
 }
 
 // a read time checksum failure treats a corrupted record as missing and stays consistent
 #[test]
 fn bit_rot() {
-    let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, SEGMENT_TIGHT));
+    let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, SEGMENT_TIGHT));
     let sim = SimIo::new(FaultPlan::new(1));
     let store = harness.open_or_panic(sim.clone());
     apply_mutation(&store, &put(GROUP, 1, LARGE_PAYLOAD, 1)).expect("large put");
@@ -778,7 +748,7 @@ fn bit_rot() {
 // a crash under multi tail same key traffic recovers by highest version
 #[test]
 fn multi_tail_same_key() {
-    let harness = ReelHarness::new(crash_config(4, SyncPolicy::EveryPut, SEGMENT_LARGE));
+    let harness = ReelHarness::new(crash_config(4, EVERY_WRITE, SEGMENT_LARGE));
     let ops = same_key_stream(OVERWRITE_COUNT);
     let total = harness.boundary_count(&ops);
     assert!(total > 0, "the stream crosses no io boundary");
@@ -803,7 +773,7 @@ fn multi_tail_same_key() {
 // a crash mid group drop rebuilds the rest and a re drop is idempotent
 #[test]
 fn group_drop() {
-    let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, SEGMENT_LARGE));
+    let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, SEGMENT_LARGE));
     let ops = drop_stream();
     let total = harness.boundary_count(&ops);
     assert!(total > 0, "the stream crosses no io boundary");
@@ -830,7 +800,7 @@ fn group_drop() {
 // a crash in the middle of a compaction rewrite keeps the live key and restarts
 #[test]
 fn mid_compaction() {
-    let harness = ReelHarness::new(crash_config(1, SyncPolicy::EveryPut, COMPACT_SEG_BYTES));
+    let harness = ReelHarness::new(crash_config(1, EVERY_WRITE, COMPACT_SEG_BYTES));
 
     let probe_sim = SimIo::new(FaultPlan::new(0));
     let probe = harness.open_or_panic(probe_sim.clone());
@@ -863,27 +833,22 @@ fn mid_compaction() {
     }
 }
 
-// a crash in the middle of a merge keeps every live key and keeps the deleted one dead
-//
-// The sources stay the authority until the output is sealed and the repoints published,
-// so a reopen has to land on one side of that or the other. The delete is the gate: its
-// tombstone rides the merge like any other row, and losing it hands back the version
-// underneath.
+// a crash in the middle of a key merge keeps every live key and keeps the deleted one dead
 #[test]
-fn mid_merge() {
-    let harness = ReelHarness::new(merge_config());
+fn mid_key_merge() {
+    let harness = ReelHarness::new(key_merge_config());
 
     let probe_sim = SimIo::new(FaultPlan::new(0));
     let probe = harness.open_or_panic(probe_sim.clone());
     write_merge_setup(&probe);
     let setup_ops = probe_sim.ops();
-    let report = probe.merge_once().expect("probe merge");
+    let depth = probe.index().overlap_depth();
+    let report = probe.merge_when_due().expect("probe merge");
     let total_ops = probe_sim.ops();
     drop(probe);
     assert!(
-        report.runs_merged >= 2,
-        "the setup left {} runs, so the merge below collapses nothing",
-        report.runs_merged,
+        report.is_some_and(|report| report.runs_merged >= 2),
+        "the setup stacked the walk {depth} deep, so the merge below folds nothing",
     );
     assert!(total_ops > setup_ops, "the merge crossed no io boundary");
 
@@ -891,64 +856,39 @@ fn mid_merge() {
         let sim = SimIo::new(FaultPlan::new(1).with_crash(crash_at));
         let store = harness.open_or_panic(sim.clone());
         write_merge_setup(&store);
-        let _ = store.merge_once();
+        let _ = store.merge_when_due();
         drop(store);
 
         let reopened = harness.reopen(sim.durable_image());
-        assert_recount(&reopened, crash_at);
-        for address in MERGE_KEPT {
-            assert!(
-                merged_value(&reopened, *address).is_some(),
-                "a merged key went missing at {crash_at}",
-            );
-        }
-        assert!(
-            merged_value(&reopened, MERGE_DELETED).is_none(),
-            "a merge crash brought a deleted key back at {crash_at}",
-        );
+        assert_merged_answers(&reopened, crash_at);
 
-        // And the pass restarts, so the crash left a volume a merge can still work on.
-        let _ = reopened.merge_once();
-        assert_recount(&reopened, crash_at);
-        assert!(
-            merged_value(&reopened, MERGE_DELETED).is_none(),
-            "the restarted merge brought a deleted key back at {crash_at}",
-        );
+        // A second merge proves the crash left a volume a merge can still work on
+        let _ = reopened.merge_when_due();
+        assert_merged_answers(&reopened, crash_at);
     }
 }
 
-/// A volume that seals by rewriting and takes a merge when asked
-///
-/// The dead ratio is at one so compaction reclaims only wholly dead segments, which
-/// leaves the runs standing for the merge to collapse. The index stays resident, since a
-/// paged rebuild counts nothing it left in a footer and the recount would then be
-/// measuring the residency instead of the crash.
-fn merge_config() -> ReelConfig {
-    ReelConfig {
-        rewrite_on_seal: true,
-        merge_sorted_runs: true,
-        compact_dead_ratio: 1.0,
-        compact_mbps: CompactRate::Mbps(100_000),
-        ..crash_config(1, SyncPolicy::EveryPut, MERGE_SEG_BYTES)
-    }
+/// A paged volume, where a key merge folds the walk once it stacks past the merge depth
+fn key_merge_config() -> ReelConfig {
+    crash_config(1, EVERY_WRITE, MERGE_SEG_BYTES)
 }
 
-/// Write two rounds of overlapping keys, settling each into a sorted run
-///
-/// The second round rewrites half of the first, so neither run goes wholly dead and both
-/// are standing when the merge arrives. The delete lands last, in its own run.
+/// A key's fill in one round of the merge stream
+fn merge_fill(round: u8, address: u8) -> u8 {
+    round * 16 + address
+}
+
+/// Write rounds over the same keys, then the delete and enough after it to seal it
 fn write_merge_setup(store: &ReelStore) {
-    for address in 1..=MERGE_KEYS {
-        apply_mutation(store, &put(GROUP, address, MERGE_PAYLOAD, address)).expect("first round");
-    }
-    settle_runs(store);
-    for address in 1..=MERGE_KEYS {
-        if address % 2 == 0 {
-            apply_mutation(store, &put(GROUP, address, MERGE_PAYLOAD, address + 100))
-                .expect("second round");
+    for round in 1..=MERGE_ROUNDS {
+        for address in 1..=MERGE_KEYS {
+            apply_mutation(
+                store,
+                &put(GROUP, address, MERGE_PAYLOAD, merge_fill(round, address)),
+            )
+            .expect("round");
         }
     }
-    settle_runs(store);
     apply_mutation(
         store,
         &StreamOp::Delete {
@@ -957,38 +897,55 @@ fn write_merge_setup(store: &ReelStore) {
         },
     )
     .expect("delete");
-    settle_runs(store);
-}
-
-/// Flush, seal and rewrite until the volume has nothing left to put in key order
-fn settle_runs(store: &ReelStore) {
-    store.flush().expect("flush");
-    drop(store.cue().expect("cue"));
-    store.page_out_sealed().expect("page out");
-    for _ in 0..MERGE_SETTLE_PASSES {
-        let pass = store.compact_once().expect("compact");
-        store.flush().expect("flush");
-        store.page_out_sealed().expect("page out");
-        if matches!(pass, CompactPass::Idle) {
-            return;
+    for round in MERGE_ROUNDS + 1..=MERGE_ROUNDS + MERGE_AFTER_ROUNDS {
+        for address in MERGE_KEPT {
+            apply_mutation(
+                store,
+                &put(GROUP, *address, MERGE_PAYLOAD, merge_fill(round, *address)),
+            )
+            .expect("round after the delete");
         }
     }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
 }
 
-/// What one key of the merge stream reads back as
-fn merged_value(store: &ReelStore, address: u8) -> Option<Vec<u8>> {
-    let key = RecordKey::from_bytes(RECORDS, &wire_key(GROUP, address)).expect("key");
-    store
-        .get(&key)
-        .expect("get")
-        .map(|value| value.as_ref().to_vec())
+/// Every key of the merge stream reads back as the last round left it, by get and by walk
+fn assert_merged_answers(store: &ReelStore, crash_at: u64) {
+    let last = MERGE_ROUNDS + MERGE_AFTER_ROUNDS;
+    let want: Vec<(Vec<u8>, Vec<u8>)> = MERGE_KEPT
+        .iter()
+        .map(|address| {
+            (
+                wire_key(GROUP, *address),
+                framed_value(MERGE_PAYLOAD, merge_fill(last, *address)),
+            )
+        })
+        .collect();
+    for (key, value) in &want {
+        let found = Store::get(store, RECORDS_CF, key)
+            .expect("get")
+            .map(|value| value.to_vec());
+        assert_eq!(
+            found.as_ref(),
+            Some(value),
+            "a merged key read back wrong at {crash_at}"
+        );
+    }
+    assert!(
+        Store::get(store, RECORDS_CF, &wire_key(GROUP, MERGE_DELETED))
+            .expect("get")
+            .is_none(),
+        "a merge crash brought a deleted key back at {crash_at}",
+    );
+    let walked: Vec<(Vec<u8>, Vec<u8>)> = Store::iter(store, RECORDS_CF)
+        .expect("iter")
+        .map(|(key, value)| (key, value.to_vec()))
+        .collect();
+    assert_eq!(walked, want, "a walk after a merge crash at {crash_at}");
 }
 
 // Assert every record the reopened reel serves is a version the stream actually wrote
-//
-// A crash may drop any record, so what survives is not fixed, but a surviving record is
-// one that was written. The counters agree with a scan either way and a damaged record
-// is still internally consistent, so this is the only check that catches one.
 fn assert_only_written_values(reopened: &ReelStore, ops: &[StreamOp], context: u64) {
     let mut written: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>> = BTreeMap::new();
     for op in ops {
@@ -1078,8 +1035,7 @@ fn redrop_group(store: &ReelStore) {
     let start = group_prefix(7);
     let end = group_prefix(8);
     Store::delete_range(store, RECORDS_CF, &start, &end).expect("re drop records");
-    // The counters converge at the sweep the maintenance tick runs, so the recount that
-    // follows checks the sweep's own accounting.
+    // The counters converge at the tick's sweep, so the recount checks the sweep's accounting
     while store.sweep_covers().expect("sweep") {}
 }
 
@@ -1094,10 +1050,6 @@ fn get(store: &ReelStore, address: u8) -> Option<Vec<u8>> {
 }
 
 // Assert the reopened reel reproduces the acknowledged prefix on every untouched key
-//
-// A memory store replays the ops that acknowledged before the crash, which under a
-// synced policy are exactly the durable ones. The op that crashed is excluded, since its
-// effect may or may not have reached the durable image.
 fn assert_durable_prefix(
     reopened: &ReelStore,
     ops: &[StreamOp],

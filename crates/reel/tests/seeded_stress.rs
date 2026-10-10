@@ -1,20 +1,5 @@
-//! A seeded walk over both doors, everything drawn from one number
-//!
-//! Caller count, residency, tail count, op mix, batch width, which door each call takes,
-//! futures dropped mid-flight and the fault plan all come from one u64, so a failure is a
-//! seed anyone can replay. Every stall is bounded and panics with the seed.
-//!
-//! What is asserted depends on what the plan drew. An honest plan keeps the strong
-//! invariant: every served payload is whole and was attempted by somebody, and after a
-//! flush a reopen serves exactly what the live store did. A plan that lies about
-//! durability or crashes mid-walk cannot promise equality, so it holds only the
-//! attempted half. DropCompletion is never drawn, since the awaited door has no give-up
-//! for a completion that never comes, so a drawn drop is a hang by design.
-//!
-//! Knobs: REEL_STRESS_OPS and REEL_STRESS_PASSES size one walk, REEL_STRESS_SEEDS with
-//! REEL_STRESS_SHARDS, REEL_STRESS_SHARD and REEL_STRESS_SKIP size and split a campaign,
-//! REEL_STRESS_REPLAY, REEL_STRESS_IMAGE and REEL_STRESS_CROSS drive the replay and
-//! forensics tests, and REEL_STRESS_DEBUG arms the stall watchdog.
+//! A seeded walk over both doors, with every choice and fault drawn from one u64
+//! A failing seed replays with `REEL_STRESS_REPLAY=<seed>`
 
 #[allow(dead_code)]
 mod harness;
@@ -37,17 +22,16 @@ use reel::format::record::{RecordHeader, HEADER_LEN};
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::{
-    ByteCount, IndexResidency, Preallocate, RecordKey, RecordWrite, ReelConfig, ReelStore,
-    Result as ReelResult, SyncPolicy, ThreadBudget, SEGMENT_SUFFIX,
+    ByteCount, RecordKey, RecordWrite, ReelConfig, ReelStore, Result as ReelResult, SyncPolicy,
+    ThreadBudget, SEGMENT_SUFFIX,
 };
 
 use harness::wire::{record_key, ID_LEN, TEST_COLUMNS};
 
-/// One key, as the group and address a caller names it by
+/// One key, as a group and an address byte
 type Key = (u16, u8);
 
-/// Versions each key was attempted with, recorded before the call because a future
-/// dropped mid-flight never reports whether its write landed
+/// Versions each key was attempted with, recorded before the call
 type Attempted = BTreeMap<Key, BTreeSet<u64>>;
 
 /// Groups the callers spread their keys across
@@ -56,7 +40,7 @@ const GROUPS: &[u16] = &[3, 4];
 /// Distinct addresses per group, small enough that callers collide
 const ADDRESS_SPACE: u8 = 10;
 
-/// Shortest payload a stamped version carries
+/// The shortest stamped payload
 const MIN_LEN: usize = 16;
 
 /// How much longer than the shortest a payload can be
@@ -65,13 +49,13 @@ const LEN_SPREAD: usize = 400;
 /// Ops each caller draws when the environment does not override it
 const OPS_PER_CALLER: u64 = 200;
 
-/// Held futures the backlog pin keeps in flight at once, past the ring's 512 tags
+/// The backlog test keeps this many futures in flight, past the ring's 512 tags
 const BACKLOG_WIDTH: usize = 600;
 
 /// How long one awaited op may stand before the walk fails with its seed
 const DRIVE_STALL: Duration = Duration::from_secs(30);
 
-/// Poll rounds the backlog pin allows before failing rather than hanging
+/// The backlog test fails after this many poll rounds, so a starved future cannot hang it
 const BACKLOG_ROUNDS: u64 = 1_000_000;
 
 /// Records kept from the end of a segment walk, for the testimony
@@ -83,7 +67,7 @@ const TESTIMONY_BYTES: usize = 64;
 /// Bytes of a key printed in the forensics dump
 const KEY_PREFIX_PRINTED: usize = 4;
 
-/// Bytes of trailer a segment carries after its footer
+/// Bytes of trailer after a segment's footer
 const TRAILER_LEN: usize = 8;
 
 fn ops_per_caller() -> u64 {
@@ -93,7 +77,7 @@ fn ops_per_caller() -> u64 {
         .unwrap_or(OPS_PER_CALLER)
 }
 
-/// Drawn seeds the campaign test runs, zero making it a no-op
+/// How many drawn seeds the campaign runs, zero for none
 fn campaign_seeds() -> u64 {
     std::env::var("REEL_STRESS_SEEDS")
         .ok()
@@ -126,7 +110,7 @@ fn campaign_skip() -> u64 {
         .unwrap_or(0)
 }
 
-/// One seed to walk over and over, named as `seed:rounds`
+/// One seed to walk over and over, given as `seed:rounds`
 fn hammered() -> Option<(u64, u64)> {
     let raw = std::env::var("REEL_STRESS_HAMMER").ok()?;
     let (seed, rounds) = raw.split_once(':')?;
@@ -159,7 +143,7 @@ fn is_stamped(byte: u8, payload: &[u8]) -> bool {
     payload == stamped(byte, u64::from_le_bytes(version)).as_slice()
 }
 
-/// Count an op error rather than expecting success, under a drawn fault plan
+/// Count an op error, which a drawn fault plan allows
 fn tolerated(errors: &mut u64, outcome: ReelResult<()>) {
     if outcome.is_err() {
         *errors += 1;
@@ -172,7 +156,7 @@ fn version_of(payload: &[u8]) -> u64 {
     u64::from_le_bytes(version)
 }
 
-/// Wakes the parked driver thread, so a bounded drive sleeps rather than spins
+/// Wakes the parked driver thread, so a bounded drive sleeps between polls
 struct ParkWaker(Thread);
 
 impl Wake for ParkWaker {
@@ -181,10 +165,7 @@ impl Wake for ParkWaker {
     }
 }
 
-/// Drive one future to completion, failing with the seed instead of hanging
-///
-/// Returns nothing when the simulator has crashed under a pending op, since a crash
-/// delivers no further completions.
+/// Drive one future to completion, panicking with the seed on a stall, `None` after a crash
 fn drive<Fut: Future>(seed: u64, sim: &SimIo, future: Fut) -> Option<Fut::Output> {
     let mut pinned = Box::pin(future);
     let waker = Waker::from(Arc::new(ParkWaker(thread::current())));
@@ -206,8 +187,6 @@ fn drive<Fut: Future>(seed: u64, sim: &SimIo, future: Fut) -> Option<Fut::Output
 }
 
 /// Poll a future a bounded number of times and then drop it where it stands
-///
-/// The waker is a no-op because the point is the drop, not the completion.
 fn poll_then_drop<Fut: Future>(future: Fut, polls: u32) {
     let mut pinned = Box::pin(future);
     let waker = Waker::noop();
@@ -224,16 +203,13 @@ struct Shape {
     /// Caller threads the walk spawns
     callers: u64,
 
-    /// Where the index lives
-    residency: IndexResidency,
-
     /// Active tail threads
     tails: u32,
 
     /// The storage and completion faults drawn for this run
     plan: FaultPlan,
 
-    /// How many faults that plan carries
+    /// How many faults that plan holds
     faults: u64,
 
     /// Whether the plan can lie about durability, which decides the invariant
@@ -246,7 +222,7 @@ struct Shape {
 /// One storage or completion fault, drawn by kind and parameter
 fn drawn_fault(rng: &mut SmallRng) -> (FaultKind, bool) {
     match rng.gen_range(0..100u32) {
-        // The completion plane keeps the largest share; fixed-shape suites reach it least.
+        // Completion delays get the largest share, since fixed-shape suites reach them least
         0..=39 => (
             FaultKind::DelayCompletion {
                 polls: rng.gen_range(1..=4),
@@ -284,21 +260,15 @@ fn drawn_fault(rng: &mut SmallRng) -> (FaultKind, bool) {
 }
 
 /// Draw the whole run's shape from the seed, faults included
-///
-/// The fault count follows the op window, so raising REEL_STRESS_OPS deepens the search
-/// instead of diluting it.
 fn shape_of(seed: u64) -> Shape {
     let mut rng = SmallRng::seed_from_u64(seed);
     let callers = rng.gen_range(2..=5);
-    let residency = match rng.gen_range(0..10) {
-        0..=2 => IndexResidency::Paged,
-        _ => IndexResidency::Resident,
-    };
+    // The old index residency draw stays spent, so recorded seeds keep their shapes
+    let _ = rng.gen_range(0..10);
     let tails = rng.gen_range(1..=4);
 
     let window = callers * ops_per_caller() * 3;
-    // Faults start past the open's own ops, since one landing on the segment header
-    // write fails the open the walk expects to succeed.
+    // Faults start past the open's own ops, so the open itself succeeds
     let open_ops = 64;
     let mut plan = FaultPlan::new(seed);
     let mut lies = false;
@@ -322,7 +292,6 @@ fn shape_of(seed: u64) -> Shape {
 
     Shape {
         callers,
-        residency,
         tails,
         plan,
         faults,
@@ -342,24 +311,16 @@ fn stress_passes() -> u32 {
 fn config(shape: &Shape) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(16 * 1024),
-        alloc_chunk: ByteCount::from_bytes(16 * 1024),
-        preallocate: Preallocate::Chunk,
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(shape.tails),
-        index: shape.residency,
         compact_dead_ratio: 0.1,
-        // A lying plan can leave torn bytes where the index points; verification is what
-        // turns serving them into the designed miss.
+        // Verified reads answer a miss where a lying plan left torn bytes under the index
         verify_reads: shape.lies,
         ..ReelConfig::default()
     }
 }
 
 /// One caller's walk, its own rng stream split off the run's seed
-///
-/// Op errors are counted rather than expected, since under a drawn fault plan an error is
-/// a legitimate outcome; the error budget asserted afterwards is what keeps tolerance
-/// from hiding a storm.
 fn caller_walk(store: &Arc<ReelStore>, sim: &SimIo, seed: u64, caller: u64) -> (Attempted, u64) {
     let mut rng = SmallRng::seed_from_u64(seed ^ (caller << 32) ^ 0x9E37_79B9);
     let mut attempted = Attempted::new();
@@ -490,14 +451,10 @@ fn caller_walk(store: &Arc<ReelStore>, sim: &SimIo, seed: u64, caller: u64) -> (
     (attempted, errors)
 }
 
-/// Everything the store serves over the key space, errors tolerated per key
 /// Versions a second life stamps, past anything a caller walk can draw
 const SECOND_LIFE: u64 = 1 << 48;
 
-/// A second life on the walk's image: the open resumes the tails, a quarter of
-/// a walk lands behind the resumed rows, and a third open must hand back
-/// exactly what the second held. The device is fault free, so nothing is
-/// waived, whatever shape the first life took.
+/// A second life on the walk's image, whose state a third open must serve unchanged
 fn resumed_life(seed: u64, shape: &Shape, root: PathBuf, image: DurableImage) {
     let sim = SimIo::from_image(image);
     let store = ReelStore::open_with_io(
@@ -571,8 +528,7 @@ fn view(store: &ReelStore) -> (BTreeMap<Key, Vec<u8>>, BTreeSet<Key>) {
                     held.insert(key, value.into_vec());
                 }
                 Ok(None) => {}
-                // A read that failed is not a key that is absent; folding the two
-                // together reads a fault landing on the check as a disagreement.
+                // A failed read goes in its own set, apart from absent keys
                 Err(_) => {
                     failed.insert(key);
                 }
@@ -582,7 +538,7 @@ fn view(store: &ReelStore) -> (BTreeMap<Key, Vec<u8>>, BTreeSet<Key>) {
     (held, failed)
 }
 
-/// Assert one side serves only whole payloads carrying attempted versions
+/// Assert one side serves only whole payloads with attempted versions
 fn assert_attempted(seed: u64, side: &str, held: &BTreeMap<Key, Vec<u8>>, attempted: &Attempted) {
     for ((group, byte), payload) in held {
         assert!(
@@ -604,8 +560,8 @@ fn walk(seed: u64) {
     let shape = shape_of(seed);
     // Captured output only surfaces when a seed fails, which is when the shape is wanted.
     println!(
-        "seed {seed}: {} callers, {:?}, {} tails, {} faults, lies {}, crashes {}",
-        shape.callers, shape.residency, shape.tails, shape.faults, shape.lies, shape.crashes
+        "seed {seed}: {} callers, {} tails, {} faults, lies {}, crashes {}",
+        shape.callers, shape.tails, shape.faults, shape.lies, shape.crashes
     );
     let sim = SimIo::new(shape.plan.clone());
     let root = PathBuf::from("/walk");
@@ -620,8 +576,7 @@ fn walk(seed: u64) {
     );
 
     let is_running = Arc::new(AtomicBool::new(true));
-    // Callers plus one ticker per admitted pass; sizing this short leaves the extras
-    // waiting on a barrier that has already released, and the run hangs doing nothing.
+    // Callers plus one ticker per admitted pass, or late arrivals hang on the barrier
     let barrier = Arc::new(Barrier::new(
         shape.callers as usize + stress_passes().max(1) as usize,
     ));
@@ -635,9 +590,7 @@ fn walk(seed: u64) {
             caller_walk(&store, &sim, seed, caller)
         }));
     }
-    // Maintenance races the callers, and the flush is the pump: the simulator moves
-    // completions only when something polls it. One ticker per admitted pass, since a
-    // single ticker can never have two rewrites under way at once.
+    // Tickers race the callers and their flushes pump the simulator, one per admitted pass
     let tickers: Vec<_> = (0..stress_passes().max(1))
         .map(|_| {
             let store = Arc::clone(&store);
@@ -690,16 +643,12 @@ fn walk(seed: u64) {
         watchdog.thread().unpark();
         let _ = watchdog.join();
     }
-    // The plan belongs to the walk, not to the check that follows it: the reopen reads a
-    // fault free device, so leaving faults armed here asks one side to answer under a
-    // plan the other never sees. The reach line reports the tail a short walk never got
-    // to, which thins the search by a fraction nothing else shows.
+    // Disarm before the check, since the reopen reads a fault free device
     let (fired, drawn) = sim.fault_reach();
     println!("seed {seed}: faults reached {fired} of {drawn}");
     sim.disarm();
 
-    // Only an uncrashed walk can bound its errors by its faults. The factor is slack for
-    // the cascade a broken segment causes, not a derived number.
+    // Only an uncrashed walk bounds its errors by its faults, with slack for cascades
     if !shape.crashes {
         assert!(
             errors <= shape.faults * 8 + 8,
@@ -708,9 +657,7 @@ fn walk(seed: u64) {
         );
     }
 
-    // Only a walk whose closing flush succeeded may demand the reopen equal the live
-    // store: a failed sync marks its segment broken for good, so the records it never
-    // covered are cached but not durable, and the difference is the durability model.
+    // Only a walk whose closing flush succeeded may demand the reopen equal the live store
     let flushed = !shape.crashes && store.flush().is_ok();
     if !shape.crashes && !flushed {
         println!("seed {seed}: the closing flush failed, durability equality waived");
@@ -722,8 +669,7 @@ fn walk(seed: u64) {
             "seed {seed}: the live store failed to read {failed:?} with the plan disarmed"
         );
         assert_attempted(seed, "the live store", &live, &attempted);
-        // Taken while the live store still stands, so a mismatch after reopen can name
-        // its mechanism.
+        // Taken while the live store stands, so a mismatch after reopen can show its cause
         let mut sites = BTreeMap::new();
         let mut lsns = BTreeMap::new();
         for group in GROUPS {
@@ -739,10 +685,7 @@ fn walk(seed: u64) {
         }
         (live, sites, lsns)
     });
-    // Whether the live store would search a segment the volume no longer has. A candidate
-    // the device cannot show is one compaction retired, and a read picking it answers as
-    // though the key had never been written. A crashed plan never reaches this, since a
-    // crash is free to take a file the index still names.
+    // The live store must search no segment the volume no longer has
     if let Some((_, sites, _)) = live.as_ref() {
         let standing: BTreeSet<u32> = sim
             .durable_image()
@@ -782,8 +725,7 @@ fn walk(seed: u64) {
     resumed_life(seed, &shape, root.clone(), image.clone());
     if let Some((live, live_sites, live_lsns)) = live {
         if !shape.lies && flushed && live != after {
-            // The index's own testimony for the keys the two sides disagree on, which is
-            // what turns a mismatch into a mechanism.
+            // Collect the index's sites for each key the two sides disagree on
             let mut testimony = String::new();
             let mut real = 0usize;
             for key in live.keys().chain(after.keys()) {
@@ -793,9 +735,7 @@ fn walk(seed: u64) {
                 {
                     continue;
                 }
-                // A put can error after its bytes landed, so a reopen resolving a strictly
-                // newer attempted version is the durability model speaking. Anything
-                // older or unattempted stays a bug.
+                // A put can error after landing, so a newer attempted version on reopen is allowed
                 let resurrected = errors > 0
                     && there.is_some_and(|payload| {
                         attempted
@@ -832,8 +772,7 @@ fn walk(seed: u64) {
             if real == 0 {
                 return;
             }
-            // The reopen is deterministic given the image, so saving it turns a
-            // one-in-thousands interleaving into a repeatable case.
+            // The reopen is deterministic given the image, so keep the image for a repeatable case
             let keep =
                 std::env::temp_dir().join(format!("seeded-image-{seed}-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&keep);
@@ -853,7 +792,7 @@ fn walk(seed: u64) {
     }
 }
 
-/// The number of the segment this path names, for a file in a kept image
+/// The segment number in a kept image's file path
 fn segment_number_of(path: &Path) -> Option<u32> {
     path.file_name()?
         .to_str()?
@@ -862,10 +801,7 @@ fn segment_number_of(path: &Path) -> Option<u32> {
         .ok()
 }
 
-/// Walk one segment's raw records, for the testimony when a reopen disagrees
-///
-/// Where the walk stops is the mechanism: the offset, the bytes standing there and the
-/// last records reached say whether a range was lost, stamped over, or torn.
+/// Walk one segment's raw records and report where the walk stopped
 fn scan_segment(path: &Path, bytes: &[u8]) -> String {
     let mut out = format!(
         "segment {:?}, {} bytes:\n",
@@ -928,14 +864,13 @@ drawn_shape!(drawn_shape_seed_5, 5);
 drawn_shape!(drawn_shape_seed_8, 8);
 drawn_shape!(drawn_shape_seed_13, 13);
 
-// a reopen must not resurrect a deleted key: the seed a campaign caught compaction on,
-// dropping a tombstone while a number drawn before it had still to land
+// a reopen must not resurrect a deleted key, on a seed a campaign caught in compaction
 drawn_shape!(
     a_reopen_must_not_resurrect_a_deleted_key,
     11630724910943363631
 );
 
-// replay one drawn seed by number, the knob a campaign failure names
+// replay one drawn seed from `REEL_STRESS_REPLAY`
 #[test]
 fn replay() {
     if let Ok(raw) = std::env::var("REEL_STRESS_REPLAY") {
@@ -943,13 +878,7 @@ fn replay() {
     }
 }
 
-// walk one drawn seed over and over, for a race a single pass almost never draws
-//
-// A walk is threaded, so one replay of a seed says nothing about an interleaving.
-// Seed 1696173307150234702 parts the live store from a reopen about once in a few
-// thousand rounds, and does so at the pre-performance tip as well.
-//
-// Opt in with REEL_STRESS_HAMMER=<seed>:<rounds>.
+// walk one seed over and over, for a race one pass almost never hits
 #[test]
 fn hammer() {
     let Some((seed, rounds)) = hammered() else {
@@ -1101,7 +1030,6 @@ fn a_lone_awaited_read_needs_no_pump() {
     let sim = SimIo::new(FaultPlan::new(7));
     let shape = Shape {
         callers: 1,
-        residency: IndexResidency::Resident,
         tails: 1,
         plan: FaultPlan::new(0),
         faults: 0,
@@ -1140,7 +1068,6 @@ fn inline_callers_colliding_on_claims() {
     let root = PathBuf::from("/claims");
     let shape = Shape {
         callers: 4,
-        residency: IndexResidency::Resident,
         tails: 1,
         plan: FaultPlan::new(0),
         faults: 0,
@@ -1211,7 +1138,6 @@ fn a_backlog_of_futures_past_the_tag_table() {
     let root = PathBuf::from("/backlog");
     let shape = Shape {
         callers: 1,
-        residency: IndexResidency::Resident,
         tails: 2,
         plan: FaultPlan::new(0),
         faults: 0,
@@ -1234,9 +1160,7 @@ fn a_backlog_of_futures_past_the_tag_table() {
             store.put_owned_wait(&key, payload).await
         }));
     }
-    // Round-robin polling keeps the whole backlog in flight at once, the flush between
-    // rounds is the pump, and the round bound turns a starved future into a report
-    // rather than a hang.
+    // Poll round-robin with a flush between rounds, and fail on a starved future
     let mut rounds = 0u64;
     while !in_flight.is_empty() {
         rounds += 1;

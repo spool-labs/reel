@@ -7,20 +7,17 @@ use crate::format::loc::SegmentId;
 use crate::sync::tension::Tension;
 
 /// The durability state of one segment, shared by every writer flushing it
-///
-/// Reached through an Arc so a waiter is not holding the tail, and so a flush that
-/// finishes after a roll still speaks for the segment it flushed.
 pub(super) struct SyncState {
     /// Bytes settled the last time a flush finished, read without taking a lock
     pub(super) synced_at: AtomicU64,
 
-    /// Bytes the last two flushes had between them, which says how this volume writes
+    /// Bytes written between the last two flushes, a hint of how this volume writes
     pub(super) last_span: AtomicU64,
 
     /// Who is at the device, whether the segment is past saving, and who is waiting
     pub(super) flush: Tension<Flush>,
 
-    /// Page-return pacing, taken only by the writer handing a chunk back
+    /// Writeback pacing, taken only by the writer starting the next stretch
     pub(super) pacing: Mutex<Pacing>,
 }
 
@@ -39,18 +36,12 @@ impl SyncState {
     }
 
     /// Report the whole segment durable, which a completed seal makes it
-    ///
-    /// The watermark has to be stored inside the gate and before the wake, or the waiter
-    /// it was meant for can miss it and wait on a segment that is already durable.
     pub(super) fn mark_durable(&self) {
         self.flush
             .slack_with(|_| self.synced_at.store(u64::MAX, Ordering::Release));
     }
 
-    /// Report the segment past saving, so waiters hear it instead of waiting
-    ///
-    /// A segment already reported durable stays that way: a seal answered for every
-    /// record it holds, and a later roll off a closed tail does not unsay that.
+    /// Report the segment past saving so waiters stop, unless it was already durable
     pub(super) fn mark_broken(&self) {
         self.flush.slack_with(|flush| {
             if self.synced_at.load(Ordering::Acquire) == u64::MAX {
@@ -79,9 +70,6 @@ pub(super) enum Turn {
 }
 
 /// The bytes of one segment a caller is waiting to have on the device
-///
-/// Drawn while the tail is held, so a flush that runs after a roll answers for the
-/// segment it named rather than for whichever one replaced it.
 #[derive(Clone)]
 pub(super) struct Owed {
     /// Durability state of that segment, shared with every writer flushing it
@@ -94,11 +82,7 @@ pub(super) struct Owed {
     pub(super) target: u64,
 }
 
-/// What a writer finds when it looks at the segment, taking the turn if it is free
-///
-/// Nothing comes back while another writer's flush is out, which is the wait: one flush
-/// answers for every writer whose bytes are already under it. Nothing comes back on a
-/// segment the tail has left either, since the seal behind the roll answers for it.
+/// What a writer finds at the segment, taking the turn if free, or nothing while it must wait
 pub(super) fn turn_at(sync: &SyncState, flush: &mut Flush, target: u64) -> Option<Turn> {
     if sync.synced_at.load(Ordering::Acquire) >= target {
         return Some(Turn::Settled);
@@ -116,10 +100,7 @@ pub(super) fn turn_at(sync: &SyncState, flush: &mut Flush, target: u64) -> Optio
     None
 }
 
-/// A turn at the device, held by the writer that owes the flush
-///
-/// Dropping it untaken gives the turn up, so nobody waits on a flush that is never
-/// coming.
+/// A turn at the device for the writer that owes the flush, given up if dropped untaken
 pub struct FlushTurn {
     pub(super) owed: Owed,
     pub(super) is_taken: bool,

@@ -1,10 +1,4 @@
-//! A durable copy of the volume as it stood at a cue point
-//!
-//! An immutable file plus a hard link is a free copy: a cue seals every tail, so
-//! every version at or below it sits in a sealed segment under a footer, the cue
-//! floor stops compaction retiring what the copy needs while the link pass runs,
-//! and recovery rebuilds the index from the segments alone. The result is a
-//! directory that opens rather than an archive that needs restoring.
+//! A durable copy of the volume at a cue point, made by hard-linking its sealed segments
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -20,15 +14,11 @@ pub struct Checkpoint {
     /// The sequence number every version in the copy is at or below
     pub at: Lsn,
 
-    /// Segment files linked into the target, which is the size of the work
+    /// How many segment files were linked into the target
     pub segments: usize,
 }
 
 /// Sealed segments of a reel directory, up to but not including a boundary
-///
-/// The boundary is the number the next segment will take, read once the cue has
-/// sealed every tail. Numbers climb, so everything below it sealed at or before the
-/// cue. A file whose name is not a segment number is not a segment.
 pub fn sealed_below(dir: &Path, boundary: SegmentId) -> Result<BTreeSet<SegmentId>> {
     let mut sealed = BTreeSet::new();
     for entry in std::fs::read_dir(dir)? {
@@ -44,13 +34,7 @@ pub fn sealed_below(dir: &Path, boundary: SegmentId) -> Result<BTreeSet<SegmentI
     Ok(sealed)
 }
 
-/// Link one sealed set into a staging directory beside the target
-///
-/// Hard links, so the copy shares every byte with the volume it came from: a sealed
-/// inode cannot change, and it cannot go away while a link holds it. A segment gone
-/// before its link is taken fails the whole checkpoint rather than being skipped,
-/// since a copy with a hole in it would paper over a retire the cue floor should
-/// have held off.
+/// Hard-link one sealed set into a staging directory, failing if any segment is gone
 pub fn link_into(dir: &Path, staging: &Path, sealed: &BTreeSet<SegmentId>) -> Result<()> {
     for segment in sealed {
         let name = segment_file_name(*segment);
@@ -70,10 +54,7 @@ pub fn link_into(dir: &Path, staging: &Path, sealed: &BTreeSet<SegmentId>) -> Re
     Ok(())
 }
 
-/// The staging directory a checkpoint builds in before it is anything
-///
-/// A sibling of the target rather than a child, so the rename that publishes it
-/// is within one directory and cannot cross a filesystem by accident.
+/// The staging directory a checkpoint builds in, a sibling of the target
 pub fn staging_of(target: &Path) -> PathBuf {
     let mut name = target.as_os_str().to_owned();
     name.push(".tmp");
@@ -81,9 +62,6 @@ pub fn staging_of(target: &Path) -> PathBuf {
 }
 
 /// The target's name, refused when the reel would mistake it for its own
-///
-/// A multi-volume checkpoint carries this name into every live volume's root, so a
-/// name the reel uses itself would be read back as part of the store beside it.
 pub fn checkpoint_name(target: &Path) -> Result<&std::ffi::OsStr> {
     let Some(name) = target.file_name() else {
         return Err(ReelError::Rejected(format!(
@@ -95,7 +73,6 @@ pub fn checkpoint_name(target: &Path) -> Result<&std::ffi::OsStr> {
     let reserved = segment_number(&text).is_some()
         || text == crate::reel::volumes::MANIFEST_NAME
         || text == crate::reel::volumes::MARKER_NAME
-        || text == crate::index::persisted::PERSISTED_INDEX
         || text == crate::engine::LOCK_FILE;
     if reserved {
         return Err(ReelError::Rejected(format!(
@@ -105,10 +82,7 @@ pub fn checkpoint_name(target: &Path) -> Result<&std::ffi::OsStr> {
     Ok(name)
 }
 
-/// Write the copy's manifest into the home staging, naming every piece
-///
-/// The copy is a store, so it proves itself the way the live one does, and both the
-/// manifest and the markers are synced before anything publishes.
+/// Write the copy's manifest, listing every piece, durably into the home staging
 pub fn write_copy_manifest(staging: &Path, pieces: &[PathBuf]) -> Result<()> {
     durable_write(
         &staging.join(crate::reel::volumes::MANIFEST_NAME),
@@ -116,7 +90,7 @@ pub fn write_copy_manifest(staging: &Path, pieces: &[PathBuf]) -> Result<()> {
     )
 }
 
-/// Write one piece's marker into its staging, naming its published path
+/// Write one piece's marker into its staging, holding its published path
 pub fn write_copy_marker(staging: &Path, published: &Path) -> Result<()> {
     durable_write(
         &staging.join(crate::reel::volumes::MARKER_NAME),

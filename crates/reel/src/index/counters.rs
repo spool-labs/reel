@@ -1,21 +1,14 @@
 //! Per-segment reclaimable-byte counters, and what a read reports about itself
-//!
-//! Live against dead bytes is the fraction the compactor reads to decide whether a
-//! segment is worth rewriting. A segment number is a counter this volume allocates in
-//! order and never reuses, so the rows sit in a chunked window indexed by that number
-//! rather than in a hashed map: a booking is a subtraction and an array index, and the
-//! window slides as the oldest segments retire.
 
-use crate::sync::checked::{AtomicBool, AtomicU32, AtomicU64, Ordering, RwLock};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{RwLock, RwLockReadGuard};
 
 use crate::format::loc::{SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
-use crate::sync::checked::{read, write};
+use crate::sync::{read, write};
 
-/// Reclaimable-byte bookkeeping for one segment
-///
-/// Pads and segment headers are counted in none of the three.
+/// Reclaimable-byte counters for one segment, leaving out pads and segment headers
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SegmentBytes {
     /// Footprint of records the index still resolves into this segment
@@ -24,10 +17,10 @@ pub struct SegmentBytes {
     /// Footprint of records shadowed by a newer version or a delete
     pub dead: u64,
 
-    /// Tombstone footprint, part of live rather than on top of it
+    /// Tombstone footprint, counted inside live
     pub held: u64,
 
-    /// Newest tombstone version this segment holds, if it holds one
+    /// The newest tombstone version in this segment, if any
     pub held_lsn: Option<Lsn>,
 }
 
@@ -43,11 +36,7 @@ impl SegmentBytes {
         self.live + self.dead
     }
 
-    /// Tombstone footprint a rewrite would drop rather than carry forward
-    ///
-    /// A tombstone is dropped when no surviving segment holds a data record older than
-    /// it, so the newest tombstone here standing below the floor puts every one of
-    /// them below it. A newer one says nothing about the rest, so none are dropped.
+    /// How many tombstone bytes a rewrite would drop, all of them once no older data survives
     pub fn droppable(&self, floor: Option<Lsn>) -> u64 {
         match (self.held_lsn, floor) {
             (None, _) => 0,
@@ -57,35 +46,19 @@ impl SegmentBytes {
         }
     }
 
-    /// Footprint a rewrite of this segment would actually reclaim
+    /// How many bytes a rewrite of this segment would reclaim
     pub fn reclaimable(&self, floor: Option<Lsn>) -> u64 {
         self.dead + self.droppable(floor)
     }
 }
 
-/// Everything one segment's row holds, taken in one pass of the table
-///
-/// The footprints and the oldest-record mark sit behind the same lock, so a caller
-/// wanting both takes them together rather than locking twice a segment.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct SegmentStamp {
-    /// Live, dead and held footprints
-    pub bytes: SegmentBytes,
-
-    /// Oldest data record the segment can still surface
-    pub min_lsn: Option<Lsn>,
-}
-
-/// The oldest record marks on a reel, enough to answer any one exclusion
-///
-/// Two marks rather than all of them: taking one segment out of the running can
-/// only unseat the oldest, and the runner-up is what steps up when it does.
+/// The two oldest record marks on a reel, enough to answer any one exclusion
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Floors {
-    /// The oldest mark on the reel, and which segment carries it
+    /// The oldest mark on the reel and the segment that holds it
     oldest: Option<(SegmentId, Lsn)>,
 
-    /// The oldest mark carried by any other segment
+    /// The oldest mark in any other segment
     runner_up: Option<Lsn>,
 }
 
@@ -120,34 +93,23 @@ impl Floors {
     }
 }
 
-/// Rows one chunk of the window holds, so retiring frees whole allocations
+/// Each `Chunk` holds this many rows, so retiring frees whole allocations
 const CHUNK: usize = 256;
 
-/// Ids the window stretches to before a booking is refused rather than allocated
-///
-/// A volume allocates segment numbers in order, so the distance from the oldest
-/// standing segment to the newest is the live count. A gap wider than this is a
-/// number nobody drew, and covering it would allocate rows for nothing.
+/// The window spans at most this many ids, and a booking past that is refused
 const MAX_WINDOW: u64 = 1 << 20;
 
 /// The row is counted: it holds bytes, ranks, and answers for its floor
 const PRESENT: u32 = 1;
 
-/// The segment was sealed before any counter saw its keys
-const BORN: u32 = 2;
-
 /// The segment retired, so every booking against it is dropped and counted
-const RETIRED: u32 = 4;
+const RETIRED: u32 = 2;
 
-/// One segment's counters, moved by whichever writer's key points into it
-///
-/// A blank row reads as a segment that has seen no record at all rather than one
-/// whose oldest record is sequence zero, which is what the reserved minimum is for.
-/// One line per row, so two segments booked at once never share one.
+/// One segment's counters, on its own cache line so two segments never share one
 #[repr(align(64))]
 #[derive(Debug)]
 struct SegmentRow {
-    /// Bytes the index still points at
+    /// How many bytes the index still points at
     live: AtomicU64,
 
     /// Bytes shadowed by an overwrite or a delete
@@ -156,24 +118,27 @@ struct SegmentRow {
     /// Tombstone bytes, counted inside live
     held: AtomicU64,
 
-    /// Oldest data record the segment can still surface, or none seen yet
+    /// The oldest data version the segment can still surface, or `u64::MAX` before any
     min_lsn: AtomicU64,
 
-    /// Newest row the segment's sealed footer holds, or the reserved zero for none
+    /// The newest lsn in the segment's sealed footer, or zero for none
     max_lsn: AtomicU64,
 
-    /// Newest tombstone version here, or the reserved zero for none
+    /// The frontier the segment's footer tally is current to, or zero if none was read
+    sealed_at: AtomicU64,
+
+    /// The newest tombstone version here, or zero for none
     held_lsn: AtomicU64,
 
-    /// The life this segment is on, or the reserved zero for none issued
+    /// The segment's current incarnation, or zero if none was issued
     incarnation: AtomicU32,
 
-    /// Present, born and retired together, so one load answers all three
+    /// The present and retired bits, so one load reads both
     flags: AtomicU32,
 }
 
 impl SegmentRow {
-    /// A row standing for a segment nothing has booked against yet
+    /// A blank row for a segment nothing has booked against yet
     fn new() -> SegmentRow {
         SegmentRow {
             live: AtomicU64::new(0),
@@ -181,6 +146,7 @@ impl SegmentRow {
             held: AtomicU64::new(0),
             min_lsn: AtomicU64::new(u64::MAX),
             max_lsn: AtomicU64::new(Lsn::NONE.as_u64()),
+            sealed_at: AtomicU64::new(Lsn::NONE.as_u64()),
             held_lsn: AtomicU64::new(Lsn::NONE.as_u64()),
             incarnation: AtomicU32::new(0),
             flags: AtomicU32::new(0),
@@ -199,7 +165,7 @@ impl SegmentRow {
         self.flags() & RETIRED != 0
     }
 
-    /// Whether anything has ever named this row, bytes, birth or a life
+    /// Whether this row ever had a flag set or an incarnation issued
     fn is_known(&self) -> bool {
         self.flags() != 0 || self.incarnation.load(Ordering::Acquire) != 0
     }
@@ -237,13 +203,14 @@ impl SegmentRow {
         }
     }
 
-    /// Take the row back to never having been touched
+    /// Reset the row to its untouched state
     fn blank(&self) {
         self.live.store(0, Ordering::Release);
         self.dead.store(0, Ordering::Release);
         self.held.store(0, Ordering::Release);
         self.min_lsn.store(u64::MAX, Ordering::Release);
         self.max_lsn.store(Lsn::NONE.as_u64(), Ordering::Release);
+        self.sealed_at.store(Lsn::NONE.as_u64(), Ordering::Release);
         self.held_lsn.store(Lsn::NONE.as_u64(), Ordering::Release);
         self.incarnation.store(0, Ordering::Release);
         self.flags.store(0, Ordering::Release);
@@ -257,9 +224,6 @@ impl SegmentRow {
     }
 
     /// Note the oldest sequence number this segment can still surface
-    ///
-    /// Read before written: the first record settles the minimum, so a plain load
-    /// leaves the line shared where a read-modify-write would take it exclusive.
     fn note_min(&self, lsn: Lsn) {
         if lsn.0 < self.min_lsn.load(Ordering::Acquire) {
             self.min_lsn.fetch_min(lsn.0, Ordering::AcqRel);
@@ -267,7 +231,7 @@ impl SegmentRow {
     }
 }
 
-/// A chunk of rows, freed whole when the window slides past it
+/// A fixed block of rows, freed whole when the window slides past it
 #[derive(Debug)]
 struct Chunk {
     rows: Box<[SegmentRow]>,
@@ -287,33 +251,27 @@ impl Chunk {
     }
 }
 
-/// The stretch of segment numbers the table holds rows for
-///
-/// Chunk aligned at the front so a number resolves by subtraction, and sliding at
-/// both ends: a retire clears from the bottom and a fresh segment grows the top.
+/// The range of segment numbers the table has rows for, sliding up as segments retire
 #[derive(Debug, Default)]
 struct Window {
-    /// The number row zero of the first chunk stands for, chunk aligned
+    /// The segment number of the first block's row zero, aligned to `CHUNK`
     base: u64,
 
-    /// Numbers below this had their chunk freed, raised only by freeing one
+    /// Numbers below this had their block freed
     gone: u64,
 
-    /// One past the highest number ever counted, which bounds every walk
+    /// One past the highest counted number, which bounds every walk
     reach: u64,
 
-    /// Rows in number order, oldest chunk first
+    /// Rows in number order, oldest block first
     chunks: VecDeque<Chunk>,
 
-    /// Rows carrying the present bit, so a count is not a walk
+    /// How many rows have the present bit, so a count needs no walk
     present: usize,
-
-    /// Rows carrying the born bit
-    born: usize,
 }
 
 impl Window {
-    /// The row a number stands on, retired numbers and untouched ones alike
+    /// The row for a number, retired and untouched ones included
     fn row(&self, segment: SegmentId) -> Option<&SegmentRow> {
         let id = u64::from(segment.as_u32());
         if id < self.gone || id < self.base {
@@ -330,7 +288,7 @@ impl Window {
         self.row(segment).filter(|row| row.is_present())
     }
 
-    /// Whether a number is one the table has already let go of
+    /// Whether the table has already let go of a number
     fn is_retired(&self, segment: SegmentId) -> bool {
         let id = u64::from(segment.as_u32());
         if id < self.gone {
@@ -339,10 +297,7 @@ impl Window {
         self.row(segment).is_some_and(|row| row.is_retired())
     }
 
-    /// The row a number stands on, growing the window to reach it
-    ///
-    /// Nothing for a number the table has retired, which is what keeps a booking
-    /// that lost its race from bringing a segment back.
+    /// The row for a number, growing the window to reach it, or nothing once it retired
     fn open(&mut self, segment: SegmentId) -> Option<&SegmentRow> {
         let id = u64::from(segment.as_u32());
         if id < self.gone {
@@ -352,7 +307,7 @@ impl Window {
             self.base = id - (id % CHUNK as u64);
         }
         if id < self.base {
-            // Never retired, so the window reaches back rather than dropping it.
+            // Never retired, so grow the window back to reach it
             let reach = self.base - (id - (id % CHUNK as u64));
             if reach > MAX_WINDOW {
                 return None;
@@ -389,34 +344,16 @@ impl Window {
         self.row(segment)
     }
 
-    /// Mark a row born, opening it without putting it on the count
-    ///
-    /// A born segment holds no bytes any counter saw, so it ranks nothing and the
-    /// present bit stays clear until a booking gives it something to rank.
-    fn open_born(&mut self, segment: SegmentId) -> bool {
-        let fresh = match self.open(segment) {
-            Some(row) => row.flags.fetch_or(BORN, Ordering::AcqRel) & BORN == 0,
-            None => return false,
-        };
-        if fresh {
-            self.born += 1;
-        }
-        true
-    }
-
-    /// Clear a retired segment's row and give back the chunks behind it
-    ///
-    /// A number the table never knew is left alone, since nothing stood there.
+    /// Clear a retired segment's row and free the blocks behind it
     fn retire(&mut self, segment: SegmentId) {
         let cleared = self.row(segment).filter(|row| row.is_known()).map(|row| {
-            let was = row.flags();
+            let was_present = row.is_present();
             row.blank();
             row.raise(RETIRED);
-            (was & PRESENT != 0, was & BORN != 0)
+            was_present
         });
-        if let Some((was_present, was_born)) = cleared {
+        if let Some(was_present) = cleared {
             self.present -= usize::from(was_present);
-            self.born -= usize::from(was_born);
         }
         if self.present == 0 {
             self.reach = self.base;
@@ -424,12 +361,8 @@ impl Window {
         self.slide();
     }
 
-    /// Give back the chunks behind a run of retired rows
-    ///
-    /// Only retired rows are passed: an untouched one is a number a tail drew and
-    /// has not written into yet, whose first booking carries the segment's floor.
+    /// Free the blocks behind a run of retired rows, stopping at any row not retired
     fn slide(&mut self) {
-        // Local, since numbers below the window's start were never touched.
         let mut at = self.base.max(self.gone);
         while let Some(row) = self.row(SegmentId(at as u32)) {
             if !row.is_retired() {
@@ -445,10 +378,7 @@ impl Window {
         }
     }
 
-    /// Every counted row with the number it stands for, in number order
-    ///
-    /// The walk is bounded by the numbers actually counted rather than by the rows
-    /// allocated, so a volume of one segment reads one row and not a whole chunk.
+    /// Every counted row and its number in order, walking only up to `reach`
     fn counted_rows(&self) -> impl Iterator<Item = (SegmentId, &SegmentRow)> {
         let from = (self.gone.max(self.base) - self.base) as usize;
         let to = (self.reach.max(self.base) - self.base) as usize;
@@ -472,7 +402,19 @@ impl Window {
         self.gone = 0;
         self.reach = 0;
         self.present = 0;
-        self.born = 0;
+    }
+}
+
+/// The segment table held for reading, for a caller looking up many segments at once
+pub struct Stamps<'table>(RwLockReadGuard<'table, Window>);
+
+impl Stamps<'_> {
+    /// The incarnation a segment currently wears, or none for one that is gone
+    pub fn of(&self, segment: SegmentId) -> SegmentIncarnation {
+        match self.0.row(segment) {
+            Some(row) => SegmentIncarnation(row.incarnation.load(Ordering::Acquire)),
+            None => SegmentIncarnation::NONE,
+        }
     }
 }
 
@@ -482,13 +424,10 @@ pub struct SegmentTable {
     /// The rows themselves, a window over the numbers this volume has issued
     window: RwLock<Window>,
 
-    /// Whether any segment carries the born bit, so an unborn volume pays one load
-    has_born: AtomicBool,
-
     /// Issues incarnations, starting past the reserved none
     next_incarnation: AtomicU32,
 
-    /// Bookings against a segment this table has already let go of
+    /// How many bookings hit a segment this table already let go of
     dropped: AtomicU64,
 }
 
@@ -498,7 +437,7 @@ impl SegmentTable {
         SegmentTable::default()
     }
 
-    /// Book a record live in its segment, and note the version it carries
+    /// Book a record live in its segment, and note the version it holds
     pub fn mark_live(&self, segment: SegmentId, lsn: Lsn, span: u64) {
         self.opened(segment, |row| {
             row.note_min(lsn);
@@ -506,10 +445,7 @@ impl SegmentTable {
         });
     }
 
-    /// Book a record dead where it lies, and note the version it carries
-    ///
-    /// A record whose index write lost its race is still on disk and a rebuild
-    /// would still find it, so its version counts as a live one's does.
+    /// Book a record dead where it lies, and note its version because a rebuild would still find it
     pub fn mark_dead(&self, segment: SegmentId, lsn: Lsn, span: u64) {
         self.opened(segment, |row| {
             row.note_min(lsn);
@@ -517,11 +453,7 @@ impl SegmentTable {
         });
     }
 
-    /// Book a tombstone's own footprint against the segment holding it
-    ///
-    /// The segment's oldest-record mark is left alone, since that mark answers what a
-    /// rebuild could surface and a tombstone surfaces nothing. The version is kept as
-    /// a maximum, since dropping tombstones is all or nothing per segment.
+    /// Book a tombstone's footprint against its segment, keeping the newest tombstone version
     pub fn mark_held(&self, segment: SegmentId, lsn: Lsn, span: u64) {
         self.opened(segment, |row| {
             row.add_live(span);
@@ -530,7 +462,7 @@ impl SegmentTable {
         });
     }
 
-    /// Add footprints a rebuild read off a footer tally or a persisted stamp
+    /// Add footprints a rebuild read off a footer tally
     pub fn adopt(&self, segment: SegmentId, bytes: SegmentBytes) {
         self.opened(segment, |row| {
             row.add_live(bytes.live);
@@ -547,11 +479,7 @@ impl SegmentTable {
         self.booked(segment, |row| row.shadow(span));
     }
 
-    /// Raise a segment's dead count to what a full sweep of it counted
-    ///
-    /// A paged open books every sealed record live, since it cannot tell a shadowed
-    /// record from a live one, and a completed sweep settles the split. Raised and
-    /// never lowered, so this cannot undo what a write counted.
+    /// Raise a segment's dead count to what a full sweep counted, never lowering it
     pub fn settle_dead(&self, segment: SegmentId, counted: u64) {
         self.booked(segment, |row| {
             let dead = row.dead.load(Ordering::Acquire);
@@ -562,9 +490,6 @@ impl SegmentTable {
     }
 
     /// Take a record's footprint off a segment's live count without booking it dead
-    ///
-    /// What a compaction copy does to the segment it left: the record moved rather
-    /// than being shadowed, so those bytes are not reclaimable.
     pub fn release_live(&self, segment: SegmentId, span: u64) {
         self.booked(segment, |row| row.drop_live(span));
     }
@@ -574,15 +499,9 @@ impl SegmentTable {
         self.opened(segment, |row| row.note_min(lsn));
     }
 
-    /// Note the newest row a segment's sealed footer holds
-    ///
-    /// Taken from the footer rather than from the bookings, which are not ordered
-    /// against the seal that makes a segment searchable. The footer is written once
-    /// and lists every row of the segment, tombstones included. Raised and never
-    /// lowered, so a rebuild meeting a footer twice cannot take the ceiling down.
+    /// Raise a segment's ceiling to the newest row its sealed footer holds
     pub fn note_max(&self, segment: SegmentId, lsn: Lsn) {
-        // A footer that lists nothing bounds nothing, and taking the row would put a
-        // segment on the table that holds no bytes for anything to rank.
+        // An empty footer bounds nothing, and opening a row would rank a segment with no bytes
         if lsn == Lsn::NONE {
             return;
         }
@@ -591,10 +510,27 @@ impl SegmentTable {
         });
     }
 
-    /// The newest row a segment can answer with, or nothing recorded for it
-    ///
-    /// Nothing means nothing is known, not that the segment is empty. A caller
-    /// ordering a search by this has to read it as no bound at all.
+    /// Note the frontier a sealed segment's footer says its tally is current to
+    pub fn note_sealed_at(&self, segment: SegmentId, lsn: Lsn) {
+        if lsn == Lsn::NONE {
+            return;
+        }
+        self.opened(segment, |row| {
+            row.sealed_at.fetch_max(lsn.as_u64(), Ordering::AcqRel);
+        });
+    }
+
+    /// The frontier a segment's tally is current to, or nothing if no footer was read
+    pub fn sealed_at_of(&self, segment: SegmentId) -> Option<Lsn> {
+        let window = read(&self.window);
+        let row = window.counted(segment)?;
+        match row.sealed_at.load(Ordering::Acquire) {
+            0 => None,
+            frontier => Some(Lsn(frontier)),
+        }
+    }
+
+    /// The newest row a segment can answer with, where nothing means unknown and no bound
     pub fn max_lsn_of(&self, segment: SegmentId) -> Option<Lsn> {
         let window = read(&self.window);
         let row = window.counted(segment)?;
@@ -623,9 +559,6 @@ impl SegmentTable {
     }
 
     /// Everything ranking a compaction target needs, from one pass under one lock
-    ///
-    /// The footprints and the floors are both a walk of every row, so one pass is
-    /// the same work under one acquisition of the lock every insert also wants.
     pub fn ranking(&self) -> (Vec<(SegmentId, SegmentBytes)>, Floors) {
         let window = read(&self.window);
         let mut out = Vec::with_capacity(window.present);
@@ -637,22 +570,6 @@ impl SegmentTable {
             }
         }
         (out, floors)
-    }
-
-    /// Every segment's footprints and floor together, from one pass under one lock
-    pub fn stamps(&self) -> HashMap<SegmentId, SegmentStamp> {
-        let window = read(&self.window);
-        let mut out = HashMap::with_capacity(window.present);
-        for (segment, row) in window.counted_rows() {
-            out.insert(
-                segment,
-                SegmentStamp {
-                    bytes: row.bytes(),
-                    min_lsn: row.min_lsn(),
-                },
-            );
-        }
-        out
     }
 
     /// The oldest record this segment can still surface
@@ -669,18 +586,12 @@ impl SegmentTable {
         total
     }
 
-    /// Oldest sequence number any segment other than this one can still surface
-    ///
-    /// A tombstone below this bound cannot be undone by a rebuild, so the compactor
-    /// may drop it rather than carry it.
+    /// The oldest lsn any other segment can surface, below which a tombstone can be dropped
     pub fn min_lsn_excluding(&self, segment: SegmentId) -> Option<Lsn> {
         self.floors().excluding(segment)
     }
 
-    /// Every segment's floor at once, in one pass rather than one pass each
-    ///
-    /// Excluding one segment can only ever remove the single oldest mark, so the
-    /// two oldest answer the question for all of them.
+    /// Every segment's floor from one pass, since only the two oldest marks matter
     pub fn floors(&self) -> Floors {
         let window = read(&self.window);
         let mut floors = Floors::default();
@@ -692,15 +603,12 @@ impl SegmentTable {
         floors
     }
 
-    /// Bookings dropped for naming a segment this table had already let go of
+    /// How many bookings were dropped for a segment this table already let go of
     pub fn dropped_bookings(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    /// The incarnation a segment the caller holds live wears, issued on first ask
-    ///
-    /// Only for a caller that can vouch the segment stands. Asked of a retired
-    /// segment it stamps none, which the read-only form does too.
+    /// A live segment's incarnation, issued on first ask, or none for a retired segment
     pub fn live_incarnation(&self, segment: SegmentId) -> SegmentIncarnation {
         if let Some(row) = read(&self.window).row(segment) {
             match row.incarnation.load(Ordering::Acquire) {
@@ -725,10 +633,12 @@ impl SegmentTable {
 
     /// The incarnation a segment currently wears, or none for one that is gone
     pub fn incarnation_of(&self, segment: SegmentId) -> SegmentIncarnation {
-        match read(&self.window).row(segment) {
-            Some(row) => SegmentIncarnation(row.incarnation.load(Ordering::Acquire)),
-            None => SegmentIncarnation::NONE,
-        }
+        self.stamps().of(segment)
+    }
+
+    /// The table held for reading, so a batch of lookups takes its lock once
+    pub fn stamps(&self) -> Stamps<'_> {
+        Stamps(read(&self.window))
     }
 
     fn issue_incarnation(&self) -> SegmentIncarnation {
@@ -737,60 +647,26 @@ impl SegmentTable {
 
     /// Forget a segment's counters once its file has been unlinked
     pub fn forget(&self, segment: SegmentId) {
-        // The counters and the incarnation go together, so the table is never read as
-        // uncounted while the stamp it hands out is still current.
-        let mut window = write(&self.window);
-        window.retire(segment);
-        if window.born == 0 {
-            self.has_born.store(false, Ordering::Relaxed);
-        }
+        // Counters and incarnation clear together, so no stamp outlives its counters
+        write(&self.window).retire(segment);
     }
 
-    /// Mark the segments a rebuild left sealed, whose keys no counter holds
-    ///
-    /// A born segment is on the volume, so it wears an incarnation from here: its
-    /// keys resolve through footers, and those entries are stamped with it.
-    pub fn mark_born(&self, segments: impl IntoIterator<Item = SegmentId>) {
+    /// Issue an incarnation to each sealed segment a rebuild left, for stamping its footer entries
+    pub fn issue_incarnations(&self, segments: impl IntoIterator<Item = SegmentId>) {
         let mut window = write(&self.window);
         for segment in segments {
-            if !window.open_born(segment) {
+            let Some(row) = window.open(segment) else {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
-            }
-            let issued = self.issue_incarnation();
-            if let Some(row) = window.row(segment) {
-                let _ = row.incarnation.compare_exchange(
-                    0,
-                    issued.0,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                );
+            };
+            if row.incarnation.load(Ordering::Acquire) == 0 {
+                let issued = self.issue_incarnation();
+                row.incarnation.store(issued.0, Ordering::Release);
             }
         }
-        if window.born > 0 {
-            self.has_born.store(true, Ordering::Relaxed);
-        }
     }
 
-    /// Whether this segment's keys were sealed away before any counter saw them
-    pub fn is_born(&self, segment: SegmentId) -> bool {
-        if !self.has_born.load(Ordering::Relaxed) {
-            return false;
-        }
-        read(&self.window)
-            .row(segment)
-            .is_some_and(|row| row.flags() & BORN != 0)
-    }
-
-    /// Segments still standing whose keys the counters exclude
-    pub fn born_count(&self) -> usize {
-        if !self.has_born.load(Ordering::Relaxed) {
-            return 0;
-        }
-        read(&self.window).born
-    }
-
-    /// Segments the table is counting
+    /// How many segments the table is counting
     pub fn len(&self) -> usize {
         read(&self.window).present
     }
@@ -803,14 +679,24 @@ impl SegmentTable {
     /// Drop every row, for a reel that is going away
     pub fn clear(&self) {
         write(&self.window).clear();
-        self.has_born.store(false, Ordering::Relaxed);
     }
 
-    /// Run something against a segment's row, opening one the first time it is touched
-    ///
-    /// For a caller booking a record into a segment it is holding open, which is
-    /// every caller that books bytes or a floor. A number the table has retired is
-    /// dropped and counted rather than given a row back.
+    /// Issue incarnations past every one the live table issued, for a rebuild that swaps into it
+    pub(crate) fn issue_past(&self, live: &SegmentTable) {
+        let issued = live.next_incarnation.load(Ordering::Relaxed);
+        self.next_incarnation.fetch_max(issued, Ordering::Relaxed);
+    }
+
+    /// Swap in a rebuilt table's rows, keeping incarnations and drop counts climbing
+    pub(crate) fn install(&self, fresh: &SegmentTable) {
+        std::mem::swap(&mut *write(&self.window), &mut *write(&fresh.window));
+        let issued = fresh.next_incarnation.load(Ordering::Relaxed);
+        self.next_incarnation.fetch_max(issued, Ordering::Relaxed);
+        let dropped = fresh.dropped.load(Ordering::Relaxed);
+        self.dropped.fetch_add(dropped, Ordering::Relaxed);
+    }
+
+    /// Run `act` on a segment's row, opening it on first touch, or drop a booking to a retired one
     fn opened<T>(&self, segment: SegmentId, act: impl FnOnce(&SegmentRow) -> T) -> Option<T> {
         {
             let window = read(&self.window);
@@ -832,11 +718,7 @@ impl SegmentTable {
         }
     }
 
-    /// Run something against a row that already exists, dropping the booking if none does
-    ///
-    /// For a caller moving bytes that were booked by somebody else: the segment it
-    /// names is whatever an entry pointed at, which compaction may have retired
-    /// since. Opening a row here is what left phantom segments on the table.
+    /// Run `act` on an existing counted row, or drop the booking if there is none
     fn booked<T>(&self, segment: SegmentId, act: impl FnOnce(&SegmentRow) -> T) -> Option<T> {
         match read(&self.window).counted(segment) {
             Some(row) => Some(act(row)),
@@ -848,10 +730,158 @@ impl SegmentTable {
     }
 }
 
+/// Where an index write books its segments' bytes, the table itself or one rebuild thread's tally
+pub trait Bookings {
+    /// The incarnation stamped on an entry pointing into a segment
+    fn live_incarnation(&self, segment: SegmentId) -> SegmentIncarnation;
+
+    /// Book a record live in its segment, and note the version it holds
+    fn mark_live(&self, segment: SegmentId, lsn: Lsn, span: u64);
+
+    /// Book a record dead where it lies, and note the version it holds
+    fn mark_dead(&self, segment: SegmentId, lsn: Lsn, span: u64);
+
+    /// Move a record's footprint from live to dead within its segment
+    fn shadow(&self, segment: SegmentId, span: u64);
+
+    /// Book a tombstone's own footprint against the segment holding it
+    fn mark_held(&self, segment: SegmentId, lsn: Lsn, span: u64);
+}
+
+impl Bookings for SegmentTable {
+    fn live_incarnation(&self, segment: SegmentId) -> SegmentIncarnation {
+        self.live_incarnation(segment)
+    }
+
+    fn mark_live(&self, segment: SegmentId, lsn: Lsn, span: u64) {
+        self.mark_live(segment, lsn, span)
+    }
+
+    fn mark_dead(&self, segment: SegmentId, lsn: Lsn, span: u64) {
+        self.mark_dead(segment, lsn, span)
+    }
+
+    fn shadow(&self, segment: SegmentId, span: u64) {
+        self.shadow(segment, span)
+    }
+
+    fn mark_held(&self, segment: SegmentId, lsn: Lsn, span: u64) {
+        self.mark_held(segment, lsn, span)
+    }
+}
+
+/// One rebuild thread's bookings, summed per segment until it hands them over
+pub struct Tally<'table> {
+    table: &'table SegmentTable,
+    rows: std::cell::RefCell<Vec<TallyRow>>,
+    last: std::cell::Cell<usize>,
+}
+
+/// What a tally has summed for one segment
+struct TallyRow {
+    segment: SegmentId,
+    incarnation: Option<SegmentIncarnation>,
+    bytes: SegmentBytes,
+    shadowed: u64,
+    oldest: Option<Lsn>,
+}
+
+impl<'table> Tally<'table> {
+    /// An empty tally that settles into this table
+    pub fn new(table: &'table SegmentTable) -> Tally<'table> {
+        Tally {
+            table,
+            rows: std::cell::RefCell::new(Vec::new()),
+            last: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Change one segment's sums, trying the row asked about last before any search
+    fn with<T>(&self, segment: SegmentId, change: impl FnOnce(&mut TallyRow) -> T) -> T {
+        let mut rows = self.rows.borrow_mut();
+        let last = self.last.get();
+        let found = match rows.get(last) {
+            Some(row) if row.segment == segment => Some(last),
+            _ => rows.iter().rposition(|row| row.segment == segment),
+        };
+        let at = match found {
+            Some(at) => at,
+            None => {
+                rows.push(TallyRow {
+                    segment,
+                    incarnation: None,
+                    bytes: SegmentBytes::default(),
+                    shadowed: 0,
+                    oldest: None,
+                });
+                rows.len() - 1
+            }
+        };
+        self.last.set(at);
+        change(&mut rows[at])
+    }
+
+    /// Hand every sum to the table, live bytes first so no count dips below zero
+    pub fn settle(self) {
+        let rows = self.rows.into_inner();
+        for row in &rows {
+            if row.bytes != SegmentBytes::default() {
+                self.table.adopt(row.segment, row.bytes);
+            }
+            if let Some(oldest) = row.oldest {
+                self.table.note_min(row.segment, oldest);
+            }
+        }
+        for row in rows.iter().filter(|row| row.shadowed > 0) {
+            self.table.shadow(row.segment, row.shadowed);
+        }
+    }
+}
+
+impl TallyRow {
+    fn note_min(&mut self, lsn: Lsn) {
+        self.oldest = Some(self.oldest.map_or(lsn, |oldest| oldest.min(lsn)));
+    }
+}
+
+impl Bookings for Tally<'_> {
+    fn live_incarnation(&self, segment: SegmentId) -> SegmentIncarnation {
+        if let Some(known) = self.with(segment, |row| row.incarnation) {
+            return known;
+        }
+        let issued = self.table.live_incarnation(segment);
+        self.with(segment, |row| row.incarnation = Some(issued));
+        issued
+    }
+
+    fn mark_live(&self, segment: SegmentId, lsn: Lsn, span: u64) {
+        self.with(segment, |row| {
+            row.note_min(lsn);
+            row.bytes.live += span;
+        });
+    }
+
+    fn mark_dead(&self, segment: SegmentId, lsn: Lsn, span: u64) {
+        self.with(segment, |row| {
+            row.note_min(lsn);
+            row.bytes.dead += span;
+        });
+    }
+
+    fn shadow(&self, segment: SegmentId, span: u64) {
+        self.with(segment, |row| row.shadowed += span);
+    }
+
+    fn mark_held(&self, segment: SegmentId, lsn: Lsn, span: u64) {
+        self.with(segment, |row| {
+            row.bytes.live += span;
+            row.bytes.held += span;
+            row.bytes.held_lsn = Some(row.bytes.held_lsn.map_or(lsn, |held| held.max(lsn)));
+        });
+    }
+}
+
 /// Store-wide counters that no single column owns
-///
-/// Live counts and byte totals belong to the columns holding the keys, so what is
-/// left here is what a read reports about itself.
 #[derive(Debug, Default)]
 pub struct ReadCounters {
     unreadable: AtomicU64,
@@ -863,10 +893,7 @@ impl ReadCounters {
         ReadCounters::default()
     }
 
-    /// Records a playback could not read, so they dropped out of its results
-    ///
-    /// A playback hands back pairs and has nowhere to put an error, so a device error
-    /// under one otherwise looks like a complete playback that found less.
+    /// How many records a playback could not read and dropped from its results
     pub fn unreadable_records(&self) -> u64 {
         self.unreadable.load(Ordering::Acquire)
     }
@@ -878,24 +905,21 @@ impl ReadCounters {
 }
 
 /// How often a sealed segment was asked about a key, and how often it said no
-///
-/// Counts rather than times, so they say the same thing on any machine.
 #[derive(Debug, Default)]
 pub struct FilterProbes {
-    /// Sealed segments asked about a key
+    /// How many sealed segments were asked about a key
     asked: AtomicU64,
 
     /// Of those, the ones a filter ruled out without a search
     skipped: AtomicU64,
 
-    /// Row blocks a search asked for, whether they were in hand or not
+    /// How many row blocks the searches asked for, in hand or not
     blocks: AtomicU64,
 
     /// Of those, the ones that were not in hand and became a read
     block_reads: AtomicU64,
 
-    /// Reads spent opening a sealed segment's directory rather than reading rows,
-    /// which is what a search pays before it searches anything
+    /// Reads spent opening a sealed segment's directory before searching it
     map_reads: AtomicU64,
 }
 
@@ -915,7 +939,7 @@ impl FilterProbes {
         self.blocks.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Note one of those blocks being read rather than found in hand
+    /// Note one of those blocks becoming a read
     pub fn note_block_read(&self) {
         self.block_reads.fetch_add(1, Ordering::AcqRel);
     }
@@ -925,10 +949,7 @@ impl FilterProbes {
         self.map_reads.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Everything the counters hold, taken together
-    ///
-    /// One read of the set rather than four, so the counts describe the same
-    /// stretch of work.
+    /// Every counter, read together so the counts cover the same stretch of work
     pub fn counts(&self) -> ProbeCounts {
         ProbeCounts {
             asked: self.asked.load(Ordering::Acquire),
@@ -943,19 +964,19 @@ impl FilterProbes {
 /// What the sealed segments were asked, and what asking them cost
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProbeCounts {
-    /// Sealed segments asked about a key
+    /// How many sealed segments were asked about a key
     pub asked: u64,
 
     /// Of those, the ones a filter ruled out without a search
     pub skipped: u64,
 
-    /// Row blocks the surviving searches asked for
+    /// How many row blocks the remaining searches asked for
     pub blocks: u64,
 
     /// Of those, the ones that became a device read
     pub block_reads: u64,
 
-    /// Reads spent opening the directories those searches went through
+    /// How many reads went to opening those searches' directories
     pub map_reads: u64,
 }
 
@@ -971,84 +992,13 @@ impl ProbeCounts {
         }
     }
 
-    /// Searches a filter did not rule out, which are the ones that read blocks
+    /// How many searches a filter did not rule out
     pub fn searched(&self) -> u64 {
         self.asked - self.skipped
     }
 }
 
-/// What the retire ordering does and does not promise a concurrent reader
-///
-/// A retire drops the incarnation before the counters, so the table never sits in
-/// stamped-but-uncounted. Only the ordering is modelled.
-#[cfg(all(test, loom))]
-mod loom_tests {
-    use super::*;
-
-    use loom::sync::Arc;
-
-    // a reader finding the counters gone never then finds the stamp current
-    #[test]
-    fn uncounted_implies_unstamped() {
-        // Outside loom's tracking on purpose: the assert only fires where the retire
-        // got there first, so a run where it never did would pass testing nothing.
-        static SAW_UNCOUNTED: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-
-        loom::model(|| {
-            let table = Arc::new(SegmentTable::new());
-            table.mark_live(SegmentId(1), Lsn(1), 1000);
-
-            let retiring = {
-                let table = Arc::clone(&table);
-                loom::thread::spawn(move || table.forget(SegmentId(1)))
-            };
-
-            let counted = table.bytes_of(SegmentId(1)) != SegmentBytes::default();
-            let stamp = table.incarnation_of(SegmentId(1));
-            if !counted {
-                SAW_UNCOUNTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                assert!(
-                    stamp.is_none(),
-                    "a segment read as uncounted still wore a current stamp"
-                );
-            }
-
-            retiring.join().expect("the retire finishes");
-        });
-
-        assert!(
-            SAW_UNCOUNTED.load(std::sync::atomic::Ordering::Relaxed) > 0,
-            "no interleaving put the retire ahead of the read, so nothing was checked"
-        );
-    }
-
-    // the read-only form never brings a forgotten segment back
-    #[test]
-    fn a_read_never_resurrects_a_forgotten_segment() {
-        loom::model(|| {
-            let table = Arc::new(SegmentTable::new());
-            table.mark_live(SegmentId(1), Lsn(1), 1000);
-
-            let reading = {
-                let table = Arc::clone(&table);
-                loom::thread::spawn(move || {
-                    table.incarnation_of(SegmentId(1));
-                })
-            };
-
-            table.forget(SegmentId(1));
-            reading.join().expect("the read finishes");
-
-            assert!(
-                table.incarnation_of(SegmentId(1)).is_none(),
-                "a read put a forgotten segment back on the table"
-            );
-        });
-    }
-}
-
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1107,7 +1057,7 @@ mod tests {
         assert_eq!(table.dead_bytes(), 900);
     }
 
-    // the oldest sequence number excludes the named segment
+    // the oldest sequence number leaves out the given segment
     #[test]
     fn table_min_lsn_excludes() {
         let table = SegmentTable::new();
@@ -1120,7 +1070,7 @@ mod tests {
         assert_eq!(table.min_lsn_excluding(SegmentId(3)), Some(Lsn(3)));
     }
 
-    // a segment nothing recorded a ceiling for offers none rather than zero
+    // a segment with no recorded ceiling reports none
     #[test]
     fn table_max_lsn_starts_unknown() {
         let table = SegmentTable::new();
@@ -1190,8 +1140,7 @@ mod tests {
             ..SegmentBytes::default()
         };
 
-        // A record older than the tombstones could still be resurrected by dropping
-        // them, so they stay.
+        // A record older than the tombstones would come back if they dropped, so they stay.
         assert_eq!(bytes.droppable(Some(Lsn(4))), 0);
         // A floor above the newest tombstone puts every one of them below it.
         assert_eq!(bytes.droppable(Some(Lsn(20))), 500);
@@ -1224,7 +1173,7 @@ mod tests {
             let segment = SegmentId(segment);
             assert_eq!(floors.excluding(segment), table.min_lsn_excluding(segment));
         }
-        // Taking out the oldest promotes the runner-up rather than the next id.
+        // Taking out the oldest promotes the runner-up, whatever its id.
         assert_eq!(floors.excluding(SegmentId(1)), Some(Lsn(7)));
         assert_eq!(floors.excluding(SegmentId(3)), Some(Lsn(3)));
     }
@@ -1277,7 +1226,7 @@ mod tests {
         assert!(table.incarnation_of(SegmentId(2)).is_none());
     }
 
-    // a forgotten segment stamps nothing, and coming back it wears a fresh one
+    // a forgotten segment stamps nothing, even when asked for a live incarnation again
     #[test]
     fn incarnation_never_returns() {
         let table = SegmentTable::new();

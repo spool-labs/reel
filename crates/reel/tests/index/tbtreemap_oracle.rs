@@ -1,9 +1,4 @@
-//! The tbtreemap against the map it wants to replace, op for op
-//!
-//! A seeded stream of inserts, overwrites, removes and reads runs against the tree and a
-//! BTreeMap in lockstep, and every answer has to agree: the length after every mutation,
-//! every point read, every batched read through all three doors, every bounded range
-//! forwards and backwards, the ends, and the full ordered walk at every audit.
+//! The tbtreemap against BTreeMap, op for op on a seeded stream
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -16,24 +11,16 @@ use reel::index::tbtreemap::{TBTreeMap, TreeKey};
 type Key = [u8; 34];
 type Tree = TBTreeMap<[u8; 34], 32, u64>;
 
-/// A name key, which is what the object columns hold
-///
-/// The same stream runs against both shapes, since what differs is the half a fixed key
-/// never exercises: keys on the heap, a node that retunes its lead past the bucket its
-/// keys share, and a placement answering for a probe carrying no bucket the node knows.
+/// A variable-width key, like the object columns hold
 type Name = Box<[u8]>;
 
 const SEEDS: &[u64] = &[3, 41, 4173, 0x5eed];
 const OPS: usize = 20_000;
 const AUDIT_EVERY: usize = 512;
 
-/// A key from one of the two shapes the store actually holds
-///
-/// Slot led, a counter in the lead bytes the way records are keyed, or uniform the way
-/// signatures are. Both run in every stream, since the lead scan's tie handling only earns
-/// its keep where leads collide.
+/// A slot-led or uniform key, the two shapes the store holds
 fn draw_key(rng: &mut SmallRng, pool: &[Key]) -> Key {
-    // Half the draws revisit a key already seen, so overwrites and removes happen.
+    // Half the draws revisit a key already seen, so overwrites and removes happen
     if !pool.is_empty() && rng.gen_bool(0.5) {
         return pool[rng.gen_range(0..pool.len())];
     }
@@ -48,18 +35,14 @@ fn draw_key(rng: &mut SmallRng, pool: &[Key]) -> Key {
     key
 }
 
-/// A range bound over the fixed key space, drawn without regard to what is held
+/// A random range bound over the fixed key space
 fn fixed_bound(rng: &mut SmallRng) -> Key {
     let mut key = [0u8; 34];
     rng.fill(&mut key[..]);
     key
 }
 
-/// A name key from the shapes a bucket holds
-///
-/// Two buckets rather than one, because a leaf that straddles a boundary is the node
-/// whose keys agree on nothing and whose window has to fall back. Three name shapes, so
-/// the bytes the window tunes past run from none to sixty.
+/// A variable-width key in one of two buckets, with one of three path shapes
 fn draw_name(rng: &mut SmallRng, pool: &[Name]) -> Name {
     if !pool.is_empty() && rng.gen_bool(0.5) {
         return pool[rng.gen_range(0..pool.len())].clone();
@@ -87,7 +70,7 @@ fn draw_name(rng: &mut SmallRng, pool: &[Name]) -> Name {
     key.into_boxed_slice()
 }
 
-/// A range bound over the name space, including ones no bucket holds
+/// A range bound over the variable-width key space, including ones no bucket holds
 fn bound_name(rng: &mut SmallRng) -> Name {
     let mut key = vec![rng.gen_range(0x10u8..0x14); rng.gen_range(0..33)];
     let tail: u64 = rng.gen();
@@ -108,21 +91,13 @@ fn audit<K: TreeKey, const B: usize>(
         "seed {seed} op {at}: length diverged"
     );
 
-    let ends = (
-        tree.first_key_value().map(|(key, val)| (key.clone(), *val)),
-        tree.last_key_value().map(|(key, val)| (key.clone(), *val)),
-    );
-    let wanted_ends = (
-        oracle
-            .first_key_value()
-            .map(|(key, val)| (key.clone(), *val)),
-        oracle
-            .last_key_value()
-            .map(|(key, val)| (key.clone(), *val)),
-    );
+    let first = tree.first_key_value().map(|(key, val)| (key.clone(), *val));
+    let wanted_first = oracle
+        .first_key_value()
+        .map(|(key, val)| (key.clone(), *val));
     assert!(
-        ends == wanted_ends,
-        "seed {seed} op {at}: the ends diverged"
+        first == wanted_first,
+        "seed {seed} op {at}: the first key diverged"
     );
 
     let walked: Vec<(&K, u64)> = tree.iter().map(|(key, val)| (key, *val)).collect();
@@ -172,7 +147,7 @@ fn audit_ranges<K: TreeKey, const B: usize>(
                 .collect();
             assert!(walked == wanted, "seed {seed} op {at}: a range diverged");
 
-            // The same span the other way, which is what a page resuming backwards walks.
+            // The same span backwards, as a page resuming backwards walks it
             let back: Vec<(&K, u64)> = tree
                 .range_back(low, high)
                 .map(|(key, val)| (key, *val))
@@ -200,7 +175,7 @@ fn audit_batches<K: TreeKey, const B: usize>(
 ) {
     let pool: Vec<K> = oracle.keys().cloned().collect();
     let mut asked: Vec<K> = (0..37).map(|_| draw(rng, &pool)).collect();
-    // A duplicate in the batch must answer twice, not confuse the cursors.
+    // A duplicate in the batch must answer twice
     if let Some(first) = asked.first().cloned() {
         asked.push(first);
     }
@@ -214,10 +189,6 @@ fn audit_batches<K: TreeKey, const B: usize>(
     tree.get_many(&asked, &mut out);
     let got: Vec<Option<u64>> = out.iter().map(|found| found.copied()).collect();
     assert_eq!(got, wanted, "seed {seed} op {at}: get_many diverged");
-
-    tree.get_many_cold(&asked, &mut out);
-    let got: Vec<Option<u64>> = out.iter().map(|found| found.copied()).collect();
-    assert_eq!(got, wanted, "seed {seed} op {at}: get_many_cold diverged");
 
     let mut sorted = asked.clone();
     sorted.sort();
@@ -236,7 +207,7 @@ fn the_tree_agrees_with_the_oracle() {
     stream_against_the_oracle::<Key, 32>(&mut draw_key, &mut fixed_bound);
 }
 
-// and so does the tree the object columns hold, at keys with no width at all
+// and so does the tree over variable-width keys
 #[test]
 fn the_name_tree_agrees_with_the_oracle() {
     stream_against_the_oracle::<Name, 32>(&mut draw_name, &mut bound_name);
@@ -256,7 +227,7 @@ fn stream_against_the_oracle<K: TreeKey, const B: usize>(
         for at in 0..OPS {
             let key = draw(&mut rng, &pool);
             match rng.gen_range(0..10u32) {
-                // Inserts and overwrites dominate, the write path's shape.
+                // Inserts and overwrites dominate, the write path's shape
                 0..=4 => {
                     let val = rng.gen();
                     let mine = tree.insert(key.clone(), val);
@@ -272,7 +243,7 @@ fn stream_against_the_oracle<K: TreeKey, const B: usize>(
                     let theirs = oracle.remove::<K>(&key);
                     assert_eq!(mine, theirs, "seed {seed} op {at}: remove diverged");
                 }
-                // A value stepped in place has to land where a put would have left it.
+                // A value stepped in place has to land where a put would have left it
                 7 => {
                     let step = rng.gen::<u64>();
                     match (tree.get_mut(key.borrow()), oracle.get_mut::<K>(&key)) {
@@ -320,8 +291,7 @@ fn stream_against_the_oracle<K: TreeKey, const B: usize>(
         audit_ranges(&mut rng, &tree, &oracle, bound, seed, OPS);
         audit_batches(&mut rng, &tree, &oracle, draw, seed, OPS);
 
-        // The survivors, bulk loaded, are the same map again: the rebuild a decayed tree
-        // takes has to answer exactly as the tree it replaces.
+        // The survivors bulk loaded must answer exactly as the tree they replace
         let survivors: Vec<(K, u64)> = oracle
             .iter()
             .map(|(key, val)| (key.clone(), *val))
@@ -329,8 +299,7 @@ fn stream_against_the_oracle<K: TreeKey, const B: usize>(
         let rebuilt: TBTreeMap<K, B, u64> = TBTreeMap::from_sorted(survivors, B);
         audit(&rebuilt, &oracle, seed, OPS + 1);
 
-        // And packed in place, which is the same rebuild without the caller handing the
-        // survivors over, so the room a stream of removes left has to be gone.
+        // Repacking in place must also drop the room the removes left
         tree.repack(B);
         audit(&tree, &oracle, seed, OPS + 2);
         audit_ranges(&mut rng, &tree, &oracle, bound, seed, OPS + 2);
@@ -388,7 +357,7 @@ fn the_empty_tree_agrees() {
     audit(&tree, &oracle, 7, 0);
     audit_ranges(&mut rng, &tree, &oracle, &mut fixed_bound, 7, 0);
     audit_batches(&mut rng, &tree, &oracle, &mut draw_key, 7, 0);
-    // Packing nothing is not a special case anywhere else, so it is one here.
+    // Repacking an empty tree must work too
     tree.repack(32);
     audit(&tree, &oracle, 7, 1);
 }
@@ -401,7 +370,7 @@ fn a_bulk_load_lands_what_the_key_at_a_time_load_lands() {
         out[..8].copy_from_slice(&at.to_be_bytes());
         out
     };
-    // Every repeat shape: a pair, a longer run, one across a leaf boundary, singletons.
+    // Every repeat shape: a pair, a longer run, one across a leaf boundary, singletons
     let mut run: Vec<(Key, u64)> = Vec::new();
     for at in 0..200u64 {
         let repeats = match at % 7 {
@@ -436,7 +405,7 @@ fn a_bulk_load_lands_what_the_key_at_a_time_load_lands() {
         let wanted: Vec<(Key, u64)> = oracle.iter().map(|(key, val)| (*key, *val)).collect();
         assert_eq!(walked, wanted, "fill {fill}: the bulk walk diverged");
 
-        // Every key taken out, since a second place only shows once the first has gone.
+        // Take every key out, since a second copy only shows once the first has gone
         let mut bulk = bulk;
         for (key, _) in &wanted {
             assert_eq!(
@@ -459,10 +428,6 @@ fn a_bulk_load_lands_what_the_key_at_a_time_load_lands() {
 }
 
 // a node that empties and fills again answers for the keys it holds now
-//
-// A leaf holding one key agrees with itself on the whole width, so its window moves to
-// the end of it. What replaces that key agrees on as many bytes and on different ones,
-// which is a window unchanged by every measure except the one that matters.
 #[test]
 fn a_refilled_node_places_probes_against_what_it_holds_now() {
     const LEAVES: u64 = 8;
@@ -474,8 +439,7 @@ fn a_refilled_node_places_probes_against_what_it_holds_now() {
         key
     };
 
-    // A fill of one is the shape that puts a single key in every node, leaf and
-    // separator alike, which is where a width-wide window comes from.
+    // A fill of one puts a single key in every node, which gives a full-width window
     let first: Vec<(Key, u64)> = (0..LEAVES).map(|at| (held(at, 0), at)).collect();
     let mut tree: Tree = TBTreeMap::from_sorted(first.clone(), 1);
     for (key, at) in &first {
@@ -517,7 +481,7 @@ fn a_shared_lead_moves_the_window_and_still_answers() {
     let mut tied_keys = Vec::with_capacity(COUNT);
     let mut spread_keys = Vec::with_capacity(COUNT);
     for at in 0..COUNT as u64 {
-        // An address, an epoch, a pubkey: every key in the scan carries them identically.
+        // Every key shares its first eight bytes and differs only in a counter
         let mut key: Key = [0x5a; 34];
         key[8..].copy_from_slice(&[0u8; 26]);
         key[8..16].copy_from_slice(&at.to_be_bytes());
@@ -534,11 +498,6 @@ fn a_shared_lead_moves_the_window_and_still_answers() {
     assert_eq!(spread.len(), COUNT, "the spread tree lost keys");
 
     assert!(
-        tied.lead_skip() >= 8.0,
-        "a node holding keys that agree on eight bytes moved its window {:.1} bytes",
-        tied.lead_skip(),
-    );
-    assert!(
         tied.tie_rate() < 0.01,
         "keys sharing eight leading bytes reported a tie rate of {:.4}",
         tied.tie_rate(),
@@ -549,7 +508,7 @@ fn a_shared_lead_moves_the_window_and_still_answers() {
         spread.tie_rate(),
     );
 
-    // The answers are the point: the window moves the lead and changes nothing else.
+    // The window moves the lead and changes no answer
     for (at, key) in tied_keys.iter().enumerate() {
         assert_eq!(
             tied.get(key),
@@ -565,8 +524,7 @@ fn a_shared_lead_moves_the_window_and_still_answers() {
         );
     }
 
-    // A probe carrying none of the bytes the nodes share is placed by that
-    // comparison rather than by a lead read from past bytes it does not have.
+    // A probe that lacks the shared bytes is placed by comparing those bytes
     for edge in [0x00u8, 0xff] {
         let mut outside: Key = [0x5a; 34];
         outside[0] = edge;
@@ -577,7 +535,7 @@ fn a_shared_lead_moves_the_window_and_still_answers() {
         );
     }
 
-    // The order comes from the whole keys, whatever the window reads.
+    // The order comes from the whole keys, whatever the window reads
     let walked: Vec<Key> = tied.iter().map(|(key, _)| *key).collect();
     let mut wanted = tied_keys.clone();
     wanted.sort();

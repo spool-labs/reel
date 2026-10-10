@@ -3,16 +3,12 @@
 use crate::format::column::{KeyBytes, RecordKey};
 use crate::format::loc::{Loc, SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
-use crate::format::record::HEADER_LEN;
+use crate::format::record::RecordLayout;
 
-/// Segment number no record can sit in, which is what tells a grave from an entry
-///
-/// Segments are numbered from one, so an entry pointing here points nowhere.
+/// No record sits in segment zero, so an entry pointing there is a grave
 const NO_SEGMENT: SegmentId = SegmentId(0);
 
 /// One resident index entry: where the live record is and which version it is
-///
-/// Twenty-four bytes, every one of them read on the path that resolves a key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Entry {
     /// Location of the live record within the reel
@@ -21,14 +17,12 @@ pub struct Entry {
     /// Sequence number of the version this entry resolves to
     pub lsn: Lsn,
 
-    /// The life of the segment the location was learned under
+    /// The segment's incarnation when the location was learned
     pub incarnation: SegmentIncarnation,
 }
 
 impl Default for Entry {
-    /// A place in a node that has not been filled yet
-    ///
-    /// Deliberately the entry no read can mistake for a live one.
+    /// A filler for an unused node slot, which no read can take for a live entry
     fn default() -> Entry {
         Entry::new(Loc::new(SegmentId(0), 0, 0), Lsn::NONE)
     }
@@ -44,7 +38,7 @@ impl Entry {
         }
     }
 
-    /// The same entry wearing the segment life it was resolved under
+    /// The same entry stamped with the segment incarnation it was resolved under
     pub fn stamped(self, incarnation: SegmentIncarnation) -> Entry {
         Entry {
             incarnation,
@@ -52,10 +46,7 @@ impl Entry {
         }
     }
 
-    /// Repoint the entry at a rewritten copy of the same record
-    ///
-    /// The copy sits in another segment, so the stamp is the destination's and
-    /// never the one this entry was wearing.
+    /// Repoint the entry at a rewritten copy of the same record, with the destination's stamp
     pub fn moved_to(&self, loc: Loc, incarnation: SegmentIncarnation) -> Entry {
         Entry {
             loc,
@@ -64,29 +55,17 @@ impl Entry {
         }
     }
 
-    /// A tombstone holding a key's place so a late older put cannot take it
-    ///
-    /// Writers publish in whatever order they finish, so the sequence number left
-    /// on the key is what refuses a put that was drawn earlier and arrived later.
-    /// This form remembers nothing about where the tombstone landed, which on a
-    /// paged column is a grave nothing can ever retire.
+    /// A grave holding a key's place against a late older put, with no tombstone segment
     pub fn grave(lsn: Lsn) -> Entry {
         Entry::grave_from(lsn, NO_SEGMENT)
     }
 
-    /// A grave that remembers which segment its tombstone record landed in
-    ///
-    /// A sealed footer still names the deleted record and is never told about the
-    /// delete, so what ends a paged grave's job is its own tombstone reaching a
-    /// footer. The segment rides in the offset a grave has no use for.
+    /// A grave that remembers its tombstone's segment, kept in the unused offset
     pub fn grave_from(lsn: Lsn, tombstone: SegmentId) -> Entry {
         Entry::new(Loc::new(NO_SEGMENT, tombstone.as_u32(), 0), lsn)
     }
 
-    /// The segment holding the tombstone that left this grave, if it named one
-    ///
-    /// Nothing comes back for a grave no tombstone record stands behind, which is
-    /// one a paged column can never retire.
+    /// The segment holding the tombstone behind this grave, if it has one
     pub fn grave_origin(&self) -> Option<SegmentId> {
         match self.is_grave() && self.loc.offset != NO_SEGMENT.as_u32() {
             true => Some(SegmentId(self.loc.offset)),
@@ -94,27 +73,23 @@ impl Entry {
         }
     }
 
-    /// Whether this holds a key's place rather than naming a record
+    /// Whether this holds a key's place with no record behind it
     pub fn is_grave(&self) -> bool {
         self.loc.segment == NO_SEGMENT
     }
 
-    /// On-disk footprint of the record, its header, key, and payload together
+    /// On-disk footprint of the record, keyless when small
     pub fn span(&self, key_width: u16) -> u64 {
         span_of(key_width, self.loc.len)
     }
 }
 
-/// On-disk footprint of a record with this key width and payload length
+/// On-disk footprint of a record with this key width and payload length, keyless when small
 pub fn span_of(key_width: u16, len: u32) -> u64 {
-    HEADER_LEN as u64 + u64::from(key_width) + u64::from(len)
+    RecordLayout::KEYLESS.prefix_len(key_width as usize, len) as u64 + u64::from(len)
 }
 
-/// A half-open key range one tombstone covers, and the version it covers it at
-///
-/// A range tombstone is the one record whose effect is not settled by comparing
-/// sequence numbers on a single key, so anything replaying the log out of order
-/// keeps it and tests later records against it.
+/// A range tombstone's half-open key range and the lsn it was drawn at
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RangeCover {
     /// Column and inclusive start of the range
@@ -123,7 +98,7 @@ pub struct RangeCover {
     /// Exclusive end, or nothing when the range runs to the top of the column
     pub end: Option<KeyBytes>,
 
-    /// Sequence number the delete was drawn at
+    /// The delete's sequence number
     pub lsn: Lsn,
 }
 
@@ -185,8 +160,7 @@ mod tests {
         ));
     }
 
-    // an entry is the pointer, the version and the stamp, with no padding, and the
-    // width is held to the number because every resident key pays it
+    // an entry is a pointer, a version and a stamp in 24 bytes with no padding
     #[test]
     fn entry_width() {
         assert_eq!(std::mem::size_of::<Entry>(), 24);

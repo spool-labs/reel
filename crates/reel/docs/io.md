@@ -1,267 +1,228 @@
 # IO: backends, the page cache, and the decisions
 
-Every number here states the machine it came from and whether the working set
-fit in memory, because on this engine that has already been the difference
-between a finding and its opposite twice. The operator knobs are documented on
-the config types; this file is the design record. Which machine to believe: a
-bare-metal box's device numbers and any box's CPU numbers, never a mac's device
-numbers, and never a VM's, whose host cache has already faked two conclusions
-(`O_DIRECT` looked 6x faster under a virtualized filesystem and is 3x slower on
-real NVMe).
+Every number here lists its machine and whether the working set fit in memory, since that has
+flipped a finding twice. Trust a bare-metal box's device numbers and any box's CPU numbers.
+Distrust device numbers from a mac or a VM: a VM's host cache faked two conclusions, and
+`O_DIRECT` looked 6x faster under a virtualized filesystem and is 3x slower on real NVMe. The
+config types document the operator knobs.
 
-## Three backends and what each is for
+## Backends
 
-**posix** is the portable floor and the one that ships. Synchronous, one
-syscall per op on the calling thread, no completion queue and no handoff. It
-is a benchmarked production path rather than a last resort.
+| backend | what it does | where |
+|---|---|---|
+| `posix` (default) | Synchronous, one syscall per op on the calling thread, no completion queue, no handoff. A benchmarked production path. | everywhere |
+| `uring` | Buffered ring that submits through the page cache. A production path. | Linux |
+| `uring_direct` | Opens descriptors `O_DIRECT` and stages every op through block-aligned buffers. | Linux, a buffered volume elsewhere |
 
-**uring** is the buffered ring on Linux. It submits through the page cache
-rather than around it, and it is a production path.
-
-**uring_direct** opens the volume's descriptors `O_DIRECT` and stages every op
-through a block-aligned buffer. Linux only, and it resolves to a buffered
-volume anywhere else.
-
-**On ext4 a buffered ring is a queue in front of a worker pool.** A buffered op
-there punts to `io_wq`, and one probe on one kernel says so plainly: two
-`iou-wrk` threads through every buffered phase on an ext4 loop device, zero
-through all of them on btrfs, and zero through the direct phases on ext4. So on
-ext4 a `uring` volume hands its work to a kernel worker pool that does the
-blocking call on the engine's behalf, which is a thread handoff bought with a
-submission and not an asynchronous op, and the compaction wave further down
-prices it at 41 percent of a drain's cycles. The fleet runs ext4, where the ring is
-decorative on a buffered volume and `uring_direct` is the answer: the descriptor
-bypasses the page cache, the request reaches the device from the submitting
-thread, and no worker stands in between. An operator who wants the page cache on
-ext4 should read the posix rows rather than the ring's.
+**On ext4 a buffered ring is a queue in front of a worker pool.** A buffered op there punts to
+`io_wq`. One probe on one kernel saw two `iou-wrk` threads through every buffered phase on an
+ext4 loop device, and zero through all of them on btrfs or through the direct phases on ext4.
+So a `uring` volume on ext4 pays a submission to hand its blocking call to a kernel worker, and
+that costs 41 percent of a compaction drain's cycles. The fleet runs ext4, so there
+`uring_direct` is the answer: the request reaches the device from the submitting thread. For
+the page cache on ext4, read the posix rows.
 
 ## How one is chosen
 
-`select_backend` runs at open and never fails the open over a backend choice.
+`select_backend` runs at open and never fails the open over a backend.
 
-- `posix` is the default and is taken as configured, without asking the kernel
-  for anything.
-- `uring` and `uring_direct` set a ring up at open. A setup the kernel refuses
-  warns once and runs posix, so a volume never fails to open over a backend.
+- `posix` is taken as configured, without asking the kernel anything.
+- `uring` and `uring_direct` build a probe ring. If the kernel refuses, or off Linux, the volume
+  logs one warning and runs posix. Docker's default seccomp profile blocks the io_uring
+  syscalls, so in a container setup sees `EPERM` and the volume runs posix.
+- A direct volume that ends up on posix keeps its direct descriptors. The backend only picks
+  who submits the op.
+- Each thread builds its own ring the first time it submits. A thread that cannot build one runs
+  its ops on posix.
 
-A direct volume that ends up on posix keeps its direct descriptors. The
-backend choice picks who submits the op, and whether the page cache stands
-behind the file is a property of the volume.
+## What the ring measured
 
-Containers are the one environment that refuses the ring from outside:
-Docker's default seccomp profile blocks the io_uring syscalls, the setup sees the
-`EPERM`, and the volume runs posix with one warning.
+A cross-thread handoff costs 16,321 ns on a ccx33 and 2,395 ns on a native M4, while a 100 byte
+write syscall on the ccx33 costs 860 ns. Anything that pays a handoff to save a syscall loses
+there, and everything that did lost: the ring's completion inbox, the kernel wait, and a
+batched drain at every record size. The machines also disagree on the answer. A batch at depth
+32 loses everywhere on the ccx33 and pays at 4 KiB and above on the mac, so a batched drain
+would need a startup probe. Neither exists.
 
-## What the ring measured, and the ruling
+The first ring sent completions back through one poller inbox at a lock and a wakeup each, and
+context switches per op climbed with writer count where posix stayed flat. Today the blocking
+doors run on the caller's own `SINGLE_ISSUER` ring, and an async caller hands ops to one engine
+thread per shard through a bounded inbox.
 
-A cross-thread handoff costs 16,321 ns on a ccx33 against 2,395 ns on a native
-M4, while the ccx33's syscalls are cheaper, 860 ns for a 100 byte write.
-Anything that pays a handoff to save a syscall loses there, and everything that
-does lost: the ring's completion inbox, the kernel wait, and a batched drain at
-every record size. The two machines disagree about the answer, not just the
-numbers, a batch at depth 32 loses everywhere on the ccx33 and pays at 4 KiB and
-above on the mac, which is why a batched drain would have to probe at startup
-rather than be compiled in. No such probe exists, and the batched drain is not
-built.
+**How a waiter waits.** It spins while the ring holds only writes and sleeps in the kernel once
+a read is out. On the beast box a spin on a write-only ring gives 8.1 us against 13.0 us at the
+commit p50, and the same spin with reads in the mix burns 10.8x the cycles for nothing. Ring
+numbers recorded before a sweep could separate the two all included a spin. On a 9975WX, 1 to
+64 threads, 4 KiB:
 
-The ring's own shape is the other half: completions come back through a
-single poller inbox that costs a lock and a wakeup each, which shows up as
-context switches per op climbing with writer count where posix stays flat.
-No registered buffers, no single-issuer rings.
+| | spin | sleep |
+|---|---|---|
+| speed | faster by 3 to 9 percent at low thread counts, 0.6 percent at 64 | |
+| CPU | 543 percent | 405 percent |
+| involuntary context switches | 263,263 | 106,523 |
+| reads | 5,344 to 6,706 MB/s | the same, the device is the limit |
 
-**How a waiter waits, and a caveat on early ring rows.** The wait follows what the
-ring is holding and nothing selects it: it spins while the ring holds only writes
-and sleeps in the kernel once a read is out. Spinning a write-only ring is worth
-8.1 us against 13.0 us at the commit p50 on the beast box, and the same spin with
-reads in the mix burns 10.8x the cycles for nothing. Until a sweep could separate
-the two, every ring number ever recorded priced a spin whether or not it said so.
-Measured on a 9975WX across 1 to 64 threads at 4 KiB, spin is the faster of the
-two at every thread count, by 3 to 9 percent low and 0.6 percent at 64, and what
-it costs is CPU: 543 percent against 405, and 263,263 involuntary context switches
-against 106,523. Reads are flat across both at 5,344 to 6,706 MB/s, which is the
-device rather than the backend, so the sleeping half gives up no throughput at all.
+**The ring is no write lever on that box.** The 129-row backend sweep of the same day put posix
+and uring within 1 percent from 64 KiB up. At 4 KiB and one thread uring is 14 percent slower,
+2,632 against 3,067 MB/s. Under `O_DIRECT` they agree within 1 to 5 percent at every cell,
+because the syscall stops being the cost once the volume is direct.
 
-**The ring is not a write lever on that box at all.** The 129-row backend sweep
-of the same day put posix and uring within 1 percent of each other from 64 KiB
-up, and at 4 KiB and one thread uring is 14 percent *slower*, 2,632 against
-3,067 MB/s. Under O_DIRECT the two agree within 1 to 5 percent at every cell,
-because the syscall is not the cost once the volume is direct.
+**Cold reads are a different trade.** A get is one `pread` on the calling thread, so queue depth
+is the number of concurrent callers. One cold reader gets 7 percent of the device and sixty-four
+saturate it. A 16 us handoff to gain depth on a 101 us cold read is a different trade from one
+that saves a 0.9 us syscall. Measured, batching a lone reader is worth 1.54x against the 15.5x the
+depth arithmetic implies, and batching a crowded volume takes depth away. So the ring follows
+the callers. `get_many` resolves and submits a batch in one call and merges physically adjacent
+records into one read, and only a ring turns a scattered batch into outstanding reads.
 
-That reasoning was taken entirely on writes that land in the page cache, and
-cold reads are the other trade: a get is one `pread` on the calling thread,
-so queue depth is the concurrent caller count, one cold reader gets 7 percent
-of the device and sixty-four saturate it. Paying a 16 us handoff to gain depth
-on a 101 us cold read is a different trade from paying it to save a 0.9 us
-syscall. The measured ruling: batching a lone reader is worth 1.54x, not the
-15.5x the depth arithmetic implies, and batching a crowded volume takes depth
-away, so the ring follows the callers rather than leading them. `get_many`
-resolves and submits a batch in one call and merges physically adjacent
-records into one read; only a ring would turn a scattered batch into
-outstanding reads.
+Agave's production ring serves accounts storage and snapshots, bulk sequential file movement,
+and never the blockstore, the key-value workload this engine replaces. Expect a ring's win on
+the cold read path and nowhere else.
 
-Agave's own precedent points the same way: its production ring reaches
-accounts storage and snapshots, bulk sequential file movement, and never the
-blockstore, the key-value workload this engine replaces. Expect a ring's win
-on the cold read path and nowhere else.
+## Which door an op took
 
-## Which door an op actually took, and why it has to be askable
+The ring backend silently hands these ops to posix:
 
-The ring backend does not serve everything it is handed. A direct volume takes
-no ring at all, since `takes_ring` reads `!is_direct`; a vectored write past the
-kernel's iovec cap has nowhere to split inside a submission, so it goes to the
-posix backend that can walk it in capped calls; a caller on a thread that could
-not build a ring falls through as well; and `Ring::stage` sends anything whose
-op names no ring file, or whose descriptor the table refuses, straight to
-`posix.dispatch`. Every one of those is correct and every one of them is silent.
+- every op on a direct volume with `registered_buffers` off (`takes_ring`)
+- a vectored write past the kernel's iovec cap, which a submission cannot split, so posix walks
+  it in capped calls
+- a write wider than `DIRECT_REQUEST_BYTES`, or a read past the kernel's per-call cap
+- every op from a thread that could not build a ring
+- from `Ring::stage`, an op with no ring file, a descriptor the table refuses, or a direct op the
+  registered pool cannot serve
 
-That is fine until a leg reports a ring number. A compaction wave measured
-2026-08-11 lost 4 KiB to posix by 3.06x, and the first suspicion was that those
-rows had never touched the ring, because a uring row that fell through is a posix
-row wearing a uring label and no other column tells them apart. That suspicion
-was wrong: the ring was genuinely in use and the cost is the kernel punting
-buffered writes to `io_wq`, 41 percent of the drain's cycles.
+So a uring row that fell through is a posix row with a uring label. When a compaction wave on
+2026-08-11 lost 4 KiB to posix by 3.06x, the first suspicion was that its rows never touched the
+ring. The ring was in use, and the cost was the kernel punting buffered writes to `io_wq`, 41
+percent of the drain's cycles. Proving it took a box, `perf` on the drain and a look at open fds,
+and an open `io_uring` fd shows a ring exists and says nothing about any one op.
 
-What it cost to find out is the point. It took a box, `perf` attached to the
-drain through a marker the bench had to learn to print, and an inspection of the
-process's open fds, and two open `io_uring` fds prove a ring exists rather than
-that any particular op went down it.
+`ReelIo::door_counts` answers directly, and `IoDriver` and `ReelStore` forward it beside
+`sync_count`:
 
-`ReelIo::door_counts` makes it a printed line instead. `reached_ring` says
-whether any op on the backend went on a ring and `off_ring` counts the ones that
-did not, forwarded through `IoDriver` and `ReelStore` beside `sync_count`. The
-door tables in the backend sweep print it per sweep, so the reading that cost
-a box session is now the row's own testimony, and a leg that never reached the
-ring says so before anyone reads its numbers.
+| field | meaning |
+|---|---|
+| `reached_ring` | any op on this backend went on a ring |
+| `off_ring` | ops handed to another backend |
+| `pool_refused` | the kernel refused a thread's buffer pool |
+| `files_refused` | the kernel refused a ring's sparse file table |
 
-It is priced so it cannot distort the rows it exists to check. The ring side is a
-relaxed load of a flag that stops changing after the first op, so the line stays
-shared and the hot path pays a predictable branch rather than a store per op;
-only the fall-through pays an atomic add, and a fall-through hot enough for that
-to show is the answer rather than the cost. A backend with no ring answers that
-nothing reached one and nothing fell off one, so a posix leg prints no line.
+The count cannot distort the rows it checks. The ring side is a relaxed load of a flag that
+stops changing after the first op, so the line stays shared and the hot path pays a
+predictable branch. Only a fall-through pays an atomic add. A backend with no ring reports that
+nothing reached one and nothing fell off one.
 
-## The one write wide enough to leave the ring
+## Wide writes leave the ring
 
-Every write reel issues waits for its own completion: `writev` goes down
-`submit_inline`, which stages one op and waits for that op. A ring write has no
-batch to travel with, so what the ring is worth on the write path is not the
-submission itself but whatever else rides in the same `io_uring_enter`.
+Every write reel issues waits for its own completion: `writev` goes down `submit_inline`, which
+stages one op and waits for it. So a ring write is worth only what else shares its
+`io_uring_enter`.
 
-A seal traced on ext4 in a container, 400k records into 24 MiB segments, put one
-9,628,877 byte `Writev` on the ring against 1,563 record writes that were all
-128 KiB or under. The wide one is a segment's whole sorted footer, and the
-kernel answers it on an `iou-wrk` worker while the sealer waits on the
-completion: the same wait, one thread further away. Writes leave the ring above
-`DIRECT_REQUEST_BYTES` now, which is where the direct door already stopped
-serving them, so both doors agree on what a ring write is and the footer blocks
-on the thread that issued it. That thread is the sealer, which owns a footer
-sort and an `fsync` already.
+A seal traced on ext4 in a container, 400k records into 24 MiB segments, put one 9,628,877 byte
+`Writev` on the ring beside 1,563 record writes of 128 KiB or less. The wide one was a segment's
+sorted footer, and the kernel served it on an `iou-wrk` worker while the sealer waited. Writes
+now leave the ring above `DIRECT_REQUEST_BYTES` (128 KiB), where the direct door already stops,
+so the footer blocks on the sealer, which already owns a footer sort and an `fsync`.
 
-Chunking the footer into 512 KiB ring submissions was the alternative, so that
-several requests reach the device from one enter. The same trace rules against
-it: with every write forced off the ring the process's peak `iou-wrk` count went
-2 to 0, so on ext4 a chunk buys another worker punt rather than another queued
-request, and twenty of them would need short-write and ordering bookkeeping for
-a write whose caller wants one count. The sealer's next act is `sync_full`,
-which serialises whatever the chunks won.
+Splitting the footer into 512 KiB ring submissions was ruled out by the same trace. With every
+write forced off the ring the peak `iou-wrk` count went from 2 to 0, so on ext4 each piece buys
+another worker punt. Twenty pieces would also need short-write and ordering bookkeeping, and the
+sealer's next step is `sync_full`, which serialises whatever they gained.
 
-## Direct io and its alignment tax
+## Direct io
 
-Bypassing the page cache moves three constraints onto the caller: the file
-offset, the byte count, and the buffer's own address all have to sit on a
-block boundary.
+Bypassing the page cache puts the file offset, the byte count and the buffer address on a block
+boundary.
 
-Writes are already framed. A whole-block volume reserves each record on a
-boundary and closes it with a pad, so staging a write is a gather into one
-aligned run.
+- **Writes are already framed.** A whole-block volume reserves each record on a boundary and
+  closes it with a pad, so staging a write is one gather. Framing follows
+  `IoBackend::is_direct()`, so a direct volume that falls back to posix still frames on blocks.
+- **Reads widen** to the blocks around the record, and the caller's bytes are copied out of the
+  middle. That copy is the direct read tax.
+- **The widening fetches no extra bytes.** `Advice::Random` is on every reader descriptor, so a
+  buffered miss faults whole pages with no readahead and fetches `L + 4095` bytes on average.
+  The covering span fetches `L + BLOCK - 1`, the same bytes at `BLOCK == 4096`.
+- **The posix staging buffer is one per thread**, because a per-read aligned allocation is the
+  whole of a small direct read's penalty.
+- **On a ring, direct data ops use registered buffers**, 32 per ring at 128 KiB plus a block
+  each, since a direct descriptor refuses the caller's own buffers. With `registered_buffers`
+  off, or a pool the kernel refused, they take the posix staging path.
 
-Reads have no such trick. A record lives wherever the drain that wrote it put
-it, so a point read asks for an offset and a length aligned to nothing. The
-read widens to the blocks containing the record and the caller's bytes are
-cut out of the middle, which is a copy the buffered path does not pay.
-Against a buffered read that was going to be cached anyway, that is a
-straight loss, and the measured 62x worse reads on the ccx33 are that.
+| box | direct reads against buffered |
+|---|---|
+| ccx33 | 62x worse |
+| 9950X | did not reproduce |
+| 9975WX | 59x worse at 4 KiB |
 
-The widening is not itself an amplification, which is what makes a ranged read
-route possible. `Advice::Random` is on every reader descriptor, so a buffered
-miss faults whole pages with no readahead and fetches `L + 4095` bytes on
-average; the covering span fetches `L + BLOCK - 1`, and at `BLOCK == 4096` those
-are the same bytes. The staging copy is the price, and on a cold read whose pages
-nothing will ask for again it is cheaper than the page cache work it replaces.
-The staging buffer is per thread rather than per read, because the per-read
-aligned allocation is the whole of a small direct read's penalty.
+Two boxes of three, so the tax is the common case. Against a read the page cache would have
+served anyway the copy is a straight loss. On a cold read whose pages nothing will ask for again
+it is cheaper than the page cache work it replaces.
 
-The ring also takes nothing while a volume is direct. A data op's buffers
-belong to the caller and sit wherever the allocator put them, which a direct
-descriptor refuses, so those ops go to the staging path instead. Putting them
-back on the ring is the registered-buffer work.
+**The submitter stops mattering once the descriptor is direct.** A removed fourth arm, posix over
+direct descriptors, agreed with `uring_direct` within 1 to 5 percent in every cell on the 9975WX
+at 16 GiB cells, writes and reads alike. The ring's whole advantage is on the buffered side.
 
-**The submitter stops mattering once the descriptor is direct.** A fourth arm,
-a posix backend over direct descriptors without the ring, was built to price the
-submitter and the cache policy separately. Measured on the 9975WX at 16 GiB cells
-it agreed with `uring_direct` to within 1 to 5 percent in every cell, writes and
-reads alike, so **the ring buys nothing once the descriptor is direct** and the
-ring's whole advantage lives on the buffered side. The arm is gone; `servo.md`
-carries the table it produced.
+## Why `O_DIRECT` is not the default
 
-Getting there took one predicate. `writes_whole_blocks` matched the ring's direct
-arm alone, so a posix direct volume was never framed on a boundary and
-`direct_writev` refused its first record for starting at offset 27. Two other
-sites had the same shape. They ask `IoBackend::is_direct()` now.
+On the one box whose device numbers are worth trusting, direct measured 3x slower than buffered
+on writes and 62x worse on reads, and it pays a staging copy. A per-op cache hint gave buffered
+writes without keeping pages or alignment rules, measured faster than direct, and still lost to
+keeping pages. The one argument left for direct is that ingest stops coupling to a metadata
+volume's dirty-page accounting, which is unmeasured on hardware that could show it.
 
-The read tax is the part that does not go away. A record sits wherever its drain
-put it, so a direct point read widens to covering blocks and copies out of the
-middle. The 62x above is the ccx33 and the 9950X did not reproduce it; the
-9975WX does, at 59x on 4 KiB reads. Two boxes to one, so the tax is the common
-case rather than the exception.
+The ruling covers the default for a whole volume. The 62x compared a warm set served from cache
+with a volume that had no cache, and the same loss prices at 7.5x. It says nothing about a cold
+read whose pages nothing will ask for again.
 
 ## The page cache
 
-**A buffered volume keeps its pages, unconditionally.** There was a knob for
-giving them back, per read and per write on Linux 6.14 and up and by
-`posix_fadvise(DONTNEED)` behind the write head anywhere else, and the measured
-story killed it: keeping pages is never badly wrong, dropping cost 47x on reads
-that follow writes, and even past RAM, where the cache cannot help, the per-op
-flag still cost 2.9x on writes because it gives up dirty page batching. There is
-no regime on this kernel and filesystem where dropping is faster, and what was
-left of its case, freeing memory for another process, never justified two code
-paths and a probe.
+**A buffered volume always keeps its pages.** A knob to give them back, per op on Linux 6.14 and
+up and by `posix_fadvise(DONTNEED)` behind the write head elsewhere, was removed. Keeping pages
+is never badly wrong. Dropping cost 47x on reads that follow writes, and even past RAM the per-op
+flag cost 2.9x on writes because it gives up dirty page batching. No regime on this kernel and
+filesystem made dropping faster. A volume that would want it, a metadata volume or a tier whose
+hot set lives behind a CDN edge, is not this engine's volume.
 
-Two things learned there are worth keeping. **The filesystem decides, not just the
-kernel**: ext4 accepted the per-op flag and btrfs refused it with `ENOTSUP` on the
-same kernel, so a Linux version test is not enough to know whether a flag applies.
-And the retirement rule that made a refusal safe: the first flagged op is the
-probe, and a flag that has once been accepted never retires, so a real error on a
-working kernel is reported rather than swallowed. The cold-window route still runs
-on exactly that rule.
+Two lessons stay:
 
-Writeback is still paced: a megabyte at a time behind the write head, so the device
-is busy while the writer is still copying.
+- **The filesystem decides as well as the kernel.** ext4 took the per-op flag and btrfs refused
+  it with `ENOTSUP` on the same kernel, so a Linux version check cannot tell whether a flag
+  applies.
+- **The retirement rule.** The first flagged op is the probe, and a flag the kernel has accepted
+  once never retires, so a real error on a working kernel is reported. The warm read probe runs
+  on this rule.
+
+Writeback is paced a megabyte at a time behind the write head, so the device is busy while the
+writer still copies.
 
 ## Readahead
 
-Sealed segments open with the readahead hint off. Every reader here asks for
-a range it already knows, a point read framed from the index or a whole scan
-window, so a kernel guessing ahead of a small record faults pages nobody
-wants. The hint is one call per descriptor rather than per read, and a
-platform without an equivalent drops it.
+Every segment a reader opens gets the readahead hint off. Each reader asks for a range it
+already knows, a point read framed from the index or a whole scan window, so readahead only
+faults pages nobody wants. The hint is one call per descriptor, and a platform without one skips
+it.
 
 ## The mapped fault window
 
-What `map_above` is priced against. A warm mapped read skips the kernel
-crossing a pread pays, which took the agave point rows from 0.75x of the
-baseline engine to 1.59x. A cold fault fetches a fixed window around the
-record instead of the record. Measured cold random on a 9950X, device bytes
-over bytes asked: 55.4x at 4 KiB, 14.0x at 16 KiB, 6.0x at 64 KiB, 2.1x at
-256 KiB, a near constant fetch of about 225 KiB an access. Above the floor a
-mapping is most of a win, below it a large loss, which is why the setting is
-a byte floor and not a switch.
+`map_above` is the smallest record served from a read-only mapping. A warm mapped read skips
+the kernel crossing a pread pays, which took the agave point rows from 0.75x of the baseline
+engine to 1.59x. A cold fault fetches a fixed window of about 225 KiB around the record. Cold
+random on a 9950X, device bytes over bytes asked:
 
-### Remeasured 2026-08-09, and the floor is unfitted
+| record | amplification |
+|---|---|
+| 4 KiB | 55.4x |
+| 16 KiB | 14.0x |
+| 64 KiB | 6.0x |
+| 256 KiB | 2.1x |
 
-On a ccx33, kernel 7.0, ext4, by `tests/probes/mapped_reads.rs`. Cold is past memory,
-40 GiB a leg, so neither plane can retain; warm is a second pass over a set
-already resident. Mapped over unmapped, so above one the mapping wins.
+Above the floor a mapping is mostly a win and below it a large loss, so the setting is a byte
+floor.
+
+### Remeasured 2026-08-09
+
+ccx33, kernel 7.0, ext4. Cold is past memory, 40 GiB a leg, so neither plane can keep its
+pages. Warm is a second pass over a resident set. Above one the mapping wins.
 
 | plane | record | mapped/unmapped |
 |---|---|---|
@@ -271,311 +232,209 @@ already resident. Mapped over unmapped, so above one the mapping wins.
 | cold | 4 KiB | 0.81 |
 | cold | 64 KiB | **1.25** |
 
-Two things move.
+- **The warm win at agave's record sizes is six to sixteen times**, far above 1.59x. The
+  blockstore integration set `MAP_EVERYTHING` on that bet.
+- **The cold penalty is gone at 64 KiB**, where a cold mapped read beats a pread. The 6.0x row
+  is device bytes on another machine and kernel and this one is wall clock, so it does not
+  refute the window. It does mean the 2 MiB floor the servo picks does not reproduce as time on
+  this box, and refitting it needs both quantities from one machine.
+- **`MADV_RANDOM` on the mapping was measured and reverted.** It measured neutral at a page,
+  0.82 against 0.81, and 8x worse above one, 0.15 against 1.25 at 64 KiB. Fault-around and
+  mapped readahead turn a sixteen-page record into one or two faults, and the advice switches
+  that off.
 
-**The warm win is far larger than 1.59x at the sizes agave stores.** Six to sixteen
-times, sub-page, which is what the blockstore integration was betting on when it
-set `MAP_EVERYTHING` and is now measured rather than inferred from a ratio
-against the baseline engine.
+### The mapped plane is blocking-only
 
-**The cold penalty does not survive at 64 KiB.** 1.25 rather than the 6.0x
-amplification the row above records, so a cold mapped read there beats a pread. The
-amplification figure and this one are not the same measurement, device bytes against
-wall clock, and they are also different machines and kernels, so this does not refute
-the window. What it does mean is that **the 2 MiB floor is fitted to rows that do not
-reproduce as time on this box**, and refitting it wants both quantities from one
-machine.
+`read_record_wait` never maps a sealed segment, since a page fault cannot be awaited and a
+device error inside one arrives as SIGBUS on whichever worker was polling. It does read an open
+tail through its mapping, since those pages were just written. A mapped read never reaches a
+backend, because `read_framed` answers from the mapping first. So a caller on the async door
+gives up the warm win, and a caller on the blocking door gives up queue depth. A warm plane of
+small records wants the mapping. A cold burst of scattered keys wants depth.
 
-**And `MADV_RANDOM` was tried and reverted.** The argument for it was symmetry, since
-`POSIX_FADV_RANDOM` sits on the descriptor and cannot reach a mapping of the same
-file, so the mapped plane was the only one still faulting ahead. It measures neutral
-at a page, 0.82 against 0.81, and **8x worse above one**, 0.15 against 1.25 at 64 KiB,
-because fault-around and mapped readahead are what turn a sixteen-page record into one
-or two faults and the advice switches exactly that off. `io/mapping.rs` carries the
-table at the point where someone would add it back.
+The warm probe bridges the two. It is one non-blocking read ahead of the op, so the page cache
+answers a warm record with no tag, slot or completion spent, and a cold one gets `EAGAIN` and
+goes to the driver. Every read on a buffered volume asks it, on both doors
+(`pread_split_reusing` and `wait_split_reusing`).
 
-### The mapped plane is blocking-only, so none of this speaks to the ring
+Prefer the probe to the mapping on media that fails by sector. A bad sector under a mapped read
+is SIGBUS and a dead process, and through the door it is an error the caller can act on.
 
-`read_record_wait` never maps, by design: a page fault cannot be awaited and a device
-error inside one arrives as SIGBUS on whichever worker was polling, so the async door
-asks the driver whatever `map_above` says. A mapped read never reaches a backend at
-all, since `read_framed` answers from the mapping before the driver is consulted.
+## The tail count is the write-path knob
 
-So a warm win of six to sixteen times is available **only** to a caller on the
-blocking door, and a caller that needs queue depth gives it up by construction. Those
-are opposite doors for opposite workloads: a warm plane of small records wants the
-mapping and no depth, and a cold burst of scattered keys wants depth and cannot have
-the mapping.
+One tail is one file. On Linux a buffered write takes the inode exclusively, so writers past
+the first queue in the kernel. The tail count turns concurrent writers into concurrent files.
 
-The escape is a warm probe: one non-blocking read ahead of the op, so a record the
-page cache holds is answered with no tag, slot or completion spent, and a cold one
-takes EAGAIN and rides the driver. `PointReads::Probed` turns it on. Both doors have
-it now, `wait_split_reusing` and `pread_split_reusing` alike.
+A direct write takes the inode shared when it is aligned and does not extend the file. The
+engine pads to a block boundary under the direct backend and preallocates, so an append lands
+inside the file's size. The `inode_lock` stress test checks below the engine that the shared
+path survives writes into preallocated, never-written extents, so an engine sweep has a floor
+to compare against. On a ccx33, ext4, 2026-08-19:
 
-Prefer the probe to the mapping on media that fails by sector. A bad sector under a
-mapped read is SIGBUS and a dead process; the same read through the door comes back
-an error the caller can act on. The probe keeps the warm win and leaves every cold
-read on the reporting path.
+| case | result |
+|---|---|
+| direct first pass into reserved extents, sixteen writers on one file | scales 12 to 14x |
+| buffered, sixteen writers on one file | flat at 1.00 |
+| buffered, a file per writer over one file | 6.8x |
+| one direct file, bare, every append extending | 222 MB/s |
+| one direct file, reserved | 3,170 MB/s |
+| reserving a piece at a time over the whole file | 28 percent slower |
 
-## Why the tail count is the write-path knob
+So the shared path is real, and the tail count is the buffered answer, which the default backend
+takes.
 
-One tail is one file, and on Linux a buffered write takes the inode
-exclusively, so writers past the first queue in the kernel however many the
-engine admits. The tail count is what turns concurrent writers into
-concurrent files.
+**One file for the whole reel was turned down.** It works only on the direct path with
+reservation. A log grows for ever, so it would reserve a piece at a time and pay the 28 percent,
+and at best it matches a file per writer, which is where segments already sit.
 
-A direct write is documented to take the inode shared where the write is
-aligned and does not extend the file, which would let one file absorb all of
-them, and the engine is shaped for that case on purpose: it pads to a block
-boundary under the direct backend and it preallocates, so an append lands
-inside a size the file already has. One condition the documentation does not
-settle is whether the shared path survives writes into preallocated but
-never-written extents, which is every write an append-only log issues.
-`tests/stress/inode_lock.rs` measures that below the engine, so an engine sweep can
-be read against a floor.
+**Preallocation pays only on a shared inode.** With a file per tail, reserving the whole file,
+reserving in pieces and not reserving land within run-to-run spread. How a segment reserves its
+blocks decides when ENOSPC arrives and how many blocks sit idle, and leaves throughput alone.
 
-**It survives.** On a ccx33 on ext4, 2026-08-19, a direct first pass into reserved
-but never-written extents scales 12 to 14 times over sixteen writers on one file,
-while the buffered rows stay flat at 1.00 and a file per writer beats one file by
-6.8x there. So the shared path is real and the tail count is the buffered answer to
-it, which is the one the default backend takes.
+## Polled completions, removed
 
-**One file for the whole reel was refused on the same run.** It only works on the
-direct path, where reservation is what makes it work at all: bare, every append
-extending, it reads 222 MB/s against 3,170 reserved. A log grows without bound, so
-a single file has to extend for ever, and reserving a chunk at a time rather than
-the whole file costs 28% of that. What it buys back is nothing, since one file only
-ever matches a file per writer, which is where segments already sit.
+The ring could poll the device for completions on direct volumes. The knob is gone. Three
+findings stay.
 
-**Preallocation earns that keep only on a shared inode.** With a file per tail,
-reserved, chunked and bare land inside the run-to-run spread of each other, so
-`Preallocate` is a question about when ENOSPC arrives and how many blocks sit idle,
-not about throughput.
+- **A polled ring posts nothing without an enter.** The spin wait, the awaited door's reap and
+  the submit path each read the queue without entering the kernel. The first build paid a fixed
+  millisecond per write, 18 to 22x the interrupt-driven rows, and a cold read leg never finished
+  in three attempts. Two on-box probes only moved the stall. Future work has to enter with `GETEVENTS` in all three places.
+- **fio's numbers do not gate the engine.** A ccx33 with polled queues engaged (virtio-scsi,
+  `virtscsi_poll_queues=4`, 0.0000 IRQ/IO) ran 80 cells. fio's hipri, a userspace busy-poll, was
+  faster on 30 of 40 shapes at a median 1.05x and cheaper on CPU in zero of 40, a median 4.42x
+  per op. The engine waits in the kernel, and on the same box with only the flag changed it
+  measured faster and cheaper at once: writes 0.78 to 0.95x latency at every size up to 1 MiB on
+  both doors, cold reads 0.85 to 0.99x across all ten sizes, total CPU 0.90 to 0.92x with user
+  time collapsing.
+- **It never earned a default.** Every number is virtio-scsi and no bare-metal run confirmed it.
+  To reopen it: fio hipri against non-hipri, sizes 4/16/64/256 KiB, depths 1/8/32/128, one and
+  four jobs, `poll_queues` sized to jobs, CPU per op beside IOPS.
 
-## Why dropping pages is not a knob
+## Deferred completion work
 
-Because it is not free and the volume that wants it is the exception. Dropping is
-what costs, per the page cache section above, and keeping pages is never badly
-wrong. The case that survives is a volume whose freed cache has a better claim,
-a metadata volume rather than a bulk one, or a tier whose hot set is genuinely
-held elsewhere such as behind a CDN edge, and none of those is this engine's
-volume.
+By default a ring interrupts its owning thread for every completion.
+`IORING_SETUP_DEFER_TASKRUN` holds the work until the thread enters asking for completions. That
+drops the inter-processor interrupt, stops completions running on a kernel entry made for
+something else, and lands them in one batch. It needs `IORING_SETUP_SINGLE_ISSUER` and the enter
+from the submitting thread, which ring-per-thread already gives.
 
-It was also never the answer for a cold read that wants the cache skipped rather
-than dropped. Dropbehind still copies through a folio and still does the page
-cache insertion and reclaim around it, which is the whole of what perf billed
-the ranged path for; it saves the retention, not the work. That is why the cold
-window route takes a second `O_DIRECT` descriptor rather than a per-op flag.
+`RingTuning::taskrun` picks the mode, `Deferred` by default. A refusal is one errno that does
+not say which flag, so `build_ring` steps down one mode at a time:
 
-## Why not `O_DIRECT` as a default
+| mode | flag | completion work runs |
+|---|---|---|
+| `Deferred` | `DEFER_TASKRUN` | when the thread asks |
+| `Cooperative` | `COOP_TASKRUN`, kernel 5.19 | at any kernel exit, no interrupt |
+| `Interrupt` | none | on an interrupt, a plain ring |
 
-The write-throughput argument for it is largely spent. A per-op cache hint
-already gave buffered writes without retention and without alignment rules, and
-it measured faster than direct while still losing to holding pages. Direct
-measured 3x slower than buffered on writes and 62x worse on reads on the one box
-whose device numbers are worth trusting, and it pays a staging copy the buffered
-path does not. What survives is that direct ingest stops coupling to a metadata volume's
-dirty-page accounting, which has not been measured on hardware that could show
-it.
+Both held modes also set `TASKRUN_FLAG`, so `IORING_SQ_TASKRUN` says when work is waiting and a
+peek stays a flag read.
 
-The ruling is about the default for a whole volume, and it is narrower than it
-reads. What the 62x measured was a warm working set served from cache against a
-volume that had no cache; the same loss prices at 7.5x. It
-says nothing about a cold read whose pages nothing will ask for again, which is
-the one shape where there is no warm plane to lose. `ranged_reads` is direct for
-exactly that shape and nothing else: one record class, one read kind, sealed
-segments only, with the buffered plane and the whole-record path untouched.
+Nothing reaches the completion queue until this thread enters with `GETEVENTS`, and
+`io-uring`'s `submit()` is `submit_and_wait(0)`, which sets `GETEVENTS` only when it also waits.
+So `flush()` runs no completion work. Every path that reads the queue without sleeping goes
+through `Ring::drain`, which asks first when the flag is up: the batch harvest, the spin, the
+engine loop and `ReelIo::poll`. The ask is an enter that submits nothing and waits for nothing.
 
-## Polled completions, measured and then removed
+The spin pays for it. A seal on the container's ext4:
 
-The ring could ask the kernel to poll the device for completions instead of taking
-interrupts, direct volumes only. The knob is gone; three findings from it are worth
-keeping.
+| seal | enters | submissions |
+|---|---|---|
+| buffered, `Interrupt` | 1,591 | 1,591 |
+| buffered, `Deferred` | 3,179 | 1,591 |
+| direct, `Deferred` | 1,594 | 1,597 |
 
-**A polled ring posts nothing without an enter.** The spin wait, the awaited door's
-reap, and the submit path each read the completion queue without entering the
-kernel, so the first implementation paid a fixed millisecond per write, 18 to 22x
-the interrupt-driven rows, and a cold read leg that never completed in three
-attempts. Two on-box probes each moved the stall to the next place rather than
-clearing it. Any future work here has to enter with `GETEVENTS` in all three.
+A buffered spin pays one submit and one ask per op. The direct arm does not move, because its
+completions are there when the submit enters. Folding `GETEVENTS` into the submission moved the
+threaded direct phase from 2,116 enters to 2,103 and nothing else, and needed a hand-rolled
+`enter`, so it was dropped. A wait that parks pays nothing extra, since `submit_and_wait`
+already asks. `Interrupt` is the way back, and `REEL_RING_TASKRUN` sweeps the mode in tests.
 
-**A gate that prices a reference implementation is not a gate on yours.** A ccx33
-with polled queues genuinely engaged, virtio-scsi at `virtscsi_poll_queues=4`,
-0.0000 IRQ/IO, ran 80 cells: fio's hipri was faster on 30 of 40 shapes at a median
-1.05x and cheaper on CPU in zero of 40, median 4.42x per op, and on that reading the
-feature was not worth having. But fio's hipri is a userspace busy-poll and the
-engine's branch waited in the kernel, and the same box with only the flag moving
-measured faster and cheaper at once: writes 0.78 to 0.95x latency at every size up
-to 1 MiB on both doors, cold reads 0.85 to 0.99x across all ten sizes, total CPU
-0.90 to 0.92x with user time collapsing.
+Without the ask a write-only spin never enters the kernel, burns its million rounds, and then
+sleeps. That is no hang and fails no correctness test: in the container a 64-write batch took
+9.85 s against 0.37 s and gave up on four spins. `spin_outs` counts waits that gave up, and
+`a_write_batch_spins_without_giving_up` asserts it stays zero. A climbing count says the ring's
+completion mode and its wait no longer agree.
 
-**It never earned a default anyway.** Every number above is virtio-scsi, the one
-bare-metal confirmation was never taken, and a knob that ships off and is measured
-on one virtualized device is a surface with nothing behind it. The cheap re-gate if
-the question reopens: fio hipri against non-hipri, sizes 4/16/64/256 KiB, depths
-1/8/32/128, one and four jobs, `poll_queues` sized to jobs, CPU-per-op quoted beside
-IOPS. A direct-volume read row has to leave `map_above` unset either way, because a
-mapped read never reaches the ring.
+## What ring-per-thread asks of callers
 
-## Deferred completion work, and the ask the spin had to learn
+None of these costs throughput in steady state, and all are invisible until something breaks.
 
-A ring interrupts its owning thread for every completion unless told otherwise.
-`IORING_SETUP_DEFER_TASKRUN` holds the work instead and runs it when the thread
-enters asking for completions, which drops the inter-processor interrupt, stops
-completions running on a transition the thread made for something else, and lands
-them in a batch at the one place that wants them. It requires
-`IORING_SETUP_SINGLE_ISSUER` and that the enter come from the submitting thread.
-Ring-per-thread already promises both, so this is the flag the design was already
-paying for and not asking for.
+- **Submit and poll are same-thread only.** `submit()` stages on the submitting thread's ring,
+  and `poll()` drains only the calling thread's ring through `on_open_ring`. The driver's `run`,
+  `run_op` and `collect` stay on one OS thread. Submitting on one thread and polling on another
+  strands completions silently, which the docs on `ReelIo::submit` and `ReelIo::poll` warn
+  about.
+- **A dead backend's rings linger.** After a volume drops, a thread's ring for it survives until
+  that thread next enters `on_ring` for any backend, or exits, and its descriptor table pins up
+  to `MAX_REGISTERED_FILES` (4096) files in the kernel. That suits long-lived store threads.
+  Eager reclaim would need a cross-thread registry and a lock on the hot path, so it stays
+  unfixed.
+- **Never add a door that returns with ops outstanding.** `Ring` drops `IoUring` before
+  `Inflight`, but closing the ring fd does not wait for kernel exit work. So DMA into just-freed
+  buffers is possible in theory on abnormal paths: thread exit, or the dead-ring sweep in
+  `on_ring` after a caller left collect's error path. All four driver doors drain before
+  returning, and that keeps the hazard shut. The drop order alone does not.
+- **The `RefCell` borrow in `on_ring` is held across `act`**, kernel parks included. Nothing
+  reenters today. A future path where completion handling or posix dispatch calls back into the
+  same backend on the same thread would panic on a double borrow.
 
-`RingTuning::taskrun` picks it, `Deferred` by default. A refusal comes back as one
-errno with nothing in it naming the flag, so `build_ring` steps down by trial:
-`Deferred`, then `Cooperative` (`COOP_TASKRUN`, 5.19, no interrupt but the work
-runs at any kernel exit), then `Interrupt`, which is a ring built the old way.
-Both held modes also ask for `TASKRUN_FLAG`, so `IORING_SQ_TASKRUN` says when work
-is waiting and a peek stays a flag read.
+The pointer match in `on_ring` has no ABA risk. The held `Weak<Core>` keeps the old allocation
+alive, so a live backend's `Arc::as_ptr` can never equal a stale entry's.
 
-**The contract that comes with it.** Nothing appears in the completion queue until
-this thread enters with `GETEVENTS`, and `io-uring`'s `submit()` is
-`submit_and_wait(0)`, which sets `GETEVENTS` only when it is also waiting. So
-`flush()` does not run completion work, and every path that reads the queue without
-sleeping would read a queue that stays empty. All of them go through `Ring::drain`,
-which asks first when the flag is up: the batch harvest, the spin, the engine loop,
-and `ReelIo::poll`. The ask is an enter offering nothing and waiting for nothing.
+`callers_spread_across_the_shards` assumes `SHARDS_TAKEN` increments are consecutive while it
+runs. The `PLACES` mutex serializes only the two tests that take it, so another test on the
+async door at the same time can flake it.
 
-**What the mode costs the spin, counted before any box sees it.** A spin exists to
-read the completion queue without a syscall, and under `Deferred` there is no such
-read: the ask is the only thing that fills the queue. On the container's ext4, a
-buffered seal went from 1,591 enters against 1,591 submissions to 3,179 against
-1,591, one submit and one ask per op. The direct arm did not move, 1,594 against
-1,597, because its completions are already there when the submit enters. Folding
-`GETEVENTS` into the submission was tried and is not kept: it moved the threaded
-direct phase 2,116 enters to 2,103 and nothing else, because the completion is not
-ready at submit time, and it bought that with a hand-rolled `enter`. A wait that
-parks pays none of this, since `submit_and_wait` was already asking, and the same
-seal under `Interrupt` measures 1,591 against 1,591, so the knob is the way back
-rather than an argument. Only the spinning half of the wait pays this, and nothing
-selects the wait any more, so `REEL_RING_TASKRUN` sweeps the mode on its own.
+## What the io-uring crate offers that the backend leaves unused
 
-**The wedge this exists to stop.** The wait spins while the ring holds only
-writes, and a spin never enters the kernel. Without the ask it burns its million
-rounds and then sleeps, which is not a hang and does not fail a correctness test:
-in the container a 64-write batch took 9.85 s against 0.37 s and gave up on four
-spins. `spin_outs` counts a wait that gave up, `a_write_batch_spins_without_giving_up`
-asserts it stays zero, and zero is the only working answer: a count climbing there
-says the ring's completion mode and its wait no longer agree.
+Read against the io-uring 0.7.13 source. The lockfile now pins 0.7.14.
 
-## What the ring backend's thread_local design constrains
-
-The per-thread ring is what makes `SINGLE_ISSUER` legal, and it is the right
-shape. What it also does is put four constraints on any future caller, none of
-which costs throughput in steady state and all of which are invisible until
-something breaks.
-
-**Submit and poll are same-thread only.** Completions staged through `submit()`
-land on the submitting thread's ring, and `poll()` drains only the calling
-thread's ring through `on_open_ring`. In-crate callers honour this: `run`,
-`run_op` and `collect` in segment.rs submit and poll on one OS thread. A caller
-pairing submit on thread A with poll on thread B strands completions silently,
-which is why the contract is written on `ReelIo::submit` and `ReelIo::poll`
-rather than left to be discovered.
-
-**A dead backend's rings linger.** After a volume drops, a thread's ring for it
-survives until that thread next enters `on_ring` for some backend, or exits, and
-the registered descriptor table pins up to `MAX_REGISTERED_FILES` files in the
-kernel until then. This is fine for the store's long-lived threads and it stays
-unfixed on purpose: an eager reclaim needs a cross-thread registry plus a lock on
-the hot path, which is the slower design.
-
-**Never add a door that returns with ops outstanding.** `Ring` drops `IoUring`
-before `Inflight`, but closing the ring fd does not wait for kernel exit work, so
-in-flight DMA into just-freed buffers is theoretically reachable on abnormal
-paths, thread exit or a retain after a caller abandoned collect's error path. All
-four doors drain before returning, and that is the invariant holding the hazard
-shut rather than anything in the drop order.
-
-**The `RefCell` borrow in `on_ring` is held across `act`,** kernel parks
-included. No reentrancy exists today. Any future path where completion handling
-or posix dispatch calls back into the same backend on the same thread panics with
-a double borrow. Latent constraint, not a defect.
-
-One thing that looks like a hazard and is not: the pointer-identity match in
-`on_ring` is not an ABA risk, because the held `Weak<Core>` keeps the old
-ArcInner allocation alive, so a live backend's `Arc::as_ptr` can never collide
-with a stale entry's.
-
-A test note that belongs with them: `callers_spread_across_the_shards` assumes
-`SHARDS_TAKEN` increments are consecutive for its duration. The `PLACES` mutex
-serializes only the two tests in that file, so another test exercising the async
-door concurrently can flake it.
-
-## What the io-uring crate offers that this backend does not take
-
-Read against the vendored source of the version pinned, `io-uring 0.7.13`,
-rather than against docs or memory. The backend already uses most of the crate,
-so the holes are narrow, but two of them point at something already measured.
-
-Already in use, so nobody re-derives it: `setup_clamp`, `setup_single_issuer`,
-`setup_defer_taskrun`, `setup_coop_taskrun`, `setup_taskrun_flag`, `Submitter::enter`,
-`register_buffers`, `register_files_sparse`, `register_files_update`, and opcodes
-`Read`, `ReadFixed`, `Readv`, `Writev`, `WriteFixed`, plus `PollAdd.multi` for the
-inbox kick. The completion-work flags are the section above; the submission-poll
-flag is not asked for, since `SQPOLL` buys a kernel thread per ring and a 30 µs
-wake against seals that arrive in bursts.
+In use: `setup_clamp`, `setup_single_issuer`, `setup_defer_taskrun`, `setup_coop_taskrun`,
+`setup_taskrun_flag`, `Submitter::enter`, `register_buffers`, `register_files_sparse`,
+`register_files_update`, the opcodes `Read`, `ReadFixed`, `Readv`, `Writev` and `WriteFixed`,
+and `PollAdd.multi` for the inbox kick. `SQPOLL` is off: it costs a kernel thread per ring and
+a 30 us wake, and seals arrive in bursts.
 
 **Worth doing, in order.**
 
-1. `register_iowq_max_workers` is not called anywhere. The compaction
-   depth-fetch work established that buffered reads missing cache punt to io-wq,
-   and this is the knob for it, a `[bounded, unbounded]` pair of worker caps.
-   The kernel default scales off cpu count, so on a 9950X a worker herd competes
-   with the engine's own threads for the same cores. One call at ring build,
-   plumbed through `RingTuning`. It is the cheapest item here because the
-   depth-fetch bench already points at it.
-2. `register_iowq_aff` pairs with 1 and is also uncalled. It pins io-wq workers
-   to a cpu_set. Ring-per-thread does real work to place engine threads, and
-   io-wq workers currently float across every core and undo that placement. Only
-   worth measuring after 1, since a capped pool badly placed and an uncapped
-   pool badly placed are not separable results.
-3. `MsgRingData` is the architectural one. Cross-thread handoff today is
-   `submit_detached` into the engine inbox plus the `PollAdd.multi` kick fd.
-   `MsgRingData` posts a completion carrying arbitrary `user_data` directly into
-   another thread's completion queue: no inbox, no kick fd, no shared lock. That
-   is the same shape as the op owning its own completion, taken from agave and
-   deferred because it implied ring-per-thread, and it is available in the
-   version already pinned. Design around it rather than bolting it on: it
-   replaces the inbox, it does not sit beside it.
+1. `register_iowq_max_workers`, uncalled. Buffered reads that miss cache punt to io-wq, and this
+   caps those workers with a `[bounded, unbounded]` pair. The kernel default scales with cpu
+   count, so on a 9950X a worker herd competes with the engine's threads for the same cores. One
+   call at ring build, plumbed through `RingTuning`. The cheapest item here.
+2. `register_iowq_aff`, uncalled. It pins io-wq workers to a cpu_set. Ring-per-thread places
+   engine threads, and floating io-wq workers undo that. Measure it after 1, since one run
+   cannot tell placement apart from the cap.
+3. `MsgRingData`, the architectural one. Cross-thread handoff today is `submit_detached` into
+   the engine inbox plus the `PollAdd.multi` kick fd. `MsgRingData` posts a completion with any
+   `user_data` straight into another thread's completion queue, with no inbox, no kick fd and no
+   shared lock. That is the op-owns-its-completion shape from agave, deferred because it
+   needed ring-per-thread, and the pinned version has it. It replaces the inbox, so design
+   around it from the start.
 
-**`WritevFixed` looks like the fix for the staged-write memcpy and is not.**
-Every caller span is copied into one registered buffer before `WriteFixed` goes
-in, and the opcode's name suggests scatter-gather out of that. Its iovecs must
-all point inside the single registered buffer named by `buf_index`, so it does
-vectored io within a registered region, not scatter-gather out of arbitrary
-caller memory, and the engine's spans are unregistered heap. The copy is
-inherent to moving arbitrary memory into an aligned registered buffer and no
-opcode in this crate removes it. Recorded so it is not proposed again on the
-strength of the name.
+**`WritevFixed` keeps the staged-write memcpy.** Every caller span is copied into one registered
+buffer before `WriteFixed` goes in. `WritevFixed`'s iovecs must all point inside the one
+registered buffer at `buf_index`, and the engine's spans are unregistered heap. No opcode in
+this crate removes the copy.
 
-**Marginal, none of them leads.** `Flags::SKIP_SUCCESS` would buy back the
-completion-queue slots that `make_room` caps in flight on, but the applicable
-set is small because the result is read for short-write detection on nearly
-every op, so it covers only ops where no news is good news. `submit_with_args`
-takes a timespec through `IORING_ENTER_EXT_ARG`, giving `park` a bounded wait
-without spending a `Timeout` sqe, which is a cheaper shutdown and liveness story
-rather than throughput. `register_probe` is a skip outright: detection is by
-trial and fallback, and `build_ring` reports a refused flag rather than silently
-retrying without it, so an operator measuring a flag finds out it did not apply,
-which is the better design already.
+**Marginal.**
 
-Nothing else in the crate surface is a gap. The socket, xattr, futex and
-zero-copy receive families do not apply to a disk engine, and `Fsync` stays off
-the ring for the reason written at its refusal site.
+- `Flags::SKIP_SUCCESS` would free completion-queue slots that `make_room` caps in flight on.
+  The result is read for short-write detection on nearly every op, so it covers few ops.
+- `submit_with_args` takes a timespec through `IORING_ENTER_EXT_ARG`, which gives `park` a
+  bounded wait without a `Timeout` sqe. A cheaper shutdown and liveness story, with no
+  throughput gain.
+- `register_probe` is a skip. `build_ring` falls back by itself and logs the mode the kernel
+  refused and the one it runs.
+
+The socket, xattr, futex and zero-copy receive families do not apply to a disk engine. `Fsync`
+stays off the ring because a sync blocks in the kernel either way, so a ring only moves the wait
+onto a worker thread.
 
 ## What is unmeasured
 
-- The ring at high core counts. Seeing a ring win needs enough cores in
-  flight to make per-op cost visible, around 32, a device with IOPS headroom
-  rather than a network disk, and records small enough that the cost is not
-  lost behind the bytes. Miss any one and both backends sit against the same
-  ceiling and the table reads as a tie.
+- The ring at high core counts. A ring win needs about 32 cores in flight, a device with IOPS
+  headroom (no network disk), and records small enough that per-op cost is not lost behind the
+  bytes. Miss any one and both backends hit the same ceiling and the table reads as a tie.
 - Every ring tunable other than the shipped defaults.

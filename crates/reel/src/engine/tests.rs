@@ -5525,3 +5525,121 @@ fn a_failed_journal_write_in_a_flush_is_never_flushed_clean() {
         assert!(reopened.get(&record(7, 1)).expect("get 1").is_some());
     }
 }
+
+/// Put a value on a chosen tail the way `put_owned` does, with no sync
+fn put_on_tail(store: &ReelStore, tail: usize, key: &RecordKey, payload: Vec<u8>) {
+    let (payload, codec) = crate::append::codec::admit(store.index.codec_of(key.column), payload);
+    let committed = store.reel.tails()[tail]
+        .append_data(
+            key.clone(),
+            payload,
+            codec,
+            crate::append::Commit::PerRecord,
+        )
+        .expect("append on the chosen tail");
+    store
+        .index
+        .insert(key, committed.loc, committed.lsn)
+        .expect("publish");
+}
+
+// a retire behind an unsynced overwrite on another tail keeps a flushed value across a crash
+#[test]
+fn a_retire_behind_an_unsynced_overwrite_keeps_the_flushed_value() {
+    let settings = config(2, SyncPolicy::Never);
+    let (store, sim) = sim_store(settings.clone());
+    let key = record(7, 1);
+    let first = vec![0x11; 1024];
+    let second = vec![0x22; 1024];
+    store.put(&key, &first).expect("put v1");
+    let source = store.reel.tails()[0].seal().expect("seal v1");
+    store.flush().expect("flush");
+    store.settle_sealed().expect("settle");
+    put_on_tail(&store, 1, &key, second.clone());
+
+    let picked = store
+        .compactor
+        .select_whole_dead(&store.reel, &store.index, None)
+        .map(|(segment, _)| segment);
+    assert_eq!(picked, Some(source));
+    let retired = store
+        .compactor
+        .compact_segment(&store.reel, &store.index, source)
+        .expect("compact");
+    assert!(retired, "the pass kept the source");
+
+    let image = sim.durable_image();
+    drop(store);
+    let found = reopen_image(image, settings).get(&key).expect("get");
+    assert!(
+        found == Some(Value::new(first)) || found == Some(Value::new(second)),
+        "a flushed value is gone after the crash"
+    );
+}
+
+// a retire behind an unsynced put on another tail keeps a flushed delete across a crash
+#[test]
+fn a_retire_behind_an_unsynced_put_keeps_the_flushed_delete() {
+    let settings = config(2, SyncPolicy::Never);
+    let (store, sim) = sim_store(settings.clone());
+    let key = record(7, 2);
+    let third = vec![0x33; 1024];
+    store.put(&key, &[0x11; 1024]).expect("put v1");
+    store.reel.tails()[0].seal().expect("seal v1");
+    store.delete(&key).expect("delete");
+    let source = store.reel.tails()[0].seal().expect("seal the delete");
+    store.flush().expect("flush");
+    store.settle_sealed().expect("settle");
+    put_on_tail(&store, 1, &key, third.clone());
+
+    let retired = store
+        .compactor
+        .compact_segment(&store.reel, &store.index, source)
+        .expect("compact");
+    assert!(retired, "the pass kept the delete's segment");
+
+    let image = sim.durable_image();
+    drop(store);
+    let found = reopen_image(image, settings).get(&key).expect("get");
+    assert!(
+        found.is_none() || found == Some(Value::new(third)),
+        "a deleted key came back after the crash"
+    );
+}
+
+// a punch makes the unsynced overwrite on another tail durable before it zeroes the old bytes
+#[test]
+fn a_punch_syncs_the_overwrite_that_freed_its_bytes() {
+    let settings = config(2, SyncPolicy::Never);
+    let (store, sim) = sim_store(settings.clone());
+    let key = record(7, 3);
+    let spread = |seed: u32| -> Vec<u8> {
+        (0..16 * 1024u32)
+            .map(|at| ((at ^ seed).wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect()
+    };
+    store.put(&key, &spread(1)).expect("put v1");
+    store
+        .put(&record(7, 4), &spread(2))
+        .expect("put a neighbour");
+    store.reel.tails()[0].seal().expect("seal v1");
+    store.flush().expect("flush");
+    store.settle_sealed().expect("settle");
+    let second = spread(3);
+    put_on_tail(&store, 1, &key, second.clone());
+
+    let report = store
+        .compactor
+        .erase_dead_runs(&store.reel, &store.index)
+        .expect("erase");
+    assert!(report.erased_bytes > 0, "nothing was punched");
+
+    let image = sim.durable_image();
+    drop(store);
+    let found = reopen_image(image, settings).get(&key).expect("get");
+    assert_eq!(
+        found,
+        Some(Value::new(second)),
+        "the punch ran ahead of the overwrite's sync"
+    );
+}

@@ -51,8 +51,9 @@ use reel_core::{ReadBlock, Value};
 use drawn::Drawn;
 use read::{
     check_in_block, cut_range, decoded, deep_range, frame_to_range, frame_to_read,
-    framed_or_nothing, keyless_range, merge_runs_into, merge_span, near_range, place_runs,
-    window_or_nothing, window_start, Planned, Proof, Run, MERGE_GAP,
+    framed_or_nothing, keyless_range, mapped_at, merge_runs_into, merge_span, near_range,
+    place_runs, window_or_nothing, window_start, Planned, Proof, Run, MAPPED_BLOCK_BYTES,
+    MERGE_GAP,
 };
 
 pub use drawn::{DrawTicket, DrawnRecords, MOST_COUNTED};
@@ -2507,11 +2508,23 @@ impl Reel {
             ) {
                 // A batch of empty records still needs its block, or their spots point at nothing
                 let block = mapped.get_or_insert_with(|| {
-                    crate::reel::payload::take(asks.iter().map(|ask| ask.loc.len as usize).sum())
+                    let wanted: usize = asks.iter().map(|ask| ask.loc.len as usize).sum();
+                    crate::reel::payload::take(wanted.min(MAPPED_BLOCK_BYTES))
                 });
+                // A record that would end past the block's offsets starts a fresh block
+                let offset = match mapped_at(block.len(), len) {
+                    Some(offset) => offset,
+                    None => {
+                        let rest: usize = asks[at..].iter().map(|ask| ask.loc.len as usize).sum();
+                        let fresh = crate::reel::payload::take(rest.min(MAPPED_BLOCK_BYTES));
+                        let full = std::mem::replace(block, fresh);
+                        blocks.push(ReadBlock::new(full, crate::reel::payload::give));
+                        0
+                    }
+                };
                 spots[ask.at as usize] = Spot {
-                    block: 0,
-                    at: block.len() as u32,
+                    block: blocks.len() as u32,
+                    at: offset,
                     len: len as u32,
                     codec,
                 };

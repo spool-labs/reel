@@ -80,6 +80,37 @@ fn key(byte: u8) -> RecordKey {
     RecordKey::from_bytes(RECORD, &[byte; 34]).expect("key")
 }
 
+// a mapped record starts a fresh block before the block's offsets pass four bytes
+#[test]
+fn a_mapped_block_splits_before_its_offsets_wrap() {
+    const GIB: usize = 1 << 30;
+    // Five asks for one gigabyte record each go through the placement plan_reads uses
+    let mut block = 0u32;
+    let mut filled = 0usize;
+    let mut placed = Vec::new();
+    for _ in 0..5 {
+        let at = match mapped_at(filled, GIB) {
+            Some(at) => at,
+            None => {
+                block += 1;
+                filled = 0;
+                0
+            }
+        };
+        assert_eq!(at as usize, filled, "a spot's offset wrapped");
+        placed.push((block, filled));
+        filled += GIB;
+    }
+    assert_eq!(
+        placed,
+        vec![(0, 0), (0, GIB), (0, 2 * GIB), (1, 0), (1, GIB)]
+    );
+    assert!(placed.iter().all(|(_, at)| at + GIB <= MAPPED_BLOCK_BYTES));
+    // A record as large as a block still fits an empty one
+    assert_eq!(mapped_at(0, MAPPED_BLOCK_BYTES), Some(0));
+    assert_eq!(mapped_at(1, MAPPED_BLOCK_BYTES), None);
+}
+
 // a segment file name is a zero-padded number and the suffix
 #[test]
 fn names_segment_files() {

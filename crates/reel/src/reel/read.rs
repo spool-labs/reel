@@ -106,6 +106,17 @@ pub(super) fn merge_span(serving: ServingBackend) -> u64 {
     }
 }
 
+/// A spot keeps its offset in four bytes, so a mapped block holds at most this many
+pub(super) const MAPPED_BLOCK_BYTES: usize = u32::MAX as usize;
+
+/// A mapped record's offset on a block holding `filled`, or nothing when it needs a fresh block
+pub(super) fn mapped_at(filled: usize, len: usize) -> Option<u32> {
+    match filled + len <= MAPPED_BLOCK_BYTES {
+        true => Some(filled as u32),
+        false => None,
+    }
+}
+
 /// One record's place in a batch, resolved before anything is submitted
 pub(super) struct Planned {
     pub(super) at: usize,

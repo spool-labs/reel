@@ -5530,7 +5530,12 @@ fn a_failed_journal_write_in_a_flush_is_never_flushed_clean() {
 fn put_on_tail(store: &ReelStore, tail: usize, key: &RecordKey, payload: Vec<u8>) {
     let (payload, codec) = crate::append::codec::admit(store.index.codec_of(key.column), payload);
     let committed = store.reel.tails()[tail]
-        .append_data(key.clone(), payload, codec, crate::append::Commit::PerRecord)
+        .append_data(
+            key.clone(),
+            payload,
+            codec,
+            crate::append::Commit::PerRecord,
+        )
         .expect("append on the chosen tail");
     store
         .index
@@ -5614,7 +5619,9 @@ fn a_punch_syncs_the_overwrite_that_freed_its_bytes() {
             .collect()
     };
     store.put(&key, &spread(1)).expect("put v1");
-    store.put(&record(7, 4), &spread(2)).expect("put a neighbour");
+    store
+        .put(&record(7, 4), &spread(2))
+        .expect("put a neighbour");
     store.reel.tails()[0].seal().expect("seal v1");
     store.flush().expect("flush");
     store.settle_sealed().expect("settle");

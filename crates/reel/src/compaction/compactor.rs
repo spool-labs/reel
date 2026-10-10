@@ -654,6 +654,12 @@ impl Compactor {
         }
         let region_end = footer_bound(shared, &source, file_len, footer.as_deref())?;
         let order = footer.as_deref().and_then(footer_order);
+        // Only rows list a keyless segment's records, so undecodable rows leave it in place
+        if order.is_none() && source.layout().is_keyless_layout() {
+            // pin it at its current dead bytes, so the ranking skips it until more dies
+            lock(&self.rotted).insert(segment, index.segment_bytes(segment).dead);
+            return Ok(false);
+        }
         let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
         reader.stock(std::mem::take(&mut *lock(&self.spare)));
         // Only a reserved tail takes a chosen tier, so a volume with them waits for a free one
@@ -698,8 +704,6 @@ impl Compactor {
                 &mut tally,
                 &mut pace,
             ),
-            // only rows list a keyless segment's records, so undecodable rows leave it in place
-            None if source.layout().is_keyless_layout() => Ok(()),
             None => self.rewrite_scanning(
                 reel,
                 dest_index,
@@ -2017,6 +2021,7 @@ mod tests {
     use crate::format::column::{
         Codec, ColumnId, ColumnSet, ColumnSpec, KeyBytes, KeyWidth, PurgeMark, RecordKey,
     };
+    use crate::format::record::checksum;
     use crate::format::segment_header::SEGMENT_HEADER_SPAN;
     use crate::index::entry::{span_of, Entry};
     use crate::index::page::KeyPage;
@@ -2024,6 +2029,7 @@ mod tests {
     use crate::index::recovery::rebuild_reel;
     use crate::index::spot::RecordSource;
     use crate::io::fault::{FaultKind, FaultPlan};
+    use crate::io::op::WriteBuf;
     use crate::io::sim_backend::{DurableImage, SimIo};
     use crate::reel::segment::{FdCache, IoDriver};
     use crate::reel::segment_file_name;
@@ -3199,6 +3205,93 @@ mod tests {
             1,
             "the volume holds bytes it cannot reclaim and says nothing about it",
         );
+    }
+
+    /// Give a sealed segment's first footer row flags no writer sets, and reseal the footer
+    fn spoil_first_row_flags(fixture: &Fixture, segment: SegmentId) {
+        let shared = fixture.reel.shared();
+        let handle = source_handle(shared, segment).expect("handle");
+        let file_len = shared.driver.length(handle.file()).expect("length");
+        let bytes = shared
+            .driver
+            .pread(handle.file(), 0, file_len)
+            .expect("read");
+        // aligned writes can pad past the footer, so it ends at the last nonzero byte
+        let end = bytes.iter().rposition(|byte| *byte != 0).expect("a footer") + 1;
+        let footer_len = read_u32_le(&bytes[end - 8..end - 4]) as usize;
+        let opens = end - footer_len;
+        let mut footer = bytes[opens..end].to_vec();
+        // a restart row holds two one-byte lengths and its whole key, then its flags
+        footer[2 + KEY_WIDTH] = 0xff;
+        // the check sits before the length and the magic, and covers the footer with itself zeroed
+        let check_at = footer_len - 12;
+        footer[check_at..check_at + 4].fill(0);
+        let check = checksum(&footer);
+        footer[check_at..check_at + 4].copy_from_slice(&check.to_le_bytes());
+        shared
+            .driver
+            .writev_all(handle.file(), opens as u64, vec![WriteBuf::Owned(footer)])
+            .expect("write footer");
+        // drop the cached footer, so the next pass reads the spoiled one
+        shared.footers.forget(segment);
+    }
+
+    // a keyless segment whose footer rows do not decode stays in place with its records
+    #[test]
+    fn a_keyless_segment_with_unreadable_rows_is_not_retired() {
+        let fixture = fixture(settings());
+        for byte in 1..=3u8 {
+            put(&fixture, byte, vec![byte; 300]);
+        }
+        seal(&fixture);
+        fixture.reel.flush().expect("flush");
+
+        let shared = fixture.reel.shared();
+        let handle = source_handle(shared, SegmentId(1)).expect("handle");
+        assert!(handle.layout().is_keyless_layout());
+        spoil_first_row_flags(&fixture, SegmentId(1));
+        let footer = shared
+            .footer_of(SegmentId(1))
+            .expect("footer read")
+            .expect("the footer parses");
+        assert!(footer_order(&footer).is_none(), "the rows still decode");
+
+        let (target, _) = fixture
+            .compactor
+            .select_target(&fixture.reel, &fixture.index, 0.0, None)
+            .expect("a first target");
+        assert_eq!(target, SegmentId(1));
+        let retired = fixture
+            .compactor
+            .compact_segment(&fixture.reel, &fixture.index, target)
+            .expect("compact");
+        fixture.reel.flush().expect("flush");
+
+        assert!(
+            !retired,
+            "the pass retired a segment it copied nothing from"
+        );
+        assert!(
+            fixture.sim.durable_bytes(&seg_path(1)).is_some(),
+            "the segment file is gone"
+        );
+        for byte in 1..=3u8 {
+            let entry = fixture
+                .index
+                .get(&key(byte))
+                .expect("read")
+                .expect("resolves");
+            assert_eq!(entry.loc.segment, SegmentId(1));
+            let read = fixture
+                .reel
+                .read_record(entry.loc, key(byte).as_ref(), entry.lsn, true, false)
+                .expect("read record");
+            assert_eq!(read, RecordRead::Found(Value::new(vec![byte; 300])));
+        }
+        let again = fixture
+            .compactor
+            .select_target(&fixture.reel, &fixture.index, 0.0, None);
+        assert!(again.is_none(), "the segment is offered again: {again:?}");
     }
 
     // the pin lasts as long as the segment does not change

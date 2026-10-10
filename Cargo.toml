@@ -15,7 +15,7 @@ edition = "2021"
 rust-version = "1.89"
 
 [workspace.dependencies]
-reel = { package = "tape-reel", path = "crates/reel" }
+reel = { package = "tape-reel", path = "crates/reel", version = "0.3.0" }
 reel-core = { package = "tape-reel-core", path = "crates/reel-core", version = "0.3.0" }
 reel-mock = { package = "tape-reel-mock", path = "crates/reel-mock" }
 

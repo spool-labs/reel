@@ -1925,6 +1925,67 @@ fn a_batch_parked_past_the_window_loses_to_the_delete() {
     });
 }
 
+// a batch whose shadow lookup fails reports it and leaves the newer sealed version standing
+#[test]
+fn a_batch_with_a_failed_shadow_lookup_keeps_the_newer_version() {
+    let script = crate::sync::rendezvous::script();
+    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
+    let store = Arc::new(store);
+    let key = record(7, 1);
+    let other = record(7, 2);
+    store.put(&key, &[1u8; 64]).expect("first version");
+
+    script.hold("batch/landed");
+    let parked = {
+        let (store, key, other) = (Arc::clone(&store), key.clone(), other.clone());
+        script.cast(move || {
+            store.apply_batch(vec![
+                RecordWrite::Put {
+                    key,
+                    payload: vec![2u8; 64],
+                },
+                RecordWrite::Put {
+                    key: other,
+                    payload: vec![2u8; 64],
+                },
+            ])
+        })
+    };
+    script.await_reached("batch/landed", 1);
+
+    // Drawn after the parked batch, sealed and handed to the spot index ahead of it
+    store.put(&key, &[3u8; 64]).expect("newer version");
+    drop(store.cue().expect("seal"));
+    store.page_out_sealed().expect("hand over");
+    assert!(
+        store
+            .index
+            .column(key.column)
+            .expect("column")
+            .get(key.as_slice())
+            .is_none(),
+        "the newer version never left the map, so this tested nothing"
+    );
+
+    // With no footer held, the batch's lookup reads one from the device and fails
+    store.reel.shared().footers.clear();
+    sim.arm_next_ops(64, FaultKind::ReadError);
+    script.release("batch/landed");
+    let published = parked.join().expect("parked thread");
+    sim.disarm();
+
+    assert!(published.is_err(), "the batch hid its failed lookup");
+    assert_eq!(
+        store.get(&key).expect("read"),
+        Some(Value::new(vec![3u8; 64])),
+        "the batch put its older version over the sealed newer one",
+    );
+    assert!(
+        store.get(&other).expect("read").is_none(),
+        "half of the failed batch published"
+    );
+}
+
 // a read during the hand-over of an older version never finds the key a delete took
 #[test]
 fn a_handover_never_shows_a_deleted_version() {

@@ -1064,30 +1064,69 @@ impl ReelIndex {
             key.as_slice(),
             Entry::new(loc, lsn),
             &self.segments,
-            &|key: &[u8], lsn: Lsn| self.is_shadowed(at, key, lsn, &failed, true),
+            &|key: &[u8], lsn: Lsn| self.is_shadowed(at, key, lsn, &failed),
         );
         failed.into_inner().map_or(Ok(landed), Err)
     }
 
-    /// Whether the spot index holds a version newer than `lsn`, a failed read answering `failing`
+    /// Whether the spot index holds a version newer than `lsn`, a failed read refusing the write
     fn is_shadowed(
         &self,
         at: usize,
         key: &[u8],
         lsn: Lsn,
         failed: &Cell<Option<ReelError>>,
-        failing: bool,
     ) -> bool {
-        // Nothing the spot index was given is newer than a write above this
-        if !self.spot_serves() || lsn.as_u64() > self.handed.load(Ordering::Acquire) {
-            return false;
-        }
-        match self.spot[at].holds_newer(KeyRef::new(self.columns[at].id, key), lsn) {
+        match self.shadow_lookup(at, key, lsn) {
             Ok(is_newer) => is_newer,
+            // The read could not rule out a newer version, so the older one stays out of the map
             Err(error) => {
                 failed.set(Some(error));
-                failing
+                true
             }
+        }
+    }
+
+    /// Whether the spot index holds a version newer than `lsn`
+    fn shadow_lookup(&self, at: usize, key: &[u8], lsn: Lsn) -> Result<bool> {
+        // Nothing the spot index was given is newer than a write above this
+        if !self.spot_serves() || lsn.as_u64() > self.handed.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        self.spot[at].holds_newer(KeyRef::new(self.columns[at].id, key), lsn)
+    }
+
+    /// Run the spot lookups a batch's moves may need, so a failed one stops the batch early
+    fn probe_shadows(&self, moves: &[KeyMove<'_>]) -> Result<()> {
+        for moving in moves {
+            if let Some(at) = self.slot(moving.column) {
+                self.shadow_lookup(at, moving.key, moving.lsn)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Book every record of a batch that publishes nothing, the way a refused move books it
+    fn refuse_batch(&self, moves: &[KeyMove<'_>], ranges: &[RangeMove<'_>]) {
+        for moving in moves {
+            if self.slot(moving.column).is_none() {
+                continue;
+            }
+            let (segment, lsn) = (moving.loc.segment, moving.lsn);
+            let span = span_of(moving.key.len() as u16, moving.loc.len);
+            match moving.is_delete {
+                // A tombstone holds space in its segment whatever it does to the key
+                true => self.segments.mark_held(segment, lsn, span),
+                false => self.segments.mark_dead(segment, lsn, span),
+            }
+        }
+        for range in ranges {
+            let Some(at) = self.slot(range.start.column) else {
+                continue;
+            };
+            let (segment, lsn) = (range.tombstone.segment, range.lsn);
+            let span = self.indexes[at].span_of(range.tombstone.len);
+            self.segments.mark_held(segment, lsn, span);
         }
     }
 
@@ -1137,6 +1176,11 @@ impl ReelIndex {
         moves: &[KeyMove<'_>],
         ranges: &[RangeMove<'_>],
     ) -> (Vec<Landed>, Result<()>) {
+        // A lookup that fails before the barrier fails the batch, and nothing of it publishes
+        if let Err(error) = self.probe_shadows(moves) {
+            self.refuse_batch(moves, ranges);
+            return (vec![Landed::Newer; moves.len()], Err(error));
+        }
         let failed = Cell::new(None);
         let landed = self.publish.publish_grouped(|| {
             let mut landed = Vec::with_capacity(moves.len());
@@ -1267,7 +1311,7 @@ impl ReelIndex {
                 Some(slot) => self.indexes[slot].apply_moves(
                     &moves[at..end],
                     &*self.segments,
-                    &|key: &[u8], lsn: Lsn| self.is_shadowed(slot, key, lsn, failed, false),
+                    &|key: &[u8], lsn: Lsn| self.is_shadowed(slot, key, lsn, failed),
                     landed,
                 ),
                 // A column nothing indexes answers `Newer` for each of its keys
@@ -1288,7 +1332,7 @@ impl ReelIndex {
             lsn,
             tombstone,
             &self.segments,
-            &|key: &[u8], lsn: Lsn| self.is_shadowed(at, key, lsn, &failed, true),
+            &|key: &[u8], lsn: Lsn| self.is_shadowed(at, key, lsn, &failed),
         );
         failed.into_inner().map_or(Ok(landed), Err)
     }

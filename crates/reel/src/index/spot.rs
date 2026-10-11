@@ -1335,8 +1335,15 @@ impl SpotColumn {
             }
             Ok(())
         })?;
-        // `load` settles each leftover against whatever slots it meets, so spread them too
-        let left = std::mem::take(&mut *lock(&unsettled));
+        // Only a key's newest leftover can stand, and one load a key keeps its bookings in order
+        let mut left = std::mem::take(&mut *lock(&unsettled));
+        left.sort_unstable_by(|at, other| {
+            let (row, other) = (&rows[*at], &rows[*other]);
+            row.key
+                .cmp(&other.key)
+                .then_with(|| (other.lsn, other.loc.segment).cmp(&(row.lsn, row.loc.segment)))
+        });
+        left.dedup_by(|later, kept| rows[*later].key == rows[*kept].key);
         let next = AtomicUsize::new(0);
         std::thread::scope(|scope| -> Result<()> {
             let workers: Vec<_> = (0..SETTLE_THREADS)
@@ -2688,6 +2695,66 @@ mod tests {
             "a tie went to the copy"
         );
         assert_eq!(column.held(), 2);
+    }
+
+    /// A footer source that holds no footers, so every set-aside row settles by its header
+    struct NoFooters;
+
+    impl FooterSource for NoFooters {
+        fn footer(
+            &self,
+            _segment: SegmentId,
+        ) -> Result<Option<Arc<crate::format::footer::SegmentFooter>>> {
+            Ok(None)
+        }
+    }
+
+    // a key's leftover rows settle in one booking, so threads cannot land its moves out of order
+    #[test]
+    fn a_key_settles_its_leftover_rows_in_one_booking() {
+        let records = Arc::new(Records::default());
+        let column = column(&records);
+        let one = key(1);
+        // Older versions and deletes in segment 1, the newest version in segment 2
+        let rows = [
+            (Loc::new(SegmentId(1), 0, 30), 1u64, false),
+            (Loc::new(SegmentId(1), 64, 0), 2, true),
+            (Loc::new(SegmentId(1), 128, 40), 3, false),
+            (Loc::new(SegmentId(2), 0, 0), 4, true),
+            (Loc::new(SegmentId(2), 64, 50), 5, false),
+        ];
+        for (loc, lsn, is_tombstone) in rows {
+            records.put(loc, one.as_slice(), Lsn(lsn), is_tombstone);
+        }
+        // The open takes the first row into the slot and sets the rest aside
+        let fresh = column
+            .take_rows(COLUMN, 0, rows.len(), |at| {
+                let (loc, lsn, is_tombstone) = rows[at];
+                Ok(Some(Taken {
+                    key: one.as_slice(),
+                    loc,
+                    lsn: Lsn(lsn),
+                    is_tombstone,
+                }))
+            })
+            .expect("take");
+        assert_eq!(fresh, vec![(0, 30)]);
+
+        let bookings = Mutex::new(Vec::new());
+        column
+            .settle_rows(
+                COLUMN,
+                &NoFooters,
+                &|_, booking| lock(&bookings).push(booking),
+                &|_, _, _| {},
+            )
+            .expect("settle");
+        column.finish_load();
+        let bookings = std::mem::take(&mut *lock(&bookings));
+        assert_eq!(bookings.len(), 1, "the key booked {} moves", bookings.len());
+        assert_eq!(bookings[0].gone, Some(30));
+        assert_eq!(bookings[0].came, Some(50));
+        assert_eq!(version(&column, 1), Some(5));
     }
 
     // a candidate whose segment went is taken out, and the lookup answers from a fresh look

@@ -76,6 +76,9 @@ pub const LOOKUP_TRIES: usize = MAX_CANDIDATES + 1;
 /// The cleaner's queue caps at this many, later ones wait for the retired-segment sweep
 const MAX_STALE: usize = 1 << 20;
 
+/// The rebook queue caps at this many, later class bookings wait for their segment to retire
+const MAX_OWED: usize = 1 << 20;
+
 /// One bucket takes this many bytes
 const BUCKET_BYTES: u64 = 64;
 
@@ -987,6 +990,9 @@ pub struct SpotColumn {
     /// How far the class bookings may sit below the truth, at most a class width each
     slack: AtomicU64,
 
+    /// Each key a class booking left owed its true length, with the lsn that displaced it
+    owed: Mutex<VecDeque<(RecordKey, Lsn)>>,
+
     /// Rows taken by an open before it could read a header, settled once it can
     set_aside: Mutex<Vec<SetAside>>,
 
@@ -1016,6 +1022,7 @@ impl SpotColumn {
             stale: Mutex::new(VecDeque::new()),
             beside: AtomicU64::new(0),
             slack: AtomicU64::new(0),
+            owed: Mutex::new(VecDeque::new()),
             set_aside: Mutex::new(Vec::new()),
             follows: AtomicBool::new(false),
             behind: AtomicU64::new(0),
@@ -1328,8 +1335,15 @@ impl SpotColumn {
             }
             Ok(())
         })?;
-        // `load` settles each leftover against whatever slots it meets, so spread them too
-        let left = std::mem::take(&mut *lock(&unsettled));
+        // Only a key's newest leftover can stand, and one load a key keeps its bookings in order
+        let mut left = std::mem::take(&mut *lock(&unsettled));
+        left.sort_unstable_by(|at, other| {
+            let (row, other) = (&rows[*at], &rows[*other]);
+            row.key
+                .cmp(&other.key)
+                .then_with(|| (other.lsn, other.loc.segment).cmp(&(row.lsn, row.loc.segment)))
+        });
+        left.dedup_by(|later, kept| rows[*later].key == rows[*kept].key);
         let next = AtomicUsize::new(0);
         std::thread::scope(|scope| -> Result<()> {
             let workers: Vec<_> = (0..SETTLE_THREADS)
@@ -1585,6 +1599,38 @@ impl SpotColumn {
 
     /// Book a key's entries older than `newer` dead, leaving unread ones for lookups in flight
     pub fn displace(&self, key: &RecordKey, newer: Lsn) -> Result<Displaced> {
+        let settled = self.settle_versions(key, newer, false)?;
+        // A class booking stands until a read finds the true length, and maintenance reads it
+        if !settled.classed.is_empty() {
+            let mut owed = lock(&self.owed);
+            if owed.len() < MAX_OWED {
+                owed.push_back((key.clone(), newer));
+            }
+        }
+        Ok(settled)
+    }
+
+    /// Read the true length of up to `budget` keys' class bookings, returning what each settled
+    pub fn rebook_owed(&self, budget: usize) -> Vec<(RecordKey, Displaced)> {
+        let mut settled = Vec::new();
+        for _ in 0..budget {
+            let Some((key, newer)) = lock(&self.owed).pop_front() else {
+                break;
+            };
+            match self.settle_versions(&key, newer, true) {
+                Ok(displaced) => settled.push((key, displaced)),
+                // A read fails before anything moves, so the booking stays owed for a later tick
+                Err(_) => {
+                    lock(&self.owed).push_back((key, newer));
+                    break;
+                }
+            }
+        }
+        settled
+    }
+
+    /// Settle a key's versions older than `newer`, and with `owed` read only its class bookings
+    fn settle_versions(&self, key: &RecordKey, newer: Lsn, owed: bool) -> Result<Displaced> {
         let (Some(records), Some(segments)) = (self.records.get(), self.segments.get()) else {
             return Ok(Displaced::default());
         };
@@ -1594,10 +1640,13 @@ impl SpotColumn {
         if seen.is_empty() {
             return Ok(Displaced::default());
         }
-        let must_read = seen.len() >= SETTLE_AT;
+        let must_read = owed || seen.len() >= SETTLE_AT;
         let (mut unread, mut older, mut gone) = (Vec::new(), Vec::new(), Vec::new());
         for place in seen.iter() {
             let slot = place.slot;
+            if owed && !slot.is_displaced() {
+                continue;
+            }
             let is_older = segments
                 .max_lsn_of(slot.segment())
                 .is_some_and(|ceiling| ceiling < newer);
@@ -2086,6 +2135,7 @@ impl SpotColumn {
             table.count_taken(held, displaced);
         }
         lock(&self.stale).clear();
+        lock(&self.owed).clear();
         lock(&self.set_aside).clear();
         self.beside.store(0, Ordering::Relaxed);
         self.slack.store(0, Ordering::Relaxed);
@@ -2108,6 +2158,7 @@ impl SpotColumn {
             live.displaced.store(displaced, Ordering::Relaxed);
         }
         std::mem::swap(&mut *lock(&self.stale), &mut *lock(&fresh.stale));
+        std::mem::swap(&mut *lock(&self.owed), &mut *lock(&fresh.owed));
         std::mem::swap(&mut *lock(&self.set_aside), &mut *lock(&fresh.set_aside));
         self.beside
             .store(fresh.beside.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -2644,6 +2695,66 @@ mod tests {
             "a tie went to the copy"
         );
         assert_eq!(column.held(), 2);
+    }
+
+    /// A footer source that holds no footers, so every set-aside row settles by its header
+    struct NoFooters;
+
+    impl FooterSource for NoFooters {
+        fn footer(
+            &self,
+            _segment: SegmentId,
+        ) -> Result<Option<Arc<crate::format::footer::SegmentFooter>>> {
+            Ok(None)
+        }
+    }
+
+    // a key's leftover rows settle in one booking, so threads cannot land its moves out of order
+    #[test]
+    fn a_key_settles_its_leftover_rows_in_one_booking() {
+        let records = Arc::new(Records::default());
+        let column = column(&records);
+        let one = key(1);
+        // Older versions and deletes in segment 1, the newest version in segment 2
+        let rows = [
+            (Loc::new(SegmentId(1), 0, 30), 1u64, false),
+            (Loc::new(SegmentId(1), 64, 0), 2, true),
+            (Loc::new(SegmentId(1), 128, 40), 3, false),
+            (Loc::new(SegmentId(2), 0, 0), 4, true),
+            (Loc::new(SegmentId(2), 64, 50), 5, false),
+        ];
+        for (loc, lsn, is_tombstone) in rows {
+            records.put(loc, one.as_slice(), Lsn(lsn), is_tombstone);
+        }
+        // The open takes the first row into the slot and sets the rest aside
+        let fresh = column
+            .take_rows(COLUMN, 0, rows.len(), |at| {
+                let (loc, lsn, is_tombstone) = rows[at];
+                Ok(Some(Taken {
+                    key: one.as_slice(),
+                    loc,
+                    lsn: Lsn(lsn),
+                    is_tombstone,
+                }))
+            })
+            .expect("take");
+        assert_eq!(fresh, vec![(0, 30)]);
+
+        let bookings = Mutex::new(Vec::new());
+        column
+            .settle_rows(
+                COLUMN,
+                &NoFooters,
+                &|_, booking| lock(&bookings).push(booking),
+                &|_, _, _| {},
+            )
+            .expect("settle");
+        column.finish_load();
+        let bookings = std::mem::take(&mut *lock(&bookings));
+        assert_eq!(bookings.len(), 1, "the key booked {} moves", bookings.len());
+        assert_eq!(bookings[0].gone, Some(30));
+        assert_eq!(bookings[0].came, Some(50));
+        assert_eq!(version(&column, 1), Some(5));
     }
 
     // a candidate whose segment went is taken out, and the lookup answers from a fresh look

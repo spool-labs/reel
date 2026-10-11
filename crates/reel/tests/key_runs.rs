@@ -400,3 +400,115 @@ fn a_delete_stands_while_a_run_still_holds_its_key() {
         ReelStore::open(dir.path().to_path_buf(), config(1, HALF_DEAD), COLUMNS).expect("reopen");
     check(&reopened, &model, "after a reopen");
 }
+
+/// Keys of any width, beside a column whose one key is empty
+const WITH_CURSOR: ColumnSet = &[
+    ColumnSpec {
+        id: ColumnId(1),
+        name: "rows",
+        key_width: KeyWidth::Variable,
+        shard_bytes: 0,
+        purge_mark: None,
+        codec: Codec::None,
+    },
+    ColumnSpec {
+        id: ColumnId(2),
+        name: "cursor",
+        key_width: KeyWidth::Variable,
+        shard_bytes: 0,
+        purge_mark: None,
+        codec: Codec::None,
+    },
+];
+
+/// The key run files under a store's directory
+fn runs_on_disk(dir: &TempDir) -> usize {
+    std::fs::read_dir(dir.path())
+        .expect("list")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".keys"))
+        .count()
+}
+
+/// Put enough rounds that a dozen segments stack, each round's keys `width_of` wide
+fn stack(
+    store: &ReelStore,
+    model: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+    width_of: fn(u64, u64) -> usize,
+    each_round: impl Fn(u64),
+) {
+    for round in 0..12 {
+        for n in round * PER_ROUND..(round + 1) * PER_ROUND {
+            let mut key = key_of(n);
+            key.truncate(width_of(round, n));
+            let value = value_of(n, round);
+            Store::put(store, "rows", &key, &value).expect("put");
+            model.insert(key, value);
+        }
+        each_round(round);
+    }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("hand over");
+}
+
+// a column whose one key is empty merges into a key run, and the run opens
+#[test]
+fn a_column_of_empty_keys_merges_into_a_key_run() {
+    let dir = TempDir::new().expect("temp dir");
+    let store =
+        ReelStore::open(dir.path().to_path_buf(), config(1, NEVER), WITH_CURSOR).expect("open");
+    let mut model = BTreeMap::new();
+    stack(
+        &store,
+        &mut model,
+        |_, _| 16,
+        |round| {
+            Store::put(&store, "cursor", &[], &round.to_le_bytes()).expect("cursor");
+        },
+    );
+    let merged = store.merge_when_due().expect("merge");
+    assert!(merged.is_some(), "the stacked segments did not merge");
+    assert!(store.index().overlap_depth() <= SETTLED_DEPTH);
+    assert_eq!(runs_on_disk(&dir), 1, "a merge left more than its one run");
+    let cursor = Store::get(&store, "cursor", &[]).expect("get cursor");
+    assert_eq!(
+        cursor.map(|value| value.to_vec()),
+        Some(11u64.to_le_bytes().to_vec())
+    );
+    let walked: Vec<(Vec<u8>, Vec<u8>)> = Store::iter(&store, "cursor")
+        .expect("iter cursor")
+        .map(|(key, value)| (key, value.to_vec()))
+        .collect();
+    assert_eq!(walked, vec![(Vec::new(), 11u64.to_le_bytes().to_vec())]);
+    check(&store, &model, "after the merge");
+
+    store.close().expect("close");
+    drop(store);
+    let reopened =
+        ReelStore::open(dir.path().to_path_buf(), config(1, NEVER), WITH_CURSOR).expect("reopen");
+    assert!(
+        !reopened.index().key_runs().runs().is_empty(),
+        "the reopen read no key run back"
+    );
+    check(&reopened, &model, "after a reopen");
+}
+
+// segments that hold one column at different widths, or one width beside many, merge together
+#[test]
+fn a_column_whose_width_changes_between_segments_merges() {
+    let dir = TempDir::new().expect("temp dir");
+    let store =
+        ReelStore::open(dir.path().to_path_buf(), config(1, NEVER), WITH_CURSOR).expect("open");
+    let mut model = BTreeMap::new();
+    // Eight bytes, then nine, then eight to sixteen, so segments come fixed at two widths and varying
+    let width_of = |round: u64, n: u64| match round % 3 {
+        0 => 8,
+        1 => 9,
+        _ => 8 + (n % 9) as usize,
+    };
+    stack(&store, &mut model, width_of, |_| {});
+    let merged = store.merge_when_due().expect("merge");
+    assert!(merged.is_some(), "the stacked segments did not merge");
+    assert!(store.index().overlap_depth() <= SETTLED_DEPTH);
+    check(&store, &model, "after the merge");
+}

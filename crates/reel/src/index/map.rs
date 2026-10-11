@@ -24,7 +24,7 @@ use crate::index::paged::{Candidates, FooterSource, SealedRanges};
 use crate::index::playback::{self, merged_page, Paged, PlaybackCursor, WalkRuns, Way};
 use crate::index::recovery::SealedSpan;
 use crate::index::spot::{
-    Booking, Lookup, Pick, RecordSource, Settled, Since, SpotColumn, LOOKUP_TRIES,
+    Booking, Displaced, Lookup, Pick, RecordSource, Settled, Since, SpotColumn, LOOKUP_TRIES,
 };
 use crate::sync::{lock, read, write};
 
@@ -1234,24 +1234,40 @@ impl ReelIndex {
             return Ok(false);
         };
         if self.spot_serves() {
-            let mut settled = false;
             let displaced = self.spot[at].displace(key, lsn)?;
-            for loc in displaced.booked {
-                settled |= self.indexes[at].settle_paged(key.as_slice(), loc, &self.segments);
-            }
-            for (loc, least) in displaced.classed {
-                settled |=
-                    self.indexes[at].settle_paged_least(key.as_slice(), loc, least, &self.segments);
-            }
-            for (loc, least) in displaced.rebooked {
-                self.indexes[at].rebook_paged(key.as_slice(), least, loc.len);
-            }
-            return Ok(settled);
+            return Ok(self.book_displaced(at, key.as_slice(), displaced));
         }
         let Some(displaced) = self.sealed_entry(at, key)? else {
             return Ok(false);
         };
         Ok(self.indexes[at].settle_paged(key.as_slice(), displaced.loc, &self.segments))
+    }
+
+    /// Book what settling a key's older versions found, reporting whether a counted one went
+    fn book_displaced(&self, at: usize, key: &[u8], displaced: Displaced) -> bool {
+        let mut settled = false;
+        for loc in displaced.booked {
+            settled |= self.indexes[at].settle_paged(key, loc, &self.segments);
+        }
+        for (loc, least) in displaced.classed {
+            settled |= self.indexes[at].settle_paged_least(key, loc, least, &self.segments);
+        }
+        for (loc, least) in displaced.rebooked {
+            self.indexes[at].rebook_paged(key, least, loc.len);
+        }
+        settled
+    }
+
+    /// Swap up to `budget` class bookings for their true lengths, one header read each
+    pub fn rebook_owed(&self, budget: usize) -> usize {
+        let mut rebooked = 0;
+        for (at, spot) in self.spot.iter().enumerate() {
+            for (key, displaced) in spot.rebook_owed(budget.saturating_sub(rebooked)) {
+                self.book_displaced(at, key.as_slice(), displaced);
+                rebooked += 1;
+            }
+        }
+        rebooked
     }
 
     /// The codec this column asks admission to try on its payloads

@@ -19,7 +19,10 @@ use crate::reel::checkpoint::{
     Checkpoint,
 };
 
-use super::{read_only, CompactPass, ReelStore, Totals, GRAVE_WINDOW, INGEST_HOT_BYTES, SWEEP_RUN};
+use super::{
+    read_only, CompactPass, ReelStore, Totals, GRAVE_WINDOW, INGEST_HOT_BYTES, SPOT_REBOOK_BUDGET,
+    SWEEP_RUN,
+};
 use crate::sync::lock;
 
 /// The spot index cleaner takes out at most this many older versions a tick, with no reads
@@ -338,6 +341,7 @@ impl ReelStore {
         self.page_out_sealed()?;
         self.scrub_once()?;
         self.index.scrub_spot(SPOT_SCRUB_BUDGET);
+        self.index.rebook_owed(SPOT_REBOOK_BUDGET);
         self.index.sweep_walk_runs();
         Ok(())
     }

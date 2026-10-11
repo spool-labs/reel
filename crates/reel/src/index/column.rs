@@ -1915,6 +1915,10 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         if prefix.len() != self.shard_bytes as usize || self.shard_bytes == 0 {
             return None;
         }
+        // A key shorter than the shard is padded into it without carrying the prefix
+        if self.declared_width < u16::from(self.shard_bytes) {
+            return None;
+        }
         // An unswept cover leaves dead entries in the counters, so the caller walks
         if self.pending_overlaps(prefix, prefix) {
             return None;

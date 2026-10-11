@@ -463,6 +463,14 @@ impl Scope {
             Direction::Desc => self.upper_inclusive.as_ref(),
         };
         match near {
+            // No key is wider than the maximum, so a wider start begins at its first bytes
+            Some(bound) if bound.len() > MAX_KEY_LEN => {
+                let cut = bound[..MAX_KEY_LEN].to_vec();
+                match self.direction {
+                    Direction::Asc => Bound::Excluded(cut),
+                    Direction::Desc => Bound::Included(cut),
+                }
+            }
             Some(bound) => Bound::Included(bound.clone()),
             None => Bound::Unbounded,
         }
@@ -773,8 +781,8 @@ impl Page {
             Direction::Asc => Way::Up,
             Direction::Desc => Way::Down,
         };
+        // The start is cut to the widest key, so the cursor takes every bound it is given
         let bound = scope.start_bound();
-        // A bound wider than any key matches nothing, so a refused cursor means no keys
         Page {
             buffered,
             serves,
@@ -819,7 +827,7 @@ impl Page {
             return Some((taken, self.buffered.found_at(taken)));
         }
 
-        // A page of graves the merge dropped comes back empty, so ask for the next one
+        // A page comes back empty only once the playback is done, and the next turn ends the walk
         loop {
             let playback = self.playback.as_mut()?;
             if playback.is_done() {

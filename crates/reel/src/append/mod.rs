@@ -550,8 +550,12 @@ impl Appender {
 
     /// Whether the active segment holds a record past its header
     pub fn holds_records(&self) -> bool {
-        let header = RecordHeader::segment_header(&[0; SEGMENT_HEADER_SPAN]);
-        self.tail.committed_len() > self.reserved_span(&header)
+        self.tail.committed_len() > self.header_span()
+    }
+
+    /// Bytes the header record takes at the front of every segment
+    fn header_span(&self) -> u64 {
+        self.reserved_span(&RecordHeader::segment_header(&[0; SEGMENT_HEADER_SPAN]))
     }
 
     /// Seal the active segment with a footer, roll to a fresh one, and return the sealed id
@@ -709,8 +713,8 @@ impl Appender {
         let span = self.reserved_span(&header);
         let target = self.shared.config.segment_bytes.to_bytes();
 
-        // A record wider than a segment fits in none and would roll forever
-        if span + ALIGN > target {
+        // A record that fits no fresh segment past its header would roll forever
+        if self.header_span() + span + ALIGN > target {
             return Err(ReelError::Rejected(format!(
                 "a record of {span} bytes does not fit a reel segment of {target}"
             )));
@@ -822,7 +826,7 @@ impl Appender {
             .sum();
         let span = self.reserved_batch_span(framed);
         let target = self.shared.config.segment_bytes.to_bytes();
-        if span + ALIGN > target {
+        if self.header_span() + span + ALIGN > target {
             return Err(ReelError::Rejected(format!(
                 "a batch of {span} bytes does not fit a reel segment"
             )));

@@ -197,7 +197,7 @@ pub fn merge_into_key_run(
         .map(|(segment, _)| segment)
         .collect();
 
-    let mut columns: BTreeSet<(ColumnId, u16)> = BTreeSet::new();
+    let mut columns: BTreeSet<ColumnId> = BTreeSet::new();
     for source in &sources {
         match source {
             Source::Footer { footer, .. } => columns.extend(
@@ -205,24 +205,10 @@ pub fn merge_into_key_run(
                     .partitions
                     .iter()
                     .filter(|rows| !rows.is_empty())
-                    .map(|rows| (rows.column, rows.key_width)),
+                    .map(|rows| rows.column),
             ),
-            Source::Keys(run) => columns.extend(
-                run.columns()
-                    .iter()
-                    .map(|column| (column.column, column.key_width)),
-            ),
+            Source::Keys(run) => columns.extend(run.columns().iter().map(|column| column.column)),
         }
-    }
-    let mut widths = columns
-        .iter()
-        .map(|(column, _)| *column)
-        .collect::<Vec<_>>();
-    widths.dedup();
-    if widths.len() != columns.len() {
-        return Err(ReelError::Rejected(
-            "a column comes in two key widths across the runs".to_string(),
-        ));
     }
 
     // A covered segment the merge skipped would hide its rows from the walk
@@ -252,8 +238,8 @@ pub fn merge_into_key_run(
     };
     let footers: Arc<dyn FooterSource> = Arc::clone(shared) as Arc<dyn FooterSource>;
     let written = (|| -> Result<()> {
-        for (column, width) in &columns {
-            writer.begin_column(*column, *width)?;
+        for column in &columns {
+            writer.begin_column(*column)?;
             merge_column(
                 &footers,
                 &sources,
@@ -277,7 +263,8 @@ pub fn merge_into_key_run(
         .count() as u64;
     report.rows_written = writer.rows();
     let path = writer.finish(&covered)?;
-    let run = Arc::new(KeyRun::open(&shared.driver, &path, id)?);
+    // A run the open refuses answers nothing, and the next merge writes a fresh one
+    let run = Arc::new(KeyRun::open_or_unlink(&shared.driver, &path, id)?);
     let merged: Vec<u64> = runs.iter().map(|run| run.id).collect();
     for retired in index.key_runs().install(run, &merged) {
         retired.retire();

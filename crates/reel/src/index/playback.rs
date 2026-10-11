@@ -792,19 +792,21 @@ impl PlaybackCursor {
 /// A page fill tries this many times when a segment a key run points into retires under it
 const REFILLS: usize = 8;
 
-/// Fill a page with one merged run of a paged column's keys, retrying when a segment retires
+/// Fill a page with up to `limit` live keys of a paged column, retrying when a segment retires
 pub fn merged_page(
     paged: &Paged<'_>,
     playback: &mut PlaybackCursor,
     limit: usize,
     out: &mut KeyPage,
 ) -> Result<()> {
+    // A try can move the playback before it fails, so the next try starts from here
+    let mark = playback.mark();
     let mut refills = 0;
     loop {
         match fill_merged_page(paged, playback, limit, out) {
             Err(error) if is_vanished(&error) && refills < REFILLS => {
                 refills += 1;
-                playback.generation = None;
+                playback.rewind(&mark);
                 std::thread::yield_now();
             }
             outcome => return outcome,
@@ -812,8 +814,23 @@ pub fn merged_page(
     }
 }
 
-/// One try at a merged page
+/// One try at a merged page, which merges run after run until the page fills or the column ends
 fn fill_merged_page(
+    paged: &Paged<'_>,
+    playback: &mut PlaybackCursor,
+    limit: usize,
+    out: &mut KeyPage,
+) -> Result<()> {
+    out.clear();
+    // A run drops the graves and covered keys of its map page, so it can leave the page short
+    while out.len() < limit && !playback.is_done() {
+        merge_run(paged, playback, limit, out)?;
+    }
+    Ok(())
+}
+
+/// Merge the map and the footers up to the edge of one map page, adding live keys to the page
+fn merge_run(
     paged: &Paged<'_>,
     playback: &mut PlaybackCursor,
     limit: usize,
@@ -821,10 +838,6 @@ fn fill_merged_page(
 ) -> Result<()> {
     let index = paged.index;
     let way = playback.way;
-    out.clear();
-    if limit == 0 {
-        return Ok(());
-    }
     // Keys move between map and footers, so the map page stands only if the sealed set held still
     loop {
         playback.open(paged)?;
@@ -1363,11 +1376,11 @@ mod tests {
         assert_eq!(fixture.drain(&mut playback()), vec![1, 3, 4]);
     }
 
-    // a page of graves alone leaves the playback open for the keys past it
+    // a map page of graves leaves the page short, so the fill goes on to the keys past it
     #[test]
-    fn a_page_of_graves_does_not_end_the_playback() {
-        let fixture = Fixture::new(&[(SegmentId(1), &[1, 2, 3, 4])]);
-        fixture.seal(SegmentId(1), 1, 4);
+    fn a_page_fills_past_a_map_page_of_graves() {
+        let fixture = Fixture::new(&[(SegmentId(1), &[1, 2, 3, 4, 5])]);
+        fixture.seal(SegmentId(1), 1, 5);
         fixture.bury(1);
         fixture.bury(2);
 
@@ -1375,14 +1388,14 @@ mod tests {
         let mut page = KeyPage::with_lens();
         assert_eq!(
             fixture.page(&mut playback, &mut page),
-            Vec::<u8>::new(),
-            "a page of graves is empty"
+            vec![3, 4],
+            "the page fills from the keys past the graves"
         );
         assert!(
             !playback.is_done(),
-            "the playback stays open past a page of graves"
+            "the playback stays open past a full page"
         );
-        assert_eq!(fixture.drain(&mut playback), vec![3, 4]);
+        assert_eq!(fixture.drain(&mut playback), vec![5]);
     }
 
     // a page that stops at its edge resumes before the sealed key it peeked, whose grave comes next

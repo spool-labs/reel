@@ -139,3 +139,46 @@ fn a_shard_prefix_count_leaves_out_short_keys() {
         0
     );
 }
+
+/// Run one write on its own thread, and say whether it came back inside the deadline
+fn returns_within<F: FnOnce() -> bool + Send + 'static>(write: F) -> Option<bool> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(write());
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .ok()
+}
+
+// a put or batch near the segment's size either lands or is refused, and never rolls forever
+#[test]
+fn a_write_just_under_the_segment_size_returns() {
+    let dir = TempDir::new().expect("temp dir");
+    let segment = 64 * 1024;
+    let config = ReelConfig {
+        segment_bytes: ByteCount::from_bytes(segment as u64),
+        ..config()
+    };
+    let store = Arc::new(ReelStore::open(dir.path().to_path_buf(), config, COLUMNS).expect("open"));
+    // Every size across the window a fresh segment's header takes, below one block short of a segment
+    for len in (segment - 4096 - 256..segment - 4096).step_by(8) {
+        let writer = Arc::clone(&store);
+        let put =
+            returns_within(move || Store::put(&*writer, "rows", b"k", &vec![7u8; len]).is_ok());
+        let landed = put.unwrap_or_else(|| panic!("a put of {len} bytes never returned"));
+        if landed {
+            let got = Store::get(&*store, "rows", b"k").expect("get");
+            assert_eq!(got.map(|value| value.len()), Some(len));
+        }
+
+        let writer = Arc::clone(&store);
+        let batch = returns_within(move || {
+            let mut batch = reel_core::WriteBatch::new();
+            batch.put("rows", b"a", &vec![1u8; len / 2]);
+            batch.put("rows", b"b", &vec![2u8; len / 2]);
+            Store::write_batch(&*writer, batch).is_ok()
+        });
+        assert!(batch.is_some(), "a batch of {len} bytes never returned");
+    }
+}

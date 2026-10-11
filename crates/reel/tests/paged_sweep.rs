@@ -142,6 +142,79 @@ fn a_sweep_hands_out_every_key() {
     );
 }
 
+// deletes over sealed keys stand in the map, and a sweep pages on past a page of them
+#[test]
+fn a_sweep_pages_past_deletes_over_sealed_keys() {
+    let dir = TempDir::new().expect("temp dir");
+    let (store, mut model) = filled(&dir);
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
+    // Three pages of keys in a row under a prefix, with live keys on both sides
+    let run = |model: &BTreeMap<Vec<u8>, Vec<u8>>, prefix: u8| -> Vec<Vec<u8>> {
+        model
+            .keys()
+            .filter(|key| key[0] == prefix)
+            .skip(PAGE)
+            .take(3 * PAGE)
+            .cloned()
+            .collect()
+    };
+
+    // Each point delete leaves a grave in the map over a sealed row
+    for key in run(&model, 1) {
+        Store::delete(&store, "rows", &key).expect("delete");
+        model.remove(&key);
+    }
+
+    // Keys written again stand in the map over their sealed rows, and one range delete covers them
+    let covered = run(&model, 2);
+    for key in &covered {
+        Store::put(&store, "rows", key, &value_of(0)).expect("rewrite");
+    }
+    let last = covered.last().expect("a covered key");
+    let end = model
+        .keys()
+        .find(|key| *key > last)
+        .expect("a key past the range")
+        .clone();
+    Store::delete_range(&store, "rows", &covered[0], &end).expect("delete range");
+    for key in &covered {
+        model.remove(key);
+    }
+
+    // A short page reads as the end, so a sweep that stops early comes back short
+    let whole: Vec<(Vec<u8>, Vec<u8>)> = model.clone().into_iter().collect();
+    let swept = sweep_all(&store);
+    assert_eq!(
+        swept.len(),
+        whole.len(),
+        "a whole sweep stopped at the deletes"
+    );
+    assert!(swept == whole, "a whole sweep differs from what is left");
+    for prefix in [[1u8], [2u8]] {
+        let under: Vec<(Vec<u8>, Vec<u8>)> = model
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let swept = sweep_prefix_all(&store, &prefix);
+        assert_eq!(
+            swept.len(),
+            under.len(),
+            "a prefix sweep under {prefix:?} stopped at the deletes"
+        );
+        assert!(swept == under, "a prefix sweep under {prefix:?} differs");
+        let keys: Vec<Vec<u8>> = under.into_iter().map(|(key, _)| key).collect();
+        let swept = sweep_keys_prefix_all(&store, &prefix);
+        assert_eq!(
+            swept.len(),
+            keys.len(),
+            "a key sweep under {prefix:?} stopped at the deletes"
+        );
+        assert!(swept == keys, "a key sweep under {prefix:?} differs");
+    }
+}
+
 // an empty value in the open tail comes back from a walk, a sweep and a batched get
 #[test]
 fn empty_values_in_the_tail() {

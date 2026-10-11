@@ -827,7 +827,7 @@ impl Page {
             return Some((taken, self.buffered.found_at(taken)));
         }
 
-        // A page of graves the merge dropped comes back empty, so ask for the next one
+        // A page comes back empty only once the playback is done, and the next turn ends the walk
         loop {
             let playback = self.playback.as_mut()?;
             if playback.is_done() {

@@ -762,7 +762,30 @@ impl<'d> RunWriter<'d> {
     }
 
     /// Write the fences, covered segments, directory and trailer, then rename the run in place
+    ///
+    /// A run that fails on the way is dropped whole, so a merge that keeps failing leaves no file.
     pub fn finish(mut self, covered: &[SegmentId]) -> Result<PathBuf> {
+        if let Err(error) = self.write_tail(covered) {
+            self.abandon();
+            return Err(error);
+        }
+        let renamed = self
+            .driver
+            .close(self.file)
+            .and_then(|()| self.driver.rename(&self.temp, &self.path));
+        if let Err(error) = renamed {
+            let _ = self.driver.unlink(&self.temp);
+            return Err(error);
+        }
+        if let Err(error) = self.driver.sync_dir(&self.root) {
+            let _ = self.driver.unlink(&self.path);
+            return Err(error);
+        }
+        Ok(self.path)
+    }
+
+    /// Write everything after the rows and sync the file
+    fn write_tail(&mut self, covered: &[SegmentId]) -> Result<()> {
         self.write_pending()?;
         let mut tail = Vec::new();
         let mut fences_at = Vec::with_capacity(self.columns.len());
@@ -789,11 +812,7 @@ impl<'d> RunWriter<'d> {
         tail.extend_from_slice(&MAGIC.to_le_bytes());
         self.driver
             .writev_all(self.file, self.at, vec![WriteBuf::owned(tail)])?;
-        self.driver.sync_full(self.file)?;
-        self.driver.close(self.file)?;
-        self.driver.rename(&self.temp, &self.path)?;
-        self.driver.sync_dir(&self.root)?;
-        Ok(self.path)
+        self.driver.sync_full(self.file)
     }
 
     /// Drop a run that will not be finished, its temporary file with it

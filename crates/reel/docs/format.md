@@ -248,11 +248,12 @@ footer partition for the column. Everything else about the row, the key, the seq
 offset, the length and the flags, is in that footer row, which never changes once the seal writes
 it. A block is 8 rows. Each column's fences hold the first key of every block and the column's last
 key, each after its length, so a seek finds its block without reading a row and then searches the
-block through the footers. The directory gives each column its id, key width, block rows, row
-count, where its rows start and where its fences start, 31 bytes a column. The covered segments are
-the ones whose footers the run stands in for during a walk, in the order the rows point into them.
-The trailer is 20 bytes: where the directory starts, the column count, the covered count and the
-magic `KRN2`.
+block through the footers. The directory gives each column its id, block rows, row count, where
+its rows start and where its fences start, 29 bytes a column. A column's keys may have any width,
+0 included, since every key's length is in its footer and every fence carries its own. The covered
+segments are the ones whose footers the run stands in for during a walk, in the order the rows
+point into them. The trailer is 20 bytes: where the directory starts, the column count, the covered
+count and the magic `KRN2`.
 
 A key run holds nothing the footers lack, only an order over their rows. Gets and recovery still
 read the footers, so a lost run only hands its segments back to the walk. A row into a segment that

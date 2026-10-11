@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use crate::error::{ReelError, Result};
 use crate::format::column::ColumnId;
-use crate::format::footer::{FooterRow, VARYING_WIDTH};
+use crate::format::footer::FooterRow;
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::prefix::PackedCursor;
@@ -26,8 +26,8 @@ const RUN_BLOCK_ROWS: u32 = 8;
 /// The writer gathers this many bytes before each write, so rows go down in large writes
 const WRITE_BYTES: usize = 1 << 20;
 
-/// A directory row takes this many bytes: column, width, block rows, rows, rows at, fences at
-const DIRECTORY_ROW: usize = 1 + 2 + 4 + 8 + 8 + 8;
+/// A directory row takes this many bytes: column, block rows, rows, rows at, fences at
+const DIRECTORY_ROW: usize = 1 + 4 + 8 + 8 + 8;
 
 /// The trailer takes this many bytes: directory at, columns, covered count, magic
 const TRAILER: usize = 8 + 4 + 4 + 4;
@@ -221,9 +221,6 @@ pub struct RunColumn {
     /// Every row belongs to this column
     pub column: ColumnId,
 
-    /// Every key in the column has this width, or VARYING_WIDTH where keys differ
-    pub key_width: u16,
-
     /// Each block holds this many rows, the last one holding the rest
     block_rows: u32,
 
@@ -330,6 +327,13 @@ pub struct KeyRun {
 }
 
 impl KeyRun {
+    /// Open one key run, unlinking its file when the open refuses it, since nothing else reads it then
+    pub fn open_or_unlink(driver: &Arc<IoDriver>, path: &Path, id: u64) -> Result<KeyRun> {
+        KeyRun::open(driver, path, id).inspect_err(|_| {
+            let _ = driver.unlink(path);
+        })
+    }
+
     /// Open one key run, reading its directory, fences and covered segments
     pub fn open(driver: &Arc<IoDriver>, path: &Path, id: u64) -> Result<KeyRun> {
         let backing = match Mapping::open(path, 0) {
@@ -370,13 +374,12 @@ impl KeyRun {
         let mut columns = Vec::with_capacity(column_count);
         for at in 0..column_count {
             let row = &directory[at * DIRECTORY_ROW..(at + 1) * DIRECTORY_ROW];
-            let key_width = u16::from_le_bytes([row[1], row[2]]);
-            let block_rows = read_u32_le(&row[3..7]);
-            let rows = read_u64_le(&row[7..15]);
-            let rows_at = read_u64_le(&row[15..23]);
-            let fences_at = read_u64_le(&row[23..31]);
-            if key_width == 0 || block_rows == 0 {
-                return Err(corrupt("a column with no width or no block size"));
+            let block_rows = read_u32_le(&row[1..5]);
+            let rows = read_u64_le(&row[5..13]);
+            let rows_at = read_u64_le(&row[13..21]);
+            let fences_at = read_u64_le(&row[21..29]);
+            if block_rows == 0 {
+                return Err(corrupt("a column with no block size"));
             }
             span(
                 rows_at,
@@ -402,7 +405,6 @@ impl KeyRun {
             let last = span(at + 2, len)?.to_vec();
             columns.push(RunColumn {
                 column: ColumnId(row[0]),
-                key_width,
                 block_rows,
                 rows,
                 rows_at,
@@ -630,11 +632,8 @@ impl KeyRunSet {
             let Some(id) = key_run_id(&entry.name) else {
                 continue;
             };
-            match KeyRun::open(driver, &path, id) {
-                Ok(run) => runs.push(run),
-                Err(_) => {
-                    let _ = driver.unlink(&path);
-                }
+            if let Ok(run) = KeyRun::open_or_unlink(driver, &path, id) {
+                runs.push(run);
             }
         }
         runs.sort_by_key(|run| run.id);
@@ -660,7 +659,6 @@ impl KeyRunSet {
 /// A column being written, its rows already down and its fences gathered
 struct Building {
     column: ColumnId,
-    key_width: u16,
     rows: u64,
     rows_at: u64,
     fences: Vec<u8>,
@@ -698,7 +696,7 @@ impl<'d> RunWriter<'d> {
     }
 
     /// Open the next column, which has to come after the one before it
-    pub fn begin_column(&mut self, column: ColumnId, key_width: u16) -> Result<()> {
+    pub fn begin_column(&mut self, column: ColumnId) -> Result<()> {
         if self
             .columns
             .last()
@@ -710,7 +708,6 @@ impl<'d> RunWriter<'d> {
         }
         self.columns.push(Building {
             column,
-            key_width,
             rows: 0,
             rows_at: self.at + self.pending.len() as u64,
             fences: Vec::new(),
@@ -725,14 +722,7 @@ impl<'d> RunWriter<'d> {
             ReelError::Rejected("a key run row came before any column".to_string())
         })?;
         let width = u16::try_from(key.len())
-            .ok()
-            .filter(|width| *width != VARYING_WIDTH)
-            .ok_or_else(|| ReelError::Rejected("a key run row's key is too wide".to_string()))?;
-        if building.key_width != VARYING_WIDTH && width != building.key_width {
-            return Err(ReelError::Rejected(
-                "a key run row is not its column's width".to_string(),
-            ));
-        }
+            .map_err(|_| ReelError::Rejected("a key run row's key is too wide".to_string()))?;
         if building.rows > 0 && key <= building.last.as_slice() {
             return Err(ReelError::Rejected(
                 "a key run's rows arrived out of order".to_string(),
@@ -785,7 +775,6 @@ impl<'d> RunWriter<'d> {
         let directory_at = self.at + tail.len() as u64;
         for (building, fences_at) in self.columns.iter().zip(&fences_at) {
             tail.push(building.column.0);
-            tail.extend_from_slice(&building.key_width.to_le_bytes());
             tail.extend_from_slice(&RUN_BLOCK_ROWS.to_le_bytes());
             tail.extend_from_slice(&building.rows.to_le_bytes());
             tail.extend_from_slice(&building.rows_at.to_le_bytes());
@@ -861,9 +850,9 @@ mod tests {
         }
     }
 
-    fn written(driver: &Arc<IoDriver>, id: u64, keys: &[Vec<u8>], width: u16) -> KeyRun {
+    fn written(driver: &Arc<IoDriver>, id: u64, keys: &[Vec<u8>]) -> KeyRun {
         let mut writer = RunWriter::create(driver, Path::new(ROOT), id).expect("create");
-        writer.begin_column(ColumnId(1), width).expect("column");
+        writer.begin_column(ColumnId(1)).expect("column");
         for (n, key) in keys.iter().enumerate() {
             writer.push(key, pointer(n as u32)).expect("push");
         }
@@ -880,7 +869,7 @@ mod tests {
         let driver = driver(&sim);
         let mut keys: Vec<Vec<u8>> = (0..2_000u32).map(|n| key(n).to_vec()).collect();
         keys.sort();
-        let run = written(&driver, 3, &keys, 8);
+        let run = written(&driver, 3, &keys);
         assert_eq!(run.covered, vec![SegmentId(4), SegmentId(9), SegmentId(12)]);
         let column = run.column(ColumnId(1)).expect("column");
         assert_eq!(column.rows(), 2_000);
@@ -908,7 +897,7 @@ mod tests {
         let keys: Vec<Vec<u8>> = (0..5_000u64)
             .map(|n| (n * 2).to_be_bytes().to_vec())
             .collect();
-        let run = written(&driver, 1, &keys, 8);
+        let run = written(&driver, 1, &keys);
         let column = run.column(ColumnId(1)).expect("column");
         let mut rows = Keys {
             keys: keys.clone(),
@@ -945,7 +934,7 @@ mod tests {
         let keys: Vec<Vec<u8>> = (0..5_000u64)
             .map(|n| (n * 2).to_be_bytes().to_vec())
             .collect();
-        let run = written(&driver, 2, &keys, 8);
+        let run = written(&driver, 2, &keys);
         let column = run.column(ColumnId(1)).expect("column");
         let mut rows = Keys {
             keys: keys.clone(),
@@ -976,7 +965,7 @@ mod tests {
             .collect();
         keys.sort();
         keys.dedup();
-        let run = written(&driver, 5, &keys, VARYING_WIDTH);
+        let run = written(&driver, 5, &keys);
         let column = run.column(ColumnId(1)).expect("varying");
         assert_eq!(
             column
@@ -1016,13 +1005,39 @@ mod tests {
         }
     }
 
+    // a run the open refuses is unlinked, so a failed install leaves no file behind
+    #[test]
+    fn an_unreadable_run_is_unlinked_by_its_open() {
+        let sim = SimIo::new(FaultPlan::new(1));
+        let driver = driver(&sim);
+        let path = key_run_path(Path::new(ROOT), 6);
+        let file = driver.open(&path, true).expect("open");
+        driver
+            .writev_all(file, 0, vec![WriteBuf::owned(vec![0x5a; 64])])
+            .expect("write");
+        driver.sync_full(file).expect("sync");
+        driver.close(file).expect("close");
+
+        assert!(KeyRun::open_or_unlink(&driver, &path, 6).is_err());
+        let names: Vec<String> = driver
+            .list_or_empty(Path::new(ROOT))
+            .expect("list")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(
+            !names.contains(&key_run_name(6)),
+            "the unreadable run is still on disk"
+        );
+    }
+
     // rows out of order are refused, so a walk can trust the run is sorted
     #[test]
     fn rows_out_of_order_are_refused() {
         let sim = SimIo::new(FaultPlan::new(1));
         let driver = driver(&sim);
         let mut writer = RunWriter::create(&driver, Path::new(ROOT), 2).expect("create");
-        writer.begin_column(ColumnId(1), 8).expect("column");
+        writer.begin_column(ColumnId(1)).expect("column");
         writer.push(&key(9), pointer(9)).expect("push");
         assert!(writer.push(&key(9), pointer(9)).is_err());
         writer.abandon();
@@ -1037,8 +1052,8 @@ mod tests {
         let wide: Vec<Vec<u8>> = (0..4_096u64)
             .map(|n| [n.to_be_bytes().as_slice(), &[7u8; 56]].concat())
             .collect();
-        let narrow = written(&driver, 7, &narrow, 8);
-        let wide = written(&driver, 8, &wide, 64);
+        let narrow = written(&driver, 7, &narrow);
+        let wide = written(&driver, 8, &wide);
         let rows = 4_096 * ROW_LEN as u64;
         // The fences add a key per block, so the wide run grows only by its keys there
         let fences = (4_096 / u64::from(RUN_BLOCK_ROWS) + 1) * 56;

@@ -76,6 +76,9 @@ pub const LOOKUP_TRIES: usize = MAX_CANDIDATES + 1;
 /// The cleaner's queue caps at this many, later ones wait for the retired-segment sweep
 const MAX_STALE: usize = 1 << 20;
 
+/// The rebook queue caps at this many, later class bookings wait for their segment to retire
+const MAX_OWED: usize = 1 << 20;
+
 /// One bucket takes this many bytes
 const BUCKET_BYTES: u64 = 64;
 
@@ -987,6 +990,9 @@ pub struct SpotColumn {
     /// How far the class bookings may sit below the truth, at most a class width each
     slack: AtomicU64,
 
+    /// Each key a class booking left owed its true length, with the lsn that displaced it
+    owed: Mutex<VecDeque<(RecordKey, Lsn)>>,
+
     /// Rows taken by an open before it could read a header, settled once it can
     set_aside: Mutex<Vec<SetAside>>,
 
@@ -1016,6 +1022,7 @@ impl SpotColumn {
             stale: Mutex::new(VecDeque::new()),
             beside: AtomicU64::new(0),
             slack: AtomicU64::new(0),
+            owed: Mutex::new(VecDeque::new()),
             set_aside: Mutex::new(Vec::new()),
             follows: AtomicBool::new(false),
             behind: AtomicU64::new(0),
@@ -1585,6 +1592,38 @@ impl SpotColumn {
 
     /// Book a key's entries older than `newer` dead, leaving unread ones for lookups in flight
     pub fn displace(&self, key: &RecordKey, newer: Lsn) -> Result<Displaced> {
+        let settled = self.settle_versions(key, newer, false)?;
+        // A class booking stands until a read finds the true length, and maintenance reads it
+        if !settled.classed.is_empty() {
+            let mut owed = lock(&self.owed);
+            if owed.len() < MAX_OWED {
+                owed.push_back((key.clone(), newer));
+            }
+        }
+        Ok(settled)
+    }
+
+    /// Read the true length of up to `budget` keys' class bookings, returning what each settled
+    pub fn rebook_owed(&self, budget: usize) -> Vec<(RecordKey, Displaced)> {
+        let mut settled = Vec::new();
+        for _ in 0..budget {
+            let Some((key, newer)) = lock(&self.owed).pop_front() else {
+                break;
+            };
+            match self.settle_versions(&key, newer, true) {
+                Ok(displaced) => settled.push((key, displaced)),
+                // A read fails before anything moves, so the booking stays owed for a later tick
+                Err(_) => {
+                    lock(&self.owed).push_back((key, newer));
+                    break;
+                }
+            }
+        }
+        settled
+    }
+
+    /// Settle a key's versions older than `newer`, and with `owed` read only its class bookings
+    fn settle_versions(&self, key: &RecordKey, newer: Lsn, owed: bool) -> Result<Displaced> {
         let (Some(records), Some(segments)) = (self.records.get(), self.segments.get()) else {
             return Ok(Displaced::default());
         };
@@ -1594,10 +1633,13 @@ impl SpotColumn {
         if seen.is_empty() {
             return Ok(Displaced::default());
         }
-        let must_read = seen.len() >= SETTLE_AT;
+        let must_read = owed || seen.len() >= SETTLE_AT;
         let (mut unread, mut older, mut gone) = (Vec::new(), Vec::new(), Vec::new());
         for place in seen.iter() {
             let slot = place.slot;
+            if owed && !slot.is_displaced() {
+                continue;
+            }
             let is_older = segments
                 .max_lsn_of(slot.segment())
                 .is_some_and(|ceiling| ceiling < newer);
@@ -2086,6 +2128,7 @@ impl SpotColumn {
             table.count_taken(held, displaced);
         }
         lock(&self.stale).clear();
+        lock(&self.owed).clear();
         lock(&self.set_aside).clear();
         self.beside.store(0, Ordering::Relaxed);
         self.slack.store(0, Ordering::Relaxed);
@@ -2108,6 +2151,7 @@ impl SpotColumn {
             live.displaced.store(displaced, Ordering::Relaxed);
         }
         std::mem::swap(&mut *lock(&self.stale), &mut *lock(&fresh.stale));
+        std::mem::swap(&mut *lock(&self.owed), &mut *lock(&fresh.owed));
         std::mem::swap(&mut *lock(&self.set_aside), &mut *lock(&fresh.set_aside));
         self.beside
             .store(fresh.beside.load(Ordering::Relaxed), Ordering::Relaxed);

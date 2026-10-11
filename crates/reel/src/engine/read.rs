@@ -19,7 +19,7 @@ use crate::index::spot::{Candidate, Lookup, Offered, RecordSource, Since, SpotRe
 use crate::reel::cue::CuePoint;
 use crate::reel::{SpotAsk, SpotRange};
 
-use super::{read_only, ReelStore, GRAVE_WINDOW, SWEEP_RUN};
+use super::{read_only, ReelStore, GRAVE_WINDOW, SPOT_REBOOK_BUDGET, SWEEP_RUN};
 use crate::index::counters::Stamps;
 use crate::index::entry::Entry;
 use crate::index::recovery::rebuild_reel;
@@ -554,8 +554,9 @@ impl ReelStore {
             self.fd_cache.remove(*segment);
         }
 
-        // A reader never runs the tick, so it sweeps covers and prunes old graves here
+        // A reader never runs the tick, so it sweeps covers, rebooks and prunes old graves here
         self.index.sweep_covers(SWEEP_RUN)?;
+        self.index.rebook_owed(SPOT_REBOOK_BUDGET);
         let floor = caught_up.highest_lsn.as_u64().saturating_sub(GRAVE_WINDOW);
         if floor > 0 {
             self.index.prune_tombstones(Lsn(floor));

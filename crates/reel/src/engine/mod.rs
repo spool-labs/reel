@@ -53,6 +53,9 @@ const INGEST_HOT_BYTES: u64 = 8 * 1024 * 1024;
 /// One maintenance tick settles at most this many keys under standing covers
 const SWEEP_RUN: usize = 1 << 16;
 
+/// One tick rebooks at most this many class-booked versions at their true length, a read each
+const SPOT_REBOOK_BUDGET: usize = 4_096;
+
 /// Counts this process's openings so each opening mints distinct sweep marks
 static OPENINGS: AtomicU32 = AtomicU32::new(0);
 

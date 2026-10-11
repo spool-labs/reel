@@ -225,3 +225,110 @@ fn paged_totals_answer_as_the_model() {
         run(seed);
     }
 }
+
+/// One tail and no scrub, so a sealed record stays in its segment through the ticks
+fn displaced_config() -> ReelConfig {
+    ReelConfig {
+        segment_bytes: ByteCount::from_bytes(1024 * 1024),
+        sync: SyncPolicy::Never,
+        active_tails: ThreadBudget::threads(1),
+        scrub_mbps: 0,
+        ..ReelConfig::default()
+    }
+}
+
+/// Every way the totals miss the model's bytes, through the engine and the trait
+fn exact_misses(store: &ReelStore, model: &Model, context: &str) -> Vec<String> {
+    let mut misses = Vec::new();
+    let mut want = |what: &str, held: Option<u64>, want: u64| {
+        if held != Some(want) {
+            misses.push(format!("{context}: {what} held {held:?}, want {want}"));
+        }
+    };
+    let (count, bytes) = modelled(model, &[]);
+    let totals = store.column_totals(ROWS);
+    want("column count", Some(totals.count), count);
+    want("column bytes", Some(totals.bytes.to_bytes()), bytes);
+    want(
+        "live bytes",
+        Store::live_data_size_bytes(store).expect("live bytes"),
+        bytes,
+    );
+    let whole = Store::bytes_prefix(store, "rows", &[]).expect("bytes prefix");
+    want("bytes of the whole column", whole, bytes);
+    let usage = Store::cf_disk_usage(store).expect("disk usage");
+    let rows = usage
+        .iter()
+        .find(|usage| usage.cf == "rows")
+        .expect("rows usage");
+    want("disk usage", Some(rows.blob_bytes), bytes);
+    for spool in 0..2 {
+        let prefix = prefix_of(spool);
+        let (count, bytes) = modelled(model, &prefix);
+        let counted = Store::count_prefix(store, "rows", &prefix).expect("count prefix");
+        want(&format!("spool {spool} count"), Some(counted), count);
+        let held = Store::bytes_prefix(store, "rows", &prefix).expect("bytes prefix");
+        want(&format!("spool {spool} bytes"), held, bytes);
+    }
+    misses
+}
+
+// a delete or overwrite of a sealed record takes its whole length off the totals by the next tick
+#[test]
+fn a_displaced_sealed_record_leaves_exact_totals() {
+    let mut misses = Vec::new();
+    for len in [5usize, 877, 100_000] {
+        for overwrite in [false, true] {
+            let context = format!("{len} bytes, overwrite {overwrite}");
+            let dir = TempDir::new().expect("temp dir");
+            let config = displaced_config();
+            let mut store =
+                ReelStore::open(dir.path().to_path_buf(), config.clone(), COLUMNS).expect("open");
+            let mut model = Model::new();
+            let target = key_of(0);
+            Store::put(&store, "rows", &target, &vec![7u8; len]).expect("put");
+            model.insert(target.clone(), len as u64);
+            // Filler in spool 1 rolls the tail, so the target seals and goes to the spot index,
+            // and keeps its segment too live for a compaction pass to retire it
+            for n in 0..400u64 {
+                let key = key_of(n * SPOOLS + 1);
+                Store::put(&store, "rows", &key, &vec![9u8; 3000]).expect("filler");
+                model.insert(key, 3000);
+            }
+            store.flush().expect("flush");
+            store.page_out_sealed().expect("page out");
+            match overwrite {
+                true => {
+                    let next = len / 2 + 3;
+                    Store::put(&store, "rows", &target, &vec![8u8; next]).expect("overwrite");
+                    model.insert(target, next as u64);
+                }
+                false => {
+                    Store::delete(&store, "rows", &target).expect("delete");
+                    model.remove(&target);
+                }
+            }
+            for _ in 0..3 {
+                Store::maintain(&store).expect("maintain");
+            }
+            misses.extend(exact_misses(
+                &store,
+                &model,
+                &format!("{context}, after maintain"),
+            ));
+            store.close().expect("close");
+            drop(store);
+            store = ReelStore::open(dir.path().to_path_buf(), config, COLUMNS).expect("reopen");
+            misses.extend(exact_misses(
+                &store,
+                &model,
+                &format!("{context}, after a reopen"),
+            ));
+        }
+    }
+    assert!(
+        misses.is_empty(),
+        "the totals missed:\n{}",
+        misses.join("\n")
+    );
+}

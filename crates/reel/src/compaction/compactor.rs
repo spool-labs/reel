@@ -31,6 +31,9 @@ const TRAILER_LEN: u64 = 8;
 /// A scrub pass takes at most this much of a quiet stretch's earnings
 const SCRUB_PASS_MAX: Duration = Duration::from_secs(60);
 
+/// How long a finished sweep waits before the next one, since rot builds over days
+const SCRUB_LAP_REST: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// One rewrite stripe holds at most this many payload bytes between fetch and apply
 const STRIPE_STAGE_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -392,6 +395,9 @@ pub struct Compactor {
     /// Read buffers one scrub pass hands the next, so a sweep allocates once
     scrub_spare: Mutex<Vec<Vec<u8>>>,
 
+    /// When the last full sweep ended, nothing before the first
+    scrub_lap_end: Mutex<Option<Instant>>,
+
     /// The sealed segment the scrub is inside, its rows in offset order
     scrub_order: Mutex<RowOrder>,
 
@@ -482,6 +488,7 @@ impl Compactor {
             scrub_cursor: Mutex::new(None),
             scrub_guard: Mutex::new(()),
             scrub_spare: Mutex::new(Vec::new()),
+            scrub_lap_end: Mutex::new(None),
             scrub_order: Mutex::new(RowOrder::default()),
             in_flight: Mutex::new(std::collections::HashSet::new()),
             rotted: Mutex::new(std::collections::HashMap::new()),
@@ -1271,6 +1278,12 @@ impl Compactor {
         let Some(_pass) = try_lock(&self.scrub_guard) else {
             return Ok(0);
         };
+        // A sweep that finished rests a day before the next one starts
+        let is_resting = lock(&self.scrub_cursor).is_none()
+            && lock(&self.scrub_lap_end).is_some_and(|end| end.elapsed() < SCRUB_LAP_REST);
+        if is_resting {
+            return Ok(0);
+        }
         // the rate sets this pass's read budget, however often the plane ticks
         let (mut budget, stretch) = gate.allowance(SCRUB_PASS_MAX);
         let _rest = Rest(gate);
@@ -1352,6 +1365,7 @@ impl Compactor {
 
         *lock(&self.scrub_cursor) = None;
         *lock(&self.scrub_order) = RowOrder::default();
+        *lock(&self.scrub_lap_end) = Some(Instant::now());
         Ok(hits)
     }
 

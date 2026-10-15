@@ -921,6 +921,9 @@ pub struct FilterProbes {
 
     /// Reads spent opening a sealed segment's directory before searching it
     map_reads: AtomicU64,
+
+    /// Keys a walk stepped over in the sealed runs, deleted ones included
+    stepped: AtomicU64,
 }
 
 impl FilterProbes {
@@ -949,6 +952,11 @@ impl FilterProbes {
         self.map_reads.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Note keys a walk stepped over in the sealed runs
+    pub fn note_stepped(&self, keys: u64) {
+        self.stepped.fetch_add(keys, Ordering::AcqRel);
+    }
+
     /// Every counter, read together so the counts cover the same stretch of work
     pub fn counts(&self) -> ProbeCounts {
         ProbeCounts {
@@ -957,6 +965,7 @@ impl FilterProbes {
             blocks: self.blocks.load(Ordering::Acquire),
             block_reads: self.block_reads.load(Ordering::Acquire),
             map_reads: self.map_reads.load(Ordering::Acquire),
+            stepped: self.stepped.load(Ordering::Acquire),
         }
     }
 }
@@ -978,6 +987,9 @@ pub struct ProbeCounts {
 
     /// How many reads went to opening those searches' directories
     pub map_reads: u64,
+
+    /// Keys walks stepped over in the sealed runs, deleted ones included
+    pub stepped: u64,
 }
 
 impl ProbeCounts {
@@ -989,6 +1001,7 @@ impl ProbeCounts {
             blocks: self.blocks - before.blocks,
             block_reads: self.block_reads - before.block_reads,
             map_reads: self.map_reads - before.map_reads,
+            stepped: self.stepped - before.stepped,
         }
     }
 

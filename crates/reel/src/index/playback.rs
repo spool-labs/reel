@@ -865,6 +865,7 @@ fn merge_run(
         .flatten();
 
     let mut taken = 0usize;
+    let mut stepped = 0u64;
     let mut want = [0u8; MAX_KEY_LEN];
     // Resume past the last key decided, grave or not, copied since a peek reuses `want`
     let mut resume = [0u8; MAX_KEY_LEN];
@@ -882,6 +883,7 @@ fn merge_run(
         }
         resume[..key.len()].copy_from_slice(key);
         resume_len = key.len();
+        stepped += 1;
 
         // The map's entry or grave wins, so the sealed rows for this key are skipped unread
         if resident.key_ref(taken) == Some(key) {
@@ -917,6 +919,7 @@ fn merge_run(
         );
     }
 
+    paged.footers.note_stepped(stepped);
     playback.at = match exhausted {
         true => None,
         false => Some(Bound::Excluded(KeyBytes::new(&resume[..resume_len])?)),

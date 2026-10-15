@@ -662,7 +662,7 @@ impl Compactor {
             }
         };
         // read once: where the records end, and their key order when the footer has one
-        let footer = shared.footer_of(segment)?;
+        let footer = shared.footer_once(segment)?;
         // No row lists an unsealed keyless segment's keys, so it stands until a reopen drops it
         if source.layout().is_keyless_layout() && footer.is_none() {
             return Ok(false);
@@ -1614,7 +1614,8 @@ impl Compactor {
         if order.segment == Some(segment) {
             return Ok(order.footer.clone());
         }
-        let footer = shared.footer_of(segment)?;
+        // The held copy serves the scrub, so a lap leaves the cache to the lookups
+        let footer = shared.footer_once(segment)?;
         if let Some(footer) = &footer {
             order.fill(segment, Arc::clone(footer))?;
         }
@@ -3252,6 +3253,44 @@ mod tests {
             shared.probes.counts().block_reads,
             before,
             "the gate read a row block"
+        );
+    }
+
+    // a scrub over a sealed segment holds its own footer and caches none
+    #[test]
+    fn uncached_scrub() {
+        let fixture = fixture(ReelConfig {
+            scrub_mbps: 1024,
+            ..scrub_config()
+        });
+        for byte in 0..40u8 {
+            put(&fixture, byte, vec![byte; 4_000]);
+        }
+        let segment = fixture
+            .index
+            .get(&key(0))
+            .expect("get")
+            .expect("live")
+            .loc
+            .segment;
+        seal(&fixture);
+        let mut scrubbed = 0;
+        for _ in 0..64 {
+            std::thread::sleep(Duration::from_millis(20));
+            fixture
+                .compactor
+                .scrub_pass(&fixture.reel, &fixture.index)
+                .expect("scrub");
+            scrubbed = fixture.compactor.counters().scrub_bytes;
+            if scrubbed > 0 {
+                break;
+            }
+        }
+        assert!(scrubbed > 0, "the scrub read nothing");
+        let shared = fixture.reel.shared();
+        assert!(
+            shared.footers.get(segment).is_none(),
+            "the scrub cached a footer"
         );
     }
 

@@ -9,7 +9,7 @@ use crate::format::column::{ColumnId, KeyBytes, MAX_KEY_LEN};
 use crate::format::footer::{FooterPartition, FooterRow, SegmentFooter};
 use crate::format::loc::{Loc, SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
-use crate::index::column::ColumnIndex;
+use crate::index::column::{is_past, ColumnIndex};
 use crate::index::counters::SegmentTable;
 use crate::index::entry::Entry;
 use crate::index::keyrun::{
@@ -642,6 +642,9 @@ pub struct PlaybackCursor {
     /// Where the next page starts, or nothing once the playback has run out
     at: Option<Bound<KeyBytes>>,
 
+    /// Where an ascending playback ends, so a page stops there however many dead keys follow
+    end: Bound<KeyBytes>,
+
     /// The cursors on every sealed run within reach
     sealed: Sealed,
 
@@ -670,7 +673,13 @@ impl Default for CursorBuffers {
 impl PlaybackCursor {
     /// A playback of one column from a bound, with nothing open yet
     pub fn new(column: ColumnId, way: Way, from: Bound<&[u8]>) -> Result<PlaybackCursor> {
-        PlaybackCursor::with_buffers(column, way, from, CursorBuffers::default())
+        PlaybackCursor::with_buffers(
+            column,
+            way,
+            from,
+            Bound::Unbounded,
+            CursorBuffers::default(),
+        )
     }
 
     /// The same playback, reusing the vectors of a finished one
@@ -678,6 +687,7 @@ impl PlaybackCursor {
         column: ColumnId,
         way: Way,
         from: Bound<&[u8]>,
+        end: Bound<&[u8]>,
         buffers: CursorBuffers,
     ) -> Result<PlaybackCursor> {
         let CursorBuffers {
@@ -686,10 +696,16 @@ impl PlaybackCursor {
         } = buffers;
         sealed.clear();
         resident.clear();
+        // A descending playback keeps its own stop, so only an ascending one takes an end
+        let end = match way {
+            Way::Up => owned_bound(end)?,
+            Way::Down => Bound::Unbounded,
+        };
         Ok(PlaybackCursor {
             column,
             way,
             at: Some(owned_bound(from)?),
+            end,
             sealed,
             generation: None,
             resident,
@@ -750,7 +766,14 @@ impl PlaybackCursor {
         let Some(at) = self.at.as_ref() else {
             return Ok(());
         };
-        resident_page(index, self.way, borrowed_bound(at), limit, out);
+        resident_page(
+            index,
+            self.way,
+            borrowed_bound(at),
+            borrowed_bound(&self.end),
+            limit,
+            out,
+        );
         self.advance(out, limit)
     }
 
@@ -848,6 +871,7 @@ fn merge_run(
             index,
             way,
             borrowed_bound(at),
+            borrowed_bound(&playback.end),
             limit,
             &mut playback.resident,
         );
@@ -857,7 +881,10 @@ fn merge_run(
     }
 
     let PlaybackCursor {
-        sealed, resident, ..
+        sealed,
+        resident,
+        end,
+        ..
     } = playback;
     // A full map page says nothing past its last key, so the merge stops at that edge
     let edge = (resident.len() == limit)
@@ -878,6 +905,11 @@ fn merge_run(
             exhausted = resident.len() < limit;
             break;
         };
+        // Past the walk's end nothing is wanted, so the dead keys beyond it go unread
+        if is_past(borrowed_bound(end), key) {
+            exhausted = true;
+            break;
+        }
         if edge.is_some_and(|edge| is_ahead(way, edge, key)) {
             break;
         }
@@ -932,11 +964,12 @@ pub fn resident_page(
     index: &ColumnIndex,
     way: Way,
     from: Bound<&[u8]>,
+    end: Bound<&[u8]>,
     limit: usize,
     out: &mut KeyPage,
 ) {
     match way {
-        Way::Up => index.page(from, limit, out),
+        Way::Up => index.page_until(from, end, limit, out),
         Way::Down => index.page_back(from, limit, out),
     }
 }

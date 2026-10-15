@@ -21,7 +21,10 @@ const DEFAULT_FOOTER_CACHE_MIB: u64 = 64;
 const DEFAULT_FILTER_BITS: u8 = 10;
 
 /// An automatic budget opens at most this many tails per volume, however wide the machine
-const MAX_AUTO_TAILS: usize = 8;
+const MAX_AUTO_TAILS: usize = 2;
+
+/// Tails an automatic budget runs on a disk that seeks, since a second one seeks against the first
+const ROTATIONAL_TAILS: u32 = 1;
 
 pub(crate) const KIB: u64 = 1024;
 pub(crate) const MIB: u64 = KIB * 1024;
@@ -74,6 +77,14 @@ impl ThreadBudget {
                     .unwrap_or(1)
             }),
             ThreadBudget::Fixed(count) => count.get() as usize,
+        }
+    }
+
+    /// The budget for a volume on this disk: an automatic one runs a single tail where the disk seeks
+    pub fn for_disk(self, is_rotational: Option<bool>) -> ThreadBudget {
+        match (self, is_rotational) {
+            (ThreadBudget::Auto, Some(true)) => ThreadBudget::threads(ROTATIONAL_TAILS),
+            (ThreadBudget::Auto, Some(false) | None) | (ThreadBudget::Fixed(_), _) => self,
         }
     }
 
@@ -399,6 +410,17 @@ mod tests {
         };
 
         assert!(config.validate().is_err());
+    }
+
+    // an automatic budget runs one tail on a spinning disk and leaves a named count alone
+    #[test]
+    fn tails_for_disk() {
+        let named = ThreadBudget::threads(8);
+
+        assert_eq!(ThreadBudget::Auto.for_disk(Some(true)).resolve_tails(), 1);
+        assert_eq!(ThreadBudget::Auto.for_disk(Some(false)), ThreadBudget::Auto);
+        assert_eq!(ThreadBudget::Auto.for_disk(None), ThreadBudget::Auto);
+        assert_eq!(named.for_disk(Some(true)), named);
     }
 
     // an automatic tail budget resolves to at least one and stops short of a wide machine

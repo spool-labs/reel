@@ -240,7 +240,7 @@ impl ReelStore {
 
     fn open_inner(
         root: PathBuf,
-        config: ReelConfig,
+        mut config: ReelConfig,
         columns: ColumnSet,
         io: Arc<dyn ReelIo>,
         is_read_only: bool,
@@ -261,7 +261,7 @@ impl ReelStore {
             false => None,
         };
 
-        // The facts are logged and kept for callers, nothing acts on them
+        // The facts are logged and kept for callers, and only an automatic tail budget acts on them
         let bias = is_real_fs.then(|| {
             let facts = MachineFacts::read(&root);
             let verdict = facts.verdict();
@@ -284,6 +284,8 @@ impl ReelStore {
             );
             facts
         });
+        let is_rotational = bias.as_ref().and_then(|facts| facts.is_rotational);
+        config.active_tails = config.active_tails.for_disk(is_rotational);
 
         let mut roots = vec![root.clone()];
         roots.extend(config.volumes.iter().map(|volume| volume.path.clone()));

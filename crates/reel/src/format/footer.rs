@@ -245,9 +245,9 @@ impl FooterPartition {
         }
     }
 
-    /// Bytes the partition holds in memory, an estimate of its on-disk size
+    /// Bytes the partition holds in memory, its rows weighed at the capacity they keep
     pub fn encoded_len(&self) -> usize {
-        self.starts.len() * START_BYTES + self.packed.len()
+        self.starts.len() * START_BYTES + self.packed.capacity()
     }
 
     /// Whether the partition records a start per row
@@ -1456,6 +1456,29 @@ mod tests {
         packed[second] = 1;
         reseal(&mut packed);
         assert!(SegmentFooter::parse(&packed).is_err());
+    }
+
+    // a parsed footer weighs at least the row buffers it holds
+    #[test]
+    fn held_capacity() {
+        let mut rows = vec![entry(RECORD, 1, 34, 1, 0, 64)];
+        for at in 0..200u32 {
+            let width = 8 + (at % 33) as usize;
+            rows.push(entry(BLOB, at as u8, width, u64::from(at) + 2, at * 64, 64));
+        }
+        let bytes = SegmentFooter::build(rows).pack(0).expect("pack");
+        let parsed = SegmentFooter::parse(&bytes).expect("parse");
+
+        let held: usize = parsed
+            .partitions
+            .iter()
+            .map(|partition| partition.packed.capacity())
+            .sum();
+        assert!(
+            parsed.encoded_len() >= held,
+            "the footer weighs {} and holds {held}",
+            parsed.encoded_len()
+        );
     }
 
     // rows of differing widths survive a pack and a parse with their keys intact

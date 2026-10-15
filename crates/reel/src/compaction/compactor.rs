@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::append::CopyRecord;
 use crate::config::{ReelConfig, RepairPath, VolumeClass};
-use crate::error::Result;
+use crate::error::{ReelError, Result};
 use crate::format::column::RecordKey;
 use crate::format::footer::{FooterRow, SegmentFooter, FIXED_TAIL_LEN};
 use crate::format::loc::{Loc, SegmentId};
@@ -389,6 +389,12 @@ pub struct Compactor {
     /// Held for the length of one scrub pass, so passes never stack
     scrub_guard: Mutex<()>,
 
+    /// Read buffers one scrub pass hands the next, so a sweep allocates once
+    scrub_spare: Mutex<Vec<Vec<u8>>>,
+
+    /// The sealed segment the scrub is inside, its rows in offset order
+    scrub_order: Mutex<RowOrder>,
+
     /// Seeds where a fresh sweep starts, so restarts do not all start at the same segment
     scrub_seed: u64,
 
@@ -475,6 +481,8 @@ impl Compactor {
             scrub_rate: scrub.map(RateGate::new),
             scrub_cursor: Mutex::new(None),
             scrub_guard: Mutex::new(()),
+            scrub_spare: Mutex::new(Vec::new()),
+            scrub_order: Mutex::new(RowOrder::default()),
             in_flight: Mutex::new(std::collections::HashSet::new()),
             rotted: Mutex::new(std::collections::HashMap::new()),
             spare: Mutex::new(Vec::new()),
@@ -1343,6 +1351,7 @@ impl Compactor {
         }
 
         *lock(&self.scrub_cursor) = None;
+        *lock(&self.scrub_order) = RowOrder::default();
         Ok(hits)
     }
 
@@ -1382,7 +1391,7 @@ impl Compactor {
         let (from, region_end) = match resume {
             Some(carried) => carried,
             None => {
-                let footer = shared.footer_of(handle.id())?;
+                let footer = self.scrub_footer(shared, segment)?;
                 (
                     0,
                     footer_bound(shared, &handle, file_len, footer.as_deref())?,
@@ -1390,9 +1399,38 @@ impl Compactor {
             }
         };
         let mut reader = SegmentReader::new(&shared.driver, handle.file(), region_end);
+        reader.stock(std::mem::take(&mut *lock(&self.scrub_spare)));
+        let step = self.scrub_reader(
+            shared,
+            index,
+            &handle,
+            (from, region_end),
+            carried,
+            budget,
+            deadline,
+            &mut reader,
+        );
+        *lock(&self.scrub_spare) = reader.into_spare();
+        step
+    }
+
+    /// Walk one segment's records through a reader the pass stocked with buffers
+    #[allow(clippy::too_many_arguments)]
+    fn scrub_reader(
+        &self,
+        shared: &Arc<ReelShared>,
+        index: &ReelIndex,
+        handle: &SegmentHandle,
+        (from, region_end): (u64, u64),
+        carried: u64,
+        budget: &mut u64,
+        deadline: Instant,
+        reader: &mut SegmentReader<'_>,
+    ) -> Result<ScrubStep> {
+        let segment = handle.id();
         // A sealed segment is walked by its rows, so a given-back hole never ends the walk early
         match (
-            shared.footer_of(handle.id())?,
+            self.scrub_footer(shared, segment)?,
             handle.layout().is_keyless_layout(),
         ) {
             (Some(footer), _) => {
@@ -1403,7 +1441,7 @@ impl Compactor {
                     region_end,
                     deadline,
                 };
-                return self.scrub_rows(shared, &walk, &mut reader, &footer, from, carried, budget);
+                return self.scrub_rows(shared, &walk, reader, &footer, from, carried, budget);
             }
             // an unsealed keyless segment holds no record the index points at
             (None, true) => {
@@ -1415,7 +1453,7 @@ impl Compactor {
             }
             (None, false) => {}
         }
-        let mut scan = RecordScan::resuming(&mut reader, from);
+        let mut scan = RecordScan::resuming(reader, from);
 
         let mut hits = 0usize;
         let mut dead = carried;
@@ -1485,6 +1523,66 @@ impl Compactor {
     }
 }
 
+/// A sealed segment's footer rows in offset order, as places in the footer
+#[derive(Default)]
+struct RowOrder {
+    /// The segment these rows belong to, nothing before the first fill
+    segment: Option<SegmentId>,
+
+    /// That segment's footer, so a pass that resumes inside it reads nothing again
+    footer: Option<Arc<SegmentFooter>>,
+
+    /// Every row's place, sorted by the offset its record sits at
+    rows: Vec<RowPlace>,
+}
+
+impl RowOrder {
+    /// Order a segment's rows, keeping the capacity an earlier segment grew
+    fn fill(&mut self, segment: SegmentId, footer: Arc<SegmentFooter>) -> Result<()> {
+        self.rows.clear();
+        for (partition, rows) in footer.partitions.iter().enumerate() {
+            for at in 0..rows.len() {
+                let row = rows.row_at(at)?;
+                self.rows.push(RowPlace {
+                    offset: row.offset,
+                    partition: partition as u32,
+                    at: at as u32,
+                });
+            }
+        }
+        self.rows.sort_unstable_by_key(|place| place.offset);
+        self.segment = Some(segment);
+        self.footer = Some(footer);
+        Ok(())
+    }
+}
+
+/// One footer row, by the record's offset and where the row sits in the footer
+#[derive(Clone, Copy)]
+struct RowPlace {
+    /// Offset of the record in its segment
+    offset: u32,
+
+    /// The footer partition that holds the row
+    partition: u32,
+
+    /// The row's position in that partition
+    at: u32,
+}
+
+impl RowPlace {
+    /// The row's key and fields, read back from the footer
+    fn read(&self, footer: &SegmentFooter) -> Result<(RecordKey, FooterRow)> {
+        let partition = footer
+            .partitions
+            .get(self.partition as usize)
+            .ok_or_else(|| ReelError::Corruption("footer partition is out of range".to_string()))?;
+        let at = self.at as usize;
+        let key = RecordKey::from_bytes(partition.column, partition.key_at(at).unwrap_or(&[]))?;
+        Ok((key, partition.row_at(at)?))
+    }
+}
+
 /// Where one scrub pass over a sealed segment reads and when it has to stop
 struct RowScrub<'a> {
     index: &'a ReelIndex,
@@ -1495,6 +1593,23 @@ struct RowScrub<'a> {
 }
 
 impl Compactor {
+    /// The footer of the segment the scrub is inside, read once and held until the scrub moves on
+    fn scrub_footer(
+        &self,
+        shared: &Arc<ReelShared>,
+        segment: SegmentId,
+    ) -> Result<Option<Arc<SegmentFooter>>> {
+        let mut order = lock(&self.scrub_order);
+        if order.segment == Some(segment) {
+            return Ok(order.footer.clone());
+        }
+        let footer = shared.footer_of(segment)?;
+        if let Some(footer) = &footer {
+            order.fill(segment, Arc::clone(footer))?;
+        }
+        Ok(footer)
+    }
+
     /// Scrub a sealed segment by its rows in offset order, from the first row at or past `from`
     #[allow(clippy::too_many_arguments)]
     fn scrub_rows(
@@ -1510,10 +1625,12 @@ impl Compactor {
         let mut hits = 0usize;
         let mut dead = carried;
         let mut scanned = 0u64;
-        let mut rows = footer_rows(footer)?;
-        rows.retain(|(_, row)| u64::from(row.offset) >= from);
-        rows.sort_unstable_by_key(|(_, row)| row.offset);
-        for (key, row) in rows {
+        let order = lock(&self.scrub_order);
+        let start = order
+            .rows
+            .partition_point(|row| u64::from(row.offset) < from);
+        for place in &order.rows[start..] {
+            let (key, row) = place.read(footer)?;
             let is_late = scanned > 0 && Instant::now() >= walk.deadline;
             if *budget == 0 || is_late {
                 self.metrics.record_hits(hits as u64);
@@ -1818,21 +1935,6 @@ fn live_rows(
 
 /// The offsets and lengths a rewrite reads, and the keyless rows beside them
 type KeptRows = (Vec<(u32, u32)>, Option<Vec<(RecordKey, FooterRow)>>);
-
-/// Every row of a footer with its key, in the same order as `footer_order`
-fn footer_rows(footer: &SegmentFooter) -> Result<Vec<(RecordKey, FooterRow)>> {
-    let mut rows = Vec::with_capacity(footer.entry_count());
-    for partition in &footer.partitions {
-        for at in 0..partition.len() {
-            let key = partition.key_at(at).unwrap_or(&[]);
-            rows.push((
-                RecordKey::from_bytes(partition.column, key)?,
-                partition.row_at(at)?,
-            ));
-        }
-    }
-    Ok(rows)
-}
 
 /// A keyless record held where the read left it, its header put together from its row
 fn keyless_held(

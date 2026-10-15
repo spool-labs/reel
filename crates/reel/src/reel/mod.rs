@@ -1281,6 +1281,34 @@ impl ReelShared {
         Ok(Some(block))
     }
 
+    /// Hand every footer row of a sealed segment to `visit`, one block at a time and caching nothing
+    pub fn walk_rows(
+        &self,
+        segment: SegmentId,
+        mut visit: impl FnMut(ColumnId, &[u8], FooterRow) -> Result<()>,
+    ) -> Result<bool> {
+        let Some(map) = self.footer_map_of(segment)? else {
+            return Ok(false);
+        };
+        let Some(handle) = self.handle_for(segment)? else {
+            return Ok(false);
+        };
+        for column in map.columns() {
+            let Some(span) = map.span_of(column) else {
+                continue;
+            };
+            for at in 0..span.blocks() {
+                self.probes.note_block_read();
+                let restarts = map.restarts_of(column);
+                let block = RowBlock::read(&self.driver, handle.file(), &span, at, restarts)?;
+                for row in 0..block.len() {
+                    visit(column, block.key_at(row).unwrap_or(&[]), block.row_at(row)?)?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// The row of a key at one offset in a sealed segment, or nothing for a segment gone
     fn row_at_offset_in(
         &self,

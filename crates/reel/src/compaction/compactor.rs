@@ -1099,7 +1099,7 @@ impl Compactor {
     ) -> Result<EraseReport> {
         let shared = reel.shared();
         let mut report = EraseReport::default();
-        let Some(footer) = shared.footer_of(segment)? else {
+        let Some(map) = shared.footer_map_of(segment)? else {
             return Ok(report);
         };
         let source = match source_handle(shared, segment) {
@@ -1108,34 +1108,31 @@ impl Compactor {
             Err(error) => return Err(error),
         };
         report.segments = 1;
+        // Records under a block each leave few whole blocks to give back
+        let bytes = index.segment_bytes(segment).total();
+        let rows = map.rows() as u64;
+        if rows == 0 || bytes / rows < ERASE_BLOCK {
+            return Ok(report);
+        }
         // A checkpoint links the file, and a punch would reach its copy too
         if is_linked(&shared.segment_path(segment)) {
             return Ok(report);
         }
-        // Records under a block each leave few whole blocks to give back
-        let bytes = index.segment_bytes(segment).total();
-        let rows = footer.entry_count() as u64;
-        if rows == 0 || bytes / rows < ERASE_BLOCK {
-            return Ok(report);
-        }
         let layout = source.layout();
         let mut dead: Vec<(u64, u64)> = Vec::new();
-        for partition in &footer.partitions {
-            for at in 0..partition.len() {
-                let row = partition.row_at(at)?;
-                if !row.flags.is_data() {
-                    continue;
-                }
-                let key = partition.key_at(at).unwrap_or(&[]);
-                let loc = Loc::new(segment, row.offset, row.len);
-                if index.is_live_at(&RecordKey::from_bytes(partition.column, key)?, loc, row.lsn)? {
-                    continue;
-                }
-                let start = u64::from(row.offset);
-                let span = layout.prefix_len(key.len(), row.len) as u64 + u64::from(row.len);
-                dead.push((start, start + span));
+        shared.walk_rows(segment, |column, key, row| {
+            if !row.flags.is_data() {
+                return Ok(());
             }
-        }
+            let loc = Loc::new(segment, row.offset, row.len);
+            if index.is_live_at(&RecordKey::from_bytes(column, key)?, loc, row.lsn)? {
+                return Ok(());
+            }
+            let start = u64::from(row.offset);
+            let span = layout.prefix_len(key.len(), row.len) as u64 + u64::from(row.len);
+            dead.push((start, start + span));
+            Ok(())
+        })?;
         dead.sort_unstable();
         let mut runs: Vec<(u64, u64)> = Vec::new();
         for (start, end) in dead {
@@ -3077,6 +3074,184 @@ mod tests {
         assert!(
             scrubbed >= live,
             "the scrub checked {scrubbed} of {live} live bytes and stopped at the hole"
+        );
+    }
+
+    /// A column keyed at many widths, which seals prefix packed
+    const NAMED: ColumnId = ColumnId(2);
+
+    const MIXED: ColumnSet = &[
+        ColumnSpec {
+            id: RECORDS,
+            name: "records",
+            key_width: KeyWidth::Fixed(KEY_WIDTH as u16),
+            shard_bytes: 2,
+            purge_mark: None,
+            codec: Codec::None,
+        },
+        ColumnSpec {
+            id: NAMED,
+            name: "named",
+            key_width: KeyWidth::Variable,
+            shard_bytes: 0,
+            purge_mark: None,
+            codec: Codec::None,
+        },
+    ];
+
+    fn named(byte: u8) -> RecordKey {
+        let width = 8 + usize::from(byte % 9);
+        RecordKey::from_bytes(NAMED, &vec![byte; width]).expect("key")
+    }
+
+    fn put_key(fixture: &Fixture, key: RecordKey, payload: Vec<u8>) {
+        let committed = fixture
+            .reel
+            .put(key.clone(), payload, 0, Commit::PerRecord)
+            .expect("put");
+        fixture
+            .index
+            .insert(&key, committed.loc, committed.lsn)
+            .expect("insert");
+    }
+
+    // a punch reads rows a block at a time and leaves no footer in the cache
+    #[test]
+    fn a_punch_leaves_no_footer_cached() {
+        let fixture = punchable(settings());
+        let segment = fixture
+            .index
+            .get(&key(100))
+            .expect("get")
+            .expect("live")
+            .loc
+            .segment;
+        fixture
+            .compactor
+            .erase_when_due(&fixture.reel, &fixture.index, 0.5, None, Duration::ZERO)
+            .expect("erase")
+            .expect("the segment was due");
+        let shared = fixture.reel.shared();
+        assert!(
+            shared.footers.get(segment).is_none(),
+            "the punch cached a footer"
+        );
+        assert_eq!(shared.footers.held_split().0, 0);
+
+        // A varying column beside a strided one walks the same rows the whole footer holds
+        let fixture = fixture_over(
+            ReelConfig {
+                segment_bytes: ByteCount::mb(16),
+                ..settings()
+            },
+            MIXED,
+        );
+        for byte in 0..130u8 {
+            put_key(&fixture, key(byte), vec![byte; 16 * 1024]);
+        }
+        for byte in 0..40u8 {
+            put_key(&fixture, named(byte), vec![byte; 16 * 1024]);
+        }
+        let segment = fixture
+            .index
+            .get(&key(0))
+            .expect("get")
+            .expect("live")
+            .loc
+            .segment;
+        seal(&fixture);
+        for byte in 0..20u8 {
+            put_key(&fixture, key(byte), vec![!byte; 16 * 1024]);
+            put_key(&fixture, named(byte), vec![!byte; 16 * 1024]);
+        }
+        let shared = fixture.reel.shared();
+        let footer = shared
+            .footer_once(segment)
+            .expect("footer")
+            .expect("sealed");
+        let varying: Vec<bool> = footer
+            .partitions
+            .iter()
+            .map(|partition| partition.is_varying())
+            .collect();
+        assert_eq!(
+            varying,
+            vec![false, true],
+            "one strided and one varying column"
+        );
+        let mut whole = Vec::new();
+        for partition in &footer.partitions {
+            for at in 0..partition.len() {
+                let key = partition.key_at(at).unwrap_or(&[]).to_vec();
+                whole.push((partition.column, key, partition.row_at(at).expect("row")));
+            }
+        }
+        let mut walked = Vec::new();
+        let found = shared
+            .walk_rows(segment, |column, key, row| {
+                walked.push((column, key.to_vec(), row));
+                Ok(())
+            })
+            .expect("walk");
+        assert!(found);
+        assert_eq!(walked, whole, "the walk and the whole footer disagree");
+
+        let report = fixture
+            .compactor
+            .erase_segment(&fixture.reel, &fixture.index, segment)
+            .expect("erase");
+        assert!(
+            report.erased_bytes > 0,
+            "the replaced runs gave back nothing"
+        );
+        assert!(
+            shared.footers.get(segment).is_none(),
+            "the punch cached a footer"
+        );
+        for byte in 0..40u8 {
+            let entry = fixture.index.get(&named(byte)).expect("get").expect("live");
+            let want = if byte < 20 { !byte } else { byte };
+            let read = fixture
+                .reel
+                .read_record(entry.loc, named(byte).as_ref(), entry.lsn, true, false)
+                .expect("read");
+            assert_eq!(read, RecordRead::Found(Value::new(vec![want; 16 * 1024])));
+        }
+    }
+
+    // a segment of records under a block each bails on its directory and reads no row
+    #[test]
+    fn a_segment_of_small_records_is_not_read() {
+        let fixture = fixture(settings());
+        for byte in 0..200u8 {
+            put(&fixture, byte, vec![byte; 100]);
+        }
+        let segment = fixture
+            .index
+            .get(&key(0))
+            .expect("get")
+            .expect("live")
+            .loc
+            .segment;
+        seal(&fixture);
+        for byte in 0..100u8 {
+            put(&fixture, byte, vec![!byte; 100]);
+        }
+        let shared = fixture.reel.shared();
+        let before = shared.probes.counts().block_reads;
+        let report = fixture
+            .compactor
+            .erase_segment(&fixture.reel, &fixture.index, segment)
+            .expect("erase");
+        assert_eq!(report.erased_bytes, 0);
+        assert!(
+            shared.footers.get(segment).is_none(),
+            "the gate cached a footer"
+        );
+        assert_eq!(
+            shared.probes.counts().block_reads,
+            before,
+            "the gate read a row block"
         );
     }
 

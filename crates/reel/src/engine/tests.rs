@@ -5643,3 +5643,38 @@ fn a_punch_syncs_the_overwrite_that_freed_its_bytes() {
         "the punch ran ahead of the overwrite's sync"
     );
 }
+
+// walks on many threads share one parsed footer when the cache holds none
+#[test]
+fn walks_share_a_parsed_footer() {
+    let (store, _) = sim_store(ReelConfig {
+        footer_cache: ByteCount::from_bytes(0),
+        ..config(1, SyncPolicy::Never)
+    });
+    for byte in 0..32u8 {
+        store.put(&record(7, byte), b"row").expect("put");
+    }
+    let segment = store.reel.tails()[0].seal().expect("seal");
+    store.page_out_sealed().expect("hand over");
+
+    let walkers = 20;
+    std::thread::scope(|scope| {
+        for _ in 0..walkers {
+            scope.spawn(|| {
+                let rows = reel_core::Store::iter_prefix(&store, "record", &[])
+                    .expect("walk")
+                    .count();
+                assert_eq!(rows, 32);
+            });
+        }
+    });
+
+    let first = store.reel.shared().footer_of(segment).expect("footer").expect("sealed");
+    let again = store.reel.shared().footer_of(segment).expect("footer").expect("sealed");
+    assert!(Arc::ptr_eq(&first, &again), "a held footer was parsed again");
+    // Each thread's run slot holds the one footer beside the two handles here
+    assert!(
+        Arc::strong_count(&first) > 2,
+        "the walks kept no footer to share"
+    );
+}

@@ -70,6 +70,9 @@ const SEGMENT_DIGITS: usize = 6;
 /// The shared rows table sweeps out entries no reader holds once it reaches this many
 const MAPPED_ROWS_SWEEP: usize = 4096;
 
+/// The parsed footer table sweeps out entries no reader holds once it reaches this many
+const PARSED_SWEEP: usize = 4096;
+
 /// Every segment file name ends with this suffix
 pub const SEGMENT_SUFFIX: &str = ".reel";
 
@@ -1090,6 +1093,9 @@ pub struct ReelShared {
     /// Each sealed partition's rows in place, shared by every key run reader holding one
     mapped_rows: Mutex<HashMap<(SegmentId, ColumnId), std::sync::Weak<MappedRows>>>,
 
+    /// Every parsed footer a reader still holds, so walks on other threads and columns share it
+    parsed: Mutex<HashMap<SegmentId, std::sync::Weak<SegmentFooter>>>,
+
     /// Load-time settings for the volume
     pub config: ReelConfig,
 
@@ -1209,6 +1215,7 @@ impl ReelShared {
             segments: OnceLock::new(),
             footers: FooterCache::new(config.footer_cache.to_bytes() as usize),
             mapped_rows: Mutex::new(HashMap::new()),
+            parsed: Mutex::new(HashMap::new()),
             config,
             columns,
             purge_floor: AtomicU64::new(NOTHING_PURGED),
@@ -1344,11 +1351,23 @@ impl ReelShared {
         if let Some(footer) = self.footers.get(segment) {
             return Ok(Some(footer));
         }
+        if let Some(footer) = lock(&self.parsed)
+            .get(&segment)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Ok(Some(footer));
+        }
         let Some(footer) = self.footer_from_disk(segment)? else {
             return Ok(None);
         };
         let footer = Arc::new(footer);
         self.footers.insert(segment, Arc::clone(&footer));
+        let mut parsed = lock(&self.parsed);
+        // Segment numbers never come back, so an entry no reader holds can just be dropped
+        if parsed.len() >= PARSED_SWEEP {
+            parsed.retain(|_, kept| kept.strong_count() > 0);
+        }
+        parsed.insert(segment, Arc::downgrade(&footer));
         Ok(Some(footer))
     }
 

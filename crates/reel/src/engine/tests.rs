@@ -722,9 +722,10 @@ fn a_second_caller_cannot_take_a_held_segment() {
     let script = crate::sync::rendezvous::script();
     script.hold("seal/spans");
 
+    // Cast, so a test sealing beside this one passes the held point
     let noting = {
         let store = Arc::clone(&store);
-        std::thread::spawn(move || store.hold_sealed())
+        script.cast(move || store.hold_sealed())
     };
     // The footer is in hand and the spans are not down
     script.await_reached("seal/spans", 1);

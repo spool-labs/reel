@@ -12,8 +12,8 @@ use rand::{Rng, SeedableRng};
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
-    ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IoBackend, KeyWidth, ReelConfig, ReelStore,
+    SyncPolicy, ThreadBudget,
 };
 use reel_core::{Direction, Store};
 
@@ -81,8 +81,18 @@ fn value_of(n: u64, op: u64, len: usize) -> Vec<u8> {
     value
 }
 
+/// The backend these runs take from REEL_STRESS_BACKEND: posix, uring or mixed, posix by default
+fn backend() -> IoBackend {
+    match std::env::var("REEL_STRESS_BACKEND").as_deref() {
+        Ok("uring") => IoBackend::Uring,
+        Ok("mixed") => IoBackend::Mixed,
+        _ => IoBackend::Posix,
+    }
+}
+
 fn config(rng: &mut SmallRng) -> ReelConfig {
     ReelConfig {
+        io_backend: backend(),
         segment_bytes: ByteCount::from_bytes(64 * 1024),
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(rng.gen_range(1..=4)),

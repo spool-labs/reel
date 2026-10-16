@@ -968,10 +968,11 @@ impl<'driver> SegmentReader<'driver> {
         Ok(buffers)
     }
 
-    /// Adopt a fetched range as the window, handing back the one it replaces
-    pub fn preload(&mut self, offset: u64, window: Vec<u8>) {
-        self.window_at = offset;
-        self.retire(Arc::new(window));
+    /// Take back a fetched range's buffer once its bytes are copied out, for the next read
+    pub fn recycle(&mut self, bytes: Vec<u8>) {
+        if bytes.capacity() > 0 {
+            self.spare.push(bytes);
+        }
     }
 }
 

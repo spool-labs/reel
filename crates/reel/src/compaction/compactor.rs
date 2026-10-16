@@ -841,7 +841,8 @@ impl Compactor {
         };
         let order = order.as_slice();
         let mut run = CopyRun::default();
-        let mut staged: Vec<Option<Part>> = Vec::new();
+        let mut staged: Vec<Option<(usize, usize)>> = Vec::new();
+        let mut slab = Arc::<Vec<u8>>::default();
         let mut start = 0usize;
         while start < order.len() {
             let end = stripe_end(order, start);
@@ -850,6 +851,11 @@ impl Compactor {
                 .collect();
             plan.sort_unstable_by_key(|&(_, offset)| offset);
             let ranges = chunk_ranges(&plan, order, prefix_bound, reader.limit());
+
+            // The stripe stages in one buffer, so a few read buffers serve all its reads
+            let mut stage = Arc::try_unwrap(slab).unwrap_or_default();
+            stage.clear();
+            stage.reserve_exact(ranges.iter().map(|range| range.len).sum());
 
             // Each record goes in the slot its key order gives it, so the apply needs no sort
             staged.clear();
@@ -863,20 +869,26 @@ impl Compactor {
                     wave.iter().map(|range| (range.start, range.len)).collect();
                 let buffers = reader.read_ranges(&asks)?;
                 for (range, buffer) in wave.iter().zip(buffers) {
-                    reader.preload(range.start, buffer);
+                    let base = stage.len();
+                    stage.extend_from_slice(&buffer);
                     for &(position, offset) in &plan[range.members.clone()] {
                         // Held in place and parsed at apply, so staging ignores key size
                         let span = prefix_bound as usize + order[position].1 as usize;
-                        staged[position - start] = Some(reader.held(u64::from(offset), span)?);
+                        let skip = ((u64::from(offset) - range.start) as usize).min(buffer.len());
+                        let len = span.min(buffer.len() - skip);
+                        staged[position - start] = Some((base + skip, len));
                     }
+                    reader.recycle(buffer);
                 }
                 pace.reached(reader.read_bytes() + tally.copied_bytes);
             }
+            slab = Arc::new(stage);
 
             for (slot, held) in staged.drain(..).enumerate() {
-                let Some(held) = held else {
+                let Some((at, stretch)) = held else {
                     continue;
                 };
+                let held = Part::new(&slab, at, stretch);
                 let (offset, len) = order[start + slot];
                 let found = match (&rows, layout.keyless_key(len)) {
                     (Some(rows), Some(check)) => {

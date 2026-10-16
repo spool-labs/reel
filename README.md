@@ -1,72 +1,76 @@
 # tape-reel
 
-A log-structured key-value store with sequential writes, immutable segments, and whole-segment reclaim.
+[![Crates.io](https://img.shields.io/crates/v/tape-reel.svg)](https://crates.io/crates/tape-reel)
+[![Documentation](https://docs.rs/tape-reel/badge.svg)](https://docs.rs/tape-reel)
+[![License](https://img.shields.io/crates/l/tape-reel.svg)](LICENSE)
 
-A reel is one log of segment files over one or more volume roots. Writers append at the head of
-several active tails, one open segment each, and a segment seals when it fills. Nothing is updated
-in place. A delete writes a tombstone and compaction gives the space back. An index maps each live
-key to its segment and offset. The open tails' keys sit in memory. A sealed key is found through the
-spot index and the footers the seals wrote. One process owns a volume for writing. Others can open
-it read-only and follow.
+Reel is a key-value store and the default storage engine for Tapedrive storage nodes.
 
-- The caller declares each column: key width (fixed or variable), sharding, lz4, and purge marks.
-- Point reads, batched reads, ranged reads, ordered walks, and prefix sweeps. A prefix sweep takes
-  any prefix, in key order.
-- A write batch is one durability point. Every call has a blocking and an awaited form.
-- Extra roots join as fast or capacity volumes, and compaction demotes aged data to capacity.
-- Cue points read the volume as it stood. A checkpoint copies it at a cue into a store of its own.
-- IO runs on POSIX everywhere, and on io_uring or io_uring with direct descriptors on Linux.
-- A new segment is written through once, and a tail keeps synced zeros ahead of its head.
+![Relative to RocksDB, reel does 3.7× the reads and writes, loads 1.8× as fast, writes 0.63× the bytes and peaks at 0.74× the memory](assets/reel-vs-rocksdb.svg)
 
-```rust
-use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, Store,
-};
+## How it works
 
-const BLOCKS: &str = "blocks";
-const COLUMNS: ColumnSet = &[ColumnSpec {
-    id: ColumnId(1),
-    name: BLOCKS,
-    key_width: KeyWidth::Fixed(16),
-    shard_bytes: 2,
-    purge_mark: None,
-    codec: Codec::None,
-}];
+Reel stores everything in large files called segments and only ever appends to them. A segment
+takes writes while it's open and is sealed once it's full. Its records die as their keys are
+overwritten or deleted, and cleanup deletes the segment once it has copied out the records still
+alive.
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = ReelConfig { segment_bytes: ByteCount::mb(64), ..ReelConfig::default() };
-    let store = ReelStore::open(std::env::temp_dir().join("reel-demo"), config, COLUMNS)?;
-    Store::put(&store, BLOCKS, &[7u8; 16], b"payload")?;
-    assert_eq!(&*Store::get(&store, BLOCKS, &[7u8; 16])?.expect("stored"), b"payload");
-    store.maintain_once()?;
-    store.close()?;
-    Ok(())
-}
-```
+![A segment's life: open, sealed, mostly dead and deleted, with surviving records copied back into an open segment](assets/segment-lifecycle.svg)
 
-The crate is published as `tape-reel` and imported as `reel`. `ReelStore` has its own `get`, `put`
-and the rest, which take a resolved `RecordKey`, so a trait call is written `Store::get`.
+### Writing
 
-Compaction, index paging, tombstone pruning, merges, and the scrub run inside `maintain_once`. Call
-it on a timer, about once a second. A volume nobody ticks grows forever. `close` also compacts every
-sealed segment past the dead ratio before it returns.
+A write goes onto the end of whichever open segment is least busy. Several segments are open at
+once, so writers don't queue behind each other. When a segment fills up, reel seals it by writing a
+sorted index of its contents at the end of the file, called the footer. After that the segment
+never changes. A batch of writes lands as one unit, so after a crash either the whole batch is
+there or none of it is. Reel has no separate log in front of the data, because the segments
+themselves are the log.
 
-## Crates and features
+### Finding a key
 
-`tape-reel-core` holds the `Store` trait and write batches.
-`tape-reel-cli` builds the `reel` binary to inspect, verify, and checkpoint a volume ([README](crates/reel-cli/README.md)).
-`tape-reel-mock` is an in-memory `Store` for tests and stays unpublished.
+Reel keeps an index in memory that says which segment and position holds each key. Keys in open
+segments sit in an in-memory tree, and keys in sealed segments are tracked in a compact lookup
+table. When the table can't answer, reel searches the footers of the sealed segments. It skips any
+segment whose key range or filter rules the key out. Either way, one disk read usually fetches the
+value. The files are the source of truth, so reel can rebuild the whole index from them when it
+opens.
 
-Nothing is on by default. `serde` adds `Serialize` for the reports and `Deserialize` for
-`IoBackend`. `sim` adds the deterministic io simulator and fault plans. `rendezvous` adds points
-where a test parks a thread.
+### Walking keys in order
 
-## Docs and tests
+Scans and prefix lookups need keys in sorted order. Segments are in the order things were written,
+so any key can sit in any segment, and a scan has to merge the footers of every segment that might
+hold part of its range. That gets slower as segments pile up. To keep it in check, reel merges
+footers in the background into key runs, which are sorted lists of keys that point back to where
+each record lives. A scan then has far fewer lists to merge. Only the keys get merged. Values stay
+where they were first written.
 
-The design notes live in [crates/reel/docs](crates/reel/docs/README.md), starting at [overview.md](crates/reel/docs/overview.md).
+### Deleting
 
-`cargo run -p tape-reel --example <name>` runs `basic`, `follower`, `servo`, `async_doors`,
-`volumes`, `cohorts`, `simulated_crash`, or `checkpoint`. `cargo test` needs no flags. The io_uring
-and kernel tests run only on Linux. Rust 1.89 or newer.
+Nothing changes in place, so a delete appends a small marker called a tombstone, which says the key
+is gone. The old value and the tombstone both stay on disk until cleanup reaches them, and a scan
+that runs into them has to step over them.
 
-Licensed under Apache-2.0. See [LICENSE](LICENSE).
+### Cleanup
+
+The store's owner calls `maintain_once` about once a second, and each call runs one maintenance
+pass. A pass tracks how much of each segment is dead, meaning overwritten or deleted:
+
+- A fully dead segment is deleted outright, which costs almost nothing.
+- A mostly dead segment has its surviving records copied into an open segment, and then the old
+  file is deleted.
+- Reel waits until a segment is about half dead before it bothers. It lowers that bar once the store
+  as a whole is carrying a lot of waste.
+- Tombstones get dropped during the copy once nothing older can come back.
+
+## What it's good at
+
+Reel works best when data is written once and expires in whole groups, as a storage node's slices
+do. Whole segments go dead together and get dropped for free. Compared with RocksDB, reel writes
+each value once and sorts only the keys, so it does far fewer disk writes. It's weaker when the same
+keys get written and deleted over and over. The waste then spreads across segments that stay mostly
+alive, so cleanup either copies a lot or waits.
+
+## More
+
+The design notes live in [crates/reel/docs](crates/reel/docs/README.md), starting at
+[overview.md](crates/reel/docs/overview.md). Licensed under Apache-2.0. See [LICENSE](LICENSE).

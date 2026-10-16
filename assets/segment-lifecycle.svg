@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="264" viewBox="0 20 1040 264" role="img" aria-labelledby="title desc">
+  <title id="title">A segment's life in reel</title>
+  <desc id="desc">Writers append records at the write head of an open segment. A full segment is sealed with a footer and never changes again. Its records die as their keys are overwritten or deleted. Cleanup copies the surviving records back into an open segment and deletes the file.</desc>
+  <style>
+    .mono { font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .stage { font-size: 12px; letter-spacing: 0.08em; fill: #13171c; fill-opacity: 0.85; }
+    .small { font-size: 11px; letter-spacing: 0.08em; fill: #13171c; fill-opacity: 0.7; }
+    .quiet { font-size: 11px; letter-spacing: 0.08em; fill: #13171c; fill-opacity: 0.55; }
+    .box { fill: none; stroke: #13171c; stroke-width: 2; }
+    .gone { fill: none; stroke: #13171c; stroke-opacity: 0.4; stroke-width: 2; stroke-dasharray: 7 6; }
+    .divide { stroke: #13171c; stroke-width: 2; }
+    .live { fill: #13171c; }
+    .dead { fill: none; stroke: #13171c; stroke-opacity: 0.3; stroke-width: 1.5; }
+    .wire { fill: none; stroke: #13171c; stroke-opacity: 0.4; stroke-width: 1.5; }
+    .tip { fill: #13171c; fill-opacity: 0.4; }
+  </style>
+  <rect y="20" width="1040" height="264" rx="16" fill="#fffdfb"/>
+
+  <text class="mono small" x="175.5" y="62" text-anchor="middle">WRITERS</text>
+  <line class="wire" x1="175.5" y1="72" x2="175.5" y2="106"/>
+  <polygon class="tip" points="170.5,106 180.5,106 175.5,114"/>
+
+  <rect class="box" x="52" y="120" width="170" height="56" rx="4"/>
+  <rect class="live" x="72" y="141" width="14" height="14"/>
+  <rect class="live" x="98" y="141" width="14" height="14"/>
+  <rect class="live" x="124" y="141" width="14" height="14"/>
+  <rect class="live" x="150" y="141" width="14" height="14"/>
+  <rect x="174" y="134" width="3" height="28" fill="#fe7d28"/>
+  <text class="mono stage" x="137" y="206" text-anchor="middle">OPEN</text>
+
+  <line class="wire" x1="232" y1="148" x2="256" y2="148"/>
+  <polygon class="tip" points="256,143 264,148 256,153"/>
+
+  <rect class="box" x="274" y="120" width="230" height="56" rx="4"/>
+  <line class="divide" x1="434" y1="120" x2="434" y2="176"/>
+  <rect class="live" x="295" y="141" width="14" height="14"/>
+  <rect class="live" x="321" y="141" width="14" height="14"/>
+  <rect class="live" x="347" y="141" width="14" height="14"/>
+  <rect class="live" x="373" y="141" width="14" height="14"/>
+  <rect class="live" x="399" y="141" width="14" height="14"/>
+  <text class="mono small" x="469" y="152" text-anchor="middle">FOOTER</text>
+  <text class="mono stage" x="389" y="206" text-anchor="middle">SEALED</text>
+
+  <line class="wire" x1="514" y1="148" x2="538" y2="148"/>
+  <polygon class="tip" points="538,143 546,148 538,153"/>
+
+  <rect class="box" x="556" y="120" width="230" height="56" rx="4"/>
+  <line class="divide" x1="716" y1="120" x2="716" y2="176"/>
+  <rect class="live" x="577" y="141" width="14" height="14"/>
+  <rect class="dead" x="603.75" y="141.75" width="12.5" height="12.5"/>
+  <rect class="dead" x="629.75" y="141.75" width="12.5" height="12.5"/>
+  <rect class="live" x="655" y="141" width="14" height="14"/>
+  <rect class="dead" x="681.75" y="141.75" width="12.5" height="12.5"/>
+  <text class="mono small" x="751" y="152" text-anchor="middle">FOOTER</text>
+  <text class="mono stage" x="671" y="206" text-anchor="middle">MOSTLY DEAD</text>
+
+  <line class="wire" x1="796" y1="148" x2="820" y2="148"/>
+  <polygon class="tip" points="820,143 828,148 820,153"/>
+
+  <rect class="gone" x="838" y="120" width="150" height="56" rx="4"/>
+  <text class="mono stage" x="913" y="206" text-anchor="middle">DELETED</text>
+
+  <path class="wire" d="M671,218 V250 H137 V226"/>
+  <polygon class="tip" points="132,226 142,226 137,218"/>
+  <rect x="306" y="240" width="196" height="20" fill="#fffdfb"/>
+  <text class="mono quiet" x="404" y="254" text-anchor="middle">SURVIVORS COPIED BACK</text>
+</svg>

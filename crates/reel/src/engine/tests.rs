@@ -5678,3 +5678,46 @@ fn walks_share_a_parsed_footer() {
         "the walks kept no footer to share"
     );
 }
+
+// a pile of small sealed segments folds into one, and sealing the one it folded into starts no more
+#[test]
+fn small_seals_fold_into_one() {
+    let (store, _) = sim_store(config(1, SyncPolicy::Never));
+    let rounds = super::maintain::FOLD_PILE as u8 + 2;
+    for round in 0..rounds {
+        for byte in 0..4u8 {
+            store.put(&record(round.into(), byte), b"row").expect("put");
+        }
+        store.reel.tails()[0].seal().expect("seal");
+    }
+    store.page_out_sealed().expect("hand over");
+    let small = store.config.segment_bytes.to_bytes() / super::maintain::SMALL_SHARE;
+    let smalls = |store: &ReelStore| {
+        store
+            .index
+            .segments_snapshot()
+            .iter()
+            .filter(|(_, bytes)| bytes.total() > 0 && bytes.total() < small)
+            .count()
+    };
+    assert!(
+        smalls(&store) >= rounds.into(),
+        "the seals left {} small segments",
+        smalls(&store)
+    );
+
+    let mut passes = 0;
+    while store.compact_once().expect("pass") == CompactPass::Copied {
+        passes += 1;
+        assert!(passes < 32, "folding never settled");
+        store.reel.tails()[0].seal().expect("seal");
+        store.page_out_sealed().expect("hand over");
+    }
+    assert!(smalls(&store) <= 1, "{} small segments were left", smalls(&store));
+    for round in 0..rounds {
+        for byte in 0..4u8 {
+            let read = store.get(&record(round.into(), byte)).expect("get");
+            assert_eq!(read.as_deref(), Some(&b"row"[..]), "round {round} key {byte} lost");
+        }
+    }
+}

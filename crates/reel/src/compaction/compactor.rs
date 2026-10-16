@@ -543,7 +543,26 @@ impl Compactor {
         if index.has_pending_covers() {
             return None;
         }
-        self.select_ranked(reel, index, effective_dead_ratio, cue_floor)
+        self.select_ranked(reel, index, cue_floor, 1, |_, fraction| {
+            (fraction >= effective_dead_ratio).then_some(fraction)
+        })
+    }
+
+    /// The smallest sealed segment under `small` bytes, once at least `fewest` of them stand
+    pub fn select_small(
+        &self,
+        reel: &Reel,
+        index: &ReelIndex,
+        small: u64,
+        fewest: usize,
+        cue_floor: Option<Lsn>,
+    ) -> Option<(SegmentId, f64)> {
+        if index.has_pending_covers() {
+            return None;
+        }
+        self.select_ranked(reel, index, cue_floor, fewest, |total, _| {
+            (total < small).then(|| 1.0 - total as f64 / small as f64)
+        })
     }
 
     /// A sealed segment with nothing live left in it, which retires by unlink
@@ -556,19 +575,23 @@ impl Compactor {
         if index.has_pending_covers() {
             return None;
         }
-        self.select_ranked(reel, index, 1.0, cue_floor)
+        self.select_ranked(reel, index, cue_floor, 1, |_, fraction| {
+            (fraction >= 1.0).then_some(fraction)
+        })
     }
 
-    /// The ranking walk behind both selectors, claiming whatever it picks
+    /// The ranking walk behind every selector, claiming the best of at least `fewest` that score
     fn select_ranked(
         &self,
         reel: &Reel,
         index: &ReelIndex,
-        effective_dead_ratio: f64,
         cue_floor: Option<Lsn>,
+        fewest: usize,
+        score: impl Fn(u64, f64) -> Option<f64>,
     ) -> Option<(SegmentId, f64)> {
         let shared = reel.shared();
         let mut best: Option<(SegmentId, f64)> = None;
+        let mut scored = 0usize;
         // one call for both, since every insert takes this lock
         let (segments, floors) = index.ranking();
         // read before the claim, so the two locks are never held at once
@@ -598,17 +621,21 @@ impl Compactor {
             }
             // dead bytes plus the tombstones this segment no longer needs to keep
             let fraction = bytes.reclaimable(floors.excluding(segment)) as f64 / total as f64;
-            if fraction < effective_dead_ratio {
+            let Some(rank) = score(total, fraction) else {
                 continue;
-            }
+            };
             // A rot-pinned segment returns only once something in it has died since
             if pinned.get(&segment) == Some(&bytes.dead) {
                 continue;
             }
-            let is_better = best.map(|existing| fraction > existing.1).unwrap_or(true);
+            scored += 1;
+            let is_better = best.map(|existing| rank > existing.1).unwrap_or(true);
             if is_better {
-                best = Some((segment, fraction));
+                best = Some((segment, rank));
             }
+        }
+        if scored < fewest {
+            return None;
         }
         // claim under the walk's lock, or two callers could leave with the same segment
         if let Some((segment, _)) = best {

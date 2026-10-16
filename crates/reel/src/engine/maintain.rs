@@ -40,6 +40,15 @@ const HANDOVER_TICK: Duration = Duration::from_secs(1);
 /// A close waits this long between looks for a free place on the compaction plane
 const DRAIN_WAIT: Duration = Duration::from_millis(1);
 
+/// A sealed segment holding under this share of a segment's bytes is folded into a tail
+pub(crate) const SMALL_SHARE: u64 = 64;
+
+/// Small segments fold once this many stand
+pub(crate) const FOLD_PILE: usize = 8;
+
+/// A pass folds at most this many small segments, which bounds its copy to a few segments' worth
+const MAX_FOLD: usize = 256;
+
 /// A tail that takes no write for this long is sealed by the tick
 const IDLE_SEAL: Duration = Duration::from_secs(5);
 
@@ -586,7 +595,7 @@ impl ReelStore {
             .pressure()
             .should_compact(dead_fraction, is_hot)
         {
-            return Ok(CompactPass::Held);
+            return self.fold_small(is_hot);
         }
         let ratio = self
             .compactor
@@ -625,10 +634,47 @@ impl ReelStore {
                 }
             }
             None if did_work => Ok(CompactPass::Copied),
-            None => {
-                self.compactor.release_spare();
-                Ok(CompactPass::Idle)
+            None => match self.fold_small(is_hot)? {
+                CompactPass::Copied => Ok(CompactPass::Copied),
+                _ => {
+                    self.compactor.release_spare();
+                    Ok(CompactPass::Idle)
+                }
+            },
+        }
+    }
+
+    /// Copy the small sealed segments into a tail once enough stand, so quiet seals do not pile up
+    fn fold_small(&self, is_hot: bool) -> Result<CompactPass> {
+        if is_hot {
+            return Ok(CompactPass::Held);
+        }
+        let small = self.config.segment_bytes.to_bytes() / SMALL_SHARE;
+        // The tail they fold into seals small too, so folding waits for a pile and takes all of it
+        let mut fewest = FOLD_PILE;
+        let mut folded = 0usize;
+        while folded < MAX_FOLD {
+            let Some((segment, _)) = self.compactor.select_small(
+                &self.reel,
+                &self.index,
+                small,
+                fewest,
+                self.cues.floor(),
+            ) else {
+                break;
+            };
+            if !self
+                .compactor
+                .compact_segment(&self.reel, &self.index, segment)?
+            {
+                break;
             }
+            folded += 1;
+            fewest = 1;
+        }
+        match folded {
+            0 => Ok(CompactPass::Held),
+            _ => Ok(CompactPass::Copied),
         }
     }
 

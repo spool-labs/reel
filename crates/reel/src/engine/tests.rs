@@ -5721,3 +5721,28 @@ fn small_seals_fold_into_one() {
         }
     }
 }
+
+// a tail the reopen does not resume is sealed by it, so compaction can take it like any segment
+#[test]
+fn a_tail_left_unresumed_is_sealed_on_open() {
+    let (store, sim) = sim_store(config(2, SyncPolicy::Never));
+    put_on_tail(&store, 0, &record(7, 1), vec![0x11; 512]);
+    put_on_tail(&store, 1, &record(7, 2), vec![0x22; 512]);
+    let left = store.reel.tails()[1].tail().active_segment();
+    store.close().expect("close");
+    drop(store);
+
+    let reopened = reopen_image(sim.durable_image(), config(1, SyncPolicy::Never));
+    assert!(
+        reopened.segment_footer(left).expect("footer").is_some(),
+        "the tail no one resumed was left without a footer"
+    );
+    assert!(reopened.reel.shared().is_settled(left), "the sealed tail never settled");
+    for (byte, fill) in [(1u8, 0x11u8), (2, 0x22)] {
+        assert_eq!(
+            reopened.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![fill; 512])),
+            "key {byte} after the reopen"
+        );
+    }
+}

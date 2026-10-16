@@ -1915,6 +1915,10 @@ impl Reel {
             };
             tails.push(Appender::open(Arc::clone(&shared), index as u64, adopted)?);
         }
+        // A tail no one resumed would stand unsealed for good, so it seals now
+        for left in candidates {
+            Appender::seal_unresumed(&shared, left)?;
+        }
         Ok(Reel {
             shared,
             tails,

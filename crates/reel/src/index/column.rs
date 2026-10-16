@@ -14,6 +14,7 @@ use crate::format::loc::{Loc, SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
 use crate::index::counters::{Bookings, SegmentTable};
 use crate::index::entry::{span_of, Entry};
+use crate::index::few::Few;
 use crate::index::in_turns;
 use crate::index::page::KeyPage;
 use crate::index::paged::SealedRanges;
@@ -2483,7 +2484,7 @@ macro_rules! tree_shapes {
     ($($width:literal),* $(,)?) => {
         $(
             impl Shape<[u8; $width]> for Trees<$width> {
-                type Entries = TBTreeMap<[u8; $width], { node_width($width) }, Entry>;
+                type Entries = Few<[u8; $width], Entry, TBTreeMap<[u8; $width], { node_width($width) }, Entry>>;
             }
         )*
     };
@@ -2498,7 +2499,7 @@ pub const VAR_NODE_WIDTH: usize = 32;
 pub struct VarTrees;
 
 impl Shape<Box<[u8]>> for VarTrees {
-    type Entries = TBTreeMap<Box<[u8]>, VAR_NODE_WIDTH, Entry>;
+    type Entries = Few<Box<[u8]>, Entry, TBTreeMap<Box<[u8]>, VAR_NODE_WIDTH, Entry>>;
 }
 
 /// A key as the resident map holds it, inline for a fixed column and boxed for a variable one

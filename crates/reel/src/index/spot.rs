@@ -751,7 +751,19 @@ impl Table {
 
     /// A copy of this table at the next rung, spilling each slot that finds no room there
     fn grown(&self) -> Table {
-        let mut table = Table::with_buckets(next_rung(self.homes, self.phase), self.phase);
+        self.moved_to(next_rung(self.homes, self.phase))
+    }
+
+    /// A copy at the rung its slots need, for a table sized for more than it kept
+    fn fitted(&self) -> Option<Table> {
+        let needed = (self.held as f64 / (WAYS as f64 * LOAD)).ceil() as usize;
+        let rung = next_rung(needed, self.phase);
+        (rung * 2 <= self.homes).then(|| self.moved_to(rung))
+    }
+
+    /// A copy with this many homes, spilling each slot that finds no room there
+    fn moved_to(&self, homes: usize) -> Table {
+        let mut table = Table::with_buckets(homes, self.phase);
         let slots = self
             .buckets
             .iter()
@@ -1544,6 +1556,10 @@ impl SpotColumn {
             let mut table = shard.write();
             let (dropped, displaced) = table.retain(|slot| !slot.is_grave());
             table.count_taken(dropped as u64, displaced);
+            // The load sized the table from a guess, so one sized for far more is rebuilt to fit
+            if let Some(fitted) = table.table.fitted() {
+                *table.table = fitted;
+            }
         }
     }
 
@@ -2406,6 +2422,28 @@ mod tests {
         let table = column.shards[shard].read();
         assert_eq!((table.held, table.spilled.len()), (0, 0));
         assert_eq!(table.buckets.len(), buckets);
+    }
+
+    // a table sized for far more than it kept is rebuilt to fit, and every slot still answers
+    #[test]
+    fn an_oversized_table_fits_what_it_kept() {
+        let mut table = Table::with_buckets(1 << 14, 0.0);
+        let hashes: Vec<u64> = (0..200u64).map(|at| mix(at + 1)).collect();
+        for (at, hash) in hashes.iter().enumerate() {
+            table.insert(Slot::new(*hash, Loc::new(SegmentId(1), at as u32 * 64, 40)));
+        }
+        let fitted = table.fitted().expect("an oversized table is rebuilt");
+        assert!(
+            fitted.homes * 8 < table.homes,
+            "fitting kept {} of {} homes",
+            fitted.homes,
+            table.homes
+        );
+        assert_eq!(fitted.held, hashes.len());
+        for hash in &hashes {
+            assert_eq!(fitted.matches(*hash).len(), 1, "a slot was lost in the fit");
+        }
+        assert!(fitted.fitted().is_none(), "a fitted table was rebuilt again");
     }
 
     // a pair full of one hash spills the rest, and growth, marks and sweeps all reach the spill

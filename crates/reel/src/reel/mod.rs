@@ -1680,7 +1680,7 @@ impl ReelShared {
     /// Whether a point read asks the page cache before it queues, as every cached volume does
     pub fn warm_first(&self) -> WarmFirst {
         match self.driver.serving() {
-            ServingBackend::Posix | ServingBackend::Ring => WarmFirst::Ask,
+            ServingBackend::Posix | ServingBackend::Ring | ServingBackend::Mixed => WarmFirst::Ask,
             ServingBackend::PosixDirect | ServingBackend::RingDirect | ServingBackend::Sim => {
                 WarmFirst::Skip
             }

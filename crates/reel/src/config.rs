@@ -215,6 +215,8 @@ pub enum IoBackend {
     Posix,
     /// Buffered ring backend on Linux, submitting through the page cache
     Uring,
+    /// Buffered ring for reads on Linux, with writes and syncs on posix
+    Mixed,
     /// Direct ring backend with registered buffers on Linux
     UringDirect,
 }
@@ -449,10 +451,12 @@ mod tests {
         let posix: IoBackend = serde_json::from_str(r#""posix""#).expect("posix");
         let ring: IoBackend = serde_json::from_str(r#""uring""#).expect("uring");
         let direct: IoBackend = serde_json::from_str(r#""uring_direct""#).expect("uring_direct");
+        let mixed: IoBackend = serde_json::from_str(r#""mixed""#).expect("mixed");
 
         assert_eq!(posix, IoBackend::Posix);
         assert_eq!(ring, IoBackend::Uring);
         assert_eq!(direct, IoBackend::UringDirect);
+        assert_eq!(mixed, IoBackend::Mixed);
         assert_eq!(IoBackend::default(), IoBackend::Posix);
     }
 }

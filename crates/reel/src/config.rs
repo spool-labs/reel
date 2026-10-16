@@ -12,6 +12,9 @@ use crate::error::{ReelError, Result};
 
 const DEFAULT_SEGMENT_GIB: u64 = 1;
 const DEFAULT_COMPACT_DEAD_RATIO: f64 = 0.50;
+
+/// Bytes written between syncs by default, the cadence a tape node runs
+const DEFAULT_SYNC_MIB: u64 = 16;
 const DEFAULT_SCRUB_MBPS: u64 = 64;
 
 /// The reader cache holds this many sealed descriptors, unless the open-file limit is lower
@@ -293,7 +296,7 @@ impl Default for ReelConfig {
     fn default() -> Self {
         Self {
             segment_bytes: ByteCount::gb(DEFAULT_SEGMENT_GIB),
-            sync: SyncPolicy::Never,
+            sync: SyncPolicy::Bytes(ByteCount::mb(DEFAULT_SYNC_MIB)),
             compact_dead_ratio: DEFAULT_COMPACT_DEAD_RATIO,
             compact_mbps: CompactRate::Auto,
             scrub_mbps: DEFAULT_SCRUB_MBPS,

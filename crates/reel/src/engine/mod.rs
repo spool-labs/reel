@@ -203,6 +203,9 @@ pub struct ReelStore {
 
     /// Admitted bytes at the last heat ask, which turns a counter into a rate
     ingest_marker: AtomicU64,
+
+    /// Deleted keys walks had stepped over when the last merge ran
+    merged_buried: AtomicU64,
 }
 
 impl ReelStore {
@@ -240,7 +243,7 @@ impl ReelStore {
 
     fn open_inner(
         root: PathBuf,
-        config: ReelConfig,
+        mut config: ReelConfig,
         columns: ColumnSet,
         io: Arc<dyn ReelIo>,
         is_read_only: bool,
@@ -261,7 +264,7 @@ impl ReelStore {
             false => None,
         };
 
-        // The facts are logged and kept for callers, nothing acts on them
+        // The facts are logged and kept for callers, and only an automatic tail budget acts on them
         let bias = is_real_fs.then(|| {
             let facts = MachineFacts::read(&root);
             let verdict = facts.verdict();
@@ -284,6 +287,8 @@ impl ReelStore {
             );
             facts
         });
+        let is_rotational = bias.as_ref().and_then(|facts| facts.is_rotational);
+        config.active_tails = config.active_tails.for_disk(is_rotational);
 
         let mut roots = vec![root.clone()];
         roots.extend(config.volumes.iter().map(|volume| volume.path.clone()));
@@ -410,6 +415,7 @@ impl ReelStore {
             bias,
             footprint: AtomicU64::new(0),
             ingest_marker: AtomicU64::new(0),
+            merged_buried: AtomicU64::new(0),
             sweep_nonce: (std::process::id() as u64) << 32
                 | OPENINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64,
             root,

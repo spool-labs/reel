@@ -12,6 +12,9 @@ use crate::error::{ReelError, Result};
 
 const DEFAULT_SEGMENT_GIB: u64 = 1;
 const DEFAULT_COMPACT_DEAD_RATIO: f64 = 0.50;
+
+/// Bytes written between syncs by default, the cadence a tape node runs
+const DEFAULT_SYNC_MIB: u64 = 16;
 const DEFAULT_SCRUB_MBPS: u64 = 64;
 
 /// The reader cache holds this many sealed descriptors, unless the open-file limit is lower
@@ -21,7 +24,10 @@ const DEFAULT_FOOTER_CACHE_MIB: u64 = 64;
 const DEFAULT_FILTER_BITS: u8 = 10;
 
 /// An automatic budget opens at most this many tails per volume, however wide the machine
-const MAX_AUTO_TAILS: usize = 8;
+const MAX_AUTO_TAILS: usize = 2;
+
+/// Tails an automatic budget runs on a disk that seeks, since a second one seeks against the first
+const ROTATIONAL_TAILS: u32 = 1;
 
 pub(crate) const KIB: u64 = 1024;
 pub(crate) const MIB: u64 = KIB * 1024;
@@ -74,6 +80,14 @@ impl ThreadBudget {
                     .unwrap_or(1)
             }),
             ThreadBudget::Fixed(count) => count.get() as usize,
+        }
+    }
+
+    /// The budget for a volume on this disk: an automatic one runs a single tail where the disk seeks
+    pub fn for_disk(self, is_rotational: Option<bool>) -> ThreadBudget {
+        match (self, is_rotational) {
+            (ThreadBudget::Auto, Some(true)) => ThreadBudget::threads(ROTATIONAL_TAILS),
+            (ThreadBudget::Auto, Some(false) | None) | (ThreadBudget::Fixed(_), _) => self,
         }
     }
 
@@ -201,6 +215,8 @@ pub enum IoBackend {
     Posix,
     /// Buffered ring backend on Linux, submitting through the page cache
     Uring,
+    /// Buffered ring for reads on Linux, with writes and syncs on posix
+    Mixed,
     /// Direct ring backend with registered buffers on Linux
     UringDirect,
 }
@@ -282,7 +298,7 @@ impl Default for ReelConfig {
     fn default() -> Self {
         Self {
             segment_bytes: ByteCount::gb(DEFAULT_SEGMENT_GIB),
-            sync: SyncPolicy::Never,
+            sync: SyncPolicy::Bytes(ByteCount::mb(DEFAULT_SYNC_MIB)),
             compact_dead_ratio: DEFAULT_COMPACT_DEAD_RATIO,
             compact_mbps: CompactRate::Auto,
             scrub_mbps: DEFAULT_SCRUB_MBPS,
@@ -401,6 +417,17 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
+    // an automatic budget runs one tail on a spinning disk and leaves a named count alone
+    #[test]
+    fn tails_for_disk() {
+        let named = ThreadBudget::threads(8);
+
+        assert_eq!(ThreadBudget::Auto.for_disk(Some(true)).resolve_tails(), 1);
+        assert_eq!(ThreadBudget::Auto.for_disk(Some(false)), ThreadBudget::Auto);
+        assert_eq!(ThreadBudget::Auto.for_disk(None), ThreadBudget::Auto);
+        assert_eq!(named.for_disk(Some(true)), named);
+    }
+
     // an automatic tail budget resolves to at least one and stops short of a wide machine
     #[test]
     fn auto_tails_are_bounded() {
@@ -424,10 +451,12 @@ mod tests {
         let posix: IoBackend = serde_json::from_str(r#""posix""#).expect("posix");
         let ring: IoBackend = serde_json::from_str(r#""uring""#).expect("uring");
         let direct: IoBackend = serde_json::from_str(r#""uring_direct""#).expect("uring_direct");
+        let mixed: IoBackend = serde_json::from_str(r#""mixed""#).expect("mixed");
 
         assert_eq!(posix, IoBackend::Posix);
         assert_eq!(ring, IoBackend::Uring);
         assert_eq!(direct, IoBackend::UringDirect);
+        assert_eq!(mixed, IoBackend::Mixed);
         assert_eq!(IoBackend::default(), IoBackend::Posix);
     }
 }

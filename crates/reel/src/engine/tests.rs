@@ -722,9 +722,10 @@ fn a_second_caller_cannot_take_a_held_segment() {
     let script = crate::sync::rendezvous::script();
     script.hold("seal/spans");
 
+    // Cast, so a test sealing beside this one passes the held point
     let noting = {
         let store = Arc::clone(&store);
-        std::thread::spawn(move || store.hold_sealed())
+        script.cast(move || store.hold_sealed())
     };
     // The footer is in hand and the spans are not down
     script.await_reached("seal/spans", 1);
@@ -5642,4 +5643,131 @@ fn a_punch_syncs_the_overwrite_that_freed_its_bytes() {
         Some(Value::new(second)),
         "the punch ran ahead of the overwrite's sync"
     );
+}
+
+// walks on many threads share one parsed footer when the cache holds none
+#[test]
+fn walks_share_a_parsed_footer() {
+    let (store, _) = sim_store(ReelConfig {
+        footer_cache: ByteCount::from_bytes(0),
+        ..config(1, SyncPolicy::Never)
+    });
+    for byte in 0..32u8 {
+        store.put(&record(7, byte), b"row").expect("put");
+    }
+    let segment = store.reel.tails()[0].seal().expect("seal");
+    store.page_out_sealed().expect("hand over");
+
+    let walkers = 20;
+    std::thread::scope(|scope| {
+        for _ in 0..walkers {
+            scope.spawn(|| {
+                let rows = reel_core::Store::iter_prefix(&store, "record", &[])
+                    .expect("walk")
+                    .count();
+                assert_eq!(rows, 32);
+            });
+        }
+    });
+
+    let first = store
+        .reel
+        .shared()
+        .footer_of(segment)
+        .expect("footer")
+        .expect("sealed");
+    let again = store
+        .reel
+        .shared()
+        .footer_of(segment)
+        .expect("footer")
+        .expect("sealed");
+    assert!(
+        Arc::ptr_eq(&first, &again),
+        "a held footer was parsed again"
+    );
+    // Each thread's run slot holds the one footer beside the two handles here
+    assert!(
+        Arc::strong_count(&first) > 2,
+        "the walks kept no footer to share"
+    );
+}
+
+// a pile of small sealed segments folds into one, and sealing the one it folded into starts no more
+#[test]
+fn small_seals_fold_into_one() {
+    let (store, _) = sim_store(config(1, SyncPolicy::Never));
+    let rounds = super::maintain::FOLD_PILE as u8 + 2;
+    for round in 0..rounds {
+        for byte in 0..4u8 {
+            store.put(&record(round.into(), byte), b"row").expect("put");
+        }
+        store.reel.tails()[0].seal().expect("seal");
+    }
+    store.page_out_sealed().expect("hand over");
+    let small = store.config.segment_bytes.to_bytes() / super::maintain::SMALL_SHARE;
+    let smalls = |store: &ReelStore| {
+        store
+            .index
+            .segments_snapshot()
+            .iter()
+            .filter(|(_, bytes)| bytes.total() > 0 && bytes.total() < small)
+            .count()
+    };
+    assert!(
+        smalls(&store) >= rounds.into(),
+        "the seals left {} small segments",
+        smalls(&store)
+    );
+
+    let mut passes = 0;
+    while store.compact_once().expect("pass") == CompactPass::Copied {
+        passes += 1;
+        assert!(passes < 32, "folding never settled");
+        store.reel.tails()[0].seal().expect("seal");
+        store.page_out_sealed().expect("hand over");
+    }
+    assert!(
+        smalls(&store) <= 1,
+        "{} small segments were left",
+        smalls(&store)
+    );
+    for round in 0..rounds {
+        for byte in 0..4u8 {
+            let read = store.get(&record(round.into(), byte)).expect("get");
+            assert_eq!(
+                read.as_deref(),
+                Some(&b"row"[..]),
+                "round {round} key {byte} lost"
+            );
+        }
+    }
+}
+
+// a tail the reopen does not resume is sealed by it, so compaction can take it like any segment
+#[test]
+fn a_tail_left_unresumed_is_sealed_on_open() {
+    let (store, sim) = sim_store(config(2, SyncPolicy::Never));
+    put_on_tail(&store, 0, &record(7, 1), vec![0x11; 512]);
+    put_on_tail(&store, 1, &record(7, 2), vec![0x22; 512]);
+    let left = store.reel.tails()[1].tail().active_segment();
+    store.close().expect("close");
+    drop(store);
+
+    let reopened = reopen_image(sim.durable_image(), config(1, SyncPolicy::Never));
+    assert!(
+        reopened.segment_footer(left).expect("footer").is_some(),
+        "the tail no one resumed was left without a footer"
+    );
+    assert!(
+        reopened.reel.shared().is_settled(left),
+        "the sealed tail never settled"
+    );
+    for (byte, fill) in [(1u8, 0x11u8), (2, 0x22)] {
+        assert_eq!(
+            reopened.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![fill; 512])),
+            "key {byte} after the reopen"
+        );
+    }
 }

@@ -1,5 +1,5 @@
 //! Walks served from segment mappings stay correct under writers, deletes and compaction
-//! Knobs: REEL_MW_SEEDS, REEL_MW_FIRST, REEL_MW_OPS, REEL_MW_SEED, REEL_MW_UNMAPPED, REEL_MW_URING
+//! Knobs: REEL_MW_SEEDS, REEL_MW_FIRST, REEL_MW_OPS, REEL_MW_SEED, REEL_MW_UNMAPPED, REEL_STRESS_BACKEND
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,8 +11,8 @@ use rand::{Rng, SeedableRng};
 use tempfile::TempDir;
 
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
-    ThreadBudget, MAP_EVERYTHING,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IoBackend, KeyWidth, ReelConfig, ReelStore,
+    SyncPolicy, ThreadBudget, MAP_EVERYTHING,
 };
 use reel_core::{Direction, Store};
 
@@ -70,6 +70,15 @@ fn check_value(seed: u64, key: u64, value: &[u8]) -> u64 {
     version
 }
 
+/// The backend these runs take from REEL_STRESS_BACKEND: posix, uring or mixed, posix by default
+fn backend() -> IoBackend {
+    match std::env::var("REEL_STRESS_BACKEND").as_deref() {
+        Ok("uring") => IoBackend::Uring,
+        Ok("mixed") => IoBackend::Mixed,
+        _ => IoBackend::Posix,
+    }
+}
+
 fn config(rng: &mut SmallRng) -> ReelConfig {
     ReelConfig {
         segment_bytes: ByteCount::from_bytes(64 * 1024),
@@ -77,10 +86,7 @@ fn config(rng: &mut SmallRng) -> ReelConfig {
         active_tails: ThreadBudget::threads(rng.gen_range(1..=4)),
         compact_dead_ratio: 0.1,
         scrub_mbps: 0,
-        io_backend: match std::env::var("REEL_MW_URING").is_ok() {
-            true => reel::IoBackend::Uring,
-            false => reel::IoBackend::Posix,
-        },
+        io_backend: backend(),
         map_above: match std::env::var("REEL_MW_UNMAPPED").is_ok() {
             true => None,
             false => MAP_EVERYTHING,

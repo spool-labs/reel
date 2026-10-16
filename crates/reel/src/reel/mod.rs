@@ -70,6 +70,9 @@ const SEGMENT_DIGITS: usize = 6;
 /// The shared rows table sweeps out entries no reader holds once it reaches this many
 const MAPPED_ROWS_SWEEP: usize = 4096;
 
+/// The parsed footer table sweeps out entries no reader holds once it reaches this many
+const PARSED_SWEEP: usize = 4096;
+
 /// Every segment file name ends with this suffix
 pub const SEGMENT_SUFFIX: &str = ".reel";
 
@@ -964,6 +967,10 @@ impl FooterSource for ReelShared {
         self.footer_of(segment)
     }
 
+    fn note_stepped(&self, keys: u64, buried: u64) {
+        self.probes.note_stepped(keys, buried);
+    }
+
     fn footer_once(&self, segment: SegmentId) -> Result<Option<Arc<SegmentFooter>>> {
         if let Some(footer) = self.footers.get(segment) {
             return Ok(Some(footer));
@@ -1086,6 +1093,9 @@ pub struct ReelShared {
     /// Each sealed partition's rows in place, shared by every key run reader holding one
     mapped_rows: Mutex<HashMap<(SegmentId, ColumnId), std::sync::Weak<MappedRows>>>,
 
+    /// Every parsed footer a reader still holds, so walks on other threads and columns share it
+    parsed: Mutex<HashMap<SegmentId, std::sync::Weak<SegmentFooter>>>,
+
     /// Load-time settings for the volume
     pub config: ReelConfig,
 
@@ -1205,6 +1215,7 @@ impl ReelShared {
             segments: OnceLock::new(),
             footers: FooterCache::new(config.footer_cache.to_bytes() as usize),
             mapped_rows: Mutex::new(HashMap::new()),
+            parsed: Mutex::new(HashMap::new()),
             config,
             columns,
             purge_floor: AtomicU64::new(NOTHING_PURGED),
@@ -1281,6 +1292,34 @@ impl ReelShared {
         Ok(Some(block))
     }
 
+    /// Hand every footer row of a sealed segment to `visit`, one block at a time and caching nothing
+    pub fn walk_rows(
+        &self,
+        segment: SegmentId,
+        mut visit: impl FnMut(ColumnId, &[u8], FooterRow) -> Result<()>,
+    ) -> Result<bool> {
+        let Some(map) = self.footer_map_of(segment)? else {
+            return Ok(false);
+        };
+        let Some(handle) = self.handle_for(segment)? else {
+            return Ok(false);
+        };
+        for column in map.columns() {
+            let Some(span) = map.span_of(column) else {
+                continue;
+            };
+            for at in 0..span.blocks() {
+                self.probes.note_block_read();
+                let restarts = map.restarts_of(column);
+                let block = RowBlock::read(&self.driver, handle.file(), &span, at, restarts)?;
+                for row in 0..block.len() {
+                    visit(column, block.key_at(row).unwrap_or(&[]), block.row_at(row)?)?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// The row of a key at one offset in a sealed segment, or nothing for a segment gone
     fn row_at_offset_in(
         &self,
@@ -1312,11 +1351,23 @@ impl ReelShared {
         if let Some(footer) = self.footers.get(segment) {
             return Ok(Some(footer));
         }
+        if let Some(footer) = lock(&self.parsed)
+            .get(&segment)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Ok(Some(footer));
+        }
         let Some(footer) = self.footer_from_disk(segment)? else {
             return Ok(None);
         };
         let footer = Arc::new(footer);
         self.footers.insert(segment, Arc::clone(&footer));
+        let mut parsed = lock(&self.parsed);
+        // Segment numbers never come back, so an entry no reader holds can just be dropped
+        if parsed.len() >= PARSED_SWEEP {
+            parsed.retain(|_, kept| kept.strong_count() > 0);
+        }
+        parsed.insert(segment, Arc::downgrade(&footer));
         Ok(Some(footer))
     }
 
@@ -1629,7 +1680,7 @@ impl ReelShared {
     /// Whether a point read asks the page cache before it queues, as every cached volume does
     pub fn warm_first(&self) -> WarmFirst {
         match self.driver.serving() {
-            ServingBackend::Posix | ServingBackend::Ring => WarmFirst::Ask,
+            ServingBackend::Posix | ServingBackend::Ring | ServingBackend::Mixed => WarmFirst::Ask,
             ServingBackend::PosixDirect | ServingBackend::RingDirect | ServingBackend::Sim => {
                 WarmFirst::Skip
             }
@@ -1863,6 +1914,10 @@ impl Reel {
                 false => None,
             };
             tails.push(Appender::open(Arc::clone(&shared), index as u64, adopted)?);
+        }
+        // A tail no one resumed would stand unsealed for good, so it seals now
+        for left in candidates {
+            Appender::seal_unresumed(&shared, left)?;
         }
         Ok(Reel {
             shared,

@@ -457,6 +457,38 @@ impl Scope {
     }
 
     /// The key the playback starts from, derived from its near bound
+    /// Where an ascending playback ends, the tightest of its upper bounds and its prefix
+    fn end_bound(&self) -> Bound<Vec<u8>> {
+        if self.direction == Direction::Desc {
+            return Bound::Unbounded;
+        }
+        let mut end = Bound::Unbounded;
+        for bound in [
+            self.upper.clone().map(Bound::Excluded),
+            self.upper_inclusive.clone().map(Bound::Included),
+            self.prefix
+                .as_deref()
+                .and_then(prefix_end)
+                .map(Bound::Excluded),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            // A bound wider than any key ends nothing a key can reach, so the scope's check keeps it
+            let key = match &bound {
+                Bound::Included(key) | Bound::Excluded(key) => key,
+                Bound::Unbounded => continue,
+            };
+            if key.len() > MAX_KEY_LEN {
+                continue;
+            }
+            if is_tighter(&bound, &end) {
+                end = bound;
+            }
+        }
+        end
+    }
+
     fn start_bound(&self) -> Bound<Vec<u8>> {
         let near = match self.direction {
             Direction::Asc => self.lower.as_ref().or(self.prefix.as_ref()),
@@ -783,12 +815,19 @@ impl Page {
         };
         // The start is cut to the widest key, so the cursor takes every bound it is given
         let bound = scope.start_bound();
+        let end = scope.end_bound();
         Page {
             buffered,
             serves,
             taken: 0,
-            playback: PlaybackCursor::with_buffers(column, way, as_slice_bound(&bound), cursor)
-                .ok(),
+            playback: PlaybackCursor::with_buffers(
+                column,
+                way,
+                as_slice_bound(&bound),
+                as_slice_bound(&end),
+                cursor,
+            )
+            .ok(),
             size: PLAYBACK_PAGE_MIN,
         }
     }
@@ -1088,6 +1127,30 @@ fn as_slice_bound(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
         Bound::Unbounded => Bound::Unbounded,
         Bound::Included(key) => Bound::Included(key.as_slice()),
         Bound::Excluded(key) => Bound::Excluded(key.as_slice()),
+    }
+}
+
+/// The first key past every key a prefix starts, or nothing for a prefix of top bytes
+fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if let Some(bumped) = last.checked_add(1) {
+            end.push(bumped);
+            return Some(end);
+        }
+    }
+    None
+}
+
+/// Whether one ascending end stops a walk sooner than another
+fn is_tighter(bound: &Bound<Vec<u8>>, than: &Bound<Vec<u8>>) -> bool {
+    match (bound, than) {
+        (Bound::Unbounded, _) => false,
+        (_, Bound::Unbounded) => true,
+        (
+            Bound::Included(key) | Bound::Excluded(key),
+            Bound::Included(other) | Bound::Excluded(other),
+        ) => key < other || (key == other && matches!(bound, Bound::Excluded(_))),
     }
 }
 

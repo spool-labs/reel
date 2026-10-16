@@ -9,6 +9,7 @@ use crate::error::{ReelError, Result};
 use crate::format::column::ColumnId;
 use crate::format::footer::{FooterPartition, SegmentFooter};
 use crate::format::loc::SegmentId;
+use crate::format::lsn::Lsn;
 use crate::index::keyrun::{
     FooterRows, KeyRun, RowReader, RunColumn, RunPointer, RunRow, RunWriter,
 };
@@ -30,6 +31,9 @@ pub struct MergeReport {
 
     /// A newer row of the same key shadowed this many rows
     pub rows_shadowed: u64,
+
+    /// The run left out this many deleted keys that nothing older can still reach
+    pub graves_dropped: u64,
 }
 
 /// One input run of a merge
@@ -228,6 +232,23 @@ pub fn merge_into_key_run(
         );
     }
     let covered: Vec<SegmentId> = covered.into_iter().collect();
+    let footers: Arc<dyn FooterSource> = Arc::clone(shared) as Arc<dyn FooterSource>;
+    // The standing segments the run leaves out, each with the oldest record it holds
+    let mut outside = Vec::new();
+    for segment in &standing {
+        if covered.binary_search(segment).is_err() {
+            outside.push(Outside {
+                segment: *segment,
+                oldest: index.min_lsn_of(*segment),
+                is_sealed: index.holds_sealed(*segment),
+            });
+        }
+    }
+    let graves = Graves {
+        footers: Arc::clone(&footers),
+        outside,
+        settled: shared.settled_below(),
+    };
 
     let root = shared.volumes.roots()[0].clone();
     let id = index.key_runs().draw_id();
@@ -236,7 +257,6 @@ pub fn merge_into_key_run(
         runs_merged: sources.len() as u64,
         ..MergeReport::default()
     };
-    let footers: Arc<dyn FooterSource> = Arc::clone(shared) as Arc<dyn FooterSource>;
     let written = (|| -> Result<()> {
         for column in &columns {
             writer.begin_column(*column)?;
@@ -246,6 +266,7 @@ pub fn merge_into_key_run(
                 *column,
                 &standing,
                 &covered,
+                &graves,
                 &mut writer,
                 &mut report,
             )?;
@@ -274,12 +295,14 @@ pub fn merge_into_key_run(
 }
 
 /// Write one column's newest row of each key across every source, in key order
+#[allow(clippy::too_many_arguments)]
 fn merge_column(
     footers: &Arc<dyn FooterSource>,
     sources: &[Source],
     column: ColumnId,
     standing: &HashSet<SegmentId>,
     covered: &[SegmentId],
+    graves: &Graves,
     writer: &mut RunWriter<'_>,
     report: &mut MergeReport,
 ) -> Result<()> {
@@ -334,6 +357,12 @@ fn merge_column(
             sift_down(&mut heap, &cursors, 0);
         }
         report.rows_shadowed += seen.saturating_sub(1);
+        if let Some((row, _)) = newest {
+            if row.flags.is_tombstone() && !graves.may_hide(column, &key, row.lsn)? {
+                report.graves_dropped += 1;
+                continue;
+            }
+        }
         if let Some((row, place)) = newest {
             let at = covered.binary_search(&row.loc.segment).map_err(|_| {
                 ReelError::Corruption(format!(
@@ -351,6 +380,57 @@ fn merge_column(
         }
     }
     Ok(())
+}
+
+/// A standing segment a merge leaves out, with the oldest record it holds
+struct Outside {
+    /// The segment
+    segment: SegmentId,
+
+    /// The lowest sequence number it holds, nothing for one it holds no record of
+    oldest: Option<Lsn>,
+
+    /// Whether it sealed, so its footer can be asked
+    is_sealed: bool,
+}
+
+/// What a merge asks before it leaves a deleted key out of its run
+struct Graves {
+    /// Where the footers of the segments left out are read
+    footers: Arc<dyn FooterSource>,
+
+    /// Every standing segment the run does not cover
+    outside: Vec<Outside>,
+
+    /// Sequence numbers below this one have landed in a segment
+    settled: Lsn,
+}
+
+impl Graves {
+    /// Whether a delete may still hide an older version of its key outside the run
+    fn may_hide(&self, column: ColumnId, key: &[u8], lsn: Lsn) -> Result<bool> {
+        if lsn >= self.settled {
+            return Ok(true);
+        }
+        for outside in &self.outside {
+            let Some(oldest) = outside.oldest else {
+                continue;
+            };
+            if oldest >= lsn {
+                continue;
+            }
+            // A segment with no footer yet cannot be asked, so it keeps the delete
+            if !outside.is_sealed {
+                return Ok(true);
+            }
+            if let Some(row) = self.footers.find(outside.segment, column, key)? {
+                if row.lsn < lsn {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// Whether cursor `a` stands on a lesser key than cursor `b`, ties to the earlier cursor

@@ -1260,44 +1260,19 @@ impl Appender {
 
     /// Take up the segment a previous process left unsealed, at its walked end
     fn resume_segment(&self, resumed: ResumableTail) -> Result<Active> {
-        let holds = self.shared.adopt_segment(resumed.segment);
-        let file = self.shared.driver.open(&resumed.path, false)?;
-        let journal = Journal::resume(
-            &self.shared.driver,
-            file,
-            resumed.rows_at,
-            resumed.rows_len,
-            self.shared.config.segment_bytes.to_bytes(),
-            self.shared.writes_whole_blocks(),
-        )?;
-        // A whole-block volume pads each record to a block, so the tail resumes at the next block
-        let end = match self.shared.writes_whole_blocks() {
-            true => align_up(resumed.end + HEADER_LEN as u64, ALIGN),
-            false => resumed.end,
-        };
-        let handle = SegmentHandle::opened(
-            resumed.segment,
-            resumed.path,
-            file,
-            Arc::clone(&self.shared.driver),
-        )?;
-        let active = Active {
-            handle,
-            reserved: AtomicU64::new(end),
-            settled: AtomicU64::new(end),
-            cut_at: AtomicU64::new(NO_CUT),
-            alloc_high: AtomicU64::new(end),
-            fill: Mutex::new(()),
-            entries: Mutex::new(resumed.entries),
-            journal: Arc::new(journal),
-            sync: Arc::new(SyncState::new()),
-            terminal: AtomicBool::new(false),
-            holds,
-        };
-        // The file already reaches the rows, so the zero window restarts at the last record
-        self.shared.driver.sync_full(active.handle.file())?;
-        active.sync.synced_at.store(end, Ordering::Release);
-        Ok(active)
+        resume_active(&self.shared, resumed)
+    }
+
+    /// Seal an unsealed segment no tail resumed, so it gets its footer and compaction can take it
+    pub fn seal_unresumed(shared: &Arc<ReelShared>, resumed: ResumableTail) -> Result<()> {
+        let active = resume_active(shared, resumed)?;
+        let end = active.end();
+        if let Err(error) = retire_segment(shared, &active, end) {
+            // Park it like a sealer failure, so the tick finishes the seal
+            tracing::warn!("an unresumed tail failed its seal at open: {error}");
+            park_broken_seal(shared, active, end);
+        }
+        Ok(())
     }
 
     /// Draw a fresh segment, reserve its space, and write its header as record zero
@@ -1497,6 +1472,48 @@ thread_local! {
 }
 
 /// This thread's write list with room for a write of this width, or a fresh one
+/// The segment a previous process left unsealed, taken up at its walked end
+fn resume_active(shared: &Arc<ReelShared>, resumed: ResumableTail) -> Result<Active> {
+    let holds = shared.adopt_segment(resumed.segment);
+    let file = shared.driver.open(&resumed.path, false)?;
+    let journal = Journal::resume(
+        &shared.driver,
+        file,
+        resumed.rows_at,
+        resumed.rows_len,
+        shared.config.segment_bytes.to_bytes(),
+        shared.writes_whole_blocks(),
+    )?;
+    // A whole-block volume pads each record to a block, so the tail resumes at the next block
+    let end = match shared.writes_whole_blocks() {
+        true => align_up(resumed.end + HEADER_LEN as u64, ALIGN),
+        false => resumed.end,
+    };
+    let handle = SegmentHandle::opened(
+        resumed.segment,
+        resumed.path,
+        file,
+        Arc::clone(&shared.driver),
+    )?;
+    let active = Active {
+        handle,
+        reserved: AtomicU64::new(end),
+        settled: AtomicU64::new(end),
+        cut_at: AtomicU64::new(NO_CUT),
+        alloc_high: AtomicU64::new(end),
+        fill: Mutex::new(()),
+        entries: Mutex::new(resumed.entries),
+        journal: Arc::new(journal),
+        sync: Arc::new(SyncState::new()),
+        terminal: AtomicBool::new(false),
+        holds,
+    };
+    // The file already reaches the rows, so the zero window restarts at the last record
+    shared.driver.sync_full(active.handle.file())?;
+    active.sync.synced_at.store(end, Ordering::Release);
+    Ok(active)
+}
+
 fn take_bufs(wanted: usize) -> Vec<WriteBuf> {
     let mut bufs = BUFS_SPARE.with(|held| held.take());
     bufs.reserve(wanted);

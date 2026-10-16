@@ -56,6 +56,9 @@ pub enum ServingBackend {
     /// A ring submitting on descriptors that bypass the page cache
     RingDirect,
 
+    /// A ring for reads through the page cache, with writes and syncs on posix
+    Mixed,
+
     /// The in-memory backend a simulation runs on, never chosen from config
     Sim,
 }
@@ -63,7 +66,10 @@ pub enum ServingBackend {
 impl ServingBackend {
     /// Whether a ring serves this volume
     pub fn is_ring(self) -> bool {
-        matches!(self, ServingBackend::Ring | ServingBackend::RingDirect)
+        matches!(
+            self,
+            ServingBackend::Ring | ServingBackend::RingDirect | ServingBackend::Mixed
+        )
     }
 
     /// Whether this volume's descriptors bypass the page cache
@@ -81,6 +87,7 @@ impl ServingBackend {
             ServingBackend::PosixDirect => "posix_direct",
             ServingBackend::Ring => "ring",
             ServingBackend::RingDirect => "ring_direct",
+            ServingBackend::Mixed => "mixed",
             ServingBackend::Sim => "sim",
         }
     }

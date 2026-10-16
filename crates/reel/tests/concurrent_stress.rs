@@ -12,8 +12,8 @@ use reel::index::map::KeySites;
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, RecordKey, ReelConfig, ReelStore,
-    SyncPolicy, ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IoBackend, KeyWidth, RecordKey, ReelConfig,
+    ReelStore, SyncPolicy, ThreadBudget,
 };
 
 const RECORDS: ColumnId = ColumnId(1);
@@ -92,8 +92,18 @@ const LEN_SPREAD: usize = 700;
 /// Small enough that every tail rolls several times over the storm
 const SEGMENT_BYTES: u64 = 16 * 1024;
 
+/// The backend these runs take from REEL_STRESS_BACKEND: posix, uring or mixed, posix by default
+fn backend() -> IoBackend {
+    match std::env::var("REEL_STRESS_BACKEND").as_deref() {
+        Ok("uring") => IoBackend::Uring,
+        Ok("mixed") => IoBackend::Mixed,
+        _ => IoBackend::Posix,
+    }
+}
+
 fn config() -> ReelConfig {
     ReelConfig {
+        io_backend: backend(),
         segment_bytes: ByteCount::from_bytes(SEGMENT_BYTES),
         sync: SyncPolicy::Never,
         active_tails: ThreadBudget::threads(2),

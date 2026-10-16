@@ -5669,9 +5669,22 @@ fn walks_share_a_parsed_footer() {
         }
     });
 
-    let first = store.reel.shared().footer_of(segment).expect("footer").expect("sealed");
-    let again = store.reel.shared().footer_of(segment).expect("footer").expect("sealed");
-    assert!(Arc::ptr_eq(&first, &again), "a held footer was parsed again");
+    let first = store
+        .reel
+        .shared()
+        .footer_of(segment)
+        .expect("footer")
+        .expect("sealed");
+    let again = store
+        .reel
+        .shared()
+        .footer_of(segment)
+        .expect("footer")
+        .expect("sealed");
+    assert!(
+        Arc::ptr_eq(&first, &again),
+        "a held footer was parsed again"
+    );
     // Each thread's run slot holds the one footer beside the two handles here
     assert!(
         Arc::strong_count(&first) > 2,
@@ -5713,11 +5726,19 @@ fn small_seals_fold_into_one() {
         store.reel.tails()[0].seal().expect("seal");
         store.page_out_sealed().expect("hand over");
     }
-    assert!(smalls(&store) <= 1, "{} small segments were left", smalls(&store));
+    assert!(
+        smalls(&store) <= 1,
+        "{} small segments were left",
+        smalls(&store)
+    );
     for round in 0..rounds {
         for byte in 0..4u8 {
             let read = store.get(&record(round.into(), byte)).expect("get");
-            assert_eq!(read.as_deref(), Some(&b"row"[..]), "round {round} key {byte} lost");
+            assert_eq!(
+                read.as_deref(),
+                Some(&b"row"[..]),
+                "round {round} key {byte} lost"
+            );
         }
     }
 }
@@ -5737,7 +5758,10 @@ fn a_tail_left_unresumed_is_sealed_on_open() {
         reopened.segment_footer(left).expect("footer").is_some(),
         "the tail no one resumed was left without a footer"
     );
-    assert!(reopened.reel.shared().is_settled(left), "the sealed tail never settled");
+    assert!(
+        reopened.reel.shared().is_settled(left),
+        "the sealed tail never settled"
+    );
     for (byte, fill) in [(1u8, 0x11u8), (2, 0x22)] {
         assert_eq!(
             reopened.get(&record(7, byte)).expect("get"),

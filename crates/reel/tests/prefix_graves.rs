@@ -186,12 +186,18 @@ fn buried_walks_merge_away() {
     };
 
     let first = walk(&store);
-    assert!(first > 0, "the churn left no deleted keys for a walk to step over");
+    assert!(
+        first > 0,
+        "the churn left no deleted keys for a walk to step over"
+    );
     let mut buried = first;
     while buried < 1 << 20 {
         buried += walk(&store);
     }
     store.maintain_once().expect("tick");
     let after = walk(&store);
-    assert_eq!(after, 0, "a walk still stepped over {after} deleted keys after the merge");
+    assert_eq!(
+        after, 0,
+        "a walk still stepped over {after} deleted keys after the merge"
+    );
 }

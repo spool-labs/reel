@@ -2443,7 +2443,10 @@ mod tests {
         for hash in &hashes {
             assert_eq!(fitted.matches(*hash).len(), 1, "a slot was lost in the fit");
         }
-        assert!(fitted.fitted().is_none(), "a fitted table was rebuilt again");
+        assert!(
+            fitted.fitted().is_none(),
+            "a fitted table was rebuilt again"
+        );
     }
 
     // a pair full of one hash spills the rest, and growth, marks and sweeps all reach the spill

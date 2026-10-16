@@ -163,9 +163,10 @@ impl<K: IndexKey, V: 'static, M: ShardMap<K, V>> ShardMap<K, V> for Few<K, V, M>
     fn heap_bytes(&self) -> u64 {
         match self {
             Few::Tree(tree) => tree.heap_bytes(),
-            Few::Few { keys, vals } => (keys.capacity() * std::mem::size_of::<K>()
-                + vals.capacity() * std::mem::size_of::<V>())
-                as u64,
+            Few::Few { keys, vals } => {
+                (keys.capacity() * std::mem::size_of::<K>()
+                    + vals.capacity() * std::mem::size_of::<V>()) as u64
+            }
         }
     }
 
@@ -341,7 +342,13 @@ mod tests {
         assert!(matches!(map, Few::Few { .. }));
         assert_eq!(walked(&map), model.0);
         for n in 0..40u32 {
-            assert_eq!(map.at(&key(n * 3)).copied(), model.span(Bound::Included(&key(n * 3)), Bound::Included(&key(n * 3))).first().copied());
+            assert_eq!(
+                map.at(&key(n * 3)).copied(),
+                model
+                    .span(Bound::Included(&key(n * 3)), Bound::Included(&key(n * 3)))
+                    .first()
+                    .copied()
+            );
         }
     }
 

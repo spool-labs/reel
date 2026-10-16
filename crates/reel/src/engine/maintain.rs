@@ -31,6 +31,9 @@ const SPOT_SCRUB_BUDGET: usize = 65_536;
 /// A key merge runs once a walk merges more runs than this, since a walk seeks once in each
 const MERGE_DEPTH: usize = 8;
 
+/// A key merge also runs once walks have stepped over this many deleted keys since the last one
+const MERGE_BURIED: u64 = 1 << 20;
+
 /// The hand-over runs this often while compaction passes hold the tick
 const HANDOVER_TICK: Duration = Duration::from_secs(1);
 
@@ -271,10 +274,24 @@ impl ReelStore {
             return Ok(None);
         };
         self.settle_sealed()?;
-        if self.index.overlap_depth() <= MERGE_DEPTH || self.index.has_pending_covers() {
+        let shared = self.reel.shared();
+        let buried = shared.probes.counts().buried;
+        // Joining every run rewrites their rows, so the walks must have wasted more steps than that
+        let run_rows: u64 = self
+            .index
+            .key_runs()
+            .runs()
+            .iter()
+            .flat_map(|run| run.columns().iter().map(|column| column.rows()))
+            .sum();
+        let wasted = buried - self.merged_buried.load(Ordering::Relaxed);
+        let is_buried = wasted >= MERGE_BURIED.max(run_rows);
+        if (self.index.overlap_depth() <= MERGE_DEPTH && !is_buried)
+            || self.index.has_pending_covers()
+        {
             return Ok(None);
         }
-        let shared = self.reel.shared();
+        self.merged_buried.store(buried, Ordering::Relaxed);
         let covered = self.index.key_runs().covered();
         let owed = shared.pending_seals();
         let mut segments = Vec::new();
@@ -304,7 +321,8 @@ impl ReelStore {
         let mut joining = Vec::new();
         for run in runs {
             let rows: u64 = run.columns().iter().map(|column| column.rows()).sum();
-            if taken > 0 && rows > taken.saturating_mul(2) {
+            // Deleted keys sit in the old runs too, so a merge for them joins every run
+            if !is_buried && taken > 0 && rows > taken.saturating_mul(2) {
                 break;
             }
             taken += rows;

@@ -967,8 +967,8 @@ impl FooterSource for ReelShared {
         self.footer_of(segment)
     }
 
-    fn note_stepped(&self, keys: u64) {
-        self.probes.note_stepped(keys);
+    fn note_stepped(&self, keys: u64, buried: u64) {
+        self.probes.note_stepped(keys, buried);
     }
 
     fn footer_once(&self, segment: SegmentId) -> Result<Option<Arc<SegmentFooter>>> {

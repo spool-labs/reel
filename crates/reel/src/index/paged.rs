@@ -30,8 +30,8 @@ pub trait FooterSource: Send + Sync {
         self.footer(segment)
     }
 
-    /// Note keys a walk stepped over in the sealed runs
-    fn note_stepped(&self, _keys: u64) {}
+    /// Note keys a walk stepped over in the sealed runs, and how many of them were deleted
+    fn note_stepped(&self, _keys: u64, _buried: u64) {}
 
     /// What a sealed segment's footer says about a key, if it says anything
     fn find(&self, segment: SegmentId, column: ColumnId, key: &[u8]) -> Result<Option<FooterRow>> {

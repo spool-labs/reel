@@ -170,3 +170,28 @@ fn spool_count() {
     assert_eq!((churned, live), (0, 1));
     assert_eq!(stepped_since(&store, before), 0);
 }
+
+// walks that keep stepping over deleted keys make a merge due, and the merge leaves them out
+#[test]
+fn buried_walks_merge_away() {
+    let dir = TempDir::new().expect("tempdir");
+    let store = churned_queue(&dir);
+    let walk = |store: &ReelStore| {
+        let before = store.filter_probes().buried;
+        let next = Store::iter_from(store, QUEUE, &key(2, 0), Direction::Asc)
+            .expect("iter_from")
+            .next();
+        assert!(next.is_none());
+        store.filter_probes().buried - before
+    };
+
+    let first = walk(&store);
+    assert!(first > 0, "the churn left no deleted keys for a walk to step over");
+    let mut buried = first;
+    while buried < 1 << 20 {
+        buried += walk(&store);
+    }
+    store.maintain_once().expect("tick");
+    let after = walk(&store);
+    assert_eq!(after, 0, "a walk still stepped over {after} deleted keys after the merge");
+}

@@ -203,6 +203,9 @@ pub struct ReelStore {
 
     /// Admitted bytes at the last heat ask, which turns a counter into a rate
     ingest_marker: AtomicU64,
+
+    /// Deleted keys walks had stepped over when the last merge ran
+    merged_buried: AtomicU64,
 }
 
 impl ReelStore {
@@ -412,6 +415,7 @@ impl ReelStore {
             bias,
             footprint: AtomicU64::new(0),
             ingest_marker: AtomicU64::new(0),
+            merged_buried: AtomicU64::new(0),
             sweep_nonce: (std::process::id() as u64) << 32
                 | OPENINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64,
             root,

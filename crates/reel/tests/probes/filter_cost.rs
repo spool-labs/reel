@@ -504,5 +504,6 @@ fn add(left: ProbeCounts, right: ProbeCounts) -> ProbeCounts {
         block_reads: left.block_reads + right.block_reads,
         map_reads: left.map_reads + right.map_reads,
         stepped: left.stepped + right.stepped,
+        buried: left.buried + right.buried,
     }
 }

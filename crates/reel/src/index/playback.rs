@@ -893,6 +893,7 @@ fn merge_run(
 
     let mut taken = 0usize;
     let mut stepped = 0u64;
+    let mut buried = 0u64;
     let mut want = [0u8; MAX_KEY_LEN];
     // Resume past the last key decided, grave or not, copied since a peek reuses `want`
     let mut resume = [0u8; MAX_KEY_LEN];
@@ -936,6 +937,7 @@ fn merge_run(
             continue;
         };
         if found.is_tombstone() || found.is_range_tombstone() {
+            buried += 1;
             continue;
         }
         if index.is_covered_key(key, found.lsn) {
@@ -951,7 +953,7 @@ fn merge_run(
         );
     }
 
-    paged.footers.note_stepped(stepped);
+    paged.footers.note_stepped(stepped, buried);
     playback.at = match exhausted {
         true => None,
         false => Some(Bound::Excluded(KeyBytes::new(&resume[..resume_len])?)),

@@ -5960,3 +5960,127 @@ fn a_kill_mid_pass_keeps_a_prefix() {
         "the sweep covered {sweep} writes"
     );
 }
+
+/// Where a segment file's rows start, read from the header at its front
+fn rows_at_of(front: &[u8]) -> Option<u64> {
+    let head = crate::format::record::RecordHeader::unpack(front.get(..HEADER_LEN)?).ok()?;
+    let payload = front.get(HEADER_LEN..HEADER_LEN + head.length as usize)?;
+    let segment = crate::format::segment_header::SegmentHeader::unpack(payload).ok()?;
+    (segment.rows_at > 0).then_some(segment.rows_at)
+}
+
+fn torn_config() -> ReelConfig {
+    ReelConfig {
+        segment_bytes: ByteCount::from_bytes(16 * 1024),
+        active_tails: ThreadBudget::threads(1),
+        sync: SyncPolicy::Never,
+        ..ReelConfig::default()
+    }
+}
+
+// a resumed tail writes over a torn group, and the whole group past it stays dead
+#[test]
+fn a_torn_group_buries_later_groups() {
+    let (store, sim) = sim_store(torn_config());
+    store.put(&record(7, 1), &[1; 100]).expect("put");
+    store.put(&record(7, 2), &[2; 100]).expect("put");
+    store.flush().expect("flush");
+    let mut image = sim.durable_image();
+    std::mem::forget(store);
+    let mut torn = 0;
+    for (_, bytes) in image.iter_mut() {
+        let Some(rows_at) = rows_at_of(bytes) else {
+            continue;
+        };
+        let rows = bytes.get(rows_at as usize..).unwrap_or_default();
+        if crate::format::journal::read_groups(rows).0.len() == 2 {
+            bytes[rows_at as usize + 10] ^= 0xff;
+            torn += 1;
+        }
+    }
+    assert_eq!(torn, 1, "one journal with two groups");
+
+    let second_sim = SimIo::from_image(image);
+    let second = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        torn_config(),
+        COLUMNS,
+        Arc::new(second_sim.clone()),
+    )
+    .expect("second open");
+    assert_eq!(second.get(&record(7, 2)).expect("get"), None, "the torn group hides both");
+    second.put(&record(7, 3), &[3; 100]).expect("put");
+    second.flush().expect("flush");
+    let image = second_sim.durable_image();
+    std::mem::forget(second);
+
+    let third = reopen_image(image, torn_config());
+    assert_eq!(third.get(&record(7, 2)).expect("get"), None, "a buried group came back");
+    assert!(third.get(&record(7, 3)).expect("get").is_some(), "the new put held");
+}
+
+/// Copy a store's files to a fresh directory, leaving its lock behind
+fn copy_store(from: &std::path::Path) -> TempDir {
+    let to = tempdir().expect("tempdir");
+    let mut stack = vec![PathBuf::new()];
+    while let Some(relative) = stack.pop() {
+        for entry in std::fs::read_dir(from.join(&relative)).expect("read dir") {
+            let name = relative.join(entry.expect("entry").file_name());
+            let source = from.join(&name);
+            if source.is_dir() {
+                std::fs::create_dir_all(to.path().join(&name)).expect("dir");
+                stack.push(name);
+            } else if name.file_name().is_some_and(|file| file != "reel.lock") {
+                std::fs::copy(&source, to.path().join(&name)).expect("copy");
+            }
+        }
+    }
+    to
+}
+
+// the same history on real files
+#[test]
+fn a_torn_group_stays_buried_on_disk() {
+    use std::os::unix::fs::FileExt;
+    let first = tempdir().expect("tempdir");
+    let store = ReelStore::open(first.path().to_path_buf(), torn_config(), COLUMNS).expect("open");
+    store.put(&record(7, 1), &[1; 100]).expect("put");
+    store.put(&record(7, 2), &[2; 100]).expect("put");
+    store.flush().expect("flush");
+    std::mem::forget(store);
+    let dir = copy_store(first.path());
+    let mut torn = 0;
+    let mut stack = vec![dir.path().to_path_buf()];
+    while let Some(at) = stack.pop() {
+        for entry in std::fs::read_dir(&at).expect("read dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("read");
+            let Some(rows_at) = rows_at_of(&bytes) else {
+                continue;
+            };
+            let rows = bytes.get(rows_at as usize..).unwrap_or_default();
+            if crate::format::journal::read_groups(rows).0.len() == 2 {
+                let file = std::fs::OpenOptions::new().write(true).open(&path).expect("open");
+                file.write_all_at(&[bytes[rows_at as usize + 10] ^ 0xff], rows_at + 10)
+                    .expect("tear");
+                torn += 1;
+            }
+        }
+    }
+    assert_eq!(torn, 1, "one journal with two groups");
+
+    let second = ReelStore::open(dir.path().to_path_buf(), torn_config(), COLUMNS).expect("open");
+    assert_eq!(second.get(&record(7, 2)).expect("get"), None, "the torn group hides both");
+    second.put(&record(7, 3), &[3; 100]).expect("put");
+    second.flush().expect("flush");
+    std::mem::forget(second);
+    let last = copy_store(dir.path());
+
+    let third = ReelStore::open(last.path().to_path_buf(), torn_config(), COLUMNS).expect("open");
+    assert_eq!(third.get(&record(7, 2)).expect("get"), None, "a buried group came back");
+    assert!(third.get(&record(7, 3)).expect("get").is_some(), "the new put held");
+}

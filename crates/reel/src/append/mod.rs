@@ -1519,9 +1519,10 @@ thread_local! {
 fn resume_active(shared: &Arc<ReelShared>, resumed: ResumableTail) -> Result<Active> {
     let holds = shared.adopt_segment(resumed.segment);
     let file = shared.driver.open(&resumed.path, false)?;
-    // Cut off the groups a reopen dropped, so a later cut can never take them back
+    // Cut off what a reopen dropped and sync it, so no stale group comes back behind new rows
     if resumed.has_dropped_rows {
         shared.driver.truncate(file, resumed.rows_at + resumed.rows_len)?;
+        shared.driver.sync_full(file)?;
     }
     let journal = Journal::resume(
         &shared.driver,

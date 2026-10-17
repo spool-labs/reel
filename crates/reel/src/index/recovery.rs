@@ -13,7 +13,7 @@ use crate::format::footer::{
     SEAL_MARK_LEN,
 };
 use crate::format::journal::{
-    cut_slot, read_cut, read_groups, read_groups_through, JournalRow, CUT_FILE, CUT_MARK_LEN,
+    cut_slot, read_cut, read_groups_through, JournalRow, CUT_FILE, CUT_MARK_LEN,
 };
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
@@ -305,7 +305,7 @@ struct JournaledEnd {
     /// The cut this tail's rows were read through
     cut: Lsn,
 
-    /// Whether whole groups past the cut follow the rows read
+    /// Whether anything but zeros follows the rows read
     has_dropped_rows: bool,
 }
 
@@ -1181,7 +1181,7 @@ struct JournaledTail {
     /// The reel's cut or this segment's copy of it, whichever is higher
     cut: Lsn,
 
-    /// Whether whole groups past the cut follow the rows read
+    /// Whether anything but zeros follows the rows read
     has_dropped_rows: bool,
 }
 
@@ -1217,7 +1217,7 @@ fn read_journaled(
     let bytes = read_rows(driver, file, rows_at, file_len, 0)?;
     let (groups, valid) = read_groups_through(&bytes, tail.cut);
     tail.journal_len = valid as u64;
-    tail.has_dropped_rows = read_groups(&bytes).1 > valid;
+    tail.has_dropped_rows = bytes[valid..].iter().any(|byte| *byte != 0);
     let mut reader = SegmentReader::new(driver, file, rows_at);
     let mut ends = Vec::new();
     // A group is one write, so a batch comes back whole or not at all

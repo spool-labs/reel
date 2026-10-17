@@ -648,10 +648,9 @@ impl Sealed {
     ) -> Result<Option<(SegmentId, FooterRow)>> {
         let mut newest: Option<(SegmentId, FooterRow)> = None;
         self.each_row(way, key, |segment, found| {
-            // A rewrite keeps its record's number, so on a tie the row in a standing segment wins
+            // A copy keeps its record's number, so on a tie a standing segment wins, then the newer one
             let is_newer = newest.as_ref().is_none_or(|(held, newest)| {
-                newest.lsn < found.lsn
-                    || (newest.lsn == found.lsn && !stands(*held) && stands(segment))
+                (newest.lsn, stands(*held), *held) < (found.lsn, stands(segment), segment)
             });
             if is_newer {
                 newest = Some((segment, found));
@@ -1604,6 +1603,24 @@ mod tests {
         fixture.bury(2);
 
         assert_eq!(fixture.drain(&mut playback()), vec![1, 3, 4]);
+    }
+
+    // a source and its copy tie on the record's number, and playback reads the copy
+    #[test]
+    fn a_tie_plays_back_the_copy() {
+        for footers in [
+            [(SegmentId(2), &[1u8][..]), (SegmentId(19), &[1u8][..])],
+            [(SegmentId(19), &[1u8][..]), (SegmentId(2), &[1u8][..])],
+        ] {
+            let fixture = Fixture::new(&footers);
+            for (segment, _) in footers {
+                fixture.seal(segment, 1, 1);
+            }
+            let mut page = KeyPage::merging();
+            assert_eq!(fixture.page(&mut playback(), &mut page), vec![1]);
+            let found = page.found_at(0).expect("an entry");
+            assert_eq!(found.loc.segment, SegmentId(19), "the punched source won the tie");
+        }
     }
 
     // a map page of graves leaves the page short, so the fill goes on to the keys past it

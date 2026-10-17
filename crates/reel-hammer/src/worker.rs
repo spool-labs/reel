@@ -87,7 +87,7 @@ struct TapeRow {
     next_track: u64,
 }
 
-/// The one writer: it calls the store, logs what returned and keeps the model
+/// The one writer: it logs each op, calls the store and keeps the model
 struct Writer {
     store: Arc<ReelStore>,
     log: OpLog,
@@ -107,6 +107,7 @@ impl Writer {
         let value = value_of(column, &key, version, len, plain(column));
         let len = value.len() as u32;
         let name = column_name(column)?;
+        self.log_op(Op::Put { column, key: key.clone(), version, len })?;
         match self.batch.as_mut() {
             Some(batch) => batch.put(name, &key, &value),
             None => {
@@ -115,13 +116,14 @@ impl Writer {
                 self.stats.put.record(start.elapsed(), value.len());
             }
         }
-        self.held.insert((column, key.clone()), Held { version, len });
-        self.log_op(Op::Put { column, key, version, len })
+        self.held.insert((column, key), Held { version, len });
+        Ok(())
     }
 
     fn delete(&mut self, column: u8, key: Vec<u8>) -> Result<(), String> {
         let version = self.take_version();
         let name = column_name(column)?;
+        self.log_op(Op::Delete { column, key: key.clone(), version })?;
         match self.batch.as_mut() {
             Some(batch) => batch.delete(name, &key),
             None => {
@@ -130,8 +132,8 @@ impl Writer {
                 self.stats.delete.record(start.elapsed(), 0);
             }
         }
-        self.held.remove(&(column, key.clone()));
-        self.log_op(Op::Delete { column, key, version })
+        self.held.remove(&(column, key));
+        Ok(())
     }
 
     fn delete_if_held(&mut self, column: u8, key: Vec<u8>) -> Result<(), String> {
@@ -146,7 +148,9 @@ impl Writer {
         self.version - 1
     }
 
-    /// A batch's ops reach the log once the batch has landed
+    /// An op reaches the log before its call, so a kill in between leaves an op the volume may lack
+    ///
+    /// A batch's ops wait and reach the log together, just before the batch is written.
     fn log_op(&mut self, op: Op) -> Result<(), String> {
         match self.batch.is_some() {
             true => {
@@ -161,16 +165,17 @@ impl Writer {
         let Some(batch) = self.batch.take() else {
             return Ok(());
         };
+        self.log.append(&Op::BatchBegin)?;
+        for op in std::mem::take(&mut self.pending) {
+            self.log.append(&op)?;
+        }
+        self.log.append(&Op::BatchEnd)?;
         let start = Instant::now();
         self.store
             .write_batch(batch)
             .map_err(|error| format!("write_batch: {error}"))?;
         self.stats.batch.record(start.elapsed(), 0);
-        self.log.append(&Op::BatchBegin)?;
-        for op in std::mem::take(&mut self.pending) {
-            self.log.append(&op)?;
-        }
-        self.log.append(&Op::BatchEnd)
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<(), String> {

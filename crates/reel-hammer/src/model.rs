@@ -117,7 +117,7 @@ pub fn check_window(column: u8, key: &[u8], held: Held, offset: usize, window: &
     Ok(())
 }
 
-/// A worker appends one record per call that returned, in one write each
+/// A worker appends one record before each call, in one write each
 pub struct OpLog {
     file: File,
 }

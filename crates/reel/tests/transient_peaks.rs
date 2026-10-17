@@ -1,4 +1,4 @@
-//! The peak heap that a short walk takes, counted by the global allocator
+//! The peak heap that a short walk and a seal take, counted by the global allocator
 //! Run with `cargo test --release -p tape-reel --test transient_peaks -- --nocapture`
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -7,6 +7,10 @@ use std::sync::Mutex;
 
 use tempfile::TempDir;
 
+use reel::format::column::RecordKey;
+use reel::format::footer::{FooterEntry, SegmentFooter};
+use reel::format::lsn::Lsn;
+use reel::format::record::Flags;
 use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
     ThreadBudget,
@@ -198,5 +202,40 @@ fn a_short_walk_reads_no_whole_footers() {
         worst < WALK_CEILING,
         "a short walk peaked at {:.2} MiB",
         mib(worst)
+    );
+}
+
+/// Rows in the footer a seal replaces
+const SEALED_ROWS: u64 = 100_000;
+
+/// A fresh footer may reserve this much, whatever the footer before it held
+const FRESH_CEILING: usize = 64 * 1024;
+
+// the footer a seal starts the next segment with reserves nothing for the old footer's rows
+#[test]
+fn a_seal_reserves_no_old_footer() {
+    let _turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut last = SegmentFooter::empty();
+    for row in 0..SEALED_ROWS {
+        let key = RecordKey::from_bytes(ColumnId(2), &filler_key(row)).expect("key");
+        last.push(&FooterEntry::new(
+            key,
+            Lsn(row + 1),
+            row as u32,
+            1,
+            Flags::DATA,
+        ));
+    }
+
+    let (fresh, next) = peak_of(|| last.empty_like());
+    println!(
+        "a fresh footer after {SEALED_ROWS} rows took {:.2} MiB",
+        mib(fresh)
+    );
+    assert!(next.is_empty(), "the fresh footer holds no rows");
+    assert!(
+        fresh < FRESH_CEILING,
+        "the fresh footer reserved {:.2} MiB",
+        mib(fresh)
     );
 }

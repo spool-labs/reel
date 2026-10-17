@@ -620,14 +620,13 @@ impl SegmentFooter {
         }
     }
 
-    /// An empty footer with room for as many rows as this one holds, column by column
+    /// An empty footer with this one's columns, its rows grown as the next segment fills
     pub fn empty_like(&self) -> SegmentFooter {
         let mut footer = SegmentFooter::empty();
         for held in &self.partitions {
-            let mut partition = FooterPartition::new(held.column, held.key_width);
-            partition.packed.reserve(held.packed.len());
-            partition.starts.reserve(held.starts.len());
-            footer.partitions.push(partition);
+            footer
+                .partitions
+                .push(FooterPartition::new(held.column, held.key_width));
         }
         footer
     }

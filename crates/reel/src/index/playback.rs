@@ -1,22 +1,23 @@
 //! One ordered run of a paged column, taken from the map and the footers at once
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use std::ops::Bound;
 
-use crate::error::Result;
+use crate::error::{ReelError, Result};
 use crate::format::column::{ColumnId, KeyBytes, MAX_KEY_LEN};
-use crate::format::footer::{FooterPartition, FooterRow, SegmentFooter};
+use crate::format::footer::{FooterRow, SegmentFooter};
 use crate::format::loc::{Loc, SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
+use crate::format::prefix::PackedCursor;
 use crate::index::column::{is_past, ColumnIndex};
 use crate::index::counters::SegmentTable;
 use crate::index::entry::Entry;
 use crate::index::keyrun::{
-    is_vanished, FooterRows, KeyRun, KeyRunSet, RowReader, RunColumn, RunRow, RunViews,
+    is_vanished, vanished, FooterRows, KeyRun, KeyRunSet, RowReader, RunColumn, RunRow, RunViews,
 };
 use crate::index::page::KeyPage;
-use crate::index::paged::{FooterSource, SealedRanges};
+use crate::index::paged::{FooterSource, MappedRows, SealedRanges};
 
 /// One paged column's three sources: its map, what it has sealed, and the footers
 pub struct Paged<'a> {
@@ -67,6 +68,12 @@ pub struct RunSet {
     generation: u64,
     runs: Vec<Run>,
     stamps: Vec<(SegmentId, SegmentIncarnation)>,
+
+    /// Where a footer run's rows are read from once a cursor needs them
+    footers: Arc<dyn FooterSource>,
+
+    /// The column the runs hold
+    column: ColumnId,
 }
 
 impl RunSet {
@@ -79,6 +86,22 @@ impl RunSet {
             Ok(at) => self.stamps[at].1,
             Err(_) => SegmentIncarnation::NONE,
         }
+    }
+
+    /// A footer run's rows, opened on the first ask, or nothing once its segment is gone
+    fn rows_of<'a>(
+        &self,
+        segment: SegmentId,
+        rows: &'a OnceLock<ColumnRows>,
+    ) -> Result<Option<&'a ColumnRows>> {
+        if let Some(opened) = rows.get() {
+            return Ok(Some(opened));
+        }
+        // A gone segment stays unopened, so a walk that retries reads it as gone again
+        let Some(opened) = ColumnRows::open(self.footers.as_ref(), segment, self.column)? else {
+            return Ok(None);
+        };
+        Ok(Some(rows.get_or_init(|| opened)))
     }
 }
 
@@ -98,6 +121,8 @@ impl WalkRuns {
     fn current(
         &self,
         generation: u64,
+        footers: &Arc<dyn FooterSource>,
+        column: ColumnId,
         open: impl FnOnce() -> Result<(Vec<Run>, Vec<(SegmentId, SegmentIncarnation)>)>,
     ) -> Result<Arc<RunSet>> {
         let slot = &self.slots[RUN_SLOT.with(|slot| *slot)];
@@ -110,6 +135,8 @@ impl WalkRuns {
             generation,
             runs,
             stamps,
+            footers: Arc::clone(footers),
+            column,
         });
         *held = Some(Arc::clone(&set));
         Ok(set)
@@ -146,14 +173,12 @@ enum Run {
         /// The segment holding these rows and their records
         segment: SegmentId,
 
-        /// The whole footer, held so stepping a row costs no read
-        footer: Arc<SegmentFooter>,
+        /// The segment's lowest and highest key, which place a cursor before its rows open
+        lowest: KeyBytes,
+        highest: KeyBytes,
 
-        /// Which of the footer's partitions holds this column
-        partition: usize,
-
-        /// The lead of every `LEAD_STRIDE`th row, so a search starts within a stride of its answer
-        leads: Vec<u64>,
+        /// The column's rows in that footer, opened when a cursor first reaches them
+        rows: OnceLock<ColumnRows>,
     },
 
     /// One column of a key run, each row pointing at a footer row, and what its readers share
@@ -164,26 +189,86 @@ enum Run {
     },
 }
 
-/// Rows between two sampled leads of a footer run
-const LEAD_STRIDE: usize = 64;
+/// One column's rows in a sealed segment's footer
+enum ColumnRows {
+    /// Read in place through the segment's mapping, so a walk decodes only the rows it steps
+    Mapped(Arc<MappedRows>),
 
-/// The lead of every `LEAD_STRIDE`th row of a partition
-fn sampled_leads(rows: &FooterPartition) -> Vec<u64> {
-    (0..rows.len())
-        .step_by(LEAD_STRIDE)
-        .map(|row| rows.key_at(row).map_or(0, lead_of))
-        .collect()
+    /// A footer parsed whole, for a segment that does not map
+    Whole(Arc<SegmentFooter>, usize),
 }
 
-/// Narrow a key's row search to the strides the sampled leads cannot rule out
-fn lead_window(leads: &[u64], key: &[u8], count: usize) -> (usize, usize) {
-    let lead = lead_of(key);
-    let below = leads.partition_point(|&held| held < lead);
-    let past = leads.partition_point(|&held| held <= lead);
-    (
-        below.saturating_sub(1) * LEAD_STRIDE,
-        (past * LEAD_STRIDE).min(count),
-    )
+impl ColumnRows {
+    /// One segment's rows for a column, or nothing once the segment is gone
+    fn open(
+        footers: &dyn FooterSource,
+        segment: SegmentId,
+        column: ColumnId,
+    ) -> Result<Option<ColumnRows>> {
+        if let Some(mapped) = footers.mapped_rows(segment, column)? {
+            return Ok(Some(ColumnRows::Mapped(mapped)));
+        }
+        let Some(footer) = footers.footer(segment)? else {
+            return Ok(None);
+        };
+        let partition = footer
+            .partitions
+            .iter()
+            .position(|rows| rows.column == column);
+        Ok(partition.map(|partition| ColumnRows::Whole(footer, partition)))
+    }
+
+    /// How many rows the column has here
+    fn len(&self) -> usize {
+        match self {
+            ColumnRows::Mapped(rows) => rows.rows(),
+            ColumnRows::Whole(footer, partition) => footer.partitions[*partition].len(),
+        }
+    }
+
+    /// The key and row at a place, a packed one decoded by `cursor`
+    #[inline]
+    fn read<'a>(
+        &'a self,
+        cursor: &'a mut PackedCursor,
+        row: usize,
+    ) -> Result<(&'a [u8], FooterRow)> {
+        match self {
+            ColumnRows::Mapped(rows) => rows.read(cursor, row as u32),
+            ColumnRows::Whole(footer, partition) => {
+                let rows = &footer.partitions[*partition];
+                let key = rows.key_at(row).ok_or_else(|| {
+                    ReelError::Corruption(format!("a playback read past a footer's rows at {row}"))
+                })?;
+                Ok((key, rows.row_at(row)?))
+            }
+        }
+    }
+
+    /// The first row whose key passes `key`, or reaches it when `past_equal` is false
+    fn bound(&self, cursor: &mut PackedCursor, key: &[u8], past_equal: bool) -> Result<usize> {
+        let (mut low, mut high) = (0, self.len());
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let (held, _) = self.read(cursor, mid)?;
+            let is_before = match past_equal {
+                true => held <= key,
+                false => held < key,
+            };
+            match is_before {
+                true => low = mid + 1,
+                false => high = mid,
+            }
+        }
+        Ok(low)
+    }
+}
+
+/// A footer cursor's decoder and a copy of the key it stands on
+#[derive(Default)]
+struct Place {
+    cursor: PackedCursor,
+    key: Vec<u8>,
 }
 
 /// A key run cursor's place and its row, if any, with the key copied into the caller's buffer
@@ -263,6 +348,9 @@ struct Head {
 
     /// Whether the cursor has passed the last row in its direction
     is_spent: bool,
+
+    /// Whether the cursor stands on its segment's key range edge with the rows still unopened
+    is_shut: bool,
 }
 
 impl Head {
@@ -272,6 +360,7 @@ impl Head {
         first: 0,
         last: 0,
         is_spent: true,
+        is_shut: false,
     };
 
     /// The head of a cursor on a run's only row of a key
@@ -282,72 +371,103 @@ impl Head {
             first: row,
             last: row,
             is_spent: false,
+            is_shut: false,
+        }
+    }
+
+    /// The head of a footer cursor opened at a bound, standing shut where its rows lie past it
+    fn shut_or_placed(
+        set: &RunSet,
+        run: &Run,
+        place: &mut Place,
+        way: Way,
+        from: Bound<&[u8]>,
+    ) -> Result<Head> {
+        let Run::Footer {
+            segment,
+            lowest,
+            highest,
+            rows,
+        } = run
+        else {
+            return Ok(Head::SPENT);
+        };
+        let (near, far) = match way {
+            Way::Up => (lowest.as_slice(), highest.as_slice()),
+            Way::Down => (highest.as_slice(), lowest.as_slice()),
+        };
+        // Whether a key of the segment's range lies on the walk's side of the bound
+        let reaches = |key: &[u8]| match (way, from) {
+            (_, Bound::Unbounded) => true,
+            (Way::Up, Bound::Included(bound)) => key >= bound,
+            (Way::Up, Bound::Excluded(bound)) => key > bound,
+            (Way::Down, Bound::Included(bound)) => key <= bound,
+            (Way::Down, Bound::Excluded(bound)) => key < bound,
+        };
+        if !reaches(far) {
+            return Ok(Head::SPENT);
+        }
+        if reaches(near) {
+            place.key.clear();
+            place.key.extend_from_slice(near);
+            return Ok(Head {
+                is_shut: true,
+                ..Head::on(near, 0)
+            });
+        }
+        // A segment retired since the range read is gone, its live rows already copied on
+        match set.rows_of(*segment, rows)? {
+            Some(rows) => Head::placed(rows, place, way, from),
+            None => Ok(Head::SPENT),
         }
     }
 
     /// The head of a cursor stepping onto a key's near end, so only the far end needs finding
-    fn at(rows: &FooterPartition, way: Way, row: usize) -> Head {
-        let Some(key) = rows.key_at(row) else {
-            return Head::SPENT;
-        };
+    fn at(rows: &ColumnRows, place: &mut Place, way: Way, row: usize) -> Result<Head> {
+        let count = rows.len();
+        if row >= count {
+            return Ok(Head::SPENT);
+        }
+        let Place { cursor, key } = place;
+        key.clear();
+        key.extend_from_slice(rows.read(cursor, row)?.0);
         let (mut first, mut last) = (row, row);
         match way {
             Way::Up => {
-                while rows.key_at(last + 1) == Some(key) {
+                while last + 1 < count && rows.read(cursor, last + 1)?.0 == key.as_slice() {
                     last += 1;
                 }
             }
             Way::Down => {
-                while first > 0 && rows.key_at(first - 1) == Some(key) {
+                while first > 0 && rows.read(cursor, first - 1)?.0 == key.as_slice() {
                     first -= 1;
                 }
             }
         }
-        Head {
+        Ok(Head {
             lead: head_lead(key),
             len: key.len(),
             first,
             last,
             is_spent: false,
-        }
+            is_shut: false,
+        })
     }
 
     /// Where a cursor opened at a bound first stands
-    fn placed(rows: &FooterPartition, leads: &[u64], way: Way, from: Bound<&[u8]>) -> Head {
-        let count = rows.len();
-        let (Some(low), Some(high)) = (
-            rows.key_at(0),
-            count.checked_sub(1).and_then(|last| rows.key_at(last)),
-        ) else {
-            return Head::SPENT;
-        };
-        let lower_bound = |key: &[u8]| {
-            let (start, end) = lead_window(leads, key, count);
-            rows.bound_within(key, start, end, false)
-        };
-        let upper_bound = |key: &[u8]| {
-            let (start, end) = lead_window(leads, key, count);
-            rows.bound_within(key, start, end, true)
-        };
+    fn placed(rows: &ColumnRows, place: &mut Place, way: Way, from: Bound<&[u8]>) -> Result<Head> {
+        let cursor = &mut place.cursor;
         let row = match (way, from) {
-            (Way::Up, Bound::Included(key)) if key > high => None,
-            (Way::Up, Bound::Excluded(key)) if key >= high => None,
-            (Way::Down, Bound::Included(key)) if key < low => None,
-            (Way::Down, Bound::Excluded(key)) if key <= low => None,
             (Way::Up, Bound::Unbounded) => Some(0),
-            (Way::Up, Bound::Included(key)) if key <= low => Some(0),
-            (Way::Up, Bound::Included(key)) => Some(lower_bound(key)),
-            (Way::Up, Bound::Excluded(key)) if key < low => Some(0),
-            (Way::Up, Bound::Excluded(key)) => Some(upper_bound(key)),
-            (Way::Down, Bound::Unbounded) => Some(count - 1),
-            (Way::Down, Bound::Included(key)) if key >= high => Some(count - 1),
-            (Way::Down, Bound::Included(key)) => upper_bound(key).checked_sub(1),
-            (Way::Down, Bound::Excluded(key)) if key > high => Some(count - 1),
-            (Way::Down, Bound::Excluded(key)) => lower_bound(key).checked_sub(1),
+            (Way::Up, Bound::Included(key)) => Some(rows.bound(cursor, key, false)?),
+            (Way::Up, Bound::Excluded(key)) => Some(rows.bound(cursor, key, true)?),
+            (Way::Down, Bound::Unbounded) => rows.len().checked_sub(1),
+            (Way::Down, Bound::Included(key)) => rows.bound(cursor, key, true)?.checked_sub(1),
+            (Way::Down, Bound::Excluded(key)) => rows.bound(cursor, key, false)?.checked_sub(1),
         };
         match row {
-            Some(row) => Head::at(rows, way, row),
-            None => Head::SPENT,
+            Some(row) => Head::at(rows, place, way, row),
+            None => Ok(Head::SPENT),
         }
     }
 }
@@ -362,14 +482,6 @@ fn head_lead(key: &[u8]) -> u128 {
     let led = key.len().min(LEAD_BYTES);
     lead[..led].copy_from_slice(&key[..led]);
     u128::from_be_bytes(lead)
-}
-
-/// A key's leading eight bytes as an integer, which orders keys whenever two leads differ
-fn lead_of(key: &[u8]) -> u64 {
-    let mut lead = [0u8; 8];
-    let led = key.len().min(8);
-    lead[..led].copy_from_slice(&key[..led]);
-    u64::from_be_bytes(lead)
 }
 
 /// A key run cursor's reader, and the key and row it stands on
@@ -391,6 +503,9 @@ struct Sealed {
 
     /// Each key run cursor's reader and the key and row it stands on, nothing for a footer cursor
     keyed: Vec<Option<Keyed>>,
+
+    /// Each footer cursor's decoder and key, left empty for a key run cursor
+    placed: Vec<Place>,
 
     /// Each node's loser, and at 0 the cursor holding the next key
     tree: Vec<usize>,
@@ -433,6 +548,7 @@ impl Sealed {
         self.at.clear();
         self.heads.clear();
         self.keyed.clear();
+        self.placed.clear();
         self.tree.clear();
     }
 
@@ -452,9 +568,7 @@ impl Sealed {
             return None;
         }
         match self.run(at) {
-            Run::Footer {
-                footer, partition, ..
-            } => footer.partitions[*partition].key_at(head.first),
+            Run::Footer { .. } => Some(self.placed[at].key.as_slice()),
             Run::Keys { .. } => self.keyed[at].as_ref().map(|keyed| keyed.key.as_slice()),
         }
     }
@@ -474,10 +588,52 @@ impl Sealed {
         (self.key_of(at) == Some(key)).then_some(at)
     }
 
+    /// Open the front cursor's rows while it stands shut on a key `opens` wants read
+    fn settle(&mut self, way: Way, opens: impl Fn(&[u8]) -> bool) -> Result<()> {
+        while let Some(&at) = self.tree.first() {
+            let head = self.heads[at];
+            if head.is_spent || !head.is_shut || !opens(&self.placed[at].key) {
+                return Ok(());
+            }
+            let Sealed {
+                set,
+                at: runs_at,
+                heads,
+                placed,
+                ..
+            } = &mut *self;
+            let set = set.as_ref().expect("cursors stand in a set");
+            let Run::Footer { segment, rows, .. } = &set.runs[runs_at[at] as usize] else {
+                return Ok(());
+            };
+            // A segment retired under the walk sends it back to reopen on the sealed set that followed
+            let Some(rows) = set.rows_of(*segment, rows)? else {
+                return Err(vanished(*segment));
+            };
+            let near = match way {
+                Way::Up => Some(0),
+                Way::Down => rows.len().checked_sub(1),
+            };
+            heads[at] = match near {
+                Some(row) => Head::at(rows, &mut placed[at], way, row)?,
+                None => Head::SPENT,
+            };
+            // The rows begin at or past the range edge, so the cursor only moves back in the tree
+            self.replay(way, at);
+        }
+        Ok(())
+    }
+
+    /// The front cursor standing on a key, its rows opened first if it stood shut there
+    fn settled_on(&mut self, way: Way, key: &[u8], lead: u128) -> Result<Option<usize>> {
+        self.settle(way, |shut| shut == key)?;
+        Ok(self.front_on(key, lead))
+    }
+
     /// Step every cursor standing on a key past it, reading none of their rows
     fn skip(&mut self, way: Way, key: &[u8]) -> Result<()> {
         let lead = head_lead(key);
-        while let Some(at) = self.front_on(key, lead) {
+        while let Some(at) = self.settled_on(way, key, lead)? {
             self.step(way, at)?;
         }
         Ok(())
@@ -512,21 +668,28 @@ impl Sealed {
         mut each: impl FnMut(SegmentId, FooterRow),
     ) -> Result<()> {
         let lead = head_lead(key);
-        while let Some(at) = self.front_on(key, lead) {
+        while let Some(at) = self.settled_on(way, key, lead)? {
             let head = self.heads[at];
-            match self.run(at) {
-                Run::Footer {
-                    segment,
-                    footer,
-                    partition,
-                    ..
-                } => {
+            let Sealed {
+                set,
+                at: runs_at,
+                keyed,
+                placed,
+                ..
+            } = &mut *self;
+            let set = set.as_ref().expect("cursors stand in a set");
+            match &set.runs[runs_at[at] as usize] {
+                Run::Footer { segment, rows, .. } => {
+                    let Some(rows) = set.rows_of(*segment, rows)? else {
+                        return Err(vanished(*segment));
+                    };
+                    let cursor = &mut placed[at].cursor;
                     for row in head.first..=head.last {
-                        each(*segment, footer.partitions[*partition].row_at(row)?);
+                        each(*segment, rows.read(cursor, row)?.1);
                     }
                 }
                 Run::Keys { .. } => {
-                    if let Some(keyed) = self.keyed[at].as_ref() {
+                    if let Some(keyed) = keyed[at].as_ref() {
                         let row = keyed.row;
                         let found = FooterRow {
                             lsn: row.lsn,
@@ -555,18 +718,17 @@ impl Sealed {
             at: runs_at,
             heads,
             keyed,
+            placed,
             ..
         } = self;
         let set = set.as_ref().expect("cursors stand in a set");
         let run = &set.runs[runs_at[at] as usize];
         heads[at] = match (next, run) {
             (None, _) => Head::SPENT,
-            (
-                Some(row),
-                Run::Footer {
-                    footer, partition, ..
-                },
-            ) => Head::at(&footer.partitions[*partition], way, row),
+            (Some(row), Run::Footer { segment, rows, .. }) => match set.rows_of(*segment, rows)? {
+                Some(rows) => Head::at(rows, &mut placed[at], way, row)?,
+                None => return Err(vanished(*segment)),
+            },
             (Some(row), Run::Keys { run, column, .. }) => {
                 let column = &run.columns()[*column];
                 let Some(keyed) = keyed[at].as_mut() else {
@@ -901,7 +1063,14 @@ fn merge_run(
     let mut exhausted = false;
 
     while out.len() < limit {
-        let Some(key) = next_key(resident.key_ref(taken), sealed, way, &mut want) else {
+        let ahead = resident.key_ref(taken);
+        // A shut cursor opens once its edge leads the map and stands inside the walk
+        sealed.settle(way, |shut| {
+            !is_past(borrowed_bound(end), shut)
+                && edge.is_none_or(|edge| !is_ahead(way, edge, shut))
+                && ahead.is_none_or(|ahead| !is_ahead(way, ahead, shut))
+        })?;
+        let Some(key) = next_key(ahead, sealed, way, &mut want) else {
             // A full map page may have keys past its edge, so only a short one ends the playback
             exhausted = resident.len() < limit;
             break;
@@ -1031,6 +1200,7 @@ fn fill_release_rows(
     let mut last_len = 0usize;
 
     while examined < limit {
+        sealed.settle(way, |shut| until.is_none_or(|until| shut < until))?;
         let Some(key) = next_key(None, sealed, way, &mut want) else {
             return Ok(ReleaseRun {
                 resume: None,
@@ -1097,7 +1267,8 @@ impl Paged<'_> {
     /// Open a cursor on every sealed segment whose keys reach into the playback
     fn open_sealed(&self, way: Way, from: Bound<&[u8]>, sealed: &mut Sealed) -> Result<()> {
         let generation = self.generation();
-        let set = self.runs.current(generation, || {
+        let runs = self.runs;
+        let set = runs.current(generation, self.footers, self.column, || {
             let mut runs = Vec::new();
             // Key runs stand in for the segments they cover, so those footers stay shut
             let covered = self.key_runs.covered();
@@ -1106,28 +1277,16 @@ impl Paged<'_> {
                 .iter()
                 .map(|segment| (*segment, self.segments.incarnation_of(*segment)))
                 .collect();
-            for segment in self.sealed.spanning(None, None) {
+            for (segment, lowest, highest) in self.sealed.spans() {
                 if covered.contains(&segment) {
                     continue;
                 }
                 stamps.push((segment, self.segments.incarnation_of(segment)));
-                // A segment retired since the range read is gone, its live rows already copied on
-                let Some(footer) = self.footers.footer(segment)? else {
-                    continue;
-                };
-                let Some(partition) = footer
-                    .partitions
-                    .iter()
-                    .position(|rows| rows.column == self.column)
-                else {
-                    continue;
-                };
-                let leads = sampled_leads(&footer.partitions[partition]);
                 runs.push(Run::Footer {
                     segment,
-                    footer,
-                    partition,
-                    leads,
+                    lowest,
+                    highest,
+                    rows: OnceLock::new(),
                 });
             }
             for run in self.key_runs.runs() {
@@ -1149,14 +1308,10 @@ impl Paged<'_> {
 
         sealed.clear();
         for (index, run) in set.runs.iter().enumerate() {
+            let mut place = Place::default();
             let (head, keyed) = match run {
-                Run::Footer {
-                    footer,
-                    partition,
-                    leads,
-                    ..
-                } => (
-                    Head::placed(&footer.partitions[*partition], leads, way, from),
+                Run::Footer { .. } => (
+                    Head::shut_or_placed(&set, run, &mut place, way, from)?,
                     None,
                 ),
                 Run::Keys { run, column, views } => {
@@ -1178,6 +1333,7 @@ impl Paged<'_> {
                 sealed.at.push(index as u32);
                 sealed.heads.push(head);
                 sealed.keyed.push(keyed);
+                sealed.placed.push(place);
             }
         }
         sealed.set = Some(set);
@@ -1379,6 +1535,42 @@ mod tests {
             fixture.opened(),
             2,
             "one open per segment for the whole playback, not per page"
+        );
+    }
+
+    // a walk opens only the footers whose keys it reaches
+    #[test]
+    fn a_short_walk_opens_only_the_footers_it_reaches() {
+        let fixture = Fixture::new(&[
+            (SegmentId(1), &[1, 2, 3, 4]),
+            (SegmentId(2), &[5, 6, 7, 8]),
+            (SegmentId(3), &[9, 10, 11, 12]),
+        ]);
+        fixture.seal(SegmentId(1), 1, 4);
+        fixture.seal(SegmentId(2), 5, 8);
+        fixture.seal(SegmentId(3), 9, 12);
+
+        let bound = [5u8; 8];
+        let mut up = PlaybackCursor::new(COLUMN, Way::Up, Bound::Included(&bound)).expect("up");
+        let mut page = KeyPage::with_lens();
+        assert_eq!(fixture.page(&mut up, &mut page), vec![5, 6]);
+        assert_eq!(
+            fixture.opened(),
+            1,
+            "only the segment holding the page opens"
+        );
+
+        let mut down = PlaybackCursor::new(COLUMN, Way::Down, Bound::Unbounded).expect("down");
+        assert_eq!(fixture.page(&mut down, &mut page), vec![12, 11]);
+        assert_eq!(
+            fixture.opened(),
+            2,
+            "a walk down opens the newest keys first"
+        );
+
+        assert_eq!(
+            fixture.drain(&mut down),
+            vec![10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
         );
     }
 

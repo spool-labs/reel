@@ -22,7 +22,7 @@ const POOLS: usize = 3;
 
 /// Where a paged index reads the footers it resolves its sealed keys through
 pub trait FooterSource: Send + Sync {
-    /// One sealed segment's footer, parsed whole since a playback cannot ask by key
+    /// One sealed segment's footer, parsed whole
     fn footer(&self, segment: SegmentId) -> Result<Option<Arc<SegmentFooter>>>;
 
     /// One sealed segment's footer for a single pass, leaving no copy in any cache
@@ -113,6 +113,13 @@ impl MappedRows {
                 rows: span.rows,
             },
         })
+    }
+
+    /// How many rows the partition holds
+    pub fn rows(&self) -> usize {
+        match self {
+            MappedRows::Strided { rows, .. } | MappedRows::Packed { rows, .. } => *rows,
+        }
     }
 
     /// The key and row at a place in the partition, a packed one decoded by `cursor`
@@ -409,6 +416,18 @@ impl SealedRanges {
             .iter()
             .filter(|(_, span)| span.as_ref().is_some_and(|span| reaches(span, low, high)))
             .map(|(segment, _)| *segment)
+            .collect()
+    }
+
+    /// Every segment with its lowest and highest key, oldest first
+    pub fn spans(&self) -> Vec<(SegmentId, KeyBytes, KeyBytes)> {
+        read(&self.ranges)
+            .by_segment
+            .iter()
+            .filter_map(|(segment, span)| {
+                let span = span.as_ref()?;
+                Some((*segment, span.lowest.clone(), span.highest.clone()))
+            })
             .collect()
     }
 

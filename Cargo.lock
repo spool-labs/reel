@@ -544,6 +544,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tape-reel-hammer"
+version = "0.3.3"
+dependencies = [
+ "clap",
+ "libc",
+ "rand",
+ "serde_json",
+ "tape-reel",
+ "tape-reel-core",
+ "tempfile",
+]
+
+[[package]]
 name = "tape-reel-mock"
 version = "0.3.3"
 dependencies = [

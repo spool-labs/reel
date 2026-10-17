@@ -1525,6 +1525,21 @@ mod tests {
         assert!(cache.get(SegmentId(9)).is_none());
     }
 
+    // an op after a crash errors at once and frees its slot
+    #[test]
+    fn an_op_after_a_crash_fails_at_once() {
+        let sim = SimIo::new(FaultPlan::new(1).with_crash(1));
+        let driver = Arc::new(IoDriver::new(Arc::new(sim.clone())));
+        let file = open(&driver, &Path::new("/reel").join("crash.reel"));
+
+        let written = driver.writev(file, 0, vec![WriteBuf::owned(b"payload".to_vec())]);
+
+        assert!(sim.is_crashed());
+        assert!(written.is_err());
+        assert!(sim.polls() <= 2, "{} polls after the crash", sim.polls());
+        assert_eq!(driver.outstanding(), 0);
+    }
+
     // a batch wider than the table goes down in runs
     #[test]
     fn a_wide_batch_goes_down_in_runs() {

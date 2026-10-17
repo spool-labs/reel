@@ -84,6 +84,7 @@ struct SimState {
     ops_submitted: u64,
     swallowed: u64,
     dropped: u64,
+    polls: u64,
 
     ready: VecDeque<Completion>,
     delayed: Vec<DelayedCompletion>,
@@ -117,6 +118,7 @@ impl SimState {
             ops_submitted: 0,
             swallowed: 0,
             dropped: 0,
+            polls: 0,
             ready: VecDeque::new(),
             delayed: Vec::new(),
             advise_traces: Vec::new(),
@@ -278,6 +280,11 @@ impl SimIo {
         lock(&self.shared.state).advise_traces.clone()
     }
 
+    /// Polls answered so far
+    pub fn polls(&self) -> u64 {
+        lock(&self.shared.state).polls
+    }
+
     /// Directory renames and unlinks, in the order they were applied
     pub fn dir_op_order(&self) -> Vec<String> {
         lock(&self.shared.state).dir_op_order.clone()
@@ -337,6 +344,7 @@ impl ReelIo for SimIo {
         let mut state = lock(&self.shared.state);
         if state.is_crashed {
             state.swallowed += ops.len() as u64;
+            refuse_all(&mut state, ops);
             return Ok(());
         }
 
@@ -345,10 +353,11 @@ impl ReelIo for SimIo {
         state.ops_submitted += submitted;
         state.widest_batch = state.widest_batch.max(ops.len());
         let mut effective = ops;
+        let mut cut = Vec::new();
         if let Some(crash_at) = state.plan.crash_at {
             if crash_at >= batch_start && crash_at < batch_start + effective.len() as u64 {
                 let keep = (crash_at - batch_start) as usize;
-                effective.truncate(keep);
+                cut = effective.split_off(keep);
                 state.is_crashed = true;
             }
         }
@@ -365,6 +374,7 @@ impl ReelIo for SimIo {
             let completion = execute_op(&mut state, op, position);
             route_completion(&mut state, position, completion);
         }
+        refuse_all(&mut state, cut);
 
         state.op_position = batch_start + submitted;
         Ok(())
@@ -372,6 +382,7 @@ impl ReelIo for SimIo {
 
     fn poll(&self, out: &mut Vec<Completion>) -> Result<usize> {
         let mut state = lock(&self.shared.state);
+        state.polls += 1;
 
         let delayed = std::mem::take(&mut state.delayed);
         let mut still_delayed = Vec::new();
@@ -459,6 +470,47 @@ fn count_toward_kill(state: &mut SimState) {
         Some(left) if left > 1 => state.kill_after = Some(left - 1),
         Some(_) | None => {}
     }
+}
+
+/// Answer each op with the crash error, so its caller fails at once and its slot comes free
+fn refuse_all(state: &mut SimState, ops: Vec<Op>) {
+    for op in ops {
+        state.ready.push_back(refused(op));
+    }
+}
+
+fn refused(op: Op) -> Completion {
+    let tag = op.tag();
+    let outcome = match op {
+        Op::Open { .. } => Outcome::Opened(Err(crashed())),
+        Op::Writev { bufs, .. } => Outcome::Wrote {
+            result: Err(crashed()),
+            bufs,
+        },
+        Op::Pread { buf, .. } => Outcome::Read {
+            result: Err(crashed()),
+            buf,
+        },
+        Op::PreadSplit { head, body, .. } => Outcome::ReadSplit {
+            result: Err(crashed()),
+            head,
+            body,
+        },
+        Op::List { .. } => Outcome::Listed(Err(crashed())),
+        Op::Length { .. } => Outcome::Length(Err(crashed())),
+        Op::SyncData { .. }
+        | Op::SyncFull { .. }
+        | Op::SyncRange { .. }
+        | Op::SyncDir { .. }
+        | Op::Rename { .. }
+        | Op::Unlink { .. }
+        | Op::Close { .. }
+        | Op::Allocate { .. }
+        | Op::Release { .. }
+        | Op::Truncate { .. }
+        | Op::Advise { .. } => Outcome::Done(Err(crashed())),
+    };
+    Completion { tag, outcome }
 }
 
 fn route_completion(state: &mut SimState, position: u64, completion: Completion) {
@@ -988,6 +1040,10 @@ fn no_such_file() -> ReelError {
         std::io::ErrorKind::NotFound,
         "no such reel file",
     ))
+}
+
+fn crashed() -> ReelError {
+    ReelError::Io(std::io::Error::other("the simulated process crashed"))
 }
 
 fn out_of_space() -> ReelError {

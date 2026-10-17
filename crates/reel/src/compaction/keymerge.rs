@@ -345,8 +345,11 @@ fn merge_column(
             }
             let (row, place) = cursors[top].row()?;
             seen += 1;
+            // A copy keeps its record's number, so on a tie the newer segment holds the copy
             if standing.contains(&row.loc.segment)
-                && newest.is_none_or(|(held, _)| held.lsn < row.lsn)
+                && newest.is_none_or(|(held, _)| {
+                    (held.lsn, held.loc.segment) < (row.lsn, row.loc.segment)
+                })
             {
                 newest = Some((row, place));
             }
@@ -459,5 +462,80 @@ fn sift_down(heap: &mut [usize], cursors: &[Cursor<'_>], mut at: usize) {
         }
         heap.swap(at, child);
         at = child;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::format::column::RecordKey;
+    use crate::format::footer::FooterEntry;
+    use crate::format::record::Flags;
+    use crate::io::fault::FaultPlan;
+    use crate::io::sim_backend::SimIo;
+    use crate::reel::segment::IoDriver;
+
+    const COLUMN: ColumnId = ColumnId(1);
+
+    /// The merge reads no footer through the source when every input is a segment's own
+    struct NoFooters;
+
+    impl FooterSource for NoFooters {
+        fn footer(&self, _segment: SegmentId) -> Result<Option<Arc<SegmentFooter>>> {
+            Ok(None)
+        }
+    }
+
+    /// A sealed segment holding one key at one sequence number
+    fn sealed(segment: SegmentId, offset: u32) -> Source {
+        let key = RecordKey::from_bytes(COLUMN, &[7; 8]).expect("key");
+        let row = FooterEntry::new(key, Lsn(5), offset, 100, Flags::DATA);
+        let mut footer = SegmentFooter::build(vec![row]);
+        let _ = footer.pack(0);
+        Source::Footer {
+            segment,
+            footer: Arc::new(footer),
+        }
+    }
+
+    // a source and its copy tie on the record's number, and the run points at the copy
+    #[test]
+    fn copy_wins() {
+        let sim = SimIo::new(FaultPlan::new(1));
+        let driver = Arc::new(IoDriver::new(Arc::new(sim)));
+        let footers: Arc<dyn FooterSource> = Arc::new(NoFooters);
+        let covered = [SegmentId(2), SegmentId(19)];
+        let sources = [sealed(covered[0], 100), sealed(covered[1], 900)];
+        let standing: HashSet<SegmentId> = covered.iter().copied().collect();
+        let graves = Graves {
+            footers: Arc::clone(&footers),
+            outside: Vec::new(),
+            settled: Lsn(u64::MAX),
+        };
+        let mut writer = RunWriter::create(&driver, Path::new("/runs"), 1).expect("create");
+        writer.begin_column(COLUMN).expect("column");
+        let mut report = MergeReport::default();
+        merge_column(
+            &footers,
+            &sources,
+            COLUMN,
+            &standing,
+            &covered,
+            &graves,
+            &mut writer,
+            &mut report,
+        )
+        .expect("merge");
+        let path = writer.finish(&covered).expect("finish");
+        let run = KeyRun::open(&driver, &path, 1).expect("open");
+        let column = run.column(COLUMN).expect("column");
+        assert_eq!(column.rows(), 1);
+        assert_eq!(
+            run.segment_of(run.pointer(column, 0)),
+            Some(covered[1]),
+            "the run points at the source"
+        );
     }
 }

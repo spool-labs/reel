@@ -6084,3 +6084,143 @@ fn a_torn_group_stays_buried_on_disk() {
     assert_eq!(third.get(&record(7, 2)).expect("get"), None, "a buried group came back");
     assert!(third.get(&record(7, 3)).expect("get").is_some(), "the new put held");
 }
+
+// a key run over a segment that reads as foreign gives way, so its other segments answer whole
+#[test]
+fn a_key_run_over_a_foreign_segment_gives_way() {
+    let config = || ReelConfig {
+        segment_bytes: ByteCount::from_bytes(16 * 1024),
+        sync: SyncPolicy::Never,
+        active_tails: ThreadBudget::threads(2),
+        ..ReelConfig::default()
+    };
+    let (store, sim) = sim_store(config());
+    // The open tail keeps the oldest version, under every sealed one
+    put_on_tail(&store, 0, &record(7, 0), vec![1; 300]);
+    let mut covered = Vec::new();
+    for round in 2..=11u8 {
+        for byte in 0..4u8 {
+            put_on_tail(&store, 1, &record(7, byte), vec![round; 300]);
+        }
+        store.flush().expect("flush");
+        covered.push(store.reel.tails()[1].seal().expect("seal"));
+    }
+    store.page_out_sealed().expect("page out");
+    assert!(store.merge_when_due().expect("merge").is_some());
+    store.flush().expect("flush");
+    let lost = *covered.last().expect("a covered segment");
+    let lost_path = Path::new(ROOT).join(segment_file_name(lost));
+    let mut image = sim.durable_image();
+    drop(store);
+    // The newest covered segment loses its header, so the open quarantines it
+    for (at, bytes) in image.iter_mut() {
+        if *at == lost_path {
+            bytes[..HEADER_LEN].fill(0);
+        }
+    }
+
+    let first_sim = SimIo::from_image(image);
+    let first =
+        ReelStore::open_with_io(PathBuf::from(ROOT), config(), COLUMNS, Arc::new(first_sim.clone()))
+            .expect("first open");
+    let answer = first.get(&record(7, 0)).expect("get");
+    assert_eq!(
+        answer,
+        Some(Value::new(vec![10; 300])),
+        "the newest version left was hidden"
+    );
+    // Every covered segment that stands retires, and the key keeps its answer
+    first.settle_sealed().expect("settle");
+    for segment in &covered[..covered.len() - 1] {
+        first
+            .compactor
+            .compact_segment(&first.reel, &first.index, *segment)
+            .expect("compact");
+    }
+    first.flush().expect("flush");
+    drop(first);
+    let second = reopen_image(first_sim.durable_image(), config());
+    assert_eq!(
+        second.get(&record(7, 0)).expect("get"),
+        answer,
+        "a retire changed what the key answers"
+    );
+}
+
+// an evicted record leaves a tombstone at its own number, so its retire revives no older version
+#[test]
+fn an_eviction_outlives_its_record() {
+    let config = || ReelConfig {
+        segment_bytes: ByteCount::from_bytes(16 * 1024),
+        sync: SyncPolicy::Never,
+        active_tails: ThreadBudget::threads(2),
+        verify_reads: true,
+        scrub_mbps: 1024,
+        ..ReelConfig::default()
+    };
+    for evicts in ["read", "compaction", "scrub"] {
+        let (store, sim) = sim_store(config());
+        put_on_tail(&store, 0, &record(7, 0), vec![1; 300]);
+        put_on_tail(&store, 1, &record(7, 0), vec![0xA7; 300]);
+        store.flush().expect("flush");
+        let sealed = store.reel.tails()[1].seal().expect("seal");
+        let path = Path::new(ROOT).join(segment_file_name(sealed));
+        let mut image = sim.durable_image();
+        drop(store);
+        // One payload byte rots, so the newer version fails its checksum
+        for (at, bytes) in image.iter_mut() {
+            if *at == path {
+                let rot = bytes
+                    .windows(300)
+                    .position(|window| window.iter().all(|byte| *byte == 0xA7))
+                    .expect("the payload");
+                bytes[rot] ^= 1;
+            }
+        }
+
+        let first_sim = SimIo::from_image(image);
+        let first = ReelStore::open_with_io(
+            PathBuf::from(ROOT),
+            config(),
+            COLUMNS,
+            Arc::new(first_sim.clone()),
+        )
+        .expect("first open");
+        first.settle_sealed().expect("settle");
+        match evicts {
+            "read" => assert_eq!(first.get(&record(7, 0)).expect("get"), None),
+            "scrub" => {
+                let mut hits = 0;
+                for _ in 0..64 {
+                    std::thread::sleep(Duration::from_millis(20));
+                    hits += first
+                        .compactor
+                        .scrub_pass(&first.reel, &first.index)
+                        .expect("scrub");
+                    if hits > 0 {
+                        break;
+                    }
+                }
+                assert_eq!(hits, 1, "the scrub found no rot");
+            }
+            _ => {}
+        }
+        first
+            .compactor
+            .compact_segment(&first.reel, &first.index, sealed)
+            .expect("compact");
+        assert_eq!(
+            first.get(&record(7, 0)).expect("get"),
+            None,
+            "{evicts}: the retire brought the older version back"
+        );
+        first.flush().expect("flush");
+        drop(first);
+        let second = reopen_image(first_sim.durable_image(), config());
+        assert_eq!(
+            second.get(&record(7, 0)).expect("get"),
+            None,
+            "{evicts}: the reopen brought the older version back"
+        );
+    }
+}

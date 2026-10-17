@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::units::ByteCount;
 
+use crate::compaction::compactor::evict_rotted;
 use crate::config::RepairPath;
 use crate::error::{ReelError, Result};
 use crate::format::column::{Codec, ColumnId, KeyRef, RecordKey};
@@ -1017,7 +1018,7 @@ impl ReelStore {
         key: &RecordKey,
         entry: Entry,
         read: RecordRead,
-        framed_nothing: &mut Option<Loc>,
+        framed_nothing: &mut Option<(Loc, Lsn)>,
     ) -> Result<Option<Resolved>> {
         match read {
             RecordRead::Found(payload) => Ok(Some(Resolved::Payload(payload))),
@@ -1029,14 +1030,14 @@ impl ReelStore {
                 )))
             }
             RecordRead::Corrupt => {
-                self.evict(key, entry.loc, "failed its checksum")?;
+                self.evict(key, entry.loc, entry.lsn, "failed its checksum")?;
                 Ok(Some(Resolved::Missing))
             }
             RecordRead::Gone if self.is_read_only => Ok(Some(Resolved::Unresolved)),
             // A retire ran under this read, so retry without evicting
             RecordRead::Gone => Ok(None),
             RecordRead::Stale => {
-                *framed_nothing = Some(entry.loc);
+                *framed_nothing = Some((entry.loc, entry.lsn));
                 Ok(None)
             }
             // Whole reads decode and the range door takes coded windows, so nothing here is coded
@@ -1045,18 +1046,23 @@ impl ReelStore {
     }
 
     /// After the retries, evict a location that never framed the record and answer missing
-    fn give_up(&self, key: &RecordKey, framed_nothing: Option<Loc>) -> Result<Resolved> {
+    fn give_up(&self, key: &RecordKey, framed_nothing: Option<(Loc, Lsn)>) -> Result<Resolved> {
         if self.is_read_only {
             return Ok(Resolved::Unresolved);
         }
-        if let Some(loc) = framed_nothing {
-            self.evict(key, loc, "never framed its record")?;
+        if let Some((loc, lsn)) = framed_nothing {
+            self.evict(key, loc, lsn, "never framed its record")?;
         }
         Ok(Resolved::Missing)
     }
 
-    fn evict(&self, key: &RecordKey, loc: Loc, why: &str) -> Result<()> {
-        if self.index.evict_at(key, loc)? {
+    fn evict(&self, key: &RecordKey, loc: Loc, lsn: Lsn, why: &str) -> Result<()> {
+        // A read-only open writes nothing, so its eviction lasts for this open alone
+        let is_evicted = match self.is_read_only {
+            true => self.index.evict_at(key, loc)?,
+            false => evict_rotted(&self.reel, &self.index, key, loc, lsn)?,
+        };
+        if is_evicted {
             tracing::warn!(
                 "evicted a record that {why} in segment {}",
                 loc.segment.as_u32()
@@ -1099,7 +1105,7 @@ struct Resolving {
     coded: bool,
 
     /// A location that framed nothing, kept so giving up can evict it
-    framed_nothing: Option<Loc>,
+    framed_nothing: Option<(Loc, Lsn)>,
 }
 
 impl Resolving {

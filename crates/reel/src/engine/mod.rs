@@ -316,7 +316,7 @@ impl ReelStore {
         };
         let compactor = Compactor::new(&config, capacity_bytes, fast_capacity);
 
-        let index = ReelIndex::new(columns)?;
+        let mut index = ReelIndex::new(columns)?;
         // The manifest lists every root before any read, so a missing mount fails here
         let dead: Vec<bool> = std::iter::once(false)
             .chain(config.volumes.iter().map(|volume| volume.dead))
@@ -336,7 +336,18 @@ impl ReelStore {
         if !is_read_only {
             index.key_runs().load(&driver, &root)?;
         }
-        let rebuilt = rebuild_reel(&driver, &roots, &dead, &index)?;
+        let mut rebuilt = rebuild_reel(&driver, &roots, &dead, &index)?;
+        // A run hides older rows behind the one it picked, so a run whose pick is unreadable goes
+        let quarantined: Vec<SegmentId> = rebuilt
+            .quarantined
+            .iter()
+            .map(|(segment, _)| *segment)
+            .collect();
+        if !is_read_only && index.key_runs().drop_covering(&quarantined) {
+            index = ReelIndex::new(columns)?;
+            index.key_runs().load(&driver, &root)?;
+            rebuilt = rebuild_reel(&driver, &roots, &dead, &index)?;
+        }
         // Compaction copies only declared columns, so a writable open must declare every column
         if let Some(column) = rebuilt.undeclared.filter(|_| !is_read_only) {
             return Err(ReelError::Config(format!(
@@ -344,7 +355,7 @@ impl ReelStore {
                 column.0,
             )));
         }
-        for path in &rebuilt.quarantined {
+        for (_, path) in &rebuilt.quarantined {
             tracing::warn!("quarantined a foreign reel segment at {}", path.display());
         }
         // Cut each walked tail to its length to free what a crash left reserved, best effort

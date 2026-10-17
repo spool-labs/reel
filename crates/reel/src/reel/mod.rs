@@ -2014,6 +2014,11 @@ impl Reel {
         self.route().append_tombstone(key, commit)
     }
 
+    /// Append a tombstone under an older record's own number, for a miss the index decided
+    pub fn bury(&self, key: RecordKey, lsn: Lsn) -> Result<Committed> {
+        self.route().append_carried_tombstone(key, lsn)
+    }
+
     /// Append a tombstone covering a half-open key range within one column
     pub fn delete_range(
         &self,

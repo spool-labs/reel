@@ -1242,7 +1242,7 @@ impl Compactor {
             // With peers the eviction queues a repair. A sole copy stays put, since a rewrite
             // would stamp a fresh checksum over rot.
             if reel.shared().config.repair == RepairPath::Peers {
-                if index.evict_at(&record.header.key, loc)? {
+                if evict_rotted(reel, index, &record.header.key, loc, record.header.lsn)? {
                     self.metrics.record_hits(1);
                     tracing::warn!(
                         "a record in segment {} fails its checksum, evicted so a peer can repair it",
@@ -1383,7 +1383,7 @@ impl Compactor {
             // the moment a pass is mid-sweep, for a test probing what a second caller sees
             crate::sync::rendezvous::at("scrub/segment");
             let step = self.scrub_segment(
-                shared,
+                reel,
                 index,
                 *segment,
                 resume,
@@ -1415,7 +1415,7 @@ impl Compactor {
     #[allow(clippy::too_many_arguments)]
     fn scrub_segment(
         &self,
-        shared: &Arc<ReelShared>,
+        reel: &Reel,
         index: &ReelIndex,
         segment: SegmentId,
         resume: Option<(u64, u64)>,
@@ -1423,6 +1423,7 @@ impl Compactor {
         budget: &mut u64,
         deadline: Instant,
     ) -> Result<ScrubStep> {
+        let shared = reel.shared();
         // a segment can retire between the plan and the pass
         let handle = match source_handle(shared, segment) {
             Ok(handle) => handle,
@@ -1458,7 +1459,7 @@ impl Compactor {
         let mut reader = SegmentReader::new(&shared.driver, handle.file(), region_end);
         reader.stock(std::mem::take(&mut *lock(&self.scrub_spare)));
         let step = self.scrub_reader(
-            shared,
+            reel,
             index,
             &handle,
             (from, region_end),
@@ -1475,7 +1476,7 @@ impl Compactor {
     #[allow(clippy::too_many_arguments)]
     fn scrub_reader(
         &self,
-        shared: &Arc<ReelShared>,
+        reel: &Reel,
         index: &ReelIndex,
         handle: &SegmentHandle,
         (from, region_end): (u64, u64),
@@ -1484,6 +1485,7 @@ impl Compactor {
         deadline: Instant,
         reader: &mut SegmentReader<'_>,
     ) -> Result<ScrubStep> {
+        let shared = reel.shared();
         let segment = handle.id();
         // A sealed segment is walked by its rows, so a given-back hole never ends the walk early
         match (
@@ -1498,7 +1500,7 @@ impl Compactor {
                     region_end,
                     deadline,
                 };
-                return self.scrub_rows(shared, &walk, reader, &footer, from, carried, budget);
+                return self.scrub_rows(reel, &walk, reader, &footer, from, carried, budget);
             }
             // an unsealed keyless segment holds no record the index points at
             (None, true) => {
@@ -1552,7 +1554,7 @@ impl Compactor {
                 // resolving so every read reports the loss.
                 match shared.config.repair {
                     RepairPath::Peers => {
-                        if index.evict_at(&record.header.key, loc)? {
+                        if evict_rotted(reel, index, &record.header.key, loc, record.header.lsn)? {
                             hits += 1;
                             tracing::warn!(
                                 "the scrub found a record in segment {} failing its checksum and evicted it",
@@ -1672,7 +1674,7 @@ impl Compactor {
     #[allow(clippy::too_many_arguments)]
     fn scrub_rows(
         &self,
-        shared: &Arc<ReelShared>,
+        reel: &Reel,
         walk: &RowScrub<'_>,
         reader: &mut SegmentReader<'_>,
         footer: &SegmentFooter,
@@ -1716,9 +1718,9 @@ impl Compactor {
             let is_intact =
                 payload.len() == record.header.length as usize && record.verify(payload);
             if !is_intact {
-                match shared.config.repair {
+                match reel.shared().config.repair {
                     RepairPath::Peers => {
-                        if walk.index.evict_at(&key, loc)? {
+                        if evict_rotted(reel, walk.index, &key, loc, record.header.lsn)? {
                             hits += 1;
                             tracing::warn!(
                                 "the scrub found a record in segment {} failing its checksum and evicted it",
@@ -1773,6 +1775,23 @@ fn should_carry(
         )?,
     };
     Ok(is_held_below || tombstone.lsn >= drop_floor)
+}
+
+/// Evict a rotted record and bury it under its own number, so a retire or a reopen keeps the miss
+pub(crate) fn evict_rotted(
+    reel: &Reel,
+    index: &ReelIndex,
+    key: &RecordKey,
+    loc: Loc,
+    lsn: Lsn,
+) -> Result<bool> {
+    if !index.evict_at(key, loc)? {
+        return Ok(false);
+    }
+    // The index alone keeps the miss, and the older versions it hides return once the record goes
+    let tombstone = reel.bury(key.clone(), lsn)?;
+    index.remove(key, lsn, tombstone.loc)?;
+    Ok(true)
 }
 
 impl Compactor {

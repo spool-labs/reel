@@ -620,6 +620,29 @@ impl KeyRunSet {
         retired
     }
 
+    /// Unlink every run that covers one of these segments, and say whether any went
+    pub fn drop_covering(&self, segments: &[SegmentId]) -> bool {
+        let mut held = crate::sync::write(&self.held);
+        let before = held.runs.len();
+        held.runs.retain(|run| {
+            let is_hit = run.covered.iter().any(|segment| segments.contains(segment));
+            if is_hit {
+                run.retire();
+            }
+            !is_hit
+        });
+        if held.runs.len() == before {
+            return false;
+        }
+        held.covered = held
+            .runs
+            .iter()
+            .flat_map(|kept| kept.covered.iter().copied())
+            .collect();
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        true
+    }
+
     /// Read back the key runs on disk, unlinking unreadable ones and any a newer run covers whole
     pub fn load(&self, driver: &Arc<IoDriver>, root: &Path) -> Result<()> {
         let mut runs = Vec::new();

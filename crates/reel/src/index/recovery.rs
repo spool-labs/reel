@@ -64,8 +64,8 @@ pub struct RebuiltReel {
     /// Which root holds each segment found off the first volume, exceptions only
     pub placements: Vec<(SegmentId, u8)>,
 
-    /// Files set aside as foreign or misplaced
-    pub quarantined: Vec<PathBuf>,
+    /// Segments set aside as foreign or misplaced, with their files
+    pub quarantined: Vec<(SegmentId, PathBuf)>,
 
     /// How far the rebuild read each tail's journal, and SEALED for a segment read from its footer
     pub consumed: HashMap<SegmentId, u64>,
@@ -199,7 +199,7 @@ pub fn rebuild_reel(
                         });
                     }
                 }
-                Loaded::Foreign => quarantined.push(path.clone()),
+                Loaded::Foreign => quarantined.push((*segment, path.clone())),
             }
             if held.len() >= FEED_WINDOW {
                 feed_held(&mut held, &mut resolver, &mut resumable)?;

@@ -5,8 +5,8 @@ use std::cell::RefCell;
 /// The smallest buffer worth pooling, since the allocator is cheap below it
 const MIN_POOLED: usize = 512;
 
-/// The largest buffer worth pooling, since a bigger high-water mark costs more than it saves
-const MAX_POOLED: usize = 16 * 1024 * 1024;
+/// The largest buffer worth pooling, since a class never holds more than its budget
+const MAX_POOLED: usize = CLASS_BUDGET;
 
 /// A size class never keeps more than this many buffers
 const PER_CLASS: usize = 4;
@@ -15,7 +15,7 @@ const PER_CLASS: usize = 4;
 const CLASS_BUDGET: usize = 2 * 1024 * 1024;
 
 /// Size classes, one per power of two from MIN_POOLED to MAX_POOLED
-const CLASSES: usize = 16;
+const CLASSES: usize = 13;
 
 thread_local! {
     /// This thread's spare payload buffers, bucketed by size class
@@ -42,7 +42,6 @@ const fn capacity_of(class: usize) -> usize {
 /// Buffers a class keeps, deep where they are small and shallow where they are not
 const fn depth_of(class: usize) -> usize {
     match CLASS_BUDGET / capacity_of(class) {
-        0 => 1,
         allowed if allowed > PER_CLASS => PER_CLASS,
         allowed => allowed,
     }
@@ -189,7 +188,7 @@ mod tests {
         for class in 0..CLASSES {
             let held = depth_of(class) * capacity_of(class);
             assert!(
-                held <= CLASS_BUDGET.max(capacity_of(class)),
+                held <= CLASS_BUDGET,
                 "class {class} holds {held} over its budget"
             );
         }
@@ -234,6 +233,16 @@ mod tests {
         give(bytes);
 
         assert!(take(MIN_POOLED).is_empty());
+    }
+
+    // a buffer bigger than a class's budget is never kept, so no thread pins one
+    #[test]
+    fn a_buffer_over_the_budget_is_dropped() {
+        let before = held_bytes();
+        for capacity in [2 * CLASS_BUDGET, 4 * CLASS_BUDGET, 8 * CLASS_BUDGET] {
+            give(take(capacity));
+        }
+        assert_eq!(held_bytes(), before, "a buffer over the budget stayed in the pool");
     }
 
     // a capacity to grow to is one the pool will take back

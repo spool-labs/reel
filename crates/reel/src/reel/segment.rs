@@ -1888,13 +1888,15 @@ mod tests {
         assert_eq!(driver.reclaimed(), 0);
     }
 
-    // an inline batch answers at submission too, whole and in order
+    // a posix batch goes to the pool and lands whole and in submit order
     #[test]
-    fn an_inline_batch_answers_at_the_first_poll() {
+    fn a_posix_batch_lands_in_order_from_the_pool() {
         let dir = tempdir().expect("tempdir");
         let driver = Arc::new(IoDriver::new(Arc::new(PosixBackend::new())));
-        let path = dir.path().join("inline-batch.reel");
+        let path = dir.path().join("pooled-batch.reel");
         let file = written(&driver, &path, b"payload");
+        let script = crate::sync::rendezvous::script();
+        script.hold("posix/pool-read");
 
         let ops = vec![
             read_op(&driver, file, 3),
@@ -1906,14 +1908,109 @@ mod tests {
         let woken = Arc::new(Counter(AtomicUsize::new(0)));
         let waker = Waker::from(Arc::clone(&woken));
         let mut cx = Context::from_waker(&waker);
+        assert!(
+            waiting.as_mut().poll(&mut cx).is_pending(),
+            "the batch ran on the caller's thread"
+        );
 
-        let landed = ready(waiting.as_mut().poll(&mut cx))
-            .expect("the batch answered inline")
-            .expect("submit");
+        script.release("posix/pool-read");
+        let landed = block_on(waiting).expect("submit");
         let answered: Vec<Tag> = landed.iter().map(|completion| completion.tag).collect();
         assert_eq!(answered, wanted);
-        assert_eq!(driver.wakers(), 0, "the first poll left a waker behind");
-        assert_eq!(woken.0.load(Ordering::SeqCst), 0);
+        assert_eq!(driver.wakers(), 0);
         assert_eq!(driver.outstanding(), 0);
+    }
+
+    /// A waker that records the thread a wake came from, then unparks the waiting thread
+    struct Witness {
+        waiter: thread::Thread,
+        woken_on: std::sync::Mutex<Option<thread::ThreadId>>,
+    }
+
+    impl Wake for Witness {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            *crate::sync::lock(&self.woken_on) = Some(thread::current().id());
+            self.waiter.unpark();
+        }
+    }
+
+    // an awaited posix read runs on a pool thread and wakes the caller from there
+    #[test]
+    fn an_awaited_posix_read_leaves_the_caller_thread() {
+        let dir = tempdir().expect("tempdir");
+        let driver = Arc::new(IoDriver::new(Arc::new(PosixBackend::new())));
+        let file = written(&driver, &dir.path().join("off-thread.reel"), b"payload");
+        let script = crate::sync::rendezvous::script();
+        script.hold("posix/pool-read");
+
+        let witness = Arc::new(Witness {
+            waiter: thread::current(),
+            woken_on: std::sync::Mutex::new(None),
+        });
+        let waker = Waker::from(Arc::clone(&witness));
+        let mut cx = Context::from_waker(&waker);
+        let mut waiting = Box::pin(driver.wait_op(read_op(&driver, file, 7)));
+        assert!(
+            waiting.as_mut().poll(&mut cx).is_pending(),
+            "the read ran on the caller's thread"
+        );
+
+        script.await_reached("posix/pool-read", 1);
+        script.release("posix/pool-read");
+        let completion = loop {
+            if let Some(answer) = ready(waiting.as_mut().poll(&mut cx)) {
+                break answer.expect("submit");
+            }
+            thread::park_timeout(Duration::from_millis(10));
+        };
+
+        assert_eq!(filled(completion).expect("a read came back"), b"payload");
+        let woken_on = *crate::sync::lock(&witness.woken_on);
+        assert!(woken_on.is_some(), "the landed read woke nothing");
+        assert_ne!(woken_on, Some(thread::current().id()));
+        assert_eq!(driver.outstanding(), 0);
+    }
+
+    // one thread keeps many awaited posix reads in flight at once
+    #[test]
+    fn awaited_posix_reads_overlap_on_one_thread() {
+        let dir = tempdir().expect("tempdir");
+        let driver = Arc::new(IoDriver::new(Arc::new(PosixBackend::new())));
+        let file = written(&driver, &dir.path().join("overlap.reel"), b"payload");
+        let script = crate::sync::rendezvous::script();
+        script.hold("posix/pool-read");
+        let flights = 8;
+
+        let woken = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&woken));
+        let mut cx = Context::from_waker(&waker);
+        let mut waiting: Vec<_> = (0..flights)
+            .map(|_| Box::pin(driver.wait_op(read_op(&driver, file, 7))))
+            .collect();
+        for wait in &mut waiting {
+            assert!(
+                wait.as_mut().poll(&mut cx).is_pending(),
+                "a read finished before the next one went down"
+            );
+        }
+
+        script.await_reached("posix/pool-read", flights as u64);
+        assert_eq!(driver.outstanding(), flights);
+        script.release("posix/pool-read");
+        for wait in &mut waiting {
+            let completion = loop {
+                if let Some(answer) = ready(wait.as_mut().poll(&mut cx)) {
+                    break answer.expect("submit");
+                }
+                thread::sleep(Duration::from_millis(1));
+            };
+            assert_eq!(filled(completion).expect("a read came back"), b"payload");
+        }
+        assert_eq!(driver.outstanding(), 0);
+        assert!(woken.0.load(Ordering::SeqCst) >= 1);
     }
 }

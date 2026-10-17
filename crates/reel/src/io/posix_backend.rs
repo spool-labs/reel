@@ -7,7 +7,10 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{
+    Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use libc::{c_int, c_void};
@@ -17,10 +20,11 @@ use crate::io::direct::{
     covering_span, cut_into, cut_split_into, wanted_window, AlignedBuf, DIRECT_ALIGN,
 };
 use crate::io::op::{
-    Advice, Completion, FileId, Op, Outcome, ReadBuf, SegmentEntry, SyncRangeMode, WriteBuf,
+    Advice, Completion, FileId, Op, Outcome, ReadBuf, SegmentEntry, SyncRangeMode, Tag, WriteBuf,
 };
+use crate::io::slots::SlotTable;
 use crate::io::{ReelIo, ServingBackend};
-use crate::sync::{lock, read, write};
+use crate::sync::{lock, read, wait, write};
 
 /// The most buffers one vectored call takes on Linux and macOS, so wider writes split
 pub(crate) const MAX_IOVECS: usize = 1024;
@@ -198,6 +202,8 @@ impl WarmCounts {
 /// Synchronous POSIX backend executing ops at submit and queuing completions
 #[derive(Debug)]
 pub struct PosixBackend {
+    /// Threads for awaited reads, declared first so they stop before the files close
+    pool: OnceLock<ReadPool>,
     files: RwLock<HashMap<FileId, OwnedFd>>,
     id: u64,
     closes: AtomicU64,
@@ -220,6 +226,7 @@ impl PosixBackend {
     /// Build a backend whose opens bypass the page cache on Linux when `is_direct` is set
     pub fn with_direct(is_direct: bool) -> PosixBackend {
         PosixBackend {
+            pool: OnceLock::new(),
             files: RwLock::new(HashMap::new()),
             id: NEXT_BACKEND.fetch_add(1, Ordering::Relaxed),
             closes: AtomicU64::new(0),
@@ -338,37 +345,23 @@ impl PosixBackend {
                 tag,
                 file,
                 offset,
-                mut buf,
-            } => {
-                let result = match self.fd_of(file) {
-                    Ok(fd) if self.is_direct => direct_pread(fd, &mut buf, offset),
-                    Ok(fd) => pread_into(fd, &mut buf, offset),
-                    Err(error) => Err(error),
-                };
-                Completion {
-                    tag,
-                    outcome: Outcome::Read { result, buf },
-                }
-            }
+                buf,
+            } => self.read_here(file, PooledRead::Whole { tag, offset, buf }),
             Op::PreadSplit {
                 tag,
                 file,
                 offset,
-                mut head,
-                mut body,
-            } => {
-                let result = match self.fd_of(file) {
-                    Ok(fd) if self.is_direct => {
-                        direct_pread_split(fd, &mut head, &mut body, offset)
-                    }
-                    Ok(fd) => preadv_into(fd, &mut head, &mut body, offset),
-                    Err(error) => Err(error),
-                };
-                Completion {
+                head,
+                body,
+            } => self.read_here(
+                file,
+                PooledRead::Split {
                     tag,
-                    outcome: Outcome::ReadSplit { result, head, body },
-                }
-            }
+                    offset,
+                    head,
+                    body,
+                },
+            ),
             Op::SyncData { tag, file } => Completion {
                 tag,
                 outcome: Outcome::Done(self.billed_sync(|| self.sync_data(file))),
@@ -538,6 +531,35 @@ impl PosixBackend {
     fn lock_completions(&self) -> MutexGuard<'_, VecDeque<Completion>> {
         lock(&self.completions)
     }
+
+    fn read_here(&self, file: FileId, read: PooledRead) -> Completion {
+        match self.fd_of(file) {
+            Ok(fd) => read.run(fd, self.is_direct),
+            Err(error) => read.refused(error),
+        }
+    }
+
+    /// Resolve a read's descriptor on this thread for a pool thread, or answer the error now
+    fn pool_job(
+        &self,
+        file: FileId,
+        read: PooledRead,
+        sink: &Arc<SlotTable>,
+    ) -> std::result::Result<PoolJob, Completion> {
+        self.ops.fetch_add(1, Ordering::Relaxed);
+        match self.fd_of(file) {
+            Ok(fd) => Ok(PoolJob {
+                fd,
+                read,
+                sink: Arc::clone(sink),
+            }),
+            Err(error) => Err(read.refused(error)),
+        }
+    }
+
+    fn pool(&self) -> &ReadPool {
+        self.pool.get_or_init(|| ReadPool::new(self.is_direct))
+    }
 }
 
 impl Default for PosixBackend {
@@ -597,6 +619,39 @@ impl ReelIo for PosixBackend {
         Ok(self.dispatch(op))
     }
 
+    /// Reads go to the pool so an awaited caller never blocks on one, other ops answer here
+    fn submit_detached(&self, ops: Vec<Op>, sink: &Arc<SlotTable>) -> Result<()> {
+        let mut jobs = Vec::with_capacity(ops.len());
+        let mut answered = Vec::new();
+        for op in ops {
+            let answer = match PooledRead::split_off(op) {
+                Ok((file, read)) => self.pool_job(file, read, sink),
+                Err(op) => Err(self.dispatch(op)),
+            };
+            match answer {
+                Ok(job) => jobs.push(job),
+                Err(completion) => answered.push(completion),
+            }
+        }
+        sink.file(&mut answered);
+        if !jobs.is_empty() {
+            self.pool().hand(jobs);
+        }
+        Ok(())
+    }
+
+    fn submit_detached_one(&self, op: Op, sink: &Arc<SlotTable>) -> Result<()> {
+        let answer = match PooledRead::split_off(op) {
+            Ok((file, read)) => self.pool_job(file, read, sink),
+            Err(op) => Err(self.dispatch(op)),
+        };
+        match answer {
+            Ok(job) => self.pool().hand(vec![job]),
+            Err(completion) => sink.file_one(completion),
+        }
+        Ok(())
+    }
+
     fn poll(&self, out: &mut Vec<Completion>) -> Result<usize> {
         let mut queue = self.lock_completions();
         let drained = queue.len();
@@ -604,6 +659,257 @@ impl ReelIo for PosixBackend {
             out.push(completion);
         }
         Ok(drained)
+    }
+}
+
+/// Most threads one backend's read pool runs, which caps its awaited reads in flight
+const POOL_THREADS: usize = 64;
+
+/// A read split from its op, so a pool thread runs it on a descriptor the caller resolved
+enum PooledRead {
+    /// One buffer, from an `Op::Pread`
+    Whole { tag: Tag, offset: u64, buf: ReadBuf },
+
+    /// A header and a payload, from an `Op::PreadSplit`
+    Split {
+        tag: Tag,
+        offset: u64,
+        head: ReadBuf,
+        body: ReadBuf,
+    },
+}
+
+impl PooledRead {
+    /// Take the read out of an op with its file, or hand back an op that reads nothing
+    fn split_off(op: Op) -> std::result::Result<(FileId, PooledRead), Op> {
+        match op {
+            Op::Pread {
+                tag,
+                file,
+                offset,
+                buf,
+            } => Ok((file, PooledRead::Whole { tag, offset, buf })),
+            Op::PreadSplit {
+                tag,
+                file,
+                offset,
+                head,
+                body,
+            } => Ok((
+                file,
+                PooledRead::Split {
+                    tag,
+                    offset,
+                    head,
+                    body,
+                },
+            )),
+            other => Err(other),
+        }
+    }
+
+    /// Run the read on this thread
+    fn run(self, fd: RawFd, is_direct: bool) -> Completion {
+        match self {
+            PooledRead::Whole {
+                tag,
+                offset,
+                mut buf,
+            } => {
+                let result = match is_direct {
+                    true => direct_pread(fd, &mut buf, offset),
+                    false => pread_into(fd, &mut buf, offset),
+                };
+                Completion {
+                    tag,
+                    outcome: Outcome::Read { result, buf },
+                }
+            }
+            PooledRead::Split {
+                tag,
+                offset,
+                mut head,
+                mut body,
+            } => {
+                let result = match is_direct {
+                    true => direct_pread_split(fd, &mut head, &mut body, offset),
+                    false => preadv_into(fd, &mut head, &mut body, offset),
+                };
+                Completion {
+                    tag,
+                    outcome: Outcome::ReadSplit { result, head, body },
+                }
+            }
+        }
+    }
+
+    /// Answer the read with an error, handing its buffers back
+    fn refused(self, error: ReelError) -> Completion {
+        match self {
+            PooledRead::Whole { tag, buf, .. } => Completion {
+                tag,
+                outcome: Outcome::Read {
+                    result: Err(error),
+                    buf,
+                },
+            },
+            PooledRead::Split {
+                tag, head, body, ..
+            } => Completion {
+                tag,
+                outcome: Outcome::ReadSplit {
+                    result: Err(error),
+                    head,
+                    body,
+                },
+            },
+        }
+    }
+}
+
+/// One read handed to the pool, with the table its completion lands in
+struct PoolJob {
+    fd: RawFd,
+    read: PooledRead,
+    sink: Arc<SlotTable>,
+}
+
+impl PoolJob {
+    fn finish(self, is_direct: bool) {
+        crate::sync::rendezvous::at("posix/pool-read");
+        self.sink.file_one(self.read.run(self.fd, is_direct));
+    }
+}
+
+/// The jobs waiting for a pool thread and the threads that take them
+struct PoolQueue {
+    jobs: VecDeque<PoolJob>,
+
+    /// Threads parked for a job
+    idle: usize,
+
+    /// Threads started, parked or busy
+    threads: usize,
+
+    /// Whether the pool is shutting down, after which threads exit once the queue is empty
+    is_stopping: bool,
+}
+
+/// The state a pool shares with its threads
+struct PoolShared {
+    queue: Mutex<PoolQueue>,
+
+    /// Signalled when a job arrives or the pool stops
+    ready: Condvar,
+
+    /// Whether the backend's descriptors bypass the page cache
+    is_direct: bool,
+}
+
+/// Threads that run awaited reads off the caller's thread, started as the reads in flight grow
+struct ReadPool {
+    shared: Arc<PoolShared>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for ReadPool {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("ReadPool").finish_non_exhaustive()
+    }
+}
+
+impl ReadPool {
+    fn new(is_direct: bool) -> ReadPool {
+        ReadPool {
+            shared: Arc::new(PoolShared {
+                queue: Mutex::new(PoolQueue {
+                    jobs: VecDeque::new(),
+                    idle: 0,
+                    threads: 0,
+                    is_stopping: false,
+                }),
+                ready: Condvar::new(),
+                is_direct,
+            }),
+            workers: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Queue jobs, waking parked threads and starting more while jobs outnumber them
+    fn hand(&self, jobs: Vec<PoolJob>) {
+        let (woken, started) = {
+            let mut queue = lock(&self.shared.queue);
+            queue.jobs.extend(jobs);
+            let waiting = queue.jobs.len();
+            let woken = waiting.min(queue.idle);
+            let started = (waiting - woken).min(POOL_THREADS - queue.threads);
+            queue.threads += started;
+            (woken, started)
+        };
+        for _ in 0..woken {
+            self.shared.ready.notify_one();
+        }
+        for _ in 0..started {
+            self.start();
+        }
+    }
+
+    /// Start one thread, or run the queue here when no thread can start at all
+    fn start(&self) {
+        let shared = Arc::clone(&self.shared);
+        let mut workers = lock(&self.workers);
+        let spawned = std::thread::Builder::new()
+            .name(format!("reel-read-{}", workers.len()))
+            .spawn(move || serve_reads(shared));
+        match spawned {
+            Ok(worker) => workers.push(worker),
+            Err(error) => {
+                tracing::warn!("a reel read thread failed to start: {error}");
+                let stranded = {
+                    let mut queue = lock(&self.shared.queue);
+                    queue.threads -= 1;
+                    match queue.threads {
+                        0 => std::mem::take(&mut queue.jobs),
+                        _ => VecDeque::new(),
+                    }
+                };
+                for job in stranded {
+                    job.finish(self.shared.is_direct);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ReadPool {
+    /// Stop every thread once the queue is empty, and wait for them
+    fn drop(&mut self) {
+        lock(&self.shared.queue).is_stopping = true;
+        self.shared.ready.notify_all();
+        for worker in lock(&self.workers).drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Take jobs until the pool stops and the queue is empty
+fn serve_reads(shared: Arc<PoolShared>) {
+    loop {
+        let job = {
+            let mut queue = lock(&shared.queue);
+            loop {
+                if let Some(job) = queue.jobs.pop_front() {
+                    break job;
+                }
+                if queue.is_stopping {
+                    return;
+                }
+                queue.idle += 1;
+                queue = wait(&shared.ready, queue);
+                queue.idle -= 1;
+            }
+        };
+        job.finish(shared.is_direct);
     }
 }
 

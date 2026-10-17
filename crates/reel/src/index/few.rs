@@ -243,6 +243,26 @@ impl<K: IndexKey, V: 'static, M: ShardMap<K, V>> ShardMap<K, V> for Few<K, V, M>
         }
     }
 
+    fn sweep(&mut self, mut keep: impl FnMut(&K, &V) -> bool) -> usize {
+        match self {
+            Few::Tree(tree) => tree.sweep(keep),
+            Few::Few { keys, vals } => {
+                let mut to = 0;
+                for at in 0..keys.len() {
+                    if keep(&keys[at], &vals[at]) {
+                        keys.swap(to, at);
+                        vals.swap(to, at);
+                        to += 1;
+                    }
+                }
+                let taken = keys.len() - to;
+                keys.truncate(to);
+                vals.truncate(to);
+                taken
+            }
+        }
+    }
+
     fn fit(&mut self) {
         match self {
             Few::Tree(tree) => tree.fit(),

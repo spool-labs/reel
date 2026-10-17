@@ -7,10 +7,15 @@ use std::sync::Mutex;
 
 use tempfile::TempDir;
 
-use reel::format::column::RecordKey;
+use reel::format::column::{KeyBytes, RecordKey};
 use reel::format::footer::{FooterEntry, SegmentFooter};
+use reel::format::loc::{Loc, SegmentId};
 use reel::format::lsn::Lsn;
 use reel::format::record::Flags;
+use reel::index::column::ColumnIndex;
+use reel::index::counters::SegmentTable;
+use reel::index::entry::Entry;
+use reel::index::paged::SealedRanges;
 use reel::{
     ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, KeyWidth, ReelConfig,
     ReelStore, SyncPolicy, ThreadBudget,
@@ -339,4 +344,86 @@ fn a_compaction_pass_reads_no_whole_footer() {
         "a compaction pass peaked at {:.2} MiB",
         mib(worst)
     );
+}
+
+/// The node's slice column: a two-byte spool, then a track address
+const SLICES: ColumnSpec = ColumnSpec {
+    id: ColumnId(14),
+    name: "slice",
+    key_width: KeyWidth::Fixed(34),
+    shard_bytes: 2,
+    purge_mark: None,
+    codec: Codec::None,
+};
+
+/// The segment every tombstone lands in, sealed before the prune
+const GRAVES_AT: SegmentId = SegmentId(2);
+
+/// A prune may add this much past the packed shard it builds
+const PRUNE_SLACK: usize = 1024 * 1024;
+
+/// One spool's key, its address spread like a hash
+fn slice_key(row: u64) -> [u8; 34] {
+    let mut key = [0u8; 34];
+    key[..2].copy_from_slice(&7u16.to_be_bytes());
+    let mut word = row;
+    for at in 0..4 {
+        word = word.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut mixed = word;
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        mixed ^= mixed >> 31;
+        key[2 + at * 8..10 + at * 8].copy_from_slice(&mixed.to_be_bytes());
+    }
+    key
+}
+
+/// A prune's peak over `rows` keys with nine in ten deleted, and the packed shard's heap
+fn prune_peak(rows: u64) -> (usize, usize) {
+    let index = ColumnIndex::new(&SLICES).expect("index");
+    let segments = SegmentTable::new();
+    for row in 0..rows {
+        let entry = Entry::new(Loc::new(SegmentId(1), row as u32, 10), Lsn(row + 1));
+        index.insert(&slice_key(row), entry, &segments, &|_, _| false);
+    }
+    let tombstone = Loc::new(GRAVES_AT, 0, 0);
+    for row in (0..rows).filter(|row| row % 10 != 0) {
+        index.remove(
+            &slice_key(row),
+            Lsn(rows + row + 1),
+            tombstone,
+            &segments,
+            &|_, _| false,
+        );
+    }
+    let sealed = SealedRanges::new();
+    let edge = KeyBytes::new(&[0u8; 34]).expect("key");
+    sealed.note(GRAVES_AT, edge.clone(), edge);
+
+    let empty = ColumnIndex::new(&SLICES).expect("index").heap_bytes();
+    let (peak, pruned) = peak_of(|| index.prune_tombstones(Lsn(u64::MAX), &sealed));
+    assert_eq!(pruned, rows - rows.div_ceil(10), "every grave was prunable");
+    for row in (0..rows).step_by(10) {
+        assert!(index.get(&slice_key(row)).is_some(), "a survivor went missing");
+    }
+    (peak, (index.heap_bytes() - empty) as usize)
+}
+
+// a prune that packs a shard holds no more than the packed shard on top of the old one
+#[test]
+fn a_prune_packs_in_place() {
+    let _turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for rows in [250_000, 1_000_000] {
+        let (peak, packed) = prune_peak(rows);
+        println!(
+            "{rows} rows: prune peaked {:.2} MiB beside a packed shard of {:.2} MiB",
+            mib(peak),
+            mib(packed)
+        );
+        assert!(
+            peak <= packed + PRUNE_SLACK,
+            "the prune of {rows} rows peaked at {:.2} MiB",
+            mib(peak)
+        );
+    }
 }

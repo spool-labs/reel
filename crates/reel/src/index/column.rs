@@ -1410,33 +1410,29 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 continue;
             }
             let standing = snapshot.get_or_insert_with(|| sealed.segments());
-            let mut doomed: Vec<K> = Vec::new();
             let mut oldest_left = Lsn(u64::MAX);
-            for (key, entry) in state.map.walk() {
-                if !entry.is_grave() {
-                    continue;
-                }
+            let mut prunes = |entry: &Entry| {
                 let prunable = entry.lsn <= before
                     && entry
                         .grave_origin()
                         .is_some_and(|from| standing.binary_search(&from).is_ok());
                 if prunable {
-                    doomed.push(key.clone());
                     lifted = lifted.max(entry.lsn);
                 } else if entry.lsn < oldest_left {
                     oldest_left = entry.lsn;
                 }
-            }
-            // The walk saw every grave, so the floor comes back exact.
+                prunable
+            };
+            let doomed = state
+                .map
+                .sweep(|_, entry| !(entry.is_grave() && prunes(entry)));
+            // The sweep saw every grave, so the floor comes back exact.
             state.oldest_grave = oldest_left;
-            if doomed.is_empty() {
+            if doomed == 0 {
                 continue;
             }
-            for key in &doomed {
-                state.map.take(key.as_slice());
-            }
-            state.graves -= doomed.len();
-            pruned += doomed.len() as u64;
+            state.graves -= doomed;
+            pruned += doomed as u64;
             // Pack the room the deletes left, since the map never merges
             state.map.pack_owed();
             self.note_emptied(at, &mut state);
@@ -2282,6 +2278,9 @@ pub trait ShardMap<K: IndexKey, V: 'static>: Default {
         }
     }
 
+    /// Take out every pair `keep` refuses, in one pass over the map
+    fn sweep(&mut self, keep: impl FnMut(&K, &V) -> bool) -> usize;
+
     /// Give back the room a map grown a key at a time holds past its fill
     fn fit(&mut self) {}
 
@@ -2361,15 +2360,19 @@ impl<const B: usize, V: Default + 'static> ShardMap<Box<[u8]>, V> for TBTreeMap<
         self.get_many_sorted(keys, out);
     }
 
+    fn sweep(&mut self, keep: impl FnMut(&Box<[u8]>, &V) -> bool) -> usize {
+        TBTreeMap::sweep(self, keep)
+    }
+
     fn fit(&mut self) {
         if !self.is_packed() {
-            self.repack(B);
+            self.repack();
         }
     }
 
     fn pack_owed(&mut self) {
         if self.repack_owed() {
-            self.repack(B);
+            self.repack();
         }
     }
 
@@ -2453,15 +2456,19 @@ impl<const N: usize, const B: usize, V: Default + 'static> ShardMap<[u8; N], V>
         self.get_many_sorted(keys, out);
     }
 
+    fn sweep(&mut self, keep: impl FnMut(&[u8; N], &V) -> bool) -> usize {
+        TBTreeMap::sweep(self, keep)
+    }
+
     fn fit(&mut self) {
         if !self.is_packed() {
-            self.repack(B);
+            self.repack();
         }
     }
 
     fn pack_owed(&mut self) {
         if self.repack_owed() {
-            self.repack(B);
+            self.repack();
         }
     }
 

@@ -5771,3 +5771,86 @@ fn a_tail_left_unresumed_is_sealed_on_open() {
         );
     }
 }
+
+// a segment number a key run still covers is never drawn again, so a delete in the next tail holds
+#[test]
+fn a_reopen_draws_no_segment_number_a_key_run_covers() {
+    let config = |tails| ReelConfig {
+        segment_bytes: ByteCount::from_bytes(16 * 1024),
+        sync: SyncPolicy::Never,
+        active_tails: ThreadBudget::threads(tails),
+        ..ReelConfig::default()
+    };
+    let (store, sim) = sim_store(config(2));
+    put_on_tail(&store, 0, &record(8, 0), vec![1; 300]);
+    let mut last = SegmentId(0);
+    for round in 1..=10u8 {
+        for byte in 0..4u8 {
+            put_on_tail(&store, 1, &record(7, byte), vec![round; 300]);
+        }
+        store.flush().expect("flush");
+        last = store.reel.tails()[1].seal().expect("seal");
+    }
+    store.page_out_sealed().expect("page out");
+    assert!(store.merge_when_due().expect("merge").is_some());
+    assert!(store.index().key_runs().covers(last), "the run covers the last seal");
+    // The lower tail takes every key, so each covered segment dies and the close unlinks it
+    for byte in 0..4u8 {
+        put_on_tail(&store, 0, &record(7, byte), vec![11; 300]);
+    }
+    store.close().expect("close");
+    drop(store);
+
+    // One tail seals the other's empty segment on open, and a fold unlinks it
+    let second_sim = SimIo::from_image(sim.durable_image());
+    let second = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        config(1),
+        COLUMNS,
+        Arc::new(second_sim.clone()),
+    )
+    .expect("second open");
+    second.settle_sealed().expect("settle");
+    let empty = SegmentId(last.as_u32() + 1);
+    assert!(
+        second
+            .compactor
+            .compact_segment(&second.reel, &second.index, empty)
+            .expect("fold"),
+        "the empty segment stood"
+    );
+    second.close().expect("close");
+    drop(second);
+
+    // Every covered segment is gone, so only the run remembers their numbers
+    let third_sim = SimIo::from_image(second_sim.durable_image());
+    let third = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        config(1),
+        COLUMNS,
+        Arc::new(third_sim.clone()),
+    )
+    .expect("third open");
+    third.reel.tails()[0].seal().expect("seal");
+    third.put(&record(9, 0), &[3; 300]).expect("put");
+    third.delete(&record(7, 0)).expect("delete");
+    third.flush().expect("flush");
+    third.reel.tails()[0].seal().expect("seal");
+    third.close().expect("close");
+    drop(third);
+
+    let fourth = reopen_image(third_sim.durable_image(), config(1));
+    assert_eq!(fourth.get(&record(7, 0)).expect("get"), None, "the delete came undone");
+    assert_eq!(
+        fourth.get(&record(9, 0)).expect("get"),
+        Some(Value::new(vec![3; 300])),
+        "the put in the new tail was lost"
+    );
+    for byte in 1..4u8 {
+        assert_eq!(
+            fourth.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![11; 300])),
+            "key {byte} after the fourth open"
+        );
+    }
+}

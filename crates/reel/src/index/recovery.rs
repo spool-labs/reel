@@ -56,7 +56,7 @@ pub struct RebuiltReel {
     /// Highest sequence number seen, for reinitializing the counter
     pub highest_lsn: Lsn,
 
-    /// Highest segment number present, for continuing the numbering
+    /// Highest segment number on disk or in a key run, for continuing the numbering
     pub highest_segment: SegmentId,
 
     /// Which root holds each segment found off the first volume, exceptions only
@@ -129,7 +129,14 @@ pub fn rebuild_reel(
     let mut resumable: Vec<ResumableTail> = Vec::new();
     let mut sealed_files = Vec::new();
     let mut placements = Vec::new();
-    let mut highest_number = 0u32;
+    // A run keeps the numbers of covered segments it outlived, so a new tail never takes one
+    let mut highest_number = index
+        .key_runs()
+        .covered()
+        .into_iter()
+        .map(SegmentId::as_u32)
+        .max()
+        .unwrap_or(0);
     let mut jobs: Vec<(SegmentId, PathBuf, u64)> = Vec::new();
     for (number, path, len, root) in files {
         highest_number = highest_number.max(number);

@@ -96,6 +96,9 @@ struct SimState {
 
     widest_batch: usize,
     is_crashed: bool,
+
+    kill_after: Option<u64>,
+    killed: Option<DurableImage>,
 }
 
 impl SimState {
@@ -123,6 +126,8 @@ impl SimState {
             read_bytes: 0,
             widest_batch: 0,
             is_crashed: false,
+            kill_after: None,
+            killed: None,
         }
     }
 }
@@ -219,6 +224,26 @@ impl SimIo {
             .collect();
         image.sort_by(|left, right| left.0.cmp(&right.0));
         image
+    }
+
+    /// The bytes every named file holds if the process is killed now: every completed write stays
+    pub fn killed_image(&self) -> DurableImage {
+        killed_image(&lock(&self.shared.state))
+    }
+
+    /// Take the image a kill leaves once this many more writes complete
+    pub fn kill_after_writes(&self, writes: u64) {
+        let mut state = lock(&self.shared.state);
+        state.killed = None;
+        state.kill_after = Some(writes);
+        if writes == 0 {
+            state.killed = Some(killed_image(&state));
+        }
+    }
+
+    /// The image the armed kill took, or nothing while fewer writes than it waits for completed
+    pub fn kill_image(&self) -> Option<DurableImage> {
+        lock(&self.shared.state).killed.clone()
     }
 
     /// The bytes one file holds if power is lost now
@@ -413,6 +438,29 @@ fn is_dir_op(op: &Op) -> bool {
     }
 }
 
+/// The bytes every named file holds after a process kill, which keeps every completed write
+fn killed_image(state: &SimState) -> DurableImage {
+    let mut image: DurableImage = state
+        .files
+        .iter()
+        .map(|(path, file)| (path.clone(), file.cached.clone()))
+        .collect();
+    image.sort_by(|left, right| left.0.cmp(&right.0));
+    image
+}
+
+/// Count one completed write against an armed kill, taking its image on the last one
+fn count_toward_kill(state: &mut SimState) {
+    match state.kill_after {
+        Some(1) => {
+            state.kill_after = Some(0);
+            state.killed = Some(killed_image(state));
+        }
+        Some(left) if left > 1 => state.kill_after = Some(left - 1),
+        Some(_) | None => {}
+    }
+}
+
 fn route_completion(state: &mut SimState, position: u64, completion: Completion) {
     match state.plan.fault_at(position) {
         Some(FaultKind::DropCompletion) => {
@@ -470,10 +518,11 @@ fn execute_op(state: &mut SimState, op: Op, position: u64) -> Completion {
             file,
             offset,
             bufs,
-        } => Completion {
-            tag,
-            outcome: write_v(state, file, offset, bufs, fault),
-        },
+        } => {
+            let outcome = write_v(state, file, offset, bufs, fault);
+            count_toward_kill(state);
+            Completion { tag, outcome }
+        }
         Op::Pread {
             tag,
             file,

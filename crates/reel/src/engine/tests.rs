@@ -18,6 +18,7 @@ use crate::units::ByteCount;
 use crate::config::{CompactRate, RepairPath, SyncPolicy, ThreadBudget};
 use crate::format::column::{Codec, ColumnId, ColumnSpec};
 use crate::format::footer::SegmentFooter;
+use crate::format::journal::{cut_slot, CUT_MARK_LEN};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::record::HEADER_LEN;
 use crate::index::page::KeyPage;
@@ -3874,7 +3875,8 @@ fn async_flush_settles_the_tail() {
     block_on(store.flush_wait()).expect("awaited flush");
 
     assert!(sim.sync_count() > before, "the flush reached the device");
-    assert_eq!(sim.unsynced_bytes(), 0);
+    // The root's cut waits for no sync, since the segment's synced copy of it covers the flush
+    assert_eq!(sim.unsynced_bytes(), CUT_MARK_LEN as u64);
 }
 
 // two columns holding the same key bytes stay apart, and their totals do too
@@ -4595,8 +4597,9 @@ fn a_covered_segment_resumed_and_sealed_again_keeps_its_new_records() {
             continue;
         }
         let (rows_at, _) = crate::format::journal::rows_region(&unsealed).expect("rows");
-        bytes.resize(rows_at as usize, 0);
-        bytes.extend_from_slice(&unsealed[rows_at as usize..]);
+        let slot = cut_slot(rows_at) as usize;
+        bytes.resize(slot, 0);
+        bytes.extend_from_slice(&unsealed[slot..]);
     }
 
     let second_sim = SimIo::from_image(image);
@@ -5853,4 +5856,107 @@ fn a_reopen_draws_no_segment_number_a_key_run_covers() {
             "key {byte} after the fourth open"
         );
     }
+}
+
+/// Delete a key on a chosen tail the way a delete does
+fn delete_on_tail(store: &ReelStore, tail: usize, key: &RecordKey) {
+    let committed = store.reel.tails()[tail]
+        .append_tombstone(key.clone(), crate::append::Commit::PerRecord)
+        .expect("tombstone on the chosen tail");
+    store
+        .index
+        .remove(key, committed.lsn, committed.loc)
+        .expect("publish");
+}
+
+// a process kill keeps every completed write, so an earlier delete must not lose to a later write
+#[test]
+fn a_kill_keeps_earlier_deletes() {
+    let config = ReelConfig {
+        sync: SyncPolicy::Bytes(ByteCount::from_bytes(16 * 1024 * 1024)),
+        active_tails: ThreadBudget::threads(2),
+        ..ReelConfig::default()
+    };
+    let (store, sim) = sim_store(config.clone());
+    let (k1, k2, cursor) = (record(1, 1), record(2, 2), record(3, 3));
+    put_on_tail(&store, 0, &k1, vec![1; 300]);
+    put_on_tail(&store, 1, &k2, vec![2; 300]);
+    store.flush().expect("flush");
+
+    // K1's delete lands on tail 0, then K2's delete and the cursor on tail 1
+    delete_on_tail(&store, 0, &k1);
+    delete_on_tail(&store, 1, &k2);
+    put_on_tail(&store, 1, &cursor, vec![7; 300]);
+    // Tail 1 takes a megabyte more, as slices would, so its pace writes its rows
+    put_on_tail(&store, 1, &record(4, 4), vec![9; 1024 * 1024 + 4096]);
+
+    // Kill: every completed write stays, what the process held goes
+    let image = sim.killed_image();
+    std::mem::forget(store);
+    let reopened = reopen_image(image, config);
+    if reopened.get(&cursor).expect("get cursor").is_some() {
+        assert!(
+            reopened.get(&k2).expect("get k2").is_none(),
+            "K2's delete was lost behind the cursor"
+        );
+        assert!(
+            reopened.get(&k1).expect("get k1").is_none(),
+            "K1's delete was lost while later writes on the other tail held"
+        );
+    }
+}
+
+// a kill between any two writes of a write-out keeps a prefix of call order across every tail
+#[test]
+fn a_kill_mid_pass_keeps_a_prefix() {
+    const TAILS: usize = 3;
+    const CALLS: usize = 12;
+    let config = config(TAILS as u32, SyncPolicy::Never);
+    // An odd call deletes a key the setup put, and an even one puts a fresh key
+    let gone = |call: usize| record(1, call as u8);
+    let fresh = |call: usize| record(2, call as u8);
+    let mut sweep = 0u64;
+    loop {
+        let (store, sim) = sim_store(config.clone());
+        for call in (1..CALLS).step_by(2) {
+            put_on_tail(&store, call % TAILS, &gone(call), vec![0x11; 300]);
+        }
+        store.flush().expect("setup flush");
+        // The kill can land on any write from here: a record, a journal's rows or a cut
+        sim.kill_after_writes(sweep);
+        for call in 0..CALLS {
+            match call % 2 {
+                0 => put_on_tail(&store, call % TAILS, &fresh(call), vec![0x22; 300]),
+                _ => delete_on_tail(&store, call % TAILS, &gone(call)),
+            }
+            // A pace halfway, so one pass cuts the calls in two
+            if call == CALLS / 2 {
+                store.reel.tails()[call % TAILS].pace_journal();
+            }
+        }
+        store.flush().expect("flush");
+        let Some(image) = sim.kill_image() else {
+            break;
+        };
+        std::mem::forget(store);
+
+        let reopened = reopen_image(image, config.clone());
+        let survived: Vec<bool> = (0..CALLS)
+            .map(|call| match call % 2 {
+                0 => reopened.get(&fresh(call)).expect("get").is_some(),
+                _ => reopened.get(&gone(call)).expect("get").is_none(),
+            })
+            .collect();
+        let kept = survived.iter().take_while(|kept| **kept).count();
+        assert!(
+            survived[kept..].iter().all(|kept| !kept),
+            "a kill after {sweep} writes kept {survived:?}, which is no prefix of call order"
+        );
+        sweep += 1;
+    }
+    // Every record, then two passes of every tail's rows and a cut each, so the sweep crossed both
+    assert!(
+        sweep > (CALLS + 2 * (TAILS + 1)) as u64,
+        "the sweep covered {sweep} writes"
+    );
 }

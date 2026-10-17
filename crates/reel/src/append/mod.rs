@@ -6,6 +6,7 @@ mod flush;
 mod journal;
 pub(crate) mod publish;
 mod sealer;
+mod writeout;
 
 #[cfg(test)]
 mod tests;
@@ -17,7 +18,7 @@ use crate::config::{SyncPolicy, VolumeClass};
 use crate::error::{ReelError, Result};
 use crate::format::column::RecordKey;
 use crate::format::footer::{FooterEntry, SegmentFooter};
-use crate::format::journal::JournalRow;
+use crate::format::journal::{cut_slot, JournalRow};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::{Lsn, LsnCounter};
 use crate::format::record::{
@@ -40,6 +41,7 @@ use sealer::{
     Sealer,
 };
 pub(crate) use sealer::{retry_broken_seals, BrokenSeal};
+pub(crate) use writeout::Writeout;
 
 /// A whole-block volume starts every record on this boundary
 const ALIGN: u64 = BLOCK;
@@ -117,6 +119,17 @@ enum Intent {
 
     /// A delete marker for a key range, with the range's exclusive end as payload
     RangeTombstone(OwnedBuf),
+}
+
+impl Intent {
+    /// The payload length the record stores, zero for a tombstone
+    fn len(&self) -> usize {
+        match self {
+            Intent::Data(payload, _) => payload.len(),
+            Intent::Tombstone => 0,
+            Intent::RangeTombstone(end) => end.len(),
+        }
+    }
 }
 
 /// Where a record's sequence number comes from, and so what kind of write it is
@@ -295,6 +308,7 @@ impl Appender {
             inflight: AtomicU64::new(0),
             draw_class: AtomicU8::new(0),
         };
+        appender.shared.writeout.enlist_tail(&appender.active);
         let fresh = match resumed {
             Some(tail) => appender.resume_segment(tail)?,
             None => appender.prepare_segment()?,
@@ -606,19 +620,21 @@ impl Appender {
     /// Flush the tail and stop it, leaving its segment open for the next process to resume
     pub fn close(&self) -> Result<()> {
         self.doom_spare();
+        // The pass comes before the tail's lock, the order every pass takes them in
+        let pass = self.shared.writeout.begin();
         let active = write(&self.active);
         if active.terminal.load(Ordering::Acquire) {
             return Ok(());
         }
         let file = active.handle.file();
         let driver = &self.shared.driver;
-        // Free the space between the records and the rows, keep the rows, and sync once
+        // Free the space between the records and the cut slot, keep the rows, and sync once
         let end = align_up(active.end(), ALIGN);
-        let rows_at = active.journal.rows_at();
-        let flushed = active
-            .journal
-            .write_pending()
-            .and_then(|()| driver.release(file, end, rows_at.saturating_sub(end)))
+        let slot = cut_slot(active.journal.rows_at());
+        let flushed = pass
+            .run(&self.shared.lsn, Some(&self.active))
+            .and_then(|cut| active.journal.note_cut(cut))
+            .and_then(|()| driver.release(file, end, slot.saturating_sub(end)))
             .and_then(|()| active.journal.release_ahead())
             .and_then(|()| driver.sync_full(file));
         active.terminal.store(true, Ordering::Release);
@@ -632,6 +648,7 @@ impl Appender {
     /// Seal the active segment and stop the tail, so a later write rolls first
     fn seal_terminal(&self) -> Result<()> {
         self.doom_spare();
+        let pass = self.shared.writeout.begin();
         let active = write(&self.active);
         if active.terminal.load(Ordering::Acquire) {
             return Ok(());
@@ -647,7 +664,9 @@ impl Appender {
             return Ok(());
         }
         let end = active.end();
-        let sealed = self.seal_active(&active, end);
+        let sealed = pass
+            .run(&self.shared.lsn, Some(&self.active))
+            .and_then(|_| self.seal_active(&active, end));
         active.terminal.store(true, Ordering::Release);
         match &sealed {
             Ok(()) => active.sync.mark_durable(),
@@ -708,9 +727,7 @@ impl Appender {
     ) -> Result<(Committed, Option<Owed>)> {
         // Count before the draw and release once published, so no prune passes this number
         let mut drawn = (origin == Origin::Fresh).then(|| self.shared.draw_gauge(1));
-        let lsn = origin.lsn(&self.shared.lsn);
-        let (header, mut payload) = build_record(key, lsn, intent, origin);
-        let span = self.reserved_span(&header);
+        let span = self.reserved_batch_span(framed_bytes(&key, intent.len()));
         let target = self.shared.config.segment_bytes.to_bytes();
 
         // A record that fits no fresh segment past its header would roll forever
@@ -730,6 +747,9 @@ impl Appender {
             let base = self.claim_filled(&active, span);
             let room = active.room(target);
             if base + span + ALIGN <= room && base + span <= MAX_SEGMENT_OFFSET {
+                // Draw under the tail's lock, so a write-out pass finds every lower number pushed
+                let lsn = origin.lsn(&self.shared.lsn);
+                let (header, payload) = build_record(key, lsn, intent, origin);
                 // Take the hold under the shared lock, so no seal can land before it
                 active.holds.hold_record();
                 let hold = SegmentHold {
@@ -738,8 +758,7 @@ impl Appender {
                     segment: active.handle.id(),
                     drawn: drawn.take().map(DrawnRecords::ticket),
                 };
-                let outcome =
-                    self.write_record(&active, base, &header, std::mem::take(&mut payload));
+                let outcome = self.write_record(&active, base, &header, payload);
                 active.settle(span);
                 // A failed write lists no row, so nothing points into its range
                 if outcome.is_err() {
@@ -749,7 +768,7 @@ impl Appender {
                 // The bytes are down, so the segment may surface this number now
                 self.shared.note_landed(loc.segment, lsn);
                 self.tail.publish_committed(base + span);
-                self.paced_writeback(&active);
+                let is_paced = self.paced_writeback(&active);
                 let is_owed = match commit {
                     Commit::Durable => true,
                     Commit::PerRecord => self.owes_sync(&active),
@@ -762,6 +781,10 @@ impl Appender {
                 });
                 let wants_spare = base + span + self.spare_margin() >= room;
                 drop(active);
+                // A pass takes every tail's lock, so it runs once this one is let go
+                if is_paced {
+                    self.shared.writeout.try_write_out(&self.shared.lsn);
+                }
                 if wants_spare {
                     self.prepare_spare();
                 }
@@ -796,15 +819,14 @@ impl Appender {
         let drawn = self.shared.draw_gauge(count as u32);
         let mut headers = Vec::with_capacity(count);
         let mut payloads = Vec::with_capacity(count);
-        let first = self.shared.lsn.issue_run(count as u64);
-        for (at, record) in records.into_iter().enumerate() {
-            let lsn = Lsn(first.0 + at as u64);
+        // The run draws its numbers once it holds its range, and the write stamps them
+        for record in records {
             let intent = match record.write {
                 BatchWrite::Put(payload, codec) => Intent::Data(payload, codec),
                 BatchWrite::Delete => Intent::Tombstone,
                 BatchWrite::DeleteRange(end) => Intent::RangeTombstone(end),
             };
-            let (header, payload) = build_record(record.key, lsn, intent, Origin::Fresh);
+            let (header, payload) = unstamped(record.key, intent, Origin::Fresh);
             headers.push(header);
             payloads.push(payload);
         }
@@ -815,11 +837,12 @@ impl Appender {
     /// Reserve one range for a run of built records, write it, and say where each landed
     fn place_run<Payload: Into<WriteBuf>>(
         &self,
-        headers: Vec<RecordHeader>,
+        mut headers: Vec<RecordHeader>,
         mut payloads: Vec<Payload>,
         mut drawn: Option<DrawnRecords<'_>>,
     ) -> Result<Vec<Committed>> {
         let count = headers.len();
+        let is_fresh = drawn.is_some();
         let framed: u64 = headers
             .iter()
             .map(|header| header.span_in(RecordLayout::KEYLESS))
@@ -842,6 +865,8 @@ impl Appender {
             let base = self.claim_filled(&active, span);
             let room = active.room(target);
             if base + span + ALIGN <= room && base + span <= MAX_SEGMENT_OFFSET {
+                // Draw under the tail's lock, so a write-out pass finds every lower number pushed
+                let first = is_fresh.then(|| self.shared.lsn.issue_run(count as u64));
                 let mut committed = Vec::with_capacity(count);
                 // The batch's draw ticket goes with its last record, which drops last
                 let mut ticket = drawn.take().map(DrawnRecords::ticket);
@@ -856,14 +881,16 @@ impl Appender {
                             false => None,
                         },
                     };
-                    committed.push((header.lsn, hold));
+                    let lsn = first.map_or(header.lsn, |first| Lsn(first.0 + at as u64));
+                    committed.push((lsn, hold));
                 }
                 let outcome = self.write_run(
                     &active,
                     base,
-                    &headers,
+                    &mut headers,
                     std::mem::take(&mut payloads),
                     framed,
+                    first,
                 );
                 active.settle(span);
                 if outcome.is_err() {
@@ -875,9 +902,12 @@ impl Appender {
                     self.shared.note_landed(active.handle.id(), oldest);
                 }
                 self.tail.publish_committed(base + span);
-                self.paced_writeback(&active);
+                let is_paced = self.paced_writeback(&active);
                 let wants_spare = base + span + self.spare_margin() >= room;
                 drop(active);
+                if is_paced {
+                    self.shared.writeout.try_write_out(&self.shared.lsn);
+                }
                 if wants_spare {
                     self.prepare_spare();
                 }
@@ -905,9 +935,10 @@ impl Appender {
         &self,
         active: &Active,
         base: u64,
-        headers: &[RecordHeader],
+        headers: &mut [RecordHeader],
         payloads: Vec<Payload>,
         framed: u64,
+        first: Option<Lsn>,
     ) -> Result<Vec<Loc>> {
         // Up to three buffers a record (header, spilled key, payload) and one for the block's zeros
         let mut bufs = take_bufs(headers.len() * 3 + 1);
@@ -916,8 +947,12 @@ impl Appender {
         let mut at = base;
         let mut rows = Vec::with_capacity(headers.len());
         let layout = active.handle.layout();
-        for (header, payload) in headers.iter().zip(payloads) {
+        for (position, (header, payload)) in headers.iter_mut().zip(payloads).enumerate() {
             let payload = payload.into();
+            if let Some(first) = first {
+                let lsn = Lsn(first.0 + position as u64);
+                header.stamp(RecordLayout::KEYLESS, lsn, payload.as_slice());
+            }
             if let Some(entry) = FooterEntry::from_record(header, at as u32) {
                 entries.push(entry);
                 rows.push(journal_row(header, at as u32, payload.as_slice()));
@@ -1083,17 +1118,17 @@ impl Appender {
         }
     }
 
-    /// Start writeback on what has settled, without waiting for it
-    fn paced_writeback(&self, active: &Active) {
+    /// Start writeback on what has settled, without waiting for it, and say if rows are due
+    fn paced_writeback(&self, active: &Active) -> bool {
         let settled = active.settled.load(Ordering::Acquire);
         // Another writer is pacing this segment, and the next writer picks up what it misses
         let Some(mut pacing) = try_lock(&active.sync.pacing) else {
-            return;
+            return false;
         };
 
         // Most puts have nothing due, so check before allocating anything
         if settled.saturating_sub(pacing.started_to) < WRITEBACK_CHUNK {
-            return;
+            return false;
         }
 
         let ops = vec![Op::SyncRange {
@@ -1105,9 +1140,9 @@ impl Appender {
         }];
         pacing.started_to = settled;
         drop(pacing);
-        // Rows go down with the records, so a crash loses no more than the stretch since this pace
-        active.journal.try_write_pending();
         let _ = self.shared.driver.run(ops);
+        // Rows go down with the records, so a crash loses no more than the stretch since this pace
+        true
     }
 
     /// Roll the tail off a segment a writer could not fit in
@@ -1383,6 +1418,7 @@ impl Appender {
             terminal: AtomicBool::new(false),
             holds,
         };
+        self.shared.writeout.enlist(&active.journal);
         active
             .alloc_high
             .store(self.open_window(&active, 0)?, Ordering::Release);
@@ -1453,6 +1489,13 @@ impl Appender {
     }
 }
 
+impl Drop for Appender {
+    /// Write the rows out on the way out, so a tail dropped without a close leaves them
+    fn drop(&mut self) {
+        let _ = self.shared.writeout.write_out(&self.shared.lsn);
+    }
+}
+
 /// One record's place in the volume's admission, released however the caller leaves
 struct Admission<'tail> {
     tail: &'tail Appender,
@@ -1476,6 +1519,10 @@ thread_local! {
 fn resume_active(shared: &Arc<ReelShared>, resumed: ResumableTail) -> Result<Active> {
     let holds = shared.adopt_segment(resumed.segment);
     let file = shared.driver.open(&resumed.path, false)?;
+    // Cut off the groups a reopen dropped, so a later cut can never take them back
+    if resumed.has_dropped_rows {
+        shared.driver.truncate(file, resumed.rows_at + resumed.rows_len)?;
+    }
     let journal = Journal::resume(
         &shared.driver,
         file,
@@ -1508,6 +1555,7 @@ fn resume_active(shared: &Arc<ReelShared>, resumed: ResumableTail) -> Result<Act
         terminal: AtomicBool::new(false),
         holds,
     };
+    shared.writeout.enlist(&active.journal);
     // The file already reaches the rows, so the zero window restarts at the last record
     shared.driver.sync_full(active.handle.file())?;
     active.sync.synced_at.store(end, Ordering::Release);
@@ -1562,45 +1610,27 @@ fn build_record(
     intent: Intent,
     origin: Origin,
 ) -> (RecordHeader, OwnedBuf) {
-    let flags = |kind: Flags| origin.applied(kind);
-    match intent {
-        Intent::Data(payload, codec) => (
-            RecordHeader::framed(
-                RecordLayout::KEYLESS,
-                payload.len() as u32,
-                lsn,
-                flags(Flags::DATA),
-                key,
-                codec,
-                &payload,
-            ),
-            payload,
-        ),
-        Intent::Tombstone => (
-            RecordHeader::framed(
-                RecordLayout::KEYLESS,
-                0,
-                lsn,
-                flags(Flags::TOMBSTONE),
-                key,
-                0,
-                &[],
-            ),
-            Vec::new(),
-        ),
-        Intent::RangeTombstone(end) => (
-            RecordHeader::framed(
-                RecordLayout::KEYLESS,
-                end.len() as u32,
-                lsn,
-                flags(Flags::RANGE_TOMBSTONE),
-                key,
-                0,
-                &end,
-            ),
-            end,
-        ),
-    }
+    let (mut header, payload) = unstamped(key, intent, origin);
+    header.stamp(RecordLayout::KEYLESS, lsn, &payload);
+    (header, payload)
+}
+
+/// The header and payload an intent writes, before its number and keyed checksum go in
+fn unstamped(key: RecordKey, intent: Intent, origin: Origin) -> (RecordHeader, OwnedBuf) {
+    let (flags, codec, payload) = match intent {
+        Intent::Data(payload, codec) => (Flags::DATA, codec, payload),
+        Intent::Tombstone => (Flags::TOMBSTONE, 0, Vec::new()),
+        Intent::RangeTombstone(end) => (Flags::RANGE_TOMBSTONE, 0, end),
+    };
+    let header = RecordHeader {
+        length: payload.len() as u32,
+        crc: 0,
+        lsn: Lsn::NONE,
+        flags: origin.applied(flags),
+        key,
+        codec,
+    };
+    (header, payload)
 }
 
 /// The journal row of one record, a range tombstone's end read off its payload
@@ -1637,8 +1667,8 @@ fn placeholder_active(driver: Arc<IoDriver>) -> Active {
 
 #[cfg(test)]
 impl Appender {
-    /// Run the pace's journal write, for a test that fails it
+    /// Run the pace's write-out pass, for a test that fails it
     pub(crate) fn pace_journal(&self) {
-        read(&self.active).journal.try_write_pending();
+        self.shared.writeout.try_write_out(&self.shared.lsn);
     }
 }

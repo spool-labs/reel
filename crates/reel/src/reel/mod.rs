@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::append::admission::InflightBudget;
-use crate::append::{Appender, BatchRecord, Commit, Committed};
+use crate::append::{Appender, BatchRecord, Commit, Committed, Writeout};
 use crate::config::ReelConfig;
 use crate::error::{ReelError, Result};
 use std::sync::OnceLock;
@@ -1131,6 +1131,9 @@ pub struct ReelShared {
 
     /// Writes drawn and not yet published, by the epoch they drew in
     drawn: Drawn,
+
+    /// Every tail and journal, so one pass writes all their rows and then the reel's cut
+    pub(crate) writeout: Writeout,
 }
 
 /// What is keeping one segment from being retired
@@ -1195,6 +1198,7 @@ impl ReelShared {
         columns: ColumnSet,
         next_segment: u32,
     ) -> ReelShared {
+        let writeout = Writeout::new(&dir, Arc::clone(&driver));
         // The primary root stays first: it holds the lock and the manifest and is the fast tier
         let mut roots = vec![dir];
         let mut classes = vec![crate::config::VolumeClass::Fast];
@@ -1228,6 +1232,7 @@ impl ReelShared {
             past_saving: AtomicU64::new(0),
             broken_seals: Mutex::new(Vec::new()),
             drawn: Drawn::default(),
+            writeout,
         }
     }
 

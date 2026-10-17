@@ -17,7 +17,21 @@ use crate::sync::{lock, read, write};
 use super::flush::Owed;
 use super::Active;
 
-/// Seal a segment, which closes it and leaves it readable and never written again
+/// Write every journal's rows out, then seal a segment that takes no more writes
+pub(super) fn write_out_and_seal(
+    shared: &Arc<ReelShared>,
+    active: &Active,
+    end: u64,
+) -> Result<()> {
+    if active.terminal.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    // A footer keeps its records past any cut, so a pass covers them first
+    shared.writeout.write_out(&shared.lsn)?;
+    seal_segment(shared, active, end)
+}
+
+/// Seal a segment once a pass wrote every row, which leaves it readable and never written again
 pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) -> Result<()> {
     if active.terminal.load(Ordering::Acquire) {
         return Ok(());
@@ -88,7 +102,7 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
 
 /// Seal a retired segment and say what it did to its durability
 pub(super) fn retire_segment(shared: &Arc<ReelShared>, retired: &Active, end: u64) -> Result<()> {
-    let sealed = seal_segment(shared, retired, end);
+    let sealed = write_out_and_seal(shared, retired, end);
     let is_terminal = retired.terminal.load(Ordering::Acquire);
     match &sealed {
         // A terminal segment skipped its seal, so its broken mark stays
@@ -145,7 +159,7 @@ pub(crate) fn retry_broken_seals(shared: &Arc<ReelShared>) -> usize {
             shared.release_segment(job.active.handle.id());
             continue;
         }
-        match seal_segment(shared, &job.active, job.end) {
+        match write_out_and_seal(shared, &job.active, job.end) {
             Ok(()) => {
                 job.active.sync.mark_durable();
                 if job.counted {
@@ -311,8 +325,9 @@ pub(super) fn flush_active(
         )
     };
 
-    // Write pending rows first, so this one sync covers rows and records
-    journal.write_pending()?;
+    // Write every journal's rows first, then this segment's copy of the cut, so one sync covers all
+    let cut = shared.writeout.write_out(&shared.lsn)?;
+    journal.note_cut(cut)?;
     shared.driver.sync_data(handle.file())?;
     Ok(Some(covered))
 }

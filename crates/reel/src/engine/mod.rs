@@ -388,7 +388,9 @@ impl ReelStore {
             columns,
             1,
         ));
-        shared.lsn.recover_to(rebuilt.highest_lsn);
+        // Numbers restart above the cut, since a row at or below it reads back with no pass
+        shared.lsn.recover_to(rebuilt.highest_lsn.max(rebuilt.cut));
+        shared.writeout.recover(rebuilt.cut);
         shared.recover_next_segment(rebuilt.highest_segment);
         for (segment, at) in &rebuilt.placements {
             shared.volumes.place(*segment, *at as usize);

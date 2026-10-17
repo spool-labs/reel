@@ -168,11 +168,25 @@ covers the group's head and rows, so a group a crash cut short fails it and the 
 A direct volume writes whole blocks, so a group can be followed by zeros up to a block boundary, and
 the next group starts on that boundary.
 
-A put leaves its group in memory. A flush writes the pending groups ahead of the file's sync, and
-writeback pacing writes them too. A reopen reads the journal's whole groups and keeps a group only
-when every record it lists sits where its row says and checks out, so a batch comes back whole or
-not at all. A resumed tail appends after the last whole group and writes new records past every
-record any group lists, so a dropped group can never match a new record.
+A put leaves its group in memory. Pacing, a flush, a seal and a close each run one write-out
+pass, which writes the pending groups of every journal in the reel and then the reel's cut. The
+pass takes every tail's lock while it takes the groups, and a record draws its sequence number
+under its tail's lock, so every number below the cut has its row in a journal. A record that
+returned before another started has the lower number, so the rows at or below a cut are a prefix
+of call order across all tails.
+
+The cut is a 16-byte mark: the magic `RCUT`, the sequence number, and a CRC32C over both. The
+reel's root keeps it in `reel.cut`. A flush and a close also write it to the block just before
+their segment's rows, so the segment's own sync covers it. A reopen reads each journal through the
+higher of the two, and stops at the first group with a row past it, since only a pass that never
+finished wrote that group and the ones after it. A resumed tail cuts the file there. Sequence
+numbers restart above the cut.
+
+A reopen keeps a group only when every record it lists sits where its row says and checks out, so
+a batch comes back whole or not at all. A resumed tail appends after the last whole group and
+writes new records past every record any group lists, so a dropped group can never match a new
+record. A seal runs a pass before its footer goes down, so a footer never lists a record above the
+cut.
 
 The key lives only in the rows, and that has two costs. A process crash under `Never` or `Bytes`
 loses what was written since the journal last went down: at most one pace or one sync threshold.

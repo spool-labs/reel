@@ -13,7 +13,7 @@ What a put that already returned is worth, per `sync` setting. A process crash t
 | a durable put or batch, any setting | nothing is lost | nothing is lost |
 | any of the above, for a multi-record batch | a batch is confirmed or it never happened | a batch is confirmed or it never happened |
 
-A record with 4 KiB of payload or less is keyless, so an open segment's journal is what says which key each record holds. The journal is a region of the segment's own file, so one sync makes a record and its row durable together. A put writes only its record. Its row waits in memory for the next pace or flush, so a put costs one write, and a record whose row never reached the journal is not found again.
+A record with 4 KiB of payload or less is keyless, so an open segment's journal is what says which key each record holds. The journal is a region of the segment's own file, so one sync makes a record and its row durable together. A put writes only its record. Its row waits in memory for the next pace or flush, so a put costs one write, and a record whose row never reached the journal is not found again. A pass writes every tail's rows and then the reel's cut, and a reopen reads no row past the cut, so the records a process crash keeps are a prefix of call order across all tails.
 
 These hold at every setting:
 

@@ -12,7 +12,9 @@ use crate::format::footer::{
     read_seal_mark, FooterEntry, FooterPartition, FooterTally, SegmentFooter, FIXED_TAIL_LEN,
     SEAL_MARK_LEN,
 };
-use crate::format::journal::{read_groups, JournalRow};
+use crate::format::journal::{
+    cut_slot, read_cut, read_groups, read_groups_through, JournalRow, CUT_FILE, CUT_MARK_LEN,
+};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
 use crate::format::record::{
@@ -79,6 +81,9 @@ pub struct RebuiltReel {
 
     /// A column the segments hold that this open doesn't declare
     pub undeclared: Option<ColumnId>,
+
+    /// The highest cut any mark holds, which the counter and the next pass start above
+    pub cut: Lsn,
 }
 
 /// One sealed segment's key span for one column, which rules it in or out of a search
@@ -121,6 +126,9 @@ pub fn rebuild_reel(
         }
     }
 
+    // A journal row past the reel's cut came from a write-out that never finished, so it goes
+    let root_cut = read_root_cut(driver, &roots[0])?;
+    let mut cut = root_cut;
     let mut resolver = Resolver::new(index);
     let mut quarantined = Vec::new();
     let mut consumed = HashMap::new();
@@ -157,7 +165,7 @@ pub fn rebuild_reel(
             .map(|_| scope.spawn(|| load_footers(index, &feed)))
             .collect();
         let mut is_sized = false;
-        let read = read_segments(driver, &jobs, |at, parts| {
+        let read = read_segments(driver, &jobs, root_cut, |at, parts| {
             let (segment, path, len) = &jobs[at];
             match absorb_segment(*segment, parts, &mut resolver, &mut held)? {
                 Loaded::Sealed(footer, cut) => {
@@ -174,6 +182,7 @@ pub fn rebuild_reel(
                     let _ = queue.send((*segment, footer));
                 }
                 Loaded::Journaled(end) => {
+                    cut = cut.max(end.cut);
                     consumed.insert(*segment, end.journal_len);
                     walked.push((path.clone(), *len));
                     // A file cut before its rows, or covered by a run, was sealed and never resumes
@@ -186,6 +195,7 @@ pub fn rebuild_reel(
                             entries: SegmentFooter::empty(),
                             rows_at,
                             rows_len: end.journal_len,
+                            has_dropped_rows: end.has_dropped_rows,
                         });
                     }
                 }
@@ -221,7 +231,20 @@ pub fn rebuild_reel(
         cuts,
         resumable,
         undeclared,
+        cut,
     })
+}
+
+/// The cut the reel's root holds, none when no pass wrote one
+fn read_root_cut(driver: &IoDriver, root: &Path) -> Result<Lsn> {
+    let file = match driver.open(&root.join(CUT_FILE), false) {
+        Ok(file) => file,
+        Err(error) if error.is_missing() => return Ok(Lsn::NONE),
+        Err(error) => return Err(error),
+    };
+    let read = driver.pread(file, 0, CUT_MARK_LEN as u64);
+    driver.close(file)?;
+    Ok(read_cut(&read?).unwrap_or(Lsn::NONE))
 }
 
 /// Take sealed footers off the queue into the spot index until it closes, even after a failed load
@@ -265,6 +288,7 @@ pub struct ResumableTail {
     pub entries: SegmentFooter,
     pub rows_at: u64,
     pub rows_len: u64,
+    pub has_dropped_rows: bool,
 }
 
 /// What a journaled tail's read leaves for the rebuild beside its rows
@@ -277,6 +301,12 @@ struct JournaledEnd {
 
     /// Rows offset of an open segment, or none once a seal closed it
     rows_at: Option<u64>,
+
+    /// The cut this tail's rows were read through
+    cut: Lsn,
+
+    /// Whether whole groups past the cut follow the rows read
+    has_dropped_rows: bool,
 }
 
 /// One segment file read off the medium, so the join touches no descriptor
@@ -295,6 +325,7 @@ enum SegmentParts {
 fn read_segments(
     driver: &IoDriver,
     jobs: &[(SegmentId, PathBuf, u64)],
+    cut: Lsn,
     mut join: impl FnMut(usize, SegmentParts) -> Result<()>,
 ) -> Result<()> {
     let readers = match reads_on_its_caller(driver) {
@@ -306,7 +337,7 @@ fn read_segments(
     };
     if readers <= 1 {
         for (at, (segment, path, len)) in jobs.iter().enumerate() {
-            join(at, read_segment(driver, path, *segment, *len)?)?;
+            join(at, read_segment(driver, path, *segment, *len, cut)?)?;
         }
         return Ok(());
     }
@@ -321,7 +352,7 @@ fn read_segments(
     let mut outcome = Ok(());
     std::thread::scope(|scope| {
         for _ in 0..readers {
-            scope.spawn(|| read_claimed(driver, jobs, &queue, &moved, readers));
+            scope.spawn(|| read_claimed(driver, jobs, cut, &queue, &moved, readers));
         }
         for at in 0..jobs.len() {
             let parts = {
@@ -376,6 +407,7 @@ struct ReadQueue {
 fn read_claimed(
     driver: &IoDriver,
     jobs: &[(SegmentId, PathBuf, u64)],
+    cut: Lsn,
     queue: &Mutex<ReadQueue>,
     moved: &Condvar,
     window: usize,
@@ -397,7 +429,7 @@ fn read_claimed(
             at
         };
         let (segment, path, len) = &jobs[at];
-        let parts = read_segment(driver, path, *segment, *len);
+        let parts = read_segment(driver, path, *segment, *len, cut);
         lock(queue).done.insert(at, parts);
         moved.notify_all();
     }
@@ -409,9 +441,10 @@ fn read_segment(
     path: &Path,
     segment: SegmentId,
     file_len: u64,
+    cut: Lsn,
 ) -> Result<SegmentParts> {
     let file = driver.open(path, false)?;
-    let read = read_parts(driver, file, segment, file_len);
+    let read = read_parts(driver, file, segment, file_len, cut);
     driver.close(file)?;
     read
 }
@@ -421,6 +454,7 @@ fn read_parts(
     file: FileId,
     segment: SegmentId,
     file_len: u64,
+    cut: Lsn,
 ) -> Result<SegmentParts> {
     if !belongs_here(driver, file, segment)? {
         return Ok(SegmentParts::Foreign);
@@ -435,7 +469,7 @@ fn read_parts(
         return Ok(SegmentParts::Sealed(footer, ends, Some(end)));
     }
     Ok(SegmentParts::Journaled(read_journaled(
-        driver, file, file_len,
+        driver, file, file_len, cut,
     )?))
 }
 
@@ -493,6 +527,8 @@ fn absorb_segment(
                 next_offset: tail.next_offset,
                 journal_len: tail.journal_len,
                 rows_at: tail.rows_at,
+                cut: tail.cut,
+                has_dropped_rows: tail.has_dropped_rows,
             }))
         }
     }
@@ -1139,18 +1175,31 @@ struct JournaledTail {
     /// End of the last record any whole group lists, where the tail resumes
     next_offset: u64,
 
-    /// Bytes of whole groups in the journal
+    /// Bytes of whole groups in the journal, up to the first past the cut
     journal_len: u64,
+
+    /// The reel's cut or this segment's copy of it, whichever is higher
+    cut: Lsn,
+
+    /// Whether whole groups past the cut follow the rows read
+    has_dropped_rows: bool,
 }
 
-/// Read an open tail from its rows, keeping only groups whose records all check out
-fn read_journaled(driver: &IoDriver, file: FileId, file_len: u64) -> Result<JournaledTail> {
+/// Read an open tail from its rows through the cut, keeping only groups whose records check out
+fn read_journaled(
+    driver: &IoDriver,
+    file: FileId,
+    file_len: u64,
+    root_cut: Lsn,
+) -> Result<JournaledTail> {
     let mut tail = JournaledTail {
         footer: SegmentFooter::empty(),
         ends: Vec::new(),
         rows_at: None,
         next_offset: header_end(driver, file)?,
         journal_len: 0,
+        cut: root_cut,
+        has_dropped_rows: false,
     };
     let header = read_segment_header(driver, file)?;
     let layout = header.map_or(RecordLayout::Keyed, |header| header.layout);
@@ -1162,9 +1211,13 @@ fn read_journaled(driver: &IoDriver, file: FileId, file_len: u64) -> Result<Jour
         return Ok(tail);
     };
     tail.rows_at = Some(rows_at);
+    // A flush syncs its segment's copy of the cut, which a power cut may keep without the root's
+    let slot = driver.pread(file, cut_slot(rows_at), CUT_MARK_LEN as u64)?;
+    tail.cut = read_cut(&slot).map_or(root_cut, |slot| slot.max(root_cut));
     let bytes = read_rows(driver, file, rows_at, file_len, 0)?;
-    let (groups, valid) = read_groups(&bytes);
+    let (groups, valid) = read_groups_through(&bytes, tail.cut);
     tail.journal_len = valid as u64;
+    tail.has_dropped_rows = read_groups(&bytes).1 > valid;
     let mut reader = SegmentReader::new(driver, file, rows_at);
     let mut ends = Vec::new();
     // A group is one write, so a batch comes back whole or not at all

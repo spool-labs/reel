@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 
 use crate::error::{ReelError, Result};
+use crate::format::block::PartitionSpan;
 use crate::format::column::{ColumnId, RecordKey};
 use crate::format::filter::{Filter, HEADER_LEN as FILTER_HEADER_LEN};
 use crate::format::lsn::Lsn;
@@ -302,17 +303,6 @@ impl FooterPartition {
     pub fn stride(&self) -> usize {
         debug_assert!(!self.is_varying(), "a varying partition has no stride");
         self.key_width as usize + ENTRY_TAIL_LEN
-    }
-
-    /// The width of the longest key in the partition
-    pub fn widest_key(&self) -> usize {
-        if !self.is_varying() {
-            return self.key_width as usize;
-        }
-        (0..self.len())
-            .filter_map(|row| self.key_len(row))
-            .max()
-            .unwrap_or(0)
     }
 
     /// Where one row begins and ends within the packed rows
@@ -1027,6 +1017,58 @@ fn read_partitions(
     Ok((partitions, rows_at, lead))
 }
 
+/// Check a whole footer where it lies as a parse would, and give where each column's rows sit
+///
+/// The footer begins at `rows_at` in the segment file
+pub fn check_in_place(footer: &[u8], rows_at: u64) -> Result<Vec<PartitionSpan>> {
+    let footer_len = footer.len();
+    if footer_len < FIXED_TAIL_LEN
+        || read_u32_le(&footer[footer_len - MAGIC_FROM_END..]) != FOOTER_MAGIC
+        || read_at_u32(footer, footer_len, FOOTER_LEN_FROM_END) as usize != footer_len
+    {
+        return Err(ReelError::Corruption(
+            "footer trailer does not frame the footer".to_string(),
+        ));
+    }
+    verify_footer_crc(footer, footer_len)?;
+
+    let entry_count = read_at_u32(footer, footer_len, ENTRY_COUNT_FROM_END) as usize;
+    let partition_count = read_at_u32(footer, footer_len, PARTITION_COUNT_FROM_END) as usize;
+    let bloom_len = read_at_u32(footer, footer_len, BLOOM_LEN_FROM_END) as usize;
+    let body = footer_len - FIXED_TAIL_LEN;
+    let directory_len = partition_count * DIRECTORY_ROW_LEN;
+    if bloom_len > body || directory_len > body - bloom_len {
+        return Err(ReelError::Corruption(
+            "footer directory does not fit its own length".to_string(),
+        ));
+    }
+    let directory_at = body - directory_len;
+    let spans = partition_spans(&footer[directory_at..body], partition_count, rows_at)?;
+
+    let mut listed = [false; u8::MAX as usize + 1];
+    let (mut consumed, mut rows) = (0u64, 0usize);
+    for span in &spans {
+        if std::mem::replace(&mut listed[span.column.as_u8() as usize], true) {
+            return Err(ReelError::Corruption(
+                "footer directory lists a column twice".to_string(),
+            ));
+        }
+        if !span.is_packed && span.encoded != (span.rows * span.stride()) as u64 {
+            return Err(ReelError::Corruption(
+                "footer partition is not the length its directory row claims".to_string(),
+            ));
+        }
+        consumed += span.encoded;
+        rows += span.rows;
+    }
+    if consumed != (directory_at - bloom_len) as u64 || rows != entry_count {
+        return Err(ReelError::Corruption(
+            "footer entry count is inconsistent with its length".to_string(),
+        ));
+    }
+    Ok(spans)
+}
+
 /// Locate a sealed segment's directory from its trailer, or nothing without a footer
 pub fn directory_span(tail: &[u8], file_len: u64) -> Result<Option<DirectorySpan>> {
     let total = tail.len();
@@ -1088,7 +1130,7 @@ pub fn partition_spans(
     directory: &[u8],
     partitions: usize,
     rows_at: u64,
-) -> Result<Vec<crate::format::block::PartitionSpan>> {
+) -> Result<Vec<PartitionSpan>> {
     let mut spans = Vec::with_capacity(partitions);
     let mut at = rows_at;
     for index in 0..partitions {
@@ -1099,7 +1141,7 @@ pub fn partition_spans(
         let (key_width, is_packed) = width_field(u16::from_le_bytes([row[1], row[2]]));
         let rows = read_u32_le(&row[3..DIRECTORY_SPAN_AT]) as usize;
         let encoded = read_u32_le(&row[DIRECTORY_SPAN_AT..DIRECTORY_ROW_LEN]) as u64;
-        let span = crate::format::block::PartitionSpan {
+        let span = PartitionSpan {
             column: ColumnId(row[0]),
             key_width,
             is_packed,
@@ -1130,10 +1172,13 @@ fn verify_footer_crc(footer: &[u8], footer_len: usize) -> Result<()> {
     let crc_at = footer_len - CRC_FROM_END;
     let stored = read_u32_le(&footer[crc_at..footer_len - FOOTER_LEN_FROM_END]);
 
-    let mut check = footer.to_vec();
-    check[crc_at..crc_at + U32_BYTES].copy_from_slice(&[0u8; U32_BYTES]);
+    // The check runs over the footer with its own field zeroed
+    let mut check = digest();
+    check.update(&footer[..crc_at]);
+    check.update(&[0u8; U32_BYTES]);
+    check.update(&footer[crc_at + U32_BYTES..footer_len]);
 
-    if checksum(&check) != stored {
+    if check.finalize() as u32 != stored {
         return Err(ReelError::Corruption(
             "footer checksum mismatch".to_string(),
         ));

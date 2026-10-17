@@ -12,10 +12,10 @@ use reel::format::footer::{FooterEntry, SegmentFooter};
 use reel::format::lsn::Lsn;
 use reel::format::record::Flags;
 use reel::{
-    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, KeyWidth, ReelConfig, ReelStore, SyncPolicy,
-    ThreadBudget,
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, CompactPass, KeyWidth, ReelConfig,
+    ReelStore, SyncPolicy, ThreadBudget,
 };
-use reel_core::{Direction, Store};
+use reel_core::{Direction, Store, WriteBatch};
 
 /// Bytes live across every thread
 static LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -237,5 +237,106 @@ fn a_seal_reserves_no_old_footer() {
         fresh < FRESH_CEILING,
         "the fresh footer reserved {:.2} MiB",
         mib(fresh)
+    );
+}
+
+/// Rows that outlive the kill, the same whatever the segment holds
+const KEPT_ROWS: u64 = 100_000;
+
+/// A compaction pass may add this much heap, whatever the segment's row count
+const COMPACT_CEILING: usize = 32 * 1024 * 1024;
+
+/// Rows per write batch
+const BATCH_ROWS: u64 = 10_000;
+
+/// Bytes in each filler record that pushes the rows' segment to its seal
+const FILLER_BYTES: usize = 1024 * 1024;
+
+/// One segment large enough for every row, and a footer cache too small for its footer
+fn compact_config() -> ReelConfig {
+    ReelConfig {
+        segment_bytes: ByteCount::from_bytes(256 * 1024 * 1024),
+        footer_cache: ByteCount::from_bytes(1024 * 1024),
+        ..config()
+    }
+}
+
+/// Write a segment's worth of filler and delete it, so the rows' segment seals
+fn seal_with_filler(store: &ReelStore) {
+    let value = vec![0x33u8; FILLER_BYTES];
+    let fillers = compact_config().segment_bytes.to_bytes() / FILLER_BYTES as u64;
+    for row in 0..fillers {
+        Store::put(store, FILLER, &filler_key(row), &value).expect("filler");
+    }
+    for row in 0..fillers {
+        Store::delete(store, FILLER, &filler_key(row)).expect("filler delete");
+    }
+}
+
+/// The peak heap of compacting one sealed segment of `rows` small records, most of them deleted
+fn compact_peak(rows: u64) -> usize {
+    let dir = TempDir::new().expect("tempdir");
+    let store = ReelStore::open(dir.path().to_path_buf(), compact_config(), COLUMNS).expect("open");
+    let value = [7u8; 16];
+    for first in (0..rows).step_by(BATCH_ROWS as usize) {
+        let mut batch = WriteBatch::new();
+        for row in first..(first + BATCH_ROWS).min(rows) {
+            batch.put(WALKED, &walked_key(row), &value);
+        }
+        Store::write_batch(&store, batch).expect("puts");
+    }
+    seal_with_filler(&store);
+
+    let every = rows / KEPT_ROWS;
+    for first in (0..rows).step_by(BATCH_ROWS as usize) {
+        let mut batch = WriteBatch::new();
+        for row in (first..(first + BATCH_ROWS).min(rows)).filter(|row| row % every != 0) {
+            batch.delete(WALKED, &walked_key(row));
+        }
+        Store::write_batch(&store, batch).expect("deletes");
+    }
+    store.flush().expect("flush");
+    store.page_out_sealed().expect("page out");
+
+    let before = store.compaction_counters();
+    let mut peak = 0;
+    for _ in 0..4 {
+        let (taken, pass) = peak_of(|| store.compact_once().expect("compact"));
+        peak = peak.max(taken);
+        if pass == CompactPass::Copied {
+            break;
+        }
+    }
+    let after = store.compaction_counters();
+    assert!(
+        after.segments_rewritten > before.segments_rewritten,
+        "the pass rewrote the segment"
+    );
+
+    let kept = Store::iter_from(&store, WALKED, &walked_key(0), Direction::Asc)
+        .expect("iter_from")
+        .count() as u64;
+    assert_eq!(kept, rows.div_ceil(every), "every kept row survives");
+    for row in [0, 1, every, rows / 2, rows - 1] {
+        let held = Store::get(&store, WALKED, &walked_key(row)).expect("get");
+        assert_eq!(held.is_some(), row % every == 0, "row {row} reads as it should");
+    }
+    peak
+}
+
+// a compaction pass's heap stays bounded however many rows the segment's footer lists
+#[test]
+fn a_compaction_pass_reads_no_whole_footer() {
+    let _turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut worst = 0;
+    for rows in [1_000_000, 2_000_000] {
+        let peak = compact_peak(rows);
+        println!("{rows} rows: compaction peak {:.2} MiB", mib(peak));
+        worst = worst.max(peak);
+    }
+    assert!(
+        worst < COMPACT_CEILING,
+        "a compaction pass peaked at {:.2} MiB",
+        mib(worst)
     );
 }

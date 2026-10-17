@@ -23,19 +23,17 @@ use crate::reel::segment::{SegmentHandle, SegmentReader, READ_CHUNK};
 use crate::reel::{Reel, ReelShared, NOTHING_PURGED};
 use crate::sync::{lock, try_lock};
 
+use crate::compaction::footer_walk::{FooterRows, LiveWalk};
 use crate::compaction::pressure::{GcPressure, PassPace, RateGate, RateLimiter};
 
 /// Bytes at the end of a sealed segment holding its footer length and magic
-const TRAILER_LEN: u64 = 8;
+pub(crate) const TRAILER_LEN: u64 = 8;
 
 /// A scrub pass takes at most this much of a quiet stretch's earnings
 const SCRUB_PASS_MAX: Duration = Duration::from_secs(60);
 
 /// How long a finished sweep waits before the next one, since rot builds over days
 const SCRUB_LAP_REST: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// One rewrite stripe holds at most this many payload bytes between fetch and apply
-const STRIPE_STAGE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// One fetch wave holds at most this many ranges in flight
 const FETCH_DEPTH: usize = 8;
@@ -688,16 +686,18 @@ impl Compactor {
                 return Ok(true);
             }
         };
-        // read once: where the records end, and their key order when the footer has one
-        let footer = shared.footer_once(segment)?;
+        // read in place where the segment maps: where the records end, and their key order
+        let footer = FooterRows::open(shared, segment, &source, file_len)?;
         // No row lists an unsealed keyless segment's keys, so it stands until a reopen drops it
         if source.layout().is_keyless_layout() && footer.is_none() {
             return Ok(false);
         }
-        let region_end = footer_bound(shared, &source, file_len, footer.as_deref())?;
-        let order = footer.as_deref().and_then(footer_order);
+        let region_end = footer_bound(shared, &source, file_len, footer.is_some())?;
+        let ordered = footer
+            .as_ref()
+            .and_then(|(rows, bound)| bound.map(|bound| (rows, bound)));
         // Only rows list a keyless segment's records, so undecodable rows leave it in place
-        if order.is_none() && source.layout().is_keyless_layout() {
+        if ordered.is_none() && source.layout().is_keyless_layout() {
             // pin it at its current dead bytes, so the ranking skips it until more dies
             lock(&self.rotted).insert(segment, index.segment_bytes(segment).dead);
             return Ok(false);
@@ -729,16 +729,15 @@ impl Compactor {
         let mut pace = self.compact_rate.pace();
 
         let mut tally = PassTally::default();
-        let copy_result = match &order {
-            Some((order, prefix_bound)) => self.rewrite_ordered(
+        let copy_result = match ordered {
+            Some((rows, prefix_bound)) => self.rewrite_ordered(
                 reel,
                 dest_index,
                 index,
                 &mut reader,
                 Ordered {
-                    order,
-                    prefix_bound: *prefix_bound,
-                    footer: footer.as_deref(),
+                    rows,
+                    prefix_bound,
                     layout: source.layout(),
                 },
                 segment,
@@ -757,6 +756,7 @@ impl Compactor {
                 &mut pace,
             ),
         };
+        drop(footer);
 
         // The pass dropped what newer records on any tail replace, so every tail syncs before the retire
         if let Err(error) = reel.flush() {
@@ -829,37 +829,47 @@ impl Compactor {
         pace: &mut PassPace<'_>,
     ) -> Result<()> {
         let Ordered {
-            order,
+            rows,
             prefix_bound,
-            footer,
             layout,
         } = ordered;
         // The index says which rows still hold the live copy, so no dead record is read
-        let (order, rows) = match footer {
-            Some(footer) => live_rows(index, segment, footer, layout)?,
-            None => (order.to_vec(), None),
-        };
-        let order = order.as_slice();
+        let is_keyless = layout.is_keyless_layout();
+        let mut walk = LiveWalk::new(rows);
+        let mut order = Vec::new();
+        let mut kept = Vec::new();
+        let mut plan: Vec<(usize, u32)> = Vec::new();
         let mut run = CopyRun::default();
         let mut staged: Vec<Option<(usize, usize)>> = Vec::new();
         let mut slab = Arc::<Vec<u8>>::default();
-        let mut start = 0usize;
-        while start < order.len() {
-            let end = stripe_end(order, start);
-            let mut plan: Vec<(usize, u32)> = (start..end)
-                .map(|position| (position, order[position].0))
-                .collect();
+        loop {
+            walk.fill(index, segment, is_keyless, &mut order, &mut kept)?;
+            if order.is_empty() {
+                break;
+            }
+            plan.clear();
+            plan.extend(
+                order
+                    .iter()
+                    .enumerate()
+                    .map(|(position, &(offset, _))| (position, offset)),
+            );
             plan.sort_unstable_by_key(|&(_, offset)| offset);
-            let ranges = chunk_ranges(&plan, order, prefix_bound, reader.limit());
+            let ranges = chunk_ranges(&plan, &order, prefix_bound, reader.limit());
 
             // The stripe stages in one buffer, so a few read buffers serve all its reads
             let mut stage = Arc::try_unwrap(slab).unwrap_or_default();
             stage.clear();
-            stage.reserve_exact(ranges.iter().map(|range| range.len).sum());
+            stage.reserve_exact(
+                order
+                    .iter()
+                    .map(|&(_, len)| prefix_bound as usize + len as usize)
+                    .sum(),
+            );
 
             // Each record goes in the slot its key order gives it, so the apply needs no sort
             staged.clear();
-            staged.resize(end - start, None);
+            staged.resize(order.len(), None);
             let mut wave_at = 0usize;
             while wave_at < ranges.len() {
                 let wave =
@@ -869,14 +879,14 @@ impl Compactor {
                     wave.iter().map(|range| (range.start, range.len)).collect();
                 let buffers = reader.read_ranges(&asks)?;
                 for (range, buffer) in wave.iter().zip(buffers) {
-                    let base = stage.len();
-                    stage.extend_from_slice(&buffer);
                     for &(position, offset) in &plan[range.members.clone()] {
                         // Held in place and parsed at apply, so staging ignores key size
                         let span = prefix_bound as usize + order[position].1 as usize;
                         let skip = ((u64::from(offset) - range.start) as usize).min(buffer.len());
                         let len = span.min(buffer.len() - skip);
-                        staged[position - start] = Some((base + skip, len));
+                        // Only the record's bytes stage, so the dead bytes around it take no room
+                        staged[position] = Some((stage.len(), len));
+                        stage.extend_from_slice(&buffer[skip..skip + len]);
                     }
                     reader.recycle(buffer);
                 }
@@ -889,11 +899,9 @@ impl Compactor {
                     continue;
                 };
                 let held = Part::new(&slab, at, stretch);
-                let (offset, len) = order[start + slot];
-                let found = match (&rows, layout.keyless_key(len)) {
-                    (Some(rows), Some(check)) => {
-                        keyless_held(&rows[start + slot], offset, held, check)
-                    }
+                let (offset, len) = order[slot];
+                let found = match (is_keyless, layout.keyless_key(len)) {
+                    (true, Some(check)) => keyless_held(&kept[slot], offset, held, check),
                     _ => held_record(offset, held),
                 };
                 let (record, payload) = match found {
@@ -919,7 +927,6 @@ impl Compactor {
             }
             // Landing the copies frees the stripe's read buffers for the next stripe
             self.land_run(reel, dest_index, index, &mut run, tally)?;
-            start = end;
         }
         Ok(())
     }
@@ -1444,7 +1451,7 @@ impl Compactor {
                 let footer = self.scrub_footer(shared, segment)?;
                 (
                     0,
-                    footer_bound(shared, &handle, file_len, footer.as_deref())?,
+                    footer_bound(shared, &handle, file_len, footer.is_some())?,
                 )
             }
         };
@@ -1739,22 +1746,6 @@ impl Compactor {
     }
 }
 
-/// Each column's records in key order as offset and length pairs, nothing on a bad row
-fn footer_order(footer: &SegmentFooter) -> Option<(Vec<(u32, u32)>, u64)> {
-    let mut order = Vec::with_capacity(footer.entry_count());
-    let mut widest = 0usize;
-    for partition in &footer.partitions {
-        widest = widest.max(partition.widest_key());
-        for row in 0..partition.len() {
-            match partition.row_at(row) {
-                Ok(row) => order.push((row.offset, row.len)),
-                Err(_) => return None,
-            }
-        }
-    }
-    Some((order, HEADER_LEN as u64 + widest as u64))
-}
-
 /// Whether a tombstone must be copied because something it shadows may still turn up
 fn should_carry(
     reel: &Reel,
@@ -1866,10 +1857,10 @@ pub fn footer_bound(
     shared: &Arc<ReelShared>,
     handle: &SegmentHandle,
     file_len: u64,
-    footer: Option<&SegmentFooter>,
+    has_footer: bool,
 ) -> Result<u64> {
     let min_footer = FIXED_TAIL_LEN as u64;
-    if footer.is_none() || file_len < min_footer {
+    if !has_footer || file_len < min_footer {
         return Ok(file_len);
     }
     let trailer = shared
@@ -1946,46 +1937,12 @@ impl<'reader, 'driver> RecordScan<'reader, 'driver> {
     }
 }
 
-/// Inputs to an ordered rewrite: the footer's order, and the rows that key keyless records
+/// Inputs to an ordered rewrite: the footer's rows, and the bound on a record's prefix
 struct Ordered<'a> {
-    order: &'a [(u32, u32)],
+    rows: &'a FooterRows,
     prefix_bound: u64,
-    footer: Option<&'a SegmentFooter>,
     layout: RecordLayout,
 }
-
-/// The footer rows the index still points at, and every tombstone, in `footer_order`'s order
-///
-/// A keyless segment also gets each kept row's key, since its records hold none
-fn live_rows(
-    index: &ReelIndex,
-    segment: SegmentId,
-    footer: &SegmentFooter,
-    layout: RecordLayout,
-) -> Result<KeptRows> {
-    let mut order = Vec::with_capacity(footer.entry_count());
-    let mut rows = layout
-        .is_keyless_layout()
-        .then(|| Vec::with_capacity(footer.entry_count()));
-    for partition in &footer.partitions {
-        for at in 0..partition.len() {
-            let row = partition.row_at(at)?;
-            let key = RecordKey::from_bytes(partition.column, partition.key_at(at).unwrap_or(&[]))?;
-            let loc = Loc::new(segment, row.offset, row.len);
-            if row.flags.is_data() && !index.is_live_at(&key, loc, row.lsn)? {
-                continue;
-            }
-            order.push((row.offset, row.len));
-            if let Some(rows) = rows.as_mut() {
-                rows.push((key, row));
-            }
-        }
-    }
-    Ok((order, rows))
-}
-
-/// The offsets and lengths a rewrite reads, and the keyless rows beside them
-type KeptRows = (Vec<(u32, u32)>, Option<Vec<(RecordKey, FooterRow)>>);
 
 /// A keyless record held where the read left it, its header put together from its row
 fn keyless_held(
@@ -2045,21 +2002,6 @@ pub fn read_payload(reader: &mut SegmentReader<'_>, record: &SourceRecord) -> Re
     let length = record.header.length as usize;
     let bytes = reader.range(record.payload_at(), length)?;
     Ok(bytes.to_vec())
-}
-
-/// The end of the stripe that starts here, capped by staged bytes, at least one record
-fn stripe_end(order: &[(u32, u32)], start: usize) -> usize {
-    let mut end = start + 1;
-    let mut staged = u64::from(order[start].1);
-    while end < order.len() {
-        let next = u64::from(order[end].1);
-        if staged + next > STRIPE_STAGE_BYTES {
-            break;
-        }
-        staged += next;
-        end += 1;
-    }
-    end
 }
 
 /// What one punch pass over the volume found and gave back
@@ -2708,7 +2650,7 @@ mod tests {
         let source = source_handle(shared, SegmentId(1)).expect("handle");
         let file_len = segment_len(shared, &source).expect("len").expect("present");
         let footer = shared.footer_of(SegmentId(1)).expect("footer");
-        let region_end = footer_bound(shared, &source, file_len, footer.as_deref()).expect("bound");
+        let region_end = footer_bound(shared, &source, file_len, footer.is_some()).expect("bound");
         let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
         let footer = footer.expect("sealed");
         let partition = &footer.partitions[0];
@@ -3634,7 +3576,10 @@ mod tests {
             .footer_of(SegmentId(1))
             .expect("footer read")
             .expect("the footer parses");
-        assert!(footer_order(&footer).is_none(), "the rows still decode");
+        assert!(
+            FooterRows::Whole(footer).prefix_bound().is_none(),
+            "the rows still decode"
+        );
 
         let (target, _) = fixture
             .compactor

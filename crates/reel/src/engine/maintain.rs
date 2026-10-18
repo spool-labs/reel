@@ -52,6 +52,11 @@ const MAX_FOLD: usize = 256;
 /// A tail that takes no write for this long is sealed by the tick
 const IDLE_SEAL: Duration = Duration::from_secs(5);
 
+/// A tail whose segment holds this many tombstones is sealed by the tick, busy or not, since
+/// each one stays a grave in the index until the seal. Deletes that never pause then peak near
+/// 230 MiB however long they run, where half the limit costs a quarter more time
+const GRAVE_SEAL: u64 = 1 << 19;
+
 impl ReelStore {
     /// Tell the index about every segment that has sealed since it was last told
     pub(super) fn settle_sealed(&self) -> Result<()> {
@@ -357,7 +362,7 @@ impl ReelStore {
             return Ok(());
         }
         self.retry_broken_seals();
-        self.seal_idle_tails(IDLE_SEAL)?;
+        self.seal_due_tails(IDLE_SEAL, GRAVE_SEAL)?;
         self.publish_footprint();
         self.page_out_sealed()?;
         self.sweep_covers()?;
@@ -385,13 +390,21 @@ impl ReelStore {
         )
     }
 
-    /// Seal each tail that took no write for `idle`, so compaction can reach what it holds
-    pub(crate) fn seal_idle_tails(&self, idle: Duration) -> Result<()> {
+    /// Seal each tail that took no write for `idle` or holds `graves` tombstones
+    ///
+    /// A quiet tail seals so compaction can reach what it holds, and a busy one so its graves
+    /// can be pruned, which steady deletes would otherwise keep in memory without bound
+    pub(crate) fn seal_due_tails(&self, idle: Duration, graves: u64) -> Result<()> {
         let now = Instant::now();
         let mut seen = lock(&self.idle);
         let tails = self.reel.tails();
         seen.resize(tails.len(), None);
         for (tail, watch) in tails.iter().zip(seen.iter_mut()) {
+            if tail.graves_held() >= graves {
+                tail.seal()?;
+                *watch = None;
+                continue;
+            }
             let head = (tail.tail().active_segment(), tail.tail().committed_len());
             match *watch {
                 Some((segment, len, since)) if (segment, len) == head => {

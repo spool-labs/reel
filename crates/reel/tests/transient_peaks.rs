@@ -478,3 +478,86 @@ fn a_seal_packs_its_footer_without_copies() {
         );
     }
 }
+
+/// The slice column alone, the way the node's repair rows are keyed
+const SLICE_COLUMNS: ColumnSet = &[SLICES];
+
+/// Keys that exist before the deletes start, the rest are deleted without ever being written
+const STANDING_KEYS: u64 = 200_000;
+
+/// Deletes between ticks, far too few apart for a tail to sit five seconds without a write
+const DELETES_PER_TICK: u64 = 100_000;
+
+/// A run of deletes may hold this much in graves and rows however long it goes on
+const GRAVE_CEILING: usize = 320 * 1024 * 1024;
+
+/// One segment that no run here fills, so only a seal the tick asks for closes it
+fn grave_config() -> ReelConfig {
+    ReelConfig {
+        segment_bytes: ByteCount::from_bytes(4000 * 1024 * 1024),
+        ..config()
+    }
+}
+
+/// The peak heap of `deletes` deletes that never pause, ticking the way the node does
+fn grave_peak(deletes: u64) -> usize {
+    let dir = TempDir::new().expect("tempdir");
+    let store =
+        ReelStore::open(dir.path().to_path_buf(), grave_config(), SLICE_COLUMNS).expect("open");
+    let value = [7u8; 16];
+    for first in (0..STANDING_KEYS).step_by(BATCH_ROWS as usize) {
+        let mut batch = WriteBatch::new();
+        for row in first..first + BATCH_ROWS {
+            batch.put(SLICES.name, &slice_key(row), &value);
+        }
+        Store::write_batch(&store, batch).expect("puts");
+    }
+    // Every other standing key is deleted, along with keys nothing ever wrote
+    let doomed = |row: u64| row >= STANDING_KEYS || row.is_multiple_of(2);
+    let (peak, _) = peak_of(|| {
+        for first in (0..deletes).step_by(BATCH_ROWS as usize) {
+            let mut batch = WriteBatch::new();
+            for row in (first..first + BATCH_ROWS).filter(|row| doomed(*row)) {
+                batch.delete(SLICES.name, &slice_key(row));
+            }
+            Store::write_batch(&store, batch).expect("deletes");
+            if (first + BATCH_ROWS).is_multiple_of(DELETES_PER_TICK) {
+                store.maintain_once().expect("tick");
+            }
+        }
+    });
+
+    let check = |store: &ReelStore| {
+        for row in [0, 1, 2, 3, STANDING_KEYS - 1, STANDING_KEYS, deletes - 1] {
+            let held = Store::get(store, SLICES.name, &slice_key(row)).expect("get");
+            assert_eq!(held.is_some(), !doomed(row), "row {row} answered wrong");
+        }
+    };
+    check(&store);
+    store.close().expect("close");
+    drop(store);
+    let reopened =
+        ReelStore::open(dir.path().to_path_buf(), grave_config(), SLICE_COLUMNS).expect("reopen");
+    check(&reopened);
+    peak
+}
+
+// deletes that never pause leave a bounded heap of graves, since a tail full of them seals
+#[test]
+fn steady_deletes_hold_bounded_graves() {
+    let _turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for deletes in [2_000_000, 8_000_000] {
+        let began = std::time::Instant::now();
+        let peak = grave_peak(deletes);
+        println!(
+            "{deletes} deletes: graves peaked {:.2} MiB in {:.2?}",
+            mib(peak),
+            began.elapsed()
+        );
+        assert!(
+            peak < GRAVE_CEILING,
+            "{deletes} deletes peaked at {:.2} MiB",
+            mib(peak)
+        );
+    }
+}

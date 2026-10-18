@@ -4479,13 +4479,13 @@ fn the_tick_seals_a_tail_gone_quiet() {
         .collect();
 
     for byte in 2..5u8 {
-        store.seal_idle_tails(quiet).expect("look");
+        store.seal_due_tails(quiet, u64::MAX).expect("look");
         store.put(&record(7, byte), &[byte; 100]).expect("put");
     }
     assert_eq!(segment(written), before, "a tail taking writes was sealed");
 
-    store.seal_idle_tails(quiet).expect("first quiet look");
-    store.seal_idle_tails(quiet).expect("second quiet look");
+    store.seal_due_tails(quiet, u64::MAX).expect("first quiet look");
+    store.seal_due_tails(quiet, u64::MAX).expect("second quiet look");
     assert_ne!(segment(written), before, "the quiet tail is still open");
     let after: Vec<_> = (0..tails.len())
         .filter(|at| *at != written)
@@ -4496,6 +4496,53 @@ fn the_tick_seals_a_tail_gone_quiet() {
         store.get(&record(7, 4)).expect("get"),
         Some(Value::new(vec![4; 100]))
     );
+}
+
+// a busy tail whose segment holds enough tombstones seals, and reads answer the same after it
+#[test]
+fn a_tail_full_of_graves_seals_while_busy() {
+    let (store, _backend, dir) = posix_store(config(1, SyncPolicy::Never));
+    let busy = std::time::Duration::MAX;
+    let tail = &store.reel.tails()[0];
+    for byte in 1..=4u8 {
+        store.put(&record(7, byte), &[byte; 100]).expect("put");
+    }
+    store.delete(&record(7, 1)).expect("delete");
+    store.delete(&record(7, 9)).expect("delete of a key never written");
+    let before = tail.tail().active_segment();
+
+    store.seal_due_tails(busy, 3).expect("look");
+    assert_eq!(tail.tail().active_segment(), before, "two graves sealed the tail");
+    store.delete(&record(7, 2)).expect("delete");
+    store.seal_due_tails(busy, 3).expect("look");
+    assert_ne!(tail.tail().active_segment(), before, "three graves left the tail open");
+    assert_eq!(tail.graves_held(), 0, "the fresh segment came with graves");
+
+    let check = |store: &ReelStore| {
+        for byte in [1u8, 2, 9] {
+            assert_eq!(store.get(&record(7, byte)).expect("get"), None, "{byte} came back");
+        }
+        for byte in [3u8, 4] {
+            assert_eq!(
+                store.get(&record(7, byte)).expect("get"),
+                Some(Value::new(vec![byte; 100])),
+                "{byte} went missing"
+            );
+        }
+    };
+    check(&store);
+    store.maintain_once().expect("tick");
+    check(&store);
+    store.close().expect("close");
+    drop(store);
+    let reopened = ReelStore::open_with_io(
+        dir.path().to_path_buf(),
+        config(1, SyncPolicy::Never),
+        COLUMNS,
+        Arc::new(PosixBackend::new()) as Arc<dyn ReelIo>,
+    )
+    .expect("reopen");
+    check(&reopened);
 }
 
 // an older version beside the newer one in a segment is found through the key's blocks

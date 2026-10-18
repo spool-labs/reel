@@ -233,6 +233,9 @@ struct Active {
     /// Rows for the records written so far, which the seal packs into the footer
     entries: Mutex<SegmentFooter>,
 
+    /// Tombstones written into this segment, each one a grave in the index until the seal
+    graves: AtomicU64,
+
     /// The same rows as journal groups in the segment file, kept until the seal
     journal: Arc<Journal>,
 
@@ -560,6 +563,11 @@ impl Appender {
             segment: active.handle.id(),
             target,
         })
+    }
+
+    /// Tombstones the active segment holds, each one a grave in the index until it seals
+    pub fn graves_held(&self) -> u64 {
+        read(&self.active).graves.load(Ordering::Relaxed)
     }
 
     /// Whether the active segment holds a record past its header
@@ -984,6 +992,8 @@ impl Appender {
             pending.push(entry);
         }
         drop(pending);
+        let graves = entries.iter().filter(|entry| entry.is_tombstone()).count();
+        active.graves.fetch_add(graves as u64, Ordering::Relaxed);
         Ok(locs)
     }
 
@@ -1048,6 +1058,9 @@ impl Appender {
         }
         if let Some(entry) = listed {
             lock(&active.entries).push(&entry);
+            if entry.is_tombstone() {
+                active.graves.fetch_add(1, Ordering::Relaxed);
+            }
         }
         Ok(Loc::new(active.handle.id(), base as u32, header.length))
     }
@@ -1413,6 +1426,7 @@ impl Appender {
             alloc_high: AtomicU64::new(0),
             fill: Mutex::new(()),
             entries: Mutex::new(SegmentFooter::empty()),
+            graves: AtomicU64::new(0),
             journal: Arc::new(journal),
             sync: Arc::new(SyncState::new()),
             terminal: AtomicBool::new(false),
@@ -1551,6 +1565,7 @@ fn resume_active(shared: &Arc<ReelShared>, resumed: ResumableTail) -> Result<Act
         alloc_high: AtomicU64::new(end),
         fill: Mutex::new(()),
         entries: Mutex::new(resumed.entries),
+        graves: AtomicU64::new(0),
         journal: Arc::new(journal),
         sync: Arc::new(SyncState::new()),
         terminal: AtomicBool::new(false),
@@ -1659,6 +1674,7 @@ fn placeholder_active(driver: Arc<IoDriver>) -> Active {
         alloc_high: AtomicU64::new(0),
         fill: Mutex::new(()),
         entries: Mutex::new(SegmentFooter::empty()),
+        graves: AtomicU64::new(0),
         journal: Arc::new(Journal::none(&driver)),
         sync: Arc::new(SyncState::new()),
         terminal: AtomicBool::new(false),

@@ -51,6 +51,11 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // A large block shrinks where it lies, so a shrink only gives bytes back
+        if new_size <= layout.size() {
+            LIVE.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
+            return unsafe { System.realloc(ptr, layout, new_size) };
+        }
         // Both buffers are live while the bytes move
         grow(new_size);
         let moved = unsafe { System.realloc(ptr, layout, new_size) };
@@ -424,6 +429,52 @@ fn a_prune_packs_in_place() {
             peak <= packed + PRUNE_SLACK,
             "the prune of {rows} rows peaked at {:.2} MiB",
             mib(peak)
+        );
+    }
+}
+
+/// A footer of `rows` slice rows in hashed key order, nine in ten of them tombstones
+fn graves_footer(rows: u64) -> SegmentFooter {
+    let mut footer = SegmentFooter::empty();
+    for row in 0..rows {
+        let key = RecordKey::from_bytes(SLICES.id, &slice_key(row)).expect("key");
+        let flags = match row % 10 {
+            0 => Flags::DATA,
+            _ => Flags::TOMBSTONE,
+        };
+        footer.push(&FooterEntry::new(key, Lsn(row + 1), row as u32, 100, flags));
+    }
+    footer
+}
+
+/// A pack may hold this much per row it sorts, for the order and the moves it walks
+const PACK_BYTES_PER_ROW: usize = 24;
+
+/// A pack may add this much whatever the row count, for the stretch in hand, the filter and the tail
+const PACK_SLACK: usize = 8 * 1024 * 1024;
+
+/// The peak heap of packing a footer of `rows` graves, and how long the pack took
+fn seal_footer_peak(rows: u64) -> (usize, std::time::Duration) {
+    let mut footer = graves_footer(rows);
+    let began = std::time::Instant::now();
+    // Each stretch is dropped once handed over, the way a seal writes it and lets it go
+    let (peak, _) = peak_of(|| footer.pack_into(10, |_| Ok(())).expect("pack"));
+    (peak, began.elapsed())
+}
+
+// a seal's footer pack holds its sort order and a stretch of rows, never another copy of them
+#[test]
+fn a_seal_packs_its_footer_without_copies() {
+    let _turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for rows in [1_000_000, 4_000_000] {
+        let (peak, took) = seal_footer_peak(rows);
+        println!("{rows} rows: footer pack peaked {:.2} MiB in {took:.2?}", mib(peak));
+        let ceiling = rows as usize * PACK_BYTES_PER_ROW + PACK_SLACK;
+        assert!(
+            peak <= ceiling,
+            "the pack of {rows} rows peaked at {:.2} MiB, over {:.2} MiB",
+            mib(peak),
+            mib(ceiling)
         );
     }
 }

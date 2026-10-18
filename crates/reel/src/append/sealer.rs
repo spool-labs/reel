@@ -9,7 +9,7 @@ use crate::config::RepairPath;
 use crate::error::{ReelError, Result};
 use crate::format::footer::{seal_mark, SegmentFooter};
 use crate::format::loc::SegmentId;
-use crate::io::op::{Advice, Part, WriteBuf};
+use crate::io::op::{Advice, WriteBuf};
 use crate::reel::ReelShared;
 use crate::sync::tension::Tension;
 use crate::sync::{lock, read, write};
@@ -47,31 +47,23 @@ pub(super) fn seal_segment(shared: &Arc<ReelShared>, active: &Active, end: u64) 
     // The tally is current up to this sequence number
     footer.sealed_at = shared.lsn.peek();
     let written = (|| -> Result<()> {
-        let (rows, tail) = footer.pack_apart(shared.config.filter_bits)?;
-        // Write the rows straight from their partitions and put them back after
-        let rows: Vec<Arc<Vec<u8>>> = rows.into_iter().map(Arc::new).collect();
-        let footer_len = rows.iter().map(|piece| piece.len()).sum::<usize>() + tail.len();
-        let sealed_end = end + footer_len as u64;
-        let mut pieces: Vec<WriteBuf> = rows
-            .iter()
-            .filter(|piece| !piece.is_empty())
-            .map(|piece| WriteBuf::Part(Part::new(piece, 0, piece.len())))
-            .collect();
-        pieces.push(WriteBuf::owned(tail));
-        // Keep the rows until the footer that lists them is on disk
+        // The rows go down a stretch at a time, never past where the journal's rows begin
         let rows_at = active.journal.rows_at();
-        let wrote = match sealed_end < rows_at {
-            true => shared.driver.writev_all(active.handle.file(), end, pieces),
-            false => Err(ReelError::Corruption(format!(
-                "a footer ending at {sealed_end} reaches the rows at {rows_at}"
-            ))),
-        };
-        footer.put_rows(
-            rows.into_iter()
-                .map(|piece| Arc::try_unwrap(piece).unwrap_or_else(|piece| Vec::clone(&piece)))
-                .collect(),
-        );
-        wrote?;
+        let mut at = end;
+        let footer_len = footer.pack_into(shared.config.filter_bits, |piece| {
+            let next = at + piece.len() as u64;
+            if next >= rows_at {
+                return Err(ReelError::Corruption(format!(
+                    "a footer ending at {next} reaches the rows at {rows_at}"
+                )));
+            }
+            shared
+                .driver
+                .writev_all(active.handle.file(), at, vec![WriteBuf::owned(piece)])?;
+            at = next;
+            Ok(())
+        })?;
+        let sealed_end = end + footer_len as u64;
         active
             .journal
             .mark_sealed(&seal_mark(sealed_end, footer_len as u32))?;

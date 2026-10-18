@@ -1,7 +1,5 @@
 //! Sealed segment footer: a sorted index of the segment's records, one partition per column
 
-use std::borrow::Cow;
-
 use crate::error::{ReelError, Result};
 use crate::format::block::PartitionSpan;
 use crate::format::column::{ColumnId, RecordKey};
@@ -559,25 +557,68 @@ impl FooterPartition {
             })
         });
 
+        if !self.is_varying() {
+            self.permute_strided(order);
+            return;
+        }
+        // Varying rows have no slot to move into, so they go to a sorted copy
         let mut sorted = Vec::with_capacity(self.packed.len());
         let mut starts = Vec::with_capacity(self.starts.len());
-        if self.is_varying() {
-            starts.push(0u32);
-        }
+        starts.push(0u32);
         for (_, index) in order {
             // In range, as above
             let (start, end) = self.row_span(index as usize).unwrap_or((0, 0));
             sorted.extend_from_slice(&self.packed[start..end]);
-            if self.is_varying() {
-                starts.push(sorted.len() as u32);
-            }
+            starts.push(sorted.len() as u32);
         }
         self.packed = sorted;
-        if self.is_varying() {
-            self.starts = starts;
+        self.starts = starts;
+    }
+
+    /// Move each strided row to its sorted place, one cycle at a time, with one row aside
+    fn permute_strided(&mut self, order: Vec<(u64, u32)>) {
+        // The walk chases sources, so a narrow table keeps more of it in cache
+        let mut from: Vec<u32> = order.iter().map(|(_, index)| *index).collect();
+        drop(order);
+        let stride = self.stride();
+        let mut aside = vec![0u8; stride];
+        for start in 0..from.len() {
+            // A placed row's source is marked spent, so its cycle is not walked twice
+            if from[start] == u32::MAX {
+                continue;
+            }
+            aside.copy_from_slice(&self.packed[start * stride..(start + 1) * stride]);
+            let mut at = start;
+            loop {
+                let source = std::mem::replace(&mut from[at], u32::MAX) as usize;
+                // Read the table a few steps on, so the walk finds those entries in cache
+                let mut ahead = source;
+                for _ in 0..LOOK_AHEAD {
+                    match from.get(ahead) {
+                        Some(&next) if next != u32::MAX => ahead = next as usize,
+                        _ => break,
+                    }
+                }
+                std::hint::black_box(ahead);
+                if source == start {
+                    self.packed[at * stride..(at + 1) * stride].copy_from_slice(&aside);
+                    break;
+                }
+                self.packed
+                    .copy_within(source * stride..(source + 1) * stride, at * stride);
+                at = source;
+            }
         }
+        drop(from);
+        self.packed.shrink_to_fit();
     }
 }
+
+/// Encoded footer rows a pack holds before it hands them to the writer
+const PACK_STRETCH: usize = 1024 * 1024;
+
+/// Steps a permute walk reads its table ahead of the row it moves
+const LOOK_AHEAD: usize = 8;
 
 /// The parsed contents of a sealed segment footer
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -709,18 +750,22 @@ impl SegmentFooter {
 
     /// Serialize the footer to its on-disk bytes with checksum and magic
     pub fn pack(&mut self, filter_bits: u8) -> Result<Vec<u8>> {
-        let (rows, tail) = self.pack_apart(filter_bits)?;
-        let mut buf = Vec::with_capacity(rows.iter().map(Vec::len).sum::<usize>() + tail.len());
-        for piece in &rows {
-            buf.extend_from_slice(piece);
-        }
-        buf.extend_from_slice(&tail);
-        self.put_rows(rows);
-        Ok(buf)
+        let mut bytes = Vec::new();
+        self.pack_into(filter_bits, |piece| {
+            bytes.extend_from_slice(&piece);
+            Ok(())
+        })?;
+        Ok(bytes)
     }
 
-    /// Pack the footer as per-partition rows and the bytes after them, for a vectored write
-    pub fn pack_apart(&mut self, filter_bits: u8) -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
+    /// Pack the footer a stretch at a time into `write`, and give the footer's length
+    ///
+    /// The rows go out as they encode, so a pack holds one stretch of them past the footer itself
+    pub fn pack_into(
+        &mut self,
+        filter_bits: u8,
+        mut write: impl FnMut(Vec<u8>) -> Result<()>,
+    ) -> Result<usize> {
         // Drop partitions that were opened with room and never written
         self.partitions.retain(|partition| !partition.is_empty());
         self.partitions.sort_by_key(|partition| partition.column);
@@ -731,12 +776,33 @@ impl SegmentFooter {
             partition.is_packed = true;
         }
 
-        let encoded = self
-            .partitions
-            .iter()
-            .map(encoded_partition_rows)
-            .collect::<Result<Vec<_>>>()?;
-        let rows_len: usize = encoded.iter().map(|rows| rows.len()).sum();
+        let mut crc = digest();
+        let mut spans = Vec::with_capacity(self.partitions.len());
+        for partition in &self.partitions {
+            let mut span = 0;
+            let mut send = |piece: Vec<u8>| -> Result<()> {
+                crc.update(&piece);
+                span += piece.len();
+                write(piece)
+            };
+            let mut rows = PrefixRows::new(Tail::Entry);
+            for index in 0..partition.len() {
+                let width = partition.key_len(index).ok_or_else(|| {
+                    ReelError::Corruption(
+                        "footer row is shorter than the tail every row carries".to_string(),
+                    )
+                })?;
+                let row = partition.row_bytes(index)?;
+                rows.push(&row[..width], &row[width..])?;
+                if rows.packed_len() >= PACK_STRETCH {
+                    send(rows.drain())?;
+                }
+            }
+            send(rows.into_encoded())?;
+            spans.push(span);
+        }
+
+        let rows_len: usize = spans.iter().sum();
         let region_len = self.filter_region_len();
         let footer_len =
             rows_len + region_len + self.partitions.len() * DIRECTORY_ROW_LEN + FIXED_TAIL_LEN;
@@ -749,8 +815,8 @@ impl SegmentFooter {
                 }
             }
         }
-        for (partition, rows) in self.partitions.iter().zip(&encoded) {
-            write_directory_row(&mut buf, partition, rows.len());
+        for (partition, span) in self.partitions.iter().zip(&spans) {
+            write_directory_row(&mut buf, partition, *span);
         }
 
         buf.extend_from_slice(&self.sealed_at.pack());
@@ -767,39 +833,11 @@ impl SegmentFooter {
         buf.extend_from_slice(&(footer_len as u32).to_le_bytes());
         buf.extend_from_slice(&FOOTER_MAGIC.to_le_bytes());
 
-        let mut crc = digest();
-        for rows in &encoded {
-            crc.update(rows);
-        }
         crc.update(&buf);
         let crc = crc.finalize() as u32;
         buf[crc_at..crc_at + U32_BYTES].copy_from_slice(&crc.to_le_bytes());
-
-        // A packed partition lends an encoded copy, and a strided one lends its own rows
-        let encoded: Vec<Option<Vec<u8>>> = encoded
-            .into_iter()
-            .map(|rows| match rows {
-                Cow::Owned(rows) => Some(rows),
-                Cow::Borrowed(_) => None,
-            })
-            .collect();
-        let rows = encoded
-            .into_iter()
-            .zip(self.partitions.iter_mut())
-            .map(|(encoded, partition)| {
-                encoded.unwrap_or_else(|| std::mem::take(&mut partition.packed))
-            })
-            .collect();
-        Ok((rows, buf))
-    }
-
-    /// Take back the rows `pack_apart` lent
-    pub fn put_rows(&mut self, rows: Vec<Vec<u8>>) {
-        for (partition, rows) in self.partitions.iter_mut().zip(rows) {
-            if !partition.is_packed() {
-                partition.packed = rows;
-            }
-        }
+        write(buf)?;
+        Ok(footer_len)
     }
 
     /// Parse a footer from the trailing bytes of a segment
@@ -917,24 +955,6 @@ pub(crate) fn partition_in<Held>(
     held.binary_search_by_key(&column, &column_of)
         .ok()
         .map(|at| &held[at])
-}
-
-/// One partition's rows in their on-disk form
-fn encoded_partition_rows(partition: &FooterPartition) -> Result<Cow<'_, [u8]>> {
-    if !partition.is_packed() {
-        return Ok(Cow::Borrowed(partition.packed.as_slice()));
-    }
-    let mut rows = PrefixRows::with_capacity(Tail::Entry, partition.packed.len());
-    for index in 0..partition.len() {
-        let width = partition.key_len(index).ok_or_else(|| {
-            ReelError::Corruption(
-                "footer row is shorter than the tail every row carries".to_string(),
-            )
-        })?;
-        let row = partition.row_bytes(index)?;
-        rows.push(&row[..width], &row[width..])?;
-    }
-    Ok(Cow::Owned(rows.into_encoded()))
 }
 
 /// Write one partition's directory row, with the span of its encoded rows
@@ -1190,6 +1210,87 @@ fn verify_footer_crc(footer: &[u8], footer_len: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FNV-1a over a footer's bytes, so a test can hold a footer's whole image as one number
+    fn fingerprint(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// Footers of every shape a seal packs: hashed fixed keys, keys in order, two columns, mixed widths
+    fn shaped_footers() -> Vec<SegmentFooter> {
+        let hashed = |row: u64| -> Vec<u8> {
+            let mut key = vec![0u8; 34];
+            let mut word = row.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            for byte in key.iter_mut() {
+                word ^= word >> 29;
+                word = word.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                *byte = (word >> 56) as u8;
+            }
+            key[0] = 0;
+            key[1] = 7;
+            key
+        };
+        let row = |column: ColumnId, key: &[u8], lsn: u64| {
+            let flags = match lsn % 10 {
+                0 => Flags::DATA,
+                _ => Flags::TOMBSTONE,
+            };
+            let key = RecordKey::from_bytes(column, key).expect("key");
+            FooterEntry::new(key, Lsn(lsn), lsn as u32 * 3, (lsn % 7) as u32 * 100, flags)
+        };
+        let mut shapes = Vec::new();
+        let mut footer = SegmentFooter::empty();
+        for at in 0..50_000u64 {
+            footer.push(&row(RECORD, &hashed(at), at + 1));
+        }
+        shapes.push(footer);
+        let mut footer = SegmentFooter::empty();
+        for at in 0..20_000u64 {
+            footer.push(&row(RECORD, &at.to_be_bytes(), at + 1));
+        }
+        shapes.push(footer);
+        let mut footer = SegmentFooter::empty();
+        for at in 0..30_000u64 {
+            footer.push(&row(BLOB, &hashed(at)[..32], at + 1));
+            footer.push(&row(RECORD, &hashed(at + 7), 40_000 + at));
+            // A key written twice, newest first, sorts by sequence number
+            if at % 97 == 0 {
+                footer.push(&row(RECORD, &hashed(at + 7), 10_000 + at));
+            }
+        }
+        shapes.push(footer);
+        let mut footer = SegmentFooter::empty();
+        for at in 0..10_000u64 {
+            let key = hashed(at);
+            let width = 8 + (at % 20) as usize;
+            footer.push(&row(RECORD, &key[..width], at + 1));
+        }
+        shapes.push(footer);
+        shapes
+    }
+
+    // a footer packs to the same bytes it did before the seal stopped copying its rows
+    #[test]
+    fn a_footer_packs_to_its_known_bytes() {
+        let packed: Vec<(usize, u64)> = shaped_footers()
+            .into_iter()
+            .map(|mut footer| {
+                let bytes = footer.pack(10).expect("pack");
+                (bytes.len(), fingerprint(&bytes))
+            })
+            .collect();
+        assert_eq!(packed, KNOWN_FOOTERS);
+    }
+
+    /// Each shaped footer's length and fingerprint, as the copying pack wrote them
+    const KNOWN_FOOTERS: [(usize, u64); 4] = [
+        (2_136_576, 10_811_219_090_749_997_459),
+        (197_465, 13_537_047_558_226_266_353),
+        (2_501_076, 5_680_304_668_234_636_622),
+        (254_271, 6_232_051_871_458_169_905),
+    ];
 
     const RECORD: ColumnId = ColumnId(1);
     const BLOB: ColumnId = ColumnId(2);

@@ -80,6 +80,9 @@ pub struct PrefixRows {
 
     /// How every row's tail lies
     tail: Tail,
+
+    /// Rows bytes already handed over by `drain`, which the restarts still count from
+    drained: usize,
 }
 
 impl PrefixRows {
@@ -91,12 +94,13 @@ impl PrefixRows {
         }
     }
 
-    /// An empty block with room for about this many bytes of rows
-    pub fn with_capacity(tail: Tail, bytes: usize) -> PrefixRows {
-        PrefixRows {
-            packed: Vec::with_capacity(bytes),
-            ..PrefixRows::new(tail)
-        }
+    /// Hand over the rows encoded so far, so a writer holds one stretch of them at a time
+    ///
+    /// The restarts keep counting from the block's first byte, so only `into_encoded` may follow
+    pub(crate) fn drain(&mut self) -> Vec<u8> {
+        let rows = std::mem::take(&mut self.packed);
+        self.drained += rows.len();
+        rows
     }
 
     /// Number of rows in the block
@@ -133,7 +137,7 @@ impl PrefixRows {
 
         let restart = self.rows.is_multiple_of(RESTART_INTERVAL);
         if restart {
-            self.restarts.push(self.packed.len() as u32);
+            self.restarts.push((self.drained + self.packed.len()) as u32);
             self.last_tail = [0; TAIL_CAP];
         }
         let shared = match restart {
@@ -865,6 +869,7 @@ impl PrefixRows {
             last: Vec::new(),
             last_tail: [0; TAIL_CAP],
             tail,
+            drained: 0,
         })
     }
 }

@@ -164,11 +164,12 @@ impl Journal {
         let Some(file) = self.file else {
             return Ok(());
         };
-        if written.lost {
-            return Err(lost_rows());
-        }
+        // A pass with no rows for a lost journal claims nothing, so its parked seal can retry
         if bytes.is_empty() {
             return Ok(());
+        }
+        if written.lost {
+            return Err(lost_rows());
         }
         let rows = bytes.len();
         if self.whole_blocks {

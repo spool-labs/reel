@@ -53,8 +53,7 @@ const MAX_FOLD: usize = 256;
 const IDLE_SEAL: Duration = Duration::from_secs(5);
 
 /// A tail whose segment holds this many tombstones is sealed by the tick, busy or not, since
-/// each one stays a grave in the index until the seal. Deletes that never pause then peak near
-/// 230 MiB however long they run, where half the limit costs a quarter more time
+/// each one stays a grave in the index until the seal
 const GRAVE_SEAL: u64 = 1 << 19;
 
 impl ReelStore {

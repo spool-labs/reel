@@ -34,10 +34,10 @@ const fn column(id: u8, name: &'static str, key_width: KeyWidth, shard_bytes: u8
     }
 }
 
-/// Tracks the store is loaded with
+/// The test loads the store with this many tracks
 const TRACKS: usize = 160_000;
 
-/// Every this many tracks carries a slice
+/// One track in this many has a slice
 const SLICE_EVERY: usize = 4;
 
 /// Bytes in one slice, which do not shrink under lz4
@@ -49,10 +49,10 @@ const DELETED_PERCENT: u32 = 75;
 /// Segment size, small enough that the slices span many segments
 const SEGMENT_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Ticks the maintenance loop runs before the test calls it settled
+/// The maintenance loop runs at most this many ticks before the test calls it settled
 const MAX_TICKS: usize = 400;
 
-/// Free bytes glibc may hold past the burst before the test fails
+/// The test fails when glibc holds more free bytes than this past the burst
 const HELD_CEILING: usize = 128 * 1024 * 1024;
 
 /// What glibc says about its heap

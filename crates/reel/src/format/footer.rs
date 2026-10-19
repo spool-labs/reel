@@ -614,10 +614,10 @@ impl FooterPartition {
     }
 }
 
-/// Encoded footer rows a pack holds before it hands them to the writer
+/// A pack holds this many bytes of encoded footer rows before it hands them to the writer
 const PACK_STRETCH: usize = 1024 * 1024;
 
-/// Steps a permute walk reads its table ahead of the row it moves
+/// A permute walk reads its table this many steps ahead of the row it moves
 const LOOK_AHEAD: usize = 8;
 
 /// The parsed contents of a sealed segment footer
@@ -1271,7 +1271,7 @@ mod tests {
         shapes
     }
 
-    // a footer packs to the same bytes it did before the seal stopped copying its rows
+    // a footer packs to its known length and fingerprint
     #[test]
     fn a_footer_packs_to_its_known_bytes() {
         let packed: Vec<(usize, u64)> = shaped_footers()
@@ -1284,7 +1284,7 @@ mod tests {
         assert_eq!(packed, KNOWN_FOOTERS);
     }
 
-    /// Each shaped footer's length and fingerprint, as the copying pack wrote them
+    /// Each shaped footer's expected length and fingerprint
     const KNOWN_FOOTERS: [(usize, u64); 4] = [
         (2_136_576, 10_811_219_090_749_997_459),
         (197_465, 13_537_047_558_226_266_353),

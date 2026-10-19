@@ -1426,7 +1426,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             let doomed = state
                 .map
                 .sweep(|_, entry| !(entry.is_grave() && prunes(entry)));
-            // The sweep saw every grave, so the floor comes back exact.
+            // The sweep saw every grave, so the floor comes back exact
             state.oldest_grave = oldest_left;
             if doomed == 0 {
                 continue;

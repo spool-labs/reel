@@ -662,7 +662,7 @@ impl ReelIo for PosixBackend {
     }
 }
 
-/// Most threads one backend's read pool runs, which caps its awaited reads in flight
+/// One backend's read pool runs at most this many threads, which caps its awaited reads in flight
 const POOL_THREADS: usize = 64;
 
 /// A read split from its op, so a pool thread runs it on a descriptor the caller resolved

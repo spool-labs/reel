@@ -204,7 +204,7 @@ pub struct ReelStore {
     /// Admitted bytes at the last heat ask, which turns a counter into a rate
     ingest_marker: AtomicU64,
 
-    /// Deleted keys walks had stepped over when the last merge ran
+    /// Walks had stepped over this many deleted keys when the last merge ran
     merged_buried: AtomicU64,
 }
 

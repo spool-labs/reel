@@ -26,7 +26,7 @@ const DEFAULT_FILTER_BITS: u8 = 10;
 /// An automatic budget opens at most this many tails per volume, however wide the machine
 const MAX_AUTO_TAILS: usize = 2;
 
-/// Tails an automatic budget runs on a disk that seeks, since a second one seeks against the first
+/// An automatic budget runs this many tails on a disk that seeks, since a second one seeks against the first
 const ROTATIONAL_TAILS: u32 = 1;
 
 pub(crate) const KIB: u64 = 1024;

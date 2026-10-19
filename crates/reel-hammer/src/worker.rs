@@ -76,7 +76,7 @@ fn number_at(key: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_be_bytes(key.get(at..at + 8)?.try_into().ok()?))
 }
 
-/// Most slices are small and a few reach 3 MiB, as on the fleet
+/// Most slices are small and a few reach 3 MiB
 fn slice_len(rng: &mut SmallRng) -> u32 {
     match rng.gen_range(0..100) {
         0..=69 => rng.gen_range(64 << 10..256 << 10),

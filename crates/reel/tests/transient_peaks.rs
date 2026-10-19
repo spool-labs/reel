@@ -113,7 +113,7 @@ const FILLER_PER_ROW: u64 = 16;
 /// Walked rows per segment, about what one segment of this size holds
 const ROWS_PER_SEGMENT: u64 = 1_000;
 
-/// Rows a short walk takes
+/// A short walk takes this many rows
 const FEW: usize = 5;
 
 /// A short walk may add this much heap, whatever the segment count
@@ -215,7 +215,7 @@ fn a_short_walk_reads_no_whole_footers() {
     );
 }
 
-/// Rows in the footer a seal replaces
+/// The footer a seal replaces holds this many rows
 const SEALED_ROWS: u64 = 100_000;
 
 /// A fresh footer may reserve this much, whatever the footer before it held

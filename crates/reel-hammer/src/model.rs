@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
-/// Bytes every value starts with: column, version, key hash and length
+/// Every value starts with this many bytes: column, version, key hash and length
 pub const HEADER: usize = 21;
 
 /// A key in one column

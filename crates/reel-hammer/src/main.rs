@@ -76,7 +76,7 @@ pub struct Options {
     /// Reader threads
     #[arg(long, default_value_t = 4)]
     pub readers: usize,
-    /// Longest a life runs, in seconds
+    /// The longest a life runs, in seconds
     #[arg(long, value_parser = seconds, default_value = "300")]
     pub life: Duration,
     /// Share of lives that end in kill -9 at a random moment

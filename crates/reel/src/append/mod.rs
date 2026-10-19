@@ -565,7 +565,7 @@ impl Appender {
         })
     }
 
-    /// Tombstones the active segment holds, each one a grave in the index until it seals
+    /// How many tombstones the active segment holds, each one a grave in the index until it seals
     pub fn graves_held(&self) -> u64 {
         read(&self.active).graves.load(Ordering::Relaxed)
     }

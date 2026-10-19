@@ -91,7 +91,7 @@ fn churned_queue(dir: &TempDir) -> ReelStore {
     ReelStore::open(dir.path().to_path_buf(), config(), COLUMNS).expect("reopen")
 }
 
-/// Sealed keys a walk stepped over since a reading
+/// How many sealed keys walks stepped over since a reading
 fn stepped_since(store: &ReelStore, before: u64) -> u64 {
     store.filter_probes().stepped - before
 }

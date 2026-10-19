@@ -922,7 +922,7 @@ pub struct FilterProbes {
     /// Reads spent opening a sealed segment's directory before searching it
     map_reads: AtomicU64,
 
-    /// Keys a walk stepped over in the sealed runs, deleted ones included
+    /// Walks stepped over this many keys in the sealed runs, deleted ones included
     stepped: AtomicU64,
 
     /// Of those, the ones whose newest sealed row is a delete
@@ -993,7 +993,7 @@ pub struct ProbeCounts {
     /// How many reads went to opening those searches' directories
     pub map_reads: u64,
 
-    /// Keys walks stepped over in the sealed runs, deleted ones included
+    /// Walks stepped over this many keys in the sealed runs, deleted ones included
     pub stepped: u64,
 
     /// Of those, the ones whose newest sealed row is a delete

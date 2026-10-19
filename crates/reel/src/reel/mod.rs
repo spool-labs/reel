@@ -2015,8 +2015,13 @@ impl Reel {
     }
 
     /// Append a tombstone under an older record's own number, for a miss the index decided
-    pub fn bury(&self, key: RecordKey, lsn: Lsn) -> Result<Committed> {
-        self.route().append_carried_tombstone(key, lsn)
+    pub fn bury(&self, key: RecordKey, lsn: Lsn, above: SegmentId) -> Result<Committed> {
+        let tail = self.route();
+        // The tombstone ties the record on its number and wins as the newer segment, so it lands above it
+        while tail.tail().active_segment() < above {
+            tail.seal()?;
+        }
+        tail.append_carried_tombstone(key, lsn)
     }
 
     /// Append a tombstone covering a half-open key range within one column

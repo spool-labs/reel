@@ -1795,7 +1795,7 @@ pub(crate) fn evict_rotted(
         return Ok(false);
     }
     // The index alone keeps the miss, and the older versions it hides return once the record goes
-    let tombstone = reel.bury(key.clone(), lsn)?;
+    let tombstone = reel.bury(key.clone(), lsn, loc.segment)?;
     index.remove(key, lsn, tombstone.loc)?;
     Ok(true)
 }

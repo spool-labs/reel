@@ -21,8 +21,17 @@ pub struct Held {
 /// One logged mutation, or a flush or batch edge that returned
 #[derive(Clone, Debug)]
 pub enum Op {
-    Put { column: u8, key: Vec<u8>, version: u64, len: u32 },
-    Delete { column: u8, key: Vec<u8>, version: u64 },
+    Put {
+        column: u8,
+        key: Vec<u8>,
+        version: u64,
+        len: u32,
+    },
+    Delete {
+        column: u8,
+        key: Vec<u8>,
+        version: u64,
+    },
     Flush,
     BatchBegin,
     BatchEnd,
@@ -103,7 +112,14 @@ pub fn header_of(column: u8, key: &[u8], bytes: &[u8]) -> Result<Held, String> {
 }
 
 /// Check a window of a value that starts at `offset`
-pub fn check_window(column: u8, key: &[u8], held: Held, offset: usize, window: &[u8], plain: bool) -> Result<(), String> {
+pub fn check_window(
+    column: u8,
+    key: &[u8],
+    held: Held,
+    offset: usize,
+    window: &[u8],
+    plain: bool,
+) -> Result<(), String> {
     if offset + window.len() > held.len as usize {
         return Err(format!("a window runs past the {} byte value", held.len));
     }
@@ -124,18 +140,28 @@ pub struct OpLog {
 
 impl OpLog {
     pub fn create(path: &Path) -> Result<OpLog, String> {
-        let file = File::create(path).map_err(|error| format!("create {}: {error}", path.display()))?;
+        let file =
+            File::create(path).map_err(|error| format!("create {}: {error}", path.display()))?;
         Ok(OpLog { file })
     }
 
     pub fn append(&mut self, op: &Op) -> Result<(), String> {
         let mut record = Vec::with_capacity(64);
         match op {
-            Op::Put { column, key, version, len } => {
+            Op::Put {
+                column,
+                key,
+                version,
+                len,
+            } => {
                 push_slot(&mut record, PUT, *column, key, *version);
                 record.extend_from_slice(&len.to_le_bytes());
             }
-            Op::Delete { column, key, version } => push_slot(&mut record, DELETE, *column, key, *version),
+            Op::Delete {
+                column,
+                key,
+                version,
+            } => push_slot(&mut record, DELETE, *column, key, *version),
             Op::Flush => record.push(FLUSH),
             Op::BatchBegin => record.push(BEGIN),
             Op::BatchEnd => record.push(END),
@@ -178,19 +204,38 @@ fn read_op(bytes: &[u8], at: &mut usize) -> Result<Option<Op>, String> {
     *at += 1;
     match kind {
         PUT | DELETE => {
-            let Some(column) = bytes.get(*at).copied() else { return Ok(None) };
-            let Some(key_len) = u16_at(bytes, *at + 1) else { return Ok(None) };
+            let Some(column) = bytes.get(*at).copied() else {
+                return Ok(None);
+            };
+            let Some(key_len) = u16_at(bytes, *at + 1) else {
+                return Ok(None);
+            };
             let start = *at + 3;
-            let Some(key) = bytes.get(start..start + key_len as usize) else { return Ok(None) };
-            let Some(version) = u64_at(bytes, start + key_len as usize) else { return Ok(None) };
+            let Some(key) = bytes.get(start..start + key_len as usize) else {
+                return Ok(None);
+            };
+            let Some(version) = u64_at(bytes, start + key_len as usize) else {
+                return Ok(None);
+            };
             *at = start + key_len as usize + 8;
             let key = key.to_vec();
             if kind == DELETE {
-                return Ok(Some(Op::Delete { column, key, version }));
+                return Ok(Some(Op::Delete {
+                    column,
+                    key,
+                    version,
+                }));
             }
-            let Some(len) = u32_at(bytes, *at) else { return Ok(None) };
+            let Some(len) = u32_at(bytes, *at) else {
+                return Ok(None);
+            };
             *at += 4;
-            Ok(Some(Op::Put { column, key, version, len }))
+            Ok(Some(Op::Put {
+                column,
+                key,
+                version,
+                len,
+            }))
         }
         FLUSH => Ok(Some(Op::Flush)),
         BEGIN => Ok(Some(Op::BatchBegin)),
@@ -228,7 +273,8 @@ impl Baseline {
         if !path.exists() {
             return Ok(Baseline::default());
         }
-        let bytes = std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+        let bytes =
+            std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
         let torn = || format!("{} ends partway through an entry", path.display());
         let next_version = u64_at(&bytes, 0).ok_or_else(torn)?;
         let count = u64_at(&bytes, 8).ok_or_else(torn)? as usize;
@@ -237,7 +283,10 @@ impl Baseline {
         for _ in 0..count {
             let column = *bytes.get(at).ok_or_else(torn)?;
             let key_len = u16_at(&bytes, at + 1).ok_or_else(torn)? as usize;
-            let key = bytes.get(at + 3..at + 3 + key_len).ok_or_else(torn)?.to_vec();
+            let key = bytes
+                .get(at + 3..at + 3 + key_len)
+                .ok_or_else(torn)?
+                .to_vec();
             at += 3 + key_len;
             let version = u64_at(&bytes, at).ok_or_else(torn)?;
             let len = u32_at(&bytes, at + 8).ok_or_else(torn)?;
@@ -278,7 +327,11 @@ struct Logged<'a> {
 }
 
 fn sort_log(ops: &[Op]) -> Logged<'_> {
-    let mut logged = Logged { mutations: Vec::new(), floor: 0, batches: Vec::new() };
+    let mut logged = Logged {
+        mutations: Vec::new(),
+        floor: 0,
+        batches: Vec::new(),
+    };
     let mut open = None;
     for op in ops {
         match op {
@@ -298,7 +351,18 @@ fn sort_log(ops: &[Op]) -> Logged<'_> {
 /// What a mutation leaves its key holding
 fn effect(op: &Op) -> Option<(Slot, Option<Held>)> {
     match op {
-        Op::Put { column, key, version, len } => Some(((*column, key.clone()), Some(Held { version: *version, len: *len }))),
+        Op::Put {
+            column,
+            key,
+            version,
+            len,
+        } => Some((
+            (*column, key.clone()),
+            Some(Held {
+                version: *version,
+                len: *len,
+            }),
+        )),
         Op::Delete { column, key, .. } => Some(((*column, key.clone()), None)),
         Op::Flush | Op::BatchBegin | Op::BatchEnd => None,
     }
@@ -314,7 +378,12 @@ fn version_of(op: &Op) -> Option<u64> {
 /// Find a prefix of the logged ops that explains what the volume holds
 ///
 /// With `exact` the whole log must have landed, as after a clean close.
-pub fn check_prefix(base: &Baseline, ops: &[Op], observed: &HashMap<Slot, Held>, exact: bool) -> Result<Verdict, String> {
+pub fn check_prefix(
+    base: &Baseline,
+    ops: &[Op],
+    observed: &HashMap<Slot, Held>,
+    exact: bool,
+) -> Result<Verdict, String> {
     let logged = sort_log(ops);
     let count = logged.mutations.len();
     let low = match exact {
@@ -350,14 +419,22 @@ pub fn check_prefix(base: &Baseline, ops: &[Op], observed: &HashMap<Slot, Held>,
     }
 
     // A cut inside a batch splits writes that landed together
-    let inside = |cut: usize| logged.batches.iter().any(|(start, end)| *start < cut && cut < *end);
+    let inside = |cut: usize| {
+        logged
+            .batches
+            .iter()
+            .any(|(start, end)| *start < cut && cut < *end)
+    };
     let kept = cuts
         .iter()
         .filter_map(|(low, high)| (*low..=*high).rev().find(|cut| !inside(*cut)))
         .max()
         .ok_or_else(|| "every prefix that fits cuts a batch in two".to_string())?;
 
-    let mut next = Baseline { held: base.held.clone(), next_version: base.next_version };
+    let mut next = Baseline {
+        held: base.held.clone(),
+        next_version: base.next_version,
+    };
     for op in logged.mutations.iter().take(kept) {
         match effect(op) {
             Some((slot, Some(held))) => {
@@ -369,32 +446,69 @@ pub fn check_prefix(base: &Baseline, ops: &[Op], observed: &HashMap<Slot, Held>,
             None => {}
         }
     }
-    let highest = logged.mutations.iter().filter_map(|op| version_of(op)).max();
-    next.next_version = highest.map_or(base.next_version, |version| (version + 1).max(base.next_version));
-    Ok(Verdict { kept, logged: count, next })
+    let highest = logged
+        .mutations
+        .iter()
+        .filter_map(|op| version_of(op))
+        .max();
+    next.next_version = highest.map_or(base.next_version, |version| {
+        (version + 1).max(base.next_version)
+    });
+    Ok(Verdict {
+        kept,
+        logged: count,
+        next,
+    })
 }
 
 /// Keys no op touched hold what the baseline holds, and nothing else appears
-fn check_untouched(base: &Baseline, history: &HashMap<Slot, Vec<(usize, Option<Held>)>>, observed: &HashMap<Slot, Held>) -> Result<(), String> {
+fn check_untouched(
+    base: &Baseline,
+    history: &HashMap<Slot, Vec<(usize, Option<Held>)>>,
+    observed: &HashMap<Slot, Held>,
+) -> Result<(), String> {
     for (slot, held) in &base.held {
         if history.contains_key(slot) {
             continue;
         }
         match observed.get(slot) {
             Some(seen) if seen == held => {}
-            Some(seen) => return Err(format!("{} holds version {} where an earlier life left version {}", show(slot), seen.version, held.version)),
-            None => return Err(format!("{} lost version {} from an earlier life", show(slot), held.version)),
+            Some(seen) => {
+                return Err(format!(
+                    "{} holds version {} where an earlier life left version {}",
+                    show(slot),
+                    seen.version,
+                    held.version
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "{} lost version {} from an earlier life",
+                    show(slot),
+                    held.version
+                ))
+            }
         }
     }
     for (slot, seen) in observed {
         if !history.contains_key(slot) && !base.held.contains_key(slot) {
-            return Err(format!("{} holds version {}, which no op wrote", show(slot), seen.version));
+            return Err(format!(
+                "{} holds version {}, which no op wrote",
+                show(slot),
+                seen.version
+            ));
         }
     }
     Ok(())
 }
 
-fn no_prefix(slot: &Slot, seen: Option<Held>, steps: &[(usize, Option<Held>)], count: usize, floor: usize) -> String {
+fn no_prefix(
+    slot: &Slot,
+    seen: Option<Held>,
+    steps: &[(usize, Option<Held>)],
+    count: usize,
+    floor: usize,
+) -> String {
     let shown = match seen {
         Some(held) => format!("version {}", held.version),
         None => "nothing".to_string(),
@@ -421,17 +535,34 @@ mod tests {
     use super::*;
 
     fn put(key: u8, version: u64) -> Op {
-        Op::Put { column: 1, key: vec![key], version, len: 30 }
+        Op::Put {
+            column: 1,
+            key: vec![key],
+            version,
+            len: 30,
+        }
     }
 
     fn delete(key: u8, version: u64) -> Op {
-        Op::Delete { column: 1, key: vec![key], version }
+        Op::Delete {
+            column: 1,
+            key: vec![key],
+            version,
+        }
     }
 
     fn seen(pairs: &[(u8, u64)]) -> HashMap<Slot, Held> {
         pairs
             .iter()
-            .map(|(key, version)| ((1, vec![*key]), Held { version: *version, len: 30 }))
+            .map(|(key, version)| {
+                (
+                    (1, vec![*key]),
+                    Held {
+                        version: *version,
+                        len: 30,
+                    },
+                )
+            })
             .collect()
     }
 
@@ -439,7 +570,8 @@ mod tests {
     #[test]
     fn suffix_lost() {
         let ops = vec![put(1, 0), put(2, 1), delete(1, 2)];
-        let verdict = check_prefix(&Baseline::default(), &ops, &seen(&[(1, 0), (2, 1)]), false).expect("a prefix fits");
+        let verdict = check_prefix(&Baseline::default(), &ops, &seen(&[(1, 0), (2, 1)]), false)
+            .expect("a prefix fits");
         assert_eq!(verdict.kept, 2);
     }
 
@@ -447,7 +579,12 @@ mod tests {
     #[test]
     fn order_broken() {
         let ops = vec![put(1, 0), put(9, 1), delete(1, 2), put(2, 3)];
-        let verdict = check_prefix(&Baseline::default(), &ops, &seen(&[(1, 0), (9, 1), (2, 3)]), false);
+        let verdict = check_prefix(
+            &Baseline::default(),
+            &ops,
+            &seen(&[(1, 0), (9, 1), (2, 3)]),
+            false,
+        );
         assert!(verdict.is_err());
     }
 
@@ -470,7 +607,13 @@ mod tests {
     fn values_check() {
         let value = value_of(14, b"key", 7, 5000, false);
         let held = header_of(14, b"key", &value).expect("a header");
-        assert_eq!(held, Held { version: 7, len: 5000 });
+        assert_eq!(
+            held,
+            Held {
+                version: 7,
+                len: 5000
+            }
+        );
         check_window(14, b"key", held, 100, &value[100..900], false).expect("the window matches");
         assert!(header_of(14, b"other", &value).is_err());
     }

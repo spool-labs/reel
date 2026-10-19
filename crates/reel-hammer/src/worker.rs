@@ -12,7 +12,9 @@ use rand::{Rng, SeedableRng};
 use reel::ReelStore;
 use reel_core::{Direction, Store, Value, WriteBatch};
 
-use crate::model::{check_window, header_of, show, value_of, Baseline, Held, Op, OpLog, Slot, HEADER};
+use crate::model::{
+    check_window, header_of, show, value_of, Baseline, Held, Op, OpLog, Slot, HEADER,
+};
 use crate::stats::{heap, Stats};
 use crate::{column_name, columns, open_store, Options};
 
@@ -36,7 +38,9 @@ const MAINTAIN_EVERY: Duration = Duration::from_millis(250);
 type Failure = Arc<RwLock<Option<String>>>;
 
 fn fail(failure: &Failure, stop: &AtomicBool, error: String) {
-    let mut first = failure.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut first = failure
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     first.get_or_insert(error);
     stop.store(true, Ordering::Relaxed);
 }
@@ -107,12 +111,18 @@ impl Writer {
         let value = value_of(column, &key, version, len, plain(column));
         let len = value.len() as u32;
         let name = column_name(column)?;
-        self.log_op(Op::Put { column, key: key.clone(), version, len })?;
+        self.log_op(Op::Put {
+            column,
+            key: key.clone(),
+            version,
+            len,
+        })?;
         match self.batch.as_mut() {
             Some(batch) => batch.put(name, &key, &value),
             None => {
                 let start = Instant::now();
-                Store::put(&*self.store, name, &key, &value).map_err(|error| format!("put: {error}"))?;
+                Store::put(&*self.store, name, &key, &value)
+                    .map_err(|error| format!("put: {error}"))?;
                 self.stats.put.record(start.elapsed(), value.len());
             }
         }
@@ -123,12 +133,17 @@ impl Writer {
     fn delete(&mut self, column: u8, key: Vec<u8>) -> Result<(), String> {
         let version = self.take_version();
         let name = column_name(column)?;
-        self.log_op(Op::Delete { column, key: key.clone(), version })?;
+        self.log_op(Op::Delete {
+            column,
+            key: key.clone(),
+            version,
+        })?;
         match self.batch.as_mut() {
             Some(batch) => batch.delete(name, &key),
             None => {
                 let start = Instant::now();
-                Store::delete(&*self.store, name, &key).map_err(|error| format!("delete: {error}"))?;
+                Store::delete(&*self.store, name, &key)
+                    .map_err(|error| format!("delete: {error}"))?;
                 self.stats.delete.record(start.elapsed(), 0);
             }
         }
@@ -180,7 +195,9 @@ impl Writer {
 
     fn flush(&mut self) -> Result<(), String> {
         let start = Instant::now();
-        self.store.flush().map_err(|error| format!("flush: {error}"))?;
+        self.store
+            .flush()
+            .map_err(|error| format!("flush: {error}"))?;
         self.stats.flush.record(start.elapsed(), 0);
         self.log.append(&Op::Flush)
     }
@@ -194,14 +211,22 @@ impl Writer {
         if self.tapes.is_empty() || rng.gen_bool(0.05) {
             let number = self.next_tape;
             self.next_tape += 1;
-            self.tapes.push(TapeRow { number, tracks: Vec::new(), next_track: 0 });
+            self.tapes.push(TapeRow {
+                number,
+                tracks: Vec::new(),
+                next_track: 0,
+            });
             self.put(TAPE, number.to_be_bytes().to_vec(), 180)?;
         }
         for _ in 0..rng.gen_range(1..=8) {
             self.ingest_track(rng)?;
         }
         let spool = rng.gen_range(0..20u16);
-        self.put(SPOOL_STATUS, spool.to_be_bytes().to_vec(), rng.gen_range(60..200))?;
+        self.put(
+            SPOOL_STATUS,
+            spool.to_be_bytes().to_vec(),
+            rng.gen_range(60..200),
+        )?;
         self.put(SYNC_CURSOR, b"cursor".to_vec(), 40)?;
         if batched {
             self.commit()?;
@@ -249,7 +274,11 @@ impl Writer {
             true => self.delete(TAPE, tape.number.to_be_bytes().to_vec())?,
             false => {
                 self.put(TAPE, tape.number.to_be_bytes().to_vec(), 180)?;
-                self.tapes.push(TapeRow { number: tape.number, tracks: Vec::new(), next_track: tape.next_track });
+                self.tapes.push(TapeRow {
+                    number: tape.number,
+                    tracks: Vec::new(),
+                    next_track: tape.next_track,
+                });
             }
         }
         let mut key = tape.number.to_be_bytes().to_vec();
@@ -282,14 +311,20 @@ impl Writer {
                 self.put(OBJECT_INFO, info_key(number, track), rng.gen_range(80..400))?;
             }
             let spool = rng.gen_range(0..20u16);
-            self.put(SPOOL_STATUS, spool.to_be_bytes().to_vec(), rng.gen_range(60..200))?;
+            self.put(
+                SPOOL_STATUS,
+                spool.to_be_bytes().to_vec(),
+                rng.gen_range(60..200),
+            )?;
         }
         Ok(())
     }
 
     fn pick_track(&self, rng: &mut SmallRng) -> Option<(u64, u64)> {
         let tape = self.tapes.get(rng.gen_range(0..self.tapes.len().max(1)))?;
-        let track = tape.tracks.get(rng.gen_range(0..tape.tracks.len().max(1)))?;
+        let track = tape
+            .tracks
+            .get(rng.gen_range(0..tape.tracks.len().max(1)))?;
         Some((tape.number, *track))
     }
 
@@ -301,10 +336,21 @@ impl Writer {
             by_column.entry(*column).or_default().push(key.clone());
             let head = Store::get_range(&*self.store, column_name(*column)?, key, 0, HEADER)
                 .map_err(|error| format!("get_range: {error}"))?
-                .ok_or_else(|| format!("{} lost version {}", show(&(*column, key.clone())), held.version))?;
+                .ok_or_else(|| {
+                    format!(
+                        "{} lost version {}",
+                        show(&(*column, key.clone())),
+                        held.version
+                    )
+                })?;
             let seen = header_of(*column, key, &head)?;
             if seen != *held {
-                return Err(format!("{} serves version {} for {}", show(&(*column, key.clone())), seen.version, held.version));
+                return Err(format!(
+                    "{} serves version {} for {}",
+                    show(&(*column, key.clone())),
+                    seen.version,
+                    held.version
+                ));
             }
         }
         for spec in columns() {
@@ -316,7 +362,13 @@ impl Writer {
         Ok(())
     }
 
-    fn check_column(&self, name: &'static str, column: u8, want: &[Vec<u8>], rng: &mut SmallRng) -> Result<(), String> {
+    fn check_column(
+        &self,
+        name: &'static str,
+        column: u8,
+        want: &[Vec<u8>],
+        rng: &mut SmallRng,
+    ) -> Result<(), String> {
         let keys = self
             .store
             .iter_keys_prefix(name, b"")
@@ -326,7 +378,11 @@ impl Writer {
                 .iter()
                 .find(|key| want.binary_search(key).is_err())
                 .map(|key| show(&(column, key.clone())));
-            return Err(format!("{name} lists {} keys for {} held, first stray {stray:?}", keys.len(), want.len()));
+            return Err(format!(
+                "{name} lists {} keys for {} held, first stray {stray:?}",
+                keys.len(),
+                want.len()
+            ));
         }
         if want.is_empty() {
             return Ok(());
@@ -344,7 +400,10 @@ impl Writer {
         let expected: Vec<Vec<u8>> = want.iter().skip(at).take(64).cloned().collect();
         match walked == expected {
             true => Ok(()),
-            false => Err(format!("a walk of {name} from {} strays from the held keys", show(&(column, want[at].clone())))),
+            false => Err(format!(
+                "a walk of {name} from {} strays from the held keys",
+                show(&(column, want[at].clone()))
+            )),
         }
     }
 
@@ -355,15 +414,20 @@ impl Writer {
             let Some(number) = number_at(key, 0) else {
                 continue;
             };
-            let tape = tapes
-                .entry(number)
-                .or_insert(TapeRow { number, tracks: Vec::new(), next_track: 0 });
+            let tape = tapes.entry(number).or_insert(TapeRow {
+                number,
+                tracks: Vec::new(),
+                next_track: 0,
+            });
             if let (OBJECT_INFO, Some(track)) = (*column, number_at(key, 8)) {
                 tape.tracks.push(track);
                 tape.next_track = tape.next_track.max(track + 1);
             }
         }
-        tapes.retain(|number, _| self.held.contains_key(&(TAPE, number.to_be_bytes().to_vec())));
+        tapes.retain(|number, _| {
+            self.held
+                .contains_key(&(TAPE, number.to_be_bytes().to_vec()))
+        });
         self.tapes = tapes.into_values().collect();
         self.tapes.sort_by_key(|tape| tape.number);
         let after_last = self.tapes.last().map_or(0, |tape| tape.number + 1);
@@ -393,7 +457,10 @@ impl Reader {
     }
 
     fn pick(&mut self) -> Option<Slot> {
-        let keys = self.sample.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = self
+            .sample
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match keys.is_empty() {
             true => None,
             false => Some(keys[self.rng.gen_range(0..keys.len())].clone()),
@@ -433,14 +500,18 @@ impl Reader {
     /// A ranged read of a slice, the way a gateway asks for part of a track
     fn window(&mut self, name: &'static str, column: u8, key: &[u8]) -> Result<(), String> {
         let start = Instant::now();
-        let head = Store::get_range(&*self.store, name, key, 0, HEADER).map_err(|error| format!("get_range: {error}"))?;
+        let head = Store::get_range(&*self.store, name, key, 0, HEADER)
+            .map_err(|error| format!("get_range: {error}"))?;
         let Some(head) = head else {
             return Ok(());
         };
         let held = header_of(column, key, &head)?;
         let offset = self.rng.gen_range(0..held.len as usize);
-        let len = self.rng.gen_range(1..=(held.len as usize - offset).min(256 << 10));
-        let window = Store::get_range(&*self.store, name, key, offset as u64, len).map_err(|error| format!("get_range: {error}"))?;
+        let len = self
+            .rng
+            .gen_range(1..=(held.len as usize - offset).min(256 << 10));
+        let window = Store::get_range(&*self.store, name, key, offset as u64, len)
+            .map_err(|error| format!("get_range: {error}"))?;
         self.stats.range.record(start.elapsed(), len);
         match window {
             Some(window) => check_window(column, key, held, offset, &window, plain(column)),
@@ -451,7 +522,10 @@ impl Reader {
     fn get(&mut self, name: &'static str, column: u8, key: &[u8]) -> Result<(), String> {
         let start = Instant::now();
         let value = Store::get(&*self.store, name, key).map_err(|error| format!("get: {error}"))?;
-        self.stats.get.record(start.elapsed(), value.as_ref().map_or(0, |value| value.len()));
+        self.stats.get.record(
+            start.elapsed(),
+            value.as_ref().map_or(0, |value| value.len()),
+        );
         let Some(value) = value else {
             return Ok(());
         };
@@ -460,7 +534,12 @@ impl Reader {
     }
 }
 
-fn spawn_maintainer(store: Arc<ReelStore>, stats: Arc<Stats>, stop: Arc<AtomicBool>, failure: Failure) -> JoinHandle<()> {
+fn spawn_maintainer(
+    store: Arc<ReelStore>,
+    stats: Arc<Stats>,
+    stop: Arc<AtomicBool>,
+    failure: Failure,
+) -> JoinHandle<()> {
     thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {
             let start = Instant::now();
@@ -479,11 +558,22 @@ fn count_segments(volume: &std::path::Path) -> usize {
     };
     entries
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().is_some_and(|extension| extension == "reel"))
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "reel")
+        })
         .count()
 }
 
-fn spawn_metrics(options: &Options, life: u64, store: Arc<ReelStore>, stats: Arc<Stats>, stop: Arc<AtomicBool>) -> Result<JoinHandle<()>, String> {
+fn spawn_metrics(
+    options: &Options,
+    life: u64,
+    store: Arc<ReelStore>,
+    stats: Arc<Stats>,
+    stop: Arc<AtomicBool>,
+) -> Result<JoinHandle<()>, String> {
     let path = options.dir.join("metrics.jsonl");
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -526,12 +616,28 @@ pub fn run(options: &Options, life: u64, base: Baseline) -> Result<(), String> {
 
     let mut threads = Vec::new();
     for _ in 0..options.readers {
-        let reader = Reader { store: store.clone(), sample: sample.clone(), stats: stats.clone(), rng: SmallRng::seed_from_u64(rng.gen()) };
+        let reader = Reader {
+            store: store.clone(),
+            sample: sample.clone(),
+            stats: stats.clone(),
+            rng: SmallRng::seed_from_u64(rng.gen()),
+        };
         let (stop, failure) = (stop.clone(), failure.clone());
         threads.push(thread::spawn(move || reader.run(stop, failure)));
     }
-    threads.push(spawn_maintainer(store.clone(), stats.clone(), stop.clone(), failure.clone()));
-    threads.push(spawn_metrics(options, life, store.clone(), stats.clone(), stop.clone())?);
+    threads.push(spawn_maintainer(
+        store.clone(),
+        stats.clone(),
+        stop.clone(),
+        failure.clone(),
+    ));
+    threads.push(spawn_metrics(
+        options,
+        life,
+        store.clone(),
+        stats.clone(),
+        stop.clone(),
+    )?);
 
     let mut writer = Writer {
         store: store.clone(),
@@ -547,12 +653,16 @@ pub fn run(options: &Options, life: u64, base: Baseline) -> Result<(), String> {
     };
     writer.adopt();
 
-    let outcome = write_until(&mut writer, options, &stop, &sample, &mut rng).and_then(|()| writer.checkpoint(&mut rng));
+    let outcome = write_until(&mut writer, options, &stop, &sample, &mut rng)
+        .and_then(|()| writer.checkpoint(&mut rng));
     stop.store(true, Ordering::Relaxed);
     for thread in threads {
         let _ = thread.join();
     }
-    let failed = failure.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+    let failed = failure
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     if let Some(error) = failed {
         return Err(error);
     }
@@ -561,10 +671,21 @@ pub fn run(options: &Options, life: u64, base: Baseline) -> Result<(), String> {
 }
 
 /// The writer picks phases at random until the life ends or a thread fails
-fn write_until(writer: &mut Writer, options: &Options, stop: &AtomicBool, sample: &RwLock<Vec<Slot>>, rng: &mut SmallRng) -> Result<(), String> {
+fn write_until(
+    writer: &mut Writer,
+    options: &Options,
+    stop: &AtomicBool,
+    sample: &RwLock<Vec<Slot>>,
+    rng: &mut SmallRng,
+) -> Result<(), String> {
     let deadline = Instant::now() + options.life;
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
-        let live = writer.store.live_data_size_bytes().ok().flatten().unwrap_or(0);
+        let live = writer
+            .store
+            .live_data_size_bytes()
+            .ok()
+            .flatten()
+            .unwrap_or(0);
         // A full volume only sheds tapes until it is back under the cap
         let phase = match live > options.max_gib << 30 {
             true => 40,
@@ -586,7 +707,10 @@ fn write_until(writer: &mut Writer, options: &Options, stop: &AtomicBool, sample
             89..=94 => writer.flush()?,
             _ => writer.checkpoint(rng)?,
         }
-        *sample.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = writer.held.keys().cloned().collect();
+        *sample
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            writer.held.keys().cloned().collect();
     }
     Ok(())
 }

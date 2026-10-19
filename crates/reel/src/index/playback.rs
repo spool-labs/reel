@@ -1619,7 +1619,11 @@ mod tests {
             let mut page = KeyPage::merging();
             assert_eq!(fixture.page(&mut playback(), &mut page), vec![1]);
             let found = page.found_at(0).expect("an entry");
-            assert_eq!(found.loc.segment, SegmentId(19), "the punched source won the tie");
+            assert_eq!(
+                found.loc.segment,
+                SegmentId(19),
+                "the punched source won the tie"
+            );
         }
     }
 

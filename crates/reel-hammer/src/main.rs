@@ -19,10 +19,15 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use reel::{ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IoBackend, KeyWidth, ReelConfig, ReelStore, SyncPolicy, ThreadBudget, MAP_EVERYTHING};
+use reel::{
+    ByteCount, Codec, ColumnId, ColumnSet, ColumnSpec, IoBackend, KeyWidth, ReelConfig, ReelStore,
+    SyncPolicy, ThreadBudget, MAP_EVERYTHING,
+};
 use reel_core::Store;
 
-use crate::model::{check_prefix, header_of, read_log, show, Baseline, Held, Slot, Verdict, HEADER};
+use crate::model::{
+    check_prefix, header_of, read_log, show, Baseline, Held, Slot, Verdict, HEADER,
+};
 
 #[derive(Parser)]
 #[command(about = "Hammer a reel volume with a tape node's workload, kills included")]
@@ -95,11 +100,25 @@ fn seconds(raw: &str) -> Result<Duration, String> {
 }
 
 const fn plain(id: u8, name: &'static str) -> ColumnSpec {
-    ColumnSpec { id: ColumnId(id), name, key_width: KeyWidth::Variable, shard_bytes: 0, purge_mark: None, codec: Codec::Lz4 }
+    ColumnSpec {
+        id: ColumnId(id),
+        name,
+        key_width: KeyWidth::Variable,
+        shard_bytes: 0,
+        purge_mark: None,
+        codec: Codec::Lz4,
+    }
 }
 
 const fn shaped(id: u8, name: &'static str, width: u16, shard_bytes: u8) -> ColumnSpec {
-    ColumnSpec { id: ColumnId(id), name, key_width: KeyWidth::Fixed(width), shard_bytes, purge_mark: None, codec: Codec::Lz4 }
+    ColumnSpec {
+        id: ColumnId(id),
+        name,
+        key_width: KeyWidth::Fixed(width),
+        shard_bytes,
+        purge_mark: None,
+        codec: Codec::Lz4,
+    }
 }
 
 /// The columns a tape node declares, with its ids and shapes
@@ -184,11 +203,14 @@ fn observe(options: &Options) -> Result<HashMap<Slot, Held>, String> {
             let head = Store::get_range(&store, spec.name, &slot.1, 0, HEADER)
                 .map_err(|error| format!("get_range: {error}"))?
                 .ok_or_else(|| format!("{} is listed but reads as missing", show(&slot)))?;
-            let held = header_of(column, &slot.1, &head).map_err(|error| format!("{}: {error}", show(&slot)))?;
+            let held = header_of(column, &slot.1, &head)
+                .map_err(|error| format!("{}: {error}", show(&slot)))?;
             seen.insert(slot, held);
         }
     }
-    store.close().map_err(|error| format!("close after the check: {error}"))?;
+    store
+        .close()
+        .map_err(|error| format!("close after the check: {error}"))?;
     Ok(seen)
 }
 
@@ -224,12 +246,20 @@ fn live_once(options: &Options, life: u64, rng: &mut SmallRng) -> Result<Ending,
     let born = Instant::now();
     loop {
         if let Some(status) = child.try_wait().map_err(|error| format!("wait: {error}"))? {
-            return Ok(Ending { killed: false, code: status.code(), seconds: born.elapsed().as_secs_f64() });
+            return Ok(Ending {
+                killed: false,
+                code: status.code(),
+                seconds: born.elapsed().as_secs_f64(),
+            });
         }
         if kill_at.is_some_and(|at| born.elapsed() >= at) {
             let _ = child.kill();
             let _ = child.wait();
-            return Ok(Ending { killed: true, code: None, seconds: born.elapsed().as_secs_f64() });
+            return Ok(Ending {
+                killed: true,
+                code: None,
+                seconds: born.elapsed().as_secs_f64(),
+            });
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -271,7 +301,11 @@ fn supervise(mut options: Options) -> Result<ExitCode, String> {
             false => "closed",
         };
         if !ending.killed && ending.code != Some(0) {
-            journal.say(format!("VIOLATION in life {life} (exit {:?}), see life-{life}.err, volume kept in {}", ending.code, dir.display()));
+            journal.say(format!(
+                "VIOLATION in life {life} (exit {:?}), see life-{life}.err, volume kept in {}",
+                ending.code,
+                dir.display()
+            ));
             return Ok(ExitCode::FAILURE);
         }
         let check = Instant::now();
@@ -287,7 +321,8 @@ fn supervise(mut options: Options) -> Result<ExitCode, String> {
                     check.elapsed().as_secs_f64()
                 ));
                 verdict.next.save(&baseline)?;
-                let _ = std::fs::remove_file(dir.join(format!("life-{}.ops", life.saturating_sub(2))));
+                let _ =
+                    std::fs::remove_file(dir.join(format!("life-{}.ops", life.saturating_sub(2))));
             }
             Err(error) => {
                 journal.say(format!("VIOLATION after life {life} ({how}): {error}. Volume, life-{life}.ops and baseline-prev.bin kept in {}", dir.display()));
@@ -327,7 +362,8 @@ fn child_args(options: &Options, life: u64) -> Vec<String> {
 }
 
 fn run_life(index: u64, options: &Options) -> ExitCode {
-    let outcome = Baseline::load(&options.dir.join("baseline.bin")).and_then(|base| worker::run(options, index, base));
+    let outcome = Baseline::load(&options.dir.join("baseline.bin"))
+        .and_then(|base| worker::run(options, index, base));
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

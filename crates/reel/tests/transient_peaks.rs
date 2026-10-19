@@ -329,7 +329,11 @@ fn compact_peak(rows: u64) -> usize {
     assert_eq!(kept, rows.div_ceil(every), "every kept row survives");
     for row in [0, 1, every, rows / 2, rows - 1] {
         let held = Store::get(&store, WALKED, &walked_key(row)).expect("get");
-        assert_eq!(held.is_some(), row % every == 0, "row {row} reads as it should");
+        assert_eq!(
+            held.is_some(),
+            row % every == 0,
+            "row {row} reads as it should"
+        );
     }
     peak
 }
@@ -409,7 +413,10 @@ fn prune_peak(rows: u64) -> (usize, usize) {
     let (peak, pruned) = peak_of(|| index.prune_tombstones(Lsn(u64::MAX), &sealed));
     assert_eq!(pruned, rows - rows.div_ceil(10), "every grave was prunable");
     for row in (0..rows).step_by(10) {
-        assert!(index.get(&slice_key(row)).is_some(), "a survivor went missing");
+        assert!(
+            index.get(&slice_key(row)).is_some(),
+            "a survivor went missing"
+        );
     }
     (peak, (index.heap_bytes() - empty) as usize)
 }
@@ -468,7 +475,10 @@ fn a_seal_packs_its_footer_without_copies() {
     let _turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     for rows in [1_000_000, 4_000_000] {
         let (peak, took) = seal_footer_peak(rows);
-        println!("{rows} rows: footer pack peaked {:.2} MiB in {took:.2?}", mib(peak));
+        println!(
+            "{rows} rows: footer pack peaked {:.2} MiB in {took:.2?}",
+            mib(peak)
+        );
         let ceiling = rows as usize * PACK_BYTES_PER_ROW + PACK_SLACK;
         assert!(
             peak <= ceiling,

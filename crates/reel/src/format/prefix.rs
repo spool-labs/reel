@@ -137,7 +137,8 @@ impl PrefixRows {
 
         let restart = self.rows.is_multiple_of(RESTART_INTERVAL);
         if restart {
-            self.restarts.push((self.drained + self.packed.len()) as u32);
+            self.restarts
+                .push((self.drained + self.packed.len()) as u32);
             self.last_tail = [0; TAIL_CAP];
         }
         let shared = match restart {

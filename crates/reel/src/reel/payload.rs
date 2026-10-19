@@ -242,7 +242,11 @@ mod tests {
         for capacity in [2 * CLASS_BUDGET, 4 * CLASS_BUDGET, 8 * CLASS_BUDGET] {
             give(take(capacity));
         }
-        assert_eq!(held_bytes(), before, "a buffer over the budget stayed in the pool");
+        assert_eq!(
+            held_bytes(),
+            before,
+            "a buffer over the budget stayed in the pool"
+        );
     }
 
     // a capacity to grow to is one the pool will take back

@@ -4484,8 +4484,12 @@ fn the_tick_seals_a_tail_gone_quiet() {
     }
     assert_eq!(segment(written), before, "a tail taking writes was sealed");
 
-    store.seal_due_tails(quiet, u64::MAX).expect("first quiet look");
-    store.seal_due_tails(quiet, u64::MAX).expect("second quiet look");
+    store
+        .seal_due_tails(quiet, u64::MAX)
+        .expect("first quiet look");
+    store
+        .seal_due_tails(quiet, u64::MAX)
+        .expect("second quiet look");
     assert_ne!(segment(written), before, "the quiet tail is still open");
     let after: Vec<_> = (0..tails.len())
         .filter(|at| *at != written)
@@ -4508,19 +4512,33 @@ fn a_tail_full_of_graves_seals_while_busy() {
         store.put(&record(7, byte), &[byte; 100]).expect("put");
     }
     store.delete(&record(7, 1)).expect("delete");
-    store.delete(&record(7, 9)).expect("delete of a key never written");
+    store
+        .delete(&record(7, 9))
+        .expect("delete of a key never written");
     let before = tail.tail().active_segment();
 
     store.seal_due_tails(busy, 3).expect("look");
-    assert_eq!(tail.tail().active_segment(), before, "two graves sealed the tail");
+    assert_eq!(
+        tail.tail().active_segment(),
+        before,
+        "two graves sealed the tail"
+    );
     store.delete(&record(7, 2)).expect("delete");
     store.seal_due_tails(busy, 3).expect("look");
-    assert_ne!(tail.tail().active_segment(), before, "three graves left the tail open");
+    assert_ne!(
+        tail.tail().active_segment(),
+        before,
+        "three graves left the tail open"
+    );
     assert_eq!(tail.graves_held(), 0, "the fresh segment came with graves");
 
     let check = |store: &ReelStore| {
         for byte in [1u8, 2, 9] {
-            assert_eq!(store.get(&record(7, byte)).expect("get"), None, "{byte} came back");
+            assert_eq!(
+                store.get(&record(7, byte)).expect("get"),
+                None,
+                "{byte} came back"
+            );
         }
         for byte in [3u8, 4] {
             assert_eq!(
@@ -5843,7 +5861,10 @@ fn a_reopen_draws_no_segment_number_a_key_run_covers() {
     }
     store.page_out_sealed().expect("page out");
     assert!(store.merge_when_due().expect("merge").is_some());
-    assert!(store.index().key_runs().covers(last), "the run covers the last seal");
+    assert!(
+        store.index().key_runs().covers(last),
+        "the run covers the last seal"
+    );
     // The lower tail takes every key, so each covered segment dies and the close unlinks it
     for byte in 0..4u8 {
         put_on_tail(&store, 0, &record(7, byte), vec![11; 300]);
@@ -5890,7 +5911,11 @@ fn a_reopen_draws_no_segment_number_a_key_run_covers() {
     drop(third);
 
     let fourth = reopen_image(third_sim.durable_image(), config(1));
-    assert_eq!(fourth.get(&record(7, 0)).expect("get"), None, "the delete came undone");
+    assert_eq!(
+        fourth.get(&record(7, 0)).expect("get"),
+        None,
+        "the delete came undone"
+    );
     assert_eq!(
         fourth.get(&record(9, 0)).expect("get"),
         Some(Value::new(vec![3; 300])),
@@ -6055,15 +6080,26 @@ fn a_torn_group_buries_later_groups() {
         Arc::new(second_sim.clone()),
     )
     .expect("second open");
-    assert_eq!(second.get(&record(7, 2)).expect("get"), None, "the torn group hides both");
+    assert_eq!(
+        second.get(&record(7, 2)).expect("get"),
+        None,
+        "the torn group hides both"
+    );
     second.put(&record(7, 3), &[3; 100]).expect("put");
     second.flush().expect("flush");
     let image = second_sim.durable_image();
     std::mem::forget(second);
 
     let third = reopen_image(image, torn_config());
-    assert_eq!(third.get(&record(7, 2)).expect("get"), None, "a buried group came back");
-    assert!(third.get(&record(7, 3)).expect("get").is_some(), "the new put held");
+    assert_eq!(
+        third.get(&record(7, 2)).expect("get"),
+        None,
+        "a buried group came back"
+    );
+    assert!(
+        third.get(&record(7, 3)).expect("get").is_some(),
+        "the new put held"
+    );
 }
 
 /// Copy a store's files to a fresh directory, leaving its lock behind
@@ -6111,7 +6147,10 @@ fn a_torn_group_stays_buried_on_disk() {
             };
             let rows = bytes.get(rows_at as usize..).unwrap_or_default();
             if crate::format::journal::read_groups(rows).0.len() == 2 {
-                let file = std::fs::OpenOptions::new().write(true).open(&path).expect("open");
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .expect("open");
                 file.write_all_at(&[bytes[rows_at as usize + 10] ^ 0xff], rows_at + 10)
                     .expect("tear");
                 torn += 1;
@@ -6121,15 +6160,26 @@ fn a_torn_group_stays_buried_on_disk() {
     assert_eq!(torn, 1, "one journal with two groups");
 
     let second = ReelStore::open(dir.path().to_path_buf(), torn_config(), COLUMNS).expect("open");
-    assert_eq!(second.get(&record(7, 2)).expect("get"), None, "the torn group hides both");
+    assert_eq!(
+        second.get(&record(7, 2)).expect("get"),
+        None,
+        "the torn group hides both"
+    );
     second.put(&record(7, 3), &[3; 100]).expect("put");
     second.flush().expect("flush");
     std::mem::forget(second);
     let last = copy_store(dir.path());
 
     let third = ReelStore::open(last.path().to_path_buf(), torn_config(), COLUMNS).expect("open");
-    assert_eq!(third.get(&record(7, 2)).expect("get"), None, "a buried group came back");
-    assert!(third.get(&record(7, 3)).expect("get").is_some(), "the new put held");
+    assert_eq!(
+        third.get(&record(7, 2)).expect("get"),
+        None,
+        "a buried group came back"
+    );
+    assert!(
+        third.get(&record(7, 3)).expect("get").is_some(),
+        "the new put held"
+    );
 }
 
 // a key run over a segment that reads as foreign gives way, so its other segments answer whole
@@ -6167,9 +6217,13 @@ fn a_key_run_over_a_foreign_segment_gives_way() {
     }
 
     let first_sim = SimIo::from_image(image);
-    let first =
-        ReelStore::open_with_io(PathBuf::from(ROOT), config(), COLUMNS, Arc::new(first_sim.clone()))
-            .expect("first open");
+    let first = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        config(),
+        COLUMNS,
+        Arc::new(first_sim.clone()),
+    )
+    .expect("first open");
     let answer = first.get(&record(7, 0)).expect("get");
     assert_eq!(
         answer,

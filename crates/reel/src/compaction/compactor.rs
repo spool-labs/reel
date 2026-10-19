@@ -926,7 +926,7 @@ impl Compactor {
                 pace.reached(reader.read_bytes() + tally.copied_bytes);
             }
             // Landing the copies frees the stripe's read buffers for the next stripe
-            self.land_run(reel, dest_index, index, &mut run, tally)?;
+            self.land_run(reel, dest_index, index, segment, &mut run, tally)?;
         }
         Ok(())
     }
@@ -953,7 +953,7 @@ impl Compactor {
             )?;
             pace.reached(reader.read_bytes() + tally.copied_bytes);
         }
-        self.land_run(reel, dest_index, index, &mut run, tally)
+        self.land_run(reel, dest_index, index, segment, &mut run, tally)
     }
 
     /// Rewrite one record, landing the run first for a tombstone or a full run
@@ -974,7 +974,7 @@ impl Compactor {
         let cap = reel.tails()[dest_index].copy_run_cap();
         // size the copy as a keyed record, since every destination tail is keyed
         if !record.header.flags.is_data() || run.bytes + record.header.span() > cap {
-            self.land_run(reel, dest_index, index, run, tally)?;
+            self.land_run(reel, dest_index, index, segment, run, tally)?;
         }
         match self.rewrite_one(
             reel, dest_index, index, reader, record, staged, segment, drop_floor, run,
@@ -993,6 +993,7 @@ impl Compactor {
         reel: &Reel,
         dest_index: usize,
         index: &ReelIndex,
+        segment: SegmentId,
         run: &mut CopyRun,
         tally: &mut PassTally,
     ) -> Result<()> {
@@ -1000,7 +1001,12 @@ impl Compactor {
             return Ok(());
         }
         run.bytes = 0;
-        let landed = reel.tails()[dest_index].append_copies(std::mem::take(&mut run.copies))?;
+        let dest = &reel.tails()[dest_index];
+        // A copy ties its source on the record's number and wins as the newer segment, so it lands above it
+        while dest.tail().active_segment() < segment {
+            dest.seal()?;
+        }
+        let landed = dest.append_copies(std::mem::take(&mut run.copies))?;
         crate::sync::rendezvous::at("compaction/repoint");
         for ((key, from, lsn, span), committed) in run.moved.drain(..).zip(landed) {
             run.repoints.push(KeyRepoint {

@@ -1572,6 +1572,8 @@ fn resume_active(shared: &Arc<ReelShared>, resumed: ResumableTail) -> Result<Act
         holds,
     };
     shared.writeout.enlist(&active.journal);
+    // The reopen read the rows through the reel's cut, so the sync keeps that cut past a power cut
+    active.journal.note_cut(shared.writeout.cut())?;
     // The file already reaches the rows, so the zero window restarts at the last record
     shared.driver.sync_full(active.handle.file())?;
     active.sync.synced_at.store(end, Ordering::Release);

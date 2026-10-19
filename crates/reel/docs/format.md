@@ -179,8 +179,9 @@ The cut is a 16-byte mark: the magic `RCUT`, the sequence number, and a CRC32C o
 reel's root keeps it in `reel.cut`. A flush and a close also write it to the block just before
 their segment's rows, so the segment's own sync covers it. A reopen reads each journal through the
 higher of the two, and stops at the first group with a row past it, since only a pass that never
-finished wrote that group and the ones after it. A resumed tail cuts the file there. Sequence
-numbers restart above the cut.
+finished wrote that group and the ones after it. A resumed tail cuts the file there and writes
+the cut it read into its own block before syncing, so a power cut later reads the same rows.
+Sequence numbers restart above the cut.
 
 A reopen keeps a group only when every record it lists sits where its row says and checks out, so
 a batch comes back whole or not at all. A resumed tail appends after the last whole group and

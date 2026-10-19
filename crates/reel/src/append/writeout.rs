@@ -72,6 +72,11 @@ impl Writeout {
         held.written = held.written.max(cut);
     }
 
+    /// The cut the file holds, or the one a reopen found
+    pub(super) fn cut(&self) -> Lsn {
+        lock(&self.cut).written
+    }
+
     /// Count a tail in, so every pass stops its draws
     pub(super) fn enlist_tail(&self, active: &Arc<RwLock<Active>>) {
         lock(&self.tails).push(Arc::downgrade(active));

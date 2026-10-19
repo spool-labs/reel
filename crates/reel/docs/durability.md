@@ -8,8 +8,8 @@ What a put that already returned is worth, per `sync` setting. A process crash t
 
 | `sync` | a process crash | a power cut |
 |---|---|---|
-| `never`, the default | what landed since the rows last went down, at most one 1 MiB writeback pace a tail | the active segment of each tail since its last seal is at risk, and everything sealed is on the medium |
-| a byte count | what landed since the rows last went down, at most one pace or that many bytes | everything after the last flush that returned, at most that many bytes |
+| `never` | what landed since the rows last went down, at most one 1 MiB writeback pace a tail | the active segment of each tail since its last seal is at risk, and everything sealed is on the medium |
+| a byte count, 16 MiB by default | what landed since the rows last went down, at most one pace or that many bytes | everything after the last flush that returned, at most that many bytes |
 | a durable put or batch, any setting | nothing is lost | nothing is lost |
 | any of the above, for a multi-record batch | a batch is confirmed or it never happened | a batch is confirmed or it never happened |
 
@@ -37,17 +37,17 @@ The batch row promises nothing new about syncs: a batch is durable exactly when 
 
 | `sync` | what it does | what a put's return means |
 |---|---|---|
-| `SyncPolicy::Never` (default) | no flush on the hot path | the record is in the page cache and the write call succeeded |
-| `SyncPolicy::Bytes` | flush once that many bytes have settled since the last flush, and zero syncs every write | the record is durable if the put crossed the threshold, otherwise once a later one does |
+| `SyncPolicy::Never` | no flush on the hot path | the record is in the page cache and the write call succeeded |
+| `SyncPolicy::Bytes` (default, 16 MiB) | flush once that many bytes have settled since the last flush, and zero syncs every write | the record is durable if the put crossed the threshold, otherwise once a later one does |
 | `put_durable`, `apply_batch_durable` | flush the one tail the write went to before returning | the record reached the device |
 
 Seals and segment creation sync whatever the setting, as listed above. A crash that took the directory block would take the whole segment with it. A tail whose syncs land less than 512 KiB apart also keeps a window of zeros written and synced ahead of its write head, so its appends land on blocks the filesystem has already handed out.
 
 The seal runs off the append path. A roll hands the retiring segment to a per-tail sealer thread. `flush()` drains that thread before syncing, so a durability ask still covers everything rolled before it. An explicit `Appender::seal()` stays synchronous, because its caller is asking for a sealed segment. A crash can land while a footer is queued and unwritten. The seal cuts the journal off only after its footer is synced, so recovery reads such a segment back through its journal, and the crash suite covers it.
 
-The `never` default is a deployment claim. If what the volume holds is redundant above the engine, a lost tail is refetched from peers, and paying a device flush per write to avoid a refetch costs more. A deployment that cannot repair from elsewhere sets a byte cadence.
+`never` is a deployment claim. If what the volume holds is redundant above the engine, a lost tail is refetched from peers, and paying a device flush per write to avoid a refetch costs more. A deployment that cannot repair from elsewhere keeps a byte cadence. The default flushes every 16 MiB, the cadence a tape node runs.
 
-What the default is worth, on a Hetzner ccx33 at eight writers with four tails, 4 KiB records:
+What each setting is worth, on a Hetzner ccx33 at eight writers with four tails, 4 KiB records:
 
 | `sync` | MB/s |
 |---|---|

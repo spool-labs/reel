@@ -287,11 +287,6 @@ impl ReelConfig {
             None => false,
         }
     }
-
-    /// Whether reads into an open tail go through its mapping, whatever `map_above` says
-    pub fn maps_tails(&self) -> bool {
-        self.io_backend != IoBackend::UringDirect
-    }
 }
 
 impl Default for ReelConfig {

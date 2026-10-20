@@ -2151,7 +2151,7 @@ impl Reel {
         ))
     }
 
-    /// Read one record as a future, from an open tail's mapping or through the driver
+    /// Read one record as a future through the driver
     pub async fn read_record_wait(
         &self,
         loc: Loc,
@@ -2167,36 +2167,21 @@ impl Reel {
         let layout = handle.layout();
         let prefix = layout.prefix_len(expected.width(), loc.len);
         let len = loc.len as usize;
-        let mapped = match self.maps_tail(loc.segment) {
-            true => mapped_framed(
-                &handle,
-                self.shared.config.segment_bytes.to_bytes(),
+        let read = self
+            .shared
+            .driver
+            .wait_split_reusing(
+                handle.file(),
                 u64::from(loc.offset),
                 prefix,
                 len,
-            ),
-            false => None,
-        };
-        let (head, body) = match mapped {
+                take_header(),
+                self.shared.warm_first(),
+            )
+            .await;
+        let (head, body) = match framed_or_nothing(read, prefix, len)? {
             Some(framed) => framed,
-            None => {
-                let read = self
-                    .shared
-                    .driver
-                    .wait_split_reusing(
-                        handle.file(),
-                        u64::from(loc.offset),
-                        prefix,
-                        len,
-                        take_header(),
-                        self.shared.warm_first(),
-                    )
-                    .await;
-                match framed_or_nothing(read, prefix, len)? {
-                    Some(framed) => framed,
-                    None => return Ok(RecordRead::Stale),
-                }
-            }
+            None => return Ok(RecordRead::Stale),
         };
         Ok(frame_to_read(
             head,
@@ -2226,7 +2211,7 @@ impl Reel {
             at,
         );
 
-        if self.maps(loc.segment, len) {
+        if self.maps(len) {
             if let Some(map) = handle.mapping(self.shared.config.segment_bytes.to_bytes()) {
                 if let Some(bytes) = map.slice(start, len) {
                     let mut body = crate::reel::payload::take(len);
@@ -2245,7 +2230,7 @@ impl Reel {
         window_or_nothing(read, len)
     }
 
-    /// Read one window as a future, from an open tail's mapping or through the driver
+    /// Read one window as a future through the driver
     pub async fn read_window_wait(
         &self,
         loc: Loc,
@@ -2261,11 +2246,6 @@ impl Reel {
             handle.layout().prefix_len(key_width as usize, loc.len),
             at,
         );
-        if self.maps_tail(loc.segment) {
-            if let Some(window) = self.mapped_window(&handle, start, len) {
-                return Ok(Some(window));
-            }
-        }
         let read = self
             .shared
             .driver
@@ -2337,7 +2317,7 @@ impl Reel {
         deep_range(filled, prefix, len, expected, lsn, loc)
     }
 
-    /// Read part of one record's payload as a future, from an open tail's mapping or the driver
+    /// Read part of one record's payload as a future through the driver
     pub async fn read_range_wait(
         &self,
         loc: Loc,
@@ -2354,35 +2334,19 @@ impl Reel {
         let offset = u64::from(loc.offset);
         if let Some(check) = handle.layout().keyless_key(loc.len) {
             let whole = loc.len as usize;
-            let mapped = match self.maps_tail(loc.segment) {
-                true => mapped_framed(
-                    &handle,
-                    self.shared.config.segment_bytes.to_bytes(),
+            let read = self
+                .shared
+                .driver
+                .wait_split_reusing(
+                    handle.file(),
                     offset,
                     KEYLESS_PREFIX,
                     whole,
-                ),
-                false => None,
-            };
-            let framed = match mapped {
-                Some(framed) => Some(framed),
-                None => {
-                    let read = self
-                        .shared
-                        .driver
-                        .wait_split_reusing(
-                            handle.file(),
-                            offset,
-                            KEYLESS_PREFIX,
-                            whole,
-                            take_header(),
-                            self.shared.warm_first(),
-                        )
-                        .await;
-                    framed_or_nothing(read, KEYLESS_PREFIX, whole)?
-                }
-            };
-            return Ok(match framed {
+                    take_header(),
+                    self.shared.warm_first(),
+                )
+                .await;
+            return Ok(match framed_or_nothing(read, KEYLESS_PREFIX, whole)? {
                 Some((head, body)) => keyless_range(
                     head,
                     body,
@@ -2396,14 +2360,6 @@ impl Reel {
             });
         }
         let prefix = HEADER_LEN + expected.width();
-
-        if self.maps_tail(loc.segment) {
-            if let Some((head, body)) = self.map_range(&handle, offset, prefix, at, len) {
-                let verdict = frame_to_range(&head, body, expected, lsn, loc);
-                recycle_header(head);
-                return verdict;
-            }
-        }
 
         if at <= MERGE_GAP {
             let span = at as usize + len;
@@ -2456,7 +2412,7 @@ impl Reel {
         at: u64,
         len: usize,
     ) -> Option<(Vec<u8>, Value)> {
-        if !self.maps(handle.id(), len) {
+        if !self.maps(len) {
             return None;
         }
         let map = handle.mapping(self.shared.config.segment_bytes.to_bytes())?;
@@ -2536,7 +2492,7 @@ impl Reel {
         scratch.handles.clear();
         // Hold every mapped segment first, so the handle list never moves under a borrowed record
         for ask in asks {
-            if self.maps(ask.loc.segment, ask.loc.len as usize) {
+            if self.maps(ask.loc.len as usize) {
                 self.hold_segment(ask.loc.segment, &mut scratch.handles)?;
             }
         }
@@ -2659,7 +2615,7 @@ impl Reel {
         ask: &Ask,
     ) -> Option<(&'held [u8], RecordLayout)> {
         let len = ask.loc.len as usize;
-        if !self.maps(ask.loc.segment, len) {
+        if !self.maps(len) {
             return None;
         }
         let at = handles
@@ -2692,19 +2648,8 @@ impl Reel {
     }
 
     /// Whether a read of `len` bytes in `segment` goes through the segment's mapping
-    fn maps(&self, segment: SegmentId, len: usize) -> bool {
-        let config = &self.shared.config;
-        // A tail's pages were just written, so its mapping reads them from the page cache
-        config.maps(len) || self.maps_tail(segment)
-    }
-
-    /// Whether a segment is an open tail whose reads go through its mapping
-    fn maps_tail(&self, segment: SegmentId) -> bool {
-        self.shared.config.maps_tails()
-            && self
-                .tails()
-                .iter()
-                .any(|tail| tail.tail().active_segment() == segment)
+    fn maps(&self, len: usize) -> bool {
+        self.shared.config.maps(len)
     }
 
     /// Resolve a segment number to a handle, opening and caching it on a miss
@@ -2721,7 +2666,7 @@ impl Reel {
         len: usize,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         // A mapped volume serves a record the mapping covers straight from the page cache
-        if self.maps(handle.id(), len) {
+        if self.maps(len) {
             if let Some(framed) = mapped_framed(
                 handle,
                 self.shared.config.segment_bytes.to_bytes(),
@@ -2743,15 +2688,6 @@ impl Reel {
             self.shared.warm_first(),
         );
         framed_or_nothing(read, prefix, len)
-    }
-
-    /// A window copied out of its segment's mapping, if the mapping covers it
-    fn mapped_window(&self, handle: &SegmentHandle, start: u64, len: usize) -> Option<Value> {
-        let map = handle.mapping(self.shared.config.segment_bytes.to_bytes())?;
-        let bytes = map.slice(start, len)?;
-        let mut window = crate::reel::payload::take(len);
-        window.extend_from_slice(bytes);
-        Some(Value::pooled(window, crate::reel::payload::give))
     }
 
     /// The tail a foreground write goes to, which is the least loaded of them

@@ -3193,28 +3193,6 @@ fn a_dropped_range_leaks_nothing() {
     );
 }
 
-// a window of a record in an open tail is copied out of the tail's mapping, with no device read
-#[test]
-fn an_open_tail_answers_a_window_from_its_mapping() {
-    let (store, backend, _dir) = posix_store(config(1, SyncPolicy::Never));
-    let key = record(7, 1);
-    let payload = stripes(64 * 1024);
-    store.put(&key, &payload).expect("put");
-    store.get(&key).expect("warm the descriptor");
-
-    let before = backend.ops();
-    let window = store
-        .get_range(&key, 40_000, 4_000)
-        .expect("range")
-        .expect("found");
-    assert_eq!(&*window, &payload[40_000..44_000]);
-    assert_eq!(
-        backend.ops() - before,
-        0,
-        "a window of an open tail went to the device"
-    );
-}
-
 // a vouched window of a sealed record takes one device read wherever it sits in the record
 #[test]
 fn a_posix_range_reads_a_window() {
@@ -3222,7 +3200,6 @@ fn a_posix_range_reads_a_window() {
     let key = record(7, 1);
     let payload = stripes(64 * 1024);
     store.put(&key, &payload).expect("put");
-    // An open tail answers from its mapping, so the record is sealed first
     store.reel.tails()[0].seal().expect("seal");
     store.get(&key).expect("warm the descriptor");
 
@@ -3449,60 +3426,17 @@ fn drop_cache(store: &ReelStore, key: &RecordKey) {
     assert_eq!(ret, 0, "dropping the segment's pages failed");
 }
 
-// a backend that services ops in place answers the future at its first poll
+// an awaited read on posix answers and leaves nothing waiting
 #[test]
-fn a_posix_read_answers_at_once() {
+fn a_posix_read_leaves_nothing_waiting() {
     let (store, _backend, _dir) = posix_store(config(1, SyncPolicy::Never));
     let key = record(7, 1);
     store.put(&key, &[0x5a; 4096]).expect("put");
 
-    let waker = Waker::noop();
-    let mut cx = Context::from_waker(waker);
-    let mut waiting = Box::pin(store.get_wait(&key));
-    let answered = match waiting.as_mut().poll(&mut cx) {
-        Poll::Ready(answer) => Some(answer),
-        Poll::Pending => None,
-    };
-
-    let read = answered
-        .expect("posix answered at the first poll")
-        .expect("get");
+    let read = block_on(store.get_wait(&key)).expect("get");
     assert_eq!(read.map(Value::into_vec), Some(vec![0x5a; 4096]));
     assert_eq!(store.driver.wakers(), 0, "nothing was left waiting");
     assert_eq!(store.driver.outstanding(), 0);
-}
-
-// the awaited door maps an open tail's record and asks the cache for a sealed one
-#[test]
-fn awaited_reads_map_only_the_open_tail() {
-    let mapped = ReelConfig {
-        map_above: crate::config::MAP_EVERYTHING,
-        ..config(1, SyncPolicy::Never)
-    };
-    let (store, backend, _dir) = posix_store(mapped);
-    store.put(&record(7, 1), &[0x5a; 4096]).expect("put");
-    // The first read opens and advises the segment, so counting starts after it
-    let blocked = store.get(&record(7, 1)).expect("warm get");
-
-    let ops = backend.ops();
-    let asked = backend.warm_reads().asked;
-    let in_tail = block_on(store.get_wait(&record(7, 1))).expect("awaited get");
-    assert_eq!(blocked, in_tail, "both doors read the same record");
-    assert_eq!(backend.ops(), ops, "the tail's record went to the driver");
-    assert_eq!(
-        backend.warm_reads().asked,
-        asked,
-        "the tail's record asked the cache"
-    );
-
-    drop(store.cue().expect("seal"));
-    let asked = backend.warm_reads().asked;
-    let sealed = block_on(store.get_wait(&record(7, 1))).expect("awaited get");
-    assert_eq!(blocked, sealed, "both doors read the same record");
-    assert!(
-        backend.warm_reads().asked > asked,
-        "the awaited read of a sealed record took its mapping"
-    );
 }
 
 /// A volume read through the page cache, whose point reads ask it before they queue
@@ -3608,7 +3542,6 @@ fn a_warm_awaited_read_skips_the_engine() {
     let key = record(7, 1);
     let payload = stripes(8 * 1024);
     store.put(&key, &payload).expect("put");
-    // Sealed, since the awaited door copies an open tail's record out of its mapping
     drop(store.cue().expect("seal"));
     // The first read opens and advises the segment and leaves the record's pages resident
     store.get(&key).expect("warm the descriptor and the cache");
@@ -3658,7 +3591,6 @@ fn a_cold_awaited_read_falls_through() {
     let key = record(7, 1);
     let payload = stripes(8 * 1024);
     store.put(&key, &payload).expect("put");
-    // Sealed, since the awaited door copies an open tail's record out of its mapping
     drop(store.cue().expect("seal"));
     // Dropping pages skips dirty ones, so flush the record to the device first
     store.flush().expect("flush");
@@ -3711,7 +3643,6 @@ fn a_warm_awaited_read_still_verifies() {
     let payload = stripes(8 * 1024);
     store.put(&awaited, &payload).expect("put");
     store.put(&blocked, &payload).expect("put");
-    // Sealed, since the awaited door copies an open tail's record out of its mapping
     drop(store.cue().expect("seal"));
     store
         .get(&awaited)

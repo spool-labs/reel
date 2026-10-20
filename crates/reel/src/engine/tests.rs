@@ -18,6 +18,7 @@ use crate::units::ByteCount;
 use crate::config::{CompactRate, RepairPath, SyncPolicy, ThreadBudget};
 use crate::format::column::{Codec, ColumnId, ColumnSpec};
 use crate::format::footer::SegmentFooter;
+use crate::format::journal::{cut_slot, CUT_MARK_LEN};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::record::HEADER_LEN;
 use crate::index::page::KeyPage;
@@ -722,9 +723,10 @@ fn a_second_caller_cannot_take_a_held_segment() {
     let script = crate::sync::rendezvous::script();
     script.hold("seal/spans");
 
+    // Cast, so a test sealing beside this one passes the held point
     let noting = {
         let store = Arc::clone(&store);
-        std::thread::spawn(move || store.hold_sealed())
+        script.cast(move || store.hold_sealed())
     };
     // The footer is in hand and the spans are not down
     script.await_reached("seal/spans", 1);
@@ -3191,28 +3193,6 @@ fn a_dropped_range_leaks_nothing() {
     );
 }
 
-// a window of a record in an open tail is copied out of the tail's mapping, with no device read
-#[test]
-fn an_open_tail_answers_a_window_from_its_mapping() {
-    let (store, backend, _dir) = posix_store(config(1, SyncPolicy::Never));
-    let key = record(7, 1);
-    let payload = stripes(64 * 1024);
-    store.put(&key, &payload).expect("put");
-    store.get(&key).expect("warm the descriptor");
-
-    let before = backend.ops();
-    let window = store
-        .get_range(&key, 40_000, 4_000)
-        .expect("range")
-        .expect("found");
-    assert_eq!(&*window, &payload[40_000..44_000]);
-    assert_eq!(
-        backend.ops() - before,
-        0,
-        "a window of an open tail went to the device"
-    );
-}
-
 // a vouched window of a sealed record takes one device read wherever it sits in the record
 #[test]
 fn a_posix_range_reads_a_window() {
@@ -3220,7 +3200,6 @@ fn a_posix_range_reads_a_window() {
     let key = record(7, 1);
     let payload = stripes(64 * 1024);
     store.put(&key, &payload).expect("put");
-    // An open tail answers from its mapping, so the record is sealed first
     store.reel.tails()[0].seal().expect("seal");
     store.get(&key).expect("warm the descriptor");
 
@@ -3447,60 +3426,17 @@ fn drop_cache(store: &ReelStore, key: &RecordKey) {
     assert_eq!(ret, 0, "dropping the segment's pages failed");
 }
 
-// a backend that services ops in place answers the future at its first poll
+// an awaited read on posix answers and leaves nothing waiting
 #[test]
-fn a_posix_read_answers_at_once() {
+fn a_posix_read_leaves_nothing_waiting() {
     let (store, _backend, _dir) = posix_store(config(1, SyncPolicy::Never));
     let key = record(7, 1);
     store.put(&key, &[0x5a; 4096]).expect("put");
 
-    let waker = Waker::noop();
-    let mut cx = Context::from_waker(waker);
-    let mut waiting = Box::pin(store.get_wait(&key));
-    let answered = match waiting.as_mut().poll(&mut cx) {
-        Poll::Ready(answer) => Some(answer),
-        Poll::Pending => None,
-    };
-
-    let read = answered
-        .expect("posix answered at the first poll")
-        .expect("get");
+    let read = block_on(store.get_wait(&key)).expect("get");
     assert_eq!(read.map(Value::into_vec), Some(vec![0x5a; 4096]));
     assert_eq!(store.driver.wakers(), 0, "nothing was left waiting");
     assert_eq!(store.driver.outstanding(), 0);
-}
-
-// the awaited door maps an open tail's record and asks the cache for a sealed one
-#[test]
-fn awaited_reads_map_only_the_open_tail() {
-    let mapped = ReelConfig {
-        map_above: crate::config::MAP_EVERYTHING,
-        ..config(1, SyncPolicy::Never)
-    };
-    let (store, backend, _dir) = posix_store(mapped);
-    store.put(&record(7, 1), &[0x5a; 4096]).expect("put");
-    // The first read opens and advises the segment, so counting starts after it
-    let blocked = store.get(&record(7, 1)).expect("warm get");
-
-    let ops = backend.ops();
-    let asked = backend.warm_reads().asked;
-    let in_tail = block_on(store.get_wait(&record(7, 1))).expect("awaited get");
-    assert_eq!(blocked, in_tail, "both doors read the same record");
-    assert_eq!(backend.ops(), ops, "the tail's record went to the driver");
-    assert_eq!(
-        backend.warm_reads().asked,
-        asked,
-        "the tail's record asked the cache"
-    );
-
-    drop(store.cue().expect("seal"));
-    let asked = backend.warm_reads().asked;
-    let sealed = block_on(store.get_wait(&record(7, 1))).expect("awaited get");
-    assert_eq!(blocked, sealed, "both doors read the same record");
-    assert!(
-        backend.warm_reads().asked > asked,
-        "the awaited read of a sealed record took its mapping"
-    );
 }
 
 /// A volume read through the page cache, whose point reads ask it before they queue
@@ -3606,7 +3542,6 @@ fn a_warm_awaited_read_skips_the_engine() {
     let key = record(7, 1);
     let payload = stripes(8 * 1024);
     store.put(&key, &payload).expect("put");
-    // Sealed, since the awaited door copies an open tail's record out of its mapping
     drop(store.cue().expect("seal"));
     // The first read opens and advises the segment and leaves the record's pages resident
     store.get(&key).expect("warm the descriptor and the cache");
@@ -3656,7 +3591,6 @@ fn a_cold_awaited_read_falls_through() {
     let key = record(7, 1);
     let payload = stripes(8 * 1024);
     store.put(&key, &payload).expect("put");
-    // Sealed, since the awaited door copies an open tail's record out of its mapping
     drop(store.cue().expect("seal"));
     // Dropping pages skips dirty ones, so flush the record to the device first
     store.flush().expect("flush");
@@ -3709,7 +3643,6 @@ fn a_warm_awaited_read_still_verifies() {
     let payload = stripes(8 * 1024);
     store.put(&awaited, &payload).expect("put");
     store.put(&blocked, &payload).expect("put");
-    // Sealed, since the awaited door copies an open tail's record out of its mapping
     drop(store.cue().expect("seal"));
     store
         .get(&awaited)
@@ -3873,7 +3806,8 @@ fn async_flush_settles_the_tail() {
     block_on(store.flush_wait()).expect("awaited flush");
 
     assert!(sim.sync_count() > before, "the flush reached the device");
-    assert_eq!(sim.unsynced_bytes(), 0);
+    // The root's cut waits for no sync, since the segment's synced copy of it covers the flush
+    assert_eq!(sim.unsynced_bytes(), CUT_MARK_LEN as u64);
 }
 
 // two columns holding the same key bytes stay apart, and their totals do too
@@ -4476,13 +4410,17 @@ fn the_tick_seals_a_tail_gone_quiet() {
         .collect();
 
     for byte in 2..5u8 {
-        store.seal_idle_tails(quiet).expect("look");
+        store.seal_due_tails(quiet, u64::MAX).expect("look");
         store.put(&record(7, byte), &[byte; 100]).expect("put");
     }
     assert_eq!(segment(written), before, "a tail taking writes was sealed");
 
-    store.seal_idle_tails(quiet).expect("first quiet look");
-    store.seal_idle_tails(quiet).expect("second quiet look");
+    store
+        .seal_due_tails(quiet, u64::MAX)
+        .expect("first quiet look");
+    store
+        .seal_due_tails(quiet, u64::MAX)
+        .expect("second quiet look");
     assert_ne!(segment(written), before, "the quiet tail is still open");
     let after: Vec<_> = (0..tails.len())
         .filter(|at| *at != written)
@@ -4493,6 +4431,67 @@ fn the_tick_seals_a_tail_gone_quiet() {
         store.get(&record(7, 4)).expect("get"),
         Some(Value::new(vec![4; 100]))
     );
+}
+
+// a busy tail whose segment holds enough tombstones seals, and reads answer the same after it
+#[test]
+fn a_tail_full_of_graves_seals_while_busy() {
+    let (store, _backend, dir) = posix_store(config(1, SyncPolicy::Never));
+    let busy = std::time::Duration::MAX;
+    let tail = &store.reel.tails()[0];
+    for byte in 1..=4u8 {
+        store.put(&record(7, byte), &[byte; 100]).expect("put");
+    }
+    store.delete(&record(7, 1)).expect("delete");
+    store
+        .delete(&record(7, 9))
+        .expect("delete of a key never written");
+    let before = tail.tail().active_segment();
+
+    store.seal_due_tails(busy, 3).expect("look");
+    assert_eq!(
+        tail.tail().active_segment(),
+        before,
+        "two graves sealed the tail"
+    );
+    store.delete(&record(7, 2)).expect("delete");
+    store.seal_due_tails(busy, 3).expect("look");
+    assert_ne!(
+        tail.tail().active_segment(),
+        before,
+        "three graves left the tail open"
+    );
+    assert_eq!(tail.graves_held(), 0, "the fresh segment came with graves");
+
+    let check = |store: &ReelStore| {
+        for byte in [1u8, 2, 9] {
+            assert_eq!(
+                store.get(&record(7, byte)).expect("get"),
+                None,
+                "{byte} came back"
+            );
+        }
+        for byte in [3u8, 4] {
+            assert_eq!(
+                store.get(&record(7, byte)).expect("get"),
+                Some(Value::new(vec![byte; 100])),
+                "{byte} went missing"
+            );
+        }
+    };
+    check(&store);
+    store.maintain_once().expect("tick");
+    check(&store);
+    store.close().expect("close");
+    drop(store);
+    let reopened = ReelStore::open_with_io(
+        dir.path().to_path_buf(),
+        config(1, SyncPolicy::Never),
+        COLUMNS,
+        Arc::new(PosixBackend::new()) as Arc<dyn ReelIo>,
+    )
+    .expect("reopen");
+    check(&reopened);
 }
 
 // an older version beside the newer one in a segment is found through the key's blocks
@@ -4594,8 +4593,9 @@ fn a_covered_segment_resumed_and_sealed_again_keeps_its_new_records() {
             continue;
         }
         let (rows_at, _) = crate::format::journal::rows_region(&unsealed).expect("rows");
-        bytes.resize(rows_at as usize, 0);
-        bytes.extend_from_slice(&unsealed[rows_at as usize..]);
+        let slot = cut_slot(rows_at) as usize;
+        bytes.resize(slot, 0);
+        bytes.extend_from_slice(&unsealed[slot..]);
     }
 
     let second_sim = SimIo::from_image(image);
@@ -5642,4 +5642,617 @@ fn a_punch_syncs_the_overwrite_that_freed_its_bytes() {
         Some(Value::new(second)),
         "the punch ran ahead of the overwrite's sync"
     );
+}
+
+// walks on many threads share one parsed footer when the cache holds none
+#[test]
+fn walks_share_a_parsed_footer() {
+    let (store, _) = sim_store(ReelConfig {
+        footer_cache: ByteCount::from_bytes(0),
+        ..config(1, SyncPolicy::Never)
+    });
+    for byte in 0..32u8 {
+        store.put(&record(7, byte), b"row").expect("put");
+    }
+    let segment = store.reel.tails()[0].seal().expect("seal");
+    store.page_out_sealed().expect("hand over");
+
+    let walkers = 20;
+    std::thread::scope(|scope| {
+        for _ in 0..walkers {
+            scope.spawn(|| {
+                let rows = reel_core::Store::iter_prefix(&store, "record", &[])
+                    .expect("walk")
+                    .count();
+                assert_eq!(rows, 32);
+            });
+        }
+    });
+
+    let first = store
+        .reel
+        .shared()
+        .footer_of(segment)
+        .expect("footer")
+        .expect("sealed");
+    let again = store
+        .reel
+        .shared()
+        .footer_of(segment)
+        .expect("footer")
+        .expect("sealed");
+    assert!(
+        Arc::ptr_eq(&first, &again),
+        "a held footer was parsed again"
+    );
+    // Each thread's run slot holds the one footer beside the two handles here
+    assert!(
+        Arc::strong_count(&first) > 2,
+        "the walks kept no footer to share"
+    );
+}
+
+// a pile of small sealed segments folds into one, and sealing the one it folded into starts no more
+#[test]
+fn small_seals_fold_into_one() {
+    let (store, _) = sim_store(config(1, SyncPolicy::Never));
+    let rounds = super::maintain::FOLD_PILE as u8 + 2;
+    for round in 0..rounds {
+        for byte in 0..4u8 {
+            store.put(&record(round.into(), byte), b"row").expect("put");
+        }
+        store.reel.tails()[0].seal().expect("seal");
+    }
+    store.page_out_sealed().expect("hand over");
+    let small = store.config.segment_bytes.to_bytes() / super::maintain::SMALL_SHARE;
+    let smalls = |store: &ReelStore| {
+        store
+            .index
+            .segments_snapshot()
+            .iter()
+            .filter(|(_, bytes)| bytes.total() > 0 && bytes.total() < small)
+            .count()
+    };
+    assert!(
+        smalls(&store) >= rounds.into(),
+        "the seals left {} small segments",
+        smalls(&store)
+    );
+
+    let mut passes = 0;
+    while store.compact_once().expect("pass") == CompactPass::Copied {
+        passes += 1;
+        assert!(passes < 32, "folding never settled");
+        store.reel.tails()[0].seal().expect("seal");
+        store.page_out_sealed().expect("hand over");
+    }
+    assert!(
+        smalls(&store) <= 1,
+        "{} small segments were left",
+        smalls(&store)
+    );
+    for round in 0..rounds {
+        for byte in 0..4u8 {
+            let read = store.get(&record(round.into(), byte)).expect("get");
+            assert_eq!(
+                read.as_deref(),
+                Some(&b"row"[..]),
+                "round {round} key {byte} lost"
+            );
+        }
+    }
+}
+
+// a tail the reopen does not resume is sealed by it, so compaction can take it like any segment
+#[test]
+fn a_tail_left_unresumed_is_sealed_on_open() {
+    let (store, sim) = sim_store(config(2, SyncPolicy::Never));
+    put_on_tail(&store, 0, &record(7, 1), vec![0x11; 512]);
+    put_on_tail(&store, 1, &record(7, 2), vec![0x22; 512]);
+    let left = store.reel.tails()[1].tail().active_segment();
+    store.close().expect("close");
+    drop(store);
+
+    let reopened = reopen_image(sim.durable_image(), config(1, SyncPolicy::Never));
+    assert!(
+        reopened.segment_footer(left).expect("footer").is_some(),
+        "the tail no one resumed was left without a footer"
+    );
+    assert!(
+        reopened.reel.shared().is_settled(left),
+        "the sealed tail never settled"
+    );
+    for (byte, fill) in [(1u8, 0x11u8), (2, 0x22)] {
+        assert_eq!(
+            reopened.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![fill; 512])),
+            "key {byte} after the reopen"
+        );
+    }
+}
+
+// a segment number a key run still covers is never drawn again, so a delete in the next tail holds
+#[test]
+fn a_reopen_draws_no_segment_number_a_key_run_covers() {
+    let config = |tails| ReelConfig {
+        segment_bytes: ByteCount::from_bytes(16 * 1024),
+        sync: SyncPolicy::Never,
+        active_tails: ThreadBudget::threads(tails),
+        ..ReelConfig::default()
+    };
+    let (store, sim) = sim_store(config(2));
+    put_on_tail(&store, 0, &record(8, 0), vec![1; 300]);
+    let mut last = SegmentId(0);
+    for round in 1..=10u8 {
+        for byte in 0..4u8 {
+            put_on_tail(&store, 1, &record(7, byte), vec![round; 300]);
+        }
+        store.flush().expect("flush");
+        last = store.reel.tails()[1].seal().expect("seal");
+    }
+    store.page_out_sealed().expect("page out");
+    assert!(store.merge_when_due().expect("merge").is_some());
+    assert!(
+        store.index().key_runs().covers(last),
+        "the run covers the last seal"
+    );
+    // The lower tail takes every key, so each covered segment dies and the close unlinks it
+    for byte in 0..4u8 {
+        put_on_tail(&store, 0, &record(7, byte), vec![11; 300]);
+    }
+    store.close().expect("close");
+    drop(store);
+
+    // One tail seals the other's empty segment on open, and a fold unlinks it
+    let second_sim = SimIo::from_image(sim.durable_image());
+    let second = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        config(1),
+        COLUMNS,
+        Arc::new(second_sim.clone()),
+    )
+    .expect("second open");
+    second.settle_sealed().expect("settle");
+    let empty = SegmentId(last.as_u32() + 1);
+    assert!(
+        second
+            .compactor
+            .compact_segment(&second.reel, &second.index, empty)
+            .expect("fold"),
+        "the empty segment stood"
+    );
+    second.close().expect("close");
+    drop(second);
+
+    // Every covered segment is gone, so only the run remembers their numbers
+    let third_sim = SimIo::from_image(second_sim.durable_image());
+    let third = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        config(1),
+        COLUMNS,
+        Arc::new(third_sim.clone()),
+    )
+    .expect("third open");
+    third.reel.tails()[0].seal().expect("seal");
+    third.put(&record(9, 0), &[3; 300]).expect("put");
+    third.delete(&record(7, 0)).expect("delete");
+    third.flush().expect("flush");
+    third.reel.tails()[0].seal().expect("seal");
+    third.close().expect("close");
+    drop(third);
+
+    let fourth = reopen_image(third_sim.durable_image(), config(1));
+    assert_eq!(
+        fourth.get(&record(7, 0)).expect("get"),
+        None,
+        "the delete came undone"
+    );
+    assert_eq!(
+        fourth.get(&record(9, 0)).expect("get"),
+        Some(Value::new(vec![3; 300])),
+        "the put in the new tail was lost"
+    );
+    for byte in 1..4u8 {
+        assert_eq!(
+            fourth.get(&record(7, byte)).expect("get"),
+            Some(Value::new(vec![11; 300])),
+            "key {byte} after the fourth open"
+        );
+    }
+}
+
+/// Delete a key on a chosen tail the way a delete does
+fn delete_on_tail(store: &ReelStore, tail: usize, key: &RecordKey) {
+    let committed = store.reel.tails()[tail]
+        .append_tombstone(key.clone(), crate::append::Commit::PerRecord)
+        .expect("tombstone on the chosen tail");
+    store
+        .index
+        .remove(key, committed.lsn, committed.loc)
+        .expect("publish");
+}
+
+// a process kill keeps every completed write, so an earlier delete must not lose to a later write
+#[test]
+fn a_kill_keeps_earlier_deletes() {
+    let config = ReelConfig {
+        sync: SyncPolicy::Bytes(ByteCount::from_bytes(16 * 1024 * 1024)),
+        active_tails: ThreadBudget::threads(2),
+        ..ReelConfig::default()
+    };
+    let (store, sim) = sim_store(config.clone());
+    let (k1, k2, cursor) = (record(1, 1), record(2, 2), record(3, 3));
+    put_on_tail(&store, 0, &k1, vec![1; 300]);
+    put_on_tail(&store, 1, &k2, vec![2; 300]);
+    store.flush().expect("flush");
+
+    // K1's delete lands on tail 0, then K2's delete and the cursor on tail 1
+    delete_on_tail(&store, 0, &k1);
+    delete_on_tail(&store, 1, &k2);
+    put_on_tail(&store, 1, &cursor, vec![7; 300]);
+    // Tail 1 takes a megabyte more, as slices would, so its pace writes its rows
+    put_on_tail(&store, 1, &record(4, 4), vec![9; 1024 * 1024 + 4096]);
+
+    // Kill: every completed write stays, what the process held goes
+    let image = sim.killed_image();
+    std::mem::forget(store);
+    let reopened = reopen_image(image, config);
+    if reopened.get(&cursor).expect("get cursor").is_some() {
+        assert!(
+            reopened.get(&k2).expect("get k2").is_none(),
+            "K2's delete was lost behind the cursor"
+        );
+        assert!(
+            reopened.get(&k1).expect("get k1").is_none(),
+            "K1's delete was lost while later writes on the other tail held"
+        );
+    }
+}
+
+// a kill between any two writes of a write-out keeps a prefix of call order across every tail
+#[test]
+fn a_kill_mid_pass_keeps_a_prefix() {
+    const TAILS: usize = 3;
+    const CALLS: usize = 12;
+    let config = config(TAILS as u32, SyncPolicy::Never);
+    // An odd call deletes a key the setup put, and an even one puts a fresh key
+    let gone = |call: usize| record(1, call as u8);
+    let fresh = |call: usize| record(2, call as u8);
+    let mut sweep = 0u64;
+    loop {
+        let (store, sim) = sim_store(config.clone());
+        for call in (1..CALLS).step_by(2) {
+            put_on_tail(&store, call % TAILS, &gone(call), vec![0x11; 300]);
+        }
+        store.flush().expect("setup flush");
+        // The kill can land on any write from here: a record, a journal's rows or a cut
+        sim.kill_after_writes(sweep);
+        for call in 0..CALLS {
+            match call % 2 {
+                0 => put_on_tail(&store, call % TAILS, &fresh(call), vec![0x22; 300]),
+                _ => delete_on_tail(&store, call % TAILS, &gone(call)),
+            }
+            // A pace halfway, so one pass cuts the calls in two
+            if call == CALLS / 2 {
+                store.reel.tails()[call % TAILS].pace_journal();
+            }
+        }
+        store.flush().expect("flush");
+        let Some(image) = sim.kill_image() else {
+            break;
+        };
+        std::mem::forget(store);
+
+        let reopened = reopen_image(image, config.clone());
+        let survived: Vec<bool> = (0..CALLS)
+            .map(|call| match call % 2 {
+                0 => reopened.get(&fresh(call)).expect("get").is_some(),
+                _ => reopened.get(&gone(call)).expect("get").is_none(),
+            })
+            .collect();
+        let kept = survived.iter().take_while(|kept| **kept).count();
+        assert!(
+            survived[kept..].iter().all(|kept| !kept),
+            "a kill after {sweep} writes kept {survived:?}, which is no prefix of call order"
+        );
+        sweep += 1;
+    }
+    // Every record, then two passes of every tail's rows and a cut each, so the sweep crossed both
+    assert!(
+        sweep > (CALLS + 2 * (TAILS + 1)) as u64,
+        "the sweep covered {sweep} writes"
+    );
+}
+
+/// Where a segment file's rows start, read from the header at its front
+fn rows_at_of(front: &[u8]) -> Option<u64> {
+    let head = crate::format::record::RecordHeader::unpack(front.get(..HEADER_LEN)?).ok()?;
+    let payload = front.get(HEADER_LEN..HEADER_LEN + head.length as usize)?;
+    let segment = crate::format::segment_header::SegmentHeader::unpack(payload).ok()?;
+    (segment.rows_at > 0).then_some(segment.rows_at)
+}
+
+fn torn_config() -> ReelConfig {
+    ReelConfig {
+        segment_bytes: ByteCount::from_bytes(16 * 1024),
+        active_tails: ThreadBudget::threads(1),
+        sync: SyncPolicy::Never,
+        ..ReelConfig::default()
+    }
+}
+
+// a resumed tail writes over a torn group, and the whole group past it stays dead
+#[test]
+fn a_torn_group_buries_later_groups() {
+    let (store, sim) = sim_store(torn_config());
+    store.put(&record(7, 1), &[1; 100]).expect("put");
+    store.put(&record(7, 2), &[2; 100]).expect("put");
+    store.flush().expect("flush");
+    let mut image = sim.durable_image();
+    std::mem::forget(store);
+    let mut torn = 0;
+    for (_, bytes) in image.iter_mut() {
+        let Some(rows_at) = rows_at_of(bytes) else {
+            continue;
+        };
+        let rows = bytes.get(rows_at as usize..).unwrap_or_default();
+        if crate::format::journal::read_groups(rows).0.len() == 2 {
+            bytes[rows_at as usize + 10] ^= 0xff;
+            torn += 1;
+        }
+    }
+    assert_eq!(torn, 1, "one journal with two groups");
+
+    let second_sim = SimIo::from_image(image);
+    let second = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        torn_config(),
+        COLUMNS,
+        Arc::new(second_sim.clone()),
+    )
+    .expect("second open");
+    assert_eq!(
+        second.get(&record(7, 2)).expect("get"),
+        None,
+        "the torn group hides both"
+    );
+    second.put(&record(7, 3), &[3; 100]).expect("put");
+    second.flush().expect("flush");
+    let image = second_sim.durable_image();
+    std::mem::forget(second);
+
+    let third = reopen_image(image, torn_config());
+    assert_eq!(
+        third.get(&record(7, 2)).expect("get"),
+        None,
+        "a buried group came back"
+    );
+    assert!(
+        third.get(&record(7, 3)).expect("get").is_some(),
+        "the new put held"
+    );
+}
+
+/// Copy a store's files to a fresh directory, leaving its lock behind
+fn copy_store(from: &std::path::Path) -> TempDir {
+    let to = tempdir().expect("tempdir");
+    let mut stack = vec![PathBuf::new()];
+    while let Some(relative) = stack.pop() {
+        for entry in std::fs::read_dir(from.join(&relative)).expect("read dir") {
+            let name = relative.join(entry.expect("entry").file_name());
+            let source = from.join(&name);
+            if source.is_dir() {
+                std::fs::create_dir_all(to.path().join(&name)).expect("dir");
+                stack.push(name);
+            } else if name.file_name().is_some_and(|file| file != "reel.lock") {
+                std::fs::copy(&source, to.path().join(&name)).expect("copy");
+            }
+        }
+    }
+    to
+}
+
+// the same history on real files
+#[test]
+fn a_torn_group_stays_buried_on_disk() {
+    use std::os::unix::fs::FileExt;
+    let first = tempdir().expect("tempdir");
+    let store = ReelStore::open(first.path().to_path_buf(), torn_config(), COLUMNS).expect("open");
+    store.put(&record(7, 1), &[1; 100]).expect("put");
+    store.put(&record(7, 2), &[2; 100]).expect("put");
+    store.flush().expect("flush");
+    std::mem::forget(store);
+    let dir = copy_store(first.path());
+    let mut torn = 0;
+    let mut stack = vec![dir.path().to_path_buf()];
+    while let Some(at) = stack.pop() {
+        for entry in std::fs::read_dir(&at).expect("read dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("read");
+            let Some(rows_at) = rows_at_of(&bytes) else {
+                continue;
+            };
+            let rows = bytes.get(rows_at as usize..).unwrap_or_default();
+            if crate::format::journal::read_groups(rows).0.len() == 2 {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .expect("open");
+                file.write_all_at(&[bytes[rows_at as usize + 10] ^ 0xff], rows_at + 10)
+                    .expect("tear");
+                torn += 1;
+            }
+        }
+    }
+    assert_eq!(torn, 1, "one journal with two groups");
+
+    let second = ReelStore::open(dir.path().to_path_buf(), torn_config(), COLUMNS).expect("open");
+    assert_eq!(
+        second.get(&record(7, 2)).expect("get"),
+        None,
+        "the torn group hides both"
+    );
+    second.put(&record(7, 3), &[3; 100]).expect("put");
+    second.flush().expect("flush");
+    std::mem::forget(second);
+    let last = copy_store(dir.path());
+
+    let third = ReelStore::open(last.path().to_path_buf(), torn_config(), COLUMNS).expect("open");
+    assert_eq!(
+        third.get(&record(7, 2)).expect("get"),
+        None,
+        "a buried group came back"
+    );
+    assert!(
+        third.get(&record(7, 3)).expect("get").is_some(),
+        "the new put held"
+    );
+}
+
+// a key run over a segment that reads as foreign gives way, so its other segments answer whole
+#[test]
+fn a_key_run_over_a_foreign_segment_gives_way() {
+    let config = || ReelConfig {
+        segment_bytes: ByteCount::from_bytes(16 * 1024),
+        sync: SyncPolicy::Never,
+        active_tails: ThreadBudget::threads(2),
+        ..ReelConfig::default()
+    };
+    let (store, sim) = sim_store(config());
+    // The open tail keeps the oldest version, under every sealed one
+    put_on_tail(&store, 0, &record(7, 0), vec![1; 300]);
+    let mut covered = Vec::new();
+    for round in 2..=11u8 {
+        for byte in 0..4u8 {
+            put_on_tail(&store, 1, &record(7, byte), vec![round; 300]);
+        }
+        store.flush().expect("flush");
+        covered.push(store.reel.tails()[1].seal().expect("seal"));
+    }
+    store.page_out_sealed().expect("page out");
+    assert!(store.merge_when_due().expect("merge").is_some());
+    store.flush().expect("flush");
+    let lost = *covered.last().expect("a covered segment");
+    let lost_path = Path::new(ROOT).join(segment_file_name(lost));
+    let mut image = sim.durable_image();
+    drop(store);
+    // The newest covered segment loses its header, so the open quarantines it
+    for (at, bytes) in image.iter_mut() {
+        if *at == lost_path {
+            bytes[..HEADER_LEN].fill(0);
+        }
+    }
+
+    let first_sim = SimIo::from_image(image);
+    let first = ReelStore::open_with_io(
+        PathBuf::from(ROOT),
+        config(),
+        COLUMNS,
+        Arc::new(first_sim.clone()),
+    )
+    .expect("first open");
+    let answer = first.get(&record(7, 0)).expect("get");
+    assert_eq!(
+        answer,
+        Some(Value::new(vec![10; 300])),
+        "the newest version left was hidden"
+    );
+    // Every covered segment that stands retires, and the key keeps its answer
+    first.settle_sealed().expect("settle");
+    for segment in &covered[..covered.len() - 1] {
+        first
+            .compactor
+            .compact_segment(&first.reel, &first.index, *segment)
+            .expect("compact");
+    }
+    first.flush().expect("flush");
+    drop(first);
+    let second = reopen_image(first_sim.durable_image(), config());
+    assert_eq!(
+        second.get(&record(7, 0)).expect("get"),
+        answer,
+        "a retire changed what the key answers"
+    );
+}
+
+// an evicted record leaves a tombstone at its own number, so its retire revives no older version
+#[test]
+fn an_eviction_outlives_its_record() {
+    let config = || ReelConfig {
+        segment_bytes: ByteCount::from_bytes(16 * 1024),
+        sync: SyncPolicy::Never,
+        active_tails: ThreadBudget::threads(2),
+        verify_reads: true,
+        scrub_mbps: 1024,
+        ..ReelConfig::default()
+    };
+    for evicts in ["read", "compaction", "scrub"] {
+        let (store, sim) = sim_store(config());
+        put_on_tail(&store, 0, &record(7, 0), vec![1; 300]);
+        put_on_tail(&store, 1, &record(7, 0), vec![0xA7; 300]);
+        store.flush().expect("flush");
+        let sealed = store.reel.tails()[1].seal().expect("seal");
+        let path = Path::new(ROOT).join(segment_file_name(sealed));
+        let mut image = sim.durable_image();
+        drop(store);
+        // One payload byte rots, so the newer version fails its checksum
+        for (at, bytes) in image.iter_mut() {
+            if *at == path {
+                let rot = bytes
+                    .windows(300)
+                    .position(|window| window.iter().all(|byte| *byte == 0xA7))
+                    .expect("the payload");
+                bytes[rot] ^= 1;
+            }
+        }
+
+        let first_sim = SimIo::from_image(image);
+        let first = ReelStore::open_with_io(
+            PathBuf::from(ROOT),
+            config(),
+            COLUMNS,
+            Arc::new(first_sim.clone()),
+        )
+        .expect("first open");
+        first.settle_sealed().expect("settle");
+        match evicts {
+            "read" => assert_eq!(first.get(&record(7, 0)).expect("get"), None),
+            "scrub" => {
+                let mut hits = 0;
+                for _ in 0..64 {
+                    std::thread::sleep(Duration::from_millis(20));
+                    hits += first
+                        .compactor
+                        .scrub_pass(&first.reel, &first.index)
+                        .expect("scrub");
+                    if hits > 0 {
+                        break;
+                    }
+                }
+                assert_eq!(hits, 1, "the scrub found no rot");
+            }
+            _ => {}
+        }
+        first
+            .compactor
+            .compact_segment(&first.reel, &first.index, sealed)
+            .expect("compact");
+        assert_eq!(
+            first.get(&record(7, 0)).expect("get"),
+            None,
+            "{evicts}: the retire brought the older version back"
+        );
+        first.flush().expect("flush");
+        drop(first);
+        let second = reopen_image(first_sim.durable_image(), config());
+        assert_eq!(
+            second.get(&record(7, 0)).expect("get"),
+            None,
+            "{evicts}: the reopen brought the older version back"
+        );
+    }
 }

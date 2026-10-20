@@ -227,6 +227,11 @@ impl FooterMap {
         self.partitions.iter().map(|held| held.span.column)
     }
 
+    /// Number of rows across every column
+    pub fn rows(&self) -> usize {
+        self.partitions.iter().map(|held| held.span.rows).sum()
+    }
+
     /// Bytes this map weighs, for a cache that bounds what it holds
     pub fn weight(&self) -> usize {
         let filters: usize = self

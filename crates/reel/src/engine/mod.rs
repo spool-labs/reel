@@ -203,6 +203,9 @@ pub struct ReelStore {
 
     /// Admitted bytes at the last heat ask, which turns a counter into a rate
     ingest_marker: AtomicU64,
+
+    /// Walks had stepped over this many deleted keys when the last merge ran
+    merged_buried: AtomicU64,
 }
 
 impl ReelStore {
@@ -240,7 +243,7 @@ impl ReelStore {
 
     fn open_inner(
         root: PathBuf,
-        config: ReelConfig,
+        mut config: ReelConfig,
         columns: ColumnSet,
         io: Arc<dyn ReelIo>,
         is_read_only: bool,
@@ -261,7 +264,7 @@ impl ReelStore {
             false => None,
         };
 
-        // The facts are logged and kept for callers, nothing acts on them
+        // The facts are logged and kept for callers, and only an automatic tail budget acts on them
         let bias = is_real_fs.then(|| {
             let facts = MachineFacts::read(&root);
             let verdict = facts.verdict();
@@ -284,6 +287,8 @@ impl ReelStore {
             );
             facts
         });
+        let is_rotational = bias.as_ref().and_then(|facts| facts.is_rotational);
+        config.active_tails = config.active_tails.for_disk(is_rotational);
 
         let mut roots = vec![root.clone()];
         roots.extend(config.volumes.iter().map(|volume| volume.path.clone()));
@@ -311,7 +316,7 @@ impl ReelStore {
         };
         let compactor = Compactor::new(&config, capacity_bytes, fast_capacity);
 
-        let index = ReelIndex::new(columns)?;
+        let mut index = ReelIndex::new(columns)?;
         // The manifest lists every root before any read, so a missing mount fails here
         let dead: Vec<bool> = std::iter::once(false)
             .chain(config.volumes.iter().map(|volume| volume.dead))
@@ -331,7 +336,18 @@ impl ReelStore {
         if !is_read_only {
             index.key_runs().load(&driver, &root)?;
         }
-        let rebuilt = rebuild_reel(&driver, &roots, &dead, &index)?;
+        let mut rebuilt = rebuild_reel(&driver, &roots, &dead, &index)?;
+        // A run hides older rows behind the one it picked, so a run whose pick is unreadable goes
+        let quarantined: Vec<SegmentId> = rebuilt
+            .quarantined
+            .iter()
+            .map(|(segment, _)| *segment)
+            .collect();
+        if !is_read_only && index.key_runs().drop_covering(&quarantined) {
+            index = ReelIndex::new(columns)?;
+            index.key_runs().load(&driver, &root)?;
+            rebuilt = rebuild_reel(&driver, &roots, &dead, &index)?;
+        }
         // Compaction copies only declared columns, so a writable open must declare every column
         if let Some(column) = rebuilt.undeclared.filter(|_| !is_read_only) {
             return Err(ReelError::Config(format!(
@@ -339,7 +355,7 @@ impl ReelStore {
                 column.0,
             )));
         }
-        for path in &rebuilt.quarantined {
+        for (_, path) in &rebuilt.quarantined {
             tracing::warn!("quarantined a foreign reel segment at {}", path.display());
         }
         // Cut each walked tail to its length to free what a crash left reserved, best effort
@@ -383,7 +399,9 @@ impl ReelStore {
             columns,
             1,
         ));
-        shared.lsn.recover_to(rebuilt.highest_lsn);
+        // Numbers restart above the cut, since a row at or below it reads back with no pass
+        shared.lsn.recover_to(rebuilt.highest_lsn.max(rebuilt.cut));
+        shared.writeout.recover(rebuilt.cut);
         shared.recover_next_segment(rebuilt.highest_segment);
         for (segment, at) in &rebuilt.placements {
             shared.volumes.place(*segment, *at as usize);
@@ -410,6 +428,7 @@ impl ReelStore {
             bias,
             footprint: AtomicU64::new(0),
             ingest_marker: AtomicU64::new(0),
+            merged_buried: AtomicU64::new(0),
             sweep_nonce: (std::process::id() as u64) << 32
                 | OPENINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64,
             root,

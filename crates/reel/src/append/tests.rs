@@ -77,6 +77,11 @@ fn harness_capped(
     (shared, sim)
 }
 
+/// Write a journal's pending groups the way a pass does
+fn write_pending(journal: &Journal) -> Result<()> {
+    journal.write_taken(journal.take_pending())
+}
+
 // pending rows keep every group in order across flushes, and a flush writes none of them twice
 #[test]
 fn pending_rows_survive_flushes() {
@@ -98,9 +103,9 @@ fn pending_rows_survive_flushes() {
     let groups = vec![vec![row(1)], vec![row(2), row(3)], vec![row(4)]];
     journal.push(&groups[0]);
     journal.push(&groups[1]);
-    journal.write_pending().expect("flush");
+    write_pending(&journal).expect("flush");
     journal.push(&groups[2]);
-    journal.write_pending().expect("flush");
+    write_pending(&journal).expect("flush");
 
     let bytes = shared
         .driver
@@ -132,11 +137,11 @@ fn a_short_journal_write_lands_whole_on_retry() {
         journal.push(&groups[0]);
         sim.arm_next_ops(1, FaultKind::ShortWrite { written_bytes: 10 });
         assert!(
-            journal.write_pending().is_err(),
+            write_pending(&journal).is_err(),
             "the short write is refused"
         );
         journal.push(&groups[1]);
-        journal.write_pending().expect("the retry lands");
+        write_pending(&journal).expect("the retry lands");
 
         let bytes = shared
             .driver
@@ -162,7 +167,7 @@ fn a_failed_journal_write_keeps_its_rows() {
         .expect("append 1");
     sim.arm_next_ops(1, FaultKind::EnospcAppend);
     let fired = sim.fault_reach().0;
-    read(&appender.active).journal.try_write_pending();
+    appender.pace_journal();
     assert_eq!(sim.fault_reach().0, fired + 1, "the pace write failed");
     appender
         .append_data(key(2), vec![0x22; 500], 0, Commit::PerRecord)
@@ -1036,8 +1041,8 @@ fn failed_drain_leaves_no_footer_entry() {
 // a failed cadence sync gives up on the segment and rolls off it
 #[test]
 fn failed_sync_rolls_off_the_segment() {
-    // Op eight is the first sync, after both opens, the dir sync, the reservation and three writes
-    let plan = FaultPlan::new(1).with_fault(7, FaultKind::SyncError);
+    // Op eleven is the first sync, after the opens, the dir sync, the reservation and six writes
+    let plan = FaultPlan::new(1).with_fault(10, FaultKind::SyncError);
     let (shared, _sim) = harness(config(EVERY_WRITE), plan);
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
 
@@ -1049,7 +1054,7 @@ fn failed_sync_rolls_off_the_segment() {
 // a segment given up on unsealed never reads as settled
 #[test]
 fn a_doomed_segment_never_settles() {
-    let plan = FaultPlan::new(1).with_fault(7, FaultKind::SyncError);
+    let plan = FaultPlan::new(1).with_fault(10, FaultKind::SyncError);
     let (shared, _sim) = harness(config(EVERY_WRITE), plan);
     let appender = Appender::open(Arc::clone(&shared), 0, None).expect("open");
 

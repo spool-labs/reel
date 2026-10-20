@@ -28,8 +28,8 @@ const FIXTURE_LEN: usize = 300;
 /// The first root listing, which finds the key runs, executes at this op position
 const ROOT_LIST_AT: u64 = 0;
 
-/// The first segment read executes at this op position, after the listings
-const FIRST_READ_AT: u64 = 4;
+/// The first segment read executes at this op position, after the listings and the cut file's open
+const FIRST_READ_AT: u64 = 5;
 
 fn config() -> ReelConfig {
     ReelConfig {

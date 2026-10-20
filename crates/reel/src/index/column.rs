@@ -14,6 +14,7 @@ use crate::format::loc::{Loc, SegmentId, SegmentIncarnation};
 use crate::format::lsn::Lsn;
 use crate::index::counters::{Bookings, SegmentTable};
 use crate::index::entry::{span_of, Entry};
+use crate::index::few::Few;
 use crate::index::in_turns;
 use crate::index::page::KeyPage;
 use crate::index::paged::SealedRanges;
@@ -486,9 +487,29 @@ impl ColumnIndex {
         on_index!(self, index => index.page(start, limit, out))
     }
 
+    /// The same page, stopping at the end of a bounded walk so dead keys past it go unread
+    pub fn page_until(
+        &self,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        limit: usize,
+        out: &mut KeyPage,
+    ) {
+        on_index!(self, index => index.page_until(start, end, limit, out))
+    }
+
     /// Fill a page with one bounded run of live keys, descending from a bound
     pub fn page_back(&self, end: Bound<&[u8]>, limit: usize, out: &mut KeyPage) {
         on_index!(self, index => index.page_back(end, limit, out))
+    }
+}
+
+/// Whether a key lies past the end of an ascending walk
+pub fn is_past(end: Bound<&[u8]>, key: &[u8]) -> bool {
+    match end {
+        Bound::Unbounded => false,
+        Bound::Included(last) => key > last,
+        Bound::Excluded(stop) => key >= stop,
     }
 }
 
@@ -1389,33 +1410,29 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 continue;
             }
             let standing = snapshot.get_or_insert_with(|| sealed.segments());
-            let mut doomed: Vec<K> = Vec::new();
             let mut oldest_left = Lsn(u64::MAX);
-            for (key, entry) in state.map.walk() {
-                if !entry.is_grave() {
-                    continue;
-                }
+            let mut prunes = |entry: &Entry| {
                 let prunable = entry.lsn <= before
                     && entry
                         .grave_origin()
                         .is_some_and(|from| standing.binary_search(&from).is_ok());
                 if prunable {
-                    doomed.push(key.clone());
                     lifted = lifted.max(entry.lsn);
                 } else if entry.lsn < oldest_left {
                     oldest_left = entry.lsn;
                 }
-            }
-            // The walk saw every grave, so the floor comes back exact.
+                prunable
+            };
+            let doomed = state
+                .map
+                .sweep(|_, entry| !(entry.is_grave() && prunes(entry)));
+            // The sweep saw every grave, so the floor comes back exact
             state.oldest_grave = oldest_left;
-            if doomed.is_empty() {
+            if doomed == 0 {
                 continue;
             }
-            for key in &doomed {
-                state.map.take(key.as_slice());
-            }
-            state.graves -= doomed.len();
-            pruned += doomed.len() as u64;
+            state.graves -= doomed;
+            pruned += doomed as u64;
             // Pack the room the deletes left, since the map never merges
             state.map.pack_owed();
             self.note_emptied(at, &mut state);
@@ -1932,6 +1949,17 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
 
     /// Fill a page with one bounded run of live keys, ascending from a bound
     pub fn page(&self, start: Bound<&[u8]>, limit: usize, out: &mut KeyPage) {
+        self.page_until(start, Bound::Unbounded, limit, out);
+    }
+
+    /// Fill a page of live keys from a bound, stopping at `end`
+    pub fn page_until(
+        &self,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        limit: usize,
+        out: &mut KeyPage,
+    ) {
         out.clear();
         if limit == 0 {
             return;
@@ -1956,6 +1984,10 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
             let judged = out.keeps_graves();
             let covers = self.has_covers.load(Ordering::Relaxed);
             for (keys, entries) in state.map.span_runs(low) {
+                // A run ends where the walk does, so no dead key past its end is stepped over
+                let inside = keys.partition_point(|key| !is_past(end, key.as_slice()));
+                let is_ending = inside < keys.len();
+                let (keys, entries) = (&keys[..inside], &entries[..inside]);
                 // A run with nothing dead goes over as one copy of keys and one of entries
                 let take = keys.len().min(limit - out.len());
                 let clean = judged || (!covers && !entries[..take].iter().any(Entry::is_grave));
@@ -1976,7 +2008,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                         }
                     }
                 }
-                if out.len() >= limit {
+                if out.len() >= limit || is_ending {
                     return;
                 }
             }
@@ -2246,6 +2278,9 @@ pub trait ShardMap<K: IndexKey, V: 'static>: Default {
         }
     }
 
+    /// Take out every pair `keep` refuses, in one pass over the map
+    fn sweep(&mut self, keep: impl FnMut(&K, &V) -> bool) -> usize;
+
     /// Give back the room a map grown a key at a time holds past its fill
     fn fit(&mut self) {}
 
@@ -2325,15 +2360,19 @@ impl<const B: usize, V: Default + 'static> ShardMap<Box<[u8]>, V> for TBTreeMap<
         self.get_many_sorted(keys, out);
     }
 
+    fn sweep(&mut self, keep: impl FnMut(&Box<[u8]>, &V) -> bool) -> usize {
+        TBTreeMap::sweep(self, keep)
+    }
+
     fn fit(&mut self) {
         if !self.is_packed() {
-            self.repack(B);
+            self.repack();
         }
     }
 
     fn pack_owed(&mut self) {
         if self.repack_owed() {
-            self.repack(B);
+            self.repack();
         }
     }
 
@@ -2417,15 +2456,19 @@ impl<const N: usize, const B: usize, V: Default + 'static> ShardMap<[u8; N], V>
         self.get_many_sorted(keys, out);
     }
 
+    fn sweep(&mut self, keep: impl FnMut(&[u8; N], &V) -> bool) -> usize {
+        TBTreeMap::sweep(self, keep)
+    }
+
     fn fit(&mut self) {
         if !self.is_packed() {
-            self.repack(B);
+            self.repack();
         }
     }
 
     fn pack_owed(&mut self) {
         if self.repack_owed() {
-            self.repack(B);
+            self.repack();
         }
     }
 
@@ -2448,7 +2491,7 @@ macro_rules! tree_shapes {
     ($($width:literal),* $(,)?) => {
         $(
             impl Shape<[u8; $width]> for Trees<$width> {
-                type Entries = TBTreeMap<[u8; $width], { node_width($width) }, Entry>;
+                type Entries = Few<[u8; $width], Entry, TBTreeMap<[u8; $width], { node_width($width) }, Entry>>;
             }
         )*
     };
@@ -2463,7 +2506,7 @@ pub const VAR_NODE_WIDTH: usize = 32;
 pub struct VarTrees;
 
 impl Shape<Box<[u8]>> for VarTrees {
-    type Entries = TBTreeMap<Box<[u8]>, VAR_NODE_WIDTH, Entry>;
+    type Entries = Few<Box<[u8]>, Entry, TBTreeMap<Box<[u8]>, VAR_NODE_WIDTH, Entry>>;
 }
 
 /// A key as the resident map holds it, inline for a fixed column and boxed for a variable one

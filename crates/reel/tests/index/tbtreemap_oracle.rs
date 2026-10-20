@@ -300,7 +300,7 @@ fn stream_against_the_oracle<K: TreeKey, const B: usize>(
         audit(&rebuilt, &oracle, seed, OPS + 1);
 
         // Repacking in place must also drop the room the removes left
-        tree.repack(B);
+        tree.repack();
         audit(&tree, &oracle, seed, OPS + 2);
         audit_ranges(&mut rng, &tree, &oracle, bound, seed, OPS + 2);
         audit_batches(&mut rng, &tree, &oracle, draw, seed, OPS + 2);
@@ -358,7 +358,7 @@ fn the_empty_tree_agrees() {
     audit_ranges(&mut rng, &tree, &oracle, &mut fixed_bound, 7, 0);
     audit_batches(&mut rng, &tree, &oracle, &mut draw_key, 7, 0);
     // Repacking an empty tree must work too
-    tree.repack(32);
+    tree.repack();
     audit(&tree, &oracle, 7, 1);
 }
 

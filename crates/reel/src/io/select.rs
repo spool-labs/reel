@@ -47,6 +47,9 @@ fn wants_direct(config: &ReelConfig) -> bool {
 #[cfg(target_os = "linux")]
 fn open_ring(config: &ReelConfig) -> Option<Arc<dyn ReelIo>> {
     match crate::io::uring_backend::UringBackend::new(wants_direct(config), config.uring) {
+        Ok(ring) if config.io_backend == IoBackend::Mixed => {
+            Some(Arc::new(ring.with_posix_writes()))
+        }
         Ok(ring) => Some(Arc::new(ring)),
         Err(error) => {
             tracing::warn!("io_uring setup failed: {error}");
@@ -63,7 +66,7 @@ fn open_ring(_config: &ReelConfig) -> Option<Arc<dyn ReelIo>> {
 fn wants_ring(backend: IoBackend) -> bool {
     match backend {
         IoBackend::Posix => false,
-        IoBackend::Uring | IoBackend::UringDirect => true,
+        IoBackend::Uring | IoBackend::UringDirect | IoBackend::Mixed => true,
     }
 }
 
@@ -105,7 +108,7 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn a_ring_request_is_posix_without_a_ring() {
-        for backend in [IoBackend::Uring, IoBackend::UringDirect] {
+        for backend in [IoBackend::Uring, IoBackend::UringDirect, IoBackend::Mixed] {
             let selected = select_backend(&config_for(backend));
             assert!(
                 !selected.serving().is_ring(),
@@ -117,7 +120,12 @@ mod tests {
     // the backend reports itself, so a ring only serves a volume that asked for one
     #[test]
     fn serving_is_the_outcome_not_the_request() {
-        for backend in [IoBackend::Posix, IoBackend::Uring, IoBackend::UringDirect] {
+        for backend in [
+            IoBackend::Posix,
+            IoBackend::Uring,
+            IoBackend::UringDirect,
+            IoBackend::Mixed,
+        ] {
             let config = config_for(backend);
             let serving = select_backend(&config).serving();
             if serving.is_ring() {

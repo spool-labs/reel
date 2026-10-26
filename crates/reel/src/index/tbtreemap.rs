@@ -690,6 +690,8 @@ pub struct TBTreeMap<K: TreeKey, const B: usize, V: Default> {
     inners: Vec<Inner<K, B>>,
     root: u32,
     first: u32,
+    /// The rightmost leaf, where a key past every held key goes without a descent
+    last: u32,
     len: usize,
 }
 
@@ -793,6 +795,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             inners: Vec::new(),
             root: NONE,
             first: NONE,
+            last: NONE,
             len: 0,
         }
     }
@@ -906,8 +909,9 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             let right_at = arena_index(self.leaves.len());
             self.leaves[at].next = right_at;
             let after = self.leaves[right_at as usize].next;
-            if after != NONE {
-                self.leaves[after as usize].prev = right_at;
+            match after {
+                NONE => self.last = right_at,
+                _ => self.leaves[after as usize].prev = right_at,
             }
             (lift_lead, lift_spill, right_at)
         };
@@ -941,7 +945,25 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             self.leaves.push(empty_leaf());
             self.root = arena_index(self.leaves.len());
             self.first = self.root;
+            self.last = self.root;
         }
+
+        // Every separator above the rightmost leaf sits at or below its keys, so a greater key lands there
+        let tail = &mut self.leaves[self.last as usize];
+        if tail.len > 0 && tail.len < B && key > tail.keys[tail.len - 1] {
+            let word = tail.win.word(key.borrow());
+            let slot = tail.len;
+            tail.lead[slot] = word.unwrap_or(0);
+            tail.keys[slot] = key;
+            tail.vals[slot] = val;
+            tail.len += 1;
+            self.len += 1;
+            if word.is_err() {
+                tail.retune();
+            }
+            return None;
+        }
+
         if self.full(self.root) {
             let mut fresh: Inner<K, B> = empty_inner();
             fresh.kids[0] = self.root;
@@ -1008,6 +1030,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             inners: Vec::new(),
             root: NONE,
             first: NONE,
+            last: NONE,
             len: 0,
         };
 
@@ -1069,6 +1092,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             };
         }
         self.first = 0;
+        self.last = count as u32 - 1;
 
         // Each entry is a subtree's first leaf, last leaf and node index
         let mut level: Vec<(u32, u32, u32)> = (0..count)
@@ -1198,6 +1222,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         self.inners.clear();
         self.root = NONE;
         self.first = NONE;
+        self.last = NONE;
         self.len = 0;
     }
 
@@ -1221,15 +1246,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
 
     /// The rightmost leaf, which a backward walk with no bound starts at
     fn last_leaf(&self) -> Option<u32> {
-        let mut at = self.root;
-        if at == NONE {
-            return None;
-        }
-        while is_inner(at) {
-            let inner = &self.inners[slot_of(at)];
-            at = inner.kids[inner.len];
-        }
-        Some(at)
+        (self.last != NONE).then_some(self.last)
     }
 
     /// Every pair inside a span in key order, from one descent and a walk along the leaves

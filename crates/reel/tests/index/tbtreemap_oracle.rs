@@ -541,3 +541,56 @@ fn a_shared_lead_moves_the_window_and_still_answers() {
     wanted.sort();
     assert_eq!(walked, wanted, "a windowed run walked out of order");
 }
+
+// slot-led keys arriving in slot order take the append path, mixed with stray older keys, removes and sweeps
+#[test]
+fn slot_ordered_appends_agree() {
+    for seed in SEEDS {
+        let mut rng = SmallRng::seed_from_u64(*seed);
+        let mut tree = Tree::new();
+        let mut oracle: BTreeMap<Key, u64> = BTreeMap::new();
+        let mut slot = 0u64;
+
+        for at in 0..OPS {
+            let mut key = [0u8; 34];
+            match rng.gen_range(0..10u32) {
+                // A late write for an older slot, which descends
+                0 => key[..8].copy_from_slice(&rng.gen_range(0..=slot).to_be_bytes()),
+                _ => {
+                    slot += rng.gen_range(0..3u64);
+                    key[..8].copy_from_slice(&slot.to_be_bytes());
+                }
+            }
+            // Long runs of one slot share the leading bytes, so the window moves when the slot does
+            key[8..16].copy_from_slice(&(at as u64).to_be_bytes());
+            rng.fill(&mut key[16..]);
+            assert_eq!(tree.insert(key, at as u64), oracle.insert(key, at as u64));
+
+            if rng.gen_bool(0.05) {
+                let gone = *oracle.keys().nth(rng.gen_range(0..oracle.len())).expect("held");
+                assert_eq!(tree.remove(&gone), oracle.remove(&gone));
+            }
+            if at % 4096 == 4095 {
+                tree.sweep(|_, val| val % 3 != 0);
+                oracle.retain(|_, val| *val % 3 != 0);
+                if rng.gen_bool(0.5) {
+                    tree.repack();
+                }
+            }
+            if at % AUDIT_EVERY == 0 {
+                audit(&tree, &oracle, *seed, at);
+                let back: Vec<u64> = tree
+                    .range_back(Bound::Unbounded, Bound::Unbounded)
+                    .take(64)
+                    .map(|(_, val)| *val)
+                    .collect();
+                let wanted: Vec<u64> = oracle.values().rev().take(64).copied().collect();
+                assert_eq!(back, wanted, "seed {seed} op {at}: the backward walk diverged");
+            }
+        }
+        audit(&tree, &oracle, *seed, OPS);
+        for (key, val) in &oracle {
+            assert_eq!(tree.get(key), Some(val), "seed {seed}: a held key went missing");
+        }
+    }
+}

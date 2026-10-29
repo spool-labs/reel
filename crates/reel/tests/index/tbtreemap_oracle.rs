@@ -567,7 +567,10 @@ fn slot_ordered_appends_agree() {
             assert_eq!(tree.insert(key, at as u64), oracle.insert(key, at as u64));
 
             if rng.gen_bool(0.05) {
-                let gone = *oracle.keys().nth(rng.gen_range(0..oracle.len())).expect("held");
+                let gone = *oracle
+                    .keys()
+                    .nth(rng.gen_range(0..oracle.len()))
+                    .expect("held");
                 assert_eq!(tree.remove(&gone), oracle.remove(&gone));
             }
             if at % 4096 == 4095 {
@@ -585,12 +588,19 @@ fn slot_ordered_appends_agree() {
                     .map(|(_, val)| *val)
                     .collect();
                 let wanted: Vec<u64> = oracle.values().rev().take(64).copied().collect();
-                assert_eq!(back, wanted, "seed {seed} op {at}: the backward walk diverged");
+                assert_eq!(
+                    back, wanted,
+                    "seed {seed} op {at}: the backward walk diverged"
+                );
             }
         }
         audit(&tree, &oracle, *seed, OPS);
         for (key, val) in &oracle {
-            assert_eq!(tree.get(key), Some(val), "seed {seed}: a held key went missing");
+            assert_eq!(
+                tree.get(key),
+                Some(val),
+                "seed {seed}: a held key went missing"
+            );
         }
     }
 }

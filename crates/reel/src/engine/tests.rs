@@ -5876,6 +5876,7 @@ fn delete_on_tail(store: &ReelStore, tail: usize, key: &RecordKey) {
 #[test]
 fn a_kill_keeps_earlier_deletes() {
     let config = ReelConfig {
+        segment_bytes: ByteCount::mb(8),
         sync: SyncPolicy::Bytes(ByteCount::from_bytes(16 * 1024 * 1024)),
         active_tails: ThreadBudget::threads(2),
         ..ReelConfig::default()

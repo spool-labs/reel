@@ -1395,7 +1395,7 @@ fn raw_allocate(fd: RawFd, offset: u64, len: u64) -> Result<()> {
 }
 
 /// Reserve a byte range on macOS, where F_PEOFPOSMODE takes a length past the end of file
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn raw_allocate(fd: RawFd, offset: u64, len: u64) -> Result<()> {
     let end = offset.saturating_add(len);
     // Measure in allocated blocks, since the length stays at the last written byte
@@ -1421,9 +1421,10 @@ fn raw_allocate(fd: RawFd, offset: u64, len: u64) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn raw_allocate(fd: RawFd, offset: u64, len: u64) -> Result<()> {
-    extend_to(fd, offset.saturating_add(len))
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+fn raw_allocate(_fd: RawFd, _offset: u64, _len: u64) -> Result<()> {
+    // Reserving ahead is an optimisation; writes still grow the file
+    Ok(())
 }
 
 /// Punch a hole over a byte range and keep the length, or do nothing if unsupported
@@ -1442,7 +1443,7 @@ fn raw_release(fd: RawFd, offset: u64, len: u64) -> Result<()> {
 }
 
 /// Punch a hole over a byte range on macOS and keep the length, or do nothing if unsupported
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn raw_release(fd: RawFd, offset: u64, len: u64) -> Result<()> {
     let hole = libc::fpunchhole_t {
         fp_flags: 0,
@@ -1460,7 +1461,7 @@ fn raw_release(fd: RawFd, offset: u64, len: u64) -> Result<()> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
 fn raw_release(_fd: RawFd, _offset: u64, _len: u64) -> Result<()> {
     Ok(())
 }
@@ -1482,7 +1483,7 @@ fn raw_advise(fd: RawFd, offset: u64, len: u64, advice: Advice) -> Result<()> {
 }
 
 /// Map the hint to per-descriptor read-ahead on macOS, dropping DontNeed
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn raw_advise(fd: RawFd, _offset: u64, _len: u64, advice: Advice) -> Result<()> {
     let (command, argument) = match advice {
         Advice::Sequential => (libc::F_RDAHEAD, 1),
@@ -1492,7 +1493,7 @@ fn raw_advise(fd: RawFd, _offset: u64, _len: u64, advice: Advice) -> Result<()> 
     checked(unsafe { libc::fcntl(fd, command, argument as c_int) })
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
 fn raw_advise(_fd: RawFd, _offset: u64, _len: u64, _advice: Advice) -> Result<()> {
     Ok(())
 }

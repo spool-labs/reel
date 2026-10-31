@@ -608,6 +608,9 @@ struct Ring {
 
     /// The volume's door tally, which this ring updates per op
     doors: Arc<DoorTally>,
+
+    /// Whether writes go to posix, for a volume that runs the ring for reads alone
+    posix_writes: bool,
 }
 
 impl Ring {
@@ -642,6 +645,7 @@ impl Ring {
             kick: None,
             asks_for_completions: core.taskrun.is_asked_for(),
             doors: Arc::clone(&core.doors),
+            posix_writes: core.posix_writes,
         })
     }
 
@@ -804,7 +808,7 @@ impl Ring {
 
     /// Queue one op on the ring, or answer it on the posix path when the ring cannot take it
     fn stage(&mut self, op: Op, posix: &PosixBackend, order: u32) -> Option<Completion> {
-        let file = match ring_file(&op) {
+        let file = match ring_file(&op, self.posix_writes) {
             Some(file) => file,
             None => {
                 self.doors.note_off_ring(1);
@@ -915,6 +919,8 @@ struct Core {
 
     is_direct: bool,
     doors: Arc<DoorTally>,
+
+    posix_writes: bool,
 }
 
 /// Which doors this volume's ops took, and what the kernel refused
@@ -1473,9 +1479,19 @@ impl UringBackend {
                 taskrun,
                 is_direct,
                 doors: Arc::new(DoorTally::default()),
+                posix_writes: false,
             }),
             engines: (0..shards).map(|_| OnceLock::new()).collect(),
         })
+    }
+
+    /// The same ring with every write and sync on posix, so a lone write costs one syscall
+    pub fn with_posix_writes(mut self) -> UringBackend {
+        // No engine has started, so the core is still this backend's alone
+        if let Some(core) = Arc::get_mut(&mut self.core) {
+            core.posix_writes = true;
+        }
+        self
     }
 
     /// Ops the posix backend under this ring has answered
@@ -1549,9 +1565,10 @@ impl UringBackend {
 impl ReelIo for UringBackend {
     /// A ring, direct when its descriptors bypass the page cache
     fn serving(&self) -> ServingBackend {
-        match self.core.is_direct {
-            true => ServingBackend::RingDirect,
-            false => ServingBackend::Ring,
+        match (self.core.is_direct, self.core.posix_writes) {
+            (true, _) => ServingBackend::RingDirect,
+            (false, true) => ServingBackend::Mixed,
+            (false, false) => ServingBackend::Ring,
         }
     }
 
@@ -1589,7 +1606,7 @@ impl ReelIo for UringBackend {
         let mut on_ring = Vec::with_capacity(ops.len());
         let mut off_ring = Vec::new();
         for op in ops {
-            match ring_file(&op) {
+            match ring_file(&op, self.core.posix_writes) {
                 Some(_) => on_ring.push(op),
                 None => off_ring.push(op),
             }
@@ -1610,7 +1627,7 @@ impl ReelIo for UringBackend {
 
     /// Service one op on this thread's own ring and hand its completion back
     fn submit_inline(&self, op: Op) -> std::result::Result<Completion, Op> {
-        if !self.takes_ring() || ring_file(&op).is_none() {
+        if !self.takes_ring() || ring_file(&op, self.core.posix_writes).is_none() {
             self.core.doors.note_off_ring(1);
             return Ok(self.core.posix.dispatch(op));
         }
@@ -1706,8 +1723,10 @@ fn write_span(bufs: &[WriteBuf]) -> u64 {
 }
 
 /// The op's file if it belongs on the ring, or nothing
-fn ring_file(op: &Op) -> Option<FileId> {
+fn ring_file(op: &Op, posix_writes: bool) -> Option<FileId> {
     match op {
+        // A mixed volume writes on posix, where a lone buffered write is one syscall
+        Op::Writev { .. } if posix_writes => None,
         // The kernel refuses a write past the iovec cap, and posix splits it
         Op::Writev { bufs, .. } if bufs.len() > MAX_IOVECS => None,
         Op::Writev { bufs, .. } if write_span(bufs) > RING_WRITE_CAP => None,
@@ -2209,7 +2228,11 @@ mod tests {
             },
         ];
         for op in ops {
-            assert_eq!(ring_file(&op), Some(file()), "{op:?} belongs on the ring");
+            assert_eq!(
+                ring_file(&op, false),
+                Some(file()),
+                "{op:?} belongs on the ring"
+            );
         }
     }
 
@@ -2224,7 +2247,7 @@ mod tests {
             bufs: (0..MAX_IOVECS).map(|_| span(1)).collect(),
         };
         assert_eq!(
-            ring_file(&at_cap),
+            ring_file(&at_cap, false),
             Some(file()),
             "a write filling the cap exactly still belongs on the ring",
         );
@@ -2236,7 +2259,7 @@ mod tests {
             bufs: (0..MAX_IOVECS + 1).map(|_| span(1)).collect(),
         };
         assert_eq!(
-            ring_file(&past_cap),
+            ring_file(&past_cap, false),
             None,
             "a write one span past the cap must take the posix path, which splits it",
         );
@@ -2252,12 +2275,12 @@ mod tests {
             bufs: vec![WriteBuf::owned(vec![0u8; bytes])],
         };
         assert_eq!(
-            ring_file(&write(RING_WRITE_CAP as usize)),
+            ring_file(&write(RING_WRITE_CAP as usize), false),
             Some(file()),
             "a write filling the cap exactly still belongs on the ring",
         );
         assert_eq!(
-            ring_file(&write(RING_WRITE_CAP as usize + 1)),
+            ring_file(&write(RING_WRITE_CAP as usize + 1), false),
             None,
             "a footer is megabytes with nothing beside it, so it blocks where it is issued",
         );
@@ -2514,7 +2537,27 @@ mod tests {
             },
         ];
         for op in ops {
-            assert_eq!(ring_file(&op), None, "{op:?} belongs off the ring");
+            assert_eq!(ring_file(&op, false), None, "{op:?} belongs off the ring");
         }
+    }
+    // a mixed volume keeps its reads on the ring and sends every write to posix
+    #[test]
+    fn mixed_writes() {
+        let read = Op::Pread {
+            tag: tag(),
+            file: file(),
+            offset: 0,
+            buf: ReadBuf::new(1),
+        };
+        let write = Op::Writev {
+            tag: tag(),
+            file: file(),
+            offset: 0,
+            bufs: vec![WriteBuf::zeros(1)],
+        };
+
+        assert_eq!(ring_file(&read, true), Some(file()));
+        assert_eq!(ring_file(&write, true), None);
+        assert_eq!(ring_file(&write, false), Some(file()));
     }
 }

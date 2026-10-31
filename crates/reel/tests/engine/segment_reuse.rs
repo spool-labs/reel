@@ -7,7 +7,7 @@ use tempfile::TempDir;
 
 use reel::config::{ReelConfig, SyncPolicy, ThreadBudget};
 use reel::format::column::{Codec, ColumnId, ColumnSet, ColumnSpec, RecordKey};
-use reel::format::journal::rows_region;
+use reel::format::journal::{cut_slot, rows_region};
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::SimIo;
 use reel::units::ByteCount;
@@ -275,7 +275,7 @@ fn a_crash_leaves_only_the_records() {
         .filter(|(path, _)| is_segment(path))
         .map(|(_, bytes)| {
             let (rows_at, _) = rows_region(bytes).expect("an open segment runs out to its rows");
-            bytes[..rows_at as usize]
+            bytes[..cut_slot(rows_at) as usize]
                 .iter()
                 .rposition(|byte| *byte != 0)
                 .map_or(0, |last| last as u64 + 1)

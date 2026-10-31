@@ -1,4 +1,5 @@
 //! The journal: one checksummed group of rows per write, read back until the first torn group
+//! A cut mark says every row at or below its sequence number is in its journal
 
 use crate::format::column::{ColumnId, KeyBytes, RecordKey};
 use crate::format::lsn::Lsn;
@@ -18,6 +19,15 @@ const ROW_FIXED: usize = 1 + 2 + 8 + 4 + 4 + 1;
 
 /// The end length a range tombstone stores when its range runs to its column's end
 const NO_END: u16 = u16::MAX;
+
+/// A cut mark opens with this tag, so zeros and rows never read as one
+const CUT_MAGIC: [u8; 4] = *b"RCUT";
+
+/// A cut mark holds its tag, the sequence number, and a CRC32C over both
+pub const CUT_MARK_LEN: usize = 4 + 8 + 4;
+
+/// The file at the reel's root that holds the reel's cut mark
+pub const CUT_FILE: &str = "reel.cut";
 
 /// One record as its segment's journal holds it
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,11 +87,20 @@ pub fn rows_region(segment: &[u8]) -> Option<(u64, &[u8])> {
 
 /// Every whole group at the front of a journal, and the bytes they take
 pub fn read_groups(bytes: &[u8]) -> (Vec<Vec<JournalRow>>, usize) {
+    read_groups_through(bytes, Lsn(u64::MAX))
+}
+
+/// The whole groups at the front of a journal up to the first with a row past the cut
+pub fn read_groups_through(bytes: &[u8], cut: Lsn) -> (Vec<Vec<JournalRow>>, usize) {
     let mut groups = Vec::new();
     let mut at = 0usize;
     // Nothing past a torn group landed whole, so the read stops there
     loop {
         if let Some((rows, next)) = read_group(bytes, at) {
+            // Only a write-out that never finished wrote this group and the ones after it
+            if rows.iter().any(|row| row.lsn > cut) {
+                return (groups, at);
+            }
             groups.push(rows);
             at = next;
             continue;
@@ -97,6 +116,28 @@ pub fn read_groups(bytes: &[u8]) -> (Vec<Vec<JournalRow>>, usize) {
             false => return (groups, at),
         }
     }
+}
+
+/// Where a segment keeps its copy of the reel's cut, the block just before its rows
+pub fn cut_slot(rows_at: u64) -> u64 {
+    rows_at.saturating_sub(BLOCK)
+}
+
+/// The cut mark for a sequence number
+pub fn pack_cut(cut: Lsn) -> [u8; CUT_MARK_LEN] {
+    let mut mark = [0u8; CUT_MARK_LEN];
+    mark[..4].copy_from_slice(&CUT_MAGIC);
+    mark[4..12].copy_from_slice(&cut.pack());
+    let crc = checksum(&mark[..12]);
+    mark[12..].copy_from_slice(&crc.to_le_bytes());
+    mark
+}
+
+/// The sequence number a cut mark holds, or nothing when the bytes are not a whole mark
+pub fn read_cut(bytes: &[u8]) -> Option<Lsn> {
+    let mark = bytes.get(..CUT_MARK_LEN)?;
+    let is_whole = mark[..4] == CUT_MAGIC && checksum(&mark[..12]) == read_u32_le(&mark[12..]);
+    is_whole.then(|| Lsn(read_u64_le(&mark[4..12])))
 }
 
 fn read_group(bytes: &[u8], at: usize) -> Option<(Vec<JournalRow>, usize)> {
@@ -208,6 +249,32 @@ mod tests {
 
         let (groups, len) = read_groups(&[0u8; 64]);
         assert_eq!((groups.len(), len), (0, 0));
+    }
+
+    // the read stops at the first group past the cut, keeping a later group below it out too
+    #[test]
+    fn the_cut_ends_the_journal() {
+        let first = vec![row(1, 10, Flags::DATA)];
+        let mut bytes = Vec::new();
+        push_group(&first, &mut bytes);
+        let kept = bytes.len();
+        push_group(&[row(2, 12, Flags::DATA)], &mut bytes);
+        push_group(&[row(3, 11, Flags::DATA)], &mut bytes);
+
+        assert_eq!(read_groups_through(&bytes, Lsn(11)), (vec![first], kept));
+        assert_eq!(read_groups_through(&bytes, Lsn(12)).0.len(), 3);
+    }
+
+    // a cut mark reads back, and zeros or a flipped byte read as none
+    #[test]
+    fn a_cut_mark_reads_back() {
+        let mark = pack_cut(Lsn(77));
+        assert_eq!(read_cut(&mark), Some(Lsn(77)));
+        assert_eq!(read_cut(&[0u8; CUT_MARK_LEN]), None);
+        let mut flipped = mark;
+        flipped[6] ^= 1;
+        assert_eq!(read_cut(&flipped), None);
+        assert_eq!(read_cut(&mark[..CUT_MARK_LEN - 1]), None);
     }
 
     // zero padding up to a block boundary is skipped

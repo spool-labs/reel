@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::append::CopyRecord;
 use crate::config::{ReelConfig, RepairPath, VolumeClass};
-use crate::error::Result;
+use crate::error::{ReelError, Result};
 use crate::format::column::RecordKey;
 use crate::format::footer::{FooterRow, SegmentFooter, FIXED_TAIL_LEN};
 use crate::format::loc::{Loc, SegmentId};
@@ -23,16 +23,17 @@ use crate::reel::segment::{SegmentHandle, SegmentReader, READ_CHUNK};
 use crate::reel::{Reel, ReelShared, NOTHING_PURGED};
 use crate::sync::{lock, try_lock};
 
+use crate::compaction::footer_walk::{FooterRows, LiveWalk};
 use crate::compaction::pressure::{GcPressure, PassPace, RateGate, RateLimiter};
 
 /// Bytes at the end of a sealed segment holding its footer length and magic
-const TRAILER_LEN: u64 = 8;
+pub(crate) const TRAILER_LEN: u64 = 8;
 
 /// A scrub pass takes at most this much of a quiet stretch's earnings
 const SCRUB_PASS_MAX: Duration = Duration::from_secs(60);
 
-/// One rewrite stripe holds at most this many payload bytes between fetch and apply
-const STRIPE_STAGE_BYTES: u64 = 256 * 1024 * 1024;
+/// How long a finished sweep waits before the next one, since rot builds over days
+const SCRUB_LAP_REST: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// One fetch wave holds at most this many ranges in flight
 const FETCH_DEPTH: usize = 8;
@@ -389,6 +390,15 @@ pub struct Compactor {
     /// Held for the length of one scrub pass, so passes never stack
     scrub_guard: Mutex<()>,
 
+    /// Read buffers one scrub pass hands the next, so a sweep allocates once
+    scrub_spare: Mutex<Vec<Vec<u8>>>,
+
+    /// When the last full sweep ended, nothing before the first
+    scrub_lap_end: Mutex<Option<Instant>>,
+
+    /// The sealed segment the scrub is inside, its rows in offset order
+    scrub_order: Mutex<RowOrder>,
+
     /// Seeds where a fresh sweep starts, so restarts do not all start at the same segment
     scrub_seed: u64,
 
@@ -475,6 +485,9 @@ impl Compactor {
             scrub_rate: scrub.map(RateGate::new),
             scrub_cursor: Mutex::new(None),
             scrub_guard: Mutex::new(()),
+            scrub_spare: Mutex::new(Vec::new()),
+            scrub_lap_end: Mutex::new(None),
+            scrub_order: Mutex::new(RowOrder::default()),
             in_flight: Mutex::new(std::collections::HashSet::new()),
             rotted: Mutex::new(std::collections::HashMap::new()),
             spare: Mutex::new(Vec::new()),
@@ -528,7 +541,26 @@ impl Compactor {
         if index.has_pending_covers() {
             return None;
         }
-        self.select_ranked(reel, index, effective_dead_ratio, cue_floor)
+        self.select_ranked(reel, index, cue_floor, 1, |_, fraction| {
+            (fraction >= effective_dead_ratio).then_some(fraction)
+        })
+    }
+
+    /// The smallest sealed segment under `small` bytes, once at least `fewest` of them stand
+    pub fn select_small(
+        &self,
+        reel: &Reel,
+        index: &ReelIndex,
+        small: u64,
+        fewest: usize,
+        cue_floor: Option<Lsn>,
+    ) -> Option<(SegmentId, f64)> {
+        if index.has_pending_covers() {
+            return None;
+        }
+        self.select_ranked(reel, index, cue_floor, fewest, |total, _| {
+            (total < small).then(|| 1.0 - total as f64 / small as f64)
+        })
     }
 
     /// A sealed segment with nothing live left in it, which retires by unlink
@@ -541,19 +573,23 @@ impl Compactor {
         if index.has_pending_covers() {
             return None;
         }
-        self.select_ranked(reel, index, 1.0, cue_floor)
+        self.select_ranked(reel, index, cue_floor, 1, |_, fraction| {
+            (fraction >= 1.0).then_some(fraction)
+        })
     }
 
-    /// The ranking walk behind both selectors, claiming whatever it picks
+    /// The ranking walk behind every selector, claiming the best of at least `fewest` that score
     fn select_ranked(
         &self,
         reel: &Reel,
         index: &ReelIndex,
-        effective_dead_ratio: f64,
         cue_floor: Option<Lsn>,
+        fewest: usize,
+        score: impl Fn(u64, f64) -> Option<f64>,
     ) -> Option<(SegmentId, f64)> {
         let shared = reel.shared();
         let mut best: Option<(SegmentId, f64)> = None;
+        let mut scored = 0usize;
         // one call for both, since every insert takes this lock
         let (segments, floors) = index.ranking();
         // read before the claim, so the two locks are never held at once
@@ -583,17 +619,21 @@ impl Compactor {
             }
             // dead bytes plus the tombstones this segment no longer needs to keep
             let fraction = bytes.reclaimable(floors.excluding(segment)) as f64 / total as f64;
-            if fraction < effective_dead_ratio {
+            let Some(rank) = score(total, fraction) else {
                 continue;
-            }
+            };
             // A rot-pinned segment returns only once something in it has died since
             if pinned.get(&segment) == Some(&bytes.dead) {
                 continue;
             }
-            let is_better = best.map(|existing| fraction > existing.1).unwrap_or(true);
+            scored += 1;
+            let is_better = best.map(|existing| rank > existing.1).unwrap_or(true);
             if is_better {
-                best = Some((segment, fraction));
+                best = Some((segment, rank));
             }
+        }
+        if scored < fewest {
+            return None;
         }
         // claim under the walk's lock, or two callers could leave with the same segment
         if let Some((segment, _)) = best {
@@ -646,16 +686,18 @@ impl Compactor {
                 return Ok(true);
             }
         };
-        // read once: where the records end, and their key order when the footer has one
-        let footer = shared.footer_of(segment)?;
+        // read in place where the segment maps: where the records end, and their key order
+        let footer = FooterRows::open(shared, segment, &source, file_len)?;
         // No row lists an unsealed keyless segment's keys, so it stands until a reopen drops it
         if source.layout().is_keyless_layout() && footer.is_none() {
             return Ok(false);
         }
-        let region_end = footer_bound(shared, &source, file_len, footer.as_deref())?;
-        let order = footer.as_deref().and_then(footer_order);
+        let region_end = footer_bound(shared, &source, file_len, footer.is_some())?;
+        let ordered = footer
+            .as_ref()
+            .and_then(|(rows, bound)| bound.map(|bound| (rows, bound)));
         // Only rows list a keyless segment's records, so undecodable rows leave it in place
-        if order.is_none() && source.layout().is_keyless_layout() {
+        if ordered.is_none() && source.layout().is_keyless_layout() {
             // pin it at its current dead bytes, so the ranking skips it until more dies
             lock(&self.rotted).insert(segment, index.segment_bytes(segment).dead);
             return Ok(false);
@@ -687,16 +729,15 @@ impl Compactor {
         let mut pace = self.compact_rate.pace();
 
         let mut tally = PassTally::default();
-        let copy_result = match &order {
-            Some((order, prefix_bound)) => self.rewrite_ordered(
+        let copy_result = match ordered {
+            Some((rows, prefix_bound)) => self.rewrite_ordered(
                 reel,
                 dest_index,
                 index,
                 &mut reader,
                 Ordered {
-                    order,
-                    prefix_bound: *prefix_bound,
-                    footer: footer.as_deref(),
+                    rows,
+                    prefix_bound,
                     layout: source.layout(),
                 },
                 segment,
@@ -715,6 +756,7 @@ impl Compactor {
                 &mut pace,
             ),
         };
+        drop(footer);
 
         // The pass dropped what newer records on any tail replace, so every tail syncs before the retire
         if let Err(error) = reel.flush() {
@@ -787,31 +829,47 @@ impl Compactor {
         pace: &mut PassPace<'_>,
     ) -> Result<()> {
         let Ordered {
-            order,
+            rows,
             prefix_bound,
-            footer,
             layout,
         } = ordered;
         // The index says which rows still hold the live copy, so no dead record is read
-        let (order, rows) = match footer {
-            Some(footer) => live_rows(index, segment, footer, layout)?,
-            None => (order.to_vec(), None),
-        };
-        let order = order.as_slice();
+        let is_keyless = layout.is_keyless_layout();
+        let mut walk = LiveWalk::new(rows);
+        let mut order = Vec::new();
+        let mut kept = Vec::new();
+        let mut plan: Vec<(usize, u32)> = Vec::new();
         let mut run = CopyRun::default();
-        let mut staged: Vec<Option<Part>> = Vec::new();
-        let mut start = 0usize;
-        while start < order.len() {
-            let end = stripe_end(order, start);
-            let mut plan: Vec<(usize, u32)> = (start..end)
-                .map(|position| (position, order[position].0))
-                .collect();
+        let mut staged: Vec<Option<(usize, usize)>> = Vec::new();
+        let mut slab = Arc::<Vec<u8>>::default();
+        loop {
+            walk.fill(index, segment, is_keyless, &mut order, &mut kept)?;
+            if order.is_empty() {
+                break;
+            }
+            plan.clear();
+            plan.extend(
+                order
+                    .iter()
+                    .enumerate()
+                    .map(|(position, &(offset, _))| (position, offset)),
+            );
             plan.sort_unstable_by_key(|&(_, offset)| offset);
-            let ranges = chunk_ranges(&plan, order, prefix_bound, reader.limit());
+            let ranges = chunk_ranges(&plan, &order, prefix_bound, reader.limit());
+
+            // The stripe stages in one buffer, so a few read buffers serve all its reads
+            let mut stage = Arc::try_unwrap(slab).unwrap_or_default();
+            stage.clear();
+            stage.reserve_exact(
+                order
+                    .iter()
+                    .map(|&(_, len)| prefix_bound as usize + len as usize)
+                    .sum(),
+            );
 
             // Each record goes in the slot its key order gives it, so the apply needs no sort
             staged.clear();
-            staged.resize(end - start, None);
+            staged.resize(order.len(), None);
             let mut wave_at = 0usize;
             while wave_at < ranges.len() {
                 let wave =
@@ -821,25 +879,29 @@ impl Compactor {
                     wave.iter().map(|range| (range.start, range.len)).collect();
                 let buffers = reader.read_ranges(&asks)?;
                 for (range, buffer) in wave.iter().zip(buffers) {
-                    reader.preload(range.start, buffer);
                     for &(position, offset) in &plan[range.members.clone()] {
                         // Held in place and parsed at apply, so staging ignores key size
                         let span = prefix_bound as usize + order[position].1 as usize;
-                        staged[position - start] = Some(reader.held(u64::from(offset), span)?);
+                        let skip = ((u64::from(offset) - range.start) as usize).min(buffer.len());
+                        let len = span.min(buffer.len() - skip);
+                        // Only the record's bytes stage, so the dead bytes around it take no room
+                        staged[position] = Some((stage.len(), len));
+                        stage.extend_from_slice(&buffer[skip..skip + len]);
                     }
+                    reader.recycle(buffer);
                 }
                 pace.reached(reader.read_bytes() + tally.copied_bytes);
             }
+            slab = Arc::new(stage);
 
             for (slot, held) in staged.drain(..).enumerate() {
-                let Some(held) = held else {
+                let Some((at, stretch)) = held else {
                     continue;
                 };
-                let (offset, len) = order[start + slot];
-                let found = match (&rows, layout.keyless_key(len)) {
-                    (Some(rows), Some(check)) => {
-                        keyless_held(&rows[start + slot], offset, held, check)
-                    }
+                let held = Part::new(&slab, at, stretch);
+                let (offset, len) = order[slot];
+                let found = match (is_keyless, layout.keyless_key(len)) {
+                    (true, Some(check)) => keyless_held(&kept[slot], offset, held, check),
                     _ => held_record(offset, held),
                 };
                 let (record, payload) = match found {
@@ -864,8 +926,7 @@ impl Compactor {
                 pace.reached(reader.read_bytes() + tally.copied_bytes);
             }
             // Landing the copies frees the stripe's read buffers for the next stripe
-            self.land_run(reel, dest_index, index, &mut run, tally)?;
-            start = end;
+            self.land_run(reel, dest_index, index, segment, &mut run, tally)?;
         }
         Ok(())
     }
@@ -892,7 +953,7 @@ impl Compactor {
             )?;
             pace.reached(reader.read_bytes() + tally.copied_bytes);
         }
-        self.land_run(reel, dest_index, index, &mut run, tally)
+        self.land_run(reel, dest_index, index, segment, &mut run, tally)
     }
 
     /// Rewrite one record, landing the run first for a tombstone or a full run
@@ -913,7 +974,7 @@ impl Compactor {
         let cap = reel.tails()[dest_index].copy_run_cap();
         // size the copy as a keyed record, since every destination tail is keyed
         if !record.header.flags.is_data() || run.bytes + record.header.span() > cap {
-            self.land_run(reel, dest_index, index, run, tally)?;
+            self.land_run(reel, dest_index, index, segment, run, tally)?;
         }
         match self.rewrite_one(
             reel, dest_index, index, reader, record, staged, segment, drop_floor, run,
@@ -932,6 +993,7 @@ impl Compactor {
         reel: &Reel,
         dest_index: usize,
         index: &ReelIndex,
+        segment: SegmentId,
         run: &mut CopyRun,
         tally: &mut PassTally,
     ) -> Result<()> {
@@ -939,7 +1001,12 @@ impl Compactor {
             return Ok(());
         }
         run.bytes = 0;
-        let landed = reel.tails()[dest_index].append_copies(std::mem::take(&mut run.copies))?;
+        let dest = &reel.tails()[dest_index];
+        // A copy ties its source on the record's number and wins as the newer segment, so it lands above it
+        while dest.tail().active_segment() < segment {
+            dest.seal()?;
+        }
+        let landed = dest.append_copies(std::mem::take(&mut run.copies))?;
         crate::sync::rendezvous::at("compaction/repoint");
         for ((key, from, lsn, span), committed) in run.moved.drain(..).zip(landed) {
             run.repoints.push(KeyRepoint {
@@ -1084,7 +1151,7 @@ impl Compactor {
     ) -> Result<EraseReport> {
         let shared = reel.shared();
         let mut report = EraseReport::default();
-        let Some(footer) = shared.footer_of(segment)? else {
+        let Some(map) = shared.footer_map_of(segment)? else {
             return Ok(report);
         };
         let source = match source_handle(shared, segment) {
@@ -1093,34 +1160,31 @@ impl Compactor {
             Err(error) => return Err(error),
         };
         report.segments = 1;
+        // Records under a block each leave few whole blocks to give back
+        let bytes = index.segment_bytes(segment).total();
+        let rows = map.rows() as u64;
+        if rows == 0 || bytes / rows < ERASE_BLOCK {
+            return Ok(report);
+        }
         // A checkpoint links the file, and a punch would reach its copy too
         if is_linked(&shared.segment_path(segment)) {
             return Ok(report);
         }
-        // Records under a block each leave few whole blocks to give back
-        let bytes = index.segment_bytes(segment).total();
-        let rows = footer.entry_count() as u64;
-        if rows == 0 || bytes / rows < ERASE_BLOCK {
-            return Ok(report);
-        }
         let layout = source.layout();
         let mut dead: Vec<(u64, u64)> = Vec::new();
-        for partition in &footer.partitions {
-            for at in 0..partition.len() {
-                let row = partition.row_at(at)?;
-                if !row.flags.is_data() {
-                    continue;
-                }
-                let key = partition.key_at(at).unwrap_or(&[]);
-                let loc = Loc::new(segment, row.offset, row.len);
-                if index.is_live_at(&RecordKey::from_bytes(partition.column, key)?, loc, row.lsn)? {
-                    continue;
-                }
-                let start = u64::from(row.offset);
-                let span = layout.prefix_len(key.len(), row.len) as u64 + u64::from(row.len);
-                dead.push((start, start + span));
+        shared.walk_rows(segment, |column, key, row| {
+            if !row.flags.is_data() {
+                return Ok(());
             }
-        }
+            let loc = Loc::new(segment, row.offset, row.len);
+            if index.is_live_at(&RecordKey::from_bytes(column, key)?, loc, row.lsn)? {
+                return Ok(());
+            }
+            let start = u64::from(row.offset);
+            let span = layout.prefix_len(key.len(), row.len) as u64 + u64::from(row.len);
+            dead.push((start, start + span));
+            Ok(())
+        })?;
         dead.sort_unstable();
         let mut runs: Vec<(u64, u64)> = Vec::new();
         for (start, end) in dead {
@@ -1184,7 +1248,7 @@ impl Compactor {
             // With peers the eviction queues a repair. A sole copy stays put, since a rewrite
             // would stamp a fresh checksum over rot.
             if reel.shared().config.repair == RepairPath::Peers {
-                if index.evict_at(&record.header.key, loc)? {
+                if evict_rotted(reel, index, &record.header.key, loc, record.header.lsn)? {
                     self.metrics.record_hits(1);
                     tracing::warn!(
                         "a record in segment {} fails its checksum, evicted so a peer can repair it",
@@ -1263,6 +1327,12 @@ impl Compactor {
         let Some(_pass) = try_lock(&self.scrub_guard) else {
             return Ok(0);
         };
+        // A sweep that finished rests a day before the next one starts
+        let is_resting = lock(&self.scrub_cursor).is_none()
+            && lock(&self.scrub_lap_end).is_some_and(|end| end.elapsed() < SCRUB_LAP_REST);
+        if is_resting {
+            return Ok(0);
+        }
         // the rate sets this pass's read budget, however often the plane ticks
         let (mut budget, stretch) = gate.allowance(SCRUB_PASS_MAX);
         let _rest = Rest(gate);
@@ -1319,7 +1389,7 @@ impl Compactor {
             // the moment a pass is mid-sweep, for a test probing what a second caller sees
             crate::sync::rendezvous::at("scrub/segment");
             let step = self.scrub_segment(
-                shared,
+                reel,
                 index,
                 *segment,
                 resume,
@@ -1343,13 +1413,15 @@ impl Compactor {
         }
 
         *lock(&self.scrub_cursor) = None;
+        *lock(&self.scrub_order) = RowOrder::default();
+        *lock(&self.scrub_lap_end) = Some(Instant::now());
         Ok(hits)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn scrub_segment(
         &self,
-        shared: &Arc<ReelShared>,
+        reel: &Reel,
         index: &ReelIndex,
         segment: SegmentId,
         resume: Option<(u64, u64)>,
@@ -1357,6 +1429,7 @@ impl Compactor {
         budget: &mut u64,
         deadline: Instant,
     ) -> Result<ScrubStep> {
+        let shared = reel.shared();
         // a segment can retire between the plan and the pass
         let handle = match source_handle(shared, segment) {
             Ok(handle) => handle,
@@ -1382,17 +1455,47 @@ impl Compactor {
         let (from, region_end) = match resume {
             Some(carried) => carried,
             None => {
-                let footer = shared.footer_of(handle.id())?;
+                let footer = self.scrub_footer(shared, segment)?;
                 (
                     0,
-                    footer_bound(shared, &handle, file_len, footer.as_deref())?,
+                    footer_bound(shared, &handle, file_len, footer.is_some())?,
                 )
             }
         };
         let mut reader = SegmentReader::new(&shared.driver, handle.file(), region_end);
+        reader.stock(std::mem::take(&mut *lock(&self.scrub_spare)));
+        let step = self.scrub_reader(
+            reel,
+            index,
+            &handle,
+            (from, region_end),
+            carried,
+            budget,
+            deadline,
+            &mut reader,
+        );
+        *lock(&self.scrub_spare) = reader.into_spare();
+        step
+    }
+
+    /// Walk one segment's records through a reader the pass stocked with buffers
+    #[allow(clippy::too_many_arguments)]
+    fn scrub_reader(
+        &self,
+        reel: &Reel,
+        index: &ReelIndex,
+        handle: &SegmentHandle,
+        (from, region_end): (u64, u64),
+        carried: u64,
+        budget: &mut u64,
+        deadline: Instant,
+        reader: &mut SegmentReader<'_>,
+    ) -> Result<ScrubStep> {
+        let shared = reel.shared();
+        let segment = handle.id();
         // A sealed segment is walked by its rows, so a given-back hole never ends the walk early
         match (
-            shared.footer_of(handle.id())?,
+            self.scrub_footer(shared, segment)?,
             handle.layout().is_keyless_layout(),
         ) {
             (Some(footer), _) => {
@@ -1403,7 +1506,7 @@ impl Compactor {
                     region_end,
                     deadline,
                 };
-                return self.scrub_rows(shared, &walk, &mut reader, &footer, from, carried, budget);
+                return self.scrub_rows(reel, &walk, reader, &footer, from, carried, budget);
             }
             // an unsealed keyless segment holds no record the index points at
             (None, true) => {
@@ -1415,7 +1518,7 @@ impl Compactor {
             }
             (None, false) => {}
         }
-        let mut scan = RecordScan::resuming(&mut reader, from);
+        let mut scan = RecordScan::resuming(reader, from);
 
         let mut hits = 0usize;
         let mut dead = carried;
@@ -1457,7 +1560,7 @@ impl Compactor {
                 // resolving so every read reports the loss.
                 match shared.config.repair {
                     RepairPath::Peers => {
-                        if index.evict_at(&record.header.key, loc)? {
+                        if evict_rotted(reel, index, &record.header.key, loc, record.header.lsn)? {
                             hits += 1;
                             tracing::warn!(
                                 "the scrub found a record in segment {} failing its checksum and evicted it",
@@ -1485,6 +1588,66 @@ impl Compactor {
     }
 }
 
+/// A sealed segment's footer rows in offset order, as places in the footer
+#[derive(Default)]
+struct RowOrder {
+    /// The segment these rows belong to, nothing before the first fill
+    segment: Option<SegmentId>,
+
+    /// That segment's footer, so a pass that resumes inside it reads nothing again
+    footer: Option<Arc<SegmentFooter>>,
+
+    /// Every row's place, sorted by the offset its record sits at
+    rows: Vec<RowPlace>,
+}
+
+impl RowOrder {
+    /// Order a segment's rows, keeping the capacity an earlier segment grew
+    fn fill(&mut self, segment: SegmentId, footer: Arc<SegmentFooter>) -> Result<()> {
+        self.rows.clear();
+        for (partition, rows) in footer.partitions.iter().enumerate() {
+            for at in 0..rows.len() {
+                let row = rows.row_at(at)?;
+                self.rows.push(RowPlace {
+                    offset: row.offset,
+                    partition: partition as u32,
+                    at: at as u32,
+                });
+            }
+        }
+        self.rows.sort_unstable_by_key(|place| place.offset);
+        self.segment = Some(segment);
+        self.footer = Some(footer);
+        Ok(())
+    }
+}
+
+/// One footer row, by the record's offset and where the row sits in the footer
+#[derive(Clone, Copy)]
+struct RowPlace {
+    /// Offset of the record in its segment
+    offset: u32,
+
+    /// The footer partition that holds the row
+    partition: u32,
+
+    /// The row's position in that partition
+    at: u32,
+}
+
+impl RowPlace {
+    /// The row's key and fields, read back from the footer
+    fn read(&self, footer: &SegmentFooter) -> Result<(RecordKey, FooterRow)> {
+        let partition = footer
+            .partitions
+            .get(self.partition as usize)
+            .ok_or_else(|| ReelError::Corruption("footer partition is out of range".to_string()))?;
+        let at = self.at as usize;
+        let key = RecordKey::from_bytes(partition.column, partition.key_at(at).unwrap_or(&[]))?;
+        Ok((key, partition.row_at(at)?))
+    }
+}
+
 /// Where one scrub pass over a sealed segment reads and when it has to stop
 struct RowScrub<'a> {
     index: &'a ReelIndex,
@@ -1495,11 +1658,29 @@ struct RowScrub<'a> {
 }
 
 impl Compactor {
+    /// The footer of the segment the scrub is inside, read once and held until the scrub moves on
+    fn scrub_footer(
+        &self,
+        shared: &Arc<ReelShared>,
+        segment: SegmentId,
+    ) -> Result<Option<Arc<SegmentFooter>>> {
+        let mut order = lock(&self.scrub_order);
+        if order.segment == Some(segment) {
+            return Ok(order.footer.clone());
+        }
+        // The held copy serves the scrub, so a lap leaves the cache to the lookups
+        let footer = shared.footer_once(segment)?;
+        if let Some(footer) = &footer {
+            order.fill(segment, Arc::clone(footer))?;
+        }
+        Ok(footer)
+    }
+
     /// Scrub a sealed segment by its rows in offset order, from the first row at or past `from`
     #[allow(clippy::too_many_arguments)]
     fn scrub_rows(
         &self,
-        shared: &Arc<ReelShared>,
+        reel: &Reel,
         walk: &RowScrub<'_>,
         reader: &mut SegmentReader<'_>,
         footer: &SegmentFooter,
@@ -1510,10 +1691,12 @@ impl Compactor {
         let mut hits = 0usize;
         let mut dead = carried;
         let mut scanned = 0u64;
-        let mut rows = footer_rows(footer)?;
-        rows.retain(|(_, row)| u64::from(row.offset) >= from);
-        rows.sort_unstable_by_key(|(_, row)| row.offset);
-        for (key, row) in rows {
+        let order = lock(&self.scrub_order);
+        let start = order
+            .rows
+            .partition_point(|row| u64::from(row.offset) < from);
+        for place in &order.rows[start..] {
+            let (key, row) = place.read(footer)?;
             let is_late = scanned > 0 && Instant::now() >= walk.deadline;
             if *budget == 0 || is_late {
                 self.metrics.record_hits(hits as u64);
@@ -1541,9 +1724,9 @@ impl Compactor {
             let is_intact =
                 payload.len() == record.header.length as usize && record.verify(payload);
             if !is_intact {
-                match shared.config.repair {
+                match reel.shared().config.repair {
                     RepairPath::Peers => {
-                        if walk.index.evict_at(&key, loc)? {
+                        if evict_rotted(reel, walk.index, &key, loc, record.header.lsn)? {
                             hits += 1;
                             tracing::warn!(
                                 "the scrub found a record in segment {} failing its checksum and evicted it",
@@ -1569,22 +1752,6 @@ impl Compactor {
             resume_at: None,
         })
     }
-}
-
-/// Each column's records in key order as offset and length pairs, nothing on a bad row
-fn footer_order(footer: &SegmentFooter) -> Option<(Vec<(u32, u32)>, u64)> {
-    let mut order = Vec::with_capacity(footer.entry_count());
-    let mut widest = 0usize;
-    for partition in &footer.partitions {
-        widest = widest.max(partition.widest_key());
-        for row in 0..partition.len() {
-            match partition.row_at(row) {
-                Ok(row) => order.push((row.offset, row.len)),
-                Err(_) => return None,
-            }
-        }
-    }
-    Some((order, HEADER_LEN as u64 + widest as u64))
 }
 
 /// Whether a tombstone must be copied because something it shadows may still turn up
@@ -1614,6 +1781,23 @@ fn should_carry(
         )?,
     };
     Ok(is_held_below || tombstone.lsn >= drop_floor)
+}
+
+/// Evict a rotted record and bury it under its own number, so a retire or a reopen keeps the miss
+pub(crate) fn evict_rotted(
+    reel: &Reel,
+    index: &ReelIndex,
+    key: &RecordKey,
+    loc: Loc,
+    lsn: Lsn,
+) -> Result<bool> {
+    if !index.evict_at(key, loc)? {
+        return Ok(false);
+    }
+    // The index alone keeps the miss, and the older versions it hides return once the record goes
+    let tombstone = reel.bury(key.clone(), lsn, loc.segment)?;
+    index.remove(key, lsn, tombstone.loc)?;
+    Ok(true)
 }
 
 impl Compactor {
@@ -1698,10 +1882,10 @@ pub fn footer_bound(
     shared: &Arc<ReelShared>,
     handle: &SegmentHandle,
     file_len: u64,
-    footer: Option<&SegmentFooter>,
+    has_footer: bool,
 ) -> Result<u64> {
     let min_footer = FIXED_TAIL_LEN as u64;
-    if footer.is_none() || file_len < min_footer {
+    if !has_footer || file_len < min_footer {
         return Ok(file_len);
     }
     let trailer = shared
@@ -1778,60 +1962,11 @@ impl<'reader, 'driver> RecordScan<'reader, 'driver> {
     }
 }
 
-/// Inputs to an ordered rewrite: the footer's order, and the rows that key keyless records
+/// Inputs to an ordered rewrite: the footer's rows, and the bound on a record's prefix
 struct Ordered<'a> {
-    order: &'a [(u32, u32)],
+    rows: &'a FooterRows,
     prefix_bound: u64,
-    footer: Option<&'a SegmentFooter>,
     layout: RecordLayout,
-}
-
-/// The footer rows the index still points at, and every tombstone, in `footer_order`'s order
-///
-/// A keyless segment also gets each kept row's key, since its records hold none
-fn live_rows(
-    index: &ReelIndex,
-    segment: SegmentId,
-    footer: &SegmentFooter,
-    layout: RecordLayout,
-) -> Result<KeptRows> {
-    let mut order = Vec::with_capacity(footer.entry_count());
-    let mut rows = layout
-        .is_keyless_layout()
-        .then(|| Vec::with_capacity(footer.entry_count()));
-    for partition in &footer.partitions {
-        for at in 0..partition.len() {
-            let row = partition.row_at(at)?;
-            let key = RecordKey::from_bytes(partition.column, partition.key_at(at).unwrap_or(&[]))?;
-            let loc = Loc::new(segment, row.offset, row.len);
-            if row.flags.is_data() && !index.is_live_at(&key, loc, row.lsn)? {
-                continue;
-            }
-            order.push((row.offset, row.len));
-            if let Some(rows) = rows.as_mut() {
-                rows.push((key, row));
-            }
-        }
-    }
-    Ok((order, rows))
-}
-
-/// The offsets and lengths a rewrite reads, and the keyless rows beside them
-type KeptRows = (Vec<(u32, u32)>, Option<Vec<(RecordKey, FooterRow)>>);
-
-/// Every row of a footer with its key, in the same order as `footer_order`
-fn footer_rows(footer: &SegmentFooter) -> Result<Vec<(RecordKey, FooterRow)>> {
-    let mut rows = Vec::with_capacity(footer.entry_count());
-    for partition in &footer.partitions {
-        for at in 0..partition.len() {
-            let key = partition.key_at(at).unwrap_or(&[]);
-            rows.push((
-                RecordKey::from_bytes(partition.column, key)?,
-                partition.row_at(at)?,
-            ));
-        }
-    }
-    Ok(rows)
 }
 
 /// A keyless record held where the read left it, its header put together from its row
@@ -1892,21 +2027,6 @@ pub fn read_payload(reader: &mut SegmentReader<'_>, record: &SourceRecord) -> Re
     let length = record.header.length as usize;
     let bytes = reader.range(record.payload_at(), length)?;
     Ok(bytes.to_vec())
-}
-
-/// The end of the stripe that starts here, capped by staged bytes, at least one record
-fn stripe_end(order: &[(u32, u32)], start: usize) -> usize {
-    let mut end = start + 1;
-    let mut staged = u64::from(order[start].1);
-    while end < order.len() {
-        let next = u64::from(order[end].1);
-        if staged + next > STRIPE_STAGE_BYTES {
-            break;
-        }
-        staged += next;
-        end += 1;
-    }
-    end
 }
 
 /// What one punch pass over the volume found and gave back
@@ -2555,7 +2675,7 @@ mod tests {
         let source = source_handle(shared, SegmentId(1)).expect("handle");
         let file_len = segment_len(shared, &source).expect("len").expect("present");
         let footer = shared.footer_of(SegmentId(1)).expect("footer");
-        let region_end = footer_bound(shared, &source, file_len, footer.as_deref()).expect("bound");
+        let region_end = footer_bound(shared, &source, file_len, footer.is_some()).expect("bound");
         let mut reader = SegmentReader::new(&shared.driver, source.file(), region_end);
         let footer = footer.expect("sealed");
         let partition = &footer.partitions[0];
@@ -2964,6 +3084,222 @@ mod tests {
         );
     }
 
+    /// A column keyed at many widths, which seals prefix packed
+    const NAMED: ColumnId = ColumnId(2);
+
+    const MIXED: ColumnSet = &[
+        ColumnSpec {
+            id: RECORDS,
+            name: "records",
+            key_width: KeyWidth::Fixed(KEY_WIDTH as u16),
+            shard_bytes: 2,
+            purge_mark: None,
+            codec: Codec::None,
+        },
+        ColumnSpec {
+            id: NAMED,
+            name: "named",
+            key_width: KeyWidth::Variable,
+            shard_bytes: 0,
+            purge_mark: None,
+            codec: Codec::None,
+        },
+    ];
+
+    fn named(byte: u8) -> RecordKey {
+        let width = 8 + usize::from(byte % 9);
+        RecordKey::from_bytes(NAMED, &vec![byte; width]).expect("key")
+    }
+
+    fn put_key(fixture: &Fixture, key: RecordKey, payload: Vec<u8>) {
+        let committed = fixture
+            .reel
+            .put(key.clone(), payload, 0, Commit::PerRecord)
+            .expect("put");
+        fixture
+            .index
+            .insert(&key, committed.loc, committed.lsn)
+            .expect("insert");
+    }
+
+    // a punch reads rows a block at a time and leaves no footer in the cache
+    #[test]
+    fn a_punch_leaves_no_footer_cached() {
+        let fixture = punchable(settings());
+        let segment = fixture
+            .index
+            .get(&key(100))
+            .expect("get")
+            .expect("live")
+            .loc
+            .segment;
+        fixture
+            .compactor
+            .erase_when_due(&fixture.reel, &fixture.index, 0.5, None, Duration::ZERO)
+            .expect("erase")
+            .expect("the segment was due");
+        let shared = fixture.reel.shared();
+        assert!(
+            shared.footers.get(segment).is_none(),
+            "the punch cached a footer"
+        );
+        assert_eq!(shared.footers.held_split().0, 0);
+
+        // A varying column beside a strided one walks the same rows the whole footer holds
+        let fixture = fixture_over(
+            ReelConfig {
+                segment_bytes: ByteCount::mb(16),
+                ..settings()
+            },
+            MIXED,
+        );
+        for byte in 0..130u8 {
+            put_key(&fixture, key(byte), vec![byte; 16 * 1024]);
+        }
+        for byte in 0..40u8 {
+            put_key(&fixture, named(byte), vec![byte; 16 * 1024]);
+        }
+        let segment = fixture
+            .index
+            .get(&key(0))
+            .expect("get")
+            .expect("live")
+            .loc
+            .segment;
+        seal(&fixture);
+        for byte in 0..20u8 {
+            put_key(&fixture, key(byte), vec![!byte; 16 * 1024]);
+            put_key(&fixture, named(byte), vec![!byte; 16 * 1024]);
+        }
+        let shared = fixture.reel.shared();
+        let footer = shared
+            .footer_once(segment)
+            .expect("footer")
+            .expect("sealed");
+        let varying: Vec<bool> = footer
+            .partitions
+            .iter()
+            .map(|partition| partition.is_varying())
+            .collect();
+        assert_eq!(
+            varying,
+            vec![false, true],
+            "one strided and one varying column"
+        );
+        let mut whole = Vec::new();
+        for partition in &footer.partitions {
+            for at in 0..partition.len() {
+                let key = partition.key_at(at).unwrap_or(&[]).to_vec();
+                whole.push((partition.column, key, partition.row_at(at).expect("row")));
+            }
+        }
+        let mut walked = Vec::new();
+        let found = shared
+            .walk_rows(segment, |column, key, row| {
+                walked.push((column, key.to_vec(), row));
+                Ok(())
+            })
+            .expect("walk");
+        assert!(found);
+        assert_eq!(walked, whole, "the walk and the whole footer disagree");
+
+        let report = fixture
+            .compactor
+            .erase_segment(&fixture.reel, &fixture.index, segment)
+            .expect("erase");
+        assert!(
+            report.erased_bytes > 0,
+            "the replaced runs gave back nothing"
+        );
+        assert!(
+            shared.footers.get(segment).is_none(),
+            "the punch cached a footer"
+        );
+        for byte in 0..40u8 {
+            let entry = fixture.index.get(&named(byte)).expect("get").expect("live");
+            let want = if byte < 20 { !byte } else { byte };
+            let read = fixture
+                .reel
+                .read_record(entry.loc, named(byte).as_ref(), entry.lsn, true, false)
+                .expect("read");
+            assert_eq!(read, RecordRead::Found(Value::new(vec![want; 16 * 1024])));
+        }
+    }
+
+    // a segment of records under a block each bails on its directory and reads no row
+    #[test]
+    fn a_segment_of_small_records_is_not_read() {
+        let fixture = fixture(settings());
+        for byte in 0..200u8 {
+            put(&fixture, byte, vec![byte; 100]);
+        }
+        let segment = fixture
+            .index
+            .get(&key(0))
+            .expect("get")
+            .expect("live")
+            .loc
+            .segment;
+        seal(&fixture);
+        for byte in 0..100u8 {
+            put(&fixture, byte, vec![!byte; 100]);
+        }
+        let shared = fixture.reel.shared();
+        let before = shared.probes.counts().block_reads;
+        let report = fixture
+            .compactor
+            .erase_segment(&fixture.reel, &fixture.index, segment)
+            .expect("erase");
+        assert_eq!(report.erased_bytes, 0);
+        assert!(
+            shared.footers.get(segment).is_none(),
+            "the gate cached a footer"
+        );
+        assert_eq!(
+            shared.probes.counts().block_reads,
+            before,
+            "the gate read a row block"
+        );
+    }
+
+    // a scrub over a sealed segment holds its own footer and caches none
+    #[test]
+    fn uncached_scrub() {
+        let fixture = fixture(ReelConfig {
+            scrub_mbps: 1024,
+            ..scrub_config()
+        });
+        for byte in 0..40u8 {
+            put(&fixture, byte, vec![byte; 4_000]);
+        }
+        let segment = fixture
+            .index
+            .get(&key(0))
+            .expect("get")
+            .expect("live")
+            .loc
+            .segment;
+        seal(&fixture);
+        let mut scrubbed = 0;
+        for _ in 0..64 {
+            std::thread::sleep(Duration::from_millis(20));
+            fixture
+                .compactor
+                .scrub_pass(&fixture.reel, &fixture.index)
+                .expect("scrub");
+            scrubbed = fixture.compactor.counters().scrub_bytes;
+            if scrubbed > 0 {
+                break;
+            }
+        }
+        assert!(scrubbed > 0, "the scrub read nothing");
+        let shared = fixture.reel.shared();
+        assert!(
+            shared.footers.get(segment).is_none(),
+            "the scrub cached a footer"
+        );
+    }
+
     // a scrub pass finds an injected bit flip in a sealed segment and evicts the key
     #[test]
     fn scrub_evicts_bit_flip() {
@@ -3265,7 +3601,10 @@ mod tests {
             .footer_of(SegmentId(1))
             .expect("footer read")
             .expect("the footer parses");
-        assert!(footer_order(&footer).is_none(), "the rows still decode");
+        assert!(
+            FooterRows::Whole(footer).prefix_bound().is_none(),
+            "the rows still decode"
+        );
 
         let (target, _) = fixture
             .compactor

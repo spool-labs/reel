@@ -4,12 +4,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::error::{ReelError, Result};
-use crate::format::journal::{push_group, JournalRow};
+use crate::format::journal::{cut_slot, pack_cut, push_group, JournalRow};
+use crate::format::lsn::Lsn;
 use crate::format::record::BLOCK;
 use crate::io::op::{FileId, WriteBuf};
 use crate::io::ServingBackend;
 use crate::reel::segment::IoDriver;
-use crate::sync::{lock, try_lock};
+use crate::sync::lock;
 
 /// Zero the rows region in steps of a sixteenth of the segment, at most this many bytes
 const FILL: u64 = 1024 * 1024;
@@ -21,6 +22,9 @@ struct Written {
 
     /// Whether a failed write lost rows it could not put back, which fails every later write
     lost: bool,
+
+    /// Whether a seal marked the file, after which its cut slot stays as it is
+    is_sealed: bool,
 }
 
 /// The journal of one open segment, stored from `rows_at` to the end of the segment file
@@ -114,6 +118,7 @@ impl Journal {
             written: Mutex::new(Written {
                 bytes: written,
                 lost: false,
+                is_sealed: false,
             }),
             pushed: AtomicU64::new(written),
             whole_blocks,
@@ -144,30 +149,27 @@ impl Journal {
             .fetch_add((pending.len() - before) as u64, Ordering::AcqRel);
     }
 
-    /// Write all pending groups to the segment file for the next sync to cover
-    pub(super) fn write_pending(&self) -> Result<()> {
+    /// Take every pending group, for a write-out pass that writes every journal together
+    pub(super) fn take_pending(&self) -> Vec<u8> {
+        std::mem::take(&mut *lock(&self.pending))
+    }
+
+    /// Write groups a pass took, putting them back in front of pending if the write fails
+    pub(super) fn write_taken(&self, bytes: Vec<u8>) -> Result<()> {
         let mut written = lock(&self.written);
-        self.write_locked(&mut written)
+        self.write_locked(&mut written, bytes)
     }
 
-    /// Same as write_pending, but skip it if another caller is writing
-    pub(super) fn try_write_pending(&self) {
-        if let Some(mut written) = try_lock(&self.written) {
-            // A failed write keeps its rows, so the next flush writes them or fails
-            let _ = self.write_locked(&mut written);
-        }
-    }
-
-    fn write_locked(&self, written: &mut Written) -> Result<()> {
+    fn write_locked(&self, written: &mut Written, mut bytes: Vec<u8>) -> Result<()> {
         let Some(file) = self.file else {
             return Ok(());
         };
-        if written.lost {
-            return Err(lost_rows());
-        }
-        let mut bytes = std::mem::take(&mut *lock(&self.pending));
+        // A pass with no rows for a lost journal claims nothing, so its parked seal can retry
         if bytes.is_empty() {
             return Ok(());
+        }
+        if written.lost {
+            return Err(lost_rows());
         }
         let rows = bytes.len();
         if self.whole_blocks {
@@ -242,24 +244,39 @@ impl Journal {
         if filled == 0 {
             let past = self.span.next_multiple_of(BLOCK);
             self.driver
-                .release(file, past, self.rows_at.saturating_sub(past))?;
+                .release(file, past, cut_slot(self.rows_at).saturating_sub(past))?;
         }
         self.filled.store(to, Ordering::Release);
         Ok(())
     }
 
-    /// Write what is pending, then a seal's mark in the block after the last row
+    /// Write a seal's mark in the block after the last row, once a pass wrote every row
     pub(super) fn mark_sealed(&self, mark: &[u8]) -> Result<()> {
         let Some(file) = self.file else {
             return Ok(());
         };
         let mut written = lock(&self.written);
-        self.write_locked(&mut written)?;
+        written.is_sealed = true;
         let at = (self.rows_at + written.bytes).next_multiple_of(BLOCK);
         let mut block = vec![0u8; BLOCK as usize];
         block[BLOCK as usize - mark.len()..].copy_from_slice(mark);
         self.driver
             .writev_all(file, at, vec![WriteBuf::owned(block)])
+    }
+
+    /// Write the reel's cut into the block before the rows, so this file's next sync covers it
+    pub(super) fn note_cut(&self, cut: Lsn) -> Result<()> {
+        let Some(file) = self.file else {
+            return Ok(());
+        };
+        // A seal cuts the file at its footer, and a slot written after would hide the footer
+        let written = lock(&self.written);
+        if written.is_sealed {
+            return Ok(());
+        }
+        let slot = WriteBuf::owned(pack_cut(cut).to_vec());
+        self.driver
+            .writev_all(file, cut_slot(self.rows_at), vec![slot])
     }
 
     /// Give back the zeros laid ahead of the written rows, at a close that writes nothing more
@@ -284,11 +301,4 @@ fn lost_rows() -> ReelError {
     ReelError::Io(std::io::Error::other(
         "a journal write failed and lost its rows",
     ))
-}
-
-impl Drop for Journal {
-    /// Write what is pending on the way out, so a store dropped without a seal leaves its rows
-    fn drop(&mut self) {
-        let _ = self.write_pending();
-    }
 }

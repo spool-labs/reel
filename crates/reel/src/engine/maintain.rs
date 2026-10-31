@@ -31,14 +31,30 @@ const SPOT_SCRUB_BUDGET: usize = 65_536;
 /// A key merge runs once a walk merges more runs than this, since a walk seeks once in each
 const MERGE_DEPTH: usize = 8;
 
+/// A key merge also runs once walks have stepped over this many deleted keys since the last one
+const MERGE_BURIED: u64 = 1 << 20;
+
 /// The hand-over runs this often while compaction passes hold the tick
 const HANDOVER_TICK: Duration = Duration::from_secs(1);
 
 /// A close waits this long between looks for a free place on the compaction plane
 const DRAIN_WAIT: Duration = Duration::from_millis(1);
 
+/// A sealed segment holding under this share of a segment's bytes is folded into a tail
+pub(crate) const SMALL_SHARE: u64 = 64;
+
+/// Small segments fold once this many stand
+pub(crate) const FOLD_PILE: usize = 8;
+
+/// A pass folds at most this many small segments, which bounds its copy to a few segments' worth
+const MAX_FOLD: usize = 256;
+
 /// A tail that takes no write for this long is sealed by the tick
 const IDLE_SEAL: Duration = Duration::from_secs(5);
+
+/// A tail whose segment holds this many tombstones is sealed by the tick, busy or not, since
+/// each one stays a grave in the index until the seal
+const GRAVE_SEAL: u64 = 1 << 19;
 
 impl ReelStore {
     /// Tell the index about every segment that has sealed since it was last told
@@ -271,10 +287,24 @@ impl ReelStore {
             return Ok(None);
         };
         self.settle_sealed()?;
-        if self.index.overlap_depth() <= MERGE_DEPTH || self.index.has_pending_covers() {
+        let shared = self.reel.shared();
+        let buried = shared.probes.counts().buried;
+        // Joining every run rewrites their rows, so the walks must have wasted more steps than that
+        let run_rows: u64 = self
+            .index
+            .key_runs()
+            .runs()
+            .iter()
+            .flat_map(|run| run.columns().iter().map(|column| column.rows()))
+            .sum();
+        let wasted = buried - self.merged_buried.load(Ordering::Relaxed);
+        let is_buried = wasted >= MERGE_BURIED.max(run_rows);
+        if (self.index.overlap_depth() <= MERGE_DEPTH && !is_buried)
+            || self.index.has_pending_covers()
+        {
             return Ok(None);
         }
-        let shared = self.reel.shared();
+        self.merged_buried.store(buried, Ordering::Relaxed);
         let covered = self.index.key_runs().covered();
         let owed = shared.pending_seals();
         let mut segments = Vec::new();
@@ -304,7 +334,8 @@ impl ReelStore {
         let mut joining = Vec::new();
         for run in runs {
             let rows: u64 = run.columns().iter().map(|column| column.rows()).sum();
-            if taken > 0 && rows > taken.saturating_mul(2) {
+            // Deleted keys sit in the old runs too, so a merge for them joins every run
+            if !is_buried && taken > 0 && rows > taken.saturating_mul(2) {
                 break;
             }
             taken += rows;
@@ -330,7 +361,7 @@ impl ReelStore {
             return Ok(());
         }
         self.retry_broken_seals();
-        self.seal_idle_tails(IDLE_SEAL)?;
+        self.seal_due_tails(IDLE_SEAL, GRAVE_SEAL)?;
         self.publish_footprint();
         self.page_out_sealed()?;
         self.sweep_covers()?;
@@ -358,13 +389,21 @@ impl ReelStore {
         )
     }
 
-    /// Seal each tail that took no write for `idle`, so compaction can reach what it holds
-    pub(crate) fn seal_idle_tails(&self, idle: Duration) -> Result<()> {
+    /// Seal each tail that took no write for `idle` or holds `graves` tombstones
+    ///
+    /// A quiet tail seals so compaction can reach what it holds, and a busy one so its graves
+    /// can be pruned, which steady deletes would otherwise keep in memory without bound
+    pub(crate) fn seal_due_tails(&self, idle: Duration, graves: u64) -> Result<()> {
         let now = Instant::now();
         let mut seen = lock(&self.idle);
         let tails = self.reel.tails();
         seen.resize(tails.len(), None);
         for (tail, watch) in tails.iter().zip(seen.iter_mut()) {
+            if tail.graves_held() >= graves {
+                tail.seal()?;
+                *watch = None;
+                continue;
+            }
             let head = (tail.tail().active_segment(), tail.tail().committed_len());
             match *watch {
                 Some((segment, len, since)) if (segment, len) == head => {
@@ -568,7 +607,7 @@ impl ReelStore {
             .pressure()
             .should_compact(dead_fraction, is_hot)
         {
-            return Ok(CompactPass::Held);
+            return self.fold_small(is_hot);
         }
         let ratio = self
             .compactor
@@ -607,10 +646,47 @@ impl ReelStore {
                 }
             }
             None if did_work => Ok(CompactPass::Copied),
-            None => {
-                self.compactor.release_spare();
-                Ok(CompactPass::Idle)
+            None => match self.fold_small(is_hot)? {
+                CompactPass::Copied => Ok(CompactPass::Copied),
+                _ => {
+                    self.compactor.release_spare();
+                    Ok(CompactPass::Idle)
+                }
+            },
+        }
+    }
+
+    /// Copy the small sealed segments into a tail once enough stand, so quiet seals do not pile up
+    fn fold_small(&self, is_hot: bool) -> Result<CompactPass> {
+        if is_hot {
+            return Ok(CompactPass::Held);
+        }
+        let small = self.config.segment_bytes.to_bytes() / SMALL_SHARE;
+        // The tail they fold into seals small too, so folding waits for a pile and takes all of it
+        let mut fewest = FOLD_PILE;
+        let mut folded = 0usize;
+        while folded < MAX_FOLD {
+            let Some((segment, _)) = self.compactor.select_small(
+                &self.reel,
+                &self.index,
+                small,
+                fewest,
+                self.cues.floor(),
+            ) else {
+                break;
+            };
+            if !self
+                .compactor
+                .compact_segment(&self.reel, &self.index, segment)?
+            {
+                break;
             }
+            folded += 1;
+            fewest = 1;
+        }
+        match folded {
+            0 => Ok(CompactPass::Held),
+            _ => Ok(CompactPass::Copied),
         }
     }
 

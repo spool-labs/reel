@@ -331,11 +331,16 @@ pub fn directory_size_bytes(path: &Path) -> Result<u64> {
     let mut total = 0u64;
     for entry in entries {
         let entry = entry.map_err(Error::Io)?;
-        let file_type = entry.file_type().map_err(Error::Io)?;
-        if file_type.is_dir() {
+        // A segment removed after the listing has no bytes left to count
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(Error::Io(error)),
+        };
+        if metadata.is_dir() {
             total = total.saturating_add(directory_size_bytes(&entry.path())?);
-        } else if file_type.is_file() {
-            total = total.saturating_add(file_bytes(&entry.metadata().map_err(Error::Io)?));
+        } else if metadata.is_file() {
+            total = total.saturating_add(file_bytes(&metadata));
         }
     }
 

@@ -7,7 +7,7 @@ mod harness;
 use std::collections::{BTreeMap, BTreeSet};
 
 use reel::format::column::RecordKey;
-use reel::format::journal::{read_groups, rows_region};
+use reel::format::journal::{cut_slot, read_groups, rows_region};
 use reel::format::record::KEYLESS_PREFIX;
 use reel::io::fault::{FaultKind, FaultPlan};
 use reel::io::sim_backend::{DurableImage, SimIo};
@@ -692,8 +692,8 @@ fn cut_the_last_batch(image: &mut DurableImage, tear: Tear) {
         let Some(at) = tear_offset(rows, tear) else {
             continue;
         };
-        // Tear only the records, the rows later in the file stay whole
-        bytes[at as usize..rows_at as usize].fill(0);
+        // Tear only the records, the cut slot and the rows later in the file stay whole
+        bytes[at as usize..cut_slot(rows_at) as usize].fill(0);
         return;
     }
     panic!("no segment of the image holds a batch");

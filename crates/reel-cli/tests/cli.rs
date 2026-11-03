@@ -330,10 +330,10 @@ fn verify_catches_a_flipped_byte() {
     let dir = tempfile::tempdir().expect("tempdir");
     let volume = volume(&dir);
     let target = segments(volume).into_iter().next().expect("a segment file");
-    // An open segment has zeros before its rows, so flip a byte inside the records
+    // An open segment has zeros between its records and its cut slot, so flip a byte inside the records
     let bytes = std::fs::read(&target).expect("read");
     let len = match reel::format::journal::rows_region(&bytes) {
-        Some((rows_at, _)) => bytes[..rows_at as usize]
+        Some((rows_at, _)) => bytes[..reel::format::journal::cut_slot(rows_at) as usize]
             .iter()
             .rposition(|byte| *byte != 0)
             .map_or(0, |last| last as u64 + 1),

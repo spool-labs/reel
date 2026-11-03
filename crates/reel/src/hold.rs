@@ -163,6 +163,14 @@ impl<V: Clone> Hold<V> {
         if inner.find(key).is_some() {
             return;
         }
+        // A shard evicts only its own entries, so an insert the other shards crowd out is refused up front
+        let others = self
+            .bytes
+            .load(Ordering::Relaxed)
+            .saturating_sub(inner.bytes);
+        if others + weight > self.budget {
+            return;
+        }
         while self.bytes.load(Ordering::Relaxed) + weight > self.budget {
             // A shard with nothing left to evict turns the entry away to stay in budget
             match inner.evict() {
@@ -500,6 +508,37 @@ mod tests {
         hold.insert(key_of(1, 0, 0), 7, 65);
 
         assert!(hold.is_empty());
+    }
+
+    // an entry the other shards leave no room for is refused before its shard drops anything
+    #[test]
+    fn refuses_first() {
+        let hold: Hold<u64> = Hold::new(16 * 8 * 16, 16);
+        assert_eq!(hold.shards.len(), SHARDS);
+        let shard = |key: u64| (mix(key) >> 32) as usize % hold.shards.len();
+        let held = key_of(1, 0, 0);
+        hold.insert(held, 1, 16);
+        let mut block = 1;
+        while hold.bytes() < hold.budget {
+            let key = key_of(1, 0, block);
+            if shard(key) != shard(held) {
+                hold.insert(key, 0, 16);
+            }
+            block += 1;
+        }
+        let incoming = (block..)
+            .map(|block| key_of(1, 0, block))
+            .find(|key| shard(*key) == shard(held))
+            .expect("a key in the same shard");
+
+        hold.insert(incoming, 2, 64);
+
+        assert_eq!(hold.get(incoming), None, "the entry did not fit");
+        assert_eq!(
+            hold.get(held),
+            Some(1),
+            "the shard dropped an entry and refused anyway"
+        );
     }
 
     // the hand gives up what was not read since it last passed

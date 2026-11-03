@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "tape-reel"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "crc-fast",
  "crossbeam-skiplist",
@@ -526,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "tape-reel-cli"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "clap",
  "libc",
@@ -538,14 +538,27 @@ dependencies = [
 
 [[package]]
 name = "tape-reel-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
+name = "tape-reel-hammer"
+version = "0.3.3"
+dependencies = [
+ "clap",
+ "libc",
+ "rand",
+ "serde_json",
+ "tape-reel",
+ "tape-reel-core",
+ "tempfile",
+]
+
+[[package]]
 name = "tape-reel-mock"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "tape-reel-core",
 ]

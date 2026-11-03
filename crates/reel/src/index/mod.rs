@@ -3,6 +3,7 @@
 pub mod column;
 pub mod counters;
 pub mod entry;
+pub mod few;
 pub mod keyrun;
 pub mod lockfile;
 pub mod map;

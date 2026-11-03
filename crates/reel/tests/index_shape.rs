@@ -19,6 +19,7 @@ use reel::format::lsn::Lsn;
 use reel::index::column::{Shape, ShardMap, Trees, VarTrees, WidthIndex, VAR_NODE_WIDTH};
 use reel::index::counters::SegmentTable;
 use reel::index::entry::Entry;
+use reel::index::few::Few;
 use reel::index::tbtreemap::{
     node_width, scan_backend, scans, Shared, TBTreeMap, TreeKey, Whole, MAX_NODE_WIDTH,
     MIN_NODE_WIDTH, NODE_BUDGET, SHARED_CAP,
@@ -527,13 +528,13 @@ fn declared_widths_take_the_budget() {
     assert_eq!(node_width(72) * 72, 1152, "transaction_status node bytes");
 
     let _: <Trees<108> as Shape<[u8; 108]>>::Entries =
-        TBTreeMap::<[u8; 108], { node_width(108) }, Entry>::new();
+        Few::Tree(TBTreeMap::<[u8; 108], { node_width(108) }, Entry>::new());
     let _: <Trees<72> as Shape<[u8; 72]>>::Entries =
-        TBTreeMap::<[u8; 72], { node_width(72) }, Entry>::new();
+        Few::Tree(TBTreeMap::<[u8; 72], { node_width(72) }, Entry>::new());
     let _: <Trees<34> as Shape<[u8; 34]>>::Entries =
-        TBTreeMap::<[u8; 34], { node_width(34) }, Entry>::new();
+        Few::Tree(TBTreeMap::<[u8; 34], { node_width(34) }, Entry>::new());
     let _: <Trees<16> as Shape<[u8; 16]>>::Entries =
-        TBTreeMap::<[u8; 16], { node_width(16) }, Entry>::new();
+        Few::Tree(TBTreeMap::<[u8; 16], { node_width(16) }, Entry>::new());
 }
 
 // from_sorted builds the same tree an insert-driven load would, and packs it
@@ -2614,7 +2615,7 @@ fn the_name_columns_are_pinned_and_nothing_is_a_btreemap() {
         "the shared window moved off the cap the sweep took"
     );
     let _: <VarTrees as Shape<Box<[u8]>>>::Entries =
-        TBTreeMap::<Box<[u8]>, VAR_NODE_WIDTH, Entry>::new();
+        Few::Tree(TBTreeMap::<Box<[u8]>, VAR_NODE_WIDTH, Entry>::new());
 
     let index = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/index");
     let mut named: Vec<String> = Vec::new();

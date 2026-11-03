@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use reel::format::journal::rows_region;
+use reel::format::journal::{cut_slot, rows_region};
 use reel::io::fault::FaultPlan;
 use reel::io::sim_backend::{DurableImage, SimIo};
 use reel::{ColumnSet, ReelConfig, ReelStore, SEGMENT_SUFFIX};
@@ -133,10 +133,10 @@ pub fn flip_largest_segment(image: &mut DurableImage) -> bool {
     }
 }
 
-/// Record bytes: up to the last nonzero byte before an open segment's rows, else the whole file
+/// Record bytes: up to the last nonzero byte before an open segment's cut slot, else the file
 fn content_len(bytes: &[u8]) -> usize {
     match rows_region(bytes) {
-        Some((rows_at, _)) => bytes[..rows_at as usize]
+        Some((rows_at, _)) => bytes[..cut_slot(rows_at) as usize]
             .iter()
             .rposition(|byte| *byte != 0)
             .map_or(0, |last| last + 1),

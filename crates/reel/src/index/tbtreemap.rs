@@ -690,6 +690,8 @@ pub struct TBTreeMap<K: TreeKey, const B: usize, V: Default> {
     inners: Vec<Inner<K, B>>,
     root: u32,
     first: u32,
+    /// The rightmost leaf, where a key past every held key goes without a descent
+    last: u32,
     len: usize,
 }
 
@@ -793,6 +795,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             inners: Vec::new(),
             root: NONE,
             first: NONE,
+            last: NONE,
             len: 0,
         }
     }
@@ -906,8 +909,9 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             let right_at = arena_index(self.leaves.len());
             self.leaves[at].next = right_at;
             let after = self.leaves[right_at as usize].next;
-            if after != NONE {
-                self.leaves[after as usize].prev = right_at;
+            match after {
+                NONE => self.last = right_at,
+                _ => self.leaves[after as usize].prev = right_at,
             }
             (lift_lead, lift_spill, right_at)
         };
@@ -941,7 +945,25 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             self.leaves.push(empty_leaf());
             self.root = arena_index(self.leaves.len());
             self.first = self.root;
+            self.last = self.root;
         }
+
+        // Every separator above the rightmost leaf sits at or below its keys, so a greater key lands there
+        let tail = &mut self.leaves[self.last as usize];
+        if tail.len > 0 && tail.len < B && key > tail.keys[tail.len - 1] {
+            let word = tail.win.word(key.borrow());
+            let slot = tail.len;
+            tail.lead[slot] = word.unwrap_or(0);
+            tail.keys[slot] = key;
+            tail.vals[slot] = val;
+            tail.len += 1;
+            self.len += 1;
+            if word.is_err() {
+                tail.retune();
+            }
+            return None;
+        }
+
         if self.full(self.root) {
             let mut fresh: Inner<K, B> = empty_inner();
             fresh.kids[0] = self.root;
@@ -1008,6 +1030,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
             inners: Vec::new(),
             root: NONE,
             first: NONE,
+            last: NONE,
             len: 0,
         };
 
@@ -1034,11 +1057,6 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
                     done.retune();
                 }
                 tree.leaves.push(empty_leaf());
-                let at = tree.leaves.len() - 1;
-                if at > 0 {
-                    tree.leaves[at - 1].next = at as u32;
-                    tree.leaves[at].prev = (at - 1) as u32;
-                }
             }
             let leaf = tree.leaves.last_mut().expect("a leaf was just made");
             // Tune once the leaf is closed, when what its keys share is known
@@ -1055,23 +1073,42 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         if let Some(done) = tree.leaves.last_mut() {
             done.retune();
         }
-        tree.first = 0;
+        tree.grow_inners();
+        tree
+    }
+
+    /// Link the leaves in arena order and build the inner levels over them
+    fn grow_inners(&mut self) {
+        self.inners.clear();
+        let count = self.leaves.len();
+        for at in 0..count {
+            self.leaves[at].prev = match at {
+                0 => NONE,
+                _ => at as u32 - 1,
+            };
+            self.leaves[at].next = match at + 1 < count {
+                true => at as u32 + 1,
+                false => NONE,
+            };
+        }
+        self.first = 0;
+        self.last = count as u32 - 1;
 
         // Each entry is a subtree's first leaf, last leaf and node index
-        let mut level: Vec<(u32, u32, u32)> = (0..tree.leaves.len())
+        let mut level: Vec<(u32, u32, u32)> = (0..count)
             .map(|at| (at as u32, at as u32, at as u32))
             .collect();
 
         while level.len() > 1 {
-            let mut up: Vec<(u32, u32, u32)> = Vec::new();
+            let mut up: Vec<(u32, u32, u32)> = Vec::with_capacity(level.len().div_ceil(B));
             for run in level.chunks(B) {
                 let mut inner: Inner<K, B> = empty_inner();
                 inner.len = run.len() - 1;
                 for (slot, (low, _, at)) in run.iter().enumerate() {
                     inner.kids[slot] = *at;
                     if slot > 0 {
-                        let left = &tree.leaves[run[slot - 1].1 as usize];
-                        let right = &tree.leaves[*low as usize];
+                        let left = &self.leaves[run[slot - 1].1 as usize];
+                        let right = &self.leaves[*low as usize];
                         let (sep, whole) = K::separator(&left.keys[left.len - 1], &right.keys[0]);
                         inner.lead[slot - 1] = K::head(sep.borrow());
                         if whole {
@@ -1080,43 +1117,90 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
                     }
                 }
                 inner.retune();
-                tree.inners.push(inner);
+                self.inners.push(inner);
                 up.push((
                     run[0].0,
                     run[run.len() - 1].1,
-                    INNER | arena_index(tree.inners.len()),
+                    INNER | arena_index(self.inners.len()),
                 ));
             }
             level = up;
         }
 
-        tree.root = level[0].2;
-        tree
+        self.root = level[0].2;
     }
 
-    /// Pack the tree back to full leaves, dropping the room deletion left
-    pub fn repack(&mut self, fill: usize) {
+    /// Pack the tree back to full leaves in place, dropping the room deletion left
+    pub fn repack(&mut self) {
         if self.root == NONE {
             return;
         }
-        let mut chain = Vec::with_capacity(self.leaves.len());
+        if self.len == 0 {
+            *self = TBTreeMap::new();
+            return;
+        }
+        let mut chain: Vec<u32> = Vec::with_capacity(self.leaves.len());
         let mut at = self.first;
         while at != NONE {
-            chain.push(at as usize);
+            chain.push(at);
             at = self.leaves[at as usize].next;
         }
-        let mut pairs: Vec<(K, V)> = Vec::with_capacity(self.len);
-        for leaf_at in chain {
-            let leaf = &mut self.leaves[leaf_at];
-            for slot in 0..leaf.len {
-                pairs.push((
-                    std::mem::replace(&mut leaf.keys[slot], K::filler()),
-                    std::mem::take(&mut leaf.vals[slot]),
-                ));
+
+        // Slide every pair down the chain to the first free slot, which never passes the pair it moves
+        let (mut to, mut slot) = (0usize, 0usize);
+        for from in 0..chain.len() {
+            let source = chain[from] as usize;
+            let held = self.leaves[source].len;
+            for at in 0..held {
+                let target = chain[to] as usize;
+                if (to, slot) != (from, at) {
+                    let key = std::mem::replace(&mut self.leaves[source].keys[at], K::filler());
+                    let val = std::mem::take(&mut self.leaves[source].vals[at]);
+                    let leaf = &mut self.leaves[target];
+                    leaf.lead[slot] = leaf.win.lead(key.borrow());
+                    leaf.keys[slot] = key;
+                    leaf.vals[slot] = val;
+                }
+                slot += 1;
+                if slot == B {
+                    self.leaves[target].len = B;
+                    self.leaves[target].retune();
+                    to += 1;
+                    slot = 0;
+                }
             }
-            leaf.len = 0;
         }
-        *self = TBTreeMap::from_sorted(pairs, fill);
+        if slot > 0 {
+            let target = chain[to] as usize;
+            self.leaves[target].len = slot;
+            self.leaves[target].retune();
+            to += 1;
+        }
+
+        // Swap the filled leaves to the front in chain order, tracking which leaf sits where
+        chain.truncate(to);
+        let mut holder = vec![NONE; self.leaves.len()];
+        for (step, at) in chain.iter().enumerate() {
+            holder[*at as usize] = step as u32;
+        }
+        for step in 0..to {
+            let from = chain[step] as usize;
+            if from == step {
+                continue;
+            }
+            let moved = holder[step];
+            self.leaves.swap(step, from);
+            holder[from] = moved;
+            if moved != NONE {
+                chain[moved as usize] = from as u32;
+            }
+        }
+        drop(holder);
+        drop(chain);
+        self.leaves.truncate(to);
+        self.leaves.shrink_to_fit();
+        self.grow_inners();
+        self.inners.shrink_to_fit();
     }
 
     /// A key's value, inserting `val` first if the key is absent
@@ -1138,6 +1222,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         self.inners.clear();
         self.root = NONE;
         self.first = NONE;
+        self.last = NONE;
         self.len = 0;
     }
 
@@ -1161,15 +1246,7 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
 
     /// The rightmost leaf, which a backward walk with no bound starts at
     fn last_leaf(&self) -> Option<u32> {
-        let mut at = self.root;
-        if at == NONE {
-            return None;
-        }
-        while is_inner(at) {
-            let inner = &self.inners[slot_of(at)];
-            at = inner.kids[inner.len];
-        }
-        Some(at)
+        (self.last != NONE).then_some(self.last)
     }
 
     /// Every pair inside a span in key order, from one descent and a walk along the leaves
@@ -1323,11 +1400,38 @@ impl<K: TreeKey, const B: usize, V: Default> TBTreeMap<K, B, V> {
         Some(held)
     }
 
+    /// Take out every pair `keep` refuses, leaving the leaves short and the inner nodes as they were
+    pub fn sweep(&mut self, mut keep: impl FnMut(&K, &V) -> bool) -> usize {
+        let mut taken = 0;
+        for leaf in &mut self.leaves {
+            let mut to = 0;
+            for at in 0..leaf.len {
+                if !keep(&leaf.keys[at], &leaf.vals[at]) {
+                    continue;
+                }
+                if to != at {
+                    leaf.keys.swap(to, at);
+                    leaf.vals.swap(to, at);
+                    leaf.lead[to] = leaf.lead[at];
+                }
+                to += 1;
+            }
+            for at in to..leaf.len {
+                drop(std::mem::replace(&mut leaf.keys[at], K::filler()));
+                drop(std::mem::take(&mut leaf.vals[at]));
+            }
+            taken += leaf.len - to;
+            leaf.len = to;
+        }
+        self.len -= taken;
+        taken
+    }
+
     /// Take a key out and repack once `repack_owed` says the room is worth taking back
     pub fn remove_packed(&mut self, probe: &K::Probe) -> Option<V> {
         let held = self.remove(probe)?;
         if self.repack_owed() {
-            self.repack(B);
+            self.repack();
         }
         Some(held)
     }

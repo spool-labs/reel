@@ -1,0 +1,25 @@
+[package]
+name = "tape-reel-hammer"
+version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Hammer a reel volume on a real disk with a tape node's workload, kills included"
+publish = false
+
+[[bin]]
+name = "reel-hammer"
+path = "src/main.rs"
+
+[dependencies]
+reel.workspace = true
+reel-core.workspace = true
+clap.workspace = true
+libc.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

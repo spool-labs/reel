@@ -38,8 +38,8 @@ const TORN_RECORD: u32 = 6;
 const REFUSED_RECORD: u32 = 7;
 
 /// Op positions of the last two records' writes, with one tail syncing every put
-const TORN_AT: u64 = 26;
-const ENOSPC_AT: u64 = 29;
+const TORN_AT: u64 = 40;
+const ENOSPC_AT: u64 = 45;
 
 /// The tear keeps the header and this many payload bytes
 const TORN_PAYLOAD_BYTES: u64 = 8;

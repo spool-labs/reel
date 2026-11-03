@@ -84,6 +84,7 @@ struct SimState {
     ops_submitted: u64,
     swallowed: u64,
     dropped: u64,
+    polls: u64,
 
     ready: VecDeque<Completion>,
     delayed: Vec<DelayedCompletion>,
@@ -96,6 +97,9 @@ struct SimState {
 
     widest_batch: usize,
     is_crashed: bool,
+
+    kill_after: Option<u64>,
+    killed: Option<DurableImage>,
 }
 
 impl SimState {
@@ -114,6 +118,7 @@ impl SimState {
             ops_submitted: 0,
             swallowed: 0,
             dropped: 0,
+            polls: 0,
             ready: VecDeque::new(),
             delayed: Vec::new(),
             advise_traces: Vec::new(),
@@ -123,6 +128,8 @@ impl SimState {
             read_bytes: 0,
             widest_batch: 0,
             is_crashed: false,
+            kill_after: None,
+            killed: None,
         }
     }
 }
@@ -221,6 +228,26 @@ impl SimIo {
         image
     }
 
+    /// The bytes every named file holds if the process is killed now: every completed write stays
+    pub fn killed_image(&self) -> DurableImage {
+        killed_image(&lock(&self.shared.state))
+    }
+
+    /// Take the image a kill leaves once this many more writes complete
+    pub fn kill_after_writes(&self, writes: u64) {
+        let mut state = lock(&self.shared.state);
+        state.killed = None;
+        state.kill_after = Some(writes);
+        if writes == 0 {
+            state.killed = Some(killed_image(&state));
+        }
+    }
+
+    /// The image the armed kill took, or nothing while fewer writes than it waits for completed
+    pub fn kill_image(&self) -> Option<DurableImage> {
+        lock(&self.shared.state).killed.clone()
+    }
+
     /// The bytes one file holds if power is lost now
     pub fn durable_bytes(&self, path: &Path) -> Option<Vec<u8>> {
         let state = lock(&self.shared.state);
@@ -251,6 +278,11 @@ impl SimIo {
     /// Advise calls recorded so far
     pub fn advise_traces(&self) -> Vec<AdviseTrace> {
         lock(&self.shared.state).advise_traces.clone()
+    }
+
+    /// Polls answered so far
+    pub fn polls(&self) -> u64 {
+        lock(&self.shared.state).polls
     }
 
     /// Directory renames and unlinks, in the order they were applied
@@ -312,6 +344,7 @@ impl ReelIo for SimIo {
         let mut state = lock(&self.shared.state);
         if state.is_crashed {
             state.swallowed += ops.len() as u64;
+            refuse_all(&mut state, ops);
             return Ok(());
         }
 
@@ -320,10 +353,11 @@ impl ReelIo for SimIo {
         state.ops_submitted += submitted;
         state.widest_batch = state.widest_batch.max(ops.len());
         let mut effective = ops;
+        let mut cut = Vec::new();
         if let Some(crash_at) = state.plan.crash_at {
             if crash_at >= batch_start && crash_at < batch_start + effective.len() as u64 {
                 let keep = (crash_at - batch_start) as usize;
-                effective.truncate(keep);
+                cut = effective.split_off(keep);
                 state.is_crashed = true;
             }
         }
@@ -340,6 +374,7 @@ impl ReelIo for SimIo {
             let completion = execute_op(&mut state, op, position);
             route_completion(&mut state, position, completion);
         }
+        refuse_all(&mut state, cut);
 
         state.op_position = batch_start + submitted;
         Ok(())
@@ -347,6 +382,7 @@ impl ReelIo for SimIo {
 
     fn poll(&self, out: &mut Vec<Completion>) -> Result<usize> {
         let mut state = lock(&self.shared.state);
+        state.polls += 1;
 
         let delayed = std::mem::take(&mut state.delayed);
         let mut still_delayed = Vec::new();
@@ -413,6 +449,70 @@ fn is_dir_op(op: &Op) -> bool {
     }
 }
 
+/// The bytes every named file holds after a process kill, which keeps every completed write
+fn killed_image(state: &SimState) -> DurableImage {
+    let mut image: DurableImage = state
+        .files
+        .iter()
+        .map(|(path, file)| (path.clone(), file.cached.clone()))
+        .collect();
+    image.sort_by(|left, right| left.0.cmp(&right.0));
+    image
+}
+
+/// Count one completed write against an armed kill, taking its image on the last one
+fn count_toward_kill(state: &mut SimState) {
+    match state.kill_after {
+        Some(1) => {
+            state.kill_after = Some(0);
+            state.killed = Some(killed_image(state));
+        }
+        Some(left) if left > 1 => state.kill_after = Some(left - 1),
+        Some(_) | None => {}
+    }
+}
+
+/// Answer each op with the crash error, so its caller fails at once and its slot comes free
+fn refuse_all(state: &mut SimState, ops: Vec<Op>) {
+    for op in ops {
+        state.ready.push_back(refused(op));
+    }
+}
+
+fn refused(op: Op) -> Completion {
+    let tag = op.tag();
+    let outcome = match op {
+        Op::Open { .. } => Outcome::Opened(Err(crashed())),
+        Op::Writev { bufs, .. } => Outcome::Wrote {
+            result: Err(crashed()),
+            bufs,
+        },
+        Op::Pread { buf, .. } => Outcome::Read {
+            result: Err(crashed()),
+            buf,
+        },
+        Op::PreadSplit { head, body, .. } => Outcome::ReadSplit {
+            result: Err(crashed()),
+            head,
+            body,
+        },
+        Op::List { .. } => Outcome::Listed(Err(crashed())),
+        Op::Length { .. } => Outcome::Length(Err(crashed())),
+        Op::SyncData { .. }
+        | Op::SyncFull { .. }
+        | Op::SyncRange { .. }
+        | Op::SyncDir { .. }
+        | Op::Rename { .. }
+        | Op::Unlink { .. }
+        | Op::Close { .. }
+        | Op::Allocate { .. }
+        | Op::Release { .. }
+        | Op::Truncate { .. }
+        | Op::Advise { .. } => Outcome::Done(Err(crashed())),
+    };
+    Completion { tag, outcome }
+}
+
 fn route_completion(state: &mut SimState, position: u64, completion: Completion) {
     match state.plan.fault_at(position) {
         Some(FaultKind::DropCompletion) => {
@@ -470,10 +570,11 @@ fn execute_op(state: &mut SimState, op: Op, position: u64) -> Completion {
             file,
             offset,
             bufs,
-        } => Completion {
-            tag,
-            outcome: write_v(state, file, offset, bufs, fault),
-        },
+        } => {
+            let outcome = write_v(state, file, offset, bufs, fault);
+            count_toward_kill(state);
+            Completion { tag, outcome }
+        }
         Op::Pread {
             tag,
             file,
@@ -939,6 +1040,10 @@ fn no_such_file() -> ReelError {
         std::io::ErrorKind::NotFound,
         "no such reel file",
     ))
+}
+
+fn crashed() -> ReelError {
+    ReelError::Io(std::io::Error::other("the simulated process crashed"))
 }
 
 fn out_of_space() -> ReelError {

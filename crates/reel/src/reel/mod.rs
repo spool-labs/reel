@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::append::admission::InflightBudget;
-use crate::append::{Appender, BatchRecord, Commit, Committed};
+use crate::append::{Appender, BatchRecord, Commit, Committed, Writeout};
 use crate::config::ReelConfig;
 use crate::error::{ReelError, Result};
 use std::sync::OnceLock;
@@ -69,6 +69,9 @@ const SEGMENT_DIGITS: usize = 6;
 
 /// The shared rows table sweeps out entries no reader holds once it reaches this many
 const MAPPED_ROWS_SWEEP: usize = 4096;
+
+/// The parsed footer table sweeps out entries no reader holds once it reaches this many
+const PARSED_SWEEP: usize = 4096;
 
 /// Every segment file name ends with this suffix
 pub const SEGMENT_SUFFIX: &str = ".reel";
@@ -964,6 +967,10 @@ impl FooterSource for ReelShared {
         self.footer_of(segment)
     }
 
+    fn note_stepped(&self, keys: u64, buried: u64) {
+        self.probes.note_stepped(keys, buried);
+    }
+
     fn footer_once(&self, segment: SegmentId) -> Result<Option<Arc<SegmentFooter>>> {
         if let Some(footer) = self.footers.get(segment) {
             return Ok(Some(footer));
@@ -1086,6 +1093,9 @@ pub struct ReelShared {
     /// Each sealed partition's rows in place, shared by every key run reader holding one
     mapped_rows: Mutex<HashMap<(SegmentId, ColumnId), std::sync::Weak<MappedRows>>>,
 
+    /// Every parsed footer a reader still holds, so walks on other threads and columns share it
+    parsed: Mutex<HashMap<SegmentId, std::sync::Weak<SegmentFooter>>>,
+
     /// Load-time settings for the volume
     pub config: ReelConfig,
 
@@ -1121,6 +1131,9 @@ pub struct ReelShared {
 
     /// Writes drawn and not yet published, by the epoch they drew in
     drawn: Drawn,
+
+    /// Every tail and journal, so one pass writes all their rows and then the reel's cut
+    pub(crate) writeout: Writeout,
 }
 
 /// What is keeping one segment from being retired
@@ -1185,6 +1198,7 @@ impl ReelShared {
         columns: ColumnSet,
         next_segment: u32,
     ) -> ReelShared {
+        let writeout = Writeout::new(&dir, Arc::clone(&driver));
         // The primary root stays first: it holds the lock and the manifest and is the fast tier
         let mut roots = vec![dir];
         let mut classes = vec![crate::config::VolumeClass::Fast];
@@ -1205,6 +1219,7 @@ impl ReelShared {
             segments: OnceLock::new(),
             footers: FooterCache::new(config.footer_cache.to_bytes() as usize),
             mapped_rows: Mutex::new(HashMap::new()),
+            parsed: Mutex::new(HashMap::new()),
             config,
             columns,
             purge_floor: AtomicU64::new(NOTHING_PURGED),
@@ -1217,6 +1232,7 @@ impl ReelShared {
             past_saving: AtomicU64::new(0),
             broken_seals: Mutex::new(Vec::new()),
             drawn: Drawn::default(),
+            writeout,
         }
     }
 
@@ -1281,6 +1297,34 @@ impl ReelShared {
         Ok(Some(block))
     }
 
+    /// Hand every footer row of a sealed segment to `visit`, one block at a time and caching nothing
+    pub fn walk_rows(
+        &self,
+        segment: SegmentId,
+        mut visit: impl FnMut(ColumnId, &[u8], FooterRow) -> Result<()>,
+    ) -> Result<bool> {
+        let Some(map) = self.footer_map_of(segment)? else {
+            return Ok(false);
+        };
+        let Some(handle) = self.handle_for(segment)? else {
+            return Ok(false);
+        };
+        for column in map.columns() {
+            let Some(span) = map.span_of(column) else {
+                continue;
+            };
+            for at in 0..span.blocks() {
+                self.probes.note_block_read();
+                let restarts = map.restarts_of(column);
+                let block = RowBlock::read(&self.driver, handle.file(), &span, at, restarts)?;
+                for row in 0..block.len() {
+                    visit(column, block.key_at(row).unwrap_or(&[]), block.row_at(row)?)?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// The row of a key at one offset in a sealed segment, or nothing for a segment gone
     fn row_at_offset_in(
         &self,
@@ -1312,11 +1356,23 @@ impl ReelShared {
         if let Some(footer) = self.footers.get(segment) {
             return Ok(Some(footer));
         }
+        if let Some(footer) = lock(&self.parsed)
+            .get(&segment)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Ok(Some(footer));
+        }
         let Some(footer) = self.footer_from_disk(segment)? else {
             return Ok(None);
         };
         let footer = Arc::new(footer);
         self.footers.insert(segment, Arc::clone(&footer));
+        let mut parsed = lock(&self.parsed);
+        // Segment numbers never come back, so an entry no reader holds can just be dropped
+        if parsed.len() >= PARSED_SWEEP {
+            parsed.retain(|_, kept| kept.strong_count() > 0);
+        }
+        parsed.insert(segment, Arc::downgrade(&footer));
         Ok(Some(footer))
     }
 
@@ -1629,7 +1685,7 @@ impl ReelShared {
     /// Whether a point read asks the page cache before it queues, as every cached volume does
     pub fn warm_first(&self) -> WarmFirst {
         match self.driver.serving() {
-            ServingBackend::Posix | ServingBackend::Ring => WarmFirst::Ask,
+            ServingBackend::Posix | ServingBackend::Ring | ServingBackend::Mixed => WarmFirst::Ask,
             ServingBackend::PosixDirect | ServingBackend::RingDirect | ServingBackend::Sim => {
                 WarmFirst::Skip
             }
@@ -1864,6 +1920,10 @@ impl Reel {
             };
             tails.push(Appender::open(Arc::clone(&shared), index as u64, adopted)?);
         }
+        // A tail no one resumed would stand unsealed for good, so it seals now
+        for left in candidates {
+            Appender::seal_unresumed(&shared, left)?;
+        }
         Ok(Reel {
             shared,
             tails,
@@ -1952,6 +2012,16 @@ impl Reel {
     /// Append a tombstone for one key, routed to the least-loaded tail
     pub fn delete(&self, key: RecordKey, commit: Commit) -> Result<Committed> {
         self.route().append_tombstone(key, commit)
+    }
+
+    /// Append a tombstone under an older record's own number, for a miss the index decided
+    pub fn bury(&self, key: RecordKey, lsn: Lsn, above: SegmentId) -> Result<Committed> {
+        let tail = self.route();
+        // The tombstone ties the record on its number and wins as the newer segment, so it lands above it
+        while tail.tail().active_segment() < above {
+            tail.seal()?;
+        }
+        tail.append_carried_tombstone(key, lsn)
     }
 
     /// Append a tombstone covering a half-open key range within one column
@@ -2081,7 +2151,7 @@ impl Reel {
         ))
     }
 
-    /// Read one record as a future, from an open tail's mapping or through the driver
+    /// Read one record as a future through the driver
     pub async fn read_record_wait(
         &self,
         loc: Loc,
@@ -2097,36 +2167,21 @@ impl Reel {
         let layout = handle.layout();
         let prefix = layout.prefix_len(expected.width(), loc.len);
         let len = loc.len as usize;
-        let mapped = match self.maps_tail(loc.segment) {
-            true => mapped_framed(
-                &handle,
-                self.shared.config.segment_bytes.to_bytes(),
+        let read = self
+            .shared
+            .driver
+            .wait_split_reusing(
+                handle.file(),
                 u64::from(loc.offset),
                 prefix,
                 len,
-            ),
-            false => None,
-        };
-        let (head, body) = match mapped {
+                take_header(),
+                self.shared.warm_first(),
+            )
+            .await;
+        let (head, body) = match framed_or_nothing(read, prefix, len)? {
             Some(framed) => framed,
-            None => {
-                let read = self
-                    .shared
-                    .driver
-                    .wait_split_reusing(
-                        handle.file(),
-                        u64::from(loc.offset),
-                        prefix,
-                        len,
-                        take_header(),
-                        self.shared.warm_first(),
-                    )
-                    .await;
-                match framed_or_nothing(read, prefix, len)? {
-                    Some(framed) => framed,
-                    None => return Ok(RecordRead::Stale),
-                }
-            }
+            None => return Ok(RecordRead::Stale),
         };
         Ok(frame_to_read(
             head,
@@ -2156,7 +2211,7 @@ impl Reel {
             at,
         );
 
-        if self.maps(loc.segment, len) {
+        if self.maps(len) {
             if let Some(map) = handle.mapping(self.shared.config.segment_bytes.to_bytes()) {
                 if let Some(bytes) = map.slice(start, len) {
                     let mut body = crate::reel::payload::take(len);
@@ -2175,7 +2230,7 @@ impl Reel {
         window_or_nothing(read, len)
     }
 
-    /// Read one window as a future, from an open tail's mapping or through the driver
+    /// Read one window as a future through the driver
     pub async fn read_window_wait(
         &self,
         loc: Loc,
@@ -2191,11 +2246,6 @@ impl Reel {
             handle.layout().prefix_len(key_width as usize, loc.len),
             at,
         );
-        if self.maps_tail(loc.segment) {
-            if let Some(window) = self.mapped_window(&handle, start, len) {
-                return Ok(Some(window));
-            }
-        }
         let read = self
             .shared
             .driver
@@ -2267,7 +2317,7 @@ impl Reel {
         deep_range(filled, prefix, len, expected, lsn, loc)
     }
 
-    /// Read part of one record's payload as a future, from an open tail's mapping or the driver
+    /// Read part of one record's payload as a future through the driver
     pub async fn read_range_wait(
         &self,
         loc: Loc,
@@ -2284,35 +2334,19 @@ impl Reel {
         let offset = u64::from(loc.offset);
         if let Some(check) = handle.layout().keyless_key(loc.len) {
             let whole = loc.len as usize;
-            let mapped = match self.maps_tail(loc.segment) {
-                true => mapped_framed(
-                    &handle,
-                    self.shared.config.segment_bytes.to_bytes(),
+            let read = self
+                .shared
+                .driver
+                .wait_split_reusing(
+                    handle.file(),
                     offset,
                     KEYLESS_PREFIX,
                     whole,
-                ),
-                false => None,
-            };
-            let framed = match mapped {
-                Some(framed) => Some(framed),
-                None => {
-                    let read = self
-                        .shared
-                        .driver
-                        .wait_split_reusing(
-                            handle.file(),
-                            offset,
-                            KEYLESS_PREFIX,
-                            whole,
-                            take_header(),
-                            self.shared.warm_first(),
-                        )
-                        .await;
-                    framed_or_nothing(read, KEYLESS_PREFIX, whole)?
-                }
-            };
-            return Ok(match framed {
+                    take_header(),
+                    self.shared.warm_first(),
+                )
+                .await;
+            return Ok(match framed_or_nothing(read, KEYLESS_PREFIX, whole)? {
                 Some((head, body)) => keyless_range(
                     head,
                     body,
@@ -2326,14 +2360,6 @@ impl Reel {
             });
         }
         let prefix = HEADER_LEN + expected.width();
-
-        if self.maps_tail(loc.segment) {
-            if let Some((head, body)) = self.map_range(&handle, offset, prefix, at, len) {
-                let verdict = frame_to_range(&head, body, expected, lsn, loc);
-                recycle_header(head);
-                return verdict;
-            }
-        }
 
         if at <= MERGE_GAP {
             let span = at as usize + len;
@@ -2386,7 +2412,7 @@ impl Reel {
         at: u64,
         len: usize,
     ) -> Option<(Vec<u8>, Value)> {
-        if !self.maps(handle.id(), len) {
+        if !self.maps(len) {
             return None;
         }
         let map = handle.mapping(self.shared.config.segment_bytes.to_bytes())?;
@@ -2466,7 +2492,7 @@ impl Reel {
         scratch.handles.clear();
         // Hold every mapped segment first, so the handle list never moves under a borrowed record
         for ask in asks {
-            if self.maps(ask.loc.segment, ask.loc.len as usize) {
+            if self.maps(ask.loc.len as usize) {
                 self.hold_segment(ask.loc.segment, &mut scratch.handles)?;
             }
         }
@@ -2589,7 +2615,7 @@ impl Reel {
         ask: &Ask,
     ) -> Option<(&'held [u8], RecordLayout)> {
         let len = ask.loc.len as usize;
-        if !self.maps(ask.loc.segment, len) {
+        if !self.maps(len) {
             return None;
         }
         let at = handles
@@ -2622,19 +2648,8 @@ impl Reel {
     }
 
     /// Whether a read of `len` bytes in `segment` goes through the segment's mapping
-    fn maps(&self, segment: SegmentId, len: usize) -> bool {
-        let config = &self.shared.config;
-        // A tail's pages were just written, so its mapping reads them from the page cache
-        config.maps(len) || self.maps_tail(segment)
-    }
-
-    /// Whether a segment is an open tail whose reads go through its mapping
-    fn maps_tail(&self, segment: SegmentId) -> bool {
-        self.shared.config.maps_tails()
-            && self
-                .tails()
-                .iter()
-                .any(|tail| tail.tail().active_segment() == segment)
+    fn maps(&self, len: usize) -> bool {
+        self.shared.config.maps(len)
     }
 
     /// Resolve a segment number to a handle, opening and caching it on a miss
@@ -2651,7 +2666,7 @@ impl Reel {
         len: usize,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         // A mapped volume serves a record the mapping covers straight from the page cache
-        if self.maps(handle.id(), len) {
+        if self.maps(len) {
             if let Some(framed) = mapped_framed(
                 handle,
                 self.shared.config.segment_bytes.to_bytes(),
@@ -2673,15 +2688,6 @@ impl Reel {
             self.shared.warm_first(),
         );
         framed_or_nothing(read, prefix, len)
-    }
-
-    /// A window copied out of its segment's mapping, if the mapping covers it
-    fn mapped_window(&self, handle: &SegmentHandle, start: u64, len: usize) -> Option<Value> {
-        let map = handle.mapping(self.shared.config.segment_bytes.to_bytes())?;
-        let bytes = map.slice(start, len)?;
-        let mut window = crate::reel::payload::take(len);
-        window.extend_from_slice(bytes);
-        Some(Value::pooled(window, crate::reel::payload::give))
     }
 
     /// The tail a foreground write goes to, which is the least loaded of them

@@ -312,6 +312,14 @@ impl RecordHeader {
         }
     }
 
+    /// Give a header built before its number was drawn that number, checksumming a keyed one
+    pub fn stamp(&mut self, layout: RecordLayout, lsn: Lsn, payload: &[u8]) {
+        self.lsn = lsn;
+        if !layout.is_keyless(self.length) || self.flags.is_control() {
+            self.crc = self.compute_crc(payload);
+        }
+    }
+
     /// A header whose payload a codec produced, checksummed over the stored bytes
     pub fn new_coded(
         length: u32,

@@ -1865,7 +1865,7 @@ impl ReelIndex {
         };
         let generation = self.sealed[slot].generation();
         if self.paged_footers(slot).is_none() {
-            playback::resident_page(&self.indexes[slot], way, from, limit, out);
+            playback::resident_page(&self.indexes[slot], way, from, Bound::Unbounded, limit, out);
             if self.sealed[slot].generation() == generation {
                 return Ok(());
             }

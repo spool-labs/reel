@@ -347,6 +347,7 @@ impl ReelStore {
             &self.index,
             &segments,
             &joining,
+            &self.stopping,
         )?;
         if merged.runs_merged == 0 {
             return Ok(None);
@@ -360,6 +361,10 @@ impl ReelStore {
         if self.is_read_only {
             return Ok(());
         }
+        let _running = lock(&self.maintaining);
+        if self.is_stopping() {
+            return Ok(());
+        }
         self.retry_broken_seals();
         self.seal_due_tails(IDLE_SEAL, GRAVE_SEAL)?;
         self.publish_footprint();
@@ -367,6 +372,9 @@ impl ReelStore {
         self.sweep_covers()?;
         self.prune_tombstones();
         self.compact_and_merge()?;
+        if self.is_stopping() {
+            return Ok(());
+        }
         self.erase_when_due()?;
         // Hand over again before the scrub, since a long rewrite or merge lets sealed keys pile up
         self.page_out_sealed()?;
@@ -464,7 +472,7 @@ impl ReelStore {
                     scope.spawn(|| -> Result<()> {
                         loop {
                             let copied = self.compact_once()? == CompactPass::Copied;
-                            if !copied || !merging.load(Ordering::Acquire) {
+                            if !copied || !merging.load(Ordering::Acquire) || self.is_stopping() {
                                 return Ok(());
                             }
                         }

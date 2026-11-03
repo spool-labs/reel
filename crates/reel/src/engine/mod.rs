@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use crate::units::ByteCount;
 
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::append::admission::InflightBudget;
 use crate::compaction::compactor::{CompactionCounters, Compactor};
@@ -206,6 +206,12 @@ pub struct ReelStore {
 
     /// Walks had stepped over this many deleted keys when the last merge ran
     merged_buried: AtomicU64,
+
+    /// Set by a close, so a running pass gives up at its next key
+    stopping: AtomicBool,
+
+    /// Held by a running maintenance pass, so a close can wait it out
+    maintaining: Mutex<()>,
 }
 
 impl ReelStore {
@@ -429,6 +435,8 @@ impl ReelStore {
             footprint: AtomicU64::new(0),
             ingest_marker: AtomicU64::new(0),
             merged_buried: AtomicU64::new(0),
+            stopping: AtomicBool::new(false),
+            maintaining: Mutex::new(()),
             sweep_nonce: (std::process::id() as u64) << 32
                 | OPENINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64,
             root,
@@ -521,13 +529,19 @@ impl ReelStore {
         self.reel.flush_wait().await
     }
 
-    /// Compact away every sealed segment past the dead ratio, then flush and stop every active tail
+    /// Stop maintenance, wait out a pass still running, then flush and stop every active tail
     pub fn close(&self) -> Result<()> {
         if self.is_read_only {
             return Ok(());
         }
-        self.drain()?;
+        self.stopping.store(true, Ordering::Release);
+        let _idle = crate::sync::lock(&self.maintaining);
         self.reel.close()
+    }
+
+    /// Whether a close has asked maintenance to stop
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
     }
 
     /// Delete a store from disk, failing if another owner holds its lock

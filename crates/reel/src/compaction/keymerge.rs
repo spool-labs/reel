@@ -2,12 +2,13 @@
 //! Only keys and places go down, so neither the spot index nor the map sees a merge
 
 use std::collections::{BTreeSet, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::compaction::compactor::{Compactor, PassClaim};
 use crate::error::{ReelError, Result};
 use crate::format::column::ColumnId;
-use crate::format::footer::{FooterPartition, SegmentFooter};
+use crate::format::footer::{FooterFind, FooterPartition, SegmentFooter};
 use crate::format::loc::SegmentId;
 use crate::format::lsn::Lsn;
 use crate::index::keyrun::{
@@ -156,6 +157,7 @@ pub fn merge_into_key_run(
     index: &ReelIndex,
     segments: &[SegmentId],
     runs: &[Arc<KeyRun>],
+    stop: &AtomicBool,
 ) -> Result<MergeReport> {
     let shared = reel.shared();
     let mut claims: Vec<PassClaim<'_>> = Vec::new();
@@ -257,10 +259,10 @@ pub fn merge_into_key_run(
         runs_merged: sources.len() as u64,
         ..MergeReport::default()
     };
-    let written = (|| -> Result<()> {
+    let written = (|| -> Result<bool> {
         for column in &columns {
             writer.begin_column(*column)?;
-            merge_column(
+            let finished = merge_column(
                 &footers,
                 &sources,
                 *column,
@@ -269,13 +271,25 @@ pub fn merge_into_key_run(
                 &graves,
                 &mut writer,
                 &mut report,
+                stop,
             )?;
+            if !finished {
+                return Ok(false);
+            }
         }
-        Ok(())
+        Ok(true)
     })();
-    if let Err(error) = written {
-        writer.abandon();
-        return Err(error);
+    match written {
+        Ok(true) => {}
+        // A stopped merge leaves the runs as they stood, and the next open merges them again
+        Ok(false) => {
+            writer.abandon();
+            return Ok(MergeReport::default());
+        }
+        Err(error) => {
+            writer.abandon();
+            return Err(error);
+        }
     }
     let before = index.key_runs().covered();
     report.segments_covered = covered
@@ -294,7 +308,7 @@ pub fn merge_into_key_run(
     Ok(report)
 }
 
-/// Write one column's newest row of each key across every source, in key order
+/// Write one column's newest row of each key across every source, in key order, false once stopped
 #[allow(clippy::too_many_arguments)]
 fn merge_column(
     footers: &Arc<dyn FooterSource>,
@@ -305,7 +319,8 @@ fn merge_column(
     graves: &Graves,
     writer: &mut RunWriter<'_>,
     report: &mut MergeReport,
-) -> Result<()> {
+    stop: &AtomicBool,
+) -> Result<bool> {
     let mut cursors: Vec<Cursor<'_>> = Vec::with_capacity(sources.len());
     for source in sources {
         match source {
@@ -333,7 +348,11 @@ fn merge_column(
         sift_down(&mut heap, &cursors, at);
     }
     let mut key = Vec::new();
+    let mut window = Window::default();
     while let Some(&top) = heap.first() {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
         key.clear();
         key.extend_from_slice(cursors[top].key().unwrap_or_default());
         // Only rows in standing segments count, since the rest point at moved or dropped records
@@ -360,29 +379,76 @@ fn merge_column(
             sift_down(&mut heap, &cursors, 0);
         }
         report.rows_shadowed += seen.saturating_sub(1);
-        if let Some((row, _)) = newest {
-            if row.flags.is_tombstone() && !graves.may_hide(column, &key, row.lsn)? {
+        if let Some((row, place)) = newest {
+            window.push(&key, row, place);
+            if window.bytes >= WINDOW_BYTES {
+                window.flush(column, covered, graves, writer, report)?;
+            }
+        }
+    }
+    window.flush(column, covered, graves, writer, report)?;
+    Ok(true)
+}
+
+/// A merge holds this many bytes of rows before it asks the segments left out about its graves
+const WINDOW_BYTES: usize = 64 << 20;
+
+/// Rows a merge has picked and not yet written, in key order
+#[derive(Default)]
+struct Window {
+    keys: Vec<u8>,
+    rows: Vec<(usize, RunRow, u32)>,
+    bytes: usize,
+}
+
+impl Window {
+    fn push(&mut self, key: &[u8], row: RunRow, place: u32) {
+        self.rows.push((self.keys.len(), row, place));
+        self.keys.extend_from_slice(key);
+        self.bytes += key.len() + std::mem::size_of::<(usize, RunRow, u32)>();
+    }
+
+    fn key(&self, at: usize) -> &[u8] {
+        let start = self.rows[at].0;
+        let end = self.rows.get(at + 1).map_or(self.keys.len(), |next| next.0);
+        &self.keys[start..end]
+    }
+
+    /// Drop the graves that hide nothing, write the rest, and start empty
+    fn flush(
+        &mut self,
+        column: ColumnId,
+        covered: &[SegmentId],
+        graves: &Graves,
+        writer: &mut RunWriter<'_>,
+        report: &mut MergeReport,
+    ) -> Result<()> {
+        let kept = graves.hiding(column, self)?;
+        for at in 0..self.rows.len() {
+            let (_, row, place) = self.rows[at];
+            if row.flags.is_tombstone() && !kept[at] {
                 report.graves_dropped += 1;
                 continue;
             }
-        }
-        if let Some((row, place)) = newest {
-            let at = covered.binary_search(&row.loc.segment).map_err(|_| {
+            let pointer = covered.binary_search(&row.loc.segment).map_err(|_| {
                 ReelError::Corruption(format!(
                     "a merged row points at segment {}, which the run does not cover",
                     row.loc.segment.as_u32()
                 ))
             })?;
             writer.push(
-                &key,
+                self.key(at),
                 RunPointer {
-                    covered: at as u32,
+                    covered: pointer as u32,
                     row: place,
                 },
             )?;
         }
+        self.keys.clear();
+        self.rows.clear();
+        self.bytes = 0;
+        Ok(())
     }
-    Ok(())
 }
 
 /// A standing segment a merge leaves out, with the oldest record it holds
@@ -410,29 +476,64 @@ struct Graves {
 }
 
 impl Graves {
-    /// Whether a delete may still hide an older version of its key outside the run
-    fn may_hide(&self, column: ColumnId, key: &[u8], lsn: Lsn) -> Result<bool> {
-        if lsn >= self.settled {
-            return Ok(true);
+    /// The window's deletes that may still hide an older version of their key outside the run
+    ///
+    /// Each segment left out is read once for the whole window, so a merge costs one footer
+    /// read per segment and window, however many graves it holds
+    fn hiding(&self, column: ColumnId, window: &Window) -> Result<Vec<bool>> {
+        let mut kept = vec![false; window.rows.len()];
+        let mut open: Vec<usize> = Vec::new();
+        for (at, (_, row, _)) in window.rows.iter().enumerate() {
+            if !row.flags.is_tombstone() {
+                continue;
+            }
+            match row.lsn >= self.settled {
+                true => kept[at] = true,
+                false => open.push(at),
+            }
         }
         for outside in &self.outside {
+            if open.is_empty() {
+                break;
+            }
             let Some(oldest) = outside.oldest else {
                 continue;
             };
-            if oldest >= lsn {
+            let lsn = |at: usize| window.rows[at].1.lsn;
+            if open.iter().all(|at| oldest >= lsn(*at)) {
                 continue;
             }
             // A segment with no footer yet cannot be asked, so it keeps the delete
             if !outside.is_sealed {
-                return Ok(true);
+                open.retain(|at| {
+                    kept[*at] = oldest < lsn(*at);
+                    !kept[*at]
+                });
+                continue;
             }
-            if let Some(row) = self.footers.find(outside.segment, column, key)? {
-                if row.lsn < lsn {
-                    return Ok(true);
+            let Some(footer) = self.footers.footer_once(outside.segment)? else {
+                continue;
+            };
+            let Some(partition) = footer.partition(column) else {
+                continue;
+            };
+            let mut failed = None;
+            open.retain(|at| {
+                if oldest >= lsn(*at) || failed.is_some() {
+                    return true;
                 }
+                match partition.lookup(window.key(*at)) {
+                    Ok(FooterFind::Found(row)) => kept[*at] = row.lsn < lsn(*at),
+                    Ok(_) => {}
+                    Err(error) => failed = Some(error),
+                }
+                !kept[*at]
+            });
+            if let Some(error) = failed {
+                return Err(error);
             }
         }
-        Ok(false)
+        Ok(kept)
     }
 }
 
@@ -526,6 +627,7 @@ mod tests {
             &graves,
             &mut writer,
             &mut report,
+            &AtomicBool::new(false),
         )
         .expect("merge");
         let path = writer.finish(&covered).expect("finish");
@@ -537,5 +639,96 @@ mod tests {
             Some(covered[1]),
             "the run points at the source"
         );
+    }
+
+    /// Footers of the segments a merge leaves out, counting every read
+    struct CountingFooters {
+        held: Vec<(SegmentId, Arc<SegmentFooter>)>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FooterSource for CountingFooters {
+        fn footer(&self, segment: SegmentId) -> Result<Option<Arc<SegmentFooter>>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self
+                .held
+                .iter()
+                .find(|(held, _)| *held == segment)
+                .map(|(_, footer)| Arc::clone(footer)))
+        }
+    }
+
+    fn footer_of(rows: Vec<FooterEntry>) -> Arc<SegmentFooter> {
+        let mut footer = SegmentFooter::build(rows);
+        let _ = footer.pack(0);
+        Arc::new(footer)
+    }
+
+    fn key(n: u32) -> RecordKey {
+        RecordKey::from_bytes(COLUMN, &n.to_be_bytes()).expect("key")
+    }
+
+    // each segment left out is read once for all the graves, and only a grave over an older row stays
+    #[test]
+    fn graves_read_each_outside_segment_once() {
+        let sim = SimIo::new(FaultPlan::new(1));
+        let driver = Arc::new(IoDriver::new(Arc::new(sim)));
+        let merged = SegmentId(40);
+        let deletes: Vec<FooterEntry> = (0..1_000u32)
+            .map(|n| FooterEntry::new(key(n), Lsn(100), n * 16, 0, Flags::TOMBSTONE))
+            .collect();
+        let sources = [Source::Footer {
+            segment: merged,
+            footer: footer_of(deletes),
+        }];
+        // Only key 3 has an older row outside the run
+        let outside: Vec<SegmentId> = (1..=20).map(SegmentId).collect();
+        let held = outside
+            .iter()
+            .map(|segment| {
+                let at = if segment.as_u32() == 7 { 3 } else { 5_000 + segment.as_u32() };
+                (*segment, footer_of(vec![FooterEntry::new(key(at), Lsn(5), 0, 100, Flags::DATA)]))
+            })
+            .collect();
+        let counting = Arc::new(CountingFooters {
+            held,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let footers: Arc<dyn FooterSource> = Arc::clone(&counting) as Arc<dyn FooterSource>;
+        let graves = Graves {
+            footers: Arc::clone(&footers),
+            outside: outside
+                .iter()
+                .map(|segment| Outside {
+                    segment: *segment,
+                    oldest: Some(Lsn(5)),
+                    is_sealed: true,
+                })
+                .collect(),
+            settled: Lsn(u64::MAX),
+        };
+        let covered = [merged];
+        let standing: HashSet<SegmentId> = covered.iter().copied().collect();
+        let mut writer = RunWriter::create(&driver, Path::new("/runs"), 1).expect("create");
+        writer.begin_column(COLUMN).expect("column");
+        let mut report = MergeReport::default();
+        let finished = merge_column(
+            &footers,
+            &sources,
+            COLUMN,
+            &standing,
+            &covered,
+            &graves,
+            &mut writer,
+            &mut report,
+            &AtomicBool::new(false),
+        )
+        .expect("merge");
+        assert!(finished);
+        assert_eq!(counting.reads.load(Ordering::Relaxed), outside.len());
+        assert_eq!(report.graves_dropped, 999);
+        let path = writer.finish(&covered).expect("finish");
+        let run = KeyRun::open(&driver, &path, 1).expect("open");
+        assert_eq!(run.column(COLUMN).expect("column").rows(), 1, "only key 3's grave stays");
     }
 }

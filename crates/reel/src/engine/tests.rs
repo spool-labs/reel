@@ -4520,9 +4520,9 @@ fn an_older_version_reads_its_row_through_the_key_blocks() {
     );
 }
 
-// a close compacts until no sealed segment is past the dead ratio
+// a drain compacts until no sealed segment is past the dead ratio
 #[test]
-fn a_close_leaves_no_segment_past_the_dead_ratio() {
+fn a_drain_leaves_no_segment_past_the_dead_ratio() {
     let (store, _backend, _dir) = posix_store(config(1, SyncPolicy::Never));
     for round in 0..12u8 {
         for byte in 0..40u8 {
@@ -4539,14 +4539,45 @@ fn a_close_leaves_no_segment_past_the_dead_ratio() {
             .is_some()
     };
     assert!(past(&store), "the walk left no segment past the ratio");
-    store.close().expect("close");
-    assert!(!past(&store), "the close left a segment past the ratio");
+    store.drain().expect("drain");
+    assert!(!past(&store), "the drain left a segment past the ratio");
     for byte in 0..40u8 {
         assert_eq!(
             store.get(&record(7, byte)).expect("get"),
             Some(Value::new(vec![11; 200]))
         );
     }
+}
+
+// a merge a close stopped writes no run, and the same merge goes through on the next open
+#[test]
+fn a_stopped_merge_leaves_the_runs_as_they_stood() {
+    let config = || ReelConfig {
+        segment_bytes: ByteCount::from_bytes(16 * 1024),
+        sync: SyncPolicy::Never,
+        active_tails: ThreadBudget::threads(1),
+        ..ReelConfig::default()
+    };
+    let (store, _sim) = sim_store(config());
+    for round in 1..=10u8 {
+        for byte in 0..4u8 {
+            store.put(&record(7, byte), &[round; 300]).expect("put");
+        }
+        store.reel.tails()[0].seal().expect("seal");
+    }
+    store.page_out_sealed().expect("page out");
+    store.stopping.store(true, std::sync::atomic::Ordering::Release);
+    assert!(
+        store.merge_when_due().expect("merge").is_none(),
+        "a stopped merge reported a run"
+    );
+    assert!(store.index().key_runs().runs().is_empty(), "a stopped merge installed a run");
+
+    store.stopping.store(false, std::sync::atomic::Ordering::Release);
+    assert!(
+        store.merge_when_due().expect("merge").is_some(),
+        "the merge did not go through once unstopped"
+    );
 }
 
 // a covered segment whose seal cut and mark were lost is never resumed, so its next seal counts

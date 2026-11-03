@@ -187,3 +187,61 @@ fn close_while_maintenance_runs() {
     }
     check(&store, keys, rounds, missing);
 }
+
+// a close while compaction rewrites dead segments returns soon, and every key reads back after reopen
+#[test]
+#[ignore]
+fn close_while_compaction_rewrites() {
+    let keys = env("GRAVE_STRESS_KEYS", 200_000);
+    let rounds = env("GRAVE_STRESS_ROUNDS", 4);
+    let dir = TempDir::new().expect("temp dir");
+    let root = dir.path().to_path_buf();
+    let store = Arc::new(ReelStore::open(root.clone(), config(), COLUMNS).expect("open"));
+    // Each round after the first rewrites every other key, so older segments end up half dead
+    for round in 0..rounds {
+        for n in (0..keys).filter(|n| round == 0 || n % 2 == round % 2) {
+            Store::put(&*store, "rows", &key(n), &value(n + round)).expect("put");
+        }
+        for n in 0..keys / 4 {
+            Store::delete(&*store, "rows", &key(1 << 40 | n)).expect("delete missing");
+        }
+        store.flush().expect("flush");
+    }
+    store.page_out_sealed().expect("page out");
+
+    let draining = Arc::clone(&store);
+    let drain = std::thread::spawn(move || {
+        let began = Instant::now();
+        let outcome = draining.drain();
+        (outcome, began.elapsed())
+    });
+    std::thread::sleep(Duration::from_millis(env("GRAVE_STRESS_CLOSE_AFTER_MS", 300)));
+    let began = Instant::now();
+    store.close().expect("close");
+    let closed = began.elapsed();
+    let (outcome, ran) = drain.join().expect("drain");
+    outcome.expect("drain");
+    println!(
+        "close {:.2}s, the drain ran {:.2}s, {} segments rewritten, {} unlinked whole",
+        closed.as_secs_f64(),
+        ran.as_secs_f64(),
+        store.compaction_counters().segments_rewritten,
+        store.compaction_counters().segments_unlinked_whole
+    );
+    drop(store);
+
+    let store = ReelStore::open(root, config(), COLUMNS).expect("reopen");
+    for n in 0..keys {
+        let got = Store::get(&store, "rows", &key(n)).expect("get");
+        assert_eq!(
+            got.map(|value| value.to_vec()),
+            Some(value(n + last_write(n, rounds))),
+            "key {n} lost its last write"
+        );
+    }
+}
+
+/// The round that last wrote key `n`: the first wrote every key, each later one every other key
+fn last_write(n: u64, rounds: u64) -> u64 {
+    (1..rounds).rev().find(|round| n % 2 == round % 2).unwrap_or(0)
+}

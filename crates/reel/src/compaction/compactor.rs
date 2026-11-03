@@ -315,6 +315,7 @@ struct PassTally {
     dropped: u64,
     had_live: bool,
     rotted: bool,
+    stopped: bool,
 }
 
 /// Live records waiting to land in the destination as one write, in the order queued
@@ -787,6 +788,14 @@ impl Compactor {
             return Ok(false);
         }
 
+        // A pass a close stopped leaves the segment, and the copies it landed already serve
+        if tally.stopped {
+            drop(source);
+            self.metrics.record_pass(&tally, read_bytes);
+            pace.settle(charged);
+            return Ok(false);
+        }
+
         // A cover raised during this pass may span rows it skipped, so the segment stays
         if index.has_pending_covers() {
             drop(source);
@@ -899,6 +908,10 @@ impl Compactor {
             slab = Arc::new(stage);
 
             for (slot, held) in staged.drain(..).enumerate() {
+                if self.is_stopped() {
+                    tally.stopped = true;
+                    break;
+                }
                 let Some((at, stretch)) = held else {
                     continue;
                 };
@@ -931,6 +944,9 @@ impl Compactor {
             }
             // Landing the copies frees the stripe's read buffers for the next stripe
             self.land_run(reel, dest_index, index, segment, &mut run, tally)?;
+            if tally.stopped {
+                break;
+            }
         }
         Ok(())
     }
@@ -951,6 +967,10 @@ impl Compactor {
         let mut run = CopyRun::default();
         let mut at = 0u64;
         while let Some(record) = RecordScan::resuming(reader, at).next_record()? {
+            if self.is_stopped() {
+                tally.stopped = true;
+                break;
+            }
             at = u64::from(record.offset) + record.header.span();
             self.apply_one(
                 reel, dest_index, index, reader, record, None, segment, drop_floor, &mut run, tally,
@@ -2408,6 +2428,27 @@ mod tests {
     /// The bytes of one key, for comparing against a rebuild
     fn key_bytes(byte: u8) -> Vec<u8> {
         vec![byte; KEY_WIDTH]
+    }
+
+    // a stopped compactor leaves the segment where it stands, and every key still reads
+    #[test]
+    fn a_stopped_rewrite_keeps_its_segment() {
+        let fixture = fixture(settings());
+        put(&fixture, 1, vec![0x11; 200]);
+        put(&fixture, 2, vec![0x22; 200]);
+        seal(&fixture);
+        put(&fixture, 1, vec![0x33; 300]);
+
+        fixture.compactor.stop();
+        let retired = fixture
+            .compactor
+            .compact_segment(&fixture.reel, &fixture.index, SegmentId(1))
+            .expect("compact");
+        assert!(!retired, "a stopped pass retired its segment");
+        assert_eq!(fixture.compactor.counters().segments_rewritten, 0);
+        assert!(fixture.index.holds_sealed(SegmentId(1)), "the segment left the index");
+        let rebuilt = rebuilt_from(&fixture);
+        assert_eq!(rebuilt_keys(&rebuilt), vec![key_bytes(1), key_bytes(2)]);
     }
 
     // a segment past the threshold is rewritten and retired after the copies are durable

@@ -535,6 +535,7 @@ impl ReelStore {
             return Ok(());
         }
         self.stopping.store(true, Ordering::Release);
+        self.compactor.stop();
         let _idle = crate::sync::lock(&self.maintaining);
         self.reel.close()
     }

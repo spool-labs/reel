@@ -1,7 +1,7 @@
 //! The maintenance plane: dead-space compaction and the crc scrub
 //! Compaction copies a segment's live records to a tail and retires the file once they are durable
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -402,6 +402,9 @@ pub struct Compactor {
     /// Seeds where a fresh sweep starts, so restarts do not all start at the same segment
     scrub_seed: u64,
 
+    /// Set by a close, so a running scrub stops at its next record as though its time ran out
+    stopped: AtomicBool,
+
     /// A fast segment's survivors demote after this many bytes of later ingest
     demote_after_bytes: Option<u64>,
 
@@ -497,6 +500,7 @@ impl Compactor {
                 .duration_since(UNIX_EPOCH)
                 .map(|since| since.as_nanos() as u64)
                 .unwrap_or(0),
+            stopped: AtomicBool::new(false),
             demote_after_bytes,
             metrics: Metrics::new(),
         }
@@ -1317,6 +1321,15 @@ impl Compactor {
         Ok(TombstoneStep::Carried)
     }
 
+    /// Stop a running scrub at its next record, for a close
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
     /// One bounded scrub pass across the volume, resuming where the last stopped
     pub fn scrub_pass(&self, reel: &Reel, index: &ReelIndex) -> Result<usize> {
         let gate = match &self.scrub_rate {
@@ -1525,7 +1538,7 @@ impl Compactor {
         let mut scanned = 0u64;
         loop {
             // a record is read before the clock is asked, so every pass moves the sweep
-            let is_late = scanned > 0 && Instant::now() >= deadline;
+            let is_late = scanned > 0 && (Instant::now() >= deadline || self.is_stopped());
             if *budget == 0 || is_late {
                 self.metrics.record_hits(hits as u64);
                 self.metrics.record_scrubbed(scanned);
@@ -1697,7 +1710,7 @@ impl Compactor {
             .partition_point(|row| u64::from(row.offset) < from);
         for place in &order.rows[start..] {
             let (key, row) = place.read(footer)?;
-            let is_late = scanned > 0 && Instant::now() >= walk.deadline;
+            let is_late = scanned > 0 && (Instant::now() >= walk.deadline || self.is_stopped());
             if *budget == 0 || is_late {
                 self.metrics.record_hits(hits as u64);
                 self.metrics.record_scrubbed(scanned);
@@ -3049,6 +3062,30 @@ mod tests {
             .expect("erase");
         assert!(report.is_none(), "a segment a cue reads was punched");
         assert_eq!(fixture.compactor.counters().erased_bytes, 0);
+    }
+
+    // a stopped scrub reads one record and keeps its place, as though its time ran out
+    #[test]
+    fn a_stopped_scrub_keeps_its_place() {
+        let fixture = punchable(ReelConfig {
+            scrub_mbps: 1024,
+            ..settings()
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        fixture.compactor.stop();
+        fixture
+            .compactor
+            .scrub_pass(&fixture.reel, &fixture.index)
+            .expect("scrub");
+        assert!(
+            fixture.compactor.counters().scrub_bytes <= 2 * LARGE as u64,
+            "a stopped scrub read {} bytes",
+            fixture.compactor.counters().scrub_bytes
+        );
+        assert!(
+            fixture.compactor.scrub_resume_point().is_some(),
+            "a stopped scrub lost its place"
+        );
     }
 
     // a scrub after a punch reads no rot and still checks every live byte

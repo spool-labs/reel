@@ -378,6 +378,9 @@ impl ReelStore {
         self.erase_when_due()?;
         // Hand over again before the scrub, since a long rewrite or merge lets sealed keys pile up
         self.page_out_sealed()?;
+        if self.is_stopping() {
+            return Ok(());
+        }
         self.scrub_once()?;
         self.index.scrub_spot(SPOT_SCRUB_BUDGET);
         self.index.rebook_owed(SPOT_REBOOK_BUDGET);

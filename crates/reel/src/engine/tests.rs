@@ -6421,3 +6421,71 @@ fn a_small_idle_tail_writes_its_rows_out_and_keeps_its_segment() {
         "with no floor the idle tail seals as before"
     );
 }
+
+// a cue pinned between a grave and the grave that covers it keeps the older one's segment,
+// also after a reopen, when the footer scan alone sets the segment's oldest mark
+#[test]
+fn a_cue_keeps_a_covered_grave_until_it_drops() {
+    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
+    let known = |store: &ReelStore| -> Vec<SegmentId> {
+        store
+            .index
+            .segments_snapshot()
+            .into_iter()
+            .map(|(segment, _)| segment)
+            .collect()
+    };
+    let (deleted, other) = (record(7, 1), record(7, 2));
+    let payload = vec![0xa5u8; 1024];
+    store.put(&deleted, &payload).expect("put");
+    store.reel.tails()[0].seal().expect("seal");
+    store.flush().expect("flush");
+    let data = known(&store);
+
+    // A mixed segment: the first grave, then a record newer than the cue will be
+    store.delete(&deleted).expect("delete");
+    store.put(&other, &payload).expect("put other");
+    store.reel.tails()[0].seal().expect("seal");
+    store.flush().expect("flush");
+    let mixed = known(&store)
+        .into_iter()
+        .find(|segment| !data.contains(segment))
+        .expect("the grave and the record sealed into a segment of their own");
+    store.close().expect("close");
+    let store = reopen(&sim, config(1, SyncPolicy::Never));
+
+    // The cue sits above the first grave and below the repeat
+    let cue = store.cue().expect("cue");
+    store.delete(&deleted).expect("delete again");
+    // The overwrite makes the mixed segment mostly dead, so compaction picks it
+    store.put(&other, &[0x5au8; 1024]).expect("overwrite other");
+    store.reel.tails()[0].seal().expect("seal");
+    store.flush().expect("flush");
+
+    for _ in 0..8 {
+        store.compact_once().expect("compact");
+    }
+    assert!(
+        known(&store).contains(&mixed),
+        "the segment stands while a cue below its grave's cover lives"
+    );
+    assert!(
+        store.get_at(&deleted, &cue).expect("read at cue").is_none(),
+        "the key reads deleted at the cue"
+    );
+
+    drop(cue);
+    for _ in 0..8 {
+        store.compact_once().expect("compact");
+    }
+    assert!(
+        !known(&store).contains(&mixed),
+        "the segment retires once the cue is gone"
+    );
+    assert!(store.get(&deleted).expect("get").is_none());
+    assert_eq!(
+        store.get(&other).expect("get other").map(|value| value[0]),
+        Some(0x5a),
+        "the overwrite stands"
+    );
+}

@@ -4410,16 +4410,16 @@ fn the_tick_seals_a_tail_gone_quiet() {
         .collect();
 
     for byte in 2..5u8 {
-        store.seal_due_tails(quiet, u64::MAX).expect("look");
+        store.seal_due_tails(quiet, u64::MAX, 0).expect("look");
         store.put(&record(7, byte), &[byte; 100]).expect("put");
     }
     assert_eq!(segment(written), before, "a tail taking writes was sealed");
 
     store
-        .seal_due_tails(quiet, u64::MAX)
+        .seal_due_tails(quiet, u64::MAX, 0)
         .expect("first quiet look");
     store
-        .seal_due_tails(quiet, u64::MAX)
+        .seal_due_tails(quiet, u64::MAX, 0)
         .expect("second quiet look");
     assert_ne!(segment(written), before, "the quiet tail is still open");
     let after: Vec<_> = (0..tails.len())
@@ -4448,14 +4448,14 @@ fn a_tail_full_of_graves_seals_while_busy() {
         .expect("delete of a key never written");
     let before = tail.tail().active_segment();
 
-    store.seal_due_tails(busy, 3).expect("look");
+    store.seal_due_tails(busy, 3, 0).expect("look");
     assert_eq!(
         tail.tail().active_segment(),
         before,
         "two graves sealed the tail"
     );
     store.delete(&record(7, 2)).expect("delete");
-    store.seal_due_tails(busy, 3).expect("look");
+    store.seal_due_tails(busy, 3, 0).expect("look");
     assert_ne!(
         tail.tail().active_segment(),
         before,
@@ -6287,4 +6287,137 @@ fn an_eviction_outlives_its_record() {
             "{evicts}: the reopen brought the older version back"
         );
     }
+}
+
+/// Fill one segment with 200 records, seal it, then delete every key twice with a seal each time
+fn two_grave_segments(store: &ReelStore) -> (SegmentId, SegmentId) {
+    let payload = vec![0xa5u8; 1024];
+    for byte in 0..200u8 {
+        store.put(&record(7, byte), &payload).expect("put");
+    }
+    store.reel.tails()[0].seal().expect("seal");
+    store.flush().expect("flush");
+    let known = |store: &ReelStore| -> Vec<SegmentId> {
+        store
+            .index
+            .segments_snapshot()
+            .into_iter()
+            .map(|(segment, _)| segment)
+            .collect()
+    };
+    let data = known(store);
+    for byte in 0..200u8 {
+        store.delete(&record(7, byte)).expect("delete");
+    }
+    store.reel.tails()[0].seal().expect("seal");
+    store.flush().expect("flush");
+    let first = known(store)
+        .into_iter()
+        .find(|segment| !data.contains(segment))
+        .expect("the first graves sealed into a segment of their own");
+    for byte in 0..200u8 {
+        store.delete(&record(7, byte)).expect("delete again");
+    }
+    store.reel.tails()[0].seal().expect("seal");
+    store.flush().expect("flush");
+    let second = known(store)
+        .into_iter()
+        .find(|segment| !data.contains(segment) && segment != &first)
+        .expect("the repeat graves sealed into a segment of their own");
+    (first, second)
+}
+
+// a grave a newer grave of the same key covers is dead, so its segment can go
+#[test]
+fn a_repeat_grave_makes_the_older_grave_reclaimable() {
+    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
+    let (first, second) = two_grave_segments(&store);
+
+    let covered = store.index.segment_bytes(first);
+    assert_eq!(covered.live, 0, "every grave in the first segment is covered by a newer one");
+    assert!(covered.dead > 0, "and the segment counts them as dead bytes");
+    let standing = store.index.segment_bytes(second);
+    assert_eq!(
+        standing.droppable(store.index.min_lsn_excluding(second)),
+        0,
+        "the newer graves still hide the sealed records"
+    );
+
+    for _ in 0..8 {
+        store.compact_once().expect("compact");
+    }
+    let left: Vec<SegmentId> = store
+        .index
+        .segments_snapshot()
+        .into_iter()
+        .map(|(segment, _)| segment)
+        .collect();
+    assert!(!left.contains(&first), "the covered graves' segment retired");
+    for byte in 0..200u8 {
+        assert!(store.get(&record(7, byte)).expect("get").is_none(), "key {byte}");
+    }
+    store.close().expect("close");
+    let reopened = reopen(&sim, config(1, SyncPolicy::Never));
+    for byte in 0..200u8 {
+        assert!(reopened.get(&record(7, byte)).expect("get").is_none(), "key {byte} after reopen");
+    }
+}
+
+// a reopen reads the same graves off the footers and books the covered ones dead too
+#[test]
+fn a_reopen_books_covered_graves_dead() {
+    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
+    let (first, second) = two_grave_segments(&store);
+    store.close().expect("close");
+
+    let reopened = reopen(&sim, config(1, SyncPolicy::Never));
+    let covered = reopened.index.segment_bytes(first);
+    assert_eq!(covered.live, 0, "the open found every first grave covered");
+    assert!(covered.dead > 0, "and booked them dead");
+    assert!(
+        reopened.index.segment_bytes(second).live > 0,
+        "the newer graves still stand"
+    );
+    for _ in 0..8 {
+        reopened.compact_once().expect("compact");
+    }
+    assert!(
+        !reopened
+            .index
+            .segments_snapshot()
+            .iter()
+            .any(|(segment, _)| *segment == first),
+        "the covered graves' segment retired after the reopen"
+    );
+    for byte in 0..200u8 {
+        assert!(reopened.get(&record(7, byte)).expect("get").is_none(), "key {byte}");
+    }
+}
+
+// a small tail left idle writes its rows out and keeps its segment instead of sealing
+#[test]
+fn a_small_idle_tail_writes_its_rows_out_and_keeps_its_segment() {
+    let (store, sim) = sim_store(config(1, SyncPolicy::Never));
+    store.put(&record(7, 1), b"one").expect("put");
+    let before = store.reel.tails()[0].tail().active_segment();
+    let floor = 1 << 20;
+    store.seal_due_tails(Duration::ZERO, u64::MAX, floor).expect("look");
+    store.seal_due_tails(Duration::ZERO, u64::MAX, floor).expect("look");
+    assert_eq!(
+        store.reel.tails()[0].tail().active_segment(),
+        before,
+        "a tail under the floor keeps its segment"
+    );
+    let killed = reopen_image(sim.killed_image(), config(1, SyncPolicy::Never));
+    assert!(
+        killed.get(&record(7, 1)).expect("get").is_some(),
+        "its rows reached the file, so a kill keeps the write"
+    );
+    store.seal_due_tails(Duration::ZERO, u64::MAX, 0).expect("look");
+    store.seal_due_tails(Duration::ZERO, u64::MAX, 0).expect("look");
+    assert_ne!(
+        store.reel.tails()[0].tail().active_segment(),
+        before,
+        "with no floor the idle tail seals as before"
+    );
 }

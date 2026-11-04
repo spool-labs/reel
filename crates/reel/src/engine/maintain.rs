@@ -366,7 +366,8 @@ impl ReelStore {
             return Ok(());
         }
         self.retry_broken_seals();
-        self.seal_due_tails(IDLE_SEAL, GRAVE_SEAL)?;
+        let floor = self.config.segment_bytes.to_bytes() / SMALL_SHARE;
+        self.seal_due_tails(IDLE_SEAL, GRAVE_SEAL, floor)?;
         self.publish_footprint();
         self.page_out_sealed()?;
         self.sweep_covers()?;
@@ -404,7 +405,7 @@ impl ReelStore {
     ///
     /// A quiet tail seals so compaction can reach what it holds, and a busy one so its graves
     /// can be pruned, which steady deletes would otherwise keep in memory without bound
-    pub(crate) fn seal_due_tails(&self, idle: Duration, graves: u64) -> Result<()> {
+    pub(crate) fn seal_due_tails(&self, idle: Duration, graves: u64, floor: u64) -> Result<()> {
         let now = Instant::now();
         let mut seen = lock(&self.idle);
         let tails = self.reel.tails();
@@ -419,6 +420,12 @@ impl ReelStore {
             match *watch {
                 Some((segment, len, since)) if (segment, len) == head => {
                     if !tail.holds_records() || now.duration_since(since) < idle {
+                        continue;
+                    }
+                    // A small idle tail keeps its segment and writes its rows out instead
+                    if head.1 < floor {
+                        tail.write_out_rows();
+                        *watch = None;
                         continue;
                     }
                     tail.seal()?;

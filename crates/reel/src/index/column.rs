@@ -215,9 +215,10 @@ impl ColumnIndex {
         key: &[u8],
         lsn: Lsn,
         segment: SegmentId,
+        segments: &SegmentTable,
         is_shadowed: impl FnOnce() -> bool,
     ) {
-        on_index!(self, index => index.hold_grave(key, lsn, segment, is_shadowed))
+        on_index!(self, index => index.hold_grave(key, lsn, segment, segments, is_shadowed))
     }
 
     /// Take out a key's grave while it still holds this tombstone's number
@@ -947,10 +948,13 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 segments.mark_dead(loc.segment, lsn, span_of(width, loc.len));
                 return Landed::Newer;
             }
-            // An older grave holds only a place, so the segment table hears nothing
+            // An older grave held its tombstone's footprint, which this put makes dead
             Some(existing) if existing.is_grave() => {
                 state.graves -= 1;
                 state.bytes += new_len;
+                if let Some(origin) = existing.grave_origin() {
+                    segments.shadow_held(origin, span_of(width, 0));
+                }
                 Landed::Grave
             }
             Some(existing) => {
@@ -1008,6 +1012,7 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         key: &[u8],
         lsn: Lsn,
         segment: SegmentId,
+        segments: &SegmentTable,
         is_shadowed: impl FnOnce() -> bool,
     ) {
         let Some(key) = K::from_slice(key) else {
@@ -1023,9 +1028,12 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
         {
             return;
         }
-        // An older grave is replaced by this one and never counted again
-        if existing.is_some() {
+        // An older grave is replaced by this one, and its tombstone's footprint goes dead
+        if let Some(existing) = existing {
             state.graves -= 1;
+            if let Some(origin) = existing.grave_origin() {
+                segments.shadow_held(origin, span_of(key.width(), 0));
+            }
         }
         self.filters.note(at, filter_hash(key.as_slice()));
         // The tombstone's span is already booked, so the segment counters stay put
@@ -1083,9 +1091,12 @@ impl<K: IndexKey, S: Shape<K>> WidthIndex<K, S> {
                 self.drop_entry(state, &key, existing, segments);
                 Landed::Record
             }
-            // An older grave is replaced by this one and never counted again
-            Some(_) => {
+            // An older grave is replaced by this one, and its tombstone's footprint goes dead
+            Some(existing) => {
                 state.graves -= 1;
+                if let Some(origin) = existing.grave_origin() {
+                    segments.shadow_held(origin, span_of(key.width(), 0));
+                }
                 Landed::Grave
             }
             // A hand-over took the map's version and its sequence number with it

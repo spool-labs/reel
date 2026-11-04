@@ -31,6 +31,12 @@ impl SegmentBytes {
         self.dead = self.dead.saturating_add(span);
     }
 
+    /// Move a tombstone's footprint from held and live to dead, once a newer version covers its key
+    pub fn shadow_held(&mut self, span: u64) {
+        self.held = self.held.saturating_sub(span);
+        self.shadow(span);
+    }
+
     /// Total footprint accounted to this segment
     pub fn total(&self) -> u64 {
         self.live + self.dead
@@ -189,6 +195,15 @@ impl SegmentRow {
     fn shadow(&self, span: u64) {
         self.drop_live(span);
         self.dead.fetch_add(span, Ordering::AcqRel);
+    }
+
+    fn shadow_held(&self, span: u64) {
+        let _ = self
+            .held
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                Some(held.saturating_sub(span))
+            });
+        self.shadow(span);
     }
 
     fn bytes(&self) -> SegmentBytes {
@@ -462,6 +477,14 @@ impl SegmentTable {
         });
     }
 
+    /// Note tombstone bytes a footer lists, which its tally already counts live
+    pub fn note_held(&self, segment: SegmentId, lsn: Lsn, span: u64) {
+        self.opened(segment, |row| {
+            row.held.fetch_add(span, Ordering::AcqRel);
+            row.held_lsn.fetch_max(lsn.as_u64(), Ordering::AcqRel);
+        });
+    }
+
     /// Add footprints a rebuild read off a footer tally
     pub fn adopt(&self, segment: SegmentId, bytes: SegmentBytes) {
         self.opened(segment, |row| {
@@ -477,6 +500,11 @@ impl SegmentTable {
     /// Move a record's footprint from live to dead within its segment
     pub fn shadow(&self, segment: SegmentId, span: u64) {
         self.booked(segment, |row| row.shadow(span));
+    }
+
+    /// Move a tombstone's footprint from held and live to dead, once a newer version covers its key
+    pub fn shadow_held(&self, segment: SegmentId, span: u64) {
+        self.booked(segment, |row| row.shadow_held(span));
     }
 
     /// Raise a segment's dead count to what a full sweep counted, never lowering it
@@ -746,11 +774,18 @@ pub trait Bookings {
 
     /// Book a tombstone's own footprint against the segment holding it
     fn mark_held(&self, segment: SegmentId, lsn: Lsn, span: u64);
+
+    /// Move a tombstone's footprint from held and live to dead, once a newer version covers its key
+    fn shadow_held(&self, segment: SegmentId, span: u64);
 }
 
 impl Bookings for SegmentTable {
     fn live_incarnation(&self, segment: SegmentId) -> SegmentIncarnation {
         self.live_incarnation(segment)
+    }
+
+    fn shadow_held(&self, segment: SegmentId, span: u64) {
+        self.shadow_held(segment, span)
     }
 
     fn mark_live(&self, segment: SegmentId, lsn: Lsn, span: u64) {
@@ -783,6 +818,9 @@ struct TallyRow {
     incarnation: Option<SegmentIncarnation>,
     bytes: SegmentBytes,
     shadowed: u64,
+
+    /// Tombstone footprint a newer version covered, settled as held bytes gone dead
+    shadowed_held: u64,
     oldest: Option<Lsn>,
 }
 
@@ -812,6 +850,7 @@ impl<'table> Tally<'table> {
                     incarnation: None,
                     bytes: SegmentBytes::default(),
                     shadowed: 0,
+                    shadowed_held: 0,
                     oldest: None,
                 });
                 rows.len() - 1
@@ -834,6 +873,9 @@ impl<'table> Tally<'table> {
         }
         for row in rows.iter().filter(|row| row.shadowed > 0) {
             self.table.shadow(row.segment, row.shadowed);
+        }
+        for row in rows.iter().filter(|row| row.shadowed_held > 0) {
+            self.table.shadow_held(row.segment, row.shadowed_held);
         }
     }
 }
@@ -870,6 +912,10 @@ impl Bookings for Tally<'_> {
 
     fn shadow(&self, segment: SegmentId, span: u64) {
         self.with(segment, |row| row.shadowed += span);
+    }
+
+    fn shadow_held(&self, segment: SegmentId, span: u64) {
+        self.with(segment, |row| row.shadowed_held += span);
     }
 
     fn mark_held(&self, segment: SegmentId, lsn: Lsn, span: u64) {

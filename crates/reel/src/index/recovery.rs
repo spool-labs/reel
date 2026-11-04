@@ -1077,8 +1077,9 @@ fn sweep_footer(
                 false => oldest = oldest.min(row.lsn),
             }
         }
+        // The tally counted these spans live when it sealed, so only the held share is new
         if held > 0 {
-            resolver.index.segments().mark_held(segment, held_lsn, held);
+            resolver.index.segments().note_held(segment, held_lsn, held);
         }
         if oldest != Lsn(u64::MAX) {
             resolver.index.segments().note_min(segment, oldest);

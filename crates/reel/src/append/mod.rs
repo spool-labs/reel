@@ -575,6 +575,11 @@ impl Appender {
         self.tail.committed_len() > self.header_span()
     }
 
+    /// Write every tail's pending journal rows out now, for a tail left idle without a seal
+    pub fn write_out_rows(&self) {
+        self.shared.writeout.try_write_out(&self.shared.lsn);
+    }
+
     /// Bytes the header record takes at the front of every segment
     fn header_span(&self) -> u64 {
         self.reserved_span(&RecordHeader::segment_header(&[0; SEGMENT_HEADER_SPAN]))

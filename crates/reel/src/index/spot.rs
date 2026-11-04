@@ -185,10 +185,13 @@ pub struct Booking {
 
     /// The record whose slot came in, nothing for a tombstone or no slot
     pub came: Option<u32>,
+
+    /// The segment whose tombstone lost its slot to a newer version
+    pub grave_gone: Option<SegmentId>,
 }
 
 /// Rows left unsettled, bookings for the rest, and each losing version with the lsn that beat it
-type Settling = (Vec<usize>, Vec<(usize, Booking)>, Vec<(usize, Loc, Lsn)>);
+type Settling = (Vec<usize>, Vec<(usize, Booking)>, Vec<(usize, Loc, Lsn, bool)>);
 
 /// What an overwrite settled: records it booked dead, and class bookings it corrected
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -201,6 +204,9 @@ pub struct Displaced {
 
     /// Records earlier booked from their class, each at true length beside the least booked
     pub rebooked: Vec<(Loc, u32)>,
+
+    /// Segments whose tombstone lost its slot, one entry per grave taken out
+    pub graves: Vec<SegmentId>,
 }
 
 /// A class booking corrected by a retiring segment's footer
@@ -1297,7 +1303,7 @@ impl SpotColumn {
         column: ColumnId,
         footers: &dyn FooterSource,
         book: &(dyn Fn(&[u8], Booking) + Sync),
-        lost: &(dyn Fn(&[u8], Loc, Lsn) + Sync),
+        lost: &(dyn Fn(&[u8], Loc, Lsn, bool) + Sync),
     ) -> Result<()> {
         let rows = std::mem::take(&mut *lock(&self.set_aside));
         if rows.is_empty() {
@@ -1331,8 +1337,8 @@ impl SpotColumn {
                             for (at, booking) in booked {
                                 book(rows[at].key.as_slice(), booking);
                             }
-                            for (at, loc, after) in gone {
-                                lost(rows[at].key.as_slice(), loc, after);
+                            for (at, loc, after, is_grave) in gone {
+                                lost(rows[at].key.as_slice(), loc, after, is_grave);
                             }
                             lock(&unsettled).extend(left);
                         }
@@ -1441,26 +1447,28 @@ impl SpotColumn {
             let slotted = match place {
                 // The slot is the version this footer holds, so the newer of the two stands
                 Some(place) if place.slot.offset == standing.offset => {
-                    let data = (!place.slot.is_grave()).then_some(standing.len);
+                    let is_grave = place.slot.is_grave();
+                    let data = (!is_grave).then_some(standing.len);
                     if is_newer {
                         table.take(hash, &place.slot);
                         table.insert(slot_of(hash, row));
-                        booked.push((newest, Booking { gone: data, came }));
+                        booked.push((newest, Booking { gone: data, came, grave_gone: None }));
                     }
-                    let data = data.map(|len| Loc::new(segment, standing.offset, len));
-                    Some((standing.lsn, segment, data))
+                    let held = Loc::new(segment, standing.offset, data.unwrap_or(0));
+                    Some((standing.lsn, segment, Some((held, is_grave))))
                 }
                 // The slot is an older version in this segment, whose footer points at this row
                 Some(place) if segment == row.loc.segment && standing.offset == row.loc.offset => {
                     match row_at(place.slot.offset)? {
                         Some(older) if partition.key_at(older) == Some(row.key.as_slice()) => {
                             let older = partition.row_at(older)?;
+                            let is_grave = place.slot.is_grave();
                             table.take(hash, &place.slot);
                             table.insert(slot_of(hash, row));
-                            let data = (!place.slot.is_grave()).then_some(older.len);
-                            booked.push((newest, Booking { gone: data, came }));
-                            let data = data.map(|len| Loc::new(segment, place.slot.offset, len));
-                            Some((older.lsn, segment, data))
+                            let data = (!is_grave).then_some(older.len);
+                            booked.push((newest, Booking { gone: data, came, grave_gone: None }));
+                            let held = Loc::new(segment, place.slot.offset, data.unwrap_or(0));
+                            Some((older.lsn, segment, Some((held, is_grave))))
                         }
                         Some(_) | None => None,
                     }
@@ -1472,23 +1480,19 @@ impl SpotColumn {
                 unsettled.extend_from_slice(same_key);
                 continue;
             };
-            // Every version met here in order, each data version paired with the next
-            let mut versions: Vec<(Lsn, SegmentId, Option<Loc>)> = same_key
+            // Every version met here in order, each one paired with the next that covers it
+            let mut versions: Vec<(Lsn, SegmentId, Option<(Loc, bool)>)> = same_key
                 .iter()
                 .map(|at| {
                     let met = &rows[*at];
-                    (
-                        met.lsn,
-                        met.loc.segment,
-                        (!met.is_tombstone).then_some(met.loc),
-                    )
+                    (met.lsn, met.loc.segment, Some((met.loc, met.is_tombstone)))
                 })
                 .collect();
             versions.push(slotted);
             versions.sort_unstable_by_key(|(lsn, segment, _)| (*lsn, *segment));
             for pair in versions.windows(2) {
-                if let Some(loc) = pair[0].2 {
-                    gone.push((newest, loc, pair[1].0));
+                if let Some((loc, is_grave)) = pair[0].2 {
+                    gone.push((newest, loc, pair[1].0, is_grave));
                 }
             }
         }
@@ -1508,6 +1512,7 @@ impl SpotColumn {
         let came = Booking {
             gone: None,
             came: (!is_tombstone).then_some(loc.len),
+            grave_gone: None,
         };
         let shard = shard_of(hash);
         {
@@ -1538,6 +1543,7 @@ impl SpotColumn {
                     table.insert(slot);
                     Booking {
                         gone: (!head.is_tombstone).then_some(head.len),
+                        grave_gone: head.is_tombstone.then_some(held.segment()),
                         ..came
                     }
                 }
@@ -1712,6 +1718,7 @@ impl SpotColumn {
                     settled.rebooked.push((loc, took.least()));
                     self.unslack(&took);
                 }
+                Some(_) if slot.is_grave() => settled.graves.push(slot.segment()),
                 Some(_) => settled.booked.push(loc),
                 None => {}
             }
@@ -2394,6 +2401,7 @@ mod tests {
             let expected = Booking {
                 gone: Some(40),
                 came: Some(50),
+                grave_gone: None,
             };
             assert_eq!(booked, expected, "key {at}");
         }
@@ -2787,7 +2795,7 @@ mod tests {
                 COLUMN,
                 &NoFooters,
                 &|_, booking| lock(&bookings).push(booking),
-                &|_, _, _| {},
+                &|_, _, _, _| {},
             )
             .expect("settle");
         column.finish_load();

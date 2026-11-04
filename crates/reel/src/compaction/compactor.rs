@@ -1795,6 +1795,10 @@ fn should_carry(
     drop_floor: Lsn,
 ) -> Result<bool> {
     if tombstone.flags.is_tombstone() {
+        // A newer version of the key, data or grave, hides everything this tombstone hid
+        if index.is_superseded(&tombstone.key, tombstone.lsn)? {
+            return Ok(false);
+        }
         if let Some(entry) = index.get(&tombstone.key)? {
             if entry.lsn > tombstone.lsn {
                 return Ok(false);

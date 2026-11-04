@@ -698,10 +698,19 @@ impl ReelIndex {
             spot.settle_rows(
                 self.columns[at].id,
                 footers.as_ref(),
-                &|key, booking| index.book_paged(key, booking),
-                // A seal's tally still counts live a version outversioned at or past that seal
-                &|key, lost, next| {
-                    if segments
+                &|key, booking| {
+                    index.book_paged(key, booking);
+                    // A tombstone a newer version displaced hides nothing that version does not
+                    if let Some(origin) = booking.grave_gone {
+                        segments.shadow_held(origin, span_of(key.len() as u16, 0));
+                    }
+                },
+                // A seal's tally still counts live a version outversioned at or past that seal,
+                // and it counts every tombstone, so a covered grave moves whatever its seal
+                &|key, lost, next, is_grave| {
+                    if is_grave {
+                        segments.shadow_held(lost.segment, span_of(key.len() as u16, 0));
+                    } else if segments
                         .sealed_at_of(lost.segment)
                         .is_some_and(|sealed| next >= sealed)
                     {
@@ -717,6 +726,7 @@ impl ReelIndex {
                 let gone = Booking {
                     gone: Some(loc.len),
                     came: None,
+                    grave_gone: None,
                 };
                 self.indexes[at].book_paged(key.as_slice(), gone);
             }
@@ -1186,6 +1196,20 @@ impl ReelIndex {
     }
 
     /// Whether the spot index holds a version newer than `lsn`
+    /// Whether a newer version of the key, data or grave, stands in the map or the spot index
+    pub fn is_superseded(&self, key: &RecordKey, lsn: Lsn) -> Result<bool> {
+        let Some(at) = self.slot(key.column) else {
+            return Ok(false);
+        };
+        if self.indexes[at]
+            .entry_or_grave(key.as_slice())
+            .is_some_and(|entry| entry.lsn > lsn)
+        {
+            return Ok(true);
+        }
+        self.shadow_lookup(at, key.as_slice(), lsn)
+    }
+
     fn shadow_lookup(&self, at: usize, key: &[u8], lsn: Lsn) -> Result<bool> {
         // Nothing the spot index was given is newer than a write above this
         if !self.spot_serves() || lsn.as_u64() > self.handed.load(Ordering::Acquire) {
@@ -1254,6 +1278,9 @@ impl ReelIndex {
         }
         for (loc, least) in displaced.rebooked {
             self.indexes[at].rebook_paged(key, least, loc.len);
+        }
+        for origin in displaced.graves {
+            self.segments.shadow_held(origin, self.indexes[at].span_of(0));
         }
         settled
     }
@@ -1730,7 +1757,7 @@ impl ReelIndex {
         };
         let spot = &self.spot[at];
         // A hand-over fills the spot index before the map lets go, so one shows a newer version
-        self.indexes[at].hold_grave(key.as_slice(), lsn, segment, || {
+        self.indexes[at].hold_grave(key.as_slice(), lsn, segment, &self.segments, || {
             spot.may_hold_newer(key.as_slice(), lsn)
         });
     }

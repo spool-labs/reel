@@ -520,7 +520,8 @@ pub struct FooterCache {
     /// Parsed footers, by the segment they came from
     footers: Hold<Arc<SegmentFooter>>,
 
-    /// Directories of segments read a block at a time, held to a share of their own
+    /// Directories and filters of sealed segments, held for the segment's life: about 1.5 B a
+    /// row, and the first thing every lookup asks, so they never compete with footers and blocks
     maps: Hold<Arc<FooterMap>>,
 
     /// Blocks of rows read on demand, by the segment and column they came from
@@ -528,12 +529,13 @@ pub struct FooterCache {
 }
 
 impl FooterCache {
-    /// A cache holding at most this many bytes of parsed footer state, split evenly over the pools
+    /// A cache holding at most this many bytes of parsed footers and row blocks, split evenly,
+    /// beside every sealed segment's directory and filters, which stay as long as the segment does
     pub fn new(capacity: usize) -> FooterCache {
         let share = capacity / POOLS;
         FooterCache {
             footers: Hold::new(share, BLOCK_BYTES),
-            maps: Hold::new(share, BLOCK_BYTES),
+            maps: Hold::new(usize::MAX, BLOCK_BYTES),
             blocks: Hold::new(share, BLOCK_BYTES),
         }
     }

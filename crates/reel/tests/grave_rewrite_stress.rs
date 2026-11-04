@@ -99,11 +99,26 @@ fn settle(store: &ReelStore) -> usize {
     let mut last = store.compaction_counters();
     // The scrub's rate gate pays out by wall time, and an idle tail seals after five seconds, so
     // the ticks are spaced and the quiet outlasts the idle seal
+    let began = Instant::now();
     while quiet < 700 && ticks < 100_000 {
         store.maintain_once().expect("maintain");
         std::thread::sleep(std::time::Duration::from_millis(10));
         ticks += 1;
         let now = store.compaction_counters();
+        // A trace every few hundred ticks, so a run that dies mid-wave still says where it was
+        if ticks % 300 == 0 {
+            println!(
+                "    tick {ticks} at {:.0}s: {} rewritten, {} unlinked, {} dropped, {} carried, scrub {} MiB, heap {} MiB, footer state {} MiB",
+                began.elapsed().as_secs_f64(),
+                now.segments_rewritten,
+                now.segments_unlinked_whole,
+                now.tombstones_dropped,
+                now.tombstones_carried,
+                now.scrub_bytes >> 20,
+                in_use() >> 20,
+                store.footer_cache_bytes().to_bytes() >> 20
+            );
+        }
         // The scrub counts dead rows behind the key runs, so its progress counts as movement too
         let moved = (now.segments_rewritten, now.segments_unlinked_whole, now.tombstones_dropped, now.tombstones_carried, now.scrub_bytes)
             != (last.segments_rewritten, last.segments_unlinked_whole, last.tombstones_dropped, last.tombstones_carried, last.scrub_bytes);
@@ -266,11 +281,12 @@ fn rewrite_through_repeat_graves() {
         counters.scrub_bytes >> 20
     );
     println!(
-        "after: {rows_after} rows ({:.1}% of before), {graves_after} graves, {data_after} data, {sealed_after} sealed, heap peak {} MiB against {} MiB after open, now {} MiB",
+        "after: {rows_after} rows ({:.1}% of before), {graves_after} graves, {data_after} data, {sealed_after} sealed, heap peak {} MiB against {} MiB after open, now {} MiB, footer state {} MiB",
         100.0 * rows_after as f64 / rows_before as f64,
         peak >> 20,
         after_open >> 20,
-        in_use() >> 20
+        in_use() >> 20,
+        store.footer_cache_bytes().to_bytes() >> 20
     );
     check(&store, keys);
 
@@ -335,14 +351,17 @@ fn rewrite_through_repeat_graves() {
         rows_after * 100 <= rows_before * 15,
         "{rows_after} of {rows_before} rows stayed: the graves did not drop"
     );
-    // The wave may fill the footer cache, parse one footer for a probe and hold one pass's
-    // buffers, never a share of the graves
+    // The wave holds every sealed segment's directory and filters, about 1.5 B a row at ten
+    // filter bits, may fill the footer cache, parses one footer for a probe and holds one
+    // pass's buffers. Never a share of the graves beyond their filter bits
     let cache = env("GRAVE_REWRITE_FOOTER_CACHE", 64 << 20) as usize;
+    let resident = (rows_before as usize * 3) / 2;
     assert!(
-        peak <= after_open + 2 * cache + (64 << 20),
-        "heap peaked at {} MiB during the wave against {} MiB after open and a {} MiB footer cache",
+        peak <= after_open + resident + 2 * cache + (64 << 20),
+        "heap peaked at {} MiB during the wave against {} MiB after open, {} MiB of resident directories and filters and a {} MiB footer cache",
         peak >> 20,
         after_open >> 20,
+        resident >> 20,
         cache >> 20
     );
 }

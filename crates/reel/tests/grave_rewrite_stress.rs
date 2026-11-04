@@ -400,16 +400,19 @@ fn rewrite_through_repeat_graves() {
         "{rows_after} of {rows_before} rows stayed: the graves did not drop"
     );
     // The wave holds every sealed segment's directory and filters, about 1.5 B a row at ten
-    // filter bits, may fill the footer cache, parses one footer for a probe and holds one
-    // pass's buffers. Never a share of the graves beyond their filter bits
+    // filter bits, may fill the footer cache, parses one footer for a probe, holds one pass's
+    // buffers, and notes each row copied into a destination by key until the destination hands
+    // over, about 24 B a live row. Never a share of the graves beyond their filter bits
     let cache = env("GRAVE_REWRITE_FOOTER_CACHE", 64 << 20) as usize;
     let resident = (rows_before as usize * 3) / 2;
+    let copies = 24 * data as usize / 10;
     assert!(
-        peak <= after_open + resident + 2 * cache + (64 << 20),
-        "heap peaked at {} MiB during the wave against {} MiB after open, {} MiB of resident directories and filters and a {} MiB footer cache",
+        peak <= after_open + resident + copies + 2 * cache + (64 << 20),
+        "heap peaked at {} MiB during the wave against {} MiB after open, {} MiB of resident directories and filters, {} MiB of noted copies and a {} MiB footer cache",
         peak >> 20,
         after_open >> 20,
         resident >> 20,
+        copies >> 20,
         cache >> 20
     );
 }

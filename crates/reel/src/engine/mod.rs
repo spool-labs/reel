@@ -168,6 +168,12 @@ pub struct ReelStore {
     /// Caps how many segment rewrites run at once
     compaction_plane: PassPlane,
 
+    /// Segments retired when tombstones were last put back up for a check
+    rearmed_at: AtomicU64,
+
+    /// The hand-over mark when tombstones were last put back up for a check
+    rearmed_handed: AtomicU64,
+
     /// The append-only log of segment files
     reel: Reel,
 
@@ -446,6 +452,8 @@ impl ReelStore {
             fd_cache,
             compactor,
             compaction_plane: PassPlane::new(config.compact_passes()),
+            rearmed_at: AtomicU64::new(0),
+            rearmed_handed: AtomicU64::new(0),
             config,
             reel,
             index,

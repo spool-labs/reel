@@ -564,6 +564,7 @@ impl ReelStore {
         if self.is_read_only {
             return Ok(());
         }
+        let mut refused: Option<SegmentId> = None;
         loop {
             self.settle_sealed()?;
             // A tick's pass may hold every place on the plane, so wait for one
@@ -590,14 +591,21 @@ impl ReelStore {
                 self.compactor
                     .select_target(&self.reel, &self.index, ratio, cue_floor)
             else {
+                if self.rearm_graves_if_retired() {
+                    continue;
+                }
                 return Ok(());
             };
-            // A target left standing would be picked again forever
+            // A target left standing twice would be picked again forever; one left standing
+            // once may have settled its tombstones, so the next pick moves on
             if !self
                 .compactor
                 .compact_segment(&self.reel, &self.index, segment)?
             {
-                return Ok(());
+                if refused == Some(segment) {
+                    return Ok(());
+                }
+                refused = Some(segment);
             }
         }
     }
@@ -667,11 +675,27 @@ impl ReelStore {
             None => match self.fold_small(is_hot)? {
                 CompactPass::Copied => Ok(CompactPass::Copied),
                 _ => {
+                    // The next tick picks up what a re-arm put back, so this one still reads idle
+                    self.rearm_graves_if_retired();
                     self.compactor.release_spare();
                     Ok(CompactPass::Idle)
                 }
             },
         }
+    }
+
+    /// Put tombstones back up for a check once a data segment's retire may have freed what they
+    /// hid, or a hand-over let the footers answer for rows that were past their reach
+    fn rearm_graves_if_retired(&self) -> bool {
+        let retired = self.index.data_retired_count();
+        let handed = self.index.handover_count();
+        let same_retired = self.rearmed_at.swap(retired, Ordering::AcqRel) == retired;
+        let same_handed = self.rearmed_handed.swap(handed, Ordering::AcqRel) == handed;
+        if same_retired && same_handed {
+            return false;
+        }
+        self.index.rearm_graves();
+        true
     }
 
     /// Copy the small sealed segments into a tail once enough stand, so quiet seals do not pile up

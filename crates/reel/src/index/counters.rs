@@ -22,6 +22,13 @@ pub struct SegmentBytes {
 
     /// The newest tombstone version in this segment, if any
     pub held_lsn: Option<Lsn>,
+
+    /// Whether a rewrite has checked every tombstone here and kept them all, so until a newer
+    /// version covers one or a segment retires, another rewrite would carry them again
+    pub graves_settled: bool,
+
+    /// Tombstone footprint moved to dead, so dead data can be told from dead graves
+    pub held_dead: u64,
 }
 
 impl SegmentBytes {
@@ -53,8 +60,15 @@ impl SegmentBytes {
     }
 
     /// How many bytes a rewrite of this segment would reclaim
+    ///
+    /// Tombstones no rewrite has checked yet count as reclaimable, so a segment of graves gets
+    /// its one pass, where each grave is dropped or carried on what the footers hold
     pub fn reclaimable(&self, floor: Option<Lsn>) -> u64 {
-        self.dead + self.droppable(floor)
+        self.dead
+            + match self.graves_settled {
+                true => self.droppable(floor),
+                false => self.held,
+            }
     }
 }
 
@@ -111,6 +125,9 @@ const PRESENT: u32 = 1;
 /// The segment retired, so every booking against it is dropped and counted
 const RETIRED: u32 = 2;
 
+/// A rewrite checked every tombstone in the segment and carried them all
+const GRAVES_SETTLED: u32 = 4;
+
 /// One segment's counters, on its own cache line so two segments never share one
 #[repr(align(64))]
 #[derive(Debug)]
@@ -123,6 +140,9 @@ struct SegmentRow {
 
     /// Tombstone bytes, counted inside live
     held: AtomicU64,
+
+    /// Tombstone footprint a newer version covered, counted inside dead
+    held_dead: AtomicU64,
 
     /// The oldest data version the segment can still surface, or `u64::MAX` before any
     min_lsn: AtomicU64,
@@ -150,6 +170,7 @@ impl SegmentRow {
             live: AtomicU64::new(0),
             dead: AtomicU64::new(0),
             held: AtomicU64::new(0),
+            held_dead: AtomicU64::new(0),
             min_lsn: AtomicU64::new(u64::MAX),
             max_lsn: AtomicU64::new(Lsn::NONE.as_u64()),
             sealed_at: AtomicU64::new(Lsn::NONE.as_u64()),
@@ -180,6 +201,10 @@ impl SegmentRow {
         self.flags.fetch_or(bits, Ordering::AcqRel);
     }
 
+    fn lower(&self, bits: u32) {
+        self.flags.fetch_and(!bits, Ordering::AcqRel);
+    }
+
     fn add_live(&self, span: u64) {
         self.live.fetch_add(span, Ordering::AcqRel);
     }
@@ -204,6 +229,9 @@ impl SegmentRow {
                 Some(held.saturating_sub(span))
             });
         self.shadow(span);
+        self.held_dead.fetch_add(span, Ordering::AcqRel);
+        // A newer version covers a grave here, so a rewrite has something to drop again
+        self.lower(GRAVES_SETTLED);
     }
 
     fn bytes(&self) -> SegmentBytes {
@@ -215,6 +243,8 @@ impl SegmentRow {
                 0 => None,
                 newest => Some(Lsn(newest)),
             },
+            graves_settled: self.flags() & GRAVES_SETTLED != 0,
+            held_dead: self.held_dead.load(Ordering::Acquire),
         }
     }
 
@@ -223,6 +253,7 @@ impl SegmentRow {
         self.live.store(0, Ordering::Release);
         self.dead.store(0, Ordering::Release);
         self.held.store(0, Ordering::Release);
+        self.held_dead.store(0, Ordering::Release);
         self.min_lsn.store(u64::MAX, Ordering::Release);
         self.max_lsn.store(Lsn::NONE.as_u64(), Ordering::Release);
         self.sealed_at.store(Lsn::NONE.as_u64(), Ordering::Release);
@@ -474,7 +505,20 @@ impl SegmentTable {
             row.add_live(span);
             row.held.fetch_add(span, Ordering::AcqRel);
             row.held_lsn.fetch_max(lsn.as_u64(), Ordering::AcqRel);
+            row.lower(GRAVES_SETTLED);
         });
+    }
+
+    /// Note that a rewrite checked every tombstone in the segment and carried them all
+    pub fn settle_graves(&self, segment: SegmentId) {
+        self.booked(segment, |row| row.raise(GRAVES_SETTLED));
+    }
+
+    /// Put every segment's tombstones back up for a check, once a retire may have freed what they hid
+    pub fn rearm_graves(&self) {
+        for (_, row) in read(&self.window).counted_rows() {
+            row.lower(GRAVES_SETTLED);
+        }
     }
 
     /// Note tombstone bytes a footer lists, which its tally already counts live
@@ -482,6 +526,7 @@ impl SegmentTable {
         self.opened(segment, |row| {
             row.held.fetch_add(span, Ordering::AcqRel);
             row.held_lsn.fetch_max(lsn.as_u64(), Ordering::AcqRel);
+            row.lower(GRAVES_SETTLED);
         });
     }
 

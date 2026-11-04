@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::index::counters::SegmentBytes;
 use crate::append::CopyRecord;
 use crate::config::{ReelConfig, RepairPath, VolumeClass};
 use crate::error::{ReelError, Result};
@@ -12,7 +13,7 @@ use crate::format::column::RecordKey;
 use crate::format::footer::{FooterRow, SegmentFooter, FIXED_TAIL_LEN};
 use crate::format::loc::{Loc, SegmentId};
 use crate::format::lsn::Lsn;
-use crate::format::record::{
+use crate::format::record::{Flags, 
     check_keyless, keyless_codec, peek_key_width, read_u32_le, CheckKey, KeylessRead, RecordHeader,
     RecordLayout, HEADER_LEN, KEYLESS_PREFIX,
 };
@@ -563,7 +564,8 @@ impl Compactor {
         if index.has_pending_covers() {
             return None;
         }
-        self.select_ranked(reel, index, cue_floor, fewest, |total, _| {
+        self.select_ranked(reel, index, cue_floor, fewest, |bytes, _| {
+            let total = bytes.total();
             (total < small).then(|| 1.0 - total as f64 / small as f64)
         })
     }
@@ -578,8 +580,9 @@ impl Compactor {
         if index.has_pending_covers() {
             return None;
         }
-        self.select_ranked(reel, index, cue_floor, 1, |_, fraction| {
-            (fraction >= 1.0).then_some(fraction)
+        // Unchecked tombstones rank as reclaimable, so only a segment with nothing live unlinks
+        self.select_ranked(reel, index, cue_floor, 1, |bytes, fraction| {
+            (bytes.live == 0 && fraction >= 1.0).then_some(fraction)
         })
     }
 
@@ -590,7 +593,7 @@ impl Compactor {
         index: &ReelIndex,
         cue_floor: Option<Lsn>,
         fewest: usize,
-        score: impl Fn(u64, f64) -> Option<f64>,
+        score: impl Fn(SegmentBytes, f64) -> Option<f64>,
     ) -> Option<(SegmentId, f64)> {
         let shared = reel.shared();
         let mut best: Option<(SegmentId, f64)> = None;
@@ -624,7 +627,7 @@ impl Compactor {
             }
             // dead bytes plus the tombstones this segment no longer needs to keep
             let fraction = bytes.reclaimable(floors.excluding(segment)) as f64 / total as f64;
-            let Some(rank) = score(total, fraction) else {
+            let Some(rank) = score(bytes, fraction) else {
                 continue;
             };
             // A rot-pinned segment returns only once something in it has died since
@@ -673,6 +676,34 @@ impl Compactor {
         let drop_floor = index
             .min_lsn_excluding(segment)
             .map_or(settled, |floor| floor.min(settled));
+        // A segment whose tombstones no rewrite has checked gets a probe first: when none of them
+        // would drop and nothing else here is dead enough, it settles instead of being copied
+        let bytes = index.segment_bytes(segment);
+        if bytes.held > 0 && !bytes.graves_settled && bytes.dead * 2 < bytes.total() {
+            let footers: &dyn FooterSource = shared.as_ref();
+            // With no footer to probe, the rewrite itself decides each tombstone as before
+            let mut would_drop = true;
+            if let Some(footer) = footers.footer_once(segment)? {
+                would_drop = false;
+                'probe: for partition in &footer.partitions {
+                    for entry in partition.entries() {
+                        let entry = entry?;
+                        if !entry.flags.is_tombstone() {
+                            continue;
+                        }
+                        let at = (segment, entry.offset);
+                        if !should_carry(reel, index, &entry.key, entry.lsn, entry.flags, at, drop_floor)? {
+                            would_drop = true;
+                            break 'probe;
+                        }
+                    }
+                }
+            }
+            if !would_drop {
+                index.settle_graves(segment);
+                return Ok(false);
+            }
+        }
         let source = match source_handle(shared, segment) {
             Ok(source) => source,
             Err(error) if is_missing(&error) => {
@@ -804,6 +835,12 @@ impl Compactor {
             return Ok(false);
         }
 
+        // Every grave checked stayed, so the destination's graves wait for a cover or a retire
+        if tally.dropped == 0 && tally.carried > 0 {
+            if let Some(lease) = &lease {
+                index.settle_graves(reel.tails()[lease.index()].tail().active_segment());
+            }
+        }
         // Seal per pass, so the destination holds one source and its key and offset orders agree
         if tally.had_live {
             if let Some(lease) = &lease {
@@ -1065,7 +1102,7 @@ impl Compactor {
         if record.header.flags.is_tombstone() || record.header.flags.is_range_tombstone() {
             return Ok(
                 match self
-                    .carry_or_drop(reel, dest_index, index, reader, &record, staged, drop_floor)?
+                    .carry_or_drop(reel, dest_index, index, reader, &record, staged, segment, drop_floor)?
                 {
                     TombstoneStep::Carried => Rewrote::Carried,
                     TombstoneStep::Dropped => Rewrote::Dropped,
@@ -1313,9 +1350,18 @@ impl Compactor {
         reader: &mut SegmentReader<'_>,
         record: &SourceRecord,
         staged: Option<Part>,
+        segment: SegmentId,
         drop_floor: Lsn,
     ) -> Result<TombstoneStep> {
-        if !should_carry(reel, index, &record.header, drop_floor)? {
+        if !should_carry(
+            reel,
+            index,
+            &record.header.key,
+            record.header.lsn,
+            record.header.flags,
+            (segment, record.offset),
+            drop_floor,
+        )? {
             // Nothing older is left for the grave to hide, and the retire removes its origin
             if record.header.flags.is_tombstone() {
                 index.drop_grave(&record.header.key, record.header.lsn);
@@ -1337,6 +1383,11 @@ impl Compactor {
         // A paged grave left with the source's seal, so hold one until the copy's segment is noted
         if record.header.flags.is_tombstone() {
             index.hold_grave(&record.header.key, record.header.lsn, carried.loc.segment);
+        }
+        // Each carried grave holds a row and a map entry until its segment seals, so a pass
+        // over millions of them seals the destination itself instead of waiting for the tick
+        if tail.graves_held() >= CARRIED_GRAVE_SEAL {
+            tail.seal()?;
         }
         Ok(TombstoneStep::Carried)
     }
@@ -1791,34 +1842,59 @@ impl Compactor {
 fn should_carry(
     reel: &Reel,
     index: &ReelIndex,
-    tombstone: &RecordHeader,
+    key: &RecordKey,
+    lsn: Lsn,
+    flags: Flags,
+    at: (SegmentId, u32),
     drop_floor: Lsn,
 ) -> Result<bool> {
-    if tombstone.flags.is_tombstone() {
-        // A newer version of the key, data or grave, hides everything this tombstone hid
-        if index.is_superseded(&tombstone.key, tombstone.lsn)? {
-            return Ok(false);
-        }
-        if let Some(entry) = index.get(&tombstone.key)? {
-            if entry.lsn > tombstone.lsn {
-                return Ok(false);
+    if flags.is_tombstone() {
+        // An open tail's version of the key settles it: a newer one hides whatever this did, an
+        // older one still needs hiding. Its own copy, held for a carry, says nothing
+        if let Some(mapped) = index.mapped_version(key) {
+            if mapped != lsn {
+                return Ok(mapped < lsn);
             }
         }
+        // A newer version in the index hides everything this tombstone hid
+        if index.is_superseded(key, lsn)? {
+            return Ok(false);
+        }
+        let settled = reel.shared().settled_below();
+        // The open or a displacement found this tombstone covered, so it hides nothing
+        if index.is_droppable_grave(at.0, at.1) && lsn < settled {
+            return Ok(false);
+        }
+        // Otherwise the footers decide: a newer row covers it, an older row needs it, and with
+        // neither it hides nothing, once every number below it has landed
+        if let Some((newer, older)) = index.sealed_versions_around(key, lsn)? {
+            if newer {
+                return Ok(false);
+            }
+            // A row in an open tail or a segment not yet handed over is past the footers' reach
+            let unheld = index.unheld_floor(at.0).is_some_and(|floor| lsn >= floor);
+            return Ok(older || unheld || lsn >= settled);
+        }
     }
-    // The floor never sees key run rows, so a delete stands while a run may hold what it deleted
+    // With no footers to ask, or for a range, the floor and the key runs decide as before
+    if lsn >= drop_floor {
+        return Ok(true);
+    }
     let key_runs = index.key_runs();
-    let is_held_below = match tombstone.flags.is_range_tombstone() {
-        true => !key_runs.runs().is_empty(),
+    match flags.is_range_tombstone() {
+        true => Ok(!key_runs.runs().is_empty()),
         false => key_runs.holds_older(
-            tombstone.key.column,
-            tombstone.key.as_slice(),
-            tombstone.lsn,
+            key.column,
+            key.as_slice(),
+            lsn,
             &(Arc::clone(reel.shared()) as Arc<dyn FooterSource>),
             &|segment| index.holds_sealed(segment),
-        )?,
-    };
-    Ok(is_held_below || tombstone.lsn >= drop_floor)
+        ),
+    }
 }
+
+/// A rewrite seals its destination once it holds this many carried tombstones, the tick's grave seal
+const CARRIED_GRAVE_SEAL: u64 = 1 << 19;
 
 /// Evict a rotted record and bury it under its own number, so a retire or a reopen keeps the miss
 pub(crate) fn evict_rotted(
@@ -2785,6 +2861,10 @@ mod tests {
         seal(&fixture);
         put(&fixture, 2, vec![0x22; 200]);
         delete(&fixture, 1);
+        // Enough dead versions that the segment earns its rewrite, rather than a probe that
+        // finds every tombstone standing and leaves the segment as it is
+        put(&fixture, 2, vec![0x44; 200]);
+        put(&fixture, 2, vec![0x55; 200]);
         put(&fixture, 2, vec![0x33; 200]);
         seal(&fixture);
         put(&fixture, 3, vec![0x44; 200]);

@@ -160,6 +160,7 @@ impl Oracle {
                 dead: row.dead,
                 held: row.held,
                 held_lsn: row.held_lsn,
+                ..SegmentBytes::default()
             })
             .unwrap_or_default()
     }

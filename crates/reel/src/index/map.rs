@@ -1,7 +1,7 @@
 //! The reel's index: one map per column over one shared set of segments
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -221,6 +221,11 @@ pub struct ReelIndex {
     /// Each key run's rows by the segment and column they point into, for an open's footer loads
     run_picks: Mutex<HashMap<(SegmentId, ColumnId), Vec<u32>>>,
 
+    /// Sealed tombstones that hide nothing, by segment and record offset: a newer version of the
+    /// key covers them, or an open found no other row of their key. A rewrite drops them with no
+    /// footer read, which the spot index could not answer once the open let their slots go
+    droppable_graves: Mutex<HashMap<SegmentId, HashSet<u32>>>,
+
     /// Each column's sealed keys as record locations, answering a get in one read
     spot: Vec<SpotColumn>,
 
@@ -229,6 +234,12 @@ pub struct ReelIndex {
 
     /// Segments retired since the spot index last dropped the entries pointing into them
     retired: AtomicU64,
+
+    /// Retired segments that held data rows, whose going may free what a carried tombstone hid
+    data_retired: AtomicU64,
+
+    /// Sealed footers handed over since the open, each one letting the footers answer for more
+    handovers: AtomicU64,
 
     /// The newest version the spot index was given, so a write above it skips the shadow check
     handed: AtomicU64,
@@ -340,10 +351,13 @@ impl ReelIndex {
             walk_runs: sealed.iter().map(|_| WalkRuns::default()).collect(),
             key_runs: KeyRunSet::default(),
             run_picks: Mutex::new(HashMap::new()),
+            droppable_graves: Mutex::new(HashMap::new()),
             sealed,
             spot: columns.iter().map(|_| SpotColumn::new()).collect(),
             spot_ready: AtomicBool::new(false),
             retired: AtomicU64::new(0),
+            data_retired: AtomicU64::new(0),
+            handovers: AtomicU64::new(0),
             handed: AtomicU64::new(0),
             by_id,
             segments: Arc::new(SegmentTable::new()),
@@ -604,6 +618,7 @@ impl ReelIndex {
         // What an open loads counts as handed over, since a follower applies older records after it
         self.handed
             .fetch_max(footer.max_lsn.as_u64(), Ordering::AcqRel);
+        self.handovers.fetch_add(1, Ordering::AcqRel);
         // The run keeps one row per key, so a version outversioned in a retired segment stays out
         if self.key_runs.covers(segment) {
             for partition in &footer.partitions {
@@ -700,8 +715,9 @@ impl ReelIndex {
                 footers.as_ref(),
                 &|key, booking| {
                     index.book_paged(key, booking);
-                    // A tombstone a newer version displaced hides nothing that version does not
-                    if let Some(origin) = booking.grave_gone {
+                    // A tombstone a newer version displaced hides nothing that version does not.
+                    // Its rewrite finds the cover in the footers, so nothing is kept per grave
+                    if let Some((origin, _)) = booking.grave_gone {
                         segments.shadow_held(origin, span_of(key.len() as u16, 0));
                     }
                 },
@@ -1118,6 +1134,8 @@ impl ReelIndex {
     pub fn note_spans(&self, segment: SegmentId, footer: &SegmentFooter) -> Result<()> {
         // The ceiling goes down first, so a search never meets a segment the fan-out thinks empty
         self.segments.note_max(segment, footer.max_lsn);
+        // From here the footers answer for this segment's rows
+        self.handovers.fetch_add(1, Ordering::AcqRel);
         for partition in &footer.partitions {
             let Some((lowest, highest)) = partition.key_range() else {
                 continue;
@@ -1196,6 +1214,86 @@ impl ReelIndex {
     }
 
     /// Whether the spot index holds a version newer than `lsn`
+    /// The version of the key an open tail holds, data or grave, if any
+    pub fn mapped_version(&self, key: &RecordKey) -> Option<Lsn> {
+        let at = self.slot(key.column)?;
+        self.indexes[at]
+            .entry_or_grave(key.as_slice())
+            .map(|entry| entry.lsn)
+    }
+
+    /// What the sealed footers hold of a key around one version: a newer row, and an older row
+    ///
+    /// Each answer costs the filter probes of the segments whose span covers the key, and a row
+    /// block read where a filter says maybe
+    pub fn sealed_versions_around(&self, key: &RecordKey, lsn: Lsn) -> Result<Option<(bool, bool)>> {
+        let Some(at) = self.slot(key.column) else {
+            return Ok(Some((false, false)));
+        };
+        // Without a footer source the footers cannot be asked, and the caller falls back
+        if self.footers.get().is_none() {
+            return Ok(None);
+        }
+        if self
+            .newest_sealed(at, key, None)?
+            .is_some_and(|newest| newest.lsn > lsn)
+        {
+            return Ok(Some((true, false)));
+        }
+        // Only data below needs hiding: an older grave already hides whatever lies under it
+        let older = match lsn.as_u64() {
+            0 => None,
+            above => self.newest_sealed(at, key, Some(Lsn(above - 1)))?,
+        };
+        Ok(Some((false, older.is_some_and(|entry| !entry.is_grave()))))
+    }
+
+    /// The oldest number in any segment whose rows the footers cannot answer for yet: an open
+    /// tail, or a sealed segment the index has not been handed. A tombstone at or past it may
+    /// still hide a row there
+    pub fn unheld_floor(&self, excluding: SegmentId) -> Option<Lsn> {
+        self.segments_snapshot()
+            .into_iter()
+            .filter(|(segment, _)| *segment != excluding && !self.holds_sealed(*segment))
+            .filter_map(|(segment, _)| self.segments.min_lsn_of(segment))
+            .min()
+    }
+
+    /// Note that a rewrite checked every tombstone in a segment and carried them all
+    pub fn settle_graves(&self, segment: SegmentId) {
+        self.segments.settle_graves(segment);
+    }
+
+    /// Put every segment's tombstones back up for a check
+    pub fn rearm_graves(&self) {
+        self.segments.rearm_graves();
+    }
+
+    /// How many segments holding data rows have retired since the open
+    pub fn data_retired_count(&self) -> u64 {
+        self.data_retired.load(Ordering::Acquire)
+    }
+
+    /// How many sealed footers have been handed over since the open
+    pub fn handover_count(&self) -> u64 {
+        self.handovers.load(Ordering::Acquire)
+    }
+
+    /// Remember a sealed tombstone that hides nothing, by where its record lies
+    pub fn note_droppable_grave(&self, segment: SegmentId, offset: u32) {
+        lock(&self.droppable_graves)
+            .entry(segment)
+            .or_default()
+            .insert(offset);
+    }
+
+    /// Whether the tombstone at this place was found to hide nothing
+    pub fn is_droppable_grave(&self, segment: SegmentId, offset: u32) -> bool {
+        lock(&self.droppable_graves)
+            .get(&segment)
+            .is_some_and(|covered| covered.contains(&offset))
+    }
+
     /// Whether a newer version of the key, data or grave, stands in the map or the spot index
     pub fn is_superseded(&self, key: &RecordKey, lsn: Lsn) -> Result<bool> {
         let Some(at) = self.slot(key.column) else {
@@ -1279,8 +1377,9 @@ impl ReelIndex {
         for (loc, least) in displaced.rebooked {
             self.indexes[at].rebook_paged(key, least, loc.len);
         }
-        for origin in displaced.graves {
+        for (origin, offset) in displaced.graves {
             self.segments.shadow_held(origin, self.indexes[at].span_of(0));
+            self.note_droppable_grave(origin, offset);
         }
         settled
     }
@@ -2036,6 +2135,12 @@ impl ReelIndex {
     /// Forget a segment's counters once its file has been unlinked
     pub fn forget_segment(&self, segment: SegmentId) {
         self.rebook_retiring(segment);
+        lock(&self.droppable_graves).remove(&segment);
+        // A segment of nothing but tombstones freed nothing a tombstone elsewhere could hide
+        let bytes = self.segments.bytes_of(segment);
+        if bytes.total() > bytes.held + bytes.held_dead {
+            self.data_retired.fetch_add(1, Ordering::AcqRel);
+        }
         self.segments.forget(segment);
         self.retired.fetch_add(1, Ordering::AcqRel);
         // A retired segment's footer goes with its file, so no search may reach it

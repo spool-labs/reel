@@ -186,8 +186,8 @@ pub struct Booking {
     /// The record whose slot came in, nothing for a tombstone or no slot
     pub came: Option<u32>,
 
-    /// The segment whose tombstone lost its slot to a newer version
-    pub grave_gone: Option<SegmentId>,
+    /// The segment and record offset of a tombstone that lost its slot to a newer version
+    pub grave_gone: Option<(SegmentId, u32)>,
 }
 
 /// Rows left unsettled, bookings for the rest, and each losing version with the lsn that beat it
@@ -205,8 +205,8 @@ pub struct Displaced {
     /// Records earlier booked from their class, each at true length beside the least booked
     pub rebooked: Vec<(Loc, u32)>,
 
-    /// Segments whose tombstone lost its slot, one entry per grave taken out
-    pub graves: Vec<SegmentId>,
+    /// Where each tombstone that lost its slot lies, as its segment and record offset
+    pub graves: Vec<(SegmentId, u32)>,
 }
 
 /// A class booking corrected by a retiring segment's footer
@@ -1543,7 +1543,7 @@ impl SpotColumn {
                     table.insert(slot);
                     Booking {
                         gone: (!head.is_tombstone).then_some(head.len),
-                        grave_gone: head.is_tombstone.then_some(held.segment()),
+                        grave_gone: head.is_tombstone.then_some((held.segment(), held.offset)),
                         ..came
                     }
                 }
@@ -1718,7 +1718,7 @@ impl SpotColumn {
                     settled.rebooked.push((loc, took.least()));
                     self.unslack(&took);
                 }
-                Some(_) if slot.is_grave() => settled.graves.push(slot.segment()),
+                Some(_) if slot.is_grave() => settled.graves.push((slot.segment(), slot.offset)),
                 Some(_) => settled.booked.push(loc),
                 None => {}
             }

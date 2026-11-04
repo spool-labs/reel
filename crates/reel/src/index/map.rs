@@ -256,6 +256,10 @@ pub struct ReelIndex {
     /// Sealed versions a tail outversions, taken out of the spot index once its load settles
     shadowed: Mutex<Vec<(usize, KeyBytes, Loc)>>,
 
+    /// Data rows a rewrite copied into segments the footers cannot answer for yet, by segment,
+    /// the hash of the key and the oldest number copied, taken out at the hand-over
+    relocated: Mutex<HashMap<SegmentId, HashMap<u64, u64>>>,
+
     /// Held while a batch moves the maps, so no spanning read sees part of one
     publish: PublishBarrier,
 
@@ -363,6 +367,7 @@ impl ReelIndex {
             segments: Arc::new(SegmentTable::new()),
             footers: OnceLock::new(),
             shadowed: Mutex::new(Vec::new()),
+            relocated: Mutex::new(HashMap::new()),
             publish: PublishBarrier::new(),
             handing: RwLock::new(()),
             installs: AtomicU64::new(0),
@@ -428,6 +433,7 @@ impl ReelIndex {
             self.key_runs.install_set(&fresh.key_runs);
             std::mem::swap(&mut *lock(&self.run_picks), &mut *lock(&fresh.run_picks));
             std::mem::swap(&mut *lock(&self.shadowed), &mut *lock(&fresh.shadowed));
+            std::mem::swap(&mut *lock(&self.relocated), &mut *lock(&fresh.relocated));
             self.segments.install(&fresh.segments);
             let ready = fresh.spot_ready.load(Ordering::Acquire);
             self.spot_ready.store(ready, Ordering::Release);
@@ -683,11 +689,15 @@ impl ReelIndex {
         }
     }
 
-    /// Size the spot index from the first sealed footer of an open, since segments run to one size
-    pub fn reserve_fast(&self, footer: &SegmentFooter, segments: usize) {
+    /// Size the spot index from the first sealed footer of an open: one segment's rows, and the
+    /// load grows the shards by rungs from there
+    ///
+    /// Sizing for every row of every footer took a slot for each grave and dead version as well,
+    /// which the load's end drops: 3.3 GB on a node of 106M rows, for 60 MB kept
+    pub fn reserve_fast(&self, footer: &SegmentFooter) {
         for partition in &footer.partitions {
             if let Some(at) = self.slot(partition.column) {
-                self.spot[at].reserve((partition.len() * segments) as u64);
+                self.spot[at].reserve(partition.len() as u64);
             }
         }
     }
@@ -1136,6 +1146,7 @@ impl ReelIndex {
         self.segments.note_max(segment, footer.max_lsn);
         // From here the footers answer for this segment's rows
         self.handovers.fetch_add(1, Ordering::AcqRel);
+        lock(&self.relocated).remove(&segment);
         for partition in &footer.partitions {
             let Some((lowest, highest)) = partition.key_range() else {
                 continue;
@@ -1248,19 +1259,70 @@ impl ReelIndex {
         Ok(Some((false, older.is_some_and(|entry| !entry.is_grave()))))
     }
 
-    /// The oldest fresh data row in any segment whose rows the footers cannot answer for yet:
-    /// an open tail, or a sealed segment the index has not been handed. A tombstone at or past
-    /// it may still hide a row there. A copy keeps the number it was written under and was live
-    /// when it moved, so no tombstone hides it, and a rewrite's own output holds no floor
+    /// The segments whose rows the footers cannot answer for yet, other than one: the open
+    /// tails, and sealed segments the index has not been handed
+    pub fn unhanded_segments(&self, excluding: SegmentId) -> Vec<SegmentId> {
+        self.segments_snapshot()
+            .into_iter()
+            .map(|(segment, _)| segment)
+            .filter(|segment| *segment != excluding && !self.holds_sealed(*segment))
+            .collect()
+    }
+
+    /// The oldest fresh data row in any segment whose rows the footers cannot answer for yet.
+    /// A tombstone at or past it may still hide a row there. A copy keeps the number it was
+    /// written under and is noted by key instead, since a floor over copies would hold every
+    /// tombstone behind the first one carried
     ///
     /// Fresh rows only take newer numbers, so the floor rises as segments seal and hand over,
     /// and a pass can read it once
     pub fn unheld_floor(&self, excluding: SegmentId) -> Option<Lsn> {
-        self.segments_snapshot()
+        self.unhanded_segments(excluding)
             .into_iter()
-            .filter(|(segment, _)| *segment != excluding && !self.holds_sealed(*segment))
-            .filter_map(|(segment, _)| self.segments.fresh_min_of(segment))
+            .filter_map(|segment| self.segments.fresh_min_of(segment))
             .min()
+    }
+
+    /// Note a data row a rewrite copied into a segment under the number it was written with. A
+    /// delete after the copy must find it there until the footers answer for the segment
+    pub fn note_relocated(&self, key: &RecordKey, loc: Loc, lsn: Lsn) {
+        let mut relocated = lock(&self.relocated);
+        let oldest = relocated
+            .entry(loc.segment)
+            .or_default()
+            .entry(Self::relocated_hash(key))
+            .or_insert(u64::MAX);
+        *oldest = (*oldest).min(lsn.as_u64());
+    }
+
+    /// Note every copy of a run under one lock
+    pub fn note_relocated_run(&self, repoints: &[KeyRepoint]) {
+        let mut relocated = lock(&self.relocated);
+        for repoint in repoints {
+            let oldest = relocated
+                .entry(repoint.to.segment)
+                .or_default()
+                .entry(Self::relocated_hash(&repoint.key))
+                .or_insert(u64::MAX);
+            *oldest = (*oldest).min(repoint.lsn.as_u64());
+        }
+    }
+
+    /// Whether a segment the footers cannot answer for yet holds a copy of the key older than `lsn`
+    pub fn holds_relocated_older(&self, segment: SegmentId, key: &RecordKey, lsn: Lsn) -> bool {
+        lock(&self.relocated)
+            .get(&segment)
+            .and_then(|rows| rows.get(&Self::relocated_hash(key)))
+            .is_some_and(|oldest| *oldest < lsn.as_u64())
+    }
+
+    /// The hash a copied row is noted under, over the column and the key
+    fn relocated_hash(key: &RecordKey) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.column.as_u8().hash(&mut hasher);
+        key.as_slice().hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Note that a rewrite checked every tombstone in a segment and carried them all
@@ -2140,6 +2202,7 @@ impl ReelIndex {
     pub fn forget_segment(&self, segment: SegmentId) {
         self.rebook_retiring(segment);
         lock(&self.droppable_graves).remove(&segment);
+        lock(&self.relocated).remove(&segment);
         // A segment of nothing but tombstones freed nothing a tombstone elsewhere could hide
         let bytes = self.segments.bytes_of(segment);
         if bytes.total() > bytes.held + bytes.held_dead {

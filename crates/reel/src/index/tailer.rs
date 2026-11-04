@@ -257,6 +257,7 @@ fn apply_one(
 
     // A relocation is the same version in a new place, so the key follows it
     if record.flags.is_relocated() {
+        index.note_relocated(&record.key, record.loc, record.lsn);
         let from = index.retired_source(&record.key, retired, record.loc.len);
         if index.repoint(&record.key, from, record.loc, record.lsn)? {
             return Ok(true);

@@ -680,6 +680,7 @@ impl Compactor {
             // Read once for the pass: a rewrite's own copies would drag it down for every grave
             // behind the first one carried, and fresh rows only ever raise it
             unheld: index.unheld_floor(segment),
+            unhanded: index.unhanded_segments(segment),
         };
         // A segment whose tombstones no rewrite has checked gets a probe first: when none of them
         // would drop and nothing else here is dead enough, it settles instead of being copied
@@ -697,7 +698,7 @@ impl Compactor {
                             continue;
                         }
                         let at = (segment, entry.offset);
-                        if !should_carry(reel, index, &entry.key, entry.lsn, entry.flags, at, floors)? {
+                        if !should_carry(reel, index, &entry.key, entry.lsn, entry.flags, at, &floors)? {
                             would_drop = true;
                             break 'probe;
                         }
@@ -782,7 +783,7 @@ impl Compactor {
                     layout: source.layout(),
                 },
                 segment,
-                floors,
+                &floors,
                 &mut tally,
                 &mut pace,
             ),
@@ -792,7 +793,7 @@ impl Compactor {
                 index,
                 &mut reader,
                 segment,
-                floors,
+                &floors,
                 &mut tally,
                 &mut pace,
             ),
@@ -879,7 +880,7 @@ impl Compactor {
         reader: &mut SegmentReader<'_>,
         ordered: Ordered<'_>,
         segment: SegmentId,
-        floors: PassFloors,
+        floors: &PassFloors,
         tally: &mut PassTally,
         pace: &mut PassPace<'_>,
     ) -> Result<()> {
@@ -1002,7 +1003,7 @@ impl Compactor {
         index: &ReelIndex,
         reader: &mut SegmentReader<'_>,
         segment: SegmentId,
-        floors: PassFloors,
+        floors: &PassFloors,
         tally: &mut PassTally,
         pace: &mut PassPace<'_>,
     ) -> Result<()> {
@@ -1033,7 +1034,7 @@ impl Compactor {
         record: SourceRecord,
         staged: Option<Part>,
         segment: SegmentId,
-        floors: PassFloors,
+        floors: &PassFloors,
         run: &mut CopyRun,
         tally: &mut PassTally,
     ) -> Result<()> {
@@ -1084,6 +1085,8 @@ impl Compactor {
             tally.copied_bytes += span;
         }
         let published = index.repoint_run(&run.repoints);
+        // The copies are down whatever the repoint did, so a delete after them must find them
+        index.note_relocated_run(&run.repoints);
         run.repoints.clear();
         published?;
         tally.had_live = true;
@@ -1101,7 +1104,7 @@ impl Compactor {
         record: SourceRecord,
         staged: Option<Part>,
         segment: SegmentId,
-        floors: PassFloors,
+        floors: &PassFloors,
         run: &mut CopyRun,
     ) -> Result<Rewrote> {
         if record.header.flags.is_tombstone() || record.header.flags.is_range_tombstone() {
@@ -1356,7 +1359,7 @@ impl Compactor {
         record: &SourceRecord,
         staged: Option<Part>,
         segment: SegmentId,
-        floors: PassFloors,
+        floors: &PassFloors,
     ) -> Result<TombstoneStep> {
         if !should_carry(
             reel,
@@ -1851,7 +1854,7 @@ fn should_carry(
     lsn: Lsn,
     flags: Flags,
     at: (SegmentId, u32),
-    floors: PassFloors,
+    floors: &PassFloors,
 ) -> Result<bool> {
     if flags.is_tombstone() {
         // An open tail's version of the key settles it: a newer one hides whatever this did, an
@@ -1876,8 +1879,13 @@ fn should_carry(
             if newer {
                 return Ok(false);
             }
-            // A row in an open tail or a segment not yet handed over is past the footers' reach
-            let unheld = floors.unheld.is_some_and(|floor| lsn >= floor);
+            // A row in an open tail or a segment not yet handed over is past the footers' reach:
+            // a fresh one holds the floor, a copy keeps its old number and is found by key
+            let unheld = floors.unheld.is_some_and(|floor| lsn >= floor)
+                || floors
+                    .unhanded
+                    .iter()
+                    .any(|segment| index.holds_relocated_older(*segment, key, lsn));
             return Ok(older || unheld || lsn >= settled);
         }
     }
@@ -1899,13 +1907,15 @@ fn should_carry(
 }
 
 /// The marks one pass decides every tombstone against, read once before its first record
-#[derive(Clone, Copy)]
 struct PassFloors {
     /// Nothing older than this can land anywhere else, so a tombstone below it may drop
     drop: Lsn,
 
     /// The oldest fresh data row past the footers' reach, or none
     unheld: Option<Lsn>,
+
+    /// The segments past the footers' reach, where a copy of a key may sit under its old number
+    unhanded: Vec<SegmentId>,
 }
 
 /// A rewrite seals its destination once it holds this many carried tombstones, the tick's grave seal

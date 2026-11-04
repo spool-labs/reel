@@ -175,7 +175,7 @@ pub fn rebuild_reel(
                     }
                     sealed_files.push((*segment, path.clone(), cut.unwrap_or(*len)));
                     if !is_sized {
-                        index.reserve_fast(&footer, jobs.len());
+                        index.reserve_fast(&footer);
                         is_sized = true;
                     }
                     // Loaders receive until the queue closes, so a send always finds a receiver
@@ -683,9 +683,9 @@ fn feed_part(
     let tally = Tally::new(index.segments());
     let mut highest = Lsn::NONE;
     merge_cursors(&mut mine, |cursor| {
-        cursor.put_with(|key, loc, lsn, is_delete| {
+        cursor.put_with(|key, loc, lsn, flags| {
             highest = highest.max(lsn);
-            queue.push(index, &tally, key, loc, lsn, is_delete);
+            queue.push(index, &tally, key, loc, lsn, flags);
         })
     })?;
     queue.flush_into(index, &tally);
@@ -790,19 +790,19 @@ impl<'a> Cursor<'a> {
     }
 
     /// Hand the row here to `put`, skipping a range, which stands when its segment is held
-    fn put_with(&self, put: impl FnOnce(&'a [u8], Loc, Lsn, bool)) -> Result<()> {
+    fn put_with(&self, put: impl FnOnce(&'a [u8], Loc, Lsn, Flags)) -> Result<()> {
         let found = self.partition.row_at(self.row())?;
         if !found.flags.is_range_tombstone() {
             let key = self.key().unwrap_or_default();
             let loc = Loc::new(self.segment, found.offset, found.len);
-            put(key, loc, found.lsn, found.flags.is_tombstone());
+            put(key, loc, found.lsn, found.flags);
         }
         Ok(())
     }
 
     fn feed(&self, resolver: &mut Resolver<'_>) -> Result<()> {
         let column = self.partition.column;
-        self.put_with(|key, loc, lsn, is_delete| resolver.put(column, key, loc, lsn, is_delete))
+        self.put_with(|key, loc, lsn, flags| resolver.put(column, key, loc, lsn, flags))
     }
 }
 
@@ -1409,14 +1409,14 @@ impl<'a> Resolver<'a> {
     }
 
     /// Queue one record or point tombstone for its column's map
-    fn put(&mut self, column: ColumnId, key: &[u8], loc: Loc, lsn: Lsn, is_delete: bool) {
+    fn put(&mut self, column: ColumnId, key: &[u8], loc: Loc, lsn: Lsn, flags: Flags) {
         self.see(lsn);
         if column != self.queue.column {
             self.flush();
             self.queue.column = column;
         }
         self.queue
-            .push(self.index, self.index.segments(), key, loc, lsn, is_delete);
+            .push(self.index, self.index.segments(), key, loc, lsn, flags);
     }
 
     /// Stand one range as a cover, after everything queued ahead of it
@@ -1459,7 +1459,7 @@ impl<'a> Resolver<'a> {
 struct KeyQueue {
     column: ColumnId,
     keys: Vec<u8>,
-    rows: Vec<(usize, Loc, Lsn, bool)>,
+    rows: Vec<(usize, Loc, Lsn, Flags)>,
     landed: Vec<Landed>,
     undeclared: Option<ColumnId>,
 }
@@ -1473,14 +1473,14 @@ impl KeyQueue {
         key: &[u8],
         loc: Loc,
         lsn: Lsn,
-        is_delete: bool,
+        flags: Flags,
     ) {
         if self.rows.len() == BATCH {
             self.flush_into(index, segments);
         }
         self.keys.extend_from_slice(key);
         let end = self.keys.len();
-        self.rows.push((end, loc, lsn, is_delete));
+        self.rows.push((end, loc, lsn, flags));
     }
 
     /// Apply what is queued in order, booked straight into the segment table
@@ -1493,13 +1493,31 @@ impl KeyQueue {
         if self.rows.is_empty() {
             return;
         }
+        // A tail's rows are past the footers' reach until it seals and hands over: a fresh data
+        // row holds the tombstone floor, and a copy is noted by key under its old number
+        let mut start = 0;
+        for &(end, loc, lsn, flags) in &self.rows {
+            let key = &self.keys[start..end];
+            start = end;
+            if flags.is_tombstone() {
+                continue;
+            }
+            match flags.is_relocated() {
+                true => {
+                    if let Ok(key) = RecordKey::from_bytes(self.column, key) {
+                        index.note_relocated(&key, loc, lsn);
+                    }
+                }
+                false => index.segments().note_fresh(loc.segment, lsn),
+            }
+        }
         match index.column(self.column) {
             Some(column) => {
                 let mut start = 0;
                 let moves: Vec<KeyMove<'_>> = self
                     .rows
                     .iter()
-                    .map(|&(end, loc, lsn, is_delete)| {
+                    .map(|&(end, loc, lsn, flags)| {
                         let key = &self.keys[start..end];
                         start = end;
                         KeyMove {
@@ -1507,7 +1525,7 @@ impl KeyQueue {
                             key,
                             loc,
                             lsn,
-                            is_delete,
+                            is_delete: flags.is_tombstone(),
                         }
                     })
                     .collect();
@@ -1518,10 +1536,10 @@ impl KeyQueue {
             None => {
                 self.undeclared.get_or_insert(self.column);
                 let mut start = 0;
-                for &(end, loc, lsn, is_delete) in &self.rows {
+                for &(end, loc, lsn, flags) in &self.rows {
                     let span = span_of((end - start) as u16, loc.len);
                     start = end;
-                    match is_delete {
+                    match flags.is_tombstone() {
                         true => segments.mark_held(loc.segment, lsn, span),
                         false => segments.mark_live(loc.segment, lsn, span),
                     }

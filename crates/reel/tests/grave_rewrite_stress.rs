@@ -5,8 +5,9 @@
 //! GRAVE_REWRITE_SEGMENT and GRAVE_REWRITE_FOOTER_CACHE scale it. GRAVE_REWRITE_LAG deletes each
 //! key that many puts after it lands, so a segment holds graves over data standing in the one
 //! before it, as on a node that deletes while it writes; with ROUNDS=0 that is the only delete.
-//! GRAVE_REWRITE_DEAD_RATIO_PCT sets the rewrite ratio. GRAVE_REWRITE_REPORT=1 prints the readings
-//! and skips the gates.
+//! GRAVE_REWRITE_DEAD_RATIO_PCT sets the rewrite ratio. GRAVE_REWRITE_OPEN_ONLY=1 stops after the
+//! reopen, for measuring the open alone. GRAVE_REWRITE_REPORT=1 prints the readings and skips the
+//! gates.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -264,13 +265,39 @@ fn rewrite_through_repeat_graves() {
     let began = Instant::now();
     store.close().expect("close");
     drop(store);
+    let before_open = reset_peak();
     let store = ReelStore::open(root.clone(), config(), COLUMNS).expect("reopen");
+    let open_peak = PEAK.load(Ordering::Relaxed);
     let after_open = reset_peak();
     println!(
-        "close and reopen {:.1}s, heap after open {} MiB",
+        "close and reopen {:.1}s, heap after open {} MiB, open peak {} MiB over {} MiB before",
         began.elapsed().as_secs_f64(),
-        after_open >> 20
+        after_open >> 20,
+        open_peak >> 20,
+        before_open >> 20
     );
+    // The open takes one slot a distinct key, graves included until the load ends, and grows the
+    // shards by rungs from one segment's rows. Its pipeline holds ten parsed footers with their
+    // shard scratch, about 100 B a row of a segment, whatever the volume holds. With key runs
+    // covering the segments it loads only the picked rows; without them every row past the first
+    // of a key waits set aside until the load ends, about 100 B each
+    if !report_only {
+        let per_segment = rows_before as usize / sealed.max(1);
+        let pipeline = 10 * 100 * per_segment;
+        let aside = match merges {
+            0 => 100 * (rows_before - keys) as usize,
+            _ => 0,
+        };
+        assert!(
+            open_peak <= after_open + 48 * keys as usize + pipeline + aside + (64 << 20),
+            "the open peaked at {} MiB against {} MiB after it, for {keys} keys, {per_segment} rows a segment and {merges} key run merges",
+            open_peak >> 20,
+            after_open >> 20
+        );
+    }
+    if env("GRAVE_REWRITE_OPEN_ONLY", 0) == 1 {
+        return;
+    }
 
     let began = Instant::now();
     let probes_before = store.filter_probes();

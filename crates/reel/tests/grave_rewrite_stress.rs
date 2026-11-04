@@ -2,8 +2,11 @@
 //!
 //! Run with `cargo test --release -p tape-reel --test grave_rewrite_stress -- --ignored --nocapture`.
 //! GRAVE_REWRITE_KEYS (default 2M, 24M for 100M rows), GRAVE_REWRITE_ROUNDS, GRAVE_REWRITE_SEAL_EVERY,
-//! GRAVE_REWRITE_SEGMENT and GRAVE_REWRITE_FOOTER_CACHE scale it. GRAVE_REWRITE_REPORT=1 prints
-//! the readings and skips the gates.
+//! GRAVE_REWRITE_SEGMENT and GRAVE_REWRITE_FOOTER_CACHE scale it. GRAVE_REWRITE_LAG deletes each
+//! key that many puts after it lands, so a segment holds graves over data standing in the one
+//! before it, as on a node that deletes while it writes; with ROUNDS=0 that is the only delete.
+//! GRAVE_REWRITE_DEAD_RATIO_PCT sets the rewrite ratio. GRAVE_REWRITE_REPORT=1 prints the readings
+//! and skips the gates.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -88,6 +91,7 @@ fn config() -> ReelConfig {
         // Unpaced, so the scrub that counts dead bytes behind key runs finishes within the run
         scrub_mbps: 1 << 20,
         active_tails: ThreadBudget::threads(1),
+        compact_dead_ratio: env("GRAVE_REWRITE_DEAD_RATIO_PCT", 50) as f64 / 100.0,
         ..ReelConfig::default()
     }
 }
@@ -203,6 +207,7 @@ fn rewrite_through_repeat_graves() {
     let keys = env("GRAVE_REWRITE_KEYS", 2_000_000);
     let rounds = env("GRAVE_REWRITE_ROUNDS", 4);
     let seal_every = env("GRAVE_REWRITE_SEAL_EVERY", 300_000);
+    let lag = env("GRAVE_REWRITE_LAG", 0);
     let report_only = env("GRAVE_REWRITE_REPORT", 0) == 1;
     let dir = TempDir::new().expect("temp dir");
     let root = dir.path().to_path_buf();
@@ -211,8 +216,17 @@ fn rewrite_through_repeat_graves() {
     let began = Instant::now();
     for n in 0..keys {
         Store::put(&store, "slice", &key(n), &n.to_le_bytes()).expect("put");
+        if lag > 0 && n >= lag && !stays(n - lag) {
+            Store::delete(&store, "slice", &key(n - lag)).expect("delete");
+        }
         if n % seal_every == seal_every - 1 {
             drop(store.cue().expect("seal"));
+        }
+    }
+    // The last keys never fell a lag behind a put, so they go now
+    if lag > 0 {
+        for n in (keys.saturating_sub(lag)..keys).filter(|n| !stays(*n)) {
+            Store::delete(&store, "slice", &key(n)).expect("delete");
         }
     }
     store.flush().expect("flush");
@@ -346,6 +360,13 @@ fn rewrite_through_repeat_graves() {
     assert!(
         map_reads * 100 <= touched.max(1),
         "{map_reads} footer map reads for {touched} graves: the rewrite reads footers per grave"
+    );
+    // A grave over data in a segment still standing is carried once. A carried grave that
+    // dragged its destination's floor down would carry the rest of its pass with it
+    assert!(
+        counters.tombstones_carried <= graves,
+        "{} carries for {graves} graves: a carried grave carried the graves behind it",
+        counters.tombstones_carried
     );
     assert!(
         rows_after * 100 <= rows_before * 15,

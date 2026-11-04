@@ -780,6 +780,9 @@ impl Appender {
                 let loc = outcome?;
                 // The bytes are down, so the segment may surface this number now
                 self.shared.note_landed(loc.segment, lsn);
+                if header.flags.is_data() && !header.flags.is_relocated() {
+                    self.shared.note_fresh_landed(loc.segment, lsn);
+                }
                 self.tail.publish_committed(base + span);
                 let is_paced = self.paced_writeback(&active);
                 let is_owed = match commit {
@@ -913,6 +916,14 @@ impl Appender {
                 // Copies keep their own numbers, so note the oldest
                 if let Some(oldest) = headers.iter().map(|header| header.lsn).min() {
                     self.shared.note_landed(active.handle.id(), oldest);
+                }
+                let fresh = headers
+                    .iter()
+                    .filter(|header| header.flags.is_data() && !header.flags.is_relocated())
+                    .map(|header| header.lsn)
+                    .min();
+                if let Some(oldest) = fresh {
+                    self.shared.note_fresh_landed(active.handle.id(), oldest);
                 }
                 self.tail.publish_committed(base + span);
                 let is_paced = self.paced_writeback(&active);

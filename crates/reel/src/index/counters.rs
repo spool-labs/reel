@@ -147,6 +147,11 @@ struct SegmentRow {
     /// The oldest data version the segment can still surface, or `u64::MAX` before any
     min_lsn: AtomicU64,
 
+    /// The oldest data row written fresh into the segment, or `u64::MAX` before any. A copy
+    /// keeps the number it was written under and needs no tombstone over it, so copies leave
+    /// this alone
+    fresh_min: AtomicU64,
+
     /// The newest lsn in the segment's sealed footer, or zero for none
     max_lsn: AtomicU64,
 
@@ -172,6 +177,7 @@ impl SegmentRow {
             held: AtomicU64::new(0),
             held_dead: AtomicU64::new(0),
             min_lsn: AtomicU64::new(u64::MAX),
+            fresh_min: AtomicU64::new(u64::MAX),
             max_lsn: AtomicU64::new(Lsn::NONE.as_u64()),
             sealed_at: AtomicU64::new(Lsn::NONE.as_u64()),
             held_lsn: AtomicU64::new(Lsn::NONE.as_u64()),
@@ -255,6 +261,7 @@ impl SegmentRow {
         self.held.store(0, Ordering::Release);
         self.held_dead.store(0, Ordering::Release);
         self.min_lsn.store(u64::MAX, Ordering::Release);
+        self.fresh_min.store(u64::MAX, Ordering::Release);
         self.max_lsn.store(Lsn::NONE.as_u64(), Ordering::Release);
         self.sealed_at.store(Lsn::NONE.as_u64(), Ordering::Release);
         self.held_lsn.store(Lsn::NONE.as_u64(), Ordering::Release);
@@ -273,6 +280,20 @@ impl SegmentRow {
     fn note_min(&self, lsn: Lsn) {
         if lsn.0 < self.min_lsn.load(Ordering::Acquire) {
             self.min_lsn.fetch_min(lsn.0, Ordering::AcqRel);
+        }
+    }
+
+    fn fresh_min(&self) -> Option<Lsn> {
+        match self.fresh_min.load(Ordering::Acquire) {
+            u64::MAX => None,
+            min => Some(Lsn(min)),
+        }
+    }
+
+    /// Note a data row written fresh here, under a number drawn for it
+    fn note_fresh(&self, lsn: Lsn) {
+        if lsn.0 < self.fresh_min.load(Ordering::Acquire) {
+            self.fresh_min.fetch_min(lsn.0, Ordering::AcqRel);
         }
     }
 }
@@ -572,6 +593,11 @@ impl SegmentTable {
         self.opened(segment, |row| row.note_min(lsn));
     }
 
+    /// Note a data row written fresh into a segment, which a tombstone past it may still hide
+    pub fn note_fresh(&self, segment: SegmentId, lsn: Lsn) {
+        self.opened(segment, |row| row.note_fresh(lsn));
+    }
+
     /// Raise a segment's ceiling to the newest row its sealed footer holds
     pub fn note_max(&self, segment: SegmentId, lsn: Lsn) {
         // An empty footer bounds nothing, and opening a row would rank a segment with no bytes
@@ -648,6 +674,11 @@ impl SegmentTable {
     /// The oldest record this segment can still surface
     pub fn min_lsn_of(&self, segment: SegmentId) -> Option<Lsn> {
         read(&self.window).counted(segment)?.min_lsn()
+    }
+
+    /// The oldest data row written fresh into this segment, with every copy left out
+    pub fn fresh_min_of(&self, segment: SegmentId) -> Option<Lsn> {
+        read(&self.window).counted(segment)?.fresh_min()
     }
 
     /// Reclaimable bytes across every segment, the dead-space gauge

@@ -673,9 +673,14 @@ impl Compactor {
         }
         // A number drawn before this pass may land after it, so the floor is capped at settled
         let settled = shared.settled_below();
-        let drop_floor = index
-            .min_lsn_excluding(segment)
-            .map_or(settled, |floor| floor.min(settled));
+        let floors = PassFloors {
+            drop: index
+                .min_lsn_excluding(segment)
+                .map_or(settled, |floor| floor.min(settled)),
+            // Read once for the pass: a rewrite's own copies would drag it down for every grave
+            // behind the first one carried, and fresh rows only ever raise it
+            unheld: index.unheld_floor(segment),
+        };
         // A segment whose tombstones no rewrite has checked gets a probe first: when none of them
         // would drop and nothing else here is dead enough, it settles instead of being copied
         let bytes = index.segment_bytes(segment);
@@ -692,7 +697,7 @@ impl Compactor {
                             continue;
                         }
                         let at = (segment, entry.offset);
-                        if !should_carry(reel, index, &entry.key, entry.lsn, entry.flags, at, drop_floor)? {
+                        if !should_carry(reel, index, &entry.key, entry.lsn, entry.flags, at, floors)? {
                             would_drop = true;
                             break 'probe;
                         }
@@ -777,7 +782,7 @@ impl Compactor {
                     layout: source.layout(),
                 },
                 segment,
-                drop_floor,
+                floors,
                 &mut tally,
                 &mut pace,
             ),
@@ -787,7 +792,7 @@ impl Compactor {
                 index,
                 &mut reader,
                 segment,
-                drop_floor,
+                floors,
                 &mut tally,
                 &mut pace,
             ),
@@ -874,7 +879,7 @@ impl Compactor {
         reader: &mut SegmentReader<'_>,
         ordered: Ordered<'_>,
         segment: SegmentId,
-        drop_floor: Lsn,
+        floors: PassFloors,
         tally: &mut PassTally,
         pace: &mut PassPace<'_>,
     ) -> Result<()> {
@@ -974,7 +979,7 @@ impl Compactor {
                     },
                 };
                 self.apply_one(
-                    reel, dest_index, index, reader, record, payload, segment, drop_floor,
+                    reel, dest_index, index, reader, record, payload, segment, floors,
                     &mut run, tally,
                 )?;
                 pace.reached(reader.read_bytes() + tally.copied_bytes);
@@ -997,7 +1002,7 @@ impl Compactor {
         index: &ReelIndex,
         reader: &mut SegmentReader<'_>,
         segment: SegmentId,
-        drop_floor: Lsn,
+        floors: PassFloors,
         tally: &mut PassTally,
         pace: &mut PassPace<'_>,
     ) -> Result<()> {
@@ -1010,7 +1015,7 @@ impl Compactor {
             }
             at = u64::from(record.offset) + record.header.span();
             self.apply_one(
-                reel, dest_index, index, reader, record, None, segment, drop_floor, &mut run, tally,
+                reel, dest_index, index, reader, record, None, segment, floors, &mut run, tally,
             )?;
             pace.reached(reader.read_bytes() + tally.copied_bytes);
         }
@@ -1028,7 +1033,7 @@ impl Compactor {
         record: SourceRecord,
         staged: Option<Part>,
         segment: SegmentId,
-        drop_floor: Lsn,
+        floors: PassFloors,
         run: &mut CopyRun,
         tally: &mut PassTally,
     ) -> Result<()> {
@@ -1038,7 +1043,7 @@ impl Compactor {
             self.land_run(reel, dest_index, index, segment, run, tally)?;
         }
         match self.rewrite_one(
-            reel, dest_index, index, reader, record, staged, segment, drop_floor, run,
+            reel, dest_index, index, reader, record, staged, segment, floors, run,
         )? {
             Rewrote::Queued | Rewrote::Skipped => {}
             Rewrote::Carried => tally.carried += 1,
@@ -1096,13 +1101,13 @@ impl Compactor {
         record: SourceRecord,
         staged: Option<Part>,
         segment: SegmentId,
-        drop_floor: Lsn,
+        floors: PassFloors,
         run: &mut CopyRun,
     ) -> Result<Rewrote> {
         if record.header.flags.is_tombstone() || record.header.flags.is_range_tombstone() {
             return Ok(
                 match self
-                    .carry_or_drop(reel, dest_index, index, reader, &record, staged, segment, drop_floor)?
+                    .carry_or_drop(reel, dest_index, index, reader, &record, staged, segment, floors)?
                 {
                     TombstoneStep::Carried => Rewrote::Carried,
                     TombstoneStep::Dropped => Rewrote::Dropped,
@@ -1351,7 +1356,7 @@ impl Compactor {
         record: &SourceRecord,
         staged: Option<Part>,
         segment: SegmentId,
-        drop_floor: Lsn,
+        floors: PassFloors,
     ) -> Result<TombstoneStep> {
         if !should_carry(
             reel,
@@ -1360,7 +1365,7 @@ impl Compactor {
             record.header.lsn,
             record.header.flags,
             (segment, record.offset),
-            drop_floor,
+            floors,
         )? {
             // Nothing older is left for the grave to hide, and the retire removes its origin
             if record.header.flags.is_tombstone() {
@@ -1846,7 +1851,7 @@ fn should_carry(
     lsn: Lsn,
     flags: Flags,
     at: (SegmentId, u32),
-    drop_floor: Lsn,
+    floors: PassFloors,
 ) -> Result<bool> {
     if flags.is_tombstone() {
         // An open tail's version of the key settles it: a newer one hides whatever this did, an
@@ -1872,12 +1877,12 @@ fn should_carry(
                 return Ok(false);
             }
             // A row in an open tail or a segment not yet handed over is past the footers' reach
-            let unheld = index.unheld_floor(at.0).is_some_and(|floor| lsn >= floor);
+            let unheld = floors.unheld.is_some_and(|floor| lsn >= floor);
             return Ok(older || unheld || lsn >= settled);
         }
     }
     // With no footers to ask, or for a range, the floor and the key runs decide as before
-    if lsn >= drop_floor {
+    if lsn >= floors.drop {
         return Ok(true);
     }
     let key_runs = index.key_runs();
@@ -1891,6 +1896,16 @@ fn should_carry(
             &|segment| index.holds_sealed(segment),
         ),
     }
+}
+
+/// The marks one pass decides every tombstone against, read once before its first record
+#[derive(Clone, Copy)]
+struct PassFloors {
+    /// Nothing older than this can land anywhere else, so a tombstone below it may drop
+    drop: Lsn,
+
+    /// The oldest fresh data row past the footers' reach, or none
+    unheld: Option<Lsn>,
 }
 
 /// A rewrite seals its destination once it holds this many carried tombstones, the tick's grave seal
@@ -2880,6 +2895,66 @@ mod tests {
 
         let rebuilt = rebuilt_from(&fixture);
         assert!(!rebuilt_keys(&rebuilt).contains(&key_bytes(1)));
+    }
+
+    // a carried tombstone lands in the destination under its old number, and that number holds
+    // no floor against the tombstones behind it in the same pass
+    #[test]
+    fn a_carried_tombstone_holds_no_floor() {
+        let fixture = fixture(settings());
+        fixture.index.set_footers(Arc::clone(fixture.reel.shared()) as Arc<dyn FooterSource>);
+        put(&fixture, 1, vec![0x11; 200]);
+        seal(&fixture);
+        // one grave over a row standing in segment 1, then three over nothing
+        delete(&fixture, 1);
+        delete(&fixture, 7);
+        delete(&fixture, 8);
+        delete(&fixture, 9);
+        seal(&fixture);
+        put(&fixture, 3, vec![0x33; 200]);
+
+        fixture
+            .compactor
+            .compact_segment(&fixture.reel, &fixture.index, SegmentId(2))
+            .expect("compact");
+        fixture.reel.flush().expect("flush");
+
+        assert_eq!(fixture.compactor.counters().tombstones_carried, 1);
+        assert_eq!(fixture.compactor.counters().tombstones_dropped, 3);
+
+        let rebuilt = rebuilt_from(&fixture);
+        assert_eq!(rebuilt_keys(&rebuilt), vec![key_bytes(3)]);
+    }
+
+    // a copy in an open tail keeps its old number, and holds no floor against the tombstones a
+    // later pass decides
+    #[test]
+    fn a_copy_holds_no_floor_for_tombstones() {
+        let fixture = fixture(settings());
+        fixture.index.set_footers(Arc::clone(fixture.reel.shared()) as Arc<dyn FooterSource>);
+        put(&fixture, 1, vec![0x11; 200]);
+        seal(&fixture);
+        delete(&fixture, 7);
+        delete(&fixture, 8);
+        delete(&fixture, 9);
+        seal(&fixture);
+
+        // the copy of key 1 lands in the open tail under the number it was written with
+        fixture
+            .compactor
+            .compact_segment(&fixture.reel, &fixture.index, SegmentId(1))
+            .expect("compact");
+        fixture
+            .compactor
+            .compact_segment(&fixture.reel, &fixture.index, SegmentId(2))
+            .expect("compact");
+        fixture.reel.flush().expect("flush");
+
+        assert_eq!(fixture.compactor.counters().tombstones_carried, 0);
+        assert_eq!(fixture.compactor.counters().tombstones_dropped, 3);
+
+        let rebuilt = rebuilt_from(&fixture);
+        assert_eq!(rebuilt_keys(&rebuilt), vec![key_bytes(1)]);
     }
 
     // a tombstone below every other segment's oldest record is trimmed

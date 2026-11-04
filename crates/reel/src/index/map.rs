@@ -1248,14 +1248,18 @@ impl ReelIndex {
         Ok(Some((false, older.is_some_and(|entry| !entry.is_grave()))))
     }
 
-    /// The oldest number in any segment whose rows the footers cannot answer for yet: an open
-    /// tail, or a sealed segment the index has not been handed. A tombstone at or past it may
-    /// still hide a row there
+    /// The oldest fresh data row in any segment whose rows the footers cannot answer for yet:
+    /// an open tail, or a sealed segment the index has not been handed. A tombstone at or past
+    /// it may still hide a row there. A copy keeps the number it was written under and was live
+    /// when it moved, so no tombstone hides it, and a rewrite's own output holds no floor
+    ///
+    /// Fresh rows only take newer numbers, so the floor rises as segments seal and hand over,
+    /// and a pass can read it once
     pub fn unheld_floor(&self, excluding: SegmentId) -> Option<Lsn> {
         self.segments_snapshot()
             .into_iter()
             .filter(|(segment, _)| *segment != excluding && !self.holds_sealed(*segment))
-            .filter_map(|(segment, _)| self.segments.min_lsn_of(segment))
+            .filter_map(|(segment, _)| self.segments.fresh_min_of(segment))
             .min()
     }
 

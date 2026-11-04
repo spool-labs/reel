@@ -1413,6 +1413,13 @@ impl ReelShared {
         }
     }
 
+    /// Note a data row written fresh into a segment, as soon as its bytes land
+    pub fn note_fresh_landed(&self, segment: SegmentId, lsn: Lsn) {
+        if let Some(segments) = self.segments.get() {
+            segments.note_fresh(segment, lsn);
+        }
+    }
+
     /// A sealed segment's directory, read once and held for the life of the segment
     pub fn footer_map_of(&self, segment: SegmentId) -> Result<Option<Arc<FooterMap>>> {
         if let Some(map) = self.footers.map_of(segment) {

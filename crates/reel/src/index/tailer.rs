@@ -263,6 +263,10 @@ fn apply_one(
         }
     }
 
+    // A fresh row holds its segment's floor against the tombstones past it, a copy holds none
+    if !record.flags.is_relocated() {
+        index.segments().note_fresh(record.loc.segment, record.lsn);
+    }
     index.insert(&record.key, record.loc, record.lsn)
 }
 

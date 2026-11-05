@@ -1,2 +1,4 @@
 # Test targets every change must run to the end, one per line
 simulation
+unit
+api_unit

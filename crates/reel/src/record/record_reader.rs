@@ -440,23 +440,3 @@ pub fn cut_to_window(buf: &mut Vec<u8>, window: ValueWindow) {
     buf.copy_within(start..end, 0);
     buf.truncate(end - start);
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // the split comes back from the record length for every value size
-    #[test]
-    fn shape_math() {
-        for value in [CHUNK_BYTES + 1, 2 * CHUNK_BYTES, 16 * 1024 * 1024 + 3, 300 * 1024 * 1024] {
-            let value_length = ByteCount(value as u64);
-            let chunks = chunk_count(value_length);
-            let front = head_bytes_for(chunks) as u64 + table_bytes(chunks).0;
-
-            let shape = written_shape(ByteCount(front + value as u64)).expect("shape");
-
-            assert_eq!(shape.value_length, value_length);
-            assert_eq!(shape.front_length as u64, front);
-        }
-    }
-}

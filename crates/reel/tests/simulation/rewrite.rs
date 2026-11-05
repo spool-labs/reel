@@ -1572,3 +1572,32 @@ fn merge_ahead_of_a_walk_target() {
     drop(planner);
     store.close().expect("close");
 }
+
+// a key found in the newest segment stops the look there, so a read costs the distance to its previous version
+#[test]
+fn newest_first_stops() {
+    let io = SimulatedIo::new(Seed(60));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    for number in 0..MOST_OVERLAP as u64 {
+        store.put(COLUMN, b"a", b"low").expect("put");
+        store.put(COLUMN, b"m-shared", format!("{number}").as_bytes()).expect("put");
+        store.put(COLUMN, b"z", b"high").expect("put");
+        seal(&store, &io);
+    }
+
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let directory = state.directories[COLUMN.0 as usize].as_ref().expect("a directory");
+    let read = state.key_read_now(COLUMN, b"m-shared").expect("read");
+    let mut asked = 0;
+    let found = state.footer_readers.with(|reader| {
+        state.walk_candidates(directory, b"m-shared", reader, |segment, reader, best| {
+            asked += 1;
+            state.ask_segment(volume, &read, segment, reader, best)
+        })
+    });
+    assert_eq!(asked, 1);
+    assert!(found.expect("a read").is_some());
+    store.close().expect("close");
+}

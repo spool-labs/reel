@@ -394,6 +394,7 @@ impl<Backend: Io> SealJob<Backend> {
                 highest: column.highest,
                 reach: column.highest,
                 segment: target.number,
+                newest_place: totals.head.places.highest,
             };
             if let Some(directory) = &state.directories[column.column.0 as usize]
                 && !directory.replace(Some(&entry), &[])

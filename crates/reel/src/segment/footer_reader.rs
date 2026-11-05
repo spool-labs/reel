@@ -9,6 +9,7 @@ use crate::index::key_hash::KeyHash;
 use crate::io::IoFile;
 use crate::io::device_error::read_or_damaged;
 use crate::record::record_check::{Checksum, RecordKey, checksum};
+use crate::segment::column_directory::Candidate;
 use crate::segment::block_cache::{BlockCache, BlockKey};
 use crate::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry, KeyPrefix};
 use crate::segment::block_filter::{may_contain, open_filter};
@@ -90,7 +91,7 @@ pub struct FooterReader {
     block: Vec<u8>,
     filter: Vec<u8>,
     key: Vec<u8>,
-    pub candidates: Vec<SegmentNumber>,
+    pub candidates: Vec<Candidate>,
     pub found_block: u32,
 }
 
@@ -102,7 +103,7 @@ impl FooterReader {
             block: touched_zeroes(ROW_BLOCK_BYTES),
             filter: touched_zeroes(ROW_BLOCK_BYTES),
             key: touched_capacity(ROW_BLOCK_BYTES, 0),
-            candidates: touched_capacity(CANDIDATE_PAGE, SegmentNumber(0)),
+            candidates: touched_capacity(CANDIDATE_PAGE, Candidate::default()),
             found_block: 0,
         }
     }

@@ -493,6 +493,7 @@ impl<Backend: Io> EngineState<Backend> {
                 highest: column.highest,
                 reach: column.highest,
                 segment: found.head.segment,
+                newest_place: found.head.places.highest,
             };
             if let Some(directory) = &self.directories[column.column.0 as usize]
                 && !directory.replace(Some(&entry), &[])

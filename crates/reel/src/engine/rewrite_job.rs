@@ -915,12 +915,12 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.enter_table(volume)?;
         // a kept grave hides an older row outside the merge, so it's in a list before the inputs leave theirs, and until
         // then a read finds it twice at one place
-        if let (Some(_totals), Some(output)) = (self.grave_totals, &self.grave_output) {
-            list_output(&state, volume, output, &self.grave_writer, &[]);
+        if let (Some(totals), Some(output)) = (self.grave_totals, &self.grave_output) {
+            list_output(&state, volume, output, &totals, &self.grave_writer, &[]);
         }
         between();
-        if let (Some(_totals), Some(output)) = (self.totals, &self.output) {
-            list_output(&state, volume, output, &self.writer, inputs);
+        if let (Some(totals), Some(output)) = (self.totals, &self.output) {
+            list_output(&state, volume, output, &totals, &self.writer, inputs);
         }
         // an unwalked merge's outputs owe a walk, and reads of finished segments leave them out until it's done
         if !self.is_unwalked {
@@ -1090,6 +1090,7 @@ pub fn list_output<Backend: Io>(
     state: &EngineState<Backend>,
     volume: &Volume<Backend>,
     output: &RewriteOutput<Backend::File>,
+    totals: &FooterTotals,
     writer: &FooterWriter,
     removed: &[SegmentNumber],
 ) {
@@ -1101,6 +1102,7 @@ pub fn list_output<Backend: Io>(
             highest: column.highest,
             reach: column.highest,
             segment: output.number,
+            newest_place: totals.head.places.highest,
         };
         if let Some(directory) = &state.directories[column.column.0 as usize]
             && !directory.replace(Some(&entry), removed)

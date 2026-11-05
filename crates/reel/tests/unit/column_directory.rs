@@ -3,6 +3,7 @@ use reel::segment::block_entry::KeyPrefix;
 use reel::segment::column_directory::*;
 use reel::segment::footer_writer::shared_prefix;
 use reel::segment::segment_tail::SegmentNumber;
+use reel_api::units::WritePlace;
 
 const CAPACITY: usize = 64;
 const MANY: u64 = 1_000;
@@ -16,6 +17,7 @@ fn entry(number: u64, lowest: &[u8], highest: &[u8]) -> DirectoryEntry {
         highest: KeyPrefix::of_key(highest, shared),
         reach: KeyPrefix::default(),
         segment: SegmentNumber(number),
+        newest_place: WritePlace(number),
     }
 }
 
@@ -24,8 +26,8 @@ fn found(directory: &ColumnDirectory, key: &[u8]) -> Vec<u64> {
     let page = directory.candidates(key, 0, &mut out);
     assert!(!page.is_cut);
     let mut numbers = Vec::new();
-    for segment in out {
-        numbers.push(segment.0);
+    for candidate in out {
+        numbers.push(candidate.segment.0);
     }
     numbers.sort_unstable();
     numbers
@@ -96,8 +98,8 @@ fn cut_pages() {
     let mut skip = 0;
     loop {
         let page = directory.candidates(b"m", skip, &mut out);
-        for segment in &out {
-            numbers.push(segment.0);
+        for candidate in &out {
+            numbers.push(candidate.segment.0);
         }
         skip += out.len();
         if !page.is_cut {

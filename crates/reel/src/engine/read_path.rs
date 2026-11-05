@@ -1,5 +1,6 @@
 //! Gets: the write index, then the spot cache, then the footers, newest by place
 
+use std::cmp::Reverse;
 use std::io::{Error, ErrorKind};
 use std::sync::atomic::Ordering;
 
@@ -644,7 +645,7 @@ impl<Backend: Io> EngineState<Backend> {
         let Some(pin) = volume.table.pin(segment) else {
             return Ok(());
         };
-        if !pin.is_walked || best.is_some_and(|row| row.row.place >= pin.head.places.highest) {
+        if !pin.is_walked {
             return Ok(());
         }
         let mut point = *read;
@@ -699,10 +700,15 @@ impl<Backend: Io> EngineState<Backend> {
                 continue;
             }
             generation = Some(page.generation);
+            // newest first, so a key with a row stops at its previous version and the older segments cost nothing
+            candidates.sort_unstable_by_key(|candidate| Reverse(candidate.newest_place));
 
             let mut outcome = Ok(());
-            for segment in &candidates {
-                outcome = ask(*segment, reader, &mut best);
+            for candidate in &candidates {
+                if best.is_some_and(|row| row.row.place >= candidate.newest_place) {
+                    break;
+                }
+                outcome = ask(candidate.segment, reader, &mut best);
                 if outcome.is_err() {
                     break;
                 }
@@ -734,9 +740,6 @@ impl<Backend: Io> EngineState<Backend> {
         let Some(pin) = volume.table.pin(segment) else {
             return Ok(());
         };
-        if best.is_some_and(|row| row.row.place >= pin.head.places.highest) {
-            return Ok(());
-        }
         let row = self.search_segment(volume, read, segment, &pin, reader)?;
         if let Some(found) = row
             && best.is_none_or(|current| current.row.place < found.place)

@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use reel_api::units::ByteCount;
+use reel_api::units::{ByteCount, WritePlace};
 
 use crate::pool::touched_capacity;
 use crate::guard::hold;
@@ -23,6 +23,14 @@ pub struct DirectoryEntry {
     pub highest: KeyPrefix,
     pub reach: KeyPrefix,
     pub segment: SegmentNumber,
+    pub newest_place: WritePlace,
+}
+
+/// A segment whose range holds a key, and the newest place any of its rows has
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Candidate {
+    pub segment: SegmentNumber,
+    pub newest_place: WritePlace,
 }
 
 /// One copy of the list, with the generation it was published under
@@ -43,7 +51,7 @@ pub struct DirectoryPage {
 /// Counts the segments a search has passed and fills a page
 #[derive(Debug)]
 pub struct PageFill<'out> {
-    out: &'out mut Vec<SegmentNumber>,
+    out: &'out mut Vec<Candidate>,
     skip: usize,
     seen: usize,
     is_cut: bool,
@@ -61,13 +69,16 @@ pub struct ColumnDirectory {
 
 impl PageFill<'_> {
     /// Add a matching segment, or note that the page is full
-    pub fn add(&mut self, segment: SegmentNumber) {
+    pub fn add(&mut self, entry: &DirectoryEntry) {
         self.seen += 1;
         if self.seen <= self.skip {
             return;
         }
         if self.out.len() < self.out.capacity() {
-            self.out.push(segment);
+            self.out.push(Candidate {
+                segment: entry.segment,
+                newest_place: entry.newest_place,
+            });
         } else {
             self.is_cut = true;
         }
@@ -95,7 +106,7 @@ impl ColumnDirectory {
     }
 
     /// Fill a buffer with the segments whose range holds a key, past those a caller already has
-    pub fn candidates(&self, key: &[u8], skip: usize, out: &mut Vec<SegmentNumber>) -> DirectoryPage {
+    pub fn candidates(&self, key: &[u8], skip: usize, out: &mut Vec<Candidate>) -> DirectoryPage {
         out.clear();
         let current = self.current.load(Ordering::Acquire);
         let copy = read_list(&self.versions[current]);
@@ -178,6 +189,7 @@ pub fn empty_list(capacity: usize) -> DirectoryList {
         highest: KeyPrefix::default(),
         reach: KeyPrefix::default(),
         segment: SegmentNumber(0),
+        newest_place: WritePlace(0),
     };
     DirectoryList {
         entries: touched_capacity(capacity, blank),
@@ -215,7 +227,7 @@ pub fn search_group(group: &[DirectoryEntry], key: KeyPrefix, fill: &mut PageFil
         return;
     }
     if entry.highest >= key {
-        fill.add(entry.segment);
+        fill.add(entry);
     }
     search_group(&group[middle + 1..], key, fill);
 }

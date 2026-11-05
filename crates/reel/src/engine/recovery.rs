@@ -931,6 +931,14 @@ pub fn copy_segment<Backend: Io>(
         }
 
         let walked = walk_rows(&segment.rows, at, &head, &mut bytes, |row| {
+            // a cover that can't be read could have hidden anything, so the columns go whole and it isn't copied
+            if row.kind == RowKind::RangeDelete
+                && !state.is_record_whole(&segment.found.data, row, &mut records, &mut value)?
+            {
+                let end = FileOffset(row.offset.0 + row.length.0);
+                damage_open(state, &segment.found, rot_sum(segment.scan.rot_sum, row.offset, end))?;
+                return Ok(true);
+            }
             copy_row(state, volume, segment.found.number, &segment.found.data, row, &mut record)?;
             Ok(true)
         })?;
@@ -1780,6 +1788,21 @@ pub fn save_cleared_spans<Backend: Io>(state: &EngineState<Backend>, volume: &Vo
                 };
                 state.note_dropped_rows(rows.push_kept(&facts, [].into_iter(), spans));
             },
+        }
+    }
+}
+
+impl<Backend: Io> EngineState<Backend> {
+    /// Damage a segment's columns whole at the counter, when a seal finds a cover it can't read
+    pub fn damage_whole(&self, volume: usize, segment: SegmentNumber) {
+        let target = &self.volumes[volume];
+        for range in whole_columns(self, volume, segment, self.order.mark()) {
+            target.damage.add(&range);
+        }
+        let mut damaged = hold(&target.damaged);
+        if !damaged.contains(&segment) {
+            damaged.push(segment);
+            self.damaged_segments.fetch_add(1, Ordering::AcqRel);
         }
     }
 }

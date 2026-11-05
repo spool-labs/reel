@@ -13,6 +13,7 @@ use reel::record::codec::Codec;
 use reel::segment::range_covers::MOST_RANGE_COVERS;
 use reel::segment::segment_tail::{SECOND_TAIL_DISTANCE, SegmentNumber};
 use reel_api::column_id::ColumnId;
+use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId, WritePlace};
 use reel_api::write_batch::WriteBatch;
@@ -28,12 +29,18 @@ const BUDGET: ByteCount = ByteCount(48 * 1024 * 1024);
 const KEYS: u64 = 100;
 const SEARCH_STEPS: usize = 4;
 const CRASH_POINTS: u64 = 10;
+const LARGE_BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
+const REPEATS: u64 = 5_000;
 const COVER_SURPLUS: u64 = 10;
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 
 type Store = ReelStore<SimulatedIo>;
 
 fn config() -> StoreConfig {
+    config_at(BUDGET)
+}
+
+fn config_at(budget: ByteCount) -> StoreConfig {
     let column = |id: ColumnId, name: &str| ColumnConfig {
         id,
         name: name.to_string(),
@@ -42,7 +49,7 @@ fn config() -> StoreConfig {
         volume: VolumeId(0),
     };
     StoreConfig {
-        memory_budget: BUDGET,
+        memory_budget: budget,
         volumes: vec![VolumeConfig {
             name: "ranges".to_string(),
             roots: vec![PathBuf::from(ROOT)],
@@ -510,5 +517,207 @@ fn cover_cap() {
     let claims = hold(&store.state.volumes[0].claims);
     assert!(claims.open.iter().all(|segment| segment.cover_rows <= MOST_RANGE_COVERS));
     drop(claims);
+    store.close().expect("close");
+}
+
+// a range with nothing in it deletes nothing and takes no slot, in a batch as in the single call
+#[test]
+fn empty_ranges() {
+    let io = SimulatedIo::new(Seed(17));
+    let store = open(&io);
+    store.put(COLUMN, b"k", b"value").expect("put");
+    store.delete_range(COLUMN, b"k", b"k").expect("delete");
+    store.delete_range(COLUMN, b"m", b"k").expect("delete");
+    let mut batch = WriteBatch::new();
+    batch.delete_range(COLUMN, b"k", b"k");
+    batch.delete_range(COLUMN, b"m", b"k");
+    batch.put(COLUMN, b"after", b"value");
+
+    store.write_batch(&batch).expect("batch");
+
+    assert_eq!(read(&store, COLUMN, b"k"), Some(b"value".to_vec()));
+    assert_eq!(read(&store, COLUMN, b"after"), Some(b"value".to_vec()));
+    assert_eq!(store.state.volumes[0].covers.len(), 0);
+    store.close().expect("close");
+    drop(store);
+    let store = open(&io);
+    assert_eq!(read(&store, COLUMN, b"k"), Some(b"value".to_vec()));
+    store.close().expect("close");
+}
+
+// every batch that fails gives back the slots it held, however early it fails
+#[test]
+fn hold_released() {
+    let io = SimulatedIo::new(Seed(18));
+    let store = open(&io);
+    let huge = vec![1; store.state.volumes[0].segment_bytes.0 as usize / 2 + 1];
+    let mut batch = WriteBatch::new();
+    batch.delete_range(COLUMN, &key_of(1), &key_of(2));
+    batch.put(COLUMN, b"first", &huge);
+    batch.put(COLUMN, b"second", &huge);
+
+    for _try in 0..MOST_RANGE_COVERS + 1 {
+        assert!(matches!(store.write_batch(&batch), Err(StoreError::BatchTooLarge { .. })));
+    }
+
+    store.delete_range(COLUMN, &key_of(1), &key_of(2)).expect("delete");
+    store.close().expect("close");
+}
+
+// a batch on a full pool is refused with nothing written
+#[test]
+fn full_batch() {
+    let io = SimulatedIo::new(Seed(19));
+    let store = open(&io);
+    for number in 0..MOST_RANGE_COVERS as u64 {
+        let start = 1_000_000 + 2 * number;
+        store.delete_range(COLUMN, &key_of(start), &key_of(start + 1)).expect("delete");
+    }
+    let mut batch = WriteBatch::new();
+    batch.put(COLUMN, b"key", b"value");
+    batch.delete_range(COLUMN, &key_of(10), &key_of(20));
+
+    assert!(matches!(store.write_batch(&batch), Err(StoreError::RangeDeletesFull { .. })));
+
+    assert_eq!(read(&store, COLUMN, b"key"), None);
+    store.close().expect("close");
+}
+
+// a grave and a range delete over one key, in either order, leave it gone until a later write
+#[test]
+fn grave_and_range() {
+    let io = SimulatedIo::new(Seed(20));
+    let store = open(&io);
+    fill(&store);
+    store.delete(COLUMN, &key_of(12)).expect("delete");
+    store.delete_range(COLUMN, &key_of(10), &key_of(20)).expect("delete");
+    store.delete_range(COLUMN, &key_of(30), &key_of(40)).expect("delete");
+    store.delete(COLUMN, &key_of(32)).expect("delete");
+
+    assert_eq!(read(&store, COLUMN, &key_of(12)), None);
+    assert_eq!(read(&store, COLUMN, &key_of(32)), None);
+    seal(&store, &io);
+    assert_eq!(read(&store, COLUMN, &key_of(12)), None);
+    assert_eq!(read(&store, COLUMN, &key_of(32)), None);
+    store.close().expect("close");
+}
+
+// a window read and contains both answer as a get does under a cover
+#[test]
+fn other_reads() {
+    let io = SimulatedIo::new(Seed(21));
+    let store = open(&io);
+    fill(&store);
+    store.delete_range(COLUMN, &key_of(10), &key_of(20)).expect("delete");
+    let mut buf = Vec::new();
+    let window = ValueWindow {
+        offset: ByteCount(0),
+        length: ByteCount(2),
+    };
+
+    assert!(!store.get_range(COLUMN, &key_of(15), window, &mut buf).expect("window"));
+    assert!(!store.contains(COLUMN, &key_of(15)).expect("contains"));
+    assert!(store.get_range(COLUMN, &key_of(25), window, &mut buf).expect("window"));
+    store.close().expect("close");
+}
+
+// a store written at one budget, with more rows than a smaller budget can rebuild, and a range delete among them
+fn past_small_budget(seed: u64) -> SimulatedIo {
+    let limit_io = SimulatedIo::new(Seed(seed));
+    let limit_store = ReelStore::open(limit_io.clone(), &config_at(BUDGET)).expect("open");
+    let limit = limit_store.state.volumes[0].segment_rows.0;
+    limit_store.close().expect("close");
+
+    let io = SimulatedIo::new(Seed(seed));
+    let store = ReelStore::open(io.clone(), &config_at(LARGE_BUDGET)).expect("open");
+    fill(&store);
+    store.delete_range(COLUMN, &key_of(10), &key_of(20)).expect("delete");
+    for number in 0..limit + 1 {
+        store.put(OTHER, &key_of(1_000 + number), b"v").expect("put");
+    }
+    store.flush().expect("flush");
+    io.kill();
+    drop(store);
+    io
+}
+
+// a range delete copied at open keeps hiding what it hid
+#[test]
+fn copied_cover() {
+    let io = past_small_budget(22);
+
+    let store = open(&io);
+
+    assert_eq!(read(&store, COLUMN, &key_of(15)), None);
+    assert_eq!(read(&store, COLUMN, &key_of(25)), Some(b"older".to_vec()));
+    store.close().expect("close");
+    drop(store);
+    let store = open(&io);
+    assert_eq!(read(&store, COLUMN, &key_of(15)), None);
+    store.close().expect("close");
+}
+
+// a cover the copy can't read refuses the column, and never shows what it hid
+#[test]
+fn copied_rot() {
+    let io = past_small_budget(23);
+    let path = data_of(&io);
+    let file = io.open_read_only(&path).expect("open");
+    let mut bytes = vec![0; file.length().expect("length").0 as usize];
+    file.read_exact_at(FileOffset(0), &mut bytes).expect("read");
+    io.close_file(file);
+    let end = key_of(20);
+    // the put of key 20 has its key in the rows file, so the data file holds these bytes in the cover's record alone
+    let at = bytes.windows(end.len()).position(|window| window == end).expect("the record");
+    io.rot(&path, FileOffset(at as u64), BitMask(1)).expect("rot");
+
+    let store = open(&io);
+
+    let mut buf = Vec::new();
+    assert!(matches!(store.get(COLUMN, &key_of(15), &mut buf), Err(StoreError::Corruption { .. })));
+    store.close().expect("close");
+}
+
+// a seal that can't read a cover's record finishes, and the columns refuse
+#[test]
+fn seal_bad_cover() {
+    let io = SimulatedIo::new(Seed(24));
+    let store = open(&io);
+    fill(&store);
+    store.delete_range(COLUMN, &key_of(10), &key_of(20)).expect("delete");
+    store.flush().expect("flush");
+    let path = data_of(&io);
+    let file = io.open_read_only(&path).expect("open");
+    let mut bytes = vec![0; file.length().expect("length").0 as usize];
+    file.read_exact_at(FileOffset(0), &mut bytes).expect("read");
+    io.close_file(file);
+    let end = key_of(20);
+    let at = bytes.windows(end.len()).position(|window| window == end).expect("the record");
+    io.rot(&path, FileOffset(at as u64), BitMask(1)).expect("rot");
+
+    seal(&store, &io);
+
+    let mut buf = Vec::new();
+    assert!(matches!(store.get(COLUMN, &key_of(15), &mut buf), Err(StoreError::Corruption { .. })));
+    store.close().expect("close");
+}
+
+// one range deleted 5,000 times in a row stays one cover, and each segment seals inside its buffer
+#[test]
+fn many_repeats() {
+    let io = SimulatedIo::new(Seed(25));
+    let store = open(&io);
+    fill(&store);
+    for _repeat in 0..REPEATS {
+        store.delete_range(COLUMN, &key_of(10), &key_of(20)).expect("delete");
+    }
+
+    assert_eq!(store.state.volumes[0].covers.len(), 1);
+    seal(&store, &io);
+    assert_deleted(&store);
+    store.close().expect("close");
+    drop(store);
+    let store = open(&io);
+    assert_deleted(&store);
     store.close().expect("close");
 }

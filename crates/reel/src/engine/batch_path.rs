@@ -68,7 +68,7 @@ impl<Backend: Io> EngineState<Backend> {
             return Err(StoreError::RangeDeletesFull { volume: volume.id });
         }
 
-        let bytes = self.encoders.with(|encoder| {
+        let landed = self.encoders.with(|encoder| {
             self.batch_rows.with(|stage| self.batch_records.with(|records| {
                 let bytes = self.measure_batch(volume, batch, encoder)?;
                 self.hold_batch_room(&plan)?;
@@ -82,12 +82,10 @@ impl<Backend: Io> EngineState<Backend> {
                     self.land_batch(volume, batch, &plan, bytes, buffers)
                 };
                 self.index.release_room(&plan.needs);
-                if landed.is_err() {
-                    volume.covers.release(plan.covers);
-                }
                 landed.map(|()| bytes)
             }))
-        })?;
+        });
+        let bytes = landed.inspect_err(|_error| volume.covers.release(plan.covers))?;
         self.after_write(volume, bytes)
     }
 
@@ -101,6 +99,8 @@ impl<Backend: Io> EngineState<Backend> {
             let (column, key, value, end) = match operation {
                 BatchOperation::Put { column, key, value } => (column, key, Some(value), None),
                 BatchOperation::Delete { column, key } => (column, key, None, None),
+                // a range with nothing in it writes nothing, as the single call does
+                BatchOperation::DeleteRange { start, end, .. } if start >= end => continue,
                 BatchOperation::DeleteRange { column, start, end } => (column, start, None, Some(end)),
             };
 
@@ -161,8 +161,10 @@ impl<Backend: Io> EngineState<Backend> {
         for index in 0..batch.len() {
             let length = match batch.operation(index) {
                 Some(BatchOperation::Put { column, key, value }) => self.record_length(column, key, value, encoder)?,
-                Some(BatchOperation::DeleteRange { end, .. }) => plain_length(ByteCount(end.len() as u64)),
-                Some(BatchOperation::Delete { .. }) | None => ByteCount(0),
+                Some(BatchOperation::DeleteRange { start, end, .. }) if start < end => {
+                    plain_length(ByteCount(end.len() as u64))
+                },
+                Some(BatchOperation::Delete { .. } | BatchOperation::DeleteRange { .. }) | None => ByteCount(0),
             };
             bytes = ByteCount(bytes.0 + length.0);
         }
@@ -207,13 +209,24 @@ impl<Backend: Io> EngineState<Backend> {
             return;
         }
         let volume = &self.volumes[plan.volume.0 as usize];
+        let mut place_cursor = first;
         for index in 0..batch.len() {
-            if let Some(BatchOperation::DeleteRange { column, start, end }) = batch.operation(index) {
+            let Some(operation) = batch.operation(index) else {
+                continue;
+            };
+            if let BatchOperation::DeleteRange { start, end, .. } = operation
+                && start >= end
+            {
+                continue;
+            }
+            let place = place_cursor;
+            place_cursor = WritePlace(place_cursor.0 + 1);
+            if let BatchOperation::DeleteRange { column, start, end } = operation {
                 volume.covers.add_held(&Cover {
                     column,
                     start,
                     end,
-                    place: WritePlace(first.0 + index as u64),
+                    place,
                     segment,
                 });
             }
@@ -226,13 +239,24 @@ impl<Backend: Io> EngineState<Backend> {
             return;
         }
         let volume = &self.volumes[plan.volume.0 as usize];
+        let mut place_cursor = first;
         for index in 0..batch.len() {
-            if let Some(BatchOperation::DeleteRange { column, start, end }) = batch.operation(index) {
+            let Some(operation) = batch.operation(index) else {
+                continue;
+            };
+            if let BatchOperation::DeleteRange { start, end, .. } = operation
+                && start >= end
+            {
+                continue;
+            }
+            let place = place_cursor;
+            place_cursor = WritePlace(place_cursor.0 + 1);
+            if let BatchOperation::DeleteRange { column, start, end } = operation {
                 volume.covers.drop_inside(&Cover {
                     column,
                     start,
                     end,
-                    place: WritePlace(first.0 + index as u64),
+                    place,
                     segment,
                 });
             }
@@ -315,6 +339,7 @@ impl<Backend: Io> EngineState<Backend> {
                     cursor.row(column, key, shape.total_length(), RowKind::Value)
                 },
                 BatchOperation::Delete { column, key } => cursor.row(column, key, ByteCount(0), RowKind::Grave),
+                BatchOperation::DeleteRange { start, end, .. } if start >= end => continue,
                 BatchOperation::DeleteRange { column, start, end } => {
                     let identity = RecordIdentity {
                         record_key: self.record_key,
@@ -542,15 +567,23 @@ impl<'batch> Iterator for BatchRows<'batch> {
     type Item = RowEntry<'batch>;
 
     fn next(&mut self) -> Option<RowEntry<'batch>> {
-        let operation = self.batch.operation(self.index)?;
-        self.index += 1;
-        let length = ByteCount(u64::from(*self.lengths.next()?));
-        match operation {
-            BatchOperation::Put { column, key, .. } => Some(self.cursor.row(column, key, length, RowKind::Value)),
-            BatchOperation::Delete { column, key } => Some(self.cursor.row(column, key, length, RowKind::Grave)),
-            BatchOperation::DeleteRange { column, start, .. } => {
-                Some(self.cursor.row(column, start, length, RowKind::RangeDelete))
-            },
+        loop {
+            let operation = self.batch.operation(self.index)?;
+            self.index += 1;
+            if let BatchOperation::DeleteRange { start, end, .. } = operation
+                && start >= end
+            {
+                continue;
+            }
+
+            let length = ByteCount(u64::from(*self.lengths.next()?));
+            return match operation {
+                BatchOperation::Put { column, key, .. } => Some(self.cursor.row(column, key, length, RowKind::Value)),
+                BatchOperation::Delete { column, key } => Some(self.cursor.row(column, key, length, RowKind::Grave)),
+                BatchOperation::DeleteRange { column, start, .. } => {
+                    Some(self.cursor.row(column, start, length, RowKind::RangeDelete))
+                },
+            };
         }
     }
 }

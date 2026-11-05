@@ -77,6 +77,8 @@ pub struct EngineState<Backend: Io> {
     pub batch_records: Pool<Vec<u8>>,
     pub batch_lengths: Pool<Vec<u32>>,
     pub longest_turn: AtomicU64,
+    pub index_waits: AtomicU64,
+    pub longest_index_wait: AtomicU64,
     pub record_readers: Pool<RecordReader>,
     pub footer_readers: Pool<FooterReader>,
     pub superblock: Mutex<Superblock>,

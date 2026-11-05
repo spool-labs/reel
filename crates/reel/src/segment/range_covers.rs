@@ -13,6 +13,11 @@ use crate::segment::segment_tail::SegmentNumber;
 
 /// Most pending range deletes a volume holds. A delete past it is refused, and maintenance makes room
 pub const MOST_RANGE_COVERS: usize = 4_096;
+/// Covers in one block of the order, each block keeping the cover that reaches furthest, so a search passes a block
+/// that ends before its key in one step
+pub const COVER_BLOCK: usize = 64;
+/// Covers a search looks at beside the ones that hold its key, however they nest
+pub const MOST_SEARCH_STEPS: usize = 200;
 /// Bytes a cover takes in a footer beside its keys: column, two key lengths and its place
 pub const COVER_RECORD_BYTES: usize = 1 + 2 + 2 + size_of::<u64>();
 /// Bytes a cover takes in the pool beside its keys
@@ -45,6 +50,7 @@ pub struct CoverPool {
     free: Vec<u16>,
     order: Vec<u16>,
     reach: Vec<u16>,
+    block_reach: Vec<u16>,
     keys: Vec<u8>,
     widest_key: usize,
     held: usize,
@@ -69,6 +75,7 @@ impl CoverPool {
             free,
             order: touched_room(MOST_RANGE_COVERS),
             reach: touched_room(MOST_RANGE_COVERS),
+            block_reach: touched_room(MOST_RANGE_COVERS / COVER_BLOCK + 1),
             keys: touched_zeroes(MOST_RANGE_COVERS * 2 * widest_key),
             widest_key,
             held: 0,
@@ -135,12 +142,16 @@ impl CoverPool {
         let mut newest = None;
         let mut position = self.past_start(column, key);
         while position > 0 {
-            position -= 1;
-            let slot = self.order[position];
+            let slot = self.order[position - 1];
             *steps += 1;
-            if self.slots[slot as usize].column != column || self.end(self.reach[position]) <= key {
+            if self.slots[slot as usize].column != column || self.end(self.reach[position - 1]) <= key {
                 break;
             }
+            if position.is_multiple_of(COVER_BLOCK) && self.end(self.block_reach[position / COVER_BLOCK - 1]) <= key {
+                position -= COVER_BLOCK;
+                continue;
+            }
+            position -= 1;
 
             let place = self.slots[slot as usize].place;
             if key < self.end(slot) && place <= read_point {
@@ -150,7 +161,7 @@ impl CoverPool {
         newest
     }
 
-    /// Check a newer cover already holds this one, as one found again at open can be
+    /// Check a cover at this place or newer already holds this one, as one found again at open can be
     pub fn is_inside_newer(&self, cover: &Cover) -> bool {
         let mut position = self.past_start(cover.column, cover.start);
         while position > 0 {
@@ -159,7 +170,7 @@ impl CoverPool {
             if self.slots[slot as usize].column != cover.column || self.end(self.reach[position]) <= cover.start {
                 return false;
             }
-            if self.slots[slot as usize].place > cover.place && cover.end <= self.end(slot) {
+            if self.slots[slot as usize].place >= cover.place && cover.end <= self.end(slot) {
                 return true;
             }
         }
@@ -204,6 +215,23 @@ impl CoverPool {
         }
         if has_dropped {
             self.rebuild_reach(first);
+            self.rebuild_blocks(first);
+        }
+    }
+
+    /// Set the reach of every block from the one holding a position on
+    pub fn rebuild_blocks(&mut self, from: usize) {
+        let first = from / COVER_BLOCK;
+        self.block_reach.truncate(first);
+        for block in first..self.order.len().div_ceil(COVER_BLOCK) {
+            let end = ((block + 1) * COVER_BLOCK).min(self.order.len());
+            let mut furthest = self.order[block * COVER_BLOCK];
+            for position in block * COVER_BLOCK..end {
+                if self.end(self.order[position]) > self.end(furthest) {
+                    furthest = self.order[position];
+                }
+            }
+            self.block_reach.push(furthest);
         }
     }
 
@@ -224,10 +252,10 @@ impl CoverPool {
         if is_same_column && self.end(earlier) > self.end(slot) { earlier } else { slot }
     }
 
-    /// Put a cover in its place in the order, or return false when no slot is left
+    /// Put a cover in its place in the order, or return false when no slot is left or its keys don't fit
     pub fn insert(&mut self, cover: &Cover) -> bool {
-        if self.is_inside_newer(cover) {
-            return true;
+        if cover.start.len() > self.widest_key || cover.end.len() > self.widest_key {
+            return false;
         }
         let Some(slot) = self.free.pop() else {
             return false;
@@ -249,6 +277,7 @@ impl CoverPool {
         self.order.insert(position, slot);
         self.reach.insert(position, slot);
         self.reach[position] = self.reach_at(position, slot);
+        self.rebuild_blocks(position);
         // a later position only changes while this cover reaches past what it had
         for later in position + 1..self.order.len() {
             let other = self.order[later];
@@ -305,7 +334,8 @@ impl RangeCovers {
     pub fn heap_bytes(&self) -> ByteCount {
         let pool = self.read();
         let slots = pool.slots.capacity() * size_of::<CoverSlot>();
-        let lists = (pool.free.capacity() + pool.order.capacity() + pool.reach.capacity()) * size_of::<u16>();
+        let lists = pool.free.capacity() + pool.order.capacity() + pool.reach.capacity() + pool.block_reach.capacity();
+        let lists = lists * size_of::<u16>();
         ByteCount((slots + lists + pool.keys.capacity()) as u64)
     }
 
@@ -368,7 +398,8 @@ impl RangeCovers {
     pub fn add(&self, cover: &Cover) -> bool {
         let mut pool = self.write();
         pool.drop_inside(cover);
-        let has_room = pool.insert(cover);
+        // no writer runs at open, so nothing above this cover can still be unpublished
+        let has_room = pool.is_inside_newer(cover) || pool.insert(cover);
         let count = pool.order.len();
         drop(pool);
         self.count.store(count, Ordering::Release);

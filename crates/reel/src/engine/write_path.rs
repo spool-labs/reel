@@ -527,12 +527,15 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Start seals and wait for the write index to have room, or report that it never did
     pub fn wait_for_index(&self, column: ColumnId, key: &[u8], slot: OpenSlot) -> Result<(), StoreError> {
+        let started = self.io.now();
+        self.index_waits.fetch_add(1, Ordering::Relaxed);
         let deadline = self.io.now().0.saturating_add(INDEX_WAIT.0);
         loop {
             for volume in &self.volumes {
                 self.seal_fullest(volume);
             }
             if self.index.has_room(column, key, slot) {
+                self.longest_index_wait.fetch_max(self.io.now().0.saturating_sub(started.0), Ordering::Relaxed);
                 return Ok(());
             }
             if self.io.now().0 > deadline {

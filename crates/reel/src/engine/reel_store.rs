@@ -161,6 +161,12 @@ impl<Backend: Io> ReelStore<Backend> {
         self.state.volumes[volume.0 as usize].covers.len()
     }
 
+    /// Count the waits for room in the write index, and read the longest
+    pub fn index_waits(&self) -> (u64, Nanoseconds) {
+        let waits = self.state.index_waits.load(Ordering::Relaxed);
+        (waits, Nanoseconds(self.state.longest_index_wait.load(Ordering::Relaxed)))
+    }
+
     /// Read the longest a long batch has held a writing turn
     pub fn longest_turn(&self) -> Nanoseconds {
         Nanoseconds(self.state.longest_turn.load(Ordering::Relaxed))
@@ -787,6 +793,8 @@ pub fn build_state<Backend: Io>(
         batch_records: Pool::new((0..WRITE_BUFFERS).map(|_buffer| touched_zeroes(GATHER_BYTES)).collect()),
         batch_lengths: Pool::new(vec![touched_filled(sizing.segment_rows.0 as usize, 0)]),
         longest_turn: AtomicU64::new(0),
+        index_waits: AtomicU64::new(0),
+        longest_index_wait: AtomicU64::new(0),
         record_readers: Pool::new(record_readers),
         footer_readers: Pool::new(footer_readers),
         superblock: Mutex::new(superblock),

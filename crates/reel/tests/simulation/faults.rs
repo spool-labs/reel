@@ -460,6 +460,7 @@ impl Run {
         let bytes = format!("set-{}", self.streams.set.next_word()).into_bytes();
         let value = (!is_grave).then_some(bytes);
         let is_long = self.streams.set.one_in(LONG_SET_ODDS);
+        let is_range = self.streams.set.one_in(2);
         let mut batch = WriteBatch::new();
         for number in 0..SET_KEYS {
             let key = set_key(set, number);
@@ -467,6 +468,7 @@ impl Run {
             batch.put(column, &key, b"overwritten");
             match &value {
                 Some(value) => batch.put(column, &key, value),
+                None if is_range => {},
                 None => batch.delete(column, &key),
             }
             // a long batch's first key sits in its first piece and the rest in its last, with graves no read looks at between
@@ -475,6 +477,11 @@ impl Run {
                     batch.delete(column, format!("filler-{filler:05}").as_bytes());
                 }
             }
+        }
+
+        // one range delete takes the whole set, after the puts above, so a read must find all of it gone or none
+        if value.is_none() && is_range {
+            batch.delete_range(column, &set_key(set, 0), &set_key(set, SET_KEYS));
         }
 
         let written = store.write_batch(&batch);

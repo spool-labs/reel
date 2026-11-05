@@ -19,6 +19,7 @@ use crate::index::seal_walk::SealWalk;
 use crate::index::spot_index::SpotLocation;
 use crate::io::job::{Job, JobStep};
 use crate::io::Io;
+use crate::io::device_error::is_device_error;
 use crate::record::codec::Codec;
 use crate::record::record_check::RecordIdentity;
 use crate::record::record_reader::{RecordLocation, RecordRead};
@@ -212,9 +213,16 @@ impl<Backend: Io> SealJob<Backend> {
                 let end = &mut self.range_end;
                 let read = self.state.record_readers.with(|reader| {
                     reader.read_value(&target.data, location, &identity, Codec::None, end)
-                })?;
-                if read != RecordRead::Valid {
-                    return Err(Error::other("the record of a range delete failed its check"));
+                });
+                let is_whole = match read {
+                    Ok(read) => read == RecordRead::Valid,
+                    Err(error) if is_device_error(&error) => false,
+                    Err(error) => return Err(error),
+                };
+                if !is_whole {
+                    self.state.damage_whole(self.volume, target.number);
+                    self.walk.advance(&self.state.index, shard);
+                    continue;
                 }
                 let cover = Cover {
                     column: head.column,

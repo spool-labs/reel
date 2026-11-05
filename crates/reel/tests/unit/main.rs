@@ -12,6 +12,7 @@ mod engine_sizing;
 mod lz4_block;
 mod open_segment;
 mod pool;
+mod range_covers;
 mod record_check;
 mod record_head;
 mod record_reader;

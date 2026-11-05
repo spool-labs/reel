@@ -30,7 +30,7 @@ use crate::little_endian::read_half;
 use crate::rows::row_group::{GROUP_HEADER_BYTES, GROUP_MAGIC, RowEntry, TOTAL_LENGTH_AT, parse_group};
 use crate::segment::block_entry::BlockEntry;
 use crate::segment::column_directory::DirectoryEntry;
-use crate::segment::damage_list::DamagedRange;
+use crate::segment::damage_list::{DamagedRange, highest_of, spans_of};
 use crate::segment::footer_reader::FooterReader;
 use crate::segment::segment_table::{TABLE_SHARDS, TableSizing, shard_of};
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber, TailHead, columns_fit};
@@ -846,7 +846,7 @@ pub fn damage_key<Backend: Io>(
 ) -> Result<()> {
     let mut end = row.key.to_vec();
     end.push(0);
-    volume.damage.add(DamagedRange {
+    volume.damage.add(&DamagedRange {
         column: row.column,
         segment,
         highest_place: row.place,
@@ -1041,7 +1041,7 @@ pub fn damage_open<Backend: Io>(
 
     volume.damage.drop_segment(found.number);
     for range in &ranges {
-        volume.damage.add(range.clone());
+        volume.damage.add(range);
     }
     let mut damaged = hold(&volume.damaged);
     if !damaged.contains(&found.number) {
@@ -1128,7 +1128,7 @@ pub fn carry_rows<Backend: Io>(
         }
 
         for range in row_ranges(&row, *number, &mut Vec::new()) {
-            volume.damage.add(range);
+            volume.damage.add(&range);
         }
         hold(&volume.damaged).push(*number);
         // the room was sized at open from every row it found, and a row with spans has to stay
@@ -1195,7 +1195,7 @@ pub fn settle_sealed<Backend: Io>(
         // spans outlive the fault that made them, and only clear_damage ends them
         if row.facts.is_damaged {
             for range in row_ranges(&row, facts.segment, &mut Vec::new()) {
-                volume.damage.add(range);
+                volume.damage.add(&range);
             }
             hold(&volume.damaged).push(facts.segment);
         }
@@ -1240,7 +1240,7 @@ pub fn settle_sealed<Backend: Io>(
         facts.is_damaged = true;
         facts.damage_place = row.facts.damage_place;
         for range in &ranges {
-            volume.damage.add(range.clone());
+            volume.damage.add(range);
         }
         hold(&volume.damaged).push(facts.segment);
     }
@@ -1284,7 +1284,7 @@ pub fn settle_damaged<Backend: Io>(
     }
 
     for range in &ranges {
-        volume.damage.add(range.clone());
+        volume.damage.add(range);
     }
     hold(&volume.damaged).push(found.number);
     let column_facts = columns.iter().map(column_of);
@@ -1434,35 +1434,25 @@ pub fn column_of(column: &OwnedColumn) -> ColumnFacts<'_> {
     }
 }
 
-/// Write what's left of every damaged segment's spans into its row, which never fails: a row with
+/// Write what's left of every damaged segment's spans into its row, in place, which never fails: a row with
 /// spans stays, and a segment with no row gets one that speaks for its spans alone
 pub fn save_cleared_spans<Backend: Io>(state: &EngineState<Backend>, volume: &Volume<Backend>) {
-    let numbers = hold(&volume.damaged).clone();
     let mut rows = hold(&volume.summary);
-    let mut rewritten = SummaryRows::new(ByteCount(0));
-    rewritten.make_room(rows.heap_bytes());
-
-    let listed = rows.offsets();
-    for (segment, at) in &listed {
-        if !numbers.contains(segment) && !rewritten.copy_row(&rows, *at) {
-            state.note_dropped_row();
+    let damaged = hold(&volume.damaged);
+    let slots = volume.damage.slots();
+    for number in damaged.iter() {
+        let spans = spans_of(&slots, *number);
+        match rows.rewrite_spans(*number, spans.clone()) {
+            Some(dropped) => state.note_dropped_rows(dropped),
+            None => {
+                let facts = SegmentFacts {
+                    segment: *number,
+                    is_damaged: true,
+                    damage_place: highest_of(&slots, *number).unwrap_or(WritePlace(0)),
+                    ..SegmentFacts::default()
+                };
+                state.note_dropped_rows(rows.push_kept(&facts, [].into_iter(), spans));
+            },
         }
     }
-    for number in numbers {
-        let ranges = volume.damage.of_segment(number);
-        let mut columns = Vec::new();
-        let mut facts = SegmentFacts {
-            segment: number,
-            is_damaged: true,
-            damage_place: ranges.iter().map(|range| range.highest_place).max().unwrap_or(WritePlace(0)),
-            ..SegmentFacts::default()
-        };
-        if let Some(row) = listed.get(&number).and_then(|at| rows.row_at(*at)) {
-            facts = row.facts;
-            let _ranges_in_row = row_ranges(&row, number, &mut columns);
-        }
-        let column_facts = columns.iter().map(column_of);
-        state.note_dropped_rows(rewritten.push_kept(&facts, column_facts, ranges.iter().map(span_of)));
-    }
-    *rows = rewritten;
 }

@@ -11,6 +11,7 @@ use crate::engine::open_segment::{OpenSegment, SegmentPhase};
 use crate::guard::hold;
 use crate::index::open_slots::{OpenSlot, OpenSlots};
 use crate::io::Io;
+use crate::pool::Pool;
 use crate::segment::damage_list::DamageList;
 use crate::segment::segment_table::SegmentTable;
 use crate::segment::segment_tail::SegmentNumber;
@@ -53,8 +54,10 @@ pub struct Volume<Backend: Io> {
     pub segment_rows: RowCount,
     pub summary: Mutex<SummaryRows>,
     pub summary_paths: SummaryPaths,
+    pub summary_buffer: Pool<Vec<u8>>,
     pub damage: DamageList,
     pub damaged: Mutex<Vec<SegmentNumber>>,
+    pub is_clearing: AtomicBool,
     pub reserve: ByteCount,
 }
 

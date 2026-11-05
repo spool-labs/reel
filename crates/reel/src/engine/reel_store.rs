@@ -32,7 +32,7 @@ use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
 use crate::io::lock_outcome::LockOutcome;
 use crate::io::{Io, IoTask};
-use crate::pool::Pool;
+use crate::pool::{Pool, touched_buffer};
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::record_check::RecordKey;
 use crate::record::record_encoder::RecordEncoder;
@@ -40,8 +40,8 @@ use crate::record::record_reader::RecordReader;
 use crate::rows::row_group::RowGroupBuffer;
 use crate::segment::block_cache::BlockCache;
 use crate::segment::column_directory::ColumnDirectory;
-use crate::segment::damage_list::DamageList;
-use crate::segment::summary::{MOST_ROW_COLUMN_BYTES, MOST_ROW_FIXED_BYTES};
+use crate::segment::damage_list::{DamageList, MOST_DAMAGED_SPANS, SPAN_KEY_BYTES};
+use crate::segment::summary::{MOST_ROW_COLUMN_BYTES, MOST_ROW_FIXED_BYTES, MOST_ROW_SPAN_FIXED_BYTES};
 use crate::segment::footer_reader::FooterReader;
 use crate::segment::row_block::ROW_BLOCK_BYTES;
 use crate::segment::segment_table::{SegmentTable, TABLE_SHARDS, TableSizing};
@@ -175,9 +175,34 @@ impl<Backend: Io> ReelStore<Backend> {
         self.check_open()?;
         let info = self.state.column(column)?;
         let volume = &self.state.volumes[info.volume.0 as usize];
-        volume.damage.clear(column, start, end);
+        while volume.is_clearing.swap(true, Ordering::AcqRel) {
+            self.state.io.pause();
+        }
+        let cleared = self.clear_spans(volume, column, start, end);
+        volume.is_clearing.store(false, Ordering::Release);
+        cleared
+    }
+
+    /// Clear spans in memory and in the summary, and go back to how they were when the save fails, so an
+    /// error always means nothing changed
+    pub fn clear_spans(
+        &self,
+        volume: &Volume<Backend>,
+        column: ColumnId,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<(), StoreError> {
+        volume.damage.keep_spare();
+        if volume.damage.clear(column, start, end).is_err() {
+            return Err(StoreError::DamagePoolFull { volume: volume.id });
+        }
         save_cleared_spans(&self.state, volume);
-        self.state.save_summary(volume).map_err(open_error("saving a summary"))
+        if let Err(source) = self.state.save_summary(volume) {
+            volume.damage.restore_spare();
+            save_cleared_spans(&self.state, volume);
+            return Err(open_error("saving a summary")(source));
+        }
+        Ok(())
     }
 
     /// Make every write that returned before this call durable on every volume
@@ -581,7 +606,8 @@ pub fn build_state<Backend: Io>(
         // the share splits by each volume's row size, so every volume plans the same number of rows
         let planned_summary = sizing.summary_share.0 as usize * row_room(columns_here) / all_row_room;
         // open never drops a row, so a segment's damage keeps its rank through every open
-        let summary_room = found_summary.max(planned_summary).max(scan.least_summary_room(index, columns_here) * 2);
+        let span_room = MOST_DAMAGED_SPANS * (MOST_ROW_SPAN_FIXED_BYTES + 2 * SPAN_KEY_BYTES);
+        let summary_room = span_room + found_summary.max(planned_summary).max(scan.least_summary_room(index, columns_here) * 2);
         summary.rows.make_room(ByteCount(summary_room as u64));
         volumes.push(Volume {
             id: VolumeId(index as u8),
@@ -607,8 +633,10 @@ pub fn build_state<Backend: Io>(
             reserve: ByteCount(sizing.segment_bytes.0 * 2),
             summary: Mutex::new(summary.rows),
             summary_paths: summary.paths,
+            summary_buffer: Pool::new(vec![touched_buffer(summary_room)]),
             damage: DamageList::new(),
-            damaged: Mutex::new(Vec::new()),
+            damaged: Mutex::new(Vec::with_capacity(MOST_DAMAGED_SPANS)),
+            is_clearing: AtomicBool::new(false),
         });
     }
 

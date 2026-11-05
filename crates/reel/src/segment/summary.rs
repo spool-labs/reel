@@ -32,10 +32,14 @@ pub const ROW_HEAD_BYTES: usize = 3 * size_of::<u32>();
 pub const ROW_SUM_BYTES: usize = size_of::<u64>();
 /// Bytes of the fields every row has, before its columns
 pub const ROW_FACT_BYTES: usize = 69;
+/// Where a row's body keeps its span count
+pub const SPAN_COUNT_AT: usize = 59;
 /// Most bytes of a key a row keeps, so a column costs about 100 B whatever the keys are
 pub const SUMMARY_KEY_BYTES: usize = 32;
 /// Bytes a row takes before its columns and spans
 pub const MOST_ROW_FIXED_BYTES: usize = ROW_HEAD_BYTES + ROW_FACT_BYTES + ROW_SUM_BYTES;
+/// Bytes a span adds to a row, before its keys
+pub const MOST_ROW_SPAN_FIXED_BYTES: usize = 1 + 2 * size_of::<u16>();
 /// The most bytes a column adds to a row, with its bounded keys
 pub const MOST_ROW_COLUMN_BYTES: usize = 21 + 2 * SUMMARY_KEY_BYTES + 1;
 /// Marks a span that runs to its column's end
@@ -188,11 +192,13 @@ impl SummaryRows {
     pub fn push<'key>(
         &mut self,
         facts: &SegmentFacts,
-        columns: impl ExactSizeIterator<Item = ColumnFacts<'key>> + Clone,
-        spans: impl ExactSizeIterator<Item = SpanFacts<'key>> + Clone,
+        columns: impl Iterator<Item = ColumnFacts<'key>> + Clone,
+        spans: impl Iterator<Item = SpanFacts<'key>> + Clone,
     ) -> bool {
         // a row keeps its counts in two bytes, and the pools that feed it stay well under that
-        debug_assert!(spans.len() < usize::from(NO_END) && columns.len() < usize::from(NO_END));
+        let column_count = columns.clone().count();
+        let span_count = spans.clone().count();
+        debug_assert!(span_count < usize::from(NO_END) && column_count < usize::from(NO_END));
         let body = row_bytes(columns.clone(), spans.clone());
         if self.bytes.len() + ROW_HEAD_BYTES + body + ROW_SUM_BYTES > self.bytes.capacity() {
             return false;
@@ -201,7 +207,7 @@ impl SummaryRows {
         let start = self.bytes.len();
         self.bytes.extend_from_slice(&row_head(body as u32));
         let body_at = self.bytes.len();
-        self.put_facts(facts, columns.len() as u16, spans.len() as u16);
+        self.put_facts(facts, column_count as u16, span_count as u16);
         for column in columns {
             self.bytes.push(column.column.0);
             self.bytes.extend_from_slice(&(column.lowest.len() as u16).to_le_bytes());
@@ -211,16 +217,7 @@ impl SummaryRows {
             self.bytes.extend_from_slice(column.lowest);
             self.bytes.extend_from_slice(column.bound);
         }
-        for span in spans {
-            self.bytes.push(span.column.0);
-            self.bytes.extend_from_slice(&(span.start.len() as u16).to_le_bytes());
-            let end_length = span.end.map_or(NO_END, |end| end.len() as u16);
-            self.bytes.extend_from_slice(&end_length.to_le_bytes());
-            self.bytes.extend_from_slice(span.start);
-            if let Some(end) = span.end {
-                self.bytes.extend_from_slice(end);
-            }
-        }
+        self.put_spans(spans);
 
         let sum = checksum(&self.bytes[body_at..]);
         self.bytes.extend_from_slice(&sum.0.to_le_bytes());
@@ -233,8 +230,8 @@ impl SummaryRows {
     pub fn push_kept<'key>(
         &mut self,
         facts: &SegmentFacts,
-        columns: impl ExactSizeIterator<Item = ColumnFacts<'key>> + Clone,
-        spans: impl ExactSizeIterator<Item = SpanFacts<'key>> + Clone,
+        columns: impl Iterator<Item = ColumnFacts<'key>> + Clone,
+        spans: impl Iterator<Item = SpanFacts<'key>> + Clone,
     ) -> u64 {
         let mut dropped = 0;
         while !self.push(facts, columns.clone(), spans.clone()) {
@@ -256,6 +253,86 @@ impl SummaryRows {
         };
         self.remove(segment);
         true
+    }
+
+    /// Write a row's spans
+    pub fn put_spans<'key>(&mut self, spans: impl Iterator<Item = SpanFacts<'key>>) {
+        for span in spans {
+            self.bytes.push(span.column.0);
+            self.bytes.extend_from_slice(&(span.start.len() as u16).to_le_bytes());
+            let end_length = span.end.map_or(NO_END, |end| end.len() as u16);
+            self.bytes.extend_from_slice(&end_length.to_le_bytes());
+            self.bytes.extend_from_slice(span.start);
+            if let Some(end) = span.end {
+                self.bytes.extend_from_slice(end);
+            }
+        }
+    }
+
+    /// Replace a row's spans in place, moving what follows it, and return false when the segment has no row.
+    /// A row that outgrows the room gives up rows with no spans first
+    pub fn rewrite_spans<'key>(
+        &mut self,
+        segment: SegmentNumber,
+        spans: impl Iterator<Item = SpanFacts<'key>> + Clone,
+    ) -> Option<u64> {
+        let mut new_bytes = 0;
+        for span in spans.clone() {
+            new_bytes += 1 + 2 * size_of::<u16>() + span.start.len() + span.end.map_or(0, <[u8]>::len);
+        }
+
+        let mut dropped = 0;
+        loop {
+            let (at, length, spans_at) = self.find_spans(segment)?;
+            let body_at = at + ROW_HEAD_BYTES;
+            let body_end = at + length - ROW_SUM_BYTES;
+            let new_end = spans_at + new_bytes + ROW_SUM_BYTES;
+            let new_length = self.bytes.len() + new_end - (at + length);
+            if new_length > self.bytes.capacity() {
+                if self.drop_clean_row() {
+                    dropped += 1;
+                    continue;
+                }
+                self.bytes.reserve(new_length - self.bytes.len());
+            }
+
+            let old_length = self.bytes.len();
+            if new_length > old_length {
+                self.bytes.resize(new_length, 0);
+            }
+            self.bytes.copy_within(body_end + ROW_SUM_BYTES..old_length, new_end);
+            self.bytes.truncate(new_length);
+
+            let mut span_at = spans_at;
+            for span in spans.clone() {
+                span_at += write_span(&mut self.bytes[span_at..], &span);
+            }
+
+            let span_count = spans.clone().count() as u16;
+            self.bytes[body_at + SPAN_COUNT_AT..body_at + SPAN_COUNT_AT + 2].copy_from_slice(&span_count.to_le_bytes());
+            let body_length = new_end - ROW_SUM_BYTES - body_at;
+            self.bytes[at..body_at].copy_from_slice(&row_head(body_length as u32));
+            let sum = checksum(&self.bytes[body_at..body_at + body_length]);
+            self.bytes[body_at + body_length..new_end].copy_from_slice(&sum.0.to_le_bytes());
+            return Some(dropped);
+        }
+    }
+
+    /// Find a segment's row, its length and where its spans start
+    pub fn find_spans(&self, segment: SegmentNumber) -> Option<(usize, usize, usize)> {
+        let mut at = 0;
+        while let Some((length, row)) = read_row(&self.bytes[at..]) {
+            if let Some(row) = row.filter(|row| row.facts.segment == segment) {
+                let mut cursor = row.cursor();
+                for _column in 0..row.column_count {
+                    cursor.column()?;
+                }
+                let spans_length = cursor.bytes.len();
+                return Some((at, length, at + length - ROW_SUM_BYTES - spans_length));
+            }
+            at += length;
+        }
+        None
     }
 
     /// Write a row's fixed fields
@@ -352,6 +429,20 @@ impl<'bytes> Iterator for RowWalk<'bytes> {
             }
         }
     }
+}
+
+/// Write one span into a row, and return its bytes
+pub fn write_span(out: &mut [u8], span: &SpanFacts) -> usize {
+    let end = span.end.unwrap_or_default();
+    let end_length = span.end.map_or(NO_END, |end| end.len() as u16);
+    let keys_at = 1 + 2 * size_of::<u16>();
+    out[0] = span.column.0;
+    out[1..3].copy_from_slice(&(span.start.len() as u16).to_le_bytes());
+    out[3..keys_at].copy_from_slice(&end_length.to_le_bytes());
+    let end_at = keys_at + span.start.len();
+    out[keys_at..end_at].copy_from_slice(span.start);
+    out[end_at..end_at + end.len()].copy_from_slice(end);
+    end_at + end.len()
 }
 
 /// Work out the bytes of a row's body

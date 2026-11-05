@@ -481,6 +481,5 @@ pub fn newest_of(open: Option<WriteRow>, sealed: Option<SealedRow>) -> Located {
 pub fn corruption(read: &KeyRead) -> StoreError {
     StoreError::Corruption {
         column: read.column,
-        key: read.key.to_vec(),
     }
 }

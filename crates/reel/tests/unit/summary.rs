@@ -180,3 +180,29 @@ fn row_grows() {
     assert_eq!(dropped, 0);
     assert_eq!(rows.get(SegmentNumber(1)).expect("row").facts, facts(1));
 }
+
+// spans rewritten in place leave the row and the rows after it whole
+#[test]
+fn span_rewrite() {
+    let mut rows = filled();
+    let longer = SpanFacts {
+        column: ColumnId(2),
+        start: b"a long start key",
+        end: Some(b"a long end key"),
+    };
+
+    assert_eq!(rows.rewrite_spans(SegmentNumber(1), [longer, span()].into_iter()), Some(0));
+
+    let row = rows.get(SegmentNumber(1)).expect("row");
+    let mut cursor = row.cursor();
+    assert_eq!(row.span_count, 2);
+    assert_eq!(cursor.column(), Some(column()));
+    assert_eq!(cursor.span(), Some(longer));
+    assert_eq!(cursor.span(), Some(span()));
+    assert_eq!(rows.get(SegmentNumber(2)).expect("row").facts, facts(2));
+
+    assert_eq!(rows.rewrite_spans(SegmentNumber(1), [].into_iter()), Some(0));
+    assert_eq!(rows.get(SegmentNumber(1)).expect("row").span_count, 0);
+    assert_eq!(rows.get(SegmentNumber(2)).expect("row").facts, facts(2));
+    assert_eq!(rows.rewrite_spans(SegmentNumber(3), [].into_iter()), None);
+}

@@ -1,11 +1,15 @@
 //! Fixed buffers shared by every thread: a caller takes one or waits
 
+use std::hint::black_box;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Condvar, Mutex};
 
 use reel_api::units::ByteCount;
 
 use crate::guard::hold;
+
+/// The byte a pool is first written with, which is not zero so the writes happen
+pub const TOUCH_BYTE: u8 = 0xA5;
 
 /// A fixed set of items, each owned by its user while in use so no lock spans a read
 #[derive(Debug)]
@@ -60,4 +64,12 @@ impl<Item> Pool<Item> {
             };
         }
     }
+}
+
+/// Allocate a buffer with every page written, since zeroed memory from the allocator is mapped on first use
+pub fn touched_buffer(capacity: usize) -> Vec<u8> {
+    let mut buffer = vec![TOUCH_BYTE; capacity];
+    black_box(buffer.as_mut_slice());
+    buffer.clear();
+    buffer
 }

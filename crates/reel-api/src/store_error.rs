@@ -25,8 +25,10 @@ pub enum StoreError {
     BatchTooLarge { length: ByteCount, limit: ByteCount },
     #[error("batch touches more than one volume")]
     BatchAcrossVolumes,
-    #[error("record of key {key:?} in column {column:?} failed its check")]
-    Corruption { column: ColumnId, key: Vec<u8> },
+    #[error("a record in column {column:?} failed its check")]
+    Corruption { column: ColumnId },
+    #[error("the damage pool of volume {volume:?} is full, so a clear that splits a span has to wait")]
+    DamagePoolFull { volume: VolumeId },
     #[error("volume {volume:?} is below its free space reserve")]
     VolumeFull { volume: VolumeId },
     #[error("volume {volume:?} refuses writes after a failed sync")]

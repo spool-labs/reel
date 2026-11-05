@@ -170,10 +170,13 @@ impl<Backend: Io> EngineState<Backend> {
         self.dropped_summary_rows.fetch_add(rows, Ordering::AcqRel);
     }
 
-    /// Write a volume's summary whole, and only its own seal, a clear and close wait on the lock
+    /// Write a volume's summary whole from a copy, so no lock is held over the writes, and one save runs at a time
     pub fn save_summary(&self, volume: &Volume<Backend>) -> Result<(), Error> {
-        let rows = hold(&volume.summary);
-        write_summary(&self.io, &volume.summary_paths, self.read_point(), rows.bytes())
+        volume.summary_buffer.with(|buffer| {
+            buffer.clear();
+            buffer.extend_from_slice(hold(&volume.summary).bytes());
+            write_summary(&self.io, &volume.summary_paths, self.read_point(), buffer)
+        })
     }
 
     /// Check the saved limit or segment counter is more than half used

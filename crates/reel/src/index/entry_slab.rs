@@ -5,6 +5,7 @@ use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::index::open_slots::OpenSlot;
 use crate::index::write_row::WriteRow;
+use crate::pool::TOUCH_BYTE;
 use crate::row_kind::RowKind;
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -12,8 +13,6 @@ use crate::segment::segment_tail::SegmentNumber;
 pub const PAGE_BYTES: usize = 8 * 1024;
 /// Every row starts on a multiple of this
 pub const ENTRY_ALIGNMENT: usize = 8;
-/// Fills the pages at open, and differs from zero so every page is really touched
-pub const TOUCH_BYTE: u8 = 0xA5;
 /// Where the place sits in a row
 pub const PLACE_AT: usize = 0;
 /// Where the file offset sits in a row

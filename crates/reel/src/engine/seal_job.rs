@@ -23,7 +23,7 @@ use crate::segment::column_directory::DirectoryEntry;
 use crate::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
 use crate::segment::row_block::FooterRow;
 use crate::segment::segment_tail::{BlockCount, SegmentNumber};
-use crate::engine::recovery::span_of;
+use crate::segment::damage_list::{highest_of, spans_of};
 use crate::segment::summary::SegmentFacts;
 
 /// Rows one step of a seal handles
@@ -232,22 +232,24 @@ impl<Backend: Io> SealJob<Backend> {
             // spans of a segment still open go on in its row, and only a clear ends them
             let mut rows = hold(&volume.summary);
             let is_listed = hold(&volume.damaged).contains(&target.number);
-            let spans = if is_listed { volume.damage.of_segment(target.number) } else { Vec::new() };
+            let slots = volume.damage.slots();
             if is_listed {
                 rows.remove(target.number);
             }
-            if let Some(span) = spans.first() {
-                facts.is_damaged = true;
-                facts.damage_place = span.highest_place;
+            match highest_of(&slots, target.number).filter(|_place| is_listed) {
+                Some(place) => {
+                    facts.is_damaged = true;
+                    facts.damage_place = place;
+                    state.note_dropped_rows(rows.push_kept(&facts, columns, spans_of(&slots, target.number)));
+                },
+                None => {
+                    // a clean row that won't fit costs nothing until the segment is damaged, and then its columns count whole
+                    if !rows.push(&facts, columns, [].into_iter()) {
+                        state.note_dropped_row();
+                    }
+                },
             }
-            if spans.is_empty() {
-                // a clean row that won't fit costs nothing until the segment is damaged, and then its columns count whole
-                if !rows.push(&facts, columns, [].into_iter()) {
-                    state.note_dropped_row();
-                }
-            } else {
-                state.note_dropped_rows(rows.push_kept(&facts, columns, spans.iter().map(span_of)));
-            }
+            drop(slots);
             drop(rows);
             self.is_summarized = true;
         }

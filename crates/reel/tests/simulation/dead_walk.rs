@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::engine_state::IndexWait;
 use reel::engine::open_segment::SegmentPhase;
-use reel::engine::planner::Planner;
+use reel::engine::planner::{Planner, WALK_LAG_SEGMENTS};
 use reel::engine::reel_store::ReelStore;
 use reel::engine::walk_job::WalkJob;
 use reel::guard::hold;
@@ -28,6 +28,7 @@ const SECOND_ROOT: &str = "/disk/walk-second";
 const BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
 const LARGE_BUDGET: ByteCount = ByteCount(512 * 1024 * 1024);
 const WALK_JOB: &str = "reel-planner";
+const SEAL_JOB: &str = "reel-seal";
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 20_000;
 const YIELD_STEPS: u64 = 200;
@@ -587,5 +588,60 @@ fn older_row_behind() {
 
     assert_eq!(counts(&store, older).1, RowCount(1));
     assert_eq!(counts(&store, newer).1, RowCount(VERSIONS - 1));
+    store.close().expect("close");
+}
+
+// the walk stands aside while a seal has a segment waiting, and stops standing aside once it has fallen too far behind
+#[test]
+fn stands_aside_for_seals() {
+    let io = SimulatedIo::new(Seed(21));
+    let store = open(&io);
+    io.hold_jobs(WALK_JOB, true);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let number = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, number);
+    io.hold_jobs(SEAL_JOB, true);
+    store.put(COLUMN, b"other", b"value").expect("put");
+    let volume = &store.state.volumes[0];
+    assert_eq!(volume.walks_waiting.load(Ordering::Acquire), 1);
+    let mut planner = Planner {
+        state: store.state.clone(),
+        walks: vec![WalkJob::new(store.state.clone(), 0)],
+        last: 0,
+    };
+    assert!(!planner.is_seal_first());
+
+    hold(&volume.claims).open[0].phase = SegmentPhase::Sealing;
+    assert!(planner.is_seal_first());
+    assert_eq!(planner.step(), JobStep::Idle);
+    assert_eq!(store.state.pending_walks(0), 1);
+
+    volume.walks_waiting.store(WALK_LAG_SEGMENTS, Ordering::Release);
+    assert!(!planner.is_seal_first());
+    assert_eq!(planner.step(), JobStep::Worked);
+    assert_eq!(store.state.pending_walks(0), 0);
+
+    drop(planner);
+    io.hold_jobs(SEAL_JOB, false);
+    store.close().expect("close");
+}
+
+// a reopen counts the segments still waiting for a walk
+#[test]
+fn waiting_reopen() {
+    let io = SimulatedIo::new(Seed(22));
+    let store = open(&io);
+    io.hold_jobs(WALK_JOB, true);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let number = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, number);
+    store.close().expect("close");
+    drop(store);
+
+    let store = open(&io);
+
+    assert_eq!(store.state.volumes[0].walks_waiting.load(Ordering::Acquire), 1);
+    settle(&io);
+    assert_eq!(store.state.volumes[0].walks_waiting.load(Ordering::Acquire), 0);
     store.close().expect("close");
 }

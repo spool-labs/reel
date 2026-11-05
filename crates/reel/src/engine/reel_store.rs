@@ -381,14 +381,18 @@ pub fn bring_up<Backend: Io>(
     }
     // the rows name finished segments and dead rows a block, which go to the table once it holds them
     for volume in &state.volumes {
+        let mut waiting = 0;
         for row in hold(&volume.summary).rows() {
             if row.facts.is_walked() {
                 volume.table.mark_walked(row.facts.segment);
+            } else {
+                waiting += 1;
             }
             for (block, dead) in row.dead_blocks() {
                 volume.table.drop_live(row.facts.segment, block, dead);
             }
         }
+        volume.walks_waiting.store(waiting, Ordering::Release);
     }
     recover_segments(state, scan).map_err(open_error("recovering a segment"))?;
     let damaged: usize = state.volumes.iter().map(|volume| hold(&volume.damaged).len()).sum();
@@ -755,6 +759,7 @@ pub fn build_state<Backend: Io>(
             segment_bytes: sizing.segment_bytes,
             segment_rows: sizing.segment_rows,
             walk_retries: AtomicU64::new(0),
+            walks_waiting: AtomicU64::new(0),
             reserve: ByteCount(sizing.segment_bytes.0 * 2),
             summary: Mutex::new(summary.rows),
             summary_paths: summary.paths,

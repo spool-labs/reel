@@ -312,6 +312,10 @@ impl<Backend: Io> SealJob<Backend> {
                 },
             }
             drop(slots);
+            // a row the summary had no room for never gets a walk, so it isn't waiting for one
+            if rows.find_row(target.number).is_some() {
+                volume.walks_waiting.fetch_add(1, Ordering::AcqRel);
+            }
             drop(rows);
             self.is_summarized = true;
         }
@@ -438,6 +442,9 @@ impl<Backend: Io> SealJob<Backend> {
         claims.open.retain(|segment| segment.slot != target.slot);
         *hold(&state.slot_files[target.slot.0 as usize].leaving_rows) = Some(target.rows.clone());
         drop(claims);
+        if let Some(task) = self.state.planner_task.get() {
+            task.wake();
+        }
         self.phase = SealPhase::Cleaning;
     }
 

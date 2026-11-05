@@ -56,6 +56,7 @@ pub struct Volume<Backend: Io> {
     pub segment_bytes: ByteCount,
     pub segment_rows: RowCount,
     pub walk_retries: AtomicU64,
+    pub walks_waiting: AtomicU64,
     pub summary: Mutex<SummaryRows>,
     pub summary_paths: SummaryPaths,
     pub lost_rows: Mutex<LostRows>,

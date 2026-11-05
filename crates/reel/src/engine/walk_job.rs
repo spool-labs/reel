@@ -142,6 +142,8 @@ impl<Backend: Io> WalkJob<Backend> {
         }
 
         volume.table.mark_walked(target.segment);
+        // a row dropped for room after its seal counted can leave this at zero
+        let _waiting = volume.walks_waiting.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_sub(1));
         self.target = None;
         state.save_summary(volume)
     }

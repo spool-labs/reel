@@ -537,6 +537,31 @@ impl<Backend: Io> EngineState<Backend> {
         self.footer_readers.with(|reader| self.search_directory(volume, directory, read, reader))
     }
 
+    /// Check an older row of a key could still be read: in a sealed segment other than one, or among the open rows
+    pub fn has_older_row(
+        &self,
+        volume: &Volume<Backend>,
+        column: ColumnId,
+        key: &[u8],
+        place: WritePlace,
+        skipped: SegmentNumber,
+    ) -> Result<bool, StoreError> {
+        let Some(directory) = &self.directories[column.0 as usize] else {
+            return Ok(false);
+        };
+        let read = self.key_read(column, key, WritePlace(place.0.saturating_sub(1)), false)?;
+        let found = self.index.lookup(column, key, read.read_point, volume.view());
+        let sealed = self.footer_readers.with(|reader| {
+            self.walk_candidates(directory, key, reader, |segment, reader, best| {
+                if segment == skipped {
+                    return Ok(());
+                }
+                self.ask_segment(volume, &read, segment, reader, best)
+            })
+        })?;
+        Ok(newest_of(found.row, sealed).place().is_some())
+    }
+
     /// Find a key's newest row among the segments whose walks have finished, leaving out one segment and range rows
     pub fn newest_walked(
         &self,

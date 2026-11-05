@@ -388,6 +388,7 @@ impl<Backend: Io> WalkJob<Backend> {
         });
         self.counter.last_column = None;
         self.next_handed_out = self.target.map_or(0, |target| target.next_block);
+        volume.has_walk_target.store(self.target.is_some(), Ordering::Release);
         self.target.is_some()
     }
 
@@ -449,6 +450,7 @@ impl<Backend: Io> WalkJob<Backend> {
         }
 
         volume.table.mark_walked(target.segment);
+        volume.has_walk_target.store(false, Ordering::Release);
         volume.wants_compaction.store(true, Ordering::Release);
         // a row dropped for room after its seal counted can leave this at zero
         let _waiting = volume.walks_waiting.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_sub(1));

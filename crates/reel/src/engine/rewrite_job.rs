@@ -50,6 +50,8 @@ pub struct RewriteTarget {
 /// How far a rewrite has gone
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RewritePhase {
+    /// Rows of a grave-heavy segment are being decided, and nothing is copied unless one would drop
+    Deciding,
     /// Rows are being decided and records copied
     Copying,
     /// Row blocks are moving down to the records' end
@@ -71,6 +73,7 @@ pub struct RewriteJob<Backend: Io> {
     used: usize,
     records_end: FileOffset,
     moved: u64,
+    input_length: ByteCount,
     block: Vec<u8>,
     key: Vec<u8>,
     last_key: Vec<u8>,
@@ -105,6 +108,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             used: 0,
             records_end: FileOffset(0),
             moved: 0,
+            input_length: ByteCount(0),
             block: touched_zeroes(ROW_BLOCK_BYTES),
             key: touched_capacity(keys, 0),
             last_key: touched_capacity(keys, 0),
@@ -135,15 +139,22 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.target.is_some()
     }
 
-    /// Start on the next half-dead segment past the last one tried, once no segment waits for a walk. A walk already going
-    /// would count rows this rewrite has decided on
+    /// Start on the next ready segment past the last one tried, once no walk target is in progress, since it would count rows
+    /// this rewrite has decided on. The walks wait from here to the install. A grave-heavy segment is decided first, and
+    /// copies nothing if no row would drop
     pub fn start(&mut self) -> bool {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
-        let Some(target) = self.pick(volume) else {
+        let Some((target, length, is_grave_heavy)) = self.pick(volume) else {
             return false;
         };
-        match self.open_output(volume, target) {
+        if is_grave_heavy {
+            self.clear(target, length);
+            self.phase = RewritePhase::Deciding;
+            volume.is_rewriting.store(true, Ordering::Release);
+            return true;
+        }
+        match self.open_output(volume, target, length) {
             Ok(()) => true,
             Err(_error) => {
                 self.abandon();
@@ -153,12 +164,12 @@ impl<Backend: Io> RewriteJob<Backend> {
     }
 
     /// Pick a segment and note it as tried
-    pub fn pick(&mut self, volume: &Volume<Backend>) -> Option<(RewriteTarget, ByteCount)> {
+    pub fn pick(&mut self, volume: &Volume<Backend>) -> Option<(RewriteTarget, ByteCount, bool)> {
         let rows = hold(&volume.summary);
-        if rows.rows().any(|row| !row.facts.is_walked()) {
+        if volume.has_walk_target.load(Ordering::Acquire) {
             return None;
         }
-        let ready = rows.rows().filter(|row| is_rewrite_ready(row, volume.table.freed_bytes(row.facts.segment)));
+        let ready = rows.rows().filter(|row| row.facts.is_walked() && is_rewrite_ready(row, volume.table.freed_bytes(row.facts.segment)));
         let after = ready.clone().filter(|row| row.facts.segment > self.last_tried).min_by_key(|row| row.facts.segment);
         let picked = after.or_else(|| ready.min_by_key(|row| row.facts.segment))?;
         self.last_tried = picked.facts.segment;
@@ -168,11 +179,12 @@ impl<Backend: Io> RewriteJob<Backend> {
             block_count: picked.facts.block_count,
             blocks_at: picked.facts.data_end,
         };
-        Some((target, picked.facts.file_length))
+        Some((target, picked.facts.file_length, is_grave_heavy(&picked)))
     }
 
-    /// Create the output and clear what the last rewrite left
-    pub fn open_output(&mut self, volume: &Volume<Backend>, (target, length): (RewriteTarget, ByteCount)) -> Result<()> {
+    /// Create the output and clear what the last rewrite left. It reserves the input's whole length, so a rewrite holds that
+    /// much twice until its footer cuts the output down
+    pub fn open_output(&mut self, volume: &Volume<Backend>, target: RewriteTarget, length: ByteCount) -> Result<()> {
         let state = Arc::clone(&self.state);
         let Some(pin) = volume.table.pin(target.segment) else {
             return Err(Error::from(ErrorKind::NotFound));
@@ -187,8 +199,16 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.output = Some(output);
 
         self.writer.start(target.blocks_at, pin.head.place_base);
-        self.target = Some(target);
+        self.clear(target, length);
         self.phase = RewritePhase::Copying;
+        volume.is_rewriting.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Start a pass over a target
+    pub fn clear(&mut self, target: RewriteTarget, length: ByteCount) {
+        self.target = Some(target);
+        self.input_length = length;
         self.totals = None;
         self.used = 0;
         self.records_end = FileOffset(0);
@@ -199,8 +219,6 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.highest_replacement = WritePlace(0);
         self.dropped_rows = 0;
         self.kept_dead.clear();
-        volume.is_rewriting.store(true, Ordering::Release);
-        Ok(())
     }
 
     /// Run one bounded step, and give the rewrite up on any failure, which leaves the input as it was
@@ -209,7 +227,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             return;
         };
         let outcome = match self.phase {
-            RewritePhase::Copying if target.next_block < target.block_count => self.copy_block(target),
+            RewritePhase::Deciding | RewritePhase::Copying if target.next_block < target.block_count => self.copy_block(target),
+            RewritePhase::Deciding => self.end_deciding(target),
             RewritePhase::Copying => self.finish_rows(),
             RewritePhase::Moving => self.move_blocks(target),
             RewritePhase::Installing => self.install(target),
@@ -262,9 +281,14 @@ impl<Backend: Io> RewriteJob<Backend> {
             }
             let replacement = self.replacement(volume, block.column, &row, target)?;
             match replacement {
-                Some(place) if self.can_drop(&row, place) => {
+                Some(place) if self.can_drop(place, &row) => {
                     self.lowest_dropped = self.lowest_dropped.min(row.place);
                     self.highest_replacement = self.highest_replacement.max(place);
+                    self.dropped_rows += 1;
+                },
+                None if row.kind == RowKind::Grave && self.hides_nothing(volume, block.column, &row, target)? => {
+                    self.lowest_dropped = WritePlace(0);
+                    self.highest_replacement = self.highest_replacement.max(row.place);
                     self.dropped_rows += 1;
                 },
                 _kept => self.keep(volume, pin, block.column, &row, replacement, target)?,
@@ -299,9 +323,34 @@ impl<Backend: Io> RewriteJob<Backend> {
         Ok(own.max(self.newest_place).filter(|place| *place > row.place))
     }
 
-    /// Check a replaced row can go: no live cue sits at or above it and below its newest replacement. Graves stay for now
-    pub fn can_drop(&self, row: &FooterRow, replacement: WritePlace) -> bool {
-        row.kind == RowKind::Value && !self.state.cues.has_cue_between(row.place, replacement)
+    /// Check a replaced row can go: no live cue sits at or above it and below its newest replacement
+    pub fn can_drop(&self, replacement: WritePlace, row: &FooterRow) -> bool {
+        !self.state.cues.has_cue_between(row.place, replacement)
+    }
+
+    /// Check a grave with no newer row of its key has nothing left to hide, by this key's own rows and nothing wider. An older
+    /// grave keeps it too: that one's walk count stands on this row, and a later write of the key would count it twice. It
+    /// drops first, as any row with a newer one does. A file on its way out comes back at a crash, so no grave drops while
+    /// one is parked. A cue below the grave can read what it covers, and damage could be hiding an older version
+    pub fn hides_nothing(
+        &self,
+        volume: &Volume<Backend>,
+        column: ColumnId,
+        row: &FooterRow,
+        target: RewriteTarget,
+    ) -> Result<bool> {
+        let state = &self.state;
+        if volume.segments_parked.load(Ordering::Acquire) > 0
+            || state.cues.has_cue_below(row.place)
+            || volume.damage.covering(column, &self.key).is_some()
+        {
+            return Ok(false);
+        }
+        match state.has_older_row(volume, column, &self.key, row.place, target.segment) {
+            Ok(has_older) => Ok(!has_older),
+            Err(StoreError::Corruption { .. }) => Ok(false),
+            Err(_error) => Err(Error::from(ErrorKind::Interrupted)),
+        }
     }
 
     /// Carry a row into the output, and note it dead when a cue is all that keeps it, since no walk will count it again
@@ -314,6 +363,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         replacement: Option<WritePlace>,
         target: RewriteTarget,
     ) -> Result<()> {
+        if self.phase == RewritePhase::Deciding {
+            return Ok(());
+        }
         let Some(output) = self.output.clone() else {
             return Err(Error::from(ErrorKind::NotFound));
         };
@@ -398,13 +450,27 @@ impl<Backend: Io> RewriteJob<Backend> {
         Ok(())
     }
 
-    /// End the copying. A rewrite that dropped nothing or kept nothing has nothing to install
+    /// End the deciding: copy from the first block if a row would drop, and leave the segment alone if none would
+    pub fn end_deciding(&mut self, target: RewriteTarget) -> Result<()> {
+        if self.dropped_rows == 0 {
+            return Err(Error::from(ErrorKind::Interrupted));
+        }
+        let state = Arc::clone(&self.state);
+        let target = RewriteTarget { next_block: 0, ..target };
+        self.open_output(&state.volumes[self.volume], target, self.input_length)
+    }
+
+    /// End the copying. A rewrite that dropped nothing has nothing to install, and one that kept nothing has no output
     pub fn finish_rows(&mut self) -> Result<()> {
         let Some(output) = self.output.clone() else {
             return Err(Error::from(ErrorKind::NotFound));
         };
-        if self.dropped_rows == 0 || self.writer.columns().is_empty() {
+        if self.dropped_rows == 0 {
             return Err(Error::from(ErrorKind::Interrupted));
+        }
+        if self.writer.columns().is_empty() {
+            self.phase = RewritePhase::Installing;
+            return Ok(());
         }
         self.flush(&output.file)?;
         self.writer.close_block(&output.file)?;
@@ -453,7 +519,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     pub fn install(&mut self, target: RewriteTarget) -> Result<()> {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
-        let (Some(output), Some(totals)) = (self.output.clone(), self.totals) else {
+        let Some(output) = self.output.clone() else {
             return Err(Error::from(ErrorKind::NotFound));
         };
         // a full park clears as reads finish, and this step comes round again
@@ -467,10 +533,12 @@ impl<Backend: Io> RewriteJob<Backend> {
         if state.cues.has_cue_between(self.lowest_dropped, self.highest_replacement) {
             return Err(Error::from(ErrorKind::Interrupted));
         }
-        if !volume.table.install(output.file.clone(), &totals.head, self.writer.columns(), self.writer.entries()) {
-            return Err(Error::from(ErrorKind::OutOfMemory));
+        if let Some(totals) = self.totals {
+            if !volume.table.install(output.file.clone(), &totals.head, self.writer.columns(), self.writer.entries()) {
+                return Err(Error::from(ErrorKind::OutOfMemory));
+            }
+            volume.table.mark_walked(output.number);
         }
-        volume.table.mark_walked(output.number);
 
         for column in self.writer.columns() {
             let entry = DirectoryEntry {
@@ -495,10 +563,19 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
 
         let retired = volume.table.retire(target.segment);
-        self.summarize(volume, &output, &totals);
+        match self.totals {
+            Some(totals) => self.summarize(volume, &output, &totals),
+            None => {
+                hold(&volume.summary).remove(target.segment);
+            },
+        }
         let saved = state.save_summary(volume);
 
         hold(&volume.partial_output).take();
+        // every row dropped, so the file was never a segment
+        if self.totals.is_none() {
+            state.remove_output(volume, output);
+        }
         self.output = None;
         self.target = None;
         volume.is_rewriting.store(false, Ordering::Release);
@@ -564,7 +641,7 @@ pub fn is_rewrite_ready(row: &SummaryRow<'_>, freed_bytes: u64) -> bool {
     if row.facts.is_damaged || row.facts.has_covers || row.facts.block_count == 0 {
         return false;
     }
-    let (mut rows, mut dead_rows, mut bytes, mut dead_bytes) = (0, 0, 0, 0);
+    let (mut rows, mut dead_rows, mut live_graves, mut bytes, mut dead_bytes) = (0, 0, 0, 0, 0);
     let mut cursor = row.cursor();
     for _column in 0..row.column_count {
         let Some(column) = cursor.column() else {
@@ -572,9 +649,24 @@ pub fn is_rewrite_ready(row: &SummaryRow<'_>, freed_bytes: u64) -> bool {
         };
         rows += column.row_count.0;
         dead_rows += column.dead_rows.0;
+        live_graves += column.grave_count.0.saturating_sub(column.dead_graves.0);
         bytes += column.live_bytes.0 + column.dead_bytes.0;
         dead_bytes += column.dead_bytes.0;
     }
     let won_back = dead_bytes.saturating_sub(freed_bytes);
-    REWRITE_DIVISOR * dead_rows >= rows || (bytes > 0 && REWRITE_DIVISOR * won_back >= bytes)
+    REWRITE_DIVISOR * (dead_rows + live_graves) >= rows || (bytes > 0 && REWRITE_DIVISOR * won_back >= bytes)
+}
+
+/// Check a row's graves make up the share that would trigger a rewrite, so deciding first can save the copy
+pub fn is_grave_heavy(row: &SummaryRow<'_>) -> bool {
+    let (mut rows, mut graves) = (0, 0);
+    let mut cursor = row.cursor();
+    for _column in 0..row.column_count {
+        let Some(column) = cursor.column() else {
+            return false;
+        };
+        rows += column.row_count.0;
+        graves += column.grave_count.0;
+    }
+    REWRITE_DIVISOR * graves >= rows
 }

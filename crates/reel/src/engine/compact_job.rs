@@ -100,7 +100,10 @@ impl<Backend: Io> CompactJob<Backend> {
         if let Some(parked) = self.take_parked(volume) {
             return match state.clear_parked(volume, parked) {
                 Ok(()) => UnitStep::Worked,
-                Err(_) => UnitStep::RetryAt(Nanoseconds(now.0 + WALK_RETRY.0)),
+                Err(parked) => {
+                    park_again(volume, parked);
+                    UnitStep::RetryAt(Nanoseconds(now.0 + WALK_RETRY.0))
+                },
             };
         }
         // a live cue may still need what it kept, and its going brings the planner back
@@ -252,6 +255,13 @@ impl<Backend: Io> CompactJob<Backend> {
         saved?;
         volume.segments_unlinked.fetch_add(1, Ordering::AcqRel);
         Ok(())
+    }
+}
+
+/// Put back a parked segment whose file wouldn't go
+pub fn park_again<Backend: Io>(volume: &Volume<Backend>, parked: ParkedSegment<Backend::File>) {
+    if let Some(slot) = hold(&volume.parked).iter_mut().find(|slot| slot.is_none()) {
+        *slot = Some(parked);
     }
 }
 

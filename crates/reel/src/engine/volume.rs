@@ -102,6 +102,8 @@ pub struct Volume<Backend: Io> {
     /// A rewrite has made its first row decision and not installed. Rows it decided on must stay as they were, so no walk
     /// starts a target
     pub is_rewriting: AtomicBool,
+    /// The walk is part way through a segment
+    pub has_walk_target: AtomicBool,
     /// Counts the turns a walk stood aside for a rewrite
     pub walks_held: AtomicU64,
     pub partial_output: Mutex<Option<RewriteOutput<Backend::File>>>,

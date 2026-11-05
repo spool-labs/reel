@@ -304,22 +304,30 @@ impl<Backend: Io> EngineState<Backend> {
         hold(&self.volumes[volume].summary).is_lookup_whole()
     }
 
-    /// Close a parked segment's file and remove it, unless a failed save means a row still lists it. A failed remove leaves
-    /// the file to the next open, which finds it with no row and walks it dead again
-    pub fn clear_parked(&self, volume: &Volume<Backend>, parked: ParkedSegment<Backend::File>) -> Result<(), Error> {
+    /// Remove a parked segment's file and close it, unless a failed save means a row still lists it. A failed remove hands the
+    /// segment back to stay parked, since no grave may drop while a file that could bring its key back is on disk
+    pub fn clear_parked(
+        &self,
+        volume: &Volume<Backend>,
+        parked: ParkedSegment<Backend::File>,
+    ) -> Result<(), ParkedSegment<Backend::File>> {
+        if parked.is_saved {
+            for root in &volume.roots {
+                match self.io.remove_file(&data_path(root, parked.segment)) {
+                    Ok(()) => {
+                        if self.io.sync_directory(root).is_err() {
+                            return Err(parked);
+                        }
+                        break;
+                    },
+                    Err(error) if error.kind() == ErrorKind::NotFound => {},
+                    Err(_error) => return Err(parked),
+                }
+            }
+        }
         volume.segments_parked.fetch_sub(1, Ordering::AcqRel);
         volume.table.free_retired(&parked.retired);
         self.io.close_file(parked.retired.file);
-        if !parked.is_saved {
-            return Ok(());
-        }
-        for root in &volume.roots {
-            match self.io.remove_file(&data_path(root, parked.segment)) {
-                Ok(()) => return self.io.sync_directory(root),
-                Err(error) if error.kind() == ErrorKind::NotFound => {},
-                Err(error) => return Err(error),
-            }
-        }
         Ok(())
     }
 

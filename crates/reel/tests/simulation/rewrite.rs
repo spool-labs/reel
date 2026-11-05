@@ -29,6 +29,7 @@ const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 20_000;
 const CRASH_POINTS: u64 = 300;
 const KEYS: [&[u8]; 4] = [b"a", b"b", b"c", b"d"];
+const MOST_LOOPS: usize = 2_000;
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -453,5 +454,250 @@ fn open_removes_input() {
     settle(&io);
     check_reads(&store);
     assert!(hold(&store.state.volumes[0].damaged).is_empty());
+    store.close().expect("close");
+}
+
+// run compaction by hand until it has nothing to do, with every other job quiet
+fn compact(store: &Store, io: &SimulatedIo) {
+    hold_compaction(store, false);
+    store.state.ask_compaction();
+    settle(io);
+}
+
+fn delete_rows(store: &Store, io: &SimulatedIo) -> SegmentNumber {
+    for key in KEYS {
+        store.delete(COLUMN, key).expect("delete");
+    }
+    seal(store, io)
+}
+
+// a grave with nothing older anywhere drops at its first rewrite, and with every row gone so does its segment
+#[test]
+fn grave_hides_nothing() {
+    let io = SimulatedIo::new(Seed(12));
+    let store = open(&io);
+    let graves = delete_rows(&store, &io);
+    compact(&store, &io);
+    let volume = &store.state.volumes[0];
+    assert!(!volume.table.holds(graves));
+    assert!(!has_file(&io, graves));
+    assert_eq!(volume.segments_rewritten.load(Ordering::Acquire), 1);
+    for key in KEYS {
+        assert_eq!(read(&store, key), None);
+    }
+    store.close().expect("close");
+    let store = open(&io);
+    settle(&io);
+    for key in KEYS {
+        assert_eq!(read(&store, key), None);
+    }
+    store.close().expect("close");
+}
+
+// a grave stays while an older version is on disk, and a read never finds that version
+#[test]
+fn grave_stays_over_older() {
+    let io = SimulatedIo::new(Seed(13));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    store.put(COLUMN, b"keep", b"value").expect("put");
+    for key in KEYS {
+        store.put(COLUMN, key, b"first").expect("put");
+    }
+    store.put(COLUMN, b"keep-1", b"value").expect("put");
+    store.put(COLUMN, b"keep-2", b"value").expect("put");
+    store.put(COLUMN, b"keep-3", b"value").expect("put");
+    store.put(COLUMN, b"keep-4", b"value").expect("put");
+    let older = seal(&store, &io);
+    let graves = delete_rows(&store, &io);
+    compact(&store, &io);
+
+    let volume = &store.state.volumes[0];
+    assert!(volume.table.holds(older));
+    assert!(volume.table.holds(graves));
+    assert_eq!(volume.segments_rewritten.load(Ordering::Acquire), 0);
+    assert_eq!(read(&store, KEYS[0]), None);
+    store.close().expect("close");
+}
+
+// an older row in an open segment counts as much as a sealed one
+#[test]
+fn open_row_is_older_data() {
+    let io = SimulatedIo::new(Seed(14));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let place = WritePlace(store.state.read_point().0 + 1);
+    let volume = &store.state.volumes[0];
+    let found = store.state.has_older_row(volume, COLUMN, b"key", place, SegmentNumber(u64::MAX));
+    assert!(found.expect("search"));
+    store.close().expect("close");
+}
+
+// a grave over an older grave waits for it, or the older one's count would stand on nothing and a later write would count it
+// twice. The older one drops first, and then this one
+#[test]
+fn older_grave_goes_first() {
+    let io = SimulatedIo::new(Seed(15));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let first = delete_rows(&store, &io);
+    for key in KEYS {
+        store.put(COLUMN, key, b"value").expect("put");
+    }
+    let middle = seal(&store, &io);
+    let second = delete_rows(&store, &io);
+    compact(&store, &io);
+
+    let volume = &store.state.volumes[0];
+    assert!(!volume.table.holds(first));
+    assert!(!volume.table.holds(middle));
+    assert!(!volume.table.holds(second));
+    for key in KEYS {
+        assert_eq!(read(&store, key), None);
+    }
+    store.close().expect("close");
+}
+
+// a cue can read a row a grave in the same segment covers, so the grave waits for the cue, and a plain read never finds the row
+#[test]
+fn cue_keeps_grave() {
+    let io = SimulatedIo::new(Seed(16));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let cue = store.cue().expect("cue");
+    store.delete(COLUMN, b"key").expect("delete");
+    let graves = seal(&store, &io);
+    compact(&store, &io);
+
+    assert_eq!(read(&store, b"key"), None);
+    let mut buf = Vec::new();
+    assert!(cue.get(COLUMN, b"key", &mut buf).expect("get"));
+    assert_eq!(buf, b"value");
+
+    drop(cue);
+    settle(&io);
+    assert_eq!(read(&store, b"key"), None);
+    assert!(!store.state.volumes[0].table.holds(graves));
+    store.close().expect("close");
+}
+
+// a file on its way out comes back at a crash, so a grave over its rows stays until the file is gone, and a deleted key
+// stays deleted
+#[test]
+fn parked_file_keeps_grave() {
+    for is_power_cut in [false, true] {
+        let io = SimulatedIo::new(Seed(17));
+        let store = open(&io);
+        hold_compaction(&store, true);
+        let state = Arc::clone(&store.state);
+        let volume = &state.volumes[0];
+        for key in KEYS {
+            store.put(COLUMN, key, b"first").expect("put");
+        }
+        let older = seal(&store, &io);
+        let graves = delete_rows(&store, &io);
+
+        let pin = volume.table.pin(older).expect("a pin");
+        let job = CompactJob::new(Arc::clone(&state), 0);
+        job.unlink(volume, older, state.read_point()).expect("unlink");
+        assert_eq!(volume.segments_parked.load(Ordering::Acquire), 1);
+
+        let mut job = CompactJob::new(Arc::clone(&state), 0);
+        hold_compaction(&store, false);
+        for _loop in 0..MOST_LOOPS {
+            job.step_unit(Nanoseconds(0));
+        }
+        assert!(volume.table.holds(graves));
+
+        if is_power_cut {
+            io.power_cut();
+        } else {
+            io.kill();
+        }
+        drop(pin);
+        drop(job);
+        drop(store);
+        drop(state);
+
+        let store = open(&io);
+        settle(&io);
+        for key in KEYS {
+            assert_eq!(read(&store, key), None);
+        }
+        store.close().expect("close");
+    }
+}
+
+// deciding first copies nothing when no grave would drop
+#[test]
+fn deciding_copies_nothing() {
+    let io = SimulatedIo::new(Seed(18));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    store.put(COLUMN, b"a", b"first").expect("put");
+    for key in [b"b", b"c", b"d"] {
+        store.put(COLUMN, key, b"first").expect("put");
+    }
+    seal(&store, &io);
+    store.delete(COLUMN, b"a").expect("delete");
+    let graves = seal(&store, &io);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(job.rewrite.start());
+    assert_eq!(job.rewrite.phase, RewritePhase::Deciding);
+    assert!(job.rewrite.output.is_none());
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    assert!(!has_partial(&io));
+    assert!(store.state.volumes[0].table.holds(graves));
+    store.close().expect("close");
+}
+
+// a ready rewrite doesn't wait for walks still waiting, which at the ingest ceiling never run out
+#[test]
+fn ahead_of_waiting_walks() {
+    let io = SimulatedIo::new(Seed(19));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let (older, _newer) = half_dead(&store, &io);
+
+    io.hold_jobs("reel-planner", true);
+    store.put(COLUMN, b"later", b"value").expect("put");
+    seal(&store, &io);
+    assert_eq!(store.state.pending_walks(0), 1);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(job.rewrite.start());
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    assert!(!store.state.volumes[0].table.holds(older));
+    assert_eq!(store.state.pending_walks(0), 1);
+    io.hold_jobs("reel-planner", false);
+    store.state.ask_compaction();
+    settle(&io);
+    assert_eq!(store.state.pending_walks(0), 0);
+    check_reads(&store);
+    store.close().expect("close");
+}
+
+// a target in progress keeps a rewrite from starting, or its counts would land on rows the rewrite decided on
+#[test]
+fn walk_target_holds_rewrite() {
+    let io = SimulatedIo::new(Seed(20));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    half_dead(&store, &io);
+    store.state.volumes[0].has_walk_target.store(true, Ordering::Release);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(!job.rewrite.start());
+    store.state.volumes[0].has_walk_target.store(false, Ordering::Release);
+    assert!(job.rewrite.start());
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
     store.close().expect("close");
 }

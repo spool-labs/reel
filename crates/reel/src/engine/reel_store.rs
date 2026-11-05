@@ -356,7 +356,8 @@ impl<Backend: Io> EngineState<Backend> {
             if slot.as_ref().is_some_and(|parked| volume.table.retired_pins(&parked.retired) == 0)
                 && let Some(parked) = slot.take()
             {
-                let _removed = self.clear_parked(volume, parked);
+                // a file that stays is one open walks dead again, and a close has no later step to try
+                let _left = self.clear_parked(volume, parked);
             }
         }
         // a stopped rewrite leaves the store as it found it
@@ -825,6 +826,7 @@ pub fn build_state<Backend: Io>(
             parked: Mutex::new([const { None }; MOST_PARKED]),
             segments_rewritten: AtomicU64::new(0),
             is_rewriting: AtomicBool::new(false),
+            has_walk_target: AtomicBool::new(false),
             walks_held: AtomicU64::new(0),
             partial_output: Mutex::new(None),
             reserve: ByteCount(sizing.segment_bytes.0 * 2),

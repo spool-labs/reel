@@ -50,6 +50,7 @@ type Key = (ColumnId, Vec<u8>);
 struct Versions {
     history: Vec<Option<Vec<u8>>>,
     floor: usize,
+    refused_at: Option<usize>,
 }
 
 /// A plain map of versions
@@ -66,11 +67,33 @@ struct Run {
     steps_left: u64,
 }
 
+impl Versions {
+    // a refusal tells the model nothing, so the versions it could hold stay in play until a read or a newer write
+    fn is_unknown(&self) -> bool {
+        self.refused_at == Some(self.history.len())
+    }
+
+    fn note_refusal(&mut self) {
+        self.refused_at = Some(self.history.len());
+    }
+
+    // take what a read found as the truth, once it's at or above what a sync covered
+    fn accept(&mut self, found: &Option<Vec<u8>>) -> bool {
+        let Some(offset) = self.history[self.floor..].iter().position(|value| value == found) else {
+            return false;
+        };
+        self.history.truncate(self.floor + offset + 1);
+        self.refused_at = None;
+        true
+    }
+}
+
 impl Default for Versions {
     fn default() -> Self {
         Self {
             history: vec![None],
             floor: 0,
+            refused_at: None,
         }
     }
 }
@@ -346,17 +369,23 @@ impl Run {
     fn flush(&mut self, store: &Store) {
         if store.flush().is_ok() {
             for versions in self.model.values_mut() {
-                versions.floor = versions.history.len() - 1;
+                if !versions.is_unknown() {
+                    versions.floor = versions.history.len() - 1;
+                }
             }
         }
     }
 
     fn check_read(&mut self, store: &Store) {
         let (column, key) = self.random_key();
-        let newest = self.model.get(&(column, key.clone())).and_then(|versions| versions.history.last().cloned());
+        let versions = self.model.entry((column, key.clone())).or_default();
+        let newest = versions.history.last().cloned().flatten();
         match read(store, column, &key) {
-            Ok(found) => assert_eq!(found, newest.flatten(), "get of {key:?}"),
-            Err(StoreError::Corruption { .. }) if self.has_rot => {},
+            Ok(found) if versions.is_unknown() => {
+                assert!(versions.accept(&found), "seed {}: get of {key:?} read {found:?} below its floor", self.seed);
+            },
+            Ok(found) => assert_eq!(found, newest, "get of {key:?}"),
+            Err(StoreError::Corruption { .. }) if self.has_rot => versions.note_refusal(),
             Err(_crashed) if self.io.is_crashed() => {},
             Err(error) => panic!("seed {}: get of {key:?} failed: {error}", self.seed),
         }
@@ -398,13 +427,15 @@ impl Run {
         for ((column, key), versions) in &mut self.model {
             let found = match read(store, *column, key) {
                 Ok(found) => found,
-                Err(StoreError::Corruption { .. }) if self.has_rot => continue,
+                Err(StoreError::Corruption { .. }) if self.has_rot => {
+                    versions.note_refusal();
+                    continue;
+                },
                 Err(error) => panic!("seed {}: get of {key:?} failed: {error}", self.seed),
             };
-            let Some(offset) = versions.history[versions.floor..].iter().position(|value| *value == found) else {
+            if !versions.accept(&found) {
                 panic!("seed {}: key {key:?} read {found:?} below its floor, in {versions:?}", self.seed);
-            };
-            versions.history.truncate(versions.floor + offset + 1);
+            }
         }
     }
 

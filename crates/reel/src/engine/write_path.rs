@@ -20,7 +20,8 @@ use crate::index::write_row::WriteRow;
 use crate::io::{Io, IoFile, IoTask};
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::record_check::RecordIdentity;
-use crate::record::record_encoder::RecordEncoder;
+use crate::record::record_encoder::{PlainRecord, RecordEncoder};
+use crate::record::record_head::plain_length;
 use crate::row_kind::RowKind;
 use crate::rows::row_group::{RowEntry, row_size};
 
@@ -78,9 +79,30 @@ impl<Backend: Io> EngineState<Backend> {
             value,
             codec: info.codec,
         };
+        if info.codec == Codec::None && value.len() <= CHUNK_BYTES {
+            return self.write_plain(volume, &write);
+        }
+
         let is_large = info.codec == Codec::Lz4 && value.len() > CHUNK_BYTES;
         let encoders = if is_large { &self.large_encoders } else { &self.encoders };
         encoders.with(|encoder| self.write_encoded(volume, &write, encoder))
+    }
+
+    /// Write a one-chunk value as it stands, with its head on the stack, so no writer waits for a shared encoder
+    pub fn write_plain(&self, volume: &Volume<Backend>, write: &ValueWrite) -> Result<(), StoreError> {
+        let identity = RecordIdentity {
+            record_key: self.record_key,
+            column: write.column,
+            key: write.key,
+            kind: RowKind::Value,
+            place: WritePlace(0),
+        };
+        let record = PlainRecord::new(&identity, write.value);
+        let length = plain_length(ByteCount(write.value.len() as u64));
+        self.land_record(volume, write, length, |claim| {
+            let head = record.head(self.record_key, claim.first_place());
+            claim.data.write_at(claim.offset, &[IoSlice::new(&head), IoSlice::new(write.value)])
+        })
     }
 
     /// Lay a value out and write it, starting over when the index has no room for its row
@@ -105,6 +127,21 @@ impl<Backend: Io> EngineState<Backend> {
         };
 
         let length = shape.total_length();
+        self.land_record(volume, write, length, |claim| {
+            encoder.set_place(self.record_key, claim.first_place());
+            let parts = encoder.parts(&shape, write.value);
+            claim.data.write_at(claim.offset, &parts)
+        })
+    }
+
+    /// Claim room for a record, write it, and land its row, starting over when the index has no room
+    pub fn land_record(
+        &self,
+        volume: &Volume<Backend>,
+        write: &ValueWrite,
+        length: ByteCount,
+        mut write_record: impl FnMut(&Claim<'_, Backend>) -> std::io::Result<()>,
+    ) -> Result<(), StoreError> {
         let request = ClaimRequest {
             bytes: length,
             rows: RowCount(1),
@@ -112,9 +149,7 @@ impl<Backend: Io> EngineState<Backend> {
         };
         loop {
             let claim = self.claim(volume, &request)?;
-            encoder.set_place(self.record_key, claim.first_place());
-            let parts = encoder.parts(&shape, write.value);
-            if let Err(source) = claim.data.write_at(claim.offset, &parts) {
+            if let Err(source) = write_record(&claim) {
                 return Err(store_error(volume, "writing a record", source));
             }
 

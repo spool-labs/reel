@@ -9,7 +9,7 @@ use reel::io::{Io, IoFile};
 use reel::record::chunk_table::{ChunkEntry, ENTRIES_PER_PAGE};
 use reel::record::codec::{CHUNK_BYTES, Codec};
 use reel::record::record_check::{Checksum, RecordIdentity, RecordKey, checksum};
-use reel::record::record_encoder::RecordEncoder;
+use reel::record::record_encoder::{PlainRecord, RecordEncoder};
 use reel::record::record_head::{SMALL_HEAD_BYTES, chunk_count, chunked_head_bytes, plain_length};
 use reel::record::record_reader::{FIRST_READ_BYTES, RecordLocation, RecordRead, RecordReader};
 use reel::row_kind::RowKind;
@@ -437,5 +437,27 @@ fn plain_lengths() {
         let shape = encoder.encode(&identity, Codec::None, &value).expect("encode");
 
         assert_eq!(plain_length(ByteCount(length as u64)), shape.total_length(), "{length} bytes");
+    }
+}
+
+// a head built on the stack is the head the encoder lays out, so a get can't tell which writer made a record
+#[test]
+fn stack_head() {
+    let identity = RecordIdentity {
+        record_key: RECORD_KEY,
+        column: COLUMN,
+        key: KEY,
+        kind: RowKind::Value,
+        place: WritePlace(7),
+    };
+    let mut encoder = RecordEncoder::new(LARGEST, ByteCount(CHUNK_BYTES as u64));
+    for length in [0, 1, CHUNK_BYTES] {
+        let value = vec![3; length];
+        let shape = encoder.encode(&identity, Codec::None, &value).expect("encode");
+
+        let parts = encoder.parts(&shape, &value);
+
+        let head = PlainRecord::new(&identity, &value).head(RECORD_KEY, identity.place);
+        assert_eq!(&*parts[0], head.as_slice(), "{length} bytes");
     }
 }

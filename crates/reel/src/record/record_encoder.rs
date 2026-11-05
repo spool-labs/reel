@@ -29,6 +29,35 @@ pub struct RecordShape {
     pub is_payload_stored: bool,
 }
 
+/// A one-chunk record stored as written, whose head fits the stack, so its writer needs no shared encoder
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlainRecord {
+    check: RecordCheck,
+}
+
+impl PlainRecord {
+    /// The form of every such record
+    pub const FORM: RecordForm = RecordForm {
+        codec: Codec::None,
+        is_chunked: false,
+    };
+
+    /// Hash a value under its identity
+    pub fn new(identity: &RecordIdentity, value: &[u8]) -> Self {
+        Self {
+            check: record_check(identity, Self::FORM, checksum(value)),
+        }
+    }
+
+    /// Build the head for the place a claim gave this write
+    pub fn head(&self, record_key: RecordKey, place: WritePlace) -> [u8; SMALL_HEAD_BYTES] {
+        let mut head = [0; SMALL_HEAD_BYTES];
+        head[..CHECK_BYTES].copy_from_slice(&place_check(self.check, record_key, place).0.to_le_bytes());
+        head[FORM_AT] = Self::FORM.as_byte();
+        head
+    }
+}
+
 /// The buffers one writer borrows from the pool
 #[derive(Debug)]
 pub struct RecordEncoder {

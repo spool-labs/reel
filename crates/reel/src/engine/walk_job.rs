@@ -86,8 +86,11 @@ impl<Backend: Io> WalkJob<Backend> {
     /// newer one finished and counts against it, and then forward walks go from the lowest
     pub fn pick_target(&mut self) -> bool {
         let state = Arc::clone(&self.state);
-        let rows = hold(&state.volumes[self.volume].summary);
-        let waiting = rows.rows().filter(|row| !row.facts.is_walked());
+        let volume = &state.volumes[self.volume];
+        // a seal only ends past the mark, so every row a walk counts by is published, and its slot has let go of the file
+        let sealing = volume.sealing.load(Ordering::Acquire);
+        let rows = hold(&volume.summary);
+        let waiting = rows.rows().filter(|row| !row.facts.is_walked() && row.facts.segment.0 != sealing);
         let backward = waiting.clone().filter(|row| row.facts.is_backward).max_by_key(|row| row.facts.places.highest);
         let picked = backward.or_else(|| waiting.min_by_key(|row| row.facts.segment));
         self.target = picked.map(|row| WalkTarget {
@@ -135,7 +138,12 @@ impl<Backend: Io> WalkJob<Backend> {
         }
 
         self.counts.sort_unstable_by_key(|count| count.segment);
-        hold(&volume.summary).apply_walk(target.segment, next_block, &self.counts);
+        let mut rows = hold(&volume.summary);
+        rows.apply_walk(target.segment, next_block, &self.counts);
+        if !target.is_backward {
+            rows.note_forward(target.segment);
+        }
+        drop(rows);
         for count in self.counts.iter().filter(|count| count.rows > 0) {
             volume.table.drop_live(count.segment, count.block, count.rows);
         }

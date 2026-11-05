@@ -34,7 +34,7 @@ use crate::engine::compact_job::CompactJob;
 use crate::engine::cue::{Cue, CueTable};
 use crate::engine::planner::Planner;
 use crate::engine::walk_job::WalkJob;
-use crate::engine::volume::{ClaimState, SyncState, Volume};
+use crate::engine::volume::{ClaimState, NO_SEAL, SyncState, Volume};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::index::spot_index::SpotIndex;
@@ -442,7 +442,9 @@ pub fn bring_up<Backend: Io>(
         let walk = WalkJob::new(Arc::clone(state), volume);
         state.seal_heap.fetch_add(walk.heap_bytes().0, Ordering::AcqRel);
         walks.push(walk);
-        compactions.push(CompactJob::new(Arc::clone(state), volume));
+        let compaction = CompactJob::new(Arc::clone(state), volume);
+        state.compaction_heap.fetch_add(compaction.heap_bytes().0, Ordering::AcqRel);
+        compactions.push(compaction);
     }
     let planner = Planner {
         state: Arc::clone(state),
@@ -781,6 +783,7 @@ pub fn build_state<Backend: Io>(
             wants_compaction: AtomicBool::new(true),
             has_kept_covers: AtomicBool::new(false),
             is_compaction_held: AtomicBool::new(false),
+            sealing: AtomicU64::new(NO_SEAL),
             segments_unlinked: AtomicU64::new(0),
             reserve: ByteCount(sizing.segment_bytes.0 * 2),
             summary: Mutex::new(summary.rows),
@@ -875,6 +878,7 @@ pub fn build_state<Backend: Io>(
         dropped_summary_rows: AtomicU64::new(0),
         memory_budget: config.memory_budget,
         seal_heap: AtomicU64::new(0),
+        compaction_heap: AtomicU64::new(0),
         job_count: AtomicU64::new(0),
         row_task: OnceLock::new(),
         reserve_task: OnceLock::new(),

@@ -19,7 +19,7 @@ use reel::segment::footer_reader::FooterReader;
 use reel::segment::row_block::BLOCK_HEADER_BYTES;
 use reel::segment::segment_tail::{SECOND_TAIL_DISTANCE, SegmentNumber, TailHead};
 use reel::segment::summary::{
-    LostRows, ROW_HEAD_BYTES, SUMMARY_HEADER_BYTES, SegmentFacts, SummaryPaths, SummaryRows, read_row, read_summary,
+    FORWARD_UNKNOWN, LostRows, ROW_HEAD_BYTES, SUMMARY_HEADER_BYTES, SegmentFacts, SummaryPaths, SummaryRows, read_row, read_summary,
     copy_ends, read_copy, write_copy, write_summary,
 };
 use reel::rows::row_group::parse_group;
@@ -812,7 +812,7 @@ fn wrong_mark() {
     facts.seal_mark = Checksum(facts.seal_mark.0 + 1);
     rows.remove(segment);
     assert!(rows.push(&facts, [].into_iter(), [].into_iter()));
-    write_summary(&built.io, &paths, mark, rows.bytes()).expect("write");
+    write_summary(&built.io, &paths, mark, rows.highest_forward, rows.bytes()).expect("write");
     rot_indexes(&built, MIDDLE);
 
     let store = open(&built.io);
@@ -830,7 +830,7 @@ fn gone_row() {
     let mut facts = rows.get(built.heads[NEWEST].segment).expect("row").facts;
     facts.segment = gone;
     assert!(rows.push(&facts, [].into_iter(), [].into_iter()));
-    write_summary(&built.io, &paths, mark, rows.bytes()).expect("write");
+    write_summary(&built.io, &paths, mark, rows.highest_forward, rows.bytes()).expect("write");
 
     let store = open(&built.io);
 
@@ -1413,7 +1413,7 @@ fn first_region() {
         ..SegmentFacts::default()
     };
     assert!(rows.push(&facts, [].into_iter(), [].into_iter()));
-    write_summary(&io, &paths, WritePlace(0), rows.bytes()).expect("write");
+    write_summary(&io, &paths, WritePlace(0), rows.highest_forward, rows.bytes()).expect("write");
     io.rot(&rows_files(&io)[0], FileOffset(starts[0] + 20), FLIP).expect("rot");
 
     let store = open(&io);
@@ -1535,7 +1535,7 @@ fn not_damage() {
 
 // write the newer copy alone, as a crash between the two copies leaves it
 fn newer_copy(io: &SimulatedIo, paths: &SummaryPaths, mark: WritePlace, rows: &[u8]) {
-    write_copy(io, paths, &paths.current, &copy_ends(WritePlace(mark.0 + 1), rows), rows).expect("write");
+    write_copy(io, paths, &paths.current, &copy_ends(WritePlace(mark.0 + 1), FORWARD_UNKNOWN, rows), rows).expect("write");
 }
 
 fn assert_all_refused(store: &Store, built: &Built) {
@@ -1580,7 +1580,7 @@ fn only_newer() {
     let segment = built.heads[MIDDLE].segment;
     let full = rows.bytes().to_vec();
     rows.remove(segment);
-    write_summary(&built.io, &paths, mark, rows.bytes()).expect("write");
+    write_summary(&built.io, &paths, mark, rows.highest_forward, rows.bytes()).expect("write");
     newer_copy(&built.io, &paths, mark, &full);
     let at = row_offset(&built.io, &paths, segment);
     built.io.rot(&paths.current, FileOffset((at + ROW_HEAD_BYTES + 2) as u64), FLIP).expect("rot");
@@ -1677,7 +1677,7 @@ fn open_lost() {
     let (paths, mut rows, mark) = summary_rows(&io);
     let (segment, full) = (rows.rows().next().expect("row").facts.segment, rows.bytes().to_vec());
     rows.remove(segment);
-    write_summary(&io, &paths, mark, rows.bytes()).expect("write");
+    write_summary(&io, &paths, mark, rows.highest_forward, rows.bytes()).expect("write");
     newer_copy(&io, &paths, mark, &full);
     let at = row_offset(&io, &paths, segment);
     io.rot(&paths.current, FileOffset((at + ROW_HEAD_BYTES + 2) as u64), FLIP).expect("rot");
@@ -1792,7 +1792,7 @@ fn save_crash() {
         let (paths, rows, mark) = summary_rows(&io);
 
         io.arm_crash(OperationCount(crash_at));
-        let _saved = write_summary(&io, &paths, WritePlace(mark.0 + 1), rows.bytes());
+        let _saved = write_summary(&io, &paths, WritePlace(mark.0 + 1), rows.highest_forward, rows.bytes());
         io.power_cut();
 
         for path in [&paths.current, &paths.second] {

@@ -70,6 +70,23 @@ pub struct KeyRead<'key> {
     pub is_cue: bool,
 }
 
+/// A key being read at the newest point, with the counts its answer has to outlive
+#[derive(Clone, Copy, Debug)]
+pub struct LatestRead<'key> {
+    pub read: KeyRead<'key>,
+    pub reclaims: u64,
+    pub handovers: u64,
+}
+
+/// Many keys being read at one point
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManyRead {
+    pub point: WritePlace,
+    pub reclaims: u64,
+    pub handovers: u64,
+    pub pin: Option<usize>,
+}
+
 impl Located {
     /// Read the row's place, if there is a row
     pub fn place(&self) -> Option<WritePlace> {
@@ -99,46 +116,88 @@ impl<Backend: Io> EngineState<Backend> {
         want: RecordWant,
         buf: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
-        let info = self.column(column)?;
-        let volume = &self.volumes[info.volume.0 as usize];
-
-        // the count comes first: a hand-over only starts past its rows' places, so a read point
-        // taken after the count can't be below a row a hand-over under this count gave out
-        let handovers = volume.handover_count();
-        let read = self.key_read_now(column, key)?;
-        self.get_at(&read, handovers, want, buf)
+        for _try in 0..MOST_READ_TRIES {
+            let latest = self.latest_read(column, key)?;
+            if let Some(answer) = self.answer_latest(&latest, want, buf) {
+                return answer;
+            }
+        }
+        Err(moving_segments())
     }
 
-    /// Answer every key at one read point, so a batch from one write_batch is seen whole or not at all. The call pins its
-    /// point as a cue does, so no cover below it goes. A full table leaves the read to start over if one went
+    /// Take the newest point for a key. Both counts come first. A reclaim counted before them has its replacements under
+    /// the point, and a hand-over only starts past its rows' places, so the point can't be below a row a hand-over under
+    /// this count gave out
+    pub fn latest_read<'key>(&self, column: ColumnId, key: &'key [u8]) -> Result<LatestRead<'key>, StoreError> {
+        let info = self.column(column)?;
+        let reclaims = self.cues.reclaims();
+        let handovers = self.volumes[info.volume.0 as usize].handover_count();
+        let read = self.key_read_now(column, key)?;
+        Ok(LatestRead { read, reclaims, handovers })
+    }
+
+    /// Answer a read at its point, or return nothing when a reclaim crossed it and took what the point could see
+    pub fn answer_latest(
+        &self,
+        latest: &LatestRead,
+        want: RecordWant,
+        buf: &mut Vec<u8>,
+    ) -> Option<Result<bool, StoreError>> {
+        let answer = self.get_at(&latest.read, latest.handovers, want, buf);
+        (self.cues.reclaims() == latest.reclaims).then_some(answer)
+    }
+
+    /// Answer every key at one read point, so a batch from one write_batch is seen whole or not at all
     pub fn get_many_now(&self, column: ColumnId, keys: &[&[u8]], values: &mut ValueList) -> Result<(), StoreError> {
         let info = self.column(column)?;
         let volume = &self.volumes[info.volume.0 as usize];
         let mut scratch = values.take_scratch();
-        let mut outcome = Err(StoreError::Io {
-            action: "reading keys whose covers keep moving",
-            source: Error::from(ErrorKind::Interrupted),
-        });
+        let mut outcome = Err(moving_segments());
         for _try in 0..MOST_READ_TRIES {
-            values.clear();
-            let drops = self.cover_drops();
-            let handovers = volume.handover_count();
-            let point = self.read_point();
-            let pin = self.cues.take(point);
-            if pin.is_some_and(|slot| !self.pin_holds(slot, drops)) {
+            let Some(many) = self.many_read(volume) else {
                 continue;
-            }
-            let read = self.read_keys(column, keys, point, handovers, values, &mut scratch);
-            if let Some(slot) = pin {
-                self.cues.release(slot);
-            }
-            if read.is_err() || pin.is_some() || self.cover_drops() == drops {
-                outcome = read;
+            };
+            if let Some(answer) = self.answer_many(&many, column, keys, values, &mut scratch) {
+                outcome = answer;
                 break;
             }
         }
         values.put_scratch(scratch);
         outcome
+    }
+
+    /// Take a point for many keys and pin it as a cue does, so no reclaim reaches below it. A reclaim that got in first costs
+    /// the try, and a full table leaves the read unpinned to start over if one crosses it
+    pub fn many_read(&self, volume: &Volume<Backend>) -> Option<ManyRead> {
+        let reclaims = self.cues.reclaims();
+        let handovers = volume.handover_count();
+        let point = self.read_point();
+        let pin = self.cues.take(point);
+        if pin.is_some_and(|slot| !self.pin_holds(slot, reclaims)) {
+            return None;
+        }
+        Some(ManyRead { point, reclaims, handovers, pin })
+    }
+
+    /// Answer keys at their point and give the pin back, or return nothing when a reclaim crossed an unpinned read
+    pub fn answer_many(
+        &self,
+        many: &ManyRead,
+        column: ColumnId,
+        keys: &[&[u8]],
+        values: &mut ValueList,
+        scratch: &mut Vec<u8>,
+    ) -> Option<Result<(), StoreError>> {
+        values.clear();
+        let answer = self.read_keys(column, keys, many.point, many.handovers, values, scratch);
+        if let Some(slot) = many.pin {
+            self.cues.release(slot);
+            // a reclaim that stood aside for this pin moved the count, and nothing else would look again
+            if self.cues.reclaims() != many.reclaims {
+                self.ask_compaction();
+            }
+        }
+        (many.pin.is_some() || self.cues.reclaims() == many.reclaims).then_some(answer)
     }
 
     /// Answer keys in order at a read point, with a bad record as that key's answer
@@ -219,10 +278,7 @@ impl<Backend: Io> EngineState<Backend> {
                 },
             }
         }
-        Err(StoreError::Io {
-            action: "reading a key whose segments keep moving",
-            source: Error::from(ErrorKind::Interrupted),
-        })
+        Err(moving_segments())
     }
 
     /// Refuse a key whose newest row could be in a damaged segment: the row found must be above it
@@ -246,9 +302,21 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
-    /// Say whether a key has a value at a read point, without reading the value
+    /// Say whether a key has a value at the newest point, without reading the value
     pub fn contains_now(&self, column: ColumnId, key: &[u8]) -> Result<bool, StoreError> {
-        self.contains_at(&self.key_read_now(column, key)?)
+        for _try in 0..MOST_READ_TRIES {
+            let latest = self.latest_read(column, key)?;
+            if let Some(answer) = self.contains_latest(&latest) {
+                return answer;
+            }
+        }
+        Err(moving_segments())
+    }
+
+    /// Say whether a key has a value at its point, or return nothing when a reclaim crossed the read
+    pub fn contains_latest(&self, latest: &LatestRead) -> Option<Result<bool, StoreError>> {
+        let answer = self.contains_at(&latest.read);
+        (self.cues.reclaims() == latest.reclaims).then_some(answer)
     }
 
     /// Say whether a key has a value at a read, without reading the value
@@ -691,5 +759,13 @@ pub fn newest_of(open: Option<WriteRow>, sealed: Option<SealedRow>) -> Located {
 pub fn corruption(read: &KeyRead) -> StoreError {
     StoreError::Corruption {
         column: read.column,
+    }
+}
+
+/// Report a read that kept losing its segments to seals and reclaims
+pub fn moving_segments() -> StoreError {
+    StoreError::Io {
+        action: "reading a key whose segments keep moving",
+        source: Error::from(ErrorKind::Interrupted),
     }
 }

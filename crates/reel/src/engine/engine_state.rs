@@ -20,7 +20,7 @@ use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
-use crate::io::Io;
+use crate::io::{Io, IoTask};
 use crate::pool::Pool;
 use crate::record::record_check::RecordKey;
 use crate::record::record_encoder::RecordEncoder;
@@ -95,6 +95,7 @@ pub struct EngineState<Backend: Io> {
     pub dropped_summary_rows: AtomicU64,
     pub memory_budget: ByteCount,
     pub seal_heap: AtomicU64,
+    pub compaction_heap: AtomicU64,
     pub job_count: AtomicU64,
     pub row_task: OnceLock<Backend::Task>,
     pub reserve_task: OnceLock<Backend::Task>,
@@ -204,8 +205,11 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn save_summary(&self, volume: &Volume<Backend>) -> Result<(), Error> {
         volume.summary_buffer.with(|buffer| {
             buffer.clear();
-            buffer.extend_from_slice(hold(&volume.summary).bytes());
-            write_summary(&self.io, &volume.summary_paths, self.read_point(), buffer)
+            let rows = hold(&volume.summary);
+            buffer.extend_from_slice(rows.bytes());
+            let forward = rows.highest_forward;
+            drop(rows);
+            write_summary(&self.io, &volume.summary_paths, self.read_point(), forward, buffer)
         })
     }
 
@@ -299,27 +303,31 @@ impl<Backend: Io> EngineState<Backend> {
         hold(&self.volumes[volume].summary).is_lookup_whole()
     }
 
-    /// Add up the cover drops of every volume
-    pub fn cover_drops(&self) -> usize {
-        self.volumes.iter().map(|volume| volume.covers.drops()).sum()
+    /// Bring the planner back to every volume's compaction
+    pub fn ask_compaction(&self) {
+        for volume in &self.volumes {
+            volume.wants_compaction.store(true, Ordering::Release);
+        }
+        if let Some(task) = self.planner_task.get() {
+            task.wake();
+        }
     }
 
-    /// Keep a slot only if no cover drop came since the count was read, and give it back if one did
-    pub fn pin_holds(&self, slot: usize, drops: usize) -> bool {
-        let is_held = self.cover_drops() == drops;
+    /// Keep a slot only if no reclaim started since the count was read, and give it back if one did
+    pub fn pin_holds(&self, slot: usize, reclaims: u64) -> bool {
+        let is_held = self.cues.reclaims() == reclaims;
         if !is_held {
             self.cues.release(slot);
         }
         is_held
     }
 
-    /// Drop the covers a published one holds inside it, unless a live cue reads below it and still needs them. The count
-    /// goes first: a cue reads it after taking its slot, so the two can't miss each other
+    /// Drop the covers a published one holds inside it, unless a live cue reads below it and still needs them
     pub fn drop_covers_inside(&self, volume: &Volume<Backend>, cover: &Cover) {
         if !volume.covers.has_inside(cover) {
             return;
         }
-        volume.covers.note_drop();
+        self.cues.note_reclaim();
         if !self.cues.has_cue_below(cover.place) {
             volume.covers.drop_inside(cover);
         } else {
@@ -336,6 +344,7 @@ impl<Backend: Io> EngineState<Backend> {
             spot_cache: self.spot.heap_bytes(),
             block_cache: ByteCount(self.filter_cache.heap_bytes().0 + self.row_cache.heap_bytes().0),
             footer_space: ByteCount(self.seal_heap.load(Ordering::Acquire)),
+            compaction: ByteCount(self.compaction_heap.load(Ordering::Acquire)),
             thread_stacks: ByteCount(self.job_count.load(Ordering::Acquire) * self.io.job_stack_bytes().0),
             ..MemoryReport::default()
         };

@@ -19,6 +19,9 @@ use crate::segment::range_covers::RangeCovers;
 use crate::segment::summary::{LostRows, SummaryPaths, SummaryRows};
 use crate::superblock::SuperblockPaths;
 
+/// A volume's `sealing` number between seals
+pub const NO_SEAL: u64 = u64::MAX;
+
 /// Where a volume's sync stands
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SyncState {
@@ -59,7 +62,10 @@ pub struct Volume<Backend: Io> {
     pub walks_waiting: AtomicU64,
     pub wants_compaction: AtomicBool,
     pub has_kept_covers: AtomicBool,
+    /// Holds compaction off. Only tests set this today
     pub is_compaction_held: AtomicBool,
+    /// The segment a seal is working on, or `NO_SEAL`. Its rows can still answer through its open slot, so no walk starts on it
+    pub sealing: AtomicU64,
     pub segments_unlinked: AtomicU64,
     pub summary: Mutex<SummaryRows>,
     pub summary_paths: SummaryPaths,

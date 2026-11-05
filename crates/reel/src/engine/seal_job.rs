@@ -11,7 +11,7 @@ use crate::pool::touched_capacity;
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::{SegmentPhase, data_path, rows_path};
-use crate::engine::volume::Volume;
+use crate::engine::volume::{NO_SEAL, Volume};
 use crate::guard::hold;
 use crate::index::key_hash::hash_key;
 use crate::index::open_slots::OpenSlot;
@@ -135,6 +135,7 @@ impl<Backend: Io> SealJob<Backend> {
         let claims = hold(&volume.claims);
         for segment in &claims.open {
             if segment.phase == SegmentPhase::Sealing {
+                volume.sealing.store(segment.number.0, Ordering::Release);
                 self.target = Some(SealTarget {
                     number: segment.number,
                     slot: segment.slot,
@@ -150,6 +151,16 @@ impl<Backend: Io> SealJob<Backend> {
             }
         }
         false
+    }
+
+    /// End the seal in progress, and bring the planner back for the walk its segment waited on
+    pub fn end_seal(&mut self) {
+        self.target = None;
+        self.phase = SealPhase::Idle;
+        self.volume().sealing.store(NO_SEAL, Ordering::Release);
+        if let Some(task) = self.state.planner_task.get() {
+            task.wake();
+        }
     }
 
     /// Check the target's writers have all landed
@@ -541,8 +552,7 @@ impl<Backend: Io> SealJob<Backend> {
                 }
                 if target.row_count.0 == 0 {
                     self.drop_empty(target)?;
-                    self.target = None;
-                    self.phase = SealPhase::Idle;
+                    self.end_seal();
                     return Ok(());
                 }
                 self.start_writing(target)
@@ -561,8 +571,7 @@ impl<Backend: Io> SealJob<Backend> {
             },
             SealPhase::Cleaning => {
                 if self.clean(target) {
-                    self.target = None;
-                    self.phase = SealPhase::Idle;
+                    self.end_seal();
                 }
                 Ok(())
             },

@@ -20,6 +20,7 @@ pub struct MemoryReport {
     pub compress_buffers: ByteCount,
     pub queues: ByteCount,
     pub footer_space: ByteCount,
+    pub compaction: ByteCount,
     pub thread_stacks: ByteCount,
 }
 
@@ -40,7 +41,8 @@ impl MemoryReport {
                 + self.copy_buffers.0
                 + self.compress_buffers.0
                 + self.queues.0
-                + self.footer_space.0,
+                + self.footer_space.0
+                + self.compaction.0,
         )
     }
 }

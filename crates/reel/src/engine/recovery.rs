@@ -1362,6 +1362,7 @@ pub fn settle_summaries<Backend: Io>(state: &EngineState<Backend>, scan: &mut Ro
         let open: BTreeSet<SegmentNumber> =
             scan.scanned.iter().filter(|segment| segment.found.volume == index).map(|segment| segment.found.number).collect();
         carry_rows(volume, &rows, &listed, (&held, &open), &mut settled);
+        settled.highest_forward = held.last().map_or(SegmentNumber(0), |highest| rows.highest_forward.min(*highest));
         let index_room = rows.index_room();
         *rows = settled;
         rows.make_index(index_room);
@@ -1539,7 +1540,8 @@ pub fn settle_sealed<Backend: Io>(
         damage_place: WritePlace(0),
         block_count: found.head.block_count.0,
         walked_blocks: 0,
-        is_backward: true,
+        // no saved count can hold a walk of a segment above the number, and one at or below it may be held already
+        is_backward: found.head.segment <= rows.highest_forward,
     };
 
     if let Some(at) = listed.get(&facts.segment)

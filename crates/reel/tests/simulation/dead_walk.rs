@@ -289,7 +289,7 @@ fn older_copy_row() {
         let mut rows = SummaryRows::new(ByteCount(0));
         let mark = read_summary(&io, &paths, &mut rows, &mut LostRows::default()).expect("read").expect("a mark");
         rows.remove(if is_newer_lost { newer } else { older });
-        let ends = copy_ends(WritePlace(mark.0 + 1), rows.bytes());
+        let ends = copy_ends(WritePlace(mark.0 + 1), rows.highest_forward, rows.bytes());
         write_copy(&io, &paths, &paths.current, &ends, rows.bytes()).expect("write");
 
         let store = open(&io);
@@ -423,7 +423,7 @@ fn live_bytes_agree() {
     let mut rows = SummaryRows::new(ByteCount(0));
     let mark = read_summary(&io, &paths, &mut rows, &mut LostRows::default()).expect("read").expect("a mark");
     rows.remove(number);
-    let ends = copy_ends(WritePlace(mark.0 + 1), rows.bytes());
+    let ends = copy_ends(WritePlace(mark.0 + 1), rows.highest_forward, rows.bytes());
     write_copy(&io, &paths, &paths.current, &ends, rows.bytes()).expect("write");
 
     let store = open(&io);
@@ -586,7 +586,7 @@ fn older_row_behind() {
             }
         }
     }
-    let ends = copy_ends(WritePlace(mark.0 + 1), kept.bytes());
+    let ends = copy_ends(WritePlace(mark.0 + 1), on_disk.highest_forward, kept.bytes());
     write_copy(&io, &paths, &paths.current, &ends, kept.bytes()).expect("write");
     drop(job);
     io.kill();

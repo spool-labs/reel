@@ -63,7 +63,6 @@ pub struct RangeCovers {
     count: AtomicUsize,
     pool: RwLock<CoverPool>,
     longest_walk: AtomicUsize,
-    drops: AtomicUsize,
 }
 
 impl CoverPool {
@@ -316,7 +315,6 @@ impl RangeCovers {
             count: AtomicUsize::new(0),
             pool: RwLock::new(CoverPool::new(widest_key)),
             longest_walk: AtomicUsize::new(0),
-            drops: AtomicUsize::new(0),
         }
     }
 
@@ -435,16 +433,6 @@ impl RangeCovers {
         end.extend_from_slice(pool.end(slot));
         let fields = &pool.slots[slot as usize];
         Some((fields.column, fields.place, fields.segment))
-    }
-
-    /// Count the times a cover went inside a newer one, so a read at a fixed point can tell one left under it
-    pub fn drops(&self) -> usize {
-        self.drops.load(Ordering::SeqCst)
-    }
-
-    /// Count a drop about to be looked at
-    pub fn note_drop(&self) {
-        self.drops.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Drop the older covers inside a published one. A get reads its read point under the lock, so none can see

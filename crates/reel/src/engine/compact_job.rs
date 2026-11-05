@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel_api::store_error::StoreError;
-use reel_api::units::Nanoseconds;
+use reel_api::units::{ByteCount, Nanoseconds, WritePlace};
 
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::engine_state::EngineState;
@@ -34,6 +34,7 @@ pub struct DeadTarget {
     pub segment: SegmentNumber,
     pub next_block: u32,
     pub block_count: u32,
+    pub highest_replacement: WritePlace,
 }
 
 /// The compaction of one volume
@@ -61,6 +62,11 @@ impl<Backend: Io> CompactJob<Backend> {
             key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             end: touched_capacity(MAX_KEY_BYTES as usize + 1, 0),
         }
+    }
+
+    /// Read the heap the job's buffers hold
+    pub fn heap_bytes(&self) -> ByteCount {
+        ByteCount((self.block.capacity() + self.key.capacity() + self.end.capacity()) as u64)
     }
 
     /// Step once: a row block of a candidate's footer, or nothing when no segment looks dead
@@ -125,94 +131,115 @@ impl<Backend: Io> CompactJob<Backend> {
             segment: row.facts.segment,
             next_block: 0,
             block_count: row.facts.block_count,
+            highest_replacement: WritePlace(0),
         });
         self.target.is_some()
     }
 
     /// Check one row block, and unlink the segment once every block has passed
     pub fn confirm_block(&mut self, volume: &Volume<Backend>, target: DeadTarget) -> Result<()> {
-        let is_clear = match (volume.table.pin(target.segment), volume.table.walk_block(target.segment, target.next_block)) {
-            (Some(pin), Some(block)) => self.is_block_dead(volume, &pin, &block, target)?,
-            _no_block => false,
+        let replaced = match (volume.table.pin(target.segment), volume.table.walk_block(target.segment, target.next_block)) {
+            (Some(pin), Some(block)) => self.block_replacement(volume, &pin, &block, target)?,
+            _no_block => None,
         };
-        if !is_clear {
+        let Some(highest) = replaced else {
             // the counts understate, so the next finished walk looks again
             self.last_tried = target.segment;
             self.target = None;
             return Ok(());
-        }
-        let next_block = target.next_block + 1;
-        if next_block < target.block_count {
-            self.target = Some(DeadTarget { next_block, ..target });
+        };
+        let target = DeadTarget {
+            next_block: target.next_block + 1,
+            highest_replacement: target.highest_replacement.max(highest),
+            ..target
+        };
+        if target.next_block < target.block_count {
+            self.target = Some(target);
             return Ok(());
         }
 
         self.last_tried = target.segment;
         self.target = None;
         volume.wants_compaction.store(true, Ordering::Release);
-        self.unlink(volume, target.segment)
+        self.unlink(volume, target.segment, target.highest_replacement)
     }
 
-    /// Check every row of a block has a newer version that every live cue can see
-    pub fn is_block_dead(
+    /// Find the highest place that replaces a block's rows, or nothing when a row lacks a replacement every cue can see
+    pub fn block_replacement(
         &mut self,
         volume: &Volume<Backend>,
         pin: &SegmentPin<'_, Backend::File>,
         block: &WalkBlock,
         target: DeadTarget,
-    ) -> Result<bool> {
+    ) -> Result<Option<WritePlace>> {
+        let mut highest = WritePlace(0);
         let length = block.entry.block_length().0 as usize;
         if length > self.block.len() {
-            return Ok(false);
+            return Ok(None);
         }
         match pin.file.read_exact_at(block.entry.block_at(), &mut self.block[..length]) {
             Ok(()) => {},
             // a block no read can give back answers for nothing, and the segment stays for damage to deal with
-            Err(error) if is_device_error(&error) => return Ok(false),
+            Err(error) if is_device_error(&error) => return Ok(None),
             Err(error) => return Err(error),
         }
         let Some(mut walk) = RowBlockWalk::open(&self.block[..length], pin.head.place_base) else {
-            return Ok(false);
+            return Ok(None);
         };
 
         while let Some(row) = walk.next_row(&mut self.key) {
             if row.kind == RowKind::RangeDelete {
-                return Ok(false);
+                return Ok(None);
             }
             let newest = match self.state.newest_walked(volume, block.column, &self.key, target.segment) {
                 Ok(newest) => newest,
-                Err(StoreError::Corruption { .. }) => return Ok(false),
+                Err(StoreError::Corruption { .. }) => return Ok(None),
                 Err(_error) => return Err(Error::from(ErrorKind::Interrupted)),
             };
             let is_replaced = newest.is_some_and(|found| found.row.place > row.place);
             // a cue below the newer version still reads this one, whatever the counts say
-            let is_seen = newest.is_some_and(|found| self.state.cues.has_cue_below(found.row.place));
-            if !is_replaced || is_seen {
-                return Ok(false);
-            }
+            let is_seen = newest.is_some_and(|found| self.state.cues.holds_back(found.row.place));
+            let Some(found) = newest.filter(|_found| is_replaced && !is_seen) else {
+                return Ok(None);
+            };
+            highest = highest.max(found.row.place);
         }
-        Ok(true)
+        Ok(Some(highest))
     }
 
-    /// Take the segment out of every list, save that, and remove its file. A crash before the file goes leaves a segment
-    /// with no row, which open walks backward and finds dead again
-    pub fn unlink(&self, volume: &Volume<Backend>, segment: SegmentNumber) -> Result<()> {
+    /// Take the segment out of every list, save that, and remove its file, once its replacements are published and no cue
+    /// reads below them. A crash before the file goes leaves a segment with no row, which open walks backward and finds
+    /// dead again
+    pub fn unlink(&self, volume: &Volume<Backend>, segment: SegmentNumber, highest_replacement: WritePlace) -> Result<()> {
         let state = &self.state;
+        if state.read_point() < highest_replacement {
+            return Ok(());
+        }
+        state.cues.note_reclaim();
+        if state.cues.has_cue_below(highest_replacement) {
+            return Ok(());
+        }
         for directory in state.directories.iter().flatten() {
             if !directory.replace(None, &[segment]) {
-                return Err(Error::other("a directory refused to lose a segment"));
+                return Err(Error::from(ErrorKind::OutOfMemory));
             }
         }
         let Some(retired) = volume.table.retire(segment) else {
             return Ok(());
         };
         hold(&volume.summary).remove(segment);
-        state.save_summary(volume)?;
-        volume.segments_unlinked.fetch_add(1, Ordering::AcqRel);
+        // the file goes only behind a saved summary, or open would find a row with no file
+        let saved = state.save_summary(volume);
         while retired.pin_count() > 0 {
+            // a stop leaves the file and its handle, as a crash here does
+            if state.is_stopping.load(Ordering::Acquire) {
+                return saved;
+            }
             state.io.pause();
         }
         state.io.close_file(retired.file.clone());
+        saved?;
+        volume.segments_unlinked.fetch_add(1, Ordering::AcqRel);
         for root in &volume.roots {
             match state.io.remove_file(&data_path(root, segment)) {
                 Ok(()) => return state.io.sync_directory(root),

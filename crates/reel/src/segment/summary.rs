@@ -30,7 +30,11 @@ pub const NEW_SUMMARY_NAME: &str = "summary.new";
 /// The second copy's file name
 pub const SECOND_SUMMARY_NAME: &str = "summary.second";
 /// Bytes of a summary file's header
-pub const SUMMARY_HEADER_BYTES: usize = 32;
+pub const SUMMARY_HEADER_BYTES: usize = 40;
+/// Where a summary end's checksum sits
+pub const END_SUM_AT: usize = SUMMARY_HEADER_BYTES - size_of::<u64>();
+/// The number a summary with no whole end reads back, so every rebuilt segment takes the backward walk
+pub const FORWARD_UNKNOWN: SegmentNumber = SegmentNumber(u64::MAX);
 /// Opens every row, so a walk past a bad row can find the next one
 pub const ROW_MARKER: u32 = 0x5253_554D;
 /// Bytes of a row's head: its marker, its body's length and the head's own checksum
@@ -130,6 +134,7 @@ pub struct SpanFacts<'key> {
 /// Every row of a volume's summary, stored as they go to disk
 #[derive(Debug)]
 pub struct SummaryRows {
+    pub highest_forward: SegmentNumber,
     bytes: Vec<u8>,
     index: NumberMap,
     listed: usize,
@@ -241,6 +246,7 @@ impl SummaryRows {
     /// Allocate room for the rows
     pub fn new(capacity: ByteCount) -> Self {
         Self {
+            highest_forward: SegmentNumber(0),
             bytes: Vec::with_capacity(capacity.0 as usize),
             index: NumberMap::new(0),
             listed: 0,
@@ -480,6 +486,11 @@ impl SummaryRows {
             at += length;
         }
         None
+    }
+
+    /// Note a forward walk's counts have landed, so any save that holds them holds this number too
+    pub fn note_forward(&mut self, walked: SegmentNumber) {
+        self.highest_forward = self.highest_forward.max(walked);
     }
 
     /// Apply one step of the dead-byte walk under one hold: every count, and how far the walk has come, so any saved
@@ -847,6 +858,7 @@ pub struct CopyEnds {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CopyEnd {
     pub mark: WritePlace,
+    pub forward: SegmentNumber,
     pub rows_length: usize,
 }
 
@@ -855,6 +867,7 @@ pub struct CopyEnd {
 pub struct SummaryCopy {
     pub header_mark: Option<WritePlace>,
     pub trailer_mark: Option<WritePlace>,
+    pub forward: Option<SegmentNumber>,
     pub rows: Vec<u8>,
 }
 
@@ -895,27 +908,34 @@ impl SummaryPaths {
 }
 
 /// Build one end of a summary copy
-pub fn mark_end(magic: u64, mark: WritePlace, rows: &[u8]) -> [u8; SUMMARY_HEADER_BYTES] {
+pub fn mark_end(magic: u64, mark: WritePlace, forward: SegmentNumber, rows: &[u8]) -> [u8; SUMMARY_HEADER_BYTES] {
     let mut end = [0; SUMMARY_HEADER_BYTES];
     end[..8].copy_from_slice(&magic.to_le_bytes());
     end[8..16].copy_from_slice(&mark.0.to_le_bytes());
     end[16..24].copy_from_slice(&(rows.len() as u64).to_le_bytes());
-    let sum = checksum(&end[..24]);
-    end[24..].copy_from_slice(&sum.0.to_le_bytes());
+    end[24..END_SUM_AT].copy_from_slice(&forward.0.to_le_bytes());
+    let sum = checksum(&end[..END_SUM_AT]);
+    end[END_SUM_AT..].copy_from_slice(&sum.0.to_le_bytes());
     end
 }
 
 /// Build the two ends of a summary copy, which carry its mark twice
-pub fn copy_ends(mark: WritePlace, rows: &[u8]) -> CopyEnds {
+pub fn copy_ends(mark: WritePlace, forward: SegmentNumber, rows: &[u8]) -> CopyEnds {
     CopyEnds {
-        header: mark_end(SUMMARY_MAGIC, mark, rows),
-        trailer: mark_end(SUMMARY_TRAILER_MAGIC, mark, rows),
+        header: mark_end(SUMMARY_MAGIC, mark, forward, rows),
+        trailer: mark_end(SUMMARY_TRAILER_MAGIC, mark, forward, rows),
     }
 }
 
 /// Write both copies of a summary, the second after the first is synced, so a crash leaves one whole
-pub fn write_summary<Backend: Io>(io: &Backend, paths: &SummaryPaths, mark: WritePlace, rows: &[u8]) -> Result<()> {
-    let ends = copy_ends(mark, rows);
+pub fn write_summary<Backend: Io>(
+    io: &Backend,
+    paths: &SummaryPaths,
+    mark: WritePlace,
+    forward: SegmentNumber,
+    rows: &[u8],
+) -> Result<()> {
+    let ends = copy_ends(mark, forward, rows);
     write_copy(io, paths, &paths.current, &ends, rows)?;
     write_copy(io, paths, &paths.second, &ends, rows)
 }
@@ -953,6 +973,8 @@ pub fn read_summary<Backend: Io>(
 ) -> Result<Option<WritePlace>> {
     let first = read_copy(io, &paths.current)?;
     let second = read_copy(io, &paths.second)?;
+    // a row can come from either copy, and a number too high costs an undercount where one too low double counts
+    let forward = first.iter().chain(&second).filter_map(|copy| copy.forward).max();
     let (newer, older) = match (first, second) {
         (Some(first), Some(second)) if second.mark() > first.mark() => (second, Some(first)),
         (Some(first), second) => (first, second),
@@ -961,6 +983,7 @@ pub fn read_summary<Backend: Io>(
     };
 
     let mark = newer.mark();
+    rows.highest_forward = forward.unwrap_or(FORWARD_UNKNOWN);
     rows.bytes = newer.rows;
     if let Some(older) = older {
         let has_two_marks = mark.is_some() && older.mark().is_some() && mark != older.mark();
@@ -1005,6 +1028,7 @@ pub fn read_copy<Backend: Io>(io: &Backend, path: &Path) -> Result<Option<Summar
     Ok(Some(SummaryCopy {
         header_mark: header.map(|end| end.mark),
         trailer_mark: trailer.map(|end| end.mark),
+        forward: header.or(trailer).map(|end| end.forward),
         rows: bytes.get(SUMMARY_HEADER_BYTES..rows_end).unwrap_or_default().to_vec(),
     }))
 }
@@ -1013,13 +1037,15 @@ pub fn read_copy<Backend: Io>(io: &Backend, path: &Path) -> Result<Option<Summar
 pub fn read_end(end: &[u8], magic: u64) -> Option<CopyEnd> {
     let mut cursor = RowCursor { bytes: end };
     let is_ours = cursor.word() == Some(magic);
-    let (mark, rows_length, sum) = (cursor.word()?, cursor.word()?, cursor.word()?);
-    if !is_ours || checksum(&end[..24]).0 != sum {
+    let (mark, rows_length) = (cursor.word()?, cursor.word()?);
+    let (forward, sum) = (cursor.word()?, cursor.word()?);
+    if !is_ours || checksum(&end[..END_SUM_AT]).0 != sum {
         return None;
     }
     Some(CopyEnd {
         mark: WritePlace(mark),
         rows_length: rows_length as usize,
+        forward: SegmentNumber(forward),
     })
 }
 

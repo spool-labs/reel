@@ -1,6 +1,6 @@
 //! A read view at one point in the write order, which copies no data and never blocks a writer
 //!
-//! A cue takes a slot in a fixed table, and everything that would drop a version or a cover looks there first.
+//! A cue takes a slot in a fixed table, and everything that would drop a version or a cover counts itself and looks there first.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,9 +13,9 @@ use reel_api::value_list::ValueList;
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::RecordWant;
-use crate::io::{Io, IoTask};
+use crate::io::Io;
 
-/// The most cues a store holds at once
+/// The most cues a store holds at once. A get_many holds a slot while it reads, so callers inside one count toward this
 pub const MOST_CUES: usize = 64;
 /// A slot with no cue in it, since a place plus one is never zero
 pub const NO_CUE: u64 = 0;
@@ -24,6 +24,7 @@ pub const NO_CUE: u64 = 0;
 #[derive(Debug)]
 pub struct CueTable {
     slots: [AtomicU64; MOST_CUES],
+    reclaims: AtomicU64,
 }
 
 impl CueTable {
@@ -31,6 +32,7 @@ impl CueTable {
     pub fn new() -> Self {
         Self {
             slots: [const { AtomicU64::new(NO_CUE) }; MOST_CUES],
+            reclaims: AtomicU64::new(0),
         }
     }
 
@@ -52,6 +54,27 @@ impl CueTable {
             let point = slot.load(Ordering::SeqCst);
             point != NO_CUE && point - 1 < place.0
         })
+    }
+
+    /// Check a live cue reads below a place, for a reclaim about to stand aside. The count moves before the last look, so
+    /// a pin this finds sees the count move as it leaves, and asks for the reclaim again
+    pub fn holds_back(&self, place: WritePlace) -> bool {
+        if !self.has_cue_below(place) {
+            return false;
+        }
+        self.note_reclaim();
+        self.has_cue_below(place)
+    }
+
+    /// Count a reclaim, before its last look at this table and before anything leaves a directory. A reader that took its
+    /// point after this has every replacement under it, and one that took it before sees this count move
+    pub fn note_reclaim(&self) {
+        self.reclaims.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Read how many reclaims have started
+    pub fn reclaims(&self) -> u64 {
+        self.reclaims.load(Ordering::SeqCst)
     }
 
     /// Count the live cues
@@ -83,12 +106,12 @@ impl<Backend: Io> Cue<Backend> {
     /// taking a slot, so either the drop sees the pin or this sees the drop and takes a newer point
     pub fn new(state: Arc<EngineState<Backend>>) -> Result<Self, StoreError> {
         loop {
-            let drops = state.cover_drops();
+            let reclaims = state.cues.reclaims();
             let point = state.read_point();
             let Some(slot) = state.cues.take(point) else {
                 return Err(StoreError::CuesFull { limit: MOST_CUES as u64 });
             };
-            if state.pin_holds(slot, drops) {
+            if state.pin_holds(slot, reclaims) {
                 return Ok(Self { state, slot, point });
             }
         }
@@ -155,11 +178,6 @@ impl<Backend: Io> Drop for Cue<Backend> {
     fn drop(&mut self) {
         self.state.cues.release(self.slot);
         // what this cue kept can go now, and nothing else would look again
-        for volume in &self.state.volumes {
-            volume.wants_compaction.store(true, Ordering::Release);
-        }
-        if let Some(task) = self.state.planner_task.get() {
-            task.wake();
-        }
+        self.state.ask_compaction();
     }
 }

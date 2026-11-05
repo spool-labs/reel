@@ -839,6 +839,7 @@ struct StagedGet {
     key: Vec<u8>,
     point: WritePlace,
     handovers: u64,
+    reclaims: u64,
     row: Option<WriteRow>,
     should_ask: bool,
 }
@@ -853,6 +854,7 @@ fn newest_at(history: &History, key: &[u8], point: u64) -> Option<Vec<u8>> {
 
 fn begin_get(state: &State, key: &[u8]) -> StagedGet {
     let volume = &state.volumes[0];
+    let reclaims = state.cues.reclaims();
     let handovers = volume.handover_count();
     let point = state.read_point();
     let found = state.index.lookup(COLUMN, key, point, volume.view());
@@ -860,6 +862,7 @@ fn begin_get(state: &State, key: &[u8]) -> StagedGet {
         key: key.to_vec(),
         point,
         handovers,
+        reclaims,
         row: found.row,
         should_ask: found.should_ask_footers,
     }
@@ -1042,7 +1045,10 @@ fn run_until_crash(
                     let index = random.below(gets.len() as u64) as usize;
                     let get = gets.swap_remove(index);
                     let found = finish_get(state, &get);
-                    assert_eq!(found, newest_at(history, &get.key, get.point.0), "staged get of {:?}", get.key);
+                    // a reclaim that crossed a get sends the real one back for a newer point
+                    if state.cues.reclaims() == get.reclaims {
+                        assert_eq!(found, newest_at(history, &get.key, get.point.0), "staged get of {:?}", get.key);
+                    }
                 }
             },
             _read => {

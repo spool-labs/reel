@@ -1,16 +1,24 @@
 //! Compaction: what no read can reach goes, and nothing else does
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::engine::compact_job::{CompactJob, DeadTarget, is_wholly_dead};
+use reel::engine::cue::MOST_CUES;
+use reel::engine::engine_sizing::COMPACT_JOB_BYTES;
 use reel::engine::open_segment::data_path;
+use reel::engine::read_path::RecordWant;
 use reel::engine::reel_store::ReelStore;
 use reel::guard::hold;
 use reel::io::Io;
 use reel::record::codec::Codec;
 use reel::segment::segment_tail::SegmentNumber;
+use reel::segment::summary::{DeadCount, LostRows, SummaryPaths, SummaryRows, read_summary};
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
+use reel_api::units::{ByteCount, Nanoseconds, VolumeId, WritePlace};
+use reel_api::value_list::{ValueAnswer, ValueList};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
@@ -21,6 +29,7 @@ const BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 20_000;
 const CRASH_POINTS: u64 = 40;
+const LATE_CRASH_POINTS: u64 = 200;
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -127,8 +136,7 @@ fn cue_keeps_segment() {
     store.close().expect("close");
 }
 
-// a crash at any step of an unlink loses nothing, and the table and the disk agree. A crash between a seal's tail and its
-// row leaves that segment to a backward walk, which flips nothing, so the older segment can stay, which only understates
+// a crash at any step of an unlink loses nothing, the table and the disk agree, and open finds no damage and no lost row
 #[test]
 fn unlink_crashes() {
     for crash_at in 0..CRASH_POINTS {
@@ -165,7 +173,441 @@ fn unlink_crashes() {
             settle(&io);
             assert_eq!(read(&store), Some(b"newer".to_vec()), "crash at {crash_at}");
             assert_eq!(has_file(&io, older), store.state.volumes[0].table.holds(older), "crash at {crash_at}");
+            assert!(hold(&store.state.volumes[0].damaged).is_empty(), "crash at {crash_at}");
+            assert_eq!(store.state.dropped_summary_rows.load(Ordering::Acquire), 0, "crash at {crash_at}");
             store.close().expect("close");
         }
     }
+}
+
+fn hold_compaction(store: &Store) {
+    store.state.volumes[0].is_compaction_held.store(true, Ordering::Release);
+}
+
+fn job(store: &Store) -> CompactJob<SimulatedIo> {
+    CompactJob::new(Arc::clone(&store.state), 0)
+}
+
+fn dead_rows(store: &Store, number: SegmentNumber) -> u64 {
+    let rows = hold(&store.state.volumes[0].summary);
+    rows.get(number).expect("a row").cursor().column().expect("a column").dead_rows.0
+}
+
+fn saved_rows(io: &SimulatedIo) -> SummaryRows {
+    let mut rows = SummaryRows::new(ByteCount(0));
+    read_summary(io, &SummaryPaths::new(Path::new(ROOT)), &mut rows, &mut LostRows::default()).expect("read");
+    rows
+}
+
+// step until the armed crash lands or the jobs go quiet, then end the process
+fn crash(io: &SimulatedIo, store: Store, is_power_cut: bool) {
+    for _step in 0..STEPS {
+        if io.is_crashed() {
+            break;
+        }
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+            if io.step_any().is_none() {
+                break;
+            }
+        }
+    }
+    if is_power_cut {
+        io.power_cut();
+    } else {
+        io.kill();
+    }
+    drop(store);
+}
+
+// an unlink that lands while a get sits at an older point took what that point could see, so the get starts over
+#[test]
+fn get_crossed() {
+    let io = SimulatedIo::new(Seed(10));
+    let store = open(&io);
+    let older = sealed_put(&store, &io, b"older");
+    let latest = store.state.latest_read(COLUMN, b"key").expect("read");
+    sealed_put(&store, &io, b"newer");
+    assert!(!store.state.volumes[0].table.holds(older));
+
+    let mut buf = Vec::new();
+    assert!(store.state.answer_latest(&latest, RecordWant::Whole, &mut buf).is_none());
+    assert_eq!(read(&store), Some(b"newer".to_vec()));
+    store.close().expect("close");
+}
+
+// a contains in the same spot starts over too, and a delete since shows
+#[test]
+fn contains_crossed() {
+    let io = SimulatedIo::new(Seed(11));
+    let store = open(&io);
+    let older = sealed_put(&store, &io, b"older");
+    let latest = store.state.latest_read(COLUMN, b"key").expect("read");
+    sealed_put(&store, &io, b"newer");
+    assert!(!store.state.volumes[0].table.holds(older));
+
+    assert!(store.state.contains_latest(&latest).is_none());
+    assert!(store.contains(COLUMN, b"key").expect("contains"));
+    store.close().expect("close");
+}
+
+// a get_many with no slot to pin its point starts over when an unlink crosses it
+#[test]
+fn many_crossed() {
+    let io = SimulatedIo::new(Seed(12));
+    let store = open(&io);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let older = sealed_put(&store, &io, b"older");
+    let slots: Vec<usize> = (0..MOST_CUES).map(|_slot| state.cues.take(WritePlace(u64::MAX - 1)).expect("a slot")).collect();
+
+    let many = state.many_read(volume).expect("a read");
+    assert_eq!(many.pin, None);
+    sealed_put(&store, &io, b"newer");
+    assert!(!volume.table.holds(older));
+
+    let mut values = ValueList::new();
+    let mut scratch = Vec::new();
+    assert!(state.answer_many(&many, COLUMN, &[b"key"], &mut values, &mut scratch).is_none());
+    for slot in slots {
+        state.cues.release(slot);
+    }
+    store.close().expect("close");
+}
+
+// a pinned get_many keeps its version through an unlink that stands aside, and the segment goes once the read is done
+#[test]
+fn many_pinned() {
+    let io = SimulatedIo::new(Seed(13));
+    let store = open(&io);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let older = sealed_put(&store, &io, b"older");
+
+    let many = state.many_read(volume).expect("a read");
+    assert!(many.pin.is_some());
+    sealed_put(&store, &io, b"newer");
+    assert!(volume.table.holds(older));
+
+    let mut values = ValueList::new();
+    let mut scratch = Vec::new();
+    let answer = state.answer_many(&many, COLUMN, &[b"key"], &mut values, &mut scratch).expect("an answer");
+    answer.expect("read");
+    assert_eq!(values.answer(0), Some(ValueAnswer::Found(b"older")));
+    settle(&io);
+    assert!(!volume.table.holds(older));
+    store.close().expect("close");
+}
+
+// a cue that read its point before an unlink and took its slot after gives the slot back
+#[test]
+fn cue_crossed() {
+    let io = SimulatedIo::new(Seed(14));
+    let store = open(&io);
+    let state = &store.state;
+    let older = sealed_put(&store, &io, b"older");
+    let reclaims = state.cues.reclaims();
+    let point = state.read_point();
+    sealed_put(&store, &io, b"newer");
+    assert!(!state.volumes[0].table.holds(older));
+
+    let slot = state.cues.take(point).expect("a slot");
+    assert!(!state.pin_holds(slot, reclaims));
+    assert!(state.cues.is_empty());
+    store.close().expect("close");
+}
+
+// a cue that came after the confirm's last look stops the unlink, and so does a replacement the mark hasn't reached
+#[test]
+fn unlink_looks_again() {
+    let io = SimulatedIo::new(Seed(15));
+    let store = open(&io);
+    hold_compaction(&store);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let older = sealed_put(&store, &io, b"older");
+    let below = state.read_point();
+    sealed_put(&store, &io, b"newer");
+    let replacement = state.read_point();
+    let job = job(&store);
+
+    let slot = state.cues.take(below).expect("a slot");
+    job.unlink(volume, older, replacement).expect("unlink");
+    assert!(volume.table.holds(older));
+    state.cues.release(slot);
+
+    job.unlink(volume, older, WritePlace(replacement.0 + 1)).expect("unlink");
+    assert!(volume.table.holds(older));
+
+    job.unlink(volume, older, replacement).expect("unlink");
+    assert!(!volume.table.holds(older));
+    assert!(!has_file(&io, older));
+    store.close().expect("close");
+}
+
+// a stop leaves an unlink stuck behind a pin, with the file as a crash would leave it, and the next open finishes the job
+#[test]
+fn stopped_unlink() {
+    let io = SimulatedIo::new(Seed(16));
+    let store = open(&io);
+    hold_compaction(&store);
+    let state = Arc::clone(&store.state);
+    let volume = &state.volumes[0];
+    let older = sealed_put(&store, &io, b"older");
+    sealed_put(&store, &io, b"newer");
+
+    let pin = volume.table.pin(older).expect("a pin");
+    state.is_stopping.store(true, Ordering::Release);
+    job(&store).unlink(volume, older, state.read_point()).expect("unlink");
+    assert!(!volume.table.holds(older));
+    assert!(has_file(&io, older));
+    drop(pin);
+    store.close().expect("close");
+    io.kill();
+
+    let store = open(&io);
+    settle(&io);
+    assert!(!has_file(&io, older));
+    assert_eq!(read(&store), Some(b"newer".to_vec()));
+    store.close().expect("close");
+}
+
+// counts that say dead move nothing while the footer shows a live row
+#[test]
+fn counts_alone() {
+    let io = SimulatedIo::new(Seed(17));
+    let store = open(&io);
+    store.put(COLUMN, b"other", b"value").expect("put");
+    let older = sealed_put(&store, &io, b"older");
+    let newer = sealed_put(&store, &io, b"newer");
+
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let extra = DeadCount {
+        segment: older,
+        column: COLUMN,
+        block: 0,
+        rows: 1,
+        graves: 0,
+        bytes: ByteCount(0),
+        kept_bytes: ByteCount(0),
+    };
+    let mut rows = hold(&volume.summary);
+    let blocks = rows.get(newer).expect("a row").facts.block_count;
+    rows.apply_walk(newer, blocks, &[extra]);
+    assert!(is_wholly_dead(&rows.get(older).expect("a row")));
+    drop(rows);
+
+    state.ask_compaction();
+    settle(&io);
+    assert!(volume.table.holds(older));
+    assert!(has_file(&io, older));
+    assert!(store.contains(COLUMN, b"other").expect("contains"));
+    store.close().expect("close");
+}
+
+// a segment holding a key's newest row stays whatever the counts say, though an older version sits in a finished segment
+#[test]
+fn newest_stays() {
+    let io = SimulatedIo::new(Seed(24));
+    let store = open(&io);
+    store.put(COLUMN, b"other", b"value").expect("put");
+    let older = sealed_put(&store, &io, b"older");
+    let newest = sealed_put(&store, &io, b"newest");
+
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let extra = DeadCount {
+        segment: newest,
+        column: COLUMN,
+        block: 0,
+        rows: 1,
+        graves: 0,
+        bytes: ByteCount(0),
+        kept_bytes: ByteCount(0),
+    };
+    let mut rows = hold(&volume.summary);
+    let blocks = rows.get(older).expect("a row").facts.block_count;
+    rows.apply_walk(older, blocks, &[extra]);
+    assert!(is_wholly_dead(&rows.get(newest).expect("a row")));
+    drop(rows);
+
+    state.ask_compaction();
+    settle(&io);
+    assert!(volume.table.holds(newest));
+    assert_eq!(read(&store), Some(b"newest".to_vec()));
+    store.close().expect("close");
+}
+
+// a range delete row answers for more than its key, so a confirm refuses it whatever replaced that key
+#[test]
+fn cover_row_stays() {
+    let io = SimulatedIo::new(Seed(18));
+    let store = open(&io);
+    hold_compaction(&store);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    store.delete_range(COLUMN, b"key", b"kez").expect("delete");
+    let older = hold(&volume.claims).open[0].number;
+    store.seal_now();
+    settle(&io);
+    sealed_put(&store, &io, b"newer");
+
+    let target = DeadTarget {
+        segment: older,
+        next_block: 0,
+        block_count: 1,
+        highest_replacement: WritePlace(0),
+    };
+    job(&store).confirm_block(volume, target).expect("confirm");
+    assert!(volume.table.holds(older));
+    store.close().expect("close");
+}
+
+// the pick passes over a segment whose counts can't be taken at their word
+#[test]
+fn pick_refuses() {
+    let io = SimulatedIo::new(Seed(19));
+    let store = open(&io);
+    hold_compaction(&store);
+    let older = sealed_put(&store, &io, b"older");
+    sealed_put(&store, &io, b"newer");
+
+    let rows = hold(&store.state.volumes[0].summary);
+    let row = rows.get(older).expect("a row");
+    assert!(is_wholly_dead(&row));
+    for refused in [
+        |row: &mut reel::segment::summary::SummaryRow<'_>| row.facts.has_covers = true,
+        |row: &mut reel::segment::summary::SummaryRow<'_>| row.facts.is_damaged = true,
+        |row: &mut reel::segment::summary::SummaryRow<'_>| row.facts.walked_blocks = 0,
+    ] {
+        let mut changed = row;
+        refused(&mut changed);
+        assert!(!is_wholly_dead(&changed));
+    }
+    drop(rows);
+    store.close().expect("close");
+}
+
+// a walk waits for a segment's seal to end, since its rows still answer through the open slot past the switch
+#[test]
+fn seal_holds_walk() {
+    let io = SimulatedIo::new(Seed(20));
+    let store = open(&io);
+    let state = &store.state;
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let number = hold(&state.volumes[0].claims).open[0].number;
+    store.seal_now();
+    for _step in 0..STEPS {
+        if !hold(&state.volumes[0].claims).open.iter().any(|segment| segment.number == number) {
+            break;
+        }
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+        }
+    }
+
+    io.hold_jobs("reel-seal", true);
+    settle(&io);
+    assert_eq!(state.volumes[0].sealing.load(Ordering::Acquire), number.0);
+    assert_eq!(state.pending_walks(0), 1);
+    io.hold_jobs("reel-seal", false);
+    settle(&io);
+    assert_eq!(state.pending_walks(0), 0);
+    store.close().expect("close");
+}
+
+// a crash between a seal's tail and its summary row leaves a segment no count holds, and its forward walk counts the
+// older row once
+#[test]
+fn rebuilt_forward() {
+    let mut has_gap = false;
+    for crash_at in 0..CRASH_POINTS {
+        for is_power_cut in [false, true] {
+            let io = SimulatedIo::new(Seed(21));
+            let store = open(&io);
+            store.put(COLUMN, b"other", b"value").expect("put");
+            let older = sealed_put(&store, &io, b"older");
+            store.put(COLUMN, b"key", b"newer").expect("put");
+            let newer = hold(&store.state.volumes[0].claims).open[0].number;
+            store.flush().expect("flush");
+            store.seal_now();
+            io.arm_crash(OperationCount(crash_at));
+            crash(&io, store, is_power_cut);
+
+            let has_row = saved_rows(&io).get(newer).is_some();
+            let store = open(&io);
+            has_gap |= !has_row && store.state.volumes[0].table.holds(newer);
+            store.seal_now();
+            settle(&io);
+            assert_eq!(read(&store), Some(b"newer".to_vec()), "crash at {crash_at}");
+            assert_eq!(dead_rows(&store, older), 1, "crash at {crash_at}");
+            store.close().expect("close");
+        }
+    }
+    assert!(has_gap);
+}
+
+// a crash after an unlink's save and before its file goes leaves a segment with no row, and the older row stays counted once
+#[test]
+fn unlinked_once() {
+    let mut has_gap = false;
+    for crash_at in 0..LATE_CRASH_POINTS {
+        for is_power_cut in [false, true] {
+            let io = SimulatedIo::new(Seed(22));
+            let store = open(&io);
+            store.put(COLUMN, b"other", b"value").expect("put");
+            let older = sealed_put(&store, &io, b"older");
+            let middle = sealed_put(&store, &io, b"middle");
+            store.put(COLUMN, b"key", b"newest").expect("put");
+            store.flush().expect("flush");
+            store.seal_now();
+            io.arm_crash(OperationCount(crash_at));
+            crash(&io, store, is_power_cut);
+
+            has_gap |= saved_rows(&io).get(middle).is_none() && has_file(&io, middle);
+            let store = open(&io);
+            store.seal_now();
+            settle(&io);
+            assert_eq!(read(&store), Some(b"newest".to_vec()), "crash at {crash_at}");
+            assert_eq!(dead_rows(&store, older), 1, "crash at {crash_at}");
+            store.close().expect("close");
+        }
+    }
+    assert!(has_gap);
+}
+
+// a row lost after its walk landed leaves counts that hold that walk, so the rebuilt segment takes the backward walk and
+// the older row stays counted once
+#[test]
+fn lost_row_once() {
+    let io = SimulatedIo::new(Seed(25));
+    let store = open(&io);
+    store.put(COLUMN, b"other", b"value").expect("put");
+    let older = sealed_put(&store, &io, b"older");
+    let newer = sealed_put(&store, &io, b"newer");
+    assert_eq!(dead_rows(&store, older), 1);
+
+    let volume = &store.state.volumes[0];
+    hold(&volume.summary).remove(newer);
+    store.state.save_summary(volume).expect("save");
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+    settle(&io);
+    assert_eq!(dead_rows(&store, older), 1);
+    assert_eq!(read(&store), Some(b"newer".to_vec()));
+    store.close().expect("close");
+}
+
+// the job's buffers fit their plan, and memory_report names them
+#[test]
+fn job_sized() {
+    let io = SimulatedIo::new(Seed(23));
+    let store = open(&io);
+    let bytes = job(&store).heap_bytes();
+    assert!(bytes.0 <= COMPACT_JOB_BYTES);
+    assert_eq!(store.state.memory_report().compaction, bytes);
+    store.close().expect("close");
 }

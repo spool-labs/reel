@@ -529,7 +529,7 @@ fn held_space() {
     io.remove_file(&path).expect("remove");
     assert_eq!(io.free_space(&root).expect("free space"), ByteCount(0));
 
-    drop(file);
+    io.close_file(file);
     assert_eq!(io.free_space(&root).expect("free space"), RESERVED);
 }
 
@@ -609,4 +609,21 @@ fn self_stop() {
         reached = latest;
     }
     assert!(is_settled);
+}
+
+// a use after close and a second close are counted, and a copy of a handle is the same handle
+#[test]
+fn closed_handle() {
+    let (io, root) = simulated(SEED);
+    let file = io.create_file(&root.join("file"), ByteCount(0)).expect("create");
+    let copy = file.clone();
+
+    assert_eq!(io.open_handle_count(), 1);
+    io.close_file(file);
+    assert_eq!(io.open_handle_count(), 0);
+
+    assert!(copy.length().is_err());
+    assert_eq!(io.handle_faults(), OperationCount(1));
+    io.close_file(copy);
+    assert_eq!(io.handle_faults(), OperationCount(2));
 }

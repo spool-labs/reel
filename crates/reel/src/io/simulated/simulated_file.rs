@@ -7,21 +7,26 @@ use reel_api::units::{ByteCount, FileOffset, ProcessId};
 
 use crate::guard::hold;
 use crate::io::IoFile;
-use crate::io::simulated::simulated_disk::{InodeNumber, OperationCount, SimulatedDisk};
+use crate::io::simulated::simulated_disk::{HandleId, InodeNumber, OperationCount, SimulatedDisk};
 
-/// A handle that only works for the process that opened it
-#[derive(Debug)]
+/// A handle that only works until its close, and only for the process that opened it
+#[derive(Clone, Debug)]
 pub struct SimulatedFile {
     pub disk: Arc<Mutex<SimulatedDisk>>,
     pub inode: InodeNumber,
+    pub handle: HandleId,
     pub process: ProcessId,
     pub is_writable: bool,
 }
 
 impl SimulatedFile {
-    /// Refuse a handle that outlived its process or a write through a read-only one
+    /// Refuse a closed handle, one that outlived its process, or a write through a read-only one
     pub fn check(&self, disk: &mut SimulatedDisk, is_write: bool) -> Result<()> {
         disk.enter()?;
+        if !disk.open_handles.contains_key(&self.handle) {
+            disk.handle_faults = OperationCount(disk.handle_faults.0 + 1);
+            return Err(Error::other("simulated handle used after its close"));
+        }
         if disk.process != self.process {
             return Err(Error::other("simulated handle outlived its process"));
         }
@@ -47,31 +52,6 @@ impl SimulatedFile {
         if let Some(image) = disk.inodes.get_mut(&self.inode) {
             image.write(offset, bytes);
         }
-    }
-}
-
-impl Clone for SimulatedFile {
-    fn clone(&self) -> Self {
-        let mut disk = hold(&self.disk);
-        if let Some(image) = disk.inodes.get_mut(&self.inode) {
-            image.handle_count += 1;
-        }
-        Self {
-            disk: Arc::clone(&self.disk),
-            inode: self.inode,
-            process: self.process,
-            is_writable: self.is_writable,
-        }
-    }
-}
-
-impl Drop for SimulatedFile {
-    fn drop(&mut self) {
-        let mut disk = hold(&self.disk);
-        if let Some(image) = disk.inodes.get_mut(&self.inode) {
-            image.handle_count = image.handle_count.saturating_sub(1);
-        }
-        disk.collect(self.inode);
     }
 }
 

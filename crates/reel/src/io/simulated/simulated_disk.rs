@@ -21,6 +21,10 @@ pub const NAME_SURVIVAL_ODDS: u64 = 2;
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct InodeNumber(pub u64);
 
+/// The id of one open, which every copy of its handle shares
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HandleId(pub u64);
+
 /// A count of operations on the simulated disk
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct OperationCount(pub u64);
@@ -52,6 +56,9 @@ pub struct SimulatedDisk {
     pub bytes_read: ByteCount,
     pub operations_until_crash: Option<OperationCount>,
     pub is_crashed: bool,
+    pub open_handles: BTreeMap<HandleId, InodeNumber>,
+    pub next_handle: HandleId,
+    pub handle_faults: OperationCount,
 }
 
 impl SimulatedDisk {
@@ -73,6 +80,9 @@ impl SimulatedDisk {
             bytes_read: ByteCount::default(),
             operations_until_crash: None,
             is_crashed: false,
+            open_handles: BTreeMap::new(),
+            next_handle: HandleId::default(),
+            handle_faults: OperationCount::default(),
         }
     }
 
@@ -271,8 +281,43 @@ impl SimulatedDisk {
         }
     }
 
+    /// Open a handle on an inode
+    pub fn open_handle(&mut self, inode: InodeNumber) -> HandleId {
+        let handle = self.next_handle;
+        self.next_handle = HandleId(handle.0 + 1);
+        self.open_handles.insert(handle, inode);
+        if let Some(image) = self.inodes.get_mut(&inode) {
+            image.handle_count += 1;
+        }
+        handle
+    }
+
+    /// Close a handle, and count a second close as a fault
+    pub fn close_handle(&mut self, handle: HandleId) {
+        let Some(inode) = self.open_handles.remove(&handle) else {
+            self.handle_faults = OperationCount(self.handle_faults.0 + 1);
+            return;
+        };
+        if let Some(image) = self.inodes.get_mut(&inode) {
+            image.handle_count = image.handle_count.saturating_sub(1);
+        }
+        self.collect(inode);
+    }
+
+    /// Close every handle, as the kernel does when a process ends
+    pub fn close_all_handles(&mut self) {
+        let handles = mem::take(&mut self.open_handles);
+        for inode in handles.into_values() {
+            if let Some(image) = self.inodes.get_mut(&inode) {
+                image.handle_count = image.handle_count.saturating_sub(1);
+            }
+            self.collect(inode);
+        }
+    }
+
     /// End the running process: the kernel keeps every write and every lock is freed
     pub fn kill(&mut self) {
+        self.close_all_handles();
         self.process = ProcessId(self.process.0 + 1);
         self.locks.clear();
         self.is_crashed = false;

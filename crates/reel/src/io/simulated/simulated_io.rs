@@ -88,6 +88,16 @@ impl SimulatedIo {
         (disk.reads, disk.bytes_read)
     }
 
+    /// Count the handles still open
+    pub fn open_handle_count(&self) -> u64 {
+        hold(&self.disk).open_handles.len() as u64
+    }
+
+    /// Count the uses of a closed handle and the second closes
+    pub fn handle_faults(&self) -> OperationCount {
+        hold(&self.disk).handle_faults
+    }
+
     /// Make the next syncs fail
     pub fn fail_syncs(&self, count: OperationCount) {
         hold(&self.disk).failing_syncs = count;
@@ -172,12 +182,10 @@ impl SimulatedIo {
 
     /// Wrap an inode in a handle for the running process
     pub fn handle(&self, disk: &mut SimulatedDisk, inode: InodeNumber, is_writable: bool) -> SimulatedFile {
-        if let Some(image) = disk.inodes.get_mut(&inode) {
-            image.handle_count += 1;
-        }
         SimulatedFile {
             disk: Arc::clone(&self.disk),
             inode,
+            handle: disk.open_handle(inode),
             process: disk.process,
             is_writable,
         }
@@ -211,7 +219,7 @@ impl Io for SimulatedIo {
     }
 
     fn close_file(&self, file: SimulatedFile) {
-        drop(file);
+        hold(&self.disk).close_handle(file.handle);
     }
 
     fn remove_file(&self, path: &Path) -> Result<()> {

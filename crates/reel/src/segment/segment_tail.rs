@@ -4,7 +4,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
-use crate::record::record_check::RecordKey;
+use crate::record::record_check::{Checksum, RecordKey};
 use crate::segment::block_entry::{KEY_PREFIX_BYTES, KeyPrefix};
 
 /// Ends every sealed segment
@@ -12,11 +12,15 @@ pub const TAIL_MAGIC: u32 = 0x5245_4C54;
 /// Bytes at the very end: the tail's length, the magic and the checksum
 pub const TRAILER_BYTES: usize = 16;
 /// Bytes of the fixed part of a tail
-pub const TAIL_FIXED_BYTES: usize = 76;
+pub const TAIL_FIXED_BYTES: usize = 84;
 /// Spare bytes in the fixed part of a tail
 pub const TAIL_PADDING_BYTES: usize = 4;
 /// Bytes of one column's part of a tail
 pub const COLUMN_TAIL_BYTES: usize = 72;
+/// Spare bytes in one column's part of a tail
+pub const COLUMN_PADDING_BYTES: usize = 4;
+/// Most bytes a segment can reach, since its offsets are 32 bits
+pub const MOST_SEGMENT_BYTES: ByteCount = ByteCount(u32::MAX as u64);
 /// Most columns a store has
 pub const MAX_COLUMNS: usize = 256;
 /// Bytes that hold any tail
@@ -42,6 +46,7 @@ pub struct PlaceRange {
 pub struct ColumnTail {
     pub column: ColumnId,
     pub shared_length: u16,
+    pub shared_sum: Checksum,
     pub lowest: KeyPrefix,
     pub highest: KeyPrefix,
     pub first_block: u32,
@@ -61,6 +66,7 @@ pub struct TailHead {
     pub ranges_length: ByteCount,
     pub places: PlaceRange,
     pub place_base: WritePlace,
+    pub index_sum: Checksum,
     pub column_count: u32,
 }
 
@@ -138,6 +144,7 @@ impl TailHead {
         out.put(&self.places.lowest.0.to_le_bytes());
         out.put(&self.places.highest.0.to_le_bytes());
         out.put(&self.place_base.0.to_le_bytes());
+        out.put(&self.index_sum.0.to_le_bytes());
         out.put(&self.column_count.to_le_bytes());
         out.put(&[0; TAIL_PADDING_BYTES]);
     }
@@ -156,6 +163,7 @@ impl TailHead {
                 highest: WritePlace(input.word()?),
             },
             place_base: WritePlace(input.word()?),
+            index_sum: Checksum(input.word()?),
             column_count: input.half()?,
         };
         input.take(TAIL_PADDING_BYTES)?;
@@ -168,13 +176,14 @@ impl ColumnTail {
     pub fn write(&self, out: &mut TailCursor) {
         out.put(&[self.column.0, 0]);
         out.put(&self.shared_length.to_le_bytes());
+        out.put(&self.shared_sum.0.to_le_bytes());
         out.put(&self.lowest.0);
         out.put(&self.highest.0);
         out.put(&self.first_block.to_le_bytes());
         out.put(&self.block_count.0.to_le_bytes());
         out.put(&self.row_count.0.to_le_bytes());
         out.put(&self.grave_count.0.to_le_bytes());
-        out.put(&[0; COLUMN_TAIL_BYTES - 60]);
+        out.put(&[0; COLUMN_PADDING_BYTES]);
     }
 
     /// Read one column's fields back
@@ -183,6 +192,7 @@ impl ColumnTail {
         let tail = Self {
             column: ColumnId(leading[0]),
             shared_length: u16::from_le_bytes([leading[2], leading[3]]),
+            shared_sum: Checksum(input.word()?),
             lowest: input.prefix()?,
             highest: input.prefix()?,
             first_block: input.half()?,
@@ -190,7 +200,7 @@ impl ColumnTail {
             row_count: RowCount(input.word()?),
             grave_count: RowCount(input.word()?),
         };
-        input.take(COLUMN_TAIL_BYTES - 60)?;
+        input.take(COLUMN_PADDING_BYTES)?;
         Some(tail)
     }
 }
@@ -246,6 +256,7 @@ mod tests {
                 highest: WritePlace(30),
             },
             place_base: WritePlace(3),
+            index_sum: Checksum(8),
             column_count: 2,
         }
     }
@@ -254,6 +265,7 @@ mod tests {
         ColumnTail {
             column: ColumnId(id),
             shared_length: 5,
+            shared_sum: Checksum(6),
             lowest: KeyPrefix::of_key(b"low", 0),
             highest: KeyPrefix::of_key(b"high", 0),
             first_block: 1,

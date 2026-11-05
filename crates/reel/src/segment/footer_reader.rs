@@ -6,9 +6,10 @@ use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::index::key_hash::KeyHash;
 use crate::io::IoFile;
-use crate::record::record_check::RecordKey;
+use crate::record::record_check::{Checksum, RecordKey, checksum};
 use crate::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry, KeyPrefix};
-use crate::segment::block_filter::may_contain;
+use crate::segment::block_filter::{may_contain, open_filter};
+use crate::segment::footer_writer::fold_sum;
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_tail::{ColumnTail, MAX_TAIL_BYTES, TailHead, TailReader, find_tail};
 
@@ -96,16 +97,18 @@ impl FooterReader {
         Ok(Some(head))
     }
 
-    /// Read a segment's block index
+    /// Read a segment's block index, and return false when it fails its check
     pub fn read_index<File: IoFile>(&mut self, file: &File, head: &TailHead, entries: &mut Vec<BlockEntry>) -> Result<bool> {
         entries.clear();
         let mut at = head.index_at;
         let mut remaining = head.block_count.0 as usize;
+        let mut sum = Checksum(0);
         let lines_per_read = self.block.len() / BLOCK_ENTRY_BYTES;
         while remaining > 0 {
             let lines = remaining.min(lines_per_read);
             let length = lines * BLOCK_ENTRY_BYTES;
             file.read_exact_at(at, &mut self.block[..length])?;
+            sum = fold_sum(sum, checksum(&self.block[..length]));
             for line in 0..lines {
                 let Some(entry) = BlockEntry::read(&self.block[line * BLOCK_ENTRY_BYTES..]) else {
                     return Ok(false);
@@ -115,7 +118,7 @@ impl FooterReader {
             at = FileOffset(at.0 + length as u64);
             remaining -= lines;
         }
-        Ok(true)
+        Ok(sum == head.index_sum)
     }
 
     /// Find a key's newest row at a read point, through its filter and one row block
@@ -139,7 +142,10 @@ impl FooterReader {
                 return Ok(FooterAnswer::Damaged);
             }
             file.read_exact_at(filter_at, &mut self.filter[..filter_length])?;
-            if !may_contain(&self.filter[..filter_length], query.hash) {
+            let Some(bits) = open_filter(&self.filter[..filter_length]) else {
+                return Ok(FooterAnswer::Damaged);
+            };
+            if !may_contain(bits, query.hash) {
                 continue;
             }
 

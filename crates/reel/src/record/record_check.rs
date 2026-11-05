@@ -18,7 +18,7 @@ pub struct RecordKey(pub u64);
 pub struct RecordCheck(pub u64);
 
 /// A checksum of stored bytes
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Checksum(pub u64);
 
 /// What a record belongs to

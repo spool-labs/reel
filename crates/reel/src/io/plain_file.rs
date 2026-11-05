@@ -2,8 +2,8 @@
 
 use std::fs::File;
 use std::io::{Error, ErrorKind, IoSlice, IoSliceMut, Result};
-use std::mem::{ManuallyDrop, MaybeUninit};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 
 use reel_api::units::{ByteCount, FileOffset};
 
@@ -26,13 +26,8 @@ impl PlainFile {
     /// Close the file
     pub fn close(self) {
         // SAFETY: this handle owns the descriptor, and the engine closes each file once
-        drop(unsafe { File::from_raw_fd(self.descriptor) });
-    }
-
-    /// Borrow the descriptor as a file for one call, without closing it
-    pub fn borrowed(&self) -> ManuallyDrop<File> {
-        // SAFETY: the descriptor stays open for the call, and ManuallyDrop never closes it
-        ManuallyDrop::new(unsafe { File::from_raw_fd(self.descriptor) })
+        // a failed close leaves nothing to retry, since the descriptor is gone either way
+        let _status = unsafe { libc::close(self.descriptor) };
     }
 
     /// Finish a short vectored write one part at a time
@@ -50,7 +45,11 @@ impl PlainFile {
             let mut sent: u64 = 0;
             while sent < remainder.len() as u64 {
                 let rest = [IoSlice::new(&remainder[sent as usize..])];
-                sent += write_vectored(self.descriptor, FileOffset(position + sent), &rest)?.0;
+                let taken = write_vectored(self.descriptor, FileOffset(position + sent), &rest)?;
+                if taken.0 == 0 {
+                    return Err(Error::from(ErrorKind::WriteZero));
+                }
+                sent += taken.0;
             }
             position = position.saturating_add(remainder.len() as u64);
             skipped = 0;
@@ -120,7 +119,7 @@ impl IoFile for PlainFile {
     }
 
     fn sync(&self) -> Result<()> {
-        self.borrowed().sync_data()
+        sync_descriptor(self.descriptor)
     }
 
     fn length(&self) -> Result<ByteCount> {
@@ -137,8 +136,35 @@ impl IoFile for PlainFile {
     }
 
     fn truncate(&self, length: ByteCount) -> Result<()> {
-        self.borrowed().set_len(length.0)
+        // SAFETY: the descriptor is open, and no pointer crosses the call
+        let status = unsafe { libc::ftruncate(self.descriptor, length.0 as libc::off_t) };
+        if status != 0 {
+            return Err(Error::last_os_error());
+        }
+        Ok(())
     }
+}
+
+/// Make a file's writes reach the disk
+#[cfg(target_os = "linux")]
+pub fn sync_descriptor(descriptor: RawFd) -> Result<()> {
+    // SAFETY: the descriptor is open, and no pointer crosses the call
+    let status = unsafe { libc::fdatasync(descriptor) };
+    if status != 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Make a file's writes reach the disk, which on macOS takes a full flush
+#[cfg(target_os = "macos")]
+pub fn sync_descriptor(descriptor: RawFd) -> Result<()> {
+    // SAFETY: the descriptor is open, and no pointer crosses the call
+    let status = unsafe { libc::fcntl(descriptor, libc::F_FULLFSYNC) };
+    if status != 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Issue one positioned vectored read and return the bytes it brought

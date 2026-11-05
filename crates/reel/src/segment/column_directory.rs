@@ -5,6 +5,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use reel_api::units::ByteCount;
 
+use crate::record::record_check::{Checksum, checksum};
 use crate::segment::block_entry::KeyPrefix;
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -14,13 +15,16 @@ pub const DIRECTORY_VERSIONS: usize = 2;
 /// One segment's range in one column
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DirectoryEntry {
+    pub shared_length: u16,
+    pub shared_sum: Checksum,
     pub lowest: KeyPrefix,
     pub highest: KeyPrefix,
     pub reach: KeyPrefix,
     pub segment: SegmentNumber,
 }
 
-/// A column's segments sorted by lowest key, in two copies with room fixed at open
+/// A column's segments, grouped by the bytes each one's keys share and sorted by lowest key in
+/// a group, in two copies with room fixed at open
 #[derive(Debug)]
 pub struct ColumnDirectory {
     versions: [RwLock<Vec<DirectoryEntry>>; DIRECTORY_VERSIONS],
@@ -46,18 +50,20 @@ impl ColumnDirectory {
     }
 
     /// Fill a buffer with the segments whose range holds a key, up to its capacity
-    pub fn candidates(&self, key: KeyPrefix, out: &mut Vec<SegmentNumber>) {
+    pub fn candidates(&self, key: &[u8], out: &mut Vec<SegmentNumber>) {
         out.clear();
         let current = self.current.load(Ordering::Acquire);
         let list = read_list(&self.versions[current]);
-        let end = list.partition_point(|entry| entry.lowest <= key);
-        for entry in list[..end].iter().rev() {
-            if entry.reach < key {
-                break;
+
+        let mut start = 0;
+        while let Some(first) = list.get(start) {
+            let shared = first.shared_length;
+            let end = start + list[start..].partition_point(|entry| entry.shared_length == shared);
+            if let Some(bytes) = key.get(..shared as usize) {
+                let group = group_of(&list[start..end], checksum(bytes));
+                search_group(group, KeyPrefix::of_key(key, shared as usize), out);
             }
-            if entry.highest >= key && out.len() < out.capacity() {
-                out.push(entry.segment);
-            }
+            start = end;
         }
     }
 
@@ -75,7 +81,7 @@ impl ColumnDirectory {
                 }
             }
             if let Some(entry) = added {
-                let at = target.partition_point(|existing| existing.lowest <= entry.lowest);
+                let at = target.partition_point(|existing| sort_key(existing) <= sort_key(entry));
                 target.insert(at, *entry);
             }
             refresh_reach(&mut target);
@@ -84,10 +90,41 @@ impl ColumnDirectory {
     }
 }
 
-/// Carry the highest key seen so far along the list, so a search knows when to stop
+/// Order entries by group, then by lowest key
+pub fn sort_key(entry: &DirectoryEntry) -> (u16, Checksum, KeyPrefix) {
+    (entry.shared_length, entry.shared_sum, entry.lowest)
+}
+
+/// Find the run of a group whose shared bytes match a key's
+pub fn group_of(length_run: &[DirectoryEntry], sum: Checksum) -> &[DirectoryEntry] {
+    let start = length_run.partition_point(|entry| entry.shared_sum < sum);
+    let end = length_run.partition_point(|entry| entry.shared_sum <= sum);
+    &length_run[start..end]
+}
+
+/// Add the segments of one group whose range holds a key, up to the buffer's capacity
+pub fn search_group(group: &[DirectoryEntry], key: KeyPrefix, out: &mut Vec<SegmentNumber>) {
+    let end = group.partition_point(|entry| entry.lowest <= key);
+    for entry in group[..end].iter().rev() {
+        if entry.reach < key {
+            break;
+        }
+        if entry.highest >= key && out.len() < out.capacity() {
+            out.push(entry.segment);
+        }
+    }
+}
+
+/// Carry the highest key seen so far along each group, so a search knows when to stop
 pub fn refresh_reach(list: &mut [DirectoryEntry]) {
     let mut reach = KeyPrefix::default();
+    let mut group = None;
     for entry in list.iter_mut() {
+        let this_group = Some((entry.shared_length, entry.shared_sum));
+        if group != this_group {
+            group = this_group;
+            reach = KeyPrefix::default();
+        }
         reach = reach.max(entry.highest);
         entry.reach = reach;
     }
@@ -112,17 +149,17 @@ pub fn write_list(list: &RwLock<Vec<DirectoryEntry>>) -> RwLockWriteGuard<'_, Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::segment::footer_writer::shared_prefix;
 
     const CAPACITY: usize = 16;
 
-    fn prefix(key: &[u8]) -> KeyPrefix {
-        KeyPrefix::of_key(key, 0)
-    }
-
     fn entry(number: u64, lowest: &[u8], highest: &[u8]) -> DirectoryEntry {
+        let shared = shared_prefix(lowest, highest);
         DirectoryEntry {
-            lowest: prefix(lowest),
-            highest: prefix(highest),
+            shared_length: shared as u16,
+            shared_sum: checksum(&lowest[..shared]),
+            lowest: KeyPrefix::of_key(lowest, shared),
+            highest: KeyPrefix::of_key(highest, shared),
             reach: KeyPrefix::default(),
             segment: SegmentNumber(number),
         }
@@ -130,7 +167,7 @@ mod tests {
 
     fn found(directory: &ColumnDirectory, key: &[u8]) -> Vec<u64> {
         let mut out = Vec::with_capacity(CAPACITY);
-        directory.candidates(prefix(key), &mut out);
+        directory.candidates(key, &mut out);
         let mut numbers = Vec::new();
         for segment in out {
             numbers.push(segment.0);
@@ -164,6 +201,19 @@ mod tests {
         directory.replace(Some(&entry(3, b"d", b"e")), &[]);
 
         assert_eq!(found(&directory, b"m"), vec![1]);
+    }
+
+    // keys sharing a long prefix still rule out the segments of other ranges
+    #[test]
+    fn long_prefix() {
+        let directory = ColumnDirectory::new(CAPACITY);
+        directory.replace(Some(&entry(1, b"address-of-one-tape-0001", b"address-of-one-tape-0100")), &[]);
+        directory.replace(Some(&entry(2, b"address-of-one-tape-0101", b"address-of-one-tape-0200")), &[]);
+        directory.replace(Some(&entry(3, b"address-of-one-tape-0201", b"address-of-one-tape-0300")), &[]);
+
+        assert_eq!(found(&directory, b"address-of-one-tape-0150"), vec![2]);
+        assert_eq!(found(&directory, b"address-of-one-tape-0250"), vec![3]);
+        assert_eq!(found(&directory, b"address-of-another-0150"), Vec::<u64>::new());
     }
 
     // a merge swaps its inputs for its output in one publish

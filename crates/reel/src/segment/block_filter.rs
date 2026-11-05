@@ -1,6 +1,7 @@
 //! A bloom filter over one row block's keys
 
 use crate::index::key_hash::KeyHash;
+use crate::record::record_check::checksum;
 
 /// Bits per row, so false positives across 32 overlapping segments stay at 0.05 or less
 pub const BITS_PER_ROW: usize = 14;
@@ -11,9 +12,30 @@ pub const MIN_FILTER_BYTES: usize = 8;
 /// Shift that picks the second probe stride
 pub const STRIDE_SHIFT: u32 = 32;
 
+/// Bytes of the checksum behind a stored filter
+pub const FILTER_SUM_BYTES: usize = size_of::<u64>();
+
 /// Count the bytes a filter over some rows takes
 pub fn filter_bytes(rows: usize) -> usize {
     (rows * BITS_PER_ROW).div_ceil(u8::BITS as usize).max(MIN_FILTER_BYTES)
+}
+
+/// Write a filter's checksum behind its bits
+pub fn seal_filter(stored: &mut [u8]) {
+    let bits = stored.len() - FILTER_SUM_BYTES;
+    let sum = checksum(&stored[..bits]);
+    stored[bits..].copy_from_slice(&sum.0.to_le_bytes());
+}
+
+/// Check a stored filter and return its bits, or nothing when it's damaged
+pub fn open_filter(stored: &[u8]) -> Option<&[u8]> {
+    let bits = stored.len().checked_sub(FILTER_SUM_BYTES)?;
+    let mut sum = [0; FILTER_SUM_BYTES];
+    sum.copy_from_slice(&stored[bits..]);
+    if checksum(&stored[..bits]).0 != u64::from_le_bytes(sum) {
+        return None;
+    }
+    Some(&stored[..bits])
 }
 
 /// Add a key to a filter
@@ -67,6 +89,19 @@ mod tests {
 
     fn hash_of(number: u64) -> KeyHash {
         hash_key(COLUMN, &number.to_le_bytes())
+    }
+
+    // a stored filter opens to its bits, and one flipped bit is refused
+    #[test]
+    fn filter_rot() {
+        let mut stored = vec![0; filter_bytes(100) + FILTER_SUM_BYTES];
+        let bits = stored.len() - FILTER_SUM_BYTES;
+        add_key(&mut stored[..bits], hash_of(1));
+        seal_filter(&mut stored);
+
+        assert_eq!(open_filter(&stored).map(<[u8]>::len), Some(bits));
+        stored[3] ^= 1;
+        assert_eq!(open_filter(&stored), None);
     }
 
     // every added key is found, and the false positive rate holds the bound

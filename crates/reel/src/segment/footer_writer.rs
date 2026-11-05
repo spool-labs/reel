@@ -1,20 +1,20 @@
 //! Writes a sealed segment's footer: row blocks with their filters, the block index and the tail
 
-use std::io::{IoSlice, Result};
+use std::io::{Error, IoSlice, Result};
 
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::io::IoFile;
-use crate::record::record_check::RecordKey;
+use crate::record::record_check::{Checksum, RecordKey, checksum};
 use crate::row_kind::RowKind;
 use crate::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry, KeyPrefix};
-use crate::segment::block_filter::{add_key, filter_bytes};
+use crate::segment::block_filter::{FILTER_SUM_BYTES, add_key, filter_bytes, seal_filter};
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockBuilder};
 use crate::segment::segment_tail::{
-    BlockCount, COLUMN_TAIL_BYTES, ColumnTail, MAX_COLUMNS, MAX_TAIL_BYTES, PlaceRange, SegmentNumber, TAIL_FIXED_BYTES,
-    TailCursor, TailHead, write_trailer,
+    BlockCount, COLUMN_TAIL_BYTES, ColumnTail, MAX_COLUMNS, MAX_TAIL_BYTES, MOST_SEGMENT_BYTES, PlaceRange, SegmentNumber,
+    TAIL_FIXED_BYTES, TailCursor, TailHead, write_trailer,
 };
 
 /// Most rows a block of the smallest rows can hold
@@ -59,7 +59,7 @@ impl FooterWriter {
     pub fn new(most_blocks: BlockCount) -> Self {
         Self {
             builder: RowBlockBuilder::new(),
-            filter: vec![0; filter_bytes(MOST_BLOCK_ROWS)],
+            filter: vec![0; filter_bytes(MOST_BLOCK_ROWS) + FILTER_SUM_BYTES],
             hashes: Vec::with_capacity(MOST_BLOCK_ROWS),
             entries: Vec::with_capacity(most_blocks.0 as usize),
             columns: Vec::with_capacity(MAX_COLUMNS),
@@ -117,8 +117,9 @@ impl FooterWriter {
         self.columns.push(ColumnTail {
             column: start.column,
             shared_length: shared as u16,
-            lowest: KeyPrefix::of_key(start.lowest, 0),
-            highest: KeyPrefix::of_key(start.highest, 0),
+            shared_sum: checksum(&start.lowest[..shared]),
+            lowest: KeyPrefix::of_key(start.lowest, shared),
+            highest: KeyPrefix::of_key(start.highest, shared),
             first_block: self.entries.len() as u32,
             block_count: BlockCount(0),
             row_count: RowCount(0),
@@ -129,7 +130,10 @@ impl FooterWriter {
 
     /// Add the next row of the current column, in row order
     pub fn push_row<File: IoFile>(&mut self, file: &File, key: &[u8], row: &FooterRow) -> Result<()> {
-        if !self.builder.push(key, row) || self.hashes.len() == MOST_BLOCK_ROWS {
+        if self.hashes.len() == MOST_BLOCK_ROWS {
+            self.close_block(file)?;
+        }
+        if !self.builder.push(key, row) {
             self.close_block(file)?;
             self.builder.push(key, row);
         }
@@ -165,16 +169,25 @@ impl FooterWriter {
         }
 
         let row_count = self.builder.row_count();
-        let filter_length = filter_bytes(self.hashes.len());
-        let filter = &mut self.filter[..filter_length];
-        filter.fill(0);
-        for hash in &self.hashes {
-            add_key(filter, *hash);
+        if self.entries.len() == self.entries.capacity() {
+            return Err(Error::other("segment has more row blocks than its index holds"));
         }
+
+        let bits = filter_bytes(self.hashes.len());
+        let filter_length = bits + FILTER_SUM_BYTES;
+        let filter = &mut self.filter[..filter_length];
+        filter[..bits].fill(0);
+        for hash in &self.hashes {
+            add_key(&mut filter[..bits], *hash);
+        }
+        seal_filter(filter);
 
         let block_at = self.position;
         let block = self.builder.finish();
         let filter_at = block_at.0 + block.len() as u64;
+        if filter_at + filter_length as u64 > MOST_SEGMENT_BYTES.0 {
+            return Err(Error::other("footer passes the most bytes a segment can reach"));
+        }
         let parts = [IoSlice::new(block), IoSlice::new(filter)];
         file.write_at(block_at, &parts)?;
 
@@ -211,12 +224,15 @@ impl FooterWriter {
         self.close_block(file)?;
 
         let index_at = self.position;
-        self.write_index(file)?;
+        let index_sum = self.write_index(file)?;
         let ranges_at = self.position;
         if !ranges.is_empty() {
             file.write_at(ranges_at, &[IoSlice::new(ranges)])?;
             self.position = FileOffset(ranges_at.0 + ranges.len() as u64);
         }
+
+        // the footer must be whole before a tail can say so, or a power cut could keep the tail alone
+        file.sync()?;
 
         let head = TailHead {
             segment,
@@ -227,6 +243,7 @@ impl FooterWriter {
             ranges_length: ByteCount(ranges.len() as u64),
             places: self.places,
             place_base: self.place_base,
+            index_sum,
             column_count: self.columns.len() as u32,
         };
         let total = self.write_tail(&head, record_key);
@@ -234,6 +251,7 @@ impl FooterWriter {
 
         let file_length = ByteCount(self.position.0 + total as u64);
         file.truncate(file_length)?;
+        file.sync()?;
         Ok(FooterTotals {
             file_length,
             block_count: head.block_count,
@@ -241,18 +259,20 @@ impl FooterWriter {
         })
     }
 
-    /// Write the block index a buffer at a time
-    pub fn write_index<File: IoFile>(&mut self, file: &File) -> Result<()> {
+    /// Write the block index a buffer at a time, and return its checksum
+    pub fn write_index<File: IoFile>(&mut self, file: &File) -> Result<Checksum> {
+        let mut sum = Checksum(0);
         let lines_per_write = self.index.len() / BLOCK_ENTRY_BYTES;
         for lines in self.entries.chunks(lines_per_write) {
             for (line, entry) in lines.iter().enumerate() {
                 entry.write(&mut self.index[line * BLOCK_ENTRY_BYTES..]);
             }
             let length = lines.len() * BLOCK_ENTRY_BYTES;
+            sum = fold_sum(sum, checksum(&self.index[..length]));
             file.write_at(self.position, &[IoSlice::new(&self.index[..length])])?;
             self.position = FileOffset(self.position.0 + length as u64);
         }
-        Ok(())
+        Ok(sum)
     }
 
     /// Lay out the tail and return its length
@@ -265,6 +285,11 @@ impl FooterWriter {
         let body = TAIL_FIXED_BYTES + self.columns.len() * COLUMN_TAIL_BYTES;
         write_trailer(&mut self.tail, body, record_key)
     }
+}
+
+/// Fold one buffer's checksum into a running one
+pub fn fold_sum(running: Checksum, next: Checksum) -> Checksum {
+    Checksum(running.0.rotate_left(1) ^ next.0)
 }
 
 /// Count the bytes two keys share at the front

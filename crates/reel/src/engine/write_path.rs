@@ -35,6 +35,8 @@ use crate::segment::range_covers::{Cover, MOST_RANGE_COVERS};
 pub const WRITES_PER_OPEN: u32 = 2;
 /// How many times a writer waits on the spot for a window to go out before it tries again
 pub const WINDOW_SPINS: u32 = 2_000;
+/// A writer waiting on a window spins this many rounds of spins, then pauses, since a sync holds the turn for milliseconds
+pub const WINDOW_SPIN_ROUNDS: u32 = 4;
 /// How long a writer waits for a seal to free the write index before it reports the failure
 pub const INDEX_WAIT: Nanoseconds = Nanoseconds(60_000_000_000);
 
@@ -219,20 +221,48 @@ impl<Backend: Io> EngineState<Backend> {
         match self.switch_window(volume, slot, length) {
             WindowSwitch::HasRoom => Ok(true),
             WindowSwitch::NoRoom => Ok(false),
-            WindowSwitch::Switched | WindowSwitch::OtherBusy => {
+            WindowSwitch::Switched => {
+                // the new window has room, and whoever holds the turn or the row job sends the old one
                 if self.try_writing_turn(slot) {
-                    let outcome = self.send_kept_window(index);
-                    hold(&self.queues[index]).is_writing = false;
-                    sent(outcome)?;
-                } else {
-                    // the write that holds the turn takes microseconds, against a millisecond for any sleep
-                    for _spin in 0..WINDOW_SPINS {
-                        hint::spin_loop();
-                    }
+                    sent(self.send_kept_in_turn(index))?;
                 }
                 Ok(true)
             },
+            WindowSwitch::OtherBusy => {
+                sent(self.wait_for_kept_window(slot))?;
+                Ok(true)
+            },
         }
+    }
+
+    /// Wait for the window waiting to go, holding nothing, and send it when the turn comes free
+    pub fn wait_for_kept_window(&self, slot: OpenSlot) -> Result<(), Error> {
+        let index = slot.0 as usize;
+        let mut rounds = 0;
+        loop {
+            if self.try_writing_turn(slot) {
+                return self.send_kept_in_turn(index);
+            }
+            if !hold(&self.queues[index]).has_kept_window {
+                return Ok(());
+            }
+            if rounds < WINDOW_SPIN_ROUNDS {
+                // the write that holds the turn takes microseconds, against a millisecond for any sleep
+                rounds += 1;
+                for _spin in 0..WINDOW_SPINS {
+                    hint::spin_loop();
+                }
+            } else {
+                self.io.pause();
+            }
+        }
+    }
+
+    /// Send the window waiting to go with the slot's turn held, and give the turn back
+    pub fn send_kept_in_turn(&self, index: usize) -> Result<(), Error> {
+        let outcome = self.send_kept_window(index);
+        hold(&self.queues[index]).is_writing = false;
+        outcome
     }
 
     /// Move a slot to the next range of its segment in the other window, under the locks and with no I/O
@@ -776,8 +806,11 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
-    /// Mark the taking segment with the most covers to seal
+    /// Mark the taking segment with the most covers to seal, unless a seal is on its way to free a slot
     pub fn seal_most_covers(&self, claims: &mut ClaimState<Backend::File>, volume: &Volume<Backend>) {
+        if claims.open.iter().any(|segment| segment.phase == SegmentPhase::Sealing) {
+            return;
+        }
         let taking = claims.open.iter_mut().filter(|segment| segment.phase == SegmentPhase::Taking);
         if let Some(segment) = taking.max_by_key(|segment| segment.cover_rows) {
             segment.phase = SegmentPhase::Sealing;
@@ -1235,23 +1268,32 @@ impl<Backend: Io> EngineState<Backend> {
         outcome
     }
 
-    /// Send the records of a slot to the kernel: the window waiting to go, then the live one, whose rest of the range
-    /// goes on in the other window
+    /// Send the records of a slot to the kernel: any window waiting to go, then the live one, whose rest of the range
+    /// goes on in the other window. Each round decides under one hold, so a writer's switch can't slip in between
     pub fn send_windows(&self, index: usize) -> Result<(), Error> {
-        self.send_kept_window(index)?;
         let windows = &self.windows[index];
-        {
-            let mut queue = hold(&self.queues[index]);
-            let live = queue.live_window;
-            if windows[live].is_empty() {
+        loop {
+            let is_live = {
+                let mut queue = hold(&self.queues[index]);
+                let is_live = !queue.has_kept_window;
+                if is_live {
+                    let live = queue.live_window;
+                    if windows[live].is_empty() {
+                        return Ok(());
+                    }
+                    windows[1 - live].reset(windows[live].end());
+                    queue.window_room -= windows[live].used();
+                    queue.live_window = 1 - live;
+                    queue.has_kept_window = true;
+                }
+                is_live
+            };
+            self.send_kept_window(index)?;
+            // the group's rows were fixed before this call, so the live window held the last of their records
+            if is_live {
                 return Ok(());
             }
-            windows[1 - live].reset(windows[live].end());
-            queue.window_room -= windows[live].used();
-            queue.live_window = 1 - live;
-            queue.has_kept_window = true;
         }
-        self.send_kept_window(index)
     }
 
     /// Send the window waiting to go, which takes the slot's writing turn

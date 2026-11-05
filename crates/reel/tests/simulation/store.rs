@@ -2,6 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 
 use crate::seed_sets::seeds;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
@@ -41,6 +44,7 @@ const WINDOW_ROWS: u64 = 500;
 const WINDOW_VALUE: usize = 300;
 const SEND_CRASH_POINTS: u64 = 8;
 const LARGE_ENOUGH: usize = 100_000;
+const RACE_RECORD_BYTES: usize = 4_000;
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -889,5 +893,104 @@ fn window_waits() {
     assert_eq!(store.state.switch_window(volume, slot, RECORD_WINDOW_BYTES + 1), WindowSwitch::OtherBusy);
 
     assert_eq!(hold(&volume.claims).open[0].write_end, before);
+    store.close().expect("close");
+}
+
+// a writer switching windows during a send loses nothing: a record pushed before a send is in the file when it returns
+#[test]
+fn window_race() {
+    let io = SimulatedIo::new(Seed(105));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let volume = &store.state.volumes[0];
+    let slot = hold(&volume.claims).open[0].slot;
+    let index = slot.0 as usize;
+    let pushed = Mutex::new(Vec::new());
+    let is_done = AtomicBool::new(false);
+    let fill = [0; RACE_RECORD_BYTES];
+
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut number = 0u64;
+            loop {
+                let bytes = number.to_le_bytes();
+                if let Some(offset) = store.state.try_window(slot, [&bytes, &fill], 1) {
+                    hold(&store.state.queues[index]).reserved -= 1;
+                    hold(&pushed).push((offset, number));
+                    number += 1;
+                } else if store.state.switch_window(volume, slot, RACE_RECORD_BYTES + bytes.len()) == WindowSwitch::NoRoom {
+                    break;
+                }
+            }
+            is_done.store(true, Ordering::Release);
+        });
+
+        let mut checked = 0;
+        while !is_done.load(Ordering::Acquire) {
+            let seen = hold(&pushed).len();
+            store.state.take_writing_turn(slot);
+            store.state.send_windows(index).expect("send");
+            hold(&store.state.queues[index]).is_writing = false;
+
+            let file = store.state.slot_files[index].file().expect("a data file");
+            let records = hold(&pushed)[checked..seen].to_vec();
+            for (offset, number) in records {
+                let mut bytes = [0; size_of::<u64>()];
+                file.read_at(offset, &mut bytes).expect("read");
+                assert_eq!(u64::from_le_bytes(bytes), number);
+            }
+            checked = seen;
+        }
+    });
+    store.close().expect("close");
+}
+
+// a writer behind a long sync pauses with nothing held, and sends the kept window once the turn frees
+#[test]
+fn window_pauses() {
+    let io = SimulatedIo::new(Seed(106));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let slot = hold(&store.state.volumes[0].claims).open[0].slot;
+    let index = slot.0 as usize;
+    let volume = &store.state.volumes[0];
+    assert_eq!(store.state.switch_window(volume, slot, RECORD_WINDOW_BYTES), WindowSwitch::Switched);
+    hold(&store.state.queues[index]).is_writing = true;
+    let start = io.now();
+
+    thread::scope(|scope| {
+        let waiter = scope.spawn(|| store.state.wait_for_kept_window(slot));
+        while io.now() == start {
+            thread::yield_now();
+        }
+        assert!(!waiter.is_finished());
+        hold(&store.state.queues[index]).is_writing = false;
+        waiter.join().expect("join").expect("send");
+    });
+
+    assert!(!hold(&store.state.queues[index]).has_kept_window);
+    store.close().expect("close");
+}
+
+// covers that fit nowhere seal one segment at a time, and the others keep taking writes
+#[test]
+fn covers_seal_one() {
+    let io = SimulatedIo::new(Seed(107));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let volume = &store.state.volumes[0];
+    hold(&volume.claims).wants_prepared = true;
+    store.state.prepare_segments();
+
+    let mut claims = hold(&volume.claims);
+    let spare = claims.prepared.take().expect("a spare");
+    volume.open_slot(spare.slot);
+    claims.open.push(spare);
+    store.state.seal_most_covers(&mut claims, volume);
+    store.state.seal_most_covers(&mut claims, volume);
+
+    let sealing = claims.open.iter().filter(|segment| segment.phase == SegmentPhase::Sealing).count();
+    assert_eq!(sealing, 1);
+    drop(claims);
     store.close().expect("close");
 }

@@ -265,8 +265,14 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Hold index room for the whole batch, starting seals while there's none
     pub fn hold_batch_room(&self, plan: &BatchPlan) -> Result<(), StoreError> {
-        let deadline = self.io.now().0.saturating_add(INDEX_WAIT.0);
-        while !self.index.hold_room(&plan.needs) {
+        if self.index.hold_room(&plan.needs) {
+            return Ok(());
+        }
+
+        let started = self.io.now();
+        self.index_waits.fetch_add(1, Ordering::Relaxed);
+        let deadline = started.0.saturating_add(INDEX_WAIT.0);
+        loop {
             for volume in &self.volumes {
                 self.seal_fullest(volume);
             }
@@ -277,8 +283,12 @@ impl<Backend: Io> EngineState<Backend> {
                 });
             }
             self.io.pause();
+            if self.index.hold_room(&plan.needs) {
+                let waited = self.io.now().0.saturating_sub(started.0);
+                self.longest_index_wait.fetch_max(waited, Ordering::Relaxed);
+                return Ok(());
+            }
         }
-        Ok(())
     }
 
     /// Claim the batch's bytes and places at once, write its records, and only then show its rows to anyone

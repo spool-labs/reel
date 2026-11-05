@@ -11,7 +11,7 @@ use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::engine::column_info::ColumnInfo;
-use crate::engine::cue::CueTable;
+use crate::engine::cue::{CueTable, JobCounts};
 use crate::engine::engine_sizing::EngineSizing;
 use crate::engine::open_segment::{RecordWindow, RowQueue};
 use crate::engine::open_segment::{data_path, output_path};
@@ -372,8 +372,8 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Give a dead record's whole blocks back, or say it has to wait for a live cue or an unpublished replacement. The count
-    /// moves first, so a read that took its point before this starts over, and one that takes it after has the replacement
-    /// under it. A filesystem that refuses leaves the record to a rewrite
+    /// moves first, so a read at an older point that fails its record check starts over, and one that takes its point after
+    /// has the replacement under it. A filesystem that refuses leaves the record to a rewrite
     pub fn free_record(&self, volume: &Volume<Backend>, free: &FreeRecord) -> bool {
         if !volume.can_free_blocks {
             return true;
@@ -381,7 +381,7 @@ impl<Backend: Io> EngineState<Backend> {
         if self.read_point() < free.replacement {
             return false;
         }
-        self.cues.note_reclaim();
+        self.cues.note_free();
         if self.cues.has_cue_between(free.place, free.replacement) {
             return false;
         }
@@ -406,9 +406,9 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
-    /// Keep a slot only if no reclaim started since the count was read, and give it back if one did
-    pub fn pin_holds(&self, slot: usize, reclaims: u64) -> bool {
-        let is_held = self.cues.reclaims() == reclaims;
+    /// Keep a slot only if no job started since the counts were read, and give it back if one did
+    pub fn pin_holds(&self, slot: usize, counts: JobCounts) -> bool {
+        let is_held = self.cues.counts() == counts;
         if !is_held {
             self.cues.release(slot);
         }

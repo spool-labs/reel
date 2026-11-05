@@ -854,7 +854,7 @@ fn newest_at(history: &History, key: &[u8], point: u64) -> Option<Vec<u8>> {
 
 fn begin_get(state: &State, key: &[u8]) -> StagedGet {
     let volume = &state.volumes[0];
-    let reclaims = state.cues.reclaims();
+    let reclaims = state.cues.counts().reclaims;
     let handovers = volume.handover_count();
     let point = state.read_point();
     let found = state.index.lookup(COLUMN, key, point, volume.view());
@@ -1046,7 +1046,7 @@ fn run_until_crash(
                     let get = gets.swap_remove(index);
                     let found = finish_get(state, &get);
                     // a reclaim that crossed a get sends the real one back for a newer point
-                    if state.cues.reclaims() == get.reclaims {
+                    if state.cues.counts().reclaims == get.reclaims {
                         assert_eq!(found, newest_at(history, &get.key, get.point.0), "staged get of {:?}", get.key);
                     }
                 }

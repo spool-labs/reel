@@ -194,7 +194,7 @@ fn plain_cover_counts_nothing() {
     store.delete_range(COLUMN, b"a", b"b").expect("delete");
     store.delete_range(COLUMN, b"c", b"d").expect("delete");
 
-    assert_eq!(store.state.cues.reclaims(), 0);
+    assert_eq!(store.state.cues.counts().reclaims, 0);
     store.close().expect("close");
 }
 
@@ -204,17 +204,33 @@ fn pin_lost() {
     let io = SimulatedIo::new(Seed(8));
     let store = open(&io);
     let state = &store.state;
-    let reclaims = state.cues.reclaims();
+    let counts = state.cues.counts();
     let slot = state.cues.take(state.read_point()).expect("a slot");
 
     state.cues.note_reclaim();
 
-    assert!(!state.pin_holds(slot, reclaims));
+    assert!(!state.pin_holds(slot, counts));
     assert!(state.cues.is_empty());
     let slot = state.cues.take(state.read_point()).expect("a slot");
-    assert!(state.pin_holds(slot, state.cues.reclaims()));
+    assert!(state.pin_holds(slot, state.cues.counts()));
     assert_eq!(state.cues.len(), 1);
     state.cues.release(slot);
+    store.close().expect("close");
+}
+
+// a free that lands between reading the counts and taking the slot costs the slot too
+#[test]
+fn pin_lost_to_a_free() {
+    let io = SimulatedIo::new(Seed(9));
+    let store = open(&io);
+    let state = &store.state;
+    let counts = state.cues.counts();
+    let slot = state.cues.take(state.read_point()).expect("a slot");
+
+    state.cues.note_free();
+
+    assert!(!state.pin_holds(slot, counts));
+    assert!(state.cues.is_empty());
     store.close().expect("close");
 }
 
@@ -224,12 +240,12 @@ fn many_pin_lost() {
     let io = SimulatedIo::new(Seed(9));
     let store = open(&io);
     let state = &store.state;
-    let reclaims = state.cues.reclaims();
+    let counts = state.cues.counts();
     let point = state.read_point();
 
     state.cues.note_reclaim();
 
-    assert_eq!(state.pin_many(point, reclaims, 0), None);
+    assert_eq!(state.pin_many(point, counts, 0), None);
     assert!(state.cues.is_empty());
     store.close().expect("close");
 }

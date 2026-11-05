@@ -16,7 +16,7 @@ use reel::io::lock_outcome::LockOutcome;
 use crate::count_pause::CountPause;
 use crate::file_image::{BitMask, SECTOR_BYTES};
 use crate::seeded_random::Seed;
-use crate::simulated_disk::{FileSyncFault, InodeNumber, OperationCount, SimulatedDisk, SyncHook};
+use crate::simulated_disk::{FileSyncFault, InodeNumber, OperationCount, ReadHook, SimulatedDisk, SyncHook};
 use crate::simulated_file::SimulatedFile;
 use crate::simulated_task::{JobCount, JobIndex, JobSlot, JobWait, SimulatedTask};
 
@@ -171,6 +171,11 @@ impl SimulatedIo {
     /// Make the next file creates fail
     pub fn fail_creates(&self, count: OperationCount) {
         hold(&self.disk).failing_creates = count;
+    }
+
+    /// Run some work at the start of every read, or stop running it
+    pub fn on_every_read(&self, work: Option<Arc<dyn Fn() + Send + Sync>>) {
+        hold(&self.disk).on_read = ReadHook(work);
     }
 
     /// Run some work right after the next sync lands

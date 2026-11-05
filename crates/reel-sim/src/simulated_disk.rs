@@ -5,6 +5,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::io::{Error, ErrorKind, Result};
 use std::mem;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use reel_api::units::{ByteCount, ProcessId};
 
@@ -37,6 +38,16 @@ pub struct SyncHook(pub Option<Box<dyn FnOnce() + Send>>);
 impl Debug for SyncHook {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str("SyncHook")
+    }
+}
+
+/// Work a test runs at the start of every read
+#[derive(Clone, Default)]
+pub struct ReadHook(pub Option<Arc<dyn Fn() + Send + Sync>>);
+
+impl Debug for ReadHook {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReadHook")
     }
 }
 
@@ -81,6 +92,7 @@ pub struct SimulatedDisk {
     pub failing_creates: OperationCount,
     pub failing_directory_syncs: OperationCount,
     pub after_sync: SyncHook,
+    pub on_read: ReadHook,
     pub reads: OperationCount,
     pub bytes_read: ByteCount,
     pub operations_until_crash: Option<OperationCount>,
@@ -118,6 +130,7 @@ impl SimulatedDisk {
             failing_creates: OperationCount::default(),
             failing_directory_syncs: OperationCount::default(),
             after_sync: SyncHook::default(),
+            on_read: ReadHook::default(),
             reads: OperationCount::default(),
             bytes_read: ByteCount::default(),
             operations_until_crash: None,

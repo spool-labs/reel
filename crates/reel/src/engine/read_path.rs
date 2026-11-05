@@ -10,6 +10,7 @@ use reel_api::value_list::ValueList;
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::engine::column_info::ColumnInfo;
+use crate::engine::cue::JobCounts;
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES;
 use crate::engine::volume::Volume;
@@ -27,7 +28,7 @@ use crate::segment::row_block::FooterRow;
 use crate::segment::segment_table::{SegmentPin, WINDOW_BLOCKS};
 use crate::segment::segment_tail::SegmentNumber;
 
-/// Tries a get makes before it reports the store as changing too fast to read
+/// Tries a read makes before it takes a pin, and tries it makes for the pin
 pub const MOST_READ_TRIES: u32 = 64;
 
 /// A row in a sealed segment
@@ -74,7 +75,7 @@ pub struct KeyRead<'key> {
 #[derive(Clone, Copy, Debug)]
 pub struct LatestRead<'key> {
     pub read: KeyRead<'key>,
-    pub reclaims: u64,
+    pub counts: JobCounts,
     pub handovers: u64,
 }
 
@@ -82,7 +83,7 @@ pub struct LatestRead<'key> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ManyRead {
     pub point: WritePlace,
-    pub reclaims: u64,
+    pub counts: JobCounts,
     pub handovers: u64,
     pub pin: Option<usize>,
 }
@@ -122,21 +123,63 @@ impl<Backend: Io> EngineState<Backend> {
                 return answer;
             }
         }
+        self.answer_pinned(column, key, |read, handovers| self.get_at(read, handovers, want, buf))
+    }
+
+    /// Answer a key under a pin, once starting over has failed, so no job can cross this try. A free needs its replacement
+    /// at or below the newest point, and a replacement at or below this fresh point would be the row found here, so the
+    /// row found has its replacement above the pin, and the pin stands inside that record's window. A full table has no
+    /// pin to give, so the read gives up and the count shows it
+    pub fn answer_pinned<Answer>(
+        &self,
+        column: ColumnId,
+        key: &[u8],
+        ask: impl FnOnce(&KeyRead, u64) -> Result<Answer, StoreError>,
+    ) -> Result<Answer, StoreError> {
+        let info = self.column(column)?;
+        let volume = &self.volumes[info.volume.0 as usize];
+        let many = (0..MOST_READ_TRIES).find_map(|_try| self.many_read(volume));
+        let Some((many, Some(slot))) = many.map(|many| (many, many.pin)) else {
+            return self.refuse_read();
+        };
+        let answer = self.key_read(column, key, many.point, true).and_then(|read| ask(&read, many.handovers));
+        self.unpin(slot, many.counts);
+        answer
+    }
+
+    /// Give up on a read and count it
+    pub fn refuse_read<Answer>(&self) -> Result<Answer, StoreError> {
+        self.cues.note_refused_read();
         Err(moving_segments())
     }
 
-    /// Take the newest point for a key. Both counts come first. A reclaim counted before them has its replacements under
+    /// Give a pin back. A job that stood aside for it moved a count, and nothing else would look again
+    pub fn unpin(&self, slot: usize, counts: JobCounts) {
+        self.cues.release(slot);
+        if self.cues.counts() != counts {
+            self.ask_compaction();
+        }
+    }
+
+    /// Check a job left a read's answer standing. A reclaim can hide a row from any read, and a free can only fail a record
+    /// check, so a read that succeeded never starts over for one
+    pub fn has_outlived(&self, counts: JobCounts, is_bad: bool) -> bool {
+        let now = self.cues.counts();
+        now.reclaims == counts.reclaims && (!is_bad || now.frees == counts.frees)
+    }
+
+    /// Take the newest point for a key. The counts come first. A job counted before them has its replacements under
     /// the point, and a hand-over only starts past its rows' places, so the point can't be below a row a hand-over under
     /// this count gave out
     pub fn latest_read<'key>(&self, column: ColumnId, key: &'key [u8]) -> Result<LatestRead<'key>, StoreError> {
         let info = self.column(column)?;
-        let reclaims = self.cues.reclaims();
+        let counts = self.cues.counts();
         let handovers = self.volumes[info.volume.0 as usize].handover_count();
         let read = self.key_read_now(column, key)?;
-        Ok(LatestRead { read, reclaims, handovers })
+        Ok(LatestRead { read, counts, handovers })
     }
 
-    /// Answer a read at its point, or return nothing when a reclaim crossed it and took what the point could see
+    /// Answer a read at its point, or return nothing when a job crossed it and took what the point could see
     pub fn answer_latest(
         &self,
         latest: &LatestRead,
@@ -144,7 +187,8 @@ impl<Backend: Io> EngineState<Backend> {
         buf: &mut Vec<u8>,
     ) -> Option<Result<bool, StoreError>> {
         let answer = self.get_at(&latest.read, latest.handovers, want, buf);
-        (self.cues.reclaims() == latest.reclaims).then_some(answer)
+        let is_bad = matches!(answer, Err(StoreError::Corruption { .. }));
+        self.has_outlived(latest.counts, is_bad).then_some(answer)
     }
 
     /// Answer every key at one read point, so a batch from one write_batch is seen whole or not at all
@@ -152,39 +196,39 @@ impl<Backend: Io> EngineState<Backend> {
         let info = self.column(column)?;
         let volume = &self.volumes[info.volume.0 as usize];
         let mut scratch = values.take_scratch();
-        let mut outcome = Err(moving_segments());
+        let mut outcome = None;
         for _try in 0..MOST_READ_TRIES {
             let Some(many) = self.many_read(volume) else {
                 continue;
             };
             if let Some(answer) = self.answer_many(&many, column, keys, values, &mut scratch) {
-                outcome = answer;
+                outcome = Some(answer);
                 break;
             }
         }
         values.put_scratch(scratch);
-        outcome
+        outcome.unwrap_or_else(|| self.refuse_read())
     }
 
-    /// Take a point for many keys and pin it as a cue does, so no reclaim reaches below it. A reclaim that got in first costs
+    /// Take a point for many keys and pin it as a cue does, so no job reaches below it. A job that got in first costs
     /// the try, and a full table leaves the read unpinned to start over if one crosses it
     pub fn many_read(&self, volume: &Volume<Backend>) -> Option<ManyRead> {
-        let reclaims = self.cues.reclaims();
+        let counts = self.cues.counts();
         let handovers = volume.handover_count();
         let point = self.read_point();
-        self.pin_many(point, reclaims, handovers)
+        self.pin_many(point, counts, handovers)
     }
 
-    /// Pin a point read after these counts, unless a reclaim moved the count first
-    pub fn pin_many(&self, point: WritePlace, reclaims: u64, handovers: u64) -> Option<ManyRead> {
+    /// Pin a point read after these counts, unless a job moved one first
+    pub fn pin_many(&self, point: WritePlace, counts: JobCounts, handovers: u64) -> Option<ManyRead> {
         let pin = self.cues.take(point);
-        if pin.is_some_and(|slot| !self.pin_holds(slot, reclaims)) {
+        if pin.is_some_and(|slot| !self.pin_holds(slot, counts)) {
             return None;
         }
-        Some(ManyRead { point, reclaims, handovers, pin })
+        Some(ManyRead { point, counts, handovers, pin })
     }
 
-    /// Answer keys at their point and give the pin back, or return nothing when a reclaim crossed an unpinned read
+    /// Answer keys at their point and give the pin back, or return nothing when a job crossed an unpinned read
     pub fn answer_many(
         &self,
         many: &ManyRead,
@@ -195,14 +239,11 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Option<Result<(), StoreError>> {
         values.clear();
         let answer = self.read_keys(column, keys, many.point, many.handovers, values, scratch);
-        if let Some(slot) = many.pin {
-            self.cues.release(slot);
-            // a reclaim that stood aside for this pin moved the count, and nothing else would look again
-            if self.cues.reclaims() != many.reclaims {
-                self.ask_compaction();
-            }
-        }
-        (many.pin.is_some() || self.cues.reclaims() == many.reclaims).then_some(answer)
+        let Some(slot) = many.pin else {
+            return self.has_outlived(many.counts, values.has_corrupt()).then_some(answer);
+        };
+        self.unpin(slot, many.counts);
+        Some(answer)
     }
 
     /// Answer keys in order at a read point, with a bad record as that key's answer
@@ -283,7 +324,7 @@ impl<Backend: Io> EngineState<Backend> {
                 },
             }
         }
-        Err(moving_segments())
+        self.refuse_read()
     }
 
     /// Refuse a key whose newest row could be in a damaged segment: the row found must be above it
@@ -315,13 +356,13 @@ impl<Backend: Io> EngineState<Backend> {
                 return answer;
             }
         }
-        Err(moving_segments())
+        self.answer_pinned(column, key, |read, _handovers| self.contains_at(read))
     }
 
     /// Say whether a key has a value at its point, or return nothing when a reclaim crossed the read
     pub fn contains_latest(&self, latest: &LatestRead) -> Option<Result<bool, StoreError>> {
         let answer = self.contains_at(&latest.read);
-        (self.cues.reclaims() == latest.reclaims).then_some(answer)
+        self.has_outlived(latest.counts, false).then_some(answer)
     }
 
     /// Say whether a key has a value at a read, without reading the value

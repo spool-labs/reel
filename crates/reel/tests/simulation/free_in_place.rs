@@ -1,10 +1,13 @@
 //! Free in place: a large dead record gives its blocks back with no copy, and the segment keeps its length and footer
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::compact_job::CompactJob;
+use reel::engine::cue::MOST_CUES;
+use reel::engine::read_path::{MOST_READ_TRIES, RecordWant};
 use reel::engine::reel_store::ReelStore;
 use reel::engine::walk_job::{FREE_BLOCK_BYTES, FREE_IN_PLACE_BYTES, FreeRecord, MOST_BLOCK_FREES};
 use reel::guard::hold;
@@ -196,9 +199,103 @@ fn read_crossed() {
     seal(&store, &io);
 
     let mut buf = Vec::new();
-    let want = reel::engine::read_path::RecordWant::Whole;
+    let want = RecordWant::Whole;
     assert!(store.state.answer_latest(&latest, want, &mut buf).is_none());
     assert_eq!(read(&store, b"key"), Some(large(2)));
+    store.close().expect("close");
+}
+
+// frees between a get's point and its answer leave a read that succeeded alone
+#[test]
+fn read_outlives_frees() {
+    let io = SimulatedIo::new(Seed(12));
+    let store = open(&io);
+    for number in 0..HELD_RECORDS {
+        store.put(COLUMN, format!("key-{number}").as_bytes(), &large(1)).expect("put");
+    }
+    for number in 0..=HELD_RECORDS {
+        store.put(COLUMN, format!("live-{number}").as_bytes(), &large(3)).expect("put");
+    }
+    seal(&store, &io);
+    let latest = store.state.latest_read(COLUMN, b"live-0").expect("read");
+    for number in 0..HELD_RECORDS {
+        store.put(COLUMN, format!("key-{number}").as_bytes(), &large(2)).expect("put");
+    }
+    seal(&store, &io);
+    assert!(store.state.cues.counts().frees >= latest.counts.frees + HELD_RECORDS);
+
+    let mut buf = Vec::new();
+    let answer = store.state.answer_latest(&latest, RecordWant::Whole, &mut buf).expect("an answer");
+    assert!(answer.expect("get"));
+    assert_eq!(buf, large(3));
+    store.close().expect("close");
+}
+
+// a pin holds a free back from the record its try reads, and the free goes once the pin does
+#[test]
+fn pin_holds_a_free() {
+    let io = SimulatedIo::new(Seed(13));
+    let store = open(&io);
+    let state = &store.state;
+    keep_live(&store);
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    seal(&store, &io);
+
+    let mut buf = Vec::new();
+    let found = state.answer_pinned(COLUMN, b"key", |read, handovers| {
+        store.put(COLUMN, b"key", &large(2)).expect("put");
+        seal(&store, &io);
+        assert_eq!(state.volumes[0].bytes_freed.load(Ordering::Acquire), 0);
+        state.get_at(read, handovers, RecordWant::Whole, &mut buf)
+    });
+    assert!(found.expect("get"));
+    assert_eq!(buf, large(1));
+
+    settle(&io);
+    assert!(state.volumes[0].bytes_freed.load(Ordering::Acquire) > 0);
+    store.close().expect("close");
+}
+
+// a get crossed on every try reads under a pin at the end, so no job's rate can starve it
+#[test]
+fn crossed_every_try() {
+    let io = SimulatedIo::new(Seed(14));
+    let store = open(&io);
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    seal(&store, &io);
+
+    let state = Arc::clone(&store.state);
+    let reads = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&reads);
+    io.on_every_read(Some(Arc::new(move || {
+        state.cues.note_reclaim();
+        counted.fetch_add(1, Ordering::Relaxed);
+    })));
+    assert_eq!(read(&store, b"key"), Some(large(1)));
+    io.on_every_read(None);
+
+    assert!(reads.load(Ordering::Relaxed) > u64::from(MOST_READ_TRIES));
+    assert_eq!(store.state.cues.refused_reads(), 0);
+    store.close().expect("close");
+}
+
+// a full table has no pin to give, so the last try gives up and the count shows it
+#[test]
+fn no_pin_to_give() {
+    let io = SimulatedIo::new(Seed(15));
+    let store = open(&io);
+    let state = &store.state;
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    let slots: Vec<usize> = (0..MOST_CUES).map(|_slot| state.cues.take(WritePlace(u64::MAX - 1)).expect("a slot")).collect();
+
+    assert!(state.answer_pinned(COLUMN, b"key", |_read, _handovers| Ok(())).is_err());
+    assert_eq!(state.cues.refused_reads(), 1);
+
+    assert_eq!(read(&store, b"key"), Some(large(1)));
+    assert_eq!(state.cues.refused_reads(), 1);
+    for slot in slots {
+        state.cues.release(slot);
+    }
     store.close().expect("close");
 }
 

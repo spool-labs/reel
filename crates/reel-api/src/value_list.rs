@@ -91,6 +91,11 @@ impl ValueList {
         self.answers.is_empty()
     }
 
+    /// Check any key's record failed its check
+    pub fn has_corrupt(&self) -> bool {
+        self.answers.iter().any(|answer| matches!(answer, StoredAnswer::Corrupt))
+    }
+
     /// Read the answer at an index
     pub fn answer(&self, index: usize) -> Option<ValueAnswer<'_>> {
         match self.answers.get(index)? {

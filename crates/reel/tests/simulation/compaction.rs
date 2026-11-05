@@ -319,13 +319,13 @@ fn cue_crossed() {
     let store = open(&io);
     let state = &store.state;
     let older = sealed_put(&store, &io, b"older");
-    let reclaims = state.cues.reclaims();
+    let counts = state.cues.counts();
     let point = state.read_point();
     sealed_put(&store, &io, b"newer");
     assert!(!state.volumes[0].table.holds(older));
 
     let slot = state.cues.take(point).expect("a slot");
-    assert!(!state.pin_holds(slot, reclaims));
+    assert!(!state.pin_holds(slot, counts));
     assert!(state.cues.is_empty());
     store.close().expect("close");
 }

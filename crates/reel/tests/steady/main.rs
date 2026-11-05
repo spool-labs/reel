@@ -15,6 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 use reel::engine::reel_store::ReelStore;
+use reel::engine::walk_job::FREE_IN_PLACE_BYTES;
 use reel::io::plain::PlainIo;
 use reel::segment::segment_tail::SECOND_TAIL_DISTANCE;
 use reel_api::store_error::StoreError;
@@ -38,6 +39,9 @@ const LONG_ROWS: usize = 4_000;
 const LONG_VALUE: &[u8] = b"a value on each column of a long batch, a value on each column of a long batch";
 const SMALL_BYTES: usize = 100;
 const CHUNKED_BYTES: usize = 200_000;
+const BURST_RECORDS: usize = 8_000;
+const BURST_FREES: usize = BURST_RECORDS / 2;
+const LONG_GET_BYTES: usize = 4 * 1024 * 1024;
 const ROUNDS: usize = 1_500;
 const FLUSH_ROUNDS: usize = 64;
 const SEAL_ROUNDS: usize = 300;
@@ -401,6 +405,56 @@ fn has_reclaimed(store: &Store, unlinked_before: u64, freed_before: u64) -> bool
     volume.segments_unlinked.load(Ordering::Acquire) > unlinked_before && volume.bytes_freed.load(Ordering::Acquire) > freed_before
 }
 
+// a long get beside a burst of frees answers every time: a free moves no count a read that succeeded looks at
+fn free_burst() -> u64 {
+    let root = scratch_root();
+    let store = open(&root);
+    let record = vec![1; FREE_IN_PLACE_BYTES.0 as usize];
+    store.put(META, b"long", &vec![2; LONG_GET_BYTES]).expect("put");
+    let write_records = || {
+        for number in 0..BURST_RECORDS {
+            store.put(META, format!("burst-{number}").as_bytes(), &record).expect("put");
+        }
+    };
+    write_records();
+    let before = store.state.volumes[0].table.segment_count();
+    store.seal_now();
+    wait_for_seal(&store, before);
+
+    let frees_before = store.state.cues.counts().frees;
+    let can_free = store.state.volumes[0].can_free_blocks;
+    let is_done = AtomicBool::new(false);
+    let (gets, errors) = thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            let (mut buf, mut gets, mut errors) = (Vec::new(), 0, 0);
+            while !is_done.load(Ordering::Acquire) {
+                gets += 1;
+                if !store.get(META, b"long", &mut buf).is_ok_and(|found| found && buf.len() == LONG_GET_BYTES) {
+                    errors += 1;
+                }
+            }
+            (gets, errors)
+        });
+        write_records();
+        store.seal_now();
+        // the frees follow the walk, which follows the seal
+        let mut waits = 0;
+        while can_free && store.state.cues.counts().frees - frees_before < BURST_FREES as u64 && waits < MOST_SEAL_WAITS {
+            waits += 1;
+            thread::sleep(SEAL_WAIT);
+        }
+        is_done.store(true, Ordering::Release);
+        reader.join().expect("join")
+    });
+    let frees = store.state.cues.counts().frees - frees_before;
+    let refused = store.state.cues.refused_reads();
+    println!("{gets} long gets beside {frees} frees: {errors} errors, {refused} refused");
+    store.close().expect("close");
+    drop(store);
+    fs::remove_dir_all(&root).expect("remove");
+    errors + refused + u64::from(can_free && frees == 0)
+}
+
 fn has_rows_file(root: &Path) -> bool {
     let entries = fs::read_dir(root).expect("list");
     entries.flatten().any(|entry| entry.path().extension().is_some_and(|extension| extension == "rows"))
@@ -584,6 +638,7 @@ fn main() {
     println!("{unlinked} unlinks in the window");
     println!("{freed} bytes freed in place in the window");
     println!("{rewritten} rewrites in the window");
+    failures += free_burst();
     if unlinked == 0 || freed == 0 || rewritten == 0 {
         failures += 1;
     }

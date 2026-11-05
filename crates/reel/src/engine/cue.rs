@@ -20,11 +20,22 @@ pub const MOST_CUES: usize = 64;
 /// A slot with no cue in it, since a place plus one is never zero
 pub const NO_CUE: u64 = 0;
 
+/// The job counts a read takes before its point, and compares once it has an answer
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobCounts {
+    /// Rows that left the lists, which can hide a row from any read
+    pub reclaims: u64,
+    /// Records freed in place, which can only fail a read's record check
+    pub frees: u64,
+}
+
 /// The read point of every live cue
 #[derive(Debug)]
 pub struct CueTable {
     slots: [AtomicU64; MOST_CUES],
     reclaims: AtomicU64,
+    frees: AtomicU64,
+    refused_reads: AtomicU64,
 }
 
 impl CueTable {
@@ -33,6 +44,8 @@ impl CueTable {
         Self {
             slots: [const { AtomicU64::new(NO_CUE) }; MOST_CUES],
             reclaims: AtomicU64::new(0),
+            frees: AtomicU64::new(0),
+            refused_reads: AtomicU64::new(0),
         }
     }
 
@@ -80,9 +93,28 @@ impl CueTable {
         self.reclaims.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Read how many reclaims have started
-    pub fn reclaims(&self) -> u64 {
-        self.reclaims.load(Ordering::SeqCst)
+    /// Count a free in place, before its last look at this table and before it touches a block. A reader that took its
+    /// point after this has the replacement under it, and one that took it before and fails a record check sees this move
+    pub fn note_free(&self) {
+        self.frees.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Read the job counts
+    pub fn counts(&self) -> JobCounts {
+        JobCounts {
+            reclaims: self.reclaims.load(Ordering::SeqCst),
+            frees: self.frees.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Count a read that had to give up because jobs kept crossing it and the table had no slot for a pin
+    pub fn note_refused_read(&self) {
+        self.refused_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read how many reads have given up
+    pub fn refused_reads(&self) -> u64 {
+        self.refused_reads.load(Ordering::Relaxed)
     }
 
     /// Count the live cues
@@ -110,16 +142,16 @@ pub struct Cue<Backend: Io> {
 }
 
 impl<Backend: Io> Cue<Backend> {
-    /// Pin the newest read point. A cover drop counts itself before it looks at the table, and this reads the count after
-    /// taking a slot, so either the drop sees the pin or this sees the drop and takes a newer point
+    /// Pin the newest read point. A job counts itself before it looks at the table, and this reads the counts after
+    /// taking a slot, so either the job sees the pin or this sees the job and takes a newer point
     pub fn new(state: Arc<EngineState<Backend>>) -> Result<Self, StoreError> {
         loop {
-            let reclaims = state.cues.reclaims();
+            let counts = state.cues.counts();
             let point = state.read_point();
             let Some(slot) = state.cues.take(point) else {
                 return Err(StoreError::CuesFull { limit: MOST_CUES as u64 });
             };
-            if state.pin_holds(slot, reclaims) {
+            if state.pin_holds(slot, counts) {
                 return Ok(Self { state, slot, point });
             }
         }

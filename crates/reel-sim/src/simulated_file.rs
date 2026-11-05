@@ -8,7 +8,7 @@ use reel_api::units::{ByteCount, FileOffset, ProcessId};
 use reel::guard::hold;
 use reel::io::IoFile;
 use crate::count_pause::CountPause;
-use crate::simulated_disk::{HandleId, InodeNumber, OperationCount, SimulatedDisk};
+use crate::simulated_disk::{HandleId, InodeNumber, OperationCount, ReadHook, SimulatedDisk};
 
 /// A handle that only works until its close, and only for the process that opened it
 #[derive(Clone, Debug)]
@@ -37,6 +37,14 @@ impl SimulatedFile {
         Ok(())
     }
 
+    /// Run a test's read work outside the disk's lock, which the work may need
+    pub fn run_read_hook(&self) {
+        let hook = hold(&self.disk).on_read.clone();
+        if let ReadHook(Some(work)) = hook {
+            work();
+        }
+    }
+
     /// Leave the leading part of a write a crash stopped, since a kill can stop one part way
     pub fn tear(&self, disk: &mut SimulatedDisk, offset: FileOffset, mut bytes: Vec<u8>) {
         let kept = disk.random.below(bytes.len() as u64 + 1);
@@ -59,6 +67,7 @@ impl SimulatedFile {
 impl IoFile for SimulatedFile {
     fn read_at(&self, offset: FileOffset, buf: &mut [u8]) -> Result<ByteCount> {
         let _pause = CountPause::new();
+        self.run_read_hook();
         let mut disk = hold(&self.disk);
         self.check(&mut disk, false)?;
         if let Some(left) = disk.reads_before_failure {
@@ -104,6 +113,7 @@ impl IoFile for SimulatedFile {
 
     fn read_parts_at(&self, offset: FileOffset, parts: &mut [IoSliceMut]) -> Result<()> {
         let _pause = CountPause::new();
+        self.run_read_hook();
         let mut disk = hold(&self.disk);
         self.check(&mut disk, false)?;
 

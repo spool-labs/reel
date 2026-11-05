@@ -102,6 +102,6 @@ pub trait Io: Clone + Send + Sync + 'static {
     /// Start a job on an engine thread
     fn spawn_job<Work: Job>(&self, name: &'static str, job: Work) -> Result<Self::Task>;
 
-    /// Read the stack a job's thread holds, which open writes through and memory_report shows
+    /// Read the stack a job's thread holds, which memory_report shows
     fn job_stack_bytes(&self) -> ByteCount;
 }

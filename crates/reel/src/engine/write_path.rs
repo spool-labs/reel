@@ -793,16 +793,6 @@ impl<Backend: Io> EngineState<Backend> {
             }
         }
 
-        // a seal lists the covers of a segment in a fixed buffer, so a segment at the limit seals whatever its size
-        for segment in &mut claims.open {
-            if segment.phase == SegmentPhase::Taking && segment.cover_rows >= MOST_RANGE_COVERS {
-                segment.phase = SegmentPhase::Sealing;
-                if let Some(task) = self.seal_tasks[volume.id.0 as usize].get() {
-                    task.wake();
-                }
-            }
-        }
-
         // half full is time for the job to have the next one ready before this one seals
         let is_half_full = rows * 2 >= volume.segment_rows.0 || bytes * 2 >= volume.segment_bytes.0;
         if is_half_full && claims.prepared.is_none() {
@@ -839,7 +829,8 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Make the segments writers asked for, with the preallocation and directory sync no put should wait on. A full
-    /// disk leaves none ready, and the writer that needs one hears it when it creates its own
+    /// disk leaves none ready, and the writer that needs one hears it when it creates its own. A spare holds a whole
+    /// segment's bytes of disk until a claim takes it or close removes it
     pub fn prepare_segments(&self) {
         for volume in &self.volumes {
             let root = {

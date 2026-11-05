@@ -241,8 +241,10 @@ fn full_cover_block() {
     for _repeat in 0..MOST_RANGE_COVERS {
         store.delete_range(META, b"range-a", b"range-b").expect("delete");
     }
-    assert!(hold(&store.state.volumes[0].claims).open.iter().any(|segment| segment.phase == SegmentPhase::Sealing));
     store.delete_range(META, b"range-a", b"range-b").expect("delete");
+    let volume = &store.state.volumes[0];
+    store.state.seal_most_covers(&mut hold(&volume.claims), volume);
+    assert!(hold(&volume.claims).open.iter().any(|segment| segment.phase == SegmentPhase::Sealing));
 
     let sealed = counted(|| settle(&io));
 

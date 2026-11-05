@@ -27,8 +27,11 @@ use crate::pool::TOUCH_BYTE;
 pub const HOLDER_WIDTH: usize = 10;
 /// The stack of a job thread, which holds a seal's and a merge's deepest calls with room to spare
 pub const JOB_STACK_BYTES: ByteCount = ByteCount(1024 * 1024);
-/// The part of a job's stack written through at its start, which leaves room for the frames around the write
-pub const TOUCHED_STACK_BYTES: usize = 1024 * 1024 - 16 * 1024;
+/// What a job's touch leaves alone: the guard page, the thread's own data that glibc keeps in the stack, and the frames
+/// above the touch, about 15 KiB in a debug build. A kernel with 64 KiB pages takes 64 KiB for the guard alone
+pub const STACK_SLACK_BYTES: usize = 128 * 1024;
+/// The part of a job's stack written through at its start
+pub const TOUCHED_STACK_BYTES: usize = JOB_STACK_BYTES.0 as usize - STACK_SLACK_BYTES;
 /// Reads of a lock file before giving up on a holder writing its id
 pub const HOLDER_READ_ATTEMPTS: u64 = 100;
 /// Wait between reads of a lock file
@@ -175,7 +178,7 @@ impl Io for PlainIo {
     }
 
     fn job_stack_bytes(&self) -> ByteCount {
-        ByteCount(TOUCHED_STACK_BYTES as u64)
+        JOB_STACK_BYTES
     }
 
     fn spawn_job<Work: Job>(&self, name: &'static str, job: Work) -> Result<PlainTask> {

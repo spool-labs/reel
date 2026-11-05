@@ -1,6 +1,6 @@
 //! Each maintenance job's state and the store's reclaim counts
 
-use crate::units::{ByteCount, Nanoseconds, RowCount, SegmentCount};
+use crate::units::{ByteCount, Nanoseconds, RowCount, SegmentCount, VolumeId};
 
 /// Every kind of job, in the order a report lists them
 pub const JOB_KINDS: [JobKind; 7] = [
@@ -55,12 +55,19 @@ pub struct JobReport {
     pub cpu_time: Nanoseconds,
 }
 
-/// Every job, the reclaim counts and the readings a node roll stops on
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MaintenanceReport {
-    pub jobs: [JobReport; JOB_KINDS.len()],
+/// One volume's readings a node roll watches
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VolumeReading {
+    pub volume: VolumeId,
     pub segment_count: SegmentCount,
     pub used_bytes: ByteCount,
+}
+
+/// Every job, the reclaim counts and the readings a node roll stops on, in buffers the caller reuses
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceReport {
+    pub jobs: [JobReport; JOB_KINDS.len()],
+    pub volumes: Vec<VolumeReading>,
     pub graves_at_open: RowCount,
     pub deletes_since_open: RowCount,
     pub graves_dropped: RowCount,
@@ -85,12 +92,16 @@ impl JobReport {
 }
 
 impl MaintenanceReport {
+    /// Forget the volume readings and keep the buffer
+    pub fn clear(&mut self) {
+        self.volumes.clear();
+    }
+
     /// Start a report with one idle entry per kind of job
     pub fn new() -> Self {
         Self {
             jobs: JOB_KINDS.map(JobReport::new),
-            segment_count: SegmentCount::default(),
-            used_bytes: ByteCount::default(),
+            volumes: Vec::new(),
             graves_at_open: RowCount::default(),
             deletes_since_open: RowCount::default(),
             graves_dropped: RowCount::default(),

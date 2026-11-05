@@ -5,7 +5,9 @@ edition.workspace = true
 
 [dependencies]
 libc.workspace = true
+lz4-sys.workspace = true
 reel-api.workspace = true
+xxhash-rust.workspace = true
 
 [lints]
 workspace = true

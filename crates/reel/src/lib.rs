@@ -2,3 +2,6 @@
 
 pub mod guard;
 pub mod io;
+pub mod record;
+pub mod row_kind;
+pub mod rows;

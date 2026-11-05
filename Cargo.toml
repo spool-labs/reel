@@ -8,8 +8,10 @@ edition = "2024"
 
 [workspace.dependencies]
 libc = "0.2"
+lz4-sys = "1"
 reel-api = { path = "crates/reel-api" }
 thiserror = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

@@ -82,6 +82,12 @@ impl SimulatedIo {
         hold(&self.disk).is_crashed
     }
 
+    /// Read how many reads have run and how many bytes they returned
+    pub fn read_totals(&self) -> (OperationCount, ByteCount) {
+        let disk = hold(&self.disk);
+        (disk.reads, disk.bytes_read)
+    }
+
     /// Make the next syncs fail
     pub fn fail_syncs(&self, count: OperationCount) {
         hold(&self.disk).failing_syncs = count;

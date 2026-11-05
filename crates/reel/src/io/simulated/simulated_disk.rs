@@ -48,6 +48,8 @@ pub struct SimulatedDisk {
     pub locks: BTreeMap<PathBuf, ProcessId>,
     pub capacities: BTreeMap<PathBuf, ByteCount>,
     pub failing_syncs: OperationCount,
+    pub reads: OperationCount,
+    pub bytes_read: ByteCount,
     pub operations_until_crash: Option<OperationCount>,
     pub is_crashed: bool,
 }
@@ -67,6 +69,8 @@ impl SimulatedDisk {
             locks: BTreeMap::new(),
             capacities: BTreeMap::new(),
             failing_syncs: OperationCount::default(),
+            reads: OperationCount::default(),
+            bytes_read: ByteCount::default(),
             operations_until_crash: None,
             is_crashed: false,
         }

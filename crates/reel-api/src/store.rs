@@ -50,8 +50,8 @@ pub trait Store: Reads {
     /// Report the heap each structure holds
     fn memory_report(&self) -> MemoryReport;
 
-    /// Report each job's state and the reclaim counts
-    fn maintenance_report(&self) -> MaintenanceReport;
+    /// Fill a report with each job's state, the reclaim counts and the volume readings
+    fn maintenance_report(&self, report: &mut MaintenanceReport);
 
     /// Stop every job, make every returned write durable and release the lock
     fn close(&self) -> Result<(), StoreError>;

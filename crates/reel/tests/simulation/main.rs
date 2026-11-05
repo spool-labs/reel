@@ -2,3 +2,4 @@
 #![cfg(test)]
 
 mod io_contract;
+mod records;

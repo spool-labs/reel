@@ -72,6 +72,8 @@ impl IoFile for SimulatedFile {
         let end = image.visible.len().min(start + buf.len());
         let count = end - start;
         buf[..count].copy_from_slice(&image.visible[start..end]);
+        disk.reads = OperationCount(disk.reads.0 + 1);
+        disk.bytes_read = ByteCount(disk.bytes_read.0 + count as u64);
         Ok(ByteCount(count as u64))
     }
 

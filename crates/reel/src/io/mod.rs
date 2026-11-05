@@ -35,6 +35,9 @@ pub trait IoFile: Clone + Send + Sync {
     /// Read the file's length
     fn length(&self) -> Result<ByteCount>;
 
+    /// Give a range's whole blocks back to the disk, leaving the file's length as it is and the range reading as zeros
+    fn free_range(&self, offset: FileOffset, length: ByteCount) -> Result<()>;
+
     /// Cut the file back to a length
     fn truncate(&self, length: ByteCount) -> Result<()>;
 }
@@ -65,6 +68,9 @@ pub trait Io: Clone + Send + Sync + 'static {
 
     /// Open an existing file to read
     fn open_read_only(&self, path: &Path) -> Result<Self::File>;
+
+    /// Check the filesystem under a root can give a file's blocks back in place
+    fn can_free_blocks(&self, root: &Path) -> bool;
 
     /// Close a handle, once no read still uses it
     fn close_file(&self, file: Self::File);

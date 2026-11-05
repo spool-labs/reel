@@ -521,6 +521,7 @@ fn main() {
     }
 
     let unlinked_before = store.state.volumes[0].segments_unlinked.load(Ordering::Acquire);
+    let freed_before = store.state.volumes[0].bytes_freed.load(Ordering::Acquire);
     let mut faults = FaultCounter::new();
     let _first_read = faults.read();
     let threads_before = thread_faults();
@@ -532,6 +533,7 @@ fn main() {
     IS_WINDOW.store(false, Ordering::Release);
     let after = counts(&mut faults);
     let unlinked = store.state.volumes[0].segments_unlinked.load(Ordering::Acquire) - unlinked_before;
+    let freed = store.state.volumes[0].bytes_freed.load(Ordering::Acquire) - freed_before;
     let threads_after = thread_faults();
 
     let allocations_before_close = ALLOCATIONS.load(Ordering::Acquire);
@@ -558,7 +560,8 @@ fn main() {
     println!("{ROUNDS} rounds: {allocations} allocations, {frees} frees, {minor_faults} minor faults, {major_faults} major faults");
     println!("close: {close_allocations} allocations");
     println!("{unlinked} unlinks in the window");
-    if unlinked == 0 {
+    println!("{freed} bytes freed in place in the window");
+    if unlinked == 0 || freed == 0 {
         failures += 1;
     }
     if failures + allocations + frees + minor_faults + major_faults + close_allocations > 0 {

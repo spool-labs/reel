@@ -14,9 +14,9 @@ use std::sync::{Arc, Barrier};
 use std::thread::{self, Builder};
 use std::time::{Duration, Instant};
 
-use reel_api::units::{ByteCount, Nanoseconds, ProcessId};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
 
-use crate::io::Io;
+use crate::io::{Io, IoFile};
 use crate::io::job::Job;
 use crate::io::lock_outcome::LockOutcome;
 use crate::io::plain_file::{PlainFile, reserve_space};
@@ -25,6 +25,10 @@ use crate::pool::TOUCH_BYTE;
 
 /// Width of the process id in a lock file, padded with spaces
 pub const HOLDER_WIDTH: usize = 10;
+/// The file open writes in a root to learn whether its filesystem gives blocks back
+pub const FREE_PROBE_NAME: &str = "free-probe";
+/// Bytes of that file, two blocks of any filesystem reel runs on
+pub const FREE_PROBE_BYTES: usize = 8 * 1024;
 /// The stack of a job thread, which holds a seal's and a merge's deepest calls with room to spare
 pub const JOB_STACK_BYTES: ByteCount = ByteCount(1024 * 1024);
 /// What a job's touch leaves alone: the guard page, the thread's own data that glibc keeps in the stack, and the frames
@@ -94,6 +98,21 @@ impl Io for PlainIo {
 
     fn open_read_only(&self, path: &Path) -> Result<PlainFile> {
         Ok(PlainFile::new(File::open(path)?))
+    }
+
+    fn can_free_blocks(&self, root: &Path) -> bool {
+        let path = root.join(FREE_PROBE_NAME);
+        let probe = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path);
+        let Ok(probe) = probe else {
+            return false;
+        };
+        let is_written = probe.write_all_at(&[1; FREE_PROBE_BYTES], 0).is_ok();
+        let file = PlainFile::new(probe);
+        let is_freed = is_written && file.free_range(FileOffset(0), ByteCount(FREE_PROBE_BYTES as u64)).is_ok();
+        file.close();
+        // a probe left behind is the next open's to replace
+        let _removed = fs::remove_file(&path);
+        is_freed
     }
 
     fn close_file(&self, file: PlainFile) {

@@ -56,6 +56,14 @@ impl CueTable {
         })
     }
 
+    /// Check a live cue reads at or above one place and below another, so it sees a row the second one replaced
+    pub fn has_cue_between(&self, lowest: WritePlace, highest: WritePlace) -> bool {
+        self.slots.iter().any(|slot| {
+            let point = slot.load(Ordering::SeqCst);
+            point != NO_CUE && (lowest.0..highest.0).contains(&(point - 1))
+        })
+    }
+
     /// Check a live cue reads below a place, for a reclaim about to stand aside. The count moves before the last look, so
     /// a pin this finds sees the count move as it leaves, and asks for the reclaim again
     pub fn holds_back(&self, place: WritePlace) -> bool {

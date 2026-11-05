@@ -17,6 +17,7 @@ mod write_index;
 mod faults;
 mod done_flag;
 mod footers;
+mod free_in_place;
 mod spot_index;
 mod staged;
 mod store;

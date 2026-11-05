@@ -1,0 +1,239 @@
+//! Free in place: a large dead record gives its blocks back with no copy, and the segment keeps its length and footer
+
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+
+use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::engine::reel_store::ReelStore;
+use reel::engine::walk_job::{FREE_BLOCK_BYTES, FREE_IN_PLACE_BYTES};
+use reel::guard::hold;
+use reel::record::codec::Codec;
+use reel::segment::segment_tail::SegmentNumber;
+use reel_api::column_id::ColumnId;
+use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
+use reel_sim::seeded_random::Seed;
+use reel_sim::simulated_disk::OperationCount;
+use reel_sim::simulated_io::SimulatedIo;
+
+const ROOT: &str = "/disk/free";
+const COLUMN: ColumnId = ColumnId(1);
+const BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
+const TICK: Nanoseconds = Nanoseconds(1_000_000);
+const STEPS: u64 = 20_000;
+const CRASH_POINTS: u64 = 60;
+
+type Store = ReelStore<SimulatedIo>;
+
+fn open(io: &SimulatedIo) -> Store {
+    let config = StoreConfig {
+        memory_budget: BUDGET,
+        volumes: vec![VolumeConfig {
+            name: "free".to_string(),
+            roots: vec![PathBuf::from(ROOT)],
+            sync: SyncPolicy::Never,
+        }],
+        columns: vec![ColumnConfig {
+            id: COLUMN,
+            name: "column".to_string(),
+            key_shape: KeyShape::Variable { most: 64 },
+            codec: Codec::None,
+            volume: VolumeId(0),
+        }],
+    };
+    ReelStore::open(io.clone(), &config).expect("open")
+}
+
+fn settle(io: &SimulatedIo) {
+    for _step in 0..STEPS {
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+            if io.step_any().is_none() {
+                return;
+            }
+        }
+    }
+    panic!("jobs never went quiet");
+}
+
+fn seal(store: &Store, io: &SimulatedIo) -> SegmentNumber {
+    let number = hold(&store.state.volumes[0].claims).open[0].number;
+    store.seal_now();
+    settle(io);
+    number
+}
+
+fn large(byte: u8) -> Vec<u8> {
+    vec![byte; FREE_IN_PLACE_BYTES.0 as usize]
+}
+
+fn read(store: &Store, key: &[u8]) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    store.get(COLUMN, key, &mut buf).expect("get").then_some(buf)
+}
+
+// a large record that goes dead gives its blocks back, its segment keeps its live row and its length, and a reopen is clean
+#[test]
+fn freed() {
+    let io = SimulatedIo::new(Seed(1));
+    let store = open(&io);
+    store.put(COLUMN, b"keep", b"value").expect("put");
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    let older = seal(&store, &io);
+    store.put(COLUMN, b"key", &large(2)).expect("put");
+    seal(&store, &io);
+
+    let volume = &store.state.volumes[0];
+    assert!(volume.table.holds(older));
+    let whole_blocks = FREE_IN_PLACE_BYTES.0 - FREE_BLOCK_BYTES;
+    assert!(volume.bytes_freed.load(Ordering::Acquire) >= whole_blocks);
+    assert_eq!(io.freed_bytes().0, volume.bytes_freed.load(Ordering::Acquire));
+    assert_eq!(read(&store, b"key"), Some(large(2)));
+    assert_eq!(read(&store, b"keep"), Some(b"value".to_vec()));
+    store.close().expect("close");
+
+    let store = open(&io);
+    settle(&io);
+    assert_eq!(read(&store, b"key"), Some(large(2)));
+    assert!(hold(&store.state.volumes[0].damaged).is_empty());
+    store.close().expect("close");
+}
+
+// a dead record under the size waits for the rewrite trigger
+#[test]
+fn small_stays() {
+    let io = SimulatedIo::new(Seed(2));
+    let store = open(&io);
+    let short = vec![1; FREE_IN_PLACE_BYTES.0 as usize / 2];
+    store.put(COLUMN, b"keep", b"value").expect("put");
+    store.put(COLUMN, b"key", &short).expect("put");
+    seal(&store, &io);
+    store.put(COLUMN, b"key", &short).expect("put");
+    seal(&store, &io);
+
+    assert_eq!(store.state.volumes[0].bytes_freed.load(Ordering::Acquire), 0);
+    store.close().expect("close");
+}
+
+// a cue that can still read a record keeps its blocks, and they go with the cue
+#[test]
+fn cue_keeps_blocks() {
+    let io = SimulatedIo::new(Seed(3));
+    let store = open(&io);
+    store.put(COLUMN, b"keep", b"value").expect("put");
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    seal(&store, &io);
+    let cue = store.cue().expect("cue");
+    store.put(COLUMN, b"key", &large(2)).expect("put");
+    seal(&store, &io);
+
+    let volume = &store.state.volumes[0];
+    assert_eq!(volume.bytes_freed.load(Ordering::Acquire), 0);
+    let mut buf = Vec::new();
+    assert!(cue.get(COLUMN, b"key", &mut buf).expect("get"));
+    assert_eq!(buf, large(1));
+
+    drop(cue);
+    settle(&io);
+    assert!(volume.bytes_freed.load(Ordering::Acquire) > 0);
+    store.close().expect("close");
+}
+
+// a cue taken after the replacement reads the replacement, so it holds nothing back
+#[test]
+fn newer_cue_frees() {
+    let io = SimulatedIo::new(Seed(4));
+    let store = open(&io);
+    store.put(COLUMN, b"keep", b"value").expect("put");
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    seal(&store, &io);
+    store.put(COLUMN, b"key", &large(2)).expect("put");
+    let cue = store.cue().expect("cue");
+    seal(&store, &io);
+
+    assert!(store.state.volumes[0].bytes_freed.load(Ordering::Acquire) > 0);
+    drop(cue);
+    store.close().expect("close");
+}
+
+// a filesystem that can't give blocks back leaves the record alone
+#[test]
+fn filesystem_refuses() {
+    let io = SimulatedIo::new(Seed(5));
+    io.refuse_free_blocks();
+    let store = open(&io);
+    assert!(!store.state.volumes[0].can_free_blocks);
+    store.put(COLUMN, b"keep", b"value").expect("put");
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    seal(&store, &io);
+    store.put(COLUMN, b"key", &large(2)).expect("put");
+    seal(&store, &io);
+
+    assert_eq!(io.freed_bytes().0, 0);
+    assert_eq!(read(&store, b"key"), Some(large(2)));
+    store.close().expect("close");
+}
+
+// a read that took its point before the free starts over and never reports the zeros
+#[test]
+fn read_crossed() {
+    let io = SimulatedIo::new(Seed(6));
+    let store = open(&io);
+    store.put(COLUMN, b"keep", b"value").expect("put");
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    seal(&store, &io);
+    let latest = store.state.latest_read(COLUMN, b"key").expect("read");
+    store.put(COLUMN, b"key", &large(2)).expect("put");
+    seal(&store, &io);
+
+    let mut buf = Vec::new();
+    let want = reel::engine::read_path::RecordWant::Whole;
+    assert!(store.state.answer_latest(&latest, want, &mut buf).is_none());
+    assert_eq!(read(&store, b"key"), Some(large(2)));
+    store.close().expect("close");
+}
+
+// a crash at any step reads the newest value, and blocks freed ahead of a saved count read as a dead record, never as damage
+#[test]
+fn crashes() {
+    let mut freed_at_crash = 0;
+    for crash_at in 0..CRASH_POINTS {
+        for is_power_cut in [false, true] {
+            let io = SimulatedIo::new(Seed(7));
+            let store = open(&io);
+            store.put(COLUMN, b"keep", b"value").expect("put");
+            store.put(COLUMN, b"key", &large(1)).expect("put");
+            seal(&store, &io);
+            store.put(COLUMN, b"key", &large(2)).expect("put");
+            store.flush().expect("flush");
+            store.seal_now();
+            io.arm_crash(OperationCount(crash_at));
+            for _step in 0..STEPS {
+                if io.is_crashed() {
+                    break;
+                }
+                if io.step_any().is_none() {
+                    io.advance_clock(TICK);
+                    if io.step_any().is_none() {
+                        break;
+                    }
+                }
+            }
+            freed_at_crash += u64::from(io.freed_bytes().0 > 0);
+            if is_power_cut {
+                io.power_cut();
+            } else {
+                io.kill();
+            }
+            drop(store);
+
+            let store = open(&io);
+            store.seal_now();
+            settle(&io);
+            assert_eq!(read(&store, b"key"), Some(large(2)), "crash at {crash_at}");
+            assert_eq!(read(&store, b"keep"), Some(b"value".to_vec()), "crash at {crash_at}");
+            assert!(hold(&store.state.volumes[0].damaged).is_empty(), "crash at {crash_at}");
+            store.close().expect("close");
+        }
+    }
+    assert!(freed_at_crash > 0);
+}

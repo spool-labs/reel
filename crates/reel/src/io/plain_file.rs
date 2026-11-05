@@ -135,6 +135,10 @@ impl IoFile for PlainFile {
         Ok(ByteCount(stats.st_size as u64))
     }
 
+    fn free_range(&self, offset: FileOffset, length: ByteCount) -> Result<()> {
+        free_descriptor_range(self.descriptor, offset, length)
+    }
+
     fn truncate(&self, length: ByteCount) -> Result<()> {
         // SAFETY: the descriptor is open, and no pointer crosses the call
         let status = unsafe { libc::ftruncate(self.descriptor, length.0 as libc::off_t) };
@@ -143,6 +147,35 @@ impl IoFile for PlainFile {
         }
         Ok(())
     }
+}
+
+/// Give a range's blocks back to the disk
+#[cfg(target_os = "linux")]
+pub fn free_descriptor_range(descriptor: RawFd, offset: FileOffset, length: ByteCount) -> Result<()> {
+    let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+    // SAFETY: the descriptor is open, and no pointer crosses the call
+    let status = unsafe { libc::fallocate(descriptor, mode, offset.0 as libc::off_t, length.0 as libc::off_t) };
+    if status != 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Give a range's blocks back to the disk
+#[cfg(not(target_os = "linux"))]
+pub fn free_descriptor_range(descriptor: RawFd, offset: FileOffset, length: ByteCount) -> Result<()> {
+    let mut range = libc::fpunchhole_t {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: offset.0 as libc::off_t,
+        fp_length: length.0 as libc::off_t,
+    };
+    // SAFETY: the descriptor is open, and the range outlives the call
+    let status = unsafe { libc::fcntl(descriptor, libc::F_PUNCHHOLE, &mut range) };
+    if status != 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Make a file's writes reach the disk

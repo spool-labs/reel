@@ -88,6 +88,8 @@ pub struct SimulatedDisk {
     pub open_handles: BTreeMap<HandleId, InodeNumber>,
     pub next_handle: HandleId,
     pub handle_faults: OperationCount,
+    pub refuses_free_blocks: bool,
+    pub freed_bytes: ByteCount,
 }
 
 impl SimulatedDisk {
@@ -123,6 +125,8 @@ impl SimulatedDisk {
             open_handles: BTreeMap::new(),
             next_handle: HandleId::default(),
             handle_faults: OperationCount::default(),
+            refuses_free_blocks: false,
+            freed_bytes: ByteCount(0),
         }
     }
 

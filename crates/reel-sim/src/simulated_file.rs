@@ -210,6 +210,15 @@ impl IoFile for SimulatedFile {
         }
     }
 
+    fn free_range(&self, offset: FileOffset, length: ByteCount) -> Result<()> {
+        let _pause = CountPause::new();
+        let zeros = vec![0; length.0 as usize];
+        self.write_at(offset, &[IoSlice::new(&zeros)])?;
+        let mut disk = hold(&self.disk);
+        disk.freed_bytes = ByteCount(disk.freed_bytes.0 + length.0);
+        Ok(())
+    }
+
     fn truncate(&self, length: ByteCount) -> Result<()> {
         let _pause = CountPause::new();
         let mut disk = hold(&self.disk);

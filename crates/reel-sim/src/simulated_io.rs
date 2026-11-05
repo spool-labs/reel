@@ -62,6 +62,16 @@ impl SimulatedIo {
         }
     }
 
+    /// Make every filesystem refuse to give blocks back in place
+    pub fn refuse_free_blocks(&self) {
+        hold(&self.disk).refuses_free_blocks = true;
+    }
+
+    /// Read how many bytes files have given back
+    pub fn freed_bytes(&self) -> ByteCount {
+        hold(&self.disk).freed_bytes
+    }
+
     /// Move the clock by real time on every wait from here on, for a test with real threads. A tick a wait would let one
     /// spinning thread run the clock past a deadline while a preempted thread holds up what it waits for. A seeded test stays
     /// off this, or the clock stops being the seed's
@@ -327,6 +337,11 @@ impl Io for SimulatedIo {
         disk.enter()?;
         let inode = disk.inode_of(path)?;
         Ok(self.handle(&mut disk, inode, false))
+    }
+
+    fn can_free_blocks(&self, _root: &Path) -> bool {
+        let _pause = CountPause::new();
+        !hold(&self.disk).refuses_free_blocks
     }
 
     fn close_file(&self, file: SimulatedFile) {

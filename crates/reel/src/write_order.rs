@@ -2,8 +2,7 @@
 
 use std::hint;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::thread::{self, Thread};
+use std::sync::{Condvar, Mutex};
 
 use reel_api::units::{RowCount, WritePlace};
 
@@ -43,14 +42,7 @@ pub struct TicketRing {
     tail: usize,
     next_place: WritePlace,
     limit: WritePlace,
-}
-
-/// Where a ticket's writer sleeps. `waiting` is the place it waits for, zero when nobody sleeps here. A slot serves a
-/// new ticket each time the ring comes round, and the place says which one it's for
-#[derive(Debug, Default)]
-pub struct ParkSlot {
-    waiting: AtomicU64,
-    thread: Mutex<Option<Thread>>,
+    waiters: u32,
 }
 
 /// The write order of a store
@@ -58,7 +50,7 @@ pub struct ParkSlot {
 pub struct WriteOrder {
     ring: Mutex<TicketRing>,
     mark: AtomicU64,
-    parks: Vec<ParkSlot>,
+    moved: Condvar,
     wakes: AtomicU64,
 }
 
@@ -85,9 +77,10 @@ impl WriteOrder {
                 tail: 0,
                 next_place: WritePlace(last_used.0 + 1),
                 limit,
+                waiters: 0,
             }),
             mark: AtomicU64::new(last_used.0),
-            parks: (0..MOST_IN_FLIGHT).map(|_slot| ParkSlot::default()).collect(),
+            moved: Condvar::new(),
             wakes: AtomicU64::new(0),
         }
     }
@@ -123,41 +116,27 @@ impl WriteOrder {
         Some(Ticket { first, last, slot })
     }
 
-    /// End a claim, move the mark past every finished claim in order, and wake only the writers it passed
+    /// End a claim, and move the mark past every finished claim in order
     pub fn finish(&self, ticket: &Ticket, state: TicketState) {
-        let (first, end, highest) = {
-            let mut ring = hold(&self.ring);
-            ring.states[ticket.slot] = state;
+        let mut ring = hold(&self.ring);
+        ring.states[ticket.slot] = state;
 
-            let first = ring.head;
-            let mut highest = None;
-            while !ring.is_empty() {
-                let head = ring.head % MOST_IN_FLIGHT;
-                if ring.states[head] == TicketState::InFlight {
-                    break;
-                }
-                highest = Some(ring.ends[head]);
-                ring.head += 1;
+        let mut highest = None;
+        while !ring.is_empty() {
+            let head = ring.head % MOST_IN_FLIGHT;
+            if ring.states[head] == TicketState::InFlight {
+                break;
             }
-            if let Some(place) = highest {
-                // a sleeper writes its place and then reads the mark, so this store and the reads below meet it
-                self.mark.store(place.0, Ordering::SeqCst);
-            }
-            (first, ring.head, highest)
-        };
+            highest = Some(ring.ends[head]);
+            ring.head += 1;
+        }
 
-        let Some(place) = highest else {
-            return;
-        };
-        for index in first..end {
-            let park = &self.parks[index % MOST_IN_FLIGHT];
-            let waiting = park.waiting.load(Ordering::SeqCst);
-            if waiting != 0
-                && waiting <= place.0
-                && let Some(thread) = hold(&park.thread).as_ref()
-            {
+        if let Some(place) = highest {
+            self.mark.store(place.0, Ordering::Release);
+            // a notify makes a system call whoever listens, so it waits for someone to wake
+            if ring.waiters > 0 {
                 self.wakes.fetch_add(1, Ordering::Relaxed);
-                thread.unpark();
+                self.moved.notify_all();
             }
         }
     }
@@ -171,54 +150,15 @@ impl WriteOrder {
             hint::spin_loop();
         }
 
-        let park = &self.parks[ticket.slot];
-        loop {
-            if self.mark().0 >= ticket.last.0 {
-                return;
-            }
-            if self.take_park(park, ticket) {
-                break;
-            }
-            // a writer the ring lapped is still leaving this slot, and the mark has passed it
-            thread::yield_now();
+        let mut ring = hold(&self.ring);
+        ring.waiters += 1;
+        while self.mark().0 < ticket.last.0 {
+            ring = match self.moved.wait(ring) {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
         }
-        while self.mark.load(Ordering::SeqCst) < ticket.last.0 {
-            thread::park();
-        }
-        // a live thread's handle drops here, and never the last one of a thread that ended, which would free in a call
-        *hold(&park.thread) = None;
-        park.waiting.store(0, Ordering::SeqCst);
-    }
-
-    /// Find a ticket's park slot
-    pub fn park_of(&self, ticket: &Ticket) -> &ParkSlot {
-        &self.parks[ticket.slot]
-    }
-
-    /// Read the next place a claim would take
-    pub fn next_place(&self) -> WritePlace {
-        hold(&self.ring).next_place
-    }
-
-    /// Check a ticket's slot still holds a thread's handle
-    pub fn has_handle(&self, ticket: &Ticket) -> bool {
-        hold(&self.parks[ticket.slot].thread).is_some()
-    }
-
-    /// Check a writer sleeps in a ticket's slot
-    pub fn has_sleeper(&self, ticket: &Ticket) -> bool {
-        self.parks[ticket.slot].waiting.load(Ordering::SeqCst) == ticket.last.0
-    }
-
-    /// Take a ticket's park slot, or return false while an earlier writer still has it
-    pub fn take_park(&self, park: &ParkSlot, ticket: &Ticket) -> bool {
-        let mut thread = hold(&park.thread);
-        if park.waiting.load(Ordering::SeqCst) != 0 {
-            return false;
-        }
-        *thread = Some(thread::current());
-        park.waiting.store(ticket.last.0, Ordering::SeqCst);
-        true
+        ring.waiters -= 1;
     }
 
     /// Check whether a claim of these rows would pass the limit

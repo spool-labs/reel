@@ -6,9 +6,9 @@ use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig
 use reel::engine::engine_state::PLACE_RUN;
 use reel::engine::reel_store::ReelStore;
 use reel::io::Io;
-use reel::io::simulated::seeded_random::Seed;
-use reel::io::simulated::simulated_disk::OperationCount;
-use reel::io::simulated::simulated_io::SimulatedIo;
+use reel_sim::seeded_random::Seed;
+use reel_sim::simulated_disk::OperationCount;
+use reel_sim::simulated_io::SimulatedIo;
 use reel::record::codec::Codec;
 use reel::superblock::{SUPERBLOCK_NAME, Superblock, SuperblockPaths};
 use reel_api::column_id::ColumnId;

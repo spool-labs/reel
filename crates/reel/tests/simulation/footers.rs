@@ -3,11 +3,11 @@
 use std::path::PathBuf;
 
 use reel::index::key_hash::hash_key;
-use reel::io::simulated::file_image::BitMask;
-use reel::io::simulated::seeded_random::{Seed, SeededRandom};
-use reel::io::simulated::simulated_io::SimulatedIo;
+use reel_sim::file_image::BitMask;
+use reel_sim::seeded_random::{Seed, SeededRandom};
+use reel_sim::simulated_io::SimulatedIo;
 use reel::io::{Io, IoFile};
-use reel::io::simulated::simulated_disk::OperationCount;
+use reel_sim::simulated_disk::OperationCount;
 use reel::record::record_check::RecordKey;
 use reel::row_kind::RowKind;
 use reel::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry};

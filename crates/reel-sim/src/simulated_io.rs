@@ -7,15 +7,15 @@ use std::sync::{Arc, Mutex};
 
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
 
-use crate::guard::hold;
-use crate::io::Io;
-use crate::io::job::{Job, JobStep};
-use crate::io::lock_outcome::LockOutcome;
-use crate::io::simulated::file_image::BitMask;
-use crate::io::simulated::seeded_random::Seed;
-use crate::io::simulated::simulated_disk::{InodeNumber, OperationCount, SimulatedDisk, SyncHook};
-use crate::io::simulated::simulated_file::SimulatedFile;
-use crate::io::simulated::simulated_task::{JobCount, JobIndex, JobSlot, JobWait, SimulatedTask};
+use reel::guard::hold;
+use reel::io::Io;
+use reel::io::job::{Job, JobStep};
+use reel::io::lock_outcome::LockOutcome;
+use crate::file_image::BitMask;
+use crate::seeded_random::Seed;
+use crate::simulated_disk::{InodeNumber, OperationCount, SimulatedDisk, SyncHook};
+use crate::simulated_file::SimulatedFile;
+use crate::simulated_task::{JobCount, JobIndex, JobSlot, JobWait, SimulatedTask};
 
 /// The clock moves this far on every read
 pub const CLOCK_TICK: Nanoseconds = Nanoseconds(1_000);

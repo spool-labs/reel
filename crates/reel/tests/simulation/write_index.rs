@@ -10,7 +10,7 @@ use reel::index::shard_cursor::ShardCursor;
 use reel::index::write_index::{SHARD_COUNT, WriteIndex};
 use reel::index::write_row::WriteRow;
 use reel::index::write_shard::{ShardSizing, WalkBound};
-use reel::io::simulated::seeded_random::{Seed, SeededRandom};
+use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel::row_kind::RowKind;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_api::column_id::ColumnId;

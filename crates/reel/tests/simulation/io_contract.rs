@@ -13,12 +13,12 @@ use std::time::Duration;
 use reel::io::job::{Job, JobStep};
 use reel::io::lock_outcome::LockOutcome;
 use reel::io::plain::PlainIo;
-use reel::io::simulated::file_image::BitMask;
-use reel::io::simulated::seeded_random::Seed;
-use reel::io::simulated::simulated_disk::{FIRST_PROCESS, OperationCount};
-use reel::io::simulated::simulated_io::SimulatedIo;
+use reel_sim::file_image::BitMask;
+use reel_sim::seeded_random::Seed;
+use reel_sim::simulated_disk::{FIRST_PROCESS, OperationCount};
+use reel_sim::simulated_io::SimulatedIo;
 use reel::guard::hold;
-use reel::io::simulated::simulated_task::{JobCount, JobIndex};
+use reel_sim::simulated_task::{JobCount, JobIndex};
 use reel::io::{Io, IoFile, IoTask};
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds};
 

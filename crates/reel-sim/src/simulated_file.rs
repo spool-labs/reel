@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use reel_api::units::{ByteCount, FileOffset, ProcessId};
 
-use crate::guard::hold;
-use crate::io::IoFile;
-use crate::io::simulated::simulated_disk::{HandleId, InodeNumber, OperationCount, SimulatedDisk};
+use reel::guard::hold;
+use reel::io::IoFile;
+use crate::simulated_disk::{HandleId, InodeNumber, OperationCount, SimulatedDisk};
 
 /// A handle that only works until its close, and only for the process that opened it
 #[derive(Clone, Debug)]

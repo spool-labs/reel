@@ -9,7 +9,9 @@ edition = "2024"
 [workspace.dependencies]
 libc = "0.2"
 lz4-sys = "1"
+reel = { path = "crates/reel" }
 reel-api = { path = "crates/reel-api" }
+reel-sim = { path = "crates/reel-sim" }
 thiserror = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 

@@ -2,9 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use reel::io::simulated::file_image::BitMask;
-use reel::io::simulated::seeded_random::Seed;
-use reel::io::simulated::simulated_io::SimulatedIo;
+use reel_sim::file_image::BitMask;
+use reel_sim::seeded_random::Seed;
+use reel_sim::simulated_io::SimulatedIo;
 use reel::io::{Io, IoFile};
 use reel::record::chunk_table::{ChunkEntry, ENTRIES_PER_PAGE};
 use reel::record::codec::{CHUNK_BYTES, Codec};

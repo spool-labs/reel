@@ -5,7 +5,6 @@ pub mod lock_outcome;
 pub mod plain;
 pub mod plain_file;
 pub mod plain_task;
-pub mod simulated;
 
 use std::io::{IoSlice, IoSliceMut, Result};
 use std::path::{Path, PathBuf};

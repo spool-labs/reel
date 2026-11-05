@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use reel_api::units::{Nanoseconds, ProcessId};
 
-use crate::guard::hold;
-use crate::io::IoTask;
-use crate::io::job::Job;
+use reel::guard::hold;
+use reel::io::IoTask;
+use reel::io::job::Job;
 
 /// A job's place in the scheduler
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]

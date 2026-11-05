@@ -9,5 +9,8 @@ lz4-sys.workspace = true
 reel-api.workspace = true
 xxhash-rust.workspace = true
 
+[dev-dependencies]
+reel-sim.workspace = true
+
 [lints]
 workspace = true

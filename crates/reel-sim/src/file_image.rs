@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use reel_api::units::{ByteCount, FileOffset};
 
-use crate::io::simulated::seeded_random::SeededRandom;
+use crate::seeded_random::SeededRandom;
 
 /// A torn write keeps or loses each sector of this size on its own
 pub const SECTOR_BYTES: u64 = 512;

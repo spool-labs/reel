@@ -410,6 +410,11 @@ fn main() {
         round(&store, &mut inputs, number);
     }
 
+    // the walk runs behind the seals, and its first run is a path like any other
+    while (0..store.state.volumes.len()).any(|volume| store.state.pending_walks(volume) > 0) {
+        thread::sleep(SEAL_WAIT);
+    }
+
     let mut faults = FaultCounter::new();
     let _first_read = faults.read();
     let threads_before = thread_faults();

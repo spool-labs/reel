@@ -1,6 +1,7 @@
 //! The dead-byte walk: every superseded row counts once, whatever order segments seal and walk in
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::engine_state::IndexWait;
@@ -500,5 +501,40 @@ fn turn_with(seed: Seed) {
     assert_eq!((store.state.pending_walks(0), store.state.pending_walks(1)), (1, 0));
     assert_eq!(planner.step(), JobStep::IdleUntil { deadline: Nanoseconds(u64::MAX) });
     drop(planner);
+    store.close().expect("close");
+}
+
+// a stop ends a walk at its next probe, keeps nothing of the block, and a later open counts it whole
+#[test]
+fn stop_mid_block() {
+    let io = SimulatedIo::new(Seed(19));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"older").expect("put");
+    let older = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, older);
+    settle(&io);
+    io.hold_jobs(WALK_JOB, true);
+    store.put(COLUMN, b"key", b"newer").expect("put");
+    let newer = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, newer);
+    assert!(store.state.is_summary_lookup_whole(0));
+
+    let mut job = WalkJob::new(store.state.clone(), 0);
+    assert!(job.pick_target());
+    let target = job.target.expect("a target");
+    store.state.is_stopping.store(true, Ordering::Release);
+    assert!(job.walk_block(target).is_err());
+    assert_eq!(store.state.walk_retries(0), 0);
+    assert_eq!(store.state.pending_walks(0), 1);
+    assert_eq!(counts(&store, older).1, RowCount(0));
+    drop(job);
+    store.close().expect("close");
+    drop(store);
+
+    let store = open(&io);
+    settle(&io);
+
+    assert_eq!(counts(&store, older).1, RowCount(1));
+    assert_eq!(store.state.pending_walks(0), 0);
     store.close().expect("close");
 }

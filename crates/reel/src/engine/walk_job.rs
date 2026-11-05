@@ -7,7 +7,7 @@
 //! Range delete rows take no part on either side, and the range-delete apply job and compaction see to rows a cover
 //! hides, so neither counts here.
 
-use std::io::{Error, Result};
+use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -103,7 +103,9 @@ impl<Backend: Io> WalkJob<Backend> {
         let outcome = self.count_and_land(target);
         if outcome.is_err() {
             self.last_column = None;
-            self.state.volumes[self.volume].walk_retries.fetch_add(1, Ordering::Relaxed);
+            if !self.state.is_stopping.load(Ordering::Acquire) {
+                self.state.volumes[self.volume].walk_retries.fetch_add(1, Ordering::Relaxed);
+            }
         }
         outcome
     }
@@ -155,6 +157,9 @@ impl<Backend: Io> WalkJob<Backend> {
     ) -> Result<()> {
         let mut index = target.next_block;
         while index > 0 {
+            if self.state.is_stopping.load(Ordering::Acquire) {
+                return Err(Error::from(ErrorKind::Interrupted));
+            }
             index -= 1;
             let Some(block) = volume.table.walk_block(target.segment, index) else {
                 return Ok(());
@@ -237,7 +242,8 @@ impl<Backend: Io> WalkJob<Backend> {
                 Ok(newest) => newest,
                 // a version a damaged block hides counts nothing, which only understates
                 Err(StoreError::Corruption { .. }) => None,
-                Err(_error) => return Err(Error::other("searching for a newer version")),
+                // the kind alone, since a stop comes through here during close and close allocates nothing
+                Err(_error) => return Err(Error::from(ErrorKind::Interrupted)),
             };
             match newest {
                 Some(found) if found.row.place > row.place => {

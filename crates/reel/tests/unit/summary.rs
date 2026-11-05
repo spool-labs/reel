@@ -285,5 +285,6 @@ fn lookup_full() {
         assert!(rows.push(&facts(number), [column()].into_iter(), [].into_iter()));
     }
 
+    assert!(!rows.is_lookup_whole());
     assert_eq!(rows.get(SegmentNumber(5)).expect("a row").facts.segment, SegmentNumber(5));
 }

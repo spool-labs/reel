@@ -298,6 +298,11 @@ impl SummaryRows {
         self.index.insert(number, at as u32);
     }
 
+    /// Check every row is in the lookup: once it gives way, each walk step reads the rows again
+    pub fn is_lookup_whole(&self) -> bool {
+        self.is_index_whole
+    }
+
     /// Find where a segment's row starts
     pub fn find_row(&self, segment: SegmentNumber) -> Option<usize> {
         if self.is_index_whole {

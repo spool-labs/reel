@@ -1,5 +1,8 @@
 //! Gets: the write index, then the spot cache, then the footers, newest by place
 
+use std::io::{Error, ErrorKind};
+use std::sync::atomic::Ordering;
+
 use reel_api::column_id::ColumnId;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
@@ -423,7 +426,8 @@ impl<Backend: Io> EngineState<Backend> {
         })
     }
 
-    /// Ask a finished segment for a key's newest row that isn't a range delete, and keep it when it's the newest so far
+    /// Ask a finished segment for a key's newest row that isn't a range delete, and keep it when it's the newest so far.
+    /// A stop ends the walk here, so it waits for one read and never for a key's whole set of probes
     pub fn ask_walked(
         &self,
         volume: &Volume<Backend>,
@@ -432,6 +436,12 @@ impl<Backend: Io> EngineState<Backend> {
         reader: &mut FooterReader,
         best: &mut Option<SealedRow>,
     ) -> Result<(), StoreError> {
+        if self.is_stopping.load(Ordering::Acquire) {
+            return Err(StoreError::Io {
+                action: "walking",
+                source: Error::from(ErrorKind::Interrupted),
+            });
+        }
         let Some(pin) = volume.table.pin(segment) else {
             return Ok(());
         };

@@ -99,6 +99,7 @@ pub struct EngineState<Backend: Io> {
     pub seal_tasks: Vec<OnceLock<Backend::Task>>,
     pub planner_task: OnceLock<Backend::Task>,
     pub index_waiters: AtomicU64,
+    pub is_stopping: AtomicBool,
 }
 
 /// A held open-slot pin, released when dropped
@@ -288,6 +289,11 @@ impl<Backend: Io> EngineState<Backend> {
     /// Count the times a volume's walk has had to try a block again
     pub fn walk_retries(&self, volume: usize) -> u64 {
         self.volumes[volume].walk_retries.load(Ordering::Relaxed)
+    }
+
+    /// Check a volume's summary lookup still holds every row
+    pub fn is_summary_lookup_whole(&self, volume: usize) -> bool {
+        hold(&self.volumes[volume].summary).is_lookup_whole()
     }
 
     /// Report the heap each structure holds

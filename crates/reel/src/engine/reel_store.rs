@@ -311,6 +311,7 @@ impl<Backend: Io> Drop for ReelStore<Backend> {
 impl<Backend: Io> EngineState<Backend> {
     /// Stop every job
     pub fn stop_jobs(&self) -> Result<(), Error> {
+        self.is_stopping.store(true, Ordering::Release);
         if let Some(task) = self.row_task.get() {
             task.stop()?;
         }
@@ -853,6 +854,7 @@ pub fn build_state<Backend: Io>(
         seal_tasks,
         planner_task: OnceLock::new(),
         index_waiters: AtomicU64::new(0),
+        is_stopping: AtomicBool::new(false),
     }
 }
 

@@ -611,6 +611,11 @@ fn seal_retry() {
     let slot = store.state.index.lookup(COLUMN, b"key", store.state.read_point(), store.state.volumes[0].view());
     let slot = slot.row.expect("row").slot;
 
+    // the rows go out first, so the failed write is the footer's
+    settle(&io);
+    io.advance_clock(ROW_PERIOD);
+    settle(&io);
+
     store.seal_now();
     io.fill_writes(OperationCount(1));
     settle(&io);

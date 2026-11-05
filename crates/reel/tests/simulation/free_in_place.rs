@@ -5,12 +5,12 @@ use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
-use reel::engine::walk_job::{FREE_BLOCK_BYTES, FREE_IN_PLACE_BYTES};
+use reel::engine::walk_job::{FREE_BLOCK_BYTES, FREE_IN_PLACE_BYTES, FreeRecord, WalkJob};
 use reel::guard::hold;
 use reel::record::codec::Codec;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId, WritePlace};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
@@ -238,12 +238,12 @@ fn crashes() {
     assert!(freed_at_crash > 0);
 }
 
-// a freed range stays inside its record on both ends, so the live records beside it read back whole
+// a freed range stays inside its record on both ends, so the large records packed against it read back whole
 #[test]
 fn neighbours_stay() {
     let io = SimulatedIo::new(Seed(8));
     let store = open(&io);
-    let beside = vec![9; 777];
+    let beside = large(9);
     store.put(COLUMN, b"before", &beside).expect("put");
     store.put(COLUMN, b"key", &large(1)).expect("put");
     store.put(COLUMN, b"after", &beside).expect("put");
@@ -254,5 +254,27 @@ fn neighbours_stay() {
     assert!(store.state.volumes[0].bytes_freed.load(Ordering::Acquire) > 0);
     assert_eq!(read(&store, b"before"), Some(beside.clone()));
     assert_eq!(read(&store, b"after"), Some(beside));
+    store.close().expect("close");
+}
+
+// a replacement the mark hasn't reached can't free anything, whatever the walk's order
+#[test]
+fn unpublished_replacement() {
+    let io = SimulatedIo::new(Seed(9));
+    let store = open(&io);
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    store.put(COLUMN, b"keep", b"value").expect("put");
+    let older = seal(&store, &io);
+
+    let job = WalkJob::new(store.state.clone(), 0);
+    let free = FreeRecord {
+        segment: older,
+        offset: FileOffset(0),
+        length: ByteCount(2 * FREE_BLOCK_BYTES),
+        place: WritePlace(1),
+        replacement: WritePlace(store.state.read_point().0 + 1),
+    };
+    assert!(!job.free_record(&store.state.volumes[0], &free));
+    assert_eq!(io.freed_bytes().0, 0);
     store.close().expect("close");
 }

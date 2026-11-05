@@ -456,12 +456,15 @@ impl<Backend: Io> WalkJob<Backend> {
         self.state.save_summary(volume)
     }
 
-    /// Give a dead record's whole blocks back, or say a live cue still reads it. The count moves first, so a read that took
-    /// its point before this starts over, and one that takes it after has the replacement under it. A filesystem that
-    /// refuses leaves the record to a rewrite
+    /// Give a dead record's whole blocks back, or say it has to wait for a live cue or an unpublished replacement. The count
+    /// moves first, so a read that took its point before this starts over, and one that takes it after has the replacement
+    /// under it. A filesystem that refuses leaves the record to a rewrite
     pub fn free_record(&self, volume: &Volume<Backend>, free: &FreeRecord) -> bool {
         if !volume.can_free_blocks {
             return true;
+        }
+        if self.state.read_point() < free.replacement {
+            return false;
         }
         self.state.cues.note_reclaim();
         if self.state.cues.has_cue_between(free.place, free.replacement) {

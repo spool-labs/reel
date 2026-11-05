@@ -1,5 +1,6 @@
 //! The single store-wide order, and the mark that publishes it
 
+use std::hint;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
@@ -7,6 +8,9 @@ use reel_api::units::{RowCount, WritePlace};
 
 use crate::guard::hold;
 
+/// How many times a writer checks the mark before it sleeps: the writers ahead are usually a write call from done,
+/// and a sleep costs both sides a system call
+pub const MARK_SPINS: u32 = 256;
 /// Writers that can be in flight at once
 pub const MOST_IN_FLIGHT: usize = 1_024;
 
@@ -38,6 +42,7 @@ pub struct TicketRing {
     tail: usize,
     next_place: WritePlace,
     limit: WritePlace,
+    waiters: u32,
 }
 
 /// The write order of a store
@@ -71,6 +76,7 @@ impl WriteOrder {
                 tail: 0,
                 next_place: WritePlace(last_used.0 + 1),
                 limit,
+                waiters: 0,
             }),
             mark: AtomicU64::new(last_used.0),
             moved: Condvar::new(),
@@ -120,23 +126,31 @@ impl WriteOrder {
 
         if let Some(place) = highest {
             self.mark.store(place.0, Ordering::Release);
-            self.moved.notify_all();
+            // a notify makes a system call whoever listens, so it waits for someone to wake
+            if ring.waiters > 0 {
+                self.moved.notify_all();
+            }
         }
     }
 
     /// Wait until the mark passes a claim, so the write is visible to every later read
     pub fn wait_visible(&self, ticket: &Ticket) {
-        if self.mark().0 >= ticket.last.0 {
-            return;
+        for _spin in 0..MARK_SPINS {
+            if self.mark().0 >= ticket.last.0 {
+                return;
+            }
+            hint::spin_loop();
         }
 
         let mut ring = hold(&self.ring);
+        ring.waiters += 1;
         while self.mark().0 < ticket.last.0 {
             ring = match self.moved.wait(ring) {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
         }
+        ring.waiters -= 1;
     }
 
     /// Check whether a claim of these rows would pass the limit

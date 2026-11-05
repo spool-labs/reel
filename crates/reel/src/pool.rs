@@ -12,18 +12,38 @@ use crate::guard::hold;
 /// The byte a pool is first written with, which is not zero so the writes happen
 pub const TOUCH_BYTE: u8 = 0xA5;
 
-/// A fixed set of items, each owned by its user while in use so no lock spans a read
+/// A fixed set of items, each owned by its user while in use so no lock spans a read. Callers are served in the
+/// order they came, and a caller who finds items free and nobody ahead never sleeps or wakes anyone
 #[derive(Debug)]
 pub struct Pool<Item> {
-    free: Mutex<Vec<Item>>,
+    state: Mutex<PoolState<Item>>,
     freed: Condvar,
+}
+
+/// The free items, and the queue of callers waiting for them
+#[derive(Debug)]
+pub struct PoolState<Item> {
+    free: Vec<Item>,
+    next_ticket: u64,
+    serving: u64,
+}
+
+impl<Item> PoolState<Item> {
+    /// Check nobody is in the queue
+    pub fn has_no_queue(&self) -> bool {
+        self.next_ticket == self.serving
+    }
 }
 
 impl<Item> Pool<Item> {
     /// Build a pool from its items
     pub fn new(items: Vec<Item>) -> Self {
         Self {
-            free: Mutex::new(items),
+            state: Mutex::new(PoolState {
+                free: items,
+                next_ticket: 0,
+                serving: 0,
+            }),
             freed: Condvar::new(),
         }
     }
@@ -31,10 +51,16 @@ impl<Item> Pool<Item> {
     /// Add up what the free items hold
     pub fn heap_bytes(&self, measure: fn(&Item) -> ByteCount) -> ByteCount {
         let mut total = 0;
-        for item in hold(&self.free).iter() {
+        for item in hold(&self.state).free.iter() {
             total += measure(item).0;
         }
         ByteCount(total)
+    }
+
+    /// Count the callers in the queue
+    pub fn waiting(&self) -> u64 {
+        let state = hold(&self.state);
+        state.next_ticket - state.serving
     }
 
     /// Run some work with an item, waiting for one when all are out
@@ -43,8 +69,7 @@ impl<Item> Pool<Item> {
 
         // a panic in the work must still hand the item back, or the pool would shrink for good
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| work(&mut item)));
-        hold(&self.free).push(item);
-        self.freed.notify_one();
+        self.give_back(item);
 
         match outcome {
             Ok(answer) => answer,
@@ -52,17 +77,44 @@ impl<Item> Pool<Item> {
         }
     }
 
-    /// Take a free item, waiting for one when all are out
+    /// Take a free item, waiting in line when all are out or others came first
     pub fn take(&self) -> Item {
-        let mut free = hold(&self.free);
+        let mut state = hold(&self.state);
+        if state.has_no_queue()
+            && let Some(item) = state.free.pop()
+        {
+            return item;
+        }
+
+        let ticket = state.next_ticket;
+        state.next_ticket += 1;
         loop {
-            if let Some(item) = free.pop() {
+            if state.serving == ticket
+                && let Some(item) = state.free.pop()
+            {
+                state.serving += 1;
+                let should_wake = !state.has_no_queue() && !state.free.is_empty();
+                drop(state);
+                if should_wake {
+                    self.freed.notify_all();
+                }
                 return item;
             }
-            free = match self.freed.wait(free) {
+            state = match self.freed.wait(state) {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
+        }
+    }
+
+    /// Hand an item back, waking the queue only when there is one
+    pub fn give_back(&self, item: Item) {
+        let mut state = hold(&self.state);
+        state.free.push(item);
+        let should_wake = !state.has_no_queue();
+        drop(state);
+        if should_wake {
+            self.freed.notify_all();
         }
     }
 }

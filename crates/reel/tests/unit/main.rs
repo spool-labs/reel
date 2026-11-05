@@ -7,6 +7,7 @@ mod block_filter;
 mod chunk_table;
 mod column_directory;
 mod damage_list;
+mod device_error;
 mod engine_sizing;
 mod lz4_block;
 mod open_segment;

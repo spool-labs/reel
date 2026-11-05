@@ -32,6 +32,7 @@ const COLUMNS: [ColumnId; 2] = [ORDERED, RANDOM];
 const BUDGET: ByteCount = ByteCount(8 * 1024 * 1024);
 const SETTLE_STEPS: u64 = 2_000_000;
 const SETTLE_TICK: Nanoseconds = Nanoseconds(1_000_000);
+const ROW_PERIOD: Nanoseconds = Nanoseconds(60_000_000);
 const KEY_COUNT: u64 = 300;
 const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
 const FLIP: BitMask = BitMask(1);
@@ -1222,6 +1223,11 @@ fn new_rot() {
 fn seal_spans() {
     let io = rotted_rows(43);
     let store = open(&io);
+    // long keys in both columns make the sealed row bigger than the open row it replaces
+    for column in COLUMNS {
+        store.put(column, &[b'k'; 100], b"value").expect("put");
+        store.put(column, &[b'z'; 100], b"value").expect("put");
+    }
     let volume = &store.state.volumes[0];
     let spans = hold(&volume.damaged)[0];
     let clean = SegmentFacts {
@@ -1264,5 +1270,28 @@ fn clear_grows() {
     assert!(hold(&volume.summary).heap_bytes() >= heap);
     assert!(read(&store, ORDERED, &split).is_ok());
     assert!(matches!(read(&store, ORDERED, &end), Err(StoreError::Corruption { .. })));
+    store.close().expect("close");
+}
+
+// what open shows stays through a power cut right after it, with no flush from the caller
+#[test]
+fn open_covers() {
+    let io = SimulatedIo::new(Seed(45));
+    let store = open(&io);
+    store.put(ORDERED, b"key", b"older").expect("put");
+    seal(&store, &io);
+    store.delete(ORDERED, b"key").expect("delete");
+    io.advance_clock(ROW_PERIOD);
+    settle(&io);
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+    assert_eq!(read(&store, ORDERED, b"key").expect("get"), None);
+    io.power_cut();
+    drop(store);
+
+    let store = open(&io);
+    assert_eq!(read(&store, ORDERED, b"key").expect("get"), None);
     store.close().expect("close");
 }

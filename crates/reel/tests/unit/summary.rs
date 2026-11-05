@@ -169,3 +169,14 @@ fn key_prefix() {
     assert_eq!(lowest.len(), SUMMARY_KEY_BYTES);
     assert!(lowest.as_slice() <= long.as_slice());
 }
+
+// a row that must stay in rows with no room takes the room it needs, from nothing
+#[test]
+fn row_grows() {
+    let mut rows = SummaryRows::new(ByteCount(0));
+
+    let dropped = rows.push_kept(&facts(1), [column()].into_iter(), [span()].into_iter());
+
+    assert_eq!(dropped, 0);
+    assert_eq!(rows.get(SegmentNumber(1)).expect("row").facts, facts(1));
+}

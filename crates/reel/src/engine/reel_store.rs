@@ -19,7 +19,7 @@ use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, 
 use crate::engine::open_segment::RowQueue;
 use crate::engine::read_path::RecordWant;
 use crate::engine::recovery::{
-    RootScan, SummaryFound, list_roots, read_summaries, recover_segments, save_cleared_spans, scan_roots,
+    RootScan, SummaryFound, list_roots, read_summaries, recover_segments, save_cleared_spans, scan_roots, walk_open_rows,
     settle_summaries,
 };
 use crate::engine::reserve_job::ReserveJob;
@@ -283,17 +283,20 @@ pub fn bring_up<Backend: Io>(
     state: &Arc<EngineState<Backend>>,
     scan: &mut RootScan<Backend::File>,
 ) -> Result<(), StoreError> {
+    // damage ranks at the counter, so the counter passes every place open can find first
+    for found in &scan.sealed {
+        state.order.resume_past(found.head.places.highest);
+    }
+    walk_open_rows(state, scan).map_err(open_error("walking a rows file"))?;
     settle_summaries(state, scan).map_err(open_error("settling a summary"))?;
 
     scan.sealed.reverse();
     while let Some(found) = scan.sealed.last() {
         let volume = &state.volumes[found.volume];
         state.install_sealed(volume, found).map_err(open_error("installing a segment"))?;
-        state.order.resume_past(found.head.places.highest);
         scan.sealed.pop();
     }
-    let highest_segment = scan.highest_segment;
-    recover_segments(state, &mut scan.open, highest_segment).map_err(open_error("recovering a segment"))?;
+    recover_segments(state, scan).map_err(open_error("recovering a segment"))?;
     let damaged: usize = state.volumes.iter().map(|volume| hold(&volume.damaged).len()).sum();
     state.damaged_segments.store(damaged as u64, Ordering::Release);
 

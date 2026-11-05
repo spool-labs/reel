@@ -22,7 +22,7 @@ use crate::index::write_row::WriteRow;
 use crate::io::job::{Job, JobStep};
 use crate::io::device_error::{is_device_error, read_or_damaged};
 use crate::io::{Io, IoFile};
-use crate::record::record_check::{Checksum, RecordIdentity, RecordKey};
+use crate::record::record_check::{Checksum, RecordIdentity, RecordKey, checksum};
 use crate::record::record_head::SMALL_HEAD_BYTES;
 use crate::record::record_reader::{RecordLocation, RecordRead, RecordReader};
 use crate::row_kind::RowKind;
@@ -32,7 +32,6 @@ use crate::segment::block_entry::BlockEntry;
 use crate::segment::column_directory::DirectoryEntry;
 use crate::segment::damage_list::DamagedRange;
 use crate::segment::footer_reader::FooterReader;
-use crate::segment::footer_writer::fold_sum;
 use crate::segment::segment_table::{TABLE_SHARDS, TableSizing, shard_of};
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber, TailHead, columns_fit};
 use crate::segment::summary::{
@@ -140,6 +139,7 @@ pub struct FoundOpen<File> {
 pub struct RootScan<File> {
     pub sealed: Vec<FoundSealed<File>>,
     pub open: Vec<FoundOpen<File>>,
+    pub scanned: Vec<ScannedOpen<File>>,
     pub damaged: Vec<FoundDamaged>,
     pub empty: Vec<FoundEmpty>,
     pub highest_segment: SegmentNumber,
@@ -181,6 +181,10 @@ impl<File> RootScan<File> {
         }
         for found in self.open.drain(..) {
             io.close_file(found.data);
+        }
+        for segment in self.scanned.drain(..) {
+            io.close_file(segment.found.data);
+            io.close_file(segment.rows);
         }
     }
 
@@ -247,6 +251,7 @@ pub fn scan_roots<Backend: Io>(
     let mut scan = RootScan {
         sealed: Vec::new(),
         open: Vec::new(),
+        scanned: Vec::new(),
         damaged: Vec::new(),
         empty: Vec::new(),
         highest_segment: SegmentNumber(0),
@@ -518,7 +523,7 @@ impl<Backend: Io> EngineState<Backend> {
             };
             if at != scan.valid_end {
                 scan.has_rot = true;
-                scan.rot_sum = fold_sum(scan.rot_sum, Checksum(scan.valid_end.0));
+                scan.rot_sum = rot_sum(scan.rot_sum, scan.valid_end, at);
             }
             scan.synced_through = scan.synced_through.max(group.synced_through);
             scan.row_count = RowCount(scan.row_count.0 + group.row_count.0);
@@ -660,62 +665,46 @@ pub fn rewrite_range<File: IoFile>(file: &File, start: FileOffset, length: ByteC
     Ok(())
 }
 
-/// Bring every open segment back, sealing as a running store at this budget would have, and leave
-/// in `found` only what still has its files open when something fails
-pub fn recover_segments<Backend: Io>(
-    state: &Arc<EngineState<Backend>>,
-    found: &mut Vec<FoundOpen<Backend::File>>,
-    highest_segment: SegmentNumber,
-) -> Result<()> {
-    let mut scanned = Vec::with_capacity(found.len());
-    let recovered = recover_all(state, found, &mut scanned, highest_segment);
-    if recovered.is_err() {
-        for segment in scanned {
-            state.io.close_file(segment.found.data);
-            state.io.close_file(segment.rows);
-        }
-    }
-    recovered
-}
-
-/// Walk every rows file, then recover each segment, moving it out of its list once its files have a new owner
-pub fn recover_all<Backend: Io>(
-    state: &Arc<EngineState<Backend>>,
-    found: &mut Vec<FoundOpen<Backend::File>>,
-    scanned: &mut Vec<ScannedOpen<Backend::File>>,
-    highest_segment: SegmentNumber,
-) -> Result<()> {
-    found.reverse();
-    while let Some(open) = found.last() {
+/// Walk every open segment's rows file and move the order past what they hold, before anything ranks damage
+pub fn walk_open_rows<Backend: Io>(state: &EngineState<Backend>, scan: &mut RootScan<Backend::File>) -> Result<()> {
+    scan.open.reverse();
+    while let Some(open) = scan.open.last() {
         let volume = &state.volumes[open.volume];
         let path = &volume.roots[open.root.0 as usize];
         let rows = state.io.open_file(&rows_path(path, open.number))?;
-        let scan = match state.scan_rows(&rows) {
-            Ok(scan) => scan,
+        let walked = match state.scan_rows(&rows) {
+            Ok(walked) => walked,
             Err(error) => {
                 state.io.close_file(rows);
                 return Err(error);
             },
         };
-        if let Some(open) = found.pop() {
-            scanned.push(ScannedOpen { found: open, rows, scan });
+        // the limit should already stand above these, and open never hands out a place it found
+        state.order.resume_past(walked.highest_place);
+        if let Some(found) = scan.open.pop() {
+            scan.scanned.push(ScannedOpen { found, rows, scan: walked });
         }
     }
-    state.resume_numbers(highest_segment);
-    // the limit should already stand above these, and open never hands out a place it found
-    for segment in scanned.iter() {
-        state.order.resume_past(segment.scan.highest_place);
-    }
-    for segment in scanned.iter() {
+    Ok(())
+}
+
+/// Bring every open segment back, sealing as a running store at this budget would have, taking each out of
+/// the scan once its files have a new owner
+pub fn recover_segments<Backend: Io>(
+    state: &Arc<EngineState<Backend>>,
+    scan: &mut RootScan<Backend::File>,
+) -> Result<()> {
+    state.resume_numbers(scan.highest_segment);
+    for segment in &scan.scanned {
         if segment.scan.has_rot {
             damage_open(state, &segment.found, segment.scan.rot_sum)?;
         }
     }
 
-    scanned.reverse();
-    while let Some(segment) = scanned.last() {
+    scan.scanned.reverse();
+    while let Some(segment) = scan.scanned.last() {
         let is_kept = recover_one(state, segment)?;
-        if let Some(segment) = scanned.pop()
+        if let Some(segment) = scan.scanned.pop()
             && !is_kept
         {
             drop_copied(state, segment)?;
@@ -968,6 +957,16 @@ pub fn read_group<File: IoFile>(rows: &File, at: FileOffset, end: ByteCount, byt
     Ok(Some(length))
 }
 
+/// Fold a bad region into a sum of where a rows file's bad regions lie, through a real hash, so a region that
+/// grows or a second region changes it, and never to the zero a row with no rot carries
+pub fn rot_sum(sum: Checksum, start: FileOffset, end: FileOffset) -> Checksum {
+    let mut region = [0; 3 * size_of::<u64>()];
+    region[..8].copy_from_slice(&sum.0.to_le_bytes());
+    region[8..16].copy_from_slice(&start.0.to_le_bytes());
+    region[16..].copy_from_slice(&end.0.to_le_bytes());
+    Checksum(checksum(&region).0 | 1)
+}
+
 /// Search past a bad group, a sector at a time, for a whole group whose sync mark reaches over it
 pub fn covering_group<File: IoFile>(
     rows: &File,
@@ -1102,8 +1101,8 @@ pub fn settle_summaries<Backend: Io>(state: &EngineState<Backend>, scan: &mut Ro
             }
         }
         let open: BTreeSet<SegmentNumber> =
-            scan.open.iter().filter(|found| found.volume == index).map(|found| found.number).collect();
-        carry_rows(state, volume, &rows, &listed, (&held, &open), &mut settled);
+            scan.scanned.iter().filter(|segment| segment.found.volume == index).map(|segment| segment.found.number).collect();
+        carry_rows(volume, &rows, &listed, (&held, &open), &mut settled);
         *rows = settled;
         drop(rows);
         state.save_summary(volume)?;
@@ -1114,7 +1113,6 @@ pub fn settle_summaries<Backend: Io>(state: &EngineState<Backend>, scan: &mut Ro
 /// Keep the rows no sealed or damaged segment took: an open segment's, and a gone segment's spans, which
 /// stay until the caller clears them
 pub fn carry_rows<Backend: Io>(
-    state: &EngineState<Backend>,
     volume: &Volume<Backend>,
     rows: &SummaryRows,
     listed: &BTreeMap<SegmentNumber, usize>,
@@ -1133,9 +1131,9 @@ pub fn carry_rows<Backend: Io>(
             volume.damage.add(range);
         }
         hold(&volume.damaged).push(*number);
-        if !settled.copy_row(rows, *at) {
-            state.note_dropped_row();
-        }
+        // the room was sized at open from every row it found, and a row with spans has to stay
+        settled.make_room_for(rows, *at);
+        let _is_copied = settled.copy_row(rows, *at);
     }
 }
 
@@ -1201,9 +1199,9 @@ pub fn settle_sealed<Backend: Io>(
             }
             hold(&volume.damaged).push(facts.segment);
         }
-        if !settled.copy_row(rows, *at) {
-            state.note_dropped_row();
-        }
+        // the room was sized at open from every row it found, and a row with spans has to stay
+        settled.make_room_for(rows, *at);
+        let _is_copied = settled.copy_row(rows, *at);
         return Ok(());
     }
 

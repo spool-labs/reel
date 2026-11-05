@@ -20,7 +20,8 @@ use reel::segment::segment_tail::{SECOND_TAIL_DISTANCE, SegmentNumber, TailHead}
 use reel::segment::summary::{
     ROW_HEAD_BYTES, SUMMARY_HEADER_BYTES, SegmentFacts, SummaryPaths, SummaryRows, read_row, read_summary, write_summary,
 };
-use reel::superblock::Superblock;
+use reel::rows::row_group::parse_group;
+use reel::superblock::{Superblock, SuperblockPaths};
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId, WritePlace};
@@ -1294,4 +1295,151 @@ fn open_covers() {
     let store = open(&io);
     assert_eq!(read(&store, ORDERED, b"key").expect("get"), None);
     store.close().expect("close");
+}
+
+// where each group of a rows file starts
+fn group_starts(io: &SimulatedIo, path: &Path) -> Vec<u64> {
+    let superblock = Superblock::read(io, Path::new(ROOT)).expect("read").expect("superblock");
+    let file = io.open_read_only(path).expect("open");
+    let mut bytes = vec![0; file_length_of(&file).0 as usize];
+    file.read_exact_at(FileOffset(0), &mut bytes).expect("read");
+    io.close_file(file);
+
+    let mut starts = Vec::new();
+    let mut at = 0;
+    while let Some(group) = bytes.get(at..).and_then(|rest| parse_group(rest, superblock.record_key)) {
+        starts.push(at as u64);
+        at += group.total_length.0 as usize;
+    }
+    starts
+}
+
+// three flushed writes, each in its group with a mark group after it
+fn three_groups(seed: u64) -> (SimulatedIo, Vec<u64>) {
+    let io = SimulatedIo::new(Seed(seed));
+    let store = open(&io);
+    for key in [b"first", b"midst", b"third"] {
+        store.put(ORDERED, key, b"value").expect("put");
+        store.flush().expect("flush");
+    }
+    io.kill();
+    drop(store);
+    let starts = group_starts(&io, &rows_files(&io)[0]);
+    (io, starts)
+}
+
+fn reopen(store: Store) {
+    store.close().expect("close");
+}
+
+// rot that grows past the region an earlier open ranked takes the new open's counter
+#[test]
+fn grown_rot() {
+    let (io, starts) = three_groups(46);
+    assert!(starts.len() >= 6);
+    let rows = rows_files(&io)[0].clone();
+    io.rot(&rows, FileOffset(starts[2] + 20), FLIP).expect("rot");
+
+    let store = open(&io);
+    store.clear_damage(ORDERED, b"", None).expect("clear");
+    assert_eq!(read(&store, ORDERED, b"third").expect("get"), Some(b"value".to_vec()));
+    reopen(store);
+
+    // the next group goes bad too, so the region starts where it did and ends further on
+    io.rot(&rows, FileOffset(starts[3] + 20), FLIP).expect("rot");
+    let store = open(&io);
+
+    assert!(matches!(read(&store, ORDERED, b"third"), Err(StoreError::Corruption { .. })));
+    store.close().expect("close");
+}
+
+// a second bad region takes the new open's counter, though the first one is known
+#[test]
+fn second_region() {
+    let (io, starts) = three_groups(47);
+    let rows = rows_files(&io)[0].clone();
+    io.rot(&rows, FileOffset(starts[0] + 20), FLIP).expect("rot");
+
+    let store = open(&io);
+    store.clear_damage(ORDERED, b"", None).expect("clear");
+    reopen(store);
+
+    io.rot(&rows, FileOffset(starts[2] + 20), FLIP).expect("rot");
+    let store = open(&io);
+
+    assert!(matches!(read(&store, ORDERED, b"third"), Err(StoreError::Corruption { .. })));
+    store.close().expect("close");
+}
+
+// rot in the first group is new rot, whatever row the segment already has
+#[test]
+fn first_region() {
+    let (io, starts) = three_groups(48);
+    let number = SegmentNumber(data_number(&rows_files(&io)[0]));
+    let paths = SummaryPaths::new(Path::new(ROOT));
+    let mut rows = SummaryRows::new(ByteCount(4_096));
+    let facts = SegmentFacts {
+        segment: number,
+        is_damaged: true,
+        ..SegmentFacts::default()
+    };
+    assert!(rows.push(&facts, [].into_iter(), [].into_iter()));
+    write_summary(&io, &paths, WritePlace(0), rows.bytes()).expect("write");
+    io.rot(&rows_files(&io)[0], FileOffset(starts[0] + 20), FLIP).expect("rot");
+
+    let store = open(&io);
+
+    assert!(matches!(read(&store, ORDERED, b"third"), Err(StoreError::Corruption { .. })));
+    store.close().expect("close");
+}
+
+fn data_number(path: &Path) -> u64 {
+    let stem = path.file_stem().expect("stem").to_string_lossy().to_string();
+    u64::from_str_radix(&stem, 16).expect("number")
+}
+
+// a rank at the counter stands above every place open found, also when the roots saved a stale limit
+#[test]
+fn stale_limit() {
+    let built = build(49);
+    rot_row(&built, built.heads[MIDDLE].segment);
+    rot_first_tail(&built, MIDDLE);
+    rot_second_tail(&built, MIDDLE);
+    let mut stale = Superblock::read(&built.io, Path::new(ROOT)).expect("read").expect("superblock");
+    stale.place_limit = WritePlace(0);
+    stale.write(&built.io, &SuperblockPaths::new(Path::new(ROOT)), &mut Vec::new()).expect("write");
+
+    let store = open(&built.io);
+
+    assert!(assert_guarded(&store, &built, Cover::Whole(STAGE_LOST)) > 0);
+    store.close().expect("close");
+}
+
+// a bad sector in the middle or at the end of a covered group, or two of them, keeps the later groups
+#[test]
+fn bad_spots() {
+    for spots in [&[600_u64][..], &[1_100], &[20, 600]] {
+        let io = SimulatedIo::new(Seed(50));
+        let store = open(&io);
+        for number in 0..SECTOR_ROWS * 2 {
+            store.put(ORDERED, &key_of(ORDERED, number), b"value").expect("put");
+        }
+        store.flush().expect("flush");
+        store.put(ORDERED, b"later", b"value").expect("put");
+        store.flush().expect("flush");
+        io.kill();
+        drop(store);
+        let rows = rows_files(&io)[0].clone();
+        assert!(group_starts(&io, &rows)[1] > 1_200);
+        for spot in spots {
+            io.bad_sector(&rows, FileOffset(*spot)).expect("bad");
+        }
+
+        let store = open(&io);
+
+        assert_eq!(store.damaged_segments(), 1, "spots {spots:?}");
+        store.clear_damage(ORDERED, b"", None).expect("clear");
+        assert_eq!(read(&store, ORDERED, b"later").expect("get"), Some(b"value".to_vec()), "spots {spots:?}");
+        store.close().expect("close");
+    }
 }

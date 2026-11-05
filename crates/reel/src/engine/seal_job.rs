@@ -230,9 +230,9 @@ impl<Backend: Io> SealJob<Backend> {
             let columns = (0..writer.columns().len()).map(|index| writer.column_facts(index));
 
             // spans of a segment still open go on in its row, and only a clear ends them
+            let mut rows = hold(&volume.summary);
             let is_listed = hold(&volume.damaged).contains(&target.number);
             let spans = if is_listed { volume.damage.of_segment(target.number) } else { Vec::new() };
-            let mut rows = hold(&volume.summary);
             if is_listed {
                 rows.remove(target.number);
             }

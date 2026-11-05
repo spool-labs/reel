@@ -191,13 +191,9 @@ impl SummaryRows {
         columns: impl ExactSizeIterator<Item = ColumnFacts<'key>> + Clone,
         spans: impl ExactSizeIterator<Item = SpanFacts<'key>> + Clone,
     ) -> bool {
-        let mut body: usize = ROW_FACT_BYTES;
-        for column in columns.clone() {
-            body += 1 + 2 * size_of::<u16>() + 2 * size_of::<u64>() + column.lowest.len() + column.bound.len();
-        }
-        for span in spans.clone() {
-            body += 1 + 2 * size_of::<u16>() + span.start.len() + span.end.map_or(0, <[u8]>::len);
-        }
+        // a row keeps its counts in two bytes, and the pools that feed it stay well under that
+        debug_assert!(spans.len() < usize::from(NO_END) && columns.len() < usize::from(NO_END));
+        let body = row_bytes(columns.clone(), spans.clone());
         if self.bytes.len() + ROW_HEAD_BYTES + body + ROW_SUM_BYTES > self.bytes.capacity() {
             return false;
         }
@@ -245,7 +241,8 @@ impl SummaryRows {
             if self.drop_clean_row() {
                 dropped += 1;
             } else {
-                self.bytes.reserve(self.bytes.capacity().max(MOST_ROW_FIXED_BYTES));
+                // reserve counts from the length, so this asks past what's there, however little that is
+                self.bytes.reserve(self.bytes.capacity() + MOST_ROW_FIXED_BYTES + row_bytes(columns.clone(), spans.clone()));
             }
         }
         dropped
@@ -317,6 +314,13 @@ impl SummaryRows {
         read_row(self.bytes.get(at..)?)?.1
     }
 
+    /// Grow so a row of other rows fits, for the rows with spans that always stay
+    pub fn make_room_for(&mut self, from: &Self, at: usize) {
+        if let Some((length, _row)) = from.bytes.get(at..).and_then(read_row) {
+            self.bytes.reserve(length);
+        }
+    }
+
     /// Copy a row as it stands from other rows, or return false when it doesn't fit
     pub fn copy_row(&mut self, from: &Self, at: usize) -> bool {
         let Some((length, _row)) = from.bytes.get(at..).and_then(read_row) else {
@@ -348,6 +352,21 @@ impl<'bytes> Iterator for RowWalk<'bytes> {
             }
         }
     }
+}
+
+/// Work out the bytes of a row's body
+pub fn row_bytes<'key>(
+    columns: impl Iterator<Item = ColumnFacts<'key>>,
+    spans: impl Iterator<Item = SpanFacts<'key>>,
+) -> usize {
+    let mut body: usize = ROW_FACT_BYTES;
+    for column in columns {
+        body += 1 + 2 * size_of::<u16>() + 2 * size_of::<u64>() + column.lowest.len() + column.bound.len();
+    }
+    for span in spans {
+        body += 1 + 2 * size_of::<u16>() + span.start.len() + span.end.map_or(0, <[u8]>::len);
+    }
+    body
 }
 
 /// Add the part of a lowest key a row keeps

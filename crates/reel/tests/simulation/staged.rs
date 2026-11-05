@@ -46,6 +46,7 @@ const KEY_SPACE: u64 = 40;
 const MOST_IN_FLIGHT: usize = 6;
 const MANY_ROWS: u64 = 11_000;
 const SHRINK_ROWS: u64 = 2_000;
+const PAST_THE_OPEN: u64 = 1_000_000_000;
 const SHRINK_CRASH_END: u64 = 5_400;
 const SHRINK_CRASH_STEP: usize = 197;
 const JOB_ROUNDS: u64 = 20;
@@ -471,7 +472,9 @@ fn smaller_budget() {
 // a crash anywhere in such an open loses nothing, and the next open finishes the job
 #[test]
 fn smaller_budget_crash() {
-    for crash_at in (0..SHRINK_CRASH_END).step_by(SHRINK_CRASH_STEP) {
+    let mut crash_points: Vec<u64> = (0..SHRINK_CRASH_END).step_by(SHRINK_CRASH_STEP).collect();
+    crash_points.push(PAST_THE_OPEN);
+    for crash_at in crash_points {
         for is_power_cut in [false, true] {
             let io = SimulatedIo::new(Seed(crash_at));
             let store = open(&io);

@@ -182,7 +182,7 @@ impl<Backend: Io> SealJob<Backend> {
                 return self.finish_footer(target);
             };
 
-            let head = &self.walk.heads[shard];
+            let head = self.walk.head(shard);
             let Some(row) = head.row else {
                 return Err(Error::other("write index row has an unknown kind"));
             };
@@ -190,7 +190,7 @@ impl<Backend: Io> SealJob<Backend> {
                 self.state.index.highest_key(target.slot, head.column, &mut self.highest);
                 let start = ColumnStart {
                     column: head.column,
-                    lowest: &head.key,
+                    lowest: head.key,
                     highest: &self.highest,
                 };
                 self.writer.start_column(&target.data, &start)?;
@@ -202,7 +202,7 @@ impl<Backend: Io> SealJob<Backend> {
                 let identity = RecordIdentity {
                     record_key: self.state.record_key,
                     column: head.column,
-                    key: &head.key,
+                    key: head.key,
                     kind: RowKind::RangeDelete,
                     place: row.place,
                 };
@@ -226,7 +226,7 @@ impl<Backend: Io> SealJob<Backend> {
                 }
                 let cover = Cover {
                     column: head.column,
-                    start: &head.key,
+                    start: head.key,
                     end,
                     place: row.place,
                     segment: target.number,
@@ -242,7 +242,7 @@ impl<Backend: Io> SealJob<Backend> {
                 length: row.length,
                 kind: row.kind,
             };
-            self.writer.push_row(&target.data, &head.key, &footer_row)?;
+            self.writer.push_row(&target.data, head.key, &footer_row)?;
             self.walk.advance(&self.state.index, shard);
         }
         Ok(())
@@ -389,11 +389,11 @@ impl<Backend: Io> SealJob<Backend> {
                 self.switch(target);
                 return;
             };
-            let head = &self.walk.heads[shard];
+            let head = self.walk.head(shard);
             let is_new_key = self.last_column != Some(head.column) || self.last_key != head.key;
             if is_new_key && let Some(row) = head.row {
-                let hash = hash_key(head.column, &head.key);
-                let is_newest = self.state.index.is_newest_version(head.column, &head.key, row.place);
+                let hash = hash_key(head.column, head.key);
+                let is_newest = self.state.index.is_newest_version(head.column, head.key, row.place);
                 if row.kind == RowKind::Value && is_newest {
                     let location = SpotLocation {
                         segment: target.number,
@@ -408,7 +408,7 @@ impl<Backend: Io> SealJob<Backend> {
             }
             self.last_column = Some(head.column);
             self.last_key.clear();
-            self.last_key.extend_from_slice(&self.walk.heads[shard].key);
+            self.last_key.extend_from_slice(self.walk.head(shard).key);
             self.walk.advance(&self.state.index, shard);
         }
     }

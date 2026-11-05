@@ -6,9 +6,9 @@ use crate::seed_sets::seeds;
 use reel::index::entry_slab::PageCount;
 use reel::index::node_pool::NodeCount;
 use reel::index::open_slots::{OpenSlot, OpenSlots};
-use reel::index::seal_walk::SealWalk;
+use reel::index::seal_walk::{SealWalk, WALK_RUN_ROWS};
 use reel::index::shard_cursor::ShardCursor;
-use reel::index::write_index::{SHARD_COUNT, WriteIndex};
+use reel::index::write_index::{SHARD_COUNT, WriteIndex, shard_of};
 use reel::index::write_row::WriteRow;
 use reel::index::key_hash::hash_key;
 use reel::index::write_shard::{ShardHold, ShardNeed, ShardSizing, WalkBound, WriteShard};
@@ -47,6 +47,7 @@ const SMALL_TABLE: ShardSizing = ShardSizing {
 };
 const LATEST: WritePlace = WritePlace(u64::MAX - 1);
 const MANY_VERSIONS: u64 = 3_000;
+const KEY_SEARCH: u64 = 4_000;
 const MOST_EXTRA_KEY_BYTES: u64 = 90;
 const LONG_KEY_BYTES: usize = 2_000;
 const NEED_ROWS: u64 = 3_000;
@@ -88,9 +89,9 @@ fn add(index: &WriteIndex, key: &[u8], written: WriteRow) {
 fn drained(walk: &mut SealWalk, index: &WriteIndex) -> Vec<(Vec<u8>, u64)> {
     let mut rows = Vec::new();
     while let Some(shard) = walk.next_shard() {
-        let head = &walk.heads[shard];
+        let head = walk.head(shard);
         let place = head.row.expect("row").place.0;
-        rows.push((head.key.clone(), place));
+        rows.push((head.key.to_vec(), place));
         walk.advance(index, shard);
     }
     rows
@@ -200,6 +201,42 @@ fn seal_order() {
         }
     }
     expected.sort_by(|left, right| left.0.cmp(&right.0).then(right.1.cmp(&left.1)));
+
+    let mut walk = SealWalk::new();
+    walk.start(&index, SEALED);
+
+    assert_eq!(drained(&mut walk, &index), expected);
+}
+
+// a walk holds its order with shards that have no rows, that run out early, and that outlast a run
+#[test]
+fn walk_gaps() {
+    let wanted = |shard: usize| match shard % 4 {
+        0 => 0,
+        1 => 1,
+        2 => WALK_RUN_ROWS,
+        _ => 2 * WALK_RUN_ROWS + 1,
+    };
+    let index = WriteIndex::new(&SIZING);
+    let mut counts = [0; SHARD_COUNT];
+    let mut expected = Vec::new();
+    for number in 0..KEY_SEARCH {
+        let key = key_of(number);
+        let shard = shard_of(hash_key(COLUMN, &key));
+        let place = number + 1;
+        if counts[shard] < wanted(shard) {
+            counts[shard] += 1;
+            add(&index, &key, row(place, SEALED, RowKind::Value));
+            expected.push((key, place));
+        } else {
+            add(&index, &key, row(place, STAYING, RowKind::Value));
+        }
+        if (0..SHARD_COUNT).all(|shard| counts[shard] == wanted(shard)) {
+            break;
+        }
+    }
+    assert!((0..SHARD_COUNT).all(|shard| counts[shard] == wanted(shard)));
+    expected.sort();
 
     let mut walk = SealWalk::new();
     walk.start(&index, SEALED);

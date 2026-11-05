@@ -45,6 +45,7 @@ const WINDOW_VALUE: usize = 300;
 const SEND_CRASH_POINTS: u64 = 8;
 const LARGE_ENOUGH: usize = 100_000;
 const RACE_RECORD_BYTES: usize = 4_000;
+const RACE_ATTEMPTS: u64 = 20_000_000;
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -912,7 +913,8 @@ fn window_race() {
     thread::scope(|scope| {
         scope.spawn(|| {
             let mut number = 0u64;
-            loop {
+            // bounded, so a failed check in the sender ends the test with nobody left to send
+            for _attempt in 0..RACE_ATTEMPTS {
                 let bytes = number.to_le_bytes();
                 if let Some(offset) = store.state.try_window(slot, [&bytes, &fill], 1) {
                     hold(&store.state.queues[index]).reserved -= 1;

@@ -5,28 +5,50 @@ use std::mem;
 use reel_api::column_id::ColumnId;
 use reel_api::units::ByteCount;
 
-use crate::pool::touched_capacity;
 use crate::config::MAX_KEY_BYTES;
+use crate::index::entry_slab::NO_ENTRY;
 use crate::index::open_slots::OpenSlot;
 use crate::index::seek_target::{SeekTarget, compare_rows};
 use crate::index::write_index::{SHARD_COUNT, WriteIndex};
 use crate::index::write_row::WriteRow;
 use crate::index::write_tree::{TreePosition, entry_at, step_forward};
+use crate::pool::touched_capacity;
 
-/// One shard's next row, copied out so the merge holds no lock
-#[derive(Clone, Debug)]
-pub struct WalkHead {
-    pub position: Option<TreePosition>,
+/// A merge copies this many of a shard's rows under one hold, so their cold reads overlap
+pub const WALK_RUN_ROWS: usize = 16;
+
+/// One shard's next row
+#[derive(Clone, Copy, Debug)]
+pub struct WalkHead<'walk> {
     pub column: ColumnId,
-    pub key: Vec<u8>,
+    pub key: &'walk [u8],
     pub row: Option<WriteRow>,
+}
+
+/// One copied row, with its key in the run's key buffer
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RunRow {
+    pub column: ColumnId,
+    pub key_start: usize,
+    pub key_end: usize,
+    pub row: Option<WriteRow>,
+}
+
+/// A shard's next rows, copied out so the merge holds no lock
+#[derive(Debug)]
+pub struct WalkRun {
+    pub next: Option<TreePosition>,
+    pub rows: [RunRow; WALK_RUN_ROWS],
+    pub keys: Vec<u8>,
+    pub count: usize,
+    pub at: usize,
 }
 
 /// A merge over a slot's sixteen trees. A loser tree holds the order, so a row costs four compares, one a level
 #[derive(Debug)]
 pub struct SealWalk {
     pub slot: OpenSlot,
-    pub heads: Vec<WalkHead>,
+    pub runs: Vec<WalkRun>,
     losers: [usize; SHARD_COUNT],
     winner: usize,
 }
@@ -34,24 +56,25 @@ pub struct SealWalk {
 impl SealWalk {
     /// Read the heap the merge's buffers hold
     pub fn heap_bytes(&self) -> ByteCount {
-        let keys: usize = self.heads.iter().map(|head| head.key.capacity()).sum();
-        ByteCount((self.heads.capacity() * size_of::<WalkHead>() + keys) as u64)
+        let keys: usize = self.runs.iter().map(|run| run.keys.capacity()).sum();
+        ByteCount((self.runs.capacity() * size_of::<WalkRun>() + keys) as u64)
     }
 
     /// Allocate the merge's buffers
     pub fn new() -> Self {
-        let mut heads = Vec::with_capacity(SHARD_COUNT);
+        let mut runs = Vec::with_capacity(SHARD_COUNT);
         for _shard in 0..SHARD_COUNT {
-            heads.push(WalkHead {
-                position: None,
-                column: ColumnId::default(),
-                key: touched_capacity(MAX_KEY_BYTES as usize, 0),
-                row: None,
+            runs.push(WalkRun {
+                next: None,
+                rows: [RunRow::default(); WALK_RUN_ROWS],
+                keys: touched_capacity(WALK_RUN_ROWS * MAX_KEY_BYTES as usize, 0),
+                count: 0,
+                at: 0,
             });
         }
         Self {
             slot: OpenSlot::default(),
-            heads,
+            runs,
             losers: [0; SHARD_COUNT],
             winner: 0,
         }
@@ -61,40 +84,67 @@ impl SealWalk {
     pub fn start(&mut self, index: &WriteIndex, slot: OpenSlot) {
         self.slot = slot;
         for shard in 0..SHARD_COUNT {
-            let position = {
+            self.runs[shard].next = {
                 let guard = index.read_shard(shard);
                 guard.trees[slot.0 as usize].first_position(&guard.nodes)
             };
-            self.heads[shard].position = position;
             self.load(index, shard);
         }
         self.build_tree();
     }
 
-    /// Copy a shard's current row into its head
+    /// Copy a shard's next rows into its run, under one hold
     pub fn load(&mut self, index: &WriteIndex, shard: usize) {
-        let head = &mut self.heads[shard];
-        let Some(position) = head.position else {
-            head.row = None;
+        let run = &mut self.runs[shard];
+        run.at = 0;
+        run.count = 0;
+        run.rows[0] = RunRow::default();
+        run.keys.clear();
+        if run.next.is_none() {
             return;
-        };
+        }
 
         let guard = index.read_shard(shard);
-        let entry = entry_at(&guard.nodes, position);
-        head.column = guard.slab.column(entry);
-        head.key.clear();
-        head.key.extend_from_slice(guard.slab.key(entry));
-        head.row = guard.slab.row(entry);
+        // the addresses sit side by side in the leaves, and with them in hand no slab read waits on the one before
+        let mut entries = [NO_ENTRY; WALK_RUN_ROWS];
+        while run.count < WALK_RUN_ROWS
+            && let Some(position) = run.next
+        {
+            entries[run.count] = entry_at(&guard.nodes, position);
+            run.next = step_forward(&guard.nodes, position);
+            run.count += 1;
+        }
+        for (row, entry) in run.rows.iter_mut().zip(entries.into_iter().take(run.count)) {
+            let key_start = run.keys.len();
+            run.keys.extend_from_slice(guard.slab.key(entry));
+            *row = RunRow {
+                column: guard.slab.column(entry),
+                key_start,
+                key_end: run.keys.len(),
+                row: guard.slab.row(entry),
+            };
+        }
+    }
+
+    /// Read a shard's next row
+    pub fn head(&self, shard: usize) -> WalkHead<'_> {
+        let run = &self.runs[shard];
+        let row = run.rows[run.at];
+        WalkHead {
+            column: row.column,
+            key: &run.keys[row.key_start..row.key_end],
+            row: row.row,
+        }
     }
 
     /// Check one shard's row comes before another's, a shard with no row coming last
     pub fn is_before(&self, shard: usize, other: usize) -> bool {
-        let (head, against) = (&self.heads[shard], &self.heads[other]);
+        let (head, against) = (self.head(shard), self.head(other));
         let (Some(row), Some(against_row)) = (head.row, against.row) else {
             return head.row.is_some();
         };
-        let target = SeekTarget::new(against.column, &against.key, against_row.place);
-        compare_rows(head.column, &head.key, row.place, &target).is_lt()
+        let target = SeekTarget::new(against.column, against.key, against_row.place);
+        compare_rows(head.column, head.key, row.place, &target).is_lt()
     }
 
     /// Play every match, from the shards up
@@ -127,21 +177,16 @@ impl SealWalk {
 
     /// Find the shard holding the next row in order
     pub fn next_shard(&self) -> Option<usize> {
-        self.heads[self.winner].row.map(|_row| self.winner)
+        self.head(self.winner).row.map(|_row| self.winner)
     }
 
     /// Move past a shard's current row
     pub fn advance(&mut self, index: &WriteIndex, shard: usize) {
-        let position = self.heads[shard].position;
-        let next = match position {
-            Some(position) => {
-                let guard = index.read_shard(shard);
-                step_forward(&guard.nodes, position)
-            },
-            None => None,
-        };
-        self.heads[shard].position = next;
-        self.load(index, shard);
+        let run = &mut self.runs[shard];
+        run.at += 1;
+        if run.at >= run.count {
+            self.load(index, shard);
+        }
         self.replay(shard);
     }
 }

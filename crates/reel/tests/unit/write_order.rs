@@ -1,8 +1,12 @@
+use std::thread;
+
 use reel::write_order::*;
 use reel_api::units::{RowCount, WritePlace};
 
 const ONE: RowCount = RowCount(1);
 const NO_LIMIT: WritePlace = WritePlace(u64::MAX);
+const WRITERS: u64 = 8;
+const CLAIMS: u64 = 20_000;
 
 // claims take places in order, and a batch takes a run of them
 #[test]
@@ -96,4 +100,95 @@ fn limit_stops() {
 
     assert!(!order.is_past_limit(ONE));
     assert_eq!(order.try_claim(ONE).expect("room").first, WritePlace(3));
+}
+
+fn wait_for_sleeper(order: &WriteOrder, ticket: &Ticket) {
+    while !order.has_sleeper(ticket) {
+        thread::yield_now();
+    }
+}
+
+// a sleeping writer wakes once when the mark passes it
+#[test]
+fn sleeper_wakes() {
+    let order = WriteOrder::new(WritePlace(0), NO_LIMIT);
+    let first = order.try_claim(ONE).expect("room");
+    let second = order.try_claim(ONE).expect("room");
+    order.finish(&second, TicketState::Landed);
+
+    thread::scope(|scope| {
+        let waiter = scope.spawn(|| order.wait_visible(&second));
+        wait_for_sleeper(&order, &second);
+        assert_eq!(order.wakes(), 0);
+        order.finish(&first, TicketState::Landed);
+        waiter.join().expect("join");
+    });
+
+    assert_eq!(order.wakes(), 1);
+    assert!(!order.has_sleeper(&second));
+}
+
+// a move of the mark wakes only the writers it passed
+#[test]
+fn wakes_passed_only() {
+    let order = WriteOrder::new(WritePlace(0), NO_LIMIT);
+    let tickets: Vec<_> = (0..4).map(|_ticket| order.try_claim(ONE).expect("room")).collect();
+    order.finish(&tickets[1], TicketState::Landed);
+    order.finish(&tickets[3], TicketState::Landed);
+
+    thread::scope(|scope| {
+        let near = scope.spawn(|| order.wait_visible(&tickets[1]));
+        let far = scope.spawn(|| order.wait_visible(&tickets[3]));
+        wait_for_sleeper(&order, &tickets[1]);
+        wait_for_sleeper(&order, &tickets[3]);
+
+        order.finish(&tickets[0], TicketState::Landed);
+        near.join().expect("join");
+        assert_eq!(order.wakes(), 1);
+        assert!(order.has_sleeper(&tickets[3]));
+
+        order.finish(&tickets[2], TicketState::Landed);
+        far.join().expect("join");
+    });
+
+    assert_eq!(order.wakes(), 2);
+}
+
+// a ticket the ring brings back to a slot waits for an earlier writer to leave it
+#[test]
+fn lapped_slot() {
+    let order = WriteOrder::new(WritePlace(0), NO_LIMIT);
+    let first = order.try_claim(ONE).expect("room");
+    let lapped = Ticket {
+        first: WritePlace(5_000),
+        last: WritePlace(5_000),
+        slot: first.slot,
+    };
+    let park = order.park_of(&first);
+
+    assert!(order.take_park(park, &first));
+    assert!(!order.take_park(park, &lapped));
+    assert!(order.has_sleeper(&first));
+    assert!(!order.has_sleeper(&lapped));
+}
+
+// writers that land and wait on many threads never hang, and the mark ends past every claim
+#[test]
+fn many_writers() {
+    let order = WriteOrder::new(WritePlace(0), NO_LIMIT);
+    thread::scope(|scope| {
+        for _writer in 0..WRITERS {
+            scope.spawn(|| {
+                for _claim in 0..CLAIMS {
+                    let Some(ticket) = order.try_claim(ONE) else {
+                        continue;
+                    };
+                    order.finish(&ticket, TicketState::Landed);
+                    order.wait_visible(&ticket);
+                }
+            });
+        }
+    });
+
+    assert_eq!(order.mark().0, order.next_place().0 - 1);
 }

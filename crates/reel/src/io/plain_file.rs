@@ -2,23 +2,37 @@
 
 use std::fs::File;
 use std::io::{Error, ErrorKind, IoSlice, IoSliceMut, Result};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
+use std::mem::{ManuallyDrop, MaybeUninit};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 
 use reel_api::units::{ByteCount, FileOffset};
 
 use crate::io::IoFile;
 
-/// A file reached through plain syscalls
-#[derive(Debug)]
+/// A file reached through plain syscalls, closed only by `Io::close_file`
+#[derive(Clone, Copy, Debug)]
 pub struct PlainFile {
-    file: File,
+    descriptor: RawFd,
 }
 
 impl PlainFile {
-    /// Wrap an open file
+    /// Take over an open file
     pub fn new(file: File) -> Self {
-        Self { file }
+        Self {
+            descriptor: file.into_raw_fd(),
+        }
+    }
+
+    /// Close the file
+    pub fn close(self) {
+        // SAFETY: this handle owns the descriptor, and the engine closes each file once
+        drop(unsafe { File::from_raw_fd(self.descriptor) });
+    }
+
+    /// Borrow the descriptor as a file for one call, without closing it
+    pub fn borrowed(&self) -> ManuallyDrop<File> {
+        // SAFETY: the descriptor stays open for the call, and ManuallyDrop never closes it
+        ManuallyDrop::new(unsafe { File::from_raw_fd(self.descriptor) })
     }
 
     /// Finish a short vectored write one part at a time
@@ -33,35 +47,48 @@ impl PlainFile {
             }
 
             let remainder = &part[skipped as usize..];
-            self.file.write_all_at(remainder, position)?;
+            let mut sent: u64 = 0;
+            while sent < remainder.len() as u64 {
+                let rest = [IoSlice::new(&remainder[sent as usize..])];
+                sent += write_vectored(self.descriptor, FileOffset(position + sent), &rest)?.0;
+            }
             position = position.saturating_add(remainder.len() as u64);
             skipped = 0;
         }
         Ok(())
     }
+
+    /// Fill a buffer from an offset, however many reads that takes
+    pub fn read_full(&self, offset: FileOffset, buf: &mut [u8]) -> Result<ByteCount> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            let position = offset.0.saturating_add(filled as u64);
+            let mut parts = [IoSliceMut::new(&mut buf[filled..])];
+            let read = read_vectored(self.descriptor, FileOffset(position), &mut parts)?;
+            if read.0 == 0 {
+                break;
+            }
+            filled += read.0 as usize;
+        }
+        Ok(ByteCount(filled as u64))
+    }
 }
 
 impl IoFile for PlainFile {
     fn read_at(&self, offset: FileOffset, buf: &mut [u8]) -> Result<ByteCount> {
-        let mut filled = 0;
-        while filled < buf.len() {
-            let position = offset.0.saturating_add(filled as u64);
-            match self.file.read_at(&mut buf[filled..], position) {
-                Ok(0) => break,
-                Ok(count) => filled += count,
-                Err(error) if error.kind() == ErrorKind::Interrupted => {},
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(ByteCount(filled as u64))
+        self.read_full(offset, buf)
     }
 
     fn read_exact_at(&self, offset: FileOffset, buf: &mut [u8]) -> Result<()> {
-        self.file.read_exact_at(buf, offset.0)
+        let read = self.read_full(offset, buf)?;
+        if read.0 < buf.len() as u64 {
+            return Err(Error::from(ErrorKind::UnexpectedEof));
+        }
+        Ok(())
     }
 
     fn read_parts_at(&self, offset: FileOffset, parts: &mut [IoSliceMut]) -> Result<()> {
-        let read = read_vectored(&self.file, offset, parts)?;
+        let read = read_vectored(self.descriptor, offset, parts)?;
         let mut skipped = read.0;
         let mut position = offset.0.saturating_add(read.0);
         for part in parts.iter_mut() {
@@ -72,7 +99,7 @@ impl IoFile for PlainFile {
             }
 
             let remainder = &mut part[skipped as usize..];
-            self.file.read_exact_at(remainder, position)?;
+            self.read_exact_at(FileOffset(position), remainder)?;
             position = position.saturating_add(remainder.len() as u64);
             skipped = 0;
         }
@@ -85,7 +112,7 @@ impl IoFile for PlainFile {
             total = total.saturating_add(part.len() as u64);
         }
 
-        let written = write_vectored(&self.file, offset, parts)?;
+        let written = write_vectored(self.descriptor, offset, parts)?;
         if written.0 == total {
             return Ok(());
         }
@@ -93,21 +120,29 @@ impl IoFile for PlainFile {
     }
 
     fn sync(&self) -> Result<()> {
-        self.file.sync_data()
+        self.borrowed().sync_data()
     }
 
     fn length(&self) -> Result<ByteCount> {
-        Ok(ByteCount(self.file.metadata()?.len()))
+        let mut stats = MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: the descriptor is open and the pointer is valid for the call
+        let status = unsafe { libc::fstat(self.descriptor, stats.as_mut_ptr()) };
+        if status != 0 {
+            return Err(Error::last_os_error());
+        }
+
+        // SAFETY: fstat filled the struct, and every field is a plain integer
+        let stats = unsafe { stats.assume_init() };
+        Ok(ByteCount(stats.st_size as u64))
     }
 
     fn truncate(&self, length: ByteCount) -> Result<()> {
-        self.file.set_len(length.0)
+        self.borrowed().set_len(length.0)
     }
 }
 
 /// Issue one positioned vectored read and return the bytes it brought
-pub fn read_vectored(file: &File, offset: FileOffset, parts: &mut [IoSliceMut]) -> Result<ByteCount> {
-    let descriptor = file.as_raw_fd();
+pub fn read_vectored(descriptor: RawFd, offset: FileOffset, parts: &mut [IoSliceMut]) -> Result<ByteCount> {
     let vectors = parts.as_ptr().cast::<libc::iovec>();
     let count = parts.len() as libc::c_int;
     let position = offset.0 as libc::off_t;
@@ -127,8 +162,7 @@ pub fn read_vectored(file: &File, offset: FileOffset, parts: &mut [IoSliceMut]) 
 }
 
 /// Issue one positioned vectored write and return the bytes it took
-pub fn write_vectored(file: &File, offset: FileOffset, parts: &[IoSlice]) -> Result<ByteCount> {
-    let descriptor = file.as_raw_fd();
+pub fn write_vectored(descriptor: RawFd, offset: FileOffset, parts: &[IoSlice]) -> Result<ByteCount> {
     let vectors = parts.as_ptr().cast::<libc::iovec>();
     let count = parts.len() as libc::c_int;
     let position = offset.0 as libc::off_t;

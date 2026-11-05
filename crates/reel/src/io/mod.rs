@@ -15,8 +15,8 @@ use reel_api::units::{ByteCount, FileOffset, Nanoseconds};
 use crate::io::job::Job;
 use crate::io::lock_outcome::LockOutcome;
 
-/// One open file
-pub trait IoFile: Send + Sync {
+/// One open file, whose handles clone with no allocation
+pub trait IoFile: Clone + Send + Sync {
     /// Read from the offset, and return how many bytes the file had
     fn read_at(&self, offset: FileOffset, buf: &mut [u8]) -> Result<ByteCount>;
 
@@ -65,6 +65,9 @@ pub trait Io: Clone + Send + Sync + 'static {
 
     /// Open an existing file to read
     fn open_read_only(&self, path: &Path) -> Result<Self::File>;
+
+    /// Close a handle, once no read still uses it
+    fn close_file(&self, file: Self::File);
 
     /// Unlink a file, which stays readable through its open handles
     fn remove_file(&self, path: &Path) -> Result<()>;

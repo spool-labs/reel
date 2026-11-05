@@ -50,6 +50,21 @@ impl SimulatedFile {
     }
 }
 
+impl Clone for SimulatedFile {
+    fn clone(&self) -> Self {
+        let mut disk = hold(&self.disk);
+        if let Some(image) = disk.inodes.get_mut(&self.inode) {
+            image.handle_count += 1;
+        }
+        Self {
+            disk: Arc::clone(&self.disk),
+            inode: self.inode,
+            process: self.process,
+            is_writable: self.is_writable,
+        }
+    }
+}
+
 impl Drop for SimulatedFile {
     fn drop(&mut self) {
         let mut disk = hold(&self.disk);

@@ -82,6 +82,10 @@ impl Io for PlainIo {
         Ok(PlainFile::new(File::open(path)?))
     }
 
+    fn close_file(&self, file: PlainFile) {
+        file.close();
+    }
+
     fn remove_file(&self, path: &Path) -> Result<()> {
         fs::remove_file(path)
     }

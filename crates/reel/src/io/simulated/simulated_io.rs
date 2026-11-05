@@ -210,6 +210,10 @@ impl Io for SimulatedIo {
         Ok(self.handle(&mut disk, inode, false))
     }
 
+    fn close_file(&self, file: SimulatedFile) {
+        drop(file);
+    }
+
     fn remove_file(&self, path: &Path) -> Result<()> {
         let mut disk = hold(&self.disk);
         disk.enter()?;

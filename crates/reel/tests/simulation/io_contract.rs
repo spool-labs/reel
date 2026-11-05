@@ -153,6 +153,11 @@ fn check_files<Backend: Io>(io: &Backend, root: &Path) {
     assert_eq!(read_bytes(&read_only, 10, 2), b"he");
     assert!(io.list_directory(root).expect("list").is_empty());
     assert!(io.free_space(root).expect("free space").0 > 0);
+
+    let copy = read_only.clone();
+    assert_eq!(read_bytes(&copy, 10, 2), b"he");
+    io.close_file(read_only);
+    io.close_file(file);
 }
 
 fn check_lock<Backend: Io>(io: &Backend, root: &Path) {

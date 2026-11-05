@@ -2,6 +2,7 @@
 
 use reel_api::units::ByteCount;
 
+use crate::little_endian::read_word;
 use crate::record::chunk_table::{ChunkCount, TablePageIndex, page_count};
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::record_check::{Checksum, RecordCheck};
@@ -72,12 +73,4 @@ pub fn read_value_length(bytes: &[u8]) -> Option<ByteCount> {
 /// Read one page's checksum from a chunked head
 pub fn read_page_sum(bytes: &[u8], page: TablePageIndex) -> Option<Checksum> {
     Some(Checksum(read_word(bytes, PAGE_SUMS_AT + page.0 as usize * PAGE_SUM_BYTES)?))
-}
-
-/// Read a little-endian word
-pub fn read_word(bytes: &[u8], at: usize) -> Option<u64> {
-    let slice = bytes.get(at..at + size_of::<u64>())?;
-    let mut word = [0; size_of::<u64>()];
-    word.copy_from_slice(slice);
-    Some(u64::from_le_bytes(word))
 }

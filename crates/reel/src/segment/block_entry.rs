@@ -2,6 +2,7 @@
 
 use reel_api::units::{ByteCount, FileOffset};
 
+use crate::little_endian::read_half;
 use crate::segment::row_block::BLOCK_HEADER_BYTES;
 
 /// Bytes of key a block index line keeps
@@ -76,12 +77,4 @@ impl BlockEntry {
     pub fn block_length(&self) -> ByteCount {
         ByteCount(u64::from(self.filter_offset - self.block_offset))
     }
-}
-
-/// Read a little-endian half word
-pub fn read_half(bytes: &[u8], at: usize) -> Option<u32> {
-    let slice = bytes.get(at..at + size_of::<u32>())?;
-    let mut half = [0; size_of::<u32>()];
-    half.copy_from_slice(slice);
-    Some(u32::from_le_bytes(half))
 }

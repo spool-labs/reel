@@ -18,7 +18,10 @@ use crate::engine::engine_sizing::{
 use crate::engine::engine_state::{EngineState, SEGMENT_NUMBER_BATCH, SlotFile};
 use crate::engine::open_segment::RowQueue;
 use crate::engine::read_path::RecordWant;
-use crate::engine::recovery::{RootScan, list_roots, recover_segments, scan_roots};
+use crate::engine::recovery::{
+    RootScan, SummaryFound, list_roots, read_summaries, recover_segments, save_cleared_spans, scan_roots,
+    settle_summaries,
+};
 use crate::engine::row_job::RowJob;
 use crate::engine::seal_job::SealJob;
 use crate::engine::volume::{ClaimState, SyncState, Volume};
@@ -36,6 +39,7 @@ use crate::record::record_reader::RecordReader;
 use crate::rows::row_group::RowGroupBuffer;
 use crate::segment::block_cache::BlockCache;
 use crate::segment::column_directory::ColumnDirectory;
+use crate::segment::damage_list::DamageList;
 use crate::segment::footer_reader::FooterReader;
 use crate::segment::row_block::ROW_BLOCK_BYTES;
 use crate::segment::segment_table::{SegmentTable, TABLE_SHARDS, TableSizing};
@@ -51,6 +55,8 @@ pub const TABLE_BUDGET_DIVISOR: u64 = 16;
 pub const PLANNED_SEGMENT_BYTES: u64 = 1_024;
 /// Block lines a table's share is planned for, as bytes per line
 pub const PLANNED_LINE_BYTES: u64 = 32;
+/// Bytes a summary row is planned at per column, keys of typical length included
+pub const PLANNED_SUMMARY_COLUMN_BYTES: usize = 100;
 
 /// An open store
 pub struct ReelStore<Backend: Io> {
@@ -84,11 +90,18 @@ impl<Backend: Io> ReelStore<Backend> {
         let listings = list_roots(&io, &roots).map_err(open_error("listing a root"))?;
         let record_key = superblock.record_key;
         let scan = scan_roots(&io, record_key, &listings).map_err(open_error("reading a tail"))?;
+        let summaries = read_summaries(&io, &roots).map_err(open_error("reading a summary"))?;
+        let mut summary_mark = WritePlace(0);
+        for summary in &summaries {
+            summary_mark = summary_mark.max(summary.mark);
+        }
 
-        let state = Arc::new(build_state(io, config, &sizing, superblock, locks, &scan));
-        state.damaged_segments.store(scan.damaged, Ordering::Release);
+        let state = Arc::new(build_state(io, config, &sizing, superblock, locks, &scan, summaries));
+        let summary_place = settle_summaries(&state, &scan.sealed, &scan.damaged).map_err(open_error("settling a summary"))?;
+        let damaged: usize = state.volumes.iter().map(|volume| hold(&volume.damaged).len()).sum();
+        state.damaged_segments.store(damaged as u64, Ordering::Release);
         let highest_segment = scan.highest_segment;
-        let highest_place = scan.highest_place;
+        let highest_place = scan.highest_place.max(summary_place).max(summary_mark);
         for found in scan.sealed {
             let volume = &state.volumes[found.volume];
             state.install_sealed(volume, found).map_err(open_error("installing a segment"))?;
@@ -169,6 +182,16 @@ impl<Backend: Io> ReelStore<Backend> {
         self.state.contains_at(column, key, self.state.read_point())
     }
 
+    /// Clear a damaged span once the caller has repaired it from peers, up to an end key or the column's end
+    pub fn clear_damage(&self, column: ColumnId, start: &[u8], end: Option<&[u8]>) -> Result<(), StoreError> {
+        self.check_open()?;
+        let info = self.state.column(column)?;
+        let volume = &self.state.volumes[info.volume.0 as usize];
+        volume.damage.clear(column, start, end);
+        save_cleared_spans(volume);
+        self.state.save_summary(volume).map_err(open_error("saving a summary"))
+    }
+
     /// Make every write that returned before this call durable on every volume
     pub fn flush(&self) -> Result<(), StoreError> {
         self.check_open()?;
@@ -197,6 +220,9 @@ impl<Backend: Io> ReelStore<Backend> {
         for volume in &self.state.volumes {
             if !volume.has_failed() {
                 outcome = outcome.and(self.state.sync_volume(volume));
+            }
+            if !volume.has_failed() {
+                outcome = outcome.and(self.state.save_summary(volume).map_err(open_error("saving a summary")));
             }
             self.state.close_volume(volume);
             hold(&volume.locks).clear();
@@ -448,6 +474,7 @@ pub fn build_state<Backend: Io>(
     superblock: Superblock,
     mut locks: Vec<Vec<Backend::Lock>>,
     scan: &RootScan<Backend::File>,
+    summaries: Vec<SummaryFound>,
 ) -> EngineState<Backend> {
     let table_share = config.memory_budget.0 / TABLE_BUDGET_DIVISOR;
     let segments_per_shard = ((table_share / PLANNED_SEGMENT_BYTES) as usize / TABLE_SHARDS).max(8);
@@ -477,12 +504,20 @@ pub fn build_state<Backend: Io>(
 
     let open_slots = sizing.shard.open_slots;
     let mut volumes = Vec::with_capacity(config.volumes.len());
+    let mut summaries = summaries.into_iter();
     for (index, volume) in config.volumes.iter().enumerate() {
         let mut paths = Vec::with_capacity(volume.roots.len());
         for root in &volume.roots {
             paths.push(SuperblockPaths::new(root));
         }
         let held = mem::take(&mut locks[index]);
+        let Some(mut summary) = summaries.next() else {
+            continue;
+        };
+        let found_summary = summary.rows.bytes().len() * 2;
+        let planned_summary = segments_per_shard * TABLE_SHARDS * config.columns.len().max(1) * PLANNED_SUMMARY_COLUMN_BYTES;
+        let summary_room = found_summary.max(planned_summary);
+        summary.rows.make_room(ByteCount(summary_room as u64));
         volumes.push(Volume {
             id: VolumeId(index as u8),
             name: volume.name.clone(),
@@ -505,6 +540,10 @@ pub fn build_state<Backend: Io>(
             segment_bytes: sizing.segment_bytes,
             segment_rows: sizing.segment_rows,
             reserve: ByteCount(sizing.segment_bytes.0 * 2),
+            summary: Mutex::new(summary.rows),
+            summary_paths: summary.paths,
+            damage: DamageList::new(),
+            damaged: Mutex::new(Vec::new()),
         });
     }
 

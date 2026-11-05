@@ -5,6 +5,7 @@ use std::io::{Error, IoSlice, Result};
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
+use crate::config::MAX_KEY_BYTES;
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::io::IoFile;
 use crate::record::record_check::{Checksum, RecordKey, checksum};
@@ -14,6 +15,7 @@ use crate::segment::block_filter::{FILTER_SUM_BYTES, add_key, filter_bytes, seal
 use crate::segment::row_block::{
     BLOCK_HEADER_BYTES, BlockHeader, FooterRow, ROW_BLOCK_BYTES, RowBlockBuilder, write_block_header,
 };
+use crate::segment::summary::ColumnFacts;
 use crate::segment::segment_tail::{
     BlockCount, COLUMN_TAIL_BYTES, COPY_GAP_BYTES, ColumnTail, MAX_COLUMNS, MAX_TAIL_BYTES, MOST_SEGMENT_BYTES,
     PlaceRange, SECOND_TAIL_DISTANCE, SegmentNumber, TAIL_FIXED_BYTES, TailCursor, TailHead, write_trailer,
@@ -28,6 +30,14 @@ pub struct ColumnStart<'key> {
     pub column: ColumnId,
     pub lowest: &'key [u8],
     pub highest: &'key [u8],
+}
+
+/// Where a column's whole lowest and highest keys sit in the writer's key buffer
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ColumnKeys {
+    pub lowest_at: usize,
+    pub highest_at: usize,
+    pub end: usize,
 }
 
 /// What a finished footer adds up to
@@ -47,6 +57,8 @@ pub struct FooterWriter {
     hashes: Vec<KeyHash>,
     entries: Vec<BlockEntry>,
     columns: Vec<ColumnTail>,
+    column_keys: Vec<ColumnKeys>,
+    key_bytes: Vec<u8>,
     tail: Vec<u8>,
     index: Vec<u8>,
     position: FileOffset,
@@ -66,6 +78,8 @@ impl FooterWriter {
             hashes: Vec::with_capacity(MOST_BLOCK_ROWS),
             entries: Vec::with_capacity(most_blocks.0 as usize),
             columns: Vec::with_capacity(MAX_COLUMNS),
+            column_keys: Vec::with_capacity(MAX_COLUMNS),
+            key_bytes: Vec::with_capacity(MAX_COLUMNS * 2 * MAX_KEY_BYTES as usize),
             tail: vec![0; MAX_TAIL_BYTES],
             index: vec![0; ROW_BLOCK_BYTES],
             position: FileOffset(0),
@@ -97,6 +111,19 @@ impl FooterWriter {
         &self.columns
     }
 
+    /// Read one column's facts for the summary
+    pub fn column_facts(&self, index: usize) -> ColumnFacts<'_> {
+        let keys = self.column_keys[index];
+        let tail = &self.columns[index];
+        ColumnFacts {
+            column: tail.column,
+            lowest: &self.key_bytes[keys.lowest_at..keys.highest_at],
+            highest: &self.key_bytes[keys.highest_at..keys.end],
+            row_count: tail.row_count,
+            grave_count: tail.grave_count,
+        }
+    }
+
     /// Start a footer right after a segment's records
     pub fn start(&mut self, data_end: FileOffset, place_base: WritePlace) {
         self.place_base = place_base;
@@ -105,6 +132,8 @@ impl FooterWriter {
         self.hashes.clear();
         self.entries.clear();
         self.columns.clear();
+        self.column_keys.clear();
+        self.key_bytes.clear();
         self.position = data_end;
         self.places = PlaceRange {
             lowest: WritePlace(u64::MAX),
@@ -117,6 +146,15 @@ impl FooterWriter {
     pub fn start_column<File: IoFile>(&mut self, file: &File, start: &ColumnStart) -> Result<()> {
         self.close_block(file)?;
         let shared = shared_prefix(start.lowest, start.highest);
+        let lowest_at = self.key_bytes.len();
+        self.key_bytes.extend_from_slice(start.lowest);
+        let highest_at = self.key_bytes.len();
+        self.key_bytes.extend_from_slice(start.highest);
+        self.column_keys.push(ColumnKeys {
+            lowest_at,
+            highest_at,
+            end: self.key_bytes.len(),
+        });
         self.columns.push(ColumnTail {
             column: start.column,
             shared_length: shared as u16,

@@ -1,5 +1,6 @@
 //! Everything a store shares between its threads
 
+use std::io::Error;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
@@ -25,6 +26,7 @@ use crate::segment::block_cache::BlockCache;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::footer_reader::FooterReader;
 use crate::segment::segment_tail::SegmentNumber;
+use crate::segment::summary::write_summary;
 use crate::superblock::Superblock;
 use crate::write_order::WriteOrder;
 
@@ -147,6 +149,12 @@ impl<Backend: Io> EngineState<Backend> {
     /// Read the write mark a new read starts from
     pub fn read_point(&self) -> WritePlace {
         self.order.mark()
+    }
+
+    /// Write a volume's summary whole, and only its own seal, a clear and close wait on the lock
+    pub fn save_summary(&self, volume: &Volume<Backend>) -> Result<(), Error> {
+        let rows = hold(&volume.summary);
+        write_summary(&self.io, &volume.summary_paths, self.read_point(), rows.bytes())
     }
 
     /// Take the next segment number, reserving more in every superblock when they run out

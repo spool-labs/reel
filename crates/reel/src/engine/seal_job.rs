@@ -23,6 +23,7 @@ use crate::segment::column_directory::DirectoryEntry;
 use crate::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
 use crate::segment::row_block::FooterRow;
 use crate::segment::segment_tail::{BlockCount, SegmentNumber};
+use crate::segment::summary::SegmentFacts;
 
 /// Rows one step of a seal handles
 pub const SEAL_STEP_ROWS: u64 = 1_024;
@@ -58,6 +59,8 @@ pub enum SealPhase {
     Writing,
     /// The footer is durable, and the segment goes into the table
     Installing,
+    /// The table has the segment, and its summary row goes to disk
+    Summarizing,
     /// The table has the segment, and the rows file goes
     DiscardingRows,
     /// The table has the segment, and every lower place has yet to reach the index
@@ -83,6 +86,7 @@ pub struct SealJob<Backend: Io> {
     pub last_column: Option<ColumnId>,
     pub is_in_table: bool,
     pub columns_listed: usize,
+    pub is_summarized: bool,
 }
 
 impl<Backend: Io> SealJob<Backend> {
@@ -102,6 +106,7 @@ impl<Backend: Io> SealJob<Backend> {
             last_column: None,
             is_in_table: false,
             columns_listed: 0,
+            is_summarized: false,
         }
     }
 
@@ -152,6 +157,7 @@ impl<Backend: Io> SealJob<Backend> {
         self.column = None;
         self.is_in_table = false;
         self.columns_listed = 0;
+        self.is_summarized = false;
         self.phase = SealPhase::Writing;
         Ok(())
     }
@@ -198,6 +204,35 @@ impl<Backend: Io> SealJob<Backend> {
             .finish(&target.data, target.number, target.data_end, b"", state.record_key)?;
         self.totals = Some(totals);
         self.phase = SealPhase::Installing;
+        Ok(())
+    }
+
+    /// Add the segment's summary row and save the summary, once however often this retries
+    pub fn summarize(&mut self, target: &SealTarget<Backend::File>) -> Result<()> {
+        let Some(totals) = self.totals else {
+            return Err(Error::other("seal summarizing with no footer"));
+        };
+        let state = Arc::clone(&self.state);
+        let volume = &state.volumes[self.volume];
+        if !self.is_summarized {
+            let facts = SegmentFacts {
+                segment: target.number,
+                file_length: totals.file_length,
+                data_end: target.data_end,
+                row_block_end: totals.head.index_at,
+                seal_mark: totals.head.index_sum,
+                places: totals.head.places,
+                is_damaged: false,
+            };
+            let writer = &self.writer;
+            let columns = (0..writer.columns().len()).map(|index| writer.column_facts(index));
+            // a row that won't fit costs nothing until the segment is damaged, and then its columns count whole
+            let _is_kept = hold(&volume.summary).push(&facts, columns, [].into_iter());
+            self.is_summarized = true;
+        }
+
+        state.save_summary(volume)?;
+        self.phase = SealPhase::DiscardingRows;
         Ok(())
     }
 
@@ -254,7 +289,7 @@ impl<Backend: Io> SealJob<Backend> {
             self.columns_listed += 1;
         }
 
-        self.phase = SealPhase::DiscardingRows;
+        self.phase = SealPhase::Summarizing;
         Ok(())
     }
 
@@ -361,6 +396,7 @@ impl<Backend: Io> SealJob<Backend> {
             SealPhase::Idle
             | SealPhase::Writing
             | SealPhase::Installing
+            | SealPhase::Summarizing
             | SealPhase::DiscardingRows
             | SealPhase::HandingOver => false,
         }
@@ -371,7 +407,10 @@ impl<Backend: Io> SealJob<Backend> {
         if self.phase == SealPhase::Writing {
             self.phase = SealPhase::Draining;
         }
-        let is_past_footer = matches!(self.phase, SealPhase::Installing | SealPhase::DiscardingRows);
+        let is_past_footer = matches!(
+            self.phase,
+            SealPhase::Installing | SealPhase::Summarizing | SealPhase::DiscardingRows
+        );
         let is_retryable = error.kind() == ErrorKind::StorageFull || is_past_footer;
         if !is_retryable {
             self.volume().fail();
@@ -402,6 +441,7 @@ impl<Backend: Io> SealJob<Backend> {
             },
             SealPhase::Writing => self.write_rows(target),
             SealPhase::Installing => self.install(target),
+            SealPhase::Summarizing => self.summarize(target),
             SealPhase::DiscardingRows => self.discard_rows(target),
             SealPhase::AwaitingMark => {
                 self.start_hand_over(target);

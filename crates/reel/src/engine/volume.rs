@@ -11,7 +11,10 @@ use crate::engine::open_segment::{OpenSegment, SegmentPhase};
 use crate::guard::hold;
 use crate::index::open_slots::{OpenSlot, OpenSlots};
 use crate::io::Io;
+use crate::segment::damage_list::DamageList;
 use crate::segment::segment_table::SegmentTable;
+use crate::segment::segment_tail::SegmentNumber;
+use crate::segment::summary::{SummaryPaths, SummaryRows};
 use crate::superblock::SuperblockPaths;
 
 /// Where a volume's sync stands
@@ -48,6 +51,10 @@ pub struct Volume<Backend: Io> {
     pub is_failed: AtomicBool,
     pub segment_bytes: ByteCount,
     pub segment_rows: RowCount,
+    pub summary: Mutex<SummaryRows>,
+    pub summary_paths: SummaryPaths,
+    pub damage: DamageList,
+    pub damaged: Mutex<Vec<SegmentNumber>>,
     pub reserve: ByteCount,
 }
 

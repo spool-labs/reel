@@ -3,6 +3,7 @@
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::little_endian::read_half;
 use crate::row_kind::RowKind;
 use crate::segment::varint::{MAX_VARINT_BYTES, read_varint, write_varint};
 
@@ -314,14 +315,6 @@ pub fn read_block_header(bytes: &[u8]) -> Option<BlockHeader> {
         block_length: read_half(header, HEADER_BLOCK_LENGTH_AT)?,
         filter_length: read_half(header, HEADER_FILTER_LENGTH_AT)?,
     })
-}
-
-/// Read a little-endian half word
-pub fn read_half(bytes: &[u8], at: usize) -> Option<u32> {
-    let slice = bytes.get(at..at + size_of::<u32>())?;
-    let mut half = [0; size_of::<u32>()];
-    half.copy_from_slice(slice);
-    Some(u32::from_le_bytes(half))
 }
 
 /// Count the bytes two keys share at the front

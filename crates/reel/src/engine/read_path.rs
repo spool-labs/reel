@@ -110,6 +110,7 @@ impl<Backend: Io> EngineState<Backend> {
         buf: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
         let volume = &self.volumes[read.info.volume.0 as usize];
+        self.check_damage(volume, read)?;
 
         for _try in 0..MOST_READ_TRIES {
             let found = self.index.lookup(read.column, read.key, read.read_point, volume.view());
@@ -158,10 +159,27 @@ impl<Backend: Io> EngineState<Backend> {
         })
     }
 
+    /// Refuse a key whose newest row could be in a damaged segment: the row found must be above it
+    pub fn check_damage(&self, volume: &Volume<Backend>, read: &KeyRead) -> Result<(), StoreError> {
+        let Some(highest) = volume.damage.covering(read.column, read.key) else {
+            return Ok(());
+        };
+
+        let found = self.index.lookup(read.column, read.key, read.read_point, volume.view());
+        let sealed = self.search_footers(volume, read)?;
+        let newest = newest_of(found.row, sealed);
+        match newest.place() {
+            Some(place) if place > highest => Ok(()),
+            Some(_at_or_below) => Err(corruption(read)),
+            None => Err(corruption(read)),
+        }
+    }
+
     /// Say whether a key has a value at a read point, without reading the value
     pub fn contains_at(&self, column: ColumnId, key: &[u8], read_point: WritePlace) -> Result<bool, StoreError> {
         let read = self.key_read(column, key, read_point, false)?;
         let volume = &self.volumes[read.info.volume.0 as usize];
+        self.check_damage(volume, &read)?;
         let found = self.index.lookup(column, key, read_point, volume.view());
         if let Some(row) = found.row
             && !found.should_ask_footers

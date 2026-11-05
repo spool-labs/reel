@@ -1,13 +1,16 @@
 //! Open's reading of the roots: sealed segments from their tails, open ones from their rows
 
+use std::collections::BTreeSet;
 use std::io::{Error, ErrorKind, IoSlice, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
 
+use crate::config::MAX_KEY_BYTES;
 use crate::engine::engine_sizing::GROUP_BYTES;
 use crate::engine::engine_state::{EngineState, SlotData};
 use crate::engine::open_segment::{DATA_SUFFIX, OpenSegment, SegmentPhase, data_path, parse_segment, rows_path};
@@ -23,12 +26,17 @@ use crate::record::record_check::{RecordIdentity, RecordKey};
 use crate::record::record_head::SMALL_HEAD_BYTES;
 use crate::record::record_reader::{RecordLocation, RecordRead, RecordReader};
 use crate::row_kind::RowKind;
-use crate::rows::row_group::{GROUP_HEADER_BYTES, RowEntry, TOTAL_LENGTH_AT, parse_group, read_half};
+use crate::little_endian::read_half;
+use crate::rows::row_group::{GROUP_HEADER_BYTES, RowEntry, TOTAL_LENGTH_AT, parse_group};
 use crate::segment::block_entry::BlockEntry;
 use crate::segment::column_directory::DirectoryEntry;
+use crate::segment::damage_list::DamagedRange;
 use crate::segment::footer_reader::FooterReader;
 use crate::segment::segment_table::{TABLE_SHARDS, TableSizing, shard_of};
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber, TailHead};
+use crate::segment::summary::{
+    ColumnFacts, SegmentFacts, SpanFacts, SummaryPaths, SummaryRow, SummaryRows, read_summary,
+};
 
 /// Steps a seal on the opening thread can take before open reports it stuck
 pub const MOST_INLINE_STEPS: u64 = 100_000_000;
@@ -53,6 +61,34 @@ pub struct FoundSealed<File> {
     pub entries: Vec<BlockEntry>,
 }
 
+/// A sealed segment whose copies of the tail or the index all fail
+#[derive(Clone, Debug)]
+pub struct FoundDamaged {
+    pub volume: usize,
+    pub number: SegmentNumber,
+    pub file_length: ByteCount,
+    pub head: Option<TailHead>,
+    pub columns: Vec<ColumnTail>,
+}
+
+/// A column's facts with its keys copied out of the summary
+#[derive(Clone, Debug)]
+pub struct OwnedColumn {
+    pub column: ColumnId,
+    pub lowest: Vec<u8>,
+    pub highest: Vec<u8>,
+    pub row_count: RowCount,
+    pub grave_count: RowCount,
+}
+
+/// A volume's summary as open found it
+#[derive(Debug)]
+pub struct SummaryFound {
+    pub rows: SummaryRows,
+    pub paths: SummaryPaths,
+    pub mark: WritePlace,
+}
+
 /// A segment with no valid tail and a rows file
 #[derive(Debug)]
 pub struct FoundOpen<File> {
@@ -67,7 +103,7 @@ pub struct FoundOpen<File> {
 pub struct RootScan<File> {
     pub sealed: Vec<FoundSealed<File>>,
     pub open: Vec<FoundOpen<File>>,
-    pub damaged: u64,
+    pub damaged: Vec<FoundDamaged>,
     pub highest_place: WritePlace,
     pub highest_segment: SegmentNumber,
 }
@@ -152,7 +188,7 @@ pub fn scan_roots<Backend: Io>(
     let mut scan = RootScan {
         sealed: Vec::new(),
         open: Vec::new(),
-        damaged: 0,
+        damaged: Vec::new(),
         highest_place: WritePlace(0),
         highest_segment: SegmentNumber(0),
     };
@@ -186,9 +222,14 @@ pub fn sort_segment<Backend: Io>(
         let mut entries = Vec::new();
         if !reader.read_index(&file, &head, &mut entries)? {
             scan.highest_place = scan.highest_place.max(head.places.highest);
-            // the file stays for an operator, and the rest of the store keeps serving
-            scan.damaged += 1;
-            io.close_file(file);
+            // the file stays, and open decides what its ranges are once it has read the summary
+            scan.damaged.push(FoundDamaged {
+                volume: listing.volume,
+                number,
+                file_length: file.length()?,
+                head: Some(head),
+                columns,
+            });
             return Ok(());
         }
         scan.highest_place = scan.highest_place.max(head.places.highest);
@@ -214,13 +255,21 @@ pub fn sort_segment<Backend: Io>(
     }
 
     let is_empty = holds_nothing(&file)?;
+    let file_length = file.length()?;
     io.close_file(file);
     if is_empty {
         // a crash between creating the two files of a segment leaves this
         io.remove_file(&data_path(&listing.path, number))?;
-    } else {
-        scan.damaged += 1;
+        return Ok(());
     }
+
+    scan.damaged.push(FoundDamaged {
+        volume: listing.volume,
+        number,
+        file_length,
+        head: None,
+        columns,
+    });
     Ok(())
 }
 
@@ -673,4 +722,303 @@ pub fn read_group<File: IoFile>(rows: &File, at: FileOffset, end: ByteCount, byt
     }
     rows.read_exact_at(at, &mut bytes[..length])?;
     Ok(Some(length))
+}
+
+/// Read each volume's summary, which open reads after the tails
+pub fn read_summaries<Backend: Io>(
+    io: &Backend,
+    roots: &[(usize, Vec<PathBuf>)],
+) -> Result<Vec<SummaryFound>> {
+    let mut found = Vec::with_capacity(roots.len());
+    for (_volume, paths) in roots {
+        let summary_paths = SummaryPaths::new(&paths[0]);
+        let mut rows = SummaryRows::new(ByteCount(0));
+        let mark = read_summary(io, &summary_paths, &mut rows)?;
+        found.push(SummaryFound {
+            rows,
+            paths: summary_paths,
+            mark: mark.unwrap_or(WritePlace(0)),
+        });
+    }
+    Ok(found)
+}
+
+/// Bring each volume's summary in line with what the tails say, and mark what's damaged
+pub fn settle_summaries<Backend: Io>(
+    state: &EngineState<Backend>,
+    sealed: &[FoundSealed<Backend::File>],
+    damaged: &[FoundDamaged],
+) -> Result<WritePlace> {
+    let mut highest = WritePlace(0);
+    for (index, volume) in state.volumes.iter().enumerate() {
+        let mut present = BTreeSet::new();
+        for found in sealed {
+            if found.volume == index {
+                present.insert(found.head.segment);
+            }
+        }
+        for found in damaged {
+            if found.volume == index {
+                present.insert(found.number);
+            }
+        }
+
+        let mut rows = hold(&volume.summary);
+        rows.keep_where(|row| present.contains(&row.facts.segment));
+        for row in rows.rows() {
+            if row.facts.places.highest.0 != u64::MAX {
+                highest = highest.max(row.facts.places.highest);
+            }
+        }
+    }
+
+    let mut reader = FooterReader::new();
+    for found in sealed {
+        check_sealed_row(state, found, &mut reader)?;
+    }
+    for found in damaged {
+        open_damaged(state, found);
+    }
+    for volume in &state.volumes {
+        state.save_summary(volume)?;
+    }
+    Ok(highest)
+}
+
+/// Check a sealed segment's row against its tail, and build the row again when it fails
+pub fn check_sealed_row<Backend: Io>(
+    state: &EngineState<Backend>,
+    found: &FoundSealed<Backend::File>,
+    reader: &mut FooterReader,
+) -> Result<()> {
+    let volume = &state.volumes[found.volume];
+    let facts = SegmentFacts {
+        segment: found.head.segment,
+        file_length: found.file.length()?,
+        data_end: found.head.data_end,
+        row_block_end: found.head.index_at,
+        seal_mark: found.head.index_sum,
+        places: found.head.places,
+        is_damaged: false,
+    };
+
+    let mut rows = hold(&volume.summary);
+    if let Some(row) = rows.get(facts.segment) {
+        let is_trusted = SegmentFacts { is_damaged: false, ..row.facts } == facts;
+        if is_trusted {
+            // spans outlive the fault that made them, and only clear_damage ends them
+            if row.facts.is_damaged {
+                let ranges = row_ranges(&row, facts.segment, &mut Vec::new());
+                for range in ranges {
+                    volume.damage.add(range);
+                }
+                hold(&volume.damaged).push(facts.segment);
+            }
+            return Ok(());
+        }
+    }
+    rows.remove(facts.segment);
+
+    let mut keys = Vec::with_capacity(found.columns.len());
+    for column in &found.columns {
+        let first = column.first_block as usize;
+        let lines = &found.entries[first..first + column.block_count.0 as usize];
+        let mut lowest = Vec::new();
+        let mut highest = Vec::new();
+        if !reader.edge_keys(&found.file, lines, found.head.place_base, &mut lowest, &mut highest)? {
+            // a block that can't be read gets the widest range, which can only ask too much of a read
+            lowest.clear();
+            highest = vec![u8::MAX; MAX_KEY_BYTES as usize];
+        }
+        keys.push((lowest, highest));
+    }
+
+    let columns = found.columns.iter().zip(keys.iter()).map(|(column, edges)| ColumnFacts {
+        column: column.column,
+        lowest: &edges.0,
+        highest: &edges.1,
+        row_count: column.row_count,
+        grave_count: column.grave_count,
+    });
+    // a row that won't fit costs nothing until the segment is damaged, and then its columns count whole
+    let _is_kept = rows.push(&facts, columns, [].into_iter());
+    Ok(())
+}
+
+/// Turn a damaged segment's summary row, or what's left of it, into ranges reads must respect
+pub fn open_damaged<Backend: Io>(state: &EngineState<Backend>, found: &FoundDamaged) {
+    let volume = &state.volumes[found.volume];
+    let mut ranges = Vec::new();
+    let mut facts = SegmentFacts {
+        segment: found.number,
+        file_length: found.file_length,
+        is_damaged: true,
+        ..SegmentFacts::default()
+    };
+    let mut columns: Vec<OwnedColumn> = Vec::new();
+
+    let rows = hold(&volume.summary);
+    let trusted = rows.get(found.number).filter(|row| is_row_trusted(row, found));
+    if let Some(row) = trusted {
+        facts = row.facts;
+        facts.is_damaged = true;
+        ranges = row_ranges(&row, found.number, &mut columns);
+    }
+    let was_recorded = trusted.is_some();
+    drop(rows);
+
+    if !was_recorded {
+        fallback_ranges(state, found, &mut facts, &mut ranges);
+    }
+
+    for range in &ranges {
+        volume.damage.add(range.clone());
+    }
+    hold(&volume.damaged).push(found.number);
+    rewrite_row(volume, &facts, &columns, &ranges);
+}
+
+/// Check a row can speak for a damaged segment: its length always, and the tail's facts when one reads
+pub fn is_row_trusted(row: &SummaryRow, found: &FoundDamaged) -> bool {
+    if row.facts.file_length != found.file_length {
+        return false;
+    }
+    match &found.head {
+        Some(head) => row.facts.seal_mark == head.index_sum && row.facts.places == head.places,
+        None => true,
+    }
+}
+
+/// Read the damaged ranges a row gives, and copy its columns out
+pub fn row_ranges(row: &SummaryRow, segment: SegmentNumber, columns: &mut Vec<OwnedColumn>) -> Vec<DamagedRange> {
+    let mut ranges = Vec::new();
+    let highest_place = row.facts.places.highest;
+    let mut cursor = row.cursor();
+    for _column in 0..row.column_count {
+        let Some(column) = cursor.column() else {
+            break;
+        };
+        columns.push(OwnedColumn {
+            column: column.column,
+            lowest: column.lowest.to_vec(),
+            highest: column.highest.to_vec(),
+            row_count: column.row_count,
+            grave_count: column.grave_count,
+        });
+    }
+
+    if row.facts.is_damaged {
+        // the spans a row keeps are all that's left, since a caller may have cleared the rest
+        for _span in 0..row.span_count {
+            let Some(span) = cursor.span() else {
+                break;
+            };
+            ranges.push(DamagedRange {
+                column: span.column,
+                segment,
+                highest_place,
+                start: span.start.to_vec(),
+                end: span.end.map(<[u8]>::to_vec),
+            });
+        }
+        return ranges;
+    }
+
+    for column in columns.iter() {
+        let mut end = column.highest.clone();
+        end.push(0);
+        ranges.push(DamagedRange {
+            column: column.column,
+            segment,
+            highest_place,
+            start: column.lowest.clone(),
+            end: Some(end),
+        });
+    }
+    ranges
+}
+
+/// Cover whole columns when no row can speak for a damaged segment
+pub fn fallback_ranges<Backend: Io>(
+    state: &EngineState<Backend>,
+    found: &FoundDamaged,
+    facts: &mut SegmentFacts,
+    ranges: &mut Vec<DamagedRange>,
+) {
+    let highest_place = match &found.head {
+        Some(head) => {
+            facts.places = head.places;
+            facts.data_end = head.data_end;
+            facts.row_block_end = head.index_at;
+            facts.seal_mark = head.index_sum;
+            head.places.highest
+        },
+        None => {
+            facts.places.highest = WritePlace(u64::MAX);
+            WritePlace(u64::MAX)
+        },
+    };
+
+    let mut add = |column: ColumnId| {
+        ranges.push(DamagedRange {
+            column,
+            segment: found.number,
+            highest_place,
+            start: Vec::new(),
+            end: None,
+        });
+    };
+    if found.head.is_some() {
+        for column in &found.columns {
+            add(column.column);
+        }
+        return;
+    }
+    for (id, info) in state.columns.iter().enumerate() {
+        if info.is_some_and(|info| info.volume.0 as usize == found.volume) {
+            add(ColumnId(id as u8));
+        }
+    }
+}
+
+/// Replace a segment's row with one that keeps these spans
+pub fn rewrite_row<Backend: Io>(
+    volume: &Volume<Backend>,
+    facts: &SegmentFacts,
+    columns: &[OwnedColumn],
+    ranges: &[DamagedRange],
+) {
+    let mut rows = hold(&volume.summary);
+    rows.remove(facts.segment);
+    let column_facts = columns.iter().map(|column| ColumnFacts {
+        column: column.column,
+        lowest: &column.lowest,
+        highest: &column.highest,
+        row_count: column.row_count,
+        grave_count: column.grave_count,
+    });
+    let spans = ranges.iter().map(|range| SpanFacts {
+        column: range.column,
+        start: &range.start,
+        end: range.end.as_deref(),
+    });
+    // a row that won't fit leaves the segment with no row, and open then covers its columns whole
+    let _is_kept = rows.push(facts, column_facts, spans);
+}
+
+/// Record a cleared span in every damaged segment's row
+pub fn save_cleared_spans<Backend: Io>(volume: &Volume<Backend>) {
+    let numbers = hold(&volume.damaged).clone();
+    for number in numbers {
+        let ranges = volume.damage.of_segment(number);
+        let mut columns = Vec::new();
+        let rows = hold(&volume.summary);
+        let Some(row) = rows.get(number) else {
+            continue;
+        };
+        let facts = row.facts;
+        let _ranges_in_row = row_ranges(&row, number, &mut columns);
+        drop(rows);
+        rewrite_row(volume, &facts, &columns, &ranges);
+    }
 }

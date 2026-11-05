@@ -4,6 +4,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
+use crate::little_endian::{read_half, read_word};
 use crate::record::record_check::RecordKey;
 use crate::row_kind::RowKind;
 
@@ -192,20 +193,4 @@ pub fn parse_group(bytes: &[u8], record_key: RecordKey) -> Option<ParsedGroup<'_
         total_length: ByteCount(total as u64),
         synced_through: FileOffset(read_word(header, SYNCED_THROUGH_AT)?),
     })
-}
-
-/// Read a little-endian word
-pub fn read_word(bytes: &[u8], at: usize) -> Option<u64> {
-    let slice = bytes.get(at..at + size_of::<u64>())?;
-    let mut word = [0; size_of::<u64>()];
-    word.copy_from_slice(slice);
-    Some(u64::from_le_bytes(word))
-}
-
-/// Read a little-endian half word
-pub fn read_half(bytes: &[u8], at: usize) -> Option<u32> {
-    let slice = bytes.get(at..at + size_of::<u32>())?;
-    let mut half = [0; size_of::<u32>()];
-    half.copy_from_slice(slice);
-    Some(u32::from_le_bytes(half))
 }

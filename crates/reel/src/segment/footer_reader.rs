@@ -231,6 +231,39 @@ impl FooterReader {
         Ok(FooterAnswer::Absent)
     }
 
+    /// Read a column's first and last key from its first and last row blocks
+    pub fn edge_keys<File: IoFile>(
+        &mut self,
+        file: &File,
+        lines: &[BlockEntry],
+        place_base: WritePlace,
+        lowest: &mut Vec<u8>,
+        highest: &mut Vec<u8>,
+    ) -> Result<bool> {
+        let (Some(first), Some(last)) = (lines.first(), lines.last()) else {
+            return Ok(false);
+        };
+
+        let length = first.block_length().0 as usize;
+        file.read_exact_at(first.block_at(), &mut self.block[..length])?;
+        let Some(mut walk) = RowBlockWalk::open(&self.block[..length], place_base) else {
+            return Ok(false);
+        };
+        lowest.clear();
+        if walk.next_row(lowest).is_none() {
+            return Ok(false);
+        }
+
+        let length = last.block_length().0 as usize;
+        file.read_exact_at(last.block_at(), &mut self.block[..length])?;
+        let Some(mut walk) = RowBlockWalk::open(&self.block[..length], place_base) else {
+            return Ok(false);
+        };
+        highest.clear();
+        while walk.next_row(highest).is_some() {}
+        Ok(true)
+    }
+
     /// Search one window of block lines, through the caches
     pub fn lookup_window<File: IoFile>(
         &mut self,

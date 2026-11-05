@@ -1,6 +1,6 @@
 use reel::engine::engine_sizing::*;
 use reel::index::open_slots::MAX_OPEN_SLOTS;
-use reel_api::units::ByteCount;
+use reel_api::units::{ByteCount, RowCount};
 
 // the default budget gets near-gigabyte segments, and a small one scales down
 #[test]
@@ -32,4 +32,19 @@ fn least_budget() {
 
     assert!(plain.least_budget() < LEAST_LZ4_BUDGET);
     assert_eq!(lz4.least_budget().0, plain.least_budget().0 + LZ4_STORED_LIMIT.0);
+}
+
+// the rows a segment takes at each budget, as `SEAL_ROWS_EIGHTHS` documents them
+#[test]
+fn documented_rows() {
+    for (mib, rows) in [(128, 62_967), (192, 155_353), (512, 617_281), (4_096, 5_790_871)] {
+        let store = StoreShape {
+            budget: ByteCount(mib * 1024 * 1024),
+            roots: 1,
+            volumes: 1,
+            has_lz4: true,
+        };
+
+        assert_eq!(EngineSizing::for_store(&store).segment_rows, RowCount(rows), "{mib} MiB");
+    }
 }

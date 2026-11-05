@@ -44,6 +44,16 @@ const SYNCED_FILES: [&str; 4] = ["data", "rows", "summary", "new"];
 const MOST_SYNC_SKIP: u64 = 6;
 const BATCH_SETS: u64 = 6;
 const SET_KEYS: u64 = 3;
+const LONG_SET_ODDS: u64 = 40;
+const LONG_SET_ROWS: u64 = 7_000;
+const STREAM_MIX: u64 = 0x100_0000_01B3;
+const ODDS_SCALE: u64 = 10;
+const WRITE_ODDS: u64 = 3;
+const SET_ODDS: u64 = 1;
+const FLUSH_ODDS: u64 = 1;
+const SEAL_ODDS: u64 = 1;
+const STEP_ODDS: u64 = 2;
+const READ_ODDS: u64 = 2;
 
 type Store = ReelStore<SimulatedIo>;
 type Key = (ColumnId, Vec<u8>);
@@ -60,10 +70,45 @@ struct Versions {
 /// A plain map of versions
 type Model = BTreeMap<Key, Versions>;
 
+/// One random stream per kind of step, so a new kind leaves the draws of the others as they are
+struct Streams {
+    open: SeededRandom,
+    crash: SeededRandom,
+    fault: SeededRandom,
+    rot: SeededRandom,
+    write: SeededRandom,
+    set: SeededRandom,
+    flush: SeededRandom,
+    seal: SeededRandom,
+    step: SeededRandom,
+    read: SeededRandom,
+}
+
+impl Streams {
+    fn new(seed: u64) -> Self {
+        let stream = |kind: &str| {
+            let tag = kind.bytes().fold(seed, |tag, byte| tag.wrapping_mul(STREAM_MIX).wrapping_add(u64::from(byte)));
+            SeededRandom::new(Seed(tag))
+        };
+        Self {
+            open: stream("open"),
+            crash: stream("crash"),
+            fault: stream("fault"),
+            rot: stream("rot"),
+            write: stream("write"),
+            set: stream("set"),
+            flush: stream("flush"),
+            seal: stream("seal"),
+            step: stream("step"),
+            read: stream("read"),
+        }
+    }
+}
+
 /// One seeded run
 struct Run {
     io: SimulatedIo,
-    random: SeededRandom,
+    streams: Streams,
     model: Model,
     seed: u64,
     has_rot: bool,
@@ -194,6 +239,11 @@ fn durable_rows(io: &SimulatedIo, path: &Path) -> Option<(u64, u64)> {
     Some((covered, data_end))
 }
 
+fn random_key(random: &mut SeededRandom) -> Key {
+    let column = COLUMNS[random.below(COLUMNS.len() as u64) as usize];
+    (column, format!("key-{:04}", random.below(KEY_SPACE)).into_bytes())
+}
+
 fn set_key(set: u64, number: u64) -> Vec<u8> {
     format!("set-{set:02}-{number}").into_bytes()
 }
@@ -203,7 +253,7 @@ impl Run {
         Self {
             seed,
             io: SimulatedIo::new(Seed(seed)),
-            random: SeededRandom::new(Seed(seed)),
+            streams: Streams::new(seed),
             model: Model::new(),
             has_rot,
             policy: match seed % 3 {
@@ -219,10 +269,10 @@ impl Run {
     fn open(&mut self) -> Store {
         let mut last_error = None;
         for _try in 0..MOST_OPENS {
-            if self.random.one_in(2) {
-                self.io.arm_crash(OperationCount(self.random.below(MOST_OPEN_DELAY)));
+            if self.streams.open.one_in(2) {
+                self.io.arm_crash(OperationCount(self.streams.open.below(MOST_OPEN_DELAY)));
             }
-            if self.random.one_in(4) {
+            if self.streams.open.one_in(4) {
                 self.arm_fault();
             }
             let opened = ReelStore::open(self.io.clone(), &config(self.policy));
@@ -244,23 +294,23 @@ impl Run {
     }
 
     fn crash(&mut self) {
-        match self.random.one_in(2) {
+        match self.streams.crash.one_in(2) {
             true => self.io.power_cut(),
             false => self.io.kill(),
         }
     }
 
     fn arm_fault(&mut self) {
-        let count = OperationCount(1 + self.random.below(3));
-        match self.random.below(6) {
+        let count = OperationCount(1 + self.streams.fault.below(3));
+        match self.streams.fault.below(6) {
             0 => self.io.fail_syncs(count),
             1 => self.io.fill_writes(count),
             2 => self.io.fail_writes(count),
             3 => self.io.fail_creates(count),
             4 => self.io.fail_directory_syncs(count),
             _last => {
-                let file = SYNCED_FILES[self.random.below(SYNCED_FILES.len() as u64) as usize];
-                self.io.fail_file_sync(file, OperationCount(self.random.below(MOST_SYNC_SKIP)));
+                let file = SYNCED_FILES[self.streams.fault.below(SYNCED_FILES.len() as u64) as usize];
+                self.io.fail_file_sync(file, OperationCount(self.streams.fault.below(MOST_SYNC_SKIP)));
             },
         }
     }
@@ -279,7 +329,7 @@ impl Run {
         if self.io.is_crashed() {
             return;
         }
-        match self.random.below(10) {
+        match self.streams.rot.below(10) {
             0 => self.rot_rows(),
             1 => self.rot_summary(),
             _data => self.rot_data(),
@@ -288,7 +338,7 @@ impl Run {
 
     // rot in the summary costs rows that open builds again from the tails
     fn rot_summary(&mut self) {
-        let root = Path::new(ROOTS[self.random.below(2) as usize * 2]);
+        let root = Path::new(ROOTS[self.streams.rot.below(2) as usize * 2]);
         let paths = SummaryPaths::new(root);
         let Ok(file) = self.io.open_read_only(&paths.current) else {
             return;
@@ -298,14 +348,14 @@ impl Run {
         if let Ok(ByteCount(length)) = length
             && length > 0
         {
-            let at = self.random.below(length);
+            let at = self.streams.rot.below(length);
             let _rotted = self.io.rot(&paths.current, FileOffset(at), BitMask(1));
         }
     }
 
     // rot in what a surviving mark covers, since rot in a synced group with its mark lost reads as a torn end
     fn rot_rows(&mut self) {
-        let root = ROOTS[self.random.below(ROOTS.len() as u64) as usize];
+        let root = ROOTS[self.streams.rot.below(ROOTS.len() as u64) as usize];
         let Ok(listing) = self.io.list_directory(Path::new(root)) else {
             return;
         };
@@ -313,12 +363,12 @@ impl Run {
         if rows.is_empty() {
             return;
         }
-        let path = rows[self.random.below(rows.len() as u64) as usize];
+        let path = rows[self.streams.rot.below(rows.len() as u64) as usize];
         let Some((covered, _data_end)) = durable_rows(&self.io, path) else {
             return;
         };
         if covered > 0 {
-            let at = self.random.below(covered);
+            let at = self.streams.rot.below(covered);
             let _rotted = self.io.rot(path, FileOffset(at), BitMask(1));
         }
     }
@@ -328,7 +378,7 @@ impl Run {
         if files.is_empty() {
             return;
         }
-        let path = &files[self.random.below(files.len() as u64) as usize];
+        let path = &files[self.streams.rot.below(files.len() as u64) as usize];
         // an armed crash can fire on this very open
         let Ok(file) = self.io.open_read_only(path) else {
             return;
@@ -352,33 +402,28 @@ impl Run {
                 return;
             };
             if data_end > 0 {
-                let at = self.random.below(data_end);
+                let at = self.streams.rot.below(data_end);
                 let _rotted = self.io.rot(path, FileOffset(at), BitMask(1));
             }
             return;
         }
 
         // half of the rot lands in the footer end of the file, where few bytes hold a lot
-        let reach = if self.random.one_in(2) { length.min(TAIL_REACH) } else { length };
-        let at = length - 1 - self.random.below(reach);
+        let reach = if self.streams.rot.one_in(2) { length.min(TAIL_REACH) } else { length };
+        let at = length - 1 - self.streams.rot.below(reach);
         // a bad sector fails its reads for good, and rot leaves them passing with the wrong bytes
-        if self.random.one_in(3) {
+        if self.streams.rot.one_in(3) {
             self.io.bad_sector(path, FileOffset(at)).expect("bad");
             return;
         }
-        self.io.rot(path, FileOffset(at), BitMask(1 << self.random.below(8))).expect("rot");
-    }
-
-    fn random_key(&mut self) -> Key {
-        let column = COLUMNS[self.random.below(COLUMNS.len() as u64) as usize];
-        (column, format!("key-{:04}", self.random.below(KEY_SPACE)).into_bytes())
+        self.io.rot(path, FileOffset(at), BitMask(1 << self.streams.rot.below(8))).expect("rot");
     }
 
     fn write(&mut self, store: &Store) {
-        let (column, key) = self.random_key();
-        let is_grave = self.random.one_in(3);
-        let is_large = self.random.one_in(LARGE_VALUE_ODDS);
-        let mut bytes = format!("value-{}", self.random.next_word()).into_bytes();
+        let (column, key) = random_key(&mut self.streams.write);
+        let is_grave = self.streams.write.one_in(3);
+        let is_large = self.streams.write.one_in(LARGE_VALUE_ODDS);
+        let mut bytes = format!("value-{}", self.streams.write.next_word()).into_bytes();
         if is_large {
             bytes.resize(LARGE_VALUE_BYTES, b'x');
         }
@@ -402,10 +447,10 @@ impl Run {
 
     // a set's keys always hold one value, so a read of them after a crash shows a batch that landed in part
     fn write_set(&mut self, store: &Store) {
-        let column = COLUMNS[self.random.below(COLUMNS.len() as u64) as usize];
-        let set = self.random.below(BATCH_SETS);
-        let is_grave = self.random.one_in(4);
-        let bytes = format!("set-{}", self.random.next_word()).into_bytes();
+        let column = COLUMNS[self.streams.set.below(COLUMNS.len() as u64) as usize];
+        let set = self.streams.set.below(BATCH_SETS);
+        let is_grave = self.streams.set.one_in(4);
+        let bytes = format!("set-{}", self.streams.set.next_word()).into_bytes();
         let value = (!is_grave).then_some(bytes);
         let mut batch = WriteBatch::new();
         for number in 0..SET_KEYS {
@@ -415,6 +460,13 @@ impl Run {
             match &value {
                 Some(value) => batch.put(column, &key, value),
                 None => batch.delete(column, &key),
+            }
+        }
+
+        // now and then the batch runs past one group buffer, with graves no read looks at
+        if self.streams.set.one_in(LONG_SET_ODDS) {
+            for number in 0..LONG_SET_ROWS {
+                batch.delete(column, format!("filler-{number:05}").as_bytes());
             }
         }
 
@@ -452,7 +504,7 @@ impl Run {
     }
 
     fn check_read(&mut self, store: &Store) {
-        let (column, key) = self.random_key();
+        let (column, key) = random_key(&mut self.streams.read);
         let versions = self.model.entry((column, key.clone())).or_default();
         match read(store, column, &key) {
             Ok(found) => assert!(versions.check_live(Some(&found)), "seed {}: get of {key:?} read {found:?}, in {versions:?}", self.seed),
@@ -469,26 +521,35 @@ impl Run {
             if self.io.is_crashed() {
                 return true;
             }
-            if self.random.one_in(CRASH_ODDS) {
-                self.io.arm_crash(OperationCount(self.random.below(MOST_CRASH_DELAY)));
+            if self.streams.crash.one_in(CRASH_ODDS) {
+                self.io.arm_crash(OperationCount(self.streams.crash.below(MOST_CRASH_DELAY)));
             }
-            if self.random.one_in(FAULT_ODDS) {
+            if self.streams.fault.one_in(FAULT_ODDS) {
                 self.arm_fault();
             }
-            if self.has_rot && self.random.one_in(ROT_ODDS) {
+            if self.has_rot && self.streams.rot.one_in(ROT_ODDS) {
                 self.rot_one();
             }
 
-            match self.random.below(10) {
-                0..3 => self.write(store),
-                3 => self.write_set(store),
-                4 => self.flush(store),
-                5 => store.seal_now(),
-                6..8 => {
-                    self.io.step_any();
-                    self.io.advance_clock(SETTLE_TICK);
-                },
-                _read => self.check_read(store),
+            // each kind draws for itself, so a step can hold several, or none
+            if self.streams.write.below(ODDS_SCALE) < WRITE_ODDS {
+                self.write(store);
+            }
+            if !self.io.is_crashed() && self.streams.set.below(ODDS_SCALE) < SET_ODDS {
+                self.write_set(store);
+            }
+            if !self.io.is_crashed() && self.streams.flush.below(ODDS_SCALE) < FLUSH_ODDS {
+                self.flush(store);
+            }
+            if !self.io.is_crashed() && self.streams.seal.below(ODDS_SCALE) < SEAL_ODDS {
+                store.seal_now();
+            }
+            if !self.io.is_crashed() && self.streams.step.below(ODDS_SCALE) < STEP_ODDS {
+                self.io.step_any();
+                self.io.advance_clock(SETTLE_TICK);
+            }
+            if !self.io.is_crashed() && self.streams.read.below(ODDS_SCALE) < READ_ODDS {
+                self.check_read(store);
             }
         }
         false

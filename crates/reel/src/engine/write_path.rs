@@ -626,19 +626,24 @@ impl<Backend: Io> EngineState<Backend> {
         None
     }
 
-    /// Take the slot's writing turn and send its rows, in a sync when given the data file
-    pub fn write_out_turn(&self, slot: OpenSlot, rows: &Backend::File, data: Option<&Backend::File>) -> Result<(), Error> {
-        let index = slot.0 as usize;
+    /// Wait for the slot's writing turn, which keeps its groups in order
+    pub fn take_writing_turn(&self, slot: OpenSlot) {
         loop {
             {
-                let mut queue = hold(&self.queues[index]);
+                let mut queue = hold(&self.queues[slot.0 as usize]);
                 if !queue.is_writing {
                     queue.is_writing = true;
-                    break;
+                    return;
                 }
             }
             self.io.pause();
         }
+    }
+
+    /// Take the slot's writing turn and send its rows, in a sync when given the data file
+    pub fn write_out_turn(&self, slot: OpenSlot, rows: &Backend::File, data: Option<&Backend::File>) -> Result<(), Error> {
+        let index = slot.0 as usize;
+        self.take_writing_turn(slot);
 
         let mut outcome = self.send_group(slot, rows, data);
         if outcome.is_ok() && self.has_left_over_rows(slot) {

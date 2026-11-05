@@ -4,9 +4,11 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
-use reel::engine::batch_path::MOST_GROUP_ROW_BYTES;
 use reel::engine::reel_store::ReelStore;
+use reel::engine::open_segment::data_path;
 use reel::engine::write_path::ClaimRequest;
+use reel::guard::hold;
+use reel::index::open_slots::OpenSlot;
 use reel::io::{Io, IoFile};
 use reel::record::codec::Codec;
 use reel::rows::row_group::{RowEntry, parse_group};
@@ -15,6 +17,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, RowCount, VolumeId, WritePlace};
 use reel_api::write_batch::WriteBatch;
+use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
@@ -30,6 +33,9 @@ const CRASH_POINTS: u64 = 12;
 const LARGE_VALUE_BYTES: usize = 200_000;
 const FILLER_ROWS: u64 = 300;
 const ROOM_ROWS: u64 = 2_000;
+const LONG_ROWS: u64 = 18_000;
+const LONG_CRASH_POINTS: u64 = 6;
+const LONG_PIECES: u64 = 3;
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -273,34 +279,21 @@ fn across_volumes() {
     store.close().expect("close");
 }
 
-// rows past one group are refused whole, and a batch at the limit lands
+// rows past what a segment takes are refused whole
 #[test]
-fn group_limit() {
+fn row_limit() {
     let io = SimulatedIo::new(Seed(7));
     let store = open(&io);
+    store.put(PLAIN, &key_of(0), b"value").expect("put");
     let mut batch = WriteBatch::new();
-    let mut number = 0;
-    while batch_row_bytes(&batch) + ROW_BYTES <= MOST_GROUP_ROW_BYTES {
+    for number in 0..=store.state.volumes[0].segment_rows.0 {
         batch.delete(PLAIN, &key_of(number));
-        number += 1;
     }
-    store.put(PLAIN, &key_of(0), b"value").expect("put");
-    store.write_batch(&batch).expect("batch");
-    assert_eq!(read(&store, PLAIN, &key_of(0)).expect("get"), None);
 
-    store.put(PLAIN, &key_of(0), b"value").expect("put");
-    batch.delete(PLAIN, &key_of(number));
-
-    assert!(matches!(store.write_batch(&batch), Err(StoreError::BatchTooLarge { .. })));
+    assert!(matches!(store.write_batch(&batch), Err(StoreError::BatchTooManyRows { .. })));
 
     assert_eq!(read(&store, PLAIN, &key_of(0)).expect("get"), Some(b"value".to_vec()));
     store.close().expect("close");
-}
-
-const ROW_BYTES: usize = reel::rows::row_group::ROW_HEADER_BYTES + "key-000000".len();
-
-fn batch_row_bytes(batch: &WriteBatch) -> usize {
-    batch.len() * ROW_BYTES
 }
 
 // values past a segment are refused whole
@@ -355,4 +348,183 @@ fn seals_make_room() {
         assert_eq!(read(&store, PLAIN, &key_of(number)).expect("get"), Some(b"value".to_vec()));
     }
     store.close().expect("close");
+}
+
+// a batch of graves with rows past two buffers, so its group goes out in three pieces
+fn long_batch(value: Option<&[u8]>) -> WriteBatch {
+    let mut batch = WriteBatch::new();
+    for number in 0..LONG_ROWS {
+        match value {
+            Some(value) => batch.put(PLAIN, &key_of(number), value),
+            None => batch.delete(PLAIN, &key_of(number)),
+        }
+    }
+    batch
+}
+
+fn long_values(store: &Store) -> Vec<Option<Vec<u8>>> {
+    (0..LONG_ROWS).map(|number| read(store, PLAIN, &key_of(number)).expect("get")).collect()
+}
+
+fn assert_all(found: &[Option<Vec<u8>>], value: Option<&[u8]>) {
+    assert!(found.iter().all(|found| found.as_deref() == value), "{:?}", found.iter().find(|found| found.as_deref() != value));
+}
+
+// a group past the buffer is one group with consecutive places, and a walk in pieces brings every row back
+#[test]
+fn long_group() {
+    let io = SimulatedIo::new(Seed(11));
+    let store = open(&io);
+    store.put(PLAIN, b"before", b"value").expect("put");
+    store.flush().expect("flush");
+    let mark = store.state.read_point();
+
+    store.write_batch(&long_batch(Some(b"value"))).expect("batch");
+
+    assert_all(&long_values(&store), Some(b"value"));
+    store.flush().expect("flush");
+    let rows: Vec<Vec<(WritePlace, Vec<u8>)>> =
+        groups(&io).into_iter().filter(|group| group.iter().any(|row| row.1 == key_of(0))).collect();
+    assert_eq!(rows.len(), 1);
+    let places: Vec<u64> = rows[0].iter().map(|row| row.0.0).collect();
+    let expected: Vec<u64> = (1..=LONG_ROWS).map(|step| mark.0 + step).collect();
+    assert_eq!(places, expected);
+
+    io.kill();
+    drop(store);
+    let store = open(&io);
+    assert_all(&long_values(&store), Some(b"value"));
+    assert_eq!(read(&store, PLAIN, b"before").expect("get"), Some(b"value".to_vec()));
+    store.close().expect("close");
+}
+
+// a crash at any step of a long group leaves all of it or none, and a later reopen agrees
+#[test]
+fn long_crash() {
+    for crash_at in 0..LONG_CRASH_POINTS {
+        for is_power_cut in [false, true] {
+            let io = SimulatedIo::new(Seed(crash_at));
+            let store = open(&io);
+            store.write_batch(&long_batch(Some(b"older"))).expect("batch");
+            store.flush().expect("flush");
+
+            io.arm_crash(OperationCount(crash_at));
+            let written = store.write_batch(&long_batch(None));
+            let flushed = written.is_ok() && store.flush().is_ok() && !io.is_crashed();
+            if is_power_cut {
+                io.power_cut();
+            } else {
+                io.kill();
+            }
+            drop(store);
+
+            let store = open(&io);
+            let found = long_values(&store);
+            assert!(found.iter().all(|value| *value == found[0]), "crash at {crash_at}");
+            assert!(found[0].is_none() || !flushed, "crash at {crash_at}");
+            store.close().expect("close");
+        }
+    }
+}
+
+// a rows write that fails partway leaves nothing for a read, the store goes on, and open drops what it left
+#[test]
+fn long_failure() {
+    for writes_before_failure in 0..LONG_PIECES {
+        let io = SimulatedIo::new(Seed(12));
+        let store = open(&io);
+        store.write_batch(&long_batch(Some(b"older"))).expect("batch");
+        store.flush().expect("flush");
+
+        io.fail_writes_after(OperationCount(writes_before_failure));
+        let written = store.write_batch(&long_batch(None));
+        io.fail_writes(OperationCount(0));
+        assert!(written.is_err(), "{writes_before_failure} writes");
+
+        assert_all(&long_values(&store), Some(b"older"));
+        store.put(PLAIN, b"after", b"value").expect("put");
+        store.flush().expect("flush");
+        io.kill();
+        drop(store);
+
+        let store = open(&io);
+        assert_all(&long_values(&store), Some(b"older"));
+        assert_eq!(read(&store, PLAIN, b"after").expect("get"), Some(b"value".to_vec()));
+        store.close().expect("close");
+    }
+}
+
+// rows of a long batch seal like any others
+#[test]
+fn long_seal() {
+    let io = SimulatedIo::new(Seed(13));
+    let store = open(&io);
+    store.write_batch(&long_batch(Some(b"value"))).expect("batch");
+    let before = store.state.volumes[0].table.segment_count();
+    store.seal_now();
+    while store.state.volumes[0].table.segment_count() == before {
+        assert!(io.step_any().is_some());
+    }
+
+    assert_all(&long_values(&store), Some(b"value"));
+    store.close().expect("close");
+}
+
+// a batch shares its group with puts beside it, and a record the crash took drops every row of the group
+#[test]
+fn shared_group() {
+    let io = SimulatedIo::new(Seed(14));
+    let store = open(&io);
+    store.write_batch(&batch_of(b"older")).expect("batch");
+    store.put(PLAIN, b"beside", b"older").expect("put");
+    store.flush().expect("flush");
+
+    store.put(PLAIN, b"beside", b"newer").expect("put");
+    store.write_batch(&batch_of(b"newer")).expect("batch");
+    store.put(PLAIN, b"after", b"newer").expect("put");
+    let (slot, data) = open_data(&store);
+    store.state.write_out(slot).expect("write out");
+    let lost = last_record(&io, &key_of(2));
+    io.kill();
+    drop(store);
+    io.rot(&data, lost, BitMask(1)).expect("rot");
+
+    let store = open(&io);
+
+    assert_whole(&store, Some(b"older"));
+    assert_eq!(read(&store, PLAIN, b"beside").expect("get"), Some(b"older".to_vec()));
+    assert_eq!(read(&store, PLAIN, b"after").expect("get"), None);
+    store.close().expect("close");
+}
+
+// the slot and data file of the one open segment
+fn open_data(store: &Store) -> (OpenSlot, PathBuf) {
+    let claims = hold(&store.state.volumes[0].claims);
+    let segment = &claims.open[0];
+    (segment.slot, data_path(Path::new(ROOT), segment.number).to_path_buf())
+}
+
+// where the newest row of a key says its record sits
+fn last_record(io: &SimulatedIo, key: &[u8]) -> FileOffset {
+    let superblock = Superblock::read(io, Path::new(ROOT)).expect("read").expect("superblock");
+    let mut found = None;
+    for path in io.list_directory(Path::new(ROOT)).expect("list") {
+        if path.extension().is_none_or(|extension| extension != "rows") {
+            continue;
+        }
+        let file = io.open_read_only(&path).expect("open");
+        let mut bytes = vec![0; file.length().expect("length").0 as usize];
+        file.read_exact_at(FileOffset(0), &mut bytes).expect("read");
+        io.close_file(file);
+        let mut at = 0;
+        while let Some(group) = bytes.get(at..).and_then(|rest| parse_group(rest, superblock.record_key)) {
+            for row in group.walk() {
+                if row.key == key {
+                    found = Some(row.offset);
+                }
+            }
+            at += group.total_length.0 as usize;
+        }
+    }
+    found.expect("a row")
 }

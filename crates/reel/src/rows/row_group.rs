@@ -55,6 +55,14 @@ pub struct RowGroupBuffer {
     row_count: u32,
 }
 
+/// What a group's header says
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GroupHead {
+    pub row_count: RowCount,
+    pub total_length: ByteCount,
+    pub synced_through: FileOffset,
+}
+
 /// A whole group read back
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ParsedGroup<'bytes> {
@@ -125,7 +133,7 @@ impl RowGroupBuffer {
     /// Walk the rows in this group
     pub fn walk(&self) -> RowWalk<'_> {
         RowWalk {
-            rows: &self.bytes[GROUP_HEADER_BYTES..self.used],
+            rows: self.rows(),
         }
     }
 
@@ -135,19 +143,38 @@ impl RowGroupBuffer {
         if !self.has_room(size) {
             return false;
         }
-        self.bytes[self.used..self.used + size].copy_from_slice(&other.bytes[GROUP_HEADER_BYTES..other.used]);
+        self.bytes[self.used..self.used + size].copy_from_slice(other.rows());
         self.used += size;
         self.row_count += other.row_count;
         true
     }
 
+    /// Write a header into this buffer
+    pub fn set_head(&mut self, head: &GroupHead) {
+        self.bytes[..TOTAL_LENGTH_AT].copy_from_slice(&GROUP_MAGIC.to_le_bytes());
+        self.bytes[TOTAL_LENGTH_AT..ROW_COUNT_AT].copy_from_slice(&(head.total_length.0 as u32).to_le_bytes());
+        self.bytes[ROW_COUNT_AT..SYNCED_THROUGH_AT].copy_from_slice(&(head.row_count.0 as u32).to_le_bytes());
+        self.bytes[SYNCED_THROUGH_AT..GROUP_HEADER_BYTES].copy_from_slice(&head.synced_through.0.to_le_bytes());
+    }
+
+    /// Read the header and the rows so far
+    pub fn with_head(&self) -> &[u8] {
+        &self.bytes[..self.used]
+    }
+
+    /// Read the rows so far
+    pub fn rows(&self) -> &[u8] {
+        &self.bytes[GROUP_HEADER_BYTES..self.used]
+    }
+
     /// Close the group and return its bytes, ready to write
     pub fn finish(&mut self, synced_through: FileOffset, record_key: RecordKey) -> &[u8] {
         let total = self.used + GROUP_SUM_BYTES;
-        self.bytes[..TOTAL_LENGTH_AT].copy_from_slice(&GROUP_MAGIC.to_le_bytes());
-        self.bytes[TOTAL_LENGTH_AT..ROW_COUNT_AT].copy_from_slice(&(total as u32).to_le_bytes());
-        self.bytes[ROW_COUNT_AT..SYNCED_THROUGH_AT].copy_from_slice(&self.row_count.to_le_bytes());
-        self.bytes[SYNCED_THROUGH_AT..GROUP_HEADER_BYTES].copy_from_slice(&synced_through.0.to_le_bytes());
+        self.set_head(&GroupHead {
+            row_count: RowCount(u64::from(self.row_count)),
+            total_length: ByteCount(total as u64),
+            synced_through,
+        });
 
         let sum = xxh3_64_with_seed(&self.bytes[..self.used], record_key.0);
         self.bytes[self.used..total].copy_from_slice(&sum.to_le_bytes());
@@ -165,6 +192,18 @@ impl<'bytes> ParsedGroup<'bytes> {
     /// Walk the group's rows
     pub fn walk(&self) -> RowWalk<'bytes> {
         RowWalk { rows: self.rows }
+    }
+}
+
+impl<'bytes> RowWalk<'bytes> {
+    /// Walk rows at the front of some bytes, stopping short of a row that runs past them
+    pub fn over(rows: &'bytes [u8]) -> Self {
+        Self { rows }
+    }
+
+    /// Count the bytes the walk hasn't reached
+    pub fn left(&self) -> usize {
+        self.rows.len()
     }
 }
 
@@ -194,19 +233,28 @@ pub fn row_size(key_length: usize) -> usize {
     ROW_HEADER_BYTES + key_length
 }
 
-/// Read the group at the front of the bytes, or nothing when it's torn or absent
-pub fn parse_group(bytes: &[u8], record_key: RecordKey) -> Option<ParsedGroup<'_>> {
+/// Read a group's header, or nothing when these bytes can't open a group
+pub fn parse_head(bytes: &[u8]) -> Option<GroupHead> {
     let header = bytes.get(..GROUP_HEADER_BYTES)?;
     if read_half(header, 0)? != GROUP_MAGIC {
         return None;
     }
-
     let total = read_half(header, TOTAL_LENGTH_AT)? as usize;
-    let sum_at = total.checked_sub(GROUP_SUM_BYTES)?;
-    let body = bytes.get(..sum_at)?;
-    if sum_at < GROUP_HEADER_BYTES {
+    if total < GROUP_OVERHEAD_BYTES {
         return None;
     }
+    Some(GroupHead {
+        row_count: RowCount(u64::from(read_half(header, ROW_COUNT_AT)?)),
+        total_length: ByteCount(total as u64),
+        synced_through: FileOffset(read_word(header, SYNCED_THROUGH_AT)?),
+    })
+}
+
+/// Read the group at the front of the bytes, or nothing when it's torn or absent
+pub fn parse_group(bytes: &[u8], record_key: RecordKey) -> Option<ParsedGroup<'_>> {
+    let head = parse_head(bytes)?;
+    let sum_at = head.total_length.0 as usize - GROUP_SUM_BYTES;
+    let body = bytes.get(..sum_at)?;
     let sum = read_word(bytes, sum_at)?;
     if xxh3_64_with_seed(body, record_key.0) != sum {
         return None;
@@ -214,8 +262,8 @@ pub fn parse_group(bytes: &[u8], record_key: RecordKey) -> Option<ParsedGroup<'_
 
     Some(ParsedGroup {
         rows: &body[GROUP_HEADER_BYTES..],
-        row_count: RowCount(u64::from(read_half(header, ROW_COUNT_AT)?)),
-        total_length: ByteCount(total as u64),
-        synced_through: FileOffset(read_word(header, SYNCED_THROUGH_AT)?),
+        row_count: head.row_count,
+        total_length: head.total_length,
+        synced_through: head.synced_through,
     })
 }

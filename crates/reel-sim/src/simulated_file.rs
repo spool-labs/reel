@@ -138,6 +138,12 @@ impl IoFile for SimulatedFile {
             disk.full_writes = OperationCount(disk.full_writes.0 - 1);
             return Err(Error::from(ErrorKind::StorageFull));
         }
+        if let Some(left) = disk.writes_before_failure {
+            disk.writes_before_failure = left.0.checked_sub(1).map(OperationCount);
+            if left.0 == 0 {
+                return Err(Error::other("simulated write failure"));
+            }
+        }
         if disk.failing_writes.0 > 0 {
             disk.failing_writes = OperationCount(disk.failing_writes.0 - 1);
             return Err(Error::other("simulated write failure"));

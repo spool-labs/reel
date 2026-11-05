@@ -23,6 +23,7 @@ const ROOT: &str = "/disk/allocations";
 const META: ColumnId = ColumnId(1);
 const BULK: ColumnId = ColumnId(2);
 const BUDGET: ByteCount = ByteCount(160 * 1024 * 1024);
+const LONG_ROWS: usize = 8_000;
 const KEYS: usize = 64;
 const CHUNKED_BYTES: usize = 200_000;
 const WARM_ROUNDS: usize = 8;
@@ -45,6 +46,7 @@ struct Inputs {
     compressible: Vec<u8>,
     batch: WriteBatch,
     large_batch: WriteBatch,
+    long_batch: WriteBatch,
     buf: Vec<u8>,
 }
 
@@ -106,6 +108,7 @@ fn round(store: &Store, io: &SimulatedIo, inputs: &mut Inputs, number: usize) ->
     total += both(refused);
     total += both(counted(|| store.clear_damage(META, DAMAGED_END, Some(DAMAGED_END)).expect("clear")));
     if number.is_multiple_of(FLUSH_ROUNDS) {
+        total += both(counted(|| store.write_batch(&inputs.long_batch).expect("long batch")));
         total += both(counted(|| store.flush().expect("flush")));
     }
     if number.is_multiple_of(SEAL_ROUNDS) {
@@ -154,6 +157,10 @@ fn no_allocations() {
     let mut large_batch = WriteBatch::new();
     large_batch.put(BULK, &keys[2], &compressible);
     large_batch.put(META, &keys[2], &small);
+    let mut long_batch = WriteBatch::new();
+    for number in 0..LONG_ROWS {
+        long_batch.delete(META, format!("long-{number:06}").as_bytes());
+    }
     let mut inputs = Inputs {
         keys,
         small,
@@ -161,6 +168,7 @@ fn no_allocations() {
         compressible,
         batch,
         large_batch,
+        long_batch,
         buf: vec![1; CHUNKED_BYTES * 2],
     };
 

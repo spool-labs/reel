@@ -35,7 +35,7 @@ use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
 use crate::io::lock_outcome::LockOutcome;
 use crate::io::{Io, IoTask};
-use crate::pool::{Pool, touched_buffer, touched_room};
+use crate::pool::{Pool, touched_buffer, touched_filled, touched_room};
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::record_check::RecordKey;
 use crate::record::record_encoder::RecordEncoder;
@@ -755,6 +755,7 @@ pub fn build_state<Backend: Io>(
         encoders: Pool::new(encoders),
         large_encoders: Pool::new(large_encoders),
         batch_rows: Pool::new((0..WRITE_BUFFERS).map(|_buffer| RowGroupBuffer::new(GROUP_BYTES)).collect()),
+        batch_lengths: Pool::new(vec![touched_filled(sizing.segment_rows.0 as usize, 0)]),
         record_readers: Pool::new(record_readers),
         footer_readers: Pool::new(footer_readers),
         superblock: Mutex::new(superblock),

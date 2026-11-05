@@ -73,6 +73,7 @@ pub struct EngineState<Backend: Io> {
     pub encoders: Pool<RecordEncoder>,
     pub large_encoders: Pool<RecordEncoder>,
     pub batch_rows: Pool<RowGroupBuffer>,
+    pub batch_lengths: Pool<Vec<u32>>,
     pub record_readers: Pool<RecordReader>,
     pub footer_readers: Pool<FooterReader>,
     pub superblock: Mutex<Superblock>,
@@ -289,7 +290,8 @@ impl<Backend: Io> EngineState<Backend> {
         let large = self.large_encoders.heap_bytes(RecordEncoder::heap_bytes);
         report.compress_buffers = ByteCount(encoders.0 + large.0);
         let batch_rows = self.batch_rows.heap_bytes(RowGroupBuffer::heap_bytes);
-        report.queues = ByteCount(report.queues.0 + batch_rows.0);
+        let batch_lengths = self.batch_lengths.heap_bytes(|lengths| ByteCount((lengths.capacity() * size_of::<u32>()) as u64));
+        report.queues = ByteCount(report.queues.0 + batch_rows.0 + batch_lengths.0);
         for queue in &self.queues {
             report.queues = ByteCount(report.queues.0 + hold(queue).filling.heap_bytes().0);
         }

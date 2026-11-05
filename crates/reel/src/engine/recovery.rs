@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
+use xxhash_rust::xxh3::Xxh3;
 
 use crate::engine::engine_sizing::GROUP_BYTES;
 use crate::engine::engine_state::{EngineState, SlotData};
@@ -28,7 +29,9 @@ use crate::record::record_head::SMALL_HEAD_BYTES;
 use crate::record::record_reader::{RecordLocation, RecordRead, RecordReader};
 use crate::row_kind::RowKind;
 use crate::little_endian::read_half;
-use crate::rows::row_group::{GROUP_HEADER_BYTES, GROUP_MAGIC, RowEntry, TOTAL_LENGTH_AT, parse_group};
+use crate::rows::row_group::{
+    GROUP_HEADER_BYTES, GROUP_MAGIC, GROUP_SUM_BYTES, GroupHead, RowEntry, RowWalk, parse_group, parse_head,
+};
 use crate::segment::block_entry::BlockEntry;
 use crate::segment::column_directory::DirectoryEntry;
 use crate::segment::damage_list::{DamagedRange, highest_of, spans_of};
@@ -503,11 +506,9 @@ impl<Backend: Io> EngineState<Backend> {
         at: FileOffset,
         end: ByteCount,
         bytes: &mut [u8],
-    ) -> Result<Option<(FileOffset, usize)>> {
-        if let Some(length) = read_group(rows, at, end, bytes)?
-            && parse_group(&bytes[..length], self.record_key).is_some()
-        {
-            return Ok(Some((at, length)));
+    ) -> Result<Option<(FileOffset, GroupHead)>> {
+        if let Some(head) = read_group(rows, at, end, bytes, self.record_key)? {
+            return Ok(Some((at, head)));
         }
         covering_group(rows, at, end, bytes, self.record_key)
     }
@@ -519,22 +520,22 @@ impl<Backend: Io> EngineState<Backend> {
         let length = rows.length()?;
 
         while scan.valid_end.0 < length.0 {
-            let Some((at, group_length)) = self.next_group(rows, scan.valid_end, length, &mut bytes)? else {
-                break;
-            };
-            let Some(group) = parse_group(&bytes[..group_length], self.record_key) else {
+            let Some((at, head)) = self.next_group(rows, scan.valid_end, length, &mut bytes)? else {
                 break;
             };
             if at != scan.valid_end {
                 scan.has_rot = true;
                 scan.rot_sum = rot_sum(scan.rot_sum, scan.valid_end, at);
             }
-            scan.synced_through = scan.synced_through.max(group.synced_through);
-            scan.row_count = RowCount(scan.row_count.0 + group.row_count.0);
-            for row in group.walk() {
-                scan.highest_place = scan.highest_place.max(row.place);
-            }
-            scan.valid_end = FileOffset(at.0 + group_length as u64);
+            scan.synced_through = scan.synced_through.max(head.synced_through);
+            scan.row_count = RowCount(scan.row_count.0 + head.row_count.0);
+            let mut highest = scan.highest_place;
+            walk_rows(rows, at, &head, &mut bytes, |row| {
+                highest = highest.max(row.place);
+                Ok(true)
+            })?;
+            scan.highest_place = highest;
+            scan.valid_end = FileOffset(at.0 + head.total_length.0);
         }
         // a torn end is bytes that read and fail their check, so a device error past the last good group is rot
         if scan.valid_end.0 < length.0 && has_bad_sector(rows, scan.valid_end, length)? {
@@ -561,30 +562,30 @@ impl<Backend: Io> EngineState<Backend> {
         let end = ByteCount(scan.valid_end.0);
 
         while at.0 < scan.valid_end.0 {
-            let Some((start, length)) = self.next_group(rows, at, end, &mut bytes)? else {
+            let Some((start, head)) = self.next_group(rows, at, end, &mut bytes)? else {
                 break;
             };
             at = start;
-            let Some(group) = parse_group(&bytes[..length], self.record_key) else {
-                break;
-            };
 
             // a group past the last sync may list a record a power cut lost, and it goes whole
             if at.0 >= scan.synced_through.0 {
-                for row in group.walk() {
-                    if !self.is_record_whole(target.data, &row, records, &mut value)? {
-                        return Ok(Some(at));
+                let is_whole = walk_rows(rows, at, &head, &mut bytes, |row| {
+                    if !self.is_record_whole(target.data, row, records, &mut value)? {
+                        return Ok(false);
                     }
                     rewrite_range(target.data, row.offset, row.length, &mut copy)?;
+                    Ok(true)
+                })?;
+                if !is_whole {
+                    return Ok(Some(at));
                 }
             }
 
-            for row in group.walk() {
-                if !self.replay_row(&row, target, recovered) {
-                    return Ok(None);
-                }
+            let has_room = walk_rows(rows, at, &head, &mut bytes, |row| Ok(self.replay_row(row, target, recovered)))?;
+            if !has_room {
+                return Ok(None);
             }
-            at = FileOffset(at.0 + length as u64);
+            at = FileOffset(at.0 + head.total_length.0);
         }
         Ok(Some(at))
     }
@@ -819,26 +820,26 @@ pub fn copy_segment<Backend: Io>(
     let mut at = FileOffset(0);
     let end = ByteCount(segment.scan.valid_end.0);
 
-    'groups: while at.0 < segment.scan.valid_end.0 {
-        let Some((start, length)) = state.next_group(&segment.rows, at, end, &mut bytes)? else {
+    while at.0 < segment.scan.valid_end.0 {
+        let Some((start, head)) = state.next_group(&segment.rows, at, end, &mut bytes)? else {
             break;
         };
         at = start;
-        let Some(group) = parse_group(&bytes[..length], state.record_key) else {
-            break;
-        };
 
         if at.0 >= segment.scan.synced_through.0 {
-            for row in group.walk() {
-                if !state.is_record_whole(&segment.found.data, &row, &mut records, &mut value)? {
-                    break 'groups;
-                }
+            let is_whole = walk_rows(&segment.rows, at, &head, &mut bytes, |row| {
+                state.is_record_whole(&segment.found.data, row, &mut records, &mut value)
+            })?;
+            if !is_whole {
+                break;
             }
         }
-        for row in group.walk() {
-            copy_row(state, volume, segment.found.number, &segment.found.data, &row, &mut record)?;
-        }
-        at = FileOffset(at.0 + length as u64);
+
+        walk_rows(&segment.rows, at, &head, &mut bytes, |row| {
+            copy_row(state, volume, segment.found.number, &segment.found.data, row, &mut record)?;
+            Ok(true)
+        })?;
+        at = FileOffset(at.0 + head.total_length.0);
     }
 
     let target = &state.volumes[volume];
@@ -948,22 +949,98 @@ pub struct ReplayTarget<'file, Backend: Io> {
 
 
 /// Read the group at an offset into a buffer, and return its length when it's all there
-pub fn read_group<File: IoFile>(rows: &File, at: FileOffset, end: ByteCount, bytes: &mut [u8]) -> Result<Option<usize>> {
-    let left = end.0.saturating_sub(at.0) as usize;
-    if left < GROUP_HEADER_BYTES || !read_or_damaged(rows, at, &mut bytes[..GROUP_HEADER_BYTES])? {
+pub fn read_group<File: IoFile>(
+    rows: &File,
+    at: FileOffset,
+    end: ByteCount,
+    bytes: &mut [u8],
+    record_key: RecordKey,
+) -> Result<Option<GroupHead>> {
+    let left = end.0.saturating_sub(at.0);
+    if left < GROUP_HEADER_BYTES as u64 || !read_or_damaged(rows, at, &mut bytes[..GROUP_HEADER_BYTES])? {
         return Ok(None);
     }
-    let Some(length) = read_half(bytes, TOTAL_LENGTH_AT) else {
+    let Some(head) = parse_head(bytes) else {
         return Ok(None);
     };
-    let length = length as usize;
-    if length > left || length > bytes.len() || length < GROUP_HEADER_BYTES {
+    if head.total_length.0 > left {
         return Ok(None);
+    }
+
+    let length = head.total_length.0 as usize;
+    if length > bytes.len() {
+        let is_whole = is_long_group_whole(rows, at, length, bytes, record_key)?;
+        return Ok(is_whole.then_some(head));
     }
     if !read_or_damaged(rows, at, &mut bytes[..length])? {
         return Ok(None);
     }
-    Ok(Some(length))
+    Ok(parse_group(&bytes[..length], record_key).map(|_group| head))
+}
+
+/// Check a group longer than the buffer against its checksum, a piece at a time
+pub fn is_long_group_whole<File: IoFile>(
+    rows: &File,
+    at: FileOffset,
+    length: usize,
+    bytes: &mut [u8],
+    record_key: RecordKey,
+) -> Result<bool> {
+    let mut sum = Xxh3::with_seed(record_key.0);
+    let body = length - GROUP_SUM_BYTES;
+    let mut done = 0;
+    while done < body {
+        let step = bytes.len().min(body - done);
+        if !read_or_damaged(rows, FileOffset(at.0 + done as u64), &mut bytes[..step])? {
+            return Ok(false);
+        }
+        sum.update(&bytes[..step]);
+        done += step;
+    }
+
+    let mut stored = [0; GROUP_SUM_BYTES];
+    let is_read = read_or_damaged(rows, FileOffset(at.0 + body as u64), &mut stored)?;
+    Ok(is_read && u64::from_le_bytes(stored) == sum.digest())
+}
+
+/// Walk the rows of a group `read_group` passed, until the work says stop. A short group is still in the
+/// buffer, and a longer one comes in pieces, with the row a piece cut in two carried to the next
+pub fn walk_rows<File: IoFile>(
+    rows: &File,
+    at: FileOffset,
+    head: &GroupHead,
+    bytes: &mut [u8],
+    mut work: impl FnMut(&RowEntry) -> Result<bool>,
+) -> Result<bool> {
+    let length = head.total_length.0 as usize;
+    let rows_end = length - GROUP_SUM_BYTES;
+    if length <= bytes.len() {
+        for row in RowWalk::over(&bytes[GROUP_HEADER_BYTES..rows_end]) {
+            if !work(&row)? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+
+    let mut done = GROUP_HEADER_BYTES;
+    let mut carried = 0;
+    while done < rows_end {
+        let step = (bytes.len() - carried).min(rows_end - done);
+        // a group that just passed its check and stops reading can't be walked in part, since that shows half a batch
+        rows.read_exact_at(FileOffset(at.0 + done as u64), &mut bytes[carried..carried + step])?;
+        done += step;
+        let filled = carried + step;
+        let mut walk = RowWalk::over(&bytes[..filled]);
+        for row in walk.by_ref() {
+            if !work(&row)? {
+                return Ok(false);
+            }
+        }
+        carried = walk.left();
+        bytes.copy_within(filled - carried..filled, 0);
+    }
+    Ok(true)
 }
 
 /// Fold a bad region into a sum of where a rows file's bad regions lie, through a real hash, so a region that
@@ -998,7 +1075,7 @@ pub fn covering_group<File: IoFile>(
     end: ByteCount,
     bytes: &mut [u8],
     record_key: RecordKey,
-) -> Result<Option<(FileOffset, usize)>> {
+) -> Result<Option<(FileOffset, GroupHead)>> {
     let mut chunk = [0; GROUP_SEARCH_BYTES + size_of::<u32>()];
     let mut at = bad_at.0 + 1;
     while at + size_of::<u32>() as u64 <= end.0 {
@@ -1015,11 +1092,10 @@ pub fn covering_group<File: IoFile>(
                     continue;
                 }
                 let candidate = FileOffset(at + position as u64);
-                if let Some(group_length) = read_group(rows, candidate, end, bytes)?
-                    && let Some(group) = parse_group(&bytes[..group_length], record_key)
-                    && group.synced_through > bad_at
+                if let Some(head) = read_group(rows, candidate, end, bytes, record_key)?
+                    && head.synced_through > bad_at
                 {
-                    return Ok(Some((candidate, group_length)));
+                    return Ok(Some((candidate, head)));
                 }
             }
         }

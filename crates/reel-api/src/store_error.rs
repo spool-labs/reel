@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::column_id::ColumnId;
-use crate::units::{ByteCount, ProcessId, VolumeId};
+use crate::units::{ByteCount, ProcessId, RowCount, VolumeId};
 
 /// A failed store call
 #[derive(Debug, Error)]
@@ -23,6 +23,8 @@ pub enum StoreError {
     ValueTooLarge { length: ByteCount, limit: ByteCount },
     #[error("batch of {length:?} doesn't fit one segment of {limit:?}")]
     BatchTooLarge { length: ByteCount, limit: ByteCount },
+    #[error("batch of {rows:?} doesn't fit one segment of {limit:?}")]
+    BatchTooManyRows { rows: RowCount, limit: RowCount },
     #[error("a budget of {budget:?} is under the {least:?} this store needs")]
     BudgetTooSmall { budget: ByteCount, least: ByteCount },
     #[error("batch touches more than one volume")]

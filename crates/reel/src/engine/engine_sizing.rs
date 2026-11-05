@@ -46,11 +46,11 @@ pub const SEAL_JOB_BYTES: u64 = 3 * 1024 * 1024;
 pub const JOB_STACK_PLAN_BYTES: u64 = 1024 * 1024;
 /// Jobs a store runs beside one seal job a volume
 pub const SHARED_JOBS: u64 = 2;
-/// Bytes a row of the write index really takes, node, page and table share included
-pub const PLANNED_ROW_BYTES: u64 = 224;
+/// Bytes a row of the write index really takes, node, page and table share included, with a long batch's length of it
+pub const PLANNED_ROW_BYTES: u64 = 227;
 /// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight. With one
-/// lz4 column that gives these rows a segment: 65,273 at 128 MiB, 158,896 at 192 MiB, 627,011 at 512 MiB and
-/// 5,869,891 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
+/// lz4 column that gives these rows a segment: 62,967 at 128 MiB, 155,353 at 192 MiB, 617,281 at 512 MiB and
+/// 5,790,871 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
 /// records seal smaller and reach their size through merges, whose outputs the write index doesn't bound
 pub const SEAL_ROWS_EIGHTHS: u64 = 5;
 /// The most stored bytes of a value on an lz4 column

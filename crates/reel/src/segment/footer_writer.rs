@@ -338,6 +338,8 @@ impl FooterWriter {
         let first_tail_at = FileOffset(file_length.0 - total as u64);
         file.write_at(second_tail_at, &[IoSlice::new(&self.tail[..total])])?;
         file.write_at(first_tail_at, &[IoSlice::new(&self.tail[..total])])?;
+        // a power cut can keep a cut alone, so an earlier seal's tail could end the file and hide every row after it
+        file.sync()?;
         file.truncate(file_length)?;
         file.sync()?;
         Ok(FooterTotals {

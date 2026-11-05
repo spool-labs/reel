@@ -1115,6 +1115,36 @@ fn rows_sync() {
     store.close().expect("close");
 }
 
+// a tail sync that fails leaves the file's length, so a tail from an earlier seal can never end the file
+#[test]
+fn tail_then_cut() {
+    let io = SimulatedIo::new(Seed(39));
+    let store = open(&io);
+    store.put(ORDERED, b"key", b"value").expect("put");
+    store.flush().expect("flush");
+    let before = data_lengths(&io);
+
+    io.fail_file_sync("data", OperationCount(1));
+    seal(&store, &io);
+
+    assert_eq!(data_lengths(&io), before);
+    io.kill();
+    drop(store);
+    let store = open(&io);
+    assert_eq!(read(&store, ORDERED, b"key").expect("get"), Some(b"value".to_vec()));
+    store.close().expect("close");
+}
+
+fn data_lengths(io: &SimulatedIo) -> Vec<ByteCount> {
+    let lengths = data_files(io).into_iter().map(|path| {
+        let file = io.open_read_only(&path).expect("open");
+        let length = file_length_of(&file);
+        io.close_file(file);
+        length
+    });
+    lengths.collect()
+}
+
 // a seal stopped at any of its data syncs loses no flushed write through a reopen and a power cut
 #[test]
 fn tail_sync() {

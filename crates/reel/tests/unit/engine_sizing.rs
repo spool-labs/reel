@@ -2,6 +2,9 @@ use reel::engine::engine_sizing::*;
 use reel::index::open_slots::MAX_OPEN_SLOTS;
 use reel_api::units::{ByteCount, RowCount};
 
+const ROWS_PER_BLOCK: u64 = 1_400;
+const MOST_ROW_BYTES: u64 = 1_024;
+
 // the default budget gets near-gigabyte segments, and a small one scales down
 #[test]
 fn budget_split() {
@@ -49,4 +52,21 @@ fn documented_rows() {
 
         assert_eq!(EngineSizing::for_store(&store).segment_rows, RowCount(rows), "{mib} MiB");
     }
+}
+
+// a summary at the default budget holds the block counts of a billion keys, beside a row for each segment
+#[test]
+fn summary_holds_blocks() {
+    let store = StoreShape {
+        budget: ByteCount(512 * 1024 * 1024),
+        roots: 1,
+        volumes: 1,
+        has_lz4: true,
+        widest_keys: 64,
+    };
+    let rows_room = EngineSizing::for_store(&store).summary_share.0 / 2;
+    let blocks = 1_000_000_000 / ROWS_PER_BLOCK;
+    let segments = 1_024;
+
+    assert!(rows_room > blocks * size_of::<u32>() as u64 + segments * MOST_ROW_BYTES);
 }

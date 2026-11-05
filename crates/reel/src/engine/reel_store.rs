@@ -714,6 +714,9 @@ pub fn build_state<Backend: Io>(
         let span_room = MOST_DAMAGED_SPANS * (MOST_ROW_SPAN_FIXED_BYTES + 2 * SPAN_KEY_BYTES);
         let summary_room = span_room + found_summary.max(planned_summary).max(scan.least_summary_room(index, columns_here) * 2);
         summary.rows.make_room(ByteCount(summary_room as u64));
+        let room = table_room(&table_sizing, &scan.least_sizing(index));
+        // a row for each segment the table can hold, beside open segments and the spans of gone ones
+        summary.rows.make_index(room.segments_per_shard * TABLE_SHARDS + open_slots + MOST_DAMAGED_SPANS);
         volumes.push(Volume {
             id: VolumeId(index as u8),
             name: volume.name.clone(),
@@ -729,7 +732,7 @@ pub fn build_state<Backend: Io>(
                 bytes_since_sync: ByteCount(0),
                 next_root: 0,
             }),
-            table: SegmentTable::new(&table_room(&table_sizing, &scan.least_sizing(index))),
+            table: SegmentTable::new(&room),
             view: AtomicU64::new(0),
             handovers: AtomicU64::new(0),
             highest_sealed: AtomicU64::new(0),
@@ -737,6 +740,7 @@ pub fn build_state<Backend: Io>(
             is_failed: AtomicBool::new(false),
             segment_bytes: sizing.segment_bytes,
             segment_rows: sizing.segment_rows,
+            walk_retries: AtomicU64::new(0),
             reserve: ByteCount(sizing.segment_bytes.0 * 2),
             summary: Mutex::new(summary.rows),
             summary_paths: summary.paths,

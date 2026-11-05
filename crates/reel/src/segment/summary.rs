@@ -12,6 +12,7 @@ use crate::io::device_error::{SECTOR_BYTES, read_or_damaged};
 use crate::io::{Io, IoFile};
 use crate::little_endian::read_half;
 use crate::record::record_check::{Checksum, checksum};
+use crate::segment::segment_table::NumberMap;
 use crate::segment::segment_tail::{PlaceRange, SegmentNumber};
 
 /// The bit of a row's flags that says its footer keeps range deletes
@@ -130,6 +131,9 @@ pub struct SpanFacts<'key> {
 #[derive(Debug)]
 pub struct SummaryRows {
     bytes: Vec<u8>,
+    index: NumberMap,
+    listed: usize,
+    is_index_whole: bool,
 }
 
 /// One row read back
@@ -238,6 +242,9 @@ impl SummaryRows {
     pub fn new(capacity: ByteCount) -> Self {
         Self {
             bytes: Vec::with_capacity(capacity.0 as usize),
+            index: NumberMap::new(0),
+            listed: 0,
+            is_index_whole: false,
         }
     }
 
@@ -251,6 +258,61 @@ impl SummaryRows {
         self.bytes.truncate(length);
     }
 
+    /// Size the lookup from a segment to its row, so a walk step goes to its rows with no walk over them all
+    pub fn make_index(&mut self, segments: usize) {
+        self.index = NumberMap::new(segments);
+        self.rebuild_index();
+    }
+
+    /// Read the bytes the rows have room for
+    pub fn byte_room(&self) -> ByteCount {
+        ByteCount(self.bytes.capacity() as u64)
+    }
+
+    /// Read how many segments the lookup was sized for
+    pub fn index_room(&self) -> usize {
+        self.index.room()
+    }
+
+    /// List every row again after rows moved. A lookup too small for them all gives way to walking the rows
+    pub fn rebuild_index(&mut self) {
+        self.index.clear();
+        self.listed = 0;
+        self.is_index_whole = true;
+        let mut at = 0;
+        while let Some((length, row)) = read_row(&self.bytes[at..]) {
+            if let Some(number) = row.map(|row| row.facts.segment) {
+                self.note_row(number, at);
+            }
+            at += length;
+        }
+    }
+
+    /// List a row at the end, or give the lookup up when it has no room
+    pub fn note_row(&mut self, number: SegmentNumber, at: usize) {
+        if self.listed >= self.index.room() {
+            self.is_index_whole = false;
+            return;
+        }
+        self.listed += 1;
+        self.index.insert(number, at as u32);
+    }
+
+    /// Find where a segment's row starts
+    pub fn find_row(&self, segment: SegmentNumber) -> Option<usize> {
+        if self.is_index_whole {
+            return self.index.get(segment).map(|at| at as usize);
+        }
+        let mut at = 0;
+        while let Some((length, row)) = read_row(&self.bytes[at..]) {
+            if row.is_some_and(|row| row.facts.segment == segment) {
+                return Some(at);
+            }
+            at += length;
+        }
+        None
+    }
+
     /// Read the stored rows
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -258,7 +320,7 @@ impl SummaryRows {
 
     /// Read the heap the rows hold
     pub fn heap_bytes(&self) -> ByteCount {
-        ByteCount(self.bytes.capacity() as u64)
+        ByteCount((self.bytes.capacity() + self.index.heap_bytes()) as u64)
     }
 
     /// Add a row, or return false when it doesn't fit
@@ -300,6 +362,7 @@ impl SummaryRows {
         let sum = checksum(&self.bytes[body_at..]);
         self.bytes.extend_from_slice(&sum.0.to_le_bytes());
         debug_assert_eq!(self.bytes.len() - start, ROW_HEAD_BYTES + body + ROW_SUM_BYTES);
+        self.note_row(facts.segment, start);
         true
     }
 
@@ -392,6 +455,7 @@ impl SummaryRows {
             self.bytes[at..body_at].copy_from_slice(&row_head(body_length as u32));
             let sum = checksum(&self.bytes[body_at..body_at + body_length]);
             self.bytes[body_at + body_length..new_end].copy_from_slice(&sum.0.to_le_bytes());
+            self.rebuild_index();
             return Some(dropped);
         }
     }
@@ -416,32 +480,45 @@ impl SummaryRows {
     /// Apply one step of the dead-byte walk under one hold: every count, and how far the walk has come, so any saved
     /// copy has counts and a position that agree. The counts come sorted by segment
     pub fn apply_walk(&mut self, walked: SegmentNumber, blocks: u32, counts: &[DeadCount]) {
-        let mut at = 0;
-        while let Some((length, row)) = read_row(&self.bytes[at..]) {
-            let found = row.map(|row| (row.facts.segment, row.column_count, row.facts.block_count));
-            if let Some((number, column_count, block_count)) = found {
-                let first = counts.partition_point(|count| count.segment < number);
-                let mine = counts[first..].iter().take_while(|count| count.segment == number);
-                let body_at = at + ROW_HEAD_BYTES;
-                let has_counts = mine.clone().next().is_some();
-                for count in mine {
-                    let field = body_at + ROW_FACT_BYTES + count.block as usize * size_of::<u32>();
-                    let dead = read_half(&self.bytes, field).unwrap_or(0) + count.rows;
-                    self.bytes[field..field + size_of::<u32>()].copy_from_slice(&dead.to_le_bytes());
-                    self.add_dead(body_at + block_count as usize * size_of::<u32>(), column_count, count);
-                }
-                if number == walked {
-                    let field = body_at + WALKED_BLOCKS_AT;
-                    self.bytes[field..field + size_of::<u32>()].copy_from_slice(&blocks.to_le_bytes());
-                }
-                if has_counts || number == walked {
-                    let body_end = at + length - ROW_SUM_BYTES;
-                    let sum = checksum(&self.bytes[body_at..body_end]);
-                    self.bytes[body_end..body_end + ROW_SUM_BYTES].copy_from_slice(&sum.0.to_le_bytes());
-                }
-            }
-            at += length;
+        let mut first = 0;
+        while let Some(count) = counts.get(first) {
+            let length = counts[first..].partition_point(|other| other.segment == count.segment);
+            let position = (count.segment == walked).then_some(blocks);
+            self.apply_counts(count.segment, &counts[first..first + length], position);
+            first += length;
         }
+        if counts.binary_search_by_key(&walked, |count| count.segment).is_err() {
+            self.apply_counts(walked, &[], Some(blocks));
+        }
+    }
+
+    /// Add a segment's counts to its row and move its walk on, resealing the row once
+    pub fn apply_counts(&mut self, segment: SegmentNumber, counts: &[DeadCount], position: Option<u32>) {
+        let Some(at) = self.find_row(segment) else {
+            return;
+        };
+        let Some((length, Some(row))) = read_row(&self.bytes[at..]) else {
+            return;
+        };
+        let (column_count, block_count) = (row.column_count, row.facts.block_count);
+        let body_at = at + ROW_HEAD_BYTES;
+        for count in counts {
+            debug_assert!(count.block < block_count);
+            if count.block >= block_count {
+                continue;
+            }
+            let field = body_at + ROW_FACT_BYTES + count.block as usize * size_of::<u32>();
+            let dead = read_half(&self.bytes, field).unwrap_or(0) + count.rows;
+            self.bytes[field..field + size_of::<u32>()].copy_from_slice(&dead.to_le_bytes());
+            self.add_dead(body_at + block_count as usize * size_of::<u32>(), column_count, count);
+        }
+        if let Some(blocks) = position {
+            let field = body_at + WALKED_BLOCKS_AT;
+            self.bytes[field..field + size_of::<u32>()].copy_from_slice(&blocks.to_le_bytes());
+        }
+        let body_end = at + length - ROW_SUM_BYTES;
+        let sum = checksum(&self.bytes[body_at..body_end]);
+        self.bytes[body_end..body_end + ROW_SUM_BYTES].copy_from_slice(&sum.0.to_le_bytes());
     }
 
     /// Start a segment's counts over for a backward walk, which rebuilds them from its own rows. Its row may be behind
@@ -523,7 +600,7 @@ impl SummaryRows {
 
     /// Find a segment's row
     pub fn get(&self, segment: SegmentNumber) -> Option<SummaryRow<'_>> {
-        self.rows().find(|row| row.facts.segment == segment)
+        self.row_at(self.find_row(segment)?)
     }
 
     /// Take a segment's row out
@@ -533,6 +610,7 @@ impl SummaryRows {
             if row.is_some_and(|row| row.facts.segment == segment) {
                 self.bytes.copy_within(at + length.., at);
                 self.bytes.truncate(self.bytes.len() - length);
+                self.rebuild_index();
                 return;
             }
             at += length;
@@ -584,7 +662,11 @@ impl SummaryRows {
         if self.bytes.len() + length > self.bytes.capacity() {
             return false;
         }
+        let start = self.bytes.len();
         self.bytes.extend_from_slice(&from.bytes[at..at + length]);
+        if let Some(number) = from.row_at(at).map(|row| row.facts.segment) {
+            self.note_row(number, start);
+        }
         true
     }
 }
@@ -877,7 +959,8 @@ pub fn read_summary<Backend: Io>(
     rows.bytes = newer.rows;
     if let Some(older) = older {
         let has_two_marks = mark.is_some() && older.mark().is_some() && mark != older.mark();
-        let older_rows = SummaryRows { bytes: older.rows };
+        let mut older_rows = SummaryRows::new(ByteCount(0));
+        older_rows.bytes = older.rows;
         let listed = rows.offsets();
         // with two marks, a row the newer copy lost may hold more than the older copy's, so it can't stand as it is
         lost.has_lost_row = has_two_marks && rows.has_bad_row();

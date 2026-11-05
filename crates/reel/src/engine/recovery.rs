@@ -1342,7 +1342,7 @@ pub fn settle_summaries<Backend: Io>(state: &EngineState<Backend>, scan: &mut Ro
 
         // rows of segments no root holds stay behind here
         let mut settled = SummaryRows::new(ByteCount(0));
-        settled.make_room(rows.heap_bytes());
+        settled.make_room(rows.byte_room());
         let mut held = BTreeSet::new();
         for found in &scan.sealed {
             if found.volume == index {
@@ -1360,7 +1360,9 @@ pub fn settle_summaries<Backend: Io>(state: &EngineState<Backend>, scan: &mut Ro
         let open: BTreeSet<SegmentNumber> =
             scan.scanned.iter().filter(|segment| segment.found.volume == index).map(|segment| segment.found.number).collect();
         carry_rows(volume, &rows, &listed, (&held, &open), &mut settled);
+        let index_room = rows.index_room();
         *rows = settled;
+        rows.make_index(index_room);
         drop(rows);
         state.save_summary(volume)?;
     }

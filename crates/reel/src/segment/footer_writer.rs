@@ -201,7 +201,10 @@ impl FooterWriter {
         self.places.highest = self.places.highest.max(row.place);
         self.row_count = RowCount(self.row_count.0 + 1);
         if let Some(keys) = self.column_keys.last_mut() {
-            keys.value_bytes = ByteCount(keys.value_bytes.0 + row.length.0);
+            // a range delete is no value, and the dead-byte walk counts it nowhere
+            if row.kind != RowKind::RangeDelete {
+                keys.value_bytes = ByteCount(keys.value_bytes.0 + row.length.0);
+            }
         }
         if let Some(column) = self.columns.last_mut() {
             column.row_count = RowCount(column.row_count.0 + 1);

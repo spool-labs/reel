@@ -14,11 +14,13 @@ use reel::segment::summary::{LostRows, SummaryPaths, SummaryRows, copy_ends, rea
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
 use reel_sim::seeded_random::Seed;
+use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
 
 const ROOT: &str = "/disk/walk";
 const COLUMN: ColumnId = ColumnId(1);
 const BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
+const LARGE_BUDGET: ByteCount = ByteCount(512 * 1024 * 1024);
 const WALK_JOB: &str = "reel-walk";
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 20_000;
@@ -26,13 +28,14 @@ const BUSY: u32 = 1_000;
 const VERSIONS: u64 = 600;
 const LONG_KEYS: u64 = 62;
 const LONG_KEY_BYTES: usize = 1_000;
+const RANGE_ROWS: u64 = 4_000;
 const ORDERS: [[usize; 3]; 6] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
 
 type Store = ReelStore<SimulatedIo>;
 
-fn config() -> StoreConfig {
+fn config(budget: ByteCount) -> StoreConfig {
     StoreConfig {
-        memory_budget: BUDGET,
+        memory_budget: budget,
         volumes: vec![VolumeConfig {
             name: "walk".to_string(),
             roots: vec![PathBuf::from(ROOT)],
@@ -49,7 +52,12 @@ fn config() -> StoreConfig {
 }
 
 fn open(io: &SimulatedIo) -> Store {
-    ReelStore::open(io.clone(), &config()).expect("open")
+    ReelStore::open(io.clone(), &config(BUDGET)).expect("open")
+}
+
+// a key's rows all sit in one shard, so a long run of them needs a large index
+fn open_large(io: &SimulatedIo) -> Store {
+    ReelStore::open(io.clone(), &config(LARGE_BUDGET)).expect("open")
 }
 
 fn settle(io: &SimulatedIo) {
@@ -297,4 +305,119 @@ fn blocks_reopen() {
     assert_eq!(counts(&store, older).1, RowCount(1));
     assert_blocks(&store, &[older, newer]);
     store.close().expect("close");
+}
+
+// a read that fails on a block's first key leaves nothing behind: the retry finds that key's top again
+#[test]
+fn failed_read_retry() {
+    let io = SimulatedIo::new(Seed(14));
+    let store = open(&io);
+    io.hold_jobs(WALK_JOB, true);
+    store.put(COLUMN, b"key", b"older").expect("put");
+    let older = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, older);
+    store.put(COLUMN, b"key", b"newer").expect("put");
+    let newer = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, newer);
+
+    let mut job = WalkJob::new(store.state.clone(), 0);
+    assert!(job.pick_target());
+    job.walk_block(job.target.expect("a target")).expect("the older segment");
+    assert!(job.pick_target());
+    let target = job.target.expect("a target");
+    assert_eq!(target.segment, newer);
+    io.fail_process_reads_after(OperationCount(1));
+    assert!(job.walk_block(target).is_err());
+    assert_eq!(store.state.walk_retries(0), 1);
+    job.walk_block(target).expect("the retry");
+
+    assert_eq!(counts(&store, older).1, RowCount(1));
+    assert_eq!(counts(&store, newer).1, RowCount(0));
+    assert_blocks(&store, &[older, newer]);
+    drop(job);
+    store.close().expect("close");
+}
+
+// a block of range deletes alone inside a key's run hides no key from a walk that resumes after it
+#[test]
+fn resume_past_ranges() {
+    let long_key = vec![b'k'; LONG_KEY_BYTES];
+    let mut end = long_key.clone();
+    end.push(b'z');
+    let mut position = 1;
+    loop {
+        let io = SimulatedIo::new(Seed(15));
+        let store = open_large(&io);
+        store.put(COLUMN, &long_key, b"oldest").expect("put");
+        let older = hold(&store.state.volumes[0].claims).open[0].number;
+        seal_segment(&store, &io, older);
+        settle(&io);
+        io.hold_jobs(WALK_JOB, true);
+        store.put(COLUMN, &long_key, b"older").expect("put");
+        for _range in 0..RANGE_ROWS {
+            store.delete_range(COLUMN, &long_key, &end).expect("delete");
+        }
+        store.put(COLUMN, &long_key, b"newer").expect("put");
+        let newer = hold(&store.state.volumes[0].claims).open[0].number;
+        seal_segment(&store, &io, newer);
+
+        let mut job = WalkJob::new(store.state.clone(), 0);
+        assert!(job.pick_target());
+        let target = job.target.expect("a target");
+        assert!(target.block_count > 2, "{} blocks", target.block_count);
+        let blocks = target.block_count;
+        for _block in 0..position {
+            job.walk_block(job.target.expect("a target")).expect("a block");
+        }
+        store.state.save_summary(&store.state.volumes[0]).expect("save");
+        drop(job);
+        io.kill();
+        drop(store);
+
+        let store = open_large(&io);
+        settle(&io);
+        assert_eq!(counts(&store, older).1, RowCount(1), "resume at {position}");
+        assert_eq!(counts(&store, newer).1, RowCount(1), "resume at {position}");
+        store.close().expect("close");
+
+        position += 1;
+        if position >= blocks {
+            return;
+        }
+    }
+}
+
+// a seal and a backward walk agree on live bytes, range delete rows left out of both
+#[test]
+fn live_bytes_agree() {
+    let io = SimulatedIo::new(Seed(16));
+    let store = open(&io);
+    store.put(COLUMN, b"aaa", b"value").expect("put");
+    store.delete_range(COLUMN, b"key", b"kez").expect("delete");
+    let number = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, number);
+    settle(&io);
+    let sealed = bytes_of(&store, number);
+    assert!(sealed.0 > 0);
+    store.close().expect("close");
+    drop(store);
+
+    let paths = SummaryPaths::new(Path::new(ROOT));
+    let mut rows = SummaryRows::new(ByteCount(0));
+    let mark = read_summary(&io, &paths, &mut rows, &mut LostRows::default()).expect("read").expect("a mark");
+    rows.remove(number);
+    let ends = copy_ends(WritePlace(mark.0 + 1), rows.bytes());
+    write_copy(&io, &paths, &paths.current, &ends, rows.bytes()).expect("write");
+
+    let store = open(&io);
+    settle(&io);
+
+    assert_eq!(bytes_of(&store, number), sealed);
+    store.close().expect("close");
+}
+
+fn bytes_of(store: &Store, number: SegmentNumber) -> (u64, u64) {
+    let rows = hold(&store.state.volumes[0].summary);
+    let column = rows.get(number).expect("a row").cursor().column().expect("a column");
+    (column.live_bytes.0, column.dead_bytes.0)
 }

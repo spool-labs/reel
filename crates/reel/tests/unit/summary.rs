@@ -245,3 +245,45 @@ fn walk_counts() {
     let other = rows.get(SegmentNumber(2)).expect("a row");
     assert_eq!(other.cursor().column().expect("a column").dead_rows, RowCount(0));
 }
+
+// a walk step finds its rows through the lookup after rows moved, and a block past the row's own is refused
+#[test]
+fn row_lookup() {
+    let mut rows = SummaryRows::new(ROOM);
+    rows.make_index(4);
+    for number in 1..=3 {
+        assert!(rows.push(&facts(number), [column()].into_iter(), [].into_iter()));
+    }
+    rows.remove(SegmentNumber(1));
+    assert!(rows.get(SegmentNumber(1)).is_none());
+    assert!(rows.rewrite_spans(SegmentNumber(2), [span()].into_iter()).is_some());
+    let count = DeadCount {
+        segment: SegmentNumber(3),
+        column: ColumnId(2),
+        block: 1,
+        rows: 1,
+        graves: 0,
+        bytes: ByteCount(5),
+        kept_bytes: ByteCount(0),
+    };
+
+    rows.apply_walk(SegmentNumber(3), 4, &[count]);
+
+    assert!(!rows.has_bad_row());
+    let counted = rows.get(SegmentNumber(3)).expect("a row");
+    assert_eq!(counted.facts.walked_blocks, 4);
+    assert_eq!(counted.dead_blocks().collect::<Vec<_>>(), [(1, 1)]);
+    assert_eq!(rows.get(SegmentNumber(2)).expect("a row").span_count, 1);
+}
+
+// a lookup too small for the rows gives way to walking them
+#[test]
+fn lookup_full() {
+    let mut rows = SummaryRows::new(ROOM);
+    rows.make_index(1);
+    for number in 1..=5 {
+        assert!(rows.push(&facts(number), [column()].into_iter(), [].into_iter()));
+    }
+
+    assert_eq!(rows.get(SegmentNumber(5)).expect("a row").facts.segment, SegmentNumber(5));
+}

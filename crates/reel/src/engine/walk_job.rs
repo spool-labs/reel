@@ -9,6 +9,7 @@
 
 use std::io::{Error, Result};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
@@ -53,6 +54,7 @@ pub struct WalkJob<Backend: Io> {
     key: Vec<u8>,
     last_key: Vec<u8>,
     last_column: Option<ColumnId>,
+    is_next_key_unknown: bool,
     counts: Vec<DeadCount>,
 }
 
@@ -67,6 +69,7 @@ impl<Backend: Io> WalkJob<Backend> {
             key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             last_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             last_column: None,
+            is_next_key_unknown: false,
             counts: touched_capacity(MOST_BLOCK_ROWS, DeadCount::default()),
         }
     }
@@ -93,8 +96,18 @@ impl<Backend: Io> WalkJob<Backend> {
         self.target.is_some()
     }
 
-    /// Walk one row block, and land its counts and the new position under one hold
+    /// Walk one row block. A failure leaves the last key wherever the attempt stood, so the retry finds it again
     pub fn walk_block(&mut self, target: WalkTarget) -> Result<()> {
+        let outcome = self.count_and_land(target);
+        if outcome.is_err() {
+            self.last_column = None;
+            self.state.volumes[self.volume].walk_retries.fetch_add(1, Ordering::Relaxed);
+        }
+        outcome
+    }
+
+    /// Count one row block, and land its counts and the new position under one hold
+    pub fn count_and_land(&mut self, target: WalkTarget) -> Result<()> {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
         self.counts.clear();
@@ -106,7 +119,7 @@ impl<Backend: Io> WalkJob<Backend> {
         if let (Some(pin), Some(block)) = (pin, block) {
             next_block = target.next_block + 1;
             if self.last_column.is_none() && target.next_block > 0 {
-                self.load_last_key(volume, &pin, target)?;
+                self.load_last_key(volume, &pin, target, block.column)?;
             }
             match self.count_block(volume, &pin, &block, target) {
                 Err(error) if is_device_error(&error) => self.counts.clear(),
@@ -129,26 +142,46 @@ impl<Backend: Io> WalkJob<Backend> {
         state.save_summary(volume)
     }
 
-    /// Find where the key before this block ended, since a key's versions can run across two blocks
+    /// Find the last key before this block, since a key's versions can run across blocks, past blocks of range deletes
+    /// alone. A block that can't be read leaves the next key unknown, and it flips nothing
     pub fn load_last_key(
         &mut self,
         volume: &Volume<Backend>,
         pin: &SegmentPin<'_, Backend::File>,
         target: WalkTarget,
+        column: ColumnId,
     ) -> Result<()> {
-        let Some(block) = volume.table.walk_block(target.segment, target.next_block - 1) else {
-            return Ok(());
-        };
-        let length = block.entry.block_length().0 as usize;
-        pin.file.read_exact_at(block.entry.block_at(), &mut self.block[..length])?;
-        let Some(mut walk) = RowBlockWalk::open(&self.block[..length], pin.head.place_base) else {
-            return Ok(());
-        };
-        while let Some(row) = walk.next_row(&mut self.key) {
-            if row.kind != RowKind::RangeDelete {
-                self.last_key.clear();
-                self.last_key.extend_from_slice(&self.key);
-                self.last_column = Some(block.column);
+        let mut index = target.next_block;
+        while index > 0 {
+            index -= 1;
+            let Some(block) = volume.table.walk_block(target.segment, index) else {
+                return Ok(());
+            };
+            if block.column != column {
+                return Ok(());
+            }
+            let length = block.entry.block_length().0 as usize;
+            let read = pin.file.read_exact_at(block.entry.block_at(), &mut self.block[..length]);
+            if let Err(error) = read {
+                if !is_device_error(&error) {
+                    return Err(error);
+                }
+                self.is_next_key_unknown = true;
+                return Ok(());
+            }
+            let Some(mut walk) = RowBlockWalk::open(&self.block[..length], pin.head.place_base) else {
+                self.is_next_key_unknown = true;
+                return Ok(());
+            };
+            while let Some(row) = walk.next_row(&mut self.key) {
+                if row.kind != RowKind::RangeDelete {
+                    self.last_key.clear();
+                    self.last_key.extend_from_slice(&self.key);
+                    self.last_column = Some(block.column);
+                }
+            }
+            if self.last_column.is_some() {
+                return Ok(());
             }
         }
         Ok(())
@@ -181,6 +214,14 @@ impl<Backend: Io> WalkJob<Backend> {
                 add_count(&mut self.counts, target.segment, block.column, target.next_block, &row, false);
             }
             let is_top = self.last_column != Some(block.column) || self.last_key != self.key;
+            // a key that may have begun in a block no read can give has a top no walk can name
+            if is_top && self.is_next_key_unknown {
+                self.is_next_key_unknown = false;
+                self.last_key.clear();
+                self.last_key.extend_from_slice(&self.key);
+                self.last_column = Some(block.column);
+                continue;
+            }
             if !is_top {
                 add_count(&mut self.counts, target.segment, block.column, target.next_block, &row, true);
                 continue;

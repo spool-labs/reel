@@ -131,6 +131,21 @@ impl NumberMap {
         }
     }
 
+    /// Read how many numbers the map holds with room for every probe to end
+    pub fn room(&self) -> usize {
+        self.slots.len() / 2
+    }
+
+    /// Empty the map
+    pub fn clear(&mut self) {
+        self.slots.fill(NO_SLOT);
+    }
+
+    /// Read the heap the map holds
+    pub fn heap_bytes(&self) -> usize {
+        self.numbers.capacity() * size_of::<SegmentNumber>() + self.slots.capacity() * size_of::<u32>()
+    }
+
     /// Find where a number sits, or the empty place it belongs
     pub fn probe(&self, number: SegmentNumber) -> usize {
         let mut index = home_of(number, self.mask);

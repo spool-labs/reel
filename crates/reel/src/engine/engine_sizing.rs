@@ -28,7 +28,9 @@ pub const WRITE_INDEX_DIVISOR: u64 = 2;
 pub const SPOT_DIVISOR: u64 = 8;
 /// The block cache gets one part in this many of what the fixed parts leave
 pub const BLOCK_CACHE_DIVISOR: u64 = 8;
-/// The summaries get one part in this many of what the fixed parts leave, rows and the save buffer together
+/// The summaries get one part in this many of what the fixed parts leave, rows and the save buffer together. A row costs
+/// about 100 B a column and four bytes a row block, about 0.003 B a key at 1,400 rows a block, so 1B keys take 2.8 MB of
+/// it. A row that doesn't fit is dropped: its segment is never walked or counted against, which only understates
 pub const SUMMARY_DIVISOR: u64 = 16;
 /// The segment tables and column directories get one part in this many of what the fixed parts leave
 pub const TABLE_DIVISOR: u64 = 16;

@@ -284,6 +284,11 @@ impl<Backend: Io> EngineState<Backend> {
         hold(&self.volumes[volume].summary).rows().filter(|row| !row.facts.is_walked()).count()
     }
 
+    /// Count the times a volume's walk has had to try a block again
+    pub fn walk_retries(&self, volume: usize) -> u64 {
+        self.volumes[volume].walk_retries.load(Ordering::Relaxed)
+    }
+
     /// Report the heap each structure holds
     pub fn memory_report(&self) -> MemoryReport {
         let mut report = MemoryReport {

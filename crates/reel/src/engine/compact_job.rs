@@ -202,7 +202,8 @@ impl<Backend: Io> CompactJob<Backend> {
                 match self.state.search_footers(volume, &read) {
                     Ok(newest) => {
                         let is_replaced = newest.is_some_and(|found| found.row.place > row.place);
-                        let is_hidden = volume.damage.covering(block.column, &self.key).is_some();
+                        // damage only answers for a row it could be newer than
+                        let is_hidden = volume.damage.covering(block.column, &self.key).is_some_and(|highest| highest > row.place);
                         debug_assert!(is_replaced || is_hidden, "the counts call a live row dead");
                         debug_assert!(row.kind != RowKind::RangeDelete, "the counts call a range delete dead");
                     },

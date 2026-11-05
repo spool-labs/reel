@@ -15,6 +15,7 @@ use reel::engine::volume::MOST_PARKED;
 use reel::guard::hold;
 use reel::io::Io;
 use reel::record::codec::Codec;
+use reel::segment::damage_list::DamagedRange;
 use reel::segment::segment_tail::SegmentNumber;
 use reel::segment::summary::{DeadCount, LostRows, SummaryPaths, SummaryRows, read_summary};
 use reel_api::column_id::ColumnId;
@@ -31,6 +32,7 @@ const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 20_000;
 const CRASH_POINTS: u64 = 40;
 const LATE_CRASH_POINTS: u64 = 200;
+const SYNC_SEEDS: u64 = 64;
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -916,5 +918,49 @@ fn replaced_past_the_walk() {
     settle(&io);
     assert!(!store.state.volumes[0].table.holds(older));
     assert_eq!(read(&store), Some(b"newer".to_vec()));
+    store.close().expect("close");
+}
+
+// an unlink's replacement is durable whatever the sync policy, since a seal syncs its footer: a power cut right after the
+// older file goes keeps the newer value
+#[test]
+fn replacement_survives_power_cut() {
+    for seed in 0..SYNC_SEEDS {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io);
+        let older = sealed_put(&store, &io, b"older");
+        let newer = sealed_put(&store, &io, b"newer");
+        assert!(!has_file(&io, older));
+
+        io.power_cut();
+        drop(store);
+
+        let store = open(&io);
+        settle(&io);
+        assert!(store.state.volumes[0].table.holds(newer), "seed {seed}");
+        assert_eq!(read(&store), Some(b"newer".to_vec()), "seed {seed}");
+        store.close().expect("close");
+    }
+}
+
+// damage older than a row says nothing about what replaced it, so counts that call that row dead still trip the check
+#[cfg(debug_assertions)]
+#[should_panic(expected = "the counts call a live row dead")]
+#[test]
+fn old_damage_hides_nothing() {
+    let io = SimulatedIo::new(Seed(41));
+    let store = open(&io);
+    hold_compaction(&store);
+    let volume = &store.state.volumes[0];
+    let live = sealed_put(&store, &io, b"value");
+    volume.damage.add(&DamagedRange {
+        column: COLUMN,
+        segment: SegmentNumber(u64::MAX),
+        highest_place: WritePlace(0),
+        start: Vec::new(),
+        end: None,
+    });
+
+    job(&store).check_rows(volume, live).expect("check");
     store.close().expect("close");
 }

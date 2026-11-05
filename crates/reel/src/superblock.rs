@@ -246,6 +246,11 @@ impl Superblock {
     /// Replace a root's superblock so a crash leaves the old one or the new one whole
     pub fn write<Backend: Io>(&self, io: &Backend, paths: &SuperblockPaths, bytes: &mut Vec<u8>) -> Result<()> {
         self.write_bytes(bytes);
+        Self::write_file(io, paths, bytes)
+    }
+
+    /// Replace a root's superblock with bytes laid out already, which needs no lock on the superblock
+    pub fn write_file<Backend: Io>(io: &Backend, paths: &SuperblockPaths, bytes: &[u8]) -> Result<()> {
         match io.remove_file(&paths.new) {
             Ok(()) => {},
             Err(error) if error.kind() == ErrorKind::NotFound => {},

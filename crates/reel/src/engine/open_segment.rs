@@ -46,6 +46,7 @@ pub struct RowQueue {
     pub filling: RowGroupBuffer,
     pub rows_end: FileOffset,
     pub synced_through: FileOffset,
+    pub marked_end: FileOffset,
     pub is_writing: bool,
     pub reserved: usize,
 }
@@ -57,6 +58,7 @@ impl RowQueue {
             filling: RowGroupBuffer::new(capacity),
             rows_end: FileOffset(0),
             synced_through: FileOffset(0),
+            marked_end: FileOffset(0),
             is_writing: false,
             reserved: 0,
         }
@@ -67,6 +69,7 @@ impl RowQueue {
         self.filling.clear();
         self.rows_end = rows_end;
         self.synced_through = synced_through;
+        self.marked_end = FileOffset(0);
         self.is_writing = false;
         self.reserved = 0;
     }

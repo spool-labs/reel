@@ -145,6 +145,12 @@ impl WriteOrder {
         ring.next_place.0 + rows.0 - 1 > ring.limit.0
     }
 
+    /// Count the places left under the limit
+    pub fn places_left(&self) -> u64 {
+        let ring = hold(&self.ring);
+        ring.limit.0.saturating_sub(ring.next_place.0)
+    }
+
     /// Set the limit, once every root holds it
     pub fn set_limit(&self, limit: WritePlace) {
         hold(&self.ring).limit = limit;

@@ -533,3 +533,15 @@ fn failed_open() {
         assert_eq!(io.handle_faults(), OperationCount(0), "crash at {crash_at}");
     }
 }
+
+// a close with a failed volume says so, since a write that returned there may not be durable
+#[test]
+fn failed_close() {
+    let io = SimulatedIo::new(Seed(1));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    io.fail_syncs(OperationCount(1));
+    assert!(store.flush().is_err());
+
+    assert!(store.close().is_err());
+}

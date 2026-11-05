@@ -31,6 +31,10 @@ pub const ROW_SUM_BYTES: usize = size_of::<u64>();
 pub const ROW_FACT_BYTES: usize = 69;
 /// Most bytes of a key a row keeps, so a column costs about 100 B whatever the keys are
 pub const SUMMARY_KEY_BYTES: usize = 32;
+/// Bytes a row takes before its columns and spans
+pub const MOST_ROW_FIXED_BYTES: usize = ROW_HEAD_BYTES + ROW_FACT_BYTES + ROW_SUM_BYTES;
+/// The most bytes a column adds to a row, with its bounded keys
+pub const MOST_ROW_COLUMN_BYTES: usize = 21 + 2 * SUMMARY_KEY_BYTES + 1;
 /// Marks a span that runs to its column's end
 pub const NO_END: u16 = u16::MAX;
 

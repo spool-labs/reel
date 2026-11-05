@@ -153,7 +153,7 @@ impl IoFile for SimulatedFile {
         let mut disk = hold(&self.disk);
         self.check(&mut disk, false)?;
 
-        let is_failing = disk.failing_syncs.0 > 0;
+        let is_failing = disk.failing_syncs.0 > 0 || disk.takes_sync_fault(self.inode);
         disk.failing_syncs = OperationCount(disk.failing_syncs.0.saturating_sub(1));
         let Some(image) = disk.inodes.get_mut(&self.inode) else {
             return Err(Error::from(ErrorKind::NotFound));

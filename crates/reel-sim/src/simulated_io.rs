@@ -13,7 +13,7 @@ use reel::io::job::{Job, JobStep};
 use reel::io::lock_outcome::LockOutcome;
 use crate::file_image::BitMask;
 use crate::seeded_random::Seed;
-use crate::simulated_disk::{InodeNumber, OperationCount, SimulatedDisk, SyncHook};
+use crate::simulated_disk::{FileSyncFault, InodeNumber, OperationCount, SimulatedDisk, SyncHook};
 use crate::simulated_file::SimulatedFile;
 use crate::simulated_task::{JobCount, JobIndex, JobSlot, JobWait, SimulatedTask};
 
@@ -129,6 +129,11 @@ impl SimulatedIo {
     /// Run some work right after the next sync lands
     pub fn after_next_sync(&self, work: Box<dyn FnOnce() + Send>) {
         hold(&self.disk).after_sync = SyncHook(Some(work));
+    }
+
+    /// Make one sync of one kind of file fail, after that kind has synced `skip` times
+    pub fn fail_file_sync(&self, extension: &'static str, skip: OperationCount) {
+        hold(&self.disk).file_sync_fault = Some(FileSyncFault { extension, skip });
     }
 
     /// Make the next syncs fail

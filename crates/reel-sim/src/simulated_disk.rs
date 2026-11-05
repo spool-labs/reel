@@ -49,6 +49,13 @@ pub enum NameChange {
     Unlink { path: PathBuf },
 }
 
+/// A sync failure aimed at one kind of file, after that kind has synced so many times
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileSyncFault {
+    pub extension: &'static str,
+    pub skip: OperationCount,
+}
+
 /// The whole simulated file system
 #[derive(Debug)]
 pub struct SimulatedDisk {
@@ -63,6 +70,7 @@ pub struct SimulatedDisk {
     pub locks: BTreeMap<PathBuf, ProcessId>,
     pub capacities: BTreeMap<PathBuf, ByteCount>,
     pub failing_syncs: OperationCount,
+    pub file_sync_fault: Option<FileSyncFault>,
     pub failing_writes: OperationCount,
     pub full_writes: OperationCount,
     pub failing_creates: OperationCount,
@@ -92,6 +100,7 @@ impl SimulatedDisk {
             locks: BTreeMap::new(),
             capacities: BTreeMap::new(),
             failing_syncs: OperationCount::default(),
+            file_sync_fault: None,
             failing_writes: OperationCount::default(),
             full_writes: OperationCount::default(),
             failing_creates: OperationCount::default(),
@@ -311,6 +320,28 @@ impl SimulatedDisk {
             image.handle_count += 1;
         }
         handle
+    }
+
+    /// Check an armed sync failure lands on this file now, and spend it if so
+    pub fn takes_sync_fault(&mut self, inode: InodeNumber) -> bool {
+        let Some(fault) = self.file_sync_fault else {
+            return false;
+        };
+        let is_aimed = self.names.iter().any(|(path, named)| {
+            *named == inode && path.extension().is_some_and(|extension| extension == fault.extension)
+        });
+        if !is_aimed {
+            return false;
+        }
+        if fault.skip.0 > 0 {
+            self.file_sync_fault = Some(FileSyncFault {
+                extension: fault.extension,
+                skip: OperationCount(fault.skip.0 - 1),
+            });
+            return false;
+        }
+        self.file_sync_fault = None;
+        true
     }
 
     /// Close a handle, and count a second close as a fault

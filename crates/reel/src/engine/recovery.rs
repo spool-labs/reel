@@ -34,7 +34,8 @@ use crate::segment::footer_reader::FooterReader;
 use crate::segment::segment_table::{TABLE_SHARDS, TableSizing, shard_of};
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber, TailHead};
 use crate::segment::summary::{
-    ColumnFacts, SUMMARY_KEY_BYTES, SegmentFacts, SpanFacts, SummaryPaths, SummaryRow, SummaryRows, put_bound, put_lowest,
+    ColumnFacts, MOST_ROW_COLUMN_BYTES, MOST_ROW_FIXED_BYTES, SUMMARY_KEY_BYTES, SegmentFacts, SpanFacts, SummaryPaths,
+    SummaryRow, SummaryRows, put_bound, put_lowest,
     read_summary,
 };
 
@@ -61,6 +62,7 @@ pub struct FoundSealed<File> {
     pub head: TailHead,
     pub columns: Vec<ColumnTail>,
     pub entries: Vec<BlockEntry>,
+    pub has_rows: bool,
 }
 
 /// A sealed segment whose copies of the tail or the index all fail
@@ -178,6 +180,16 @@ impl<File> RootScan<File> {
         }
     }
 
+    /// Work out the room the rows of what was found can need, at most
+    pub fn least_summary_room(&self, volume: usize, columns: usize) -> usize {
+        let sealed_columns: usize = self.sealed.iter().filter(|found| found.volume == volume).map(|found| found.columns.len()).sum();
+        let sealed = self.sealed.iter().filter(|found| found.volume == volume).count();
+        let others = self.damaged.iter().filter(|found| found.volume == volume).count()
+            + self.open.iter().filter(|found| found.volume == volume).count()
+            + self.empty.iter().filter(|found| found.volume == volume).count();
+        (sealed + others) * MOST_ROW_FIXED_BYTES + (sealed_columns + others * columns) * MOST_ROW_COLUMN_BYTES
+    }
+
     /// Work out the table room each volume needs for what was found
     pub fn least_sizing(&self, volume: usize) -> TableSizing {
         let mut segments = [0; TABLE_SHARDS];
@@ -281,6 +293,7 @@ pub fn sort_segment<Backend: Io>(
             head,
             columns,
             entries,
+            has_rows: has_rows(listing, number),
         }),
         SegmentRead::Open => scan.open.push(FoundOpen {
             volume: listing.volume,
@@ -312,6 +325,11 @@ pub fn sort_segment<Backend: Io>(
     Ok(())
 }
 
+/// Check a segment has a rows file, in a listing that comes sorted
+pub fn has_rows(listing: &RootListing, number: SegmentNumber) -> bool {
+    listing.files.binary_search(&rows_path(&listing.path, number)).is_ok()
+}
+
 /// Work out what one segment is from its tail, its index and its rows file
 pub fn read_segment<File: IoFile>(
     record_key: RecordKey,
@@ -334,7 +352,7 @@ pub fn read_segment<File: IoFile>(
         });
     }
 
-    if listing.files.contains(&rows_path(&listing.path, number)) {
+    if has_rows(listing, number) {
         return Ok(SegmentRead::Open);
     }
     // a head that can't be read may hold anything, so it counts as something
@@ -364,11 +382,18 @@ pub fn holds_nothing<File: IoFile>(file: &File) -> Result<bool> {
 impl<Backend: Io> EngineState<Backend> {
     /// Put a sealed segment in the table and the directories
     pub fn install_sealed(&self, volume: &Volume<Backend>, found: &FoundSealed<Backend::File>) -> Result<()> {
-        // a kill between a footer's sync and its rows file going leaves the rows behind
-        match self.io.remove_file(&rows_path(&found.path, found.head.segment)) {
-            Ok(()) => {},
-            Err(error) if error.kind() == ErrorKind::NotFound => {},
-            Err(error) => return Err(error),
+        // a seal stopped after its tails reached the kernel leaves its rows, and a failed sync can have left
+        // the tails nowhere else, so they go out again and sync before the rows go
+        if found.has_rows {
+            let end = found.file.length()?;
+            let tails = ByteCount(end.0 - found.head.second_index_at.0);
+            rewrite_range(&found.file, found.head.second_index_at, tails, &mut vec![0; GROUP_BYTES.0 as usize])?;
+            found.file.sync()?;
+            match self.io.remove_file(&rows_path(&found.path, found.head.segment)) {
+                Ok(()) => {},
+                Err(error) if error.kind() == ErrorKind::NotFound => {},
+                Err(error) => return Err(error),
+            }
         }
 
         volume.note_sealed(found.head.places.highest);
@@ -422,8 +447,10 @@ impl<Backend: Io> EngineState<Backend> {
         scanned.rows.truncate(ByteCount(kept_end.0))?;
 
         let synced_through = FileOffset(scanned.scan.synced_through.0.min(kept_end.0));
-        let unsynced = ByteCount(kept_end.0 - synced_through.0);
-        rewrite_range(&scanned.rows, synced_through, unsynced, &mut vec![0; GROUP_BYTES.0 as usize])?;
+        // what no mark covers may be a kernel's copy only, so it goes out again before the sync below
+        let rewrite_from = synced_through;
+        let unsynced = ByteCount(kept_end.0 - rewrite_from.0);
+        rewrite_range(&scanned.rows, rewrite_from, unsynced, &mut vec![0; GROUP_BYTES.0 as usize])?;
         hold(&self.queues[slot.0 as usize]).reset(kept_end, synced_through);
         // what open keeps, a read can see: this sync covers it on disk, so no crash or rot can take it back
         self.write_out_turn(slot, &scanned.rows, Some(&found.data))?;
@@ -595,8 +622,10 @@ pub fn rewrite_range<File: IoFile>(file: &File, start: FileOffset, length: ByteC
     let end = start.0 + length.0;
     while at < end {
         let step = copy.len().min((end - at) as usize);
-        file.read_exact_at(FileOffset(at), &mut copy[..step])?;
-        file.write_at(FileOffset(at), &[IoSlice::new(&copy[..step])])?;
+        // a bad sector has nothing to give back, and what's under it stays as it is
+        if file.read_exact_at(FileOffset(at), &mut copy[..step]).is_ok() {
+            file.write_at(FileOffset(at), &[IoSlice::new(&copy[..step])])?;
+        }
         at += step as u64;
     }
     Ok(())
@@ -721,6 +750,8 @@ pub fn seal_every_open<Backend: Io>(state: &Arc<EngineState<Backend>>, volume: u
     let target = &state.volumes[volume];
     while !hold(&target.claims).open.is_empty() {
         state.seal_fullest(target);
+        // the fullest pick skips a segment with no rows, and those leave by the same seal
+        state.seal_empty(target);
         seal_inline(state, volume)?;
     }
     Ok(())

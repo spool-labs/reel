@@ -1,12 +1,13 @@
 //! Everything a store shares between its threads
 
 use std::io::Error;
+use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, RowCount, WritePlace};
+use reel_api::units::{ByteCount, WritePlace};
 
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::EngineSizing;
@@ -76,11 +77,13 @@ pub struct EngineState<Backend: Io> {
     pub superblock_bytes: Mutex<Vec<u8>>,
     pub next_segment: AtomicU64,
     pub reserved_segment: AtomicU64,
+    pub is_reserving: AtomicBool,
     pub deletes: AtomicU64,
     pub row_job_idle: AtomicBool,
     pub damaged_segments: AtomicU64,
     pub dropped_summary_rows: AtomicU64,
     pub row_task: OnceLock<Backend::Task>,
+    pub reserve_task: OnceLock<Backend::Task>,
     pub seal_tasks: Vec<OnceLock<Backend::Task>>,
 }
 
@@ -168,44 +171,55 @@ impl<Backend: Io> EngineState<Backend> {
         write_summary(&self.io, &volume.summary_paths, self.read_point(), rows.bytes())
     }
 
-    /// Save the superblock to every root with its revision moved on
-    pub fn save_superblock(&self, superblock: &mut Superblock) -> Result<(), StoreError> {
-        superblock.revision += 1;
-        let mut bytes = hold(&self.superblock_bytes);
+    /// Check the saved limit or segment counter is more than half used
+    pub fn needs_reservation(&self) -> bool {
+        let next_segment = self.next_segment.load(Ordering::Acquire);
+        let reserved = self.reserved_segment.load(Ordering::Acquire);
+        self.order.places_left() < PLACE_RUN / 2 || reserved.saturating_sub(next_segment) < SEGMENT_NUMBER_BATCH / 2
+    }
+
+    /// Save the next limit and segment counter to every live root, then publish them: a root that
+    /// can't take them fails its volume alone, no lock is held over the writes, and one save runs at a time
+    pub fn reserve_ahead(&self) {
+        if self.is_reserving.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let mut bytes = mem::take(&mut *hold(&self.superblock_bytes));
+        let (limit, reserved) = {
+            let mut superblock = hold(&self.superblock);
+            let next_segment = self.next_segment.load(Ordering::Acquire).max(superblock.next_segment.0);
+            superblock.place_limit = WritePlace(superblock.place_limit.0 + PLACE_RUN);
+            superblock.next_segment = SegmentNumber(next_segment + SEGMENT_NUMBER_BATCH);
+            superblock.revision += 1;
+            superblock.write_bytes(&mut bytes);
+            (superblock.place_limit, superblock.next_segment)
+        };
+
         for volume in &self.volumes {
             for paths in &volume.superblock_paths {
-                superblock.write(&self.io, paths, &mut bytes).map_err(|source| StoreError::Io {
-                    action: "writing a superblock",
-                    source,
-                })?;
+                if !volume.has_failed() && Superblock::write_file(&self.io, paths, &bytes).is_err() {
+                    volume.fail();
+                }
             }
         }
-        Ok(())
+
+        *hold(&self.superblock_bytes) = bytes;
+        self.order.set_limit(limit);
+        self.reserved_segment.store(reserved.0, Ordering::Release);
+        self.is_reserving.store(false, Ordering::Release);
     }
 
-    /// Sync a higher place limit to every root before a claim of these rows passes the old one
-    pub fn raise_place_limit(&self, rows: RowCount) -> Result<(), StoreError> {
-        let mut superblock = hold(&self.superblock);
-        if !self.order.is_past_limit(rows) {
-            return Ok(());
-        }
-        superblock.place_limit = WritePlace(superblock.place_limit.0 + PLACE_RUN);
-        self.save_superblock(&mut superblock)?;
-        self.order.set_limit(superblock.place_limit);
-        Ok(())
-    }
-
-    /// Take the next segment number, reserving more in every superblock when they run out
-    pub fn next_segment_number(&self) -> Result<SegmentNumber, StoreError> {
+    /// Take the next segment number, and only save more here when the job has fallen a whole batch behind
+    pub fn next_segment_number(&self) -> SegmentNumber {
         let number = self.next_segment.fetch_add(1, Ordering::AcqRel);
-        if number >= self.reserved_segment.load(Ordering::Acquire) {
-            let target = number + SEGMENT_NUMBER_BATCH;
-            let mut superblock = hold(&self.superblock);
-            superblock.next_segment = SegmentNumber(target);
-            self.save_superblock(&mut superblock)?;
-            self.reserved_segment.store(target, Ordering::Release);
+        while number >= self.reserved_segment.load(Ordering::Acquire) {
+            self.reserve_ahead();
+            if number >= self.reserved_segment.load(Ordering::Acquire) {
+                self.io.pause();
+            }
         }
-        Ok(SegmentNumber(number))
+        SegmentNumber(number)
     }
 
     /// Take a free open slot

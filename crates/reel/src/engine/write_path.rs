@@ -288,7 +288,9 @@ impl<Backend: Io> EngineState<Backend> {
                 let Some(ticket) = self.order.try_claim(request.rows) else {
                     // the ring frees when claims end, and ending one needs this lock, and so does a raise
                     drop(claims);
-                    self.raise_place_limit(request.rows)?;
+                    if self.order.is_past_limit(request.rows) {
+                        self.reserve_ahead();
+                    }
                     self.io.pause();
                     continue;
                 };
@@ -383,6 +385,16 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
+    /// Mark every open segment with no rows to seal, which drops it
+    pub fn seal_empty(&self, volume: &Volume<Backend>) {
+        let mut claims = hold(&volume.claims);
+        for segment in &mut claims.open {
+            if segment.phase == SegmentPhase::Taking && segment.row_count.0 == 0 {
+                segment.phase = SegmentPhase::Sealing;
+            }
+        }
+    }
+
     /// Mark one open segment to seal
     pub fn seal_slot(&self, volume: &Volume<Backend>, slot: OpenSlot) {
         let mut claims = hold(&volume.claims);
@@ -439,7 +451,7 @@ impl<Backend: Io> EngineState<Backend> {
         request: &ClaimRequest,
     ) -> Result<OpenSegment<Backend::File>, StoreError> {
         let path = &volume.roots[root.0 as usize];
-        let number = self.next_segment_number()?;
+        let number = self.next_segment_number();
         let reserved = if request.bytes.0 > 0 {
             ByteCount(volume.segment_bytes.0.max(request.bytes.0))
         } else {
@@ -650,13 +662,13 @@ impl<Backend: Io> EngineState<Backend> {
             group
         };
 
-        let (rows_end, synced_through) = {
+        let (rows_end, synced_through, mut marked_end) = {
             let mut queue = hold(&self.queues[index]);
             // a group a failed write left behind goes first, and whole
             if group.is_empty() {
                 mem::swap(&mut queue.filling, &mut group);
             }
-            (queue.rows_end, queue.synced_through)
+            (queue.rows_end, queue.synced_through, queue.marked_end)
         };
 
         let mut outcome = Ok(());
@@ -666,15 +678,8 @@ impl<Backend: Io> EngineState<Backend> {
         }
 
         let mut new_end = rows_end;
-        // a sync with no new rows still writes an empty group, or open would read what it covered as unsynced
-        let has_uncovered_rows = data.is_some() && synced_through < rows_end;
-        if outcome.is_ok() && (!group.is_empty() || has_uncovered_rows) {
-            // a sync turn synced this group's records before writing it, so the group covers itself
-            let through = match data {
-                Some(_data) => FileOffset(rows_end.0 + group.total_length().0),
-                None => synced_through,
-            };
-            let bytes = group.finish(through, self.record_key);
+        if outcome.is_ok() && !group.is_empty() {
+            let bytes = group.finish(synced_through, self.record_key);
             let parts = [IoSlice::new(bytes)];
             outcome = rows.write_at(rows_end, &parts);
             new_end = FileOffset(rows_end.0 + bytes.len() as u64);
@@ -683,13 +688,28 @@ impl<Backend: Io> EngineState<Backend> {
             outcome = rows.sync();
         }
 
+        let mut covered = synced_through;
         if outcome.is_ok() {
             group.clear();
+            if data.is_some() {
+                covered = new_end;
+                // only a group written after the sync can say it finished, and with nothing new there's nothing to say
+                if new_end > marked_end {
+                    let bytes = group.finish(covered, self.record_key);
+                    let parts = [IoSlice::new(bytes)];
+                    let mark_end = FileOffset(new_end.0 + bytes.len() as u64);
+                    // the sync is done whatever this does: a lost mark costs the next open a check of these records
+                    if rows.write_at(new_end, &parts).is_ok() {
+                        new_end = mark_end;
+                        marked_end = mark_end;
+                    }
+                    group.clear();
+                }
+            }
             let mut queue = hold(&self.queues[index]);
             queue.rows_end = new_end;
-            if data.is_some() {
-                queue.synced_through = new_end;
-            }
+            queue.synced_through = covered;
+            queue.marked_end = marked_end;
         }
         *hold(&self.spare_groups[index]) = Some(group);
         outcome

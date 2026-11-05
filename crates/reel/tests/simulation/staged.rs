@@ -10,6 +10,7 @@ use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig
 use reel::engine::claim::Claim;
 use reel::engine::engine_state::EngineState;
 use reel::engine::read_path::{KeyRead, RecordWant};
+use reel::engine::recovery::seal_every_open;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::write_path::{ClaimRequest, LandOutcome};
 use reel::guard::hold;
@@ -1048,4 +1049,25 @@ fn run_until_crash(
         staged.finish(state);
     }
     None
+}
+
+// a segment with no rows leaves with the rest, so sealing every open segment ends
+#[test]
+fn empty_seal() {
+    let io = SimulatedIo::new(Seed(21));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+    let state = Arc::clone(&store.state);
+    let open_rows = hold(&state.volumes[0].claims).open.iter().map(|segment| segment.row_count.0).sum::<u64>();
+    assert_eq!(open_rows, 0);
+    assert!(!hold(&state.volumes[0].claims).open.is_empty());
+
+    seal_every_open(&state, 0).expect("seal");
+
+    assert!(hold(&state.volumes[0].claims).open.is_empty());
+    store.close().expect("close");
 }

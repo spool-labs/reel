@@ -22,6 +22,7 @@ use crate::engine::recovery::{
     RootScan, SummaryFound, list_roots, read_summaries, recover_segments, save_cleared_spans, scan_roots,
     settle_summaries,
 };
+use crate::engine::reserve_job::ReserveJob;
 use crate::engine::row_job::RowJob;
 use crate::engine::seal_job::SealJob;
 use crate::engine::volume::{ClaimState, SyncState, Volume};
@@ -220,6 +221,10 @@ impl<Backend: Io> ReelStore<Backend> {
             if !volume.has_failed() {
                 outcome = outcome.and(self.state.save_summary(volume).map_err(open_error("saving a summary")));
             }
+            // writes that returned on a failed volume may not be durable, and the caller hears it
+            if volume.has_failed() {
+                outcome = outcome.and(Err(StoreError::VolumeFailed { volume: volume.id }));
+            }
             self.state.close_volume(volume);
             hold(&volume.locks).clear();
         }
@@ -238,6 +243,9 @@ impl<Backend: Io> EngineState<Backend> {
     /// Stop every job
     pub fn stop_jobs(&self) -> Result<(), Error> {
         if let Some(task) = self.row_task.get() {
+            task.stop()?;
+        }
+        if let Some(task) = self.reserve_task.get() {
             task.stop()?;
         }
         for cell in &self.seal_tasks {
@@ -314,6 +322,11 @@ pub fn bring_up<Backend: Io>(
         let task = state.io.spawn_job("reel-seal", seal_job).map_err(open_error("starting a job"))?;
         let _set = state.seal_tasks[volume].set(task);
     }
+    let reserve_job = ReserveJob {
+        state: Arc::clone(state),
+    };
+    let task = state.io.spawn_job("reel-reserve", reserve_job).map_err(open_error("starting a job"))?;
+    let _set = state.reserve_task.set(task);
     Ok(())
 }
 
@@ -564,7 +577,9 @@ pub fn build_state<Backend: Io>(
         };
         let found_summary = summary.rows.bytes().len() * 2;
         let planned_summary = segments_per_shard * TABLE_SHARDS * PLANNED_SUMMARY_ROW_BYTES / config.volumes.len().max(1);
-        let summary_room = found_summary.max(planned_summary);
+        let columns_here = config.columns.iter().filter(|column| column.volume.0 as usize == index).count();
+        // open never drops a row, so a segment's damage keeps its rank through every open
+        let summary_room = found_summary.max(planned_summary).max(scan.least_summary_room(index, columns_here) * 2);
         summary.rows.make_room(ByteCount(summary_room as u64));
         volumes.push(Volume {
             id: VolumeId(index as u8),
@@ -657,11 +672,13 @@ pub fn build_state<Backend: Io>(
         superblock_bytes: Mutex::new(Vec::new()),
         next_segment: AtomicU64::new(first_number),
         reserved_segment: AtomicU64::new(reserved),
+        is_reserving: AtomicBool::new(false),
         deletes: AtomicU64::new(0),
         row_job_idle: AtomicBool::new(false),
         damaged_segments: AtomicU64::new(0),
         dropped_summary_rows: AtomicU64::new(0),
         row_task: OnceLock::new(),
+        reserve_task: OnceLock::new(),
         seal_tasks,
     }
 }

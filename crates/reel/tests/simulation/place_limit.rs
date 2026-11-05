@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::engine_state::PLACE_RUN;
 use reel::engine::reel_store::ReelStore;
+use reel::engine::reserve_job::RESERVE_PERIOD;
 use reel::io::Io;
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
@@ -148,13 +149,12 @@ fn run_raise() {
     store.close().expect("close");
 }
 
-// a raise that can't reach a root fails the write, hands out no place, and the next write goes through
+// a raise that can't reach a root fails that root's volume and hands out no place, and the next open goes on
 #[test]
 fn raise_fails() {
     let io = SimulatedIo::new(Seed(6));
     let store = open(&io);
     store.put(COLUMN, b"before", VALUE).expect("put");
-    let saved = limit_of(&io, FIRST_ROOT);
     let mark = store.state.read_point();
     store.state.order.set_limit(mark);
 
@@ -163,11 +163,28 @@ fn raise_fails() {
 
     assert_eq!(store.state.read_point(), mark);
     assert!(!holds(&store, KEY));
+    assert!(store.close().is_err());
+    drop(store);
+
+    let store = open(&io);
+    assert!(store.state.read_point() >= mark);
     store.put(COLUMN, KEY, VALUE).expect("put");
-    assert_eq!(store.state.read_point(), WritePlace(mark.0 + 1));
-    for root in ROOTS {
-        assert!(limit_of(&io, root) > saved);
-    }
+    assert!(holds(&store, KEY));
+    store.close().expect("close");
+}
+
+// the job saves the next limit while half a run is left, so no writer waits on a root's sync
+#[test]
+fn job_raises() {
+    let io = SimulatedIo::new(Seed(7));
+    let store = open(&io);
+    let saved = limit_of(&io, FIRST_ROOT);
+    store.state.order.set_limit(WritePlace(store.state.read_point().0 + PLACE_RUN / 2 - 1));
+
+    io.advance_clock(RESERVE_PERIOD);
+    while io.step_any().is_some() {}
+
+    assert_eq!(limit_of(&io, FIRST_ROOT), WritePlace(saved.0 + PLACE_RUN));
     store.close().expect("close");
 }
 

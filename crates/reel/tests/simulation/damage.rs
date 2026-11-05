@@ -42,6 +42,9 @@ const SEGMENTS: usize = 3;
 const SEAL_CRASH_POINTS: u64 = 24;
 const SEAL_STEPS: u64 = 1_000;
 const CLEAR_CRASH_POINTS: u64 = 8;
+const SEAL_DATA_SYNCS: u64 = 6;
+const MANY_SEGMENTS: u64 = 450;
+const LEAST_BUDGET: ByteCount = ByteCount(1024 * 1024);
 // a segment lost with its row counts every stage a store held at open
 const STAGE_LOST: usize = NEWEST;
 // a stage for writes after the open
@@ -1025,7 +1028,7 @@ fn rows_stay() {
     store.close().expect("close");
 }
 
-// a bad last group has no mark after it, so it reads as a torn end
+// a synced last group that rots while a power cut took its mark reads as a torn end, which the spec accepts
 #[test]
 fn torn_end() {
     let io = SimulatedIo::new(Seed(36));
@@ -1035,11 +1038,104 @@ fn torn_end() {
     io.kill();
     drop(store);
     let files = rows_files(&io);
+    let length = file_length(&io, &files[0]);
     io.rot(&files[0], FileOffset(20), FLIP).expect("rot");
+    io.rot(&files[0], FileOffset(length.0 - 3), FLIP).expect("rot");
 
     let store = open(&io);
 
     assert_eq!(store.damaged_segments(), 0);
     assert_eq!(read(&store, ORDERED, b"older").expect("get"), None);
+    store.close().expect("close");
+}
+
+// a covered last group that rots with its mark group present reads as damage
+#[test]
+fn covered_last() {
+    let io = SimulatedIo::new(Seed(37));
+    let store = open(&io);
+    store.put(ORDERED, b"older", b"value").expect("put");
+    store.flush().expect("flush");
+    io.kill();
+    drop(store);
+    io.rot(&rows_files(&io)[0], FileOffset(20), FLIP).expect("rot");
+
+    let store = open(&io);
+
+    assert_eq!(store.damaged_segments(), 1);
+    assert!(matches!(read(&store, ORDERED, b"older"), Err(StoreError::Corruption { .. })));
+    store.close().expect("close");
+}
+
+// a rows sync that fails drops a delete from the disk, and what open shows stays through a power cut
+#[test]
+fn rows_sync() {
+    let io = SimulatedIo::new(Seed(38));
+    let store = open(&io);
+    store.put(ORDERED, b"key", b"older").expect("put");
+    seal(&store, &io);
+    store.delete(ORDERED, b"key").expect("delete");
+    io.fail_file_sync("rows", OperationCount(0));
+    assert!(store.flush().is_err());
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+    assert_eq!(read(&store, ORDERED, b"key").expect("get"), None);
+    store.flush().expect("flush");
+    io.power_cut();
+    drop(store);
+
+    let store = open(&io);
+    assert_eq!(read(&store, ORDERED, b"key").expect("get"), None);
+    store.close().expect("close");
+}
+
+// a seal stopped at any of its data syncs loses no flushed write through a reopen and a power cut
+#[test]
+fn tail_sync() {
+    for skip in 0..SEAL_DATA_SYNCS {
+        let io = SimulatedIo::new(Seed(skip));
+        let store = open(&io);
+        store.put(ORDERED, b"key", b"value").expect("put");
+        store.flush().expect("flush");
+        store.seal_now();
+        io.fail_file_sync("data", OperationCount(skip));
+        settle(&io);
+        io.kill();
+        drop(store);
+
+        let store = open(&io);
+        store.flush().expect("flush");
+        io.power_cut();
+        drop(store);
+
+        let store = open(&io);
+        assert_eq!(read(&store, ORDERED, b"key").expect("get"), Some(b"value".to_vec()), "skip {skip}");
+        store.close().expect("close");
+    }
+}
+
+// more segments than the plan and no summary: every row comes back, so open drops none and no rank moves
+#[test]
+fn rows_fit() {
+    let io = SimulatedIo::new(Seed(39));
+    let store = open(&io);
+    for number in 0..MANY_SEGMENTS {
+        store.put(ORDERED, &key_of(ORDERED, number), b"value").expect("put");
+        seal(&store, &io);
+    }
+    store.close().expect("close");
+    drop(store);
+    io.remove_file(&SummaryPaths::new(Path::new(ROOT)).current).expect("remove");
+
+    let config = StoreConfig {
+        memory_budget: LEAST_BUDGET,
+        ..config()
+    };
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+
+    assert_eq!(store.dropped_summary_rows(), 0);
+    assert_eq!(hold(&store.state.volumes[0].summary).rows().count() as u64, MANY_SEGMENTS);
     store.close().expect("close");
 }

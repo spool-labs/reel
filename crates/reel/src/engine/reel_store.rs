@@ -240,10 +240,20 @@ impl<Backend: Io> EngineState<Backend> {
         let mut claims = hold(&volume.claims);
         for segment in claims.open.drain(..) {
             self.slot_files[segment.slot.0 as usize].set(None);
-            self.io.close_file(segment.data);
+            // a seal past its install left the table as the data file's owner
+            if !volume.table.holds(segment.number) {
+                self.io.close_file(segment.data);
+            }
             self.io.close_file(segment.rows);
         }
         drop(claims);
+
+        // a seal stopped between its switch and its clean left its rows with the slot
+        for slot_file in &self.slot_files {
+            if let Some(rows) = hold(&slot_file.leaving_rows).take() {
+                self.io.close_file(rows);
+            }
+        }
 
         for shard in 0..TABLE_SHARDS {
             let mut guard = volume.table.write_shard(shard);

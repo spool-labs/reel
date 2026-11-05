@@ -354,6 +354,9 @@ impl SimulatedDisk {
                 apply_name(&mut self.durable_names, &change);
             }
         }
+        // a link can outlive its own unlink in this shuffle, and a real file system has no name for a freed inode
+        let inodes = &self.inodes;
+        self.durable_names.retain(|_path, inode| inodes.contains_key(inode));
         self.names.clone_from(&self.durable_names);
 
         for image in self.inodes.values_mut() {

@@ -47,6 +47,7 @@ pub struct SlotData<File> {
 #[derive(Debug)]
 pub struct SlotFile<File> {
     pub data: RwLock<Option<SlotData<File>>>,
+    pub leaving_rows: Mutex<Option<File>>,
     pub pins: AtomicU32,
 }
 
@@ -100,6 +101,7 @@ impl<File: Clone> SlotFile<File> {
     pub fn new() -> Self {
         Self {
             data: RwLock::new(None),
+            leaving_rows: Mutex::new(None),
             pins: AtomicU32::new(0),
         }
     }

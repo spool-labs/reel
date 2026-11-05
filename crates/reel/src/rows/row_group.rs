@@ -116,6 +116,11 @@ impl RowGroupBuffer {
         true
     }
 
+    /// Count the bytes the finished group takes in the file
+    pub fn total_length(&self) -> ByteCount {
+        ByteCount((self.used + GROUP_SUM_BYTES) as u64)
+    }
+
     /// Close the group and return its bytes, ready to write
     pub fn finish(&mut self, synced_through: FileOffset, record_key: RecordKey) -> &[u8] {
         let total = self.used + GROUP_SUM_BYTES;

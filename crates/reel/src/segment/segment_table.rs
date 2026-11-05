@@ -256,6 +256,11 @@ impl<File: Clone> SegmentTable<File> {
         true
     }
 
+    /// Check the table has a segment
+    pub fn holds(&self, number: SegmentNumber) -> bool {
+        self.read_shard(shard_of(number)).map.get(number).is_some()
+    }
+
     /// Hold a segment open for a read, or return nothing when it has left the table
     pub fn pin(&self, number: SegmentNumber) -> Option<SegmentPin<'_, File>> {
         let shard = shard_of(number);

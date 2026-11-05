@@ -348,6 +348,7 @@ impl<Backend: Io> SealJob<Backend> {
 
         let mut claims = hold(&volume.claims);
         claims.open.retain(|segment| segment.slot != target.slot);
+        *hold(&state.slot_files[target.slot.0 as usize].leaving_rows) = Some(target.rows.clone());
         drop(claims);
         self.phase = SealPhase::Cleaning;
     }
@@ -364,7 +365,9 @@ impl<Backend: Io> SealJob<Backend> {
         if slot_file.pin_count() > 0 {
             return false;
         }
-        self.state.io.close_file(target.rows.clone());
+        if let Some(rows) = hold(&slot_file.leaving_rows).take() {
+            self.state.io.close_file(rows);
+        }
         self.state.free_slot(target.slot);
         true
     }

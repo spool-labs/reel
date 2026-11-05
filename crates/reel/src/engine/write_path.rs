@@ -666,8 +666,15 @@ impl<Backend: Io> EngineState<Backend> {
         }
 
         let mut new_end = rows_end;
-        if outcome.is_ok() && !group.is_empty() {
-            let bytes = group.finish(synced_through, self.record_key);
+        // a sync with no new rows still writes an empty group, or open would read what it covered as unsynced
+        let has_uncovered_rows = data.is_some() && synced_through < rows_end;
+        if outcome.is_ok() && (!group.is_empty() || has_uncovered_rows) {
+            // a sync turn synced this group's records before writing it, so the group covers itself
+            let through = match data {
+                Some(_data) => FileOffset(rows_end.0 + group.total_length().0),
+                None => synced_through,
+            };
+            let bytes = group.finish(through, self.record_key);
             let parts = [IoSlice::new(bytes)];
             outcome = rows.write_at(rows_end, &parts);
             new_end = FileOffset(rows_end.0 + bytes.len() as u64);

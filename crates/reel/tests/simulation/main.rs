@@ -6,6 +6,7 @@ mod io_contract;
 mod place_limit;
 mod records;
 mod write_index;
+mod faults;
 mod footers;
 mod spot_index;
 mod staged;

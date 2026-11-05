@@ -596,3 +596,46 @@ fn close_mark() {
 
     assert_eq!(saved, Some(mark));
 }
+
+// rot in a record the last sync covered reads as corruption, and never as the older version under it
+#[test]
+fn flushed_rot() {
+    let io = SimulatedIo::new(Seed(18));
+    let store = open(&io);
+    let key = key_of(ORDERED, 1);
+    store.put(ORDERED, &key, b"older").expect("put");
+    seal(&store, &io);
+    store.put(ORDERED, &key, b"newer").expect("put");
+    store.flush().expect("flush");
+    io.kill();
+    drop(store);
+
+    let files = data_files(&io);
+    io.rot(&files[files.len() - 1], FileOffset(3), FLIP).expect("rot");
+    let store = open(&io);
+
+    assert!(matches!(read(&store, ORDERED, &key), Err(StoreError::Corruption { .. })));
+    store.close().expect("close");
+}
+
+// a sync that found no new rows still covers what the row job wrote out before it
+#[test]
+fn later_sync() {
+    let io = SimulatedIo::new(Seed(19));
+    let store = open(&io);
+    let key = key_of(ORDERED, 1);
+    store.put(ORDERED, &key, b"older").expect("put");
+    seal(&store, &io);
+    store.put(ORDERED, &key, b"newer").expect("put");
+    settle(&io);
+    store.flush().expect("flush");
+    io.kill();
+    drop(store);
+
+    let files = data_files(&io);
+    io.rot(&files[files.len() - 1], FileOffset(3), FLIP).expect("rot");
+    let store = open(&io);
+
+    assert!(matches!(read(&store, ORDERED, &key), Err(StoreError::Corruption { .. })));
+    store.close().expect("close");
+}

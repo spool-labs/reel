@@ -398,7 +398,11 @@ impl<Backend: Io> EngineState<Backend> {
         scanned.rows.truncate(ByteCount(kept_end.0))?;
 
         let synced_through = FileOffset(scanned.scan.synced_through.0.min(kept_end.0));
+        let unsynced = ByteCount(kept_end.0 - synced_through.0);
+        rewrite_range(&scanned.rows, synced_through, unsynced, &mut vec![0; GROUP_BYTES.0 as usize])?;
         hold(&self.queues[slot.0 as usize]).reset(kept_end, synced_through);
+        // what open keeps, a read can see: this sync covers it on disk, so no crash or rot can take it back
+        self.write_out_turn(slot, &scanned.rows, Some(&found.data))?;
         self.slot_files[slot.0 as usize].set(Some(SlotData {
             segment: found.number,
             file: found.data.clone(),
@@ -451,6 +455,7 @@ impl<Backend: Io> EngineState<Backend> {
         recovered: &mut RecoveredRows,
     ) -> Result<Option<FileOffset>> {
         let mut bytes = vec![0; GROUP_BYTES.0 as usize];
+        let mut copy = vec![0; GROUP_BYTES.0 as usize];
         let mut value = Vec::new();
         let mut at = FileOffset(0);
         let end = ByteCount(scan.valid_end.0);
@@ -469,6 +474,7 @@ impl<Backend: Io> EngineState<Backend> {
                     if !self.is_record_whole(target.data, &row, records, &mut value)? {
                         return Ok(Some(at));
                     }
+                    rewrite_range(target.data, row.offset, row.length, &mut copy)?;
                 }
             }
 
@@ -546,6 +552,20 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn resume_numbers(&self, highest_segment: SegmentNumber) {
         self.next_segment.fetch_max(highest_segment.0 + 1, Ordering::AcqRel);
     }
+}
+
+/// Write a range back over itself: a kernel forgets the writes a failed sync covered and keeps showing
+/// them, so bytes no sync covered must be dirty again before a later sync can say they're on disk
+pub fn rewrite_range<File: IoFile>(file: &File, start: FileOffset, length: ByteCount, copy: &mut [u8]) -> Result<()> {
+    let mut at = start.0;
+    let end = start.0 + length.0;
+    while at < end {
+        let step = copy.len().min((end - at) as usize);
+        file.read_exact_at(FileOffset(at), &mut copy[..step])?;
+        file.write_at(FileOffset(at), &[IoSlice::new(&copy[..step])])?;
+        at += step as u64;
+    }
+    Ok(())
 }
 
 /// Bring every open segment back, sealing as a running store at this budget would have, and leave

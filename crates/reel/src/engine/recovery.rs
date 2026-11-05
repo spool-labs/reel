@@ -1038,8 +1038,10 @@ pub fn copy_row<Backend: Io>(
                         segment: copied.segment,
                     });
                     if !has_room {
-                        state.damage_whole(volume, copied.segment);
-                        state.save_summary(target)?;
+                        // the cover's row stays in the copy, so this holds for this open and the next open decides again
+                        for range in whole_columns(state, volume, copied.segment, state.order.mark()) {
+                            target.damage.add(&range);
+                        }
                     }
                 }
                 claim.finish();

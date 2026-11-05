@@ -5,12 +5,16 @@ use std::thread;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::open_segment::{data_path, rows_path};
+use reel::engine::recovery::copy_row;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::write_path::ClaimRequest;
 use reel::guard::hold;
 use reel::io::{Io, IoFile};
 use reel::record::codec::Codec;
-use reel::segment::range_covers::MOST_RANGE_COVERS;
+use reel::record::record_head::plain_length;
+use reel::row_kind::RowKind;
+use reel::rows::row_group::RowEntry;
+use reel::segment::range_covers::{Cover, MOST_RANGE_COVERS};
 use reel::segment::segment_tail::{SECOND_TAIL_DISTANCE, SegmentNumber};
 use reel_api::column_id::ColumnId;
 use reel_api::reads::ValueWindow;
@@ -851,4 +855,63 @@ fn rotted_cover_seal() {
             store.close().expect("close");
         }
     }
+}
+
+// a copied cover with no slot refuses its columns for this open, and the next open decides again from the rows
+#[test]
+fn copied_cover_full() {
+    let io = SimulatedIo::new(Seed(32));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"older").expect("put");
+    seal(&store, &io);
+    store.delete_range(COLUMN, b"key", b"kez").expect("delete");
+    store.flush().expect("flush");
+
+    let volume = &store.state.volumes[0];
+    let length = plain_length(ByteCount(b"kez".len() as u64));
+    let (number, data, offset) = {
+        let claims = hold(&volume.claims);
+        let segment = claims.open.iter().find(|segment| segment.cover_rows > 0).expect("a cover");
+        (segment.number, segment.data.clone(), FileOffset(segment.write_end.0 - length.0))
+    };
+    let row = RowEntry {
+        column: COLUMN,
+        key: b"key",
+        place: store.state.order.mark(),
+        offset,
+        length,
+        kind: RowKind::RangeDelete,
+    };
+    // at a real open a copied cover isn't in the pool yet, so the test takes it out
+    volume.covers.drop_inside(&Cover {
+        column: COLUMN,
+        start: b"a",
+        end: b"z",
+        place: WritePlace(row.place.0 + 1),
+        segment: number,
+    });
+    for filler in 0..MOST_RANGE_COVERS as u64 {
+        let (start, end) = (key_of(filler * 2), key_of(filler * 2 + 1));
+        let cover = Cover {
+            column: OTHER,
+            start: &start,
+            end: &end,
+            place: WritePlace(1),
+            segment: number,
+        };
+        if !volume.covers.add(&cover) {
+            break;
+        }
+    }
+
+    copy_row(&store.state, 0, number, &data, &row, &mut Vec::new()).expect("copy");
+
+    let mut buf = Vec::new();
+    assert!(matches!(store.get(COLUMN, b"key", &mut buf), Err(StoreError::Corruption { .. })));
+    store.close().expect("close");
+    drop(store);
+
+    let store = open(&io);
+    assert_eq!(read(&store, COLUMN, b"key"), None);
+    store.close().expect("close");
 }

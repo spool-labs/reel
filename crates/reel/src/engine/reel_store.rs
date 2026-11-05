@@ -161,6 +161,13 @@ impl<Backend: Io> ReelStore<Backend> {
         Ok(())
     }
 
+    /// Mark each volume's fullest taking segment to seal, as an idle volume does on its own
+    pub fn seal_now(&self) {
+        for volume in &self.state.volumes {
+            self.state.seal_fullest(volume);
+        }
+    }
+
     /// Stop every job, make every returned write durable and release the locks
     pub fn close(&self) -> Result<(), StoreError> {
         if self.is_closed.swap(true, Ordering::AcqRel) {

@@ -257,6 +257,30 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
+    /// Mark a volume's fullest taking segment to seal
+    pub fn seal_fullest(&self, volume: &Volume<Backend>) {
+        let mut claims = hold(&volume.claims);
+        let mut fullest: Option<usize> = None;
+        for (index, segment) in claims.open.iter().enumerate() {
+            if segment.phase == SegmentPhase::Taking && segment.row_count.0 > 0 {
+                let is_fuller = match fullest {
+                    Some(best) => segment.write_end > claims.open[best].write_end,
+                    None => true,
+                };
+                if is_fuller {
+                    fullest = Some(index);
+                }
+            }
+        }
+
+        if let Some(index) = fullest {
+            claims.open[index].phase = SegmentPhase::Sealing;
+            if let Some(task) = self.seal_tasks[volume.id.0 as usize].get() {
+                task.wake();
+            }
+        }
+    }
+
     /// Create a segment's files outside every lock, or return nothing when no slot is free yet
     pub fn create_segment(
         &self,

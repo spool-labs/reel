@@ -25,6 +25,10 @@ const SETTLE_STEPS: u64 = 2_000_000;
 const KILL_WINDOW: Nanoseconds = Nanoseconds(100_000_000);
 const TICK: Nanoseconds = Nanoseconds(5_000_000);
 const MOST_VALUE_BYTES: u64 = 300;
+const SEAL_ROWS: u64 = 200;
+const SEAL_STEPS: u64 = 1_000;
+const SEAL_CRASH_POINTS: u64 = 14;
+const SEAL_CRASH_SEEDS: u64 = 3;
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -359,4 +363,138 @@ fn reconcile(store: &Store, model: &mut Model, crash: Crash) {
         model.accept_crash(&key, found, crash);
     }
     model.returned.clear();
+}
+
+fn fill_sealable(store: &Store, rows: u64) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let mut expected = BTreeMap::new();
+    for number in 0..rows {
+        let key = key_of(number);
+        let value = format!("value-{number}").into_bytes();
+        store.put(COLUMN, &key, &value).expect("put");
+        expected.insert(key, value);
+    }
+    expected
+}
+
+fn check_all(store: &Store, expected: &BTreeMap<Vec<u8>, Vec<u8>>) {
+    for (key, value) in expected {
+        assert_eq!(read(store, key).as_ref(), Some(value));
+    }
+}
+
+// a crash at any operation of a seal loses no flushed write, through two reopens
+#[test]
+fn seal_crashes() {
+    for crash_at in 0..SEAL_CRASH_POINTS {
+        for seed in 0..SEAL_CRASH_SEEDS {
+            for crash in [Crash::Kill, Crash::PowerCut] {
+                crash_during_seal(OperationCount(crash_at), Seed(seed), crash);
+            }
+        }
+    }
+}
+
+fn crash_during_seal(crash_at: OperationCount, seed: Seed, crash: Crash) {
+    let io = SimulatedIo::new(seed);
+    let store = open(&io);
+    let expected = fill_sealable(&store, SEAL_ROWS);
+    store.flush().expect("flush");
+
+    store.seal_now();
+    io.arm_crash(crash_at);
+    for _step in 0..SEAL_STEPS {
+        if io.step_any().is_none() || io.is_crashed() {
+            break;
+        }
+    }
+
+    match crash {
+        Crash::Kill => io.kill(),
+        Crash::PowerCut => io.power_cut(),
+    }
+    drop(store);
+
+    let store = open(&io);
+    check_all(&store, &expected);
+    settle(&io);
+    check_all(&store, &expected);
+
+    io.kill();
+    drop(store);
+    let store = open(&io);
+    check_all(&store, &expected);
+    store.close().expect("close");
+    assert_eq!(io.open_handle_count(), 0);
+    assert_eq!(io.handle_faults(), OperationCount(0));
+}
+
+// every step of a seal answers the same, for keys in the sealing segment and for keys written beside it
+#[test]
+fn gets_through_seal() {
+    let io = SimulatedIo::new(Seed(7));
+    let store = open(&io);
+    let mut expected = fill_sealable(&store, SEAL_ROWS);
+    store.put(COLUMN, b"gone-later", b"old").expect("put");
+
+    store.seal_now();
+    store.put(COLUMN, &key_of(1), b"newer-beside-the-seal").expect("put");
+    expected.insert(key_of(1), b"newer-beside-the-seal".to_vec());
+    store.delete(COLUMN, b"gone-later").expect("delete");
+
+    let mut steps = 0;
+    loop {
+        check_all(&store, &expected);
+        assert_eq!(read(&store, b"gone-later"), None);
+        steps += 1;
+        if io.step_any().is_none() {
+            break;
+        }
+    }
+
+    assert!(steps > 3);
+    store.close().expect("close");
+}
+
+// a sealed grave takes its key out of the spot cache, so a cached value can't come back
+#[test]
+fn spot_grave() {
+    let io = SimulatedIo::new(Seed(8));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    store.seal_now();
+    settle(&io);
+    assert_eq!(read(&store, b"key"), Some(b"value".to_vec()));
+    assert_eq!(read(&store, b"key"), Some(b"value".to_vec()));
+
+    store.delete(COLUMN, b"key").expect("delete");
+    store.seal_now();
+    settle(&io);
+
+    assert_eq!(read(&store, b"key"), None);
+    store.close().expect("close");
+}
+
+// a get that started before a hand-over can't put its older row in the spot cache
+#[test]
+fn spot_fence() {
+    let io = SimulatedIo::new(Seed(9));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"older").expect("put");
+    store.seal_now();
+    settle(&io);
+
+    let volume = &store.state.volumes[0];
+    let before = volume.handover_count();
+    let point = store.state.read_point();
+    let hit = store.state.key_read(COLUMN, b"key", point, false).expect("key");
+    let older = store.state.search_footers(volume, &hit).expect("footers").expect("row");
+
+    store.put(COLUMN, b"key", b"newer").expect("put");
+    store.seal_now();
+    settle(&io);
+    store.state.spot.remove(hit.hash);
+    store.state.fill_spot(volume, &hit, &older, before);
+
+    assert_eq!(read(&store, b"key"), Some(b"newer".to_vec()));
+    store.close().expect("close");
 }

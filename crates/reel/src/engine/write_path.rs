@@ -271,6 +271,9 @@ impl<Backend: Io> EngineState<Backend> {
         request: &ClaimRequest,
     ) -> Result<Claim<'state, Backend>, StoreError> {
         loop {
+            // a failed volume frees no slot, so a wait for one would never end
+            check_writable(volume)?;
+
             let mut claims = hold(&volume.claims);
             if let Some(index) = pick_segment(&claims, volume, request) {
                 let Some(ticket) = self.order.try_claim(request.rows) else {

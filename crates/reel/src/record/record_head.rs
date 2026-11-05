@@ -3,7 +3,7 @@
 use reel_api::units::ByteCount;
 
 use crate::little_endian::read_word;
-use crate::record::chunk_table::{ChunkCount, TablePageIndex, page_count};
+use crate::record::chunk_table::{ChunkCount, TablePageIndex, page_count, table_bytes};
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::record_check::{Checksum, RecordCheck};
 
@@ -73,4 +73,13 @@ pub fn read_value_length(bytes: &[u8]) -> Option<ByteCount> {
 /// Read one page's checksum from a chunked head
 pub fn read_page_sum(bytes: &[u8], page: TablePageIndex) -> Option<Checksum> {
     Some(Checksum(read_word(bytes, PAGE_SUMS_AT + page.0 as usize * PAGE_SUM_BYTES)?))
+}
+
+/// Count the bytes of a record stored as written, with no need to hash the value
+pub fn plain_length(value_length: ByteCount) -> ByteCount {
+    if value_length.0 <= CHUNK_BYTES as u64 {
+        return ByteCount(SMALL_HEAD_BYTES as u64 + value_length.0);
+    }
+    let head = chunked_head_bytes(value_length) as u64;
+    ByteCount(head + table_bytes(chunk_count(value_length)).0 + value_length.0)
 }

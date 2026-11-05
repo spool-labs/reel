@@ -117,6 +117,30 @@ impl RowGroupBuffer {
         true
     }
 
+    /// Count the bytes of the rows in this group
+    pub fn row_bytes(&self) -> usize {
+        self.used - GROUP_HEADER_BYTES
+    }
+
+    /// Walk the rows in this group
+    pub fn walk(&self) -> RowWalk<'_> {
+        RowWalk {
+            rows: &self.bytes[GROUP_HEADER_BYTES..self.used],
+        }
+    }
+
+    /// Add another group's rows, or return false when they don't fit
+    pub fn append(&mut self, other: &Self) -> bool {
+        let size = other.row_bytes();
+        if !self.has_room(size) {
+            return false;
+        }
+        self.bytes[self.used..self.used + size].copy_from_slice(&other.bytes[GROUP_HEADER_BYTES..other.used]);
+        self.used += size;
+        self.row_count += other.row_count;
+        true
+    }
+
     /// Close the group and return its bytes, ready to write
     pub fn finish(&mut self, synced_through: FileOffset, record_key: RecordKey) -> &[u8] {
         let total = self.used + GROUP_SUM_BYTES;

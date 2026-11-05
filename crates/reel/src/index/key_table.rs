@@ -48,7 +48,17 @@ impl KeyTable {
 
     /// Check a new key can go in, which also keeps every probe finite
     pub fn has_room(&self) -> bool {
-        self.used * LOAD_LIMIT_SCALE < self.slots.len() * LOAD_LIMIT_EIGHTHS
+        self.has_room_for(1)
+    }
+
+    /// Check this many new keys can go in
+    pub fn has_room_for(&self, rows: u64) -> bool {
+        (self.used as u64 + rows - 1) * (LOAD_LIMIT_SCALE as u64) < (self.slots.len() * LOAD_LIMIT_EIGHTHS) as u64
+    }
+
+    /// Count the keys an empty table of this size takes
+    pub fn most_rows(&self) -> u64 {
+        (self.slots.len() * LOAD_LIMIT_EIGHTHS / LOAD_LIMIT_SCALE) as u64
     }
 
     /// Find the slot of a key, or the empty slot where it belongs

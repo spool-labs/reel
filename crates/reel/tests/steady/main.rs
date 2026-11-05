@@ -19,6 +19,7 @@ use reel::io::plain::PlainIo;
 use reel::segment::segment_tail::SECOND_TAIL_DISTANCE;
 use reel_api::store_error::StoreError;
 use reel_api::units::ByteCount;
+use reel_api::write_batch::WriteBatch;
 
 mod store_config;
 
@@ -129,6 +130,8 @@ struct Inputs {
     small: Vec<u8>,
     chunked: Vec<u8>,
     compressible: Vec<u8>,
+    batch: WriteBatch,
+    large_batch: WriteBatch,
     buf: Vec<u8>,
 }
 
@@ -199,19 +202,37 @@ fn open(root: &Path) -> Store {
     ReelStore::open(PlainIo::new(), &config(root, BUDGET)).expect("open")
 }
 
+// two batches: small rows on the shared encoders, and a compressed large value on the large one
+fn batches(keys: &[Vec<u8>], small: &[u8], compressible: &[u8]) -> (WriteBatch, WriteBatch) {
+    let mut batch = WriteBatch::new();
+    batch.put(META, &keys[0], small);
+    batch.put(META, &keys[1], small);
+    batch.delete(BULK, &keys[1]);
+    let mut large_batch = WriteBatch::new();
+    large_batch.put(BULK, &keys[2], compressible);
+    large_batch.put(META, &keys[2], small);
+    (batch, large_batch)
+}
+
 fn inputs() -> Inputs {
     let mut chunked = vec![0; CHUNKED_BYTES];
     for (index, byte) in chunked.iter_mut().enumerate() {
         *byte = (index.wrapping_mul(2_654_435_761) >> 13) as u8;
     }
+    let keys: Vec<Vec<u8>> = (0..KEYS).map(|number| format!("key-{number:06}").into_bytes()).collect();
+    let small = vec![7; SMALL_BYTES];
+    let compressible = vec![b'x'; CHUNKED_BYTES];
+    let (batch, large_batch) = batches(&keys, &small, &compressible);
     Inputs {
-        keys: (0..KEYS).map(|number| format!("key-{number:06}").into_bytes()).collect(),
+        keys,
         missing: b"key-missing".to_vec(),
         damaged: b"damaged-000100".to_vec(),
         damaged_end: b"damaged-000101".to_vec(),
-        small: vec![7; SMALL_BYTES],
+        small,
         chunked,
-        compressible: vec![b'x'; CHUNKED_BYTES],
+        compressible,
+        batch,
+        large_batch,
         buf: vec![1; CHUNKED_BYTES * 2],
     }
 }
@@ -241,6 +262,8 @@ fn round(store: &Store, inputs: &mut Inputs, number: usize) {
     assert!(!store.get(META, &inputs.missing, buf).expect("get a miss"));
     assert!(store.contains(META, key).expect("contains"));
     store.delete(BULK, other).expect("delete");
+    store.write_batch(&inputs.batch).expect("batch");
+    store.write_batch(&inputs.large_batch).expect("large batch");
 
     let refused = store.get(META, &inputs.damaged, buf);
     assert!(matches!(refused, Err(StoreError::Corruption { .. })));

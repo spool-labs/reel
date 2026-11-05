@@ -10,6 +10,7 @@ use reel_api::memory_report::MemoryReport;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, VolumeId, WritePlace};
+use reel_api::write_batch::WriteBatch;
 
 use crate::config::{ColumnConfig, StoreConfig};
 use crate::engine::column_info::ColumnInfo;
@@ -150,6 +151,12 @@ impl<Backend: Io> ReelStore<Backend> {
     pub fn put(&self, column: ColumnId, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.check_open()?;
         self.state.write_value(column, key, value)
+    }
+
+    /// Apply a batch whole, in batch order, visible to every later read when this returns
+    pub fn write_batch(&self, batch: &WriteBatch) -> Result<(), StoreError> {
+        self.check_open()?;
+        self.state.write_batch(batch)
     }
 
     /// Write a grave
@@ -747,6 +754,7 @@ pub fn build_state<Backend: Io>(
         free_slots: Mutex::new(free_slots),
         encoders: Pool::new(encoders),
         large_encoders: Pool::new(large_encoders),
+        batch_rows: Pool::new((0..WRITE_BUFFERS).map(|_buffer| RowGroupBuffer::new(GROUP_BYTES)).collect()),
         record_readers: Pool::new(record_readers),
         footer_readers: Pool::new(footer_readers),
         superblock: Mutex::new(superblock),

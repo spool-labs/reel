@@ -99,7 +99,7 @@ impl StoreShape {
     /// Add up what a store holds whatever its budget: buffers, pools, stacks and the spans a summary must keep
     pub fn fixed_bytes(&self) -> ByteCount {
         let volumes = self.volumes as u64;
-        let queues = self.open_slots() as u64 * 2 * GROUP_BYTES.0;
+        let queues = (self.open_slots() as u64 * 2 + WRITE_BUFFERS as u64) * GROUP_BYTES.0;
         let reads = READ_BUFFERS as u64 * READ_BUFFER_BYTES;
         let large = if self.has_lz4 { LZ4_STORED_LIMIT.0 } else { 0 };
         let encoders = (WRITE_BUFFERS as u64 + 1) * ENCODER_BYTES + large;

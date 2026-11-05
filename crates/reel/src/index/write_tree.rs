@@ -48,6 +48,7 @@ pub struct WriteTree {
     pub chain_tail: NodeIndex,
     pub node_count: NodeCount,
     pub pages: PageChain,
+    pub batch_pages: PageChain,
     pub cleanup: Option<TreePosition>,
     pub segment: SegmentNumber,
 }
@@ -88,6 +89,7 @@ impl WriteTree {
             chain_tail: NO_NODE,
             node_count: NodeCount::default(),
             pages: PageChain::empty(),
+            batch_pages: PageChain::empty(),
             cleanup: None,
             segment: SegmentNumber(0),
         }
@@ -97,6 +99,7 @@ impl WriteTree {
     pub fn clear(&mut self, nodes: &mut NodePool, slab: &mut EntrySlab) {
         nodes.release(self.chain_head, self.chain_tail, self.node_count);
         slab.release(&mut self.pages);
+        slab.release(&mut self.batch_pages);
         *self = Self::empty();
     }
 

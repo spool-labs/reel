@@ -18,6 +18,7 @@ use reel::superblock::Superblock;
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId};
+use reel_api::write_batch::WriteBatch;
 
 const ROOTS: [&str; 3] = ["/disk/faults-meta", "/disk/faults-meta-two", "/disk/faults-bulk"];
 const COLUMNS: [ColumnId; 2] = [ColumnId(1), ColumnId(2)];
@@ -41,6 +42,8 @@ const LARGE_VALUE_BYTES: usize = 200_000;
 const POLICY_BYTES: ByteCount = ByteCount(4_096);
 const SYNCED_FILES: [&str; 4] = ["data", "rows", "summary", "new"];
 const MOST_SYNC_SKIP: u64 = 6;
+const BATCH_SETS: u64 = 6;
+const SET_KEYS: u64 = 3;
 
 type Store = ReelStore<SimulatedIo>;
 type Key = (ColumnId, Vec<u8>);
@@ -189,6 +192,10 @@ fn durable_rows(io: &SimulatedIo, path: &Path) -> Option<(u64, u64)> {
     let covered = groups.iter().filter(|group| group.0 < last_mark).map(|group| group.1).max()?;
     let data_end = groups.iter().filter(|group| group.0 < covered).map(|group| group.2).max().unwrap_or(0);
     Some((covered, data_end))
+}
+
+fn set_key(set: u64, number: u64) -> Vec<u8> {
+    format!("set-{set:02}-{number}").into_bytes()
 }
 
 impl Run {
@@ -393,6 +400,49 @@ impl Run {
         }
     }
 
+    // a set's keys always hold one value, so a read of them after a crash shows a batch that landed in part
+    fn write_set(&mut self, store: &Store) {
+        let column = COLUMNS[self.random.below(COLUMNS.len() as u64) as usize];
+        let set = self.random.below(BATCH_SETS);
+        let is_grave = self.random.one_in(4);
+        let bytes = format!("set-{}", self.random.next_word()).into_bytes();
+        let value = (!is_grave).then_some(bytes);
+        let mut batch = WriteBatch::new();
+        for number in 0..SET_KEYS {
+            let key = set_key(set, number);
+            // the first of two operations on a key never shows, since the later one wins
+            batch.put(column, &key, b"overwritten");
+            match &value {
+                Some(value) => batch.put(column, &key, value),
+                None => batch.delete(column, &key),
+            }
+        }
+
+        let written = store.write_batch(&batch);
+        let has_landed = matches!(written, Err(StoreError::Io { action: "syncing a volume", .. }));
+        if written.is_ok() || has_landed || self.io.is_crashed() {
+            let is_covered = written.is_ok() && column == COLUMNS[0] && self.policy == SyncPolicy::EveryWrite;
+            for number in 0..SET_KEYS {
+                let versions = self.model.entry((column, set_key(set, number))).or_default();
+                versions.history.push(value.clone());
+                if is_covered {
+                    versions.floor = versions.history.len() - 1;
+                }
+            }
+        }
+    }
+
+    // a refused key says nothing, and every key that answers must agree
+    fn check_sets(&self, store: &Store) {
+        for column in COLUMNS {
+            for set in 0..BATCH_SETS {
+                let answers: Vec<_> = (0..SET_KEYS).filter_map(|number| read(store, column, &set_key(set, number)).ok()).collect();
+                let is_whole = answers.iter().all(|answer| *answer == answers[0]);
+                assert!(is_whole, "seed {}: set {set} landed in part: {answers:?}", self.seed);
+            }
+        }
+    }
+
     fn flush(&mut self, store: &Store) {
         if store.flush().is_ok() {
             for versions in self.model.values_mut() {
@@ -430,7 +480,8 @@ impl Run {
             }
 
             match self.random.below(10) {
-                0..4 => self.write(store),
+                0..3 => self.write(store),
+                3 => self.write_set(store),
                 4 => self.flush(store),
                 5 => store.seal_now(),
                 6..8 => {
@@ -460,6 +511,7 @@ impl Run {
             // open syncs what it shows, so what it showed can't go back
             versions.floor = versions.history.len() - 1;
         }
+        self.check_sets(store);
     }
 
     fn settle(&self) {

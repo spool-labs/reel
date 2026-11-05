@@ -2,6 +2,7 @@
 #![cfg(test)]
 
 mod allocations;
+mod batches;
 mod counting;
 mod damage;
 mod io_contract;

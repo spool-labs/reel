@@ -10,7 +10,7 @@ use reel::record::chunk_table::{ChunkEntry, ENTRIES_PER_PAGE};
 use reel::record::codec::{CHUNK_BYTES, Codec};
 use reel::record::record_check::{Checksum, RecordIdentity, RecordKey, checksum};
 use reel::record::record_encoder::RecordEncoder;
-use reel::record::record_head::{SMALL_HEAD_BYTES, chunk_count, chunked_head_bytes};
+use reel::record::record_head::{SMALL_HEAD_BYTES, chunk_count, chunked_head_bytes, plain_length};
 use reel::record::record_reader::{FIRST_READ_BYTES, RecordLocation, RecordRead, RecordReader};
 use reel::row_kind::RowKind;
 use reel_api::column_id::ColumnId;
@@ -25,6 +25,7 @@ const ROOT: &str = "/disk/records";
 const LARGEST: ByteCount = ByteCount(64 * 1024 * 1024);
 const LEADING_BYTES: u64 = 100;
 const ROT: BitMask = BitMask(0b0001_0000);
+const PLAIN_MOST: usize = 2 * 1024 * 1024;
 
 struct Stored {
     io: SimulatedIo,
@@ -417,4 +418,24 @@ fn wrong_place() {
 
     assert_eq!(read, RecordRead::Failed);
     assert_eq!(read_all(&stored, &identity()).0, RecordRead::Valid);
+}
+
+// the length a batch adds up with no hashing is the length the encoder lays out, on either side of a chunk
+#[test]
+fn plain_lengths() {
+    let identity = RecordIdentity {
+        record_key: RecordKey(1),
+        column: ColumnId(1),
+        key: b"key",
+        kind: RowKind::Value,
+        place: WritePlace(1),
+    };
+    let mut encoder = RecordEncoder::new(ByteCount(PLAIN_MOST as u64), ByteCount(CHUNK_BYTES as u64));
+    for length in [0, 1, CHUNK_BYTES - 1, CHUNK_BYTES, CHUNK_BYTES + 1, CHUNK_BYTES * 3, PLAIN_MOST] {
+        let value = vec![1; length];
+
+        let shape = encoder.encode(&identity, Codec::None, &value).expect("encode");
+
+        assert_eq!(plain_length(ByteCount(length as u64)), shape.total_length(), "{length} bytes");
+    }
 }

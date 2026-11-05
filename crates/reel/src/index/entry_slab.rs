@@ -107,9 +107,19 @@ impl EntrySlab {
         ByteCount((self.bytes.capacity() + links) as u64)
     }
 
+    /// Check this many pages are free
+    pub fn has_free_pages(&self, pages: PageCount) -> bool {
+        self.free_pages >= pages
+    }
+
+    /// Count every page of this slab
+    pub fn total_pages(&self) -> PageCount {
+        PageCount(self.next_page.len() as u32)
+    }
+
     /// Check a row of this key length could be stored
-    pub fn has_room(&self, chain: &PageChain, key_length: usize) -> bool {
-        chain.used + entry_size(key_length) <= PAGE_BYTES || self.free_pages.0 > 0
+    pub fn has_room(&self, chain: &PageChain, key_length: usize, held: PageCount) -> bool {
+        chain.used + entry_size(key_length) <= PAGE_BYTES || self.free_pages > held
     }
 
     /// Store a row and return where it went, or nothing when the pages ran out

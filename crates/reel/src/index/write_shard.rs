@@ -6,10 +6,10 @@ use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
 use reel_api::units::{ByteCount, RowCount, WritePlace};
 
-use crate::index::entry_slab::{EntryAddress, EntrySlab, NO_ENTRY, PageCount};
+use crate::index::entry_slab::{ENTRY_ALIGNMENT, EntryAddress, EntrySlab, NO_ENTRY, PAGE_BYTES, PageCount, entry_size};
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::key_table::KeyTable;
-use crate::index::node_pool::{NodeCount, NodePool};
+use crate::index::node_pool::{NODE_FANOUT, NodeCount, NodePool};
 use crate::index::open_slots::{OpenSlot, OpenSlots};
 use crate::index::seek_target::SeekTarget;
 use crate::index::shard_cursor::{MAX_CURSOR_STEPS, ShardCursor, TreeCursor};
@@ -24,6 +24,40 @@ pub struct ShardSizing {
     pub nodes: NodeCount,
     pub table_slots: usize,
     pub open_slots: usize,
+}
+
+/// What a batch asks of one shard
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ShardNeed {
+    pub rows: u64,
+    pub entry_bytes: u64,
+    pub largest_entry: u64,
+}
+
+/// Room batches hold in a shard until their rows are in
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ShardHold {
+    pub rows: u64,
+    pub pages: PageCount,
+}
+
+impl ShardNeed {
+    /// Count one more row of this key length
+    pub fn add(&mut self, key_length: usize) {
+        let size = entry_size(key_length) as u64;
+        self.rows += 1;
+        self.entry_bytes += size;
+        self.largest_entry = self.largest_entry.max(size);
+    }
+
+    /// Count the pages these rows can take: a page stops short only of an entry that doesn't fit
+    pub fn pages(&self) -> PageCount {
+        if self.rows == 0 {
+            return PageCount(0);
+        }
+        let filled = PAGE_BYTES as u64 + ENTRY_ALIGNMENT as u64 - self.largest_entry;
+        PageCount(self.entry_bytes.div_ceil(filled) as u32)
+    }
 }
 
 /// Where a walk goes next
@@ -42,6 +76,7 @@ pub struct WriteShard {
     pub slab: EntrySlab,
     pub table: KeyTable,
     pub trees: Vec<WriteTree>,
+    pub held: ShardHold,
 }
 
 impl WriteShard {
@@ -52,6 +87,7 @@ impl WriteShard {
             slab: EntrySlab::new(sizing.pages),
             table: KeyTable::new(sizing.table_slots),
             trees: vec![WriteTree::empty(); sizing.open_slots],
+            held: ShardHold::default(),
         }
     }
 
@@ -65,7 +101,50 @@ impl WriteShard {
     /// Check the pools can take one more row of this key length in a slot
     pub fn has_room(&self, slot: OpenSlot, key_length: usize) -> bool {
         let tree = &self.trees[slot.0 as usize];
-        self.nodes.free_count >= MAX_NEW_NODES && self.table.has_room() && self.slab.has_room(&tree.pages, key_length)
+        self.nodes.free_count >= MAX_NEW_NODES
+            && self.table.has_room_for(self.held.rows + 1)
+            && self.slab.has_room(&tree.pages, key_length, self.held.pages)
+            && (self.held.rows == 0 || self.rows_fit_nodes(self.held.rows + 1))
+    }
+
+    /// Count the rows this shard's nodes can always hold: every node but a root is at least half full
+    pub fn node_row_limit(&self) -> u64 {
+        let spare = self.trees.len() * MAX_NEW_NODES.0 as usize;
+        let usable = self.nodes.nodes.len().saturating_sub(spare) as u64;
+        usable * (NODE_FANOUT as u64 / 2 - 1)
+    }
+
+    /// Check the nodes can take this many more rows beside the rows every tree holds
+    pub fn rows_fit_nodes(&self, rows: u64) -> bool {
+        let held: u64 = self.trees.iter().map(|tree| tree.row_count.0).sum();
+        held + rows <= self.node_row_limit()
+    }
+
+    /// Hold room for a batch's rows, or hold nothing
+    pub fn hold_room(&mut self, need: &ShardNeed) -> bool {
+        if need.rows == 0 {
+            return true;
+        }
+        let rows = self.held.rows + need.rows;
+        let pages = PageCount(self.held.pages.0 + need.pages().0);
+        if !self.table.has_room_for(rows) || !self.slab.has_free_pages(pages) || !self.rows_fit_nodes(rows) {
+            return false;
+        }
+        self.held = ShardHold { rows, pages };
+        true
+    }
+
+    /// Give back what a batch held
+    pub fn release_room(&mut self, need: &ShardNeed) {
+        self.held.rows -= need.rows;
+        self.held.pages = PageCount(self.held.pages.0 - need.pages().0);
+    }
+
+    /// Check an empty shard could hold a batch's rows
+    pub fn could_hold(&self, need: &ShardNeed) -> bool {
+        need.rows <= self.table.most_rows()
+            && need.rows <= self.node_row_limit()
+            && need.pages() <= self.slab.total_pages()
     }
 
     /// Add a row, or return false when a pool ran out
@@ -74,9 +153,20 @@ impl WriteShard {
             return false;
         }
 
+        self.link_row(hash, column, key, row, false)
+    }
+
+    /// Add a row of a batch that holds its room
+    pub fn insert_held(&mut self, hash: KeyHash, column: ColumnId, key: &[u8], row: &WriteRow) -> bool {
+        self.link_row(hash, column, key, row, true)
+    }
+
+    /// Store a row and link it, keeping a batch's rows on their own pages so a put beside it can't use up their room
+    pub fn link_row(&mut self, hash: KeyHash, column: ColumnId, key: &[u8], row: &WriteRow, is_held: bool) -> bool {
         let tree = &mut self.trees[row.slot.0 as usize];
         tree.segment = row.segment;
-        let Some(address) = self.slab.store(&mut tree.pages, column, key, row) else {
+        let chain = if is_held { &mut tree.batch_pages } else { &mut tree.pages };
+        let Some(address) = self.slab.store(chain, column, key, row) else {
             return false;
         };
 

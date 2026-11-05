@@ -9,7 +9,7 @@ use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::open_slots::{OpenSlot, OpenSlots};
 use crate::index::shard_cursor::ShardCursor;
 use crate::index::write_row::{WriteLookup, WriteRow};
-use crate::index::write_shard::{ShardSizing, WalkBound, WriteShard};
+use crate::index::write_shard::{ShardNeed, ShardSizing, WalkBound, WriteShard};
 
 /// Shards of the write index
 pub const SHARD_COUNT: usize = 16;
@@ -61,6 +61,35 @@ impl WriteIndex {
     pub fn insert(&self, column: ColumnId, key: &[u8], row: &WriteRow) -> bool {
         let hash = hash_key(column, key);
         self.write_shard(shard_of(hash)).insert(hash, column, key, row)
+    }
+
+    /// Add a row of a batch that holds its room
+    pub fn insert_held(&self, column: ColumnId, key: &[u8], row: &WriteRow) -> bool {
+        let hash = hash_key(column, key);
+        self.write_shard(shard_of(hash)).insert_held(hash, column, key, row)
+    }
+
+    /// Hold room for a batch in every shard it touches, or hold nothing
+    pub fn hold_room(&self, needs: &[ShardNeed; SHARD_COUNT]) -> bool {
+        for (index, need) in needs.iter().enumerate() {
+            if !self.write_shard(index).hold_room(need) {
+                self.release_room(&needs[..index]);
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Give back the room a batch held, in shards from the first
+    pub fn release_room(&self, needs: &[ShardNeed]) {
+        for (index, need) in needs.iter().enumerate() {
+            self.write_shard(index).release_room(need);
+        }
+    }
+
+    /// Check empty shards could hold a batch
+    pub fn could_hold(&self, needs: &[ShardNeed; SHARD_COUNT]) -> bool {
+        needs.iter().enumerate().all(|(index, need)| self.read_shard(index).could_hold(need))
     }
 
     /// Find the newest row a reader at a place can see

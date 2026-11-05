@@ -10,7 +10,8 @@ use reel::index::seal_walk::SealWalk;
 use reel::index::shard_cursor::ShardCursor;
 use reel::index::write_index::{SHARD_COUNT, WriteIndex};
 use reel::index::write_row::WriteRow;
-use reel::index::write_shard::{ShardSizing, WalkBound};
+use reel::index::key_hash::hash_key;
+use reel::index::write_shard::{ShardHold, ShardNeed, ShardSizing, WalkBound, WriteShard};
 use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel::row_kind::RowKind;
 use reel::segment::segment_tail::SegmentNumber;
@@ -46,6 +47,15 @@ const SMALL_TABLE: ShardSizing = ShardSizing {
 };
 const LATEST: WritePlace = WritePlace(u64::MAX - 1);
 const MANY_VERSIONS: u64 = 3_000;
+const MOST_EXTRA_KEY_BYTES: u64 = 90;
+const LONG_KEY_BYTES: usize = 2_000;
+const NEED_ROWS: u64 = 3_000;
+const BATCH_SIZING: ShardSizing = ShardSizing {
+    pages: PageCount(256),
+    nodes: NodeCount(256),
+    table_slots: 8_192,
+    open_slots: 4,
+};
 
 fn row(place: u64, slot: OpenSlot, kind: RowKind) -> WriteRow {
     WriteRow {
@@ -542,4 +552,97 @@ fn walk_under_writes() {
     for key in &expected {
         assert!(walked.contains(key));
     }
+}
+
+fn held_row(place: u64) -> WriteRow {
+    row(place, STAYING, RowKind::Value)
+}
+
+fn random_keys(seed: u64, count: u64) -> Vec<Vec<u8>> {
+    let mut random = SeededRandom::new(Seed(seed));
+    (0..count)
+        .map(|number| {
+            let mut key = format!("{:016x}-{number}", random.next_word()).into_bytes();
+            key.resize(key.len() + random.below(MOST_EXTRA_KEY_BYTES) as usize, b'k');
+            key
+        })
+        .collect()
+}
+
+// a batch's need covers the pages its rows take, whatever its key lengths
+#[test]
+fn need_pages() {
+    for seed in seeds([1, 2, 3]) {
+        let keys = random_keys(seed, NEED_ROWS);
+        let mut need = ShardNeed::default();
+        for key in &keys {
+            need.add(key.len());
+        }
+        let mut shard = WriteShard::new(&BATCH_SIZING);
+        assert!(shard.hold_room(&need), "seed {seed}");
+
+        for (place, key) in keys.iter().enumerate() {
+            let hash = hash_key(COLUMN, key);
+            assert!(shard.insert_held(hash, COLUMN, key, &held_row(place as u64 + 1)), "seed {seed}");
+        }
+
+        assert!(shard.trees[STAYING.0 as usize].batch_pages.pages <= need.pages(), "seed {seed}");
+    }
+}
+
+// rows up to the limit the nodes promise always go in, falling keys being the order that leaves every node half full
+#[test]
+fn node_limit() {
+    let mut shard = WriteShard::new(&BATCH_SIZING);
+    let limit = shard.node_row_limit();
+    let keys: Vec<Vec<u8>> = (0..limit).rev().map(key_of).collect();
+    let mut need = ShardNeed::default();
+    for key in &keys {
+        need.add(key.len());
+    }
+    assert!(shard.hold_room(&need));
+
+    for (place, key) in keys.iter().enumerate() {
+        let hash = hash_key(COLUMN, key);
+        assert!(shard.insert_held(hash, COLUMN, key, &held_row(place as u64 + 1)));
+    }
+
+    assert_eq!(shard.trees[STAYING.0 as usize].row_count, RowCount(limit));
+    for key in &keys {
+        let hash = hash_key(COLUMN, key);
+        assert!(shard.lookup(hash, COLUMN, key, LATEST, both()).row.is_some());
+    }
+}
+
+// a put beside a hold can't take the pages held, and gets them once they're given back
+#[test]
+fn hold_blocks() {
+    let mut shard = WriteShard::new(&TIGHT);
+    let key = vec![b'k'; LONG_KEY_BYTES];
+    let mut need = ShardNeed::default();
+    while need.pages() < shard.slab.total_pages() {
+        need.add(key.len());
+    }
+    assert!(shard.hold_room(&need));
+
+    assert!(!shard.has_room(SEALED, key.len()));
+
+    shard.release_room(&need);
+    assert!(shard.has_room(SEALED, key.len()));
+}
+
+// a hold that a later shard can't take leaves nothing held in the shards before it
+#[test]
+fn hold_whole() {
+    let index = WriteIndex::new(&TIGHT);
+    let key = key_of(1);
+    let mut needs = [ShardNeed::default(); SHARD_COUNT];
+    needs[0].add(key.len());
+    while needs[SHARD_COUNT - 1].pages() <= index.read_shard(SHARD_COUNT - 1).slab.total_pages() {
+        needs[SHARD_COUNT - 1].add(key.len());
+    }
+
+    assert!(!index.hold_room(&needs));
+
+    assert_eq!(index.read_shard(0).held, ShardHold::default());
 }

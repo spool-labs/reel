@@ -11,6 +11,7 @@ use reel::record::codec::Codec;
 use reel::segment::segment_tail::SECOND_TAIL_DISTANCE;
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId};
+use reel_api::write_batch::WriteBatch;
 use reel_sim::count_pause::CountPause;
 use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::Seed;
@@ -42,6 +43,8 @@ struct Inputs {
     small: Vec<u8>,
     chunked: Vec<u8>,
     compressible: Vec<u8>,
+    batch: WriteBatch,
+    large_batch: WriteBatch,
     buf: Vec<u8>,
 }
 
@@ -96,6 +99,8 @@ fn round(store: &Store, io: &SimulatedIo, inputs: &mut Inputs, number: usize) ->
     total += both(counted(|| store.get(META, b"missing", buf).expect("miss")));
     total += both(counted(|| store.contains(META, key).expect("contains")));
     total += both(counted(|| store.delete(BULK, other).expect("delete")));
+    total += both(counted(|| store.write_batch(&inputs.batch).expect("batch")));
+    total += both(counted(|| store.write_batch(&inputs.large_batch).expect("large batch")));
     let refused = counted(|| store.get(META, DAMAGED_KEY, buf).is_err());
     assert!(refused.0);
     total += both(refused);
@@ -139,11 +144,23 @@ fn no_allocations() {
     let io = SimulatedIo::new(Seed(1));
     damage(&io);
     let store = ReelStore::open(io.clone(), &config()).expect("open");
+    let keys: Vec<Vec<u8>> = (0..KEYS).map(|number| format!("key-{number:06}").into_bytes()).collect();
+    let small = vec![7; 100];
+    let compressible = vec![b'x'; CHUNKED_BYTES];
+    let mut batch = WriteBatch::new();
+    batch.put(META, &keys[0], &small);
+    batch.put(META, &keys[1], &small);
+    batch.delete(BULK, &keys[1]);
+    let mut large_batch = WriteBatch::new();
+    large_batch.put(BULK, &keys[2], &compressible);
+    large_batch.put(META, &keys[2], &small);
     let mut inputs = Inputs {
-        keys: (0..KEYS).map(|number| format!("key-{number:06}").into_bytes()).collect(),
-        small: vec![7; 100],
+        keys,
+        small,
         chunked: (0..CHUNKED_BYTES).map(|index| ((index * 31) >> 3) as u8).collect(),
-        compressible: vec![b'x'; CHUNKED_BYTES],
+        compressible,
+        batch,
+        large_batch,
         buf: vec![1; CHUNKED_BYTES * 2],
     };
 

@@ -72,6 +72,7 @@ pub struct EngineState<Backend: Io> {
     pub free_slots: Mutex<Vec<OpenSlot>>,
     pub encoders: Pool<RecordEncoder>,
     pub large_encoders: Pool<RecordEncoder>,
+    pub batch_rows: Pool<RowGroupBuffer>,
     pub record_readers: Pool<RecordReader>,
     pub footer_readers: Pool<FooterReader>,
     pub superblock: Mutex<Superblock>,
@@ -287,6 +288,8 @@ impl<Backend: Io> EngineState<Backend> {
         let encoders = self.encoders.heap_bytes(RecordEncoder::heap_bytes);
         let large = self.large_encoders.heap_bytes(RecordEncoder::heap_bytes);
         report.compress_buffers = ByteCount(encoders.0 + large.0);
+        let batch_rows = self.batch_rows.heap_bytes(RowGroupBuffer::heap_bytes);
+        report.queues = ByteCount(report.queues.0 + batch_rows.0);
         for queue in &self.queues {
             report.queues = ByteCount(report.queues.0 + hold(queue).filling.heap_bytes().0);
         }

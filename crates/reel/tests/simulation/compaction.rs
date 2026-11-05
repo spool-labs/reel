@@ -9,8 +9,10 @@ use reel::engine::compact_job::{CompactJob, is_wholly_dead};
 use reel::engine::cue::MOST_CUES;
 use reel::engine::engine_sizing::COMPACT_JOB_BYTES;
 use reel::engine::open_segment::data_path;
+use reel::engine::planner::UnitStep;
 use reel::engine::read_path::RecordWant;
 use reel::engine::reel_store::ReelStore;
+use reel::engine::walk_job::WALK_RETRY;
 use reel::engine::volume::MOST_PARKED;
 use reel::guard::hold;
 use reel::io::Io;
@@ -32,6 +34,7 @@ const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 20_000;
 const CRASH_POINTS: u64 = 40;
 const LATE_CRASH_POINTS: u64 = 200;
+const AFTER_THE_RETRY: Nanoseconds = Nanoseconds(2 * WALK_RETRY.0);
 const SYNC_SEEDS: u64 = 64;
 
 type Store = ReelStore<SimulatedIo>;
@@ -715,7 +718,7 @@ fn run_steps(io: &SimulatedIo) {
     }
 }
 
-// a save that failed still lists the segment on disk, so its file stays and open finds the two agreeing
+// a save that failed still lists the segment on disk, so its file stays parked and holds every grave back until a save lands
 #[test]
 fn failed_save_keeps_file() {
     let io = SimulatedIo::new(Seed(34));
@@ -731,10 +734,17 @@ fn failed_save_keeps_file() {
     assert!(!volume.table.holds(older));
     assert_eq!(volume.segments_unlinked.load(Ordering::Acquire), 0);
 
+    let mut job = job(&store);
     release_compaction(&store);
-    state.ask_compaction();
-    settle(&io);
+    io.fail_writes(OperationCount(1));
+    assert!(matches!(job.step_unit(Nanoseconds(0)), UnitStep::RetryAt(_)));
     assert!(has_file(&io, older));
+    assert_eq!(volume.segments_parked.load(Ordering::Acquire), 1);
+
+    assert_eq!(job.step_unit(AFTER_THE_RETRY), UnitStep::Worked);
+    assert!(!has_file(&io, older));
+    assert_eq!(volume.segments_parked.load(Ordering::Acquire), 0);
+    drop(job);
     io.kill();
     drop(store);
     drop(state);
@@ -1024,4 +1034,32 @@ fn cue_between_replacements() {
     settle(&io);
     assert!(!store.state.volumes[0].table.holds(number));
     store.close().expect("close");
+}
+
+// a file's removal that didn't reach the directory stays parked until it has, or a power cut brings the file back after the
+// grave over its rows has gone
+#[test]
+fn parked_until_durable() {
+    let io = SimulatedIo::new(Seed(44));
+    let store = open(&io);
+    hold_compaction(&store);
+    let state = Arc::clone(&store.state);
+    let volume = &state.volumes[0];
+    let older = sealed_put(&store, &io, b"older");
+    sealed_put(&store, &io, b"newer");
+
+    let mut job = job(&store);
+    job.unlink(volume, older, state.read_point()).expect("unlink");
+    release_compaction(&store);
+    io.fail_directory_syncs(OperationCount(1));
+    assert!(matches!(job.step_unit(Nanoseconds(0)), UnitStep::RetryAt(_)));
+    assert_eq!(volume.segments_parked.load(Ordering::Acquire), 1);
+
+    assert_eq!(job.step_unit(AFTER_THE_RETRY), UnitStep::Worked);
+    assert_eq!(volume.segments_parked.load(Ordering::Acquire), 0);
+    io.power_cut();
+    drop(job);
+    drop(store);
+    drop(state);
+    assert!(!has_file(&io, older));
 }

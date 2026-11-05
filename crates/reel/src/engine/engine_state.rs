@@ -305,25 +305,32 @@ impl<Backend: Io> EngineState<Backend> {
         hold(&self.volumes[volume].summary).is_lookup_whole()
     }
 
-    /// Remove a parked segment's file and close it, unless a failed save means a row still lists it. A failed remove hands the
-    /// segment back to stay parked, since no grave may drop while a file that could bring its key back is on disk
+    /// Remove a parked segment's file and close it, after saving the summary if the save that dropped its row failed. Any
+    /// failure hands the segment back to stay parked, since no grave may drop while a file that could bring its key back is
+    /// on disk
     pub fn clear_parked(
         &self,
         volume: &Volume<Backend>,
         parked: ParkedSegment<Backend::File>,
     ) -> Result<(), ParkedSegment<Backend::File>> {
-        if parked.is_saved {
-            for root in &volume.roots {
-                match self.io.remove_file(&data_path(root, parked.segment)) {
-                    Ok(()) => {
-                        if self.io.sync_directory(root).is_err() {
-                            return Err(parked);
-                        }
-                        break;
-                    },
-                    Err(error) if error.kind() == ErrorKind::NotFound => {},
-                    Err(_error) => return Err(parked),
-                }
+        // the file goes only behind a saved summary, or open would find a row with no file
+        if !parked.is_saved && self.save_summary(volume).is_err() {
+            volume.reclaim_retries.fetch_add(1, Ordering::Relaxed);
+            return Err(parked);
+        }
+        for root in &volume.roots {
+            // a retry finds the file gone, and its removal still has to reach the directory
+            match self.io.remove_file(&data_path(root, parked.segment)) {
+                Ok(()) => {},
+                Err(error) if error.kind() == ErrorKind::NotFound => {},
+                Err(_error) => {
+                    volume.reclaim_retries.fetch_add(1, Ordering::Relaxed);
+                    return Err(parked);
+                },
+            }
+            if self.io.sync_directory(root).is_err() {
+                volume.reclaim_retries.fetch_add(1, Ordering::Relaxed);
+                return Err(parked);
             }
         }
         volume.segments_parked.fetch_sub(1, Ordering::AcqRel);
@@ -332,16 +339,37 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(())
     }
 
-    /// Close a rewrite's output and remove it under whichever name it reached
-    pub fn remove_output(&self, volume: &Volume<Backend>, output: RewriteOutput<Backend::File>) {
+    /// Remove a rewrite's output under whichever name it reached and close it. A named output that could still come back at a
+    /// crash is handed back, since its rows would answer again from under any grave dropped since
+    pub fn remove_output(
+        &self,
+        volume: &Volume<Backend>,
+        output: RewriteOutput<Backend::File>,
+    ) -> Result<(), RewriteOutput<Backend::File>> {
         let root = &volume.roots[output.root];
-        self.io.close_file(output.file);
         let path = if output.is_named { data_path(root, output.number) } else { output_path(root, output.number) };
-        // what stays behind goes at the next open
-        let _removed = self.io.remove_file(&path);
-        let _synced = self.io.sync_directory(root);
+        let removed = self.io.remove_file(&path);
+        // a file with no segment's name goes at the next open whatever happens here
+        if !output.is_named {
+            let _synced = self.io.sync_directory(root);
+            self.io.close_file(output.file);
+            return Ok(());
+        }
+        match removed {
+            Ok(()) => {},
+            Err(error) if error.kind() == ErrorKind::NotFound => {},
+            Err(_error) => {
+                volume.reclaim_retries.fetch_add(1, Ordering::Relaxed);
+                return Err(output);
+            },
+        }
+        if self.io.sync_directory(root).is_err() {
+            volume.reclaim_retries.fetch_add(1, Ordering::Relaxed);
+            return Err(output);
+        }
+        self.io.close_file(output.file);
+        Ok(())
     }
-
 
     /// Give a dead record's whole blocks back, or say it has to wait for a live cue or an unpublished replacement. The count
     /// moves first, so a read that took its point before this starts over, and one that takes it after has the replacement

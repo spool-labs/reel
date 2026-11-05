@@ -31,7 +31,7 @@ pub const MOST_PARKED: usize = 8;
 pub struct ParkedSegment<File> {
     pub retired: RetiredSegment<File>,
     pub segment: SegmentNumber,
-    /// A failed save keeps the file, or open would find a row with no file
+    /// The summary that dropped this row is on disk, or the next look at the park saves it first
     pub is_saved: bool,
 }
 
@@ -104,6 +104,10 @@ pub struct Volume<Backend: Io> {
     /// A rewrite has made its first row decision and not installed. Rows it decided on must stay as they were, so no walk
     /// starts a target
     pub is_rewriting: AtomicBool,
+    /// A named output a failed rewrite could not remove is still on disk
+    pub stray_outputs: AtomicU64,
+    /// Counts the times a file that has to go would not, which a volume stuck that way shows here
+    pub reclaim_retries: AtomicU64,
     /// The walk is part way through a segment
     pub has_walk_target: AtomicBool,
     /// Counts the turns a walk stood aside for a rewrite

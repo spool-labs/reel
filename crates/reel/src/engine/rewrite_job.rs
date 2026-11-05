@@ -165,6 +165,9 @@ impl<Backend: Io> RewriteJob<Backend> {
 
     /// Pick a segment and note it as tried
     pub fn pick(&mut self, volume: &Volume<Backend>) -> Option<(RewriteTarget, ByteCount, bool)> {
+        if volume.stray_outputs.load(Ordering::Acquire) > 0 {
+            return None;
+        }
         let rows = hold(&volume.summary);
         if volume.has_walk_target.load(Ordering::Acquire) {
             return None;
@@ -341,6 +344,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     ) -> Result<bool> {
         let state = &self.state;
         if volume.segments_parked.load(Ordering::Acquire) > 0
+            || volume.stray_outputs.load(Ordering::Acquire) > 0
             || state.cues.has_cue_below(row.place)
             || volume.damage.covering(column, &self.key).is_some()
         {
@@ -505,10 +509,11 @@ impl<Backend: Io> RewriteJob<Backend> {
         let inputs = [target.segment];
         let totals = self.writer.finish(&output.file, output.number, self.records_end, &[], state.record_key, &inputs)?;
         state.io.rename_file(&output_path(root, output.number), &data_path(root, output.number))?;
-        state.io.sync_directory(root)?;
+        // the name has landed from here, whatever the directory's sync says
         let named = RewriteOutput { is_named: true, ..output.clone() };
         *hold(&state.volumes[self.volume].partial_output) = Some(named.clone());
         self.output = Some(named);
+        state.io.sync_directory(root)?;
         self.totals = Some(totals);
         self.phase = RewritePhase::Installing;
         Ok(())
@@ -574,7 +579,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         hold(&volume.partial_output).take();
         // every row dropped, so the file was never a segment
         if self.totals.is_none() {
-            state.remove_output(volume, output);
+            self.leave_output(volume, output);
         }
         self.output = None;
         self.target = None;
@@ -622,13 +627,33 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
     }
 
+    /// Try again to remove an output a failure left behind
+    pub fn clear_stray(&self) {
+        let volume = &self.state.volumes[self.volume];
+        let stray = hold(&volume.partial_output).take();
+        if let Some(output) = stray {
+            self.leave_output(volume, output);
+        }
+    }
+
+    /// Remove an output, or keep it listed, as a stray that holds every grave back until it's gone
+    pub fn leave_output(&self, volume: &Volume<Backend>, output: RewriteOutput<Backend::File>) {
+        match self.state.remove_output(volume, output) {
+            Ok(()) => volume.stray_outputs.store(0, Ordering::Release),
+            Err(output) => {
+                *hold(&volume.partial_output) = Some(output);
+                volume.stray_outputs.store(1, Ordering::Release);
+            },
+        }
+    }
+
     /// Give the rewrite up: the input stays, and the output goes whatever name it has reached
     pub fn abandon(&mut self) {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
         hold(&volume.partial_output).take();
         if let Some(output) = self.output.take() {
-            state.remove_output(volume, output);
+            self.leave_output(volume, output);
         }
         self.target = None;
         volume.is_rewriting.store(false, Ordering::Release);

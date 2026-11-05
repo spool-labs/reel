@@ -357,12 +357,15 @@ impl<Backend: Io> EngineState<Backend> {
                 && let Some(parked) = slot.take()
             {
                 // a file that stays is one open walks dead again, and a close has no later step to try
-                let _left = self.clear_parked(volume, parked);
+                if let Err(parked) = self.clear_parked(volume, parked) {
+                    self.io.close_file(parked.retired.file);
+                }
             }
         }
         // a stopped rewrite leaves the store as it found it
-        if let Some(output) = hold(&volume.partial_output).take() {
-            self.remove_output(volume, output);
+        let stray = hold(&volume.partial_output).take();
+        if let Some(Err(output)) = stray.map(|output| self.remove_output(volume, output)) {
+            self.io.close_file(output.file);
         }
         let mut claims = hold(&volume.claims);
         for segment in claims.open.drain(..) {
@@ -827,6 +830,8 @@ pub fn build_state<Backend: Io>(
             parked: Mutex::new([const { None }; MOST_PARKED]),
             segments_rewritten: AtomicU64::new(0),
             is_rewriting: AtomicBool::new(false),
+            stray_outputs: AtomicU64::new(0),
+            reclaim_retries: AtomicU64::new(0),
             has_walk_target: AtomicBool::new(false),
             walks_held: AtomicU64::new(0),
             partial_output: Mutex::new(None),

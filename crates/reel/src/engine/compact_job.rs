@@ -107,12 +107,18 @@ impl<Backend: Io> CompactJob<Backend> {
             return UnitStep::RetryAt(at);
         }
         self.retry_at = None;
+        if volume.stray_outputs.load(Ordering::Acquire) > 0 {
+            self.rewrite.clear_stray();
+            if volume.stray_outputs.load(Ordering::Acquire) > 0 {
+                return self.wait_for_retry(now);
+            }
+        }
         if let Some(parked) = self.take_parked(volume) {
             return match state.clear_parked(volume, parked) {
                 Ok(()) => UnitStep::Worked,
                 Err(parked) => {
                     park_again(volume, parked);
-                    UnitStep::RetryAt(Nanoseconds(now.0 + WALK_RETRY.0))
+                    self.wait_for_retry(now)
                 },
             };
         }
@@ -147,6 +153,13 @@ impl<Backend: Io> CompactJob<Backend> {
                 UnitStep::RetryAt(at)
             },
         }
+    }
+
+    /// Come back after the retry wait
+    pub fn wait_for_retry(&mut self, now: Nanoseconds) -> UnitStep {
+        let at = Nanoseconds(now.0 + WALK_RETRY.0);
+        self.retry_at = Some(at);
+        UnitStep::RetryAt(at)
     }
 
     /// Take a parked segment no read holds any more

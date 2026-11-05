@@ -701,3 +701,54 @@ fn walk_target_holds_rewrite() {
     }
     store.close().expect("close");
 }
+
+// an output a give-up couldn't remove for good holds every grave back and stops new rewrites, until a retry has it gone
+#[test]
+fn stray_output_holds_graves() {
+    let io = SimulatedIo::new(Seed(21));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    half_dead(&store, &io);
+
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let mut job = CompactJob::new(Arc::clone(state), 0);
+    assert!(job.rewrite.start());
+    while job.rewrite.phase != RewritePhase::Installing {
+        job.rewrite.step();
+    }
+    let slot = state.cues.take(WritePlace(state.read_point().0 - 3)).expect("a slot");
+    io.fail_directory_syncs(OperationCount(1));
+    job.rewrite.step();
+    state.cues.release(slot);
+
+    assert_eq!(volume.stray_outputs.load(Ordering::Acquire), 1);
+    assert_eq!(volume.reclaim_retries.load(Ordering::Acquire), 1);
+    assert!(!job.rewrite.start());
+    job.rewrite.clear_stray();
+    assert_eq!(volume.stray_outputs.load(Ordering::Acquire), 0);
+    assert!(job.rewrite.start());
+    store.close().expect("close");
+}
+
+// a name that landed under a failed directory sync is still a segment on disk, so a give-up removes it by that name
+#[test]
+fn name_landed_before_the_failure() {
+    let io = SimulatedIo::new(Seed(22));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    half_dead(&store, &io);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(job.rewrite.start());
+    let number = job.rewrite.output.as_ref().expect("an output").number;
+    while job.rewrite.phase == RewritePhase::Copying {
+        job.rewrite.step();
+    }
+    io.fail_directory_syncs(OperationCount(1));
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    assert!(!has_file(&io, number));
+    store.close().expect("close");
+}

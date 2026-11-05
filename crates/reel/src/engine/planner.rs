@@ -47,6 +47,24 @@ pub struct Planner<Backend: Io> {
 }
 
 impl<Backend: Io> Planner<Backend> {
+    /// Check a seal can't finish until a reclaim frees room in the table or a directory, so standing aside would hold both up
+    pub fn is_seal_stuck(&self) -> bool {
+        self.state.volumes.iter().any(|volume| volume.is_seal_stuck.load(Ordering::Acquire))
+    }
+
+    /// Note what a unit's step found, and say whether it worked
+    pub fn note_step(&mut self, index: usize, step: UnitStep, soonest: &mut Option<Nanoseconds>) -> bool {
+        match step {
+            UnitStep::Worked => {
+                self.last = index;
+                return true;
+            },
+            UnitStep::Idle => {},
+            UnitStep::RetryAt(at) => *soonest = Some(soonest.map_or(at, |other| Nanoseconds(other.0.min(at.0)))),
+        }
+        false
+    }
+
     /// Check whether a seal goes first: a segment is waiting and no volume's walk has fallen too far behind. A failed
     /// volume's seal never ends, so it counts for nothing
     pub fn is_seal_first(&self) -> bool {
@@ -65,13 +83,14 @@ pub fn is_sealing<File>(segment: &OpenSegment<File>) -> bool {
 impl<Backend: Io> Job for Planner<Backend> {
     fn step(&mut self) -> JobStep {
         let now = self.state.io.now();
-        if self.state.index_waiters.load(Ordering::Acquire) > 0 {
+        let is_stuck = self.is_seal_stuck();
+        if !is_stuck && self.state.index_waiters.load(Ordering::Acquire) > 0 {
             return JobStep::IdleUntil {
                 deadline: Nanoseconds(now.0 + WRITER_YIELD.0),
             };
         }
         // a seal wakes the planner as it ends, and each one that adds to the walk's lag
-        if self.is_seal_first() {
+        if !is_stuck && self.is_seal_first() {
             return JobStep::Idle;
         }
 
@@ -80,25 +99,16 @@ impl<Backend: Io> Job for Planner<Backend> {
         let mut soonest: Option<Nanoseconds> = None;
         for turn in 0..count {
             let index = (first + turn) % count;
-            match self.walks[index].step_unit(now) {
-                UnitStep::Worked => {
-                    self.last = index;
+            // a ready reclaim runs ahead of the next walk target, and each segment it frees is one that walk won't probe
+            if self.walks[index].target.is_none() {
+                let step = self.compactions[index].step_unit(now);
+                if self.note_step(index, step, &mut soonest) {
                     return JobStep::Worked;
-                },
-                UnitStep::Idle => {},
-                UnitStep::RetryAt(at) => soonest = Some(soonest.map_or(at, |other| Nanoseconds(other.0.min(at.0)))),
+                }
             }
-        }
-        // compaction comes after every walk: it goes by counts the walks are still making
-        for turn in 0..self.compactions.len() {
-            let index = (first + turn) % self.compactions.len();
-            match self.compactions[index].step_unit(now) {
-                UnitStep::Worked => {
-                    self.last = index;
-                    return JobStep::Worked;
-                },
-                UnitStep::Idle => {},
-                UnitStep::RetryAt(at) => soonest = Some(soonest.map_or(at, |other| Nanoseconds(other.0.min(at.0)))),
+            let step = self.walks[index].step_unit(now);
+            if self.note_step(index, step, &mut soonest) {
+                return JobStep::Worked;
             }
         }
         match soonest {

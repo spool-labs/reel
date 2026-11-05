@@ -791,6 +791,7 @@ pub fn build_state<Backend: Io>(
             wants_compaction: AtomicBool::new(true),
             has_kept_covers: AtomicBool::new(false),
             is_compaction_held: AtomicBool::new(false),
+            is_seal_stuck: AtomicBool::new(false),
             sealing: AtomicU64::new(NO_SEAL),
             segments_unlinked: AtomicU64::new(0),
             segments_parked: AtomicU64::new(0),

@@ -815,3 +815,60 @@ fn place_after_open() {
     drop(cue);
     store.close().expect("close");
 }
+
+// a ready unlink runs ahead of the next walk target, so ingest that keeps walks waiting still frees segments
+#[test]
+fn unlink_before_walk() {
+    let io = SimulatedIo::new(Seed(36));
+    let store = open(&io);
+    hold_compaction(&store);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let older = sealed_put(&store, &io, b"older");
+    sealed_put(&store, &io, b"newer");
+
+    io.hold_jobs("reel-planner", true);
+    for key in [b"later-a", b"later-b"] {
+        store.put(COLUMN, key, b"value").expect("put");
+        store.seal_now();
+        settle(&io);
+    }
+    assert_eq!(state.pending_walks(0), 2);
+    release_compaction(&store);
+    state.ask_compaction();
+    io.hold_jobs("reel-planner", false);
+
+    while volume.table.holds(older) {
+        assert!(io.step_any().is_some());
+    }
+    assert_eq!(state.pending_walks(0), 2);
+    settle(&io);
+    assert_eq!(state.pending_walks(0), 0);
+    store.close().expect("close");
+}
+
+// a seal that needs a reclaim's room doesn't wait on a planner that stands aside for it
+#[test]
+fn stuck_seal_gets_its_reclaim() {
+    let io = SimulatedIo::new(Seed(37));
+    let store = open(&io);
+    hold_compaction(&store);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let older = sealed_put(&store, &io, b"older");
+    sealed_put(&store, &io, b"newer");
+
+    release_compaction(&store);
+    state.index_waiters.fetch_add(1, Ordering::AcqRel);
+    state.ask_compaction();
+    run_steps(&io);
+    assert!(volume.table.holds(older));
+
+    volume.is_seal_stuck.store(true, Ordering::Release);
+    state.ask_compaction();
+    run_steps(&io);
+    assert!(!volume.table.holds(older));
+    state.index_waiters.fetch_sub(1, Ordering::AcqRel);
+    volume.is_seal_stuck.store(false, Ordering::Release);
+    store.close().expect("close");
+}

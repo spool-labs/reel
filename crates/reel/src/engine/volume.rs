@@ -76,6 +76,8 @@ pub struct Volume<Backend: Io> {
     pub has_kept_covers: AtomicBool,
     /// Holds compaction off. Only tests set this today
     pub is_compaction_held: AtomicBool,
+    /// A seal found the table or a directory full, and only a reclaim can give it room
+    pub is_seal_stuck: AtomicBool,
     /// The segment a seal is working on, or `NO_SEAL`. Its rows can still answer through its open slot, so no walk starts on it
     pub sealing: AtomicU64,
     pub segments_unlinked: AtomicU64,

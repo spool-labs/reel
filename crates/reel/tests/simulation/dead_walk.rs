@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::engine::compact_job::CompactJob;
 use reel::engine::engine_state::IndexWait;
 use reel::engine::open_segment::SegmentPhase;
 use reel::engine::planner::{Planner, WALK_LAG_SEGMENTS};
@@ -502,7 +503,7 @@ fn turn_with(seed: Seed) {
     let mut planner = Planner {
         state: store.state.clone(),
         walks,
-        compactions: Vec::new(),
+        compactions: vec![CompactJob::new(store.state.clone(), 0), CompactJob::new(store.state.clone(), 1)],
         last: 0,
     };
 
@@ -616,7 +617,7 @@ fn stands_aside_for_seals() {
     let mut planner = Planner {
         state: store.state.clone(),
         walks: vec![WalkJob::new(store.state.clone(), 0)],
-        compactions: Vec::new(),
+        compactions: vec![CompactJob::new(store.state.clone(), 0)],
         last: 0,
     };
     assert!(!planner.is_seal_first());

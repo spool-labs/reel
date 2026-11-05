@@ -163,6 +163,14 @@ impl<Backend: Io> SealJob<Backend> {
         }
     }
 
+    /// Say the seal needs a reclaim's room, and bring the planner back, which would otherwise stand aside for this seal
+    pub fn note_stuck(&self) {
+        self.volume().is_seal_stuck.store(true, Ordering::Release);
+        if let Some(task) = self.state.planner_task.get() {
+            task.wake();
+        }
+    }
+
     /// Check the target's writers have all landed
     pub fn is_drained(&self, slot: OpenSlot) -> bool {
         let claims = hold(&self.volume().claims);
@@ -368,6 +376,7 @@ impl<Backend: Io> SealJob<Backend> {
                 self.writer.entries(),
             );
             if !installed {
+                self.note_stuck();
                 // the rows file stays until the table has room, so a retry loses nothing
                 return Err(Error::other("segment table is full"));
             }
@@ -387,11 +396,13 @@ impl<Backend: Io> SealJob<Backend> {
             if let Some(directory) = &state.directories[column.column.0 as usize]
                 && !directory.replace(Some(&entry), &[])
             {
+                self.note_stuck();
                 return Err(Error::other("column directory is full"));
             }
             self.columns_listed += 1;
         }
 
+        volume.is_seal_stuck.store(false, Ordering::Release);
         self.phase = SealPhase::Summarizing;
         Ok(())
     }

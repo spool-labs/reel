@@ -11,7 +11,9 @@ use crate::record::record_check::{Checksum, RecordKey, checksum};
 use crate::row_kind::RowKind;
 use crate::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry, KeyPrefix};
 use crate::segment::block_filter::{FILTER_SUM_BYTES, add_key, filter_bytes, seal_filter};
-use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockBuilder};
+use crate::segment::row_block::{
+    BLOCK_HEADER_BYTES, BlockHeader, FooterRow, ROW_BLOCK_BYTES, RowBlockBuilder, write_block_header,
+};
 use crate::segment::segment_tail::{
     BlockCount, COLUMN_TAIL_BYTES, COPY_GAP_BYTES, ColumnTail, MAX_COLUMNS, MAX_TAIL_BYTES, MOST_SEGMENT_BYTES,
     PlaceRange, SECOND_TAIL_DISTANCE, SegmentNumber, TAIL_FIXED_BYTES, TailCursor, TailHead, write_trailer,
@@ -183,14 +185,18 @@ impl FooterWriter {
         }
         seal_filter(filter);
 
-        let block_at = self.position;
+        let block_at = FileOffset(self.position.0 + BLOCK_HEADER_BYTES as u64);
         let block = self.builder.finish();
         let filter_at = block_at.0 + block.len() as u64;
         if filter_at + filter_length as u64 > MOST_SEGMENT_BYTES.0 {
             return Err(Error::other("footer passes the most bytes a segment can reach"));
         }
-        let parts = [IoSlice::new(block), IoSlice::new(filter)];
-        file.write_at(block_at, &parts)?;
+        let header = write_block_header(&BlockHeader {
+            block_length: block.len() as u32,
+            filter_length: filter_length as u32,
+        });
+        let parts = [IoSlice::new(&header), IoSlice::new(block), IoSlice::new(filter)];
+        file.write_at(self.position, &parts)?;
 
         let shared = match self.columns.last() {
             Some(column) => column.shared_length as usize,

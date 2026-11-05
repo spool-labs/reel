@@ -207,7 +207,7 @@ impl FooterReader {
             }
 
             let filter_ends_at = match index.entries.get(position + 1) {
-                Some(next) => next.block_at(),
+                Some(next) => next.header_at(),
                 None => index.filter_end,
             };
             let filter_at = FileOffset(u64::from(entry.filter_offset));
@@ -242,7 +242,7 @@ impl FooterReader {
         for position in 0..read.window.count {
             let entry = read.window.entries[position];
             let filter_end = match read.window.entries.get(position + 1) {
-                Some(next) if position + 1 < read.window.count => u64::from(next.block_offset),
+                Some(next) if position + 1 < read.window.count => next.header_at().0,
                 _last_line => read.window.filter_end_of_last,
             };
             match self.probe_filter(file, read.segment, &entry, filter_end, caches, query)? {

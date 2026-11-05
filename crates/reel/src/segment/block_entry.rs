@@ -2,6 +2,8 @@
 
 use reel_api::units::{ByteCount, FileOffset};
 
+use crate::segment::row_block::BLOCK_HEADER_BYTES;
+
 /// Bytes of key a block index line keeps
 pub const KEY_PREFIX_BYTES: usize = 16;
 /// Bytes of one line on disk
@@ -58,6 +60,11 @@ impl BlockEntry {
             filter_offset: read_half(line, FILTER_OFFSET_AT)?,
             live_rows: read_half(line, LIVE_ROWS_AT)?,
         })
+    }
+
+    /// Find where the block's header starts, which is where the filter before it ends
+    pub fn header_at(&self) -> FileOffset {
+        FileOffset(u64::from(self.block_offset) - BLOCK_HEADER_BYTES as u64)
     }
 
     /// Find where the row block starts

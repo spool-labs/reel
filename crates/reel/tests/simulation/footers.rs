@@ -121,7 +121,7 @@ fn find(
     let first = column.first_block as usize;
     let end = first + column.block_count.0 as usize;
     let filter_end = match loaded.entries.get(end) {
-        Some(next) => next.block_at(),
+        Some(next) => next.header_at(),
         None => loaded.head.index_at,
     };
     let index = ColumnIndex {

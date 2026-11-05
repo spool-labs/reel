@@ -26,6 +26,24 @@ pub const KIND_BITS: u32 = 2;
 /// Picks the kind out of a row's first number
 pub const KIND_MASK: u64 = (1 << KIND_BITS) - 1;
 
+/// Opens every row block, so a walk with no index can find one
+pub const BLOCK_MARKER: u32 = 0x524C_4248;
+/// Bytes of a row block's header
+pub const BLOCK_HEADER_BYTES: usize = 16;
+/// Where the header keeps the row block's length
+pub const HEADER_BLOCK_LENGTH_AT: usize = 4;
+/// Where the header keeps the filter's length
+pub const HEADER_FILTER_LENGTH_AT: usize = 8;
+/// Where the header keeps its own checksum
+pub const HEADER_SUM_AT: usize = 12;
+
+/// What a row block's header says
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockHeader {
+    pub block_length: u32,
+    pub filter_length: u32,
+}
+
 /// A row as a footer stores it
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FooterRow {
@@ -272,6 +290,40 @@ impl<'block> RowBlockWalk<'block> {
     }
 }
 
+/// Lay out a row block's header
+pub fn write_block_header(header: &BlockHeader) -> [u8; BLOCK_HEADER_BYTES] {
+    let mut bytes = [0; BLOCK_HEADER_BYTES];
+    bytes[..HEADER_BLOCK_LENGTH_AT].copy_from_slice(&BLOCK_MARKER.to_le_bytes());
+    bytes[HEADER_BLOCK_LENGTH_AT..HEADER_FILTER_LENGTH_AT].copy_from_slice(&header.block_length.to_le_bytes());
+    bytes[HEADER_FILTER_LENGTH_AT..HEADER_SUM_AT].copy_from_slice(&header.filter_length.to_le_bytes());
+    let sum = xxh3_64(&bytes[..HEADER_SUM_AT]) as u32;
+    bytes[HEADER_SUM_AT..].copy_from_slice(&sum.to_le_bytes());
+    bytes
+}
+
+/// Read a row block's header, or nothing when it fails its check
+pub fn read_block_header(bytes: &[u8]) -> Option<BlockHeader> {
+    let header = bytes.get(..BLOCK_HEADER_BYTES)?;
+    if read_half(header, 0)? != BLOCK_MARKER {
+        return None;
+    }
+    if read_half(header, HEADER_SUM_AT)? != xxh3_64(&header[..HEADER_SUM_AT]) as u32 {
+        return None;
+    }
+    Some(BlockHeader {
+        block_length: read_half(header, HEADER_BLOCK_LENGTH_AT)?,
+        filter_length: read_half(header, HEADER_FILTER_LENGTH_AT)?,
+    })
+}
+
+/// Read a little-endian half word
+pub fn read_half(bytes: &[u8], at: usize) -> Option<u32> {
+    let slice = bytes.get(at..at + size_of::<u32>())?;
+    let mut half = [0; size_of::<u32>()];
+    half.copy_from_slice(slice);
+    Some(u32::from_le_bytes(half))
+}
+
 /// Count the bytes two keys share at the front
 pub fn shared_length(left: &[u8], right: &[u8]) -> usize {
     let mut shared = 0;
@@ -370,6 +422,23 @@ mod tests {
         block[100] ^= 1;
 
         assert!(RowBlockWalk::open(&block, WritePlace(0)).is_none());
+    }
+
+    // a header reads back, and any flipped byte or a foreign marker is refused
+    #[test]
+    fn header_round() {
+        let header = BlockHeader {
+            block_length: 60_000,
+            filter_length: 2_500,
+        };
+        let bytes = write_block_header(&header);
+
+        assert_eq!(read_block_header(&bytes), Some(header));
+        for at in 0..BLOCK_HEADER_BYTES {
+            let mut damaged = bytes;
+            damaged[at] ^= 1;
+            assert_eq!(read_block_header(&damaged), None);
+        }
     }
 
     // a block with no rows opens and has nothing to find

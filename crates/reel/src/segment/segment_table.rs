@@ -316,7 +316,7 @@ impl<File: Clone> SegmentTable<File> {
             window.entries[window.count] = *line;
             window.count += 1;
             window.filter_end_of_last = match lines.get(index + 1) {
-                Some(next) => u64::from(next.block_offset),
+                Some(next) => next.header_at().0,
                 None => filter_end(entry, column_tail, &guard.blocks),
             };
         }
@@ -392,7 +392,7 @@ pub fn filter_end<File>(entry: &TableEntry<File>, column: &ColumnTail, blocks: &
     let next = entry.blocks.start as usize + column.first_block as usize + column.block_count.0 as usize;
     let extent_end = (entry.blocks.start + entry.blocks.length) as usize;
     if next < extent_end {
-        return u64::from(blocks[next].block_offset);
+        return blocks[next].header_at().0;
     }
     entry.head.index_at.0
 }
@@ -410,6 +410,7 @@ pub fn home_of(number: SegmentNumber, mask: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::segment::row_block::BLOCK_HEADER_BYTES;
 
     const NUMBERS: u64 = 500;
 
@@ -423,7 +424,7 @@ mod tests {
 
     fn line(offset: u32) -> BlockEntry {
         BlockEntry {
-            block_offset: offset,
+            block_offset: offset + BLOCK_HEADER_BYTES as u32,
             ..BlockEntry::default()
         }
     }
@@ -454,7 +455,7 @@ mod tests {
 
         let lines_of = |slot: usize| {
             let run = shard.segments[slot].as_ref().expect("segment").blocks;
-            shard.blocks[run.start as usize].block_offset
+            shard.blocks[run.start as usize].block_offset - BLOCK_HEADER_BYTES as u32
         };
         assert_eq!(lines_of(0), 40);
         assert_eq!(lines_of(1), 30);

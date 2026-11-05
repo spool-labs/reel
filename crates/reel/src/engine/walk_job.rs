@@ -18,6 +18,7 @@ use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 
 use crate::config::MAX_KEY_BYTES;
+use crate::engine::cover_apply::{ApplyStep, CoverApply};
 use crate::engine::engine_state::EngineState;
 use crate::engine::planner::UnitStep;
 use crate::engine::volume::{NO_SEAL, Volume};
@@ -189,6 +190,7 @@ pub struct WalkJob<Backend: Io> {
     waiting_frees: Vec<FreeRecord>,
     next_handed_out: u32,
     failed_slot: Option<usize>,
+    pub apply: CoverApply<Backend>,
 }
 
 /// A worker that counts the blocks the planner hands it
@@ -339,12 +341,19 @@ impl<Backend: Io> BlockCounter<Backend> {
                 // the kind alone, since a stop comes through here during close and close allocates nothing
                 Err(_error) => return Err(Error::from(ErrorKind::Interrupted)),
             };
+            let covered = volume.covers.newest_applied(block.column, &self.key);
+            let is_covered = |place: WritePlace| covered.is_some_and(|cover| cover > place);
             match newest {
                 Some(found) if found.row.place > row.place => {
                     let replacement = found.row.place;
                     counts.count_dead(target.segment, block.column, target.next_block, &row, replacement);
                 },
-                Some(found) if !target.is_backward => {
+                // a row under an applied cover is dead by it, and so is any older one a row here would find
+                _ if is_covered(row.place) => {
+                    let replacement = covered.unwrap_or(row.place);
+                    counts.count_dead(target.segment, block.column, target.next_block, &row, replacement);
+                },
+                Some(found) if !target.is_backward && !is_covered(found.row.place) => {
                     if let Some(index) = volume.table.block_at(found.segment, found.block_offset) {
                         counts.count_dead(found.segment, block.column, index, &found.row, row.place);
                     }
@@ -360,6 +369,7 @@ impl<Backend: Io> WalkJob<Backend> {
     /// Allocate the walk's fixed buffers
     pub fn new(state: Arc<EngineState<Backend>>, volume: usize) -> Self {
         Self {
+            apply: CoverApply::new(Arc::clone(&state), volume),
             counter: BlockCounter::new(Arc::clone(&state)),
             state,
             volume,
@@ -375,7 +385,7 @@ impl<Backend: Io> WalkJob<Backend> {
     /// Read the heap the walk's buffers hold
     pub fn heap_bytes(&self) -> ByteCount {
         let waiting = self.waiting_frees.capacity() * size_of::<FreeRecord>();
-        ByteCount(self.counter.heap_bytes().0 + self.counts.heap_bytes().0 + waiting as u64)
+        ByteCount(self.counter.heap_bytes().0 + self.counts.heap_bytes().0 + self.apply.heap_bytes().0 + waiting as u64)
     }
 
     /// Pick a segment whose walk hasn't finished. Backward walks go first and newest first, so an older segment finds a
@@ -470,8 +480,45 @@ impl<Backend: Io> WalkJob<Backend> {
             self.target = Some(WalkTarget { next_block, ..target });
             return Ok(());
         }
+        // the covers land before the mark, while no other walk is running to see the rows they hide
+        if self.has_covers(volume, target.segment) {
+            self.apply.start(target.segment);
+            volume.is_applying.store(true, Ordering::Release);
+            self.target = Some(WalkTarget { next_block, ..target });
+            return Ok(());
+        }
+        self.finish_target(volume, target.segment)
+    }
 
-        volume.table.mark_walked(target.segment);
+    /// Check a segment's summary row says it holds covers
+    pub fn has_covers(&self, volume: &Volume<Backend>, segment: SegmentNumber) -> bool {
+        hold(&volume.summary).get(segment).is_some_and(|row| row.facts.has_covers)
+    }
+
+    /// Take one step of a target's covers, and end the target with the last
+    pub fn step_apply(&mut self, volume: &Volume<Backend>, now: Nanoseconds) -> UnitStep {
+        let Some(target) = self.target else {
+            return UnitStep::Idle;
+        };
+        match self.apply.step() {
+            Ok(ApplyStep::Working) => UnitStep::Worked,
+            Ok(ApplyStep::Done) => {
+                volume.is_applying.store(false, Ordering::Release);
+                volume.covers.mark_segment_applied(target.segment);
+                // an older cover inside this one could not go until now
+                volume.has_kept_covers.store(true, Ordering::Release);
+                match self.finish_target(volume, target.segment) {
+                    Ok(()) => UnitStep::Worked,
+                    Err(_) => self.wait_for_retry(now),
+                }
+            },
+            Err(_) => self.wait_for_retry(now),
+        }
+    }
+
+    /// End a walk target
+    pub fn finish_target(&mut self, volume: &Volume<Backend>, segment: SegmentNumber) -> Result<()> {
+        volume.table.mark_walked(segment);
         volume.has_walk_target.store(false, Ordering::Release);
         volume.walk_segment.store(NO_SEAL, Ordering::Release);
         volume.wants_compaction.store(true, Ordering::Release);
@@ -565,6 +612,9 @@ impl<Backend: Io> WalkJob<Backend> {
         self.free_waiting(volume);
         if let Some(index) = self.failed_slot.take() {
             assign(&volume.walk_slots[index]);
+        }
+        if self.apply.segment.is_some() {
+            return self.step_apply(volume, now);
         }
         if self.target.is_none() && volume.is_walk_held.load(Ordering::Acquire) {
             return UnitStep::Idle;

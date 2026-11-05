@@ -1833,3 +1833,23 @@ fn data_goes_before_its_rows() {
     assert_eq!(volume.segments_parked.load(Ordering::Acquire), 1);
     io.kill();
 }
+
+// a close that can't remove a data output leaves its grave output too, so the reopen that takes the merge keeps the graves
+#[test]
+fn close_keeps_graves_with_a_stuck_output() {
+    let io = SimulatedIo::new(Seed(68));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    grave_over_older(&store, &io);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    run_to_both_outputs(&mut job);
+    io.fail_removes(OperationCount(1));
+    store.close().expect("close");
+    drop(job);
+    drop(store);
+
+    let store = open(&io);
+    assert_eq!(read(&store, b"key"), None);
+    store.close().expect("close");
+}

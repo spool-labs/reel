@@ -118,6 +118,8 @@ pub struct Volume<Backend: Io> {
     pub walk_segment: AtomicU64,
     /// A test holds the walk here to leave segments unwalked
     pub is_walk_held: AtomicBool,
+    /// A walk is counting what its covers hide, and a row that left now would make an older one look live
+    pub is_applying: AtomicBool,
     /// The inputs of a merge running beside the walk, which the walk leaves alone
     pub merging: Mutex<[SegmentNumber; MOST_MERGE_SEGMENTS]>,
     /// Counts the turns a walk stood aside for a rewrite

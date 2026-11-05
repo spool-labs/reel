@@ -765,13 +765,14 @@ impl<Backend: Io> EngineState<Backend> {
             return;
         }
 
-        let has_room = target.volume.covers.add(&Cover {
+        let cover = Cover {
             column: row.column,
             start: row.key,
             end: value,
             place: row.place,
             segment: target.segment,
-        });
+        };
+        let has_room = target.volume.covers.add(&cover, false);
         if !has_room {
             recovered.lost_region = lost;
         }
@@ -833,9 +834,9 @@ pub fn rewrite_range<File: IoFile>(file: &File, start: FileOffset, length: ByteC
 }
 
 /// Add the covers of a footer to the pool, or return false when it fails or the pool has no slot left
-pub fn read_block(bytes: &[u8], segment: SegmentNumber, covers: &RangeCovers) -> bool {
+pub fn read_block(bytes: &[u8], segment: SegmentNumber, covers: &RangeCovers, is_applied: bool) -> bool {
     let mut has_room = true;
-    let is_whole = read_covers(bytes, segment, |cover| has_room &= covers.add(cover));
+    let is_whole = read_covers(bytes, segment, |cover| has_room &= covers.add(cover, is_applied));
     is_whole && has_room
 }
 
@@ -853,9 +854,11 @@ pub fn load_covers<Backend: Io>(state: &EngineState<Backend>, scan: &RootScan<Ba
         }
         bytes.resize(found.head.ranges_length.0 as usize, 0);
         let is_read = read_or_damaged(&found.file, found.head.ranges_at, &mut bytes)?;
+        // a saved walk has counted what these covers hide, so an older one stays beside a newer one that hasn't
+        let is_applied = hold(&volume.summary).get(found.head.segment).is_some_and(|row| row.facts.is_walked());
         let is_whole = is_read
             && checksum(&bytes) == found.head.ranges_sum
-            && read_block(&bytes, found.head.segment, &volume.covers);
+            && read_block(&bytes, found.head.segment, &volume.covers, is_applied);
         if !is_whole {
             hold(&volume.lost_rows).unread_covers.push(found.head.segment);
         }
@@ -1133,13 +1136,14 @@ pub fn copy_row<Backend: Io>(
             LandOutcome::Landed => {
                 note_copied_place(target, copied.slot, row.place);
                 if row.kind == RowKind::RangeDelete {
-                    let has_room = target.covers.add(&Cover {
+                    let cover = Cover {
                         column: row.column,
                         start: row.key,
                         end: record.get(SMALL_HEAD_BYTES..).unwrap_or_default(),
                         place: row.place,
                         segment: copied.segment,
-                    });
+                    };
+                    let has_room = target.covers.add(&cover, false);
                     if !has_room {
                         // the cover's row stays in the copy, so this holds for this open and the next open decides again
                         for range in whole_columns(state, volume, copied.segment, state.order.mark()) {

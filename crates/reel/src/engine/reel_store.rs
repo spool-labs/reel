@@ -440,6 +440,9 @@ pub fn bring_up<Backend: Io>(
         for row in hold(&volume.summary).rows() {
             if row.facts.is_walked() {
                 volume.table.mark_walked(row.facts.segment);
+                if row.facts.has_covers {
+                    volume.covers.mark_segment_applied(row.facts.segment);
+                }
             } else {
                 waiting += 1;
             }
@@ -856,6 +859,7 @@ pub fn build_state<Backend: Io>(
             has_walk_target: AtomicBool::new(false),
             walk_segment: AtomicU64::new(NO_SEAL),
             is_walk_held: AtomicBool::new(false),
+            is_applying: AtomicBool::new(false),
             merging: Mutex::new([SegmentNumber(0); MOST_MERGE_SEGMENTS]),
             walks_held: AtomicU64::new(0),
             partial_outputs: Mutex::new([None, None]),

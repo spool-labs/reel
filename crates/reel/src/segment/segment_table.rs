@@ -435,6 +435,19 @@ impl<File: Clone> SegmentTable<File> {
         Some((tail.first_block, tail.block_count.0))
     }
 
+    /// Find the block a key's rows can start in and the end of its column's blocks, in the segment's own block numbers
+    pub fn blocks_from(&self, number: SegmentNumber, column: ColumnId, key: &[u8]) -> Option<(u32, u32)> {
+        let guard = self.read_shard(shard_of(number));
+        let slot = guard.map.get(number)?;
+        let entry = guard.segments[slot as usize].as_ref()?;
+        let column_tail = guard.column_of(entry, column)?;
+        let first = entry.blocks.start as usize + column_tail.first_block as usize;
+        let lines = guard.blocks.get(first..first + column_tail.block_count.0 as usize)?;
+        let prefix = KeyPrefix::of_key(key, column_tail.shared_length as usize);
+        let start = column_tail.first_block + first_candidate(lines, prefix) as u32;
+        Some((start, column_tail.first_block + column_tail.block_count.0))
+    }
+
     /// Copy out the block lines that can hold a key, from a block onward
     pub fn block_window(&self, number: SegmentNumber, column: ColumnId, key: &[u8], skip: usize) -> Option<BlockWindow> {
         let guard = self.read_shard(shard_of(number));

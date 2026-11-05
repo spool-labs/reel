@@ -191,12 +191,14 @@ pub struct RewriteJob<Backend: Io> {
     grave_column: Option<ColumnId>,
     top_place: WritePlace,
     newest_place: Option<WritePlace>,
+    cover_place: Option<WritePlace>,
     lowest_dropped: WritePlace,
     pub highest_replacement: WritePlace,
     dropped_rows: u64,
     kept_dead: Vec<DeadCount>,
     last_tried: SegmentNumber,
     park_waits: u32,
+    pub forced: Option<SegmentNumber>,
     is_unwalked: bool,
     looked_up_to: SegmentNumber,
 }
@@ -239,12 +241,14 @@ impl<Backend: Io> RewriteJob<Backend> {
             grave_column: None,
             top_place: WritePlace(0),
             newest_place: None,
+            cover_place: None,
             lowest_dropped: WritePlace(u64::MAX),
             highest_replacement: WritePlace(0),
             dropped_rows: 0,
             kept_dead: touched_capacity(MOST_KEPT_BLOCKS, DeadCount::default()),
             last_tried: SegmentNumber(0),
             park_waits: 0,
+            forced: None,
             is_unwalked: false,
             looked_up_to: SegmentNumber(0),
         }
@@ -321,8 +325,12 @@ impl<Backend: Io> RewriteJob<Backend> {
         if volume.has_walk_target.load(Ordering::Acquire) {
             return None;
         }
+        // a full pool refuses range deletes, so the segment holding the oldest cover back goes whatever the trigger says
+        if let Some(row) = self.forced.take().and_then(|forced| rows.get(forced)).filter(|row| is_mergeable(volume, row)) {
+            return Some((self.gather(volume, &rows, &row, 1, |_row| false), false));
+        }
         let is_ready = |row: &SummaryRow<'_>| {
-            row.facts.is_walked() && is_rewrite_ready(row, 0) && is_rewrite_ready(row, freed_in_place(volume, row))
+            row.facts.is_walked() && is_rewrite_ready(volume, row, 0) && is_rewrite_ready(volume, row, freed_in_place(volume, row))
         };
         let ready = rows.rows().filter(is_ready);
         let after = ready.clone().filter(|row| row.facts.segment > self.last_tried).min_by_key(|row| row.facts.segment);
@@ -592,8 +600,10 @@ impl<Backend: Io> RewriteJob<Backend> {
         column: ColumnId,
         row: &FooterRow,
     ) -> Result<()> {
+        // its cover left the pool before this segment could merge, so nothing older sits under it
         if row.kind == RowKind::RangeDelete {
-            return Err(Error::from(ErrorKind::InvalidData));
+            self.dropped_rows += 1;
+            return Ok(());
         }
         let replacement = self.replacement(volume, column, row)?;
         match replacement {
@@ -627,6 +637,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             self.last_key.clear();
             self.last_key.extend_from_slice(&self.key);
             self.top_place = row.place;
+            // a cover whose walk has counted what it hides replaces a row as a newer row does
+            self.cover_place = if self.is_unwalked { None } else { volume.covers.newest_applied(column, &self.key) };
             // an unwalked merge goes by its own rows, so it runs at the disk's rate and leaves the rest to the output's walk
             self.newest_place = match self.newest_outside(volume, column) {
                 Ok(found) => found.map(|found| found.row.place),
@@ -636,7 +648,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             };
         }
         let own = (!is_top).then_some(self.top_place);
-        Ok(own.max(self.newest_place).filter(|place| *place > row.place))
+        Ok(own.max(self.newest_place).max(self.cover_place).filter(|place| *place > row.place))
     }
 
     /// Find a key's newest row in a finished segment outside the merge
@@ -976,6 +988,10 @@ impl<Backend: Io> RewriteJob<Backend> {
             }
         }
 
+        // a cover goes with its segment: the rows it hid there just left, and nothing older sits under it anywhere else
+        for input in inputs {
+            volume.covers.remove_segment(*input);
+        }
         let retired: [_; MOST_MERGE_SEGMENTS] = array::from_fn(|index| inputs.get(index).and_then(|number| volume.table.retire(*number)));
         self.summarize(volume, inputs);
         let saved = state.save_summary(volume);
@@ -1153,9 +1169,16 @@ pub fn list_output<Backend: Io>(
     }
 }
 
+/// Check a segment's covers have all left the pool, with every cover still there in a sealed segment: a cover dropped inside a
+/// newer one rests on that one, which a crash could lose until its segment seals
+pub fn has_settled_covers<Backend: Io>(volume: &Volume<Backend>, row: &SummaryRow<'_>) -> bool {
+    row.facts.has_covers && volume.covers.are_all_applied() && !volume.covers.holds_segment(row.facts.segment)
+}
+
 /// Check a segment can go into a merge at all. Damage and covers answer for more than their rows
-pub fn is_mergeable(row: &SummaryRow<'_>) -> bool {
-    row.facts.is_walked() && !row.facts.is_damaged && !row.facts.has_covers && row.facts.block_count > 0
+pub fn is_mergeable<Backend: Io>(volume: &Volume<Backend>, row: &SummaryRow<'_>) -> bool {
+    let is_clear = !row.facts.has_covers || has_settled_covers(volume, row);
+    row.facts.is_walked() && !row.facts.is_damaged && is_clear && row.facts.block_count > 0
 }
 
 /// Check a segment can go into an overlap merge: walked, or with no walk begun and a forward one owed. A half-walked segment's
@@ -1166,9 +1189,13 @@ pub fn is_overlap_input(row: &SummaryRow<'_>) -> bool {
 }
 
 /// Check a row's counts say a merge would win back its share of the rows or the bytes, past the bytes already freed in place
-pub fn is_rewrite_ready(row: &SummaryRow<'_>, freed_bytes: u64) -> bool {
-    if !is_mergeable(row) {
+pub fn is_rewrite_ready<Backend: Io>(volume: &Volume<Backend>, row: &SummaryRow<'_>, freed_bytes: u64) -> bool {
+    if !is_mergeable(volume, row) {
         return false;
+    }
+    // a settled cover's row only leaves at a rewrite
+    if row.facts.has_covers {
+        return true;
     }
     let (mut rows, mut dead_rows, mut live_graves, mut bytes, mut dead_bytes) = (0, 0, 0, 0, 0);
     let mut cursor = row.cursor();

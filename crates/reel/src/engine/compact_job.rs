@@ -10,10 +10,12 @@ use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, WritePlace};
 
 use crate::config::MAX_KEY_BYTES;
+use crate::engine::cover_apply::is_in_range;
 use crate::engine::engine_state::EngineState;
 use crate::engine::planner::UnitStep;
 use crate::engine::rewrite_job::RewriteJob;
@@ -24,12 +26,14 @@ use crate::io::device_error::is_device_error;
 use crate::io::{Io, IoFile};
 use crate::pool::{touched_capacity, touched_zeroes};
 use crate::row_kind::RowKind;
-use crate::segment::range_covers::Cover;
+use crate::segment::range_covers::{Cover, MOST_RANGE_COVERS};
 use crate::segment::row_block::{ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::RetiredSegment;
 use crate::segment::segment_tail::SegmentNumber;
 use crate::segment::summary::SummaryRow;
 
+/// Covers one ask of compaction looks at, which bounds what settling them costs
+pub const MOST_SETTLE_LOOKS: usize = 16;
 /// How long compaction waits before it looks at a parked segment's pins again
 pub const PARKED_RETRY: Nanoseconds = Nanoseconds(1_000_000);
 
@@ -41,6 +45,17 @@ pub struct HeldPass {
     pub is_whole: bool,
 }
 
+/// What keeps a cover in the pool
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Blocker {
+    /// Nothing does
+    None,
+    /// An open segment may hold a row it hides
+    OpenRows,
+    /// This sealed segment holds a row it hides
+    Segment(SegmentNumber),
+}
+
 /// The compaction of one volume
 pub struct CompactJob<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
@@ -50,8 +65,10 @@ pub struct CompactJob<Backend: Io> {
     held_pass: Option<HeldPass>,
     should_rewrite: bool,
     last_tried: SegmentNumber,
+    settle_at: usize,
     block: Vec<u8>,
     key: Vec<u8>,
+    row_key: Vec<u8>,
     end: Vec<u8>,
 }
 
@@ -68,15 +85,17 @@ impl<Backend: Io> CompactJob<Backend> {
             volume,
             retry_at: None,
             last_tried: SegmentNumber(0),
+            settle_at: 0,
             block: touched_zeroes(ROW_BLOCK_BYTES),
             key: touched_capacity(MAX_KEY_BYTES as usize, 0),
+            row_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             end: touched_capacity(MAX_KEY_BYTES as usize + 1, 0),
         }
     }
 
     /// Read the heap the job's buffers hold
     pub fn heap_bytes(&self) -> ByteCount {
-        let buffers = self.block.capacity() + self.key.capacity() + self.end.capacity();
+        let buffers = self.block.capacity() + self.key.capacity() + self.row_key.capacity() + self.end.capacity();
         ByteCount(buffers as u64 + self.rewrite.heap_bytes().0)
     }
 
@@ -144,6 +163,14 @@ impl<Backend: Io> CompactJob<Backend> {
             return UnitStep::Worked;
         }
         let is_asked = volume.wants_compaction.swap(false, Ordering::AcqRel);
+        if is_asked {
+            let has_settled = self.settle_covers(volume);
+            self.force_oldest(volume);
+            // a settled cover asks again, and only a worked step brings the planner back to hear it
+            if has_settled {
+                return UnitStep::Worked;
+            }
+        }
         self.should_rewrite |= is_asked;
         let candidate = if is_asked { self.pick_dead(volume) } else { None };
         let Some(segment) = candidate else {
@@ -250,8 +277,120 @@ impl<Backend: Io> CompactJob<Backend> {
         }
     }
 
+    /// Take covers out of the pool that nothing older sits under any more, a few each time compaction is asked, and say whether
+    /// any went
+    pub fn settle_covers(&mut self, volume: &Volume<Backend>) -> bool {
+        let mut has_settled = false;
+        let is_stuck = volume.segments_parked.load(Ordering::Acquire) > 0 || volume.stray_outputs.load(Ordering::Acquire) > 0;
+        if volume.covers.is_empty() || is_stuck {
+            return false;
+        }
+        for _look in 0..MOST_SETTLE_LOOKS {
+            let is_applied = volume.covers.is_applied_at(self.settle_at);
+            let Some((column, place, segment)) = volume.covers.cover_at(self.settle_at, &mut self.key, &mut self.end) else {
+                self.settle_at = 0;
+                return has_settled;
+            };
+            if !is_applied || self.blocker(volume, column, place, segment) != Blocker::None {
+                self.settle_at += 1;
+                continue;
+            }
+            // rows under it in its own segment leave with it, at that segment's rewrite
+            if self.has_row_under(volume, segment, column, place) {
+                if volume.covers.mark_clear(place) {
+                    volume.wants_compaction.store(true, Ordering::Release);
+                }
+                self.settle_at += 1;
+                continue;
+            }
+            let cover = Cover {
+                column,
+                start: &self.key,
+                end: &self.end,
+                place,
+                segment,
+            };
+            volume.covers.remove(&cover);
+            has_settled = true;
+            volume.wants_compaction.store(true, Ordering::Release);
+        }
+        has_settled
+    }
+
+    /// Find the first segment that keeps a cover in the pool: an open row or a sealed one it still hides. A cue needs no check of
+    /// its own, since the rows a cue below the cover reads stay while it lives, and those keep the cover here
+    pub fn blocker(&mut self, volume: &Volume<Backend>, column: ColumnId, place: WritePlace, segment: SegmentNumber) -> Blocker {
+        if hold(&volume.claims).open.iter().any(|open| open.row_count.0 > 0 && open.lowest_place < place) {
+            return Blocker::OpenRows;
+        }
+        let mut last = SegmentNumber(0);
+        loop {
+            let rows = hold(&volume.summary);
+            let is_under = |row: &SummaryRow<'_>| {
+                row.facts.segment > last
+                    && row.facts.segment != segment
+                    && row.facts.places.lowest < place
+                    && is_in_range(row, column, &self.key, &self.end)
+            };
+            let next = rows.rows().filter(is_under).min_by_key(|row| row.facts.segment).map(|row| (row.facts.segment, row.facts.is_damaged));
+            drop(rows);
+            let Some((other, is_damaged)) = next else {
+                return Blocker::None;
+            };
+            if is_damaged || self.has_row_under(volume, other, column, place) {
+                return Blocker::Segment(other);
+            }
+            last = other;
+        }
+    }
+
+    /// Check a segment holds a row older than a place inside the range in `key` and `end`. A block that won't read counts as one
+    pub fn has_row_under(&mut self, volume: &Volume<Backend>, other: SegmentNumber, column: ColumnId, place: WritePlace) -> bool {
+        let (Some(pin), Some((first, end))) = (volume.table.pin(other), volume.table.blocks_from(other, column, &self.key)) else {
+            return false;
+        };
+        for index in first..end {
+            let Some(block) = volume.table.walk_block(other, index) else {
+                return true;
+            };
+            let length = block.entry.block_length().0 as usize;
+            if length > self.block.len() || pin.file.read_exact_at(block.entry.block_at(), &mut self.block[..length]).is_err() {
+                return true;
+            }
+            let Some(mut walk) = RowBlockWalk::open(&self.block[..length], pin.head.place_base) else {
+                return true;
+            };
+            while let Some(row) = walk.next_row(&mut self.row_key) {
+                if self.row_key >= self.end {
+                    return false;
+                }
+                if self.row_key >= self.key && row.place < place {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Past half of the pool, send the oldest cover's first sealed row to a rewrite, whatever the trigger says
+    pub fn force_oldest(&mut self, volume: &Volume<Backend>) {
+        if volume.covers.len() * 2 <= MOST_RANGE_COVERS {
+            return;
+        }
+        let Some((column, place, segment)) = volume.covers.oldest_applied(&mut self.key, &mut self.end) else {
+            return;
+        };
+        if let Blocker::Segment(other) = self.blocker(volume, column, place, segment) {
+            self.rewrite.forced = Some(other);
+            self.should_rewrite = true;
+        }
+    }
+
     /// Pick the next segment past the last one tried whose counts say nothing in it is live
     pub fn pick_dead(&self, volume: &Volume<Backend>) -> Option<SegmentNumber> {
+        if volume.is_applying.load(Ordering::Acquire) {
+            return None;
+        }
         let rows = hold(&volume.summary);
         let dead = rows.rows().filter(is_wholly_dead);
         let after = dead.clone().filter(|row| row.facts.segment > self.last_tried).min_by_key(|row| row.facts.segment);
@@ -306,9 +445,10 @@ impl<Backend: Io> CompactJob<Backend> {
                 match self.state.search_footers(volume, &read) {
                     Ok(newest) => {
                         let is_replaced = newest.is_some_and(|found| found.row.place > row.place);
+                        let is_covered = volume.covers.newest_over(block.column, &self.key, WritePlace(u64::MAX)).is_some_and(|cover| cover > row.place);
                         // damage only answers for a row it could be newer than
                         let is_hidden = volume.damage.covering(block.column, &self.key).is_some_and(|highest| highest > row.place);
-                        debug_assert!(is_replaced || is_hidden, "the counts call a live row dead");
+                        debug_assert!(is_replaced || is_covered || is_hidden, "the counts call a live row dead");
                         debug_assert!(row.kind != RowKind::RangeDelete, "the counts call a range delete dead");
                     },
                     Err(StoreError::Corruption { .. }) => return Ok(()),

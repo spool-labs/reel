@@ -648,8 +648,21 @@ impl<Backend: Io> EngineState<Backend> {
         if !pin.is_walked {
             return Ok(());
         }
+        self.ask_rows(volume, read, segment, &pin, reader, best)
+    }
+
+    /// Ask one pinned segment for a key's newest row that isn't a range delete, whether or not its walk has finished
+    pub fn ask_rows(
+        &self,
+        volume: &Volume<Backend>,
+        read: &KeyRead,
+        segment: SegmentNumber,
+        pin: &SegmentPin<'_, Backend::File>,
+        reader: &mut FooterReader,
+        best: &mut Option<SealedRow>,
+    ) -> Result<(), StoreError> {
         let mut point = *read;
-        while let Some(found) = self.search_segment(volume, &point, segment, &pin, reader)? {
+        while let Some(found) = self.search_segment(volume, &point, segment, pin, reader)? {
             if found.kind != RowKind::RangeDelete {
                 if best.is_none_or(|current| current.row.place < found.place) {
                     *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block });

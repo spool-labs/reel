@@ -11,6 +11,7 @@ mod dead_walk;
 mod io_contract;
 mod place_limit;
 mod range_deletes;
+mod range_apply;
 mod rewrite;
 mod records;
 mod seed_sets;

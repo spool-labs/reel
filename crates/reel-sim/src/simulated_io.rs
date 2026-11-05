@@ -173,6 +173,11 @@ impl SimulatedIo {
         hold(&self.disk).failing_removes = count;
     }
 
+    /// Read how many reads have run
+    pub fn read_count(&self) -> OperationCount {
+        hold(&self.disk).reads
+    }
+
     /// Make the next file creates fail
     pub fn fail_creates(&self, count: OperationCount) {
         hold(&self.disk).failing_creates = count;

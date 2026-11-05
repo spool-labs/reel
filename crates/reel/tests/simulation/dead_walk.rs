@@ -3,11 +3,14 @@
 use std::path::{Path, PathBuf};
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::engine::engine_state::IndexWait;
 use reel::engine::open_segment::SegmentPhase;
+use reel::engine::planner::Planner;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::walk_job::WalkJob;
 use reel::guard::hold;
 use reel::io::IoTask;
+use reel::io::job::{Job, JobStep};
 use reel::record::codec::Codec;
 use reel::segment::segment_tail::SegmentNumber;
 use reel::segment::summary::{LostRows, SummaryPaths, SummaryRows, copy_ends, read_summary, write_copy};
@@ -19,11 +22,15 @@ use reel_sim::simulated_io::SimulatedIo;
 
 const ROOT: &str = "/disk/walk";
 const COLUMN: ColumnId = ColumnId(1);
+const SECOND_COLUMN: ColumnId = ColumnId(2);
+const SECOND_ROOT: &str = "/disk/walk-second";
 const BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
 const LARGE_BUDGET: ByteCount = ByteCount(512 * 1024 * 1024);
-const WALK_JOB: &str = "reel-walk";
+const WALK_JOB: &str = "reel-planner";
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 20_000;
+const YIELD_STEPS: u64 = 200;
+const TURN_SEEDS: u64 = 8;
 const BUSY: u32 = 1_000;
 const VERSIONS: u64 = 600;
 const LONG_KEYS: u64 = 62;
@@ -420,4 +427,78 @@ fn bytes_of(store: &Store, number: SegmentNumber) -> (u64, u64) {
     let rows = hold(&store.state.volumes[0].summary);
     let column = rows.get(number).expect("a row").cursor().column().expect("a column");
     (column.live_bytes.0, column.dead_bytes.0)
+}
+
+// the walk stands aside while a writer waits for index room, and goes on once none does
+#[test]
+fn yields_to_writers() {
+    let io = SimulatedIo::new(Seed(17));
+    let store = open(&io);
+    io.hold_jobs(WALK_JOB, true);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let number = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, number);
+    assert_eq!(store.state.pending_walks(0), 1);
+
+    let waiting = IndexWait::new(&store.state.index_waiters);
+    io.hold_jobs(WALK_JOB, false);
+    for _step in 0..YIELD_STEPS {
+        io.advance_clock(TICK);
+        io.step_any();
+    }
+    assert_eq!(store.state.pending_walks(0), 1);
+
+    drop(waiting);
+    io.advance_clock(TICK);
+    settle(&io);
+    assert_eq!(store.state.pending_walks(0), 0);
+    store.close().expect("close");
+}
+
+// a walk waiting out a failed read holds up no other volume's walk
+#[test]
+fn volumes_in_turn() {
+    // the simulator picks the unit that goes first, so some seeds try the waiting walk before the other
+    for seed in 0..TURN_SEEDS {
+        turn_with(Seed(seed));
+    }
+}
+
+fn turn_with(seed: Seed) {
+    let io = SimulatedIo::new(seed);
+    let mut config = config(BUDGET);
+    config.volumes.push(VolumeConfig {
+        name: "second".to_string(),
+        roots: vec![PathBuf::from(SECOND_ROOT)],
+        sync: SyncPolicy::Never,
+    });
+    config.columns.push(ColumnConfig {
+        id: SECOND_COLUMN,
+        name: "second".to_string(),
+        key_shape: KeyShape::Variable { most: 64 },
+        codec: Codec::None,
+        volume: VolumeId(1),
+    });
+    let store = ReelStore::open(io.clone(), &config).expect("open");
+    io.hold_jobs(WALK_JOB, true);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    store.put(SECOND_COLUMN, b"key", b"value").expect("put");
+    store.seal_now();
+    settle(&io);
+    assert_eq!((store.state.pending_walks(0), store.state.pending_walks(1)), (1, 1));
+
+    let mut walks = vec![WalkJob::new(store.state.clone(), 0), WalkJob::new(store.state.clone(), 1)];
+    walks[0].retry_at = Some(Nanoseconds(u64::MAX));
+    let mut planner = Planner {
+        state: store.state.clone(),
+        walks,
+        last: 0,
+    };
+
+    assert_eq!(planner.step(), JobStep::Worked);
+
+    assert_eq!((store.state.pending_walks(0), store.state.pending_walks(1)), (1, 0));
+    assert_eq!(planner.step(), JobStep::IdleUntil { deadline: Nanoseconds(u64::MAX) });
+    drop(planner);
+    store.close().expect("close");
 }

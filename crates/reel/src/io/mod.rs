@@ -96,6 +96,11 @@ pub trait Io: Clone + Send + Sync + 'static {
     /// Draw a random word for a new store's id and key
     fn random_word(&self) -> u64;
 
+    /// Pick the unit a planner tries first, a volume in turn unless the backend says otherwise
+    fn next_unit(&self, last: usize, count: usize) -> usize {
+        (last + 1) % count
+    }
+
     /// Let background work run while a caller waits for it
     fn pause(&self);
 

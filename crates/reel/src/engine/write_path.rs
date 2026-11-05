@@ -13,7 +13,7 @@ use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, RowCount, Writ
 use crate::config::SyncPolicy;
 use crate::engine::claim::Claim;
 use crate::engine::engine_sizing::OPEN_PER_ROOT;
-use crate::engine::engine_state::{EngineState, SlotData, SlotPin};
+use crate::engine::engine_state::{EngineState, IndexWait, SlotData, SlotPin};
 use crate::engine::open_segment::{
     MOST_WINDOW_RECORD_BYTES, OpenSegment, RECORD_WINDOW_BYTES, RecordWindow, RowQueue, SegmentPhase, data_path,
     rows_path,
@@ -660,6 +660,7 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn wait_for_index(&self, column: ColumnId, key: &[u8], slot: OpenSlot) -> Result<(), StoreError> {
         let started = self.io.now();
         self.index_waits.fetch_add(1, Ordering::Relaxed);
+        let _waiting = IndexWait::new(&self.index_waiters);
         let deadline = self.io.now().0.saturating_add(INDEX_WAIT.0);
         loop {
             for volume in &self.volumes {

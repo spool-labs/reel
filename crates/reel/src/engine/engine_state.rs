@@ -97,7 +97,8 @@ pub struct EngineState<Backend: Io> {
     pub row_task: OnceLock<Backend::Task>,
     pub reserve_task: OnceLock<Backend::Task>,
     pub seal_tasks: Vec<OnceLock<Backend::Task>>,
-    pub walk_tasks: Vec<OnceLock<Backend::Task>>,
+    pub planner_task: OnceLock<Backend::Task>,
+    pub index_waiters: AtomicU64,
 }
 
 /// A held open-slot pin, released when dropped
@@ -344,3 +345,23 @@ impl<Backend: Io> EngineState<Backend> {
     }
 }
 
+
+/// Keeps the planner aside while a writer waits for index room
+#[derive(Debug)]
+pub struct IndexWait<'state> {
+    waiters: &'state AtomicU64,
+}
+
+impl<'state> IndexWait<'state> {
+    /// Count one more writer waiting
+    pub fn new(waiters: &'state AtomicU64) -> Self {
+        waiters.fetch_add(1, Ordering::AcqRel);
+        Self { waiters }
+    }
+}
+
+impl Drop for IndexWait<'_> {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+}

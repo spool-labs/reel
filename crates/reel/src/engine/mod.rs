@@ -6,6 +6,7 @@ pub mod column_info;
 pub mod engine_sizing;
 pub mod engine_state;
 pub mod open_segment;
+pub mod planner;
 pub mod read_path;
 pub mod recovery;
 pub mod reel_store;

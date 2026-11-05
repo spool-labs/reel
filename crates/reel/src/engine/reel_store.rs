@@ -15,7 +15,7 @@ use reel_api::write_batch::WriteBatch;
 use crate::config::{ColumnConfig, StoreConfig};
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
-    EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, PLANNED_COLUMN_BYTES, PLANNED_LINE_BYTES,
+    EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, PLANNED_COLUMN_BYTES, PLANNED_LINE_BYTES, SHARED_JOBS,
     PLANNED_SEGMENT_BYTES, StoreShape, GATHER_BYTES, READ_BUFFERS, WRITE_BUFFERS,
 };
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
@@ -29,6 +29,7 @@ use crate::engine::recovery::{
 use crate::engine::reserve_job::ReserveJob;
 use crate::engine::row_job::RowJob;
 use crate::engine::seal_job::SealJob;
+use crate::engine::planner::Planner;
 use crate::engine::walk_job::WalkJob;
 use crate::engine::volume::{ClaimState, SyncState, Volume};
 use crate::guard::hold;
@@ -316,7 +317,10 @@ impl<Backend: Io> EngineState<Backend> {
         if let Some(task) = self.reserve_task.get() {
             task.stop()?;
         }
-        for cell in self.seal_tasks.iter().chain(&self.walk_tasks) {
+        if let Some(task) = self.planner_task.get() {
+            task.stop()?;
+        }
+        for cell in &self.seal_tasks {
             if let Some(task) = cell.get() {
                 task.stop()?;
             }
@@ -411,17 +415,26 @@ pub fn bring_up<Backend: Io>(
         state.seal_heap.fetch_add(seal_job.heap_bytes().0, Ordering::AcqRel);
         let task = state.io.spawn_job("reel-seal", seal_job).map_err(open_error("starting a job"))?;
         let _set = state.seal_tasks[volume].set(task);
-        let walk_job = WalkJob::new(Arc::clone(state), volume);
-        state.seal_heap.fetch_add(walk_job.heap_bytes().0, Ordering::AcqRel);
-        let task = state.io.spawn_job("reel-walk", walk_job).map_err(open_error("starting a job"))?;
-        let _set = state.walk_tasks[volume].set(task);
     }
+    let mut walks = Vec::with_capacity(state.volumes.len());
+    for volume in 0..state.volumes.len() {
+        let walk = WalkJob::new(Arc::clone(state), volume);
+        state.seal_heap.fetch_add(walk.heap_bytes().0, Ordering::AcqRel);
+        walks.push(walk);
+    }
+    let planner = Planner {
+        state: Arc::clone(state),
+        walks,
+        last: 0,
+    };
+    let task = state.io.spawn_job("reel-planner", planner).map_err(open_error("starting a job"))?;
+    let _set = state.planner_task.set(task);
     let reserve_job = ReserveJob {
         state: Arc::clone(state),
     };
     let task = state.io.spawn_job("reel-reserve", reserve_job).map_err(open_error("starting a job"))?;
     let _set = state.reserve_task.set(task);
-    state.job_count.store(2 + 2 * state.volumes.len() as u64, Ordering::Release);
+    state.job_count.store(SHARED_JOBS + state.volumes.len() as u64, Ordering::Release);
     Ok(())
 }
 
@@ -784,10 +797,8 @@ pub fn build_state<Backend: Io>(
     }
 
     let mut seal_tasks = Vec::with_capacity(config.volumes.len());
-    let mut walk_tasks = Vec::with_capacity(config.volumes.len());
     for _volume in &config.volumes {
         seal_tasks.push(OnceLock::new());
-        walk_tasks.push(OnceLock::new());
     }
 
     let filter_share = ByteCount(sizing.cache_share.0 / 4 * FILTER_CACHE_QUARTERS);
@@ -840,7 +851,8 @@ pub fn build_state<Backend: Io>(
         row_task: OnceLock::new(),
         reserve_task: OnceLock::new(),
         seal_tasks,
-        walk_tasks,
+        planner_task: OnceLock::new(),
+        index_waiters: AtomicU64::new(0),
     }
 }
 

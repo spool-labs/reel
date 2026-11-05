@@ -412,6 +412,11 @@ impl Io for SimulatedIo {
         hold(&self.disk).random.next_word()
     }
 
+    fn next_unit(&self, _last: usize, count: usize) -> usize {
+        // the scheduler steps units in random order, as it does jobs
+        self.draw(count as u64) as usize
+    }
+
     fn pause(&self) {
         // one thread drives a simulation, so a waiter runs the work it waits for
         self.advance_clock(PAUSE_TICK);

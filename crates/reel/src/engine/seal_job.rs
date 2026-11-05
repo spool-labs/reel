@@ -317,7 +317,7 @@ impl<Backend: Io> SealJob<Backend> {
         }
 
         state.save_summary(volume)?;
-        if let Some(task) = state.walk_tasks[self.volume].get() {
+        if let Some(task) = state.planner_task.get() {
             task.wake();
         }
         self.phase = SealPhase::DiscardingRows;

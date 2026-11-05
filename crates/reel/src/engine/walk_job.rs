@@ -1,4 +1,4 @@
-//! The dead-byte walk: after a seal, count the versions each segment's rows supersede, a row block at a time
+//! The dead-byte walk, a planner unit: after a seal, count the versions each segment's rows supersede, a row block at a time
 //!
 //! A walk looks only at segments whose own walk has finished, so after each walk exactly the newest row of a key
 //! among them is live and every other row is counted once. A segment not yet walked counts nothing until its turn,
@@ -17,10 +17,10 @@ use reel_api::units::{ByteCount, Nanoseconds, WritePlace};
 
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::engine_state::EngineState;
+use crate::engine::planner::UnitStep;
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::io::device_error::is_device_error;
-use crate::io::job::{Job, JobStep};
 use crate::io::{Io, IoFile};
 use crate::pool::touched_capacity;
 use crate::row_kind::RowKind;
@@ -50,6 +50,7 @@ pub struct WalkJob<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
     pub volume: usize,
     pub target: Option<WalkTarget>,
+    pub retry_at: Option<Nanoseconds>,
     block: Vec<u8>,
     key: Vec<u8>,
     last_key: Vec<u8>,
@@ -65,6 +66,7 @@ impl<Backend: Io> WalkJob<Backend> {
             state,
             volume,
             target: None,
+            retry_at: None,
             block: vec![0; ROW_BLOCK_BYTES],
             key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             last_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
@@ -253,24 +255,28 @@ impl<Backend: Io> WalkJob<Backend> {
     }
 }
 
-impl<Backend: Io> Job for WalkJob<Backend> {
-    fn step(&mut self) -> JobStep {
+impl<Backend: Io> WalkJob<Backend> {
+    /// Step this volume's walk once: one row block, or nothing when no segment waits or a failed read's wait isn't over
+    pub fn step_unit(&mut self, now: Nanoseconds) -> UnitStep {
         if self.state.volumes[self.volume].has_failed() {
-            return JobStep::Idle;
+            return UnitStep::Idle;
         }
+        if let Some(at) = self.retry_at.filter(|at| at.0 > now.0) {
+            return UnitStep::RetryAt(at);
+        }
+        self.retry_at = None;
         if self.target.is_none() && !self.pick_target() {
-            return JobStep::Idle;
+            return UnitStep::Idle;
         }
         let Some(target) = self.target else {
-            return JobStep::Idle;
+            return UnitStep::Idle;
         };
         match self.walk_block(target) {
-            Ok(()) => JobStep::Worked,
+            Ok(()) => UnitStep::Worked,
             Err(_) => {
-                let now = self.state.io.now();
-                JobStep::IdleUntil {
-                    deadline: Nanoseconds(now.0 + WALK_RETRY.0),
-                }
+                let at = Nanoseconds(now.0 + WALK_RETRY.0);
+                self.retry_at = Some(at);
+                UnitStep::RetryAt(at)
             },
         }
     }

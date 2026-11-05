@@ -18,7 +18,7 @@ use crate::engine::engine_sizing::{
 use crate::engine::engine_state::{EngineState, SEGMENT_NUMBER_BATCH, SlotFile};
 use crate::engine::open_segment::RowQueue;
 use crate::engine::read_path::RecordWant;
-use crate::engine::recovery::{RootScan, list_roots, scan_roots};
+use crate::engine::recovery::{RootScan, list_roots, recover_segments, scan_roots};
 use crate::engine::row_job::RowJob;
 use crate::engine::seal_job::SealJob;
 use crate::engine::volume::{ClaimState, SyncState, Volume};
@@ -88,17 +88,12 @@ impl<Backend: Io> ReelStore<Backend> {
         let state = Arc::new(build_state(io, config, &sizing, superblock, locks, &scan));
         state.damaged_segments.store(scan.damaged, Ordering::Release);
         let highest_segment = scan.highest_segment;
-        let mut highest_place = scan.highest_place;
+        let highest_place = scan.highest_place;
         for found in scan.sealed {
             let volume = &state.volumes[found.volume];
             state.install_sealed(volume, found).map_err(open_error("installing a segment"))?;
         }
-        for found in scan.open {
-            let volume = &state.volumes[found.volume];
-            let place = state.recover_open(volume, found).map_err(open_error("recovering a segment"))?;
-            highest_place = highest_place.max(place);
-        }
-        state.resume_order(highest_place, highest_segment);
+        recover_segments(&state, scan.open, highest_place, highest_segment).map_err(open_error("recovering a segment"))?;
 
         // an open is not a state: the limits say what a run-through would seal, from the same rows
         for volume in &state.volumes {

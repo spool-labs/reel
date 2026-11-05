@@ -1,18 +1,23 @@
 //! Open's reading of the roots: sealed segments from their tails, open ones from their rows
 
-use std::io::{Error, ErrorKind, Result};
+use std::io::{Error, ErrorKind, IoSlice, Result};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
 
 use crate::engine::engine_sizing::GROUP_BYTES;
 use crate::engine::engine_state::{EngineState, SlotData};
 use crate::engine::open_segment::{DATA_SUFFIX, OpenSegment, SegmentPhase, data_path, parse_segment, rows_path};
+use crate::engine::seal_job::SealJob;
 use crate::engine::volume::Volume;
+use crate::engine::write_path::{ClaimRequest, LandOutcome};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::index::write_row::WriteRow;
+use crate::io::job::{Job, JobStep};
 use crate::io::{Io, IoFile};
 use crate::record::record_check::{RecordIdentity, RecordKey};
 use crate::record::record_head::SMALL_HEAD_BYTES;
@@ -24,6 +29,9 @@ use crate::segment::column_directory::DirectoryEntry;
 use crate::segment::footer_reader::FooterReader;
 use crate::segment::segment_table::{TABLE_SHARDS, TableSizing, shard_of};
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber, TailHead};
+
+/// Steps a seal on the opening thread can take before open reports it stuck
+pub const MOST_INLINE_STEPS: u64 = 100_000_000;
 
 /// A root's files, listed before any of them is read
 #[derive(Clone, Debug)]
@@ -64,11 +72,21 @@ pub struct RootScan<File> {
     pub highest_segment: SegmentNumber,
 }
 
+/// An open segment with its rows file walked, waiting for its turn
+#[derive(Debug)]
+pub struct ScannedOpen<File> {
+    pub found: FoundOpen<File>,
+    pub rows: File,
+    pub scan: RowsScan,
+}
+
 /// What a walk of one rows file found
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RowsScan {
     pub valid_end: FileOffset,
     pub synced_through: FileOffset,
+    pub row_count: RowCount,
+    pub highest_place: WritePlace,
 }
 
 /// The rows of a recovered segment so far
@@ -247,15 +265,13 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(())
     }
 
-    /// Rebuild an open segment from its rows, ready to go on taking writes
-    pub fn recover_open(&self, volume: &Volume<Backend>, found: FoundOpen<Backend::File>) -> Result<WritePlace> {
-        let path = &volume.roots[found.root.0 as usize];
-        let rows = self.io.open_file(&rows_path(path, found.number))?;
+    /// Rebuild an open segment from its rows, ready to go on taking writes, or return false
+    /// with nothing changed when its rows don't fit the write index
+    pub fn recover_open(&self, volume: &Volume<Backend>, scanned: &ScannedOpen<Backend::File>) -> Result<bool> {
         let Some(slot) = self.take_slot() else {
             return Err(Error::other("more open segments than slots"));
         };
-
-        let scan = self.scan_rows(&rows)?;
+        let found = &scanned.found;
         let mut recovered = RecoveredRows {
             write_end: FileOffset(0),
             row_count: RowCount(0),
@@ -268,10 +284,14 @@ impl<Backend: Io> EngineState<Backend> {
             slot,
             segment: found.number,
         };
-        let kept_end = self.replay_rows(&rows, &target, &scan, &mut records, &mut recovered)?;
-        rows.truncate(ByteCount(kept_end.0))?;
+        let Some(kept_end) = self.replay_rows(&scanned.rows, &target, &scanned.scan, &mut records, &mut recovered)? else {
+            self.index.clean_slot(slot, RowCount(u64::MAX));
+            self.free_slot(slot);
+            return Ok(false);
+        };
+        scanned.rows.truncate(ByteCount(kept_end.0))?;
 
-        let synced_through = FileOffset(scan.synced_through.0.min(kept_end.0));
+        let synced_through = FileOffset(scanned.scan.synced_through.0.min(kept_end.0));
         hold(&self.queues[slot.0 as usize]).reset(kept_end, synced_through);
         self.slot_files[slot.0 as usize].set(Some(SlotData {
             segment: found.number,
@@ -282,8 +302,8 @@ impl<Backend: Io> EngineState<Backend> {
             number: found.number,
             slot,
             root: found.root,
-            data: found.data,
-            rows,
+            data: found.data.clone(),
+            rows: scanned.rows.clone(),
             phase: SegmentPhase::Taking,
             write_end: recovered.write_end,
             row_count: recovered.row_count,
@@ -291,7 +311,7 @@ impl<Backend: Io> EngineState<Backend> {
             lowest_place: recovered.lowest_place,
             highest_place: recovered.highest_place,
         });
-        Ok(recovered.highest_place)
+        Ok(true)
     }
 
     /// Walk a rows file's whole groups for where they end and what a sync last covered
@@ -308,12 +328,17 @@ impl<Backend: Io> EngineState<Backend> {
                 break;
             };
             scan.synced_through = scan.synced_through.max(group.synced_through);
+            scan.row_count = RowCount(scan.row_count.0 + group.row_count.0);
+            for row in group.walk() {
+                scan.highest_place = scan.highest_place.max(row.place);
+            }
             scan.valid_end = FileOffset(scan.valid_end.0 + group_length as u64);
         }
         Ok(scan)
     }
 
-    /// Put each group's rows in the index, checking the records of groups no sync covered
+    /// Put each group's rows in the index, checking the records of groups no sync covered, and
+    /// return where the kept rows end, or nothing when the index ran out of room
     pub fn replay_rows(
         &self,
         rows: &Backend::File,
@@ -321,7 +346,7 @@ impl<Backend: Io> EngineState<Backend> {
         scan: &RowsScan,
         records: &mut RecordReader,
         recovered: &mut RecoveredRows,
-    ) -> Result<FileOffset> {
+    ) -> Result<Option<FileOffset>> {
         let mut bytes = vec![0; GROUP_BYTES.0 as usize];
         let mut value = Vec::new();
         let mut at = FileOffset(0);
@@ -339,17 +364,19 @@ impl<Backend: Io> EngineState<Backend> {
             if at.0 >= scan.synced_through.0 {
                 for row in group.walk() {
                     if !self.is_record_whole(target.data, &row, records, &mut value)? {
-                        return Ok(at);
+                        return Ok(Some(at));
                     }
                 }
             }
 
             for row in group.walk() {
-                self.replay_row(&row, target, recovered)?;
+                if !self.replay_row(&row, target, recovered) {
+                    return Ok(None);
+                }
             }
             at = FileOffset(at.0 + length as u64);
         }
-        Ok(at)
+        Ok(Some(at))
     }
 
     /// Check a row's record reads back whole, and take a row with no bytes as it stands
@@ -385,13 +412,13 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
-    /// Put one recovered row in the write index
+    /// Put one recovered row in the write index, and return false when it has no room
     pub fn replay_row(
         &self,
         row: &RowEntry,
         target: &ReplayTarget<Backend::File>,
         recovered: &mut RecoveredRows,
-    ) -> Result<()> {
+    ) -> bool {
         let write_row = WriteRow {
             place: row.place,
             offset: row.offset,
@@ -401,14 +428,14 @@ impl<Backend: Io> EngineState<Backend> {
             segment: target.segment,
         };
         if !self.index.insert(row.column, row.key, &write_row) {
-            return Err(Error::other("open segments hold more rows than this budget's write index"));
+            return false;
         }
 
         recovered.row_count = RowCount(recovered.row_count.0 + 1);
         recovered.lowest_place = recovered.lowest_place.min(row.place);
         recovered.highest_place = recovered.highest_place.max(row.place);
         recovered.write_end = recovered.write_end.max(FileOffset(row.offset.0 + row.length.0));
-        Ok(())
+        true
     }
 
     /// Carry on the write order and the segment numbers from what open found
@@ -416,6 +443,199 @@ impl<Backend: Io> EngineState<Backend> {
         self.order.resume_after(highest_place);
         self.next_segment.fetch_max(highest_segment.0 + 1, Ordering::AcqRel);
     }
+}
+
+/// Bring every open segment back, sealing as a running store at this budget would have
+pub fn recover_segments<Backend: Io>(
+    state: &Arc<EngineState<Backend>>,
+    found: Vec<FoundOpen<Backend::File>>,
+    highest_place: WritePlace,
+    highest_segment: SegmentNumber,
+) -> Result<()> {
+    let mut scanned = Vec::with_capacity(found.len());
+    let mut highest = highest_place;
+    for open in found {
+        let volume = &state.volumes[open.volume];
+        let path = &volume.roots[open.root.0 as usize];
+        let rows = state.io.open_file(&rows_path(path, open.number))?;
+        let scan = state.scan_rows(&rows)?;
+        highest = highest.max(scan.highest_place);
+        scanned.push(ScannedOpen { found: open, rows, scan });
+    }
+    state.resume_order(highest, highest_segment);
+
+    for segment in scanned {
+        let index = segment.found.volume;
+        let volume = &state.volumes[index];
+        if segment.scan.row_count > volume.segment_rows {
+            copy_segment(state, index, &segment)?;
+            continue;
+        }
+
+        make_room(state, index, segment.scan.row_count)?;
+        if state.recover_open(volume, &segment)? {
+            continue;
+        }
+
+        // long keys can fill the index below the row limit
+        seal_every_open(state, index)?;
+        if !state.recover_open(volume, &segment)? {
+            copy_segment(state, index, &segment)?;
+        }
+    }
+    Ok(())
+}
+
+/// Seal the fullest segments until some rows fit under the volume's limit
+pub fn make_room<Backend: Io>(state: &Arc<EngineState<Backend>>, volume: usize, rows: RowCount) -> Result<()> {
+    let target = &state.volumes[volume];
+    loop {
+        let mut open_rows = rows.0;
+        let mut has_open = false;
+        for segment in &hold(&target.claims).open {
+            open_rows += segment.row_count.0;
+            has_open = true;
+        }
+        if open_rows <= target.segment_rows.0 || !has_open {
+            return Ok(());
+        }
+        state.seal_fullest(target);
+        seal_inline(state, volume)?;
+    }
+}
+
+/// Seal every open segment of a volume
+pub fn seal_every_open<Backend: Io>(state: &Arc<EngineState<Backend>>, volume: usize) -> Result<()> {
+    let target = &state.volumes[volume];
+    while !hold(&target.claims).open.is_empty() {
+        state.seal_fullest(target);
+        seal_inline(state, volume)?;
+    }
+    Ok(())
+}
+
+/// Run the seals marked on a volume to their end, on the opening thread
+pub fn seal_inline<Backend: Io>(state: &Arc<EngineState<Backend>>, volume: usize) -> Result<()> {
+    let mut job = SealJob::new(Arc::clone(state), volume);
+    for _step in 0..MOST_INLINE_STEPS {
+        match job.step() {
+            JobStep::Worked => {},
+            JobStep::IdleUntil { .. } => state.io.pause(),
+            JobStep::Idle | JobStep::Finished => {
+                if state.volumes[volume].has_failed() {
+                    return Err(Error::other("a seal failed during open"));
+                }
+                return Ok(());
+            },
+        }
+    }
+    Err(Error::other("a seal never finished during open"))
+}
+
+/// Copy a segment too large for this budget's index into new segments, keeping every place, then
+/// drop it: a crash part way leaves it whole, and the copies only repeat rows it still holds
+pub fn copy_segment<Backend: Io>(
+    state: &Arc<EngineState<Backend>>,
+    volume: usize,
+    segment: &ScannedOpen<Backend::File>,
+) -> Result<()> {
+    let mut bytes = vec![0; GROUP_BYTES.0 as usize];
+    let mut value = Vec::new();
+    let mut record = Vec::new();
+    let mut records = RecordReader::new();
+    let mut at = FileOffset(0);
+    let end = ByteCount(segment.scan.valid_end.0);
+
+    'groups: while at.0 < segment.scan.valid_end.0 {
+        let Some(length) = read_group(&segment.rows, at, end, &mut bytes)? else {
+            break;
+        };
+        let Some(group) = parse_group(&bytes[..length], state.record_key) else {
+            break;
+        };
+
+        if at.0 >= segment.scan.synced_through.0 {
+            for row in group.walk() {
+                if !state.is_record_whole(&segment.found.data, &row, &mut records, &mut value)? {
+                    break 'groups;
+                }
+            }
+        }
+        for row in group.walk() {
+            copy_row(state, volume, &segment.found.data, &row, &mut record)?;
+        }
+        at = FileOffset(at.0 + length as u64);
+    }
+
+    let target = &state.volumes[volume];
+    state.sync_volume(target).map_err(open_failure)?;
+    let path = &target.roots[segment.found.root.0 as usize];
+    state.io.close_file(segment.found.data.clone());
+    state.io.close_file(segment.rows.clone());
+    state.io.remove_file(&data_path(path, segment.found.number))?;
+    state.io.remove_file(&rows_path(path, segment.found.number))?;
+    state.io.sync_directory(path)
+}
+
+/// Copy one row and its record as stored, sealing when the limits say a running store would
+pub fn copy_row<Backend: Io>(
+    state: &Arc<EngineState<Backend>>,
+    volume: usize,
+    data: &Backend::File,
+    row: &RowEntry,
+    record: &mut Vec<u8>,
+) -> Result<()> {
+    let target = &state.volumes[volume];
+    record.resize(row.length.0 as usize, 0);
+    if !record.is_empty() {
+        data.read_exact_at(row.offset, record)?;
+    }
+
+    let request = ClaimRequest {
+        bytes: row.length,
+        rows: RowCount(1),
+    };
+    loop {
+        let claim = state.claim(target, &request).map_err(open_failure)?;
+        if !record.is_empty() {
+            claim.data.write_at(claim.offset, &[IoSlice::new(record)])?;
+        }
+
+        let copied = WriteRow {
+            place: row.place,
+            offset: claim.offset,
+            length: row.length,
+            kind: row.kind,
+            slot: claim.slot,
+            segment: claim.segment,
+        };
+        match state.land_row(row.column, row.key, &copied).map_err(open_failure)? {
+            LandOutcome::Landed => {
+                note_copied_place(target, copied.slot, row.place);
+                claim.finish();
+                break;
+            },
+            LandOutcome::IndexFull => {
+                drop(claim);
+                seal_every_open(state, volume)?;
+            },
+        }
+    }
+    seal_inline(state, volume)
+}
+
+/// Lower a segment's first place to a copied row's, which predates the segment
+pub fn note_copied_place<Backend: Io>(volume: &Volume<Backend>, slot: OpenSlot, place: WritePlace) {
+    for segment in &mut hold(&volume.claims).open {
+        if segment.slot == slot {
+            segment.lowest_place = segment.lowest_place.min(place);
+        }
+    }
+}
+
+/// Carry a store error out through open's own errors
+pub fn open_failure(error: StoreError) -> Error {
+    Error::other(error.to_string())
 }
 
 /// Where recovered rows go

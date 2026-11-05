@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::claim::Claim;
-use reel::engine::engine_sizing::LEAST_LZ4_BUDGET;
 use reel::engine::engine_state::EngineState;
 use reel::engine::read_path::{KeyRead, RecordWant};
 use reel::engine::reel_store::ReelStore;
@@ -46,6 +45,9 @@ const STEPS: u64 = 4_000;
 const KEY_SPACE: u64 = 40;
 const MOST_IN_FLIGHT: usize = 6;
 const MANY_ROWS: u64 = 11_000;
+const SHRINK_ROWS: u64 = 2_000;
+const SHRINK_CRASH_END: u64 = 400;
+const SHRINK_CRASH_STEP: usize = 23;
 const JOB_ROUNDS: u64 = 20;
 const MOST_OPEN: usize = 4;
 
@@ -431,21 +433,66 @@ fn create_failure() {
     store.close().expect("close");
 }
 
-// reopening with a budget too small for the open rows is an error, never a hang
+fn fill_numbers(store: &Store, rows: u64) {
+    for number in 0..rows {
+        store.put(COLUMN, &number.to_le_bytes(), &number.to_be_bytes()).expect("put");
+    }
+}
+
+fn check_numbers(store: &Store, rows: u64) {
+    for number in 0..rows {
+        assert_eq!(read(store, &number.to_le_bytes()), Some(number.to_be_bytes().to_vec()));
+    }
+}
+
+// a smaller budget opens by sealing and copying, with every row still there
 #[test]
 fn smaller_budget() {
     let io = SimulatedIo::new(Seed(9));
     let store = open(&io);
-    for number in 0..MANY_ROWS {
-        store.put(COLUMN, &number.to_le_bytes(), b"value").expect("put");
-    }
+    fill_numbers(&store, MANY_ROWS);
     store.close().expect("close");
     drop(store);
 
-    let small = ReelStore::open(io.clone(), &config(SMALL_BUDGET));
+    let store = ReelStore::open(io.clone(), &config(SMALL_BUDGET)).expect("open");
+    check_numbers(&store, MANY_ROWS);
+    store.put(COLUMN, b"after", b"value").expect("put");
+    store.close().expect("close");
+    drop(store);
 
-    assert!(small.is_err());
-    assert!(ReelStore::open(io.clone(), &config(LEAST_LZ4_BUDGET)).is_ok());
+    let store = open(&io);
+    check_numbers(&store, MANY_ROWS);
+    assert_eq!(read(&store, b"after"), Some(b"value".to_vec()));
+    store.close().expect("close");
+    assert_eq!(io.open_handle_count(), 0);
+    assert_eq!(io.handle_faults(), OperationCount(0));
+}
+
+// a crash anywhere in such an open loses nothing, and the next open finishes the job
+#[test]
+fn smaller_budget_crash() {
+    for crash_at in (0..SHRINK_CRASH_END).step_by(SHRINK_CRASH_STEP) {
+        for is_power_cut in [false, true] {
+            let io = SimulatedIo::new(Seed(crash_at));
+            let store = open(&io);
+            fill_numbers(&store, SHRINK_ROWS);
+            store.close().expect("close");
+            drop(store);
+
+            io.arm_crash(OperationCount(crash_at));
+            let interrupted = ReelStore::open(io.clone(), &config(SMALL_BUDGET));
+            if is_power_cut {
+                io.power_cut();
+            } else {
+                io.kill();
+            }
+            drop(interrupted);
+
+            let store = ReelStore::open(io.clone(), &config(SMALL_BUDGET)).expect("open");
+            check_numbers(&store, SHRINK_ROWS);
+            store.close().expect("close");
+        }
+    }
 }
 
 // a seal that fails part way starts its footer again and finishes

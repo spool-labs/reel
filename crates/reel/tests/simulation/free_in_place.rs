@@ -237,3 +237,22 @@ fn crashes() {
     }
     assert!(freed_at_crash > 0);
 }
+
+// a freed range stays inside its record on both ends, so the live records beside it read back whole
+#[test]
+fn neighbours_stay() {
+    let io = SimulatedIo::new(Seed(8));
+    let store = open(&io);
+    let beside = vec![9; 777];
+    store.put(COLUMN, b"before", &beside).expect("put");
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    store.put(COLUMN, b"after", &beside).expect("put");
+    seal(&store, &io);
+    store.put(COLUMN, b"key", &large(2)).expect("put");
+    seal(&store, &io);
+
+    assert!(store.state.volumes[0].bytes_freed.load(Ordering::Acquire) > 0);
+    assert_eq!(read(&store, b"before"), Some(beside.clone()));
+    assert_eq!(read(&store, b"after"), Some(beside));
+    store.close().expect("close");
+}

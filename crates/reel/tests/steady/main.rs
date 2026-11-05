@@ -42,6 +42,7 @@ const ROUNDS: usize = 1_500;
 const FLUSH_ROUNDS: usize = 64;
 const SEAL_ROUNDS: usize = 300;
 const MOST_WARM_ROUNDS: usize = 20 * SEAL_ROUNDS;
+const MOST_WINDOW_ROUNDS: usize = 20 * ROUNDS;
 const SEAL_WAIT: Duration = Duration::from_millis(1);
 const MOST_SEAL_WAITS: u32 = 20_000;
 const MOST_SITES: u64 = 8;
@@ -394,6 +395,12 @@ fn round(store: &Store, inputs: &mut Inputs, number: usize) {
     }
 }
 
+// an unlink and a free in place have both run since these counts
+fn has_reclaimed(store: &Store, unlinked_before: u64, freed_before: u64) -> bool {
+    let volume = &store.state.volumes[0];
+    volume.segments_unlinked.load(Ordering::Acquire) > unlinked_before && volume.bytes_freed.load(Ordering::Acquire) > freed_before
+}
+
 fn has_rows_file(root: &Path) -> bool {
     let entries = fs::read_dir(root).expect("list");
     entries.flatten().any(|entry| entry.path().extension().is_some_and(|extension| extension == "rows"))
@@ -527,8 +534,14 @@ fn main() {
     let threads_before = thread_faults();
     let before = counts(&mut faults);
     IS_WINDOW.store(true, Ordering::Release);
-    for number in 1..=ROUNDS {
-        round(&store, &mut inputs, number);
+    // whether a reclaim lands in the window is timing, so the rounds go on until one has, and the counts cover it
+    let mut rounds = 0;
+    while rounds < ROUNDS || !has_reclaimed(&store, unlinked_before, freed_before) {
+        rounds += 1;
+        if rounds > MOST_WINDOW_ROUNDS {
+            break;
+        }
+        round(&store, &mut inputs, rounds);
     }
     IS_WINDOW.store(false, Ordering::Release);
     let after = counts(&mut faults);
@@ -557,7 +570,7 @@ fn main() {
             }
         }
     }
-    println!("{ROUNDS} rounds: {allocations} allocations, {frees} frees, {minor_faults} minor faults, {major_faults} major faults");
+    println!("{rounds} rounds: {allocations} allocations, {frees} frees, {minor_faults} minor faults, {major_faults} major faults");
     println!("close: {close_allocations} allocations");
     println!("{unlinked} unlinks in the window");
     println!("{freed} bytes freed in place in the window");

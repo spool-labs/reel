@@ -1,0 +1,281 @@
+//! The simulated backend: one seed drives the disk, the clock and the job order
+
+use std::io::{Error, ErrorKind, Result};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use crate::guard::hold;
+use crate::io::Io;
+use crate::io::job::{Job, JobStep};
+use crate::io::lock_outcome::LockOutcome;
+use crate::io::simulated::simulated_disk::{InodeNumber, SimulatedDisk};
+use crate::io::simulated::simulated_file::SimulatedFile;
+use crate::io::simulated::simulated_task::{JobSlot, SimulatedTask};
+use crate::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
+
+/// The clock moves this far on every read
+pub const CLOCK_TICK: Nanoseconds = Nanoseconds(1_000);
+
+/// A deterministic backend that a test drives by hand
+#[derive(Clone)]
+pub struct SimulatedIo {
+    pub disk: Arc<Mutex<SimulatedDisk>>,
+    pub slots: Arc<Mutex<Vec<JobSlot>>>,
+    pub clock: Arc<AtomicU64>,
+}
+
+/// A held simulated lock, released when dropped
+pub struct SimulatedLock {
+    pub disk: Arc<Mutex<SimulatedDisk>>,
+    pub path: PathBuf,
+    pub process: ProcessId,
+}
+
+impl Drop for SimulatedLock {
+    fn drop(&mut self) {
+        let mut disk = hold(&self.disk);
+        if disk.locks.get(&self.path) == Some(&self.process) {
+            disk.locks.remove(&self.path);
+        }
+    }
+}
+
+impl SimulatedIo {
+    /// Start an empty simulation from a seed
+    pub fn new(seed: u64) -> Self {
+        Self {
+            disk: Arc::new(Mutex::new(SimulatedDisk::new(seed))),
+            slots: Arc::new(Mutex::new(Vec::new())),
+            clock: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Declare a disk under a path, with a size in bytes
+    pub fn add_disk(&self, root: &Path, capacity: ByteCount) {
+        hold(&self.disk).capacities.insert(root.to_path_buf(), capacity);
+    }
+
+    /// Kill the process: running jobs end, and the kernel keeps every write
+    pub fn kill(&self) {
+        hold(&self.slots).clear();
+        hold(&self.disk).kill();
+    }
+
+    /// Cut the power: running jobs end, and unsynced changes each live or die
+    pub fn power_cut(&self) {
+        hold(&self.slots).clear();
+        hold(&self.disk).power_cut();
+    }
+
+    /// Crash the process when this many more operations have run
+    pub fn arm_crash(&self, operations: u64) {
+        hold(&self.disk).operations_until_crash = Some(operations);
+    }
+
+    /// Check whether an armed crash has fired
+    pub fn is_crashed(&self) -> bool {
+        hold(&self.disk).is_crashed
+    }
+
+    /// Make the next syncs fail
+    pub fn fail_syncs(&self, count: u64) {
+        hold(&self.disk).failing_syncs = count;
+    }
+
+    /// Flip bits of one byte of a file in place
+    pub fn rot(&self, path: &Path, offset: FileOffset, mask: u8) -> Result<()> {
+        let mut disk = hold(&self.disk);
+        let inode = disk.inode_of(path)?;
+        if let Some(image) = disk.inodes.get_mut(&inode) {
+            image.rot(offset, mask);
+        }
+        Ok(())
+    }
+
+    /// Move the clock forward
+    pub fn advance_clock(&self, elapsed: Nanoseconds) {
+        self.clock.fetch_add(elapsed.0, Ordering::Relaxed);
+    }
+
+    /// Draw a number below the bound from the simulation's seed
+    pub fn draw(&self, bound: u64) -> u64 {
+        hold(&self.disk).random.below(bound)
+    }
+
+    /// Count the jobs that can still run
+    pub fn live_jobs(&self) -> u64 {
+        let mut live = 0;
+        for slot in hold(&self.slots).iter() {
+            if !slot.is_finished {
+                live += 1;
+            }
+        }
+        live
+    }
+
+    /// Run one step of the job at an index, if it can still run
+    pub fn step_job(&self, index: usize) -> Option<JobStep> {
+        let mut work = {
+            let mut slots = hold(&self.slots);
+            let slot = slots.get_mut(index)?;
+            slot.is_woken = false;
+            slot.work.take()?
+        };
+
+        // the job calls back into this backend, so nothing is locked while it runs
+        let step = work.step();
+
+        let mut slots = hold(&self.slots);
+        if let Some(slot) = slots.get_mut(index) {
+            if step == JobStep::Finished {
+                slot.is_finished = true;
+            } else if !slot.is_finished {
+                slot.work = Some(work);
+            }
+        }
+        Some(step)
+    }
+
+    /// Run one step of a job the seed picks, and say whether any could run
+    pub fn step_any(&self) -> Option<JobStep> {
+        let mut live: Vec<usize> = Vec::new();
+        for (index, slot) in hold(&self.slots).iter().enumerate() {
+            if slot.work.is_some() {
+                live.push(index);
+            }
+        }
+
+        let pick = self.draw(live.len() as u64) as usize;
+        let index = live.get(pick)?;
+        self.step_job(*index)
+    }
+
+    /// Wrap an inode in a handle for the running process
+    pub fn handle(&self, disk: &mut SimulatedDisk, inode: InodeNumber, is_writable: bool) -> SimulatedFile {
+        if let Some(image) = disk.inodes.get_mut(&inode) {
+            image.handle_count += 1;
+        }
+        SimulatedFile {
+            disk: Arc::clone(&self.disk),
+            inode,
+            process: disk.process,
+            is_writable,
+        }
+    }
+}
+
+impl Io for SimulatedIo {
+    type File = SimulatedFile;
+    type Lock = SimulatedLock;
+    type Task = SimulatedTask;
+
+    fn create_file(&self, path: &Path, reserved: ByteCount) -> Result<SimulatedFile> {
+        let mut disk = hold(&self.disk);
+        disk.enter()?;
+        let inode = disk.create(path, reserved)?;
+        Ok(self.handle(&mut disk, inode, true))
+    }
+
+    fn open_file(&self, path: &Path) -> Result<SimulatedFile> {
+        let mut disk = hold(&self.disk);
+        disk.enter()?;
+        let inode = disk.inode_of(path)?;
+        Ok(self.handle(&mut disk, inode, true))
+    }
+
+    fn open_read_only(&self, path: &Path) -> Result<SimulatedFile> {
+        let mut disk = hold(&self.disk);
+        disk.enter()?;
+        let inode = disk.inode_of(path)?;
+        Ok(self.handle(&mut disk, inode, false))
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        let mut disk = hold(&self.disk);
+        disk.enter()?;
+        disk.unlink(path)
+    }
+
+    fn rename_file(&self, from: &Path, to: &Path) -> Result<()> {
+        let mut disk = hold(&self.disk);
+        disk.enter()?;
+        disk.rename(from, to)
+    }
+
+    fn create_directory(&self, path: &Path) -> Result<()> {
+        let mut disk = hold(&self.disk);
+        disk.enter()?;
+        for ancestor in path.ancestors() {
+            if !disk.directories.iter().any(|directory| directory == ancestor) {
+                disk.directories.push(ancestor.to_path_buf());
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_directory(&self, path: &Path) -> Result<()> {
+        let mut disk = hold(&self.disk);
+        disk.enter()?;
+        disk.sync_directory(path);
+        Ok(())
+    }
+
+    fn list_directory(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        let mut disk = hold(&self.disk);
+        disk.enter()?;
+        if !disk.directories.iter().any(|directory| directory == path) {
+            return Err(Error::from(ErrorKind::NotFound));
+        }
+
+        let mut paths = Vec::new();
+        for name in disk.names.keys() {
+            if name.parent() == Some(path) {
+                paths.push(name.clone());
+            }
+        }
+        Ok(paths)
+    }
+
+    fn free_space(&self, path: &Path) -> Result<ByteCount> {
+        let mut disk = hold(&self.disk);
+        disk.enter()?;
+        Ok(disk.free_space(path))
+    }
+
+    fn lock(&self, path: &Path) -> Result<LockOutcome<SimulatedLock>> {
+        let mut disk = hold(&self.disk);
+        disk.enter()?;
+        if let Some(holder) = disk.locks.get(path) {
+            return Ok(LockOutcome::Refused { holder: *holder });
+        }
+
+        let process = disk.process;
+        disk.locks.insert(path.to_path_buf(), process);
+        Ok(LockOutcome::Held(SimulatedLock {
+            disk: Arc::clone(&self.disk),
+            path: path.to_path_buf(),
+            process,
+        }))
+    }
+
+    fn now(&self) -> Nanoseconds {
+        let reading = self.clock.fetch_add(CLOCK_TICK.0, Ordering::Relaxed);
+        Nanoseconds(reading)
+    }
+
+    fn spawn_job<Work: Job>(&self, name: &'static str, job: Work) -> Result<SimulatedTask> {
+        let mut slots = hold(&self.slots);
+        let index = slots.len();
+        slots.push(JobSlot {
+            name,
+            work: Some(Box::new(job)),
+            is_woken: false,
+            is_finished: false,
+        });
+        Ok(SimulatedTask {
+            slots: Arc::clone(&self.slots),
+            index,
+        })
+    }
+}

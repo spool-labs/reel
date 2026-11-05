@@ -217,3 +217,19 @@ fn pin_lost() {
     state.cues.release(slot);
     store.close().expect("close");
 }
+
+// a reclaim between a get_many's count and its pin costs the pin, and the slot goes back
+#[test]
+fn many_pin_lost() {
+    let io = SimulatedIo::new(Seed(9));
+    let store = open(&io);
+    let state = &store.state;
+    let reclaims = state.cues.reclaims();
+    let point = state.read_point();
+
+    state.cues.note_reclaim();
+
+    assert_eq!(state.pin_many(point, reclaims, 0), None);
+    assert!(state.cues.is_empty());
+    store.close().expect("close");
+}

@@ -172,6 +172,11 @@ impl<Backend: Io> EngineState<Backend> {
         let reclaims = self.cues.reclaims();
         let handovers = volume.handover_count();
         let point = self.read_point();
+        self.pin_many(point, reclaims, handovers)
+    }
+
+    /// Pin a point read after these counts, unless a reclaim moved the count first
+    pub fn pin_many(&self, point: WritePlace, reclaims: u64, handovers: u64) -> Option<ManyRead> {
         let pin = self.cues.take(point);
         if pin.is_some_and(|slot| !self.pin_holds(slot, reclaims)) {
             return None;

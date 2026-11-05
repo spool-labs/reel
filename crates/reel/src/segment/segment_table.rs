@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use reel_api::column_id::ColumnId;
-use reel_api::units::ByteCount;
+use reel_api::units::{ByteCount, WritePlace};
 
 use crate::pool::touched_capacity;
 use crate::segment::block_entry::{BlockEntry, KeyPrefix};
@@ -38,6 +38,7 @@ pub struct TableEntry<File> {
     pub columns: Extent,
     pub blocks: Extent,
     pub is_walked: bool,
+    pub highest_replacement: WritePlace,
 }
 
 /// A segment held open for a read, let go when dropped
@@ -270,6 +271,7 @@ impl<File: Clone> SegmentTable<File> {
             columns: column_extent,
             blocks: block_extent,
             is_walked: false,
+            highest_replacement: WritePlace(0),
         });
         guard.map.insert(head.segment, slot);
         true
@@ -305,15 +307,17 @@ impl<File: Clone> SegmentTable<File> {
         })
     }
 
-    /// Take a block's dead rows off its live count
-    pub fn drop_live(&self, number: SegmentNumber, block: u32, rows: u32) {
+    /// Take a block's dead rows off its live count, and keep the highest place that replaced any of the segment's rows
+    pub fn drop_live(&self, number: SegmentNumber, block: u32, rows: u32, replacement: WritePlace) {
         let mut guard = self.write_shard(shard_of(number));
         let Some(slot) = guard.map.get(number) else {
             return;
         };
-        let Some(start) = guard.segments[slot as usize].as_ref().map(|entry| entry.blocks.start) else {
+        let Some(entry) = guard.segments[slot as usize].as_mut() else {
             return;
         };
+        entry.highest_replacement = entry.highest_replacement.max(replacement);
+        let start = entry.blocks.start;
         if let Some(line) = guard.blocks.get_mut(start as usize + block as usize) {
             line.live_rows = line.live_rows.saturating_sub(rows);
         }
@@ -328,6 +332,17 @@ impl<File: Clone> SegmentTable<File> {
         let lines = guard.blocks.get(first..first + entry.blocks.length as usize)?;
         let index = lines.partition_point(|line| line.block_offset < offset);
         lines.get(index).filter(|line| line.block_offset == offset).map(|_line| index as u32)
+    }
+
+    /// Read the highest place that replaced a segment's rows, or nothing while a block still has a live row. The place lives
+    /// here alone, and it starts at zero after an open, where no cue can read below what was already written
+    pub fn dead_replacement(&self, number: SegmentNumber) -> Option<WritePlace> {
+        let guard = self.read_shard(shard_of(number));
+        let slot = guard.map.get(number)?;
+        let entry = guard.segments[slot as usize].as_ref()?;
+        let first = entry.blocks.start as usize;
+        let lines = guard.blocks.get(first..first + entry.blocks.length as usize)?;
+        lines.iter().all(|line| line.live_rows == 0).then_some(entry.highest_replacement)
     }
 
     /// Add up a segment's live rows, block by block

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
-use reel::engine::compact_job::{CompactJob, DeadTarget, is_wholly_dead};
+use reel::engine::compact_job::{CompactJob, is_wholly_dead};
 use reel::engine::cue::MOST_CUES;
 use reel::engine::engine_sizing::COMPACT_JOB_BYTES;
 use reel::engine::open_segment::data_path;
@@ -349,7 +349,9 @@ fn unlink_looks_again() {
     store.close().expect("close");
 }
 
-// counts that say dead move nothing while the footer shows a live row
+// counts that call a live row dead break the summary's one promise, and a debug build's row check says so
+#[cfg(debug_assertions)]
+#[should_panic(expected = "the counts call a live row dead")]
 #[test]
 fn counts_alone() {
     let io = SimulatedIo::new(Seed(17));
@@ -368,12 +370,14 @@ fn counts_alone() {
         graves: 0,
         bytes: ByteCount(0),
         kept_bytes: ByteCount(0),
+        replacement: WritePlace(0),
     };
     let mut rows = hold(&volume.summary);
     let blocks = rows.get(newer).expect("a row").facts.block_count;
     rows.apply_walk(newer, blocks, &[extra]);
     assert!(is_wholly_dead(&rows.get(older).expect("a row")));
     drop(rows);
+    volume.table.drop_live(older, 0, 1, WritePlace(0));
 
     state.ask_compaction();
     settle(&io);
@@ -383,7 +387,9 @@ fn counts_alone() {
     store.close().expect("close");
 }
 
-// a segment holding a key's newest row stays whatever the counts say, though an older version sits in a finished segment
+// the row check goes by place: an older version in a finished segment replaces nothing
+#[cfg(debug_assertions)]
+#[should_panic(expected = "the counts call a live row dead")]
 #[test]
 fn newest_stays() {
     let io = SimulatedIo::new(Seed(24));
@@ -402,42 +408,19 @@ fn newest_stays() {
         graves: 0,
         bytes: ByteCount(0),
         kept_bytes: ByteCount(0),
+        replacement: WritePlace(0),
     };
     let mut rows = hold(&volume.summary);
     let blocks = rows.get(older).expect("a row").facts.block_count;
     rows.apply_walk(older, blocks, &[extra]);
     assert!(is_wholly_dead(&rows.get(newest).expect("a row")));
     drop(rows);
+    volume.table.drop_live(newest, 0, 1, WritePlace(0));
 
     state.ask_compaction();
     settle(&io);
     assert!(volume.table.holds(newest));
     assert_eq!(read(&store), Some(b"newest".to_vec()));
-    store.close().expect("close");
-}
-
-// a range delete row answers for more than its key, so a confirm refuses it whatever replaced that key
-#[test]
-fn cover_row_stays() {
-    let io = SimulatedIo::new(Seed(18));
-    let store = open(&io);
-    hold_compaction(&store);
-    let state = &store.state;
-    let volume = &state.volumes[0];
-    store.delete_range(COLUMN, b"key", b"kez").expect("delete");
-    let older = hold(&volume.claims).open[0].number;
-    store.seal_now();
-    settle(&io);
-    sealed_put(&store, &io, b"newer");
-
-    let target = DeadTarget {
-        segment: older,
-        next_block: 0,
-        block_count: 1,
-        highest_replacement: WritePlace(0),
-    };
-    job(&store).confirm_block(volume, target).expect("confirm");
-    assert!(volume.table.holds(older));
     store.close().expect("close");
 }
 
@@ -753,5 +736,82 @@ fn failed_save_keeps_file() {
     assert_eq!(read(&store), Some(b"newer".to_vec()));
     assert!(hold(&store.state.volumes[0].damaged).is_empty());
     assert_eq!(store.state.dropped_summary_rows.load(Ordering::Acquire), 0);
+    store.close().expect("close");
+}
+
+// a rebuilt segment's backward walk keeps the place of what replaced its rows
+#[test]
+fn rebuilt_keeps_place() {
+    let io = SimulatedIo::new(Seed(35));
+    let store = open(&io);
+    hold_compaction(&store);
+    let older = sealed_put(&store, &io, b"older");
+    sealed_put(&store, &io, b"newer");
+    let replacement = store.state.read_point();
+    let volume = &store.state.volumes[0];
+    hold(&volume.summary).remove(older);
+    store.state.save_summary(volume).expect("save");
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+    hold_compaction(&store);
+    settle(&io);
+    assert_eq!(store.state.volumes[0].table.dead_replacement(older), Some(replacement));
+    store.close().expect("close");
+}
+
+// the walk keeps the place that replaced a segment's rows, for a whole unlink to check cues against with no lookups
+#[test]
+fn walk_keeps_place() {
+    let io = SimulatedIo::new(Seed(26));
+    let store = open(&io);
+    hold_compaction(&store);
+    store.put(COLUMN, b"key", b"oldest").expect("put");
+    let older = sealed_put(&store, &io, b"older");
+    sealed_put(&store, &io, b"newer");
+    let replacement = store.state.read_point();
+
+    let table = &store.state.volumes[0].table;
+    assert_eq!(table.dead_replacement(older), Some(replacement));
+    store.close().expect("close");
+}
+
+// a segment with a live row has no place to give
+#[test]
+fn live_has_no_place() {
+    let io = SimulatedIo::new(Seed(27));
+    let store = open(&io);
+    hold_compaction(&store);
+    store.put(COLUMN, b"other", b"value").expect("put");
+    let older = sealed_put(&store, &io, b"older");
+    sealed_put(&store, &io, b"newer");
+
+    assert_eq!(store.state.volumes[0].table.dead_replacement(older), None);
+    store.close().expect("close");
+}
+
+// the place starts at zero after an open, and that holds nothing back: a cue taken now reads above all that was written
+#[test]
+fn place_after_open() {
+    let io = SimulatedIo::new(Seed(28));
+    let store = open(&io);
+    hold_compaction(&store);
+    let older = sealed_put(&store, &io, b"older");
+    sealed_put(&store, &io, b"newer");
+    store.close().expect("close");
+    drop(store);
+
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    assert_eq!(volume.table.dead_replacement(older), Some(WritePlace(0)));
+    let cue = store.cue().expect("cue");
+    settle(&io);
+    assert!(!volume.table.holds(older));
+
+    let mut buf = Vec::new();
+    assert!(cue.get(COLUMN, b"key", &mut buf).expect("get"));
+    assert_eq!(buf, b"newer");
+    drop(cue);
     store.close().expect("close");
 }

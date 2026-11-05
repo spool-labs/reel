@@ -230,6 +230,7 @@ fn walk_counts() {
         graves: 1,
         bytes: ByteCount(30),
         kept_bytes: ByteCount(0),
+        replacement: WritePlace(0),
     };
 
     rows.apply_walk(SegmentNumber(3), 5, &[count]);
@@ -265,6 +266,7 @@ fn row_lookup() {
         graves: 0,
         bytes: ByteCount(5),
         kept_bytes: ByteCount(0),
+        replacement: WritePlace(0),
     };
 
     rows.apply_walk(SegmentNumber(3), 4, &[count]);

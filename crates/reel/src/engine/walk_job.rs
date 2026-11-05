@@ -145,7 +145,7 @@ impl<Backend: Io> WalkJob<Backend> {
         }
         drop(rows);
         for count in self.counts.iter().filter(|count| count.rows > 0) {
-            volume.table.drop_live(count.segment, count.block, count.rows);
+            volume.table.drop_live(count.segment, count.block, count.rows, count.replacement);
         }
         if next_block < target.block_count {
             self.target = Some(WalkTarget { next_block, ..target });
@@ -232,7 +232,7 @@ impl<Backend: Io> WalkJob<Backend> {
                 continue;
             }
             if target.is_backward {
-                add_count(&mut self.counts, target.segment, block.column, target.next_block, &row, false);
+                add_count(&mut self.counts, target.segment, block.column, target.next_block, &row, None);
             }
             let is_top = self.last_column != Some(block.column) || self.last_key != self.key;
             // a key that may have begun in a block no read can give has a top no walk can name
@@ -244,7 +244,9 @@ impl<Backend: Io> WalkJob<Backend> {
                 continue;
             }
             if !is_top {
-                add_count(&mut self.counts, target.segment, block.column, target.next_block, &row, true);
+                // the key's top is in this segment, and its highest place is at or above that
+                let replacement = Some(pin.head.places.highest);
+                add_count(&mut self.counts, target.segment, block.column, target.next_block, &row, replacement);
                 continue;
             }
 
@@ -261,11 +263,12 @@ impl<Backend: Io> WalkJob<Backend> {
             };
             match newest {
                 Some(found) if found.row.place > row.place => {
-                    add_count(&mut self.counts, target.segment, block.column, target.next_block, &row, true);
+                    let replacement = Some(found.row.place);
+                    add_count(&mut self.counts, target.segment, block.column, target.next_block, &row, replacement);
                 },
                 Some(found) if !target.is_backward => {
                     if let Some(index) = volume.table.block_at(found.segment, found.block_offset) {
-                        add_count(&mut self.counts, found.segment, block.column, index, &found.row, true);
+                        add_count(&mut self.counts, found.segment, block.column, index, &found.row, Some(row.place));
                     }
                 },
                 Some(_) | None => {},
@@ -302,15 +305,15 @@ impl<Backend: Io> WalkJob<Backend> {
     }
 }
 
-/// Add one row to a block's counts. A dead row moves its bytes from live to dead, and a backward walk first adds
-/// every row's bytes as live, since it rebuilds them
+/// Add one row to a block's counts. A row with a replacement is dead, and its bytes move from live to dead. A backward walk
+/// first adds every row's bytes as live, since it rebuilds them
 pub fn add_count(
     counts: &mut Vec<DeadCount>,
     segment: SegmentNumber,
     column: ColumnId,
     block: u32,
     row: &FooterRow,
-    is_dead: bool,
+    replacement: Option<WritePlace>,
 ) {
     // keys run in order, so a repeat is near the end, and a miss only costs another entry
     let recent = counts.len().saturating_sub(COUNT_SEARCH);
@@ -328,10 +331,11 @@ pub fn add_count(
         },
     };
     let count = &mut counts[index];
-    if !is_dead {
+    let Some(replacement) = replacement else {
         count.kept_bytes = ByteCount(count.kept_bytes.0 + row.length.0);
         return;
-    }
+    };
+    count.replacement = count.replacement.max(replacement);
     count.rows += 1;
     count.graves += u32::from(row.kind == RowKind::Grave);
     count.bytes = ByteCount(count.bytes.0 + row.length.0);

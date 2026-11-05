@@ -41,6 +41,7 @@ const CHUNKED_BYTES: usize = 200_000;
 const ROUNDS: usize = 1_500;
 const FLUSH_ROUNDS: usize = 64;
 const SEAL_ROUNDS: usize = 300;
+const MOST_WARM_ROUNDS: usize = 20 * SEAL_ROUNDS;
 const SEAL_WAIT: Duration = Duration::from_millis(1);
 const MOST_SEAL_WAITS: u32 = 20_000;
 const MOST_SITES: u64 = 8;
@@ -205,6 +206,7 @@ struct Inputs {
     chunked: Vec<u8>,
     compressible: Vec<u8>,
     batch: WriteBatch,
+    plain_batch: WriteBatch,
     large_batch: WriteBatch,
     long_batch: WriteBatch,
     buf: Vec<u8>,
@@ -289,8 +291,13 @@ fn long_batch() -> WriteBatch {
     batch
 }
 
-// two batches: small rows on the shared encoders, and a compressed large value on the large one
-fn batches(keys: &[Vec<u8>], small: &[u8], compressible: &[u8]) -> (WriteBatch, WriteBatch) {
+// three batches: small rows on the shared encoders, the same with no range delete, and a compressed large value on the
+// large one
+fn batches(keys: &[Vec<u8>], small: &[u8], compressible: &[u8]) -> (WriteBatch, WriteBatch, WriteBatch) {
+    let mut plain_batch = WriteBatch::new();
+    plain_batch.put(META, &keys[0], small);
+    plain_batch.put(META, &keys[1], small);
+    plain_batch.delete(BULK, &keys[1]);
     let mut batch = WriteBatch::new();
     batch.put(META, &keys[0], small);
     batch.put(META, &keys[1], small);
@@ -299,7 +306,7 @@ fn batches(keys: &[Vec<u8>], small: &[u8], compressible: &[u8]) -> (WriteBatch, 
     let mut large_batch = WriteBatch::new();
     large_batch.put(BULK, &keys[2], compressible);
     large_batch.put(META, &keys[2], small);
-    (batch, large_batch)
+    (batch, plain_batch, large_batch)
 }
 
 fn inputs() -> Inputs {
@@ -310,7 +317,7 @@ fn inputs() -> Inputs {
     let keys: Vec<Vec<u8>> = (0..KEYS).map(|number| format!("key-{number:06}").into_bytes()).collect();
     let small = vec![7; SMALL_BYTES];
     let compressible = vec![b'x'; CHUNKED_BYTES];
-    let (batch, large_batch) = batches(&keys, &small, &compressible);
+    let (batch, plain_batch, large_batch) = batches(&keys, &small, &compressible);
     let long_batch = long_batch();
     Inputs {
         keys,
@@ -321,6 +328,7 @@ fn inputs() -> Inputs {
         chunked,
         compressible,
         batch,
+        plain_batch,
         large_batch,
         long_batch,
         buf: vec![1; CHUNKED_BYTES * 2],
@@ -360,8 +368,13 @@ fn round(store: &Store, inputs: &mut Inputs, number: usize) {
     cue.get_many(META, &keys, &mut inputs.values).expect("get_many at a cue");
     drop(cue);
     store.delete(BULK, other).expect("delete");
-    store.delete_range(META, b"range-a", b"range-b").expect("delete range");
-    store.write_batch(&inputs.batch).expect("batch");
+    // a segment with covers sits out compaction, so every other one has none
+    let has_covers = number.div_ceil(SEAL_ROUNDS).is_multiple_of(2);
+    if has_covers {
+        store.delete_range(META, b"range-a", b"range-b").expect("delete range");
+    }
+    let batch = if has_covers { &inputs.batch } else { &inputs.plain_batch };
+    store.write_batch(batch).expect("batch");
     store.write_batch(&inputs.large_batch).expect("large batch");
     if number.is_multiple_of(FLUSH_ROUNDS) {
         store.write_batch(&inputs.long_batch).expect("long batch");
@@ -495,8 +508,11 @@ fn main() {
     assert_eq!(store.damaged_segments(), 1);
 
     // the first run of a path faults in the binary's own pages, so every path runs before the window
-    for number in 0..SEAL_ROUNDS + 1 {
+    let mut number = 0;
+    while number <= 2 * SEAL_ROUNDS || store.state.volumes[0].segments_unlinked.load(Ordering::Acquire) == 0 {
+        assert!(number < MOST_WARM_ROUNDS, "no unlink ran before the window");
         round(&store, &mut inputs, number);
+        number += 1;
     }
 
     // the walk runs behind the seals, and its first run is a path like any other
@@ -504,6 +520,7 @@ fn main() {
         thread::sleep(SEAL_WAIT);
     }
 
+    let unlinked_before = store.state.volumes[0].segments_unlinked.load(Ordering::Acquire);
     let mut faults = FaultCounter::new();
     let _first_read = faults.read();
     let threads_before = thread_faults();
@@ -514,6 +531,7 @@ fn main() {
     }
     IS_WINDOW.store(false, Ordering::Release);
     let after = counts(&mut faults);
+    let unlinked = store.state.volumes[0].segments_unlinked.load(Ordering::Acquire) - unlinked_before;
     let threads_after = thread_faults();
 
     let allocations_before_close = ALLOCATIONS.load(Ordering::Acquire);
@@ -539,6 +557,10 @@ fn main() {
     }
     println!("{ROUNDS} rounds: {allocations} allocations, {frees} frees, {minor_faults} minor faults, {major_faults} major faults");
     println!("close: {close_allocations} allocations");
+    println!("{unlinked} unlinks in the window");
+    if unlinked == 0 {
+        failures += 1;
+    }
     if failures + allocations + frees + minor_faults + major_faults + close_allocations > 0 {
         process::exit(1);
     }

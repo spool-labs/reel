@@ -121,6 +121,7 @@ pub struct DeadCount {
     pub graves: u32,
     pub bytes: ByteCount,
     pub kept_bytes: ByteCount,
+    pub replacement: WritePlace,
 }
 
 /// One damaged span of a column, to its end key or the column's end

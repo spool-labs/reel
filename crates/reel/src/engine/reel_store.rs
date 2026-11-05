@@ -412,7 +412,7 @@ pub fn bring_up<Backend: Io>(
                 waiting += 1;
             }
             for (block, dead) in row.dead_blocks() {
-                volume.table.drop_live(row.facts.segment, block, dead);
+                volume.table.drop_live(row.facts.segment, block, dead, WritePlace(0));
             }
         }
         volume.walks_waiting.store(waiting, Ordering::Release);

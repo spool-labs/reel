@@ -1,8 +1,8 @@
 //! Compaction, a planner unit: first the cheapest reclaim there is, unlinking a segment with nothing live in it
 //!
-//! Counts only say where to look. A segment goes when its own footer shows that every row has a newer version in a
-//! finished segment that every live cue can see. Damage and covers keep a segment, since their rows answer for more than
-//! themselves.
+//! A segment goes when its row block index shows no live row, and no live cue reads below the highest place that replaced
+//! its rows. The summary never overstates dead, so that takes no lookups. Damage and covers keep a segment, since their
+//! rows answer for more than themselves.
 
 use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
@@ -23,27 +23,16 @@ use crate::pool::{touched_capacity, touched_zeroes};
 use crate::row_kind::RowKind;
 use crate::segment::range_covers::Cover;
 use crate::segment::row_block::{ROW_BLOCK_BYTES, RowBlockWalk};
-use crate::segment::segment_table::{SegmentPin, WalkBlock};
 use crate::segment::segment_tail::SegmentNumber;
 use crate::segment::summary::SummaryRow;
 
 /// How long compaction waits before it looks at a parked segment's pins again
 pub const PARKED_RETRY: Nanoseconds = Nanoseconds(1_000_000);
 
-/// A segment being checked for anything live
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DeadTarget {
-    pub segment: SegmentNumber,
-    pub next_block: u32,
-    pub block_count: u32,
-    pub highest_replacement: WritePlace,
-}
-
 /// The compaction of one volume
 pub struct CompactJob<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
     pub volume: usize,
-    pub target: Option<DeadTarget>,
     pub retry_at: Option<Nanoseconds>,
     last_tried: SegmentNumber,
     block: Vec<u8>,
@@ -59,7 +48,6 @@ impl<Backend: Io> CompactJob<Backend> {
         Self {
             state,
             volume,
-            target: None,
             retry_at: None,
             last_tried: SegmentNumber(0),
             block: touched_zeroes(ROW_BLOCK_BYTES),
@@ -73,7 +61,7 @@ impl<Backend: Io> CompactJob<Backend> {
         ByteCount((self.block.capacity() + self.key.capacity() + self.end.capacity()) as u64)
     }
 
-    /// Step once: a row block of a candidate's footer, or nothing when no segment looks dead
+    /// Step once: try the next segment the counts call dead, or nothing when none is
     pub fn step_unit(&mut self, now: Nanoseconds) -> UnitStep {
         match self.step_work(now) {
             UnitStep::Idle if self.has_parked() => UnitStep::RetryAt(Nanoseconds(now.0 + PARKED_RETRY.0)),
@@ -111,13 +99,13 @@ impl<Backend: Io> CompactJob<Backend> {
             self.sweep_covers(volume);
             return UnitStep::Worked;
         }
-        if self.target.is_none() && !self.pick_dead(volume) {
+        if !volume.wants_compaction.swap(false, Ordering::AcqRel) {
             return UnitStep::Idle;
         }
-        let Some(target) = self.target else {
+        let Some(segment) = self.pick_dead(volume) else {
             return UnitStep::Idle;
         };
-        match self.confirm_block(volume, target) {
+        match self.confirm(volume, segment) {
             Ok(()) => UnitStep::Worked,
             Err(_) => {
                 let at = Nanoseconds(now.0 + WALK_RETRY.0);
@@ -159,92 +147,66 @@ impl<Backend: Io> CompactJob<Backend> {
     }
 
     /// Pick the next segment past the last one tried whose counts say nothing in it is live
-    pub fn pick_dead(&mut self, volume: &Volume<Backend>) -> bool {
-        if !volume.wants_compaction.swap(false, Ordering::AcqRel) {
-            return false;
-        }
+    pub fn pick_dead(&self, volume: &Volume<Backend>) -> Option<SegmentNumber> {
         let rows = hold(&volume.summary);
         let dead = rows.rows().filter(is_wholly_dead);
         let after = dead.clone().filter(|row| row.facts.segment > self.last_tried).min_by_key(|row| row.facts.segment);
         let picked = after.or_else(|| dead.min_by_key(|row| row.facts.segment));
-        self.target = picked.map(|row| DeadTarget {
-            segment: row.facts.segment,
-            next_block: 0,
-            block_count: row.facts.block_count,
-            highest_replacement: WritePlace(0),
-        });
-        self.target.is_some()
+        picked.map(|row| row.facts.segment)
     }
 
-    /// Check one row block, and unlink the segment once every block has passed
-    pub fn confirm_block(&mut self, volume: &Volume<Backend>, target: DeadTarget) -> Result<()> {
-        let replaced = match (volume.table.pin(target.segment), volume.table.walk_block(target.segment, target.next_block)) {
-            (Some(pin), Some(block)) => self.block_replacement(volume, &pin, &block, target)?,
-            _no_block => None,
-        };
-        let Some(highest) = replaced else {
-            // the counts understate, so the next finished walk looks again
-            self.last_tried = target.segment;
-            self.target = None;
+    /// Confirm a candidate from its block counts and unlink it. A cue that stands in the way brings the planner back as it
+    /// goes, and counts that haven't landed bring it back with the walk that lands them
+    pub fn confirm(&mut self, volume: &Volume<Backend>, segment: SegmentNumber) -> Result<()> {
+        self.last_tried = segment;
+        let Some(highest_replacement) = volume.table.dead_replacement(segment) else {
             return Ok(());
         };
-        let target = DeadTarget {
-            next_block: target.next_block + 1,
-            highest_replacement: target.highest_replacement.max(highest),
-            ..target
-        };
-        if target.next_block < target.block_count {
-            self.target = Some(target);
+        if self.state.cues.holds_back(highest_replacement) {
             return Ok(());
         }
-
-        self.last_tried = target.segment;
-        self.target = None;
+        if cfg!(debug_assertions) {
+            self.check_rows(volume, segment)?;
+        }
         volume.wants_compaction.store(true, Ordering::Release);
-        self.unlink(volume, target.segment, target.highest_replacement)
+        self.unlink(volume, segment, highest_replacement)
     }
 
-    /// Find the highest place that replaces a block's rows, or nothing when a row lacks a replacement every cue can see
-    pub fn block_replacement(
-        &mut self,
-        volume: &Volume<Backend>,
-        pin: &SegmentPin<'_, Backend::File>,
-        block: &WalkBlock,
-        target: DeadTarget,
-    ) -> Result<Option<WritePlace>> {
-        let mut highest = WritePlace(0);
-        let length = block.entry.block_length().0 as usize;
-        if length > self.block.len() {
-            return Ok(None);
-        }
-        match pin.file.read_exact_at(block.entry.block_at(), &mut self.block[..length]) {
-            Ok(()) => {},
-            // a block no read can give back answers for nothing, and the segment stays for damage to deal with
-            Err(error) if is_device_error(&error) => return Ok(None),
-            Err(error) => return Err(error),
-        }
-        let Some(mut walk) = RowBlockWalk::open(&self.block[..length], pin.head.place_base) else {
-            return Ok(None);
+    /// Check every row of a segment the counts call dead has a newer version in a finished segment. Only a debug build
+    /// comes here, so the seed sweep proves each unlink row by row
+    pub fn check_rows(&mut self, volume: &Volume<Backend>, segment: SegmentNumber) -> Result<()> {
+        let Some(pin) = volume.table.pin(segment) else {
+            return Ok(());
         };
-
-        while let Some(row) = walk.next_row(&mut self.key) {
-            if row.kind == RowKind::RangeDelete {
-                return Ok(None);
+        let mut index = 0;
+        while let Some(block) = volume.table.walk_block(segment, index) {
+            index += 1;
+            let length = block.entry.block_length().0 as usize;
+            if length > self.block.len() {
+                return Ok(());
             }
-            let newest = match self.state.newest_walked(volume, block.column, &self.key, target.segment) {
-                Ok(newest) => newest,
-                Err(StoreError::Corruption { .. }) => return Ok(None),
-                Err(_error) => return Err(Error::from(ErrorKind::Interrupted)),
+            match pin.file.read_exact_at(block.entry.block_at(), &mut self.block[..length]) {
+                Ok(()) => {},
+                // a block no read can give back has nothing to check against
+                Err(error) if is_device_error(&error) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+            let Some(mut walk) = RowBlockWalk::open(&self.block[..length], pin.head.place_base) else {
+                return Ok(());
             };
-            let is_replaced = newest.is_some_and(|found| found.row.place > row.place);
-            // a cue below the newer version still reads this one, whatever the counts say
-            let is_seen = newest.is_some_and(|found| self.state.cues.holds_back(found.row.place));
-            let Some(found) = newest.filter(|_found| is_replaced && !is_seen) else {
-                return Ok(None);
-            };
-            highest = highest.max(found.row.place);
+            while let Some(row) = walk.next_row(&mut self.key) {
+                match self.state.newest_walked(volume, block.column, &self.key, segment) {
+                    Ok(newest) => {
+                        let is_replaced = newest.is_some_and(|found| found.row.place > row.place);
+                        debug_assert!(is_replaced, "the counts call a live row dead");
+                        debug_assert!(row.kind != RowKind::RangeDelete, "the counts call a range delete dead");
+                    },
+                    Err(StoreError::Corruption { .. }) => return Ok(()),
+                    Err(_error) => return Err(Error::from(ErrorKind::Interrupted)),
+                }
+            }
         }
-        Ok(Some(highest))
+        Ok(())
     }
 
     /// Take the segment out of every list and save that, once its replacements are published and no cue reads below them,

@@ -2,6 +2,7 @@ use reel::segment::block_entry::BlockEntry;
 use reel::segment::row_block::BLOCK_HEADER_BYTES;
 use reel::segment::segment_table::*;
 use reel::segment::segment_tail::{SegmentNumber, TailHead};
+use reel_api::units::WritePlace;
 
 const NUMBERS: u64 = 500;
 
@@ -37,6 +38,7 @@ fn pool_compact() {
         columns: Extent::default(),
         blocks: Extent { start, length },
         is_walked: false,
+        highest_replacement: WritePlace(0),
     };
     // the slots run against pool order, and the run at 1 has retired
     shard.segments[0] = Some(entry(1, 3, 1));

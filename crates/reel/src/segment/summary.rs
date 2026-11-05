@@ -388,6 +388,18 @@ impl SummaryRows {
         offsets
     }
 
+    /// Check whether some row fails its check
+    pub fn has_bad_row(&self) -> bool {
+        let mut at = 0;
+        while at < self.bytes.len() {
+            let Some((length, Some(_row))) = read_row(&self.bytes[at..]) else {
+                return true;
+            };
+            at += length;
+        }
+        false
+    }
+
     /// Read the row at an offset `offsets` gave
     pub fn row_at(&self, at: usize) -> Option<SummaryRow<'_>> {
         read_row(self.bytes.get(at..)?)?.1
@@ -561,6 +573,13 @@ pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
     })
 }
 
+/// What a summary read can't vouch for, when the newer copy lost a row and the two copies differ
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LostRows {
+    pub has_lost_row: bool,
+    pub older: Vec<SegmentNumber>,
+}
+
 /// A summary file's paths, built once at open so a save allocates nothing
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SummaryPaths {
@@ -582,15 +601,20 @@ impl SummaryPaths {
     }
 }
 
-/// Write both copies of a summary, the second after the first is synced, so a crash leaves one whole
-pub fn write_summary<Backend: Io>(io: &Backend, paths: &SummaryPaths, mark: WritePlace, rows: &[u8]) -> Result<()> {
+/// Build the header a summary copy opens with
+pub fn summary_header(mark: WritePlace, rows: &[u8]) -> [u8; SUMMARY_HEADER_BYTES] {
     let mut header = [0; SUMMARY_HEADER_BYTES];
     header[..8].copy_from_slice(&SUMMARY_MAGIC.to_le_bytes());
     header[8..16].copy_from_slice(&mark.0.to_le_bytes());
     header[16..24].copy_from_slice(&(rows.len() as u64).to_le_bytes());
     let sum = checksum(&header[..24]);
     header[24..].copy_from_slice(&sum.0.to_le_bytes());
+    header
+}
 
+/// Write both copies of a summary, the second after the first is synced, so a crash leaves one whole
+pub fn write_summary<Backend: Io>(io: &Backend, paths: &SummaryPaths, mark: WritePlace, rows: &[u8]) -> Result<()> {
+    let header = summary_header(mark, rows);
     write_copy(io, paths, &paths.current, &header, rows)?;
     write_copy(io, paths, &paths.second, &header, rows)
 }
@@ -623,9 +647,11 @@ pub fn read_summary<Backend: Io>(
     io: &Backend,
     paths: &SummaryPaths,
     rows: &mut SummaryRows,
+    lost: &mut LostRows,
 ) -> Result<Option<WritePlace>> {
     let first = read_copy(io, &paths.current)?;
     let second = read_copy(io, &paths.second)?;
+    let has_two_marks = matches!((&first, &second), (Some(first), Some(second)) if first.0 != second.0);
     let (newer, older) = match (first, second) {
         (Some(first), Some(second)) if second.0 > first.0 => (second, Some(first)),
         (Some(first), second) => (first, second),
@@ -638,9 +664,14 @@ pub fn read_summary<Backend: Io>(
         let older_rows = SummaryRows { bytes };
         let listed = rows.offsets();
         rows.bytes.reserve(older_rows.bytes.len());
+        // with two marks, a row the newer copy lost may hold more than the older copy's, so it can't stand as it is
+        lost.has_lost_row = has_two_marks && rows.has_bad_row();
         for (segment, at) in older_rows.offsets() {
             if !listed.contains_key(&segment) {
                 rows.copy_row(&older_rows, at);
+                if lost.has_lost_row {
+                    lost.older.push(segment);
+                }
             }
         }
     }

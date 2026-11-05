@@ -15,7 +15,7 @@ use crate::pool::Pool;
 use crate::segment::damage_list::DamageList;
 use crate::segment::segment_table::SegmentTable;
 use crate::segment::segment_tail::SegmentNumber;
-use crate::segment::summary::{SummaryPaths, SummaryRows};
+use crate::segment::summary::{LostRows, SummaryPaths, SummaryRows};
 use crate::superblock::SuperblockPaths;
 
 /// Where a volume's sync stands
@@ -54,6 +54,7 @@ pub struct Volume<Backend: Io> {
     pub segment_rows: RowCount,
     pub summary: Mutex<SummaryRows>,
     pub summary_paths: SummaryPaths,
+    pub lost_rows: Mutex<LostRows>,
     pub summary_buffer: Pool<Vec<u8>>,
     pub damage: DamageList,
     pub damaged: Mutex<Vec<SegmentNumber>>,

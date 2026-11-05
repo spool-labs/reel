@@ -1,12 +1,18 @@
 //! The zero-allocation gate on the simulated disk: every call of a warm store allocates and frees nothing
 
+use std::hint::black_box;
 use std::path::PathBuf;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
+use reel::io::job::{Job, JobStep};
+use reel::io::{Io, IoFile};
 use reel::record::codec::Codec;
+use reel::segment::segment_tail::SECOND_TAIL_DISTANCE;
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId};
+use reel_sim::count_pause::CountPause;
+use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_io::SimulatedIo;
 
@@ -24,6 +30,9 @@ const FLUSH_ROUNDS: usize = 4;
 const SEAL_ROUNDS: usize = 8;
 const SETTLE_STEPS: u64 = 2_000_000;
 const SETTLE_TICK: Nanoseconds = Nanoseconds(1_000_000);
+const DAMAGED_KEY: &[u8] = b"damaged-100";
+const DAMAGED_END: &[u8] = b"damaged-101";
+const DAMAGED_KEYS: u64 = 200;
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -87,6 +96,10 @@ fn round(store: &Store, io: &SimulatedIo, inputs: &mut Inputs, number: usize) ->
     total += both(counted(|| store.get(META, b"missing", buf).expect("miss")));
     total += both(counted(|| store.contains(META, key).expect("contains")));
     total += both(counted(|| store.delete(BULK, other).expect("delete")));
+    let refused = counted(|| store.get(META, DAMAGED_KEY, buf).is_err());
+    assert!(refused.0);
+    total += both(refused);
+    total += both(counted(|| store.clear_damage(META, DAMAGED_END, Some(DAMAGED_END)).expect("clear")));
     if number.is_multiple_of(FLUSH_ROUNDS) {
         total += both(counted(|| store.flush().expect("flush")));
     }
@@ -97,10 +110,34 @@ fn round(store: &Store, io: &SimulatedIo, inputs: &mut Inputs, number: usize) ->
     total
 }
 
+// a sealed segment that opens damaged, so a round has a refused read and a clear to do
+fn damage(io: &SimulatedIo) {
+    let store = ReelStore::open(io.clone(), &config()).expect("open");
+    for number in 0..DAMAGED_KEYS {
+        store.put(META, format!("damaged-{number:03}").as_bytes(), b"value").expect("put");
+    }
+    store.seal_now();
+    settle(io);
+    store.close().expect("close");
+    drop(store);
+
+    let root = PathBuf::from(ROOT);
+    for path in io.list_directory(&root).expect("list") {
+        if path.extension().is_some_and(|extension| extension == "data") {
+            let file = io.open_read_only(&path).expect("open");
+            let length = file.length().expect("length").0;
+            io.close_file(file);
+            io.rot(&path, FileOffset(length - 3), BitMask(1)).expect("rot");
+            io.rot(&path, FileOffset(length - SECOND_TAIL_DISTANCE - 3), BitMask(1)).expect("rot");
+        }
+    }
+}
+
 // once every path has run, no call on the simulated disk allocates or frees
 #[test]
 fn no_allocations() {
     let io = SimulatedIo::new(Seed(1));
+    damage(&io);
     let store = ReelStore::open(io.clone(), &config()).expect("open");
     let mut inputs = Inputs {
         keys: (0..KEYS).map(|number| format!("key-{number:06}").into_bytes()).collect(),
@@ -123,4 +160,32 @@ fn no_allocations() {
     let (closed, allocations, _frees) = counted(|| store.close());
     closed.expect("close");
     assert_eq!(allocations, 0, "close allocated");
+}
+
+/// A job that allocates at every step, for the count to catch
+struct AllocatingJob;
+
+impl Job for AllocatingJob {
+    fn step(&mut self) -> JobStep {
+        black_box(vec![1_u8; 64]);
+        JobStep::Finished
+    }
+}
+
+// the count sees engine code in a call and in a job, and a pause hides only what runs inside it
+#[test]
+fn count_sees() {
+    let (_list, allocations, frees) = counted(|| black_box(vec![1_u8; 64]).len());
+    assert_eq!((allocations, frees), (1, 1));
+
+    let io = SimulatedIo::new(Seed(2));
+    let _task = io.spawn_job("allocating", AllocatingJob).expect("spawn");
+    let (_step, allocations, _frees) = counted(|| io.step_any());
+    assert_eq!(allocations, 1);
+
+    let (_hidden, allocations, _frees) = counted(|| {
+        let _pause = CountPause::new();
+        black_box(vec![1_u8; 64]).len()
+    });
+    assert_eq!(allocations, 0);
 }

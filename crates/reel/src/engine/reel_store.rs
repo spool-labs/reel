@@ -683,6 +683,7 @@ pub fn build_state<Backend: Io>(
             reserve: ByteCount(sizing.segment_bytes.0 * 2),
             summary: Mutex::new(summary.rows),
             summary_paths: summary.paths,
+            lost_rows: Mutex::new(summary.lost),
             summary_buffer: Pool::new(vec![touched_buffer(summary_room)]),
             damage: DamageList::new(),
             damaged: Mutex::new(touched_room(MOST_DAMAGED_SPANS)),

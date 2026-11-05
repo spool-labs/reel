@@ -19,7 +19,8 @@ use reel::segment::footer_reader::FooterReader;
 use reel::segment::row_block::BLOCK_HEADER_BYTES;
 use reel::segment::segment_tail::{SECOND_TAIL_DISTANCE, SegmentNumber, TailHead};
 use reel::segment::summary::{
-    ROW_HEAD_BYTES, SUMMARY_HEADER_BYTES, SegmentFacts, SummaryPaths, SummaryRows, read_row, read_summary, write_summary,
+    LostRows, ROW_HEAD_BYTES, SUMMARY_HEADER_BYTES, SegmentFacts, SummaryPaths, SummaryRows, read_row, read_summary,
+    summary_header, write_copy, write_summary,
 };
 use reel::rows::row_group::parse_group;
 use reel::superblock::{Superblock, SuperblockPaths};
@@ -41,6 +42,8 @@ const FLIP: BitMask = BitMask(1);
 const OLDEST: usize = 0;
 const MIDDLE: usize = 1;
 const NEWEST: usize = 2;
+const SECTOR_BYTES: u64 = 512;
+const SECTOR_KEYS: u64 = 40;
 const SEGMENTS: usize = 3;
 const SEAL_CRASH_POINTS: u64 = 24;
 const SEAL_STEPS: u64 = 1_000;
@@ -601,7 +604,7 @@ fn close_mark() {
     drop(store);
 
     let mut rows = SummaryRows::new(ByteCount(0));
-    let saved = read_summary(&built.io, &SummaryPaths::new(Path::new(ROOT)), &mut rows).expect("read");
+    let saved = read_summary(&built.io, &SummaryPaths::new(Path::new(ROOT)), &mut rows, &mut LostRows::default()).expect("read");
 
     assert_eq!(saved, Some(mark));
 }
@@ -659,7 +662,7 @@ fn rot_length(built: &Built, segment: SegmentNumber) {
 fn summary_rows(built: &Built) -> (SummaryPaths, SummaryRows, WritePlace) {
     let paths = SummaryPaths::new(Path::new(ROOT));
     let mut rows = SummaryRows::new(ByteCount(0));
-    let mark = read_summary(&built.io, &paths, &mut rows).expect("read").expect("a summary");
+    let mark = read_summary(&built.io, &paths, &mut rows, &mut LostRows::default()).expect("read").expect("a summary");
     rows.make_room(ByteCount(rows.bytes().len() as u64 * 2));
     (paths, rows, mark)
 }
@@ -1522,5 +1525,136 @@ fn not_damage() {
 
     assert_eq!(store.damaged_segments(), 0);
     assert_match(&store, &built.model);
+    store.close().expect("close");
+}
+
+// write the newer copy alone, as a crash between the two copies leaves it
+fn newer_copy(built: &Built, paths: &SummaryPaths, mark: WritePlace, rows: &[u8]) {
+    write_copy(&built.io, paths, &paths.current, &summary_header(WritePlace(mark.0 + 1), rows), rows).expect("write");
+}
+
+fn assert_all_refused(store: &Store, built: &Built) {
+    for (column, key) in built.model.keys() {
+        let got = read(store, *column, key);
+        assert!(matches!(got, Err(StoreError::Corruption { .. })), "key {key:?} answered {got:?}");
+    }
+}
+
+// rot in the newer copy's row, head or body, keeps the older row's facts and damages the columns at the counter
+#[test]
+fn newer_rot() {
+    for stage in [OLDEST, MIDDLE, NEWEST] {
+        for rot_at in [1, ROW_HEAD_BYTES + 2] {
+            let built = build(60 + stage as u64);
+            let (paths, rows, mark) = summary_rows(&built);
+            let segment = built.heads[stage].segment;
+            let older = rows.get(segment).expect("row").facts;
+            newer_copy(&built, &paths, mark, rows.bytes());
+            let at = row_offset(&built, &paths, segment);
+            built.io.rot(&paths.current, FileOffset((at + rot_at) as u64), FLIP).expect("rot");
+
+            let store = open(&built.io);
+
+            assert_eq!(store.damaged_segments(), 1, "stage {stage}, rot at {rot_at}");
+            assert_all_refused(&store, &built);
+            let summary = hold(&store.state.volumes[0].summary);
+            let facts = summary.get(segment).expect("row").facts;
+            assert_eq!((facts.places, facts.seal_mark), (older.places, older.seal_mark));
+            assert_eq!(facts.damage_place, store.state.order.mark());
+            drop(summary);
+            store.close().expect("close");
+        }
+    }
+}
+
+// the row the newer copy lost may be the first the segment had, so no row is no proof of no spans
+#[test]
+fn only_newer() {
+    let built = build(63);
+    let (paths, mut rows, mark) = summary_rows(&built);
+    let segment = built.heads[MIDDLE].segment;
+    let full = rows.bytes().to_vec();
+    rows.remove(segment);
+    write_summary(&built.io, &paths, mark, rows.bytes()).expect("write");
+    newer_copy(&built, &paths, mark, &full);
+    let at = row_offset(&built, &paths, segment);
+    built.io.rot(&paths.current, FileOffset((at + ROW_HEAD_BYTES + 2) as u64), FLIP).expect("rot");
+
+    let store = open(&built.io);
+
+    assert_eq!(store.damaged_segments(), 1);
+    assert_all_refused(&store, &built);
+    assert_eq!(hold(&store.state.volumes[0].summary).get(segment).expect("row").facts.places, built.heads[MIDDLE].places);
+    store.close().expect("close");
+}
+
+// a segment the newer copy lacks takes the older row, and two marks alone damage nothing
+#[test]
+fn only_older() {
+    let built = build(64);
+    let (paths, mut rows, mark) = summary_rows(&built);
+    let segment = built.heads[MIDDLE].segment;
+    let older = rows.get(segment).expect("row").facts;
+    rows.remove(segment);
+    newer_copy(&built, &paths, mark, rows.bytes());
+
+    let store = open(&built.io);
+
+    assert_eq!(store.damaged_segments(), 0);
+    assert_eq!(hold(&store.state.volumes[0].summary).get(segment).expect("row").facts, older);
+    assert_match(&store, &built.model);
+    store.close().expect("close");
+}
+
+// rows that reach a second sector: the last group runs over the sector edge and its mark group sits past it
+fn sector_end(seed: u64) -> (SimulatedIo, PathBuf, ByteCount) {
+    let io = SimulatedIo::new(Seed(seed));
+    let store = open(&io);
+    store.put(ORDERED, b"older", b"first").expect("put");
+    store.flush().expect("flush");
+    store.put(ORDERED, b"older", b"second").expect("put");
+    for number in 0..SECTOR_KEYS {
+        store.put(ORDERED, &key_of(ORDERED, number), b"value").expect("put");
+    }
+    store.flush().expect("flush");
+    io.kill();
+    drop(store);
+
+    let rows = rows_files(&io)[0].clone();
+    let length = file_length(&io, &rows);
+    let starts = group_starts(&io, &rows);
+    let (last, mark) = (starts[starts.len() - 2], starts[starts.len() - 1]);
+    assert!(last / SECTOR_BYTES < (length.0 - 1) / SECTOR_BYTES, "groups at {starts:?} of {length:?}");
+    assert_eq!(mark / SECTOR_BYTES, (length.0 - 1) / SECTOR_BYTES, "groups at {starts:?} of {length:?}");
+    (io, rows, length)
+}
+
+// one bad sector over the last group's end and its mark group refuses, through later opens, and never shows the older value
+#[test]
+fn bad_end() {
+    let (io, rows, length) = sector_end(65);
+    io.bad_sector(&rows, FileOffset(length.0 - 1)).expect("bad");
+
+    for _open in 0..2 {
+        let store = open(&io);
+
+        assert_eq!(store.damaged_segments(), 1);
+        assert!(matches!(read(&store, ORDERED, b"older"), Err(StoreError::Corruption { .. })));
+        store.close().expect("close");
+    }
+}
+
+// the same two groups with readable bytes that fail their check cut as a torn end
+#[test]
+fn rot_end() {
+    let (io, rows, length) = sector_end(66);
+    let starts = group_starts(&io, &rows);
+    io.rot(&rows, FileOffset(starts[starts.len() - 2] + 20), FLIP).expect("rot");
+    io.rot(&rows, FileOffset(length.0 - 3), FLIP).expect("rot");
+
+    let store = open(&io);
+
+    assert_eq!(store.damaged_segments(), 0);
+    assert_eq!(read(&store, ORDERED, b"older").expect("get"), Some(b"first".to_vec()));
     store.close().expect("close");
 }

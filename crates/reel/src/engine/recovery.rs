@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Error, ErrorKind, IoSlice, Result};
+use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -35,7 +36,8 @@ use crate::segment::footer_reader::FooterReader;
 use crate::segment::segment_table::{TABLE_SHARDS, TableSizing, shard_of};
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber, TailHead, columns_fit};
 use crate::segment::summary::{
-    ColumnFacts, MOST_ROW_COLUMN_BYTES, MOST_ROW_FIXED_BYTES, SUMMARY_KEY_BYTES, SegmentFacts, SpanFacts, SummaryPaths,
+    ColumnFacts, LostRows, MOST_ROW_COLUMN_BYTES, MOST_ROW_FIXED_BYTES, SUMMARY_KEY_BYTES, SegmentFacts, SpanFacts,
+    SummaryPaths,
     SummaryRow, SummaryRows, put_bound, put_lowest,
     read_summary,
 };
@@ -123,6 +125,7 @@ pub struct OwnedColumn {
 pub struct SummaryFound {
     pub rows: SummaryRows,
     pub paths: SummaryPaths,
+    pub lost: LostRows,
 }
 
 /// A segment with no valid tail and a rows file
@@ -532,6 +535,11 @@ impl<Backend: Io> EngineState<Backend> {
                 scan.highest_place = scan.highest_place.max(row.place);
             }
             scan.valid_end = FileOffset(at.0 + group_length as u64);
+        }
+        // a torn end is bytes that read and fail their check, so a device error past the last good group is rot
+        if scan.valid_end.0 < length.0 && has_bad_sector(rows, scan.valid_end, length)? {
+            scan.has_rot = true;
+            scan.rot_sum = rot_sum(scan.rot_sum, scan.valid_end, FileOffset(length.0));
         }
         Ok(scan)
     }
@@ -968,6 +976,21 @@ pub fn rot_sum(sum: Checksum, start: FileOffset, end: FileOffset) -> Checksum {
     Checksum(checksum(&region).0 | 1)
 }
 
+/// Check whether the device can't give back some sector of a range
+pub fn has_bad_sector<File: IoFile>(rows: &File, start: FileOffset, end: ByteCount) -> Result<bool> {
+    let mut sector = [0; GROUP_SEARCH_BYTES];
+    let mut at = start.0;
+    while at < end.0 {
+        let sector_end = (at / GROUP_SEARCH_BYTES as u64 + 1) * GROUP_SEARCH_BYTES as u64;
+        let length = (sector_end.min(end.0) - at) as usize;
+        if !read_or_damaged(rows, FileOffset(at), &mut sector[..length])? {
+            return Ok(true);
+        }
+        at = sector_end;
+    }
+    Ok(false)
+}
+
 /// Search past a bad group, a sector at a time, for a whole group whose sync mark reaches over it
 pub fn covering_group<File: IoFile>(
     rows: &File,
@@ -1027,18 +1050,7 @@ pub fn damage_open<Backend: Io>(
         damage_place: counter,
         ..SegmentFacts::default()
     };
-    let mut ranges = Vec::new();
-    for (id, info) in state.columns.iter().enumerate() {
-        if info.is_some_and(|info| info.volume.0 as usize == found.volume) {
-            ranges.push(DamagedRange {
-                column: ColumnId(id as u8),
-                segment: found.number,
-                highest_place: counter,
-                start: Vec::new(),
-                end: None,
-            });
-        }
-    }
+    let ranges = whole_columns(state, found.volume, found.number, counter);
 
     volume.damage.drop_segment(found.number);
     for range in &ranges {
@@ -1067,10 +1079,12 @@ pub fn read_summaries<Backend: Io>(
         let summary_paths = SummaryPaths::new(&paths[0]);
         let mut rows = SummaryRows::new(ByteCount(0));
         // the superblock's limit keeps the write order, so open has no use for the summary's mark
-        let _mark = read_summary(io, &summary_paths, &mut rows)?;
+        let mut lost = LostRows::default();
+        let _mark = read_summary(io, &summary_paths, &mut rows, &mut lost)?;
         found.push(SummaryFound {
             rows,
             paths: summary_paths,
+            lost,
         });
     }
     Ok(found)
@@ -1081,6 +1095,7 @@ pub fn settle_summaries<Backend: Io>(state: &EngineState<Backend>, scan: &mut Ro
     let mut reader = FooterReader::new();
     for (index, volume) in state.volumes.iter().enumerate() {
         let mut rows = hold(&volume.summary);
+        mark_lost_rows(state, scan, index, &mut rows);
         let listed = rows.offsets();
         sort_empties(state, scan, index, &listed)?;
 
@@ -1136,6 +1151,73 @@ pub fn carry_rows<Backend: Io>(
         settled.make_room_for(rows, *at);
         let is_copied = settled.copy_row(rows, *at);
         debug_assert!(is_copied);
+    }
+}
+
+/// Build a whole-column range for every column of a volume in a segment
+pub fn whole_columns<Backend: Io>(
+    state: &EngineState<Backend>,
+    volume: usize,
+    segment: SegmentNumber,
+    counter: WritePlace,
+) -> Vec<DamagedRange> {
+    let mut ranges = Vec::new();
+    for (id, info) in state.columns.iter().enumerate() {
+        if info.is_some_and(|info| info.volume.0 as usize == volume) {
+            ranges.push(DamagedRange {
+                column: ColumnId(id as u8),
+                segment,
+                highest_place: counter,
+                start: Vec::new(),
+                end: None,
+            });
+        }
+    }
+    ranges
+}
+
+/// Damage whole what a row the newer summary copy lost could have spoken for: an older row may lack the
+/// newer row's spans, and a segment with no row may have had some. Older rows keep their facts
+pub fn mark_lost_rows<Backend: Io>(
+    state: &EngineState<Backend>,
+    scan: &RootScan<Backend::File>,
+    index: usize,
+    rows: &mut SummaryRows,
+) {
+    let lost = mem::take(&mut *hold(&state.volumes[index].lost_rows));
+    if !lost.has_lost_row {
+        return;
+    }
+
+    let counter = state.order.mark();
+    for number in lost.older {
+        let Some(row) = rows.get(number) else {
+            continue;
+        };
+        let mut facts = row.facts;
+        let mut columns = Vec::new();
+        let _spans = row_ranges(&row, number, &mut columns);
+        facts.is_damaged = true;
+        facts.damage_place = counter;
+        let ranges = whole_columns(state, index, number, counter);
+        rows.remove(number);
+        state.note_dropped_rows(rows.push_kept(&facts, columns.iter().map(column_of), ranges.iter().map(span_of)));
+    }
+
+    let sealed = scan.sealed.iter().filter(|found| found.volume == index).map(|found| found.head.segment);
+    let open = scan.scanned.iter().filter(|segment| segment.found.volume == index).map(|segment| segment.found.number);
+    for number in sealed.chain(open) {
+        if rows.get(number).is_some() {
+            continue;
+        }
+        let facts = SegmentFacts {
+            segment: number,
+            is_damaged: true,
+            damage_place: counter,
+            ..SegmentFacts::default()
+        };
+        let ranges = whole_columns(state, index, number, counter);
+        state.note_dropped_rows(rows.push_kept(&facts, [].into_iter(), ranges.iter().map(span_of)));
     }
 }
 

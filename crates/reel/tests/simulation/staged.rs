@@ -46,8 +46,8 @@ const KEY_SPACE: u64 = 40;
 const MOST_IN_FLIGHT: usize = 6;
 const MANY_ROWS: u64 = 11_000;
 const SHRINK_ROWS: u64 = 2_000;
-const SHRINK_CRASH_END: u64 = 3_600;
-const SHRINK_CRASH_STEP: usize = 149;
+const SHRINK_CRASH_END: u64 = 5_400;
+const SHRINK_CRASH_STEP: usize = 197;
 const JOB_ROUNDS: u64 = 20;
 const MOST_OPEN: usize = 4;
 

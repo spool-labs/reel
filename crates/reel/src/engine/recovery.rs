@@ -621,7 +621,11 @@ pub fn copy_row<Backend: Io>(
             },
         }
     }
-    seal_inline(state, volume)
+    let is_sealing = hold(&target.claims).open.iter().any(|segment| segment.phase == SegmentPhase::Sealing);
+    if is_sealing {
+        seal_inline(state, volume)?;
+    }
+    Ok(())
 }
 
 /// Lower a segment's first place to a copied row's, which predates the segment

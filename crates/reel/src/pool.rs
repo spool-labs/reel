@@ -1,16 +1,23 @@
 //! Fixed buffers shared by every thread: a caller takes one or waits
 
+use std::ops::{Deref, DerefMut};
 use std::sync::{Condvar, Mutex, MutexGuard};
 
 use reel_api::units::ByteCount;
 
 use crate::guard::hold;
 
+/// Wakes a waiter when dropped, which runs after the item's lock has gone
+#[derive(Debug)]
+pub struct Freed<'pool, Item> {
+    pool: &'pool Pool<Item>,
+}
+
 /// A pooled item, handed back when dropped
 #[derive(Debug)]
 pub struct Pooled<'pool, Item> {
-    guard: Option<MutexGuard<'pool, Item>>,
-    pool: &'pool Pool<Item>,
+    guard: MutexGuard<'pool, Item>,
+    _freed: Freed<'pool, Item>,
 }
 
 /// A fixed set of items
@@ -57,21 +64,15 @@ impl<Item> Pool<Item> {
     /// Take a free item, starting the search at a hint so threads spread out
     pub fn take(&self, hint: usize) -> Pooled<'_, Item> {
         loop {
-            if let Some(guard) = self.try_take(hint) {
-                return Pooled {
-                    guard: Some(guard),
-                    pool: self,
-                };
+            if let Some(item) = self.try_take(hint) {
+                return item;
             }
 
             let mut waiters = hold(&self.waiters);
             *waiters += 1;
-            if let Some(guard) = self.try_take(hint) {
+            if let Some(item) = self.try_take(hint) {
                 *waiters -= 1;
-                return Pooled {
-                    guard: Some(guard),
-                    pool: self,
-                };
+                return item;
             }
             waiters = match self.freed.wait(waiters) {
                 Ok(guard) => guard,
@@ -82,41 +83,37 @@ impl<Item> Pool<Item> {
     }
 
     /// Take a free item if one is free right now
-    pub fn try_take(&self, hint: usize) -> Option<MutexGuard<'_, Item>> {
+    pub fn try_take(&self, hint: usize) -> Option<Pooled<'_, Item>> {
         let count = self.items.len();
         for step in 0..count {
             let slot = &self.items[(hint + step) % count];
             if let Ok(guard) = slot.try_lock() {
-                return Some(guard);
+                return Some(Pooled {
+                    guard,
+                    _freed: Freed { pool: self },
+                });
             }
         }
         None
     }
 }
 
-impl<Item> std::ops::Deref for Pooled<'_, Item> {
+impl<Item> Deref for Pooled<'_, Item> {
     type Target = Item;
 
     fn deref(&self) -> &Item {
-        match &self.guard {
-            Some(guard) => guard,
-            None => unreachable!("a pooled item holds its guard until drop"),
-        }
+        &self.guard
     }
 }
 
-impl<Item> std::ops::DerefMut for Pooled<'_, Item> {
+impl<Item> DerefMut for Pooled<'_, Item> {
     fn deref_mut(&mut self) -> &mut Item {
-        match &mut self.guard {
-            Some(guard) => guard,
-            None => unreachable!("a pooled item holds its guard until drop"),
-        }
+        &mut self.guard
     }
 }
 
-impl<Item> Drop for Pooled<'_, Item> {
+impl<Item> Drop for Freed<'_, Item> {
     fn drop(&mut self) {
-        drop(self.guard.take());
         let waiters = hold(&self.pool.waiters);
         if *waiters > 0 {
             self.pool.freed.notify_one();

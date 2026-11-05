@@ -298,6 +298,10 @@ impl Io for SimulatedIo {
         Nanoseconds(reading)
     }
 
+    fn random_word(&self) -> u64 {
+        hold(&self.disk).random.next_word()
+    }
+
     fn pause(&self) {
         // one thread drives a simulation, so a waiter runs the work it waits for
         self.advance_clock(PAUSE_TICK);

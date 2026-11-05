@@ -183,6 +183,29 @@ impl WriteShard {
         }
     }
 
+    /// Find a slot's last row in a column
+    pub fn last_of_column(&self, slot: OpenSlot, column: ColumnId) -> Option<EntryAddress> {
+        let tree = &self.trees[slot.0 as usize];
+        let position = match column.0.checked_add(1) {
+            Some(next) => {
+                let target = SeekTarget::new(ColumnId(next), &[], WritePlace(u64::MAX));
+                tree.seek_before(&self.nodes, &self.slab, &target)?
+            },
+            None => tree.last_position(&self.nodes)?,
+        };
+        let entry = entry_at(&self.nodes, position);
+        if self.slab.column(entry) == column {
+            return Some(entry);
+        }
+        None
+    }
+
+    /// Check no newer version of a key is in any open segment or has sealed away
+    pub fn is_newest_version(&self, hash: KeyHash, column: ColumnId, key: &[u8], place: WritePlace) -> bool {
+        let head = self.table.head(self.table.probe(hash, column, key, &self.slab));
+        head != NO_ENTRY && self.slab.place(head) == place && !self.slab.has_newer_sealed(head)
+    }
+
     /// Check whether a key's newest row is a visible grave in an open slot
     pub fn is_newest_grave(
         &self,

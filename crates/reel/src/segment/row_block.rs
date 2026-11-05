@@ -181,6 +181,21 @@ impl<'block> RowBlockWalk<'block> {
         })
     }
 
+    /// Start at the first row of a block already checked once
+    pub fn open_checked(block: &'block [u8], place_base: WritePlace) -> Option<Self> {
+        let sum_at = block.len().checked_sub(BLOCK_SUM_BYTES)?;
+        let count_at = sum_at.checked_sub(RESTART_COUNT_BYTES)?;
+        let restarts = u16::from_le_bytes([block[count_at], block[count_at + 1]]) as usize;
+        let rows_count_at = count_at.checked_sub(COUNT_BYTES)?;
+        let restarts_at = rows_count_at.checked_sub(restarts * size_of::<u16>())?;
+        Some(Self {
+            rows: &block[..restarts_at],
+            restarts: &block[restarts_at..rows_count_at],
+            position: 0,
+            place_base,
+        })
+    }
+
     /// Count the restart points
     pub fn restart_count(&self) -> usize {
         self.restarts.len() / size_of::<u16>()

@@ -374,6 +374,7 @@ fn cut_during_footer(rows: &[(Vec<u8>, FooterRow)], crash_at: OperationCount, se
         path,
         file: reopened,
         totals: FooterTotals {
+            head,
             file_length: ByteCount(0),
             block_count: head.block_count,
             row_count: RowCount(0),

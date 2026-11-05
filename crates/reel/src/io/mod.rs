@@ -93,6 +93,9 @@ pub trait Io: Clone + Send + Sync + 'static {
     /// Read the monotonic clock
     fn now(&self) -> Nanoseconds;
 
+    /// Draw a random word for a new store's id and key
+    fn random_word(&self) -> u64;
+
     /// Let background work run while a caller waits for it
     fn pause(&self);
 

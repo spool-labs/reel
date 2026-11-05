@@ -1,7 +1,7 @@
 //! One per root: the store's identity, its layout and the segment counter
 
 use std::io::{Error, ErrorKind, IoSlice, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset};
@@ -36,20 +36,37 @@ pub struct StoredColumn {
     pub volume_name: String,
 }
 
+/// A volume as the store remembers it
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredVolume {
+    pub name: String,
+    pub roots: Vec<String>,
+}
+
+/// A root's paths, built once at open so a save allocates nothing
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SuperblockPaths {
+    pub root: PathBuf,
+    pub current: PathBuf,
+    pub new: PathBuf,
+}
+
 /// A root's superblock
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Superblock {
     pub store_id: StoreId,
     pub record_key: RecordKey,
+    pub revision: u64,
     pub next_segment: SegmentNumber,
+    pub volumes: Vec<StoredVolume>,
     pub columns: Vec<StoredColumn>,
     pub dead_roots: Vec<String>,
 }
 
 /// Appends a superblock's fields to a buffer
-#[derive(Debug, Default)]
-pub struct FieldWriter {
-    bytes: Vec<u8>,
+#[derive(Debug)]
+pub struct FieldWriter<'bytes> {
+    bytes: &'bytes mut Vec<u8>,
 }
 
 /// Reads a superblock's fields from its bytes
@@ -58,7 +75,18 @@ pub struct FieldReader<'bytes> {
     bytes: &'bytes [u8],
 }
 
-impl FieldWriter {
+impl SuperblockPaths {
+    /// Build a root's paths
+    pub fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            current: root.join(SUPERBLOCK_NAME),
+            new: root.join(NEW_SUPERBLOCK_NAME),
+        }
+    }
+}
+
+impl FieldWriter<'_> {
     /// Append a word
     pub fn word(&mut self, word: u64) {
         self.bytes.extend_from_slice(&word.to_le_bytes());
@@ -91,13 +119,23 @@ impl<'bytes> FieldReader<'bytes> {
 }
 
 impl Superblock {
-    /// Turn the superblock into its stored bytes
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut fields = FieldWriter::default();
+    /// Lay the superblock out in a buffer the caller keeps, so a save allocates nothing
+    pub fn write_bytes(&self, out: &mut Vec<u8>) {
+        out.clear();
+        let mut fields = FieldWriter { bytes: out };
         fields.word(u64::from(SUPERBLOCK_MAGIC));
         fields.word(self.store_id.0);
         fields.word(self.record_key.0);
+        fields.word(self.revision);
         fields.word(self.next_segment.0);
+        fields.word(self.volumes.len() as u64);
+        for volume in &self.volumes {
+            fields.text(&volume.name);
+            fields.word(volume.roots.len() as u64);
+            for root in &volume.roots {
+                fields.text(root);
+            }
+        }
         fields.word(self.columns.len() as u64);
         for column in &self.columns {
             fields.word(u64::from(column.id.0));
@@ -115,9 +153,8 @@ impl Superblock {
             fields.text(root);
         }
 
-        let sum = xxh3_64(&fields.bytes);
+        let sum = xxh3_64(fields.bytes);
         fields.word(sum);
-        fields.bytes
     }
 
     /// Read a superblock from its stored bytes, or nothing when they fail their check
@@ -134,7 +171,20 @@ impl Superblock {
         }
         let store_id = StoreId(fields.word()?);
         let record_key = RecordKey(fields.word()?);
+        let revision = fields.word()?;
         let next_segment = SegmentNumber(fields.word()?);
+
+        let volume_count = fields.word()?;
+        let mut volumes = Vec::new();
+        for _volume in 0..volume_count {
+            let name = fields.text()?;
+            let root_count = fields.word()?;
+            let mut roots = Vec::new();
+            for _root in 0..root_count {
+                roots.push(fields.text()?);
+            }
+            volumes.push(StoredVolume { name, roots });
+        }
 
         let column_count = fields.word()?;
         let mut columns = Vec::new();
@@ -165,7 +215,9 @@ impl Superblock {
         Some(Self {
             store_id,
             record_key,
+            revision,
             next_segment,
+            volumes,
             columns,
             dead_roots,
         })
@@ -190,22 +242,20 @@ impl Superblock {
     }
 
     /// Replace a root's superblock so a crash leaves the old one or the new one whole
-    pub fn write<Backend: Io>(&self, io: &Backend, root: &Path) -> Result<()> {
-        let new_path = root.join(NEW_SUPERBLOCK_NAME);
-        let path = root.join(SUPERBLOCK_NAME);
-        match io.remove_file(&new_path) {
+    pub fn write<Backend: Io>(&self, io: &Backend, paths: &SuperblockPaths, bytes: &mut Vec<u8>) -> Result<()> {
+        self.write_bytes(bytes);
+        match io.remove_file(&paths.new) {
             Ok(()) => {},
             Err(error) if error.kind() == ErrorKind::NotFound => {},
             Err(error) => return Err(error),
         }
 
-        let file = io.create_file(&new_path, ByteCount(0))?;
-        let bytes = self.to_bytes();
-        file.write_at(FileOffset(0), &[IoSlice::new(&bytes)])?;
+        let file = io.create_file(&paths.new, ByteCount(0))?;
+        file.write_at(FileOffset(0), &[IoSlice::new(bytes)])?;
         file.sync()?;
         io.close_file(file);
-        io.rename_file(&new_path, &path)?;
-        io.sync_directory(root)
+        io.rename_file(&paths.new, &paths.current)?;
+        io.sync_directory(&paths.root)
     }
 }
 
@@ -228,7 +278,18 @@ mod tests {
         Superblock {
             store_id: StoreId(5),
             record_key: RecordKey(6),
+            revision: 2,
             next_segment: SegmentNumber(700),
+            volumes: vec![
+                StoredVolume {
+                    name: "meta".to_string(),
+                    roots: vec!["/mnt/nvme".to_string()],
+                },
+                StoredVolume {
+                    name: "bulk".to_string(),
+                    roots: vec!["/mnt/one".to_string(), "/mnt/two".to_string()],
+                },
+            ],
             columns: vec![
                 StoredColumn {
                     id: ColumnId(1),
@@ -250,7 +311,8 @@ mod tests {
     // a superblock reads back field for field
     #[test]
     fn superblock_round() {
-        let bytes = superblock().to_bytes();
+        let mut bytes = Vec::new();
+        superblock().write_bytes(&mut bytes);
 
         assert_eq!(Superblock::from_bytes(&bytes), Some(superblock()));
     }
@@ -258,7 +320,8 @@ mod tests {
     // a flipped byte and a cut file are refused
     #[test]
     fn superblock_rot() {
-        let mut bytes = superblock().to_bytes();
+        let mut bytes = Vec::new();
+        superblock().write_bytes(&mut bytes);
 
         assert_eq!(Superblock::from_bytes(&bytes[..bytes.len() - 1]), None);
         bytes[12] ^= 1;

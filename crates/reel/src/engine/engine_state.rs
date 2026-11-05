@@ -1,0 +1,177 @@
+//! Everything a store shares between its threads
+
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
+
+use reel_api::column_id::ColumnId;
+use reel_api::store_error::StoreError;
+use reel_api::units::{ByteCount, WritePlace};
+
+use crate::engine::column_info::ColumnInfo;
+use crate::engine::engine_sizing::EngineSizing;
+use crate::engine::open_segment::RowQueue;
+use crate::engine::volume::Volume;
+use crate::guard::hold;
+use crate::index::open_slots::OpenSlot;
+use crate::index::spot_index::SpotIndex;
+use crate::index::write_index::WriteIndex;
+use crate::io::Io;
+use crate::pool::Pool;
+use crate::record::record_check::RecordKey;
+use crate::record::record_encoder::RecordEncoder;
+use crate::record::record_reader::RecordReader;
+use crate::rows::row_group::RowGroupBuffer;
+use crate::segment::block_cache::BlockCache;
+use crate::segment::column_directory::ColumnDirectory;
+use crate::segment::footer_reader::FooterReader;
+use crate::segment::segment_tail::SegmentNumber;
+use crate::superblock::Superblock;
+use crate::write_order::WriteOrder;
+
+/// Segment numbers one superblock write reserves
+pub const SEGMENT_NUMBER_BATCH: u64 = 1_024;
+
+/// One open slot's file, kept under a short lock
+#[derive(Debug)]
+pub struct SlotFile<File> {
+    pub data: RwLock<Option<File>>,
+    pub pins: AtomicU32,
+}
+
+/// The state every store handle and job shares
+pub struct EngineState<Backend: Io> {
+    pub io: Backend,
+    pub record_key: RecordKey,
+    pub sizing: EngineSizing,
+    pub columns: Vec<Option<ColumnInfo>>,
+    pub directories: Vec<Option<ColumnDirectory>>,
+    pub volumes: Vec<Volume<Backend>>,
+    pub order: WriteOrder,
+    pub index: WriteIndex,
+    pub spot: SpotIndex,
+    pub filter_cache: BlockCache,
+    pub row_cache: BlockCache,
+    pub queues: Vec<Mutex<RowQueue>>,
+    pub spare_groups: Vec<Mutex<Option<RowGroupBuffer>>>,
+    pub slot_files: Vec<SlotFile<Backend::File>>,
+    pub free_slots: Mutex<Vec<OpenSlot>>,
+    pub encoders: Pool<RecordEncoder>,
+    pub large_encoders: Pool<RecordEncoder>,
+    pub record_readers: Pool<RecordReader>,
+    pub footer_readers: Pool<FooterReader>,
+    pub superblock: Mutex<Superblock>,
+    pub superblock_bytes: Mutex<Vec<u8>>,
+    pub next_segment: AtomicU64,
+    pub reserved_segment: AtomicU64,
+    pub deletes: AtomicU64,
+    pub rows_waiting: AtomicBool,
+    pub row_task: OnceLock<Backend::Task>,
+    pub seal_tasks: Vec<OnceLock<Backend::Task>>,
+}
+
+/// A held open-slot pin, released when dropped
+#[derive(Debug)]
+pub struct SlotPin<'state, File> {
+    pub file: File,
+    slot: &'state SlotFile<File>,
+}
+
+impl<File> Drop for SlotPin<'_, File> {
+    fn drop(&mut self) {
+        self.slot.pins.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl<File: Clone> SlotFile<File> {
+    /// Start an empty slot
+    pub fn new() -> Self {
+        Self {
+            data: RwLock::new(None),
+            pins: AtomicU32::new(0),
+        }
+    }
+
+    /// Hold the slot's file for a read, or return nothing when the slot has moved on
+    pub fn pin(&self) -> Option<SlotPin<'_, File>> {
+        let guard = match self.data.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let file = guard.clone()?;
+        self.pins.fetch_add(1, Ordering::AcqRel);
+        Some(SlotPin { file, slot: self })
+    }
+
+    /// Set the slot's file
+    pub fn set(&self, file: Option<File>) {
+        let mut guard = match self.data.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = file;
+    }
+
+    /// Count the reads still holding the slot
+    pub fn pin_count(&self) -> u32 {
+        self.pins.load(Ordering::Acquire)
+    }
+}
+
+impl<File: Clone> Default for SlotFile<File> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<Backend: Io> EngineState<Backend> {
+    /// Find a declared column
+    pub fn column(&self, column: ColumnId) -> Result<ColumnInfo, StoreError> {
+        match self.columns[column.0 as usize] {
+            Some(info) => Ok(info),
+            None => Err(StoreError::UnknownColumn { column }),
+        }
+    }
+
+    /// Read the write mark a new read starts from
+    pub fn read_point(&self) -> WritePlace {
+        self.order.mark()
+    }
+
+    /// Take the next segment number, reserving more in every superblock when they run out
+    pub fn next_segment_number(&self) -> Result<SegmentNumber, StoreError> {
+        let number = self.next_segment.fetch_add(1, Ordering::AcqRel);
+        if number >= self.reserved_segment.load(Ordering::Acquire) {
+            let target = number + SEGMENT_NUMBER_BATCH;
+            let mut superblock = hold(&self.superblock);
+            superblock.next_segment = SegmentNumber(target);
+            superblock.revision += 1;
+            let mut bytes = hold(&self.superblock_bytes);
+            for volume in &self.volumes {
+                for paths in &volume.superblock_paths {
+                    superblock.write(&self.io, paths, &mut bytes).map_err(|source| StoreError::Io {
+                        action: "writing a superblock",
+                        source,
+                    })?;
+                }
+            }
+            self.reserved_segment.store(target, Ordering::Release);
+        }
+        Ok(SegmentNumber(number))
+    }
+
+    /// Take a free open slot
+    pub fn take_slot(&self) -> Option<OpenSlot> {
+        hold(&self.free_slots).pop()
+    }
+
+    /// Give a slot back once nothing uses it
+    pub fn free_slot(&self, slot: OpenSlot) {
+        hold(&self.free_slots).push(slot);
+    }
+
+    /// Add up the heap the shared parts hold
+    pub fn heap_bytes(&self) -> ByteCount {
+        ByteCount(self.index.heap_bytes().0 + self.spot.heap_bytes().0)
+    }
+}
+

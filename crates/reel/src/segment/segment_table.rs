@@ -14,6 +14,12 @@ use crate::segment::segment_tail::{ColumnTail, SegmentNumber, TailHead};
 pub const TABLE_SHARDS: usize = 16;
 /// Block lines one search copies out, so no lock stays held across a read
 pub const WINDOW_BLOCKS: usize = 4;
+/// Picks a shard from the top of a mixed segment number
+pub const SHARD_SHIFT: u32 = u64::BITS - TABLE_SHARDS.trailing_zeros();
+/// Marks an empty slot in a number map
+pub const NO_SLOT: u32 = u32::MAX;
+/// Spreads segment numbers over a number map
+pub const NUMBER_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// A run of a pool
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -26,20 +32,26 @@ pub struct Extent {
 #[derive(Clone, Debug)]
 pub struct TableEntry<File> {
     pub number: SegmentNumber,
-    pub file: Option<File>,
+    pub file: File,
     pub head: TailHead,
     pub columns: Extent,
     pub blocks: Extent,
-    pub pin_slot: usize,
 }
 
-/// A segment held open for a read
+/// A segment held open for a read, let go when dropped
 #[derive(Debug)]
-pub struct PinnedSegment<File> {
+pub struct SegmentPin<'table, File> {
     pub file: File,
     pub head: TailHead,
-    pub pin_slot: usize,
-    pub shard: usize,
+    pin: &'table AtomicU32,
+}
+
+/// A segment taken out of the table, whose file closes once its pins are gone
+#[derive(Debug)]
+pub struct RetiredSegment<'table, File> {
+    pub file: File,
+    pub head: TailHead,
+    pin: &'table AtomicU32,
 }
 
 /// A few block lines around a key, with what a read of them needs
@@ -52,13 +64,22 @@ pub struct BlockWindow {
     pub has_more: bool,
 }
 
-/// One shard: fixed pools for tails and block lines, and a fixed list of segments
+/// An open-addressed map from a segment number to its slot, of fixed size
+#[derive(Clone, Debug)]
+pub struct NumberMap {
+    numbers: Vec<SegmentNumber>,
+    slots: Vec<u32>,
+    mask: usize,
+}
+
+/// One shard: fixed pools for tails and block lines, and fixed slots for segments
 #[derive(Debug)]
 pub struct TableShard<File> {
-    pub segments: Vec<TableEntry<File>>,
+    pub segments: Vec<Option<TableEntry<File>>>,
+    pub map: NumberMap,
+    pub free_slots: Vec<u32>,
     pub columns: Vec<ColumnTail>,
     pub blocks: Vec<BlockEntry>,
-    pub free_pins: Vec<usize>,
 }
 
 /// The table of a volume
@@ -76,23 +97,95 @@ pub struct TableSizing {
     pub blocks_per_shard: usize,
 }
 
+impl<File> Drop for SegmentPin<'_, File> {
+    fn drop(&mut self) {
+        self.pin.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl<File> RetiredSegment<'_, File> {
+    /// Count the reads still holding the segment
+    pub fn pin_count(&self) -> u32 {
+        self.pin.load(Ordering::Acquire)
+    }
+}
+
+impl NumberMap {
+    /// Allocate a map for a number of segments
+    pub fn new(capacity: usize) -> Self {
+        let size = (capacity.max(1) * 2).next_power_of_two();
+        Self {
+            numbers: vec![SegmentNumber(0); size],
+            slots: vec![NO_SLOT; size],
+            mask: size - 1,
+        }
+    }
+
+    /// Find where a number sits, or the empty place it belongs
+    pub fn probe(&self, number: SegmentNumber) -> usize {
+        let mut index = home_of(number, self.mask);
+        while self.slots[index] != NO_SLOT && self.numbers[index] != number {
+            index = (index + 1) & self.mask;
+        }
+        index
+    }
+
+    /// Find a number's slot
+    pub fn get(&self, number: SegmentNumber) -> Option<u32> {
+        let slot = self.slots[self.probe(number)];
+        if slot == NO_SLOT { None } else { Some(slot) }
+    }
+
+    /// Add a number
+    pub fn insert(&mut self, number: SegmentNumber, slot: u32) {
+        let index = self.probe(number);
+        self.numbers[index] = number;
+        self.slots[index] = slot;
+    }
+
+    /// Remove a number, moving later ones back so no probe breaks
+    pub fn remove(&mut self, number: SegmentNumber) {
+        let mut hole = self.probe(number);
+        if self.slots[hole] == NO_SLOT {
+            return;
+        }
+
+        let mut next = (hole + 1) & self.mask;
+        while self.slots[next] != NO_SLOT {
+            let home = home_of(self.numbers[next], self.mask);
+            let distance_to_hole = hole.wrapping_sub(home) & self.mask;
+            let distance_to_next = next.wrapping_sub(home) & self.mask;
+            if distance_to_hole < distance_to_next {
+                self.numbers[hole] = self.numbers[next];
+                self.slots[hole] = self.slots[next];
+                hole = next;
+            }
+            next = (next + 1) & self.mask;
+        }
+        self.slots[hole] = NO_SLOT;
+    }
+}
+
 impl<File: Clone> SegmentTable<File> {
     /// Allocate every pool
     pub fn new(sizing: &TableSizing) -> Self {
         let mut shards = Vec::with_capacity(TABLE_SHARDS);
         let mut pins = Vec::with_capacity(TABLE_SHARDS);
         for _shard in 0..TABLE_SHARDS {
-            let mut free_pins = Vec::with_capacity(sizing.segments_per_shard);
+            let mut segments = Vec::with_capacity(sizing.segments_per_shard);
+            let mut free_slots = Vec::with_capacity(sizing.segments_per_shard);
             let mut shard_pins = Vec::with_capacity(sizing.segments_per_shard);
             for slot in 0..sizing.segments_per_shard {
-                free_pins.push(slot);
+                segments.push(None);
+                free_slots.push(slot as u32);
                 shard_pins.push(AtomicU32::new(0));
             }
             shards.push(RwLock::new(TableShard {
-                segments: Vec::with_capacity(sizing.segments_per_shard),
+                segments,
+                map: NumberMap::new(sizing.segments_per_shard),
+                free_slots,
                 columns: Vec::with_capacity(sizing.columns_per_shard),
                 blocks: Vec::with_capacity(sizing.blocks_per_shard),
-                free_pins,
             }));
             pins.push(shard_pins);
         }
@@ -120,33 +213,27 @@ impl<File: Clone> SegmentTable<File> {
         let mut total = 0;
         for shard in 0..TABLE_SHARDS {
             let guard = self.read_shard(shard);
-            total += guard.segments.capacity() * size_of::<TableEntry<File>>();
+            total += guard.segments.capacity() * size_of::<Option<TableEntry<File>>>();
             total += guard.columns.capacity() * size_of::<ColumnTail>();
             total += guard.blocks.capacity() * size_of::<BlockEntry>();
-            total += guard.free_pins.capacity() * size_of::<usize>();
+            total += guard.free_slots.capacity() * size_of::<u32>();
+            total += guard.map.slots.capacity() * (size_of::<u32>() + size_of::<SegmentNumber>());
         }
         ByteCount(total as u64)
     }
 
     /// Install a sealed segment, or return false when its shard has no room
     pub fn install(&self, file: File, head: &TailHead, columns: &[ColumnTail], blocks: &[BlockEntry]) -> bool {
-        let shard = shard_of(head.segment);
-        let mut guard = self.write_shard(shard);
-        let has_room = guard.columns.len() + columns.len() <= guard.columns.capacity()
-            && guard.blocks.len() + blocks.len() <= guard.blocks.capacity()
-            && guard.segments.len() < guard.segments.capacity();
-        if !has_room {
+        let mut guard = self.write_shard(shard_of(head.segment));
+        if !guard.has_room(columns, blocks) {
             guard.compact();
         }
-        let Some(pin_slot) = guard.free_pins.pop() else {
-            return false;
-        };
-        if guard.columns.len() + columns.len() > guard.columns.capacity()
-            || guard.blocks.len() + blocks.len() > guard.blocks.capacity()
-        {
-            guard.free_pins.push(pin_slot);
+        if !guard.has_room(columns, blocks) {
             return false;
         }
+        let Some(slot) = guard.free_slots.pop() else {
+            return false;
+        };
 
         let column_extent = Extent {
             start: guard.columns.len() as u32,
@@ -158,41 +245,52 @@ impl<File: Clone> SegmentTable<File> {
             length: blocks.len() as u32,
         };
         guard.blocks.extend_from_slice(blocks);
-        guard.segments.push(TableEntry {
+        guard.segments[slot as usize] = Some(TableEntry {
             number: head.segment,
-            file: Some(file),
+            file,
             head: *head,
             columns: column_extent,
             blocks: block_extent,
-            pin_slot,
         });
+        guard.map.insert(head.segment, slot);
         true
     }
 
     /// Hold a segment open for a read, or return nothing when it has left the table
-    pub fn pin(&self, number: SegmentNumber) -> Option<PinnedSegment<File>> {
+    pub fn pin(&self, number: SegmentNumber) -> Option<SegmentPin<'_, File>> {
         let shard = shard_of(number);
         let guard = self.read_shard(shard);
-        let entry = guard.find(number)?;
-        let file = entry.file.clone()?;
-        self.pins[shard][entry.pin_slot].fetch_add(1, Ordering::AcqRel);
-        Some(PinnedSegment {
-            file,
+        let slot = guard.map.get(number)?;
+        let entry = guard.segments[slot as usize].as_ref()?;
+        let pin = &self.pins[shard][slot as usize];
+        pin.fetch_add(1, Ordering::AcqRel);
+        Some(SegmentPin {
+            file: entry.file.clone(),
             head: entry.head,
-            pin_slot: entry.pin_slot,
-            shard,
+            pin,
         })
     }
 
-    /// Let go of a pinned segment
-    pub fn unpin(&self, pinned: &PinnedSegment<File>) {
-        self.pins[pinned.shard][pinned.pin_slot].fetch_sub(1, Ordering::AcqRel);
+    /// Take a segment out so no new read can pin it
+    pub fn retire(&self, number: SegmentNumber) -> Option<RetiredSegment<'_, File>> {
+        let shard = shard_of(number);
+        let mut guard = self.write_shard(shard);
+        let slot = guard.map.get(number)?;
+        let entry = guard.segments[slot as usize].take()?;
+        guard.map.remove(number);
+        guard.free_slots.push(slot);
+        Some(RetiredSegment {
+            file: entry.file,
+            head: entry.head,
+            pin: &self.pins[shard][slot as usize],
+        })
     }
 
     /// Copy out the block lines that can hold a key, from a block onward
     pub fn block_window(&self, number: SegmentNumber, column: ColumnId, key: &[u8], skip: usize) -> Option<BlockWindow> {
         let guard = self.read_shard(shard_of(number));
-        let entry = guard.find(number)?;
+        let slot = guard.map.get(number)?;
+        let entry = guard.segments[slot as usize].as_ref()?;
         let column_tail = guard.column_of(entry, column)?;
         let first = entry.blocks.start as usize + column_tail.first_block as usize;
         let lines = &guard.blocks[first..first + column_tail.block_count.0 as usize];
@@ -227,9 +325,10 @@ impl<File: Clone> SegmentTable<File> {
 }
 
 impl<File> TableShard<File> {
-    /// Find a segment
-    pub fn find(&self, number: SegmentNumber) -> Option<&TableEntry<File>> {
-        self.segments.iter().find(|entry| entry.number == number)
+    /// Check a segment's tail and block lines fit the pools
+    pub fn has_room(&self, columns: &[ColumnTail], blocks: &[BlockEntry]) -> bool {
+        self.columns.len() + columns.len() <= self.columns.capacity()
+            && self.blocks.len() + blocks.len() <= self.blocks.capacity()
     }
 
     /// Find a segment's tail of one column
@@ -239,25 +338,52 @@ impl<File> TableShard<File> {
         self.columns[start..end].iter().find(|tail| tail.column == column)
     }
 
-    /// Close the holes retired segments left in the pools
+    /// Close the holes retired segments left in the pools, moving runs in pool order so none lands on another
     pub fn compact(&mut self) {
         let mut column_end = 0;
-        let mut block_end = 0;
-        for index in 0..self.segments.len() {
-            let columns = self.segments[index].columns;
-            let blocks = self.segments[index].blocks;
-            let column_range = columns.start as usize..(columns.start + columns.length) as usize;
-            self.columns.copy_within(column_range, column_end);
-            let block_range = blocks.start as usize..(blocks.start + blocks.length) as usize;
-            self.blocks.copy_within(block_range, block_end);
-
-            self.segments[index].columns.start = column_end as u32;
-            self.segments[index].blocks.start = block_end as u32;
-            column_end += columns.length as usize;
-            block_end += blocks.length as usize;
+        let mut moved_columns = 0;
+        while let Some(index) = self.next_run(moved_columns, |entry| entry.columns) {
+            let Some(entry) = &mut self.segments[index] else {
+                break;
+            };
+            let run = entry.columns;
+            entry.columns.start = column_end as u32;
+            let range = run.start as usize..(run.start + run.length) as usize;
+            self.columns.copy_within(range, column_end);
+            column_end += run.length as usize;
+            moved_columns = run.start + run.length.max(1);
         }
         self.columns.truncate(column_end);
+
+        let mut block_end = 0;
+        let mut moved_blocks = 0;
+        while let Some(index) = self.next_run(moved_blocks, |entry| entry.blocks) {
+            let Some(entry) = &mut self.segments[index] else {
+                break;
+            };
+            let run = entry.blocks;
+            entry.blocks.start = block_end as u32;
+            let range = run.start as usize..(run.start + run.length) as usize;
+            self.blocks.copy_within(range, block_end);
+            block_end += run.length as usize;
+            moved_blocks = run.start + run.length.max(1);
+        }
         self.blocks.truncate(block_end);
+    }
+
+    /// Find the segment whose run starts lowest at or past a pool position
+    pub fn next_run(&self, from: u32, run_of: fn(&TableEntry<File>) -> Extent) -> Option<usize> {
+        let mut best: Option<(u32, usize)> = None;
+        for (index, slot) in self.segments.iter().enumerate() {
+            let Some(entry) = slot else {
+                continue;
+            };
+            let start = run_of(entry).start;
+            if start >= from && best.is_none_or(|(lowest, _index)| start < lowest) {
+                best = Some((start, index));
+            }
+        }
+        best.map(|(_start, index)| index)
     }
 }
 
@@ -273,5 +399,113 @@ pub fn filter_end<File>(entry: &TableEntry<File>, column: &ColumnTail, blocks: &
 
 /// Pick a segment's shard
 pub fn shard_of(number: SegmentNumber) -> usize {
-    (number.0 % TABLE_SHARDS as u64) as usize
+    (number.0.wrapping_mul(NUMBER_MIX) >> SHARD_SHIFT) as usize
+}
+
+/// Pick a number's first place in a map
+pub fn home_of(number: SegmentNumber, mask: usize) -> usize {
+    (number.0.wrapping_mul(NUMBER_MIX) >> 32) as usize & mask
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NUMBERS: u64 = 500;
+
+    fn table_with(segments_per_shard: usize) -> SegmentTable<u32> {
+        SegmentTable::new(&TableSizing {
+            segments_per_shard,
+            columns_per_shard: segments_per_shard,
+            blocks_per_shard: segments_per_shard * 2,
+        })
+    }
+
+    fn line(offset: u32) -> BlockEntry {
+        BlockEntry {
+            block_offset: offset,
+            ..BlockEntry::default()
+        }
+    }
+
+    // closing the holes keeps each segment on its own lines, whatever order slots were taken in
+    #[test]
+    fn pool_compact() {
+        let mut shard = TableShard {
+            segments: vec![None, None, None],
+            map: NumberMap::new(3),
+            free_slots: Vec::new(),
+            columns: Vec::new(),
+            blocks: vec![line(10), line(20), line(30), line(40)],
+        };
+        let entry = |number: u64, start: u32, length: u32| TableEntry {
+            number: SegmentNumber(number),
+            file: 0_u32,
+            head: TailHead::default(),
+            columns: Extent::default(),
+            blocks: Extent { start, length },
+        };
+        // the slots run against pool order, and the run at 1 has retired
+        shard.segments[0] = Some(entry(1, 3, 1));
+        shard.segments[2] = Some(entry(2, 0, 1));
+        shard.segments[1] = Some(entry(3, 2, 1));
+
+        shard.compact();
+
+        let lines_of = |slot: usize| {
+            let run = shard.segments[slot].as_ref().expect("segment").blocks;
+            shard.blocks[run.start as usize].block_offset
+        };
+        assert_eq!(lines_of(0), 40);
+        assert_eq!(lines_of(1), 30);
+        assert_eq!(lines_of(2), 10);
+        assert_eq!(shard.blocks.len(), 3);
+    }
+
+    // numbers that end alike still spread across the shards
+    #[test]
+    fn shard_spread() {
+        let mut seen = [false; TABLE_SHARDS];
+        for batch in 1..256 {
+            seen[shard_of(SegmentNumber(batch * 1_024 + 1))] = true;
+        }
+
+        assert!(seen.iter().filter(|hit| **hit).count() > TABLE_SHARDS / 2);
+    }
+
+    // a table with no room refuses a segment
+    #[test]
+    fn table_full() {
+        let table = table_with(1);
+        let head = |number: u64| TailHead {
+            segment: SegmentNumber(number),
+            ..TailHead::default()
+        };
+        let same_shard = |number: u64| shard_of(SegmentNumber(number)) == shard_of(SegmentNumber(1));
+
+        assert!(table.install(1, &head(1), &[], &[]));
+        let mut other = 2;
+        while !same_shard(other) {
+            other += 1;
+        }
+        assert!(!table.install(2, &head(other), &[], &[]));
+    }
+
+    // numbers go in, read back and come out with every other number still found
+    #[test]
+    fn number_map() {
+        let mut map = NumberMap::new(NUMBERS as usize);
+        for number in 0..NUMBERS {
+            map.insert(SegmentNumber(number * 16), number as u32);
+        }
+
+        for number in (0..NUMBERS).step_by(3) {
+            map.remove(SegmentNumber(number * 16));
+        }
+
+        for number in 0..NUMBERS {
+            let expected = if number.is_multiple_of(3) { None } else { Some(number as u32) };
+            assert_eq!(map.get(SegmentNumber(number * 16)), expected);
+        }
+    }
 }

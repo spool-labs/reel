@@ -189,10 +189,24 @@ impl SpotIndex {
         word.fetch_and(!(1 << (index % CLOCK_WORD_BITS)), Ordering::Relaxed);
     }
 
+    /// Fill a slot from a read, unless a seal has started handing rows over since the read began
+    pub fn insert_from_read(&self, hash: KeyHash, location: &SpotLocation, is_current: impl Fn() -> bool) {
+        let shard = shard_of(hash);
+        let mut guard = self.write_shard(shard);
+        if is_current() {
+            self.store(shard, &mut guard, hash, location);
+        }
+    }
+
     /// Point a key at a new location, taking the slot of a cold key when its bucket is full
     pub fn insert(&self, hash: KeyHash, location: &SpotLocation) {
         let shard = shard_of(hash);
         let mut guard = self.write_shard(shard);
+        self.store(shard, &mut guard, hash, location);
+    }
+
+    /// Write a location into a key's slot under the shard's lock
+    pub fn store(&self, shard: usize, guard: &mut SpotShard, hash: KeyHash, location: &SpotLocation) {
         let found = guard.find(hash);
 
         // a slot keeps 32 bits of the number, and an older location must never stay behind
@@ -205,7 +219,7 @@ impl SpotIndex {
 
         let index = match found {
             Some(index) => index,
-            None => self.pick_slot(shard, &guard, hash),
+            None => self.pick_slot(shard, guard, hash),
         };
         guard.slots[index] = SpotSlot {
             tag: tag_of(hash),

@@ -12,7 +12,7 @@ pub const TAIL_MAGIC: u32 = 0x5245_4C54;
 /// Bytes at the very end: the tail's length, the magic and the checksum
 pub const TRAILER_BYTES: usize = 16;
 /// Bytes of the fixed part of a tail
-pub const TAIL_FIXED_BYTES: usize = 84;
+pub const TAIL_FIXED_BYTES: usize = 92;
 /// Spare bytes in the fixed part of a tail
 pub const TAIL_PADDING_BYTES: usize = 4;
 /// Bytes of one column's part of a tail
@@ -67,6 +67,7 @@ pub struct TailHead {
     pub places: PlaceRange,
     pub place_base: WritePlace,
     pub index_sum: Checksum,
+    pub ranges_sum: Checksum,
     pub column_count: u32,
 }
 
@@ -145,6 +146,7 @@ impl TailHead {
         out.put(&self.places.highest.0.to_le_bytes());
         out.put(&self.place_base.0.to_le_bytes());
         out.put(&self.index_sum.0.to_le_bytes());
+        out.put(&self.ranges_sum.0.to_le_bytes());
         out.put(&self.column_count.to_le_bytes());
         out.put(&[0; TAIL_PADDING_BYTES]);
     }
@@ -164,6 +166,7 @@ impl TailHead {
             },
             place_base: WritePlace(input.word()?),
             index_sum: Checksum(input.word()?),
+            ranges_sum: Checksum(input.word()?),
             column_count: input.half()?,
         };
         input.take(TAIL_PADDING_BYTES)?;
@@ -257,6 +260,7 @@ mod tests {
             },
             place_base: WritePlace(3),
             index_sum: Checksum(8),
+            ranges_sum: Checksum(9),
             column_count: 2,
         }
     }

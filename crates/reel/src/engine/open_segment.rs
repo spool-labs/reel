@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use reel_api::units::{ByteCount, FileOffset, RootId, RowCount};
+use reel_api::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
 
 use crate::index::open_slots::OpenSlot;
 use crate::rows::row_group::RowGroupBuffer;
@@ -36,6 +36,7 @@ pub struct OpenSegment<File> {
     pub write_end: FileOffset,
     pub row_count: RowCount,
     pub in_flight: u32,
+    pub lowest_place: WritePlace,
 }
 
 /// The rows of a segment waiting to reach the kernel

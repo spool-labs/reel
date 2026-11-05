@@ -31,6 +31,7 @@ pub struct ColumnStart<'key> {
 /// What a finished footer adds up to
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FooterTotals {
+    pub head: TailHead,
     pub file_length: ByteCount,
     pub block_count: BlockCount,
     pub row_count: RowCount,
@@ -244,6 +245,7 @@ impl FooterWriter {
             places: self.places,
             place_base: self.place_base,
             index_sum,
+            ranges_sum: checksum(ranges),
             column_count: self.columns.len() as u32,
         };
         let total = self.write_tail(&head, record_key);
@@ -253,6 +255,7 @@ impl FooterWriter {
         file.truncate(file_length)?;
         file.sync()?;
         Ok(FooterTotals {
+            head,
             file_length,
             block_count: head.block_count,
             row_count: self.row_count,

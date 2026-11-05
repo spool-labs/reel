@@ -137,6 +137,12 @@ impl WriteOrder {
         }
     }
 
+    /// Move the order past the highest place an open found
+    pub fn resume_after(&self, last_used: WritePlace) {
+        hold(&self.ring).next_place = WritePlace(last_used.0 + 1);
+        self.mark.store(last_used.0, Ordering::Release);
+    }
+
     /// Read the next place a claim would take
     pub fn next_place(&self) -> WritePlace {
         hold(&self.ring).next_place

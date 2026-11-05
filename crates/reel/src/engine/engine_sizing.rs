@@ -31,8 +31,12 @@ pub const SEAL_ROWS_EIGHTHS: u64 = 5;
 pub const LZ4_STORED_LIMIT: ByteCount = ByteCount(64 * 1024 * 1024);
 /// Bytes of one row group buffer
 pub const GROUP_BYTES: ByteCount = ByteCount(256 * 1024);
-/// The share of a full budget one compress buffer can take, as a divisor
-pub const COMPRESS_DIVISOR: u64 = 8;
+/// A store with an lz4 column needs at least this budget, so its compress pool fits inside
+pub const LEAST_LZ4_BUDGET: ByteCount = ByteCount(2 * LZ4_STORED_LIMIT.0);
+/// The share of the block cache filters get, in quarters, since every get probes them
+pub const FILTER_CACHE_QUARTERS: u64 = 3;
+/// Bytes of a filter cache slot, which holds the filter of a full block of typical rows
+pub const FILTER_SLOT_BYTES: usize = 4 * 1024;
 /// Read buffers a store keeps
 pub const READ_BUFFERS: usize = 8;
 /// Write buffers a store keeps
@@ -78,7 +82,7 @@ impl EngineSizing {
             },
             spot_share: ByteCount(budget.0 / SPOT_DIVISOR),
             cache_share: ByteCount(budget.0 / BLOCK_CACHE_DIVISOR),
-            lz4_stored_limit: ByteCount(LZ4_STORED_LIMIT.0.min(budget.0 / COMPRESS_DIVISOR)),
+            lz4_stored_limit: LZ4_STORED_LIMIT,
         }
     }
 }

@@ -7,11 +7,34 @@ use reel_api::units::{ByteCount, FileOffset, WritePlace};
 use crate::index::key_hash::KeyHash;
 use crate::io::IoFile;
 use crate::record::record_check::{Checksum, RecordKey, checksum};
+use crate::segment::block_cache::{BlockCache, BlockKey};
 use crate::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry, KeyPrefix};
 use crate::segment::block_filter::{may_contain, open_filter};
 use crate::segment::footer_writer::fold_sum;
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
-use crate::segment::segment_tail::{ColumnTail, MAX_TAIL_BYTES, TailHead, TailReader, find_tail};
+use crate::segment::segment_table::BlockWindow;
+use crate::segment::segment_tail::{ColumnTail, MAX_TAIL_BYTES, SegmentNumber, TailHead, TailReader, find_tail};
+
+/// Segments one page of a directory search holds
+pub const CANDIDATE_PAGE: usize = 64;
+
+/// What a filter says about one key
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FilterAnswer {
+    /// The block can't hold the key
+    No,
+    /// The block may hold the key
+    Maybe,
+    /// The filter failed its check
+    Damaged,
+}
+
+impl FilterAnswer {
+    /// Turn a filter's bit into an answer
+    pub fn of(may_hold: bool) -> Self {
+        if may_hold { Self::Maybe } else { Self::No }
+    }
+}
 
 /// What a footer says about one key
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +64,21 @@ pub struct FooterQuery<'key> {
     pub read_point: WritePlace,
 }
 
+/// The caches a footer read goes through
+#[derive(Clone, Copy, Debug)]
+pub struct FooterCaches<'cache> {
+    pub filters: &'cache BlockCache,
+    pub rows: &'cache BlockCache,
+}
+
+/// What a read of one window of block lines needs
+#[derive(Clone, Copy, Debug)]
+pub struct WindowRead<'window> {
+    pub segment: SegmentNumber,
+    pub window: &'window BlockWindow,
+    pub place_base: WritePlace,
+}
+
 /// The buffers one footer read borrows from the pool
 #[derive(Debug)]
 pub struct FooterReader {
@@ -48,6 +86,7 @@ pub struct FooterReader {
     block: Vec<u8>,
     filter: Vec<u8>,
     key: Vec<u8>,
+    pub candidates: Vec<SegmentNumber>,
 }
 
 impl FooterReader {
@@ -58,6 +97,7 @@ impl FooterReader {
             block: vec![0; ROW_BLOCK_BYTES],
             filter: vec![0; ROW_BLOCK_BYTES],
             key: Vec::with_capacity(ROW_BLOCK_BYTES),
+            candidates: Vec::with_capacity(CANDIDATE_PAGE),
         }
     }
 
@@ -157,6 +197,92 @@ impl FooterReader {
         Ok(FooterAnswer::Absent)
     }
 
+    /// Search one window of block lines, through the caches
+    pub fn lookup_window<File: IoFile>(
+        &mut self,
+        file: &File,
+        read: &WindowRead,
+        caches: &FooterCaches,
+        query: &FooterQuery,
+    ) -> Result<FooterAnswer> {
+        for position in 0..read.window.count {
+            let entry = read.window.entries[position];
+            let filter_end = match read.window.entries.get(position + 1) {
+                Some(next) if position + 1 < read.window.count => u64::from(next.block_offset),
+                _last_line => read.window.filter_end_of_last,
+            };
+            match self.probe_filter(file, read.segment, &entry, filter_end, caches, query)? {
+                FilterAnswer::Damaged => return Ok(FooterAnswer::Damaged),
+                FilterAnswer::No => continue,
+                FilterAnswer::Maybe => {},
+            }
+
+            match self.search_cached(file, read, &entry, caches, query)? {
+                FooterAnswer::Absent => {},
+                answer => return Ok(answer),
+            }
+        }
+        Ok(FooterAnswer::Absent)
+    }
+
+    /// Ask a block's filter, reading and checking it once when the cache lacks it
+    pub fn probe_filter<File: IoFile>(
+        &mut self,
+        file: &File,
+        segment: SegmentNumber,
+        entry: &BlockEntry,
+        filter_end: u64,
+        caches: &FooterCaches,
+        query: &FooterQuery,
+    ) -> Result<FilterAnswer> {
+        let key = BlockKey {
+            segment,
+            offset: entry.filter_offset,
+        };
+        let hash = query.hash;
+        if let Some(may_hold) = caches.filters.with(key, |bits| may_contain(bits, hash)) {
+            return Ok(FilterAnswer::of(may_hold));
+        }
+
+        let length = (filter_end - u64::from(entry.filter_offset)) as usize;
+        if length > self.filter.len() {
+            return Ok(FilterAnswer::Damaged);
+        }
+        let at = FileOffset(u64::from(entry.filter_offset));
+        file.read_exact_at(at, &mut self.filter[..length])?;
+        let Some(bits) = open_filter(&self.filter[..length]) else {
+            return Ok(FilterAnswer::Damaged);
+        };
+        caches.filters.insert(key, bits);
+        Ok(FilterAnswer::of(may_contain(bits, hash)))
+    }
+
+    /// Search a row block, reading and checking it once when the cache lacks it
+    pub fn search_cached<File: IoFile>(
+        &mut self,
+        file: &File,
+        read: &WindowRead,
+        entry: &BlockEntry,
+        caches: &FooterCaches,
+        query: &FooterQuery,
+    ) -> Result<FooterAnswer> {
+        let key = BlockKey {
+            segment: read.segment,
+            offset: entry.block_offset,
+        };
+        let buffer = &mut self.key;
+        let cached = caches.rows.with(key, |block| search_rows(block, read.place_base, query, buffer));
+        if let Some(answer) = cached {
+            return Ok(answer);
+        }
+
+        let answer = self.search_block(file, entry, read.place_base, query)?;
+        if answer != FooterAnswer::Damaged {
+            caches.rows.insert(key, &self.block[..entry.block_length().0 as usize]);
+        }
+        Ok(answer)
+    }
+
     /// Read one row block and find the key's newest row at a read point
     pub fn search_block<File: IoFile>(
         &mut self,
@@ -174,28 +300,41 @@ impl FooterReader {
         let Some(mut walk) = RowBlockWalk::open(&self.block[..length], place_base) else {
             return Ok(FooterAnswer::Damaged);
         };
-        let Some(mut row) = walk.seek(query.key, &mut self.key) else {
-            return Ok(FooterAnswer::Absent);
-        };
-
-        loop {
-            if self.key != query.key {
-                return Ok(FooterAnswer::Absent);
-            }
-            if row.place <= query.read_point {
-                return Ok(FooterAnswer::Found(row));
-            }
-            match walk.next_row(&mut self.key) {
-                Some(next) => row = next,
-                None => return Ok(FooterAnswer::Absent),
-            }
-        }
+        Ok(newest_at(&mut walk, query, &mut self.key))
     }
 }
 
 impl Default for FooterReader {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Find a key's newest row at a read point in a block already checked
+pub fn search_rows(block: &[u8], place_base: WritePlace, query: &FooterQuery, key: &mut Vec<u8>) -> FooterAnswer {
+    let Some(mut walk) = RowBlockWalk::open_checked(block, place_base) else {
+        return FooterAnswer::Damaged;
+    };
+    newest_at(&mut walk, query, key)
+}
+
+/// Walk from a seek to the key's newest row at a read point
+pub fn newest_at(walk: &mut RowBlockWalk, query: &FooterQuery, key: &mut Vec<u8>) -> FooterAnswer {
+    let Some(mut row) = walk.seek(query.key, key) else {
+        return FooterAnswer::Absent;
+    };
+
+    loop {
+        if key.as_slice() != query.key {
+            return FooterAnswer::Absent;
+        }
+        if row.place <= query.read_point {
+            return FooterAnswer::Found(row);
+        }
+        match walk.next_row(key) {
+            Some(next) => row = next,
+            None => return FooterAnswer::Absent,
+        }
     }
 }
 

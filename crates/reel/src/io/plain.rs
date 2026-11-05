@@ -1,6 +1,8 @@
 //! The plain-syscall backend, used on every platform
 
+use std::collections::hash_map::RandomState;
 use std::fs::{self, File, OpenOptions, TryLockError};
+use std::hash::{BuildHasher, Hasher};
 use std::io::{Error, ErrorKind, Result};
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
@@ -156,6 +158,10 @@ impl Io for PlainIo {
         let elapsed = self.origin.elapsed();
         let nanoseconds = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         Nanoseconds(nanoseconds)
+    }
+
+    fn random_word(&self) -> u64 {
+        RandomState::new().build_hasher().finish()
     }
 
     fn pause(&self) {

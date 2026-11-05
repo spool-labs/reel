@@ -84,6 +84,28 @@ impl WriteIndex {
         is_clean
     }
 
+    /// Find a slot's highest key in a column, in any shard
+    pub fn highest_key(&self, slot: OpenSlot, column: ColumnId, highest: &mut Vec<u8>) {
+        highest.clear();
+        for shard in 0..SHARD_COUNT {
+            let guard = self.read_shard(shard);
+            let Some(entry) = guard.last_of_column(slot, column) else {
+                continue;
+            };
+            let key = guard.slab.key(entry);
+            if key > highest.as_slice() {
+                highest.clear();
+                highest.extend_from_slice(key);
+            }
+        }
+    }
+
+    /// Check a row is its key's newest, so a seal may hand it to the spot cache
+    pub fn is_newest_version(&self, column: ColumnId, key: &[u8], place: WritePlace) -> bool {
+        let hash = hash_key(column, key);
+        self.read_shard(shard_of(hash)).is_newest_version(hash, column, key, place)
+    }
+
     /// Find the key a walk reaches next in one shard
     pub fn next_key(
         &self,

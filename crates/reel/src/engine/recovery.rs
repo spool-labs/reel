@@ -336,7 +336,8 @@ pub fn sort_segment<Backend: Io>(
 
 /// Check a segment has a rows file, in a listing that comes sorted
 pub fn has_rows(listing: &RootListing, number: SegmentNumber) -> bool {
-    listing.files.binary_search(&rows_path(&listing.path, number)).is_ok()
+    let rows = rows_path(&listing.path, number);
+    listing.files.binary_search_by(|file| file.as_path().cmp(&rows)).is_ok()
 }
 
 /// Work out what one segment is from its tail, its index and its rows file

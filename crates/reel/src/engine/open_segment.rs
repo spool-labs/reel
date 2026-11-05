@@ -1,6 +1,9 @@
 //! One segment taking writes: its files, its claims and its waiting rows
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsStr;
+use std::ops::Deref;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 use reel_api::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
 
@@ -14,6 +17,10 @@ pub const NUMBER_DIGITS: usize = 16;
 pub const DATA_SUFFIX: &str = ".data";
 /// The end of a segment's rows file name
 pub const ROWS_SUFFIX: &str = ".rows";
+/// The longest path a segment file can have, with its root
+pub const MOST_PATH_BYTES: usize = 512;
+/// The digits of a segment number
+pub const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 /// What an open segment is doing
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,14 +82,54 @@ impl RowQueue {
     }
 }
 
+/// A segment file's path, built on the stack so a new segment or a seal allocates nothing
+#[derive(Clone, Copy, Debug)]
+pub struct SegmentPath {
+    bytes: [u8; MOST_PATH_BYTES],
+    length: usize,
+}
+
+impl Deref for SegmentPath {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        Path::new(OsStr::from_bytes(&self.bytes[..self.length]))
+    }
+}
+
+/// Check a root leaves room for a segment file's name, which open does once
+pub fn fits_a_segment_path(root: &Path) -> bool {
+    root.as_os_str().len() + 1 + NUMBER_DIGITS + DATA_SUFFIX.len() <= MOST_PATH_BYTES
+}
+
+/// Build a path from a root, a segment's number in hex and a suffix
+pub fn segment_path(root: &Path, number: SegmentNumber, suffix: &str) -> SegmentPath {
+    let mut path = SegmentPath {
+        bytes: [0; MOST_PATH_BYTES],
+        length: 0,
+    };
+    let root = root.as_os_str().as_bytes();
+    path.bytes[..root.len()].copy_from_slice(root);
+    path.bytes[root.len()] = b'/';
+    let digits_at = root.len() + 1;
+    for digit in 0..NUMBER_DIGITS {
+        let shift = 4 * (NUMBER_DIGITS - 1 - digit);
+        path.bytes[digits_at + digit] = HEX_DIGITS[((number.0 >> shift) & 0xF) as usize];
+    }
+    let suffix_at = digits_at + NUMBER_DIGITS;
+    path.bytes[suffix_at..suffix_at + suffix.len()].copy_from_slice(suffix.as_bytes());
+    path.length = suffix_at + suffix.len();
+    path
+}
+
 /// Build a segment's data file path
-pub fn data_path(root: &Path, number: SegmentNumber) -> PathBuf {
-    root.join(format!("{:0width$x}{DATA_SUFFIX}", number.0, width = NUMBER_DIGITS))
+pub fn data_path(root: &Path, number: SegmentNumber) -> SegmentPath {
+    segment_path(root, number, DATA_SUFFIX)
 }
 
 /// Build a segment's rows file path
-pub fn rows_path(root: &Path, number: SegmentNumber) -> PathBuf {
-    root.join(format!("{:0width$x}{ROWS_SUFFIX}", number.0, width = NUMBER_DIGITS))
+pub fn rows_path(root: &Path, number: SegmentNumber) -> SegmentPath {
+    segment_path(root, number, ROWS_SUFFIX)
 }
 
 /// Read a segment number from a file name, or nothing when it isn't one of a segment's files

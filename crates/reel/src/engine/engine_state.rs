@@ -103,11 +103,14 @@ impl<File> Drop for SlotPin<'_, File> {
 impl<File: Clone> SlotFile<File> {
     /// Start an empty slot
     pub fn new() -> Self {
-        Self {
+        let slot = Self {
             data: RwLock::new(None),
             leaving_rows: Mutex::new(None),
             pins: AtomicU32::new(0),
-        }
+        };
+        // some platforms set a lock up at its first use, and that's a job for open
+        drop(hold(&slot.leaving_rows));
+        slot
     }
 
     /// Hold a segment's file for a read, or return nothing when the slot has moved on from it

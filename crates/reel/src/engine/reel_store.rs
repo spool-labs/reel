@@ -16,7 +16,7 @@ use crate::engine::engine_sizing::{
     EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, READ_BUFFERS, WRITE_BUFFERS,
 };
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
-use crate::engine::open_segment::RowQueue;
+use crate::engine::open_segment::{RowQueue, fits_a_segment_path};
 use crate::engine::read_path::RecordWant;
 use crate::engine::recovery::{
     RootScan, SummaryFound, list_roots, read_summaries, recover_segments, save_cleared_spans, scan_roots, walk_open_rows,
@@ -352,6 +352,15 @@ pub fn bring_up<Backend: Io>(
 
 /// Refuse a config that can't work
 pub fn check_config(config: &StoreConfig) -> Result<(), StoreError> {
+    for volume in &config.volumes {
+        if !volume.roots.iter().all(|root| fits_a_segment_path(root)) {
+            return Err(StoreError::Io {
+                action: "checking a root",
+                source: Error::other("the path leaves no room for a segment file"),
+            });
+        }
+    }
+
     let mut has_lz4 = false;
     let mut seen = [false; MAX_COLUMNS];
     for column in &config.columns {

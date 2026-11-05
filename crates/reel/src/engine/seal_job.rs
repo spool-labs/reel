@@ -89,6 +89,7 @@ pub struct SealJob<Backend: Io> {
     pub column: Option<ColumnId>,
     pub highest: Vec<u8>,
     pub ranges: Vec<u8>,
+    pub has_unsaved_damage: bool,
     pub range_end: Vec<u8>,
     pub totals: Option<FooterTotals>,
     pub last_key: Vec<u8>,
@@ -112,6 +113,7 @@ impl<Backend: Io> SealJob<Backend> {
             column: None,
             highest: touched_capacity(MAX_KEY_BYTES as usize, 0),
             ranges: touched_capacity(ranges_room, 0),
+            has_unsaved_damage: false,
             range_end: touched_capacity(MAX_KEY_BYTES as usize, 0),
             totals: None,
             last_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
@@ -221,6 +223,7 @@ impl<Backend: Io> SealJob<Backend> {
                 };
                 if !is_whole {
                     self.state.damage_whole(self.volume, target.number);
+                    self.has_unsaved_damage = true;
                     self.walk.advance(&self.state.index, shard);
                     continue;
                 }
@@ -251,6 +254,12 @@ impl<Backend: Io> SealJob<Backend> {
     /// Finish the footer, which syncs it, then discard the rows file
     pub fn finish_footer(&mut self, target: &SealTarget<Backend::File>) -> Result<()> {
         let state = Arc::clone(&self.state);
+        // the tail ends the segment's rows, so what they can no longer say has to be on disk first, and a failed save
+        // holds the seal here
+        if self.has_unsaved_damage {
+            state.save_summary(&state.volumes[self.volume])?;
+            self.has_unsaved_damage = false;
+        }
         let totals = self.writer.finish(&target.data, target.number, target.data_end, &self.ranges, state.record_key)?;
         self.totals = Some(totals);
         self.phase = SealPhase::Installing;

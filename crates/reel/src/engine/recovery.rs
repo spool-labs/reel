@@ -1032,9 +1032,8 @@ pub fn copy_row<Backend: Io>(
                         segment: copied.segment,
                     });
                     if !has_room {
-                        for range in whole_columns(state, volume, copied.segment, state.order.mark()) {
-                            target.damage.add(&range);
-                        }
+                        state.damage_whole(volume, copied.segment);
+                        state.save_summary(target)?;
                     }
                 }
                 claim.finish();
@@ -1798,16 +1797,32 @@ pub fn save_cleared_spans<Backend: Io>(state: &EngineState<Backend>, volume: &Vo
 }
 
 impl<Backend: Io> EngineState<Backend> {
-    /// Damage a segment's columns whole at the counter, when a seal finds a cover it can't read
+    /// Damage a segment's columns whole at the counter, when a seal finds a cover it can't read. The row it leaves is an
+    /// open segment's, which open carries over to the sealed segment, and the seal saves it before its tail is durable
     pub fn damage_whole(&self, volume: usize, segment: SegmentNumber) {
+        let counter = self.order.mark();
+        let ranges = whole_columns(self, volume, segment, counter);
         let target = &self.volumes[volume];
-        for range in whole_columns(self, volume, segment, self.order.mark()) {
-            target.damage.add(&range);
+        for range in &ranges {
+            target.damage.add(range);
         }
         let mut damaged = hold(&target.damaged);
         if !damaged.contains(&segment) {
             damaged.push(segment);
             self.damaged_segments.fetch_add(1, Ordering::AcqRel);
         }
+        drop(damaged);
+
+        let facts = SegmentFacts {
+            segment,
+            is_damaged: true,
+            damage_place: counter,
+            ..SegmentFacts::default()
+        };
+        let mut rows = hold(&target.summary);
+        rows.remove(segment);
+        let dropped = rows.push_kept(&facts, [].into_iter(), ranges.iter().map(span_of));
+        drop(rows);
+        self.note_dropped_rows(dropped);
     }
 }

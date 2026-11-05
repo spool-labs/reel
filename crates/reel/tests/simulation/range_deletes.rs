@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
-use reel::engine::open_segment::rows_path;
+use reel::engine::open_segment::{data_path, rows_path};
 use reel::engine::reel_store::ReelStore;
 use reel::engine::write_path::ClaimRequest;
 use reel::guard::hold;
@@ -33,6 +33,8 @@ const LARGE_BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
 const REPEATS: u64 = 5_000;
 const CENTRE: u64 = 500_000;
 const SPARE_STEPS: u64 = 10_000;
+const ROT_CRASH_POINTS: u64 = 40;
+const ROT_SEAL_STEPS: u64 = 400;
 const BATCH_COVERS: u64 = 100;
 const COVER_SURPLUS: u64 = 10;
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
@@ -796,5 +798,57 @@ fn spare_crash() {
             assert_eq!(read(&store, COLUMN, &key_of(number)), Some(b"older".to_vec()));
         }
         store.close().expect("close");
+    }
+}
+
+// a cover that rots before its seal can't go quietly: at every crash point the older value stays hidden or the read
+// refuses
+#[test]
+fn rotted_cover_seal() {
+    for crash_at in 0..ROT_CRASH_POINTS {
+        for is_power_cut in [false, true] {
+            let io = SimulatedIo::new(Seed(31));
+            let store = open(&io);
+            store.put(COLUMN, b"key", b"older").expect("put");
+            store.flush().expect("flush");
+            seal(&store, &io);
+            store.put(COLUMN, b"aaa", b"beside").expect("put");
+            store.delete_range(COLUMN, b"key", b"kez").expect("delete");
+            store.flush().expect("flush");
+            // rot under a mark no power cut can lose: without one a synced last group reads as a torn end, which the
+            // spec accepts
+            store.flush().expect("flush");
+
+            let volume = &store.state.volumes[0];
+            let claims = hold(&volume.claims);
+            let segment = claims.open.iter().find(|segment| segment.cover_rows > 0).expect("a cover");
+            let path = data_path(&volume.roots[segment.root.0 as usize], segment.number).to_path_buf();
+            let end = FileOffset(segment.write_end.0 - 1);
+            drop(claims);
+            io.rot(&path, end, BitMask(1)).expect("rot");
+
+            store.seal_now();
+            io.arm_crash(OperationCount(crash_at));
+            for _step in 0..ROT_SEAL_STEPS {
+                if io.is_crashed() {
+                    break;
+                }
+                if io.step_any().is_none() {
+                    io.advance_clock(TICK);
+                }
+            }
+            if is_power_cut {
+                io.power_cut();
+            } else {
+                io.kill();
+            }
+            drop(store);
+
+            let store = open(&io);
+            let mut buf = Vec::new();
+            let found = store.get(COLUMN, b"key", &mut buf);
+            assert!(!matches!(found, Ok(true)), "crash at {crash_at} read {buf:?}");
+            store.close().expect("close");
+        }
     }
 }

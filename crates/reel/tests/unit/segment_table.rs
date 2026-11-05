@@ -103,3 +103,27 @@ fn number_map() {
         assert_eq!(map.get(SegmentNumber(number * 16)), expected);
     }
 }
+
+// a retired segment keeps its slot until it's given back, so a new segment's reads never count as its own
+#[test]
+fn retired_keeps_slot() {
+    let table = table_with(4);
+    let head = |number: u64| TailHead {
+        segment: SegmentNumber(number),
+        ..TailHead::default()
+    };
+    let mut other = 2;
+    while shard_of(SegmentNumber(other)) != shard_of(SegmentNumber(1)) {
+        other += 1;
+    }
+    assert!(table.install(1, &head(1), &[], &[]));
+    let retired = table.retire(SegmentNumber(1)).expect("retired");
+
+    assert!(table.install(2, &head(other), &[], &[]));
+    let pin = table.pin(SegmentNumber(other)).expect("a pin");
+    assert_eq!(table.retired_pins(&retired), 0);
+    drop(pin);
+
+    table.free_retired(&retired);
+    assert_eq!(table.read_shard(retired.shard).free_slots.len(), 3);
+}

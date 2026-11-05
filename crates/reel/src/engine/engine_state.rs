@@ -304,9 +304,11 @@ impl<Backend: Io> EngineState<Backend> {
         hold(&self.volumes[volume].summary).is_lookup_whole()
     }
 
-    /// Close a parked segment's file and remove it, unless a failed save means a row still lists it
+    /// Close a parked segment's file and remove it, unless a failed save means a row still lists it. A failed remove leaves
+    /// the file to the next open, which finds it with no row and walks it dead again
     pub fn clear_parked(&self, volume: &Volume<Backend>, parked: ParkedSegment<Backend::File>) -> Result<(), Error> {
         volume.segments_parked.fetch_sub(1, Ordering::AcqRel);
+        volume.table.free_retired(&parked.retired);
         self.io.close_file(parked.retired.file);
         if !parked.is_saved {
             return Ok(());

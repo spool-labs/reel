@@ -388,7 +388,6 @@ impl<File: Clone> SegmentTable<File> {
         let slot = guard.map.get(number)?;
         let entry = guard.segments[slot as usize].take()?;
         guard.map.remove(number);
-        guard.free_slots.push(slot);
         Some(RetiredSegment {
             file: entry.file,
             shard,
@@ -396,9 +395,14 @@ impl<File: Clone> SegmentTable<File> {
         })
     }
 
-    /// Count the reads still holding a retired segment. A new segment in its slot only makes this count longer
+    /// Count the reads still holding a retired segment, which keeps its slot until `free_retired`, so the count is its own
     pub fn retired_pins(&self, retired: &RetiredSegment<File>) -> u32 {
         self.pins[retired.shard][retired.slot as usize].load(Ordering::Acquire)
+    }
+
+    /// Give a retired segment's slot back, once no read holds it
+    pub fn free_retired(&self, retired: &RetiredSegment<File>) {
+        self.write_shard(retired.shard).free_slots.push(retired.slot);
     }
 
     /// Copy out the block lines that can hold a key, from a block onward

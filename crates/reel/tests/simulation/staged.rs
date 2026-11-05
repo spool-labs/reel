@@ -157,6 +157,7 @@ fn stage<'state>(state: &'state State, key: &[u8], value: Option<&[u8]>) -> Stag
     let request = ClaimRequest {
         bytes: ByteCount(length as u64),
         rows: RowCount(1),
+        is_alone: false,
     };
     let claim = state.claim(volume, &request).expect("claim");
     let record = value.map_or(Vec::new(), |value| encode(state, key, value, claim.first_place()));

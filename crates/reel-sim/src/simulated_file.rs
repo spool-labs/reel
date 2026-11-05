@@ -61,6 +61,12 @@ impl IoFile for SimulatedFile {
         let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         self.check(&mut disk, false)?;
+        if let Some(left) = disk.reads_before_failure {
+            disk.reads_before_failure = left.0.checked_sub(1).map(OperationCount);
+            if left.0 == 0 {
+                return Err(Error::from_raw_os_error(libc::EIO));
+            }
+        }
         if disk.failing_reads.0 > 0 {
             disk.failing_reads = OperationCount(disk.failing_reads.0 - 1);
             return Err(Error::other("simulated read failure from the process"));

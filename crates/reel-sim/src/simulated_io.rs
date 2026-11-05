@@ -117,6 +117,11 @@ impl SimulatedIo {
         hold(&self.disk).failing_writes = count;
     }
 
+    /// Fail one read after this many pass
+    pub fn fail_reads_after(&self, reads: OperationCount) {
+        hold(&self.disk).reads_before_failure = Some(reads);
+    }
+
     /// Fail one write after this many pass
     pub fn fail_writes_after(&self, writes: OperationCount) {
         hold(&self.disk).writes_before_failure = Some(writes);

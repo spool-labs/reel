@@ -9,7 +9,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::memory_report::MemoryReport;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, VolumeId, WritePlace};
+use reel_api::units::{ByteCount, Nanoseconds, VolumeId, WritePlace};
 use reel_api::write_batch::WriteBatch;
 
 use crate::config::{ColumnConfig, StoreConfig};
@@ -151,6 +151,11 @@ impl<Backend: Io> ReelStore<Backend> {
     pub fn put(&self, column: ColumnId, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.check_open()?;
         self.state.write_value(column, key, value)
+    }
+
+    /// Read the longest a long batch has held a writing turn
+    pub fn longest_turn(&self) -> Nanoseconds {
+        Nanoseconds(self.state.longest_turn.load(Ordering::Relaxed))
     }
 
     /// Apply a batch whole, in batch order, visible to every later read when this returns
@@ -756,6 +761,7 @@ pub fn build_state<Backend: Io>(
         large_encoders: Pool::new(large_encoders),
         batch_rows: Pool::new((0..WRITE_BUFFERS).map(|_buffer| RowGroupBuffer::new(GROUP_BYTES)).collect()),
         batch_lengths: Pool::new(vec![touched_filled(sizing.segment_rows.0 as usize, 0)]),
+        longest_turn: AtomicU64::new(0),
         record_readers: Pool::new(record_readers),
         footer_readers: Pool::new(footer_readers),
         superblock: Mutex::new(superblock),

@@ -27,6 +27,8 @@ pub const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 pub enum SegmentPhase {
     /// It takes new claims
     Taking,
+    /// One long batch has it, so no new claim lands rows behind that batch's writing turn
+    Alone,
     /// It takes no new claims, and seals once its writers land
     Sealing,
 }

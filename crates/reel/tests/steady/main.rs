@@ -29,7 +29,8 @@ const BUDGET: ByteCount = ByteCount(192 * 1024 * 1024);
 // set in the child that makes the damaged store, so the measured process runs one open
 const PREPARE_ROOT: &str = "REEL_STEADY_PREPARE";
 const KEYS: usize = 512;
-const LONG_ROWS: usize = 8_000;
+const LONG_ROWS: usize = 4_000;
+const LONG_VALUE: &[u8] = b"a value on each column of a long batch, a value on each column of a long batch";
 const SMALL_BYTES: usize = 100;
 const CHUNKED_BYTES: usize = 200_000;
 const ROUNDS: usize = 1_500;
@@ -208,7 +209,9 @@ fn open(root: &Path) -> Store {
 fn long_batch() -> WriteBatch {
     let mut batch = WriteBatch::new();
     for number in 0..LONG_ROWS {
-        batch.delete(META, format!("long-{number:06}").as_bytes());
+        let key = format!("long-{number:06}");
+        batch.put(META, key.as_bytes(), LONG_VALUE);
+        batch.put(BULK, key.as_bytes(), LONG_VALUE);
     }
     batch
 }

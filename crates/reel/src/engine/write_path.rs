@@ -34,6 +34,7 @@ pub const INDEX_WAIT: Nanoseconds = Nanoseconds(60_000_000_000);
 pub struct ClaimRequest {
     pub bytes: ByteCount,
     pub rows: RowCount,
+    pub is_alone: bool,
 }
 
 /// A value on its way to a record
@@ -107,6 +108,7 @@ impl<Backend: Io> EngineState<Backend> {
         let request = ClaimRequest {
             bytes: length,
             rows: RowCount(1),
+            is_alone: false,
         };
         loop {
             let claim = self.claim(volume, &request)?;
@@ -153,6 +155,7 @@ impl<Backend: Io> EngineState<Backend> {
         let request = ClaimRequest {
             bytes: ByteCount(0),
             rows: RowCount(1),
+            is_alone: false,
         };
         loop {
             let claim = self.claim(volume, &request)?;
@@ -298,6 +301,9 @@ impl<Backend: Io> EngineState<Backend> {
                 };
 
                 let segment = &mut claims.open[index];
+                if request.is_alone {
+                    segment.phase = SegmentPhase::Alone;
+                }
                 let offset = segment.write_end;
                 segment.write_end = FileOffset(offset.0 + request.bytes.0);
                 segment.row_count = RowCount(segment.row_count.0 + request.rows.0);
@@ -318,6 +324,7 @@ impl<Backend: Io> EngineState<Backend> {
                     offset,
                     ticket,
                     is_landed: false,
+                    is_alone: request.is_alone,
                 });
             }
 
@@ -612,6 +619,19 @@ impl<Backend: Io> EngineState<Backend> {
         outcome
     }
 
+    /// Send a slot's waiting rows unless its turn is out, so a long group holds back no other slot's rows
+    pub fn write_out_if_free(&self, slot: OpenSlot) -> Result<(), Error> {
+        let Some((pin, rows)) = self.pin_rows(slot) else {
+            return Ok(());
+        };
+        if !self.try_writing_turn(slot) {
+            return Ok(());
+        }
+        let outcome = self.send_in_turn(slot, &rows, None);
+        drop(pin);
+        outcome
+    }
+
     /// Pin an open slot and find its rows file, which a seal closes only once the pins are gone
     pub fn pin_rows(&self, slot: OpenSlot) -> Option<(SlotPin<'_, Backend::File>, Backend::File)> {
         for volume in &self.volumes {
@@ -626,24 +646,30 @@ impl<Backend: Io> EngineState<Backend> {
         None
     }
 
+    /// Take the slot's writing turn if it's free
+    pub fn try_writing_turn(&self, slot: OpenSlot) -> bool {
+        let mut queue = hold(&self.queues[slot.0 as usize]);
+        let is_free = !queue.is_writing;
+        queue.is_writing = true;
+        is_free
+    }
+
     /// Wait for the slot's writing turn, which keeps its groups in order
     pub fn take_writing_turn(&self, slot: OpenSlot) {
-        loop {
-            {
-                let mut queue = hold(&self.queues[slot.0 as usize]);
-                if !queue.is_writing {
-                    queue.is_writing = true;
-                    return;
-                }
-            }
+        while !self.try_writing_turn(slot) {
             self.io.pause();
         }
     }
 
     /// Take the slot's writing turn and send its rows, in a sync when given the data file
     pub fn write_out_turn(&self, slot: OpenSlot, rows: &Backend::File, data: Option<&Backend::File>) -> Result<(), Error> {
-        let index = slot.0 as usize;
         self.take_writing_turn(slot);
+        self.send_in_turn(slot, rows, data)
+    }
+
+    /// Send a slot's rows with its turn held, and give the turn back
+    pub fn send_in_turn(&self, slot: OpenSlot, rows: &Backend::File, data: Option<&Backend::File>) -> Result<(), Error> {
+        let index = slot.0 as usize;
 
         let mut outcome = self.send_group(slot, rows, data);
         if outcome.is_ok() && self.has_left_over_rows(slot) {
@@ -747,7 +773,9 @@ pub fn pick_segment<Backend: Io>(
         if segment.phase != SegmentPhase::Taking {
             continue;
         }
-        let fits = segment.write_end.0 + request.bytes.0 <= volume.segment_bytes.0.max(request.bytes.0);
+        let has_bytes = segment.write_end.0 + request.bytes.0 <= volume.segment_bytes.0.max(request.bytes.0);
+        let has_rows = segment.row_count.0 + request.rows.0 <= volume.segment_rows.0.max(request.rows.0);
+        let fits = has_bytes && has_rows;
         if !fits {
             continue;
         }

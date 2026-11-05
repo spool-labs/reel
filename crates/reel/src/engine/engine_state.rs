@@ -74,6 +74,7 @@ pub struct EngineState<Backend: Io> {
     pub large_encoders: Pool<RecordEncoder>,
     pub batch_rows: Pool<RowGroupBuffer>,
     pub batch_lengths: Pool<Vec<u32>>,
+    pub longest_turn: AtomicU64,
     pub record_readers: Pool<RecordReader>,
     pub footer_readers: Pool<FooterReader>,
     pub superblock: Mutex<Superblock>,

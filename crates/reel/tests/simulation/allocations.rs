@@ -23,7 +23,8 @@ const ROOT: &str = "/disk/allocations";
 const META: ColumnId = ColumnId(1);
 const BULK: ColumnId = ColumnId(2);
 const BUDGET: ByteCount = ByteCount(160 * 1024 * 1024);
-const LONG_ROWS: usize = 8_000;
+const LONG_ROWS: usize = 4_000;
+const LONG_VALUE: &[u8] = b"a value on each column of a long batch, a value on each column of a long batch";
 const KEYS: usize = 64;
 const CHUNKED_BYTES: usize = 200_000;
 const WARM_ROUNDS: usize = 8;
@@ -159,7 +160,9 @@ fn no_allocations() {
     large_batch.put(META, &keys[2], &small);
     let mut long_batch = WriteBatch::new();
     for number in 0..LONG_ROWS {
-        long_batch.delete(META, format!("long-{number:06}").as_bytes());
+        let key = format!("long-{number:06}");
+        long_batch.put(META, key.as_bytes(), LONG_VALUE);
+        long_batch.put(BULK, key.as_bytes(), LONG_VALUE);
     }
     let mut inputs = Inputs {
         keys,

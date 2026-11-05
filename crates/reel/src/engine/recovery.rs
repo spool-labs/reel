@@ -177,6 +177,7 @@ pub struct RecoveredRows {
     pub row_count: RowCount,
     pub lowest_place: WritePlace,
     pub highest_place: WritePlace,
+    pub lost_region: Option<(FileOffset, FileOffset)>,
 }
 
 impl<File> RootScan<File> {
@@ -454,6 +455,7 @@ impl<Backend: Io> EngineState<Backend> {
             row_count: RowCount(0),
             lowest_place: WritePlace(u64::MAX),
             highest_place: WritePlace(0),
+            lost_region: None,
         };
         let mut records = RecordReader::new();
         let target = ReplayTarget {
@@ -467,6 +469,9 @@ impl<Backend: Io> EngineState<Backend> {
             self.free_slot(slot);
             return Ok(false);
         };
+        if let Some((start, end)) = recovered.lost_region {
+            damage_open(self, found, rot_sum(scanned.scan.rot_sum, start, end))?;
+        }
         scanned.rows.truncate(ByteCount(kept_end.0))?;
 
         let synced_through = FileOffset(scanned.scan.synced_through.0.min(kept_end.0));
@@ -530,10 +535,14 @@ impl<Backend: Io> EngineState<Backend> {
             scan.synced_through = scan.synced_through.max(head.synced_through);
             scan.row_count = RowCount(scan.row_count.0 + head.row_count.0);
             let mut highest = scan.highest_place;
-            walk_rows(rows, at, &head, &mut bytes, |row| {
+            let walked = walk_rows(rows, at, &head, &mut bytes, |row| {
                 highest = highest.max(row.place);
                 Ok(true)
             })?;
+            if walked == RowsWalked::Unreadable {
+                scan.has_rot = true;
+                scan.rot_sum = rot_sum(scan.rot_sum, at, FileOffset(at.0 + head.total_length.0));
+            }
             scan.highest_place = highest;
             scan.valid_end = FileOffset(at.0 + head.total_length.0);
         }
@@ -569,21 +578,29 @@ impl<Backend: Io> EngineState<Backend> {
 
             // a group past the last sync may list a record a power cut lost, and it goes whole
             if at.0 >= scan.synced_through.0 {
-                let is_whole = walk_rows(rows, at, &head, &mut bytes, |row| {
+                let walked = walk_rows(rows, at, &head, &mut bytes, |row| {
                     if !self.is_record_whole(target.data, row, records, &mut value)? {
                         return Ok(false);
                     }
                     rewrite_range(target.data, row.offset, row.length, &mut copy)?;
                     Ok(true)
                 })?;
-                if !is_whole {
-                    return Ok(Some(at));
+                match walked {
+                    RowsWalked::Whole => {},
+                    RowsWalked::Stopped => return Ok(Some(at)),
+                    RowsWalked::Unreadable => {
+                        recovered.lost_region = Some((at, FileOffset(at.0 + head.total_length.0)));
+                        return Ok(Some(at));
+                    },
                 }
             }
 
-            let has_room = walk_rows(rows, at, &head, &mut bytes, |row| Ok(self.replay_row(row, target, recovered)))?;
-            if !has_room {
-                return Ok(None);
+            let walked = walk_rows(rows, at, &head, &mut bytes, |row| Ok(self.replay_row(row, target, recovered)))?;
+            match walked {
+                RowsWalked::Whole => {},
+                RowsWalked::Stopped => return Ok(None),
+                // rows of this group are in the index, and damage over the columns keeps them from a read
+                RowsWalked::Unreadable => recovered.lost_region = Some((at, FileOffset(at.0 + head.total_length.0))),
             }
             at = FileOffset(at.0 + head.total_length.0);
         }
@@ -827,18 +844,24 @@ pub fn copy_segment<Backend: Io>(
         at = start;
 
         if at.0 >= segment.scan.synced_through.0 {
-            let is_whole = walk_rows(&segment.rows, at, &head, &mut bytes, |row| {
+            let walked = walk_rows(&segment.rows, at, &head, &mut bytes, |row| {
                 state.is_record_whole(&segment.found.data, row, &mut records, &mut value)
             })?;
-            if !is_whole {
+            if walked == RowsWalked::Unreadable {
+                damage_open(state, &segment.found, rot_sum(segment.scan.rot_sum, at, FileOffset(at.0 + head.total_length.0)))?;
+            }
+            if walked != RowsWalked::Whole {
                 break;
             }
         }
 
-        walk_rows(&segment.rows, at, &head, &mut bytes, |row| {
+        let walked = walk_rows(&segment.rows, at, &head, &mut bytes, |row| {
             copy_row(state, volume, segment.found.number, &segment.found.data, row, &mut record)?;
             Ok(true)
         })?;
+        if walked == RowsWalked::Unreadable {
+            damage_open(state, &segment.found, rot_sum(segment.scan.rot_sum, at, FileOffset(at.0 + head.total_length.0)))?;
+        }
         at = FileOffset(at.0 + head.total_length.0);
     }
 
@@ -890,6 +913,7 @@ pub fn copy_row<Backend: Io>(
     let request = ClaimRequest {
         bytes: row.length,
         rows: RowCount(1),
+        is_alone: false,
     };
     loop {
         let claim = state.claim(target, &request).map_err(open_failure)?;
@@ -1003,6 +1027,17 @@ pub fn is_long_group_whole<File: IoFile>(
     Ok(is_read && u64::from_le_bytes(stored) == sum.digest())
 }
 
+/// How a walk over a group's rows ended
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RowsWalked {
+    /// Every row went through the work
+    Whole,
+    /// The work said stop
+    Stopped,
+    /// The device lost a piece the group's check had just read
+    Unreadable,
+}
+
 /// Walk the rows of a group `read_group` passed, until the work says stop. A short group is still in the
 /// buffer, and a longer one comes in pieces, with the row a piece cut in two carried to the next
 pub fn walk_rows<File: IoFile>(
@@ -1011,36 +1046,41 @@ pub fn walk_rows<File: IoFile>(
     head: &GroupHead,
     bytes: &mut [u8],
     mut work: impl FnMut(&RowEntry) -> Result<bool>,
-) -> Result<bool> {
+) -> Result<RowsWalked> {
     let length = head.total_length.0 as usize;
     let rows_end = length - GROUP_SUM_BYTES;
     if length <= bytes.len() {
         for row in RowWalk::over(&bytes[GROUP_HEADER_BYTES..rows_end]) {
             if !work(&row)? {
-                return Ok(false);
+                return Ok(RowsWalked::Stopped);
             }
         }
-        return Ok(true);
+        return Ok(RowsWalked::Whole);
     }
 
     let mut done = GROUP_HEADER_BYTES;
     let mut carried = 0;
     while done < rows_end {
         let step = (bytes.len() - carried).min(rows_end - done);
-        // a group that just passed its check and stops reading can't be walked in part, since that shows half a batch
-        rows.read_exact_at(FileOffset(at.0 + done as u64), &mut bytes[carried..carried + step])?;
+        // a row no walk can read fills the buffer, and a group that passed its check can't hold one
+        if step == 0 {
+            return Err(Error::other("a group's check passed over a row no walk can read"));
+        }
+        if !read_or_damaged(rows, FileOffset(at.0 + done as u64), &mut bytes[carried..carried + step])? {
+            return Ok(RowsWalked::Unreadable);
+        }
         done += step;
         let filled = carried + step;
         let mut walk = RowWalk::over(&bytes[..filled]);
         for row in walk.by_ref() {
             if !work(&row)? {
-                return Ok(false);
+                return Ok(RowsWalked::Stopped);
             }
         }
         carried = walk.left();
         bytes.copy_within(filled - carried..filled, 0);
     }
-    Ok(true)
+    Ok(RowsWalked::Whole)
 }
 
 /// Fold a bad region into a sum of where a rows file's bad regions lie, through a real hash, so a region that
@@ -1068,6 +1108,19 @@ pub fn has_bad_sector<File: IoFile>(rows: &File, start: FileOffset, end: ByteCou
     Ok(false)
 }
 
+/// Check the header at an offset could open a group that covers a bad offset
+pub fn is_covering_head<File: IoFile>(
+    rows: &File,
+    candidate: FileOffset,
+    bad_at: FileOffset,
+    bytes: &mut [u8],
+) -> Result<bool> {
+    if !read_or_damaged(rows, candidate, &mut bytes[..GROUP_HEADER_BYTES])? {
+        return Ok(false);
+    }
+    Ok(parse_head(bytes).is_some_and(|head| head.synced_through > bad_at && head.synced_through <= candidate))
+}
+
 /// Search past a bad group, a sector at a time, for a whole group whose sync mark reaches over it
 pub fn covering_group<File: IoFile>(
     rows: &File,
@@ -1092,9 +1145,12 @@ pub fn covering_group<File: IoFile>(
                     continue;
                 }
                 let candidate = FileOffset(at + position as u64);
-                if let Some(head) = read_group(rows, candidate, end, bytes, record_key)?
-                    && head.synced_through > bad_at
-                {
+                // a real group's mark reaches past the bad bytes and no further than its own start, so a stray
+                // marker in rotted bytes costs a header read and no hash
+                if !is_covering_head(rows, candidate, bad_at, bytes)? {
+                    continue;
+                }
+                if let Some(head) = read_group(rows, candidate, end, bytes, record_key)? {
                     return Ok(Some((candidate, head)));
                 }
             }

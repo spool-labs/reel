@@ -32,7 +32,7 @@ impl<Backend: Io> RowJob<Backend> {
             has_sent = true;
 
             // a failed group stays in place for the next pass, and only a full disk can pass by itself
-            if let Err(error) = self.state.write_out(slot)
+            if let Err(error) = self.state.write_out_if_free(slot)
                 && error.kind() != ErrorKind::StorageFull
             {
                 self.fail_volume_of(slot);

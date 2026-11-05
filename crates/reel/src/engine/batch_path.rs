@@ -218,7 +218,12 @@ impl<Backend: Io> EngineState<Backend> {
         bytes: ByteCount,
         (encoder, stage, lengths): BatchBuffers,
     ) -> Result<(), StoreError> {
-        let request = ClaimRequest { bytes, rows: plan.rows };
+        let is_long = plan.row_bytes > MOST_BUFFERED_ROW_BYTES;
+        let request = ClaimRequest {
+            bytes,
+            rows: plan.rows,
+            is_alone: is_long,
+        };
         let claim = self.claim(volume, &request)?;
         let start = BatchCursor {
             offset: claim.offset,
@@ -226,7 +231,6 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let mut cursor = start;
 
-        let is_long = plan.row_bytes > MOST_BUFFERED_ROW_BYTES;
         let mut kept_lengths = lengths.iter_mut();
         stage.clear();
         for index in 0..batch.len() {
@@ -318,14 +322,26 @@ impl<Backend: Io> EngineState<Backend> {
             });
         };
 
+        let total = ByteCount((plan.row_bytes + GROUP_OVERHEAD_BYTES) as u64);
+        self.check_rows_room(claim.volume, slot, total)?;
+
+        // no other writer's rows wait behind the turn: new claims go elsewhere, and these go out first
+        self.wait_for_other_claims(claim.volume, slot);
+        let _sent = self.write_out(slot);
+        let started = self.io.now();
         self.take_writing_turn(slot);
         let sent = self.send_long_group(slot, &rows, plan, rows_of_batch.clone(), stage);
         hold(&self.queues[slot.0 as usize]).is_writing = false;
+        let held = self.io.now().0.saturating_sub(started.0);
+        self.longest_turn.fetch_max(held, Ordering::Relaxed);
         drop(pin);
-        sent.map_err(|source| StoreError::Io {
-            action: "writing rows",
-            source,
-        })?;
+        if let Err(source) = sent {
+            // the row job passes over a full disk alone, and a rows file that won't take rows stops the volume
+            if source.kind() != ErrorKind::StorageFull {
+                claim.volume.fail();
+            }
+            return Err(store_error(claim.volume, "writing rows", source));
+        }
 
         for row in rows_of_batch {
             let write_row = WriteRow {
@@ -345,6 +361,33 @@ impl<Backend: Io> EngineState<Backend> {
         Ok(())
     }
 
+    /// Refuse a group its root has no room for before any of it goes out
+    pub fn check_rows_room(&self, volume: &Volume<Backend>, slot: OpenSlot, total: ByteCount) -> Result<(), StoreError> {
+        let root = hold(&volume.claims).open.iter().find(|segment| segment.slot == slot).map(|segment| segment.root);
+        let Some(root) = root else {
+            return Ok(());
+        };
+        let free = self
+            .io
+            .free_space(&volume.roots[root.0 as usize])
+            .map_err(|source| store_error(volume, "reading free space", source))?;
+        if free < total {
+            return Err(StoreError::VolumeFull { volume: volume.id });
+        }
+        Ok(())
+    }
+
+    /// Wait until a slot's only claim is the caller's
+    pub fn wait_for_other_claims(&self, volume: &Volume<Backend>, slot: OpenSlot) {
+        loop {
+            let is_alone = hold(&volume.claims).open.iter().any(|segment| segment.slot == slot && segment.in_flight == 1);
+            if is_alone {
+                return;
+            }
+            self.io.pause();
+        }
+    }
+
     /// Send a batch's rows as one group, in pieces through the stage. Only the holder of the writing turn may
     pub fn send_long_group(
         &self,
@@ -360,7 +403,7 @@ impl<Backend: Io> EngineState<Backend> {
             (guard.rows_end, guard.synced_through)
         };
         let total = ByteCount((plan.row_bytes + GROUP_OVERHEAD_BYTES) as u64);
-        let mut group = LongGroup::new(rows, rows_end, self.record_key);
+        let group = LongGroup::new(rows, rows_end, self.record_key);
 
         stage.clear();
         stage.set_head(&GroupHead {
@@ -368,18 +411,32 @@ impl<Backend: Io> EngineState<Backend> {
             total_length: total,
             synced_through,
         });
-        for row in batch_rows {
-            if !stage.push(&row) {
-                group.send(stage)?;
-                stage.clear();
-                let is_staged = stage.push(&row);
-                debug_assert!(is_staged);
-            }
+        let sent = send_pieces(group, batch_rows, stage);
+        // a failed write may still have landed, and a whole group left behind would bring the batch back at open
+        if sent.is_err() && rows.truncate(ByteCount(rows_end.0)).is_err() {
+            return Err(Error::other("a failed group can't be cut from its rows file"));
         }
-        group.finish(stage)?;
+        sent?;
         hold(queue).rows_end = FileOffset(rows_end.0 + total.0);
         Ok(())
     }
+}
+
+/// Send a batch's rows through the stage, a buffer at a time
+pub fn send_pieces<File: IoFile>(
+    mut group: LongGroup<'_, File>,
+    batch_rows: BatchRows<'_>,
+    stage: &mut RowGroupBuffer,
+) -> std::io::Result<()> {
+    for row in batch_rows {
+        if !stage.push(&row) {
+            group.send(stage)?;
+            stage.clear();
+            let is_staged = stage.push(&row);
+            debug_assert!(is_staged);
+        }
+    }
+    group.finish(stage)
 }
 
 /// A long batch's rows, built from its operations and their record lengths

@@ -23,7 +23,9 @@ use reel_api::write_batch::WriteBatch;
 const ROOTS: [&str; 3] = ["/disk/faults-meta", "/disk/faults-meta-two", "/disk/faults-bulk"];
 const COLUMNS: [ColumnId; 2] = [ColumnId(1), ColumnId(2)];
 const BUDGET: ByteCount = ByteCount(48 * 1024 * 1024);
-// each set keeps the seeds that found a bug, and a full sweep passed before these were cut down
+// a test holds each seed with a traced bug: 0 `failed_open` and `failed_close`, 1 `rows_sync` and `tail_sync`, 37 and
+// 349 `covered_last` and `later_sync`, 125 `one_copy`, 959 `flushed_unknown`, 1000 `open_covers`, 1002 `wrong_place`.
+// Seeds 1 and 1000 are mapped from notes, with no replay. The rest are plain extra seeds
 const SEEDS: [u64; 7] = [0, 1, 2, 3, 17, 31, 37];
 const ROT_SEEDS: [u64; 9] = [125, 349, 959, 1_000, 1_001, 1_002, 1_003, 1_011, 1_031];
 const STEPS: u64 = 3_000;
@@ -452,6 +454,7 @@ impl Run {
         let is_grave = self.streams.set.one_in(4);
         let bytes = format!("set-{}", self.streams.set.next_word()).into_bytes();
         let value = (!is_grave).then_some(bytes);
+        let is_long = self.streams.set.one_in(LONG_SET_ODDS);
         let mut batch = WriteBatch::new();
         for number in 0..SET_KEYS {
             let key = set_key(set, number);
@@ -461,12 +464,11 @@ impl Run {
                 Some(value) => batch.put(column, &key, value),
                 None => batch.delete(column, &key),
             }
-        }
-
-        // now and then the batch runs past one group buffer, with graves no read looks at
-        if self.streams.set.one_in(LONG_SET_ODDS) {
-            for number in 0..LONG_SET_ROWS {
-                batch.delete(column, format!("filler-{number:05}").as_bytes());
+            // a long batch's first key sits in its first piece and the rest in its last, with graves no read looks at between
+            if is_long && number == 0 {
+                for filler in 0..LONG_SET_ROWS {
+                    batch.delete(column, format!("filler-{filler:05}").as_bytes());
+                }
             }
         }
 
@@ -531,24 +533,30 @@ impl Run {
                 self.rot_one();
             }
 
-            // each kind draws for itself, so a step can hold several, or none
-            if self.streams.write.below(ODDS_SCALE) < WRITE_ODDS {
+            // each kind draws on every step, used or not, so nothing another kind does moves its stream
+            let is_write = self.streams.write.below(ODDS_SCALE) < WRITE_ODDS;
+            let is_set = self.streams.set.below(ODDS_SCALE) < SET_ODDS;
+            let is_flush = self.streams.flush.below(ODDS_SCALE) < FLUSH_ODDS;
+            let is_seal = self.streams.seal.below(ODDS_SCALE) < SEAL_ODDS;
+            let is_step = self.streams.step.below(ODDS_SCALE) < STEP_ODDS;
+            let is_read = self.streams.read.below(ODDS_SCALE) < READ_ODDS;
+            if is_write {
                 self.write(store);
             }
-            if !self.io.is_crashed() && self.streams.set.below(ODDS_SCALE) < SET_ODDS {
+            if is_set && !self.io.is_crashed() {
                 self.write_set(store);
             }
-            if !self.io.is_crashed() && self.streams.flush.below(ODDS_SCALE) < FLUSH_ODDS {
+            if is_flush && !self.io.is_crashed() {
                 self.flush(store);
             }
-            if !self.io.is_crashed() && self.streams.seal.below(ODDS_SCALE) < SEAL_ODDS {
+            if is_seal && !self.io.is_crashed() {
                 store.seal_now();
             }
-            if !self.io.is_crashed() && self.streams.step.below(ODDS_SCALE) < STEP_ODDS {
+            if is_step && !self.io.is_crashed() {
                 self.io.step_any();
                 self.io.advance_clock(SETTLE_TICK);
             }
-            if !self.io.is_crashed() && self.streams.read.below(ODDS_SCALE) < READ_ODDS {
+            if is_read && !self.io.is_crashed() {
                 self.check_read(store);
             }
         }

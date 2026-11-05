@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 use reel_api::units::{FileOffset, WritePlace};
 
 use crate::engine::engine_state::EngineState;
+use crate::engine::open_segment::SegmentPhase;
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
@@ -22,6 +23,7 @@ pub struct Claim<'state, Backend: Io> {
     pub offset: FileOffset,
     pub ticket: Ticket,
     pub is_landed: bool,
+    pub is_alone: bool,
 }
 
 impl<Backend: Io> Claim<'_, Backend> {
@@ -51,8 +53,14 @@ impl<Backend: Io> Claim<'_, Backend> {
         for segment in &mut claims.open {
             if segment.slot == self.slot {
                 segment.in_flight -= 1;
+                if self.is_alone && segment.phase == SegmentPhase::Alone {
+                    segment.phase = SegmentPhase::Taking;
+                }
                 break;
             }
+        }
+        if self.is_alone {
+            self.state.mark_full_segments(&mut claims, self.volume);
         }
         self.state.slot_files[self.slot.0 as usize].pins.fetch_sub(1, Ordering::AcqRel);
     }

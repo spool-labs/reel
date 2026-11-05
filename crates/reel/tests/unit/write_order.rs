@@ -126,6 +126,7 @@ fn sleeper_wakes() {
 
     assert_eq!(order.wakes(), 1);
     assert!(!order.has_sleeper(&second));
+    assert!(!order.has_handle(&second));
 }
 
 // a move of the mark wakes only the writers it passed

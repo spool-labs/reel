@@ -6,7 +6,7 @@ use std::io::{Error, ErrorKind, Result};
 use std::mem;
 use std::path::{Path, PathBuf};
 
-use reel_api::units::{ByteCount, FileOffset, ProcessId};
+use reel_api::units::{ByteCount, ProcessId};
 
 use crate::file_image::FileImage;
 use crate::seeded_random::{Seed, SeededRandom};
@@ -188,7 +188,7 @@ impl SimulatedDisk {
             ..FileImage::default()
         };
         if reserved.0 > 0 {
-            image.write(FileOffset(0), vec![0; reserved.0 as usize]);
+            image.reserve(reserved);
         }
         self.inodes.insert(inode, image);
         self.names.insert(path.to_path_buf(), inode);

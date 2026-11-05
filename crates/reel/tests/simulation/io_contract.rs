@@ -22,6 +22,9 @@ use reel_sim::simulated_task::{JobCount, JobIndex};
 use reel::io::{Io, IoFile, IoTask};
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds};
 
+const RESERVED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const NEAR_ROT: u64 = 200;
+
 const SEED: Seed = Seed(7);
 const SEED_COUNT: u64 = 64;
 const SIMULATED_ROOT: &str = "/disk/root";
@@ -626,4 +629,34 @@ fn closed_handle() {
     assert_eq!(io.handle_faults(), OperationCount(1));
     io.close_file(copy);
     assert_eq!(io.handle_faults(), OperationCount(2));
+}
+
+// room set aside reads as zeros, a write lands inside it, and a sync keeps its length
+#[test]
+fn reserved_room() {
+    let io = SimulatedIo::new(Seed(40));
+    let path = PathBuf::from("/disk/contract/reserved");
+    io.create_directory(Path::new("/disk/contract")).expect("directory");
+    let file = io.create_file(&path, ByteCount(RESERVED_BYTES)).expect("create");
+    assert_eq!(file.length().expect("length"), ByteCount(RESERVED_BYTES));
+
+    let far = FileOffset(RESERVED_BYTES - 8);
+    let mut bytes = [1; 8];
+    file.read_exact_at(far, &mut bytes).expect("read");
+    assert_eq!(bytes, [0; 8]);
+
+    file.write_at(FileOffset(100), &[IoSlice::new(b"held")]).expect("write");
+    file.sync().expect("sync");
+    file.read_exact_at(FileOffset(100), &mut bytes[..4]).expect("read");
+    assert_eq!(&bytes[..4], b"held");
+    file.read_exact_at(far, &mut bytes).expect("read");
+    assert_eq!(bytes, [0; 8]);
+    assert_eq!(file.length().expect("length"), ByteCount(RESERVED_BYTES));
+
+    // a flip gives the file bytes up to it, so this stays near the start
+    let near = FileOffset(NEAR_ROT);
+    io.rot(&path, near, BitMask(1)).expect("rot");
+    file.read_exact_at(near, &mut bytes).expect("read");
+    assert_eq!(bytes[0], 1);
+    io.close_file(file);
 }

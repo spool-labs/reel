@@ -538,3 +538,54 @@ fn stop_mid_block() {
     assert_eq!(store.state.pending_walks(0), 0);
     store.close().expect("close");
 }
+
+// a row from the older copy sits behind counts the newer copy holds, so it rebuilds its own and flips nothing again
+#[test]
+fn older_row_behind() {
+    let io = SimulatedIo::new(Seed(20));
+    let store = open(&io);
+    io.hold_jobs(WALK_JOB, true);
+    store.put(COLUMN, b"key", b"older").expect("put");
+    let older = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, older);
+    fill_block(&store);
+    let newer = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, newer);
+
+    let mut job = WalkJob::new(store.state.clone(), 0);
+    assert!(job.pick_target());
+    job.walk_block(job.target.expect("the older segment")).expect("a block");
+    assert!(job.pick_target());
+    let target = job.target.expect("the newer segment");
+    assert!(target.block_count > 1);
+    // both copies hold the older segment live and the newer one unwalked
+    store.state.save_summary(&store.state.volumes[0]).expect("save");
+    job.walk_block(target).expect("a block");
+    assert_eq!(counts(&store, older).1, RowCount(1));
+
+    // the newer copy holds the flip and lost the row that says how far the walk came
+    let paths = SummaryPaths::new(Path::new(ROOT));
+    let mut on_disk = SummaryRows::new(ByteCount(0));
+    let mark = read_summary(&io, &paths, &mut on_disk, &mut LostRows::default()).expect("read").expect("a mark");
+    let mut kept = SummaryRows::new(BUDGET);
+    {
+        let rows = hold(&store.state.volumes[0].summary);
+        for (number, at) in rows.offsets() {
+            if number != newer {
+                assert!(kept.copy_row(&rows, at));
+            }
+        }
+    }
+    let ends = copy_ends(WritePlace(mark.0 + 1), kept.bytes());
+    write_copy(&io, &paths, &paths.current, &ends, kept.bytes()).expect("write");
+    drop(job);
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+    settle(&io);
+
+    assert_eq!(counts(&store, older).1, RowCount(1));
+    assert_eq!(counts(&store, newer).1, RowCount(VERSIONS - 1));
+    store.close().expect("close");
+}

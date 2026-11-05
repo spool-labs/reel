@@ -185,6 +185,8 @@ impl WriteOrder {
         while self.mark.load(Ordering::SeqCst) < ticket.last.0 {
             thread::park();
         }
+        // a live thread's handle drops here, and never the last one of a thread that ended, which would free in a call
+        *hold(&park.thread) = None;
         park.waiting.store(0, Ordering::SeqCst);
     }
 
@@ -196,6 +198,11 @@ impl WriteOrder {
     /// Read the next place a claim would take
     pub fn next_place(&self) -> WritePlace {
         hold(&self.ring).next_place
+    }
+
+    /// Check a ticket's slot still holds a thread's handle
+    pub fn has_handle(&self, ticket: &Ticket) -> bool {
+        hold(&self.parks[ticket.slot].thread).is_some()
     }
 
     /// Check a writer sleeps in a ticket's slot

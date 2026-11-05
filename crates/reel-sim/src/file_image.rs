@@ -36,13 +36,71 @@ pub enum PendingChange {
     Write { offset: FileOffset, bytes: Vec<u8> },
     /// The file cut back to a length
     Truncate { length: ByteCount },
+    /// Room set aside at create, which reads as zeros and holds no bytes
+    Reserve { length: ByteCount },
+}
+
+/// A file's bytes: those written, then zeros out to its length, which take no memory
+#[derive(Clone, Debug, Default)]
+pub struct LazyBytes {
+    written: Vec<u8>,
+    length: usize,
+}
+
+impl LazyBytes {
+    /// Read the file's length
+    pub fn len(&self) -> usize {
+        self.length
+    }
+
+    /// Check the file has no bytes
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// Copy bytes out, with zeros past what was written
+    pub fn read(&self, start: usize, out: &mut [u8]) {
+        let from = self.written.len().min(start);
+        let to = self.written.len().min(start + out.len());
+        out[..to - from].copy_from_slice(&self.written[from..to]);
+        out[to - from..].fill(0);
+    }
+
+    /// Copy bytes in, growing the file when needed
+    pub fn write(&mut self, offset: FileOffset, bytes: &[u8]) {
+        let start = offset.0 as usize;
+        let end = start + bytes.len();
+        if self.written.len() < end {
+            self.written.resize(end, 0);
+        }
+        self.written[start..end].copy_from_slice(bytes);
+        self.length = self.length.max(end);
+    }
+
+    /// Set the length, cutting what was written or adding zeros that hold nothing
+    pub fn resize(&mut self, length: usize) {
+        self.written.truncate(length);
+        self.length = length;
+    }
+
+    /// Flip bits of one byte, when the file reaches it
+    pub fn flip(&mut self, offset: FileOffset, mask: BitMask) {
+        let at = offset.0 as usize;
+        if at >= self.length {
+            return;
+        }
+        if self.written.len() <= at {
+            self.written.resize(at + 1, 0);
+        }
+        self.written[at] ^= mask.0;
+    }
 }
 
 /// The bytes of one file
 #[derive(Clone, Debug, Default)]
 pub struct FileImage {
-    pub visible: Vec<u8>,
-    pub durable: Vec<u8>,
+    pub visible: LazyBytes,
+    pub durable: LazyBytes,
     pub pending: Vec<PendingChange>,
     pub disk: Option<PathBuf>,
     pub handle_count: u64,
@@ -51,15 +109,21 @@ pub struct FileImage {
 }
 
 impl FileImage {
+    /// Set room aside, which a reader sees at once as zeros
+    pub fn reserve(&mut self, length: ByteCount) {
+        self.visible.resize(length.0 as usize);
+        self.pending.push(PendingChange::Reserve { length });
+    }
+
     /// Apply a write that a reader sees at once
     pub fn write(&mut self, offset: FileOffset, bytes: Vec<u8>) {
-        apply_write(&mut self.visible, offset, &bytes);
+        self.visible.write(offset, &bytes);
         self.pending.push(PendingChange::Write { offset, bytes });
     }
 
     /// Cut the file back, which a reader sees at once
     pub fn truncate(&mut self, length: ByteCount) {
-        self.visible.resize(length.0 as usize, 0);
+        self.visible.resize(length.0 as usize);
         self.pending.push(PendingChange::Truncate { length });
     }
 
@@ -90,12 +154,8 @@ impl FileImage {
 
     /// Flip bits of one byte in what readers see and in what survives
     pub fn rot(&mut self, offset: FileOffset, mask: BitMask) {
-        if let Some(byte) = self.visible.get_mut(offset.0 as usize) {
-            *byte ^= mask.0;
-        }
-        if let Some(byte) = self.durable.get_mut(offset.0 as usize) {
-            *byte ^= mask.0;
-        }
+        self.visible.flip(offset, mask);
+        self.durable.flip(offset, mask);
     }
 
     /// Check a read can reach these bytes
@@ -111,35 +171,32 @@ impl FileImage {
     }
 }
 
-/// Copy bytes into an image, growing it with zeros when needed
-pub fn apply_write(image: &mut Vec<u8>, offset: FileOffset, bytes: &[u8]) {
-    let start = offset.0 as usize;
-    let end = start + bytes.len();
-    if image.len() < end {
-        image.resize(end, 0);
-    }
-    image[start..end].copy_from_slice(bytes);
-}
-
 /// Apply one change whole
-pub fn apply_change(image: &mut Vec<u8>, change: &PendingChange) {
+pub fn apply_change(image: &mut LazyBytes, change: &PendingChange) {
     match change {
-        PendingChange::Write { offset, bytes } => apply_write(image, *offset, bytes),
-        PendingChange::Truncate { length } => image.resize(length.0 as usize, 0),
+        PendingChange::Write { offset, bytes } => image.write(*offset, bytes),
+        PendingChange::Truncate { length } => image.resize(length.0 as usize),
+        PendingChange::Reserve { length } => image.resize(image.len().max(length.0 as usize)),
     }
 }
 
 /// Apply any set of a write's sectors, since pages reach a disk in any order
-pub fn apply_torn(image: &mut Vec<u8>, change: &PendingChange, random: &mut SeededRandom) {
+pub fn apply_torn(image: &mut LazyBytes, change: &PendingChange, random: &mut SeededRandom) {
     match change {
         PendingChange::Write { offset, bytes } => {
             for (index, sector) in bytes.chunks(SECTOR_BYTES as usize).enumerate() {
                 if random.one_in(SECTOR_SURVIVAL_ODDS) {
                     let start = offset.0 + index as u64 * SECTOR_BYTES;
-                    apply_write(image, FileOffset(start), sector);
+                    image.write(FileOffset(start), sector);
                 }
             }
         },
         PendingChange::Truncate { .. } => apply_change(image, change),
+        // zeros that tore read like zeros that never came, so all a tear changes is how far the file reaches
+        PendingChange::Reserve { length } => {
+            let sectors = length.0.div_ceil(SECTOR_BYTES);
+            let reach = (random.below(sectors + 1) * SECTOR_BYTES).min(length.0);
+            image.resize(image.len().max(reach as usize));
+        },
     }
 }

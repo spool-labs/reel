@@ -87,7 +87,7 @@ impl IoFile for SimulatedFile {
             return Err(Error::from_raw_os_error(libc::EIO));
         }
         let count = end - start;
-        buf[..count].copy_from_slice(&image.visible[start..end]);
+        image.visible.read(start, &mut buf[..count]);
         disk.reads = OperationCount(disk.reads.0 + 1);
         disk.bytes_read = ByteCount(disk.bytes_read.0 + count as u64);
         Ok(ByteCount(count as u64))
@@ -117,10 +117,10 @@ impl IoFile for SimulatedFile {
             if !image.is_readable(start, end) {
                 return Err(Error::from_raw_os_error(libc::EIO));
             }
-            let Some(bytes) = image.visible.get(start..end) else {
+            if end > image.visible.len() {
                 return Err(Error::from(ErrorKind::UnexpectedEof));
             };
-            part.copy_from_slice(bytes);
+            image.visible.read(start, part);
             total += part.len() as u64;
             start = end;
         }

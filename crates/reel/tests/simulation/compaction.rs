@@ -127,8 +127,8 @@ fn cue_keeps_segment() {
     store.close().expect("close");
 }
 
-// a crash at any step of an unlink loses nothing, and the table and the disk agree. A segment whose counts a crash lost
-// can stay, since a backward walk flips nothing and that only understates
+// a crash at any step of an unlink loses nothing, and the table and the disk agree. A crash between a seal's tail and its
+// row leaves that segment to a backward walk, which flips nothing, so the older segment can stay, which only understates
 #[test]
 fn unlink_crashes() {
     for crash_at in 0..CRASH_POINTS {
@@ -164,8 +164,7 @@ fn unlink_crashes() {
             let store = open(&io);
             settle(&io);
             assert_eq!(read(&store), Some(b"newer".to_vec()), "crash at {crash_at}");
-            let is_held = store.state.volumes[0].table.holds(older);
-            assert_eq!(has_file(&io, older), is_held, "crash at {crash_at}");
+            assert_eq!(has_file(&io, older), store.state.volumes[0].table.holds(older), "crash at {crash_at}");
             store.close().expect("close");
         }
     }

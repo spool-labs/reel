@@ -152,3 +152,68 @@ fn full_table() {
     assert!(store.state.cues.is_empty());
     store.close().expect("close");
 }
+
+// a cue outlives nothing: once the store has closed its reads say so, and its files are never touched
+#[test]
+fn closed_store() {
+    let io = SimulatedIo::new(Seed(5));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let cue = store.cue().expect("cue");
+    store.close().expect("close");
+
+    let mut buf = Vec::new();
+    assert!(matches!(cue.get(COLUMN, b"key", &mut buf), Err(StoreError::Closed)));
+    assert!(matches!(cue.contains(COLUMN, b"key"), Err(StoreError::Closed)));
+    let mut values = ValueList::new();
+    assert!(matches!(cue.get_many(COLUMN, &[b"key"], &mut values), Err(StoreError::Closed)));
+}
+
+// a cover kept for a cue goes once the cue has
+#[test]
+fn kept_cover_goes() {
+    let io = SimulatedIo::new(Seed(6));
+    let store = open(&io);
+    store.delete_range(COLUMN, b"kex", b"kez").expect("delete");
+    let cue = store.cue().expect("cue");
+    store.delete_range(COLUMN, b"a", b"z").expect("delete");
+    assert_eq!(store.state.volumes[0].covers.len(), 2);
+
+    drop(cue);
+    settle(&io);
+
+    assert_eq!(store.state.volumes[0].covers.len(), 1);
+    store.close().expect("close");
+}
+
+// a cover with nothing inside it asks no read to start over
+#[test]
+fn plain_cover_counts_nothing() {
+    let io = SimulatedIo::new(Seed(7));
+    let store = open(&io);
+    store.delete_range(COLUMN, b"a", b"b").expect("delete");
+    store.delete_range(COLUMN, b"c", b"d").expect("delete");
+
+    assert_eq!(store.state.cover_drops(), 0);
+    store.close().expect("close");
+}
+
+// a cover drop that lands between reading the count and taking the slot costs the slot, and the next try takes a newer point
+#[test]
+fn pin_lost() {
+    let io = SimulatedIo::new(Seed(8));
+    let store = open(&io);
+    let state = &store.state;
+    let drops = state.cover_drops();
+    let slot = state.cues.take(state.read_point()).expect("a slot");
+
+    state.volumes[0].covers.note_drop();
+
+    assert!(!state.pin_holds(slot, drops));
+    assert!(state.cues.is_empty());
+    let slot = state.cues.take(state.read_point()).expect("a slot");
+    assert!(state.pin_holds(slot, state.cover_drops()));
+    assert_eq!(state.cues.len(), 1);
+    state.cues.release(slot);
+    store.close().expect("close");
+}

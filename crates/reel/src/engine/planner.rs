@@ -22,8 +22,9 @@ use crate::io::job::{Job, JobStep};
 /// How long the planner stands aside before it looks again
 pub const WRITER_YIELD: Nanoseconds = Nanoseconds(200_000);
 
-/// A volume with this many sealed segments waiting for a walk stops standing aside for seals. A segment has thousands of
-/// row blocks, so a unit a seal would fall behind for good, and this bound keeps the walk within a few segments of ingest
+/// A volume with this many sealed segments waiting for a walk stops standing aside for seals, since a segment has thousands
+/// of row blocks and a unit a seal would fall behind for good. This ends the standing aside and no more: a walk slower than
+/// the seals still falls behind while ingest lasts
 pub const WALK_LAG_SEGMENTS: u64 = 8;
 
 /// What one step of a unit found

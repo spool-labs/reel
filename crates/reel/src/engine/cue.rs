@@ -88,10 +88,9 @@ impl<Backend: Io> Cue<Backend> {
             let Some(slot) = state.cues.take(point) else {
                 return Err(StoreError::CuesFull { limit: MOST_CUES as u64 });
             };
-            if state.cover_drops() == drops {
+            if state.pin_holds(slot, drops) {
                 return Ok(Self { state, slot, point });
             }
-            state.cues.release(slot);
         }
     }
 
@@ -118,11 +117,13 @@ impl<Backend: Io> Cue<Backend> {
 
     /// Check whether the key had a value at this cue
     pub fn contains(&self, column: ColumnId, key: &[u8]) -> Result<bool, StoreError> {
+        self.check_open()?;
         self.state.contains_at(&self.state.key_read(column, key, self.point, true)?)
     }
 
     /// Answer every key at this cue, with a bad record as that key's answer
     pub fn get_many(&self, column: ColumnId, keys: &[&[u8]], values: &mut ValueList) -> Result<(), StoreError> {
+        self.check_open()?;
         let info = self.state.column(column)?;
         let handovers = self.state.volumes[info.volume.0 as usize].handover_count();
         values.clear();
@@ -132,8 +133,17 @@ impl<Backend: Io> Cue<Backend> {
         read
     }
 
+    /// Refuse a read once the store is going, whose files are closing under it
+    pub fn check_open(&self) -> Result<(), StoreError> {
+        if self.state.is_stopping.load(Ordering::Acquire) {
+            return Err(StoreError::Closed);
+        }
+        Ok(())
+    }
+
     /// Read a key at this cue
     pub fn read(&self, column: ColumnId, key: &[u8], want: RecordWant, buf: &mut Vec<u8>) -> Result<bool, StoreError> {
+        self.check_open()?;
         let info = self.state.column(column)?;
         let handovers = self.state.volumes[info.volume.0 as usize].handover_count();
         let read = self.state.key_read(column, key, self.point, true)?;

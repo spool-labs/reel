@@ -58,6 +58,7 @@ pub struct Volume<Backend: Io> {
     pub walk_retries: AtomicU64,
     pub walks_waiting: AtomicU64,
     pub wants_compaction: AtomicBool,
+    pub has_kept_covers: AtomicBool,
     pub is_compaction_held: AtomicBool,
     pub segments_unlinked: AtomicU64,
     pub summary: Mutex<SummaryRows>,

@@ -197,6 +197,22 @@ impl CoverPool {
         false
     }
 
+    /// Check an older cover lies wholly inside a new one
+    pub fn has_inside(&self, cover: &Cover) -> bool {
+        let mut position = self.at_start(cover.column, cover.start);
+        while position < self.order.len() {
+            let slot = self.order[position];
+            if self.slots[slot as usize].column != cover.column || self.start(slot) >= cover.end {
+                return false;
+            }
+            if self.end(slot) <= cover.end && self.slots[slot as usize].place < cover.place {
+                return true;
+            }
+            position += 1;
+        }
+        false
+    }
+
     /// Drop every older cover wholly inside a new one, whose place and range say all they said
     pub fn drop_inside(&mut self, cover: &Cover) {
         let mut position = self.at_start(cover.column, cover.start);
@@ -402,6 +418,23 @@ impl RangeCovers {
         let count = pool.order.len();
         drop(pool);
         self.count.store(count, Ordering::Release);
+    }
+
+    /// Check an older cover lies wholly inside a new one
+    pub fn has_inside(&self, cover: &Cover) -> bool {
+        self.read().has_inside(cover)
+    }
+
+    /// Copy out the cover at a position in key order, or return false past the end
+    pub fn cover_at(&self, position: usize, start: &mut Vec<u8>, end: &mut Vec<u8>) -> Option<(ColumnId, WritePlace, SegmentNumber)> {
+        let pool = self.read();
+        let slot = *pool.order.get(position)?;
+        start.clear();
+        start.extend_from_slice(pool.start(slot));
+        end.clear();
+        end.extend_from_slice(pool.end(slot));
+        let fields = &pool.slots[slot as usize];
+        Some((fields.column, fields.place, fields.segment))
     }
 
     /// Count the times a cover went inside a newer one, so a read at a fixed point can tell one left under it

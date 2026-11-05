@@ -82,12 +82,15 @@ impl<Backend: Io> WalkJob<Backend> {
         ByteCount((self.block.capacity() + keys + self.counts.capacity() * size_of::<DeadCount>()) as u64)
     }
 
-    /// Pick the lowest segment whose walk hasn't finished
+    /// Pick a segment whose walk hasn't finished. Backward walks go first and newest first, so an older segment finds the
+    /// newer one finished and counts against it, and then forward walks go from the lowest
     pub fn pick_target(&mut self) -> bool {
         let state = Arc::clone(&self.state);
         let rows = hold(&state.volumes[self.volume].summary);
         let waiting = rows.rows().filter(|row| !row.facts.is_walked());
-        self.target = waiting.min_by_key(|row| row.facts.segment).map(|row| WalkTarget {
+        let backward = waiting.clone().filter(|row| row.facts.is_backward).max_by_key(|row| row.facts.places.highest);
+        let picked = backward.or_else(|| waiting.min_by_key(|row| row.facts.segment));
+        self.target = picked.map(|row| WalkTarget {
             segment: row.facts.segment,
             next_block: row.facts.walked_blocks,
             block_count: row.facts.block_count,

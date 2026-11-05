@@ -779,6 +779,7 @@ pub fn build_state<Backend: Io>(
             walk_retries: AtomicU64::new(0),
             walks_waiting: AtomicU64::new(0),
             wants_compaction: AtomicBool::new(true),
+            has_kept_covers: AtomicBool::new(false),
             is_compaction_held: AtomicBool::new(false),
             segments_unlinked: AtomicU64::new(0),
             reserve: ByteCount(sizing.segment_bytes.0 * 2),

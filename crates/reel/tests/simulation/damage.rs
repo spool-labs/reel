@@ -27,6 +27,7 @@ use reel::superblock::{Superblock, SuperblockPaths};
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId, WritePlace};
+use reel_api::value_list::{ValueAnswer, ValueList};
 
 const ROOT: &str = "/disk/damage";
 const ORDERED: ColumnId = ColumnId(1);
@@ -1806,4 +1807,52 @@ fn key_of_segment(segment: u64) -> Vec<u8> {
     let mut key = vec![b'k'; 40];
     key[..8].copy_from_slice(&segment.to_le_bytes());
     key
+}
+
+// get_many gives each key the answer a get gives it, so a bad record or a damaged span is that key's answer alone
+fn assert_many_agrees(store: &Store, built: &Built) -> u64 {
+    let mut refused = 0;
+    for column in COLUMNS {
+        let keys: Vec<&[u8]> = built.model.keys().filter(|(owner, _key)| *owner == column).map(|(_owner, key)| key.as_slice()).collect();
+        let mut values = ValueList::new();
+        store.get_many(column, &keys, &mut values).expect("get_many");
+        for (index, key) in keys.iter().enumerate() {
+            let answer = values.answer(index).expect("an answer");
+            match read(store, column, key) {
+                Ok(Some(value)) => assert_eq!(answer, ValueAnswer::Found(&value)),
+                Ok(None) => assert_eq!(answer, ValueAnswer::Missing),
+                Err(StoreError::Corruption { .. }) => {
+                    assert_eq!(answer, ValueAnswer::Corrupt);
+                    refused += 1;
+                },
+                Err(error) => panic!("get: {error}"),
+            }
+        }
+    }
+    refused
+}
+
+// a record no read can give back is that key's answer, and the keys around it still answer
+#[test]
+fn many_bad_record() {
+    let built = build(61);
+    built.io.bad_sector(&built.files[MIDDLE], FileOffset(3)).expect("bad");
+
+    let store = open(&built.io);
+
+    assert!(assert_many_agrees(&store, &built) > 0);
+    store.close().expect("close");
+}
+
+// a key inside a damaged span answers the same way
+#[test]
+fn many_damaged_span() {
+    let built = build(62);
+    rot_first_tail(&built, MIDDLE);
+    rot_second_tail(&built, MIDDLE);
+
+    let store = open(&built.io);
+
+    assert!(assert_many_agrees(&store, &built) > 0);
+    store.close().expect("close");
 }

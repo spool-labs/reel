@@ -109,8 +109,8 @@ impl<Backend: Io> EngineState<Backend> {
         self.get_at(&read, handovers, want, buf)
     }
 
-    /// Answer every key at one read point, so a batch from one write_batch is seen whole or not at all. A cover that went
-    /// inside a newer one under that point could hide nothing from it, so the keys are read again
+    /// Answer every key at one read point, so a batch from one write_batch is seen whole or not at all. The call pins its
+    /// point as a cue does, so no cover below it goes. A full table leaves the read to start over if one went
     pub fn get_many_now(&self, column: ColumnId, keys: &[&[u8]], values: &mut ValueList) -> Result<(), StoreError> {
         let info = self.column(column)?;
         let volume = &self.volumes[info.volume.0 as usize];
@@ -121,11 +121,18 @@ impl<Backend: Io> EngineState<Backend> {
         });
         for _try in 0..MOST_READ_TRIES {
             values.clear();
-            let drops = volume.covers.drops();
+            let drops = self.cover_drops();
             let handovers = volume.handover_count();
             let point = self.read_point();
+            let pin = self.cues.take(point);
+            if pin.is_some_and(|slot| !self.pin_holds(slot, drops)) {
+                continue;
+            }
             let read = self.read_keys(column, keys, point, handovers, values, &mut scratch);
-            if read.is_err() || volume.covers.drops() == drops {
+            if let Some(slot) = pin {
+                self.cues.release(slot);
+            }
+            if read.is_err() || pin.is_some() || self.cover_drops() == drops {
                 outcome = read;
                 break;
             }
@@ -214,7 +221,7 @@ impl<Backend: Io> EngineState<Backend> {
         }
         Err(StoreError::Io {
             action: "reading a key whose segments keep moving",
-            source: std::io::Error::other("too many tries"),
+            source: Error::from(ErrorKind::Interrupted),
         })
     }
 

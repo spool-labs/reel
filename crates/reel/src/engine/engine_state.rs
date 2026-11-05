@@ -304,12 +304,27 @@ impl<Backend: Io> EngineState<Backend> {
         self.volumes.iter().map(|volume| volume.covers.drops()).sum()
     }
 
+    /// Keep a slot only if no cover drop came since the count was read, and give it back if one did
+    pub fn pin_holds(&self, slot: usize, drops: usize) -> bool {
+        let is_held = self.cover_drops() == drops;
+        if !is_held {
+            self.cues.release(slot);
+        }
+        is_held
+    }
+
     /// Drop the covers a published one holds inside it, unless a live cue reads below it and still needs them. The count
     /// goes first: a cue reads it after taking its slot, so the two can't miss each other
     pub fn drop_covers_inside(&self, volume: &Volume<Backend>, cover: &Cover) {
+        if !volume.covers.has_inside(cover) {
+            return;
+        }
         volume.covers.note_drop();
         if !self.cues.has_cue_below(cover.place) {
             volume.covers.drop_inside(cover);
+        } else {
+            // the cue's going looks again, or this cover would stay past its need
+            volume.has_kept_covers.store(true, Ordering::Release);
         }
     }
 

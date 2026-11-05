@@ -22,6 +22,7 @@ use crate::io::device_error::is_device_error;
 use crate::io::{Io, IoFile};
 use crate::pool::{touched_capacity, touched_zeroes};
 use crate::row_kind::RowKind;
+use crate::segment::range_covers::Cover;
 use crate::segment::row_block::{ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::{SegmentPin, WalkBlock};
 use crate::segment::segment_tail::SegmentNumber;
@@ -44,6 +45,7 @@ pub struct CompactJob<Backend: Io> {
     last_tried: SegmentNumber,
     block: Vec<u8>,
     key: Vec<u8>,
+    end: Vec<u8>,
 }
 
 impl<Backend: Io> CompactJob<Backend> {
@@ -57,6 +59,7 @@ impl<Backend: Io> CompactJob<Backend> {
             last_tried: SegmentNumber(0),
             block: touched_zeroes(ROW_BLOCK_BYTES),
             key: touched_capacity(MAX_KEY_BYTES as usize, 0),
+            end: touched_capacity(MAX_KEY_BYTES as usize + 1, 0),
         }
     }
 
@@ -71,6 +74,11 @@ impl<Backend: Io> CompactJob<Backend> {
             return UnitStep::RetryAt(at);
         }
         self.retry_at = None;
+        // a live cue may still need what it kept, and its going brings the planner back
+        if state.cues.is_empty() && volume.has_kept_covers.swap(false, Ordering::AcqRel) {
+            self.sweep_covers(volume);
+            return UnitStep::Worked;
+        }
         if self.target.is_none() && !self.pick_dead(volume) {
             return UnitStep::Idle;
         }
@@ -84,6 +92,23 @@ impl<Backend: Io> CompactJob<Backend> {
                 self.retry_at = Some(at);
                 UnitStep::RetryAt(at)
             },
+        }
+    }
+
+    /// Drop covers a cue kept inside newer ones, once no cue reads below those. Each cover takes its own hold of the pool,
+    /// so a get waits for one at most
+    pub fn sweep_covers(&mut self, volume: &Volume<Backend>) {
+        let mut position = 0;
+        while let Some((column, place, segment)) = volume.covers.cover_at(position, &mut self.key, &mut self.end) {
+            let cover = Cover {
+                column,
+                start: &self.key,
+                end: &self.end,
+                place,
+                segment,
+            };
+            self.state.drop_covers_inside(volume, &cover);
+            position += 1;
         }
     }
 

@@ -168,7 +168,7 @@ impl SimulatedIo {
         hold(&self.disk).failing_directory_syncs = count;
     }
 
-    /// Make the next file removes fail
+    /// Make the next removes of a segment's data file fail
     pub fn fail_removes(&self, count: OperationCount) {
         hold(&self.disk).failing_removes = count;
     }
@@ -363,7 +363,7 @@ impl Io for SimulatedIo {
         let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         disk.enter()?;
-        if disk.failing_removes.0 > 0 {
+        if disk.failing_removes.0 > 0 && path.extension().is_some_and(|extension| extension == "data") {
             disk.failing_removes = OperationCount(disk.failing_removes.0 - 1);
             return Err(Error::other("simulated remove failure"));
         }

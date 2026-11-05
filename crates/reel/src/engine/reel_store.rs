@@ -30,7 +30,7 @@ use crate::engine::recovery::{
 use crate::engine::reserve_job::ReserveJob;
 use crate::engine::row_job::RowJob;
 use crate::engine::seal_job::SealJob;
-use crate::engine::compact_job::CompactJob;
+use crate::engine::compact_job::{CompactJob, park};
 use crate::engine::cue::{Cue, CueTable};
 use crate::engine::planner::Planner;
 use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
@@ -353,12 +353,14 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn close_volume(&self, volume: &Volume<Backend>) {
         // a read that outlives its store keeps its handle, and open finishes what the file's leaving started
         for slot in hold(&volume.parked).iter_mut() {
-            if slot.as_ref().is_some_and(|parked| volume.table.retired_pins(&parked.retired) == 0)
+            if slot.as_ref().is_some_and(|parked| volume.is_unpinned(parked))
                 && let Some(parked) = slot.take()
             {
                 // a file that stays is one open walks dead again, and a close has no later step to try
-                if let Err(parked) = self.clear_parked(volume, parked) {
-                    self.io.close_file(parked.retired.file);
+                if let Err(parked) = self.clear_parked(volume, parked)
+                    && let Some(retired) = parked.retired
+                {
+                    self.io.close_file(retired.file);
                 }
             }
         }
@@ -410,6 +412,14 @@ pub fn bring_up<Backend: Io>(
     state: &Arc<EngineState<Backend>>,
     scan: &mut RootScan<Backend::File>,
 ) -> Result<(), StoreError> {
+    // what stays on disk stays out of every list, and its going waits for this open's summary
+    for held in mem::take(&mut scan.held) {
+        let volume = &state.volumes[held.volume];
+        if !volume.can_park(1) {
+            return Err(open_error("holding a file a merge replaced")(Error::from(ErrorKind::StorageFull)));
+        }
+        park(volume, None, held.number, false);
+    }
     // damage ranks at the counter, so the counter passes every place open can find first
     for found in &scan.sealed {
         state.order.resume_past(found.head.places.highest);
@@ -836,6 +846,7 @@ pub fn build_state<Backend: Io>(
             has_held_frees: AtomicBool::new(false),
             segments_unlinked: AtomicU64::new(0),
             segments_parked: AtomicU64::new(0),
+            empties_left: AtomicU64::new(0),
             parked: Mutex::new([const { None }; MOST_PARKED]),
             segments_rewritten: AtomicU64::new(0),
             is_rewriting: AtomicBool::new(false),

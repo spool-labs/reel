@@ -1,5 +1,6 @@
 //! Rewrite: a half-dead segment becomes a new one with only what a read can reach, through any crash
 
+use std::io::IoSlice;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -15,7 +16,7 @@ use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAIT
 use reel::engine::volume::{MOST_PARKED, NO_SEAL};
 use reel::engine::walk_job::WalkJob;
 use reel::guard::hold;
-use reel::io::Io;
+use reel::io::{Io, IoFile};
 use reel::io::job::Job;
 use reel::record::codec::Codec;
 use reel::segment::damage_list::DamagedRange;
@@ -24,7 +25,7 @@ use reel::segment::footer_writer::FooterWriter;
 use reel::segment::segment_table::{RetiredSegment, shard_of};
 use reel::segment::segment_tail::{BlockCount, MOST_MERGE_SEGMENTS, SegmentNumber, TailHead};
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, Nanoseconds, VolumeId, WritePlace};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId, WritePlace};
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
@@ -1273,7 +1274,7 @@ fn fill_park(store: &Store, stand_in: &SegmentNumber, count: usize) {
     let pin = volume.table.pin(*stand_in).expect("a pin");
     for _slot in 0..count {
         let retired = RetiredSegment { file: pin.file.clone(), shard: 0, slot: 0 };
-        park(volume, retired, *stand_in, true);
+        park(volume, Some(retired), *stand_in, true);
     }
 }
 
@@ -1676,4 +1677,143 @@ fn small_ones_merge_alone() {
     assert_eq!(inputs, small);
     job.rewrite.abandon();
     store.close().expect("close");
+}
+
+// a merge whose inputs are still on disk at a crash, from a job stopped between its save and its removes
+fn inputs_left_on_disk(store: Store, io: &SimulatedIo) -> Vec<SegmentNumber> {
+    hold_compaction(&store, true);
+    grave_over_older(&store, io);
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    run_to_install(&mut job);
+    let inputs = job.rewrite.input_numbers().to_vec();
+    job.rewrite.step();
+    assert!(!job.rewrite.is_running());
+    io.kill();
+    drop(job);
+    drop(store);
+    inputs
+}
+
+// an input open can't remove stays out of the lists, the store serves, the graves wait, and a retry takes it
+#[test]
+fn input_held_at_open() {
+    let io = SimulatedIo::new(Seed(37));
+    let inputs = inputs_left_on_disk(open(&io), &io);
+    assert!(inputs.iter().all(|input| has_file(&io, *input)));
+
+    io.fail_removes(OperationCount(1));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    assert_eq!(volume.segments_parked.load(Ordering::Acquire), 1);
+    assert!(inputs.iter().all(|input| !volume.table.holds(*input)));
+    assert_eq!(read(&store, b"key"), None);
+    assert_eq!(read(&store, b"d"), Some(b"first".to_vec()));
+    assert!(store.state.unlisted_segments(volume).expect("list").is_empty());
+
+    settle(&io);
+    assert_eq!(volume.segments_parked.load(Ordering::Acquire), 0);
+    assert!(inputs.iter().all(|input| !has_file(&io, *input)));
+    store.close().expect("close");
+}
+
+// a remove that keeps failing costs no open, however many in a row, and the first one that works ends it
+#[test]
+fn input_held_across_opens() {
+    let io = SimulatedIo::new(Seed(38));
+    let inputs = inputs_left_on_disk(open(&io), &io);
+
+    for _open in 0..3 {
+        io.fail_removes(OperationCount(u64::MAX));
+        let store = open(&io);
+        assert_eq!(read(&store, b"key"), None);
+        io.kill();
+        drop(store);
+    }
+
+    io.fail_removes(OperationCount(0));
+    let store = open(&io);
+    settle(&io);
+    assert_eq!(store.state.volumes[0].segments_parked.load(Ordering::Acquire), 0);
+    assert!(inputs.iter().all(|input| !has_file(&io, *input)));
+    assert_eq!(read(&store, b"key"), None);
+    store.close().expect("close");
+}
+
+// a segment with newer rows can sort between older ones by lowest key, and a read walks on past the older one to find it
+#[test]
+fn newest_past_an_older_segment() {
+    let io = SimulatedIo::new(Seed(64));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let put_range = |lowest: &[u8], highest: &[u8], value: &[u8]| {
+        store.put(COLUMN, lowest, b"edge").expect("put");
+        store.put(COLUMN, b"m", value).expect("put");
+        store.put(COLUMN, highest, b"edge").expect("put");
+        seal(&store, &io)
+    };
+    put_range(b"b", b"y", b"oldest");
+    put_range(b"a", b"z", b"middle");
+    let newest = put_range(b"c", b"x", b"newest");
+
+    // the spot cache would answer a plain get, so this asks the footers
+    let state = &store.state;
+    let read = state.key_read_now(COLUMN, b"m").expect("read");
+    let found = state.search_footers(&state.volumes[0], &read).expect("search").expect("a row");
+    assert_eq!(found.segment, newest);
+    store.close().expect("close");
+}
+
+fn plant(io: &SimulatedIo, number: SegmentNumber, bytes: &[u8]) {
+    let file = io.create_file(&data_path(Path::new(ROOT), number), ByteCount(1)).expect("create");
+    if !bytes.is_empty() {
+        file.write_at(FileOffset(0), &[IoSlice::new(bytes)]).expect("write");
+    }
+    io.close_file(file);
+}
+
+const PLANTED: SegmentNumber = SegmentNumber(u64::MAX / 4);
+
+// a full park excuses an empty file, and the count shows it
+#[test]
+fn full_park_excuses_an_empty_file() {
+    let io = SimulatedIo::new(Seed(65));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    half_dead(&store, &io);
+    let volume = &store.state.volumes[0];
+    fill_park(&store, &stand_in_parked(&store), MOST_PARKED);
+    plant(&io, PLANTED, &[]);
+
+    assert!(store.state.unlisted_segments(volume).expect("list").is_empty());
+    io.fail_removes(OperationCount(1));
+    assert!(!store.state.remove_or_park(volume, Path::new(ROOT), PLANTED));
+    assert_eq!(volume.empties_left.load(Ordering::Acquire), 1);
+    io.kill();
+}
+
+// a full park excuses nothing with a record in it
+#[test]
+fn full_park_excuses_no_record() {
+    let io = SimulatedIo::new(Seed(66));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    half_dead(&store, &io);
+    let volume = &store.state.volumes[0];
+    fill_park(&store, &stand_in_parked(&store), MOST_PARKED);
+    plant(&io, PLANTED, b"a record");
+
+    assert_eq!(store.state.unlisted_segments(volume).expect("list"), vec![PLANTED]);
+    io.kill();
+}
+
+// an empty file with room in the park belongs in it
+#[test]
+fn park_room_excuses_nothing() {
+    let io = SimulatedIo::new(Seed(67));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    plant(&io, PLANTED, &[]);
+
+    assert_eq!(store.state.unlisted_segments(&store.state.volumes[0]).expect("list"), vec![PLANTED]);
+    io.kill();
 }

@@ -4,7 +4,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Error, ErrorKind, IoSlice, Result};
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -15,9 +15,9 @@ use xxhash_rust::xxh3::Xxh3;
 
 use crate::engine::engine_sizing::GROUP_BYTES;
 use crate::engine::engine_state::{EngineState, SlotData};
-use crate::engine::open_segment::{DATA_SUFFIX, OUTPUT_SUFFIX, OpenSegment, SegmentPhase, data_path, parse_segment, rows_path};
+use crate::engine::open_segment::{DATA_SUFFIX, OUTPUT_SUFFIX, ROWS_SUFFIX, OpenSegment, SegmentPhase, data_path, parse_segment, rows_path};
 use crate::engine::seal_job::SealJob;
-use crate::engine::volume::Volume;
+use crate::engine::volume::{MOST_PARKED, Volume};
 use crate::engine::write_path::{ClaimRequest, LandOutcome};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
@@ -148,6 +148,13 @@ pub struct FoundOpen<File> {
     pub data: File,
 }
 
+/// A file open couldn't remove, which the park holds until a retry gets it gone
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeldFile {
+    pub volume: usize,
+    pub number: SegmentNumber,
+}
+
 /// What a read of every root found
 #[derive(Debug)]
 pub struct RootScan<File> {
@@ -157,6 +164,7 @@ pub struct RootScan<File> {
     pub damaged: Vec<FoundDamaged>,
     pub empty: Vec<FoundEmpty>,
     pub highest_segment: SegmentNumber,
+    pub held: Vec<HeldFile>,
 }
 
 /// An open segment with its rows file walked, waiting for its turn
@@ -273,6 +281,7 @@ pub fn scan_roots<Backend: Io>(
         damaged: Vec::new(),
         empty: Vec::new(),
         highest_segment: SegmentNumber(0),
+        held: Vec::new(),
     };
     let mut reader = FooterReader::new();
 
@@ -280,10 +289,7 @@ pub fn scan_roots<Backend: Io>(
         for path in &listing.files {
             // a stopped rewrite's output has no tail, and everything in it is still in its input
             if parse_segment(path, OUTPUT_SUFFIX).is_some() {
-                if let Err(error) = io.remove_file(path) {
-                    scan.close_files(io);
-                    return Err(error);
-                }
+                let _removed = io.remove_file(path);
                 continue;
             }
             let Some(number) = parse_segment(path, DATA_SUFFIX) else {
@@ -299,34 +305,40 @@ pub fn scan_roots<Backend: Io>(
             }
         }
     }
-    if let Err(error) = drop_inputs(io, &mut scan) {
-        scan.close_files(io);
-        return Err(error);
-    }
+    drop_inputs(io, &mut scan);
     Ok(scan)
+}
+
+/// Remove a file that has to go, or note it for the park: a store that can't open is an outage for every key, and one
+/// leftover file is not
+pub fn remove_or_hold<Backend: Io>(io: &Backend, root: &Path, volume: usize, number: SegmentNumber, held: &mut Vec<HeldFile>) {
+    let removed = match io.remove_file(&data_path(root, number)) {
+        Ok(()) => true,
+        Err(error) => error.kind() == ErrorKind::NotFound,
+    };
+    if !removed || io.sync_directory(root).is_err() {
+        held.push(HeldFile { volume, number });
+    }
 }
 
 /// Remove every segment a whole data output lists, before anything counts them, since the output has all that still answers.
 /// A grave output whose inputs are still here belongs to a merge that never finished, and it goes instead
-pub fn drop_inputs<Backend: Io>(io: &Backend, scan: &mut RootScan<Backend::File>) -> Result<()> {
+pub fn drop_inputs<Backend: Io>(io: &Backend, scan: &mut RootScan<Backend::File>) {
     let is_final = |found: &&FoundSealed<Backend::File>| !found.head.is_grave_output;
     let inputs: Vec<SegmentNumber> = scan.sealed.iter().filter(is_final).flat_map(|found| found.head.inputs()).copied().collect();
     for input in inputs {
         if let Some(at) = scan.sealed.iter().position(|found| found.head.segment == input) {
             let found = scan.sealed.remove(at);
             io.close_file(found.file);
-            io.remove_file(&data_path(&found.path, input))?;
-            io.sync_directory(&found.path)?;
+            remove_or_hold(io, &found.path, found.volume, input, &mut scan.held);
         }
         if let Some(at) = scan.empty.iter().position(|found| found.number == input) {
             let found = scan.empty.remove(at);
-            io.remove_file(&data_path(&found.root, input))?;
-            io.sync_directory(&found.root)?;
+            remove_or_hold(io, &found.root, found.volume, input, &mut scan.held);
         }
         if let Some(at) = scan.damaged.iter().position(|found| found.number == input) {
             let found = scan.damaged.remove(at);
-            io.remove_file(&data_path(&found.path, input))?;
-            io.sync_directory(&found.path)?;
+            remove_or_hold(io, &found.path, found.volume, input, &mut scan.held);
         }
     }
     let mut index = 0;
@@ -340,10 +352,8 @@ pub fn drop_inputs<Backend: Io>(io: &Backend, scan: &mut RootScan<Backend::File>
         let found = scan.sealed.remove(index);
         let number = found.head.segment;
         io.close_file(found.file);
-        io.remove_file(&data_path(&found.path, number))?;
-        io.sync_directory(&found.path)?;
+        remove_or_hold(io, &found.path, found.volume, number, &mut scan.held);
     }
-    Ok(())
 }
 
 /// Read one segment and hand its file to the scan, or close it
@@ -506,6 +516,58 @@ impl<Backend: Io> EngineState<Backend> {
             return Err(Error::other("segment table sized below what the roots hold"));
         }
         Ok(())
+    }
+
+    /// Check a file is the one kind a full park may leave behind: with no record and no rows it can bring nothing back, and the
+    /// next open removes it. Both have to hold, so nothing else passes
+    pub fn is_empty_past_the_park(&self, path: &Path, parked: usize) -> Result<bool> {
+        if parked < MOST_PARKED {
+            return Ok(false);
+        }
+        let file = self.io.open_read_only(path)?;
+        let is_empty = holds_nothing(&file);
+        self.io.close_file(file);
+        Ok(is_empty? && self.has_no_rows(path)?)
+    }
+
+    /// Check a data file's rows file is gone or holds nothing
+    pub fn has_no_rows(&self, path: &Path) -> Result<bool> {
+        let rows = path.with_extension(ROWS_SUFFIX.trim_start_matches('.'));
+        let file = match self.io.open_read_only(&rows) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        let length = file.length();
+        self.io.close_file(file);
+        Ok(length?.0 == 0)
+    }
+
+    /// List the files with a segment's name that neither the lists nor a hold account for, which is always none at a quiet
+    /// moment. A test asks this after every open and before every close
+    pub fn unlisted_segments(&self, volume: &Volume<Backend>) -> Result<Vec<SegmentNumber>> {
+        let claims = hold(&volume.claims);
+        let parked = hold(&volume.parked);
+        let outputs = hold(&volume.partial_outputs);
+        let damaged = hold(&volume.damaged);
+        let mut unlisted = Vec::new();
+        for root in &volume.roots {
+            for path in self.io.list_directory(root)? {
+                let Some(number) = parse_segment(&path, DATA_SUFFIX) else {
+                    continue;
+                };
+                let is_held = volume.table.holds(number)
+                    || claims.open.iter().any(|segment| segment.number == number)
+                    || claims.prepared.as_ref().is_some_and(|segment| segment.number == number)
+                    || parked.iter().flatten().any(|parked| parked.segment == number)
+                    || outputs.iter().flatten().any(|output| output.number == number)
+                    || damaged.contains(&number);
+                if !is_held && !self.is_empty_past_the_park(&path, parked.iter().flatten().count())? {
+                    unlisted.push(number);
+                }
+            }
+        }
+        Ok(unlisted)
     }
 
     /// Rebuild an open segment from its rows, ready to go on taking writes, or return false
@@ -911,7 +973,15 @@ pub fn drop_copied<Backend: Io>(state: &Arc<EngineState<Backend>>, segment: Scan
     let number = segment.found.number;
     state.io.close_file(segment.found.data);
     state.io.close_file(segment.rows);
-    state.io.remove_file(&data_path(path, number))?;
+    // a data file with no rows and no tail reads as damage, so the rows go only once it has
+    let has_room = target.can_park(1);
+    if !state.remove_or_park(target, path, number) {
+        // only an empty file may stay in no list, so a copied one that won't go ends the open
+        if !has_room {
+            return Err(Error::from(ErrorKind::StorageFull));
+        }
+        return Ok(());
+    }
     state.io.remove_file(&rows_path(path, number))?;
     state.io.sync_directory(path)
 }
@@ -1569,7 +1639,7 @@ pub fn sort_empties<Backend: Io>(
             });
             continue;
         }
-        state.io.remove_file(&data_path(&found.root, found.number))?;
+        let _is_gone = state.remove_or_park(&state.volumes[volume], &found.root, found.number);
     }
     Ok(())
 }

@@ -875,7 +875,7 @@ impl<Backend: Io> EngineState<Backend> {
         self.io.close_file(segment.rows);
         self.slot_files[segment.slot.0 as usize].set(None);
         self.free_slot(segment.slot);
-        self.io.remove_file(&data_path(root, segment.number))?;
+        let _is_gone = self.remove_or_park(volume, root, segment.number);
         self.io.remove_file(&rows_path(root, segment.number))?;
         self.io.sync_directory(root)
     }
@@ -995,7 +995,7 @@ impl<Backend: Io> EngineState<Backend> {
             Err(source) => {
                 self.io.close_file(data);
                 // the file is empty, and open drops an empty file it finds
-                let _removed = self.io.remove_file(&data_file);
+                let _is_gone = self.remove_or_park(volume, path, number);
                 return Err(store_error(volume, "creating a rows file", source));
             },
         };
@@ -1003,7 +1003,7 @@ impl<Backend: Io> EngineState<Backend> {
         if let Err(source) = self.io.sync_directory(path) {
             self.io.close_file(data);
             self.io.close_file(rows);
-            let _removed = self.io.remove_file(&data_file);
+            let _is_gone = self.remove_or_park(volume, path, number);
             let _removed = self.io.remove_file(&rows_file);
             return Err(store_error(volume, "syncing a root", source));
         }

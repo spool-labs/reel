@@ -29,7 +29,8 @@ pub const MOST_PARKED: usize = 8;
 /// A segment out of every list, whose file goes once no read holds it
 #[derive(Clone, Debug)]
 pub struct ParkedSegment<File> {
-    pub retired: RetiredSegment<File>,
+    /// Its slot and handle, which a file open couldn't remove never had
+    pub retired: Option<RetiredSegment<File>>,
     pub segment: SegmentNumber,
     /// The summary that dropped this row is on disk, or the next look at the park saves it first
     pub is_saved: bool,
@@ -99,6 +100,8 @@ pub struct Volume<Backend: Io> {
     pub has_held_frees: AtomicBool,
     pub segments_unlinked: AtomicU64,
     pub segments_parked: AtomicU64,
+    /// Empty files a failed remove left with the park full, which the next open removes
+    pub empties_left: AtomicU64,
     pub parked: Mutex<[Option<ParkedSegment<Backend::File>>; MOST_PARKED]>,
     pub segments_rewritten: AtomicU64,
     /// A rewrite has made its first row decision and not installed. Rows it decided on must stay as they were, so no walk
@@ -185,6 +188,11 @@ impl<Backend: Io> Volume<Backend> {
     /// Check a merge running beside the walk has taken a segment
     pub fn is_merging(&self, segment: SegmentNumber) -> bool {
         hold(&self.merging).contains(&segment)
+    }
+
+    /// Check no read holds a parked segment any more
+    pub fn is_unpinned(&self, parked: &ParkedSegment<Backend::File>) -> bool {
+        parked.retired.as_ref().is_none_or(|retired| self.table.retired_pins(retired) == 0)
     }
 
     /// Count the park's free slots

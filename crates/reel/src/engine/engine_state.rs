@@ -1,6 +1,7 @@
 //! Everything a store shares between its threads
 
 use std::io::{Error, ErrorKind};
+use std::path::Path;
 use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
@@ -14,7 +15,8 @@ use crate::engine::column_info::ColumnInfo;
 use crate::engine::cue::{CueTable, JobCounts};
 use crate::engine::engine_sizing::EngineSizing;
 use crate::engine::open_segment::{RecordWindow, RowQueue};
-use crate::engine::open_segment::{data_path, output_path};
+use crate::engine::compact_job::park;
+use crate::engine::open_segment::{data_path, output_path, rows_path};
 use crate::engine::walk_job::{FREE_BLOCK_BYTES, FreeRecord};
 use crate::engine::volume::{ParkedSegment, RewriteOutput, Volume};
 use crate::segment::range_covers::Cover;
@@ -305,6 +307,22 @@ impl<Backend: Io> EngineState<Backend> {
         hold(&self.volumes[volume].summary).is_lookup_whole()
     }
 
+    /// Remove a data file that's in no list and say so, or hold it in the park for a retry. A full park leaves it for the next
+    /// open, and only an empty file may come this far with one, so the count of those is the report's
+    pub fn remove_or_park(&self, volume: &Volume<Backend>, root: &Path, number: SegmentNumber) -> bool {
+        let is_gone = match self.io.remove_file(&data_path(root, number)) {
+            Ok(()) => true,
+            Err(error) => error.kind() == ErrorKind::NotFound,
+        };
+        if !is_gone {
+            if !volume.can_park(1) {
+                volume.empties_left.fetch_add(1, Ordering::Relaxed);
+            }
+            park(volume, None, number, true);
+        }
+        is_gone
+    }
+
     /// Remove a parked segment's file and close it, after saving the summary if the save that dropped its row failed. Any
     /// failure hands the segment back to stay parked, since no grave may drop while a file that could bring its key back is
     /// on disk
@@ -328,14 +346,25 @@ impl<Backend: Io> EngineState<Backend> {
                     return Err(parked);
                 },
             }
+            // a file open held can still have its rows beside it
+            match self.io.remove_file(&rows_path(root, parked.segment)) {
+                Ok(()) => {},
+                Err(error) if error.kind() == ErrorKind::NotFound => {},
+                Err(_error) => {
+                    volume.reclaim_retries.fetch_add(1, Ordering::Relaxed);
+                    return Err(parked);
+                },
+            }
             if self.io.sync_directory(root).is_err() {
                 volume.reclaim_retries.fetch_add(1, Ordering::Relaxed);
                 return Err(parked);
             }
         }
         volume.segments_parked.fetch_sub(1, Ordering::AcqRel);
-        volume.table.free_retired(&parked.retired);
-        self.io.close_file(parked.retired.file);
+        if let Some(retired) = parked.retired {
+            volume.table.free_retired(&retired);
+            self.io.close_file(retired.file);
+        }
         Ok(())
     }
 

@@ -10,7 +10,7 @@ use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, RowCount, Writ
 use crate::pool::touched_capacity;
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::engine_state::EngineState;
-use crate::engine::open_segment::{SegmentPhase, data_path, rows_path};
+use crate::engine::open_segment::{SegmentPhase, rows_path};
 use crate::engine::volume::{NO_SEAL, Volume};
 use crate::guard::hold;
 use crate::index::key_hash::hash_key;
@@ -510,7 +510,7 @@ impl<Backend: Io> SealJob<Backend> {
         hold(&volume.claims).open.retain(|segment| segment.slot != target.slot);
 
         let root = &volume.roots[target.root.0 as usize];
-        state.io.remove_file(&data_path(root, target.number))?;
+        let _is_gone = state.remove_or_park(volume, root, target.number);
         state.io.remove_file(&rows_path(root, target.number))?;
         state.io.sync_directory(root)?;
         state.slot_files[target.slot.0 as usize].set(None);

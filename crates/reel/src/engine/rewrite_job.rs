@@ -994,7 +994,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         volume.wants_compaction.store(true, Ordering::Release);
         for (segment, retired) in inputs.iter().zip(retired) {
             if let Some(retired) = retired {
-                park(volume, retired, *segment, saved.is_ok());
+                park(volume, Some(retired), *segment, saved.is_ok());
             }
         }
         saved

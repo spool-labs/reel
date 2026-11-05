@@ -172,7 +172,7 @@ impl<Backend: Io> CompactJob<Backend> {
     pub fn take_parked(&self, volume: &Volume<Backend>) -> Option<ParkedSegment<Backend::File>> {
         let mut parked = hold(&volume.parked);
         let slot = parked.iter_mut().find(|slot| {
-            slot.as_ref().is_some_and(|parked| volume.table.retired_pins(&parked.retired) == 0)
+            slot.as_ref().is_some_and(|parked| volume.is_unpinned(parked))
         })?;
         slot.take()
     }
@@ -342,7 +342,7 @@ impl<Backend: Io> CompactJob<Backend> {
         hold(&volume.summary).remove(segment);
         // the file goes only behind a saved summary, or open would find a row with no file
         let saved = state.save_summary(volume);
-        park(volume, retired, segment, saved.is_ok());
+        park(volume, Some(retired), segment, saved.is_ok());
         saved?;
         volume.segments_unlinked.fetch_add(1, Ordering::AcqRel);
         Ok(())
@@ -359,7 +359,7 @@ pub fn park_again<Backend: Io>(volume: &Volume<Backend>, parked: ParkedSegment<B
 /// Hold a retired segment until no read holds it. The caller has checked `Volume::can_park`, and one planner fills the park
 pub fn park<Backend: Io>(
     volume: &Volume<Backend>,
-    retired: RetiredSegment<Backend::File>,
+    retired: Option<RetiredSegment<Backend::File>>,
     segment: SegmentNumber,
     is_saved: bool,
 ) {

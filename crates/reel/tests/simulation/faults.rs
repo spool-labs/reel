@@ -26,7 +26,7 @@ const BUDGET: ByteCount = ByteCount(76 * 1024 * 1024);
 // a test holds each seed with a traced bug: 0 `failed_open` and `failed_close`, 1 `rows_sync` and `tail_sync`, 37 and
 // 349 `covered_last` and `later_sync`, 125 `one_copy`, 681 `tail_then_cut`, 959 `flushed_unknown`, 1000 `open_covers`, 1002
 // `wrong_place`. Seeds 1 and 1000 are mapped from notes, with no replay. The rest are plain extra seeds
-const SEEDS: [u64; 8] = [0, 1, 2, 3, 17, 31, 37, 681];
+const SEEDS: [u64; 9] = [0, 1, 2, 3, 17, 31, 37, 62, 681];
 const ROT_SEEDS: [u64; 9] = [125, 349, 959, 1_000, 1_001, 1_002, 1_003, 1_011, 1_031];
 const STEPS: u64 = 3_000;
 const KEY_SPACE: u64 = 30;
@@ -309,12 +309,13 @@ impl Run {
 
     fn arm_fault(&mut self) {
         let count = OperationCount(1 + self.streams.fault.below(3));
-        match self.streams.fault.below(6) {
+        match self.streams.fault.below(7) {
             0 => self.io.fail_syncs(count),
             1 => self.io.fill_writes(count),
             2 => self.io.fail_writes(count),
             3 => self.io.fail_creates(count),
             4 => self.io.fail_directory_syncs(count),
+            5 => self.io.fail_removes(count),
             _last => {
                 let file = SYNCED_FILES[self.streams.fault.below(SYNCED_FILES.len() as u64) as usize];
                 self.io.fail_file_sync(file, OperationCount(self.streams.fault.below(MOST_SYNC_SKIP)));
@@ -329,6 +330,7 @@ impl Run {
         self.io.fail_writes(none);
         self.io.fail_creates(none);
         self.io.fail_directory_syncs(none);
+        self.io.fail_removes(none);
         self.io.clear_file_sync();
     }
 
@@ -633,10 +635,22 @@ impl Run {
         panic!("jobs never went quiet");
     }
 
+    // every file with a segment's name sits in the lists or under a hold, after any failed remove, sync or rename
+    fn check_files(&self, store: &Store) {
+        for volume in &store.state.volumes {
+            // an armed crash can land on the listing itself
+            let Ok(unlisted) = store.state.unlisted_segments(volume) else {
+                return;
+            };
+            assert!(unlisted.is_empty(), "seed {}: {unlisted:?} are in no list", self.seed);
+        }
+    }
+
     fn run(mut self) {
         while self.steps_left > 0 {
             let store = self.open();
             self.reconcile(&store);
+            self.check_files(&store);
             let has_crashed = self.work(&store);
             if has_crashed {
                 self.crash();
@@ -646,6 +660,7 @@ impl Run {
 
             self.clear_faults();
             self.settle();
+            self.check_files(&store);
             // a volume a failed sync stopped refuses a clean close, and the next open sorts it out
             let _closed = store.close();
             drop(store);

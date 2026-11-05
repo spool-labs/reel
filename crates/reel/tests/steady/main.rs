@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
@@ -281,6 +281,15 @@ fn counts(faults: &mut FaultCounter) -> Counts {
     }
 }
 
+// a store's scratch folder, gone when this drops, so a run that panics leaves nothing on a small tmpfs
+struct ScratchRoot(PathBuf);
+
+impl Drop for ScratchRoot {
+    fn drop(&mut self) {
+        let _removed = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn open(root: &Path) -> Store {
     ReelStore::open(PlainIo::new(), &config(root, BUDGET)).expect("open")
 }
@@ -408,6 +417,7 @@ fn has_reclaimed(store: &Store, unlinked_before: u64, freed_before: u64) -> bool
 // a long get beside a burst of frees answers every time: a free moves no count a read that succeeded looks at
 fn free_burst() -> u64 {
     let root = scratch_root();
+    let _cleanup = ScratchRoot(root.clone());
     let store = open(&root);
     let record = vec![1; FREE_IN_PLACE_BYTES.0 as usize];
     store.put(META, b"long", &vec![2; LONG_GET_BYTES]).expect("put");
@@ -451,7 +461,6 @@ fn free_burst() -> u64 {
     println!("{gets} long gets beside {frees} frees: {errors} errors, {refused} refused");
     store.close().expect("close");
     drop(store);
-    fs::remove_dir_all(&root).expect("remove");
     errors + refused + u64::from(can_free && frees == 0)
 }
 
@@ -536,6 +545,7 @@ fn main() {
     }
 
     let root = scratch_root();
+    let cleanup = ScratchRoot(root.clone());
     let mut inputs = inputs();
     prepare(&root);
 
@@ -618,7 +628,7 @@ fn main() {
     IS_WINDOW.store(false, Ordering::Release);
     let close_allocations = ALLOCATIONS.load(Ordering::Acquire) - allocations_before_close;
     drop(store);
-    fs::remove_dir_all(&root).expect("remove");
+    drop(cleanup);
 
     let allocations = after.allocations - before.allocations;
     let frees = after.frees - before.frees;

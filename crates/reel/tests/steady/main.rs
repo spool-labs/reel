@@ -5,28 +5,28 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::backtrace::Backtrace;
 use std::cell::Cell;
+use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
-use std::process;
+use std::path::Path;
+use std::process::{self, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel::io::plain::PlainIo;
-use reel::record::codec::Codec;
 use reel::segment::segment_tail::SECOND_TAIL_DISTANCE;
-use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, VolumeId};
+use reel_api::units::ByteCount;
 
-const META: ColumnId = ColumnId(1);
-const BULK: ColumnId = ColumnId(2);
+mod store_config;
+
+use store_config::{BULK, META, config, scratch_root};
+
 const BUDGET: ByteCount = ByteCount(192 * 1024 * 1024);
-const MIB: u64 = 1024 * 1024;
-const BUDGETS: [u64; 4] = [128, 192, 512, 4_096];
+// set in the child that makes the damaged store, so the measured process runs one open
+const PREPARE_ROOT: &str = "REEL_STEADY_PREPARE";
 const KEYS: usize = 512;
 const SMALL_BYTES: usize = 100;
 const CHUNKED_BYTES: usize = 200_000;
@@ -195,25 +195,6 @@ fn counts(faults: &mut FaultCounter) -> Counts {
     }
 }
 
-fn config(root: &Path, budget: ByteCount) -> StoreConfig {
-    let column = |id: ColumnId, name: &str, codec: Codec| ColumnConfig {
-        id,
-        name: name.to_string(),
-        key_shape: KeyShape::Variable { most: 64 },
-        codec,
-        volume: VolumeId(0),
-    };
-    StoreConfig {
-        memory_budget: budget,
-        volumes: vec![VolumeConfig {
-            name: "steady".to_string(),
-            roots: vec![root.to_path_buf()],
-            sync: SyncPolicy::Never,
-        }],
-        columns: vec![column(META, "meta", Codec::None), column(BULK, "bulk", Codec::Lz4)],
-    }
-}
-
 fn open(root: &Path) -> Store {
     ReelStore::open(PlainIo::new(), &config(root, BUDGET)).expect("open")
 }
@@ -342,51 +323,22 @@ fn resident_bytes() -> Option<u64> {
     Some(kib * KIB)
 }
 
-fn scratch_root() -> PathBuf {
-    let root = std::env::temp_dir().join(format!("reel-steady-{}", process::id()));
-    fs::create_dir_all(&root).expect("create");
-    root
-}
-
-// open fits inside each budget, and the report agrees with the heap the allocator sees
-fn check_budgets() -> u64 {
-    let mut failures = 0;
-    for budget in BUDGETS {
-        let root = scratch_root();
-        let live_before = LIVE_BYTES.load(Ordering::Acquire);
-        let budget = ByteCount(budget * MIB);
-        let store = ReelStore::open(PlainIo::new(), &config(&root, budget)).expect("open");
-        let live = LIVE_BYTES.load(Ordering::Acquire) - live_before;
-        let report = store.memory_report();
-        let held = report.heap_total().0 + report.thread_stacks.0;
-        let shard = &store.state.sizing.shard;
-        println!(
-            "budget {} MiB: {} B held, {live} B live, {:?} rows a segment, {:?} a segment, {} pages {} nodes {} slots a shard",
-            budget.0 / MIB,
-            held,
-            store.state.sizing.segment_rows,
-            store.state.sizing.segment_bytes,
-            shard.pages.0,
-            shard.nodes.0,
-            shard.table_slots,
-        );
-        println!("{report:?}");
-        if held > budget.0 || live.abs_diff(report.heap_total().0) > report.heap_total().0 / REPORT_SLACK_DIVISOR {
-            println!("budget {} MiB fails", budget.0 / MIB);
-            failures += 1;
-        }
-        store.close().expect("close");
-        drop(store);
-        fs::remove_dir_all(&root).expect("remove");
-    }
-    failures
+// an earlier open leaves the allocator holding freed pages, so the process that counts runs none
+fn prepare(root: &Path) {
+    let program = env::current_exe().expect("path");
+    let status = Command::new(program).env(PREPARE_ROOT, root).status().expect("run");
+    assert!(status.success());
 }
 
 fn main() {
-    let budget_failures = check_budgets();
+    if let Some(root) = env::var_os(PREPARE_ROOT) {
+        damage(Path::new(&root), &inputs());
+        return;
+    }
+
     let root = scratch_root();
     let mut inputs = inputs();
-    damage(&root, &inputs);
+    prepare(&root);
 
     let live_before = LIVE_BYTES.load(Ordering::Acquire);
     let resident_before = resident_bytes();
@@ -398,7 +350,7 @@ fn main() {
     let resident_grown = resident_bytes().zip(resident_before).map(|(after, before)| after.saturating_sub(before));
     println!("open: {live_grown} B live, {reported} B reported, {} B of stacks, resident grew {resident_grown:?}", report.thread_stacks.0);
     println!("{report:?}");
-    let mut failures = budget_failures;
+    let mut failures = 0;
     if live_grown.abs_diff(reported) > reported / REPORT_SLACK_DIVISOR {
         println!("memory_report misses the heap by more than a tenth");
         failures += 1;

@@ -20,3 +20,8 @@ workspace = true
 name = "steady"
 path = "tests/steady/main.rs"
 harness = false
+
+[[test]]
+name = "budgets"
+path = "tests/budgets/main.rs"
+harness = false

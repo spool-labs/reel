@@ -68,7 +68,8 @@ pub struct EngineState<Backend: Io> {
     pub row_cache: BlockCache,
     pub queues: Vec<Mutex<RowQueue>>,
     pub spare_groups: Vec<Mutex<Option<RowGroupBuffer>>>,
-    pub spare_windows: Vec<Mutex<Option<RecordWindow>>>,
+    pub windows: Vec<[RecordWindow; 2]>,
+    pub window_copies: Vec<Mutex<Vec<u8>>>,
     pub slot_files: Vec<SlotFile<Backend::File>>,
     pub free_slots: Mutex<Vec<OpenSlot>>,
     pub encoders: Pool<RecordEncoder>,
@@ -310,12 +311,13 @@ impl<Backend: Io> EngineState<Backend> {
         report.queues = ByteCount(report.queues.0 + batch_rows.0 + batch_records.0 + batch_lengths.0);
         for queue in &self.queues {
             let queue = hold(queue);
-            report.queues = ByteCount(report.queues.0 + queue.filling.heap_bytes().0 + queue.records.heap_bytes().0);
+            report.queues = ByteCount(report.queues.0 + queue.filling.heap_bytes().0);
         }
-        for window in &self.spare_windows {
-            if let Some(window) = hold(window).as_ref() {
-                report.queues = ByteCount(report.queues.0 + window.heap_bytes().0);
-            }
+        for windows in &self.windows {
+            report.queues = ByteCount(report.queues.0 + windows[0].heap_bytes().0 + windows[1].heap_bytes().0);
+        }
+        for copy in &self.window_copies {
+            report.queues = ByteCount(report.queues.0 + hold(copy).capacity() as u64);
         }
         for group in &self.spare_groups {
             if let Some(group) = hold(group).as_ref() {

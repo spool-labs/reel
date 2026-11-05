@@ -19,7 +19,7 @@ use crate::engine::engine_sizing::{
     PLANNED_SEGMENT_BYTES, StoreShape, GATHER_BYTES, READ_BUFFERS, WRITE_BUFFERS,
 };
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
-use crate::engine::open_segment::{RecordWindow, RowQueue, fits_a_segment_path};
+use crate::engine::open_segment::{RECORD_WINDOW_BYTES, RecordWindow, RowQueue, fits_a_segment_path};
 use crate::engine::read_path::RecordWant;
 use crate::engine::recovery::{
     RootScan, SummaryFound, list_roots, load_covers, read_summaries, recover_segments, save_cleared_spans, scan_roots,
@@ -291,6 +291,7 @@ impl<Backend: Io> ReelStore<Backend> {
             if volume.has_failed() {
                 outcome = outcome.and(Err(StoreError::VolumeFailed { volume: volume.id }));
             }
+            outcome = outcome.and(self.state.drop_prepared(volume).map_err(open_error("removing a spare segment")));
             self.state.close_volume(volume);
             hold(&volume.locks).clear();
         }
@@ -707,6 +708,8 @@ pub fn build_state<Backend: Io>(
             claims: Mutex::new(ClaimState {
                 open: touched_room(open_slots),
                 is_creating: false,
+                prepared: None,
+                wants_prepared: false,
                 bytes_since_sync: ByteCount(0),
                 next_root: 0,
             }),
@@ -732,13 +735,15 @@ pub fn build_state<Backend: Io>(
 
     let mut queues = Vec::with_capacity(open_slots);
     let mut spare_groups = Vec::with_capacity(open_slots);
-    let mut spare_windows = Vec::with_capacity(open_slots);
+    let mut windows = Vec::with_capacity(open_slots);
+    let mut window_copies = Vec::with_capacity(open_slots);
     let mut slot_files = Vec::with_capacity(open_slots);
     let mut free_slots = Vec::with_capacity(open_slots);
     for slot in 0..open_slots {
         queues.push(Mutex::new(RowQueue::new(GROUP_BYTES)));
         spare_groups.push(Mutex::new(Some(RowGroupBuffer::new(GROUP_BYTES))));
-        spare_windows.push(Mutex::new(Some(RecordWindow::new())));
+        windows.push([RecordWindow::new(), RecordWindow::new()]);
+        window_copies.push(Mutex::new(touched_zeroes(RECORD_WINDOW_BYTES)));
         slot_files.push(SlotFile::new());
         free_slots.push(OpenSlot((open_slots - 1 - slot) as u8));
     }
@@ -784,7 +789,8 @@ pub fn build_state<Backend: Io>(
         row_cache: BlockCache::new(row_share, ROW_BLOCK_BYTES),
         queues,
         spare_groups,
-        spare_windows,
+        windows,
+        window_copies,
         slot_files,
         free_slots: Mutex::new(free_slots),
         encoders: Pool::new(encoders),

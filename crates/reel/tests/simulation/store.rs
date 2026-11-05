@@ -1,13 +1,15 @@
 //! The whole engine on the simulated disk, checked against a plain model of versions
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 
 use crate::seed_sets::seeds;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::engine::open_segment::{SegmentPhase, rows_path};
 use reel::engine::reel_store::ReelStore;
 use reel::guard::hold;
+use reel::io::{Io, IoFile};
 use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
@@ -15,7 +17,7 @@ use reel::record::codec::Codec;
 use reel_api::column_id::ColumnId;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId};
+use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
 
 const ROOT: &str = "/disk/meta";
 const COLUMN: ColumnId = ColumnId(1);
@@ -37,6 +39,8 @@ const FAILED_OPEN_POINTS: u64 = 40;
 const QUIET_ROWS: u64 = 100;
 const WINDOW_ROWS: u64 = 500;
 const WINDOW_VALUE: usize = 300;
+const REFILL_LARGE: usize = 3_000;
+const SEND_CRASH_POINTS: u64 = 8;
 const LARGE_ENOUGH: usize = 100_000;
 
 type Store = ReelStore<SimulatedIo>;
@@ -669,26 +673,225 @@ fn window_rolls() {
     store.close().expect("close");
 }
 
-// a get during the window's write waits for it and reads the record whole
+// a get of a held record takes no queue lock, so a writer holding it for as long as it likes can't slow a read
 #[test]
-fn window_sending() {
+fn held_read_free() {
     let io = SimulatedIo::new(Seed(96));
     let store = open(&io);
     store.put(COLUMN, b"key", b"value").expect("put");
     let slot = hold(&store.state.volumes[0].claims).open[0].slot;
-    hold(&store.state.queues[slot.0 as usize]).sending = Some((FileOffset(0), FileOffset(1)));
-    let spare = hold(&store.state.spare_windows[slot.0 as usize]).take();
+
+    let guard = hold(&store.state.queues[slot.0 as usize]);
+    let mut buf = Vec::new();
+    assert!(store.get(COLUMN, b"key", &mut buf).expect("get"));
+    drop(guard);
+
+    assert_eq!(buf, b"value");
+    store.close().expect("close");
+}
+
+// a window read of a held record cuts it like a read from the file
+#[test]
+fn held_window() {
+    let io = SimulatedIo::new(Seed(99));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"0123456789").expect("put");
+    let window = ValueWindow {
+        offset: ByteCount(2),
+        length: ByteCount(3),
+    };
+
+    let mut buf = Vec::new();
+    assert!(store.get_range(COLUMN, b"key", window, &mut buf).expect("window"));
+
+    assert_eq!(buf, b"234");
+    store.close().expect("close");
+}
+
+// a writer past the end of a range and a smaller one beside it both land: nothing goes in the rest of a range once its
+// refill starts, so the next range can't take a record with it
+#[test]
+fn refill_beside() {
+    let io = SimulatedIo::new(Seed(100));
+    let store = open(&io);
+    let state = &store.state;
+    store.put(COLUMN, b"first", b"value").expect("put");
+    let slot = hold(&state.volumes[0].claims).open[0].slot;
+    let index = slot.0 as usize;
+    let large = vec![1; REFILL_LARGE];
+    let room = |store: &Store| {
+        let guard = hold(&store.state.queues[index]);
+        guard.window_room - store.state.windows[index][guard.live_window].used()
+    };
+    let mut number = 0_u64;
+    while room(&store) > REFILL_LARGE {
+        store.put(COLUMN, &number.to_le_bytes(), &large).expect("put");
+        number += 1;
+    }
+    state.take_writing_turn(slot);
 
     thread::scope(|scope| {
-        let reader = scope.spawn(|| {
-            let mut buf = Vec::new();
-            store.get(COLUMN, b"key", &mut buf).map(|has_value| (has_value, buf))
-        });
-        *hold(&store.state.spare_windows[slot.0 as usize]) = spare;
-        hold(&store.state.queues[slot.0 as usize]).sending = None;
-        let (has_value, buf) = reader.join().expect("join").expect("get");
-        assert!(has_value);
-        assert_eq!(buf, b"value");
+        let big = scope.spawn(|| store.put(COLUMN, b"big", &large));
+        while !hold(&state.queues[index]).is_refilling {
+            thread::yield_now();
+        }
+        let small = scope.spawn(|| store.put(COLUMN, b"small", b"value"));
+        hold(&state.queues[index]).is_writing = false;
+        big.join().expect("join").expect("put");
+        small.join().expect("join").expect("put");
     });
+
+    let mut buf = Vec::new();
+    assert!(store.get(COLUMN, b"small", &mut buf).expect("get"));
+    assert_eq!(buf, b"value");
+    assert!(store.get(COLUMN, b"big", &mut buf).expect("get"));
+    assert_eq!(buf, large);
+    store.flush().expect("flush");
+    io.kill();
+    drop(store);
+    let store = open(&io);
+    assert!(store.get(COLUMN, b"small", &mut buf).expect("get"));
+    store.close().expect("close");
+}
+
+// a segment marked to seal gets no new range, so a window can't land under its footer
+#[test]
+fn no_range_sealing() {
+    let io = SimulatedIo::new(Seed(101));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let volume = &store.state.volumes[0];
+    let slot = {
+        let mut claims = hold(&volume.claims);
+        claims.open[0].phase = SegmentPhase::Sealing;
+        claims.open[0].slot
+    };
+    let before = hold(&volume.claims).open[0].write_end;
+
+    store.state.write_out(slot).expect("write out");
+    assert!(store.state.claim_window(volume, slot, 1));
+
+    assert_eq!(hold(&volume.claims).open[0].write_end, before);
+    store.close().expect("close");
+}
+
+// rows never go out ahead of records a failed write kept back, and both arrive once writes work again
+#[test]
+fn window_retry() {
+    let io = SimulatedIo::new(Seed(102));
+    let store = open(&io);
+    store.put(COLUMN, b"first", b"value").expect("put");
+    store.flush().expect("flush");
+    store.put(COLUMN, b"second", b"value").expect("put");
+    let slot = hold(&store.state.volumes[0].claims).open[0].slot;
+    let rows_before = rows_length(&io);
+
+    io.fail_writes_after(OperationCount(0));
+    assert!(store.state.write_out(slot).is_err());
+    store.put(COLUMN, b"third", b"value").expect("put");
+
+    assert_eq!(rows_length(&io), rows_before);
+    let mut buf = Vec::new();
+    assert!(store.get(COLUMN, b"second", &mut buf).expect("get"));
+    store.flush().expect("flush");
+    io.kill();
+    drop(store);
+    let store = open(&io);
+    assert!(store.get(COLUMN, b"second", &mut buf).expect("get"));
+    assert!(store.get(COLUMN, b"third", &mut buf).expect("get"));
+    store.close().expect("close");
+}
+
+fn rows_length(io: &SimulatedIo) -> u64 {
+    let mut total = 0;
+    for path in io.list_directory(Path::new(ROOT)).expect("list") {
+        if path.extension().is_some_and(|extension| extension == "rows") {
+            let file = io.open_read_only(&path).expect("open");
+            total += file.length().expect("length").0;
+            io.close_file(file);
+        }
+    }
+    total
+}
+
+// a crash at any step of a send leaves no row listing bytes that never went out
+#[test]
+fn send_crash() {
+    for crash_at in 0..SEND_CRASH_POINTS {
+        for is_power_cut in [false, true] {
+            let io = SimulatedIo::new(Seed(crash_at));
+            let store = open(&io);
+            store.put(COLUMN, b"older", b"value").expect("put");
+            store.flush().expect("flush");
+            store.put(COLUMN, b"key", b"value").expect("put");
+
+            io.arm_crash(OperationCount(crash_at));
+            let flushed = store.flush().is_ok() && !io.is_crashed();
+            if is_power_cut {
+                io.power_cut();
+            } else {
+                io.kill();
+            }
+            drop(store);
+
+            let store = open(&io);
+            let mut buf = Vec::new();
+            assert!(store.get(COLUMN, b"older", &mut buf).expect("get"), "crash at {crash_at}");
+            let found = store.get(COLUMN, b"key", &mut buf).expect("get");
+            assert!(found || !flushed, "crash at {crash_at}");
+            store.close().expect("close");
+        }
+    }
+}
+
+// a half-full segment asks for the next one, a claim takes it with no sync of its own, and close removes a spare
+#[test]
+fn segment_ahead() {
+    let io = SimulatedIo::new(Seed(97));
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    for number in 0..volume.segment_rows.0 / 2 + 1 {
+        store.put(COLUMN, &number.to_le_bytes(), b"v").expect("put");
+    }
+    for _step in 0..SETTLE_STEPS {
+        if hold(&volume.claims).prepared.is_some() {
+            break;
+        }
+        if io.step_any().is_none() {
+            io.advance_clock(SETTLE_TICK);
+        }
+    }
+    assert!(hold(&volume.claims).prepared.is_some());
+
+    let spare = hold(&volume.claims).prepared.as_ref().map(|segment| segment.number);
+    let before = io.write_calls();
+    store.seal_now();
+    store.put(COLUMN, b"after", b"value").expect("put");
+
+    assert_eq!(hold(&volume.claims).open.iter().find(|segment| segment.phase == SegmentPhase::Taking).map(|segment| segment.number), spare);
+    assert_eq!(io.write_calls(), before);
+    store.close().expect("close");
+}
+
+// a spare no claim took leaves with close, and the next open finds nothing of it
+#[test]
+fn spare_closed() {
+    let io = SimulatedIo::new(Seed(98));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    hold(&store.state.volumes[0].claims).wants_prepared = true;
+    store.state.prepare_segments();
+    let spare = hold(&store.state.volumes[0].claims).prepared.as_ref().map(|segment| segment.number);
+    assert!(spare.is_some());
+
+    store.close().expect("close");
+    drop(store);
+
+    let listing = io.list_directory(Path::new(ROOT)).expect("list");
+    let spare_rows = spare.map(|number| rows_path(Path::new(ROOT), number).to_path_buf());
+    assert!(!listing.iter().any(|path| Some(path) == spare_rows.as_ref()));
+    let store = open(&io);
+    let mut buf = Vec::new();
+    assert!(store.get(COLUMN, b"key", &mut buf).expect("get"));
     store.close().expect("close");
 }

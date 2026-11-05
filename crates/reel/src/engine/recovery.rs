@@ -485,6 +485,7 @@ impl<Backend: Io> EngineState<Backend> {
         let unsynced = ByteCount(kept_end.0 - rewrite_from.0);
         rewrite_range(&scanned.rows, rewrite_from, unsynced, &mut vec![0; GROUP_BYTES.0 as usize])?;
         hold(&self.queues[slot.0 as usize]).reset(kept_end, synced_through);
+        self.reset_windows(slot);
         // what open keeps, a read can see: this sync covers it on disk, so no crash or rot can take it back
         self.write_out_turn(slot, &scanned.rows, Some(&found.data))?;
         self.slot_files[slot.0 as usize].set(Some(SlotData {

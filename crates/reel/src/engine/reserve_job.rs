@@ -1,4 +1,4 @@
-//! The job that keeps the write order's limit and the segment counter ahead of what writers need
+//! The job that keeps the limit of the write order, the segment counter and the next segment ahead of what writers need
 
 use std::sync::Arc;
 
@@ -18,6 +18,7 @@ pub struct ReserveJob<Backend: Io> {
 
 impl<Backend: Io> Job for ReserveJob<Backend> {
     fn step(&mut self) -> JobStep {
+        self.state.prepare_segments();
         if self.state.needs_reservation() {
             // a root that took nothing failed its volume, and writers there hear it
             let _is_held = self.state.reserve_ahead();

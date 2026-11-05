@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::io::IoSlice;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread;
 
 use crate::seed_sets::seeds;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
@@ -27,6 +28,7 @@ use reel::record::record_check::{RecordIdentity, RecordKey};
 use reel::record::record_encoder::RecordEncoder;
 use reel::row_kind::RowKind;
 use reel::segment::footer_reader::FooterReader;
+use reel::segment::range_covers::Cover;
 use reel::segment::segment_tail::SECOND_TAIL_DISTANCE;
 use reel::superblock::Superblock;
 use reel_api::column_id::ColumnId;
@@ -152,6 +154,9 @@ fn data_files(io: &SimulatedIo) -> Vec<PathBuf> {
 
 fn stage<'state>(state: &'state State, key: &[u8], value: Option<&[u8]>) -> Staged<'state> {
     let volume = &state.volumes[0];
+    // a claim beside busy writers takes a segment made ahead, so have one ready
+    hold(&volume.claims).wants_prepared = true;
+    state.prepare_segments();
     let kind = if value.is_some() { RowKind::Value } else { RowKind::Grave };
     let length = value.map_or(0, |value| encode(state, key, value, WritePlace(0)).len());
     let request = ClaimRequest {
@@ -1101,5 +1106,59 @@ fn copy_bad() {
         }
     }
     assert!(refused > 0);
+    store.close().expect("close");
+}
+
+// a range delete lands behind a newer one that a stalled writer keeps from publishing: a get at the older one's place
+// must find its cover, though the newer one holds it
+#[test]
+fn covers_out_of_order() {
+    let io = SimulatedIo::new(Seed(40));
+    let store = open(&io);
+    let state = Arc::clone(&store.state);
+    store.put(COLUMN, b"m", b"value").expect("put");
+    let volume = &state.volumes[0];
+    let request = ClaimRequest {
+        bytes: ByteCount(0),
+        rows: RowCount(1),
+        is_alone: false,
+        has_records: true,
+        covers: 1,
+    };
+
+    assert!(volume.covers.hold(1));
+    let older = state.claim(volume, &request).expect("claim");
+    let stalled = stage(&state, b"stalled", None);
+    let older_row = WriteRow {
+        place: older.first_place(),
+        offset: older.offset,
+        length: ByteCount(0),
+        kind: RowKind::Grave,
+        slot: older.slot,
+        segment: older.segment,
+        has_newer_sealed: false,
+    };
+
+    thread::scope(|scope| {
+        let newer = scope.spawn(|| store.delete_range(COLUMN, b"a", b"zz"));
+        while volume.covers.is_empty() {
+            thread::yield_now();
+        }
+
+        assert_eq!(state.land_row(COLUMN, b"a", &older_row).expect("land"), LandOutcome::Landed);
+        volume.covers.add_held(&Cover {
+            column: COLUMN,
+            start: b"a",
+            end: b"z",
+            place: older_row.place,
+            segment: older_row.segment,
+        });
+        older.finish();
+
+        assert_eq!(read(&store, b"m"), None);
+        stalled.finish(&state);
+        newer.join().expect("join").expect("delete");
+    });
+    assert_eq!(read(&store, b"m"), None);
     store.close().expect("close");
 }

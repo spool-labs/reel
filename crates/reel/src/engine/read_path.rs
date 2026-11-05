@@ -9,7 +9,6 @@ use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES;
 use crate::engine::volume::Volume;
-use crate::guard::hold;
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::spot_index::SpotLocation;
 use crate::index::write_row::WriteRow;
@@ -276,8 +275,8 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
-    /// Answer from a record still in its slot's window, or return nothing when it has reached the kernel. A record
-    /// on its way there waits for the write, which is one call
+    /// Answer from a record still in its slot's windows, or return nothing when it has reached the kernel. This takes
+    /// no lock and waits for nothing, since a window keeps its bytes until the write call that sends them returns
     pub fn read_held(
         &self,
         read: &KeyRead,
@@ -290,28 +289,10 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok(None);
         }
 
-        let index = row.slot.0 as usize;
         let mut held = [0; MOST_WINDOW_RECORD_BYTES];
-        loop {
-            let queue = hold(&self.queues[index]);
-            if let Some(record) = queue.records.record(row.offset, row.length) {
-                held[..length].copy_from_slice(record);
-                break;
-            }
-            let is_sending = queue.sending.is_some_and(|(start, end)| row.offset >= start && row.offset < end);
-            drop(queue);
-            if !is_sending {
-                return Ok(None);
-            }
-
-            // a window a failed write left behind stays readable until it goes out
-            let spare = hold(&self.spare_windows[index]);
-            if let Some(record) = spare.as_ref().and_then(|window| window.record(row.offset, row.length)) {
-                held[..length].copy_from_slice(record);
-                break;
-            }
-            drop(spare);
-            self.io.pause();
+        let windows = &self.windows[row.slot.0 as usize];
+        if !windows.iter().any(|window| window.read(row.offset, &mut held[..length])) {
+            return Ok(None);
         }
 
         let identity = RecordIdentity {

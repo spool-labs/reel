@@ -721,3 +721,17 @@ fn many_repeats() {
     assert_deleted(&store);
     store.close().expect("close");
 }
+
+// every slot at its cover limit seals, so range deletes go on, with covers that keep dropping out of the pool
+#[test]
+fn every_slot_capped() {
+    let io = SimulatedIo::new(Seed(26));
+    let store = open(&io);
+    let slots = store.state.sizing.shard.open_slots as u64;
+    for _repeat in 0..(MOST_RANGE_COVERS as u64 + 1) * slots {
+        store.delete_range(COLUMN, &key_of(10), &key_of(20)).expect("delete");
+    }
+
+    assert_eq!(store.state.volumes[0].covers.len(), 1);
+    store.close().expect("close");
+}

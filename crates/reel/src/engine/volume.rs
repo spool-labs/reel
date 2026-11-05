@@ -32,6 +32,8 @@ pub struct SyncState {
 pub struct ClaimState<File> {
     pub open: Vec<OpenSegment<File>>,
     pub is_creating: bool,
+    pub prepared: Option<OpenSegment<File>>,
+    pub wants_prepared: bool,
     pub bytes_since_sync: ByteCount,
     pub next_root: usize,
 }

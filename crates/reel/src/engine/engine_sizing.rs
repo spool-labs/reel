@@ -53,8 +53,8 @@ pub const SHARED_JOBS: u64 = 2;
 /// Bytes a row of the write index really takes, node, page and table share included, with a long batch's length of it
 pub const PLANNED_ROW_BYTES: u64 = 227;
 /// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight. With one
-/// lz4 column and 64 B keys that gives these rows a segment: 56,590 at 128 MiB, 148,975 at 192 MiB, 610,903 at 512 MiB and
-/// 5,784,494 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
+/// lz4 column and 64 B keys that gives these rows a segment: 55,868 at 128 MiB, 148,253 at 192 MiB, 610,181 at 512 MiB and
+/// 5,783,772 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
 /// records seal smaller and reach their size through merges, whose outputs the write index doesn't bound
 pub const SEAL_ROWS_EIGHTHS: u64 = 5;
 /// The most stored bytes of a value on an lz4 column, which is also the compress pool, cut into shares
@@ -108,7 +108,7 @@ impl StoreShape {
         let volumes = self.volumes as u64;
         let queues = (self.open_slots() as u64 * 2 + WRITE_BUFFERS as u64) * GROUP_BYTES.0;
         let gathers = WRITE_BUFFERS as u64 * GATHER_BYTES as u64;
-        let windows = self.open_slots() as u64 * 2 * RECORD_WINDOW_BYTES as u64;
+        let windows = self.open_slots() as u64 * 3 * RECORD_WINDOW_BYTES as u64;
         let reads = READ_BUFFERS as u64 * READ_BUFFER_BYTES;
         let large = if self.has_lz4 { LZ4_STORED_LIMIT.0 } else { 0 };
         let encoders = WRITE_BUFFERS as u64 * ENCODER_BYTES + large;

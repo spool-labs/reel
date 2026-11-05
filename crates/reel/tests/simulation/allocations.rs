@@ -4,7 +4,9 @@ use std::hint::black_box;
 use std::path::PathBuf;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::engine::open_segment::SegmentPhase;
 use reel::engine::reel_store::ReelStore;
+use reel::guard::hold;
 use reel::io::job::{Job, JobStep};
 use reel::io::{Io, IoFile};
 use reel::record::codec::Codec;
@@ -225,29 +227,25 @@ fn count_sees() {
     assert_eq!(allocations, 0);
 }
 
-// a segment holding as many covers as it can seals with the buffer open gave it
+// one range repeated until its segment holds all the covers it can: a newer cover in the next segment drops the last of
+// them from the pool, so the seal keeps every row, and the buffer open gave it still holds them
 #[test]
 fn full_cover_block() {
     let io = SimulatedIo::new(Seed(4));
     let store = ReelStore::open(io.clone(), &config()).expect("open");
-    // a first seal sets up what any seal touches, as the gate's warm rounds do
+    // a first seal sets up what any seal touches, as the warm rounds of the gate do
     store.delete_range(META, b"warm-a", b"warm-b").expect("delete");
     store.seal_now();
     settle(&io);
-    for number in 1..MOST_RANGE_COVERS {
-        let start = format!("cover-{:06}", 2 * number);
-        let end = format!("cover-{:06}", 2 * number + 1);
-        store.delete_range(META, start.as_bytes(), end.as_bytes()).expect("delete");
-    }
-    let capacity = |store: &Store| store.state.volumes[0].covers.footer_room();
-    let room = capacity(&store);
 
-    let sealed = counted(|| {
-        store.seal_now();
-        settle(&io);
-    });
+    for _repeat in 0..MOST_RANGE_COVERS {
+        store.delete_range(META, b"range-a", b"range-b").expect("delete");
+    }
+    assert!(hold(&store.state.volumes[0].claims).open.iter().any(|segment| segment.phase == SegmentPhase::Sealing));
+    store.delete_range(META, b"range-a", b"range-b").expect("delete");
+
+    let sealed = counted(|| settle(&io));
 
     assert_eq!((sealed.1, sealed.2), (0, 0));
-    assert_eq!(capacity(&store), room);
     store.close().expect("close");
 }

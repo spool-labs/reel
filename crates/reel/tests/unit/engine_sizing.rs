@@ -38,7 +38,7 @@ fn least_budget() {
 // the rows a segment takes at each budget, as `SEAL_ROWS_EIGHTHS` documents them
 #[test]
 fn documented_rows() {
-    for (mib, rows) in [(128, 56_590), (192, 148_975), (512, 610_903), (4_096, 5_784_494)] {
+    for (mib, rows) in [(128, 55_868), (192, 148_253), (512, 610_181), (4_096, 5_783_772)] {
         let store = StoreShape {
             budget: ByteCount(mib * 1024 * 1024),
             roots: 1,

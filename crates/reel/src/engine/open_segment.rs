@@ -1,7 +1,7 @@
 //! One segment taking writes: its files, its claims and its waiting rows
 
 use std::ffi::OsStr;
-use std::mem;
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
 use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -9,7 +9,7 @@ use std::path::Path;
 use reel_api::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
 
 use crate::index::open_slots::OpenSlot;
-use crate::pool::touched_zeroes;
+use crate::pool::TOUCH_BYTE;
 use crate::rows::row_group::RowGroupBuffer;
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -57,84 +57,112 @@ pub const RECORD_WINDOW_BYTES: usize = 64 * 1024;
 /// The largest record that goes through a window, so bulk values are never copied into one
 pub const MOST_WINDOW_RECORD_BYTES: usize = 4 * 1024;
 
-/// Records of an open segment on their way to the kernel, in a range of its data file claimed ahead
+/// Records of an open segment on their way to the kernel, in a range of its data file claimed ahead. Only the holder
+/// of the slot's queue lock writes here. A read takes no lock: bytes below `used` never change until a reset, and a
+/// reset moves `generation`, so a read that saw the same generation on both sides read whole bytes
 #[derive(Debug)]
 pub struct RecordWindow {
-    bytes: Vec<u8>,
-    start: FileOffset,
-    used: usize,
-    room: usize,
-}
-
-impl Default for RecordWindow {
-    fn default() -> Self {
-        Self::new()
-    }
+    bytes: Vec<AtomicU8>,
+    generation: AtomicU64,
+    start: AtomicU64,
+    used: AtomicUsize,
 }
 
 impl RecordWindow {
     /// Allocate a window with no range yet
     pub fn new() -> Self {
+        let mut bytes = Vec::with_capacity(RECORD_WINDOW_BYTES);
+        for _byte in 0..RECORD_WINDOW_BYTES {
+            bytes.push(AtomicU8::new(TOUCH_BYTE));
+        }
         Self {
-            bytes: touched_zeroes(RECORD_WINDOW_BYTES),
-            start: FileOffset(0),
-            used: 0,
-            room: 0,
+            bytes,
+            generation: AtomicU64::new(0),
+            start: AtomicU64::new(0),
+            used: AtomicUsize::new(0),
         }
     }
 
     /// Read the heap this window holds
     pub fn heap_bytes(&self) -> ByteCount {
-        ByteCount(self.bytes.capacity() as u64)
+        ByteCount((self.bytes.capacity() * size_of::<AtomicU8>()) as u64)
+    }
+
+    /// Count the bytes of records in the window
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
     }
 
     /// Check the window holds no record
     pub fn is_empty(&self) -> bool {
-        self.used == 0
-    }
-
-    /// Check a record of this length fits
-    pub fn has_room(&self, length: usize) -> bool {
-        self.used + length <= self.room
-    }
-
-    /// Start on a new range of the file
-    pub fn reset(&mut self, start: FileOffset, room: usize) {
-        self.start = start;
-        self.used = 0;
-        self.room = room;
-    }
-
-    /// Copy a record in and return where the file will hold it
-    pub fn push(&mut self, parts: [&[u8]; 2]) -> FileOffset {
-        let offset = FileOffset(self.start.0 + self.used as u64);
-        for part in parts {
-            self.bytes[self.used..self.used + part.len()].copy_from_slice(part);
-            self.used += part.len();
-        }
-        offset
+        self.used() == 0
     }
 
     /// Read where the window starts
     pub fn start(&self) -> FileOffset {
-        self.start
+        FileOffset(self.start.load(Ordering::Acquire))
     }
 
-    /// Read the records so far
-    pub fn records(&self) -> &[u8] {
-        &self.bytes[..self.used]
+    /// Read where the window's records end
+    pub fn end(&self) -> FileOffset {
+        FileOffset(self.start().0 + self.used() as u64)
     }
 
-    /// Find a record in the window
-    pub fn record(&self, offset: FileOffset, length: ByteCount) -> Option<&[u8]> {
-        let at = offset.0.checked_sub(self.start.0)? as usize;
-        self.records().get(at..at + length.0 as usize)
+    /// Start on a new range of the file, once nothing in the window needs reading from here
+    pub fn reset(&self, start: FileOffset) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.used.store(0, Ordering::Release);
+        self.start.store(start.0, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Hand the records to a spare window, and go on in what's left of the range
-    pub fn hand_over(&mut self, spare: &mut Self) {
-        spare.reset(FileOffset(self.start.0 + self.used as u64), self.room - self.used);
-        mem::swap(self, spare);
+    /// Copy a record in and return where the file will hold it, which only the queue lock's holder may do
+    pub fn push(&self, parts: [&[u8]; 2]) -> FileOffset {
+        let used = self.used();
+        let offset = FileOffset(self.start().0 + used as u64);
+        let mut at = used;
+        for part in parts {
+            for byte in part {
+                self.bytes[at].store(*byte, Ordering::Relaxed);
+                at += 1;
+            }
+        }
+        self.used.store(at, Ordering::Release);
+        offset
+    }
+
+    /// Copy the records out for a write call
+    pub fn copy_out(&self, out: &mut [u8]) -> usize {
+        let used = self.used();
+        for (byte, stored) in out[..used].iter_mut().zip(&self.bytes) {
+            *byte = stored.load(Ordering::Relaxed);
+        }
+        used
+    }
+
+    /// Copy a record out with no lock, or return false when the window doesn't hold it whole
+    pub fn read(&self, offset: FileOffset, record: &mut [u8]) -> bool {
+        let before = self.generation.load(Ordering::Acquire);
+        if !before.is_multiple_of(2) {
+            return false;
+        }
+        let Some(at) = offset.0.checked_sub(self.start().0).map(|at| at as usize) else {
+            return false;
+        };
+        if at + record.len() > self.used() {
+            return false;
+        }
+        for (byte, stored) in record.iter_mut().zip(&self.bytes[at..]) {
+            *byte = stored.load(Ordering::Relaxed);
+        }
+        fence(Ordering::Acquire);
+        self.generation.load(Ordering::Relaxed) == before
+    }
+}
+
+impl Default for RecordWindow {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -147,8 +175,9 @@ pub struct RowQueue {
     pub marked_end: FileOffset,
     pub is_writing: bool,
     pub reserved: usize,
-    pub records: RecordWindow,
-    pub sending: Option<(FileOffset, FileOffset)>,
+    pub live_window: usize,
+    pub window_room: usize,
+    pub has_kept_window: bool,
     pub is_refilling: bool,
 }
 
@@ -162,8 +191,9 @@ impl RowQueue {
             marked_end: FileOffset(0),
             is_writing: false,
             reserved: 0,
-            records: RecordWindow::new(),
-            sending: None,
+            live_window: 0,
+            window_room: 0,
+            has_kept_window: false,
             is_refilling: false,
         }
     }
@@ -176,8 +206,8 @@ impl RowQueue {
         self.marked_end = FileOffset(0);
         self.is_writing = false;
         self.reserved = 0;
-        self.records.reset(FileOffset(0), 0);
-        self.sending = None;
+        self.window_room = 0;
+        self.has_kept_window = false;
         self.is_refilling = false;
     }
 }

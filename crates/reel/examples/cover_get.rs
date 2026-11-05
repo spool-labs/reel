@@ -13,6 +13,7 @@ use reel_api::units::WritePlace;
 const COLUMN: ColumnId = ColumnId(1);
 const KEY_BYTES: usize = 32;
 const LOOKUPS: u64 = 4_000_000;
+const NESTED_LOOKUPS: u64 = 20_000;
 const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
 
 fn key_of(number: u64) -> Vec<u8> {
@@ -50,4 +51,24 @@ fn main() {
         add(&covers, number);
     }
     time(&covers, "full pool");
+
+    // the worst case: every cover in the pool holds the key, so the walk visits all of them
+    let nested = RangeCovers::new(KEY_BYTES);
+    for depth in 0..MOST_RANGE_COVERS as u64 {
+        let (start, end) = (key_of(depth), key_of(2 * MOST_RANGE_COVERS as u64 - depth));
+        nested.add(&Cover {
+            column: COLUMN,
+            start: &start,
+            end: &end,
+            place: WritePlace(depth + 1),
+            segment: SegmentNumber(1),
+        });
+    }
+    let key = key_of(MOST_RANGE_COVERS as u64);
+    let start = Instant::now();
+    for _lookup in 0..NESTED_LOOKUPS {
+        black_box(nested.newest_over(COLUMN, &key, WritePlace(u64::MAX)));
+    }
+    let nanos = start.elapsed().as_secs_f64() * NANOS_PER_SECOND / NESTED_LOOKUPS as f64;
+    println!("every cover over one key: {nanos:.0} ns a check, {} steps", nested.longest_walk());
 }

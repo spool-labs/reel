@@ -563,6 +563,6 @@ fn quiet_put() {
 
     let state = &store.state;
     assert_eq!(state.order.wakes(), 0);
-    assert_eq!(state.encoders.wakes() + state.large_encoders.wakes() + state.record_readers.wakes(), 0);
+    assert_eq!(state.encoders.wakes() + state.stored_shares.wakes() + state.record_readers.wakes(), 0);
     store.close().expect("close");
 }

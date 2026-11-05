@@ -4,7 +4,7 @@ use std::hint::black_box;
 use std::mem::MaybeUninit;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 use reel_api::units::ByteCount;
 
@@ -77,6 +77,19 @@ impl<Item> Pool<Item> {
         state.next_ticket - state.serving
     }
 
+    /// Hand every item in a list back
+    pub fn give_back_all(&self, items: &mut Vec<Item>) {
+        if items.is_empty() {
+            return;
+        }
+        let mut state = hold(&self.state);
+        state.free.append(items);
+        let should_wake = !state.has_no_queue();
+        drop(state);
+        if should_wake {
+            self.wake();
+        }
+    }
     /// Run some work with an item, waiting for one when all are out
     pub fn with<Answer>(&self, work: impl FnOnce(&mut Item) -> Answer) -> Answer {
         let mut item = self.take();
@@ -93,31 +106,48 @@ impl<Item> Pool<Item> {
 
     /// Take a free item, waiting in line when all are out or others came first
     pub fn take(&self) -> Item {
-        let mut state = hold(&self.state);
-        if state.has_no_queue()
-            && let Some(item) = state.free.pop()
-        {
-            return item;
+        let mut state = self.wait_for(1);
+        let item = state.free.pop();
+        self.leave_line(state);
+        match item {
+            Some(item) => item,
+            // the line only ends with an item free, and a wrong count just waits again
+            None => self.take(),
         }
+    }
 
+    /// Take this many items at once, so nobody holds a part of what they need while they wait for the rest
+    pub fn take_many(&self, count: usize, items: &mut Vec<Item>) {
+        if count == 0 {
+            return;
+        }
+        let mut state = self.wait_for(count);
+        let first = state.free.len() - count;
+        items.extend(state.free.drain(first..));
+        self.leave_line(state);
+    }
+
+    /// Wait until these items are free and nobody who came first is still waiting
+    pub fn wait_for(&self, count: usize) -> MutexGuard<'_, PoolState<Item>> {
+        let mut state = hold(&self.state);
         let ticket = state.next_ticket;
         state.next_ticket += 1;
-        loop {
-            if state.serving == ticket
-                && let Some(item) = state.free.pop()
-            {
-                state.serving += 1;
-                let should_wake = !state.has_no_queue() && !state.free.is_empty();
-                drop(state);
-                if should_wake {
-                    self.wake();
-                }
-                return item;
-            }
+        while state.serving != ticket || state.free.len() < count {
             state = match self.freed.wait(state) {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
+        }
+        state
+    }
+
+    /// Pass the line on, waking it only when someone is in it and an item is left for them
+    pub fn leave_line(&self, mut state: MutexGuard<'_, PoolState<Item>>) {
+        state.serving += 1;
+        let should_wake = !state.has_no_queue() && !state.free.is_empty();
+        drop(state);
+        if should_wake {
+            self.wake();
         }
     }
 

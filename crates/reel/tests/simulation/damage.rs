@@ -60,7 +60,7 @@ const WIDE_SEGMENTS: u64 = 90;
 const WIDE_BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
 // what the summary plans at the least budget, spans included
 const PLANNED_ROOM_AT_LEAST: u64 = 1_400_000;
-const LEAST_BUDGET: ByteCount = ByteCount(30 * 1024 * 1024);
+const LEAST_BUDGET: ByteCount = ByteCount(31 * 1024 * 1024);
 // a segment lost with its row counts every stage a store held at open
 const STAGE_LOST: usize = NEWEST;
 // a stage for writes after the open

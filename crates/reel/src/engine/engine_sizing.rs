@@ -38,7 +38,7 @@ pub const PLANNED_LINE_BYTES: u64 = 32;
 pub const LEAST_SHARED_BYTES: ByteCount = ByteCount(8 * 1024 * 1024);
 /// Bytes a read buffer pair is planned at: a record reader and a footer reader
 pub const READ_BUFFER_BYTES: u64 = 512 * 1024;
-/// Bytes a record encoder is planned at, with no large compress buffer
+/// Bytes a record encoder is planned at, with no share of the compress pool
 pub const ENCODER_BYTES: u64 = 256 * 1024;
 /// Bytes a seal job's own buffers are planned at
 pub const SEAL_JOB_BYTES: u64 = 3 * 1024 * 1024;
@@ -49,11 +49,11 @@ pub const SHARED_JOBS: u64 = 2;
 /// Bytes a row of the write index really takes, node, page and table share included, with a long batch's length of it
 pub const PLANNED_ROW_BYTES: u64 = 227;
 /// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight. With one
-/// lz4 column that gives these rows a segment: 62,967 at 128 MiB, 155,353 at 192 MiB, 617,281 at 512 MiB and
-/// 5,790,871 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
+/// lz4 column that gives these rows a segment: 60,441 at 128 MiB, 152,826 at 192 MiB, 614,755 at 512 MiB and
+/// 5,788,345 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
 /// records seal smaller and reach their size through merges, whose outputs the write index doesn't bound
 pub const SEAL_ROWS_EIGHTHS: u64 = 5;
-/// The most stored bytes of a value on an lz4 column
+/// The most stored bytes of a value on an lz4 column, which is also the compress pool, cut into shares
 pub const LZ4_STORED_LIMIT: ByteCount = ByteCount(64 * 1024 * 1024);
 /// Bytes of one row group buffer
 pub const GROUP_BYTES: ByteCount = ByteCount(256 * 1024);
@@ -66,7 +66,7 @@ pub const FILTER_SLOT_BYTES: usize = 4 * 1024;
 /// Read buffers a store keeps
 pub const READ_BUFFERS: usize = 8;
 /// Write buffers a store keeps
-pub const WRITE_BUFFERS: usize = 4;
+pub const WRITE_BUFFERS: usize = 8;
 
 /// What a store is made of, which fixes the parts a budget can't shrink
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,7 +102,7 @@ impl StoreShape {
         let queues = (self.open_slots() as u64 * 2 + WRITE_BUFFERS as u64) * GROUP_BYTES.0;
         let reads = READ_BUFFERS as u64 * READ_BUFFER_BYTES;
         let large = if self.has_lz4 { LZ4_STORED_LIMIT.0 } else { 0 };
-        let encoders = (WRITE_BUFFERS as u64 + 1) * ENCODER_BYTES + large;
+        let encoders = WRITE_BUFFERS as u64 * ENCODER_BYTES + large;
         let spans = 4 * MOST_DAMAGED_SPANS as u64 * (SPAN_KEY_BYTES as u64 * 2);
         let stacks = (SHARED_JOBS + volumes) * JOB_STACK_PLAN_BYTES;
         ByteCount(queues + reads + encoders + volumes * (SEAL_JOB_BYTES + spans) + stacks)

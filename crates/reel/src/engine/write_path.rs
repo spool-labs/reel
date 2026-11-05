@@ -20,7 +20,7 @@ use crate::index::write_row::WriteRow;
 use crate::io::{Io, IoFile, IoTask};
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::record_check::RecordIdentity;
-use crate::record::record_encoder::{PlainRecord, RecordEncoder};
+use crate::record::record_encoder::{PlainRecord, RecordEncoder, RecordShape};
 use crate::record::record_head::plain_length;
 use crate::row_kind::RowKind;
 use crate::rows::row_group::{RowEntry, row_size};
@@ -83,9 +83,7 @@ impl<Backend: Io> EngineState<Backend> {
             return self.write_plain(volume, &write);
         }
 
-        let is_large = info.codec == Codec::Lz4 && value.len() > CHUNK_BYTES;
-        let encoders = if is_large { &self.large_encoders } else { &self.encoders };
-        encoders.with(|encoder| self.write_encoded(volume, &write, encoder))
+        self.encoders.with(|encoder| self.write_encoded(volume, &write, encoder))
     }
 
     /// Write a one-chunk value as it stands, with its head on the stack, so no writer waits for a shared encoder
@@ -119,18 +117,35 @@ impl<Backend: Io> EngineState<Backend> {
             kind: RowKind::Value,
             place: WritePlace(0),
         };
-        let Some(shape) = encoder.encode(&identity, write.codec, write.value) else {
-            return Err(StoreError::ValueTooLarge {
-                length: ByteCount(write.value.len() as u64),
-                limit: self.sizing.lz4_stored_limit,
-            });
-        };
+        let shape = self.encode_value(encoder, &identity, write.codec, write.value)?;
 
         let length = shape.total_length();
-        self.land_record(volume, write, length, |claim| {
+        let landed = self.land_record(volume, write, length, |claim| {
             encoder.set_place(self.record_key, claim.first_place());
-            let parts = encoder.parts(&shape, write.value);
-            claim.data.write_at(claim.offset, &parts)
+            encoder.write_to(&claim.data, claim.offset, &shape, write.value)
+        });
+        encoder.give_shares(&self.stored_shares);
+        landed
+    }
+
+    /// Lay a value out with the shares it may need, which the caller gives back once the record is written
+    pub fn encode_value(
+        &self,
+        encoder: &mut RecordEncoder,
+        identity: &RecordIdentity,
+        codec: Codec,
+        value: &[u8],
+    ) -> Result<RecordShape, StoreError> {
+        let shape = encoder
+            .take_shares(&self.stored_shares, codec, value)
+            .then(|| encoder.encode(identity, codec, value))
+            .flatten();
+        shape.ok_or_else(|| {
+            encoder.give_shares(&self.stored_shares);
+            StoreError::ValueTooLarge {
+                length: ByteCount(value.len() as u64),
+                limit: self.sizing.lz4_stored_limit,
+            }
         })
     }
 

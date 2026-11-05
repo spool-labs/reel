@@ -71,7 +71,7 @@ pub struct EngineState<Backend: Io> {
     pub slot_files: Vec<SlotFile<Backend::File>>,
     pub free_slots: Mutex<Vec<OpenSlot>>,
     pub encoders: Pool<RecordEncoder>,
-    pub large_encoders: Pool<RecordEncoder>,
+    pub stored_shares: Pool<Vec<u8>>,
     pub batch_rows: Pool<RowGroupBuffer>,
     pub batch_lengths: Pool<Vec<u32>>,
     pub longest_turn: AtomicU64,
@@ -288,8 +288,8 @@ impl<Backend: Io> EngineState<Backend> {
         let footers = self.footer_readers.heap_bytes(FooterReader::heap_bytes);
         report.read_buffers = ByteCount(readers.0 + footers.0);
         let encoders = self.encoders.heap_bytes(RecordEncoder::heap_bytes);
-        let large = self.large_encoders.heap_bytes(RecordEncoder::heap_bytes);
-        report.compress_buffers = ByteCount(encoders.0 + large.0);
+        let shares = self.stored_shares.heap_bytes(|share| ByteCount(share.capacity() as u64));
+        report.compress_buffers = ByteCount(encoders.0 + shares.0);
         let batch_rows = self.batch_rows.heap_bytes(RowGroupBuffer::heap_bytes);
         let batch_lengths = self.batch_lengths.heap_bytes(|lengths| ByteCount((lengths.capacity() * size_of::<u32>()) as u64));
         report.queues = ByteCount(report.queues.0 + batch_rows.0 + batch_lengths.0);

@@ -37,7 +37,7 @@ const ROOT: &str = "/disk/staged";
 const COLUMN: ColumnId = ColumnId(1);
 const LONG_COLUMN: ColumnId = ColumnId(2);
 const BUDGET: ByteCount = ByteCount(48 * 1024 * 1024);
-const SMALL_BUDGET: ByteCount = ByteCount(30 * 1024 * 1024);
+const SMALL_BUDGET: ByteCount = ByteCount(31 * 1024 * 1024);
 const LARGEST: ByteCount = ByteCount(1024 * 1024);
 const LONG_KEY_BYTES: usize = 1_000;
 const LONG_KEYS: u64 = 6_000;
@@ -179,7 +179,7 @@ fn encode(state: &State, key: &[u8], value: &[u8], place: WritePlace) -> Vec<u8>
         kind: RowKind::Value,
         place,
     };
-    let mut encoder = RecordEncoder::new(LARGEST, LARGEST);
+    let mut encoder = RecordEncoder::new(LARGEST, 0);
     let shape = encoder.encode(&identity, Codec::None, value).expect("encode");
     let mut record = Vec::new();
     for part in encoder.parts(&shape, value) {

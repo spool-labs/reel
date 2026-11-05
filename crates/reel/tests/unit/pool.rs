@@ -64,3 +64,30 @@ fn queue_drains() {
     });
     assert_eq!(pool.waiting(), 0);
 }
+
+// a caller who needs several waits in line without holding any, and gets them all at once
+#[test]
+fn many_at_once() {
+    let pool = Pool::new(vec![0_u32, 1, 2]);
+    let first = pool.take();
+    let second = pool.take();
+
+    thread::scope(|scope| {
+        let waiter = scope.spawn(|| {
+            let mut items = Vec::with_capacity(3);
+            pool.take_many(3, &mut items);
+            let count = items.len();
+            pool.give_back_all(&mut items);
+            count
+        });
+        while pool.waiting() == 0 {
+            thread::yield_now();
+        }
+
+        pool.give_back(first);
+        pool.give_back(second);
+
+        assert_eq!(waiter.join().expect("join"), 3);
+    });
+    assert_eq!(pool.waiting(), 0);
+}

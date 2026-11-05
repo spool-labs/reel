@@ -35,10 +35,10 @@ use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
 use crate::io::lock_outcome::LockOutcome;
 use crate::io::{Io, IoTask};
-use crate::pool::{Pool, touched_buffer, touched_filled, touched_room};
-use crate::record::codec::{CHUNK_BYTES, Codec};
+use crate::pool::{Pool, touched_buffer, touched_filled, touched_room, touched_zeroes};
+use crate::record::codec::Codec;
 use crate::record::record_check::RecordKey;
-use crate::record::record_encoder::RecordEncoder;
+use crate::record::record_encoder::{RecordEncoder, SHARE_BYTES};
 use crate::record::record_reader::RecordReader;
 use crate::rows::row_group::RowGroupBuffer;
 use crate::segment::block_cache::BlockCache;
@@ -715,12 +715,12 @@ pub fn build_state<Backend: Io>(
     }
 
     let largest_value = sizing.segment_bytes;
+    let most_shares = if has_lz4 { sizing.lz4_stored_limit.0 as usize / SHARE_BYTES } else { 0 };
     let mut encoders = Vec::with_capacity(WRITE_BUFFERS);
     for _encoder in 0..WRITE_BUFFERS {
-        encoders.push(RecordEncoder::new(largest_value, ByteCount(CHUNK_BYTES as u64)));
+        encoders.push(RecordEncoder::new(largest_value, most_shares));
     }
-    let large_stored = if has_lz4 { sizing.lz4_stored_limit } else { ByteCount(CHUNK_BYTES as u64) };
-    let large_encoders = vec![RecordEncoder::new(largest_value, large_stored)];
+    let shares = (0..most_shares).map(|_share| touched_zeroes(SHARE_BYTES)).collect();
 
     let mut record_readers = Vec::with_capacity(READ_BUFFERS);
     let mut footer_readers = Vec::with_capacity(READ_BUFFERS);
@@ -758,7 +758,7 @@ pub fn build_state<Backend: Io>(
         slot_files,
         free_slots: Mutex::new(free_slots),
         encoders: Pool::new(encoders),
-        large_encoders: Pool::new(large_encoders),
+        stored_shares: Pool::new(shares),
         batch_rows: Pool::new((0..WRITE_BUFFERS).map(|_buffer| RowGroupBuffer::new(GROUP_BYTES)).collect()),
         batch_lengths: Pool::new(vec![touched_filled(sizing.segment_rows.0 as usize, 0)]),
         longest_turn: AtomicU64::new(0),

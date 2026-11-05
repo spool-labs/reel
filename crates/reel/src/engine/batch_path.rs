@@ -22,7 +22,7 @@ use crate::index::write_index::{SHARD_COUNT, shard_of};
 use crate::index::write_row::WriteRow;
 use crate::index::write_shard::ShardNeed;
 use crate::io::{Io, IoFile};
-use crate::record::codec::{CHUNK_BYTES, Codec};
+use crate::record::codec::Codec;
 use crate::record::record_check::RecordIdentity;
 use crate::record::record_encoder::RecordEncoder;
 use crate::record::record_head::plain_length;
@@ -45,7 +45,6 @@ pub struct BatchPlan {
     pub rows: RowCount,
     pub row_bytes: usize,
     pub deletes: u64,
-    pub has_large_value: bool,
     pub needs: [ShardNeed; SHARD_COUNT],
 }
 
@@ -58,8 +57,7 @@ impl<Backend: Io> EngineState<Backend> {
         let volume = &self.volumes[plan.volume.0 as usize];
         check_writable(volume)?;
 
-        let encoders = if plan.has_large_value { &self.large_encoders } else { &self.encoders };
-        let bytes = encoders.with(|encoder| {
+        let bytes = self.encoders.with(|encoder| {
             self.batch_rows.with(|stage| {
                 let bytes = self.measure_batch(volume, batch, encoder)?;
                 self.hold_batch_room(&plan)?;
@@ -102,7 +100,6 @@ impl<Backend: Io> EngineState<Backend> {
                 rows: RowCount(0),
                 row_bytes: 0,
                 deletes: 0,
-                has_large_value: false,
                 needs: [ShardNeed::default(); SHARD_COUNT],
             });
             if info.volume != plan.volume {
@@ -112,7 +109,6 @@ impl<Backend: Io> EngineState<Backend> {
             match value {
                 Some(value) => {
                     check_value_size(&self.volumes[info.volume.0 as usize], value)?;
-                    plan.has_large_value |= info.codec == Codec::Lz4 && value.len() > CHUNK_BYTES;
                 },
                 None => plan.deletes += 1,
             }
@@ -182,13 +178,9 @@ impl<Backend: Io> EngineState<Backend> {
             kind: RowKind::Value,
             place: WritePlace(0),
         };
-        match encoder.encode(&identity, info.codec, value) {
-            Some(shape) => Ok(shape.total_length()),
-            None => Err(StoreError::ValueTooLarge {
-                length: ByteCount(value.len() as u64),
-                limit: self.sizing.lz4_stored_limit,
-            }),
-        }
+        let shape = self.encode_value(encoder, &identity, info.codec, value)?;
+        encoder.give_shares(&self.stored_shares);
+        Ok(shape.total_length())
     }
 
     /// Hold index room for the whole batch, starting seals while there's none
@@ -247,14 +239,10 @@ impl<Backend: Io> EngineState<Backend> {
                         kind: RowKind::Value,
                         place: cursor.place,
                     };
-                    let Some(shape) = encoder.encode(&identity, info.codec, value) else {
-                        return Err(StoreError::ValueTooLarge {
-                            length: ByteCount(value.len() as u64),
-                            limit: self.sizing.lz4_stored_limit,
-                        });
-                    };
-                    let parts = encoder.parts(&shape, value);
-                    if let Err(source) = claim.data.write_at(cursor.offset, &parts) {
+                    let shape = self.encode_value(encoder, &identity, info.codec, value)?;
+                    let written = encoder.write_to(&claim.data, cursor.offset, &shape, value);
+                    encoder.give_shares(&self.stored_shares);
+                    if let Err(source) = written {
                         return Err(store_error(volume, "writing a record", source));
                     }
                     cursor.row(column, key, shape.total_length(), RowKind::Value)

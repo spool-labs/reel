@@ -9,7 +9,8 @@ use reel::io::{Io, IoFile};
 use reel::record::chunk_table::{ChunkEntry, ENTRIES_PER_PAGE};
 use reel::record::codec::{CHUNK_BYTES, Codec};
 use reel::record::record_check::{Checksum, RecordIdentity, RecordKey, checksum};
-use reel::record::record_encoder::{PlainRecord, RecordEncoder};
+use reel::pool::Pool;
+use reel::record::record_encoder::{MOST_RECORD_RUNS, PlainRecord, RecordEncoder, SHARE_BYTES};
 use reel::record::record_head::{SMALL_HEAD_BYTES, chunk_count, chunked_head_bytes, plain_length};
 use reel::record::record_reader::{FIRST_READ_BYTES, RecordLocation, RecordRead, RecordReader};
 use reel::row_kind::RowKind;
@@ -26,6 +27,8 @@ const LARGEST: ByteCount = ByteCount(64 * 1024 * 1024);
 const LEADING_BYTES: u64 = 100;
 const ROT: BitMask = BitMask(0b0001_0000);
 const PLAIN_MOST: usize = 2 * 1024 * 1024;
+const LZ4_MOST: u64 = 64 * 1024 * 1024;
+const LITTLE_SHRINK: usize = 16;
 
 struct Stored {
     io: SimulatedIo,
@@ -63,7 +66,10 @@ fn noise(length: usize) -> Vec<u8> {
 
 fn store(codec: Codec, value: &[u8]) -> Stored {
     let largest = ByteCount(LARGEST.0.max(value.len() as u64));
-    let mut encoder = RecordEncoder::new(largest, largest);
+    let shares = (value.len() / SHARE_BYTES) + 1;
+    let pool = Pool::new(vec![vec![0; SHARE_BYTES]; shares]);
+    let mut encoder = RecordEncoder::new(largest, shares);
+    assert!(encoder.take_shares(&pool, codec, value));
     let shape = encoder.encode(&identity(), codec, value).expect("encode");
 
     let io = SimulatedIo::new(SEED);
@@ -71,7 +77,7 @@ fn store(codec: Codec, value: &[u8]) -> Stored {
     io.create_directory(&root).expect("directory");
     let path = root.join("segment");
     let file = io.create_file(&path, ByteCount(0)).expect("create");
-    file.write_at(FileOffset(LEADING_BYTES), &encoder.parts(&shape, value)).expect("write");
+    encoder.write_to(&file, FileOffset(LEADING_BYTES), &shape, value).expect("write");
 
     let location = RecordLocation {
         offset: FileOffset(LEADING_BYTES),
@@ -351,7 +357,7 @@ fn changed_codec() {
 fn short_span() {
     let value = noise(3 * CHUNK_BYTES);
     let largest = ByteCount(value.len() as u64);
-    let mut encoder = RecordEncoder::new(largest, largest);
+    let mut encoder = RecordEncoder::new(largest, 0);
     let mut shape = encoder.encode(&identity(), Codec::None, &value).expect("encode");
 
     let chunks = chunk_count(largest);
@@ -430,7 +436,7 @@ fn plain_lengths() {
         kind: RowKind::Value,
         place: WritePlace(1),
     };
-    let mut encoder = RecordEncoder::new(ByteCount(PLAIN_MOST as u64), ByteCount(CHUNK_BYTES as u64));
+    let mut encoder = RecordEncoder::new(ByteCount(PLAIN_MOST as u64), 0);
     for length in [0, 1, CHUNK_BYTES - 1, CHUNK_BYTES, CHUNK_BYTES + 1, CHUNK_BYTES * 3, PLAIN_MOST] {
         let value = vec![1; length];
 
@@ -450,7 +456,7 @@ fn stack_head() {
         kind: RowKind::Value,
         place: WritePlace(7),
     };
-    let mut encoder = RecordEncoder::new(LARGEST, ByteCount(CHUNK_BYTES as u64));
+    let mut encoder = RecordEncoder::new(LARGEST, 0);
     for length in [0, 1, CHUNK_BYTES] {
         let value = vec![3; length];
         let shape = encoder.encode(&identity, Codec::None, &value).expect("encode");
@@ -460,4 +466,55 @@ fn stack_head() {
         let head = PlainRecord::new(&identity, &value).head(RECORD_KEY, identity.place);
         assert_eq!(&*parts[0], head.as_slice(), "{length} bytes");
     }
+}
+
+// chunks that take turns shrinking would need a part each: past the limit the rest stay as written, one write call
+// holds the record, and every byte reads back
+#[test]
+fn run_limit() {
+    let plain = noise(CHUNK_BYTES);
+    let packed = compressible(CHUNK_BYTES);
+    let mut value = Vec::with_capacity(LZ4_MOST as usize);
+    while value.len() < LZ4_MOST as usize {
+        value.extend_from_slice(&packed);
+        value.extend_from_slice(&plain);
+    }
+    let pool = Pool::new(vec![vec![0; SHARE_BYTES]; LZ4_MOST as usize / SHARE_BYTES]);
+    let mut encoder = RecordEncoder::new(ByteCount(LZ4_MOST), LZ4_MOST as usize / SHARE_BYTES);
+    assert!(encoder.take_shares(&pool, Codec::Lz4, &value));
+
+    encoder.encode(&identity(), Codec::Lz4, &value).expect("encode");
+
+    assert_eq!(encoder.run_count(), MOST_RECORD_RUNS);
+    encoder.give_shares(&pool);
+    let stored = store(Codec::Lz4, &value);
+    let (read, buf) = read_declared(&stored, &identity(), Codec::Lz4);
+    assert_eq!(read, RecordRead::Valid);
+    assert!(buf == value);
+}
+
+// compressed chunks cross from one share to the next, in a value larger than a share
+#[test]
+fn across_shares() {
+    let mut chunk = noise(CHUNK_BYTES);
+    chunk[..CHUNK_BYTES / LITTLE_SHRINK].fill(0);
+    let value = chunk.repeat(5 * SHARE_BYTES / CHUNK_BYTES);
+
+    let stored = store(Codec::Lz4, &value);
+
+    let (read, buf) = read_declared(&stored, &identity(), Codec::Lz4);
+    assert_eq!(read, RecordRead::Valid);
+    assert!(buf == value);
+}
+
+// a value past the shares a pool holds is refused, and takes none of them
+#[test]
+fn too_many_shares() {
+    let pool = Pool::new(vec![vec![0; SHARE_BYTES]; 1]);
+    let mut encoder = RecordEncoder::new(ByteCount(2 * SHARE_BYTES as u64), 1);
+    let value = vec![1; 2 * SHARE_BYTES];
+
+    assert!(!encoder.take_shares(&pool, Codec::Lz4, &value));
+
+    assert_eq!(pool.heap_bytes(|share| ByteCount(share.len() as u64)), ByteCount(SHARE_BYTES as u64));
 }

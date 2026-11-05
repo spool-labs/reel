@@ -1,10 +1,11 @@
 //! Lays a value out as a record, in pooled buffers so a put allocates nothing
 
-use std::io::IoSlice;
+use std::io::{IoSlice, Result};
 
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
-use crate::pool::touched_zeroes;
+use crate::io::IoFile;
+use crate::pool::{Pool, touched_room, touched_zeroes};
 use crate::record::chunk_table::{
     ChunkCount, ChunkEntry, ENTRIES_PER_PAGE, PAGE_END_AT, TABLE_PAGE_BYTES, TablePageIndex, page_bytes, page_count,
     table_bytes, write_entry,
@@ -17,6 +18,14 @@ use crate::record::record_head::{
     chunked_head_bytes,
 };
 
+/// Bytes of one share of the compress pool
+pub const SHARE_BYTES: usize = 1024 * 1024;
+/// Chunks a share holds whatever they compress to
+pub const CHUNKS_PER_SHARE: usize = SHARE_BYTES / CHUNK_BYTES;
+/// Parts one write call can take
+pub const MOST_WRITE_PARTS: usize = 1_024;
+/// Runs a chunked record's payload can use, beside its head and table, and still go out in one write call
+pub const MOST_RECORD_RUNS: usize = MOST_WRITE_PARTS - 2;
 /// Parts of a record: head, table and payload
 pub const RECORD_PARTS: usize = 3;
 
@@ -27,6 +36,15 @@ pub struct RecordShape {
     pub table_length: usize,
     pub payload_length: usize,
     pub is_payload_stored: bool,
+}
+
+/// Adjacent stored chunks that sit together in memory, so they go out as one part of a write call
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoredRun {
+    /// Compressed chunks in a share
+    Share { share: usize, start: usize, end: usize },
+    /// Chunks stored as written, straight from the caller's value
+    Value { start: usize, end: usize },
 }
 
 /// A one-chunk record stored as written, whose head fits the stack, so its writer needs no shared encoder
@@ -64,6 +82,8 @@ pub struct RecordEncoder {
     head: Vec<u8>,
     table: Vec<u8>,
     stored: Vec<u8>,
+    shares: Vec<Vec<u8>>,
+    runs: Vec<StoredRun>,
     lz4: Lz4State,
     check: RecordCheck,
 }
@@ -76,14 +96,15 @@ impl RecordShape {
 }
 
 impl RecordEncoder {
-    /// Allocate buffers for values up to a length and stored payloads up to a length
-    pub fn new(largest_value: ByteCount, largest_stored: ByteCount) -> Self {
+    /// Allocate buffers for values up to a length, with room for a share of each of a pool's items
+    pub fn new(largest_value: ByteCount, most_shares: usize) -> Self {
         let chunks = chunk_count(largest_value);
-        let stored = (largest_stored.0 as usize).max(CHUNK_BYTES);
         Self {
             head: touched_zeroes(chunked_head_bytes(largest_value)),
             table: touched_zeroes(page_count(chunks).0 as usize * TABLE_PAGE_BYTES),
-            stored: touched_zeroes(stored),
+            stored: touched_zeroes(CHUNK_BYTES),
+            shares: touched_room(most_shares),
+            runs: touched_room(MOST_RECORD_RUNS),
             lz4: Lz4State::new(),
             check: RecordCheck(0),
         }
@@ -91,11 +112,37 @@ impl RecordEncoder {
 
     /// Read the heap these buffers hold
     pub fn heap_bytes(&self) -> ByteCount {
-        ByteCount((self.head.capacity() + self.table.capacity() + self.stored.capacity()) as u64)
+        let runs = self.runs.capacity() * size_of::<StoredRun>();
+        let shares = self.shares.capacity() * size_of::<Vec<u8>>();
+        ByteCount((self.head.capacity() + self.table.capacity() + self.stored.capacity() + runs + shares) as u64)
+    }
+
+    /// Take the shares a value could need, all at once so two large values can't each hold what the other waits
+    /// for, or return false when the pool could never hold it. A chunk that doesn't shrink uses no room in them,
+    /// but only compressing tells which chunks those are
+    pub fn take_shares(&mut self, pool: &Pool<Vec<u8>>, codec: Codec, value: &[u8]) -> bool {
+        // a panic in an earlier write leaves its shares here
+        self.give_shares(pool);
+        if codec != Codec::Lz4 || value.len() <= CHUNK_BYTES {
+            return true;
+        }
+
+        let count = (chunk_count(ByteCount(value.len() as u64)).0 as usize).div_ceil(CHUNKS_PER_SHARE);
+        if count > self.shares.capacity() {
+            return false;
+        }
+        pool.take_many(count, &mut self.shares);
+        true
+    }
+
+    /// Give every share back
+    pub fn give_shares(&mut self, pool: &Pool<Vec<u8>>) {
+        pool.give_back_all(&mut self.shares);
     }
 
     /// Lay a value out, or return nothing when it doesn't fit these buffers
     pub fn encode(&mut self, identity: &RecordIdentity, codec: Codec, value: &[u8]) -> Option<RecordShape> {
+        self.runs.clear();
         if value.len() <= CHUNK_BYTES {
             return Some(self.encode_small(identity, codec, value));
         }
@@ -155,7 +202,7 @@ impl RecordEncoder {
             head_length,
             table_length,
             payload_length,
-            is_payload_stored: stored_codec == Codec::Lz4,
+            is_payload_stored: false,
         })
     }
 
@@ -169,28 +216,105 @@ impl RecordEncoder {
         value.len()
     }
 
-    /// Compress each chunk into the stored buffer, or return nothing when they don't fit
+    /// Compress each chunk into the shares, keep what doesn't shrink in the value, and return the payload length,
+    /// or nothing when the shares run out. Past the last run but one the chunks stay as written, which takes one
+    /// run however many there are, and depends only on the value
     pub fn table_compressed(&mut self, value: &[u8], payload_start: u64) -> Option<usize> {
+        let mut share = 0;
         let mut used = 0;
+        let mut stored = 0;
         for (index, chunk) in value.chunks(CHUNK_BYTES).enumerate() {
-            let room = self.stored.get_mut(used..)?;
-            let length = match self.lz4.compress(chunk, room) {
-                Some(length) => length,
+            let start = index * CHUNK_BYTES;
+            if used + chunk.len() > SHARE_BYTES {
+                share += 1;
+                used = 0;
+            }
+
+            let compressed = if self.runs.len() + 1 < MOST_RECORD_RUNS {
+                let room = self.shares.get_mut(share)?.get_mut(used..used + chunk.len())?;
+                self.lz4.compress(chunk, room)
+            } else {
+                None
+            };
+            let (length, sum) = match compressed {
+                Some(length) => {
+                    let sum = checksum(&self.shares[share][used..used + length]);
+                    self.add_run(StoredRun::Share {
+                        share,
+                        start: used,
+                        end: used + length,
+                    });
+                    used += length;
+                    (length, sum)
+                },
                 None => {
-                    room.get_mut(..chunk.len())?.copy_from_slice(chunk);
-                    chunk.len()
+                    self.add_run(StoredRun::Value {
+                        start,
+                        end: start + chunk.len(),
+                    });
+                    (chunk.len(), checksum(chunk))
                 },
             };
-            let sum = checksum(&self.stored[used..used + length]);
+
             let entry = ChunkEntry {
-                stored_offset: FileOffset(payload_start + used as u64),
+                stored_offset: FileOffset(payload_start + stored as u64),
                 value_length: ByteCount(chunk.len() as u64),
                 checksum: sum,
             };
             self.write_table_entry(index, &entry);
-            used += length;
+            stored += length;
         }
-        Some(used)
+        Some(stored)
+    }
+
+    /// Count the runs of the record laid out last
+    pub fn run_count(&self) -> usize {
+        self.runs.len()
+    }
+
+    /// Add a chunk's place in memory, joining the last run when it sits right after it
+    pub fn add_run(&mut self, run: StoredRun) {
+        match (self.runs.last_mut(), run) {
+            (Some(StoredRun::Value { end, .. }), StoredRun::Value { start, end: new_end }) if *end == start => {
+                *end = new_end;
+            },
+            (
+                Some(StoredRun::Share { share, end, .. }),
+                StoredRun::Share {
+                    share: new_share,
+                    start,
+                    end: new_end,
+                },
+            ) if *share == new_share && *end == start => {
+                *end = new_end;
+            },
+            (_last, run) => self.runs.push(run),
+        }
+    }
+
+    /// Write a laid-out record in one call
+    pub fn write_to<File: IoFile>(
+        &self,
+        file: &File,
+        at: FileOffset,
+        shape: &RecordShape,
+        value: &[u8],
+    ) -> Result<()> {
+        if self.runs.is_empty() {
+            return file.write_at(at, &self.parts(shape, value));
+        }
+
+        let mut parts = [IoSlice::new(&[]); MOST_WRITE_PARTS];
+        parts[0] = IoSlice::new(&self.head[..shape.head_length]);
+        parts[1] = IoSlice::new(&self.table[..shape.table_length]);
+        for (part, run) in parts[2..].iter_mut().zip(&self.runs) {
+            let bytes = match *run {
+                StoredRun::Share { share, start, end } => &self.shares[share][start..end],
+                StoredRun::Value { start, end } => &value[start..end],
+            };
+            *part = IoSlice::new(bytes);
+        }
+        file.write_at(at, &parts[..2 + self.runs.len()])
     }
 
     /// Write the entry of a chunk stored as written

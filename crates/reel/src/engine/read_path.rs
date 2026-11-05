@@ -304,10 +304,8 @@ impl<Backend: Io> EngineState<Backend> {
             RecordWant::Whole => reader.read_value(file, location, &identity, read.info.codec, buf),
             RecordWant::Window(window) => reader.read_window(file, location, &identity, window, buf),
         });
-        outcome.map_err(|source| StoreError::Io {
-            action: "reading a record",
-            source,
-        })
+        // a bad sector comes back as a read error, and it means what a failed check means
+        Ok(outcome.unwrap_or(RecordRead::Failed))
     }
 
     /// Find the key's newest row in the sealed segments, asking every one its range can't rule out
@@ -413,12 +411,8 @@ impl<Backend: Io> EngineState<Backend> {
                 window: &window,
                 place_base: pin.head.place_base,
             };
-            let answer = reader
-                .lookup_window(&pin.file, &window_read, &caches, &query)
-                .map_err(|source| StoreError::Io {
-                    action: "reading a footer",
-                    source,
-                })?;
+            let looked_up = reader.lookup_window(&pin.file, &window_read, &caches, &query);
+            let answer = looked_up.unwrap_or(FooterAnswer::Damaged);
             match answer {
                 FooterAnswer::Found(row) => return Ok(Some(row)),
                 FooterAnswer::Damaged => return Err(corruption(read)),

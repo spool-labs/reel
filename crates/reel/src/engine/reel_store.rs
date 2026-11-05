@@ -55,8 +55,8 @@ pub const TABLE_BUDGET_DIVISOR: u64 = 16;
 pub const PLANNED_SEGMENT_BYTES: u64 = 1_024;
 /// Block lines a table's share is planned for, as bytes per line
 pub const PLANNED_LINE_BYTES: u64 = 32;
-/// Bytes a summary row is planned at per column, keys of typical length included
-pub const PLANNED_SUMMARY_COLUMN_BYTES: usize = 100;
+/// Bytes a summary row is planned at: four columns at about 100 B, and the row's own fields
+pub const PLANNED_SUMMARY_ROW_BYTES: usize = 512;
 
 /// An open store
 pub struct ReelStore<Backend: Io> {
@@ -115,6 +115,11 @@ impl<Backend: Io> ReelStore<Backend> {
         })
     }
 
+    /// Count the summary rows that didn't fit, each one a segment whose damage would cover its columns whole
+    pub fn dropped_summary_rows(&self) -> u64 {
+        self.state.dropped_summary_rows.load(Ordering::Acquire)
+    }
+
     /// Count the segments open kept and couldn't read
     pub fn damaged_segments(&self) -> u64 {
         self.state.damaged_segments.load(Ordering::Acquire)
@@ -170,8 +175,16 @@ impl<Backend: Io> ReelStore<Backend> {
         self.check_open()?;
         let info = self.state.column(column)?;
         let volume = &self.state.volumes[info.volume.0 as usize];
+        let before = volume.damage.ranges();
         volume.damage.clear(column, start, end);
-        save_cleared_spans(volume);
+        // a clear the summary can't hold would come back at the next open, so it doesn't happen at all
+        if !save_cleared_spans(volume) {
+            volume.damage.restore(before);
+            return Err(StoreError::Io {
+                action: "saving a cleared span",
+                source: Error::other("the summary has no row for it, or no room"),
+            });
+        }
         self.state.save_summary(volume).map_err(open_error("saving a summary"))
     }
 
@@ -271,9 +284,7 @@ pub fn bring_up<Backend: Io>(
     state: &Arc<EngineState<Backend>>,
     scan: &mut RootScan<Backend::File>,
 ) -> Result<(), StoreError> {
-    settle_summaries(state, &scan.sealed, &scan.damaged).map_err(open_error("settling a summary"))?;
-    let damaged: usize = state.volumes.iter().map(|volume| hold(&volume.damaged).len()).sum();
-    state.damaged_segments.store(damaged as u64, Ordering::Release);
+    settle_summaries(state, scan).map_err(open_error("settling a summary"))?;
 
     scan.sealed.reverse();
     while let Some(found) = scan.sealed.last() {
@@ -283,6 +294,8 @@ pub fn bring_up<Backend: Io>(
     }
     let highest_segment = scan.highest_segment;
     recover_segments(state, &mut scan.open, highest_segment).map_err(open_error("recovering a segment"))?;
+    let damaged: usize = state.volumes.iter().map(|volume| hold(&volume.damaged).len()).sum();
+    state.damaged_segments.store(damaged as u64, Ordering::Release);
 
     // an open is not a state: the limits say what a run-through would seal, from the same rows
     for volume in &state.volumes {
@@ -550,7 +563,7 @@ pub fn build_state<Backend: Io>(
             continue;
         };
         let found_summary = summary.rows.bytes().len() * 2;
-        let planned_summary = segments_per_shard * TABLE_SHARDS * config.columns.len().max(1) * PLANNED_SUMMARY_COLUMN_BYTES;
+        let planned_summary = segments_per_shard * TABLE_SHARDS * PLANNED_SUMMARY_ROW_BYTES / config.volumes.len().max(1);
         let summary_room = found_summary.max(planned_summary);
         summary.rows.make_room(ByteCount(summary_room as u64));
         volumes.push(Volume {
@@ -647,6 +660,7 @@ pub fn build_state<Backend: Io>(
         deletes: AtomicU64::new(0),
         row_job_idle: AtomicBool::new(false),
         damaged_segments: AtomicU64::new(0),
+        dropped_summary_rows: AtomicU64::new(0),
         row_task: OnceLock::new(),
         seal_tasks,
     }

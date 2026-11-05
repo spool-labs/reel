@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::seed_sets::seeds;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel_sim::file_image::BitMask;
@@ -327,7 +328,7 @@ impl Run {
 // flushed writes and every read hold through failed syncs, full disks and crashes in and out of recovery
 #[test]
 fn random_faults() {
-    for seed in SEEDS {
+    for seed in seeds(SEEDS) {
         Run::new(seed, false).run();
     }
 }
@@ -335,7 +336,7 @@ fn random_faults() {
 // the same with rot: a read matches or says it can't, and never answers older or missing
 #[test]
 fn random_rot() {
-    for seed in ROT_SEEDS {
+    for seed in seeds(ROT_SEEDS) {
         Run::new(seed, true).run();
     }
 }

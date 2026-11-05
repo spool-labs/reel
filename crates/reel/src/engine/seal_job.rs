@@ -23,6 +23,7 @@ use crate::segment::column_directory::DirectoryEntry;
 use crate::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
 use crate::segment::row_block::FooterRow;
 use crate::segment::segment_tail::{BlockCount, SegmentNumber};
+use crate::engine::recovery::span_of;
 use crate::segment::summary::SegmentFacts;
 
 /// Rows one step of a seal handles
@@ -215,7 +216,7 @@ impl<Backend: Io> SealJob<Backend> {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
         if !self.is_summarized {
-            let facts = SegmentFacts {
+            let mut facts = SegmentFacts {
                 segment: target.number,
                 file_length: totals.file_length,
                 data_end: target.data_end,
@@ -223,11 +224,27 @@ impl<Backend: Io> SealJob<Backend> {
                 seal_mark: totals.head.index_sum,
                 places: totals.head.places,
                 is_damaged: false,
+                damage_place: WritePlace(0),
             };
             let writer = &self.writer;
             let columns = (0..writer.columns().len()).map(|index| writer.column_facts(index));
+
+            // spans of a segment still open go on in its row, and only a clear ends them
+            let is_listed = hold(&volume.damaged).contains(&target.number);
+            let spans = if is_listed { volume.damage.of_segment(target.number) } else { Vec::new() };
+            let mut rows = hold(&volume.summary);
+            if is_listed {
+                rows.remove(target.number);
+            }
+            if let Some(span) = spans.first() {
+                facts.is_damaged = true;
+                facts.damage_place = span.highest_place;
+            }
             // a row that won't fit costs nothing until the segment is damaged, and then its columns count whole
-            let _is_kept = hold(&volume.summary).push(&facts, columns, [].into_iter());
+            if !rows.push(&facts, columns, spans.iter().map(span_of)) {
+                state.note_dropped_row();
+            }
+            drop(rows);
             self.is_summarized = true;
         }
 

@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use crate::seed_sets::seeds;
 use reel::index::key_hash::hash_key;
 use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::{Seed, SeededRandom};
@@ -371,7 +372,7 @@ fn power_cut() {
     let mut sealed = 0;
 
     for crash_at in 0..CRASH_POINTS {
-        for seed in 0..CRASH_SEEDS {
+        for seed in seeds(0..CRASH_SEEDS) {
             sealed += cut_during_footer(&rows, OperationCount(crash_at), Seed(seed));
         }
     }

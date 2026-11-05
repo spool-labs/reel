@@ -5,6 +5,7 @@ mod damage;
 mod io_contract;
 mod place_limit;
 mod records;
+mod seed_sets;
 mod write_index;
 mod faults;
 mod footers;

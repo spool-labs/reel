@@ -137,7 +137,10 @@ impl FooterReader {
     ) -> Result<Option<TailHead>> {
         let read = (end.0 as usize).min(MAX_TAIL_BYTES);
         let at = FileOffset(end.0 - read as u64);
-        file.read_exact_at(at, &mut self.tail[..read])?;
+        // a bad sector under a copy costs that copy, as a failed check does
+        if file.read_exact_at(at, &mut self.tail[..read]).is_err() {
+            return Ok(None);
+        }
 
         let Some(tail) = find_tail(&self.tail[..read], record_key) else {
             return Ok(None);
@@ -181,7 +184,9 @@ impl FooterReader {
         while remaining > 0 {
             let lines = remaining.min(lines_per_read);
             let length = lines * BLOCK_ENTRY_BYTES;
-            file.read_exact_at(at, &mut self.block[..length])?;
+            if file.read_exact_at(at, &mut self.block[..length]).is_err() {
+                return Ok(false);
+            }
             sum = fold_sum(sum, checksum(&self.block[..length]));
             for line in 0..lines {
                 let Some(entry) = BlockEntry::read(&self.block[line * BLOCK_ENTRY_BYTES..]) else {
@@ -245,7 +250,9 @@ impl FooterReader {
         };
 
         let length = first.block_length().0 as usize;
-        file.read_exact_at(first.block_at(), &mut self.block[..length])?;
+        if file.read_exact_at(first.block_at(), &mut self.block[..length]).is_err() {
+            return Ok(false);
+        }
         let Some(mut walk) = RowBlockWalk::open(&self.block[..length], place_base) else {
             return Ok(false);
         };
@@ -255,7 +262,9 @@ impl FooterReader {
         }
 
         let length = last.block_length().0 as usize;
-        file.read_exact_at(last.block_at(), &mut self.block[..length])?;
+        if file.read_exact_at(last.block_at(), &mut self.block[..length]).is_err() {
+            return Ok(false);
+        }
         let Some(mut walk) = RowBlockWalk::open(&self.block[..length], place_base) else {
             return Ok(false);
         };

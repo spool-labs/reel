@@ -136,6 +136,16 @@ impl SimulatedIo {
         hold(&self.disk).failing_syncs = count;
     }
 
+    /// Make one byte fail every read that touches it, as a bad sector does
+    pub fn bad_sector(&self, path: &Path, offset: FileOffset) -> Result<()> {
+        let mut disk = hold(&self.disk);
+        let inode = disk.inode_of(path)?;
+        if let Some(image) = disk.inodes.get_mut(&inode) {
+            image.bad_sectors.insert(offset.0);
+        }
+        Ok(())
+    }
+
     /// Flip bits of one byte of a file in place
     pub fn rot(&self, path: &Path, offset: FileOffset, mask: BitMask) -> Result<()> {
         let mut disk = hold(&self.disk);

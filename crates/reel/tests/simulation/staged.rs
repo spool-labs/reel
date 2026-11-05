@@ -5,6 +5,7 @@ use std::io::IoSlice;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::seed_sets::seeds;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::claim::Claim;
 use reel::engine::engine_state::EngineState;
@@ -233,7 +234,7 @@ impl Staged<'_> {
 // a row that lands during a sync is never covered by it without its record, so it reads back or it's gone
 #[test]
 fn sync_order() {
-    for seed in 0..SEED_COUNT {
+    for seed in seeds(0..SEED_COUNT) {
         let io = SimulatedIo::new(Seed(seed));
         let store = open(&io);
         store.put(COLUMN, b"durable", b"first").expect("put");
@@ -773,7 +774,7 @@ fn sealed_in_open() {
 // a sync reaches every open segment even when a seal removes one beside it
 #[test]
 fn sync_beside_seal() {
-    for seed in 0..SEED_COUNT {
+    for seed in seeds(0..SEED_COUNT) {
         let io = SimulatedIo::new(Seed(seed));
         let store = open(&io);
         let state = Arc::clone(&store.state);
@@ -876,7 +877,7 @@ fn finish_get(state: &State, get: &StagedGet) -> Option<Vec<u8>> {
 // picks: every get sees the newest row at its read point, and a crash keeps what a sync covered
 #[test]
 fn seeded_interleaving() {
-    for seed in 0..SEED_COUNT {
+    for seed in seeds(0..SEED_COUNT) {
         run_interleaving(Seed(seed));
     }
 }

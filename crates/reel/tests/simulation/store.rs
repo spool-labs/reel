@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::seed_sets::seeds;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel_sim::seeded_random::{Seed, SeededRandom};
@@ -296,7 +297,7 @@ fn value_window() {
 // random writes, kills, power cuts and reopens never lose a write that had to survive
 #[test]
 fn model_crashes() {
-    for seed in 0..SEED_COUNT {
+    for seed in seeds(0..SEED_COUNT) {
         run_crashes(Seed(seed));
     }
 }
@@ -392,7 +393,7 @@ fn check_all(store: &Store, expected: &BTreeMap<Vec<u8>, Vec<u8>>) {
 #[test]
 fn seal_crashes() {
     for crash_at in 0..SEAL_CRASH_POINTS {
-        for seed in 0..SEAL_CRASH_SEEDS {
+        for seed in seeds(0..SEAL_CRASH_SEEDS) {
             for crash in [Crash::Kill, Crash::PowerCut] {
                 crash_during_seal(OperationCount(crash_at), Seed(seed), crash);
             }

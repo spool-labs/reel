@@ -256,6 +256,15 @@ impl<File: Clone> SegmentTable<File> {
         true
     }
 
+    /// Count the segments in the table
+    pub fn segment_count(&self) -> u64 {
+        let mut count = 0;
+        for shard in 0..TABLE_SHARDS {
+            count += self.read_shard(shard).segments.iter().flatten().count() as u64;
+        }
+        count
+    }
+
     /// Check the table has a segment
     pub fn holds(&self, number: SegmentNumber) -> bool {
         self.read_shard(shard_of(number)).map.get(number).is_some()

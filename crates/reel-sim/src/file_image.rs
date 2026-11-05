@@ -1,5 +1,6 @@
 //! One simulated file: what a reader sees and what a power cut leaves
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use reel_api::units::{ByteCount, FileOffset};
@@ -46,6 +47,7 @@ pub struct FileImage {
     pub disk: Option<PathBuf>,
     pub handle_count: u64,
     pub is_named: bool,
+    pub bad_sectors: BTreeSet<u64>,
 }
 
 impl FileImage {
@@ -94,6 +96,11 @@ impl FileImage {
         if let Some(byte) = self.durable.get_mut(offset.0 as usize) {
             *byte ^= mask.0;
         }
+    }
+
+    /// Check a read can reach these bytes
+    pub fn is_readable(&self, start: usize, end: usize) -> bool {
+        self.bad_sectors.range(start as u64..end as u64).next().is_none()
     }
 
     /// Check whether the bytes still take space on the disk

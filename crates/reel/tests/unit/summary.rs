@@ -18,6 +18,7 @@ fn facts(number: u64) -> SegmentFacts {
             highest: WritePlace(9),
         },
         is_damaged: false,
+        damage_place: WritePlace(0),
     }
 }
 
@@ -25,7 +26,7 @@ fn column() -> ColumnFacts<'static> {
     ColumnFacts {
         column: ColumnId(2),
         lowest: b"apple",
-        highest: b"pear",
+        bound: b"pear",
         row_count: RowCount(10),
         grave_count: RowCount(1),
     }
@@ -93,13 +94,78 @@ fn row_room() {
     assert!(!rows.push(&facts(1), [column()].into_iter(), [].into_iter()));
 }
 
-// a row fails the test and leaves, and the others stay whole
+// one walk finds where every row starts
 #[test]
-fn row_keep() {
-    let mut rows = filled();
+fn row_offsets() {
+    let rows = filled();
 
-    rows.keep_where(|row| row.facts.segment == SegmentNumber(2));
+    let offsets = rows.offsets();
 
-    assert!(rows.get(SegmentNumber(1)).is_none());
-    assert_eq!(rows.get(SegmentNumber(2)).expect("row").facts, facts(2));
+    assert_eq!(offsets.len(), 2);
+    assert_eq!(rows.row_at(offsets[&SegmentNumber(2)]).expect("row").facts, facts(2));
+}
+
+// a row copies across as it stands
+#[test]
+fn row_copy() {
+    let rows = filled();
+    let offsets = rows.offsets();
+    let mut copied = SummaryRows::new(ROOM);
+
+    assert!(copied.copy_row(&rows, offsets[&SegmentNumber(1)]));
+
+    assert_eq!(copied.get(SegmentNumber(1)).expect("row").facts, facts(1));
+    assert!(copied.get(SegmentNumber(2)).is_none());
+}
+
+// rot in a row's length costs that row alone: the walk finds the next head
+#[test]
+fn head_rot() {
+    let rows = filled();
+    let mut bytes = rows.bytes().to_vec();
+
+    bytes[5] ^= 1;
+    let (length, first) = read_row(&bytes).expect("a row follows");
+    let (_, second) = read_row(&bytes[length..]).expect("row");
+
+    assert!(first.is_none());
+    assert_eq!(second.expect("row").facts, facts(2));
+}
+
+// a short key's bound sits right above it, and a long key's above every key sharing its first bytes
+#[test]
+fn key_bound() {
+    let mut bound = Vec::new();
+    put_bound(b"pear", &mut bound);
+    assert_eq!(bound, b"pear\0");
+
+    let long = [7; 2 * SUMMARY_KEY_BYTES];
+    bound.clear();
+    put_bound(&long, &mut bound);
+    let mut above = long[..SUMMARY_KEY_BYTES].to_vec();
+    above[SUMMARY_KEY_BYTES - 1] += 1;
+    assert_eq!(bound, above);
+    assert!(long.as_slice() < bound.as_slice());
+}
+
+// a key of top bytes has nothing above it, so the range runs to the column's end
+#[test]
+fn no_bound() {
+    let mut bound = Vec::new();
+
+    put_bound(&[u8::MAX; SUMMARY_KEY_BYTES], &mut bound);
+
+    assert!(bound.is_empty());
+}
+
+// a lowest key keeps its first bytes, which sort at or below it
+#[test]
+fn key_prefix() {
+    let long = [7; 2 * SUMMARY_KEY_BYTES];
+    let mut lowest = Vec::new();
+
+    put_lowest(&long, &mut lowest);
+
+    assert_eq!(lowest.len(), SUMMARY_KEY_BYTES);
+    assert!(lowest.as_slice() <= long.as_slice());
 }

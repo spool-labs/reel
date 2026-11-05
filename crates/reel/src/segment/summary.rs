@@ -1,5 +1,6 @@
 //! A volume's summary: one row per sealed segment, which outlives that segment's tail
 
+use std::collections::BTreeMap;
 use std::io::{Error, ErrorKind, IoSlice, Result};
 use std::path::{Path, PathBuf};
 
@@ -7,6 +8,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
 use crate::io::{Io, IoFile};
+use crate::little_endian::read_half;
 use crate::record::record_check::{Checksum, checksum};
 use crate::segment::segment_tail::{PlaceRange, SegmentNumber};
 use crate::superblock::read_whole;
@@ -19,12 +21,16 @@ pub const SUMMARY_NAME: &str = "summary";
 pub const NEW_SUMMARY_NAME: &str = "summary.new";
 /// Bytes of a summary file's header
 pub const SUMMARY_HEADER_BYTES: usize = 32;
-/// Bytes of a row's length
-pub const ROW_LENGTH_BYTES: usize = size_of::<u32>();
+/// Opens every row, so a walk past a bad row can find the next one
+pub const ROW_MARKER: u32 = 0x5253_554D;
+/// Bytes of a row's head: its marker, its body's length and the head's own checksum
+pub const ROW_HEAD_BYTES: usize = 3 * size_of::<u32>();
 /// Bytes of a row's checksum
 pub const ROW_SUM_BYTES: usize = size_of::<u64>();
 /// Bytes of the fields every row has, before its columns
 pub const ROW_FACT_BYTES: usize = 69;
+/// Most bytes of a key a row keeps, so a column costs about 100 B whatever the keys are
+pub const SUMMARY_KEY_BYTES: usize = 32;
 /// Marks a span that runs to its column's end
 pub const NO_END: u16 = u16::MAX;
 
@@ -38,6 +44,7 @@ pub struct SegmentFacts {
     pub seal_mark: Checksum,
     pub places: PlaceRange,
     pub is_damaged: bool,
+    pub damage_place: WritePlace,
 }
 
 /// One column's range and counts in a segment
@@ -45,7 +52,7 @@ pub struct SegmentFacts {
 pub struct ColumnFacts<'key> {
     pub column: ColumnId,
     pub lowest: &'key [u8],
-    pub highest: &'key [u8],
+    pub bound: &'key [u8],
     pub row_count: RowCount,
     pub grave_count: RowCount,
 }
@@ -109,13 +116,13 @@ impl<'bytes> RowCursor<'bytes> {
     pub fn column(&mut self) -> Option<ColumnFacts<'bytes>> {
         let column = ColumnId(self.byte()?);
         let lowest_length = self.short()? as usize;
-        let highest_length = self.short()? as usize;
+        let bound_length = self.short()? as usize;
         let row_count = RowCount(self.word()?);
         let grave_count = RowCount(self.word()?);
         Some(ColumnFacts {
             column,
             lowest: self.take(lowest_length)?,
-            highest: self.take(highest_length)?,
+            bound: self.take(bound_length)?,
             row_count,
             grave_count,
         })
@@ -179,27 +186,27 @@ impl SummaryRows {
     ) -> bool {
         let mut body: usize = ROW_FACT_BYTES;
         for column in columns.clone() {
-            body += 1 + 2 * size_of::<u16>() + 2 * size_of::<u64>() + column.lowest.len() + column.highest.len();
+            body += 1 + 2 * size_of::<u16>() + 2 * size_of::<u64>() + column.lowest.len() + column.bound.len();
         }
         for span in spans.clone() {
             body += 1 + 2 * size_of::<u16>() + span.start.len() + span.end.map_or(0, <[u8]>::len);
         }
-        if self.bytes.len() + ROW_LENGTH_BYTES + body + ROW_SUM_BYTES > self.bytes.capacity() {
+        if self.bytes.len() + ROW_HEAD_BYTES + body + ROW_SUM_BYTES > self.bytes.capacity() {
             return false;
         }
 
         let start = self.bytes.len();
-        self.bytes.extend_from_slice(&(body as u32).to_le_bytes());
+        self.bytes.extend_from_slice(&row_head(body as u32));
         let body_at = self.bytes.len();
         self.put_facts(facts, columns.len() as u16, spans.len() as u16);
         for column in columns {
             self.bytes.push(column.column.0);
             self.bytes.extend_from_slice(&(column.lowest.len() as u16).to_le_bytes());
-            self.bytes.extend_from_slice(&(column.highest.len() as u16).to_le_bytes());
+            self.bytes.extend_from_slice(&(column.bound.len() as u16).to_le_bytes());
             self.bytes.extend_from_slice(&column.row_count.0.to_le_bytes());
             self.bytes.extend_from_slice(&column.grave_count.0.to_le_bytes());
             self.bytes.extend_from_slice(column.lowest);
-            self.bytes.extend_from_slice(column.highest);
+            self.bytes.extend_from_slice(column.bound);
         }
         for span in spans {
             self.bytes.push(span.column.0);
@@ -214,7 +221,7 @@ impl SummaryRows {
 
         let sum = checksum(&self.bytes[body_at..]);
         self.bytes.extend_from_slice(&sum.0.to_le_bytes());
-        debug_assert_eq!(self.bytes.len() - start, ROW_LENGTH_BYTES + body + ROW_SUM_BYTES);
+        debug_assert_eq!(self.bytes.len() - start, ROW_HEAD_BYTES + body + ROW_SUM_BYTES);
         true
     }
 
@@ -230,7 +237,7 @@ impl SummaryRows {
         self.bytes.push(u8::from(facts.is_damaged));
         self.bytes.extend_from_slice(&columns.to_le_bytes());
         self.bytes.extend_from_slice(&spans.to_le_bytes());
-        self.bytes.extend_from_slice(&[0; ROW_FACT_BYTES - 61]);
+        self.bytes.extend_from_slice(&facts.damage_place.0.to_le_bytes());
     }
 
     /// Walk the rows that pass their checks
@@ -256,18 +263,34 @@ impl SummaryRows {
         }
     }
 
-    /// Keep only the rows a check passes on
-    pub fn keep_where(&mut self, should_keep: impl Fn(&SummaryRow) -> bool) {
-        let mut read = 0;
-        let mut write = 0;
-        while let Some((length, row)) = read_row(&self.bytes[read..]) {
-            if row.is_some_and(|row| should_keep(&row)) {
-                self.bytes.copy_within(read..read + length, write);
-                write += length;
+    /// List where each row that passes its check starts, in one walk
+    pub fn offsets(&self) -> BTreeMap<SegmentNumber, usize> {
+        let mut offsets = BTreeMap::new();
+        let mut at = 0;
+        while let Some((length, row)) = read_row(&self.bytes[at..]) {
+            if let Some(row) = row {
+                offsets.insert(row.facts.segment, at);
             }
-            read += length;
+            at += length;
         }
-        self.bytes.truncate(write);
+        offsets
+    }
+
+    /// Read the row at an offset `offsets` gave
+    pub fn row_at(&self, at: usize) -> Option<SummaryRow<'_>> {
+        read_row(self.bytes.get(at..)?)?.1
+    }
+
+    /// Copy a row as it stands from other rows, or return false when it doesn't fit
+    pub fn copy_row(&mut self, from: &Self, at: usize) -> bool {
+        let Some((length, _row)) = from.bytes.get(at..).and_then(read_row) else {
+            return false;
+        };
+        if self.bytes.len() + length > self.bytes.capacity() {
+            return false;
+        }
+        self.bytes.extend_from_slice(&from.bytes[at..at + length]);
+        true
     }
 }
 
@@ -291,18 +314,65 @@ impl<'bytes> Iterator for RowWalk<'bytes> {
     }
 }
 
-/// Read a row's length and the row itself, which is nothing when it fails its check
-pub fn read_row(bytes: &[u8]) -> Option<(usize, Option<SummaryRow<'_>>)> {
-    let length_bytes = bytes.get(..ROW_LENGTH_BYTES)?;
-    let mut length = [0; ROW_LENGTH_BYTES];
-    length.copy_from_slice(length_bytes);
-    let body_length = u32::from_le_bytes(length) as usize;
-    let total = ROW_LENGTH_BYTES + body_length + ROW_SUM_BYTES;
-    let row_bytes = bytes.get(..total)?;
+/// Add the part of a lowest key a row keeps
+pub fn put_lowest(key: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(&key[..key.len().min(SUMMARY_KEY_BYTES)]);
+}
 
-    let body = &row_bytes[ROW_LENGTH_BYTES..ROW_LENGTH_BYTES + body_length];
+/// Add an exclusive bound above every key sharing a highest key's first bytes, which is nothing
+/// when no key can sit above them, and which can only widen a range
+pub fn put_bound(key: &[u8], out: &mut Vec<u8>) {
+    let start = out.len();
+    if key.len() < SUMMARY_KEY_BYTES {
+        out.extend_from_slice(key);
+        out.push(0);
+        return;
+    }
+
+    out.extend_from_slice(&key[..SUMMARY_KEY_BYTES]);
+    while out.len() > start {
+        let last = out.len() - 1;
+        if out[last] < u8::MAX {
+            out[last] += 1;
+            return;
+        }
+        out.pop();
+    }
+}
+
+/// Lay out a row's head
+pub fn row_head(body_length: u32) -> [u8; ROW_HEAD_BYTES] {
+    let mut head = [0; ROW_HEAD_BYTES];
+    head[..4].copy_from_slice(&ROW_MARKER.to_le_bytes());
+    head[4..8].copy_from_slice(&body_length.to_le_bytes());
+    let sum = checksum(&head[..8]).0 as u32;
+    head[8..].copy_from_slice(&sum.to_le_bytes());
+    head
+}
+
+/// Read a row's body length when its head passes its check and the whole row is there
+pub fn read_row_head(bytes: &[u8]) -> Option<usize> {
+    let head = bytes.get(..ROW_HEAD_BYTES)?;
+    if read_half(head, 0)? != ROW_MARKER || read_half(head, 8)? != checksum(&head[..8]).0 as u32 {
+        return None;
+    }
+    let body_length = read_half(head, 4)? as usize;
+    bytes.get(..ROW_HEAD_BYTES + body_length + ROW_SUM_BYTES)?;
+    Some(body_length)
+}
+
+/// Read how far a row reaches and the row itself, which is nothing when it fails its check, and
+/// after a bad head reach to the next head that passes, so one bad row costs that row alone
+pub fn read_row(bytes: &[u8]) -> Option<(usize, Option<SummaryRow<'_>>)> {
+    let Some(body_length) = read_row_head(bytes) else {
+        let next = (1..bytes.len()).find(|at| read_row_head(&bytes[*at..]).is_some())?;
+        return Some((next, None));
+    };
+
+    let total = ROW_HEAD_BYTES + body_length + ROW_SUM_BYTES;
+    let body = &bytes[ROW_HEAD_BYTES..ROW_HEAD_BYTES + body_length];
     let mut sum = [0; ROW_SUM_BYTES];
-    sum.copy_from_slice(&row_bytes[ROW_LENGTH_BYTES + body_length..]);
+    sum.copy_from_slice(&bytes[ROW_HEAD_BYTES + body_length..total]);
     if checksum(body).0 != u64::from_le_bytes(sum) {
         return Some((total, None));
     }
@@ -312,21 +382,29 @@ pub fn read_row(bytes: &[u8]) -> Option<(usize, Option<SummaryRow<'_>>)> {
 /// Read a row's fixed fields
 pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
     let mut cursor = RowCursor { bytes: body };
-    let facts = SegmentFacts {
-        segment: SegmentNumber(cursor.word()?),
-        file_length: ByteCount(cursor.word()?),
-        data_end: FileOffset(cursor.word()?),
-        row_block_end: FileOffset(cursor.word()?),
-        seal_mark: Checksum(cursor.word()?),
-        places: PlaceRange {
-            lowest: WritePlace(cursor.word()?),
-            highest: WritePlace(cursor.word()?),
-        },
-        is_damaged: cursor.byte()? != 0,
+    let segment = SegmentNumber(cursor.word()?);
+    let file_length = ByteCount(cursor.word()?);
+    let data_end = FileOffset(cursor.word()?);
+    let row_block_end = FileOffset(cursor.word()?);
+    let seal_mark = Checksum(cursor.word()?);
+    let places = PlaceRange {
+        lowest: WritePlace(cursor.word()?),
+        highest: WritePlace(cursor.word()?),
     };
+    let is_damaged = cursor.byte()? != 0;
     let column_count = cursor.short()?;
     let span_count = cursor.short()?;
-    cursor.take(ROW_FACT_BYTES - 61)?;
+    let damage_place = WritePlace(cursor.word()?);
+    let facts = SegmentFacts {
+        segment,
+        file_length,
+        data_end,
+        row_block_end,
+        seal_mark,
+        places,
+        is_damaged,
+        damage_place,
+    };
     Some(SummaryRow {
         facts,
         column_count,
@@ -392,7 +470,10 @@ pub fn read_summary<Backend: Io>(
 
     let bytes = read_whole(&file);
     io.close_file(file);
-    let bytes = bytes?;
+    // rows the file can't give back are rebuilt from the tails, like any row that fails its check
+    let Ok(bytes) = bytes else {
+        return Ok(None);
+    };
 
     let Some(header) = bytes.get(..SUMMARY_HEADER_BYTES) else {
         return Ok(None);

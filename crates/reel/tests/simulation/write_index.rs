@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::seed_sets::seeds;
 use reel::index::entry_slab::PageCount;
 use reel::index::node_pool::NodeCount;
 use reel::index::open_slots::{OpenSlot, OpenSlots};
@@ -112,7 +113,7 @@ fn next_across_shards(
 // lookups match a plain model at every read point, whatever order rows land in
 #[test]
 fn model_lookups() {
-    for seed in 0..SEED_COUNT {
+    for seed in seeds(0..SEED_COUNT) {
         let mut random = SeededRandom::new(Seed(seed));
         let index = WriteIndex::new(&SIZING);
         let mut model: BTreeMap<Vec<u8>, BTreeMap<u64, RowKind>> = BTreeMap::new();

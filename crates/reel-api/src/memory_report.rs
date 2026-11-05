@@ -11,6 +11,7 @@ pub struct MemoryReport {
     pub block_cache: ByteCount,
     pub block_indexes: ByteCount,
     pub segment_table: ByteCount,
+    pub summary: ByteCount,
     pub range_deletes: ByteCount,
     pub key_runs: ByteCount,
     pub read_buffers: ByteCount,

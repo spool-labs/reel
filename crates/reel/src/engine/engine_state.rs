@@ -79,6 +79,7 @@ pub struct EngineState<Backend: Io> {
     pub deletes: AtomicU64,
     pub row_job_idle: AtomicBool,
     pub damaged_segments: AtomicU64,
+    pub dropped_summary_rows: AtomicU64,
     pub row_task: OnceLock<Backend::Task>,
     pub seal_tasks: Vec<OnceLock<Backend::Task>>,
 }
@@ -156,6 +157,11 @@ impl<Backend: Io> EngineState<Backend> {
         self.order.mark()
     }
 
+    /// Count a summary row that did not fit
+    pub fn note_dropped_row(&self) {
+        self.dropped_summary_rows.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Write a volume's summary whole, and only its own seal, a clear and close wait on the lock
     pub fn save_summary(&self, volume: &Volume<Backend>) -> Result<(), Error> {
         let rows = hold(&volume.summary);
@@ -214,7 +220,11 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Add up the heap the shared parts hold
     pub fn heap_bytes(&self) -> ByteCount {
-        ByteCount(self.index.heap_bytes().0 + self.spot.heap_bytes().0)
+        let mut summaries = 0;
+        for volume in &self.volumes {
+            summaries += hold(&volume.summary).heap_bytes().0;
+        }
+        ByteCount(self.index.heap_bytes().0 + self.spot.heap_bytes().0 + summaries)
     }
 }
 

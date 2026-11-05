@@ -86,6 +86,18 @@ impl DamageList {
         self.count.store(ranges.len(), Ordering::Release);
     }
 
+    /// Copy every range
+    pub fn ranges(&self) -> Vec<DamagedRange> {
+        read_ranges(&self.ranges).clone()
+    }
+
+    /// Put back the ranges a copy holds
+    pub fn restore(&self, kept: Vec<DamagedRange>) {
+        let mut ranges = write_ranges(&self.ranges);
+        *ranges = kept;
+        self.count.store(ranges.len(), Ordering::Release);
+    }
+
     /// Copy the ranges of one segment
     pub fn of_segment(&self, segment: SegmentNumber) -> Vec<DamagedRange> {
         let ranges = read_ranges(&self.ranges);

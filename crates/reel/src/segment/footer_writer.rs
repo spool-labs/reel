@@ -5,7 +5,6 @@ use std::io::{Error, IoSlice, Result};
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
-use crate::config::MAX_KEY_BYTES;
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::io::IoFile;
 use crate::record::record_check::{Checksum, RecordKey, checksum};
@@ -15,7 +14,7 @@ use crate::segment::block_filter::{FILTER_SUM_BYTES, add_key, filter_bytes, seal
 use crate::segment::row_block::{
     BLOCK_HEADER_BYTES, BlockHeader, FooterRow, ROW_BLOCK_BYTES, RowBlockBuilder, write_block_header,
 };
-use crate::segment::summary::ColumnFacts;
+use crate::segment::summary::{ColumnFacts, SUMMARY_KEY_BYTES, put_bound, put_lowest};
 use crate::segment::segment_tail::{
     BlockCount, COLUMN_TAIL_BYTES, COPY_GAP_BYTES, ColumnTail, MAX_COLUMNS, MAX_TAIL_BYTES, MOST_SEGMENT_BYTES,
     PlaceRange, SECOND_TAIL_DISTANCE, SegmentNumber, TAIL_FIXED_BYTES, TailCursor, TailHead, write_trailer,
@@ -79,7 +78,7 @@ impl FooterWriter {
             entries: Vec::with_capacity(most_blocks.0 as usize),
             columns: Vec::with_capacity(MAX_COLUMNS),
             column_keys: Vec::with_capacity(MAX_COLUMNS),
-            key_bytes: Vec::with_capacity(MAX_COLUMNS * 2 * MAX_KEY_BYTES as usize),
+            key_bytes: Vec::with_capacity(MAX_COLUMNS * (2 * SUMMARY_KEY_BYTES + 1)),
             tail: vec![0; MAX_TAIL_BYTES],
             index: vec![0; ROW_BLOCK_BYTES],
             position: FileOffset(0),
@@ -118,7 +117,7 @@ impl FooterWriter {
         ColumnFacts {
             column: tail.column,
             lowest: &self.key_bytes[keys.lowest_at..keys.highest_at],
-            highest: &self.key_bytes[keys.highest_at..keys.end],
+            bound: &self.key_bytes[keys.highest_at..keys.end],
             row_count: tail.row_count,
             grave_count: tail.grave_count,
         }
@@ -147,9 +146,9 @@ impl FooterWriter {
         self.close_block(file)?;
         let shared = shared_prefix(start.lowest, start.highest);
         let lowest_at = self.key_bytes.len();
-        self.key_bytes.extend_from_slice(start.lowest);
+        put_lowest(start.lowest, &mut self.key_bytes);
         let highest_at = self.key_bytes.len();
-        self.key_bytes.extend_from_slice(start.highest);
+        put_bound(start.highest, &mut self.key_bytes);
         self.column_keys.push(ColumnKeys {
             lowest_at,
             highest_at,

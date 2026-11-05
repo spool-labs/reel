@@ -65,6 +65,9 @@ impl IoFile for SimulatedFile {
         };
         let start = image.visible.len().min(offset.0 as usize);
         let end = image.visible.len().min(start + buf.len());
+        if !image.is_readable(start, end) {
+            return Err(Error::other("simulated read failure"));
+        }
         let count = end - start;
         buf[..count].copy_from_slice(&image.visible[start..end]);
         disk.reads = OperationCount(disk.reads.0 + 1);
@@ -91,6 +94,9 @@ impl IoFile for SimulatedFile {
         let mut total = 0;
         for part in parts.iter_mut() {
             let end = start + part.len();
+            if !image.is_readable(start, end) {
+                return Err(Error::other("simulated read failure"));
+            }
             let Some(bytes) = image.visible.get(start..end) else {
                 return Err(Error::from(ErrorKind::UnexpectedEof));
             };

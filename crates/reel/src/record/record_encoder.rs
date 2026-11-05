@@ -5,7 +5,8 @@ use std::io::IoSlice;
 use reel_api::units::{ByteCount, FileOffset};
 
 use crate::record::chunk_table::{
-    ChunkEntry, ENTRIES_PER_PAGE, PAGE_END_AT, TABLE_PAGE_BYTES, page_bytes, page_count, table_bytes, write_entry,
+    ChunkCount, ChunkEntry, ENTRIES_PER_PAGE, PAGE_END_AT, TABLE_PAGE_BYTES, TablePageIndex, page_bytes, page_count,
+    table_bytes, write_entry,
 };
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::lz4_block::Lz4State;
@@ -50,7 +51,7 @@ impl RecordEncoder {
         let stored = (largest_stored.0 as usize).max(CHUNK_BYTES);
         Self {
             head: vec![0; chunked_head_bytes(largest_value)],
-            table: vec![0; page_count(chunks) as usize * TABLE_PAGE_BYTES],
+            table: vec![0; page_count(chunks).0 as usize * TABLE_PAGE_BYTES],
             stored: vec![0; stored],
             lz4: Lz4State::new(),
         }
@@ -84,7 +85,7 @@ impl RecordEncoder {
             codec: stored_codec,
             is_chunked: false,
         };
-        let check = record_check(identity, form.as_byte(), checksum(payload));
+        let check = record_check(identity, form, checksum(payload));
 
         self.head[..CHECK_BYTES].copy_from_slice(&check.0.to_le_bytes());
         self.head[FORM_AT] = form.as_byte();
@@ -101,7 +102,7 @@ impl RecordEncoder {
         let value_length = ByteCount(value.len() as u64);
         let chunks = chunk_count(value_length);
         let head_length = chunked_head_bytes(value_length);
-        let table_length = table_bytes(chunks) as usize;
+        let table_length = table_bytes(chunks).0 as usize;
         if head_length > self.head.len() || table_length > self.table.len() {
             return None;
         }
@@ -175,10 +176,10 @@ impl RecordEncoder {
     }
 
     /// Give each full page the stored end of its last chunk
-    pub fn seal_table(&mut self, chunks: u64, record_end: u64) {
-        let pages = page_count(chunks) as usize;
+    pub fn seal_table(&mut self, chunks: ChunkCount, record_end: u64) {
+        let pages = page_count(chunks).0 as usize;
         for page in 0..pages {
-            if page_bytes(chunks, page as u64) != TABLE_PAGE_BYTES {
+            if page_bytes(chunks, TablePageIndex(page as u64)) != TABLE_PAGE_BYTES {
                 continue;
             }
             let next = (page + 1) * TABLE_PAGE_BYTES;
@@ -198,7 +199,7 @@ impl RecordEncoder {
         identity: &RecordIdentity,
         codec: Codec,
         value_length: ByteCount,
-        chunks: u64,
+        chunks: ChunkCount,
         head_length: usize,
     ) {
         let form = RecordForm {
@@ -208,15 +209,15 @@ impl RecordEncoder {
         self.head[FORM_AT] = form.as_byte();
         self.head[VALUE_LENGTH_AT..PAGE_SUMS_AT].copy_from_slice(&value_length.0.to_le_bytes());
 
-        for page in 0..page_count(chunks) as usize {
+        for page in 0..page_count(chunks).0 as usize {
             let start = page * TABLE_PAGE_BYTES;
-            let length = page_bytes(chunks, page as u64);
+            let length = page_bytes(chunks, TablePageIndex(page as u64));
             let sum = checksum(&self.table[start..start + length]);
             let at = PAGE_SUMS_AT + page * PAGE_SUM_BYTES;
             self.head[at..at + PAGE_SUM_BYTES].copy_from_slice(&sum.0.to_le_bytes());
         }
 
-        let check = record_check(identity, form.as_byte(), checksum(&self.head[FORM_AT..head_length]));
+        let check = record_check(identity, form, checksum(&self.head[FORM_AT..head_length]));
         self.head[..CHECK_BYTES].copy_from_slice(&check.0.to_le_bytes());
     }
 

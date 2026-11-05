@@ -2,7 +2,7 @@
 
 use reel_api::units::ByteCount;
 
-use crate::record::chunk_table::page_count;
+use crate::record::chunk_table::{ChunkCount, TablePageIndex, page_count};
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::record_check::{Checksum, RecordCheck};
 
@@ -45,13 +45,18 @@ impl RecordForm {
 }
 
 /// Count the chunks of a value
-pub fn chunk_count(value_length: ByteCount) -> u64 {
-    value_length.0.div_ceil(CHUNK_BYTES as u64)
+pub fn chunk_count(value_length: ByteCount) -> ChunkCount {
+    ChunkCount(value_length.0.div_ceil(CHUNK_BYTES as u64))
 }
 
 /// Count the bytes of a chunked record's head
 pub fn chunked_head_bytes(value_length: ByteCount) -> usize {
-    PAGE_SUMS_AT + page_count(chunk_count(value_length)) as usize * PAGE_SUM_BYTES
+    head_bytes_for(chunk_count(value_length))
+}
+
+/// Count the bytes of a head over a number of chunks
+pub fn head_bytes_for(chunks: ChunkCount) -> usize {
+    PAGE_SUMS_AT + page_count(chunks).0 as usize * PAGE_SUM_BYTES
 }
 
 /// Read the check at the front of a record
@@ -65,8 +70,8 @@ pub fn read_value_length(bytes: &[u8]) -> Option<ByteCount> {
 }
 
 /// Read one page's checksum from a chunked head
-pub fn read_page_sum(bytes: &[u8], page: usize) -> Option<Checksum> {
-    Some(Checksum(read_word(bytes, PAGE_SUMS_AT + page * PAGE_SUM_BYTES)?))
+pub fn read_page_sum(bytes: &[u8], page: TablePageIndex) -> Option<Checksum> {
+    Some(Checksum(read_word(bytes, PAGE_SUMS_AT + page.0 as usize * PAGE_SUM_BYTES)?))
 }
 
 /// Read a little-endian word

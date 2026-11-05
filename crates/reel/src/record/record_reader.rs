@@ -1,24 +1,27 @@
 //! Reads a record back and checks every byte it returns
 
-use std::io::Result;
+use std::io::{IoSliceMut, Result};
 use std::ops::Range;
 
 use reel_api::reads::ValueWindow;
 use reel_api::units::{ByteCount, FileOffset};
 
 use crate::io::IoFile;
-use crate::record::chunk_table::{ChunkSpan, ENTRIES_PER_PAGE, TABLE_PAGE_BYTES, chunk_span, page_bytes, table_bytes};
+use crate::record::chunk_table::{
+    ChunkCount, ChunkIndex, ChunkSpan, ENTRIES_PER_PAGE, TABLE_PAGE_BYTES, TablePageIndex, chunk_span, page_bytes,
+    page_count, page_of, table_bytes,
+};
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::lz4_block::decompress;
 use crate::record::record_check::{RecordIdentity, checksum, record_check};
 use crate::record::record_head::{
-    FORM_AT, RecordForm, SMALL_HEAD_BYTES, chunk_count, chunked_head_bytes, read_check, read_page_sum,
+    FORM_AT, RecordForm, SMALL_HEAD_BYTES, chunk_count, chunked_head_bytes, head_bytes_for, read_check, read_page_sum,
     read_value_length,
 };
 
 /// Room for a head beside the first table page, which one read fills
 pub const FIRST_READ_BYTES: usize = TABLE_PAGE_BYTES + 4 * 1024;
-/// A record this long or less fits the first read whole
+/// A longer record can't be a one-chunk record
 pub const SMALL_RECORD_BYTES: usize = CHUNK_BYTES + SMALL_HEAD_BYTES;
 
 /// Where a record sits in its segment
@@ -42,8 +45,15 @@ pub enum RecordRead {
 pub struct ChunkedHead {
     pub codec: Codec,
     pub value_length: ByteCount,
-    pub chunks: u64,
+    pub chunks: ChunkCount,
     pub head_length: usize,
+}
+
+/// The split a record stored as written has, worked out from its length alone
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WrittenShape {
+    pub front_length: usize,
+    pub value_length: ByteCount,
 }
 
 /// The buffers one read borrows from the pool
@@ -72,14 +82,34 @@ impl RecordReader {
         ByteCount(total as u64)
     }
 
-    /// Fill the buffer with the whole value
+    /// Fill the buffer with the whole value, in one read when the column stores values as written
     pub fn read_value<File: IoFile>(
         &mut self,
         file: &File,
         location: RecordLocation,
         identity: &RecordIdentity,
+        declared: Codec,
         buf: &mut Vec<u8>,
     ) -> Result<RecordRead> {
+        if declared == Codec::None
+            && let Some(shape) = written_shape(location.length)
+            && shape.front_length <= FIRST_READ_BYTES
+        {
+            buf.resize(shape.value_length.0 as usize, 0);
+            let mut parts = [IoSliceMut::new(&mut self.first[..shape.front_length]), IoSliceMut::new(buf)];
+            file.read_parts_at(location.offset, &mut parts)?;
+
+            if let Some(form) = self.form()
+                && form.is_chunked
+                && form.codec == Codec::None
+            {
+                let Some(head) = self.check_chunked(form, shape.front_length, identity) else {
+                    return Ok(RecordRead::Failed);
+                };
+                return self.check_payload(file, location, &head, buf);
+            }
+        }
+
         let length = self.read_front(file, location)?;
         let Some(form) = self.form() else {
             return Ok(RecordRead::Failed);
@@ -91,6 +121,9 @@ impl RecordReader {
         let Some(head) = self.check_chunked(form, length, identity) else {
             return Ok(RecordRead::Failed);
         };
+        if head.codec == Codec::None {
+            return self.read_payload(file, location, &head, buf);
+        }
         let window = ValueWindow {
             offset: ByteCount(0),
             length: head.value_length,
@@ -147,7 +180,7 @@ impl RecordReader {
             return RecordRead::Failed;
         }
         let payload = &self.first[SMALL_HEAD_BYTES..length];
-        let check = record_check(identity, form.as_byte(), checksum(payload));
+        let check = record_check(identity, form, checksum(payload));
         if read_check(&self.first) != Some(check) {
             return RecordRead::Failed;
         }
@@ -173,7 +206,7 @@ impl RecordReader {
             return None;
         }
 
-        let check = record_check(identity, form.as_byte(), checksum(&self.first[FORM_AT..head_length]));
+        let check = record_check(identity, form, checksum(&self.first[FORM_AT..head_length]));
         if read_check(&self.first) != Some(check) {
             return None;
         }
@@ -183,6 +216,50 @@ impl RecordReader {
             chunks: chunk_count(value_length),
             head_length,
         })
+    }
+
+    /// Read a value stored as written in one read, past a table the first read couldn't hold
+    pub fn read_payload<File: IoFile>(
+        &mut self,
+        file: &File,
+        location: RecordLocation,
+        head: &ChunkedHead,
+        buf: &mut Vec<u8>,
+    ) -> Result<RecordRead> {
+        buf.resize(head.value_length.0 as usize, 0);
+        let payload_start = payload_start(head);
+        file.read_exact_at(FileOffset(location.offset.0 + payload_start), buf)?;
+        self.check_payload(file, location, head, buf)
+    }
+
+    /// Check each chunk of a value stored as written where it sits in the buffer
+    pub fn check_payload<File: IoFile>(
+        &mut self,
+        file: &File,
+        location: RecordLocation,
+        head: &ChunkedHead,
+        buf: &[u8],
+    ) -> Result<RecordRead> {
+        let start = payload_start(head);
+        for page in 0..page_count(head.chunks).0 {
+            let page = TablePageIndex(page);
+            if !self.load_page(file, location, head, page)? {
+                return Ok(RecordRead::Failed);
+            }
+
+            let first = page.0 * ENTRIES_PER_PAGE as u64;
+            let last = (first + ENTRIES_PER_PAGE as u64).min(head.chunks.0);
+            for chunk in first..last {
+                let chunk = ChunkIndex(chunk);
+                let Some(span) = self.span_of(location, head, chunk, page) else {
+                    return Ok(RecordRead::Failed);
+                };
+                if !is_chunk_in_place(&span, chunk, start, buf) {
+                    return Ok(RecordRead::Failed);
+                }
+            }
+        }
+        Ok(RecordRead::Valid)
     }
 
     /// Fill the buffer from the chunks a window touches
@@ -205,7 +282,8 @@ impl RecordReader {
         let last_chunk = (end - 1) / CHUNK_BYTES as u64;
         let mut loaded_page = None;
         for chunk in first_chunk..=last_chunk {
-            let page = chunk / ENTRIES_PER_PAGE as u64;
+            let chunk = ChunkIndex(chunk);
+            let page = page_of(chunk);
             if loaded_page != Some(page) {
                 if !self.load_page(file, location, head, page)? {
                     return Ok(RecordRead::Failed);
@@ -216,7 +294,7 @@ impl RecordReader {
             let Some(span) = self.span_of(location, head, chunk, page) else {
                 return Ok(RecordRead::Failed);
             };
-            let chunk_start = chunk * CHUNK_BYTES as u64;
+            let chunk_start = chunk.0 * CHUNK_BYTES as u64;
             let from = start.saturating_sub(chunk_start) as usize;
             let to = (end - chunk_start).min(span.entry.value_length.0) as usize;
             if !self.read_chunk(file, location, head, &span, from..to, buf)? {
@@ -232,16 +310,16 @@ impl RecordReader {
         file: &File,
         location: RecordLocation,
         head: &ChunkedHead,
-        page: u64,
+        page: TablePageIndex,
     ) -> Result<bool> {
         let length = page_bytes(head.chunks, page);
-        let table_end = head.head_length + table_bytes(head.chunks) as usize;
-        let start = head.head_length + page as usize * TABLE_PAGE_BYTES;
+        let start = head.head_length + page.0 as usize * TABLE_PAGE_BYTES;
+        let table_end = head.head_length + table_bytes(head.chunks).0 as usize;
         if start + length > table_end {
             return Ok(false);
         }
 
-        if page == 0 && start + length <= FIRST_READ_BYTES.min(location.length.0 as usize) {
+        if page.0 == 0 && start + length <= FIRST_READ_BYTES.min(location.length.0 as usize) {
             self.page[..length].copy_from_slice(&self.first[start..start + length]);
         } else {
             let offset = FileOffset(location.offset.0 + start as u64);
@@ -249,13 +327,19 @@ impl RecordReader {
         }
 
         let sum = checksum(&self.page[..length]);
-        Ok(read_page_sum(&self.first, page as usize) == Some(sum))
+        Ok(read_page_sum(&self.first, page) == Some(sum))
     }
 
     /// Find one chunk's stored span in the loaded page
-    pub fn span_of(&self, location: RecordLocation, head: &ChunkedHead, chunk: u64, page: u64) -> Option<ChunkSpan> {
+    pub fn span_of(
+        &self,
+        location: RecordLocation,
+        head: &ChunkedHead,
+        chunk: ChunkIndex,
+        page: TablePageIndex,
+    ) -> Option<ChunkSpan> {
         let length = page_bytes(head.chunks, page);
-        let index = (chunk % ENTRIES_PER_PAGE as u64) as usize;
+        let index = (chunk.0 % ENTRIES_PER_PAGE as u64) as usize;
         chunk_span(&self.page[..length], index, FileOffset(location.length.0))
     }
 
@@ -270,7 +354,7 @@ impl RecordReader {
         buf: &mut Vec<u8>,
     ) -> Result<bool> {
         let stored = span.stored_length.0 as usize;
-        if stored > CHUNK_BYTES {
+        if stored > CHUNK_BYTES || span.stored_length > span.entry.value_length {
             return Ok(false);
         }
 
@@ -280,11 +364,14 @@ impl RecordReader {
             return Ok(false);
         }
 
-        let is_compressed = head.codec == Codec::Lz4 && span.stored_length != span.entry.value_length;
-        if !is_compressed {
+        if span.stored_length == span.entry.value_length {
             buf.extend_from_slice(&self.chunk[part]);
             return Ok(true);
         }
+        if head.codec != Codec::Lz4 {
+            return Ok(false);
+        }
+
         let Some(restored) = decompress(&self.chunk[..stored], &mut self.decoded) else {
             return Ok(false);
         };
@@ -302,10 +389,71 @@ impl Default for RecordReader {
     }
 }
 
+/// Find where a chunked record's payload starts
+pub fn payload_start(head: &ChunkedHead) -> u64 {
+    head.head_length as u64 + table_bytes(head.chunks).0
+}
+
+/// Check one chunk of a value stored as written: its span, then its bytes
+pub fn is_chunk_in_place(span: &ChunkSpan, chunk: ChunkIndex, payload_start: u64, buf: &[u8]) -> bool {
+    let start = chunk.0 * CHUNK_BYTES as u64;
+    let is_where_expected = span.entry.stored_offset.0 == payload_start + start;
+    if !is_where_expected || span.stored_length != span.entry.value_length {
+        return false;
+    }
+
+    let end = start + span.entry.value_length.0;
+    match buf.get(start as usize..end as usize) {
+        Some(bytes) => checksum(bytes) == span.entry.checksum,
+        None => false,
+    }
+}
+
+/// Work out how a record stored as written splits, from its length alone
+pub fn written_shape(length: ByteCount) -> Option<WrittenShape> {
+    if length.0 as usize <= SMALL_RECORD_BYTES {
+        return None;
+    }
+
+    let estimate = length.0 / CHUNK_BYTES as u64;
+    for chunks in estimate.saturating_sub(1)..=estimate + 1 {
+        let chunks = ChunkCount(chunks);
+        let front = head_bytes_for(chunks) as u64 + table_bytes(chunks).0;
+        let value_length = ByteCount(length.0.checked_sub(front)?);
+        if chunk_count(value_length) == chunks {
+            return Some(WrittenShape {
+                front_length: front as usize,
+                value_length,
+            });
+        }
+    }
+    None
+}
+
 /// Keep only a window of a value already in the buffer
 pub fn cut_to_window(buf: &mut Vec<u8>, window: ValueWindow) {
     let start = (window.offset.0 as usize).min(buf.len());
     let end = start.saturating_add(window.length.0 as usize).min(buf.len());
     buf.copy_within(start..end, 0);
     buf.truncate(end - start);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // the split comes back from the record length for every value size
+    #[test]
+    fn shape_math() {
+        for value in [CHUNK_BYTES + 1, 2 * CHUNK_BYTES, 16 * 1024 * 1024 + 3, 300 * 1024 * 1024] {
+            let value_length = ByteCount(value as u64);
+            let chunks = chunk_count(value_length);
+            let front = head_bytes_for(chunks) as u64 + table_bytes(chunks).0;
+
+            let shape = written_shape(ByteCount(front + value as u64)).expect("shape");
+
+            assert_eq!(shape.value_length, value_length);
+            assert_eq!(shape.front_length as u64, front);
+        }
+    }
 }

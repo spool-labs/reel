@@ -17,6 +17,22 @@ pub const ENTRY_LENGTH_AT: usize = 8;
 /// Where an entry's checksum sits
 pub const ENTRY_CHECKSUM_AT: usize = 12;
 
+/// A count of chunks in a value
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ChunkCount(pub u64);
+
+/// One chunk of a value, counted from the front
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ChunkIndex(pub u64);
+
+/// A count of table pages
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TablePageCount(pub u64);
+
+/// One page of a table, counted from the front
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TablePageIndex(pub u64);
+
 /// One chunk's place, size and checksum
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ChunkEntry {
@@ -33,21 +49,26 @@ pub struct ChunkSpan {
 }
 
 /// Count the table pages a number of chunks needs
-pub fn page_count(chunks: u64) -> u64 {
-    chunks.div_ceil(ENTRIES_PER_PAGE as u64)
+pub fn page_count(chunks: ChunkCount) -> TablePageCount {
+    TablePageCount(chunks.0.div_ceil(ENTRIES_PER_PAGE as u64))
+}
+
+/// Find the page that lists a chunk
+pub fn page_of(chunk: ChunkIndex) -> TablePageIndex {
+    TablePageIndex(chunk.0 / ENTRIES_PER_PAGE as u64)
 }
 
 /// Count the stored bytes of a table
-pub fn table_bytes(chunks: u64) -> u64 {
-    let full_pages = chunks / ENTRIES_PER_PAGE as u64;
-    let remainder = chunks % ENTRIES_PER_PAGE as u64;
-    full_pages * TABLE_PAGE_BYTES as u64 + remainder * TABLE_ENTRY_BYTES as u64
+pub fn table_bytes(chunks: ChunkCount) -> ByteCount {
+    let full_pages = chunks.0 / ENTRIES_PER_PAGE as u64;
+    let remainder = chunks.0 % ENTRIES_PER_PAGE as u64;
+    ByteCount(full_pages * TABLE_PAGE_BYTES as u64 + remainder * TABLE_ENTRY_BYTES as u64)
 }
 
 /// Count the stored bytes of one page of a table
-pub fn page_bytes(chunks: u64, page: u64) -> usize {
-    let start = page * ENTRIES_PER_PAGE as u64;
-    let remaining = chunks.saturating_sub(start);
+pub fn page_bytes(chunks: ChunkCount, page: TablePageIndex) -> usize {
+    let start = page.0 * ENTRIES_PER_PAGE as u64;
+    let remaining = chunks.0.saturating_sub(start);
     if remaining >= ENTRIES_PER_PAGE as u64 {
         return TABLE_PAGE_BYTES;
     }
@@ -132,11 +153,14 @@ mod tests {
     #[test]
     fn page_math() {
         assert_eq!(ENTRIES_PER_PAGE, 3_276);
-        assert_eq!(page_count(1), 1);
-        assert_eq!(page_count(ENTRIES_PER_PAGE as u64), 1);
-        assert_eq!(page_count(ENTRIES_PER_PAGE as u64 + 1), 2);
-        assert_eq!(table_bytes(2), 2 * TABLE_ENTRY_BYTES as u64);
-        assert_eq!(table_bytes(ENTRIES_PER_PAGE as u64 + 1), (TABLE_PAGE_BYTES + TABLE_ENTRY_BYTES) as u64);
+        assert_eq!(page_count(ChunkCount(1)), TablePageCount(1));
+        assert_eq!(page_count(ChunkCount(ENTRIES_PER_PAGE as u64)), TablePageCount(1));
+        assert_eq!(page_count(ChunkCount(ENTRIES_PER_PAGE as u64 + 1)), TablePageCount(2));
+        assert_eq!(table_bytes(ChunkCount(2)), ByteCount(2 * TABLE_ENTRY_BYTES as u64));
+        assert_eq!(
+            table_bytes(ChunkCount(ENTRIES_PER_PAGE as u64 + 1)),
+            ByteCount((TABLE_PAGE_BYTES + TABLE_ENTRY_BYTES) as u64)
+        );
     }
 
     // a stored length comes from the next entry, the page end or the record end

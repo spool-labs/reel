@@ -3,6 +3,7 @@
 use reel_api::column_id::ColumnId;
 use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 
+use crate::record::record_head::RecordForm;
 use crate::row_kind::RowKind;
 
 /// Bytes of the fields hashed beside the key
@@ -34,12 +35,12 @@ pub fn checksum(bytes: &[u8]) -> Checksum {
     Checksum(xxh3_64(bytes))
 }
 
-/// Hash the column, the key, the kind, the codec byte and a payload checksum under the store's key
-pub fn record_check(identity: &RecordIdentity, form: u8, payload: Checksum) -> RecordCheck {
+/// Hash the column, the key, the kind, the form and a payload checksum under the store's key
+pub fn record_check(identity: &RecordIdentity, form: RecordForm, payload: Checksum) -> RecordCheck {
     let mut fields = [0; CHECK_FIELDS_BYTES];
     fields[0] = identity.column.0;
     fields[1] = identity.kind.as_byte();
-    fields[2] = form;
+    fields[2] = form.as_byte();
     fields[3..].copy_from_slice(&payload.0.to_le_bytes());
 
     let seed = xxh3_64_with_seed(&fields, identity.record_key.0);
@@ -49,9 +50,17 @@ pub fn record_check(identity: &RecordIdentity, form: u8, payload: Checksum) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::codec::Codec;
 
     const RECORD_KEY: RecordKey = RecordKey(9);
-    const FORM: u8 = 0;
+    const FORM: RecordForm = RecordForm {
+        codec: Codec::None,
+        is_chunked: false,
+    };
+    const OTHER_FORM: RecordForm = RecordForm {
+        codec: Codec::Lz4,
+        is_chunked: false,
+    };
 
     fn identity(key: &[u8]) -> RecordIdentity<'_> {
         RecordIdentity {
@@ -79,7 +88,7 @@ mod tests {
         assert_ne!(base, record_check(&other_column, FORM, payload));
         assert_ne!(base, record_check(&other_kind, FORM, payload));
         assert_ne!(base, record_check(&other_store, FORM, payload));
-        assert_ne!(base, record_check(&identity(b"key"), FORM + 1, payload));
+        assert_ne!(base, record_check(&identity(b"key"), OTHER_FORM, payload));
         assert_ne!(base, record_check(&identity(b"key"), FORM, checksum(b"other")));
     }
 }

@@ -1,6 +1,6 @@
 //! An open handle to a simulated file
 
-use std::io::{Error, ErrorKind, IoSlice, Result};
+use std::io::{Error, ErrorKind, IoSlice, IoSliceMut, Result};
 use std::sync::{Arc, Mutex};
 
 use reel_api::units::{ByteCount, FileOffset, ProcessId};
@@ -82,6 +82,30 @@ impl IoFile for SimulatedFile {
         if count.0 < buf.len() as u64 {
             return Err(Error::from(ErrorKind::UnexpectedEof));
         }
+        Ok(())
+    }
+
+    fn read_parts_at(&self, offset: FileOffset, parts: &mut [IoSliceMut]) -> Result<()> {
+        let mut disk = hold(&self.disk);
+        self.check(&mut disk, false)?;
+
+        let Some(image) = disk.inodes.get(&self.inode) else {
+            return Err(Error::from(ErrorKind::NotFound));
+        };
+        let mut start = offset.0 as usize;
+        let mut total = 0;
+        for part in parts.iter_mut() {
+            let end = start + part.len();
+            let Some(bytes) = image.visible.get(start..end) else {
+                return Err(Error::from(ErrorKind::UnexpectedEof));
+            };
+            part.copy_from_slice(bytes);
+            total += part.len() as u64;
+            start = end;
+        }
+
+        disk.reads = OperationCount(disk.reads.0 + 1);
+        disk.bytes_read = ByteCount(disk.bytes_read.0 + total);
         Ok(())
     }
 

@@ -6,11 +6,11 @@ use reel::io::simulated::file_image::BitMask;
 use reel::io::simulated::seeded_random::Seed;
 use reel::io::simulated::simulated_io::SimulatedIo;
 use reel::io::{Io, IoFile};
-use reel::record::chunk_table::ENTRIES_PER_PAGE;
+use reel::record::chunk_table::{ChunkEntry, ENTRIES_PER_PAGE};
 use reel::record::codec::{CHUNK_BYTES, Codec};
-use reel::record::record_check::{RecordIdentity, RecordKey};
+use reel::record::record_check::{Checksum, RecordIdentity, RecordKey, checksum};
 use reel::record::record_encoder::RecordEncoder;
-use reel::record::record_head::SMALL_HEAD_BYTES;
+use reel::record::record_head::{SMALL_HEAD_BYTES, chunk_count, chunked_head_bytes};
 use reel::record::record_reader::{FIRST_READ_BYTES, RecordLocation, RecordRead, RecordReader};
 use reel::row_kind::RowKind;
 use reel_api::column_id::ColumnId;
@@ -83,10 +83,16 @@ fn open(stored: &Stored) -> <SimulatedIo as Io>::File {
 }
 
 fn read_all(stored: &Stored, who: &RecordIdentity) -> (RecordRead, Vec<u8>) {
+    read_declared(stored, who, Codec::None)
+}
+
+fn read_declared(stored: &Stored, who: &RecordIdentity, declared: Codec) -> (RecordRead, Vec<u8>) {
     let file = open(stored);
     let mut reader = RecordReader::new();
     let mut buf = Vec::new();
-    let read = reader.read_value(&file, stored.location, who, &mut buf).expect("read");
+    let read = reader
+        .read_value(&file, stored.location, who, declared, &mut buf)
+        .expect("read");
     (read, buf)
 }
 
@@ -304,4 +310,84 @@ fn rot_contained() {
 
 fn stored_end(value: &[u8]) -> u64 {
     store(Codec::None, value).location.length.0
+}
+
+fn count_reads(stored: &Stored, declared: Codec) -> u64 {
+    let (before, _bytes) = stored.io.read_totals();
+    let (read, _value) = read_declared(stored, &identity(), declared);
+    let (after, _bytes) = stored.io.read_totals();
+    assert_eq!(read, RecordRead::Valid);
+    after.0 - before.0
+}
+
+// a whole value stored as written is one read, whatever its size
+#[test]
+fn one_read() {
+    for length in [1_200, CHUNK_BYTES, CHUNK_BYTES + 1, 256 * CHUNK_BYTES] {
+        let stored = store(Codec::None, &noise(length));
+
+        assert_eq!(count_reads(&stored, Codec::None), 1);
+    }
+}
+
+// a column that changed its codec still reads every record that was written before
+#[test]
+fn changed_codec() {
+    let value = compressible(4 * CHUNK_BYTES);
+    for (written, declared) in [(Codec::Lz4, Codec::None), (Codec::None, Codec::Lz4)] {
+        let stored = store(written, &value);
+
+        let (read, restored) = read_declared(&stored, &identity(), declared);
+
+        assert_eq!(read, RecordRead::Valid);
+        assert_eq!(restored, value);
+    }
+}
+
+// a table that lists a span shorter than its chunk fails, so no stale buffer bytes come back
+#[test]
+fn short_span() {
+    let value = noise(3 * CHUNK_BYTES);
+    let largest = ByteCount(value.len() as u64);
+    let mut encoder = RecordEncoder::new(largest, largest);
+    let mut shape = encoder.encode(&identity(), Codec::None, &value).expect("encode");
+
+    let chunks = chunk_count(largest);
+    let head_length = chunked_head_bytes(largest);
+    let payload_start = (head_length + shape.table_length) as u64;
+    let short = CHUNK_BYTES - 100;
+    let cut = ChunkEntry {
+        stored_offset: FileOffset(payload_start),
+        value_length: ByteCount(CHUNK_BYTES as u64),
+        checksum: checksum(&value[..short]),
+    };
+    let moved = ChunkEntry {
+        stored_offset: FileOffset(payload_start + short as u64),
+        value_length: ByteCount(CHUNK_BYTES as u64),
+        checksum: Checksum::default(),
+    };
+    encoder.write_table_entry(0, &cut);
+    encoder.write_table_entry(1, &moved);
+    encoder.write_chunked_head(&identity(), Codec::None, largest, chunks, head_length);
+    shape.is_payload_stored = false;
+
+    let io = SimulatedIo::new(SEED);
+    let root = PathBuf::from(ROOT);
+    io.create_directory(&root).expect("directory");
+    let path = root.join("segment");
+    let file = io.create_file(&path, ByteCount(0)).expect("create");
+    file.write_at(FileOffset(0), &encoder.parts(&shape, &value)).expect("write");
+    let stored = Stored {
+        io,
+        path,
+        location: RecordLocation {
+            offset: FileOffset(0),
+            length: shape.total_length(),
+        },
+    };
+
+    let (read, _bytes) = read_window(&stored, window(0, 10));
+    assert_eq!(read, RecordRead::Failed);
+    let (read, _value) = read_all(&stored, &identity());
+    assert_eq!(read, RecordRead::Failed);
 }

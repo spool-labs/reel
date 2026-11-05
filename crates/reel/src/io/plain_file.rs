@@ -1,7 +1,7 @@
 //! An open file on the plain-syscall backend
 
 use std::fs::File;
-use std::io::{Error, ErrorKind, IoSlice, Result};
+use std::io::{Error, ErrorKind, IoSlice, IoSliceMut, Result};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 
@@ -60,6 +60,25 @@ impl IoFile for PlainFile {
         self.file.read_exact_at(buf, offset.0)
     }
 
+    fn read_parts_at(&self, offset: FileOffset, parts: &mut [IoSliceMut]) -> Result<()> {
+        let read = read_vectored(&self.file, offset, parts)?;
+        let mut skipped = read.0;
+        let mut position = offset.0.saturating_add(read.0);
+        for part in parts.iter_mut() {
+            let length = part.len() as u64;
+            if skipped >= length {
+                skipped -= length;
+                continue;
+            }
+
+            let remainder = &mut part[skipped as usize..];
+            self.file.read_exact_at(remainder, position)?;
+            position = position.saturating_add(remainder.len() as u64);
+            skipped = 0;
+        }
+        Ok(())
+    }
+
     fn write_at(&self, offset: FileOffset, parts: &[IoSlice]) -> Result<()> {
         let mut total: u64 = 0;
         for part in parts {
@@ -83,6 +102,27 @@ impl IoFile for PlainFile {
 
     fn truncate(&self, length: ByteCount) -> Result<()> {
         self.file.set_len(length.0)
+    }
+}
+
+/// Issue one positioned vectored read and return the bytes it brought
+pub fn read_vectored(file: &File, offset: FileOffset, parts: &mut [IoSliceMut]) -> Result<ByteCount> {
+    let descriptor = file.as_raw_fd();
+    let vectors = parts.as_ptr().cast::<libc::iovec>();
+    let count = parts.len() as libc::c_int;
+    let position = offset.0 as libc::off_t;
+
+    loop {
+        // SAFETY: IoSliceMut has the layout of iovec on unix, and the parts outlive the call
+        let read = unsafe { libc::preadv(descriptor, vectors, count, position) };
+        if read >= 0 {
+            return Ok(ByteCount(read as u64));
+        }
+
+        let error = Error::last_os_error();
+        if error.kind() != ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 

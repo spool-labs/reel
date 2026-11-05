@@ -7,7 +7,7 @@ pub mod plain_file;
 pub mod plain_task;
 pub mod simulated;
 
-use std::io::{IoSlice, Result};
+use std::io::{IoSlice, IoSliceMut, Result};
 use std::path::{Path, PathBuf};
 
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds};
@@ -22,6 +22,9 @@ pub trait IoFile: Send + Sync {
 
     /// Fill the whole buffer from the offset
     fn read_exact_at(&self, offset: FileOffset, buf: &mut [u8]) -> Result<()>;
+
+    /// Fill every part from the offset in one read call
+    fn read_parts_at(&self, offset: FileOffset, parts: &mut [IoSliceMut]) -> Result<()>;
 
     /// Write every part at the offset in one write call
     fn write_at(&self, offset: FileOffset, parts: &[IoSlice]) -> Result<()>;

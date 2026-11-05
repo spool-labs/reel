@@ -8,7 +8,7 @@ use crate::index::write_row::WriteRow;
 use crate::row_kind::RowKind;
 
 /// Bytes in one page
-pub const PAGE_BYTES: usize = 64 * 1024;
+pub const PAGE_BYTES: usize = 8 * 1024;
 /// Every row starts on a multiple of this
 pub const ENTRY_ALIGNMENT: usize = 8;
 /// Fills the pages at open, and differs from zero so every page is really touched

@@ -26,6 +26,9 @@ pub const HOLDER_READ_ATTEMPTS: u64 = 100;
 /// Wait between reads of a lock file
 pub const HOLDER_READ_WAIT: Duration = Duration::from_millis(1);
 
+/// How long a waiting caller sleeps between looks
+pub const PAUSE_WAIT: Duration = Duration::from_micros(100);
+
 /// The backend that calls the operating system directly
 #[derive(Clone, Debug)]
 pub struct PlainIo {
@@ -153,6 +156,10 @@ impl Io for PlainIo {
         let elapsed = self.origin.elapsed();
         let nanoseconds = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         Nanoseconds(nanoseconds)
+    }
+
+    fn pause(&self) {
+        thread::sleep(PAUSE_WAIT);
     }
 
     fn spawn_job<Work: Job>(&self, name: &'static str, job: Work) -> Result<PlainTask> {

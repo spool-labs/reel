@@ -1,6 +1,7 @@
 //! Reel is an embedded key-value store for the Tapedrive storage node
 
 pub mod config;
+pub mod engine;
 pub mod guard;
 pub mod index;
 pub mod io;

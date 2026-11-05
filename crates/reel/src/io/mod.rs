@@ -93,6 +93,9 @@ pub trait Io: Clone + Send + Sync + 'static {
     /// Read the monotonic clock
     fn now(&self) -> Nanoseconds;
 
+    /// Let background work run while a caller waits for it
+    fn pause(&self);
+
     /// Start a job on an engine thread
     fn spawn_job<Work: Job>(&self, name: &'static str, job: Work) -> Result<Self::Task>;
 }

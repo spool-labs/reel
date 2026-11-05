@@ -20,6 +20,9 @@ use crate::io::simulated::simulated_task::{JobCount, JobIndex, JobSlot, JobWait,
 /// The clock moves this far on every read
 pub const CLOCK_TICK: Nanoseconds = Nanoseconds(1_000);
 
+/// The clock moves this far each time a caller waits
+pub const PAUSE_TICK: Nanoseconds = Nanoseconds(1_000_000);
+
 /// A deterministic backend that a test drives by hand
 #[derive(Clone)]
 pub struct SimulatedIo {
@@ -293,6 +296,12 @@ impl Io for SimulatedIo {
     fn now(&self) -> Nanoseconds {
         let reading = self.clock.fetch_add(CLOCK_TICK.0, Ordering::Relaxed);
         Nanoseconds(reading)
+    }
+
+    fn pause(&self) {
+        // one thread drives a simulation, so a waiter runs the work it waits for
+        self.advance_clock(PAUSE_TICK);
+        self.step_any();
     }
 
     fn spawn_job<Work: Job>(&self, name: &'static str, job: Work) -> Result<SimulatedTask> {

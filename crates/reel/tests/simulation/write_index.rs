@@ -25,19 +25,19 @@ const KEY_SPACE: u64 = 300;
 const ROWS: u64 = 4_000;
 const CLEAN_ALL: RowCount = RowCount(u64::MAX);
 const SIZING: ShardSizing = ShardSizing {
-    pages: PageCount(24),
+    pages: PageCount(192),
     nodes: NodeCount(512),
     table_slots: 2_048,
     open_slots: 4,
 };
 const TIGHT: ShardSizing = ShardSizing {
-    pages: PageCount(1),
+    pages: PageCount(8),
     nodes: NodeCount(64),
     table_slots: 8_192,
     open_slots: 4,
 };
 const SMALL_TABLE: ShardSizing = ShardSizing {
-    pages: PageCount(32),
+    pages: PageCount(256),
     nodes: NodeCount(512),
     table_slots: 64,
     open_slots: 4,

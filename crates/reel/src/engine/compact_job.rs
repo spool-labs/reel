@@ -203,7 +203,7 @@ impl<Backend: Io> CompactJob<Backend> {
             if row.kind != RowKind::Value || row.length < FREE_IN_PLACE_BYTES {
                 continue;
             }
-            let newest = match self.state.newest_walked(volume, block.column, &self.key, pass.segment) {
+            let newest = match self.state.newest_walked(volume, block.column, &self.key, &[pass.segment]) {
                 Ok(newest) => newest,
                 Err(StoreError::Corruption { .. }) => None,
                 Err(_error) => return Err(Error::from(ErrorKind::Interrupted)),
@@ -318,7 +318,7 @@ impl<Backend: Io> CompactJob<Backend> {
     /// crash before it goes leaves a segment with no row, which open walks backward and finds dead again
     pub fn unlink(&self, volume: &Volume<Backend>, segment: SegmentNumber, highest_replacement: WritePlace) -> Result<()> {
         let state = &self.state;
-        if !volume.can_park() || state.read_point() < highest_replacement {
+        if !volume.can_park(1) || state.read_point() < highest_replacement {
             return Ok(());
         }
         state.cues.note_reclaim();

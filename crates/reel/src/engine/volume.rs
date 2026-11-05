@@ -112,7 +112,7 @@ pub struct Volume<Backend: Io> {
     pub has_walk_target: AtomicBool,
     /// Counts the turns a walk stood aside for a rewrite
     pub walks_held: AtomicU64,
-    pub partial_output: Mutex<Option<RewriteOutput<Backend::File>>>,
+    pub partial_outputs: Mutex<[Option<RewriteOutput<Backend::File>>; 2]>,
     pub summary: Mutex<SummaryRows>,
     pub summary_paths: SummaryPaths,
     pub lost_rows: Mutex<LostRows>,
@@ -171,9 +171,14 @@ impl<Backend: Io> Volume<Backend> {
         self.has_held_frees.store(true, Ordering::Release);
     }
 
-    /// Check the park has room for another segment
-    pub fn can_park(&self) -> bool {
-        hold(&self.parked).iter().any(Option::is_none)
+    /// Check the park has room for this many segments
+    pub fn can_park(&self, count: usize) -> bool {
+        self.park_room() >= count
+    }
+
+    /// Count the park's free slots
+    pub fn park_room(&self) -> usize {
+        hold(&self.parked).iter().filter(|slot| slot.is_none()).count()
     }
 
     /// Read the handover counter a get compares before it fills the spot cache

@@ -363,9 +363,18 @@ impl<Backend: Io> EngineState<Backend> {
             }
         }
         // a stopped rewrite leaves the store as it found it
-        let stray = hold(&volume.partial_output).take();
-        if let Some(Err(output)) = stray.map(|output| self.remove_output(volume, output)) {
+        let [data, graves] = mem::take(&mut *hold(&volume.partial_outputs));
+        let mut is_data_gone = true;
+        if let Some(Err(output)) = data.map(|output| self.remove_output(volume, output)) {
+            is_data_gone = false;
             self.io.close_file(output.file);
+        }
+        // a data output left on disk needs its graves at the next open
+        if let Some(output) = graves {
+            let left = if is_data_gone { self.remove_output(volume, output) } else { Err(output) };
+            if let Err(output) = left {
+                self.io.close_file(output.file);
+            }
         }
         let mut claims = hold(&volume.claims);
         for segment in claims.open.drain(..) {
@@ -834,7 +843,7 @@ pub fn build_state<Backend: Io>(
             reclaim_retries: AtomicU64::new(0),
             has_walk_target: AtomicBool::new(false),
             walks_held: AtomicU64::new(0),
-            partial_output: Mutex::new(None),
+            partial_outputs: Mutex::new([None, None]),
             reserve: ByteCount(sizing.segment_bytes.0 * 2),
             summary: Mutex::new(summary.rows),
             summary_paths: summary.paths,

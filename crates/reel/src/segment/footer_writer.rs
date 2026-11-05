@@ -68,6 +68,8 @@ pub struct FooterWriter {
     places: PlaceRange,
     place_base: WritePlace,
     row_count: RowCount,
+    pub is_output: bool,
+    pub is_grave_output: bool,
 }
 
 impl FooterWriter {
@@ -89,6 +91,8 @@ impl FooterWriter {
             places: PlaceRange::default(),
             place_base: WritePlace(0),
             row_count: RowCount(0),
+            is_output: false,
+            is_grave_output: false,
         }
     }
 
@@ -159,6 +163,8 @@ impl FooterWriter {
             highest: WritePlace(0),
         };
         self.row_count = RowCount(0);
+        self.is_output = false;
+        self.is_grave_output = false;
     }
 
     /// Start a column, closing the row block of the one before it
@@ -284,6 +290,11 @@ impl FooterWriter {
         Ok(())
     }
 
+    /// Check a row can go in: a block it closes and the last block both fit the index
+    pub fn has_block_room(&self) -> bool {
+        self.entries.len() + 2 <= self.entries.capacity()
+    }
+
     /// Write the block index, the range deletes and the tail, and return the totals
     pub fn finish<File: IoFile>(
         &mut self,
@@ -329,6 +340,8 @@ impl FooterWriter {
             ranges_sum: checksum(ranges),
             column_count: self.columns.len() as u32,
             input_count: inputs.len() as u32,
+            is_output: self.is_output,
+            is_grave_output: self.is_grave_output,
             inputs: listed,
         };
         let total = self.write_tail(&head, record_key);

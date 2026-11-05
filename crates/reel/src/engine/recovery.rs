@@ -306,9 +306,11 @@ pub fn scan_roots<Backend: Io>(
     Ok(scan)
 }
 
-/// Remove every segment a whole output lists, before anything counts them. The output has all that still answers
+/// Remove every segment a whole data output lists, before anything counts them, since the output has all that still answers.
+/// A grave output whose inputs are still here belongs to a merge that never finished, and it goes instead
 pub fn drop_inputs<Backend: Io>(io: &Backend, scan: &mut RootScan<Backend::File>) -> Result<()> {
-    let inputs: Vec<SegmentNumber> = scan.sealed.iter().flat_map(|found| found.head.inputs()).copied().collect();
+    let is_final = |found: &&FoundSealed<Backend::File>| !found.head.is_grave_output;
+    let inputs: Vec<SegmentNumber> = scan.sealed.iter().filter(is_final).flat_map(|found| found.head.inputs()).copied().collect();
     for input in inputs {
         if let Some(at) = scan.sealed.iter().position(|found| found.head.segment == input) {
             let found = scan.sealed.remove(at);
@@ -326,6 +328,20 @@ pub fn drop_inputs<Backend: Io>(io: &Backend, scan: &mut RootScan<Backend::File>
             io.remove_file(&data_path(&found.path, input))?;
             io.sync_directory(&found.path)?;
         }
+    }
+    let mut index = 0;
+    while index < scan.sealed.len() {
+        let head = &scan.sealed[index].head;
+        let is_held = |number: &SegmentNumber| scan.sealed.iter().any(|found| found.head.segment == *number);
+        if !head.is_grave_output || !head.inputs().iter().any(is_held) {
+            index += 1;
+            continue;
+        }
+        let found = scan.sealed.remove(index);
+        let number = found.head.segment;
+        io.close_file(found.file);
+        io.remove_file(&data_path(&found.path, number))?;
+        io.sync_directory(&found.path)?;
     }
     Ok(())
 }
@@ -1581,7 +1597,7 @@ pub fn settle_sealed<Backend: Io>(
         walked_blocks: 0,
         // no saved count can hold a walk of a segment above the number, one at or below it may be held already, and an output
         // holds rows its input's walk already counted
-        is_backward: found.head.segment <= rows.highest_forward || found.head.input_count > 0,
+        is_backward: found.head.segment <= rows.highest_forward || found.head.is_output,
     };
 
     if let Some(at) = listed.get(&facts.segment)

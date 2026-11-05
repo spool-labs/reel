@@ -16,6 +16,7 @@ use reel::record::codec::Codec;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId, WritePlace};
+use reel_api::value_list::ValueList;
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
@@ -297,6 +298,34 @@ fn no_pin_to_give() {
     for slot in slots {
         state.cues.release(slot);
     }
+    store.close().expect("close");
+}
+
+// a get_many with no pin that a free crossed starts over, where a key failed its record check
+#[test]
+fn many_crossed_by_a_free() {
+    let io = SimulatedIo::new(Seed(18));
+    let store = open(&io);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    keep_live(&store);
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    seal(&store, &io);
+    let slots: Vec<usize> = (0..MOST_CUES).map(|_slot| state.cues.take(WritePlace(u64::MAX - 1)).expect("a slot")).collect();
+
+    let many = state.many_read(volume).expect("a read");
+    assert_eq!(many.pin, None);
+    store.put(COLUMN, b"key", &large(2)).expect("put");
+    seal(&store, &io);
+    assert!(volume.bytes_freed.load(Ordering::Acquire) > 0);
+
+    let mut values = ValueList::new();
+    let mut scratch = Vec::new();
+    assert!(state.answer_many(&many, COLUMN, &[b"key"], &mut values, &mut scratch).is_none());
+    for slot in slots {
+        state.cues.release(slot);
+    }
+    assert_eq!(read(&store, b"key"), Some(large(2)));
     store.close().expect("close");
 }
 

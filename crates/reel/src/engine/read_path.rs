@@ -585,7 +585,7 @@ impl<Backend: Io> EngineState<Backend> {
         column: ColumnId,
         key: &[u8],
         place: WritePlace,
-        skipped: SegmentNumber,
+        skipped: &[SegmentNumber],
     ) -> Result<bool, StoreError> {
         let Some(directory) = &self.directories[column.0 as usize] else {
             return Ok(false);
@@ -594,7 +594,7 @@ impl<Backend: Io> EngineState<Backend> {
         let found = self.index.lookup(column, key, read.read_point, volume.view());
         let sealed = self.footer_readers.with(|reader| {
             self.walk_candidates(directory, key, reader, |segment, reader, best| {
-                if segment == skipped {
+                if skipped.contains(&segment) {
                     return Ok(());
                 }
                 self.ask_segment(volume, &read, segment, reader, best)
@@ -609,7 +609,7 @@ impl<Backend: Io> EngineState<Backend> {
         volume: &Volume<Backend>,
         column: ColumnId,
         key: &[u8],
-        skipped: SegmentNumber,
+        skipped: &[SegmentNumber],
     ) -> Result<Option<SealedRow>, StoreError> {
         let Some(directory) = &self.directories[column.0 as usize] else {
             return Ok(None);
@@ -617,7 +617,7 @@ impl<Backend: Io> EngineState<Backend> {
         let read = self.key_read(column, key, WritePlace(u64::MAX), false)?;
         self.footer_readers.with(|reader| {
             self.walk_candidates(directory, key, reader, |segment, reader, best| {
-                if segment == skipped {
+                if skipped.contains(&segment) {
                     return Ok(());
                 }
                 self.ask_walked(volume, &read, segment, reader, best)

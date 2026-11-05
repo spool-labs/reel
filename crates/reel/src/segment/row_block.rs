@@ -219,6 +219,16 @@ impl<'block> RowBlockWalk<'block> {
         })
     }
 
+    /// Read how far the walk has come, to resume it later
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Go on from where another walk stopped, with its key still in the buffer
+    pub fn resume(&mut self, position: usize) {
+        self.position = position;
+    }
+
     /// Count the restart points
     pub fn restart_count(&self) -> usize {
         self.restarts.len() / size_of::<u16>()

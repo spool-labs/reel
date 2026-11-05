@@ -5,18 +5,21 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
-use reel::engine::compact_job::CompactJob;
+use reel::engine::compact_job::{CompactJob, park};
 use reel::engine::cue::{Cue, CueTable};
 use reel::engine::open_segment::{OUTPUT_SUFFIX, data_path};
 use reel::engine::read_path::RecordWant;
 use reel::engine::reel_store::ReelStore;
-use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, RewritePhase};
+use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, RewritePhase};
+use reel::engine::volume::MOST_PARKED;
 use reel::guard::hold;
 use reel::io::Io;
 use reel::record::codec::Codec;
 use reel::segment::damage_list::DamagedRange;
 use reel::segment::footer_reader::FooterReader;
-use reel::segment::segment_tail::SegmentNumber;
+use reel::segment::footer_writer::FooterWriter;
+use reel::segment::segment_table::{RetiredSegment, shard_of};
+use reel::segment::segment_tail::{BlockCount, SegmentNumber, TailHead};
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, Nanoseconds, VolumeId, WritePlace};
 use reel_sim::seeded_random::Seed;
@@ -31,6 +34,9 @@ const STEPS: u64 = 20_000;
 const CRASH_POINTS: u64 = 300;
 const KEYS: [&[u8]; 4] = [b"a", b"b", b"c", b"d"];
 const MOST_LOOPS: usize = 2_000;
+const OVER_THE_BOUND: u64 = MOST_OVERLAP as u64 + 8;
+const KEPT_LIVE_KEYS: u64 = 16;
+const MANY_GRAVES: u64 = 30_000;
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -359,6 +365,7 @@ fn big_record() {
     store.put(COLUMN, b"big", &value).expect("put");
     store.put(COLUMN, b"a", b"first").expect("put");
     store.put(COLUMN, b"b", b"first").expect("put");
+    store.put(COLUMN, b"c", b"live").expect("put");
     let older = seal(&store, &io);
     store.put(COLUMN, b"a", b"second").expect("put");
     store.put(COLUMN, b"b", b"second").expect("put");
@@ -529,7 +536,7 @@ fn open_row_is_older_data() {
     store.put(COLUMN, b"key", b"value").expect("put");
     let place = WritePlace(store.state.read_point().0 + 1);
     let volume = &store.state.volumes[0];
-    let found = store.state.has_older_row(volume, COLUMN, b"key", place, SegmentNumber(u64::MAX));
+    let found = store.state.has_older_row(volume, COLUMN, b"key", place, &[]);
     assert!(found.expect("search"));
     store.close().expect("close");
 }
@@ -793,7 +800,8 @@ fn grave_with_nothing_older(store: &Store, io: &SimulatedIo) {
 }
 
 fn kept_graves(job: &CompactJob<SimulatedIo>) -> u64 {
-    job.rewrite.writer.columns().iter().map(|column| column.grave_count.0).sum()
+    let columns = job.rewrite.writer.columns().iter().chain(job.rewrite.grave_writer.columns());
+    columns.map(|column| column.grave_count.0).sum()
 }
 
 // the same grave drops when nothing holds it back, which the two tests below turn on
@@ -876,4 +884,389 @@ fn mark_holds_the_install() {
     assert!(state.volumes[0].table.holds(older));
     check_reads(&store);
     store.close().expect("close");
+}
+
+fn segments(store: &Store) -> u64 {
+    store.state.volumes[0].table.segment_count()
+}
+
+// segments piling up over one key range merge down under the bound, with every key still reading its value
+#[test]
+fn overlap_merges() {
+    let io = SimulatedIo::new(Seed(23));
+    let store = open(&io);
+    for number in 0..OVER_THE_BOUND {
+        store.put(COLUMN, format!("a-{number:03}").as_bytes(), b"low").expect("put");
+        store.put(COLUMN, format!("z-{number:03}").as_bytes(), b"high").expect("put");
+        seal(&store, &io);
+    }
+
+    assert!(segments(&store) <= MOST_OVERLAP as u64);
+    assert!(store.state.volumes[0].segments_rewritten.load(Ordering::Acquire) > 0);
+    for number in 0..OVER_THE_BOUND {
+        assert_eq!(read(&store, format!("a-{number:03}").as_bytes()), Some(b"low".to_vec()));
+        assert_eq!(read(&store, format!("z-{number:03}").as_bytes()), Some(b"high".to_vec()));
+    }
+    store.close().expect("close");
+
+    let store = open(&io);
+    settle(&io);
+    assert_eq!(read(&store, b"a-000"), Some(b"low".to_vec()));
+    assert!(hold(&store.state.volumes[0].damaged).is_empty());
+    store.close().expect("close");
+}
+
+// a merge takes a key's versions from every input in one pass, and only the newest stays
+#[test]
+fn versions_across_inputs() {
+    let io = SimulatedIo::new(Seed(24));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    for version in 0..4_u8 {
+        for key in KEYS {
+            store.put(COLUMN, key, &[version]).expect("put");
+        }
+        store.put(COLUMN, format!("only-{version}").as_bytes(), b"value").expect("put");
+        seal(&store, &io);
+    }
+    compact(&store, &io);
+
+    assert!(store.state.volumes[0].segments_rewritten.load(Ordering::Acquire) > 0);
+    for key in KEYS {
+        assert_eq!(read(&store, key), Some(vec![3]));
+    }
+    for version in 0..4_u8 {
+        assert_eq!(read(&store, format!("only-{version}").as_bytes()), Some(b"value".to_vec()));
+    }
+    store.close().expect("close");
+}
+
+// a grave that stays leaves its data behind: it goes to an output of its own, footer rows and no bytes
+#[test]
+fn graves_get_their_own_output() {
+    let io = SimulatedIo::new(Seed(25));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    store.put(COLUMN, b"a", b"value").expect("put");
+    for key in [&b"keep-1"[..], b"keep-2", b"keep-3", b"keep-4", b"keep-5", b"keep-6"] {
+        store.put(COLUMN, key, b"value").expect("put");
+    }
+    seal(&store, &io);
+    store.delete(COLUMN, b"a").expect("delete");
+    store.put(COLUMN, b"b", b"first").expect("put");
+    store.put(COLUMN, b"c", b"live").expect("put");
+    let middle = seal(&store, &io);
+    store.put(COLUMN, b"b", b"second").expect("put");
+    seal(&store, &io);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(job.rewrite.start());
+    assert_eq!(job.rewrite.input_numbers()[0], middle);
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    let rows = hold(&store.state.volumes[0].summary);
+    let graves = rows.rows().filter(|row| row.facts.data_end.0 == 0).count();
+    assert_eq!(graves, 1);
+    drop(rows);
+    drop(job);
+    assert_eq!(read(&store, b"a"), None);
+    store.close().expect("close");
+}
+
+// a crash at any step of a merge with two outputs changes no key and leaves no grave output behind that a finished merge
+// wouldn't have
+#[test]
+fn two_output_crashes() {
+    let mut left_grave_output = 0;
+    for crash_at in 0..CRASH_POINTS {
+        for is_power_cut in [false, true] {
+            let io = SimulatedIo::new(Seed(26));
+            let store = open(&io);
+            hold_compaction(&store, true);
+            store.put(COLUMN, b"a", b"value").expect("put");
+            for key in [&b"keep-1"[..], b"keep-2", b"keep-3", b"keep-4", b"keep-5", b"keep-6"] {
+                store.put(COLUMN, key, b"value").expect("put");
+            }
+            seal(&store, &io);
+            store.delete(COLUMN, b"a").expect("delete");
+            store.put(COLUMN, b"b", b"first").expect("put");
+            store.put(COLUMN, b"c", b"live").expect("put");
+            let middle = seal(&store, &io);
+            store.put(COLUMN, b"b", b"second").expect("put");
+            seal(&store, &io);
+
+            hold_compaction(&store, false);
+            store.state.ask_compaction();
+            io.arm_crash(OperationCount(crash_at));
+            for _step in 0..STEPS {
+                if io.is_crashed() {
+                    break;
+                }
+                if io.step_any().is_none() {
+                    io.advance_clock(TICK);
+                    if io.step_any().is_none() {
+                        break;
+                    }
+                }
+            }
+            if is_power_cut {
+                io.power_cut();
+            } else {
+                io.kill();
+            }
+            drop(store);
+
+            let store = open(&io);
+            let is_grave_row = |row: &reel::segment::summary::SummaryRow<'_>| row.facts.data_end.0 == 0;
+            let graves = hold(&store.state.volumes[0].summary).rows().filter(is_grave_row).count();
+            let has_input = store.state.volumes[0].table.holds(middle);
+            assert!(graves == 0 || !has_input, "crash at {crash_at}");
+            left_grave_output += graves;
+            settle(&io);
+            assert_eq!(read(&store, b"a"), None, "crash at {crash_at}");
+            assert_eq!(read(&store, b"b"), Some(b"second".to_vec()), "crash at {crash_at}");
+            assert_eq!(read(&store, b"keep-1"), Some(b"value".to_vec()), "crash at {crash_at}");
+            assert_eq!(read(&store, b"c"), Some(b"live".to_vec()), "crash at {crash_at}");
+            assert!(hold(&store.state.volumes[0].damaged).is_empty(), "crash at {crash_at}");
+            store.close().expect("close");
+        }
+    }
+    assert!(left_grave_output > 0);
+}
+
+// an older row sits in a segment no merge wants, and its grave goes into a merge with a live row, so a merge has both outputs
+fn grave_over_older(store: &Store, io: &SimulatedIo) {
+    store.put(COLUMN, b"key", b"older").expect("put");
+    for number in 0..KEPT_LIVE_KEYS {
+        store.put(COLUMN, format!("live-{number}").as_bytes(), b"value").expect("put");
+    }
+    seal(store, io);
+    store.delete(COLUMN, b"key").expect("delete");
+    half_dead(store, io);
+}
+
+fn run_to_both_outputs(job: &mut CompactJob<SimulatedIo>) {
+    assert!(job.rewrite.start());
+    while job.rewrite.phase != RewritePhase::Installing {
+        job.rewrite.step();
+    }
+    assert!(job.rewrite.totals.is_some() && job.rewrite.grave_totals.is_some());
+}
+
+// a kept grave is in a list before the inputs leave theirs, so a read between the two still finds it over the older row
+#[test]
+fn grave_listed_first() {
+    let io = SimulatedIo::new(Seed(30));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    grave_over_older(&store, &io);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    run_to_both_outputs(&mut job);
+    job.rewrite.install_with(|| assert_eq!(read(&store, b"key"), None)).expect("install");
+    assert_eq!(read(&store, b"key"), None);
+    assert_eq!(read(&store, b"d"), Some(b"first".to_vec()));
+    store.close().expect("close");
+}
+
+// a data output that can't be removed lists the inputs, so its grave output stays too, and open finds both at a power cut
+#[test]
+fn stuck_data_output_keeps_graves() {
+    let io = SimulatedIo::new(Seed(31));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    grave_over_older(&store, &io);
+
+    let state = &store.state;
+    let mut job = CompactJob::new(Arc::clone(state), 0);
+    run_to_both_outputs(&mut job);
+    let slot = state.cues.take(WritePlace(state.read_point().0 - 3)).expect("a slot");
+    io.fail_removes(OperationCount(1));
+    job.rewrite.step();
+    state.cues.release(slot);
+    assert!(!job.rewrite.is_running());
+    assert_eq!(state.volumes[0].stray_outputs.load(Ordering::Acquire), 2);
+
+    io.power_cut();
+    drop(job);
+    drop(store);
+    let store = open(&io);
+    assert_eq!(read(&store, b"key"), None);
+    store.close().expect("close");
+}
+
+// a retry clears the data output first, then the grave output, and nothing holds back after that
+#[test]
+fn strays_clear_in_order() {
+    let io = SimulatedIo::new(Seed(32));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    grave_over_older(&store, &io);
+
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let mut job = CompactJob::new(Arc::clone(state), 0);
+    run_to_both_outputs(&mut job);
+    let slot = state.cues.take(WritePlace(state.read_point().0 - 3)).expect("a slot");
+    io.fail_removes(OperationCount(1));
+    job.rewrite.step();
+    state.cues.release(slot);
+
+    io.fail_removes(OperationCount(1));
+    job.rewrite.clear_stray();
+    assert_eq!(volume.stray_outputs.load(Ordering::Acquire), 2);
+    job.rewrite.clear_stray();
+    assert_eq!(volume.stray_outputs.load(Ordering::Acquire), 0);
+    assert_eq!(read(&store, b"key"), None);
+    store.close().expect("close");
+}
+
+// a table with room for one output takes neither, and the merge gives way with the inputs where they were
+#[test]
+fn no_room_for_the_second_output() {
+    let io = SimulatedIo::new(Seed(33));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    grave_over_older(&store, &io);
+
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let mut job = CompactJob::new(Arc::clone(state), 0);
+    run_to_both_outputs(&mut job);
+    let inputs = job.rewrite.input_numbers().to_vec();
+    let data = job.rewrite.output.clone().expect("an output");
+    let graves = job.rewrite.grave_output.clone().expect("an output");
+    let head = job.rewrite.grave_totals.expect("totals").head;
+
+    let shard = shard_of(graves.number);
+    let mut number = u64::MAX / 2;
+    loop {
+        number += 1;
+        let filler = SegmentNumber(number);
+        if shard_of(filler) == shard
+            && filler != data.number
+            && !volume.table.install(graves.file.clone(), &TailHead { segment: filler, ..head }, &[], &[])
+        {
+            break;
+        }
+    }
+
+    job.rewrite.step();
+    assert!(!job.rewrite.is_running());
+    assert!(!volume.table.holds(data.number));
+    assert!(!volume.table.holds(graves.number));
+    assert!(inputs.iter().all(|input| volume.table.holds(*input)));
+    assert_eq!(read(&store, b"key"), None);
+    io.kill();
+}
+
+// a segment that overlaps too many but finds no second input takes no merge, and the next look starts past it
+#[test]
+fn overlap_needs_two() {
+    let io = SimulatedIo::new(Seed(34));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    for number in 0..OVER_THE_BOUND {
+        store.put(COLUMN, format!("a-{number:03}").as_bytes(), b"low").expect("put");
+        store.put(COLUMN, format!("z-{number:03}").as_bytes(), b"high").expect("put");
+        seal(&store, &io);
+    }
+
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let stand_in = stand_in_parked(&store);
+    fill_park(&store, &stand_in, MOST_PARKED - 1);
+    let mut job = CompactJob::new(Arc::clone(state), 0);
+    assert!(!job.rewrite.start());
+    assert!(!job.rewrite.is_running());
+    assert!(!volume.is_rewriting.load(Ordering::Acquire));
+    let first_tried = job.rewrite.last_tried();
+    assert!(!job.rewrite.start());
+    assert!(job.rewrite.last_tried() > first_tried);
+
+    *hold(&volume.parked) = [const { None }; MOST_PARKED];
+    assert!(job.rewrite.start());
+    assert!(job.rewrite.input_numbers().len() > 1);
+    io.kill();
+}
+
+// a park that stays full ends the wait, and the merge gives way with the inputs where they were
+#[test]
+fn park_wait_ends() {
+    let io = SimulatedIo::new(Seed(35));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    half_dead(&store, &io);
+
+    let volume = &store.state.volumes[0];
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(job.rewrite.start());
+    while job.rewrite.phase != RewritePhase::Installing {
+        job.rewrite.step();
+    }
+    let inputs = job.rewrite.input_numbers().to_vec();
+    let stand_in = stand_in_parked(&store);
+    fill_park(&store, &stand_in, MOST_PARKED);
+
+    for _round in 0..MOST_PARK_WAITS {
+        job.rewrite.step();
+    }
+    assert!(job.rewrite.is_running());
+    job.rewrite.step();
+    assert!(!job.rewrite.is_running());
+    assert!(inputs.iter().all(|input| volume.table.holds(*input)));
+    io.kill();
+}
+
+// a full grave output leaves the rest of the graves in the data output, and the merge still lands with every key deleted
+#[test]
+fn graves_past_the_output() {
+    let io = SimulatedIo::new(Seed(36));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    for number in 0..MANY_GRAVES {
+        store.put(COLUMN, format!("key-{number:05}").as_bytes(), b"older").expect("put");
+    }
+    // a cover keeps this segment out of every merge, so the older rows stay under the graves
+    store.delete_range(COLUMN, b"y", b"z").expect("delete");
+    seal(&store, &io);
+    for number in 0..MANY_GRAVES {
+        store.delete(COLUMN, format!("key-{number:05}").as_bytes()).expect("delete");
+    }
+    store.put(COLUMN, b"zz", b"first").expect("put");
+    store.put(COLUMN, b"zz", b"second").expect("put");
+    seal(&store, &io);
+
+    let volume = &store.state.volumes[0];
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    job.rewrite.grave_writer = FooterWriter::new(BlockCount(2));
+    assert!(job.rewrite.start());
+    let inputs = job.rewrite.input_numbers().to_vec();
+    let (mut has_full_writer, mut has_graves_in_data) = (false, false);
+    while job.rewrite.is_running() {
+        has_full_writer |= !job.rewrite.grave_writer.has_block_room();
+        has_graves_in_data |= job.rewrite.writer.columns().iter().any(|column| column.grave_count.0 > 0);
+        job.rewrite.step();
+    }
+    assert!(has_full_writer && has_graves_in_data);
+    assert!(inputs.iter().all(|input| !volume.table.holds(*input)));
+    assert_eq!(read(&store, b"key-00000"), None);
+    assert_eq!(read(&store, format!("key-{:05}", MANY_GRAVES - 1).as_bytes()), None);
+    assert_eq!(read(&store, b"zz"), Some(b"second".to_vec()));
+    store.close().expect("close");
+}
+
+fn stand_in_parked(store: &Store) -> SegmentNumber {
+    hold(&store.state.volumes[0].summary).rows().map(|row| row.facts.segment).min().expect("a row")
+}
+
+// fill the park with retired stand-ins, which only a kill may leave behind
+fn fill_park(store: &Store, stand_in: &SegmentNumber, count: usize) {
+    let volume = &store.state.volumes[0];
+    let pin = volume.table.pin(*stand_in).expect("a pin");
+    for _slot in 0..count {
+        let retired = RetiredSegment { file: pin.file.clone(), shard: 0, slot: 0 };
+        park(volume, retired, *stand_in, true);
+    }
 }

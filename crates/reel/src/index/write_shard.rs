@@ -1,6 +1,7 @@
 //! One shard of the write index: a tree per open segment and one table over all of them
 
 use std::cmp::Ordering;
+use std::hint;
 
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
@@ -16,6 +17,9 @@ use crate::index::shard_cursor::{MAX_CURSOR_STEPS, ShardCursor, TreeCursor};
 use crate::index::write_row::{WriteLookup, WriteRow};
 use crate::index::write_tree::{MAX_NEW_NODES, TreePosition, WriteTree, entry_at, step_back, step_forward};
 use crate::row_kind::RowKind;
+
+/// A cleanup takes this many rows at a time, so their cold reads overlap
+pub const CLEAN_RUN_ROWS: usize = 16;
 
 /// Sizes of one shard's pools, fixed at open
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -337,12 +341,20 @@ impl WriteShard {
             None => tree.first_position(&self.nodes),
         };
 
-        for _row in 0..limit.0 {
-            let Some(current) = position else {
-                break;
-            };
-            self.unlink(entry_at(&self.nodes, current));
-            position = step_forward(&self.nodes, current);
+        let mut left = limit.0;
+        while left > 0 && position.is_some() {
+            let mut entries = [NO_ENTRY; CLEAN_RUN_ROWS];
+            let mut count = 0;
+            while count < CLEAN_RUN_ROWS
+                && (count as u64) < left
+                && let Some(current) = position
+            {
+                entries[count] = entry_at(&self.nodes, current);
+                position = step_forward(&self.nodes, current);
+                count += 1;
+            }
+            self.unlink_run(&entries[..count]);
+            left -= count as u64;
         }
 
         match position {
@@ -358,8 +370,22 @@ impl WriteShard {
         }
     }
 
+    /// Take a run of rows out of their chains. Each row's cold reads come first, side by side, so they overlap
+    pub fn unlink_run(&mut self, entries: &[EntryAddress]) {
+        let mut hashes = [KeyHash::default(); CLEAN_RUN_ROWS];
+        let mut touched = 0;
+        for (hash, &entry) in hashes.iter_mut().zip(entries) {
+            *hash = hash_key(self.slab.column(entry), self.slab.key(entry));
+            touched ^= self.table.home_tag(*hash);
+        }
+        hint::black_box(touched);
+        for (&entry, &hash) in entries.iter().zip(&hashes) {
+            self.unlink(entry, hash);
+        }
+    }
+
     /// Take one row out of its key's chain, and leave a mark on the next older version
-    pub fn unlink(&mut self, address: EntryAddress) {
+    pub fn unlink(&mut self, address: EntryAddress, hash: KeyHash) {
         let older = self.slab.older(address);
         let newer = self.slab.newer(address);
         if older != NO_ENTRY {
@@ -371,9 +397,7 @@ impl WriteShard {
             return;
         }
 
-        let column = self.slab.column(address);
-        let hash = hash_key(column, self.slab.key(address));
-        let index = self.table.probe(hash, column, self.slab.key(address), &self.slab);
+        let index = self.table.find_head(hash, address);
         if older == NO_ENTRY {
             self.table.remove(index);
         } else {

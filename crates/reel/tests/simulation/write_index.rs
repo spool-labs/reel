@@ -48,6 +48,7 @@ const SMALL_TABLE: ShardSizing = ShardSizing {
 const LATEST: WritePlace = WritePlace(u64::MAX - 1);
 const MANY_VERSIONS: u64 = 3_000;
 const KEY_SEARCH: u64 = 4_000;
+const CLEAN_VERSIONS: u64 = 40;
 const MOST_EXTRA_KEY_BYTES: u64 = 90;
 const LONG_KEY_BYTES: usize = 2_000;
 const NEED_ROWS: u64 = 3_000;
@@ -293,6 +294,31 @@ fn switch_mid_cleanup() {
         assert_eq!(staying.row.expect("open row").place, WritePlace(ROWS + 1));
         assert!(!staying.should_ask_footers);
     }
+}
+
+// a cleanup run through many versions of a key keeps its chain: the table slot goes with the last row, and a newer
+// row in another slot stays
+#[test]
+fn clean_versions() {
+    let index = WriteIndex::new(&SIZING);
+    for place in 1..=CLEAN_VERSIONS {
+        add(&index, b"gone", row(place, SEALED, RowKind::Value));
+        add(&index, b"kept", row(CLEAN_VERSIONS + place, SEALED, RowKind::Value));
+    }
+    let newest = 2 * CLEAN_VERSIONS + 1;
+    add(&index, b"kept", row(newest, STAYING, RowKind::Value));
+
+    let mut is_clean = false;
+    while !is_clean {
+        is_clean = index.clean_slot(SEALED, RowCount(5));
+    }
+
+    assert_eq!(index.lookup(COLUMN, b"gone", LATEST, both()).row, None);
+    let kept = index.lookup(COLUMN, b"kept", LATEST, both());
+    assert_eq!(kept.row.expect("open row").place, WritePlace(newest));
+    add(&index, b"gone", row(newest + 1, STAYING, RowKind::Value));
+    let back = index.lookup(COLUMN, b"gone", LATEST, both());
+    assert_eq!(back.row.expect("open row").place, WritePlace(newest + 1));
 }
 
 // a view loaded before the switch either finds the row or goes to the footers

@@ -77,6 +77,23 @@ impl KeyTable {
         }
     }
 
+    /// Find the slot whose newest row is this one, which needs no key compare
+    pub fn find_head(&self, hash: KeyHash, head: EntryAddress) -> usize {
+        let mut index = hash.0 as u32 as usize & self.mask;
+        loop {
+            let slot = self.slots[index];
+            if slot.head == head || slot.head == NO_ENTRY {
+                return index;
+            }
+            index = (index + 1) & self.mask;
+        }
+    }
+
+    /// Read the tag in a key's home slot, so a later probe of that slot finds it cached
+    pub fn home_tag(&self, hash: KeyHash) -> u32 {
+        self.slots[hash.0 as u32 as usize & self.mask].tag
+    }
+
     /// Read the newest row at a slot
     pub fn head(&self, index: usize) -> EntryAddress {
         self.slots[index].head

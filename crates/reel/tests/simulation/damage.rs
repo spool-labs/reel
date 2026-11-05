@@ -32,7 +32,7 @@ const ROOT: &str = "/disk/damage";
 const ORDERED: ColumnId = ColumnId(1);
 const RANDOM: ColumnId = ColumnId(2);
 const COLUMNS: [ColumnId; 2] = [ORDERED, RANDOM];
-const BUDGET: ByteCount = ByteCount(36 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(38 * 1024 * 1024);
 const SETTLE_STEPS: u64 = 2_000_000;
 const SETTLE_TICK: Nanoseconds = Nanoseconds(1_000_000);
 const ROW_PERIOD: Nanoseconds = Nanoseconds(60_000_000);
@@ -60,7 +60,7 @@ const WIDE_SEGMENTS: u64 = 90;
 const WIDE_BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
 // what the summary plans at the least budget, spans included
 const PLANNED_ROOM_AT_LEAST: u64 = 1_400_000;
-const LEAST_BUDGET: ByteCount = ByteCount(35 * 1024 * 1024);
+const LEAST_BUDGET: ByteCount = ByteCount(37 * 1024 * 1024);
 // a segment lost with its row counts every stage a store held at open
 const STAGE_LOST: usize = NEWEST;
 // a stage for writes after the open
@@ -1591,7 +1591,7 @@ fn only_newer() {
     store.close().expect("close");
 }
 
-// a segment the newer copy lacks takes the older row, and two marks alone damage nothing
+// a segment the newer copy lacks takes the older row with its walk started over, and two marks alone damage nothing
 #[test]
 fn only_older() {
     let built = build(64);
@@ -1604,7 +1604,10 @@ fn only_older() {
     let store = open(&built.io);
 
     assert_eq!(store.damaged_segments(), 0);
-    assert_eq!(hold(&store.state.volumes[0].summary).get(segment).expect("row").facts, older);
+    let taken = hold(&store.state.volumes[0].summary).get(segment).expect("row").facts;
+    assert!(taken.is_backward);
+    assert_eq!(taken.walked_blocks, 0);
+    assert_eq!(SegmentFacts { is_backward: older.is_backward, walked_blocks: older.walked_blocks, ..taken }, older);
     assert_match(&store, &built.model);
     store.close().expect("close");
 }

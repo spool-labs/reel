@@ -97,6 +97,7 @@ pub struct EngineState<Backend: Io> {
     pub row_task: OnceLock<Backend::Task>,
     pub reserve_task: OnceLock<Backend::Task>,
     pub seal_tasks: Vec<OnceLock<Backend::Task>>,
+    pub walk_tasks: Vec<OnceLock<Backend::Task>>,
 }
 
 /// A held open-slot pin, released when dropped
@@ -276,6 +277,11 @@ impl<Backend: Io> EngineState<Backend> {
     /// Give a slot back once nothing uses it
     pub fn free_slot(&self, slot: OpenSlot) {
         hold(&self.free_slots).push(slot);
+    }
+
+    /// Count a volume's segments waiting for the dead-byte walk
+    pub fn pending_walks(&self, volume: usize) -> usize {
+        hold(&self.volumes[volume].summary).rows().filter(|row| !row.facts.is_walked()).count()
     }
 
     /// Report the heap each structure holds

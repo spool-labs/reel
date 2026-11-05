@@ -36,6 +36,7 @@ pub struct JobSlot {
     pub wait: JobWait,
     pub is_woken: bool,
     pub is_stopped: bool,
+    pub is_held: bool,
 }
 
 /// The handle of a job the scheduler owns, good only for the process that started it
@@ -48,7 +49,7 @@ pub struct SimulatedTask {
 impl JobSlot {
     /// Check whether the job can run at a clock reading
     pub fn is_runnable(&self, now: Nanoseconds) -> bool {
-        if self.work.is_none() {
+        if self.work.is_none() || self.is_held {
             return false;
         }
         match self.wait {

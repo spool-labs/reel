@@ -20,6 +20,9 @@ fn facts(number: u64) -> SegmentFacts {
         },
         is_damaged: false,
         damage_place: WritePlace(0),
+        block_count: 7,
+        walked_blocks: 3,
+        is_backward: false,
     }
 }
 
@@ -30,6 +33,10 @@ fn column() -> ColumnFacts<'static> {
         bound: b"pear",
         row_count: RowCount(10),
         grave_count: RowCount(1),
+        dead_rows: RowCount(0),
+        dead_graves: RowCount(0),
+        live_bytes: ByteCount(50),
+        dead_bytes: ByteCount(0),
     }
 }
 
@@ -206,4 +213,33 @@ fn span_rewrite() {
     assert_eq!(rows.get(SegmentNumber(1)).expect("row").span_count, 0);
     assert_eq!(rows.get(SegmentNumber(2)).expect("row").facts, facts(2));
     assert_eq!(rows.rewrite_spans(SegmentNumber(3), [].into_iter()), None);
+}
+
+// a walk step lands its counts and its position together, and leaves other rows alone
+#[test]
+fn walk_counts() {
+    let mut rows = SummaryRows::new(ROOM);
+    for number in [SegmentNumber(1), SegmentNumber(2), SegmentNumber(3)] {
+        assert!(rows.push(&facts(number.0), [column()].into_iter(), [].into_iter()));
+    }
+    let count = DeadCount {
+        segment: SegmentNumber(1),
+        column: ColumnId(2),
+        rows: RowCount(2),
+        graves: RowCount(1),
+        bytes: ByteCount(30),
+        kept_bytes: ByteCount(0),
+    };
+
+    rows.apply_walk(SegmentNumber(3), 5, &[count]);
+
+    assert!(!rows.has_bad_row());
+    let counted = rows.get(SegmentNumber(1)).expect("a row");
+    let facts_of = counted.cursor().column().expect("a column");
+    assert_eq!((facts_of.dead_rows, facts_of.dead_graves), (RowCount(2), RowCount(1)));
+    assert_eq!((facts_of.live_bytes, facts_of.dead_bytes), (ByteCount(20), ByteCount(30)));
+    assert_eq!(counted.facts.walked_blocks, 3);
+    assert_eq!(rows.get(SegmentNumber(3)).expect("a row").facts.walked_blocks, 5);
+    let other = rows.get(SegmentNumber(2)).expect("a row");
+    assert_eq!(other.cursor().column().expect("a column").dead_rows, RowCount(0));
 }

@@ -124,6 +124,10 @@ pub struct OwnedColumn {
     pub bound: Vec<u8>,
     pub row_count: RowCount,
     pub grave_count: RowCount,
+    pub dead_rows: RowCount,
+    pub dead_graves: RowCount,
+    pub live_bytes: ByteCount,
+    pub dead_bytes: ByteCount,
 }
 
 /// A volume's summary as open found it
@@ -1448,6 +1452,10 @@ pub fn mark_lost_rows<Backend: Io>(
     for number in &lost.unread_covers {
         widen_row(state, index, rows, *number, counter);
     }
+    // a row from the older copy can sit behind counts the newer rows already hold, so only a backward walk is safe
+    for number in &lost.older {
+        rows.restart_backward(*number);
+    }
     if !lost.has_lost_row {
         return;
     }
@@ -1523,6 +1531,9 @@ pub fn settle_sealed<Backend: Io>(
         is_damaged: false,
         has_covers: found.head.ranges_length.0 > 0,
         damage_place: WritePlace(0),
+        block_count: found.head.block_count.0,
+        walked_blocks: 0,
+        is_backward: true,
     };
 
     if let Some(at) = listed.get(&facts.segment)
@@ -1567,6 +1578,10 @@ pub fn settle_sealed<Backend: Io>(
         bound: &edges.1,
         row_count: column.row_count,
         grave_count: column.grave_count,
+        dead_rows: RowCount(0),
+        dead_graves: RowCount(0),
+        live_bytes: ByteCount(0),
+        dead_bytes: ByteCount(0),
     });
     let mut ranges = Vec::new();
     let mut facts = facts;
@@ -1659,6 +1674,10 @@ pub fn row_ranges(row: &SummaryRow, segment: SegmentNumber, columns: &mut Vec<Ow
             bound: column.bound.to_vec(),
             row_count: column.row_count,
             grave_count: column.grave_count,
+            dead_rows: column.dead_rows,
+            dead_graves: column.dead_graves,
+            live_bytes: column.live_bytes,
+            dead_bytes: column.dead_bytes,
         });
     }
 
@@ -1738,11 +1757,13 @@ pub fn fallback_ranges<Backend: Io>(
     }
 }
 
-/// Check a row and a tail describe the same segment, whatever its row says about damage
+/// Check a row and a tail describe the same segment, whatever its row says about damage or the walk
 pub fn is_same_segment(row: &SegmentFacts, tail: &SegmentFacts) -> bool {
     let without_damage = SegmentFacts {
         is_damaged: false,
         damage_place: WritePlace(0),
+        walked_blocks: tail.walked_blocks,
+        is_backward: tail.is_backward,
         ..*row
     };
     without_damage == *tail
@@ -1770,6 +1791,10 @@ pub fn column_of(column: &OwnedColumn) -> ColumnFacts<'_> {
         bound: &column.bound,
         row_count: column.row_count,
         grave_count: column.grave_count,
+        dead_rows: column.dead_rows,
+        dead_graves: column.dead_graves,
+        live_bytes: column.live_bytes,
+        dead_bytes: column.dead_bytes,
     }
 }
 

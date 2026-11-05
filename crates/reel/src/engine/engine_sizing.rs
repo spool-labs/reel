@@ -46,15 +46,17 @@ pub const READ_BUFFER_BYTES: u64 = 512 * 1024;
 pub const ENCODER_BYTES: u64 = 256 * 1024;
 /// Bytes a seal job's own buffers are planned at
 pub const SEAL_JOB_BYTES: u64 = 3 * 1024 * 1024;
+/// Bytes a dead-byte walk's own buffers are planned at
+pub const WALK_JOB_BYTES: u64 = 1024 * 1024;
 /// Bytes a job's stack is planned at
 pub const JOB_STACK_PLAN_BYTES: u64 = 1024 * 1024;
-/// Jobs a store runs beside one seal job a volume
+/// Jobs a store runs beside one seal job and one walk job a volume
 pub const SHARED_JOBS: u64 = 2;
 /// Bytes a row of the write index really takes, node, page and table share included, with a long batch's length of it
 pub const PLANNED_ROW_BYTES: u64 = 227;
 /// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight. With one
-/// lz4 column and 64 B keys that gives these rows a segment: 55,868 at 128 MiB, 148,253 at 192 MiB, 610,181 at 512 MiB and
-/// 5,783,772 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
+/// lz4 column and 64 B keys that gives these rows a segment: 52,981 at 128 MiB, 145,366 at 192 MiB, 607,295 at 512 MiB and
+/// 5,780,885 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
 /// records seal smaller and reach their size through merges, whose outputs the write index doesn't bound
 pub const SEAL_ROWS_EIGHTHS: u64 = 5;
 /// The most stored bytes of a value on an lz4 column, which is also the compress pool, cut into shares
@@ -113,12 +115,12 @@ impl StoreShape {
         let large = if self.has_lz4 { LZ4_STORED_LIMIT.0 } else { 0 };
         let encoders = WRITE_BUFFERS as u64 * ENCODER_BYTES + large;
         let spans = 4 * MOST_DAMAGED_SPANS as u64 * (SPAN_KEY_BYTES as u64 * 2);
-        let stacks = (SHARED_JOBS + volumes) * JOB_STACK_PLAN_BYTES;
+        let stacks = (SHARED_JOBS + 2 * volumes) * JOB_STACK_PLAN_BYTES;
         // the pool holds both keys of every cover, and a seal job has room to write them all to a footer
         let cover_keys = 2 * MOST_RANGE_COVERS as u64 * self.widest_keys;
         let cover_fixed = (COVER_SLOT_BYTES + COVER_RECORD_BYTES) as u64 * MOST_RANGE_COVERS as u64;
         let covers = 2 * cover_keys + volumes * cover_fixed;
-        ByteCount(queues + gathers + windows + reads + encoders + covers + volumes * (SEAL_JOB_BYTES + spans) + stacks)
+        ByteCount(queues + gathers + windows + reads + encoders + covers + volumes * (SEAL_JOB_BYTES + WALK_JOB_BYTES + spans) + stacks)
     }
 
     /// Read the smallest budget this store can run in

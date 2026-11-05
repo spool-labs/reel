@@ -29,6 +29,7 @@ use crate::engine::recovery::{
 use crate::engine::reserve_job::ReserveJob;
 use crate::engine::row_job::RowJob;
 use crate::engine::seal_job::SealJob;
+use crate::engine::walk_job::WalkJob;
 use crate::engine::volume::{ClaimState, SyncState, Volume};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
@@ -315,7 +316,7 @@ impl<Backend: Io> EngineState<Backend> {
         if let Some(task) = self.reserve_task.get() {
             task.stop()?;
         }
-        for cell in &self.seal_tasks {
+        for cell in self.seal_tasks.iter().chain(&self.walk_tasks) {
             if let Some(task) = cell.get() {
                 task.stop()?;
             }
@@ -373,6 +374,12 @@ pub fn bring_up<Backend: Io>(
         state.install_sealed(volume, found).map_err(open_error("installing a segment"))?;
         scan.sealed.pop();
     }
+    // a walk counts only against finished segments, which the rows name once the table holds them
+    for volume in &state.volumes {
+        for row in hold(&volume.summary).rows().filter(|row| row.facts.is_walked()) {
+            volume.table.mark_walked(row.facts.segment);
+        }
+    }
     recover_segments(state, scan).map_err(open_error("recovering a segment"))?;
     let damaged: usize = state.volumes.iter().map(|volume| hold(&volume.damaged).len()).sum();
     state.damaged_segments.store(damaged as u64, Ordering::Release);
@@ -399,13 +406,17 @@ pub fn bring_up<Backend: Io>(
         state.seal_heap.fetch_add(seal_job.heap_bytes().0, Ordering::AcqRel);
         let task = state.io.spawn_job("reel-seal", seal_job).map_err(open_error("starting a job"))?;
         let _set = state.seal_tasks[volume].set(task);
+        let walk_job = WalkJob::new(Arc::clone(state), volume);
+        state.seal_heap.fetch_add(walk_job.heap_bytes().0, Ordering::AcqRel);
+        let task = state.io.spawn_job("reel-walk", walk_job).map_err(open_error("starting a job"))?;
+        let _set = state.walk_tasks[volume].set(task);
     }
     let reserve_job = ReserveJob {
         state: Arc::clone(state),
     };
     let task = state.io.spawn_job("reel-reserve", reserve_job).map_err(open_error("starting a job"))?;
     let _set = state.reserve_task.set(task);
-    state.job_count.store(2 + state.volumes.len() as u64, Ordering::Release);
+    state.job_count.store(2 + 2 * state.volumes.len() as u64, Ordering::Release);
     Ok(())
 }
 
@@ -764,8 +775,10 @@ pub fn build_state<Backend: Io>(
     }
 
     let mut seal_tasks = Vec::with_capacity(config.volumes.len());
+    let mut walk_tasks = Vec::with_capacity(config.volumes.len());
     for _volume in &config.volumes {
         seal_tasks.push(OnceLock::new());
+        walk_tasks.push(OnceLock::new());
     }
 
     let filter_share = ByteCount(sizing.cache_share.0 / 4 * FILTER_CACHE_QUARTERS);
@@ -818,6 +831,7 @@ pub fn build_state<Backend: Io>(
         row_task: OnceLock::new(),
         reserve_task: OnceLock::new(),
         seal_tasks,
+        walk_tasks,
     }
 }
 

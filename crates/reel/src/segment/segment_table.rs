@@ -37,6 +37,7 @@ pub struct TableEntry<File> {
     pub head: TailHead,
     pub columns: Extent,
     pub blocks: Extent,
+    pub is_walked: bool,
 }
 
 /// A segment held open for a read, let go when dropped
@@ -44,6 +45,7 @@ pub struct TableEntry<File> {
 pub struct SegmentPin<'table, File> {
     pub file: File,
     pub head: TailHead,
+    pub is_walked: bool,
     pin: &'table AtomicU32,
 }
 
@@ -53,6 +55,13 @@ pub struct RetiredSegment<'table, File> {
     pub file: File,
     pub head: TailHead,
     pin: &'table AtomicU32,
+}
+
+/// One row block of a segment, for the dead-byte walk
+#[derive(Clone, Copy, Debug)]
+pub struct WalkBlock {
+    pub column: ColumnId,
+    pub entry: BlockEntry,
 }
 
 /// A few block lines around a key, with what a read of them needs
@@ -252,6 +261,7 @@ impl<File: Clone> SegmentTable<File> {
             head: *head,
             columns: column_extent,
             blocks: block_extent,
+            is_walked: false,
         });
         guard.map.insert(head.segment, slot);
         true
@@ -282,7 +292,34 @@ impl<File: Clone> SegmentTable<File> {
         Some(SegmentPin {
             file: entry.file.clone(),
             head: entry.head,
+            is_walked: entry.is_walked,
             pin,
+        })
+    }
+
+    /// Note a segment's walk has finished, so other walks may count against it
+    pub fn mark_walked(&self, number: SegmentNumber) {
+        let mut guard = self.write_shard(shard_of(number));
+        let Some(slot) = guard.map.get(number) else {
+            return;
+        };
+        if let Some(entry) = guard.segments[slot as usize].as_mut() {
+            entry.is_walked = true;
+        }
+    }
+
+    /// Copy out one of a segment's block lines, counted over all its columns, and the column it belongs to
+    pub fn walk_block(&self, number: SegmentNumber, index: u32) -> Option<WalkBlock> {
+        let guard = self.read_shard(shard_of(number));
+        let slot = guard.map.get(number)?;
+        let entry = guard.segments[slot as usize].as_ref()?;
+        let line = guard.blocks.get(entry.blocks.start as usize + index as usize)?;
+        let first = entry.columns.start as usize;
+        let columns = guard.columns.get(first..first + entry.columns.length as usize)?;
+        let column = columns.iter().find(|tail| index >= tail.first_block && index - tail.first_block < tail.block_count.0)?;
+        Some(WalkBlock {
+            column: column.column,
+            entry: *line,
         })
     }
 

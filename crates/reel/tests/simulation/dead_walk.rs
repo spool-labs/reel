@@ -1,0 +1,265 @@
+//! The dead-byte walk: every superseded row counts once, whatever order segments seal and walk in
+
+use std::path::{Path, PathBuf};
+
+use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::engine::open_segment::SegmentPhase;
+use reel::engine::reel_store::ReelStore;
+use reel::engine::walk_job::WalkJob;
+use reel::guard::hold;
+use reel::io::IoTask;
+use reel::record::codec::Codec;
+use reel::segment::segment_tail::SegmentNumber;
+use reel::segment::summary::{LostRows, SummaryPaths, SummaryRows, copy_ends, read_summary, write_copy};
+use reel_api::column_id::ColumnId;
+use reel_api::units::{ByteCount, Nanoseconds, RowCount, VolumeId, WritePlace};
+use reel_sim::seeded_random::Seed;
+use reel_sim::simulated_io::SimulatedIo;
+
+const ROOT: &str = "/disk/walk";
+const COLUMN: ColumnId = ColumnId(1);
+const BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
+const WALK_JOB: &str = "reel-walk";
+const TICK: Nanoseconds = Nanoseconds(1_000_000);
+const STEPS: u64 = 20_000;
+const BUSY: u32 = 1_000;
+const VERSIONS: u64 = 600;
+const LONG_KEYS: u64 = 62;
+const LONG_KEY_BYTES: usize = 1_000;
+const ORDERS: [[usize; 3]; 6] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+
+type Store = ReelStore<SimulatedIo>;
+
+fn config() -> StoreConfig {
+    StoreConfig {
+        memory_budget: BUDGET,
+        volumes: vec![VolumeConfig {
+            name: "walk".to_string(),
+            roots: vec![PathBuf::from(ROOT)],
+            sync: SyncPolicy::Never,
+        }],
+        columns: vec![ColumnConfig {
+            id: COLUMN,
+            name: "column".to_string(),
+            key_shape: KeyShape::Variable { most: LONG_KEY_BYTES as u16 + 8 },
+            codec: Codec::None,
+            volume: VolumeId(0),
+        }],
+    }
+}
+
+fn open(io: &SimulatedIo) -> Store {
+    ReelStore::open(io.clone(), &config()).expect("open")
+}
+
+fn settle(io: &SimulatedIo) {
+    for _step in 0..STEPS {
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+            if io.step_any().is_none() {
+                return;
+            }
+        }
+    }
+    panic!("jobs never went quiet");
+}
+
+// seal one segment by number, with whatever else runs held to the seal's own steps
+fn seal_segment(store: &Store, io: &SimulatedIo, number: SegmentNumber) {
+    let volume = &store.state.volumes[0];
+    {
+        let mut claims = hold(&volume.claims);
+        let segment = claims.open.iter_mut().find(|segment| segment.number == number).expect("open");
+        segment.phase = SegmentPhase::Sealing;
+    }
+    if let Some(task) = store.state.seal_tasks[0].get() {
+        task.wake();
+    }
+    settle(io);
+    assert!(volume.table.holds(number));
+}
+
+// open another segment beside the ones there and return its number
+fn add_open(store: &Store, io: &SimulatedIo) -> SegmentNumber {
+    let volume = &store.state.volumes[0];
+    hold(&volume.claims).wants_prepared = true;
+    store.state.prepare_segments();
+    settle(io);
+    let mut claims = hold(&volume.claims);
+    let spare = claims.prepared.take().expect("a spare");
+    let number = spare.number;
+    volume.open_slot(spare.slot);
+    claims.open.push(spare);
+    number
+}
+
+// write a key to one open segment, by making every other look busy
+fn put_in(store: &Store, number: SegmentNumber, value: &[u8]) {
+    let volume = &store.state.volumes[0];
+    let busy = |is_busy: bool| {
+        for segment in hold(&volume.claims).open.iter_mut().filter(|segment| segment.number != number) {
+            segment.in_flight = if is_busy { BUSY } else { 0 };
+        }
+    };
+    busy(true);
+    store.put(COLUMN, b"key", value).expect("put");
+    busy(false);
+}
+
+// read a segment's rows and dead rows from its summary row
+fn counts(store: &Store, number: SegmentNumber) -> (RowCount, RowCount) {
+    let rows = hold(&store.state.volumes[0].summary);
+    let row = rows.get(number).expect("a row");
+    let column = row.cursor().column().expect("a column");
+    (column.row_count, column.dead_rows)
+}
+
+fn live_rows(store: &Store, segments: &[SegmentNumber]) -> u64 {
+    segments.iter().map(|number| counts(store, *number)).map(|(rows, dead)| rows.0 - dead.0).sum()
+}
+
+// long keys that nearly fill a row block, then versions of one key, so the block ends among them
+fn fill_block(store: &Store) {
+    for number in 0..LONG_KEYS {
+        let mut key = format!("a{number:03}").into_bytes();
+        key.resize(LONG_KEY_BYTES, number as u8);
+        store.put(COLUMN, &key, b"value").expect("put");
+    }
+    for number in 0..VERSIONS {
+        store.put(COLUMN, b"key", &number.to_le_bytes()).expect("put");
+    }
+}
+
+// two segments of one key, both sealed before the walk starts: the older row counts once
+#[test]
+fn lagging_walk() {
+    let io = SimulatedIo::new(Seed(1));
+    let store = open(&io);
+    io.hold_jobs(WALK_JOB, true);
+    store.put(COLUMN, b"key", b"older").expect("put");
+    let first = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, first);
+    store.put(COLUMN, b"key", b"newer").expect("put");
+    let second = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, second);
+    assert_eq!(store.state.pending_walks(0), 2);
+
+    io.hold_jobs(WALK_JOB, false);
+    settle(&io);
+
+    assert_eq!(store.state.pending_walks(0), 0);
+    assert_eq!(counts(&store, first).1, RowCount(1));
+    assert_eq!(counts(&store, second).1, RowCount(0));
+    store.close().expect("close");
+}
+
+// three segments of one key, with places in one order and seals in every other: one row stays live
+#[test]
+fn every_seal_order() {
+    for (seed, order) in ORDERS.iter().enumerate() {
+        for is_held in [false, true] {
+            let io = SimulatedIo::new(Seed(seed as u64 + 2));
+            let store = open(&io);
+            io.hold_jobs(WALK_JOB, is_held);
+            store.put(COLUMN, b"first", b"value").expect("put");
+            let first = hold(&store.state.volumes[0].claims).open[0].number;
+            let segments = [first, add_open(&store, &io), add_open(&store, &io)];
+            for (place, number) in segments.iter().enumerate() {
+                put_in(&store, *number, format!("value-{place}").as_bytes());
+            }
+
+            for index in order {
+                seal_segment(&store, &io, segments[*index]);
+            }
+            io.hold_jobs(WALK_JOB, false);
+            settle(&io);
+
+            let newest = counts(&store, segments[2]);
+            assert_eq!(live_rows(&store, &segments), 2, "order {order:?}");
+            assert_eq!(newest.0.0 - newest.1.0, newest.0.0, "order {order:?}");
+            store.close().expect("close");
+        }
+    }
+}
+
+// a key whose versions run across row blocks counts each once, and flips the older segment's row once
+#[test]
+fn versions_across_blocks() {
+    let io = SimulatedIo::new(Seed(10));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"older").expect("put");
+    let older = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, older);
+    fill_block(&store);
+    let newer = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, newer);
+    settle(&io);
+
+    assert_eq!(counts(&store, older).1, RowCount(1));
+    assert_eq!(counts(&store, newer), (RowCount(LONG_KEYS + VERSIONS), RowCount(VERSIONS - 1)));
+    store.close().expect("close");
+}
+
+// a walk stopped part way resumes at its saved position and counts nothing twice
+#[test]
+fn walk_resumes() {
+    let io = SimulatedIo::new(Seed(11));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"older").expect("put");
+    let older = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, older);
+    settle(&io);
+    io.hold_jobs(WALK_JOB, true);
+    fill_block(&store);
+    let newer = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, newer);
+
+    let mut job = WalkJob::new(store.state.clone(), 0);
+    assert!(job.pick_target());
+    let target = job.target.expect("a target");
+    assert!(target.block_count > 1);
+    job.walk_block(target).expect("a block");
+    store.state.save_summary(&store.state.volumes[0]).expect("save");
+    drop(job);
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+    settle(&io);
+
+    assert_eq!(counts(&store, older).1, RowCount(1));
+    assert_eq!(counts(&store, newer), (RowCount(LONG_KEYS + VERSIONS), RowCount(VERSIONS - 1)));
+    store.close().expect("close");
+}
+
+// a row from the older copy rebuilds its own counts and flips nothing, so no row counts twice
+#[test]
+fn older_copy_row() {
+    for is_newer_lost in [false, true] {
+        let io = SimulatedIo::new(Seed(12));
+        let store = open(&io);
+        store.put(COLUMN, b"key", b"older").expect("put");
+        let older = hold(&store.state.volumes[0].claims).open[0].number;
+        seal_segment(&store, &io, older);
+        store.put(COLUMN, b"key", b"newer").expect("put");
+        let newer = hold(&store.state.volumes[0].claims).open[0].number;
+        seal_segment(&store, &io, newer);
+        settle(&io);
+        store.close().expect("close");
+        drop(store);
+
+        let paths = SummaryPaths::new(Path::new(ROOT));
+        let mut rows = SummaryRows::new(ByteCount(0));
+        let mark = read_summary(&io, &paths, &mut rows, &mut LostRows::default()).expect("read").expect("a mark");
+        rows.remove(if is_newer_lost { newer } else { older });
+        let ends = copy_ends(WritePlace(mark.0 + 1), rows.bytes());
+        write_copy(&io, &paths, &paths.current, &ends, rows.bytes()).expect("write");
+
+        let store = open(&io);
+        settle(&io);
+
+        assert_eq!(counts(&store, older).1, RowCount(1));
+        assert_eq!(counts(&store, newer).1, RowCount(0));
+        store.close().expect("close");
+    }
+}

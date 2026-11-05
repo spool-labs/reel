@@ -38,6 +38,7 @@ pub struct ColumnKeys {
     pub lowest_at: usize,
     pub highest_at: usize,
     pub end: usize,
+    pub value_bytes: ByteCount,
 }
 
 /// What a finished footer adds up to
@@ -121,6 +122,10 @@ impl FooterWriter {
             bound: &self.key_bytes[keys.highest_at..keys.end],
             row_count: tail.row_count,
             grave_count: tail.grave_count,
+            dead_rows: RowCount(0),
+            dead_graves: RowCount(0),
+            live_bytes: keys.value_bytes,
+            dead_bytes: ByteCount(0),
         }
     }
 
@@ -154,6 +159,7 @@ impl FooterWriter {
             lowest_at,
             highest_at,
             end: self.key_bytes.len(),
+            value_bytes: ByteCount(0),
         });
         self.columns.push(ColumnTail {
             column: start.column,
@@ -194,6 +200,9 @@ impl FooterWriter {
         self.places.lowest = self.places.lowest.min(row.place);
         self.places.highest = self.places.highest.max(row.place);
         self.row_count = RowCount(self.row_count.0 + 1);
+        if let Some(keys) = self.column_keys.last_mut() {
+            keys.value_bytes = ByteCount(keys.value_bytes.0 + row.length.0);
+        }
         if let Some(column) = self.columns.last_mut() {
             column.row_count = RowCount(column.row_count.0 + 1);
             if row.kind == RowKind::Grave {

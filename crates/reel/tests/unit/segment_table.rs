@@ -36,6 +36,7 @@ fn pool_compact() {
         head: TailHead::default(),
         columns: Extent::default(),
         blocks: Extent { start, length },
+        is_walked: false,
     };
     // the slots run against pool order, and the run at 1 has retired
     shard.segments[0] = Some(entry(1, 3, 1));

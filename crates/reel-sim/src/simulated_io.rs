@@ -202,6 +202,13 @@ impl SimulatedIo {
         hold(&self.disk).random.below(bound)
     }
 
+    /// Keep every job of a name out of the runnable set, or let them back in
+    pub fn hold_jobs(&self, name: &str, is_held: bool) {
+        for slot in hold(&self.slots).iter_mut().filter(|slot| slot.name == name) {
+            slot.is_held = is_held;
+        }
+    }
+
     /// Count the jobs that have not ended
     pub fn live_jobs(&self) -> JobCount {
         let mut live = 0;
@@ -421,6 +428,7 @@ impl Io for SimulatedIo {
             wait: JobWait::Nothing,
             is_woken: false,
             is_stopped: false,
+            is_held: false,
         });
         Ok(SimulatedTask {
             slots: Arc::clone(&self.slots),

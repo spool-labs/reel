@@ -400,7 +400,60 @@ impl<Backend: Io> EngineState<Backend> {
         self.footer_readers.with(|reader| self.search_directory(volume, directory, read, reader))
     }
 
-    /// Walk a directory's pages, starting over when the list changes between them
+    /// Find a key's newest row among the segments whose walks have finished, leaving out one segment and range rows
+    pub fn newest_walked(
+        &self,
+        volume: &Volume<Backend>,
+        column: ColumnId,
+        key: &[u8],
+        skipped: SegmentNumber,
+    ) -> Result<Option<SealedRow>, StoreError> {
+        let Some(directory) = &self.directories[column.0 as usize] else {
+            return Ok(None);
+        };
+        let read = self.key_read(column, key, WritePlace(u64::MAX), false)?;
+        self.footer_readers.with(|reader| {
+            self.walk_candidates(directory, key, reader, |segment, reader, best| {
+                if segment == skipped {
+                    return Ok(());
+                }
+                self.ask_walked(volume, &read, segment, reader, best)
+            })
+        })
+    }
+
+    /// Ask a finished segment for a key's newest row that isn't a range delete, and keep it when it's the newest so far
+    pub fn ask_walked(
+        &self,
+        volume: &Volume<Backend>,
+        read: &KeyRead,
+        segment: SegmentNumber,
+        reader: &mut FooterReader,
+        best: &mut Option<SealedRow>,
+    ) -> Result<(), StoreError> {
+        let Some(pin) = volume.table.pin(segment) else {
+            return Ok(());
+        };
+        if !pin.is_walked || best.is_some_and(|row| row.row.place >= pin.head.places.highest) {
+            return Ok(());
+        }
+        let mut point = *read;
+        while let Some(found) = self.search_segment(volume, &point, segment, &pin, reader)? {
+            if found.kind != RowKind::RangeDelete {
+                if best.is_none_or(|current| current.row.place < found.place) {
+                    *best = Some(SealedRow { segment, row: found });
+                }
+                return Ok(());
+            }
+            let Some(below) = found.place.0.checked_sub(1) else {
+                return Ok(());
+            };
+            point.read_point = WritePlace(below);
+        }
+        Ok(())
+    }
+
+    /// Ask every segment a directory lists for a key
     pub fn search_directory(
         &self,
         volume: &Volume<Backend>,
@@ -408,12 +461,25 @@ impl<Backend: Io> EngineState<Backend> {
         read: &KeyRead,
         reader: &mut FooterReader,
     ) -> Result<Option<SealedRow>, StoreError> {
+        self.walk_candidates(directory, read.key, reader, |segment, reader, best| {
+            self.ask_segment(volume, read, segment, reader, best)
+        })
+    }
+
+    /// Walk a directory's pages, starting over when the list changes between them
+    pub fn walk_candidates(
+        &self,
+        directory: &ColumnDirectory,
+        key: &[u8],
+        reader: &mut FooterReader,
+        mut ask: impl FnMut(SegmentNumber, &mut FooterReader, &mut Option<SealedRow>) -> Result<(), StoreError>,
+    ) -> Result<Option<SealedRow>, StoreError> {
         let mut best: Option<SealedRow> = None;
         let mut skip = 0;
         let mut generation = None;
         loop {
             let mut candidates = std::mem::take(&mut reader.candidates);
-            let page = directory.candidates(read.key, skip, &mut candidates);
+            let page = directory.candidates(key, skip, &mut candidates);
 
             // a list that changed between pages could hide a segment, and asking twice is harmless
             if generation.is_some_and(|seen| seen != page.generation) {
@@ -426,7 +492,7 @@ impl<Backend: Io> EngineState<Backend> {
 
             let mut outcome = Ok(());
             for segment in &candidates {
-                outcome = self.ask_segment(volume, read, *segment, reader, &mut best);
+                outcome = ask(*segment, reader, &mut best);
                 if outcome.is_err() {
                     break;
                 }

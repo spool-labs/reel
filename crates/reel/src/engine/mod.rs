@@ -13,4 +13,5 @@ pub mod reserve_job;
 pub mod row_job;
 pub mod seal_job;
 pub mod volume;
+pub mod walk_job;
 pub mod write_path;

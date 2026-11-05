@@ -16,6 +16,8 @@ use crate::segment::segment_tail::{PlaceRange, SegmentNumber};
 
 /// The bit of a row's flags that says its footer keeps range deletes
 pub const HAS_COVERS_BIT: u8 = 1;
+/// The bit of a row's flags that says its counts come from a backward walk
+pub const IS_BACKWARD_BIT: u8 = 2;
 /// Opens a summary file
 pub const SUMMARY_MAGIC: u64 = 0x5245_4C53_554D_4D31;
 /// Closes a summary file
@@ -35,9 +37,13 @@ pub const ROW_HEAD_BYTES: usize = 3 * size_of::<u32>();
 /// Bytes of a row's checksum
 pub const ROW_SUM_BYTES: usize = size_of::<u64>();
 /// Bytes of the fields every row has, before its columns
-pub const ROW_FACT_BYTES: usize = 69;
+pub const ROW_FACT_BYTES: usize = 77;
 /// Where a row's body keeps its span count
+/// Where a row's body keeps its flags
+pub const ROW_FLAGS_AT: usize = 56;
 pub const SPAN_COUNT_AT: usize = 59;
+/// Where a row's body keeps how far the dead-byte walk has come
+pub const WALKED_BLOCKS_AT: usize = 73;
 /// Most bytes of a key a row keeps, so a column costs about 100 B whatever the keys are
 pub const SUMMARY_KEY_BYTES: usize = 32;
 /// Bytes a row takes before its columns and spans
@@ -45,7 +51,17 @@ pub const MOST_ROW_FIXED_BYTES: usize = ROW_HEAD_BYTES + ROW_FACT_BYTES + ROW_SU
 /// Bytes a span adds to a row, before its keys
 pub const MOST_ROW_SPAN_FIXED_BYTES: usize = 1 + 2 * size_of::<u16>();
 /// The most bytes a column adds to a row, with its bounded keys
-pub const MOST_ROW_COLUMN_BYTES: usize = 21 + 2 * SUMMARY_KEY_BYTES + 1;
+pub const MOST_ROW_COLUMN_BYTES: usize = COLUMN_FIXED_BYTES + 2 * SUMMARY_KEY_BYTES + 1;
+/// Words of counts each column keeps in a row
+pub const COLUMN_WORDS: usize = 6;
+/// Bytes of a column in a row, before its keys
+pub const COLUMN_FIXED_BYTES: usize = 1 + 2 * size_of::<u16>() + COLUMN_WORDS * size_of::<u64>();
+/// Where a column keeps the length of its lowest key
+pub const COLUMN_LOWEST_AT: usize = 1;
+/// Where a column keeps the length of its bound
+pub const COLUMN_BOUND_AT: usize = 3;
+/// Where a column keeps its dead rows, with dead graves, live bytes and dead bytes after it
+pub const COLUMN_DEAD_AT: usize = 21;
 /// Marks a span that runs to its column's end
 pub const NO_END: u16 = u16::MAX;
 
@@ -61,6 +77,18 @@ pub struct SegmentFacts {
     pub is_damaged: bool,
     pub has_covers: bool,
     pub damage_place: WritePlace,
+    pub block_count: u32,
+    pub walked_blocks: u32,
+    pub is_backward: bool,
+}
+
+impl SegmentFacts {
+    /// Check the dead-byte walk has finished this segment, so other walks may count against it. A merge output
+    /// starts finished, and its counts come from the rows it keeps, never from its inputs' numbers, since a rewrite
+    /// can drop a row an unfinished walk would have flipped later
+    pub fn is_walked(&self) -> bool {
+        self.walked_blocks >= self.block_count
+    }
 }
 
 /// One column's range and counts in a segment
@@ -71,6 +99,21 @@ pub struct ColumnFacts<'key> {
     pub bound: &'key [u8],
     pub row_count: RowCount,
     pub grave_count: RowCount,
+    pub dead_rows: RowCount,
+    pub dead_graves: RowCount,
+    pub live_bytes: ByteCount,
+    pub dead_bytes: ByteCount,
+}
+
+/// One walk step's dead rows in one column of one segment
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DeadCount {
+    pub segment: SegmentNumber,
+    pub column: ColumnId,
+    pub rows: RowCount,
+    pub graves: RowCount,
+    pub bytes: ByteCount,
+    pub kept_bytes: ByteCount,
 }
 
 /// One damaged span of a column, to its end key or the column's end
@@ -117,6 +160,12 @@ impl<'bytes> RowCursor<'bytes> {
         Some(u64::from_le_bytes(word))
     }
 
+    /// Take a four-byte number
+    pub fn half(&mut self) -> Option<u32> {
+        let bytes = self.take(size_of::<u32>())?;
+        Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
     /// Take a short
     pub fn short(&mut self) -> Option<u16> {
         let bytes = self.take(size_of::<u16>())?;
@@ -135,12 +184,20 @@ impl<'bytes> RowCursor<'bytes> {
         let bound_length = self.short()? as usize;
         let row_count = RowCount(self.word()?);
         let grave_count = RowCount(self.word()?);
+        let dead_rows = RowCount(self.word()?);
+        let dead_graves = RowCount(self.word()?);
+        let live_bytes = ByteCount(self.word()?);
+        let dead_bytes = ByteCount(self.word()?);
         Some(ColumnFacts {
             column,
             lowest: self.take(lowest_length)?,
             bound: self.take(bound_length)?,
             row_count,
             grave_count,
+            dead_rows,
+            dead_graves,
+            live_bytes,
+            dead_bytes,
         })
     }
 
@@ -220,6 +277,10 @@ impl SummaryRows {
             self.bytes.extend_from_slice(&(column.bound.len() as u16).to_le_bytes());
             self.bytes.extend_from_slice(&column.row_count.0.to_le_bytes());
             self.bytes.extend_from_slice(&column.grave_count.0.to_le_bytes());
+            self.bytes.extend_from_slice(&column.dead_rows.0.to_le_bytes());
+            self.bytes.extend_from_slice(&column.dead_graves.0.to_le_bytes());
+            self.bytes.extend_from_slice(&column.live_bytes.0.to_le_bytes());
+            self.bytes.extend_from_slice(&column.dead_bytes.0.to_le_bytes());
             self.bytes.extend_from_slice(column.lowest);
             self.bytes.extend_from_slice(column.bound);
         }
@@ -341,6 +402,86 @@ impl SummaryRows {
         None
     }
 
+    /// Apply one step of the dead-byte walk under one hold: every count, and how far the walk has come, so any saved
+    /// copy has counts and a position that agree. The counts come sorted by segment
+    pub fn apply_walk(&mut self, walked: SegmentNumber, blocks: u32, counts: &[DeadCount]) {
+        let mut at = 0;
+        while let Some((length, row)) = read_row(&self.bytes[at..]) {
+            let found = row.map(|row| (row.facts.segment, row.column_count));
+            if let Some((number, column_count)) = found {
+                let first = counts.partition_point(|count| count.segment < number);
+                let mine = counts[first..].iter().take_while(|count| count.segment == number);
+                let body_at = at + ROW_HEAD_BYTES;
+                let has_counts = mine.clone().next().is_some();
+                for count in mine {
+                    self.add_dead(body_at, column_count, count);
+                }
+                if number == walked {
+                    let field = body_at + WALKED_BLOCKS_AT;
+                    self.bytes[field..field + size_of::<u32>()].copy_from_slice(&blocks.to_le_bytes());
+                }
+                if has_counts || number == walked {
+                    let body_end = at + length - ROW_SUM_BYTES;
+                    let sum = checksum(&self.bytes[body_at..body_end]);
+                    self.bytes[body_end..body_end + ROW_SUM_BYTES].copy_from_slice(&sum.0.to_le_bytes());
+                }
+            }
+            at += length;
+        }
+    }
+
+    /// Start a segment's counts over for a backward walk, which rebuilds them from its own rows. Its row may be behind
+    /// counts other rows already hold, so it can't resume as a forward walk
+    pub fn restart_backward(&mut self, segment: SegmentNumber) {
+        let mut at = 0;
+        while let Some((length, row)) = read_row(&self.bytes[at..]) {
+            let found = row.filter(|row| row.facts.segment == segment).map(|row| row.column_count);
+            if let Some(column_count) = found {
+                let body_at = at + ROW_HEAD_BYTES;
+                self.bytes[body_at + WALKED_BLOCKS_AT..body_at + WALKED_BLOCKS_AT + size_of::<u32>()].fill(0);
+                self.bytes[body_at + ROW_FLAGS_AT] |= 1 << IS_BACKWARD_BIT;
+                let mut column_at = body_at + ROW_FACT_BYTES;
+                for _column in 0..column_count {
+                    let lowest = read_short(&self.bytes[column_at + COLUMN_LOWEST_AT..]);
+                    let bound = read_short(&self.bytes[column_at + COLUMN_BOUND_AT..]);
+                    self.bytes[column_at + COLUMN_DEAD_AT..column_at + COLUMN_FIXED_BYTES].fill(0);
+                    column_at += COLUMN_FIXED_BYTES + usize::from(lowest) + usize::from(bound);
+                }
+                let body_end = at + length - ROW_SUM_BYTES;
+                let sum = checksum(&self.bytes[body_at..body_end]);
+                self.bytes[body_end..body_end + ROW_SUM_BYTES].copy_from_slice(&sum.0.to_le_bytes());
+                return;
+            }
+            at += length;
+        }
+    }
+
+    /// Add one count to its column in a row, leaving the row's checksum to the caller
+    pub fn add_dead(&mut self, body_at: usize, column_count: u16, count: &DeadCount) {
+        let mut column_at = body_at + ROW_FACT_BYTES;
+        for _column in 0..column_count {
+            let lowest = read_short(&self.bytes[column_at + COLUMN_LOWEST_AT..]);
+            let bound = read_short(&self.bytes[column_at + COLUMN_BOUND_AT..]);
+            if self.bytes[column_at] == count.column.0 {
+                let words = column_at + COLUMN_DEAD_AT;
+                self.change_word(words, |rows| rows + count.rows.0);
+                self.change_word(words + size_of::<u64>(), |graves| graves + count.graves.0);
+                self.change_word(words + 2 * size_of::<u64>(), |live| (live + count.kept_bytes.0).saturating_sub(count.bytes.0));
+                self.change_word(words + 3 * size_of::<u64>(), |dead| dead + count.bytes.0);
+                return;
+            }
+            column_at += COLUMN_FIXED_BYTES + usize::from(lowest) + usize::from(bound);
+        }
+    }
+
+    /// Change one stored word
+    pub fn change_word(&mut self, at: usize, change: impl FnOnce(u64) -> u64) {
+        let field = &mut self.bytes[at..at + size_of::<u64>()];
+        let mut word = [0; size_of::<u64>()];
+        word.copy_from_slice(field);
+        field.copy_from_slice(&change(u64::from_le_bytes(word)).to_le_bytes());
+    }
+
     /// Write a row's fixed fields
     pub fn put_facts(&mut self, facts: &SegmentFacts, columns: u16, spans: u16) {
         self.bytes.extend_from_slice(&facts.segment.0.to_le_bytes());
@@ -350,10 +491,12 @@ impl SummaryRows {
         self.bytes.extend_from_slice(&facts.seal_mark.0.to_le_bytes());
         self.bytes.extend_from_slice(&facts.places.lowest.0.to_le_bytes());
         self.bytes.extend_from_slice(&facts.places.highest.0.to_le_bytes());
-        self.bytes.push(u8::from(facts.is_damaged) | (u8::from(facts.has_covers) << HAS_COVERS_BIT));
+        self.bytes.push(u8::from(facts.is_damaged) | (u8::from(facts.has_covers) << HAS_COVERS_BIT) | (u8::from(facts.is_backward) << IS_BACKWARD_BIT));
         self.bytes.extend_from_slice(&columns.to_le_bytes());
         self.bytes.extend_from_slice(&spans.to_le_bytes());
         self.bytes.extend_from_slice(&facts.damage_place.0.to_le_bytes());
+        self.bytes.extend_from_slice(&facts.block_count.to_le_bytes());
+        self.bytes.extend_from_slice(&facts.walked_blocks.to_le_bytes());
     }
 
     /// Walk the rows that pass their checks
@@ -470,7 +613,7 @@ pub fn row_bytes<'key>(
 ) -> usize {
     let mut body: usize = ROW_FACT_BYTES;
     for column in columns {
-        body += 1 + 2 * size_of::<u16>() + 2 * size_of::<u64>() + column.lowest.len() + column.bound.len();
+        body += COLUMN_FIXED_BYTES + column.lowest.len() + column.bound.len();
     }
     for span in spans {
         body += 1 + 2 * size_of::<u16>() + span.start.len() + span.end.map_or(0, <[u8]>::len);
@@ -557,10 +700,13 @@ pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
     };
     let flags = cursor.byte()?;
     let is_damaged = flags & 1 != 0;
-    let has_covers = flags >> HAS_COVERS_BIT != 0;
+    let has_covers = flags >> HAS_COVERS_BIT & 1 != 0;
+    let is_backward = flags >> IS_BACKWARD_BIT & 1 != 0;
     let column_count = cursor.short()?;
     let span_count = cursor.short()?;
     let damage_place = WritePlace(cursor.word()?);
+    let block_count = cursor.half()?;
+    let walked_blocks = cursor.half()?;
     let facts = SegmentFacts {
         segment,
         file_length,
@@ -571,6 +717,9 @@ pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
         is_damaged,
         has_covers,
         damage_place,
+        block_count,
+        walked_blocks,
+        is_backward,
     };
     Some(SummaryRow {
         facts,
@@ -780,4 +929,9 @@ pub fn read_readable<File: IoFile>(file: &File) -> Result<Vec<u8>> {
         }
     }
     Ok(bytes)
+}
+
+/// Read a stored short
+pub fn read_short(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes([bytes[0], bytes[1]])
 }

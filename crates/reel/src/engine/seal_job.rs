@@ -284,6 +284,9 @@ impl<Backend: Io> SealJob<Backend> {
                 is_damaged: false,
                 has_covers: totals.head.ranges_length.0 > 0,
                 damage_place: WritePlace(0),
+                block_count: self.writer.entries().len() as u32,
+                walked_blocks: 0,
+                is_backward: false,
             };
             let writer = &self.writer;
             let columns = (0..writer.columns().len()).map(|index| writer.column_facts(index));
@@ -314,6 +317,9 @@ impl<Backend: Io> SealJob<Backend> {
         }
 
         state.save_summary(volume)?;
+        if let Some(task) = state.walk_tasks[self.volume].get() {
+            task.wake();
+        }
         self.phase = SealPhase::DiscardingRows;
         Ok(())
     }

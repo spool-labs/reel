@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use reel_api::column_id::ColumnId;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, RootId, VolumeId, WritePlace};
+use reel_api::units::{ByteCount, VolumeId, WritePlace};
 
 use crate::config::{ColumnConfig, StoreConfig};
 use crate::engine::column_info::ColumnInfo;
@@ -18,7 +18,7 @@ use crate::engine::engine_sizing::{
 use crate::engine::engine_state::{EngineState, SEGMENT_NUMBER_BATCH, SlotFile};
 use crate::engine::open_segment::RowQueue;
 use crate::engine::read_path::RecordWant;
-use crate::engine::recovery::RootFindings;
+use crate::engine::recovery::{RootScan, list_roots, scan_roots};
 use crate::engine::row_job::RowJob;
 use crate::engine::seal_job::SealJob;
 use crate::engine::volume::{ClaimState, SyncState, Volume};
@@ -75,19 +75,36 @@ impl<Backend: Io> ReelStore<Backend> {
             root_count += volume.roots.len();
         }
         let sizing = EngineSizing::for_budget(config.memory_budget, root_count);
-        let state = Arc::new(build_state(io, config, &sizing, superblock, locks));
 
-        let mut findings = RootFindings::default();
-        for volume in &state.volumes {
-            for root in 0..volume.roots.len() {
-                let found = state
-                    .recover_root(volume, RootId(root as u8))
-                    .map_err(open_error("recovering a root"))?;
-                findings.highest_place = findings.highest_place.max(found.highest_place);
-                findings.highest_segment = findings.highest_segment.max(found.highest_segment);
-            }
+        // every root is listed before any tail is read, and the table is sized from what they hold
+        let mut roots = Vec::with_capacity(config.volumes.len());
+        for (index, volume) in config.volumes.iter().enumerate() {
+            roots.push((index, volume.roots.clone()));
         }
-        state.resume_order(&findings);
+        let listings = list_roots(&io, &roots).map_err(open_error("listing a root"))?;
+        let record_key = superblock.record_key;
+        let scan = scan_roots(&io, record_key, &listings).map_err(open_error("reading a tail"))?;
+
+        let state = Arc::new(build_state(io, config, &sizing, superblock, locks, &scan));
+        state.damaged_segments.store(scan.damaged, Ordering::Release);
+        let highest_segment = scan.highest_segment;
+        let mut highest_place = scan.highest_place;
+        for found in scan.sealed {
+            let volume = &state.volumes[found.volume];
+            state.install_sealed(volume, found).map_err(open_error("installing a segment"))?;
+        }
+        for found in scan.open {
+            let volume = &state.volumes[found.volume];
+            let place = state.recover_open(volume, found).map_err(open_error("recovering a segment"))?;
+            highest_place = highest_place.max(place);
+        }
+        state.resume_order(highest_place, highest_segment);
+
+        // an open is not a state: the limits say what a run-through would seal, from the same rows
+        for volume in &state.volumes {
+            let mut claims = hold(&volume.claims);
+            state.mark_full_segments(&mut claims, volume);
+        }
 
         let row_job = RowJob {
             state: Arc::clone(&state),
@@ -105,6 +122,11 @@ impl<Backend: Io> ReelStore<Backend> {
             state,
             is_closed: AtomicBool::new(false),
         })
+    }
+
+    /// Count the segments open kept and couldn't read
+    pub fn damaged_segments(&self) -> u64 {
+        self.state.damaged_segments.load(Ordering::Acquire)
     }
 
     /// Refuse a call after close
@@ -130,7 +152,7 @@ impl<Backend: Io> ReelStore<Backend> {
     /// Fill a buffer with the newest value, and say whether the key has one
     pub fn get(&self, column: ColumnId, key: &[u8], buf: &mut Vec<u8>) -> Result<bool, StoreError> {
         self.check_open()?;
-        self.state.get_at(column, key, self.state.read_point(), RecordWant::Whole, buf)
+        self.state.get_latest(column, key, RecordWant::Whole, buf)
     }
 
     /// Fill a buffer with a checked window of the value, and say whether the key has one
@@ -143,7 +165,7 @@ impl<Backend: Io> ReelStore<Backend> {
     ) -> Result<bool, StoreError> {
         self.check_open()?;
         let want = RecordWant::Window(window);
-        self.state.get_at(column, key, self.state.read_point(), want, buf)
+        self.state.get_latest(column, key, want, buf)
     }
 
     /// Check whether the key has a value, without reading the value
@@ -414,6 +436,15 @@ pub fn stored_columns(config: &StoreConfig, _earlier: &[StoredColumn]) -> Vec<St
     columns
 }
 
+/// Give a table the planned room, or more when the roots already hold more
+pub fn table_room(planned: &TableSizing, found: &TableSizing) -> TableSizing {
+    TableSizing {
+        segments_per_shard: planned.segments_per_shard.max(found.segments_per_shard * 2),
+        columns_per_shard: planned.columns_per_shard.max(found.columns_per_shard * 2),
+        blocks_per_shard: planned.blocks_per_shard.max(found.blocks_per_shard * 2),
+    }
+}
+
 /// Allocate and touch everything the engine will hold
 pub fn build_state<Backend: Io>(
     io: Backend,
@@ -421,6 +452,7 @@ pub fn build_state<Backend: Io>(
     sizing: &EngineSizing,
     superblock: Superblock,
     mut locks: Vec<Vec<Backend::Lock>>,
+    scan: &RootScan<Backend::File>,
 ) -> EngineState<Backend> {
     let table_share = config.memory_budget.0 / TABLE_BUDGET_DIVISOR;
     let segments_per_shard = ((table_share / PLANNED_SEGMENT_BYTES) as usize / TABLE_SHARDS).max(8);
@@ -443,7 +475,9 @@ pub fn build_state<Backend: Io>(
             codec: column.codec,
             volume: column.volume,
         });
-        directories[column.id.0 as usize] = Some(ColumnDirectory::new(segments_per_shard * TABLE_SHARDS));
+        let found = scan.sealed.len();
+        let room = (segments_per_shard * TABLE_SHARDS).max(found * 2);
+        directories[column.id.0 as usize] = Some(ColumnDirectory::new(room));
     }
 
     let open_slots = sizing.shard.open_slots;
@@ -467,7 +501,7 @@ pub fn build_state<Backend: Io>(
                 bytes_since_sync: ByteCount(0),
                 next_root: 0,
             }),
-            table: SegmentTable::new(&table_sizing),
+            table: SegmentTable::new(&table_room(&table_sizing, &scan.least_sizing(index))),
             view: AtomicU64::new(0),
             handovers: AtomicU64::new(0),
             sync: Mutex::new(SyncState::default()),
@@ -539,7 +573,8 @@ pub fn build_state<Backend: Io>(
         next_segment: AtomicU64::new(first_number),
         reserved_segment: AtomicU64::new(reserved),
         deletes: AtomicU64::new(0),
-        rows_waiting: AtomicBool::new(false),
+        row_job_idle: AtomicBool::new(false),
+        damaged_segments: AtomicU64::new(0),
         row_task: OnceLock::new(),
         seal_tasks,
     }

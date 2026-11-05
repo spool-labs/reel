@@ -1,6 +1,7 @@
 //! The simulated file system: names, inodes, locks, faults and capacity
 
 use std::collections::BTreeMap;
+use std::fmt::{self, Debug, Formatter};
 use std::io::{Error, ErrorKind, Result};
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,16 @@ pub struct HandleId(pub u64);
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct OperationCount(pub u64);
 
+/// Work a test runs right after the next sync lands
+#[derive(Default)]
+pub struct SyncHook(pub Option<Box<dyn FnOnce() + Send>>);
+
+impl Debug for SyncHook {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SyncHook")
+    }
+}
+
 /// A change to a directory that no directory sync has covered
 #[derive(Clone, Debug)]
 pub enum NameChange {
@@ -52,6 +63,9 @@ pub struct SimulatedDisk {
     pub locks: BTreeMap<PathBuf, ProcessId>,
     pub capacities: BTreeMap<PathBuf, ByteCount>,
     pub failing_syncs: OperationCount,
+    pub failing_writes: OperationCount,
+    pub failing_creates: OperationCount,
+    pub after_sync: SyncHook,
     pub reads: OperationCount,
     pub bytes_read: ByteCount,
     pub operations_until_crash: Option<OperationCount>,
@@ -76,6 +90,9 @@ impl SimulatedDisk {
             locks: BTreeMap::new(),
             capacities: BTreeMap::new(),
             failing_syncs: OperationCount::default(),
+            failing_writes: OperationCount::default(),
+            failing_creates: OperationCount::default(),
+            after_sync: SyncHook::default(),
             reads: OperationCount::default(),
             bytes_read: ByteCount::default(),
             operations_until_crash: None,

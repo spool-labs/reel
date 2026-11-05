@@ -76,6 +76,7 @@ pub struct MaintenanceReport {
     pub segments_unlinked: SegmentCount,
     pub rewrites_reclaiming_nothing: SegmentCount,
     pub corruption_errors: RowCount,
+    pub damaged_segments: SegmentCount,
 }
 
 impl JobReport {
@@ -110,6 +111,7 @@ impl MaintenanceReport {
             segments_unlinked: SegmentCount::default(),
             rewrites_reclaiming_nothing: SegmentCount::default(),
             corruption_errors: RowCount::default(),
+            damaged_segments: SegmentCount::default(),
         }
     }
 }

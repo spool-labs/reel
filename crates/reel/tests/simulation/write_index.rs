@@ -12,6 +12,7 @@ use reel::index::write_row::WriteRow;
 use reel::index::write_shard::{ShardSizing, WalkBound};
 use reel::io::simulated::seeded_random::{Seed, SeededRandom};
 use reel::row_kind::RowKind;
+use reel::segment::segment_tail::SegmentNumber;
 use reel_api::column_id::ColumnId;
 use reel_api::direction::Direction;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
@@ -52,6 +53,7 @@ fn row(place: u64, slot: OpenSlot, kind: RowKind) -> WriteRow {
         length: ByteCount(place),
         kind,
         slot,
+        segment: SegmentNumber(1),
     }
 }
 

@@ -9,14 +9,13 @@ use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_state::EngineState;
 use crate::engine::volume::Volume;
 use crate::index::key_hash::{KeyHash, hash_key};
-use crate::index::open_slots::OpenSlot;
 use crate::index::spot_index::SpotLocation;
 use crate::index::write_row::WriteRow;
 use crate::io::Io;
-use crate::pool::Pooled;
 use crate::record::record_check::RecordIdentity;
 use crate::record::record_reader::{RecordLocation, RecordRead};
 use crate::row_kind::RowKind;
+use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::footer_reader::{FooterAnswer, FooterCaches, FooterQuery, FooterReader, WindowRead};
 use crate::segment::row_block::FooterRow;
 use crate::segment::segment_table::{SegmentPin, WINDOW_BLOCKS};
@@ -84,38 +83,53 @@ impl Located {
 }
 
 impl<Backend: Io> EngineState<Backend> {
-    /// Fill a buffer with a key's newest value at a read point, and say whether it has one
-    pub fn get_at(
+    /// Fill a buffer with a key's newest value, and say whether it has one
+    pub fn get_latest(
         &self,
         column: ColumnId,
         key: &[u8],
-        read_point: WritePlace,
         want: RecordWant,
         buf: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
-        let read = self.key_read(column, key, read_point, false)?;
-        let volume = &self.volumes[read.info.volume.0 as usize];
+        let info = self.column(column)?;
+        let volume = &self.volumes[info.volume.0 as usize];
+
+        // the count comes first: a hand-over only starts past its rows' places, so a read point
+        // taken after the count can't be below a row a hand-over under this count gave out
         let handovers = volume.handover_count();
+        let read = self.key_read(column, key, self.read_point(), false)?;
+        self.get_at(&read, handovers, want, buf)
+    }
+
+    /// Fill a buffer with a key's newest value at a read point, and say whether it has one
+    pub fn get_at(
+        &self,
+        read: &KeyRead,
+        handovers: u64,
+        want: RecordWant,
+        buf: &mut Vec<u8>,
+    ) -> Result<bool, StoreError> {
+        let volume = &self.volumes[read.info.volume.0 as usize];
 
         for _try in 0..MOST_READ_TRIES {
-            let found = self.index.lookup(column, key, read_point, volume.view());
+            let found = self.index.lookup(read.column, read.key, read.read_point, volume.view());
             if let Some(row) = found.row
                 && !found.should_ask_footers
             {
                 if row.kind != RowKind::Value {
                     return Ok(false);
                 }
-                if self.read_open(&read, &row, want, buf)? {
+                if self.read_open(read, &row, want, buf)? {
                     return Ok(true);
                 }
                 continue;
             }
 
-            if let Some(answer) = self.try_spot(volume, &read, found.row, want, buf)? {
+            if let Some(answer) = self.try_spot(volume, read, found.row, want, buf)? {
                 return Ok(answer);
             }
 
-            let sealed = self.search_footers(volume, &read)?;
+            let sealed = self.search_footers(volume, read)?;
             let located = newest_of(found.row, sealed);
             match located {
                 Located::Absent => return Ok(false),
@@ -123,7 +137,7 @@ impl<Backend: Io> EngineState<Backend> {
                     if row.kind != RowKind::Value {
                         return Ok(false);
                     }
-                    if self.read_open(&read, &row, want, buf)? {
+                    if self.read_open(read, &row, want, buf)? {
                         return Ok(true);
                     }
                 },
@@ -131,8 +145,8 @@ impl<Backend: Io> EngineState<Backend> {
                     if row.row.kind != RowKind::Value {
                         return Ok(false);
                     }
-                    if self.read_sealed(volume, &read, &row, want, buf)? {
-                        self.fill_spot(volume, &read, &row, handovers);
+                    if self.read_sealed(volume, read, &row, want, buf)? {
+                        self.fill_spot(volume, read, &row, handovers);
                         return Ok(true);
                     }
                 },
@@ -218,7 +232,7 @@ impl<Backend: Io> EngineState<Backend> {
         want: RecordWant,
         buf: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
-        let Some(pin) = self.slot_files[row.slot.0 as usize].pin() else {
+        let Some(pin) = self.slot_files[row.slot.0 as usize].pin(row.segment) else {
             return Ok(false);
         };
         let location = RecordLocation {
@@ -268,11 +282,10 @@ impl<Backend: Io> EngineState<Backend> {
             key: read.key,
             kind: RowKind::Value,
         };
-        let mut reader = self.record_readers.take(read.hash.0 as usize);
-        let outcome = match want {
+        let outcome = self.record_readers.with(|reader| match want {
             RecordWant::Whole => reader.read_value(file, location, &identity, read.info.codec, buf),
             RecordWant::Window(window) => reader.read_window(file, location, &identity, window, buf),
-        };
+        });
         outcome.map_err(|source| StoreError::Io {
             action: "reading a record",
             source,
@@ -285,7 +298,17 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok(None);
         };
 
-        let mut reader = self.footer_readers.take(read.hash.0 as usize);
+        self.footer_readers.with(|reader| self.search_directory(volume, directory, read, reader))
+    }
+
+    /// Walk a directory's pages, starting over when the list changes between them
+    pub fn search_directory(
+        &self,
+        volume: &Volume<Backend>,
+        directory: &ColumnDirectory,
+        read: &KeyRead,
+        reader: &mut FooterReader,
+    ) -> Result<Option<SealedRow>, StoreError> {
         let mut best: Option<SealedRow> = None;
         let mut skip = 0;
         let mut generation = None;
@@ -304,7 +327,7 @@ impl<Backend: Io> EngineState<Backend> {
 
             let mut outcome = Ok(());
             for segment in &candidates {
-                outcome = self.ask_segment(volume, read, *segment, &mut reader, &mut best);
+                outcome = self.ask_segment(volume, read, *segment, reader, &mut best);
                 if outcome.is_err() {
                     break;
                 }
@@ -325,7 +348,7 @@ impl<Backend: Io> EngineState<Backend> {
         volume: &Volume<Backend>,
         read: &KeyRead,
         segment: SegmentNumber,
-        reader: &mut Pooled<'_, FooterReader>,
+        reader: &mut FooterReader,
         best: &mut Option<SealedRow>,
     ) -> Result<(), StoreError> {
         let Some(pin) = volume.table.pin(segment) else {
@@ -350,7 +373,7 @@ impl<Backend: Io> EngineState<Backend> {
         read: &KeyRead,
         segment: SegmentNumber,
         pin: &SegmentPin<'_, Backend::File>,
-        reader: &mut Pooled<'_, FooterReader>,
+        reader: &mut FooterReader,
     ) -> Result<Option<FooterRow>, StoreError> {
         let caches = FooterCaches {
             filters: &self.filter_cache,
@@ -405,10 +428,6 @@ impl<Backend: Io> EngineState<Backend> {
             .insert_from_read(read.hash, &location, || volume.handover_count() == handovers);
     }
 
-    /// Check a slot belongs to a volume's view, for reports
-    pub fn is_slot_open(&self, volume: &Volume<Backend>, slot: OpenSlot) -> bool {
-        volume.view().contains(slot)
-    }
 }
 
 /// Pick the newer of the index's row and the footers' row

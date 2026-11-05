@@ -1,6 +1,6 @@
 //! Which sealed segments can hold a key of one column, published with no lock on readers' writers
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use reel_api::units::ByteCount;
@@ -24,6 +24,13 @@ pub struct DirectoryEntry {
     pub segment: SegmentNumber,
 }
 
+/// One copy of the list, with the generation it was published under
+#[derive(Clone, Debug, Default)]
+pub struct DirectoryList {
+    pub entries: Vec<DirectoryEntry>,
+    pub generation: u64,
+}
+
 /// What one pass over the list left out
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DirectoryPage {
@@ -45,9 +52,8 @@ pub struct PageFill<'out> {
 /// a group, in two copies with room fixed at open
 #[derive(Debug)]
 pub struct ColumnDirectory {
-    versions: [RwLock<Vec<DirectoryEntry>>; DIRECTORY_VERSIONS],
+    versions: [RwLock<DirectoryList>; DIRECTORY_VERSIONS],
     current: AtomicUsize,
-    generation: AtomicU64,
     writer: Mutex<()>,
 }
 
@@ -70,9 +76,8 @@ impl ColumnDirectory {
     /// Allocate room for a number of segments
     pub fn new(capacity: usize) -> Self {
         Self {
-            versions: [RwLock::new(Vec::with_capacity(capacity)), RwLock::new(Vec::with_capacity(capacity))],
+            versions: [RwLock::new(empty_list(capacity)), RwLock::new(empty_list(capacity))],
             current: AtomicUsize::new(0),
-            generation: AtomicU64::new(0),
             writer: Mutex::new(()),
         }
     }
@@ -81,7 +86,7 @@ impl ColumnDirectory {
     pub fn heap_bytes(&self) -> ByteCount {
         let mut total = 0;
         for version in &self.versions {
-            total += read_list(version).capacity() * size_of::<DirectoryEntry>();
+            total += read_list(version).entries.capacity() * size_of::<DirectoryEntry>();
         }
         ByteCount(total as u64)
     }
@@ -90,8 +95,8 @@ impl ColumnDirectory {
     pub fn candidates(&self, key: &[u8], skip: usize, out: &mut Vec<SegmentNumber>) -> DirectoryPage {
         out.clear();
         let current = self.current.load(Ordering::Acquire);
-        let list = read_list(&self.versions[current]);
-        let generation = self.generation.load(Ordering::Acquire);
+        let copy = read_list(&self.versions[current]);
+        let list = &copy.entries;
         let mut fill = PageFill {
             out,
             skip,
@@ -111,7 +116,7 @@ impl ColumnDirectory {
         }
 
         DirectoryPage {
-            generation,
+            generation: copy.generation,
             skipped_past: fill.seen,
             is_cut: fill.is_cut,
         }
@@ -125,11 +130,12 @@ impl ColumnDirectory {
         {
             let source = read_list(&self.versions[current]);
             let mut target = write_list(&self.versions[next]);
-            target.clear();
+            target.entries.clear();
+            target.generation = source.generation + 1;
 
-            let room = target.capacity();
+            let room = target.entries.capacity();
             let mut kept = 0;
-            for entry in source.iter() {
+            for entry in &source.entries {
                 if !removed.contains(&entry.segment) {
                     kept += 1;
                 }
@@ -138,20 +144,27 @@ impl ColumnDirectory {
                 return false;
             }
 
-            for entry in source.iter() {
+            for entry in &source.entries {
                 if !removed.contains(&entry.segment) {
-                    target.push(*entry);
+                    target.entries.push(*entry);
                 }
             }
             if let Some(entry) = added {
-                let at = target.partition_point(|existing| sort_key(existing) <= sort_key(entry));
-                target.insert(at, *entry);
+                let at = target.entries.partition_point(|existing| sort_key(existing) <= sort_key(entry));
+                target.entries.insert(at, *entry);
             }
-            refresh_groups(&mut target);
+            refresh_groups(&mut target.entries);
         }
-        self.generation.fetch_add(1, Ordering::AcqRel);
         self.current.store(next, Ordering::Release);
         true
+    }
+}
+
+/// Build an empty copy with fixed room
+pub fn empty_list(capacity: usize) -> DirectoryList {
+    DirectoryList {
+        entries: Vec::with_capacity(capacity),
+        generation: 0,
     }
 }
 
@@ -218,7 +231,7 @@ pub fn refresh_reach(run: &mut [DirectoryEntry]) -> KeyPrefix {
 }
 
 /// Read one copy of the list
-pub fn read_list(list: &RwLock<Vec<DirectoryEntry>>) -> RwLockReadGuard<'_, Vec<DirectoryEntry>> {
+pub fn read_list(list: &RwLock<DirectoryList>) -> RwLockReadGuard<'_, DirectoryList> {
     match list.read() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -226,7 +239,7 @@ pub fn read_list(list: &RwLock<Vec<DirectoryEntry>>) -> RwLockReadGuard<'_, Vec<
 }
 
 /// Change one copy of the list
-pub fn write_list(list: &RwLock<Vec<DirectoryEntry>>) -> RwLockWriteGuard<'_, Vec<DirectoryEntry>> {
+pub fn write_list(list: &RwLock<DirectoryList>) -> RwLockWriteGuard<'_, DirectoryList> {
     match list.write() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),

@@ -6,6 +6,7 @@ use reel_api::units::{ByteCount, FileOffset, WritePlace};
 use crate::index::open_slots::OpenSlot;
 use crate::index::write_row::WriteRow;
 use crate::row_kind::RowKind;
+use crate::segment::segment_tail::SegmentNumber;
 
 /// Bytes in one page
 pub const PAGE_BYTES: usize = 8 * 1024;
@@ -199,6 +200,7 @@ impl EntrySlab {
             length: ByteCount(u64::from(self.half(start + LENGTH_AT))),
             kind: RowKind::from_byte(self.bytes[start + KIND_AT] & !NEWER_SEALED_FLAG)?,
             slot: self.slot(address),
+            segment: SegmentNumber(0),
         })
     }
 

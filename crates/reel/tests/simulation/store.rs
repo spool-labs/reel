@@ -25,6 +25,7 @@ const SETTLE_STEPS: u64 = 2_000_000;
 const KILL_WINDOW: Nanoseconds = Nanoseconds(100_000_000);
 const TICK: Nanoseconds = Nanoseconds(5_000_000);
 const MOST_VALUE_BYTES: u64 = 300;
+const SETTLE_TICK: Nanoseconds = Nanoseconds(1_000_000);
 const SEAL_ROWS: u64 = 200;
 const SEAL_STEPS: u64 = 1_000;
 const SEAL_CRASH_POINTS: u64 = 14;
@@ -165,7 +166,11 @@ fn read(store: &Store, key: &[u8]) -> Option<Vec<u8>> {
 fn settle(io: &SimulatedIo) {
     for _step in 0..SETTLE_STEPS {
         if io.step_any().is_none() {
-            return;
+            // a job waiting a moment for a writer or the mark runs again after this
+            io.advance_clock(SETTLE_TICK);
+            if io.step_any().is_none() {
+                return;
+            }
         }
     }
     panic!("jobs never went quiet");

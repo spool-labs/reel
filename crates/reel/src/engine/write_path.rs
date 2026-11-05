@@ -6,32 +6,52 @@ use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, RowCount, WritePlace};
 
 use crate::config::SyncPolicy;
 use crate::engine::claim::Claim;
 use crate::engine::engine_sizing::OPEN_PER_ROOT;
-use crate::engine::engine_state::EngineState;
+use crate::engine::engine_state::{EngineState, SlotData};
 use crate::engine::open_segment::{OpenSegment, SegmentPhase, data_path, rows_path};
 use crate::engine::volume::{ClaimState, Volume};
 use crate::guard::hold;
-use crate::index::key_hash::hash_key;
 use crate::index::open_slots::OpenSlot;
 use crate::index::write_row::WriteRow;
 use crate::io::{Io, IoFile, IoTask};
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::record_check::RecordIdentity;
+use crate::record::record_encoder::RecordEncoder;
 use crate::row_kind::RowKind;
-use crate::rows::row_group::RowEntry;
+use crate::rows::row_group::{RowEntry, row_size};
 
 /// In-flight writes an open segment takes before the volume opens another
 pub const WRITES_PER_OPEN: u32 = 2;
+/// How long a writer waits for a seal to free the write index before it reports the failure
+pub const INDEX_WAIT: Nanoseconds = Nanoseconds(60_000_000_000);
 
 /// What a claim asks for
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClaimRequest {
     pub bytes: ByteCount,
     pub rows: RowCount,
+}
+
+/// A value on its way to a record
+#[derive(Clone, Copy, Debug)]
+pub struct ValueWrite<'bytes> {
+    pub column: ColumnId,
+    pub key: &'bytes [u8],
+    pub value: &'bytes [u8],
+    pub codec: Codec,
+}
+
+/// How an attempt to land a row ended
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LandOutcome {
+    /// The row is in the index and the queue
+    Landed,
+    /// The index has no room, so nothing changed
+    IndexFull,
 }
 
 /// Turn a backend failure into a store error, and a full disk into the volume's own error
@@ -48,25 +68,36 @@ impl<Backend: Io> EngineState<Backend> {
         let info = self.column(column)?;
         self.check_key(column, key)?;
         let volume = &self.volumes[info.volume.0 as usize];
-        check_value_size(volume, value, info.codec, self.sizing.lz4_stored_limit)?;
+        check_value_size(volume, value)?;
         check_writable(volume)?;
 
-        let identity = RecordIdentity {
-            record_key: self.record_key,
+        let write = ValueWrite {
             column,
             key,
-            kind: RowKind::Value,
+            value,
+            codec: info.codec,
         };
         let is_large = info.codec == Codec::Lz4 && value.len() > CHUNK_BYTES;
-        let hint = hash_key(column, key).0 as usize;
-        let mut encoder = if is_large {
-            self.large_encoders.take(hint)
-        } else {
-            self.encoders.take(hint)
+        let encoders = if is_large { &self.large_encoders } else { &self.encoders };
+        encoders.with(|encoder| self.write_encoded(volume, &write, encoder))
+    }
+
+    /// Lay a value out and write it, starting over when the index has no room for its row
+    pub fn write_encoded(
+        &self,
+        volume: &Volume<Backend>,
+        write: &ValueWrite,
+        encoder: &mut RecordEncoder,
+    ) -> Result<(), StoreError> {
+        let identity = RecordIdentity {
+            record_key: self.record_key,
+            column: write.column,
+            key: write.key,
+            kind: RowKind::Value,
         };
-        let Some(shape) = encoder.encode(&identity, info.codec, value) else {
+        let Some(shape) = encoder.encode(&identity, write.codec, write.value) else {
             return Err(StoreError::ValueTooLarge {
-                length: ByteCount(value.len() as u64),
+                length: ByteCount(write.value.len() as u64),
                 limit: self.sizing.lz4_stored_limit,
             });
         };
@@ -76,23 +107,34 @@ impl<Backend: Io> EngineState<Backend> {
             bytes: length,
             rows: RowCount(1),
         };
-        let claim = self.claim(volume, &request)?;
-        let parts = encoder.parts(&shape, value);
-        if let Err(source) = claim.data.write_at(claim.offset, &parts) {
-            return Err(store_error(volume, "writing a record", source));
-        }
-        drop(encoder);
+        loop {
+            let claim = self.claim(volume, &request)?;
+            let parts = encoder.parts(&shape, write.value);
+            if let Err(source) = claim.data.write_at(claim.offset, &parts) {
+                return Err(store_error(volume, "writing a record", source));
+            }
 
-        let row = WriteRow {
-            place: claim.first_place(),
-            offset: claim.offset,
-            length,
-            kind: RowKind::Value,
-            slot: claim.slot,
-        };
-        self.land_row(column, key, &row)?;
-        claim.land();
-        self.after_write(volume, length)
+            let row = WriteRow {
+                place: claim.first_place(),
+                offset: claim.offset,
+                length,
+                kind: RowKind::Value,
+                slot: claim.slot,
+                segment: claim.segment,
+            };
+            let slot = claim.slot;
+            match self.land_row(write.column, write.key, &row)? {
+                LandOutcome::Landed => {
+                    claim.land();
+                    return self.after_write(volume, length);
+                },
+                LandOutcome::IndexFull => {
+                    // the claim ends here, so the seal that makes room doesn't wait for this writer
+                    drop(claim);
+                    self.wait_for_index(write.column, write.key, slot)?;
+                },
+            }
+        }
     }
 
     /// Write a grave, unless the key's newest row in the index already is one
@@ -100,9 +142,7 @@ impl<Backend: Io> EngineState<Backend> {
         let info = self.column(column)?;
         self.check_key(column, key)?;
         let volume = &self.volumes[info.volume.0 as usize];
-        if volume.has_failed() {
-            return Err(StoreError::VolumeFailed { volume: volume.id });
-        }
+        check_writable(volume)?;
         if self.index.is_newest_grave(column, key, self.read_point(), volume.view()) {
             return Ok(());
         }
@@ -111,18 +151,29 @@ impl<Backend: Io> EngineState<Backend> {
             bytes: ByteCount(0),
             rows: RowCount(1),
         };
-        let claim = self.claim(volume, &request)?;
-        let row = WriteRow {
-            place: claim.first_place(),
-            offset: claim.offset,
-            length: ByteCount(0),
-            kind: RowKind::Grave,
-            slot: claim.slot,
-        };
-        self.land_row(column, key, &row)?;
-        claim.land();
-        self.deletes.fetch_add(1, Ordering::Relaxed);
-        self.after_write(volume, ByteCount(0))
+        loop {
+            let claim = self.claim(volume, &request)?;
+            let row = WriteRow {
+                place: claim.first_place(),
+                offset: claim.offset,
+                length: ByteCount(0),
+                kind: RowKind::Grave,
+                slot: claim.slot,
+                segment: claim.segment,
+            };
+            let slot = claim.slot;
+            match self.land_row(column, key, &row)? {
+                LandOutcome::Landed => {
+                    claim.land();
+                    self.deletes.fetch_add(1, Ordering::Relaxed);
+                    return self.after_write(volume, ByteCount(0));
+                },
+                LandOutcome::IndexFull => {
+                    drop(claim);
+                    self.wait_for_index(column, key, slot)?;
+                },
+            }
+        }
     }
 
     /// Refuse a key of the wrong width
@@ -137,10 +188,15 @@ impl<Backend: Io> EngineState<Backend> {
         })
     }
 
-    /// Put a row in the write index and the rows queue, waiting for a seal when either is full
-    pub fn land_row(&self, column: ColumnId, key: &[u8], row: &WriteRow) -> Result<(), StoreError> {
-        while !self.index.insert(column, key, row) {
-            self.io.pause();
+    /// Put a row in the write index and the rows queue, or in neither
+    pub fn land_row(&self, column: ColumnId, key: &[u8], row: &WriteRow) -> Result<LandOutcome, StoreError> {
+        let size = row_size(key.len());
+        self.reserve_row(row.slot, size)?;
+
+        let queue = &self.queues[row.slot.0 as usize];
+        if !self.index.insert(column, key, row) {
+            hold(queue).reserved -= size;
+            return Ok(LandOutcome::IndexFull);
         }
 
         let entry = RowEntry {
@@ -151,20 +207,59 @@ impl<Backend: Io> EngineState<Backend> {
             length: row.length,
             kind: row.kind,
         };
-        let queue = &self.queues[row.slot.0 as usize];
+        {
+            let mut guard = hold(queue);
+            guard.reserved -= size;
+            // the reservation holds this room, whichever group is filling by now
+            guard.filling.push(&entry);
+        }
+        self.wake_row_job();
+        Ok(LandOutcome::Landed)
+    }
+
+    /// Hold room for a row in the group filling, sending the group out when it's full
+    pub fn reserve_row(&self, slot: OpenSlot, size: usize) -> Result<(), StoreError> {
+        let queue = &self.queues[slot.0 as usize];
         loop {
-            if hold(queue).filling.push(&entry) {
-                if !self.rows_waiting.swap(true, Ordering::AcqRel)
-                    && let Some(task) = self.row_task.get()
-                {
-                    task.wake();
+            {
+                let mut guard = hold(queue);
+                if guard.filling.has_room(guard.reserved + size) {
+                    guard.reserved += size;
+                    return Ok(());
                 }
-                return Ok(());
             }
-            self.write_out(row.slot).map_err(|source| StoreError::Io {
+            self.write_out(slot).map_err(|source| StoreError::Io {
                 action: "writing rows",
                 source,
             })?;
+        }
+    }
+
+    /// Wake the row job, which only sleeps with no deadline when it found nothing to do
+    pub fn wake_row_job(&self) {
+        if self.row_job_idle.swap(false, Ordering::AcqRel)
+            && let Some(task) = self.row_task.get()
+        {
+            task.wake();
+        }
+    }
+
+    /// Start seals and wait for the write index to have room, or report that it never did
+    pub fn wait_for_index(&self, column: ColumnId, key: &[u8], slot: OpenSlot) -> Result<(), StoreError> {
+        let deadline = self.io.now().0.saturating_add(INDEX_WAIT.0);
+        loop {
+            for volume in &self.volumes {
+                self.seal_fullest(volume);
+            }
+            if self.index.has_room(column, key, slot) {
+                return Ok(());
+            }
+            if self.io.now().0 > deadline {
+                return Err(StoreError::Io {
+                    action: "waiting for the write index",
+                    source: Error::other("no seal freed room in the write index"),
+                });
+            }
             self.io.pause();
         }
     }
@@ -178,13 +273,21 @@ impl<Backend: Io> EngineState<Backend> {
         loop {
             let mut claims = hold(&volume.claims);
             if let Some(index) = pick_segment(&claims, volume, request) {
+                let Some(ticket) = self.order.try_claim(request.rows) else {
+                    // the ring frees when claims end, and ending one needs this lock
+                    drop(claims);
+                    self.io.pause();
+                    continue;
+                };
+
                 let segment = &mut claims.open[index];
-                let ticket = self.order.claim(request.rows);
                 let offset = segment.write_end;
                 segment.write_end = FileOffset(offset.0 + request.bytes.0);
                 segment.row_count = RowCount(segment.row_count.0 + request.rows.0);
                 segment.in_flight += 1;
                 segment.lowest_place = segment.lowest_place.min(ticket.first);
+                segment.highest_place = segment.highest_place.max(ticket.last);
+                let number = segment.number;
                 let data = segment.data.clone();
                 let slot = segment.slot;
                 self.slot_files[slot.0 as usize].pins.fetch_add(1, Ordering::AcqRel);
@@ -193,6 +296,7 @@ impl<Backend: Io> EngineState<Backend> {
                     state: self,
                     volume,
                     slot,
+                    segment: number,
                     data,
                     offset,
                     ticket,
@@ -227,39 +331,24 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
-    /// Start seals when the open segments together pass their limits
+    /// Start a seal when the open segments together pass their limits
     pub fn mark_full_segments(&self, claims: &mut ClaimState<Backend::File>, volume: &Volume<Backend>) {
         let mut rows = 0;
         let mut bytes = 0;
-        let mut fullest: Option<usize> = None;
-        for (index, segment) in claims.open.iter().enumerate() {
-            if segment.phase != SegmentPhase::Taking {
-                continue;
-            }
-            rows += segment.row_count.0;
-            bytes += segment.write_end.0;
-            let is_fuller = match fullest {
-                Some(best) => segment.write_end > claims.open[best].write_end,
-                None => true,
-            };
-            if is_fuller {
-                fullest = Some(index);
+        for segment in &claims.open {
+            if segment.phase == SegmentPhase::Taking {
+                rows += segment.row_count.0;
+                bytes += segment.write_end.0;
             }
         }
 
-        if (rows >= volume.segment_rows.0 || bytes >= volume.segment_bytes.0)
-            && let Some(index) = fullest
-        {
-            claims.open[index].phase = SegmentPhase::Sealing;
-            if let Some(task) = self.seal_tasks[volume.id.0 as usize].get() {
-                task.wake();
-            }
+        if rows >= volume.segment_rows.0 || bytes >= volume.segment_bytes.0 {
+            self.mark_fullest(claims, volume);
         }
     }
 
-    /// Mark a volume's fullest taking segment to seal
-    pub fn seal_fullest(&self, volume: &Volume<Backend>) {
-        let mut claims = hold(&volume.claims);
+    /// Mark the fullest taking segment to seal
+    pub fn mark_fullest(&self, claims: &mut ClaimState<Backend::File>, volume: &Volume<Backend>) {
         let mut fullest: Option<usize> = None;
         for (index, segment) in claims.open.iter().enumerate() {
             if segment.phase == SegmentPhase::Taking && segment.row_count.0 > 0 {
@@ -281,6 +370,25 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
+    /// Mark one open segment to seal
+    pub fn seal_slot(&self, volume: &Volume<Backend>, slot: OpenSlot) {
+        let mut claims = hold(&volume.claims);
+        for segment in &mut claims.open {
+            if segment.slot == slot {
+                segment.phase = SegmentPhase::Sealing;
+            }
+        }
+        if let Some(task) = self.seal_tasks[volume.id.0 as usize].get() {
+            task.wake();
+        }
+    }
+
+    /// Mark a volume's fullest taking segment to seal
+    pub fn seal_fullest(&self, volume: &Volume<Backend>) {
+        let mut claims = hold(&volume.claims);
+        self.mark_fullest(&mut claims, volume);
+    }
+
     /// Create a segment's files outside every lock, or return nothing when no slot is free yet
     pub fn create_segment(
         &self,
@@ -300,32 +408,62 @@ impl<Backend: Io> EngineState<Backend> {
         let Some(slot) = self.take_slot() else {
             return Ok(None);
         };
-        let number = self.next_segment_number()?;
-        let reserved = ByteCount(volume.segment_bytes.0.max(request.bytes.0));
-        let reserved = if request.bytes.0 > 0 { reserved } else { ByteCount(0) };
-
-        let data = self
-            .io
-            .create_file(&data_path(path, number), reserved)
-            .map_err(|source| store_error(volume, "creating a segment", source));
-        let data = match data {
-            Ok(data) => data,
+        match self.create_files(volume, root, slot, request) {
+            Ok(segment) => Ok(Some(segment)),
             Err(error) => {
                 self.free_slot(slot);
-                return Err(error);
+                Err(error)
+            },
+        }
+    }
+
+    /// Create the data and rows files, leaving neither behind on a failure
+    pub fn create_files(
+        &self,
+        volume: &Volume<Backend>,
+        root: RootId,
+        slot: OpenSlot,
+        request: &ClaimRequest,
+    ) -> Result<OpenSegment<Backend::File>, StoreError> {
+        let path = &volume.roots[root.0 as usize];
+        let number = self.next_segment_number()?;
+        let reserved = if request.bytes.0 > 0 {
+            ByteCount(volume.segment_bytes.0.max(request.bytes.0))
+        } else {
+            ByteCount(0)
+        };
+
+        let data_file = data_path(path, number);
+        let data = self
+            .io
+            .create_file(&data_file, reserved)
+            .map_err(|source| store_error(volume, "creating a segment", source))?;
+
+        let rows_file = rows_path(path, number);
+        let rows = match self.io.create_file(&rows_file, ByteCount(0)) {
+            Ok(rows) => rows,
+            Err(source) => {
+                self.io.close_file(data);
+                // the file is empty, and open drops an empty file it finds
+                let _removed = self.io.remove_file(&data_file);
+                return Err(store_error(volume, "creating a rows file", source));
             },
         };
-        let rows = self
-            .io
-            .create_file(&rows_path(path, number), ByteCount(0))
-            .map_err(|source| store_error(volume, "creating a rows file", source))?;
-        self.io
-            .sync_directory(path)
-            .map_err(|source| store_error(volume, "syncing a root", source))?;
+
+        if let Err(source) = self.io.sync_directory(path) {
+            self.io.close_file(data);
+            self.io.close_file(rows);
+            let _removed = self.io.remove_file(&data_file);
+            let _removed = self.io.remove_file(&rows_file);
+            return Err(store_error(volume, "syncing a root", source));
+        }
 
         hold(&self.queues[slot.0 as usize]).reset(FileOffset(0), FileOffset(0));
-        self.slot_files[slot.0 as usize].set(Some(data.clone()));
-        Ok(Some(OpenSegment {
+        self.slot_files[slot.0 as usize].set(Some(SlotData {
+            segment: number,
+            file: data.clone(),
+        }));
+        Ok(OpenSegment {
             number,
             slot,
             root,
@@ -336,7 +474,8 @@ impl<Backend: Io> EngineState<Backend> {
             row_count: RowCount(0),
             in_flight: 0,
             lowest_place: WritePlace(u64::MAX),
-        }))
+            highest_place: WritePlace(0),
+        })
     }
 
     /// Run the volume's sync policy after a write
@@ -406,15 +545,13 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
-    /// Sync each open segment: records first, then the rows that list them
+    /// Sync each open segment through its writing turn
     pub fn run_sync(&self, volume: &Volume<Backend>) -> Result<(), Error> {
-        let mut slot = 0;
-        while let Some(found) = next_open(volume, slot) {
-            let (next, segment_slot, data, rows) = found;
-            slot = next;
-
-            data.sync()?;
-            self.write_out_turn(segment_slot, &rows, true)?;
+        let mut after = 0;
+        while let Some(found) = next_open(volume, after) {
+            let (next, slot, data, rows) = found;
+            after = next;
+            self.write_out_turn(slot, &rows, Some(&data))?;
         }
         Ok(())
     }
@@ -424,7 +561,7 @@ impl<Backend: Io> EngineState<Backend> {
         let Some(rows) = self.rows_file(slot) else {
             return Ok(());
         };
-        self.write_out_turn(slot, &rows, false)
+        self.write_out_turn(slot, &rows, None)
     }
 
     /// Find the rows file of an open slot
@@ -440,53 +577,92 @@ impl<Backend: Io> EngineState<Backend> {
         None
     }
 
-    /// Take the slot's writing turn, send its rows, and sync them when asked
-    pub fn write_out_turn(&self, slot: OpenSlot, rows: &Backend::File, should_sync: bool) -> Result<(), Error> {
+    /// Take the slot's writing turn and send its rows, in a sync when given the data file
+    pub fn write_out_turn(&self, slot: OpenSlot, rows: &Backend::File, data: Option<&Backend::File>) -> Result<(), Error> {
         let index = slot.0 as usize;
-        let mut spare = loop {
-            let mut queue = hold(&self.queues[index]);
-            if !queue.is_writing {
-                queue.is_writing = true;
-                let mut spare_slot = hold(&self.spare_groups[index]);
-                let Some(mut spare) = spare_slot.take() else {
-                    queue.is_writing = false;
-                    return Err(Error::other("rows queue lost its spare group"));
-                };
-                mem::swap(&mut queue.filling, &mut spare);
-                break spare;
+        loop {
+            {
+                let mut queue = hold(&self.queues[index]);
+                if !queue.is_writing {
+                    queue.is_writing = true;
+                    break;
+                }
             }
-            drop(queue);
             self.io.pause();
+        }
+
+        let mut outcome = self.send_group(slot, rows, data);
+        if outcome.is_ok() && self.has_left_over_rows(slot) {
+            outcome = self.send_group(slot, rows, data);
+        }
+        hold(&self.queues[index]).is_writing = false;
+        outcome
+    }
+
+    /// Check rows are waiting beyond the group just sent
+    pub fn has_left_over_rows(&self, slot: OpenSlot) -> bool {
+        !hold(&self.queues[slot.0 as usize]).filling.is_empty()
+    }
+
+    /// Send one group: fix its rows first, then sync their records, then write and sync the rows
+    pub fn send_group(&self, slot: OpenSlot, rows: &Backend::File, data: Option<&Backend::File>) -> Result<(), Error> {
+        let index = slot.0 as usize;
+        let mut group = {
+            let mut spare_slot = hold(&self.spare_groups[index]);
+            let Some(group) = spare_slot.take() else {
+                return Err(Error::other("rows queue lost its spare group"));
+            };
+            group
         };
 
         let (rows_end, synced_through) = {
-            let queue = hold(&self.queues[index]);
+            let mut queue = hold(&self.queues[index]);
+            // a group a failed write left behind goes first, and whole
+            if group.is_empty() {
+                mem::swap(&mut queue.filling, &mut group);
+            }
             (queue.rows_end, queue.synced_through)
         };
 
         let mut outcome = Ok(());
+        if let Some(data) = data {
+            // only records of rows already fixed in this group count as covered
+            outcome = data.sync();
+        }
+
         let mut new_end = rows_end;
-        if !spare.is_empty() {
-            let bytes = spare.finish(synced_through, self.record_key);
+        if outcome.is_ok() && !group.is_empty() {
+            let bytes = group.finish(synced_through, self.record_key);
             let parts = [IoSlice::new(bytes)];
             outcome = rows.write_at(rows_end, &parts);
             new_end = FileOffset(rows_end.0 + bytes.len() as u64);
         }
-        if outcome.is_ok() && should_sync {
+        if outcome.is_ok() && data.is_some() {
             outcome = rows.sync();
         }
 
-        spare.clear();
-        *hold(&self.spare_groups[index]) = Some(spare);
-        let mut queue = hold(&self.queues[index]);
-        queue.is_writing = false;
         if outcome.is_ok() {
+            group.clear();
+            let mut queue = hold(&self.queues[index]);
             queue.rows_end = new_end;
-            if should_sync {
+            if data.is_some() {
                 queue.synced_through = new_end;
             }
         }
+        *hold(&self.spare_groups[index]) = Some(group);
         outcome
+    }
+
+    /// Check a slot has rows that haven't reached the kernel
+    pub fn has_waiting_rows(&self, slot: OpenSlot) -> bool {
+        let index = slot.0 as usize;
+        if !hold(&self.queues[index]).filling.is_empty() {
+            return true;
+        }
+        match hold(&self.spare_groups[index]).as_ref() {
+            Some(group) => !group.is_empty(),
+            None => true,
+        }
     }
 }
 
@@ -536,13 +712,8 @@ pub fn pick_segment<Backend: Io>(
     best
 }
 
-/// Refuse a value the volume can't hold
-pub fn check_value_size<Backend: Io>(
-    volume: &Volume<Backend>,
-    value: &[u8],
-    codec: Codec,
-    lz4_limit: ByteCount,
-) -> Result<(), StoreError> {
+/// Refuse a value larger than a segment of its volume
+pub fn check_value_size<Backend: Io>(volume: &Volume<Backend>, value: &[u8]) -> Result<(), StoreError> {
     let length = ByteCount(value.len() as u64);
     if length > volume.segment_bytes {
         return Err(StoreError::ValueTooLarge {
@@ -550,7 +721,6 @@ pub fn check_value_size<Backend: Io>(
             limit: volume.segment_bytes,
         });
     }
-    let _codec_cap_is_on_stored_bytes = (codec, lz4_limit);
     Ok(())
 }
 
@@ -561,4 +731,3 @@ pub fn check_writable<Backend: Io>(volume: &Volume<Backend>) -> Result<(), Store
     }
     Ok(())
 }
-

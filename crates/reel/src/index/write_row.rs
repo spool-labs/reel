@@ -4,6 +4,7 @@ use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::index::open_slots::OpenSlot;
 use crate::row_kind::RowKind;
+use crate::segment::segment_tail::SegmentNumber;
 
 /// A row's place in the write order and where its record sits
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13,6 +14,7 @@ pub struct WriteRow {
     pub length: ByteCount,
     pub kind: RowKind,
     pub slot: OpenSlot,
+    pub segment: SegmentNumber,
 }
 
 /// What the write index says about a key

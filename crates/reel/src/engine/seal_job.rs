@@ -1,11 +1,11 @@
 //! Seal: an open segment's footer, its hand-over, and the one atomic switch to sealed
 
-use std::io::{Error, Result};
+use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
-use reel_api::units::{FileOffset, RootId, RowCount, WritePlace};
+use reel_api::units::{FileOffset, Nanoseconds, RootId, RowCount, WritePlace};
 
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::engine_state::EngineState;
@@ -26,6 +26,10 @@ use crate::segment::segment_tail::{BlockCount, SegmentNumber};
 
 /// Rows one step of a seal handles
 pub const SEAL_STEP_ROWS: u64 = 1_024;
+/// How long a seal waits before it tries a failed step again
+pub const SEAL_RETRY: Nanoseconds = Nanoseconds(100_000_000);
+/// How long a seal sleeps while writers land or the mark catches up
+pub const SEAL_WAIT: Nanoseconds = Nanoseconds(100_000);
 /// Row blocks one segment can have
 pub const MOST_SEGMENT_BLOCKS: BlockCount = BlockCount(64 * 1024);
 
@@ -40,6 +44,7 @@ pub struct SealTarget<File> {
     pub data_end: FileOffset,
     pub row_count: RowCount,
     pub lowest_place: WritePlace,
+    pub highest_place: WritePlace,
 }
 
 /// How far a seal has gone
@@ -53,6 +58,8 @@ pub enum SealPhase {
     Writing,
     /// The footer is durable, and the segment goes into the table
     Installing,
+    /// The table has the segment, and every lower place has yet to reach the index
+    AwaitingMark,
     /// Rows go to the spot cache
     HandingOver,
     /// The switch has happened, and the write index lets go
@@ -112,6 +119,7 @@ impl<Backend: Io> SealJob<Backend> {
                     data_end: segment.write_end,
                     row_count: segment.row_count,
                     lowest_place: segment.lowest_place,
+                    highest_place: segment.highest_place,
                 });
                 return true;
             }
@@ -228,13 +236,24 @@ impl<Backend: Io> SealJob<Backend> {
         }
 
         self.discard_rows(target)?;
+        self.phase = SealPhase::AwaitingMark;
+        Ok(())
+    }
+
+    /// Start the hand-over once the mark passes the segment, so every lower place is in the index
+    /// and no read that starts from here can have a read point below this segment's rows
+    pub fn start_hand_over(&mut self, target: &SealTarget<Backend::File>) {
+        let state = Arc::clone(&self.state);
+        let volume = &state.volumes[self.volume];
+        if state.order.mark() < target.highest_place {
+            return;
+        }
 
         // a get that started before this count can't fill the spot cache with an older row
         volume.handovers.fetch_add(1, Ordering::AcqRel);
         self.walk.start(&state.index, target.slot);
         self.last_column = None;
         self.phase = SealPhase::HandingOver;
-        Ok(())
     }
 
     /// Give a step's rows to the spot cache: every row replaces or removes its key's slot
@@ -314,6 +333,33 @@ impl<Backend: Io> SealJob<Backend> {
         Ok(())
     }
 
+    /// Check the seal can do nothing until writers land or the mark moves
+    pub fn is_waiting(&self, target: &SealTarget<Backend::File>) -> bool {
+        match self.phase {
+            SealPhase::Draining => !self.is_drained(target.slot),
+            SealPhase::AwaitingMark => true,
+            SealPhase::Cleaning => self.state.slot_files[target.slot.0 as usize].pin_count() > 0,
+            SealPhase::Idle | SealPhase::Writing | SealPhase::Installing | SealPhase::HandingOver => false,
+        }
+    }
+
+    /// Decide what a failed step leaves: a retry from the footer's start, or a failed volume
+    pub fn after_failure(&mut self, error: &Error) -> JobStep {
+        if self.phase == SealPhase::Writing {
+            self.phase = SealPhase::Draining;
+        }
+        let is_retryable = error.kind() == ErrorKind::StorageFull || self.phase == SealPhase::Installing;
+        if !is_retryable {
+            self.volume().fail();
+            return JobStep::Idle;
+        }
+
+        let now = self.state.io.now();
+        JobStep::IdleUntil {
+            deadline: Nanoseconds(now.0 + SEAL_RETRY.0),
+        }
+    }
+
     /// Run one bounded step of the seal in progress
     pub fn advance(&mut self, target: &SealTarget<Backend::File>) -> Result<()> {
         match self.phase {
@@ -332,6 +378,10 @@ impl<Backend: Io> SealJob<Backend> {
             },
             SealPhase::Writing => self.write_rows(target),
             SealPhase::Installing => self.install(target),
+            SealPhase::AwaitingMark => {
+                self.start_hand_over(target);
+                Ok(())
+            },
             SealPhase::HandingOver => {
                 self.hand_over(target);
                 Ok(())
@@ -349,6 +399,11 @@ impl<Backend: Io> SealJob<Backend> {
 
 impl<Backend: Io> Job for SealJob<Backend> {
     fn step(&mut self) -> JobStep {
+        // a volume that failed makes no claim of durability until it's reopened
+        if self.volume().has_failed() {
+            return JobStep::Idle;
+        }
+
         if self.phase == SealPhase::Idle {
             if !self.pick_target() {
                 return JobStep::Idle;
@@ -360,10 +415,16 @@ impl<Backend: Io> Job for SealJob<Backend> {
             self.phase = SealPhase::Idle;
             return JobStep::Worked;
         };
-        // a failed step keeps the rows file and the open state, so the next open recovers the segment
-        if self.advance(&target).is_err() {
-            return JobStep::Idle;
+        // a failed step keeps the rows file and the open state, so nothing is lost by trying again
+        match self.advance(&target) {
+            Ok(()) if self.is_waiting(&target) => {
+                let now = self.state.io.now();
+                JobStep::IdleUntil {
+                    deadline: Nanoseconds(now.0 + SEAL_WAIT.0),
+                }
+            },
+            Ok(()) => JobStep::Worked,
+            Err(error) => self.after_failure(&error),
         }
-        JobStep::Worked
     }
 }

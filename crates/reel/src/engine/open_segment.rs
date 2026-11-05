@@ -37,6 +37,7 @@ pub struct OpenSegment<File> {
     pub row_count: RowCount,
     pub in_flight: u32,
     pub lowest_place: WritePlace,
+    pub highest_place: WritePlace,
 }
 
 /// The rows of a segment waiting to reach the kernel
@@ -46,6 +47,7 @@ pub struct RowQueue {
     pub rows_end: FileOffset,
     pub synced_through: FileOffset,
     pub is_writing: bool,
+    pub reserved: usize,
 }
 
 impl RowQueue {
@@ -56,6 +58,7 @@ impl RowQueue {
             rows_end: FileOffset(0),
             synced_through: FileOffset(0),
             is_writing: false,
+            reserved: 0,
         }
     }
 
@@ -65,6 +68,7 @@ impl RowQueue {
         self.rows_end = rows_end;
         self.synced_through = synced_through;
         self.is_writing = false;
+        self.reserved = 0;
     }
 }
 

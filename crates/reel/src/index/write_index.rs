@@ -84,6 +84,12 @@ impl WriteIndex {
         is_clean
     }
 
+    /// Check a key's shard could take a row in a slot right now
+    pub fn has_room(&self, column: ColumnId, key: &[u8], slot: OpenSlot) -> bool {
+        let hash = hash_key(column, key);
+        self.read_shard(shard_of(hash)).has_room(slot, key.len())
+    }
+
     /// Find a slot's highest key in a column, in any shard
     pub fn highest_key(&self, slot: OpenSlot, column: ColumnId, highest: &mut Vec<u8>) {
         highest.clear();

@@ -9,6 +9,7 @@ use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::io::Io;
+use crate::segment::segment_tail::SegmentNumber;
 use crate::write_order::{Ticket, TicketState};
 
 /// A byte range and a run of places, claimed together
@@ -16,6 +17,7 @@ pub struct Claim<'state, Backend: Io> {
     pub state: &'state EngineState<Backend>,
     pub volume: &'state Volume<Backend>,
     pub slot: OpenSlot,
+    pub segment: SegmentNumber,
     pub data: Backend::File,
     pub offset: FileOffset,
     pub ticket: Ticket,
@@ -29,11 +31,18 @@ impl<Backend: Io> Claim<'_, Backend> {
     }
 
     /// End the claim with its rows in the index, and wait until a later read sees them
-    pub fn land(mut self) {
+    pub fn land(self) {
+        let state = self.state;
+        let ticket = self.ticket;
+        self.finish();
+        state.order.wait_visible(&ticket);
+    }
+
+    /// End the claim with its rows in the index, leaving the wait for the mark to the caller
+    pub fn finish(mut self) {
         self.state.order.finish(&self.ticket, TicketState::Landed);
         self.is_landed = true;
         self.release();
-        self.state.order.wait_visible(&self.ticket);
     }
 
     /// Let the segment seal once its last claim is done

@@ -119,6 +119,11 @@ impl IoFile for SimulatedFile {
             return Err(error);
         }
 
+        if disk.failing_writes.0 > 0 {
+            disk.failing_writes = OperationCount(disk.failing_writes.0 - 1);
+            return Err(Error::other("simulated write failure"));
+        }
+
         let Some(image) = disk.inodes.get(&self.inode) else {
             return Err(Error::from(ErrorKind::NotFound));
         };
@@ -148,6 +153,11 @@ impl IoFile for SimulatedFile {
             return Err(Error::other("simulated sync failure"));
         }
         image.sync();
+        let hook = disk.after_sync.0.take();
+        drop(disk);
+        if let Some(hook) = hook {
+            hook();
+        }
         Ok(())
     }
 

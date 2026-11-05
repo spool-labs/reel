@@ -31,10 +31,17 @@ use crate::write_order::WriteOrder;
 /// Segment numbers one superblock write reserves
 pub const SEGMENT_NUMBER_BATCH: u64 = 1_024;
 
+/// The segment in a slot and its data file
+#[derive(Clone, Debug)]
+pub struct SlotData<File> {
+    pub segment: SegmentNumber,
+    pub file: File,
+}
+
 /// One open slot's file, kept under a short lock
 #[derive(Debug)]
 pub struct SlotFile<File> {
-    pub data: RwLock<Option<File>>,
+    pub data: RwLock<Option<SlotData<File>>>,
     pub pins: AtomicU32,
 }
 
@@ -64,7 +71,8 @@ pub struct EngineState<Backend: Io> {
     pub next_segment: AtomicU64,
     pub reserved_segment: AtomicU64,
     pub deletes: AtomicU64,
-    pub rows_waiting: AtomicBool,
+    pub row_job_idle: AtomicBool,
+    pub damaged_segments: AtomicU64,
     pub row_task: OnceLock<Backend::Task>,
     pub seal_tasks: Vec<OnceLock<Backend::Task>>,
 }
@@ -91,19 +99,23 @@ impl<File: Clone> SlotFile<File> {
         }
     }
 
-    /// Hold the slot's file for a read, or return nothing when the slot has moved on
-    pub fn pin(&self) -> Option<SlotPin<'_, File>> {
+    /// Hold a segment's file for a read, or return nothing when the slot has moved on from it
+    pub fn pin(&self, segment: SegmentNumber) -> Option<SlotPin<'_, File>> {
         let guard = match self.data.read() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let file = guard.clone()?;
+        let held = guard.as_ref()?;
+        if held.segment != segment {
+            return None;
+        }
+        let file = held.file.clone();
         self.pins.fetch_add(1, Ordering::AcqRel);
         Some(SlotPin { file, slot: self })
     }
 
     /// Set the slot's file
-    pub fn set(&self, file: Option<File>) {
+    pub fn set(&self, file: Option<SlotData<File>>) {
         let mut guard = match self.data.write() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),

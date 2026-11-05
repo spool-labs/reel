@@ -1,122 +1,80 @@
 //! Fixed buffers shared by every thread: a caller takes one or waits
 
-use std::ops::{Deref, DerefMut};
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::{Condvar, Mutex};
 
 use reel_api::units::ByteCount;
 
 use crate::guard::hold;
 
-/// Wakes a waiter when dropped, which runs after the item's lock has gone
-#[derive(Debug)]
-pub struct Freed<'pool, Item> {
-    pool: &'pool Pool<Item>,
-}
-
-/// A pooled item, handed back when dropped
-#[derive(Debug)]
-pub struct Pooled<'pool, Item> {
-    guard: MutexGuard<'pool, Item>,
-    _freed: Freed<'pool, Item>,
-}
-
-/// A fixed set of items
+/// A fixed set of items, each owned by its user while in use so no lock spans a read
 #[derive(Debug)]
 pub struct Pool<Item> {
-    items: Vec<Mutex<Item>>,
-    waiters: Mutex<u64>,
+    free: Mutex<Vec<Item>>,
     freed: Condvar,
 }
 
 impl<Item> Pool<Item> {
     /// Build a pool from its items
     pub fn new(items: Vec<Item>) -> Self {
-        let mut slots = Vec::with_capacity(items.len());
-        for item in items {
-            slots.push(Mutex::new(item));
-        }
         Self {
-            items: slots,
-            waiters: Mutex::new(0),
+            free: Mutex::new(items),
             freed: Condvar::new(),
         }
     }
 
-    /// Count the items
-    pub fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    /// Check whether the pool holds no items
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    /// Add up what the items hold
+    /// Add up what the free items hold
     pub fn heap_bytes(&self, measure: fn(&Item) -> ByteCount) -> ByteCount {
         let mut total = 0;
-        for slot in &self.items {
-            total += measure(&hold(slot)).0;
+        for item in hold(&self.free).iter() {
+            total += measure(item).0;
         }
         ByteCount(total)
     }
 
-    /// Take a free item, starting the search at a hint so threads spread out
-    pub fn take(&self, hint: usize) -> Pooled<'_, Item> {
-        loop {
-            if let Some(item) = self.try_take(hint) {
-                return item;
-            }
+    /// Run some work with an item, waiting for one when all are out
+    pub fn with<Answer>(&self, work: impl FnOnce(&mut Item) -> Answer) -> Answer {
+        let mut item = self.take();
 
-            let mut waiters = hold(&self.waiters);
-            *waiters += 1;
-            if let Some(item) = self.try_take(hint) {
-                *waiters -= 1;
+        // a panic in the work must still hand the item back, or the pool would shrink for good
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| work(&mut item)));
+        hold(&self.free).push(item);
+        self.freed.notify_one();
+
+        match outcome {
+            Ok(answer) => answer,
+            Err(payload) => panic::resume_unwind(payload),
+        }
+    }
+
+    /// Take a free item, waiting for one when all are out
+    pub fn take(&self) -> Item {
+        let mut free = hold(&self.free);
+        loop {
+            if let Some(item) = free.pop() {
                 return item;
             }
-            waiters = match self.freed.wait(waiters) {
+            free = match self.freed.wait(free) {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            *waiters -= 1;
         }
-    }
-
-    /// Take a free item if one is free right now
-    pub fn try_take(&self, hint: usize) -> Option<Pooled<'_, Item>> {
-        let count = self.items.len();
-        for step in 0..count {
-            let slot = &self.items[(hint + step) % count];
-            if let Ok(guard) = slot.try_lock() {
-                return Some(Pooled {
-                    guard,
-                    _freed: Freed { pool: self },
-                });
-            }
-        }
-        None
     }
 }
 
-impl<Item> Deref for Pooled<'_, Item> {
-    type Target = Item;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    fn deref(&self) -> &Item {
-        &self.guard
-    }
-}
+    // an item goes back after use, also when the work panics
+    #[test]
+    fn item_returns() {
+        let pool = Pool::new(vec![1_u32]);
 
-impl<Item> DerefMut for Pooled<'_, Item> {
-    fn deref_mut(&mut self) -> &mut Item {
-        &mut self.guard
-    }
-}
+        assert_eq!(pool.with(|item| *item + 1), 2);
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| pool.with(|_item| panic!("failed work"))));
 
-impl<Item> Drop for Freed<'_, Item> {
-    fn drop(&mut self) {
-        let waiters = hold(&self.pool.waiters);
-        if *waiters > 0 {
-            self.pool.freed.notify_one();
-        }
+        assert!(outcome.is_err());
+        assert_eq!(pool.with(|item| *item), 1);
     }
 }

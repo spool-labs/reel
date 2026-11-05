@@ -62,13 +62,20 @@ impl WriteShard {
         ByteCount(total)
     }
 
+    /// Check the pools can take one more row of this key length in a slot
+    pub fn has_room(&self, slot: OpenSlot, key_length: usize) -> bool {
+        let tree = &self.trees[slot.0 as usize];
+        self.nodes.free_count >= MAX_NEW_NODES && self.table.has_room() && self.slab.has_room(&tree.pages, key_length)
+    }
+
     /// Add a row, or return false when a pool ran out
     pub fn insert(&mut self, hash: KeyHash, column: ColumnId, key: &[u8], row: &WriteRow) -> bool {
-        let tree = &mut self.trees[row.slot.0 as usize];
-        let has_pools = self.nodes.free_count >= MAX_NEW_NODES && self.table.has_room();
-        if !has_pools || !self.slab.has_room(&tree.pages, key.len()) {
+        if !self.has_room(row.slot, key.len()) {
             return false;
         }
+
+        let tree = &mut self.trees[row.slot.0 as usize];
+        tree.segment = row.segment;
         let Some(address) = self.slab.store(&mut tree.pages, column, key, row) else {
             return false;
         };
@@ -135,11 +142,18 @@ impl WriteShard {
 
         if self.slab.place(head) <= read_point && view.contains(self.slab.slot(head)) {
             return WriteLookup {
-                row: self.slab.row(head),
+                row: self.row_of(head),
                 should_ask_footers: self.slab.has_newer_sealed(head),
             };
         }
         self.search_trees(column, key, read_point, view)
+    }
+
+    /// Read a row with the segment of the tree that holds it
+    pub fn row_of(&self, entry: EntryAddress) -> Option<WriteRow> {
+        let mut row = self.slab.row(entry)?;
+        row.segment = self.trees[row.slot.0 as usize].segment;
+        Some(row)
     }
 
     /// Find a key's newest version at a read point with one seek per tree, whatever the versions
@@ -178,7 +192,7 @@ impl WriteShard {
             };
         };
         WriteLookup {
-            row: self.slab.row(entry),
+            row: self.row_of(entry),
             should_ask_footers: newest_closed > self.slab.place(entry) || self.slab.has_newer_sealed(entry),
         }
     }

@@ -80,14 +80,11 @@ impl WriteOrder {
         WritePlace(self.mark.load(Ordering::Acquire))
     }
 
-    /// Claim the next places, waiting while too many writers are in flight
-    pub fn claim(&self, rows: RowCount) -> Ticket {
+    /// Claim the next places, or return nothing while too many writers are in flight
+    pub fn try_claim(&self, rows: RowCount) -> Option<Ticket> {
         let mut ring = hold(&self.ring);
-        while ring.len() == MOST_IN_FLIGHT {
-            ring = match self.moved.wait(ring) {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+        if ring.len() == MOST_IN_FLIGHT {
+            return None;
         }
 
         let first = ring.next_place;
@@ -98,7 +95,7 @@ impl WriteOrder {
         ring.states[slot] = TicketState::InFlight;
         ring.ends[slot] = last;
         ring.tail += 1;
-        Ticket { first, last, slot }
+        Some(Ticket { first, last, slot })
     }
 
     /// End a claim, and move the mark past every finished claim in order
@@ -160,9 +157,9 @@ mod tests {
     fn claim_order() {
         let order = WriteOrder::new(WritePlace(10));
 
-        let first = order.claim(ONE);
-        let batch = order.claim(RowCount(3));
-        let last = order.claim(ONE);
+        let first = order.try_claim(ONE).expect("room");
+        let batch = order.try_claim(RowCount(3)).expect("room");
+        let last = order.try_claim(ONE).expect("room");
 
         assert_eq!((first.first, first.last), (WritePlace(11), WritePlace(11)));
         assert_eq!((batch.first, batch.last), (WritePlace(12), WritePlace(14)));
@@ -173,9 +170,9 @@ mod tests {
     #[test]
     fn mark_order() {
         let order = WriteOrder::new(WritePlace(0));
-        let first = order.claim(ONE);
-        let second = order.claim(ONE);
-        let third = order.claim(ONE);
+        let first = order.try_claim(ONE).expect("room");
+        let second = order.try_claim(ONE).expect("room");
+        let third = order.try_claim(ONE).expect("room");
 
         order.finish(&second, TicketState::Landed);
         order.finish(&third, TicketState::Landed);
@@ -189,8 +186,8 @@ mod tests {
     #[test]
     fn mark_abort() {
         let order = WriteOrder::new(WritePlace(0));
-        let first = order.claim(ONE);
-        let second = order.claim(ONE);
+        let first = order.try_claim(ONE).expect("room");
+        let second = order.try_claim(ONE).expect("room");
 
         order.finish(&first, TicketState::Aborted);
         assert_eq!(order.mark(), first.last);
@@ -202,11 +199,25 @@ mod tests {
     #[test]
     fn mark_batch() {
         let order = WriteOrder::new(WritePlace(0));
-        let batch = order.claim(RowCount(5));
+        let batch = order.try_claim(RowCount(5)).expect("room");
 
         assert_eq!(order.mark(), WritePlace(0));
         order.finish(&batch, TicketState::Landed);
         assert_eq!(order.mark(), WritePlace(5));
+    }
+
+    // a full ring refuses a claim, and takes one again when the oldest ends
+    #[test]
+    fn ring_full() {
+        let order = WriteOrder::new(WritePlace(0));
+        let first = order.try_claim(ONE).expect("room");
+        for _claim in 1..MOST_IN_FLIGHT {
+            assert!(order.try_claim(ONE).is_some());
+        }
+
+        assert_eq!(order.try_claim(ONE), None);
+        order.finish(&first, TicketState::Landed);
+        assert!(order.try_claim(ONE).is_some());
     }
 
     // the ring reuses its slots past its size
@@ -214,7 +225,7 @@ mod tests {
     fn ring_reuse() {
         let order = WriteOrder::new(WritePlace(0));
         for _claim in 0..MOST_IN_FLIGHT * 3 {
-            let ticket = order.claim(ONE);
+            let ticket = order.try_claim(ONE).expect("room");
             order.finish(&ticket, TicketState::Landed);
         }
 

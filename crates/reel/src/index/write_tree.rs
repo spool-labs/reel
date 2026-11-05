@@ -7,6 +7,7 @@ use reel_api::units::RowCount;
 use crate::index::entry_slab::{EntryAddress, EntrySlab, PageChain};
 use crate::index::node_pool::{NO_NODE, NODE_FANOUT, NodeCount, NodeIndex, NodePool};
 use crate::index::seek_target::{RowPrefix, SeekTarget, compare_rows};
+use crate::segment::segment_tail::SegmentNumber;
 
 /// Deepest a tree can get: half-full nodes reach 2^32 rows in this many levels
 pub const MAX_DEPTH: usize = 10;
@@ -48,6 +49,7 @@ pub struct WriteTree {
     pub node_count: NodeCount,
     pub pages: PageChain,
     pub cleanup: Option<TreePosition>,
+    pub segment: SegmentNumber,
 }
 
 impl DescentPath {
@@ -87,6 +89,7 @@ impl WriteTree {
             node_count: NodeCount::default(),
             pages: PageChain::empty(),
             cleanup: None,
+            segment: SegmentNumber(0),
         }
     }
 

@@ -13,7 +13,7 @@ use crate::io::job::{Job, JobStep};
 use crate::io::lock_outcome::LockOutcome;
 use crate::io::simulated::file_image::BitMask;
 use crate::io::simulated::seeded_random::Seed;
-use crate::io::simulated::simulated_disk::{InodeNumber, OperationCount, SimulatedDisk};
+use crate::io::simulated::simulated_disk::{InodeNumber, OperationCount, SimulatedDisk, SyncHook};
 use crate::io::simulated::simulated_file::SimulatedFile;
 use crate::io::simulated::simulated_task::{JobCount, JobIndex, JobSlot, JobWait, SimulatedTask};
 
@@ -99,6 +99,21 @@ impl SimulatedIo {
     /// Count the uses of a closed handle and the second closes
     pub fn handle_faults(&self) -> OperationCount {
         hold(&self.disk).handle_faults
+    }
+
+    /// Make the next writes fail
+    pub fn fail_writes(&self, count: OperationCount) {
+        hold(&self.disk).failing_writes = count;
+    }
+
+    /// Make the next file creates fail
+    pub fn fail_creates(&self, count: OperationCount) {
+        hold(&self.disk).failing_creates = count;
+    }
+
+    /// Run some work right after the next sync lands
+    pub fn after_next_sync(&self, work: Box<dyn FnOnce() + Send>) {
+        hold(&self.disk).after_sync = SyncHook(Some(work));
     }
 
     /// Make the next syncs fail
@@ -203,6 +218,10 @@ impl Io for SimulatedIo {
     fn create_file(&self, path: &Path, reserved: ByteCount) -> Result<SimulatedFile> {
         let mut disk = hold(&self.disk);
         disk.enter()?;
+        if disk.failing_creates.0 > 0 {
+            disk.failing_creates = OperationCount(disk.failing_creates.0 - 1);
+            return Err(Error::other("simulated create failure"));
+        }
         let inode = disk.create(path, reserved)?;
         Ok(self.handle(&mut disk, inode, true))
     }

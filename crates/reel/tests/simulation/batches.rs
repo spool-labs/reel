@@ -38,7 +38,7 @@ const SECOND_ROOT: &str = "/disk/batch-bulk";
 const PLAIN: ColumnId = ColumnId(1);
 const PACKED: ColumnId = ColumnId(2);
 const OTHER_VOLUME: ColumnId = ColumnId(3);
-const BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(134 * 1024 * 1024);
 const BATCH_KEYS: u64 = 5;
 const CRASH_POINTS: u64 = 12;
 const LARGE_VALUE_BYTES: usize = 200_000;
@@ -639,7 +639,7 @@ fn rows_go_first() {
 
     thread::scope(|scope| {
         let writer = scope.spawn(|| store.write_batch(&long_batch(None)));
-        while !hold(&volume.claims).open.iter().any(|open| open.phase == SegmentPhase::Alone) {
+        while !writer.is_finished() && !hold(&volume.claims).open.iter().any(|open| open.phase == SegmentPhase::Alone) {
             thread::yield_now();
         }
         let row = WriteRow {
@@ -929,7 +929,7 @@ fn long_seal_beside() {
 
     thread::scope(|scope| {
         let writer = scope.spawn(|| store.write_batch(&long_batch(Some(b"value"))));
-        while !hold(&volume.claims).open.iter().any(|open| open.phase == SegmentPhase::Alone) {
+        while !writer.is_finished() && !hold(&volume.claims).open.iter().any(|open| open.phase == SegmentPhase::Alone) {
             thread::yield_now();
         }
         store.seal_now();

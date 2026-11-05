@@ -7,9 +7,9 @@ use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig
 use reel::engine::compact_job::CompactJob;
 use reel::engine::engine_state::IndexWait;
 use reel::engine::open_segment::SegmentPhase;
-use reel::engine::planner::{Planner, WALK_LAG_SEGMENTS};
+use reel::engine::planner::{Planner, WALK_LAG_SEGMENTS, UnitStep};
 use reel::engine::reel_store::ReelStore;
-use reel::engine::walk_job::WalkJob;
+use reel::engine::walk_job::{SLOT_COUNTED, WalkJob, WalkTarget};
 use reel::guard::hold;
 use reel::io::IoTask;
 use reel::io::job::{Job, JobStep};
@@ -507,7 +507,7 @@ fn turn_with(seed: Seed) {
         last: 0,
     };
 
-    assert_eq!(planner.step(), JobStep::Worked);
+    assert_eq!(land_block(&mut planner, &io), JobStep::Worked);
 
     assert_eq!((store.state.pending_walks(0), store.state.pending_walks(1)), (1, 0));
     assert_eq!(planner.step(), JobStep::IdleUntil { deadline: Nanoseconds(u64::MAX) });
@@ -629,12 +629,26 @@ fn stands_aside_for_seals() {
 
     volume.walks_waiting.store(WALK_LAG_SEGMENTS, Ordering::Release);
     assert!(!planner.is_seal_first());
-    assert_eq!(planner.step(), JobStep::Worked);
+    assert_eq!(land_block(&mut planner, &io), JobStep::Worked);
     assert_eq!(store.state.pending_walks(0), 0);
 
     drop(planner);
     io.hold_jobs(SEAL_JOB, false);
     store.close().expect("close");
+}
+
+// run the planner by hand, with the workers it hands blocks to
+fn land_block(planner: &mut Planner<SimulatedIo>, io: &SimulatedIo) -> JobStep {
+    io.hold_jobs("reel-planner", true);
+    for _step in 0..STEPS {
+        match planner.step() {
+            JobStep::Idle | JobStep::IdleUntil { .. } => {
+                io.step_any();
+            },
+            step => return step,
+        }
+    }
+    panic!("no block landed");
 }
 
 // a reopen counts the segments still waiting for a walk
@@ -654,5 +668,68 @@ fn waiting_reopen() {
     assert_eq!(store.state.volumes[0].walks_waiting.load(Ordering::Acquire), 1);
     settle(&io);
     assert_eq!(store.state.volumes[0].walks_waiting.load(Ordering::Acquire), 0);
+    store.close().expect("close");
+}
+
+fn two_blocks(store: &Store, io: &SimulatedIo) -> WalkJob<SimulatedIo> {
+    io.hold_jobs("reel-planner", true);
+    io.hold_jobs("reel-walk", true);
+    fill_block(store);
+    fill_block(store);
+    let number = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(store, io, number);
+    let mut job = WalkJob::new(store.state.clone(), 0);
+    assert!(job.pick_target());
+    assert!(job.target.expect("a target").block_count >= 2);
+    job
+}
+
+// a worker can finish ahead of the block before it, and its counts wait their turn, so the position stays contiguous
+#[test]
+fn blocks_land_in_order() {
+    let io = SimulatedIo::new(Seed(40));
+    let store = open(&io);
+    let mut job = two_blocks(&store, &io);
+    let target = job.target.expect("a target");
+
+    let slot = &store.state.volumes[0].walk_slots[1];
+    let ahead = WalkTarget {
+        next_block: target.next_block + 1,
+        ..target
+    };
+    let mut work = hold(&slot.work);
+    work.target = ahead;
+    work.next_block = ahead.next_block + 1;
+    drop(work);
+    slot.phase.store(SLOT_COUNTED, Ordering::Release);
+
+    assert_eq!(job.step_unit(Nanoseconds(0)), UnitStep::Idle);
+    assert_eq!(job.target, Some(target));
+    assert_eq!(slot.phase.load(Ordering::Acquire), SLOT_COUNTED);
+    drop(job);
+    io.hold_jobs("reel-walk", false);
+    store.close().expect("close");
+}
+
+// counts left from a target that ended go nowhere, and their slot comes free
+#[test]
+fn stale_slot_comes_free() {
+    let io = SimulatedIo::new(Seed(41));
+    let store = open(&io);
+    let mut job = two_blocks(&store, &io);
+    let target = job.target.expect("a target");
+
+    let slot = &store.state.volumes[0].walk_slots[1];
+    hold(&slot.work).target = WalkTarget {
+        segment: SegmentNumber(target.segment.0 + 1_000),
+        ..target
+    };
+    slot.phase.store(SLOT_COUNTED, Ordering::Release);
+
+    assert_eq!(job.step_unit(Nanoseconds(0)), UnitStep::Idle);
+    assert_eq!(job.target, Some(target));
+    assert_ne!(slot.phase.load(Ordering::Acquire), SLOT_COUNTED);
+    drop(job);
+    io.hold_jobs("reel-walk", false);
     store.close().expect("close");
 }

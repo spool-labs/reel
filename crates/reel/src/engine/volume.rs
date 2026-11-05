@@ -8,6 +8,7 @@ use reel_api::units::{ByteCount, RowCount, VolumeId, WritePlace};
 
 use crate::config::SyncPolicy;
 use crate::engine::open_segment::{OpenSegment, SegmentPhase};
+use crate::engine::walk_job::WalkSlot;
 use crate::guard::hold;
 use crate::index::open_slots::{OpenSlot, OpenSlots};
 use crate::io::Io;
@@ -80,6 +81,7 @@ pub struct Volume<Backend: Io> {
     pub is_seal_stuck: AtomicBool,
     /// The segment a seal is working on, or `NO_SEAL`. Its rows can still answer through its open slot, so no walk starts on it
     pub sealing: AtomicU64,
+    pub walk_slots: Vec<WalkSlot<Backend::Task>>,
     pub segments_unlinked: AtomicU64,
     pub segments_parked: AtomicU64,
     pub parked: Mutex<[Option<ParkedSegment<Backend::File>>; MOST_PARKED]>,

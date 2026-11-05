@@ -991,3 +991,33 @@ fn stuck_seal_gets_its_walks() {
     volume.is_seal_stuck.store(false, Ordering::Release);
     store.close().expect("close");
 }
+
+// the walk keeps the highest replacement of a segment's rows: one key's replacement above a cue still needs the segment,
+// though the walk meets a lower replacement after it
+#[test]
+fn cue_between_replacements() {
+    let io = SimulatedIo::new(Seed(43));
+    let store = open(&io);
+    store.put(COLUMN, b"a", b"older").expect("put");
+    store.put(COLUMN, b"b", b"older").expect("put");
+    let number = hold(&store.state.volumes[0].claims).open[0].number;
+    store.seal_now();
+    settle(&io);
+
+    store.put(COLUMN, b"b", b"newer").expect("put");
+    let cue = store.cue().expect("cue");
+    store.put(COLUMN, b"a", b"newer").expect("put");
+    store.seal_now();
+    settle(&io);
+
+    let table = &store.state.volumes[0].table;
+    assert!(table.holds(number));
+    let mut buf = Vec::new();
+    assert!(cue.get(COLUMN, b"a", &mut buf).expect("get"));
+    assert_eq!(buf, b"older");
+
+    drop(cue);
+    settle(&io);
+    assert!(!table.holds(number));
+    store.close().expect("close");
+}

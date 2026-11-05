@@ -49,7 +49,11 @@ pub const ENCODER_BYTES: u64 = 256 * 1024;
 /// Bytes a seal job's own buffers are planned at
 pub const SEAL_JOB_BYTES: u64 = 3 * 1024 * 1024;
 /// Bytes a dead-byte walk's own buffers are planned at
-pub const WALK_JOB_BYTES: u64 = 1024 * 1024;
+pub const WALK_JOB_BYTES: u64 = 5 * 256 * 1024;
+/// Most workers a volume's walk has, which sets how far the walk can stay behind the seal ceiling
+pub const MOST_WALK_WORKERS: usize = 2;
+/// A store gets one walk worker a volume for each this much budget, up to the most
+pub const WALK_WORKER_BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
 /// Bytes a compaction job's own buffers are planned at
 pub const COMPACT_JOB_BYTES: u64 = 128 * 1024;
 /// Bytes a job's stack is planned at
@@ -59,8 +63,8 @@ pub const SHARED_JOBS: u64 = 3;
 /// Bytes a row of the write index really takes, node, page and table share included, with a long batch's length of it
 pub const PLANNED_ROW_BYTES: u64 = 227;
 /// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight. With one
-/// lz4 column and 64 B keys that gives these rows a segment: 52,801 at 128 MiB, 145,186 at 192 MiB, 607,114 at 512 MiB and
-/// 5,780,705 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
+/// lz4 column and 64 B keys that gives these rows a segment: 45,944 at 128 MiB, 138,330 at 192 MiB, 600,257 at 512 MiB and
+/// 5,773,848 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
 /// records seal smaller and reach their size through merges, whose outputs the write index doesn't bound
 pub const SEAL_ROWS_EIGHTHS: u64 = 5;
 /// The most stored bytes of a value on an lz4 column, which is also the compress pool, cut into shares
@@ -101,9 +105,15 @@ pub struct EngineSizing {
     pub summary_share: ByteCount,
     pub table_share: ByteCount,
     pub lz4_stored_limit: ByteCount,
+    pub walk_workers: usize,
 }
 
 impl StoreShape {
+    /// Count the walk workers each volume gets
+    pub fn walk_workers(&self) -> usize {
+        ((self.budget.0 / WALK_WORKER_BUDGET.0) as usize).min(MOST_WALK_WORKERS)
+    }
+
     /// Count the open slots the roots can use
     pub fn open_slots(&self) -> usize {
         (self.roots * OPEN_PER_ROOT * SLOTS_PER_OPEN).min(MAX_OPEN_SLOTS)
@@ -119,13 +129,14 @@ impl StoreShape {
         let large = if self.has_lz4 { LZ4_STORED_LIMIT.0 } else { 0 };
         let encoders = WRITE_BUFFERS as u64 * ENCODER_BYTES + large;
         let spans = 4 * MOST_DAMAGED_SPANS as u64 * (SPAN_KEY_BYTES as u64 * 2);
-        let stacks = (SHARED_JOBS + volumes) * JOB_STACK_PLAN_BYTES;
+        let workers = volumes * self.walk_workers() as u64;
+        let stacks = (SHARED_JOBS + volumes + workers) * JOB_STACK_PLAN_BYTES;
         // the pool holds both keys of every cover, and a seal job has room to write them all to a footer
         let cover_keys = 2 * MOST_RANGE_COVERS as u64 * self.widest_keys;
         let cover_fixed = (COVER_SLOT_BYTES + COVER_RECORD_BYTES) as u64 * MOST_RANGE_COVERS as u64;
         let covers = 2 * cover_keys + volumes * cover_fixed;
         let jobs = SEAL_JOB_BYTES + WALK_JOB_BYTES + COMPACT_JOB_BYTES;
-        ByteCount(queues + gathers + windows + reads + encoders + covers + volumes * (jobs + spans) + stacks)
+        ByteCount(queues + gathers + windows + reads + encoders + covers + volumes * (jobs + spans) + workers * WALK_JOB_BYTES + stacks)
     }
 
     /// Read the smallest budget this store can run in
@@ -168,6 +179,7 @@ impl EngineSizing {
             summary_share: ByteCount(shared / SUMMARY_DIVISOR),
             table_share: ByteCount(shared / TABLE_DIVISOR),
             lz4_stored_limit: LZ4_STORED_LIMIT,
+            walk_workers: shape.walk_workers(),
         }
     }
 }

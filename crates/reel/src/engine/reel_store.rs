@@ -33,7 +33,7 @@ use crate::engine::seal_job::SealJob;
 use crate::engine::compact_job::CompactJob;
 use crate::engine::cue::{Cue, CueTable};
 use crate::engine::planner::Planner;
-use crate::engine::walk_job::WalkJob;
+use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
 use crate::engine::volume::{ClaimState, MOST_PARKED, NO_SEAL, SyncState, Volume};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
@@ -333,6 +333,11 @@ impl<Backend: Io> EngineState<Backend> {
         if let Some(task) = self.reserve_task.get() {
             task.stop()?;
         }
+        for slot in self.volumes.iter().flat_map(|volume| &volume.walk_slots) {
+            if let Some(task) = slot.task.get() {
+                task.stop()?;
+            }
+        }
         if let Some(task) = self.planner_task.get() {
             task.stop()?;
         }
@@ -454,6 +459,21 @@ pub fn bring_up<Backend: Io>(
         state.compaction_heap.fetch_add(compaction.heap_bytes().0, Ordering::AcqRel);
         compactions.push(compaction);
     }
+    let mut workers = 0;
+    for (volume, held) in state.volumes.iter().enumerate() {
+        for (index, slot) in held.walk_slots.iter().enumerate() {
+            let worker = WalkWorker {
+                state: Arc::clone(state),
+                volume,
+                slot: index,
+                counter: BlockCounter::new(Arc::clone(state)),
+            };
+            state.seal_heap.fetch_add(worker.counter.heap_bytes().0 + slot.heap_bytes().0, Ordering::AcqRel);
+            let task = state.io.spawn_job("reel-walk", worker).map_err(open_error("starting a job"))?;
+            let _set = slot.task.set(task);
+            workers += 1;
+        }
+    }
     let planner = Planner {
         state: Arc::clone(state),
         walks,
@@ -467,7 +487,7 @@ pub fn bring_up<Backend: Io>(
     };
     let task = state.io.spawn_job("reel-reserve", reserve_job).map_err(open_error("starting a job"))?;
     let _set = state.reserve_task.set(task);
-    state.job_count.store(SHARED_JOBS + state.volumes.len() as u64, Ordering::Release);
+    state.job_count.store(SHARED_JOBS + state.volumes.len() as u64 + workers, Ordering::Release);
     Ok(())
 }
 
@@ -793,6 +813,7 @@ pub fn build_state<Backend: Io>(
             is_compaction_held: AtomicBool::new(false),
             is_seal_stuck: AtomicBool::new(false),
             sealing: AtomicU64::new(NO_SEAL),
+            walk_slots: (0..sizing.walk_workers).map(|_slot| WalkSlot::new()).collect(),
             segments_unlinked: AtomicU64::new(0),
             segments_parked: AtomicU64::new(0),
             parked: Mutex::new([const { None }; MOST_PARKED]),

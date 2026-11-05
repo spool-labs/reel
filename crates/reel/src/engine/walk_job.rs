@@ -8,7 +8,9 @@
 //! hides, so neither counts here.
 
 use std::io::{Error, ErrorKind, Result};
-use std::sync::Arc;
+use std::mem;
+use std::sync::atomic::AtomicU8;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
@@ -21,7 +23,8 @@ use crate::engine::planner::UnitStep;
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::io::device_error::is_device_error;
-use crate::io::{Io, IoFile};
+use crate::io::job::{Job, JobStep};
+use crate::io::{Io, IoFile, IoTask};
 use crate::pool::{touched_capacity, touched_zeroes};
 use crate::row_kind::RowKind;
 use crate::segment::footer_writer::MOST_BLOCK_ROWS;
@@ -35,8 +38,17 @@ pub const WALK_RETRY: Nanoseconds = Nanoseconds(1_000_000_000);
 /// How far back a count looks for an entry to add to
 pub const COUNT_SEARCH: usize = 32;
 
+/// A worker's slot has no block
+pub const SLOT_FREE: u8 = 0;
+/// A worker's slot has a block to count
+pub const SLOT_ASSIGNED: u8 = 1;
+/// A worker's slot holds a block's counts, waiting for the planner to land them in block order
+pub const SLOT_COUNTED: u8 = 2;
+/// A worker's slot holds a block it couldn't count
+pub const SLOT_FAILED: u8 = 3;
+
 /// The segment a walk is on
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WalkTarget {
     pub segment: SegmentNumber,
     pub next_block: u32,
@@ -45,119 +57,114 @@ pub struct WalkTarget {
     pub is_damaged: bool,
 }
 
+/// One block's counts on their way from a worker to the planner
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SlotWork {
+    pub target: WalkTarget,
+    pub next_block: u32,
+    pub counts: Vec<DeadCount>,
+}
+
+/// A worker's place to take a block and hand its counts back. Workers only read, and the planner alone lands counts, so
+/// a volume still has one walk: it keeps one target, one position and one order of landing
+#[derive(Debug)]
+pub struct WalkSlot<Task> {
+    pub phase: AtomicU8,
+    pub work: Mutex<SlotWork>,
+    pub task: OnceLock<Task>,
+}
+
+impl<Task> WalkSlot<Task> {
+    /// Build an empty slot with room for one block's counts
+    pub fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(SLOT_FREE),
+            work: Mutex::new(SlotWork {
+                counts: touched_capacity(MOST_BLOCK_ROWS, DeadCount::default()),
+                ..SlotWork::default()
+            }),
+            task: OnceLock::new(),
+        }
+    }
+
+    /// Read the heap the slot's counts hold
+    pub fn heap_bytes(&self) -> ByteCount {
+        ByteCount((hold(&self.work).counts.capacity() * size_of::<DeadCount>()) as u64)
+    }
+}
+
+impl<Task> Default for WalkSlot<Task> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What it takes to count one row block: nothing here changes the store
+pub struct BlockCounter<Backend: Io> {
+    pub state: Arc<EngineState<Backend>>,
+    block: Vec<u8>,
+    key: Vec<u8>,
+    last_key: Vec<u8>,
+    pub last_column: Option<ColumnId>,
+    is_next_key_unknown: bool,
+}
+
 /// The walk of one volume's sealed segments
 pub struct WalkJob<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
     pub volume: usize,
     pub target: Option<WalkTarget>,
     pub retry_at: Option<Nanoseconds>,
-    block: Vec<u8>,
-    key: Vec<u8>,
-    last_key: Vec<u8>,
-    last_column: Option<ColumnId>,
-    is_next_key_unknown: bool,
+    counter: BlockCounter<Backend>,
     counts: Vec<DeadCount>,
+    next_handed_out: u32,
+    failed_slot: Option<usize>,
 }
 
-impl<Backend: Io> WalkJob<Backend> {
-    /// Allocate the walk's fixed buffers
-    pub fn new(state: Arc<EngineState<Backend>>, volume: usize) -> Self {
+/// A worker that counts the blocks the planner hands it
+pub struct WalkWorker<Backend: Io> {
+    pub state: Arc<EngineState<Backend>>,
+    pub volume: usize,
+    pub slot: usize,
+    pub counter: BlockCounter<Backend>,
+}
+
+impl<Backend: Io> BlockCounter<Backend> {
+    /// Allocate the fixed buffers
+    pub fn new(state: Arc<EngineState<Backend>>) -> Self {
         Self {
             state,
-            volume,
-            target: None,
-            retry_at: None,
             block: touched_zeroes(ROW_BLOCK_BYTES),
             key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             last_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             last_column: None,
             is_next_key_unknown: false,
-            counts: touched_capacity(MOST_BLOCK_ROWS, DeadCount::default()),
         }
     }
 
-    /// Read the heap the walk's buffers hold
+    /// Read the heap the buffers hold
     pub fn heap_bytes(&self) -> ByteCount {
-        let keys = self.key.capacity() + self.last_key.capacity();
-        ByteCount((self.block.capacity() + keys + self.counts.capacity() * size_of::<DeadCount>()) as u64)
+        ByteCount((self.block.capacity() + self.key.capacity() + self.last_key.capacity()) as u64)
     }
 
-    /// Pick a segment whose walk hasn't finished. Backward walks go first and newest first, so an older segment finds the
-    /// newer one finished and counts against it, and then forward walks go from the lowest
-    pub fn pick_target(&mut self) -> bool {
-        let state = Arc::clone(&self.state);
-        let volume = &state.volumes[self.volume];
-        // a seal only ends past the mark, so every row a walk counts by is published, and its slot has let go of the file
-        let sealing = volume.sealing.load(Ordering::Acquire);
-        let rows = hold(&volume.summary);
-        let waiting = rows.rows().filter(|row| !row.facts.is_walked() && row.facts.segment.0 != sealing);
-        let backward = waiting.clone().filter(|row| row.facts.is_backward).max_by_key(|row| row.facts.places.highest);
-        let picked = backward.or_else(|| waiting.min_by_key(|row| row.facts.segment));
-        self.target = picked.map(|row| WalkTarget {
-            segment: row.facts.segment,
-            next_block: row.facts.walked_blocks,
-            block_count: row.facts.block_count,
-            is_backward: row.facts.is_backward,
-            is_damaged: row.facts.is_damaged,
-        });
-        self.last_column = None;
-        self.target.is_some()
-    }
-
-    /// Walk one row block. A failure leaves the last key wherever the attempt stood, so the retry finds it again
-    pub fn walk_block(&mut self, target: WalkTarget) -> Result<()> {
-        let outcome = self.count_and_land(target);
-        if outcome.is_err() {
-            self.last_column = None;
-            if !self.state.is_stopping.load(Ordering::Acquire) {
-                self.state.volumes[self.volume].walk_retries.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        outcome
-    }
-
-    /// Count one row block, and land its counts and the new position under one hold
-    pub fn count_and_land(&mut self, target: WalkTarget) -> Result<()> {
-        let state = Arc::clone(&self.state);
-        let volume = &state.volumes[self.volume];
-        self.counts.clear();
+    /// Count a target's next block into a list, and return the position past it
+    pub fn count(&mut self, volume: &Volume<Backend>, target: WalkTarget, counts: &mut Vec<DeadCount>) -> Result<u32> {
+        counts.clear();
 
         // a damaged segment answers for nothing, so its rows count nothing and the walk moves past it
         let pin = volume.table.pin(target.segment).filter(|_pin| !target.is_damaged);
         let block = volume.table.walk_block(target.segment, target.next_block);
-        let mut next_block = target.block_count;
-        if let (Some(pin), Some(block)) = (pin, block) {
-            next_block = target.next_block + 1;
-            if self.last_column.is_none() && target.next_block > 0 {
-                self.load_last_key(volume, &pin, target, block.column)?;
-            }
-            match self.count_block(volume, &pin, &block, target) {
-                Err(error) if is_device_error(&error) => self.counts.clear(),
-                outcome => outcome?,
-            }
+        let (Some(pin), Some(block)) = (pin, block) else {
+            return Ok(target.block_count);
+        };
+        if self.last_column.is_none() && target.next_block > 0 {
+            self.load_last_key(volume, &pin, target, block.column)?;
         }
-
-        self.counts.sort_unstable_by_key(|count| count.segment);
-        let mut rows = hold(&volume.summary);
-        rows.apply_walk(target.segment, next_block, &self.counts);
-        if !target.is_backward {
-            rows.note_forward(target.segment);
+        match self.count_block(volume, &pin, &block, target, counts) {
+            Err(error) if is_device_error(&error) => counts.clear(),
+            outcome => outcome?,
         }
-        drop(rows);
-        for count in self.counts.iter().filter(|count| count.rows > 0) {
-            volume.table.drop_live(count.segment, count.block, count.rows, count.replacement);
-        }
-        if next_block < target.block_count {
-            self.target = Some(WalkTarget { next_block, ..target });
-            return Ok(());
-        }
-
-        volume.table.mark_walked(target.segment);
-        volume.wants_compaction.store(true, Ordering::Release);
-        // a row dropped for room after its seal counted can leave this at zero
-        let _waiting = volume.walks_waiting.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_sub(1));
-        self.target = None;
-        state.save_summary(volume)
+        Ok(target.next_block + 1)
     }
 
     /// Find the last key before this block, since a key's versions can run across blocks, past blocks of range deletes
@@ -215,6 +222,7 @@ impl<Backend: Io> WalkJob<Backend> {
         pin: &SegmentPin<'_, Backend::File>,
         block: &WalkBlock,
         target: WalkTarget,
+        counts: &mut Vec<DeadCount>,
     ) -> Result<()> {
         let length = block.entry.block_length().0 as usize;
         pin.file.read_exact_at(block.entry.block_at(), &mut self.block[..length])?;
@@ -232,7 +240,7 @@ impl<Backend: Io> WalkJob<Backend> {
                 continue;
             }
             if target.is_backward {
-                add_count(&mut self.counts, target.segment, block.column, target.next_block, &row, None);
+                add_count(counts, target.segment, block.column, target.next_block, &row, None);
             }
             let is_top = self.last_column != Some(block.column) || self.last_key != self.key;
             // a key that may have begun in a block no read can give has a top no walk can name
@@ -246,7 +254,7 @@ impl<Backend: Io> WalkJob<Backend> {
             if !is_top {
                 // the key's top is in this segment, and its highest place is at or above that
                 let replacement = Some(pin.head.places.highest);
-                add_count(&mut self.counts, target.segment, block.column, target.next_block, &row, replacement);
+                add_count(counts, target.segment, block.column, target.next_block, &row, replacement);
                 continue;
             }
 
@@ -264,11 +272,11 @@ impl<Backend: Io> WalkJob<Backend> {
             match newest {
                 Some(found) if found.row.place > row.place => {
                     let replacement = Some(found.row.place);
-                    add_count(&mut self.counts, target.segment, block.column, target.next_block, &row, replacement);
+                    add_count(counts, target.segment, block.column, target.next_block, &row, replacement);
                 },
                 Some(found) if !target.is_backward => {
                     if let Some(index) = volume.table.block_at(found.segment, found.block_offset) {
-                        add_count(&mut self.counts, found.segment, block.column, index, &found.row, Some(row.place));
+                        add_count(counts, found.segment, block.column, index, &found.row, Some(row.place));
                     }
                 },
                 Some(_) | None => {},
@@ -279,29 +287,234 @@ impl<Backend: Io> WalkJob<Backend> {
 }
 
 impl<Backend: Io> WalkJob<Backend> {
+    /// Allocate the walk's fixed buffers
+    pub fn new(state: Arc<EngineState<Backend>>, volume: usize) -> Self {
+        Self {
+            counter: BlockCounter::new(Arc::clone(&state)),
+            state,
+            volume,
+            target: None,
+            retry_at: None,
+            counts: touched_capacity(MOST_BLOCK_ROWS, DeadCount::default()),
+            next_handed_out: 0,
+            failed_slot: None,
+        }
+    }
+
+    /// Read the heap the walk's buffers hold
+    pub fn heap_bytes(&self) -> ByteCount {
+        ByteCount(self.counter.heap_bytes().0 + (self.counts.capacity() * size_of::<DeadCount>()) as u64)
+    }
+
+    /// Pick a segment whose walk hasn't finished. Backward walks go first and newest first, so an older segment finds a
+    /// newer one finished and counts against it, and then forward walks go from the lowest
+    pub fn pick_target(&mut self) -> bool {
+        let state = Arc::clone(&self.state);
+        let volume = &state.volumes[self.volume];
+        // a seal only ends past the mark, so every row a walk counts by is published, and its slot has let go of the file
+        let sealing = volume.sealing.load(Ordering::Acquire);
+        let rows = hold(&volume.summary);
+        let waiting = rows.rows().filter(|row| !row.facts.is_walked() && row.facts.segment.0 != sealing);
+        let backward = waiting.clone().filter(|row| row.facts.is_backward).max_by_key(|row| row.facts.places.highest);
+        let picked = backward.or_else(|| waiting.min_by_key(|row| row.facts.segment));
+        self.target = picked.map(|row| WalkTarget {
+            segment: row.facts.segment,
+            next_block: row.facts.walked_blocks,
+            block_count: row.facts.block_count,
+            is_backward: row.facts.is_backward,
+            is_damaged: row.facts.is_damaged,
+        });
+        self.counter.last_column = None;
+        self.next_handed_out = self.target.map_or(0, |target| target.next_block);
+        self.target.is_some()
+    }
+
+    /// Walk one row block here. A failure leaves the last key wherever the attempt stood, so the retry finds it again
+    pub fn walk_block(&mut self, target: WalkTarget) -> Result<()> {
+        let outcome = self.count_and_land(target);
+        if outcome.is_err() {
+            self.counter.last_column = None;
+            self.note_retry();
+        }
+        outcome
+    }
+
+    /// Count a failed attempt, unless a stop is what failed it
+    pub fn note_retry(&self) {
+        if !self.state.is_stopping.load(Ordering::Acquire) {
+            self.state.volumes[self.volume].walk_retries.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Count one row block, and land its counts and the new position under one hold
+    pub fn count_and_land(&mut self, target: WalkTarget) -> Result<()> {
+        let state = Arc::clone(&self.state);
+        let volume = &state.volumes[self.volume];
+        let mut counts = mem::take(&mut self.counts);
+        let outcome = self.counter.count(volume, target, &mut counts);
+        let landed = outcome.and_then(|next_block| self.land(volume, target, next_block, &mut counts));
+        self.counts = counts;
+        landed
+    }
+
+    /// Land one block's counts and the new position under one hold. A count for a segment that left since goes nowhere, since
+    /// a segment number is never used twice
+    pub fn land(
+        &mut self,
+        volume: &Volume<Backend>,
+        target: WalkTarget,
+        next_block: u32,
+        counts: &mut [DeadCount],
+    ) -> Result<()> {
+        counts.sort_unstable_by_key(|count| count.segment);
+        let mut rows = hold(&volume.summary);
+        rows.apply_walk(target.segment, next_block, counts);
+        if !target.is_backward {
+            rows.note_forward(target.segment);
+        }
+        drop(rows);
+        for count in counts.iter().filter(|count| count.rows > 0) {
+            volume.table.drop_live(count.segment, count.block, count.rows, count.replacement);
+        }
+        if next_block < target.block_count {
+            self.target = Some(WalkTarget { next_block, ..target });
+            return Ok(());
+        }
+
+        volume.table.mark_walked(target.segment);
+        volume.wants_compaction.store(true, Ordering::Release);
+        // a row dropped for room after its seal counted can leave this at zero
+        let _waiting = volume.walks_waiting.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_sub(1));
+        self.target = None;
+        self.state.save_summary(volume)
+    }
+
+    /// Give every free worker the next block. The slots bound how far ahead of the landing the workers get
+    pub fn hand_out(&mut self, volume: &Volume<Backend>, target: WalkTarget) {
+        self.next_handed_out = self.next_handed_out.max(target.next_block);
+        for slot in &volume.walk_slots {
+            if self.next_handed_out >= target.block_count {
+                return;
+            }
+            if slot.phase.load(Ordering::Acquire) == SLOT_FREE {
+                hold(&slot.work).target = WalkTarget {
+                    next_block: self.next_handed_out,
+                    ..target
+                };
+                self.next_handed_out += 1;
+                assign(slot);
+            }
+        }
+    }
+
+    /// Land the next block once its worker has counted it, in block order, and let go of what an ended target left behind
+    pub fn step_slots(&mut self, volume: &Volume<Backend>, target: WalkTarget, now: Nanoseconds) -> UnitStep {
+        self.hand_out(volume, target);
+        for (index, slot) in volume.walk_slots.iter().enumerate() {
+            let phase = slot.phase.load(Ordering::Acquire);
+            if phase != SLOT_COUNTED && phase != SLOT_FAILED {
+                continue;
+            }
+            let mut work = hold(&slot.work);
+            if work.target.segment != target.segment {
+                slot.phase.store(SLOT_FREE, Ordering::Release);
+                continue;
+            }
+            if work.target.next_block != target.next_block {
+                continue;
+            }
+            if phase == SLOT_FAILED {
+                drop(work);
+                self.failed_slot = Some(index);
+                self.note_retry();
+                return self.wait_for_retry(now);
+            }
+
+            let next_block = work.next_block;
+            let landed = self.land(volume, target, next_block, &mut work.counts);
+            drop(work);
+            slot.phase.store(SLOT_FREE, Ordering::Release);
+            return match landed {
+                Ok(()) => UnitStep::Worked,
+                Err(_) => self.wait_for_retry(now),
+            };
+        }
+        UnitStep::Idle
+    }
+
+    /// Come back after the retry wait
+    pub fn wait_for_retry(&mut self, now: Nanoseconds) -> UnitStep {
+        let at = Nanoseconds(now.0 + WALK_RETRY.0);
+        self.retry_at = Some(at);
+        UnitStep::RetryAt(at)
+    }
+
     /// Step this volume's walk once: one row block, or nothing when no segment waits or a failed read's wait isn't over
     pub fn step_unit(&mut self, now: Nanoseconds) -> UnitStep {
-        if self.state.volumes[self.volume].has_failed() {
+        let state = Arc::clone(&self.state);
+        let volume = &state.volumes[self.volume];
+        if volume.has_failed() {
             return UnitStep::Idle;
         }
         if let Some(at) = self.retry_at.filter(|at| at.0 > now.0) {
             return UnitStep::RetryAt(at);
         }
         self.retry_at = None;
+        if let Some(index) = self.failed_slot.take() {
+            assign(&volume.walk_slots[index]);
+        }
         if self.target.is_none() && !self.pick_target() {
             return UnitStep::Idle;
         }
         let Some(target) = self.target else {
             return UnitStep::Idle;
         };
+        if !volume.walk_slots.is_empty() && !target.is_damaged {
+            return self.step_slots(volume, target, now);
+        }
         match self.walk_block(target) {
             Ok(()) => UnitStep::Worked,
-            Err(_) => {
-                let at = Nanoseconds(now.0 + WALK_RETRY.0);
-                self.retry_at = Some(at);
-                UnitStep::RetryAt(at)
-            },
+            Err(_) => self.wait_for_retry(now),
         }
+    }
+}
+
+/// Put a slot's block in its worker's hands
+pub fn assign<Task: IoTask>(slot: &WalkSlot<Task>) {
+    slot.phase.store(SLOT_ASSIGNED, Ordering::Release);
+    if let Some(task) = slot.task.get() {
+        task.wake();
+    }
+}
+
+impl<Backend: Io> Job for WalkWorker<Backend> {
+    fn step(&mut self) -> JobStep {
+        let state = Arc::clone(&self.state);
+        let volume = &state.volumes[self.volume];
+        let slot = &volume.walk_slots[self.slot];
+        if slot.phase.load(Ordering::Acquire) != SLOT_ASSIGNED {
+            return JobStep::Idle;
+        }
+
+        let mut work = hold(&slot.work);
+        let SlotWork { target, next_block, counts } = &mut *work;
+        // blocks reach a worker out of order, so each one finds the key before it
+        self.counter.last_column = None;
+        self.counter.is_next_key_unknown = false;
+        let counted = self.counter.count(volume, *target, counts);
+        let phase = match counted {
+            Ok(position) => {
+                *next_block = position;
+                SLOT_COUNTED
+            },
+            Err(_) => SLOT_FAILED,
+        };
+        drop(work);
+        slot.phase.store(phase, Ordering::Release);
+        if let Some(task) = state.planner_task.get() {
+            task.wake();
+        }
+        JobStep::Worked
     }
 }
 

@@ -1,0 +1,362 @@
+//! One block of a footer's rows, with shared key prefixes and restart points
+
+use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
+use xxhash_rust::xxh3::xxh3_64;
+
+use crate::row_kind::RowKind;
+use crate::segment::varint::{MAX_VARINT_BYTES, read_varint, write_varint};
+
+/// Most bytes in a row block
+pub const ROW_BLOCK_BYTES: usize = 64 * 1024;
+/// Rows between restart points, where a key is stored whole
+pub const RESTART_INTERVAL: u32 = 16;
+/// Most restart points a block can hold
+pub const MAX_RESTARTS: usize = ROW_BLOCK_BYTES / 2 / size_of::<u16>();
+/// Bytes of the row count at the end of a block
+pub const COUNT_BYTES: usize = size_of::<u32>();
+/// Bytes of the restart count at the end of a block
+pub const RESTART_COUNT_BYTES: usize = size_of::<u16>();
+/// Bytes of the checksum at the end of a block
+pub const BLOCK_SUM_BYTES: usize = size_of::<u64>();
+/// Bytes at the end of a block beside its restart points
+pub const BLOCK_TRAILER_BYTES: usize = COUNT_BYTES + RESTART_COUNT_BYTES + BLOCK_SUM_BYTES;
+
+/// A row as a footer stores it
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FooterRow {
+    pub place: WritePlace,
+    pub offset: FileOffset,
+    pub length: ByteCount,
+    pub kind: RowKind,
+}
+
+/// A block being filled, in buffers that never grow
+#[derive(Debug)]
+pub struct RowBlockBuilder {
+    bytes: Vec<u8>,
+    used: usize,
+    restarts: Vec<u16>,
+    last_key: Vec<u8>,
+    row_count: u32,
+}
+
+/// A walk over a checked block's rows, keeping the current key in a buffer the caller lends
+#[derive(Debug)]
+pub struct RowBlockWalk<'block> {
+    rows: &'block [u8],
+    restarts: &'block [u8],
+    position: usize,
+}
+
+impl RowBlockBuilder {
+    /// Allocate the buffers
+    pub fn new() -> Self {
+        Self {
+            bytes: vec![0; ROW_BLOCK_BYTES],
+            used: 0,
+            restarts: Vec::with_capacity(MAX_RESTARTS),
+            last_key: Vec::with_capacity(ROW_BLOCK_BYTES),
+            row_count: 0,
+        }
+    }
+
+    /// Read the heap these buffers hold
+    pub fn heap_bytes(&self) -> ByteCount {
+        let restarts = self.restarts.capacity() * size_of::<u16>();
+        ByteCount((self.bytes.capacity() + restarts + self.last_key.capacity()) as u64)
+    }
+
+    /// Count the rows so far
+    pub fn row_count(&self) -> RowCount {
+        RowCount(u64::from(self.row_count))
+    }
+
+    /// Check whether the block holds no rows
+    pub fn is_empty(&self) -> bool {
+        self.row_count == 0
+    }
+
+    /// Add a row, or return false when the block is full
+    pub fn push(&mut self, key: &[u8], row: &FooterRow) -> bool {
+        let is_restart = self.row_count.is_multiple_of(RESTART_INTERVAL);
+        let shared = if is_restart { 0 } else { shared_length(&self.last_key, key) };
+        let suffix = &key[shared..];
+
+        let restarts_after = self.restarts.len() + usize::from(is_restart);
+        let trailer = restarts_after * size_of::<u16>() + BLOCK_TRAILER_BYTES;
+        let most_row_bytes = 5 * MAX_VARINT_BYTES + 1 + suffix.len();
+        if self.used + most_row_bytes + trailer > ROW_BLOCK_BYTES {
+            return false;
+        }
+
+        if is_restart {
+            self.restarts.push(self.used as u16);
+        }
+        self.put_varint(shared as u64);
+        self.put_varint(suffix.len() as u64);
+        self.bytes[self.used..self.used + suffix.len()].copy_from_slice(suffix);
+        self.used += suffix.len();
+        self.bytes[self.used] = row.kind.as_byte();
+        self.used += 1;
+        self.put_varint(row.place.0);
+        self.put_varint(row.offset.0);
+        self.put_varint(row.length.0);
+
+        self.last_key.truncate(shared);
+        self.last_key.extend_from_slice(suffix);
+        self.row_count += 1;
+        true
+    }
+
+    /// Append one number, which the room check has already allowed for
+    pub fn put_varint(&mut self, number: u64) {
+        if let Some(used) = write_varint(&mut self.bytes[self.used..], number) {
+            self.used += used;
+        }
+    }
+
+    /// Close the block and return its bytes
+    pub fn finish(&mut self) -> &[u8] {
+        for restart in &self.restarts {
+            self.bytes[self.used..self.used + size_of::<u16>()].copy_from_slice(&restart.to_le_bytes());
+            self.used += size_of::<u16>();
+        }
+        self.bytes[self.used..self.used + COUNT_BYTES].copy_from_slice(&self.row_count.to_le_bytes());
+        self.used += COUNT_BYTES;
+        let restarts = self.restarts.len() as u16;
+        self.bytes[self.used..self.used + RESTART_COUNT_BYTES].copy_from_slice(&restarts.to_le_bytes());
+        self.used += RESTART_COUNT_BYTES;
+
+        let sum = xxh3_64(&self.bytes[..self.used]);
+        self.bytes[self.used..self.used + BLOCK_SUM_BYTES].copy_from_slice(&sum.to_le_bytes());
+        self.used += BLOCK_SUM_BYTES;
+        &self.bytes[..self.used]
+    }
+
+    /// Start the next block in the same buffers
+    pub fn clear(&mut self) {
+        self.used = 0;
+        self.restarts.clear();
+        self.last_key.clear();
+        self.row_count = 0;
+    }
+}
+
+impl Default for RowBlockBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'block> RowBlockWalk<'block> {
+    /// Check a stored block and start at its first row, or return nothing when it's damaged
+    pub fn open(block: &'block [u8]) -> Option<Self> {
+        let sum_at = block.len().checked_sub(BLOCK_SUM_BYTES)?;
+        let mut sum = [0; BLOCK_SUM_BYTES];
+        sum.copy_from_slice(&block[sum_at..]);
+        if xxh3_64(&block[..sum_at]) != u64::from_le_bytes(sum) {
+            return None;
+        }
+
+        let count_at = sum_at.checked_sub(RESTART_COUNT_BYTES)?;
+        let restarts = u16::from_le_bytes([block[count_at], block[count_at + 1]]) as usize;
+        let rows_count_at = count_at.checked_sub(COUNT_BYTES)?;
+        let restarts_at = rows_count_at.checked_sub(restarts * size_of::<u16>())?;
+        Some(Self {
+            rows: &block[..restarts_at],
+            restarts: &block[restarts_at..rows_count_at],
+            position: 0,
+        })
+    }
+
+    /// Count the restart points
+    pub fn restart_count(&self) -> usize {
+        self.restarts.len() / size_of::<u16>()
+    }
+
+    /// Read a restart point's position
+    pub fn restart_at(&self, index: usize) -> usize {
+        let at = index * size_of::<u16>();
+        u16::from_le_bytes([self.restarts[at], self.restarts[at + 1]]) as usize
+    }
+
+    /// Fill the key buffer with the next row's key and return its row, or nothing at the end
+    pub fn next_row(&mut self, key: &mut Vec<u8>) -> Option<FooterRow> {
+        let bytes = self.rows.get(self.position..)?;
+        if bytes.is_empty() {
+            return None;
+        }
+
+        let (shared, shared_bytes) = read_varint(bytes)?;
+        let (suffix_length, suffix_bytes) = read_varint(bytes.get(shared_bytes..)?)?;
+        let suffix_at = shared_bytes + suffix_bytes;
+        let suffix = bytes.get(suffix_at..suffix_at + suffix_length as usize)?;
+        key.truncate(shared as usize);
+        key.extend_from_slice(suffix);
+
+        let kind_at = suffix_at + suffix_length as usize;
+        let kind = RowKind::from_byte(*bytes.get(kind_at)?)?;
+        let (place, place_bytes) = read_varint(bytes.get(kind_at + 1..)?)?;
+        let offset_at = kind_at + 1 + place_bytes;
+        let (offset, offset_bytes) = read_varint(bytes.get(offset_at..)?)?;
+        let length_at = offset_at + offset_bytes;
+        let (length, length_bytes) = read_varint(bytes.get(length_at..)?)?;
+
+        self.position += length_at + length_bytes;
+        Some(FooterRow {
+            place: WritePlace(place),
+            offset: FileOffset(offset),
+            length: ByteCount(length),
+            kind,
+        })
+    }
+
+    /// Read the key at a restart point, leaving the walk there
+    pub fn key_at_restart(&mut self, index: usize, key: &mut Vec<u8>) -> Option<FooterRow> {
+        self.position = self.restart_at(index);
+        key.clear();
+        self.next_row(key)
+    }
+
+    /// Move to the first row at or after a key, return its row, and leave its key in the buffer
+    pub fn seek(&mut self, target: &[u8], key: &mut Vec<u8>) -> Option<FooterRow> {
+        let mut low = 0;
+        let mut high = self.restart_count();
+        while low + 1 < high {
+            let middle = (low + high) / 2;
+            self.key_at_restart(middle, key)?;
+            if key.as_slice() < target {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+
+        let mut row = self.key_at_restart(low, key)?;
+        while key.as_slice() < target {
+            row = self.next_row(key)?;
+        }
+        Some(row)
+    }
+}
+
+/// Count the bytes two keys share at the front
+pub fn shared_length(left: &[u8], right: &[u8]) -> usize {
+    let mut shared = 0;
+    for (left_byte, right_byte) in left.iter().zip(right.iter()) {
+        if left_byte != right_byte {
+            break;
+        }
+        shared += 1;
+    }
+    shared
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROWS: u64 = 500;
+
+    fn key_of(number: u64) -> Vec<u8> {
+        format!("column-key-{number:08}").into_bytes()
+    }
+
+    fn row_of(number: u64) -> FooterRow {
+        FooterRow {
+            place: WritePlace(number * 3),
+            offset: FileOffset(number * 1_000),
+            length: ByteCount(number),
+            kind: if number.is_multiple_of(5) { RowKind::Grave } else { RowKind::Value },
+        }
+    }
+
+    fn filled() -> RowBlockBuilder {
+        let mut builder = RowBlockBuilder::new();
+        for number in 0..ROWS {
+            assert!(builder.push(&key_of(number * 2), &row_of(number)));
+        }
+        builder
+    }
+
+    // rows walk back in order with their keys whole
+    #[test]
+    fn block_walk() {
+        let mut builder = filled();
+        let block = builder.finish();
+        let mut walk = RowBlockWalk::open(block).expect("whole block");
+        let mut key = Vec::new();
+
+        for number in 0..ROWS {
+            assert_eq!(walk.next_row(&mut key), Some(row_of(number)));
+            assert_eq!(key, key_of(number * 2));
+        }
+        assert_eq!(walk.next_row(&mut key), None);
+    }
+
+    // a seek lands on the key, or on the first one after it, or past the end
+    #[test]
+    fn block_seek() {
+        let mut builder = filled();
+        let block = builder.finish();
+        let mut key = Vec::new();
+
+        for number in 0..ROWS {
+            let mut walk = RowBlockWalk::open(block).expect("whole block");
+            assert_eq!(walk.seek(&key_of(number * 2), &mut key), Some(row_of(number)));
+            assert_eq!(key, key_of(number * 2));
+
+            let mut walk = RowBlockWalk::open(block).expect("whole block");
+            let after = walk.seek(&key_of(number * 2 + 1), &mut key);
+            if number + 1 < ROWS {
+                assert_eq!(after, Some(row_of(number + 1)));
+            } else {
+                assert_eq!(after, None);
+            }
+        }
+    }
+
+    // a block stays inside its size and refuses the row that would overflow it
+    #[test]
+    fn block_limit() {
+        let mut builder = RowBlockBuilder::new();
+        let mut number = 0;
+        while builder.push(&key_of(number), &row_of(number)) {
+            number += 1;
+        }
+
+        assert!(number > ROWS);
+        assert!(builder.finish().len() <= ROW_BLOCK_BYTES);
+    }
+
+    // one flipped bit fails the block
+    #[test]
+    fn block_rot() {
+        let mut builder = filled();
+        let mut block = builder.finish().to_vec();
+
+        block[100] ^= 1;
+
+        assert!(RowBlockWalk::open(&block).is_none());
+    }
+
+    // empty keys and repeated keys survive the shared prefixes
+    #[test]
+    fn odd_keys() {
+        let mut builder = RowBlockBuilder::new();
+        assert!(builder.push(b"", &row_of(1)));
+        assert!(builder.push(b"same", &row_of(2)));
+        assert!(builder.push(b"same", &row_of(3)));
+
+        let block = builder.finish();
+        let mut walk = RowBlockWalk::open(block).expect("whole block");
+        let mut key = Vec::new();
+
+        assert_eq!(walk.next_row(&mut key), Some(row_of(1)));
+        assert!(key.is_empty());
+        assert_eq!(walk.next_row(&mut key), Some(row_of(2)));
+        assert_eq!(key, b"same");
+        assert_eq!(walk.next_row(&mut key), Some(row_of(3)));
+        assert_eq!(key, b"same");
+    }
+}

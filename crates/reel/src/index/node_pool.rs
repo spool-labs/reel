@@ -23,6 +23,7 @@ pub struct NodeCount(pub u32);
 #[derive(Clone, Copy, Debug)]
 pub struct TreeNode {
     pub count: u32,
+    pub version: u32,
     pub is_leaf: bool,
     pub next: NodeIndex,
     pub previous: NodeIndex,
@@ -45,6 +46,7 @@ impl TreeNode {
     pub fn empty() -> Self {
         Self {
             count: 0,
+            version: 0,
             is_leaf: true,
             next: NO_NODE,
             previous: NO_NODE,
@@ -98,6 +100,7 @@ impl NodePool {
         self.free_count = NodeCount(self.free_count.0 - 1);
         let node = self.node_mut(index);
         node.count = 0;
+        node.version = node.version.wrapping_add(1);
         node.is_leaf = is_leaf;
         node.next = NO_NODE;
         node.previous = NO_NODE;

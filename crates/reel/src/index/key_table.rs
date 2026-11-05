@@ -6,6 +6,11 @@ use reel_api::units::ByteCount;
 use crate::index::entry_slab::{EntryAddress, EntrySlab, NO_ENTRY};
 use crate::index::key_hash::KeyHash;
 
+/// The table refuses a new key past this share of its slots, in eighths
+pub const LOAD_LIMIT_EIGHTHS: usize = 7;
+/// The share above counts in eighths
+pub const LOAD_LIMIT_SCALE: usize = 8;
+
 /// One slot: the low bits of the key's hash and the newest row of the key
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TableSlot {
@@ -18,6 +23,7 @@ pub struct TableSlot {
 pub struct KeyTable {
     slots: Vec<TableSlot>,
     mask: usize,
+    used: usize,
 }
 
 impl KeyTable {
@@ -31,12 +37,18 @@ impl KeyTable {
         Self {
             slots: vec![empty; size],
             mask: size - 1,
+            used: 0,
         }
     }
 
     /// Read the heap this table holds
     pub fn heap_bytes(&self) -> ByteCount {
         ByteCount((self.slots.capacity() * size_of::<TableSlot>()) as u64)
+    }
+
+    /// Check a new key can go in, which also keeps every probe finite
+    pub fn has_room(&self) -> bool {
+        self.used * LOAD_LIMIT_SCALE < self.slots.len() * LOAD_LIMIT_EIGHTHS
     }
 
     /// Find the slot of a key, or the empty slot where it belongs
@@ -62,6 +74,9 @@ impl KeyTable {
 
     /// Point a slot at a row
     pub fn set(&mut self, index: usize, hash: KeyHash, head: EntryAddress) {
+        if self.slots[index].head == NO_ENTRY {
+            self.used += 1;
+        }
         self.slots[index] = TableSlot {
             tag: hash.0 as u32,
             head,
@@ -70,6 +85,7 @@ impl KeyTable {
 
     /// Empty a slot, moving later rows back so no probe breaks
     pub fn remove(&mut self, index: usize) {
+        self.used -= 1;
         let mut hole = index;
         let mut next = (hole + 1) & self.mask;
         loop {

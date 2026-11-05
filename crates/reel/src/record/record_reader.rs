@@ -106,6 +106,9 @@ impl RecordReader {
                 let Some(head) = self.check_chunked(form, shape.front_length, identity) else {
                     return Ok(RecordRead::Failed);
                 };
+                if head.value_length != shape.value_length {
+                    return Ok(RecordRead::Failed);
+                }
                 return self.check_payload(file, location, &head, buf);
             }
         }

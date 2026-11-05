@@ -112,14 +112,17 @@ impl RecordEncoder {
             Codec::None => self.table_as_written(value, payload_start),
             Codec::Lz4 => self.table_compressed(value, payload_start)?,
         };
+
+        // a record nothing shrank in reads as one run, like a none column's
+        let stored_codec = if payload_length == value.len() { Codec::None } else { codec };
         self.seal_table(chunks, payload_start + payload_length as u64);
-        self.write_chunked_head(identity, codec, value_length, chunks, head_length);
+        self.write_chunked_head(identity, stored_codec, value_length, chunks, head_length);
 
         Some(RecordShape {
             head_length,
             table_length,
             payload_length,
-            is_payload_stored: codec == Codec::Lz4,
+            is_payload_stored: stored_codec == Codec::Lz4,
         })
     }
 

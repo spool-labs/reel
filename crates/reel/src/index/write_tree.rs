@@ -438,6 +438,7 @@ pub fn insert_slot(nodes: &mut NodePool, node: NodeIndex, position: u32, slot: &
     tree_node.entries[index] = slot.address;
     tree_node.children[index] = slot.child;
     tree_node.count += 1;
+    tree_node.version = tree_node.version.wrapping_add(1);
 }
 
 /// Move a node's slots past a count into an empty sibling
@@ -451,5 +452,7 @@ pub fn move_upper(nodes: &mut NodePool, from: NodeIndex, to: NodeIndex, keep: us
     target.children[..moved].copy_from_slice(&source.children[keep..keep + moved]);
     target.count = moved as u32;
 
-    nodes.node_mut(from).count = keep as u32;
+    let source = nodes.node_mut(from);
+    source.count = keep as u32;
+    source.version = source.version.wrapping_add(1);
 }

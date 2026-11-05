@@ -7,6 +7,7 @@ pub mod node_pool;
 pub mod open_slots;
 pub mod seal_walk;
 pub mod seek_target;
+pub mod shard_cursor;
 pub mod spot_index;
 pub mod write_index;
 pub mod write_row;

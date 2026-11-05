@@ -7,6 +7,7 @@ use reel_api::units::{ByteCount, RowCount, WritePlace};
 
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::open_slots::{OpenSlot, OpenSlots};
+use crate::index::shard_cursor::ShardCursor;
 use crate::index::write_row::{WriteLookup, WriteRow};
 use crate::index::write_shard::{ShardSizing, WalkBound, WriteShard};
 
@@ -84,8 +85,15 @@ impl WriteIndex {
     }
 
     /// Find the key a walk reaches next in one shard
-    pub fn next_key(&self, shard: usize, bound: &WalkBound, view: OpenSlots, key: &mut Vec<u8>) -> bool {
-        self.read_shard(shard).next_key(bound, view, key)
+    pub fn next_key(
+        &self,
+        shard: usize,
+        cursor: &mut ShardCursor,
+        bound: &WalkBound,
+        view: OpenSlots,
+        key: &mut Vec<u8>,
+    ) -> bool {
+        self.read_shard(shard).next_key(cursor, bound, view, key)
     }
 }
 

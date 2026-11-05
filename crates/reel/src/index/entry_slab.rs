@@ -18,9 +18,11 @@ pub const PLACE_AT: usize = 0;
 /// Where the file offset sits in a row
 pub const OFFSET_AT: usize = 8;
 /// Where the record length sits in a row
-pub const LENGTH_AT: usize = 16;
+pub const LENGTH_AT: usize = 12;
 /// Where the link to the next older version sits in a row
-pub const OLDER_AT: usize = 20;
+pub const OLDER_AT: usize = 16;
+/// Where the link to the next newer version sits in a row
+pub const NEWER_AT: usize = 20;
 /// Where the column sits in a row
 pub const COLUMN_AT: usize = 24;
 /// Where the kind and flags sit in a row
@@ -121,9 +123,10 @@ impl EntrySlab {
         let start = self.claim(chain, entry_size(key.len()))?;
         let bytes = &mut self.bytes[start..start + KEY_AT + key.len()];
         bytes[PLACE_AT..OFFSET_AT].copy_from_slice(&row.place.0.to_le_bytes());
-        bytes[OFFSET_AT..LENGTH_AT].copy_from_slice(&row.offset.0.to_le_bytes());
+        bytes[OFFSET_AT..LENGTH_AT].copy_from_slice(&(row.offset.0 as u32).to_le_bytes());
         bytes[LENGTH_AT..OLDER_AT].copy_from_slice(&(row.length.0 as u32).to_le_bytes());
-        bytes[OLDER_AT..COLUMN_AT].copy_from_slice(&NO_ENTRY.0.to_le_bytes());
+        bytes[OLDER_AT..NEWER_AT].copy_from_slice(&NO_ENTRY.0.to_le_bytes());
+        bytes[NEWER_AT..COLUMN_AT].copy_from_slice(&NO_ENTRY.0.to_le_bytes());
         bytes[COLUMN_AT] = column.0;
         bytes[KIND_AT] = row.kind.as_byte();
         bytes[KEY_LENGTH_AT..SLOT_AT].copy_from_slice(&(key.len() as u16).to_le_bytes());
@@ -192,7 +195,7 @@ impl EntrySlab {
         let start = byte_of(address);
         Some(WriteRow {
             place: WritePlace(self.word(start + PLACE_AT)),
-            offset: FileOffset(self.word(start + OFFSET_AT)),
+            offset: FileOffset(u64::from(self.half(start + OFFSET_AT))),
             length: ByteCount(u64::from(self.half(start + LENGTH_AT))),
             kind: RowKind::from_byte(self.bytes[start + KIND_AT] & !NEWER_SEALED_FLAG)?,
             slot: self.slot(address),
@@ -208,6 +211,17 @@ impl EntrySlab {
     pub fn set_older(&mut self, address: EntryAddress, older: EntryAddress) {
         let at = byte_of(address) + OLDER_AT;
         self.bytes[at..at + size_of::<u32>()].copy_from_slice(&older.0.to_le_bytes());
+    }
+
+    /// Read the next newer version of a row's key
+    pub fn newer(&self, address: EntryAddress) -> EntryAddress {
+        EntryAddress(self.half(byte_of(address) + NEWER_AT))
+    }
+
+    /// Link a row to the next newer version of its key
+    pub fn set_newer(&mut self, address: EntryAddress, newer: EntryAddress) {
+        let at = byte_of(address) + NEWER_AT;
+        self.bytes[at..at + size_of::<u32>()].copy_from_slice(&newer.0.to_le_bytes());
     }
 
     /// Check whether a newer version of this row's key sits in a sealed segment

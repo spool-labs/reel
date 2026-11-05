@@ -6,6 +6,7 @@ use reel::index::entry_slab::PageCount;
 use reel::index::node_pool::NodeCount;
 use reel::index::open_slots::{OpenSlot, OpenSlots};
 use reel::index::seal_walk::SealWalk;
+use reel::index::shard_cursor::ShardCursor;
 use reel::index::write_index::{SHARD_COUNT, WriteIndex};
 use reel::index::write_row::WriteRow;
 use reel::index::write_shard::{ShardSizing, WalkBound};
@@ -35,7 +36,14 @@ const TIGHT: ShardSizing = ShardSizing {
     table_slots: 8_192,
     open_slots: 4,
 };
+const SMALL_TABLE: ShardSizing = ShardSizing {
+    pages: PageCount(32),
+    nodes: NodeCount(512),
+    table_slots: 64,
+    open_slots: 4,
+};
 const LATEST: WritePlace = WritePlace(u64::MAX - 1);
+const MANY_VERSIONS: u64 = 3_000;
 
 fn row(place: u64, slot: OpenSlot, kind: RowKind) -> WriteRow {
     WriteRow {
@@ -74,11 +82,16 @@ fn drained(walk: &mut SealWalk, index: &WriteIndex) -> Vec<(Vec<u8>, u64)> {
     rows
 }
 
-fn next_across_shards(index: &WriteIndex, bound: &WalkBound, view: OpenSlots) -> Option<Vec<u8>> {
+fn next_across_shards(
+    index: &WriteIndex,
+    cursors: &mut [ShardCursor],
+    bound: &WalkBound,
+    view: OpenSlots,
+) -> Option<Vec<u8>> {
     let mut best: Option<Vec<u8>> = None;
     let mut found = Vec::new();
-    for shard in 0..SHARD_COUNT {
-        if !index.next_key(shard, bound, view, &mut found) {
+    for (shard, cursor) in cursors.iter_mut().enumerate() {
+        if !index.next_key(shard, cursor, bound, view, &mut found) {
             continue;
         }
         let is_closer = match (&best, bound.direction) {
@@ -373,6 +386,7 @@ fn walk_keys() {
     let other = ColumnId(COLUMN.0 + 1);
     assert!(index.insert(other, b"key-99999", &row(ROWS + 1, SEALED, RowKind::Value)));
 
+    let mut cursors = vec![ShardCursor::new(SIZING.open_slots); SHARD_COUNT];
     let mut walked = Vec::new();
     let mut last: Vec<u8> = Vec::new();
     let mut is_inclusive = true;
@@ -383,7 +397,7 @@ fn walk_keys() {
             is_inclusive,
             direction: Direction::Ascending,
         };
-        let Some(next) = next_across_shards(&index, &bound, both()) else {
+        let Some(next) = next_across_shards(&index, &mut cursors, &bound, both()) else {
             break;
         };
         walked.push(next.clone());
@@ -393,6 +407,7 @@ fn walk_keys() {
     let ascending: Vec<Vec<u8>> = expected.iter().cloned().collect();
     assert_eq!(walked, ascending);
 
+    let mut cursors = vec![ShardCursor::new(SIZING.open_slots); SHARD_COUNT];
     let mut walked = Vec::new();
     let mut last = b"z".to_vec();
     loop {
@@ -402,7 +417,7 @@ fn walk_keys() {
             is_inclusive: false,
             direction: Direction::Descending,
         };
-        let Some(next) = next_across_shards(&index, &bound, both()) else {
+        let Some(next) = next_across_shards(&index, &mut cursors, &bound, both()) else {
             break;
         };
         walked.push(next.clone());
@@ -410,4 +425,117 @@ fn walk_keys() {
     }
     let descending: Vec<Vec<u8>> = expected.iter().rev().cloned().collect();
     assert_eq!(walked, descending);
+}
+
+// a shard refuses a row when its table is near full, and never spins in a probe
+#[test]
+fn table_limit() {
+    let index = WriteIndex::new(&SMALL_TABLE);
+    let mut taken = 0;
+    for number in 0..ROWS {
+        if index.insert(COLUMN, &key_of(number), &row(number + 1, SEALED, RowKind::Value)) {
+            taken += 1;
+        }
+    }
+
+    assert!(taken < ROWS);
+    let absent = index.lookup(COLUMN, b"absent", LATEST, both());
+    assert_eq!(absent.row, None);
+}
+
+// cleaning a middle segment keeps the versions on both sides of it
+#[test]
+fn middle_clean() {
+    let middle = OpenSlot(2);
+    let view = both().with(middle);
+    let index = WriteIndex::new(&SIZING);
+    add(&index, b"key", row(1, STAYING, RowKind::Value));
+    add(&index, b"key", row(2, middle, RowKind::Value));
+    add(&index, b"key", row(3, SEALED, RowKind::Value));
+
+    assert!(index.clean_slot(middle, CLEAN_ALL));
+
+    let without_middle = view.without(middle);
+    let newest = index.lookup(COLUMN, b"key", LATEST, without_middle);
+    assert_eq!(newest.row.expect("newest").place, WritePlace(3));
+    assert!(!newest.should_ask_footers);
+    let oldest = index.lookup(COLUMN, b"key", WritePlace(2), without_middle);
+    assert_eq!(oldest.row.expect("oldest").place, WritePlace(1));
+    assert!(oldest.should_ask_footers);
+}
+
+// a cue far behind a much rewritten key finds its version among all the newer ones
+#[test]
+fn cue_versions() {
+    let index = WriteIndex::new(&SIZING);
+    for place in 1..=MANY_VERSIONS {
+        let slot = if place % 2 == 0 { SEALED } else { STAYING };
+        add(&index, b"key", row(place, slot, RowKind::Value));
+    }
+
+    for read_point in [1, 2, 77, MANY_VERSIONS - 1, MANY_VERSIONS] {
+        let found = index.lookup(COLUMN, b"key", WritePlace(read_point), both());
+        assert_eq!(found.row.expect("version").place, WritePlace(read_point));
+        assert!(!found.should_ask_footers);
+    }
+}
+
+// a much rewritten key cleans out of one slot and keeps its versions in the other
+#[test]
+fn hot_key_clean() {
+    let index = WriteIndex::new(&SIZING);
+    for place in 1..=MANY_VERSIONS {
+        let slot = if place % 2 == 0 { SEALED } else { STAYING };
+        add(&index, b"key", row(place, slot, RowKind::Value));
+    }
+
+    assert!(index.clean_slot(SEALED, CLEAN_ALL));
+
+    let found = index.lookup(COLUMN, b"key", LATEST, after_seal());
+    assert_eq!(found.row.expect("row").place, WritePlace(MANY_VERSIONS - 1));
+    assert!(found.should_ask_footers);
+}
+
+// a walk keeps going through rows written under it, with no key twice and none lost
+#[test]
+fn walk_under_writes() {
+    let index = WriteIndex::new(&SIZING);
+    let mut expected: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for number in 0..KEY_SPACE {
+        let key = key_of(number * 2);
+        add(&index, &key, row(number + 1, SEALED, RowKind::Value));
+        expected.insert(key);
+    }
+
+    let mut cursors = vec![ShardCursor::new(SIZING.open_slots); SHARD_COUNT];
+    let mut walked = Vec::new();
+    let mut last: Vec<u8> = Vec::new();
+    let mut is_inclusive = true;
+    let mut place = KEY_SPACE;
+    loop {
+        let bound = WalkBound {
+            column: COLUMN,
+            key: &last,
+            is_inclusive,
+            direction: Direction::Ascending,
+        };
+        let Some(next) = next_across_shards(&index, &mut cursors, &bound, both()) else {
+            break;
+        };
+        walked.push(next.clone());
+        last = next;
+        is_inclusive = false;
+
+        place += 1;
+        add(&index, &key_of(place % KEY_SPACE * 2 + 1), row(place, STAYING, RowKind::Value));
+    }
+
+    let mut previous: Option<&Vec<u8>> = None;
+    for key in &walked {
+        assert!(previous.is_none_or(|earlier| earlier < key));
+        previous = Some(key);
+    }
+    for key in &expected {
+        assert!(walked.contains(key));
+    }
 }

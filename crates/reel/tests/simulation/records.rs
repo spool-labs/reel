@@ -391,3 +391,16 @@ fn short_span() {
     let (read, _value) = read_all(&stored, &identity());
     assert_eq!(read, RecordRead::Failed);
 }
+
+// an lz4 value nothing shrank stores as written, so it reads in two reads
+#[test]
+fn nothing_shrank() {
+    let value = noise(32 * CHUNK_BYTES);
+    let stored = store(Codec::Lz4, &value);
+
+    assert_eq!(count_reads(&stored, Codec::Lz4), 2);
+    assert_eq!(count_reads(&stored, Codec::None), 1);
+    let (read, restored) = read_declared(&stored, &identity(), Codec::Lz4);
+    assert_eq!(read, RecordRead::Valid);
+    assert_eq!(restored, value);
+}

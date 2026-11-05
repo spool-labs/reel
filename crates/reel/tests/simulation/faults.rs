@@ -199,6 +199,11 @@ impl Run {
         // half of the rot lands in the footer end of the file, where few bytes hold a lot
         let reach = if self.random.one_in(2) { length.min(TAIL_REACH) } else { length };
         let at = length - 1 - self.random.below(reach);
+        // a bad sector fails its reads for good, and rot leaves them passing with the wrong bytes
+        if self.random.one_in(3) {
+            self.io.bad_sector(path, FileOffset(at)).expect("bad");
+            return;
+        }
         self.io.rot(path, FileOffset(at), BitMask(1 << self.random.below(8))).expect("rot");
     }
 

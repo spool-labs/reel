@@ -12,6 +12,7 @@ use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::spot_index::SpotLocation;
 use crate::index::write_row::WriteRow;
 use crate::io::Io;
+use crate::io::device_error::is_device_error;
 use crate::record::record_check::RecordIdentity;
 use crate::record::record_reader::{RecordLocation, RecordRead};
 use crate::row_kind::RowKind;
@@ -236,7 +237,7 @@ impl<Backend: Io> EngineState<Backend> {
             length: spot.length,
         };
         // a slot holds no key, so a failed check here means another key or a moved record: a miss
-        match self.read_record(&pin.file, location, read, want, buf)? {
+        match self.read_record(&pin.file, location, spot.place, read, want, buf)? {
             RecordRead::Valid => Ok(Some(true)),
             RecordRead::Failed => Ok(None),
         }
@@ -257,7 +258,7 @@ impl<Backend: Io> EngineState<Backend> {
             offset: row.offset,
             length: row.length,
         };
-        match self.read_record(&pin.file, location, read, want, buf)? {
+        match self.read_record(&pin.file, location, row.place, read, want, buf)? {
             RecordRead::Valid => Ok(true),
             RecordRead::Failed => Err(corruption(read)),
         }
@@ -279,7 +280,7 @@ impl<Backend: Io> EngineState<Backend> {
             offset: sealed.row.offset,
             length: sealed.row.length,
         };
-        match self.read_record(&pin.file, location, read, want, buf)? {
+        match self.read_record(&pin.file, location, sealed.row.place, read, want, buf)? {
             RecordRead::Valid => Ok(true),
             RecordRead::Failed => Err(corruption(read)),
         }
@@ -290,6 +291,7 @@ impl<Backend: Io> EngineState<Backend> {
         &self,
         file: &Backend::File,
         location: RecordLocation,
+        place: WritePlace,
         read: &KeyRead,
         want: RecordWant,
         buf: &mut Vec<u8>,
@@ -299,13 +301,21 @@ impl<Backend: Io> EngineState<Backend> {
             column: read.column,
             key: read.key,
             kind: RowKind::Value,
+            place,
         };
         let outcome = self.record_readers.with(|reader| match want {
             RecordWant::Whole => reader.read_value(file, location, &identity, read.info.codec, buf),
             RecordWant::Window(window) => reader.read_window(file, location, &identity, window, buf),
         });
         // a bad sector comes back as a read error, and it means what a failed check means
-        Ok(outcome.unwrap_or(RecordRead::Failed))
+        match outcome {
+            Ok(read) => Ok(read),
+            Err(source) if is_device_error(&source) => Ok(RecordRead::Failed),
+            Err(source) => Err(StoreError::Io {
+                action: "reading a record",
+                source,
+            }),
+        }
     }
 
     /// Find the key's newest row in the sealed segments, asking every one its range can't rule out
@@ -412,7 +422,16 @@ impl<Backend: Io> EngineState<Backend> {
                 place_base: pin.head.place_base,
             };
             let looked_up = reader.lookup_window(&pin.file, &window_read, &caches, &query);
-            let answer = looked_up.unwrap_or(FooterAnswer::Damaged);
+            let answer = match looked_up {
+                Ok(answer) => answer,
+                Err(source) if is_device_error(&source) => FooterAnswer::Damaged,
+                Err(source) => {
+                    return Err(StoreError::Io {
+                        action: "reading a footer",
+                        source,
+                    });
+                },
+            };
             match answer {
                 FooterAnswer::Found(row) => return Ok(Some(row)),
                 FooterAnswer::Damaged => return Err(corruption(read)),

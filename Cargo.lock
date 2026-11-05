@@ -74,6 +74,7 @@ dependencies = [
 name = "reel-sim"
 version = "0.4.0"
 dependencies = [
+ "libc",
  "reel",
  "reel-api",
 ]

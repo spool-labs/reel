@@ -3,6 +3,7 @@ use reel::record::record_check::*;
 use reel::record::record_head::RecordForm;
 use reel::row_kind::RowKind;
 use reel_api::column_id::ColumnId;
+use reel_api::units::WritePlace;
 
 const RECORD_KEY: RecordKey = RecordKey(9);
 const FORM: RecordForm = RecordForm {
@@ -20,6 +21,7 @@ fn identity(key: &[u8]) -> RecordIdentity<'_> {
         column: ColumnId(1),
         key,
         kind: RowKind::Value,
+        place: WritePlace(0),
     }
 }
 

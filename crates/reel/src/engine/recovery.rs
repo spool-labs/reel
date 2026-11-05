@@ -20,6 +20,7 @@ use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::index::write_row::WriteRow;
 use crate::io::job::{Job, JobStep};
+use crate::io::device_error::{is_device_error, read_or_damaged};
 use crate::io::{Io, IoFile};
 use crate::record::record_check::{RecordIdentity, RecordKey};
 use crate::record::record_head::SMALL_HEAD_BYTES;
@@ -41,8 +42,8 @@ use crate::segment::summary::{
 
 /// Steps a seal on the opening thread can take before open reports it stuck
 pub const MOST_INLINE_STEPS: u64 = 100_000_000;
-/// Bytes read at a time while searching a rows file for the group after a bad one
-pub const GROUP_SEARCH_BYTES: usize = 4_096;
+/// Bytes of a sector, the most a bad spot of a disk hides at once
+pub const GROUP_SEARCH_BYTES: usize = 512;
 
 /// A root's files, listed before any of them is read
 #[derive(Clone, Debug)]
@@ -356,7 +357,12 @@ pub fn read_segment<File: IoFile>(
         return Ok(SegmentRead::Open);
     }
     // a head that can't be read may hold anything, so it counts as something
-    if holds_nothing(file).unwrap_or(false) {
+    let is_empty = match holds_nothing(file) {
+        Ok(is_empty) => is_empty,
+        Err(error) if is_device_error(&error) => false,
+        Err(error) => return Err(error),
+    };
+    if is_empty {
         return Ok(SegmentRead::Empty {
             file_length: file.length()?,
         });
@@ -388,6 +394,8 @@ impl<Backend: Io> EngineState<Backend> {
             let end = found.file.length()?;
             let tails = ByteCount(end.0 - found.head.second_index_at.0);
             rewrite_range(&found.file, found.head.second_index_at, tails, &mut vec![0; GROUP_BYTES.0 as usize])?;
+            // the last sync covered the seal's cut to length too, so that goes out again as well
+            found.file.truncate(end)?;
             found.file.sync()?;
             match self.io.remove_file(&rows_path(&found.path, found.head.segment)) {
                 Ok(()) => {},
@@ -477,11 +485,17 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Find the next whole group: the one at this offset, or past a bad one the first that shows a sync
     /// covered it, which makes the bad one rot and never a torn end
-    pub fn next_group(&self, rows: &Backend::File, at: FileOffset, end: ByteCount, bytes: &mut [u8]) -> Option<(FileOffset, usize)> {
-        if let Some(length) = read_group(rows, at, end, bytes)
+    pub fn next_group(
+        &self,
+        rows: &Backend::File,
+        at: FileOffset,
+        end: ByteCount,
+        bytes: &mut [u8],
+    ) -> Result<Option<(FileOffset, usize)>> {
+        if let Some(length) = read_group(rows, at, end, bytes)?
             && parse_group(&bytes[..length], self.record_key).is_some()
         {
-            return Some((at, length));
+            return Ok(Some((at, length)));
         }
         covering_group(rows, at, end, bytes, self.record_key)
     }
@@ -493,7 +507,7 @@ impl<Backend: Io> EngineState<Backend> {
         let length = rows.length()?;
 
         while scan.valid_end.0 < length.0 {
-            let Some((at, group_length)) = self.next_group(rows, scan.valid_end, length, &mut bytes) else {
+            let Some((at, group_length)) = self.next_group(rows, scan.valid_end, length, &mut bytes)? else {
                 break;
             };
             let Some(group) = parse_group(&bytes[..group_length], self.record_key) else {
@@ -524,7 +538,7 @@ impl<Backend: Io> EngineState<Backend> {
         let end = ByteCount(scan.valid_end.0);
 
         while at.0 < scan.valid_end.0 {
-            let Some((start, length)) = self.next_group(rows, at, end, &mut bytes) else {
+            let Some((start, length)) = self.next_group(rows, at, end, &mut bytes)? else {
                 break;
             };
             at = start;
@@ -569,6 +583,7 @@ impl<Backend: Io> EngineState<Backend> {
             column: row.column,
             key: row.key,
             kind: row.kind,
+            place: row.place,
         };
         let location = RecordLocation {
             offset: row.offset,
@@ -577,9 +592,14 @@ impl<Backend: Io> EngineState<Backend> {
         let Some(info) = self.columns[row.column.0 as usize] else {
             return Ok(false);
         };
-        // a row whose record can't be read has no whole write behind it, whatever the reason
+        // a row whose record the device can't give back has no whole write behind it
         let read = records.read_value(data, location, &identity, info.codec, value);
-        Ok(matches!(read, Ok(RecordRead::Valid)))
+        match read {
+            Ok(RecordRead::Valid) => Ok(true),
+            Ok(RecordRead::Failed) => Ok(false),
+            Err(error) if is_device_error(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Put one recovered row in the write index, and return false when it has no room
@@ -623,7 +643,7 @@ pub fn rewrite_range<File: IoFile>(file: &File, start: FileOffset, length: ByteC
     while at < end {
         let step = copy.len().min((end - at) as usize);
         // a bad sector has nothing to give back, and what's under it stays as it is
-        if file.read_exact_at(FileOffset(at), &mut copy[..step]).is_ok() {
+        if read_or_damaged(file, FileOffset(at), &mut copy[..step])? {
             file.write_at(FileOffset(at), &[IoSlice::new(&copy[..step])])?;
         }
         at += step as u64;
@@ -790,7 +810,7 @@ pub fn copy_segment<Backend: Io>(
     let end = ByteCount(segment.scan.valid_end.0);
 
     'groups: while at.0 < segment.scan.valid_end.0 {
-        let Some((start, length)) = state.next_group(&segment.rows, at, end, &mut bytes) else {
+        let Some((start, length)) = state.next_group(&segment.rows, at, end, &mut bytes)? else {
             break;
         };
         at = start;
@@ -891,51 +911,59 @@ pub struct ReplayTarget<'file, Backend: Io> {
 
 
 /// Read the group at an offset into a buffer, and return its length when it's all there
-pub fn read_group<File: IoFile>(rows: &File, at: FileOffset, end: ByteCount, bytes: &mut [u8]) -> Option<usize> {
+pub fn read_group<File: IoFile>(rows: &File, at: FileOffset, end: ByteCount, bytes: &mut [u8]) -> Result<Option<usize>> {
     let left = end.0.saturating_sub(at.0) as usize;
-    if left < GROUP_HEADER_BYTES {
-        return None;
+    if left < GROUP_HEADER_BYTES || !read_or_damaged(rows, at, &mut bytes[..GROUP_HEADER_BYTES])? {
+        return Ok(None);
     }
-    rows.read_exact_at(at, &mut bytes[..GROUP_HEADER_BYTES]).ok()?;
-    let length = read_half(bytes, TOTAL_LENGTH_AT)? as usize;
+    let Some(length) = read_half(bytes, TOTAL_LENGTH_AT) else {
+        return Ok(None);
+    };
+    let length = length as usize;
     if length > left || length > bytes.len() || length < GROUP_HEADER_BYTES {
-        return None;
+        return Ok(None);
     }
-    rows.read_exact_at(at, &mut bytes[..length]).ok()?;
-    Some(length)
+    if !read_or_damaged(rows, at, &mut bytes[..length])? {
+        return Ok(None);
+    }
+    Ok(Some(length))
 }
 
-/// Search past a bad group for a whole group whose sync mark reaches over it
+/// Search past a bad group, a sector at a time, for a whole group whose sync mark reaches over it
 pub fn covering_group<File: IoFile>(
     rows: &File,
     bad_at: FileOffset,
     end: ByteCount,
     bytes: &mut [u8],
     record_key: RecordKey,
-) -> Option<(FileOffset, usize)> {
-    let mut chunk = [0; GROUP_SEARCH_BYTES];
+) -> Result<Option<(FileOffset, usize)>> {
+    let mut chunk = [0; GROUP_SEARCH_BYTES + size_of::<u32>()];
     let mut at = bad_at.0 + 1;
     while at + size_of::<u32>() as u64 <= end.0 {
-        let length = GROUP_SEARCH_BYTES.min((end.0 - at) as usize);
-        // a bad sector hides what it holds, and the search goes on after it
-        if rows.read_exact_at(FileOffset(at), &mut chunk[..length]).is_ok() {
-            for position in 0..=length - size_of::<u32>() {
+        let sector_end = (at / GROUP_SEARCH_BYTES as u64 + 1) * GROUP_SEARCH_BYTES as u64;
+        let length = (sector_end.min(end.0) - at) as usize;
+        // a bad sector hides what it holds, and the search goes on at the next one
+        if read_or_damaged(rows, FileOffset(at), &mut chunk[..length])? {
+            // a marker can start in this sector and run into the next, which may not read
+            let reach = (length + size_of::<u32>() - 1).min((end.0 - at) as usize);
+            let is_whole = read_or_damaged(rows, FileOffset(at), &mut chunk[..reach])?;
+            let readable = if is_whole { reach } else { length };
+            for position in 0..=readable.saturating_sub(size_of::<u32>()) {
                 if read_half(&chunk, position) != Some(GROUP_MAGIC) {
                     continue;
                 }
                 let candidate = FileOffset(at + position as u64);
-                if let Some(group_length) = read_group(rows, candidate, end, bytes)
+                if let Some(group_length) = read_group(rows, candidate, end, bytes)?
                     && let Some(group) = parse_group(&bytes[..group_length], record_key)
                     && group.synced_through > bad_at
                 {
-                    return Some((candidate, group_length));
+                    return Ok(Some((candidate, group_length)));
                 }
             }
         }
-        // the last bytes of a chunk go round again, since a marker can straddle two chunks
-        at += (length - size_of::<u32>() + 1) as u64;
+        at = sector_end;
     }
-    None
+    Ok(None)
 }
 
 /// Mark an open segment's columns damaged whole when rot took a group a sync had covered, ranked at the

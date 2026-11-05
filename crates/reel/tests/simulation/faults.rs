@@ -12,11 +12,14 @@ use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
 use reel::io::{Io, IoFile};
 use reel::record::codec::Codec;
+use reel::rows::row_group::parse_group;
+use reel::segment::summary::SummaryPaths;
+use reel::superblock::Superblock;
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId};
 
-const ROOTS: [&str; 2] = ["/disk/faults-meta", "/disk/faults-bulk"];
+const ROOTS: [&str; 3] = ["/disk/faults-meta", "/disk/faults-meta-two", "/disk/faults-bulk"];
 const COLUMNS: [ColumnId; 2] = [ColumnId(1), ColumnId(2)];
 const BUDGET: ByteCount = ByteCount(8 * 1024 * 1024);
 // each set keeps the seeds that found a bug, and a full sweep passed before these were cut down
@@ -33,6 +36,11 @@ const MOST_CRASH_DELAY: u64 = 40;
 const MOST_OPEN_DELAY: u64 = 120;
 const MOST_OPENS: u64 = 400;
 const TAIL_REACH: u64 = 200_000;
+const LARGE_VALUE_ODDS: u64 = 40;
+const LARGE_VALUE_BYTES: usize = 200_000;
+const POLICY_BYTES: ByteCount = ByteCount(4_096);
+const SYNCED_FILES: [&str; 4] = ["data", "rows", "summary", "new"];
+const MOST_SYNC_SKIP: u64 = 6;
 
 type Store = ReelStore<SimulatedIo>;
 type Key = (ColumnId, Vec<u8>);
@@ -54,6 +62,7 @@ struct Run {
     model: Model,
     seed: u64,
     has_rot: bool,
+    policy: SyncPolicy,
     steps_left: u64,
 }
 
@@ -66,11 +75,11 @@ impl Default for Versions {
     }
 }
 
-fn config() -> StoreConfig {
-    let volume = |name: &str, root: &str| VolumeConfig {
+fn config(policy: SyncPolicy) -> StoreConfig {
+    let volume = |name: &str, roots: &[&str], sync: SyncPolicy| VolumeConfig {
         name: name.to_string(),
-        roots: vec![PathBuf::from(root)],
-        sync: SyncPolicy::Never,
+        roots: roots.iter().map(PathBuf::from).collect(),
+        sync,
     };
     let column = |id: ColumnId, name: &str, volume: u8| ColumnConfig {
         id,
@@ -81,7 +90,7 @@ fn config() -> StoreConfig {
     };
     StoreConfig {
         memory_budget: BUDGET,
-        volumes: vec![volume("meta", ROOTS[0]), volume("bulk", ROOTS[1])],
+        volumes: vec![volume("meta", &ROOTS[..2], policy), volume("bulk", &ROOTS[2..], SyncPolicy::Never)],
         columns: vec![column(COLUMNS[0], "meta", 0), column(COLUMNS[1], "bulk", 1)],
     }
 }
@@ -107,6 +116,31 @@ fn data_files(io: &SimulatedIo) -> Vec<PathBuf> {
     files
 }
 
+// find how far a rows file is covered by a mark that a later sync covered too, and where the records of those
+// rows end: rot below that always has a surviving mark above it, and the spec accepts rot in a synced group
+// whose mark a power cut took
+fn durable_rows(io: &SimulatedIo, path: &Path) -> Option<(u64, u64)> {
+    let superblock = Superblock::read(io, Path::new(ROOTS[0])).ok()??;
+    let file = io.open_read_only(path).ok()?;
+    let length = file.length();
+    let mut bytes = vec![0; length.as_ref().map_or(0, |length| length.0 as usize)];
+    let read = file.read_exact_at(FileOffset(0), &mut bytes);
+    io.close_file(file);
+    read.ok()?;
+
+    let mut groups = Vec::new();
+    let mut at = 0;
+    while let Some(group) = bytes.get(at..).and_then(|rest| parse_group(rest, superblock.record_key)) {
+        let record_end = group.walk().map(|row| row.offset.0 + row.length.0).max().unwrap_or(0);
+        groups.push((at as u64, group.synced_through.0, record_end));
+        at += group.total_length.0 as usize;
+    }
+    let last_mark = groups.iter().map(|group| group.1).max()?;
+    let covered = groups.iter().filter(|group| group.0 < last_mark).map(|group| group.1).max()?;
+    let data_end = groups.iter().filter(|group| group.0 < covered).map(|group| group.2).max().unwrap_or(0);
+    Some((covered, data_end))
+}
+
 impl Run {
     fn new(seed: u64, has_rot: bool) -> Self {
         Self {
@@ -115,6 +149,11 @@ impl Run {
             random: SeededRandom::new(Seed(seed)),
             model: Model::new(),
             has_rot,
+            policy: match seed % 3 {
+                0 => SyncPolicy::Never,
+                1 => SyncPolicy::EveryWrite,
+                _other => SyncPolicy::EveryBytes(POLICY_BYTES),
+            },
             steps_left: STEPS,
         }
     }
@@ -129,7 +168,7 @@ impl Run {
             if self.random.one_in(4) {
                 self.arm_fault();
             }
-            let opened = ReelStore::open(self.io.clone(), &config());
+            let opened = ReelStore::open(self.io.clone(), &config(self.policy));
             if self.io.is_crashed() {
                 self.crash();
                 drop(opened);
@@ -156,12 +195,16 @@ impl Run {
 
     fn arm_fault(&mut self) {
         let count = OperationCount(1 + self.random.below(3));
-        match self.random.below(5) {
+        match self.random.below(6) {
             0 => self.io.fail_syncs(count),
             1 => self.io.fill_writes(count),
             2 => self.io.fail_writes(count),
             3 => self.io.fail_creates(count),
-            _last => self.io.fail_directory_syncs(count),
+            4 => self.io.fail_directory_syncs(count),
+            _last => {
+                let file = SYNCED_FILES[self.random.below(SYNCED_FILES.len() as u64) as usize];
+                self.io.fail_file_sync(file, OperationCount(self.random.below(MOST_SYNC_SKIP)));
+            },
         }
     }
 
@@ -172,12 +215,58 @@ impl Run {
         self.io.fail_writes(none);
         self.io.fail_creates(none);
         self.io.fail_directory_syncs(none);
+        self.io.clear_file_sync();
     }
 
     fn rot_one(&mut self) {
         if self.io.is_crashed() {
             return;
         }
+        match self.random.below(10) {
+            0 => self.rot_rows(),
+            1 => self.rot_summary(),
+            _data => self.rot_data(),
+        }
+    }
+
+    // rot in the summary costs rows that open builds again from the tails
+    fn rot_summary(&mut self) {
+        let root = Path::new(ROOTS[self.random.below(2) as usize * 2]);
+        let paths = SummaryPaths::new(root);
+        let Ok(file) = self.io.open_read_only(&paths.current) else {
+            return;
+        };
+        let length = file.length();
+        self.io.close_file(file);
+        if let Ok(ByteCount(length)) = length
+            && length > 0
+        {
+            let at = self.random.below(length);
+            let _rotted = self.io.rot(&paths.current, FileOffset(at), BitMask(1));
+        }
+    }
+
+    // rot in what a surviving mark covers, since rot in a synced group with its mark lost reads as a torn end
+    fn rot_rows(&mut self) {
+        let root = ROOTS[self.random.below(ROOTS.len() as u64) as usize];
+        let Ok(listing) = self.io.list_directory(Path::new(root)) else {
+            return;
+        };
+        let rows: Vec<&PathBuf> = listing.iter().filter(|path| path.extension().is_some_and(|name| name == "rows")).collect();
+        if rows.is_empty() {
+            return;
+        }
+        let path = rows[self.random.below(rows.len() as u64) as usize];
+        let Some((covered, _data_end)) = durable_rows(&self.io, path) else {
+            return;
+        };
+        if covered > 0 {
+            let at = self.random.below(covered);
+            let _rotted = self.io.rot(path, FileOffset(at), BitMask(1));
+        }
+    }
+
+    fn rot_data(&mut self) {
         let files = data_files(&self.io);
         if files.is_empty() {
             return;
@@ -193,6 +282,22 @@ impl Run {
             return;
         };
         if length == 0 {
+            return;
+        }
+
+        // an open segment takes rot only under records a surviving mark covers
+        let rows = path.with_extension("rows");
+        let Ok(listing) = self.io.list_directory(path.parent().unwrap_or(Path::new("/"))) else {
+            return;
+        };
+        if listing.contains(&rows) {
+            let Some((_covered, data_end)) = durable_rows(&self.io, &rows) else {
+                return;
+            };
+            if data_end > 0 {
+                let at = self.random.below(data_end);
+                let _rotted = self.io.rot(path, FileOffset(at), BitMask(1));
+            }
             return;
         }
 
@@ -214,14 +319,27 @@ impl Run {
 
     fn write(&mut self, store: &Store) {
         let (column, key) = self.random_key();
-        let value = (!self.random.one_in(3)).then(|| format!("value-{}", self.random.next_word()).into_bytes());
+        let is_grave = self.random.one_in(3);
+        let is_large = self.random.one_in(LARGE_VALUE_ODDS);
+        let mut bytes = format!("value-{}", self.random.next_word()).into_bytes();
+        if is_large {
+            bytes.resize(LARGE_VALUE_BYTES, b'x');
+        }
+        let value = (!is_grave).then_some(bytes);
         let written = match &value {
             Some(value) => store.put(column, &key, value),
             None => store.delete(column, &key),
         };
         // a crash inside the call leaves its outcome open, and the next open shows which way it went
-        if written.is_ok() || self.io.is_crashed() {
-            self.model.entry((column, key)).or_default().history.push(value);
+        // and so does a policy sync that failed after the write landed, which reads see from then on
+        let has_landed = matches!(written, Err(StoreError::Io { action: "syncing a volume", .. }));
+        if written.is_ok() || has_landed || self.io.is_crashed() {
+            let is_covered = written.is_ok() && column == COLUMNS[0] && self.policy == SyncPolicy::EveryWrite;
+            let versions = self.model.entry((column, key)).or_default();
+            versions.history.push(value);
+            if is_covered {
+                versions.floor = versions.history.len() - 1;
+            }
         }
     }
 

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
+use crate::io::device_error::is_device_error;
 use crate::io::{Io, IoFile};
 use crate::little_endian::read_half;
 use crate::record::record_check::{Checksum, checksum};
@@ -475,8 +476,10 @@ pub fn read_summary<Backend: Io>(
     let bytes = read_whole(&file);
     io.close_file(file);
     // rows the file can't give back are rebuilt from the tails, like any row that fails its check
-    let Ok(bytes) = bytes else {
-        return Ok(None);
+    let bytes = match bytes {
+        Ok(bytes) => bytes,
+        Err(error) if is_device_error(&error) => return Ok(None),
+        Err(error) => return Err(error),
     };
 
     let Some(header) = bytes.get(..SUMMARY_HEADER_BYTES) else {

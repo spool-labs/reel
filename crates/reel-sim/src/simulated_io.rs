@@ -11,7 +11,7 @@ use reel::guard::hold;
 use reel::io::Io;
 use reel::io::job::{Job, JobStep};
 use reel::io::lock_outcome::LockOutcome;
-use crate::file_image::BitMask;
+use crate::file_image::{BitMask, SECTOR_BYTES};
 use crate::seeded_random::Seed;
 use crate::simulated_disk::{FileSyncFault, InodeNumber, OperationCount, SimulatedDisk, SyncHook};
 use crate::simulated_file::SimulatedFile;
@@ -136,17 +136,22 @@ impl SimulatedIo {
         hold(&self.disk).file_sync_fault = Some(FileSyncFault { extension, skip });
     }
 
+    /// Take back an aimed sync failure that has not landed
+    pub fn clear_file_sync(&self) {
+        hold(&self.disk).file_sync_fault = None;
+    }
+
     /// Make the next syncs fail
     pub fn fail_syncs(&self, count: OperationCount) {
         hold(&self.disk).failing_syncs = count;
     }
 
-    /// Make one byte fail every read that touches it, as a bad sector does
+    /// Make the sector under an offset fail every read that touches it
     pub fn bad_sector(&self, path: &Path, offset: FileOffset) -> Result<()> {
         let mut disk = hold(&self.disk);
         let inode = disk.inode_of(path)?;
         if let Some(image) = disk.inodes.get_mut(&inode) {
-            image.bad_sectors.insert(offset.0);
+            image.bad_sectors.insert(offset.0 / SECTOR_BYTES);
         }
         Ok(())
     }

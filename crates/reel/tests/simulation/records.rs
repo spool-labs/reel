@@ -15,7 +15,7 @@ use reel::record::record_reader::{FIRST_READ_BYTES, RecordLocation, RecordRead, 
 use reel::row_kind::RowKind;
 use reel_api::column_id::ColumnId;
 use reel_api::reads::ValueWindow;
-use reel_api::units::{ByteCount, FileOffset};
+use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 const SEED: Seed = Seed(3);
 const RECORD_KEY: RecordKey = RecordKey(21);
@@ -38,6 +38,7 @@ fn identity() -> RecordIdentity<'static> {
         column: COLUMN,
         key: KEY,
         kind: RowKind::Value,
+        place: WritePlace(0),
     }
 }
 
@@ -403,4 +404,17 @@ fn nothing_shrank() {
     let (read, restored) = read_declared(&stored, &identity(), Codec::Lz4);
     assert_eq!(read, RecordRead::Valid);
     assert_eq!(restored, value);
+}
+
+// a record checks only for the write that made it, so bytes left at a reused offset fail
+#[test]
+fn wrong_place() {
+    let stored = store(Codec::None, b"value");
+    let mut other = identity();
+    other.place = WritePlace(1);
+
+    let (read, _bytes) = read_all(&stored, &other);
+
+    assert_eq!(read, RecordRead::Failed);
+    assert_eq!(read_all(&stored, &identity()).0, RecordRead::Valid);
 }

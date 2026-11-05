@@ -13,7 +13,7 @@ use crate::record::chunk_table::{
 };
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::lz4_block::decompress;
-use crate::record::record_check::{RecordIdentity, checksum, record_check};
+use crate::record::record_check::{RecordIdentity, checksum, place_check, record_check};
 use crate::record::record_head::{
     FORM_AT, RecordForm, SMALL_HEAD_BYTES, chunk_count, chunked_head_bytes, head_bytes_for, read_check, read_page_sum,
     read_value_length,
@@ -183,7 +183,7 @@ impl RecordReader {
             return RecordRead::Failed;
         }
         let payload = &self.first[SMALL_HEAD_BYTES..length];
-        let check = record_check(identity, form, checksum(payload));
+        let check = place_check(record_check(identity, form, checksum(payload)), identity.record_key, identity.place);
         if read_check(&self.first) != Some(check) {
             return RecordRead::Failed;
         }
@@ -209,7 +209,8 @@ impl RecordReader {
             return None;
         }
 
-        let check = record_check(identity, form, checksum(&self.first[FORM_AT..head_length]));
+        let sum = checksum(&self.first[FORM_AT..head_length]);
+        let check = place_check(record_check(identity, form, sum), identity.record_key, identity.place);
         if read_check(&self.first) != Some(check) {
             return None;
         }

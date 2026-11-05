@@ -100,7 +100,9 @@ impl FileImage {
 
     /// Check a read can reach these bytes
     pub fn is_readable(&self, start: usize, end: usize) -> bool {
-        self.bad_sectors.range(start as u64..end as u64).next().is_none()
+        let first = start as u64 / SECTOR_BYTES;
+        let last = end.saturating_sub(1) as u64 / SECTOR_BYTES;
+        start == end || self.bad_sectors.range(first..=last).next().is_none()
     }
 
     /// Check whether the bytes still take space on the disk

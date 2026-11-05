@@ -2,7 +2,7 @@
 
 use std::io::IoSlice;
 
-use reel_api::units::{ByteCount, FileOffset};
+use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::record::chunk_table::{
     ChunkCount, ChunkEntry, ENTRIES_PER_PAGE, PAGE_END_AT, TABLE_PAGE_BYTES, TablePageIndex, page_bytes, page_count,
@@ -10,7 +10,7 @@ use crate::record::chunk_table::{
 };
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::lz4_block::Lz4State;
-use crate::record::record_check::{RecordIdentity, checksum, record_check};
+use crate::record::record_check::{RecordCheck, RecordIdentity, RecordKey, checksum, place_check, record_check};
 use crate::record::record_head::{
     CHECK_BYTES, FORM_AT, PAGE_SUM_BYTES, PAGE_SUMS_AT, RecordForm, SMALL_HEAD_BYTES, VALUE_LENGTH_AT, chunk_count,
     chunked_head_bytes,
@@ -35,6 +35,7 @@ pub struct RecordEncoder {
     table: Vec<u8>,
     stored: Vec<u8>,
     lz4: Lz4State,
+    check: RecordCheck,
 }
 
 impl RecordShape {
@@ -54,6 +55,7 @@ impl RecordEncoder {
             table: vec![0; page_count(chunks).0 as usize * TABLE_PAGE_BYTES],
             stored: vec![0; stored],
             lz4: Lz4State::new(),
+            check: RecordCheck(0),
         }
     }
 
@@ -85,14 +87,15 @@ impl RecordEncoder {
             codec: stored_codec,
             is_chunked: false,
         };
-        let check = record_check(identity, form, checksum(payload));
-
-        self.head[..CHECK_BYTES].copy_from_slice(&check.0.to_le_bytes());
+        let sum = checksum(payload);
+        let payload_length = payload.len();
+        self.check = record_check(identity, form, sum);
+        self.set_place(identity.record_key, identity.place);
         self.head[FORM_AT] = form.as_byte();
         RecordShape {
             head_length: SMALL_HEAD_BYTES,
             table_length: 0,
-            payload_length: payload.len(),
+            payload_length,
             is_payload_stored: compressed.is_some(),
         }
     }
@@ -220,7 +223,13 @@ impl RecordEncoder {
             self.head[at..at + PAGE_SUM_BYTES].copy_from_slice(&sum.0.to_le_bytes());
         }
 
-        let check = record_check(identity, form, checksum(&self.head[FORM_AT..head_length]));
+        self.check = record_check(identity, form, checksum(&self.head[FORM_AT..head_length]));
+        self.set_place(identity.record_key, identity.place);
+    }
+
+    /// Fold in the place a claim gave this write, which a retry with a new claim does again
+    pub fn set_place(&mut self, record_key: RecordKey, place: WritePlace) {
+        let check = place_check(self.check, record_key, place);
         self.head[..CHECK_BYTES].copy_from_slice(&check.0.to_le_bytes());
     }
 

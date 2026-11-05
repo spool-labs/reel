@@ -6,6 +6,7 @@ use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::index::key_hash::KeyHash;
 use crate::io::IoFile;
+use crate::io::device_error::read_or_damaged;
 use crate::record::record_check::{Checksum, RecordKey, checksum};
 use crate::segment::block_cache::{BlockCache, BlockKey};
 use crate::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry, KeyPrefix};
@@ -138,7 +139,7 @@ impl FooterReader {
         let read = (end.0 as usize).min(MAX_TAIL_BYTES);
         let at = FileOffset(end.0 - read as u64);
         // a bad sector under a copy costs that copy, as a failed check does
-        if file.read_exact_at(at, &mut self.tail[..read]).is_err() {
+        if !read_or_damaged(file, at, &mut self.tail[..read])? {
             return Ok(None);
         }
 
@@ -184,7 +185,7 @@ impl FooterReader {
         while remaining > 0 {
             let lines = remaining.min(lines_per_read);
             let length = lines * BLOCK_ENTRY_BYTES;
-            if file.read_exact_at(at, &mut self.block[..length]).is_err() {
+            if !read_or_damaged(file, at, &mut self.block[..length])? {
                 return Ok(false);
             }
             sum = fold_sum(sum, checksum(&self.block[..length]));
@@ -250,7 +251,7 @@ impl FooterReader {
         };
 
         let length = first.block_length().0 as usize;
-        if file.read_exact_at(first.block_at(), &mut self.block[..length]).is_err() {
+        if !read_or_damaged(file, first.block_at(), &mut self.block[..length])? {
             return Ok(false);
         }
         let Some(mut walk) = RowBlockWalk::open(&self.block[..length], place_base) else {
@@ -262,7 +263,7 @@ impl FooterReader {
         }
 
         let length = last.block_length().0 as usize;
-        if file.read_exact_at(last.block_at(), &mut self.block[..length]).is_err() {
+        if !read_or_damaged(file, last.block_at(), &mut self.block[..length])? {
             return Ok(false);
         }
         let Some(mut walk) = RowBlockWalk::open(&self.block[..length], place_base) else {

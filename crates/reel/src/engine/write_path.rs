@@ -94,6 +94,7 @@ impl<Backend: Io> EngineState<Backend> {
             column: write.column,
             key: write.key,
             kind: RowKind::Value,
+            place: WritePlace(0),
         };
         let Some(shape) = encoder.encode(&identity, write.codec, write.value) else {
             return Err(StoreError::ValueTooLarge {
@@ -109,6 +110,7 @@ impl<Backend: Io> EngineState<Backend> {
         };
         loop {
             let claim = self.claim(volume, &request)?;
+            encoder.set_place(self.record_key, claim.first_place());
             let parts = encoder.parts(&shape, write.value);
             if let Err(source) = claim.data.write_at(claim.offset, &parts) {
                 return Err(store_error(volume, "writing a record", source));

@@ -45,6 +45,8 @@ const SETTLE_STEPS: u64 = 2_000_000;
 const SETTLE_TICK: Nanoseconds = Nanoseconds(1_000_000);
 const ROW_PERIOD: Nanoseconds = Nanoseconds(60_000_000);
 const SEED_COUNT: u64 = 16;
+// seeds a sweep found, kept so CI runs them
+const FOUND_SEEDS: [u64; 1] = [314];
 const STEPS: u64 = 4_000;
 const KEY_SPACE: u64 = 40;
 const MOST_IN_FLIGHT: usize = 6;
@@ -150,15 +152,14 @@ fn data_files(io: &SimulatedIo) -> Vec<PathBuf> {
 
 fn stage<'state>(state: &'state State, key: &[u8], value: Option<&[u8]>) -> Staged<'state> {
     let volume = &state.volumes[0];
-    let (kind, record) = match value {
-        Some(value) => (RowKind::Value, encode(state, key, value)),
-        None => (RowKind::Grave, Vec::new()),
-    };
+    let kind = if value.is_some() { RowKind::Value } else { RowKind::Grave };
+    let length = value.map_or(0, |value| encode(state, key, value, WritePlace(0)).len());
     let request = ClaimRequest {
-        bytes: ByteCount(record.len() as u64),
+        bytes: ByteCount(length as u64),
         rows: RowCount(1),
     };
     let claim = state.claim(volume, &request).expect("claim");
+    let record = value.map_or(Vec::new(), |value| encode(state, key, value, claim.first_place()));
     Staged {
         claim,
         key: key.to_vec(),
@@ -169,12 +170,13 @@ fn stage<'state>(state: &'state State, key: &[u8], value: Option<&[u8]>) -> Stag
     }
 }
 
-fn encode(state: &State, key: &[u8], value: &[u8]) -> Vec<u8> {
+fn encode(state: &State, key: &[u8], value: &[u8], place: WritePlace) -> Vec<u8> {
     let identity = RecordIdentity {
         record_key: state.record_key,
         column: COLUMN,
         key,
         kind: RowKind::Value,
+        place,
     };
     let mut encoder = RecordEncoder::new(LARGEST, LARGEST);
     let shape = encoder.encode(&identity, Codec::None, value).expect("encode");
@@ -878,7 +880,7 @@ fn finish_get(state: &State, get: &StagedGet) -> Option<Vec<u8>> {
 // picks: every get sees the newest row at its read point, and a crash keeps what a sync covered
 #[test]
 fn seeded_interleaving() {
-    for seed in seeds(0..SEED_COUNT) {
+    for seed in seeds((0..SEED_COUNT).chain(FOUND_SEEDS)) {
         run_interleaving(Seed(seed));
     }
 }

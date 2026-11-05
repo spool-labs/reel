@@ -1,5 +1,6 @@
 //! The one interface every file operation, clock read and engine thread goes through
 
+pub mod device_error;
 pub mod job;
 pub mod lock_outcome;
 pub mod plain;

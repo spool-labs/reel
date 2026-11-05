@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 reel.workspace = true
+libc.workspace = true
 reel-api.workspace = true
 
 [lints]

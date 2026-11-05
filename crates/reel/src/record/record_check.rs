@@ -1,6 +1,7 @@
 //! The keyed check that ties a record to its key
 
 use reel_api::column_id::ColumnId;
+use reel_api::units::WritePlace;
 use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 
 use crate::record::record_head::RecordForm;
@@ -28,6 +29,7 @@ pub struct RecordIdentity<'key> {
     pub column: ColumnId,
     pub key: &'key [u8],
     pub kind: RowKind,
+    pub place: WritePlace,
 }
 
 /// Sum stored bytes
@@ -35,7 +37,12 @@ pub fn checksum(bytes: &[u8]) -> Checksum {
     Checksum(xxh3_64(bytes))
 }
 
-/// Hash the column, the key, the kind, the form and a payload checksum under the store's key
+/// Fold a place into a check, so a record checks only for the one write that made it
+pub fn place_check(check: RecordCheck, record_key: RecordKey, place: WritePlace) -> RecordCheck {
+    RecordCheck(check.0 ^ xxh3_64_with_seed(&place.0.to_le_bytes(), record_key.0))
+}
+
+/// Hash the column, the key, the kind, the form and a payload checksum under the store's key, with no place yet
 pub fn record_check(identity: &RecordIdentity, form: RecordForm, payload: Checksum) -> RecordCheck {
     let mut fields = [0; CHECK_FIELDS_BYTES];
     fields[0] = identity.column.0;

@@ -26,7 +26,7 @@ pub trait Reads: Send + Sync {
     /// Fill the buffer with the newest value, and say whether the key has one
     fn get(&self, column: ColumnId, key: &[u8], buf: &mut Vec<u8>) -> Result<bool, StoreError>;
 
-    /// Answer every key at one point in the write order
+    /// Answer every key at one point in the write order, with a bad record as that key's answer
     fn get_many(&self, column: ColumnId, keys: &[&[u8]], values: &mut ValueList) -> Result<(), StoreError>;
 
     /// Fill the buffer with a checked window of the value, and say whether the key has one

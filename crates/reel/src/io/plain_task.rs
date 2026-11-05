@@ -2,7 +2,7 @@
 
 use std::io::{Error, Result};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use reel_api::units::Nanoseconds;
@@ -93,7 +93,16 @@ impl IoTask for PlainTask {
         hold(&self.signal.flags).is_stopping = true;
         self.signal.changed.notify_all();
 
-        let thread = hold(&self.thread).take();
+        let mut slot = hold(&self.thread);
+        // a job stopping itself ends after this step, and can't wait for its own thread
+        if let Some(thread) = slot.as_ref()
+            && thread.thread().id() == thread::current().id()
+        {
+            return Ok(());
+        }
+
+        let thread = slot.take();
+        drop(slot);
         if let Some(thread) = thread {
             return match thread.join() {
                 Ok(()) => Ok(()),

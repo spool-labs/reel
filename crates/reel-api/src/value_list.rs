@@ -9,11 +9,33 @@ pub struct ValueSpan {
     pub length: ByteCount,
 }
 
+/// How one key was answered
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoredAnswer {
+    /// The key has a value
+    Found(ValueSpan),
+    /// The key has no value
+    Missing,
+    /// The key's record failed its check
+    Corrupt,
+}
+
+/// One key's answer, read back from a list
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValueAnswer<'list> {
+    /// The key has this value
+    Found(&'list [u8]),
+    /// The key has no value
+    Missing,
+    /// The key's record failed its check, and the caller can repair it from peers
+    Corrupt,
+}
+
 /// One answer per key, in the order of the keys asked for
 #[derive(Debug, Default)]
 pub struct ValueList {
     bytes: Vec<u8>,
-    spans: Vec<Option<ValueSpan>>,
+    answers: Vec<StoredAnswer>,
 }
 
 impl ValueList {
@@ -25,12 +47,17 @@ impl ValueList {
     /// Forget every answer and keep the buffers
     pub fn clear(&mut self) {
         self.bytes.clear();
-        self.spans.clear();
+        self.answers.clear();
     }
 
     /// Add the answer for a key with no value
     pub fn push_missing(&mut self) {
-        self.spans.push(None);
+        self.answers.push(StoredAnswer::Missing);
+    }
+
+    /// Add the answer for a key whose record failed its check
+    pub fn push_corrupt(&mut self) {
+        self.answers.push(StoredAnswer::Corrupt);
     }
 
     /// Add the answer for a key with a value
@@ -40,25 +67,30 @@ impl ValueList {
             length: ByteCount(value.len() as u64),
         };
         self.bytes.extend_from_slice(value);
-        self.spans.push(Some(span));
+        self.answers.push(StoredAnswer::Found(span));
     }
 
     /// Count the answers
     pub fn len(&self) -> usize {
-        self.spans.len()
+        self.answers.len()
     }
 
     /// Check whether the list holds no answers
     pub fn is_empty(&self) -> bool {
-        self.spans.is_empty()
+        self.answers.is_empty()
     }
 
     /// Read the answer at an index
-    pub fn value(&self, index: usize) -> Option<&[u8]> {
-        let span = (*self.spans.get(index)?)?;
-        let start = span.start.0 as usize;
-        let end = start.checked_add(span.length.0 as usize)?;
-        self.bytes.get(start..end)
+    pub fn answer(&self, index: usize) -> Option<ValueAnswer<'_>> {
+        match self.answers.get(index)? {
+            StoredAnswer::Found(span) => {
+                let start = span.start.0 as usize;
+                let end = start.checked_add(span.length.0 as usize)?;
+                Some(ValueAnswer::Found(self.bytes.get(start..end)?))
+            },
+            StoredAnswer::Missing => Some(ValueAnswer::Missing),
+            StoredAnswer::Corrupt => Some(ValueAnswer::Corrupt),
+        }
     }
 }
 
@@ -73,13 +105,15 @@ mod tests {
 
         list.push_found(b"first");
         list.push_missing();
+        list.push_corrupt();
         list.push_found(b"");
 
-        assert_eq!(list.len(), 3);
-        assert_eq!(list.value(0), Some(&b"first"[..]));
-        assert_eq!(list.value(1), None);
-        assert_eq!(list.value(2), Some(&b""[..]));
-        assert_eq!(list.value(3), None);
+        assert_eq!(list.len(), 4);
+        assert_eq!(list.answer(0), Some(ValueAnswer::Found(b"first")));
+        assert_eq!(list.answer(1), Some(ValueAnswer::Missing));
+        assert_eq!(list.answer(2), Some(ValueAnswer::Corrupt));
+        assert_eq!(list.answer(3), Some(ValueAnswer::Found(b"")));
+        assert_eq!(list.answer(4), None);
 
         list.clear();
         assert!(list.is_empty());

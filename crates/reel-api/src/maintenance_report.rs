@@ -2,14 +2,21 @@
 
 use crate::units::{ByteCount, Nanoseconds, RowCount, SegmentCount};
 
-/// How many kinds of job the engine runs
-pub const JOB_KINDS: usize = 7;
+/// Every kind of job, in the order a report lists them
+pub const JOB_KINDS: [JobKind; 7] = [
+    JobKind::RowWriteOut,
+    JobKind::Seal,
+    JobKind::DeadByteWalk,
+    JobKind::RangeDeleteApply,
+    JobKind::Compaction,
+    JobKind::KeyRunMerge,
+    JobKind::SpotCacheUpkeep,
+];
 
 /// A kind of maintenance job
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum JobKind {
     /// Row groups reaching the kernel
-    #[default]
     RowWriteOut,
     /// Open segments becoming sealed ones
     Seal,
@@ -26,10 +33,9 @@ pub enum JobKind {
 }
 
 /// What a job is doing
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum JobState {
     /// Nothing to do
-    #[default]
     Idle,
     /// Working
     Running,
@@ -40,7 +46,7 @@ pub enum JobState {
 }
 
 /// One job's state and totals
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobReport {
     pub kind: JobKind,
     pub state: JobState,
@@ -49,12 +55,71 @@ pub struct JobReport {
     pub cpu_time: Nanoseconds,
 }
 
-/// Every job and the reclaim counts
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Every job, the reclaim counts and the readings a node roll stops on
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaintenanceReport {
-    pub jobs: [JobReport; JOB_KINDS],
+    pub jobs: [JobReport; JOB_KINDS.len()],
+    pub segment_count: SegmentCount,
+    pub used_bytes: ByteCount,
+    pub graves_at_open: RowCount,
+    pub deletes_since_open: RowCount,
     pub graves_dropped: RowCount,
     pub graves_carried: RowCount,
     pub segments_rewritten: SegmentCount,
     pub segments_unlinked: SegmentCount,
+    pub rewrites_reclaiming_nothing: SegmentCount,
+    pub corruption_errors: RowCount,
+}
+
+impl JobReport {
+    /// Start an idle job with nothing moved
+    pub fn new(kind: JobKind) -> Self {
+        Self {
+            kind,
+            state: JobState::Idle,
+            bytes_moved: ByteCount::default(),
+            last_run: None,
+            cpu_time: Nanoseconds::default(),
+        }
+    }
+}
+
+impl MaintenanceReport {
+    /// Start a report with one idle entry per kind of job
+    pub fn new() -> Self {
+        Self {
+            jobs: JOB_KINDS.map(JobReport::new),
+            segment_count: SegmentCount::default(),
+            used_bytes: ByteCount::default(),
+            graves_at_open: RowCount::default(),
+            deletes_since_open: RowCount::default(),
+            graves_dropped: RowCount::default(),
+            graves_carried: RowCount::default(),
+            segments_rewritten: SegmentCount::default(),
+            segments_unlinked: SegmentCount::default(),
+            rewrites_reclaiming_nothing: SegmentCount::default(),
+            corruption_errors: RowCount::default(),
+        }
+    }
+}
+
+impl Default for MaintenanceReport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // a new report lists each kind of job once
+    #[test]
+    fn job_list() {
+        let report = MaintenanceReport::new();
+
+        for (index, kind) in JOB_KINDS.iter().enumerate() {
+            assert_eq!(report.jobs[index].kind, *kind);
+        }
+    }
 }

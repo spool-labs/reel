@@ -6,7 +6,7 @@ use crate::memory_report::MemoryReport;
 use crate::reads::Reads;
 use crate::store_error::StoreError;
 use crate::units::{ByteCount, RowCount};
-use crate::usage::{ColumnUsage, VolumeUsage};
+use crate::usage::{ColumnUsage, UsageReport};
 use crate::write_batch::WriteBatch;
 
 /// A key-value store shared across threads, where each key behaves as one register
@@ -41,11 +41,11 @@ pub trait Store: Reads {
     /// Estimate the keys of the whole store, without a scan
     fn key_count_estimate(&self) -> RowCount;
 
-    /// Report live and on-disk bytes of one column
-    fn column_disk_usage(&self, column: ColumnId) -> Result<ColumnUsage, StoreError>;
+    /// Fill a report with live and on-disk bytes of one column
+    fn column_disk_usage(&self, column: ColumnId, report: &mut ColumnUsage) -> Result<(), StoreError>;
 
-    /// Report used and free bytes of every volume and root
-    fn volume_usage(&self) -> Result<Vec<VolumeUsage>, StoreError>;
+    /// Fill a report with used and free bytes of every volume and root
+    fn volume_usage(&self, report: &mut UsageReport) -> Result<(), StoreError>;
 
     /// Report the heap each structure holds
     fn memory_report(&self) -> MemoryReport;

@@ -27,3 +27,11 @@ pub struct SegmentCount(pub u64);
 /// One place in the store-wide write order
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WritePlace(pub u64);
+
+/// One of a store's volumes, in the order the config declares them
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct VolumeId(pub u8);
+
+/// One of a volume's roots, in the order the config declares them
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RootId(pub u8);

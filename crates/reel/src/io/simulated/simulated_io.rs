@@ -142,7 +142,7 @@ impl SimulatedIo {
                 JobStep::Idle => JobWait::Wake,
                 JobStep::IdleUntil { deadline } => JobWait::Clock { deadline },
             };
-            if step != JobStep::Finished {
+            if step != JobStep::Finished && !slot.is_stopped {
                 slot.work = Some(work);
             }
         }
@@ -287,6 +287,7 @@ impl Io for SimulatedIo {
             work: Some(Box::new(job)),
             wait: JobWait::Nothing,
             is_woken: false,
+            is_stopped: false,
         });
         Ok(SimulatedTask {
             slots: Arc::clone(&self.slots),

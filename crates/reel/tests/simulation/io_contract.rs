@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{Error, ErrorKind, IoSlice};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -17,6 +17,7 @@ use reel::io::simulated::file_image::BitMask;
 use reel::io::simulated::seeded_random::Seed;
 use reel::io::simulated::simulated_disk::{FIRST_PROCESS, OperationCount};
 use reel::io::simulated::simulated_io::SimulatedIo;
+use reel::guard::hold;
 use reel::io::simulated::simulated_task::{JobCount, JobIndex};
 use reel::io::{Io, IoFile, IoTask};
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds};
@@ -30,6 +31,9 @@ const TORN_BYTES: usize = 2_048;
 const SECTOR: usize = 512;
 const QUIET_WAIT: Duration = Duration::from_millis(30);
 const DEADLINE: Nanoseconds = Nanoseconds(1_000_000);
+const DRAW_BOUND: u64 = 1_000;
+const DRAW_COUNT: u64 = 100;
+const SETTLE_ATTEMPTS: u64 = 100;
 
 struct CountingJob {
     count: Arc<AtomicU64>,
@@ -55,6 +59,33 @@ impl Job for IdleJob {
         self.steps.fetch_add(1, Ordering::Relaxed);
         self.answer
     }
+}
+
+struct StoppingJob<Handle: IoTask + 'static> {
+    task: Arc<Mutex<Option<Handle>>>,
+    steps: Arc<AtomicU64>,
+}
+
+impl<Handle: IoTask + 'static> Job for StoppingJob<Handle> {
+    fn step(&mut self) -> JobStep {
+        self.steps.fetch_add(1, Ordering::Relaxed);
+        if let Some(task) = hold(&self.task).as_ref() {
+            task.stop().expect("stop from inside");
+        }
+        JobStep::Worked
+    }
+}
+
+fn check_self_stop<Backend: Io>(io: &Backend) -> Arc<AtomicU64> {
+    let steps = Arc::new(AtomicU64::new(0));
+    let slot = Arc::new(Mutex::new(None));
+    let job = StoppingJob {
+        task: Arc::clone(&slot),
+        steps: Arc::clone(&steps),
+    };
+    let task = io.spawn_job("stopping", job).expect("spawn");
+    *hold(&slot) = Some(task);
+    steps
 }
 
 fn plain_root(test: &str) -> PathBuf {
@@ -540,7 +571,37 @@ fn seed_replay() {
     let first = SimulatedIo::new(SEED);
     let second = SimulatedIo::new(SEED);
 
-    for _ in 0..100 {
-        assert_eq!(first.draw(1_000), second.draw(1_000));
+    for _ in 0..DRAW_COUNT {
+        assert_eq!(first.draw(DRAW_BOUND), second.draw(DRAW_BOUND));
     }
+}
+
+
+// a job that stops its own task ends after that step on both backends
+#[test]
+fn self_stop() {
+    let (io, _root) = simulated(SEED);
+    let steps = check_self_stop(&io);
+    while io.step_any().is_some() {}
+    assert_eq!(steps.load(Ordering::Relaxed), 1);
+    assert_eq!(io.live_jobs(), JobCount(0));
+
+    let plain = PlainIo::new();
+    let steps = check_self_stop(&plain);
+    while steps.load(Ordering::Relaxed) == 0 {
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let mut is_settled = false;
+    let mut reached = steps.load(Ordering::Relaxed);
+    for _ in 0..SETTLE_ATTEMPTS {
+        thread::sleep(QUIET_WAIT);
+        let latest = steps.load(Ordering::Relaxed);
+        is_settled = latest == reached;
+        if is_settled {
+            break;
+        }
+        reached = latest;
+    }
+    assert!(is_settled);
 }

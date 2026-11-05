@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::column_id::ColumnId;
-use crate::units::{ByteCount, ProcessId};
+use crate::units::{ByteCount, ProcessId, VolumeId};
 
 /// A failed store call
 #[derive(Debug, Error)]
@@ -25,12 +25,12 @@ pub enum StoreError {
     BatchTooLarge { length: ByteCount, limit: ByteCount },
     #[error("batch touches more than one volume")]
     BatchAcrossVolumes,
-    #[error("record in column {column:?} failed its check")]
-    Corruption { column: ColumnId },
-    #[error("volume `{volume}` is below its free space reserve")]
-    VolumeFull { volume: String },
-    #[error("volume `{volume}` refuses writes after a failed sync")]
-    VolumeFailed { volume: String },
+    #[error("record of key {key:?} in column {column:?} failed its check")]
+    Corruption { column: ColumnId, key: Vec<u8> },
+    #[error("volume {volume:?} is below its free space reserve")]
+    VolumeFull { volume: VolumeId },
+    #[error("volume {volume:?} refuses writes after a failed sync")]
+    VolumeFailed { volume: VolumeId },
     #[error("root {root:?} is held by process {holder:?}")]
     Locked { root: PathBuf, holder: ProcessId },
     #[error("store is closed")]

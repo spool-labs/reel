@@ -35,6 +35,7 @@ pub struct JobSlot {
     pub work: Option<Box<dyn Job>>,
     pub wait: JobWait,
     pub is_woken: bool,
+    pub is_stopped: bool,
 }
 
 /// The handle of a job the scheduler owns, good only for the process that started it
@@ -73,6 +74,7 @@ impl IoTask for SimulatedTask {
         if let Some(slot) = slots.get_mut(self.index.0)
             && slot.process == self.process
         {
+            slot.is_stopped = true;
             slot.work = None;
         }
         Ok(())

@@ -185,6 +185,7 @@ pub fn sort_segment<Backend: Io>(
     if let Some(head) = reader.read_tail(&file, record_key, &mut columns)? {
         let mut entries = Vec::new();
         if !reader.read_index(&file, &head, &mut entries)? {
+            scan.highest_place = scan.highest_place.max(head.places.highest);
             // the file stays for an operator, and the rest of the store keeps serving
             scan.damaged += 1;
             io.close_file(file);
@@ -244,6 +245,7 @@ impl<Backend: Io> EngineState<Backend> {
             Err(error) => return Err(error),
         }
 
+        volume.note_sealed(found.head.places.highest);
         if !volume.table.install(found.file, &found.head, &found.columns, &found.entries) {
             return Err(Error::other("segment table sized below what the roots hold"));
         }
@@ -280,6 +282,7 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let mut records = RecordReader::new();
         let target = ReplayTarget {
+            volume,
             data: &found.data,
             slot,
             segment: found.number,
@@ -342,7 +345,7 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn replay_rows(
         &self,
         rows: &Backend::File,
-        target: &ReplayTarget<Backend::File>,
+        target: &ReplayTarget<Backend>,
         scan: &RowsScan,
         records: &mut RecordReader,
         recovered: &mut RecoveredRows,
@@ -416,7 +419,7 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn replay_row(
         &self,
         row: &RowEntry,
-        target: &ReplayTarget<Backend::File>,
+        target: &ReplayTarget<Backend>,
         recovered: &mut RecoveredRows,
     ) -> bool {
         let write_row = WriteRow {
@@ -426,6 +429,7 @@ impl<Backend: Io> EngineState<Backend> {
             kind: row.kind,
             slot: target.slot,
             segment: target.segment,
+            has_newer_sealed: target.volume.may_hide_under_sealed(row.place),
         };
         if !self.index.insert(row.column, row.key, &write_row) {
             return false;
@@ -608,6 +612,7 @@ pub fn copy_row<Backend: Io>(
             kind: row.kind,
             slot: claim.slot,
             segment: claim.segment,
+            has_newer_sealed: target.may_hide_under_sealed(row.place),
         };
         match state.land_row(row.column, row.key, &copied).map_err(open_failure)? {
             LandOutcome::Landed => {
@@ -643,9 +648,9 @@ pub fn open_failure(error: StoreError) -> Error {
 }
 
 /// Where recovered rows go
-#[derive(Clone, Copy, Debug)]
-pub struct ReplayTarget<'file, File> {
-    pub data: &'file File,
+pub struct ReplayTarget<'file, Backend: Io> {
+    pub volume: &'file Volume<Backend>,
+    pub data: &'file Backend::File,
     pub slot: OpenSlot,
     pub segment: SegmentNumber,
 }

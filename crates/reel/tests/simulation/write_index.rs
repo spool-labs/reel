@@ -54,6 +54,7 @@ fn row(place: u64, slot: OpenSlot, kind: RowKind) -> WriteRow {
         kind,
         slot,
         segment: SegmentNumber(1),
+        has_newer_sealed: false,
     }
 }
 

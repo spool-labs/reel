@@ -129,7 +129,8 @@ impl EntrySlab {
         bytes[OLDER_AT..NEWER_AT].copy_from_slice(&NO_ENTRY.0.to_le_bytes());
         bytes[NEWER_AT..COLUMN_AT].copy_from_slice(&NO_ENTRY.0.to_le_bytes());
         bytes[COLUMN_AT] = column.0;
-        bytes[KIND_AT] = row.kind.as_byte();
+        let flag = if row.has_newer_sealed { NEWER_SEALED_FLAG } else { 0 };
+        bytes[KIND_AT] = row.kind.as_byte() | flag;
         bytes[KEY_LENGTH_AT..SLOT_AT].copy_from_slice(&(key.len() as u16).to_le_bytes());
         bytes[SLOT_AT] = row.slot.0;
         bytes[KEY_AT..].copy_from_slice(key);
@@ -201,6 +202,7 @@ impl EntrySlab {
             kind: RowKind::from_byte(self.bytes[start + KIND_AT] & !NEWER_SEALED_FLAG)?,
             slot: self.slot(address),
             segment: SegmentNumber(0),
+            has_newer_sealed: self.has_newer_sealed(address),
         })
     }
 

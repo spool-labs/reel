@@ -15,6 +15,7 @@ pub struct WriteRow {
     pub kind: RowKind,
     pub slot: OpenSlot,
     pub segment: SegmentNumber,
+    pub has_newer_sealed: bool,
 }
 
 /// What the write index says about a key

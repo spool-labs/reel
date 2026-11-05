@@ -106,6 +106,16 @@ impl SimulatedIo {
         hold(&self.disk).failing_writes = count;
     }
 
+    /// Make the next writes report a full disk
+    pub fn fill_writes(&self, count: OperationCount) {
+        hold(&self.disk).full_writes = count;
+    }
+
+    /// Make the next directory syncs fail
+    pub fn fail_directory_syncs(&self, count: OperationCount) {
+        hold(&self.disk).failing_directory_syncs = count;
+    }
+
     /// Make the next file creates fail
     pub fn fail_creates(&self, count: OperationCount) {
         hold(&self.disk).failing_creates = count;
@@ -270,6 +280,10 @@ impl Io for SimulatedIo {
     fn sync_directory(&self, path: &Path) -> Result<()> {
         let mut disk = hold(&self.disk);
         disk.enter()?;
+        if disk.failing_directory_syncs.0 > 0 {
+            disk.failing_directory_syncs = OperationCount(disk.failing_directory_syncs.0 - 1);
+            return Err(Error::other("simulated directory sync failure"));
+        }
         disk.sync_directory(path);
         Ok(())
     }

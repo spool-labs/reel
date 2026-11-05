@@ -58,6 +58,8 @@ pub enum SealPhase {
     Writing,
     /// The footer is durable, and the segment goes into the table
     Installing,
+    /// The table has the segment, and the rows file goes
+    DiscardingRows,
     /// The table has the segment, and every lower place has yet to reach the index
     AwaitingMark,
     /// Rows go to the spot cache
@@ -79,6 +81,8 @@ pub struct SealJob<Backend: Io> {
     pub totals: Option<FooterTotals>,
     pub last_key: Vec<u8>,
     pub last_column: Option<ColumnId>,
+    pub is_in_table: bool,
+    pub columns_listed: usize,
 }
 
 impl<Backend: Io> SealJob<Backend> {
@@ -96,6 +100,8 @@ impl<Backend: Io> SealJob<Backend> {
             totals: None,
             last_key: Vec::with_capacity(MAX_KEY_BYTES as usize),
             last_column: None,
+            is_in_table: false,
+            columns_listed: 0,
         }
     }
 
@@ -144,6 +150,8 @@ impl<Backend: Io> SealJob<Backend> {
         self.writer.start(target.data_end, target.lowest_place);
         self.walk.start(&self.state.index, target.slot);
         self.column = None;
+        self.is_in_table = false;
+        self.columns_listed = 0;
         self.phase = SealPhase::Writing;
         Ok(())
     }
@@ -197,29 +205,39 @@ impl<Backend: Io> SealJob<Backend> {
     pub fn discard_rows(&mut self, target: &SealTarget<Backend::File>) -> Result<()> {
         let state = Arc::clone(&self.state);
         let root = &self.volume().roots[target.root.0 as usize];
-        state.io.remove_file(&rows_path(root, target.number))?;
-        state.io.sync_directory(root)
+        match state.io.remove_file(&rows_path(root, target.number)) {
+            Ok(()) => {},
+            Err(error) if error.kind() == ErrorKind::NotFound => {},
+            Err(error) => return Err(error),
+        }
+        state.io.sync_directory(root)?;
+        self.phase = SealPhase::AwaitingMark;
+        Ok(())
     }
 
-    /// Put the segment in the table and the directories, ready for the switch
+    /// Put the segment in the table and the directories, each part once however often this retries
     pub fn install(&mut self, target: &SealTarget<Backend::File>) -> Result<()> {
         let Some(totals) = self.totals else {
             return Err(Error::other("seal installing with no footer"));
         };
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
-        let installed = volume.table.install(
-            target.data.clone(),
-            &totals.head,
-            self.writer.columns(),
-            self.writer.entries(),
-        );
-        if !installed {
-            // the rows file stays until the table has room, so a retry loses nothing
-            return Err(Error::other("segment table is full"));
+        if !self.is_in_table {
+            let installed = volume.table.install(
+                target.data.clone(),
+                &totals.head,
+                self.writer.columns(),
+                self.writer.entries(),
+            );
+            if !installed {
+                // the rows file stays until the table has room, so a retry loses nothing
+                return Err(Error::other("segment table is full"));
+            }
+            volume.note_sealed(totals.head.places.highest);
+            self.is_in_table = true;
         }
 
-        for column in self.writer.columns() {
+        while let Some(column) = self.writer.columns().get(self.columns_listed) {
             let entry = DirectoryEntry {
                 shared_length: column.shared_length,
                 shared_sum: column.shared_sum,
@@ -233,10 +251,10 @@ impl<Backend: Io> SealJob<Backend> {
             {
                 return Err(Error::other("column directory is full"));
             }
+            self.columns_listed += 1;
         }
 
-        self.discard_rows(target)?;
-        self.phase = SealPhase::AwaitingMark;
+        self.phase = SealPhase::DiscardingRows;
         Ok(())
     }
 
@@ -306,10 +324,11 @@ impl<Backend: Io> SealJob<Backend> {
         }
 
         let slot_file = &self.state.slot_files[target.slot.0 as usize];
+        // no new pin can land once the slot is empty, so a count of zero stays zero
+        slot_file.set(None);
         if slot_file.pin_count() > 0 {
             return false;
         }
-        slot_file.set(None);
         self.state.io.close_file(target.rows.clone());
         self.state.free_slot(target.slot);
         true
@@ -339,7 +358,11 @@ impl<Backend: Io> SealJob<Backend> {
             SealPhase::Draining => !self.is_drained(target.slot),
             SealPhase::AwaitingMark => true,
             SealPhase::Cleaning => self.state.slot_files[target.slot.0 as usize].pin_count() > 0,
-            SealPhase::Idle | SealPhase::Writing | SealPhase::Installing | SealPhase::HandingOver => false,
+            SealPhase::Idle
+            | SealPhase::Writing
+            | SealPhase::Installing
+            | SealPhase::DiscardingRows
+            | SealPhase::HandingOver => false,
         }
     }
 
@@ -348,7 +371,8 @@ impl<Backend: Io> SealJob<Backend> {
         if self.phase == SealPhase::Writing {
             self.phase = SealPhase::Draining;
         }
-        let is_retryable = error.kind() == ErrorKind::StorageFull || self.phase == SealPhase::Installing;
+        let is_past_footer = matches!(self.phase, SealPhase::Installing | SealPhase::DiscardingRows);
+        let is_retryable = error.kind() == ErrorKind::StorageFull || is_past_footer;
         if !is_retryable {
             self.volume().fail();
             return JobStep::Idle;
@@ -378,6 +402,7 @@ impl<Backend: Io> SealJob<Backend> {
             },
             SealPhase::Writing => self.write_rows(target),
             SealPhase::Installing => self.install(target),
+            SealPhase::DiscardingRows => self.discard_rows(target),
             SealPhase::AwaitingMark => {
                 self.start_hand_over(target);
                 Ok(())

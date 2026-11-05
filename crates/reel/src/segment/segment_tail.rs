@@ -12,7 +12,7 @@ pub const TAIL_MAGIC: u32 = 0x5245_4C54;
 /// Bytes at the very end: the tail's length, the magic and the checksum
 pub const TRAILER_BYTES: usize = 16;
 /// Bytes of the fixed part of a tail
-pub const TAIL_FIXED_BYTES: usize = 92;
+pub const TAIL_FIXED_BYTES: usize = 100;
 /// Spare bytes in the fixed part of a tail
 pub const TAIL_PADDING_BYTES: usize = 4;
 /// Bytes of one column's part of a tail
@@ -25,6 +25,11 @@ pub const MOST_SEGMENT_BYTES: ByteCount = ByteCount(u32::MAX as u64);
 pub const MAX_COLUMNS: usize = 256;
 /// Bytes that hold any tail
 pub const MAX_TAIL_BYTES: usize = TAIL_FIXED_BYTES + MAX_COLUMNS * COLUMN_TAIL_BYTES + TRAILER_BYTES;
+
+/// The two copies of a tail or index never share this span of the file
+pub const COPY_GAP_BYTES: u64 = 64 * 1024;
+/// The second tail copy ends this far before the file's end, wherever the first one starts
+pub const SECOND_TAIL_DISTANCE: u64 = MAX_TAIL_BYTES as u64 + COPY_GAP_BYTES;
 
 /// A segment's number, which a store never uses twice
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -61,6 +66,7 @@ pub struct TailHead {
     pub segment: SegmentNumber,
     pub data_end: FileOffset,
     pub index_at: FileOffset,
+    pub second_index_at: FileOffset,
     pub block_count: BlockCount,
     pub ranges_at: FileOffset,
     pub ranges_length: ByteCount,
@@ -139,6 +145,7 @@ impl TailHead {
         out.put(&self.segment.0.to_le_bytes());
         out.put(&self.data_end.0.to_le_bytes());
         out.put(&self.index_at.0.to_le_bytes());
+        out.put(&self.second_index_at.0.to_le_bytes());
         out.put(&self.block_count.0.to_le_bytes());
         out.put(&self.ranges_at.0.to_le_bytes());
         out.put(&self.ranges_length.0.to_le_bytes());
@@ -157,6 +164,7 @@ impl TailHead {
             segment: SegmentNumber(input.word()?),
             data_end: FileOffset(input.word()?),
             index_at: FileOffset(input.word()?),
+            second_index_at: FileOffset(input.word()?),
             block_count: BlockCount(input.half()?),
             ranges_at: FileOffset(input.word()?),
             ranges_length: ByteCount(input.word()?),
@@ -251,6 +259,7 @@ mod tests {
             segment: SegmentNumber(9),
             data_end: FileOffset(1_000),
             index_at: FileOffset(9_000),
+            second_index_at: FileOffset(9_200),
             block_count: BlockCount(4),
             ranges_at: FileOffset(9_500),
             ranges_length: ByteCount(20),

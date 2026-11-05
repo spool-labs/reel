@@ -10,11 +10,13 @@ use reel::io::{Io, IoFile};
 use reel::io::simulated::simulated_disk::OperationCount;
 use reel::record::record_check::RecordKey;
 use reel::row_kind::RowKind;
-use reel::segment::block_entry::BlockEntry;
+use reel::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry};
 use reel::segment::footer_reader::{ColumnIndex, FooterAnswer, FooterQuery, FooterReader};
 use reel::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
 use reel::segment::row_block::FooterRow;
-use reel::segment::segment_tail::{BlockCount, ColumnTail, SegmentNumber, TailHead};
+use reel::segment::segment_tail::{
+    BlockCount, COPY_GAP_BYTES, ColumnTail, MAX_TAIL_BYTES, SECOND_TAIL_DISTANCE, SegmentNumber, TailHead,
+};
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
@@ -29,6 +31,7 @@ const ROWS: u64 = 20_000;
 const LATEST: WritePlace = WritePlace(u64::MAX);
 const RANDOM_KEY_BYTES: usize = 32;
 const MOST_ROW_BYTES: f64 = 44.0;
+const COPY_BYTES: u64 = 240_000;
 const LARGE_PLACE: u64 = 40_000_000_000;
 const CRASH_POINTS: u64 = 12;
 const CRASH_SEEDS: u64 = 48;
@@ -205,18 +208,47 @@ fn footer_versions() {
     assert_eq!(find(&written, &mut reader, &loaded, 0, b"key", WritePlace(9)), FooterAnswer::Absent);
 }
 
-// a segment with a torn tail reads as not sealed
+// one rotted tail copy costs nothing, and with both gone the segment reads as not sealed
 #[test]
 fn torn_tail() {
     let written = write_rows(&[(FIRST_COLUMN, ordered_rows())]);
     let last = FileOffset(written.totals.file_length.0 - 3);
+    let mut columns = Vec::new();
+    let mut reader = FooterReader::new();
+
     written.io.rot(&written.path, last, BitMask(1)).expect("rot");
+    let one_lost = reader.read_tail(&written.file, RECORD_KEY, &mut columns).expect("read");
+    assert_eq!(one_lost, Some(written.totals.head));
+
+    let second = FileOffset(written.totals.file_length.0 - SECOND_TAIL_DISTANCE - 3);
+    written.io.rot(&written.path, second, BitMask(1)).expect("rot");
+    let both_lost = reader.read_tail(&written.file, RECORD_KEY, &mut columns).expect("read");
+    assert_eq!(both_lost, None);
+}
+
+// the second copy alone still seals the segment
+#[test]
+fn second_tail_only() {
+    let written = write_rows(&[(FIRST_COLUMN, ordered_rows())]);
+    let second = FileOffset(written.totals.file_length.0 - SECOND_TAIL_DISTANCE - 3);
+    written.io.rot(&written.path, second, BitMask(1)).expect("rot");
 
     let mut columns = Vec::new();
     let mut reader = FooterReader::new();
     let head = reader.read_tail(&written.file, RECORD_KEY, &mut columns).expect("read");
 
-    assert_eq!(head, None);
+    assert_eq!(head, Some(written.totals.head));
+}
+
+// the two copies of the tail and of the index never share a span of the file
+#[test]
+fn copy_distance() {
+    let written = write_rows(&[(FIRST_COLUMN, ordered_rows())]);
+    let head = written.totals.head;
+    let lines = u64::from(head.block_count.0) * BLOCK_ENTRY_BYTES as u64;
+
+    assert!(head.second_index_at.0 >= head.index_at.0 + lines + COPY_GAP_BYTES);
+    assert!(SECOND_TAIL_DISTANCE >= MAX_TAIL_BYTES as u64 + COPY_GAP_BYTES);
 }
 
 // rot in a row block reads as damaged, never as a row or as absent
@@ -260,7 +292,8 @@ fn row_cost() {
     }
 
     let written = write_rows(&[(FIRST_COLUMN, rows)]);
-    let footer_bytes = written.totals.file_length.0 - DATA_END.0;
+    // the second copies cost a fixed span per segment, whatever its row count
+    let footer_bytes = written.totals.file_length.0 - DATA_END.0 - COPY_BYTES;
     let per_row = footer_bytes as f64 / ROWS as f64;
 
     assert!(per_row <= MOST_ROW_BYTES);
@@ -280,7 +313,7 @@ fn filter_rot() {
     assert_eq!(found, FooterAnswer::Damaged);
 }
 
-// rot in the block index fails the read of the index
+// one rotted index copy costs nothing, and with both gone the read fails
 #[test]
 fn index_rot() {
     let written = write_rows(&[(FIRST_COLUMN, ordered_rows())]);
@@ -290,9 +323,12 @@ fn index_rot() {
     written.io.rot(&written.path, at, BitMask(0b100)).expect("rot");
 
     let mut entries = Vec::new();
-    let is_whole = reader.read_index(&written.file, &loaded.head, &mut entries).expect("read");
+    assert!(reader.read_index(&written.file, &loaded.head, &mut entries).expect("read"));
+    assert_eq!(entries, loaded.entries);
 
-    assert!(!is_whole);
+    let second = FileOffset(loaded.head.second_index_at.0 + 3);
+    written.io.rot(&written.path, second, BitMask(0b100)).expect("rot");
+    assert!(!reader.read_index(&written.file, &loaded.head, &mut entries).expect("read"));
 }
 
 // keys sharing more than a prefix's length keep ranges that tell their segments apart

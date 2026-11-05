@@ -13,7 +13,9 @@ use crate::segment::block_filter::{may_contain, open_filter};
 use crate::segment::footer_writer::fold_sum;
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::BlockWindow;
-use crate::segment::segment_tail::{ColumnTail, MAX_TAIL_BYTES, SegmentNumber, TailHead, TailReader, find_tail};
+use crate::segment::segment_tail::{
+    ColumnTail, MAX_TAIL_BYTES, SECOND_TAIL_DISTANCE, SegmentNumber, TailHead, TailReader, find_tail,
+};
 
 /// Segments one page of a directory search holds
 pub const CANDIDATE_PAGE: usize = 64;
@@ -107,16 +109,34 @@ impl FooterReader {
         ByteCount(total as u64)
     }
 
-    /// Read a segment's tail into columns, or return nothing when the segment isn't sealed
+    /// Read a segment's tail into columns from either copy, or return nothing when neither is whole
     pub fn read_tail<File: IoFile>(
         &mut self,
         file: &File,
         record_key: RecordKey,
         columns: &mut Vec<ColumnTail>,
     ) -> Result<Option<TailHead>> {
-        let length = file.length()?.0 as usize;
-        let read = length.min(MAX_TAIL_BYTES);
-        let at = FileOffset((length - read) as u64);
+        let length = file.length()?.0;
+        if let Some(head) = self.read_tail_ending(file, FileOffset(length), record_key, columns)? {
+            return Ok(Some(head));
+        }
+
+        let Some(second_end) = length.checked_sub(SECOND_TAIL_DISTANCE) else {
+            return Ok(None);
+        };
+        self.read_tail_ending(file, FileOffset(second_end), record_key, columns)
+    }
+
+    /// Read the tail copy that ends at an offset
+    pub fn read_tail_ending<File: IoFile>(
+        &mut self,
+        file: &File,
+        end: FileOffset,
+        record_key: RecordKey,
+        columns: &mut Vec<ColumnTail>,
+    ) -> Result<Option<TailHead>> {
+        let read = (end.0 as usize).min(MAX_TAIL_BYTES);
+        let at = FileOffset(end.0 - read as u64);
         file.read_exact_at(at, &mut self.tail[..read])?;
 
         let Some(tail) = find_tail(&self.tail[..read], record_key) else {
@@ -137,10 +157,24 @@ impl FooterReader {
         Ok(Some(head))
     }
 
-    /// Read a segment's block index, and return false when it fails its check
+    /// Read a segment's block index from either copy, and return false when neither is whole
     pub fn read_index<File: IoFile>(&mut self, file: &File, head: &TailHead, entries: &mut Vec<BlockEntry>) -> Result<bool> {
+        if self.read_index_at(file, head, head.index_at, entries)? {
+            return Ok(true);
+        }
+        self.read_index_at(file, head, head.second_index_at, entries)
+    }
+
+    /// Read one copy of a block index, and return false when it fails its check
+    pub fn read_index_at<File: IoFile>(
+        &mut self,
+        file: &File,
+        head: &TailHead,
+        start: FileOffset,
+        entries: &mut Vec<BlockEntry>,
+    ) -> Result<bool> {
         entries.clear();
-        let mut at = head.index_at;
+        let mut at = start;
         let mut remaining = head.block_count.0 as usize;
         let mut sum = Checksum(0);
         let lines_per_read = self.block.len() / BLOCK_ENTRY_BYTES;

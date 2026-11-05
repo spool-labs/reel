@@ -499,6 +499,7 @@ pub fn build_state<Backend: Io>(
             table: SegmentTable::new(&table_room(&table_sizing, &scan.least_sizing(index))),
             view: AtomicU64::new(0),
             handovers: AtomicU64::new(0),
+            highest_sealed: AtomicU64::new(0),
             sync: Mutex::new(SyncState::default()),
             is_failed: AtomicBool::new(false),
             segment_bytes: sizing.segment_bytes,

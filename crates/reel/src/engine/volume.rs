@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use reel_api::units::{ByteCount, RowCount, VolumeId};
+use reel_api::units::{ByteCount, RowCount, VolumeId, WritePlace};
 
 use crate::config::SyncPolicy;
 use crate::engine::open_segment::{OpenSegment, SegmentPhase};
@@ -43,6 +43,7 @@ pub struct Volume<Backend: Io> {
     pub table: SegmentTable<Backend::File>,
     pub view: AtomicU64,
     pub handovers: AtomicU64,
+    pub highest_sealed: AtomicU64,
     pub sync: Mutex<SyncState>,
     pub is_failed: AtomicBool,
     pub segment_bytes: ByteCount,
@@ -66,6 +67,11 @@ impl<Backend: Io> Volume<Backend> {
         self.view.fetch_and(!OpenSlots::only(slot).0, Ordering::AcqRel);
     }
 
+    /// Check any sealed segment has reached the table
+    pub fn table_holds_any(&self) -> bool {
+        self.highest_sealed.load(Ordering::Acquire) > 0
+    }
+
     /// Check the volume still takes writes
     pub fn has_failed(&self) -> bool {
         self.is_failed.load(Ordering::Acquire)
@@ -74,6 +80,16 @@ impl<Backend: Io> Volume<Backend> {
     /// Note that a sync failed, so the volume refuses writes until the store is reopened
     pub fn fail(&self) {
         self.is_failed.store(true, Ordering::Release);
+    }
+
+    /// Note a sealed segment's highest place
+    pub fn note_sealed(&self, place: WritePlace) {
+        self.highest_sealed.fetch_max(place.0, Ordering::AcqRel);
+    }
+
+    /// Check a replayed row could sit under a newer row in a sealed segment
+    pub fn may_hide_under_sealed(&self, place: WritePlace) -> bool {
+        place.0 < self.highest_sealed.load(Ordering::Acquire)
     }
 
     /// Read the handover counter a get compares before it fills the spot cache

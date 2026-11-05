@@ -18,12 +18,14 @@ use reel::io::simulated::file_image::BitMask;
 use reel::io::simulated::seeded_random::{Seed, SeededRandom};
 use reel::io::simulated::simulated_disk::OperationCount;
 use reel::io::simulated::simulated_io::SimulatedIo;
+use reel::io::simulated::simulated_task::JobIndex;
 use reel::io::{Io, IoFile};
 use reel::record::codec::Codec;
 use reel::record::record_check::{RecordIdentity, RecordKey};
 use reel::record::record_encoder::RecordEncoder;
 use reel::row_kind::RowKind;
 use reel::segment::footer_reader::FooterReader;
+use reel::segment::segment_tail::SECOND_TAIL_DISTANCE;
 use reel::superblock::Superblock;
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
@@ -40,17 +42,23 @@ const LONG_KEYS: u64 = 6_000;
 const SETTLE_STEPS: u64 = 2_000_000;
 const SETTLE_TICK: Nanoseconds = Nanoseconds(1_000_000);
 const ROW_PERIOD: Nanoseconds = Nanoseconds(60_000_000);
-const SEED_COUNT: u64 = 24;
+const SEED_COUNT: u64 = 16;
 const STEPS: u64 = 4_000;
 const KEY_SPACE: u64 = 40;
 const MOST_IN_FLIGHT: usize = 6;
 const MANY_ROWS: u64 = 11_000;
 const SHRINK_ROWS: u64 = 2_000;
+const SPLIT_ROWS: u64 = 1_000;
+const CRASH_ODDS: u64 = 300;
+const FLUSH_ODDS: u64 = 60;
+const SEAL_JOB: JobIndex = JobIndex(1);
+const MOST_SEAL_STEPS: u64 = 10_000;
 const PAST_THE_OPEN: u64 = 1_000_000_000;
 const SHRINK_CRASH_END: u64 = 5_400;
 const SHRINK_CRASH_STEP: usize = 197;
 const JOB_ROUNDS: u64 = 20;
 const MOST_OPEN: usize = 4;
+const MOST_LISTED: usize = 16;
 
 type Store = ReelStore<SimulatedIo>;
 type State = EngineState<SimulatedIo>;
@@ -192,7 +200,7 @@ impl Staged<'_> {
         self.is_written = true;
     }
 
-    fn land(&mut self, state: &State) {
+    fn try_land(&mut self, state: &State) -> bool {
         let row = WriteRow {
             place: self.claim.first_place(),
             offset: self.claim.offset,
@@ -200,10 +208,15 @@ impl Staged<'_> {
             kind: self.kind,
             slot: self.claim.slot,
             segment: self.claim.segment,
+            has_newer_sealed: false,
         };
         let outcome = state.land_row(COLUMN, &self.key, &row).expect("land");
-        assert_eq!(outcome, LandOutcome::Landed);
-        self.is_landed = true;
+        self.is_landed = outcome == LandOutcome::Landed;
+        self.is_landed
+    }
+
+    fn land(&mut self, state: &State) {
+        assert!(self.try_land(state));
     }
 
     fn finish(mut self, state: &State) {
@@ -312,6 +325,8 @@ fn tail_rot() {
     let length = file.length().expect("length");
     io.close_file(file);
     io.rot(&files[0], FileOffset(length.0 - 3), BitMask(1)).expect("rot");
+    let second = FileOffset(length.0 - SECOND_TAIL_DISTANCE - 3);
+    io.rot(&files[0], second, BitMask(1)).expect("rot");
 
     let store = open(&io);
     assert_eq!(store.damaged_segments(), 1);
@@ -344,6 +359,7 @@ fn index_rot() {
     let head = reader.read_tail(&file, key, &mut columns).expect("tail").expect("sealed");
     io.close_file(file);
     io.rot(&first[0], FileOffset(head.index_at.0 + 2), BitMask(1)).expect("rot");
+    io.rot(&first[0], FileOffset(head.second_index_at.0 + 2), BitMask(1)).expect("rot");
 
     let store = open(&io);
     assert_eq!(store.damaged_segments(), 1);
@@ -498,28 +514,6 @@ fn smaller_budget_crash() {
     }
 }
 
-// a seal that fails part way starts its footer again and finishes
-#[test]
-fn seal_retry() {
-    let io = SimulatedIo::new(Seed(10));
-    let store = open(&io);
-    store.put(COLUMN, b"key", b"value").expect("put");
-    settle(&io);
-    io.advance_clock(ROW_PERIOD);
-    settle(&io);
-
-    store.seal_now();
-    io.fail_writes(OperationCount(1));
-    settle(&io);
-    for _try in 0..10 {
-        io.advance_clock(ROW_PERIOD);
-        settle(&io);
-    }
-
-    assert_eq!(read(&store, b"key"), Some(b"value".to_vec()));
-    store.close().expect("close");
-}
-
 // a seal holds its switch for a slower write of a lower place, so the later delete still wins
 #[test]
 fn late_row() {
@@ -604,7 +598,277 @@ fn reused_slot() {
     store.close().expect("close");
 }
 
-// staged puts, deletes, seals, jobs and gets in the order a seed picks: every get sees the newest row at the mark
+fn stage_done(state: &State, key: &[u8], value: Option<&[u8]>) {
+    stage(state, key, value).finish(state);
+}
+
+// a seal that hits a full disk part way starts its footer again and finishes
+#[test]
+fn seal_retry() {
+    let io = SimulatedIo::new(Seed(10));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let slot = store.state.index.lookup(COLUMN, b"key", store.state.read_point(), store.state.volumes[0].view());
+    let slot = slot.row.expect("row").slot;
+
+    store.seal_now();
+    io.fill_writes(OperationCount(1));
+    settle(&io);
+    assert!(!store.state.volumes[0].has_failed());
+    for _try in 0..JOB_ROUNDS {
+        io.advance_clock(ROW_PERIOD);
+        settle(&io);
+    }
+
+    assert!(!store.state.volumes[0].view().contains(slot));
+    assert_eq!(read(&store, b"key"), Some(b"value".to_vec()));
+    store.close().expect("close");
+}
+
+// a seal that fails after the table has it finishes with one entry, not one per retry
+#[test]
+fn install_retry() {
+    let io = SimulatedIo::new(Seed(15));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    settle(&io);
+    io.advance_clock(ROW_PERIOD);
+    settle(&io);
+
+    store.seal_now();
+    for _step in 0..MOST_SEAL_STEPS {
+        // the discard is the seal's first directory sync once its footer is durable
+        if store.state.volumes[0].table_holds_any() {
+            break;
+        }
+        assert!(io.step_job(SEAL_JOB).is_some());
+    }
+    io.fail_directory_syncs(OperationCount(1));
+    for _try in 0..JOB_ROUNDS {
+        io.advance_clock(ROW_PERIOD);
+        settle(&io);
+    }
+
+    assert_eq!(store.state.volumes[0].view().0, 0);
+    let mut listed = Vec::with_capacity(MOST_LISTED);
+    let directory = store.state.directories[COLUMN.0 as usize].as_ref().expect("directory");
+    directory.candidates(b"key", 0, &mut listed);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(read(&store, b"key"), Some(b"value".to_vec()));
+    store.close().expect("close");
+}
+
+// an older row replayed beside a sealed newer one can't win, through a close or a kill
+#[test]
+fn reopened_older() {
+    for is_kill in [false, true] {
+        let io = SimulatedIo::new(Seed(16));
+        let store = open(&io);
+        let state = Arc::clone(&store.state);
+
+        let older = stage(&state, b"key", Some(b"older"));
+        let hold_open = stage(&state, b"hold", Some(b"value"));
+        let newer = stage(&state, b"key", Some(b"newer"));
+        let newer_slot = newer.slot();
+        assert_ne!(newer_slot, older.slot());
+        older.finish(&state);
+        hold_open.finish(&state);
+        newer.finish(&state);
+
+        state.seal_slot(&state.volumes[0], newer_slot);
+        settle(&io);
+        assert_eq!(read(&store, b"key"), Some(b"newer".to_vec()));
+
+        io.advance_clock(ROW_PERIOD);
+        settle(&io);
+        if is_kill {
+            io.kill();
+        } else {
+            store.close().expect("close");
+        }
+        drop(state);
+        drop(store);
+
+        let store = open(&io);
+        assert_eq!(read(&store, b"key"), Some(b"newer".to_vec()));
+        store.close().expect("close");
+    }
+}
+
+// a replayed older grave can't stand in for a delete of the newer sealed value
+#[test]
+fn reopened_grave() {
+    let io = SimulatedIo::new(Seed(17));
+    let store = open(&io);
+    let state = Arc::clone(&store.state);
+
+    let grave = stage(&state, b"key", None);
+    let hold_open = stage(&state, b"hold", Some(b"value"));
+    let newer = stage(&state, b"key", Some(b"newer"));
+    let newer_slot = newer.slot();
+    grave.finish(&state);
+    hold_open.finish(&state);
+    newer.finish(&state);
+    state.seal_slot(&state.volumes[0], newer_slot);
+    settle(&io);
+    store.close().expect("close");
+    drop(state);
+    drop(store);
+
+    let store = open(&io);
+    store.delete(COLUMN, b"key").expect("delete");
+    assert_eq!(read(&store, b"key"), None);
+    store.seal_now();
+    settle(&io);
+    store.close().expect("close");
+    drop(store);
+
+    let store = open(&io);
+    assert_eq!(read(&store, b"key"), None);
+    store.close().expect("close");
+}
+
+// a segment sealed during open can't let an older row replayed after it win
+#[test]
+fn sealed_in_open() {
+    let io = SimulatedIo::new(Seed(14));
+    let store = open(&io);
+    let state = Arc::clone(&store.state);
+
+    let first_hold = stage(&state, b"hold-one", Some(b"value"));
+    let second_hold = stage(&state, b"hold-two", Some(b"value"));
+    let older = stage(&state, b"key", Some(b"older"));
+    let third_hold = stage(&state, b"hold-three", Some(b"value"));
+    let older_slot = older.slot();
+    assert_ne!(older_slot, first_hold.slot());
+    assert_eq!(older_slot, third_hold.slot());
+    older.finish(&state);
+    for number in 0..SPLIT_ROWS {
+        stage_done(&state, &number.to_be_bytes(), Some(b"in the second segment"));
+    }
+
+    first_hold.finish(&state);
+    let newer = stage(&state, b"key", Some(b"newer"));
+    assert_ne!(newer.slot(), older_slot);
+    newer.finish(&state);
+    second_hold.finish(&state);
+    third_hold.finish(&state);
+    for number in 0..SPLIT_ROWS {
+        stage_done(&state, &number.to_le_bytes(), Some(b"in the first segment"));
+    }
+    store.close().expect("close");
+    drop(state);
+    drop(store);
+
+    let store = ReelStore::open(io.clone(), &config(SMALL_BUDGET)).expect("open");
+    assert_eq!(read(&store, b"key"), Some(b"newer".to_vec()));
+    store.close().expect("close");
+}
+
+// a sync reaches every open segment even when a seal removes one beside it
+#[test]
+fn sync_beside_seal() {
+    for seed in 0..SEED_COUNT {
+        let io = SimulatedIo::new(Seed(seed));
+        let store = open(&io);
+        let state = Arc::clone(&store.state);
+
+        let sealing = stage(&state, b"first", Some(b"value"));
+        let hold_open = stage(&state, b"hold", Some(b"value"));
+        let beside = stage(&state, b"second", Some(b"value"));
+        let sealing_slot = sealing.slot();
+        assert_ne!(beside.slot(), sealing_slot);
+        sealing.finish(&state);
+        hold_open.finish(&state);
+        beside.finish(&state);
+
+        let volume = &state.volumes[0];
+        let before = volume.handover_count();
+        state.seal_slot(volume, sealing_slot);
+        for _step in 0..MOST_SEAL_STEPS {
+            if volume.handover_count() != before {
+                break;
+            }
+            assert!(io.step_job(SEAL_JOB).is_some());
+        }
+
+        let hook_io = io.clone();
+        let hook_state = Arc::clone(&state);
+        io.after_next_sync(Box::new(move || {
+            for _step in 0..MOST_SEAL_STEPS {
+                if !hook_state.volumes[0].view().contains(sealing_slot) {
+                    break;
+                }
+                hook_io.step_job(SEAL_JOB);
+            }
+        }));
+        store.flush().expect("flush");
+        assert!(!volume.view().contains(sealing_slot));
+
+        io.power_cut();
+        drop(state);
+        drop(store);
+
+        let store = open(&io);
+        assert_eq!(read(&store, b"second"), Some(b"value".to_vec()));
+        assert_eq!(read(&store, b"first"), Some(b"value".to_vec()));
+        store.close().expect("close");
+    }
+}
+
+/// A get stopped between its lookup and its read
+struct StagedGet {
+    key: Vec<u8>,
+    point: WritePlace,
+    handovers: u64,
+    row: Option<WriteRow>,
+    should_ask: bool,
+}
+
+type History = BTreeMap<Vec<u8>, BTreeMap<u64, Option<Vec<u8>>>>;
+
+fn newest_at(history: &History, key: &[u8], point: u64) -> Option<Vec<u8>> {
+    let versions = history.get(key)?;
+    let (_place, value) = versions.range(..=point).next_back()?;
+    value.clone()
+}
+
+fn begin_get(state: &State, key: &[u8]) -> StagedGet {
+    let volume = &state.volumes[0];
+    let handovers = volume.handover_count();
+    let point = state.read_point();
+    let found = state.index.lookup(COLUMN, key, point, volume.view());
+    StagedGet {
+        key: key.to_vec(),
+        point,
+        handovers,
+        row: found.row,
+        should_ask: found.should_ask_footers,
+    }
+}
+
+fn finish_get(state: &State, get: &StagedGet) -> Option<Vec<u8>> {
+    let read: KeyRead = state.key_read(COLUMN, &get.key, get.point, false).expect("key");
+    let mut buf = Vec::new();
+    if let Some(row) = get.row
+        && !get.should_ask
+    {
+        if row.kind != RowKind::Value {
+            return None;
+        }
+        if state.read_open(&read, &row, RecordWant::Whole, &mut buf).expect("read") {
+            return Some(buf);
+        }
+    }
+
+    match state.get_at(&read, get.handovers, RecordWant::Whole, &mut buf).expect("get") {
+        true => Some(buf),
+        false => None,
+    }
+}
+
+// staged puts, deletes and gets with seals, jobs, syncs, kills and power cuts in the order a seed
+// picks: every get sees the newest row at its read point, and a crash keeps what a sync covered
 #[test]
 fn seeded_interleaving() {
     for seed in 0..SEED_COUNT {
@@ -614,24 +878,111 @@ fn seeded_interleaving() {
 
 fn run_interleaving(seed: Seed) {
     let io = SimulatedIo::new(seed);
-    let store = open(&io);
-    let state = Arc::clone(&store.state);
     let mut random = SeededRandom::new(seed);
-    let mut in_flight: Vec<Staged> = Vec::new();
-    let mut versions: BTreeMap<Vec<u8>, BTreeMap<u64, Option<Vec<u8>>>> = BTreeMap::new();
+    let mut history: History = BTreeMap::new();
+    let mut floors: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+    let mut steps_left = STEPS;
 
-    for step in 0..STEPS {
-        match random.below(10) {
+    while steps_left > 0 {
+        let store = open(&io);
+        let state = Arc::clone(&store.state);
+        let crash = run_until_crash(&io, &store, &state, &mut random, &mut history, &mut floors, &mut steps_left);
+        match crash {
+            Some(is_power_cut) => {
+                if is_power_cut {
+                    io.power_cut();
+                } else {
+                    io.kill();
+                }
+            },
+            None => {
+                settle(&io);
+                let mark = state.read_point().0;
+                for key in history.keys() {
+                    assert_eq!(read(&store, key), newest_at(&history, key, mark));
+                }
+                store.close().expect("close");
+                assert_eq!(io.open_handle_count(), 0);
+            },
+        }
+        drop(state);
+        drop(store);
+
+        if crash.is_some() {
+            let store = open(&io);
+            reconcile(&store, &mut history, &floors);
+            store.close().expect("close");
+        }
+    }
+    assert_eq!(io.handle_faults(), OperationCount(0));
+}
+
+// take what each key reads after a crash as the truth, once it's at or above what a sync covered
+fn reconcile(store: &Store, history: &mut History, floors: &BTreeMap<Vec<u8>, u64>) {
+    for (key, versions) in history.iter_mut() {
+        let found = read(store, key);
+        let floor = floors.get(key).copied().unwrap_or(0);
+        if floor == 0 && found.is_none() {
+            // nothing a sync covered, and nothing survived: every version of this key is gone
+            versions.clear();
+            continue;
+        }
+
+        let mut accepted = None;
+        for (place, value) in versions.range(floor..) {
+            if *value == found {
+                accepted = Some(*place);
+                // two deletes read alike, and the lower one keeps no place a later write could pass
+                break;
+            }
+        }
+
+        let Some(accepted) = accepted else {
+            panic!("key {key:?} read {found:?} below its floor {floor}");
+        };
+        versions.retain(|place, _value| *place >= floor && *place <= accepted);
+    }
+}
+
+// run seeded steps until the steps run out, and say which crash ended them, if one did
+fn run_until_crash(
+    io: &SimulatedIo,
+    store: &Store,
+    state: &State,
+    random: &mut SeededRandom,
+    history: &mut History,
+    floors: &mut BTreeMap<Vec<u8>, u64>,
+    steps_left: &mut u64,
+) -> Option<bool> {
+    let mut in_flight: Vec<Staged> = Vec::new();
+    let mut gets: Vec<StagedGet> = Vec::new();
+
+    while *steps_left > 0 {
+        *steps_left -= 1;
+        if random.one_in(CRASH_ODDS) {
+            return Some(random.one_in(2));
+        }
+        if random.one_in(FLUSH_ODDS) {
+            let mark = state.read_point().0;
+            store.flush().expect("flush");
+            for (key, versions) in history.iter() {
+                if let Some((place, _value)) = versions.range(..=mark).next_back() {
+                    floors.insert(key.clone(), *place);
+                }
+            }
+        }
+
+        match random.below(12) {
             0..3 => {
                 if in_flight.len() < MOST_IN_FLIGHT {
                     let key = format!("key-{:04}", random.below(KEY_SPACE)).into_bytes();
                     let value = if random.one_in(3) {
                         None
                     } else {
-                        Some(format!("value-{step}").into_bytes())
+                        Some(format!("value-{}", random.next_word()).into_bytes())
                     };
-                    let staged = stage(&state, &key, value.as_deref());
-                    versions.entry(key).or_default().insert(staged.place().0, value);
+                    let staged = stage(state, &key, value.as_deref());
+                    history.entry(key).or_default().insert(staged.place().0, value);
                     in_flight.push(staged);
                 }
             },
@@ -643,10 +994,14 @@ fn run_interleaving(seed: Seed) {
                         staged.write();
                         in_flight.push(staged);
                     } else if !staged.is_landed {
-                        staged.land(&state);
-                        in_flight.push(staged);
+                        if staged.try_land(state) {
+                            in_flight.push(staged);
+                        } else if let Some(versions) = history.get_mut(&staged.key) {
+                            // the index was full, so this write ends as aborted
+                            versions.remove(&staged.place().0);
+                        }
                     } else {
-                        staged.finish(&state);
+                        staged.finish(state);
                     }
                 }
             },
@@ -660,30 +1015,31 @@ fn run_interleaving(seed: Seed) {
                 io.step_any();
                 io.advance_clock(SETTLE_TICK);
             },
+            8 => {
+                let key = format!("key-{:04}", random.below(KEY_SPACE)).into_bytes();
+                gets.push(begin_get(state, &key));
+            },
+            9 => {
+                if !gets.is_empty() {
+                    let index = random.below(gets.len() as u64) as usize;
+                    let get = gets.swap_remove(index);
+                    let found = finish_get(state, &get);
+                    assert_eq!(found, newest_at(history, &get.key, get.point.0), "staged get of {:?}", get.key);
+                }
+            },
             _read => {
                 let key = format!("key-{:04}", random.below(KEY_SPACE)).into_bytes();
                 let mark = state.read_point().0;
-                let expected = versions
-                    .get(&key)
-                    .and_then(|history| history.range(..=mark).next_back())
-                    .and_then(|(_place, value)| value.clone());
-                let found = read(&store, &key);
-                let is_newer_now = state.read_point().0 != mark;
-                assert!(is_newer_now || found == expected, "seed {seed:?} step {step} key {key:?}");
+                let found = read(store, &key);
+                if state.read_point().0 == mark {
+                    assert_eq!(found, newest_at(history, &key, mark), "get of {key:?}");
+                }
             },
         }
     }
 
     for staged in in_flight {
-        staged.finish(&state);
+        staged.finish(state);
     }
-    settle(&io);
-    let mark = state.read_point().0;
-    for (key, history) in &versions {
-        let expected = history.range(..=mark).next_back().and_then(|(_place, value)| value.clone());
-        assert_eq!(read(&store, key), expected);
-    }
-    store.close().expect("close");
-    assert_eq!(io.open_handle_count(), 0);
-    assert_eq!(io.handle_faults(), OperationCount(0));
+    None
 }

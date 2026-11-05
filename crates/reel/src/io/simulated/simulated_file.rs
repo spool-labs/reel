@@ -119,6 +119,10 @@ impl IoFile for SimulatedFile {
             return Err(error);
         }
 
+        if disk.full_writes.0 > 0 {
+            disk.full_writes = OperationCount(disk.full_writes.0 - 1);
+            return Err(Error::from(ErrorKind::StorageFull));
+        }
         if disk.failing_writes.0 > 0 {
             disk.failing_writes = OperationCount(disk.failing_writes.0 - 1);
             return Err(Error::other("simulated write failure"));

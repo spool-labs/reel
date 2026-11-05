@@ -11,7 +11,7 @@ use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, RowCount, Writ
 use crate::config::SyncPolicy;
 use crate::engine::claim::Claim;
 use crate::engine::engine_sizing::OPEN_PER_ROOT;
-use crate::engine::engine_state::{EngineState, SlotData};
+use crate::engine::engine_state::{EngineState, SlotData, SlotPin};
 use crate::engine::open_segment::{OpenSegment, SegmentPhase, data_path, rows_path};
 use crate::engine::volume::{ClaimState, Volume};
 use crate::guard::hold;
@@ -121,6 +121,7 @@ impl<Backend: Io> EngineState<Backend> {
                 kind: RowKind::Value,
                 slot: claim.slot,
                 segment: claim.segment,
+                has_newer_sealed: false,
             };
             let slot = claim.slot;
             match self.land_row(write.column, write.key, &row)? {
@@ -160,6 +161,7 @@ impl<Backend: Io> EngineState<Backend> {
                 kind: RowKind::Grave,
                 slot: claim.slot,
                 segment: claim.segment,
+                has_newer_sealed: false,
             };
             let slot = claim.slot;
             match self.land_row(column, key, &row)? {
@@ -270,9 +272,16 @@ impl<Backend: Io> EngineState<Backend> {
         volume: &'state Volume<Backend>,
         request: &ClaimRequest,
     ) -> Result<Claim<'state, Backend>, StoreError> {
+        let deadline = self.io.now().0.saturating_add(INDEX_WAIT.0);
         loop {
             // a failed volume frees no slot, so a wait for one would never end
             check_writable(volume)?;
+            if self.io.now().0 > deadline {
+                return Err(StoreError::Io {
+                    action: "waiting for an open segment",
+                    source: Error::other("no segment or slot freed up"),
+                });
+            }
 
             let mut claims = hold(&volume.claims);
             if let Some(index) = pick_segment(&claims, volume, request) {
@@ -548,32 +557,54 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
-    /// Sync each open segment through its writing turn
+    /// Sync each open segment through its writing turn, walking by slot since seals remove segments
     pub fn run_sync(&self, volume: &Volume<Backend>) -> Result<(), Error> {
-        let mut after = 0;
-        while let Some(found) = next_open(volume, after) {
-            let (next, slot, data, rows) = found;
-            after = next;
-            self.write_out_turn(slot, &rows, Some(&data))?;
+        let mut after: Option<OpenSlot> = None;
+        while let Some((slot, pin, rows)) = self.next_open(volume, after) {
+            after = Some(slot);
+            self.write_out_turn(slot, &rows, Some(&pin.file))?;
         }
         Ok(())
     }
 
-    /// Send a slot's waiting rows to the kernel
-    pub fn write_out(&self, slot: OpenSlot) -> Result<(), Error> {
-        let Some(rows) = self.rows_file(slot) else {
-            return Ok(());
-        };
-        self.write_out_turn(slot, &rows, None)
+    /// Pin the open segment with the lowest slot past another
+    pub fn next_open(
+        &self,
+        volume: &Volume<Backend>,
+        after: Option<OpenSlot>,
+    ) -> Option<(OpenSlot, SlotPin<'_, Backend::File>, Backend::File)> {
+        let claims = hold(&volume.claims);
+        let mut best: Option<&OpenSegment<Backend::File>> = None;
+        for segment in &claims.open {
+            let is_past = after.is_none_or(|slot| segment.slot > slot);
+            if is_past && best.is_none_or(|current| segment.slot < current.slot) {
+                best = Some(segment);
+            }
+        }
+
+        let segment = best?;
+        let pin = self.slot_files[segment.slot.0 as usize].pin(segment.number)?;
+        Some((segment.slot, pin, segment.rows.clone()))
     }
 
-    /// Find the rows file of an open slot
-    pub fn rows_file(&self, slot: OpenSlot) -> Option<Backend::File> {
+    /// Send a slot's waiting rows to the kernel
+    pub fn write_out(&self, slot: OpenSlot) -> Result<(), Error> {
+        let Some((pin, rows)) = self.pin_rows(slot) else {
+            return Ok(());
+        };
+        let outcome = self.write_out_turn(slot, &rows, None);
+        drop(pin);
+        outcome
+    }
+
+    /// Pin an open slot and find its rows file, which a seal closes only once the pins are gone
+    pub fn pin_rows(&self, slot: OpenSlot) -> Option<(SlotPin<'_, Backend::File>, Backend::File)> {
         for volume in &self.volumes {
             let claims = hold(&volume.claims);
             for segment in &claims.open {
                 if segment.slot == slot {
-                    return Some(segment.rows.clone());
+                    let pin = self.slot_files[slot.0 as usize].pin(segment.number)?;
+                    return Some((pin, segment.rows.clone()));
                 }
             }
         }
@@ -667,16 +698,6 @@ impl<Backend: Io> EngineState<Backend> {
             None => true,
         }
     }
-}
-
-/// Find the first open segment past a slot, with handles copied out of the lock
-pub fn next_open<Backend: Io>(
-    volume: &Volume<Backend>,
-    after: usize,
-) -> Option<(usize, OpenSlot, Backend::File, Backend::File)> {
-    let claims = hold(&volume.claims);
-    let segment = claims.open.get(after)?;
-    Some((after + 1, segment.slot, segment.data.clone(), segment.rows.clone()))
 }
 
 /// Pick the taking segment with the fewest writers, unless the volume should open another

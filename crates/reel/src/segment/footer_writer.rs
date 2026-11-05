@@ -13,8 +13,8 @@ use crate::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry, KeyPrefix};
 use crate::segment::block_filter::{FILTER_SUM_BYTES, add_key, filter_bytes, seal_filter};
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockBuilder};
 use crate::segment::segment_tail::{
-    BlockCount, COLUMN_TAIL_BYTES, ColumnTail, MAX_COLUMNS, MAX_TAIL_BYTES, MOST_SEGMENT_BYTES, PlaceRange, SegmentNumber,
-    TAIL_FIXED_BYTES, TailCursor, TailHead, write_trailer,
+    BlockCount, COLUMN_TAIL_BYTES, COPY_GAP_BYTES, ColumnTail, MAX_COLUMNS, MAX_TAIL_BYTES, MOST_SEGMENT_BYTES,
+    PlaceRange, SECOND_TAIL_DISTANCE, SegmentNumber, TAIL_FIXED_BYTES, TailCursor, TailHead, write_trailer,
 };
 
 /// Most rows a block of the smallest rows can hold
@@ -226,11 +226,17 @@ impl FooterWriter {
 
         let index_at = self.position;
         let index_sum = self.write_index(file)?;
+        let index_end = self.position;
         let ranges_at = self.position;
         if !ranges.is_empty() {
             file.write_at(ranges_at, &[IoSlice::new(ranges)])?;
             self.position = FileOffset(ranges_at.0 + ranges.len() as u64);
         }
+
+        // the second copy sits past the gap, so one bad span of the file can't take both
+        let second_index_at = FileOffset(self.position.0.max(index_end.0 + COPY_GAP_BYTES));
+        self.position = second_index_at;
+        self.write_index(file)?;
 
         // the footer must be whole before a tail can say so, or a power cut could keep the tail alone
         file.sync()?;
@@ -239,6 +245,7 @@ impl FooterWriter {
             segment,
             data_end,
             index_at,
+            second_index_at,
             block_count: BlockCount(self.entries.len() as u32),
             ranges_at,
             ranges_length: ByteCount(ranges.len() as u64),
@@ -249,9 +256,12 @@ impl FooterWriter {
             column_count: self.columns.len() as u32,
         };
         let total = self.write_tail(&head, record_key);
-        file.write_at(self.position, &[IoSlice::new(&self.tail[..total])])?;
-
-        let file_length = ByteCount(self.position.0 + total as u64);
+        let second_tail_at = self.position;
+        let second_end = second_tail_at.0 + total as u64;
+        let file_length = ByteCount(second_end + SECOND_TAIL_DISTANCE);
+        let first_tail_at = FileOffset(file_length.0 - total as u64);
+        file.write_at(second_tail_at, &[IoSlice::new(&self.tail[..total])])?;
+        file.write_at(first_tail_at, &[IoSlice::new(&self.tail[..total])])?;
         file.truncate(file_length)?;
         file.sync()?;
         Ok(FooterTotals {

@@ -23,3 +23,7 @@ pub struct RowCount(pub u64);
 /// A count of segments
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SegmentCount(pub u64);
+
+/// One place in the store-wide write order
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct WritePlace(pub u64);

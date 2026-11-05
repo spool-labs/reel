@@ -1,12 +1,32 @@
 //! One simulated file: what a reader sees and what a power cut leaves
 
-use crate::io::simulated::seeded_random::SeededRandom;
+use std::path::PathBuf;
+
 use reel_api::units::{ByteCount, FileOffset};
 
-/// A torn write keeps a whole number of these
+use crate::io::simulated::seeded_random::SeededRandom;
+
+/// A torn write keeps or loses each sector of this size on its own
 pub const SECTOR_BYTES: u64 = 512;
-/// Each unsynced change is lost, kept or torn with equal odds
-pub const POWER_CUT_OUTCOMES: u64 = 3;
+/// Each sector of a torn write survives one time in this many
+pub const SECTOR_SURVIVAL_ODDS: u64 = 2;
+/// What a power cut can do to one unsynced change, each as likely as the others
+pub const POWER_CUT_OUTCOMES: [PowerCutOutcome; 3] = [PowerCutOutcome::Lost, PowerCutOutcome::Kept, PowerCutOutcome::Torn];
+
+/// What a power cut does to one unsynced change
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PowerCutOutcome {
+    /// None of it reached the disk
+    Lost,
+    /// All of it reached the disk
+    Kept,
+    /// Some of its sectors reached the disk
+    Torn,
+}
+
+/// The bits to flip in one byte
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct BitMask(pub u8);
 
 /// A change the kernel holds and no sync has covered
 #[derive(Clone, Debug)]
@@ -23,6 +43,7 @@ pub struct FileImage {
     pub visible: Vec<u8>,
     pub durable: Vec<u8>,
     pub pending: Vec<PendingChange>,
+    pub disk: Option<PathBuf>,
     pub handle_count: u64,
     pub is_named: bool,
 }
@@ -55,23 +76,29 @@ impl FileImage {
     /// Replay what a power cut leaves: each change survives, tears or goes on its own
     pub fn power_cut(&mut self, random: &mut SeededRandom) {
         for change in self.pending.drain(..) {
-            match random.below(POWER_CUT_OUTCOMES) {
-                0 => {},
-                1 => apply_change(&mut self.durable, &change),
-                _ => apply_torn(&mut self.durable, &change, random),
+            let pick = random.below(POWER_CUT_OUTCOMES.len() as u64) as usize;
+            match POWER_CUT_OUTCOMES[pick] {
+                PowerCutOutcome::Lost => {},
+                PowerCutOutcome::Kept => apply_change(&mut self.durable, &change),
+                PowerCutOutcome::Torn => apply_torn(&mut self.durable, &change, random),
             }
         }
         self.visible.clone_from(&self.durable);
     }
 
-    /// Flip one bit in what readers see and in what survives
-    pub fn rot(&mut self, offset: FileOffset, mask: u8) {
+    /// Flip bits of one byte in what readers see and in what survives
+    pub fn rot(&mut self, offset: FileOffset, mask: BitMask) {
         if let Some(byte) = self.visible.get_mut(offset.0 as usize) {
-            *byte ^= mask;
+            *byte ^= mask.0;
         }
         if let Some(byte) = self.durable.get_mut(offset.0 as usize) {
-            *byte ^= mask;
+            *byte ^= mask.0;
         }
+    }
+
+    /// Check whether the bytes still take space on the disk
+    pub fn is_held(&self) -> bool {
+        self.is_named || self.handle_count > 0
     }
 }
 
@@ -93,14 +120,16 @@ pub fn apply_change(image: &mut Vec<u8>, change: &PendingChange) {
     }
 }
 
-/// Apply the leading sectors of a write, and a truncate whole
+/// Apply any set of a write's sectors, since pages reach a disk in any order
 pub fn apply_torn(image: &mut Vec<u8>, change: &PendingChange, random: &mut SeededRandom) {
     match change {
         PendingChange::Write { offset, bytes } => {
-            let sectors = (bytes.len() as u64).div_ceil(SECTOR_BYTES);
-            let kept = random.below(sectors.saturating_add(1)).saturating_mul(SECTOR_BYTES);
-            let end = bytes.len().min(kept as usize);
-            apply_write(image, *offset, &bytes[..end]);
+            for (index, sector) in bytes.chunks(SECTOR_BYTES as usize).enumerate() {
+                if random.one_in(SECTOR_SURVIVAL_ODDS) {
+                    let start = offset.0 + index as u64 * SECTOR_BYTES;
+                    apply_write(image, FileOffset(start), sector);
+                }
+            }
         },
         PendingChange::Truncate { .. } => apply_change(image, change),
     }

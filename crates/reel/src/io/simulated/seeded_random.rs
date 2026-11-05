@@ -13,6 +13,10 @@ pub const SHIFT_SECOND: u32 = 27;
 /// Last mixing shift
 pub const SHIFT_LAST: u32 = 31;
 
+/// The one number a whole simulated run follows from
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct Seed(pub u64);
+
 /// A small generator whose whole output follows from its seed
 #[derive(Clone, Debug)]
 pub struct SeededRandom {
@@ -21,8 +25,8 @@ pub struct SeededRandom {
 
 impl SeededRandom {
     /// Start from a seed
-    pub fn new(seed: u64) -> Self {
-        Self { state: seed }
+    pub fn new(seed: Seed) -> Self {
+        Self { state: seed.0 }
     }
 
     /// Draw the next word

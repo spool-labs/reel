@@ -5,12 +5,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::guard::hold;
-use crate::io::IoTask;
-use crate::io::job::{Job, JobStep};
+use reel_api::units::Nanoseconds;
 
-/// How long an idle job sleeps before it looks for work again
-pub const IDLE_WAIT: Duration = Duration::from_millis(10);
+use crate::guard::hold;
+use crate::io::job::{Job, JobStep};
+use crate::io::{Io, IoTask};
 
 /// What the job's thread is told
 #[derive(Debug, Default)]
@@ -33,21 +32,36 @@ pub struct PlainTask {
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
+impl TaskFlags {
+    /// Check whether the job has to keep sleeping
+    pub fn is_quiet(&self) -> bool {
+        !self.is_woken && !self.is_stopping
+    }
+}
+
 impl TaskSignal {
     /// Check whether the job should end
     pub fn is_stopping(&self) -> bool {
         hold(&self.flags).is_stopping
     }
 
-    /// Sleep until a wake, a stop or the idle wait running out
+    /// Sleep until a wake or a stop
     pub fn wait(&self) {
-        let mut flags = hold(&self.flags);
-        if !flags.is_woken && !flags.is_stopping {
-            flags = match self.changed.wait_timeout(flags, IDLE_WAIT) {
-                Ok(outcome) => outcome.0,
-                Err(poisoned) => poisoned.into_inner().0,
-            };
-        }
+        let flags = hold(&self.flags);
+        let mut flags = match self.changed.wait_while(flags, |flags| flags.is_quiet()) {
+            Ok(flags) => flags,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        flags.is_woken = false;
+    }
+
+    /// Sleep until a wake, a stop or the time running out
+    pub fn wait_for(&self, limit: Duration) {
+        let flags = hold(&self.flags);
+        let mut flags = match self.changed.wait_timeout_while(flags, limit, |flags| flags.is_quiet()) {
+            Ok(outcome) => outcome.0,
+            Err(poisoned) => poisoned.into_inner().0,
+        };
         flags.is_woken = false;
     }
 }
@@ -91,7 +105,7 @@ impl IoTask for PlainTask {
 }
 
 /// Step a job until it finishes or its handle stops it
-pub fn run_job<Work: Job>(mut job: Work, signal: &TaskSignal) {
+pub fn run_job<Work: Job, Backend: Io>(mut job: Work, signal: &TaskSignal, io: &Backend) {
     loop {
         if signal.is_stopping() {
             return;
@@ -99,7 +113,13 @@ pub fn run_job<Work: Job>(mut job: Work, signal: &TaskSignal) {
         match job.step() {
             JobStep::Worked => {},
             JobStep::Idle => signal.wait(),
+            JobStep::IdleUntil { deadline } => signal.wait_for(time_left(deadline, io.now())),
             JobStep::Finished => return,
         }
     }
+}
+
+/// Measure the time from a clock reading to a deadline
+pub fn time_left(deadline: Nanoseconds, now: Nanoseconds) -> Duration {
+    Duration::from_nanos(deadline.0.saturating_sub(now.0))
 }

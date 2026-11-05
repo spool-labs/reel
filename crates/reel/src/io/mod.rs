@@ -10,9 +10,10 @@ pub mod simulated;
 use std::io::{IoSlice, Result};
 use std::path::{Path, PathBuf};
 
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds};
+
 use crate::io::job::Job;
 use crate::io::lock_outcome::LockOutcome;
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds};
 
 /// One open file
 pub trait IoFile: Send + Sync {

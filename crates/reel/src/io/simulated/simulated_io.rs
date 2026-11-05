@@ -5,14 +5,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
+
 use crate::guard::hold;
 use crate::io::Io;
 use crate::io::job::{Job, JobStep};
 use crate::io::lock_outcome::LockOutcome;
-use crate::io::simulated::simulated_disk::{InodeNumber, SimulatedDisk};
+use crate::io::simulated::file_image::BitMask;
+use crate::io::simulated::seeded_random::Seed;
+use crate::io::simulated::simulated_disk::{InodeNumber, OperationCount, SimulatedDisk};
 use crate::io::simulated::simulated_file::SimulatedFile;
-use crate::io::simulated::simulated_task::{JobSlot, SimulatedTask};
-use reel_api::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
+use crate::io::simulated::simulated_task::{JobCount, JobIndex, JobSlot, JobWait, SimulatedTask};
 
 /// The clock moves this far on every read
 pub const CLOCK_TICK: Nanoseconds = Nanoseconds(1_000);
@@ -43,7 +46,7 @@ impl Drop for SimulatedLock {
 
 impl SimulatedIo {
     /// Start an empty simulation from a seed
-    pub fn new(seed: u64) -> Self {
+    pub fn new(seed: Seed) -> Self {
         Self {
             disk: Arc::new(Mutex::new(SimulatedDisk::new(seed))),
             slots: Arc::new(Mutex::new(Vec::new())),
@@ -53,7 +56,8 @@ impl SimulatedIo {
 
     /// Declare a disk under a path, with a size in bytes
     pub fn add_disk(&self, root: &Path, capacity: ByteCount) {
-        hold(&self.disk).capacities.insert(root.to_path_buf(), capacity);
+        let mut disk = hold(&self.disk);
+        disk.capacities.insert(root.to_path_buf(), capacity);
     }
 
     /// Kill the process: running jobs end, and the kernel keeps every write
@@ -69,7 +73,7 @@ impl SimulatedIo {
     }
 
     /// Crash the process when this many more operations have run
-    pub fn arm_crash(&self, operations: u64) {
+    pub fn arm_crash(&self, operations: OperationCount) {
         hold(&self.disk).operations_until_crash = Some(operations);
     }
 
@@ -79,12 +83,12 @@ impl SimulatedIo {
     }
 
     /// Make the next syncs fail
-    pub fn fail_syncs(&self, count: u64) {
+    pub fn fail_syncs(&self, count: OperationCount) {
         hold(&self.disk).failing_syncs = count;
     }
 
     /// Flip bits of one byte of a file in place
-    pub fn rot(&self, path: &Path, offset: FileOffset, mask: u8) -> Result<()> {
+    pub fn rot(&self, path: &Path, offset: FileOffset, mask: BitMask) -> Result<()> {
         let mut disk = hold(&self.disk);
         let inode = disk.inode_of(path)?;
         if let Some(image) = disk.inodes.get_mut(&inode) {
@@ -98,27 +102,32 @@ impl SimulatedIo {
         self.clock.fetch_add(elapsed.0, Ordering::Relaxed);
     }
 
+    /// Read the clock without moving it
+    pub fn clock_reading(&self) -> Nanoseconds {
+        Nanoseconds(self.clock.load(Ordering::Relaxed))
+    }
+
     /// Draw a number below the bound from the simulation's seed
     pub fn draw(&self, bound: u64) -> u64 {
         hold(&self.disk).random.below(bound)
     }
 
-    /// Count the jobs that can still run
-    pub fn live_jobs(&self) -> u64 {
+    /// Count the jobs that have not ended
+    pub fn live_jobs(&self) -> JobCount {
         let mut live = 0;
         for slot in hold(&self.slots).iter() {
-            if !slot.is_finished {
+            if slot.work.is_some() {
                 live += 1;
             }
         }
-        live
+        JobCount(live)
     }
 
-    /// Run one step of the job at an index, if it can still run
-    pub fn step_job(&self, index: usize) -> Option<JobStep> {
+    /// Run one step of the job at an index, whatever it waits for
+    pub fn step_job(&self, index: JobIndex) -> Option<JobStep> {
         let mut work = {
             let mut slots = hold(&self.slots);
-            let slot = slots.get_mut(index)?;
+            let slot = slots.get_mut(index.0)?;
             slot.is_woken = false;
             slot.work.take()?
         };
@@ -127,27 +136,31 @@ impl SimulatedIo {
         let step = work.step();
 
         let mut slots = hold(&self.slots);
-        if let Some(slot) = slots.get_mut(index) {
-            if step == JobStep::Finished {
-                slot.is_finished = true;
-            } else if !slot.is_finished {
+        if let Some(slot) = slots.get_mut(index.0) {
+            slot.wait = match step {
+                JobStep::Worked | JobStep::Finished => JobWait::Nothing,
+                JobStep::Idle => JobWait::Wake,
+                JobStep::IdleUntil { deadline } => JobWait::Clock { deadline },
+            };
+            if step != JobStep::Finished {
                 slot.work = Some(work);
             }
         }
         Some(step)
     }
 
-    /// Run one step of a job the seed picks, and say whether any could run
+    /// Run one step of a runnable job the seed picks, if any job can run
     pub fn step_any(&self) -> Option<JobStep> {
-        let mut live: Vec<usize> = Vec::new();
+        let now = self.clock_reading();
+        let mut runnable: Vec<JobIndex> = Vec::new();
         for (index, slot) in hold(&self.slots).iter().enumerate() {
-            if slot.work.is_some() {
-                live.push(index);
+            if slot.is_runnable(now) {
+                runnable.push(JobIndex(index));
             }
         }
 
-        let pick = self.draw(live.len() as u64) as usize;
-        let index = live.get(pick)?;
+        let pick = self.draw(runnable.len() as u64) as usize;
+        let index = runnable.get(pick)?;
         self.step_job(*index)
     }
 
@@ -207,7 +220,7 @@ impl Io for SimulatedIo {
         let mut disk = hold(&self.disk);
         disk.enter()?;
         for ancestor in path.ancestors() {
-            if !disk.directories.iter().any(|directory| directory == ancestor) {
+            if !disk.has_directory(ancestor) {
                 disk.directories.push(ancestor.to_path_buf());
             }
         }
@@ -224,7 +237,7 @@ impl Io for SimulatedIo {
     fn list_directory(&self, path: &Path) -> Result<Vec<PathBuf>> {
         let mut disk = hold(&self.disk);
         disk.enter()?;
-        if !disk.directories.iter().any(|directory| directory == path) {
+        if !disk.has_directory(path) {
             return Err(Error::from(ErrorKind::NotFound));
         }
 
@@ -265,17 +278,20 @@ impl Io for SimulatedIo {
     }
 
     fn spawn_job<Work: Job>(&self, name: &'static str, job: Work) -> Result<SimulatedTask> {
+        let process = hold(&self.disk).process;
         let mut slots = hold(&self.slots);
-        let index = slots.len();
+        let index = JobIndex(slots.len());
         slots.push(JobSlot {
             name,
+            process,
             work: Some(Box::new(job)),
+            wait: JobWait::Nothing,
             is_woken: false,
-            is_finished: false,
         });
         Ok(SimulatedTask {
             slots: Arc::clone(&self.slots),
             index,
+            process,
         })
     }
 }

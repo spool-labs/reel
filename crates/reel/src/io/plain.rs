@@ -1,21 +1,30 @@
 //! The plain-syscall backend, used on every platform
 
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom, Write};
+use std::io::{Error, ErrorKind, Result};
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
-use std::thread::Builder;
-use std::time::Instant;
+use std::thread::{self, Builder};
+use std::time::{Duration, Instant};
+
+use reel_api::units::{ByteCount, Nanoseconds, ProcessId};
 
 use crate::io::Io;
 use crate::io::job::Job;
 use crate::io::lock_outcome::LockOutcome;
 use crate::io::plain_file::{PlainFile, reserve_space};
 use crate::io::plain_task::{PlainTask, TaskSignal, run_job};
-use reel_api::units::{ByteCount, Nanoseconds, ProcessId};
+
+/// Width of the process id in a lock file, padded with spaces
+pub const HOLDER_WIDTH: usize = 10;
+/// Reads of a lock file before giving up on a holder writing its id
+pub const HOLDER_READ_ATTEMPTS: u64 = 100;
+/// Wait between reads of a lock file
+pub const HOLDER_READ_WAIT: Duration = Duration::from_millis(1);
 
 /// The backend that calls the operating system directly
 #[derive(Clone, Debug)]
@@ -26,7 +35,7 @@ pub struct PlainIo {
 /// A held file lock, released when the file closes
 #[derive(Debug)]
 pub struct PlainLock {
-    file: File,
+    pub file: File,
 }
 
 impl PlainIo {
@@ -120,17 +129,17 @@ impl Io for PlainIo {
     fn lock(&self, path: &Path) -> Result<LockOutcome<PlainLock>> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
-        let mut file = options.open(path)?;
+        let file = options.open(path)?;
 
         match file.try_lock() {
             Ok(()) => {
-                file.set_len(0)?;
-                file.seek(SeekFrom::Start(0))?;
-                write!(file, "{}", process::id())?;
+                // one padded write, so a reader never sees a cut-down id
+                let holder = format!("{:>HOLDER_WIDTH$}", process::id());
+                file.write_all_at(holder.as_bytes(), 0)?;
                 Ok(LockOutcome::Held(PlainLock { file }))
             },
             Err(TryLockError::WouldBlock) => Ok(LockOutcome::Refused {
-                holder: read_holder(&mut file)?,
+                holder: read_holder(&file)?,
             }),
             Err(TryLockError::Error(error)) => Err(error),
         }
@@ -145,28 +154,33 @@ impl Io for PlainIo {
     fn spawn_job<Work: Job>(&self, name: &'static str, job: Work) -> Result<PlainTask> {
         let signal = Arc::new(TaskSignal::default());
         let thread_signal = Arc::clone(&signal);
+        let thread_io = self.clone();
         let thread = Builder::new()
             .name(name.to_string())
-            .spawn(move || run_job(job, &thread_signal))?;
+            .spawn(move || run_job(job, &thread_signal, &thread_io))?;
         Ok(PlainTask::new(signal, thread))
     }
 }
 
-/// Read the process id the lock's holder wrote into the file
-pub fn read_holder(file: &mut File) -> Result<ProcessId> {
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
+/// Read the holder's id, waiting out the moment a first holder takes to write it
+pub fn read_holder(file: &File) -> Result<ProcessId> {
+    let mut buf = [0; HOLDER_WIDTH];
+    for _attempt in 0..HOLDER_READ_ATTEMPTS {
+        let count = file.read_at(&mut buf, 0)?;
+        if count == HOLDER_WIDTH {
+            return parse_holder(&buf);
+        }
+        thread::sleep(HOLDER_READ_WAIT);
+    }
+    Err(Error::from(ErrorKind::InvalidData))
+}
+
+/// Parse a padded process id
+pub fn parse_holder(buf: &[u8]) -> Result<ProcessId> {
+    let text = String::from_utf8_lossy(buf);
     match text.trim().parse() {
         Ok(process) => Ok(ProcessId(process)),
         Err(_unreadable) => Err(Error::from(ErrorKind::InvalidData)),
-    }
-}
-
-impl PlainLock {
-    /// Read the holder's process id back from the lock file
-    pub fn holder(&mut self) -> Result<ProcessId> {
-        self.file.seek(SeekFrom::Start(0))?;
-        read_holder(&mut self.file)
     }
 }
 

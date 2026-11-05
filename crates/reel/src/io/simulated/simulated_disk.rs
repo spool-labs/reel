@@ -2,22 +2,28 @@
 
 use std::collections::BTreeMap;
 use std::io::{Error, ErrorKind, Result};
+use std::mem;
 use std::path::{Path, PathBuf};
 
-use crate::io::simulated::file_image::FileImage;
-use crate::io::simulated::seeded_random::SeededRandom;
 use reel_api::units::{ByteCount, FileOffset, ProcessId};
+
+use crate::io::simulated::file_image::FileImage;
+use crate::io::simulated::seeded_random::{Seed, SeededRandom};
 
 /// The disk size used under a path with no declared disk
 pub const UNBOUNDED_CAPACITY: ByteCount = ByteCount(1 << 50);
 /// Process ids in a simulation count up from here
-pub const FIRST_PROCESS: u32 = 1_000;
+pub const FIRST_PROCESS: ProcessId = ProcessId(1_000);
 /// Each unsynced directory change survives a power cut one time in this many
 pub const NAME_SURVIVAL_ODDS: u64 = 2;
 
 /// The id of one file's bytes, apart from any name it has
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct InodeNumber(pub u64);
+
+/// A count of operations on the simulated disk
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct OperationCount(pub u64);
 
 /// A change to a directory that no directory sync has covered
 #[derive(Clone, Debug)]
@@ -41,17 +47,17 @@ pub struct SimulatedDisk {
     pub next_inode: InodeNumber,
     pub locks: BTreeMap<PathBuf, ProcessId>,
     pub capacities: BTreeMap<PathBuf, ByteCount>,
-    pub failing_syncs: u64,
-    pub operations_until_crash: Option<u64>,
+    pub failing_syncs: OperationCount,
+    pub operations_until_crash: Option<OperationCount>,
     pub is_crashed: bool,
 }
 
 impl SimulatedDisk {
     /// Start an empty disk from a seed
-    pub fn new(seed: u64) -> Self {
+    pub fn new(seed: Seed) -> Self {
         Self {
             random: SeededRandom::new(seed),
-            process: ProcessId(FIRST_PROCESS),
+            process: FIRST_PROCESS,
             names: BTreeMap::new(),
             durable_names: BTreeMap::new(),
             pending_names: Vec::new(),
@@ -60,7 +66,7 @@ impl SimulatedDisk {
             next_inode: InodeNumber::default(),
             locks: BTreeMap::new(),
             capacities: BTreeMap::new(),
-            failing_syncs: 0,
+            failing_syncs: OperationCount::default(),
             operations_until_crash: None,
             is_crashed: false,
         }
@@ -69,11 +75,11 @@ impl SimulatedDisk {
     /// Count one operation, and fail it once the process has crashed
     pub fn enter(&mut self) -> Result<()> {
         if let Some(remaining) = self.operations_until_crash {
-            if remaining == 0 {
+            if remaining.0 == 0 {
                 self.is_crashed = true;
                 self.operations_until_crash = None;
             } else {
-                self.operations_until_crash = Some(remaining - 1);
+                self.operations_until_crash = Some(OperationCount(remaining.0 - 1));
             }
         }
         if self.is_crashed {
@@ -93,11 +99,21 @@ impl SimulatedDisk {
     /// Check the path's parent exists
     pub fn check_parent(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent()
-            && self.directories.iter().any(|directory| directory == parent)
+            && self.has_directory(parent)
         {
             return Ok(());
         }
         Err(Error::from(ErrorKind::NotFound))
+    }
+
+    /// Check whether a directory exists
+    pub fn has_directory(&self, path: &Path) -> bool {
+        for directory in &self.directories {
+            if directory == path {
+                return true;
+            }
+        }
+        false
     }
 
     /// Make a new empty file under a name
@@ -113,6 +129,7 @@ impl SimulatedDisk {
         let inode = self.next_inode;
         self.next_inode = InodeNumber(inode.0 + 1);
         let mut image = FileImage {
+            disk: self.disk_of(path),
             is_named: true,
             ..FileImage::default()
         };
@@ -165,15 +182,22 @@ impl SimulatedDisk {
         Ok(())
     }
 
-    /// Drop an inode once it has no name and no handle
+    /// Drop an inode once nothing can reach it, a power cut included
     pub fn collect(&mut self, inode: InodeNumber) {
-        let is_unused = match self.inodes.get(&inode) {
-            Some(image) => !image.is_named && image.handle_count == 0,
-            None => false,
+        let is_held = match self.inodes.get(&inode) {
+            Some(image) => image.is_held(),
+            None => true,
         };
-        if is_unused && !self.durable_names.values().any(|durable| *durable == inode) {
-            self.inodes.remove(&inode);
+        if is_held {
+            return;
         }
+
+        for durable in self.durable_names.values() {
+            if *durable == inode {
+                return;
+            }
+        }
+        self.inodes.remove(&inode);
     }
 
     /// Make a directory's pending changes survive a power cut
@@ -193,16 +217,6 @@ impl SimulatedDisk {
         self.pending_names = remaining;
     }
 
-    /// Check a file can grow by some bytes on its disk
-    pub fn has_room(&self, inode: InodeNumber, growth: ByteCount) -> bool {
-        for (path, named) in &self.names {
-            if *named == inode {
-                return growth <= self.free_space(path);
-            }
-        }
-        true
-    }
-
     /// Find the disk a path sits on
     pub fn disk_of(&self, path: &Path) -> Option<PathBuf> {
         let mut found: Option<PathBuf> = None;
@@ -214,13 +228,11 @@ impl SimulatedDisk {
         found
     }
 
-    /// Add up the bytes the files on a disk hold
+    /// Add up the bytes a disk holds, for unlinked files with open handles too
     pub fn used_space(&self, root: &Path) -> ByteCount {
         let mut used: u64 = 0;
-        for (path, inode) in &self.names {
-            if path.starts_with(root)
-                && let Some(image) = self.inodes.get(inode)
-            {
+        for image in self.inodes.values() {
+            if image.is_held() && image.disk.as_deref() == Some(root) {
                 used = used.saturating_add(image.visible.len() as u64);
             }
         }
@@ -228,13 +240,30 @@ impl SimulatedDisk {
     }
 
     /// Read how much a disk can still take
+    pub fn disk_room(&self, root: &Path) -> ByteCount {
+        let capacity = match self.capacities.get(root) {
+            Some(capacity) => *capacity,
+            None => UNBOUNDED_CAPACITY,
+        };
+        ByteCount(capacity.0.saturating_sub(self.used_space(root).0))
+    }
+
+    /// Read how much the disk under a path can still take
     pub fn free_space(&self, path: &Path) -> ByteCount {
         match self.disk_of(path) {
-            Some(root) => {
-                let capacity = self.capacities.get(&root).copied().unwrap_or(UNBOUNDED_CAPACITY);
-                ByteCount(capacity.0.saturating_sub(self.used_space(&root).0))
-            },
+            Some(root) => self.disk_room(&root),
             None => UNBOUNDED_CAPACITY,
+        }
+    }
+
+    /// Check a file can grow by some bytes on its disk
+    pub fn has_room(&self, inode: InodeNumber, growth: ByteCount) -> bool {
+        let Some(image) = self.inodes.get(&inode) else {
+            return false;
+        };
+        match &image.disk {
+            Some(root) => growth <= self.disk_room(root),
+            None => true,
         }
     }
 
@@ -250,7 +279,7 @@ impl SimulatedDisk {
     pub fn power_cut(&mut self) {
         self.kill();
 
-        for change in std::mem::take(&mut self.pending_names) {
+        for change in mem::take(&mut self.pending_names) {
             if self.random.one_in(NAME_SURVIVAL_ODDS) {
                 apply_name(&mut self.durable_names, &change);
             }

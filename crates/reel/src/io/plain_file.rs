@@ -5,8 +5,9 @@ use std::io::{Error, ErrorKind, IoSlice, Result};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 
-use crate::io::IoFile;
 use reel_api::units::{ByteCount, FileOffset};
+
+use crate::io::IoFile;
 
 /// A file reached through plain syscalls
 #[derive(Debug)]
@@ -21,9 +22,9 @@ impl PlainFile {
     }
 
     /// Finish a short vectored write one part at a time
-    pub fn write_remainder(&self, offset: FileOffset, parts: &[IoSlice], written: u64) -> Result<()> {
-        let mut skipped = written;
-        let mut position = offset.0.saturating_add(written);
+    pub fn write_remainder(&self, offset: FileOffset, parts: &[IoSlice], written: ByteCount) -> Result<()> {
+        let mut skipped = written.0;
+        let mut position = offset.0.saturating_add(written.0);
         for part in parts {
             let length = part.len() as u64;
             if skipped >= length {
@@ -66,7 +67,7 @@ impl IoFile for PlainFile {
         }
 
         let written = write_vectored(&self.file, offset, parts)?;
-        if written == total {
+        if written.0 == total {
             return Ok(());
         }
         self.write_remainder(offset, parts, written)
@@ -86,7 +87,7 @@ impl IoFile for PlainFile {
 }
 
 /// Issue one positioned vectored write and return the bytes it took
-pub fn write_vectored(file: &File, offset: FileOffset, parts: &[IoSlice]) -> Result<u64> {
+pub fn write_vectored(file: &File, offset: FileOffset, parts: &[IoSlice]) -> Result<ByteCount> {
     let descriptor = file.as_raw_fd();
     let vectors = parts.as_ptr().cast::<libc::iovec>();
     let count = parts.len() as libc::c_int;
@@ -96,7 +97,7 @@ pub fn write_vectored(file: &File, offset: FileOffset, parts: &[IoSlice]) -> Res
         // SAFETY: IoSlice has the layout of iovec on unix, and the parts outlive the call
         let written = unsafe { libc::pwritev(descriptor, vectors, count, position) };
         if written >= 0 {
-            return Ok(written as u64);
+            return Ok(ByteCount(written as u64));
         }
 
         let error = Error::last_os_error();

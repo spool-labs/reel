@@ -3,10 +3,11 @@
 use std::io::{Error, ErrorKind, IoSlice, Result};
 use std::sync::{Arc, Mutex};
 
+use reel_api::units::{ByteCount, FileOffset, ProcessId};
+
 use crate::guard::hold;
 use crate::io::IoFile;
-use crate::io::simulated::simulated_disk::{InodeNumber, SimulatedDisk};
-use reel_api::units::{ByteCount, FileOffset, ProcessId};
+use crate::io::simulated::simulated_disk::{InodeNumber, OperationCount, SimulatedDisk};
 
 /// A handle that only works for the process that opened it
 #[derive(Debug)]
@@ -28,6 +29,24 @@ impl SimulatedFile {
             return Err(Error::from(ErrorKind::PermissionDenied));
         }
         Ok(())
+    }
+
+    /// Leave the leading part of a write a crash stopped, since a kill can stop one part way
+    pub fn tear(&self, disk: &mut SimulatedDisk, offset: FileOffset, mut bytes: Vec<u8>) {
+        let kept = disk.random.below(bytes.len() as u64 + 1);
+        bytes.truncate(kept as usize);
+
+        let Some(image) = disk.inodes.get(&self.inode) else {
+            return;
+        };
+        let end = offset.0.saturating_add(kept);
+        let growth = end.saturating_sub(image.visible.len() as u64);
+        if !disk.has_room(self.inode, ByteCount(growth)) {
+            return;
+        }
+        if let Some(image) = disk.inodes.get_mut(&self.inode) {
+            image.write(offset, bytes);
+        }
     }
 }
 
@@ -71,7 +90,13 @@ impl IoFile for SimulatedFile {
         }
 
         let mut disk = hold(&self.disk);
-        self.check(&mut disk, true)?;
+        let was_crashed = disk.is_crashed;
+        if let Err(error) = self.check(&mut disk, true) {
+            if !was_crashed && disk.is_crashed {
+                self.tear(&mut disk, offset, bytes);
+            }
+            return Err(error);
+        }
 
         let Some(image) = disk.inodes.get(&self.inode) else {
             return Err(Error::from(ErrorKind::NotFound));
@@ -92,8 +117,8 @@ impl IoFile for SimulatedFile {
         let mut disk = hold(&self.disk);
         self.check(&mut disk, false)?;
 
-        let is_failing = disk.failing_syncs > 0;
-        disk.failing_syncs = disk.failing_syncs.saturating_sub(1);
+        let is_failing = disk.failing_syncs.0 > 0;
+        disk.failing_syncs = OperationCount(disk.failing_syncs.0.saturating_sub(1));
         let Some(image) = disk.inodes.get_mut(&self.inode) else {
             return Err(Error::from(ErrorKind::NotFound));
         };

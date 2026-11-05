@@ -3,6 +3,11 @@ name: ci
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "17 2 * * *"
+
+env:
+  SWEEP_SEEDS: 256
 
 jobs:
   ci:
@@ -14,3 +19,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: cargo xtask ci
+
+  sweep:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # each night starts where the last one ended, so the sweep covers new seeds
+      - run: cargo xtask sweep "$SWEEP_SEEDS" "$(( $(date +%s) / 86400 * SWEEP_SEEDS ))"

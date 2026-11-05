@@ -29,6 +29,13 @@ pub struct CargoRun {
     pub lines: Vec<String>,
 }
 
+/// One environment variable a cargo run is given
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Variable {
+    pub name: String,
+    pub value: String,
+}
+
 /// Run every check and every harness, and report every failure at the end
 pub fn run_ci() -> Result<(), TaskError> {
     let root = workspace_root()?;
@@ -83,10 +90,19 @@ pub fn read_harnesses(root: &Path) -> Result<Vec<String>, TaskError> {
 
 /// Run cargo in the workspace, echo its output and keep every line
 pub fn run_cargo(root: &Path, arguments: &[&str]) -> Result<CargoRun, TaskError> {
+    run_cargo_with(root, arguments, &[])
+}
+
+/// Run cargo with extra environment variables, echo its output and keep every line
+pub fn run_cargo_with(root: &Path, arguments: &[&str], variables: &[Variable]) -> Result<CargoRun, TaskError> {
     let cargo = env::var("CARGO").unwrap_or_else(|_missing| "cargo".to_string());
     println!("cargo {}", arguments.join(" "));
 
-    let mut child = Command::new(cargo)
+    let mut command = Command::new(cargo);
+    for variable in variables {
+        command.env(&variable.name, &variable.value);
+    }
+    let mut child = command
         .args(arguments)
         .current_dir(root)
         .stdout(Stdio::piped())

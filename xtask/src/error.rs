@@ -10,6 +10,10 @@ pub enum TaskError {
     MissingCommand,
     /// The subcommand is not one this tool runs
     UnknownCommand { command: String },
+    /// A sweep was asked for with no seed count
+    MissingSeedCount,
+    /// An argument is not the number it has to be
+    BadNumber { argument: String },
     /// The workspace root could not be found
     MissingRoot,
     /// A file or process could not be used
@@ -23,6 +27,8 @@ impl Display for TaskError {
         match self {
             TaskError::MissingCommand => write!(formatter, "no command given, try `ci`"),
             TaskError::UnknownCommand { command } => write!(formatter, "unknown command `{command}`"),
+            TaskError::MissingSeedCount => write!(formatter, "sweep needs a seed count: `sweep <count> [first]`"),
+            TaskError::BadNumber { argument } => write!(formatter, "`{argument}` is not a whole number"),
             TaskError::MissingRoot => write!(formatter, "workspace root not found"),
             TaskError::Io { action, source } => write!(formatter, "{action}: {source}"),
             TaskError::Failed { failures } => write_failures(formatter, failures),

@@ -5,6 +5,7 @@ use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use reel_api::units::ByteCount;
 
+use crate::pool::touched_capacity;
 use crate::guard::hold;
 use crate::record::record_check::{Checksum, checksum};
 use crate::segment::block_entry::KeyPrefix;
@@ -162,8 +163,16 @@ impl ColumnDirectory {
 
 /// Build an empty copy with fixed room
 pub fn empty_list(capacity: usize) -> DirectoryList {
+    let blank = DirectoryEntry {
+        shared_length: 0,
+        shared_sum: Checksum(0),
+        lowest: KeyPrefix::default(),
+        highest: KeyPrefix::default(),
+        reach: KeyPrefix::default(),
+        segment: SegmentNumber(0),
+    };
     DirectoryList {
-        entries: Vec::with_capacity(capacity),
+        entries: touched_capacity(capacity, blank),
         generation: 0,
     }
 }

@@ -6,6 +6,7 @@ use std::ops::Range;
 use reel_api::reads::ValueWindow;
 use reel_api::units::{ByteCount, FileOffset};
 
+use crate::pool::touched_zeroes;
 use crate::io::IoFile;
 use crate::record::chunk_table::{
     ChunkCount, ChunkIndex, ChunkSpan, ENTRIES_PER_PAGE, TABLE_PAGE_BYTES, TablePageIndex, chunk_span, page_bytes,
@@ -69,10 +70,10 @@ impl RecordReader {
     /// Allocate the buffers
     pub fn new() -> Self {
         Self {
-            first: vec![0; FIRST_READ_BYTES],
-            page: vec![0; TABLE_PAGE_BYTES],
-            chunk: vec![0; CHUNK_BYTES],
-            decoded: vec![0; CHUNK_BYTES],
+            first: touched_zeroes(FIRST_READ_BYTES),
+            page: touched_zeroes(TABLE_PAGE_BYTES),
+            chunk: touched_zeroes(CHUNK_BYTES),
+            decoded: touched_zeroes(CHUNK_BYTES),
         }
     }
 

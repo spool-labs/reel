@@ -4,6 +4,8 @@ use std::os::raw::{c_char, c_int, c_void};
 
 use lz4_sys::LZ4_decompress_safe;
 
+use crate::pool::touched_capacity;
+
 /// The library's default speed setting
 pub const ACCELERATION: c_int = 1;
 
@@ -31,7 +33,9 @@ impl Lz4State {
         // SAFETY: the call takes no arguments and reads no memory of ours
         let bytes = unsafe { LZ4_sizeofState() };
         let words = (bytes as usize).div_ceil(size_of::<u64>());
-        Self { words: vec![0; words] }
+        let mut state = touched_capacity(words, 0);
+        state.resize(words, 0);
+        Self { words: state }
     }
 
     /// Compress one chunk, or return nothing when it doesn't shrink

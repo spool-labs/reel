@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
 use reel_api::column_id::ColumnId;
+use reel_api::memory_report::MemoryReport;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, WritePlace};
 
@@ -82,6 +83,9 @@ pub struct EngineState<Backend: Io> {
     pub row_job_idle: AtomicBool,
     pub damaged_segments: AtomicU64,
     pub dropped_summary_rows: AtomicU64,
+    pub memory_budget: ByteCount,
+    pub seal_heap: AtomicU64,
+    pub job_count: AtomicU64,
     pub row_task: OnceLock<Backend::Task>,
     pub reserve_task: OnceLock<Backend::Task>,
     pub seal_tasks: Vec<OnceLock<Backend::Task>>,
@@ -257,13 +261,46 @@ impl<Backend: Io> EngineState<Backend> {
         hold(&self.free_slots).push(slot);
     }
 
+    /// Report the heap each structure holds
+    pub fn memory_report(&self) -> MemoryReport {
+        let mut report = MemoryReport {
+            budget: self.memory_budget,
+            write_index: self.index.heap_bytes(),
+            spot_cache: self.spot.heap_bytes(),
+            block_cache: ByteCount(self.filter_cache.heap_bytes().0 + self.row_cache.heap_bytes().0),
+            footer_space: ByteCount(self.seal_heap.load(Ordering::Acquire)),
+            thread_stacks: ByteCount(self.job_count.load(Ordering::Acquire) * self.io.job_stack_bytes().0),
+            ..MemoryReport::default()
+        };
+        for directory in self.directories.iter().flatten() {
+            report.block_indexes = ByteCount(report.block_indexes.0 + directory.heap_bytes().0);
+        }
+        for volume in &self.volumes {
+            report.segment_table = ByteCount(report.segment_table.0 + volume.table.heap_bytes().0);
+            report.damaged_spans = ByteCount(report.damaged_spans.0 + volume.damage.heap_bytes().0);
+            let buffer = volume.summary_buffer.heap_bytes(|buffer| ByteCount(buffer.capacity() as u64));
+            report.summary = ByteCount(report.summary.0 + hold(&volume.summary).heap_bytes().0 + buffer.0);
+        }
+        let readers = self.record_readers.heap_bytes(RecordReader::heap_bytes);
+        let footers = self.footer_readers.heap_bytes(FooterReader::heap_bytes);
+        report.read_buffers = ByteCount(readers.0 + footers.0);
+        let encoders = self.encoders.heap_bytes(RecordEncoder::heap_bytes);
+        let large = self.large_encoders.heap_bytes(RecordEncoder::heap_bytes);
+        report.compress_buffers = ByteCount(encoders.0 + large.0);
+        for queue in &self.queues {
+            report.queues = ByteCount(report.queues.0 + hold(queue).filling.heap_bytes().0);
+        }
+        for group in &self.spare_groups {
+            if let Some(group) = hold(group).as_ref() {
+                report.queues = ByteCount(report.queues.0 + group.heap_bytes().0);
+            }
+        }
+        report
+    }
+
     /// Add up the heap the shared parts hold
     pub fn heap_bytes(&self) -> ByteCount {
-        let mut summaries = 0;
-        for volume in &self.volumes {
-            summaries += hold(&volume.summary).heap_bytes().0;
-        }
-        ByteCount(self.index.heap_bytes().0 + self.spot.heap_bytes().0 + summaries)
+        self.memory_report().heap_total()
     }
 }
 

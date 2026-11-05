@@ -6,6 +6,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use reel_api::column_id::ColumnId;
 use reel_api::units::ByteCount;
 
+use crate::pool::touched_capacity;
 use crate::segment::block_entry::{BlockEntry, KeyPrefix};
 use crate::segment::footer_reader::first_candidate;
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber, TailHead};
@@ -184,8 +185,8 @@ impl<File: Clone> SegmentTable<File> {
                 segments,
                 map: NumberMap::new(sizing.segments_per_shard),
                 free_slots,
-                columns: Vec::with_capacity(sizing.columns_per_shard),
-                blocks: Vec::with_capacity(sizing.blocks_per_shard),
+                columns: touched_capacity(sizing.columns_per_shard, ColumnTail::default()),
+                blocks: touched_capacity(sizing.blocks_per_shard, BlockEntry::default()),
             }));
             pins.push(shard_pins);
         }

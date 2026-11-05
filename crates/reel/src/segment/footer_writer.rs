@@ -5,6 +5,7 @@ use std::io::{Error, IoSlice, Result};
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
+use crate::pool::{touched_capacity, touched_zeroes};
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::io::IoFile;
 use crate::record::record_check::{Checksum, RecordKey, checksum};
@@ -73,17 +74,17 @@ impl FooterWriter {
     pub fn new(most_blocks: BlockCount) -> Self {
         Self {
             builder: RowBlockBuilder::new(),
-            filter: vec![0; filter_bytes(MOST_BLOCK_ROWS) + FILTER_SUM_BYTES],
-            hashes: Vec::with_capacity(MOST_BLOCK_ROWS),
-            entries: Vec::with_capacity(most_blocks.0 as usize),
-            columns: Vec::with_capacity(MAX_COLUMNS),
-            column_keys: Vec::with_capacity(MAX_COLUMNS),
-            key_bytes: Vec::with_capacity(MAX_COLUMNS * (2 * SUMMARY_KEY_BYTES + 1)),
-            tail: vec![0; MAX_TAIL_BYTES],
-            index: vec![0; ROW_BLOCK_BYTES],
+            filter: touched_zeroes(filter_bytes(MOST_BLOCK_ROWS) + FILTER_SUM_BYTES),
+            hashes: touched_capacity(MOST_BLOCK_ROWS, KeyHash::default()),
+            entries: touched_capacity(most_blocks.0 as usize, BlockEntry::default()),
+            columns: touched_capacity(MAX_COLUMNS, ColumnTail::default()),
+            column_keys: touched_capacity(MAX_COLUMNS, ColumnKeys::default()),
+            key_bytes: touched_capacity(MAX_COLUMNS * (2 * SUMMARY_KEY_BYTES + 1), 0),
+            tail: touched_zeroes(MAX_TAIL_BYTES),
+            index: touched_zeroes(ROW_BLOCK_BYTES),
             position: FileOffset(0),
-            first_key: Vec::with_capacity(ROW_BLOCK_BYTES),
-            last_key: Vec::with_capacity(ROW_BLOCK_BYTES),
+            first_key: touched_capacity(ROW_BLOCK_BYTES, 0),
+            last_key: touched_capacity(ROW_BLOCK_BYTES, 0),
             places: PlaceRange::default(),
             place_base: WritePlace(0),
             row_count: RowCount(0),

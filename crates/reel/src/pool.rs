@@ -73,3 +73,22 @@ pub fn touched_buffer(capacity: usize) -> Vec<u8> {
     buffer.clear();
     buffer
 }
+
+/// Allocate zeroed bytes with every page written
+pub fn touched_zeroes(length: usize) -> Vec<u8> {
+    let mut bytes = vec![TOUCH_BYTE; length];
+    black_box(bytes.as_mut_slice());
+    bytes.fill(0);
+    bytes
+}
+
+/// Allocate an empty list with room for its items and every page of that room written
+pub fn touched_capacity<Item: Clone>(capacity: usize, filler: Item) -> Vec<Item> {
+    let mut items: Vec<Item> = Vec::with_capacity(capacity);
+    // the room has to count as seen, or a compiler can turn the writes into a zeroed allocation
+    black_box(items.as_mut_ptr());
+    items.resize(capacity, filler);
+    black_box(items.as_mut_slice());
+    items.clear();
+    items
+}

@@ -3,6 +3,7 @@
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::pool::{touched_capacity, touched_zeroes};
 use crate::little_endian::{read_half, read_word};
 use crate::row_kind::RowKind;
 use crate::segment::varint::{MAX_VARINT_BYTES, read_varint, write_varint};
@@ -81,10 +82,10 @@ impl RowBlockBuilder {
     /// Allocate the buffers
     pub fn new() -> Self {
         Self {
-            bytes: vec![0; ROW_BLOCK_BYTES],
+            bytes: touched_zeroes(ROW_BLOCK_BYTES),
             used: 0,
-            restarts: Vec::with_capacity(MAX_RESTARTS),
-            last_key: Vec::with_capacity(ROW_BLOCK_BYTES),
+            restarts: touched_capacity(MAX_RESTARTS, 0),
+            last_key: touched_capacity(ROW_BLOCK_BYTES, 0),
             row_count: 0,
             place_base: WritePlace(0),
         }

@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use reel_api::column_id::ColumnId;
+use reel_api::memory_report::MemoryReport;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, VolumeId, WritePlace};
@@ -118,6 +119,11 @@ impl<Backend: Io> ReelStore<Backend> {
     /// Count the summary rows that didn't fit, each one a segment whose damage would cover its columns whole
     pub fn dropped_summary_rows(&self) -> u64 {
         self.state.dropped_summary_rows.load(Ordering::Acquire)
+    }
+
+    /// Report the heap each structure holds
+    pub fn memory_report(&self) -> MemoryReport {
+        self.state.memory_report()
     }
 
     /// Count the segments open kept and couldn't read
@@ -325,6 +331,11 @@ pub fn bring_up<Backend: Io>(
     let damaged: usize = state.volumes.iter().map(|volume| hold(&volume.damaged).len()).sum();
     state.damaged_segments.store(damaged as u64, Ordering::Release);
 
+    // some platforms set a lock up at its first use, and close is the first to take this one
+    for volume in &state.volumes {
+        drop(hold(&volume.locks));
+    }
+
     // an open is not a state: the limits say what a run-through would seal, from the same rows
     for volume in &state.volumes {
         let mut claims = hold(&volume.claims);
@@ -339,6 +350,7 @@ pub fn bring_up<Backend: Io>(
     let _set = state.row_task.set(task);
     for volume in 0..state.volumes.len() {
         let seal_job = SealJob::new(Arc::clone(state), volume);
+        state.seal_heap.fetch_add(seal_job.heap_bytes().0, Ordering::AcqRel);
         let task = state.io.spawn_job("reel-seal", seal_job).map_err(open_error("starting a job"))?;
         let _set = state.seal_tasks[volume].set(task);
     }
@@ -347,6 +359,7 @@ pub fn bring_up<Backend: Io>(
     };
     let task = state.io.spawn_job("reel-reserve", reserve_job).map_err(open_error("starting a job"))?;
     let _set = state.reserve_task.set(task);
+    state.job_count.store(2 + state.volumes.len() as u64, Ordering::Release);
     Ok(())
 }
 
@@ -716,6 +729,9 @@ pub fn build_state<Backend: Io>(
         row_job_idle: AtomicBool::new(false),
         damaged_segments: AtomicU64::new(0),
         dropped_summary_rows: AtomicU64::new(0),
+        memory_budget: config.memory_budget,
+        seal_heap: AtomicU64::new(0),
+        job_count: AtomicU64::new(0),
         row_task: OnceLock::new(),
         reserve_task: OnceLock::new(),
         seal_tasks,

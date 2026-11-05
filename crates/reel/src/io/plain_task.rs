@@ -69,10 +69,13 @@ impl TaskSignal {
 impl PlainTask {
     /// Wrap a started thread
     pub fn new(signal: Arc<TaskSignal>, thread: JoinHandle<()>) -> Self {
-        Self {
+        let task = Self {
             signal,
             thread: Mutex::new(Some(thread)),
-        }
+        };
+        // some platforms set a lock up at its first use, and that's a job for open
+        drop(hold(&task.thread));
+        task
     }
 }
 

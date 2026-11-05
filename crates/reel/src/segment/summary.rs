@@ -1,6 +1,7 @@
 //! A volume's summary: one row per sealed segment, which outlives that segment's tail
 
 use std::collections::BTreeMap;
+use std::hint::black_box;
 use std::io::{ErrorKind, IoSlice, Result};
 use std::path::{Path, PathBuf};
 
@@ -174,6 +175,7 @@ impl SummaryRows {
         let wanted = capacity.0 as usize;
         let length = self.bytes.len();
         self.bytes.reserve_exact(wanted.saturating_sub(length));
+        black_box(self.bytes.as_mut_ptr());
         self.bytes.resize(wanted.max(length), 0);
         self.bytes.truncate(length);
     }

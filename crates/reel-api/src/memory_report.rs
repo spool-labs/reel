@@ -12,6 +12,7 @@ pub struct MemoryReport {
     pub block_indexes: ByteCount,
     pub segment_table: ByteCount,
     pub summary: ByteCount,
+    pub damaged_spans: ByteCount,
     pub range_deletes: ByteCount,
     pub key_runs: ByteCount,
     pub read_buffers: ByteCount,
@@ -20,4 +21,26 @@ pub struct MemoryReport {
     pub queues: ByteCount,
     pub footer_space: ByteCount,
     pub thread_stacks: ByteCount,
+}
+
+impl MemoryReport {
+    /// Add up every named part of the heap, stacks apart since they aren't heap
+    pub fn heap_total(&self) -> ByteCount {
+        ByteCount(
+            self.write_index.0
+                + self.spot_cache.0
+                + self.block_cache.0
+                + self.block_indexes.0
+                + self.segment_table.0
+                + self.summary.0
+                + self.damaged_spans.0
+                + self.range_deletes.0
+                + self.key_runs.0
+                + self.read_buffers.0
+                + self.copy_buffers.0
+                + self.compress_buffers.0
+                + self.queues.0
+                + self.footer_space.0,
+        )
+    }
 }

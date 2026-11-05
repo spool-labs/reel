@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
-use reel_api::units::{FileOffset, Nanoseconds, RootId, RowCount, WritePlace};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RootId, RowCount, WritePlace};
 
+use crate::pool::touched_capacity;
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::{SegmentPhase, data_path, rows_path};
@@ -101,9 +102,9 @@ impl<Backend: Io> SealJob<Backend> {
             writer: FooterWriter::new(MOST_SEGMENT_BLOCKS),
             walk: SealWalk::new(),
             column: None,
-            highest: Vec::with_capacity(MAX_KEY_BYTES as usize),
+            highest: touched_capacity(MAX_KEY_BYTES as usize, 0),
             totals: None,
-            last_key: Vec::with_capacity(MAX_KEY_BYTES as usize),
+            last_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             last_column: None,
             is_in_table: false,
             columns_listed: 0,
@@ -393,6 +394,12 @@ impl<Backend: Io> SealJob<Backend> {
         }
         self.state.free_slot(target.slot);
         true
+    }
+
+    /// Read the heap the job's own buffers hold
+    pub fn heap_bytes(&self) -> ByteCount {
+        let keys = self.highest.capacity() + self.last_key.capacity();
+        ByteCount(self.writer.heap_bytes().0 + self.walk.heap_bytes().0 + keys as u64)
     }
 
     /// Drop an empty segment's files with no footer

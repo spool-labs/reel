@@ -33,16 +33,22 @@ const FLUSH_ROUNDS: usize = 64;
 const SEAL_ROUNDS: usize = 300;
 const SEAL_WAIT: Duration = Duration::from_millis(1);
 const MOST_SEAL_WAITS: u32 = 20_000;
-const MOST_SITES: u64 = 16;
+const MOST_SITES: u64 = 8;
 const STAT_BYTES: usize = 1_024;
 const STAT_PATH: &str = "/proc/self/stat";
 const MINOR_FAULTS_FIELD: usize = 7;
 const MAJOR_FAULTS_FIELD: usize = 9;
+const STATUS_PATH: &str = "/proc/self/status";
+const RESIDENT_FIELD: &str = "VmRSS:";
+const KIB: u64 = 1_024;
+// the spec lets memory_report miss the process heap by this share, as a divisor
+const REPORT_SLACK_DIVISOR: u64 = 10;
 
 type Store = ReelStore<PlainIo>;
 
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static FREES: AtomicU64 = AtomicU64::new(0);
+static LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 static IS_WINDOW: AtomicBool = AtomicBool::new(false);
 static SITES: AtomicU64 = AtomicU64::new(0);
 
@@ -80,6 +86,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         if note_site("allocation") {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         }
+        LIVE_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
         unsafe { System.alloc(layout) }
     }
 
@@ -88,6 +95,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         if note_site("allocation") {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         }
+        LIVE_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
         unsafe { System.alloc_zeroed(layout) }
     }
 
@@ -95,6 +103,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         if note_site("free") {
             FREES.fetch_add(1, Ordering::Relaxed);
         }
+        LIVE_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
         unsafe { System.dealloc(pointer, layout) }
     }
 
@@ -103,6 +112,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
         if note_site("reallocation") {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         }
+        LIVE_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+        LIVE_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
         unsafe { System.realloc(pointer, layout, size) }
     }
 }
@@ -299,6 +310,36 @@ fn damage(root: &Path, inputs: &Inputs) {
     }
 }
 
+// read each thread's name and faults, for a failure to say which thread took them
+fn thread_faults() -> Vec<(String, u64, u64)> {
+    let mut threads = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc/self/task") else {
+        return threads;
+    };
+    for entry in entries.flatten() {
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let (Some(name_start), Some(name_end)) = (stat.find('('), stat.rfind(')')) else {
+            continue;
+        };
+        let fields: Vec<&str> = stat[name_end + 2..].split(' ').collect();
+        let minor = fields[MINOR_FAULTS_FIELD].parse().unwrap_or(0);
+        let major = fields[MAJOR_FAULTS_FIELD].parse().unwrap_or(0);
+        let tid = entry.file_name().to_string_lossy().to_string();
+        threads.push((format!("{tid} {}", &stat[name_start + 1..name_end]), minor, major));
+    }
+    threads
+}
+
+// read how much of the process is resident, or nothing where the file doesn't exist
+fn resident_bytes() -> Option<u64> {
+    let status = fs::read_to_string(STATUS_PATH).ok()?;
+    let line = status.lines().find(|line| line.starts_with(RESIDENT_FIELD))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * KIB)
+}
+
 fn scratch_root() -> PathBuf {
     let root = std::env::temp_dir().join(format!("reel-steady-{}", process::id()));
     fs::create_dir_all(&root).expect("create");
@@ -310,7 +351,25 @@ fn main() {
     let mut inputs = inputs();
     damage(&root, &inputs);
 
+    let live_before = LIVE_BYTES.load(Ordering::Acquire);
+    let resident_before = resident_bytes();
     let store = open(&root);
+    let live_grown = LIVE_BYTES.load(Ordering::Acquire) - live_before;
+    let report = store.memory_report();
+    let reported = report.heap_total().0;
+    let pools = reported + report.thread_stacks.0;
+    let resident_grown = resident_bytes().zip(resident_before).map(|(after, before)| after.saturating_sub(before));
+    println!("open: {live_grown} B live, {reported} B reported, {} B of stacks, resident grew {resident_grown:?}", report.thread_stacks.0);
+    println!("{report:?}");
+    let mut failures = 0;
+    if live_grown.abs_diff(reported) > reported / REPORT_SLACK_DIVISOR {
+        println!("memory_report misses the heap by more than a tenth");
+        failures += 1;
+    }
+    if resident_grown.is_some_and(|grown| grown < pools) {
+        println!("open left pages unwritten: resident grew less than memory_report holds");
+        failures += 1;
+    }
     assert_eq!(store.damaged_segments(), 1);
 
     // the first run of a path faults in the binary's own pages, so every path runs before the window
@@ -320,6 +379,7 @@ fn main() {
 
     let mut faults = FaultCounter::new();
     let _first_read = faults.read();
+    let threads_before = thread_faults();
     let before = counts(&mut faults);
     IS_WINDOW.store(true, Ordering::Release);
     for number in 1..=ROUNDS {
@@ -327,8 +387,19 @@ fn main() {
     }
     IS_WINDOW.store(false, Ordering::Release);
     let after = counts(&mut faults);
+    for (name, minor, major) in thread_faults() {
+        let before = threads_before.iter().find(|thread| thread.0 == name);
+        let (minor_before, major_before) = before.map_or((0, 0), |thread| (thread.1, thread.2));
+        if minor != minor_before || major != major_before {
+            println!("thread {name}: {} minor, {} major", minor - minor_before, major - major_before);
+        }
+    }
 
+    let allocations_before_close = ALLOCATIONS.load(Ordering::Acquire);
+    IS_WINDOW.store(true, Ordering::Release);
     store.close().expect("close");
+    IS_WINDOW.store(false, Ordering::Release);
+    let close_allocations = ALLOCATIONS.load(Ordering::Acquire) - allocations_before_close;
     drop(store);
     fs::remove_dir_all(&root).expect("remove");
 
@@ -337,7 +408,8 @@ fn main() {
     let minor_faults = after.minor_faults - before.minor_faults;
     let major_faults = after.major_faults - before.major_faults;
     println!("{ROUNDS} rounds: {allocations} allocations, {frees} frees, {minor_faults} minor faults, {major_faults} major faults");
-    if allocations + frees + minor_faults + major_faults > 0 {
+    println!("close: {close_allocations} allocations");
+    if failures + allocations + frees + minor_faults + major_faults + close_allocations > 0 {
         process::exit(1);
     }
 }

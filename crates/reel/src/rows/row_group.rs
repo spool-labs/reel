@@ -4,6 +4,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
+use crate::pool::touched_zeroes;
 use crate::little_endian::{read_half, read_word};
 use crate::record::record_check::RecordKey;
 use crate::row_kind::RowKind;
@@ -73,7 +74,7 @@ impl RowGroupBuffer {
     /// Allocate a group of a fixed size
     pub fn new(capacity: ByteCount) -> Self {
         Self {
-            bytes: vec![0; capacity.0 as usize],
+            bytes: touched_zeroes(capacity.0 as usize),
             used: GROUP_HEADER_BYTES,
             row_count: 0,
         }

@@ -4,6 +4,7 @@ use std::io::Result;
 
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
+use crate::pool::{touched_capacity, touched_zeroes};
 use crate::index::key_hash::KeyHash;
 use crate::io::IoFile;
 use crate::io::device_error::read_or_damaged;
@@ -96,11 +97,11 @@ impl FooterReader {
     /// Allocate the buffers
     pub fn new() -> Self {
         Self {
-            tail: vec![0; MAX_TAIL_BYTES],
-            block: vec![0; ROW_BLOCK_BYTES],
-            filter: vec![0; ROW_BLOCK_BYTES],
-            key: Vec::with_capacity(ROW_BLOCK_BYTES),
-            candidates: Vec::with_capacity(CANDIDATE_PAGE),
+            tail: touched_zeroes(MAX_TAIL_BYTES),
+            block: touched_zeroes(ROW_BLOCK_BYTES),
+            filter: touched_zeroes(ROW_BLOCK_BYTES),
+            key: touched_capacity(ROW_BLOCK_BYTES, 0),
+            candidates: touched_capacity(CANDIDATE_PAGE, SegmentNumber(0)),
         }
     }
 

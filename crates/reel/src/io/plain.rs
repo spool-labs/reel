@@ -3,13 +3,14 @@
 use std::collections::hash_map::RandomState;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::hash::{BuildHasher, Hasher};
+use std::hint::black_box;
 use std::io::{Error, ErrorKind, Result};
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread::{self, Builder};
 use std::time::{Duration, Instant};
 
@@ -20,9 +21,14 @@ use crate::io::job::Job;
 use crate::io::lock_outcome::LockOutcome;
 use crate::io::plain_file::{PlainFile, reserve_space};
 use crate::io::plain_task::{PlainTask, TaskSignal, run_job};
+use crate::pool::TOUCH_BYTE;
 
 /// Width of the process id in a lock file, padded with spaces
 pub const HOLDER_WIDTH: usize = 10;
+/// The stack of a job thread, which holds a seal's and a merge's deepest calls with room to spare
+pub const JOB_STACK_BYTES: ByteCount = ByteCount(1024 * 1024);
+/// The part of a job's stack written through at its start, which leaves room for the frames around the write
+pub const TOUCHED_STACK_BYTES: usize = 1024 * 1024 - 16 * 1024;
 /// Reads of a lock file before giving up on a holder writing its id
 pub const HOLDER_READ_ATTEMPTS: u64 = 100;
 /// Wait between reads of a lock file
@@ -168,15 +174,35 @@ impl Io for PlainIo {
         thread::sleep(PAUSE_WAIT);
     }
 
+    fn job_stack_bytes(&self) -> ByteCount {
+        ByteCount(TOUCHED_STACK_BYTES as u64)
+    }
+
     fn spawn_job<Work: Job>(&self, name: &'static str, job: Work) -> Result<PlainTask> {
         let signal = Arc::new(TaskSignal::default());
         let thread_signal = Arc::clone(&signal);
         let thread_io = self.clone();
+        // open isn't over until the stack is written, so it waits for the thread to get that far
+        let ready = Arc::new(Barrier::new(2));
+        let thread_ready = Arc::clone(&ready);
         let thread = Builder::new()
             .name(name.to_string())
-            .spawn(move || run_job(job, &thread_signal, &thread_io))?;
+            .stack_size(JOB_STACK_BYTES.0 as usize)
+            .spawn(move || {
+                touch_stack();
+                thread_ready.wait();
+                run_job(job, &thread_signal, &thread_io);
+            })?;
+        ready.wait();
         Ok(PlainTask::new(signal, thread))
     }
+}
+
+/// Write through the thread's stack now, so a job never faults one of its pages in later
+#[inline(never)]
+pub fn touch_stack() {
+    let mut stack = [TOUCH_BYTE; TOUCHED_STACK_BYTES];
+    black_box(&mut stack);
 }
 
 /// Read the holder's id, waiting out the moment a first holder takes to write it

@@ -366,6 +366,10 @@ impl Io for SimulatedIo {
         self.step_any();
     }
 
+    fn job_stack_bytes(&self) -> ByteCount {
+        ByteCount(0)
+    }
+
     fn spawn_job<Work: Job>(&self, name: &'static str, job: Work) -> Result<SimulatedTask> {
         let process = hold(&self.disk).process;
         let mut slots = hold(&self.slots);

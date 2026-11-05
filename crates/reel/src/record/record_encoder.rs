@@ -4,6 +4,7 @@ use std::io::IoSlice;
 
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
+use crate::pool::touched_zeroes;
 use crate::record::chunk_table::{
     ChunkCount, ChunkEntry, ENTRIES_PER_PAGE, PAGE_END_AT, TABLE_PAGE_BYTES, TablePageIndex, page_bytes, page_count,
     table_bytes, write_entry,
@@ -51,9 +52,9 @@ impl RecordEncoder {
         let chunks = chunk_count(largest_value);
         let stored = (largest_stored.0 as usize).max(CHUNK_BYTES);
         Self {
-            head: vec![0; chunked_head_bytes(largest_value)],
-            table: vec![0; page_count(chunks).0 as usize * TABLE_PAGE_BYTES],
-            stored: vec![0; stored],
+            head: touched_zeroes(chunked_head_bytes(largest_value)),
+            table: touched_zeroes(page_count(chunks).0 as usize * TABLE_PAGE_BYTES),
+            stored: touched_zeroes(stored),
             lz4: Lz4State::new(),
             check: RecordCheck(0),
         }

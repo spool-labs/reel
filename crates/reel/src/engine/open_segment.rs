@@ -17,8 +17,8 @@ pub const NUMBER_DIGITS: usize = 16;
 pub const DATA_SUFFIX: &str = ".data";
 /// The end of a segment's rows file name
 pub const ROWS_SUFFIX: &str = ".rows";
-/// The longest path a segment file can have, with its root
-pub const MOST_PATH_BYTES: usize = 512;
+/// The longest path a segment file can have, with its root, under what the standard library keeps on the stack
+pub const MOST_PATH_BYTES: usize = 376;
 /// The digits of a segment number
 pub const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 

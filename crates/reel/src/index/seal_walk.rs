@@ -1,15 +1,15 @@
 //! A sealing segment's rows in order, merged from every shard with fixed buffers
 
 use reel_api::column_id::ColumnId;
+use reel_api::units::ByteCount;
 
+use crate::pool::touched_capacity;
+use crate::config::MAX_KEY_BYTES;
 use crate::index::open_slots::OpenSlot;
 use crate::index::seek_target::{SeekTarget, compare_rows};
 use crate::index::write_index::{SHARD_COUNT, WriteIndex};
 use crate::index::write_row::WriteRow;
 use crate::index::write_tree::{TreePosition, entry_at, step_forward};
-
-/// The longest key a column can declare
-pub const MAX_KEY_BYTES: usize = 1_056;
 
 /// One shard's next row, copied out so the merge holds no lock
 #[derive(Clone, Debug)]
@@ -28,6 +28,12 @@ pub struct SealWalk {
 }
 
 impl SealWalk {
+    /// Read the heap the merge's buffers hold
+    pub fn heap_bytes(&self) -> ByteCount {
+        let keys: usize = self.heads.iter().map(|head| head.key.capacity()).sum();
+        ByteCount((self.heads.capacity() * size_of::<WalkHead>() + keys) as u64)
+    }
+
     /// Allocate the merge's buffers
     pub fn new() -> Self {
         let mut heads = Vec::with_capacity(SHARD_COUNT);
@@ -35,7 +41,7 @@ impl SealWalk {
             heads.push(WalkHead {
                 position: None,
                 column: ColumnId::default(),
-                key: Vec::with_capacity(MAX_KEY_BYTES),
+                key: touched_capacity(MAX_KEY_BYTES as usize, 0),
                 row: None,
             });
         }

@@ -389,9 +389,11 @@ impl<Backend: Io> EngineState<Backend> {
         let end = (free.offset.0 + free.length.0) / FREE_BLOCK_BYTES * FREE_BLOCK_BYTES;
         if let (Some(pin), true) = (volume.table.pin(free.segment), start < end) {
             let length = ByteCount(end - start);
-            if pin.file.free_range(FileOffset(start), length).is_ok() {
-                volume.bytes_freed.fetch_add(length.0, Ordering::AcqRel);
-                volume.table.note_freed(free.segment, length.0);
+            let held = pin.file.held_bytes();
+            if pin.file.free_range(FileOffset(start), length).is_ok()
+                && let (Ok(before), Ok(after)) = (held, pin.file.held_bytes())
+            {
+                volume.bytes_freed.fetch_add(before.0.saturating_sub(after.0), Ordering::AcqRel);
             }
         }
         true

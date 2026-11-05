@@ -9,6 +9,8 @@ use crate::seeded_random::SeededRandom;
 
 /// A torn write keeps or loses each sector of this size on its own
 pub const SECTOR_BYTES: u64 = 512;
+/// The block a free in place gives back
+pub const FREED_BLOCK_BYTES: u64 = 4_096;
 /// Each sector of a torn write survives one time in this many
 pub const SECTOR_SURVIVAL_ODDS: u64 = 2;
 /// What a power cut can do to one unsynced change, each as likely as the others
@@ -106,6 +108,7 @@ pub struct FileImage {
     pub handle_count: u64,
     pub is_named: bool,
     pub bad_sectors: BTreeSet<u64>,
+    pub freed_blocks: BTreeSet<u64>,
 }
 
 impl FileImage {
@@ -150,12 +153,26 @@ impl FileImage {
             }
         }
         self.visible.clone_from(&self.durable);
+        self.freed_blocks.clear();
     }
 
     /// Flip bits of one byte in what readers see and in what survives
     pub fn rot(&mut self, offset: FileOffset, mask: BitMask) {
         self.visible.flip(offset, mask);
         self.durable.flip(offset, mask);
+    }
+
+    /// Note a range's whole blocks as given back, and return the bytes that were still held
+    pub fn note_freed(&mut self, offset: FileOffset, length: ByteCount) -> ByteCount {
+        let blocks = offset.0 / FREED_BLOCK_BYTES..(offset.0 + length.0) / FREED_BLOCK_BYTES;
+        let newly = blocks.filter(|block| self.freed_blocks.insert(*block)).count();
+        ByteCount(newly as u64 * FREED_BLOCK_BYTES)
+    }
+
+    /// Read the bytes the file takes on its disk
+    pub fn held_bytes(&self) -> ByteCount {
+        let whole = (self.visible.len() as u64).next_multiple_of(FREED_BLOCK_BYTES);
+        ByteCount(whole - self.freed_blocks.len() as u64 * FREED_BLOCK_BYTES)
     }
 
     /// Check a read can reach these bytes

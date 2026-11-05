@@ -9,6 +9,7 @@ use reel::engine::compact_job::CompactJob;
 use reel::engine::cue::MOST_CUES;
 use reel::engine::read_path::{MOST_READ_TRIES, RecordWant};
 use reel::engine::reel_store::ReelStore;
+use reel::engine::rewrite_job::freed_in_place;
 use reel::engine::walk_job::{FREE_BLOCK_BYTES, FREE_IN_PLACE_BYTES, FreeRecord, MOST_BLOCK_FREES};
 use reel::guard::hold;
 use reel::record::codec::Codec;
@@ -296,6 +297,57 @@ fn no_pin_to_give() {
     for slot in slots {
         state.cues.release(slot);
     }
+    store.close().expect("close");
+}
+
+// a pass over blocks already given back counts nothing, so the freed figure stays what the disk got back
+#[test]
+fn second_punch_counts_nothing() {
+    let io = SimulatedIo::new(Seed(16));
+    let store = open(&io);
+    keep_live(&store);
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    let older = seal(&store, &io);
+    store.put(COLUMN, b"key", &large(2)).expect("put");
+    seal(&store, &io);
+
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let freed = volume.bytes_freed.load(Ordering::Acquire);
+    let frees = state.cues.counts().frees;
+    assert!(freed > 0);
+
+    volume.table.flag_held_frees(older, true);
+    volume.has_held_frees.store(true, Ordering::Release);
+    state.ask_compaction();
+    settle(&io);
+
+    assert!(state.cues.counts().frees > frees);
+    assert_eq!(volume.bytes_freed.load(Ordering::Acquire), freed);
+    assert_eq!(io.freed_bytes().0, freed);
+    store.close().expect("close");
+}
+
+// what a file gave back outlasts a reopen, so the byte trigger never counts those bytes as won back again
+#[test]
+fn freed_outlasts_a_reopen() {
+    let io = SimulatedIo::new(Seed(17));
+    let store = open(&io);
+    keep_live(&store);
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    let older = seal(&store, &io);
+    store.put(COLUMN, b"key", &large(2)).expect("put");
+    seal(&store, &io);
+    store.close().expect("close");
+    drop(store);
+
+    let store = open(&io);
+    settle(&io);
+    let volume = &store.state.volumes[0];
+    let rows = hold(&volume.summary);
+    let row = rows.rows().find(|row| row.facts.segment == older).expect("a row");
+    assert!(freed_in_place(volume, &row) >= FREE_IN_PLACE_BYTES.0 - 2 * FREE_BLOCK_BYTES);
+    drop(rows);
     store.close().expect("close");
 }
 

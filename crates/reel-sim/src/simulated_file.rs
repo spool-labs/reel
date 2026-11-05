@@ -220,12 +220,26 @@ impl IoFile for SimulatedFile {
         }
     }
 
+    fn held_bytes(&self) -> Result<ByteCount> {
+        let _pause = CountPause::new();
+        let mut disk = hold(&self.disk);
+        self.check(&mut disk, false)?;
+        match disk.inodes.get(&self.inode) {
+            Some(image) => Ok(image.held_bytes()),
+            None => Err(Error::from(ErrorKind::NotFound)),
+        }
+    }
+
     fn free_range(&self, offset: FileOffset, length: ByteCount) -> Result<()> {
         let _pause = CountPause::new();
         let zeros = vec![0; length.0 as usize];
         self.write_at(offset, &[IoSlice::new(&zeros)])?;
         let mut disk = hold(&self.disk);
-        disk.freed_bytes = ByteCount(disk.freed_bytes.0 + length.0);
+        let newly = match disk.inodes.get_mut(&self.inode) {
+            Some(image) => image.note_freed(offset, length),
+            None => ByteCount(0),
+        };
+        disk.freed_bytes = ByteCount(disk.freed_bytes.0 + newly.0);
         Ok(())
     }
 

@@ -14,6 +14,7 @@ use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, RewritePhase};
 use reel::guard::hold;
 use reel::io::Io;
 use reel::record::codec::Codec;
+use reel::segment::damage_list::DamagedRange;
 use reel::segment::footer_reader::FooterReader;
 use reel::segment::segment_tail::SegmentNumber;
 use reel_api::column_id::ColumnId;
@@ -750,5 +751,129 @@ fn name_landed_before_the_failure() {
         job.rewrite.step();
     }
     assert!(!has_file(&io, number));
+    store.close().expect("close");
+}
+
+fn run_to_install(job: &mut CompactJob<SimulatedIo>) {
+    assert!(job.rewrite.start());
+    while job.rewrite.phase != RewritePhase::Installing {
+        job.rewrite.step();
+    }
+}
+
+// a named output a give-up can't remove stays as a stray, and a later try removes it
+#[test]
+fn failed_remove_stays_a_stray() {
+    let io = SimulatedIo::new(Seed(40));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    half_dead(&store, &io);
+
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let mut job = CompactJob::new(Arc::clone(state), 0);
+    run_to_install(&mut job);
+    let slot = state.cues.take(WritePlace(state.read_point().0 - 3)).expect("a slot");
+    io.fail_removes(OperationCount(1));
+    job.rewrite.step();
+    state.cues.release(slot);
+
+    assert!(!job.rewrite.is_running());
+    assert_eq!(volume.stray_outputs.load(Ordering::Acquire), 1);
+    job.rewrite.clear_stray();
+    assert_eq!(volume.stray_outputs.load(Ordering::Acquire), 0);
+    store.close().expect("close");
+}
+
+// a grave and the value under it share a half-dead segment, so with nothing else in the way the grave drops
+fn grave_with_nothing_older(store: &Store, io: &SimulatedIo) {
+    store.put(COLUMN, b"key", b"value").expect("put");
+    store.delete(COLUMN, b"key").expect("delete");
+    half_dead(store, io);
+}
+
+fn kept_graves(job: &CompactJob<SimulatedIo>) -> u64 {
+    job.rewrite.writer.columns().iter().map(|column| column.grave_count.0).sum()
+}
+
+// the same grave drops when nothing holds it back, which the two tests below turn on
+#[test]
+fn grave_drops_alone() {
+    let io = SimulatedIo::new(Seed(41));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    grave_with_nothing_older(&store, &io);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    run_to_install(&mut job);
+    assert_eq!(kept_graves(&job), 0);
+    job.rewrite.abandon();
+    store.close().expect("close");
+}
+
+// a stray that turns up mid-rewrite keeps a grave, since the stray could come back at a crash
+#[test]
+fn stray_keeps_a_grave() {
+    let io = SimulatedIo::new(Seed(42));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    grave_with_nothing_older(&store, &io);
+
+    let volume = &store.state.volumes[0];
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(job.rewrite.start());
+    volume.stray_outputs.store(1, Ordering::Release);
+    while job.rewrite.phase != RewritePhase::Installing {
+        job.rewrite.step();
+    }
+    volume.stray_outputs.store(0, Ordering::Release);
+    assert_eq!(kept_graves(&job), 1);
+    job.rewrite.abandon();
+    store.close().expect("close");
+}
+
+// damage over a grave's key could hide an older version, so the grave stays
+#[test]
+fn damage_keeps_a_grave() {
+    let io = SimulatedIo::new(Seed(43));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    grave_with_nothing_older(&store, &io);
+
+    let volume = &store.state.volumes[0];
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(job.rewrite.start());
+    volume.damage.add(&DamagedRange {
+        column: COLUMN,
+        segment: SegmentNumber(0),
+        highest_place: WritePlace(1),
+        start: b"key".to_vec(),
+        end: Some(b"kez".to_vec()),
+    });
+    while job.rewrite.phase != RewritePhase::Installing {
+        job.rewrite.step();
+    }
+    assert_eq!(kept_graves(&job), 1);
+    job.rewrite.abandon();
+    store.close().expect("close");
+}
+
+// a replacement the mark hasn't reached stops the install: a read below it would find neither version
+#[test]
+fn mark_holds_the_install() {
+    let io = SimulatedIo::new(Seed(44));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let (older, _newer) = half_dead(&store, &io);
+
+    let state = &store.state;
+    let mut job = CompactJob::new(Arc::clone(state), 0);
+    run_to_install(&mut job);
+    job.rewrite.highest_replacement = WritePlace(state.read_point().0 + 1);
+    job.rewrite.step();
+
+    assert!(!job.rewrite.is_running());
+    assert!(state.volumes[0].table.holds(older));
+    check_reads(&store);
     store.close().expect("close");
 }

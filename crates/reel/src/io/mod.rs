@@ -35,6 +35,9 @@ pub trait IoFile: Clone + Send + Sync {
     /// Read the file's length
     fn length(&self) -> Result<ByteCount>;
 
+    /// Read the bytes the file takes on its disk, which a free in place lowers
+    fn held_bytes(&self) -> Result<ByteCount>;
+
     /// Give a range's whole blocks back to the disk, leaving the file's length as it is and the range reading as zeros
     fn free_range(&self, offset: FileOffset, length: ByteCount) -> Result<()>;
 

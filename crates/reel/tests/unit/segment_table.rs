@@ -39,7 +39,6 @@ fn pool_compact() {
         blocks: Extent { start, length },
         is_walked: false,
         highest_replacement: WritePlace(0),
-        freed_bytes: 0,
         has_held_frees: false,
     };
     // the slots run against pool order, and the run at 1 has retired

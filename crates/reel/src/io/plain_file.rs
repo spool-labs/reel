@@ -9,6 +9,9 @@ use reel_api::units::{ByteCount, FileOffset};
 
 use crate::io::IoFile;
 
+/// The size stat counts a file's blocks in, whatever the filesystem's own block is
+pub const STAT_BLOCK_BYTES: u64 = 512;
+
 /// A file reached through plain syscalls, closed only by `Io::close_file`
 #[derive(Clone, Copy, Debug)]
 pub struct PlainFile {
@@ -123,16 +126,11 @@ impl IoFile for PlainFile {
     }
 
     fn length(&self) -> Result<ByteCount> {
-        let mut stats = MaybeUninit::<libc::stat>::zeroed();
-        // SAFETY: the descriptor is open and the pointer is valid for the call
-        let status = unsafe { libc::fstat(self.descriptor, stats.as_mut_ptr()) };
-        if status != 0 {
-            return Err(Error::last_os_error());
-        }
+        Ok(ByteCount(descriptor_stats(self.descriptor)?.st_size as u64))
+    }
 
-        // SAFETY: fstat filled the struct, and every field is a plain integer
-        let stats = unsafe { stats.assume_init() };
-        Ok(ByteCount(stats.st_size as u64))
+    fn held_bytes(&self) -> Result<ByteCount> {
+        Ok(ByteCount(descriptor_stats(self.descriptor)?.st_blocks as u64 * STAT_BLOCK_BYTES))
     }
 
     fn free_range(&self, offset: FileOffset, length: ByteCount) -> Result<()> {
@@ -238,6 +236,19 @@ pub fn write_vectored(descriptor: RawFd, offset: FileOffset, parts: &[IoSlice]) 
             return Err(error);
         }
     }
+}
+
+/// Read a descriptor's stats
+pub fn descriptor_stats(descriptor: RawFd) -> Result<libc::stat> {
+    let mut stats = MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: the descriptor is open and the pointer is valid for the call
+    let status = unsafe { libc::fstat(descriptor, stats.as_mut_ptr()) };
+    if status != 0 {
+        return Err(Error::last_os_error());
+    }
+
+    // SAFETY: fstat filled the struct, and every field is a plain integer
+    Ok(unsafe { stats.assume_init() })
 }
 
 /// Reserve a new file's space, so a full disk fails here and never during a write

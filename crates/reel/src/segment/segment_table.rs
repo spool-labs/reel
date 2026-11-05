@@ -39,7 +39,6 @@ pub struct TableEntry<File> {
     pub blocks: Extent,
     pub is_walked: bool,
     pub highest_replacement: WritePlace,
-    pub freed_bytes: u64,
     pub has_held_frees: bool,
 }
 
@@ -274,7 +273,6 @@ impl<File: Clone> SegmentTable<File> {
             blocks: block_extent,
             is_walked: false,
             highest_replacement: WritePlace(0),
-            freed_bytes: 0,
             has_held_frees: false,
         });
         guard.map.insert(head.segment, slot);
@@ -344,24 +342,6 @@ impl<File: Clone> SegmentTable<File> {
             let guard = self.read_shard(shard);
             guard.segments.iter().flatten().find(|entry| entry.has_held_frees).map(|entry| entry.number)
         })
-    }
-
-    /// Note bytes a segment gave back in place
-    pub fn note_freed(&self, number: SegmentNumber, bytes: u64) {
-        let mut guard = self.write_shard(shard_of(number));
-        let Some(slot) = guard.map.get(number) else {
-            return;
-        };
-        if let Some(entry) = guard.segments[slot as usize].as_mut() {
-            entry.freed_bytes += bytes;
-        }
-    }
-
-    /// Read the bytes a segment gave back in place since this open. A reopen forgets them, which costs one needless rewrite
-    pub fn freed_bytes(&self, number: SegmentNumber) -> u64 {
-        let guard = self.read_shard(shard_of(number));
-        let entry = guard.map.get(number).and_then(|slot| guard.segments[slot as usize].as_ref());
-        entry.map_or(0, |entry| entry.freed_bytes)
     }
 
     /// Find which of a segment's blocks starts at an offset in its file

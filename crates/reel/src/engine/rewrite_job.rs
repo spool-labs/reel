@@ -84,7 +84,7 @@ pub struct RewriteJob<Backend: Io> {
     top_place: WritePlace,
     newest_place: Option<WritePlace>,
     lowest_dropped: WritePlace,
-    highest_replacement: WritePlace,
+    pub highest_replacement: WritePlace,
     dropped_rows: u64,
     kept_dead: Vec<DeadCount>,
     last_tried: SegmentNumber,
@@ -172,7 +172,10 @@ impl<Backend: Io> RewriteJob<Backend> {
         if volume.has_walk_target.load(Ordering::Acquire) {
             return None;
         }
-        let ready = rows.rows().filter(|row| row.facts.is_walked() && is_rewrite_ready(row, volume.table.freed_bytes(row.facts.segment)));
+        let is_ready = |row: &SummaryRow<'_>| {
+            row.facts.is_walked() && is_rewrite_ready(row, 0) && is_rewrite_ready(row, freed_in_place(volume, row))
+        };
+        let ready = rows.rows().filter(is_ready);
         let after = ready.clone().filter(|row| row.facts.segment > self.last_tried).min_by_key(|row| row.facts.segment);
         let picked = after.or_else(|| ready.min_by_key(|row| row.facts.segment))?;
         self.last_tried = picked.facts.segment;
@@ -658,6 +661,14 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.target = None;
         volume.is_rewriting.store(false, Ordering::Release);
     }
+}
+
+/// Read the bytes a segment has given back in place: its length less what its file still takes on the disk
+pub fn freed_in_place<Backend: Io>(volume: &Volume<Backend>, row: &SummaryRow<'_>) -> u64 {
+    let Some(pin) = volume.table.pin(row.facts.segment) else {
+        return 0;
+    };
+    pin.file.held_bytes().map_or(0, |held| row.facts.file_length.0.saturating_sub(held.0))
 }
 
 /// Check a row's counts say a rewrite would win back its share of the rows or the bytes, past the bytes already freed in

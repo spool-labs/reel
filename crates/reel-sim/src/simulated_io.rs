@@ -168,6 +168,11 @@ impl SimulatedIo {
         hold(&self.disk).failing_directory_syncs = count;
     }
 
+    /// Make the next file removes fail
+    pub fn fail_removes(&self, count: OperationCount) {
+        hold(&self.disk).failing_removes = count;
+    }
+
     /// Make the next file creates fail
     pub fn fail_creates(&self, count: OperationCount) {
         hold(&self.disk).failing_creates = count;
@@ -358,6 +363,10 @@ impl Io for SimulatedIo {
         let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         disk.enter()?;
+        if disk.failing_removes.0 > 0 {
+            disk.failing_removes = OperationCount(disk.failing_removes.0 - 1);
+            return Err(Error::other("simulated remove failure"));
+        }
         disk.unlink(path)
     }
 

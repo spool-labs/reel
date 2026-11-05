@@ -9,6 +9,7 @@ use reel_api::column_id::ColumnId;
 use reel_api::memory_report::MemoryReport;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
+use reel_api::value_list::ValueList;
 use reel_api::units::{ByteCount, Nanoseconds, VolumeId, WritePlace};
 use reel_api::write_batch::WriteBatch;
 
@@ -201,6 +202,12 @@ impl<Backend: Io> ReelStore<Backend> {
     pub fn get(&self, column: ColumnId, key: &[u8], buf: &mut Vec<u8>) -> Result<bool, StoreError> {
         self.check_open()?;
         self.state.get_latest(column, key, RecordWant::Whole, buf)
+    }
+
+    /// Answer every key at one point in the write order, with a bad record as that key's answer
+    pub fn get_many(&self, column: ColumnId, keys: &[&[u8]], values: &mut ValueList) -> Result<(), StoreError> {
+        self.check_open()?;
+        self.state.get_many_now(column, keys, values)
     }
 
     /// Fill a buffer with a checked window of the value, and say whether the key has one

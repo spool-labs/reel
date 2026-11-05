@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use reel_api::column_id::ColumnId;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
+use reel_api::value_list::ValueList;
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::engine::column_info::ColumnInfo;
@@ -106,6 +107,54 @@ impl<Backend: Io> EngineState<Backend> {
         let handovers = volume.handover_count();
         let read = self.key_read_now(column, key)?;
         self.get_at(&read, handovers, want, buf)
+    }
+
+    /// Answer every key at one read point, so a batch from one write_batch is seen whole or not at all. A cover that went
+    /// inside a newer one under that point could hide nothing from it, so the keys are read again
+    pub fn get_many_now(&self, column: ColumnId, keys: &[&[u8]], values: &mut ValueList) -> Result<(), StoreError> {
+        let info = self.column(column)?;
+        let volume = &self.volumes[info.volume.0 as usize];
+        let mut scratch = values.take_scratch();
+        let mut outcome = Err(StoreError::Io {
+            action: "reading keys whose covers keep moving",
+            source: Error::from(ErrorKind::Interrupted),
+        });
+        for _try in 0..MOST_READ_TRIES {
+            values.clear();
+            let drops = volume.covers.drops();
+            let handovers = volume.handover_count();
+            let point = self.read_point();
+            let read = self.read_keys(column, keys, point, handovers, values, &mut scratch);
+            if read.is_err() || volume.covers.drops() == drops {
+                outcome = read;
+                break;
+            }
+        }
+        values.put_scratch(scratch);
+        outcome
+    }
+
+    /// Answer keys in order at a read point, with a bad record as that key's answer
+    pub fn read_keys(
+        &self,
+        column: ColumnId,
+        keys: &[&[u8]],
+        point: WritePlace,
+        handovers: u64,
+        values: &mut ValueList,
+        scratch: &mut Vec<u8>,
+    ) -> Result<(), StoreError> {
+        for key in keys {
+            // a value read below the newest must stay out of the spot cache, as a cue's does
+            let read = self.key_read(column, key, point, true)?;
+            match self.get_at(&read, handovers, RecordWant::Whole, scratch) {
+                Ok(true) => values.push_found(scratch),
+                Ok(false) => values.push_missing(),
+                Err(StoreError::Corruption { .. }) => values.push_corrupt(),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     /// Fill a buffer with a key's newest value at a read point, and say whether it has one

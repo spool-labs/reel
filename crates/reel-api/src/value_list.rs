@@ -36,6 +36,7 @@ pub enum ValueAnswer<'list> {
 pub struct ValueList {
     bytes: Vec<u8>,
     answers: Vec<StoredAnswer>,
+    scratch: Vec<u8>,
 }
 
 impl ValueList {
@@ -68,6 +69,16 @@ impl ValueList {
         };
         self.bytes.extend_from_slice(value);
         self.answers.push(StoredAnswer::Found(span));
+    }
+
+    /// Lend out the buffer a value is read into on its way here, which `put_scratch` hands back so it's kept for next time
+    pub fn take_scratch(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.scratch)
+    }
+
+    /// Keep a lent buffer
+    pub fn put_scratch(&mut self, scratch: Vec<u8>) {
+        self.scratch = scratch;
     }
 
     /// Count the answers

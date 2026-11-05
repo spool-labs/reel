@@ -19,6 +19,7 @@ use reel::io::plain::PlainIo;
 use reel::segment::segment_tail::SECOND_TAIL_DISTANCE;
 use reel_api::store_error::StoreError;
 use reel_api::units::ByteCount;
+use reel_api::value_list::ValueList;
 use reel_api::write_batch::WriteBatch;
 
 mod store_config;
@@ -207,6 +208,7 @@ struct Inputs {
     large_batch: WriteBatch,
     long_batch: WriteBatch,
     buf: Vec<u8>,
+    values: ValueList,
 }
 
 /// What the process counted at one moment
@@ -322,6 +324,7 @@ fn inputs() -> Inputs {
         large_batch,
         long_batch,
         buf: vec![1; CHUNKED_BYTES * 2],
+        values: ValueList::new(),
     }
 }
 
@@ -349,6 +352,8 @@ fn round(store: &Store, inputs: &mut Inputs, number: usize) {
     assert!(store.get(BULK, key, buf).expect("get lz4"));
     assert!(!store.get(META, &inputs.missing, buf).expect("get a miss"));
     assert!(store.contains(META, key).expect("contains"));
+    let keys: [&[u8]; 3] = [key, other, &inputs.missing];
+    store.get_many(META, &keys, &mut inputs.values).expect("get_many");
     store.delete(BULK, other).expect("delete");
     store.delete_range(META, b"range-a", b"range-b").expect("delete range");
     store.write_batch(&inputs.batch).expect("batch");

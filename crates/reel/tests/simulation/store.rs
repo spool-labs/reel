@@ -23,6 +23,8 @@ use reel_api::column_id::ColumnId;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, Nanoseconds, RootId, RowCount, VolumeId};
+use reel_api::value_list::{ValueAnswer, ValueList};
+use reel_api::write_batch::WriteBatch;
 
 const ROOT: &str = "/disk/meta";
 const COLUMN: ColumnId = ColumnId(1);
@@ -47,6 +49,7 @@ const WINDOW_VALUE: usize = 300;
 const SEND_CRASH_POINTS: u64 = 8;
 const LARGE_ENOUGH: usize = 100_000;
 const RACE_RECORD_BYTES: usize = 4_000;
+const BATCH_ROUNDS: u64 = 20_000;
 const RACE_ATTEMPTS: u64 = 20_000_000;
 const JOB_STEPS: u64 = 200;
 const SEAL_TICK: Nanoseconds = Nanoseconds(1_000_000);
@@ -1101,5 +1104,82 @@ fn spare_after_seal() {
     for slot in taken {
         store.state.free_slot(slot);
     }
+    store.close().expect("close");
+}
+
+// every key gets its answer in order: a value, nothing, or a bad record
+#[test]
+fn many_answers() {
+    let io = SimulatedIo::new(Seed(118));
+    let store = open(&io);
+    store.put(COLUMN, b"first", b"one").expect("put");
+    store.put(COLUMN, b"third", b"three").expect("put");
+    store.seal_now();
+    settle(&io);
+    store.put(COLUMN, b"fourth", b"four").expect("put");
+
+    let mut values = ValueList::new();
+    let keys: [&[u8]; 4] = [b"first", b"second", b"third", b"fourth"];
+    store.get_many(COLUMN, &keys, &mut values).expect("get_many");
+
+    assert_eq!(values.len(), 4);
+    assert_eq!(values.answer(0), Some(ValueAnswer::Found(b"one")));
+    assert_eq!(values.answer(1), Some(ValueAnswer::Missing));
+    assert_eq!(values.answer(2), Some(ValueAnswer::Found(b"three")));
+    assert_eq!(values.answer(3), Some(ValueAnswer::Found(b"four")));
+    store.close().expect("close");
+}
+
+// a read at one point sees what was there then, and leaves nothing older in the spot cache for a later get
+#[test]
+fn many_old_point() {
+    let io = SimulatedIo::new(Seed(119));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"older").expect("put");
+    store.seal_now();
+    settle(&io);
+    let point = store.state.read_point();
+    store.put(COLUMN, b"key", b"newer").expect("put");
+    store.seal_now();
+    settle(&io);
+
+    let mut values = ValueList::new();
+    let mut scratch = Vec::new();
+    let handovers = store.state.volumes[0].handover_count();
+    store.state.read_keys(COLUMN, &[b"key"], point, handovers, &mut values, &mut scratch).expect("read");
+
+    assert_eq!(values.answer(0), Some(ValueAnswer::Found(b"older")));
+    let mut buf = Vec::new();
+    assert!(store.get(COLUMN, b"key", &mut buf).expect("get"));
+    assert_eq!(buf, b"newer");
+    store.close().expect("close");
+}
+
+// a batch is seen whole or not at all, while a writer rewrites it
+#[test]
+fn many_batch_whole() {
+    let io = SimulatedIo::new(Seed(120));
+    let store = open(&io);
+    let is_done = AtomicBool::new(false);
+    let keys: [&[u8]; 3] = [b"a", b"b", b"c"];
+
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            for number in 0..BATCH_ROUNDS {
+                let mut batch = WriteBatch::new();
+                for key in keys {
+                    batch.put(COLUMN, key, &number.to_le_bytes());
+                }
+                store.write_batch(&batch).expect("batch");
+            }
+            is_done.store(true, Ordering::Release);
+        });
+        let mut values = ValueList::new();
+        while !is_done.load(Ordering::Acquire) {
+            store.get_many(COLUMN, &keys, &mut values).expect("get_many");
+            assert_eq!(values.answer(0), values.answer(1));
+            assert_eq!(values.answer(1), values.answer(2));
+        }
+    });
     store.close().expect("close");
 }

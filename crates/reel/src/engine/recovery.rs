@@ -21,7 +21,7 @@ use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::index::write_row::WriteRow;
 use crate::io::job::{Job, JobStep};
-use crate::io::device_error::{is_device_error, read_or_damaged};
+use crate::io::device_error::{SECTOR_BYTES, is_device_error, read_or_damaged};
 use crate::io::{Io, IoFile};
 use crate::record::record_check::{Checksum, RecordIdentity, RecordKey, checksum};
 use crate::record::record_head::SMALL_HEAD_BYTES;
@@ -45,7 +45,7 @@ use crate::segment::summary::{
 /// Steps a seal on the opening thread can take before open reports it stuck
 pub const MOST_INLINE_STEPS: u64 = 100_000_000;
 /// Bytes of a sector, the most a bad spot of a disk hides at once
-pub const GROUP_SEARCH_BYTES: usize = 512;
+pub const GROUP_SEARCH_BYTES: usize = SECTOR_BYTES;
 
 /// A root's files, listed before any of them is read
 #[derive(Clone, Debug)]

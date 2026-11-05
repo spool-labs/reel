@@ -6,6 +6,9 @@ use reel_api::units::FileOffset;
 
 use crate::io::IoFile;
 
+/// Bytes of the smallest unit a device can lose
+pub const SECTOR_BYTES: usize = 512;
+
 /// Check an error says the bytes are gone, which is damage: a bad descriptor or no memory says nothing about them
 pub fn is_device_error(error: &Error) -> bool {
     if error.kind() == ErrorKind::UnexpectedEof {

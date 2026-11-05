@@ -8,15 +8,16 @@ use std::path::{Path, PathBuf};
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 
-use crate::io::device_error::is_device_error;
+use crate::io::device_error::{SECTOR_BYTES, read_or_damaged};
 use crate::io::{Io, IoFile};
 use crate::little_endian::read_half;
 use crate::record::record_check::{Checksum, checksum};
 use crate::segment::segment_tail::{PlaceRange, SegmentNumber};
-use crate::superblock::read_whole;
 
 /// Opens a summary file
 pub const SUMMARY_MAGIC: u64 = 0x5245_4C53_554D_4D31;
+/// Closes a summary file
+pub const SUMMARY_TRAILER_MAGIC: u64 = 0x5245_4C53_554D_4D32;
 /// The summary's file name
 pub const SUMMARY_NAME: &str = "summary";
 /// The name a new summary is written under before it replaces the old one
@@ -573,6 +574,35 @@ pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
     })
 }
 
+/// The two ends of a summary copy
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CopyEnds {
+    pub header: [u8; SUMMARY_HEADER_BYTES],
+    pub trailer: [u8; SUMMARY_HEADER_BYTES],
+}
+
+/// One end of a summary copy, read back
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CopyEnd {
+    pub mark: WritePlace,
+    pub rows_length: usize,
+}
+
+/// One summary copy, read back
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SummaryCopy {
+    pub header_mark: Option<WritePlace>,
+    pub trailer_mark: Option<WritePlace>,
+    pub rows: Vec<u8>,
+}
+
+impl SummaryCopy {
+    /// Read the mark from whichever end passes
+    pub fn mark(&self) -> Option<WritePlace> {
+        self.header_mark.or(self.trailer_mark)
+    }
+}
+
 /// What a summary read can't vouch for, when the newer copy lost a row and the two copies differ
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LostRows {
@@ -601,22 +631,30 @@ impl SummaryPaths {
     }
 }
 
-/// Build the header a summary copy opens with
-pub fn summary_header(mark: WritePlace, rows: &[u8]) -> [u8; SUMMARY_HEADER_BYTES] {
-    let mut header = [0; SUMMARY_HEADER_BYTES];
-    header[..8].copy_from_slice(&SUMMARY_MAGIC.to_le_bytes());
-    header[8..16].copy_from_slice(&mark.0.to_le_bytes());
-    header[16..24].copy_from_slice(&(rows.len() as u64).to_le_bytes());
-    let sum = checksum(&header[..24]);
-    header[24..].copy_from_slice(&sum.0.to_le_bytes());
-    header
+/// Build one end of a summary copy
+pub fn mark_end(magic: u64, mark: WritePlace, rows: &[u8]) -> [u8; SUMMARY_HEADER_BYTES] {
+    let mut end = [0; SUMMARY_HEADER_BYTES];
+    end[..8].copy_from_slice(&magic.to_le_bytes());
+    end[8..16].copy_from_slice(&mark.0.to_le_bytes());
+    end[16..24].copy_from_slice(&(rows.len() as u64).to_le_bytes());
+    let sum = checksum(&end[..24]);
+    end[24..].copy_from_slice(&sum.0.to_le_bytes());
+    end
+}
+
+/// Build the two ends of a summary copy, which carry its mark twice
+pub fn copy_ends(mark: WritePlace, rows: &[u8]) -> CopyEnds {
+    CopyEnds {
+        header: mark_end(SUMMARY_MAGIC, mark, rows),
+        trailer: mark_end(SUMMARY_TRAILER_MAGIC, mark, rows),
+    }
 }
 
 /// Write both copies of a summary, the second after the first is synced, so a crash leaves one whole
 pub fn write_summary<Backend: Io>(io: &Backend, paths: &SummaryPaths, mark: WritePlace, rows: &[u8]) -> Result<()> {
-    let header = summary_header(mark, rows);
-    write_copy(io, paths, &paths.current, &header, rows)?;
-    write_copy(io, paths, &paths.second, &header, rows)
+    let ends = copy_ends(mark, rows);
+    write_copy(io, paths, &paths.current, &ends, rows)?;
+    write_copy(io, paths, &paths.second, &ends, rows)
 }
 
 /// Replace one copy through the new file
@@ -624,7 +662,7 @@ pub fn write_copy<Backend: Io>(
     io: &Backend,
     paths: &SummaryPaths,
     target: &Path,
-    header: &[u8],
+    ends: &CopyEnds,
     rows: &[u8],
 ) -> Result<()> {
     match io.remove_file(&paths.new) {
@@ -634,7 +672,7 @@ pub fn write_copy<Backend: Io>(
     }
 
     let file = io.create_file(&paths.new, ByteCount(0))?;
-    let written = file.write_at(FileOffset(0), &[IoSlice::new(header), IoSlice::new(rows)]);
+    let written = file.write_at(FileOffset(0), &[IoSlice::new(&ends.header), IoSlice::new(rows), IoSlice::new(&ends.trailer)]);
     let synced = written.and_then(|()| file.sync());
     io.close_file(file);
     synced?;
@@ -642,7 +680,8 @@ pub fn write_copy<Backend: Io>(
     io.sync_directory(&paths.root)
 }
 
-/// Read a summary into rows, each from whichever copy passes its check, and return the newer mark
+/// Read a summary into rows, each from whichever copy passes its check, and return the newer mark. A copy with
+/// no mark at either end leaves the other copy's rows as they are
 pub fn read_summary<Backend: Io>(
     io: &Backend,
     paths: &SummaryPaths,
@@ -651,21 +690,22 @@ pub fn read_summary<Backend: Io>(
 ) -> Result<Option<WritePlace>> {
     let first = read_copy(io, &paths.current)?;
     let second = read_copy(io, &paths.second)?;
-    let has_two_marks = matches!((&first, &second), (Some(first), Some(second)) if first.0 != second.0);
     let (newer, older) = match (first, second) {
-        (Some(first), Some(second)) if second.0 > first.0 => (second, Some(first)),
+        (Some(first), Some(second)) if second.mark() > first.mark() => (second, Some(first)),
         (Some(first), second) => (first, second),
         (None, Some(second)) => (second, None),
         (None, None) => return Ok(None),
     };
 
-    rows.bytes = newer.1;
-    if let Some((_mark, bytes)) = older {
-        let older_rows = SummaryRows { bytes };
+    let mark = newer.mark();
+    rows.bytes = newer.rows;
+    if let Some(older) = older {
+        let has_two_marks = mark.is_some() && older.mark().is_some() && mark != older.mark();
+        let older_rows = SummaryRows { bytes: older.rows };
         let listed = rows.offsets();
-        rows.bytes.reserve(older_rows.bytes.len());
         // with two marks, a row the newer copy lost may hold more than the older copy's, so it can't stand as it is
         lost.has_lost_row = has_two_marks && rows.has_bad_row();
+        rows.bytes.reserve(older_rows.bytes.len());
         for (segment, at) in older_rows.offsets() {
             if !listed.contains_key(&segment) {
                 rows.copy_row(&older_rows, at);
@@ -673,37 +713,64 @@ pub fn read_summary<Backend: Io>(
             }
         }
     }
-    Ok(Some(WritePlace(newer.0)))
+    Ok(mark)
 }
 
-/// Read one copy's mark and rows, or nothing when it's absent, unreadable or its header fails
-pub fn read_copy<Backend: Io>(io: &Backend, path: &Path) -> Result<Option<(u64, Vec<u8>)>> {
+/// Read one copy's marks and rows, or nothing when it's absent. Its rows are read whether or not its ends pass
+pub fn read_copy<Backend: Io>(io: &Backend, path: &Path) -> Result<Option<SummaryCopy>> {
     let file = match io.open_read_only(path) {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
 
-    let bytes = read_whole(&file);
+    let bytes = read_readable(&file);
     io.close_file(file);
-    let bytes = match bytes {
-        Ok(bytes) => bytes,
-        Err(error) if is_device_error(&error) => return Ok(None),
-        Err(error) => return Err(error),
-    };
+    let bytes = bytes?;
 
-    let Some(header) = bytes.get(..SUMMARY_HEADER_BYTES) else {
-        return Ok(None);
+    let header = bytes.get(..SUMMARY_HEADER_BYTES).and_then(|end| read_end(end, SUMMARY_MAGIC));
+    let trailer_at = match header {
+        Some(header) => SUMMARY_HEADER_BYTES.saturating_add(header.rows_length),
+        None => bytes.len().saturating_sub(SUMMARY_HEADER_BYTES),
     };
-    let mut cursor = RowCursor { bytes: header };
-    let is_ours = cursor.word() == Some(SUMMARY_MAGIC);
-    let (Some(mark), Some(rows_length), Some(sum)) = (cursor.word(), cursor.word(), cursor.word()) else {
-        return Ok(None);
-    };
-    if !is_ours || checksum(&header[..24]).0 != sum {
-        return Ok(None);
+    let trailer = bytes
+        .get(trailer_at..trailer_at.saturating_add(SUMMARY_HEADER_BYTES))
+        .and_then(|end| read_end(end, SUMMARY_TRAILER_MAGIC));
+
+    let rows_end = trailer_at.min(bytes.len());
+    Ok(Some(SummaryCopy {
+        header_mark: header.map(|end| end.mark),
+        trailer_mark: trailer.map(|end| end.mark),
+        rows: bytes.get(SUMMARY_HEADER_BYTES..rows_end).unwrap_or_default().to_vec(),
+    }))
+}
+
+/// Read one end of a copy, or nothing when it fails its check
+pub fn read_end(end: &[u8], magic: u64) -> Option<CopyEnd> {
+    let mut cursor = RowCursor { bytes: end };
+    let is_ours = cursor.word() == Some(magic);
+    let (mark, rows_length, sum) = (cursor.word()?, cursor.word()?, cursor.word()?);
+    if !is_ours || checksum(&end[..24]).0 != sum {
+        return None;
+    }
+    Some(CopyEnd {
+        mark: WritePlace(mark),
+        rows_length: rows_length as usize,
+    })
+}
+
+/// Read a whole file, leaving zeroes over the sectors the device can't give back
+pub fn read_readable<File: IoFile>(file: &File) -> Result<Vec<u8>> {
+    let length = file.length()?;
+    let mut bytes = vec![0; length.0 as usize];
+    if read_or_damaged(file, FileOffset(0), &mut bytes)? {
+        return Ok(bytes);
     }
 
-    let end = (SUMMARY_HEADER_BYTES + rows_length as usize).min(bytes.len());
-    Ok(Some((mark, bytes[SUMMARY_HEADER_BYTES..end].to_vec())))
+    for (index, sector) in bytes.chunks_mut(SECTOR_BYTES).enumerate() {
+        if !read_or_damaged(file, FileOffset((index * SECTOR_BYTES) as u64), sector)? {
+            sector.fill(0);
+        }
+    }
+    Ok(bytes)
 }

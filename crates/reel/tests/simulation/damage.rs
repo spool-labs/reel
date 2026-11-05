@@ -20,7 +20,7 @@ use reel::segment::row_block::BLOCK_HEADER_BYTES;
 use reel::segment::segment_tail::{SECOND_TAIL_DISTANCE, SegmentNumber, TailHead};
 use reel::segment::summary::{
     LostRows, ROW_HEAD_BYTES, SUMMARY_HEADER_BYTES, SegmentFacts, SummaryPaths, SummaryRows, read_row, read_summary,
-    summary_header, write_copy, write_summary,
+    copy_ends, read_copy, write_copy, write_summary,
 };
 use reel::rows::row_group::parse_group;
 use reel::superblock::{Superblock, SuperblockPaths};
@@ -44,6 +44,9 @@ const MIDDLE: usize = 1;
 const NEWEST: usize = 2;
 const SECTOR_BYTES: u64 = 512;
 const SECTOR_KEYS: u64 = 40;
+const MARK_AT: u64 = 9;
+const TRAILER_MARK_BACK: u64 = 23;
+const SAVE_CRASH_POINTS: u64 = 16;
 const SEGMENTS: usize = 3;
 const SEAL_CRASH_POINTS: u64 = 24;
 const SEAL_STEPS: u64 = 1_000;
@@ -1530,7 +1533,7 @@ fn not_damage() {
 
 // write the newer copy alone, as a crash between the two copies leaves it
 fn newer_copy(io: &SimulatedIo, paths: &SummaryPaths, mark: WritePlace, rows: &[u8]) {
-    write_copy(io, paths, &paths.current, &summary_header(WritePlace(mark.0 + 1), rows), rows).expect("write");
+    write_copy(io, paths, &paths.current, &copy_ends(WritePlace(mark.0 + 1), rows), rows).expect("write");
 }
 
 fn assert_all_refused(store: &Store, built: &Built) {
@@ -1681,17 +1684,116 @@ fn open_lost() {
     store.close().expect("close");
 }
 
-// rot that grows replaces the spans of the open before it, so the pool holds one span per column
+// rot that grows replaces the spans of the open before it, so open after open the pool holds one span per column
 #[test]
 fn ranked_again() {
     let (io, starts) = three_groups(68);
     let rows = rows_files(&io)[0].clone();
-    io.rot(&rows, FileOffset(starts[2] + 20), FLIP).expect("rot");
-    reopen(open(&io));
-    io.rot(&rows, FileOffset(starts[3] + 20), FLIP).expect("rot");
+    for start in &starts[2..] {
+        io.rot(&rows, FileOffset(start + 20), FLIP).expect("rot");
+
+        let store = open(&io);
+
+        assert_eq!(store.state.volumes[0].damage.len(), COLUMNS.len());
+        store.close().expect("close");
+    }
+}
+
+// a clear holds once open has cut the bad tail, since nothing is left there to read as new rot
+#[test]
+fn end_cleared() {
+    let (io, rows, length) = sector_end(69);
+    io.bad_sector(&rows, FileOffset(length.0 - 1)).expect("bad");
+    let store = open(&io);
+    store.clear_damage(ORDERED, b"", None).expect("clear");
+    store.clear_damage(RANDOM, b"", None).expect("clear");
+    assert_eq!(read(&store, ORDERED, b"older").expect("get"), Some(b"first".to_vec()));
+    reopen(store);
 
     let store = open(&io);
 
-    assert_eq!(store.state.volumes[0].damage.len(), COLUMNS.len());
+    assert_eq!(store.state.volumes[0].damage.len(), 0);
+    assert_eq!(read(&store, ORDERED, b"older").expect("get"), Some(b"first".to_vec()));
     store.close().expect("close");
+}
+
+// a bad sector over the newer header after a crash between the copies still compares marks, through the trailer
+#[test]
+fn trailer_mark() {
+    let built = build(70);
+    let (paths, rows, mark) = summary_rows(&built.io);
+    newer_copy(&built.io, &paths, mark, rows.bytes());
+    built.io.bad_sector(&paths.current, FileOffset(0)).expect("bad");
+
+    let store = open(&built.io);
+
+    assert!(store.damaged_segments() > 0);
+    assert_all_refused(&store, &built);
+    store.close().expect("close");
+}
+
+// a bad header with equal marks costs nothing, whether it took the rows beside it or not
+#[test]
+fn equal_trailer() {
+    for is_bad_sector in [false, true] {
+        let built = build(71);
+        let paths = SummaryPaths::new(Path::new(ROOT));
+        if is_bad_sector {
+            built.io.bad_sector(&paths.current, FileOffset(0)).expect("bad");
+        } else {
+            built.io.rot(&paths.current, FileOffset(MARK_AT), FLIP).expect("rot");
+        }
+
+        let store = open(&built.io);
+
+        assert_eq!(store.damaged_segments(), 0);
+        assert_match(&store, &built.model);
+        store.close().expect("close");
+    }
+}
+
+// a copy with no mark at either end leaves the other's rows as they are, and a row it does hold still counts
+#[test]
+fn no_marks() {
+    for is_newer in [true, false] {
+        let built = build(72);
+        let (paths, rows, mark) = summary_rows(&built.io);
+        newer_copy(&built.io, &paths, mark, rows.bytes());
+        let (markless, other) = if is_newer { (&paths.current, &paths.second) } else { (&paths.second, &paths.current) };
+        built.io.rot(markless, FileOffset(MARK_AT), FLIP).expect("rot");
+        let length = file_length(&built.io, markless);
+        built.io.rot(markless, FileOffset(length.0 - TRAILER_MARK_BACK), FLIP).expect("rot");
+        let at = row_offset(&built.io, &paths, built.heads[MIDDLE].segment);
+        built.io.rot(other, FileOffset((at + ROW_HEAD_BYTES + 2) as u64), FLIP).expect("rot");
+
+        let store = open(&built.io);
+
+        assert_eq!(store.damaged_segments(), 0);
+        assert!(hold(&store.state.volumes[0].summary).get(built.heads[MIDDLE].segment).is_some());
+        assert_match(&store, &built.model);
+        store.close().expect("close");
+    }
+}
+
+// a crash at any step of a save leaves every copy with one mark at both ends, since a copy lands by rename
+#[test]
+fn save_crash() {
+    for crash_at in 0..SAVE_CRASH_POINTS {
+        let io = SimulatedIo::new(Seed(crash_at));
+        let store = open(&io);
+        store.put(ORDERED, b"key", b"value").expect("put");
+        store.close().expect("close");
+        drop(store);
+        let (paths, rows, mark) = summary_rows(&io);
+
+        io.arm_crash(OperationCount(crash_at));
+        let _saved = write_summary(&io, &paths, WritePlace(mark.0 + 1), rows.bytes());
+        io.power_cut();
+
+        for path in [&paths.current, &paths.second] {
+            let copy = read_copy(&io, path).expect("read").expect("a copy");
+            assert!(copy.header_mark.is_some(), "crash at {crash_at}");
+            assert_eq!(copy.header_mark, copy.trailer_mark, "crash at {crash_at}");
+        }
+    }
 }

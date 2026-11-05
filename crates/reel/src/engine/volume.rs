@@ -15,7 +15,7 @@ use crate::io::Io;
 use crate::pool::Pool;
 use crate::segment::damage_list::DamageList;
 use crate::segment::segment_table::{RetiredSegment, SegmentTable};
-use crate::segment::segment_tail::SegmentNumber;
+use crate::segment::segment_tail::{MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::segment::range_covers::RangeCovers;
 use crate::segment::summary::{LostRows, SummaryPaths, SummaryRows};
 use crate::superblock::SuperblockPaths;
@@ -110,6 +110,12 @@ pub struct Volume<Backend: Io> {
     pub reclaim_retries: AtomicU64,
     /// The walk is part way through a segment
     pub has_walk_target: AtomicBool,
+    /// The segment the walk has as its target, or `NO_SEAL`
+    pub walk_segment: AtomicU64,
+    /// A test holds the walk here to leave segments unwalked
+    pub is_walk_held: AtomicBool,
+    /// The inputs of a merge running beside the walk, which the walk leaves alone
+    pub merging: Mutex<[SegmentNumber; MOST_MERGE_SEGMENTS]>,
     /// Counts the turns a walk stood aside for a rewrite
     pub walks_held: AtomicU64,
     pub partial_outputs: Mutex<[Option<RewriteOutput<Backend::File>>; 2]>,
@@ -174,6 +180,11 @@ impl<Backend: Io> Volume<Backend> {
     /// Check the park has room for this many segments
     pub fn can_park(&self, count: usize) -> bool {
         self.park_room() >= count
+    }
+
+    /// Check a merge running beside the walk has taken a segment
+    pub fn is_merging(&self, segment: SegmentNumber) -> bool {
+        hold(&self.merging).contains(&segment)
     }
 
     /// Count the park's free slots

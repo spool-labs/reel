@@ -20,7 +20,7 @@ use reel_api::units::{ByteCount, FileOffset, Nanoseconds, WritePlace};
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::engine_state::EngineState;
 use crate::engine::planner::UnitStep;
-use crate::engine::volume::Volume;
+use crate::engine::volume::{NO_SEAL, Volume};
 use crate::guard::hold;
 use crate::io::device_error::is_device_error;
 use crate::io::job::{Job, JobStep};
@@ -31,7 +31,7 @@ use crate::segment::footer_writer::MOST_BLOCK_ROWS;
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::{SegmentPin, WalkBlock};
 use crate::segment::segment_tail::SegmentNumber;
-use crate::segment::summary::DeadCount;
+use crate::segment::summary::{DeadCount, SummaryRow};
 
 /// How long a walk waits after a failed read before it tries the block again
 pub const WALK_RETRY: Nanoseconds = Nanoseconds(1_000_000_000);
@@ -386,7 +386,10 @@ impl<Backend: Io> WalkJob<Backend> {
         // a seal only ends past the mark, so every row a walk counts by is published, and its slot has let go of the file
         let sealing = volume.sealing.load(Ordering::Acquire);
         let rows = hold(&volume.summary);
-        let waiting = rows.rows().filter(|row| !row.facts.is_walked() && row.facts.segment.0 != sealing);
+        let can_walk = |row: &SummaryRow<'_>| {
+            !row.facts.is_walked() && row.facts.segment.0 != sealing && !volume.is_merging(row.facts.segment)
+        };
+        let waiting = rows.rows().filter(can_walk);
         let backward = waiting.clone().filter(|row| row.facts.is_backward).max_by_key(|row| row.facts.places.highest);
         let picked = backward.or_else(|| waiting.min_by_key(|row| row.facts.segment));
         self.target = picked.map(|row| WalkTarget {
@@ -399,6 +402,7 @@ impl<Backend: Io> WalkJob<Backend> {
         self.counter.last_column = None;
         self.next_handed_out = self.target.map_or(0, |target| target.next_block);
         volume.has_walk_target.store(self.target.is_some(), Ordering::Release);
+        volume.walk_segment.store(self.target.map_or(NO_SEAL, |target| target.segment.0), Ordering::Release);
         self.target.is_some()
     }
 
@@ -469,6 +473,7 @@ impl<Backend: Io> WalkJob<Backend> {
 
         volume.table.mark_walked(target.segment);
         volume.has_walk_target.store(false, Ordering::Release);
+        volume.walk_segment.store(NO_SEAL, Ordering::Release);
         volume.wants_compaction.store(true, Ordering::Release);
         // a row dropped for room after its seal counted can leave this at zero
         let _waiting = volume.walks_waiting.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_sub(1));
@@ -560,6 +565,9 @@ impl<Backend: Io> WalkJob<Backend> {
         self.free_waiting(volume);
         if let Some(index) = self.failed_slot.take() {
             assign(&volume.walk_slots[index]);
+        }
+        if self.target.is_none() && volume.is_walk_held.load(Ordering::Acquire) {
+            return UnitStep::Idle;
         }
         if self.target.is_none() && volume.is_rewriting.load(Ordering::Acquire) {
             volume.walks_held.fetch_add(1, Ordering::Relaxed);

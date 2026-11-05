@@ -18,6 +18,7 @@ use reel_api::units::{ByteCount, FileOffset, WritePlace};
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::compact_job::park;
 use crate::engine::engine_state::EngineState;
+use crate::engine::read_path::SealedRow;
 use crate::engine::open_segment::{data_path, output_path};
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
 use crate::engine::volume::{RewriteOutput, Volume};
@@ -196,6 +197,8 @@ pub struct RewriteJob<Backend: Io> {
     kept_dead: Vec<DeadCount>,
     last_tried: SegmentNumber,
     park_waits: u32,
+    is_unwalked: bool,
+    looked_up_to: SegmentNumber,
 }
 
 impl<Backend: Io> RewriteJob<Backend> {
@@ -203,6 +206,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     pub fn new(state: Arc<EngineState<Backend>>, volume: usize) -> Self {
         // a mutex's first lock can allocate, and this one's first real use could be in a close
         drop(hold(&state.volumes[volume].partial_outputs));
+        drop(hold(&state.volumes[volume].merging));
         let keys = MAX_KEY_BYTES as usize;
         Self {
             state,
@@ -241,6 +245,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             kept_dead: touched_capacity(MOST_KEPT_BLOCKS, DeadCount::default()),
             last_tried: SegmentNumber(0),
             park_waits: 0,
+            is_unwalked: false,
+            looked_up_to: SegmentNumber(0),
         }
     }
 
@@ -254,14 +260,19 @@ impl<Backend: Io> RewriteJob<Backend> {
         ByteCount(writers + (self.buffer.capacity() + keys + edges + inputs + counts) as u64)
     }
 
+    /// Check a merge of unwalked segments is under way, which runs ahead of the walk and needs nothing from it
+    pub fn is_unwalked_merge(&self) -> bool {
+        self.target.is_some() && self.is_unwalked
+    }
+
     /// Check a merge is under way
     pub fn is_running(&self) -> bool {
         self.target.is_some()
     }
 
-    /// Read the last segment a pick took, where the next look starts
-    pub fn last_tried(&self) -> SegmentNumber {
-        self.last_tried
+    /// Read the newest segment a look for an overlap has passed
+    pub fn looked_up_to(&self) -> SegmentNumber {
+        self.looked_up_to
     }
 
     /// Read the segments going in
@@ -269,9 +280,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         &self.numbers[..self.input_count]
     }
 
-    /// Start on the next ready segments past the last one tried, once no walk target is in progress, since it would count rows
-    /// this merge has decided on. The walks wait from here to the install. A grave-heavy segment is decided first, and copies
-    /// nothing if no row would drop
+    /// Start on a run of segments over the overlap bound, or else on the next ready segments past the last one tried. A merge
+    /// of walked segments needs no walk target in progress, since it would count rows this merge has decided on, and the walks
+    /// wait from here to the install. A grave-heavy segment is decided first, and copies nothing if no row would drop
     pub fn start(&mut self) -> bool {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
@@ -279,7 +290,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             return false;
         };
         self.clear(target);
-        volume.is_rewriting.store(true, Ordering::Release);
+        volume.is_rewriting.store(!self.is_unwalked, Ordering::Release);
         if is_grave_heavy {
             self.phase = RewritePhase::Deciding;
             return true;
@@ -293,12 +304,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
     }
 
-    /// Pick the inputs: ready segments first, and failing that a run of segments over the overlap bound
+    /// Pick the inputs: a run of segments over the overlap bound first, since that comes ahead of the walk, then ready segments
     pub fn pick(&mut self, volume: &Volume<Backend>) -> Option<(MergeTarget, bool)> {
         if volume.stray_outputs.load(Ordering::Acquire) > 0 {
-            return None;
-        }
-        if volume.has_walk_target.load(Ordering::Acquire) {
             return None;
         }
         let room = volume.park_room().min(MOST_MERGE_SEGMENTS);
@@ -306,6 +314,13 @@ impl<Backend: Io> RewriteJob<Backend> {
             return None;
         }
         let rows = hold(&volume.summary);
+        self.is_unwalked = false;
+        if let Some(target) = self.pick_overlap(volume, &rows, room) {
+            return Some((target, false));
+        }
+        if volume.has_walk_target.load(Ordering::Acquire) {
+            return None;
+        }
         let is_ready = |row: &SummaryRow<'_>| {
             row.facts.is_walked() && is_rewrite_ready(row, 0) && is_rewrite_ready(row, freed_in_place(volume, row))
         };
@@ -316,11 +331,42 @@ impl<Backend: Io> RewriteJob<Backend> {
             let is_more = |row: &SummaryRow<'_>| is_ready(row) && row.facts.segment > first.facts.segment;
             return Some((self.gather(volume, &rows, &first, room, is_more), is_grave_heavy));
         }
-        let first = overlap_start(&rows, self.last_tried)?;
-        let is_more = |row: &SummaryRow<'_>| is_mergeable(row) && row.facts.segment > first.facts.segment && overlaps(&first, row);
-        let target = self.gather(volume, &rows, &first, room, is_more);
+        None
+    }
+
+    /// Pick a run of segments over the overlap bound, all walked or all unwalked: a walked input's rows are counted and an
+    /// unwalked one's aren't, so a mix leaves no rule for the output's counts
+    pub fn pick_overlap(&mut self, volume: &Volume<Backend>, rows: &SummaryRows, room: usize) -> Option<MergeTarget> {
+        let sealing = volume.sealing.load(Ordering::Acquire);
+        let walking = volume.walk_segment.load(Ordering::Acquire);
+        let can_merge = |row: &SummaryRow<'_>| {
+            let segment = row.facts.segment.0;
+            is_overlap_input(row) && segment != sealing && segment != walking
+        };
+        let crowded = overlap_start(rows, &mut self.looked_up_to, can_merge)?;
+        let is_near = |row: &SummaryRow<'_>| can_merge(row) && overlaps(&crowded, row);
+        // unwalked segments go first, since they need nothing from the walk
+        let is_unwalked = rows.rows().filter(|row| is_near(row) && !row.facts.is_walked()).take(2).count() == 2;
+        if !is_unwalked && volume.has_walk_target.load(Ordering::Acquire) {
+            return None;
+        }
+        let is_more = |row: &SummaryRow<'_>| is_near(row) && row.facts.is_walked() != is_unwalked;
+        let Some(first) = rows.rows().filter(is_more).min_by_key(|row| row.facts.segment) else {
+            self.looked_up_to = crowded.facts.segment;
+            return None;
+        };
+        let target = self.gather(volume, rows, &first, room, is_more);
         // one segment alone wins back no overlap, and the next look starts past it
-        (self.input_count > 1).then_some((target, false))
+        if self.input_count < 2 {
+            self.looked_up_to = crowded.facts.segment;
+            return None;
+        }
+        self.is_unwalked = is_unwalked;
+        if is_unwalked {
+            let mut merging = hold(&volume.merging);
+            merging[..self.input_count].copy_from_slice(&self.numbers[..self.input_count]);
+        }
+        Some(target)
     }
 
     /// Take a first segment and the next ones a test passes, while they fit one output, and note the last as tried
@@ -517,7 +563,7 @@ impl<Backend: Io> RewriteJob<Backend> {
                 self.dropped_rows += 1;
                 Ok(())
             },
-            None if row.kind == RowKind::Grave && self.hides_nothing(volume, column, row)? => {
+            None if row.kind == RowKind::Grave && !self.is_unwalked && self.hides_nothing(volume, column, row)? => {
                 self.lowest_dropped = WritePlace(0);
                 self.highest_replacement = self.highest_replacement.max(row.place);
                 self.dropped_rows += 1;
@@ -541,7 +587,8 @@ impl<Backend: Io> RewriteJob<Backend> {
             self.last_key.clear();
             self.last_key.extend_from_slice(&self.key);
             self.top_place = row.place;
-            self.newest_place = match self.state.newest_walked(volume, column, &self.key, &self.numbers[..self.input_count]) {
+            // an unwalked merge goes by its own rows, so it runs at the disk's rate and leaves the rest to the output's walk
+            self.newest_place = match self.newest_outside(volume, column) {
                 Ok(found) => found.map(|found| found.row.place),
                 // a version a damaged block hides replaces nothing, and the row stays
                 Err(StoreError::Corruption { .. }) => None,
@@ -550,6 +597,18 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         let own = (!is_top).then_some(self.top_place);
         Ok(own.max(self.newest_place).filter(|place| *place > row.place))
+    }
+
+    /// Find a key's newest row in a finished segment outside the merge
+    pub fn newest_outside(
+        &self,
+        volume: &Volume<Backend>,
+        column: ColumnId,
+    ) -> std::result::Result<Option<SealedRow>, StoreError> {
+        if self.is_unwalked {
+            return Ok(None);
+        }
+        self.state.newest_walked(volume, column, &self.key, &self.numbers[..self.input_count])
     }
 
     /// Check a replaced row can go: no live cue sits at or above it and below its newest replacement
@@ -654,7 +713,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         kept: &FooterRow,
         replacement: Option<WritePlace>,
     ) -> Result<()> {
-        if replacement.is_some() {
+        if replacement.is_some() && !self.is_unwalked {
             if self.kept_dead.len() == self.kept_dead.capacity() {
                 return Err(Error::from(ErrorKind::OutOfMemory));
             }
@@ -791,6 +850,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         if let Some(graves) = self.grave_output.clone() {
             self.grave_writer.close_block(&graves.file)?;
             self.grave_writer.is_output = true;
+            self.grave_writer.is_unwalked = self.is_unwalked;
             self.grave_writer.is_grave_output = has_data;
             let totals = self.grave_writer.finish(&graves.file, graves.number, FileOffset(0), &[], state.record_key, inputs)?;
             self.grave_totals = Some(totals);
@@ -799,6 +859,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         if has_data {
             self.writer.move_down(ByteCount(distance));
             self.writer.is_output = true;
+            self.writer.is_unwalked = self.is_unwalked;
             let totals = self.writer.finish(&output.file, output.number, self.records_end, &[], state.record_key, inputs)?;
             self.totals = Some(totals);
             self.name_output(output, 0)?;
@@ -861,6 +922,12 @@ impl<Backend: Io> RewriteJob<Backend> {
         if let (Some(_totals), Some(output)) = (self.totals, &self.output) {
             list_output(&state, volume, output, &self.writer, inputs);
         }
+        // an unwalked merge's outputs owe a walk, and reads of finished segments leave them out until it's done
+        if !self.is_unwalked {
+            for output in [self.output.as_ref(), self.grave_output.as_ref()].into_iter().flatten() {
+                volume.table.mark_walked(output.number);
+            }
+        }
         // a column every row of which went has no entry to swap in
         for directory in state.directories.iter().flatten() {
             if !directory.replace(None, inputs) {
@@ -881,6 +948,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.grave_output = None;
         self.target = None;
         volume.is_rewriting.store(false, Ordering::Release);
+        *hold(&volume.merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         volume.segments_rewritten.fetch_add(1, Ordering::AcqRel);
         volume.wants_compaction.store(true, Ordering::Release);
         for (segment, retired) in inputs.iter().zip(retired) {
@@ -924,6 +992,14 @@ impl<Backend: Io> RewriteJob<Backend> {
         if let (Some(totals), Some(output)) = (self.grave_totals, &self.grave_output) {
             self.push_row(&mut rows, &self.grave_writer, output.number, &totals, FileOffset(0));
         }
+        if self.is_unwalked {
+            let outputs = u64::from(self.totals.is_some()) + u64::from(self.grave_totals.is_some());
+            let gone = inputs.len() as u64;
+            let _waiting = volume.walks_waiting.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                Some(count.saturating_sub(gone) + outputs)
+            });
+            return;
+        }
         self.kept_dead.sort_unstable_by_key(|count| (count.segment, count.block));
         let number = self.output.as_ref().map_or(SegmentNumber(0), |output| output.number);
         rows.apply_walk(number, self.writer.entries().len() as u32, &self.kept_dead);
@@ -954,7 +1030,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             has_covers: false,
             damage_place: WritePlace(0),
             block_count,
-            walked_blocks: block_count,
+            walked_blocks: if self.is_unwalked { 0 } else { block_count },
             is_backward: false,
         };
         let columns = (0..writer.columns().len()).map(|index| writer.column_facts(index));
@@ -997,6 +1073,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.leave_outputs(volume, data, graves);
         self.target = None;
         volume.is_rewriting.store(false, Ordering::Release);
+        *hold(&volume.merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
     }
 }
 
@@ -1016,7 +1093,6 @@ pub fn list_output<Backend: Io>(
     writer: &FooterWriter,
     removed: &[SegmentNumber],
 ) {
-    volume.table.mark_walked(output.number);
     for column in writer.columns() {
         let entry = DirectoryEntry {
             shared_length: column.shared_length,
@@ -1037,6 +1113,13 @@ pub fn list_output<Backend: Io>(
 /// Check a segment can go into a merge at all. Damage and covers answer for more than their rows
 pub fn is_mergeable(row: &SummaryRow<'_>) -> bool {
     row.facts.is_walked() && !row.facts.is_damaged && !row.facts.has_covers && row.facts.block_count > 0
+}
+
+/// Check a segment can go into an overlap merge: walked, or with no walk begun and a forward one owed. A half-walked segment's
+/// rows are half counted
+pub fn is_overlap_input(row: &SummaryRow<'_>) -> bool {
+    let is_unwalked = row.facts.walked_blocks == 0 && !row.facts.is_backward;
+    (row.facts.is_walked() || is_unwalked) && !row.facts.is_damaged && !row.facts.has_covers && row.facts.block_count > 0
 }
 
 /// Check a row's counts say a merge would win back its share of the rows or the bytes, past the bytes already freed in place
@@ -1077,40 +1160,43 @@ pub fn is_grave_heavy(row: &SummaryRow<'_>) -> bool {
 /// Check two segments share a column and their ranges meet. A summary keeps only a key's first bytes, so a range here can only
 /// be wider than the truth
 pub fn overlaps(left: &SummaryRow<'_>, right: &SummaryRow<'_>) -> bool {
-    let mut left_columns = left.cursor();
-    for _column in 0..left.column_count {
-        let Some(ours) = left_columns.column() else {
-            return false;
-        };
-        let mut right_columns = right.cursor();
-        for _column in 0..right.column_count {
-            let Some(theirs) = right_columns.column() else {
-                return false;
-            };
-            let is_before = !theirs.bound.is_empty() && theirs.bound <= ours.lowest;
-            let is_after = !ours.bound.is_empty() && ours.bound <= theirs.lowest;
-            if ours.column == theirs.column && !is_before && !is_after {
+    let (mut left_columns, mut right_columns) = (left.cursor(), right.cursor());
+    let (mut left_left, mut right_left) = (left.column_count, right.column_count);
+    let (mut ours, mut theirs) = (left_columns.column(), right_columns.column());
+    // a row keeps its columns in order, so the two lists meet in one pass
+    while let (Some(our), Some(their)) = (&ours, &theirs) {
+        if our.column == their.column {
+            let is_before = !their.bound.is_empty() && their.bound <= our.lowest;
+            let is_after = !our.bound.is_empty() && our.bound <= their.lowest;
+            if !is_before && !is_after {
                 return true;
             }
+        }
+        if our.column <= their.column {
+            left_left -= 1;
+            ours = if left_left > 0 { left_columns.column() } else { None };
+        } else {
+            right_left -= 1;
+            theirs = if right_left > 0 { right_columns.column() } else { None };
         }
     }
     false
 }
 
-/// Find a segment past the last one tried that overlaps more segments than the bound allows. A look starts from a few
-/// segments only, so a volume of many segments pays little, and the next look starts where this one stopped
-pub fn overlap_start<'rows>(rows: &'rows SummaryRows, last_tried: SegmentNumber) -> Option<SummaryRow<'rows>> {
-    let mut looks = 0;
-    let after = rows.rows().filter(is_mergeable).filter(|row| row.facts.segment > last_tried);
-    let before = rows.rows().filter(is_mergeable).filter(|row| row.facts.segment <= last_tried);
-    for row in after.chain(before) {
-        if rows.rows().filter(is_mergeable).filter(|other| overlaps(&row, other)).count() > MOST_OVERLAP {
+/// Find a segment no look has passed that overlaps more segments than the bound allows. Overlap only grows when a segment
+/// arrives, so each one takes one look, and with none new a look costs nothing
+pub fn overlap_start<'rows>(
+    rows: &'rows SummaryRows,
+    looked_up_to: &mut SegmentNumber,
+    can_merge: impl Fn(&SummaryRow<'_>) -> bool,
+) -> Option<SummaryRow<'rows>> {
+    for _look in 0..OVERLAP_LOOKS {
+        let row = rows.rows().filter(|row| row.facts.segment > *looked_up_to).min_by_key(|row| row.facts.segment)?;
+        let over = rows.rows().filter(|other| can_merge(other) && overlaps(&row, other)).take(MOST_OVERLAP + 1).count();
+        if can_merge(&row) && over > MOST_OVERLAP {
             return Some(row);
         }
-        looks += 1;
-        if looks == OVERLAP_LOOKS {
-            return None;
-        }
+        *looked_up_to = row.facts.segment;
     }
     None
 }

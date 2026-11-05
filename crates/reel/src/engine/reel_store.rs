@@ -55,7 +55,7 @@ use crate::segment::summary::{MOST_ROW_COLUMN_BYTES, MOST_ROW_FIXED_BYTES, MOST_
 use crate::segment::footer_reader::FooterReader;
 use crate::segment::row_block::ROW_BLOCK_BYTES;
 use crate::segment::segment_table::{SegmentTable, TABLE_SHARDS, TableSizing};
-use crate::segment::segment_tail::{MAX_COLUMNS, SegmentNumber};
+use crate::segment::segment_tail::{MAX_COLUMNS, MOST_MERGE_SEGMENTS, SegmentNumber};
 use crate::superblock::{RootCopies, StoreId, StoredColumn, StoredVolume, Superblock, SuperblockPaths, stored_column};
 use crate::write_order::WriteOrder;
 
@@ -842,6 +842,9 @@ pub fn build_state<Backend: Io>(
             stray_outputs: AtomicU64::new(0),
             reclaim_retries: AtomicU64::new(0),
             has_walk_target: AtomicBool::new(false),
+            walk_segment: AtomicU64::new(NO_SEAL),
+            is_walk_held: AtomicBool::new(false),
+            merging: Mutex::new([SegmentNumber(0); MOST_MERGE_SEGMENTS]),
             walks_held: AtomicU64::new(0),
             partial_outputs: Mutex::new([None, None]),
             reserve: ByteCount(sizing.segment_bytes.0 * 2),

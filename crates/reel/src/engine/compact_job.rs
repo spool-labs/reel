@@ -96,6 +96,12 @@ impl<Backend: Io> CompactJob<Backend> {
         is_stepping && volume.segments_parked.load(Ordering::Acquire) > 0
     }
 
+    /// Check a merge beside the walk is running, or a seal or a reclaim has asked for a look at the overlap
+    pub fn has_overlap_work(&self) -> bool {
+        let volume = &self.state.volumes[self.volume];
+        self.rewrite.is_unwalked_merge() || volume.wants_compaction.load(Ordering::Acquire)
+    }
+
     /// Step once: a parked file no read holds any more, then the candidate work
     pub fn step_work(&mut self, now: Nanoseconds) -> UnitStep {
         let state = Arc::clone(&self.state);

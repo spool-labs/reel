@@ -1597,7 +1597,7 @@ pub fn settle_sealed<Backend: Io>(
         walked_blocks: 0,
         // no saved count can hold a walk of a segment above the number, one at or below it may be held already, and an output
         // holds rows its input's walk already counted
-        is_backward: found.head.segment <= rows.highest_forward || found.head.is_output,
+        is_backward: found.head.segment <= rows.highest_forward || (found.head.is_output && !found.head.is_unwalked),
     };
 
     if let Some(at) = listed.get(&facts.segment)

@@ -70,6 +70,7 @@ pub struct FooterWriter {
     row_count: RowCount,
     pub is_output: bool,
     pub is_grave_output: bool,
+    pub is_unwalked: bool,
 }
 
 impl FooterWriter {
@@ -93,6 +94,7 @@ impl FooterWriter {
             row_count: RowCount(0),
             is_output: false,
             is_grave_output: false,
+            is_unwalked: false,
         }
     }
 
@@ -165,6 +167,7 @@ impl FooterWriter {
         self.row_count = RowCount(0);
         self.is_output = false;
         self.is_grave_output = false;
+        self.is_unwalked = false;
     }
 
     /// Start a column, closing the row block of the one before it
@@ -342,6 +345,7 @@ impl FooterWriter {
             input_count: inputs.len() as u32,
             is_output: self.is_output,
             is_grave_output: self.is_grave_output,
+            is_unwalked: self.is_unwalked,
             inputs: listed,
         };
         let total = self.write_tail(&head, record_key);

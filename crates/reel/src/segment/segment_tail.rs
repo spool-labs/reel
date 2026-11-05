@@ -26,6 +26,8 @@ pub const OUTPUT_BIT: u32 = 1 << 31;
 /// Set beside it on the grave output of a merge that also has a data output: its inputs are for reference, and it stands only
 /// if that output landed
 pub const GRAVE_OUTPUT_BIT: u32 = 1 << 30;
+/// Set beside it on an output of inputs no walk had reached: it owes the forward walk they owed, and a rebuild gives it one
+pub const UNWALKED_BIT: u32 = 1 << 29;
 /// Most columns a store has
 pub const MAX_COLUMNS: usize = 256;
 /// Bytes that hold any tail
@@ -83,6 +85,7 @@ pub struct TailHead {
     pub input_count: u32,
     pub is_output: bool,
     pub is_grave_output: bool,
+    pub is_unwalked: bool,
     pub inputs: [SegmentNumber; MOST_MERGE_SEGMENTS],
 }
 
@@ -166,7 +169,8 @@ impl TailHead {
         out.put(&self.column_count.to_le_bytes());
         let bit = if self.is_output { OUTPUT_BIT } else { 0 };
         let grave_bit = if self.is_grave_output { GRAVE_OUTPUT_BIT } else { 0 };
-        out.put(&(self.input_count | bit | grave_bit).to_le_bytes());
+        let unwalked_bit = if self.is_unwalked { UNWALKED_BIT } else { 0 };
+        out.put(&(self.input_count | bit | grave_bit | unwalked_bit).to_le_bytes());
         for input in &self.inputs {
             out.put(&input.0.to_le_bytes());
         }
@@ -198,12 +202,14 @@ impl TailHead {
             input_count: 0,
             is_output: false,
             is_grave_output: false,
+            is_unwalked: false,
             inputs: [SegmentNumber(0); MOST_MERGE_SEGMENTS],
         };
         let listed = input.half()?;
-        head.input_count = listed & !(OUTPUT_BIT | GRAVE_OUTPUT_BIT);
+        head.input_count = listed & !(OUTPUT_BIT | GRAVE_OUTPUT_BIT | UNWALKED_BIT);
         head.is_output = listed & OUTPUT_BIT != 0;
         head.is_grave_output = listed & GRAVE_OUTPUT_BIT != 0;
+        head.is_unwalked = listed & UNWALKED_BIT != 0;
         for segment in &mut head.inputs {
             *segment = SegmentNumber(input.word()?);
         }

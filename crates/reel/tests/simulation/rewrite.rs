@@ -9,11 +9,14 @@ use reel::engine::compact_job::{CompactJob, park};
 use reel::engine::cue::{Cue, CueTable};
 use reel::engine::open_segment::{OUTPUT_SUFFIX, data_path};
 use reel::engine::read_path::RecordWant;
+use reel::engine::planner::Planner;
 use reel::engine::reel_store::ReelStore;
-use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, RewritePhase};
-use reel::engine::volume::MOST_PARKED;
+use reel::engine::rewrite_job::{MERGE_BUFFER_BYTES, MOST_OVERLAP, MOST_PARK_WAITS, RewritePhase, is_overlap_input};
+use reel::engine::volume::{MOST_PARKED, NO_SEAL};
+use reel::engine::walk_job::WalkJob;
 use reel::guard::hold;
 use reel::io::Io;
+use reel::io::job::Job;
 use reel::record::codec::Codec;
 use reel::segment::damage_list::DamagedRange;
 use reel::segment::footer_reader::FooterReader;
@@ -37,6 +40,9 @@ const MOST_LOOPS: usize = 2_000;
 const OVER_THE_BOUND: u64 = MOST_OVERLAP as u64 + 8;
 const KEPT_LIVE_KEYS: u64 = 16;
 const MANY_GRAVES: u64 = 30_000;
+const TWO_BLOCK_ROWS: u64 = 12_000;
+const UNWALKED_CRASH_POINTS: u64 = 40;
+const UNWALKED_CRASH_STRIDE: u64 = 3;
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -1181,9 +1187,9 @@ fn overlap_needs_two() {
     assert!(!job.rewrite.start());
     assert!(!job.rewrite.is_running());
     assert!(!volume.is_rewriting.load(Ordering::Acquire));
-    let first_tried = job.rewrite.last_tried();
+    let first_tried = job.rewrite.looked_up_to();
     assert!(!job.rewrite.start());
-    assert!(job.rewrite.last_tried() > first_tried);
+    assert!(job.rewrite.looked_up_to() > first_tried);
 
     *hold(&volume.parked) = [const { None }; MOST_PARKED];
     assert!(job.rewrite.start());
@@ -1269,4 +1275,300 @@ fn fill_park(store: &Store, stand_in: &SegmentNumber, count: usize) {
         let retired = RetiredSegment { file: pin.file.clone(), shard: 0, slot: 0 };
         park(volume, retired, *stand_in, true);
     }
+}
+
+fn hold_walk(store: &Store, is_held: bool) {
+    store.state.volumes[0].is_walk_held.store(is_held, Ordering::Release);
+    store.state.ask_compaction();
+}
+
+// segments over one key range, each with a version of one shared key and two keys of its own
+fn pile_up(store: &Store, io: &SimulatedIo, count: u64) {
+    for number in 0..count {
+        store.put(COLUMN, format!("a-{number:03}").as_bytes(), b"low").expect("put");
+        store.put(COLUMN, b"m-shared", format!("{number}").as_bytes()).expect("put");
+        store.put(COLUMN, format!("z-{number:03}").as_bytes(), b"high").expect("put");
+        seal(store, io);
+    }
+}
+
+fn check_pile(store: &Store, count: u64) {
+    for number in 0..count {
+        assert_eq!(read(store, format!("a-{number:03}").as_bytes()), Some(b"low".to_vec()));
+        assert_eq!(read(store, format!("z-{number:03}").as_bytes()), Some(b"high".to_vec()));
+    }
+    assert_eq!(read(store, b"m-shared"), Some(format!("{}", count - 1).into_bytes()));
+}
+
+fn row_totals(store: &Store) -> (u64, u64) {
+    let (mut rows, mut dead) = (0, 0);
+    for row in hold(&store.state.volumes[0].summary).rows() {
+        let column = row.cursor().column().expect("a column");
+        rows += column.row_count.0;
+        dead += column.dead_rows.0;
+    }
+    (rows, dead)
+}
+
+// an overlap past the bound merges with no walk at all, and every key reads through it
+#[test]
+fn overlap_needs_no_walk() {
+    let io = SimulatedIo::new(Seed(50));
+    let store = open(&io);
+    hold_walk(&store, true);
+    pile_up(&store, &io, OVER_THE_BOUND);
+
+    let volume = &store.state.volumes[0];
+    assert!(segments(&store) <= MOST_OVERLAP as u64);
+    assert!(volume.segments_rewritten.load(Ordering::Acquire) > 0);
+    assert_eq!(volume.walks_waiting.load(Ordering::Acquire), segments(&store));
+    assert!(hold(&volume.summary).rows().all(|row| row.facts.walked_blocks == 0 && !row.facts.is_backward));
+    check_pile(&store, OVER_THE_BOUND);
+    store.close().expect("close");
+}
+
+// the walk that comes after counts every row once, whichever segments merged ahead of it
+#[test]
+fn walk_after_merges_counts_once() {
+    let io = SimulatedIo::new(Seed(51));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    hold_walk(&store, true);
+    pile_up(&store, &io, MOST_OVERLAP as u64 / 2);
+    hold_walk(&store, false);
+    settle(&io);
+    hold_walk(&store, true);
+    let walked = segments(&store);
+    pile_up(&store, &io, OVER_THE_BOUND);
+    hold_compaction(&store, false);
+    store.state.ask_compaction();
+    settle(&io);
+    assert!(segments(&store) < walked + OVER_THE_BOUND);
+
+    hold_walk(&store, false);
+    settle(&io);
+    let keys = 2 * OVER_THE_BOUND + 1;
+    let (rows, dead) = row_totals(&store);
+    assert_eq!(rows - dead, keys);
+    check_pile(&store, OVER_THE_BOUND);
+    store.close().expect("close");
+}
+
+// a merge takes walked inputs or unwalked ones and never both, and an unwalked one leaves the walk free
+#[test]
+fn no_mix_of_walked() {
+    let io = SimulatedIo::new(Seed(52));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    pile_up(&store, &io, MOST_OVERLAP as u64 / 2);
+    hold_walk(&store, true);
+    pile_up(&store, &io, OVER_THE_BOUND);
+
+    let volume = &store.state.volumes[0];
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(job.rewrite.start());
+    assert!(job.rewrite.is_unwalked_merge());
+    assert!(!volume.is_rewriting.load(Ordering::Acquire));
+    let rows = hold(&volume.summary);
+    for input in job.rewrite.input_numbers() {
+        assert!(!rows.get(*input).expect("a row").facts.is_walked());
+    }
+    drop(rows);
+    job.rewrite.abandon();
+    store.close().expect("close");
+}
+
+// a walk target in progress holds a walked merge back, and leaves an unwalked one to go ahead without that segment
+#[test]
+fn walk_target_stays_out() {
+    let io = SimulatedIo::new(Seed(53));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    hold_walk(&store, true);
+    pile_up(&store, &io, OVER_THE_BOUND);
+
+    let volume = &store.state.volumes[0];
+    let target = hold(&volume.summary).rows().map(|row| row.facts.segment).min().expect("a row");
+    volume.has_walk_target.store(true, Ordering::Release);
+    volume.walk_segment.store(target.0, Ordering::Release);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(job.rewrite.start());
+    assert!(!job.rewrite.input_numbers().contains(&target));
+    job.rewrite.abandon();
+    volume.has_walk_target.store(false, Ordering::Release);
+    volume.walk_segment.store(NO_SEAL, Ordering::Release);
+    store.close().expect("close");
+}
+
+// the walk leaves a merge's inputs alone, and takes them up again if the merge gives way
+#[test]
+fn walk_skips_merge_inputs() {
+    let io = SimulatedIo::new(Seed(54));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    hold_walk(&store, true);
+    pile_up(&store, &io, OVER_THE_BOUND);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(job.rewrite.start());
+    let inputs = job.rewrite.input_numbers().to_vec();
+    let mut walk = WalkJob::new(Arc::clone(&store.state), 0);
+    assert!(walk.pick_target());
+    assert!(!inputs.contains(&walk.target.expect("a target").segment));
+
+    job.rewrite.abandon();
+    assert!(walk.pick_target());
+    assert!(inputs.contains(&walk.target.expect("a target").segment));
+    store.state.volumes[0].has_walk_target.store(false, Ordering::Release);
+    store.state.volumes[0].walk_segment.store(NO_SEAL, Ordering::Release);
+    store.close().expect("close");
+}
+
+// a grave in an unwalked merge stays whatever it hides, since looking would cost a lookup over every segment
+#[test]
+fn unwalked_merge_keeps_graves() {
+    let io = SimulatedIo::new(Seed(55));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    hold_walk(&store, true);
+    store.put(COLUMN, b"a-gone", b"value").expect("put");
+    store.delete(COLUMN, b"a-gone").expect("delete");
+    pile_up(&store, &io, OVER_THE_BOUND);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(job.rewrite.start());
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+    let graves = hold(&store.state.volumes[0].summary).rows().map(|row| row.cursor().column().expect("a column").grave_count.0).sum::<u64>();
+    assert_eq!(graves, 1);
+    assert_eq!(read(&store, b"a-gone"), None);
+    store.close().expect("close");
+}
+
+// an output of unwalked inputs that open has to rebuild owes the forward walk its inputs did, and it comes out counted once
+#[test]
+fn rebuilt_output_walks_forward() {
+    let io = SimulatedIo::new(Seed(56));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    hold_walk(&store, true);
+    pile_up(&store, &io, OVER_THE_BOUND);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(job.rewrite.start());
+    while job.rewrite.phase != RewritePhase::Installing {
+        job.rewrite.step();
+    }
+    let output = job.rewrite.output.clone().expect("an output").number;
+    drop(job);
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let rows = hold(&store.state.volumes[0].summary);
+    let row = rows.get(output).expect("a row");
+    assert!(!row.facts.is_backward);
+    assert_eq!(row.facts.walked_blocks, 0);
+    drop(rows);
+    settle(&io);
+    let (rows, dead) = row_totals(&store);
+    assert_eq!(rows - dead, 2 * OVER_THE_BOUND + 1);
+    check_pile(&store, OVER_THE_BOUND);
+    store.close().expect("close");
+}
+
+// a crash at any step of an unwalked merge keeps every read, and the walk after it counts every row once
+#[test]
+fn unwalked_crashes() {
+    for crash_at in (0..UNWALKED_CRASH_POINTS).map(|point| point * UNWALKED_CRASH_STRIDE) {
+        for is_power_cut in [false, true] {
+            let io = SimulatedIo::new(Seed(57));
+            let store = open(&io);
+            hold_compaction(&store, true);
+            hold_walk(&store, true);
+            pile_up(&store, &io, OVER_THE_BOUND);
+            hold_compaction(&store, false);
+            store.state.ask_compaction();
+            io.arm_crash(OperationCount(crash_at));
+            for _step in 0..STEPS {
+                if io.is_crashed() {
+                    break;
+                }
+                if io.step_any().is_none() {
+                    io.advance_clock(TICK);
+                    if io.step_any().is_none() {
+                        break;
+                    }
+                }
+            }
+            io.disarm_crash();
+            if is_power_cut {
+                io.power_cut();
+            } else {
+                io.kill();
+            }
+            drop(store);
+
+            let store = open(&io);
+            assert!(!has_partial(&io), "crash at {crash_at}");
+            settle(&io);
+            check_pile(&store, OVER_THE_BOUND);
+            let (rows, dead) = row_totals(&store);
+            assert_eq!(rows - dead, 2 * OVER_THE_BOUND + 1, "crash at {crash_at}");
+            assert!(hold(&store.state.volumes[0].damaged).is_empty(), "crash at {crash_at}");
+            store.close().expect("close");
+        }
+    }
+}
+
+// a half-walked segment's rows are half counted, so it waits for its walk to end
+#[test]
+fn half_walked_stays_out() {
+    let io = SimulatedIo::new(Seed(58));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    hold_walk(&store, true);
+    for number in 0..TWO_BLOCK_ROWS {
+        store.put(COLUMN, format!("key-{number:06}").as_bytes(), b"value").expect("put");
+    }
+    let segment = seal(&store, &io);
+
+    let mut rows = hold(&store.state.volumes[0].summary);
+    assert!(rows.get(segment).expect("a row").facts.block_count > 1);
+    assert!(is_overlap_input(&rows.get(segment).expect("a row")));
+    rows.apply_walk(segment, 1, &[]);
+    assert!(!is_overlap_input(&rows.get(segment).expect("a row")));
+    drop(rows);
+    store.close().expect("close");
+}
+
+// the planner steps an unwalked merge with a walk target in progress, so an overlap past the bound never waits for one
+#[test]
+fn merge_ahead_of_a_walk_target() {
+    let io = SimulatedIo::new(Seed(59));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    hold_walk(&store, true);
+    pile_up(&store, &io, OVER_THE_BOUND);
+    hold_compaction(&store, false);
+
+    let state = &store.state;
+    let mut planner = Planner {
+        state: Arc::clone(state),
+        walks: vec![WalkJob::new(Arc::clone(state), 0)],
+        compactions: vec![CompactJob::new(Arc::clone(state), 0)],
+        last: 0,
+    };
+    assert!(planner.walks[0].pick_target());
+    state.volumes[0].wants_compaction.store(true, Ordering::Release);
+    planner.step();
+    assert!(planner.compactions[0].rewrite.is_unwalked_merge());
+    planner.compactions[0].rewrite.abandon();
+    state.volumes[0].has_walk_target.store(false, Ordering::Release);
+    state.volumes[0].walk_segment.store(NO_SEAL, Ordering::Release);
+    drop(planner);
+    store.close().expect("close");
 }

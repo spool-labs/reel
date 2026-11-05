@@ -110,8 +110,9 @@ impl<Backend: Io> Job for Planner<Backend> {
         let mut soonest: Option<Nanoseconds> = None;
         for turn in 0..count {
             let index = (first + turn) % count;
-            // a ready reclaim runs ahead of the next walk target, and each segment it frees is one that walk won't probe
-            if self.walks[index].target.is_none() {
+            // a ready reclaim runs ahead of the next walk target, and each segment it frees is one that walk won't probe. A
+            // merge of unwalked segments needs nothing from a walk, so an overlap past the bound doesn't wait for one to end
+            if self.walks[index].target.is_none() || self.compactions[index].has_overlap_work() {
                 let step = self.compactions[index].step_unit(now);
                 if self.note_step(index, step, &mut soonest) {
                     return JobStep::Worked;

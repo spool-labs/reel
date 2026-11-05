@@ -63,7 +63,8 @@ impl SimulatedIo {
     }
 
     /// Move the clock by real time on every wait from here on, for a test with real threads. A tick a wait would let one
-    /// spinning thread run the clock past a deadline while a preempted thread holds up what it waits for
+    /// spinning thread run the clock past a deadline while a preempted thread holds up what it waits for. A seeded test stays
+    /// off this, or the clock stops being the seed's
     pub fn keep_real_time(&self) {
         *hold(&self.real_time) = Some(Instant::now());
     }

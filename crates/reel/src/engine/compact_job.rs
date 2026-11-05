@@ -172,8 +172,9 @@ impl<Backend: Io> CompactJob<Backend> {
         self.unlink(volume, segment, highest_replacement)
     }
 
-    /// Check every row of a segment the counts call dead has a newer version in a finished segment. Only a debug build
-    /// comes here, so the seed sweep proves each unlink row by row
+    /// Check every row of a segment the counts call dead has a newer version in some sealed segment, or sits in a damaged
+    /// range, where a rotted replacement can't show itself. Only a debug build comes here, so the seed sweep proves each
+    /// unlink row by row
     pub fn check_rows(&mut self, volume: &Volume<Backend>, segment: SegmentNumber) -> Result<()> {
         let Some(pin) = volume.table.pin(segment) else {
             return Ok(());
@@ -195,10 +196,14 @@ impl<Backend: Io> CompactJob<Backend> {
                 return Ok(());
             };
             while let Some(row) = walk.next_row(&mut self.key) {
-                match self.state.newest_walked(volume, block.column, &self.key, segment) {
+                let Ok(read) = self.state.key_read(block.column, &self.key, WritePlace(u64::MAX), false) else {
+                    return Ok(());
+                };
+                match self.state.search_footers(volume, &read) {
                     Ok(newest) => {
                         let is_replaced = newest.is_some_and(|found| found.row.place > row.place);
-                        debug_assert!(is_replaced, "the counts call a live row dead");
+                        let is_hidden = volume.damage.covering(block.column, &self.key).is_some();
+                        debug_assert!(is_replaced || is_hidden, "the counts call a live row dead");
                         debug_assert!(row.kind != RowKind::RangeDelete, "the counts call a range delete dead");
                     },
                     Err(StoreError::Corruption { .. }) => return Ok(()),

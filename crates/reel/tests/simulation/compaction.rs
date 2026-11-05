@@ -872,3 +872,49 @@ fn stuck_seal_gets_its_reclaim() {
     volume.is_seal_stuck.store(false, Ordering::Release);
     store.close().expect("close");
 }
+
+// a replacement rot took away can't show itself, and the damaged range answers for it: the row is still dead
+#[test]
+fn rotted_replacement() {
+    let io = SimulatedIo::new(Seed(38));
+    let store = open(&io);
+    hold_compaction(&store);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let older = sealed_put(&store, &io, b"older");
+    let newer = sealed_put(&store, &io, b"newer");
+
+    state.damage_whole(0, newer);
+    for directory in state.directories.iter().flatten() {
+        directory.replace(None, &[newer]);
+    }
+    let retired = volume.table.retire(newer).expect("retired");
+    io.close_file(retired.file);
+    release_compaction(&store);
+    state.ask_compaction();
+    settle(&io);
+    assert!(!volume.table.holds(older));
+    store.close().expect("close");
+}
+
+// a replacement in a segment no walk has reached still replaces: a rebuilt row leaves one waiting while the older segment,
+// already counted, is ready to go
+#[test]
+fn replaced_past_the_walk() {
+    let io = SimulatedIo::new(Seed(39));
+    let store = open(&io);
+    hold_compaction(&store);
+    let older = sealed_put(&store, &io, b"older");
+    let newer = sealed_put(&store, &io, b"newer");
+    let volume = &store.state.volumes[0];
+    hold(&volume.summary).remove(newer);
+    store.state.save_summary(volume).expect("save");
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+    settle(&io);
+    assert!(!store.state.volumes[0].table.holds(older));
+    assert_eq!(read(&store), Some(b"newer".to_vec()));
+    store.close().expect("close");
+}

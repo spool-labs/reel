@@ -51,6 +51,7 @@ struct Versions {
     history: Vec<Option<Vec<u8>>>,
     floor: usize,
     refused_at: Option<usize>,
+    has_flushed_unknown: bool,
 }
 
 /// A plain map of versions
@@ -68,7 +69,8 @@ struct Run {
 }
 
 impl Versions {
-    // a refusal tells the model nothing, so the versions it could hold stay in play until a read or a newer write
+    // a refusal after a crash tells the model nothing, so the versions it could hold stay in play until a read
+    // or a newer write, and a live refusal changes nothing, since a known key's only answer is its newest
     fn is_unknown(&self) -> bool {
         self.refused_at == Some(self.history.len())
     }
@@ -77,12 +79,36 @@ impl Versions {
         self.refused_at = Some(self.history.len());
     }
 
+    // a flush covers whatever a key holds, so a flush while it's unknown lands on the version a read finds
+    fn note_flush(&mut self) {
+        if self.is_unknown() {
+            self.has_flushed_unknown = true;
+        } else {
+            self.floor = self.history.len() - 1;
+        }
+    }
+
+    // check a read with no crash since the key was known: a refusal is allowed, and an answer must be the newest
+    fn check_live(&mut self, found: Option<&Option<Vec<u8>>>) -> bool {
+        let Some(found) = found else {
+            return true;
+        };
+        if self.is_unknown() {
+            return self.accept(found);
+        }
+        self.history.last() == Some(found)
+    }
+
     // take what a read found as the truth, once it's at or above what a sync covered
     fn accept(&mut self, found: &Option<Vec<u8>>) -> bool {
         let Some(offset) = self.history[self.floor..].iter().position(|value| value == found) else {
             return false;
         };
         self.history.truncate(self.floor + offset + 1);
+        if self.has_flushed_unknown {
+            self.floor = self.history.len() - 1;
+        }
+        self.has_flushed_unknown = false;
         self.refused_at = None;
         true
     }
@@ -94,6 +120,7 @@ impl Default for Versions {
             history: vec![None],
             floor: 0,
             refused_at: None,
+            has_flushed_unknown: false,
         }
     }
 }
@@ -369,9 +396,7 @@ impl Run {
     fn flush(&mut self, store: &Store) {
         if store.flush().is_ok() {
             for versions in self.model.values_mut() {
-                if !versions.is_unknown() {
-                    versions.floor = versions.history.len() - 1;
-                }
+                versions.note_flush();
             }
         }
     }
@@ -379,13 +404,9 @@ impl Run {
     fn check_read(&mut self, store: &Store) {
         let (column, key) = self.random_key();
         let versions = self.model.entry((column, key.clone())).or_default();
-        let newest = versions.history.last().cloned().flatten();
         match read(store, column, &key) {
-            Ok(found) if versions.is_unknown() => {
-                assert!(versions.accept(&found), "seed {}: get of {key:?} read {found:?} below its floor", self.seed);
-            },
-            Ok(found) => assert_eq!(found, newest, "get of {key:?}"),
-            Err(StoreError::Corruption { .. }) if self.has_rot => versions.note_refusal(),
+            Ok(found) => assert!(versions.check_live(Some(&found)), "seed {}: get of {key:?} read {found:?}, in {versions:?}", self.seed),
+            Err(StoreError::Corruption { .. }) if self.has_rot => {},
             Err(_crashed) if self.io.is_crashed() => {},
             Err(error) => panic!("seed {}: get of {key:?} failed: {error}", self.seed),
         }
@@ -493,4 +514,36 @@ fn random_rot() {
     for seed in seeds(ROT_SEEDS) {
         Run::new(seed, true).run();
     }
+}
+
+// the model holds what the harness checks, so a stand-in that answers wrongly has to fail it
+fn versions_of(values: &[Option<&[u8]>], floor: usize) -> Versions {
+    Versions {
+        history: values.iter().map(|value| value.map(<[u8]>::to_vec)).collect(),
+        floor,
+        ..Versions::default()
+    }
+}
+
+// a live refusal widens nothing: an older version after it fails
+#[test]
+fn live_refusal() {
+    let mut versions = versions_of(&[None, Some(b"a"), Some(b"b"), Some(b"c")], 1);
+
+    assert!(versions.check_live(None));
+
+    assert!(!versions.check_live(Some(&Some(b"b".to_vec()))));
+    assert!(versions.check_live(Some(&Some(b"c".to_vec()))));
+}
+
+// a flush while a key is unknown holds once a read shows the version: an older one after a crash fails
+#[test]
+fn flushed_unknown() {
+    let mut versions = versions_of(&[None, Some(b"a"), Some(b"b"), Some(b"c")], 1);
+    versions.note_refusal();
+    versions.note_flush();
+
+    assert!(versions.accept(&Some(b"c".to_vec())));
+
+    assert!(!versions.accept(&Some(b"a".to_vec())));
 }

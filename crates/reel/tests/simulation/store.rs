@@ -924,6 +924,7 @@ fn window_waits() {
 #[test]
 fn window_race() {
     let io = SimulatedIo::new(Seed(105));
+    io.keep_real_time();
     let store = open(&io);
     store.put(COLUMN, b"key", b"value").expect("put");
     let volume = &store.state.volumes[0];
@@ -974,6 +975,7 @@ fn window_race() {
 #[test]
 fn window_pauses() {
     let io = SimulatedIo::new(Seed(106));
+    io.keep_real_time();
     let store = open(&io);
     store.put(COLUMN, b"key", b"value").expect("put");
     let slot = hold(&store.state.volumes[0].claims).open[0].slot;
@@ -1161,6 +1163,7 @@ fn many_old_point() {
 #[test]
 fn many_batch_whole() {
     let io = SimulatedIo::new(Seed(120));
+    io.keep_real_time();
     let store = open(&io);
     let is_done = AtomicBool::new(false);
     let keys: [&[u8]; 3] = [b"a", b"b", b"c"];

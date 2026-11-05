@@ -1123,6 +1123,7 @@ fn copy_bad() {
 #[test]
 fn covers_out_of_order() {
     let io = SimulatedIo::new(Seed(40));
+    io.keep_real_time();
     let store = open(&io);
     let state = Arc::clone(&store.state);
     store.put(COLUMN, b"m", b"value").expect("put");

@@ -215,6 +215,7 @@ fn one_claim() {
 #[test]
 fn seen_whole() {
     let io = SimulatedIo::new(Seed(4));
+    io.keep_real_time();
     let store = open(&io);
     let volume = &store.state.volumes[0];
     let request = ClaimRequest {
@@ -622,6 +623,7 @@ fn alone_claim() {
 #[test]
 fn rows_go_first() {
     let io = SimulatedIo::new(Seed(16));
+    io.keep_real_time();
     let store = open(&io);
     store.put(PLAIN, b"first", b"value").expect("put");
     let volume = &store.state.volumes[0];
@@ -667,6 +669,7 @@ fn rows_go_first() {
 #[test]
 fn turn_spares_puts() {
     let io = SimulatedIo::new(Seed(17));
+    io.keep_real_time();
     let store = open(&io);
     store.put(PLAIN, b"before", b"value").expect("put");
     let volume = &store.state.volumes[0];
@@ -912,6 +915,7 @@ fn long_new_segment() {
 #[test]
 fn long_seal_beside() {
     let io = SimulatedIo::new(Seed(28));
+    io.keep_real_time();
     let store = open(&io);
     let volume = &store.state.volumes[0];
     let request = ClaimRequest {

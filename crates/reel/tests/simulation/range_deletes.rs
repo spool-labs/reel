@@ -386,6 +386,7 @@ fn data_of(io: &SimulatedIo) -> PathBuf {
 #[test]
 fn older_outlives_newer() {
     let io = SimulatedIo::new(Seed(13));
+    io.keep_real_time();
     let store = open(&io);
     fill(&store);
     store.delete_range(COLUMN, &key_of(10), &key_of(20)).expect("delete");

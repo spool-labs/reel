@@ -4,6 +4,8 @@ use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Instant;
 
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
 
@@ -30,6 +32,7 @@ pub struct SimulatedIo {
     pub disk: Arc<Mutex<SimulatedDisk>>,
     pub slots: Arc<Mutex<Vec<JobSlot>>>,
     pub clock: Arc<AtomicU64>,
+    pub real_time: Arc<Mutex<Option<Instant>>>,
 }
 
 /// A held simulated lock, released when dropped
@@ -55,7 +58,14 @@ impl SimulatedIo {
             disk: Arc::new(Mutex::new(SimulatedDisk::new(seed))),
             slots: Arc::new(Mutex::new(Vec::new())),
             clock: Arc::new(AtomicU64::new(0)),
+            real_time: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Move the clock by real time on every wait from here on, for a test with real threads. A tick a wait would let one
+    /// spinning thread run the clock past a deadline while a preempted thread holds up what it waits for
+    pub fn keep_real_time(&self) {
+        *hold(&self.real_time) = Some(Instant::now());
     }
 
     /// Declare a disk under a path, with a size in bytes
@@ -419,7 +429,15 @@ impl Io for SimulatedIo {
 
     fn pause(&self) {
         // one thread drives a simulation, so a waiter runs the work it waits for
-        self.advance_clock(PAUSE_TICK);
+        match hold(&self.real_time).as_mut() {
+            Some(last) => {
+                let now = Instant::now();
+                self.advance_clock(Nanoseconds(now.duration_since(*last).as_nanos() as u64));
+                *last = now;
+                thread::yield_now();
+            },
+            None => self.advance_clock(PAUSE_TICK),
+        }
         self.step_any();
     }
 

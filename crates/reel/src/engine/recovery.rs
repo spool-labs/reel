@@ -161,6 +161,7 @@ pub struct RowsScan {
     pub row_count: RowCount,
     pub has_rot: bool,
     pub rot_sum: Checksum,
+    pub highest_place: WritePlace,
 }
 
 /// The rows of a recovered segment so far
@@ -521,6 +522,9 @@ impl<Backend: Io> EngineState<Backend> {
             }
             scan.synced_through = scan.synced_through.max(group.synced_through);
             scan.row_count = RowCount(scan.row_count.0 + group.row_count.0);
+            for row in group.walk() {
+                scan.highest_place = scan.highest_place.max(row.place);
+            }
             scan.valid_end = FileOffset(at.0 + group_length as u64);
         }
         Ok(scan)
@@ -693,17 +697,20 @@ pub fn recover_all<Backend: Io>(
                 return Err(error);
             },
         };
-        if scan.has_rot
-            && let Err(error) = damage_open(state, open, scan.rot_sum)
-        {
-            state.io.close_file(rows);
-            return Err(error);
-        };
         if let Some(open) = found.pop() {
             scanned.push(ScannedOpen { found: open, rows, scan });
         }
     }
     state.resume_numbers(highest_segment);
+    // the limit should already stand above these, and open never hands out a place it found
+    for segment in scanned.iter() {
+        state.order.resume_past(segment.scan.highest_place);
+    }
+    for segment in scanned.iter() {
+        if segment.scan.has_rot {
+            damage_open(state, &segment.found, segment.scan.rot_sum)?;
+        }
+    }
 
     scanned.reverse();
     while let Some(segment) = scanned.last() {
@@ -878,8 +885,8 @@ pub fn copy_row<Backend: Io>(
     let target = &state.volumes[volume];
     record.resize(row.length.0 as usize, 0);
     if !record.is_empty() && !read_or_damaged(data, row.offset, record)? {
-            return damage_key(state, target, segment, row);
-        }
+        return damage_key(state, target, segment, row);
+    }
 
     let request = ClaimRequest {
         bytes: row.length,

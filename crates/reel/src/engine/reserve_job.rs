@@ -19,7 +19,8 @@ pub struct ReserveJob<Backend: Io> {
 impl<Backend: Io> Job for ReserveJob<Backend> {
     fn step(&mut self) -> JobStep {
         if self.state.needs_reservation() {
-            self.state.reserve_ahead();
+            // a root that took nothing failed its volume, and writers there hear it
+            let _is_held = self.state.reserve_ahead();
         }
         let now = self.state.io.now();
         JobStep::IdleUntil {

@@ -145,6 +145,15 @@ impl WriteOrder {
         ring.next_place.0 + rows.0 - 1 > ring.limit.0
     }
 
+    /// Move the order past a place recovery found
+    pub fn resume_past(&self, place: WritePlace) {
+        let mut ring = hold(&self.ring);
+        if place >= ring.next_place {
+            ring.next_place = WritePlace(place.0 + 1);
+            self.mark.store(place.0, Ordering::Release);
+        }
+    }
+
     /// Count the places left under the limit
     pub fn places_left(&self) -> u64 {
         let ring = hold(&self.ring);

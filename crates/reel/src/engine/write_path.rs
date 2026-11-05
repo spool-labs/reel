@@ -291,7 +291,7 @@ impl<Backend: Io> EngineState<Backend> {
                     // the ring frees when claims end, and ending one needs this lock, and so does a raise
                     drop(claims);
                     if self.order.is_past_limit(request.rows) {
-                        self.reserve_ahead();
+                        let _is_held = self.reserve_ahead();
                     }
                     self.io.pause();
                     continue;
@@ -453,7 +453,7 @@ impl<Backend: Io> EngineState<Backend> {
         request: &ClaimRequest,
     ) -> Result<OpenSegment<Backend::File>, StoreError> {
         let path = &volume.roots[root.0 as usize];
-        let number = self.next_segment_number();
+        let number = self.next_segment_number()?;
         let reserved = if request.bytes.0 > 0 {
             ByteCount(volume.segment_bytes.0.max(request.bytes.0))
         } else {

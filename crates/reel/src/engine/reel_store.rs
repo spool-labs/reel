@@ -289,6 +289,7 @@ pub fn bring_up<Backend: Io>(
     while let Some(found) = scan.sealed.last() {
         let volume = &state.volumes[found.volume];
         state.install_sealed(volume, found).map_err(open_error("installing a segment"))?;
+        state.order.resume_past(found.head.places.highest);
         scan.sealed.pop();
     }
     let highest_segment = scan.highest_segment;

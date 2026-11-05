@@ -3,6 +3,7 @@
 
 mod damage;
 mod io_contract;
+mod place_limit;
 mod records;
 mod write_index;
 mod footers;

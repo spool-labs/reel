@@ -15,7 +15,7 @@ use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
     EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, READ_BUFFERS, WRITE_BUFFERS,
 };
-use crate::engine::engine_state::{EngineState, SEGMENT_NUMBER_BATCH, SlotFile};
+use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
 use crate::engine::open_segment::RowQueue;
 use crate::engine::read_path::RecordWant;
 use crate::engine::recovery::{
@@ -91,22 +91,17 @@ impl<Backend: Io> ReelStore<Backend> {
         let record_key = superblock.record_key;
         let scan = scan_roots(&io, record_key, &listings).map_err(open_error("reading a tail"))?;
         let summaries = read_summaries(&io, &roots).map_err(open_error("reading a summary"))?;
-        let mut summary_mark = WritePlace(0);
-        for summary in &summaries {
-            summary_mark = summary_mark.max(summary.mark);
-        }
 
         let state = Arc::new(build_state(io, config, &sizing, superblock, locks, &scan, summaries));
-        let summary_place = settle_summaries(&state, &scan.sealed, &scan.damaged).map_err(open_error("settling a summary"))?;
+        settle_summaries(&state, &scan.sealed, &scan.damaged).map_err(open_error("settling a summary"))?;
         let damaged: usize = state.volumes.iter().map(|volume| hold(&volume.damaged).len()).sum();
         state.damaged_segments.store(damaged as u64, Ordering::Release);
         let highest_segment = scan.highest_segment;
-        let highest_place = scan.highest_place.max(summary_place).max(summary_mark);
         for found in scan.sealed {
             let volume = &state.volumes[found.volume];
             state.install_sealed(volume, found).map_err(open_error("installing a segment"))?;
         }
-        recover_segments(&state, scan.open, highest_place, highest_segment).map_err(open_error("recovering a segment"))?;
+        recover_segments(&state, scan.open, highest_segment).map_err(open_error("recovering a segment"))?;
 
         // an open is not a state: the limits say what a run-through would seal, from the same rows
         for volume in &state.volumes {
@@ -331,12 +326,14 @@ pub fn lock_roots<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Vec
 /// Read the newest superblock of any root, check the config against it, and write it to every root
 pub fn settle_superblock<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Superblock, StoreError> {
     let mut newest: Option<Superblock> = None;
+    let mut highest_limit = WritePlace(0);
     for volume in &config.volumes {
         for root in &volume.roots {
             let found = Superblock::read(io, root).map_err(open_error("reading a superblock"))?;
             let Some(found) = found else {
                 continue;
             };
+            highest_limit = highest_limit.max(found.place_limit);
             let is_newer = match &newest {
                 Some(current) => {
                     if current.store_id != found.store_id {
@@ -365,6 +362,7 @@ pub fn settle_superblock<Backend: Io>(io: &Backend, config: &StoreConfig) -> Res
             record_key: RecordKey(io.random_word()),
             revision: 0,
             next_segment: SegmentNumber(1),
+            place_limit: WritePlace(0),
             volumes: Vec::new(),
             columns: Vec::new(),
             dead_roots: Vec::new(),
@@ -375,6 +373,7 @@ pub fn settle_superblock<Backend: Io>(io: &Backend, config: &StoreConfig) -> Res
     superblock.volumes = stored_volumes(config);
     superblock.columns = stored_columns(config, &superblock.columns);
     superblock.next_segment = SegmentNumber(superblock.next_segment.0 + SEGMENT_NUMBER_BATCH);
+    superblock.place_limit = WritePlace(highest_limit.0 + PLACE_RUN);
 
     let mut bytes = Vec::new();
     for volume in &config.volumes {
@@ -582,6 +581,8 @@ pub fn build_state<Backend: Io>(
     let row_share = ByteCount(sizing.cache_share.0 - filter_share.0);
     let reserved = superblock.next_segment.0;
     let first_number = reserved.saturating_sub(SEGMENT_NUMBER_BATCH);
+    let place_limit = superblock.place_limit;
+    let first_place = place_limit.0.saturating_sub(PLACE_RUN);
 
     EngineState {
         io,
@@ -590,7 +591,7 @@ pub fn build_state<Backend: Io>(
         columns,
         directories,
         volumes,
-        order: WriteOrder::new(WritePlace(0)),
+        order: WriteOrder::new(WritePlace(first_place), place_limit),
         index: WriteIndex::new(&sizing.shard),
         spot: SpotIndex::new(sizing.spot_share),
         filter_cache: BlockCache::new(filter_share, FILTER_SLOT_BYTES),

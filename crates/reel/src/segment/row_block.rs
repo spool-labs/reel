@@ -3,7 +3,7 @@
 use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::little_endian::read_half;
+use crate::little_endian::{read_half, read_word};
 use crate::row_kind::RowKind;
 use crate::segment::varint::{MAX_VARINT_BYTES, read_varint, write_varint};
 
@@ -30,19 +30,22 @@ pub const KIND_MASK: u64 = (1 << KIND_BITS) - 1;
 /// Opens every row block, so a walk with no index can find one
 pub const BLOCK_MARKER: u32 = 0x524C_4248;
 /// Bytes of a row block's header
-pub const BLOCK_HEADER_BYTES: usize = 16;
+pub const BLOCK_HEADER_BYTES: usize = 24;
 /// Where the header keeps the row block's length
 pub const HEADER_BLOCK_LENGTH_AT: usize = 4;
 /// Where the header keeps the filter's length
 pub const HEADER_FILTER_LENGTH_AT: usize = 8;
+/// Where the header keeps the base its rows' places count from
+pub const HEADER_PLACE_BASE_AT: usize = 12;
 /// Where the header keeps its own checksum
-pub const HEADER_SUM_AT: usize = 12;
+pub const HEADER_SUM_AT: usize = 20;
 
 /// What a row block's header says
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockHeader {
     pub block_length: u32,
     pub filter_length: u32,
+    pub place_base: WritePlace,
 }
 
 /// A row as a footer stores it
@@ -296,7 +299,8 @@ pub fn write_block_header(header: &BlockHeader) -> [u8; BLOCK_HEADER_BYTES] {
     let mut bytes = [0; BLOCK_HEADER_BYTES];
     bytes[..HEADER_BLOCK_LENGTH_AT].copy_from_slice(&BLOCK_MARKER.to_le_bytes());
     bytes[HEADER_BLOCK_LENGTH_AT..HEADER_FILTER_LENGTH_AT].copy_from_slice(&header.block_length.to_le_bytes());
-    bytes[HEADER_FILTER_LENGTH_AT..HEADER_SUM_AT].copy_from_slice(&header.filter_length.to_le_bytes());
+    bytes[HEADER_FILTER_LENGTH_AT..HEADER_PLACE_BASE_AT].copy_from_slice(&header.filter_length.to_le_bytes());
+    bytes[HEADER_PLACE_BASE_AT..HEADER_SUM_AT].copy_from_slice(&header.place_base.0.to_le_bytes());
     let sum = xxh3_64(&bytes[..HEADER_SUM_AT]) as u32;
     bytes[HEADER_SUM_AT..].copy_from_slice(&sum.to_le_bytes());
     bytes
@@ -314,6 +318,7 @@ pub fn read_block_header(bytes: &[u8]) -> Option<BlockHeader> {
     Some(BlockHeader {
         block_length: read_half(header, HEADER_BLOCK_LENGTH_AT)?,
         filter_length: read_half(header, HEADER_FILTER_LENGTH_AT)?,
+        place_base: WritePlace(read_word(header, HEADER_PLACE_BASE_AT)?),
     })
 }
 

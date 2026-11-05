@@ -90,6 +90,7 @@ fn block_rot() {
 #[test]
 fn header_round() {
     let header = BlockHeader {
+        place_base: WritePlace(77),
         block_length: 60_000,
         filter_length: 2_500,
     };

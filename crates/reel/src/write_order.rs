@@ -37,6 +37,7 @@ pub struct TicketRing {
     head: usize,
     tail: usize,
     next_place: WritePlace,
+    limit: WritePlace,
 }
 
 /// The write order of a store
@@ -60,8 +61,8 @@ impl TicketRing {
 }
 
 impl WriteOrder {
-    /// Start the order after the last place a store has used
-    pub fn new(last_used: WritePlace) -> Self {
+    /// Start the order after the last place a store has used, with places reserved up to a limit
+    pub fn new(last_used: WritePlace, limit: WritePlace) -> Self {
         Self {
             ring: Mutex::new(TicketRing {
                 states: vec![TicketState::Landed; MOST_IN_FLIGHT],
@@ -69,6 +70,7 @@ impl WriteOrder {
                 head: 0,
                 tail: 0,
                 next_place: WritePlace(last_used.0 + 1),
+                limit,
             }),
             mark: AtomicU64::new(last_used.0),
             moved: Condvar::new(),
@@ -80,7 +82,7 @@ impl WriteOrder {
         WritePlace(self.mark.load(Ordering::Acquire))
     }
 
-    /// Claim the next places, or return nothing while too many writers are in flight
+    /// Claim the next places, or return nothing while too many writers are in flight or the limit is in the way
     pub fn try_claim(&self, rows: RowCount) -> Option<Ticket> {
         let mut ring = hold(&self.ring);
         if ring.len() == MOST_IN_FLIGHT {
@@ -89,6 +91,9 @@ impl WriteOrder {
 
         let first = ring.next_place;
         let last = WritePlace(first.0 + rows.0 - 1);
+        if last > ring.limit {
+            return None;
+        }
         ring.next_place = WritePlace(last.0 + 1);
 
         let slot = ring.tail % MOST_IN_FLIGHT;
@@ -134,14 +139,14 @@ impl WriteOrder {
         }
     }
 
-    /// Move the order past the highest place an open found
-    pub fn resume_after(&self, last_used: WritePlace) {
-        hold(&self.ring).next_place = WritePlace(last_used.0 + 1);
-        self.mark.store(last_used.0, Ordering::Release);
+    /// Check whether a claim of these rows would pass the limit
+    pub fn is_past_limit(&self, rows: RowCount) -> bool {
+        let ring = hold(&self.ring);
+        ring.next_place.0 + rows.0 - 1 > ring.limit.0
     }
 
-    /// Read the next place a claim would take
-    pub fn next_place(&self) -> WritePlace {
-        hold(&self.ring).next_place
+    /// Set the limit, once every root holds it
+    pub fn set_limit(&self, limit: WritePlace) {
+        hold(&self.ring).limit = limit;
     }
 }

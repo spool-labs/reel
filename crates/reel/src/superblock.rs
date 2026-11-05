@@ -1,10 +1,10 @@
-//! One per root: the store's identity, its layout and the segment counter
+//! One per root: the store's identity, its layout, the segment counter and the write order's limit
 
 use std::io::{Error, ErrorKind, IoSlice, Result};
 use std::path::{Path, PathBuf};
 
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, FileOffset};
+use reel_api::units::{ByteCount, FileOffset, WritePlace};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::{ColumnConfig, KeyShape};
@@ -58,6 +58,7 @@ pub struct Superblock {
     pub record_key: RecordKey,
     pub revision: u64,
     pub next_segment: SegmentNumber,
+    pub place_limit: WritePlace,
     pub volumes: Vec<StoredVolume>,
     pub columns: Vec<StoredColumn>,
     pub dead_roots: Vec<String>,
@@ -128,6 +129,7 @@ impl Superblock {
         fields.word(self.record_key.0);
         fields.word(self.revision);
         fields.word(self.next_segment.0);
+        fields.word(self.place_limit.0);
         fields.word(self.volumes.len() as u64);
         for volume in &self.volumes {
             fields.text(&volume.name);
@@ -173,6 +175,7 @@ impl Superblock {
         let record_key = RecordKey(fields.word()?);
         let revision = fields.word()?;
         let next_segment = SegmentNumber(fields.word()?);
+        let place_limit = WritePlace(fields.word()?);
 
         let volume_count = fields.word()?;
         let mut volumes = Vec::new();
@@ -217,6 +220,7 @@ impl Superblock {
             record_key,
             revision,
             next_segment,
+            place_limit,
             volumes,
             columns,
             dead_roots,

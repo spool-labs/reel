@@ -1,0 +1,196 @@
+//! The write order's limit: every new write lands above every place ever handed out, whatever was lost
+
+use std::path::{Path, PathBuf};
+
+use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::engine::engine_state::PLACE_RUN;
+use reel::engine::reel_store::ReelStore;
+use reel::io::Io;
+use reel::io::simulated::seeded_random::Seed;
+use reel::io::simulated::simulated_disk::OperationCount;
+use reel::io::simulated::simulated_io::SimulatedIo;
+use reel::record::codec::Codec;
+use reel::superblock::{SUPERBLOCK_NAME, Superblock, SuperblockPaths};
+use reel_api::column_id::ColumnId;
+use reel_api::units::{ByteCount, VolumeId, WritePlace};
+
+const FIRST_ROOT: &str = "/disk/limit-one";
+const SECOND_ROOT: &str = "/disk/limit-two";
+const ROOTS: [&str; 2] = [FIRST_ROOT, SECOND_ROOT];
+const COLUMN: ColumnId = ColumnId(1);
+const BUDGET: ByteCount = ByteCount(8 * 1024 * 1024);
+const KEY: &[u8] = b"key";
+const VALUE: &[u8] = b"value";
+const CRASH_POINTS: u64 = 16;
+
+type Store = ReelStore<SimulatedIo>;
+
+fn config() -> StoreConfig {
+    StoreConfig {
+        memory_budget: BUDGET,
+        volumes: vec![VolumeConfig {
+            name: "meta".to_string(),
+            roots: ROOTS.iter().map(PathBuf::from).collect(),
+            sync: SyncPolicy::Never,
+        }],
+        columns: vec![ColumnConfig {
+            id: COLUMN,
+            name: "track".to_string(),
+            key_shape: KeyShape::Variable { most: 64 },
+            codec: Codec::None,
+            volume: VolumeId(0),
+        }],
+    }
+}
+
+fn open(io: &SimulatedIo) -> Store {
+    ReelStore::open(io.clone(), &config()).expect("open")
+}
+
+fn superblock_of(io: &SimulatedIo, root: &str) -> Superblock {
+    Superblock::read(io, Path::new(root)).expect("read").expect("superblock")
+}
+
+fn limit_of(io: &SimulatedIo, root: &str) -> WritePlace {
+    superblock_of(io, root).place_limit
+}
+
+fn holds(store: &Store, key: &[u8]) -> bool {
+    let mut buf = Vec::new();
+    store.get(COLUMN, key, &mut buf).expect("get")
+}
+
+// a fresh store starts at the bottom of its first run, and every root saved the run first
+#[test]
+fn first_run() {
+    let io = SimulatedIo::new(Seed(1));
+
+    let store = open(&io);
+
+    assert_eq!(store.state.read_point(), WritePlace(0));
+    for root in ROOTS {
+        assert_eq!(limit_of(&io, root), WritePlace(PLACE_RUN));
+    }
+    store.close().expect("close");
+}
+
+// open starts at the limit the last open saved, and saves the next limit before any write
+#[test]
+fn open_start() {
+    let io = SimulatedIo::new(Seed(2));
+    let store = open(&io);
+    store.put(COLUMN, KEY, VALUE).expect("put");
+    store.close().expect("close");
+    drop(store);
+    let saved = limit_of(&io, FIRST_ROOT);
+
+    let store = open(&io);
+
+    assert_eq!(store.state.read_point(), saved);
+    assert!(holds(&store, KEY));
+    for root in ROOTS {
+        assert_eq!(limit_of(&io, root), WritePlace(saved.0 + PLACE_RUN));
+    }
+    store.close().expect("close");
+}
+
+// the highest limit wins, whatever the revisions say, so a stale root can't pull the counter back
+#[test]
+fn stale_root() {
+    let io = SimulatedIo::new(Seed(3));
+    let store = open(&io);
+    store.close().expect("close");
+    drop(store);
+    let saved = limit_of(&io, FIRST_ROOT);
+
+    let mut stale = superblock_of(&io, SECOND_ROOT);
+    stale.place_limit = WritePlace(1);
+    stale.revision += 5;
+    stale.write(&io, &SuperblockPaths::new(Path::new(SECOND_ROOT)), &mut Vec::new()).expect("write");
+
+    let store = open(&io);
+
+    assert_eq!(store.state.read_point(), saved);
+    store.close().expect("close");
+}
+
+// a root that lost its superblock leaves the other root's limit standing
+#[test]
+fn lost_root() {
+    let io = SimulatedIo::new(Seed(4));
+    let store = open(&io);
+    store.close().expect("close");
+    drop(store);
+    let saved = limit_of(&io, SECOND_ROOT);
+    io.remove_file(&Path::new(FIRST_ROOT).join(SUPERBLOCK_NAME)).expect("remove");
+
+    let store = open(&io);
+
+    assert_eq!(store.state.read_point(), saved);
+    store.close().expect("close");
+}
+
+// a claim past the limit waits for every root to hold the next one
+#[test]
+fn run_raise() {
+    let io = SimulatedIo::new(Seed(5));
+    let store = open(&io);
+    store.put(COLUMN, b"before", VALUE).expect("put");
+    let saved = limit_of(&io, FIRST_ROOT);
+    store.state.order.set_limit(store.state.read_point());
+
+    store.put(COLUMN, KEY, VALUE).expect("put");
+
+    assert!(holds(&store, KEY));
+    for root in ROOTS {
+        assert_eq!(limit_of(&io, root), WritePlace(saved.0 + PLACE_RUN));
+    }
+    store.close().expect("close");
+}
+
+// a raise that can't reach a root fails the write, hands out no place, and the next write goes through
+#[test]
+fn raise_fails() {
+    let io = SimulatedIo::new(Seed(6));
+    let store = open(&io);
+    store.put(COLUMN, b"before", VALUE).expect("put");
+    let saved = limit_of(&io, FIRST_ROOT);
+    let mark = store.state.read_point();
+    store.state.order.set_limit(mark);
+
+    io.fail_syncs(OperationCount(1));
+    assert!(store.put(COLUMN, KEY, VALUE).is_err());
+
+    assert_eq!(store.state.read_point(), mark);
+    assert!(!holds(&store, KEY));
+    store.put(COLUMN, KEY, VALUE).expect("put");
+    assert_eq!(store.state.read_point(), WritePlace(mark.0 + 1));
+    for root in ROOTS {
+        assert!(limit_of(&io, root) > saved);
+    }
+    store.close().expect("close");
+}
+
+// a crash at any step of a raise leaves a limit at or above every place handed out
+#[test]
+fn raise_crash() {
+    for crash_at in 0..CRASH_POINTS {
+        let io = SimulatedIo::new(Seed(100 + crash_at));
+        let store = open(&io);
+        store.put(COLUMN, b"before", VALUE).expect("put");
+        let mark = store.state.read_point();
+        store.state.order.set_limit(mark);
+
+        io.arm_crash(OperationCount(crash_at));
+        let written = store.put(COLUMN, KEY, VALUE);
+        let handed_out = WritePlace(mark.0 + u64::from(written.is_ok()));
+        io.power_cut();
+        drop(store);
+
+        let store = open(&io);
+        assert!(store.state.read_point() >= handed_out, "crash at {crash_at}");
+        store.put(COLUMN, b"after", VALUE).expect("put");
+        assert!(holds(&store, b"after"));
+        store.close().expect("close");
+    }
+}

@@ -15,7 +15,9 @@ use reel::record::codec::Codec;
 use reel::segment::footer_reader::FooterReader;
 use reel::segment::row_block::BLOCK_HEADER_BYTES;
 use reel::segment::segment_tail::{SECOND_TAIL_DISTANCE, SegmentNumber, TailHead};
-use reel::segment::summary::{ROW_LENGTH_BYTES, SUMMARY_HEADER_BYTES, SummaryPaths, read_row};
+use reel::segment::summary::{
+    ROW_LENGTH_BYTES, SUMMARY_HEADER_BYTES, SummaryPaths, SummaryRows, read_row, read_summary,
+};
 use reel::superblock::Superblock;
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
@@ -35,8 +37,10 @@ const OLDEST: usize = 0;
 const MIDDLE: usize = 1;
 const NEWEST: usize = 2;
 const SEGMENTS: usize = 3;
-// a stage above them all, for a segment whose highest place is lost
-const UNKNOWN: usize = usize::MAX;
+// a segment lost with its row counts every stage a store held at open
+const STAGE_LOST: usize = NEWEST;
+// a stage for writes after the open
+const AFTER_OPEN: usize = usize::MAX;
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -387,7 +391,7 @@ fn rebuilt_row() {
     store.close().expect("close");
 }
 
-// tails and row lost: the damage covers the columns whole, and no row can show it's above
+// tails and row lost: the damage covers the columns whole, at the place counter at open
 #[test]
 fn nothing_left() {
     let built = build(8);
@@ -398,7 +402,7 @@ fn nothing_left() {
     let store = open(&built.io);
 
     assert_eq!(store.damaged_segments(), 1);
-    assert!(assert_guarded(&store, &built, Cover::Whole(UNKNOWN)) > 0);
+    assert!(assert_guarded(&store, &built, Cover::Whole(STAGE_LOST)) > 0);
     store.close().expect("close");
 }
 
@@ -547,20 +551,47 @@ fn moved_length() {
     let store = open(&built.io);
 
     assert_eq!(store.damaged_segments(), 1);
-    assert!(assert_guarded(&store, &built, Cover::Whole(UNKNOWN)) > 0);
+    assert!(assert_guarded(&store, &built, Cover::Whole(STAGE_LOST)) > 0);
     store.close().expect("close");
 }
 
-// the summary's mark keeps the write order above a segment lost with its row
+// the counter at open stands above a segment lost with its row, and writes above it serve across opens
 #[test]
-fn mark_holds() {
-    let built = build(16);
+fn lost_write() {
+    let mut built = build(16);
     rot_row(&built, built.heads[NEWEST].segment);
     rot_first_tail(&built, NEWEST);
     rot_second_tail(&built, NEWEST);
 
     let store = open(&built.io);
-
     assert!(store.state.read_point() >= built.heads[NEWEST].places.highest);
+    let mut model = built.model.clone();
+    write(&store, &mut model, ORDERED, 155, AFTER_OPEN, false);
+    write(&store, &mut model, RANDOM, 156, AFTER_OPEN, true);
+    built.model = model;
+    let refused = assert_guarded(&store, &built, Cover::Whole(STAGE_LOST));
+    assert!(refused > 0);
+    seal(&store, &built.io);
     store.close().expect("close");
+    drop(store);
+
+    let store = open(&built.io);
+    assert_eq!(assert_guarded(&store, &built, Cover::Whole(STAGE_LOST)), refused);
+    store.close().expect("close");
+}
+
+// close saves the summary with the mark it's current to
+#[test]
+fn close_mark() {
+    let built = build(17);
+    let store = open(&built.io);
+    store.put(ORDERED, b"last", b"value").expect("put");
+    let mark = store.state.read_point();
+    store.close().expect("close");
+    drop(store);
+
+    let mut rows = SummaryRows::new(ByteCount(0));
+    let saved = read_summary(&built.io, &SummaryPaths::new(Path::new(ROOT)), &mut rows).expect("read");
+
+    assert_eq!(saved, Some(mark));
 }

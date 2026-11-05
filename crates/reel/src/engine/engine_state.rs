@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock, RwLock};
 
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, WritePlace};
+use reel_api::units::{ByteCount, RowCount, WritePlace};
 
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::EngineSizing;
@@ -32,6 +32,9 @@ use crate::write_order::WriteOrder;
 
 /// Segment numbers one superblock write reserves
 pub const SEGMENT_NUMBER_BATCH: u64 = 1_024;
+/// Places one limit reserves: a raise costs a superblock sync per root once per 2^32 rows, about 70
+/// minutes at a million rows a second, and each open skips what's left of a run, so 2^64 outlasts 2^32 opens
+pub const PLACE_RUN: u64 = 1 << 32;
 
 /// The segment in a slot and its data file
 #[derive(Clone, Debug)]
@@ -157,6 +160,33 @@ impl<Backend: Io> EngineState<Backend> {
         write_summary(&self.io, &volume.summary_paths, self.read_point(), rows.bytes())
     }
 
+    /// Save the superblock to every root with its revision moved on
+    pub fn save_superblock(&self, superblock: &mut Superblock) -> Result<(), StoreError> {
+        superblock.revision += 1;
+        let mut bytes = hold(&self.superblock_bytes);
+        for volume in &self.volumes {
+            for paths in &volume.superblock_paths {
+                superblock.write(&self.io, paths, &mut bytes).map_err(|source| StoreError::Io {
+                    action: "writing a superblock",
+                    source,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Sync a higher place limit to every root before a claim of these rows passes the old one
+    pub fn raise_place_limit(&self, rows: RowCount) -> Result<(), StoreError> {
+        let mut superblock = hold(&self.superblock);
+        if !self.order.is_past_limit(rows) {
+            return Ok(());
+        }
+        superblock.place_limit = WritePlace(superblock.place_limit.0 + PLACE_RUN);
+        self.save_superblock(&mut superblock)?;
+        self.order.set_limit(superblock.place_limit);
+        Ok(())
+    }
+
     /// Take the next segment number, reserving more in every superblock when they run out
     pub fn next_segment_number(&self) -> Result<SegmentNumber, StoreError> {
         let number = self.next_segment.fetch_add(1, Ordering::AcqRel);
@@ -164,16 +194,7 @@ impl<Backend: Io> EngineState<Backend> {
             let target = number + SEGMENT_NUMBER_BATCH;
             let mut superblock = hold(&self.superblock);
             superblock.next_segment = SegmentNumber(target);
-            superblock.revision += 1;
-            let mut bytes = hold(&self.superblock_bytes);
-            for volume in &self.volumes {
-                for paths in &volume.superblock_paths {
-                    superblock.write(&self.io, paths, &mut bytes).map_err(|source| StoreError::Io {
-                        action: "writing a superblock",
-                        source,
-                    })?;
-                }
-            }
+            self.save_superblock(&mut superblock)?;
             self.reserved_segment.store(target, Ordering::Release);
         }
         Ok(SegmentNumber(number))

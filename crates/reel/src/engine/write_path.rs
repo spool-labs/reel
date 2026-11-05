@@ -286,8 +286,9 @@ impl<Backend: Io> EngineState<Backend> {
             let mut claims = hold(&volume.claims);
             if let Some(index) = pick_segment(&claims, volume, request) {
                 let Some(ticket) = self.order.try_claim(request.rows) else {
-                    // the ring frees when claims end, and ending one needs this lock
+                    // the ring frees when claims end, and ending one needs this lock, and so does a raise
                     drop(claims);
+                    self.raise_place_limit(request.rows)?;
                     self.io.pause();
                     continue;
                 };

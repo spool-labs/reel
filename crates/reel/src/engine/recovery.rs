@@ -86,7 +86,6 @@ pub struct OwnedColumn {
 pub struct SummaryFound {
     pub rows: SummaryRows,
     pub paths: SummaryPaths,
-    pub mark: WritePlace,
 }
 
 /// A segment with no valid tail and a rows file
@@ -104,7 +103,6 @@ pub struct RootScan<File> {
     pub sealed: Vec<FoundSealed<File>>,
     pub open: Vec<FoundOpen<File>>,
     pub damaged: Vec<FoundDamaged>,
-    pub highest_place: WritePlace,
     pub highest_segment: SegmentNumber,
 }
 
@@ -122,7 +120,6 @@ pub struct RowsScan {
     pub valid_end: FileOffset,
     pub synced_through: FileOffset,
     pub row_count: RowCount,
-    pub highest_place: WritePlace,
 }
 
 /// The rows of a recovered segment so far
@@ -189,7 +186,6 @@ pub fn scan_roots<Backend: Io>(
         sealed: Vec::new(),
         open: Vec::new(),
         damaged: Vec::new(),
-        highest_place: WritePlace(0),
         highest_segment: SegmentNumber(0),
     };
     let mut reader = FooterReader::new();
@@ -221,7 +217,6 @@ pub fn sort_segment<Backend: Io>(
     if let Some(head) = reader.read_tail(&file, record_key, &mut columns)? {
         let mut entries = Vec::new();
         if !reader.read_index(&file, &head, &mut entries)? {
-            scan.highest_place = scan.highest_place.max(head.places.highest);
             // the file stays, and open decides what its ranges are once it has read the summary
             scan.damaged.push(FoundDamaged {
                 volume: listing.volume,
@@ -232,7 +227,6 @@ pub fn sort_segment<Backend: Io>(
             });
             return Ok(());
         }
-        scan.highest_place = scan.highest_place.max(head.places.highest);
         scan.sealed.push(FoundSealed {
             volume: listing.volume,
             path: listing.path.clone(),
@@ -381,9 +375,6 @@ impl<Backend: Io> EngineState<Backend> {
             };
             scan.synced_through = scan.synced_through.max(group.synced_through);
             scan.row_count = RowCount(scan.row_count.0 + group.row_count.0);
-            for row in group.walk() {
-                scan.highest_place = scan.highest_place.max(row.place);
-            }
             scan.valid_end = FileOffset(scan.valid_end.0 + group_length as u64);
         }
         Ok(scan)
@@ -491,9 +482,8 @@ impl<Backend: Io> EngineState<Backend> {
         true
     }
 
-    /// Carry on the write order and the segment numbers from what open found
-    pub fn resume_order(&self, highest_place: WritePlace, highest_segment: SegmentNumber) {
-        self.order.resume_after(highest_place);
+    /// Carry on the segment numbers from what open found
+    pub fn resume_numbers(&self, highest_segment: SegmentNumber) {
         self.next_segment.fetch_max(highest_segment.0 + 1, Ordering::AcqRel);
     }
 }
@@ -502,20 +492,17 @@ impl<Backend: Io> EngineState<Backend> {
 pub fn recover_segments<Backend: Io>(
     state: &Arc<EngineState<Backend>>,
     found: Vec<FoundOpen<Backend::File>>,
-    highest_place: WritePlace,
     highest_segment: SegmentNumber,
 ) -> Result<()> {
     let mut scanned = Vec::with_capacity(found.len());
-    let mut highest = highest_place;
     for open in found {
         let volume = &state.volumes[open.volume];
         let path = &volume.roots[open.root.0 as usize];
         let rows = state.io.open_file(&rows_path(path, open.number))?;
         let scan = state.scan_rows(&rows)?;
-        highest = highest.max(scan.highest_place);
         scanned.push(ScannedOpen { found: open, rows, scan });
     }
-    state.resume_order(highest, highest_segment);
+    state.resume_numbers(highest_segment);
 
     for segment in scanned {
         let index = segment.found.volume;
@@ -733,11 +720,11 @@ pub fn read_summaries<Backend: Io>(
     for (_volume, paths) in roots {
         let summary_paths = SummaryPaths::new(&paths[0]);
         let mut rows = SummaryRows::new(ByteCount(0));
-        let mark = read_summary(io, &summary_paths, &mut rows)?;
+        // the superblock's limit keeps the write order, so open has no use for the summary's mark
+        let _mark = read_summary(io, &summary_paths, &mut rows)?;
         found.push(SummaryFound {
             rows,
             paths: summary_paths,
-            mark: mark.unwrap_or(WritePlace(0)),
         });
     }
     Ok(found)
@@ -748,8 +735,7 @@ pub fn settle_summaries<Backend: Io>(
     state: &EngineState<Backend>,
     sealed: &[FoundSealed<Backend::File>],
     damaged: &[FoundDamaged],
-) -> Result<WritePlace> {
-    let mut highest = WritePlace(0);
+) -> Result<()> {
     for (index, volume) in state.volumes.iter().enumerate() {
         let mut present = BTreeSet::new();
         for found in sealed {
@@ -763,13 +749,7 @@ pub fn settle_summaries<Backend: Io>(
             }
         }
 
-        let mut rows = hold(&volume.summary);
-        rows.keep_where(|row| present.contains(&row.facts.segment));
-        for row in rows.rows() {
-            if row.facts.places.highest.0 != u64::MAX {
-                highest = highest.max(row.facts.places.highest);
-            }
-        }
+        hold(&volume.summary).keep_where(|row| present.contains(&row.facts.segment));
     }
 
     let mut reader = FooterReader::new();
@@ -782,7 +762,7 @@ pub fn settle_summaries<Backend: Io>(
     for volume in &state.volumes {
         state.save_summary(volume)?;
     }
-    Ok(highest)
+    Ok(())
 }
 
 /// Check a sealed segment's row against its tail, and build the row again when it fails
@@ -954,8 +934,10 @@ pub fn fallback_ranges<Backend: Io>(
             head.places.highest
         },
         None => {
-            facts.places.highest = WritePlace(u64::MAX);
-            WritePlace(u64::MAX)
+            // every row a read can find sits at or below the counter at open, and every new write above it
+            let counter = state.order.mark();
+            facts.places.highest = counter;
+            counter
         },
     };
 

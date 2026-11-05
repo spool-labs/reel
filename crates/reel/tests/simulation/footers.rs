@@ -13,7 +13,7 @@ use reel::row_kind::RowKind;
 use reel::segment::block_entry::{BLOCK_ENTRY_BYTES, BlockEntry};
 use reel::segment::footer_reader::{ColumnIndex, FooterAnswer, FooterQuery, FooterReader};
 use reel::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
-use reel::segment::row_block::FooterRow;
+use reel::segment::row_block::{BLOCK_HEADER_BYTES, FooterRow, read_block_header};
 use reel::segment::segment_tail::{
     BlockCount, COPY_GAP_BYTES, ColumnTail, MAX_TAIL_BYTES, SECOND_TAIL_DISTANCE, SegmentNumber, TailHead,
 };
@@ -263,6 +263,22 @@ fn block_rot() {
     let found = find(&written, &mut reader, &loaded, 0, &key_of(0), LATEST);
 
     assert_eq!(found, FooterAnswer::Damaged);
+}
+
+// every row block's header carries the base its rows count from, so a walk needs no tail
+#[test]
+fn header_base() {
+    let written = write_rows(&[(FIRST_COLUMN, ordered_rows())]);
+    let mut reader = FooterReader::new();
+    let loaded = load(&written, &mut reader);
+    assert!(loaded.entries.len() > 1);
+
+    let mut bytes = [0; BLOCK_HEADER_BYTES];
+    for entry in &loaded.entries {
+        written.file.read_exact_at(entry.header_at(), &mut bytes).expect("read");
+        let header = read_block_header(&bytes).expect("header");
+        assert_eq!(header.place_base, loaded.head.place_base);
+    }
 }
 
 // a footer costs about what the index layer budgets on random 32 B keys, filters included

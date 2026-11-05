@@ -232,6 +232,7 @@ impl FooterWriter {
         let header = write_block_header(&BlockHeader {
             block_length: block.len() as u32,
             filter_length: filter_length as u32,
+            place_base: self.place_base,
         });
         let parts = [IoSlice::new(&header), IoSlice::new(block), IoSlice::new(filter)];
         file.write_at(self.position, &parts)?;

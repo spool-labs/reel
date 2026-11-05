@@ -3,6 +3,7 @@ use reel::record::record_check::RecordKey;
 use reel::segment::segment_tail::SegmentNumber;
 use reel::superblock::*;
 use reel_api::column_id::ColumnId;
+use reel_api::units::WritePlace;
 
 fn superblock() -> Superblock {
     Superblock {
@@ -10,6 +11,7 @@ fn superblock() -> Superblock {
         record_key: RecordKey(6),
         revision: 2,
         next_segment: SegmentNumber(700),
+        place_limit: WritePlace(9_000),
         volumes: vec![
             StoredVolume {
                 name: "meta".to_string(),

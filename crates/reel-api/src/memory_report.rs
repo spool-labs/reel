@@ -15,6 +15,7 @@ pub struct MemoryReport {
     pub key_runs: ByteCount,
     pub read_buffers: ByteCount,
     pub copy_buffers: ByteCount,
+    pub compress_buffers: ByteCount,
     pub queues: ByteCount,
     pub footer_space: ByteCount,
     pub thread_stacks: ByteCount,

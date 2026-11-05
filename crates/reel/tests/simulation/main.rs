@@ -4,4 +4,5 @@
 mod io_contract;
 mod records;
 mod write_index;
+mod footers;
 mod spot_index;

@@ -2,6 +2,7 @@
 
 use reel::index::key_hash::{KeyHash, hash_key};
 use reel::index::spot_index::{SpotIndex, SpotLocation, SpotSlot};
+use reel::segment::segment_tail::SegmentNumber;
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
@@ -17,7 +18,7 @@ fn hash_of(number: u64) -> KeyHash {
 
 fn location(number: u64) -> SpotLocation {
     SpotLocation {
-        segment: (number % 1_000) as u32,
+        segment: SegmentNumber(number % 1_000),
         offset: FileOffset(number * 8),
         length: ByteCount(number % 4_096),
         place: WritePlace(number),

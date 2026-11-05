@@ -1,5 +1,9 @@
 //! Sealed segments: footers, filters and row blocks
 
+pub mod block_entry;
 pub mod block_filter;
+pub mod footer_reader;
+pub mod footer_writer;
 pub mod row_block;
+pub mod segment_tail;
 pub mod varint;

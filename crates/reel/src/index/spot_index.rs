@@ -7,6 +7,7 @@ use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::index::key_hash::KeyHash;
 use crate::index::write_index::{SHARD_COUNT, shard_of};
+use crate::segment::segment_tail::SegmentNumber;
 
 /// Slots a key can land in
 pub const BUCKET_SLOTS: usize = 4;
@@ -20,7 +21,7 @@ pub const CLOCK_WORD_BITS: usize = u64::BITS as usize;
 /// One key's location in a sealed segment
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpotLocation {
-    pub segment: u32,
+    pub segment: SegmentNumber,
     pub offset: FileOffset,
     pub length: ByteCount,
     pub place: WritePlace,
@@ -70,7 +71,7 @@ impl SpotSlot {
     /// Read the location back
     pub fn location(&self) -> SpotLocation {
         SpotLocation {
-            segment: self.segment,
+            segment: SegmentNumber(u64::from(self.segment)),
             offset: FileOffset(u64::from(self.offset)),
             length: ByteCount(u64::from(self.length)),
             place: WritePlace(self.place),
@@ -192,13 +193,23 @@ impl SpotIndex {
     pub fn insert(&self, hash: KeyHash, location: &SpotLocation) {
         let shard = shard_of(hash);
         let mut guard = self.write_shard(shard);
-        let index = match guard.find(hash) {
+        let found = guard.find(hash);
+
+        // a slot keeps 32 bits of the number, and an older location must never stay behind
+        let Ok(segment) = u32::try_from(location.segment.0) else {
+            if let Some(index) = found {
+                guard.slots[index] = SpotSlot::empty();
+            }
+            return;
+        };
+
+        let index = match found {
             Some(index) => index,
             None => self.pick_slot(shard, &guard, hash),
         };
         guard.slots[index] = SpotSlot {
             tag: tag_of(hash),
-            segment: location.segment,
+            segment,
             offset: location.offset.0 as u32,
             length: location.length.0 as u32,
             place: location.place.0,

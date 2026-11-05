@@ -35,8 +35,13 @@ pub const MOST_BUFFERED_ROW_BYTES: usize = GROUP_BYTES.0 as usize - GROUP_OVERHE
 /// The most bytes of rows a group's length field can reach
 pub const MOST_GROUP_ROW_BYTES: usize = u32::MAX as usize - GROUP_OVERHEAD_BYTES;
 
-/// The buffers a batch works in: an encoder, the row stage, and each row's record length when it's a long one
-pub type BatchBuffers<'buffers> = (&'buffers mut RecordEncoder, &'buffers mut RowGroupBuffer, &'buffers mut [u32]);
+/// The buffers a batch works in
+pub struct BatchBuffers<'buffers> {
+    pub encoder: &'buffers mut RecordEncoder,
+    pub stage: &'buffers mut RowGroupBuffer,
+    pub records: &'buffers mut [u8],
+    pub lengths: &'buffers mut [u32],
+}
 
 /// What a batch asks of its volume and the write index, read before anything is written
 #[derive(Clone, Copy, Debug)]
@@ -58,19 +63,21 @@ impl<Backend: Io> EngineState<Backend> {
         check_writable(volume)?;
 
         let bytes = self.encoders.with(|encoder| {
-            self.batch_rows.with(|stage| {
+            self.batch_rows.with(|stage| self.batch_records.with(|records| {
                 let bytes = self.measure_batch(volume, batch, encoder)?;
                 self.hold_batch_room(&plan)?;
                 let landed = if plan.row_bytes > MOST_BUFFERED_ROW_BYTES {
                     self.batch_lengths.with(|lengths| {
-                        self.land_batch(volume, batch, &plan, bytes, (encoder, stage, lengths))
+                        let buffers = BatchBuffers { encoder, stage, records, lengths };
+                        self.land_batch(volume, batch, &plan, bytes, buffers)
                     })
                 } else {
-                    self.land_batch(volume, batch, &plan, bytes, (encoder, stage, &mut []))
+                    let buffers = BatchBuffers { encoder, stage, records, lengths: &mut [] };
+                    self.land_batch(volume, batch, &plan, bytes, buffers)
                 };
                 self.index.release_room(&plan.needs);
                 landed.map(|()| bytes)
-            })
+            }))
         })?;
         self.after_write(volume, bytes)
     }
@@ -208,8 +215,9 @@ impl<Backend: Io> EngineState<Backend> {
         batch: &WriteBatch,
         plan: &BatchPlan,
         bytes: ByteCount,
-        (encoder, stage, lengths): BatchBuffers,
+        buffers: BatchBuffers,
     ) -> Result<(), StoreError> {
+        let BatchBuffers { encoder, stage, records, lengths } = buffers;
         let is_long = plan.row_bytes > MOST_BUFFERED_ROW_BYTES;
         let request = ClaimRequest {
             bytes,
@@ -224,6 +232,7 @@ impl<Backend: Io> EngineState<Backend> {
         let mut cursor = start;
 
         let mut kept_lengths = lengths.iter_mut();
+        let mut gathered = GatheredRecords::new(&claim.data, records, claim.offset);
         stage.clear();
         for index in 0..batch.len() {
             let Some(operation) = batch.operation(index) else {
@@ -240,7 +249,14 @@ impl<Backend: Io> EngineState<Backend> {
                         place: cursor.place,
                     };
                     let shape = self.encode_value(encoder, &identity, info.codec, value)?;
-                    let written = encoder.write_to(&claim.data, cursor.offset, &shape, value);
+                    let written = if shape.table_length == 0 {
+                        gathered.add(&encoder.parts(&shape, value))
+                    } else {
+                        gathered.send().and_then(|()| {
+                            gathered.skip_to(FileOffset(cursor.offset.0 + shape.total_length().0));
+                            encoder.write_to(&claim.data, cursor.offset, &shape, value)
+                        })
+                    };
                     encoder.give_shares(&self.stored_shares);
                     if let Err(source) = written {
                         return Err(store_error(volume, "writing a record", source));
@@ -258,6 +274,10 @@ impl<Backend: Io> EngineState<Backend> {
                 let is_staged = stage.push(&row);
                 debug_assert!(is_staged);
             }
+        }
+
+        if let Err(source) = gathered.send() {
+            return Err(store_error(volume, "writing a record", source));
         }
 
         if is_long {
@@ -460,6 +480,55 @@ impl<'batch> Iterator for BatchRows<'batch> {
             BatchOperation::Delete { column, key } => Some(self.cursor.row(column, key, length, RowKind::Grave)),
             BatchOperation::DeleteRange { .. } => None,
         }
+    }
+}
+
+/// A batch's one-chunk records on their way out, gathered so they share a write call
+pub struct GatheredRecords<'work, File: IoFile> {
+    data: &'work File,
+    buffer: &'work mut [u8],
+    start: FileOffset,
+    used: usize,
+}
+
+impl<'work, File: IoFile> GatheredRecords<'work, File> {
+    /// Start gathering at an offset
+    pub fn new(data: &'work File, buffer: &'work mut [u8], start: FileOffset) -> Self {
+        Self {
+            data,
+            buffer,
+            start,
+            used: 0,
+        }
+    }
+
+    /// Copy a record in, sending what's gathered first when it doesn't fit
+    pub fn add(&mut self, parts: &[IoSlice]) -> std::io::Result<()> {
+        let length: usize = parts.iter().map(|part| part.len()).sum();
+        if self.used + length > self.buffer.len() {
+            self.send()?;
+        }
+        for part in parts {
+            self.buffer[self.used..self.used + part.len()].copy_from_slice(part);
+            self.used += part.len();
+        }
+        Ok(())
+    }
+
+    /// Send what's gathered
+    pub fn send(&mut self) -> std::io::Result<()> {
+        if self.used == 0 {
+            return Ok(());
+        }
+        self.data.write_at(self.start, &[IoSlice::new(&self.buffer[..self.used])])?;
+        self.start = FileOffset(self.start.0 + self.used as u64);
+        self.used = 0;
+        Ok(())
+    }
+
+    /// Go on past a record written on its own
+    pub fn skip_to(&mut self, start: FileOffset) {
+        self.start = start;
     }
 }
 

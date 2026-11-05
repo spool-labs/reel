@@ -73,6 +73,7 @@ pub struct EngineState<Backend: Io> {
     pub encoders: Pool<RecordEncoder>,
     pub stored_shares: Pool<Vec<u8>>,
     pub batch_rows: Pool<RowGroupBuffer>,
+    pub batch_records: Pool<Vec<u8>>,
     pub batch_lengths: Pool<Vec<u32>>,
     pub longest_turn: AtomicU64,
     pub record_readers: Pool<RecordReader>,
@@ -292,7 +293,8 @@ impl<Backend: Io> EngineState<Backend> {
         report.compress_buffers = ByteCount(encoders.0 + shares.0);
         let batch_rows = self.batch_rows.heap_bytes(RowGroupBuffer::heap_bytes);
         let batch_lengths = self.batch_lengths.heap_bytes(|lengths| ByteCount((lengths.capacity() * size_of::<u32>()) as u64));
-        report.queues = ByteCount(report.queues.0 + batch_rows.0 + batch_lengths.0);
+        let batch_records = self.batch_records.heap_bytes(|records| ByteCount(records.capacity() as u64));
+        report.queues = ByteCount(report.queues.0 + batch_rows.0 + batch_records.0 + batch_lengths.0);
         for queue in &self.queues {
             report.queues = ByteCount(report.queues.0 + hold(queue).filling.heap_bytes().0);
         }

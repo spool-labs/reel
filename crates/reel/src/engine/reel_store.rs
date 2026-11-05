@@ -16,7 +16,7 @@ use crate::config::{ColumnConfig, StoreConfig};
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
     EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, PLANNED_COLUMN_BYTES, PLANNED_LINE_BYTES,
-    PLANNED_SEGMENT_BYTES, StoreShape, READ_BUFFERS, WRITE_BUFFERS,
+    PLANNED_SEGMENT_BYTES, StoreShape, GATHER_BYTES, READ_BUFFERS, WRITE_BUFFERS,
 };
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
 use crate::engine::open_segment::{RowQueue, fits_a_segment_path};
@@ -760,6 +760,7 @@ pub fn build_state<Backend: Io>(
         encoders: Pool::new(encoders),
         stored_shares: Pool::new(shares),
         batch_rows: Pool::new((0..WRITE_BUFFERS).map(|_buffer| RowGroupBuffer::new(GROUP_BYTES)).collect()),
+        batch_records: Pool::new((0..WRITE_BUFFERS).map(|_buffer| touched_zeroes(GATHER_BYTES)).collect()),
         batch_lengths: Pool::new(vec![touched_filled(sizing.segment_rows.0 as usize, 0)]),
         longest_turn: AtomicU64::new(0),
         record_readers: Pool::new(record_readers),

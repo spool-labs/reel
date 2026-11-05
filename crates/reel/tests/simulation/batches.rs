@@ -47,6 +47,10 @@ const ROOM_ROWS: u64 = 2_000;
 const LONG_ROWS: u64 = 18_000;
 const LONG_CRASH_POINTS: u64 = 6;
 const LONG_PIECES: u64 = 3;
+const GATHERED_ROWS: u64 = 100;
+const SMALL_VALUE: usize = 100;
+const SPLIT_ROWS: u64 = 200;
+const SPLIT_VALUE: usize = 5_000;
 const LEFT_ON_DISK: u64 = 4_096;
 const SMALL_DISK: ByteCount = ByteCount(256 * 1024 * 1024);
 const PAST_FIRST_PIECE: u64 = 300_000;
@@ -971,4 +975,53 @@ fn unread_row() {
 
     assert!(walked.is_err());
     io.close_file(file);
+}
+
+// small records share a write call, and a chunked record between them goes out on its own at the right offset
+#[test]
+fn few_writes() {
+    let io = SimulatedIo::new(Seed(31));
+    let store = open(&io);
+    store.put(PLAIN, b"first", b"value").expect("put");
+    let mut batch = WriteBatch::new();
+    for number in 0..GATHERED_ROWS {
+        batch.put(PLAIN, &key_of(number), &[number as u8; SMALL_VALUE]);
+    }
+
+    let before = io.write_calls();
+    store.write_batch(&batch).expect("batch");
+    let calls = io.write_calls().0 - before.0;
+
+    assert_eq!(calls, 1);
+    for number in 0..GATHERED_ROWS {
+        assert_eq!(read(&store, PLAIN, &key_of(number)).expect("get"), Some(vec![number as u8; SMALL_VALUE]));
+    }
+    store.close().expect("close");
+}
+
+// records past one buffer, and a chunked one between small ones, keep their offsets across the write calls
+#[test]
+fn split_writes() {
+    let io = SimulatedIo::new(Seed(32));
+    let store = open(&io);
+    let large: Vec<u8> = (0..LARGE_VALUE_BYTES).map(|index| ((index * 7) >> 2) as u8).collect();
+    let mut batch = WriteBatch::new();
+    for number in 0..SPLIT_ROWS {
+        batch.put(PLAIN, &key_of(number), &[number as u8; SPLIT_VALUE]);
+        if number == SPLIT_ROWS / 2 {
+            batch.put(PLAIN, b"large", &large);
+        }
+    }
+
+    store.write_batch(&batch).expect("batch");
+    store.flush().expect("flush");
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+    assert_eq!(read(&store, PLAIN, b"large").expect("get"), Some(large));
+    for number in 0..SPLIT_ROWS {
+        assert_eq!(read(&store, PLAIN, &key_of(number)).expect("get"), Some(vec![number as u8; SPLIT_VALUE]));
+    }
+    store.close().expect("close");
 }

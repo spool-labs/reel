@@ -91,6 +91,7 @@ pub struct FooterReader {
     filter: Vec<u8>,
     key: Vec<u8>,
     pub candidates: Vec<SegmentNumber>,
+    pub found_block: u32,
 }
 
 impl FooterReader {
@@ -102,6 +103,7 @@ impl FooterReader {
             filter: touched_zeroes(ROW_BLOCK_BYTES),
             key: touched_capacity(ROW_BLOCK_BYTES, 0),
             candidates: touched_capacity(CANDIDATE_PAGE, SegmentNumber(0)),
+            found_block: 0,
         }
     }
 
@@ -297,7 +299,10 @@ impl FooterReader {
 
             match self.search_cached(file, read, &entry, caches, query)? {
                 FooterAnswer::Absent => {},
-                answer => return Ok(answer),
+                answer => {
+                    self.found_block = entry.block_offset;
+                    return Ok(answer);
+                },
             }
         }
         Ok(FooterAnswer::Absent)

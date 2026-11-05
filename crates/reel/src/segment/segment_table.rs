@@ -297,6 +297,41 @@ impl<File: Clone> SegmentTable<File> {
         })
     }
 
+    /// Take a block's dead rows off its live count
+    pub fn drop_live(&self, number: SegmentNumber, block: u32, rows: u32) {
+        let mut guard = self.write_shard(shard_of(number));
+        let Some(slot) = guard.map.get(number) else {
+            return;
+        };
+        let Some(start) = guard.segments[slot as usize].as_ref().map(|entry| entry.blocks.start) else {
+            return;
+        };
+        if let Some(line) = guard.blocks.get_mut(start as usize + block as usize) {
+            line.live_rows = line.live_rows.saturating_sub(rows);
+        }
+    }
+
+    /// Find which of a segment's blocks starts at an offset in its file
+    pub fn block_at(&self, number: SegmentNumber, offset: u32) -> Option<u32> {
+        let guard = self.read_shard(shard_of(number));
+        let slot = guard.map.get(number)?;
+        let entry = guard.segments[slot as usize].as_ref()?;
+        let first = entry.blocks.start as usize;
+        let lines = guard.blocks.get(first..first + entry.blocks.length as usize)?;
+        let index = lines.partition_point(|line| line.block_offset < offset);
+        lines.get(index).filter(|line| line.block_offset == offset).map(|_line| index as u32)
+    }
+
+    /// Add up a segment's live rows, block by block
+    pub fn live_rows(&self, number: SegmentNumber) -> Option<u64> {
+        let guard = self.read_shard(shard_of(number));
+        let slot = guard.map.get(number)?;
+        let entry = guard.segments[slot as usize].as_ref()?;
+        let first = entry.blocks.start as usize;
+        let lines = guard.blocks.get(first..first + entry.blocks.length as usize)?;
+        Some(lines.iter().map(|line| u64::from(line.live_rows)).sum())
+    }
+
     /// Note a segment's walk has finished, so other walks may count against it
     pub fn mark_walked(&self, number: SegmentNumber) {
         let mut guard = self.write_shard(shard_of(number));

@@ -31,6 +31,7 @@ pub const MOST_READ_TRIES: u32 = 64;
 pub struct SealedRow {
     pub segment: SegmentNumber,
     pub row: FooterRow,
+    pub block_offset: u32,
 }
 
 /// Where a key's newest row sits
@@ -441,7 +442,7 @@ impl<Backend: Io> EngineState<Backend> {
         while let Some(found) = self.search_segment(volume, &point, segment, &pin, reader)? {
             if found.kind != RowKind::RangeDelete {
                 if best.is_none_or(|current| current.row.place < found.place) {
-                    *best = Some(SealedRow { segment, row: found });
+                    *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block });
                 }
                 return Ok(());
             }
@@ -526,7 +527,7 @@ impl<Backend: Io> EngineState<Backend> {
         if let Some(found) = row
             && best.is_none_or(|current| current.row.place < found.place)
         {
-            *best = Some(SealedRow { segment, row: found });
+            *best = Some(SealedRow { segment, row: found, block_offset: reader.found_block });
         }
         Ok(())
     }

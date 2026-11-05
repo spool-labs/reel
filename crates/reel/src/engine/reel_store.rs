@@ -374,10 +374,15 @@ pub fn bring_up<Backend: Io>(
         state.install_sealed(volume, found).map_err(open_error("installing a segment"))?;
         scan.sealed.pop();
     }
-    // a walk counts only against finished segments, which the rows name once the table holds them
+    // the rows name finished segments and dead rows a block, which go to the table once it holds them
     for volume in &state.volumes {
-        for row in hold(&volume.summary).rows().filter(|row| row.facts.is_walked()) {
-            volume.table.mark_walked(row.facts.segment);
+        for row in hold(&volume.summary).rows() {
+            if row.facts.is_walked() {
+                volume.table.mark_walked(row.facts.segment);
+            }
+            for (block, dead) in row.dead_blocks() {
+                volume.table.drop_live(row.facts.segment, block, dead);
+            }
         }
     }
     recover_segments(state, scan).map_err(open_error("recovering a segment"))?;

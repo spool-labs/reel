@@ -225,8 +225,9 @@ fn walk_counts() {
     let count = DeadCount {
         segment: SegmentNumber(1),
         column: ColumnId(2),
-        rows: RowCount(2),
-        graves: RowCount(1),
+        block: 3,
+        rows: 2,
+        graves: 1,
         bytes: ByteCount(30),
         kept_bytes: ByteCount(0),
     };
@@ -239,6 +240,7 @@ fn walk_counts() {
     assert_eq!((facts_of.dead_rows, facts_of.dead_graves), (RowCount(2), RowCount(1)));
     assert_eq!((facts_of.live_bytes, facts_of.dead_bytes), (ByteCount(20), ByteCount(30)));
     assert_eq!(counted.facts.walked_blocks, 3);
+    assert_eq!(counted.dead_blocks().collect::<Vec<_>>(), [(3, 2)]);
     assert_eq!(rows.get(SegmentNumber(3)).expect("a row").facts.walked_blocks, 5);
     let other = rows.get(SegmentNumber(2)).expect("a row");
     assert_eq!(other.cursor().column().expect("a column").dead_rows, RowCount(0));

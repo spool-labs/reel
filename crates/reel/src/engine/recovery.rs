@@ -210,7 +210,9 @@ impl<File> RootScan<File> {
         let others = self.damaged.iter().filter(|found| found.volume == volume).count()
             + self.open.iter().filter(|found| found.volume == volume).count()
             + self.empty.iter().filter(|found| found.volume == volume).count();
-        (sealed + others) * MOST_ROW_FIXED_BYTES + (sealed_columns + others * columns) * MOST_ROW_COLUMN_BYTES
+        let sealed_blocks: usize = self.sealed.iter().filter(|found| found.volume == volume).map(|found| found.entries.len()).sum();
+        let fixed = (sealed + others) * MOST_ROW_FIXED_BYTES + sealed_blocks * size_of::<u32>();
+        fixed + (sealed_columns + others * columns) * MOST_ROW_COLUMN_BYTES
     }
 
     /// Work out the table room each volume needs for what was found

@@ -114,6 +114,14 @@ fn counts(store: &Store, number: SegmentNumber) -> (RowCount, RowCount) {
     (column.row_count, column.dead_rows)
 }
 
+// the block lines add up to the same live rows as the row's column
+fn assert_blocks(store: &Store, segments: &[SegmentNumber]) {
+    for number in segments {
+        let (rows, dead) = counts(store, *number);
+        assert_eq!(store.state.volumes[0].table.live_rows(*number), Some(rows.0 - dead.0));
+    }
+}
+
 fn live_rows(store: &Store, segments: &[SegmentNumber]) -> u64 {
     segments.iter().map(|number| counts(store, *number)).map(|(rows, dead)| rows.0 - dead.0).sum()
 }
@@ -150,6 +158,7 @@ fn lagging_walk() {
     assert_eq!(store.state.pending_walks(0), 0);
     assert_eq!(counts(&store, first).1, RowCount(1));
     assert_eq!(counts(&store, second).1, RowCount(0));
+    assert_blocks(&store, &[first, second]);
     store.close().expect("close");
 }
 
@@ -176,6 +185,7 @@ fn every_seal_order() {
 
             let newest = counts(&store, segments[2]);
             assert_eq!(live_rows(&store, &segments), 2, "order {order:?}");
+            assert_blocks(&store, &segments);
             assert_eq!(newest.0.0 - newest.1.0, newest.0.0, "order {order:?}");
             store.close().expect("close");
         }
@@ -197,6 +207,7 @@ fn versions_across_blocks() {
 
     assert_eq!(counts(&store, older).1, RowCount(1));
     assert_eq!(counts(&store, newer), (RowCount(LONG_KEYS + VERSIONS), RowCount(VERSIONS - 1)));
+    assert_blocks(&store, &[older, newer]);
     store.close().expect("close");
 }
 
@@ -229,6 +240,7 @@ fn walk_resumes() {
 
     assert_eq!(counts(&store, older).1, RowCount(1));
     assert_eq!(counts(&store, newer), (RowCount(LONG_KEYS + VERSIONS), RowCount(VERSIONS - 1)));
+    assert_blocks(&store, &[older, newer]);
     store.close().expect("close");
 }
 
@@ -260,6 +272,29 @@ fn older_copy_row() {
 
         assert_eq!(counts(&store, older).1, RowCount(1));
         assert_eq!(counts(&store, newer).1, RowCount(0));
+        assert_blocks(&store, &[older, newer]);
         store.close().expect("close");
     }
+}
+
+// a reopen brings each block's dead rows back from the summary
+#[test]
+fn blocks_reopen() {
+    let io = SimulatedIo::new(Seed(13));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"older").expect("put");
+    let older = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, older);
+    store.put(COLUMN, b"key", b"newer").expect("put");
+    let newer = hold(&store.state.volumes[0].claims).open[0].number;
+    seal_segment(&store, &io, newer);
+    settle(&io);
+    store.close().expect("close");
+    drop(store);
+
+    let store = open(&io);
+
+    assert_eq!(counts(&store, older).1, RowCount(1));
+    assert_blocks(&store, &[older, newer]);
+    store.close().expect("close");
 }

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use reel_api::column_id::ColumnId;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, Nanoseconds, RowCount, WritePlace};
+use reel_api::units::{ByteCount, Nanoseconds, WritePlace};
 
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::engine_state::EngineState;
@@ -31,6 +31,8 @@ use crate::segment::summary::DeadCount;
 
 /// How long a walk waits after a failed read before it tries the block again
 pub const WALK_RETRY: Nanoseconds = Nanoseconds(1_000_000_000);
+/// How far back a count looks for an entry to add to
+pub const COUNT_SEARCH: usize = 32;
 
 /// The segment a walk is on
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,6 +116,9 @@ impl<Backend: Io> WalkJob<Backend> {
 
         self.counts.sort_unstable_by_key(|count| count.segment);
         hold(&volume.summary).apply_walk(target.segment, next_block, &self.counts);
+        for count in self.counts.iter().filter(|count| count.rows > 0) {
+            volume.table.drop_live(count.segment, count.block, count.rows);
+        }
         if next_block < target.block_count {
             self.target = Some(WalkTarget { next_block, ..target });
             return Ok(());
@@ -173,11 +178,11 @@ impl<Backend: Io> WalkJob<Backend> {
                 continue;
             }
             if target.is_backward {
-                add_count(&mut self.counts, target.segment, block.column, &row, false);
+                add_count(&mut self.counts, target.segment, block.column, target.next_block, &row, false);
             }
             let is_top = self.last_column != Some(block.column) || self.last_key != self.key;
             if !is_top {
-                add_count(&mut self.counts, target.segment, block.column, &row, true);
+                add_count(&mut self.counts, target.segment, block.column, target.next_block, &row, true);
                 continue;
             }
 
@@ -193,10 +198,12 @@ impl<Backend: Io> WalkJob<Backend> {
             };
             match newest {
                 Some(found) if found.row.place > row.place => {
-                    add_count(&mut self.counts, target.segment, block.column, &row, true);
+                    add_count(&mut self.counts, target.segment, block.column, target.next_block, &row, true);
                 },
                 Some(found) if !target.is_backward => {
-                    add_count(&mut self.counts, found.segment, block.column, &found.row, true);
+                    if let Some(index) = volume.table.block_at(found.segment, found.block_offset) {
+                        add_count(&mut self.counts, found.segment, block.column, index, &found.row, true);
+                    }
                 },
                 Some(_) | None => {},
             }
@@ -230,13 +237,24 @@ impl<Backend: Io> Job for WalkJob<Backend> {
 
 /// Add one row to a block's counts. A dead row moves its bytes from live to dead, and a backward walk first adds
 /// every row's bytes as live, since it rebuilds them
-pub fn add_count(counts: &mut Vec<DeadCount>, segment: SegmentNumber, column: ColumnId, row: &FooterRow, is_dead: bool) {
-    let index = match counts.iter().rposition(|count| count.segment == segment && count.column == column) {
-        Some(index) => index,
+pub fn add_count(
+    counts: &mut Vec<DeadCount>,
+    segment: SegmentNumber,
+    column: ColumnId,
+    block: u32,
+    row: &FooterRow,
+    is_dead: bool,
+) {
+    // keys run in order, so a repeat is near the end, and a miss only costs another entry
+    let recent = counts.len().saturating_sub(COUNT_SEARCH);
+    let found = counts[recent..].iter().rposition(|count| count.segment == segment && count.block == block);
+    let index = match found {
+        Some(index) => recent + index,
         None => {
             counts.push(DeadCount {
                 segment,
                 column,
+                block,
                 ..DeadCount::default()
             });
             counts.len() - 1
@@ -247,7 +265,7 @@ pub fn add_count(counts: &mut Vec<DeadCount>, segment: SegmentNumber, column: Co
         count.kept_bytes = ByteCount(count.kept_bytes.0 + row.length.0);
         return;
     }
-    count.rows = RowCount(count.rows.0 + 1);
-    count.graves = RowCount(count.graves.0 + u64::from(row.kind == RowKind::Grave));
+    count.rows += 1;
+    count.graves += u32::from(row.kind == RowKind::Grave);
     count.bytes = ByteCount(count.bytes.0 + row.length.0);
 }

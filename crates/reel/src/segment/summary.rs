@@ -105,13 +105,15 @@ pub struct ColumnFacts<'key> {
     pub dead_bytes: ByteCount,
 }
 
-/// One walk step's dead rows in one column of one segment
+/// One walk step's dead rows in one row block of one segment. A row keeps dead rows a block, which start at zero, and a
+/// block's live rows are what its line says less these
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DeadCount {
     pub segment: SegmentNumber,
     pub column: ColumnId,
-    pub rows: RowCount,
-    pub graves: RowCount,
+    pub block: u32,
+    pub rows: u32,
+    pub graves: u32,
     pub bytes: ByteCount,
     pub kept_bytes: ByteCount,
 }
@@ -134,6 +136,7 @@ pub struct SummaryRows {
 #[derive(Clone, Copy, Debug)]
 pub struct SummaryRow<'bytes> {
     pub facts: SegmentFacts,
+    pub block_dead: &'bytes [u8],
     pub column_count: u16,
     pub span_count: u16,
     pub body: &'bytes [u8],
@@ -217,6 +220,13 @@ impl<'bytes> RowCursor<'bytes> {
 }
 
 impl<'bytes> SummaryRow<'bytes> {
+    /// Walk the blocks with dead rows, as each block's index and its count
+    pub fn dead_blocks(&self) -> impl Iterator<Item = (u32, u32)> + 'bytes {
+        let counts = self.block_dead.chunks_exact(size_of::<u32>());
+        let dead = counts.map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        dead.enumerate().filter(|(_block, dead)| *dead > 0).map(|(block, dead)| (block as u32, dead))
+    }
+
     /// Walk the row's columns, then its spans
     pub fn cursor(&self) -> RowCursor<'bytes> {
         RowCursor { bytes: self.body }
@@ -262,7 +272,7 @@ impl SummaryRows {
         let column_count = columns.clone().count();
         let span_count = spans.clone().count();
         debug_assert!(span_count < usize::from(NO_END) && column_count < usize::from(NO_END));
-        let body = row_bytes(columns.clone(), spans.clone());
+        let body = row_bytes(facts.block_count, columns.clone(), spans.clone());
         if self.bytes.len() + ROW_HEAD_BYTES + body + ROW_SUM_BYTES > self.bytes.capacity() {
             return false;
         }
@@ -271,6 +281,7 @@ impl SummaryRows {
         self.bytes.extend_from_slice(&row_head(body as u32));
         let body_at = self.bytes.len();
         self.put_facts(facts, column_count as u16, span_count as u16);
+        self.bytes.resize(self.bytes.len() + facts.block_count as usize * size_of::<u32>(), 0);
         for column in columns {
             self.bytes.push(column.column.0);
             self.bytes.extend_from_slice(&(column.lowest.len() as u16).to_le_bytes());
@@ -306,7 +317,7 @@ impl SummaryRows {
                 dropped += 1;
             } else {
                 // reserve counts from the length, so this asks past what's there, however little that is
-                self.bytes.reserve(self.bytes.capacity() + MOST_ROW_FIXED_BYTES + row_bytes(columns.clone(), spans.clone()));
+                self.bytes.reserve(self.bytes.capacity() + MOST_ROW_FIXED_BYTES + row_bytes(facts.block_count, columns.clone(), spans.clone()));
             }
         }
         dropped
@@ -407,14 +418,17 @@ impl SummaryRows {
     pub fn apply_walk(&mut self, walked: SegmentNumber, blocks: u32, counts: &[DeadCount]) {
         let mut at = 0;
         while let Some((length, row)) = read_row(&self.bytes[at..]) {
-            let found = row.map(|row| (row.facts.segment, row.column_count));
-            if let Some((number, column_count)) = found {
+            let found = row.map(|row| (row.facts.segment, row.column_count, row.facts.block_count));
+            if let Some((number, column_count, block_count)) = found {
                 let first = counts.partition_point(|count| count.segment < number);
                 let mine = counts[first..].iter().take_while(|count| count.segment == number);
                 let body_at = at + ROW_HEAD_BYTES;
                 let has_counts = mine.clone().next().is_some();
                 for count in mine {
-                    self.add_dead(body_at, column_count, count);
+                    let field = body_at + ROW_FACT_BYTES + count.block as usize * size_of::<u32>();
+                    let dead = read_half(&self.bytes, field).unwrap_or(0) + count.rows;
+                    self.bytes[field..field + size_of::<u32>()].copy_from_slice(&dead.to_le_bytes());
+                    self.add_dead(body_at + block_count as usize * size_of::<u32>(), column_count, count);
                 }
                 if number == walked {
                     let field = body_at + WALKED_BLOCKS_AT;
@@ -435,12 +449,14 @@ impl SummaryRows {
     pub fn restart_backward(&mut self, segment: SegmentNumber) {
         let mut at = 0;
         while let Some((length, row)) = read_row(&self.bytes[at..]) {
-            let found = row.filter(|row| row.facts.segment == segment).map(|row| row.column_count);
-            if let Some(column_count) = found {
+            let found = row.filter(|row| row.facts.segment == segment).map(|row| (row.column_count, row.facts.block_count));
+            if let Some((column_count, block_count)) = found {
                 let body_at = at + ROW_HEAD_BYTES;
                 self.bytes[body_at + WALKED_BLOCKS_AT..body_at + WALKED_BLOCKS_AT + size_of::<u32>()].fill(0);
                 self.bytes[body_at + ROW_FLAGS_AT] |= 1 << IS_BACKWARD_BIT;
-                let mut column_at = body_at + ROW_FACT_BYTES;
+                let blocks_length = block_count as usize * size_of::<u32>();
+                self.bytes[body_at + ROW_FACT_BYTES..body_at + ROW_FACT_BYTES + blocks_length].fill(0);
+                let mut column_at = body_at + ROW_FACT_BYTES + blocks_length;
                 for _column in 0..column_count {
                     let lowest = read_short(&self.bytes[column_at + COLUMN_LOWEST_AT..]);
                     let bound = read_short(&self.bytes[column_at + COLUMN_BOUND_AT..]);
@@ -456,7 +472,8 @@ impl SummaryRows {
         }
     }
 
-    /// Add one count to its column in a row, leaving the row's checksum to the caller
+    /// Add one count to its column in a row, leaving the row's checksum to the caller. The offset passes the row's block
+    /// counts
     pub fn add_dead(&mut self, body_at: usize, column_count: u16, count: &DeadCount) {
         let mut column_at = body_at + ROW_FACT_BYTES;
         for _column in 0..column_count {
@@ -464,8 +481,8 @@ impl SummaryRows {
             let bound = read_short(&self.bytes[column_at + COLUMN_BOUND_AT..]);
             if self.bytes[column_at] == count.column.0 {
                 let words = column_at + COLUMN_DEAD_AT;
-                self.change_word(words, |rows| rows + count.rows.0);
-                self.change_word(words + size_of::<u64>(), |graves| graves + count.graves.0);
+                self.change_word(words, |rows| rows + u64::from(count.rows));
+                self.change_word(words + size_of::<u64>(), |graves| graves + u64::from(count.graves));
                 self.change_word(words + 2 * size_of::<u64>(), |live| (live + count.kept_bytes.0).saturating_sub(count.bytes.0));
                 self.change_word(words + 3 * size_of::<u64>(), |dead| dead + count.bytes.0);
                 return;
@@ -608,10 +625,11 @@ pub fn write_span(out: &mut [u8], span: &SpanFacts) -> usize {
 
 /// Work out the bytes of a row's body
 pub fn row_bytes<'key>(
+    block_count: u32,
     columns: impl Iterator<Item = ColumnFacts<'key>>,
     spans: impl Iterator<Item = SpanFacts<'key>>,
 ) -> usize {
-    let mut body: usize = ROW_FACT_BYTES;
+    let mut body: usize = ROW_FACT_BYTES + block_count as usize * size_of::<u32>();
     for column in columns {
         body += COLUMN_FIXED_BYTES + column.lowest.len() + column.bound.len();
     }
@@ -707,6 +725,7 @@ pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
     let damage_place = WritePlace(cursor.word()?);
     let block_count = cursor.half()?;
     let walked_blocks = cursor.half()?;
+    let block_dead = cursor.take(block_count as usize * size_of::<u32>())?;
     let facts = SegmentFacts {
         segment,
         file_length,
@@ -723,6 +742,7 @@ pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
     };
     Some(SummaryRow {
         facts,
+        block_dead,
         column_count,
         span_count,
         body: cursor.bytes,

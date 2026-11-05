@@ -3,6 +3,7 @@
 
 mod allocations;
 mod batches;
+mod compaction;
 mod counting;
 mod cues;
 mod damage;

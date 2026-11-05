@@ -61,12 +61,20 @@ fn config(budget: ByteCount) -> StoreConfig {
 }
 
 fn open(io: &SimulatedIo) -> Store {
-    ReelStore::open(io.clone(), &config(BUDGET)).expect("open")
+    held(ReelStore::open(io.clone(), &config(BUDGET)).expect("open"))
 }
 
 // a key's rows all sit in one shard, so a long run of them needs a large index
 fn open_large(io: &SimulatedIo) -> Store {
-    ReelStore::open(io.clone(), &config(LARGE_BUDGET)).expect("open")
+    held(ReelStore::open(io.clone(), &config(LARGE_BUDGET)).expect("open"))
+}
+
+// these tests read the counts of segments compaction would take away
+fn held(store: Store) -> Store {
+    for volume in &store.state.volumes {
+        volume.is_compaction_held.store(true, Ordering::Release);
+    }
+    store
 }
 
 fn settle(io: &SimulatedIo) {
@@ -481,7 +489,7 @@ fn turn_with(seed: Seed) {
         codec: Codec::None,
         volume: VolumeId(1),
     });
-    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let store = held(ReelStore::open(io.clone(), &config).expect("open"));
     io.hold_jobs(WALK_JOB, true);
     store.put(COLUMN, b"key", b"value").expect("put");
     store.put(SECOND_COLUMN, b"key", b"value").expect("put");
@@ -494,6 +502,7 @@ fn turn_with(seed: Seed) {
     let mut planner = Planner {
         state: store.state.clone(),
         walks,
+        compactions: Vec::new(),
         last: 0,
     };
 
@@ -607,6 +616,7 @@ fn stands_aside_for_seals() {
     let mut planner = Planner {
         state: store.state.clone(),
         walks: vec![WalkJob::new(store.state.clone(), 0)],
+        compactions: Vec::new(),
         last: 0,
     };
     assert!(!planner.is_seal_first());

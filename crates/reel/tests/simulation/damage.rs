@@ -1159,9 +1159,10 @@ fn wide_config(budget: ByteCount) -> StoreConfig {
 fn rows_fit() {
     let io = SimulatedIo::new(Seed(39));
     let store = ReelStore::open(io.clone(), &wide_config(WIDE_BUDGET)).expect("open");
-    for _segment in 0..WIDE_SEGMENTS {
+    for segment in 0..WIDE_SEGMENTS {
         for id in 1..=WIDE_COLUMNS {
-            store.put(ColumnId(id), &[b'k'; 40], b"value").expect("put");
+            // a key of its own a segment, so compaction leaves every one
+            store.put(ColumnId(id), &key_of_segment(segment), b"value").expect("put");
         }
         seal(&store, &io);
     }
@@ -1799,4 +1800,10 @@ fn save_crash() {
             assert_eq!(copy.header_mark, copy.trailer_mark, "crash at {crash_at}");
         }
     }
+}
+
+fn key_of_segment(segment: u64) -> Vec<u8> {
+    let mut key = vec![b'k'; 40];
+    key[..8].copy_from_slice(&segment.to_le_bytes());
+    key
 }

@@ -13,7 +13,7 @@ use reel_api::value_list::ValueList;
 
 use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::RecordWant;
-use crate::io::Io;
+use crate::io::{Io, IoTask};
 
 /// The most cues a store holds at once
 pub const MOST_CUES: usize = 64;
@@ -144,5 +144,12 @@ impl<Backend: Io> Cue<Backend> {
 impl<Backend: Io> Drop for Cue<Backend> {
     fn drop(&mut self) {
         self.state.cues.release(self.slot);
+        // what this cue kept can go now, and nothing else would look again
+        for volume in &self.state.volumes {
+            volume.wants_compaction.store(true, Ordering::Release);
+        }
+        if let Some(task) = self.state.planner_task.get() {
+            task.wake();
+        }
     }
 }

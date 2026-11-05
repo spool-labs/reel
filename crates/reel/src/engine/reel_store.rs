@@ -30,6 +30,7 @@ use crate::engine::recovery::{
 use crate::engine::reserve_job::ReserveJob;
 use crate::engine::row_job::RowJob;
 use crate::engine::seal_job::SealJob;
+use crate::engine::compact_job::CompactJob;
 use crate::engine::cue::{Cue, CueTable};
 use crate::engine::planner::Planner;
 use crate::engine::walk_job::WalkJob;
@@ -436,14 +437,17 @@ pub fn bring_up<Backend: Io>(
         let _set = state.seal_tasks[volume].set(task);
     }
     let mut walks = Vec::with_capacity(state.volumes.len());
+    let mut compactions = Vec::with_capacity(state.volumes.len());
     for volume in 0..state.volumes.len() {
         let walk = WalkJob::new(Arc::clone(state), volume);
         state.seal_heap.fetch_add(walk.heap_bytes().0, Ordering::AcqRel);
         walks.push(walk);
+        compactions.push(CompactJob::new(Arc::clone(state), volume));
     }
     let planner = Planner {
         state: Arc::clone(state),
         walks,
+        compactions,
         last: 0,
     };
     let task = state.io.spawn_job("reel-planner", planner).map_err(open_error("starting a job"))?;
@@ -774,6 +778,9 @@ pub fn build_state<Backend: Io>(
             segment_rows: sizing.segment_rows,
             walk_retries: AtomicU64::new(0),
             walks_waiting: AtomicU64::new(0),
+            wants_compaction: AtomicBool::new(true),
+            is_compaction_held: AtomicBool::new(false),
+            segments_unlinked: AtomicU64::new(0),
             reserve: ByteCount(sizing.segment_bytes.0 * 2),
             summary: Mutex::new(summary.rows),
             summary_paths: summary.paths,

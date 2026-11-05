@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 
 use reel_api::units::Nanoseconds;
 
+use crate::engine::compact_job::CompactJob;
 use crate::engine::engine_state::EngineState;
 use crate::engine::open_segment::{OpenSegment, SegmentPhase};
 use crate::engine::volume::Volume;
@@ -40,6 +41,7 @@ pub enum UnitStep {
 pub struct Planner<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
     pub walks: Vec<WalkJob<Backend>>,
+    pub compactions: Vec<CompactJob<Backend>>,
     pub last: usize,
 }
 
@@ -78,6 +80,18 @@ impl<Backend: Io> Job for Planner<Backend> {
         for turn in 0..count {
             let index = (first + turn) % count;
             match self.walks[index].step_unit(now) {
+                UnitStep::Worked => {
+                    self.last = index;
+                    return JobStep::Worked;
+                },
+                UnitStep::Idle => {},
+                UnitStep::RetryAt(at) => soonest = Some(soonest.map_or(at, |other| Nanoseconds(other.0.min(at.0)))),
+            }
+        }
+        // compaction comes after every walk: it goes by counts the walks are still making
+        for turn in 0..self.compactions.len() {
+            let index = (first + turn) % self.compactions.len();
+            match self.compactions[index].step_unit(now) {
                 UnitStep::Worked => {
                     self.last = index;
                     return JobStep::Worked;

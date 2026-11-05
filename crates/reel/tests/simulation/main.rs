@@ -1,6 +1,8 @@
 //! Deterministic simulation: the engine on a simulated disk, clock and scheduler
 #![cfg(test)]
 
+mod allocations;
+mod counting;
 mod damage;
 mod io_contract;
 mod place_limit;

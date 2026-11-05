@@ -7,6 +7,7 @@ use reel_api::units::{ByteCount, FileOffset, ProcessId};
 
 use reel::guard::hold;
 use reel::io::IoFile;
+use crate::count_pause::CountPause;
 use crate::simulated_disk::{HandleId, InodeNumber, OperationCount, SimulatedDisk};
 
 /// A handle that only works until its close, and only for the process that opened it
@@ -57,6 +58,7 @@ impl SimulatedFile {
 
 impl IoFile for SimulatedFile {
     fn read_at(&self, offset: FileOffset, buf: &mut [u8]) -> Result<ByteCount> {
+        let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         self.check(&mut disk, false)?;
         if disk.failing_reads.0 > 0 {
@@ -80,6 +82,7 @@ impl IoFile for SimulatedFile {
     }
 
     fn read_exact_at(&self, offset: FileOffset, buf: &mut [u8]) -> Result<()> {
+        let _pause = CountPause::new();
         let count = self.read_at(offset, buf)?;
         if count.0 < buf.len() as u64 {
             return Err(Error::from(ErrorKind::UnexpectedEof));
@@ -88,6 +91,7 @@ impl IoFile for SimulatedFile {
     }
 
     fn read_parts_at(&self, offset: FileOffset, parts: &mut [IoSliceMut]) -> Result<()> {
+        let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         self.check(&mut disk, false)?;
 
@@ -115,6 +119,7 @@ impl IoFile for SimulatedFile {
     }
 
     fn write_at(&self, offset: FileOffset, parts: &[IoSlice]) -> Result<()> {
+        let _pause = CountPause::new();
         let mut bytes = Vec::new();
         for part in parts {
             bytes.extend_from_slice(part);
@@ -154,6 +159,7 @@ impl IoFile for SimulatedFile {
     }
 
     fn sync(&self) -> Result<()> {
+        let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         self.check(&mut disk, false)?;
 
@@ -176,6 +182,7 @@ impl IoFile for SimulatedFile {
     }
 
     fn length(&self) -> Result<ByteCount> {
+        let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         self.check(&mut disk, false)?;
         match disk.inodes.get(&self.inode) {
@@ -185,6 +192,7 @@ impl IoFile for SimulatedFile {
     }
 
     fn truncate(&self, length: ByteCount) -> Result<()> {
+        let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         self.check(&mut disk, true)?;
         match disk.inodes.get_mut(&self.inode) {

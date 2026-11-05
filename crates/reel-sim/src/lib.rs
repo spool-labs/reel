@@ -1,5 +1,6 @@
 //! A deterministic disk, clock and job scheduler driven by one seed
 
+pub mod count_pause;
 pub mod file_image;
 pub mod seeded_random;
 pub mod simulated_disk;

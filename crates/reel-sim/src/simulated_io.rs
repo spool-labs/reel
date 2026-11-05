@@ -11,6 +11,7 @@ use reel::guard::hold;
 use reel::io::Io;
 use reel::io::job::{Job, JobStep};
 use reel::io::lock_outcome::LockOutcome;
+use crate::count_pause::CountPause;
 use crate::file_image::{BitMask, SECTOR_BYTES};
 use crate::seeded_random::Seed;
 use crate::simulated_disk::{FileSyncFault, InodeNumber, OperationCount, SimulatedDisk, SyncHook};
@@ -199,6 +200,7 @@ impl SimulatedIo {
 
     /// Run one step of the job at an index, whatever it waits for
     pub fn step_job(&self, index: JobIndex) -> Option<JobStep> {
+        let pause = CountPause::new();
         let mut work = {
             let mut slots = hold(&self.slots);
             let slot = slots.get_mut(index.0)?;
@@ -207,7 +209,10 @@ impl SimulatedIo {
         };
 
         // the job calls back into this backend, so nothing is locked while it runs
+        // the job is engine code, and it counts
+        drop(pause);
         let step = work.step();
+        let _pause = CountPause::new();
 
         let mut slots = hold(&self.slots);
         if let Some(slot) = slots.get_mut(index.0) {
@@ -225,6 +230,7 @@ impl SimulatedIo {
 
     /// Run one step of a runnable job the seed picks, if any job can run
     pub fn step_any(&self) -> Option<JobStep> {
+        let pause = CountPause::new();
         let now = self.clock_reading();
         let mut runnable: Vec<JobIndex> = Vec::new();
         for (index, slot) in hold(&self.slots).iter().enumerate() {
@@ -234,8 +240,10 @@ impl SimulatedIo {
         }
 
         let pick = self.draw(runnable.len() as u64) as usize;
-        let index = runnable.get(pick)?;
-        self.step_job(*index)
+        let index = *runnable.get(pick)?;
+        drop(runnable);
+        drop(pause);
+        self.step_job(index)
     }
 
     /// Wrap an inode in a handle for the running process
@@ -256,6 +264,7 @@ impl Io for SimulatedIo {
     type Task = SimulatedTask;
 
     fn create_file(&self, path: &Path, reserved: ByteCount) -> Result<SimulatedFile> {
+        let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         disk.enter()?;
         if disk.failing_creates.0 > 0 {
@@ -267,6 +276,7 @@ impl Io for SimulatedIo {
     }
 
     fn open_file(&self, path: &Path) -> Result<SimulatedFile> {
+        let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         disk.enter()?;
         let inode = disk.inode_of(path)?;
@@ -274,6 +284,7 @@ impl Io for SimulatedIo {
     }
 
     fn open_read_only(&self, path: &Path) -> Result<SimulatedFile> {
+        let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         disk.enter()?;
         let inode = disk.inode_of(path)?;
@@ -281,22 +292,26 @@ impl Io for SimulatedIo {
     }
 
     fn close_file(&self, file: SimulatedFile) {
+        let _pause = CountPause::new();
         hold(&self.disk).close_handle(file.handle);
     }
 
     fn remove_file(&self, path: &Path) -> Result<()> {
+        let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         disk.enter()?;
         disk.unlink(path)
     }
 
     fn rename_file(&self, from: &Path, to: &Path) -> Result<()> {
+        let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         disk.enter()?;
         disk.rename(from, to)
     }
 
     fn create_directory(&self, path: &Path) -> Result<()> {
+        let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         disk.enter()?;
         for ancestor in path.ancestors() {
@@ -308,6 +323,7 @@ impl Io for SimulatedIo {
     }
 
     fn sync_directory(&self, path: &Path) -> Result<()> {
+        let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         disk.enter()?;
         if disk.failing_directory_syncs.0 > 0 {
@@ -319,6 +335,7 @@ impl Io for SimulatedIo {
     }
 
     fn list_directory(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         disk.enter()?;
         if !disk.has_directory(path) {
@@ -335,6 +352,7 @@ impl Io for SimulatedIo {
     }
 
     fn free_space(&self, path: &Path) -> Result<ByteCount> {
+        let _pause = CountPause::new();
         let mut disk = hold(&self.disk);
         disk.enter()?;
         Ok(disk.free_space(path))
@@ -357,11 +375,13 @@ impl Io for SimulatedIo {
     }
 
     fn now(&self) -> Nanoseconds {
+        let _pause = CountPause::new();
         let reading = self.clock.fetch_add(CLOCK_TICK.0, Ordering::Relaxed);
         Nanoseconds(reading)
     }
 
     fn random_word(&self) -> u64 {
+        let _pause = CountPause::new();
         hold(&self.disk).random.next_word()
     }
 

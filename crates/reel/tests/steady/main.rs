@@ -10,7 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::process::{self, Command};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -28,6 +28,10 @@ use store_config::{BULK, META, config, scratch_root};
 const BUDGET: ByteCount = ByteCount(192 * 1024 * 1024);
 // set in the child that makes the damaged store, so the measured process runs one open
 const PREPARE_ROOT: &str = "REEL_STEADY_PREPARE";
+const PAGE_BYTES: usize = 4_096;
+const MOST_OPEN_BLOCKS: usize = 32_768;
+#[cfg(target_os = "linux")]
+const MOST_BLOCK_PAGES: usize = 65_536;
 const KEYS: usize = 512;
 const LONG_ROWS: usize = 4_000;
 const LONG_VALUE: &[u8] = b"a value on each column of a long batch, a value on each column of a long batch";
@@ -85,6 +89,68 @@ fn note_site(what: &str) -> bool {
     true
 }
 
+// every heap block of a page or more that open leaves live, so the gate can ask the kernel which pages were written
+static OPEN_ADDRESSES: [AtomicUsize; MOST_OPEN_BLOCKS] = [const { AtomicUsize::new(0) }; MOST_OPEN_BLOCKS];
+static OPEN_LENGTHS: [AtomicUsize; MOST_OPEN_BLOCKS] = [const { AtomicUsize::new(0) }; MOST_OPEN_BLOCKS];
+static IS_OPENING: AtomicBool = AtomicBool::new(false);
+
+fn note_block(address: *mut u8, length: usize) {
+    if length < PAGE_BYTES || !IS_OPENING.load(Ordering::Acquire) {
+        return;
+    }
+    for slot in 0..MOST_OPEN_BLOCKS {
+        if OPEN_ADDRESSES[slot].compare_exchange(0, address as usize, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            OPEN_LENGTHS[slot].store(length, Ordering::Release);
+            return;
+        }
+    }
+}
+
+fn forget_block(address: *mut u8, length: usize) {
+    if length < PAGE_BYTES {
+        return;
+    }
+    for slot in &OPEN_ADDRESSES {
+        if slot.compare_exchange(address as usize, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            return;
+        }
+    }
+}
+
+// count the pages of open's blocks no one has written, which the kernel has yet to back
+#[cfg(target_os = "linux")]
+fn unwritten_pages() -> usize {
+    let mut unwritten = 0;
+    let mut resident = vec![0_u8; MOST_BLOCK_PAGES];
+    for slot in 0..MOST_OPEN_BLOCKS {
+        let address = OPEN_ADDRESSES[slot].load(Ordering::Acquire);
+        if address == 0 {
+            continue;
+        }
+        let end = (address + OPEN_LENGTHS[slot].load(Ordering::Acquire)) / PAGE_BYTES * PAGE_BYTES;
+        let start = address.div_ceil(PAGE_BYTES) * PAGE_BYTES;
+        let mut page = start;
+        while page < end {
+            let pages = ((end - page) / PAGE_BYTES).min(MOST_BLOCK_PAGES);
+            // SAFETY: the range lies in a live allocation, and the buffer holds a byte a page
+            let status = unsafe { libc::mincore(page as *mut libc::c_void, pages * PAGE_BYTES, resident.as_mut_ptr()) };
+            assert_eq!(status, 0, "mincore");
+            let missing = resident[..pages].iter().filter(|byte| **byte & 1 == 0).count();
+            if missing > 0 {
+                println!("{missing} of {pages} pages unwritten in a block of {} B", OPEN_LENGTHS[slot].load(Ordering::Acquire));
+            }
+            unwritten += missing;
+            page += pages * PAGE_BYTES;
+        }
+    }
+    unwritten
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unwritten_pages() -> usize {
+    0
+}
+
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // the trace's own allocations count for nothing
@@ -92,7 +158,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         }
         LIVE_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        unsafe { System.alloc(layout) }
+        let block = unsafe { System.alloc(layout) };
+        note_block(block, layout.size());
+        block
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
@@ -101,7 +169,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         }
         LIVE_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        unsafe { System.alloc_zeroed(layout) }
+        let block = unsafe { System.alloc_zeroed(layout) };
+        note_block(block, layout.size());
+        block
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
@@ -109,6 +179,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
             FREES.fetch_add(1, Ordering::Relaxed);
         }
         LIVE_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+        forget_block(pointer, layout.size());
         unsafe { System.dealloc(pointer, layout) }
     }
 
@@ -386,7 +457,9 @@ fn main() {
 
     let live_before = LIVE_BYTES.load(Ordering::Acquire);
     let resident_before = resident_bytes();
+    IS_OPENING.store(true, Ordering::Release);
     let store = open(&root);
+    IS_OPENING.store(false, Ordering::Release);
     let live_grown = LIVE_BYTES.load(Ordering::Acquire) - live_before;
     let report = store.memory_report();
     let reported = report.heap_total().0;
@@ -397,6 +470,12 @@ fn main() {
     let mut failures = 0;
     if live_grown.abs_diff(reported) > reported / REPORT_SLACK_DIVISOR {
         println!("memory_report misses the heap by more than a tenth");
+        failures += 1;
+    }
+    // the whole-process check above is too coarse for one buffer, so this asks about each block open left live
+    let unwritten = unwritten_pages();
+    if unwritten > 0 {
+        println!("open left {unwritten} pages of its blocks unwritten");
         failures += 1;
     }
     if resident_grown.is_some_and(|grown| grown < pools) {

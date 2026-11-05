@@ -22,7 +22,7 @@ use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::io::device_error::is_device_error;
 use crate::io::{Io, IoFile};
-use crate::pool::touched_capacity;
+use crate::pool::{touched_capacity, touched_zeroes};
 use crate::row_kind::RowKind;
 use crate::segment::footer_writer::MOST_BLOCK_ROWS;
 use crate::segment::row_block::{FooterRow, ROW_BLOCK_BYTES, RowBlockWalk};
@@ -67,7 +67,7 @@ impl<Backend: Io> WalkJob<Backend> {
             volume,
             target: None,
             retry_at: None,
-            block: vec![0; ROW_BLOCK_BYTES],
+            block: touched_zeroes(ROW_BLOCK_BYTES),
             key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             last_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             last_column: None,

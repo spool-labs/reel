@@ -1077,7 +1077,6 @@ fn empty_seal() {
     // a claim that lands nothing leaves a segment with no rows in the index
     drop(state.claim(&state.volumes[0], &request).expect("claim"));
     assert!(!hold(&state.volumes[0].claims).open.is_empty());
-    assert!(!hold(&state.volumes[0].claims).open.is_empty());
 
     seal_every_open(&state, 0).expect("seal");
 

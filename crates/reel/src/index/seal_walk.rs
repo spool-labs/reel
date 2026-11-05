@@ -1,5 +1,7 @@
 //! A sealing segment's rows in order, merged from every shard with fixed buffers
 
+use std::mem;
+
 use reel_api::column_id::ColumnId;
 use reel_api::units::ByteCount;
 
@@ -20,11 +22,13 @@ pub struct WalkHead {
     pub row: Option<WriteRow>,
 }
 
-/// A merge over a slot's sixteen trees
+/// A merge over a slot's sixteen trees. A loser tree holds the order, so a row costs four compares, one a level
 #[derive(Debug)]
 pub struct SealWalk {
     pub slot: OpenSlot,
     pub heads: Vec<WalkHead>,
+    losers: [usize; SHARD_COUNT],
+    winner: usize,
 }
 
 impl SealWalk {
@@ -48,6 +52,8 @@ impl SealWalk {
         Self {
             slot: OpenSlot::default(),
             heads,
+            losers: [0; SHARD_COUNT],
+            winner: 0,
         }
     }
 
@@ -62,6 +68,7 @@ impl SealWalk {
             self.heads[shard].position = position;
             self.load(index, shard);
         }
+        self.build_tree();
     }
 
     /// Copy a shard's current row into its head
@@ -80,27 +87,47 @@ impl SealWalk {
         head.row = guard.slab.row(entry);
     }
 
+    /// Check one shard's row comes before another's, a shard with no row coming last
+    pub fn is_before(&self, shard: usize, other: usize) -> bool {
+        let (head, against) = (&self.heads[shard], &self.heads[other]);
+        let (Some(row), Some(against_row)) = (head.row, against.row) else {
+            return head.row.is_some();
+        };
+        let target = SeekTarget::new(against.column, &against.key, against_row.place);
+        compare_rows(head.column, &head.key, row.place, &target).is_lt()
+    }
+
+    /// Play every match, from the shards up
+    pub fn build_tree(&mut self) {
+        let mut winners = [0; 2 * SHARD_COUNT];
+        for shard in 0..SHARD_COUNT {
+            winners[SHARD_COUNT + shard] = shard;
+        }
+        for node in (1..SHARD_COUNT).rev() {
+            let (left, right) = (winners[2 * node], winners[2 * node + 1]);
+            let (winner, loser) = if self.is_before(right, left) { (right, left) } else { (left, right) };
+            winners[node] = winner;
+            self.losers[node] = loser;
+        }
+        self.winner = winners[1];
+    }
+
+    /// Play the matches of a shard again after its row changed, from its place in the tree to the top
+    pub fn replay(&mut self, shard: usize) {
+        let mut winner = shard;
+        let mut node = (SHARD_COUNT + shard) / 2;
+        while node > 0 {
+            if self.is_before(self.losers[node], winner) {
+                mem::swap(&mut self.losers[node], &mut winner);
+            }
+            node /= 2;
+        }
+        self.winner = winner;
+    }
+
     /// Find the shard holding the next row in order
     pub fn next_shard(&self) -> Option<usize> {
-        let mut best: Option<usize> = None;
-        for (shard, head) in self.heads.iter().enumerate() {
-            let Some(row) = head.row else {
-                continue;
-            };
-            let Some(current) = best else {
-                best = Some(shard);
-                continue;
-            };
-            let leader = &self.heads[current];
-            let Some(leader_row) = leader.row else {
-                continue;
-            };
-            let target = SeekTarget::new(leader.column, &leader.key, leader_row.place);
-            if compare_rows(head.column, &head.key, row.place, &target).is_lt() {
-                best = Some(shard);
-            }
-        }
-        best
+        self.heads[self.winner].row.map(|_row| self.winner)
     }
 
     /// Move past a shard's current row
@@ -115,6 +142,7 @@ impl SealWalk {
         };
         self.heads[shard].position = next;
         self.load(index, shard);
+        self.replay(shard);
     }
 }
 

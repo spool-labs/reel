@@ -7,6 +7,7 @@ mod counting;
 mod damage;
 mod io_contract;
 mod place_limit;
+mod range_deletes;
 mod records;
 mod seed_sets;
 mod write_index;

@@ -59,6 +59,14 @@ pub struct StoreConfig {
 }
 
 impl KeyShape {
+    /// Read the widest key this shape takes
+    pub fn widest(self) -> usize {
+        match self {
+            KeyShape::Fixed { width } => width as usize,
+            KeyShape::Variable { most } => most as usize,
+        }
+    }
+
     /// Check a key's width
     pub fn accepts(self, length: usize) -> bool {
         match self {
@@ -73,5 +81,13 @@ impl KeyShape {
             KeyShape::Fixed { width } => width <= MAX_KEY_BYTES,
             KeyShape::Variable { most } => most <= MAX_KEY_BYTES,
         }
+    }
+}
+
+impl StoreConfig {
+    /// Read the widest key a volume's columns take
+    pub fn widest_key(&self, volume: usize) -> usize {
+        let columns = self.columns.iter().filter(|column| column.volume.0 as usize == volume);
+        columns.map(|column| column.key_shape.widest()).max().unwrap_or(0)
     }
 }

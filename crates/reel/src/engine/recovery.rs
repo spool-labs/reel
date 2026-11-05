@@ -1,5 +1,6 @@
 //! Open's reading of the roots: sealed segments from their tails, open ones from their rows
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Error, ErrorKind, IoSlice, Result};
 use std::mem;
@@ -24,6 +25,7 @@ use crate::index::write_row::WriteRow;
 use crate::io::job::{Job, JobStep};
 use crate::io::device_error::{SECTOR_BYTES, is_device_error, read_or_damaged};
 use crate::io::{Io, IoFile};
+use crate::record::codec::Codec;
 use crate::record::record_check::{Checksum, RecordIdentity, RecordKey, checksum};
 use crate::record::record_head::SMALL_HEAD_BYTES;
 use crate::record::record_reader::{RecordLocation, RecordRead, RecordReader};
@@ -35,6 +37,7 @@ use crate::rows::row_group::{
 use crate::segment::block_entry::BlockEntry;
 use crate::segment::column_directory::DirectoryEntry;
 use crate::segment::damage_list::{DamagedRange, highest_of, spans_of};
+use crate::segment::range_covers::{Cover, RangeCovers, read_covers};
 use crate::segment::footer_reader::FooterReader;
 use crate::segment::segment_table::{TABLE_SHARDS, TableSizing, shard_of};
 use crate::segment::segment_tail::{ColumnTail, SegmentNumber, TailHead, columns_fit};
@@ -595,7 +598,9 @@ impl<Backend: Io> EngineState<Backend> {
                 }
             }
 
-            let walked = walk_rows(rows, at, &head, &mut bytes, |row| Ok(self.replay_row(row, target, recovered)))?;
+            let walked = walk_rows(rows, at, &head, &mut bytes, |row| {
+                Ok(self.replay_row(row, target, recovered, records, &mut value))
+            })?;
             match walked {
                 RowsWalked::Whole => {},
                 RowsWalked::Stopped => return Ok(None),
@@ -615,7 +620,7 @@ impl<Backend: Io> EngineState<Backend> {
         records: &mut RecordReader,
         value: &mut Vec<u8>,
     ) -> Result<bool> {
-        if row.kind != RowKind::Value {
+        if row.kind == RowKind::Grave {
             return Ok(true);
         }
 
@@ -633,13 +638,43 @@ impl<Backend: Io> EngineState<Backend> {
         let Some(info) = self.columns[row.column.0 as usize] else {
             return Ok(false);
         };
+        // the record of a range delete holds its end, stored as written whatever the column does
+        let codec = if row.kind == RowKind::RangeDelete { Codec::None } else { info.codec };
         // a row whose record the device can't give back has no whole write behind it
-        let read = records.read_value(data, location, &identity, info.codec, value);
+        let read = records.read_value(data, location, &identity, codec, value);
         match read {
             Ok(RecordRead::Valid) => Ok(true),
             Ok(RecordRead::Failed) => Ok(false),
             Err(error) if is_device_error(&error) => Ok(false),
             Err(error) => Err(error),
+        }
+    }
+
+    /// Bring a recovered range delete back into the pool, its end read from its record
+    pub fn replay_cover(
+        &self,
+        row: &RowEntry,
+        target: &ReplayTarget<Backend>,
+        recovered: &mut RecoveredRows,
+        records: &mut RecordReader,
+        value: &mut Vec<u8>,
+    ) {
+        // a cover no read can give back could have hidden anything, so the columns are damaged whole
+        let lost = Some((row.offset, FileOffset(row.offset.0 + row.length.0)));
+        if !matches!(self.is_record_whole(target.data, row, records, value), Ok(true)) {
+            recovered.lost_region = lost;
+            return;
+        }
+
+        let has_room = target.volume.covers.add(&Cover {
+            column: row.column,
+            start: row.key,
+            end: value,
+            place: row.place,
+            segment: target.segment,
+        });
+        if !has_room {
+            recovered.lost_region = lost;
         }
     }
 
@@ -649,6 +684,8 @@ impl<Backend: Io> EngineState<Backend> {
         row: &RowEntry,
         target: &ReplayTarget<Backend>,
         recovered: &mut RecoveredRows,
+        records: &mut RecordReader,
+        value: &mut Vec<u8>,
     ) -> bool {
         let write_row = WriteRow {
             place: row.place,
@@ -661,6 +698,9 @@ impl<Backend: Io> EngineState<Backend> {
         };
         if !self.index.insert(row.column, row.key, &write_row) {
             return false;
+        }
+        if row.kind == RowKind::RangeDelete {
+            self.replay_cover(row, target, recovered, records, value);
         }
 
         recovered.row_count = RowCount(recovered.row_count.0 + 1);
@@ -688,6 +728,37 @@ pub fn rewrite_range<File: IoFile>(file: &File, start: FileOffset, length: ByteC
             file.write_at(FileOffset(at), &[IoSlice::new(&copy[..step])])?;
         }
         at += step as u64;
+    }
+    Ok(())
+}
+
+/// Add the covers of a footer to the pool, or return false when it fails or the pool has no slot left
+pub fn read_block(bytes: &[u8], segment: SegmentNumber, covers: &RangeCovers) -> bool {
+    let mut has_room = true;
+    let is_whole = read_covers(bytes, segment, |cover| has_room &= covers.add(cover));
+    is_whole && has_room
+}
+
+/// Bring back the covers sealed footers keep. A block that fails its check can't say what it hid, so its segment's
+/// columns are damaged whole
+pub fn load_covers<Backend: Io>(state: &EngineState<Backend>, scan: &RootScan<Backend::File>) -> Result<()> {
+    // newest first, so a cover inside a newer one never takes a slot
+    let mut sealed: Vec<&FoundSealed<Backend::File>> = scan.sealed.iter().collect();
+    sealed.sort_by_key(|found| Reverse(found.head.places.highest));
+    let mut bytes = Vec::new();
+    for found in sealed {
+        let volume = &state.volumes[found.volume];
+        if found.head.ranges_length.0 == 0 {
+            continue;
+        }
+        bytes.resize(found.head.ranges_length.0 as usize, 0);
+        let is_read = read_or_damaged(&found.file, found.head.ranges_at, &mut bytes)?;
+        let is_whole = is_read
+            && checksum(&bytes) == found.head.ranges_sum
+            && read_block(&bytes, found.head.segment, &volume.covers);
+        if !is_whole {
+            hold(&volume.lost_rows).unread_covers.push(found.head.segment);
+        }
     }
     Ok(())
 }
@@ -933,6 +1004,20 @@ pub fn copy_row<Backend: Io>(
         match state.land_row(row.column, row.key, &copied).map_err(open_failure)? {
             LandOutcome::Landed => {
                 note_copied_place(target, copied.slot, row.place);
+                if row.kind == RowKind::RangeDelete {
+                    let has_room = target.covers.add(&Cover {
+                        column: row.column,
+                        start: row.key,
+                        end: record.get(SMALL_HEAD_BYTES..).unwrap_or_default(),
+                        place: row.place,
+                        segment: copied.segment,
+                    });
+                    if !has_room {
+                        for range in whole_columns(state, volume, copied.segment, state.order.mark()) {
+                            target.damage.add(&range);
+                        }
+                    }
+                }
                 claim.finish();
                 break;
             },
@@ -1308,6 +1393,30 @@ pub fn whole_columns<Backend: Io>(
     ranges
 }
 
+/// Damage a segment's columns whole at the counter, keeping its row's facts when it has a row
+pub fn widen_row<Backend: Io>(
+    state: &EngineState<Backend>,
+    index: usize,
+    rows: &mut SummaryRows,
+    number: SegmentNumber,
+    counter: WritePlace,
+) {
+    let ranges = whole_columns(state, index, number, counter);
+    let mut facts = SegmentFacts {
+        segment: number,
+        ..SegmentFacts::default()
+    };
+    let mut columns = Vec::new();
+    if let Some(row) = rows.get(number) {
+        facts = row.facts;
+        let _spans = row_ranges(&row, number, &mut columns);
+    }
+    facts.is_damaged = true;
+    facts.damage_place = counter;
+    rows.remove(number);
+    state.note_dropped_rows(rows.push_kept(&facts, columns.iter().map(column_of), ranges.iter().map(span_of)));
+}
+
 /// Damage whole what a row the newer summary copy lost could have spoken for: an older row may lack the
 /// newer row's spans, and a segment with no row may have had some. Older rows keep their facts
 pub fn mark_lost_rows<Backend: Io>(
@@ -1317,23 +1426,16 @@ pub fn mark_lost_rows<Backend: Io>(
     rows: &mut SummaryRows,
 ) {
     let lost = mem::take(&mut *hold(&state.volumes[index].lost_rows));
+    let counter = state.order.mark();
+    for number in &lost.unread_covers {
+        widen_row(state, index, rows, *number, counter);
+    }
     if !lost.has_lost_row {
         return;
     }
 
-    let counter = state.order.mark();
     for number in lost.older {
-        let Some(row) = rows.get(number) else {
-            continue;
-        };
-        let mut facts = row.facts;
-        let mut columns = Vec::new();
-        let _spans = row_ranges(&row, number, &mut columns);
-        facts.is_damaged = true;
-        facts.damage_place = counter;
-        let ranges = whole_columns(state, index, number, counter);
-        rows.remove(number);
-        state.note_dropped_rows(rows.push_kept(&facts, columns.iter().map(column_of), ranges.iter().map(span_of)));
+        widen_row(state, index, rows, number, counter);
     }
 
     let sealed = scan.sealed.iter().filter(|found| found.volume == index).map(|found| found.head.segment);
@@ -1401,6 +1503,7 @@ pub fn settle_sealed<Backend: Io>(
         seal_mark: found.head.index_sum,
         places: found.head.places,
         is_damaged: false,
+        has_covers: found.head.ranges_length.0 > 0,
         damage_place: WritePlace(0),
     };
 
@@ -1488,7 +1591,8 @@ pub fn settle_damaged<Backend: Io>(
     };
     let mut columns: Vec<OwnedColumn> = Vec::new();
 
-    match row.filter(|row| is_row_trusted(row, found)) {
+    // a row can give the keys a segment held, and never the ranges its lost footer hid, so those go whole
+    match row.filter(|row| is_row_trusted(row, found) && !row.facts.has_covers) {
         Some(row) => {
             facts = row.facts;
             facts.is_damaged = true;

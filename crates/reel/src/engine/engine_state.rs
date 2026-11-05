@@ -282,6 +282,7 @@ impl<Backend: Io> EngineState<Backend> {
         for volume in &self.volumes {
             report.segment_table = ByteCount(report.segment_table.0 + volume.table.heap_bytes().0);
             report.damaged_spans = ByteCount(report.damaged_spans.0 + volume.damage.heap_bytes().0);
+            report.range_deletes = ByteCount(report.range_deletes.0 + volume.covers.heap_bytes().0);
             let buffer = volume.summary_buffer.heap_bytes(|buffer| ByteCount(buffer.capacity() as u64));
             report.summary = ByteCount(report.summary.0 + hold(&volume.summary).heap_bytes().0 + buffer.0);
         }

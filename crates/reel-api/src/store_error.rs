@@ -25,6 +25,8 @@ pub enum StoreError {
     BatchTooLarge { length: ByteCount, limit: ByteCount },
     #[error("batch of {rows:?} doesn't fit one segment of {limit:?}")]
     BatchTooManyRows { rows: RowCount, limit: RowCount },
+    #[error("volume {volume:?} holds as many pending range deletes as it can")]
+    RangeDeletesFull { volume: VolumeId },
     #[error("a budget of {budget:?} is under the {least:?} this store needs")]
     BudgetTooSmall { budget: ByteCount, least: ByteCount },
     #[error("batch touches more than one volume")]

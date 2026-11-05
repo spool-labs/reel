@@ -22,7 +22,8 @@ use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, 
 use crate::engine::open_segment::{RowQueue, fits_a_segment_path};
 use crate::engine::read_path::RecordWant;
 use crate::engine::recovery::{
-    RootScan, SummaryFound, list_roots, read_summaries, recover_segments, save_cleared_spans, scan_roots, walk_open_rows,
+    RootScan, SummaryFound, list_roots, load_covers, read_summaries, recover_segments, save_cleared_spans, scan_roots,
+    walk_open_rows,
     settle_summaries,
 };
 use crate::engine::reserve_job::ReserveJob;
@@ -44,6 +45,7 @@ use crate::rows::row_group::RowGroupBuffer;
 use crate::segment::block_cache::BlockCache;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::damage_list::{DamageList, MOST_DAMAGED_SPANS, SPAN_KEY_BYTES};
+use crate::segment::range_covers::RangeCovers;
 use crate::segment::summary::{MOST_ROW_COLUMN_BYTES, MOST_ROW_FIXED_BYTES, MOST_ROW_SPAN_FIXED_BYTES};
 use crate::segment::footer_reader::FooterReader;
 use crate::segment::row_block::ROW_BLOCK_BYTES;
@@ -82,6 +84,7 @@ impl<Backend: Io> ReelStore<Backend> {
             roots: root_count,
             volumes: config.volumes.len(),
             has_lz4: config.columns.iter().any(|column| column.codec == Codec::Lz4),
+            widest_keys: (0..config.volumes.len()).map(|volume| config.widest_key(volume) as u64).sum(),
         };
         if config.memory_budget < shape.least_budget() {
             return Err(StoreError::BudgetTooSmall {
@@ -153,6 +156,11 @@ impl<Backend: Io> ReelStore<Backend> {
         self.state.write_value(column, key, value)
     }
 
+    /// Count a volume's pending range deletes
+    pub fn pending_range_deletes(&self, volume: VolumeId) -> usize {
+        self.state.volumes[volume.0 as usize].covers.len()
+    }
+
     /// Read the longest a long batch has held a writing turn
     pub fn longest_turn(&self) -> Nanoseconds {
         Nanoseconds(self.state.longest_turn.load(Ordering::Relaxed))
@@ -167,6 +175,12 @@ impl<Backend: Io> ReelStore<Backend> {
     /// Write a value and take its buffer, which a none column sends to the file as it stands
     pub fn put_owned(&self, column: ColumnId, key: &[u8], value: Vec<u8>) -> Result<(), StoreError> {
         self.put(column, key, &value)
+    }
+
+    /// Remove every key in [start, end) written before this call, as one record whatever the keys it covers
+    pub fn delete_range(&self, column: ColumnId, start: &[u8], end: &[u8]) -> Result<(), StoreError> {
+        self.check_open()?;
+        self.state.write_range_delete(column, start, end)
     }
 
     /// Write a grave
@@ -197,7 +211,7 @@ impl<Backend: Io> ReelStore<Backend> {
     /// Check whether the key has a value, without reading the value
     pub fn contains(&self, column: ColumnId, key: &[u8]) -> Result<bool, StoreError> {
         self.check_open()?;
-        self.state.contains_at(column, key, self.state.read_point())
+        self.state.contains_now(column, key)
     }
 
     /// Clear a damaged span once the caller has repaired it from peers, up to an end key or the column's end
@@ -343,6 +357,7 @@ pub fn bring_up<Backend: Io>(
         state.order.resume_past(found.head.places.highest);
     }
     walk_open_rows(state, scan).map_err(open_error("walking a rows file"))?;
+    load_covers(state, scan).map_err(open_error("reading pending range deletes"))?;
     settle_summaries(state, scan).map_err(open_error("settling a summary"))?;
 
     scan.sealed.reverse();
@@ -703,6 +718,7 @@ pub fn build_state<Backend: Io>(
             lost_rows: Mutex::new(summary.lost),
             summary_buffer: Pool::new(vec![touched_buffer(summary_room)]),
             damage: DamageList::new(),
+            covers: RangeCovers::new(config.widest_key(index)),
             damaged: Mutex::new(touched_room(MOST_DAMAGED_SPANS)),
             is_clearing: AtomicBool::new(false),
         });

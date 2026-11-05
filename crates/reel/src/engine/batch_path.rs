@@ -24,11 +24,13 @@ use crate::index::write_shard::ShardNeed;
 use crate::io::{Io, IoFile};
 use crate::record::codec::Codec;
 use crate::record::record_check::RecordIdentity;
-use crate::record::record_encoder::RecordEncoder;
+use crate::record::record_encoder::{PlainRecord, RecordEncoder};
 use crate::record::record_head::plain_length;
 use crate::row_kind::RowKind;
 use crate::record::record_check::RecordKey;
 use crate::rows::row_group::{GROUP_OVERHEAD_BYTES, GroupHead, RowEntry, RowGroupBuffer, row_size};
+use crate::segment::range_covers::Cover;
+use crate::segment::segment_tail::SegmentNumber;
 
 /// The most bytes of rows one group's buffer can carry
 pub const MOST_BUFFERED_ROW_BYTES: usize = GROUP_BYTES.0 as usize - GROUP_OVERHEAD_BYTES;
@@ -50,6 +52,7 @@ pub struct BatchPlan {
     pub rows: RowCount,
     pub row_bytes: usize,
     pub deletes: u64,
+    pub covers: usize,
     pub needs: [ShardNeed; SHARD_COUNT],
 }
 
@@ -61,6 +64,9 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let volume = &self.volumes[plan.volume.0 as usize];
         check_writable(volume)?;
+        if !volume.covers.hold(plan.covers) {
+            return Err(StoreError::RangeDeletesFull { volume: volume.id });
+        }
 
         let bytes = self.encoders.with(|encoder| {
             self.batch_rows.with(|stage| self.batch_records.with(|records| {
@@ -76,6 +82,9 @@ impl<Backend: Io> EngineState<Backend> {
                     self.land_batch(volume, batch, &plan, bytes, buffers)
                 };
                 self.index.release_room(&plan.needs);
+                if landed.is_err() {
+                    volume.covers.release(plan.covers);
+                }
                 landed.map(|()| bytes)
             }))
         })?;
@@ -89,15 +98,10 @@ impl<Backend: Io> EngineState<Backend> {
             let Some(operation) = batch.operation(index) else {
                 continue;
             };
-            let (column, key, value) = match operation {
-                BatchOperation::Put { column, key, value } => (column, key, Some(value)),
-                BatchOperation::Delete { column, key } => (column, key, None),
-                BatchOperation::DeleteRange { .. } => {
-                    return Err(StoreError::Io {
-                        action: "writing a batch",
-                        source: Error::new(ErrorKind::Unsupported, "range deletes aren't built yet"),
-                    });
-                },
+            let (column, key, value, end) = match operation {
+                BatchOperation::Put { column, key, value } => (column, key, Some(value), None),
+                BatchOperation::Delete { column, key } => (column, key, None, None),
+                BatchOperation::DeleteRange { column, start, end } => (column, start, None, Some(end)),
             };
 
             let info = self.column(column)?;
@@ -107,17 +111,22 @@ impl<Backend: Io> EngineState<Backend> {
                 rows: RowCount(0),
                 row_bytes: 0,
                 deletes: 0,
+                covers: 0,
                 needs: [ShardNeed::default(); SHARD_COUNT],
             });
             if info.volume != plan.volume {
                 return Err(StoreError::BatchAcrossVolumes);
             }
 
-            match value {
-                Some(value) => {
+            match (value, end) {
+                (Some(value), _no_end) => {
                     check_value_size(&self.volumes[info.volume.0 as usize], value)?;
                 },
-                None => plan.deletes += 1,
+                (None, Some(end)) => {
+                    self.check_key(column, end)?;
+                    plan.covers += 1;
+                },
+                (None, None) => plan.deletes += 1,
             }
             plan.rows = RowCount(plan.rows.0 + 1);
             plan.row_bytes += row_size(key.len());
@@ -150,10 +159,12 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<ByteCount, StoreError> {
         let mut bytes = ByteCount(0);
         for index in 0..batch.len() {
-            if let Some(BatchOperation::Put { column, key, value }) = batch.operation(index) {
-                let length = self.record_length(column, key, value, encoder)?;
-                bytes = ByteCount(bytes.0 + length.0);
-            }
+            let length = match batch.operation(index) {
+                Some(BatchOperation::Put { column, key, value }) => self.record_length(column, key, value, encoder)?,
+                Some(BatchOperation::DeleteRange { end, .. }) => plain_length(ByteCount(end.len() as u64)),
+                Some(BatchOperation::Delete { .. }) | None => ByteCount(0),
+            };
+            bytes = ByteCount(bytes.0 + length.0);
         }
 
         if bytes > volume.segment_bytes {
@@ -188,6 +199,44 @@ impl<Backend: Io> EngineState<Backend> {
         let shape = self.encode_value(encoder, &identity, info.codec, value)?;
         encoder.give_shares(&self.stored_shares);
         Ok(shape.total_length())
+    }
+
+    /// Put a batch's range deletes in the pool, each at its operation's place, once its rows can't fail
+    pub fn add_covers(&self, batch: &WriteBatch, plan: &BatchPlan, first: WritePlace, segment: SegmentNumber) {
+        if plan.covers == 0 {
+            return;
+        }
+        let volume = &self.volumes[plan.volume.0 as usize];
+        for index in 0..batch.len() {
+            if let Some(BatchOperation::DeleteRange { column, start, end }) = batch.operation(index) {
+                volume.covers.add_held(&Cover {
+                    column,
+                    start,
+                    end,
+                    place: WritePlace(first.0 + index as u64),
+                    segment,
+                });
+            }
+        }
+    }
+
+    /// Drop the older covers inside a batch's range deletes, once the batch is published
+    pub fn drop_covered(&self, batch: &WriteBatch, plan: &BatchPlan, first: WritePlace, segment: SegmentNumber) {
+        if plan.covers == 0 {
+            return;
+        }
+        let volume = &self.volumes[plan.volume.0 as usize];
+        for index in 0..batch.len() {
+            if let Some(BatchOperation::DeleteRange { column, start, end }) = batch.operation(index) {
+                volume.covers.drop_inside(&Cover {
+                    column,
+                    start,
+                    end,
+                    place: WritePlace(first.0 + index as u64),
+                    segment,
+                });
+            }
+        }
     }
 
     /// Hold index room for the whole batch, starting seals while there's none
@@ -264,7 +313,21 @@ impl<Backend: Io> EngineState<Backend> {
                     cursor.row(column, key, shape.total_length(), RowKind::Value)
                 },
                 BatchOperation::Delete { column, key } => cursor.row(column, key, ByteCount(0), RowKind::Grave),
-                BatchOperation::DeleteRange { .. } => continue,
+                BatchOperation::DeleteRange { column, start, end } => {
+                    let identity = RecordIdentity {
+                        record_key: self.record_key,
+                        column,
+                        key: start,
+                        kind: RowKind::RangeDelete,
+                        place: WritePlace(0),
+                    };
+                    let head = PlainRecord::new(&identity, end).head(self.record_key, cursor.place);
+                    if let Err(source) = gathered.add(&[IoSlice::new(&head), IoSlice::new(end)]) {
+                        return Err(store_error(volume, "writing a record", source));
+                    }
+                    let length = plain_length(ByteCount(end.len() as u64));
+                    cursor.row(column, start, length, RowKind::RangeDelete)
+                },
             };
             if is_long {
                 if let Some(kept) = kept_lengths.next() {
@@ -308,8 +371,10 @@ impl<Backend: Io> EngineState<Backend> {
             debug_assert!(is_appended);
         }
         self.wake_row_job();
+        self.add_covers(batch, plan, start.place, segment);
         self.deletes.fetch_add(plan.deletes, Ordering::Relaxed);
         claim.land();
+        self.drop_covered(batch, plan, start.place, segment);
         Ok(())
     }
 
@@ -338,6 +403,7 @@ impl<Backend: Io> EngineState<Backend> {
         let _sent = self.write_out(slot);
         let started = self.io.now();
         self.take_writing_turn(slot);
+        let (batch, first_place) = (rows_of_batch.batch, rows_of_batch.cursor.place);
         let sent = self.send_long_group(slot, &rows, plan, rows_of_batch.clone(), stage);
         hold(&self.queues[slot.0 as usize]).is_writing = false;
         let held = self.io.now().0.saturating_sub(started.0);
@@ -364,8 +430,10 @@ impl<Backend: Io> EngineState<Backend> {
             let is_held = self.index.insert_held(row.column, row.key, &write_row);
             debug_assert!(is_held);
         }
+        self.add_covers(batch, plan, first_place, segment);
         self.deletes.fetch_add(plan.deletes, Ordering::Relaxed);
         claim.land();
+        self.drop_covered(batch, plan, first_place, segment);
         Ok(())
     }
 
@@ -478,7 +546,9 @@ impl<'batch> Iterator for BatchRows<'batch> {
         match operation {
             BatchOperation::Put { column, key, .. } => Some(self.cursor.row(column, key, length, RowKind::Value)),
             BatchOperation::Delete { column, key } => Some(self.cursor.row(column, key, length, RowKind::Grave)),
-            BatchOperation::DeleteRange { .. } => None,
+            BatchOperation::DeleteRange { column, start, .. } => {
+                Some(self.cursor.row(column, start, length, RowKind::RangeDelete))
+            },
         }
     }
 }

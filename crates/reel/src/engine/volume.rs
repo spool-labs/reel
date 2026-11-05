@@ -15,6 +15,7 @@ use crate::pool::Pool;
 use crate::segment::damage_list::DamageList;
 use crate::segment::segment_table::SegmentTable;
 use crate::segment::segment_tail::SegmentNumber;
+use crate::segment::range_covers::RangeCovers;
 use crate::segment::summary::{LostRows, SummaryPaths, SummaryRows};
 use crate::superblock::SuperblockPaths;
 
@@ -57,6 +58,7 @@ pub struct Volume<Backend: Io> {
     pub lost_rows: Mutex<LostRows>,
     pub summary_buffer: Pool<Vec<u8>>,
     pub damage: DamageList,
+    pub covers: RangeCovers,
     pub damaged: Mutex<Vec<SegmentNumber>>,
     pub is_clearing: AtomicBool,
     pub reserve: ByteCount,

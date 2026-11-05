@@ -22,7 +22,7 @@ use reel_api::write_batch::WriteBatch;
 
 const ROOTS: [&str; 3] = ["/disk/faults-meta", "/disk/faults-meta-two", "/disk/faults-bulk"];
 const COLUMNS: [ColumnId; 2] = [ColumnId(1), ColumnId(2)];
-const BUDGET: ByteCount = ByteCount(48 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(52 * 1024 * 1024);
 // a test holds each seed with a traced bug: 0 `failed_open` and `failed_close`, 1 `rows_sync` and `tail_sync`, 37 and
 // 349 `covered_last` and `later_sync`, 125 `one_copy`, 959 `flushed_unknown`, 1000 `open_covers`, 1002 `wrong_place`.
 // Seeds 1 and 1000 are mapped from notes, with no replay. The rest are plain extra seeds
@@ -52,6 +52,9 @@ const STREAM_MIX: u64 = 0x100_0000_01B3;
 const ODDS_SCALE: u64 = 10;
 const WRITE_ODDS: u64 = 3;
 const SET_ODDS: u64 = 1;
+const RANGE_ODDS: u64 = 1;
+const RANGE_SCALE: u64 = 40;
+const MOST_RANGE_KEYS: u64 = 6;
 const FLUSH_ODDS: u64 = 1;
 const SEAL_ODDS: u64 = 1;
 const STEP_ODDS: u64 = 2;
@@ -80,6 +83,7 @@ struct Streams {
     rot: SeededRandom,
     write: SeededRandom,
     set: SeededRandom,
+    range: SeededRandom,
     flush: SeededRandom,
     seal: SeededRandom,
     step: SeededRandom,
@@ -99,6 +103,7 @@ impl Streams {
             rot: stream("rot"),
             write: stream("write"),
             set: stream("set"),
+            range: stream("range"),
             flush: stream("flush"),
             seal: stream("seal"),
             step: stream("step"),
@@ -486,6 +491,28 @@ impl Run {
         }
     }
 
+    // a range of plain keys goes in one record, and every known key in it gets a nothing on top
+    fn write_range(&mut self, store: &Store) {
+        let column = COLUMNS[self.streams.range.below(COLUMNS.len() as u64) as usize];
+        let first = self.streams.range.below(KEY_SPACE);
+        let last = first + 1 + self.streams.range.below(MOST_RANGE_KEYS);
+        let (start, end) = (format!("key-{first:04}").into_bytes(), format!("key-{last:04}").into_bytes());
+
+        let written = store.delete_range(column, &start, &end);
+        let has_landed = matches!(written, Err(StoreError::Io { action: "syncing a volume", .. }));
+        if written.is_ok() || has_landed || self.io.is_crashed() {
+            let is_covered = written.is_ok() && column == COLUMNS[0] && self.policy == SyncPolicy::EveryWrite;
+            for number in first..last {
+                let key = format!("key-{number:04}").into_bytes();
+                let versions = self.model.entry((column, key)).or_default();
+                versions.history.push(None);
+                if is_covered {
+                    versions.floor = versions.history.len() - 1;
+                }
+            }
+        }
+    }
+
     // a refused key says nothing, and every key that answers must agree
     fn check_sets(&self, store: &Store) {
         for column in COLUMNS {
@@ -536,6 +563,7 @@ impl Run {
             // each kind draws on every step, used or not, so nothing another kind does moves its stream
             let is_write = self.streams.write.below(ODDS_SCALE) < WRITE_ODDS;
             let is_set = self.streams.set.below(ODDS_SCALE) < SET_ODDS;
+            let is_range = self.streams.range.below(RANGE_SCALE) < RANGE_ODDS;
             let is_flush = self.streams.flush.below(ODDS_SCALE) < FLUSH_ODDS;
             let is_seal = self.streams.seal.below(ODDS_SCALE) < SEAL_ODDS;
             let is_step = self.streams.step.below(ODDS_SCALE) < STEP_ODDS;
@@ -545,6 +573,9 @@ impl Run {
             }
             if is_set && !self.io.is_crashed() {
                 self.write_set(store);
+            }
+            if is_range && !self.io.is_crashed() {
+                self.write_range(store);
             }
             if is_flush && !self.io.is_crashed() {
                 self.flush(store);

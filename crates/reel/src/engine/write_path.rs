@@ -24,6 +24,7 @@ use crate::record::record_encoder::{PlainRecord, RecordEncoder, RecordShape};
 use crate::record::record_head::plain_length;
 use crate::row_kind::RowKind;
 use crate::rows::row_group::{RowEntry, row_size};
+use crate::segment::range_covers::Cover;
 
 /// In-flight writes an open segment takes before the volume opens another
 pub const WRITES_PER_OPEN: u32 = 2;
@@ -228,6 +229,91 @@ impl<Backend: Io> EngineState<Backend> {
                 LandOutcome::IndexFull => {
                     drop(claim);
                     self.wait_for_index(column, key, slot)?;
+                },
+            }
+        }
+    }
+
+    /// Remove every key in [start, end) of a column written before this call, as one record
+    pub fn write_range_delete(&self, column: ColumnId, start: &[u8], end: &[u8]) -> Result<(), StoreError> {
+        let info = self.column(column)?;
+        self.check_key(column, start)?;
+        self.check_key(column, end)?;
+        let volume = &self.volumes[info.volume.0 as usize];
+        check_writable(volume)?;
+        if start >= end {
+            return Ok(());
+        }
+        if !volume.covers.hold(1) {
+            return Err(StoreError::RangeDeletesFull { volume: volume.id });
+        }
+
+        let landed = self.land_range_delete(volume, column, start, end);
+        if landed.is_err() {
+            volume.covers.release(1);
+        }
+        let length = landed?;
+        self.after_write(volume, length)
+    }
+
+    /// Write the record of a range delete and land its row and cover, a hold having made room for the cover, and
+    /// return the length of the record
+    pub fn land_range_delete(
+        &self,
+        volume: &Volume<Backend>,
+        column: ColumnId,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<ByteCount, StoreError> {
+        let identity = RecordIdentity {
+            record_key: self.record_key,
+            column,
+            key: start,
+            kind: RowKind::RangeDelete,
+            place: WritePlace(0),
+        };
+        let record = PlainRecord::new(&identity, end);
+        let length = plain_length(ByteCount(end.len() as u64));
+        let request = ClaimRequest {
+            bytes: length,
+            rows: RowCount(1),
+            is_alone: false,
+        };
+        loop {
+            let claim = self.claim(volume, &request)?;
+            let head = record.head(self.record_key, claim.first_place());
+            if let Err(source) = claim.data.write_at(claim.offset, &[IoSlice::new(&head), IoSlice::new(end)]) {
+                return Err(store_error(volume, "writing a record", source));
+            }
+
+            let row = WriteRow {
+                place: claim.first_place(),
+                offset: claim.offset,
+                length,
+                kind: RowKind::RangeDelete,
+                slot: claim.slot,
+                segment: claim.segment,
+                has_newer_sealed: false,
+            };
+            let slot = claim.slot;
+            match self.land_row(column, start, &row)? {
+                LandOutcome::Landed => {
+                    let cover = Cover {
+                        column,
+                        start,
+                        end,
+                        place: row.place,
+                        segment: row.segment,
+                    };
+                    volume.covers.add_held(&cover);
+                    claim.land();
+                    // older covers leave only now, since a reader below this place still needs them
+                    volume.covers.drop_inside(&cover);
+                    return Ok(length);
+                },
+                LandOutcome::IndexFull => {
+                    drop(claim);
+                    self.wait_for_index(column, start, slot)?;
                 },
             }
         }

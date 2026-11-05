@@ -19,9 +19,13 @@ use crate::index::seal_walk::SealWalk;
 use crate::index::spot_index::SpotLocation;
 use crate::io::job::{Job, JobStep};
 use crate::io::Io;
+use crate::record::codec::Codec;
+use crate::record::record_check::RecordIdentity;
+use crate::record::record_reader::{RecordLocation, RecordRead};
 use crate::row_kind::RowKind;
 use crate::segment::column_directory::DirectoryEntry;
 use crate::segment::footer_writer::{ColumnStart, FooterTotals, FooterWriter};
+use crate::segment::range_covers::{Cover, put_cover};
 use crate::segment::row_block::FooterRow;
 use crate::segment::segment_tail::{BlockCount, SegmentNumber};
 use crate::segment::damage_list::{highest_of, spans_of};
@@ -83,6 +87,8 @@ pub struct SealJob<Backend: Io> {
     pub walk: SealWalk,
     pub column: Option<ColumnId>,
     pub highest: Vec<u8>,
+    pub ranges: Vec<u8>,
+    pub range_end: Vec<u8>,
     pub totals: Option<FooterTotals>,
     pub last_key: Vec<u8>,
     pub last_column: Option<ColumnId>,
@@ -94,6 +100,7 @@ pub struct SealJob<Backend: Io> {
 impl<Backend: Io> SealJob<Backend> {
     /// Build a job with its buffers
     pub fn new(state: Arc<EngineState<Backend>>, volume: usize) -> Self {
+        let ranges_room = state.volumes[volume].covers.footer_room();
         Self {
             state,
             volume,
@@ -103,6 +110,8 @@ impl<Backend: Io> SealJob<Backend> {
             walk: SealWalk::new(),
             column: None,
             highest: touched_capacity(MAX_KEY_BYTES as usize, 0),
+            ranges: touched_capacity(ranges_room, 0),
+            range_end: touched_capacity(MAX_KEY_BYTES as usize, 0),
             totals: None,
             last_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             last_column: None,
@@ -157,6 +166,7 @@ impl<Backend: Io> SealJob<Backend> {
         self.writer.start(target.data_end, target.lowest_place);
         self.walk.start(&self.state.index, target.slot);
         self.column = None;
+        self.ranges.clear();
         self.is_in_table = false;
         self.columns_listed = 0;
         self.is_summarized = false;
@@ -186,6 +196,38 @@ impl<Backend: Io> SealJob<Backend> {
                 self.column = Some(head.column);
             }
 
+            // the row says what the pool may have dropped: a newer cover in another segment can be lost without this one
+            if row.kind == RowKind::RangeDelete {
+                let identity = RecordIdentity {
+                    record_key: self.state.record_key,
+                    column: head.column,
+                    key: &head.key,
+                    kind: RowKind::RangeDelete,
+                    place: row.place,
+                };
+                let location = RecordLocation {
+                    offset: row.offset,
+                    length: row.length,
+                };
+                let end = &mut self.range_end;
+                let read = self.state.record_readers.with(|reader| {
+                    reader.read_value(&target.data, location, &identity, Codec::None, end)
+                })?;
+                if read != RecordRead::Valid {
+                    return Err(Error::other("the record of a range delete failed its check"));
+                }
+                let cover = Cover {
+                    column: head.column,
+                    start: &head.key,
+                    end,
+                    place: row.place,
+                    segment: target.number,
+                };
+                if !self.state.volumes[self.volume].covers.has_newer_in_segment(&cover) {
+                    put_cover(&mut self.ranges, &cover);
+                }
+            }
+
             let footer_row = FooterRow {
                 place: row.place,
                 offset: row.offset,
@@ -201,9 +243,7 @@ impl<Backend: Io> SealJob<Backend> {
     /// Finish the footer, which syncs it, then discard the rows file
     pub fn finish_footer(&mut self, target: &SealTarget<Backend::File>) -> Result<()> {
         let state = Arc::clone(&self.state);
-        let totals = self
-            .writer
-            .finish(&target.data, target.number, target.data_end, b"", state.record_key)?;
+        let totals = self.writer.finish(&target.data, target.number, target.data_end, &self.ranges, state.record_key)?;
         self.totals = Some(totals);
         self.phase = SealPhase::Installing;
         Ok(())
@@ -225,6 +265,7 @@ impl<Backend: Io> SealJob<Backend> {
                 seal_mark: totals.head.index_sum,
                 places: totals.head.places,
                 is_damaged: false,
+                has_covers: totals.head.ranges_length.0 > 0,
                 damage_place: WritePlace(0),
             };
             let writer = &self.writer;
@@ -398,7 +439,7 @@ impl<Backend: Io> SealJob<Backend> {
 
     /// Read the heap the job's own buffers hold
     pub fn heap_bytes(&self) -> ByteCount {
-        let keys = self.highest.capacity() + self.last_key.capacity();
+        let keys = self.highest.capacity() + self.last_key.capacity() + self.ranges.capacity();
         ByteCount(self.writer.heap_bytes().0 + self.walk.heap_bytes().0 + keys as u64)
     }
 

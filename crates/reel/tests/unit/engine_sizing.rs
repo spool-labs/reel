@@ -21,6 +21,7 @@ fn shape(budget: ByteCount, roots: usize) -> StoreShape {
         roots,
         volumes: 1,
         has_lz4: false,
+        widest_keys: 64,
     }
 }
 
@@ -37,12 +38,13 @@ fn least_budget() {
 // the rows a segment takes at each budget, as `SEAL_ROWS_EIGHTHS` documents them
 #[test]
 fn documented_rows() {
-    for (mib, rows) in [(128, 59_720), (192, 152_105), (512, 614_033), (4_096, 5_787_623)] {
+    for (mib, rows) in [(128, 58_033), (192, 150_419), (512, 612_346), (4_096, 5_785_938)] {
         let store = StoreShape {
             budget: ByteCount(mib * 1024 * 1024),
             roots: 1,
             volumes: 1,
             has_lz4: true,
+            widest_keys: 64,
         };
 
         assert_eq!(EngineSizing::for_store(&store).segment_rows, RowCount(rows), "{mib} MiB");

@@ -60,6 +60,7 @@ pub struct KeyRead<'key> {
     pub key: &'key [u8],
     pub hash: KeyHash,
     pub read_point: WritePlace,
+    pub cover: Option<WritePlace>,
     pub is_cue: bool,
 }
 
@@ -98,7 +99,7 @@ impl<Backend: Io> EngineState<Backend> {
         // the count comes first: a hand-over only starts past its rows' places, so a read point
         // taken after the count can't be below a row a hand-over under this count gave out
         let handovers = volume.handover_count();
-        let read = self.key_read(column, key, self.read_point(), false)?;
+        let read = self.key_read_now(column, key)?;
         self.get_at(&read, handovers, want, buf)
     }
 
@@ -111,14 +112,16 @@ impl<Backend: Io> EngineState<Backend> {
         buf: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
         let volume = &self.volumes[read.info.volume.0 as usize];
-        self.check_damage(volume, read)?;
+        let cover = read.cover;
+        self.check_damage(volume, read, cover)?;
+        let is_hidden = |place: WritePlace| cover.is_some_and(|cover| cover > place);
 
         for _try in 0..MOST_READ_TRIES {
             let found = self.index.lookup(read.column, read.key, read.read_point, volume.view());
             if let Some(row) = found.row
                 && !found.should_ask_footers
             {
-                if row.kind != RowKind::Value {
+                if row.kind != RowKind::Value || is_hidden(row.place) {
                     return Ok(false);
                 }
                 if self.read_open(read, &row, want, buf)? {
@@ -127,7 +130,8 @@ impl<Backend: Io> EngineState<Backend> {
                 continue;
             }
 
-            if let Some(answer) = self.try_spot(volume, read, found.row, want, buf)? {
+            let newest_below = found.row.map(|row| row.place).max(cover);
+            if let Some(answer) = self.try_spot(volume, read, newest_below, want, buf)? {
                 return Ok(answer);
             }
 
@@ -136,7 +140,7 @@ impl<Backend: Io> EngineState<Backend> {
             match located {
                 Located::Absent => return Ok(false),
                 Located::Open(row) => {
-                    if row.kind != RowKind::Value {
+                    if row.kind != RowKind::Value || is_hidden(row.place) {
                         return Ok(false);
                     }
                     if self.read_open(read, &row, want, buf)? {
@@ -144,7 +148,7 @@ impl<Backend: Io> EngineState<Backend> {
                     }
                 },
                 Located::Sealed(row) => {
-                    if row.row.kind != RowKind::Value {
+                    if row.row.kind != RowKind::Value || is_hidden(row.row.place) {
                         return Ok(false);
                     }
                     if self.read_sealed(volume, read, &row, want, buf)? {
@@ -161,7 +165,12 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Refuse a key whose newest row could be in a damaged segment: the row found must be above it
-    pub fn check_damage(&self, volume: &Volume<Backend>, read: &KeyRead) -> Result<(), StoreError> {
+    pub fn check_damage(
+        &self,
+        volume: &Volume<Backend>,
+        read: &KeyRead,
+        cover: Option<WritePlace>,
+    ) -> Result<(), StoreError> {
         let Some(highest) = volume.damage.covering(read.column, read.key) else {
             return Ok(());
         };
@@ -169,7 +178,7 @@ impl<Backend: Io> EngineState<Backend> {
         let found = self.index.lookup(read.column, read.key, read.read_point, volume.view());
         let sealed = self.search_footers(volume, read)?;
         let newest = newest_of(found.row, sealed);
-        match newest.place() {
+        match newest.place().max(cover) {
             Some(place) if place > highest => Ok(()),
             Some(_at_or_below) => Err(corruption(read)),
             None => Err(corruption(read)),
@@ -177,19 +186,40 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Say whether a key has a value at a read point, without reading the value
-    pub fn contains_at(&self, column: ColumnId, key: &[u8], read_point: WritePlace) -> Result<bool, StoreError> {
-        let read = self.key_read(column, key, read_point, false)?;
+    pub fn contains_now(&self, column: ColumnId, key: &[u8]) -> Result<bool, StoreError> {
+        let read = self.key_read_now(column, key)?;
+        let read_point = read.read_point;
         let volume = &self.volumes[read.info.volume.0 as usize];
-        self.check_damage(volume, &read)?;
+        let cover = read.cover;
+        self.check_damage(volume, &read, cover)?;
+        let is_hidden = |place: WritePlace| cover.is_some_and(|cover| cover > place);
         let found = self.index.lookup(column, key, read_point, volume.view());
         if let Some(row) = found.row
             && !found.should_ask_footers
         {
-            return Ok(row.kind == RowKind::Value);
+            return Ok(row.kind == RowKind::Value && !is_hidden(row.place));
         }
 
         let sealed = self.search_footers(volume, &read)?;
-        Ok(newest_of(found.row, sealed).has_value())
+        let newest = newest_of(found.row, sealed);
+        Ok(newest.has_value() && !newest.place().is_some_and(is_hidden))
+    }
+
+    /// Check a key and gather what reading it at the newest point takes
+    pub fn key_read_now<'key>(&self, column: ColumnId, key: &'key [u8]) -> Result<KeyRead<'key>, StoreError> {
+        let info = self.column(column)?;
+        self.check_key(column, key)?;
+        let covers = &self.volumes[info.volume.0 as usize].covers;
+        let (cover, read_point) = covers.newest_now(column, key, || self.read_point());
+        Ok(KeyRead {
+            column,
+            info,
+            key,
+            hash: hash_key(column, key),
+            read_point,
+            cover,
+            is_cue: false,
+        })
     }
 
     /// Check a key and gather what reading it takes
@@ -208,6 +238,7 @@ impl<Backend: Io> EngineState<Backend> {
             key,
             hash: hash_key(column, key),
             read_point,
+            cover: self.volumes[info.volume.0 as usize].covers.newest_over(column, key, read_point),
             is_cue,
         })
     }
@@ -217,14 +248,14 @@ impl<Backend: Io> EngineState<Backend> {
         &self,
         volume: &Volume<Backend>,
         read: &KeyRead,
-        open_row: Option<WriteRow>,
+        newest_below: Option<WritePlace>,
         want: RecordWant,
         buf: &mut Vec<u8>,
     ) -> Result<Option<bool>, StoreError> {
         let Some(spot) = self.spot.lookup(read.hash) else {
             return Ok(None);
         };
-        let is_newest = spot.place <= read.read_point && open_row.is_none_or(|row| row.place < spot.place);
+        let is_newest = spot.place <= read.read_point && newest_below.is_none_or(|place| place < spot.place);
         if !is_newest {
             return Ok(None);
         }

@@ -7,6 +7,7 @@ pub mod footer_reader;
 pub mod footer_writer;
 pub mod column_directory;
 pub mod damage_list;
+pub mod range_covers;
 pub mod segment_table;
 pub mod summary;
 pub mod row_block;

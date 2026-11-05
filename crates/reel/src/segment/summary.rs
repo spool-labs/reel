@@ -14,6 +14,8 @@ use crate::little_endian::read_half;
 use crate::record::record_check::{Checksum, checksum};
 use crate::segment::segment_tail::{PlaceRange, SegmentNumber};
 
+/// The bit of a row's flags that says its footer keeps range deletes
+pub const HAS_COVERS_BIT: u8 = 1;
 /// Opens a summary file
 pub const SUMMARY_MAGIC: u64 = 0x5245_4C53_554D_4D31;
 /// Closes a summary file
@@ -57,6 +59,7 @@ pub struct SegmentFacts {
     pub seal_mark: Checksum,
     pub places: PlaceRange,
     pub is_damaged: bool,
+    pub has_covers: bool,
     pub damage_place: WritePlace,
 }
 
@@ -347,7 +350,7 @@ impl SummaryRows {
         self.bytes.extend_from_slice(&facts.seal_mark.0.to_le_bytes());
         self.bytes.extend_from_slice(&facts.places.lowest.0.to_le_bytes());
         self.bytes.extend_from_slice(&facts.places.highest.0.to_le_bytes());
-        self.bytes.push(u8::from(facts.is_damaged));
+        self.bytes.push(u8::from(facts.is_damaged) | (u8::from(facts.has_covers) << HAS_COVERS_BIT));
         self.bytes.extend_from_slice(&columns.to_le_bytes());
         self.bytes.extend_from_slice(&spans.to_le_bytes());
         self.bytes.extend_from_slice(&facts.damage_place.0.to_le_bytes());
@@ -552,7 +555,9 @@ pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
         lowest: WritePlace(cursor.word()?),
         highest: WritePlace(cursor.word()?),
     };
-    let is_damaged = cursor.byte()? != 0;
+    let flags = cursor.byte()?;
+    let is_damaged = flags & 1 != 0;
+    let has_covers = flags >> HAS_COVERS_BIT != 0;
     let column_count = cursor.short()?;
     let span_count = cursor.short()?;
     let damage_place = WritePlace(cursor.word()?);
@@ -564,6 +569,7 @@ pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
         seal_mark,
         places,
         is_damaged,
+        has_covers,
         damage_place,
     };
     Some(SummaryRow {
@@ -608,6 +614,7 @@ impl SummaryCopy {
 pub struct LostRows {
     pub has_lost_row: bool,
     pub older: Vec<SegmentNumber>,
+    pub unread_covers: Vec<SegmentNumber>,
 }
 
 /// A summary file's paths, built once at open so a save allocates nothing

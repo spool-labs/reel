@@ -36,8 +36,8 @@ use reel_api::units::{ByteCount, FileOffset, Nanoseconds, RowCount, VolumeId, Wr
 const ROOT: &str = "/disk/staged";
 const COLUMN: ColumnId = ColumnId(1);
 const LONG_COLUMN: ColumnId = ColumnId(2);
-const BUDGET: ByteCount = ByteCount(48 * 1024 * 1024);
-const SMALL_BUDGET: ByteCount = ByteCount(31 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
+const SMALL_BUDGET: ByteCount = ByteCount(48 * 1024 * 1024);
 const LARGEST: ByteCount = ByteCount(1024 * 1024);
 const LONG_KEY_BYTES: usize = 1_000;
 const LONG_KEYS: u64 = 6_000;

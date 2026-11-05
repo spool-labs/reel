@@ -222,6 +222,7 @@ fn batches(keys: &[Vec<u8>], small: &[u8], compressible: &[u8]) -> (WriteBatch, 
     batch.put(META, &keys[0], small);
     batch.put(META, &keys[1], small);
     batch.delete(BULK, &keys[1]);
+    batch.delete_range(META, b"range-c", b"range-d");
     let mut large_batch = WriteBatch::new();
     large_batch.put(BULK, &keys[2], compressible);
     large_batch.put(META, &keys[2], small);
@@ -278,6 +279,7 @@ fn round(store: &Store, inputs: &mut Inputs, number: usize) {
     assert!(!store.get(META, &inputs.missing, buf).expect("get a miss"));
     assert!(store.contains(META, key).expect("contains"));
     store.delete(BULK, other).expect("delete");
+    store.delete_range(META, b"range-a", b"range-b").expect("delete range");
     store.write_batch(&inputs.batch).expect("batch");
     store.write_batch(&inputs.large_batch).expect("large batch");
     if number.is_multiple_of(FLUSH_ROUNDS) {

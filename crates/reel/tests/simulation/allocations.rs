@@ -106,6 +106,7 @@ fn round(store: &Store, io: &SimulatedIo, inputs: &mut Inputs, number: usize) ->
     let owned = inputs.small.clone();
     let (_put, allocations, frees) = counted(|| store.put_owned(META, key, owned).expect("put owned"));
     assert_eq!((allocations, frees), (0, 1));
+    total += both(counted(|| store.delete_range(META, b"range-a", b"range-b").expect("delete range")));
     total += both(counted(|| store.write_batch(&inputs.batch).expect("batch")));
     total += both(counted(|| store.write_batch(&inputs.large_batch).expect("large batch")));
     let refused = counted(|| store.get(META, DAMAGED_KEY, buf).is_err());
@@ -159,6 +160,7 @@ fn no_allocations() {
     batch.put(META, &keys[0], &small);
     batch.put(META, &keys[1], &small);
     batch.delete(BULK, &keys[1]);
+    batch.delete_range(META, b"range-c", b"range-d");
     let mut large_batch = WriteBatch::new();
     large_batch.put(BULK, &keys[2], &compressible);
     large_batch.put(META, &keys[2], &small);

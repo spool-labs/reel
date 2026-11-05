@@ -8,6 +8,7 @@ const ROOM: ByteCount = ByteCount(4_096);
 
 fn facts(number: u64) -> SegmentFacts {
     SegmentFacts {
+        has_covers: false,
         segment: SegmentNumber(number),
         file_length: ByteCount(1_000),
         data_end: FileOffset(100),

@@ -1,6 +1,6 @@
 //! Everything a store shares between its threads
 
-use std::io::Error;
+use std::io::{Error, ErrorKind};
 use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
@@ -14,7 +14,8 @@ use crate::engine::column_info::ColumnInfo;
 use crate::engine::cue::CueTable;
 use crate::engine::engine_sizing::EngineSizing;
 use crate::engine::open_segment::{RecordWindow, RowQueue};
-use crate::engine::volume::Volume;
+use crate::engine::open_segment::data_path;
+use crate::engine::volume::{ParkedSegment, Volume};
 use crate::segment::range_covers::Cover;
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
@@ -301,6 +302,23 @@ impl<Backend: Io> EngineState<Backend> {
     /// Check a volume's summary lookup still holds every row
     pub fn is_summary_lookup_whole(&self, volume: usize) -> bool {
         hold(&self.volumes[volume].summary).is_lookup_whole()
+    }
+
+    /// Close a parked segment's file and remove it, unless a failed save means a row still lists it
+    pub fn clear_parked(&self, volume: &Volume<Backend>, parked: ParkedSegment<Backend::File>) -> Result<(), Error> {
+        volume.segments_parked.fetch_sub(1, Ordering::AcqRel);
+        self.io.close_file(parked.retired.file);
+        if !parked.is_saved {
+            return Ok(());
+        }
+        for root in &volume.roots {
+            match self.io.remove_file(&data_path(root, parked.segment)) {
+                Ok(()) => return self.io.sync_directory(root),
+                Err(error) if error.kind() == ErrorKind::NotFound => {},
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     /// Bring the planner back to every volume's compaction

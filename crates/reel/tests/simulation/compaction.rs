@@ -11,6 +11,7 @@ use reel::engine::engine_sizing::COMPACT_JOB_BYTES;
 use reel::engine::open_segment::data_path;
 use reel::engine::read_path::RecordWant;
 use reel::engine::reel_store::ReelStore;
+use reel::engine::volume::MOST_PARKED;
 use reel::guard::hold;
 use reel::io::Io;
 use reel::record::codec::Codec;
@@ -340,35 +341,11 @@ fn unlink_looks_again() {
     assert!(volume.table.holds(older));
 
     job.unlink(volume, older, replacement).expect("unlink");
-    assert!(!volume.table.holds(older));
-    assert!(!has_file(&io, older));
-    store.close().expect("close");
-}
-
-// a stop leaves an unlink stuck behind a pin, with the file as a crash would leave it, and the next open finishes the job
-#[test]
-fn stopped_unlink() {
-    let io = SimulatedIo::new(Seed(16));
-    let store = open(&io);
-    hold_compaction(&store);
-    let state = Arc::clone(&store.state);
-    let volume = &state.volumes[0];
-    let older = sealed_put(&store, &io, b"older");
-    sealed_put(&store, &io, b"newer");
-
-    let pin = volume.table.pin(older).expect("a pin");
-    state.is_stopping.store(true, Ordering::Release);
-    job(&store).unlink(volume, older, state.read_point()).expect("unlink");
-    assert!(!volume.table.holds(older));
-    assert!(has_file(&io, older));
-    drop(pin);
-    store.close().expect("close");
-    io.kill();
-
-    let store = open(&io);
+    release_compaction(&store);
+    state.ask_compaction();
     settle(&io);
+    assert!(!volume.table.holds(older));
     assert!(!has_file(&io, older));
-    assert_eq!(read(&store), Some(b"newer".to_vec()));
     store.close().expect("close");
 }
 
@@ -609,5 +586,172 @@ fn job_sized() {
     let bytes = job(&store).heap_bytes();
     assert!(bytes.0 <= COMPACT_JOB_BYTES);
     assert_eq!(store.state.memory_report().compaction, bytes);
+    store.close().expect("close");
+}
+
+// a read holding a dead segment holds nothing else up: the file waits for the pin, and later walks and seals go on
+#[test]
+fn parked_waits() {
+    let io = SimulatedIo::new(Seed(30));
+    let store = open(&io);
+    hold_compaction(&store);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let older = sealed_put(&store, &io, b"older");
+    sealed_put(&store, &io, b"newer");
+
+    let pin = volume.table.pin(older).expect("a pin");
+    job(&store).unlink(volume, older, state.read_point()).expect("unlink");
+    assert!(!volume.table.holds(older));
+    assert!(has_file(&io, older));
+    assert_eq!(volume.segments_parked.load(Ordering::Acquire), 1);
+
+    release_compaction(&store);
+    store.put(COLUMN, b"later", b"value").expect("put");
+    store.seal_now();
+    run_steps(&io);
+    assert_eq!(state.pending_walks(0), 0);
+    assert!(has_file(&io, older));
+
+    drop(pin);
+    run_steps(&io);
+    assert!(!has_file(&io, older));
+    assert_eq!(volume.segments_parked.load(Ordering::Acquire), 0);
+    store.close().expect("close");
+    assert_eq!(io.open_handle_count(), 0);
+}
+
+// a full park leaves the next unlink for later, and it goes once a slot frees
+#[test]
+fn park_full() {
+    let io = SimulatedIo::new(Seed(31));
+    let store = open(&io);
+    hold_compaction(&store);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let mut numbers = Vec::new();
+    for _segment in 0..=MOST_PARKED {
+        numbers.push(sealed_put(&store, &io, b"value"));
+    }
+    sealed_put(&store, &io, b"newest");
+
+    let job = job(&store);
+    let last = numbers[MOST_PARKED];
+    let pins: Vec<_> = numbers[..MOST_PARKED].iter().map(|number| volume.table.pin(*number).expect("a pin")).collect();
+    for number in &numbers[..MOST_PARKED] {
+        job.unlink(volume, *number, state.read_point()).expect("unlink");
+    }
+    job.unlink(volume, last, state.read_point()).expect("unlink");
+    assert!(volume.table.holds(last));
+
+    drop(pins);
+    release_compaction(&store);
+    state.ask_compaction();
+    settle(&io);
+    assert!(!volume.table.holds(last));
+    assert_eq!(volume.segments_parked.load(Ordering::Acquire), 0);
+    store.close().expect("close");
+}
+
+// a close takes the files no read holds
+#[test]
+fn close_clears_parked() {
+    let io = SimulatedIo::new(Seed(32));
+    let store = open(&io);
+    hold_compaction(&store);
+    let volume = &store.state.volumes[0];
+    let older = sealed_put(&store, &io, b"older");
+    sealed_put(&store, &io, b"newer");
+
+    let pin = volume.table.pin(older).expect("a pin");
+    job(&store).unlink(volume, older, store.state.read_point()).expect("unlink");
+    drop(pin);
+    store.close().expect("close");
+    assert!(!has_file(&io, older));
+    assert_eq!(io.open_handle_count(), 0);
+}
+
+// a crash with two files parked is two segments with no row, and open drops both
+#[test]
+fn parked_crash() {
+    for is_power_cut in [false, true] {
+        let io = SimulatedIo::new(Seed(33));
+        let store = open(&io);
+        hold_compaction(&store);
+        let state = Arc::clone(&store.state);
+        let volume = &state.volumes[0];
+        let first = sealed_put(&store, &io, b"first");
+        let second = sealed_put(&store, &io, b"second");
+        sealed_put(&store, &io, b"third");
+
+        let pins = [volume.table.pin(first).expect("a pin"), volume.table.pin(second).expect("a pin")];
+        let job = job(&store);
+        job.unlink(volume, first, state.read_point()).expect("unlink");
+        job.unlink(volume, second, state.read_point()).expect("unlink");
+        assert_eq!(volume.segments_parked.load(Ordering::Acquire), 2);
+        assert!(has_file(&io, first) && has_file(&io, second));
+
+        if is_power_cut {
+            io.power_cut();
+        } else {
+            io.kill();
+        }
+        drop(pins);
+        drop(job);
+        drop(store);
+        drop(state);
+
+        let store = open(&io);
+        settle(&io);
+        assert!(!has_file(&io, first) && !has_file(&io, second));
+        assert_eq!(read(&store), Some(b"third".to_vec()));
+        assert!(hold(&store.state.volumes[0].damaged).is_empty());
+        assert_eq!(store.state.dropped_summary_rows.load(Ordering::Acquire), 0);
+        store.close().expect("close");
+    }
+}
+
+fn release_compaction(store: &Store) {
+    store.state.volumes[0].is_compaction_held.store(false, Ordering::Release);
+}
+
+// step for a while without asking the jobs to go quiet, since a parked file keeps its job coming back
+fn run_steps(io: &SimulatedIo) {
+    for _step in 0..STEPS / 4 {
+        if io.step_any().is_none() {
+            io.advance_clock(TICK);
+        }
+    }
+}
+
+// a save that failed still lists the segment on disk, so its file stays and open finds the two agreeing
+#[test]
+fn failed_save_keeps_file() {
+    let io = SimulatedIo::new(Seed(34));
+    let store = open(&io);
+    hold_compaction(&store);
+    let state = Arc::clone(&store.state);
+    let volume = &state.volumes[0];
+    let older = sealed_put(&store, &io, b"older");
+    sealed_put(&store, &io, b"newer");
+
+    io.fail_writes(OperationCount(1));
+    assert!(job(&store).unlink(volume, older, state.read_point()).is_err());
+    assert!(!volume.table.holds(older));
+    assert_eq!(volume.segments_unlinked.load(Ordering::Acquire), 0);
+
+    release_compaction(&store);
+    state.ask_compaction();
+    settle(&io);
+    assert!(has_file(&io, older));
+    io.kill();
+    drop(store);
+    drop(state);
+
+    let store = open(&io);
+    settle(&io);
+    assert_eq!(read(&store), Some(b"newer".to_vec()));
+    assert!(hold(&store.state.volumes[0].damaged).is_empty());
+    assert_eq!(store.state.dropped_summary_rows.load(Ordering::Acquire), 0);
     store.close().expect("close");
 }

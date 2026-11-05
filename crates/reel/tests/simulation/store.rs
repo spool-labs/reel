@@ -1,5 +1,6 @@
 //! The whole engine on the simulated disk, checked against a plain model of versions
 
+use crate::done_flag::SetsOnDrop;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -934,6 +935,7 @@ fn window_race() {
 
     thread::scope(|scope| {
         scope.spawn(|| {
+            let _done = SetsOnDrop(&is_done);
             let mut number = 0u64;
             // bounded, so a failed check in the sender ends the test with nobody left to send
             for _attempt in 0..RACE_ATTEMPTS {
@@ -946,7 +948,6 @@ fn window_race() {
                     break;
                 }
             }
-            is_done.store(true, Ordering::Release);
         });
 
         let mut checked = 0;
@@ -1166,6 +1167,7 @@ fn many_batch_whole() {
 
     thread::scope(|scope| {
         scope.spawn(|| {
+            let _done = SetsOnDrop(&is_done);
             for number in 0..BATCH_ROUNDS {
                 let mut batch = WriteBatch::new();
                 for key in keys {
@@ -1173,7 +1175,6 @@ fn many_batch_whole() {
                 }
                 store.write_batch(&batch).expect("batch");
             }
-            is_done.store(true, Ordering::Release);
         });
         let mut values = ValueList::new();
         while !is_done.load(Ordering::Acquire) {

@@ -13,7 +13,7 @@ use crate::index::open_slots::{OpenSlot, OpenSlots};
 use crate::io::Io;
 use crate::pool::Pool;
 use crate::segment::damage_list::DamageList;
-use crate::segment::segment_table::SegmentTable;
+use crate::segment::segment_table::{RetiredSegment, SegmentTable};
 use crate::segment::segment_tail::SegmentNumber;
 use crate::segment::range_covers::RangeCovers;
 use crate::segment::summary::{LostRows, SummaryPaths, SummaryRows};
@@ -21,6 +21,18 @@ use crate::superblock::SuperblockPaths;
 
 /// A volume's `sealing` number between seals
 pub const NO_SEAL: u64 = u64::MAX;
+
+/// A volume's room for segments out of every list whose files wait for their reads to finish
+pub const MOST_PARKED: usize = 8;
+
+/// A segment out of every list, whose file goes once no read holds it
+#[derive(Clone, Debug)]
+pub struct ParkedSegment<File> {
+    pub retired: RetiredSegment<File>,
+    pub segment: SegmentNumber,
+    /// A failed save keeps the file, or open would find a row with no file
+    pub is_saved: bool,
+}
 
 /// Where a volume's sync stands
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -67,6 +79,8 @@ pub struct Volume<Backend: Io> {
     /// The segment a seal is working on, or `NO_SEAL`. Its rows can still answer through its open slot, so no walk starts on it
     pub sealing: AtomicU64,
     pub segments_unlinked: AtomicU64,
+    pub segments_parked: AtomicU64,
+    pub parked: Mutex<[Option<ParkedSegment<Backend::File>>; MOST_PARKED]>,
     pub summary: Mutex<SummaryRows>,
     pub summary_paths: SummaryPaths,
     pub lost_rows: Mutex<LostRows>,

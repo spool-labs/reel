@@ -15,6 +15,7 @@ mod records;
 mod seed_sets;
 mod write_index;
 mod faults;
+mod done_flag;
 mod footers;
 mod spot_index;
 mod staged;

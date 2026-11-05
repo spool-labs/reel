@@ -34,7 +34,7 @@ use crate::engine::compact_job::CompactJob;
 use crate::engine::cue::{Cue, CueTable};
 use crate::engine::planner::Planner;
 use crate::engine::walk_job::WalkJob;
-use crate::engine::volume::{ClaimState, NO_SEAL, SyncState, Volume};
+use crate::engine::volume::{ClaimState, MOST_PARKED, NO_SEAL, SyncState, Volume};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::index::spot_index::SpotIndex;
@@ -346,6 +346,14 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Close every handle of a volume
     pub fn close_volume(&self, volume: &Volume<Backend>) {
+        // a read that outlives its store keeps its handle, and open finishes what the file's leaving started
+        for slot in hold(&volume.parked).iter_mut() {
+            if slot.as_ref().is_some_and(|parked| volume.table.retired_pins(&parked.retired) == 0)
+                && let Some(parked) = slot.take()
+            {
+                let _removed = self.clear_parked(volume, parked);
+            }
+        }
         let mut claims = hold(&volume.claims);
         for segment in claims.open.drain(..) {
             self.slot_files[segment.slot.0 as usize].set(None);
@@ -785,6 +793,8 @@ pub fn build_state<Backend: Io>(
             is_compaction_held: AtomicBool::new(false),
             sealing: AtomicU64::new(NO_SEAL),
             segments_unlinked: AtomicU64::new(0),
+            segments_parked: AtomicU64::new(0),
+            parked: Mutex::new([const { None }; MOST_PARKED]),
             reserve: ByteCount(sizing.segment_bytes.0 * 2),
             summary: Mutex::new(summary.rows),
             summary_paths: summary.paths,

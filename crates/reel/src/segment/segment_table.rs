@@ -50,11 +50,11 @@ pub struct SegmentPin<'table, File> {
 }
 
 /// A segment taken out of the table, whose file closes once its pins are gone
-#[derive(Debug)]
-pub struct RetiredSegment<'table, File> {
+#[derive(Clone, Debug)]
+pub struct RetiredSegment<File> {
     pub file: File,
-    pub head: TailHead,
-    pin: &'table AtomicU32,
+    pub shard: usize,
+    pub slot: u32,
 }
 
 /// One row block of a segment, for the dead-byte walk
@@ -110,13 +110,6 @@ pub struct TableSizing {
 impl<File> Drop for SegmentPin<'_, File> {
     fn drop(&mut self) {
         self.pin.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-impl<File> RetiredSegment<'_, File> {
-    /// Count the reads still holding the segment
-    pub fn pin_count(&self) -> u32 {
-        self.pin.load(Ordering::Acquire)
     }
 }
 
@@ -374,7 +367,7 @@ impl<File: Clone> SegmentTable<File> {
     }
 
     /// Take a segment out so no new read can pin it
-    pub fn retire(&self, number: SegmentNumber) -> Option<RetiredSegment<'_, File>> {
+    pub fn retire(&self, number: SegmentNumber) -> Option<RetiredSegment<File>> {
         let shard = shard_of(number);
         let mut guard = self.write_shard(shard);
         let slot = guard.map.get(number)?;
@@ -383,9 +376,14 @@ impl<File: Clone> SegmentTable<File> {
         guard.free_slots.push(slot);
         Some(RetiredSegment {
             file: entry.file,
-            head: entry.head,
-            pin: &self.pins[shard][slot as usize],
+            shard,
+            slot,
         })
+    }
+
+    /// Count the reads still holding a retired segment. A new segment in its slot only makes this count longer
+    pub fn retired_pins(&self, retired: &RetiredSegment<File>) -> u32 {
+        self.pins[retired.shard][retired.slot as usize].load(Ordering::Acquire)
     }
 
     /// Copy out the block lines that can hold a key, from a block onward

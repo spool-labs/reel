@@ -673,7 +673,7 @@ impl<Backend: Io> EngineState<Backend> {
             if self.io.now().0 > deadline {
                 return Err(StoreError::Io {
                     action: "waiting for the write index",
-                    source: Error::other("no seal freed room in the write index"),
+                    source: Error::from(ErrorKind::TimedOut),
                 });
             }
             self.io.pause();

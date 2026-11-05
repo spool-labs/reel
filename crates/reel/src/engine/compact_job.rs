@@ -13,9 +13,8 @@ use reel_api::units::{ByteCount, Nanoseconds, WritePlace};
 
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::engine_state::EngineState;
-use crate::engine::open_segment::data_path;
 use crate::engine::planner::UnitStep;
-use crate::engine::volume::Volume;
+use crate::engine::volume::{ParkedSegment, Volume};
 use crate::engine::walk_job::WALK_RETRY;
 use crate::guard::hold;
 use crate::io::device_error::is_device_error;
@@ -27,6 +26,9 @@ use crate::segment::row_block::{ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::{SegmentPin, WalkBlock};
 use crate::segment::segment_tail::SegmentNumber;
 use crate::segment::summary::SummaryRow;
+
+/// How long compaction waits before it looks at a parked segment's pins again
+pub const PARKED_RETRY: Nanoseconds = Nanoseconds(1_000_000);
 
 /// A segment being checked for anything live
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +54,8 @@ pub struct CompactJob<Backend: Io> {
 impl<Backend: Io> CompactJob<Backend> {
     /// Allocate the job's fixed buffers
     pub fn new(state: Arc<EngineState<Backend>>, volume: usize) -> Self {
+        // a mutex's first lock can allocate, and this one's could otherwise come in a close
+        drop(hold(&state.volumes[volume].parked));
         Self {
             state,
             volume,
@@ -71,6 +75,22 @@ impl<Backend: Io> CompactJob<Backend> {
 
     /// Step once: a row block of a candidate's footer, or nothing when no segment looks dead
     pub fn step_unit(&mut self, now: Nanoseconds) -> UnitStep {
+        match self.step_work(now) {
+            UnitStep::Idle if self.has_parked() => UnitStep::RetryAt(Nanoseconds(now.0 + PARKED_RETRY.0)),
+            step => step,
+        }
+    }
+
+    /// Check a file still waits for its reads, so the job has to come back with nothing else to wake it. A failed or held
+    /// volume does no work, and its files stay for the next open
+    pub fn has_parked(&self) -> bool {
+        let volume = &self.state.volumes[self.volume];
+        let is_stepping = !volume.has_failed() && !volume.is_compaction_held.load(Ordering::Acquire);
+        is_stepping && volume.segments_parked.load(Ordering::Acquire) > 0
+    }
+
+    /// Step once: a parked file no read holds any more, then the candidate work
+    pub fn step_work(&mut self, now: Nanoseconds) -> UnitStep {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
         if volume.has_failed() || volume.is_compaction_held.load(Ordering::Acquire) {
@@ -80,6 +100,12 @@ impl<Backend: Io> CompactJob<Backend> {
             return UnitStep::RetryAt(at);
         }
         self.retry_at = None;
+        if let Some(parked) = self.take_parked(volume) {
+            return match state.clear_parked(volume, parked) {
+                Ok(()) => UnitStep::Worked,
+                Err(_) => UnitStep::RetryAt(Nanoseconds(now.0 + WALK_RETRY.0)),
+            };
+        }
         // a live cue may still need what it kept, and its going brings the planner back
         if state.cues.is_empty() && volume.has_kept_covers.swap(false, Ordering::AcqRel) {
             self.sweep_covers(volume);
@@ -99,6 +125,20 @@ impl<Backend: Io> CompactJob<Backend> {
                 UnitStep::RetryAt(at)
             },
         }
+    }
+
+    /// Take a parked segment no read holds any more
+    pub fn take_parked(&self, volume: &Volume<Backend>) -> Option<ParkedSegment<Backend::File>> {
+        let mut parked = hold(&volume.parked);
+        let slot = parked.iter_mut().find(|slot| {
+            slot.as_ref().is_some_and(|parked| volume.table.retired_pins(&parked.retired) == 0)
+        })?;
+        slot.take()
+    }
+
+    /// Check the volume has room to park another segment
+    pub fn can_park(&self, volume: &Volume<Backend>) -> bool {
+        hold(&volume.parked).iter().any(Option::is_none)
     }
 
     /// Drop covers a cue kept inside newer ones, once no cue reads below those. Each cover takes its own hold of the pool,
@@ -207,12 +247,12 @@ impl<Backend: Io> CompactJob<Backend> {
         Ok(Some(highest))
     }
 
-    /// Take the segment out of every list, save that, and remove its file, once its replacements are published and no cue
-    /// reads below them. A crash before the file goes leaves a segment with no row, which open walks backward and finds
-    /// dead again
+    /// Take the segment out of every list and save that, once its replacements are published and no cue reads below them,
+    /// then park it. The file goes at a later step, once no read holds it, so a slow read never holds up the planner. A
+    /// crash before it goes leaves a segment with no row, which open walks backward and finds dead again
     pub fn unlink(&self, volume: &Volume<Backend>, segment: SegmentNumber, highest_replacement: WritePlace) -> Result<()> {
         let state = &self.state;
-        if state.read_point() < highest_replacement {
+        if !self.can_park(volume) || state.read_point() < highest_replacement {
             return Ok(());
         }
         state.cues.note_reclaim();
@@ -230,23 +270,17 @@ impl<Backend: Io> CompactJob<Backend> {
         hold(&volume.summary).remove(segment);
         // the file goes only behind a saved summary, or open would find a row with no file
         let saved = state.save_summary(volume);
-        while retired.pin_count() > 0 {
-            // a stop leaves the file and its handle, as a crash here does
-            if state.is_stopping.load(Ordering::Acquire) {
-                return saved;
-            }
-            state.io.pause();
+        let parked = ParkedSegment {
+            retired,
+            segment,
+            is_saved: saved.is_ok(),
+        };
+        if let Some(slot) = hold(&volume.parked).iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(parked);
+            volume.segments_parked.fetch_add(1, Ordering::AcqRel);
         }
-        state.io.close_file(retired.file.clone());
         saved?;
         volume.segments_unlinked.fetch_add(1, Ordering::AcqRel);
-        for root in &volume.roots {
-            match state.io.remove_file(&data_path(root, segment)) {
-                Ok(()) => return state.io.sync_directory(root),
-                Err(error) if error.kind() == ErrorKind::NotFound => {},
-                Err(error) => return Err(error),
-            }
-        }
         Ok(())
     }
 }

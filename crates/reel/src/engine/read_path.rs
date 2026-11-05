@@ -7,7 +7,9 @@ use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_state::EngineState;
+use crate::engine::open_segment::MOST_WINDOW_RECORD_BYTES;
 use crate::engine::volume::Volume;
+use crate::guard::hold;
 use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::spot_index::SpotLocation;
 use crate::index::write_row::WriteRow;
@@ -274,6 +276,59 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
+    /// Answer from a record still in its slot's window, or return nothing when it has reached the kernel. A record
+    /// on its way there waits for the write, which is one call
+    pub fn read_held(
+        &self,
+        read: &KeyRead,
+        row: &WriteRow,
+        want: RecordWant,
+        buf: &mut Vec<u8>,
+    ) -> Result<Option<RecordRead>, StoreError> {
+        let length = row.length.0 as usize;
+        if length > MOST_WINDOW_RECORD_BYTES {
+            return Ok(None);
+        }
+
+        let index = row.slot.0 as usize;
+        let mut held = [0; MOST_WINDOW_RECORD_BYTES];
+        loop {
+            let queue = hold(&self.queues[index]);
+            if let Some(record) = queue.records.record(row.offset, row.length) {
+                held[..length].copy_from_slice(record);
+                break;
+            }
+            let is_sending = queue.sending.is_some_and(|(start, end)| row.offset >= start && row.offset < end);
+            drop(queue);
+            if !is_sending {
+                return Ok(None);
+            }
+
+            // a window a failed write left behind stays readable until it goes out
+            let spare = hold(&self.spare_windows[index]);
+            if let Some(record) = spare.as_ref().and_then(|window| window.record(row.offset, row.length)) {
+                held[..length].copy_from_slice(record);
+                break;
+            }
+            drop(spare);
+            self.io.pause();
+        }
+
+        let identity = RecordIdentity {
+            record_key: self.record_key,
+            column: read.column,
+            key: read.key,
+            kind: RowKind::Value,
+            place: row.place,
+        };
+        let window = match want {
+            RecordWant::Whole => None,
+            RecordWant::Window(window) => Some(window),
+        };
+        let outcome = self.record_readers.with(|reader| reader.read_held(&held[..length], &identity, window, buf));
+        Ok(Some(outcome))
+    }
+
     /// Read a record from an open segment, and return false when the slot has moved on
     pub fn read_open(
         &self,
@@ -284,6 +339,12 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<bool, StoreError> {
         let Some(pin) = self.slot_files[row.slot.0 as usize].pin(row.segment) else {
             return Ok(false);
+        };
+        // the slot is pinned, so its queue still speaks for this segment
+        match self.read_held(read, row, want, buf)? {
+            Some(RecordRead::Valid) => return Ok(true),
+            Some(RecordRead::Failed) => return Err(corruption(read)),
+            None => {},
         };
         let location = RecordLocation {
             offset: row.offset,

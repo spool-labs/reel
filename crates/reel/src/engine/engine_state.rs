@@ -12,7 +12,7 @@ use reel_api::units::{ByteCount, WritePlace};
 
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::EngineSizing;
-use crate::engine::open_segment::RowQueue;
+use crate::engine::open_segment::{RecordWindow, RowQueue};
 use crate::engine::volume::Volume;
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
@@ -68,6 +68,7 @@ pub struct EngineState<Backend: Io> {
     pub row_cache: BlockCache,
     pub queues: Vec<Mutex<RowQueue>>,
     pub spare_groups: Vec<Mutex<Option<RowGroupBuffer>>>,
+    pub spare_windows: Vec<Mutex<Option<RecordWindow>>>,
     pub slot_files: Vec<SlotFile<Backend::File>>,
     pub free_slots: Mutex<Vec<OpenSlot>>,
     pub encoders: Pool<RecordEncoder>,
@@ -119,6 +120,15 @@ impl<File: Clone> SlotFile<File> {
         // some platforms set a lock up at its first use, and that's a job for open
         drop(hold(&slot.leaving_rows));
         slot
+    }
+
+    /// Read the file the slot holds now
+    pub fn file(&self) -> Option<File> {
+        let guard = match self.data.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.as_ref().map(|held| held.file.clone())
     }
 
     /// Hold a segment's file for a read, or return nothing when the slot has moved on from it
@@ -297,7 +307,13 @@ impl<Backend: Io> EngineState<Backend> {
         let batch_records = self.batch_records.heap_bytes(|records| ByteCount(records.capacity() as u64));
         report.queues = ByteCount(report.queues.0 + batch_rows.0 + batch_records.0 + batch_lengths.0);
         for queue in &self.queues {
-            report.queues = ByteCount(report.queues.0 + hold(queue).filling.heap_bytes().0);
+            let queue = hold(queue);
+            report.queues = ByteCount(report.queues.0 + queue.filling.heap_bytes().0 + queue.records.heap_bytes().0);
+        }
+        for window in &self.spare_windows {
+            if let Some(window) = hold(window).as_ref() {
+                report.queues = ByteCount(report.queues.0 + window.heap_bytes().0);
+            }
         }
         for group in &self.spare_groups {
             if let Some(group) = hold(group).as_ref() {

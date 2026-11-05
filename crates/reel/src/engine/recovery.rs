@@ -181,6 +181,7 @@ pub struct RecoveredRows {
     pub lowest_place: WritePlace,
     pub highest_place: WritePlace,
     pub lost_region: Option<(FileOffset, FileOffset)>,
+    pub cover_rows: usize,
 }
 
 impl<File> RootScan<File> {
@@ -459,6 +460,7 @@ impl<Backend: Io> EngineState<Backend> {
             lowest_place: WritePlace(u64::MAX),
             highest_place: WritePlace(0),
             lost_region: None,
+            cover_rows: 0,
         };
         let mut records = RecordReader::new();
         let target = ReplayTarget {
@@ -499,6 +501,7 @@ impl<Backend: Io> EngineState<Backend> {
             phase: SegmentPhase::Taking,
             write_end: recovered.write_end,
             row_count: recovered.row_count,
+            cover_rows: recovered.cover_rows,
             in_flight: 0,
             lowest_place: recovered.lowest_place,
             highest_place: recovered.highest_place,
@@ -700,6 +703,7 @@ impl<Backend: Io> EngineState<Backend> {
             return false;
         }
         if row.kind == RowKind::RangeDelete {
+            recovered.cover_rows += 1;
             self.replay_cover(row, target, recovered, records, value);
         }
 
@@ -985,6 +989,8 @@ pub fn copy_row<Backend: Io>(
         bytes: row.length,
         rows: RowCount(1),
         is_alone: false,
+        has_records: row.length.0 > 0,
+        covers: usize::from(row.kind == RowKind::RangeDelete),
     };
     loop {
         let claim = state.claim(target, &request).map_err(open_failure)?;

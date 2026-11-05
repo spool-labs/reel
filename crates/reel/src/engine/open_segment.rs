@@ -1,6 +1,7 @@
 //! One segment taking writes: its files, its claims and its waiting rows
 
 use std::ffi::OsStr;
+use std::mem;
 use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -8,6 +9,7 @@ use std::path::Path;
 use reel_api::units::{ByteCount, FileOffset, RootId, RowCount, WritePlace};
 
 use crate::index::open_slots::OpenSlot;
+use crate::pool::touched_zeroes;
 use crate::rows::row_group::RowGroupBuffer;
 use crate::segment::segment_tail::SegmentNumber;
 
@@ -45,8 +47,95 @@ pub struct OpenSegment<File> {
     pub write_end: FileOffset,
     pub row_count: RowCount,
     pub in_flight: u32,
+    pub cover_rows: usize,
     pub lowest_place: WritePlace,
     pub highest_place: WritePlace,
+}
+
+/// Bytes of the file range a slot's small records fill before they reach the kernel in one write call
+pub const RECORD_WINDOW_BYTES: usize = 64 * 1024;
+/// The largest record that goes through a window, so bulk values are never copied into one
+pub const MOST_WINDOW_RECORD_BYTES: usize = 4 * 1024;
+
+/// Records of an open segment on their way to the kernel, in a range of its data file claimed ahead
+#[derive(Debug)]
+pub struct RecordWindow {
+    bytes: Vec<u8>,
+    start: FileOffset,
+    used: usize,
+    room: usize,
+}
+
+impl Default for RecordWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RecordWindow {
+    /// Allocate a window with no range yet
+    pub fn new() -> Self {
+        Self {
+            bytes: touched_zeroes(RECORD_WINDOW_BYTES),
+            start: FileOffset(0),
+            used: 0,
+            room: 0,
+        }
+    }
+
+    /// Read the heap this window holds
+    pub fn heap_bytes(&self) -> ByteCount {
+        ByteCount(self.bytes.capacity() as u64)
+    }
+
+    /// Check the window holds no record
+    pub fn is_empty(&self) -> bool {
+        self.used == 0
+    }
+
+    /// Check a record of this length fits
+    pub fn has_room(&self, length: usize) -> bool {
+        self.used + length <= self.room
+    }
+
+    /// Start on a new range of the file
+    pub fn reset(&mut self, start: FileOffset, room: usize) {
+        self.start = start;
+        self.used = 0;
+        self.room = room;
+    }
+
+    /// Copy a record in and return where the file will hold it
+    pub fn push(&mut self, parts: [&[u8]; 2]) -> FileOffset {
+        let offset = FileOffset(self.start.0 + self.used as u64);
+        for part in parts {
+            self.bytes[self.used..self.used + part.len()].copy_from_slice(part);
+            self.used += part.len();
+        }
+        offset
+    }
+
+    /// Read where the window starts
+    pub fn start(&self) -> FileOffset {
+        self.start
+    }
+
+    /// Read the records so far
+    pub fn records(&self) -> &[u8] {
+        &self.bytes[..self.used]
+    }
+
+    /// Find a record in the window
+    pub fn record(&self, offset: FileOffset, length: ByteCount) -> Option<&[u8]> {
+        let at = offset.0.checked_sub(self.start.0)? as usize;
+        self.records().get(at..at + length.0 as usize)
+    }
+
+    /// Hand the records to a spare window, and go on in what's left of the range
+    pub fn hand_over(&mut self, spare: &mut Self) {
+        spare.reset(FileOffset(self.start.0 + self.used as u64), self.room - self.used);
+        mem::swap(self, spare);
+    }
 }
 
 /// The rows of a segment waiting to reach the kernel
@@ -58,6 +147,9 @@ pub struct RowQueue {
     pub marked_end: FileOffset,
     pub is_writing: bool,
     pub reserved: usize,
+    pub records: RecordWindow,
+    pub sending: Option<(FileOffset, FileOffset)>,
+    pub is_refilling: bool,
 }
 
 impl RowQueue {
@@ -70,6 +162,9 @@ impl RowQueue {
             marked_end: FileOffset(0),
             is_writing: false,
             reserved: 0,
+            records: RecordWindow::new(),
+            sending: None,
+            is_refilling: false,
         }
     }
 
@@ -81,6 +176,9 @@ impl RowQueue {
         self.marked_end = FileOffset(0);
         self.is_writing = false;
         self.reserved = 0;
+        self.records.reset(FileOffset(0), 0);
+        self.sending = None;
+        self.is_refilling = false;
     }
 }
 

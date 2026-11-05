@@ -37,7 +37,7 @@ const ROOT: &str = "/disk/staged";
 const COLUMN: ColumnId = ColumnId(1);
 const LONG_COLUMN: ColumnId = ColumnId(2);
 const BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
-const SMALL_BUDGET: ByteCount = ByteCount(48 * 1024 * 1024);
+const SMALL_BUDGET: ByteCount = ByteCount(49 * 1024 * 1024);
 const LARGEST: ByteCount = ByteCount(1024 * 1024);
 const LONG_KEY_BYTES: usize = 1_000;
 const LONG_KEYS: u64 = 6_000;
@@ -158,6 +158,8 @@ fn stage<'state>(state: &'state State, key: &[u8], value: Option<&[u8]>) -> Stag
         bytes: ByteCount(length as u64),
         rows: RowCount(1),
         is_alone: false,
+        has_records: true,
+        covers: 0,
     };
     let claim = state.claim(volume, &request).expect("claim");
     let record = value.map_or(Vec::new(), |value| encode(state, key, value, claim.first_place()));

@@ -7,6 +7,7 @@ use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig
 use reel::engine::open_segment::rows_path;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::write_path::ClaimRequest;
+use reel::guard::hold;
 use reel::io::{Io, IoFile};
 use reel::record::codec::Codec;
 use reel::segment::range_covers::MOST_RANGE_COVERS;
@@ -27,6 +28,7 @@ const BUDGET: ByteCount = ByteCount(48 * 1024 * 1024);
 const KEYS: u64 = 100;
 const SEARCH_STEPS: usize = 4;
 const CRASH_POINTS: u64 = 10;
+const COVER_SURPLUS: u64 = 10;
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 
 type Store = ReelStore<SimulatedIo>;
@@ -378,6 +380,8 @@ fn older_outlives_newer() {
         bytes: ByteCount(1),
         rows: RowCount(1),
         is_alone: true,
+        has_records: true,
+        covers: 0,
     };
     let claim = store.state.claim(volume, &alone).expect("claim");
     let (older_slot, older_segment) = (claim.slot, claim.segment);
@@ -491,4 +495,20 @@ fn lost_record() {
 fn has_rows_file(io: &SimulatedIo) -> bool {
     let listing = io.list_directory(Path::new(ROOT)).expect("list");
     listing.iter().any(|path| path.extension().is_some_and(|extension| extension == "rows"))
+}
+
+// covers that keep dropping out of the pool still count against their segment, so a seal's buffer holds them all
+#[test]
+fn cover_cap() {
+    let io = SimulatedIo::new(Seed(16));
+    let store = open(&io);
+    for number in 0..MOST_RANGE_COVERS as u64 + COVER_SURPLUS {
+        store.delete_range(COLUMN, &key_of(100), &key_of(200 + number)).expect("delete");
+    }
+
+    assert_eq!(store.state.volumes[0].covers.len(), 1);
+    let claims = hold(&store.state.volumes[0].claims);
+    assert!(claims.open.iter().all(|segment| segment.cover_rows <= MOST_RANGE_COVERS));
+    drop(claims);
+    store.close().expect("close");
 }

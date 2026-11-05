@@ -8,6 +8,7 @@ use reel::engine::reel_store::ReelStore;
 use reel::io::job::{Job, JobStep};
 use reel::io::{Io, IoFile};
 use reel::record::codec::Codec;
+use reel::segment::range_covers::MOST_RANGE_COVERS;
 use reel::segment::segment_tail::SECOND_TAIL_DISTANCE;
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId};
@@ -222,4 +223,31 @@ fn count_sees() {
         black_box(vec![1_u8; 64]).len()
     });
     assert_eq!(allocations, 0);
+}
+
+// a segment holding as many covers as it can seals with the buffer open gave it
+#[test]
+fn full_cover_block() {
+    let io = SimulatedIo::new(Seed(4));
+    let store = ReelStore::open(io.clone(), &config()).expect("open");
+    // a first seal sets up what any seal touches, as the gate's warm rounds do
+    store.delete_range(META, b"warm-a", b"warm-b").expect("delete");
+    store.seal_now();
+    settle(&io);
+    for number in 1..MOST_RANGE_COVERS {
+        let start = format!("cover-{:06}", 2 * number);
+        let end = format!("cover-{:06}", 2 * number + 1);
+        store.delete_range(META, start.as_bytes(), end.as_bytes()).expect("delete");
+    }
+    let capacity = |store: &Store| store.state.volumes[0].covers.footer_room();
+    let room = capacity(&store);
+
+    let sealed = counted(|| {
+        store.seal_now();
+        settle(&io);
+    });
+
+    assert_eq!((sealed.1, sealed.2), (0, 0));
+    assert_eq!(capacity(&store), room);
+    store.close().expect("close");
 }

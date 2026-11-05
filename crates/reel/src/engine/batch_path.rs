@@ -272,6 +272,8 @@ impl<Backend: Io> EngineState<Backend> {
             bytes,
             rows: plan.rows,
             is_alone: is_long,
+            has_records: bytes.0 > 0,
+            covers: plan.covers,
         };
         let claim = self.claim(volume, &request)?;
         let start = BatchCursor {

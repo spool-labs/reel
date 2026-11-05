@@ -12,7 +12,9 @@ use crate::config::SyncPolicy;
 use crate::engine::claim::Claim;
 use crate::engine::engine_sizing::OPEN_PER_ROOT;
 use crate::engine::engine_state::{EngineState, SlotData, SlotPin};
-use crate::engine::open_segment::{OpenSegment, SegmentPhase, data_path, rows_path};
+use crate::engine::open_segment::{
+    MOST_WINDOW_RECORD_BYTES, OpenSegment, RECORD_WINDOW_BYTES, RecordWindow, SegmentPhase, data_path, rows_path,
+};
 use crate::engine::volume::{ClaimState, Volume};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
@@ -24,7 +26,7 @@ use crate::record::record_encoder::{PlainRecord, RecordEncoder, RecordShape};
 use crate::record::record_head::plain_length;
 use crate::row_kind::RowKind;
 use crate::rows::row_group::{RowEntry, row_size};
-use crate::segment::range_covers::Cover;
+use crate::segment::range_covers::{Cover, MOST_RANGE_COVERS};
 
 /// In-flight writes an open segment takes before the volume opens another
 pub const WRITES_PER_OPEN: u32 = 2;
@@ -37,6 +39,8 @@ pub struct ClaimRequest {
     pub bytes: ByteCount,
     pub rows: RowCount,
     pub is_alone: bool,
+    pub has_records: bool,
+    pub covers: usize,
 }
 
 /// A value on its way to a record
@@ -87,6 +91,131 @@ impl<Backend: Io> EngineState<Backend> {
         self.encoders.with(|encoder| self.write_encoded(volume, &write, encoder))
     }
 
+    /// Land a small record in its slot's window, so the put makes no write call: the record reaches the kernel with
+    /// the rows that list it, and a put a sync covers returns after that sync
+    pub fn land_held(
+        &self,
+        volume: &Volume<Backend>,
+        write: &ValueWrite,
+        record: &PlainRecord,
+        length: ByteCount,
+    ) -> Result<(), StoreError> {
+        let request = ClaimRequest {
+            bytes: ByteCount(0),
+            rows: RowCount(1),
+            is_alone: false,
+            has_records: true,
+            covers: 0,
+        };
+        let size = row_size(write.key.len());
+        loop {
+            let claim = self.claim(volume, &request)?;
+            let (slot, place) = (claim.slot, claim.first_place());
+            let head = record.head(self.record_key, place);
+            let Some(offset) = self.reserve_in_window(volume, slot, [&head, write.value], size)? else {
+                drop(claim);
+                return self.land_record(volume, write, length, |claim| {
+                    let head = record.head(self.record_key, claim.first_place());
+                    claim.data.write_at(claim.offset, &[IoSlice::new(&head), IoSlice::new(write.value)])
+                });
+            };
+
+            let row = WriteRow {
+                place,
+                offset,
+                length,
+                kind: RowKind::Value,
+                slot,
+                segment: claim.segment,
+                has_newer_sealed: false,
+            };
+            let queue = &self.queues[slot.0 as usize];
+            if !self.index.insert(write.column, write.key, &row) {
+                hold(queue).reserved -= size;
+                drop(claim);
+                self.wait_for_index(write.column, write.key, slot)?;
+                continue;
+            }
+
+            let entry = RowEntry {
+                column: write.column,
+                key: write.key,
+                place,
+                offset,
+                length,
+                kind: RowKind::Value,
+            };
+            {
+                let mut guard = hold(queue);
+                guard.reserved -= size;
+                guard.filling.push(&entry);
+            }
+            self.wake_row_job();
+            claim.land();
+            return self.after_write(volume, length);
+        }
+    }
+
+    /// Copy a record into a slot's window and hold room for its row, or return nothing when the segment has no room
+    /// left for a window
+    pub fn reserve_in_window(
+        &self,
+        volume: &Volume<Backend>,
+        slot: OpenSlot,
+        parts: [&[u8]; 2],
+        size: usize,
+    ) -> Result<Option<FileOffset>, StoreError> {
+        let length = parts[0].len() + parts[1].len();
+        let queue = &self.queues[slot.0 as usize];
+        loop {
+            let mut guard = hold(queue);
+            let has_row_room = guard.filling.has_room(guard.reserved + size);
+            if has_row_room && guard.records.has_room(length) {
+                guard.reserved += size;
+                return Ok(Some(guard.records.push(parts)));
+            }
+
+            let needs_window = !guard.records.has_room(length) && !guard.is_refilling;
+            guard.is_refilling |= needs_window;
+            drop(guard);
+            if !needs_window && has_row_room {
+                self.io.pause();
+                continue;
+            }
+
+            let sent = self.write_out(slot).map_err(|source| StoreError::Io {
+                action: "writing rows",
+                source,
+            });
+            let has_window = !needs_window || sent.is_ok() && self.claim_window(volume, slot, length);
+            if needs_window {
+                hold(queue).is_refilling = false;
+            }
+            sent?;
+            if !has_window {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Claim the next range of a segment for its window, and return false when too little of the segment is left
+    pub fn claim_window(&self, volume: &Volume<Backend>, slot: OpenSlot, length: usize) -> bool {
+        let mut claims = hold(&volume.claims);
+        let Some(segment) = claims.open.iter_mut().find(|segment| segment.slot == slot) else {
+            return false;
+        };
+        let left = volume.segment_bytes.0.saturating_sub(segment.write_end.0) as usize;
+        let room = left.min(RECORD_WINDOW_BYTES);
+        if room < length {
+            return false;
+        }
+        let start = segment.write_end;
+        segment.write_end = FileOffset(start.0 + room as u64);
+        drop(claims);
+        hold(&self.queues[slot.0 as usize]).records.reset(start, room);
+        true
+    }
+
     /// Write a one-chunk value as it stands, with its head on the stack, so no writer waits for a shared encoder
     pub fn write_plain(&self, volume: &Volume<Backend>, write: &ValueWrite) -> Result<(), StoreError> {
         let identity = RecordIdentity {
@@ -98,6 +227,9 @@ impl<Backend: Io> EngineState<Backend> {
         };
         let record = PlainRecord::new(&identity, write.value);
         let length = plain_length(ByteCount(write.value.len() as u64));
+        if length.0 as usize <= MOST_WINDOW_RECORD_BYTES {
+            return self.land_held(volume, write, &record, length);
+        }
         self.land_record(volume, write, length, |claim| {
             let head = record.head(self.record_key, claim.first_place());
             claim.data.write_at(claim.offset, &[IoSlice::new(&head), IoSlice::new(write.value)])
@@ -162,6 +294,8 @@ impl<Backend: Io> EngineState<Backend> {
             bytes: length,
             rows: RowCount(1),
             is_alone: false,
+            has_records: true,
+            covers: 0,
         };
         loop {
             let claim = self.claim(volume, &request)?;
@@ -207,6 +341,8 @@ impl<Backend: Io> EngineState<Backend> {
             bytes: ByteCount(0),
             rows: RowCount(1),
             is_alone: false,
+            has_records: false,
+            covers: 0,
         };
         loop {
             let claim = self.claim(volume, &request)?;
@@ -278,6 +414,8 @@ impl<Backend: Io> EngineState<Backend> {
             bytes: length,
             rows: RowCount(1),
             is_alone: false,
+            has_records: true,
+            covers: 1,
         };
         loop {
             let claim = self.claim(volume, &request)?;
@@ -444,6 +582,7 @@ impl<Backend: Io> EngineState<Backend> {
                 segment.write_end = FileOffset(offset.0 + request.bytes.0);
                 segment.row_count = RowCount(segment.row_count.0 + request.rows.0);
                 segment.in_flight += 1;
+                segment.cover_rows += request.covers;
                 segment.lowest_place = segment.lowest_place.min(ticket.first);
                 segment.highest_place = segment.highest_place.max(ticket.last);
                 let number = segment.number;
@@ -571,7 +710,7 @@ impl<Backend: Io> EngineState<Backend> {
             .io
             .free_space(path)
             .map_err(|source| store_error(volume, "reading free space", source))?;
-        if request.bytes.0 > 0 && free.0 < volume.reserve.0 + volume.segment_bytes.0 {
+        if request.has_records && free.0 < volume.reserve.0 + volume.segment_bytes.0 {
             return Err(StoreError::VolumeFull { volume: volume.id });
         }
 
@@ -597,7 +736,7 @@ impl<Backend: Io> EngineState<Backend> {
     ) -> Result<OpenSegment<Backend::File>, StoreError> {
         let path = &volume.roots[root.0 as usize];
         let number = self.next_segment_number()?;
-        let reserved = if request.bytes.0 > 0 {
+        let reserved = if request.has_records {
             ByteCount(volume.segment_bytes.0.max(request.bytes.0))
         } else {
             ByteCount(0)
@@ -643,6 +782,7 @@ impl<Backend: Io> EngineState<Backend> {
             write_end: FileOffset(0),
             row_count: RowCount(0),
             in_flight: 0,
+            cover_rows: 0,
             lowest_place: WritePlace(u64::MAX),
             highest_place: WritePlace(0),
         })
@@ -831,17 +971,30 @@ impl<Backend: Io> EngineState<Backend> {
             group
         };
 
+        let mut window = match hold(&self.spare_windows[index]).take() {
+            Some(window) => window,
+            None => return Err(Error::other("rows queue lost its spare window")),
+        };
+
         let (rows_end, synced_through, mut marked_end) = {
             let mut queue = hold(&self.queues[index]);
             // a group a failed write left behind goes first, and whole
             if group.is_empty() {
                 mem::swap(&mut queue.filling, &mut group);
             }
+            // records go first, so the rows that list them never reach the kernel alone
+            if window.is_empty() {
+                queue.records.hand_over(&mut window);
+            }
+            let window_end = FileOffset(window.start().0 + window.records().len() as u64);
+            queue.sending = Some((window.start(), window_end));
             (queue.rows_end, queue.synced_through, queue.marked_end)
         };
 
-        let mut outcome = Ok(());
-        if let Some(data) = data {
+        let mut outcome = self.send_window(index, &window);
+        if outcome.is_ok()
+            && let Some(data) = data
+        {
             // only records of rows already fixed in this group count as covered
             outcome = data.sync();
         }
@@ -881,15 +1034,33 @@ impl<Backend: Io> EngineState<Backend> {
             queue.marked_end = marked_end;
         }
         *hold(&self.spare_groups[index]) = Some(group);
+        if outcome.is_ok() {
+            window.reset(FileOffset(0), 0);
+            hold(&self.queues[index]).sending = None;
+        }
+        *hold(&self.spare_windows[index]) = Some(window);
         outcome
+    }
+
+    /// Send a window's records to the kernel
+    pub fn send_window(&self, index: usize, window: &RecordWindow) -> Result<(), Error> {
+        if window.is_empty() {
+            return Ok(());
+        }
+        let Some(file) = self.slot_files[index].file() else {
+            return Err(Error::other("a window's slot has no data file"));
+        };
+        file.write_at(window.start(), &[IoSlice::new(window.records())])
     }
 
     /// Check a slot has rows that haven't reached the kernel
     pub fn has_waiting_rows(&self, slot: OpenSlot) -> bool {
         let index = slot.0 as usize;
-        if !hold(&self.queues[index]).filling.is_empty() {
+        let queue = hold(&self.queues[index]);
+        if !queue.filling.is_empty() || !queue.records.is_empty() {
             return true;
         }
+        drop(queue);
         match hold(&self.spare_groups[index]).as_ref() {
             Some(group) => !group.is_empty(),
             None => true,
@@ -911,7 +1082,9 @@ pub fn pick_segment<Backend: Io>(
         }
         let has_bytes = segment.write_end.0 + request.bytes.0 <= volume.segment_bytes.0.max(request.bytes.0);
         let has_rows = segment.row_count.0 + request.rows.0 <= volume.segment_rows.0.max(request.rows.0);
-        let fits = has_bytes && has_rows;
+        // a seal lists a segment's covers in a buffer sized for this many
+        let has_cover_room = segment.cover_rows + request.covers <= MOST_RANGE_COVERS;
+        let fits = has_bytes && has_rows && has_cover_room;
         if !fits {
             continue;
         }

@@ -2,10 +2,12 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::thread;
 
 use crate::seed_sets::seeds;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
+use reel::guard::hold;
 use reel_sim::seeded_random::{Seed, SeededRandom};
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
@@ -13,11 +15,11 @@ use reel::record::codec::Codec;
 use reel_api::column_id::ColumnId;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId};
 
 const ROOT: &str = "/disk/meta";
 const COLUMN: ColumnId = ColumnId(1);
-const BUDGET: ByteCount = ByteCount(32 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(34 * 1024 * 1024);
 const KEY_SPACE: u64 = 400;
 const OPERATIONS: u64 = 3_000;
 const SEED_COUNT: u64 = 8;
@@ -33,6 +35,8 @@ const SEAL_CRASH_POINTS: u64 = 14;
 const SEAL_CRASH_SEEDS: u64 = 3;
 const FAILED_OPEN_POINTS: u64 = 40;
 const QUIET_ROWS: u64 = 100;
+const WINDOW_ROWS: u64 = 500;
+const WINDOW_VALUE: usize = 300;
 const LARGE_ENOUGH: usize = 100_000;
 
 type Store = ReelStore<SimulatedIo>;
@@ -579,5 +583,112 @@ fn owned_value() {
     let mut buf = Vec::new();
     assert!(store.get(COLUMN, b"key", &mut buf).expect("get"));
     assert!(buf == value);
+    store.close().expect("close");
+}
+
+// a small put makes no write call of its own, and its record reads back before and after its window goes out
+#[test]
+fn held_record() {
+    let io = SimulatedIo::new(Seed(92));
+    let store = open(&io);
+    store.put(COLUMN, b"first", b"value").expect("put");
+    store.flush().expect("flush");
+
+    let before = io.write_calls();
+    store.put(COLUMN, b"key", b"value").expect("put");
+
+    assert_eq!(io.write_calls(), before);
+    let mut buf = Vec::new();
+    assert!(store.get(COLUMN, b"key", &mut buf).expect("get"));
+    assert_eq!(buf, b"value");
+
+    store.flush().expect("flush");
+    assert!(io.write_calls() > before);
+    assert!(store.get(COLUMN, b"key", &mut buf).expect("get"));
+    assert_eq!(buf, b"value");
+    store.close().expect("close");
+}
+
+// a put that asks for durability never returns from the window
+#[test]
+fn durable_put() {
+    let io = SimulatedIo::new(Seed(93));
+    let store = ReelStore::open(io.clone(), &config(SyncPolicy::EveryWrite)).expect("open");
+    store.put(COLUMN, b"key", b"value").expect("put");
+    io.power_cut();
+    drop(store);
+
+    let store = ReelStore::open(io.clone(), &config(SyncPolicy::EveryWrite)).expect("open");
+    let mut buf = Vec::new();
+    assert!(store.get(COLUMN, b"key", &mut buf).expect("get"));
+    store.close().expect("close");
+}
+
+// a kill with records still in the window loses them and their rows together, so no row lists bytes never written
+#[test]
+fn window_killed() {
+    let io = SimulatedIo::new(Seed(94));
+    let store = open(&io);
+    store.put(COLUMN, b"older", b"value").expect("put");
+    store.flush().expect("flush");
+    store.put(COLUMN, b"younger", b"value").expect("put");
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+
+    let mut buf = Vec::new();
+    assert!(store.get(COLUMN, b"older", &mut buf).expect("get"));
+    assert!(!store.get(COLUMN, b"younger", &mut buf).expect("get"));
+    store.close().expect("close");
+}
+
+// records past one window roll to the next range of the file, and every one reads back after a reopen
+#[test]
+fn window_rolls() {
+    let io = SimulatedIo::new(Seed(95));
+    let store = open(&io);
+    let value = vec![9; WINDOW_VALUE];
+    for number in 0..WINDOW_ROWS {
+        store.put(COLUMN, &number.to_le_bytes(), &value).expect("put");
+    }
+    let mut buf = Vec::new();
+    for number in 0..WINDOW_ROWS {
+        assert!(store.get(COLUMN, &number.to_le_bytes(), &mut buf).expect("get"));
+        assert_eq!(buf, value);
+    }
+    store.flush().expect("flush");
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+    for number in 0..WINDOW_ROWS {
+        assert!(store.get(COLUMN, &number.to_le_bytes(), &mut buf).expect("get"));
+        assert_eq!(buf, value);
+    }
+    store.close().expect("close");
+}
+
+// a get during the window's write waits for it and reads the record whole
+#[test]
+fn window_sending() {
+    let io = SimulatedIo::new(Seed(96));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let slot = hold(&store.state.volumes[0].claims).open[0].slot;
+    hold(&store.state.queues[slot.0 as usize]).sending = Some((FileOffset(0), FileOffset(1)));
+    let spare = hold(&store.state.spare_windows[slot.0 as usize]).take();
+
+    thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            let mut buf = Vec::new();
+            store.get(COLUMN, b"key", &mut buf).map(|has_value| (has_value, buf))
+        });
+        *hold(&store.state.spare_windows[slot.0 as usize]) = spare;
+        hold(&store.state.queues[slot.0 as usize]).sending = None;
+        let (has_value, buf) = reader.join().expect("join").expect("get");
+        assert!(has_value);
+        assert_eq!(buf, b"value");
+    });
     store.close().expect("close");
 }

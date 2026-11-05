@@ -83,6 +83,25 @@ impl RecordReader {
         ByteCount(total as u64)
     }
 
+    /// Check a one-chunk record still in memory and fill the buffer from it
+    pub fn read_held(
+        &mut self,
+        record: &[u8],
+        identity: &RecordIdentity,
+        window: Option<ValueWindow>,
+        buf: &mut Vec<u8>,
+    ) -> RecordRead {
+        self.first[..record.len()].copy_from_slice(record);
+        let Some(form) = self.form() else {
+            return RecordRead::Failed;
+        };
+        let read = self.finish_small(form, record.len(), identity, buf);
+        if let Some(window) = window {
+            cut_to_window(buf, window);
+        }
+        read
+    }
+
     /// Fill the buffer with the whole value, in one read when the column stores values as written
     pub fn read_value<File: IoFile>(
         &mut self,

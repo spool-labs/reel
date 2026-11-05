@@ -221,6 +221,8 @@ fn seen_whole() {
         bytes: ByteCount(0),
         rows: RowCount(1),
         is_alone: false,
+        has_records: false,
+        covers: 0,
     };
     let earlier = store.state.claim(volume, &request).expect("claim");
 
@@ -541,9 +543,9 @@ fn shared_group() {
     store.put(PLAIN, b"beside", b"newer").expect("put");
     store.write_batch(&batch_of(b"newer")).expect("batch");
     store.put(PLAIN, b"after", b"newer").expect("put");
-    let (slot, data) = open_data(&store);
+    let (slot, _data) = open_data(&store);
     store.state.write_out(slot).expect("write out");
-    let lost = last_record(&io, &key_of(2));
+    let (data, lost) = last_record(&io, &key_of(2));
     io.kill();
     drop(store);
     io.rot(&data, lost, BitMask(1)).expect("rot");
@@ -563,8 +565,8 @@ fn open_data(store: &Store) -> (OpenSlot, PathBuf) {
     (segment.slot, data_path(Path::new(ROOT), segment.number).to_path_buf())
 }
 
-// where the newest row of a key says its record sits
-fn last_record(io: &SimulatedIo, key: &[u8]) -> FileOffset {
+// where the newest row of a key says its record sits, in which data file
+fn last_record(io: &SimulatedIo, key: &[u8]) -> (PathBuf, FileOffset) {
     let superblock = Superblock::read(io, Path::new(ROOT)).expect("read").expect("superblock");
     let mut found = None;
     for path in io.list_directory(Path::new(ROOT)).expect("list") {
@@ -579,7 +581,7 @@ fn last_record(io: &SimulatedIo, key: &[u8]) -> FileOffset {
         while let Some(group) = bytes.get(at..).and_then(|rest| parse_group(rest, superblock.record_key)) {
             for row in group.walk() {
                 if row.key == key {
-                    found = Some(row.offset);
+                    found = Some((path.with_extension("data"), row.offset));
                 }
             }
             at += group.total_length.0 as usize;
@@ -599,6 +601,8 @@ fn alone_claim() {
         bytes,
         rows: RowCount(1),
         is_alone: true,
+        has_records: true,
+        covers: 0,
     };
     let short = ClaimRequest { is_alone: false, ..long };
 
@@ -625,6 +629,8 @@ fn rows_go_first() {
         bytes: ByteCount(0),
         rows: RowCount(1),
         is_alone: false,
+        has_records: false,
+        covers: 0,
     };
     let earlier = store.state.claim(volume, &request).expect("claim");
     let place = earlier.first_place();
@@ -668,6 +674,8 @@ fn turn_spares_puts() {
         bytes: ByteCount(1),
         rows: RowCount(1),
         is_alone: true,
+        has_records: true,
+        covers: 0,
     };
     let claim = store.state.claim(volume, &long).expect("claim");
     let slot = claim.slot;
@@ -782,8 +790,7 @@ fn long_lost_record() {
     store.flush().expect("flush");
 
     store.write_batch(&long_batch(Some(b"newer"))).expect("batch");
-    let (_slot, data) = open_data(&store);
-    let lost = last_record(&io, &key_of(LONG_ROWS - 1));
+    let (data, lost) = last_record(&io, &key_of(LONG_ROWS - 1));
     io.kill();
     drop(store);
     io.rot(&data, lost, BitMask(1)).expect("rot");
@@ -911,6 +918,8 @@ fn long_seal_beside() {
         bytes: ByteCount(0),
         rows: RowCount(1),
         is_alone: false,
+        has_records: false,
+        covers: 0,
     };
     let earlier = store.state.claim(volume, &request).expect("claim");
 

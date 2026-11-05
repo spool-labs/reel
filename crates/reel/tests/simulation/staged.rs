@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::io::IoSlice;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
@@ -10,6 +10,7 @@ use crate::seed_sets::seeds;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::claim::Claim;
 use reel::engine::engine_state::EngineState;
+use reel::engine::open_segment::{data_path, rows_path};
 use reel::engine::read_path::{KeyRead, RecordWant};
 use reel::engine::recovery::seal_every_open;
 use reel::engine::reel_store::ReelStore;
@@ -1177,5 +1178,29 @@ fn empty_open() {
     let store = open(&io);
 
     assert!(hold(&store.state.volumes[0].claims).open.is_empty());
+    store.close().expect("close");
+}
+
+// a rows file of bytes that read and fail their checks isn't a spare's empty file, so its segment stays
+#[test]
+fn rotted_rows() {
+    let io = SimulatedIo::new(Seed(42));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    store.flush().expect("flush");
+    let number = hold(&store.state.volumes[0].claims).open[0].number;
+    io.kill();
+    drop(store);
+    let rows = rows_path(Path::new(ROOT), number);
+    let file = io.open_file(&rows).expect("open");
+    let junk = vec![0xFF; file.length().expect("length").0 as usize];
+    file.write_at(FileOffset(0), &[IoSlice::new(&junk)]).expect("write");
+    file.sync().expect("sync");
+    io.close_file(file);
+
+    let store = open(&io);
+
+    let data = data_path(Path::new(ROOT), number).to_path_buf();
+    assert!(io.list_directory(Path::new(ROOT)).expect("list").contains(&data));
     store.close().expect("close");
 }

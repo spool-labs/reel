@@ -820,8 +820,8 @@ pub fn recover_segments<Backend: Io>(
 pub fn recover_one<Backend: Io>(state: &Arc<EngineState<Backend>>, segment: &ScannedOpen<Backend::File>) -> Result<bool> {
     let index = segment.found.volume;
     let volume = &state.volumes[index];
-    // a segment made ahead that no claim took holds nothing, and a crash left it behind
-    if segment.scan.row_count.0 == 0 && !segment.scan.has_rot && hold(&volume.summary).get(segment.found.number).is_none() {
+    // a segment made ahead that no claim took has an empty rows file. Bytes that fail their check are something else
+    if segment.rows.length()?.0 == 0 && hold(&volume.summary).get(segment.found.number).is_none() {
         return Ok(false);
     }
     if segment.scan.row_count > volume.segment_rows {

@@ -23,6 +23,8 @@ fn head() -> TailHead {
         index_sum: Checksum(8),
         ranges_sum: Checksum(9),
         column_count: 2,
+        input_count: 1,
+        inputs: [SegmentNumber(5); MOST_MERGE_SEGMENTS],
     }
 }
 

@@ -95,7 +95,7 @@ fn write_rows(columns: &[ColumnRows]) -> Written {
             writer.push_row(&file, key, row).expect("row");
         }
     }
-    let totals = writer.finish(&file, SEGMENT, DATA_END, b"", RECORD_KEY).expect("finish");
+    let totals = writer.finish(&file, SEGMENT, DATA_END, b"", RECORD_KEY, &[]).expect("finish");
     Written { io, path, file, totals }
 }
 
@@ -405,7 +405,7 @@ fn cut_during_footer(rows: &[(Vec<u8>, FooterRow)], crash_at: OperationCount, se
         }
     }
     if outcome.is_ok() {
-        let finished = writer.finish(&file, SEGMENT, DATA_END, b"", RECORD_KEY);
+        let finished = writer.finish(&file, SEGMENT, DATA_END, b"", RECORD_KEY, &[]);
         outcome = finished.map(|_totals| ());
     }
     // a crash that never fired still loses whatever the last sync didn't cover

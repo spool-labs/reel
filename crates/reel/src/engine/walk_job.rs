@@ -476,6 +476,7 @@ impl<Backend: Io> WalkJob<Backend> {
             let length = ByteCount(end - start);
             if pin.file.free_range(FileOffset(start), length).is_ok() {
                 volume.bytes_freed.fetch_add(length.0, Ordering::AcqRel);
+                volume.table.note_freed(free.segment, length.0);
             }
         }
         true
@@ -565,6 +566,10 @@ impl<Backend: Io> WalkJob<Backend> {
         self.free_waiting(volume);
         if let Some(index) = self.failed_slot.take() {
             assign(&volume.walk_slots[index]);
+        }
+        if self.target.is_none() && volume.is_rewriting.load(Ordering::Acquire) {
+            volume.walks_held.fetch_add(1, Ordering::Relaxed);
+            return UnitStep::Idle;
         }
         if self.target.is_none() && !self.pick_target() {
             return UnitStep::Idle;

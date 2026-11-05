@@ -12,9 +12,9 @@ pub const TAIL_MAGIC: u32 = 0x5245_4C54;
 /// Bytes at the very end: the tail's length, the magic and the checksum
 pub const TRAILER_BYTES: usize = 16;
 /// Bytes of the fixed part of a tail
-pub const TAIL_FIXED_BYTES: usize = 100;
-/// Spare bytes in the fixed part of a tail
-pub const TAIL_PADDING_BYTES: usize = 4;
+pub const TAIL_FIXED_BYTES: usize = 100 + MOST_MERGE_SEGMENTS * size_of::<u64>();
+/// Most segments one compaction merges into one, which a tail lists as its inputs
+pub const MOST_MERGE_SEGMENTS: usize = 8;
 /// Bytes of one column's part of a tail
 pub const COLUMN_TAIL_BYTES: usize = 72;
 /// Spare bytes in one column's part of a tail
@@ -75,6 +75,8 @@ pub struct TailHead {
     pub index_sum: Checksum,
     pub ranges_sum: Checksum,
     pub column_count: u32,
+    pub input_count: u32,
+    pub inputs: [SegmentNumber; MOST_MERGE_SEGMENTS],
 }
 
 /// Writes the fixed fields of a tail in order
@@ -155,12 +157,20 @@ impl TailHead {
         out.put(&self.index_sum.0.to_le_bytes());
         out.put(&self.ranges_sum.0.to_le_bytes());
         out.put(&self.column_count.to_le_bytes());
-        out.put(&[0; TAIL_PADDING_BYTES]);
+        out.put(&self.input_count.to_le_bytes());
+        for input in &self.inputs {
+            out.put(&input.0.to_le_bytes());
+        }
+    }
+
+    /// Read the segments this one replaced
+    pub fn inputs(&self) -> &[SegmentNumber] {
+        self.inputs.get(..self.input_count as usize).unwrap_or_default()
     }
 
     /// Read the fixed fields back
     pub fn read(input: &mut TailReader) -> Option<Self> {
-        let head = Self {
+        let mut head = Self {
             segment: SegmentNumber(input.word()?),
             data_end: FileOffset(input.word()?),
             index_at: FileOffset(input.word()?),
@@ -176,8 +186,12 @@ impl TailHead {
             index_sum: Checksum(input.word()?),
             ranges_sum: Checksum(input.word()?),
             column_count: input.half()?,
+            input_count: input.half()?,
+            inputs: [SegmentNumber(0); MOST_MERGE_SEGMENTS],
         };
-        input.take(TAIL_PADDING_BYTES)?;
+        for segment in &mut head.inputs {
+            *segment = SegmentNumber(input.word()?);
+        }
         Some(head)
     }
 }

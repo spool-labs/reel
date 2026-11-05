@@ -35,6 +35,16 @@ pub struct ParkedSegment<File> {
     pub is_saved: bool,
 }
 
+/// The file a rewrite is writing
+#[derive(Clone, Debug)]
+pub struct RewriteOutput<File> {
+    pub file: File,
+    pub root: usize,
+    pub number: SegmentNumber,
+    /// The tail is durable and the file has a segment's name
+    pub is_named: bool,
+}
+
 /// Where a volume's sync stands
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SyncState {
@@ -88,6 +98,13 @@ pub struct Volume<Backend: Io> {
     pub segments_unlinked: AtomicU64,
     pub segments_parked: AtomicU64,
     pub parked: Mutex<[Option<ParkedSegment<Backend::File>>; MOST_PARKED]>,
+    pub segments_rewritten: AtomicU64,
+    /// A rewrite has made its first row decision and not installed. Rows it decided on must stay as they were, so no walk
+    /// starts a target
+    pub is_rewriting: AtomicBool,
+    /// Counts the turns a walk stood aside for a rewrite
+    pub walks_held: AtomicU64,
+    pub partial_output: Mutex<Option<RewriteOutput<Backend::File>>>,
     pub summary: Mutex<SummaryRows>,
     pub summary_paths: SummaryPaths,
     pub lost_rows: Mutex<LostRows>,
@@ -138,6 +155,11 @@ impl<Backend: Io> Volume<Backend> {
     /// Check a replayed row could sit under a newer row in a sealed segment
     pub fn may_hide_under_sealed(&self, place: WritePlace) -> bool {
         place.0 < self.highest_sealed.load(Ordering::Acquire)
+    }
+
+    /// Check the park has room for another segment
+    pub fn can_park(&self) -> bool {
+        hold(&self.parked).iter().any(Option::is_none)
     }
 
     /// Read the handover counter a get compares before it fills the spot cache

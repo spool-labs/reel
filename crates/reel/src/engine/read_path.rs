@@ -645,8 +645,13 @@ impl<Backend: Io> EngineState<Backend> {
             reader.candidates = candidates;
             outcome?;
 
-            if !page.is_cut {
+            // a segment that left under this walk took rows with it, and the list that took it out has their new home
+            if !page.is_cut && directory.generation() == page.generation {
                 return Ok(best);
+            }
+            if !page.is_cut {
+                skip = 0;
+                generation = None;
             }
         }
     }

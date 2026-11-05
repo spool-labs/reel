@@ -55,7 +55,7 @@ pub const MOST_WALK_WORKERS: usize = 2;
 /// A store gets one walk worker a volume for each this much budget, up to the most
 pub const WALK_WORKER_BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
 /// Bytes a compaction job's own buffers are planned at
-pub const COMPACT_JOB_BYTES: u64 = 128 * 1024;
+pub const COMPACT_JOB_BYTES: u64 = 5 * 1024 * 1024;
 /// Bytes a job's stack is planned at
 pub const JOB_STACK_PLAN_BYTES: u64 = 1024 * 1024;
 /// Jobs a store runs beside one seal job a volume: row write-out, reservations and the planner
@@ -63,8 +63,8 @@ pub const SHARED_JOBS: u64 = 3;
 /// Bytes a row of the write index really takes, node, page and table share included, with a long batch's length of it
 pub const PLANNED_ROW_BYTES: u64 = 227;
 /// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight. With one
-/// lz4 column and 64 B keys that gives these rows a segment: 45,944 at 128 MiB, 138,330 at 192 MiB, 600,257 at 512 MiB and
-/// 5,773,848 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
+/// lz4 column and 64 B keys that gives these rows a segment: 38,906 at 128 MiB, 131,292 at 192 MiB, 593,220 at 512 MiB and
+/// 5,766,811 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
 /// records seal smaller and reach their size through merges, whose outputs the write index doesn't bound
 pub const SEAL_ROWS_EIGHTHS: u64 = 5;
 /// The most stored bytes of a value on an lz4 column, which is also the compress pool, cut into shares

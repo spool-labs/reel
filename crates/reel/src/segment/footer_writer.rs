@@ -17,7 +17,7 @@ use crate::segment::row_block::{
 };
 use crate::segment::summary::{ColumnFacts, SUMMARY_KEY_BYTES, put_bound, put_lowest};
 use crate::segment::segment_tail::{
-    BlockCount, COLUMN_TAIL_BYTES, COPY_GAP_BYTES, ColumnTail, MAX_COLUMNS, MAX_TAIL_BYTES, MOST_SEGMENT_BYTES,
+    BlockCount, COLUMN_TAIL_BYTES, COPY_GAP_BYTES, ColumnTail, MAX_COLUMNS, MAX_TAIL_BYTES, MOST_MERGE_SEGMENTS, MOST_SEGMENT_BYTES,
     PlaceRange, SECOND_TAIL_DISTANCE, SegmentNumber, TAIL_FIXED_BYTES, TailCursor, TailHead, write_trailer,
 };
 
@@ -127,6 +127,20 @@ impl FooterWriter {
             live_bytes: keys.value_bytes,
             dead_bytes: ByteCount(0),
         }
+    }
+
+    /// Read where the next row block goes
+    pub fn position(&self) -> FileOffset {
+        self.position
+    }
+
+    /// Note the blocks written so far moved down the file by this many bytes
+    pub fn move_down(&mut self, bytes: ByteCount) {
+        for entry in &mut self.entries {
+            entry.block_offset -= bytes.0 as u32;
+            entry.filter_offset -= bytes.0 as u32;
+        }
+        self.position = FileOffset(self.position.0 - bytes.0);
     }
 
     /// Start a footer right after a segment's records
@@ -278,6 +292,7 @@ impl FooterWriter {
         data_end: FileOffset,
         ranges: &[u8],
         record_key: RecordKey,
+        inputs: &[SegmentNumber],
     ) -> Result<FooterTotals> {
         self.close_block(file)?;
 
@@ -298,6 +313,8 @@ impl FooterWriter {
         // the footer must be whole before a tail can say so, or a power cut could keep the tail alone
         file.sync()?;
 
+        let mut listed = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
+        listed[..inputs.len()].copy_from_slice(inputs);
         let head = TailHead {
             segment,
             data_end,
@@ -311,6 +328,8 @@ impl FooterWriter {
             index_sum,
             ranges_sum: checksum(ranges),
             column_count: self.columns.len() as u32,
+            input_count: inputs.len() as u32,
+            inputs: listed,
         };
         let total = self.write_tail(&head, record_key);
         let second_tail_at = self.position;

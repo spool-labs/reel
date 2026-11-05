@@ -14,8 +14,8 @@ use crate::engine::column_info::ColumnInfo;
 use crate::engine::cue::CueTable;
 use crate::engine::engine_sizing::EngineSizing;
 use crate::engine::open_segment::{RecordWindow, RowQueue};
-use crate::engine::open_segment::data_path;
-use crate::engine::volume::{ParkedSegment, Volume};
+use crate::engine::open_segment::{data_path, output_path};
+use crate::engine::volume::{ParkedSegment, RewriteOutput, Volume};
 use crate::segment::range_covers::Cover;
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
@@ -321,6 +321,16 @@ impl<Backend: Io> EngineState<Backend> {
             }
         }
         Ok(())
+    }
+
+    /// Close a rewrite's output and remove it under whichever name it reached
+    pub fn remove_output(&self, volume: &Volume<Backend>, output: RewriteOutput<Backend::File>) {
+        let root = &volume.roots[output.root];
+        self.io.close_file(output.file);
+        let path = if output.is_named { data_path(root, output.number) } else { output_path(root, output.number) };
+        // what stays behind goes at the next open
+        let _removed = self.io.remove_file(&path);
+        let _synced = self.io.sync_directory(root);
     }
 
     /// Bring the planner back to every volume's compaction

@@ -25,7 +25,7 @@ use crate::counting::counted;
 const ROOT: &str = "/disk/allocations";
 const META: ColumnId = ColumnId(1);
 const BULK: ColumnId = ColumnId(2);
-const BUDGET: ByteCount = ByteCount(160 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(165 * 1024 * 1024);
 const LONG_ROWS: usize = 4_000;
 const LONG_VALUE: &[u8] = b"a value on each column of a long batch, a value on each column of a long batch";
 const KEYS: usize = 64;

@@ -39,6 +39,7 @@ pub struct TableEntry<File> {
     pub blocks: Extent,
     pub is_walked: bool,
     pub highest_replacement: WritePlace,
+    pub freed_bytes: u64,
 }
 
 /// A segment held open for a read, let go when dropped
@@ -272,6 +273,7 @@ impl<File: Clone> SegmentTable<File> {
             blocks: block_extent,
             is_walked: false,
             highest_replacement: WritePlace(0),
+            freed_bytes: 0,
         });
         guard.map.insert(head.segment, slot);
         true
@@ -321,6 +323,24 @@ impl<File: Clone> SegmentTable<File> {
         if let Some(line) = guard.blocks.get_mut(start as usize + block as usize) {
             line.live_rows = line.live_rows.saturating_sub(rows);
         }
+    }
+
+    /// Note bytes a segment gave back in place
+    pub fn note_freed(&self, number: SegmentNumber, bytes: u64) {
+        let mut guard = self.write_shard(shard_of(number));
+        let Some(slot) = guard.map.get(number) else {
+            return;
+        };
+        if let Some(entry) = guard.segments[slot as usize].as_mut() {
+            entry.freed_bytes += bytes;
+        }
+    }
+
+    /// Read the bytes a segment gave back in place since this open. A reopen forgets them, which costs one needless rewrite
+    pub fn freed_bytes(&self, number: SegmentNumber) -> u64 {
+        let guard = self.read_shard(shard_of(number));
+        let entry = guard.map.get(number).and_then(|slot| guard.segments[slot as usize].as_ref());
+        entry.map_or(0, |entry| entry.freed_bytes)
     }
 
     /// Find which of a segment's blocks starts at an offset in its file
@@ -403,6 +423,15 @@ impl<File: Clone> SegmentTable<File> {
     /// Give a retired segment's slot back, once no read holds it
     pub fn free_retired(&self, retired: &RetiredSegment<File>) {
         self.write_shard(retired.shard).free_slots.push(retired.slot);
+    }
+
+    /// Read where a column's blocks start in a segment and how many there are
+    pub fn column_blocks(&self, number: SegmentNumber, column: ColumnId) -> Option<(u32, u32)> {
+        let guard = self.read_shard(shard_of(number));
+        let slot = guard.map.get(number)?;
+        let entry = guard.segments[slot as usize].as_ref()?;
+        let tail = guard.column_of(entry, column)?;
+        Some((tail.first_block, tail.block_count.0))
     }
 
     /// Copy out the block lines that can hold a key, from a block onward

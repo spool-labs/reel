@@ -1,10 +1,12 @@
-//! Compaction, a planner unit: first the cheapest reclaim there is, unlinking a segment with nothing live in it
+//! Compaction, a planner unit: first the cheapest reclaim there is, unlinking a segment with nothing live in it, then a
+//! rewrite of a half-dead one
 //!
 //! A segment goes when its row block index shows no live row, and no live cue reads below the highest place that replaced
 //! its rows. The summary never overstates dead, so that takes no lookups. Damage and covers keep a segment, since their
 //! rows answer for more than themselves.
 
 use std::io::{Error, ErrorKind, Result};
+use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -14,6 +16,7 @@ use reel_api::units::{ByteCount, Nanoseconds, WritePlace};
 use crate::config::MAX_KEY_BYTES;
 use crate::engine::engine_state::EngineState;
 use crate::engine::planner::UnitStep;
+use crate::engine::rewrite_job::RewriteJob;
 use crate::engine::volume::{ParkedSegment, Volume};
 use crate::engine::walk_job::WALK_RETRY;
 use crate::guard::hold;
@@ -23,6 +26,7 @@ use crate::pool::{touched_capacity, touched_zeroes};
 use crate::row_kind::RowKind;
 use crate::segment::range_covers::Cover;
 use crate::segment::row_block::{ROW_BLOCK_BYTES, RowBlockWalk};
+use crate::segment::segment_table::RetiredSegment;
 use crate::segment::segment_tail::SegmentNumber;
 use crate::segment::summary::SummaryRow;
 
@@ -34,6 +38,8 @@ pub struct CompactJob<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
     pub volume: usize,
     pub retry_at: Option<Nanoseconds>,
+    pub rewrite: RewriteJob<Backend>,
+    should_rewrite: bool,
     last_tried: SegmentNumber,
     block: Vec<u8>,
     key: Vec<u8>,
@@ -46,6 +52,8 @@ impl<Backend: Io> CompactJob<Backend> {
         // a mutex's first lock can allocate, and this one's could otherwise come in a close
         drop(hold(&state.volumes[volume].parked));
         Self {
+            rewrite: RewriteJob::new(Arc::clone(&state), volume),
+            should_rewrite: false,
             state,
             volume,
             retry_at: None,
@@ -58,7 +66,8 @@ impl<Backend: Io> CompactJob<Backend> {
 
     /// Read the heap the job's buffers hold
     pub fn heap_bytes(&self) -> ByteCount {
-        ByteCount((self.block.capacity() + self.key.capacity() + self.end.capacity()) as u64)
+        let buffers = self.block.capacity() + self.key.capacity() + self.end.capacity();
+        ByteCount(buffers as u64 + self.rewrite.heap_bytes().0)
     }
 
     /// Step once: try the next segment the counts call dead, or nothing when none is
@@ -99,11 +108,17 @@ impl<Backend: Io> CompactJob<Backend> {
             self.sweep_covers(volume);
             return UnitStep::Worked;
         }
-        if !volume.wants_compaction.swap(false, Ordering::AcqRel) {
-            return UnitStep::Idle;
+        if self.rewrite.is_running() {
+            self.rewrite.step();
+            return UnitStep::Worked;
         }
-        let Some(segment) = self.pick_dead(volume) else {
-            return UnitStep::Idle;
+        let is_asked = volume.wants_compaction.swap(false, Ordering::AcqRel);
+        self.should_rewrite |= is_asked;
+        let candidate = if is_asked { self.pick_dead(volume) } else { None };
+        let Some(segment) = candidate else {
+            // an unlink wins back the most for the least, so a rewrite waits until none is left to try
+            let should_rewrite = mem::take(&mut self.should_rewrite);
+            return if should_rewrite && self.rewrite.start() { UnitStep::Worked } else { UnitStep::Idle };
         };
         match self.confirm(volume, segment) {
             Ok(()) => UnitStep::Worked,
@@ -122,11 +137,6 @@ impl<Backend: Io> CompactJob<Backend> {
             slot.as_ref().is_some_and(|parked| volume.table.retired_pins(&parked.retired) == 0)
         })?;
         slot.take()
-    }
-
-    /// Check the volume has room to park another segment
-    pub fn can_park(&self, volume: &Volume<Backend>) -> bool {
-        hold(&volume.parked).iter().any(Option::is_none)
     }
 
     /// Drop covers a cue kept inside newer ones, once no cue reads below those. Each cover takes its own hold of the pool,
@@ -220,7 +230,7 @@ impl<Backend: Io> CompactJob<Backend> {
     /// crash before it goes leaves a segment with no row, which open walks backward and finds dead again
     pub fn unlink(&self, volume: &Volume<Backend>, segment: SegmentNumber, highest_replacement: WritePlace) -> Result<()> {
         let state = &self.state;
-        if !self.can_park(volume) || state.read_point() < highest_replacement {
+        if !volume.can_park() || state.read_point() < highest_replacement {
             return Ok(());
         }
         state.cues.note_reclaim();
@@ -238,18 +248,23 @@ impl<Backend: Io> CompactJob<Backend> {
         hold(&volume.summary).remove(segment);
         // the file goes only behind a saved summary, or open would find a row with no file
         let saved = state.save_summary(volume);
-        let parked = ParkedSegment {
-            retired,
-            segment,
-            is_saved: saved.is_ok(),
-        };
-        if let Some(slot) = hold(&volume.parked).iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(parked);
-            volume.segments_parked.fetch_add(1, Ordering::AcqRel);
-        }
+        park(volume, retired, segment, saved.is_ok());
         saved?;
         volume.segments_unlinked.fetch_add(1, Ordering::AcqRel);
         Ok(())
+    }
+}
+
+/// Hold a retired segment until no read holds it. The caller has checked `Volume::can_park`, and one planner fills the park
+pub fn park<Backend: Io>(
+    volume: &Volume<Backend>,
+    retired: RetiredSegment<Backend::File>,
+    segment: SegmentNumber,
+    is_saved: bool,
+) {
+    if let Some(slot) = hold(&volume.parked).iter_mut().find(|slot| slot.is_none()) {
+        *slot = Some(ParkedSegment { retired, segment, is_saved });
+        volume.segments_parked.fetch_add(1, Ordering::AcqRel);
     }
 }
 

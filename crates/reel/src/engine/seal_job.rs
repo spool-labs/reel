@@ -279,7 +279,7 @@ impl<Backend: Io> SealJob<Backend> {
             state.save_summary(&state.volumes[self.volume])?;
             self.has_unsaved_damage = false;
         }
-        let totals = self.writer.finish(&target.data, target.number, target.data_end, &self.ranges, state.record_key)?;
+        let totals = self.writer.finish(&target.data, target.number, target.data_end, &self.ranges, state.record_key, &[])?;
         self.totals = Some(totals);
         self.phase = SealPhase::Installing;
         Ok(())

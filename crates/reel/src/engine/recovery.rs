@@ -15,7 +15,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 use crate::engine::engine_sizing::GROUP_BYTES;
 use crate::engine::engine_state::{EngineState, SlotData};
-use crate::engine::open_segment::{DATA_SUFFIX, OpenSegment, SegmentPhase, data_path, parse_segment, rows_path};
+use crate::engine::open_segment::{DATA_SUFFIX, OUTPUT_SUFFIX, OpenSegment, SegmentPhase, data_path, parse_segment, rows_path};
 use crate::engine::seal_job::SealJob;
 use crate::engine::volume::Volume;
 use crate::engine::write_path::{ClaimRequest, LandOutcome};
@@ -78,6 +78,7 @@ pub struct FoundSealed<File> {
 #[derive(Clone, Debug)]
 pub struct FoundDamaged {
     pub volume: usize,
+    pub path: PathBuf,
     pub number: SegmentNumber,
     pub file_length: ByteCount,
     pub head: Option<TailHead>,
@@ -277,6 +278,14 @@ pub fn scan_roots<Backend: Io>(
 
     for listing in listings {
         for path in &listing.files {
+            // a stopped rewrite's output has no tail, and everything in it is still in its input
+            if parse_segment(path, OUTPUT_SUFFIX).is_some() {
+                if let Err(error) = io.remove_file(path) {
+                    scan.close_files(io);
+                    return Err(error);
+                }
+                continue;
+            }
             let Some(number) = parse_segment(path, DATA_SUFFIX) else {
                 continue;
             };
@@ -290,7 +299,35 @@ pub fn scan_roots<Backend: Io>(
             }
         }
     }
+    if let Err(error) = drop_inputs(io, &mut scan) {
+        scan.close_files(io);
+        return Err(error);
+    }
     Ok(scan)
+}
+
+/// Remove every segment a whole output lists, before anything counts them. The output has all that still answers
+pub fn drop_inputs<Backend: Io>(io: &Backend, scan: &mut RootScan<Backend::File>) -> Result<()> {
+    let inputs: Vec<SegmentNumber> = scan.sealed.iter().flat_map(|found| found.head.inputs()).copied().collect();
+    for input in inputs {
+        if let Some(at) = scan.sealed.iter().position(|found| found.head.segment == input) {
+            let found = scan.sealed.remove(at);
+            io.close_file(found.file);
+            io.remove_file(&data_path(&found.path, input))?;
+            io.sync_directory(&found.path)?;
+        }
+        if let Some(at) = scan.empty.iter().position(|found| found.number == input) {
+            let found = scan.empty.remove(at);
+            io.remove_file(&data_path(&found.root, input))?;
+            io.sync_directory(&found.root)?;
+        }
+        if let Some(at) = scan.damaged.iter().position(|found| found.number == input) {
+            let found = scan.damaged.remove(at);
+            io.remove_file(&data_path(&found.path, input))?;
+            io.sync_directory(&found.path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Read one segment and hand its file to the scan, or close it
@@ -331,6 +368,7 @@ pub fn sort_segment<Backend: Io>(
             io.close_file(file);
             scan.damaged.push(FoundDamaged {
                 volume: listing.volume,
+                path: listing.path.clone(),
                 number,
                 file_length,
                 head,
@@ -1506,6 +1544,7 @@ pub fn sort_empties<Backend: Io>(
             // a zeroed first sector on a sealed segment reads like this, and the row says what it is
             scan.damaged.push(FoundDamaged {
                 volume,
+                path: found.root.clone(),
                 number: found.number,
                 file_length: found.file_length,
                 head: None,
@@ -1540,8 +1579,9 @@ pub fn settle_sealed<Backend: Io>(
         damage_place: WritePlace(0),
         block_count: found.head.block_count.0,
         walked_blocks: 0,
-        // no saved count can hold a walk of a segment above the number, and one at or below it may be held already
-        is_backward: found.head.segment <= rows.highest_forward,
+        // no saved count can hold a walk of a segment above the number, one at or below it may be held already, and an output
+        // holds rows its input's walk already counted
+        is_backward: found.head.segment <= rows.highest_forward || found.head.input_count > 0,
     };
 
     if let Some(at) = listed.get(&facts.segment)

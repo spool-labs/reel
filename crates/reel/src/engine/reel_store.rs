@@ -359,6 +359,10 @@ impl<Backend: Io> EngineState<Backend> {
                 let _removed = self.clear_parked(volume, parked);
             }
         }
+        // a stopped rewrite leaves the store as it found it
+        if let Some(output) = hold(&volume.partial_output).take() {
+            self.remove_output(volume, output);
+        }
         let mut claims = hold(&volume.claims);
         for segment in claims.open.drain(..) {
             self.slot_files[segment.slot.0 as usize].set(None);
@@ -819,6 +823,10 @@ pub fn build_state<Backend: Io>(
             segments_unlinked: AtomicU64::new(0),
             segments_parked: AtomicU64::new(0),
             parked: Mutex::new([const { None }; MOST_PARKED]),
+            segments_rewritten: AtomicU64::new(0),
+            is_rewriting: AtomicBool::new(false),
+            walks_held: AtomicU64::new(0),
+            partial_output: Mutex::new(None),
             reserve: ByteCount(sizing.segment_bytes.0 * 2),
             summary: Mutex::new(summary.rows),
             summary_paths: summary.paths,

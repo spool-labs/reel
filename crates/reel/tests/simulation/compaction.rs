@@ -76,6 +76,13 @@ fn sealed_put(store: &Store, io: &SimulatedIo, value: &[u8]) -> SegmentNumber {
     number
 }
 
+// keep a segment's dead share under half, so a rewrite leaves it alone
+fn keep_live(store: &Store) {
+    for key in [&b"other"[..], b"other-1", b"other-2"] {
+        store.put(COLUMN, key, b"value").expect("put");
+    }
+}
+
 fn read(store: &Store) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     store.get(COLUMN, b"key", &mut buf).expect("get").then_some(buf)
@@ -109,7 +116,7 @@ fn dead_unlinks() {
 fn live_stays() {
     let io = SimulatedIo::new(Seed(2));
     let store = open(&io);
-    store.put(COLUMN, b"other", b"value").expect("put");
+    keep_live(&store);
     let older = sealed_put(&store, &io, b"older");
     sealed_put(&store, &io, b"newer");
 
@@ -358,7 +365,7 @@ fn unlink_looks_again() {
 fn counts_alone() {
     let io = SimulatedIo::new(Seed(17));
     let store = open(&io);
-    store.put(COLUMN, b"other", b"value").expect("put");
+    keep_live(&store);
     let older = sealed_put(&store, &io, b"older");
     let newer = sealed_put(&store, &io, b"newer");
 
@@ -368,7 +375,7 @@ fn counts_alone() {
         segment: older,
         column: COLUMN,
         block: 0,
-        rows: 1,
+        rows: 3,
         graves: 0,
         bytes: ByteCount(0),
         kept_bytes: ByteCount(0),
@@ -379,12 +386,11 @@ fn counts_alone() {
     rows.apply_walk(newer, blocks, &[extra]);
     assert!(is_wholly_dead(&rows.get(older).expect("a row")));
     drop(rows);
-    volume.table.drop_live(older, 0, 1, WritePlace(0));
+    volume.table.drop_live(older, 0, 3, WritePlace(0));
 
     state.ask_compaction();
     settle(&io);
-    assert!(volume.table.holds(older));
-    assert!(has_file(&io, older));
+    assert_eq!(volume.segments_unlinked.load(Ordering::Acquire), 0);
     assert!(store.contains(COLUMN, b"other").expect("contains"));
     store.close().expect("close");
 }
@@ -396,7 +402,7 @@ fn counts_alone() {
 fn newest_stays() {
     let io = SimulatedIo::new(Seed(24));
     let store = open(&io);
-    store.put(COLUMN, b"other", b"value").expect("put");
+    keep_live(&store);
     let older = sealed_put(&store, &io, b"older");
     let newest = sealed_put(&store, &io, b"newest");
 
@@ -488,7 +494,7 @@ fn rebuilt_forward() {
         for is_power_cut in [false, true] {
             let io = SimulatedIo::new(Seed(21));
             let store = open(&io);
-            store.put(COLUMN, b"other", b"value").expect("put");
+            keep_live(&store);
             let older = sealed_put(&store, &io, b"older");
             store.put(COLUMN, b"key", b"newer").expect("put");
             let newer = hold(&store.state.volumes[0].claims).open[0].number;
@@ -518,7 +524,7 @@ fn unlinked_once() {
         for is_power_cut in [false, true] {
             let io = SimulatedIo::new(Seed(22));
             let store = open(&io);
-            store.put(COLUMN, b"other", b"value").expect("put");
+            keep_live(&store);
             let older = sealed_put(&store, &io, b"older");
             let middle = sealed_put(&store, &io, b"middle");
             store.put(COLUMN, b"key", b"newest").expect("put");
@@ -545,7 +551,7 @@ fn unlinked_once() {
 fn lost_row_once() {
     let io = SimulatedIo::new(Seed(25));
     let store = open(&io);
-    store.put(COLUMN, b"other", b"value").expect("put");
+    keep_live(&store);
     let older = sealed_put(&store, &io, b"older");
     let newer = sealed_put(&store, &io, b"newer");
     assert_eq!(dead_rows(&store, older), 1);
@@ -1010,14 +1016,12 @@ fn cue_between_replacements() {
     store.seal_now();
     settle(&io);
 
-    let table = &store.state.volumes[0].table;
-    assert!(table.holds(number));
     let mut buf = Vec::new();
     assert!(cue.get(COLUMN, b"a", &mut buf).expect("get"));
     assert_eq!(buf, b"older");
 
     drop(cue);
     settle(&io);
-    assert!(!table.holds(number));
+    assert!(!store.state.volumes[0].table.holds(number));
     store.close().expect("close");
 }

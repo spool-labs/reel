@@ -1,6 +1,6 @@
 //! Which sealed segments can hold a key of one column, published with no lock on readers' writers
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use reel_api::units::ByteCount;
@@ -55,6 +55,7 @@ pub struct PageFill<'out> {
 pub struct ColumnDirectory {
     versions: [RwLock<DirectoryList>; DIRECTORY_VERSIONS],
     current: AtomicUsize,
+    generation: AtomicU64,
     writer: Mutex<()>,
 }
 
@@ -79,6 +80,7 @@ impl ColumnDirectory {
         Self {
             versions: [RwLock::new(empty_list(capacity)), RwLock::new(empty_list(capacity))],
             current: AtomicUsize::new(0),
+            generation: AtomicU64::new(0),
             writer: Mutex::new(()),
         }
     }
@@ -123,6 +125,11 @@ impl ColumnDirectory {
         }
     }
 
+    /// Read the generation of the newest list, so a walk can tell one was published under it
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
     /// Publish a list with a segment added and some gone, or return false when it doesn't fit
     pub fn replace(&self, added: Option<&DirectoryEntry>, removed: &[SegmentNumber]) -> bool {
         let _one_writer = hold(&self.writer);
@@ -157,6 +164,7 @@ impl ColumnDirectory {
             refresh_groups(&mut target.entries);
         }
         self.current.store(next, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
         true
     }
 }

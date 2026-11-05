@@ -62,6 +62,13 @@ fn seal(store: &Store, io: &SimulatedIo) -> SegmentNumber {
     number
 }
 
+// keep a segment's dead share under what triggers a rewrite
+fn keep_live(store: &Store) {
+    store.put(COLUMN, b"keep", b"value").expect("put");
+    store.put(COLUMN, b"keep-1", &large(3)).expect("put");
+    store.put(COLUMN, b"keep-2", &large(4)).expect("put");
+}
+
 fn large(byte: u8) -> Vec<u8> {
     vec![byte; FREE_IN_PLACE_BYTES.0 as usize]
 }
@@ -76,7 +83,7 @@ fn read(store: &Store, key: &[u8]) -> Option<Vec<u8>> {
 fn freed() {
     let io = SimulatedIo::new(Seed(1));
     let store = open(&io);
-    store.put(COLUMN, b"keep", b"value").expect("put");
+    keep_live(&store);
     store.put(COLUMN, b"key", &large(1)).expect("put");
     let older = seal(&store, &io);
     store.put(COLUMN, b"key", &large(2)).expect("put");
@@ -104,7 +111,7 @@ fn small_stays() {
     let io = SimulatedIo::new(Seed(2));
     let store = open(&io);
     let short = vec![1; FREE_IN_PLACE_BYTES.0 as usize / 2];
-    store.put(COLUMN, b"keep", b"value").expect("put");
+    keep_live(&store);
     store.put(COLUMN, b"key", &short).expect("put");
     seal(&store, &io);
     store.put(COLUMN, b"key", &short).expect("put");
@@ -119,7 +126,7 @@ fn small_stays() {
 fn cue_keeps_blocks() {
     let io = SimulatedIo::new(Seed(3));
     let store = open(&io);
-    store.put(COLUMN, b"keep", b"value").expect("put");
+    keep_live(&store);
     store.put(COLUMN, b"key", &large(1)).expect("put");
     seal(&store, &io);
     let cue = store.cue().expect("cue");
@@ -143,7 +150,7 @@ fn cue_keeps_blocks() {
 fn newer_cue_frees() {
     let io = SimulatedIo::new(Seed(4));
     let store = open(&io);
-    store.put(COLUMN, b"keep", b"value").expect("put");
+    keep_live(&store);
     store.put(COLUMN, b"key", &large(1)).expect("put");
     seal(&store, &io);
     store.put(COLUMN, b"key", &large(2)).expect("put");
@@ -162,7 +169,7 @@ fn filesystem_refuses() {
     io.refuse_free_blocks();
     let store = open(&io);
     assert!(!store.state.volumes[0].can_free_blocks);
-    store.put(COLUMN, b"keep", b"value").expect("put");
+    keep_live(&store);
     store.put(COLUMN, b"key", &large(1)).expect("put");
     seal(&store, &io);
     store.put(COLUMN, b"key", &large(2)).expect("put");
@@ -178,7 +185,7 @@ fn filesystem_refuses() {
 fn read_crossed() {
     let io = SimulatedIo::new(Seed(6));
     let store = open(&io);
-    store.put(COLUMN, b"keep", b"value").expect("put");
+    keep_live(&store);
     store.put(COLUMN, b"key", &large(1)).expect("put");
     seal(&store, &io);
     let latest = store.state.latest_read(COLUMN, b"key").expect("read");
@@ -200,7 +207,7 @@ fn crashes() {
         for is_power_cut in [false, true] {
             let io = SimulatedIo::new(Seed(7));
             let store = open(&io);
-            store.put(COLUMN, b"keep", b"value").expect("put");
+            keep_live(&store);
             store.put(COLUMN, b"key", &large(1)).expect("put");
             seal(&store, &io);
             store.put(COLUMN, b"key", &large(2)).expect("put");
@@ -263,7 +270,7 @@ fn unpublished_replacement() {
     let io = SimulatedIo::new(Seed(9));
     let store = open(&io);
     store.put(COLUMN, b"key", &large(1)).expect("put");
-    store.put(COLUMN, b"keep", b"value").expect("put");
+    keep_live(&store);
     let older = seal(&store, &io);
 
     let job = WalkJob::new(store.state.clone(), 0);

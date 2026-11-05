@@ -13,6 +13,7 @@ pub mod read_path;
 pub mod recovery;
 pub mod reel_store;
 pub mod reserve_job;
+pub mod rewrite_job;
 pub mod row_job;
 pub mod seal_job;
 pub mod volume;

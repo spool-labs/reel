@@ -27,6 +27,8 @@ pub enum StoreError {
     BatchTooManyRows { rows: RowCount, limit: RowCount },
     #[error("volume {volume:?} holds as many pending range deletes as it can")]
     RangeDeletesFull { volume: VolumeId },
+    #[error("{limit} cues are live, which is as many as a store holds")]
+    CuesFull { limit: u64 },
     #[error("a budget of {budget:?} is under the {least:?} this store needs")]
     BudgetTooSmall { budget: ByteCount, least: ByteCount },
     #[error("batch touches more than one volume")]

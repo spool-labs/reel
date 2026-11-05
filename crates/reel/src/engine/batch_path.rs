@@ -252,7 +252,7 @@ impl<Backend: Io> EngineState<Backend> {
             let place = place_cursor;
             place_cursor = WritePlace(place_cursor.0 + 1);
             if let BatchOperation::DeleteRange { column, start, end } = operation {
-                volume.covers.drop_inside(&Cover {
+                self.drop_covers_inside(volume, &Cover {
                     column,
                     start,
                     end,

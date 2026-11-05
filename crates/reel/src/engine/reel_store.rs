@@ -30,6 +30,7 @@ use crate::engine::recovery::{
 use crate::engine::reserve_job::ReserveJob;
 use crate::engine::row_job::RowJob;
 use crate::engine::seal_job::SealJob;
+use crate::engine::cue::{Cue, CueTable};
 use crate::engine::planner::Planner;
 use crate::engine::walk_job::WalkJob;
 use crate::engine::volume::{ClaimState, SyncState, Volume};
@@ -221,6 +222,12 @@ impl<Backend: Io> ReelStore<Backend> {
         self.check_open()?;
         let want = RecordWant::Window(window);
         self.state.get_latest(column, key, want, buf)
+    }
+
+    /// Take a read view at this point in the write order, which copies no data and never blocks a writer
+    pub fn cue(&self) -> Result<Cue<Backend>, StoreError> {
+        self.check_open()?;
+        Cue::new(Arc::clone(&self.state))
     }
 
     /// Check whether the key has a value, without reading the value
@@ -866,6 +873,7 @@ pub fn build_state<Backend: Io>(
         seal_tasks,
         planner_task: OnceLock::new(),
         index_waiters: AtomicU64::new(0),
+        cues: CueTable::new(),
         is_stopping: AtomicBool::new(false),
     }
 }

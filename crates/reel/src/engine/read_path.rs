@@ -241,11 +241,15 @@ impl<Backend: Io> EngineState<Backend> {
 
     /// Say whether a key has a value at a read point, without reading the value
     pub fn contains_now(&self, column: ColumnId, key: &[u8]) -> Result<bool, StoreError> {
-        let read = self.key_read_now(column, key)?;
-        let read_point = read.read_point;
+        self.contains_at(&self.key_read_now(column, key)?)
+    }
+
+    /// Say whether a key has a value at a read, without reading the value
+    pub fn contains_at(&self, read: &KeyRead) -> Result<bool, StoreError> {
+        let (column, key, read_point) = (read.column, read.key, read.read_point);
         let volume = &self.volumes[read.info.volume.0 as usize];
         let cover = read.cover;
-        self.check_damage(volume, &read, cover)?;
+        self.check_damage(volume, read, cover)?;
         let is_hidden = |place: WritePlace| cover.is_some_and(|cover| cover > place);
         let found = self.index.lookup(column, key, read_point, volume.view());
         if let Some(row) = found.row
@@ -254,7 +258,7 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok(row.kind == RowKind::Value && !is_hidden(row.place));
         }
 
-        let sealed = self.search_footers(volume, &read)?;
+        let sealed = self.search_footers(volume, read)?;
         let newest = newest_of(found.row, sealed);
         Ok(newest.has_value() && !newest.place().is_some_and(is_hidden))
     }

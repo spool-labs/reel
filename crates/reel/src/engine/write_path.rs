@@ -544,7 +544,7 @@ impl<Backend: Io> EngineState<Backend> {
                     volume.covers.add_held(&cover);
                     claim.land();
                     // older covers leave only now, since a reader below this place still needs them
-                    volume.covers.drop_inside(&cover);
+                    self.drop_covers_inside(volume, &cover);
                     return Ok(length);
                 },
                 LandOutcome::IndexFull => {

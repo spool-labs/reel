@@ -4,6 +4,7 @@
 mod allocations;
 mod batches;
 mod counting;
+mod cues;
 mod damage;
 mod dead_walk;
 mod io_contract;

@@ -11,9 +11,11 @@ use reel_api::store_error::StoreError;
 use reel_api::units::{ByteCount, WritePlace};
 
 use crate::engine::column_info::ColumnInfo;
+use crate::engine::cue::CueTable;
 use crate::engine::engine_sizing::EngineSizing;
 use crate::engine::open_segment::{RecordWindow, RowQueue};
 use crate::engine::volume::Volume;
+use crate::segment::range_covers::Cover;
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::index::spot_index::SpotIndex;
@@ -99,6 +101,7 @@ pub struct EngineState<Backend: Io> {
     pub seal_tasks: Vec<OnceLock<Backend::Task>>,
     pub planner_task: OnceLock<Backend::Task>,
     pub index_waiters: AtomicU64,
+    pub cues: CueTable,
     pub is_stopping: AtomicBool,
 }
 
@@ -294,6 +297,20 @@ impl<Backend: Io> EngineState<Backend> {
     /// Check a volume's summary lookup still holds every row
     pub fn is_summary_lookup_whole(&self, volume: usize) -> bool {
         hold(&self.volumes[volume].summary).is_lookup_whole()
+    }
+
+    /// Add up the cover drops of every volume
+    pub fn cover_drops(&self) -> usize {
+        self.volumes.iter().map(|volume| volume.covers.drops()).sum()
+    }
+
+    /// Drop the covers a published one holds inside it, unless a live cue reads below it and still needs them. The count
+    /// goes first: a cue reads it after taking its slot, so the two can't miss each other
+    pub fn drop_covers_inside(&self, volume: &Volume<Backend>, cover: &Cover) {
+        volume.covers.note_drop();
+        if !self.cues.has_cue_below(cover.place) {
+            volume.covers.drop_inside(cover);
+        }
     }
 
     /// Report the heap each structure holds

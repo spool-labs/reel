@@ -354,6 +354,11 @@ fn round(store: &Store, inputs: &mut Inputs, number: usize) {
     assert!(store.contains(META, key).expect("contains"));
     let keys: [&[u8]; 3] = [key, other, &inputs.missing];
     store.get_many(META, &keys, &mut inputs.values).expect("get_many");
+    let cue = store.cue().expect("cue");
+    assert!(cue.get(META, key, buf).expect("get at a cue"));
+    assert!(cue.contains(META, key).expect("contains at a cue"));
+    cue.get_many(META, &keys, &mut inputs.values).expect("get_many at a cue");
+    drop(cue);
     store.delete(BULK, other).expect("delete");
     store.delete_range(META, b"range-a", b"range-b").expect("delete range");
     store.write_batch(&inputs.batch).expect("batch");

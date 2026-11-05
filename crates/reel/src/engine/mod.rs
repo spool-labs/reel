@@ -3,6 +3,7 @@
 pub mod batch_path;
 pub mod claim;
 pub mod column_info;
+pub mod cue;
 pub mod engine_sizing;
 pub mod engine_state;
 pub mod open_segment;

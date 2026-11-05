@@ -9,6 +9,7 @@ use reel_api::units::{ByteCount, FileOffset, RowCount, WritePlace};
 use crate::io::{Io, IoFile};
 use crate::record::record_check::{Checksum, checksum};
 use crate::segment::segment_tail::{PlaceRange, SegmentNumber};
+use crate::superblock::read_whole;
 
 /// Opens a summary file
 pub const SUMMARY_MAGIC: u64 = 0x5245_4C53_554D_4D31;
@@ -389,10 +390,9 @@ pub fn read_summary<Backend: Io>(
         Err(error) => return Err(error),
     };
 
-    let length = file.length()?.0 as usize;
-    let mut bytes = vec![0; length];
-    file.read_exact_at(FileOffset(0), &mut bytes)?;
+    let bytes = read_whole(&file);
     io.close_file(file);
+    let bytes = bytes?;
 
     let Some(header) = bytes.get(..SUMMARY_HEADER_BYTES) else {
         return Ok(None);

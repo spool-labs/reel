@@ -89,36 +89,24 @@ impl<Backend: Io> ReelStore<Backend> {
         }
         let listings = list_roots(&io, &roots).map_err(open_error("listing a root"))?;
         let record_key = superblock.record_key;
-        let scan = scan_roots(&io, record_key, &listings).map_err(open_error("reading a tail"))?;
-        let summaries = read_summaries(&io, &roots).map_err(open_error("reading a summary"))?;
+        let mut scan = scan_roots(&io, record_key, &listings).map_err(open_error("reading a tail"))?;
+        let summaries = match read_summaries(&io, &roots) {
+            Ok(summaries) => summaries,
+            Err(error) => {
+                scan.close_files(&io);
+                return Err(open_error("reading a summary")(error));
+            },
+        };
 
         let state = Arc::new(build_state(io, config, &sizing, superblock, locks, &scan, summaries));
-        settle_summaries(&state, &scan.sealed, &scan.damaged).map_err(open_error("settling a summary"))?;
-        let damaged: usize = state.volumes.iter().map(|volume| hold(&volume.damaged).len()).sum();
-        state.damaged_segments.store(damaged as u64, Ordering::Release);
-        let highest_segment = scan.highest_segment;
-        for found in scan.sealed {
-            let volume = &state.volumes[found.volume];
-            state.install_sealed(volume, found).map_err(open_error("installing a segment"))?;
-        }
-        recover_segments(&state, scan.open, highest_segment).map_err(open_error("recovering a segment"))?;
-
-        // an open is not a state: the limits say what a run-through would seal, from the same rows
-        for volume in &state.volumes {
-            let mut claims = hold(&volume.claims);
-            state.mark_full_segments(&mut claims, volume);
-        }
-
-        let row_job = RowJob {
-            state: Arc::clone(&state),
-        };
-        let task = state.io.spawn_job("reel-rows", row_job).map_err(open_error("starting a job"))?;
-        // the cell is empty until here, so this set can't fail
-        let _set = state.row_task.set(task);
-        for volume in 0..state.volumes.len() {
-            let seal_job = SealJob::new(Arc::clone(&state), volume);
-            let task = state.io.spawn_job("reel-seal", seal_job).map_err(open_error("starting a job"))?;
-            let _set = state.seal_tasks[volume].set(task);
+        if let Err(error) = bring_up(&state, &mut scan) {
+            // a caller can retry, so a failed open leaves no handle behind
+            let _stopped = state.stop_jobs();
+            scan.close_files(&state.io);
+            for volume in &state.volumes {
+                state.close_volume(volume);
+            }
+            return Err(error);
         }
 
         Ok(Self {
@@ -266,6 +254,44 @@ impl<Backend: Io> EngineState<Backend> {
             }
         }
     }
+}
+
+/// Install what the scan found, recover the open segments and start the jobs
+pub fn bring_up<Backend: Io>(
+    state: &Arc<EngineState<Backend>>,
+    scan: &mut RootScan<Backend::File>,
+) -> Result<(), StoreError> {
+    settle_summaries(state, &scan.sealed, &scan.damaged).map_err(open_error("settling a summary"))?;
+    let damaged: usize = state.volumes.iter().map(|volume| hold(&volume.damaged).len()).sum();
+    state.damaged_segments.store(damaged as u64, Ordering::Release);
+
+    scan.sealed.reverse();
+    while let Some(found) = scan.sealed.last() {
+        let volume = &state.volumes[found.volume];
+        state.install_sealed(volume, found).map_err(open_error("installing a segment"))?;
+        scan.sealed.pop();
+    }
+    let highest_segment = scan.highest_segment;
+    recover_segments(state, &mut scan.open, highest_segment).map_err(open_error("recovering a segment"))?;
+
+    // an open is not a state: the limits say what a run-through would seal, from the same rows
+    for volume in &state.volumes {
+        let mut claims = hold(&volume.claims);
+        state.mark_full_segments(&mut claims, volume);
+    }
+
+    let row_job = RowJob {
+        state: Arc::clone(state),
+    };
+    let task = state.io.spawn_job("reel-rows", row_job).map_err(open_error("starting a job"))?;
+    // the cell is empty until here, so this set can't fail
+    let _set = state.row_task.set(task);
+    for volume in 0..state.volumes.len() {
+        let seal_job = SealJob::new(Arc::clone(state), volume);
+        let task = state.io.spawn_job("reel-seal", seal_job).map_err(open_error("starting a job"))?;
+        let _set = state.seal_tasks[volume].set(task);
+    }
+    Ok(())
 }
 
 /// Refuse a config that can't work

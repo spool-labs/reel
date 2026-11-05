@@ -357,6 +357,7 @@ fn both_indexes() {
     assert_eq!(store.damaged_segments(), 1);
     assert!(assert_guarded(&store, &built, Cover::Edges(MIDDLE)) > 0);
     store.close().expect("close");
+    assert_eq!(built.io.open_handle_count(), 0);
 }
 
 // a summary row lost alone comes back from the tail, and reads never notice

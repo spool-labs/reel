@@ -235,11 +235,9 @@ impl Superblock {
             Err(error) => return Err(error),
         };
 
-        let length = file.length()?;
-        let mut bytes = vec![0; length.0 as usize];
-        file.read_exact_at(FileOffset(0), &mut bytes)?;
+        let bytes = read_whole(&file);
         io.close_file(file);
-        match Self::from_bytes(&bytes) {
+        match Self::from_bytes(&bytes?) {
             Some(superblock) => Ok(Some(superblock)),
             None => Err(Error::from(ErrorKind::InvalidData)),
         }
@@ -255,12 +253,21 @@ impl Superblock {
         }
 
         let file = io.create_file(&paths.new, ByteCount(0))?;
-        file.write_at(FileOffset(0), &[IoSlice::new(bytes)])?;
-        file.sync()?;
+        let written = file.write_at(FileOffset(0), &[IoSlice::new(bytes)]);
+        let synced = written.and_then(|()| file.sync());
         io.close_file(file);
+        synced?;
         io.rename_file(&paths.new, &paths.current)?;
         io.sync_directory(&paths.root)
     }
+}
+
+/// Read a file from end to end
+pub fn read_whole<File: IoFile>(file: &File) -> Result<Vec<u8>> {
+    let length = file.length()?;
+    let mut bytes = vec![0; length.0 as usize];
+    file.read_exact_at(FileOffset(0), &mut bytes)?;
+    Ok(bytes)
 }
 
 /// Build the stored form of a declared column

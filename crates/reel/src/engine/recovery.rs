@@ -71,6 +71,27 @@ pub struct FoundDamaged {
     pub columns: Vec<ColumnTail>,
 }
 
+/// What one segment turned out to be
+#[derive(Debug)]
+pub enum SegmentRead {
+    /// Its tail and index read
+    Sealed {
+        head: TailHead,
+        columns: Vec<ColumnTail>,
+        entries: Vec<BlockEntry>,
+    },
+    /// It has a rows file, so it was open when the store stopped
+    Open,
+    /// Its copies fail, and its file stays for the rebuild
+    Damaged {
+        head: Option<TailHead>,
+        columns: Vec<ColumnTail>,
+        file_length: ByteCount,
+    },
+    /// It never held anything
+    Empty,
+}
+
 /// A column's facts with its keys copied out of the summary
 #[derive(Clone, Debug)]
 pub struct OwnedColumn {
@@ -132,6 +153,16 @@ pub struct RecoveredRows {
 }
 
 impl<File> RootScan<File> {
+    /// Close every file the scan still holds
+    pub fn close_files<Backend: Io<File = File>>(&mut self, io: &Backend) {
+        for found in self.sealed.drain(..) {
+            io.close_file(found.file);
+        }
+        for found in self.open.drain(..) {
+            io.close_file(found.data);
+        }
+    }
+
     /// Work out the table room each volume needs for what was found
     pub fn least_sizing(&self, volume: usize) -> TableSizing {
         let mut segments = [0; TABLE_SHARDS];
@@ -176,7 +207,7 @@ pub fn list_roots<Backend: Io>(io: &Backend, roots: &[(usize, Vec<PathBuf>)]) ->
     Ok(listings)
 }
 
-/// Read every listed segment's tail and sort them into sealed, open and damaged
+/// Read every listed segment's tail and sort them into sealed, open and damaged, closing all on a failure
 pub fn scan_roots<Backend: Io>(
     io: &Backend,
     record_key: RecordKey,
@@ -196,14 +227,19 @@ pub fn scan_roots<Backend: Io>(
                 continue;
             };
             scan.highest_segment = scan.highest_segment.max(number);
-            let file = io.open_file(path)?;
-            sort_segment(io, record_key, listing, number, file, &mut reader, &mut scan)?;
+            let sorted = io
+                .open_file(path)
+                .and_then(|file| sort_segment(io, record_key, listing, number, file, &mut reader, &mut scan));
+            if let Err(error) = sorted {
+                scan.close_files(io);
+                return Err(error);
+            }
         }
     }
     Ok(scan)
 }
 
-/// Sort one segment by what its tail and its rows file say
+/// Read one segment and hand its file to the scan, or close it
 pub fn sort_segment<Backend: Io>(
     io: &Backend,
     record_key: RecordKey,
@@ -213,58 +249,81 @@ pub fn sort_segment<Backend: Io>(
     reader: &mut FooterReader,
     scan: &mut RootScan<Backend::File>,
 ) -> Result<()> {
-    let mut columns = Vec::new();
-    if let Some(head) = reader.read_tail(&file, record_key, &mut columns)? {
-        let mut entries = Vec::new();
-        if !reader.read_index(&file, &head, &mut entries)? {
-            // the file stays, and open decides what its ranges are once it has read the summary
-            scan.damaged.push(FoundDamaged {
-                volume: listing.volume,
-                number,
-                file_length: file.length()?,
-                head: Some(head),
-                columns,
-            });
-            return Ok(());
-        }
-        scan.sealed.push(FoundSealed {
+    let segment = match read_segment(record_key, listing, number, &file, reader) {
+        Ok(segment) => segment,
+        Err(error) => {
+            io.close_file(file);
+            return Err(error);
+        },
+    };
+
+    match segment {
+        SegmentRead::Sealed { head, columns, entries } => scan.sealed.push(FoundSealed {
             volume: listing.volume,
             path: listing.path.clone(),
             file,
             head,
             columns,
             entries,
-        });
-        return Ok(());
-    }
-
-    if listing.files.contains(&rows_path(&listing.path, number)) {
-        scan.open.push(FoundOpen {
+        }),
+        SegmentRead::Open => scan.open.push(FoundOpen {
             volume: listing.volume,
             root: listing.root,
             number,
             data: file,
+        }),
+        SegmentRead::Damaged { head, columns, file_length } => {
+            io.close_file(file);
+            scan.damaged.push(FoundDamaged {
+                volume: listing.volume,
+                number,
+                file_length,
+                head,
+                columns,
+            });
+        },
+        SegmentRead::Empty => {
+            io.close_file(file);
+            // a crash between creating the two files of a segment leaves this
+            io.remove_file(&data_path(&listing.path, number))?;
+        },
+    }
+    Ok(())
+}
+
+/// Work out what one segment is from its tail, its index and its rows file
+pub fn read_segment<File: IoFile>(
+    record_key: RecordKey,
+    listing: &RootListing,
+    number: SegmentNumber,
+    file: &File,
+    reader: &mut FooterReader,
+) -> Result<SegmentRead> {
+    let mut columns = Vec::new();
+    if let Some(head) = reader.read_tail(file, record_key, &mut columns)? {
+        let mut entries = Vec::new();
+        if reader.read_index(file, &head, &mut entries)? {
+            return Ok(SegmentRead::Sealed { head, columns, entries });
+        }
+        // open decides what its ranges are once it has read the summary
+        return Ok(SegmentRead::Damaged {
+            head: Some(head),
+            columns,
+            file_length: file.length()?,
         });
-        return Ok(());
     }
 
-    let is_empty = holds_nothing(&file)?;
-    let file_length = file.length()?;
-    io.close_file(file);
-    if is_empty {
-        // a crash between creating the two files of a segment leaves this
-        io.remove_file(&data_path(&listing.path, number))?;
-        return Ok(());
+    if listing.files.contains(&rows_path(&listing.path, number)) {
+        return Ok(SegmentRead::Open);
     }
-
-    scan.damaged.push(FoundDamaged {
-        volume: listing.volume,
-        number,
-        file_length,
+    if holds_nothing(file)? {
+        return Ok(SegmentRead::Empty);
+    }
+    Ok(SegmentRead::Damaged {
         head: None,
         columns,
-    });
-    Ok(())
+        file_length: file.length()?,
+    })
 }
 
 /// Check a file has never taken a record: its first head is all zeros or absent
@@ -280,7 +339,7 @@ pub fn holds_nothing<File: IoFile>(file: &File) -> Result<bool> {
 
 impl<Backend: Io> EngineState<Backend> {
     /// Put a sealed segment in the table and the directories
-    pub fn install_sealed(&self, volume: &Volume<Backend>, found: FoundSealed<Backend::File>) -> Result<()> {
+    pub fn install_sealed(&self, volume: &Volume<Backend>, found: &FoundSealed<Backend::File>) -> Result<()> {
         // a kill between a footer's sync and its rows file going leaves the rows behind
         match self.io.remove_file(&rows_path(&found.path, found.head.segment)) {
             Ok(()) => {},
@@ -289,9 +348,6 @@ impl<Backend: Io> EngineState<Backend> {
         }
 
         volume.note_sealed(found.head.places.highest);
-        if !volume.table.install(found.file, &found.head, &found.columns, &found.entries) {
-            return Err(Error::other("segment table sized below what the roots hold"));
-        }
         for column in &found.columns {
             let entry = DirectoryEntry {
                 shared_length: column.shared_length,
@@ -306,6 +362,10 @@ impl<Backend: Io> EngineState<Backend> {
             {
                 return Err(Error::other("column directory sized below what the roots hold"));
             }
+        }
+        // the table takes the file last, so a failure before it leaves one owner, the scan
+        if !volume.table.install(found.file.clone(), &found.head, &found.columns, &found.entries) {
+            return Err(Error::other("segment table sized below what the roots hold"));
         }
         Ok(())
     }
@@ -488,42 +548,94 @@ impl<Backend: Io> EngineState<Backend> {
     }
 }
 
-/// Bring every open segment back, sealing as a running store at this budget would have
+/// Bring every open segment back, sealing as a running store at this budget would have, and leave
+/// in `found` only what still has its files open when something fails
 pub fn recover_segments<Backend: Io>(
     state: &Arc<EngineState<Backend>>,
-    found: Vec<FoundOpen<Backend::File>>,
+    found: &mut Vec<FoundOpen<Backend::File>>,
     highest_segment: SegmentNumber,
 ) -> Result<()> {
     let mut scanned = Vec::with_capacity(found.len());
-    for open in found {
+    let recovered = recover_all(state, found, &mut scanned, highest_segment);
+    if recovered.is_err() {
+        for segment in scanned {
+            state.io.close_file(segment.found.data);
+            state.io.close_file(segment.rows);
+        }
+    }
+    recovered
+}
+
+/// Walk every rows file, then recover each segment, moving it out of its list once its files have a new owner
+pub fn recover_all<Backend: Io>(
+    state: &Arc<EngineState<Backend>>,
+    found: &mut Vec<FoundOpen<Backend::File>>,
+    scanned: &mut Vec<ScannedOpen<Backend::File>>,
+    highest_segment: SegmentNumber,
+) -> Result<()> {
+    found.reverse();
+    while let Some(open) = found.last() {
         let volume = &state.volumes[open.volume];
         let path = &volume.roots[open.root.0 as usize];
         let rows = state.io.open_file(&rows_path(path, open.number))?;
-        let scan = state.scan_rows(&rows)?;
-        scanned.push(ScannedOpen { found: open, rows, scan });
+        let scan = match state.scan_rows(&rows) {
+            Ok(scan) => scan,
+            Err(error) => {
+                state.io.close_file(rows);
+                return Err(error);
+            },
+        };
+        if let Some(open) = found.pop() {
+            scanned.push(ScannedOpen { found: open, rows, scan });
+        }
     }
     state.resume_numbers(highest_segment);
 
-    for segment in scanned {
-        let index = segment.found.volume;
-        let volume = &state.volumes[index];
-        if segment.scan.row_count > volume.segment_rows {
-            copy_segment(state, index, &segment)?;
-            continue;
-        }
-
-        make_room(state, index, segment.scan.row_count)?;
-        if state.recover_open(volume, &segment)? {
-            continue;
-        }
-
-        // long keys can fill the index below the row limit
-        seal_every_open(state, index)?;
-        if !state.recover_open(volume, &segment)? {
-            copy_segment(state, index, &segment)?;
+    scanned.reverse();
+    while let Some(segment) = scanned.last() {
+        let is_kept = recover_one(state, segment)?;
+        if let Some(segment) = scanned.pop()
+            && !is_kept
+        {
+            drop_copied(state, segment)?;
         }
     }
     Ok(())
+}
+
+/// Recover one open segment, and say whether it went on as an open segment or was copied out
+pub fn recover_one<Backend: Io>(state: &Arc<EngineState<Backend>>, segment: &ScannedOpen<Backend::File>) -> Result<bool> {
+    let index = segment.found.volume;
+    let volume = &state.volumes[index];
+    if segment.scan.row_count > volume.segment_rows {
+        copy_segment(state, index, segment)?;
+        return Ok(false);
+    }
+
+    make_room(state, index, segment.scan.row_count)?;
+    if state.recover_open(volume, segment)? {
+        return Ok(true);
+    }
+
+    // long keys can fill the index below the row limit
+    seal_every_open(state, index)?;
+    if state.recover_open(volume, segment)? {
+        return Ok(true);
+    }
+    copy_segment(state, index, segment)?;
+    Ok(false)
+}
+
+/// Close and remove a segment whose rows now live in copies
+pub fn drop_copied<Backend: Io>(state: &Arc<EngineState<Backend>>, segment: ScannedOpen<Backend::File>) -> Result<()> {
+    let target = &state.volumes[segment.found.volume];
+    let path = &target.roots[segment.found.root.0 as usize];
+    let number = segment.found.number;
+    state.io.close_file(segment.found.data);
+    state.io.close_file(segment.rows);
+    state.io.remove_file(&data_path(path, number))?;
+    state.io.remove_file(&rows_path(path, number))?;
+    state.io.sync_directory(path)
 }
 
 /// Seal the fullest segments until some rows fit under the volume's limit
@@ -572,8 +684,8 @@ pub fn seal_inline<Backend: Io>(state: &Arc<EngineState<Backend>>, volume: usize
     Err(Error::other("a seal never finished during open"))
 }
 
-/// Copy a segment too large for this budget's index into new segments, keeping every place, then
-/// drop it: a crash part way leaves it whole, and the copies only repeat rows it still holds
+/// Copy a segment too large for this budget's index into new segments, keeping every place, so
+/// the caller can drop it: a crash part way leaves it whole, and the copies only repeat rows it still holds
 pub fn copy_segment<Backend: Io>(
     state: &Arc<EngineState<Backend>>,
     volume: usize,
@@ -608,13 +720,7 @@ pub fn copy_segment<Backend: Io>(
     }
 
     let target = &state.volumes[volume];
-    state.sync_volume(target).map_err(open_failure)?;
-    let path = &target.roots[segment.found.root.0 as usize];
-    state.io.close_file(segment.found.data.clone());
-    state.io.close_file(segment.rows.clone());
-    state.io.remove_file(&data_path(path, segment.found.number))?;
-    state.io.remove_file(&rows_path(path, segment.found.number))?;
-    state.io.sync_directory(path)
+    state.sync_volume(target).map_err(open_failure)
 }
 
 /// Copy one row and its record as stored, sealing when the limits say a running store would

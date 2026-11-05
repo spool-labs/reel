@@ -80,6 +80,11 @@ impl SimulatedIo {
         hold(&self.disk).operations_until_crash = Some(operations);
     }
 
+    /// Take back a crash that has not fired
+    pub fn disarm_crash(&self) {
+        hold(&self.disk).operations_until_crash = None;
+    }
+
     /// Check whether an armed crash has fired
     pub fn is_crashed(&self) -> bool {
         hold(&self.disk).is_crashed

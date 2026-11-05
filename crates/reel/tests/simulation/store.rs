@@ -30,6 +30,7 @@ const SEAL_ROWS: u64 = 200;
 const SEAL_STEPS: u64 = 1_000;
 const SEAL_CRASH_POINTS: u64 = 14;
 const SEAL_CRASH_SEEDS: u64 = 3;
+const FAILED_OPEN_POINTS: u64 = 40;
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -502,4 +503,32 @@ fn spot_fence() {
 
     assert_eq!(read(&store, b"key"), Some(b"newer".to_vec()));
     store.close().expect("close");
+}
+
+// an open that fails at any step leaves no handle behind, so a caller can try again
+#[test]
+fn failed_open() {
+    for crash_at in 0..FAILED_OPEN_POINTS {
+        let io = SimulatedIo::new(Seed(crash_at));
+        let store = open(&io);
+        fill_sealable(&store, SEAL_ROWS);
+        store.seal_now();
+        settle(&io);
+        fill_sealable(&store, SEAL_ROWS);
+        store.flush().expect("flush");
+        io.kill();
+        drop(store);
+
+        io.arm_crash(OperationCount(crash_at));
+        let opened = ReelStore::open(io.clone(), &config(SyncPolicy::Never));
+        if opened.is_err() {
+            assert_eq!(io.open_handle_count(), 0, "crash at {crash_at}");
+        }
+        io.kill();
+        drop(opened);
+
+        let store = open(&io);
+        store.close().expect("close");
+        assert_eq!(io.handle_faults(), OperationCount(0), "crash at {crash_at}");
+    }
 }

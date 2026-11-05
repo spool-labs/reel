@@ -23,6 +23,8 @@ pub enum StoreError {
     ValueTooLarge { length: ByteCount, limit: ByteCount },
     #[error("batch of {length:?} doesn't fit one segment of {limit:?}")]
     BatchTooLarge { length: ByteCount, limit: ByteCount },
+    #[error("a budget of {budget:?} is under the {least:?} this store needs")]
+    BudgetTooSmall { budget: ByteCount, least: ByteCount },
     #[error("batch touches more than one volume")]
     BatchAcrossVolumes,
     #[error("a record in column {column:?} failed its check")]

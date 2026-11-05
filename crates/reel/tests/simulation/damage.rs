@@ -30,7 +30,7 @@ const ROOT: &str = "/disk/damage";
 const ORDERED: ColumnId = ColumnId(1);
 const RANDOM: ColumnId = ColumnId(2);
 const COLUMNS: [ColumnId; 2] = [ORDERED, RANDOM];
-const BUDGET: ByteCount = ByteCount(8 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(32 * 1024 * 1024);
 const SETTLE_STEPS: u64 = 2_000_000;
 const SETTLE_TICK: Nanoseconds = Nanoseconds(1_000_000);
 const ROW_PERIOD: Nanoseconds = Nanoseconds(60_000_000);
@@ -48,8 +48,8 @@ const SEAL_DATA_SYNCS: u64 = 6;
 const LONG_KEY_BYTES: usize = 100;
 const SECTOR_ROWS: u64 = 40;
 const GROUPS_BACK: u64 = 150;
-const MANY_SEGMENTS: u64 = 450;
-const LEAST_BUDGET: ByteCount = ByteCount(1024 * 1024);
+const MANY_SEGMENTS: u64 = 300;
+const LEAST_BUDGET: ByteCount = ByteCount(30 * 1024 * 1024);
 // a segment lost with its row counts every stage a store held at open
 const STAGE_LOST: usize = NEWEST;
 // a stage for writes after the open

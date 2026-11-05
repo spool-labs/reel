@@ -25,6 +25,8 @@ use reel_api::units::{ByteCount, VolumeId};
 const META: ColumnId = ColumnId(1);
 const BULK: ColumnId = ColumnId(2);
 const BUDGET: ByteCount = ByteCount(192 * 1024 * 1024);
+const MIB: u64 = 1024 * 1024;
+const BUDGETS: [u64; 4] = [128, 192, 512, 4_096];
 const KEYS: usize = 512;
 const SMALL_BYTES: usize = 100;
 const CHUNKED_BYTES: usize = 200_000;
@@ -193,7 +195,7 @@ fn counts(faults: &mut FaultCounter) -> Counts {
     }
 }
 
-fn config(root: &Path) -> StoreConfig {
+fn config(root: &Path, budget: ByteCount) -> StoreConfig {
     let column = |id: ColumnId, name: &str, codec: Codec| ColumnConfig {
         id,
         name: name.to_string(),
@@ -202,7 +204,7 @@ fn config(root: &Path) -> StoreConfig {
         volume: VolumeId(0),
     };
     StoreConfig {
-        memory_budget: BUDGET,
+        memory_budget: budget,
         volumes: vec![VolumeConfig {
             name: "steady".to_string(),
             roots: vec![root.to_path_buf()],
@@ -213,7 +215,7 @@ fn config(root: &Path) -> StoreConfig {
 }
 
 fn open(root: &Path) -> Store {
-    ReelStore::open(PlainIo::new(), &config(root)).expect("open")
+    ReelStore::open(PlainIo::new(), &config(root, BUDGET)).expect("open")
 }
 
 fn inputs() -> Inputs {
@@ -346,7 +348,42 @@ fn scratch_root() -> PathBuf {
     root
 }
 
+// open fits inside each budget, and the report agrees with the heap the allocator sees
+fn check_budgets() -> u64 {
+    let mut failures = 0;
+    for budget in BUDGETS {
+        let root = scratch_root();
+        let live_before = LIVE_BYTES.load(Ordering::Acquire);
+        let budget = ByteCount(budget * MIB);
+        let store = ReelStore::open(PlainIo::new(), &config(&root, budget)).expect("open");
+        let live = LIVE_BYTES.load(Ordering::Acquire) - live_before;
+        let report = store.memory_report();
+        let held = report.heap_total().0 + report.thread_stacks.0;
+        let shard = &store.state.sizing.shard;
+        println!(
+            "budget {} MiB: {} B held, {live} B live, {:?} rows a segment, {:?} a segment, {} pages {} nodes {} slots a shard",
+            budget.0 / MIB,
+            held,
+            store.state.sizing.segment_rows,
+            store.state.sizing.segment_bytes,
+            shard.pages.0,
+            shard.nodes.0,
+            shard.table_slots,
+        );
+        println!("{report:?}");
+        if held > budget.0 || live.abs_diff(report.heap_total().0) > report.heap_total().0 / REPORT_SLACK_DIVISOR {
+            println!("budget {} MiB fails", budget.0 / MIB);
+            failures += 1;
+        }
+        store.close().expect("close");
+        drop(store);
+        fs::remove_dir_all(&root).expect("remove");
+    }
+    failures
+}
+
 fn main() {
+    let budget_failures = check_budgets();
     let root = scratch_root();
     let mut inputs = inputs();
     damage(&root, &inputs);
@@ -361,7 +398,7 @@ fn main() {
     let resident_grown = resident_bytes().zip(resident_before).map(|(after, before)| after.saturating_sub(before));
     println!("open: {live_grown} B live, {reported} B reported, {} B of stacks, resident grew {resident_grown:?}", report.thread_stacks.0);
     println!("{report:?}");
-    let mut failures = 0;
+    let mut failures = budget_failures;
     if live_grown.abs_diff(reported) > reported / REPORT_SLACK_DIVISOR {
         println!("memory_report misses the heap by more than a tenth");
         failures += 1;

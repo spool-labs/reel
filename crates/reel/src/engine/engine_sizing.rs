@@ -7,6 +7,7 @@ use crate::index::node_pool::{NODE_FANOUT, NodeCount};
 use crate::index::open_slots::MAX_OPEN_SLOTS;
 use crate::index::write_index::SHARD_COUNT;
 use crate::index::write_shard::ShardSizing;
+use crate::segment::damage_list::{MOST_DAMAGED_SPANS, SPAN_KEY_BYTES};
 use crate::segment::segment_tail::MOST_SEGMENT_BYTES;
 
 /// A segment's target size on a store with a full budget
@@ -17,16 +18,36 @@ pub const FULL_BUDGET: ByteCount = ByteCount(512 * 1024 * 1024);
 pub const OPEN_PER_ROOT: usize = 4;
 /// Open slots each open segment can need: its own, and one while it seals
 pub const SLOTS_PER_OPEN: usize = 2;
-/// The share of the budget the write index gets, as a divisor
-pub const WRITE_INDEX_DIVISOR: u64 = 4;
-/// The share of the budget the spot cache gets, as a divisor
-pub const SPOT_DIVISOR: u64 = 4;
-/// The share of the budget the block cache gets, as a divisor
+/// The write index gets one part in this many of what the fixed parts leave
+pub const WRITE_INDEX_DIVISOR: u64 = 2;
+/// The spot cache gets one part in this many of what the fixed parts leave
+pub const SPOT_DIVISOR: u64 = 8;
+/// The block cache gets one part in this many of what the fixed parts leave
 pub const BLOCK_CACHE_DIVISOR: u64 = 8;
-/// The share of the budget the summaries get, as a divisor
+/// The summaries get one part in this many of what the fixed parts leave, rows and the save buffer together
 pub const SUMMARY_DIVISOR: u64 = 16;
-/// Bytes a row of the write index is planned at, node and table share included
-pub const PLANNED_ROW_BYTES: u64 = 112;
+/// The segment tables and column directories get one part in this many of what the fixed parts leave
+pub const TABLE_DIVISOR: u64 = 16;
+/// Bytes the table plans for a segment before its columns
+pub const PLANNED_SEGMENT_BYTES: u64 = 512;
+/// Bytes the table and directories plan for a column of a segment
+pub const PLANNED_COLUMN_BYTES: u64 = 240;
+/// Bytes the table plans for a line of a block index
+pub const PLANNED_LINE_BYTES: u64 = 32;
+/// The least a budget has to leave after the fixed parts
+pub const LEAST_SHARED_BYTES: ByteCount = ByteCount(8 * 1024 * 1024);
+/// Bytes a read buffer pair is planned at: a record reader and a footer reader
+pub const READ_BUFFER_BYTES: u64 = 512 * 1024;
+/// Bytes a record encoder is planned at, with no large compress buffer
+pub const ENCODER_BYTES: u64 = 256 * 1024;
+/// Bytes a seal job's own buffers are planned at
+pub const SEAL_JOB_BYTES: u64 = 3 * 1024 * 1024;
+/// Bytes a job's stack is planned at
+pub const JOB_STACK_PLAN_BYTES: u64 = 1024 * 1024;
+/// Jobs a store runs beside one seal job a volume
+pub const SHARED_JOBS: u64 = 2;
+/// Bytes a row of the write index really takes, node, page and table share included
+pub const PLANNED_ROW_BYTES: u64 = 224;
 /// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight
 pub const SEAL_ROWS_EIGHTHS: u64 = 5;
 /// The most stored bytes of a value on an lz4 column
@@ -44,6 +65,15 @@ pub const READ_BUFFERS: usize = 8;
 /// Write buffers a store keeps
 pub const WRITE_BUFFERS: usize = 4;
 
+/// What a store is made of, which fixes the parts a budget can't shrink
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoreShape {
+    pub budget: ByteCount,
+    pub roots: usize,
+    pub volumes: usize,
+    pub has_lz4: bool,
+}
+
 /// What a budget buys
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EngineSizing {
@@ -53,14 +83,41 @@ pub struct EngineSizing {
     pub spot_share: ByteCount,
     pub cache_share: ByteCount,
     pub summary_share: ByteCount,
+    pub table_share: ByteCount,
     pub lz4_stored_limit: ByteCount,
 }
 
+impl StoreShape {
+    /// Count the open slots the roots can use
+    pub fn open_slots(&self) -> usize {
+        (self.roots * OPEN_PER_ROOT * SLOTS_PER_OPEN).min(MAX_OPEN_SLOTS)
+    }
+
+    /// Add up what a store holds whatever its budget: buffers, pools, stacks and the spans a summary must keep
+    pub fn fixed_bytes(&self) -> ByteCount {
+        let volumes = self.volumes as u64;
+        let queues = self.open_slots() as u64 * 2 * GROUP_BYTES.0;
+        let reads = READ_BUFFERS as u64 * READ_BUFFER_BYTES;
+        let large = if self.has_lz4 { LZ4_STORED_LIMIT.0 } else { 0 };
+        let encoders = (WRITE_BUFFERS as u64 + 1) * ENCODER_BYTES + large;
+        let spans = 4 * MOST_DAMAGED_SPANS as u64 * (SPAN_KEY_BYTES as u64 * 2);
+        let stacks = (SHARED_JOBS + volumes) * JOB_STACK_PLAN_BYTES;
+        ByteCount(queues + reads + encoders + volumes * (SEAL_JOB_BYTES + spans) + stacks)
+    }
+
+    /// Read the smallest budget this store can run in
+    pub fn least_budget(&self) -> ByteCount {
+        ByteCount(self.fixed_bytes().0 + LEAST_SHARED_BYTES.0)
+    }
+}
+
 impl EngineSizing {
-    /// Split a budget for a store with this many roots
-    pub fn for_budget(budget: ByteCount, roots: usize) -> Self {
-        let open_slots = (roots * OPEN_PER_ROOT * SLOTS_PER_OPEN).min(MAX_OPEN_SLOTS);
-        let index_share = budget.0 / WRITE_INDEX_DIVISOR;
+    /// Share out what a budget leaves after the fixed parts
+    pub fn for_store(shape: &StoreShape) -> Self {
+        let open_slots = shape.open_slots();
+        let budget = shape.budget;
+        let shared = budget.0.saturating_sub(shape.fixed_bytes().0);
+        let index_share = shared / WRITE_INDEX_DIVISOR;
         let rows_total = index_share / PLANNED_ROW_BYTES;
         let rows_per_shard = (rows_total / SHARD_COUNT as u64).max(64);
 
@@ -72,7 +129,7 @@ impl EngineSizing {
         let segment_bytes = if budget >= FULL_BUDGET {
             SEGMENT_TARGET
         } else {
-            ByteCount(budget.0 * 2)
+            ByteCount(budget.0 / 2)
         };
         Self {
             segment_bytes: ByteCount(segment_bytes.0.min(MOST_SEGMENT_BYTES.0 / 2)),
@@ -83,9 +140,10 @@ impl EngineSizing {
                 table_slots: (rows_per_shard as usize * 2).next_power_of_two(),
                 open_slots,
             },
-            spot_share: ByteCount(budget.0 / SPOT_DIVISOR),
-            cache_share: ByteCount(budget.0 / BLOCK_CACHE_DIVISOR),
-            summary_share: ByteCount(budget.0 / SUMMARY_DIVISOR),
+            spot_share: ByteCount(shared / SPOT_DIVISOR),
+            cache_share: ByteCount(shared / BLOCK_CACHE_DIVISOR),
+            summary_share: ByteCount(shared / SUMMARY_DIVISOR),
+            table_share: ByteCount(shared / TABLE_DIVISOR),
             lz4_stored_limit: LZ4_STORED_LIMIT,
         }
     }

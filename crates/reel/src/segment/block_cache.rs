@@ -5,6 +5,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use reel_api::units::ByteCount;
 
+use crate::pool::touched_filled;
 use crate::segment::segment_tail::SegmentNumber;
 
 /// Shards of a cache
@@ -55,7 +56,7 @@ impl BlockCache {
         for _shard in 0..CACHE_SHARDS {
             shards.push(RwLock::new(CacheShard {
                 keys: vec![NO_BLOCK; slots],
-                lengths: vec![0; slots],
+                lengths: touched_filled(slots, 0),
                 bytes: vec![1; slots * slot_bytes],
             }));
             let mut bits = Vec::with_capacity(slots);

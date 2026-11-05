@@ -14,7 +14,8 @@ use reel_api::units::{ByteCount, VolumeId, WritePlace};
 use crate::config::{ColumnConfig, StoreConfig};
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::engine_sizing::{
-    EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, READ_BUFFERS, WRITE_BUFFERS,
+    EngineSizing, FILTER_CACHE_QUARTERS, FILTER_SLOT_BYTES, GROUP_BYTES, LEAST_LZ4_BUDGET, PLANNED_COLUMN_BYTES, PLANNED_LINE_BYTES,
+    PLANNED_SEGMENT_BYTES, StoreShape, READ_BUFFERS, WRITE_BUFFERS,
 };
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
 use crate::engine::open_segment::{RowQueue, fits_a_segment_path};
@@ -33,7 +34,7 @@ use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
 use crate::io::lock_outcome::LockOutcome;
 use crate::io::{Io, IoTask};
-use crate::pool::{Pool, touched_buffer};
+use crate::pool::{Pool, touched_buffer, touched_room};
 use crate::record::codec::{CHUNK_BYTES, Codec};
 use crate::record::record_check::RecordKey;
 use crate::record::record_encoder::RecordEncoder;
@@ -52,12 +53,6 @@ use crate::write_order::WriteOrder;
 
 /// The lock file in each root
 pub const LOCK_NAME: &str = "lock";
-/// Segments a table holds per byte of the budget, as a divisor
-pub const TABLE_BUDGET_DIVISOR: u64 = 16;
-/// Bytes one segment is planned at in the table
-pub const PLANNED_SEGMENT_BYTES: u64 = 1_024;
-/// Block lines a table's share is planned for, as bytes per line
-pub const PLANNED_LINE_BYTES: u64 = 32;
 
 /// An open store
 pub struct ReelStore<Backend: Io> {
@@ -81,7 +76,19 @@ impl<Backend: Io> ReelStore<Backend> {
         for volume in &config.volumes {
             root_count += volume.roots.len();
         }
-        let sizing = EngineSizing::for_budget(config.memory_budget, root_count);
+        let shape = StoreShape {
+            budget: config.memory_budget,
+            roots: root_count,
+            volumes: config.volumes.len(),
+            has_lz4: config.columns.iter().any(|column| column.codec == Codec::Lz4),
+        };
+        if config.memory_budget < shape.least_budget() {
+            return Err(StoreError::BudgetTooSmall {
+                budget: config.memory_budget,
+                least: shape.least_budget(),
+            });
+        }
+        let sizing = EngineSizing::for_store(&shape);
 
         // every root is listed before any tail is read, and the table is sized from what they hold
         let mut roots = Vec::with_capacity(config.volumes.len());
@@ -584,12 +591,19 @@ pub fn build_state<Backend: Io>(
     scan: &RootScan<Backend::File>,
     summaries: Vec<SummaryFound>,
 ) -> EngineState<Backend> {
-    let table_share = config.memory_budget.0 / TABLE_BUDGET_DIVISOR;
-    let segments_per_shard = ((table_share / PLANNED_SEGMENT_BYTES) as usize / TABLE_SHARDS).max(8);
+    // a volume's table and directories come out of its part of the share, by the columns it can hold
+    let volume_share = sizing.table_share.0 / config.volumes.len().max(1) as u64;
+    let most_columns = (0..config.volumes.len())
+        .map(|volume| config.columns.iter().filter(|column| column.volume.0 as usize == volume).count())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let segment_bytes = PLANNED_SEGMENT_BYTES + most_columns as u64 * PLANNED_COLUMN_BYTES;
+    let segments_per_shard = ((volume_share / 2 / segment_bytes) as usize / TABLE_SHARDS).max(8);
     let table_sizing = TableSizing {
         segments_per_shard,
-        columns_per_shard: segments_per_shard * config.columns.len().max(1),
-        blocks_per_shard: ((table_share / PLANNED_LINE_BYTES) as usize / TABLE_SHARDS).max(64),
+        columns_per_shard: segments_per_shard * most_columns,
+        blocks_per_shard: ((volume_share / 2 / PLANNED_LINE_BYTES) as usize / TABLE_SHARDS).max(64),
     };
 
     let mut columns: Vec<Option<ColumnInfo>> = vec![None; MAX_COLUMNS];
@@ -626,7 +640,8 @@ pub fn build_state<Backend: Io>(
         let found_summary = summary.rows.bytes().len() * 2;
         let columns_here = config.columns.iter().filter(|column| column.volume.0 as usize == index).count();
         // the share splits by each volume's row size, so every volume plans the same number of rows
-        let planned_summary = sizing.summary_share.0 as usize * row_room(columns_here) / all_row_room;
+        // the share pays for the rows and the buffer they save through
+        let planned_summary = sizing.summary_share.0 as usize / 2 * row_room(columns_here) / all_row_room;
         // open never drops a row, so a segment's damage keeps its rank through every open
         let span_room = MOST_DAMAGED_SPANS * (MOST_ROW_SPAN_FIXED_BYTES + 2 * SPAN_KEY_BYTES);
         let summary_room = span_room + found_summary.max(planned_summary).max(scan.least_summary_room(index, columns_here) * 2);
@@ -639,7 +654,7 @@ pub fn build_state<Backend: Io>(
             policy: volume.sync,
             locks: Mutex::new(held),
             claims: Mutex::new(ClaimState {
-                open: Vec::with_capacity(open_slots),
+                open: touched_room(open_slots),
                 is_creating: false,
                 bytes_since_sync: ByteCount(0),
                 next_root: 0,
@@ -657,7 +672,7 @@ pub fn build_state<Backend: Io>(
             summary_paths: summary.paths,
             summary_buffer: Pool::new(vec![touched_buffer(summary_room)]),
             damage: DamageList::new(),
-            damaged: Mutex::new(Vec::with_capacity(MOST_DAMAGED_SPANS)),
+            damaged: Mutex::new(touched_room(MOST_DAMAGED_SPANS)),
             is_clearing: AtomicBool::new(false),
         });
     }

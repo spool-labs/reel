@@ -21,7 +21,7 @@ use reel_api::units::{ByteCount, FileOffset, Nanoseconds, VolumeId};
 
 const ROOTS: [&str; 3] = ["/disk/faults-meta", "/disk/faults-meta-two", "/disk/faults-bulk"];
 const COLUMNS: [ColumnId; 2] = [ColumnId(1), ColumnId(2)];
-const BUDGET: ByteCount = ByteCount(8 * 1024 * 1024);
+const BUDGET: ByteCount = ByteCount(48 * 1024 * 1024);
 // each set keeps the seeds that found a bug, and a full sweep passed before these were cut down
 const SEEDS: [u64; 7] = [0, 1, 2, 3, 17, 31, 37];
 const ROT_SEEDS: [u64; 9] = [125, 349, 959, 1_000, 1_001, 1_002, 1_003, 1_011, 1_031];

@@ -3,6 +3,7 @@
 use std::hint::black_box;
 use std::mem::MaybeUninit;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use reel_api::units::ByteCount;
@@ -18,6 +19,7 @@ pub const TOUCH_BYTE: u8 = 0xA5;
 pub struct Pool<Item> {
     state: Mutex<PoolState<Item>>,
     freed: Condvar,
+    wakes: AtomicU64,
 }
 
 /// The free items, and the queue of callers waiting for them
@@ -45,6 +47,7 @@ impl<Item> Pool<Item> {
                 serving: 0,
             }),
             freed: Condvar::new(),
+            wakes: AtomicU64::new(0),
         }
     }
 
@@ -55,6 +58,17 @@ impl<Item> Pool<Item> {
             total += measure(item).0;
         }
         ByteCount(total)
+    }
+
+    /// Count the wake-ups so far, each a system call
+    pub fn wakes(&self) -> u64 {
+        self.wakes.load(Ordering::Relaxed)
+    }
+
+    /// Wake the queue
+    pub fn wake(&self) {
+        self.wakes.fetch_add(1, Ordering::Relaxed);
+        self.freed.notify_all();
     }
 
     /// Count the callers in the queue
@@ -96,7 +110,7 @@ impl<Item> Pool<Item> {
                 let should_wake = !state.has_no_queue() && !state.free.is_empty();
                 drop(state);
                 if should_wake {
-                    self.freed.notify_all();
+                    self.wake();
                 }
                 return item;
             }
@@ -114,7 +128,7 @@ impl<Item> Pool<Item> {
         let should_wake = !state.has_no_queue();
         drop(state);
         if should_wake {
-            self.freed.notify_all();
+            self.wake();
         }
     }
 }

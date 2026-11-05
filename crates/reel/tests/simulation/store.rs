@@ -32,6 +32,8 @@ const SEAL_STEPS: u64 = 1_000;
 const SEAL_CRASH_POINTS: u64 = 14;
 const SEAL_CRASH_SEEDS: u64 = 3;
 const FAILED_OPEN_POINTS: u64 = 40;
+const QUIET_ROWS: u64 = 100;
+const LARGE_ENOUGH: usize = 100_000;
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -544,4 +546,23 @@ fn failed_close() {
     assert!(store.flush().is_err());
 
     assert!(store.close().is_err());
+}
+
+// a put or a get with nobody waiting wakes nobody, since a wake is a system call whether anyone listens or not
+#[test]
+fn quiet_put() {
+    let io = SimulatedIo::new(Seed(90));
+    let store = open(&io);
+    let mut buf = Vec::new();
+
+    for number in 0..QUIET_ROWS {
+        store.put(COLUMN, &number.to_le_bytes(), &[1; LARGE_ENOUGH]).expect("put");
+        store.put(COLUMN, &number.to_le_bytes(), b"value").expect("put");
+        assert!(store.get(COLUMN, &number.to_le_bytes(), &mut buf).expect("get"));
+    }
+
+    let state = &store.state;
+    assert_eq!(state.order.wakes(), 0);
+    assert_eq!(state.encoders.wakes() + state.large_encoders.wakes() + state.record_readers.wakes(), 0);
+    store.close().expect("close");
 }

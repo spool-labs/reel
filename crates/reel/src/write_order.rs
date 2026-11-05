@@ -51,6 +51,7 @@ pub struct WriteOrder {
     ring: Mutex<TicketRing>,
     mark: AtomicU64,
     moved: Condvar,
+    wakes: AtomicU64,
 }
 
 impl TicketRing {
@@ -80,7 +81,13 @@ impl WriteOrder {
             }),
             mark: AtomicU64::new(last_used.0),
             moved: Condvar::new(),
+            wakes: AtomicU64::new(0),
         }
+    }
+
+    /// Count the wake-ups so far, each a system call
+    pub fn wakes(&self) -> u64 {
+        self.wakes.load(Ordering::Relaxed)
     }
 
     /// Read the mark: every place at or below it is published
@@ -128,6 +135,7 @@ impl WriteOrder {
             self.mark.store(place.0, Ordering::Release);
             // a notify makes a system call whoever listens, so it waits for someone to wake
             if ring.waiters > 0 {
+                self.wakes.fetch_add(1, Ordering::Relaxed);
                 self.moved.notify_all();
             }
         }

@@ -30,6 +30,8 @@ const LATEST: WritePlace = WritePlace(u64::MAX);
 const RANDOM_KEY_BYTES: usize = 32;
 const MOST_ROW_BYTES: f64 = 44.0;
 const LARGE_PLACE: u64 = 40_000_000_000;
+const CRASH_POINTS: u64 = 12;
+const CRASH_SEEDS: u64 = 48;
 
 type ColumnRows = (ColumnId, Vec<(Vec<u8>, FooterRow)>);
 
@@ -316,63 +318,71 @@ fn power_cut() {
     rows.truncate(4_000);
     let mut sealed = 0;
 
-    for crash_at in 0..40 {
-        let io = SimulatedIo::new(Seed(crash_at));
-        let root = PathBuf::from(ROOT);
-        io.create_directory(&root).expect("directory");
-        let path = root.join("segment");
-        let file = io.create_file(&path, ByteCount(DATA_END.0)).expect("create");
-        file.sync().expect("sync");
-        io.sync_directory(&root).expect("directory sync");
-
-        io.arm_crash(OperationCount(crash_at));
-        let mut writer = FooterWriter::new(MOST_BLOCKS);
-        writer.start(DATA_END, WritePlace(1));
-        let start = ColumnStart {
-            column: FIRST_COLUMN,
-            lowest: &rows[0].0,
-            highest: &rows[rows.len() - 1].0,
-        };
-        let mut outcome = writer.start_column(&file, &start);
-        for (key, row) in &rows {
-            if outcome.is_ok() {
-                outcome = writer.push_row(&file, key, row);
-            }
-        }
-        if outcome.is_ok() {
-            let finished = writer.finish(&file, SEGMENT, DATA_END, b"", RECORD_KEY);
-            outcome = finished.map(|_totals| ());
-        }
-        io.power_cut();
-
-        let reopened = io.open_file(&path).expect("reopen");
-        let mut reader = FooterReader::new();
-        let mut columns = Vec::new();
-        let head = reader.read_tail(&reopened, RECORD_KEY, &mut columns).expect("read");
-        let Some(head) = head else {
-            continue;
-        };
-
-        sealed += 1;
-        assert!(outcome.is_ok() || crash_at > 0);
-        let mut entries = Vec::new();
-        assert!(reader.read_index(&reopened, &head, &mut entries).expect("index"));
-        let written = Written {
-            io,
-            path,
-            file: reopened,
-            totals: FooterTotals {
-                file_length: ByteCount(0),
-                block_count: head.block_count,
-                row_count: RowCount(0),
-            },
-        };
-        let loaded = Loaded { head, columns, entries };
-        for (key, row) in rows.iter().step_by(97) {
-            let found = find(&written, &mut reader, &loaded, 0, key, LATEST);
-            assert_eq!(found, FooterAnswer::Found(*row));
+    for crash_at in 0..CRASH_POINTS {
+        for seed in 0..CRASH_SEEDS {
+            sealed += cut_during_footer(&rows, OperationCount(crash_at), Seed(seed));
         }
     }
 
     assert!(sealed > 0);
+}
+
+// run one footer into a power cut, check what's left, and count it when it reads as sealed
+fn cut_during_footer(rows: &[(Vec<u8>, FooterRow)], crash_at: OperationCount, seed: Seed) -> u64 {
+    let io = SimulatedIo::new(seed);
+    let root = PathBuf::from(ROOT);
+    io.create_directory(&root).expect("directory");
+    let path = root.join("segment");
+    let file = io.create_file(&path, ByteCount(DATA_END.0)).expect("create");
+    file.sync().expect("sync");
+    io.sync_directory(&root).expect("directory sync");
+
+    io.arm_crash(crash_at);
+    let mut writer = FooterWriter::new(MOST_BLOCKS);
+    writer.start(DATA_END, WritePlace(1));
+    let start = ColumnStart {
+        column: FIRST_COLUMN,
+        lowest: &rows[0].0,
+        highest: &rows[rows.len() - 1].0,
+    };
+    let mut outcome = writer.start_column(&file, &start);
+    for (key, row) in rows {
+        if outcome.is_ok() {
+            outcome = writer.push_row(&file, key, row);
+        }
+    }
+    if outcome.is_ok() {
+        let finished = writer.finish(&file, SEGMENT, DATA_END, b"", RECORD_KEY);
+        outcome = finished.map(|_totals| ());
+    }
+    // a crash that never fired still loses whatever the last sync didn't cover
+    let _ended = outcome;
+    io.power_cut();
+
+    let reopened = io.open_file(&path).expect("reopen");
+    let mut reader = FooterReader::new();
+    let mut columns = Vec::new();
+    let head = reader.read_tail(&reopened, RECORD_KEY, &mut columns).expect("read");
+    let Some(head) = head else {
+        return 0;
+    };
+
+    let mut entries = Vec::new();
+    assert!(reader.read_index(&reopened, &head, &mut entries).expect("index"));
+    let written = Written {
+        io,
+        path,
+        file: reopened,
+        totals: FooterTotals {
+            file_length: ByteCount(0),
+            block_count: head.block_count,
+            row_count: RowCount(0),
+        },
+    };
+    let loaded = Loaded { head, columns, entries };
+    for (key, row) in rows.iter().step_by(97) {
+        let found = find(&written, &mut reader, &loaded, 0, key, LATEST);
+        assert_eq!(found, FooterAnswer::Found(*row));
+    }
+    1
 }

@@ -243,7 +243,7 @@ fn rot_indexes(built: &Built, stage: usize) {
 // rot a row in both copies, the double failure that loses it
 fn rot_row(built: &Built, segment: SegmentNumber) {
     let paths = SummaryPaths::new(Path::new(ROOT));
-    let at = row_offset(built, &paths, segment);
+    let at = row_offset(&built.io, &paths, segment);
     let offset = FileOffset((at + ROW_HEAD_BYTES + 2) as u64);
     built.io.rot(&paths.current, offset, FLIP).expect("rot");
     built.io.rot(&paths.second, offset, FLIP).expect("rot");
@@ -654,24 +654,24 @@ fn later_sync() {
 
 fn rot_length(built: &Built, segment: SegmentNumber) {
     let paths = SummaryPaths::new(Path::new(ROOT));
-    let at = FileOffset((row_offset(built, &paths, segment) + 5) as u64);
+    let at = FileOffset((row_offset(&built.io, &paths, segment) + 5) as u64);
     built.io.rot(&paths.current, at, FLIP).expect("rot");
     built.io.rot(&paths.second, at, FLIP).expect("rot");
 }
 
-fn summary_rows(built: &Built) -> (SummaryPaths, SummaryRows, WritePlace) {
+fn summary_rows(io: &SimulatedIo) -> (SummaryPaths, SummaryRows, WritePlace) {
     let paths = SummaryPaths::new(Path::new(ROOT));
     let mut rows = SummaryRows::new(ByteCount(0));
-    let mark = read_summary(&built.io, &paths, &mut rows, &mut LostRows::default()).expect("read").expect("a summary");
+    let mark = read_summary(io, &paths, &mut rows, &mut LostRows::default()).expect("read").expect("a summary");
     rows.make_room(ByteCount(rows.bytes().len() as u64 * 2));
     (paths, rows, mark)
 }
 
-fn row_offset(built: &Built, paths: &SummaryPaths, segment: SegmentNumber) -> usize {
-    let file = built.io.open_read_only(&paths.current).expect("open");
+fn row_offset(io: &SimulatedIo, paths: &SummaryPaths, segment: SegmentNumber) -> usize {
+    let file = io.open_read_only(&paths.current).expect("open");
     let mut bytes = vec![0; file_length_of(&file).0 as usize];
     file.read_exact_at(FileOffset(0), &mut bytes).expect("read");
-    built.io.close_file(file);
+    io.close_file(file);
 
     let mut at = SUMMARY_HEADER_BYTES;
     loop {
@@ -802,7 +802,7 @@ fn zero_head() {
 #[test]
 fn wrong_mark() {
     let built = build(27);
-    let (paths, mut rows, mark) = summary_rows(&built);
+    let (paths, mut rows, mark) = summary_rows(&built.io);
     let segment = built.heads[MIDDLE].segment;
     let mut facts = rows.get(segment).expect("row").facts;
     facts.seal_mark = Checksum(facts.seal_mark.0 + 1);
@@ -821,7 +821,7 @@ fn wrong_mark() {
 #[test]
 fn gone_row() {
     let built = build(28);
-    let (paths, mut rows, mark) = summary_rows(&built);
+    let (paths, mut rows, mark) = summary_rows(&built.io);
     let gone = SegmentNumber(built.heads[NEWEST].segment.0 + 1_000);
     let mut facts = rows.get(built.heads[NEWEST].segment).expect("row").facts;
     facts.segment = gone;
@@ -1183,7 +1183,7 @@ fn rows_fit() {
 fn one_copy() {
     let built = build(40);
     let paths = SummaryPaths::new(Path::new(ROOT));
-    let at = row_offset(&built, &paths, built.heads[MIDDLE].segment);
+    let at = row_offset(&built.io, &paths, built.heads[MIDDLE].segment);
     built.io.rot(&paths.current, FileOffset((at + ROW_HEAD_BYTES + 2) as u64), FLIP).expect("rot");
     rot_first_tail(&built, MIDDLE);
     rot_second_tail(&built, MIDDLE);
@@ -1529,8 +1529,8 @@ fn not_damage() {
 }
 
 // write the newer copy alone, as a crash between the two copies leaves it
-fn newer_copy(built: &Built, paths: &SummaryPaths, mark: WritePlace, rows: &[u8]) {
-    write_copy(&built.io, paths, &paths.current, &summary_header(WritePlace(mark.0 + 1), rows), rows).expect("write");
+fn newer_copy(io: &SimulatedIo, paths: &SummaryPaths, mark: WritePlace, rows: &[u8]) {
+    write_copy(io, paths, &paths.current, &summary_header(WritePlace(mark.0 + 1), rows), rows).expect("write");
 }
 
 fn assert_all_refused(store: &Store, built: &Built) {
@@ -1546,11 +1546,11 @@ fn newer_rot() {
     for stage in [OLDEST, MIDDLE, NEWEST] {
         for rot_at in [1, ROW_HEAD_BYTES + 2] {
             let built = build(60 + stage as u64);
-            let (paths, rows, mark) = summary_rows(&built);
+            let (paths, rows, mark) = summary_rows(&built.io);
             let segment = built.heads[stage].segment;
             let older = rows.get(segment).expect("row").facts;
-            newer_copy(&built, &paths, mark, rows.bytes());
-            let at = row_offset(&built, &paths, segment);
+            newer_copy(&built.io, &paths, mark, rows.bytes());
+            let at = row_offset(&built.io, &paths, segment);
             built.io.rot(&paths.current, FileOffset((at + rot_at) as u64), FLIP).expect("rot");
 
             let store = open(&built.io);
@@ -1571,13 +1571,13 @@ fn newer_rot() {
 #[test]
 fn only_newer() {
     let built = build(63);
-    let (paths, mut rows, mark) = summary_rows(&built);
+    let (paths, mut rows, mark) = summary_rows(&built.io);
     let segment = built.heads[MIDDLE].segment;
     let full = rows.bytes().to_vec();
     rows.remove(segment);
     write_summary(&built.io, &paths, mark, rows.bytes()).expect("write");
-    newer_copy(&built, &paths, mark, &full);
-    let at = row_offset(&built, &paths, segment);
+    newer_copy(&built.io, &paths, mark, &full);
+    let at = row_offset(&built.io, &paths, segment);
     built.io.rot(&paths.current, FileOffset((at + ROW_HEAD_BYTES + 2) as u64), FLIP).expect("rot");
 
     let store = open(&built.io);
@@ -1592,11 +1592,11 @@ fn only_newer() {
 #[test]
 fn only_older() {
     let built = build(64);
-    let (paths, mut rows, mark) = summary_rows(&built);
+    let (paths, mut rows, mark) = summary_rows(&built.io);
     let segment = built.heads[MIDDLE].segment;
     let older = rows.get(segment).expect("row").facts;
     rows.remove(segment);
-    newer_copy(&built, &paths, mark, rows.bytes());
+    newer_copy(&built.io, &paths, mark, rows.bytes());
 
     let store = open(&built.io);
 
@@ -1656,5 +1656,42 @@ fn rot_end() {
 
     assert_eq!(store.damaged_segments(), 0);
     assert_eq!(read(&store, ORDERED, b"older").expect("get"), Some(b"first".to_vec()));
+    store.close().expect("close");
+}
+
+// an open segment's row may be the only trace of a tail open cut, so losing it damages the segment again
+#[test]
+fn open_lost() {
+    let (io, rows_file, length) = sector_end(67);
+    io.bad_sector(&rows_file, FileOffset(length.0 - 1)).expect("bad");
+    open(&io).close().expect("close");
+
+    let (paths, mut rows, mark) = summary_rows(&io);
+    let (segment, full) = (rows.rows().next().expect("row").facts.segment, rows.bytes().to_vec());
+    rows.remove(segment);
+    write_summary(&io, &paths, mark, rows.bytes()).expect("write");
+    newer_copy(&io, &paths, mark, &full);
+    let at = row_offset(&io, &paths, segment);
+    io.rot(&paths.current, FileOffset((at + ROW_HEAD_BYTES + 2) as u64), FLIP).expect("rot");
+
+    let store = open(&io);
+
+    assert_eq!(store.damaged_segments(), 1);
+    assert!(matches!(read(&store, ORDERED, b"older"), Err(StoreError::Corruption { .. })));
+    store.close().expect("close");
+}
+
+// rot that grows replaces the spans of the open before it, so the pool holds one span per column
+#[test]
+fn ranked_again() {
+    let (io, starts) = three_groups(68);
+    let rows = rows_files(&io)[0].clone();
+    io.rot(&rows, FileOffset(starts[2] + 20), FLIP).expect("rot");
+    reopen(open(&io));
+    io.rot(&rows, FileOffset(starts[3] + 20), FLIP).expect("rot");
+
+    let store = open(&io);
+
+    assert_eq!(store.state.volumes[0].damage.len(), COLUMNS.len());
     store.close().expect("close");
 }

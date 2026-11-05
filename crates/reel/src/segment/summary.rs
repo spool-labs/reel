@@ -669,9 +669,7 @@ pub fn read_summary<Backend: Io>(
         for (segment, at) in older_rows.offsets() {
             if !listed.contains_key(&segment) {
                 rows.copy_row(&older_rows, at);
-                if lost.has_lost_row {
-                    lost.older.push(segment);
-                }
+                lost.older.push(segment);
             }
         }
     }

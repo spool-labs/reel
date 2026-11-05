@@ -31,6 +31,9 @@ const SEARCH_STEPS: usize = 4;
 const CRASH_POINTS: u64 = 10;
 const LARGE_BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
 const REPEATS: u64 = 5_000;
+const CENTRE: u64 = 500_000;
+const SPARE_STEPS: u64 = 10_000;
+const BATCH_COVERS: u64 = 100;
 const COVER_SURPLUS: u64 = 10;
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 
@@ -722,16 +725,76 @@ fn many_repeats() {
     store.close().expect("close");
 }
 
-// every slot at its cover limit seals, so range deletes go on, with covers that keep dropping out of the pool
+// every slot at its cover limit seals, so range deletes go on. Each start key differs, or the index fills first and its
+// wait seals the segments, and each cover holds the one before, so the pool stays at one
 #[test]
 fn every_slot_capped() {
     let io = SimulatedIo::new(Seed(26));
-    let store = open(&io);
+    let store = ReelStore::open(io.clone(), &config_at(LARGE_BUDGET)).expect("open");
     let slots = store.state.sizing.shard.open_slots as u64;
-    for _repeat in 0..(MOST_RANGE_COVERS as u64 + 1) * slots {
-        store.delete_range(COLUMN, &key_of(10), &key_of(20)).expect("delete");
+    for number in 0..(MOST_RANGE_COVERS as u64 + 1) * (slots + 1) {
+        store.delete_range(COLUMN, &key_of(CENTRE - number), &key_of(CENTRE + 1 + number)).expect("delete");
     }
 
     assert_eq!(store.state.volumes[0].covers.len(), 1);
     store.close().expect("close");
+}
+
+// batches that fit no segment's cover room still land: the fullest seals though none is at the limit
+#[test]
+fn batches_past_room() {
+    let io = SimulatedIo::new(Seed(27));
+    let store = ReelStore::open(io.clone(), &config_at(LARGE_BUDGET)).expect("open");
+    let slots = store.state.sizing.shard.open_slots as u64;
+    let mut number = 0;
+    for _batch in 0..(MOST_RANGE_COVERS as u64 / BATCH_COVERS + 1) * (slots + 1) {
+        let mut batch = WriteBatch::new();
+        for _repeat in 0..BATCH_COVERS {
+            batch.delete_range(COLUMN, &key_of(CENTRE - number), &key_of(CENTRE + 1 + number));
+            number += 1;
+        }
+        store.write_batch(&batch).expect("batch");
+    }
+
+    assert_eq!(store.state.volumes[0].covers.len(), 1);
+    store.close().expect("close");
+}
+
+// a spare a crash left behind is gone after open, and the data around it is whole
+#[test]
+fn spare_crash() {
+    for is_power_cut in [false, true] {
+        let io = SimulatedIo::new(Seed(28));
+        let store = open(&io);
+        fill(&store);
+        store.flush().expect("flush");
+        hold(&store.state.volumes[0].claims).wants_prepared = true;
+        store.state.prepare_segments();
+        let spare = hold(&store.state.volumes[0].claims).prepared.as_ref().map(|segment| segment.number).expect("a spare");
+        if is_power_cut {
+            io.power_cut();
+        } else {
+            io.kill();
+        }
+        drop(store);
+
+        let store = open(&io);
+
+        let spare_rows = rows_path(Path::new(ROOT), spare).to_path_buf();
+        // open seals what holds no row away with its jobs
+        for _step in 0..SPARE_STEPS {
+            if !io.list_directory(Path::new(ROOT)).expect("list").contains(&spare_rows) {
+                break;
+            }
+            if io.step_any().is_none() {
+                io.advance_clock(TICK);
+            }
+        }
+        let listing = io.list_directory(Path::new(ROOT)).expect("list");
+        assert!(!listing.contains(&spare_rows));
+        for number in 0..KEYS {
+            assert_eq!(read(&store, COLUMN, &key_of(number)), Some(b"older".to_vec()));
+        }
+        store.close().expect("close");
+    }
 }

@@ -299,7 +299,13 @@ impl<Backend: Io> EngineState<Backend> {
             has_records: bytes.0 > 0,
             covers: plan.covers,
         };
-        let claim = self.claim(volume, &request)?;
+        // a long group goes out under its own turn, and a short one needs room in the group filling
+        let (claim, room) = if is_long {
+            (self.claim(volume, &request)?, None)
+        } else {
+            let (claim, room) = self.claim_with_room(volume, &request, plan.row_bytes)?;
+            (claim, Some(room))
+        };
         let start = BatchCursor {
             offset: claim.offset,
             place: claim.first_place(),
@@ -375,8 +381,6 @@ impl<Backend: Io> EngineState<Backend> {
         }
 
         let (slot, segment) = (claim.slot, claim.segment);
-        let size = stage.row_bytes();
-        self.reserve_row(slot, size)?;
         for row in stage.walk() {
             let write_row = WriteRow {
                 place: row.place,
@@ -392,11 +396,11 @@ impl<Backend: Io> EngineState<Backend> {
         }
         {
             let mut queue = hold(&self.queues[slot.0 as usize]);
-            queue.reserved -= size;
             // the reservation holds this room, whichever group is filling by now
             let is_appended = queue.filling.append(stage);
             debug_assert!(is_appended);
         }
+        drop(room);
         self.wake_row_job();
         self.add_covers(batch, plan, start.place, segment);
         self.deletes.fetch_add(plan.deletes, Ordering::Relaxed);

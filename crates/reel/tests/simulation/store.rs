@@ -2,11 +2,11 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::thread;
 
 use crate::seed_sets::seeds;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
-use reel::engine::open_segment::{SegmentPhase, rows_path};
+use reel::engine::open_segment::{RECORD_WINDOW_BYTES, SegmentPhase, rows_path};
+use reel::engine::write_path::WindowSwitch;
 use reel::engine::reel_store::ReelStore;
 use reel::guard::hold;
 use reel::io::{Io, IoFile};
@@ -39,7 +39,6 @@ const FAILED_OPEN_POINTS: u64 = 40;
 const QUIET_ROWS: u64 = 100;
 const WINDOW_ROWS: u64 = 500;
 const WINDOW_VALUE: usize = 300;
-const REFILL_LARGE: usize = 3_000;
 const SEND_CRASH_POINTS: u64 = 8;
 const LARGE_ENOUGH: usize = 100_000;
 
@@ -708,52 +707,6 @@ fn held_window() {
     store.close().expect("close");
 }
 
-// a writer past the end of a range and a smaller one beside it both land: nothing goes in the rest of a range once its
-// refill starts, so the next range can't take a record with it
-#[test]
-fn refill_beside() {
-    let io = SimulatedIo::new(Seed(100));
-    let store = open(&io);
-    let state = &store.state;
-    store.put(COLUMN, b"first", b"value").expect("put");
-    let slot = hold(&state.volumes[0].claims).open[0].slot;
-    let index = slot.0 as usize;
-    let large = vec![1; REFILL_LARGE];
-    let room = |store: &Store| {
-        let guard = hold(&store.state.queues[index]);
-        guard.window_room - store.state.windows[index][guard.live_window].used()
-    };
-    let mut number = 0_u64;
-    while room(&store) > REFILL_LARGE {
-        store.put(COLUMN, &number.to_le_bytes(), &large).expect("put");
-        number += 1;
-    }
-    state.take_writing_turn(slot);
-
-    thread::scope(|scope| {
-        let big = scope.spawn(|| store.put(COLUMN, b"big", &large));
-        while !hold(&state.queues[index]).is_refilling {
-            thread::yield_now();
-        }
-        let small = scope.spawn(|| store.put(COLUMN, b"small", b"value"));
-        hold(&state.queues[index]).is_writing = false;
-        big.join().expect("join").expect("put");
-        small.join().expect("join").expect("put");
-    });
-
-    let mut buf = Vec::new();
-    assert!(store.get(COLUMN, b"small", &mut buf).expect("get"));
-    assert_eq!(buf, b"value");
-    assert!(store.get(COLUMN, b"big", &mut buf).expect("get"));
-    assert_eq!(buf, large);
-    store.flush().expect("flush");
-    io.kill();
-    drop(store);
-    let store = open(&io);
-    assert!(store.get(COLUMN, b"small", &mut buf).expect("get"));
-    store.close().expect("close");
-}
-
 // a segment marked to seal gets no new range, so a window can't land under its footer
 #[test]
 fn no_range_sealing() {
@@ -769,7 +722,7 @@ fn no_range_sealing() {
     let before = hold(&volume.claims).open[0].write_end;
 
     store.state.write_out(slot).expect("write out");
-    assert!(store.state.claim_window(volume, slot, 1));
+    assert_eq!(store.state.switch_window(volume, slot, RECORD_WINDOW_BYTES), WindowSwitch::HasRoom);
 
     assert_eq!(hold(&volume.claims).open[0].write_end, before);
     store.close().expect("close");
@@ -893,5 +846,48 @@ fn spare_closed() {
     let store = open(&io);
     let mut buf = Vec::new();
     assert!(store.get(COLUMN, b"key", &mut buf).expect("get"));
+    store.close().expect("close");
+}
+
+// a window that fills moves the slot to the next range with no write call of its own in the way: a writer lands in
+// the new window while the old one waits, and both read back
+#[test]
+fn window_switches() {
+    let io = SimulatedIo::new(Seed(103));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let volume = &store.state.volumes[0];
+    let slot = hold(&volume.claims).open[0].slot;
+    let index = slot.0 as usize;
+    let live = hold(&store.state.queues[index]).live_window;
+    let before = hold(&volume.claims).open[0].write_end;
+
+    assert_eq!(store.state.switch_window(volume, slot, RECORD_WINDOW_BYTES), WindowSwitch::Switched);
+
+    assert_eq!(hold(&store.state.queues[index]).live_window, 1 - live);
+    assert!(hold(&volume.claims).open[0].write_end > before);
+    assert!(!store.state.windows[index][live].is_empty());
+    assert!(store.state.try_window(slot, [b"h", b"v"], 1).is_some());
+    hold(&store.state.queues[index]).reserved -= 1;
+    let mut buf = Vec::new();
+    assert!(store.get(COLUMN, b"key", &mut buf).expect("get"));
+    assert_eq!(buf, b"value");
+    store.close().expect("close");
+}
+
+// a window waiting to go keeps its range and its records: the live one can't move onto it
+#[test]
+fn window_waits() {
+    let io = SimulatedIo::new(Seed(104));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let volume = &store.state.volumes[0];
+    let slot = hold(&volume.claims).open[0].slot;
+    assert_eq!(store.state.switch_window(volume, slot, RECORD_WINDOW_BYTES), WindowSwitch::Switched);
+    let before = hold(&volume.claims).open[0].write_end;
+
+    assert_eq!(store.state.switch_window(volume, slot, RECORD_WINDOW_BYTES + 1), WindowSwitch::OtherBusy);
+
+    assert_eq!(hold(&volume.claims).open[0].write_end, before);
     store.close().expect("close");
 }

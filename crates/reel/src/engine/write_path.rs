@@ -1,7 +1,9 @@
 //! Puts, deletes and syncs
 
+use std::hint;
 use std::io::{Error, ErrorKind, IoSlice};
 use std::mem;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
@@ -13,7 +15,8 @@ use crate::engine::claim::Claim;
 use crate::engine::engine_sizing::OPEN_PER_ROOT;
 use crate::engine::engine_state::{EngineState, SlotData, SlotPin};
 use crate::engine::open_segment::{
-    MOST_WINDOW_RECORD_BYTES, OpenSegment, RECORD_WINDOW_BYTES, RecordWindow, SegmentPhase, data_path, rows_path,
+    MOST_WINDOW_RECORD_BYTES, OpenSegment, RECORD_WINDOW_BYTES, RecordWindow, RowQueue, SegmentPhase, data_path,
+    rows_path,
 };
 use crate::engine::volume::{ClaimState, Volume};
 use crate::guard::hold;
@@ -30,6 +33,8 @@ use crate::segment::range_covers::{Cover, MOST_RANGE_COVERS};
 
 /// In-flight writes an open segment takes before the volume opens another
 pub const WRITES_PER_OPEN: u32 = 2;
+/// How many times a writer waits on the spot for a window to go out before it tries again
+pub const WINDOW_SPINS: u32 = 2_000;
 /// How long a writer waits for a seal to free the write index before it reports the failure
 pub const INDEX_WAIT: Nanoseconds = Nanoseconds(60_000_000_000);
 
@@ -59,6 +64,19 @@ pub enum LandOutcome {
     Landed,
     /// The index has no room, so nothing changed
     IndexFull,
+}
+
+/// Room held in a slot's filling group, given back when it drops, by which time a landed row has taken it
+#[derive(Debug)]
+pub struct RowRoom<'queue> {
+    pub queue: &'queue Mutex<RowQueue>,
+    pub size: usize,
+}
+
+impl Drop for RowRoom<'_> {
+    fn drop(&mut self) {
+        hold(self.queue).reserved -= self.size;
+    }
 }
 
 /// Turn a backend failure into a store error, and a full disk into the volume's own error
@@ -174,7 +192,7 @@ impl<Backend: Io> EngineState<Backend> {
     }
 
     /// Make room in a slot's window and group, with no claim held, and return false when the segment has too little
-    /// left for a window
+    /// left for a window. Writers go on in the new window while this one sends the old
     pub fn refill_window(
         &self,
         volume: &Volume<Backend>,
@@ -182,68 +200,74 @@ impl<Backend: Io> EngineState<Backend> {
         length: usize,
         size: usize,
     ) -> Result<bool, StoreError> {
-        let queue = &self.queues[slot.0 as usize];
-        let mut guard = hold(queue);
-        let has_row_room = guard.filling.has_room(guard.reserved + size);
-        let window = &self.windows[slot.0 as usize][guard.live_window];
-        let has_record_room = window.used() + length <= guard.window_room;
-        if has_row_room && has_record_room {
-            return Ok(true);
+        let index = slot.0 as usize;
+        let sent = |outcome: Result<(), Error>| {
+            outcome.map_err(|source| StoreError::Io {
+                action: "writing rows",
+                source,
+            })
+        };
+        {
+            let guard = hold(&self.queues[index]);
+            if !guard.filling.has_room(guard.reserved + size) {
+                drop(guard);
+                sent(self.write_out(slot))?;
+                return Ok(true);
+            }
         }
 
-        let needs_window = !has_record_room && !guard.is_refilling;
-        if needs_window {
-            // nothing goes in the rest of this range, since the range after it replaces it
-            guard.is_refilling = true;
-            guard.window_room = window.used();
+        match self.switch_window(volume, slot, length) {
+            WindowSwitch::HasRoom => Ok(true),
+            WindowSwitch::NoRoom => Ok(false),
+            WindowSwitch::Switched | WindowSwitch::OtherBusy => {
+                if self.try_writing_turn(slot) {
+                    let outcome = self.send_kept_window(index);
+                    hold(&self.queues[index]).is_writing = false;
+                    sent(outcome)?;
+                } else {
+                    // the write that holds the turn takes microseconds, against a millisecond for any sleep
+                    for _spin in 0..WINDOW_SPINS {
+                        hint::spin_loop();
+                    }
+                }
+                Ok(true)
+            },
         }
-        drop(guard);
-        if !needs_window && has_row_room {
-            self.io.pause();
-            return Ok(true);
-        }
-
-        let sent = self.write_out(slot).map_err(|source| StoreError::Io {
-            action: "writing rows",
-            source,
-        });
-        let has_window = !needs_window || sent.is_ok() && self.claim_window(volume, slot, length);
-        if needs_window {
-            hold(queue).is_refilling = false;
-        }
-        sent?;
-        Ok(has_window)
     }
 
-    /// Claim the next range of a segment for its window, and return false when too little of the segment is left
-    pub fn claim_window(&self, volume: &Volume<Backend>, slot: OpenSlot, length: usize) -> bool {
+    /// Move a slot to the next range of its segment in the other window, under the locks and with no I/O
+    pub fn switch_window(&self, volume: &Volume<Backend>, slot: OpenSlot, length: usize) -> WindowSwitch {
+        let index = slot.0 as usize;
         let mut claims = hold(&volume.claims);
         let Some(segment) = claims.open.iter_mut().find(|segment| segment.slot == slot) else {
             // the segment went while no claim was held, and the next claim finds another
-            return true;
+            return WindowSwitch::HasRoom;
         };
         if segment.phase != SegmentPhase::Taking {
-            return true;
+            return WindowSwitch::HasRoom;
         }
-        // a window that still holds records cannot start over, and the refill that follows sends them
-        {
-            let guard = hold(&self.queues[slot.0 as usize]);
-            if !self.windows[slot.0 as usize][guard.live_window].is_empty() {
-                return true;
-            }
+
+        let mut guard = hold(&self.queues[index]);
+        let live = guard.live_window;
+        if self.windows[index][live].used() + length <= guard.window_room {
+            return WindowSwitch::HasRoom;
+        }
+        if guard.has_kept_window {
+            return WindowSwitch::OtherBusy;
         }
         let left = volume.segment_bytes.0.saturating_sub(segment.write_end.0) as usize;
         let room = left.min(RECORD_WINDOW_BYTES);
         if room < length {
-            return false;
+            return WindowSwitch::NoRoom;
         }
+
         let start = segment.write_end;
         segment.write_end = FileOffset(start.0 + room as u64);
-        drop(claims);
-        let mut guard = hold(&self.queues[slot.0 as usize]);
-        self.windows[slot.0 as usize][guard.live_window].reset(start);
+        self.windows[index][1 - live].reset(start);
+        guard.live_window = 1 - live;
         guard.window_room = room;
-        true
+        guard.has_kept_window = !self.windows[index][live].is_empty();
+        WindowSwitch::Switched
     }
 
     /// Write a one-chunk value as it stands, with its head on the stack, so no writer waits for a shared encoder
@@ -328,7 +352,7 @@ impl<Backend: Io> EngineState<Backend> {
             covers: 0,
         };
         loop {
-            let claim = self.claim(volume, &request)?;
+            let (claim, room) = self.claim_with_room(volume, &request, row_size(write.key.len()))?;
             if let Err(source) = write_record(&claim) {
                 return Err(store_error(volume, "writing a record", source));
             }
@@ -343,7 +367,9 @@ impl<Backend: Io> EngineState<Backend> {
                 has_newer_sealed: false,
             };
             let slot = claim.slot;
-            match self.land_row(write.column, write.key, &row)? {
+            let landed = self.land_reserved(write.column, write.key, &row);
+            drop(room);
+            match landed {
                 LandOutcome::Landed => {
                     claim.land();
                     return self.after_write(volume, length);
@@ -375,7 +401,7 @@ impl<Backend: Io> EngineState<Backend> {
             covers: 0,
         };
         loop {
-            let claim = self.claim(volume, &request)?;
+            let (claim, room) = self.claim_with_room(volume, &request, row_size(key.len()))?;
             let row = WriteRow {
                 place: claim.first_place(),
                 offset: claim.offset,
@@ -386,7 +412,9 @@ impl<Backend: Io> EngineState<Backend> {
                 has_newer_sealed: false,
             };
             let slot = claim.slot;
-            match self.land_row(column, key, &row)? {
+            let landed = self.land_reserved(column, key, &row);
+            drop(room);
+            match landed {
                 LandOutcome::Landed => {
                     claim.land();
                     self.deletes.fetch_add(1, Ordering::Relaxed);
@@ -448,7 +476,7 @@ impl<Backend: Io> EngineState<Backend> {
             covers: 1,
         };
         loop {
-            let claim = self.claim(volume, &request)?;
+            let (claim, room) = self.claim_with_room(volume, &request, row_size(start.len()))?;
             let head = record.head(self.record_key, claim.first_place());
             if let Err(source) = claim.data.write_at(claim.offset, &[IoSlice::new(&head), IoSlice::new(end)]) {
                 return Err(store_error(volume, "writing a record", source));
@@ -464,7 +492,9 @@ impl<Backend: Io> EngineState<Backend> {
                 has_newer_sealed: false,
             };
             let slot = claim.slot;
-            match self.land_row(column, start, &row)? {
+            let landed = self.land_reserved(column, start, &row);
+            drop(room);
+            match landed {
                 LandOutcome::Landed => {
                     let cover = Cover {
                         column,
@@ -499,15 +529,39 @@ impl<Backend: Io> EngineState<Backend> {
         })
     }
 
-    /// Put a row in the write index and the rows queue, or in neither
-    pub fn land_row(&self, column: ColumnId, key: &[u8], row: &WriteRow) -> Result<LandOutcome, StoreError> {
-        let size = row_size(key.len());
-        self.reserve_row(row.slot, size)?;
+    /// Claim with room held for rows in the group filling. A full group goes out with no claim held, since a writer
+    /// that writes with a ticket stops the mark for every writer behind it
+    pub fn claim_with_room<'state>(
+        &'state self,
+        volume: &'state Volume<Backend>,
+        request: &ClaimRequest,
+        size: usize,
+    ) -> Result<(Claim<'state, Backend>, RowRoom<'state>), StoreError> {
+        loop {
+            let claim = self.claim(volume, request)?;
+            let queue = &self.queues[claim.slot.0 as usize];
+            {
+                let mut guard = hold(queue);
+                if guard.filling.has_room(guard.reserved + size) {
+                    guard.reserved += size;
+                    drop(guard);
+                    return Ok((claim, RowRoom { queue, size }));
+                }
+            }
 
-        let queue = &self.queues[row.slot.0 as usize];
+            let slot = claim.slot;
+            drop(claim);
+            self.write_out(slot).map_err(|source| StoreError::Io {
+                action: "writing rows",
+                source,
+            })?;
+        }
+    }
+
+    /// Put a row in the write index and the rows queue, or in neither, with room held for it
+    pub fn land_reserved(&self, column: ColumnId, key: &[u8], row: &WriteRow) -> LandOutcome {
         if !self.index.insert(column, key, row) {
-            hold(queue).reserved -= size;
-            return Ok(LandOutcome::IndexFull);
+            return LandOutcome::IndexFull;
         }
 
         let entry = RowEntry {
@@ -518,14 +572,23 @@ impl<Backend: Io> EngineState<Backend> {
             length: row.length,
             kind: row.kind,
         };
-        {
-            let mut guard = hold(queue);
-            guard.reserved -= size;
-            // the reservation holds this room, whichever group is filling by now
-            guard.filling.push(&entry);
-        }
+        // the reservation holds this room, whichever group is filling by now
+        hold(&self.queues[row.slot.0 as usize]).filling.push(&entry);
         self.wake_row_job();
-        Ok(LandOutcome::Landed)
+        LandOutcome::Landed
+    }
+
+    /// Put a row in the write index and the rows queue, or in neither, for a caller with no claim to give up
+    pub fn land_row(&self, column: ColumnId, key: &[u8], row: &WriteRow) -> Result<LandOutcome, StoreError> {
+        let size = row_size(key.len());
+        self.reserve_row(row.slot, size)?;
+        let room = RowRoom {
+            queue: &self.queues[row.slot.0 as usize],
+            size,
+        };
+        let landed = self.land_reserved(column, key, row);
+        drop(room);
+        Ok(landed)
     }
 
     /// Hold room for a row in the group filling, sending the group out when it's full
@@ -604,6 +667,10 @@ impl<Backend: Io> EngineState<Backend> {
                     claims.open.push(segment);
                     self.ask_for_segment(&mut claims);
                     continue;
+                }
+                // no segment seals on its own for covers that fit none, and each holds a slot
+                if pick.best.is_none() && request.covers > 0 {
+                    self.seal_most_covers(&mut claims, volume);
                 }
                 if pick.wants_more {
                     self.ask_for_segment(&mut claims);
@@ -709,6 +776,17 @@ impl<Backend: Io> EngineState<Backend> {
         }
     }
 
+    /// Mark the taking segment with the most covers to seal
+    pub fn seal_most_covers(&self, claims: &mut ClaimState<Backend::File>, volume: &Volume<Backend>) {
+        let taking = claims.open.iter_mut().filter(|segment| segment.phase == SegmentPhase::Taking);
+        if let Some(segment) = taking.max_by_key(|segment| segment.cover_rows) {
+            segment.phase = SegmentPhase::Sealing;
+            if let Some(task) = self.seal_tasks[volume.id.0 as usize].get() {
+                task.wake();
+            }
+        }
+    }
+
     /// Ask the job for a segment made ahead, unless it has been asked
     pub fn ask_for_segment(&self, claims: &mut ClaimState<Backend::File>) {
         if !claims.wants_prepared {
@@ -745,8 +823,10 @@ impl<Backend: Io> EngineState<Backend> {
             let created = self.create_segment(volume, RootId(root as u8), &request);
             let mut claims = hold(&volume.claims);
             claims.is_creating = false;
-            if let Ok(Some(segment)) = created {
-                claims.prepared = Some(segment);
+            match created {
+                Ok(Some(segment)) => claims.prepared = Some(segment),
+                // left asked for, so the job tries at its next period and no claim wakes it
+                Ok(None) | Err(_) => claims.wants_prepared = true,
             }
         }
     }
@@ -1155,36 +1235,40 @@ impl<Backend: Io> EngineState<Backend> {
         outcome
     }
 
-    /// Send the records of a slot to the kernel: a window a failed write left first, then the live one, whose rest of the
-    /// range goes on in the other window
+    /// Send the records of a slot to the kernel: the window waiting to go, then the live one, whose rest of the range
+    /// goes on in the other window
     pub fn send_windows(&self, index: usize) -> Result<(), Error> {
+        self.send_kept_window(index)?;
         let windows = &self.windows[index];
-        loop {
-            let (window, was_kept) = {
-                let mut queue = hold(&self.queues[index]);
-                let live = queue.live_window;
-                if queue.has_kept_window {
-                    (&windows[1 - live], true)
-                } else {
-                    if windows[live].is_empty() {
-                        return Ok(());
-                    }
-                    windows[1 - live].reset(windows[live].end());
-                    queue.window_room -= windows[live].used();
-                    queue.live_window = 1 - live;
-                    queue.has_kept_window = true;
-                    (&windows[live], false)
-                }
-            };
-
-            self.send_window(index, window)?;
-            hold(&self.queues[index]).has_kept_window = false;
-            // reads go to the file from here, before any sync, so a sync never holds one up
-            window.reset(FileOffset(0));
-            if !was_kept {
+        {
+            let mut queue = hold(&self.queues[index]);
+            let live = queue.live_window;
+            if windows[live].is_empty() {
                 return Ok(());
             }
+            windows[1 - live].reset(windows[live].end());
+            queue.window_room -= windows[live].used();
+            queue.live_window = 1 - live;
+            queue.has_kept_window = true;
         }
+        self.send_kept_window(index)
+    }
+
+    /// Send the window waiting to go, which takes the slot's writing turn
+    pub fn send_kept_window(&self, index: usize) -> Result<(), Error> {
+        let (window, is_kept) = {
+            let queue = hold(&self.queues[index]);
+            (&self.windows[index][1 - queue.live_window], queue.has_kept_window)
+        };
+        if !is_kept {
+            return Ok(());
+        }
+
+        self.send_window(index, window)?;
+        // reads go to the file from here, before any sync, so a sync never holds one up
+        window.reset(FileOffset(0));
+        hold(&self.queues[index]).has_kept_window = false;
+        Ok(())
     }
 
     /// Send a window's records to the kernel
@@ -1211,6 +1295,19 @@ impl<Backend: Io> EngineState<Backend> {
             None => true,
         }
     }
+}
+
+/// What a try to move a slot to its next window found
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowSwitch {
+    /// The live window has room, or the slot has left this segment, so the next claim goes on
+    HasRoom,
+    /// The slot moved on, and the old window is waiting to go
+    Switched,
+    /// The other window is still going out
+    OtherBusy,
+    /// Too little of the segment is left for a window
+    NoRoom,
 }
 
 /// A claim's choice of segment

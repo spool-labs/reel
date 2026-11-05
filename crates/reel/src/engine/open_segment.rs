@@ -178,7 +178,6 @@ pub struct RowQueue {
     pub live_window: usize,
     pub window_room: usize,
     pub has_kept_window: bool,
-    pub is_refilling: bool,
 }
 
 impl RowQueue {
@@ -194,7 +193,6 @@ impl RowQueue {
             live_window: 0,
             window_room: 0,
             has_kept_window: false,
-            is_refilling: false,
         }
     }
 
@@ -208,7 +206,6 @@ impl RowQueue {
         self.reserved = 0;
         self.window_room = 0;
         self.has_kept_window = false;
-        self.is_refilling = false;
     }
 }
 

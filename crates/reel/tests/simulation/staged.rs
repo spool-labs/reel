@@ -1066,14 +1066,17 @@ fn run_until_crash(
 fn empty_seal() {
     let io = SimulatedIo::new(Seed(21));
     let store = open(&io);
-    store.put(COLUMN, b"key", b"value").expect("put");
-    io.kill();
-    drop(store);
-
-    let store = open(&io);
     let state = Arc::clone(&store.state);
-    let open_rows = hold(&state.volumes[0].claims).open.iter().map(|segment| segment.row_count.0).sum::<u64>();
-    assert_eq!(open_rows, 0);
+    let request = ClaimRequest {
+        bytes: ByteCount(0),
+        rows: RowCount(1),
+        is_alone: false,
+        has_records: false,
+        covers: 0,
+    };
+    // a claim that lands nothing leaves a segment with no rows in the index
+    drop(state.claim(&state.volumes[0], &request).expect("claim"));
+    assert!(!hold(&state.volumes[0].claims).open.is_empty());
     assert!(!hold(&state.volumes[0].claims).open.is_empty());
 
     seal_every_open(&state, 0).expect("seal");
@@ -1160,5 +1163,20 @@ fn covers_out_of_order() {
         newer.join().expect("join").expect("delete");
     });
     assert_eq!(read(&store, b"m"), None);
+    store.close().expect("close");
+}
+
+// an open segment that took no row goes at open, as a spare a crash left behind does
+#[test]
+fn empty_open() {
+    let io = SimulatedIo::new(Seed(41));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    io.kill();
+    drop(store);
+
+    let store = open(&io);
+
+    assert!(hold(&store.state.volumes[0].claims).open.is_empty());
     store.close().expect("close");
 }

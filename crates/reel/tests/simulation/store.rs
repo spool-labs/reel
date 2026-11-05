@@ -9,7 +9,9 @@ use std::thread;
 use crate::seed_sets::seeds;
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::open_segment::{RECORD_WINDOW_BYTES, SegmentPhase, rows_path};
-use reel::engine::write_path::WindowSwitch;
+use reel::engine::engine_sizing::OPEN_PER_ROOT;
+use reel::engine::reserve_job::RESERVE_PERIOD;
+use reel::engine::write_path::{ClaimRequest, SPARE_REQUEST, WRITES_PER_OPEN, WindowSwitch};
 use reel::engine::reel_store::ReelStore;
 use reel::guard::hold;
 use reel::io::{Io, IoFile};
@@ -20,7 +22,7 @@ use reel::record::codec::Codec;
 use reel_api::column_id::ColumnId;
 use reel_api::reads::ValueWindow;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, Nanoseconds, VolumeId};
+use reel_api::units::{ByteCount, Nanoseconds, RootId, RowCount, VolumeId};
 
 const ROOT: &str = "/disk/meta";
 const COLUMN: ColumnId = ColumnId(1);
@@ -46,6 +48,15 @@ const SEND_CRASH_POINTS: u64 = 8;
 const LARGE_ENOUGH: usize = 100_000;
 const RACE_RECORD_BYTES: usize = 4_000;
 const RACE_ATTEMPTS: u64 = 20_000_000;
+const JOB_STEPS: u64 = 200;
+const SEAL_TICK: Nanoseconds = Nanoseconds(1_000_000);
+const ONE_ROW: ClaimRequest = ClaimRequest {
+    bytes: ByteCount(1),
+    rows: RowCount(1),
+    is_alone: false,
+    has_records: true,
+    covers: 0,
+};
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -158,6 +169,14 @@ fn config(sync: SyncPolicy) -> StoreConfig {
 
 fn open(io: &SimulatedIo) -> Store {
     ReelStore::open(io.clone(), &config(SyncPolicy::Never)).expect("open")
+}
+
+fn settle_jobs(io: &SimulatedIo) {
+    for _step in 0..JOB_STEPS {
+        if io.step_any().is_none() {
+            return;
+        }
+    }
 }
 
 fn key_of(number: u64) -> Vec<u8> {
@@ -994,5 +1013,93 @@ fn covers_seal_one() {
     let sealing = claims.open.iter().filter(|segment| segment.phase == SegmentPhase::Sealing).count();
     assert_eq!(sealing, 1);
     drop(claims);
+    store.close().expect("close");
+}
+
+// eight writers in flight reach every segment a root may have open, in a few job steps inside the job's period
+#[test]
+fn spares_spread() {
+    let io = SimulatedIo::new(Seed(108));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let volume = &store.state.volumes[0];
+    let start = io.clock_reading();
+
+    let mut held = Vec::new();
+    for _writer in 0..OPEN_PER_ROOT as u32 * WRITES_PER_OPEN {
+        held.push(store.state.claim(volume, &ONE_ROW).expect("claim"));
+        settle_jobs(&io);
+    }
+
+    let claims = hold(&volume.claims);
+    let taking = claims.open.iter().filter(|segment| segment.phase == SegmentPhase::Taking).count();
+    assert_eq!(taking, OPEN_PER_ROOT);
+    assert!(io.clock_reading().0 - start.0 < RESERVE_PERIOD.0);
+    drop(claims);
+    drop(held);
+    store.close().expect("close");
+}
+
+// a spare made while a second ask waits leaves nothing asked, so the claim that takes it wakes the job
+#[test]
+fn spare_asks_again() {
+    let io = SimulatedIo::new(Seed(109));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let volume = &store.state.volumes[0];
+    settle_jobs(&io);
+
+    hold(&volume.claims).is_creating = true;
+    let created = store.state.create_segment(volume, RootId(0), &SPARE_REQUEST);
+    store.state.ask_for_segment(&mut hold(&volume.claims));
+    store.state.finish_create(volume, created);
+    settle_jobs(&io);
+
+    {
+        let mut claims = hold(&volume.claims);
+        let spare = claims.prepared.take().expect("a spare");
+        volume.open_slot(spare.slot);
+        claims.open.push(spare);
+        store.state.ask_for_segment(&mut claims);
+    }
+    settle_jobs(&io);
+
+    assert!(hold(&volume.claims).prepared.is_some());
+    store.close().expect("close");
+}
+
+// a slot a seal frees goes to the spare the job couldn't make, well before the job's period
+#[test]
+fn spare_after_seal() {
+    let io = SimulatedIo::new(Seed(110));
+    let store = open(&io);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    let volume = &store.state.volumes[0];
+    let mut taken = Vec::new();
+    while let Some(slot) = store.state.take_slot() {
+        taken.push(slot);
+    }
+    hold(&volume.claims).wants_prepared = true;
+    store.state.prepare_segments();
+    assert!(hold(&volume.claims).prepared.is_none());
+    let start = io.clock_reading();
+
+    {
+        let mut claims = hold(&volume.claims);
+        store.state.mark_fullest(&mut claims, volume);
+    }
+    for _step in 0..SEAL_STEPS {
+        io.advance_clock(SEAL_TICK);
+        settle_jobs(&io);
+        if hold(&volume.claims).prepared.is_some() {
+            break;
+        }
+    }
+
+    assert!(hold(&volume.claims).prepared.is_some());
+    assert!(io.clock_reading().0 - start.0 < RESERVE_PERIOD.0);
+    for slot in taken {
+        store.state.free_slot(slot);
+    }
     store.close().expect("close");
 }

@@ -18,7 +18,7 @@ use crate::index::open_slots::OpenSlot;
 use crate::index::seal_walk::SealWalk;
 use crate::index::spot_index::SpotLocation;
 use crate::io::job::{Job, JobStep};
-use crate::io::Io;
+use crate::io::{Io, IoTask};
 use crate::io::device_error::is_device_error;
 use crate::record::codec::Codec;
 use crate::record::record_check::RecordIdentity;
@@ -442,6 +442,10 @@ impl<Backend: Io> SealJob<Backend> {
             self.state.io.close_file(rows);
         }
         self.state.free_slot(target.slot);
+        // a spare the job could not make for want of a slot goes ahead now, before the job's period
+        if let Some(task) = self.state.reserve_task.get() {
+            task.wake();
+        }
         true
     }
 

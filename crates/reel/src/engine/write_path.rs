@@ -33,6 +33,14 @@ use crate::segment::range_covers::{Cover, MOST_RANGE_COVERS};
 
 /// In-flight writes an open segment takes before the volume opens another
 pub const WRITES_PER_OPEN: u32 = 2;
+/// The job asks for a segment that takes writes as they come, with nothing claimed yet
+pub const SPARE_REQUEST: ClaimRequest = ClaimRequest {
+    bytes: ByteCount(0),
+    rows: RowCount(0),
+    is_alone: false,
+    has_records: true,
+    covers: 0,
+};
 /// How many times a writer waits on the spot for a window to go out before it tries again
 pub const WINDOW_SPINS: u32 = 2_000;
 /// A writer waiting on a window spins this many rounds of spins, then pauses, since a sync holds the turn for milliseconds
@@ -846,21 +854,22 @@ impl<Backend: Io> EngineState<Backend> {
                 root
             };
 
-            let request = ClaimRequest {
-                bytes: ByteCount(0),
-                rows: RowCount(0),
-                is_alone: false,
-                has_records: true,
-                covers: 0,
-            };
-            let created = self.create_segment(volume, RootId(root as u8), &request);
-            let mut claims = hold(&volume.claims);
-            claims.is_creating = false;
-            match created {
-                Ok(Some(segment)) => claims.prepared = Some(segment),
-                // left asked for, so the job tries at its next period and no claim wakes it
-                Ok(None) | Err(_) => claims.wants_prepared = true,
-            }
+            let created = self.create_segment(volume, RootId(root as u8), &SPARE_REQUEST);
+            self.finish_create(volume, created);
+        }
+    }
+
+    /// Take a made segment in as the spare. It answers every ask so far, and the claim that takes it asks again
+    pub fn finish_create(&self, volume: &Volume<Backend>, created: Result<Option<OpenSegment<Backend::File>>, StoreError>) {
+        let mut claims = hold(&volume.claims);
+        claims.is_creating = false;
+        match created {
+            Ok(Some(segment)) => {
+                claims.prepared = Some(segment);
+                claims.wants_prepared = false;
+            },
+            // left asked for, so the job tries at its next period or when a seal frees a slot, and no claim wakes it
+            Ok(None) | Err(_) => claims.wants_prepared = true,
         }
     }
 

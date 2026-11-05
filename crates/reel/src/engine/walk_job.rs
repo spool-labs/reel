@@ -78,6 +78,7 @@ pub struct FreeRecord {
 pub struct BlockCounts {
     pub counts: Vec<DeadCount>,
     pub frees: Vec<FreeRecord>,
+    pub overflowed: Vec<SegmentNumber>,
 }
 
 impl BlockCounts {
@@ -86,6 +87,7 @@ impl BlockCounts {
         Self {
             counts: touched_capacity(MOST_BLOCK_ROWS, DeadCount::default()),
             frees: touched_capacity(MOST_BLOCK_FREES, FreeRecord::default()),
+            overflowed: touched_capacity(MOST_BLOCK_FREES, SegmentNumber(0)),
         }
     }
 
@@ -99,20 +101,28 @@ impl BlockCounts {
     pub fn clear(&mut self) {
         self.counts.clear();
         self.frees.clear();
+        self.overflowed.clear();
     }
 
     /// Count a row dead, and note a large record so its blocks can go
     pub fn count_dead(&mut self, segment: SegmentNumber, column: ColumnId, block: u32, row: &FooterRow, replacement: WritePlace) {
         add_count(&mut self.counts, segment, column, block, row, Some(replacement));
-        if row.kind == RowKind::Value && row.length >= FREE_IN_PLACE_BYTES && self.frees.len() < self.frees.capacity() {
-            self.frees.push(FreeRecord {
-                segment,
-                offset: row.offset,
-                length: row.length,
-                place: row.place,
-                replacement,
-            });
+        if row.kind != RowKind::Value || row.length < FREE_IN_PLACE_BYTES {
+            return;
         }
+        if self.frees.len() == self.frees.capacity() {
+            if !self.overflowed.contains(&segment) && self.overflowed.len() < self.overflowed.capacity() {
+                self.overflowed.push(segment);
+            }
+            return;
+        }
+        self.frees.push(FreeRecord {
+            segment,
+            offset: row.offset,
+            length: row.length,
+            place: row.place,
+            replacement,
+        });
     }
 }
 
@@ -439,10 +449,18 @@ impl<Backend: Io> WalkJob<Backend> {
         for count in counts.counts.iter().filter(|count| count.rows > 0) {
             volume.table.drop_live(count.segment, count.block, count.rows, count.replacement);
         }
+        for segment in counts.overflowed.iter().filter(|_segment| volume.can_free_blocks) {
+            volume.note_held_frees(*segment);
+        }
         for free in &counts.frees {
-            if !self.free_record(volume, free) && self.waiting_frees.len() < self.waiting_frees.capacity() {
-                self.waiting_frees.push(*free);
+            if self.state.free_record(volume, free) {
+                continue;
             }
+            if self.waiting_frees.len() == self.waiting_frees.capacity() {
+                volume.note_held_frees(free.segment);
+                continue;
+            }
+            self.waiting_frees.push(*free);
         }
         if next_block < target.block_count {
             self.target = Some(WalkTarget { next_block, ..target });
@@ -458,39 +476,13 @@ impl<Backend: Io> WalkJob<Backend> {
         self.state.save_summary(volume)
     }
 
-    /// Give a dead record's whole blocks back, or say it has to wait for a live cue or an unpublished replacement. The count
-    /// moves first, so a read that took its point before this starts over, and one that takes it after has the replacement
-    /// under it. A filesystem that refuses leaves the record to a rewrite
-    pub fn free_record(&self, volume: &Volume<Backend>, free: &FreeRecord) -> bool {
-        if !volume.can_free_blocks {
-            return true;
-        }
-        if self.state.read_point() < free.replacement {
-            return false;
-        }
-        self.state.cues.note_reclaim();
-        if self.state.cues.has_cue_between(free.place, free.replacement) {
-            return false;
-        }
-        let start = free.offset.0.next_multiple_of(FREE_BLOCK_BYTES);
-        let end = (free.offset.0 + free.length.0) / FREE_BLOCK_BYTES * FREE_BLOCK_BYTES;
-        if let (Some(pin), true) = (volume.table.pin(free.segment), start < end) {
-            let length = ByteCount(end - start);
-            if pin.file.free_range(FileOffset(start), length).is_ok() {
-                volume.bytes_freed.fetch_add(length.0, Ordering::AcqRel);
-                volume.table.note_freed(free.segment, length.0);
-            }
-        }
-        true
-    }
-
     /// Try the records a cue held back, once no cue is left to hold them
     pub fn free_waiting(&mut self, volume: &Volume<Backend>) {
         if self.waiting_frees.is_empty() || !self.state.cues.is_empty() {
             return;
         }
         let mut waiting = mem::take(&mut self.waiting_frees);
-        waiting.retain(|free| !self.free_record(volume, free));
+        waiting.retain(|free| !self.state.free_record(volume, free));
         self.waiting_frees = waiting;
     }
 

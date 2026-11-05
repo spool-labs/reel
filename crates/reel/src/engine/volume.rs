@@ -95,6 +95,8 @@ pub struct Volume<Backend: Io> {
     /// Every root's filesystem can give a file's blocks back in place
     pub can_free_blocks: bool,
     pub bytes_freed: AtomicU64,
+    /// A segment has large dead records no list could hold, for one pass to free once no cue is live
+    pub has_held_frees: AtomicBool,
     pub segments_unlinked: AtomicU64,
     pub segments_parked: AtomicU64,
     pub parked: Mutex<[Option<ParkedSegment<Backend::File>>; MOST_PARKED]>,
@@ -157,6 +159,12 @@ impl<Backend: Io> Volume<Backend> {
     /// Check a replayed row could sit under a newer row in a sealed segment
     pub fn may_hide_under_sealed(&self, place: WritePlace) -> bool {
         place.0 < self.highest_sealed.load(Ordering::Acquire)
+    }
+
+    /// Flag a segment for the pass that frees what no list could hold
+    pub fn note_held_frees(&self, segment: SegmentNumber) {
+        self.table.flag_held_frees(segment, true);
+        self.has_held_frees.store(true, Ordering::Release);
     }
 
     /// Check the park has room for another segment

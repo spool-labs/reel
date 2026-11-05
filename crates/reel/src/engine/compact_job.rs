@@ -18,7 +18,7 @@ use crate::engine::engine_state::EngineState;
 use crate::engine::planner::UnitStep;
 use crate::engine::rewrite_job::RewriteJob;
 use crate::engine::volume::{ParkedSegment, Volume};
-use crate::engine::walk_job::WALK_RETRY;
+use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, FreeRecord, WALK_RETRY};
 use crate::guard::hold;
 use crate::io::device_error::is_device_error;
 use crate::io::{Io, IoFile};
@@ -33,12 +33,21 @@ use crate::segment::summary::SummaryRow;
 /// How long compaction waits before it looks at a parked segment's pins again
 pub const PARKED_RETRY: Nanoseconds = Nanoseconds(1_000_000);
 
+/// A pass over a segment's large rows, for dead records no list could hold
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeldPass {
+    pub segment: SegmentNumber,
+    pub next_block: u32,
+    pub is_whole: bool,
+}
+
 /// The compaction of one volume
 pub struct CompactJob<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
     pub volume: usize,
     pub retry_at: Option<Nanoseconds>,
     pub rewrite: RewriteJob<Backend>,
+    held_pass: Option<HeldPass>,
     should_rewrite: bool,
     last_tried: SegmentNumber,
     block: Vec<u8>,
@@ -54,6 +63,7 @@ impl<Backend: Io> CompactJob<Backend> {
         Self {
             rewrite: RewriteJob::new(Arc::clone(&state), volume),
             should_rewrite: false,
+            held_pass: None,
             state,
             volume,
             retry_at: None,
@@ -111,6 +121,12 @@ impl<Backend: Io> CompactJob<Backend> {
             self.sweep_covers(volume);
             return UnitStep::Worked;
         }
+        if state.cues.is_empty() && volume.has_held_frees.load(Ordering::Acquire) {
+            return match self.step_held_pass(volume) {
+                Ok(()) => UnitStep::Worked,
+                Err(_) => UnitStep::RetryAt(Nanoseconds(now.0 + WALK_RETRY.0)),
+            };
+        }
         if self.rewrite.is_running() {
             self.rewrite.step();
             return UnitStep::Worked;
@@ -140,6 +156,62 @@ impl<Backend: Io> CompactJob<Backend> {
             slot.as_ref().is_some_and(|parked| volume.table.retired_pins(&parked.retired) == 0)
         })?;
         slot.take()
+    }
+
+    /// Free one block's large dead records for the pass over a flagged segment, or end the pass with no block left. A row
+    /// goes by its key's newest row, and a cue that came back keeps the flag for its going
+    pub fn step_held_pass(&mut self, volume: &Volume<Backend>) -> Result<()> {
+        let pass = match self.held_pass {
+            Some(pass) => pass,
+            None => {
+                let Some(segment) = volume.table.next_held_frees() else {
+                    volume.has_held_frees.store(false, Ordering::Release);
+                    return Ok(());
+                };
+                HeldPass { segment, next_block: 0, is_whole: true }
+            },
+        };
+        let (pin, block) = (volume.table.pin(pass.segment), volume.table.walk_block(pass.segment, pass.next_block));
+        let (Some(pin), Some(block)) = (pin, block) else {
+            volume.table.flag_held_frees(pass.segment, !pass.is_whole);
+            self.held_pass = None;
+            return Ok(());
+        };
+        let length = block.entry.block_length().0 as usize;
+        if length > self.block.len() {
+            return Err(Error::from(ErrorKind::InvalidData));
+        }
+        pin.file.read_exact_at(block.entry.block_at(), &mut self.block[..length])?;
+        let Some(mut walk) = RowBlockWalk::open(&self.block[..length], pin.head.place_base) else {
+            return Err(Error::from(ErrorKind::InvalidData));
+        };
+        let mut is_whole = pass.is_whole;
+        while let Some(row) = walk.next_row(&mut self.key) {
+            if row.kind != RowKind::Value || row.length < FREE_IN_PLACE_BYTES {
+                continue;
+            }
+            let newest = match self.state.newest_walked(volume, block.column, &self.key, pass.segment) {
+                Ok(newest) => newest,
+                Err(StoreError::Corruption { .. }) => None,
+                Err(_error) => return Err(Error::from(ErrorKind::Interrupted)),
+            };
+            if let Some(found) = newest.filter(|found| found.row.place > row.place) {
+                let free = FreeRecord {
+                    segment: pass.segment,
+                    offset: row.offset,
+                    length: row.length,
+                    place: row.place,
+                    replacement: found.row.place,
+                };
+                is_whole &= self.state.free_record(volume, &free);
+            }
+        }
+        self.held_pass = Some(HeldPass {
+            next_block: pass.next_block + 1,
+            is_whole,
+            ..pass
+        });
+        Ok(())
     }
 
     /// Drop covers a cue kept inside newer ones, once no cue reads below those. Each cover takes its own hold of the pool,

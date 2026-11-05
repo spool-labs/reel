@@ -821,6 +821,7 @@ pub fn build_state<Backend: Io>(
             walk_slots: (0..sizing.walk_workers).map(|_slot| WalkSlot::new()).collect(),
             can_free_blocks: volume.roots.iter().all(|root| io.can_free_blocks(root)),
             bytes_freed: AtomicU64::new(0),
+            has_held_frees: AtomicBool::new(false),
             segments_unlinked: AtomicU64::new(0),
             segments_parked: AtomicU64::new(0),
             parked: Mutex::new([const { None }; MOST_PARKED]),

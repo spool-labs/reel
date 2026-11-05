@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::engine::compact_job::CompactJob;
 use reel::engine::reel_store::ReelStore;
-use reel::engine::walk_job::{FREE_BLOCK_BYTES, FREE_IN_PLACE_BYTES, FreeRecord, WalkJob};
+use reel::engine::walk_job::{FREE_BLOCK_BYTES, FREE_IN_PLACE_BYTES, FreeRecord, MOST_BLOCK_FREES};
 use reel::guard::hold;
 use reel::record::codec::Codec;
 use reel::segment::segment_tail::SegmentNumber;
@@ -21,6 +22,8 @@ const BUDGET: ByteCount = ByteCount(64 * 1024 * 1024);
 const TICK: Nanoseconds = Nanoseconds(1_000_000);
 const STEPS: u64 = 20_000;
 const CRASH_POINTS: u64 = 60;
+const HELD_RECORDS: u64 = 2 * MOST_BLOCK_FREES as u64;
+const PASS_STEPS: u32 = 4;
 
 type Store = ReelStore<SimulatedIo>;
 
@@ -273,7 +276,7 @@ fn unpublished_replacement() {
     keep_live(&store);
     let older = seal(&store, &io);
 
-    let job = WalkJob::new(store.state.clone(), 0);
+    let state = store.state.clone();
     let free = FreeRecord {
         segment: older,
         offset: FileOffset(0),
@@ -281,7 +284,67 @@ fn unpublished_replacement() {
         place: WritePlace(1),
         replacement: WritePlace(store.state.read_point().0 + 1),
     };
-    assert!(!job.free_record(&store.state.volumes[0], &free));
+    assert!(!state.free_record(&store.state.volumes[0], &free));
     assert_eq!(io.freed_bytes().0, 0);
+    store.close().expect("close");
+}
+
+// a cue over more large dead records than any list holds flags their segment, nothing goes while it lives, and one pass frees
+// every one of them after it
+#[test]
+fn held_past_the_list() {
+    let io = SimulatedIo::new(Seed(10));
+    let store = open(&io);
+    for number in 0..HELD_RECORDS {
+        store.put(COLUMN, format!("key-{number}").as_bytes(), &large(1)).expect("put");
+    }
+    for number in 0..=HELD_RECORDS {
+        store.put(COLUMN, format!("live-{number}").as_bytes(), &large(3)).expect("put");
+    }
+    let older = seal(&store, &io);
+    let cue = store.cue().expect("cue");
+    for number in 0..HELD_RECORDS {
+        store.put(COLUMN, format!("key-{number}").as_bytes(), &large(2)).expect("put");
+    }
+    seal(&store, &io);
+
+    let volume = &store.state.volumes[0];
+    assert_eq!(volume.bytes_freed.load(Ordering::Acquire), 0);
+    assert_eq!(volume.table.next_held_frees(), Some(older));
+
+    drop(cue);
+    settle(&io);
+    let whole_blocks = HELD_RECORDS * (FREE_IN_PLACE_BYTES.0 - FREE_BLOCK_BYTES);
+    assert!(volume.bytes_freed.load(Ordering::Acquire) >= whole_blocks);
+    assert_eq!(volume.table.next_held_frees(), None);
+    assert!(!volume.has_held_frees.load(Ordering::Acquire));
+    assert_eq!(read(&store, b"key-0"), Some(large(2)));
+    assert_eq!(read(&store, b"live-0"), Some(large(3)));
+    store.close().expect("close");
+}
+
+// a cue that comes back mid-pass keeps the flag, and its going finishes the job
+#[test]
+fn pass_waits_for_a_new_cue() {
+    let io = SimulatedIo::new(Seed(11));
+    let store = open(&io);
+    keep_live(&store);
+    store.put(COLUMN, b"key", &large(1)).expect("put");
+    let older = seal(&store, &io);
+    let cue = store.cue().expect("cue");
+    store.put(COLUMN, b"key", &large(2)).expect("put");
+    seal(&store, &io);
+
+    let volume = &store.state.volumes[0];
+    volume.note_held_frees(older);
+    let mut job = CompactJob::new(store.state.clone(), 0);
+    for _block in 0..=PASS_STEPS {
+        job.step_held_pass(volume).expect("a block");
+    }
+    assert_eq!(volume.table.next_held_frees(), Some(older));
+    drop(cue);
+    settle(&io);
+    assert_eq!(volume.table.next_held_frees(), None);
+    assert!(volume.bytes_freed.load(Ordering::Acquire) > 0);
     store.close().expect("close");
 }

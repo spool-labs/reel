@@ -40,6 +40,7 @@ pub struct TableEntry<File> {
     pub is_walked: bool,
     pub highest_replacement: WritePlace,
     pub freed_bytes: u64,
+    pub has_held_frees: bool,
 }
 
 /// A segment held open for a read, let go when dropped
@@ -274,6 +275,7 @@ impl<File: Clone> SegmentTable<File> {
             is_walked: false,
             highest_replacement: WritePlace(0),
             freed_bytes: 0,
+            has_held_frees: false,
         });
         guard.map.insert(head.segment, slot);
         true
@@ -323,6 +325,25 @@ impl<File: Clone> SegmentTable<File> {
         if let Some(line) = guard.blocks.get_mut(start as usize + block as usize) {
             line.live_rows = line.live_rows.saturating_sub(rows);
         }
+    }
+
+    /// Set or clear a segment's flag for large dead records no list could hold
+    pub fn flag_held_frees(&self, number: SegmentNumber, is_held: bool) {
+        let mut guard = self.write_shard(shard_of(number));
+        let Some(slot) = guard.map.get(number) else {
+            return;
+        };
+        if let Some(entry) = guard.segments[slot as usize].as_mut() {
+            entry.has_held_frees = is_held;
+        }
+    }
+
+    /// Find a segment with large dead records no list could hold
+    pub fn next_held_frees(&self) -> Option<SegmentNumber> {
+        (0..TABLE_SHARDS).find_map(|shard| {
+            let guard = self.read_shard(shard);
+            guard.segments.iter().flatten().find(|entry| entry.has_held_frees).map(|entry| entry.number)
+        })
     }
 
     /// Note bytes a segment gave back in place

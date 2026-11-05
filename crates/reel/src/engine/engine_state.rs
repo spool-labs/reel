@@ -8,20 +8,21 @@ use std::sync::{Mutex, OnceLock, RwLock};
 use reel_api::column_id::ColumnId;
 use reel_api::memory_report::MemoryReport;
 use reel_api::store_error::StoreError;
-use reel_api::units::{ByteCount, WritePlace};
+use reel_api::units::{ByteCount, FileOffset, WritePlace};
 
 use crate::engine::column_info::ColumnInfo;
 use crate::engine::cue::CueTable;
 use crate::engine::engine_sizing::EngineSizing;
 use crate::engine::open_segment::{RecordWindow, RowQueue};
 use crate::engine::open_segment::{data_path, output_path};
+use crate::engine::walk_job::{FREE_BLOCK_BYTES, FreeRecord};
 use crate::engine::volume::{ParkedSegment, RewriteOutput, Volume};
 use crate::segment::range_covers::Cover;
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
-use crate::io::{Io, IoTask};
+use crate::io::{Io, IoFile, IoTask};
 use crate::pool::Pool;
 use crate::record::record_check::RecordKey;
 use crate::record::record_encoder::RecordEncoder;
@@ -341,6 +342,32 @@ impl<Backend: Io> EngineState<Backend> {
         let _synced = self.io.sync_directory(root);
     }
 
+
+    /// Give a dead record's whole blocks back, or say it has to wait for a live cue or an unpublished replacement. The count
+    /// moves first, so a read that took its point before this starts over, and one that takes it after has the replacement
+    /// under it. A filesystem that refuses leaves the record to a rewrite
+    pub fn free_record(&self, volume: &Volume<Backend>, free: &FreeRecord) -> bool {
+        if !volume.can_free_blocks {
+            return true;
+        }
+        if self.read_point() < free.replacement {
+            return false;
+        }
+        self.cues.note_reclaim();
+        if self.cues.has_cue_between(free.place, free.replacement) {
+            return false;
+        }
+        let start = free.offset.0.next_multiple_of(FREE_BLOCK_BYTES);
+        let end = (free.offset.0 + free.length.0) / FREE_BLOCK_BYTES * FREE_BLOCK_BYTES;
+        if let (Some(pin), true) = (volume.table.pin(free.segment), start < end) {
+            let length = ByteCount(end - start);
+            if pin.file.free_range(FileOffset(start), length).is_ok() {
+                volume.bytes_freed.fetch_add(length.0, Ordering::AcqRel);
+                volume.table.note_freed(free.segment, length.0);
+            }
+        }
+        true
+    }
     /// Bring the planner back to every volume's compaction
     pub fn ask_compaction(&self) {
         for volume in &self.volumes {

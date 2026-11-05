@@ -66,6 +66,9 @@ pub const PLANNED_ROW_BYTES: u64 = 227;
 /// lz4 column and 64 B keys that gives these rows a segment: 38,906 at 128 MiB, 131,292 at 192 MiB, 593,220 at 512 MiB and
 /// 5,766,811 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
 /// records seal smaller and reach their size through merges, whose outputs the write index doesn't bound
+/// A volume holds its open segment and one spare at full size even when its sealed data is small: the reserve is twice the
+/// segment size, 128 MiB at a 128 MiB budget, 192 MiB at 192 MiB, and 2 GiB from the default 512 MiB up. The space gate adds
+/// this to the live bytes
 pub const SEAL_ROWS_EIGHTHS: u64 = 5;
 /// The most stored bytes of a value on an lz4 column, which is also the compress pool, cut into shares
 pub const LZ4_STORED_LIMIT: ByteCount = ByteCount(64 * 1024 * 1024);

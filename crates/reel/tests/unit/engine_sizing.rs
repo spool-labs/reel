@@ -70,3 +70,20 @@ fn summary_holds_blocks() {
 
     assert!(rows_room > blocks * size_of::<u32>() as u64 + segments * MOST_ROW_BYTES);
 }
+
+// the reserve an idle volume holds at each budget, as `SEAL_ROWS_EIGHTHS` documents it
+#[test]
+fn documented_reserve() {
+    for (mib, reserve) in [(128, 128), (192, 192), (512, 2_048), (4_096, 2_048)] {
+        let store = StoreShape {
+            budget: ByteCount(mib * 1024 * 1024),
+            roots: 1,
+            volumes: 1,
+            has_lz4: true,
+            widest_keys: 64,
+        };
+
+        let segment = EngineSizing::for_store(&store).segment_bytes;
+        assert_eq!(2 * segment.0, reserve * 1024 * 1024, "{mib} MiB");
+    }
+}

@@ -164,6 +164,11 @@ impl<Backend: Io> ReelStore<Backend> {
         self.state.write_batch(batch)
     }
 
+    /// Write a value and take its buffer, which a none column sends to the file as it stands
+    pub fn put_owned(&self, column: ColumnId, key: &[u8], value: Vec<u8>) -> Result<(), StoreError> {
+        self.put(column, key, &value)
+    }
+
     /// Write a grave
     pub fn delete(&self, column: ColumnId, key: &[u8]) -> Result<(), StoreError> {
         self.check_open()?;

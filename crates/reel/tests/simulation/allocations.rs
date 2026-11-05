@@ -102,6 +102,10 @@ fn round(store: &Store, io: &SimulatedIo, inputs: &mut Inputs, number: usize) ->
     total += both(counted(|| store.get(META, b"missing", buf).expect("miss")));
     total += both(counted(|| store.contains(META, key).expect("contains")));
     total += both(counted(|| store.delete(BULK, other).expect("delete")));
+    // the one free here is the caller's own buffer, which the call takes
+    let owned = inputs.small.clone();
+    let (_put, allocations, frees) = counted(|| store.put_owned(META, key, owned).expect("put owned"));
+    assert_eq!((allocations, frees), (0, 1));
     total += both(counted(|| store.write_batch(&inputs.batch).expect("batch")));
     total += both(counted(|| store.write_batch(&inputs.large_batch).expect("large batch")));
     let refused = counted(|| store.get(META, DAMAGED_KEY, buf).is_err());

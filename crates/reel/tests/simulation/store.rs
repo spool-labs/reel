@@ -566,3 +566,18 @@ fn quiet_put() {
     assert_eq!(state.encoders.wakes() + state.stored_shares.wakes() + state.record_readers.wakes(), 0);
     store.close().expect("close");
 }
+
+// an owned value lands like any other, and the store keeps nothing of the buffer
+#[test]
+fn owned_value() {
+    let io = SimulatedIo::new(Seed(91));
+    let store = open(&io);
+    let value = vec![7; LARGE_ENOUGH];
+
+    store.put_owned(COLUMN, b"key", value.clone()).expect("put");
+
+    let mut buf = Vec::new();
+    assert!(store.get(COLUMN, b"key", &mut buf).expect("get"));
+    assert!(buf == value);
+    store.close().expect("close");
+}

@@ -307,7 +307,7 @@ impl<File: Clone> SegmentTable<File> {
         let entry = guard.segments[slot as usize].as_ref()?;
         let column_tail = guard.column_of(entry, column)?;
         let first = entry.blocks.start as usize + column_tail.first_block as usize;
-        let lines = &guard.blocks[first..first + column_tail.block_count.0 as usize];
+        let lines = guard.blocks.get(first..first + column_tail.block_count.0 as usize)?;
 
         let prefix = KeyPrefix::of_key(key, column_tail.shared_length as usize);
         let start = first_candidate(lines, prefix) + skip;

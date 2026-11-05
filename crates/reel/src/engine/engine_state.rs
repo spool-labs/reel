@@ -165,6 +165,11 @@ impl<Backend: Io> EngineState<Backend> {
         self.dropped_summary_rows.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Count summary rows given up for rows that must stay
+    pub fn note_dropped_rows(&self, rows: u64) {
+        self.dropped_summary_rows.fetch_add(rows, Ordering::AcqRel);
+    }
+
     /// Write a volume's summary whole, and only its own seal, a clear and close wait on the lock
     pub fn save_summary(&self, volume: &Volume<Backend>) -> Result<(), Error> {
         let rows = hold(&volume.summary);

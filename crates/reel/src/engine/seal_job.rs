@@ -240,9 +240,13 @@ impl<Backend: Io> SealJob<Backend> {
                 facts.is_damaged = true;
                 facts.damage_place = span.highest_place;
             }
-            // a row that won't fit costs nothing until the segment is damaged, and then its columns count whole
-            if !rows.push(&facts, columns, spans.iter().map(span_of)) {
-                state.note_dropped_row();
+            if spans.is_empty() {
+                // a clean row that won't fit costs nothing until the segment is damaged, and then its columns count whole
+                if !rows.push(&facts, columns, [].into_iter()) {
+                    state.note_dropped_row();
+                }
+            } else {
+                state.note_dropped_rows(rows.push_kept(&facts, columns, spans.iter().map(span_of)));
             }
             drop(rows);
             self.is_summarized = true;

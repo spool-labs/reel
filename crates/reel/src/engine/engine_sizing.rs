@@ -23,6 +23,8 @@ pub const WRITE_INDEX_DIVISOR: u64 = 4;
 pub const SPOT_DIVISOR: u64 = 4;
 /// The share of the budget the block cache gets, as a divisor
 pub const BLOCK_CACHE_DIVISOR: u64 = 8;
+/// The share of the budget the summaries get, as a divisor
+pub const SUMMARY_DIVISOR: u64 = 16;
 /// Bytes a row of the write index is planned at, node and table share included
 pub const PLANNED_ROW_BYTES: u64 = 112;
 /// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight
@@ -50,6 +52,7 @@ pub struct EngineSizing {
     pub shard: ShardSizing,
     pub spot_share: ByteCount,
     pub cache_share: ByteCount,
+    pub summary_share: ByteCount,
     pub lz4_stored_limit: ByteCount,
 }
 
@@ -82,6 +85,7 @@ impl EngineSizing {
             },
             spot_share: ByteCount(budget.0 / SPOT_DIVISOR),
             cache_share: ByteCount(budget.0 / BLOCK_CACHE_DIVISOR),
+            summary_share: ByteCount(budget.0 / SUMMARY_DIVISOR),
             lz4_stored_limit: LZ4_STORED_LIMIT,
         }
     }

@@ -22,7 +22,7 @@ use crate::index::write_row::WriteRow;
 use crate::io::job::{Job, JobStep};
 use crate::io::device_error::{is_device_error, read_or_damaged};
 use crate::io::{Io, IoFile};
-use crate::record::record_check::{RecordIdentity, RecordKey};
+use crate::record::record_check::{Checksum, RecordIdentity, RecordKey};
 use crate::record::record_head::SMALL_HEAD_BYTES;
 use crate::record::record_reader::{RecordLocation, RecordRead, RecordReader};
 use crate::row_kind::RowKind;
@@ -32,8 +32,9 @@ use crate::segment::block_entry::BlockEntry;
 use crate::segment::column_directory::DirectoryEntry;
 use crate::segment::damage_list::DamagedRange;
 use crate::segment::footer_reader::FooterReader;
+use crate::segment::footer_writer::fold_sum;
 use crate::segment::segment_table::{TABLE_SHARDS, TableSizing, shard_of};
-use crate::segment::segment_tail::{ColumnTail, SegmentNumber, TailHead};
+use crate::segment::segment_tail::{ColumnTail, SegmentNumber, TailHead, columns_fit};
 use crate::segment::summary::{
     ColumnFacts, MOST_ROW_COLUMN_BYTES, MOST_ROW_FIXED_BYTES, SUMMARY_KEY_BYTES, SegmentFacts, SpanFacts, SummaryPaths,
     SummaryRow, SummaryRows, put_bound, put_lowest,
@@ -159,6 +160,7 @@ pub struct RowsScan {
     pub synced_through: FileOffset,
     pub row_count: RowCount,
     pub has_rot: bool,
+    pub rot_sum: Checksum,
 }
 
 /// The rows of a recovered segment so far
@@ -342,7 +344,7 @@ pub fn read_segment<File: IoFile>(
     let mut columns = Vec::new();
     if let Some(head) = reader.read_tail(file, record_key, &mut columns)? {
         let mut entries = Vec::new();
-        if reader.read_index(file, &head, &mut entries)? {
+        if reader.read_index(file, &head, &mut entries)? && columns_fit(&columns, entries.len()) {
             return Ok(SegmentRead::Sealed { head, columns, entries });
         }
         // open decides what its ranges are once it has read the summary
@@ -513,7 +515,10 @@ impl<Backend: Io> EngineState<Backend> {
             let Some(group) = parse_group(&bytes[..group_length], self.record_key) else {
                 break;
             };
-            scan.has_rot |= at != scan.valid_end;
+            if at != scan.valid_end {
+                scan.has_rot = true;
+                scan.rot_sum = fold_sum(scan.rot_sum, Checksum(scan.valid_end.0));
+            }
             scan.synced_through = scan.synced_through.max(group.synced_through);
             scan.row_count = RowCount(scan.row_count.0 + group.row_count.0);
             scan.valid_end = FileOffset(at.0 + group_length as u64);
@@ -689,7 +694,7 @@ pub fn recover_all<Backend: Io>(
             },
         };
         if scan.has_rot
-            && let Err(error) = damage_open(state, open)
+            && let Err(error) = damage_open(state, open, scan.rot_sum)
         {
             state.io.close_file(rows);
             return Err(error);
@@ -826,7 +831,7 @@ pub fn copy_segment<Backend: Io>(
             }
         }
         for row in group.walk() {
-            copy_row(state, volume, &segment.found.data, &row, &mut record)?;
+            copy_row(state, volume, segment.found.number, &segment.found.data, &row, &mut record)?;
         }
         at = FileOffset(at.0 + length as u64);
     }
@@ -835,19 +840,46 @@ pub fn copy_segment<Backend: Io>(
     state.sync_volume(target).map_err(open_failure)
 }
 
+/// Keep a row whose record the device lost out of the copy, and damage its key from here on, ranked at the
+/// row, so nothing older answers for it
+pub fn damage_key<Backend: Io>(
+    state: &EngineState<Backend>,
+    volume: &Volume<Backend>,
+    segment: SegmentNumber,
+    row: &RowEntry,
+) -> Result<()> {
+    let mut end = row.key.to_vec();
+    end.push(0);
+    volume.damage.add(DamagedRange {
+        column: row.column,
+        segment,
+        highest_place: row.place,
+        start: row.key.to_vec(),
+        end: Some(end),
+    });
+    let mut damaged = hold(&volume.damaged);
+    if !damaged.contains(&segment) {
+        damaged.push(segment);
+    }
+    drop(damaged);
+    save_cleared_spans(state, volume);
+    state.save_summary(volume)
+}
+
 /// Copy one row and its record as stored, sealing when the limits say a running store would
 pub fn copy_row<Backend: Io>(
     state: &Arc<EngineState<Backend>>,
     volume: usize,
+    segment: SegmentNumber,
     data: &Backend::File,
     row: &RowEntry,
     record: &mut Vec<u8>,
 ) -> Result<()> {
     let target = &state.volumes[volume];
     record.resize(row.length.0 as usize, 0);
-    if !record.is_empty() {
-        data.read_exact_at(row.offset, record)?;
-    }
+    if !record.is_empty() && !read_or_damaged(data, row.offset, record)? {
+            return damage_key(state, target, segment, row);
+        }
 
     let request = ClaimRequest {
         bytes: row.length,
@@ -967,16 +999,23 @@ pub fn covering_group<File: IoFile>(
 }
 
 /// Mark an open segment's columns damaged whole when rot took a group a sync had covered, ranked at the
-/// counter at open: the group's keys can't be known, and the mark stays through opens in the summary
-pub fn damage_open<Backend: Io>(state: &EngineState<Backend>, found: &FoundOpen<Backend::File>) -> Result<()> {
+/// counter at open: the group's keys can't be known. The row keeps where the rot was, in its seal mark, so
+/// the rot an earlier open ranked keeps its rank and clears, and new rot takes this open's counter
+pub fn damage_open<Backend: Io>(
+    state: &EngineState<Backend>,
+    found: &FoundOpen<Backend::File>,
+    rot_sum: Checksum,
+) -> Result<()> {
     let volume = &state.volumes[found.volume];
-    if hold(&volume.summary).get(found.number).is_some() {
+    let is_known = hold(&volume.summary).get(found.number).is_some_and(|row| row.facts.seal_mark == rot_sum);
+    if is_known {
         return Ok(());
     }
 
     let counter = state.order.mark();
     let facts = SegmentFacts {
         segment: found.number,
+        seal_mark: rot_sum,
         is_damaged: true,
         damage_place: counter,
         ..SegmentFacts::default()
@@ -994,13 +1033,20 @@ pub fn damage_open<Backend: Io>(state: &EngineState<Backend>, found: &FoundOpen<
         }
     }
 
+    volume.damage.drop_segment(found.number);
     for range in &ranges {
         volume.damage.add(range.clone());
     }
-    hold(&volume.damaged).push(found.number);
-    if !push_row(&mut hold(&volume.summary), &facts, &[], &ranges) {
-        state.note_dropped_row();
+    let mut damaged = hold(&volume.damaged);
+    if !damaged.contains(&found.number) {
+        damaged.push(found.number);
     }
+    drop(damaged);
+    let mut rows = hold(&volume.summary);
+    rows.remove(found.number);
+    let dropped = rows.push_kept(&facts, [].into_iter(), ranges.iter().map(span_of));
+    drop(rows);
+    state.note_dropped_rows(dropped);
     state.save_summary(volume)
 }
 
@@ -1193,8 +1239,12 @@ pub fn settle_sealed<Backend: Io>(
         }
         hold(&volume.damaged).push(facts.segment);
     }
-    if !settled.push(&facts, columns, ranges.iter().map(span_of)) {
-        state.note_dropped_row();
+    if ranges.is_empty() {
+        if !settled.push(&facts, columns, [].into_iter()) {
+            state.note_dropped_row();
+        }
+    } else {
+        state.note_dropped_rows(settled.push_kept(&facts, columns, ranges.iter().map(span_of)));
     }
     Ok(())
 }
@@ -1232,9 +1282,8 @@ pub fn settle_damaged<Backend: Io>(
         volume.damage.add(range.clone());
     }
     hold(&volume.damaged).push(found.number);
-    if !push_row(settled, &facts, &columns, &ranges) {
-        state.note_dropped_row();
-    }
+    let column_facts = columns.iter().map(column_of);
+    state.note_dropped_rows(settled.push_kept(&facts, column_facts, ranges.iter().map(span_of)));
 }
 
 /// Check a row can speak for a damaged segment: its length always, and the tail's facts when one reads
@@ -1369,21 +1418,20 @@ pub fn span_of(range: &DamagedRange) -> SpanFacts<'_> {
     }
 }
 
-/// Add a row that keeps these spans, or return false when it doesn't fit
-pub fn push_row(rows: &mut SummaryRows, facts: &SegmentFacts, columns: &[OwnedColumn], ranges: &[DamagedRange]) -> bool {
-    let column_facts = columns.iter().map(|column| ColumnFacts {
+/// Read an owned column as the facts a row keeps
+pub fn column_of(column: &OwnedColumn) -> ColumnFacts<'_> {
+    ColumnFacts {
         column: column.column,
         lowest: &column.lowest,
         bound: &column.bound,
         row_count: column.row_count,
         grave_count: column.grave_count,
-    });
-    rows.push(facts, column_facts, ranges.iter().map(span_of))
+    }
 }
 
-/// Write what's left of every damaged segment's spans into its row, or return false when a row is
-/// missing or no longer fits, which leaves the rows as they were
-pub fn save_cleared_spans<Backend: Io>(volume: &Volume<Backend>) -> bool {
+/// Write what's left of every damaged segment's spans into its row, which never fails: a row with
+/// spans stays, and a segment with no row gets one that speaks for its spans alone
+pub fn save_cleared_spans<Backend: Io>(state: &EngineState<Backend>, volume: &Volume<Backend>) {
     let numbers = hold(&volume.damaged).clone();
     let mut rows = hold(&volume.summary);
     let mut rewritten = SummaryRows::new(ByteCount(0));
@@ -1391,23 +1439,25 @@ pub fn save_cleared_spans<Backend: Io>(volume: &Volume<Backend>) -> bool {
 
     let listed = rows.offsets();
     for (segment, at) in &listed {
-        if numbers.contains(segment) {
-            continue;
-        }
-        if !rewritten.copy_row(&rows, *at) {
-            return false;
+        if !numbers.contains(segment) && !rewritten.copy_row(&rows, *at) {
+            state.note_dropped_row();
         }
     }
     for number in numbers {
-        let Some(row) = listed.get(&number).and_then(|at| rows.row_at(*at)) else {
-            return false;
-        };
+        let ranges = volume.damage.of_segment(number);
         let mut columns = Vec::new();
-        let _ranges_in_row = row_ranges(&row, number, &mut columns);
-        if !push_row(&mut rewritten, &row.facts, &columns, &volume.damage.of_segment(number)) {
-            return false;
+        let mut facts = SegmentFacts {
+            segment: number,
+            is_damaged: true,
+            damage_place: ranges.iter().map(|range| range.highest_place).max().unwrap_or(WritePlace(0)),
+            ..SegmentFacts::default()
+        };
+        if let Some(row) = listed.get(&number).and_then(|at| rows.row_at(*at)) {
+            facts = row.facts;
+            let _ranges_in_row = row_ranges(&row, number, &mut columns);
         }
+        let column_facts = columns.iter().map(column_of);
+        state.note_dropped_rows(rewritten.push_kept(&facts, column_facts, ranges.iter().map(span_of)));
     }
     *rows = rewritten;
-    true
 }

@@ -1,7 +1,7 @@
 //! A volume's summary: one row per sealed segment, which outlives that segment's tail
 
 use std::collections::BTreeMap;
-use std::io::{Error, ErrorKind, IoSlice, Result};
+use std::io::{ErrorKind, IoSlice, Result};
 use std::path::{Path, PathBuf};
 
 use reel_api::column_id::ColumnId;
@@ -20,6 +20,8 @@ pub const SUMMARY_MAGIC: u64 = 0x5245_4C53_554D_4D31;
 pub const SUMMARY_NAME: &str = "summary";
 /// The name a new summary is written under before it replaces the old one
 pub const NEW_SUMMARY_NAME: &str = "summary.new";
+/// The second copy's file name
+pub const SECOND_SUMMARY_NAME: &str = "summary.second";
 /// Bytes of a summary file's header
 pub const SUMMARY_HEADER_BYTES: usize = 32;
 /// Opens every row, so a walk past a bad row can find the next one
@@ -230,6 +232,35 @@ impl SummaryRows {
         true
     }
 
+    /// Add a row that must stay, giving up rows with no spans for it, and growing past the plan when there
+    /// are none left, since losing spans would let an older version answer: return how many rows went
+    pub fn push_kept<'key>(
+        &mut self,
+        facts: &SegmentFacts,
+        columns: impl ExactSizeIterator<Item = ColumnFacts<'key>> + Clone,
+        spans: impl ExactSizeIterator<Item = SpanFacts<'key>> + Clone,
+    ) -> u64 {
+        let mut dropped = 0;
+        while !self.push(facts, columns.clone(), spans.clone()) {
+            if self.drop_clean_row() {
+                dropped += 1;
+            } else {
+                self.bytes.reserve(self.bytes.capacity().max(MOST_ROW_FIXED_BYTES));
+            }
+        }
+        dropped
+    }
+
+    /// Take out the first row with no damage on it, and return false when there is none
+    pub fn drop_clean_row(&mut self) -> bool {
+        let clean = self.rows().find(|row| !row.facts.is_damaged).map(|row| row.facts.segment);
+        let Some(segment) = clean else {
+            return false;
+        };
+        self.remove(segment);
+        true
+    }
+
     /// Write a row's fixed fields
     pub fn put_facts(&mut self, facts: &SegmentFacts, columns: u16, spans: u16) {
         self.bytes.extend_from_slice(&facts.segment.0.to_le_bytes());
@@ -423,6 +454,7 @@ pub fn parse_row(body: &[u8]) -> Option<SummaryRow<'_>> {
 pub struct SummaryPaths {
     pub root: PathBuf,
     pub current: PathBuf,
+    pub second: PathBuf,
     pub new: PathBuf,
 }
 
@@ -432,19 +464,14 @@ impl SummaryPaths {
         Self {
             root: root.to_path_buf(),
             current: root.join(SUMMARY_NAME),
+            second: root.join(SECOND_SUMMARY_NAME),
             new: root.join(NEW_SUMMARY_NAME),
         }
     }
 }
 
-/// Replace a summary so a crash leaves the old one or the new one whole
+/// Write both copies of a summary, the second after the first is synced, so a crash leaves one whole
 pub fn write_summary<Backend: Io>(io: &Backend, paths: &SummaryPaths, mark: WritePlace, rows: &[u8]) -> Result<()> {
-    match io.remove_file(&paths.new) {
-        Ok(()) => {},
-        Err(error) if error.kind() == ErrorKind::NotFound => {},
-        Err(error) => return Err(error),
-    }
-
     let mut header = [0; SUMMARY_HEADER_BYTES];
     header[..8].copy_from_slice(&SUMMARY_MAGIC.to_le_bytes());
     header[8..16].copy_from_slice(&mark.0.to_le_bytes());
@@ -452,22 +479,65 @@ pub fn write_summary<Backend: Io>(io: &Backend, paths: &SummaryPaths, mark: Writ
     let sum = checksum(&header[..24]);
     header[24..].copy_from_slice(&sum.0.to_le_bytes());
 
+    write_copy(io, paths, &paths.current, &header, rows)?;
+    write_copy(io, paths, &paths.second, &header, rows)
+}
+
+/// Replace one copy through the new file
+pub fn write_copy<Backend: Io>(
+    io: &Backend,
+    paths: &SummaryPaths,
+    target: &Path,
+    header: &[u8],
+    rows: &[u8],
+) -> Result<()> {
+    match io.remove_file(&paths.new) {
+        Ok(()) => {},
+        Err(error) if error.kind() == ErrorKind::NotFound => {},
+        Err(error) => return Err(error),
+    }
+
     let file = io.create_file(&paths.new, ByteCount(0))?;
-    let written = file.write_at(FileOffset(0), &[IoSlice::new(&header), IoSlice::new(rows)]);
+    let written = file.write_at(FileOffset(0), &[IoSlice::new(header), IoSlice::new(rows)]);
     let synced = written.and_then(|()| file.sync());
     io.close_file(file);
     synced?;
-    io.rename_file(&paths.new, &paths.current)?;
+    io.rename_file(&paths.new, target)?;
     io.sync_directory(&paths.root)
 }
 
-/// Read a summary into rows, and return its mark, or nothing when it's absent or its header fails
+/// Read a summary into rows, each from whichever copy passes its check, and return the newer mark
 pub fn read_summary<Backend: Io>(
     io: &Backend,
     paths: &SummaryPaths,
     rows: &mut SummaryRows,
 ) -> Result<Option<WritePlace>> {
-    let file = match io.open_read_only(&paths.current) {
+    let first = read_copy(io, &paths.current)?;
+    let second = read_copy(io, &paths.second)?;
+    let (newer, older) = match (first, second) {
+        (Some(first), Some(second)) if second.0 > first.0 => (second, Some(first)),
+        (Some(first), second) => (first, second),
+        (None, Some(second)) => (second, None),
+        (None, None) => return Ok(None),
+    };
+
+    rows.bytes = newer.1;
+    if let Some((_mark, bytes)) = older {
+        let older_rows = SummaryRows { bytes };
+        let listed = rows.offsets();
+        rows.bytes.reserve(older_rows.bytes.len());
+        for (segment, at) in older_rows.offsets() {
+            if !listed.contains_key(&segment) {
+                rows.copy_row(&older_rows, at);
+            }
+        }
+    }
+    Ok(Some(WritePlace(newer.0)))
+}
+
+/// Read one copy's mark and rows, or nothing when it's absent, unreadable or its header fails
+pub fn read_copy<Backend: Io>(io: &Backend, path: &Path) -> Result<Option<(u64, Vec<u8>)>> {
+    let file = match io.open_read_only(path) {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -475,7 +545,6 @@ pub fn read_summary<Backend: Io>(
 
     let bytes = read_whole(&file);
     io.close_file(file);
-    // rows the file can't give back are rebuilt from the tails, like any row that fails its check
     let bytes = match bytes {
         Ok(bytes) => bytes,
         Err(error) if is_device_error(&error) => return Ok(None),
@@ -487,22 +556,13 @@ pub fn read_summary<Backend: Io>(
     };
     let mut cursor = RowCursor { bytes: header };
     let is_ours = cursor.word() == Some(SUMMARY_MAGIC);
-    let mark = cursor.word();
-    let rows_length = cursor.word();
-    let sum = cursor.word();
-    let (Some(mark), Some(rows_length), Some(sum)) = (mark, rows_length, sum) else {
-        return Err(Error::from(ErrorKind::InvalidData));
+    let (Some(mark), Some(rows_length), Some(sum)) = (cursor.word(), cursor.word(), cursor.word()) else {
+        return Ok(None);
     };
     if !is_ours || checksum(&header[..24]).0 != sum {
         return Ok(None);
     }
 
     let end = (SUMMARY_HEADER_BYTES + rows_length as usize).min(bytes.len());
-    rows.bytes.clear();
-    let body = &bytes[SUMMARY_HEADER_BYTES..end];
-    if rows.bytes.capacity() < body.len() {
-        rows.bytes.reserve_exact(body.len());
-    }
-    rows.bytes.extend_from_slice(body);
-    Ok(Some(WritePlace(mark)))
+    Ok(Some((mark, bytes[SUMMARY_HEADER_BYTES..end].to_vec())))
 }

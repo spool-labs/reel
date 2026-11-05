@@ -1073,3 +1073,30 @@ fn empty_seal() {
     assert!(hold(&state.volumes[0].claims).open.is_empty());
     store.close().expect("close");
 }
+
+// a bad sector under a synced record on the copy path damages its keys and the open goes through
+#[test]
+fn copy_bad() {
+    let io = SimulatedIo::new(Seed(22));
+    let store = open(&io);
+    fill_numbers(&store, SHRINK_ROWS);
+    store.flush().expect("flush");
+    io.kill();
+    drop(store);
+    let files = data_files(&io);
+    io.bad_sector(&files[0], FileOffset(3)).expect("bad");
+
+    let store = ReelStore::open(io.clone(), &config(SMALL_BUDGET)).expect("open");
+
+    let mut refused = 0;
+    let mut buf = Vec::new();
+    for number in 0..SHRINK_ROWS {
+        match store.get(COLUMN, &number.to_be_bytes(), &mut buf) {
+            Ok(_is_found) => {},
+            Err(StoreError::Corruption { .. }) => refused += 1,
+            Err(error) => panic!("key {number} failed: {error}"),
+        }
+    }
+    assert!(refused > 0);
+    store.close().expect("close");
+}

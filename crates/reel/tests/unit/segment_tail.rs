@@ -77,3 +77,13 @@ fn no_tail() {
     bytes[20] ^= 1;
     assert!(find_tail(&bytes, RECORD_KEY).is_none());
 }
+
+// a column whose blocks run past the index doesn't fit
+#[test]
+fn column_range() {
+    let column = column(1);
+    let lines = column.first_block as usize + column.block_count.0 as usize;
+
+    assert!(columns_fit(&[column], lines));
+    assert!(!columns_fit(&[column], lines - 1));
+}

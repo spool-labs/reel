@@ -247,3 +247,8 @@ pub fn find_tail(end: &[u8], record_key: RecordKey) -> Option<&[u8]> {
     }
     Some(&end[tail_at..trailer_at])
 }
+
+/// Check every column's blocks lie inside a segment's block index
+pub fn columns_fit(columns: &[ColumnTail], block_lines: usize) -> bool {
+    columns.iter().all(|column| column.first_block as usize + column.block_count.0 as usize <= block_lines)
+}

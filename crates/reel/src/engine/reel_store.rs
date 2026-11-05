@@ -41,6 +41,7 @@ use crate::rows::row_group::RowGroupBuffer;
 use crate::segment::block_cache::BlockCache;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::damage_list::DamageList;
+use crate::segment::summary::{MOST_ROW_COLUMN_BYTES, MOST_ROW_FIXED_BYTES};
 use crate::segment::footer_reader::FooterReader;
 use crate::segment::row_block::ROW_BLOCK_BYTES;
 use crate::segment::segment_table::{SegmentTable, TABLE_SHARDS, TableSizing};
@@ -56,8 +57,6 @@ pub const TABLE_BUDGET_DIVISOR: u64 = 16;
 pub const PLANNED_SEGMENT_BYTES: u64 = 1_024;
 /// Block lines a table's share is planned for, as bytes per line
 pub const PLANNED_LINE_BYTES: u64 = 32;
-/// Bytes a summary row is planned at: four columns at about 100 B, and the row's own fields
-pub const PLANNED_SUMMARY_ROW_BYTES: usize = 512;
 
 /// An open store
 pub struct ReelStore<Backend: Io> {
@@ -176,16 +175,8 @@ impl<Backend: Io> ReelStore<Backend> {
         self.check_open()?;
         let info = self.state.column(column)?;
         let volume = &self.state.volumes[info.volume.0 as usize];
-        let before = volume.damage.ranges();
         volume.damage.clear(column, start, end);
-        // a clear the summary can't hold would come back at the next open, so it doesn't happen at all
-        if !save_cleared_spans(volume) {
-            volume.damage.restore(before);
-            return Err(StoreError::Io {
-                action: "saving a cleared span",
-                source: Error::other("the summary has no row for it, or no room"),
-            });
-        }
+        save_cleared_spans(&self.state, volume);
         self.state.save_summary(volume).map_err(open_error("saving a summary"))
     }
 
@@ -527,6 +518,11 @@ pub fn table_room(planned: &TableSizing, found: &TableSizing) -> TableSizing {
     }
 }
 
+/// Work out the most a row can take on a volume with this many columns
+pub fn row_room(columns: usize) -> usize {
+    MOST_ROW_FIXED_BYTES + columns * MOST_ROW_COLUMN_BYTES
+}
+
 /// Allocate and touch everything the engine will hold
 pub fn build_state<Backend: Io>(
     io: Backend,
@@ -565,6 +561,7 @@ pub fn build_state<Backend: Io>(
 
     let open_slots = sizing.shard.open_slots;
     let mut volumes = Vec::with_capacity(config.volumes.len());
+    let all_row_room = config.volumes.len() * MOST_ROW_FIXED_BYTES + config.columns.len() * MOST_ROW_COLUMN_BYTES;
     let mut summaries = summaries.into_iter();
     for (index, volume) in config.volumes.iter().enumerate() {
         let mut paths = Vec::with_capacity(volume.roots.len());
@@ -576,8 +573,9 @@ pub fn build_state<Backend: Io>(
             continue;
         };
         let found_summary = summary.rows.bytes().len() * 2;
-        let planned_summary = segments_per_shard * TABLE_SHARDS * PLANNED_SUMMARY_ROW_BYTES / config.volumes.len().max(1);
         let columns_here = config.columns.iter().filter(|column| column.volume.0 as usize == index).count();
+        // the share splits by each volume's row size, so every volume plans the same number of rows
+        let planned_summary = sizing.summary_share.0 as usize * row_room(columns_here) / all_row_room;
         // open never drops a row, so a segment's damage keeps its rank through every open
         let summary_room = found_summary.max(planned_summary).max(scan.least_summary_room(index, columns_here) * 2);
         summary.rows.make_room(ByteCount(summary_room as u64));

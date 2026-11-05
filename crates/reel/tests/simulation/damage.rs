@@ -18,7 +18,7 @@ use reel::segment::footer_reader::FooterReader;
 use reel::segment::row_block::BLOCK_HEADER_BYTES;
 use reel::segment::segment_tail::{SECOND_TAIL_DISTANCE, SegmentNumber, TailHead};
 use reel::segment::summary::{
-    ROW_HEAD_BYTES, SUMMARY_HEADER_BYTES, SummaryPaths, SummaryRows, read_row, read_summary, write_summary,
+    ROW_HEAD_BYTES, SUMMARY_HEADER_BYTES, SegmentFacts, SummaryPaths, SummaryRows, read_row, read_summary, write_summary,
 };
 use reel::superblock::Superblock;
 use reel_api::column_id::ColumnId;
@@ -43,6 +43,9 @@ const SEAL_CRASH_POINTS: u64 = 24;
 const SEAL_STEPS: u64 = 1_000;
 const CLEAR_CRASH_POINTS: u64 = 8;
 const SEAL_DATA_SYNCS: u64 = 6;
+const LONG_KEY_BYTES: usize = 100;
+const SECTOR_ROWS: u64 = 40;
+const GROUPS_BACK: u64 = 150;
 const MANY_SEGMENTS: u64 = 450;
 const LEAST_BUDGET: ByteCount = ByteCount(1024 * 1024);
 // a segment lost with its row counts every stage a store held at open
@@ -90,14 +93,14 @@ fn config() -> StoreConfig {
             ColumnConfig {
                 id: ORDERED,
                 name: "ordered".to_string(),
-                key_shape: KeyShape::Variable { most: 64 },
+                key_shape: KeyShape::Variable { most: 128 },
                 codec: Codec::None,
                 volume: VolumeId(0),
             },
             ColumnConfig {
                 id: RANDOM,
                 name: "random".to_string(),
-                key_shape: KeyShape::Variable { most: 64 },
+                key_shape: KeyShape::Variable { most: 128 },
                 codec: Codec::None,
                 volume: VolumeId(0),
             },
@@ -227,10 +230,13 @@ fn rot_indexes(built: &Built, stage: usize) {
     built.io.rot(&built.files[stage], FileOffset(head.second_index_at.0 + 2), FLIP).expect("rot");
 }
 
+// rot a row in both copies, the double failure that loses it
 fn rot_row(built: &Built, segment: SegmentNumber) {
     let paths = SummaryPaths::new(Path::new(ROOT));
     let at = row_offset(built, &paths, segment);
-    built.io.rot(&paths.current, FileOffset((at + ROW_HEAD_BYTES + 2) as u64), FLIP).expect("rot");
+    let offset = FileOffset((at + ROW_HEAD_BYTES + 2) as u64);
+    built.io.rot(&paths.current, offset, FLIP).expect("rot");
+    built.io.rot(&paths.second, offset, FLIP).expect("rot");
 }
 
 fn file_length(io: &SimulatedIo, path: &Path) -> ByteCount {
@@ -638,8 +644,9 @@ fn later_sync() {
 
 fn rot_length(built: &Built, segment: SegmentNumber) {
     let paths = SummaryPaths::new(Path::new(ROOT));
-    let at = row_offset(built, &paths, segment);
-    built.io.rot(&paths.current, FileOffset((at + 5) as u64), FLIP).expect("rot");
+    let at = FileOffset((row_offset(built, &paths, segment) + 5) as u64);
+    built.io.rot(&paths.current, at, FLIP).expect("rot");
+    built.io.rot(&paths.second, at, FLIP).expect("rot");
 }
 
 fn summary_rows(built: &Built) -> (SummaryPaths, SummaryRows, WritePlace) {
@@ -747,12 +754,13 @@ fn bad_block() {
     store.close().expect("close");
 }
 
-// a bad sector under the summary costs its rows, which come back from the tails
+// bad sectors under both copies cost their rows, which come back from the tails
 #[test]
 fn bad_summary() {
     let built = build(25);
     let paths = SummaryPaths::new(Path::new(ROOT));
     built.io.bad_sector(&paths.current, FileOffset(SUMMARY_HEADER_BYTES as u64 + 3)).expect("bad");
+    built.io.bad_sector(&paths.second, FileOffset(SUMMARY_HEADER_BYTES as u64 + 3)).expect("bad");
 
     let store = open(&built.io);
 
@@ -836,7 +844,9 @@ fn key_contains() {
 #[test]
 fn no_summary() {
     let built = build(30);
-    built.io.remove_file(&SummaryPaths::new(Path::new(ROOT)).current).expect("remove");
+    let paths = SummaryPaths::new(Path::new(ROOT));
+    built.io.remove_file(&paths.current).expect("remove");
+    built.io.remove_file(&paths.second).expect("remove");
 
     let store = open(&built.io);
 
@@ -867,7 +877,7 @@ fn full_summary() {
 fn long_keys() {
     let io = SimulatedIo::new(Seed(32));
     let store = open(&io);
-    let shared = "s".repeat(40);
+    let shared = "s".repeat(LONG_KEY_BYTES);
     let key = |number: u64| format!("{shared}{number:04}").into_bytes();
     let mut model = Model::new();
     for number in 0..10 {
@@ -1127,7 +1137,9 @@ fn rows_fit() {
     }
     store.close().expect("close");
     drop(store);
-    io.remove_file(&SummaryPaths::new(Path::new(ROOT)).current).expect("remove");
+    let paths = SummaryPaths::new(Path::new(ROOT));
+    io.remove_file(&paths.current).expect("remove");
+    io.remove_file(&paths.second).expect("remove");
 
     let config = StoreConfig {
         memory_budget: LEAST_BUDGET,
@@ -1137,5 +1149,120 @@ fn rows_fit() {
 
     assert_eq!(store.dropped_summary_rows(), 0);
     assert_eq!(hold(&store.state.volumes[0].summary).rows().count() as u64, MANY_SEGMENTS);
+    store.close().expect("close");
+}
+
+// a row lost in one copy comes from the other, so a segment that loses its tails keeps its ranges
+#[test]
+fn one_copy() {
+    let built = build(40);
+    let paths = SummaryPaths::new(Path::new(ROOT));
+    let at = row_offset(&built, &paths, built.heads[MIDDLE].segment);
+    built.io.rot(&paths.current, FileOffset((at + ROW_HEAD_BYTES + 2) as u64), FLIP).expect("rot");
+    rot_first_tail(&built, MIDDLE);
+    rot_second_tail(&built, MIDDLE);
+
+    let store = open(&built.io);
+
+    assert!(assert_guarded(&store, &built, Cover::Edges(MIDDLE)) > 0);
+    store.close().expect("close");
+}
+
+// a bad sector under a covered group keeps the later groups: the search goes on sector by sector
+#[test]
+fn bad_rows() {
+    let io = SimulatedIo::new(Seed(41));
+    let store = open(&io);
+    for number in 0..SECTOR_ROWS {
+        store.put(ORDERED, &key_of(ORDERED, number), b"value").expect("put");
+    }
+    store.flush().expect("flush");
+    store.put(ORDERED, b"later", b"value").expect("put");
+    store.flush().expect("flush");
+    io.kill();
+    drop(store);
+    io.bad_sector(&rows_files(&io)[0], FileOffset(20)).expect("bad");
+
+    let store = open(&io);
+
+    assert_eq!(store.damaged_segments(), 1);
+    assert!(matches!(read(&store, ORDERED, b"later"), Err(StoreError::Corruption { .. })));
+    store.clear_damage(ORDERED, b"", None).expect("clear");
+    assert_eq!(read(&store, ORDERED, b"later").expect("get"), Some(b"value".to_vec()));
+    store.close().expect("close");
+}
+
+// rot found at a later open takes that open's counter, also over spans a caller cleared
+#[test]
+fn new_rot() {
+    let io = rotted_rows(42);
+    let store = open(&io);
+    store.clear_damage(ORDERED, b"", None).expect("clear");
+    store.put(ORDERED, b"key", b"older").expect("put");
+    store.flush().expect("flush");
+    store.put(ORDERED, b"key", b"newer").expect("put");
+    store.flush().expect("flush");
+    store.put(ORDERED, b"other", b"value").expect("put");
+    store.flush().expect("flush");
+    let file = &rows_files(&io)[0];
+    let length = file_length(&io, file);
+    store.close().expect("close");
+    drop(store);
+
+    // the group of the newer put sits a few groups back from the end
+    io.rot(file, FileOffset(length.0 - GROUPS_BACK), FLIP).expect("rot");
+    let store = open(&io);
+
+    assert!(matches!(read(&store, ORDERED, b"key"), Err(StoreError::Corruption { .. })));
+    store.close().expect("close");
+}
+
+// a seal keeps a damaged open segment's spans when the summary is full, giving up a clean row for them
+#[test]
+fn seal_spans() {
+    let io = rotted_rows(43);
+    let store = open(&io);
+    let volume = &store.state.volumes[0];
+    let spans = hold(&volume.damaged)[0];
+    let clean = SegmentFacts {
+        segment: SegmentNumber(spans.0 + 1_000),
+        ..SegmentFacts::default()
+    };
+    while hold(&volume.summary).push(&clean, [].into_iter(), [].into_iter()) {}
+
+    seal(&store, &io);
+    store.close().expect("close");
+    drop(store);
+
+    let store = open(&io);
+    assert_eq!(store.damaged_segments(), 1);
+    assert!(matches!(read(&store, ORDERED, b"later"), Err(StoreError::Corruption { .. })));
+    store.close().expect("close");
+}
+
+// a clear works when a damaged segment has no row, and when a split outgrows the room
+#[test]
+fn clear_grows() {
+    let built = build(44);
+    rot_first_tail(&built, MIDDLE);
+    rot_second_tail(&built, MIDDLE);
+    let store = open(&built.io);
+    let volume = &store.state.volumes[0];
+    hold(&volume.summary).remove(built.heads[MIDDLE].segment);
+    let heap = hold(&volume.summary).heap_bytes();
+    let clean = SegmentFacts {
+        segment: SegmentNumber(1),
+        is_damaged: true,
+        ..SegmentFacts::default()
+    };
+    while hold(&volume.summary).push(&clean, [].into_iter(), [].into_iter()) {}
+
+    let split = key_of(ORDERED, 130);
+    let end = key_of(ORDERED, 131);
+    store.clear_damage(ORDERED, &split, Some(&end)).expect("clear");
+
+    assert!(hold(&volume.summary).heap_bytes() >= heap);
+    assert!(read(&store, ORDERED, &split).is_ok());
+    assert!(matches!(read(&store, ORDERED, &end), Err(StoreError::Corruption { .. })));
     store.close().expect("close");
 }

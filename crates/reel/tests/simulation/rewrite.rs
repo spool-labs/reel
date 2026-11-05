@@ -22,7 +22,7 @@ use reel::segment::damage_list::DamagedRange;
 use reel::segment::footer_reader::FooterReader;
 use reel::segment::footer_writer::FooterWriter;
 use reel::segment::segment_table::{RetiredSegment, shard_of};
-use reel::segment::segment_tail::{BlockCount, SegmentNumber, TailHead};
+use reel::segment::segment_tail::{BlockCount, MOST_MERGE_SEGMENTS, SegmentNumber, TailHead};
 use reel_api::column_id::ColumnId;
 use reel_api::units::{ByteCount, Nanoseconds, VolumeId, WritePlace};
 use reel_sim::seeded_random::Seed;
@@ -1599,5 +1599,81 @@ fn newest_first_stops() {
     });
     assert_eq!(asked, 1);
     assert!(found.expect("a read").is_some());
+    store.close().expect("close");
+}
+
+// a full unwalked output below small unwalked segments stays out of a merge, so the small ones never wait on its walk
+#[test]
+fn full_segment_stays_out() {
+    let io = SimulatedIo::new(Seed(61));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    hold_walk(&store, true);
+    let half = store.state.volumes[0].segment_bytes.0 as usize / 2;
+    store.put(COLUMN, b"a", &vec![1; half + 1]).expect("put");
+    store.put(COLUMN, b"z", b"high").expect("put");
+    let full = seal(&store, &io);
+    pile_up(&store, &io, OVER_THE_BOUND);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(job.rewrite.start());
+    assert!(job.rewrite.is_unwalked_merge());
+    assert_eq!(job.rewrite.input_numbers().len(), MOST_MERGE_SEGMENTS);
+    assert!(!job.rewrite.input_numbers().contains(&full));
+    job.rewrite.abandon();
+    store.close().expect("close");
+}
+
+// with only large segments near, a small one still pairs with one, and a large one that doesn't fit is passed over
+#[test]
+fn large_merge_when_alone() {
+    let io = SimulatedIo::new(Seed(62));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    hold_walk(&store, true);
+    let large = store.state.volumes[0].segment_bytes.0 as usize * 3 / 5;
+    for _segment in 0..OVER_THE_BOUND {
+        store.put(COLUMN, b"a", &vec![1; large]).expect("put");
+        store.put(COLUMN, b"z", b"high").expect("put");
+        seal(&store, &io);
+    }
+    store.put(COLUMN, b"a", b"small").expect("put");
+    store.put(COLUMN, b"z", b"high").expect("put");
+    let small = seal(&store, &io);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(job.rewrite.start());
+    assert_eq!(job.rewrite.input_numbers().len(), 2);
+    assert!(job.rewrite.input_numbers().contains(&small));
+    job.rewrite.abandon();
+    store.close().expect("close");
+}
+
+// a few small segments merge alone, with room left over that a large one could have taken
+#[test]
+fn small_ones_merge_alone() {
+    let io = SimulatedIo::new(Seed(63));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    hold_walk(&store, true);
+    let large = store.state.volumes[0].segment_bytes.0 as usize * 3 / 5;
+    for _segment in 0..OVER_THE_BOUND {
+        store.put(COLUMN, b"a", &vec![1; large]).expect("put");
+        store.put(COLUMN, b"z", b"high").expect("put");
+        seal(&store, &io);
+    }
+    let mut small = Vec::new();
+    for _segment in 0..3 {
+        store.put(COLUMN, b"a", b"small").expect("put");
+        store.put(COLUMN, b"z", b"high").expect("put");
+        small.push(seal(&store, &io));
+    }
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(job.rewrite.start());
+    let mut inputs = job.rewrite.input_numbers().to_vec();
+    inputs.sort_unstable();
+    assert_eq!(inputs, small);
+    job.rewrite.abandon();
     store.close().expect("close");
 }

@@ -351,11 +351,13 @@ impl<Backend: Io> RewriteJob<Backend> {
             return None;
         }
         let is_more = |row: &SummaryRow<'_>| is_near(row) && row.facts.is_walked() != is_unwalked;
-        let Some(first) = rows.rows().filter(is_more).min_by_key(|row| row.facts.segment) else {
-            self.looked_up_to = crowded.facts.segment;
-            return None;
-        };
-        let target = self.gather(volume, rows, &first, room, is_more);
+        // a segment past half an output only goes in if nothing else makes two: copying it again wins back little
+        let half = volume.segment_bytes.0 / 2;
+        let is_small = |row: &SummaryRow<'_>| is_more(row) && row.facts.data_end.0 <= half;
+        let mut target = self.gather_smallest(volume, rows, room, is_small);
+        if self.input_count < 2 {
+            target = self.gather_smallest(volume, rows, room, is_more);
+        }
         // one segment alone wins back no overlap, and the next look starts past it
         if self.input_count < 2 {
             self.looked_up_to = crowded.facts.segment;
@@ -405,6 +407,44 @@ impl<Backend: Io> RewriteJob<Backend> {
                     data + row.facts.data_end.0 <= volume.segment_bytes.0
                         && blocks + row.facts.block_count <= MOST_SEGMENT_BLOCKS.0
                 });
+        }
+        MergeTarget {
+            blocks_at: FileOffset(data),
+            length: ByteCount(length),
+        }
+    }
+
+    /// Take the smallest segments a test passes while they fit one output, passing over any that don't, so one full segment
+    /// can't stop the small ones behind it
+    pub fn gather_smallest(
+        &mut self,
+        volume: &Volume<Backend>,
+        rows: &SummaryRows,
+        most: usize,
+        is_more: impl Fn(&SummaryRow<'_>) -> bool,
+    ) -> MergeTarget {
+        self.input_count = 0;
+        let (mut data, mut length, mut blocks) = (0, 0, 0);
+        while self.input_count < most {
+            let numbers = &self.numbers[..self.input_count];
+            let fits = |row: &SummaryRow<'_>| {
+                data + row.facts.data_end.0 <= volume.segment_bytes.0
+                    && blocks + row.facts.block_count <= MOST_SEGMENT_BLOCKS.0
+                    && !numbers.contains(&row.facts.segment)
+            };
+            let next = rows.rows().filter(|row| is_more(row) && fits(row)).min_by_key(|row| row.facts.data_end);
+            let Some(row) = next else {
+                break;
+            };
+            let facts = row.facts;
+            let input = &mut self.inputs[self.input_count];
+            input.segment = facts.segment;
+            input.block_count = facts.block_count;
+            self.numbers[self.input_count] = facts.segment;
+            self.input_count += 1;
+            data += facts.data_end.0;
+            length += facts.file_length.0;
+            blocks += facts.block_count;
         }
         MergeTarget {
             blocks_at: FileOffset(data),
@@ -923,6 +963,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             list_output(&state, volume, output, &totals, &self.writer, inputs);
         }
         // an unwalked merge's outputs owe a walk, and reads of finished segments leave them out until it's done
+        // a walked merge marks its outputs after the lists, which only holds with no walk target running beside it
         if !self.is_unwalked {
             for output in [self.output.as_ref(), self.grave_output.as_ref()].into_iter().flatten() {
                 volume.table.mark_walked(output.number);

@@ -10,7 +10,7 @@ use crate::index::write_shard::ShardSizing;
 use crate::segment::damage_list::{MOST_DAMAGED_SPANS, SPAN_KEY_BYTES};
 use crate::segment::segment_tail::MOST_SEGMENT_BYTES;
 
-/// A segment's target size on a store with a full budget
+/// A segment's target size on a store with a full budget, and a smaller budget targets half of itself
 pub const SEGMENT_TARGET: ByteCount = ByteCount(1024 * 1024 * 1024);
 /// A budget this large or more gets the full segment target
 pub const FULL_BUDGET: ByteCount = ByteCount(512 * 1024 * 1024);
@@ -48,7 +48,10 @@ pub const JOB_STACK_PLAN_BYTES: u64 = 1024 * 1024;
 pub const SHARED_JOBS: u64 = 2;
 /// Bytes a row of the write index really takes, node, page and table share included
 pub const PLANNED_ROW_BYTES: u64 = 224;
-/// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight
+/// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight. With one
+/// lz4 column that gives these rows a segment: 65,273 at 128 MiB, 158,896 at 192 MiB, 627,011 at 512 MiB and
+/// 5,869,891 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
+/// records seal smaller and reach their size through merges, whose outputs the write index doesn't bound
 pub const SEAL_ROWS_EIGHTHS: u64 = 5;
 /// The most stored bytes of a value on an lz4 column
 pub const LZ4_STORED_LIMIT: ByteCount = ByteCount(64 * 1024 * 1024);

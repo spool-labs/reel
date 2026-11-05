@@ -59,6 +59,10 @@ impl IoFile for SimulatedFile {
     fn read_at(&self, offset: FileOffset, buf: &mut [u8]) -> Result<ByteCount> {
         let mut disk = hold(&self.disk);
         self.check(&mut disk, false)?;
+        if disk.failing_reads.0 > 0 {
+            disk.failing_reads = OperationCount(disk.failing_reads.0 - 1);
+            return Err(Error::other("simulated read failure from the process"));
+        }
 
         let Some(image) = disk.inodes.get(&self.inode) else {
             return Err(Error::from(ErrorKind::NotFound));

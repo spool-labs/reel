@@ -1134,7 +1134,8 @@ pub fn carry_rows<Backend: Io>(
         hold(&volume.damaged).push(*number);
         // the room was sized at open from every row it found, and a row with spans has to stay
         settled.make_room_for(rows, *at);
-        let _is_copied = settled.copy_row(rows, *at);
+        let is_copied = settled.copy_row(rows, *at);
+        debug_assert!(is_copied);
     }
 }
 
@@ -1202,7 +1203,8 @@ pub fn settle_sealed<Backend: Io>(
         }
         // the room was sized at open from every row it found, and a row with spans has to stay
         settled.make_room_for(rows, *at);
-        let _is_copied = settled.copy_row(rows, *at);
+        let is_copied = settled.copy_row(rows, *at);
+        debug_assert!(is_copied);
         return Ok(());
     }
 

@@ -16,6 +16,8 @@ use crate::segment::summary::SpanFacts;
 pub const MOST_DAMAGED_SPANS: usize = 2 * MAX_COLUMNS;
 /// The longest key a span can keep: a key and the zero that makes it an exclusive end
 pub const SPAN_KEY_BYTES: usize = MAX_KEY_BYTES as usize + 1;
+// the merge in a full pool needs more spans than columns, and a summary row keeps its span count in two bytes
+const _: () = assert!(MOST_DAMAGED_SPANS > MAX_COLUMNS && MOST_DAMAGED_SPANS < u16::MAX as usize);
 /// Marks a span that runs to its column's end
 const NO_END: u16 = u16::MAX;
 
@@ -175,6 +177,7 @@ impl DamageList {
     pub fn add(&self, range: &DamagedRange) {
         let mut slots = write_slots(&self.slots);
         let is_covered = slots.len() == MOST_DAMAGED_SPANS && widen_for(&mut slots, range);
+        debug_assert!(is_covered || slots.len() < MOST_DAMAGED_SPANS);
         if !is_covered && slots.len() < MOST_DAMAGED_SPANS {
             slots.push(DamageSlot::new(range));
         }

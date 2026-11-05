@@ -457,6 +457,8 @@ impl Run {
             if !versions.accept(&found) {
                 panic!("seed {}: key {key:?} read {found:?} below its floor, in {versions:?}", self.seed);
             }
+            // open syncs what it shows, so what it showed can't go back
+            versions.floor = versions.history.len() - 1;
         }
     }
 

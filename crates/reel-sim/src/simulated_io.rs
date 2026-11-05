@@ -106,6 +106,11 @@ impl SimulatedIo {
         hold(&self.disk).handle_faults
     }
 
+    /// Make the next reads fail with an error a device never gives
+    pub fn fail_reads(&self, count: OperationCount) {
+        hold(&self.disk).failing_reads = count;
+    }
+
     /// Make the next writes fail
     pub fn fail_writes(&self, count: OperationCount) {
         hold(&self.disk).failing_writes = count;

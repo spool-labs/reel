@@ -141,3 +141,17 @@ fn spare_copy() {
 
     assert_eq!(list.len(), MOST_DAMAGED_SPANS);
 }
+
+// dropping a segment's spans keeps the cover a widened span gave another segment, since open adds its whole columns back
+#[test]
+fn drop_widened() {
+    let list = full_list();
+    list.add(&numbered(1, COLUMN, 8));
+    assert_eq!(list.covering(COLUMN, b"zzz"), Some(WritePlace(5)));
+
+    list.drop_segment(SegmentNumber(9));
+    list.add(&range(b"", None, 7));
+
+    assert_eq!(list.covering(COLUMN, b"000001"), Some(WritePlace(7)));
+    assert_eq!(list.covering(COLUMN, b"zzz"), Some(WritePlace(7)));
+}

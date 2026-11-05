@@ -14,6 +14,7 @@ use reel_sim::simulated_io::SimulatedIo;
 use reel::io::{Io, IoFile};
 use reel::record::codec::Codec;
 use reel::record::record_check::Checksum;
+use reel::segment::damage_list::{DamagedRange, MOST_DAMAGED_SPANS};
 use reel::segment::footer_reader::FooterReader;
 use reel::segment::row_block::BLOCK_HEADER_BYTES;
 use reel::segment::segment_tail::{SECOND_TAIL_DISTANCE, SegmentNumber, TailHead};
@@ -43,12 +44,16 @@ const NEWEST: usize = 2;
 const SEGMENTS: usize = 3;
 const SEAL_CRASH_POINTS: u64 = 24;
 const SEAL_STEPS: u64 = 1_000;
-const CLEAR_CRASH_POINTS: u64 = 8;
+const CLEAR_CRASH_POINTS: u64 = 24;
 const SEAL_DATA_SYNCS: u64 = 6;
 const LONG_KEY_BYTES: usize = 100;
 const SECTOR_ROWS: u64 = 40;
 const GROUPS_BACK: u64 = 150;
-const MANY_SEGMENTS: u64 = 300;
+const WIDE_COLUMNS: u8 = 200;
+const WIDE_SEGMENTS: u64 = 90;
+const WIDE_BUDGET: ByteCount = ByteCount(128 * 1024 * 1024);
+// what the summary plans at the least budget, spans included
+const PLANNED_ROOM_AT_LEAST: u64 = 1_400_000;
 const LEAST_BUDGET: ByteCount = ByteCount(30 * 1024 * 1024);
 // a segment lost with its row counts every stage a store held at open
 const STAGE_LOST: usize = NEWEST;
@@ -1128,13 +1133,30 @@ fn tail_sync() {
     }
 }
 
-// more segments than the plan and no summary: every row comes back, so open drops none and no rank moves
+fn wide_config(budget: ByteCount) -> StoreConfig {
+    let mut config = config();
+    config.memory_budget = budget;
+    config.columns = (1..=WIDE_COLUMNS)
+        .map(|id| ColumnConfig {
+            id: ColumnId(id),
+            name: format!("column-{id}"),
+            key_shape: KeyShape::Variable { most: 128 },
+            codec: Codec::None,
+            volume: VolumeId(0),
+        })
+        .collect();
+    config
+}
+
+// more rows than the plan and no summary: every row comes back, so open drops none and no rank moves
 #[test]
 fn rows_fit() {
     let io = SimulatedIo::new(Seed(39));
-    let store = open(&io);
-    for number in 0..MANY_SEGMENTS {
-        store.put(ORDERED, &key_of(ORDERED, number), b"value").expect("put");
+    let store = ReelStore::open(io.clone(), &wide_config(WIDE_BUDGET)).expect("open");
+    for _segment in 0..WIDE_SEGMENTS {
+        for id in 1..=WIDE_COLUMNS {
+            store.put(ColumnId(id), &[b'k'; 40], b"value").expect("put");
+        }
         seal(&store, &io);
     }
     store.close().expect("close");
@@ -1143,14 +1165,13 @@ fn rows_fit() {
     io.remove_file(&paths.current).expect("remove");
     io.remove_file(&paths.second).expect("remove");
 
-    let config = StoreConfig {
-        memory_budget: LEAST_BUDGET,
-        ..config()
-    };
-    let store = ReelStore::open(io.clone(), &config).expect("open");
+    let store = ReelStore::open(io.clone(), &wide_config(LEAST_BUDGET)).expect("open");
 
+    let rows = hold(&store.state.volumes[0].summary);
+    assert!(rows.bytes().len() as u64 > PLANNED_ROOM_AT_LEAST);
+    assert_eq!(rows.rows().count() as u64, WIDE_SEGMENTS);
+    drop(rows);
     assert_eq!(store.dropped_summary_rows(), 0);
-    assert_eq!(hold(&store.state.volumes[0].summary).rows().count() as u64, MANY_SEGMENTS);
     store.close().expect("close");
 }
 
@@ -1442,4 +1463,64 @@ fn bad_spots() {
         assert_eq!(read(&store, ORDERED, b"later").expect("get"), Some(b"value".to_vec()), "spots {spots:?}");
         store.close().expect("close");
     }
+}
+
+// a clear whose save fails says so and changes nothing, and the same clear then goes through
+#[test]
+fn clear_save() {
+    let built = build(51);
+    rot_first_tail(&built, MIDDLE);
+    rot_second_tail(&built, MIDDLE);
+    let store = open(&built.io);
+    let inside = key_of(ORDERED, 110);
+
+    built.io.fail_file_sync("new", OperationCount(0));
+    assert!(store.clear_damage(ORDERED, b"", None).is_err());
+    assert!(matches!(read(&store, ORDERED, &inside), Err(StoreError::Corruption { .. })));
+
+    store.clear_damage(ORDERED, b"", None).expect("clear");
+    assert!(read(&store, ORDERED, &inside).is_ok());
+    store.close().expect("close");
+}
+
+// a clear that would split a span on a full pool comes back as its own error
+#[test]
+fn clear_full() {
+    let built = build(52);
+    rot_first_tail(&built, MIDDLE);
+    rot_second_tail(&built, MIDDLE);
+    let store = open(&built.io);
+    let damage = &store.state.volumes[0].damage;
+    let segment = built.heads[MIDDLE].segment;
+    let mut number = 0;
+    while damage.len() < MOST_DAMAGED_SPANS {
+        damage.add(&DamagedRange {
+            column: RANDOM,
+            segment,
+            highest_place: WritePlace(1),
+            start: format!("{number:06}").into_bytes(),
+            end: Some(format!("{number:06}z").into_bytes()),
+        });
+        number += 1;
+    }
+
+    let split = store.clear_damage(RANDOM, b"000002a", Some(b"000002b"));
+
+    assert!(matches!(split, Err(StoreError::DamagePoolFull { .. })));
+    store.close().expect("close");
+}
+
+// a read the process gets wrong is no damage: open fails, saves nothing, and the next open is clean
+#[test]
+fn not_damage() {
+    let built = build(53);
+    built.io.fail_reads(OperationCount(1));
+    assert!(ReelStore::open(built.io.clone(), &config()).is_err());
+    built.io.fail_reads(OperationCount(0));
+
+    let store = open(&built.io);
+
+    assert_eq!(store.damaged_segments(), 0);
+    assert_match(&store, &built.model);
+    store.close().expect("close");
 }

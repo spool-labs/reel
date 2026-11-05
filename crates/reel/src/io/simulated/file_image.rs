@@ -1,7 +1,7 @@
 //! One simulated file: what a reader sees and what a power cut leaves
 
 use crate::io::simulated::seeded_random::SeededRandom;
-use crate::units::{ByteCount, FileOffset};
+use reel_api::units::{ByteCount, FileOffset};
 
 /// A torn write keeps a whole number of these
 pub const SECTOR_BYTES: u64 = 512;

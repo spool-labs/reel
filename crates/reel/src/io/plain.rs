@@ -15,7 +15,7 @@ use crate::io::job::Job;
 use crate::io::lock_outcome::LockOutcome;
 use crate::io::plain_file::{PlainFile, reserve_space};
 use crate::io::plain_task::{PlainTask, TaskSignal, run_job};
-use crate::units::{ByteCount, Nanoseconds, ProcessId};
+use reel_api::units::{ByteCount, Nanoseconds, ProcessId};
 
 /// The backend that calls the operating system directly
 #[derive(Clone, Debug)]

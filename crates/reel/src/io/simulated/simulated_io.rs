@@ -12,7 +12,7 @@ use crate::io::lock_outcome::LockOutcome;
 use crate::io::simulated::simulated_disk::{InodeNumber, SimulatedDisk};
 use crate::io::simulated::simulated_file::SimulatedFile;
 use crate::io::simulated::simulated_task::{JobSlot, SimulatedTask};
-use crate::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
+use reel_api::units::{ByteCount, FileOffset, Nanoseconds, ProcessId};
 
 /// The clock moves this far on every read
 pub const CLOCK_TICK: Nanoseconds = Nanoseconds(1_000);

@@ -3,5 +3,8 @@ name = "reel-api"
 version.workspace = true
 edition.workspace = true
 
+[dependencies]
+thiserror.workspace = true
+
 [lints]
 workspace = true

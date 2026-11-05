@@ -15,3 +15,11 @@ pub struct Nanoseconds(pub u64);
 /// The operating system's id for a process
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProcessId(pub u32);
+
+/// A count of rows
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RowCount(pub u64);
+
+/// A count of segments
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SegmentCount(pub u64);

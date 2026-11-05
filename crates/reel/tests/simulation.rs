@@ -16,7 +16,7 @@ use reel::io::lock_outcome::LockOutcome;
 use reel::io::plain::PlainIo;
 use reel::io::simulated::simulated_io::SimulatedIo;
 use reel::io::{Io, IoFile, IoTask};
-use reel::units::{ByteCount, FileOffset, ProcessId};
+use reel_api::units::{ByteCount, FileOffset, ProcessId};
 
 const SEED: u64 = 7;
 const SIMULATED_ROOT: &str = "/disk/root";

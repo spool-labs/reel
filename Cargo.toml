@@ -8,6 +8,8 @@ edition = "2024"
 
 [workspace.dependencies]
 libc = "0.2"
+reel-api = { path = "crates/reel-api" }
+thiserror = "2"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

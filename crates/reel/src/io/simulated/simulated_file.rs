@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use crate::guard::hold;
 use crate::io::IoFile;
 use crate::io::simulated::simulated_disk::{InodeNumber, SimulatedDisk};
-use crate::units::{ByteCount, FileOffset, ProcessId};
+use reel_api::units::{ByteCount, FileOffset, ProcessId};
 
 /// A handle that only works for the process that opened it
 #[derive(Debug)]

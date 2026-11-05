@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 
 use crate::io::IoFile;
-use crate::units::{ByteCount, FileOffset};
+use reel_api::units::{ByteCount, FileOffset};
 
 /// A file reached through plain syscalls
 #[derive(Debug)]

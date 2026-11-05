@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::io::simulated::file_image::FileImage;
 use crate::io::simulated::seeded_random::SeededRandom;
-use crate::units::{ByteCount, FileOffset, ProcessId};
+use reel_api::units::{ByteCount, FileOffset, ProcessId};
 
 /// The disk size used under a path with no declared disk
 pub const UNBOUNDED_CAPACITY: ByteCount = ByteCount(1 << 50);

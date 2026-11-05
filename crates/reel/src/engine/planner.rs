@@ -52,6 +52,22 @@ impl<Backend: Io> Planner<Backend> {
         self.state.volumes.iter().any(|volume| volume.is_seal_stuck.load(Ordering::Acquire))
     }
 
+    /// Step a ready reclaim while the walks stand aside: it takes a few steps, and a hot write load needs what it frees most.
+    /// A seal wakes the planner as it ends and each one that adds to the walk's lag, and an index wait ends on the clock
+    pub fn reclaim_only(&mut self, now: Nanoseconds, is_index_wait: bool) -> JobStep {
+        let mut soonest = is_index_wait.then_some(Nanoseconds(now.0 + WRITER_YIELD.0));
+        for index in 0..self.compactions.len() {
+            let step = self.compactions[index].step_unit(now);
+            if self.note_step(index, step, &mut soonest) {
+                return JobStep::Worked;
+            }
+        }
+        match soonest {
+            Some(deadline) => JobStep::IdleUntil { deadline },
+            None => JobStep::Idle,
+        }
+    }
+
     /// Note what a unit's step found, and say whether it worked
     pub fn note_step(&mut self, index: usize, step: UnitStep, soonest: &mut Option<Nanoseconds>) -> bool {
         match step {
@@ -84,14 +100,9 @@ impl<Backend: Io> Job for Planner<Backend> {
     fn step(&mut self) -> JobStep {
         let now = self.state.io.now();
         let is_stuck = self.is_seal_stuck();
-        if !is_stuck && self.state.index_waiters.load(Ordering::Acquire) > 0 {
-            return JobStep::IdleUntil {
-                deadline: Nanoseconds(now.0 + WRITER_YIELD.0),
-            };
-        }
-        // a seal wakes the planner as it ends, and each one that adds to the walk's lag
-        if !is_stuck && self.is_seal_first() {
-            return JobStep::Idle;
+        let is_index_wait = !is_stuck && self.state.index_waiters.load(Ordering::Acquire) > 0;
+        if is_index_wait || (!is_stuck && self.is_seal_first()) {
+            return self.reclaim_only(now, is_index_wait);
         }
 
         let count = self.walks.len();

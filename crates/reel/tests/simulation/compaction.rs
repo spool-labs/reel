@@ -849,32 +849,6 @@ fn unlink_before_walk() {
     store.close().expect("close");
 }
 
-// a seal that needs a reclaim's room doesn't wait on a planner that stands aside for it
-#[test]
-fn stuck_seal_gets_its_reclaim() {
-    let io = SimulatedIo::new(Seed(37));
-    let store = open(&io);
-    hold_compaction(&store);
-    let state = &store.state;
-    let volume = &state.volumes[0];
-    let older = sealed_put(&store, &io, b"older");
-    sealed_put(&store, &io, b"newer");
-
-    release_compaction(&store);
-    state.index_waiters.fetch_add(1, Ordering::AcqRel);
-    state.ask_compaction();
-    run_steps(&io);
-    assert!(volume.table.holds(older));
-
-    volume.is_seal_stuck.store(true, Ordering::Release);
-    state.ask_compaction();
-    run_steps(&io);
-    assert!(!volume.table.holds(older));
-    state.index_waiters.fetch_sub(1, Ordering::AcqRel);
-    volume.is_seal_stuck.store(false, Ordering::Release);
-    store.close().expect("close");
-}
-
 // a replacement rot took away can't show itself, and the damaged range answers for it: the row is still dead
 #[test]
 fn rotted_replacement() {
@@ -962,5 +936,58 @@ fn old_damage_hides_nothing() {
     });
 
     job(&store).check_rows(volume, live).expect("check");
+    store.close().expect("close");
+}
+
+// a ready unlink goes through the yield a writer's index wait puts on the walks, when what it frees matters most
+#[test]
+fn unlink_through_yield() {
+    let io = SimulatedIo::new(Seed(37));
+    let store = open(&io);
+    hold_compaction(&store);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    let older = sealed_put(&store, &io, b"older");
+    sealed_put(&store, &io, b"newer");
+
+    io.hold_jobs("reel-planner", true);
+    store.put(COLUMN, b"later", b"value").expect("put");
+    store.seal_now();
+    settle(&io);
+    state.index_waiters.fetch_add(1, Ordering::AcqRel);
+    release_compaction(&store);
+    state.ask_compaction();
+    io.hold_jobs("reel-planner", false);
+    run_steps(&io);
+    assert!(!volume.table.holds(older));
+    assert_eq!(state.pending_walks(0), 1);
+    state.index_waiters.fetch_sub(1, Ordering::AcqRel);
+    settle(&io);
+    store.close().expect("close");
+}
+
+// a seal that needs a reclaim's room gets the walks too, which an index wait would otherwise hold back
+#[test]
+fn stuck_seal_gets_its_walks() {
+    let io = SimulatedIo::new(Seed(42));
+    let store = open(&io);
+    let state = &store.state;
+    let volume = &state.volumes[0];
+    io.hold_jobs("reel-planner", true);
+    store.put(COLUMN, b"key", b"value").expect("put");
+    store.seal_now();
+    settle(&io);
+    state.index_waiters.fetch_add(1, Ordering::AcqRel);
+    state.ask_compaction();
+    io.hold_jobs("reel-planner", false);
+    run_steps(&io);
+    assert_eq!(state.pending_walks(0), 1);
+
+    volume.is_seal_stuck.store(true, Ordering::Release);
+    state.ask_compaction();
+    run_steps(&io);
+    assert_eq!(state.pending_walks(0), 0);
+    state.index_waiters.fetch_sub(1, Ordering::AcqRel);
+    volume.is_seal_stuck.store(false, Ordering::Release);
     store.close().expect("close");
 }

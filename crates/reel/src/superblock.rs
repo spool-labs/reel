@@ -1,6 +1,6 @@
 //! One per root: the store's identity, its layout, the segment counter and the write order's limit
 
-use std::io::{Error, ErrorKind, IoSlice, Result};
+use std::io::{ErrorKind, IoSlice, Result};
 use std::path::{Path, PathBuf};
 
 use reel_api::column_id::ColumnId;
@@ -8,6 +8,7 @@ use reel_api::units::{ByteCount, FileOffset, WritePlace};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::{ColumnConfig, KeyShape};
+use crate::io::device_error::is_device_error;
 use crate::io::{Io, IoFile};
 use crate::record::record_check::RecordKey;
 use crate::segment::segment_tail::SegmentNumber;
@@ -18,6 +19,8 @@ pub const SUPERBLOCK_MAGIC: u32 = 0x5245_4C53;
 pub const SUPERBLOCK_NAME: &str = "superblock";
 /// The name a new superblock is written under before it replaces the old one
 pub const NEW_SUPERBLOCK_NAME: &str = "superblock.new";
+/// The second copy's file name
+pub const SECOND_SUPERBLOCK_NAME: &str = "superblock.second";
 /// The stored byte of a fixed key shape
 pub const FIXED_SHAPE: u8 = 0;
 /// The stored byte of a variable key shape
@@ -48,6 +51,7 @@ pub struct StoredVolume {
 pub struct SuperblockPaths {
     pub root: PathBuf,
     pub current: PathBuf,
+    pub second: PathBuf,
     pub new: PathBuf,
 }
 
@@ -62,6 +66,23 @@ pub struct Superblock {
     pub volumes: Vec<StoredVolume>,
     pub columns: Vec<StoredColumn>,
     pub dead_roots: Vec<String>,
+}
+
+/// What a read of one copy found
+#[derive(Debug)]
+pub enum CopyRead {
+    /// There's no such file
+    Absent,
+    /// The file is there and fails its check or can't be read
+    Failed,
+    /// The copy passes its check
+    Passed(Superblock),
+}
+
+/// A root's two copies as they read
+#[derive(Debug)]
+pub struct RootCopies {
+    pub copies: [CopyRead; 2],
 }
 
 /// Appends a superblock's fields to a buffer
@@ -82,6 +103,7 @@ impl SuperblockPaths {
         Self {
             root: root.to_path_buf(),
             current: root.join(SUPERBLOCK_NAME),
+            second: root.join(SECOND_SUPERBLOCK_NAME),
             new: root.join(NEW_SUPERBLOCK_NAME),
         }
     }
@@ -227,20 +249,27 @@ impl Superblock {
         })
     }
 
-    /// Read a root's superblock, or nothing when the root has none
+    /// Read a root's newest copy that passes its check, or nothing when none does
     pub fn read<Backend: Io>(io: &Backend, root: &Path) -> Result<Option<Self>> {
-        let file = match io.open_read_only(&root.join(SUPERBLOCK_NAME)) {
+        Ok(RootCopies::read(io, root)?.newest())
+    }
+
+    /// Read one copy, or nothing when it's absent, and say so when it's there and fails
+    pub fn read_copy<Backend: Io>(io: &Backend, path: &Path) -> Result<CopyRead> {
+        let file = match io.open_read_only(path) {
             Ok(file) => file,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(CopyRead::Absent),
             Err(error) => return Err(error),
         };
 
         let bytes = read_whole(&file);
         io.close_file(file);
-        match Self::from_bytes(&bytes?) {
-            Some(superblock) => Ok(Some(superblock)),
-            None => Err(Error::from(ErrorKind::InvalidData)),
-        }
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(error) if is_device_error(&error) => return Ok(CopyRead::Failed),
+            Err(error) => return Err(error),
+        };
+        Ok(Self::from_bytes(&bytes).map_or(CopyRead::Failed, CopyRead::Passed))
     }
 
     /// Replace a root's superblock so a crash leaves the old one or the new one whole
@@ -249,8 +278,15 @@ impl Superblock {
         Self::write_file(io, paths, bytes)
     }
 
-    /// Replace a root's superblock with bytes laid out already, which needs no lock on the superblock
+    /// Replace a root's two copies with bytes laid out already, which needs no lock on the superblock, the
+    /// second after the first is synced, so a crash leaves one whole
     pub fn write_file<Backend: Io>(io: &Backend, paths: &SuperblockPaths, bytes: &[u8]) -> Result<()> {
+        Self::write_copy(io, paths, &paths.current, bytes)?;
+        Self::write_copy(io, paths, &paths.second, bytes)
+    }
+
+    /// Replace one copy through the new file
+    pub fn write_copy<Backend: Io>(io: &Backend, paths: &SuperblockPaths, target: &Path, bytes: &[u8]) -> Result<()> {
         match io.remove_file(&paths.new) {
             Ok(()) => {},
             Err(error) if error.kind() == ErrorKind::NotFound => {},
@@ -262,7 +298,7 @@ impl Superblock {
         let synced = written.and_then(|()| file.sync());
         io.close_file(file);
         synced?;
-        io.rename_file(&paths.new, &paths.current)?;
+        io.rename_file(&paths.new, target)?;
         io.sync_directory(&paths.root)
     }
 }
@@ -273,6 +309,40 @@ pub fn read_whole<File: IoFile>(file: &File) -> Result<Vec<u8>> {
     let mut bytes = vec![0; length.0 as usize];
     file.read_exact_at(FileOffset(0), &mut bytes)?;
     Ok(bytes)
+}
+
+impl RootCopies {
+    /// Read both copies
+    pub fn read<Backend: Io>(io: &Backend, root: &Path) -> Result<Self> {
+        let paths = SuperblockPaths::new(root);
+        Ok(Self {
+            copies: [Superblock::read_copy(io, &paths.current)?, Superblock::read_copy(io, &paths.second)?],
+        })
+    }
+
+    /// Walk the copies that pass their check
+    pub fn passed(&self) -> impl Iterator<Item = &Superblock> {
+        self.copies.iter().filter_map(|copy| match copy {
+            CopyRead::Passed(superblock) => Some(superblock),
+            CopyRead::Absent | CopyRead::Failed => None,
+        })
+    }
+
+    /// Check any copy is there and fails
+    pub fn has_failed(&self) -> bool {
+        self.copies.iter().any(|copy| matches!(copy, CopyRead::Failed))
+    }
+
+    /// Take the newest copy that passes
+    pub fn newest(self) -> Option<Superblock> {
+        let [first, second] = self.copies;
+        match (first, second) {
+            (CopyRead::Passed(first), CopyRead::Passed(second)) if second.revision > first.revision => Some(second),
+            (CopyRead::Passed(first), _second) => Some(first),
+            (_first, CopyRead::Passed(second)) => Some(second),
+            (_first, _second) => None,
+        }
+    }
 }
 
 /// Build the stored form of a declared column

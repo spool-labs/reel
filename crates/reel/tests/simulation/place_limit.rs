@@ -8,13 +8,14 @@ use reel::engine::engine_state::PLACE_RUN;
 use reel::engine::reel_store::ReelStore;
 use reel::engine::reserve_job::RESERVE_PERIOD;
 use reel::io::Io;
+use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::Seed;
 use reel_sim::simulated_disk::OperationCount;
 use reel_sim::simulated_io::SimulatedIo;
 use reel::record::codec::Codec;
-use reel::superblock::{SUPERBLOCK_NAME, Superblock, SuperblockPaths};
+use reel::superblock::{CopyRead, Superblock, SuperblockPaths};
 use reel_api::column_id::ColumnId;
-use reel_api::units::{ByteCount, RowCount, VolumeId, WritePlace};
+use reel_api::units::{ByteCount, FileOffset, RowCount, VolumeId, WritePlace};
 
 const FIRST_ROOT: &str = "/disk/limit-one";
 const SECOND_ROOT: &str = "/disk/limit-two";
@@ -124,7 +125,9 @@ fn lost_root() {
     store.close().expect("close");
     drop(store);
     let saved = limit_of(&io, SECOND_ROOT);
-    io.remove_file(&Path::new(FIRST_ROOT).join(SUPERBLOCK_NAME)).expect("remove");
+    let paths = SuperblockPaths::new(Path::new(FIRST_ROOT));
+    io.remove_file(&paths.current).expect("remove");
+    io.remove_file(&paths.second).expect("remove");
 
     let store = open(&io);
 
@@ -271,4 +274,80 @@ fn replay_past() {
     store.get(COLUMN, KEY, &mut buf).expect("get");
     assert_eq!(buf, b"newer");
     store.close().expect("close");
+}
+
+fn rot_copy(io: &SimulatedIo, path: &Path) {
+    io.rot(path, FileOffset(40), BitMask(1)).expect("rot");
+}
+
+// one bad copy in a store with one copy left per root still opens
+#[test]
+fn bad_copy() {
+    let io = SimulatedIo::new(Seed(11));
+    let store = open(&io);
+    store.put(COLUMN, KEY, VALUE).expect("put");
+    store.close().expect("close");
+    drop(store);
+    for root in ROOTS {
+        rot_copy(&io, &SuperblockPaths::new(Path::new(root)).current);
+    }
+
+    let store = open(&io);
+
+    assert!(holds(&store, KEY));
+    store.close().expect("close");
+}
+
+// a root with both copies bad opens from another root, and gets both copies back
+#[test]
+fn bad_root() {
+    let io = SimulatedIo::new(Seed(12));
+    let store = open(&io);
+    store.close().expect("close");
+    drop(store);
+    let paths = SuperblockPaths::new(Path::new(FIRST_ROOT));
+    rot_copy(&io, &paths.current);
+    rot_copy(&io, &paths.second);
+
+    let store = open(&io);
+    store.close().expect("close");
+    drop(store);
+
+    assert!(matches!(Superblock::read_copy(&io, &paths.current), Ok(CopyRead::Passed(_))));
+    assert!(matches!(Superblock::read_copy(&io, &paths.second), Ok(CopyRead::Passed(_))));
+}
+
+// with every copy bad, nothing says what the store is, and open refuses
+#[test]
+fn no_copy() {
+    let io = SimulatedIo::new(Seed(13));
+    let store = open(&io);
+    store.close().expect("close");
+    drop(store);
+    for root in ROOTS {
+        let paths = SuperblockPaths::new(Path::new(root));
+        rot_copy(&io, &paths.current);
+        rot_copy(&io, &paths.second);
+    }
+
+    assert!(ReelStore::open(io.clone(), &config()).is_err());
+}
+
+// a crash at any step of writing the copies leaves a store that opens at or past every place it handed out
+#[test]
+fn copy_crash() {
+    for crash_at in 0..2 * CRASH_POINTS {
+        let io = SimulatedIo::new(Seed(200 + crash_at));
+        let store = open(&io);
+        store.put(COLUMN, KEY, VALUE).expect("put");
+        let mark = store.state.read_point();
+        io.arm_crash(OperationCount(crash_at));
+        let _is_held = store.state.reserve_ahead();
+        io.power_cut();
+        drop(store);
+
+        let store = open(&io);
+        assert!(store.state.read_point() >= mark, "crash at {crash_at}");
+        store.close().expect("close");
+    }
 }

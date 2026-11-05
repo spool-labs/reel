@@ -1,6 +1,6 @@
 //! A store: open, the calls consumers make, and close
 
-use std::io::Error;
+use std::io::{Error, ErrorKind};
 use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -48,7 +48,7 @@ use crate::segment::footer_reader::FooterReader;
 use crate::segment::row_block::ROW_BLOCK_BYTES;
 use crate::segment::segment_table::{SegmentTable, TABLE_SHARDS, TableSizing};
 use crate::segment::segment_tail::{MAX_COLUMNS, SegmentNumber};
-use crate::superblock::{StoreId, StoredColumn, StoredVolume, Superblock, SuperblockPaths, stored_column};
+use crate::superblock::{RootCopies, StoreId, StoredColumn, StoredVolume, Superblock, SuperblockPaths, stored_column};
 use crate::write_order::WriteOrder;
 
 /// The lock file in each root
@@ -438,13 +438,18 @@ pub fn lock_roots<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Vec
 pub fn settle_superblock<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Superblock, StoreError> {
     let mut newest: Option<Superblock> = None;
     let mut highest_limit = WritePlace(0);
+    let mut has_failed = false;
     for volume in &config.volumes {
         for root in &volume.roots {
-            let found = Superblock::read(io, root).map_err(open_error("reading a superblock"))?;
+            let copies = RootCopies::read(io, root).map_err(open_error("reading a superblock"))?;
+            has_failed |= copies.has_failed();
+            for copy in copies.passed() {
+                highest_limit = highest_limit.max(copy.place_limit);
+            }
+            let found = copies.newest();
             let Some(found) = found else {
                 continue;
             };
-            highest_limit = highest_limit.max(found.place_limit);
             let is_newer = match &newest {
                 Some(current) => {
                     if current.store_id != found.store_id {
@@ -461,6 +466,14 @@ pub fn settle_superblock<Backend: Io>(io: &Backend, config: &StoreConfig) -> Res
                 newest = Some(found);
             }
         }
+    }
+
+    // no copy anywhere that passes, with some that exist, is a lost store and never a new one
+    if newest.is_none() && has_failed {
+        return Err(StoreError::Io {
+            action: "reading a superblock",
+            source: Error::from(ErrorKind::InvalidData),
+        });
     }
 
     let mut superblock = match newest {

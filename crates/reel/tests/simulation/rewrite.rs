@@ -42,6 +42,7 @@ const OVER_THE_BOUND: u64 = MOST_OVERLAP as u64 + 8;
 const KEPT_LIVE_KEYS: u64 = 16;
 const MANY_GRAVES: u64 = 30_000;
 const SET_CRASH_STRIDE: u64 = 7;
+const IDLE_TICKS: u64 = 8;
 const TWO_BLOCK_ROWS: u64 = 12_000;
 const UNWALKED_CRASH_POINTS: u64 = 40;
 const UNWALKED_CRASH_STRIDE: u64 = 3;
@@ -108,6 +109,18 @@ fn dead_rows(store: &Store, number: SegmentNumber) -> u64 {
 
 fn newest_segment(store: &Store) -> SegmentNumber {
     hold(&store.state.volumes[0].summary).rows().map(|row| row.facts.segment).max().expect("a row")
+}
+
+// a pick looks at a few segments at a time, so a test that wants a merge goes on until the looks run out
+fn start_merge(job: &mut CompactJob<SimulatedIo>) -> bool {
+    loop {
+        if job.rewrite.start() {
+            return true;
+        }
+        if !job.rewrite.has_looks_left {
+            return false;
+        }
+    }
 }
 
 fn hold_compaction(store: &Store, is_held: bool) {
@@ -215,7 +228,7 @@ fn install_looks_again() {
     let state = &store.state;
     let volume = &state.volumes[0];
     let mut job = CompactJob::new(Arc::clone(state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     let number = job.rewrite.output.as_ref().expect("an output").number;
     while job.rewrite.phase != RewritePhase::Installing {
         job.rewrite.step();
@@ -244,7 +257,7 @@ fn walk_stands_aside() {
     let state = &store.state;
     let volume = &state.volumes[0];
     let mut job = CompactJob::new(Arc::clone(state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     store.put(COLUMN, b"e", b"value").expect("put");
     seal(&store, &io);
     assert_eq!(state.pending_walks(0), 1);
@@ -269,7 +282,7 @@ fn stopped() {
 
     let volume = &store.state.volumes[0];
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     job.rewrite.step();
     assert!(has_partial(&io));
     let output = job.rewrite.output.clone().expect("an output");
@@ -291,7 +304,7 @@ fn partial_goes_at_open() {
     hold_compaction(&store, true);
     half_dead(&store, &io);
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     job.rewrite.step();
     io.kill();
     drop(job);
@@ -454,7 +467,7 @@ fn open_removes_input() {
     let (older, _newer) = half_dead(&store, &io);
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     let number = job.rewrite.output.as_ref().expect("an output").number;
     while job.rewrite.phase != RewritePhase::Installing {
         job.rewrite.step();
@@ -660,7 +673,7 @@ fn deciding_copies_nothing() {
     let graves = seal(&store, &io);
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     assert_eq!(job.rewrite.phase, RewritePhase::Deciding);
     assert!(job.rewrite.output.is_none());
     while job.rewrite.is_running() {
@@ -685,7 +698,7 @@ fn ahead_of_waiting_walks() {
     assert_eq!(store.state.pending_walks(0), 1);
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     while job.rewrite.is_running() {
         job.rewrite.step();
     }
@@ -711,7 +724,7 @@ fn walk_target_holds_rewrite() {
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     assert!(!job.rewrite.start());
     store.state.volumes[0].has_walk_target.store(false, Ordering::Release);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     while job.rewrite.is_running() {
         job.rewrite.step();
     }
@@ -729,7 +742,7 @@ fn stray_output_holds_graves() {
     let state = &store.state;
     let volume = &state.volumes[0];
     let mut job = CompactJob::new(Arc::clone(state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     while job.rewrite.phase != RewritePhase::Installing {
         job.rewrite.step();
     }
@@ -743,7 +756,7 @@ fn stray_output_holds_graves() {
     assert!(!job.rewrite.start());
     job.rewrite.clear_stray();
     assert_eq!(volume.stray_outputs.load(Ordering::Acquire), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     store.close().expect("close");
 }
 
@@ -756,7 +769,7 @@ fn name_landed_before_the_failure() {
     half_dead(&store, &io);
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     let number = job.rewrite.output.as_ref().expect("an output").number;
     while job.rewrite.phase == RewritePhase::Copying {
         job.rewrite.step();
@@ -770,7 +783,7 @@ fn name_landed_before_the_failure() {
 }
 
 fn run_to_install(job: &mut CompactJob<SimulatedIo>) {
-    assert!(job.rewrite.start());
+    assert!(start_merge(job));
     while job.rewrite.phase != RewritePhase::Installing {
         job.rewrite.step();
     }
@@ -837,7 +850,7 @@ fn stray_keeps_a_grave() {
 
     let volume = &store.state.volumes[0];
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     volume.stray_outputs.store(1, Ordering::Release);
     while job.rewrite.phase != RewritePhase::Installing {
         job.rewrite.step();
@@ -858,7 +871,7 @@ fn damage_keeps_a_grave() {
 
     let volume = &store.state.volumes[0];
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     volume.damage.add(&DamagedRange {
         column: COLUMN,
         segment: SegmentNumber(0),
@@ -968,7 +981,7 @@ fn graves_get_their_own_output() {
     seal(&store, &io);
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     assert_eq!(job.rewrite.input_numbers()[0], middle);
     while job.rewrite.is_running() {
         job.rewrite.step();
@@ -1055,7 +1068,7 @@ fn grave_over_older(store: &Store, io: &SimulatedIo) {
 }
 
 fn run_to_both_outputs(job: &mut CompactJob<SimulatedIo>) {
-    assert!(job.rewrite.start());
+    assert!(start_merge(job));
     while job.rewrite.phase != RewritePhase::Installing {
         job.rewrite.step();
     }
@@ -1194,7 +1207,7 @@ fn overlap_needs_two() {
     assert!(job.rewrite.looked_up_to() > first_tried);
 
     *hold(&volume.parked) = [const { None }; MOST_PARKED];
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     assert!(job.rewrite.input_numbers().len() > 1);
     io.kill();
 }
@@ -1209,7 +1222,7 @@ fn park_wait_ends() {
 
     let volume = &store.state.volumes[0];
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     while job.rewrite.phase != RewritePhase::Installing {
         job.rewrite.step();
     }
@@ -1249,7 +1262,7 @@ fn graves_past_the_output() {
     let volume = &store.state.volumes[0];
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     job.rewrite.grave_writer = FooterWriter::new(BlockCount(2));
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     let inputs = job.rewrite.input_numbers().to_vec();
     let (mut has_full_writer, mut has_graves_in_data) = (false, false);
     while job.rewrite.is_running() {
@@ -1368,7 +1381,7 @@ fn no_mix_of_walked() {
 
     let volume = &store.state.volumes[0];
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     assert!(job.rewrite.is_unwalked_merge());
     assert!(!volume.is_rewriting.load(Ordering::Acquire));
     let rows = hold(&volume.summary);
@@ -1395,7 +1408,7 @@ fn walk_target_stays_out() {
     volume.walk_segment.store(target.0, Ordering::Release);
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     assert!(!job.rewrite.input_numbers().contains(&target));
     job.rewrite.abandon();
     volume.has_walk_target.store(false, Ordering::Release);
@@ -1413,7 +1426,7 @@ fn walk_skips_merge_inputs() {
     pile_up(&store, &io, OVER_THE_BOUND);
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     let inputs = job.rewrite.input_numbers().to_vec();
     let mut walk = WalkJob::new(Arc::clone(&store.state), 0);
     assert!(walk.pick_target());
@@ -1439,7 +1452,7 @@ fn unwalked_merge_keeps_graves() {
     pile_up(&store, &io, OVER_THE_BOUND);
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     while job.rewrite.is_running() {
         job.rewrite.step();
     }
@@ -1459,7 +1472,7 @@ fn rebuilt_output_walks_forward() {
     pile_up(&store, &io, OVER_THE_BOUND);
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     while job.rewrite.phase != RewritePhase::Installing {
         job.rewrite.step();
     }
@@ -1566,7 +1579,12 @@ fn merge_ahead_of_a_walk_target() {
     };
     assert!(planner.walks[0].pick_target());
     state.volumes[0].wants_compaction.store(true, Ordering::Release);
-    planner.step();
+    for _step in 0..OVER_THE_BOUND {
+        planner.step();
+        if planner.compactions[0].rewrite.is_unwalked_merge() {
+            break;
+        }
+    }
     assert!(planner.compactions[0].rewrite.is_unwalked_merge());
     planner.compactions[0].rewrite.abandon();
     state.volumes[0].has_walk_target.store(false, Ordering::Release);
@@ -1618,7 +1636,7 @@ fn full_segment_stays_out() {
     pile_up(&store, &io, OVER_THE_BOUND);
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     assert!(job.rewrite.is_unwalked_merge());
     assert_eq!(job.rewrite.input_numbers().len(), MOST_MERGE_SEGMENTS);
     assert!(!job.rewrite.input_numbers().contains(&full));
@@ -1626,7 +1644,7 @@ fn full_segment_stays_out() {
     store.close().expect("close");
 }
 
-// with only large segments near, a small one still pairs with one, and a large one that doesn't fit is passed over
+// with only large segments near, they merge whole, and the output's cut keeps each one under a segment's size
 #[test]
 fn large_merge_when_alone() {
     let io = SimulatedIo::new(Seed(62));
@@ -1644,16 +1662,16 @@ fn large_merge_when_alone() {
     let small = seal(&store, &io);
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
-    assert_eq!(job.rewrite.input_numbers().len(), 2);
+    assert!(start_merge(&mut job));
+    assert_eq!(job.rewrite.input_numbers().len(), MOST_MERGE_SEGMENTS);
     assert!(job.rewrite.input_numbers().contains(&small));
     job.rewrite.abandon();
     store.close().expect("close");
 }
 
-// a few small segments merge alone, with room left over that a large one could have taken
+// small segments go first, and whole segments fill what's left, since the output is cut to size
 #[test]
-fn small_ones_merge_alone() {
+fn whole_segments_fill_a_merge() {
     let io = SimulatedIo::new(Seed(63));
     let store = open(&io);
     hold_compaction(&store, true);
@@ -1672,10 +1690,11 @@ fn small_ones_merge_alone() {
     }
 
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     let mut inputs = job.rewrite.input_numbers().to_vec();
     inputs.sort_unstable();
-    assert_eq!(inputs, small);
+    assert!(small.iter().all(|segment| inputs.contains(segment)));
+    assert_eq!(inputs.len(), MOST_MERGE_SEGMENTS);
     job.rewrite.abandon();
     store.close().expect("close");
 }
@@ -1888,7 +1907,7 @@ fn check_set(store: &Store) {
 // run a merge up to its install, cutting at small sizes, with the outputs written so far
 fn run_to_set(job: &mut CompactJob<SimulatedIo>) -> usize {
     job.rewrite.cut_floor = 0;
-    assert!(job.rewrite.start());
+    assert!(start_merge(job));
     while job.rewrite.phase != RewritePhase::Installing {
         job.rewrite.step();
     }
@@ -1992,7 +2011,7 @@ fn cut_keeps_a_key_whole() {
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     job.rewrite.forced = Some(only);
     job.rewrite.cut_floor = 0;
-    assert!(job.rewrite.start());
+    assert!(start_merge(&mut job));
     while job.rewrite.is_running() {
         job.rewrite.step();
     }
@@ -2064,4 +2083,72 @@ fn set_crashes() {
         crash_at += SET_CRASH_STRIDE;
     }
     assert!(sets > 0);
+}
+
+// a quiet volume under the overlap bound, with nothing past the trigger, starts no merge
+#[test]
+fn idle_starts_no_merge() {
+    let io = SimulatedIo::new(Seed(75));
+    let store = open(&io);
+    for number in 0..MOST_OVERLAP as u64 / 2 {
+        store.put(COLUMN, format!("a-{number:03}").as_bytes(), b"low").expect("put");
+        store.put(COLUMN, format!("z-{number:03}").as_bytes(), b"high").expect("put");
+        seal(&store, &io);
+    }
+    for _tick in 0..IDLE_TICKS {
+        store.state.ask_compaction();
+        settle(&io);
+    }
+    assert_eq!(store.state.volumes[0].segments_rewritten.load(Ordering::Acquire), 0);
+    store.close().expect("close");
+}
+
+// disjoint narrow segments under one wide one are no crowd, whatever one segment's count of neighbours says
+#[test]
+fn narrow_neighbours_are_no_crowd() {
+    let io = SimulatedIo::new(Seed(76));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    for number in 0..OVER_THE_BOUND {
+        store.put(COLUMN, format!("k-{number:03}-a").as_bytes(), b"value").expect("put");
+        store.put(COLUMN, format!("k-{number:03}-b").as_bytes(), b"value").expect("put");
+        seal(&store, &io);
+    }
+    store.put(COLUMN, b"a", b"value").expect("put");
+    store.put(COLUMN, b"z", b"value").expect("put");
+    seal(&store, &io);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(!start_merge(&mut job));
+    store.close().expect("close");
+}
+
+// the segment that wins back the most for what it costs to read goes first, whatever its number
+#[test]
+fn most_won_back_goes_first() {
+    let io = SimulatedIo::new(Seed(77));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    for number in 0..20 {
+        store.put(COLUMN, format!("a-{number:02}").as_bytes(), b"value").expect("put");
+    }
+    let half = seal(&store, &io);
+    for number in 0..20 {
+        store.put(COLUMN, format!("b-{number:02}").as_bytes(), b"value").expect("put");
+    }
+    let most = seal(&store, &io);
+    for number in 0..10 {
+        store.put(COLUMN, format!("a-{number:02}").as_bytes(), b"newer").expect("put");
+    }
+    for number in 0..19 {
+        store.put(COLUMN, format!("b-{number:02}").as_bytes(), b"newer").expect("put");
+    }
+    seal(&store, &io);
+
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(start_merge(&mut job));
+    assert_eq!(job.rewrite.input_numbers()[0], most);
+    assert!(!job.rewrite.input_numbers().contains(&half));
+    job.rewrite.abandon();
+    store.close().expect("close");
 }

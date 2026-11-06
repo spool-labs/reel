@@ -118,7 +118,7 @@ impl<Backend: Io> CompactJob<Backend> {
     /// Check a merge beside the walk is running, or a seal or a reclaim has asked for a look at the overlap
     pub fn has_overlap_work(&self) -> bool {
         let volume = &self.state.volumes[self.volume];
-        self.rewrite.is_unwalked_merge() || volume.wants_compaction.load(Ordering::Acquire)
+        self.rewrite.is_unwalked_merge() || self.should_rewrite || volume.wants_compaction.load(Ordering::Acquire)
     }
 
     /// Step once: a parked file no read holds any more, then the candidate work
@@ -176,7 +176,12 @@ impl<Backend: Io> CompactJob<Backend> {
         let Some(segment) = candidate else {
             // an unlink wins back the most for the least, so a rewrite waits until none is left to try
             let should_rewrite = mem::take(&mut self.should_rewrite);
-            return if should_rewrite && self.rewrite.start() { UnitStep::Worked } else { UnitStep::Idle };
+            if should_rewrite && self.rewrite.start() {
+                return UnitStep::Worked;
+            }
+            // a look takes a few segments at a time, and the rest still count
+            self.should_rewrite = should_rewrite && self.rewrite.has_looks_left;
+            return if self.should_rewrite { UnitStep::Worked } else { UnitStep::Idle };
         };
         match self.confirm(volume, segment) {
             Ok(()) => UnitStep::Worked,

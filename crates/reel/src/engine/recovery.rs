@@ -953,6 +953,12 @@ pub fn recover_one<Backend: Io>(state: &Arc<EngineState<Backend>>, segment: &Sca
     }
 
     make_room(state, index, segment.scan.row_count)?;
+    // failed removes can leave more open segments than a store has slots, and a seal gives one back
+    if !state.has_free_slot() {
+        for other in 0..state.volumes.len() {
+            seal_every_open(state, other)?;
+        }
+    }
     if state.recover_open(volume, segment)? {
         return Ok(true);
     }

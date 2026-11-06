@@ -510,8 +510,10 @@ impl<Backend: Io> SealJob<Backend> {
         hold(&volume.claims).open.retain(|segment| segment.slot != target.slot);
 
         let root = &volume.roots[target.root.0 as usize];
-        let _is_gone = state.remove_or_park(volume, root, target.number);
-        state.io.remove_file(&rows_path(root, target.number))?;
+        // a data file left with no rows and no tail reads as damage, so the rows go only once it has
+        if state.remove_or_park(volume, root, target.number) {
+            state.io.remove_file(&rows_path(root, target.number))?;
+        }
         state.io.sync_directory(root)?;
         state.slot_files[target.slot.0 as usize].set(None);
         state.io.close_file(target.data.clone());

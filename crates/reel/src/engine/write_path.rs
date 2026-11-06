@@ -875,8 +875,10 @@ impl<Backend: Io> EngineState<Backend> {
         self.io.close_file(segment.rows);
         self.slot_files[segment.slot.0 as usize].set(None);
         self.free_slot(segment.slot);
-        let _is_gone = self.remove_or_park(volume, root, segment.number);
-        self.io.remove_file(&rows_path(root, segment.number))?;
+        // a data file left with no rows and no tail reads as damage, so the rows go only once it has
+        if self.remove_or_park(volume, root, segment.number) {
+            self.io.remove_file(&rows_path(root, segment.number))?;
+        }
         self.io.sync_directory(root)
     }
 
@@ -1003,8 +1005,9 @@ impl<Backend: Io> EngineState<Backend> {
         if let Err(source) = self.io.sync_directory(path) {
             self.io.close_file(data);
             self.io.close_file(rows);
-            let _is_gone = self.remove_or_park(volume, path, number);
-            let _removed = self.io.remove_file(&rows_file);
+            if self.remove_or_park(volume, path, number) {
+                let _removed = self.io.remove_file(&rows_file);
+            }
             return Err(store_error(volume, "syncing a root", source));
         }
 

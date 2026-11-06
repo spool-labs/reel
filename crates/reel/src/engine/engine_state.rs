@@ -287,6 +287,11 @@ impl<Backend: Io> EngineState<Backend> {
         hold(&self.free_slots).pop()
     }
 
+    /// Check a slot is free
+    pub fn has_free_slot(&self) -> bool {
+        !hold(&self.free_slots).is_empty()
+    }
+
     /// Give a slot back once nothing uses it
     pub fn free_slot(&self, slot: OpenSlot) {
         hold(&self.free_slots).push(slot);
@@ -314,6 +319,9 @@ impl<Backend: Io> EngineState<Backend> {
             Ok(()) => true,
             Err(error) => error.kind() == ErrorKind::NotFound,
         };
+        // the directory has to know before the rows go: a power cut could keep their removal and lose this one, and a data file
+        // with no rows and no tail reads as damage
+        let is_gone = is_gone && self.io.sync_directory(root).is_ok();
         if !is_gone {
             if !volume.can_park(1) {
                 volume.empties_left.fetch_add(1, Ordering::Relaxed);
@@ -346,7 +354,11 @@ impl<Backend: Io> EngineState<Backend> {
                     return Err(parked);
                 },
             }
-            // a file open held can still have its rows beside it
+            // a file open held can still have its rows beside it, and the rows go only once the data file's going is on disk
+            if self.io.sync_directory(root).is_err() {
+                volume.reclaim_retries.fetch_add(1, Ordering::Relaxed);
+                return Err(parked);
+            }
             match self.io.remove_file(&rows_path(root, parked.segment)) {
                 Ok(()) => {},
                 Err(error) if error.kind() == ErrorKind::NotFound => {},

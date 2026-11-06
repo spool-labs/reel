@@ -1817,3 +1817,19 @@ fn park_room_excuses_nothing() {
     assert_eq!(store.state.unlisted_segments(&store.state.volumes[0]).expect("list"), vec![PLANTED]);
     io.kill();
 }
+
+// a data file's removal has to reach the directory before its rows go: a power cut that kept only the rows' would leave a file
+// that reads as damage, so a sync that fails holds the file and its rows
+#[test]
+fn data_goes_before_its_rows() {
+    let io = SimulatedIo::new(Seed(69));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    plant(&io, PLANTED, &[]);
+
+    io.fail_directory_syncs(OperationCount(1));
+    assert!(!store.state.remove_or_park(volume, Path::new(ROOT), PLANTED));
+    assert_eq!(volume.segments_parked.load(Ordering::Acquire), 1);
+    io.kill();
+}

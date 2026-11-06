@@ -26,8 +26,8 @@ const BUDGET: ByteCount = ByteCount(76 * 1024 * 1024);
 // a test holds each seed with a traced bug: 0 `failed_open` and `failed_close`, 1 `rows_sync` and `tail_sync`, 37 and
 // 349 `covered_last` and `later_sync`, 125 `one_copy`, 681 `tail_then_cut`, 959 `flushed_unknown`, 1000 `open_covers`, 1002
 // `wrong_place`. Seeds 1 and 1000 are mapped from notes, with no replay. The rest are plain extra seeds
-const SEEDS: [u64; 9] = [0, 1, 2, 3, 17, 31, 37, 62, 681];
-const ROT_SEEDS: [u64; 9] = [125, 349, 959, 1_000, 1_001, 1_002, 1_003, 1_011, 1_031];
+const SEEDS: [u64; 10] = [0, 1, 2, 3, 17, 31, 37, 62, 681, 7_157];
+const ROT_SEEDS: [u64; 10] = [125, 349, 959, 1_000, 1_001, 1_002, 1_003, 1_011, 1_031, 10_745];
 const STEPS: u64 = 3_000;
 const KEY_SPACE: u64 = 30;
 const SETTLE_STEPS: u64 = 2_000_000;

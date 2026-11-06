@@ -25,7 +25,8 @@ pub struct Ration {
 }
 
 impl Ration {
-    /// Start a seal of this many rows, with the index holding some rows and able to take some more
+    /// Start a seal of this many rows, with the index holding some rows and able to take some more. Two volumes sealing at
+    /// once each count the same free room as theirs, so together they can admit past the index and fall back on its own wait
     pub fn start(&self, seal_rows: RowCount, held: RowCount, free: RowCount) {
         self.start_rows.store(held.0, Ordering::Relaxed);
         self.free_rows.store(free.0, Ordering::Relaxed);

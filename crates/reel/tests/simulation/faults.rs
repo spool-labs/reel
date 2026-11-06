@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::seed_sets::seeds;
-use reel::config::{DEFAULT_MAINTENANCE_WORKERS, ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
+use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
 use reel_sim::file_image::BitMask;
 use reel_sim::seeded_random::{Seed, SeededRandom};
@@ -34,7 +34,7 @@ const BUDGET: ByteCount = ByteCount(118 * 1024 * 1024);
 // 349 `covered_last` and `later_sync`, 125 `one_copy`, 681 `tail_then_cut`, 959 `flushed_unknown`, 1000 `open_covers`, 1002
 // `wrong_place`. Seeds 1 and 1000 are mapped from notes, with no replay. The rest are plain extra seeds
 const SEEDS: [u64; 10] = [0, 1, 2, 3, 17, 31, 37, 62, 681, 7_157];
-const WORKERS_BUDGET: ByteCount = ByteCount(136 * 1024 * 1024);
+const WORKERS_BUDGET: ByteCount = ByteCount(256 * 1024 * 1024);
 const WORKER_SEED_STRIDE: u64 = 9;
 const MARK_SEED_STRIDE: u64 = 11;
 const MARK_SPREAD: u64 = 16;
@@ -323,12 +323,13 @@ impl Run {
             if self.streams.open.one_in(4) {
                 self.arm_fault();
             }
-            let workers = if has_every_worker(self.seed) { DEFAULT_MAINTENANCE_WORKERS } else { (self.seed % WALK_WORKER_COUNTS) as usize };
             let mut config = config(self.policy, complete_rows_of(self.seed));
+            config.threads.maintenance_workers = Some((self.seed % WALK_WORKER_COUNTS) as usize);
+            // the default runs what fits, so these seeds open on any machine, and this budget holds four on the ones here
             if has_every_worker(self.seed) {
+                config.threads.maintenance_workers = None;
                 config.memory_budget = WORKERS_BUDGET;
             }
-            config.threads.maintenance_workers = Some(workers);
             let opened = ReelStore::open(self.io.clone(), &config);
             if self.io.is_crashed() {
                 self.crash();

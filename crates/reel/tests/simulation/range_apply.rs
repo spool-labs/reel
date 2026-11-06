@@ -557,6 +557,27 @@ fn rebuilt_cover_counts_once() {
     store.close().expect("close");
 }
 
+// a segment whose summary row went for room still holds a cover back, or the rows the cover hides there would come back
+#[test]
+fn row_gone_keeps_a_cover() {
+    let io = SimulatedIo::new(Seed(23));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let volume = &store.state.volumes[0];
+    put_keys(&store, "m", b"value");
+    let older = seal(&store, &io);
+    store.delete_range(COLUMN, b"m", b"n").expect("delete");
+    store.put(COLUMN, b"zz", b"value").expect("put");
+    seal(&store, &io);
+
+    hold(&volume.summary).remove(older);
+    hold_compaction(&store, false);
+    settle(&io);
+    assert_eq!(pending(&store), 1);
+    assert_eq!(read(&store, b"m-000"), None);
+    store.close().expect("close");
+}
+
 // a settled cover costs its segment no rewrite, and open leaves it out of the pool
 #[test]
 fn settled_cover_stays_put() {

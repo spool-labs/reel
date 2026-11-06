@@ -27,6 +27,7 @@ use crate::io::device_error::is_device_error;
 use crate::io::{Io, IoFile};
 use crate::pool::{touched_capacity, touched_zeroes};
 use crate::row_kind::RowKind;
+use crate::segment::block_entry::KeyBound;
 use crate::segment::range_covers::{Cover, MOST_RANGE_COVERS};
 use crate::segment::row_block::{ROW_BLOCK_BYTES, RowBlockWalk};
 use crate::segment::segment_table::RetiredSegment;
@@ -37,6 +38,8 @@ use crate::segment::summary::{DeadCount, SummaryRow};
 pub const MOST_SETTLE_LOOKS: usize = 16;
 /// Settled covers' rows that can wait for their segment's note
 pub const MOST_SETTLED_ROWS: usize = 1_024;
+/// Segments a look at a cover's list takes at a time
+pub const MOST_LISTED_LOOKS: usize = 64;
 /// How long compaction waits before it looks at a parked segment's pins again
 pub const PARKED_RETRY: Nanoseconds = Nanoseconds(1_000_000);
 
@@ -70,6 +73,7 @@ pub struct CompactJob<Backend: Io> {
     last_tried: SegmentNumber,
     settle_at: usize,
     settled_rows: Vec<DeadCount>,
+    listed: Vec<SegmentNumber>,
     block: Vec<u8>,
     key: Vec<u8>,
     row_key: Vec<u8>,
@@ -91,6 +95,7 @@ impl<Backend: Io> CompactJob<Backend> {
             last_tried: SegmentNumber(0),
             settle_at: 0,
             settled_rows: touched_capacity(MOST_SETTLED_ROWS, DeadCount::default()),
+            listed: touched_capacity(MOST_LISTED_LOOKS, SegmentNumber(0)),
             block: touched_zeroes(ROW_BLOCK_BYTES),
             key: touched_capacity(MAX_KEY_BYTES as usize, 0),
             row_key: touched_capacity(MAX_KEY_BYTES as usize, 0),
@@ -101,7 +106,7 @@ impl<Backend: Io> CompactJob<Backend> {
     /// Read the heap the job's buffers hold
     pub fn heap_bytes(&self) -> ByteCount {
         let buffers = self.block.capacity() + self.key.capacity() + self.row_key.capacity() + self.end.capacity();
-        let settled = self.settled_rows.capacity() * size_of::<DeadCount>();
+        let settled = self.settled_rows.capacity() * size_of::<DeadCount>() + self.listed.capacity() * size_of::<SegmentNumber>();
         ByteCount((buffers + settled) as u64 + self.rewrite.heap_bytes().0)
     }
 
@@ -409,12 +414,37 @@ impl<Backend: Io> CompactJob<Backend> {
             let next = rows.rows().filter(is_under).min_by_key(|row| row.facts.segment).map(|row| (row.facts.segment, row.facts.is_damaged));
             drop(rows);
             let Some((other, is_damaged)) = next else {
-                return Blocker::None;
+                return self.unrowed_blocker(volume, column, place, segment);
             };
             if is_damaged || self.has_row_under(volume, other, column, place) {
                 return Blocker::Segment(other);
             }
             last = other;
+        }
+    }
+
+    /// Find a listed segment with no summary row that holds a row under a cover. A row given up for room leaves the summary
+    /// blind to its segment, and the lists still have it
+    pub fn unrowed_blocker(&mut self, volume: &Volume<Backend>, column: ColumnId, place: WritePlace, segment: SegmentNumber) -> Blocker {
+        let state = Arc::clone(&self.state);
+        let Some(directory) = &state.directories[column.0 as usize] else {
+            return Blocker::None;
+        };
+        let (low, high) = (KeyBound::of_key(&self.key), KeyBound::of_key(&self.end));
+        let mut skip = 0;
+        loop {
+            let mut listed = mem::take(&mut self.listed);
+            let page = directory.overlapping(&low, &high, skip, &mut listed);
+            skip += listed.len();
+            let has_no_row = |other: &SegmentNumber| *other != segment && hold(&volume.summary).get(*other).is_none();
+            let found = listed.iter().copied().filter(has_no_row).find(|other| self.has_row_under(volume, *other, column, place));
+            self.listed = listed;
+            if let Some(other) = found {
+                return Blocker::Segment(other);
+            }
+            if !page.is_cut {
+                return Blocker::None;
+            }
         }
     }
 

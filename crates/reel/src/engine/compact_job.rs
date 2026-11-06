@@ -8,7 +8,7 @@
 use std::io::{Error, ErrorKind, Result};
 use std::mem;
 use std::slice;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
@@ -20,12 +20,12 @@ use crate::config::MAX_KEY_BYTES;
 use crate::engine::cover_apply::is_in_range;
 use crate::engine::engine_state::EngineState;
 use crate::engine::planner::UnitStep;
-use crate::engine::rewrite_job::RewriteJob;
+use crate::engine::rewrite_job::{RewriteJob, RewriteSeat};
 use crate::engine::volume::{ParkedSegment, Volume};
 use crate::engine::walk_job::{FREE_IN_PLACE_BYTES, FreeRecord, WALK_RETRY};
 use crate::guard::hold;
 use crate::io::device_error::is_device_error;
-use crate::io::{Io, IoFile};
+use crate::io::{Io, IoFile, IoTask};
 use crate::pool::{touched_capacity, touched_zeroes};
 use crate::row_kind::RowKind;
 use crate::segment::block_entry::KeyBound;
@@ -69,6 +69,9 @@ pub struct CompactJob<Backend: Io> {
     pub volume: usize,
     pub retry_at: Option<Nanoseconds>,
     pub rewrite: RewriteJob<Backend>,
+    /// One rewrite for each of the volume's workers
+    pub seats: Arc<Vec<RewriteSeat<Backend>>>,
+    handed_at: u64,
     held_pass: Option<HeldPass>,
     should_rewrite: bool,
     last_tried: SegmentNumber,
@@ -86,8 +89,13 @@ impl<Backend: Io> CompactJob<Backend> {
     pub fn new(state: Arc<EngineState<Backend>>, volume: usize) -> Self {
         // a mutex's first lock can allocate, and this one's could otherwise come in a close
         drop(hold(&state.volumes[volume].parked));
+        let workers = state.volumes[volume].walk_slots.len();
+        let seats: Vec<RewriteSeat<Backend>> =
+            (1..=workers).map(|lane| RewriteSeat { job: Mutex::new(RewriteJob::new(Arc::clone(&state), volume, lane)) }).collect();
         Self {
-            rewrite: RewriteJob::new(Arc::clone(&state), volume),
+            rewrite: RewriteJob::new(Arc::clone(&state), volume, 0),
+            seats: Arc::new(seats),
+            handed_at: 0,
             should_rewrite: false,
             held_pass: None,
             state,
@@ -108,7 +116,8 @@ impl<Backend: Io> CompactJob<Backend> {
     pub fn heap_bytes(&self) -> ByteCount {
         let buffers = self.block.capacity() + self.key.capacity() + self.row_key.capacity() + self.end.capacity();
         let settled = self.settled_rows.capacity() * size_of::<DeadCount>() + self.listed.capacity() * size_of::<SegmentNumber>();
-        ByteCount((buffers + settled) as u64 + self.rewrite.heap_bytes().0)
+        let seats: u64 = self.seats.iter().map(|seat| hold(&seat.job).heap_bytes().0).sum();
+        ByteCount((buffers + settled) as u64 + self.rewrite.heap_bytes().0 + seats)
     }
 
     /// Step once: try the next segment the counts call dead, or nothing when none is
@@ -170,6 +179,7 @@ impl<Backend: Io> CompactJob<Backend> {
                 Err(_) => UnitStep::RetryAt(Nanoseconds(now.0 + WALK_RETRY.0)),
             };
         }
+        self.hand_out(volume);
         if self.rewrite.is_running() {
             self.rewrite.step();
             return UnitStep::Worked;
@@ -203,6 +213,30 @@ impl<Backend: Io> CompactJob<Backend> {
                 self.retry_at = Some(at);
                 UnitStep::RetryAt(at)
             },
+        }
+    }
+
+    /// Start a rewrite on each idle worker, once something has changed that could give one a pick. The planner picks and the worker
+    /// runs, so more workers means more rewrites at once
+    pub fn hand_out(&mut self, volume: &Volume<Backend>) {
+        let left = volume.segments_rewritten.load(Ordering::Acquire) + volume.segments_unlinked.load(Ordering::Acquire);
+        let changes = left + volume.seals_done.load(Ordering::Acquire);
+        if self.seats.is_empty() || changes == self.handed_at {
+            return;
+        }
+        self.handed_at = changes;
+        for (index, seat) in self.seats.iter().enumerate() {
+            let mut job = hold(&seat.job);
+            if job.is_running() {
+                continue;
+            }
+            if !job.start() {
+                return;
+            }
+            drop(job);
+            if let Some(task) = volume.walk_slots[index].task.get() {
+                task.wake();
+            }
         }
     }
 

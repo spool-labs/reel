@@ -37,6 +37,7 @@ pub struct JobCounts {
 pub struct CueTable {
     slots: [AtomicU64; MOST_CUES],
     reclaims: AtomicU64,
+    cues_gone: AtomicU64,
     frees: AtomicU64,
     refused_reads: AtomicU64,
 }
@@ -47,6 +48,7 @@ impl CueTable {
         Self {
             slots: [const { AtomicU64::new(NO_CUE) }; MOST_CUES],
             reclaims: AtomicU64::new(0),
+            cues_gone: AtomicU64::new(0),
             frees: AtomicU64::new(0),
             refused_reads: AtomicU64::new(0),
         }
@@ -108,6 +110,16 @@ impl CueTable {
             reclaims: self.reclaims.load(Ordering::SeqCst),
             frees: self.frees.load(Ordering::SeqCst),
         }
+    }
+
+    /// Count a cue going, since a row or grave it held can go now
+    pub fn note_cue_gone(&self) {
+        self.cues_gone.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Read how many cues have gone
+    pub fn cues_gone(&self) -> u64 {
+        self.cues_gone.load(Ordering::Acquire)
     }
 
     /// Count a read that had to give up because jobs kept crossing it and the table had no slot for a pin
@@ -271,6 +283,7 @@ impl<Backend: Io> Cue<Backend> {
 impl<Backend: Io> Drop for Cue<Backend> {
     fn drop(&mut self) {
         self.state.cues.release(self.slot);
+        self.state.cues.note_cue_gone();
         // what this cue kept can go now, and nothing else would look again
         self.state.ask_compaction();
     }

@@ -43,7 +43,7 @@ use crate::engine::compact_job::{CompactJob, park};
 use crate::engine::cue::{Cue, CueTable};
 use crate::engine::planner::Planner;
 use crate::engine::walk_job::{BlockCounter, WalkJob, WalkSlot, WalkWorker};
-use crate::engine::volume::{ClaimState, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, SyncState, Volume};
+use crate::engine::volume::{ClaimState, GaveUp, MOST_MERGE_OUTPUTS, MOST_PARKED, NO_SEAL, RewriteLane, SyncState, Volume};
 use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::engine::complete_image::ImageFiles;
@@ -67,7 +67,7 @@ use crate::segment::footer_reader::FooterReader;
 use crate::segment::block_entry::BlockEntry;
 use crate::segment::row_block::{COMPLETE_BLOCK_BYTES, ROW_BLOCK_BYTES};
 use crate::segment::segment_table::{SegmentTable, TABLE_SHARDS, TableSizing};
-use crate::segment::segment_tail::{MAX_COLUMNS, MOST_MERGE_SEGMENTS, SegmentNumber};
+use crate::segment::segment_tail::{MAX_COLUMNS, SegmentNumber};
 use crate::superblock::{RootCopies, StoreId, StoredColumn, StoredVolume, Superblock, SuperblockPaths, stored_column};
 use crate::write_order::WriteOrder;
 
@@ -474,18 +474,20 @@ impl<Backend: Io> EngineState<Backend> {
             }
         }
         // a stopped rewrite leaves the store as it found it
-        let mut outputs = mem::take(&mut *hold(&volume.partial_outputs));
-        // the last data output lists the inputs, and if it stays on disk the next open needs the rest of its set
-        let last = outputs[..MOST_MERGE_OUTPUTS].iter().rposition(Option::is_some);
-        let mut is_set_gone = true;
-        if let Some(Err(output)) = last.and_then(|slot| outputs[slot].take()).map(|output| self.remove_output(volume, output)) {
-            is_set_gone = false;
-            self.io.close_file(output.file);
-        }
-        for output in outputs.into_iter().flatten() {
-            let left = if is_set_gone { self.remove_output(volume, output) } else { Err(output) };
-            if let Err(output) = left {
+        for lane in &volume.lanes {
+            let mut outputs = mem::take(&mut *hold(&lane.partial_outputs));
+            // the last data output lists the inputs, and if it stays on disk the next open needs the rest of its set
+            let last = outputs[..MOST_MERGE_OUTPUTS].iter().rposition(Option::is_some);
+            let mut is_set_gone = true;
+            if let Some(Err(output)) = last.and_then(|slot| outputs[slot].take()).map(|output| self.remove_output(volume, output)) {
+                is_set_gone = false;
                 self.io.close_file(output.file);
+            }
+            for output in outputs.into_iter().flatten() {
+                let left = if is_set_gone { self.remove_output(volume, output) } else { Err(output) };
+                if let Err(output) = left {
+                    self.io.close_file(output.file);
+                }
             }
         }
         let mut claims = hold(&volume.claims);
@@ -609,6 +611,7 @@ pub fn bring_up<Backend: Io>(
                 volume,
                 slot: index,
                 counter: BlockCounter::new(Arc::clone(state)),
+                seats: Arc::clone(&compactions[volume].seats),
             };
             state.seal_heap.fetch_add(worker.counter.heap_bytes().0 + slot.heap_bytes().0, Ordering::AcqRel);
             let task = state.io.spawn_job("reel-walk", worker).map_err(open_error("starting a job"))?;
@@ -1017,7 +1020,8 @@ pub fn build_state<Backend: Io>(
             is_compaction_held: AtomicBool::new(false),
             is_seal_stuck: AtomicBool::new(false),
             sealing: AtomicU64::new(NO_SEAL),
-            output_floor: AtomicU64::new(NO_SEAL),
+            lanes: (0..=sizing.walk_workers).map(|_lane| RewriteLane::new()).collect(),
+            gave_up: Mutex::new(GaveUp::new()),
             seal_point: AtomicU64::new(volume_rows(config, index, sizing.segment_rows).0),
             seal_rate: AtomicU64::new(0),
             ingest_rate: AtomicU64::new(0),
@@ -1031,16 +1035,13 @@ pub fn build_state<Backend: Io>(
             empties_left: AtomicU64::new(0),
             parked: Mutex::new([const { None }; MOST_PARKED]),
             segments_rewritten: AtomicU64::new(0),
-            is_rewriting: AtomicBool::new(false),
             stray_outputs: AtomicU64::new(0),
             reclaim_retries: AtomicU64::new(0),
             has_walk_target: AtomicBool::new(false),
             walk_segment: AtomicU64::new(NO_SEAL),
             is_walk_held: AtomicBool::new(false),
             is_applying: AtomicBool::new(false),
-            merging: Mutex::new([SegmentNumber(0); MOST_MERGE_SEGMENTS]),
             walks_held: AtomicU64::new(0),
-            partial_outputs: Mutex::new(Default::default()),
             reserve: ByteCount(sizing.segment_bytes.0 * 2),
             summary: Mutex::new(summary.rows),
             summary_paths: summary.paths,

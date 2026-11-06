@@ -9,7 +9,7 @@ use std::array;
 use std::iter;
 use std::io::{Error, ErrorKind, IoSlice, Result};
 use std::mem;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 
 use reel_api::column_id::ColumnId;
@@ -23,7 +23,7 @@ use crate::engine::engine_state::EngineState;
 use crate::engine::read_path::SealedRow;
 use crate::engine::open_segment::{data_path, output_path};
 use crate::engine::seal_job::MOST_SEGMENT_BLOCKS;
-use crate::engine::volume::{NO_SEAL, GRAVE_SLOT, MOST_MERGE_OUTPUTS, OutputSlots, RewriteOutput, Volume};
+use crate::engine::volume::{GRAVE_SLOT, GaveUp, MOST_MERGE_OUTPUTS, NO_SEAL, OutputSlots, RewriteOutput, Volume};
 use crate::engine::walk_job::add_count;
 use crate::guard::hold;
 use crate::io::{Io, IoFile};
@@ -193,6 +193,7 @@ impl Default for MergeInput {
 pub struct RewriteJob<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
     pub volume: usize,
+    lane: usize,
     pub target: Option<MergeTarget>,
     pub phase: RewritePhase,
     pub output: Option<RewriteOutput<Backend::File>>,
@@ -250,15 +251,16 @@ pub struct RewriteJob<Backend: Io> {
 
 impl<Backend: Io> RewriteJob<Backend> {
     /// Allocate the job's fixed buffers
-    pub fn new(state: Arc<EngineState<Backend>>, volume: usize) -> Self {
+    pub fn new(state: Arc<EngineState<Backend>>, volume: usize, lane: usize) -> Self {
         // a mutex's first lock can allocate, and this one's first real use could be in a close
-        drop(hold(&state.volumes[volume].partial_outputs));
-        drop(hold(&state.volumes[volume].merging));
+        drop(hold(&state.volumes[volume].lanes[lane].partial_outputs));
+        drop(hold(&state.volumes[volume].lanes[lane].merging));
         let keys = MAX_KEY_BYTES as usize;
         let cut_floor = state.volumes[volume].segment_bytes.0 / MOST_MERGE_OUTPUTS as u64;
         Self {
             state,
             volume,
+            lane,
             target: None,
             phase: RewritePhase::Copying,
             output: None,
@@ -360,7 +362,10 @@ impl<Backend: Io> RewriteJob<Backend> {
             return false;
         };
         self.clear(target);
-        volume.is_rewriting.store(!self.is_unwalked, Ordering::Release);
+        volume.lanes[self.lane].is_rewriting.store(!self.is_unwalked, Ordering::Release);
+        let mut inputs = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
+        inputs[..self.input_count].copy_from_slice(&self.numbers[..self.input_count]);
+        *hold(&volume.lanes[self.lane].inputs) = inputs;
         if is_grave_heavy {
             self.phase = RewritePhase::Deciding;
             return true;
@@ -395,8 +400,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         if let Some(row) = self.forced.take().and_then(|forced| rows.get(forced)).filter(|row| is_mergeable(volume, row)) {
             return Some((self.gather(volume, &rows, &row, 1, |_row| false), false));
         }
+        let gave_up = self.gave_up_list(volume);
         let is_ready = |row: &SummaryRow<'_>| {
-            row.facts.is_walked() && is_rewrite_ready(volume, row, 0) && is_rewrite_ready(volume, row, freed_in_place(volume, row))
+            row.facts.is_walked() && !gave_up.holds(row.facts.segment) && is_rewrite_ready(volume, row, 0) && is_rewrite_ready(volume, row, freed_in_place(volume, row))
         };
         let ready = rows.rows().filter(is_ready);
         // the most won back for the bytes read goes first, past the one last tried, so a merge that gave way lets the next one up
@@ -416,7 +422,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         let walking = volume.walk_segment.load(Ordering::Acquire);
         let can_merge = |row: &SummaryRow<'_>| {
             let segment = row.facts.segment.0;
-            is_overlap_input(row) && segment != sealing && segment != walking
+            is_overlap_input(row) && segment != sealing && segment != walking && !volume.is_taken(row.facts.segment)
         };
         let has_bound = |column: ColumnId| self.state.complete_table(column).is_none();
         let found = overlap_start(rows, &mut self.looked_up_to, can_merge, has_bound, &mut self.crowded_key);
@@ -439,7 +445,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         }
         self.is_unwalked = is_unwalked;
         if is_unwalked {
-            let mut merging = hold(&volume.merging);
+            let mut merging = hold(&volume.lanes[self.lane].merging);
             merging[..self.input_count].copy_from_slice(&self.numbers[..self.input_count]);
         }
         Some(target)
@@ -509,9 +515,9 @@ impl<Backend: Io> RewriteJob<Backend> {
         };
         let root = number.0 as usize % volume.roots.len();
         let file = self.state.io.create_file(&output_path(&volume.roots[root], number), length)?;
-        volume.output_floor.fetch_min(number.0, Ordering::AcqRel);
+        volume.lanes[self.lane].output_floor.fetch_min(number.0, Ordering::AcqRel);
         let output = RewriteOutput { file, root, number, is_named: false };
-        hold(&volume.partial_outputs)[slot] = Some(output.clone());
+        hold(&volume.lanes[self.lane].partial_outputs)[slot] = Some(output.clone());
         Ok(output)
     }
 
@@ -956,6 +962,7 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// End the deciding: copy from the first row if one would drop, and leave the segments alone if none would
     pub fn end_deciding(&mut self, target: MergeTarget) -> Result<()> {
         if self.dropped_rows == 0 {
+            self.note_gave_up();
             return Err(Error::from(ErrorKind::Interrupted));
         }
         let state = Arc::clone(&self.state);
@@ -969,6 +976,7 @@ impl<Backend: Io> RewriteJob<Backend> {
             return Err(Error::from(ErrorKind::NotFound));
         };
         if self.dropped_rows == 0 && self.input_count == 1 && !self.is_cutting && self.staged.is_empty() {
+            self.note_gave_up();
             return Err(Error::from(ErrorKind::Interrupted));
         }
         self.flush(&output.file)?;
@@ -1107,7 +1115,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         state.io.rename_file(&output_path(root, output.number), &data_path(root, output.number))?;
         // the name has landed from here, whatever the directory's sync says
         let named = RewriteOutput { is_named: true, ..output.clone() };
-        hold(&volume.partial_outputs)[slot] = Some(named.clone());
+        hold(&volume.lanes[self.lane].partial_outputs)[slot] = Some(named.clone());
         if slot == GRAVE_SLOT {
             self.grave_output = Some(named);
         } else {
@@ -1183,7 +1191,7 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.summarize(volume, inputs);
         let saved = state.save_summary(volume);
 
-        *hold(&volume.partial_outputs) = Default::default();
+        *hold(&volume.lanes[self.lane].partial_outputs) = Default::default();
         // a merge that kept no data never made its file a segment
         if let (None, Some(output)) = (self.totals, self.output.take()) {
             let mut slots: OutputSlots<Backend::File> = Default::default();
@@ -1193,9 +1201,10 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.output = None;
         self.grave_output = None;
         self.target = None;
-        volume.output_floor.store(NO_SEAL, Ordering::Release);
-        volume.is_rewriting.store(false, Ordering::Release);
-        *hold(&volume.merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
+        volume.lanes[self.lane].output_floor.store(NO_SEAL, Ordering::Release);
+        volume.lanes[self.lane].is_rewriting.store(false, Ordering::Release);
+        *hold(&volume.lanes[self.lane].merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
+        *hold(&volume.lanes[self.lane].inputs) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
         volume.segments_rewritten.fetch_add(1, Ordering::AcqRel);
         volume.wants_compaction.store(true, Ordering::Release);
         for (segment, retired) in inputs.iter().zip(retired) {
@@ -1293,13 +1302,23 @@ impl<Backend: Io> RewriteJob<Backend> {
     /// Try again to remove outputs a failure left behind
     pub fn clear_stray(&self) {
         let volume = &self.state.volumes[self.volume];
-        let slots = mem::take(&mut *hold(&volume.partial_outputs));
-        self.leave_outputs(volume, slots);
+        // a lane with no strays may be mid-rewrite, and its outputs are none of this
+        for (index, lane) in volume.lanes.iter().enumerate() {
+            if lane.strays.load(Ordering::Acquire) > 0 {
+                let slots = mem::take(&mut *hold(&lane.partial_outputs));
+                self.leave_lane_outputs(volume, index, slots);
+            }
+        }
     }
 
     /// Remove outputs, or keep them listed, as strays that hold every grave back until they're gone. The last data output goes
     /// first: its tail lists the inputs, so at a crash open removes them, and the rest of its set has to be there to take over
-    pub fn leave_outputs(&self, volume: &Volume<Backend>, mut outputs: OutputSlots<Backend::File>) {
+    pub fn leave_outputs(&self, volume: &Volume<Backend>, outputs: OutputSlots<Backend::File>) {
+        self.leave_lane_outputs(volume, self.lane, outputs);
+    }
+
+    /// Remove one lane's outputs, and note what a failed remove left there
+    pub fn leave_lane_outputs(&self, volume: &Volume<Backend>, lane: usize, mut outputs: OutputSlots<Backend::File>) {
         let last = outputs[..MOST_MERGE_OUTPUTS].iter().rposition(Option::is_some);
         let mut is_held = false;
         if let Some(slot) = last {
@@ -1312,15 +1331,40 @@ impl<Backend: Io> RewriteJob<Backend> {
             }
         }
         let strays = outputs.iter().flatten().count();
-        *hold(&volume.partial_outputs) = outputs;
-        volume.stray_outputs.store(strays as u64, Ordering::Release);
+        *hold(&volume.lanes[lane].partial_outputs) = outputs;
+        volume.lanes[lane].strays.store(strays as u64, Ordering::Release);
+        let total = volume.lanes.iter().map(|lane| lane.strays.load(Ordering::Acquire)).sum();
+        volume.stray_outputs.store(total, Ordering::Release);
+    }
+
+    /// Count what can free a row or a grave: a segment leaving, or a cue going
+    pub fn changes(&self, volume: &Volume<Backend>) -> u64 {
+        let left = volume.segments_rewritten.load(Ordering::Acquire) + volume.segments_unlinked.load(Ordering::Acquire);
+        left + self.state.cues.cues_gone()
+    }
+
+    /// Read the segments that gave up, as they stand since the last change
+    pub fn gave_up_list(&self, volume: &Volume<Backend>) -> GaveUp {
+        let mut gave_up = hold(&volume.gave_up);
+        gave_up.catch_up(self.changes(volume));
+        *gave_up
+    }
+
+    /// List this merge's inputs as having nothing to win until something changes
+    pub fn note_gave_up(&self) {
+        let volume = &self.state.volumes[self.volume];
+        let mut gave_up = hold(&volume.gave_up);
+        gave_up.catch_up(self.changes(volume));
+        for number in &self.numbers[..self.input_count] {
+            gave_up.add(*number);
+        }
     }
 
     /// Give the merge up: the inputs stay, and the outputs go whatever name they have reached
     pub fn abandon(&mut self) {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
-        let slots = mem::take(&mut *hold(&volume.partial_outputs));
+        let slots = mem::take(&mut *hold(&volume.lanes[self.lane].partial_outputs));
         // what the table holds waits for no read, since no list ever had it, and the removes below close the files
         for staged in &self.staged {
             if let Some(retired) = volume.table.retire(staged.facts.segment) {
@@ -1332,9 +1376,10 @@ impl<Backend: Io> RewriteJob<Backend> {
         self.grave_output = None;
         self.leave_outputs(volume, slots);
         self.target = None;
-        volume.output_floor.store(NO_SEAL, Ordering::Release);
-        volume.is_rewriting.store(false, Ordering::Release);
-        *hold(&volume.merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
+        volume.lanes[self.lane].output_floor.store(NO_SEAL, Ordering::Release);
+        volume.lanes[self.lane].is_rewriting.store(false, Ordering::Release);
+        *hold(&volume.lanes[self.lane].merging) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
+        *hold(&volume.lanes[self.lane].inputs) = [SegmentNumber(0); MOST_MERGE_SEGMENTS];
     }
 }
 
@@ -1391,7 +1436,7 @@ pub fn has_settled_covers<Backend: Io>(volume: &Volume<Backend>, row: &SummaryRo
 /// Check a segment can go into a merge at all. Damage and covers answer for more than their rows
 pub fn is_mergeable<Backend: Io>(volume: &Volume<Backend>, row: &SummaryRow<'_>) -> bool {
     let is_clear = !row.facts.has_covers || has_settled_covers(volume, row);
-    row.facts.is_walked() && !row.facts.is_damaged && is_clear && row.facts.block_count > 0
+    row.facts.is_walked() && !row.facts.is_damaged && is_clear && row.facts.block_count > 0 && !volume.is_taken(row.facts.segment)
 }
 
 /// Check a segment can go into an overlap merge: walked, or with no walk begun and a forward one owed. A half-walked segment's
@@ -1580,4 +1625,9 @@ pub fn lowest_inside<'row>(row: &SummaryRow<'row>, column: ColumnId, lowest: &[u
         }
     }
     None
+}
+
+/// A rewrite a worker runs. The planner starts one here and the worker steps it, and the lock only ever waits on one step
+pub struct RewriteSeat<Backend: Io> {
+    pub job: Mutex<RewriteJob<Backend>>,
 }

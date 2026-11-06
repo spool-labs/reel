@@ -246,7 +246,7 @@ fn install_looks_again() {
     assert!(!job.rewrite.is_running());
     assert!(!has_file(&io, number));
     assert!(volume.table.holds(older));
-    assert!(!volume.is_rewriting.load(Ordering::Acquire));
+    assert!(!volume.is_rewriting());
     state.cues.release(slot);
     check_reads(&store);
     store.close().expect("close");
@@ -292,7 +292,7 @@ fn stopped() {
     job.rewrite.step();
     assert!(has_partial(&io));
     let output = job.rewrite.output.clone().expect("an output");
-    assert!(volume.is_rewriting.load(Ordering::Acquire));
+    assert!(volume.is_rewriting());
     drop(job);
     store.close().expect("close");
 
@@ -1210,7 +1210,7 @@ fn overlap_needs_two() {
     let mut job = CompactJob::new(Arc::clone(state), 0);
     assert!(!job.rewrite.start());
     assert!(!job.rewrite.is_running());
-    assert!(!volume.is_rewriting.load(Ordering::Acquire));
+    assert!(!volume.is_rewriting());
     let first_tried = job.rewrite.looked_up_to();
     assert!(!job.rewrite.start());
     assert!(job.rewrite.looked_up_to() > first_tried);
@@ -1392,7 +1392,7 @@ fn no_mix_of_walked() {
     let mut job = CompactJob::new(Arc::clone(&store.state), 0);
     assert!(start_merge(&mut job));
     assert!(job.rewrite.is_unwalked_merge());
-    assert!(!volume.is_rewriting.load(Ordering::Acquire));
+    assert!(!volume.is_rewriting());
     let rows = hold(&volume.summary);
     for input in job.rewrite.input_numbers() {
         assert!(!rows.get(*input).expect("a row").facts.is_walked());
@@ -2202,5 +2202,71 @@ fn rows_alone_start_no_copy() {
 
     assert!(store.state.volumes[0].table.holds(older));
     assert_eq!(store.state.volumes[0].segments_rewritten.load(Ordering::Acquire), 0);
+    store.close().expect("close");
+}
+
+fn run_to_end(job: &mut CompactJob<SimulatedIo>) {
+    while job.rewrite.is_running() {
+        job.rewrite.step();
+    }
+}
+
+// a segment of graves that all hide a row gets one look, and no more until a segment leaves the volume
+#[test]
+fn hiding_graves_get_one_look() {
+    let io = SimulatedIo::new(Seed(79));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let value = vec![7; IDLE_VALUE_BYTES];
+    for number in 0..IDLE_KEYS {
+        store.put(COLUMN, format!("key-{number:04}").as_bytes(), &value).expect("put");
+    }
+    seal(&store, &io);
+    for number in 0..IDLE_KEYS / 4 {
+        store.delete(COLUMN, format!("key-{number:04}").as_bytes()).expect("delete");
+    }
+    let graves = seal(&store, &io);
+
+    let volume = &store.state.volumes[0];
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(start_merge(&mut job));
+    assert_eq!(job.rewrite.input_numbers(), &[graves]);
+    run_to_end(&mut job);
+    assert_eq!(volume.segments_rewritten.load(Ordering::Acquire), 0);
+    assert!(!job.rewrite.start(), "the graves would be read again");
+
+    volume.segments_unlinked.fetch_add(1, Ordering::AcqRel);
+    assert!(start_merge(&mut job));
+    job.rewrite.abandon();
+    store.close().expect("close");
+}
+
+// a segment a cue keeps whole writes no second output: the copy that found nothing to drop counts for as long as the cue lives
+#[test]
+fn cue_held_rows_copy_once() {
+    let io = SimulatedIo::new(Seed(80));
+    let store = open(&io);
+    hold_compaction(&store, true);
+    let value = vec![7; IDLE_VALUE_BYTES];
+    for number in 0..IDLE_KEYS {
+        store.put(COLUMN, format!("key-{number:04}").as_bytes(), &value).expect("put");
+    }
+    seal(&store, &io);
+    let cue = store.cue().expect("cue");
+    for number in 0..IDLE_KEYS {
+        store.put(COLUMN, format!("key-{number:04}").as_bytes(), b"newer").expect("put");
+    }
+    seal(&store, &io);
+
+    let volume = &store.state.volumes[0];
+    let mut job = CompactJob::new(Arc::clone(&store.state), 0);
+    assert!(start_merge(&mut job));
+    run_to_end(&mut job);
+    assert_eq!(volume.segments_rewritten.load(Ordering::Acquire), 0);
+    assert!(!job.rewrite.start(), "the copy would run again");
+
+    drop(cue);
+    assert!(start_merge(&mut job));
+    job.rewrite.abandon();
     store.close().expect("close");
 }

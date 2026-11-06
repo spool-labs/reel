@@ -155,7 +155,8 @@ impl StoreShape {
         let cover_fixed = (COVER_SLOT_BYTES + COVER_RECORD_BYTES) as u64 * MOST_RANGE_COVERS as u64;
         let covers = 2 * cover_keys + volumes * cover_fixed;
         let jobs = SEAL_JOB_BYTES + WALK_JOB_BYTES + COMPACT_JOB_BYTES;
-        ByteCount(queues + gathers + windows + reads + scans + read_slots + encoders + covers + volumes * (jobs + spans) + workers * WALK_JOB_BYTES + stacks)
+        let worker_jobs = workers * COMPACT_JOB_BYTES;
+        ByteCount(queues + gathers + windows + reads + scans + read_slots + encoders + covers + volumes * (jobs + spans) + worker_jobs + workers * WALK_JOB_BYTES + stacks)
     }
 
     /// Read the smallest budget this store can run in

@@ -237,7 +237,7 @@ pub fn has_walk_work<Backend: Io>(volume: &Volume<Backend>) -> bool {
 
 /// Check a volume has a merge under way or a file it can't yet give up
 pub fn has_reclaim_work<Backend: Io>(volume: &Volume<Backend>) -> bool {
-    volume.is_rewriting.load(Ordering::Acquire)
+    volume.is_rewriting()
         || volume.segments_parked.load(Ordering::Acquire) > 0
         || volume.stray_outputs.load(Ordering::Acquire) > 0
 }

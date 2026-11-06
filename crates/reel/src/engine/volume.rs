@@ -72,6 +72,88 @@ pub struct ClaimState<File> {
     pub next_root: usize,
 }
 
+/// Segments a rewrite gave up on with nothing to win, which a later pick skips. The oldest leaves when the list fills, for the
+/// cost of one more look
+pub const MOST_GAVE_UP: usize = 64;
+
+/// The segments that gave up since something last changed that could free a row or a grave
+#[derive(Clone, Copy, Debug)]
+pub struct GaveUp {
+    segments: [SegmentNumber; MOST_GAVE_UP],
+    next: usize,
+    changes: u64,
+}
+
+impl GaveUp {
+    /// Start with nothing listed
+    pub fn new() -> Self {
+        Self {
+            segments: [SegmentNumber(0); MOST_GAVE_UP],
+            next: 0,
+            changes: 0,
+        }
+    }
+
+    /// Empty the list when something has changed since it was filled
+    pub fn catch_up(&mut self, changes: u64) {
+        if self.changes != changes {
+            *self = Self { changes, ..Self::new() };
+        }
+    }
+
+    /// Add a segment, in place of the oldest when the list is full
+    pub fn add(&mut self, segment: SegmentNumber) {
+        self.segments[self.next] = segment;
+        self.next = (self.next + 1) % MOST_GAVE_UP;
+    }
+
+    /// Check a segment is listed
+    pub fn holds(&self, segment: SegmentNumber) -> bool {
+        self.segments.contains(&segment)
+    }
+}
+
+impl Default for GaveUp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What one running rewrite shares with the rest of the volume
+#[derive(Debug)]
+pub struct RewriteLane<File> {
+    pub is_rewriting: AtomicBool,
+    /// The lowest segment this rewrite is writing, or `NO_SEAL`
+    pub output_floor: AtomicU64,
+    /// The inputs of a merge running beside the walk, which the walk leaves alone
+    pub merging: Mutex<[SegmentNumber; MOST_MERGE_SEGMENTS]>,
+    /// Every input of the rewrite running here
+    pub inputs: Mutex<[SegmentNumber; MOST_MERGE_SEGMENTS]>,
+    pub partial_outputs: Mutex<OutputSlots<File>>,
+    /// Outputs a failed remove left here. A lane with any starts nothing until they go
+    pub strays: AtomicU64,
+}
+
+impl<File> RewriteLane<File> {
+    /// Start a lane with nothing running
+    pub fn new() -> Self {
+        Self {
+            is_rewriting: AtomicBool::new(false),
+            output_floor: AtomicU64::new(NO_SEAL),
+            merging: Mutex::new([SegmentNumber(0); MOST_MERGE_SEGMENTS]),
+            inputs: Mutex::new([SegmentNumber(0); MOST_MERGE_SEGMENTS]),
+            partial_outputs: Mutex::new(Default::default()),
+            strays: AtomicU64::new(0),
+        }
+    }
+}
+
+impl<File> Default for RewriteLane<File> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// One volume of a store
 pub struct Volume<Backend: Io> {
     pub id: VolumeId,
@@ -114,33 +196,29 @@ pub struct Volume<Backend: Io> {
     pub segments_rewritten: AtomicU64,
     /// A rewrite has made its first row decision and not installed. Rows it decided on must stay as they were, so no walk
     /// starts a target
-    pub is_rewriting: AtomicBool,
     /// A named output a failed rewrite could not remove is still on disk
     pub stray_outputs: AtomicU64,
     /// Counts the times a file that has to go would not, which a volume stuck that way shows here
     pub reclaim_retries: AtomicU64,
     /// The walk is part way through a segment
     pub has_walk_target: AtomicBool,
+    pub gave_up: Mutex<GaveUp>,
+    /// One lane for each rewrite that can run at once: the planner's, then a worker's each
+    pub lanes: Vec<RewriteLane<Backend::File>>,
     /// Rows the open segments reach before a seal starts, from the measured rates and set as each seal ends
     pub seal_point: AtomicU64,
     /// Rows a second the last seal ran at, or 0 before one has finished
     pub seal_rate: AtomicU64,
     /// Rows a second the volume took between the last two seals, or 0 before there are two
     pub ingest_rate: AtomicU64,
-    /// The lowest segment a rewrite is writing, or `NO_SEAL`. A slot at or above it can point at a segment the table has yet to take. One value
-    /// serves one rewrite at a time: when rewrites run on several workers, each needs its own, or one ending uncovers the others
-    pub output_floor: AtomicU64,
     /// The segment the walk has as its target, or `NO_SEAL`
     pub walk_segment: AtomicU64,
     /// A test holds the walk here to leave segments unwalked
     pub is_walk_held: AtomicBool,
     /// A walk is counting what its covers hide, and a row that left now would make an older one look live
     pub is_applying: AtomicBool,
-    /// The inputs of a merge running beside the walk, which the walk leaves alone
-    pub merging: Mutex<[SegmentNumber; MOST_MERGE_SEGMENTS]>,
     /// Counts the turns a walk stood aside for a rewrite
     pub walks_held: AtomicU64,
-    pub partial_outputs: Mutex<OutputSlots<Backend::File>>,
     pub summary: Mutex<SummaryRows>,
     pub summary_paths: SummaryPaths,
     pub lost_rows: Mutex<LostRows>,
@@ -206,7 +284,23 @@ impl<Backend: Io> Volume<Backend> {
 
     /// Check a merge running beside the walk has taken a segment
     pub fn is_merging(&self, segment: SegmentNumber) -> bool {
-        hold(&self.merging).contains(&segment)
+        self.lanes.iter().any(|lane| hold(&lane.merging).contains(&segment))
+    }
+
+    /// Check a running rewrite has taken a segment as an input, so no other lane picks it
+    pub fn is_taken(&self, segment: SegmentNumber) -> bool {
+        self.lanes.iter().any(|lane| hold(&lane.inputs).contains(&segment))
+    }
+
+    /// Check a rewrite sits between its first row decision and its install
+    pub fn is_rewriting(&self) -> bool {
+        self.lanes.iter().any(|lane| lane.is_rewriting.load(Ordering::Acquire))
+    }
+
+    /// Read the lowest segment any rewrite is writing, or `NO_SEAL`. A slot at or above it can point at a segment the table has
+    /// yet to take
+    pub fn output_floor(&self) -> u64 {
+        self.lanes.iter().map(|lane| lane.output_floor.load(Ordering::Acquire)).min().unwrap_or(NO_SEAL)
     }
 
     /// Check no read holds a parked segment any more

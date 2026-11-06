@@ -22,6 +22,7 @@ use crate::config::MAX_KEY_BYTES;
 use crate::engine::cover_apply::{ApplyStep, CoverApply};
 use crate::engine::engine_state::EngineState;
 use crate::engine::planner::UnitStep;
+use crate::engine::rewrite_job::RewriteSeat;
 use crate::engine::volume::{NO_SEAL, Volume};
 use crate::guard::hold;
 use crate::io::device_error::is_device_error;
@@ -197,12 +198,13 @@ pub struct WalkJob<Backend: Io> {
     pub apply: CoverApply<Backend>,
 }
 
-/// A worker that counts the blocks the planner hands it
+/// A worker that counts the blocks and runs the rewrites the planner hands it
 pub struct WalkWorker<Backend: Io> {
     pub state: Arc<EngineState<Backend>>,
     pub volume: usize,
     pub slot: usize,
     pub counter: BlockCounter<Backend>,
+    pub seats: Arc<Vec<RewriteSeat<Backend>>>,
 }
 
 impl<Backend: Io> BlockCounter<Backend> {
@@ -637,7 +639,7 @@ impl<Backend: Io> WalkJob<Backend> {
         if self.target.is_none() && volume.is_walk_held.load(Ordering::Acquire) {
             return UnitStep::Idle;
         }
-        if self.target.is_none() && volume.is_rewriting.load(Ordering::Acquire) {
+        if self.target.is_none() && volume.is_rewriting() {
             volume.walks_held.fetch_add(1, Ordering::Relaxed);
             return UnitStep::Idle;
         }
@@ -665,13 +667,30 @@ pub fn assign<Task: IoTask>(slot: &WalkSlot<Task>) {
     }
 }
 
+impl<Backend: Io> WalkWorker<Backend> {
+    /// Run one step of this worker's rewrite, and bring the planner back when it ends, for the next pick
+    pub fn step_rewrite(&mut self) -> JobStep {
+        let mut job = hold(&self.seats[self.slot].job);
+        if !job.is_running() {
+            return JobStep::Idle;
+        }
+        job.step();
+        if !job.is_running()
+            && let Some(task) = self.state.planner_task.get()
+        {
+            task.wake();
+        }
+        JobStep::Worked
+    }
+}
+
 impl<Backend: Io> Job for WalkWorker<Backend> {
     fn step(&mut self) -> JobStep {
         let state = Arc::clone(&self.state);
         let volume = &state.volumes[self.volume];
         let slot = &volume.walk_slots[self.slot];
         if slot.phase.load(Ordering::Acquire) != SLOT_ASSIGNED {
-            return JobStep::Idle;
+            return self.step_rewrite();
         }
 
         let mut work = hold(&slot.work);

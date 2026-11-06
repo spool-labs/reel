@@ -1,6 +1,7 @@
 //! The caller's thread counts: any count gives the same store, and a count the budget can't hold is refused at open
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 use reel::config::{ColumnConfig, KeyShape, StoreConfig, SyncPolicy, ThreadCounts, VolumeConfig};
 use reel::engine::reel_store::ReelStore;
@@ -111,5 +112,31 @@ fn read_threads_follow_the_count() {
     let threads = ThreadCounts { read_threads: 2, ..ThreadCounts::default() };
     let store: Store = ReelStore::open(io, &config(threads)).expect("open");
     assert_eq!(store.state.read_tasks.len(), 2);
+    store.close().expect("close");
+}
+
+// a worker runs a rewrite the planner hands it, and the store reads the same through it
+#[test]
+fn workers_run_rewrites() {
+    let io = SimulatedIo::new(Seed(5));
+    let threads = ThreadCounts { maintenance_workers: 2, ..ThreadCounts::default() };
+    let store: Store = ReelStore::open(io.clone(), &config(threads)).expect("open");
+    for round in 0..ROUNDS {
+        for number in 0..KEYS {
+            store.put(COLUMN, format!("key-{number:04}").as_bytes(), format!("value-{round}").as_bytes()).expect("put");
+            store.put(COLUMN, format!("stays-{round}-{number:04}").as_bytes(), b"value").expect("put");
+        }
+        store.seal_now();
+        settle(&io);
+    }
+    let volume = &store.state.volumes[0];
+    let worked = volume.lanes.len();
+    assert_eq!(worked, 3);
+    assert!(volume.segments_rewritten.load(Ordering::Acquire) > 0);
+    for number in 0..KEYS {
+        let mut value = Vec::new();
+        assert!(store.get(COLUMN, format!("key-{number:04}").as_bytes(), &mut value).expect("get"));
+        assert_eq!(value, format!("value-{}", ROUNDS - 1).into_bytes());
+    }
     store.close().expect("close");
 }

@@ -589,7 +589,6 @@ impl<Backend: Io> EngineState<Backend> {
     pub fn unlisted_segments(&self, volume: &Volume<Backend>) -> Result<Vec<SegmentNumber>> {
         let claims = hold(&volume.claims);
         let parked = hold(&volume.parked);
-        let outputs = hold(&volume.partial_outputs);
         let damaged = hold(&volume.damaged);
         let mut unlisted = Vec::new();
         for root in &volume.roots {
@@ -601,7 +600,7 @@ impl<Backend: Io> EngineState<Backend> {
                     || claims.open.iter().any(|segment| segment.number == number)
                     || claims.prepared.as_ref().is_some_and(|segment| segment.number == number)
                     || parked.iter().flatten().any(|parked| parked.segment == number)
-                    || outputs.iter().flatten().any(|output| output.number == number)
+                    || volume.lanes.iter().any(|lane| hold(&lane.partial_outputs).iter().flatten().any(|output| output.number == number))
                     || damaged.contains(&number);
                 if !is_held && !self.is_empty_past_the_park(&path, parked.iter().flatten().count())? {
                     unlisted.push(number);

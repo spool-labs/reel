@@ -166,7 +166,7 @@ impl<Backend: Io> EngineState<Backend> {
     /// Check a slot's segment has left the volume. A seal's own segment enters the table only when it finishes
     pub fn is_slot_gone(&self, volume: &Volume<Backend>, segment: u32) -> bool {
         let number = SegmentNumber(u64::from(segment));
-        number.0 != volume.sealing.load(Ordering::Acquire) && number.0 < volume.output_floor.load(Ordering::Acquire) && volume.table.pin(number).is_none()
+        number.0 != volume.sealing.load(Ordering::Acquire) && number.0 < volume.output_floor() && volume.table.pin(number).is_none()
     }
 
     /// Fill every complete table: from its saved image where one stands, then from the row blocks of every segment the image

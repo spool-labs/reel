@@ -64,8 +64,8 @@ pub const SHARED_JOBS: u64 = 3;
 /// Bytes a row of the write index really takes, node, page and table share included, with a long batch's length of it
 pub const PLANNED_ROW_BYTES: u64 = 227;
 /// A volume seals at this share of what the index holds, in eighths, to keep room for writers in flight. With one
-/// lz4 column and 64 B keys that gives these rows a segment: 38,185 at 128 MiB, 130,570 at 192 MiB, 592,498 at 512 MiB and
-/// 5,766,089 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
+/// lz4 column and 64 B keys that gives these rows a segment: 37,011 at 128 MiB, 129,397 at 192 MiB, 591,325 at 512 MiB and
+/// 5,764,916 at 4 GiB. A segment seals at its byte target or at this limit, whichever comes first, so small
 /// records seal smaller and reach their size through merges, whose outputs the write index doesn't bound
 /// A volume holds its open segment and one spare at full size even when its sealed data is small: the reserve is twice the
 /// segment size, 128 MiB at a 128 MiB budget, 192 MiB at 192 MiB, and 2 GiB from the default 512 MiB up. The space gate adds

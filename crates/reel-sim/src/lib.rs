@@ -6,4 +6,5 @@ pub mod seeded_random;
 pub mod simulated_disk;
 pub mod simulated_file;
 pub mod simulated_io;
+pub mod simulated_ring;
 pub mod simulated_task;

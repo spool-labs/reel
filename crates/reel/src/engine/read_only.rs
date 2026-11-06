@@ -46,7 +46,7 @@ pub fn load_read_only<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result
 /// Build a view from one listing
 pub fn try_load<Backend: Io>(io: &Backend, config: &StoreConfig) -> Result<Arc<EngineState<Backend>>, StoreError> {
     let superblock = read_superblock(io, config)?;
-    let sizing = store_sizing(config)?;
+    let sizing = store_sizing(config, false)?;
     let roots: Vec<_> = config.volumes.iter().enumerate().map(|(index, volume)| (index, volume.roots.clone())).collect();
     let listings = list_roots(io, &roots).map_err(open_error("listing a root"))?;
     let mode = OpenMode::ReadOnly;

@@ -26,6 +26,7 @@ use crate::engine::engine_sizing::{
 use crate::engine::engine_state::{EngineState, PLACE_RUN, SEGMENT_NUMBER_BATCH, SlotFile};
 use crate::engine::open_segment::{RECORD_WINDOW_BYTES, RecordWindow, RowQueue, fits_a_segment_path};
 use crate::engine::ration::Ration;
+use crate::engine::ring_job::RingReaper;
 use crate::engine::read_only::{close_read_only, load_read_only};
 use crate::engine::read_path::RecordWant;
 use crate::engine::read_pool::{ReadPool, ReadWorker};
@@ -94,7 +95,8 @@ impl<Backend: Io> ReelStore<Backend> {
         let locks = lock_roots(&io, config)?;
         let superblock = settle_superblock(&io, config)?;
 
-        let sizing = store_sizing(config)?;
+        let ring = io.open_ring().map_err(open_error("opening a ring"))?;
+        let sizing = store_sizing(config, ring.is_some())?;
 
         // every root is listed before any tail is read, and the table is sized from what they hold
         let mut roots = Vec::with_capacity(config.volumes.len());
@@ -115,6 +117,7 @@ impl<Backend: Io> ReelStore<Backend> {
         let mut state = build_state(io, config, &sizing, superblock, locks, &scan, summaries);
         state.complete = complete_tables(config);
         state.complete_images = complete_images(config);
+        state.attach_ring(ring);
         let state = Arc::new(state);
         if let Err(error) = bring_up(&state, &mut scan) {
             // a caller can retry, so a failed open leaves no handle behind
@@ -456,6 +459,10 @@ impl<Backend: Io> EngineState<Backend> {
             }
         }
         self.read_pool.refuse_queued();
+        self.drain_ring();
+        if let Some(task) = self.ring_task.get() {
+            task.stop()?;
+        }
         if let Some(task) = self.reserve_task.get() {
             task.stop()?;
         }
@@ -655,6 +662,11 @@ pub fn bring_up<Backend: Io>(
         let task = state.io.spawn_job("reel-read", worker).map_err(open_error("starting a job"))?;
         let _set = cell.set(task);
     }
+    if state.ring.is_some() {
+        let reaper = RingReaper { state: Arc::clone(state) };
+        let task = state.io.spawn_job("reel-ring", reaper).map_err(open_error("starting a job"))?;
+        let _set = state.ring_task.set(task);
+    }
     state.job_count.store(SHARED_JOBS + state.read_tasks.len() as u64 + state.volumes.len() as u64 + workers, Ordering::Release);
     state.note_graves_at_open();
     Ok(())
@@ -662,7 +674,7 @@ pub fn bring_up<Backend: Io>(
 
 /// Refuse a config that can't work
 /// Work out what a store's budget buys, or refuse one too small
-pub fn store_sizing(config: &StoreConfig) -> Result<EngineSizing, StoreError> {
+pub fn store_sizing(config: &StoreConfig, has_ring: bool) -> Result<EngineSizing, StoreError> {
     let root_count = config.volumes.iter().map(|volume| volume.roots.len()).sum();
     let shape = StoreShape {
         budget: config.memory_budget,
@@ -671,6 +683,7 @@ pub fn store_sizing(config: &StoreConfig) -> Result<EngineSizing, StoreError> {
         has_lz4: config.columns.iter().any(|column| column.codec == Codec::Lz4),
         widest_keys: (0..config.volumes.len()).map(|volume| config.widest_key(volume) as u64).sum(),
         threads: config.threads,
+        has_ring,
     };
     let shape = shape.with_workers_settled();
     let least_shape = StoreShape { threads: NO_WORKERS, ..shape };
@@ -1188,6 +1201,10 @@ pub fn build_state<Backend: Io>(
         reserve_task: OnceLock::new(),
         read_tasks: (0..config.threads.read_threads).map(|_worker| OnceLock::new()).collect(),
         read_pool: ReadPool::new(scans, config.threads.read_threads),
+        ring: None,
+        ring_task: OnceLock::new(),
+        ring_record_readers: Pool::new(Vec::new()),
+        ring_footer_readers: Pool::new(Vec::new()),
         is_read_only: false,
         complete: Vec::new(),
         complete_images: Vec::new(),

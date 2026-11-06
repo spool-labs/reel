@@ -23,6 +23,7 @@ pub mod recovery;
 pub mod reel_store;
 pub mod reserve_job;
 pub mod rewrite_job;
+pub mod ring_job;
 pub mod row_job;
 pub mod scan_path;
 pub mod scan_state;

@@ -6,6 +6,9 @@ pub mod lock_outcome;
 pub mod plain;
 pub mod plain_file;
 pub mod plain_task;
+pub mod ring;
+#[cfg(target_os = "linux")]
+pub mod uring;
 
 use std::future::{Future, ready};
 use std::io::{IoSlice, IoSliceMut, Result};
@@ -17,6 +20,7 @@ use reel_api::units::{ByteCount, FileOffset, Nanoseconds};
 
 use crate::io::job::Job;
 use crate::io::lock_outcome::LockOutcome;
+use crate::io::ring::RingDriver;
 
 /// One open file, whose handles clone with no allocation
 pub trait IoFile: Clone + Send + Sync {
@@ -55,6 +59,11 @@ pub trait DeviceReads<File>: Sync {
 
     /// Fill every part from the offset
     fn read_parts(&self, file: &File, offset: FileOffset, parts: &mut [IoSliceMut<'_>]) -> impl Future<Output = Result<()>> + Send;
+
+    /// Say whether a read can sit waiting with buffers in hand, so it needs buffers no blocking read waits for
+    fn holds_across_waits(&self) -> bool {
+        false
+    }
 }
 
 /// Reads that block the calling thread, so every one is done by its first poll
@@ -97,8 +106,13 @@ pub trait Io: Clone + Send + Sync + 'static {
     type File: IoFile;
     /// A held lock, released when dropped
     type Lock: Send + Sync;
+    /// A completion queue for async reads
+    type Ring: RingDriver<Self::File>;
     /// A running job
     type Task: IoTask;
+
+    /// Open the ring async reads complete through, or nothing where they run on the blocking pool
+    fn open_ring(&self) -> Result<Option<Self::Ring>>;
 
     /// Create a new file with its space reserved, and fail when the disk can't hold it
     fn create_file(&self, path: &Path, reserved: ByteCount) -> Result<Self::File>;

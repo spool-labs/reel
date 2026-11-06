@@ -10,6 +10,7 @@ use crate::engine::scan_state::{MOST_SCANS, planned_scan_bytes};
 use crate::index::entry_slab::{PAGE_BYTES, PageCount};
 use crate::index::node_pool::{NODE_FANOUT, NodeCount};
 use crate::index::open_slots::MAX_OPEN_SLOTS;
+use crate::io::ring::{RING_READ_BYTES, RING_READS, RING_SLOT_BYTES, RING_SLOTS};
 use crate::lifetime::MOST_LIFETIME_GROUPS;
 use crate::index::write_index::SHARD_COUNT;
 use crate::index::write_shard::ShardSizing;
@@ -113,6 +114,7 @@ pub struct StoreShape {
     pub has_lz4: bool,
     pub widest_keys: u64,
     pub threads: ThreadCounts,
+    pub has_ring: bool,
 }
 
 /// What a budget buys
@@ -159,7 +161,8 @@ impl StoreShape {
         let queues = (self.open_slots() as u64 * 2 + WRITE_BUFFERS as u64) * GROUP_BYTES.0;
         let gathers = WRITE_BUFFERS as u64 * GATHER_BYTES as u64;
         let windows = self.open_slots() as u64 * 3 * RECORD_WINDOW_BYTES as u64;
-        let reads = READ_BUFFERS as u64 * READ_BUFFER_BYTES;
+        let ring = if self.has_ring { (RING_SLOTS * RING_SLOT_BYTES) as u64 + RING_READS as u64 * RING_READ_BYTES } else { 0 };
+        let reads = READ_BUFFERS as u64 * READ_BUFFER_BYTES + ring;
         let scans = MOST_SCANS as u64 * planned_scan_bytes(self.widest_keys, self.open_slots());
         let read_slots = READ_SLOTS as u64 * (SLOT_KEY_BYTES + SLOT_KEYS * size_of::<usize>()) as u64;
         let large = if self.has_lz4 { LZ4_STORED_LIMIT.0 } else { 0 };

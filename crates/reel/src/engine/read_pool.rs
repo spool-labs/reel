@@ -22,7 +22,8 @@ use crate::engine::scan_path::ScanWant;
 use crate::engine::scan_state::ScanState;
 use crate::guard::hold;
 use crate::io::job::{Job, JobStep};
-use crate::io::{InPlace, Io, IoTask, in_place};
+use crate::io::ring::{OnRing, ReadRing};
+use crate::io::{DeviceReads, InPlace, Io, IoTask, in_place};
 use crate::pool::{touched_capacity, touched_queue};
 
 /// Async reads in flight at once
@@ -362,6 +363,9 @@ impl<Backend: Io> EngineState<Backend> {
         point: Option<WritePlace>,
         buf: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
+        if let Some(ring) = &self.ring {
+            return self.get_on_ring(ring, column, key, want, point, buf).await;
+        }
         let lease = self.read_pool.claim().await;
         let value = mem::take(buf);
         lease.load(key, ReadWork::Get { column, want, point, value });
@@ -430,12 +434,43 @@ impl<Backend: Io> EngineState<Backend> {
         point: Option<WritePlace>,
         value: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
+        in_place(self.get_one_on(&InPlace, column, key, want, point, value))
+    }
+
+    /// Read one key through a device's read path
+    pub async fn get_one_on(
+        &self,
+        device: &impl DeviceReads<Backend::File>,
+        column: ColumnId,
+        key: &[u8],
+        want: RecordWant,
+        point: Option<WritePlace>,
+        value: &mut Vec<u8>,
+    ) -> Result<bool, StoreError> {
         let Some(point) = point else {
-            return self.get_latest(column, key, want, value);
+            return self.get_latest_on(device, column, key, want, value).await;
         };
         let info = self.column(column)?;
         let handovers = self.volumes[info.volume.0 as usize].handover_count();
-        in_place(self.get_at(&InPlace, &self.key_read(column, key, point, true)?, handovers, want, value))
+        let read = self.key_read(column, key, point, true)?;
+        self.get_at(device, &read, handovers, want, value).await
+    }
+
+    /// Run a get on the ring, on the caller's task, and hold no thread while the device works
+    pub async fn get_on_ring(
+        &self,
+        ring: &ReadRing<Backend::Ring>,
+        column: ColumnId,
+        key: &[u8],
+        want: RecordWant,
+        point: Option<WritePlace>,
+        value: &mut Vec<u8>,
+    ) -> Result<bool, StoreError> {
+        let Ok(_seat) = ring.seat().await else {
+            return Err(StoreError::Closed);
+        };
+        let answer = self.get_one_on(&OnRing(ring), column, key, want, point, value).await;
+        self.counted(answer)
     }
 
     /// Fill a list with the next block of a scan's keys, and say whether the walk has more

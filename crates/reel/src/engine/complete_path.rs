@@ -64,7 +64,7 @@ impl<Backend: Io> EngineState<Backend> {
         if matches.slots().iter().any(CompleteSlot::is_sticky) {
             return self.search_footers(device, volume, read).await;
         }
-        let mut reader = self.footer_readers.lease();
+        let mut reader = self.footer_reader_for(device);
         let mut best = None;
         for slot in matches.slots() {
             if !slot.is_stale() || is_behind {

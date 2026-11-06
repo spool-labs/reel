@@ -9,6 +9,9 @@ lz4-sys.workspace = true
 reel-api.workspace = true
 xxhash-rust.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+
 [dev-dependencies]
 libc.workspace = true
 reel-sim.workspace = true

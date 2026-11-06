@@ -23,6 +23,7 @@ mod scans;
 mod read_only;
 mod records;
 mod reports;
+mod ring_reads;
 mod seed_sets;
 mod write_index;
 mod faults;

@@ -455,6 +455,13 @@ pub fn first_candidate(entries: &[BlockEntry], prefix: KeyPrefix) -> usize {
     after.saturating_sub(1)
 }
 
+impl FooterReader {
+    /// Allocate a reader for reads alone, with no room for a tail
+    pub fn without_tail() -> Self {
+        Self { tail: Vec::new(), ..Self::new() }
+    }
+}
+
 impl HollowItem for FooterReader {
     fn hollow() -> Self {
         Self {

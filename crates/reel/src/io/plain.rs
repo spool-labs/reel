@@ -21,6 +21,10 @@ use crate::io::job::Job;
 use crate::io::lock_outcome::LockOutcome;
 use crate::io::plain_file::{PlainFile, reserve_space};
 use crate::io::plain_task::{PlainTask, TaskSignal, run_job};
+#[cfg(not(target_os = "linux"))]
+use crate::io::ring::NoRing;
+#[cfg(target_os = "linux")]
+use crate::io::uring::UringDriver;
 use crate::pool::TOUCH_BYTE;
 
 /// Width of the process id in a lock file, padded with spaces
@@ -50,6 +54,7 @@ pub const PAUSE_WAIT: Duration = Duration::from_micros(100);
 #[derive(Clone, Debug)]
 pub struct PlainIo {
     origin: Instant,
+    has_ring: bool,
 }
 
 /// A held file lock, released when the file closes
@@ -61,7 +66,12 @@ pub struct PlainLock {
 impl PlainIo {
     /// Start a backend whose clock counts from now
     pub fn new() -> Self {
-        Self { origin: Instant::now() }
+        Self { origin: Instant::now(), has_ring: true }
+    }
+
+    /// Start a backend whose async reads run on the blocking pool, for a measurement of one path against the other
+    pub fn without_ring() -> Self {
+        Self { origin: Instant::now(), has_ring: false }
     }
 }
 
@@ -75,6 +85,21 @@ impl Io for PlainIo {
     type File = PlainFile;
     type Lock = PlainLock;
     type Task = PlainTask;
+    #[cfg(target_os = "linux")]
+    type Ring = UringDriver;
+    #[cfg(not(target_os = "linux"))]
+    type Ring = NoRing;
+
+    #[cfg(target_os = "linux")]
+    fn open_ring(&self) -> Result<Option<UringDriver>> {
+        // a kernel or a sandbox with no ring leaves the blocking pool, and the report says so
+        Ok(if self.has_ring { UringDriver::open().ok() } else { None })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn open_ring(&self) -> Result<Option<NoRing>> {
+        Ok(None)
+    }
 
     fn create_file(&self, path: &Path, reserved: ByteCount) -> Result<PlainFile> {
         let mut options = OpenOptions::new();

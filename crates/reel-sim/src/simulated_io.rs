@@ -2,7 +2,7 @@
 
 use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -18,6 +18,7 @@ use crate::file_image::{BitMask, SECTOR_BYTES};
 use crate::seeded_random::Seed;
 use crate::simulated_disk::{FileSyncFault, InodeNumber, OperationCount, ReadHook, SimulatedDisk, SyncHook};
 use crate::simulated_file::SimulatedFile;
+use crate::simulated_ring::SimulatedRing;
 use crate::simulated_task::{JobCount, JobIndex, JobSlot, JobWait, SimulatedTask};
 
 /// The clock moves this far on every read
@@ -33,6 +34,7 @@ pub struct SimulatedIo {
     pub slots: Arc<Mutex<Vec<JobSlot>>>,
     pub clock: Arc<AtomicU64>,
     pub real_time: Arc<Mutex<Option<Instant>>>,
+    pub has_ring: Arc<AtomicBool>,
 }
 
 /// A held simulated lock, released when dropped
@@ -59,6 +61,7 @@ impl SimulatedIo {
             slots: Arc::new(Mutex::new(Vec::new())),
             clock: Arc::new(AtomicU64::new(0)),
             real_time: Arc::new(Mutex::new(None)),
+            has_ring: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -248,6 +251,18 @@ impl SimulatedIo {
         hold(&self.disk).random.below(bound)
     }
 
+    /// Give stores opened from here on a completion ring
+    pub fn use_ring(&self) {
+        self.has_ring.store(true, Ordering::Release);
+    }
+
+    /// Wake every job of a name
+    pub fn wake_jobs(&self, name: &str) {
+        for slot in hold(&self.slots).iter_mut().filter(|slot| slot.name == name) {
+            slot.is_woken = true;
+        }
+    }
+
     /// Keep every job of a name out of the runnable set, or let them back in
     pub fn hold_jobs(&self, name: &str, is_held: bool) {
         for slot in hold(&self.slots).iter_mut().filter(|slot| slot.name == name) {
@@ -330,6 +345,11 @@ impl Io for SimulatedIo {
     type File = SimulatedFile;
     type Lock = SimulatedLock;
     type Task = SimulatedTask;
+    type Ring = SimulatedRing;
+
+    fn open_ring(&self) -> Result<Option<SimulatedRing>> {
+        Ok(self.has_ring.load(Ordering::Acquire).then(|| SimulatedRing::new(self.clone())))
+    }
 
     fn create_file(&self, path: &Path, reserved: ByteCount) -> Result<SimulatedFile> {
         let _pause = CountPause::new();

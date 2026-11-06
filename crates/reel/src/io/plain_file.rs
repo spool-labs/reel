@@ -19,6 +19,11 @@ pub struct PlainFile {
 }
 
 impl PlainFile {
+    /// Read the descriptor the kernel knows this file by
+    pub fn descriptor(&self) -> RawFd {
+        self.descriptor
+    }
+
     /// Take over an open file
     pub fn new(file: File) -> Self {
         Self {

@@ -19,9 +19,10 @@ use crate::index::key_hash::{KeyHash, hash_key};
 use crate::index::spot_index::SpotLocation;
 use crate::index::write_row::WriteRow;
 use crate::io::{DeviceReads, InPlace, Io, in_place};
+use crate::pool::PoolLease;
 use crate::io::device_error::is_device_error;
 use crate::record::record_check::RecordIdentity;
-use crate::record::record_reader::{RecordLocation, RecordRead};
+use crate::record::record_reader::{RecordLocation, RecordRead, RecordReader};
 use crate::row_kind::RowKind;
 use crate::segment::column_directory::ColumnDirectory;
 use crate::segment::footer_reader::{FooterAnswer, FooterCaches, FooterQuery, FooterReader, WindowRead};
@@ -149,6 +150,16 @@ impl Located {
 }
 
 impl<Backend: Io> EngineState<Backend> {
+    /// Lease a record reader. One from the blocking pool could wait behind a read that waits on this runtime thread
+    pub fn record_reader_for(&self, device: &impl DeviceReads<Backend::File>) -> PoolLease<'_, RecordReader> {
+        if device.holds_across_waits() { self.ring_record_readers.lease() } else { self.record_readers.lease() }
+    }
+
+    /// Lease a footer reader, as a record reader
+    pub fn footer_reader_for(&self, device: &impl DeviceReads<Backend::File>) -> PoolLease<'_, FooterReader> {
+        if device.holds_across_waits() { self.ring_footer_readers.lease() } else { self.footer_readers.lease() }
+    }
+
     /// Fill a buffer with a key's newest value, and say whether it has one
     pub fn get_latest(
         &self,
@@ -627,7 +638,7 @@ impl<Backend: Io> EngineState<Backend> {
             kind: RowKind::Value,
             place,
         };
-        let mut reader = self.record_readers.lease();
+        let mut reader = self.record_reader_for(device);
         let outcome = match want {
             RecordWant::Whole => reader.read_value(device, file, location, &identity, read.info.codec, buf).await,
             RecordWant::Window(window) => reader.read_window(device, file, location, &identity, window, buf).await,
@@ -650,7 +661,7 @@ impl<Backend: Io> EngineState<Backend> {
             return Ok(None);
         };
 
-        let mut reader = self.footer_readers.lease();
+        let mut reader = self.footer_reader_for(device);
         self.search_directory(device, volume, directory, read, &mut reader).await
     }
 

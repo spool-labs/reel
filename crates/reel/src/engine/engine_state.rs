@@ -26,6 +26,7 @@ use crate::guard::hold;
 use crate::index::open_slots::OpenSlot;
 use crate::index::spot_index::SpotIndex;
 use crate::index::write_index::WriteIndex;
+use crate::io::ring::{ReadRing, RingDriver};
 use crate::io::{Io, IoFile, IoTask};
 use crate::pool::Pool;
 use crate::record::record_check::RecordKey;
@@ -119,6 +120,10 @@ pub struct EngineState<Backend: Io> {
     pub reserve_task: OnceLock<Backend::Task>,
     pub read_tasks: Vec<OnceLock<Backend::Task>>,
     pub read_pool: ReadPool,
+    pub ring: Option<ReadRing<Backend::Ring>>,
+    pub ring_task: OnceLock<Backend::Task>,
+    pub ring_record_readers: Pool<RecordReader>,
+    pub ring_footer_readers: Pool<FooterReader>,
     pub is_read_only: bool,
     pub complete: Vec<Option<CompleteTable>>,
     pub complete_images: Vec<Option<Mutex<ImageFiles>>>,
@@ -529,7 +534,9 @@ impl<Backend: Io> EngineState<Backend> {
         report.scans = self.scan_heap;
         // the tables and their block lines come on top of the budget
         report.budget = ByteCount(report.budget.0 + report.complete_tables.0 + self.complete_line_bytes.0);
-        report.read_buffers = ByteCount(report.read_buffers.0 + self.read_pool.heap_bytes().0);
+        let ring_readers = self.ring_record_readers.heap_bytes(RecordReader::heap_bytes).0 + self.ring_footer_readers.heap_bytes(FooterReader::heap_bytes).0;
+        let ring = self.ring.as_ref().map_or(0, |ring| ring.heap_bytes().0 + ring.driver.heap_bytes().0);
+        report.read_buffers = ByteCount(report.read_buffers.0 + self.read_pool.heap_bytes().0 + ring + ring_readers);
         let encoders = self.encoders.heap_bytes(RecordEncoder::heap_bytes);
         let shares = self.stored_shares.heap_bytes(|share| ByteCount(share.capacity() as u64));
         report.compress_buffers = ByteCount(encoders.0 + shares.0);

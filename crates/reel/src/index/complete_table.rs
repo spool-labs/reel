@@ -506,11 +506,8 @@ impl CompleteTable {
             block: 0,
             tag: homes.tag | STALE_BIT,
         };
-        // the slots folded may all have sat in the overflow area, and then that's where room is
-        let is_placed = [homes.first, homes.second].into_iter().any(|bucket| shard.fill_bucket(bucket, sticky, &|_segment| false).is_some());
-        if !is_placed {
-            shard.fill_overflow(sticky);
-        }
+        // every key of the tag walks this run, whatever its homes, and a full list held most of its slots here, so there's room
+        shard.fill_overflow(sticky);
         self.used.fetch_sub(folded - 1, Ordering::AcqRel);
     }
 

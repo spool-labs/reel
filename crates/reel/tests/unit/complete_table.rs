@@ -142,3 +142,24 @@ fn fold_clears_a_whole_run() {
     assert_eq!(tag_count(&shard, 4), 1);
     assert_eq!(shard.overflow_used(), 1);
 }
+
+// a fold takes slots of the tag that belong to a key with other homes, and that key finds the sticky slot in the run they share
+#[test]
+fn fold_covers_a_key_with_other_homes() {
+    let table = CompleteTable::new(RowCount(ROWS));
+    let hot = KeyHash(0x0000_1234_0000_0000);
+    let other = KeyHash(0x0000_1234_4000_0000);
+    {
+        let mut shard = table.write_shard(shard_of(other));
+        let (hot_homes, other_homes) = (shard.homes(hot), shard.homes(other));
+        assert!(![hot_homes.first, hot_homes.second].contains(&other_homes.first));
+        assert!(![hot_homes.first, hot_homes.second].contains(&other_homes.second));
+        shard.fill_overflow(CompleteSlot { segment: 7, block: 3, tag: tag_of(other) });
+    }
+    assert!(has_row(&table, other, 7, 3), "before the fold");
+    for segment in 100..101 + MOST_TAG_SLOTS as u64 {
+        table.insert(hot, SegmentNumber(segment), 1, |_segment| false);
+    }
+    let matches = matches_of(&table, other);
+    assert!(matches.slots().iter().any(|slot| slot.is_sticky() || (slot.segment == 7 && slot.block == 3)));
+}
